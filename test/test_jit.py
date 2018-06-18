@@ -2587,6 +2587,44 @@ def func(t):
             f = io.BytesIO()
             torch.onnx._export(m, (x, seq_lens), f, verbose=False)
 
+    def test_one():
+        def end(a):
+            b = a + 4
+            c = 3 + 2 # input consists of all constants,
+                      # find future usages and replace wiith computation
+            d = c + b
+            return d
+
+        # # becomes
+        # def end(a):
+        #     b = a + 4
+        #     d = 5 + b
+        #     return d
+
+        # could be
+        # def end(a):
+        #   return a + 4 + 5
+        #   -> return a + 9`
+
+        # def beginning(a):
+        #     b = 3 + 2
+        #     c = b + 4
+        #     return a + c
+        #
+        # def beginning(a):
+        #     c = 5 + 4
+        #     return a + c
+        #
+        # def beginning(a):
+        #     return a + 9
+
+
+        def middle(a):
+            a = a + 4
+            b = 3 + 2
+            c = 4 + 7
+            return a + c
+
     def test_tuples(self):
         @torch.jit.script
         def foo(i):
@@ -2807,6 +2845,7 @@ def func(t):
         def use(b):
             return foo(b - 1.0, a) + 1.0
 
+        print(str(foo.graph))
         # test we propagated shapes through the function
         self.assertTrue("Dynamic" not in str(use.graph))
 
