@@ -340,7 +340,6 @@ private:
     }
     return false;
   }
-
   const Code & getOrCreateAutogradFallback() {
     std::lock_guard<std::mutex> lock(compile_mutex);
     if(autograd_fallback) {
