@@ -1063,6 +1063,48 @@ class TestJit(JitTestCase):
         self.assertEqual(out_ref, out_test)
         self.assertExpected(canonical(addmm.graph))
 
+    def test_decompose_addmm_test(self):
+        @torch.jit.script
+        def addmm(mat, mat1, mat2, alpha, beta):
+            a = mat.addmm(mat1, mat2)
+            b = mat.addmm(mat1, mat2, alpha=1.0, beta=1.0)
+            c = mat.addmm(mat1, mat2, alpha=4.20, beta=2.0)
+            d = mat.addmm(mat1, mat2, alpha=alpha, beta=beta)
+
+            return a + b + c + d
+
+        mat = torch.randn(2, 2)
+        mat1 = torch.randn(2, 4)
+        mat2 = torch.randn(4, 2)
+        alpha = torch.FloatTensor([123.0])
+        beta = torch.FloatTensor([321.0])
+
+        out_ref = addmm(mat, mat1, mat2, alpha, beta)
+        self.run_pass('decompose_addmm_test', addmm.graph)
+        out_test = addmm(mat, mat1, mat2, alpha, beta)
+        self.assertEqual(out_ref, out_test)
+        # self.assertExpected(canonical(addmm.graph))
+
+
+    def test_constant_propagation(self):
+        @torch.jit.script
+        def constant_propagation():
+            c = 1 + 3
+            d = 2 + 1
+            f = d + 2
+            g = 3 + 5
+            h = g + f
+            e = c + h
+
+            return e
+
+        out_ref = constant_propagation()
+        print(constant_propagation.graph)
+        self.run_pass('constant_propagation', constant_propagation.graph)
+        print(constant_propagation.graph)
+        out_test = constant_propagation()
+        # self.assertEqual(out_ref, out_test)
+
     def test_index_put(self):
         ten = torch.zeros(3, 3)
         mask = torch.Tensor([[True, True, True],
@@ -3341,6 +3383,18 @@ def func(t):
 
         graph = torch.jit._script_graph(fn)
         self.run_pass('loop_unrolling', graph)
+        self.assertExpectedGraph(graph)
+        self.checkScript(fn, (torch.tensor(10),))
+
+    def test_loop_unrolling_add(self):
+        def fn(x):
+            y = 0
+            for i in range(x):
+                y += i
+            return y
+
+        graph = torch.jit._script_graph(fn)
+        self.run_pass('loop_unrolling_test', graph)
         self.assertExpectedGraph(graph)
         self.checkScript(fn, (torch.tensor(10),))
 
