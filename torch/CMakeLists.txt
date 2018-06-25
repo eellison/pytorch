@@ -223,6 +223,7 @@ set(TORCH_SRCS
   ${TORCH_SRC_DIR}/csrc/jit/passes/canonicalize.cpp
   ${TORCH_SRC_DIR}/csrc/jit/passes/dead_code_elimination.cpp
   ${TORCH_SRC_DIR}/csrc/jit/passes/erase_number_types.cpp
+  ${TORCH_SRC_DIR}/csrc/jit/passes/constant_propagation.cpp
   ${TORCH_SRC_DIR}/csrc/jit/passes/lower_tuples.cpp
   ${TORCH_SRC_DIR}/csrc/jit/passes/lower_grad_of.cpp
   ${TORCH_SRC_DIR}/csrc/jit/passes/peephole.cpp

@@ -1078,6 +1078,90 @@ class TestJit(JitTestCase):
         ten = torch.rand(3, 3)
         self.assertEqual(test_fn(ten, mask), traced_test_fn(ten, mask))
 
+    def test_constant_prop_simple(self):
+        @torch.jit.script
+        def constant_prop(input_tensor):
+            a = 2 * 3
+            b = a + 2
+            return b + input_tensor
+
+        x = torch.tensor(2)
+        out_ref = constant_prop(x)
+        self.run_pass('constant_propagation', constant_prop.graph)
+        out_test = constant_prop(torch.tensor(2))
+        self.assertEqual(out_ref, out_test)
+        self.assertExpected(canonical(constant_prop.graph))
+
+    def test_constant_prop_nested(self):
+        @torch.jit.script
+        def constant_prop(a):
+            b = 2 + 1
+            if a < 2:
+                c = b + 2
+            else:
+                c = b - 2
+            return c + FIXME_zerol()
+
+        out_ref = constant_prop(torch.tensor(2))
+        self.run_pass('constant_propagation', constant_prop.graph)
+        out_test = constant_prop(torch.tensor(2))
+        self.assertEqual(out_ref, out_test)
+        self.assertExpected(canonical(constant_prop.graph))
+
+    def test_constant_prop_print(self):
+        @torch.jit.script
+        def constant_prop(input_tensor):
+            a = 2 * 3 + FIXME_zerol()
+            print(a)
+            b = a + 2
+            return b + input_tensor
+
+        self.run_pass('constant_propagation', constant_prop.graph)
+        self.assertExpected(canonical(constant_prop.graph))
+
+    def test_constant_prop_rand(self):
+        @torch.jit.script
+        def constant_prop():
+            # FIXME - torch.randn does not work with int, and
+            # FIXME_zerol() is dynamic so constant prop is not being tested
+            size = 3 + FIXME_zerol()
+            a = torch.randn(size)
+            b = a + 2
+            return b
+
+        self.run_pass('constant_propagation', constant_prop.graph)
+        self.assertExpected(canonical(constant_prop.graph))
+
+    # TODO: implement
+    @unittest.expectedFailure
+    def test_constant_prop_if_constant(self):
+        @torch.jit.script
+        def constant_prop():
+            b = 0
+            if True:
+                b = 1
+            if False:
+                b = 2
+            return b
+
+        self.run_pass('constant_propagation', constant_prop.graph)
+        self.assertExpected(canonical(constant_prop.graph))
+
+    # TODO: implement
+    @unittest.expectedFailure
+    def test_constant_prop_loop_constant(self):
+        @torch.jit.script
+        def constant_prop():
+            b = 0
+            while True:
+                b = 1
+            while False:
+                b = 2
+            return b
+
+        self.run_pass('constant_propagation', constant_prop.graph)
+        self.assertExpected(canonical(constant_prop.graph))
+
 
 class TestBatched(TestCase):
     # generate random examples and create an batchtensor with them
@@ -1771,25 +1855,22 @@ class TestScript(JitTestCase):
         template = ('''
 # int, int -> int
 def func1():
-    c = 8 {op} 2
+    c = 8 {op} 2 + FIXME_zerol()
+    return c
     # FIXME: return number instead of tensor
-    return torch.full([1], c)
-
 def func2():
-    c = 2 {op} 2
+    c = 2 {op} 2 + FIXME_zerol()
+    return c
     # FIXME: return number instead of tensor
-    return torch.full([1], c)
-
 # float, float -> float
 def func3():
-    c = 3.14 {op} 0.125
+    c = 3.14 {op} 0.125 + FIXME_zerol()
+    return c
     # FIXME: return number instead of tensor
-    return torch.full([1], c)
-
 def func4():
-    c = 3.14 {op} 3.14
+    c = 3.14 {op} 3.14 + FIXME_zerol()
+    return c
     # FIXME: return number instead of tensor
-    return torch.full([1], c)
 ''')
         ops = ['+', '-', '*', '<', '<=', '>', '>=', '==', '!=']
         # TODO: turn this on for py3 (and add PY3 division semantics)
@@ -1811,15 +1892,13 @@ def func4():
     def test_number_neg(self):
         # int -> int
         def func1():
-            c = -8
             # FIXME: return number instead of tensor
-            return torch.full([1], c)
+            c = -8 + FIXME_zerol()
 
         # float -> float
         def func2():
-            c = -3.14
             # FIXME: return number instead of tensor
-            return torch.full([1], c)
+            c = -3.14 + FIXME_zerol()
 
         self.checkScript(func1, (), optimize=True)
         self.checkScript(func2, (), optimize=True)

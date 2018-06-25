@@ -1,0 +1,19 @@
+graph(%a : Dynamic) {
+  %1 : Long() = prim::Constant[value={2}]()
+  %2 : Dynamic = aten::type_as(%1, %a)
+  %3 : Dynamic = aten::lt(%a, %2)
+  %c : int = prim::If(%3)
+    block0() {
+      %5 : Long() = prim::Constant[value={5}]()
+      -> (%5)
+    }
+    block1() {
+      %6 : Long() = prim::Constant[value={1}]()
+      -> (%6)
+    }
+  %7 : Dynamic = ^FIXME_zerol()()
+  %8 : Dynamic = prim::NumToTensor(%c)
+  %9 : Dynamic = aten::type_as(%8, %7)
+  %10 : Dynamic = aten::add[alpha={1}](%7, %9)
+  return (%10);
+}

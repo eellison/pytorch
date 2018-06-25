@@ -18,6 +18,7 @@
 #include "torch/csrc/jit/passes/decompose_addmm.h"
 #include "torch/csrc/jit/passes/specialize_undef.h"
 #include "torch/csrc/jit/passes/loop_unrolling.h"
+#include "torch/csrc/jit/passes/constant_propagation.h"
 #include "torch/csrc/jit/passes/lower_grad_of.h"
 #include "torch/csrc/jit/symbolic_variable.h"
 
@@ -512,6 +513,7 @@ void runOptimization(std::shared_ptr<Graph> & graph, bool graphMustSupportVariab
 
     // They also may assume that concrete sizes/strides are availiable
     UnrollLoops(graph);
+    ConstantPropagation(graph);
 
     //TODO: create peephole optimizations that are safe to run
     // when we are using variables, and when we do not know sizes.
