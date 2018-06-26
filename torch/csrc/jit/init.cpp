@@ -90,7 +90,7 @@ void initJITBindings(PyObject *module) {
    .def("_jit_pass_onnx_block", BlockToONNX)
    .def("_jit_pass_fixup_onnx_loops", FixupONNXLoops)
    .def("_jit_pass_decompose_addmm", DecomposeAddmm)
-    .def("_jit_pass_specialize_undef", specializeUndef)
+   .def("_jit_pass_specialize_undef", specializeUndef)
    .def("_jit_differentiate", [](Graph &g, const std::vector<bool>& requires_grad) {
        // the python binding slightly differs in semantics
        // it makes a copy of the input Graph, and works on that
