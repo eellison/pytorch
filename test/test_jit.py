@@ -4063,7 +4063,18 @@ def func(t):
                 return python_fn(torch.mm(x, self.param))
 
         sm = ScriptMod()
+<<<<<<< HEAD
         self.assertExpected(str(sm.__getattr__('forward').graph))
+=======
+        # TODO: At the time of writing this test fails with:
+        # RuntimeError
+        # undefined value python_fn:
+        # @torch.jit.script_method
+        # def forward(self, x):
+        #     return python_fn(torch.mm(x, self.param))
+        #            ~~~~~~~~~ <--- HERE
+        self.assertExpected(str(sm.graph))
+>>>>>>> Switch to emitting ScriptModule for scripted and traced functions (#8876)
 
     def test_call_python_mod_from_script_module(self):
         class PythonMod(torch.nn.Module):
@@ -4104,7 +4115,18 @@ def func(t):
                 return traced_fn(torch.mm(x, self.param))
 
         sm = ScriptMod()
+<<<<<<< HEAD
         self.assertExpected(str(sm.__getattr__('forward').graph))
+=======
+        # FIXME: at the time of writing we fail with the following:
+        # RuntimeError:
+        # undefined value traced_fn:
+        # @torch.jit.script_method
+        # def forward(self, x):
+        #     return traced_fn(torch.mm(x, self.param))
+        #            ~~~~~~~~~ <--- HERE
+        self.assertExpected(str(sm.graph))
+>>>>>>> Switch to emitting ScriptModule for scripted and traced functions (#8876)
 
     def test_call_tracing_mod_from_script_module(self):
         class TracedMod(torch.nn.Module):
@@ -4146,7 +4168,18 @@ def func(t):
                 return script_fn(torch.mm(x, self.param))
 
         sm = ScriptMod()
+<<<<<<< HEAD
         self.assertExpected(str(sm.__getattr__('forward').graph))
+=======
+        # FIXME: at the time of writing, this failes with
+        # RuntimeError:
+        # undefined value traced_fn:
+        # @torch.jit.script_method
+        # def forward(self, x):
+        #     return traced_fn(torch.mm(x, self.param))
+        #            ~~~~~~~~~ <--- HERE
+        self.assertExpected(str(sm.graph))
+>>>>>>> Switch to emitting ScriptModule for scripted and traced functions (#8876)
 
     def test_call_script_mod_from_script_module(self):
         class ScriptMod1(torch.jit.ScriptModule):
