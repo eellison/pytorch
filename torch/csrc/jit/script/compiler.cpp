@@ -1258,6 +1258,7 @@ private:
     } else if (ident.name() == "print") {
       if (!attributes.empty())
         throw ErrorReport(ident) << "print doesn't accept any keyword arguments";
+      throw std::runtime_error("Hi Elias3\n");
       ensureTensors(ident.range(), toValues(inputs));
       emitNode(prim::Print, ident.range(), toValues(inputs), 0);
       return std::make_shared<NoneValue>();
@@ -1472,6 +1473,28 @@ private:
       }
       case TK_APPLY: {
         auto apply = Apply(tree);
+
+        if(apply.callee().kind() == TK_VAR && Var(apply.callee()).name() == "print") {
+
+          // return emitApplyIdent(Var(apply.callee()).name(), inputs, attributes, n_binders);
+        }
+
+
+        // std::ostringstream stream;
+        // stream << "inputs ";
+        // stream << apply.inputs();
+        // for(size_t i = 0; i < apply.inputs().size(); i++)
+        // {
+        //   stream << "inputs i: ";
+        //   stream << apply.inputs()[i];
+        // }
+        // stream << "name ";
+        // if(apply.callee().kind() == TK_VAR) {
+        //   stream << Var(apply.callee()).name();
+        // }
+        // stream << tree;
+        // std::string str = stream.str();
+        // throw std::runtime_error(str);
         auto inputs = getNamedValues(apply.inputs(), true, identity);
         auto attributes = fmap(apply.attributes(), [&](const Attribute& attr) {
           return NamedValue(attr.range(), attr.name().name(), emitExpr(attr.value(), identity));
@@ -1550,6 +1573,10 @@ private:
       case TK_IF_EXPR: {
         return emitTernaryIf(TernaryIf(tree));
       } break;
+      case TK_STRINGCONST: {  
+        // throw std::runtime_error("Hi Elias2\n");
+        // return emitTernaryIf(TernaryIf(tree));
+      } break;
       case TK_LIST_LITERAL: {
         auto ll = ListLiteral(tree);
         auto values = getValues(ll.inputs(), /*maybe_unpack=*/true, identity);
@@ -1617,7 +1644,7 @@ private:
     return n;
   }
 
-  void matchSchemaAndLiftConstantAttributes(
+  void matchSchemaAndLiftConstantAttributes( 
       const SourceRange& loc,
       Node* n,
       std::vector<Value*> input_vals,

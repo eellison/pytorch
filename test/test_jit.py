@@ -1063,6 +1063,23 @@ class TestJit(JitTestCase):
         self.assertEqual(out_ref, out_test)
         self.assertExpected(canonical(addmm.graph))
 
+    def test_print(self):
+        @torch.jit.script
+        def fn(x, y, z):
+            a = 5
+            # q = x + y - z.sigmoid()
+            # print(q)
+            # w = -z
+            # if not x and not y and z:
+            #     m = x if not z else y
+            # while x < y > z:
+            #     q = x
+            return x
+
+        ast = torch.jit.frontend.get_jit_ast(fn)
+        print(str(ast))
+
+
     def test_decompose_addmm_test(self):
         @torch.jit.script
         def addmm(mat, mat1, mat2, alpha, beta):
@@ -1500,14 +1517,18 @@ class TestScript(JitTestCase):
         return [torch.tensor(val, dtype=dtype) for val in arr]
 
     def test_while(self):
+        @torch.jit.script
         def func(a, b, max):
             while a < max:
                 a = a + 1
                 b = b + 1
             c = a + b
+            print("""hi elias""")
             return c
 
         inputs = self._make_scalar_vars([1, 1, 10], torch.int64)
+        ast = torch.jit.frontend.get_jit_ast(func)
+        print(str(ast))
         self.checkScript(func, inputs, optimize=True)
 
     def test_fibb(self):

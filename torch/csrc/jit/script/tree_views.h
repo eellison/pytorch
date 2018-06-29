@@ -250,6 +250,8 @@ struct Expr : public TreeView {
       case '/':
       case TK_NOT:
       case TK_CONST:
+      case TK_STRING:
+      case TK_STRINGCONST:
       case TK_TRUE:
       case TK_FALSE:
       case TK_CAST:
@@ -263,7 +265,7 @@ struct Expr : public TreeView {
       case TK_POW:
         return;
       default:
-        throw ErrorReport(tree) << kindToString(tree->kind()) << " is not a valid Expr";
+        throw ErrorReport(tree) << kindToString(tree->kind()) << " is not a valid Expr e";
     }
   }
 };
@@ -577,6 +579,19 @@ struct Const : public Expr {
   }
   static Const create(const SourceRange& range, const std::string& value) {
     return Const(Compound::create(TK_CONST, range, {String::create(value)}));
+  }
+};
+
+struct StringConst : public Expr {
+  explicit StringConst(const TreeRef& tree) : Expr(tree) {
+    tree_->matchNumSubtrees(TK_STRINGCONST, 1);
+  }
+  const std::string& text() const {
+    throw std::runtime_error("found number 2");
+    return subtree(0)->stringValue();
+  }
+  static StringConst create(const SourceRange& range, const std::string& value) {
+    return StringConst(Compound::create(TK_STRINGCONST, range, {String::create(value)}));
   }
 };
 

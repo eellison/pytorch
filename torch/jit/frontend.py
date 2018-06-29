@@ -7,6 +7,7 @@ from textwrap import dedent
 from functools import partial
 from collections import namedtuple
 from torch._C._jit_tree_views import *
+from pprint import pprint
 
 PY2 = sys.version_info[0] == 2
 _reserved_prefix = '__jit'
@@ -136,6 +137,9 @@ class Builder(object):
     def __call__(self, ctx, node):
         method = getattr(self, 'build_' + node.__class__.__name__, None)
         if method is None:
+            print(self)
+            print(ctx)
+            print(node)
             raise UnsupportedNodeError(ctx, node)
         return method(ctx, node)
 
@@ -184,6 +188,7 @@ class StmtBuilder(Builder):
     @staticmethod
     def build_Expr(ctx, stmt):
         value = stmt.value
+        print 
         if value.__class__.__name__ == 'Str':
             # If a statement is a string literal expression,
             # then it is a docstring. Just ignore it.
@@ -440,9 +445,22 @@ class ExprBuilder(Builder):
         return Const(r, value)
 
     @staticmethod
+    def build_Str(ctx, expr):
+        print("Hi Elias")
+        pprint(vars(expr))
+        value = str(expr.s)
+        print(value)
+        # print(node.__class__.__name__)
+        print(expr)
+        r = ctx.make_range(expr.lineno, expr.col_offset, expr.col_offset + len(value))
+        return StringConst(r, value)
+
+    @staticmethod
     def build_Starred(ctx, expr):
         r = ctx.make_range(expr.lineno, expr.col_offset, expr.col_offset + 1)
         return Starred(r, build_expr(ctx, expr.value))
+
+
 
 build_expr = ExprBuilder()
 build_stmt = StmtBuilder()

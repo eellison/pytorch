@@ -77,6 +77,9 @@ struct Parser {
         L.expect(')');
         prefix = Cast::create(r, Type(type), Expr(exp));
       } break;
+      case TK_STRINGCONST: {
+        prefix = parseStringConst();
+      } break;
       default: {
         Ident name = parseIdent();
         prefix = Var::create(name.range(), name);
@@ -187,6 +190,13 @@ struct Parser {
     auto t = L.expect(TK_NUMBER);
     return Const::create(t.range, t.text());
   }
+  StringConst parseStringConst() {
+    auto range = L.cur().range;
+    auto t = L.expect(TK_STRINGCONST);
+    throw std::runtime_error(t.text());
+    return StringConst::create(t.range, t.text());
+  }
+
   Expr parseAttributeValue() {
     return parseExp();
   }

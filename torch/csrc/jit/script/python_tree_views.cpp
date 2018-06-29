@@ -171,6 +171,10 @@ void initTreeViewBindings(PyObject *module) {
     .def(py::init([](const SourceRange& range, std::string value) {
       return Const::create(range, value);
     }));
+  py::class_<StringConst, Expr>(m, "StringConst")
+    .def(py::init([](const SourceRange& range, std::string value) {
+      return StringConst::create(range, value);
+    }));
   py::class_<Apply, Expr>(m, "Apply")
     .def(py::init([](const Expr& expr, std::vector<Expr> args, std::vector<Attribute> kwargs) {
       auto r = expr.range();

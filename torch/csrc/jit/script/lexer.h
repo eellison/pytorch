@@ -8,6 +8,8 @@
 #include <unordered_map>
 #include <vector>
 #include "torch/csrc/jit/source_location.h"
+#include <ios>
+#include <fstream>
 
 
 namespace torch {
@@ -38,6 +40,7 @@ namespace script {
   _(TK_EQUIVALENT, "equivalent", "<=>")          \
   _(TK_IDENT, "ident", "")                       \
   _(TK_STRING, "string", "")                     \
+  _(TK_STRINGCONST, "string_const", "")          \
   _(TK_CONST, "const", "")                       \
   _(TK_LIST, "list", "")                         \
   _(TK_OPTION, "option", "")                     \
@@ -83,7 +86,7 @@ namespace script {
   _(TK_IN, "in", "in")                           \
   _(TK_STARRED, "starred", "")                   \
   _(TK_UNARY_MINUS, "unary minus", "")           \
-  _(TK_POW, "pow operator", "**")
+  _(TK_POW, "pow operator", "**")                
 
 static const char* valid_single_char_tokens = "+-*/@()[]:,={}><.";
 
@@ -180,7 +183,7 @@ struct SharedParserData {
     // strtod allows numbers to start with + or - or nan or inf
     // http://en.cppreference.com/w/cpp/string/byte/strtof
     // but we want only the number part, otherwise 1+3 will turn into two
-    // adjacent numbers in the lexer
+    // adjacent numbers in the lexer    
     if (first == '-' || first == '+' || isalpha(first))
       return false;
     const char* startptr = str.c_str() + start;
@@ -189,6 +192,30 @@ struct SharedParserData {
     *len = endptr - startptr;
     return *len > 0;
   }
+  
+  bool isString(const std::string& str, size_t start, size_t* len) {
+    char quote = str[start];
+    if (quote != '\"' && quote != '\'')
+      return false;
+    size_t end = start + 1; 
+    while(end < str.size() && str[end] != quote) {
+      if (str[end] == '\\') {
+        //last or second to last character
+        if (end + 2 >= str.size()) {
+          return false; 
+        } else if (str[end + 1] == quote || str[end + 1] == '\\') {
+          end++;
+        }
+      }
+      if (str[end] == '\n') {
+        return false;
+      }
+      end++;
+    }
+    *len = end - start + 1; 
+    return end < str.size() && str[end] == quote;
+  }
+
   bool isblank(int n) {
     return isspace(n) && n != '\n';
   }
@@ -228,6 +255,10 @@ struct SharedParserData {
             str, pos + 1, continuation, !continuation, kind, start, len);
       }
     }
+    std::ofstream log("logfile.txt", std::ios_base::app | std::ios_base::out);
+    log << "line\n";
+
+    // throw std::runtime_error("found number");
     if (pos == str.size()) {
       *kind = TK_EOF;
       *start = pos;
@@ -243,9 +274,21 @@ struct SharedParserData {
     *start = pos;
     // check for a valid number
     if (isNumber(str, pos, len)) {
+      // std::cout << str; 
+      // throw std::runtime_error("found number 1");
+      // std::cout << "Found number\n";
       *kind = TK_NUMBER;
       return true;
     }
+    // check for string 
+    if (isString(str, pos, len)) {
+      std::cout << str; 
+      // throw std::runtime_error(str.substr(pos, pos + *len));
+      std::cout << "Found string\n";
+      *kind = TK_STRINGCONST;
+      return true;
+    }
+
     // check for either an ident or a token
     // ident tracks whether what we have scanned so far could be an identifier
     // matched indicates if we have found any match.
