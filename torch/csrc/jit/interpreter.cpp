@@ -727,18 +727,29 @@ struct CodeImpl {
       };
     IR_ELSEIF(Print)
       size_t num_inputs = value->inputs().size();
-      return [num_inputs](Stack & stack) {
+      std::vector<std::string> strings = node->ss(Symbol::attr("strings"));
+      std::vector<int64_t> indices = node->is(Symbol::attr("string_indices"));
+      return [num_inputs, strings, indices](Stack & stack) {
+        int64_t ten_i = 0;
+        int64_t str_i = 0;
+        auto inputs = last(stack, num_inputs);
         bool first = true;
-        for (at::Tensor i : last(stack, num_inputs)) {
+        //indices are the indices to print string
+        while(ten_i < inputs.size() || str_i < strings.size()) {
           if (!first) std::cout << " ";
           first = false;
-          if (auto tensor_impl = dynamic_cast<at::TensorImpl*>(i.get())) {
-            std::cout << at::Tensor(tensor_impl, true);
-          } else if (!i.defined()) {
-            std::cout << "<undefined tensor>";
+          if (str_i < strings.size() && ten_i + str_i == indices[str_i]) {
+            std::cout << strings[str_i++];
           } else {
-            auto& r = *i.get();
-            std::cout << "<" << typeid(r).name() << " at " << i << ">";
+            at::Tensor tensor = inputs[ten_i++];
+            if (auto tensor_impl = dynamic_cast<at::TensorImpl*>(tensor.get())) {
+              std::cout << at::Tensor(tensor_impl, true);
+            } else if (!tensor.defined()) {
+              std::cout << "<undefined tensor>";
+            } else {
+              auto& r = *tensor.get();
+              std::cout << "<" << typeid(r).name() << " at " << tensor << ">";
+            }
           }
         }
         drop(stack, num_inputs);

@@ -1516,6 +1516,15 @@ class TestScript(JitTestCase):
     def _make_scalar_vars(self, arr, dtype):
         return [torch.tensor(val, dtype=dtype) for val in arr]
 
+    def test_string_print(self):
+        @torch.jit.script
+        def func(a):
+            print(a, "a" 'b' '''c''' """d""", "a \
+            b" "c" #
+            "d")
+            return a
+        inputs = self._make_scalar_vars([1], torch.int64)
+
     def test_while(self):
         @torch.jit.script
         def func(a, b, max):

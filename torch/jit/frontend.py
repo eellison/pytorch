@@ -446,12 +446,7 @@ class ExprBuilder(Builder):
 
     @staticmethod
     def build_Str(ctx, expr):
-        print("Hi Elias")
-        pprint(vars(expr))
         value = str(expr.s)
-        print(value)
-        # print(node.__class__.__name__)
-        print(expr)
         r = ctx.make_range(expr.lineno, expr.col_offset, expr.col_offset + len(value))
         return StringConst(r, value)
 
