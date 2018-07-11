@@ -19,6 +19,7 @@ _(ListType) \
 _(NumberType) \
 _(FloatType) \
 _(IntType) \
+_(String) \
 
 enum class TypeKind {
 #define DEFINE_TYPE(T) T,

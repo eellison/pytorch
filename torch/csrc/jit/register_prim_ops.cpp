@@ -92,6 +92,15 @@ RegisterOperators reg({
           };
         }),
     Operator(
+        prim::StringLiteral,
+        [](Node* node) {
+          return [](Stack& stack) {
+            stack.push_back(at::Tensor());
+            return 0;
+          };
+        }),
+
+    Operator(
         prim::ReplaceIfUndef,
         [](Node* n) {
           return [](Stack& stack) {
@@ -110,21 +119,24 @@ RegisterOperators reg({
         prim::Print,
         [](Node* node) {
           size_t num_inputs = node->inputs().size();
-          std::vector<std::string> strings = node->ss(Symbol::attr("strings"));
-          std::vector<int64_t> indices = node->is(Symbol::attr("string_indices"));
-          return [num_inputs, strings, indices](Stack & stack) {
-            size_t ten_i = 0;
-            size_t str_i = 0;
+          std::string format = node->s(attr::string);
+          std::vector<std::string> strings;
+          for(size_t i = 0; i < format.size(); i++) {
+            if (format[i] == 's') {
+              strings.push_back(node->inputs()[i]->node()->s(attr::string));
+            }
+          }
+          return [num_inputs, format, strings](Stack & stack) {
             auto inputs = last(stack, num_inputs);
             bool first = true;
-            //indices are the indices to print string
-            while(ten_i < inputs.size() || str_i < strings.size()) {
+            size_t str_i = 0;
+            for(size_t i = 0; i < format.size(); i++) {
               if (!first) std::cout << " ";
               first = false;
-              if (str_i < strings.size() && int(ten_i + str_i) == indices[str_i]) {
+              if (format[i] == 's') {
                 std::cout << strings[str_i++];
               } else {
-                at::Tensor tensor = inputs[ten_i++];
+                const at::Tensor& tensor = inputs[i];
                 if (auto tensor_impl = dynamic_cast<at::TensorImpl*>(tensor.get())) {
                   std::cout << at::Tensor(tensor_impl, true);
                 } else if (!tensor.defined()) {

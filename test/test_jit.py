@@ -1173,12 +1173,15 @@ class TestScript(JitTestCase):
     def test_string_cu(self):
         cu = torch.jit.CompilationUnit('''
             def foo(a):
-                print(a, "a" "b" \
-                'c')
+                print(a, "a")
+                # print("afffaffff")
+                # f = a
                 return a
         ''')
-        a = Variable(torch.rand(1))
-        self.assertExpected(str(cu.foo.graph))
+        print(str(cu.foo.graph))
+        # a = Variable(torch.rand(1))
+        # cu.foo(a)
+        # self.assertExpected(str(cu.foo.graph))
 
     def test_script_annotation(self):
         @torch.jit.script

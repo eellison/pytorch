@@ -946,6 +946,12 @@ public:
   Node * createUndefined() {
     return create(prim::Undefined);
   }
+  Node * createString(const std::string& str) {
+    auto n = create(prim::StringLiteral);
+    n->s_(attr:string, std::move(str);
+    n->output()->setType(prim::String);
+    return n;
+  }
   Node * createConstant(const at::Tensor& ref) {
     JIT_ASSERT(ref.defined());
     auto n = create(prim::Constant);
