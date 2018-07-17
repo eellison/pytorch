@@ -36,6 +36,8 @@ std::ostream& operator<<(std::ostream & out, const Type & t) {
   } else if(t.kind() == TypeKind::ListType) {
     auto prim = t.cast<ListType>()->getElementType();
     out << *prim << "[]";
+  } else if(t.kind() == TypeKind::StringType) {
+    out << "string";
   } else {
     barf("unknown type kind");
   }
@@ -58,8 +60,10 @@ TypePtr FloatType::get() {
   static auto value = std::make_shared<FloatType>();
   return value;
 }
-
-
+TypePtr StringType::get() {
+  static auto value = std::make_shared<StringType>();
+  return value;
+}
 TypePtr ListType::ofTensors() {
   static auto value = std::make_shared<ListType>(DynamicType::get());
   return value;
