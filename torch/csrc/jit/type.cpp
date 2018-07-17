@@ -40,6 +40,8 @@ std::ostream& operator<<(std::ostream & out, const Type & t) {
     out << *prim << "[]";
   } else if(t.kind() == TypeKind::NoneType) {
     out << "None";
+  } else if(t.kind() == TypeKind::StringType) {
+    out << "string";
   } else {
     AT_ERROR("unknown type kind");
   }
@@ -66,6 +68,13 @@ TypePtr NoneType::get() {
   static auto value = NoneType::create();
   return value;
 }
+<<<<<<< HEAD
+=======
+TypePtr StringType::get() {
+  static auto value = std::make_shared<StringType>();
+  return value;
+}
+>>>>>>> Addressing PR Requests
 TypePtr ListType::ofTensors() {
   static auto value = ListType::create(DynamicType::get());
   return value;
