@@ -7,6 +7,11 @@
 #include "torch/csrc/jit/operator.h"
 #include "torch/csrc/jit/passes/dead_code_elimination.h"
 #include "torch/csrc/utils/functional.h"
+#include "torch/csrc/autograd/variable.h"
+#include "torch/csrc/jit/constants.h"
+#include "torch/csrc/variable_tensor_functions.h"
+#include <ios>
+#include <fstream>
 
 namespace torch { namespace jit {
 
@@ -35,11 +40,21 @@ std::unordered_set<Symbol> skip_list = {
   aten::randperm_out,
  };
 
+std::unordered_set<Symbol> size_ops = {
+  //not including random size ops
+  aten::size,
+  aten::zeros_like,
+  aten::ones_like,
+  aten::empty_like,
+  aten::full_like, //need to test this one
+};
+
 std::vector<IValue> runNode(Node* n) {
   auto op = getOperation(n);
   Stack stack;
   for (auto input : n->inputs()) {
-    stack.push_back(*(toIValue(input)));
+    auto iv = *(toIValue(input));
+    stack.push_back(iv);
   }
   op(stack);
   auto var_outputs = fmap(stack, [&](IValue v) {
@@ -63,6 +78,28 @@ void propagateNode(Node* n) {
   }
 }
 
+void handleSizeOps(Node *n) {
+  WithInsertPoint guard(n);
+  auto graph = n->owningGraph();
+  for (size_t i = 0; i < n->inputs().size(); i++) {
+    //check if input is a prim::constant don't need to replace(and shoudnt)
+    //bc fill
+    //already tested that all inputs are tensor types
+    auto type = n->inputs()[i]->type()->cast<TensorType>();
+
+    auto backend = type->device() == -1 ? at::kCPU : at::kCUDA;
+    at::DeviceGuard device_guard(type->device());
+    auto& attype = at::getType(backend, type->scalarType());
+    auto zero = attype.tensor(type->sizes(), type->strides()).zero_();
+
+    //dce will remove constant
+    auto* constant = insertConstant(*graph, zero);
+    n->replaceInput(i, constant);
+  }
+  propagateNode(n);
+}
+
+
 } // anonymous namespace
 
 void ConstantPropagation(Node* n, bool recurse) {
@@ -73,7 +110,12 @@ void ConstantPropagation(Node* n, bool recurse) {
   bool supported_node = skip_list.count(n->kind()) == 0;
   if (constant_inputs && supported_node) {
     propagateNode(n);
-  }
+  } else if (size_ops.count(n->kind()) &&
+    std::all_of(n->inputs().begin(), n->inputs().end(), [&](Value* v) {
+      return v->type()->cast<TensorType>();
+  })) {
+    handleSizeOps(n);
+  };
   if (recurse) {
     for (Block * block : n->blocks())
       ConstantPropagation(block, recurse);
@@ -89,7 +131,7 @@ void ConstantPropagation(Block* block, bool recurse) {
 
 void ConstantPropagation(std::shared_ptr<Graph>& graph) {
   ConstantPropagation(graph->block(), true);
-  EliminateDeadCode(graph);
+  // EliminateDeadCode(graph);
 }
 
 }}

@@ -1135,11 +1135,20 @@ class TestJit(JitTestCase):
                 c = b - 2
             return c
 
-        out_ref = constant_prop(torch.tensor(2))
+
+    def test_constant_prop_size(self):
+        @torch.jit.script
+        def constant_prop():
+            a = torch.randn((3, 20))
+            b = a.size(0)
+            return b;
+
+        out_ref = constant_prop()
+        print(str(constant_prop.graph))
+        torch._C._jit_pass_shape_analysis(
+            constant_prop.graph, (), False)
         self.run_pass('constant_propagation', constant_prop.graph)
-        out_test = constant_prop(torch.tensor(2))
-        self.assertEqual(out_ref, out_test)
-        self.assertExpected(canonical(constant_prop.graph))
+        print(str(constant_prop.graph))
 
     def test_constant_prop_print(self):
         @torch.jit.script
@@ -1581,17 +1590,61 @@ class TestScript(JitTestCase):
     def test_sum(self):
         @torch.jit.script
         def func(x):
-            return x.sum(dim=[4])
+            a = torch.ones_like(x)
+            b = torch.ones_like(x)
+            return a + b
 
-        @torch.jit.script
-        def func2(x):
-            return x.sum(dim=4)
+        # @torch.jit.script
+        # def func2(x):
+        #     a = x.size(0)
+        #     return x.view((a, -1))
+        #     # a = torch.ones_like(x)
+        #     b = torch.ones_like(x)
+        #     return a + b
+        #     a = x + 3
+        #     return torch.zeros_like(x)
 
-        self.assertExpected(canonical(func.graph), subname='1')
+        # print(str(func2.graph))
+        # self.assertExpected(canonical(func.graph), subname='1')
         # test that shape analysis is written correctly for sum with IntList[1] dim argument
+        print(str(func.graph))
+        x = torch.zeros(10, dtype=torch.long)
         torch._C._jit_pass_shape_analysis(
-            func2.graph, (torch.zeros(1, 1, 1, 1, 4),), False)
-        self.assertExpected(canonical(func2.graph), subname='2')
+            func.graph, (torch.zeros(2, 3, 2, dtype=torch.long, device='cpu'),), False)
+        x = torch.zeros(1, 3, 2)
+        ref = func(x)
+        # print(str(func.graph))
+        torch._C._jit_pass_constant_propagation(func.graph)
+        test = func(x)
+        # print(str(func.graph))
+        torch._C._jit_pass_dce(func.graph)
+        print(str(func.graph))
+        # print(ref, test)
+        # print("ref", ref, "test", test)
+        print(ref)
+        print("\n\n")
+        print(test)
+
+
+        # print(str(func.graph))
+        # x = torch.zeros(10, dtype=torch.long)
+        # torch._C._jit_pass_shape_analysis(
+        #     func.graph, (torch.zeros(2, 3, 2, dtype=torch.long),), False)
+        # x = torch.zeros(1, 3, 2)
+        # ref = func2(x)
+        # print(str(func.graph))
+        # torch._C._jit_pass_constant_propagation(func.graph)
+        # test = func(x)
+        # print(str(func.graph))
+        # torch._C._jit_pass_dce(func.graph)
+        # print(str(func.graph))
+        # # print(ref, test)
+        # # print("ref", ref, "test", test)
+        # print(ref)
+        # print("\n\n")
+        # print(test)
+
+        # self.assertExpected(canonical(func2.graph), subname='2')
 
     def test_cat(self):
         @torch.jit.script
