@@ -1323,8 +1323,9 @@ private:
         format += "t";
       }
     }
-    Node* n = emitNode(prim::Print, ident.range(), values, 0);
-    n->s_(attr::string, format);
+    (*graph).insertNode((*graph).create(prim::Print, values, 0)
+                     ->setSourceLocation(std::make_shared<SourceRange>(ident.range())))
+                     ->s_(attr::string, format);
     return std::make_shared<NoneValue>();
   }
 
@@ -1459,6 +1460,10 @@ private:
       return insertConstant(*graph, c.asFloatingPoint(), c.range());
     else
       return insertConstant(*graph, c.asIntegral(), c.range());
+  }
+
+  Value* emitStringLiteral(const StringLiteral& c) {
+    return createStringLiteral(*graph, c.range(), c.text());
   }
 
   // Desugars slice syntactic sugar tensor[begin:end] -> tensor.slice(begin,

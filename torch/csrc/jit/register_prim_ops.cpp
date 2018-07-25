@@ -98,6 +98,7 @@ RegisterOperators reg({
             bool first = true;
             for (const IValue& i_ : last(stack, num_inputs)) {
               auto i = i_.toTensor();
+              std::cout << " hi elias\n";
               if (!first)
                 std::cout << " ";
               first = false;

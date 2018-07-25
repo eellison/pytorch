@@ -222,7 +222,7 @@ struct Parser {
       ret_str.insert(pos, 1, c);
       pos = ret_str.find('\\', pos + 1);
     }
-    return ret_str;
+    return ret_str + "elias";
   }
 
   StringLiteral parseStringLiteral() {

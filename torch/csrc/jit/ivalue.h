@@ -146,6 +146,9 @@ struct IValue {
     JIT_ASSERT(isTensor());
     return at::Tensor(as_tensor_impl, /*retain=*/true);
   }
+  std::string formatTensor() {
+    return "tensor";
+  }
 
   // Tuple
   IValue(Shared<Tuple> v);
@@ -158,6 +161,9 @@ struct IValue {
     JIT_ASSERT(isTuple());
     return toRetainable<Tuple>();
   }
+  std::string formatTuple() {
+    return "tuple";
+  }
 
   // Double
   IValue(double d)
@@ -168,6 +174,9 @@ struct IValue {
   double toDouble() const {
     JIT_ASSERT(isDouble());
     return as_double;
+  }
+  std::string formatDouble() const {
+    return "double";
   }
 
   // Int
@@ -188,7 +197,9 @@ struct IValue {
     JIT_ASSERT(isInt());
     return as_int;
   }
-
+  std::string formatInt() {
+    return "int";
+  }
   // IntList
   IValue(Shared<IntList> v);
   IValue(std::vector<int64_t> v);
@@ -202,6 +213,9 @@ struct IValue {
   Shared<IntList> toIntList() const & {
     JIT_ASSERT(isIntList());
     return toRetainable<IntList>();
+  }
+  std::string formatIntList() {
+    return "int list";
   }
 
   std::vector<int64_t> copyToIntList() const;
@@ -218,9 +232,14 @@ struct IValue {
     JIT_ASSERT(isDoubleList());
     return toRetainable<DoubleList>();
   }
-
+  std::string formatDoubleList() {
+    return "double list";
+  }
   bool isNone() {
     return Tag::None == tag;
+  }
+  std::string formatNone() {
+    return "none";
   }
 
   // Scalar, which gets encoded as either an Int or a Double
@@ -244,6 +263,7 @@ struct IValue {
       throw std::runtime_error("IValue is not a Scalar");
   }
 
+
   // for debugging
   std::string tagKind() {
     switch(tag) {
@@ -251,6 +271,18 @@ struct IValue {
       TORCH_FORALL_TAGS(DEFINE_CASE)
       #undef DEFINE_CASE
     }
+    return "Invalid Tag";
+  }
+
+  // for debugging
+  std::string tagFormat() {
+    // switch(tag) {
+    //   #define METHOD_CALL(x) format ## x
+    //   #define DEFINE_FORMAT(x) case Tag::x: return METHOD_CALL(x);
+    //   TORCH_FORALL_TAGS(DEFINE_FORMAT)
+    //   #undef DEFINE_CASE
+    //   #undef METHOD_CALL
+    // }
     return "Invalid Tag";
   }
 
@@ -293,6 +325,7 @@ private:
     at::TensorImpl* as_tensor_impl;
     at::Retainable* as_retainable;
     double as_double;
+    std::string as_string;
     int64_t as_int;
     // this type should be as big as all the other types because it will
     // be used to copy the union's value in certain cases
