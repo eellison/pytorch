@@ -24,6 +24,9 @@ Value* insertConstant(
   } else if(val.isIntList()) {
     n->is_(attr::value, val.toIntList()->elements());
     n->output()->setType(ListType::ofInts());
+  } else if(val.isString()) {
+    n->s_(attr::string, val.toString()->string());
+    n->output()->setType(StringType::get());
   } else {
     throw std::runtime_error("Unsupported value kind: " + val.tagKind());
   }
@@ -64,6 +67,12 @@ RegisterOperators reg({
           auto is = node->is(attr::value);
           return [is](Stack& stack) {
             push(stack, is);
+            return 0;
+          };
+        } else if (type == StringType::get()) {
+          auto s = node->s(attr::string);
+          return [s](Stack& stack) {
+            push(stack, s);
             return 0;
           };
         } else {
