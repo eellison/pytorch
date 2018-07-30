@@ -82,16 +82,16 @@ struct ConstantString : at::Retainable {
  private:
   ConstantString(const std::string & str)
   : str_(str) {}
-  const std::string & str_;
+  const std::string str_;
  public:
   static Shared<ConstantString> create(const std::string & str_) {
     return Shared<ConstantString>(
         new ConstantString(str_), false);
   }
-  const char * string() const {
-    return str_.c_str();
+  const std::string& string() const {
+    return str_;
   }
-  operator const char * () const {
+  operator const std::string& () const {
     return string();
   }
   std::ostream& operator<<(std::ostream & out) const {
