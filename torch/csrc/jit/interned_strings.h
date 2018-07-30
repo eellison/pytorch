@@ -50,7 +50,6 @@ _(prim, TensorToNum) \
 _(prim, AutogradAdd) \
 _(prim, GradOf) \
 _(prim, AnyDefined) \
-_(prim, StringLiteral) \
 _(aten, __not__) \
 FORALL_ATEN_BASE_SYMBOLS(_) \
 _(onnx, Add) \
