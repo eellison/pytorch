@@ -46,8 +46,29 @@ struct PrintValue : public SugaredValue {
       auto& g = *m.graph();
       if (!attributes.empty())
         throw ErrorReport(loc) << "print doesn't accept any keyword arguments";
-      auto values = toValues(inputs);
-      g.insertNode(g.create(prim::Print, values, 0)
+
+      //temporary hack to allow print statements to work in python 2, where
+      //print(a, b) is treated as a (a, b) tuple input.
+
+      //logic from lower_tuples, here we are lowering tuples before they are
+      //inputs to the node
+      std::vector<Value*> lowered_inputs = toValues(inputs);
+      for(size_t i = 0; i < lowered_inputs.size();) {
+        auto input = lowered_inputs[i];
+        if(TupleTypePtr tt = input->type()->cast<TupleType>()) {
+          JIT_ASSERTM(input->node()->kind() == prim::TupleConstruct, "tuple use not matched to tuple construct");
+          for(size_t j = 0; j < tt->elements().size(); ++j) {
+            lowered_inputs.insert(lowered_inputs.begin() + i + 1 + j, input->node()->inputs().at(j));
+          }
+          lowered_inputs.erase(lowered_inputs.begin() + i);
+          // note: no update to i
+          // since tuples might be nested we need to recursively scan
+          // the new flattened inputs
+        } else {
+          ++i;
+        }
+      }
+      g.insertNode(g.create(prim::Print, lowered_inputs, 0)
                        ->setSourceLocation(std::make_shared<SourceRange>(loc)));
       return std::make_shared<NoneValue>();
   }
