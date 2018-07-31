@@ -46,7 +46,12 @@ std::unordered_set<Symbol> size_ops = {
   aten::zeros_like,
   aten::ones_like,
   aten::empty_like,
-  aten::full_like, //need to test this one
+  aten::expand_as,
+  aten::reshape_as,
+  aten::reshape,
+  aten::view_as,
+  aten::empty_like,
+  aten::full_like,
 };
 
 std::vector<IValue> runNode(Node* n) {
@@ -82,8 +87,11 @@ void handleSizeOps(Node *n) {
   WithInsertPoint guard(n);
   auto graph = n->owningGraph();
   for (size_t i = 0; i < n->inputs().size(); i++) {
-    //check if input is a prim::constant don't need to replace(and shoudnt)
-    //bc fill
+    //don't need to
+    if (n->inputs()[i]->node()->kind() == prim::Constant) {
+      continue;
+    }
+
     //already tested that all inputs are tensor types
     auto type = n->inputs()[i]->type()->cast<TensorType>();
 
@@ -92,7 +100,7 @@ void handleSizeOps(Node *n) {
     auto& attype = at::getType(backend, type->scalarType());
     auto zero = attype.tensor(type->sizes(), type->strides()).zero_();
 
-    //dce will remove constant
+    //dce will remove constant after use
     auto* constant = insertConstant(*graph, zero);
     n->replaceInput(i, constant);
   }
@@ -112,7 +120,7 @@ void ConstantPropagation(Node* n, bool recurse) {
     propagateNode(n);
   } else if (size_ops.count(n->kind()) &&
     std::all_of(n->inputs().begin(), n->inputs().end(), [&](Value* v) {
-      return v->type()->cast<TensorType>();
+      return v->node()->kind() == prim::Constant || v->type()->cast<TensorType>();
   })) {
     handleSizeOps(n);
   };
@@ -131,7 +139,7 @@ void ConstantPropagation(Block* block, bool recurse) {
 
 void ConstantPropagation(std::shared_ptr<Graph>& graph) {
   ConstantPropagation(graph->block(), true);
-  // EliminateDeadCode(graph);
+  EliminateDeadCode(graph);
 }
 
 }}

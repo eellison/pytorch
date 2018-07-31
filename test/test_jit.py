@@ -1588,54 +1588,39 @@ class TestScript(JitTestCase):
         self.assertEqual(y.grad, grad.sum(dim=0))
 
     def test_sum(self):
-        @torch.jit.script
-        def func(x):
-            a = torch.ones_like(x)
-            b = torch.ones_like(x)
-            return a + b
-
         # @torch.jit.script
-        # def func2(x):
-        #     a = x.size(0)
-        #     return x.view((a, -1))
-        #     # a = torch.ones_like(x)
+        # def func(x):
+        #     a = torch.ones_like(x)
         #     b = torch.ones_like(x)
         #     return a + b
-        #     a = x + 3
-        #     return torch.zeros_like(x)
+
+        @torch.jit.script
+        def func2(x):
+            a = x.size(0)
+            b = torch.ones([1])
+            c = 1
+            # if b < 2:
+                # d = 4
+            # else:
+                # d = 2
+            # c = torch.ones([1])
+            c = torch.full_like(x, c)
+            b = b.expand_as(x)
+            return x.view((a, -1)), b, c
 
         # print(str(func2.graph))
         # self.assertExpected(canonical(func.graph), subname='1')
-        # test that shape analysis is written correctly for sum with IntList[1] dim argument
-        print(str(func.graph))
-        x = torch.zeros(10, dtype=torch.long)
-        torch._C._jit_pass_shape_analysis(
-            func.graph, (torch.zeros(2, 3, 2, dtype=torch.long, device='cpu'),), False)
-        x = torch.zeros(1, 3, 2)
-        ref = func(x)
-        # print(str(func.graph))
-        torch._C._jit_pass_constant_propagation(func.graph)
-        test = func(x)
-        # print(str(func.graph))
-        torch._C._jit_pass_dce(func.graph)
-        print(str(func.graph))
-        # print(ref, test)
-        # print("ref", ref, "test", test)
-        print(ref)
-        print("\n\n")
-        print(test)
-
-
+        # # test that shape analysis is written correctly for sum with IntList[1] dim argument
         # print(str(func.graph))
         # x = torch.zeros(10, dtype=torch.long)
         # torch._C._jit_pass_shape_analysis(
-        #     func.graph, (torch.zeros(2, 3, 2, dtype=torch.long),), False)
-        # x = torch.zeros(1, 3, 2)
-        # ref = func2(x)
-        # print(str(func.graph))
+        #     func.graph, (torch.zeros(2, 3, 2, dtype=torch.float, device='cpu'),), False)
+        # x = torch.zeros(1, 3, 2, dtype=torch.float, device='cpu')
+        # ref = func(x)
+        # # print(str(func.graph))
         # torch._C._jit_pass_constant_propagation(func.graph)
         # test = func(x)
-        # print(str(func.graph))
+        # # print(str(func.graph))
         # torch._C._jit_pass_dce(func.graph)
         # print(str(func.graph))
         # # print(ref, test)
@@ -1643,6 +1628,27 @@ class TestScript(JitTestCase):
         # print(ref)
         # print("\n\n")
         # print(test)
+        # # return
+
+        print(str(func2.graph))
+        # self.assertExpected(canonical(func.graph), subname='1')
+        # test that shape analysis is written correctly for sum with IntList[1] dim argument
+        print(str(func2.graph))
+        x = torch.zeros(10, dtype=torch.long)
+        torch._C._jit_pass_shape_analysis(
+            func2.graph, (x,), False)
+        ref = func2(x)
+        # print(str(func.graph))
+        torch._C._jit_pass_constant_propagation(func2.graph)
+        torch._C._jit_pass_dce(func2.graph)
+        test = func2(x)
+        # print(str(func.graph))
+        print(str(func2.graph))
+        # print(ref, test)
+        # print("ref", ref, "test", test)
+        print(ref)
+        print("\n\n")
+        print(test)
 
         # self.assertExpected(canonical(func2.graph), subname='2')
 
