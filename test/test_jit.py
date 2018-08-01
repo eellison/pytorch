@@ -1186,6 +1186,28 @@ class TestJit(JitTestCase):
         self.run_pass('constant_propagation', constant_prop.graph)
         self.assertExpected(canonical(constant_prop.graph))
 
+    def test_constant_prop_size_ops(self):
+        @torch.jit.script
+        def constant_prop(x, y):
+            a = torch.ones_like(x)
+            a = a.view((x.size(0), -1))  # a value known
+            x = x.view((x.size(0), -1))  # x value not known
+
+            b = torch.full_like(x, 1)  # 2nd argument value known
+            c = torch.full_like(x, int(y))  # 2nd argument value not known
+
+            return a, b, c, x
+
+        x = torch.zeros(5, 2, dtype=torch.float)
+        y = torch.zeros(1, dtype=torch.float)
+        torch._C._jit_pass_shape_analysis(
+            constant_prop.graph, (x, y), False)
+        ref = constant_prop(x, y)
+        torch._C._jit_pass_constant_propagation(constant_prop.graph)
+        self.assertExpected(canonical(constant_prop.graph))
+        test = constant_prop(x, y)
+        self.assertEqual(ref, test)
+
     # TODO: implement
     @unittest.expectedFailure
     def test_constant_prop_loop_constant(self):

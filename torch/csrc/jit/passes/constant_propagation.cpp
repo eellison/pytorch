@@ -33,6 +33,22 @@ std::unordered_set<Symbol> skip_list = {
   aten::randperm_out,
  };
 
+#define SIZE_ONLY 0
+#define VALUE_NEEDED 1
+
+std::unordered_map<Symbol, std::vector<bool>> size_ops = {
+ //not including random size ops
+ {aten::size, {SIZE_ONLY, VALUE_NEEDED}},
+ {aten::sizes, {SIZE_ONLY}},
+ {aten::zeros_like, {SIZE_ONLY}},
+ {aten::ones_like, {SIZE_ONLY}},
+ {aten::empty_like, {SIZE_ONLY}},
+ {aten::expand_as, {VALUE_NEEDED, SIZE_ONLY}},
+ {aten::reshape_as, {VALUE_NEEDED, SIZE_ONLY}},
+ {aten::view_as, {VALUE_NEEDED, SIZE_ONLY}},
+ {aten::full_like, {SIZE_ONLY, VALUE_NEEDED}},
+};
+
 std::vector<IValue> runNode(Node* n) {
   auto op = getOperation(n);
   Stack stack;
@@ -59,6 +75,30 @@ void propagateNode(Node* n) {
     n->outputs()[i]->replaceAllUsesWith(new_output);
     // let dce elimination remove n
   }
+}
+
+void handleSizeOps(Node *n) {
+  WithInsertPoint guard(n);
+  auto graph = n->owningGraph();
+  for (size_t i = 0; i < n->inputs().size(); i++) {
+    //don't need to replace value that is already known
+    if (n->inputs()[i]->node()->kind() == prim::Constant) {
+      continue;
+    }
+
+    //already tested that all inputs are tensor types
+    auto type = n->inputs()[i]->type()->cast<TensorType>();
+
+    auto backend = type->device() == -1 ? at::kCPU : at::kCUDA;
+    at::DeviceGuard device_guard(type->device());
+    auto& attype = at::getType(backend, type->scalarType());
+    auto zero = attype.tensor(type->sizes(), type->strides()).zero_();
+
+    //dce will remove constant after use
+    auto* constant = insertConstant(*graph, zero);
+    n->replaceInput(i, constant);
+  }
+  propagateNode(n);
 }
 
 void lowerIf(Block *body, Node * n) {
@@ -161,12 +201,26 @@ bool ConstantPropagation(Node* n, bool recurse) {
     return constant_inputs || changed;
   } else if (constant_inputs && supported_node) {
     propagateNode(n);
-  }
+  } else if (size_ops.count(n->kind())) {
+    auto schema = size_ops[n->kind()];
+    bool runnable = true;
+    for (size_t i = 0; i < n->inputs().size() && runnable; i++) {
+      auto v = n->inputs()[i];
+      bool i_runnable = v->node()->kind() == prim::Constant ||
+        (v->type()->cast<TensorType>() && schema[i] == SIZE_ONLY);
+      runnable = runnable && i_runnable;
+    }
+    if (runnable)
+      handleSizeOps(n);
+  };
   //TODO handle loop nodes. Even if a loop node contains an if that is
   //inlined its mutated variables currently don't get updated
   run_blocks();
   return false;
 }
+
+#undef VALUE_NEEDED
+#undef SIZE_ONLY
 
 //returns true if the mutated variables in this block's node have changed
 bool ConstantPropagation(Block* block, bool recurse) {
