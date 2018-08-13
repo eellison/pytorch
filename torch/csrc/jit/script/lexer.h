@@ -23,66 +23,67 @@ namespace script {
 // Some kinds TK_APPLY, TK_LIST are only used in the AST and are not seen in the
 // lexer.
 
-#define TC_FORALL_TOKEN_KINDS(_)                 \
-  _(TK_EOF, "eof", "")                           \
-  _(TK_WHITESPACE, "whitespace", "")             \
-  _(TK_NUMBER, "number", "")                     \
-  _(TK_NEWLINE, "newline", "")                   \
-  _(TK_INDENT, "indent", "")                     \
-  _(TK_DEDENT, "dedent", "")                     \
-  _(TK_DEF, "def", "def")                        \
-  _(TK_EQUIVALENT, "equivalent", "<=>")          \
-  _(TK_IDENT, "ident", "")                       \
-  _(TK_STRING, "string", "")                     \
-  _(TK_STRINGLITERAL, "string_literal", "")      \
-  _(TK_CONST, "const", "")                       \
-  _(TK_LIST, "list", "")                         \
-  _(TK_OPTION, "option", "")                     \
-  _(TK_APPLY, "apply", "")                       \
-  _(TK_COMPREHENSION, "comprehension", "")       \
-  _(TK_TENSOR_TYPE, "tensor_type", "")           \
-  _(TK_RANGE_CONSTRAINT, "range_constraint", "") \
-  _(TK_PARAM, "param", "")                       \
-  _(TK_INFERRED, "inferred", "")                 \
-  _(TK_ACCESS, "access", "")                     \
-  _(TK_ASSIGN, "assign", "")                     \
-  _(TK_ATTRIBUTE, "attribute", "")               \
-  _(TK_IF, "if", "if")                           \
-  _(TK_ELSE, "else", "else")                     \
-  _(TK_ELIF, "elif", "elif")                     \
-  _(TK_WHILE, "while", "while")                  \
-  _(TK_EXPR_STMT, "expression statement", "")    \
-  _(TK_RETURN, "return", "return")               \
-  _(TK_NE, "ne", "!=")                           \
-  _(TK_EQ, "eq", "==")                           \
-  _(TK_LE, "le", "<=")                           \
-  _(TK_GE, "ge", ">=")                           \
-  _(TK_IF_EXPR, "if", "")                        \
-  _(TK_TRUE, "True", "True")                     \
-  _(TK_FALSE, "False", "False")                  \
-  _(TK_NONE, "None", "None")                     \
-  _(TK_AND, "and", "and")                        \
-  _(TK_OR, "or", "or")                           \
-  _(TK_NOT, "not", "not")                        \
-  _(TK_CAST, "cast", "")                         \
-  _(TK_PLUS_EQ, "+=", "+=")                      \
-  _(TK_MINUS_EQ, "-=", "-=")                     \
-  _(TK_TIMES_EQ, "*=", "*=")                     \
-  _(TK_DIV_EQ, "/=", "/=")                       \
-  _(TK_GLOBAL, "global", "global")               \
-  _(TK_BUILT_IN, "built-in", "")                 \
-  _(TK_SLICE, "slice", "")                       \
-  _(TK_VAR, "variable", "")                      \
-  _(TK_GATHER, "gather", "")                     \
-  _(TK_NOTHING, "nothing", "")                   \
-  _(TK_LIST_LITERAL, "list-literal", "")         \
-  _(TK_TUPLE_LITERAL, "tuple-literal", "")       \
-  _(TK_FOR, "for", "for")                        \
-  _(TK_IN, "in", "in")                           \
-  _(TK_STARRED, "starred", "")                   \
-  _(TK_UNARY_MINUS, "unary minus", "")           \
-  _(TK_POW, "pow operator", "**")                \
-  _(TK_ARROW, "arrow", "->")                     \
+#define TC_FORALL_TOKEN_KINDS(_)                   \
+  _(TK_EOF, "eof", "")                             \
+  _(TK_WHITESPACE, "whitespace", "")               \
+  _(TK_NUMBER, "number", "")                       \
+  _(TK_NEWLINE, "newline", "")                     \
+  _(TK_INDENT, "indent", "")                       \
+  _(TK_DEDENT, "dedent", "")                       \
+  _(TK_DEF, "def", "def")                          \
+  _(TK_EQUIVALENT, "equivalent", "<=>")            \
+  _(TK_IDENT, "ident", "")                         \
+  _(TK_STRING, "string", "")                       \
+  _(TK_STRINGLITERAL, "string_literal", "")        \
+  _(TK_RAWSTRINGLITERAL, "raw_string_literal", "") \
+  _(TK_CONST, "const", "")                         \
+  _(TK_LIST, "list", "")                           \
+  _(TK_OPTION, "option", "")                       \
+  _(TK_APPLY, "apply", "")                         \
+  _(TK_COMPREHENSION, "comprehension", "")         \
+  _(TK_TENSOR_TYPE, "tensor_type", "")             \
+  _(TK_RANGE_CONSTRAINT, "range_constraint", "")   \
+  _(TK_PARAM, "param", "")                         \
+  _(TK_INFERRED, "inferred", "")                   \
+  _(TK_ACCESS, "access", "")                       \
+  _(TK_ASSIGN, "assign", "")                       \
+  _(TK_ATTRIBUTE, "attribute", "")                 \
+  _(TK_IF, "if", "if")                             \
+  _(TK_ELSE, "else", "else")                       \
+  _(TK_ELIF, "elif", "elif")                       \
+  _(TK_WHILE, "while", "while")                    \
+  _(TK_EXPR_STMT, "expression statement", "")      \
+  _(TK_RETURN, "return", "return")                 \
+  _(TK_NE, "ne", "!=")                             \
+  _(TK_EQ, "eq", "==")                             \
+  _(TK_LE, "le", "<=")                             \
+  _(TK_GE, "ge", ">=")                             \
+  _(TK_IF_EXPR, "if", "")                          \
+  _(TK_TRUE, "True", "True")                       \
+  _(TK_FALSE, "False", "False")                    \
+  _(TK_NONE, "None", "None")                       \
+  _(TK_AND, "and", "and")                          \
+  _(TK_OR, "or", "or")                             \
+  _(TK_NOT, "not", "not")                          \
+  _(TK_CAST, "cast", "")                           \
+  _(TK_PLUS_EQ, "+=", "+=")                        \
+  _(TK_MINUS_EQ, "-=", "-=")                       \
+  _(TK_TIMES_EQ, "*=", "*=")                       \
+  _(TK_DIV_EQ, "/=", "/=")                         \
+  _(TK_GLOBAL, "global", "global")                 \
+  _(TK_BUILT_IN, "built-in", "")                   \
+  _(TK_SLICE, "slice", "")                         \
+  _(TK_VAR, "variable", "")                        \
+  _(TK_GATHER, "gather", "")                       \
+  _(TK_NOTHING, "nothing", "")                     \
+  _(TK_LIST_LITERAL, "list-literal", "")           \
+  _(TK_TUPLE_LITERAL, "tuple-literal", "")         \
+  _(TK_FOR, "for", "for")                          \
+  _(TK_IN, "in", "in")                             \
+  _(TK_STARRED, "starred", "")                     \
+  _(TK_UNARY_MINUS, "unary minus", "")             \
+  _(TK_POW, "pow operator", "**")                  \
+  _(TK_ARROW, "arrow", "->")                       \
 
 static const char* valid_single_char_tokens = "+-*/@()[]:,={}><.?";
 
@@ -224,6 +225,16 @@ struct SharedParserData {
     return end < str.size();
   }
 
+  // same lexing rules apply to raw strings as regular strings
+  bool isRawString(const std::string& str, size_t start, size_t* len) {
+    if (str[start] == 'r') {
+      auto is_string = isString(str, start + 1, len);
+      *len = *len + 1;
+      return is_string;
+    }
+    return false;
+  }
+
   bool isblank(int n) {
     return isspace(n) && n != '\n';
   }
@@ -286,6 +297,12 @@ struct SharedParserData {
       *kind = TK_STRINGLITERAL;
       return true;
     }
+    // raw string
+    if (isRawString(str, pos, len)) {
+      *kind = TK_RAWSTRINGLITERAL;
+      return true;
+    }
+
 
     // check for either an ident or a token
     // ident tracks whether what we have scanned so far could be an identifier

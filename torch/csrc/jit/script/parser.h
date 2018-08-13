@@ -75,8 +75,9 @@ struct Parser {
         auto list = parseList('[', ',', ']', &Parser::parseExp);
         prefix = ListLiteral::create(list.range(), List<Expr>(list));
       } break;
-      case TK_STRINGLITERAL: {
-        prefix = parseStringLiteral();
+      case TK_STRINGLITERAL:
+      case TK_RAWSTRINGLITERAL: {
+        prefix = parseStrings();
       } break;
       default: {
         Ident name = parseIdent();
@@ -232,11 +233,23 @@ struct Parser {
     return ret_str;
   }
 
-  StringLiteral parseStringLiteral() {
+  std::string parseRawString(const std::string &str) {
+    // starting from one because of the r prefix
+    int quote_len = isCharCount(str[1], str, 1, 3) ? 3 : 1;
+    // remove quotes and r prefix, starting from the first quote
+    return str.substr(quote_len + 1, str.size() - quote_len * 2 - 1);
+  }
+
+  StringLiteral parseStrings() {
     auto range = L.cur().range;
     std::stringstream ss;
-    while(L.cur().kind == TK_STRINGLITERAL)
-      ss << parseString(L.cur().range, L.next().text());
+    while(L.cur().kind == TK_STRINGLITERAL || L.cur().kind == TK_RAWSTRINGLITERAL) {
+      if (L.cur().kind == TK_STRINGLITERAL) {
+        ss << parseString(L.cur().range, L.next().text());
+      } else {
+        ss << parseRawString(L.next().text());
+      }
+    }
     return StringLiteral::create(range, ss.str());
   }
 

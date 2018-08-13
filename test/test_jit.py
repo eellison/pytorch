@@ -1894,7 +1894,7 @@ class TestScript(JitTestCase):
         cu = torch.jit.CompilationUnit('''
             def foo(a):
                 print(a, """a\\n\tb\\n""", 2, "a\
-a")
+a" r"\\\\")
                 return a
         ''')
         self.assertExpected(str(cu.foo.graph))
@@ -2389,7 +2389,7 @@ a")
 
     def test_string_print(self):
         def func(a):
-            print(a, "a" 'b' '''c''' """d""", 2, 1.5)
+            print(a, "a" 'b' '''c''' """d""" r"\\", 2, 1.5)
             return a
 
         inputs = self._make_scalar_vars([1], torch.int64)
