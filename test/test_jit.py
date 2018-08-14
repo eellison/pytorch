@@ -3580,11 +3580,20 @@ def func(t):
         with self.assertRaisesRegex(RuntimeError, "Type mismatch: c0 is set to type Tensor "
                                     "in the true branch and type int in the false branch:"):
             @torch.jit.script
-            def diff_type(x):
+            def tensor_scalar(x):
                 if False:
                     c0 = x
                 else:
                     c0 = 1
+                return c0
+        with self.assertRaisesRegex(RuntimeError, "Type mismatch: c0 is set to type int in "
+                                    "the true branch and type float in the false branch:"):
+            @torch.jit.script
+            def int_float(x):
+                if False:
+                    c0 = 1
+                else:
+                    c0 = 1.0
                 return c0
 
     def test_if_list(self):
@@ -3612,13 +3621,6 @@ def func(t):
             else:
                 x, y, z = x, x, y
 
-            #  set to scalar
-            if True:
-                c = 1.0
-            else:
-                c = 1
-
-            x = x.clamp(c, c)
             return x, y, z
 
         a = torch.zeros(2, 2, dtype=torch.float)

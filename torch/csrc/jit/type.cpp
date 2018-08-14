@@ -94,9 +94,9 @@ at::optional<TypePtr> unifyTypes(const TypePtr& t1, const TypePtr& t2) {
   }
 
   // cases in which two types share a supertype
-  if (t1->isSubtypeOf(NumberType::get()) && t2->isSubtypeOf(NumberType::get())) {
-    return static_cast<TypePtr>(NumberType::get());
-  } else if (t1->isSubtypeOf(DynamicType::get()) && t2->isSubtypeOf(DynamicType::get())) {
+  // currently floats & ints to not get unified as a Scalar because lack of
+  // ops supporting Scalars, but something to consider in the future
+  if (t1->isSubtypeOf(DynamicType::get()) && t2->isSubtypeOf(DynamicType::get())) {
     return static_cast<TypePtr>(DynamicType::get());;
   }
 
