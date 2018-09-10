@@ -1015,6 +1015,11 @@ public:
     }
     return n;
   }
+  Node* createTupleIndex(Value * tup, Value * index, const TypePtr& elem_type) {
+    auto n = create(prim::TupleIndex, {tup, index}, 0);
+    n->addOutput()->setType(elem_type);
+    return n;
+  }
   Node* createList(const TypePtr& elem_type, at::ArrayRef<Value*> values) {
     auto n = create(prim::ListConstruct, values);
     for(const auto & v : values) {

@@ -44,6 +44,7 @@ namespace torch { namespace jit {
   _(prim, Starred)                 \
   _(prim, TupleConstruct)          \
   _(prim, TupleUnpack)             \
+  _(prim, TupleIndex)              \
   _(prim, ListConstruct)           \
   _(prim, ListUnpack)              \
   _(prim, NumToTensor)             \

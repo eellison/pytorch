@@ -5,6 +5,8 @@
 
 namespace torch { namespace jit {
 
+namespace {
+
 // operators where we expect to find tuples as inputs/outputs
 // this is to assert we are only  doing modifications when we know
 // we can flatten tuples
@@ -17,6 +19,12 @@ std::unordered_set<Symbol> white_list = {
   prim::Return,
 };
 
+int64_t indexVal(Value * index) {
+  return (*toIValue(index->node()->output())).toInt();
+}
+
+
+} //anonymous namespace
 
 static void LowerAllTuples(Block* block);
 
@@ -40,6 +48,17 @@ static void VisitNode(Node* n, Node* insert_point) {
     }
     return;
   }
+
+  // make any TupleIndex dead by undoing TupleUnpack(TupleIndex)
+  if (n->kind() == prim::TupleIndex) {
+    auto construct = n->inputs().at(0)->node();
+    auto idx = indexVal(n->inputs().at(1));
+    JIT_ASSERTM(construct->kind() == prim::TupleConstruct, "tuple index not matched to tuple construct");
+    n->output()->replaceAllUsesWith(construct->inputs()[idx]);
+    return;
+  }
+
+
   // flatten the input list  op(a, tup, b) --> op(a, t0, t1, b)
   for(size_t i = 0; i < n->inputs().size();) {
     auto input = n->inputs()[i];
@@ -134,6 +153,11 @@ static void LowerSimpleTuples(Block* block) {
           n->outputs()[i]->replaceAllUsesWith(construct->inputs()[i]);
         }
       }
+    }
+    if (n->kind() == prim::TupleIndex) {
+      auto construct = n->inputs().at(0)->node();
+      auto idx = indexVal(n->inputs().at(1));
+      n->output()->replaceAllUsesWith(construct->inputs()[idx]);
     }
     for(auto b : n->blocks()) {
       LowerSimpleTuples(b);

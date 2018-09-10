@@ -1676,6 +1676,33 @@ private:
     return emitSlice(loc, sliceable, maybe_dim, slice_exp);
   }
 
+  // TypePtr getTupleIndexType(const SourceRange& loc, NamedValue tuple, NamedValue idx) {
+  //   auto idx_value = idx.value(*graph);
+  //   auto tuple = gatherable.value(*graph)->type()->cast<TupleType>();
+  //   if (idx_value->node()->kind() == prim::Constant) {
+  //     auto tensor_type = idx_value->type();
+  //     if (auto t = t.cast<CompleteTensorType>()) {
+  //       tensor_type = t.scalarType();
+  //     }  else if (auto t = t.cast<TensorType>()) {
+  //       tensor_type = t.scalarType():
+  //     }
+  //
+  //     if (idx_value->type()->cast<CompleteTensorType>())  idx_value->type()->cast<TensorType>()) {
+  //       value->scalarType()
+  //
+  //     }
+  //
+  //
+  //
+  //
+  //
+  //
+  //   }
+  //
+  //
+  //
+  // }
+
   // Desugars gather syntactic sugar foo[i]
   Value* emitBasicGather(
       const SourceRange& loc,
@@ -1691,12 +1718,24 @@ private:
       return emitBuiltinCall(
                  loc, *graph, aten::select, {gatherable, idx}, {}, true);
 
-    } else {
-      JIT_ASSERT(gatherable.value(*graph)->type()->isSubtypeOf(DynamicType::get()));
+    } if (gatherable.value(*graph)->type()->isSubtypeOf(DynamicType::get())) {
       return emitSelect(
           loc, gatherable.value(*graph), /*dim=*/0, idx.value(*graph));
+    } else if (auto tuple = gatherable.value(*graph)->type()->cast<TupleType>()) {
+      auto idx_value = idx.value(*graph);
+      auto index = (*toIValue(idx_value->node()->output())).toInt();
+      auto elem_type = tuple->elements().at(index);
+      auto const_val = graph->insertConstant(idx_value, idx.loc());
+      return graph->insertNode(graph->createTupleIndex(gatherable.value(*graph), const_val, elem_type))->output();
+    } else {
+      throw ErrorReport(loc)
+        << "Unsupported operation: attempted to use multidimensional "
+        << "indexing with unsupported index type.";
     }
   }
+
+
+
 };
 
 static const std::unordered_map<std::string, std::string> &builtin_cast_methods() {

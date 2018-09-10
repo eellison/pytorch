@@ -1493,18 +1493,56 @@ class TestJit(JitTestCase):
         self.run_pass('constant_propagation', constant_prop.graph)
         self.assertExpected(canonical(constant_prop.graph))
 
+    def test_tuple_indexing(self):
+        @torch.jit.script
+        def indexing(a):
+            if a:
+                b = (8, 1)
+            else:
+                b = (3, 2)
+
+            if a:
+                # c, d  = b
+                # print(c, d)
+                f = 1
+                print(b[f])
+            else:
+                f = 1
+                print(b[1])
+            # print(c)
+            # else:
+            #     b = (f, 2)
+            # c, d = b
+            # print(c)
+            # while d:
+            #     c = c + 1
+            # print(c, d)
+            # print(a)
+
+        # torch._C._jit_pass_lower_all_tuples(indexing.graph)
+        print(indexing.graph)
+        indexing(torch.zeros(1))
+
+
     def test_constant_prop_loop_constant(self):
         @torch.jit.script
-        def constant_prop():
+        def constant_prop(a):
             b = 0
+            c = 0
+            f = 0
+            if a:
+                f = 1
             while True:
-                b = 1
+                b = int(a)
+                if False:
+                    c = f
             while False:
                 b = 2
-            return b
+            return b, c
 
         self.run_pass('constant_propagation', constant_prop.graph)
-        self.assertExpected(canonical(constant_prop.graph))
+        print(constant_prop.graph)
+        # self.assertExpected(canonical(constant_prop.graph))
 
     def test_trace_detach(self):
         def foo(x, w):
