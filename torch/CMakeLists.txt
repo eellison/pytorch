@@ -147,6 +147,7 @@ set(TORCH_SRCS
   ${TORCH_SRC_DIR}/csrc/jit/interned_strings.cpp
   ${TORCH_SRC_DIR}/csrc/jit/interpreter.cpp
   ${TORCH_SRC_DIR}/csrc/jit/constants.cpp
+  ${TORCH_SRC_DIR}/csrc/jit/node_hashing.cpp
   ${TORCH_SRC_DIR}/csrc/jit/ir.cpp
   ${TORCH_SRC_DIR}/csrc/jit/operator.cpp
   ${TORCH_SRC_DIR}/csrc/jit/operator.cpp
@@ -154,6 +155,7 @@ set(TORCH_SRCS
   ${TORCH_SRC_DIR}/csrc/jit/passes/batch_mm.cpp
   ${TORCH_SRC_DIR}/csrc/jit/passes/canonicalize.cpp
   ${TORCH_SRC_DIR}/csrc/jit/passes/constant_propagation.cpp
+  ${TORCH_SRC_DIR}/csrc/jit/passes/constant_pooling.cpp
   ${TORCH_SRC_DIR}/csrc/jit/passes/common_subexpression_elimination.cpp
   ${TORCH_SRC_DIR}/csrc/jit/passes/create_autodiff_subgraphs.cpp
   ${TORCH_SRC_DIR}/csrc/jit/passes/inline_autodiff_subgraphs.cpp
