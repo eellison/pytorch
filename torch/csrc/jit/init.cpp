@@ -22,6 +22,7 @@
 #include "torch/csrc/jit/passes/shape_analysis.h"
 #include "torch/csrc/jit/passes/canonicalize_ops.h"
 #include "torch/csrc/jit/passes/constant_propagation.h"
+#include "torch/csrc/jit/passes/loop_invariant_code_motion.h"
 #include "torch/csrc/jit/passes/loop_unrolling.h"
 #include "torch/csrc/jit/passes/to_batch.h"
 #include "torch/csrc/jit/passes/lower_tuples.h"
@@ -105,6 +106,9 @@ void initJITBindings(PyObject *module) {
    .def("_jit_pass_loop_unrolling", UnrollLoops)
    .def("_jit_pass_constant_propagation", [](std::shared_ptr<Graph>& g) {
      return ConstantPropagation(g);
+   })
+   .def("_jit_pass_loop_invariant_code_motion", [](std::shared_ptr<Graph>& g) {
+     return LoopInvariantCodeMotion(g);
    })
    .def("_jit_pass_erase_shape_information", EraseShapeInformation)
    .def("_jit_pass_create_autodiff_subgraphs", [](Graph& graph) {

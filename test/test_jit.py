@@ -1725,18 +1725,20 @@ class TestJit(JitTestCase):
         self.run_pass('constant_propagation', constant_prop.graph)
         self.assertExpected(canonical(constant_prop.graph))
 
+
     def test_constant_prop_loop_constant(self):
         @torch.jit.script
         def constant_prop():
             b = 0
-            while True:
+            while b < 4:
                 b = 1
             while False:
                 b = 2
             return b
 
-        self.run_pass('constant_propagation', constant_prop.graph)
-        self.assertExpected(canonical(constant_prop.graph))
+        print(constant_prop.graph)
+        # self.run_pass('constant_propagation', constant_prop.graph)
+        # self.assertExpected(canonical(constant_prop.graph))
 
     def test_trace_detach(self):
         def foo(x, w):
@@ -3068,6 +3070,240 @@ a")
         y2 = torch.sum(x, dim=0)
         self.assertEqual(y, y2)
 
+    def test_loop_invariants(self):
+        def loop_counter_no_movement(x):
+            c = 4
+            for i in range(int(x)):
+                c = i * c
+            return c
+
+        def loop_counter_sunk_node(x):
+            c = 4
+            for i in range(int(x)):
+                c = i * i
+            return c
+
+        def python_op(x):
+            print('hi')
+            return x
+
+        def loop_condition_no_movement(x):
+            c = x
+            while int(python_op(x)) != 0:
+                x -= 1
+                c = x * 4
+            return c
+
+        @torch.jit.script
+        def test_loop_invariant(x, y):
+            c = x
+            d = x
+            e = x
+            f = x
+            for i in range(int(x)):
+                f = d * i   # sunk node
+                c = y * 10  # c is loop invariant
+                d = d * c   # must remain in loo
+                e = c * i   # sunk
+            return c, d, e, f
+
+        @torch.jit.script
+        def testing_lifted_loop(x, y, z):
+            # a = x
+            # for j in range(int(x)):
+            #     # z = z * j is only used if the lower loop does not execute
+            #     # testing it doesn't get sunk
+            #     z = z * j
+            #     for i in range(int(x)):
+            #         z = x
+            #         a = y * 5
+            #         z = z * i
+            while(0):
+                print('tehe')
+                x = y * z
+                # tehe
+            # print(a, z)
+
+        # self.run_pass('loop_invariant_code_motion', testing_lifted_loop.graph)
+        # m = torch.jit.ScriptModule()
+        # m._create_method_from_graph("forward", testing_lifted_loop.graph)
+        # print(m(torch.tensor(1), torch.tensor(1), torch.tensor(1)))
+
+        @torch.jit.script
+        def test_undefined_type_pooling(x, y, z):
+            a = 0
+            for i in range(4):
+                a = i * i
+                local_ten = x * i
+                print(local_ten)
+                y = local_ten * 5
+
+            b = 0
+            for i in range(3):
+                b = i * 5
+                local_ten = x * i
+                print(local_ten)
+                z = local_ten * 5
+
+            return a, b, y, z
+
+        self.run_pass('loop_invariant_code_motion', test_undefined_type_pooling.graph)
+        self.assertTrue(str(test_undefined_type_pooling.graph).count("Undefined") == 2)
+        print(test_undefined_type_pooling.graph)
+        return
+
+
+
+        print(testing_lifted_loop.graph)
+        return
+
+        def test_test(x):
+            b = 1
+            for i in range(4):
+                print(b)
+                b = 2
+
+        def test_test_test(x):
+            b = 1
+            for i in range(4):
+                b = 5
+            print(b)
+
+        def test_test_test_test(x):
+            b = x
+            for i in range(4):
+                for j in range(2):
+                    b = x * 10 * i
+                    print(b)
+            print(b)
+
+        def testing(x, y):
+            b = 3
+            a = 2
+            for i in range(4):
+                a = i * 5
+                b = a
+            print(a, b)
+
+        a = str(testing.graph)
+        print(testing.graph)
+        self.run_pass('loop_invariant_code_motion', testing.graph)
+                # m = torch.jit.ScriptModule()
+                # m._create_method_from_graph("forward", loop_condition_no_movement.graph)
+                # print(m(torch.tensor(1)))
+        print(a)
+        print(testing.graph)
+
+        return
+        # self.checkScript(capture_outputs = True)
+        # self.run_pass('loop_invariant_code_motion', loop_condition_no_movement.graph)
+        # print(loop_condition_no_movement.graph)
+
+        self.run_pass('loop_invariant_code_motion', test_test.graph)
+        print(test_test.graph)
+
+        self.run_pass('loop_invariant_code_motion', test_test_test.graph)
+        print(test_test_test.graph)
+
+        return
+        # loop_condition_no_movement
+        m = torch.jit.ScriptModule()
+        m._create_method_from_graph("forward", loop_condition_no_movement.graph)
+        print(m(torch.tensor(1)))
+        return
+
+    def test_invariant(self):
+        def test(c):
+            print("hi")
+            return c
+            # if c == :
+            #     return torch.tensor(0)
+            # else:
+            #     return torch.tensor(1)
+
+        @torch.jit.script
+        def hello(x):
+            a = x * 1
+            return x * 4
+
+        def hello_elias(x):
+            c = torch.zeros([1])
+            c -= 4
+            d = x
+            while int(test(c)):
+                a = torch.rand(1)
+                ab = 1
+                bc = 2
+                cd = ab + bc
+                de = cd + 3
+                print(a, cd, de)
+                c += 1
+                d = torch.rand(1)
+
+            alpha = hello(x)
+            print(alpha)
+            return c
+
+        # self.checkScript(hello_elias, torch.tensor([4]), optimize=True, capture_output=True)
+        # return
+
+        def test_multiple_invariants(x):
+            ab = 1
+            bc = 2
+            cd = 1
+            de = 2
+            for i in range(int(x)):
+                b = 4
+                print(b)
+                cd = i + 7
+                de = i + 8
+            print(cd, de)
+
+        # self.checkScript(test_multiple_invariants, torch.tensor([4]), optimize=True, capture_output=True)
+
+        def foo(y):
+            x = int(y)
+            b = 1
+            for i in range(x):
+                b = i * 10
+                b = b * 10
+                c = torch.randn(1)
+                print(c)
+            print(b)
+
+        self.checkScript(foo, torch.tensor([4]), optimize=True)
+        return
+
+
+    def test_invariant_loop(self):
+        def constant_prop(x):
+            b = 8
+            i = 2
+            c = x
+            f = 0
+            d = 0
+            for i in range(int(x)):
+                f = b * 4
+                b = 3
+                e = i * 10
+                print(e)
+                d = e * 5
+            print(c, d, f, i)
+            return b
+
+        self.checkScript(constant_prop, torch.tensor(4), optimize=True)
+
+        def test():
+            i = 0
+            b = 0
+            for i in range(5):
+                b = 2
+            return i, b
+
+        self.checkScript(constant_prop, (), optimize=True)
+
+
+
     def test_literal(self):
         def func1(a, b):
             c = a, b
@@ -3704,6 +3940,8 @@ a")
             somenum = 5
             dontmutateme = 3
             third = 0
+            # bug is that the output is being used by mutliple inputs and the
+            # second one is not being used
             while bool(i < lim):
                 third = first + second
                 first = second

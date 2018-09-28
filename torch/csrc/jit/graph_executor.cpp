@@ -12,6 +12,7 @@
 #include "torch/csrc/jit/passes/common_subexpression_elimination.h"
 #include "torch/csrc/jit/passes/create_autodiff_subgraphs.h"
 #include "torch/csrc/jit/passes/dead_code_elimination.h"
+#include "torch/csrc/jit/passes/loop_invariant_code_motion.h"
 #include "torch/csrc/jit/passes/erase_number_types.h"
 #include "torch/csrc/jit/passes/graph_fuser.h"
 #include "torch/csrc/jit/passes/inplace_check.h"
@@ -442,6 +443,7 @@ private:
   }
 
   void runOptimization(std::shared_ptr<Graph>& graph, const ArgumentSpec& spec) {
+    LoopInvariantCodeMotion(graph);
     EliminateDeadCode(graph);
     EliminateCommonSubexpression(graph);
     UnrollLoops(graph);
