@@ -6,6 +6,7 @@
 #include "torch/csrc/jit/constants.h"
 #include "torch/csrc/jit/assertions.h"
 #include "torch/csrc/jit/script/compiler.h"
+#include "torch/csrc/jit/constants.h"
 #include "torch/csrc/jit/passes/pretty_print.h"
 
 #include <iostream>
@@ -19,11 +20,29 @@
 
 namespace torch { namespace jit {
 
+namespace {
+
+//do not print constant nodes that are not tensors, and when they are used,
+//print their ivalue inline
+//tensors take up too much space and inlining the value makes the ir unreadable
+bool printableInline(const Node * n) {
+  return n->kind() == prim::Constant && !n->outputs().at(0)->type()->isSubtypeOf(DynamicType::get())
+    && !n->outputs().at(0)->type()->isSubtypeOf(ListType::ofTensors());
+}
+
+}
+
 // Sigh, see https://stackoverflow.com/questions/8016780/undefined-reference-to-static-constexpr-char
 constexpr Symbol PythonOp::Kind;
 
 void printValueRef(std::ostream & out, const Value * n) {
-  out << "%" << n->uniqueName();
+  if (printableInline(n->node())) {
+    auto ivalue = toIValue(n);
+    JIT_ASSERT(ivalue);
+    out << *ivalue;
+  } else {
+    out << "%" << n->uniqueName();
+  }
 }
 
 template <typename T>
@@ -153,7 +172,8 @@ std::ostream& operator<<(std::ostream & out, const Graph & g) {
       out << "  ---------------- stage " << n->stage() << " ----------------\n";
       prev_stage = n->stage();
     }
-    printNode(out, 1, n, &groups);
+    if (!printableInline(n))
+      printNode(out, 1, n, &groups);
   }
   out << "  return (" << g.outputs() << ");\n}\n";
   size_t i = 0;
