@@ -12,6 +12,7 @@
 #include "torch/csrc/jit/constants.h"
 #include "torch/csrc/jit/operator.h"
 #include "torch/csrc/variable_tensor_functions.h"
+#include "torch/csrc/jit/passes/constant_pooling.h"
 
 #include <exception>
 #include <iostream>
@@ -314,6 +315,7 @@ struct PreprocessGraph {
     desugarTripCounts(graph->block());
     stage_input_types = flattenStages(*graph);
     dropUnused(graph->block());
+    ConstantPooling(graph);
     // fill in move_flags by scanning blocks;
     move_flags = findLastUses(*graph);
     //TODO: desugar Loop trip counts, for now we drop trip counts
@@ -388,6 +390,7 @@ struct CodeImpl {
   CodeImpl(std::shared_ptr<Graph>& graph_)
       : preprocess(*graph_) {
     graph = preprocess.graph;
+    fillConstantsArray();
     insertNodesFromBlock(graph->block());
   }
 
@@ -497,6 +500,8 @@ struct CodeImpl {
           createJumpFalse(cond_branch, instructions.size());
           createJumpTrue(cond_branch_end, entry);
         } break;
+        //do not emit instructions for constant node
+        case prim::Constant: break;
         default: {
           insertInstruction(node);
         } break;
@@ -600,6 +605,21 @@ struct CodeImpl {
     return r;
   }
 
+  void fillConstantsArray() {
+    auto graph_block = graph->block();
+    for (Node * n: graph_block->nodes()) {
+      //in preprocessing all constants are moved to the beginning of the graph
+      if (n->kind() != prim::Constant)
+        break;
+
+      getOrAllocateRegister(n->output());
+      auto ivalue = toIValue(n->output());
+      JIT_ASSERT(ivalue);
+
+      constants.emplace_back(n->output(), *ivalue);
+    }
+  }
+
   const std::vector<GraphExecutor*>& grad_executors() {
     if (!grad_executors_) {
       grad_executors_.emplace();
@@ -660,6 +680,10 @@ struct CodeImpl {
   std::vector<size_t> stage_end; // each stage runs while(pc < stage_end[stage])
   int register_size = 0;
 
+  //we do not emit instructions for constant nodes. instead hold their values
+  //here and copy them into registers at the beginning of the function call
+  std::vector<std::pair<Value *, IValue>> constants;
+
   // all memory ArrayRef<int> are slices of this, to make sure
   // the interpreter is mostly linearly scanning through memory
   std::vector<int> int_data;
@@ -669,11 +693,22 @@ struct CodeImpl {
 // InterpreterState state that is held across stages and used to compute a Code
 struct InterpreterStateImpl {
   InterpreterStateImpl(const Code & code)
-  : function(code.pImpl),
-    int_data(function->int_data.data()),
-    bool_data(function->bool_data),
-    registers(function->register_size) {
+    : function(code.pImpl),
+      int_data(function->int_data.data()),
+      bool_data(function->bool_data),
+      registers(function->register_size) {
+    loadConstantsIntoRegisters();
   }
+
+  void loadConstantsIntoRegisters() {
+    for (auto constant: function->constants) {
+      Value * val = constant.first;
+      IValue ivalue = constant.second;
+      int reg = function->getOrAllocateRegister(val, true);
+      registers[reg] = ivalue;
+    }
+  }
+
   void runOneStage(Stack & stack) {
     // std::cout << "running stage: " << current_stage << " of " << function->stage_end.size() << "\n";
     // std::cout << *function->graph << "\n";
