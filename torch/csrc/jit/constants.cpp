@@ -63,7 +63,7 @@ RegisterOperators reg({
   // Implementation of constant node, computes and IValue
   Operator(
       prim::Constant,
-      [](Node* node) -> Operation {
+      [](const Node* node) -> Operation {
         TypePtr type = node->output()->type();
         if(type->isSubtypeOf(DynamicType::get())) {
           auto t = autograd::make_variable(node->t(attr::value));
@@ -127,7 +127,7 @@ RegisterOperators reg({
       }),
 });
 
-at::optional<IValue> toIValue(Value* v) {
+at::optional<IValue> toIValue(const Value* v) {
   if(v->node()->kind() != prim::Constant)
     return at::nullopt;
   // use implemenation of prim::Constant to compute the output IValue
