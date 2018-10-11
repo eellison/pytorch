@@ -12,6 +12,7 @@ namespace torch { namespace jit {
 
 namespace {
 
+//non deterministic ops handled in a separate condition
 std::unordered_set<Symbol> skip_list = {
   prim::If,
   prim::Loop, //TODO: handle Loop
@@ -19,14 +20,6 @@ std::unordered_set<Symbol> skip_list = {
   prim::PythonOp, //may have side effects
   prim::LoadWorld,
   prim::StoreWorld,
-  //all the rand functions from native_functions.yaml
-  aten::rand,
-  aten::rand_like,
-  aten::randint,
-  aten::randint_like,
-  aten::randn,
-  aten::randn_like,
-  aten::randperm,
   prim::Constant,
   prim::Undefined,
   prim::NoneGenerator,
@@ -72,6 +65,13 @@ void propagateNode(Node* n) {
   }
 }
 
+void removeLoopNode(Node * n) {
+  for (size_t i = 0; i < n->outputs().size(); ++i) {
+    n->outputs().at(i)->replaceAllUsesWith(n->inputs().at(i - 2));
+  }
+  n->destroy();
+}
+
 void inlineIf(Block *body, Node * n) {
   for(auto it = body->nodes().begin(); it != body->nodes().end();) {
     Node *body_node = *it;
@@ -93,12 +93,60 @@ bool isTrueConstant(Value *val) {
   return *maybe_value;
 }
 
+bool loopWillNotRun(Node* node) {
+  Value* trip_count = node->inputs().at(0);
+  int64_t iter_len = constant_as<int64_t>(trip_count).value_or(1);
+
+  Value* start_cond = node->inputs().at(1);
+  int64_t cond_val = constant_as<int64_t>(start_cond).value_or(1);
+
+  return (cond_val == 0 && iter_len <= 0);
+}
+
+
 void inlineIf(Node *n) {
   if (isTrueConstant(n->input())) {
     inlineIf(n->blocks()[0], n);
   } else {
     inlineIf(n->blocks()[1], n);
   }
+}
+
+//remove extra outputs from the node
+bool removeExtraLoopOutputs(Node *n) {
+  JIT_ASSERTM(n->kind() == prim::Loop, "Only supported for If nodes");
+  auto block = n->blocks()[0];
+  for (size_t i = 0; i < n->outputs().size(); ) {
+    if (block->outputs().at(i + 1) == n->inputs().at(i - 1)) {
+      block->inputs().at(i + 1)->replaceAllUsesWith(n->inputs().at(i - 1));
+
+      n->eraseOutput(i);
+      n->removeInput(i + 2);
+
+      block->eraseInput(i + 1);
+      block->eraseOutput(i + 1);
+    } else {
+      ++i;
+    }
+  }
+
+
+  auto true_block = n->blocks()[0];
+  auto false_block = n->blocks()[1];
+  auto initial_outputs = true_block->outputs().size();
+  for (size_t i = 0; i < true_block->outputs().size(); ) {
+    //neither block changes the output value
+    if (true_block->outputs()[i] == false_block->outputs()[i]) {
+      n->outputs().at(i)->replaceAllUsesWith(true_block->outputs()[i]);
+      n->eraseOutput(i);
+      true_block->eraseOutput(i);
+      false_block->eraseOutput(i);
+    } else {
+      i++; //increment bc we didn't remove current index
+    }
+  }
+  //an output was removed
+  return initial_outputs != true_block->outputs().size();
 }
 
 //remove extra outputs from the node
@@ -129,7 +177,8 @@ void ConstantPropagation(Node* n, bool recurse) {
       std::all_of(n->inputs().begin(), n->inputs().end(), [&](Value* v) {
         return v->node()->kind() == prim::Constant;
       });
-  bool supported_node = !n->kind().is_onnx() && skip_list.count(n->kind()) == 0;
+  bool supported_node = !n->kind().is_onnx() && !n->isNondeterministic() &&
+    skip_list.count(n->kind()) == 0;
   auto run_blocks = [&]() {
     if (recurse) {
       for (Block * block : n->blocks()) {
@@ -147,11 +196,18 @@ void ConstantPropagation(Node* n, bool recurse) {
     }
     //don't rerun run_blocks
     return;
+  } else if (n->kind() == prim::Loop) {
+    if (loopWillNotRun(n)) {
+      removeLoopNode(n);
+    } else {
+      run_blocks();
+      removeExtraLoopOutputs(n);
+    }
+    //don't rerun run_blocks
+    return;
   } else if (constant_inputs && supported_node) {
     propagateNode(n);
   }
-  //TODO handle loop nodes. Even if a loop node contains an if that is
-  //inlined its mutated variables currently don't get updated
   run_blocks();
 }
 
