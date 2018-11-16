@@ -551,10 +551,6 @@ Value* tryMatchArgument(
   value = tryConvertToType(loc, graph, concrete_type, value, convert_tensors_to_nums);
 
   if(!value->type()->isSubtypeOf(concrete_type)) {
-    if (concrete_type->str() == "int[]?" && arg.name() == "size") {
-      std::cout << "hi";
-    }
-
     err() << "expected a value of type " << concrete_type->str() << " for argument '" << arg.name() << "' but found "
           << value->type()->str() << "\n"
           << named_value.locOr(loc);
