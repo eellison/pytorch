@@ -482,6 +482,12 @@ Value* tryConvertToType(
     TypePtr concrete_type,
     Value* value,
     bool convert_tensors_to_nums) {
+
+  //if the target type is an optional, allow the same matching logic to apply
+  if (auto opt_concrete_type = concrete_type->cast<OptionalType>()) {
+    concrete_type = opt_concrete_type->getElementType();
+  }
+
   // Allow homogeneous tuples to be casted implicitly to lists of appropriate
   // types
   if (convertibleToList(value->type(), concrete_type) &&
@@ -545,6 +551,10 @@ Value* tryMatchArgument(
   value = tryConvertToType(loc, graph, concrete_type, value, convert_tensors_to_nums);
 
   if(!value->type()->isSubtypeOf(concrete_type)) {
+    if (concrete_type->str() == "int[]?" && arg.name() == "size") {
+      std::cout << "hi";
+    }
+
     err() << "expected a value of type " << concrete_type->str() << " for argument '" << arg.name() << "' but found "
           << value->type()->str() << "\n"
           << named_value.locOr(loc);
