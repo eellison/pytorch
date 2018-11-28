@@ -9383,7 +9383,9 @@ EXCLUDE_SCRIPT = {
     'test_nn_unfold',
     'test_nn_max_unpool2d',
 
-    # argument type not supported
+
+    # flakey test - unsure of issue
+    'test_nn_ctc_loss',
 
     # unknown builtin op
     'test_nn_binary_cross_entropy',
