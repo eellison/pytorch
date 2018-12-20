@@ -354,6 +354,10 @@ Value* emitBuiltinCall(
   // otherwise it will return nullptr if the builtin is not found.
   bool required) {
 
+  std::cout << name.toUnqualString();
+  if (name.toUnqualString() == "_unchecked_unwrap_optional") {
+    std::cout << "hi";
+  }
 
   const auto& variants = getAllOperatorsFor(name);
   const auto& builtin_functions = getAllBuiltinFunctionsFor(name);

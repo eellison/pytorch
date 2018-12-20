@@ -620,6 +620,13 @@ RegisterOperators reg({
           return 0;
         };
       }),
+    Operator("aten::_unchecked_unwrap_optional(t? optional) -> t",
+      [](const Node* node) -> Operation {
+        return [=](Stack& stack) {
+          AT_ERROR("Should not be run");
+          return 0;
+        };
+      }),
     Operator(
         prim::fork,
         [](const Node* node) {

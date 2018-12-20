@@ -884,7 +884,6 @@ public:
       c10::optional<SourceRange> loc = c10::nullopt,
       c10::optional<ScopePtr> scope = c10::nullopt);
 
-
   // schema-driven insert
   // this inserts a node into the graph with inputs determined from args and kwargs using Python
   // argument matching rules, and checks that the op matches a known schema
@@ -1103,6 +1102,7 @@ inline Node* Graph::createPythonOp(
 }
 
 TORCH_API void LintGraph(std::shared_ptr<Graph>& graph);
+TORCH_API inline const SourceRange& fakeRange();
 
 TORCH_API at::ArrayRef<Value*> createTupleUnpack(Value* v);
 // unpack_outputs - if true, and the callee returns a single tuple value, then insert a tuple unpack node

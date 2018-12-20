@@ -28,6 +28,19 @@ using ValueTable = std::unordered_map<std::string, SugaredValuePtr>;
 using AttributeMap = std::unordered_map<std::string, Const>;
 using ListAttributeMap = std::unordered_map<std::string, std::vector<Const>>;
 
+using Refinements = std::unordered_map<Value *, TypePtr>;
+struct BoolInfo {
+
+  BoolInfo(Refinements true_info, Refinements false_info):
+    true_info(true_info), false_info(false_info) {};
+
+  BoolInfo() {};
+
+  Refinements true_info;
+  Refinements false_info;
+};
+
+
 static Value* asSimple(const SugaredValuePtr& value) {
   if(SimpleValue* sv = dynamic_cast<SimpleValue*>(value.get())) {
     return sv->getValue();
@@ -86,6 +99,9 @@ struct Environment {
   std::unordered_map<std::string, std::string> error_messages;
   Block* b;
 
+  Refinements * type_refinements;
+  std::unordered_map<Value *, BoolInfo> bool_information;
+
   std::shared_ptr<Environment> next;
 
   // set type error in the lowest environment. if the variable is used after an
@@ -111,6 +127,90 @@ struct Environment {
       return c10::nullopt;
     }
   }
+
+  void setBoolInfo(Value * v, BoolInfo info) {
+    bool_information[v] = info;
+  }
+
+  void insertRefinements() {
+    if (type_refinements == nullptr)
+      return;
+    auto g = b->owningGraph();
+    WithInsertPoint guard(b);
+    for (auto value_type: *type_refinements) {
+      Value * v = value_type.first;
+      auto type = value_type.second;
+      auto loc = v->node()->getSourceLocation();
+      if (type != NoneType::get()) {
+        auto fake_range = fakeRange();
+        auto node =
+                 g->create(aten::_unchecked_unwrap_optional, {v}, 1)
+                  ->setSourceLocation(std::make_shared<SourceRange>(fake_range));
+        node->output()->setType(type);
+        g->insertNode(node);
+        setVar(fake_range, v->uniqueName(), node->output());
+      }
+    }
+    std::cout << "\nhere\n";
+    g->dump();
+  }
+
+  void setRefinements() {
+    if (!b->owningNode() || b->owningNode()->kind() != prim::If ||
+        !this->next)
+      return;
+
+    auto parent = this->next;
+    auto cond_value = b->owningNode()->input();
+    std::cout << " Cond value ";
+    cond_value->node()->dump();
+    std::cout << "\nParent values\n";
+    std::cout << "size " << parent->bool_information.size() << "\n";
+    for (auto v: parent->bool_information) {
+      v.first->node()->dump();
+      for (auto pair: v.second.true_info) {
+        pair.first->node()->dump();
+        std::cout << pair.second->str();
+      }
+      for (auto pair: v.second.false_info) {
+        pair.first->node()->dump();
+        std::cout << pair.second->str();
+      }
+    }
+    auto bool_info = parent->bool_information.find(cond_value);
+    if (bool_info != parent->bool_information.end()) {
+      JIT_ASSERT(b->owningNode())
+      auto is_true_block = b->owningNode()->blocks().at(0) == b;
+      if (is_true_block) {
+        type_refinements = &bool_info->second.false_info;
+      } else {
+        type_refinements = &bool_info->second.true_info;
+      }
+      insertRefinements();
+    }
+  }
+
+  //
+  c10::optional<TypePtr>findTypeInThisFrame(Value * v) {
+    if (!type_refinements)
+      return c10::nullopt;
+
+    auto it = type_refinements->find(v);
+    if (it != type_refinements->end()) {
+      return it->second;
+    }
+    return c10::nullopt;
+  }
+
+  c10::optional<TypePtr> findTypeInyFrame(Value * v) {
+    for (auto runner = this; runner; runner = runner->next.get()) {
+      if(auto r = runner->findTypeInThisFrame(v)) {
+        return r;
+      }
+    }
+    return c10::nullopt;
+  }
+
 
   SugaredValuePtr findInThisFrame(const std::string& name) {
     auto it = value_table.find(name);
@@ -402,6 +502,7 @@ private:
 
   void pushFrame(Block * b) {
     environment_stack = std::make_shared<Environment>(method, resolver, b, environment_stack);
+    environment_stack->setRefinements();
   }
   std::shared_ptr<Environment> popFrame() {
     auto old_frame = environment_stack;
@@ -707,7 +808,8 @@ private:
 
   std::shared_ptr<Environment> emitSingleIfBranch(
       Block* b,
-      const List<Stmt>& branch) {
+      const List<Stmt>& branch,
+      bool is_true_block) {
     pushFrame(b);
     WithInsertPoint guard(b);
     emitStatements(branch);
@@ -787,6 +889,33 @@ private:
     return expr_value;
   }
 
+
+  BoolInfo getConditionRefinements(Value * cond) {
+    JIT_ASSERT(cond->type() == BoolType::get());
+    std::unordered_map<Value *, TypePtr> refinements;
+    Refinements true_info, false_info;
+    std::cout << cond->node()->kind().toQualString();
+    if (cond->node()->kind() == aten::__is__ || cond->node()->kind() == aten::__isnot__) {
+      Value * input_val = cond->node()->inputs().at(0);
+      if (input_val->type()->cast<OptionalType>() &&
+          cond->node()->inputs().at(1)->mustBeNone()) {
+
+        true_info[input_val] = input_val->type()->expect<OptionalType>()->getElementType();
+        false_info[input_val] = NoneType::get();
+        if (cond->node()->kind() == aten::__isnot__) {
+          return BoolInfo(false_info, true_info);
+        }
+      }
+    }
+    return BoolInfo(true_info, false_info);
+  }
+
+
+  void emitCondTemp(Value * v) {
+    auto bool_info = getConditionRefinements(v);
+    environment_stack->setBoolInfo(v, bool_info);
+  }
+
   Value* emitCond(const Expr& cond) {
     Value* v = emitExpr(cond);
     if (!v->type()->isSubtypeOf(BoolType::get())) {
@@ -799,6 +928,8 @@ private:
       }
       throw error;
     }
+    auto bool_info = getConditionRefinements(v);
+    environment_stack->setBoolInfo(v, bool_info);
     return v;
   }
 
@@ -809,8 +940,8 @@ private:
     auto* false_block = n->addBlock();
 
     // Emit both blocks once to get the union of all mutated values
-    auto save_true = emitSingleIfBranch(true_block, stmt.trueBranch());
-    auto save_false = emitSingleIfBranch(false_block, stmt.falseBranch());
+    auto save_true = emitSingleIfBranch(true_block, stmt.trueBranch(), true);
+    auto save_false = emitSingleIfBranch(false_block, stmt.falseBranch(), false);
 
     // In python, every variable assigned in an if statement escapes
     // the scope of the if statement (all variables are scoped to the function).
@@ -855,6 +986,8 @@ private:
       auto tv = save_true->getVar(x, stmt.range());
       auto fv = save_false->getVar(x, stmt.range());
       auto unified = unifyTypes(tv->type(), fv->type());
+
+
 
       // attempt to unify the types. we allow variables to be set to different types
       // in each branch as long as that variable is not already in scope,
@@ -937,6 +1070,7 @@ private:
           {lhs_val->asValue(lhs_range, method), rhs_val->asValue(rhs_range, method)},
           {},
           /*required=*/true);
+      emitCondTemp(cond_value);
       emitIfElseBlocks(cond_value, stmt);
 
     }
