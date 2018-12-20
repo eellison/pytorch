@@ -3963,25 +3963,24 @@ a")
             ''')
 
     def test_optional_refinement(self):
-        with self.disableModuleHook():  # TODO:
-            code = """
-            def test(x):
-                # type: (Optional[int]) -> int
-                b = x is None and True
-                if b:
-                    x = 1
-                else:
-                    x = torch._unchecked_unwrap_optional(x)
-                return x
-                print(test.graph)
-            """
-            cu = torch.jit.CompilationUnit(code)
-            print(cu.graph)
-        # @torch.jit.script
-        # def test_2(x):
-        #     # type: (Optional[int]) -> int
-        #     x = 1 if x is None else x
-        #     return x
+        # with self.disableModuleHook():  # TODO:
+        #     code = """
+        #     def test(x):
+        #         # type: (Optional[int]) -> int
+        #         b = x is None and True
+        #         if b:
+        #             x = 1
+        #         else:
+        #             x = _unchecked_unwrap_optional(x)
+        #         return x
+        #     """
+        #     cu = torch.jit.CompilationUnit(code)
+        #     print(cu.test.graph)
+        @torch.jit.script
+        def test_2(x):
+            # type: (Optional[int]) -> int
+            x = 1 if x is None else 2
+            return x
             # @torch.jit.script
             # def test_2(x):
             #     # type: (Optional[int])
