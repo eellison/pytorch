@@ -249,6 +249,14 @@ struct TORCH_API IsInstanceValue : SugaredValue {
   }
 };
 
+// matched against for special handling of unchecked unwrap optional expressions
+struct TORCH_API UncheckedUnwrapOptional : SugaredValue {
+  UncheckedUnwrapOptional() = default;
+  std::string kind() const override {
+    return "unchecked_unwrapped_optiononal";
+  }
+};
+
 static inline std::vector<Value*> toValues(Graph& g, at::ArrayRef<NamedValue> nvs) {
   return fmap(nvs, [&](const NamedValue& v) {
     return v.value(g);

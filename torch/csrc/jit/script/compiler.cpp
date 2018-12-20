@@ -144,7 +144,7 @@ struct Environment {
       if (type != NoneType::get()) {
         auto fake_range = fakeRange();
         auto node =
-                 g->create(aten::_unchecked_unwrap_optional, {v}, 1)
+                 g->create(prim::_unchecked_unwrap_optional, {v}, 1)
                   ->setSourceLocation(std::make_shared<SourceRange>(fake_range));
         node->output()->setType(type);
         g->insertNode(node);
@@ -359,6 +359,7 @@ struct Environment {
         {"bool", std::make_shared<CastValue>(BoolType::get(), prim::Bool)},
         {"getattr", std::make_shared<GetAttrValue>()},
         {"isinstance", std::make_shared<IsInstanceValue>()},
+        {"_unchecked_unwrap_optional", std::make_shared<UncheckedUnwrapOptional>()},
         // todo(zach): remove when we can correctly export torch.full via ONNX
         // or we have implicit conversion that can convert numbers to tensors
         {"_to_tensor", std::make_shared<CastValue>(DynamicType::get(), prim::NumToTensor)},
@@ -1818,6 +1819,25 @@ private:
       checkApplyExpr(apply, loc);
       bool is_instance_val = isInstanceCheck(apply.inputs()[0], apply.inputs()[1]);
       return std::make_shared<SimpleValue>(graph->insertConstant(is_instance_val, loc));
+    } else if (auto isinstance = dynamic_cast<UncheckedUnwrapOptional*>(sv.get())) {
+      JIT_ASSERT(apply.inputs().size() == 1);
+      auto input = emitExpr(apply.inputs()[0]);
+      Value * output_val;
+      if (input->node()->kind() == prim::_unchecked_unwrap_optional) {
+        output_val = input;
+      } else {
+        // graph->insert(create(prim::_unchecked_unwrap_optional, {input}, 1));
+        auto node = graph->create(prim::_unchecked_unwrap_optional, {input}, 1);
+             // ->setSourceLocation(std::make_shared<SourceRange>(fakeRange());
+        graph->insertNode(node);
+        auto new_type = input->type()->expect<OptionalType>()->getElementType();
+        auto output_val = node->output();
+         node->output()->setType(new_type);
+        return std::make_shared<SimpleValue>(output_val);
+         // ->setSourceLocation(std::make_shared<SourceRange>(fake_range));
+         //  g->insertNode(node);
+      }
+      return std::make_shared<SimpleValue>(output_val);
     } else {
       auto inputs = getNamedValues(apply.inputs(), true);
       auto attributes = emitAttributes(apply.attributes());
