@@ -269,7 +269,10 @@ class JitTestCase(TestCase):
             sm = copy_structure_and_params(module)
             torch._C._jit_import_methods(sm, ppv, constant_table)
             pp2, _ = sm._python_print()
+            print(pp)
+            print(pp2)
             if pp != pp2:
+                import pdb; pdb.set_trace()
                 self.assertMultiLineEqual(pp, pp2)
 
     def getExportImportCopy(self, m, also_test_file=True, map_location=None):
@@ -3958,6 +3961,48 @@ a")
                     b = b + 1
                 return a + b
             ''')
+
+    def test_optional_refinement(self):
+        with self.disableModuleHook():  # TODO:
+            code = """
+            def test(x):
+                # type: (Optional[int]) -> int
+                b = x is None and True
+                if b:
+                    x = 1
+                else:
+                    x = torch._unchecked_unwrap_optional(x)
+                return x
+                print(test.graph)
+            """
+            cu = torch.jit.CompilationUnit(code)
+            print(cu.graph)
+        # @torch.jit.script
+        # def test_2(x):
+        #     # type: (Optional[int]) -> int
+        #     x = 1 if x is None else x
+        #     return x
+            # @torch.jit.script
+            # def test_2(x):
+            #     # type: (Optional[int])
+            #     if x is None:
+            #         print(x)
+            #     else:
+            #         print(x + 1)
+            #     # return x
+            # @torch.jit.script
+            # def test_2(x):
+            #     # type: (Optional[int])
+            #     if x is not None:
+            #         print(x + 1)
+
+        # @torch.jit.script
+        # def test_2(x):
+        #     # type: (Optional[Tensor])
+        #     if x is not None and len(x) < 2:
+        #         print(x)
+        # print(test_2.graph)
+
 
     def test_while_write_outer_then_read(self):
         def func(a, b):
