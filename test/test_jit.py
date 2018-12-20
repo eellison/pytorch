@@ -5572,6 +5572,30 @@ a")
             with self.assertRaisesRegex(RuntimeError, "modified"):
                 output2.sum().backward()
 
+    def test_module_error_msg(self):
+        class Sub(torch.jit.ScriptModule):
+            def __init__(self):
+                super(Sub, self).__init__(False)
+
+            @torch.jit.script_method
+            def forward(self, thing):
+                return thing
+
+        class M(torch.jit.ScriptModule):
+            # __constants__ = ['mods'] # not added
+
+            def __init__(self):
+                super(M, self).__init__(False)
+                self.mods = nn.ModuleList([Sub() for i in range(10)])
+
+            @torch.jit.script_method
+            def forward(self, v):
+                for i in self.mods:
+                    v = i(v)
+                return v
+        with self.assertRaisesRegex(RuntimeError, "ModuleLists must be declared in __constants__"):
+            M()
+
     def test_type_annotations(self):
         def fn(x, y):
             # type: (Tensor, Tensor) -> Tuple[Tensor, Tensor, Tensor]

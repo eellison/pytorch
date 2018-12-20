@@ -136,6 +136,19 @@ struct VISIBILITY_HIDDEN PythonValue : public SugaredValue {
     return ss.str();
   }
 
+  std::vector<std::shared_ptr<SugaredValue>> asTuple(
+      const SourceRange& loc,
+      Method& m,
+      const c10::optional<size_t>& size_hint) override {
+    auto kind_str = kind();
+    auto err = ErrorReport(loc);
+    err << kind() << " cannot be used as a tuple";
+    if (typeString(self) == "ModuleList") {
+      err << "\nModuleLists must be declared in __constants__";
+    }
+    throw err;
+  }
+
 protected:
 
   py::object getattr(const SourceRange& loc, const std::string& name) {
