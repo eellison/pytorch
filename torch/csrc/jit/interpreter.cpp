@@ -476,7 +476,9 @@ struct CodeImpl {
           createJumpFalse(cond_branch, instructions.size());
           createJumpTrue(cond_branch_end, entry);
         } break;
-        // case prim::_unchecked_unwrap_optional:
+        // case prim::_unchecked_unwrap_optional: {
+        //   node->output()->replaceAllUsesWith(node->input());
+        // }
         default: {
           insertInstruction(node);
         } break;

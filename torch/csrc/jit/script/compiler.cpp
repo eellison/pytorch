@@ -95,7 +95,7 @@ struct Environment {
   std::unordered_map<std::string, std::string> error_messages;
   Block* b;
 
-  Refinements * type_refinements;
+  Refinements * active_refinements;
   std::unordered_map<Value *, BoolInfo> bool_information;
 
   std::shared_ptr<Environment> next;
@@ -130,19 +130,21 @@ struct Environment {
   }
 
   c10::optional<BoolInfo> getBoolInfo(Value * v) {
-    auto info = bool_information.find(v);
-    if (info != bool_information.end()) {
-      return info->second;
+    for (auto runner = this; runner; runner = runner->next.get()) {
+      auto info = runner->bool_information.find(v);
+      if (info != runner->bool_information.end()) {
+        return info->second;
+      }
     }
     return c10::nullopt;
   }
 
   void insertRefinements() {
-    if (type_refinements == nullptr)
+    if (active_refinements == nullptr)
       return;
     auto g = b->owningGraph();
     WithInsertPoint guard(b);
-    for (auto value_type: *type_refinements) {
+    for (auto value_type: *active_refinements) {
       Value * v = value_type.first;
       auto type = value_type.second;
       if (type != NoneType::get()) {
@@ -159,13 +161,14 @@ struct Environment {
 
     auto parent = this->next;
     auto cond_value = b->owningNode()->input();
-    auto bool_info = parent->bool_information.find(cond_value);
-    if (bool_info != parent->bool_information.end()) {
+    auto maybe_bool_info = getBoolInfo(cond_value);
+    if (maybe_bool_info) {
+      auto bool_info = *maybe_bool_info;
       auto is_true_block = b->owningNode()->blocks().at(0) == b;
       if (is_true_block) {
-        type_refinements = &bool_info->second.true_info;
+        active_refinements = &maybe_bool_info->true_info;
       } else {
-        type_refinements = &bool_info->second.false_info;
+        active_refinements = &maybe_bool_info->false_info;
       }
       insertRefinements();
     }
@@ -253,12 +256,6 @@ struct Environment {
 
   void setSugaredVar(const SourceRange& loc, const std::string& name, SugaredValuePtr value) {
     Value* as_simple_value = asSimple(value);
-    auto find = value_table.find(name);
-    auto a = find != value_table.end();
-
-    if (as_simple_value && a && asSimple(find->second) == as_simple_value) {
-      return;
-    }
 
     if (as_simple_value && !as_simple_value->hasUniqueName() &&
         meaningfulName(name) &&
@@ -820,7 +817,6 @@ private:
     return BoolInfo(true_info, false_info);
   }
 
-
   Refinements intersectRefinements(Refinements a, Refinements b) {
     Refinements ret;
     for (auto& value_type: a) {
@@ -870,7 +866,7 @@ private:
       const TreeRef & second_expr,
       bool is_or) {
     Value * first_value = emitCond(Expr(first_expr));
-    BoolInfo b_1 = getConditionRefinements(first_value);
+    BoolInfo b_1 = getConditionBoolInfo(first_value);
     BoolInfo b_2;
 
     auto get_first_expr = [first_value] {
@@ -878,7 +874,7 @@ private:
     };
     auto get_second_expr = [&] {
       auto v = emitCond(Expr(second_expr));
-      b_2 = getConditionRefinements(v);
+      b_2 = getConditionBoolInfo(v);
       return v;
     };
 
@@ -930,7 +926,7 @@ private:
     return expr_value;
   }
 
-  BoolInfo getConditionRefinements(Value * cond) {
+  BoolInfo getConditionBoolInfo(Value * cond) {
     JIT_ASSERT(cond->type() == BoolType::get());
     if (auto maybe_found = environment_stack->getBoolInfo(cond)) {
       return *maybe_found;
@@ -951,10 +947,9 @@ private:
     return BoolInfo(true_info, false_info);
   }
 
-
-  void emitCondTemp(Value * v) {
+  void setConditionBoolInfo(Value *v) {
     if (!environment_stack->getBoolInfo(v)) {
-      auto bool_info = getConditionRefinements(v);
+      auto bool_info = getConditionBoolInfo(v);
       environment_stack->setBoolInfo(v, bool_info);
     }
   }
@@ -971,8 +966,7 @@ private:
       }
       throw error;
     }
-    auto bool_info = getConditionRefinements(v);
-    environment_stack->setBoolInfo(v, bool_info);
+    setConditionBoolInfo(v);
     return v;
   }
 
@@ -982,10 +976,10 @@ private:
 
     bool set_in_false = false_set.count(x) != 0;
     bool set_in_true = true_set.count(x) != 0;
-    bool tv_unwrap = true_v->node()->kind() == prim::_unchecked_unwrap_optional;
-    bool fv_unwrap = false_v->node()->kind() == prim::_unchecked_unwrap_optional;
+    bool tv_not_unwrap = true_v->node()->kind() != prim::_unchecked_unwrap_optional;
+    bool fv_not_unwrap = false_v->node()->kind() != prim::_unchecked_unwrap_optional;
 
-    return !((set_in_false && !fv_unwrap) || (set_in_true && !tv_unwrap));
+    return !((set_in_false && tv_not_unwrap) || (set_in_true && fv_not_unwrap));
   }
 
   void emitIfElseBlocks(Value* cond_value, const If& stmt) {
@@ -1132,7 +1126,7 @@ private:
           {lhs_val->asValue(lhs_range, method), rhs_val->asValue(rhs_range, method)},
           {},
           /*required=*/true);
-      emitCondTemp(cond_value);
+      setConditionBoolInfo(cond_value);
       emitIfElseBlocks(cond_value, stmt);
 
     }
@@ -1883,12 +1877,20 @@ private:
     } else if (auto isinstance = dynamic_cast<UncheckedUnwrapOptional*>(sv.get())) {
       JIT_ASSERT(apply.inputs().size() == 1);
       auto input = emitExpr(apply.inputs()[0]);
+
+      // When a graph is exported and reimported, the implicitly inserted unchecked
+      // optionals will exist when inserting the ones from the previous compilation
+      // here, special case so that we don't emit chains of unchecked optionals
+      Value * output_val;
       if (input->node()->kind() == prim::_unchecked_unwrap_optional) {
         Value * prev_input = input->node()->input();
-        prev_input->setUniqueName(prev_input->uniqueNameBase());
+        prev_input->setUniqueName(prev_input->uniqueNameBase()); //reset name to prevent jittering
         input = prev_input;
+        output_val = graph->insert(prim::_unchecked_unwrap_optional, {input});
+        prev_input->replaceAllUsesWith(output_val);
+      } else {
+        output_val = graph->insert(prim::_unchecked_unwrap_optional, {input});
       }
-      Value * output_val = graph->insert(prim::_unchecked_unwrap_optional, {input});
       return std::make_shared<SimpleValue>(output_val);
     } else {
       auto inputs = getNamedValues(apply.inputs(), true);
