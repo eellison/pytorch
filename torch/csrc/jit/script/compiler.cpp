@@ -10,8 +10,8 @@
 #include <torch/csrc/utils/object_ptr.h>
 #include <torch/csrc/jit/operator.h>
 #include <torch/csrc/jit/hooks_for_testing.h>
-
 #include <torch/csrc/jit/constants.h>
+#include <torch/csrc/jit/passes/canonicalize.h>
 
 #include <c10/util/Optional.h>
 
@@ -39,6 +39,22 @@ struct BoolInfo {
   Refinements true_info;
   Refinements false_info;
 };
+
+void printRefinement(const Refinements& r) {
+  for (auto pair: r) {
+    std::cout << "\tName: " << pair.first->uniqueName() << " :: ";
+    std::cout << pair.second->str() << "\n";
+  }
+
+}
+
+void printBoolInfo(const BoolInfo& b) {
+  std::cout << "Bool Info\n";
+  std::cout << "True Info\n";
+  printRefinement(b.true_info);
+  std::cout << "False Info\n";
+  printRefinement(b.false_info);
+}
 
 
 static Value* asSimple(const SugaredValuePtr& value) {
@@ -114,6 +130,7 @@ struct Environment {
     runner->error_messages[name] = msg;
   }
 
+
   // see if type error has been set for a variable
   c10::optional<std::string> findVariableTypeError(const std::string& name) {
     auto runner = this;
@@ -132,6 +149,14 @@ struct Environment {
     bool_information[v] = info;
   }
 
+  c10::optional<BoolInfo> getBoolInfo(Value * v) {
+    auto info = bool_information.find(v);
+    if (info != bool_information.end()) {
+      return info->second;
+    }
+    return c10::nullopt;
+  }
+
   void insertRefinements() {
     if (type_refinements == nullptr)
       return;
@@ -140,7 +165,6 @@ struct Environment {
     for (auto value_type: *type_refinements) {
       Value * v = value_type.first;
       auto type = value_type.second;
-      auto loc = v->node()->getSourceLocation();
       if (type != NoneType::get()) {
         auto fake_range = fakeRange();
         auto node =
@@ -148,67 +172,27 @@ struct Environment {
                   ->setSourceLocation(std::make_shared<SourceRange>(fake_range));
         node->output()->setType(type);
         g->insertNode(node);
-        setVar(fake_range, v->uniqueName(), node->output());
+        setVar(fake_range, v->uniqueNameBase(), node->output());
       }
     }
-    std::cout << "\nhere\n";
-    g->dump();
   }
 
   void setRefinements() {
-    if (!b->owningNode() || b->owningNode()->kind() != prim::If ||
-        !this->next)
+    if (getBlockOwningKind() != prim::If)
       return;
 
     auto parent = this->next;
     auto cond_value = b->owningNode()->input();
-    std::cout << " Cond value ";
-    cond_value->node()->dump();
-    std::cout << "\nParent values\n";
-    std::cout << "size " << parent->bool_information.size() << "\n";
-    for (auto v: parent->bool_information) {
-      v.first->node()->dump();
-      for (auto pair: v.second.true_info) {
-        pair.first->node()->dump();
-        std::cout << pair.second->str();
-      }
-      for (auto pair: v.second.false_info) {
-        pair.first->node()->dump();
-        std::cout << pair.second->str();
-      }
-    }
     auto bool_info = parent->bool_information.find(cond_value);
     if (bool_info != parent->bool_information.end()) {
-      JIT_ASSERT(b->owningNode())
       auto is_true_block = b->owningNode()->blocks().at(0) == b;
       if (is_true_block) {
-        type_refinements = &bool_info->second.false_info;
-      } else {
         type_refinements = &bool_info->second.true_info;
+      } else {
+        type_refinements = &bool_info->second.false_info;
       }
       insertRefinements();
     }
-  }
-
-  //
-  c10::optional<TypePtr>findTypeInThisFrame(Value * v) {
-    if (!type_refinements)
-      return c10::nullopt;
-
-    auto it = type_refinements->find(v);
-    if (it != type_refinements->end()) {
-      return it->second;
-    }
-    return c10::nullopt;
-  }
-
-  c10::optional<TypePtr> findTypeInyFrame(Value * v) {
-    for (auto runner = this; runner; runner = runner->next.get()) {
-      if(auto r = runner->findTypeInThisFrame(v)) {
-        return r;
-      }
-    }
-    return c10::nullopt;
   }
 
 
@@ -293,6 +277,13 @@ struct Environment {
 
   void setSugaredVar(const SourceRange& loc, const std::string& name, SugaredValuePtr value) {
     Value* as_simple_value = asSimple(value);
+    auto find = value_table.find(name);
+    auto a = find != value_table.end();
+
+    if (as_simple_value && a && asSimple(find->second) == as_simple_value) {
+      return;
+    }
+
     if (as_simple_value && !as_simple_value->hasUniqueName() &&
         meaningfulName(name) &&
         // note: if the value wasn't defined in this block, we might be giving a name
@@ -488,6 +479,14 @@ struct to_ir {
 
     method.setSchema(emitDef(def, self, graph->block()));
     runCleanupPasses(graph);
+    // std::cout << "\n\n return graph \n";
+    // std::stringstream test;
+    // test << *graph;
+    // auto s = test.str();
+    // if (s.find("la_1.1") != std::string::npos) {
+    //   std::cout << "i'm here";
+    // }
+    // graph->dump();
   }
 
 private:
@@ -515,6 +514,7 @@ private:
     // remove any uses of tuples that we inserted that are not needed
     LowerSimpleTuples(to_clean);
     ConstantPooling(to_clean);
+    // to_clean = Canonicalize(to_clean);
   }
 
   FunctionSchema emitDef(const Def& def, const SugaredValuePtr& self, Block* block) {
@@ -533,6 +533,7 @@ private:
     emitStatements(stmts_begin, stmts_end);
     const SourceRange& range = return_stmt ? return_stmt->range() : def.range();
     std::vector<Argument> returns = {emitReturn(range, return_stmt, schema, block)};
+
     return {def.name().name(), std::move(arguments), std::move(returns)};
   }
 
@@ -834,26 +835,105 @@ private:
     return emitIfExpr(expr.range(), cond_value, true_expr, false_expr);
   }
 
+  BoolInfo mergeAnd(BoolInfo a, BoolInfo b) {
+    // if the result of an AND is true, both a & b had to be true,
+    // so we take the union of a.true_info and b.true_info.
+    // if the result is false, either a or b could have been false,
+    // so we take their intersection.
+    auto true_info = unionRefinements(a.true_info, b.true_info);
+    auto false_info = unionRefinements(a.false_info, b.false_info);
+    return BoolInfo(true_info, false_info);
+  }
+
+  BoolInfo mergeOr(BoolInfo a, BoolInfo b) {
+    // if the result of an OR is true, either a & b could have been true,
+    // so we take the intersection of a.true_info & b.true_info.
+    // if the result is false, both a or b had to be false,
+    // so we take their union.
+    auto true_info = intersectRefinements(a.true_info, b.true_info);
+    auto false_info = unionRefinements(a.false_info, b.false_info);
+    return BoolInfo(true_info, false_info);
+  }
+
+  Refinements intersectRefinements(Refinements a, Refinements b) {
+    Refinements ret;
+    for (auto& value_type: a) {
+      Value * v_1 = value_type.first;
+      TypePtr t_1 = value_type.second;
+      auto maybe_t_2 = b.find(v_1);
+      if (maybe_t_2 != b.end()) {
+        TypePtr t_2 = maybe_t_2->second;
+        auto maybe_unified_type = unifyTypes(t_1, t_2);
+        if (maybe_unified_type)
+          ret[v_1] = *maybe_unified_type;
+      }
+    }
+    return ret;
+  }
+
+  Refinements unionRefinements(Refinements a, Refinements b) {
+    Refinements ret;
+    for (auto& value_type: a) {
+      Value * v_1 = value_type.first;
+      TypePtr t_1 = value_type.second;
+      auto maybe_t_2 = b.find(v_1);
+      if (maybe_t_2 != b.end()) {
+        TypePtr t_2 = maybe_t_2->second;
+        auto maybe_unified_type = unifyTypes(t_1, t_2);
+        if (maybe_unified_type)
+          ret[v_1] = *maybe_unified_type;
+      } else {
+        ret[v_1] = t_1;
+      }
+    }
+
+    for (auto& value_type: b) {
+      Value * v_1 = value_type.first;
+      TypePtr t_1 = value_type.second;
+      if (a.count(v_1) == 0) {
+        ret[v_1] = t_1;
+      }
+    }
+
+    return ret;
+  }
+
   Value* emitShortCircuitIf(
       const SourceRange& loc,
       const TreeRef & first_expr,
       const TreeRef & second_expr,
       bool is_or) {
     Value * first_value = emitCond(Expr(first_expr));
+    auto b_1 = getConditionRefinements(first_value);
+    BoolInfo b_2;
 
     auto get_first_expr = [first_value] {
       return first_value;
     };
     auto get_second_expr = [&] {
-      return emitCond(Expr(second_expr));
+      auto v = emitCond(Expr(second_expr));
+      b_2 = getConditionRefinements(v);
+      return v;
     };
 
     // if this is an OR, eval second expression if first expr is False.
     // If this is an AND, eval second expression if first expr is True
     if (is_or) {
-      return emitIfExpr(loc, first_value, get_first_expr, get_second_expr);
+      auto v = emitIfExpr(loc, first_value, get_first_expr, get_second_expr);
+      std::cout << "B1\n";
+      printBoolInfo(b_1);
+      std::cout << "B2\n";
+      printBoolInfo(b_2);
+      std::cout << "OR Result\n";
+      auto bool_info = mergeOr(b_1, b_2);
+      printBoolInfo(bool_info);
+      environment_stack->setBoolInfo(v, bool_info);
+      return v;
     } else {
-      return emitIfExpr(loc, first_value, get_second_expr, get_first_expr);
+      auto v = emitIfExpr(loc, first_value, get_second_expr, get_first_expr);
+      auto bool_info = mergeAnd(b_1, b_2);
+      environment_stack->setBoolInfo(v, bool_info);
+      return v;
     }
   }
 
@@ -890,31 +970,40 @@ private:
     return expr_value;
   }
 
-
   BoolInfo getConditionRefinements(Value * cond) {
     JIT_ASSERT(cond->type() == BoolType::get());
-    std::unordered_map<Value *, TypePtr> refinements;
+    if (auto maybe_found = environment_stack->getBoolInfo(cond)) {
+      return *maybe_found;
+    }
     Refinements true_info, false_info;
-    std::cout << cond->node()->kind().toQualString();
+    std::cout << "Emitting bool info for ";
+    cond->node()->dump();
+    std::cout << "\n";
     if (cond->node()->kind() == aten::__is__ || cond->node()->kind() == aten::__isnot__) {
       Value * input_val = cond->node()->inputs().at(0);
       if (input_val->type()->cast<OptionalType>() &&
           cond->node()->inputs().at(1)->mustBeNone()) {
 
-        true_info[input_val] = input_val->type()->expect<OptionalType>()->getElementType();
-        false_info[input_val] = NoneType::get();
+        true_info[input_val] = NoneType::get();
+        false_info[input_val] = input_val->type()->expect<OptionalType>()->getElementType();
         if (cond->node()->kind() == aten::__isnot__) {
-          return BoolInfo(false_info, true_info);
+          auto b = BoolInfo(false_info, true_info);
+          printBoolInfo(b);
+          return b;
         }
       }
     }
-    return BoolInfo(true_info, false_info);
+    auto b = BoolInfo(true_info, false_info);
+    printBoolInfo(b);
+    return b;
   }
 
 
   void emitCondTemp(Value * v) {
-    auto bool_info = getConditionRefinements(v);
-    environment_stack->setBoolInfo(v, bool_info);
+    if (!environment_stack->getBoolInfo(v)) {
+      auto bool_info = getConditionRefinements(v);
+      environment_stack->setBoolInfo(v, bool_info);
+    }
   }
 
   Value* emitCond(const Expr& cond) {
@@ -933,6 +1022,20 @@ private:
     environment_stack->setBoolInfo(v, bool_info);
     return v;
   }
+
+  // bool valueNotWrittenTo(Value * tv, Value *fv, const std::unordered_set<std::string>& true_set,
+  //     const std::unordered_set<std::string>& false_set, const std::string& x) {
+  //   auto set_in_false = false_set.find(x) != false_set.end();
+  //   auto set_in_true = true_set.find(x) != true_set.end();
+  //
+  //   auto tv_unwrap = tv->node()->kind() == prim::_unchecked_unwrap_optional;
+  //   auto fv_unwrap = fv->node()->kind() == prim::_unchecked_unwrap_optional;
+  //
+  //   if ((set_in_true && !tv_unwrap) || (set_in_false && !fv_unwrap)) {
+  //     return false;
+  //   }
+  //   return true;
+  // }
 
   void emitIfElseBlocks(Value* cond_value, const If& stmt) {
     Node* n = graph->insertNode(create(prim::If, stmt.range(), 0));
@@ -981,6 +1084,10 @@ private:
         mutated_variables.insert(v);
       }
     }
+    auto true_vars = save_true->definedVariables();
+    std::unordered_set<std::string> true_set(true_vars.begin(), true_vars.end());
+    auto false_vars = save_false->definedVariables();
+    std::unordered_set<std::string> false_set(false_vars.begin(), false_vars.end());
 
     // Register outputs in each block
     for (const auto& x : mutated_variables) {
@@ -988,6 +1095,20 @@ private:
       auto fv = save_false->getVar(x, stmt.range());
       auto unified = unifyTypes(tv->type(), fv->type());
 
+      auto set_in_false = false_set.find(x) != false_set.end();
+      auto set_in_true = true_set.find(x) != true_set.end();
+      auto tv_unwrap = tv->node()->kind() == prim::_unchecked_unwrap_optional;
+      auto fv_unwrap = fv->node()->kind() == prim::_unchecked_unwrap_optional;
+      if (tv_unwrap || fv_unwrap) {
+        std::cout << "hi";
+      }
+
+
+      //TODO FIX
+      if ((!set_in_false && tv_unwrap) ||
+            (!set_in_true && fv_unwrap)) {
+        continue;
+      }
 
 
       // attempt to unify the types. we allow variables to be set to different types
@@ -1618,6 +1739,7 @@ private:
         auto v = Var(stmt.lhs());
         environment_stack->setSugaredVar(
             v.range(), v.name().name(), emitSugaredExpr(stmt.rhs(), 1));
+        std::cout << "hi " << v.name().name() << "\n";
       } break;
       case TK_TUPLE_LITERAL:
         emitTupleAssign(TupleLiteral(stmt.lhs()), stmt.rhs());
@@ -1822,21 +1944,29 @@ private:
     } else if (auto isinstance = dynamic_cast<UncheckedUnwrapOptional*>(sv.get())) {
       JIT_ASSERT(apply.inputs().size() == 1);
       auto input = emitExpr(apply.inputs()[0]);
-      Value * output_val;
+      Value * old_input;
       if (input->node()->kind() == prim::_unchecked_unwrap_optional) {
-        output_val = input;
+        old_input = input;
+        input = input->node()->input();
+        input->setUniqueName(input->uniqueNameBase());
       } else {
-        // graph->insert(create(prim::_unchecked_unwrap_optional, {input}, 1));
-        auto node = graph->create(prim::_unchecked_unwrap_optional, {input}, 1);
-             // ->setSourceLocation(std::make_shared<SourceRange>(fakeRange());
-        graph->insertNode(node);
-        auto new_type = input->type()->expect<OptionalType>()->getElementType();
-        auto output_val = node->output();
-         node->output()->setType(new_type);
-        return std::make_shared<SimpleValue>(output_val);
-         // ->setSourceLocation(std::make_shared<SourceRange>(fake_range));
-         //  g->insertNode(node);
+        old_input = input;
       }
+
+        // graph->insert(create(prim::_unchecked_unwrap_optional, {input}, 1));
+      auto node = graph->create(prim::_unchecked_unwrap_optional, {input}, 1);
+           // ->setSourceLocation(std::make_shared<SourceRange>(fakeRange());
+      graph->insertNode(node);
+      auto new_type = input->type()->expect<OptionalType>()->getElementType();
+      Value * output_val = node->output();
+      node->output()->setType(new_type);
+      if (old_input != input) {
+        old_input->node()->replaceAllUsesWith(node);
+        // old_input->node()->destroy();
+      }
+      // return std::make_shared<SimpleValue>(output_val);
+       // ->setSourceLocation(std::make_shared<SourceRange>(fake_range));
+       //  g->insertNode(node);
       return std::make_shared<SimpleValue>(output_val);
     } else {
       auto inputs = getNamedValues(apply.inputs(), true);

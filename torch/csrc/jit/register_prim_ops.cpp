@@ -620,13 +620,9 @@ RegisterOperators reg({
           return 0;
         };
       }),
-    Operator("prim::_unchecked_unwrap_optional(t? optional) -> t",
-      [](const Node* node) -> Operation {
-        return [=](Stack& stack) {
-          AT_ERROR("Should not be run");
-          return 0;
-        };
-      }),
+    // will get removed in in preprocessing before being run in the interpreter,
+    // but it should be able to be run in constant propagation wo/erroring
+    Operator("prim::_unchecked_unwrap_optional(t? optional) -> t", noop),
     Operator(
         prim::fork,
         [](const Node* node) {

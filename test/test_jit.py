@@ -3963,25 +3963,38 @@ a")
             ''')
 
     def test_optional_refinement(self):
+        # @torch.jit.script
+        # def test_unwrap(x):
+        #     print(torch.jit._unwrap_optional(x))
+        # print(test_unwrap.graph)
+        # return
+
         # with self.disableModuleHook():  # TODO:
-        #     code = """
-        #     def test(x):
-        #         # type: (Optional[int]) -> int
-        #         b = x is None and True
-        #         if b:
-        #             x = 1
-        #         else:
-        #             x = _unchecked_unwrap_optional(x)
-        #         return x
-        #     """
-        #     cu = torch.jit.CompilationUnit(code)
-        #     print(cu.test.graph)
-        @torch.jit.script
-        def test_2(x):
-            # type: (Optional[int]) -> int
-            x = 1 if x is None else 2
-            return x
-            # @torch.jit.script
+
+            # if x is None:
+            #     x = 1
+
+        # code = """
+        # def test(x, y):
+        #     # type: (Optional[int], bool) -> int
+        #     if y:
+        #         x = 1
+        #     else:
+        #         x = _unchecked_unwrap_optional(x)
+        #     return x
+        # """
+        # cu = torch.jit.CompilationUnit(code)
+        # print(cu.test.graph)
+        # @torch.jit.script
+        # def test_2(x):
+        #     # type: (Optional[int]) -> int
+        #     # x = 1 if x is None else 2
+        #     if x is 1:
+        #         x = 2
+        #     else:
+        #         x = torch.jit._unwrap_optional(x)
+        #     return x
+        #     # @torch.jit.script
             # def test_2(x):
             #     # type: (Optional[int])
             #     if x is None:
@@ -3989,18 +4002,50 @@ a")
             #     else:
             #         print(x + 1)
             #     # return x
-            # @torch.jit.script
-            # def test_2(x):
-            #     # type: (Optional[int])
-            #     if x is not None:
-            #         print(x + 1)
+        @torch.jit.script
+        def elias_test(xla, y):
+            # type: (Optional[int], Optional[int])
+            if xla is not None and xla < 2 and y is not None:
+                xla = xla + y
+            else:
+                xla = 5
+            return xla + 2
+
+        print(elias_test.graph)
 
         # @torch.jit.script
         # def test_2(x):
-        #     # type: (Optional[Tensor])
-        #     if x is not None and len(x) < 2:
-        #         print(x)
+        #     # type: (Optional[int])
+        #     if x is not None:
+        #         x = x * 2
+        #     else:
+        #         x = 2
+        #     return x
         # print(test_2.graph)
+        # @torch.jit.script
+        # def elias_test(xla, y):
+        #
+        #     # type: (Optional[int], int)
+        #     a = None
+        #     if xla is 4:
+        #         if xla is 2:
+        #             xla = 2
+        #     if xla is not a and xla < 2:
+        #         xla = torch.jit._unwrap_optional(xla)
+        #     else:
+        #         xla = 4
+        #     xla = xla * y
+        #     xla = xla if xla is not a else 4
+        #     if y < 2:
+        #         xla = xla + 4
+        #     else:
+        #         xla = 2
+        #     return xla
+        # self.run_pass('cse', elias_test.graph)
+        # self.run_pass('constant_pooling', elias_test.graph)
+        # print(elias_test(None, 1))
+
+        # print(elias_test.graph)
 
 
     def test_while_write_outer_then_read(self):

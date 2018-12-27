@@ -476,6 +476,7 @@ struct CodeImpl {
           createJumpFalse(cond_branch, instructions.size());
           createJumpTrue(cond_branch_end, entry);
         } break;
+        // case prim::_unchecked_unwrap_optional:
         default: {
           insertInstruction(node);
         } break;

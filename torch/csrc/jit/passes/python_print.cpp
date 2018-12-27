@@ -8,7 +8,6 @@
 #include <torch/csrc/jit/script/error_report.h>
 #include <torch/csrc/jit/script/module.h>
 
-
 namespace torch {
 namespace jit {
 
@@ -1012,7 +1011,6 @@ TORCH_API bool printerHasSpecialCaseFor(Symbol sym) {
     prim::TupleSlice,
     prim::TupleUnpack,
     prim::Undefined,
-    // prim::_unchecked_unwrap_optional,
   };
 
   // WARNING: by adding a value to this set, you are asserting that your
@@ -1035,7 +1033,6 @@ TORCH_API bool printerHasSpecialCaseFor(Symbol sym) {
     prim::MMTreeReduce, // used as an optimization
     prim::MMBatchSide, // used as an optimization
     prim::Store, // used in interpreter only
-    // prim::_unchecked_unwrap_optional, //inserted in compilation
   };
 
   return handled.count(sym) || unneeded.count(sym);
