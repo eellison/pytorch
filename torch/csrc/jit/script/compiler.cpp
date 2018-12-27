@@ -39,23 +39,6 @@ struct BoolInfo {
   Refinements false_info;
 };
 
-void printRefinement(const Refinements& r) {
-  for (auto pair: r) {
-    std::cout << "\tName: " << pair.first->uniqueName() << " :: ";
-    std::cout << pair.second->str() << "\n";
-  }
-
-}
-
-void printBoolInfo(const BoolInfo& b) {
-  std::cout << "Bool Info\n";
-  std::cout << "True Info\n";
-  printRefinement(b.true_info);
-  std::cout << "False Info\n";
-  printRefinement(b.false_info);
-}
-
-
 static Value* asSimple(const SugaredValuePtr& value) {
   if(SimpleValue* sv = dynamic_cast<SimpleValue*>(value.get())) {
     return sv->getValue();
@@ -904,13 +887,8 @@ private:
     // If this is an AND, eval second expression if first expr is True
     if (is_or) {
       auto v = emitIfExpr(loc, first_value, get_first_expr, get_second_expr);
-      std::cout << "B1\n";
-      printBoolInfo(b_1);
-      std::cout << "B2\n";
-      printBoolInfo(b_2);
       std::cout << "OR Result\n";
       auto bool_info = mergeOr(b_1, b_2);
-      printBoolInfo(bool_info);
       environment_stack->setBoolInfo(v, bool_info);
       return v;
     } else {
@@ -960,9 +938,6 @@ private:
       return *maybe_found;
     }
     Refinements true_info, false_info;
-    std::cout << "Emitting bool info for ";
-    cond->node()->dump();
-    std::cout << "\n";
     if (cond->node()->kind() == aten::__is__ || cond->node()->kind() == aten::__isnot__) {
       Value * input_val = cond->node()->inputs().at(0);
       if (input_val->type()->cast<OptionalType>() &&
@@ -971,15 +946,11 @@ private:
         true_info[input_val] = NoneType::get();
         false_info[input_val] = input_val->type()->expect<OptionalType>()->getElementType();
         if (cond->node()->kind() == aten::__isnot__) {
-          auto b = BoolInfo(false_info, true_info);
-          printBoolInfo(b);
-          return b;
+          return BoolInfo(false_info, true_info);
         }
       }
     }
-    auto b = BoolInfo(true_info, false_info);
-    printBoolInfo(b);
-    return b;
+    return BoolInfo(true_info, false_info);
   }
 
 
@@ -1006,20 +977,6 @@ private:
     environment_stack->setBoolInfo(v, bool_info);
     return v;
   }
-
-  // bool valueNotWrittenTo(Value * tv, Value *fv, const std::unordered_set<std::string>& true_set,
-  //     const std::unordered_set<std::string>& false_set, const std::string& x) {
-  //   auto set_in_false = false_set.find(x) != false_set.end();
-  //   auto set_in_true = true_set.find(x) != true_set.end();
-  //
-  //   auto tv_unwrap = tv->node()->kind() == prim::_unchecked_unwrap_optional;
-  //   auto fv_unwrap = fv->node()->kind() == prim::_unchecked_unwrap_optional;
-  //
-  //   if ((set_in_true && !tv_unwrap) || (set_in_false && !fv_unwrap)) {
-  //     return false;
-  //   }
-  //   return true;
-  // }
 
   void emitIfElseBlocks(Value* cond_value, const If& stmt) {
     Node* n = graph->insertNode(create(prim::If, stmt.range(), 0));
