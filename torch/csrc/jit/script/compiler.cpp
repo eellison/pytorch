@@ -29,10 +29,8 @@ using ListAttributeMap = std::unordered_map<std::string, std::vector<Const>>;
 
 using Refinements = std::unordered_map<Value *, TypePtr>;
 struct BoolInfo {
-
   BoolInfo(Refinements true_info, Refinements false_info):
     true_info(true_info), false_info(false_info) {};
-
   BoolInfo() {};
 
   Refinements true_info;
@@ -808,19 +806,20 @@ private:
     // if the result is false, either a or b could have been false,
     // so we take their intersection.
     auto true_info = unionRefinements(a.true_info, b.true_info);
-    auto false_info = unionRefinements(a.false_info, b.false_info);
+    auto false_info = intersectRefinements(a.false_info, b.false_info);
     return BoolInfo(true_info, false_info);
   }
 
   BoolInfo mergeOr(BoolInfo a, BoolInfo b) {
     // if the result of an OR is true, either a & b could have been true,
     // so we take the intersection of a.true_info & b.true_info.
-    // if the result is false, both a or b had to be false,
+    // if the result is false, both a and b had to be false,
     // so we take their union.
     auto true_info = intersectRefinements(a.true_info, b.true_info);
     auto false_info = unionRefinements(a.false_info, b.false_info);
     return BoolInfo(true_info, false_info);
   }
+
 
   Refinements intersectRefinements(Refinements a, Refinements b) {
     Refinements ret;
@@ -871,7 +870,7 @@ private:
       const TreeRef & second_expr,
       bool is_or) {
     Value * first_value = emitCond(Expr(first_expr));
-    auto b_1 = getConditionRefinements(first_value);
+    BoolInfo b_1 = getConditionRefinements(first_value);
     BoolInfo b_2;
 
     auto get_first_expr = [first_value] {
@@ -887,7 +886,6 @@ private:
     // If this is an AND, eval second expression if first expr is True
     if (is_or) {
       auto v = emitIfExpr(loc, first_value, get_first_expr, get_second_expr);
-      std::cout << "OR Result\n";
       auto bool_info = mergeOr(b_1, b_2);
       environment_stack->setBoolInfo(v, bool_info);
       return v;
@@ -978,6 +976,18 @@ private:
     return v;
   }
 
+  bool valueNotWrittenTo(const std::unordered_set<std::string>& true_set,
+      const std::unordered_set<std::string>& false_set,
+      Value * true_v, Value * false_v, const std::string& x) {
+
+    bool set_in_false = false_set.count(x) != 0;
+    bool set_in_true = true_set.count(x) != 0;
+    bool tv_unwrap = true_v->node()->kind() == prim::_unchecked_unwrap_optional;
+    bool fv_unwrap = false_v->node()->kind() == prim::_unchecked_unwrap_optional;
+
+    return !((set_in_false && !fv_unwrap) || (set_in_true && !tv_unwrap));
+  }
+
   void emitIfElseBlocks(Value* cond_value, const If& stmt) {
     Node* n = graph->insertNode(create(prim::If, stmt.range(), 0));
     n->addInput(cond_value);
@@ -1014,20 +1024,21 @@ private:
 
     //ordered set, because we want deterministic graph output
     std::set<std::string> mutated_variables;
+    auto true_vars = save_true->definedVariables();
+    auto false_vars = save_false->definedVariables();
 
-    for(auto & v : save_true->definedVariables()) {
+    for(auto & v : true_vars) {
       if(save_false->findInAnyFrame(v)) {
         mutated_variables.insert(v);
       }
     }
-    for(auto & v : save_false->definedVariables()) {
+    for(auto & v : false_vars) {
       if(save_true->findInAnyFrame(v)) {
         mutated_variables.insert(v);
       }
     }
-    auto true_vars = save_true->definedVariables();
+
     std::unordered_set<std::string> true_set(true_vars.begin(), true_vars.end());
-    auto false_vars = save_false->definedVariables();
     std::unordered_set<std::string> false_set(false_vars.begin(), false_vars.end());
 
     // Register outputs in each block
@@ -1036,21 +1047,9 @@ private:
       auto fv = save_false->getVar(x, stmt.range());
       auto unified = unifyTypes(tv->type(), fv->type());
 
-      auto set_in_false = false_set.find(x) != false_set.end();
-      auto set_in_true = true_set.find(x) != true_set.end();
-      auto tv_unwrap = tv->node()->kind() == prim::_unchecked_unwrap_optional;
-      auto fv_unwrap = fv->node()->kind() == prim::_unchecked_unwrap_optional;
-      if (tv_unwrap || fv_unwrap) {
-        std::cout << "hi";
-      }
-
-
-      //TODO FIX
-      if ((!set_in_false && tv_unwrap) ||
-            (!set_in_true && fv_unwrap)) {
+      if (valueNotWrittenTo(true_set, false_set, tv, fv, x)) {
         continue;
       }
-
 
       // attempt to unify the types. we allow variables to be set to different types
       // in each branch as long as that variable is not already in scope,
@@ -1680,7 +1679,6 @@ private:
         auto v = Var(stmt.lhs());
         environment_stack->setSugaredVar(
             v.range(), v.name().name(), emitSugaredExpr(stmt.rhs(), 1));
-        std::cout << "hi " << v.name().name() << "\n";
       } break;
       case TK_TUPLE_LITERAL:
         emitTupleAssign(TupleLiteral(stmt.lhs()), stmt.rhs());
