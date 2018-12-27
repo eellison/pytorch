@@ -11,7 +11,6 @@
 #include <torch/csrc/jit/operator.h>
 #include <torch/csrc/jit/hooks_for_testing.h>
 #include <torch/csrc/jit/constants.h>
-#include <torch/csrc/jit/passes/canonicalize.h>
 
 #include <c10/util/Optional.h>
 
@@ -166,13 +165,9 @@ struct Environment {
       Value * v = value_type.first;
       auto type = value_type.second;
       if (type != NoneType::get()) {
-        auto fake_range = fakeRange();
-        auto node =
-                 g->create(prim::_unchecked_unwrap_optional, {v}, 1)
-                  ->setSourceLocation(std::make_shared<SourceRange>(fake_range));
-        node->output()->setType(type);
-        g->insertNode(node);
-        setVar(fake_range, v->uniqueNameBase(), node->output());
+        auto output = g->insert(prim::_unchecked_unwrap_optional, {v});
+        //set name using "a" and not "a.1"
+        setVar(fakeRange(), v->uniqueNameBase(), output);
       }
     }
   }
@@ -479,14 +474,6 @@ struct to_ir {
 
     method.setSchema(emitDef(def, self, graph->block()));
     runCleanupPasses(graph);
-    // std::cout << "\n\n return graph \n";
-    // std::stringstream test;
-    // test << *graph;
-    // auto s = test.str();
-    // if (s.find("la_1.1") != std::string::npos) {
-    //   std::cout << "i'm here";
-    // }
-    // graph->dump();
   }
 
 private:
@@ -514,7 +501,6 @@ private:
     // remove any uses of tuples that we inserted that are not needed
     LowerSimpleTuples(to_clean);
     ConstantPooling(to_clean);
-    // to_clean = Canonicalize(to_clean);
   }
 
   FunctionSchema emitDef(const Def& def, const SugaredValuePtr& self, Block* block) {
@@ -533,7 +519,6 @@ private:
     emitStatements(stmts_begin, stmts_end);
     const SourceRange& range = return_stmt ? return_stmt->range() : def.range();
     std::vector<Argument> returns = {emitReturn(range, return_stmt, schema, block)};
-
     return {def.name().name(), std::move(arguments), std::move(returns)};
   }
 
@@ -810,8 +795,7 @@ private:
 
   std::shared_ptr<Environment> emitSingleIfBranch(
       Block* b,
-      const List<Stmt>& branch,
-      bool is_true_block) {
+      const List<Stmt>& branch) {
     pushFrame(b);
     WithInsertPoint guard(b);
     emitStatements(branch);
@@ -1044,8 +1028,8 @@ private:
     auto* false_block = n->addBlock();
 
     // Emit both blocks once to get the union of all mutated values
-    auto save_true = emitSingleIfBranch(true_block, stmt.trueBranch(), true);
-    auto save_false = emitSingleIfBranch(false_block, stmt.falseBranch(), false);
+    auto save_true = emitSingleIfBranch(true_block, stmt.trueBranch());
+    auto save_false = emitSingleIfBranch(false_block, stmt.falseBranch());
 
     // In python, every variable assigned in an if statement escapes
     // the scope of the if statement (all variables are scoped to the function).
@@ -1944,29 +1928,12 @@ private:
     } else if (auto isinstance = dynamic_cast<UncheckedUnwrapOptional*>(sv.get())) {
       JIT_ASSERT(apply.inputs().size() == 1);
       auto input = emitExpr(apply.inputs()[0]);
-      Value * old_input;
       if (input->node()->kind() == prim::_unchecked_unwrap_optional) {
-        old_input = input;
-        input = input->node()->input();
-        input->setUniqueName(input->uniqueNameBase());
-      } else {
-        old_input = input;
+        Value * prev_input = input->node()->input();
+        prev_input->setUniqueName(prev_input->uniqueNameBase());
+        input = prev_input;
       }
-
-        // graph->insert(create(prim::_unchecked_unwrap_optional, {input}, 1));
-      auto node = graph->create(prim::_unchecked_unwrap_optional, {input}, 1);
-           // ->setSourceLocation(std::make_shared<SourceRange>(fakeRange());
-      graph->insertNode(node);
-      auto new_type = input->type()->expect<OptionalType>()->getElementType();
-      Value * output_val = node->output();
-      node->output()->setType(new_type);
-      if (old_input != input) {
-        old_input->node()->replaceAllUsesWith(node);
-        // old_input->node()->destroy();
-      }
-      // return std::make_shared<SimpleValue>(output_val);
-       // ->setSourceLocation(std::make_shared<SourceRange>(fake_range));
-       //  g->insertNode(node);
+      Value * output_val = graph->insert(prim::_unchecked_unwrap_optional, {input});
       return std::make_shared<SimpleValue>(output_val);
     } else {
       auto inputs = getNamedValues(apply.inputs(), true);

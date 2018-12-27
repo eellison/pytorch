@@ -354,6 +354,7 @@ Value* emitBuiltinCall(
   // otherwise it will return nullptr if the builtin is not found.
   bool required) {
 
+
   const auto& variants = getAllOperatorsFor(name);
   const auto& builtin_functions = getAllBuiltinFunctionsFor(name);
 
