@@ -1327,12 +1327,6 @@ void Node::removeFromList() {
   this->prev() = nullptr;
 }
 
-inline const SourceRange& fakeRange() {
-  static SourceRange range(
-      std::make_shared<std::string>("<internally-created-node>"), 0, 1);
-  return range;
-}
-
 Value* Graph::insert(
     Symbol opname,
     at::ArrayRef<NamedValue> args,
