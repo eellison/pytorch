@@ -3984,6 +3984,86 @@ a")
                 return a + b
             ''')
 
+    def test_opt_refinement_dce(self):
+        # @torch.jit.script
+        # def forward(x, y, z):
+        #     print(z)
+        #     # type: (Optional[int], Optional[int], Optional[int]) -> int
+        #     if y is not None and y == 3:
+        #         z = y
+        #     else:
+        #         x = x
+        #     print(x, y, z)
+        #     return 1
+        #
+        # @torch.jit.script
+        # def forward(x, y, z):
+        #     print(z)
+        #     # type: (Optional[int], Optional[int], Optional[int]) -> int
+        #     if y is not None and y == 3:
+        #         pass
+        #     else:
+        #         z = y
+        #         x = x
+        #     print(x, y, z)
+        #     return 1
+        #
+        # @torch.jit.script
+        # def forward(sx, y, z):
+        #     print(z)
+        #     # type: (Optional[int], Optional[int], Optional[int]) -> int
+        #     if y is not None and y == 3:
+        #         z = y
+        #     else:
+        #         z = y
+        #         x = x
+        #     print(x, y, z)
+        #     return 1
+
+        with self.disableModuleHook():  # TODO: Python print broadcasting list
+            class M1(torch.jit.ScriptModule):
+                def __init__(self):
+                    super(M1, self).__init__(False)
+
+                @torch.jit.script_method
+                def forward(self, x, y, z):
+                    print(z)
+                    # type: (Optional[int], Optional[int], Optional[int]) -> int
+                    if y is not None and y == 3:
+                        x = x
+                        z = y
+                    else:
+                        x = x
+                    print(x, y, z)
+                    return 1
+
+            module = M1()
+            torch._C._jit_pass_dce(module.graph)
+            def copy_structure_and_params(m):
+                c = torch.jit.ScriptModule()
+                for name, v, buffer in m._get_parameters():
+                    c._register_parameter(name, v, buffer)
+                for name, s in m._get_modules():
+                    c._register_module(name, copy_structure_and_params(s))
+                return c
+
+            try:
+                pp, constant_table = module._python_print()
+            except RuntimeError as e:
+                se = str(e)
+                if "could not export python function" not in se and \
+                   "closures are not exportable" not in se:
+                    raise
+                else:
+                    return
+            ppv = "op_version_set = 0\n{}".format(pp)
+            sm = copy_structure_and_params(module)
+            torch._C._jit_import_methods(sm, ppv, constant_table)
+            pp2, _ = sm._python_print()
+            print(sm.graph)
+            if pp != pp2:
+                self.assertMultiLineEqual(pp, pp2)
+
     def test_optional_refinement(self):
         @torch.jit.script
         def test_if_none_assignment(x):

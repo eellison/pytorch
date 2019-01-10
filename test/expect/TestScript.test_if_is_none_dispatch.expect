@@ -8,7 +8,7 @@ graph(%input : Tensor
   %7 : bool = aten::__isnot__(%opt.1, %6)
   %opt.4 : Tensor?, %x.3 : Tensor = prim::If(%7)
     block0() {
-      %opt.2 : Tensor = prim::_unchecked_unwrap_optional(%opt.1)
+      %opt.2 : Tensor = prim::unchecked_unwrap_optional(%opt.1)
       %opt.3 : Tensor = aten::_unwrap_optional(%opt.2)
       %x.2 : Tensor = aten::add(%opt.3, %x.1, %2)
       -> (%opt.3, %x.2)
