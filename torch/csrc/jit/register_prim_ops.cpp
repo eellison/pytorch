@@ -1003,6 +1003,31 @@ Operation listAppend(const Node* node) {
   };
 }
 
+template <typename TList>
+Operation listPop(const Node* node) {
+  return [](Stack& stack) {
+    TList list;
+    int64_t idx;
+    pop(stack, list, idx);
+
+    auto& elements = list->elements();
+    
+    if (elements.size() == 0) {
+      AT_ERROR("pop from empty list");
+    }
+
+    if (idx == -1) {
+      push(stack, std::move(elements.back()));
+      elements.pop_back();
+    } else {
+      push(stack, std::move(getItem(list, idx)));
+      elements.erase(elements.begin() + idx);
+    }
+
+    return 0;
+  };
+}
+
 template <typename T>
 Operation listSelect(const Node* node) {
   return [=](Stack& stack) {
@@ -1289,7 +1314,11 @@ RegisterOperators reg2({
       Operator(                                                             \
           "aten::_set_item(" decl_type "[](a!) l, int idx, " decl_type      \
           " el) -> " decl_type "[](a!)",                                    \
-          listSetItem<Shared<c_type>, c_type::ElemType>)
+          listSetItem<Shared<c_type>, c_type::ElemType>),                   \
+      Operator(                                                             \
+          "aten::pop(" decl_type "[](a!) self, int idx=-1)                  \
+          -> " decl_type  "(*)",                                            \
+          listPop<Shared<c_type>>)
 
     CREATE_MUTABLE_LIST_OPS("Tensor", TensorList),
 
@@ -1305,7 +1334,10 @@ RegisterOperators reg2({
       Operator(                                                        \
           "aten::_set_item(" decl_type "[](a!) l, int idx, " decl_type \
           " el) -> " decl_type "[](a!)",                               \
-          listSetItem<Shared<c_type>, c_type::ElemType>)
+          listSetItem<Shared<c_type>, c_type::ElemType>),              \
+      Operator(                                                        \
+          "aten::pop(" decl_type "[](a!) self, int idx=-1)             \
+          -> " decl_type, listPop<Shared<c_type>>)
 
     CREATE_IMMUTABLE_LIST_OPS("int", IntList),
     CREATE_IMMUTABLE_LIST_OPS("float", DoubleList),
