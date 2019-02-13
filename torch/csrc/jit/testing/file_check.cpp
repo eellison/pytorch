@@ -41,15 +41,33 @@ struct Check {
       : type_(type), search_str_(std::move(str)) {
     count_ = count;
   };
-  //
-  // void setSourceLocation(SourceRange sl) {
-  //   source_range_ = std::move(sl);
-  // }
 
   CheckType type_;
   c10::optional<size_t> count_;
   const std::string search_str_;
+
+  friend std::ostream & operator<<(std::ostream &out, const Check &c);
 };
+
+std::ostream& operator<<(std::ostream& out, const Check& c) {
+  switch (c.type_) {
+    case CHECK:
+      out << "CHECK";
+    case CHECK_NEXT:
+      out << "CHECK-NEXT";
+    case CHECK_SAME:
+      out << "CHECK-SAME";
+    case CHECK_NOT:
+      out << "CHECK-NOT";
+    case CHECK_DAG:
+      out << "CHECK-DAG";
+    case CHECK_COUNT:
+      out << "CHECK-COUNT-" << *c.count_;
+  }
+  out << ": " << c.search_str_;
+  return out;
+};
+
 
 namespace {
 static std::string escapeString(const std::string& input) {
@@ -69,14 +87,13 @@ static std::string escapeString(const std::string& input) {
 }
 
 size_t assertFind(
-    SourceRange range,
+    SourceRange search_range,
     const std::string& sub,
-    size_t start,
     std::function<void(std::ostream& out)> extra_msg = nullptr) {
-  auto pos = range.file().find(sub, start);
-  if (pos == std::string::npos || (pos + sub.size()) > range.end()) {
+  auto pos = search_range.file().find(sub, search_range.start());
+  if (pos == std::string::npos || (pos + sub.size()) > search_range.end()) {
     auto range =
-        SourceRange(std::make_shared<std::string>(file), start, sub.size());
+        SourceRange(std::make_shared<std::string>(search_range.file()), search_range.start(), sub.size());
     std::stringstream ss;
     ss << "Expected to find '" << escapeString(sub)
        << "' but did not find it\n";
@@ -93,9 +110,8 @@ size_t assertFind(
     const std::string& sub,
     size_t start,
     const Check& check) {
-  return assertFind(file, sub, start, [&](std::ostream& out) {
-    // out << "From the check defined\n";
-    // check.source_range_->highlight(out);
+  return assertFind(SourceRange(file, start, file->size()), sub, [&](std::ostream& out) {
+    out << "From " << check << "\n";
   });
 }
 
@@ -122,7 +138,7 @@ struct FileCheckImpl {
 
   TORCH_API void checkFile(const std::string& test_file) {
     has_run = true;
-    doChecks(test_file);
+    doChecks(std::make_shared<std::string>(test_file));
   }
 
   TORCH_API void addCheck(CheckType type, const std::string& s, c10::optional<size_t> count = c10::nullopt) {
@@ -144,26 +160,7 @@ struct FileCheckImpl {
   }
 
   bool has_run;
-
  private:
-
-  // consecutive CHECK_DAGs & CHECK_NOTs need to be evaluated as a group
-  void makeGroups(std::vector<Check> input) {
-    for (size_t i = 0; i < input.size(); ++i) {
-      std::vector<Check> group = {input[i]};
-      CheckType type = input[i].type_;
-      if (type != CHECK_NOT && type != CHECK_DAG) {
-        groups.push_back(group);
-        continue;
-      }
-      while (i + 1 < input.size() && input[i + 1].type_ == type) {
-        ++i;
-        group.push_back(input[i]);
-      }
-      groups.push_back(group);
-    }
-  }
-
   void doCheckNot(
       const std::vector<Check>& nots,
       std::shared_ptr<std::string> file,
@@ -174,10 +171,9 @@ struct FileCheckImpl {
     if (end < start) {
       return;
     }
-    const auto& substr = file.substr(start, end - start);
     for (const auto& check : nots) {
       AT_ASSERT(check.type_ == CHECK_NOT);
-      assertNotFind(substr, check.search_str_, check);
+      assertNotFind(SourceRange(file, start, end), check.search_str_, check);
     }
   }
 
@@ -232,8 +228,7 @@ struct FileCheckImpl {
         auto line_end = assertFind(test_file, "\n", start_range, check);
         auto pos =
             assertFind(test_file, check.search_str_, line_end + 1, check);
-        assertNotFind(
-            test_file.substr(line_end + 1, pos - (line_end + 1)), "\n", check);
+        assertNotFind(SourceRange(test_file, line_end + 1, pos), "\n", check);
         start_range = pos;
         end_range = pos + check.search_str_.size();
       } break;
