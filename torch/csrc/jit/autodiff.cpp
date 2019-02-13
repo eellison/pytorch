@@ -97,6 +97,7 @@ bool isDifferentiable(Node* n) {
       "aten::max_pool2d_with_indices(Tensor self, int[] kernel_size, int[] stride, int[] padding, int[] dilation, bool ceil_mode) -> (Tensor, Tensor)",
       "aten::thnn_conv2d_forward(Tensor self, Tensor weight, int[] kernel_size, Tensor? bias, int[] stride, int[] padding) -> (Tensor, Tensor, Tensor)",
       "aten::native_batch_norm(Tensor input, Tensor? weight, Tensor? bias, Tensor? running_mean, Tensor? running_var, bool training, float momentum, float eps) -> (Tensor, Tensor, Tensor)",
+      // "aten::nll_loss(Tensor self, Tensor target, Tensor? weight, int reduction, int ignore_index) -> Tensor",
   };
 
   // TODO: add support for the following fusible operators.
@@ -109,6 +110,10 @@ bool isDifferentiable(Node* n) {
     return true;
   if (differentiable_ops.find(n))
     return true;
+
+  if (n->kind() == aten::nll_loss) {
+    std::cout << "hi";
+  }
 
   auto schema = n->maybeSchema();
   if (schema && hasGradientInfoForSchema(*schema)) {
@@ -125,12 +130,11 @@ bool isDifferentiable(Node* n) {
     return n->get<std::vector<int64_t>>(attr::size) &&
         n->namedInput(attr::self)->type()->cast<CompleteTensorType>();
   }
-  if (n->matches(
-          "aten::nll_loss(Tensor self, Tensor target, Tensor? weight, int reduction, int ignore_index) -> Tensor")) {
-    // TODO(asuhan): support weight
-    return n->namedInput(attr::weight)->node()->mustBeNone();
-  }
-
+  // if (n->matches(
+  //         "aten::nll_loss(Tensor self, Tensor target, Tensor? weight, int reduction, int ignore_index) -> Tensor")) {
+  //   // TODO(asuhan): support weight
+  //   return n->namedInput(attr::weight)->node()->mustBeNone();
+  // }
   // linear blocks may appear as inputs to graph executors, but they are removed
   // before differentiation occurs
   if (n->kind() == prim::GradOf) {
@@ -261,6 +265,8 @@ class GradientHelper {
     };
     auto inputs = fmap<SymbolicVariable>(node->inputs());
     auto outputs = fmap<SymbolicVariable>(node->outputs());
+    std::cout << "Build symbolic gradient\n";
+    node->dump();
 
     if (node->matches(
             "aten::add(Tensor self, Tensor other, *, Scalar alpha) -> Tensor")) {
@@ -706,27 +712,6 @@ class GradientHelper {
               tuple_outputs[1],
               tuple_outputs[2],
               nullptr,
-              nullptr,
-              nullptr,
-              nullptr,
-              nullptr};
-
-    } else if (
-        node->matches(
-            "aten::nll_loss(Tensor self, Tensor target, Tensor? weight, int reduction, int ignore_index) -> Tensor")) {
-      auto graph = node->owningGraph();
-      auto total_weight = graph->insertNode(graph->createUndefined());
-      auto weight = graph->insertNode(graph->createNone(TensorType::get()));
-      auto backward_value = graph->insert(
-          aten::nll_loss_backward,
-          {grads.at(0).value(),
-           inputs.at(0).value(),
-           inputs.at(1).value(),
-           weight->output(),
-           inputs.at(3).value(),
-           inputs.at(4).value(),
-           total_weight->output()});
-      return {backward_value->node()->output(0),
               nullptr,
               nullptr,
               nullptr,

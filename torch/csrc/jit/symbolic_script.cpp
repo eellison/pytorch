@@ -20,6 +20,12 @@ const std::vector<std::string> functions = {
                 return grad_self, None
 
             return torch.adaptive_avg_pool2d(self, output_size), backward
+
+        def nll_loss(self, target, weight: Optional[Tensor], reduction: int, ignore_index: int):
+            def backward(grad):
+                total_weight = torch.empty_like(self).resize(0)
+                return torch.nll_loss_backward(grad, self, target, weight, reduction, ignore_index, total_weight), None, None, None, None
+            return torch.nll_loss(self, target, weight, reduction, ignore_index), backward
       )"};
 std::unordered_map<std::string, GradientPair> schema_to_graphs;
 
@@ -91,6 +97,7 @@ void loadModule(const std::shared_ptr<script::Module>& module) {
         loaded_schema.arguments(),
         {originalReturnType(new_tuple->type()->expect<TupleType>())});
     std::string key = canonicalSchemaString(actual_schema);
+    std::cout << "THIS IS THE STRING \n\n" << key << "\n";
     schema_to_graphs[key] = std::move(pair);
   }
 }
