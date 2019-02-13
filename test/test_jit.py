@@ -3975,8 +3975,8 @@ a")
             a = torch.jit.annotate(List[int], [])
             return a.pop()
 
-        self.checkScriptRaisesRegex(test_pop_empty(), (), RuntimeError,
-        "pop from emtpy list")
+        self.checkScriptRaisesRegex(test_pop_empty, (), RuntimeError,
+                                    "pop from emtpy list")
 
     def test_mutable_list_pop(self):
         def test_pop():
@@ -3985,7 +3985,7 @@ a")
 
             return b == 4
 
-        self.checkScript(test_pop(), ())
+        self.checkScript(test_pop, ())
 
     def test_mutable_list_pop2(self):
         def test_pop2():
@@ -3994,7 +3994,7 @@ a")
 
             return len(a) == 3
 
-        self.checkScript(test_pop2(), ())
+        self.checkScript(test_pop2, ())
 
     def test_mutable_list_pop_at(self):
         def test_pop_at():
@@ -4003,7 +4003,7 @@ a")
 
             return b == 2
 
-        self.checkScript(test_pop_at(), ())
+        self.checkScript(test_pop_at, ())
 
     def test_mutable_list_pop_at2(self):
         def test_pop_at2():
@@ -4012,7 +4012,25 @@ a")
 
             return len(a) == 3
 
-        self.checkScript(test_pop_at2(), ())
+        self.checkScript(test_pop_at2, ())
+
+    def test_mutable_list_pop_at_negative(self):
+        def test_pop_at_negative():
+            a = [1, 2, 3, 4]
+            b = a.pop(-2)
+
+            return b == 3
+
+        self.checkScript(test_pop_at_negative, ())
+
+    def test_mutable_list_pop_at_negative2(self):
+        def test_pop_at_negative2():
+            a = [1, 2, 3, 4]
+            b = a.pop(-2)
+
+            return len(a) == 3
+
+        self.checkScript(test_pop_at_negative2, ())
 
     def test_mutable_list_pop_slice(self):
         def test_pop_slice():
@@ -4024,7 +4042,7 @@ a")
 
             return a == b
 
-        self.checkScript(test_pop_slice(), ())
+        self.checkScript(test_pop_slice, ())
 
     def test_func_call(self):
         script = '''

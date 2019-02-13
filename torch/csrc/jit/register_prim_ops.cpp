@@ -1004,28 +1004,23 @@ Operation listAppend(const Node* node) {
 }
 
 template <typename TList>
-Operation listPop(const Node* node) {
-  return [](Stack& stack) {
-    TList list;
-    int64_t idx;
-    pop(stack, list, idx);
+int listPop(Stack& stack) {
+  TList list;
+  int64_t idx;
+  pop(stack, list, idx);
 
-    auto& elements = list->elements();
-    
-    if (elements.size() == 0) {
-      AT_ERROR("pop from empty list");
-    }
+  auto& elements = list->elements();
+  const int64_t list_size = elements.size();
+  const int64_t normalized_idx = normalizeIndex(idx, list_size);
+  
+  if (list_size == 0) {
+    AT_ERROR("pop from empty list");
+  }
 
-    if (idx == -1) {
-      push(stack, std::move(elements.back()));
-      elements.pop_back();
-    } else {
-      push(stack, std::move(getItem(list, idx)));
-      elements.erase(elements.begin() + idx);
-    }
+  push(stack, std::move(getItem(list, idx)));
+  elements.erase(elements.begin() + normalized_idx);
 
-    return 0;
-  };
+  return 0;
 }
 
 template <typename T>
