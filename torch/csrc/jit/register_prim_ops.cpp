@@ -1023,6 +1023,26 @@ int listPop(Stack& stack) {
   return 0;
 }
 
+template <>
+int listPop<Shared<BoolList>>(Stack& stack) {
+  Shared<BoolList> list;
+  int64_t idx;
+  pop(stack, list, idx);
+
+  auto& elements = list->elements();
+  const int64_t list_size = elements.size();
+  const int64_t normalized_idx = normalizeIndex(idx, list_size);
+  
+  if (list_size == 0) {
+    AT_ERROR("pop from empty list");
+  }
+
+  push(stack, std::move(getBoolItem(elements, idx)));
+  elements.erase(elements.begin() + normalized_idx);
+
+  return 0;
+}
+
 template <typename T>
 Operation listSelect(const Node* node) {
   return [=](Stack& stack) {
