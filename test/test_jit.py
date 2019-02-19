@@ -7743,6 +7743,12 @@ a")
         self.assertEqual(torch.autograd.grad(slstm(*inputs).sum(), inputs),
                          torch.autograd.grad(lstm(*inputs).sum(), inputs))
 
+    def test_generic_list_equal(self):
+        @torch.jit.script
+        def test_gen_list(self):
+            return [[1, 2], [3]] == [[3, 4], [5]]
+
+
     def test_loop_unrolling(self):
         def fn(x):
             y = 0
