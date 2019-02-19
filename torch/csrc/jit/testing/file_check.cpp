@@ -311,8 +311,11 @@ FileCheck* FileCheck::check_next(const std::string& str) {
   return this;
 }
 
-FileCheck* FileCheck::check_count(const std::string& str, size_t count) {
+FileCheck* FileCheck::check_count(const std::string& str, size_t count, bool exactly) {
   fcImpl->addCheck(CHECK_COUNT, str, count);
+  if (exactly) {
+    fcImpl->addCheck(CHECK_NOT, str);
+  }
   return this;
 }
 
