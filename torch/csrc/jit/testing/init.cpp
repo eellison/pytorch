@@ -17,7 +17,13 @@ void initJitTestingBindings(PyObject* module) {
       .def("check_next", &FileCheck::check_next)
       .def("check_count", &FileCheck::check_count)
       .def("check_dag", &FileCheck::check_dag)
+      .def(
+          "check_count",
+          [](FileCheck& f, const std::string& str, size_t count, bool exactly) {
+            return f.check_count(str, count, exactly);
+          }, "Check Count", py::arg("str"), py::arg("count"), py::arg("exactly") = true)
       .def("run", &FileCheck::run);
+
 }
 
 } // namespace testing
