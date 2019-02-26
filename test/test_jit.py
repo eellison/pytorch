@@ -1374,10 +1374,6 @@ class TestJit(JitTestCase):
             out.copy_(x)
             return out
 
-        @torch.jit.script
-        def test(x, y):
-            x.copy_(y)
-
         trace, outputs, inputs = torch.jit.get_trace_graph(f, (x, ), return_inputs=True)
         self.run_pass('dce', trace)
         m = self.createScriptModuleFromGraph(trace)
