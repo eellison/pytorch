@@ -14,10 +14,7 @@ import torch.jit.frontend
 from torch.autograd import Variable, Function
 from torch.onnx import OperatorExportTypes
 from torch._six import inf, PY2, builtins, StringIO
-from common_utils import TestCase, run_tests, IS_WINDOWS, TEST_WITH_UBSAN, \
-    skipIfRocm, skipIfNoLapack, suppress_warnings, load_tests, IS_SANDCASTLE, \
-    freeze_rng_state, set_rng_seed, slowTest
-from common_nn import module_tests, new_module_tests, criterion_tests
+from jit_common_utils import *
 from textwrap import dedent
 from functools import wraps
 import os
@@ -38,9 +35,6 @@ import copy
 import zipfile
 
 
-from common_methods_invocations import method_tests as autograd_method_tests
-from common_methods_invocations import create_input, unpack_variables, \
-    exclude_tensor_method, non_differentiable, EXCLUDE_GRADCHECK, EXCLUDE_FUNCTIONAL
 from torch.testing import FileCheck
 from torch._C import TensorType, parse_ir
 from copy import deepcopy
