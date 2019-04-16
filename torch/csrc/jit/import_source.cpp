@@ -108,6 +108,7 @@ struct SourceImporter {
         {"CONSTANTS", std::make_shared<ConstantTableValue>(constant_table)},
         {"fork", std::make_shared<ForkValue>()},
         {"annotate", std::make_shared<AnnotateValue>()},
+        {"uninitialized", std::make_shared<UninitializedValue>()},
         {"inf",
          std::make_shared<ConstantValue>(
              std::numeric_limits<double>::infinity())},

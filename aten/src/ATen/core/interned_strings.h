@@ -23,6 +23,7 @@ namespace c10 {
   _(prim, BroadcastingChunk)       \
   _(prim, BroadcastSizes)          \
   _(prim, Bottom)                  \
+  _(prim, Uninitialized)           \
   _(prim, Constant)                \
   _(prim, ChunkSizes)              \
   _(prim, Drop)                    \

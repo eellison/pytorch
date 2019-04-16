@@ -394,6 +394,7 @@ struct Environment {
           {"bool", std::make_shared<CastValue>(BoolType::get(), prim::Bool)},
           {"getattr", std::make_shared<GetAttrValue>()},
           {"isinstance", std::make_shared<IsInstanceValue>()},
+          {"unitialized", std::make_shared<UninitializedValue>()},
           // todo(zach): remove when we can correctly export torch.full via ONNX
           // or we have implicit conversion that can convert numbers to tensors
           {"_to_tensor",
@@ -1206,6 +1207,11 @@ struct to_ir {
     // a = ...
     // if ...:
     //   a =
+    // ... = a # OK, a is defined along all paths
+    // if ...
+    //   a =
+    // else:
+    //   return ...
     // ... = a # OK, a is defined along all paths
 
     // ordered set, because we want deterministic graph output
@@ -2153,6 +2159,12 @@ struct to_ir {
       }
       return classNew->createObject(
           apply.range(), method, Var(apply.inputs()[0]).name().name());
+    } else if (auto annotate_value = dynamic_cast<UninitializedValue*>(sv.get())) {
+      TypePtr type = typeParser_.parseTypeFromExpr(apply.inputs()[0]);
+      auto out = graph->insertNode(graph->create(prim::Uninitialized, {}, 1)
+                       ->setSourceLocation(std::make_shared<SourceRange>(loc)));
+      out->output()->setType(type);
+      return std::make_shared<SimpleValue>(out->output());
     } else {
       auto inputs = getNamedValues(apply.inputs(), true);
       auto attributes = emitAttributes(apply.attributes());

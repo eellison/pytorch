@@ -407,6 +407,7 @@ void AliasDb::analyzeImpl(Node* node) {
     }
     case prim::Print:
     case prim::Bottom:
+    case prim::Uninitialized:
       // These ops do nothing
       return;
     default:
@@ -1164,6 +1165,7 @@ TORCH_API bool aliasAnalysisHasSpecialCaseFor(Symbol symbol) {
       prim::DifferentiableGraph,
       prim::Constant,
       prim::Bottom,
+      prim::Uninitialized,
       prim::DictConstruct,
       prim::ListConstruct,
       prim::TupleConstruct,

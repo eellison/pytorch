@@ -337,7 +337,6 @@ class JitTestCase(TestCase):
             main_module_2_code = ""
             for line in main_module_2:
                 main_module_2_code += line.decode()
-
             self.assertMultiLineEqual(main_module_code, main_module_2_code)
 
     def getExportImportCopy(self, m, also_test_file=True, map_location=None):
@@ -10667,6 +10666,38 @@ a")
         self.checkScript(fn3, ("abcdefghi",))
         self.checkScript(fn4, ("abcdefghi",))
 
+    def test_loop_final_returns(self):
+        def test(x: int):
+            a = 1
+            for i in range(x):
+                a = 2
+                if x == 4:
+                    return x
+
+            return x * 10 * a
+
+        def test_nested(x: int):
+            a = 1
+            if x > 3:
+                for i in range(x):
+                    a = 2
+                    if x == 4:
+                        return x
+
+            return x * 10 * a
+
+        for i in range(6):
+            self.checkScript(test, (i,))
+            self.checkScript(test_nested, (i,))
+
+        def test2():
+            a = 1
+            while a < 10:
+                if a == 1:
+                    return 3
+                raise "hi"
+            return 2
+
     def test_non_final_return(self):
         def simple(x):
             if bool(x > 3):
@@ -10811,13 +10842,15 @@ a")
         FileCheck().check(": int?").run(typed_none.graph)
 
     def test_early_returns_error(self):
-        with self.assertRaisesRegex(RuntimeError, "within loops"):
-            @torch.jit.script
-            def nest_while_ret(x):
-                while bool(x > 4):
-                    if bool(x < 3):
-                        return 4
-                return 5
+        @torch.jit.script
+        def nest_while_ret(x):
+            while bool(x > 4):
+                if bool(x < 3):
+                    return 4
+            return 5
+
+        print(nest_while_ret.graph)
+        return
 
         with self.assertRaisesRegex(RuntimeError, "within loops"):
             @torch.jit.script

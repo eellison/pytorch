@@ -94,6 +94,8 @@ std::ostream& operator<<(std::ostream & out, const IValue & v) {
       return out << v.toDevice();
     case IValue::Tag::GenericDict:
       return printDict(out, v.toGenericDict());
+    case IValue::Tag::Uninitialized:
+      return out << "Uninitialized";
     case IValue::Tag::Object:
       // TODO we should print the object contents
       return out << "Object<" << v.toObject()->name()

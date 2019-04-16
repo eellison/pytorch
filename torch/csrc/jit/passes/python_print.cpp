@@ -554,7 +554,7 @@ struct PythonPrintPass {
     // values to the node->outputs() before the loop,
     // and assign node->outputs() to the new values at the end of each trip.
 
-    bool emit_as_for_loop = shouldEmitAsForLoop(stmt);
+    bool emit_as_for_loop = false; //shouldEmitAsForLoop(stmt);
 
     assignValuesToTheirUniqueNames(stmt.carriedOutputs());
     // Add aliases for loop-carried dependencies
@@ -833,6 +833,9 @@ struct PythonPrintPass {
         stmt << "^" << value->name();
         value->writeScalars(stmt);
         printValueList(stmt, node->inputs(), "(", ")");
+      } break;
+      case prim::Uninitialized: {
+        stmt << "unitialized(" << node->output()->type()->python_str() << ")";
       } break;
       case prim::Constant: {
         if (node->kind() == prim::Constant && !node->mustBeNone()) {
@@ -1228,6 +1231,7 @@ TORCH_API bool printerHasSpecialCaseFor(Symbol sym) {
       prim::CreateObject,
       prim::GetAttr,
       prim::SetAttr,
+      prim::Uninitialized,
   };
 
   // WARNING: by adding a value to this set, you are asserting that your

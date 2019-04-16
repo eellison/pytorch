@@ -857,10 +857,16 @@ RegisterOperators reg(
      Operator(
          "prim::Bottom() -> Bottom",
          [](Stack& stack) {
-           // Todo: add special unitialized ivalue that will error
-           // whenever it is used
-           push(stack, 1);
+           push(stack, IValue::uninitialized());
            return 0;
+         }),
+     Operator(
+         prim::Uninitialized,
+         [](const Node* node) {
+           return [](Stack& stack) {
+             push(stack, IValue::uninitialized());
+             return 0;
+           };
          }),
      Operator(
          prim::CreateObject,
