@@ -456,6 +456,11 @@ struct ParserImpl {
         L.expect(TK_NEWLINE);
         return Assert::create(range, cond, maybe_first);
       }
+      case TK_BREAK : {
+        auto range = L.next().range;
+        L.expect(TK_NEWLINE);
+        return Break::create(range);
+      }
       case TK_PASS: {
         auto range = L.next().range;
         L.expect(TK_NEWLINE);

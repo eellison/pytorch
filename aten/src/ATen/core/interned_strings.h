@@ -45,6 +45,9 @@ namespace c10 {
   _(prim, PythonOp)                \
   _(prim, IgnoredPythonOp)         \
   _(prim, Reverse)                 \
+  _(prim, BreakStmt)               \
+  _(prim, LoopCondition)           \
+  _(prim, VarCapture)              \
   _(prim, Return)                  \
   _(prim, ReturnStmt)              \
   _(prim, Store)                   \

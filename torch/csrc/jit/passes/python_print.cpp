@@ -837,6 +837,9 @@ struct PythonPrintPass {
       case prim::Uninitialized: {
         stmt << "unitialized(" << node->output()->type()->python_str() << ")";
       } break;
+      case prim::BreakStmt: {
+        stmt << "break";
+      }
       case prim::Constant: {
         if (node->kind() == prim::Constant && !node->mustBeNone()) {
           IValue v = toIValue(node->output()).value();
@@ -1221,6 +1224,7 @@ TORCH_API bool printerHasSpecialCaseFor(Symbol sym) {
       prim::ListConstruct,
       prim::DictConstruct,
       prim::ListUnpack,
+      prim::BreakStmt,
       prim::Print,
       prim::PythonOp,
       prim::TupleConstruct,

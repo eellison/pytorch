@@ -97,6 +97,7 @@ namespace script {
   _(TK_DOTS, "dots", "...")                      \
   _(TK_LIST_COMP, "list comprehension", "")      \
   _(TK_PASS, "pass", "pass")                     \
+  _(TK_BREAK, "break", "break")                  \
   _(TK_CLASS_DEF, "class", "class")
 
 static const char* valid_single_char_tokens = "+-*/%@()[]:,={}><.?!&^|";

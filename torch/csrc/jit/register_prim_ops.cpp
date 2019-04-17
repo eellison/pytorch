@@ -855,6 +855,8 @@ RegisterOperators reg(
            return 0;
          }),
      Operator(
+         prim::BreakStmt, noop),
+     Operator(
          "prim::Bottom() -> Bottom",
          [](Stack& stack) {
            push(stack, IValue::uninitialized());

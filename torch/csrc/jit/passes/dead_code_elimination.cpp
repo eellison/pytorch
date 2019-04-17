@@ -270,19 +270,19 @@ class DeadCodeEliminator {
 };
 
 void EliminateDeadCode(const std::shared_ptr<Graph>& graph) {
-  DeadCodeEliminator(graph).run(graph->block(), /*recurse=*/true);
+  // DeadCodeEliminator(graph).run(graph->block(), /*recurse=*/true);
 }
 
 void EliminateDeadCode(Block* block, bool recurse) {
-  DeadCodeEliminator().run(block, recurse);
+  // DeadCodeEliminator().run(block, recurse);
 }
 
 void EliminateDeadCode(
     Block* block,
     std::function<void(const std::unordered_set<const Value*>&)> cb) {
-  DeadCodeEliminator eliminator;
-  eliminator.setDeleteCallback(std::move(cb));
-  eliminator.run(block, /*recurse=*/true);
+  // DeadCodeEliminator eliminator;
+  // eliminator.setDeleteCallback(std::move(cb));
+  // eliminator.run(block, /*recurse=*/true);
 }
 
 } // namespace jit

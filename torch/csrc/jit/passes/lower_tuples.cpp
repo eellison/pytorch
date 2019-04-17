@@ -181,7 +181,7 @@ void LowerSimpleTuples(Block* block) {
 
 void LowerSimpleTuples(std::shared_ptr<Graph>& graph) {
   LowerSimpleTuples(graph->block());
-  EliminateDeadCode(graph);
+  // EliminateDeadCode(graph);
 }
 
 } // namespace jit

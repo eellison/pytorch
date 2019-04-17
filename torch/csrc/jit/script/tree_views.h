@@ -243,6 +243,7 @@ struct Stmt : public TreeView {
       case TK_RAISE:
       case TK_ASSERT:
       case TK_PASS:
+      case TK_BREAK:
       case TK_DEF:
         return;
       default:
@@ -639,6 +640,15 @@ struct Pass : public Stmt {
   }
   static Pass create(const SourceRange& range) {
     return Pass(Compound::create(TK_PASS, range, {}));
+  }
+};
+
+struct Break : public Stmt {
+  explicit Break(const TreeRef& tree) : Stmt(tree) {
+    tree_->match(TK_BREAK);
+  }
+  static Break create(const SourceRange& range) {
+    return Break(Compound::create(TK_BREAK, range, {}));
   }
 };
 

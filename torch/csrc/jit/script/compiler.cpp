@@ -11,6 +11,7 @@
 #include <torch/csrc/jit/script/parser.h>
 #include <torch/csrc/jit/script/schema_matching.h>
 #include <torch/csrc/jit/script/script_type_parser.h>
+#include <torch/csrc/jit/script/break_transform.h>
 #include <torch/csrc/utils/object_ptr.h>
 
 #include <torch/csrc/jit/constants.h>
@@ -484,13 +485,12 @@ static Value* materializeConstant(
     const SourceRange& r,
     std::unordered_map<T, Value*>& map) {
   auto existing_constant = map.find(val);
-  if (existing_constant != map.end()) {
-    return existing_constant->second;
-  }
-
+  // if (existing_constant != map.end()) {
+  //   return existing_constant->second;
+  // }
   WithInsertPoint guard(graph.block()->nodes().front());
   auto new_constant = graph.insertConstant(val, nullptr, r);
-  map[val] = new_constant;
+  // map[val] = new_constant;
 
   return new_constant;
 }
@@ -574,6 +574,7 @@ struct to_ir {
 
   void runCleanupPasses(std::shared_ptr<Graph>& to_clean) {
     // remove any uses of tuples that we inserted that are not needed
+    transformBreaks(graph);
     LowerSimpleTuples(to_clean);
     ConstantPooling(to_clean);
   }
@@ -870,6 +871,38 @@ struct to_ir {
     environment_stack->setVar(def.name().range(), def.name().name(), tup);
   }
 
+  void emitBreak(const Break& stmt) {
+    auto loop_block = environment_stack;
+
+    std::set<std::string> captured_vars;
+    do {
+      const auto& defined_vars = loop_block->definedVariables();
+      captured_vars.insert(defined_vars.begin(), defined_vars.end());
+      loop_block = loop_block->next;
+    } while(loop_block->b->owningNode()->kind() != prim::Loop && loop_block->next);
+
+    if (loop_block->b->owningNode()->kind() != prim::Loop) {
+      throw ErrorReport(stmt) << "Break statements must be within a loop.";
+    }
+    std::vector<Value *> vars;
+    std::vector<std::string> value_names(captured_vars.begin(), captured_vars.end());
+    for (const auto& var: value_names) {
+      Value * val = environment_stack->findInAnyFrame(var)->asValue(stmt.range(), method);
+      environment_stack->setVar(stmt.range(), var, val);
+      vars.push_back(val);
+    }
+
+    Node * var_capture = graph->create(prim::VarCapture, {vars}, 0);
+    var_capture->ss_(attr::value, value_names);
+    graph->insertNode(var_capture);
+    auto break_node = graph->create(prim::BreakStmt, {vars}, 0)
+      ->setSourceLocation(std::make_shared<SourceRange>(stmt.range()));
+    graph->insertNode(break_node);
+    break_node->ss_(attr::value, value_names);
+    var_capture->destroy();
+    exit_blocks.insert(environment_stack->block());
+  }
+
   void emitReturn(const Return& stmt) {
     Value* result = emitExpr(stmt.expr());
     TypePtr result_type = def_stack_.back().declared_return_type_;
@@ -954,6 +987,9 @@ struct to_ir {
         case TK_RETURN: {
           emitReturn(Return(stmt));
         } break;
+        case TK_BREAK: {
+          emitBreak(Break(stmt));
+        } break;
         case TK_PASS:
           // Emit nothing for pass
           break;
@@ -975,6 +1011,18 @@ struct to_ir {
     WithInsertPoint guard(b);
     insertRefinements(refinements);
     emitStatements(branch);
+    auto def_vars = environment_stack->definedVariables();
+    static SourceRange range(
+        std::make_shared<std::string>("<internally-created-node>"), 0, 1);
+    std::vector<Value*> values = {};
+    for (const auto& var: def_vars) {
+      Value * val = environment_stack->getVar(var, range);
+      values.push_back(val);
+    };
+    Node * var_capture = graph->create(prim::VarCapture, {values}, 0);
+    var_capture->ss_(attr::value, def_vars);
+    graph->insertNode(var_capture);
+    //XXX THIS DOESNT WORK BECAUSE WE JUST INSERT CONSTANTS IN THE BEGINNING of the graph i think;
     return popFrame();
   }
 
@@ -1233,6 +1281,7 @@ struct to_ir {
                      ->output()
                      ->setType(BottomType::get());
 
+    std::vector<std::string> emitted_vars;
     // Register outputs in each block
     for (const auto& x : mutated_variables) {
       auto tv = save_true->findInAnyFrame(x)
@@ -1274,7 +1323,11 @@ struct to_ir {
       false_block->registerOutput(fv);
       environment_stack->setVar(
           stmt.range(), x, n->addOutput()->setType(*unified));
+      emitted_vars.push_back(x);
     }
+    // Node * var_capture = graph->create(prim::VarCapture, {n->outputs()}, 0)
+    //                           ->insertAfter(n);
+    // var_capture->ss_(attr::value, emitted_vars);
   }
 
   void emitIf(const If& stmt) {
@@ -1419,7 +1472,8 @@ struct to_ir {
             itr_ident->range(), itr_ident->name(), trip_count);
       }
       emitStatements(body);
-
+      // TODO FOR CONTINUES prim::LoopCdondtions
+      // graph->insertNode(graph->create(prim::LoopCondition, 0));
       // Also emit the conditional
       if (cond) {
         Value* body_cond_value = emitCond(cond.value());
@@ -1432,15 +1486,26 @@ struct to_ir {
       auto body_frame = popFrame();
       auto outer_frame = environment_stack;
 
+      std::vector<Value *> vars;
+      std::vector<std::string> value_names;
       // Add block outputs to correspond to each captured input
       // some of these will be removed.
       for (const auto& x : body_frame->captured_inputs) {
         auto fv = body_frame->getValueInThisFrame(range, x);
+        vars.push_back(fv);
+        value_names.push_back(x);
         body_block->registerOutput(fv);
       }
+      value_names.insert(value_names.begin(), "$continue_loop");
+      vars.insert(vars.begin(), body_block->outputs().at(0));
+      Node * var_capture = graph->create(prim::VarCapture, {vars}, 0);
+      var_capture->ss_(attr::value, value_names);
+      graph->insertNode(var_capture);
+
 
       // Remove inputs for values that did not mutate within the
       // block
+      // should be able to replace with DCE
       body_frame->deleteExtraInputs(range);
 
       // register node inputs/outputs for the true loop carried deps,
