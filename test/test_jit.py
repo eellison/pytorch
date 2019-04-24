@@ -4125,43 +4125,6 @@ a")
             RuntimeError,
             "bool value of Tensor")
 
-    def test_list_sort(self):
-        template = dedent('''
-        def func():
-            li = {list_create}
-            li.sort()
-            return li
-        ''')
-
-        lists = ["[]", "[1, 3, 2]", "[True, False, True]", "[1.2, .2, 3.2]",
-                 "[torch.tensor(1.0), torch.tensor(0.2), torch.tensor(0.5)]",
-                 "[torch.tensor(5), torch.tensor(-2), torch.tensor(4)]"]
-        for li in lists:
-            code = template.format(list_create=li)
-            scope = {}
-            exec(code, globals(), scope)
-            cu = torch.jit.CompilationUnit(code)
-            t1 = cu.func()
-            t2 = scope['func']()
-            self.assertEqual(t1, t2)
-
-        def test_fail(x):
-            # type: (List[Tensor]) -> List[Tensor]
-            x.sort()
-            return x
-
-        self.checkScriptRaisesRegex(test_fail, (([torch.zeros([2]), torch.zeros([2])],)), Exception,
-                                    "bool value of Tensor with more than one value")
-
-        @torch.jit.script
-        def test_mutation():
-            a = [1, 2, 3]
-            a.sort()
-            return a
-
-        test_mutation()
-        FileCheck().check("aten::sort").run(test_mutation.graph_for())
-
     def test_list_slice(self):
         def test_regular_slice():
             a = [0, 1, 2, 3, 4]
@@ -14232,6 +14195,77 @@ class TestClassType(JitTestCase):
         sfoo = self.checkScript(use_foo, input)
         graphstr = str(sfoo.graph_for(*input))
         FileCheck().check_count("Double(*, *) = prim::GetAttr", 4).run(graphstr)
+
+    def test_class_sorting(self):
+        @torch.jit.script  # noqa: B903
+        class Foo(object):
+            def __init__(self, x):
+                # type: (int) -> None
+                self.x = x
+
+            def __lt__(self, other):
+                # type: (Foo) -> bool
+                return self.x < other.x
+
+            def getVal(self):
+                return self.x
+
+        @torch.jit.script
+        def test(li, reverse=False):
+            # type: (List[Foo], bool) -> List[int]
+            li.sort(reverse=reverse)
+            ret_list = torch.jit.annotate(List[int], [])
+            for foo in li:
+                ret_list.append(foo.getVal())
+            return ret_list
+
+        self.assertEqual(test([Foo(2), Foo(1), Foo(3)]), [1, 2, 3])
+        self.assertEqual(test([Foo(2), Foo(1), Foo(3)], True), [3, 2, 1])
+        self.assertEqual(test([Foo(2)]), [2])
+        self.assertEqual(test([]), [])
+
+        @torch.jit.script
+        def test_list_no_reverse():
+            li = [Foo(3), Foo(1)]
+            li.sort()
+            return li[0].getVal()
+
+        self.assertEqual(test_list_no_reverse(), 1)
+
+        with self.assertRaisesRegex(RuntimeError, "bool for argument \'reverse"):
+            @torch.jit.script
+            def test():
+                li = [Foo(1)]
+                li.sort(li)
+                return li
+
+        with self.assertRaisesRegex(RuntimeError, "because it does not define a __lt__ method"):
+            @torch.jit.script
+            class Foo(object):
+                def __init__(self):
+                    pass
+
+            @torch.jit.script
+            def test():
+                li = [Foo(), Foo()]
+                li.sort()
+                return li
+
+        @torch.jit.script
+        class WrongLt(object):
+            def __init__(self):
+                pass
+
+            # lt method defined with the wrong signature
+            def __lt__(self, other):
+                pass
+
+        with self.assertRaisesRegex(RuntimeError, "and returns a bool"):
+            @torch.jit.script
+            def test():
+                li = [WrongLt(), WrongLt()]
+                li.sort()
+                return li
 
 
 class TestLogging(JitTestCase):
