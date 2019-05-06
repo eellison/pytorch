@@ -1,0 +1,520 @@
+Optimized Graphs With Ifs
+test_nn_binary_cross_entropy, 2
+graph(%i0 : Double(*, *),
+      %i1 : Double(*, *),
+      %i2 : Double(*, *)):
+  %16 : string = prim::Constant[value="Using a target size ({}) that is different to the input size ({}) is deprecated. Please ensure they have the same size."]()
+  %13 : bool = prim::Constant[value=0]()
+  %11 : string = prim::Constant[value="Exception"]()
+  %6 : int = prim::Constant[value=1]()
+  %3 : int = prim::Constant[value=2]()
+  %49 : int[] = aten::size(%i1)
+  %50 : int[] = aten::size(%i0)
+  %51 : bool = aten::ne(%49, %50)
+   = prim::If(%51)
+    block0():
+      %52 : int[] = aten::size(%i1)
+      %53 : int[] = aten::size(%i0)
+      %54 : string = aten::format(%16, %52, %53)
+       = aten::warn(%54, %3)
+      -> ()
+    block1():
+      -> ()
+  %55 : int = aten::numel(%i0)
+  %56 : int = aten::numel(%i1)
+  %57 : bool = aten::ne(%55, %56)
+   = prim::If(%57)
+    block0():
+       = prim::RaiseException(%11)
+      -> ()
+    block1():
+      -> ()
+  %61 : int[] = aten::size(%i1)
+  %62 : int[] = aten::size(%i2)
+  %new_size : int[] = aten::_infer_size(%61, %62)
+  %weight.3 : Tensor = aten::expand(%i2, %new_size, %13)
+  %65 : Tensor = aten::binary_cross_entropy(%i0, %i1, %weight.3, %6)
+  return (%65)
+
+test_nn_binary_cross_entropy_size_average, 2
+graph(%i0 : Double(*, *),
+      %i1 : Double(*, *),
+      %i2 : Double(*, *)):
+  %16 : string = prim::Constant[value="Using a target size ({}) that is different to the input size ({}) is deprecated. Please ensure they have the same size."]()
+  %13 : bool = prim::Constant[value=0]()
+  %11 : string = prim::Constant[value="Exception"]()
+  %6 : int = prim::Constant[value=1]()
+  %3 : int = prim::Constant[value=2]()
+  %49 : int[] = aten::size(%i1)
+  %50 : int[] = aten::size(%i0)
+  %51 : bool = aten::ne(%49, %50)
+   = prim::If(%51)
+    block0():
+      %52 : int[] = aten::size(%i1)
+      %53 : int[] = aten::size(%i0)
+      %54 : string = aten::format(%16, %52, %53)
+       = aten::warn(%54, %3)
+      -> ()
+    block1():
+      -> ()
+  %55 : int = aten::numel(%i0)
+  %56 : int = aten::numel(%i1)
+  %57 : bool = aten::ne(%55, %56)
+   = prim::If(%57)
+    block0():
+       = prim::RaiseException(%11)
+      -> ()
+    block1():
+      -> ()
+  %61 : int[] = aten::size(%i1)
+  %62 : int[] = aten::size(%i2)
+  %new_size : int[] = aten::_infer_size(%61, %62)
+  %weight.3 : Tensor = aten::expand(%i2, %new_size, %13)
+  %65 : Tensor = aten::binary_cross_entropy(%i0, %i1, %weight.3, %6)
+  return (%65)
+
+test_nn_binary_cross_entropy_with_logits, 1
+graph(%i0 : Double(*),
+      %i1 : Double(*)):
+  %17 : Tensor? = prim::Constant()
+  %9 : string = prim::Constant[value="Exception"]()
+  %4 : int = prim::Constant[value=1]()
+  %48 : int[] = aten::size(%i1)
+  %49 : int[] = aten::size(%i0)
+  %50 : bool = aten::eq(%48, %49)
+  %51 : bool = aten::__not__(%50)
+   = prim::If(%51)
+    block0():
+       = prim::RaiseException(%9)
+      -> ()
+    block1():
+      -> ()
+  %52 : Tensor = aten::binary_cross_entropy_with_logits(%i0, %i1, %17, %17, %4)
+  return (%52)
+
+test_nn_cross_entropy, 1
+graph(%i0 : Double(*, *),
+      %i1 : Long(*)):
+  %19 : string = prim::Constant[value="Exception"]()
+  %12 : int = prim::Constant[value=0]()
+  %72 : int = aten::size(%i1, %12)
+  %ret.12 : Tensor, %ret.30 : Double(*, *) = prim::DifferentiableGraph_0(%i1, %i0)
+  %71 : int = aten::size(%ret.30, %12)
+  %73 : bool = aten::ne(%71, %72)
+   = prim::If(%73)
+    block0():
+       = prim::RaiseException(%19)
+      -> ()
+    block1():
+      -> ()
+  return (%ret.12)
+with prim::DifferentiableGraph_0 = graph(%1 : Long(*),
+      %6 : Double(*, *)):
+  %7 : int = prim::Constant[value=1]()
+  %ret.31 : Double(*, *) = aten::log_softmax(%6, %7)
+  %2 : Tensor? = prim::Constant()
+  %4 : int = prim::Constant[value=-100]()
+  %result.1 : Tensor, %total_weight.2 : Tensor = aten::nll_loss_forward(%ret.31, %1, %2, %7, %4)
+  return (%result.1, %ret.31, %total_weight.2)
+
+test_nn_embedding_bag, 5
+graph(%i0 : Long(*),
+      %i1 : Double(*, *),
+      %i2 : Long(*)):
+  %17 : bool = prim::Constant[value=0]()
+  %15 : Tensor? = prim::Constant()
+  %12 : int = prim::Constant[value=-1]()
+  %11 : bool? = prim::Constant()
+  %10 : int? = prim::Constant()
+  %9 : string = prim::Constant[value="Exception"]()
+  %6 : int = prim::Constant[value=4]()
+  %5 : int = prim::Constant[value=2]()
+  %4 : int = prim::Constant[value=0]()
+  %3 : int = prim::Constant[value=1]()
+  %33 : bool = aten::eq(%3, %5)
+  %input : Tensor, %offsets.9 : Tensor = prim::If(%33)
+    block0():
+       = prim::RaiseException(%9)
+      %38 : int = aten::numel(%i0)
+      %39 : int = aten::size(%i0, %3)
+      %92 : Device = prim::Constant[value="cpu"]()
+      %offsets.4 : Tensor = aten::arange(%4, %38, %39, %6, %10, %92, %11)
+      %input.3 : Tensor = prim::DifferentiableGraph_0(%i0)
+      -> (%input.3, %offsets.4)
+    block1():
+      %50 : bool = aten::eq(%3, %3)
+       = prim::If(%50)
+        block0():
+          %57 : bool = aten::ne(%3, %3)
+           = prim::If(%57)
+            block0():
+               = prim::RaiseException(%9)
+              -> ()
+            block1():
+              -> ()
+          %58 : Tensor = aten::select(%i2, %4, %4)
+          %59 : int = prim::Int(%58)
+          %60 : bool = aten::ne(%59, %4)
+           = prim::If(%60)
+            block0():
+               = prim::RaiseException(%9)
+              -> ()
+            block1():
+              -> ()
+          %61 : Tensor = aten::select(%i2, %4, %12)
+          %62 : int = prim::Int(%61)
+          %63 : int = aten::size(%i0, %4)
+          %64 : bool = aten::gt(%62, %63)
+           = prim::If(%64)
+            block0():
+               = prim::RaiseException(%9)
+              -> ()
+            block1():
+              -> ()
+          -> ()
+        block1():
+           = prim::RaiseException(%9)
+          -> ()
+      -> (%i0, %i2)
+  %ret : Tensor, %78 : Tensor, %79 : Tensor, %80 : Tensor = aten::embedding_bag(%i1, %input, %offsets.9, %17, %3, %17, %15)
+  return (%ret)
+with prim::DifferentiableGraph_0 = graph(%0 : Long(*)):
+  %1 : int[] = prim::Constant[value=[-1]]()
+  %input.3 : Tensor = aten::reshape(%0, %1)
+  return (%input.3)
+
+test_nn_l1_loss, 2
+graph(%i0 : Double(*, *),
+      %i1 : Double(*, *)):
+  %10 : int = prim::Constant[value=1]()
+  %3 : string = prim::Constant[value="Using a target size ({}) that is different to the input size ({}). This will likely lead to incorrect results due to broadcasting. Please ensure they have the same size."]()
+  %2 : int = prim::Constant[value=2]()
+  %18 : int[] = aten::size(%i1)
+  %19 : int[] = aten::size(%i0)
+  %20 : bool = aten::eq(%18, %19)
+  %21 : bool = aten::__not__(%20)
+   = prim::If(%21)
+    block0():
+      %22 : int[] = aten::size(%i1)
+      %23 : int[] = aten::size(%i0)
+      %24 : string = aten::format(%3, %22, %23)
+       = aten::warn(%24, %2)
+      -> ()
+    block1():
+      -> ()
+  %39 : bool = prim::requires_grad(%i1)
+  %ret : Tensor = prim::If(%39)
+    block0():
+      %68 : Double() = prim::DifferentiableGraph_0(%i0, %i1)
+      -> (%68)
+    block1():
+      %49 : Tensor[] = prim::ListConstruct(%i0, %i1)
+      %50 : Tensor[] = aten::broadcast_tensors(%49)
+      %expanded_input : Tensor, %expanded_target : Tensor = prim::ListUnpack(%50)
+      %ret.14 : Tensor = aten::l1_loss(%expanded_input, %expanded_target, %10)
+      -> (%ret.14)
+  return (%ret)
+with prim::DifferentiableGraph_0 = graph(%4 : Double(*, *),
+      %5 : Double(*, *)):
+  %6 : int = prim::Constant[value=1]()
+  %31 : int[] = aten::size(%4)
+  %7 : Double(*, *) = aten::sub(%4, %5, %6)
+  %ret.6 : Double(*, *) = aten::abs(%7)
+  %1 : Double() = aten::mean(%ret.6)
+  %self_size.2 : int[] = aten::size(%ret.6)
+  %self_numel.2 : int = aten::numel(%ret.6)
+  return (%1, %31, %7, %self_size.2, %self_numel.2)
+
+test_nn_l1_loss_with_grad, 2
+graph(%i0 : Double(*, *),
+      %i1 : Double(*, *)):
+  %10 : int = prim::Constant[value=1]()
+  %3 : string = prim::Constant[value="Using a target size ({}) that is different to the input size ({}). This will likely lead to incorrect results due to broadcasting. Please ensure they have the same size."]()
+  %2 : int = prim::Constant[value=2]()
+  %18 : int[] = aten::size(%i1)
+  %19 : int[] = aten::size(%i0)
+  %20 : bool = aten::eq(%18, %19)
+  %21 : bool = aten::__not__(%20)
+   = prim::If(%21)
+    block0():
+      %22 : int[] = aten::size(%i1)
+      %23 : int[] = aten::size(%i0)
+      %24 : string = aten::format(%3, %22, %23)
+       = aten::warn(%24, %2)
+      -> ()
+    block1():
+      -> ()
+  %39 : bool = prim::requires_grad(%i1)
+  %ret : Tensor = prim::If(%39)
+    block0():
+      %68 : Double() = prim::DifferentiableGraph_0(%i0, %i1)
+      -> (%68)
+    block1():
+      %49 : Tensor[] = prim::ListConstruct(%i0, %i1)
+      %50 : Tensor[] = aten::broadcast_tensors(%49)
+      %expanded_input : Tensor, %expanded_target : Tensor = prim::ListUnpack(%50)
+      %ret.14 : Tensor = aten::l1_loss(%expanded_input, %expanded_target, %10)
+      -> (%ret.14)
+  return (%ret)
+with prim::DifferentiableGraph_0 = graph(%4 : Double(*, *),
+      %5 : Double(*, *)):
+  %6 : int = prim::Constant[value=1]()
+  %31 : int[] = aten::size(%4)
+  %35 : int[] = aten::size(%5)
+  %7 : Double(*, *) = aten::sub(%4, %5, %6)
+  %ret.6 : Double(*, *) = aten::abs(%7)
+  %1 : Double() = aten::mean(%ret.6)
+  %self_size.2 : int[] = aten::size(%ret.6)
+  %self_numel.2 : int = aten::numel(%ret.6)
+  return (%1, %31, %35, %7, %self_size.2, %self_numel.2)
+
+test_nn_mse_loss, 2
+graph(%i0 : Double(*, *),
+      %i1 : Double(*, *)):
+  %10 : int = prim::Constant[value=1]()
+  %3 : string = prim::Constant[value="Using a target size ({}) that is different to the input size ({}). This will likely lead to incorrect results due to broadcasting. Please ensure they have the same size."]()
+  %2 : int = prim::Constant[value=2]()
+  %18 : int[] = aten::size(%i1)
+  %19 : int[] = aten::size(%i0)
+  %20 : bool = aten::eq(%18, %19)
+  %21 : bool = aten::__not__(%20)
+   = prim::If(%21)
+    block0():
+      %22 : int[] = aten::size(%i1)
+      %23 : int[] = aten::size(%i0)
+      %24 : string = aten::format(%3, %22, %23)
+       = aten::warn(%24, %2)
+      -> ()
+    block1():
+      -> ()
+  %39 : bool = prim::requires_grad(%i1)
+  %ret : Tensor = prim::If(%39)
+    block0():
+      %68 : Double() = prim::DifferentiableGraph_0(%i0, %i1)
+      -> (%68)
+    block1():
+      %49 : Tensor[] = prim::ListConstruct(%i0, %i1)
+      %50 : Tensor[] = aten::broadcast_tensors(%49)
+      %expanded_input : Tensor, %expanded_target : Tensor = prim::ListUnpack(%50)
+      %ret.14 : Tensor = aten::mse_loss(%expanded_input, %expanded_target, %10)
+      -> (%ret.14)
+  return (%ret)
+with prim::DifferentiableGraph_0 = graph(%5 : Double(*, *),
+      %6 : Double(*, *)):
+  %7 : int = prim::Constant[value=1]()
+  %46 : int[] = aten::size(%5)
+  %8 : Double(*, *) = aten::sub(%5, %6, %7)
+  %3 : int = prim::Constant[value=2]()
+  %ret.6 : Double(*, *) = aten::pow(%8, %3)
+  %1 : Double() = aten::mean(%ret.6)
+  %self_size.2 : int[] = aten::size(%ret.6)
+  %self_numel.2 : int = aten::numel(%ret.6)
+  return (%1, %7, %46, %8, %3, %self_size.2, %self_numel.2)
+
+test_nn_mse_loss_with_grad, 2
+graph(%i0 : Double(*, *),
+      %i1 : Double(*, *)):
+  %10 : int = prim::Constant[value=1]()
+  %3 : string = prim::Constant[value="Using a target size ({}) that is different to the input size ({}). This will likely lead to incorrect results due to broadcasting. Please ensure they have the same size."]()
+  %2 : int = prim::Constant[value=2]()
+  %18 : int[] = aten::size(%i1)
+  %19 : int[] = aten::size(%i0)
+  %20 : bool = aten::eq(%18, %19)
+  %21 : bool = aten::__not__(%20)
+   = prim::If(%21)
+    block0():
+      %22 : int[] = aten::size(%i1)
+      %23 : int[] = aten::size(%i0)
+      %24 : string = aten::format(%3, %22, %23)
+       = aten::warn(%24, %2)
+      -> ()
+    block1():
+      -> ()
+  %39 : bool = prim::requires_grad(%i1)
+  %ret : Tensor = prim::If(%39)
+    block0():
+      %68 : Double() = prim::DifferentiableGraph_0(%i0, %i1)
+      -> (%68)
+    block1():
+      %49 : Tensor[] = prim::ListConstruct(%i0, %i1)
+      %50 : Tensor[] = aten::broadcast_tensors(%49)
+      %expanded_input : Tensor, %expanded_target : Tensor = prim::ListUnpack(%50)
+      %ret.14 : Tensor = aten::mse_loss(%expanded_input, %expanded_target, %10)
+      -> (%ret.14)
+  return (%ret)
+with prim::DifferentiableGraph_0 = graph(%5 : Double(*, *),
+      %6 : Double(*, *)):
+  %7 : int = prim::Constant[value=1]()
+  %46 : int[] = aten::size(%5)
+  %50 : int[] = aten::size(%6)
+  %8 : Double(*, *) = aten::sub(%5, %6, %7)
+  %3 : int = prim::Constant[value=2]()
+  %ret.6 : Double(*, *) = aten::pow(%8, %3)
+  %1 : Double() = aten::mean(%ret.6)
+  %self_size.2 : int[] = aten::size(%ret.6)
+  %self_numel.2 : int = aten::numel(%ret.6)
+  return (%1, %7, %46, %50, %8, %3, %self_size.2, %self_numel.2)
+
+test_nn_nll_loss, 1
+graph(%i0 : Double(*, *),
+      %i1 : Long(*)):
+  %12 : string = prim::Constant[value="Exception"]()
+  %4 : int = prim::Constant[value=0]()
+  %37 : int = aten::size(%i0, %4)
+  %38 : int = aten::size(%i1, %4)
+  %39 : bool = aten::ne(%37, %38)
+   = prim::If(%39)
+    block0():
+       = prim::RaiseException(%12)
+      -> ()
+    block1():
+      -> ()
+  %ret.12 : Tensor = prim::DifferentiableGraph_0(%i0, %i1)
+  return (%ret.12)
+with prim::DifferentiableGraph_0 = graph(%0 : Double(*, *),
+      %1 : Long(*)):
+  %2 : Tensor? = prim::Constant()
+  %3 : int = prim::Constant[value=1]()
+  %4 : int = prim::Constant[value=-100]()
+  %result : Tensor, %total_weight.2 : Tensor = aten::nll_loss_forward(%0, %1, %2, %3, %4)
+  return (%result, %total_weight.2)
+
+test_nn_normalize, 1
+graph(%i0 : Double(*, *, *)):
+  %20 : int[] = prim::Constant[value=[1]]()
+  %6 : float = prim::Constant[value=2]()
+  %4 : float = prim::Constant[value=1e-12]()
+  %3 : Tensor? = prim::Constant()
+  %2 : bool = prim::Constant[value=1]()
+  %1 : None = prim::Constant()
+  %7 : bool = aten::__is__(%3, %1)
+  %ret : Tensor = prim::If(%7)
+    block0():
+      %10 : Double(*, *, *) = aten::norm(%i0, %6, %20, %2)
+      %11 : Double(*, *, *) = aten::clamp_min(%10, %4)
+      %ret.1 : Double(*, *, *) = prim::DifferentiableGraph_0(%i0, %11)
+      -> (%ret.1)
+    block1():
+      %out.2 : Tensor = prim::unchecked_unwrap_optional(%3)
+      %21 : int[] = prim::Constant[value=[1]]()
+      %16 : Double(*, *, *) = aten::norm(%i0, %6, %21, %2)
+      %17 : Double(*, *, *) = aten::clamp_min(%16, %4)
+      %denom.2 : Double(*, *, *) = prim::DifferentiableGraph_1(%17, %i0)
+      %ret.2 : Tensor = aten::div(%i0, %denom.2, %out.2)
+      -> (%ret.2)
+  return (%ret)
+with prim::DifferentiableGraph_0 = graph(%0 : Double(*, *, *),
+      %3 : Double(*, *, *)):
+  %denom.2 : Double(*, *, *) = aten::expand_as(%3, %0)
+  %self_size.2 : int[] = aten::size(%3)
+  %ret.1 : Double(*, *, *) = aten::div(%0, %denom.2)
+  return (%ret.1, %denom.2, %self_size.2)
+with prim::DifferentiableGraph_1 = graph(%0 : Double(*, *, *),
+      %1 : Double(*, *, *)):
+  %denom.2 : Double(*, *, *) = aten::expand_as(%0, %1)
+  %self_size.2 : int[] = aten::size(%0)
+  return (%denom.2, %self_size.2)
+
+test_nn_smooth_l1_loss, 2
+graph(%i0 : Double(*, *),
+      %i1 : Double(*, *)):
+  %10 : int = prim::Constant[value=1]()
+  %3 : string = prim::Constant[value="Using a target size ({}) that is different to the input size ({}). This will likely lead to incorrect results due to broadcasting. Please ensure they have the same size."]()
+  %2 : int = prim::Constant[value=2]()
+  %19 : int[] = aten::size(%i1)
+  %20 : int[] = aten::size(%i0)
+  %21 : bool = aten::eq(%19, %20)
+  %22 : bool = aten::__not__(%21)
+   = prim::If(%22)
+    block0():
+      %23 : int[] = aten::size(%i1)
+      %24 : int[] = aten::size(%i0)
+      %25 : string = aten::format(%3, %23, %24)
+       = aten::warn(%25, %2)
+      -> ()
+    block1():
+      -> ()
+  %40 : bool = prim::requires_grad(%i1)
+  %ret : Tensor = prim::If(%40)
+    block0():
+      %74 : Double() = prim::DifferentiableGraph_0(%i0, %i1)
+      -> (%74)
+    block1():
+      %55 : Tensor[] = prim::ListConstruct(%i0, %i1)
+      %56 : Tensor[] = aten::broadcast_tensors(%55)
+      %expanded_input : Tensor, %expanded_target : Tensor = prim::ListUnpack(%56)
+      %ret.14 : Tensor = aten::smooth_l1_loss(%expanded_input, %expanded_target, %10)
+      -> (%ret.14)
+  return (%ret)
+with prim::DifferentiableGraph_0 = graph(%19 : Double(*, *),
+      %20 : Double(*, *)):
+  %21 : int = prim::Constant[value=1]()
+  %98 : int[] = aten::size(%19)
+  %22 : Double(*, *) = aten::sub(%19, %20, %21)
+  %t.1 : Double(*, *) = aten::abs(%22)
+  %16 : Byte(*, *) = aten::lt(%t.1, %21)
+  %13 : int = prim::Constant[value=2]()
+  %14 : Double(*, *) = aten::pow(%t.1, %13)
+  %11 : float = prim::Constant[value=0.5]()
+  %12 : Double(*, *) = aten::mul(%14, %11)
+  %9 : Double(*, *) = aten::sub(%t.1, %11, %21)
+  %ret.6 : Double(*, *) = aten::where(%16, %12, %9)
+  %self_size.4 : int[] = aten::size(%12)
+  %other_size.2 : int[] = aten::size(%9)
+  %1 : Double() = aten::mean(%ret.6)
+  %self_size.2 : int[] = aten::size(%ret.6)
+  %self_numel.2 : int = aten::numel(%ret.6)
+  return (%1, %21, %98, %22, %t.1, %16, %13, %self_size.4, %other_size.2, %self_size.2, %self_numel.2)
+
+test_nn_smooth_l1_loss_with_grad, 2
+graph(%i0 : Double(*, *),
+      %i1 : Double(*, *)):
+  %10 : int = prim::Constant[value=1]()
+  %3 : string = prim::Constant[value="Using a target size ({}) that is different to the input size ({}). This will likely lead to incorrect results due to broadcasting. Please ensure they have the same size."]()
+  %2 : int = prim::Constant[value=2]()
+  %19 : int[] = aten::size(%i1)
+  %20 : int[] = aten::size(%i0)
+  %21 : bool = aten::eq(%19, %20)
+  %22 : bool = aten::__not__(%21)
+   = prim::If(%22)
+    block0():
+      %23 : int[] = aten::size(%i1)
+      %24 : int[] = aten::size(%i0)
+      %25 : string = aten::format(%3, %23, %24)
+       = aten::warn(%25, %2)
+      -> ()
+    block1():
+      -> ()
+  %40 : bool = prim::requires_grad(%i1)
+  %ret : Tensor = prim::If(%40)
+    block0():
+      %74 : Double() = prim::DifferentiableGraph_0(%i0, %i1)
+      -> (%74)
+    block1():
+      %55 : Tensor[] = prim::ListConstruct(%i0, %i1)
+      %56 : Tensor[] = aten::broadcast_tensors(%55)
+      %expanded_input : Tensor, %expanded_target : Tensor = prim::ListUnpack(%56)
+      %ret.14 : Tensor = aten::smooth_l1_loss(%expanded_input, %expanded_target, %10)
+      -> (%ret.14)
+  return (%ret)
+with prim::DifferentiableGraph_0 = graph(%19 : Double(*, *),
+      %20 : Double(*, *)):
+  %21 : int = prim::Constant[value=1]()
+  %98 : int[] = aten::size(%19)
+  %102 : int[] = aten::size(%20)
+  %22 : Double(*, *) = aten::sub(%19, %20, %21)
+  %t.1 : Double(*, *) = aten::abs(%22)
+  %16 : Byte(*, *) = aten::lt(%t.1, %21)
+  %13 : int = prim::Constant[value=2]()
+  %14 : Double(*, *) = aten::pow(%t.1, %13)
+  %11 : float = prim::Constant[value=0.5]()
+  %12 : Double(*, *) = aten::mul(%14, %11)
+  %9 : Double(*, *) = aten::sub(%t.1, %11, %21)
+  %ret.6 : Double(*, *) = aten::where(%16, %12, %9)
+  %self_size.4 : int[] = aten::size(%12)
+  %other_size.2 : int[] = aten::size(%9)
+  %1 : Double() = aten::mean(%ret.6)
+  %self_size.2 : int[] = aten::size(%ret.6)
+  %self_numel.2 : int = aten::numel(%ret.6)
+  return (%1, %21, %98, %102, %22, %t.1, %16, %13, %self_size.4, %other_size.2, %self_size.2, %self_numel.2)
+

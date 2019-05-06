@@ -12837,6 +12837,7 @@ def create_script_fn(self, method_name, func_type, output_process_fn):
         CU = torch.jit.CompilationUnit(script)
         self.assertExportImport(CU.the_method.graph, tensors)
         output = output_process_fn(CU.the_method(*tensors))
+        script_fn.unoptimized_graph = CU.the_method.graph
         script_fn.last_graph = CU.the_method.graph_for(*tensors)
         return output
     return script_fn
@@ -12889,6 +12890,18 @@ def check_against_reference(self, func, reference_func, args, kwargs=None,
 
     if check_types:
         check_output_types(self, func, outputs_test, nograd_inputs, kwargs)
+
+    import pdb; pdb.set_trace()
+    # if (str)
+    # print(str(graph).count("prim::If"))
+    # # if str(graph).count("prim::If"):
+    # #     print(graph)
+    # print(func)
+    # graph2 = getattr(func, 'graph', None)
+    # print(func)
+    # print(reference_func)
+    #
+    # print(graph)
 
     if no_grad:
         # skip grad tests
@@ -13557,6 +13570,13 @@ def add_autograd_test(
                                                     fn, (self_variable,) + args_variable, kwargs_variable,
                                                     check_types=check_types)
 
+                            # if count:
+                            #     import pdb; pdb.set_trace()
+                            #     print(count)
+                            #     print(func)
+                            #     print(func.unoptimized_graph)
+
+
                             # Fuser not supported on windows
                             if IS_SANDCASTLE or IS_WINDOWS:
                                 autodiff_nodes = autodiff_nodes + fusible_nodes
@@ -13649,6 +13669,49 @@ def add_nn_functional_test(name, self_size, args, variant_name='', check_ad=(), 
                     check_against_reference(self, script_fn, fn, f_args_variable, kwargs_variable, no_grad=no_grad)
                     # For tests we disabled AD subgraph inlining, make sure it's not falling back to autograd
                     self.assertAutodiffNode(script_fn.last_graph, should_autodiff_node, autodiff_nodes, fusible_nodes)
+
+                    def if_count(graph):
+                        # if test_name =
+                        graph_str = str(graph)
+                        diff = graph_str.find("with prim::DifferentiableGraph")
+                        if diff != -1:
+                            graph_str = graph_str[0:diff]
+                        return graph_str.count("prim::If")
+
+
+                    # filename = "if_counts.txt"
+                    # if not os.path.exists(filename):
+                    #     f = open(filename, "w+")
+                    #     f.write("func_name, unoptimized ifs, optimized ifs\n")
+                    # else:
+                    #     f = open(filename, "a")
+                    #
+                    # opt_graph_file = "opt_graphs.txt"
+                    # if not os.path.exists(opt_graph_file):
+                    #     g_file = open(opt_graph_file, "w+")
+                    #     g_file.write("Optimized Graphs With Ifs\n")
+                    # else:
+                    #     g_file = open(opt_graph_file, "a")
+                    #
+                    # graph = script_fn.unoptimized_graph
+                    # count = if_count(graph)
+                    opt_graph = getattr(script_fn, 'last_graph', None)
+                    # print("RUNNING PEEPHOLE AGAIN\n\n")
+
+                    # self.run_pass('peephole', opt_graph)
+                    torch._C._jit_pass_constant_propagation(opt_graph)
+                    torch._C._jit_pass_constant_propagation(opt_graph)
+                    print(if_count(opt_graph))
+                    print(opt_graph)
+                    # opt_count = if_count(opt_graph)
+                    #
+                    # # f.write(test_name + ", " + str(count) + ", " + str(opt_count) + "\n")
+                    # f.close()
+                    #
+                    # if opt_count:
+                    #     g_file.write(test_name + ", " + str(opt_count) + "\n")
+                    #     g_file.write(str(opt_graph))
+                    #     g_file.write("\n")
 
             if test_name in EXCLUDE_PYTHON_PRINT:
                 with self.disableEmitHook():
@@ -13765,6 +13828,9 @@ def add_nn_module_test(*args, **kwargs):
 
         # Check against Python module as reference
         check_against_reference(self, create_script_module, create_nn_module, f_args_variable, no_grad=no_grad)
+
+        import pdb; pdb.set_trace()
+
 
     post_add_test(test_name, (), do_test, TestJitGeneratedModule)
 
