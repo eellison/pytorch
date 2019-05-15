@@ -295,6 +295,7 @@ class JitTestCase(TestCase):
 
         # disable the hook while we parse code, otherwise we will re-enter the hook
         with self.disableModuleHook():
+            return
             try:
                 if len(module.code) == 0:
                     # short-circuit if this is an empty module
@@ -9856,6 +9857,212 @@ a")
 
         self.checkScript(code, (101,), name='elif_test', outputs=3028)
 
+    def test_elias(self):
+        def assign_after_break(y: int):
+            x = 0
+            for i in range(y):
+                x = y * 2 + i
+                break
+                x = 4
+            return x
+
+        self.checkScript(assign_after_break, (1,))
+        self.checkScript(assign_after_break, (2,))
+        self.checkScript(assign_after_break, (3,))
+
+        def assign_after_break_nested(y: int):
+            x = 0
+            for i in range(y):
+                if y == 1:
+                    x = 5
+                    break
+                    assert False
+                else:
+                    x = x + 1
+                    break
+                    assert False
+                x = -30
+                assert False
+            return x
+
+        self.checkScript(assign_after_break_nested, (1,))
+        self.checkScript(assign_after_break_nested, (2,))
+        self.checkScript(assign_after_break_nested, (3,))
+
+        def may_break(y: int):
+            x = 0
+            for i in range(y):
+                if y == 1:
+                    x = 5
+                else:
+                    x = x + 1
+                    break
+                x = -30
+            return x
+
+        self.checkScript(may_break, (1,))
+        self.checkScript(may_break, (2,))
+        self.checkScript(may_break, (3,))
+
+        def test(x: int, y: int):
+            a = 1
+            while (x > 0):
+                if y == 3:
+                    for i in range(y):
+                        a += (1 % (i + 1))
+                        x -= 1
+                if x == 3:
+                    a = x * 3
+                    break
+                if x < 3:
+                    if x == 1:
+                        a -= 2
+                        x -= 1
+                        break
+                a -= 1
+                x -= 3
+            return a, x
+
+        self.checkScript(test, (10, 3))
+        self.checkScript(test, (10, 2))
+        self.checkScript(test, (3, 2))
+        self.checkScript(test, (5, 3))
+        self.checkScript(test, (2, 3))
+
+        def test_delete_after_break(x: int):
+            a = 1
+            b = 1
+            for i in range(x):
+                a = i * 3
+                break
+                b = i * 5
+            return a, b
+
+        self.checkScript(test_delete_after_break, (0,))
+        self.checkScript(test_delete_after_break, (1,))
+
+        def test_will_break_after_guard(x: int):
+            a = 1
+            for i in range(x):
+                if i == 4:
+                    a = 3
+                    break
+                a -= 1
+                break
+                assert False
+                a -= -100
+            return a
+
+        graph = torch.jit.script(test_will_break_after_guard).graph
+        print(graph)
+        self.run_pass('peephole', graph)
+        self.run_pass('constant_propagation', graph)
+        # TODO - it would be nice to have a merge if pass
+        #
+
+        print(graph)
+
+        return
+
+
+
+
+
+            #
+            # # def test(x: int, y: int):
+            # #     a = 1
+            # #     while (x > 0):
+            # #         if y == 3:
+            # #             for i in range(y):
+            # #                 a += (1 % (i + 1))
+            # #                 x -= 1
+            # #         if x == 3:
+            # #             a = x * 3
+            # #             break
+            # #         if x < 3:
+            # #             # this loop will only have a set
+            # #             # here, if there is another value
+            # #             #  set we need
+            # #             if x == 1:
+            # #                 a -= 2
+            # #                 x -= 1
+            # #                 break
+            # #         a -= 1
+            # #         x -= 3
+            # #     return a, x
+            #
+            # # self.checkScript(test, (14, 2))
+            # # self.checkScript(test, (12, 2))
+            # fn = torch.jit.script(test)
+            # print(fn.graph)
+            # # torch._C._jit_pass_lint(graph)
+            # return
+            #
+            # def test(x: int):
+            #     a = 1
+            #     while (x > 0):
+            #         if x == 3:
+            #             a = x * 3
+            #             break
+            #         if did_break:
+            #             a = x * 3
+            #             # x input_x
+            #             # loop_continue
+            #         else:
+            #             if x < 3:
+            #                 # this loop will only have a set
+            #                 # here, if there is another value
+            #                 #  set we need
+            #                 if x == 1:
+            #                     a = 0
+            #                     break
+            #             a -= 1
+            #             x -= 1
+            #     return a, x
+            #
+            #
+            # @torch.jit.script
+            # def test():
+            #     a = torch.tensor(1.0)
+            #     while (a.add_(1) < 5):
+            #         print(a)
+            #
+            # print(test.graph)
+            #
+            #
+            # @torch.jit.script
+            # def loop(x: int):
+            #     a = 1
+            #     b = 1
+            #     for i in range(x):
+            #         if x == 5:
+            #             a = 2
+            #             break
+            #         a = 1
+            #         b = i * i
+            #         # a = i * 2
+            #     return a, b
+            #
+            # print(loop.graph)
+            # return
+            # @torch.jit.script
+            # def loop(x: int):
+            #     a = 1
+            #     b = 1
+            #     for i in range(x):
+            #         b = 4 * 3
+            #         if x == 4:
+            #             if x == 5:
+            #                 a = 2
+            #                 break
+            #             a = 3
+            #             b = 2
+            #         b = i * i
+            #         a = i * 2
+            #     print(a, b)
+            #     return a, b
+            # print(loop.graph)
+
     def test_pyop_exception_message(self):
         class Foo(torch.jit.ScriptModule):
             def __init__(self):
@@ -9953,6 +10160,8 @@ a")
         # we don't currently validate the name of the exception
         with self.assertRaisesRegex(torch.jit.Error, "Exception"):
             foo(torch.tensor(0))
+
+
 
     def test_weak_script_function(self):
         outer_var = 10
@@ -10667,7 +10876,7 @@ a")
         self.checkScript(fn4, ("abcdefghi",))
 
     def test_loop_final_returns(self):
-        @torch.jit.script
+        @torch._jit_internal.weak_script
         def test(x: int):
             a = 1
             b = 2
@@ -10680,9 +10889,10 @@ a")
                     else:
                         a = 5
                         break
-                    a = 1
-                a = 1
+                    a = 5 * 5
+                a = 4
             return a
+
 
         print(test.graph)
         return

@@ -871,19 +871,31 @@ struct to_ir {
     environment_stack->setVar(def.name().range(), def.name().name(), tup);
   }
 
-  void emitBreak(const Break& stmt) {
-    auto loop_block = environment_stack;
+  bool inLoop() {
+    auto env = environment_stack;
+    do {
+      Node * n = env->b->owningNode();
+      if (n && n->kind() == prim::Loop) {
+        return true;
+      }
+      env = env->next;
+    } while(env->next);
+    return false;
+  }
 
+  void emitBreak(const Break& stmt) {
+    if (!inLoop()) {
+      throw ErrorReport(stmt) << "Break statements must be within a loop.";
+    }
+
+    auto loop_block = environment_stack;
     std::set<std::string> captured_vars;
     do {
       const auto& defined_vars = loop_block->definedVariables();
       captured_vars.insert(defined_vars.begin(), defined_vars.end());
       loop_block = loop_block->next;
-    } while(loop_block->b->owningNode()->kind() != prim::Loop && loop_block->next);
+    } while(loop_block->next && loop_block->b->owningNode()->kind() != prim::Loop);
 
-    if (loop_block->b->owningNode()->kind() != prim::Loop) {
-      throw ErrorReport(stmt) << "Break statements must be within a loop.";
-    }
     std::vector<Value *> vars;
     std::vector<std::string> value_names(captured_vars.begin(), captured_vars.end());
     for (const auto& var: value_names) {
@@ -892,15 +904,24 @@ struct to_ir {
       vars.push_back(val);
     }
 
-    Node * var_capture = graph->create(prim::VarCapture, {vars}, 0);
-    var_capture->ss_(attr::value, value_names);
-    graph->insertNode(var_capture);
     auto break_node = graph->create(prim::BreakStmt, {vars}, 0)
       ->setSourceLocation(std::make_shared<SourceRange>(stmt.range()));
     graph->insertNode(break_node);
     break_node->ss_(attr::value, value_names);
-    var_capture->destroy();
-    exit_blocks.insert(environment_stack->block());
+    // todo -
+    // a = 3
+    // for i in range(5):
+    //  if i == 1:
+    //    a = 4
+    //    break
+    //  you could allow this by having a stitch correct break values
+    //  to loop outputs
+    //  else:
+    //    b = 3
+    //  print(b)
+    //
+    //
+    // exit_blocks.insert(environment_stack->block());
   }
 
   void emitReturn(const Return& stmt) {
@@ -1019,9 +1040,9 @@ struct to_ir {
       Value * val = environment_stack->getVar(var, range);
       values.push_back(val);
     };
-    Node * var_capture = graph->create(prim::VarCapture, {values}, 0);
-    var_capture->ss_(attr::value, def_vars);
-    graph->insertNode(var_capture);
+    // Node * var_capture = graph->create(prim::VarCapture, {values}, 0);
+    // var_capture->ss_(attr::value, def_vars);
+    // graph->insertNode(var_capture);
     //XXX THIS DOESNT WORK BECAUSE WE JUST INSERT CONSTANTS IN THE BEGINNING of the graph i think;
     return popFrame();
   }
@@ -1325,9 +1346,7 @@ struct to_ir {
           stmt.range(), x, n->addOutput()->setType(*unified));
       emitted_vars.push_back(x);
     }
-    // Node * var_capture = graph->create(prim::VarCapture, {n->outputs()}, 0)
-    //                           ->insertAfter(n);
-    // var_capture->ss_(attr::value, emitted_vars);
+    n->ss_(attr::value, emitted_vars);
   }
 
   void emitIf(const If& stmt) {
@@ -1486,37 +1505,29 @@ struct to_ir {
       auto body_frame = popFrame();
       auto outer_frame = environment_stack;
 
-      std::vector<Value *> vars;
-      std::vector<std::string> value_names;
       // Add block outputs to correspond to each captured input
       // some of these will be removed.
       for (const auto& x : body_frame->captured_inputs) {
         auto fv = body_frame->getValueInThisFrame(range, x);
-        vars.push_back(fv);
-        value_names.push_back(x);
         body_block->registerOutput(fv);
       }
-      value_names.insert(value_names.begin(), "$continue_loop");
-      vars.insert(vars.begin(), body_block->outputs().at(0));
-      Node * var_capture = graph->create(prim::VarCapture, {vars}, 0);
-      var_capture->ss_(attr::value, value_names);
-      graph->insertNode(var_capture);
-
 
       // Remove inputs for values that did not mutate within the
       // block
       // should be able to replace with DCE
       body_frame->deleteExtraInputs(range);
-
+      std::vector<std::string> input_names = {"$continue_loop"};
       // register node inputs/outputs for the true loop carried deps,
       for (size_t i = 0; i < body_frame->captured_inputs.size(); ++i) {
         auto x = body_frame->captured_inputs[i];
         n->addInput(outer_frame->getVar(x, range));
+        input_names.push_back(x);
         // body_block->inputs(): loop_counter, lcd0, lcd1, ...
         // captured_inputs: lcd0, lcd1, ...
         auto typ = body_block->inputs()[i + 1]->type();
         outer_frame->setVar(range, x, n->addOutput()->setType(typ));
       }
+      n->ss_(attr::value, input_names);
     }
   }
 
