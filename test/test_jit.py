@@ -295,7 +295,6 @@ class JitTestCase(TestCase):
 
         # disable the hook while we parse code, otherwise we will re-enter the hook
         with self.disableModuleHook():
-            return
             try:
                 if len(module.code) == 0:
                     # short-circuit if this is an empty module
@@ -9858,6 +9857,7 @@ a")
         self.checkScript(code, (101,), name='elif_test', outputs=3028)
 
     def test_elias(self):
+        @torch.jit.script
         def assign_after_break(y: int):
             x = 0
             for i in range(y):
@@ -9866,6 +9866,7 @@ a")
                 x = 4
             return x
 
+        return
         self.checkScript(assign_after_break, (1,))
         self.checkScript(assign_after_break, (2,))
         self.checkScript(assign_after_break, (3,))

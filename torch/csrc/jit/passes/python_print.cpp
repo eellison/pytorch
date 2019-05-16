@@ -554,7 +554,7 @@ struct PythonPrintPass {
     // values to the node->outputs() before the loop,
     // and assign node->outputs() to the new values at the end of each trip.
 
-    bool emit_as_for_loop = false; //shouldEmitAsForLoop(stmt);
+    bool emit_as_for_loop = shouldEmitAsForLoop(stmt);
 
     assignValuesToTheirUniqueNames(stmt.carriedOutputs());
     // Add aliases for loop-carried dependencies

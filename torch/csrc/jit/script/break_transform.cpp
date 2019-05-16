@@ -33,24 +33,11 @@ struct MiniEnvironment {
         return r;
       }
     }
-    AT_ASSERT(false); // should never happen in this context
+    AT_ASSERT(false); // should never happen in break transform
   }
 
   void setVar(const std::string& name, Value* value) {
     value_table[name] = std::move(value);
-  }
-
-  std::vector<std::string> loopScopedVars() {
-    auto runner = this;
-    while (runner && runner->b->owningNode()->kind() != prim::Loop) {
-      runner = runner->next.get();
-    }
-    AT_ASSERT(runner);
-    std::vector<std::string> result;
-    for (auto& kv : runner->value_table) {
-      result.push_back(kv.first);
-    }
-    return result;
   }
 
  private:
@@ -264,8 +251,8 @@ struct BreakTransformer {
       return WILL_BREAK;
     }
 
-    pushScope(block);
     auto ret_status = WONT_BREAK;
+    pushFrame(block);
     for (auto it = block->nodes().begin(); it != block->nodes().end();) {
       Node* node = *it;
       it++;
@@ -291,10 +278,10 @@ struct BreakTransformer {
         break;
       }
     }
+    popFrame();
     if (ret_status == WONT_BREAK) {
       block_sentinel_val[block] = false_val;
     }
-    popFrame();
     return ret_status;
   }
 
@@ -317,13 +304,6 @@ struct BreakTransformer {
     eraseControlFlowAttr(graph->block());
   }
 
-  void pushScope(Block *b) {
-    pushFrame(b);
-    if (b->owningNode() && b->owningNode()->kind() == prim::Loop) {
-      setLoopCarriedVars(b);
-    }
-  }
-
   void setLoopCarriedVars(Block* b) {
     auto names = b->owningNode()->ss(attr::value);
     // we set the continue loop value to be true, since
@@ -337,6 +317,9 @@ struct BreakTransformer {
 
   void pushFrame(Block* b) {
     environment_stack = std::make_shared<MiniEnvironment>(b, environment_stack);
+    if (b->owningNode() && b->owningNode()->kind() == prim::Loop) {
+      setLoopCarriedVars(b);
+    }
   }
 
   std::shared_ptr<MiniEnvironment> popFrame() {
