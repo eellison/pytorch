@@ -384,20 +384,6 @@ void testCustomFusion() {
 }
 
 static const auto cf_examples = R"JIT(
-  def if_test(a, b):
-      # FIXME: use 0 instead of a.
-      # c = 0
-      c = a
-      if bool(a < b):
-        c = b
-      else:
-        c = a
-      return c
-  def if_one(a, b):
-    c = b
-    if bool(a < b):
-      c = a
-    return c
   def while_test(a, i):
     while bool(i < 3):
       a *= a
@@ -422,10 +408,6 @@ void testControlFlow() {
   auto run_binary = [&](const std::string& name, int64_t a, int64_t b) {
     return V(run(name, {L(a), L(b)})[0]);
   };
-  ASSERT_EQ(2, run_binary("if_test", 1, 2));
-  ASSERT_EQ(3, run_binary("if_test", 3, 2));
-  ASSERT_EQ(2, run_binary("if_one", 2, 3));
-  ASSERT_EQ(2, run_binary("if_one", 3, 2));
   ASSERT_EQ(256, run_binary("while_test", 2, 0));
 }
 
@@ -683,13 +665,15 @@ void testRecordFunction() {
         for (const auto& input : inputs) {
           if (input.isTensor()) {
             sizes.push_back(input.toTensor().sizes().vec());
-          } else if (input.isScalar()){
+          } else if (input.isScalar()) {
             sizes.push_back(std::vector<int64_t>());
           }
         }
         traced_inputs.push_back(
             std::make_tuple(std::string(getFullName(&fn)), sizes));
-      }, [](const autograd::profiler::RecordFunction&) {}, true);
+      },
+      [](const autograd::profiler::RecordFunction&) {},
+      true);
 
   autograd::profiler::setSamplingProbability(1.0);
 
@@ -815,7 +799,6 @@ void testModuleConversion() {
     AT_ASSERT(m->get_buffer("bar").data().device().is_cuda());
   }
 }
-
 
 static int testPassValue = 0;
 void fakePass(std::shared_ptr<Graph>& g) {

@@ -7244,7 +7244,7 @@ a")
             print(c)
 
         # c is used, then unused should be ordered by alphabetical
-        FileCheck().check(r"%c : int, %a : int, %b : int").run(loop_unused.graph)
+        FileCheck().check(r"%c.9 : int, %a : int, %b : int").run(loop_unused.graph)
 
     def test_filecheck(self):
         def test_check():
@@ -13903,8 +13903,8 @@ graph(%0 : Double(5, 5)):
         def func(x):
             return torch.ops.aten.relu(x)
         self.assertExpectedInline(canonical(func.graph), '''\
-graph(%x : Tensor):
-  %1 : Tensor = aten::relu(%x)
+graph(%x.1 : Tensor):
+  %1 : Tensor = aten::relu(%x.1)
   return (%1)
 ''')
 

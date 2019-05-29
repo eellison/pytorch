@@ -6,8 +6,11 @@
 #include <torch/csrc/jit/operator.h>
 #include <torch/csrc/jit/passes/canonicalize.h>
 #include <torch/csrc/jit/passes/constant_pooling.h>
+#include <torch/csrc/jit/passes/dead_code_elimination.h>
 #include <torch/csrc/jit/passes/lower_tuples.h>
+#include <torch/csrc/jit/script/convert_to_ssa.h>
 #include <torch/csrc/jit/script/final_returns.h>
+#include <torch/csrc/jit/script/mini_environment.h>
 #include <torch/csrc/jit/script/parser.h>
 #include <torch/csrc/jit/script/schema_matching.h>
 #include <torch/csrc/jit/script/script_type_parser.h>
@@ -27,6 +30,7 @@ namespace script {
 using SugaredValuePtr = std::shared_ptr<SugaredValue>;
 using FunctionTable = std::unordered_map<std::string, Function&>;
 using ValueTable = std::unordered_map<std::string, SugaredValuePtr>;
+using SimpleValueTable = std::unordered_map<std::string, Value*>;
 using AttributeMap = std::unordered_map<std::string, Const>;
 using ListAttributeMap = std::unordered_map<std::string, std::vector<Const>>;
 
@@ -166,28 +170,24 @@ static bool meaningfulName(const std::string& name) {
 // explicitly scoped language as we descend down nested control structures in
 // the frontend (which themselves don't introduce scopes)
 //
-// The algorithm is roughly as follows:
-// 1) While emitting a block within a control operator, add inputs and outputs
-//      from the block for each value referenced (both "reads" and "writes").
-//      This sets the value up as a candidate loop carried dependency.
-// 2) When we reach the end of the block, examine all the values in the current
-//      scope's value map. If the name also resides in an outer scope with a
-//      different Value*, this is a true loop-carried dependency. If not, this
-//      value was not assigned to. Replace all references to the block input
-//      with the Value* pointed to in the tightest enclosing scope. Then delete
-//      that block input and output.
-// 3) When we emit the actual control operator, take all of the loop-carried
-//      dependency values as inputs and return them as outputs from the control
-//      op
+// The Environment keeps track of two tables, one for values which are first
+// class and another for values which are not. When a first class value
+// is set in the environment, we emit a prim::Store which sets the
+// name of the variable to the type of a value. When a first-class value is
+// referenced we emit a prim::Load that generates a value of the appropriate
+// type type.
 //
-//  Note that an alternative implementation could only add the loop-carried dep
-//      inputs and outputs when we see a value that is mutated. This, however
-//      requires replacing all references to that value *within the current
-//      block* with a new input. That is to say: we need to traverse the pre-
-//      decessor nodes and replace inputs that reference that value with the
-//      newly-created input. This could be made less expensive with a change to
-//      the IR API, but for now we choose to pessimisitically create inputs and
-//      delete unnecessary ones later with replaceAllusesWith().
+// a = 1
+// print(a)
+// becomes:
+// = prim::Store[name="a"](%a.1)
+// %a : int = prim::Load[name="a"]()
+// prim::Print(%a)
+//
+// When we emit a control operator, for all mutated variables we emit a
+// block output that loads the variable at the end of the block, and add a
+// and add a node output that sets the variable in the enclosing scope.
+
 struct Environment {
   Environment(
       Function& method,
@@ -201,7 +201,6 @@ struct Environment {
 
   Function& method;
   ResolverPtr resolver;
-  std::vector<std::string> captured_inputs;
   std::unordered_map<std::string, std::string> error_messages;
   Block* b;
 
@@ -231,10 +230,26 @@ struct Environment {
     }
   }
 
+  SugaredValuePtr insertLoad(const std::string& name, TypePtr type) {
+    auto g = b->owningGraph();
+    auto load = g->insertNode(g->createLoad(name, type));
+    return std::make_shared<SimpleValue>(load->output());
+  }
+
+  void insertStore(const std::string& name, const SourceRange& loc, Value* v) {
+    auto g = b->owningGraph();
+    auto store = g->insertNode(g->createStore(name, v))->setSourceRange(loc);
+    first_class_types[name] = store->input();
+  }
+
   SugaredValuePtr findInThisFrame(const std::string& name) {
     auto it = value_table.find(name);
     if (it != value_table.end()) {
       return it->second;
+    }
+    auto it2 = first_class_types.find(name);
+    if (it2 != first_class_types.end()) {
+      return insertLoad(name, it2->second->type());
     }
     return nullptr;
   }
@@ -243,7 +258,21 @@ struct Environment {
     return next ? next->findInAnyFrame(name) : nullptr;
   }
 
+  // This is needed for tuple indexing, where you need the
+  // value of a index in order to correctly set the output type
+  Value* getRecentlySetValue(const std::string& name) {
+    for (auto runner = this; runner; runner = runner->next.get()) {
+      auto val = runner->first_class_types.find(name);
+      if (val != runner->first_class_types.end()) {
+        return val->second;
+        ;
+      }
+    }
+    return nullptr;
+  }
+
   SugaredValuePtr findInAnyFrame(const std::string& name) {
+    WithInsertPoint insert(b);
     for (auto runner = this; runner; runner = runner->next.get()) {
       if (auto r = runner->findInThisFrame(name)) {
         return r;
@@ -252,63 +281,8 @@ struct Environment {
     return nullptr;
   }
 
-  Value* getValueInThisFrame(const SourceRange& loc, const std::string& name) {
-    return value_table.at(name)->asValue(loc, method);
-  }
-
-  SugaredValuePtr createCapturedInput(Value* orig, const std::string& name) {
-    // insert the captured input alphabetically in the capture list.
-    // this ensures consistency of the order of loop-carried dependencies
-    // even when the use in the loop is in a different order
-    size_t insert_pos = 0;
-    while (insert_pos < captured_inputs.size() &&
-           name > captured_inputs[insert_pos]) {
-      insert_pos++;
-    }
-    captured_inputs.insert(captured_inputs.begin() + insert_pos, name);
-
-    // Create the input
-    const size_t loop_carried_block_inputs_offset = 1;
-    Value* new_input =
-        b->insertInput(loop_carried_block_inputs_offset + insert_pos)
-            ->setType(orig->type());
-
-    // Associate this name with this value
-    auto sv = std::make_shared<SimpleValue>(new_input);
-    value_table[name] = sv;
-
-    return sv;
-  }
-
-  SugaredValuePtr createCapturedInputIfNeeded(
-      const SourceRange& loc,
-      const std::string& ident) {
-    auto in_frame = findInThisFrame(ident);
-    if (in_frame) {
-      return in_frame;
-    }
-
-    // recursively handles the case where parent blocks are also loops
-    auto from_parent =
-        next ? next->createCapturedInputIfNeeded(loc, ident) : nullptr;
-
-    // recursively create the captured input if it is the loop block
-    if (from_parent && getBlockOwningKind() == prim::Loop) {
-      if (Value* simple_val = asSimple(from_parent))
-        from_parent = createCapturedInput(simple_val, ident);
-    }
-    return from_parent;
-  }
-
   Block* block() {
     return b;
-  }
-  Symbol getBlockOwningKind() {
-    Symbol owning_kind = Symbol();
-    if (b->owningNode()) {
-      owning_kind = b->owningNode()->kind();
-    }
-    return owning_kind;
   }
 
   void setVar(const SourceRange& loc, const std::string& name, Value* value) {
@@ -319,7 +293,9 @@ struct Environment {
       const SourceRange& loc,
       const std::string& name,
       SugaredValuePtr value) {
+    WithInsertPoint guard(b->return_node());
     Value* as_simple_value = asSimple(value);
+
     if (as_simple_value && !as_simple_value->hasUniqueName() &&
         meaningfulName(name) &&
         // note: if the value wasn't defined in this block, we might be giving a
@@ -367,9 +343,11 @@ struct Environment {
         throw ErrorReport(loc) << errMsg.str();
       }
     }
-    if (as_simple_value)
-      createCapturedInputIfNeeded(loc, name);
-    value_table[name] = std::move(value);
+    if (as_simple_value) {
+      insertStore(name, loc, std::move(as_simple_value));
+    } else {
+      value_table[name] = std::move(value);
+    }
   }
 
   SugaredValuePtr getSugaredVar(const Ident& ident, bool required = true) {
@@ -383,7 +361,7 @@ struct Environment {
       const std::string& ident,
       const SourceRange& range,
       bool required = true) {
-    auto retval = createCapturedInputIfNeeded(range, ident);
+    auto retval = findInAnyFrame(ident);
 
     if (!retval) {
       static std::unordered_map<std::string, SugaredValuePtr> globals = {
@@ -440,40 +418,16 @@ struct Environment {
     return getSugaredVar(ident, range)->asValue(range, method);
   }
 
-  // Given that after emitting statements in a block, we've added block inputs
-  // for all value references and assignments, delete inputs for which there was
-  // no assignment, only references.
-  void deleteExtraInputs(const SourceRange& loc) {
-    // note: skip i == 0, it is the loop trip count for inputs
-    // and the loop condition for outputs.
-    // captured_inputs is indexed by i - 1 since it only contains loop
-    // carried dependencies
-    //          inputs: loop_counter, lcd0, lcd1, ...
-    //         outputs: loop_condition, lcd0, lcd1, ...
-    // captured_inputs: lcd0, lcd1, ...
-    AT_ASSERT(b->inputs().size() == b->outputs().size());
-    AT_ASSERT(b->inputs().size() == captured_inputs.size() + 1);
-    for (size_t i = b->inputs().size() - 1; i > 0; i--) {
-      // nothing changed along this loop
-      if (b->inputs()[i] == b->outputs()[i]) {
-        auto name = captured_inputs[i - 1];
-        Value* orig = findInParentFrame(name)->asValue(loc, method);
-        b->inputs()[i]->replaceAllUsesWith(orig);
-        b->eraseInput(i);
-        b->eraseOutput(i);
-        captured_inputs.erase(captured_inputs.begin() + i - 1);
-      }
-    }
-  }
   std::vector<std::string> definedVariables() {
     std::vector<std::string> result;
-    for (auto& kv : value_table) {
+    for (auto& kv : first_class_types) {
       result.push_back(kv.first);
     }
     return result;
   }
 
  private:
+  SimpleValueTable first_class_types;
   ValueTable value_table;
 };
 
@@ -506,6 +460,39 @@ static Value* ensureInt(const SourceRange& range, Value* v) {
 inline bool isSupportedListElementType(const TypePtr& type) {
   return type->isSubtypeOf(TensorType::get()) ||
       type->isSubtypeOf(NumberType::get());
+}
+
+using MiniTypeEnvironment = MiniEnvironment<TypePtr>;
+
+// Invokes close_var_fn when a variable is used that isn't defined in the
+// current scope. This is for use in forks & closures which close over variables
+// in the enclosing scope
+static void addClosedOverVariables(
+    Block* block,
+    std::shared_ptr<MiniTypeEnvironment> parent,
+    std::function<void(const std::string&, TypePtr)> close_var_fn) {
+  std::shared_ptr<MiniTypeEnvironment> frame =
+      std::make_shared<MiniTypeEnvironment>(block, parent);
+  for (Node* n : block->nodes()) {
+    switch (n->kind()) {
+      case prim::If:
+      case prim::Loop: {
+        for (Block* b : n->blocks()) {
+          addClosedOverVariables(b, frame, close_var_fn);
+        }
+      } break;
+      case prim::Store: {
+        frame->setVar(n->s(attr::name), n->input()->type());
+      } break;
+      case prim::Load: {
+        const auto& name = n->s(attr::name);
+        auto out = frame->findInAnyFrame(name);
+        if (!out) {
+          close_var_fn(name, n->output()->type());
+        }
+      } break;
+    }
+  }
 }
 
 // Information for each def being emitted.
@@ -572,6 +559,7 @@ struct to_ir {
   }
 
   void runCleanupPasses(std::shared_ptr<Graph>& to_clean) {
+    ConvertToSSA(to_clean);
     // remove any uses of tuples that we inserted that are not needed
     LowerSimpleTuples(to_clean);
     ConstantPooling(to_clean);
@@ -752,11 +740,12 @@ struct to_ir {
       if (meaningfulName(name)) {
         new_input->setUniqueName(name);
       }
-      environment_stack->setVar((*it).ident().range(), name, new_input);
-
       // Record the type for the schema and set the Type on the Value*
       arguments.push_back(schema.arguments().at(arg_annotation_idx++));
       new_input->setType(arguments.back().type());
+
+      // NB: set type of new_input before setVar call
+      environment_stack->setVar((*it).ident().range(), name, new_input);
     }
     return arguments;
   }
@@ -786,18 +775,37 @@ struct to_ir {
     Node* unpack_context =
         subgraph->insertNode(subgraph->create(prim::TupleUnpack, {context}, 0));
 
+    std::shared_ptr<MiniTypeEnvironment> frame =
+        std::make_shared<MiniTypeEnvironment>(block, nullptr);
+
     std::unordered_map<Value*, Value*> captures;
     auto env = [&](Value* v) -> Value* {
       auto it = captures.find(v);
       if (it != captures.end()) {
         return it->second;
       }
+      // TODO - these should all be non-aliasing constants,
+      // so they can just be copied over
       pack_context->addInput(v);
       Value* r = unpack_context->addOutput()->copyMetadata(v);
       captures[v] = r;
       return r;
     };
     subgraph->block()->cloneFrom(block, env);
+
+    // since we emit prim::Load when a variable is referenced,
+    // we need add the variables that were closed over from the enclosing scope
+    // and stitch them as inputs into the closure.
+    auto addClosedOverVar = [&](const std::string& name, TypePtr type) {
+      auto v =
+          graph->createLoad(name, type)->insertBefore(pack_context)->output();
+      pack_context->addInput(v);
+      auto block_input = unpack_context->addOutput()->copyMetadata(v);
+      subgraph->createStore(name, block_input)->insertAfter(unpack_context);
+      frame->setVar(name, type);
+    };
+    addClosedOverVariables(block, frame, addClosedOverVar);
+
     auto context_type = TupleType::create(
         fmap(pack_context->inputs(), [](Value* v) { return v->type(); }));
     pack_context->output()->setType(context_type);
@@ -832,9 +840,11 @@ struct to_ir {
                   // never create a Method for the closure
       popFrame(/*ends_def=*/true);
     }
+
     std::shared_ptr<Graph> subgraph;
     Value* context;
     std::tie(subgraph, context) = lambdaLift(block);
+    ConvertToSSA(subgraph);
     runCleanupPasses(subgraph);
     closure_node->eraseBlock(0);
     closure_node->g_(attr::Subgraph, std::move(subgraph));
@@ -952,8 +962,7 @@ struct to_ir {
   }
 
   Node* create(Symbol kind, const SourceRange& loc, size_t n_outputs) {
-    return graph->create(kind, n_outputs)
-        ->setSourceRange(loc);
+    return graph->create(kind, n_outputs)->setSourceRange(loc);
   }
 
   Value* emitTernaryIf(const TernaryIf& expr) {
@@ -1313,10 +1322,6 @@ struct to_ir {
           current_element_assigner,
       c10::optional<Expr> cond,
       Value* max_trip_count_val = nullptr) {
-    Value* cond_val = nullptr;
-    Node* n = graph->insertNode(create(prim::Loop, range, 0));
-    WithInsertPoint guard(n);
-
     if (!max_trip_count_val) {
       max_trip_count_val = materializeConstant(
           std::numeric_limits<int64_t>::max(),
@@ -1325,8 +1330,12 @@ struct to_ir {
           integral_constants);
     }
 
-    cond_val = (cond) ? emitCond(cond.value())
-                      : graph->insertConstant(true, nullptr, range);
+    Value* cond_val = (cond) ? emitCond(cond.value())
+                             : graph->insertConstant(true, nullptr, range);
+
+    Node* n = graph->insertNode(create(prim::Loop, range, 0));
+    WithInsertPoint guard(n);
+
     n->addInput(max_trip_count_val);
     n->addInput(cond_val);
     auto* body_block = n->addBlock();
@@ -1345,33 +1354,46 @@ struct to_ir {
 
       emitStatements(body);
 
-      // Also emit the conditional
-      cond_val = (cond) ? emitCond(cond.value())
-                        : graph->insertConstant(true, nullptr, range);
-      body_block->registerOutput(cond_val);
-      auto body_frame = popFrame();
-      auto outer_frame = environment_stack;
+      // If a variable was mutated and defined in the enclosing scope,
+      // then it becomes a loop carried output.
+      // For al block inputs variables, we store the value of the variable
+      // at the beginning of the block, and load the value of the variable
+      // at the end of the block.
 
-      // Add block outputs to correspond to each captured input
-      // some of these will be removed.
-      for (const auto& x : body_frame->captured_inputs) {
-        auto fv = body_frame->getValueInThisFrame(range, x);
-        body_block->registerOutput(fv);
+      std::vector<std::string> def_vars = environment_stack->definedVariables();
+      // sort for deterministic output
+      std::sort(def_vars.begin(), def_vars.end());
+      auto loop_begin = body_block->param_node();
+      auto loop_end = body_block->return_node();
+      for (const auto& name : def_vars) {
+        auto parent = asSimple(environment_stack->findInParentFrame(name));
+        if (!parent) {
+          continue;
+        }
+        auto type = parent->type();
+
+        auto node_input =
+            graph->createLoad(name, type)->insertBefore(n)->output();
+        n->addInput(node_input);
+
+        auto block_input = body_block->addInput(name)->setType(type);
+        graph->createStore(name, block_input)->insertAfter(loop_begin);
+
+        auto block_exit =
+            graph->createLoad(name, type)->insertBefore(loop_end)->output();
+        body_block->registerOutput(block_exit);
+
+        auto node_exit = n->addOutput()->setUniqueName(name)->setType(type);
+        graph->createStore(name, node_exit)->insertAfter(n);
       }
 
-      // Remove inputs for values that did not mutate within the
-      // block
-      body_frame->deleteExtraInputs(range);
+      // NB: emit the block condition after the loop carried vars are set
+      Value* block_condition = (cond)
+          ? emitCond(cond.value())
+          : graph->insertConstant(true, nullptr, range);
+      body_block->insertOutput(0, block_condition);
 
-      // register node inputs/outputs for the true loop carried deps,
-      for (size_t i = 0; i < body_frame->captured_inputs.size(); ++i) {
-        auto x = body_frame->captured_inputs[i];
-        n->addInput(outer_frame->getVar(x, range));
-        // body_block->inputs(): loop_counter, lcd0, lcd1, ...
-        // captured_inputs: lcd0, lcd1, ...
-        auto typ = body_block->inputs()[i + 1]->type();
-        outer_frame->setVar(range, x, n->addOutput()->setType(typ));
-      }
+      popFrame();
     }
   }
 
@@ -2376,17 +2398,35 @@ struct to_ir {
       at::ArrayRef<NamedValue> inputs,
       at::ArrayRef<NamedValue> attributes) {
     // Build the fork node without inputs
-    auto fork_node =
-        method.graph()
-            ->insertNode(method.graph()->create(prim::fork, 1))
-            ->setSourceRange(loc);
+    auto fork_node = method.graph()
+                         ->insertNode(method.graph()->create(prim::fork, 1))
+                         ->setSourceRange(loc);
     auto body_block = fork_node->addBlock();
 
     // Build a template of the graph to be executed
     Value* node_output;
     {
       WithInsertPoint guard(body_block);
-      auto fn_sugared_output = forked->call(loc, method, inputs, attributes, 1);
+
+      auto simple_forked = asSimple(forked);
+      std::shared_ptr<SugaredValue> fn_sugared_output;
+      // this is needed because we currently don't currently have a way of
+      // typing functions. We represent functions as a tuple of (None,
+      // (Inputs)). The environment has no way of knowing that the tuple does
+      // not represent a first class type, so it emits the load to the function
+      // as a prim::Load to a tuple type. This is a workaround to get the actual
+      // value. When functions are first class, we should be able to remove
+      // this.
+      if (simple_forked && simple_forked->node()->kind() == prim::Load) {
+        auto fork_val = environment_stack->getRecentlySetValue(
+            simple_forked->node()->s(attr::name));
+        auto fork_val_shared = std::make_shared<SimpleValue>(fork_val);
+        fn_sugared_output =
+            fork_val_shared->call(loc, method, inputs, attributes, 1);
+      } else {
+        fn_sugared_output = forked->call(loc, method, inputs, attributes, 1);
+      }
+
       auto fn_simple_output = fn_sugared_output->asValue(loc, method);
       body_block->registerOutput(fn_simple_output);
       node_output = fork_node->output()->setType(
@@ -2824,7 +2864,16 @@ struct to_ir {
     auto tuple_typ = tuple_val->type()->cast<TupleType>();
     auto elems = tuple_typ->elements();
     TypePtr output_type;
-    auto idx = toIValue(idx_val);
+    c10::optional<IValue> idx;
+    if (idx_val->type() != IntType::get()) {
+      throw ErrorReport(loc) << "tuple index must be an integer";
+    }
+    if (idx_val->node()->kind() == prim::Load) {
+      idx = toIValue(environment_stack->getRecentlySetValue(
+          idx_val->node()->s(attr::name)));
+    } else {
+      idx = toIValue(idx_val);
+    }
     if (!idx) {
       if (elems.size() == 0 ||
           !convertibleToList(tuple_typ, ListType::create(elems[0]))) {
@@ -2834,9 +2883,6 @@ struct to_ir {
       }
       output_type = elems[0];
     } else {
-      if (!idx->isInt()) {
-        throw ErrorReport(loc) << "tuple index must be an integer";
-      }
       auto adj_index = getAdjTupleIndex(
           loc, tuple_typ, idx->toInt(), /*allow_out_of_bounds*/ false);
       output_type = elems[adj_index];
@@ -2857,7 +2903,13 @@ struct to_ir {
   }
 
   int64_t getSliceInd(Value* idx_val, const SourceRange& loc) {
-    at::optional<IValue> ivalue = toIValue(idx_val);
+    at::optional<IValue> ivalue;
+    if (idx_val->node()->kind() == prim::Load) {
+      ivalue = toIValue(environment_stack->getRecentlySetValue(
+          idx_val->node()->s(attr::name)));
+    } else {
+      ivalue = toIValue(idx_val);
+    }
     if (ivalue && ivalue->isInt()) {
       return ivalue->to<int64_t>();
     } else {
@@ -2980,8 +3032,7 @@ struct FunctionResolver : public Resolver {
       functionTable_;
 };
 
-CompilationUnit::CompilationUnit(const std::string& source)
-{
+CompilationUnit::CompilationUnit(const std::string& source) {
   // calles the define with native resolver to generate the graph for functions
   define(source, nativeResolver(), nullptr);
 }
@@ -3054,6 +3105,7 @@ void lambdaLiftFork(Node* fork_node) {
 
   // Make sure we capture everything in the new graph.
   // The uncaptured values will be added to the fork signature.
+  // TODO: remove, this should just be constants
   std::unordered_map<Value*, Value*> uncaptures_map;
   auto env = [&](Value* v) -> Value* {
     if (!uncaptures_map.count(v)) {
@@ -3064,7 +3116,23 @@ void lambdaLiftFork(Node* fork_node) {
     return uncaptures_map[v];
   };
 
+  auto parent_graph = fork_node->owningGraph();
+
   forked_graph->block()->cloneFrom(body_block, env);
+
+  std::shared_ptr<MiniTypeEnvironment> frame =
+      std::make_shared<MiniTypeEnvironment>(forked_graph->block(), nullptr);
+
+  // add the variables that were captured to fork signature
+  auto addClosedOverVar = [&](const std::string& name, TypePtr type) {
+    auto v =
+        parent_graph->createLoad(name, type)->insertBefore(fork_node)->output();
+    Value* new_input = forked_graph->addInput()->copyMetadata(v);
+    forked_graph->createStore(name, new_input)
+        ->insertAfter(forked_graph->block()->param_node());
+    frame->setVar(name, type);
+  };
+  addClosedOverVariables(forked_graph->block(), frame, addClosedOverVar);
 
   // Separate the subgraph and clean up the orignal one
   fork_node->g_(attr::Subgraph, forked_graph);
