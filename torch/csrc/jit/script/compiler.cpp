@@ -30,6 +30,7 @@ namespace script {
 using SugaredValuePtr = std::shared_ptr<SugaredValue>;
 using FunctionTable = std::unordered_map<std::string, Function&>;
 using ValueTable = std::unordered_map<std::string, SugaredValuePtr>;
+using TypeTable = std::unordered_map<std::string, TypePtr>;
 using SimpleValueTable = std::unordered_map<std::string, Value*>;
 using AttributeMap = std::unordered_map<std::string, Const>;
 using ListAttributeMap = std::unordered_map<std::string, std::vector<Const>>;
@@ -239,7 +240,7 @@ struct Environment {
   void insertStore(const std::string& name, const SourceRange& loc, Value* v) {
     auto g = b->owningGraph();
     auto store = g->insertNode(g->createStore(name, v))->setSourceRange(loc);
-    first_class_types[name] = store->input();
+    type_table[name] = store->input()->type();
   }
 
   SugaredValuePtr findInThisFrame(const std::string& name) {
@@ -247,9 +248,9 @@ struct Environment {
     if (it != value_table.end()) {
       return it->second;
     }
-    auto it2 = first_class_types.find(name);
-    if (it2 != first_class_types.end()) {
-      return insertLoad(name, it2->second->type());
+    auto it2 = type_table.find(name);
+    if (it2 != type_table.end()) {
+      return insertLoad(name, it2->second);
     }
     return nullptr;
   }
@@ -258,17 +259,8 @@ struct Environment {
     return next ? next->findInAnyFrame(name) : nullptr;
   }
 
-  // This is needed for tuple indexing, where you need the
-  // value of a index in order to correctly set the output type
-  Value* getRecentlySetValue(const std::string& name) {
-    for (auto runner = this; runner; runner = runner->next.get()) {
-      auto val = runner->first_class_types.find(name);
-      if (val != runner->first_class_types.end()) {
-        return val->second;
-        ;
-      }
-    }
-    return nullptr;
+  void setType(const std::string& name, TypePtr type) {
+    type_table[name] = std::move(type);
   }
 
   SugaredValuePtr findInAnyFrame(const std::string& name) {
@@ -420,14 +412,14 @@ struct Environment {
 
   std::vector<std::string> definedVariables() {
     std::vector<std::string> result;
-    for (auto& kv : first_class_types) {
+    for (auto& kv : type_table) {
       result.push_back(kv.first);
     }
     return result;
   }
 
  private:
-  SimpleValueTable first_class_types;
+  TypeTable type_table;
   ValueTable value_table;
 };
 
@@ -1232,10 +1224,7 @@ struct to_ir {
           continue;
         }
       }
-      true_block->registerOutput(tv);
-      false_block->registerOutput(fv);
-      environment_stack->setVar(
-          stmt.range(), x, n->addOutput()->setType(*unified));
+      environment_stack->setType(x, *unified);
     }
   }
 
@@ -1354,44 +1343,21 @@ struct to_ir {
 
       emitStatements(body);
 
-      // If a variable was mutated and defined in the enclosing scope,
-      // then it becomes a loop carried output.
-      // For al block inputs variables, we store the value of the variable
-      // at the beginning of the block, and load the value of the variable
-      // at the end of the block.
-
-      std::vector<std::string> def_vars = environment_stack->definedVariables();
-      // sort for deterministic output
-      std::sort(def_vars.begin(), def_vars.end());
-      auto loop_begin = body_block->param_node();
-      auto loop_end = body_block->return_node();
-      for (const auto& name : def_vars) {
-        auto parent = asSimple(environment_stack->findInParentFrame(name));
-        if (!parent) {
-          continue;
-        }
-        auto type = parent->type();
-
-        auto node_input =
-            graph->createLoad(name, type)->insertBefore(n)->output();
-        n->addInput(node_input);
-
-        auto block_input = body_block->addInput(name)->setType(type);
-        graph->createStore(name, block_input)->insertAfter(loop_begin);
-
-        auto block_exit =
-            graph->createLoad(name, type)->insertBefore(loop_end)->output();
-        body_block->registerOutput(block_exit);
-
-        auto node_exit = n->addOutput()->setUniqueName(name)->setType(type);
-        graph->createStore(name, node_exit)->insertAfter(n);
+      Node* loop_condition =
+          graph->insertNode(create(prim::LoopCondition, range, 0));
+      auto condition_block = loop_condition->addBlock();
+      {
+        pushFrame(condition_block);
+        WithInsertPoint insert(condition_block);
+        Value* block_condition = (cond)
+            ? emitCond(cond.value())
+            : graph->insertConstant(true, nullptr, range);
+        condition_block->insertOutput(0, block_condition);
+        popFrame();
       }
-
-      // NB: emit the block condition after the loop carried vars are set
-      Value* block_condition = (cond)
-          ? emitCond(cond.value())
-          : graph->insertConstant(true, nullptr, range);
-      body_block->insertOutput(0, block_condition);
+      auto block_continue_condition =
+          loop_condition->addOutput()->setType(BoolType::get());
+      body_block->registerOutput(block_continue_condition);
 
       popFrame();
     }
@@ -2408,7 +2374,7 @@ struct to_ir {
     {
       WithInsertPoint guard(body_block);
 
-      auto simple_forked = asSimple(forked);
+      // auto simple_forked = asSimple(forked);
       std::shared_ptr<SugaredValue> fn_sugared_output;
       // this is needed because we currently don't currently have a way of
       // typing functions. We represent functions as a tuple of (None,
@@ -2417,15 +2383,15 @@ struct to_ir {
       // as a prim::Load to a tuple type. This is a workaround to get the actual
       // value. When functions are first class, we should be able to remove
       // this.
-      if (simple_forked && simple_forked->node()->kind() == prim::Load) {
-        auto fork_val = environment_stack->getRecentlySetValue(
-            simple_forked->node()->s(attr::name));
-        auto fork_val_shared = std::make_shared<SimpleValue>(fork_val);
-        fn_sugared_output =
-            fork_val_shared->call(loc, method, inputs, attributes, 1);
-      } else {
-        fn_sugared_output = forked->call(loc, method, inputs, attributes, 1);
-      }
+      // if (simple_forked && simple_forked->node()->kind() == prim::Load) {
+      //   auto fork_val = environment_stack->getRecentlySetValue(
+      //       simple_forked->node()->s(attr::name));
+      //   auto fork_val_shared = std::make_shared<SimpleValue>(fork_val);
+      //   fn_sugared_output =
+      //       fork_val_shared->call(loc, method, inputs, attributes, 1);
+      // } else {
+      fn_sugared_output = forked->call(loc, method, inputs, attributes, 1);
+      // }
 
       auto fn_simple_output = fn_sugared_output->asValue(loc, method);
       body_block->registerOutput(fn_simple_output);
@@ -2864,22 +2830,16 @@ struct to_ir {
     auto tuple_typ = tuple_val->type()->cast<TupleType>();
     auto elems = tuple_typ->elements();
     TypePtr output_type;
-    c10::optional<IValue> idx;
     if (idx_val->type() != IntType::get()) {
       throw ErrorReport(loc) << "tuple index must be an integer";
     }
-    if (idx_val->node()->kind() == prim::Load) {
-      idx = toIValue(environment_stack->getRecentlySetValue(
-          idx_val->node()->s(attr::name)));
-    } else {
-      idx = toIValue(idx_val);
-    }
+    auto idx = toIValue(idx_val);
     if (!idx) {
       if (elems.size() == 0 ||
           !convertibleToList(tuple_typ, ListType::create(elems[0]))) {
         throw ErrorReport(loc)
             << "Cannot index into a " << tuple_typ->python_str()
-            << " with a non-constant index because we cannot resolve the output type";
+            << " with a non-integer literal because we cannot resolve the output type";
       }
       output_type = elems[0];
     } else {
@@ -2903,13 +2863,7 @@ struct to_ir {
   }
 
   int64_t getSliceInd(Value* idx_val, const SourceRange& loc) {
-    at::optional<IValue> ivalue;
-    if (idx_val->node()->kind() == prim::Load) {
-      ivalue = toIValue(environment_stack->getRecentlySetValue(
-          idx_val->node()->s(attr::name)));
-    } else {
-      ivalue = toIValue(idx_val);
-    }
+    auto ivalue = toIValue(idx_val);
     if (ivalue && ivalue->isInt()) {
       return ivalue->to<int64_t>();
     } else {

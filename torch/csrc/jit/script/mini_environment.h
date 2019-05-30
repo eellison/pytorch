@@ -14,7 +14,7 @@ struct MiniEnvironment {
   MiniEnvironment(Block* b, std::shared_ptr<MiniEnvironment> next = nullptr)
       : next(std::move(next)) {}
 
-  std::shared_ptr<MiniEnvironment> next;
+  std::shared_ptr<MiniEnvironment<T>> next;
 
   T findInThisFrame(const std::string& name) {
     auto it = table.find(name);
@@ -35,6 +35,15 @@ struct MiniEnvironment {
 
   void setVar(const std::string& name, T value) {
     table[name] = value;
+  }
+
+  std::vector<std::string> definedVariables() {
+    std::vector<std::string> result;
+    for (auto& kv : table) {
+      result.push_back(kv.first);
+    }
+    std::sort(result.begin(), result.end());
+    return result;
   }
 
  private:
