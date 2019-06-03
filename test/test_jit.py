@@ -392,7 +392,10 @@ class JitTestCase(TestCase):
             main_module_2_code = ""
             for line in main_module_2:
                 main_module_2_code += line.decode()
-
+            # if (main_module_code != main_module_2_code):
+            #     print("printing one", main_module_code)
+            #     print("printing two", main_module_2_code)
+                # print(main_module_code, main_module_2_code)
             self.assertMultiLineEqual(main_module_code, main_module_2_code)
 
     def getExportImportCopy(self, m, also_test_file=True, map_location=None):
@@ -9899,8 +9902,10 @@ a")
 
         slstm = torch.jit.script(lstm)
 
+        print(slstm.graph)
         inputs = get_lstm_inputs('cpu', training=True, seq_length=10)
         slstm(*inputs).sum().backward()
+        return
 
         fw_graph = slstm.graph_for(*inputs)
         bw_graph = backward_graph(slstm, diff_graph_idx=0)
@@ -15041,6 +15046,72 @@ class TestAsync(JitTestCase):
 
         self.assertEqual(y, y_hat)
 
+    def test_elias(self):
+        with self.disableEmitHook():
+            cu = torch.jit.CompilationUnit('''
+            def _grad_sum_to_size(self,
+                                  size: Optional[List[int]]):
+                if size is not None:
+                    self_size = self.size()
+                else:
+                    self_size = None
+
+                result = self
+                def backward(grad_output):
+                    if self_size is None:
+                        grad_input = grad_output
+                    else:
+                        grad_input = grad_output.expand(self_size)
+                    return grad_input, None
+
+                return result, backward
+            ''')
+            print(cu._grad_sum_to_size.graph)
+
+            return
+            # @torch.jit.script
+            # def test(cond: bool):
+            #     if cond:
+            #         i = 1
+            #     else:
+            #         i = 2
+            #     return i
+            #
+            # @torch.jit.script
+            # def AD_unsqueeze_multiple(t,
+            #                           dims: List[int],
+            #                           n_dims: int):
+            #     seen = [False] * n_dims
+            #     for i in range(len(dims)):
+            #         seen[dims[i]] = True
+            #
+            #     for d in range(n_dims):
+            #         if seen[d]:
+            #             t = t.unsqueeze(d)
+            #     return t
+            #
+            # @torch.jit.script
+            # def AD_sum_backward(grad,
+            #                     sizes: List[int],
+            #                     dims: List[int],
+            #                     keepdim: bool):
+            #     if not keepdim and len(sizes) > 0:
+            #         if len(dims) == 1:
+            #             return grad.unsqueeze(dims[0]).expand(sizes)
+            #         else:
+            #             res = AD_unsqueeze_multiple(grad, dims, len(sizes))
+            #             return res.expand(sizes)
+            #     else:
+            #         return grad.expand(sizes)
+            #
+            # def while_test(a: int, i: int):
+            #     while bool(i < 3):
+            #         a *= a
+            #         i += 1
+            #     return a
+            #
+            # self.checkScript(while_test, (2, 2))
+
     def test_async_script_capture(self):
         class Mod(torch.jit.ScriptModule):
             __constants__ = ['const']
@@ -15095,7 +15166,7 @@ class TestAsync(JitTestCase):
     def test_async_script_no_script_mod(self):
         x = torch.rand(3, 4)
 
-        with self.assertRaisesRegex(RuntimeError, 'cannot call a value'):
+        with self.assertRaisesRegex(RuntimeError, 'Cannot fork this'):
             @torch.jit.script
             def wait_script(x):
                 fut = torch.jit._fork(x)
