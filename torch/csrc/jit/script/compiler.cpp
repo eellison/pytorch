@@ -574,8 +574,162 @@ struct to_ir {
     return old_frame;
   }
 
-  void runCleanupPasses(std::shared_ptr<Graph>& to_clean) {
-    ConvertToSSA(to_clean);
+
+
+
+  void inlineForkedClosure(Node * fork_closure) {
+    Node* function_context_node = fork_closure->input()->node();
+    Node* function = function_context_node->inputs().at(0)->node();
+    Node* context = function_context_node->inputs().at(1)->node();
+    auto fork_graph = function->g(attr::Subgraph)->copy();
+    auto g = fork_closure->owningGraph();
+    Node* fork_node = g->create(prim::fork, 1)->insertAfter(fork_closure)
+                          ->setSourceRange(fork_closure->sourceRange());
+
+    if (fork_graph->inputs().size() != 1 || !fork_graph->inputs().at(0)->type()->cast<TupleType>()) {
+      throw ErrorReport(fork_node->sourceRange()) << "Cannot fork lambda with parameters";
+    }
+    auto fork_graph_context = fork_graph->inputs().at(0);
+    AT_ASSERT(fork_graph_context->uses().size() == 1);
+    auto fork_graph_unpack = fork_graph_context->uses().at(0).user;
+
+    for (size_t i = 0; i < context->inputs().size(); ++i) {
+      auto cont_input = context->inputs().at(i);
+      fork_node->addInput(cont_input);
+      auto inp = fork_graph->insertInput(i)->copyMetadata(cont_input);
+      fork_graph_unpack->outputs().at(i)->replaceAllUsesWith(inp);
+    }
+    fork_graph_unpack->destroy();
+    fork_graph->eraseInput(fork_graph->inputs().size() - 1);
+    fork_node->output()->copyMetadata(fork_closure->output());
+    fork_closure->output()->replaceAllUsesWith(fork_node->output());
+    fork_closure->destroy();
+    fork_node->g_(attr::Subgraph, fork_graph);
+    runCleanupPasses(fork_graph, false);
+  }
+
+
+  void inlineForkedClosures(Block * block) {
+    for (auto it = block->nodes().begin(); it != block->nodes().end();) {
+      Node * n = *it;
+      it++;
+      switch (n->kind()) {
+        case prim::forkClosure: {
+          inlineForkedClosure(n);
+        } break;
+        default: {
+          for (Block * b: n->blocks()) {
+            inlineForkedClosures(b);
+          }
+        } break;
+      }
+    }
+  }
+
+  void inlineForkedClosures(std::shared_ptr<Graph>& to_clean) {
+    inlineForkedClosures(to_clean->block());
+  }
+
+  void liftFork(Node* fork_node) {
+    if (fork_node->hasAttribute(attr::Subgraph)) {
+      AT_ASSERT(fork_node->blocks().size() == 0);
+      return;
+    }
+
+    // Fork a new graph from its orignal owning graph
+    auto forked_graph = std::make_shared<Graph>();
+    auto body_block = fork_node->blocks()[0];
+
+    // Make sure we capture everything in the new graph.
+    // The uncaptured values will be added to the fork signature.
+    // TODO: remove, this should just be constants
+    std::unordered_map<Value*, Value*> uncaptures_map;
+    auto env = [&](Value* v) -> Value* {
+      if (!uncaptures_map.count(v)) {
+        // Capture values for both graphs
+        uncaptures_map[v] = forked_graph->addInput()->copyMetadata(v);
+        fork_node->addInput(v);
+      }
+      return uncaptures_map[v];
+    };
+    forked_graph->block()->cloneFrom(body_block, env);
+
+    std::shared_ptr<MiniTypeEnvironment> frame =
+        std::make_shared<MiniTypeEnvironment>(forked_graph->block(), nullptr);
+
+    // Separate the subgraph and clean up the orignal one
+    fork_node->g_(attr::Subgraph, forked_graph);
+    fork_node->eraseBlock(0);
+    runCleanupPasses(forked_graph, false);
+  }
+
+  void liftClosure(Node *closure) {
+    auto block = closure->blocks().at(0);
+    auto subgraph = std::make_shared<Graph>();
+    // closures/forks can be nested, so use closure owning graph
+    auto g = closure->owningGraph();
+    Node* pack_context = g->create(prim::TupleConstruct, {}, 1)->insertAfter(closure);
+    Value* context = subgraph->addInput("context");
+    // cannot use createTupleUnpack because the type is not known yet
+    Node* unpack_context =
+        subgraph->insertNode(subgraph->create(prim::TupleUnpack, {context}, 0));
+
+    std::unordered_map<Value*, Value*> captures;
+    auto env = [&](Value* v) -> Value* {
+      auto it = captures.find(v);
+      if (it != captures.end()) {
+        return it->second;
+      }
+      pack_context->addInput(v);
+      Value* r = unpack_context->addOutput()->copyMetadata(v);
+      captures[v] = r;
+      return r;
+    };
+    subgraph->block()->cloneFrom(block, env);
+    auto context_type = TupleType::create(
+        fmap(pack_context->inputs(), [](Value* v) { return v->type(); }));
+    pack_context->output()->setType(context_type);
+    context->setType(context_type);
+    AT_ASSERT(closure->output()->uses().size() == 1);
+    auto closure_tuple = closure->output()->uses().at(0).user;
+    closure_tuple->addInput(pack_context->output());
+    closure_tuple->output()->setType(TupleType::create({closure->output()->type(), context_type}));
+    closure->eraseBlock(0);
+    closure->g_(attr::Subgraph, std::move(subgraph));
+    runCleanupPasses(closure->g(attr::Subgraph), false);
+  }
+
+  void liftClosures(Block * block) {
+    for (auto it = block->nodes().begin(); it != block->nodes().end();) {
+      Node* n = *it;
+      it++; // advance iterator bc the current node may be destroyed
+      switch (n->kind()) {
+        case prim::Function: {
+          liftClosure(n);
+        } break;
+        case prim::fork: {
+          liftFork(n);
+        } break;
+        default: {
+          for (Block * b: n->blocks()) {
+            liftClosures(b);
+          }
+        }
+      }
+    }
+  }
+
+  void liftClosures(std::shared_ptr<Graph>& to_clean) {
+    liftClosures(to_clean->block());
+  }
+
+
+  void runCleanupPasses(std::shared_ptr<Graph>& to_clean, bool convert_ssa=true) {
+    if (convert_ssa) {
+      ConvertToSSA(to_clean);
+    }
+    liftClosures(to_clean);
+    inlineForkedClosures(to_clean);
     // remove any uses of tuples that we inserted that are not needed
     Inline(*to_clean);
     LowerSimpleTuples(to_clean);
@@ -791,59 +945,13 @@ struct to_ir {
   void emitStatements(const List<Stmt>& statements) {
     return emitStatements(statements.begin(), statements.end());
   }
-  std::pair<std::shared_ptr<Graph>, Value*> lambdaLift(Block* block) {
-    auto subgraph = std::make_shared<Graph>();
-    // note: type is set later on pack_context and context when we know it
-    Node* pack_context =
-        graph->insertNode(graph->create(prim::TupleConstruct, {}, 1));
-    Value* context = subgraph->addInput("context");
-    // cannot use createTupleUnpack because the type is not known yet
-    Node* unpack_context =
-        subgraph->insertNode(subgraph->create(prim::TupleUnpack, {context}, 0));
 
-    std::shared_ptr<MiniTypeEnvironment> frame =
-        std::make_shared<MiniTypeEnvironment>(block, nullptr);
-
-    std::unordered_map<Value*, Value*> captures;
-    auto env = [&](Value* v) -> Value* {
-      auto it = captures.find(v);
-      if (it != captures.end()) {
-        return it->second;
-      }
-      // TODO - these should all be non-aliasing constants,
-      // so they can just be copied over
-      pack_context->addInput(v);
-      Value* r = unpack_context->addOutput()->copyMetadata(v);
-      captures[v] = r;
-      return r;
-    };
-    subgraph->block()->cloneFrom(block, env);
-
-    // since we emit prim::Load when a variable is referenced,
-    // we need add the variables that were closed over from the enclosing scope
-    // and stitch them as inputs into the closure.
-    auto addClosedOverVar = [&](const std::string& name, TypePtr type) {
-      auto v =
-          graph->createLoad(name, type)->insertBefore(pack_context)->output();
-      pack_context->addInput(v);
-      auto block_input = unpack_context->addOutput()->copyMetadata(v);
-      subgraph->createStore(name, block_input)->insertAfter(unpack_context);
-      frame->setVar(name, type);
-    };
-    addClosedOverVariables(block, frame, addClosedOverVar);
-
-    auto context_type = TupleType::create(
-        fmap(pack_context->inputs(), [](Value* v) { return v->type(); }));
-    pack_context->output()->setType(context_type);
-    context->setType(context_type);
-    return std::make_pair(std::move(subgraph), pack_context->output());
-  }
   // XXX - right now closures are used _only_ for defining gradients internally
   // There are several unfinished aspects that make them unusable generally
   // 1. We do not have a type, ivalue, operator to represent prim::Function, so
   // closure_node has type None
   //    and any graphs that contain it cannot be run
-  // 2. There is no export logic for it yet, so it cannot be
+// 2. There is no export logic for it yet, so it cannot be
   // exported/python_printed
   // 3. There is nothing preventing the assignment of already existing variables
   // inside the closures
@@ -852,9 +960,6 @@ struct to_ir {
   //    prevents people from accidentally using this feature.
   void emitClosure(const Def& def) {
     Node* closure_node = graph->insertNode(graph->create(prim::Function, 1));
-    closure_node->output()->setType(
-        NoneType::get()); // it is not a real thing yet, so just say the type is
-                          // none.
     Block* block = closure_node->addBlock();
     {
       WithInsertPoint guard(block);
@@ -866,16 +971,19 @@ struct to_ir {
                   // never create a Method for the closure
       popFrame(/*ends_def=*/true);
     }
-
+    AT_ASSERT(block->outputs().size() == 1);
+    closure_node->output()->setType(block->outputs().at(0)->type());
+    // closure_node->output()->setType(
+    //     NoneType::get()); // it is not a real thing yet, so just say the type is
+                          // none.
     std::shared_ptr<Graph> subgraph;
-    Value* context;
-    std::tie(subgraph, context) = lambdaLift(block);
-    ConvertToSSA(subgraph);
-    runCleanupPasses(subgraph);
-    closure_node->eraseBlock(0);
-    closure_node->g_(attr::Subgraph, std::move(subgraph));
+    // Value* context;
+    // std::tie(subgraph, context) = lambdaLift(block);
+    // runCleanupPasses(subgraph);
+    // closure_node->eraseBlock(0);
+    // closure_node->g_(attr::Subgraph, std::move(subgraph));
     auto tup =
-        graph->insertNode(graph->createTuple({closure_node->output(), context}))
+        graph->insertNode(graph->createTuple({closure_node->output()}))
             ->output();
     environment_stack->setVar(def.name().range(), def.name().name(), tup);
   }
@@ -2456,6 +2564,24 @@ struct to_ir {
     return graph->insertConstant(stack[0], nullptr, tree->range());
   }
 
+  // this is needed because we currently don't currently have a way of
+  // typing functions. We represent functions as a tuple of (None,
+  // (Inputs)). The environment has no way of knowing that the tuple does
+  // not represent a first class type, so it emits the load to the function
+  // as a prim::Load to a tuple type. This is a workaround to get the actual
+  // value. When functions are first class, we should be able to remove
+  // this.
+  // if (simple_forked && simple_forked->node()->kind() == prim::Load) {
+  //   auto fork_val = environment_stack->getRecentlySetValue(
+  //       simple_forked->node()->s(attr::name));
+  //   auto fork_val_shared = std::make_shared<SimpleValue>(fork_val);
+  //   fn_sugared_output =
+  //       fork_val_shared->call(loc, method, inputs, attributes, 1);
+  // } else {
+  // Lambda lift block(0) into attr::Subgraph
+  // lambdaLiftFork(fork_node);
+  // runCleanupPasses(fork_node->g(attr::Subgraph));
+
   // This function extract a new graph from its original subgraph
   std::shared_ptr<SugaredValue> emitForkExpr(
       SourceRange loc,
@@ -2463,43 +2589,34 @@ struct to_ir {
       at::ArrayRef<NamedValue> inputs,
       at::ArrayRef<NamedValue> attributes) {
     // Build the fork node without inputs
-    auto fork_node = method.graph()
-                         ->insertNode(method.graph()->create(prim::fork, 1))
-                         ->setSourceRange(loc);
-    auto body_block = fork_node->addBlock();
-
     // Build a template of the graph to be executed
-    Value* node_output;
-    {
-      WithInsertPoint guard(body_block);
+    auto g = method.graph();
 
-      // auto simple_forked = asSimple(forked);
-      std::shared_ptr<SugaredValue> fn_sugared_output;
-      // this is needed because we currently don't currently have a way of
-      // typing functions. We represent functions as a tuple of (None,
-      // (Inputs)). The environment has no way of knowing that the tuple does
-      // not represent a first class type, so it emits the load to the function
-      // as a prim::Load to a tuple type. This is a workaround to get the actual
-      // value. When functions are first class, we should be able to remove
-      // this.
-      // if (simple_forked && simple_forked->node()->kind() == prim::Load) {
-      //   auto fork_val = environment_stack->getRecentlySetValue(
-      //       simple_forked->node()->s(attr::name));
-      //   auto fork_val_shared = std::make_shared<SimpleValue>(fork_val);
-      //   fn_sugared_output =
-      //       fork_val_shared->call(loc, method, inputs, attributes, 1);
-      // } else {
-      fn_sugared_output = forked->call(loc, method, inputs, attributes, 1);
-      // }
-
-      auto fn_simple_output = fn_sugared_output->asValue(loc, method);
-      body_block->registerOutput(fn_simple_output);
-      node_output = fork_node->output()->setType(
-          FutureType::create(fn_simple_output->type()));
+    Node* fork_node;
+    TypePtr out_type;
+    auto simple_forked = asSimple(forked);
+    if (simple_forked) {
+      auto tuple_type = simple_forked->type()->cast<TupleType>();
+      if (!tuple_type) {
+        throw ErrorReport(loc) << "Cannot fork this value";
+      }
+      fork_node = graph->insertNode(graph->create(prim::forkClosure, {simple_forked}, 1)
+                      ->setSourceRange(loc));
+      out_type = tuple_type->elements().at(0);
+    } else {
+      fork_node = g->insertNode(method.graph()->create(prim::fork, 1))
+                      ->setSourceRange(loc);
+      auto body_block = fork_node->addBlock();
+      {
+        std::shared_ptr<SugaredValue> fn_sugared_output;
+        WithInsertPoint guard(body_block);
+        fn_sugared_output = forked->call(loc, method, inputs, attributes, 1);
+        auto fn_simple_output = fn_sugared_output->asValue(loc, method);
+        body_block->registerOutput(fn_simple_output);
+        out_type = fn_simple_output->type();
+      }
     }
-    // Lambda lift block(0) into attr::Subgraph
-    lambdaLiftFork(fork_node);
-    runCleanupPasses(fork_node->g(attr::Subgraph));
+    Value* node_output = fork_node->output()->setType(FutureType::create(out_type));
     return std::make_shared<SimpleValue>(node_output);
   }
 
