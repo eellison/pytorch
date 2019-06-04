@@ -12,7 +12,6 @@
 #include <torch/csrc/jit/passes/lower_tuples.h>
 #include <torch/csrc/jit/script/convert_to_ssa.h>
 #include <torch/csrc/jit/script/final_returns.h>
-#include <torch/csrc/jit/script/mini_environment.h>
 #include <torch/csrc/jit/script/parser.h>
 #include <torch/csrc/jit/script/schema_matching.h>
 #include <torch/csrc/jit/script/script_type_parser.h>
@@ -290,7 +289,6 @@ struct Environment {
       const std::string& name,
       SugaredValuePtr value) {
     Value* as_simple_value = asSimple(value);
-
     if (as_simple_value && !as_simple_value->hasUniqueName() &&
         meaningfulName(name) &&
         // note: if the value wasn't defined in this block, we might be giving a
@@ -455,39 +453,6 @@ inline bool isSupportedListElementType(const TypePtr& type) {
       type->isSubtypeOf(NumberType::get());
 }
 
-using MiniTypeEnvironment = MiniEnvironment<TypePtr>;
-
-// Invokes close_var_fn when a variable is used that isn't defined in the
-// current scope. This is for use in forks & closures which close over variables
-// in the enclosing scope
-static void addClosedOverVariables(
-    Block* block,
-    std::shared_ptr<MiniTypeEnvironment> parent,
-    std::function<void(const std::string&, TypePtr)> close_var_fn) {
-  std::shared_ptr<MiniTypeEnvironment> frame =
-      std::make_shared<MiniTypeEnvironment>(block, parent);
-  for (Node* n : block->nodes()) {
-    switch (n->kind()) {
-      case prim::If:
-      case prim::Loop: {
-        for (Block* b : n->blocks()) {
-          addClosedOverVariables(b, frame, close_var_fn);
-        }
-      } break;
-      case prim::Store: {
-        frame->setVar(n->s(attr::name), n->input()->type());
-      } break;
-      case prim::Load: {
-        const auto& name = n->s(attr::name);
-        auto out = frame->findInAnyFrame(name);
-        if (!out) {
-          close_var_fn(name, n->output()->type());
-        }
-      } break;
-    }
-  }
-}
-
 // Information for each def being emitted.
 // Defs can be nested to support closures so we need a stack of this information
 // Currently records information about the functions return type.
@@ -615,13 +580,13 @@ struct to_ir {
   }
 
   void liftFork(Node* fork_node) {
-    // forks eg from tracing will already be lifted, or with nested forks
+    // forks from tracing or nested forks will already be lifted
     if (fork_node->hasAttribute(attr::Subgraph)) {
       AT_ASSERT(fork_node->blocks().size() == 0);
       return;
     }
 
-    // lambda lift fork is exposed, so that it can be invoked in the tracer
+    // lambda lift fork is exposed so that it can be invoked in the tracer
     lambdaLiftFork(fork_node);
     runCleanupPasses(fork_node->g(attr::Subgraph), /*convert_to_ssa*/false);
   }
@@ -634,7 +599,7 @@ struct to_ir {
   // so closed over variables will just be value * that are not set in the
   // closure block.
   // Within the closure subgraph, the context tuple is unpacked and the unpacked
-  // unpack values are used for closed over values.
+  // values are used for closed over values.
   void liftClosure(Node* closure) {
     auto block = closure->blocks().at(0);
     auto subgraph = std::make_shared<Graph>();

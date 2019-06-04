@@ -7,7 +7,7 @@ namespace jit {
 namespace script {
 
 // At the beginning of the pass the Graph has already undergone type checking,
-// and Loads & Stores to a variable are emitted as explicit nodes in the graph.
+// and writes or reads to a variable are emitted as Loads and Stores in the graph.
 // a = 1
 // print(a)
 // is represented as:
@@ -18,11 +18,12 @@ namespace script {
 // prim::Print(%a)
 //
 // First, this pass recursively adds the correct outputs to If & Loop nodes.
-// Then it converts the graph to SSA form.
+// Then the graph is converted to SSA form.
 
 using ValueEnvironment = MiniEnvironment<Value *>;
 using TypeEnvironment = MiniEnvironment<TypePtr>;
 
+// Adds Outputs to Loops & Ifs given a graph of Loads & Stores
 struct ControlFlowOutputs {
   static void addBlockInput(Block *b, const TypePtr& type, const std::string& name) {
     auto g = b->owningGraph();
@@ -173,6 +174,8 @@ struct ControlFlowOutputs {
   std::shared_ptr<TypeEnvironment> environment_stack = nullptr;
 };
 
+// Given a graph where outputs have been added to control flow nodes, and
+// loads and stores are represented in the graph, converts the graph to SSA
 struct SSATransformer {
   void convertBlockToSSA(Block* block) {
     pushFrame(block);
