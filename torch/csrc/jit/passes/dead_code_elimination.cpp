@@ -44,6 +44,7 @@ class DeadCodeEliminator {
 
  private:
   void eliminateDeadForkInputs(Block* block, bool recurse) {
+    return;
     for (Node* node : block->nodes()) {
       if (recurse) {
         for (Block* sb : node->blocks()) {
