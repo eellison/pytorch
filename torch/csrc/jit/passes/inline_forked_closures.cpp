@@ -18,6 +18,14 @@ namespace script {
 // def foo(a, b):
 void inlineForkedClosure(Node* fork_closure) {
   Node* function_context_node = fork_closure->input()->node();
+
+  if (function_context_node->inputs().size() != 2 ||
+      function_context_node->inputs().at(0)->node()->kind() != prim::Function ||
+      function_context_node->inputs().at(1)->node()->kind() !=
+          prim::TupleConstruct) {
+    throw ErrorReport(fork_closure->sourceRange()) << "Cannot fork this value";
+  }
+
   Node* function = function_context_node->inputs().at(0)->node();
   Node* context = function_context_node->inputs().at(1)->node();
   auto fork_graph = function->g(attr::Subgraph)->copy();
@@ -47,7 +55,7 @@ void inlineForkedClosure(Node* fork_closure) {
   fork_closure->output()->replaceAllUsesWith(fork_node->output());
   fork_closure->destroy();
   fork_node->g_(attr::Subgraph, fork_graph);
-  runCleanupPasses(fork_graph, /*convert_to_ssa */false);
+  runCleanupPasses(fork_graph, /*convert_to_ssa */ false);
 }
 
 void inlineForkedClosures(Block* block) {
@@ -71,6 +79,6 @@ void inlineForkedClosures(std::shared_ptr<Graph>& to_clean) {
   inlineForkedClosures(to_clean->block());
 }
 
-}
+} // namespace script
 } // namespace jit
 } // namespace torch
