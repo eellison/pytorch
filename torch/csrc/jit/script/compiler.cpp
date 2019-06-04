@@ -289,7 +289,6 @@ struct Environment {
       const SourceRange& loc,
       const std::string& name,
       SugaredValuePtr value) {
-    WithInsertPoint guard(b->return_node());
     Value* as_simple_value = asSimple(value);
 
     if (as_simple_value && !as_simple_value->hasUniqueName() &&
