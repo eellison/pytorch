@@ -9,6 +9,8 @@
 #include <torch/csrc/jit/passes/constant_pooling.h>
 #include <torch/csrc/jit/passes/dead_code_elimination.h>
 #include <torch/csrc/jit/passes/inliner.h>
+#include <torch/csrc/jit/passes/lift_forks_closures.h>
+#include <torch/csrc/jit/passes/inline_forked_closures.h>
 #include <torch/csrc/jit/passes/lower_tuples.h>
 #include <torch/csrc/jit/script/convert_to_ssa.h>
 #include <torch/csrc/jit/script/final_returns.h>
@@ -511,177 +513,6 @@ struct to_ir {
       def_stack_.pop_back();
     }
     return old_frame;
-  }
-
-  // Closure nodes are emitted as a tuple of (function %, context tuple %)
-  // Inside the closure the closure is then unpacked so that all closed over
-  // values are set. A function closing over a and b would look like:
-  // def foo(context):
-  //  a, b = context
-  //
-  // To fork the closure, we need to set each value in the context tuple
-  // as an explicit input to the fork node, and then within the closure
-  // subgraph, replace the context unpacking value with the new graph input.
-  // fork(foo) ->
-  // def foo(a, b):
-  void inlineForkedClosure(Node* fork_closure) {
-    Node* function_context_node = fork_closure->input()->node();
-    Node* function = function_context_node->inputs().at(0)->node();
-    Node* context = function_context_node->inputs().at(1)->node();
-    auto fork_graph = function->g(attr::Subgraph)->copy();
-    auto g = fork_closure->owningGraph();
-    Node* fork_node = g->create(prim::fork, 1)
-                          ->insertAfter(fork_closure)
-                          ->setSourceRange(fork_closure->sourceRange());
-
-    if (fork_graph->inputs().size() != 1 ||
-        !fork_graph->inputs().at(0)->type()->cast<TupleType>()) {
-      throw ErrorReport(fork_node->sourceRange())
-          << "Cannot fork lambda with parameters";
-    }
-    auto fork_graph_context = fork_graph->inputs().at(0);
-    AT_ASSERT(fork_graph_context->uses().size() == 1);
-    auto fork_graph_unpack = fork_graph_context->uses().at(0).user;
-
-    for (size_t i = 0; i < context->inputs().size(); ++i) {
-      auto cont_input = context->inputs().at(i);
-      fork_node->addInput(cont_input);
-      auto inp = fork_graph->insertInput(i)->copyMetadata(cont_input);
-      fork_graph_unpack->outputs().at(i)->replaceAllUsesWith(inp);
-    }
-    fork_graph_unpack->destroy();
-    fork_graph->eraseInput(fork_graph->inputs().size() - 1);
-    fork_node->output()->copyMetadata(fork_closure->output());
-    fork_closure->output()->replaceAllUsesWith(fork_node->output());
-    fork_closure->destroy();
-    fork_node->g_(attr::Subgraph, fork_graph);
-    runCleanupPasses(fork_graph, /*convert_to_ssa */false);
-  }
-
-  void inlineForkedClosures(Block* block) {
-    for (auto it = block->nodes().begin(); it != block->nodes().end();) {
-      Node* n = *it;
-      it++;
-      switch (n->kind()) {
-        case prim::forkClosure: {
-          inlineForkedClosure(n);
-        } break;
-        default: {
-          for (Block* b : n->blocks()) {
-            inlineForkedClosures(b);
-          }
-        } break;
-      }
-    }
-  }
-
-  void inlineForkedClosures(std::shared_ptr<Graph>& to_clean) {
-    inlineForkedClosures(to_clean->block());
-  }
-
-  void liftFork(Node* fork_node) {
-    // forks from tracing or nested forks will already be lifted
-    if (fork_node->hasAttribute(attr::Subgraph)) {
-      AT_ASSERT(fork_node->blocks().size() == 0);
-      return;
-    }
-
-    // lambda lift fork is exposed so that it can be invoked in the tracer
-    lambdaLiftFork(fork_node);
-    runCleanupPasses(fork_node->g(attr::Subgraph), /*convert_to_ssa*/false);
-  }
-
-
-  // Closures are initially emitted as prim::Function nodes with a single block.
-  // Here, we convert the block to a subgraph, adding all closed over variables
-  // as a context tuple input to the closure node.
-  // At this point the closure has already undergone conversion to SSA,
-  // so closed over variables will just be value * that are not set in the
-  // closure block.
-  // Within the closure subgraph, the context tuple is unpacked and the unpacked
-  // values are used for closed over values.
-  void liftClosure(Node* closure) {
-    auto block = closure->blocks().at(0);
-    auto subgraph = std::make_shared<Graph>();
-    // closures/forks can be nested, so use closure owning graph
-    auto g = closure->owningGraph();
-    Node* pack_context =
-        g->create(prim::TupleConstruct, {}, 1)->insertAfter(closure);
-    Value* context = subgraph->addInput("context");
-    // cannot use createTupleUnpack because the type is not known yet
-    Node* unpack_context =
-        subgraph->insertNode(subgraph->create(prim::TupleUnpack, {context}, 0));
-
-    std::unordered_map<Value*, Value*> captures;
-    auto env = [&](Value* v) -> Value* {
-      auto it = captures.find(v);
-      if (it != captures.end()) {
-        return it->second;
-      }
-      pack_context->addInput(v);
-      Value* r = unpack_context->addOutput()->copyMetadata(v);
-      captures[v] = r;
-      return r;
-    };
-    subgraph->block()->cloneFrom(block, env);
-    auto context_type = TupleType::create(
-        fmap(pack_context->inputs(), [](Value* v) { return v->type(); }));
-    pack_context->output()->setType(context_type);
-    context->setType(context_type);
-    AT_ASSERT(closure->output()->uses().size() == 1);
-    auto closure_tuple = closure->output()->uses().at(0).user;
-    closure_tuple->addInput(pack_context->output());
-    closure_tuple->output()->setType(
-        TupleType::create({closure->output()->type(), context_type}));
-    closure->eraseBlock(0);
-    closure->g_(attr::Subgraph, std::move(subgraph));
-    runCleanupPasses(closure->g(attr::Subgraph), /*convert_to_ssa*/false);
-  }
-
-  void liftClosuresAndForks(Block* block) {
-    for (auto it = block->nodes().begin(); it != block->nodes().end();) {
-      Node* n = *it;
-      it++;
-      switch (n->kind()) {
-        case prim::Function: {
-          liftClosure(n);
-        } break;
-        case prim::fork: {
-          liftFork(n);
-        } break;
-        default: {
-          for (Block* b : n->blocks()) {
-            liftClosuresAndForks(b);
-          }
-        }
-      }
-    }
-  }
-
-  void liftClosuresAndForks(std::shared_ptr<Graph>& to_clean) {
-    liftClosuresAndForks(to_clean->block());
-  }
-
-  void runCleanupPasses(
-      std::shared_ptr<Graph>& to_clean,
-      bool convert_ssa = true) {
-    // the graph including closures is converted to ssa in the first pass,
-    // so subsequent cleanups do not need reconvert it
-    if (convert_ssa) {
-      ConvertToSSA(to_clean);
-    }
-    // NB ORDERING: SSA conversion, lifting of closures and forks,
-    // and inling of forked closurees has to go in that order.
-    // this way closures get converted to SSA while part of their original
-    // graph, and closures are lifted & ready to be inlined into fork nodes.
-    liftClosuresAndForks(to_clean);
-    inlineForkedClosures(to_clean);
-    // remove any uses of tuples that we inserted that are not needed
-    Inline(*to_clean);
-    LowerSimpleTuples(to_clean);
-    ConstantPooling(to_clean);
-    // For jitter
-    CanonicalizeOutputs(to_clean);
   }
 
   FunctionSchema emitDef(const Def& def, const Self& self, Block* block) {
@@ -3204,27 +3035,26 @@ void CompilationUnit::define(
   define(definitions, resolvers, self);
 }
 
-void lambdaLiftFork(Node* fork_node) {
-  // Fork a new graph from its orignal owning graph
-  auto forked_graph = std::make_shared<Graph>();
-  auto body_block = fork_node->blocks()[0];
-
-  // Make sure we capture everything in the new graph.
-  // The uncaptured values will be added to the fork signature.
-  std::unordered_map<Value*, Value*> uncaptures_map;
-  auto env = [&](Value* v) -> Value* {
-    if (!uncaptures_map.count(v)) {
-      // Capture values for both graphs
-      uncaptures_map[v] = forked_graph->addInput()->copyMetadata(v);
-      fork_node->addInput(v);
-    }
-    return uncaptures_map[v];
-  };
-  forked_graph->block()->cloneFrom(body_block, env);
-
-  // Separate the subgraph and clean up the orignal one
-  fork_node->g_(attr::Subgraph, forked_graph);
-  fork_node->eraseBlock(0);
+void runCleanupPasses(
+    std::shared_ptr<Graph>& to_clean,
+    bool convert_ssa) {
+  // the graph including closures is converted to ssa in the first pass,
+  // so subsequent cleanups do not need reconvert it
+  if (convert_ssa) {
+    ConvertToSSA(to_clean);
+  }
+  // NB ORDERING: SSA conversion, lifting of closures and forks,
+  // and inling of forked closurees has to go in that order.
+  // this way closures get converted to SSA while part of their original
+  // graph, and closures are lifted & ready to be inlined into fork nodes.
+  liftClosuresAndForks(to_clean);
+  inlineForkedClosures(to_clean);
+  // remove any uses of tuples that we inserted that are not needed
+  Inline(*to_clean);
+  LowerSimpleTuples(to_clean);
+  ConstantPooling(to_clean);
+  // For jitter
+  CanonicalizeOutputs(to_clean);
 }
 
 
