@@ -905,7 +905,8 @@ struct to_ir {
       arguments.push_back(schema.arguments().at(arg_annotation_idx++));
       new_input->setType(arguments.back().type());
 
-      // NB: set type of new_input before setVar call
+      // NB: set type of new_input before setVar call so the Store is
+      // typed appropriately
       environment_stack->setVar((*it).ident().range(), name, new_input);
     }
     return arguments;
@@ -951,10 +952,11 @@ struct to_ir {
       popFrame(/*ends_def=*/true);
     }
     AT_ASSERT(block->outputs().size() == 1);
-    // Set the type of the closure equal to its outputs.
-    // A forked closure needs its outputs correctly set so that typechecking
-    // will work. Later, in inlinedForkedClosure pass, we will check that the
-    // input is a closure and not any arbitrary value.
+    // Set the type of the closure equal to its return type.
+    // Since the closures are not-first class yet in the type system,
+    // we use their output type to correctly type forks of closures,
+    // and after the graph is transformed to SSA ensure that forked closures
+    // are actually being invoked on a closure and not an arbitrary value.
     closure_node->output()->setType(block->outputs().at(0)->type());
     std::shared_ptr<Graph> subgraph;
     auto tup = graph->insertNode(graph->createTuple({closure_node->output()}))
