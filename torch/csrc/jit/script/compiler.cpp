@@ -26,6 +26,7 @@ namespace torch {
 namespace jit {
 namespace script {
 
+
 using SugaredValuePtr = std::shared_ptr<SugaredValue>;
 using FunctionTable = std::unordered_map<std::string, Method&>;
 using ValueTable = std::unordered_map<std::string, SugaredValuePtr>;
