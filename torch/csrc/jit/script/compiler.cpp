@@ -33,7 +33,6 @@ namespace script {
 using FunctionTable = std::unordered_map<std::string, Function&>;
 using ValueTable = std::unordered_map<std::string, SugaredValuePtr>;
 using TypeTable = std::unordered_map<std::string, TypePtr>;
-using SimpleValueTable = std::unordered_map<std::string, Value*>;
 using AttributeMap = std::unordered_map<std::string, Const>;
 using ListAttributeMap = std::unordered_map<std::string, std::vector<Const>>;
 
@@ -753,11 +752,10 @@ struct to_ir {
     // we use their output type to correctly type forks of closures,
     // and after the graph is transformed to SSA ensure that forked closures
     // are actually being invoked on a closure and not an arbitrary value.
-    closure_node->output()->setType(block->outputs().at(0)->type());
+    closure_node->output()->setType(NoneType::get());
     std::shared_ptr<Graph> subgraph;
-    auto tup = graph->insertNode(graph->createTuple({closure_node->output()}))
-                   ->output();
-    environment_stack->setVar(def.name().range(), def.name().name(), tup);
+    auto closure_value = std::make_shared<ClosureValue>(closure_node->output());
+    environment_stack->setSugaredVar(def.name().range(), def.name().name(), closure_value);
   }
 
   void emitReturn(const Return& stmt) {
@@ -2349,38 +2347,39 @@ struct to_ir {
     auto g = method.graph();
     Node* fork_node;
     TypePtr out_type;
-
-    // We have two pathways for forks, one for invocations of closures
-    // and one for invocations of builtins or functions. If the input value is
-    // simple than we go through the closure pathway.
-    auto simple_forked = asSimple(forked);
-    if (simple_forked) {
-      // because closures are not first-class yet, they are represented as
-      // a tuple of (Output Type, Context). We need to extract the output type
-      // so the rest of the function type checks. Later, we ensure that
-      // the input actually is a closure and not just a tuple, and inline the
-      // closure into the fork.
-      auto tuple_type = simple_forked->type()->cast<TupleType>();
-      if (!tuple_type) {
-        throw ErrorReport(loc) << "Cannot fork this value";
-      }
-      fork_node =
-          graph->insertNode(graph->create(prim::forkClosure, {simple_forked}, 1)
-                                ->setSourceRange(loc));
-      out_type = tuple_type->elements().at(0);
-    } else {
+    // // We have two pathways for forks, one for invocations of closures
+    // // and one for invocations of builtins or functions. If the input value is
+    // // simple than we go through the closure pathway.
+    // auto simple_forked = asSimple(forked);
+    // if (simple_forked) {
+    //   // because closures are not first-class yet, they are represented as
+    //   // a tuple of (Output Type, Context). We need to extract the output type
+    //   // so the rest of the function type checks. Later, we ensure that
+    //   // the input actually is a closure and not just a tuple, and inline the
+    //   // closure into the fork.
+    //   auto tuple_type = simple_forked->type()->cast<TupleType>();
+    //   if (!tuple_type) {
+    //     throw ErrorReport(loc) << "Cannot fork this value";
+    //   }
+    //   fork_node =
+    //       graph->insertNode(graph->create(prim::forkClosure, {simple_forked}, 1)
+    //                             ->setSourceRange(loc));
+    //   out_type = tuple_type->elements().at(0);
       // Build a template of the graph to be executed
-      fork_node = g->insertNode(method.graph()->create(prim::fork, 1))
-                      ->setSourceRange(loc);
-      auto body_block = fork_node->addBlock();
-      {
-        std::shared_ptr<SugaredValue> fn_sugared_output;
-        WithInsertPoint guard(body_block);
+    fork_node = g->insertNode(method.graph()->create(prim::fork, 1))
+                    ->setSourceRange(loc);
+    auto body_block = fork_node->addBlock();
+    {
+      std::shared_ptr<SugaredValue> fn_sugared_output;
+      WithInsertPoint guard(body_block);
+      if (ClosureValue* sv = dynamic_cast<ClosureValue*>(forked.get())) {
+        fn_sugared_output = sv->inlineInto(body_block);
+      } else {
         fn_sugared_output = forked->call(loc, method, inputs, attributes, 1);
-        auto fn_simple_output = fn_sugared_output->asValue(loc, method);
-        body_block->registerOutput(fn_simple_output);
-        out_type = fn_simple_output->type();
       }
+      auto fn_simple_output = fn_sugared_output->asValue(loc, method);
+      body_block->registerOutput(fn_simple_output);
+      out_type = fn_simple_output->type();
     }
     Value* node_output =
         fork_node->output()->setType(FutureType::create(out_type));

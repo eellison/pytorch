@@ -274,6 +274,53 @@ struct TORCH_API PrintValue : public SugaredValue {
       size_t n_binders) override;
 };
 
+
+struct TORCH_API ClosureValue : public SugaredValue {
+  ClosureValue(Value* value) : value_(value) {
+    TORCH_INTERNAL_ASSERT(value_->node()->kind() == prim::Function);
+  }
+  std::string kind() const override {
+    return "print";
+  }
+  std::shared_ptr<SugaredValue> inlineInto(Block * b) {
+    auto env = [&](Value* v) -> Value* {
+      return v;
+    };
+    b->cloneFrom(value_->node()->blocks().at(0), env);
+    AT_ASSERT(b->outputs().size() == 1);
+    return std::make_shared<SimpleValue>(b->outputs().at(0));
+  }
+  // std::shared_ptr<SugaredValue> call(
+  //     const SourceRange& loc,
+  //     Function& m,
+  //     at::ArrayRef<NamedValue> inputs,
+  //     at::ArrayRef<NamedValue> attributes,
+  //     size_t n_binders) override {
+  //   if (inputs.size() != 0 || attributes.size() != 0) {
+  //     throw ErrorReport(loc) << "Cannot call lambda with parameters";
+  //   }
+  //   auto function_block = value_->node()->blocks().at(0);
+  //   auto env = [&](Value* v) -> Value* {
+  //     return v;
+  //   };
+  //   auto& g = *m.graph();
+  //   auto insert_node = g.insertNode(g.createNone(IntType::get()));
+  //   auto block = insert_node->owningBlock();
+  //
+  //
+  //   // subgraph->block()->cloneFrom(block, env);
+  //
+  //   // *m.graph()->
+  //
+  //
+  //
+  // };
+  Value* asValue(const SourceRange& range, Function& m) override {
+    return value_;
+  }
+  Value * value_;
+};
+
 // expressions like int(x)
 // these are the same as call prim::Int or equivalent except it
 // is a noop when the input is a subtype of 'type'
@@ -356,6 +403,13 @@ struct TORCH_API AnnotateValue : public SugaredValue {
   AnnotateValue() = default;
   std::string kind() const override {
     return "annotate";
+  }
+};
+
+struct TORCH_API UninitializedValue : public SugaredValue {
+  UninitializedValue() = default;
+  std::string kind() const override {
+    return "uninitialized";
   }
 };
 

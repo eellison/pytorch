@@ -15243,6 +15243,13 @@ class TestAsync(JitTestCase):
         result = bar(x)
         self.assertEqual(len(result), 3)
 
+    # def test_elias(self):
+        # cu = torch.jit.CompilationUnit('''
+        #     def foo(a):
+        #         print("hi\016")
+        # ''')
+        #
+
     def test_async_script(self):
         @torch.jit.script
         def foo(x):

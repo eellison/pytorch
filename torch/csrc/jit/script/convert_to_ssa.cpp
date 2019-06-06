@@ -7,8 +7,10 @@ namespace jit {
 namespace script {
 
 // At the beginning of the pass the Graph has already undergone type checking,
-// and writes or reads to a variable are emitted as Loads and Stores in the
-// graph. a = 1 print(a) is represented as:
+// and writes or reads to a variable are emitted as Loads and Stores in the graph.
+// a = 1
+// print(a)
+// is represented as:
 //
 // %a.1 : int = prim::Constant[value=1]()
 // prim::Store[name="a"](%a.1)
@@ -18,49 +20,36 @@ namespace script {
 // First, this pass recursively adds the correct outputs to If & Loop nodes.
 // Then the graph is converted to SSA form.
 
-using ValueEnvironment = MiniEnvironment<Value*>;
+using ValueEnvironment = MiniEnvironment<Value *>;
 using TypeEnvironment = MiniEnvironment<TypePtr>;
 
 // Adds Outputs to Loops & Ifs given a graph of Loads & Stores
 struct ControlFlowOutputs {
-  static void addBlockInput(
-      Block* b,
-      const TypePtr& type,
-      const std::string& name) {
+  static void addBlockInput(Block *b, const TypePtr& type, const std::string& name) {
     auto g = b->owningGraph();
-    g->createStore(name, b->addInput(name)->setType(type))
-        ->insertAfter(b->param_node());
+    g->createStore(name, b->addInput(name)->setType(type))->insertAfter(b->param_node());
   }
 
-  static void addBlockOutput(
-      Block* b,
-      const TypePtr& type,
-      const std::string& name) {
+  static void addBlockOutput(Block *b, const TypePtr& type, const std::string& name) {
     WithInsertPoint insert(b);
     auto g = b->owningGraph();
     auto block_output = g->insertNode(g->createLoad(name, type))->output();
     b->registerOutput(block_output);
   }
 
-  static void addNodeOutput(
-      Node* n,
-      const TypePtr& type,
-      const std::string& name) {
+  static void addNodeOutput(Node *n, const TypePtr& type, const std::string& name) {
     auto out = n->addOutput()->setType(type)->setUniqueName(name);
     auto g = n->owningGraph();
     g->createStore(name, out)->insertAfter(n);
   }
 
-  static void addNodeInput(
-      Node* n,
-      const TypePtr& type,
-      const std::string& name) {
+  static void addNodeInput(Node *n, const TypePtr& type, const std::string& name) {
     auto g = n->owningGraph();
     auto inp = g->createLoad(name, type)->insertBefore(n)->output();
     n->addInput(inp);
   }
 
-  void addIfOutputs(Node* n) {
+  void addIfOutputs(Node * n) {
     auto true_block = n->blocks().at(0);
     auto false_block = n->blocks().at(1);
 
@@ -106,13 +95,14 @@ struct ControlFlowOutputs {
   // all loop_carried_... lists are the same length and represent the value of
   // loop-carried variables whose definitions are updated as the loop executes
   // in a way that ensure single static assignment.
-  void addLoopOutputs(Node* n) {
+  void addLoopOutputs(Node * n) {
     auto body_block = n->blocks().at(0);
     auto loop_vars = addControlFlowOutputs(body_block);
     for (const auto& name : loop_vars->definedVariables()) {
+
       // we require that the variable is defined outside the loop to be emitted,
-      // and we do not refine the type of the parent variable since the loop may
-      // not be entered.
+      // and we do not refine the type of the parent variable since the loop may not
+      // be entered.
       auto parent_type = environment_stack->findInAnyFrame(name);
       if (!parent_type) {
         continue;
@@ -131,19 +121,19 @@ struct ControlFlowOutputs {
     AT_ASSERT(loop_condition->kind() == prim::LoopCondition);
     loop_condition->moveBefore(body_block->return_node());
     auto loop_condition_block = loop_condition->blocks().at(0);
-    for (auto it = loop_condition_block->nodes().begin();
-         it != loop_condition_block->nodes().end();) {
+    for (auto it = loop_condition_block->nodes().begin(); it != loop_condition_block->nodes().end();) {
       auto block_node = *it++;
       block_node->moveBefore(loop_condition);
     }
 
-    for (Node* n : loop_condition_block->nodes()) {
+    for (Node * n: loop_condition_block->nodes()) {
       n->moveBefore(loop_condition);
     }
     body_block->eraseOutput(0);
     body_block->insertOutput(0, loop_condition_block->outputs().at(0));
     loop_condition->destroy();
   }
+
 
   std::shared_ptr<TypeEnvironment> addControlFlowOutputs(Block* block) {
     pushFrame(block);
@@ -156,6 +146,7 @@ struct ControlFlowOutputs {
         case prim::Loop: {
           addLoopOutputs(n);
         } break;
+        case prim::fork:
         case prim::Function: {
           addControlFlowOutputs(n->blocks().at(0));
         } break;
@@ -196,7 +187,7 @@ struct SSATransformer {
         case prim::If:
         case prim::Loop:
         case prim::Function: {
-          for (auto b : n->blocks()) {
+          for (auto b: n->blocks()) {
             convertBlockToSSA(b);
           }
         } break;
@@ -207,8 +198,7 @@ struct SSATransformer {
         case prim::Load: {
           auto name = n->s(attr::name);
           auto var = environment_stack->findInAnyFrame(name);
-          TORCH_INTERNAL_ASSERT(
-              var, "Typechecking should ensure the variable name is set");
+          TORCH_INTERNAL_ASSERT(var, "Typechecking should ensure the variable name is set");
           n->output()->replaceAllUsesWith(var);
           n->destroy();
         } break;
@@ -218,8 +208,7 @@ struct SSATransformer {
   }
 
   void pushFrame(Block* b) {
-    environment_stack =
-        std::make_shared<ValueEnvironment>(b, environment_stack);
+    environment_stack = std::make_shared<ValueEnvironment>(b, environment_stack);
   }
 
   std::shared_ptr<ValueEnvironment> popFrame() {
@@ -244,6 +233,6 @@ void ConvertToSSA(std::shared_ptr<Graph>& graph) {
   ssa.run(graph);
 }
 
-} // namespace script
 } // namespace jit
+} // namespace torch
 } // namespace torch
