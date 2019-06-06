@@ -39,7 +39,6 @@ namespace c10 {
   _(prim, JumpZ) /* debug */       \
   _(prim, Load)                    \
   _(prim, Loop)                    \
-  _(prim, LoopCondition)           \
   _(prim, Param)                   \
   _(prim, PackPadded) /* onnx */   \
   _(prim, PadPacked) /* onnx */    \
@@ -49,6 +48,7 @@ namespace c10 {
   _(prim, IgnoredPythonOp)         \
   _(prim, Reverse)                 \
   _(prim, Return)                  \
+  _(prim, BreakStmt)               \
   _(prim, Store)                   \
   _(prim, AutogradZero)            \
   _(prim, AutogradAnyNonZero)      \
@@ -63,6 +63,7 @@ namespace c10 {
   _(prim, DictIndex)               \
   _(prim, StringIndex)             \
   _(prim, NumToTensor)             \
+  _(prim, Uninitialized)           \
   _(prim, ImplicitTensorToNum)     \
   _(prim, Bool)                    \
   _(prim, Int)                     \

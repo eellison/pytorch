@@ -115,23 +115,6 @@ struct ControlFlowOutputs {
       addBlockOutput(body_block, parent_type, name);
       addNodeOutput(n, parent_type, name);
     }
-
-    // loop continue expression should go after the loop carried outputs
-    auto loop_condition = body_block->outputs().at(0)->node();
-    AT_ASSERT(loop_condition->kind() == prim::LoopCondition);
-    loop_condition->moveBefore(body_block->return_node());
-    auto loop_condition_block = loop_condition->blocks().at(0);
-    for (auto it = loop_condition_block->nodes().begin(); it != loop_condition_block->nodes().end();) {
-      auto block_node = *it++;
-      block_node->moveBefore(loop_condition);
-    }
-
-    for (Node * n: loop_condition_block->nodes()) {
-      n->moveBefore(loop_condition);
-    }
-    body_block->eraseOutput(0);
-    body_block->insertOutput(0, loop_condition_block->outputs().at(0));
-    loop_condition->destroy();
   }
 
 
@@ -146,7 +129,11 @@ struct ControlFlowOutputs {
         case prim::Loop: {
           addLoopOutputs(n);
         } break;
-        case prim::fork:
+        case prim::fork: {
+          if (n->blocks().size()) {
+            addControlFlowOutputs(n->blocks().at(0));
+          }
+        } break;
         case prim::Function: {
           addControlFlowOutputs(n->blocks().at(0));
         } break;

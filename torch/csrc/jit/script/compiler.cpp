@@ -1256,21 +1256,11 @@ struct to_ir {
 
       emitStatements(body);
 
-      Node* loop_condition =
-          graph->insertNode(create(prim::LoopCondition, range, 0));
-      auto condition_block = loop_condition->addBlock();
-      {
-        pushFrame(condition_block);
-        WithInsertPoint insert(condition_block);
-        Value* block_condition = (cond)
-            ? emitCond(cond.value())
-            : graph->insertConstant(true, nullptr, range);
-        condition_block->insertOutput(0, block_condition);
-        popFrame();
-      }
-      auto block_continue_condition =
-          loop_condition->addOutput()->setType(BoolType::get());
-      body_block->registerOutput(block_continue_condition);
+      Value* block_condition = (cond)
+          ? emitCond(cond.value())
+          : graph->insertConstant(true, nullptr, range);
+
+      body_block->registerOutput(block_condition);
 
       popFrame();
     }
@@ -3045,7 +3035,6 @@ void runCleanupPasses(std::shared_ptr<Graph>& to_clean, bool convert_ssa) {
   // this way closures get converted to SSA while part of their original
   // graph, and closures are lifted & ready to be inlined into fork nodes.
   liftClosuresAndForks(to_clean);
-  inlineForkedClosures(to_clean);
   // remove any uses of tuples that we inserted that are not needed
   Inline(*to_clean);
   LowerSimpleTuples(to_clean);
