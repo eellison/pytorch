@@ -15,7 +15,7 @@ namespace script {
  * This pass transforms so that break & continue statements are removed.
  */
 
-// Will a block or node continue or breaks
+// Will a block or node continue or break
 enum LoopStatus { WONT, MIGHT, WILL };
 
 // Are we transforming breaks or continues
@@ -160,7 +160,7 @@ struct LoopTransformer {
   };
 
   LoopStatus handleBreaks(Block* block) {
-    auto ret_status = WONT;
+    auto loop_status = WONT;
     for (auto it = block->nodes().begin(); it != block->nodes().end();) {
       Node* node = *it;
       it++;
@@ -175,23 +175,23 @@ struct LoopTransformer {
           }
           WithInsertPoint b(block);
           node->destroy();
-          ret_status = WILL;
+          loop_status = WILL;
         } break;
         case prim::If: {
-          ret_status = handleIf(node);
+          loop_status = handleIf(node);
         } break;
         case prim::Loop: {
           handleLoop(node);
           // break statement can only effect the loop node
-          ret_status = WONT;
+          loop_status = WONT;
         } break;
       }
-      if (ret_status == WILL) {
+      if (loop_status == WILL) {
         deleteAfterBreakNodes(block, it);
         break;
-      } else if (ret_status == MIGHT) {
+      } else if (loop_status == MIGHT) {
         if (it != block->nodes().end()) {
-          ret_status = guardBlockNodes(block, it);
+          loop_status = guardBlockNodes(block, it);
         }
         break;
       }
@@ -200,14 +200,14 @@ struct LoopTransformer {
     {
       // MIGHT value must be an output of an if, so we do not need to set it
       WithInsertPoint insert(block);
-      if (ret_status == WILL) {
+      if (loop_status == WILL) {
         graph->insertNode(graph->createStore(getVarname(), true_val));
-      } else if (ret_status == WONT) {
+      } else if (loop_status == WONT) {
         graph->insertNode(graph->createStore(getVarname(), false_val));
       }
     }
 
-    return ret_status;
+    return loop_status;
   }
 
   void run() {

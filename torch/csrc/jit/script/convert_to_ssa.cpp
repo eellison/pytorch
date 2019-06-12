@@ -107,7 +107,7 @@ struct ControlFlowLoadStores {
     // Otherwise, in the example above, we would error in the m += k call.
 
     bool true_escape = block_exits.count(true_block) == 1;
-    bool false_escape = block_exits.count(false_block) == 0;
+    bool false_escape = block_exits.count(false_block) == 1;
 
     std::set<std::string> mutated_variables;
 
@@ -331,7 +331,6 @@ struct SSATransformer {
 
 void transformModifiedForToWhile(Node * n) {
   LoopView loop(n);
-
   if (loop.loopType() != LoopView::ModifiedLoop) {
     return;
   }
@@ -350,7 +349,7 @@ void transformModifiedForToWhile(Node * n) {
   WithInsertPoint loop_insert(loop.bodyBlock());
   n->addInput(zero);
   auto new_iter = loop.bodyBlock()->addInput()->setType(IntType::get());
-  // unset unique name for jitter, since its replacement does not have a name
+  // unset unique name for jitter, its replacement does not have a name
   loop.currentTripCount()->setUniqueName("")->replaceAllUsesWith(new_iter);
   auto inc_iter = g->insert(aten::add, {new_iter, one});
   loop.bodyBlock()->registerOutput(inc_iter);
