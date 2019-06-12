@@ -404,6 +404,7 @@ if (NOT INTERN_BUILD_MOBILE)
     ${TORCH_SRC_DIR}/csrc/jit/passes/loop_unrolling.cpp
     ${TORCH_SRC_DIR}/csrc/jit/passes/lower_grad_of.cpp
     ${TORCH_SRC_DIR}/csrc/jit/passes/lower_tuples.cpp
+    ${TORCH_SRC_DIR}/csrc/jit/passes/break_transform.cpp
     ${TORCH_SRC_DIR}/csrc/jit/passes/peephole.cpp
     ${TORCH_SRC_DIR}/csrc/jit/passes/remove_expands.cpp
     ${TORCH_SRC_DIR}/csrc/jit/passes/remove_inplace_ops.cpp

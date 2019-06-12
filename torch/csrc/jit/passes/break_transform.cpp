@@ -11,89 +11,80 @@ namespace torch {
 namespace jit {
 namespace script {
 
-using NameToValue = std::unordered_map<std::string, Value*>;
-using ValueToName = std::unordered_map<Value*, std::string>;
-
 /**
- * This pass transforms the Graph so that all ReturnStmts are merged into a
- * single value at the end of the graph.
- *
- * For blocks and control flow nodes that have a return statement that may have
- * been hit, we add an extra output for the return value, and an extra output
- * indicating whether or not the return has been hit (a sentinel value).
- *
- * When we encounter a node that might return, we guard all subsequent nodes
- * in the block with the sentinel value of that node.
+ * This pass transforms so that break & continue statements are removed.
  */
 
-// Will a block or node return
-enum BreakStatus { WONT_BREAK, MIGHT_BREAK, WILL_BREAK };
+// Will a block or node continue or breaks
+enum LoopStatus { WONT, MIGHT, WILL };
 
-// The return output of Control Flow Nodes is the second to last output,
-// sentinel output is the output
-constexpr size_t HAS_BROKE_OFFSET = 1;
+// Are we transforming breaks or continues
+enum Transform { BREAKS, CONTINUES };
 
-struct BreakTransformer {
-  BreakTransformer(std::shared_ptr<Graph> graph_) : graph(std::move(graph_)){};
+struct LoopTransformer {
+  LoopTransformer(std::shared_ptr<Graph> graph_, Transform transform_) : graph(std::move(graph_)) {
+    WithInsertPoint guard(graph->block()->nodes().front());
+    true_val = graph->insertConstant(true);
+    false_val = graph->insertConstant(false);
+    transform = transform_;
+  };
+
+  const std::string& getVarname() {
+    static const std::string& break_name = "$did_break";
+    static const std::string& continue_name = "$did_continue";
+    return transform == BREAKS ? break_name : continue_name;
+  }
+
+  Symbol transformKind() {
+    return transform == BREAKS ? prim::BreakStmt : prim::ContinueStmt;
+  }
 
   // Recurses on the if node and returns its return status
-  // If status != WONT_BREAK, sets the block_return_val and sentinel val
+  // If status != WONT, sets the block_return_val and sentinel val
   // of its parent block before exit
-  BreakStatus handleIf(Node* node) {
+  LoopStatus handleIf(Node* node) {
     auto true_block = node->blocks().at(0);
     auto false_block = node->blocks().at(1);
 
-    // recurse
     auto true_status = handleBreaks(true_block);
     auto false_status = handleBreaks(false_block);
 
-    if (true_status == WONT_BREAK && false_status == WONT_BREAK) {
-      return WONT_BREAK;
-    } else if (true_status == WILL_BREAK && false_status == WILL_BREAK) {
-      return WILL_BREAK;
+    if (true_status == WONT && false_status == WONT) {
+      return WONT;
+    } else if (true_status == WILL && false_status == WILL) {
+      return WILL;
     } else {
-      return MIGHT_BREAK;
+      return MIGHT;
     }
   }
-  BreakStatus guardBlockNodes(
+
+  LoopStatus guardBlockNodes(
       Block* block,
       generic_graph_node_list_iterator<Node>& iter) {
-    AT_ASSERT(getBlockStatus(block) == MIGHT_BREAK);
-    auto sentinel = block_sentinel_val[block];
-    auto new_if = graph->create(prim::If, 0)->insertAfter(sentinel->node());
-    new_if->addInput(sentinel);
 
-    auto break_block = new_if->addBlock();
+    // if we hit an if node and it might hit a break or continue,
+    // we guard all subsequent nodes in the block, and do not execute
+    // them if we did continue.
+
+    auto new_if = graph->create(prim::If, 0)->insertBefore(*iter);
+    auto sentinel = graph->createLoad(getVarname(), BoolType::get())->insertBefore(new_if);
+    new_if->addInput(sentinel->output());
+
+    auto hit_control_flow_block = new_if->addBlock();
     auto guard_block = new_if->addBlock();
 
-    // Move all remaining nodes into the guard block
     while (iter != block->nodes().end()) {
       auto node = *iter++;
       node->moveBefore(guard_block->return_node());
     }
-    std::vector<std::string> block_output_names =
-        block->owningNode()->ss(attr::value);
-    for (auto name : block_output_names) {
-      break_block->registerOutput(environment_stack->findInAnyFrame(name));
-    }
-    for (size_t i = 0; i < block->outputs().size(); ++i) {
-      guard_block->registerOutput(block->outputs().at(i));
-    }
-    new_if->ss_(attr::value, block_output_names);
 
-    for (size_t i = 0; i < block->outputs().size(); ++i) {
-      auto orig_output = block->outputs().at(i);
-      new_if->addOutput()
-          ->setType(orig_output->type())
-          ->setUniqueName(uniqueName(orig_output));
+    {
+      WithInsertPoint insert(hit_control_flow_block);
+      // NB: insert var scape before transform kind so it is not removed
+      // See note in convert_to_ssa for why we need to insert VarEscape
+      graph->insertNode(graph->create(prim::VarEscape, 0));
+      graph->insertNode(graph->create(transformKind(), 0));
     }
-    while (block->outputs().size() > 0) {
-      block->eraseOutput(0);
-    }
-    for (auto out : new_if->outputs()) {
-      block->registerOutput(out);
-    }
-    block_sentinel_val[break_block] = true_val;
     return handleIf(new_if);
   }
 
@@ -112,132 +103,133 @@ struct BreakTransformer {
     iter->destroy();
   }
 
-  void handleLoop(Node* n){
+  void inlineLoopConditionIntoLoopBody(Node * n) {
+    auto body_block = n->blocks().at(0);
+    auto pre_header = n->blocks().at(1);
+    for (auto it = pre_header->nodes().begin();
+         it != pre_header->nodes().end();) {
+      auto block_node = *it++;
+      block_node->moveBefore(body_block->return_node());
+    }
+    body_block->insertOutput(0, pre_header->outputs().at(0));
+    n->eraseBlock(1);
+  }
 
+  void handleLoop(Node* n) {
+    Block * body_block = n->blocks().at(0);
+    auto ret_status = handleBreaks(body_block);
+
+    // When we're transforming breaks:
+    // the body condition has not yet been inlined. If we we are not breaking
+    // we need to inline the condition block into the end of the loop.
+    // if we might break, we create an if statement and only execute the loop
+    // header if we did not break.
+    // Since we run the continue pass before the break pass,
+    // we do not need to do any additional work in continues; guardBlock nodes
+    // ensures that we do not execute any ops present in the block after a continue,
+    // and loop condition is inlined after.
+
+    if (transform == CONTINUES) {
+      return;
+    }
+
+    if (ret_status == WONT) {
+      inlineLoopConditionIntoLoopBody(n);
+      return;
+    }
+
+    WithInsertPoint insert(body_block);
+    auto did_break = graph->insertNode(graph->createLoad(getVarname(), BoolType::get()))->output();
+
+    auto new_loop_condition = graph->insertNode(graph->create(prim::If));
+    new_loop_condition->addInput(did_break);
+    new_loop_condition->output()->setType(BoolType::get());
+
+    // if we did break, we do not continue
+    new_loop_condition->addBlock()->registerOutput(false_val);
+    auto original_condition = new_loop_condition->addBlock();
+    auto pre_header = n->blocks().at(1);
+    for (auto it = pre_header->nodes().begin();
+         it != pre_header->nodes().end();) {
+      auto block_node = *it++;
+      block_node->moveBefore(original_condition->return_node());
+    }
+    original_condition->insertOutput(0, pre_header->outputs().at(0));
+    n->eraseBlock(1);
+    body_block->registerOutput(new_loop_condition->output());
   };
 
-  BreakStatus handleBreaks(Block* block) {
-    auto ret_status = WONT_BREAK;
+  LoopStatus handleBreaks(Block* block) {
+    auto ret_status = WONT;
     for (auto it = block->nodes().begin(); it != block->nodes().end();) {
       Node* node = *it;
       it++;
       switch (node->kind()) {
+        case prim::Function: {
+          handleBreaks(node->blocks().at(0));
+        } break;
+        case prim::ContinueStmt:
         case prim::BreakStmt: {
+          if (node->kind() != transformKind()) {
+            continue;
+          }
           WithInsertPoint b(block);
-          graph->createStore("__did_return", true_val);
-          ret_status = WILL_BREAK;
+          node->destroy();
+          ret_status = WILL;
         } break;
         case prim::If: {
           ret_status = handleIf(node);
         } break;
-        case prim::Loop:
+        case prim::Loop: {
           handleLoop(node);
           // break statement can only effect the loop node
-          ret_status = WONT_BREAK;
-        default:
-          break;
+          ret_status = WONT;
+        } break;
       }
-      if (ret_status == WILL_BREAK) {
+      if (ret_status == WILL) {
         deleteAfterBreakNodes(block, it);
         break;
-      } else if (ret_status == MIGHT_BREAK) {
+      } else if (ret_status == MIGHT) {
         if (it != block->nodes().end()) {
-          // if (block->owningNode()->kind() == prim::Loop) {
-          // ret_status = guardLoopBlockNodes(block, getSentinelVal(node), it);
-        } else {
           ret_status = guardBlockNodes(block, it);
         }
+        break;
       }
-      break;
     }
-  }
-  if (block_status.count(block) == 0) {
-    block_status[block] = ret_status;
-  } else {
-    // Guarded return blocks have their status set prior
-    AT_ASSERT(
-        block_status[block] == WILL_BREAK &&
-        block->nodes().begin() == block->nodes().end());
-  }
-}
 
-Value*
-getBottomVal() {
-  if (bottom_val != nullptr) {
-    return bottom_val;
-  }
-  WithInsertPoint guard(graph->block()->nodes().front());
-  bottom_val = graph->insertNode(graph->create(prim::Bottom, {}, 1))
-                   ->output()
-                   ->setType(BottomType::get());
-  return bottom_val;
-}
-
-Value* getBoolVal(bool val) {
-  WithInsertPoint guard(graph->block()->nodes().front());
-  if (val) {
-    if (true_val != nullptr) {
-      return true_val;
+    {
+      // MIGHT value must be an output of an if, so we do not need to set it
+      WithInsertPoint insert(block);
+      if (ret_status == WILL) {
+        graph->insertNode(graph->createStore(getVarname(), true_val));
+      } else if (ret_status == WONT) {
+        graph->insertNode(graph->createStore(getVarname(), false_val));
+      }
     }
-    true_val = graph->insertConstant(true);
-    return true_val;
-  } else {
-    if (false_val != nullptr) {
-      return false_val;
-    }
-    false_val = graph->insertConstant(false);
-    return false_val;
+
+    return ret_status;
   }
-}
-// for (Node * n: block->nodes()) {
-void associateVarCaptures(Block* block) {
-  for (auto it = block->nodes().begin(); it != block->nodes().end();) {
-    Node* n = *it;
-    it++;
-    if (n->kind() == prim::VarCapture) {
-      block_capture[block] = convertVarNameToValueNode(n);
-      n->destroy();
-    }
-    for (Block* b : n->blocks()) {
-      associateVarCaptures(b);
-    }
+
+  void run() {
+    handleBreaks(graph->block());
   }
+
+  Transform transform;
+  Value* true_val = nullptr;
+  Value* false_val = nullptr;
+
+  std::shared_ptr<Graph> graph;
+};
+
+void TransformBreaks(std::shared_ptr<Graph>& graph) {
+  // We transform the continues first, so the loop body condition is not yet
+  // inlined, and the loop condition still executes even if a continue is hit.
+  LoopTransformer continues(graph, CONTINUES);
+  continues.run();
+  LoopTransformer breaks(graph, BREAKS);
+  breaks.run();
 }
 
-void run() {
-  associateVarCaptures(graph->block());
-  handleBreaks(graph->block());
-}
-
-// a block may have a value that is used in the loop continue condition
-std::unordered_map<Block*, Value*> loop_continue_condition;
-
-// After a call to handleBreaks, a block will have set its break status
-std::unordered_map<Block*, BreakStatus> block_status;
-
-// Blocks that might break need a sentinel value to indicate if they
-// broke or not
-std::unordered_map<Block*, Value*> block_sentinel_val;
-
-std::unordered_map<Block*, NameToValue> block_capture;
-// std::unordered_map<Block *, NameToValue> var_capture_blocks;
-
-std::unordered_map<Node*, NameToValue> node_capture;
-
-Value* bottom_val = nullptr;
-Value* true_val = nullptr;
-Value* false_val = nullptr;
-
-std::shared_ptr<Graph> graph;
-}; // namespace script
-
-void transformBreaks(std::shared_ptr<Graph>& graph) {
-  ConstantPooling(graph);
-  BreakTransformer e(graph);
-  e.run();
-  // maybe dce ?
-}
-
+} // namespace script
 } // namespace jit
-} // namespace torch
 } // namespace torch

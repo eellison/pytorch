@@ -17,6 +17,8 @@
 #include <torch/csrc/jit/script/parser.h>
 #include <torch/csrc/jit/script/schema_matching.h>
 #include <torch/csrc/jit/script/script_type_parser.h>
+#include <torch/csrc/jit/passes/constant_propagation.h>
+#include <torch/csrc/jit/passes/peephole.h>
 
 #include <torch/csrc/jit/constants.h>
 
@@ -157,23 +159,6 @@ static std::shared_ptr<MagicMethod> makeMagic(
     const std::string& name,
     SugaredValuePtr base) {
   return std::make_shared<MagicMethod>(name, base);
-}
-
-// we consider _N where N is a number, to be a non-meaningful name
-// and do not record it as a unique name. This allows python printing to
-// be able to export and import more consistently named graphs
-static bool meaningfulName(const std::string& name) {
-  if (name.size() == 0)
-    return false;
-  if (name[0] == '$')
-    return false;
-  if (name[0] != '_')
-    return true;
-  for (size_t i = 1; i < name.size(); ++i) {
-    if (!isdigit(name[i]))
-      return true;
-  }
-  return false;
 }
 
 // Auxiliary data structure for desugaring variable binding into our always
@@ -766,6 +751,12 @@ struct to_ir {
     graph->insertNode(break_node);
   }
 
+  void emitContinue(const Continue& stmt) {
+    auto continue_node = graph->create(prim::ContinueStmt, {}, 0)
+      ->setSourceRange(stmt.range());
+    graph->insertNode(continue_node);
+  }
+
   void emitReturn(const Return& stmt) {
     Value* result = emitExpr(stmt.expr());
     TypePtr result_type = def_stack_.back().declared_return_type_;
@@ -848,6 +839,9 @@ struct to_ir {
           break;
         case TK_RETURN: {
           emitReturn(Return(stmt));
+        } break;
+        case TK_CONTINUE: {
+          emitContinue(Continue(stmt));
         } break;
         case TK_BREAK: {
           emitBreak(Break(stmt));
@@ -1239,22 +1233,25 @@ struct to_ir {
       c10::optional<Expr> cond,
       Value* max_trip_count_val = nullptr) {
     if (!max_trip_count_val) {
-      max_trip_count_val = insertConstant(
-          *graph, std::numeric_limits<int64_t>::max(), nullptr, range);
+      max_trip_count_val = graph->insertConstant(std::numeric_limits<int64_t>::max(), nullptr, range);
     }
 
-    Value* cond_val = (cond) ? emitCond(cond.value())
-                             : graph->insertConstant(true, nullptr, range);
-
     Node* n = graph->insertNode(create(prim::Loop, range, 0));
-    WithInsertPoint guard(n);
-
-    n->addInput(max_trip_count_val);
-    n->addInput(cond_val);
     auto* body_block = n->addBlock();
+
+    {
+      Block* condition_block = n->addBlock();
+      pushFrame(condition_block);
+      WithInsertPoint insert(condition_block);
+      Value* out = cond ? emitCond(cond.value())
+                        : graph->insertConstant(true, nullptr, range);
+      condition_block->registerOutput(out);
+      popFrame();
+    }
+    n->addInput(max_trip_count_val);
+
     Value* trip_count =
         body_block->addInput()->setType(IntType::get()); // Iteration num
-
     {
       pushFrame(body_block);
       WithInsertPoint guard(body_block);
@@ -1266,22 +1263,6 @@ struct to_ir {
       }
 
       emitStatements(body);
-
-      Node* loop_condition =
-          graph->insertNode(create(prim::LoopCondition, range, 0));
-      auto condition_block = loop_condition->addBlock();
-      {
-        pushFrame(condition_block);
-        WithInsertPoint insert(condition_block);
-        Value* block_condition = (cond)
-            ? emitCond(cond.value())
-            : graph->insertConstant(true, nullptr, range);
-        condition_block->insertOutput(0, block_condition);
-        popFrame();
-      }
-      auto block_continue_condition =
-          loop_condition->addOutput()->setType(BoolType::get());
-      body_block->registerOutput(block_continue_condition);
 
       popFrame();
     }
@@ -3070,10 +3051,28 @@ void runCleanupPasses(std::shared_ptr<Graph>& to_clean, bool convert_ssa) {
   inlineForkedClosures(to_clean);
   // remove any uses of tuples that we inserted that are not needed
   Inline(*to_clean);
+  PeepholeOptimize(to_clean);
   LowerSimpleTuples(to_clean);
   ConstantPooling(to_clean);
   // For jitter
   CanonicalizeOutputs(to_clean);
+}
+
+// we consider _N where N is a number, to be a non-meaningful name
+// and do not record it as a unique name. This allows python printing to
+// be able to export and import more consistently named graphs
+bool meaningfulName(const std::string& name) {
+  if (name.size() == 0)
+    return false;
+  if (name[0] == '$')
+    return false;
+  if (name[0] != '_')
+    return true;
+  for (size_t i = 1; i < name.size(); ++i) {
+    if (!isdigit(name[i]))
+      return true;
+  }
+  return false;
 }
 
 } // namespace script

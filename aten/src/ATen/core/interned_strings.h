@@ -50,7 +50,9 @@ namespace c10 {
   _(prim, Reverse)                 \
   _(prim, Return)                  \
   _(prim, BreakStmt)               \
+  _(prim, ContinueStmt)            \
   _(prim, Store)                   \
+  _(prim, VarEscape)               \
   _(prim, AutogradZero)            \
   _(prim, AutogradAnyNonZero)      \
   _(prim, Starred)                 \
