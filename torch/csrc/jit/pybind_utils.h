@@ -321,6 +321,7 @@ inline IValue toIValue(
       }
       return userObj;
     }
+    case TypeKind::BottomType:
     case TypeKind::NumberType:
     case TypeKind::GeneratorType:
     case TypeKind::VarType:

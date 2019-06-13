@@ -9,6 +9,7 @@
 
 using c10::AliasInfo;
 using c10::BoolType;
+using c10::BottomType;
 using c10::CompleteTensorType;
 using c10::DeviceObjType;
 using c10::DictType;
@@ -44,6 +45,7 @@ TypeAndAlias SchemaTypeParser::parseBaseType() {
       {"int", IntType::get()},
       {"bool", BoolType::get()},
       {"None", NoneType::get()},
+      {"Bottom", BottomType::get()},
   };
   auto tok = L.cur();
   if (!L.nextIf(TK_NONE)) {
