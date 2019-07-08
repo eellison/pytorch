@@ -13679,12 +13679,12 @@ def add_nn_functional_test(name, self_size, args, variant_name='', check_ad=(), 
                         return graph_str.count("prim::If")
 
 
-                    # filename = "if_counts.txt"
-                    # if not os.path.exists(filename):
-                    #     f = open(filename, "w+")
-                    #     f.write("func_name, unoptimized ifs, optimized ifs\n")
-                    # else:
-                    #     f = open(filename, "a")
+                    filename = "if_counts.txt"
+                    if not os.path.exists(filename):
+                        f = open(filename, "w+")
+                        f.write("func_name, unoptimized ifs, optimized ifs\n")
+                    else:
+                        f = open(filename, "a")
                     #
                     # opt_graph_file = "opt_graphs.txt"
                     # if not os.path.exists(opt_graph_file):
@@ -13693,19 +13693,19 @@ def add_nn_functional_test(name, self_size, args, variant_name='', check_ad=(), 
                     # else:
                     #     g_file = open(opt_graph_file, "a")
                     #
-                    # graph = script_fn.unoptimized_graph
-                    # count = if_count(graph)
+                    graph = script_fn.unoptimized_graph
+                    count = if_count(graph)
                     opt_graph = getattr(script_fn, 'last_graph', None)
                     # print("RUNNING PEEPHOLE AGAIN\n\n")
 
                     # self.run_pass('peephole', opt_graph)
-                    torch._C._jit_pass_constant_propagation(opt_graph)
-                    torch._C._jit_pass_constant_propagation(opt_graph)
-                    print(if_count(opt_graph))
-                    print(opt_graph)
-                    # opt_count = if_count(opt_graph)
+                    # torch._C._jit_pass_constant_propagation(opt_graph)
+                    # torch._C._jit_pass_constant_propagation(opt_graph)
+                    # print(if_count(opt_graph))
+                    # print(opt_graph)
+                    opt_count = if_count(opt_graph)
                     #
-                    # # f.write(test_name + ", " + str(count) + ", " + str(opt_count) + "\n")
+                    f.write(test_name + ", " + str(count) + ", " + str(opt_count) + "\n")
                     # f.close()
                     #
                     # if opt_count:
