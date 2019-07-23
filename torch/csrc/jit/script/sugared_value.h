@@ -332,6 +332,18 @@ struct TORCH_API PrintValue : public SugaredValue {
       size_t n_binders) override;
 };
 
+struct TORCH_API SortedValue : public SugaredValue {
+  std::string kind() const override {
+    return "sorted";
+  }
+  std::shared_ptr<SugaredValue> call(
+      const SourceRange& loc,
+      Function& m,
+      at::ArrayRef<NamedValue> inputs,
+      at::ArrayRef<NamedValue> attributes,
+      size_t n_binders) override;
+};
+
 // expressions like int(x)
 // these are the same as call prim::Int or equivalent except it
 // is a noop when the input is a subtype of 'type'
@@ -470,15 +482,15 @@ struct TORCH_API IterableValue : SugaredValue {
   Symbol symbol_;
 };
 
-// Specialized Tree structure to matched against for special handling 
+// Specialized Tree structure to matched against for special handling
 // of builtin functions iterables expressions like zip(), enumerate(), etc.
 // zip and enumerate can be modeled as a tree of SimpleValue/RangeValue:
 //    zip(x, y) ->  (x, y) with tuple assignment to each loop target
 //    enumerate(x) -> (range(0, math.inf, 1), x)
 // So a complicated expression like zip(a, enumerate(b), range(0, 100)) will be:
 // (a, (range(0, math.inf, 1), b), range(0, 100))
-// We use those base iterables to fill in the loop information like max_trip_count
-// and set the value table for loop targets
+// We use those base iterables to fill in the loop information like
+// max_trip_count and set the value table for loop targets
 struct TORCH_API IterableTree : SugaredValue {
   IterableTree() = default;
   IterableTree(const std::vector<SugaredValuePtr> children): children_(std::move(children)) {}
