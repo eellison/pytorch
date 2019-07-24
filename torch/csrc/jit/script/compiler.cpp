@@ -762,7 +762,8 @@ struct to_ir {
     AT_ASSERT(def_stack_.back().merged_return_type_);
     auto typ = def_stack_.back().merged_return_type_;
     auto g = block->owningGraph();
-    auto placeholder_value = g->insertNode(g->createUninitialized(typ))->output();
+    auto placeholder_value =
+        g->insertNode(g->createUninitialized(typ))->output();
     environment_stack->setVar(range, "$return", placeholder_value);
     Value* result = environment_stack->getVar("$return", range);
     block->registerOutput(result);
@@ -1235,10 +1236,12 @@ struct to_ir {
         tv = graph->createUninitialized(fv->type())
                  ->insertBefore(true_block->return_node())
                  ->output();
+        graph->createStore(x, tv)->insertBefore(true_block->return_node());
       } else if (false_exits) {
         fv = graph->createUninitialized(tv->type())
                  ->insertBefore(false_block->return_node())
                  ->output();
+        graph->createStore(x, fv)->insertBefore(false_block->return_node());
       }
 
       auto unified = unifyTypes(tv->type(), fv->type());

@@ -156,6 +156,42 @@ struct ExitTransformer {
     return match_values;
   }
 
+  ExitPair transformLoop(Node * node) {
+    LoopView loop(node);
+    Block * body = loop.bodyBlock();
+    auto exit_pair = transformExits(body);
+    if (getExitStatus(exit_pair) == ExitStatus::WONT) {
+      return exit_pair;
+    }
+
+    WithInsertPoint insert(body);
+    auto new_if = graph_->insertNode(graph_->create(prim::If, 0));
+    new_if->addInput(exit_pair.hasExited());
+    new_if->addBlock()->registerOutput(false_val_);
+    new_if->addBlock()->registerOutput(loop.nextCond());
+    auto new_condition = new_if->addOutput()->setType(BoolType::get());
+    loop.bodyBlock()->eraseOutput(0);
+    loop.bodyBlock()->insertOutput(0, new_condition);
+
+    node->addInput(false_val_);
+    body->addInput()->setType(BoolType::get());
+    body->registerOutput(exit_pair.hasExited());
+    Value * new_has_exited = node->addOutput()->setType(BoolType::get());
+
+    for (Value * exit_value: exit_pair.exitValues()) {
+      auto typ = exit_value->type();
+      node->addInput(getUnitValue(exit_value->type()));
+      node->addOutput()->setType(exit_value->type());
+      body->addInput()->setType(typ);
+      body->registerOutput(exit_value);
+    }
+
+    auto exit_vals =
+        node->outputs().slice(node->outputs().size() - exit_pair.exitValues().size());
+
+    return ExitPair(new_has_exited, exit_vals);
+  }
+
   // Recursively transforms the if node
   ExitPair transformIf(Node* node) {
     auto then_block = node->blocks().at(0);
@@ -249,7 +285,7 @@ struct ExitTransformer {
       block->registerOutput(out);
     }
 
-    graph_->create(prim::LoopContinuation, {exit_pair.exitValues()}, 0)
+    graph_->create(current_exit_kind_, {exit_pair.exitValues()}, 0)
         ->insertBefore(exit_block->return_node());
     return transformIf(new_if);
   }
@@ -315,9 +351,11 @@ struct ExitTransformer {
         case prim::If: {
           exit_pair = transformIf(node);
         } break;
-        case prim::Function:
-        case prim::Loop: {
+        case prim::Function: {
           exit_pair = transformExits(node->blocks().at(0));
+        } break;
+        case prim::Loop: {
+          exit_pair = transformLoop(node);
         } break;
       }
 
@@ -448,9 +486,10 @@ struct ExitTransformer {
 //     -> (%44, %i)
 
 void TransformExits(std::shared_ptr<Graph>& graph) {
-  ExitTransformer e(graph);
-  e.run(Transform::LoopContinuations);
-  e.run(Transform::Returns);
+  ExitTransformer e_loop(graph);
+  e_loop.run(Transform::LoopContinuations);
+  ExitTransformer e_ret(graph);
+  e_ret.run(Transform::Returns);
 }
 
 } // namespace jit
