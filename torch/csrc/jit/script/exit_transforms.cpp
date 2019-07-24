@@ -81,8 +81,7 @@ struct ExitTransformer {
   void run(Transform transform_kind) {
     if (transform_kind == Transform::Returns) {
       current_exit_kind_ = prim::ReturnStmt;
-      target_block_ = graph_->block();
-      convertClosureOutputsToReturnStmts(graph_->block());
+      convertReturnOutputsToReturnStmts(graph_->block());
     } else {
       current_exit_kind_ = prim::LoopContinuation;
       convertLoopOutputsToContinuations(graph_->block());
@@ -115,13 +114,13 @@ struct ExitTransformer {
      }
    }
 
-   static void convertClosureOutputsToReturnStmts(Block* block) {
+   static void convertReturnOutputsToReturnStmts(Block* block) {
      for (Node* n : block->nodes()) {
        for (Block* b : n->blocks()) {
-         convertClosureOutputsToReturnStmts(b);
+         convertReturnOutputsToReturnStmts(b);
        }
      }
-     if (owningNodeKind(block) == prim::Function) {
+     if (owningNodeKind(block) == prim::Function || block->owningNode() == nullptr) {
        convertBlockOutputsToNode(block, prim::ReturnStmt);
      }
    }
@@ -144,11 +143,6 @@ struct ExitTransformer {
           unifyTypes(true_outs.at(i)->type(), false_outs.at(i)->type());
       n->addOutput()->setType(*out_type);
     }
-  }
-
-  ExitPair transformLoop(Node* node) {
-    auto loop_block = node->blocks().at(0);
-    return transformExits(loop_block);
   }
 
   // creates a vector of uninitialized values of the same type as the
@@ -291,8 +285,21 @@ struct ExitTransformer {
     destroyNodeAfterExit(*iter);
   }
 
+  void setTargetBlock(Block * block) {
+    if (current_exit_kind_ == prim::LoopContinuation) {
+      if (owningNodeKind(block) == prim::Loop) {
+        target_block_ = block;
+      }
+    } else {
+      if (owningNodeKind(block) == prim::Function || !block->owningNode()) {
+        target_block_ = block;
+      }
+    }
+  }
+
   ExitPair transformExits(Block* block) {
     Block* curr_target_block = target_block_;
+    setTargetBlock(block);
     ExitPair exit_pair = ExitPair(false_val_, std::vector<Value*>({}));
     for (auto it = block->nodes().begin(); it != block->nodes().end();) {
       Node* node = *it;
@@ -308,16 +315,8 @@ struct ExitTransformer {
         case prim::If: {
           exit_pair = transformIf(node);
         } break;
+        case prim::Function:
         case prim::Loop: {
-          if (current_exit_kind_ == prim::LoopContinuation) {
-            target_block_ = block;
-          }
-          transformLoop(node);
-        } break;
-        case prim::Function: {
-          if (current_exit_kind_ == prim::ReturnStmt) {
-            target_block_ = block;
-          }
           exit_pair = transformExits(node->blocks().at(0));
         } break;
       }

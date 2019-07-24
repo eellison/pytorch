@@ -760,7 +760,10 @@ struct to_ir {
       Block* block) {
     // rewrites ensure there is always a return statement in program
     AT_ASSERT(def_stack_.back().merged_return_type_);
-    // outputs
+    auto typ = def_stack_.back().merged_return_type_;
+    auto g = block->owningGraph();
+    auto placeholder_value = g->insertNode(g->createUninitialized(typ))->output();
+    environment_stack->setVar(range, "$return", placeholder_value);
     Value* result = environment_stack->getVar("$return", range);
     block->registerOutput(result);
     return Argument("", def_stack_.back().merged_return_type_);
