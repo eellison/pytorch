@@ -11,6 +11,7 @@ from torch._six import PY2, PY37, with_metaclass, get_function_from_type, \
     string_classes
 from ..nn.modules.utils import _single, _pair, _triple, _quadruple, \
     _list_with_default
+from typing import overload as typing_overload
 import torch.testing
 
 import math
@@ -2078,6 +2079,61 @@ def _get_script_class(name):
         raise RuntimeError("Unknown reference to ScriptClass '{}'. "
                            "Did you forget to import it?".format(name))
     return _script_classes[name]
+
+# qualified_name => list[(overload decl, overload default args)]
+_overloads = {}
+
+# qualified name => list[compiled fns]
+_compiled_overloads = {}
+
+def overload(func):
+    qual_name = _qualified_name(func)
+    global _overloads
+    li = _overloads.get(qual_name)
+    if li is None:
+        li = []
+        _overloads[qual_name] = li
+    signature = torch.jit.annotations.get_signature(func)
+    if signature is None:
+        raise RuntimeError("Must explicitly add type annotations to overloaded functions")
+    li.append((torch.jit.get_jit_def(func).decl(), get_default_args(func)))
+    return typing_overload(func)
+
+def compile_function_with_overload(qual_name, impl_fn, overload_decl, overload_defaults):
+    _frames_up = 0
+    impl_ast = torch.jit.get_jit_def(impl_fn)
+    # TODO: figure out correct closure_rcb, stack_rcb, although this seems to work
+    # and refactor with above usage
+    closure_rcb = _jit_internal.createResolutionCallbackFromClosure(impl_fn)
+    stack_rcb = _jit_internal.createResolutionCallback(_frames_up + 1)
+
+    def _rcb(name):
+        # since type comments aren't captured in the function's closures,
+        # we still need to try to the rcb based on stack frames if the
+        # closure rcb fails
+        result = closure_rcb(name)
+        if result:
+            return result
+        return stack_rcb(name)
+    fn = torch._C._jit_script_compile_overload(qual_name, overload_decl, impl_ast, _rcb, overload_defaults)
+    return fn
+
+def get_overloads(obj):
+    qual_name = _qualified_name(obj)
+    global _compiled_overloads
+    compiled_overloads = _compiled_overloads.get(qual_name, None)
+    if compiled_overloads is not None:
+        return compiled_overloads
+    global _overloads
+    overload_decls = _overloads.get(qual_name, None)
+    if overload_decls is None:
+        return None
+    compiled_fns = []
+    for overload_decl, overload_defaults in overload_decls:
+        compiled_fn = compile_function_with_overload(qual_name, obj, overload_decl, overload_defaults)
+        compiled_fns.append(compiled_fn)
+    _compiled_overloads[qual_name] = compiled_fns
+    return compiled_fns
 
 # torch.jit.Error
 Error = torch._C.JITException

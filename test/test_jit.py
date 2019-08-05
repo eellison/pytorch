@@ -12803,6 +12803,99 @@ a")
 
             FileCheck().check_not("prim::PythonOp").run(cu.test.graph)
 
+    def test_elias(self):
+        @torch.jit.overload
+        def test_py2(x1 = 2):
+            # type: (int) -> int
+            pass
+
+        @torch.jit.overload
+        def test_py2(x1):
+            # type: (float) -> float
+            pass
+
+        def test_py2(x1):
+            return x1 + 5
+
+        @torch.jit.script
+        def test():
+            return test_py2()
+
+        print(test.graph)
+
+        return
+        print(torch.jit.get_overloads(test_py2)[0].graph)
+        return
+
+        # @torch.jit.script
+        # def test_me():
+        #     return test_py2(), test_py2(1), test_py2(.5)
+
+        print(test_py2.graph)
+
+
+        # @torch.jit.script
+        # def test():
+        #     return test_elias_hi(1), test_elias_hi(.5)
+        # print(test.graph)
+        # graph():
+        #   %0 : int = prim::Constant[value=1]() # test/test_jit.py:12821:34
+        #   %3 : float = prim::Constant[value=0.5]() # test/test_jit.py:12821:52
+        #   %14 : int = aten::add(%0, %0) # test/test_jit.py:12817:20
+        #   %16 : float = aten::add(%3, %0) # test/test_jit.py:12817:20
+        #   %6 : (int, float) = prim::TupleConstruct(%14, %16)
+        #   return (%6)
+
+        return
+
+
+        # overloads = (torch.jit.try_compile_overload(test_elias_hi))
+        # print(overloads[0].graph, overloads[1].graph)
+        # return
+        # def foo_elias(x):
+        #     return test(x)
+
+        # if _rcb is None:
+        #     closure_rcb = _jit_internal.createResolutionCallbackFromClosure(obj)
+        #     stack_rcb = _jit_internal.createResolutionCallback(_frames_up + 1)
+        #
+        #     def _rcb(name):
+        #         # since type comments aren't captured in the function's closures,
+        #         # we still need to try to the rcb based on stack frames if the
+        #         # closure rcb fails
+        #         result = closure_rcb(name)
+        #         if result:
+        #             return result
+        #         return stack_rcb(name)
+        # fn = torch._C._jit_script_compile(qualified_name, ast, _rcb, get_default_args(obj))
+
+        g = torch.jit.script(foo_elias)
+        print(g.graph)
+        # print(torch.jit._overloads)
+        # def elias_decorator(func):
+        #     print(torch.jit.annotations.get_signature(func))
+        #     # print(func)
+        #     return func
+        #     # from typing import overload
+        #     # return overload(func)
+        #
+        # def test(x1: int) -> int: ...
+        #
+        # print(test)
+        # test(2)
+        # @overload
+        # def test(x1: float) -> float: ...
+        #
+        # @overload
+        # def test(x1): ...
+        #     # type: (str) -> str
+        #
+        # def test(x1):
+        #     return x1
+        #
+        # print(test(.5))
+
+
     @unittest.skipIf(True, "Removing weak script")
     def test_overloading(self):
         @torch._jit_internal.weak_module

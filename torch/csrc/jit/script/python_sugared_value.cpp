@@ -91,6 +91,7 @@ std::shared_ptr<SugaredValue> PythonValue::call(
     at::ArrayRef<NamedValue> inputs_,
     at::ArrayRef<NamedValue> attributes,
     size_t n_binders) {
+
   auto inputs = toValues(*m.graph(), inputs_);
   auto schema = getSchema(inputs.size(), n_binders);
 
@@ -237,6 +238,35 @@ std::shared_ptr<SugaredValue> OverloadedMethodValue::call(
   }
   throw ErrorReport(loc) << "Could not find any matching overloads\n"
                          << err.str();
+}
+
+std::shared_ptr<SugaredValue> OverloadedFunctionValue::call(
+    const SourceRange& loc,
+    Function& caller,
+    at::ArrayRef<NamedValue> inputs_,
+    at::ArrayRef<NamedValue> attributes,
+    size_t n_binders) {
+  std::stringstream failure_messages;
+  for (bool allow_conversions : {false, true}) {
+    // clear previous error messages
+    failure_messages.str("");
+    for (const auto& compiled_overload : compiled_overloads_) {
+      const auto matched_schema = tryMatchSchema(
+          compiled_overload->schema(),
+          loc,
+          *caller.graph(),
+          c10::nullopt,
+          inputs_,
+          attributes,
+          &failure_messages,
+          allow_conversions);
+      if (matched_schema) {
+        return compiled_overload->call(
+            loc, caller, inputs_, attributes, n_binders);
+      }
+    }
+  }
+  throw ErrorReport(loc) << failure_messages.str();
 }
 
 std::shared_ptr<SugaredValue> ModuleValue::attr(
@@ -544,6 +574,16 @@ std::shared_ptr<SugaredValue> toSugaredValue(
 
   py::bool_ isFunction = py::module::import("inspect").attr("isfunction")(obj);
   if (py::cast<bool>(isFunction)) {
+    auto overloads = py::module::import("torch.jit").attr("get_overloads")(obj);
+    if (!overloads.is_none()) {
+      // std::vector<std::shared_ptr<FunctionValue>> compiled_overloads;
+      auto compiled_fns = py::cast<std::vector<StrongFunctionPtr>>(overloads);
+      auto shared_fn_ptrs = fmap(compiled_fns, [](StrongFunctionPtr ptr) {
+        return std::make_shared<FunctionValue>(ptr);
+      });
+      return std::make_shared<OverloadedFunctionValue>(std::move(shared_fn_ptrs));
+    }
+
     auto compiled_fn =
         py::module::import("torch.jit").attr("_try_compile_fn")(obj, loc);
     if (auto callee = as_function(compiled_fn)) {

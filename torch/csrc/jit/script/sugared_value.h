@@ -268,6 +268,11 @@ struct FunctionValue : public SugaredValue {
     output->node()->setSourceRange(loc);
     return std::make_shared<SimpleValue>(output);
   }
+  //
+  const FunctionSchema& schema() {
+    callee_->ensure_defined();
+    return callee_->getSchema();
+  }
 
  private:
   Function* callee_;

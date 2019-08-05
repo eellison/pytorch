@@ -212,8 +212,10 @@ _vararg_kwarg_err = ("Compiled functions can't take variable number of arguments
 
 def build_param_list(ctx, py_args, self_name):
     if py_args.vararg is not None or py_args.kwarg is not None:
+        import pdb; pdb.set_trace()
         raise ValueError(_vararg_kwarg_err)
     if not PY2 and py_args.kw_defaults:
+        import pdb; pdb.set_trace()
         raise ValueError(_vararg_kwarg_err)
     result = [build_param(ctx, arg, self_name, False) for arg in py_args.args]
     if not PY2:
