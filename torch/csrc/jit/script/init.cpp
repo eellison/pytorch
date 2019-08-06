@@ -173,6 +173,24 @@ std::shared_ptr<PythonResolver> pythonResolver(
   return std::make_shared<PythonResolver>(
       rcb, std::move(classname), std::move(classType));
 }
+
+void checkOverloadDecl(const Decl& new_decl, const Decl& old_decl) {
+  const auto& new_params = new_decl.params();
+  const auto& old_params = old_decl.params();
+
+  TORCH_INTERNAL_ASSERT(
+      new_params.size() == old_params.size(),
+      "Overload must have same number of parameters",
+      new_decl.range(),
+      old_decl.range());
+  for (size_t i = 0; i < new_decl.params().size(); ++i) {
+    TORCH_INTERNAL_ASSERT(
+        new_params[i].ident().name() == old_params[i].ident().name(),
+        "Overload parameters must have the same names",
+        new_params[i].ident(),
+        old_params[i].ident());
+  }
+}
 } // namespace
 
 FunctionSchema getSchemaWithNameAndDefaults(
@@ -698,6 +716,34 @@ void initJitScriptBindings(PyObject* module) {
         auto& defined = defined_functions[0];
         defined->setSchema(getSchemaWithNameAndDefaults(
             def.range(), defined->getSchema(), def.name().name(), defaults));
+        StrongFunctionPtr ret(std::move(cu), defined);
+        didFinishEmitFunction(ret);
+        return ret;
+      });
+  m.def(
+      "_jit_script_compile_overload",
+      [](const std::string& qualname,
+         const Decl& overload_decl,
+         const Def& implementation_def,
+         ResolutionCallback rcb,
+         FunctionDefaults defaults) {
+        const auto name = c10::QualifiedName(qualname);
+        auto cu = get_python_cu();
+        checkOverloadDecl(overload_decl, implementation_def.decl());
+        auto new_def = implementation_def.withDecl(overload_decl);
+        auto defined_functions = cu->define(
+            QualifiedName(name.prefix()),
+            {new_def},
+            {pythonResolver(std::move(rcb))},
+            nullptr,
+            true);
+        TORCH_INTERNAL_ASSERT(defined_functions.size() == 1);
+        auto& defined = defined_functions[0];
+        defined->setSchema(getSchemaWithNameAndDefaults(
+            new_def.range(),
+            defined->getSchema(),
+            new_def.name().name(),
+            defaults));
         StrongFunctionPtr ret(std::move(cu), defined);
         didFinishEmitFunction(ret);
         return ret;
