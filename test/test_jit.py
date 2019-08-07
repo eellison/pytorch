@@ -12939,6 +12939,41 @@ a")
 
         self.checkScript(test_uses, ())
 
+    def test_elias(self):
+        class W(torch.nn.Module):
+            def __init__(self):
+                super(W, self).__init__()
+
+            # @torch.jit.overload_method
+            # def forward(self, x):
+            #     # type: (float) -> (float)
+            #     pass
+            #
+            # @torch.jit.overload_method
+            # def forward(self, x):
+            #     # type: (int) -> (int)
+            #     pass
+
+            def forward(self, x):
+                return x
+
+        w = W()
+        a = torch.jit.script(w)
+        print(a)
+        import pdb; pdb.set_trace()
+
+        return
+
+        def test():
+            return w.forward(1)
+
+        print(torch.jit.script(test).graph)
+
+        # def hi():
+        #     return a.forward()
+
+        print(a)
+
     @unittest.skipIf(True, "Removing weak script")
     def test_overloading(self):
         @torch._jit_internal.weak_module

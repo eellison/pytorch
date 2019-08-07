@@ -1340,10 +1340,39 @@ def _get_valid_constant(attr, v):
 
 
 def _create_methods_from_stubs(self, stubs):
-    defs = [m.def_ for m in stubs]
-    rcbs = [m.resolution_callback for m in stubs]
-    defaults = [get_default_args(m.original_method) for m in stubs]
+    defs = []
+    defaults = []
+    rcbs = []
+    set = False
+    for m in stubs:
+        if m.original_method.__qualname__ in _method_overloads:
+            set = True
+            names = []
+            overloads = _method_overloads[m.original_method.__qualname__]
+            name = m.def_.name().name
+            i = 0
+            for overload_decl, overload_defaults in overloads:
+                names.append(name + "__" + str(i))
+                defs.append(m.def_.withDecl(overload_decl).withName(name + "__" + str(i)))
+                defaults.append(overload_defaults)
+                rcbs.append(m.resolution_callback)
+                i += 1
+                break
+            self._overloads[name] = names
+        else:
+            defs.append(m.def_)
+            defaults.append(get_default_args(m.original_method))
+            rcbs.append(m.resolution_callback)
+    # defs = [m.def_ for m in stubs]
+    # for m in stubs:
+    #     if m.original_method.__qualname__ in _method_overloads:
+    #         import pdb; pdb.set_trace()
+    # rcbs = [m.resolution_callback for m in stubs]
+    # defaults = [get_default_args(m.original_method) for m in stubs]
     self._c._create_methods(self, defs, rcbs, defaults)
+    if set:
+        import pdb; pdb.set_trace()
+        print(self)
 
 # For each user-defined class that subclasses ScriptModule this meta-class,
 # (1) finds all the methods annotated with @script_method
@@ -2106,10 +2135,6 @@ def overload(func):
 
 def compile_function_with_overload(qual_name, impl_fn, overload_decl, overload_defaults):
     _frames_up = 0
-    impl_ast = torch.jit.get_jit_def(impl_fn)
-    closure_rcb = _jit_internal.createResolutionCallbackFromClosure(impl_fn)
-    stack_rcb = _jit_internal.createResolutionCallback(_frames_up + 1)
-    _frames_up = 0
     _rcb = _gen_rcb(impl_fn, _frames_up)
     fn = torch._C._jit_script_compile_overload(qual_name, overload_decl, impl_ast, _rcb, overload_defaults)
     return fn
@@ -2147,8 +2172,26 @@ def check_directly_compile_overloaded(obj):
     global _overloaded_fns
     if qual_name in _compiled_overloaded_fns or qual_name in _overloaded_fns:
         raise RuntimeError("Function {} cannot be directly compiled because it"
-                           " is overloaded. Please wrap it with typed inputs of"
-                           " the signature you wish to compile instead".format(obj))
+                           " is overloaded. It must be used in a context of a function"
+                           " where its inputs can determine which overload to call.".format(qual_name))
+   #
+   # It must be used in the context of a function where `isinstance` checks can statically determine the type
+_method_overloads = {}
+
+def overload_method(obj):
+    qual_name = obj.__qualname__
+    global _method_overloads
+    method_overload_list = _method_overloads.get(qual_name)
+    if method_overload_list is None:
+        method_overload_list = []
+        _method_overloads[qual_name] = method_overload_list
+    signature = torch.jit.annotations.get_signature(obj)
+    if signature is None:
+        raise RuntimeError("Must explicitly add type annotations to overloaded functions: {obj}").format(obj)
+    self_name = inspect.getfullargspec(obj).args[0]
+    decl = torch.jit.get_jit_def(obj, self_name="self").decl()
+    method_overload_list.append((decl, get_default_args(obj)))
+    return obj
 
 # torch.jit.Error
 Error = torch._C.JITException
