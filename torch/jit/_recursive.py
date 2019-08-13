@@ -74,8 +74,20 @@ def copy_to_script_module(original, stubs):
         if the_type is not None:
             script_module._c._register_attribute(name, the_type, item)
 
-    # Copy overloads
-    script_module.__dict__["_overloads"] = dict(getattr(original, "__overloads__", {}))
+
+    script_overloads = dict(getattr(original, "__overloads__", {}))
+    # if hasattr(original, "method_overloads"):
+    #     for orig_fn, overload_fns in original.method_overloads:
+    #             orig_ast = torch.jit.get_jit_def(orig_fn, self_name="ScriptModule")
+    #             names = list(map(lambda i: orig_ast.name().name + "__" + str(i), range(len(overload_fns))))
+    #             script_overloads[orig_ast.name().name] = names
+    #             for overload_fn, name in zip(overload_fns, names):
+    #                 over_ast = torch.jit.get_jit_def(overload_fn, self_name="ScriptModule")
+    #                 new_ast = orig_ast.withDecl(over_ast.decl()).withName(name)
+    #                 _rcb = _jit_internal.createResolutionCallbackFromClosure(orig_fn)
+    #                 stubs.insert(0, torch.jit.ScriptMethodStub(_rcb, new_ast, overload_fn))
+
+    script_module.__dict__["_overloads"] = script_overloads
 
     # Copy links to Python methods so they can be resolved when compiling
     for name in dir(original):
@@ -117,19 +129,45 @@ def recursive_script(mod):
         if not _jit_internal.is_ignored_fn(mod.forward):
             methods = ('forward',)
     exported = []
+    overloads = []
     for name in dir(mod):
         item = getattr(mod, name)
         if callable(item):
             if _jit_internal.get_torchscript_modifier(item) is _jit_internal.FunctionModifiers.EXPORT:
                 exported.append(name)
+            method_overloads = _jit_internal._get_fn_overloads(item.__qualname__)
+            if method_overloads is not None:
+                overloads.append((item, method_overloads))
+
     methods = methods + tuple(exported)
+
+    overload_name_mappings = dict(getattr(mod, "__overloads__", {}))
+    overload_stubs = []
+
+    for orig_fn, overload_fns in overloads:
+        orig_ast = torch.jit.get_jit_def(orig_fn, self_name="ScriptModule")
+        names = list(map(lambda i: orig_ast.name().name + "__" + str(i), range(len(overload_fns))))
+        overload_name_mappings[orig_ast.name().name] = names
+        for overload_fn, name in zip(overload_fns, names):
+            torch.jit._check_no_signature(overload_fn)
+            over_ast = torch.jit.get_jit_def(overload_fn, self_name="ScriptModule")
+            new_ast = torch._C.replace_overloaded_method_decl(over_ast.decl(), orig_ast, name)
+            _rcb = _jit_internal.createResolutionCallbackFromClosure(orig_fn)
+            overload_stubs.append(torch.jit.ScriptMethodStub(_rcb, new_ast, overload_fn))
+
+    setattr(mod, "__overloads__", overload_name_mappings)
+
+    # we shouldn't directly compile overloaded methods, just its overloads
+    def ignore_overloaded(method_name):
+        return method_name not in overload_name_mappings
 
     def make_stub(method):
         func = get_function_from_type(type(mod), method)
         return torch.jit.script_method(func, _jit_internal.createResolutionCallbackFromClosure(func))
 
-    stubs = list(map(make_stub, methods))
-    return copy_to_script_module(mod, stubs)
+    filtered_methods = filter(ignore_overloaded, methods)
+    stubs = list(map(make_stub, filtered_methods))
+    return copy_to_script_module(mod, overload_stubs + stubs)
 
 
 def create_method_from_fn(module, fn):
