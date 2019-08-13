@@ -75,19 +75,8 @@ def copy_to_script_module(original, stubs):
             script_module._c._register_attribute(name, the_type, item)
 
 
-    script_overloads = dict(getattr(original, "__overloads__", {}))
-    # if hasattr(original, "method_overloads"):
-    #     for orig_fn, overload_fns in original.method_overloads:
-    #             orig_ast = torch.jit.get_jit_def(orig_fn, self_name="ScriptModule")
-    #             names = list(map(lambda i: orig_ast.name().name + "__" + str(i), range(len(overload_fns))))
-    #             script_overloads[orig_ast.name().name] = names
-    #             for overload_fn, name in zip(overload_fns, names):
-    #                 over_ast = torch.jit.get_jit_def(overload_fn, self_name="ScriptModule")
-    #                 new_ast = orig_ast.withDecl(over_ast.decl()).withName(name)
-    #                 _rcb = _jit_internal.createResolutionCallbackFromClosure(orig_fn)
-    #                 stubs.insert(0, torch.jit.ScriptMethodStub(_rcb, new_ast, overload_fn))
-
-    script_module.__dict__["_overloads"] = script_overloads
+    # Copy overloads
+    script_module.__dict__["_overloads"] = dict(getattr(original, "__overloads__", {}))
 
     # Copy links to Python methods so they can be resolved when compiling
     for name in dir(original):

@@ -151,13 +151,7 @@ void initTreeViewBindings(PyObject* module) {
             return Def::create(r, name, decl, wrap_list(r, std::move(body)));
           }))
       .def("decl", [](const Def& def) { return def.decl(); })
-      .def("name", [](const Def& def) { return def.name(); })
-      .def(
-          "withDecl",
-          [](const Def& def, const Decl& decl) { return def.withDecl(decl); })
-      .def("withName", [](const Def& def, const std::string& new_name) {
-        return def.withName(new_name);
-      });
+      .def("name", [](const Def& def) { return def.name(); });
   py::class_<ClassDef, TreeView>(m, "ClassDef")
       .def(py::init([](const Ident& name, std::vector<Stmt> body) {
         const auto& r = name.range();
