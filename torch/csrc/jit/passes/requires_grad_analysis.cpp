@@ -11,6 +11,8 @@ namespace jit {
 
 namespace {
 
+std::unordered_set<Value*> req_grad_set;
+
 bool getRequiresGrad(Value* value) {
   return value->requires_grad();
 }
@@ -42,6 +44,24 @@ std::vector<bool> bitwiseOr(std::vector<bool> a, const std::vector<bool>& b) {
   return a;
 }
 
+c10::optional<bool> nodeRequiresGrad(Node* node) {
+  TORCH_INTERNAL_ASSERT(
+      node->kind() == aten::tensor || node->kind() == aten::requires_grad_);
+  if (auto grad_index = node->schema().argumentIndexWithName("requires_grad")) {
+    if (auto const_arg = constant_as<bool>(node->inputs().at(*grad_index))) {
+      return *const_arg;
+    }
+  }
+  if (auto type = node->output()->type()->cast<TensorType>()) {
+    if (type->scalarType()) {
+      if (!at::isFloatingType(*type->scalarType())) {
+        return false;
+      }
+    }
+  }
+  return c10::nullopt;
+}
+
 void PropagateRequiresGradSimpleNode(Node* node) {
   static const OperatorSet comparison_ops = {
       "aten::lt(Tensor self, Tensor other) -> Tensor",
@@ -65,17 +85,11 @@ void PropagateRequiresGradSimpleNode(Node* node) {
     return setRequiresGrad(node->output(), node->input(0)->requires_grad());
   } else if (node->matches("aten::detach(Tensor self) -> Tensor")) {
     return setRequiresGrad(node->output(), false);
-  } else if (node->kind() == aten::tensor) {
-    if (auto grad_index =
-            node->schema().argumentIndexWithName("requires_grad")) {
-      if (auto const_arg = constant_as<bool>(node->inputs().at(*grad_index))) {
-        return setRequiresGrad(node->output(), *const_arg);
-      }
-    }
-    if (auto type = node->output()->type()->cast<TensorType>()) {
-      if (type->scalarType()) {
-        setRequiresGrad(node->output(), at::isFloatingType(*type->scalarType()));
-      }
+  } else if (
+      node->kind() == aten::tensor || node->kind() == aten::requires_grad_) {
+    auto maybe_grad = nodeRequiresGrad(node);
+    if (maybe_grad) {
+      return setRequiresGrad(node->output(), *maybe_grad);
     }
     return;
   }
@@ -145,6 +159,22 @@ void PropagateRequiresGrad(Block* block) {
     PropagateRequiresGrad(node);
   }
 }
+
+void collectSetRequiresGradSet(Block* block) {
+  for (Node* node : block->nodes()) {
+    if (node->kind() == aten::requires_grad_) {
+      auto maybe_grad = nodeRequiresGrad(node);
+      if (maybe_grad && *maybe_grad == false) {
+        continue;
+      }
+      req_grad_set.insert(node->output());
+    }
+    for (Block* block : node->blocks()) {
+      collectSetRequiresGradSet(block);
+    }
+  }
+}
+
 } // anonymous namespace
 
 void PropagateRequiresGrad(std::shared_ptr<Graph>& graph) {

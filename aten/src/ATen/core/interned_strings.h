@@ -125,6 +125,7 @@ namespace c10 {
   _(aten, copy_)                     \
   _(aten, t_)                        \
   _(aten, addbmm_)                   \
+  _(aten, requires_grad_)            \
   _(aten, addcdiv_)                  \
   _(aten, addcmul_)                  \
   _(aten, addmv_)                    \

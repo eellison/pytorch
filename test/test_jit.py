@@ -6313,6 +6313,28 @@ a")
         self.assertTrue(out_inp[1].requires_grad())
         self.assertFalse(out_inp[2].requires_grad())
 
+    def test_set_requries_grad(self):
+        @torch.jit.script
+        def test():
+            a = torch.tensor(1.0)
+            b = a.requires_grad_(True)
+            assert a is b
+
+            c = torch.tensor(1.0)
+            d = a.requires_grad_(False)
+
+            e = torch.tensor(1.0, requires_grad=True)
+            f = e.requires_grad_(False)
+
+            return a, b, c, d, e, f
+
+        g = test.graph_for()
+        out = g.outputs()
+        out_inp = list(out)
+        for i in range(6):
+            print(i)
+            self.assertTrue(out_inp[i].requires_grad() == i < 2)
+
     def test_grad_from_script(self):
         def test():
             a = torch.tensor(2.5, requires_grad=True)
@@ -12566,6 +12588,9 @@ a")
         script_result2 = strong_mod2(x)
         self.assertEqual(script_result, expected_result)
         self.assertEqual(script_result, script_result2)
+
+    def test_elias(self):
+        print(torch.tensor(1.0).requires_grad_(True))
 
     @unittest.skipIf(True, "Removing weak script")
     def test_weak_module_parameters_and_buffers(self):
