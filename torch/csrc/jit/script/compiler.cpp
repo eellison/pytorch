@@ -1646,6 +1646,13 @@ struct to_ir {
     // enumerate() or SimpleValue like List, Tensor, Dict, etc.
     SugaredValuePtr sv = emitSugaredExpr(itrs[0], 1);
     IterableValuePtr iterable = asIterable(loc, method, sv);
+
+    // We unroll the loop for iterables that contain ModuleLists because
+    // the list can contain different types.
+    // In order to support ModuleLists which return different types,
+    // we do not push a new environment frame because if we did they would have
+    // to subtype the value in the existing frame.
+
     if (!iterable->staticFor()) {
       return emitLoopCommon(loc, body, iterable->getValue(), targets, {});
     }
@@ -1657,59 +1664,11 @@ struct to_ir {
       emitExprsAssign(targets, {sugared_value}, itrs[0].range(), /*n_binders=*/1);
       emitStatements(body);
     }
-    //
-    //
-    //
-    //
-    // // We will get IterableTree for builtinFunctions zip() and enumerate(),
-    // // RangeValue for range(), and SimpleValue for types like
-    // // List/Tensor/Dict/String.
-    // auto range_val = std::dynamic_pointer_cast<RangeValue>(sv);
-    // auto siv = std::dynamic_pointer_cast<SimpleValue>(sv);
-    // auto iterable_tree = std::dynamic_pointer_cast<IterableTree>(sv);
-    //
-    // // For SimpleValue(except Tuple) or RanveValue/IterableTree, emit common
-    // // loop
-    // if ((siv && !siv->getValue()->type()->cast<TupleType>()) || range_val ||
-    //     iterable_tree) {
-    //   // looping over a dict defaults to looping over the keys in python
-    //   if (siv && siv->getValue()->type()->cast<DictType>()) {
-    //     sv = std::make_shared<SimpleValue>(
-    //         graph->insert(aten::keys, {siv->getValue()}, {}, stmt.range()));
-    //   }
-    //   emitLoopCommon(stmt.range(), body, sv, targets, {});
-    //   return;
-    // }
-
-    // Emit or unroll the loop for Tuple or ModuleList, we choose to unroll or
-    // emit each subelemnt for each iteration separately. This is because for
-    // ModuleList, each module inside the list may be different types, so FOR ..
-    // in ModuleList essentially should emit different stmts for each iteration,
-    // which we shouldn't emit the prim::Loop node for it, the same rule applies
-    // for the Tuple case.
-  //   auto instances = sv->asTuple(stmt.range(), method);
-  //   pushFrame(environment_stack->block());
-  //   for (const auto& inst : instances) {
-  //     emitExprsAssign(targets, {inst}, itrs[0].range(), /*n_binders=*/1);
-  //     emitStatements(body);
-  //   }
-  //
-  //   for (const auto& n : environment_stack->definedVariables()) {
-  //     if (environment_stack->findInParentFrame(n)) {
-  //       environment_stack->next->setVar(
-  //           stmt.range(), n, environment_stack->getVar(n, stmt.range()));
-  //     }
-  //   }
-  //   popFrame();
   }
-  //
+
   void emitWhile(const While& stmt) {
     auto cond = stmt.cond();
-    auto body_fn = [&]() {
-      emitStatements(stmt.body());
-    };
-
-    emitLoopCommon(stmt.range(), body_fn, nullptr, {}, cond);
+    emitLoopCommon(stmt.range(), stmt.body(), nullptr, {}, cond);
   }
 
   // Currently we do not support assigning exceptions to variables,
