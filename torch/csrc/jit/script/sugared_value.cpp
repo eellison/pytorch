@@ -298,29 +298,20 @@ Value* SimpleValue::len(const SourceRange& loc, Function& m) {
   }
 }
 
-Value* SimpleValue::getitem(const SourceRange& loc, Function& m, Value* idx) {
+SugaredValuePtr SimpleValue::getitem(const SourceRange& loc, Function& m, Value* idx) {
   Value* val = getValue();
   TypePtr val_type = val->type();
   Graph& g = *m.graph();
 
   // if it's a List/String/Dict, emit a regular __getitem__ op
   if (val_type->cast<ListType>() || val_type->cast<StringType>()) {
-    return g.insert(aten::__getitem__, {val, idx}, {}, loc);
+    return std::make_shared<SimpleValue>(g.insert(aten::__getitem__, {val, idx}, {}, loc));
   } else if (auto dict_type = val_type->cast<DictType>()) {
-    if (!idx->type()->isSubtypeOf(dict_type->getKeyType())) {
-      throw ErrorReport(loc)
-          << "Expected key type '" << idx->type()->python_str()
-          << "' to subtype the key type '"
-          << dict_type->getKeyType()->python_str() << "' of the dict '"
-          << dict_type->python_str() << "'";
-    }
-    return g.insert(aten::__getitem__, {val, idx}, {}, loc);
+    return std::make_shared<SimpleValue>(g.insert(aten::__getitem__, {val, idx}, {}, loc));
   } else if (val_type->isSubtypeOf(TensorType::get())) {
-    return g.insert(aten::select, {val, 0, idx}, {}, loc);
+    return std::make_shared<SimpleValue>(g.insert(aten::select, {val, 0, idx}, {}, loc));
   } else if (auto class_type = val_type->cast<ClassType>()) {
-    return attr(loc, m, "__getitem__")
-        ->call(loc, m, {idx}, {}, 1)
-        ->asValue(loc, m);
+    return attr(loc, m, "__getitem__")->call(loc, m, {idx}, {}, 1);
   } else {
     throw ErrorReport(loc) << "'" << val_type->python_str() << "'"
                            << " object is not subscriptable";
@@ -362,7 +353,27 @@ RangeValue::RangeValue(
     throw ErrorReport(loc) << "range expected at most 3 arguments, got "
                            << inputs.size();
   }
+
+
+  // TODO: !has_only_end calculation
+  if (has_only_end_) {
+    static_len_ = toIValue(end_)->to<c10::optional<int64_t>>();
+  } else {
+    static_len_ = c10::nullopt;
+  }
 }
+
+c10::optional<int64_t> RangeValue::staticLen() {
+  return static_len_;
+}
+
+// RangeValue::RangeValue(RangeValue * range) {
+//    start_ = range->start_;
+//    end_ = range->end_;
+//    step_= range->step_;
+//    has_only_end_ = range->has_only_end_;
+//    static_len_ = range->static_len_;
+// }
 
 Value* RangeValue::len(const SourceRange& loc, Function& m) {
   if (has_only_end_) {
@@ -373,12 +384,12 @@ Value* RangeValue::len(const SourceRange& loc, Function& m) {
   }
 }
 
-Value* RangeValue::getitem(const SourceRange& loc, Function& m, Value* idx) {
+SugaredValuePtr RangeValue::getitem(const SourceRange& loc, Function& m, Value* idx) {
   if (has_only_end_) {
-    return idx;
+    return std::make_shared<SimpleValue>(idx);
   } else {
     auto& g = *m.graph();
-    return g.insert(aten::__derive_index, {idx, start_, step_}, {}, loc);
+    return std::make_shared<SimpleValue>(g.insert(aten::__derive_index, {idx, start_, step_}, {}, loc));
   }
 }
 
@@ -418,15 +429,65 @@ Value* IterableTree::len(const SourceRange& loc, Function& m) {
   return g.insert(prim::min, {list_node->output()}, {}, loc);
 }
 
-Value* IterableTree::getitem(const SourceRange& loc, Function& m, Value* idx) {
-  std::vector<Value*> child_items;
+SugaredValuePtr IterableTree::getitem(const SourceRange& loc, Function& m, Value* idx) {
+  std::vector<SugaredValuePtr> child_items;
   for (const SugaredValuePtr& child : children_) {
     child_items.emplace_back(child->getitem(loc, m, idx));
   }
-  // If you call getitem() on a IterableTree sugared value, we will create Tuple
-  // from the children items, and make the Tuple value as the element
-  Graph& g = *m.graph();
-  return g.insertNode(g.createTuple(child_items))->output();
+  return std::make_shared<SugaredTupleValue>(child_items);
+  //
+  // // If you call getitem() on a IterableTree sugared value, we will create Tuple
+  // // from the children items, and make the Tuple value as the element
+  // Graph& g = *m.graph();
+  // return g.insertNode(g.createTuple(child_items))->output();
+}
+
+IterableValuePtr asIterable(
+    const SourceRange& loc,
+    Function& m,
+    SugaredValuePtr sv) {
+  auto simple_value = std::dynamic_pointer_cast<SimpleValue>(sv);
+  if (simple_value) {
+    auto value = simple_value->getValue();
+    auto type = value->type();
+    // built-in iterable types
+    if (type->cast<ListType>() || type->cast<StringType>() ||
+        type->cast<TensorType>()) {
+      return std::make_shared<IterableValue>(std::make_shared<SimpleValue>(value));
+    }
+    // dicts iterate over keys
+    if (type->cast<DictType>()) {
+      return std::make_shared<IterableValue>(std::make_shared<SimpleValue>(
+          m.graph()->insert(aten::keys, {value}, {}, loc)));
+    }
+    // we allow iteration over tuples if their types can be unified
+    if (auto tup = type->cast<TupleType>()) {
+      auto tuple_type = unifyTypeList(tup->elements());
+      if (!tuple_type) {
+        throw ErrorReport(loc)
+            << "Heterogenous tuples cannot be iterated over. Found "
+            << type->python_str();
+      }
+      int64_t static_len = tup->elements().size();
+      return std::make_shared<IterableValue>(
+          std::make_shared<SimpleValue>(
+              m.graph()
+                  ->createList(*tuple_type, createTupleUnpack(value))
+                  ->output()),
+          static_len);
+    } else {
+      throw ErrorReport(loc) << "'" << type->python_str() << "'"
+                           << " object is not iterable";
+    }
+  }
+  auto range_value = std::dynamic_pointer_cast<RangeValue>(sv);
+  if (range_value) {
+    return std::make_shared<IterableValue>(std::shared_ptr<RangeValue>(range_value), range_value->staticLen());
+  } else if (auto iter_tree = std::dynamic_pointer_cast<IterableTree>(sv)) {
+    return std::make_shared<IterableValue>(std::shared_ptr<IterableTree>(iter_tree), iter_tree->staticLen(), iter_tree->emitStatically());
+  } else {
+    return sv->asIterable(loc, m);
+  }
 }
 
 std::shared_ptr<SugaredValue> MagicMethod::call(
