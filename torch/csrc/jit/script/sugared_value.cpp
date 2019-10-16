@@ -357,7 +357,12 @@ RangeValue::RangeValue(
 
   // TODO: !has_only_end calculation
   if (has_only_end_) {
-    static_len_ = toIValue(end_)->to<c10::optional<int64_t>>();
+    auto len = toIValue(end_);
+    if (len) {
+      static_len_ = len->toInt();
+    } else {
+      static_len_ = c10::nullopt;
+    }
   } else {
     static_len_ = c10::nullopt;
   }
@@ -366,14 +371,6 @@ RangeValue::RangeValue(
 c10::optional<int64_t> RangeValue::staticLen() {
   return static_len_;
 }
-
-// RangeValue::RangeValue(RangeValue * range) {
-//    start_ = range->start_;
-//    end_ = range->end_;
-//    step_= range->step_;
-//    has_only_end_ = range->has_only_end_;
-//    static_len_ = range->static_len_;
-// }
 
 Value* RangeValue::len(const SourceRange& loc, Function& m) {
   if (has_only_end_) {
@@ -435,11 +432,6 @@ SugaredValuePtr IterableTree::getitem(const SourceRange& loc, Function& m, Value
     child_items.emplace_back(child->getitem(loc, m, idx));
   }
   return std::make_shared<SugaredTupleValue>(child_items);
-  //
-  // // If you call getitem() on a IterableTree sugared value, we will create Tuple
-  // // from the children items, and make the Tuple value as the element
-  // Graph& g = *m.graph();
-  // return g.insertNode(g.createTuple(child_items))->output();
 }
 
 IterableValuePtr asIterable(

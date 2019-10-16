@@ -356,16 +356,16 @@ IterableValuePtr ModuleValue::desugarModuleContainer(
   int64_t len = submoduleNames.size();
   if (get_keys) {
     return std::make_shared<IterableValue>(
-        std::make_shared<PyModuleList>(keys), len, unroll);
+        std::make_shared<ConstantTupleValue>(keys), len, unroll);
   } else if (get_values) {
     return std::make_shared<IterableValue>(
-        std::make_shared<PyModuleList>(values), len, unroll);
+        std::make_shared<ConstantTupleValue>(values), len, unroll);
   } else {
-    auto key_list = std::make_shared<IterableValue>(std::make_shared<PyModuleList>(keys), len, unroll);
-    auto value_list = std::make_shared<IterableValue>(std::make_shared<PyModuleList>(values), len, unroll);
+    auto key_list = std::make_shared<IterableValue>(std::make_shared<ConstantTupleValue>(keys), len, unroll);
+    auto value_list = std::make_shared<IterableValue>(std::make_shared<ConstantTupleValue>(values), len, unroll);
     auto iterator = std::make_shared<IterableTree>();
-    iterator->addChild(key_list);
-    iterator->addChild(value_list);
+    iterator->addChild(loc, key_list);
+    iterator->addChild(loc, value_list);
     return std::make_shared<IterableValue>(iterator, len, unroll);
   }
 }

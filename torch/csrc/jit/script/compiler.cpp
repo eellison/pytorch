@@ -1647,7 +1647,7 @@ struct to_ir {
     SugaredValuePtr sv = emitSugaredExpr(itrs[0], 1);
     IterableValuePtr iterable = asIterable(loc, method, sv);
     if (!iterable->staticFor()) {
-      emitLoopCommon(loc, body, iterable->getValue(), targets, {});
+      return emitLoopCommon(loc, body, iterable->getValue(), targets, {});
     }
     TORCH_INTERNAL_ASSERT(iterable->getLen(), "Static For should have defined length");
     int64_t len = *iterable->getLen();
@@ -2539,8 +2539,8 @@ struct to_ir {
         // range should have the same static length as the other iterable
         auto range = std::make_shared<IterableValue>(range_sv, iterable->getLen());
         auto tree = std::make_shared<IterableTree>();
-        tree->addChild(iterable);
-        tree->addChild(range);
+        tree->addChild(loc, iterable);
+        tree->addChild(loc, iterable);
         return tree;
       }
       case prim::zip: {
@@ -2554,7 +2554,7 @@ struct to_ir {
         auto iterable_tree = std::make_shared<IterableTree>();
         for (Expr expr : inputs) {
           auto iterable = asIterable(apply.range(), method, emitSugaredExpr(expr, 1));
-          iterable_tree->addChild(iterable);
+          iterable_tree->addChild(apply.range(), iterable);
         }
         return iterable_tree;
       }

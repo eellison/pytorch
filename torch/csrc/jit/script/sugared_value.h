@@ -523,19 +523,35 @@ IterableValuePtr asIterable(
 // max_trip_count and set the value table for loop targets
 struct TORCH_API IterableTree : SugaredValue {
   IterableTree() = default;
-  IterableTree(at::ArrayRef<IterableValuePtr> children) {
+  IterableTree(const SourceRange& range, at::ArrayRef<IterableValuePtr> children) {
     for (const auto& child: children) {
-      addChild(child);
+      addChild(range, child);
     }
   }
   std::string kind() const override {
     return "iterabletree";
   }
 
-  void addChild(IterableValuePtr iter_value) {
+  void addChild(const SourceRange& range, IterableValuePtr iter_value) {
+    auto child_len = iter_value->getLen();
+    auto child_static = iter_value->staticFor();
+    if (children_.size() == 0) {
+      static_len_ = child_len;
+      emit_statically_ = child_static;
+    } else {
+      if ((emit_statically_ && !child_len) ||
+          (child_static && !static_len_)) {
+        throw ErrorReport(range)
+            << "Can not iterate over a module list with a value"
+               "with a length that can not be statically determined\n";
+      }
+      if (child_len && static_len_) {
+        static_len_ = std::min(*child_len, *static_len_);
+      }
+      emit_statically_ = emit_statically_ || child_static;
+    }
+
     children_.push_back(iter_value->getValue());
-    static_len_ = iter_value->getLen();
-    emit_statically_ = iter_value->staticFor();
   }
 
   std::vector<SugaredValuePtr> get_children() {
@@ -543,7 +559,7 @@ struct TORCH_API IterableTree : SugaredValue {
   }
 
   c10::optional<int64_t> staticLen() const {
-    return emit_statically_;
+    return static_len_;
   }
 
   bool emitStatically() const {
@@ -571,38 +587,6 @@ static inline std::vector<Value*> toValues(
     at::ArrayRef<NamedValue> nvs) {
   return fmap(nvs, [&](const NamedValue& v) { return v.value(g); });
 }
-
-struct TORCH_API PyModuleList : public SugaredValue {
-  PyModuleList(std::vector<SugaredValuePtr> modules)
-      : modules_(std::move(modules)) {}
-
-  std::string kind() const override {
-    return "Module List";
-  }
-
-  SugaredValuePtr getitem(const SourceRange& loc, Function& m, Value* idx) override {
-    auto index = toIValue(idx).value_or(-1).toInt();
-    // should never happen - not user visible
-    TORCH_INTERNAL_ASSERT(index >= 0 && index < static_cast<int64_t>(modules_.size()),
-      loc,
-      "Expected index in range of modulelist");
-    return modules_.at(index);
-  }
-
-  IterableValuePtr asIterable(const SourceRange& loc, Function& m) override {
-    return std::make_shared<IterableValue>(std::make_shared<PyModuleList>(modules_), modules_.size(), true);
-  };
-
-  std::shared_ptr<SugaredValue> call(
-      const SourceRange& loc,
-      Function& caller,
-      at::ArrayRef<NamedValue> inputs,
-      at::ArrayRef<NamedValue> attributes,
-      size_t n_binders) override;
-
- private:
-  std::vector<SugaredValuePtr> modules_;
-};
 
 struct SimpleSelf : public Self {
   explicit SimpleSelf(ClassTypePtr classType)

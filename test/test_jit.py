@@ -10024,6 +10024,8 @@ a")
         f = test()
         # no failure
         g = torch.jit.trace(f, (torch.zeros(1, 1, 28, 28),))
+        import pdb; pdb.set_trace()
+
         x = torch.zeros(1, 1, 14, 14)
         # constants not baked in
         self.assertEqual(g(x), f(x))
@@ -10973,6 +10975,42 @@ a")
             def range_non_float():
                 for i in range(.5):
                     print(i)
+
+    def test_elias(self):
+        class Sub(torch.nn.Module):
+            def __init__(self):
+                super(Sub, self).__init__()
+
+            def forward(self, thing):
+                return thing + 2
+
+        class Add(torch.nn.Module):
+            def __init__(self):
+                super(Add, self).__init__()
+
+            def forward(self, thing):
+                return thing + 2
+
+        class Mod(torch.nn.Module):
+            __constants__ = ['mods', 'mods2']
+
+            def __init__(self):
+                super(Mod, self).__init__()
+                self.mods = nn.ModuleList([Sub() for i in range(10)])
+                self.mods2 = nn.ModuleList([Add() for i in range(9)])
+
+            def forward(self, v):
+                me = 0
+                iter = 0
+                for m1, m2, m3, m4 in zip(self.mods, self.mods2, (1, 1, 1, 1), [1, 5]):
+                    print(m1)
+                    print(m2)
+                    iter += 1
+                print("NUMBER ITERS", iter)
+                return v
+
+        out = torch.jit.script(Mod())
+        print(out(torch.tensor(0.0)))
 
 
     def test_for_in_enumerate(self):

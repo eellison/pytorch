@@ -232,6 +232,65 @@ struct VISIBILITY_HIDDEN ConstantTupleMethod : public SugaredValue {
   const std::string name_;
 };
 
+struct VISIBILITY_HIDDEN ConstantTupleValue : public SugaredValue {
+  explicit ConstantTupleValue(
+      std::vector<std::shared_ptr<SugaredValue>> tup)
+      : modules_(tup){};
+
+  std::string kind() const override {
+    return "constant tuple";
+  }
+
+  SugaredValuePtr getitem(const SourceRange& loc, Function& m, Value* idx) override {
+    auto index = toIValue(idx).value_or(-1).toInt();
+    // should never happen - not user visible
+    TORCH_INTERNAL_ASSERT(index >= 0 && index < static_cast<int64_t>(modules_.size()),
+      loc,
+      "Expected index in range of modulelist");
+    return modules_.at(index);
+  }
+
+  IterableValuePtr asIterable(const SourceRange& loc, Function& m) override {
+    return std::make_shared<IterableValue>(std::make_shared<ConstantTupleValue>(modules_), modules_.size(), true);
+  };
+
+  std::vector<std::shared_ptr<SugaredValue>> modules_;
+};
+
+//
+// struct VISIBILITY_HIDDEN PyModuleList : public SugaredValue {
+//   PyModuleList(std::vector<SugaredValuePtr> modules)
+//       : modules_(std::move(modules)) {}
+//
+//   std::string kind() const override {
+//     return "Module List";
+//   }
+//
+//   SugaredValuePtr getitem(const SourceRange& loc, Function& m, Value* idx) override {
+//     auto index = toIValue(idx).value_or(-1).toInt();
+//     // should never happen - not user visible
+//     TORCH_INTERNAL_ASSERT(index >= 0 && index < static_cast<int64_t>(modules_.size()),
+//       loc,
+//       "Expected index in range of modulelist");
+//     return modules_.at(index);
+//   }
+//
+//   IterableValuePtr asIterable(const SourceRange& loc, Function& m) override {
+//     return std::make_shared<IterableValue>(std::make_shared<PyModuleList>(modules_), modules_.size(), true);
+//   };
+//
+//   std::shared_ptr<SugaredValue> call(
+//       const SourceRange& loc,
+//       Function& caller,
+//       at::ArrayRef<NamedValue> inputs,
+//       at::ArrayRef<NamedValue> attributes,
+//       size_t n_binders) override;
+//
+//  private:
+//   std::vector<SugaredValuePtr> modules_;
+// };
+
+
 struct VISIBILITY_HIDDEN BooleanDispatchValue : public SugaredValue {
   BooleanDispatchValue(py::dict dispatched_fn)
       : dispatched_fn_(std::move(dispatched_fn)) {}
