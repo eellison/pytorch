@@ -10974,7 +10974,7 @@ a")
                 for i in range(.5):
                     print(i)
 
-    def test_enumerate_modulelist(self):
+    def test_zip_enumerate_modulelist(self):
         class Sub(torch.nn.Module):
             def __init__(self):
                 super(Sub, self).__init__()
@@ -11039,7 +11039,7 @@ a")
                     x = mod(x) * val
                 return x
 
-        with self.assertRaisesRegex(Exception, "that does not have a statically determinable"):
+        with self.assertRaisesRegex(Exception, "that does not have a statically determinable length"):
             torch.jit.script(Mod2())
 
         # modulelist, variable length
@@ -11049,7 +11049,7 @@ a")
                     x = mod(x) * val
                 return x
 
-        with self.assertRaisesRegex(Exception, " a length that can not be statically determined"):
+        with self.assertRaisesRegex(Exception, "that does not have a statically determinable length"):
             torch.jit.script(Mod3())
 
     def test_elias(self):
