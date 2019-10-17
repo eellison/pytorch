@@ -566,8 +566,8 @@ struct TORCH_API IterableTree : SugaredValue {
       if ((emit_unrolled_ && !child_len) ||
           (child_unrolled && !static_len_)) {
         throw ErrorReport(range)
-            << "Can not iterate over a module list with a value"
-               "with a length that can not be statically determined\n";
+            << "Can not iterate over a module list with a value "
+               "that does not have a statically determinable length\n";
       }
       if (child_len && static_len_) {
         // iterables run for the minimum length of all its leaves

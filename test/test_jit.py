@@ -11032,6 +11032,25 @@ a")
 
         self.checkModule(Mod(), (torch.tensor(.5),))
 
+        # variable lenghth, modulelist
+        class Mod2(Mod):
+            def forward(self, x):
+                for val, mod in zip(range(int(x)), self.mods):
+                    x = mod(x) * val
+                return x
+
+        with self.assertRaisesRegex(Exception, "that does not have a statically determinable"):
+            torch.jit.script(Mod2())
+
+        # modulelist, variable length
+        class Mod3(Mod):
+            def forward(self, x):
+                for val, mod in zip(self.mods, range(int(x))):
+                    x = mod(x) * val
+                return x
+
+        with self.assertRaisesRegex(Exception, " a length that can not be statically determined"):
+            torch.jit.script(Mod3())
 
     def test_elias(self):
         class Sub(torch.nn.Module):
