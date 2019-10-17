@@ -83,17 +83,6 @@ struct VISIBILITY_HIDDEN PythonModuleValue : public PythonValue {
       const std::string& field) override;
 };
 
-struct VISIBILITY_HIDDEN ConstantPythonTupleValue : public PythonValue {
-  explicit ConstantPythonTupleValue(py::object tup)
-      : PythonValue(std::move(tup)) {}
-  std::vector<std::shared_ptr<SugaredValue>> asTuple(
-      const SourceRange& loc,
-      Function& m,
-      const c10::optional<size_t>& size_hint = {}) override;
-
-  Value* asValue(const SourceRange& loc, Function& m) override;
-};
-
 // Represents all the parameters of a module as a List[Tensor]
 struct VISIBILITY_HIDDEN ConstantParameterList : public SugaredValue {
   ConstantParameterList(Value* the_list) : the_list_(the_list) {}

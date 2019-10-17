@@ -215,29 +215,6 @@ std::shared_ptr<SugaredValue> PythonModuleValue::attr(
   return toSugaredValue(member, m, loc, /*is_constant=*/true);
 }
 
-std::vector<std::shared_ptr<SugaredValue>> ConstantPythonTupleValue::asTuple(
-    const SourceRange& loc,
-    Function& m,
-    const c10::optional<size_t>& size_hint) {
-  py::tuple tup = self;
-  std::vector<std::shared_ptr<SugaredValue>> result;
-  result.reserve(tup.size());
-  for (py::handle t : tup) {
-    py::object obj = py::reinterpret_borrow<py::object>(t);
-    result.push_back(toSugaredValue(obj, m, loc, true));
-  }
-  return result;
-}
-
-Value* ConstantPythonTupleValue::asValue(const SourceRange& loc, Function& m) {
-  std::vector<Value*> values;
-  for (const auto& sugared_item : asTuple(loc, m)) {
-    values.push_back(sugared_item->asValue(loc, m));
-  }
-  auto node = m.graph()->createTuple(values);
-  return m.graph()->insertNode(node)->output();
-}
-
 std::shared_ptr<SugaredValue> OverloadedMethodValue::call(
     const SourceRange& loc,
     Function& caller,
@@ -582,7 +559,15 @@ std::shared_ptr<SugaredValue> toSugaredValue(
       const auto l = static_cast<int8_t>(layout->layout);
       return toSimple(g.insertConstant(l, loc));
     } else if (py::isinstance<py::tuple>(obj)) {
-      return std::make_shared<ConstantPythonTupleValue>(obj);
+      py::tuple tup = obj;
+      std::vector<std::shared_ptr<SugaredValue>> result;
+      result.reserve(tup.size());
+      for (py::handle t : tup) {
+        py::object obj = py::reinterpret_borrow<py::object>(t);
+        result.push_back(toSugaredValue(obj, m, loc, true));
+      }
+      bool contains_module_list = false; // Python Tuples can't contain module list
+      return std::make_shared<SugaredTupleValue>(result, contains_module_list);
     }
   }
 

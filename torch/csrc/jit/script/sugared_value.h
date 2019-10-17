@@ -192,8 +192,8 @@ struct TORCH_API BuiltinFunction : public SugaredValue {
 
 struct TORCH_API SugaredTupleValue : public SugaredValue {
   explicit SugaredTupleValue(
-      std::vector<std::shared_ptr<SugaredValue>> tup, bool emit_unrolled)
-      : tup_(tup), emit_unrolled_(emit_unrolled) {};
+      std::vector<std::shared_ptr<SugaredValue>> tup, bool contains_module_list)
+      : tup_(tup), contains_module_list_(contains_module_list) {};
 
   std::vector<std::shared_ptr<SugaredValue>> asTuple(
       const SourceRange& loc,
@@ -225,12 +225,11 @@ struct TORCH_API SugaredTupleValue : public SugaredValue {
   }
 
   IterableValuePtr asIterable(const SourceRange& loc, Function& m) override {
-    return std::make_shared<IterableValue>(std::make_shared<SugaredTupleValue>(tup_, emit_unrolled_), tup_.size(), emit_unrolled_);
+    return std::make_shared<IterableValue>(shared_from_this(), tup_.size(), contains_module_list_);
   };
 
-
   std::vector<std::shared_ptr<SugaredValue>> tup_;
-  bool emit_unrolled_;
+  bool contains_module_list_;
 };
 
 
