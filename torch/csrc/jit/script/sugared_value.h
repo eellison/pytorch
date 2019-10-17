@@ -149,6 +149,8 @@ struct TORCH_API SimpleValue : public SugaredValue {
       at::ArrayRef<NamedValue> attributes,
       size_t n_binders) override;
 
+  IterableValuePtr asIterable(const SourceRange& loc, Function& m) override;
+
   Value* getValue() const {
     return value_;
   }
@@ -190,8 +192,8 @@ struct TORCH_API BuiltinFunction : public SugaredValue {
 
 struct TORCH_API SugaredTupleValue : public SugaredValue {
   explicit SugaredTupleValue(
-      std::vector<std::shared_ptr<SugaredValue>> tup)
-      : tup_(tup){};
+      std::vector<std::shared_ptr<SugaredValue>> tup, bool emit_unrolled)
+      : tup_(tup), emit_unrolled_(emit_unrolled) {};
 
   std::vector<std::shared_ptr<SugaredValue>> asTuple(
       const SourceRange& loc,
@@ -213,7 +215,22 @@ struct TORCH_API SugaredTupleValue : public SugaredValue {
     return "Sugared Tuple";
   }
 
+  SugaredValuePtr getitem(const SourceRange& loc, Function& m, Value* idx) override {
+    TORCH_INTERNAL_ASSERT(toIValue(idx), loc, "Expected integer literal for Sugared Tuple");
+    auto index = toIValue(idx)->toInt();
+    TORCH_INTERNAL_ASSERT(index >= 0 && index < static_cast<int64_t>(tup_.size()),
+      loc,
+      "Index out of range of Sugared Tuple");
+    return tup_.at(index);
+  }
+
+  IterableValuePtr asIterable(const SourceRange& loc, Function& m) override {
+    return std::make_shared<IterableValue>(std::make_shared<SugaredTupleValue>(tup_, emit_unrolled_), tup_.size(), emit_unrolled_);
+  };
+
+
   std::vector<std::shared_ptr<SugaredValue>> tup_;
+  bool emit_unrolled_;
 };
 
 
@@ -480,12 +497,19 @@ struct TORCH_API RangeValue : SugaredValue {
   c10::optional<int64_t> static_len_;
 };
 
+
+// We handle iteration over Module Containers by unrolling the for loop over each value.
+// As a result we need to statically know the number of elements of the iterable.
+// IterableValue contains an underlying SugaredValue, its static length if it is known,
+// and whether or not the Iterable needs to be emmitted statically.
+// We error if an iterable contains both a SugaredValue that needs to be emitted statically,
+// and a SugaredValue which does not have a statically-determinable length.
 struct IterableValue {
   IterableValue(
       SugaredValuePtr value,
       c10::optional<int64_t> len = c10::nullopt,
-      bool static_for = false)
-      : value_(std::move(value)), len_(len), static_for_(static_for){};
+      bool emit_unrolled = false)
+      : value_(std::move(value)), len_(len), emit_unrolled_(emit_unrolled){};
 
   SugaredValuePtr getValue() const {
     return value_;
@@ -495,14 +519,14 @@ struct IterableValue {
     return len_;
   }
 
-  bool staticFor() const {
-    return static_for_;
+  bool emitUnrolled() const {
+    return emit_unrolled_;
   }
 
 private:
   std::shared_ptr<SugaredValue> value_;
   c10::optional<int64_t> len_;
-  bool static_for_ = false;
+  bool emit_unrolled_ = false;
 };
 
 
@@ -534,21 +558,22 @@ struct TORCH_API IterableTree : SugaredValue {
 
   void addChild(const SourceRange& range, IterableValuePtr iter_value) {
     auto child_len = iter_value->getLen();
-    auto child_static = iter_value->staticFor();
+    auto child_unrolled = iter_value->emitUnrolled();
     if (children_.size() == 0) {
       static_len_ = child_len;
-      emit_statically_ = child_static;
+      emit_unrolled_ = child_unrolled;
     } else {
-      if ((emit_statically_ && !child_len) ||
-          (child_static && !static_len_)) {
+      if ((emit_unrolled_ && !child_len) ||
+          (child_unrolled && !static_len_)) {
         throw ErrorReport(range)
             << "Can not iterate over a module list with a value"
                "with a length that can not be statically determined\n";
       }
       if (child_len && static_len_) {
+        // iterables run for the minimum length of all its leaves
         static_len_ = std::min(*child_len, *static_len_);
       }
-      emit_statically_ = emit_statically_ || child_static;
+      emit_unrolled_ = emit_unrolled_ || child_unrolled;
     }
 
     children_.push_back(iter_value->getValue());
@@ -562,8 +587,8 @@ struct TORCH_API IterableTree : SugaredValue {
     return static_len_;
   }
 
-  bool emitStatically() const {
-    return emit_statically_;
+  bool emitUnrolled() const {
+    return emit_unrolled_;
   }
 
   // given a IterableTree node, get all the base iterables/leaves under the
@@ -577,7 +602,7 @@ struct TORCH_API IterableTree : SugaredValue {
 
  private:
   c10::optional<int64_t> static_len_ = c10::nullopt;
-  bool emit_statically_ = false;
+  bool emit_unrolled_ = false;
   std::vector<SugaredValuePtr> children_;
 };
 

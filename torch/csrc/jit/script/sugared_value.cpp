@@ -318,6 +318,43 @@ SugaredValuePtr SimpleValue::getitem(const SourceRange& loc, Function& m, Value*
   }
 }
 
+IterableValuePtr SimpleValue::asIterable(
+    const SourceRange& loc,
+    Function& m) {
+  auto value = getValue();
+  auto type = value->type();
+  // built-in iterable types
+  if (type->cast<ListType>() || type->cast<StringType>() ||
+      type->cast<TensorType>()) {
+    return std::make_shared<IterableValue>(std::make_shared<SimpleValue>(value));
+  }
+  // dicts iterate over keys
+  if (type->cast<DictType>()) {
+    return std::make_shared<IterableValue>(std::make_shared<SimpleValue>(
+        m.graph()->insert(aten::keys, {value}, {}, loc)));
+  }
+  // we allow iteration over tuples if their types can be unified
+  if (auto tup = type->cast<TupleType>()) {
+    auto tuple_type = unifyTypeList(tup->elements());
+    if (!tuple_type) {
+      throw ErrorReport(loc)
+          << "Heterogenous tuples cannot be iterated over. Found "
+          << type->python_str();
+    }
+    int64_t static_len = tup->elements().size();
+    return std::make_shared<IterableValue>(
+        std::make_shared<SimpleValue>(
+            m.graph()
+                ->createList(*tuple_type, createTupleUnpack(value))
+                ->output()),
+        static_len);
+  } else {
+    throw ErrorReport(loc) << "'" << type->python_str() << "'"
+                         << " object is not iterable";
+  }
+}
+
+
 RangeValue::RangeValue(
     const SourceRange& loc,
     Function& m,
@@ -425,52 +462,19 @@ SugaredValuePtr IterableTree::getitem(const SourceRange& loc, Function& m, Value
   for (const SugaredValuePtr& child : children_) {
     child_items.emplace_back(child->getitem(loc, m, idx));
   }
-  return std::make_shared<SugaredTupleValue>(child_items);
+  return std::make_shared<SugaredTupleValue>(child_items, emit_unrolled_);
 }
 
 IterableValuePtr asIterable(
     const SourceRange& loc,
     Function& m,
     SugaredValuePtr sv) {
-  auto simple_value = std::dynamic_pointer_cast<SimpleValue>(sv);
-  if (simple_value) {
-    auto value = simple_value->getValue();
-    auto type = value->type();
-    // built-in iterable types
-    if (type->cast<ListType>() || type->cast<StringType>() ||
-        type->cast<TensorType>()) {
-      return std::make_shared<IterableValue>(std::make_shared<SimpleValue>(value));
-    }
-    // dicts iterate over keys
-    if (type->cast<DictType>()) {
-      return std::make_shared<IterableValue>(std::make_shared<SimpleValue>(
-          m.graph()->insert(aten::keys, {value}, {}, loc)));
-    }
-    // we allow iteration over tuples if their types can be unified
-    if (auto tup = type->cast<TupleType>()) {
-      auto tuple_type = unifyTypeList(tup->elements());
-      if (!tuple_type) {
-        throw ErrorReport(loc)
-            << "Heterogenous tuples cannot be iterated over. Found "
-            << type->python_str();
-      }
-      int64_t static_len = tup->elements().size();
-      return std::make_shared<IterableValue>(
-          std::make_shared<SimpleValue>(
-              m.graph()
-                  ->createList(*tuple_type, createTupleUnpack(value))
-                  ->output()),
-          static_len);
-    } else {
-      throw ErrorReport(loc) << "'" << type->python_str() << "'"
-                           << " object is not iterable";
-    }
-  }
-  auto range_value = std::dynamic_pointer_cast<RangeValue>(sv);
-  if (range_value) {
+  // RangeValue and IterableValue are handled here because they just return themselves,
+  // TODO figure out enable_shared_from_this or better code structure
+  if (auto range_value = std::dynamic_pointer_cast<RangeValue>(sv)) {
     return std::make_shared<IterableValue>(std::shared_ptr<RangeValue>(range_value), range_value->staticLen());
   } else if (auto iter_tree = std::dynamic_pointer_cast<IterableTree>(sv)) {
-    return std::make_shared<IterableValue>(std::shared_ptr<IterableTree>(iter_tree), iter_tree->staticLen(), iter_tree->emitStatically());
+    return std::make_shared<IterableValue>(std::shared_ptr<IterableTree>(iter_tree), iter_tree->staticLen(), iter_tree->emitUnrolled());
   } else {
     return sv->asIterable(loc, m);
   }

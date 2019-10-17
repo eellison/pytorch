@@ -1639,13 +1639,15 @@ struct to_ir {
     SugaredValuePtr sv = emitSugaredExpr(itrs[0], 1);
     IterableValuePtr iterable = asIterable(loc, method, sv);
 
-    // We unroll the loop for iterables that contain ModuleLists because
-    // the list can contain different types.
+    // We unroll the loop for iterables that contain ModuleLists so that we can
+    // compile Heterogenous module lists.
     // In order to support ModuleLists which return different types,
-    // we do not push a new environment frame because if we did they would have
-    // to subtype the value in the existing frame.
+    // as with an nn.Sequential which has a module that returns a Dict and then
+    // a module which returns a Tensor,
+    // we do not push a new environment frame because if we did all intermediary
+    // values would have to subtype the input type.
 
-    if (!iterable->staticFor()) {
+    if (!iterable->emitUnrolled()) {
       return emitLoopCommon(loc, body, iterable->getValue(), targets, {});
     }
     TORCH_INTERNAL_ASSERT(iterable->getLen(), "Static For should have defined length");
