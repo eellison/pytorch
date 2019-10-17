@@ -296,7 +296,6 @@ IterableValuePtr ModuleValue::desugarModuleContainer(
     bool get_values,
     const SourceRange& loc,
     Function& m) {
-  TORCH_INTERNAL_ASSERT(get_keys || get_values);
   std::vector<std::string> submoduleNames;
   const auto& selfType = concreteType_->getJitType();
   for (size_t i = 0; i < selfType->numAttributes(); ++i) {
@@ -333,13 +332,15 @@ IterableValuePtr ModuleValue::desugarModuleContainer(
     return std::make_shared<SugaredTupleValue>(keys, true)->asIterable(loc, m);
   } else if (get_values && !get_keys) {
     return std::make_shared<SugaredTupleValue>(values, true)->asIterable(loc, m);
-  } else {
+  } else if (get_values && get_keys) {
     auto key_list = std::make_shared<IterableValue>(std::make_shared<SugaredTupleValue>(keys, true), len, contains_module_list);
     auto value_list = std::make_shared<IterableValue>(std::make_shared<SugaredTupleValue>(values, true), len, contains_module_list);
     auto iterator = std::make_shared<IterableTree>();
     iterator->addChild(loc, key_list);
     iterator->addChild(loc, value_list);
     return iterator->asIterable(loc, m);
+  } else {
+    TORCH_INTERNAL_ASSERT(false);
   }
 }
 
