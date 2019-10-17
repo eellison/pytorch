@@ -2488,12 +2488,12 @@ struct to_ir {
         SugaredValuePtr range_sv =
             std::make_shared<RangeValue>(loc, method, range_inputs);
         SugaredValuePtr expr_sv = emitSugaredExpr(inputs[0], 1);
-        auto iterable = expr_sv->asIterable(loc, method);
+        auto iterable_value = expr_sv->asIterable(loc, method);
         // range should have the same static length as the other iterable
-        auto range = std::make_shared<IterableValue>(range_sv, iterable->getLen());
+        auto range_value = std::make_shared<IterableValue>(range_sv, iterable_value->getLen());
         auto tree = std::make_shared<IterableTree>();
-        tree->addChild(loc, iterable);
-        tree->addChild(loc, iterable);
+        tree->addChild(loc, range_value);
+        tree->addChild(loc, iterable_value);
         return tree;
       }
       case prim::zip: {

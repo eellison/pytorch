@@ -465,6 +465,29 @@ SugaredValuePtr IterableTree::getitem(const SourceRange& loc, Function& m, Value
   return std::make_shared<SugaredTupleValue>(child_items, emit_unrolled_);
 }
 
+void IterableTree::addChild(const SourceRange& range, IterableValuePtr iter_value) {
+  auto child_len = iter_value->getLen();
+  auto child_unrolled = iter_value->emitUnrolled();
+  if (children_.size() == 0) {
+    static_len_ = child_len;
+    emit_unrolled_ = child_unrolled;
+  } else {
+    if ((emit_unrolled_ && !child_len) ||
+        (child_unrolled && !static_len_)) {
+      throw ErrorReport(range)
+          << "Can not iterate over a module list with a value "
+             "that does not have a statically determinable length\n";
+    }
+    if (child_len && static_len_) {
+      // iterables run for the minimum length of all its leaves
+      static_len_ = std::min(*child_len, *static_len_);
+    }
+    emit_unrolled_ = emit_unrolled_ || child_unrolled;
+  }
+
+  children_.push_back(iter_value->getValue());
+}
+
 std::shared_ptr<SugaredValue> MagicMethod::call(
     const SourceRange& loc,
     Function& m,

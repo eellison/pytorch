@@ -534,6 +534,9 @@ private:
 // (a, (range(0, math.inf, 1), b), range(0, 100))
 // We use those base iterables to fill in the loop information like
 // max_trip_count and set the value table for loop targets
+// Iterables can contain lists of SugaredValues like ModuleLists. If it
+// does, then we emit it unrolled and require that all values it contains
+// have a statically-determinable length.
 struct TORCH_API IterableTree : SugaredValue {
   IterableTree() = default;
   IterableTree(const SourceRange& range, at::ArrayRef<IterableValuePtr> children) {
@@ -549,28 +552,7 @@ struct TORCH_API IterableTree : SugaredValue {
     return std::make_shared<IterableValue>(shared_from_this(), static_len_, emit_unrolled_);
   }
 
-  void addChild(const SourceRange& range, IterableValuePtr iter_value) {
-    auto child_len = iter_value->getLen();
-    auto child_unrolled = iter_value->emitUnrolled();
-    if (children_.size() == 0) {
-      static_len_ = child_len;
-      emit_unrolled_ = child_unrolled;
-    } else {
-      if ((emit_unrolled_ && !child_len) ||
-          (child_unrolled && !static_len_)) {
-        throw ErrorReport(range)
-            << "Can not iterate over a module list with a value "
-               "that does not have a statically determinable length\n";
-      }
-      if (child_len && static_len_) {
-        // iterables run for the minimum length of all its leaves
-        static_len_ = std::min(*child_len, *static_len_);
-      }
-      emit_unrolled_ = emit_unrolled_ || child_unrolled;
-    }
-
-    children_.push_back(iter_value->getValue());
-  }
+  void addChild(const SourceRange& range, IterableValuePtr iter_value);
 
   std::vector<SugaredValuePtr> get_children() {
     return children_;
