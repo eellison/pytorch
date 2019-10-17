@@ -10989,11 +10989,12 @@ a")
             def forward(self, thing):
                 return thing * 2
 
-        class Mod(torch.nn.Module):
+        # zipping over two
+        class ZipModLists(torch.nn.Module):
             __constants__ = ['mods', 'mods2']
 
             def __init__(self, mods, mods2):
-                super(Mod, self).__init__()
+                super(ZipModLists, self).__init__()
                 self.mods = mods
                 self.mods2 = mods2
 
@@ -11004,11 +11005,36 @@ a")
                     iter += 1
                 return x, iter
 
+        class ZipWithValues(torch.nn.Module):
+            __constants__ = ['mods', 'mods2', 'tup']
+
+            def __init__(self, mods, mods2):
+                super(ZipWithValues, self).__init__()
+                self.mods = mods
+                self.mods2 = mods2
+                self.tup = list(range(len(mods2) + 1))
+
+            def forward(self, x):
+                iter = 0
+                tup = self.tup
+                print(tup)
+                for mod1, mod2 in zip(self.tup, self.mods, self.mods2):
+                    x = mod2(mod1(x))
+                    iter += 1
+                return x, iter
+
+
         mods = nn.ModuleList([Double()]), nn.ModuleList([Double(), Sub(), Sub()]), nn.ModuleList([Sub(), Double()])
+        mod_me = ZipWithValues(mods[0], mods[1])
+        mod = torch.jit.script(mod_me)
+        print(mod.graph)
+
         for i in range(len(mods)):
             for j in range(len(mods)):
-                mod = Mod(mods[i], mods[j])
+                mod = ZipModLists(mods[i], mods[j])
                 self.checkModule(mod, (torch.tensor(.5),))
+                mod2 = ZipWithValues(mods[i], mods[j])
+                self.checkModule(mod2, (torch.tensor(.5),))
 
 
     def test_enumerate_modlist_range(self):
@@ -11051,43 +11077,6 @@ a")
 
         with self.assertRaisesRegex(Exception, "that does not have a statically determinable length"):
             torch.jit.script(Mod3())
-
-    def test_elias(self):
-        class Sub(torch.nn.Module):
-            def __init__(self):
-                super(Sub, self).__init__()
-
-            def forward(self, thing):
-                return thing + 2
-
-        class Add(torch.nn.Module):
-            def __init__(self):
-                super(Add, self).__init__()
-
-            def forward(self, thing):
-                return thing + 2
-
-        class Mod(torch.nn.Module):
-            __constants__ = ['mods', 'mods2']
-
-            def __init__(self):
-                super(Mod, self).__init__()
-                self.mods = nn.ModuleList([Sub() for i in range(10)])
-                self.mods2 = nn.ModuleList([Add() for i in range(9)])
-
-            def forward(self, v):
-                me = 0
-                iter = 0
-                for m1, m2, m3 in zip(self.mods, self.mods2, (1, 1, 1, 1)):
-                    print(m1)
-                    print(m2)
-                    iter += 1
-                print("NUMBER ITERS", iter)
-                return v
-
-        out = torch.jit.script(Mod())
-        print(out(torch.tensor(0.0)))
-
 
     def test_for_in_enumerate(self):
         def fn(x):
