@@ -400,12 +400,8 @@ RangeValue::RangeValue(
 }
 
 IterableValuePtr RangeValue::asIterable(const SourceRange& loc, Function& m) {
-  return std::make_shared<IterableValue>(shared_from_this(), staticLen());
+  return std::make_shared<IterableValue>(shared_from_this(), static_len_);
 };
-
-c10::optional<int64_t> RangeValue::staticLen() {
-  return static_len_;
-}
 
 Value* RangeValue::len(const SourceRange& loc, Function& m) {
   if (has_only_end_) {

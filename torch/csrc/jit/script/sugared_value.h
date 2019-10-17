@@ -106,7 +106,7 @@ struct TORCH_API SugaredValue
                            << " object is not iterable";
   }
   // expression for ith elemement for iterable value
-  virtual SugaredValuePtr getitem(const SourceRange& loc, Function& m, Value* idx) {
+  virtual std::shared_ptr<SugaredValue> getitem(const SourceRange& loc, Function& m, Value* idx) {
     throw ErrorReport(loc) << "'" << kind() << "'"
                            << " object is not subscriptable";
   }
@@ -171,7 +171,6 @@ struct TORCH_API BuiltinFunction : public SugaredValue {
 
   // if this is method, then this is the self argument.
   c10::optional<NamedValue> self;
-
   std::string kind() const override {
     return "builtin";
   }
@@ -480,10 +479,7 @@ struct TORCH_API RangeValue : SugaredValue {
     return "range";
   }
   Value* len(const SourceRange& loc, Function& m) override;
-  c10::optional<int64_t> staticLen();
-
   SugaredValuePtr getitem(const SourceRange& loc, Function& m, Value* idx) override;
-
   IterableValuePtr asIterable(const SourceRange& loc, Function& m) override;
 
  private:
@@ -497,7 +493,6 @@ struct TORCH_API RangeValue : SugaredValue {
   bool has_only_end_;
   c10::optional<int64_t> static_len_;
 };
-
 
 // We handle iteration over Module Containers by unrolling the for loop over each value.
 // As a result we need to statically know the number of elements of the iterable.
@@ -529,7 +524,6 @@ private:
   c10::optional<int64_t> len_;
   bool emit_unrolled_ = false;
 };
-
 
 // Specialized Tree structure to matched against for special handling
 // of builtin functions iterables expressions like zip(), enumerate(), etc.
