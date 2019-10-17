@@ -327,21 +327,19 @@ IterableValuePtr ModuleValue::desugarModuleContainer(
     }
   }
 
-  bool unroll = true;
+  bool contains_module_list = true;
   int64_t len = submoduleNames.size();
-  if (get_keys) {
-    return std::make_shared<IterableValue>(
-        std::make_shared<SugaredTupleValue>(keys, true), len, unroll);
-  } else if (get_values) {
-    return std::make_shared<IterableValue>(
-        std::make_shared<SugaredTupleValue>(values, true), len, unroll);
+  if (get_keys && !get_values) {
+    return std::make_shared<SugaredTupleValue>(keys, true)->asIterable(loc, m);
+  } else if (get_values && !get_keys) {
+    return std::make_shared<SugaredTupleValue>(values, true)->asIterable(loc, m);
   } else {
-    auto key_list = std::make_shared<IterableValue>(std::make_shared<SugaredTupleValue>(keys, true), len, unroll);
-    auto value_list = std::make_shared<IterableValue>(std::make_shared<SugaredTupleValue>(values, true), len, unroll);
+    auto key_list = std::make_shared<IterableValue>(std::make_shared<SugaredTupleValue>(keys, true), len, contains_module_list);
+    auto value_list = std::make_shared<IterableValue>(std::make_shared<SugaredTupleValue>(values, true), len, contains_module_list);
     auto iterator = std::make_shared<IterableTree>();
     iterator->addChild(loc, key_list);
     iterator->addChild(loc, value_list);
-    return std::make_shared<IterableValue>(iterator, len, unroll);
+    return iterator->asIterable(loc, m);
   }
 }
 
