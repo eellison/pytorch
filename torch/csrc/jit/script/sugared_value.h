@@ -485,6 +485,8 @@ struct TORCH_API RangeValue : SugaredValue {
 
   SugaredValuePtr getitem(const SourceRange& loc, Function& m, Value* idx) override;
 
+  IterableValuePtr asIterable(const SourceRange& loc, Function& m) override;
+
  private:
   Value* start_;
   Value* end_;
@@ -530,12 +532,6 @@ private:
 };
 
 
-IterableValuePtr asIterable(
-    const SourceRange& loc,
-    Function& m,
-    SugaredValuePtr sv);
-
-
 // Specialized Tree structure to matched against for special handling
 // of builtin functions iterables expressions like zip(), enumerate(), etc.
 // zip and enumerate can be modeled as a tree of SimpleValue/RangeValue:
@@ -554,6 +550,10 @@ struct TORCH_API IterableTree : SugaredValue {
   }
   std::string kind() const override {
     return "iterabletree";
+  }
+
+  IterableValuePtr asIterable(const SourceRange& loc, Function& m) override {
+    return std::make_shared<IterableValue>(shared_from_this(), static_len_, emit_unrolled_);
   }
 
   void addChild(const SourceRange& range, IterableValuePtr iter_value) {

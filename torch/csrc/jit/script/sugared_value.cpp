@@ -399,6 +399,10 @@ RangeValue::RangeValue(
   }
 }
 
+IterableValuePtr RangeValue::asIterable(const SourceRange& loc, Function& m) {
+  return std::make_shared<IterableValue>(shared_from_this(), staticLen());
+};
+
 c10::optional<int64_t> RangeValue::staticLen() {
   return static_len_;
 }
@@ -463,21 +467,6 @@ SugaredValuePtr IterableTree::getitem(const SourceRange& loc, Function& m, Value
     child_items.emplace_back(child->getitem(loc, m, idx));
   }
   return std::make_shared<SugaredTupleValue>(child_items, emit_unrolled_);
-}
-
-IterableValuePtr asIterable(
-    const SourceRange& loc,
-    Function& m,
-    SugaredValuePtr sv) {
-  // RangeValue and IterableValue are handled here because they just return themselves,
-  // TODO figure out enable_shared_from_this or better code structure
-  if (auto range_value = std::dynamic_pointer_cast<RangeValue>(sv)) {
-    return std::make_shared<IterableValue>(std::shared_ptr<RangeValue>(range_value), range_value->staticLen());
-  } else if (auto iter_tree = std::dynamic_pointer_cast<IterableTree>(sv)) {
-    return std::make_shared<IterableValue>(std::shared_ptr<IterableTree>(iter_tree), iter_tree->staticLen(), iter_tree->emitUnrolled());
-  } else {
-    return sv->asIterable(loc, m);
-  }
 }
 
 std::shared_ptr<SugaredValue> MagicMethod::call(

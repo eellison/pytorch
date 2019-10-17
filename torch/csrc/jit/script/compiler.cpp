@@ -1637,7 +1637,7 @@ struct to_ir {
     // Emit loop information for builtinFunction values like range(), zip(),
     // enumerate() or SimpleValue like List, Tensor, Dict, etc.
     SugaredValuePtr sv = emitSugaredExpr(itrs[0], 1);
-    IterableValuePtr iterable = asIterable(loc, method, sv);
+    IterableValuePtr iterable = sv->asIterable(loc, method);
 
     // We unroll the loop for iterables that contain ModuleLists so that we can
     // compile Heterogenous module lists.
@@ -2488,7 +2488,7 @@ struct to_ir {
         SugaredValuePtr range_sv =
             std::make_shared<RangeValue>(loc, method, range_inputs);
         SugaredValuePtr expr_sv = emitSugaredExpr(inputs[0], 1);
-        auto iterable = asIterable(loc, method, expr_sv);
+        auto iterable = expr_sv->asIterable(loc, method);
         // range should have the same static length as the other iterable
         auto range = std::make_shared<IterableValue>(range_sv, iterable->getLen());
         auto tree = std::make_shared<IterableTree>();
@@ -2506,7 +2506,7 @@ struct to_ir {
         }
         auto iterable_tree = std::make_shared<IterableTree>();
         for (Expr expr : inputs) {
-          auto iterable = asIterable(apply.range(), method, emitSugaredExpr(expr, 1));
+          auto iterable = emitSugaredExpr(expr, 1)->asIterable(apply.range(), method);
           iterable_tree->addChild(apply.range(), iterable);
         }
         return iterable_tree;
