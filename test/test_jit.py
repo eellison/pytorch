@@ -10024,8 +10024,6 @@ a")
         f = test()
         # no failure
         g = torch.jit.trace(f, (torch.zeros(1, 1, 28, 28),))
-        import pdb; pdb.set_trace()
-
         x = torch.zeros(1, 1, 14, 14)
         # constants not baked in
         self.assertEqual(g(x), f(x))
@@ -10976,6 +10974,65 @@ a")
                 for i in range(.5):
                     print(i)
 
+    def test_enumerate_modulelist(self):
+        class Sub(torch.nn.Module):
+            def __init__(self):
+                super(Sub, self).__init__()
+
+            def forward(self, thing):
+                return thing - 2
+
+        class Double(torch.nn.Module):
+            def __init__(self):
+                super(Double, self).__init__()
+
+            def forward(self, thing):
+                return thing * 2
+
+        class Mod(torch.nn.Module):
+            __constants__ = ['mods', 'mods2']
+
+            def __init__(self, mods, mods2):
+                super(Mod, self).__init__()
+                self.mods = mods
+                self.mods2 = mods2
+
+            def forward(self, x):
+                iter = 0
+                for mod1, mod2 in zip(self.mods, self.mods2):
+                    x = mod2(mod1(x))
+                    iter += 1
+                return x, iter
+
+        mods = nn.ModuleList([Double()]), nn.ModuleList([Double(), Sub(), Sub()]), nn.ModuleList([Sub(), Double()])
+        for i in range(len(mods)):
+            for j in range(len(mods)):
+                mod = Mod(mods[i], mods[j])
+                self.checkModule(mod, (torch.tensor(.5),))
+
+
+    def test_enumerate_modlist_range(self):
+        class Double(torch.nn.Module):
+            def forward(self, thing):
+                return thing * 2
+
+        class Mod(torch.nn.Module):
+            __constants__ = ['mods']
+
+            def __init__(self):
+                super(Mod, self).__init__()
+                self.mods = nn.ModuleList([Double(), Double()])
+
+            def forward(self, x):
+                iter = 0
+                for val, mod in zip(range(5), self.mods):
+                    x = mod(x) * val
+                    iter += 1
+                return x, iter
+
+        self.checkModule(Mod(), (torch.tensor(.5),))
+
+
     def test_elias(self):
         class Sub(torch.nn.Module):
             def __init__(self):
@@ -11002,7 +11059,7 @@ a")
             def forward(self, v):
                 me = 0
                 iter = 0
-                for m1, m2, m3, m4 in zip(self.mods, self.mods2, (1, 1, 1, 1), [1, 5]):
+                for m1, m2, m3 in zip(self.mods, self.mods2, (1, 1, 1, 1)):
                     print(m1)
                     print(m2)
                     iter += 1
