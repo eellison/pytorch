@@ -319,9 +319,7 @@ IterableValuePtr ModuleValue::desugarModuleContainer(
     bool get_values,
     const SourceRange& loc,
     Function& m) {
-
   TORCH_INTERNAL_ASSERT(get_keys || get_values);
-
   std::vector<std::string> submoduleNames;
   const auto& selfType = concreteType_->getJitType();
   for (size_t i = 0; i < selfType->numAttributes(); ++i) {

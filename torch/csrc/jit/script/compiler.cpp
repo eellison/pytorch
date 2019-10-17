@@ -1547,14 +1547,6 @@ struct to_ir {
     emitIfElseBlocks(
         stmt.range(), cond_value, stmt.trueBranch(), stmt.falseBranch());
   }
-  //
-  void emitLoopCommon(
-      SourceRange range,
-      std::function<void()> emit_body,
-      const SugaredValuePtr& iter_val,
-      c10::optional<List<Expr>> targets,
-      c10::optional<Expr> cond) {
-  }
 
   // *********************** Loop Operators ************************************
   // Emits a loop operator with the form:

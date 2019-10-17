@@ -354,15 +354,9 @@ RangeValue::RangeValue(
                            << inputs.size();
   }
 
-
   // TODO: !has_only_end calculation
-  if (has_only_end_) {
-    auto len = toIValue(end_);
-    if (len) {
-      static_len_ = len->toInt();
-    } else {
-      static_len_ = c10::nullopt;
-    }
+  if (has_only_end_ && toIValue(end_)) {
+    static_len_ = toIValue(end_)->toInt();
   } else {
     static_len_ = c10::nullopt;
   }
