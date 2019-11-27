@@ -15198,6 +15198,12 @@ a")
         with self.assertRaisesRegex(Exception, "Parameters not specified on the overloaded declaration must have a type annotation"):
             torch.jit.script(test)
 
+    def test_function_compilation_caching(self):
+        def fun():
+            return 1 + 2
+
+        self.assertIs(torch.jit.script(fun), torch.jit.script(fun))
+
 
     def test_function_overloading_isinstance(self):
         @torch.jit._overload  # noqa: F811
