@@ -7604,6 +7604,29 @@ a")
         b_script.backward()
         self.assertEqual(a.grad, a_script.grad)
 
+    @_tmp_donotuse_dont_inline_everything
+    def test_elias(self):
+        class Mod(torch.nn.Module):
+            def __init__(self):
+                super(Mod, self).__init__()
+                self.hi = torch.tensor(2)
+                self.me = (torch.tensor(2), torch.tensor(2))
+
+            def forward(self, thing):
+                return self.hi * thing + self.me[0] + self.me[1]
+
+        class Sub(torch.nn.Module):
+            def __init__(self):
+                super(Sub, self).__init__()
+                self.mod = Mod()
+
+            def forward(self, thing):
+                return self.mod(thing) * 2
+
+        mod = torch.jit.script(Sub())
+        self.run_pass('constant_propagation', mod.forward.graph)
+
+
     def test_torch_tensor_as_tensor(self):
         tensor_template = dedent('''
         def func():
