@@ -377,6 +377,8 @@ def ignore(drop=False, **kwargs):
         fn._torchscript_modifier = FunctionModifiers.IGNORE
         return fn
 
+    import pdb; pdb.set_trace()
+
     if not isinstance(drop, bool):
         raise RuntimeError("Argument to @torch.jit.ignore must be a bool or "
                            "a function but got {}".format(drop))
@@ -513,8 +515,15 @@ def _get_overloaded_methods(method, mod_class):
     # TODO: __name__ not set for submodules in recursive script
     if not hasattr(method, "__name__"):
         return None
-    qual_name = _qualified_name(method)
-    class_name_map = _overloaded_methods.get(qual_name, None)
+    method_qual_name = _qualified_name(method)
+    if "Inherited" in repr(mod_class) and "forward" in repr(method):
+        import pdb; pdb.set_trace()
+
+    method_resolution_order = mod_class.mro()
+    for m_class in method_resolution_order:
+        print(m_class)
+
+    class_name_map = _overloaded_methods.get(method_qual_name, None)
     if class_name_map is None:
         return None
     overloads = class_name_map.get(mod_class.__name__, None)

@@ -396,6 +396,10 @@ def get_overload_annotations(mod):
     overloads = {}
 
     for name in dir(type(mod)):
+
+        if "Inherited" in repr(mod) and "forward" == name:
+            import pdb; pdb.set_trace()
+
         item = getattr(mod, name, None)
         if not callable(item):
             continue
@@ -405,7 +409,8 @@ def get_overload_annotations(mod):
             method_overloads = _jit_internal._get_overloaded_methods(item, mod.__class__)
             if method_overloads is None:
                 continue
-
+            # import pdb; pdb.set_trace()
+            _jit_internal._get_overloaded_methods(item, mod.__class__)
             names = [name + "__" + str(i) for i in range(len(method_overloads))]
             overloads[item] = list(zip(names, method_overloads))
 

@@ -15685,6 +15685,19 @@ a")
                 else:
                     return x[0] + 5
 
+        class Inherited(Over):
+            def __init__(self):
+                super(Inherited, self).__init__()
+
+            # @torch.jit.export
+            # def hi(self, x):
+            #     return self.forward((x, x))
+
+        print(torch.jit.script(Over()))
+        print(torch.jit.script(Inherited()).forward.graph)
+        return
+
+
         class S(torch.jit.ScriptModule):
             def __init__(self):
                 super(S, self).__init__()
