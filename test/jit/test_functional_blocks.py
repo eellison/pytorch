@@ -21,6 +21,33 @@ if __name__ == '__main__':
                        "instead.")
 
 class TestFunctionalBlocks(JitTestCase):
+    def test_elias(self):
+        from typing import NamedTuple
+        import torch
+        from torch import nn
+
+        class TestType(NamedTuple):
+            x: int
+            y: int
+
+        class Model(nn.Module):
+            # config: TestType
+            def __init__(self, config):
+                super().__init__()
+                self.config = config
+
+            def forward(self):
+                return TestType(1, 2)
+                # if config.x > 0:
+                #     return x
+                # else:
+                #     return x
+
+        config = TestType(x=1, y=1)
+        model = Model(config)
+        print(torch.jit.script(model).code)
+
+
     def test_simple_no_merge(self):
         # o: autodiff supported. x: not autodiff supported.
         # o --> x
@@ -32,7 +59,6 @@ class TestFunctionalBlocks(JitTestCase):
             z = z * z
             y = y * z
             return x + y + z
-            return
 
         graph = torch.jit.script(fn).graph
         self.run_pass('create_functional_blocks', graph)

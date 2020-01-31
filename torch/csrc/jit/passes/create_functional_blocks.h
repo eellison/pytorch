@@ -10,8 +10,8 @@ namespace jit {
 // // subgraphs that are differentiable by the jit's autodiff passes
 // // threshold - minimum number of nodes that will appear in a block
 // // returns all differentiable blocks that have been found
-// TORCH_API void CreateFunctionalBlocks(
-//     const std::shared_ptr<Graph>& graph);
+TORCH_API void CreateFunctionalBlocks(
+    const std::shared_ptr<Graph>& graph);
 
 } // namespace jit
 } // namespace torch

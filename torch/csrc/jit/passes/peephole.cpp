@@ -492,10 +492,9 @@ private:
     auto reverse_iter = block->nodes().reverse();
 
     Node * last_functional_node = graph_->insertNode(graph_->createWithSubgraph(prim::FunctionalBlock));
-    std::vector<std::pair<Node*, std::unordered_set<Node*>>>
-        functional_block_sets;
-    std::unordered_set<Node*> contained_nodes;
-    Node* moveBeforePoint = block->return_node();
+    std::vector<std::pair<Node *, std::unordered_set<Node *>>> functional_block_sets;
+    std::unordered_set<Node *> contained_nodes;
+    Node * moveBeforePoint = block->return_node();
     bool seen_escape_value = false;
     // output of the new subgraph IFF the added node outputs
     // has uses outside of the nodes contained in the current subgraph
@@ -513,10 +512,9 @@ private:
       if (functional_nodes_.count(n)) {
         if (aliasDb_->couldMoveBeforeTopologically(n, moveBeforePoint)) {
           auto outputs = n->outputs();
-          bool has_escape_value =
-              std::any_of(outputs.begin(), outputs.end(), [&](Value* output) {
-                return aliasDb_->escapesScope(output);
-              });
+          bool has_escape_value = std::any_of(outputs.begin(), outputs.end(), [&](Value * output) {
+            return aliasDb_->escapesScope(output);
+          });
           if (!(seen_escape_value && has_escape_value)) {
             moveBeforePoint = n;
             contained_nodes.insert(n);
@@ -526,11 +524,9 @@ private:
         }
 
         // fallthrough
-        functional_block_sets.emplace_back(
-            last_functional_node, contained_nodes);
+        functional_block_sets.emplace_back(last_functional_node, contained_nodes);
         contained_nodes = {n};
-        last_functional_node =
-            graph_->createWithSubgraph(prim::FunctionalBlock)->insertAfter(n);
+        last_functional_node = graph_->createWithSubgraph(prim::FunctionalBlock)->insertAfter(n);
         moveBeforePoint = n;
       }
     }
@@ -538,28 +534,25 @@ private:
     functional_block_sets.emplace_back(last_functional_node, contained_nodes);
     for (size_t i = 0; i < functional_block_sets.size(); ++i) {
       Node * functional_node;
-      std::unordered_set<Node*> contained_nodes;
+      std::unordered_set<Node *> contained_nodes;
       std::tie(functional_node, contained_nodes) = functional_block_sets[i];
-      std::vector<Node*> ordered_nodes(
-          contained_nodes.begin(), contained_nodes.end());
-      std::sort(
-          ordered_nodes.begin(), ordered_nodes.end(), [](Node* a, Node* b) {
-            return a->isAfter(b);
-          });
+      std::vector<Node *> ordered_nodes(contained_nodes.begin(), contained_nodes.end());
+      std::sort(ordered_nodes.begin(), ordered_nodes.end(), [](Node * a, Node * b) {
+        return a->isAfter(b);
+      });
       if (contained_nodes.size() == 0) {
         functional_node->destroy();
       }
-      for (Node* n : ordered_nodes) {
+      for (Node * n: ordered_nodes) {
         SubgraphUtils::mergeNodeIntoSubgraph(n, functional_node);
       }
     }
   }
 
-  bool newAlias(Value* v) {
-    // it's an builtin op we can reason and the inputs dont alias or contain
-    // alias to the output
-    return v->node()->kind().is_aten() &&
-        aliasDb_->mayContainAlias(v, v->node()->inputs());
+  bool newAlias(Value * v) {
+    // it's an builtin op we can reason and the inputs dont alias or contain alias
+    // to the output
+    return v->node()->kind().is_aten() && aliasDb_->mayContainAlias(v, v->node()->inputs());
   }
 
   bool Functionalize(Node* n) {
@@ -575,10 +568,9 @@ private:
       functional_blocks = functional_blocks && functional_block;
     }
     auto inputs = n->inputs();
-    bool functional_inputs =
-        std::all_of(inputs.begin(), inputs.end(), [&](Value* v) {
-          return !aliasDb_->hasWriters(v);
-        });
+    bool functional_inputs = std::all_of(inputs.begin(), inputs.end(), [&](Value* v) {
+      return !aliasDb_->hasWriters(v);
+    });
     if (functional_outputs && functional_blocks && functional_inputs) {
       functional_nodes_.insert(n);
       return true;
@@ -615,19 +607,19 @@ private:
   std::unordered_set<Node *> functional_producer_;
   std::unordered_set<Node *> functional_nodes_;
   std::unordered_set<Value *> functional_values_;
-  std::unordered_set<Value*> escape_values_;
+  std::unordered_set<Value *> escape_values_;
   std::shared_ptr<Graph> graph_;
   std::unique_ptr<AliasDb> aliasDb_;
 };
 
 
-void CreateFunctionalBlocks(
-    const std::shared_ptr<Graph>& graph) {
-  ConstantPooling(graph);
-  Functionalizor func(graph);
-  func.run();
-}
-
+// void CreateFunctionalBlocks(
+//     const std::shared_ptr<Graph>& graph) {
+//   ConstantPooling(graph);
+//   Functionalizor func(graph);
+//   func.run();
+// }
+//
 
 
 

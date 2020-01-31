@@ -9,8 +9,8 @@
 #include <torch/csrc/utils/memory.h>
 #include <torch/csrc/jit/passes/constant_pooling.h>
 
-// namespace torch {
-// namespace jit {
+namespace torch {
+namespace jit {
 //
 // struct Functionalizor {
 //
@@ -136,12 +136,14 @@
 // };
 //
 //
-// void CreateFunctionalBlocks(
-//     const std::shared_ptr<Graph>& graph) {
+
+void CreateFunctionalBlocks(
+    const std::shared_ptr<Graph>& graph) {
+  std::cout << "HI ELIAS\n";
 //   ConstantPooling(graph);
 //   Functionalizor func(graph);
 //   func.run();
-// }
+}
 //
-// } // namespace jit
-// } // namespace torch
+} // namespace jit
+} // namespace torch
