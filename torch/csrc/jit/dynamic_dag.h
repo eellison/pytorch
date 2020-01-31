@@ -6,7 +6,8 @@
 #include <unordered_set>
 #include <vector>
 
-#include "torch/csrc/utils/functional.h"
+#include <ATen/core/functional.h>
+#include <c10/util/Optional.h>
 
 namespace torch { namespace jit { namespace detail {
 
@@ -98,7 +99,7 @@ struct visited_list {
   }
 
   void push_back(Vertex<T>* elt) {
-    JIT_ASSERT(!elt->visited_);
+    TORCH_INTERNAL_ASSERT(!elt->visited_);
     elt->visited_ = true;
     data_.push_back(elt);
   }
@@ -149,7 +150,7 @@ struct DynamicDAG {
   // max_size() >= the number of live vertices.
   // for all vertices v, v.ord < max_size()
   size_t max_size() const { return vertices_.size(); };
-  at::optional<Vertex<T>*> at(size_t ord) const;
+  c10::optional<Vertex<T>*> at(size_t ord) const;
 
   std::string toString();
 
@@ -193,9 +194,9 @@ Vertex<T>* DynamicDAG<T>::newVertex(T datum) {
 
 template <typename T>
 void DynamicDAG<T>::removeEdge(Vertex<T>* producer, Vertex<T>* consumer) {
-  JIT_ASSERT(producer != consumer);
-  JIT_ASSERT(producer->out_edges().contains(consumer));
-  JIT_ASSERT(consumer->in_edges().contains(producer));
+  TORCH_INTERNAL_ASSERT(producer != consumer);
+  TORCH_INTERNAL_ASSERT(producer->out_edges().contains(consumer));
+  TORCH_INTERNAL_ASSERT(consumer->in_edges().contains(producer));
   producer->out_edges().erase(consumer);
   consumer->in_edges().erase(producer);
 }
@@ -217,7 +218,7 @@ void DynamicDAG<T>::debugCheckInvariants() {
 }
 
 template <typename T>
-at::optional<Vertex<T>*> DynamicDAG<T>::at(size_t ord) const {
+c10::optional<Vertex<T>*> DynamicDAG<T>::at(size_t ord) const {
   const auto& vertex = vertices_.at(ord);
   if (!vertex) {
     return at::nullopt;
@@ -313,13 +314,13 @@ IOEdges<T> DynamicDAG<T>::removeVertex(Vertex<T>* v) {
  */
 template <typename T>
 void DynamicDAG<T>::addEdge(Vertex<T>* producer, Vertex<T>* consumer) {
-  JIT_ASSERT(producer != consumer);
+  TORCH_INTERNAL_ASSERT(producer != consumer);
 
   // NB: DynamicDAG is a simple graph. If an edge exists already, don't do anything.
   bool is_distinct = producer->out_edges().insert(consumer);
   if (!is_distinct) return;
   is_distinct = consumer->in_edges().insert(producer);
-  JIT_ASSERT(is_distinct);
+  TORCH_INTERNAL_ASSERT(is_distinct);
 
   if (producer->ord <= consumer->ord) {
     // topological ordering is already consistent, no need to update.
@@ -339,8 +340,12 @@ void DynamicDAG<T>::addEdge(Vertex<T>* producer, Vertex<T>* consumer) {
 
   // Search for vertices that can reach producer that have a now incorrect
   // topological ordering
-  JIT_ASSERT(!dfsSearch(DFSDirection::backward, producer, consumer,
-                        /*lower_bound=*/consumer->ord, deltaB));
+  TORCH_INTERNAL_ASSERT(!dfsSearch(
+      DFSDirection::backward,
+      producer,
+      consumer,
+      /*lower_bound=*/consumer->ord,
+      deltaB));
 
   // Reorder the vertices that are reachable from consumer to occur BEFORE
   // the vertices that can reach producer.
@@ -355,7 +360,7 @@ void DynamicDAG<T>::addEdge(Vertex<T>* producer, Vertex<T>* consumer) {
 // contractEdge is O(|AR| log |AR| * min(|out_edges(producer)|, |in_edges(consumer)|))
 template <typename T>
 bool DynamicDAG<T>::contractEdge(Vertex<T>* producer, Vertex<T>* consumer) {
-  JIT_ASSERT(producer != consumer);
+  TORCH_INTERNAL_ASSERT(producer != consumer);
   if (contractionProducesCycle(producer, consumer)) {
     return false;
   }
