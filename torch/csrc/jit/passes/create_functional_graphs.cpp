@@ -14,6 +14,10 @@ namespace jit {
 
 namespace {
 
+const static std::unordered_set<Symbol> skip_list = {
+    prim::BailoutTemplate,
+};
+
 struct FunctionalGraphSlicer {
   FunctionalGraphSlicer(std::shared_ptr<Graph> graph)
       : graph_(std::move(graph)) {}

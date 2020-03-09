@@ -17,7 +17,6 @@ _modules_containing_builtins = (torch, torch._C._nn)
 
 _builtin_ops = [
     # Pairs of (function, op_name)
-    (_list_with_default, "aten::list_with_default"),
     (_pair, "aten::_pair"),
     (_quadruple, "aten::_quadruple"),
     (_single, "aten::_single"),
