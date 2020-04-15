@@ -273,7 +273,8 @@ struct PeepholeOptimizeImpl {
         auto index = toIValue(node->inputs().at(1));
         if (auto ptt = node->inputs().at(0)->type()->cast<TensorType>()) {
           if (auto sizes = ptt->sizes().concrete_sizes()) {
-            if (index && index->toInt() >= 0 && index->toInt() < sizes->size()) {
+            if (index && index->toInt() >= 0 &&
+                index->toInt() < sizes->size()) {
               WithInsertPoint guard(node);
               IValue ival(sizes->at(index->toInt()));
               auto const_sizes_val = node->owningGraph()->insertConstant(ival);
@@ -488,17 +489,22 @@ struct PeepholeOptimizeImpl {
         node->output()->replaceAllUsesWith(node->input(0));
         changed_ = true;
       }
-    } else if (node->kind() == aten::len && node->inputs().at(0)->type()->cast<ListType>()) {
+    } else if (
+        node->kind() == aten::len &&
+        node->inputs().at(0)->type()->cast<ListType>()) {
       auto inp = node->inputs().at(0);
       if (inp->node()->kind() == prim::ListConstruct) {
         refreshAliasDb();
         if (!aliasDb_->hasWriters(inp)) {
           WithInsertPoint guard(node);
-          node->output()->replaceAllUsesWith(graph_->insertConstant(static_cast<int64_t>(inp->node()->inputs().size())));
+          node->output()->replaceAllUsesWith(graph_->insertConstant(
+              static_cast<int64_t>(inp->node()->inputs().size())));
           changed_ = true;
         }
       }
-    } else if (node->kind() == aten::__getitem__ && node->inputs().at(0)->type()->cast<ListType>()) {
+    } else if (
+        node->kind() == aten::__getitem__ &&
+        node->inputs().at(0)->type()->cast<ListType>()) {
       auto inp = node->inputs().at(0);
       auto list_creation_node = inp->node();
       if (list_creation_node->kind() == prim::ListConstruct) {
@@ -507,30 +513,36 @@ struct PeepholeOptimizeImpl {
           if (auto index = toIValue(node->inputs().at(1))) {
             auto li_size = list_creation_node->inputs().size();
             int64_t norm_index = normalizeIndex(index->toInt(), li_size);
-            if (norm_index >= 0 && norm_index < static_cast<int64_t>(list_creation_node->inputs().size())) {
-              node->output()->replaceAllUsesWith(list_creation_node->inputs().at(norm_index));
+            if (norm_index >= 0 &&
+                norm_index <
+                    static_cast<int64_t>(list_creation_node->inputs().size())) {
+              node->output()->replaceAllUsesWith(
+                  list_creation_node->inputs().at(norm_index));
               changed_ = true;
             }
           }
         }
       }
-    } else if (node->kind() == aten::add && node->inputs().at(0)->type()->cast<ListType>()) {
+    } else if (
+        node->kind() == aten::add &&
+        node->inputs().at(0)->type()->cast<ListType>()) {
       auto inp_1 = node->inputs().at(0);
       auto inp_2 = node->inputs().at(1);
-      for (Value * v: {inp_1, inp_2}) {
-        if (v->node()->kind() != prim::ListConstruct && v->node()->kind() != prim::Constant) {
+      for (Value* v : {inp_1, inp_2}) {
+        if (v->node()->kind() != prim::ListConstruct &&
+            v->node()->kind() != prim::Constant) {
           return;
         }
       }
       refreshAliasDb();
-      for (Value * v: {inp_1, inp_2}) {
+      for (Value* v : {inp_1, inp_2}) {
         if (aliasDb_->hasWriters(v)) {
           return;
         }
       }
       WithInsertPoint guard(node);
       for (size_t i = 0; i < 2; ++i) {
-        Value * v;
+        Value* v;
         if (i == 0) {
           v = inp_1;
         } else {
@@ -539,31 +551,37 @@ struct PeepholeOptimizeImpl {
         if (v->node()->kind() != prim::Constant) {
           continue;
         }
-        if (AliasDb::mutableType(v->type()->expect<ListType>()->getElementType())) {
+        if (AliasDb::isMutableType(
+                v->type()->expect<ListType>()->getElementType())) {
           continue;
         }
         c10::List<IValue> li = toIValue(v)->toList();
         std::vector<Value*> li_elems;
         for (size_t i = 0; i < li.size(); ++i) {
           const IValue& ival = li.get(i);
-          Value * elem = graph_->insertConstant(ival);
+          Value* elem = graph_->insertConstant(ival);
           li_elems.push_back(elem);
         }
         auto elem_type = v->type()->expect<ListType>()->getElementType();
         if (i == 0) {
-          inp_1 = graph_->insertNode(graph_->createList(elem_type, li_elems))->output();
+          inp_1 = graph_->insertNode(graph_->createList(elem_type, li_elems))
+                      ->output();
         } else {
-          inp_2 = graph_->insertNode(graph_->createList(elem_type, li_elems))->output();
+          inp_2 = graph_->insertNode(graph_->createList(elem_type, li_elems))
+                      ->output();
         }
       }
 
-      std::vector<Value*> new_inps(inp_1->node()->inputs().begin(), inp_1->node()->inputs().end());
-      for (Value * inp: inp_2->node()->inputs()) {
+      std::vector<Value*> new_inps(
+          inp_1->node()->inputs().begin(), inp_1->node()->inputs().end());
+      for (Value* inp : inp_2->node()->inputs()) {
         new_inps.push_back(inp);
       }
-      auto new_list = graph_->insertNode(graph_->createList(node->output()->type()->expect<ListType>()->getElementType(), new_inps));
+      auto new_list = graph_->insertNode(graph_->createList(
+          node->output()->type()->expect<ListType>()->getElementType(),
+          new_inps));
       node->replaceAllUsesWith(new_list);
-      changed_= true;
+      changed_ = true;
     }
   }
 

@@ -805,7 +805,7 @@ void runOptimization(std::shared_ptr<Graph>& graph, bool unroll) {
   // run again with unrolled loops
   PeepholeOptimize(graph);
   ConstantPropagation(graph);
- 
+
   EliminateCommonSubexpression(graph);
 
   CheckInplace(graph);
