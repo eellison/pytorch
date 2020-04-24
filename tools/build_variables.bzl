@@ -217,6 +217,7 @@ libtorch_extra_sources = [
     "torch/csrc/jit/passes/lower_graph.cpp",
     "torch/csrc/jit/runtime/register_c10_ops.cpp",
     "torch/csrc/jit/runtime/register_prim_ops.cpp",
+    "torch/csrc/jit/runtime/register_legacy_ops.cpp",
     "torch/csrc/jit/runtime/register_prim_ops_c10.cpp",
     "torch/csrc/jit/runtime/register_prim_ops_fulljit.cpp",
     "torch/csrc/jit/runtime/register_special_ops.cpp",
