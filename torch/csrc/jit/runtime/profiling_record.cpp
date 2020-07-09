@@ -168,8 +168,6 @@ bool needsProfiledInputs(Node* n) {
     case aten::type_as:
     // TODO: hack to make `test_lstm_gates_permutations_cuda`
     // pass.
-    case aten::t:
-    case aten::mm:
       return true;
     default:
       return false;

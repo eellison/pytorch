@@ -165,6 +165,15 @@ void unroll(Node* loop) {
   if (!isSmallBlock(body))
     return;
 
+  Value* trip_count = loop->inputs().at(0);
+  c10::optional<int64_t> const_len = constant_as<int64_t>(trip_count);
+
+  // heuristic: it is unlikely that a Tensor will be 8 dims or more.
+  // TODO: could consider unroll factor of four
+  if (trip_count->node()->matches("aten::len.Tensor(Tensor t) -> int") && !const_len) {
+    return;
+  }
+
   // We will be using a "mutable" counter outside of the loop instead of the
   // default one, because this will allow us to share it between the unrolled
   // loop and its epilogue. This is necessary only if the loop counter is
@@ -174,8 +183,6 @@ void unroll(Node* loop) {
 
   // Some optimization for constant-length loops. If we know they won't run too
   // many times, then we can unroll them entirely.
-  Value* trip_count = loop->inputs().at(0);
-  c10::optional<int64_t> const_len = constant_as<int64_t>(trip_count);
   if (const_len && *const_len < kMaxBodyRepeats) {
     Block* dest = loop->addBlock();
     repeatBody(body, *const_len, dest);

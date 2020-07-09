@@ -1421,6 +1421,14 @@ graph(%Ra, %Rb):
         does_decompose()
         doesnt_decompose()
 
+
+    def test_elias2(self):
+        @torch.jit.script
+        def foo(x):
+            for i in x:
+                print(i)
+        print(foo.graph)
+
     @suppress_warnings
     def test_sparse_tensors(self):
         @torch.jit.ignore
@@ -1739,9 +1747,21 @@ graph(%Ra, %Rb):
         self.run_pass('constant_propagation', graph)
         self.assertTrue(graph.findNode("prim::Loop").outputsSize() == 2)
 
+    def test_elias(self):
+        s = dedent("""
+        def func():
+            withitem = 4
+            return withitem
+            """)
+
+        cu = torch.jit.CompilationUnit(s)
+        print(cu.func.graph)
+        self.getExportImportCopy(cu.func)
+
     def test_constant_insertion(self):
         funcs_template = dedent('''
         def func():
+            withitem = 3
             return {constant_constructor}
         ''')
 

@@ -6,6 +6,9 @@
 #include <torch/csrc/jit/passes/common_subexpression_elimination.h>
 #include <torch/csrc/jit/passes/utils/subgraph_utils.h>
 #include <torch/csrc/jit/runtime/autodiff.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
 
 namespace torch {
 namespace jit {
@@ -171,7 +174,9 @@ std::vector<Node*> CreateAutodiffSubgraphs(
     const std::shared_ptr<Graph>& graph,
     size_t threshold) {
   std::vector<Node*> diff_nodes;
+  time_t my_time = time(NULL);
   SubgraphSlicer(graph->block(), graph, threshold).run(diff_nodes);
+  printf("%s", ctime(&my_time));
   return diff_nodes;
 }
 } // namespace jit
