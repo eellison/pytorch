@@ -170,7 +170,7 @@ void unroll(Node* loop) {
 
   // heuristic: it is unlikely that a Tensor will be 8 dims or more.
   // TODO: could consider unroll factor of four
-  if (trip_count->node()->matches("aten::len.Tensor(Tensor t) -> int") && !const_len) {
+  if (trip_count->node()->kind() == aten::len && trip_count->node()->inputs().at(0)->type()->cast<TensorType>() && !const_len) {
     return;
   }
 

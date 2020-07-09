@@ -277,7 +277,7 @@ struct PeepholeOptimizeImpl {
           node->output()->replaceAllUsesWith(output);
         }
       } else if (
-          node->matches("aten::dim(Tensor self) -> int") && shape_peepholes_) {
+          (node->matches("aten::dim(Tensor self) -> int") && shape_peepholes_) || (node->kind() == aten::dim)) {
         auto ptt = node->input()->type()->expect<TensorType>();
         if (auto dim = ptt->sizes().size()) {
           WithInsertPoint guard(node);

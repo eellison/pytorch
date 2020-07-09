@@ -9,11 +9,24 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
+#include <chrono>
+
 
 namespace torch {
 namespace jit {
 
 namespace {
+
+struct WorkPair : public std::pair<Node*, Node*> {
+  using pair::pair;
+
+  Node* start() {
+    return this->first;
+  }
+  Node* end() {
+    return this->second;
+  }
+};
 
 class SubgraphSlicer {
  public:
@@ -80,6 +93,24 @@ class SubgraphSlicer {
   }
 
  private:
+
+  void buildWorkSets() {
+    // work sets are delineated by the nodes that cannot be moved,
+    // so they are exclusive
+    //
+
+
+    // for (auto it = block_->nodes().rbegin(); it != block_->nodes().rend();) {
+    //     bool changed;
+    //     std::tie(it, changed) = scanNode(*it, aliasDb);
+    //     any_changed |= changed;
+    // }
+
+
+
+  }
+
+
   // Inline this node's group subgraph into the outer graph if it's smaller
   // than the specified minimum size.
   //
@@ -167,6 +198,9 @@ class SubgraphSlicer {
   Block* block_;
   std::shared_ptr<Graph> graph_;
   size_t minSubgraphSize_;
+  std::vector<WorkPair> workset_;
+  std::unordered_set<Node*> curr_work_group_;
+
 };
 } // anonymous namespace
 
@@ -174,9 +208,14 @@ std::vector<Node*> CreateAutodiffSubgraphs(
     const std::shared_ptr<Graph>& graph,
     size_t threshold) {
   std::vector<Node*> diff_nodes;
-  time_t my_time = time(NULL);
+
+  std::chrono::steady_clock::time_point begin = std::chrono::steady_clock::now();
   SubgraphSlicer(graph->block(), graph, threshold).run(diff_nodes);
-  printf("%s", ctime(&my_time));
+  std::chrono::steady_clock::time_point end = std::chrono::steady_clock::now();
+
+  std::cout << "Time difference = " << std::chrono::duration_cast<std::chrono::microseconds>(end - begin).count() << "[µs]" << std::endl;
+  std::cout << "Time difference = " << std::chrono::duration_cast<std::chrono::seconds> (end - begin).count() << "[s]" << std::endl;
+
   return diff_nodes;
 }
 } // namespace jit
