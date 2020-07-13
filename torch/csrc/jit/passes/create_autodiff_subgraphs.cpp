@@ -6,6 +6,7 @@
 #include <torch/csrc/jit/passes/common_subexpression_elimination.h>
 #include <torch/csrc/jit/passes/utils/subgraph_utils.h>
 #include <torch/csrc/jit/runtime/autodiff.h>
+#include <ATen/core/functional.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
@@ -16,6 +17,138 @@ namespace torch {
 namespace jit {
 
 namespace {
+
+// Which index in b's owning Node is b
+size_t blockIndex(const Block* b) {
+  auto n = b->owningNode();
+  AT_ASSERT(n);
+  for (size_t i = 0; i < n->blocks().size(); ++i) {
+    if (n->blocks()[i] == b) {
+      return i;
+    }
+  }
+  AT_ASSERT(false);
+}
+
+bool isAfter(Node* n1, Node* n2) {
+  // Invalid to call with the same node as both args
+  AT_ASSERT(n1 != n2);
+
+  // Set n1 and n2 to be the number of blocks from the Graph block
+  size_t d_1 = n1->blocksFromGraphBlock();
+  size_t d_2 = n2->blocksFromGraphBlock();
+
+  for (; d_1 > d_2; --d_1) {
+    n1 = n1->owningBlock()->owningNode();
+    // n2 contains n1
+    if (n1 == n2) {
+      return true;
+    }
+  }
+
+  for (; d_2 > d_1; --d_2) {
+    n2 = n2->owningBlock()->owningNode();
+    // n1 contains n2
+    if (n2 == n1) {
+      return false;
+    }
+  }
+
+  // Now they are the same numer of blocks from the graph block,
+  // recurse upwards, checking if they are on the same block
+  while (true) {
+    if (n1->owningBlock() == n2->owningBlock()) {
+      return n1->isAfter(n2);
+    }
+
+    auto new_n1 = n1->owningBlock()->owningNode();
+    auto new_n2 = n2->owningBlock()->owningNode();
+
+    AT_ASSERT(new_n1 != nullptr);
+    AT_ASSERT(new_n2 != nullptr);
+
+    if (new_n1 == new_n2) {
+      // take whichever node is in the later block
+      auto index_1 = blockIndex(n1->owningBlock());
+      auto index_2 = blockIndex(n2->owningBlock());
+      return index_1 > index_2;
+    }
+
+    n1 = new_n1;
+    n2 = new_n2;
+  }
+}
+
+bool isAfter(const Use& a, const Use& b) {
+  // If two uses are the same node, we order on offset
+  if (a.user == b.user) {
+    return a.offset > b.offset;
+  }
+
+  return isAfter(a.user, b.user);
+}
+
+c10::optional<const Use> lastUse(Value * v) {
+  if (v->uses().size() == 0) {
+    return c10::nullopt;
+  }
+  Use last_use = v->uses()[0];
+  for (size_t i = 1; i < v->uses().size(); ++i) {
+    auto n_use = v->uses()[i];
+    if (!isAfter(last_use, n_use)) {
+      last_use = n_use;
+    }
+  }
+
+  return last_use;
+}
+
+std::vector<c10::optional<const Use>> gatherLastUses(at::ArrayRef<Value*> values) {
+  return fmap(values, lastUse);
+}
+
+struct ValueMapper {
+    ValueMapper(Node * n, AliasDb& db, size_t subgraph_num_outputs) {
+      last_uses_ = gatherLastUses(n->outputs());
+      subgraph_num_outputs_ = subgraph_num_outputs;
+      WithInsertPoint guard(n);
+      auto g = n->owningGraph();
+      placeholder_node_ = g->insertNode(g->create(prim::Uninitialized, 0));
+      for (size_t i = 0; i < n->outputs().size(); ++i) {
+        Value * existing = n->outputs().at(i);
+        Value * new_value = placeholder_node_->insertOutput(i)->copyMetadata(n->outputs().at(i));
+        db.replaceWithNewValue(existing, new_value);
+      }
+    }
+
+    bool usesEqual(const Use& a, const Use& b) {
+      return a.user == b.user && a.offset == b.offset;
+    }
+
+    void copyAliasing(Node * merged_node, AliasDb& db) {
+      auto num_outputs = merged_node->outputs().size();
+      auto new_outputs = merged_node->outputs().slice(subgraph_num_outputs_, num_outputs - subgraph_num_outputs_);
+      for (Value * v: new_outputs) {
+        auto maybe_last_use = lastUse(v);
+        if (!maybe_last_use) {
+          continue;
+        }
+        const Use last_use = *maybe_last_use;
+
+        size_t i = 0;
+        while (i < last_uses_.size() && last_uses_.at(i).has_value() && !usesEqual(*last_uses_.at(i), last_use)) {
+          ++i;
+        }
+        TORCH_INTERNAL_ASSERT(i != last_uses_.size());
+        db.replaceWithNewValue(placeholder_node_->outputs().at(i), v);
+      }
+      placeholder_node_->destroy();
+    }
+
+    std::vector<c10::optional<const Use>> last_uses_;
+    size_t subgraph_num_outputs_;
+    Node * placeholder_node_;
+};
 
 struct WorkPair : public std::pair<Node*, Node*> {
   using pair::pair;
@@ -39,6 +172,8 @@ class SubgraphSlicer {
         minSubgraphSize_(minSubgraphSize) {}
 
   void run(std::vector<Node*>& diffGraphs) {
+    // buildWorkSets();
+
     // We need to run the slicer multiple times in order to get all merge
     // opportunities. This is because moveBeforeTopologicalValid may reorder
     // nodes to be AFTER the current iteration point. In order to properly
@@ -53,10 +188,10 @@ class SubgraphSlicer {
     //   c = f(a, b)
     //   e = f(d)  <- iter still here
     //   d = f(c)  <- this was node moved on the other side.
+    AliasDb aliasDb(graph_);
     bool any_changed = true;
     while (any_changed) {
       any_changed = false;
-      AliasDb aliasDb(graph_);
       for (auto it = block_->nodes().rbegin(); it != block_->nodes().rend();) {
         bool changed;
         std::tie(it, changed) = scanNode(*it, aliasDb);
@@ -65,7 +200,7 @@ class SubgraphSlicer {
     }
 
     // Done constructing subgraphs. Do some post-processing cleanup:
-    // 1. Run CSE to delete redundanet constant nodes.
+    // 1. Run CSE to delete redundant constant nodes.
     // 2. We may need to re-inline ones that are too small.
     auto curNode = *block_->nodes().rbegin();
     while (curNode != *block_->nodes().rend()) {
@@ -93,21 +228,30 @@ class SubgraphSlicer {
   }
 
  private:
-
   void buildWorkSets() {
+
     // work sets are delineated by the nodes that cannot be moved,
-    // so they are exclusive
-    //
+    // so they are exclusive and represent [bound_node, bound_node]
+    Node * end_bound_node = block_->return_node();
+    Node * curr = end_bound_node->prev();
 
+    std::vector<WorkPair> worklist;
 
-    // for (auto it = block_->nodes().rbegin(); it != block_->nodes().rend();) {
-    //     bool changed;
-    //     std::tie(it, changed) = scanNode(*it, aliasDb);
-    //     any_changed |= changed;
-    // }
+    while (curr != block_->param_node()) {
+      // constants are allowed in all sets, so we ignore them
+      if (curr->kind() == prim::Constant) {
+        continue;
+      }
 
+      if (curr->hasSideEffects()) {
+        worklist.emplace_back(curr, end_bound_node);
+        end_bound_node = curr;
+      }
+      curr = curr->prev();
+    }
+    worklist.emplace_back(curr, end_bound_node);
 
-
+    workset_ = std::move(worklist);
   }
 
 
@@ -155,13 +299,18 @@ class SubgraphSlicer {
     return isDifferentiable(node);
   }
 
+
+
   std::pair<graph_node_list::iterator, bool> scanNode(
       Node* consumer,
       AliasDb& aliasDb) {
     if (shouldConsiderForMerge(consumer)) {
       if (consumer->kind() != prim::DifferentiableGraph) {
-        consumer = SubgraphUtils::createSingletonSubgraph(
-            consumer, prim::DifferentiableGraph);
+        // we need a way to map the node's outputs to the new Singleton subgraphs outputs
+
+        ValueMapper vm(consumer, aliasDb, 0);
+        consumer = SubgraphUtils::createSingletonSubgraph(consumer, prim::DifferentiableGraph);
+        vm.copyAliasing(consumer, aliasDb);
       }
       auto inputs = sortReverseTopological(consumer->inputs());
       for (auto input : inputs) {
@@ -190,8 +339,9 @@ class SubgraphSlicer {
       return c10::nullopt;
     }
 
+    ValueMapper vm(producer, aliasDb, consumer->outputs().size());
     SubgraphUtils::mergeNodeIntoSubgraph(producer, consumer);
-
+    vm.copyAliasing(consumer, aliasDb);
     return consumer;
   }
 
