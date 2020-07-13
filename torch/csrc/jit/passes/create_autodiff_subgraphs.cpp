@@ -166,10 +166,12 @@ class SubgraphSlicer {
   SubgraphSlicer(
       Block* block,
       std::shared_ptr<Graph> graph,
-      size_t minSubgraphSize)
+      size_t minSubgraphSize,
+      AliasDb& aliasDb)
       : block_(block),
         graph_(std::move(graph)),
-        minSubgraphSize_(minSubgraphSize) {}
+        minSubgraphSize_(minSubgraphSize),
+        aliasDb_(aliasDb) {}
 
   void run(std::vector<Node*>& diffGraphs) {
     // buildWorkSets();
@@ -188,26 +190,41 @@ class SubgraphSlicer {
     //   c = f(a, b)
     //   e = f(d)  <- iter still here
     //   d = f(c)  <- this was node moved on the other side.
-    AliasDb aliasDb(graph_);
     bool any_changed = true;
-    while (any_changed) {
-      any_changed = false;
-      for (auto it = block_->nodes().rbegin(); it != block_->nodes().rend();) {
-        bool changed;
-        std::tie(it, changed) = scanNode(*it, aliasDb);
-        any_changed |= changed;
+
+    auto worksets = buildWorkSets();
+    for (auto& workset : worksets) {
+      auto curr_work_group = buildWorkGroup(workset);
+      while (any_changed) {
+        any_changed = false;
+        for (auto it = workset.end()->reverseIterator(); it != workset.start()->reverseIterator();) {
+          bool changed;
+          std::tie(it, changed) = scanNode(*it, aliasDb_);
+          any_changed |= changed;
+        }
       }
     }
+
+    // while (any_changed) {
+    //   any_changed = false;
+    //   for (auto it = block_->nodes().rbegin(); it != block_->nodes().rend();) {
+    //     bool changed;
+    //     std::tie(it, changed) = scanNode(*it, aliasDb_);
+    //     any_changed |= changed;
+    //   }
+    // }
 
     // Done constructing subgraphs. Do some post-processing cleanup:
     // 1. Run CSE to delete redundant constant nodes.
     // 2. We may need to re-inline ones that are too small.
+    for (auto node : block_->nodes()) {
+      for (auto subBlock : node->blocks()) {
+        SubgraphSlicer(subBlock, graph_, minSubgraphSize_, aliasDb_).run(diffGraphs);
+      }
+    }
+
     auto curNode = *block_->nodes().rbegin();
     while (curNode != *block_->nodes().rend()) {
-      for (auto subBlock : curNode->blocks()) {
-        SubgraphSlicer(subBlock, graph_, minSubgraphSize_).run(diffGraphs);
-      }
-
       // Save the previous node, since we might delete `curNode` in next block
       auto prevNode = curNode->prev();
       if (curNode->kind() == prim::DifferentiableGraph) {
@@ -228,7 +245,18 @@ class SubgraphSlicer {
   }
 
  private:
-  void buildWorkSets() {
+
+  std::unordered_set<Node *> buildWorkGroup(WorkPair& pair) {
+    Node * curr = pair.start()->next();
+    std::unordered_set<Node *> nodes;
+    while (curr != pair.end()) {
+      nodes.insert(curr);
+      curr = curr->next();
+    }
+    return nodes;
+  }
+
+  std::vector<WorkPair> buildWorkSets() {
 
     // work sets are delineated by the nodes that cannot be moved,
     // so they are exclusive and represent [bound_node, bound_node]
@@ -240,6 +268,7 @@ class SubgraphSlicer {
     while (curr != block_->param_node()) {
       // constants are allowed in all sets, so we ignore them
       if (curr->kind() == prim::Constant) {
+        curr = curr->prev();
         continue;
       }
 
@@ -250,8 +279,7 @@ class SubgraphSlicer {
       curr = curr->prev();
     }
     worklist.emplace_back(curr, end_bound_node);
-
-    workset_ = std::move(worklist);
+    return worklist;
   }
 
 
@@ -348,8 +376,9 @@ class SubgraphSlicer {
   Block* block_;
   std::shared_ptr<Graph> graph_;
   size_t minSubgraphSize_;
-  std::vector<WorkPair> workset_;
-  std::unordered_set<Node*> curr_work_group_;
+  AliasDb& aliasDb_;
+  // std::vector<WorkPair> workset_;
+  // std::unordered_set<Node*> curr_work_group_;
 
 };
 } // anonymous namespace
@@ -360,7 +389,8 @@ std::vector<Node*> CreateAutodiffSubgraphs(
   std::vector<Node*> diff_nodes;
 
   std::chrono::steady_clock::time_point begin = std::chrono::steady_clock::now();
-  SubgraphSlicer(graph->block(), graph, threshold).run(diff_nodes);
+  AliasDb db(graph);
+  SubgraphSlicer(graph->block(), graph, threshold, db).run(diff_nodes);
   std::chrono::steady_clock::time_point end = std::chrono::steady_clock::now();
 
   std::cout << "Time difference = " << std::chrono::duration_cast<std::chrono::microseconds>(end - begin).count() << "[µs]" << std::endl;

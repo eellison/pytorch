@@ -156,6 +156,7 @@ class TestAutodiffSubgraphSlicing(JitTestCase):
         num_nodes = 4 if GRAPH_EXECUTOR == ProfilingMode.PROFILING else 3
         # add moved down
         g_str = str(graph)
+        print(g_str)
         FileCheck().check_not("aten::add").run(g_str[0:g_str.find("return")])
         num_diff_nodes = 2 if GRAPH_EXECUTOR == ProfilingMode.PROFILING else 1
         self.assertGraphContainsExactly(graph, 'prim::DifferentiableGraph', num_diff_nodes)
