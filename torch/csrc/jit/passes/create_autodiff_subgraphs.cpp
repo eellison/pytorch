@@ -192,18 +192,29 @@ class SubgraphSlicer {
     //   d = f(c)  <- this was node moved on the other side.
     bool any_changed = true;
 
-    auto worksets = buildWorkSets();
-    for (auto& workset : worksets) {
-      auto curr_work_group = buildWorkGroup(workset);
-      while (any_changed) {
-        any_changed = false;
-        for (auto it = workset.end()->reverseIterator(); it != workset.start()->reverseIterator();) {
-          bool changed;
-          std::tie(it, changed) = scanNode(*it, aliasDb_);
-          any_changed |= changed;
-        }
-      }
-    }
+    // auto worksets = buildWorkSets();
+    // for (auto& workset : worksets) {
+    //   // curr_work_group_ = buildWorkGroup(workset);
+    //   while (any_changed) {
+    //     any_changed = false;
+    //     for (auto it = workset.end()->reverseIterator(); it != workset.start()->reverseIterator();) {
+    //       bool changed;
+    //       std::tie(it, changed) = scanNode(*it, aliasDb_);
+    //       any_changed |= changed;
+    //     }
+    //   }
+    // }
+    // bool any_changed = true;
+    // while (any_changed) {
+    //   any_changed = false;
+    //   AliasDb aliasDb(graph_);
+    //   for (auto it = block_->nodes().rbegin(); it != block_->nodes().rend();) {
+    //     bool changed;
+    //     std::tie(it, changed) = scanNode(*it, aliasDb);
+    //     any_changed |= changed;
+    //   }
+    // }
+
 
     // while (any_changed) {
     //   any_changed = false;
@@ -342,6 +353,9 @@ class SubgraphSlicer {
       }
       auto inputs = sortReverseTopological(consumer->inputs());
       for (auto input : inputs) {
+        // if (!curr_work_group_.count(input->node())) {
+        //   continue;
+        // }
         if (auto group = tryMerge(consumer, input->node(), aliasDb)) {
           // we successfully merged, so the new group's `inputs` may have
           // changed. So rescan the new group for more merging opportunities.
