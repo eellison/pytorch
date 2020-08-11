@@ -49,6 +49,9 @@ struct AutogradZeroSpecializer {
     }
   }
 
+  enum class OptionalState { None, Value, Unknown };
+  std::unordered_map<Value*, OptionalState> optional_state;
+
   void setStatesOnGraphInputs() {
     for (Value* input : graph_->inputs()) {
       const auto& tp = input->type();
@@ -80,6 +83,12 @@ struct AutogradZeroSpecializer {
     }
 
     return nullptr;
+  }
+
+  bool hasProfileOptionalUses(Value* v) {
+    return std::any_of(v->uses().begin(), v->uses().end(), [](const Use& use) {
+      return use.user->kind() == prim::profile_optional;
+    });
   }
 
   Node* prepareGraph() {

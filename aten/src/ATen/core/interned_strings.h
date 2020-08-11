@@ -130,6 +130,7 @@ namespace c10 {
   _(prim, GetAttr)                   \
   _(prim, HasAttr)                   \
   _(prim, profile)                   \
+  _(prim, profile_optional)          \
   _(prim, AddStatValue)              \
   _(prim, TimePoint)                 \
   _(prim, CallFunction)              \
@@ -260,6 +261,8 @@ namespace c10 {
   _(attr, inplace)                   \
   _(attr, input_as_shape)            \
   _(attr, is_zero)                   \
+  _(attr, num_none)                  \
+  _(attr, num_val)                   \
   _(attr, perm)                      \
   _(attr, sizes)                     \
   _(attr, starts)                    \
