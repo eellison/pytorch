@@ -47,6 +47,9 @@ private:
   enum class State { Nonzero, Zero, Unknown };
   std::unordered_map<Value*, State> state;
 
+  enum class OptionalState { None, Value, Unknown };
+  std::unordered_map<Value*, OptionalState> optional_state;
+
   void setStatesOnGraphInputs() {
     for (Value* input : g.inputs()) {
       const auto& tp = input->type();
@@ -81,6 +84,12 @@ private:
     return nullptr;
   }
 
+  bool hasProfileOptionalUses(Value * v) {
+  return std::any_of(v->uses().begin(), v->uses().end(), [](const Use& use) {
+        return use.user->kind() == prim::profile_optional;
+      });
+  }
+
   Node* prepareGraph() {
 
     auto vif = g.create(prim::If, {}, g.outputs().size());
@@ -95,11 +104,16 @@ private:
 
     auto optimize = true;
     WithInsertPoint wip{*g.nodes().begin()};
-    
+
     std::vector<Node*> checks;
     std::set<Value*> checked;
     for (auto inp: g.inputs()) {
-        if (inp->uses().size() == 0 || !inp->type()->cast<TensorType>()) {
+        if (hasProfileOptionalUses(inp)) {
+          std::cout << "hello ";
+        }
+
+
+        if (inp->uses().size() == 0 || !inp->type()->cast<TensorType>() ) {
           continue;
         }
 

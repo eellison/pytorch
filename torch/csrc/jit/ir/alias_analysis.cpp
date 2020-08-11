@@ -521,6 +521,7 @@ void AliasDb::analyzeImpl(Node* node) {
     case prim::SetAttr:
       return analyzeSetAttr(node);
     case prim::profile:
+    case prim::profile_optional:
       if (node->inputs().size() > 0) {
         makePointerTo(node->output(), node->inputs().at(0));
       }

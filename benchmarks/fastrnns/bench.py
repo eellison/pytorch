@@ -90,6 +90,7 @@ def trainbench(name, rnn_creator, nloops=100, warmup=10,
         if modeldef.backward is not None:
             modeldef.backward(*backward_input)
         bwd_end_event.record()
+        import pdb; pdb.set_trace()
 
         if modeldef.backward is not None:
             for param in modeldef.params:
