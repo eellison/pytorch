@@ -1386,7 +1386,6 @@ struct InterpreterStateImpl : c10::intrusive_ptr_target {
                   // std::cout << "TypeCheck yields FALSE\n";
                   push(stack, false);
                 } else {
-                  //                 push(stack, expected_type->matchTensor(t));
                   bool res = expected_type->matchTensor(t);
                   // std::cout << "TypeCheck yields " << (res ? "TRUE" :
                   // "FALSE") << "\n";

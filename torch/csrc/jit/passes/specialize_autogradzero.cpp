@@ -1,5 +1,4 @@
 #include <torch/csrc/jit/passes/specialize_autogradzero.h>
-#include <torch/csrc/jit/passes/clear_undefinedness.h>
 #include <torch/csrc/jit/runtime/graph_executor.h>
 #include "ATen/core/interned_strings.h"
 #include "ATen/core/jit_type.h"
@@ -8,6 +7,7 @@
 #include "jit/ir/constants.h"
 #include "jit/ir/ir.h"
 #include "jit/jit_log.h"
+#include <torch/csrc/jit/passes/clear_undefinedness.h>
 #include "jit/passes/dead_code_elimination.h"
 
 namespace torch {
@@ -16,11 +16,13 @@ namespace jit {
 enum class State { Nonzero, Zero, Unknown };
 
 struct AutogradZeroSpecializer {
-  AutogradZeroSpecializer(std::shared_ptr<Graph> graph)
-      : graph_(std::move(graph)) {}
+  AutogradZeroSpecializer(std::shared_ptr<Graph> graph): graph_(std::move(graph)) {}
 
   void run() {
-    if (getProfilingMode() && isBackwardGraph()) {
+    if (!isBackwardGraph()) {
+      return;
+    }
+    if (getProfilingMode()) {
       if (auto vif = prepareGraph()) {
         specializeAutogradOps(vif->blocks()[0]);
         GRAPH_DUMP("After versioning graph", graph_);
@@ -32,13 +34,32 @@ struct AutogradZeroSpecializer {
     GRAPH_DUMP("After specializeAutogradOps graph", graph_);
   }
 
- private:
+private:
   bool isBackwardGraph() {
-    return std::any_of(
-        graph_->nodes().begin(), graph_->nodes().end(), [](Node* n) {
-          return n->kind() == prim::AutogradAnyNonZero ||
-              n->kind() == prim::AutogradAdd;
-        });
+    return std::any_of(graph_->nodes().begin(), graph_->nodes().end(), [](Node* n) {
+      switch (n->kind()) {
+        case prim::AutogradAnyNonZero:
+        case prim::AutogradAdd:
+        case aten::_grad_sum_to_size:
+          return true;
+        default:
+          return false;
+      }
+    });
+  }
+
+  void dump() {
+    std::cout << "Autograd State:\n";
+    for (auto pair: state_) {
+      std::cout << "\t" << pair.first->debugName() << " : ";
+      if (pair.second == State::Zero) {
+        std::cout << "Zero\n";
+      } else if (pair.second == State::Unknown) {
+        std::cout << "Unknown\n";
+      } else {
+        std::cout << "NonZero\n";
+      }
+    }
   }
 
   void replaceBlockInputsWithGraph(Block* b) {
@@ -48,9 +69,6 @@ struct AutogradZeroSpecializer {
       b->eraseInput(i);
     }
   }
-
-  enum class OptionalState { None, Value, Unknown };
-  std::unordered_map<Value*, OptionalState> optional_state;
 
   void setStatesOnGraphInputs() {
     for (Value* input : graph_->inputs()) {
@@ -75,20 +93,14 @@ struct AutogradZeroSpecializer {
     }
   }
 
-  static Value* getProfiledUse(Value* inp) {
+  static Node* getUse(Value* inp, Symbol kind) {
     for (auto use : inp->uses()) {
-      if (use.user->kind() == prim::profile) {
-        return use.user->output();
+      if (use.user->kind() == kind) {
+        return use.user;
       }
     }
 
     return nullptr;
-  }
-
-  bool hasProfileOptionalUses(Value* v) {
-    return std::any_of(v->uses().begin(), v->uses().end(), [](const Use& use) {
-      return use.user->kind() == prim::profile_optional;
-    });
   }
 
   Node* prepareGraph() {
@@ -97,37 +109,61 @@ struct AutogradZeroSpecializer {
     auto true_block = vif->addBlock();
     auto false_block = vif->addBlock();
 
+
     // we will optimize true_block
     true_block->cloneFrom(graph_->block(), value_map);
     replaceBlockInputsWithGraph(true_block);
     false_block->cloneFrom(graph_->block(), value_map);
     replaceBlockInputsWithGraph(false_block);
 
-    WithInsertPoint wip{graph_->block()};
-    std::vector<Node*> checks;
+    WithInsertPoint wip{*graph_->nodes().begin()};
+    std::vector<Value*> checks;
+    Value * none_val = graph_->insertConstant(IValue());
+    WithInsertPoint insert(none_val->node());
 
-    for (auto inp : graph_->inputs()) {
-      if (inp->uses().size() == 0 || !inp->type()->cast<TensorType>()) {
-        continue;
-      }
+    for (auto inp: graph_->inputs()) {
+        if (auto profile_optional_node = getUse(inp, prim::profile_optional)) {
+          if (profile_optional_node->i(attr::num_val) == 0 && profile_optional_node->i(attr::num_none) != 0) {
+            auto check = graph_->insert(aten::__is__, {inp, none_val})->node();
+            checks.push_back(check->output());
+            profiled_none_.insert(inp);
+          }
 
-      // TODO: we should be checking all of the profiles instead of one
-      auto pout = getProfiledUse(inp);
-      if (!pout) {
-        continue;
-      }
+          std::vector<Node*> prrofiled_opt_uses;
+          for (const Use& use: inp->uses()) {
+            if (use.user->kind() == prim::profile_optional) {
+              prrofiled_opt_uses.push_back(use.user);
+            }
+          }
+          for (Node * n: prrofiled_opt_uses) {
+            n->output()->replaceAllUsesWith(inp);
+            n->destroy();
+          }
 
-      auto pttp = pout->type()->cast<TensorType>();
-      if (!pttp->undefined().has_value()) {
-        continue;
-      }
+          continue;
+        }
 
-      state_[inp] = *pttp->undefined() ? State::Zero : State::Nonzero;
-      auto check = graph_->insert(prim::AutogradAnyNonZero, {inp});
-      if (!*pttp->undefined()) {
-        check = graph_->insert(aten::__not__, {check});
-      }
-      checks.push_back(check->node());
+        if (inp->uses().size() == 0 || !inp->type()->cast<TensorType>() ) {
+          continue;
+        }
+
+        // TODO: we should be checking all of the profiles instead of one
+        auto pout = getUse(inp, prim::profile);
+        if (!pout) {
+          continue;
+        }
+
+        auto pttp = pout->output()->type()->cast<TensorType>();
+        if (!pttp->undefined().has_value()) {
+          continue;
+        }
+
+        state_[inp] = *pttp->undefined() ? State::Zero : State::Nonzero;
+        auto check = graph_->insert(prim::AutogradAnyNonZero, {inp});
+        if (!*pttp->undefined()) {
+          check = graph_->insert(aten::__not__, {check});
+        }
+        checks.push_back(check);
     }
 
     // unable to specialize any of the inputs
@@ -138,11 +174,8 @@ struct AutogradZeroSpecializer {
       return nullptr;
     }
 
-    auto conjunction = checks[0]->output();
-    for (size_t i = 1; i < checks.size(); i++) {
-      conjunction =
-          graph_->insert(aten::__and__, {checks[i]->output(), conjunction});
-    }
+    Value * bool_list = graph_->insertNode(graph_->createList(BoolType::get(), checks))->output();
+    Value * conjunction = graph_->insert(aten::all, {bool_list});
 
     vif->addInput(conjunction);
     graph_->insertNode(vif);
@@ -162,6 +195,8 @@ struct AutogradZeroSpecializer {
   void specializeAutogradOps(Block* block) {
     for (auto it = block->nodes().begin(); it != block->nodes().end(); ++it) {
       auto n = *it;
+      // dump();
+
       switch (n->kind()) {
         case prim::AutogradAdd: {
           auto a = n->input(0);
@@ -175,8 +210,7 @@ struct AutogradZeroSpecializer {
             // a + Zero == a
             n->output()->replaceAllUsesWith(a);
             it.destroyCurrent();
-          } else if (
-              state_[a] == State::Nonzero && state_[b] == State::Nonzero) {
+          } else if (state_[a] == State::Nonzero && state_[b] == State::Nonzero) {
             // when both are Nonzero, we can use a normal, optimizable add
             // instruction
             WithInsertPoint guard(n);
@@ -200,15 +234,20 @@ struct AutogradZeroSpecializer {
         case prim::AutogradZero: {
           state_[n->output()] = State::Zero;
         } break;
+        case aten::_grad_sum_to_size : {
+          if (n->input(1)->mustBeNone() || profiled_none_.count(n->input(1))) {
+            n->output()->replaceAllUsesWith(n->input(0));
+            it.destroyCurrent();
+          }
+          break;
+        }
         case prim::profile: {
           // this a profile node on a tensor use
           // if we decided to specialize this graph
           // its input may have undefinedness info
           // otherwise it should be Unknown
           if (n->inputs().size() > 0) {
-            state_[n->output()] = !state_.count(n->input())
-                ? State::Unknown
-                : state_[n->output()] = state_[n->input()];
+              state_[n->output()] = !state_.count(n->input()) ? State::Unknown : state_[n->output()] = state_[n->input()];
           }
           break;
         }
@@ -236,8 +275,7 @@ struct AutogradZeroSpecializer {
             // then the gradOutputs are also zero and will be represented as
             // AutogradZero nodes
             if (all_zeros) {
-              auto zero =
-                  graph_->createAutogradZero()->insertAfter(n)->output();
+              auto zero = graph_->createAutogradZero()->insertAfter(n)->output();
               state_[zero] = State::Zero;
               for (auto o : n->outputs()) {
                 o->replaceAllUsesWith(zero);
@@ -248,10 +286,11 @@ struct AutogradZeroSpecializer {
 
             if (all_nonzeros) {
               auto body = n->blocks().at(0);
-              // hoist the nodes in the GradOf body to be before the linear
-              // block
-              for (auto it = body->nodes().begin();
-                   it != body->nodes().end();) {
+              // this optimizes grad_sum_to_size ops
+              specializeAutogradOps(body);
+
+              // hoist the nodes in the GradOf body to be before the linear block
+              for (auto it = body->nodes().begin(); it != body->nodes().end();) {
                 auto block_node = *it++;
                 block_node->moveBefore(n);
               }
@@ -280,8 +319,10 @@ struct AutogradZeroSpecializer {
   }
 
   std::shared_ptr<Graph> graph_;
+  std::unordered_set<Value*> profiled_none_;
   std::unordered_map<Value*, State> state_;
 };
+
 
 // propagate autograd zero information through a gradient graph and
 // remove grad_of blocks if present.
@@ -292,6 +333,7 @@ struct AutogradZeroSpecializer {
 void specializeAutogradZero(std::shared_ptr<Graph> g) {
   AutogradZeroSpecializer azs(g);
   azs.run();
+
 }
 
 } // namespace jit

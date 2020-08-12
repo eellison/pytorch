@@ -1,0 +1,6 @@
+$2 = void
+Exception ignored in: <module 'threading' from '/usr/local/fbcode/platform009/lib/python3.8/threading.py'>
+Traceback (most recent call last):
+  File "/usr/local/fbcode/platform009/lib/python3.8/threading.py", line 1355, in _shutdown
+    def _shutdown():
+KeyboardInterrupt: 

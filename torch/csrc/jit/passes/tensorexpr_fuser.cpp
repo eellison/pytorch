@@ -515,7 +515,11 @@ void insertGuards(
     // Add guard for inputs
     Value* check_result = nullptr;
     std::unordered_map<Value*, Value*> checked_values;
-    Value* cond = b->owningGraph()->insertConstant(true);
+    Value * cond;
+    {
+      WithInsertPoint insert_guard{*b->owningGraph()->nodes().begin()};
+      cond = b->owningGraph()->insertConstant(true);
+    }
     for (auto inp : it->inputs()) {
       if (value_types.count(inp) && value_types.at(inp)->isComplete()) {
         auto guard = b->owningGraph()->create(prim::TypeCheck, {inp, cond}, 2);
@@ -584,6 +588,7 @@ void insertGuards(
 }
 
 void FuseTensorExprs(std::shared_ptr<Graph>& graph) {
+  return;
   GRAPH_DUMP("Before TExprFuser: ", graph);
 
   std::unordered_map<Value*, TensorTypePtr> value_types;
