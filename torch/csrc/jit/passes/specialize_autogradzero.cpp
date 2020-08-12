@@ -34,7 +34,8 @@ struct AutogradZeroSpecializer {
       }
       GRAPH_DUMP("After versioning graph", &g);
       specializeAutogradOps(vif->blocks()[0]);
-    } else {
+    }
+    else {
       setStatesOnGraphInputs();
       specializeAutogradOps(g.block());
     }
@@ -45,8 +46,6 @@ private:
   Graph& g;
   enum class State { Nonzero, Zero, Unknown };
   std::unordered_map<Value*, State> state;
-
-  std::unordered_set<Value*> profiled_none_;
 
   void setStatesOnGraphInputs() {
     for (Value* input : g.inputs()) {
@@ -71,10 +70,11 @@ private:
     }
   }
 
-  static Node* getUse(Value* inp, Symbol kind) {
+  static Value* getProfiledUse(Value* inp) {
     for (auto use : inp->uses()) {
-      if (use.user->kind() == kind) {
-        return use.user;
+      if (use.user->kind() == prim::profile) {
+        return use.user->output();
+
       }
     }
 
@@ -95,38 +95,15 @@ private:
 
     auto optimize = true;
     WithInsertPoint wip{*g.nodes().begin()};
-    Value * none_val = insertConstant(g, IValue());
-
+    
     std::vector<Node*> checks;
     std::set<Value*> checked;
-
     for (auto inp: g.inputs()) {
-        if (auto profile_optional_node = getUse(inp, prim::profile_optional)) {
-          if (profile_optional_node->i(attr::num_val) == 0 && profile_optional_node->i(attr::num_none) != 0) {
-            auto check = g.insert(aten::__is__, {inp, none_val})->node();
-            checks.push_back(check);
-            profiled_none_.insert(inp);
-          }
-
-          std::vector<Node*> prrofiled_opt_uses;
-          for (const Use& use: inp->uses()) {
-            if (use.user->kind() == prim::profile_optional) {
-              prrofiled_opt_uses.push_back(use.user);
-            }
-          }
-          for (Node * n: prrofiled_opt_uses) {
-            n->output()->replaceAllUsesWith(inp);
-            n->destroy();
-          }
-
+        if (inp->uses().size() == 0 || !inp->type()->cast<TensorType>()) {
           continue;
         }
 
-        if (inp->uses().size() == 0 || !inp->type()->cast<TensorType>() ) {
-          continue;
-        }
-
-        auto pout = getUse(inp, prim::profile)->output();
+        auto pout = getProfiledUse(inp);
         if (!pout) {
           state[inp] = State::Unknown;
           continue;
@@ -183,13 +160,8 @@ private:
   }
 
   void specializeAutogradOps(Block* block) {
-    for (auto it = block->nodes().begin(); it != block->nodes().end(); it++) {
+    for (auto it = block->nodes().begin(); it != block->nodes().end(); ++it) {
       auto n = *it;
-
-      for (Block * b: n->blocks()) {
-        specializeAutogradOps(b);
-      }
-
       switch (n->kind()) {
         case prim::AutogradAdd: {
           auto a = n->input(0);
@@ -228,13 +200,6 @@ private:
         case prim::AutogradZero: {
           state[n->output()] = State::Zero;
         } break;
-        case aten::_grad_sum_to_size : {
-          if (n->input(1)->mustBeNone() || profiled_none_.count(n->input(1))) {
-            n->output()->replaceAllUsesWith(n->input(0));
-            it.destroyCurrent();
-          }
-          break;
-        }
         case prim::profile: {
           // this a profile node on a tensor use
           // not a counter

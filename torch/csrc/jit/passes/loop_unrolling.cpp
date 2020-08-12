@@ -36,7 +36,7 @@ int64_t limitedBlockSize(Block* body, int64_t limit) {
   auto it = body->nodes().begin();
   auto end = body->nodes().end();
   for (int64_t i = 0; i < limit; ++i, ++it) {
-    if (it->kind() == prim::profile || it->kind() == prim::profile_optional) {
+    if (it->kind() == prim::profile) {
       i--;
     }
     for (Block* subblock : it->blocks()) {

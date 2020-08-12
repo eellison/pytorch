@@ -15,7 +15,6 @@ BenchResult = namedtuple('BenchResult', [
     'name', 'avg_fwd', 'std_fwd', 'info_fwd', 'avg_bwd', 'std_bwd', 'info_bwd',
 ])
 
-torch._C._jit_set_emit_hooks(None, None)
 
 def fit_str(string, colwidth=16):
     if len(string) < colwidth:
@@ -91,7 +90,6 @@ def trainbench(name, rnn_creator, nloops=100, warmup=10,
         if modeldef.backward is not None:
             modeldef.backward(*backward_input)
         bwd_end_event.record()
-        import pdb; pdb.set_trace()
 
         if modeldef.backward is not None:
             for param in modeldef.params:
