@@ -1996,6 +1996,9 @@ TypePtr NamedValue::type() const {
   }
 }
 
+constexpr Symbol ProfileOp::Kind;
+constexpr Symbol ProfileOptionalOp::Kind;
+
 OperatorSet::OperatorSet(std::initializer_list<const char*> sig_literals) {
   for (const char* sig : sig_literals) {
     auto op = getOperatorForLiteral(sig);

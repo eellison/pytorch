@@ -15,6 +15,7 @@ BenchResult = namedtuple('BenchResult', [
     'name', 'avg_fwd', 'std_fwd', 'info_fwd', 'avg_bwd', 'std_bwd', 'info_bwd',
 ])
 
+torch._C._jit_set_emit_hooks(None, None)
 
 def fit_str(string, colwidth=16):
     if len(string) < colwidth:

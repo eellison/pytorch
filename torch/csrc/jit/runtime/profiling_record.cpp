@@ -55,6 +55,8 @@ ProfileOptionalOp* ProfilingRecord::createProfileOptionalNode(
       const std::function<void(Stack&)>& fp,
       at::ArrayRef<Value*> inputs) {
   auto pn = new ProfileOptionalOp(profiled_graph_.get(), fp);
+  pn->i_(attr::num_val, 0);
+  pn->i_(attr::num_none, 0);
 
   for (auto in : inputs) {
     pn->addInput(in);
@@ -222,6 +224,9 @@ void ProfilingRecord::instrumentBlock(Block* block) {
         auto opt_pn = createProfileOptionalNode(nullptr, {i});
         std::function<void(Stack&)> optional_profiler = [this, opt_pn](Stack& stack) {
           std::lock_guard<std::mutex> lock(this->mutex_);
+          // todo: get rid of it
+          int64_t frame_id = 0;
+          pop(stack, frame_id);
           IValue value;
           pop(stack, value);
           if (value.isNone()) {
@@ -234,9 +239,9 @@ void ProfilingRecord::instrumentBlock(Block* block) {
         opt_pn->setCallback(optional_profiler);
         auto pno = opt_pn->addOutput();
         pno->setType(i->type());
-        WithInsertPoint guard(block);
-        i->replaceAllUsesWith(pno);
-        block->owningGraph()->insertNode(opt_pn);
+        WithInsertPoint guard(i->node());
+        opt_pn->insertAfter(i->node());
+        i->replaceAllUsesAfterNodeWith(opt_pn, pno);
       }
     }
 
