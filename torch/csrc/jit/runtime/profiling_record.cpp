@@ -106,6 +106,7 @@ c10::SymbolicShape ProfilingRecord::mergeSymbolicShapes(
 void ProfilingRecord::insertShapeProfile(Node* n, Value* i) {
   auto pn = createProfileNode(nullptr, {i});
   auto pno = pn->addOutput();
+  pn->ty_(attr::profiled_type, TensorType::get());
   pno->setType(TensorType::get());
   std::function<void(Stack&)> shape_profiler = [this, pno](Stack& stack) {
     int64_t frame_id = 0;
@@ -287,7 +288,6 @@ std::unique_ptr<ProfilingRecord> ProfilingRecord::instrumentGraph(
             } else {
               // reset symbolic shapes when ranks are different
               type = type->merge(val_type_pair.second);
-              // type = type->withSymbolicShapes(c10::nullopt);
               merged_profiled_types[val_type_pair.first] = type;
             }
           }
@@ -296,7 +296,8 @@ std::unique_ptr<ProfilingRecord> ProfilingRecord::instrumentGraph(
 
       // update types in the graph
       for (auto val_type_pair : merged_profiled_types) {
-        val_type_pair.first->setType(val_type_pair.second);
+        val_type_pair.first->node()->ty_(
+            attr::profiled_type, val_type_pair.second);
       }
     }
   };
