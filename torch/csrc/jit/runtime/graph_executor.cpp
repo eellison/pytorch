@@ -48,6 +48,7 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#include "jit/passes/tensorexpr_fuser.h"
 
 namespace torch {
 namespace jit {
@@ -585,7 +586,7 @@ struct GraphExecutorImpl : public GraphExecutorImplBase {
     //          left in that may inhibit optimization
     Inline(*opt_graph);
     LowerGradOf(*opt_graph);
-    specializeAutogradZero(*opt_graph);
+    specializeAutogradZero(opt_graph);
     LowerSimpleTuples(opt_graph);
     ConstantPooling(opt_graph);
 
@@ -775,7 +776,11 @@ void runNondiffOptimization(
   // Rewrite subgraphs with many MMs into expressions that batch them.
   BatchMM(graph);
 
-  if (!getProfilingMode()) {
+  if (getProfilingMode()) {
+    if (tensorExprFuserEnabled()) {
+      FuseTensorExprs(graph);
+    }
+  } else {
     FuseGraph(graph, strict_fuser_check);
   }
 

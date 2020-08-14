@@ -58,7 +58,8 @@ bool isDifferentiable(Node* n) {
   // Tensor", "aten::min(Tensor self) -> Tensor"
 
   if (n->kind() == prim::Constant || n->kind() == prim::AutogradZero ||
-      n->kind() == prim::AutogradAdd || n->kind() == prim::ConstantChunk)
+      n->kind() == prim::AutogradAdd || n->kind() == prim::ConstantChunk ||
+      n->kind() == prim::profile)
     return true;
 
   if (n->isMemberOf(differentiable_ops))
@@ -208,6 +209,8 @@ class GradientHelper {
     if (node->kind() == prim::AutogradAdd) {
       // NB: AutogradAdds don't broadcast
       return {grad_values.at(0), grad_values.at(0)};
+    } else if (node->kind() == prim::profile) {
+      return {grad_values.at(0)};
     } else if (node->kind() == prim::ConstantChunk) {
       auto* g = node->owningGraph();
 
@@ -306,7 +309,7 @@ class GradientHelper {
 // later. It is ok to replace any backward function with known-zero inputs with
 // something that produces known-zero outputs. This function encloses each
 // know-linear backward function in a 'GradOf' sub-block so that we can perform
-// optimizations using this information. In particular, specializeAutogradZero
+// optimizations using this information. In particular, g
 // will observe if all the inputs to the linear block are AutogradZeroTensor,
 // which the autograd uses to represent zeros, and then propagate the zeros to
 // the outputs of the block.

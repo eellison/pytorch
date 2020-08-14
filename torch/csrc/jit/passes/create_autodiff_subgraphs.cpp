@@ -3,6 +3,7 @@
 #include <c10/util/Exception.h>
 #include <torch/csrc/jit/ir/alias_analysis.h>
 #include <torch/csrc/jit/ir/ir.h>
+#include <torch/csrc/jit/jit_log.h>
 #include <torch/csrc/jit/passes/canonicalize.h>
 #include <torch/csrc/jit/passes/common_subexpression_elimination.h>
 #include <torch/csrc/jit/passes/utils/subgraph_utils.h>
@@ -229,12 +230,13 @@ class SubgraphSlicer {
     for (auto it = subgraph->nodes().begin(); it != subgraph->nodes().end();
          ++it) {
       // constants are not interpreted as instructions, ignore them
-      i += it->kind() != prim::Constant;
+      i += !it->notExecutedOp();
       if (i >= minSubgraphSize_) {
         return false;
       }
     }
 
+    GRAPH_DEBUG("Unmerging ", getHeader(n));
     SubgraphUtils::unmergeSubgraph(n);
     return true;
   }
