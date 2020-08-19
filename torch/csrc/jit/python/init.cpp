@@ -14,6 +14,7 @@
 #include <torch/csrc/jit/passes/constant_propagation.h>
 #include <torch/csrc/jit/passes/create_autodiff_subgraphs.h>
 #include <torch/csrc/jit/passes/create_functional_graphs.h>
+#include <torch/csrc/jit/passes/batch_mm.cpp>
 #include <torch/csrc/jit/passes/cuda_graph_fuser.h>
 #include <torch/csrc/jit/passes/dead_code_elimination.h>
 #include <torch/csrc/jit/passes/decompose_ops.h>
@@ -29,6 +30,7 @@
 #include <torch/csrc/jit/passes/lower_graph.h>
 #include <torch/csrc/jit/passes/lower_tuples.h>
 #include <torch/csrc/jit/passes/normalize_ops.h>
+#include <torch/csrc/jit/passes/batch_mm.h>
 #include <torch/csrc/jit/passes/onnx.h>
 #include <torch/csrc/jit/passes/onnx/cast_all_constant_to_floating.h>
 #include <torch/csrc/jit/passes/onnx/constant_fold.h>
@@ -294,6 +296,7 @@ void initJITBindings(PyObject* module) {
           "_jit_pass_remove_inplace_ops",
           [](std::shared_ptr<Graph> g) { return RemoveInplaceOps(g); })
       .def("_jit_pass_constant_pooling", ConstantPooling)
+      .def("_jit_pass_batch_mm", BatchMM)
       .def(
           "_jit_pass_create_functional_graphs",
           [](std::shared_ptr<Graph>& g) { return CreateFunctionalGraphs(g); })
@@ -343,6 +346,9 @@ void initJITBindings(PyObject* module) {
             PropagateInputShapes(graph);
           })
       .def("_jit_pass_remove_expands", RemoveExpands)
+      .def(
+          "_jit_pass_batch_mm",
+          [](std::shared_ptr<Graph>& g) { return BatchMM(g); })
       .def("_jit_pass_erase_number_types", EraseNumberTypes)
       .def("_jit_pass_inline_fork_wait", InlineForkWait)
       .def("_jit_pass_inline", Inline)

@@ -13,6 +13,7 @@
 #include <torch/csrc/jit/passes/graph_fuser.h>
 #include <torch/csrc/jit/passes/guard_elimination.h>
 #include <torch/csrc/jit/passes/inline_autodiff_subgraphs.h>
+#include <torch/csrc/jit/runtime/profiling_graph_executor_impl.h>
 #include <torch/csrc/jit/passes/inplace_check.h>
 #include <torch/csrc/jit/passes/insert_guards.h>
 #include <torch/csrc/jit/passes/loop_unrolling.h>
@@ -135,6 +136,7 @@ void ProfilingGraphExecutorImpl::runProfilingOptimizations(
     InlineAutodiffSubgraphs(
         copy,
         getAutodiffSubgraphInlining() ? autodiffSubgraphInlineThreshold : 1);
+    // UpdateDiffGraphRequiresGrad(copy);
   } else {
     GRAPH_DEBUG("Running no needsGradientInProfilingMode version");
     runNondiffOptimization(copy, true);

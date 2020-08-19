@@ -182,6 +182,7 @@ core_sources_full = [
     "torch/csrc/jit/passes/graph_rewrite_helper.cpp",
     "torch/csrc/jit/passes/guard_elimination.cpp",
     "torch/csrc/jit/passes/inline_autodiff_subgraphs.cpp",
+    "torch/csrc/jit/passes/update_differentiable_graph_grad_property.cpp",
     "torch/csrc/jit/passes/inline_forked_closures.cpp",
     "torch/csrc/jit/passes/inliner.cpp",
     "torch/csrc/jit/passes/inplace_check.cpp",

@@ -5207,6 +5207,65 @@ a")
             # this triggers 2 bailouts
             self.assertEqual(def_in_one_branch(a, True), 3.0)
 
+    def test_elias(self):
+        import torch
+        import torch.nn as nn
+
+        class MyScriptModule(nn.Module):
+            def __init__(self):
+                super().__init__()
+
+            def forward(self, input):
+                blob = torch.zeros(input.shape[0], device = input.device)
+                print("input: ", input.device)
+                print("blob: ", blob.device)
+                return blob + input
+
+        class MyTraceModule(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.mod = torch.jit.script(MyScriptModule())
+
+            def forward(self, input):
+                return self.mod(input)
+
+        input = torch.zeros(10)
+        # input_gpu = input.to("cuda:0")
+
+        myModule = MyTraceModule()
+        traced = torch.jit.trace(myModule, (input))
+        self.run_pass("inline", traced.graph)
+        print(traced.graph)
+        # print(traced(input_gpu))
+
+
+    def test_mul_nick(self):
+        # with enable_profiling_mode_for_profiling_tests():
+        def warmup_backward(f, *args):
+            profiling_count = 2
+            results = []
+            for i in range(profiling_count):
+                if len(args) > 0:
+                    r = torch.autograd.grad(f, *args)
+                    results.append(r)
+                else:
+                    f.backward(retain_graph=True)
+
+            return results
+
+        @torch.jit.script
+        def test_fuse(a, b, c, d):
+            return a * b + c * d
+
+
+        torch._C._jit_pass_batch_mm(test_fuse.graph)
+        x = torch.ones(1, requires_grad = True)
+        y = torch.ones(1, requires_grad = True)
+        test_fuse(x, y)
+        b = test_fuse(x, y)
+        # warmup_backward(b)
+        # b.backward()
+        print(torch.jit.last_executed_optimized_graph())
 
     @unittest.skipIf(GRAPH_EXECUTOR != ProfilingMode.PROFILING, "skip if profiling isn't enabled")
     def test_maxpool_guard_elimination(self):

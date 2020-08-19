@@ -588,6 +588,8 @@ void insertGuards(
 }
 
 void FuseTensorExprs(std::shared_ptr<Graph>& graph) {
+  std::cout << " running tensorexpr fuser\n";
+  graph->dump();
   return;
   GRAPH_DUMP("Before TExprFuser: ", graph);
 
