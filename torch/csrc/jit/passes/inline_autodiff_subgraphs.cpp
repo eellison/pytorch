@@ -2,6 +2,7 @@
 
 #include <torch/csrc/jit/ir/ir.h>
 #include <torch/csrc/jit/passes/dead_code_elimination.h>
+#include <torch/csrc/jit/passes/update_differentiable_graph_requires_grad.h>
 #include <torch/csrc/jit/passes/utils/subgraph_utils.h>
 
 namespace torch {
@@ -45,6 +46,9 @@ graph_node_list::iterator scanNode(Node* node, size_t threshold) {
     return next_node;
   }
 
+  // now that we inline the graph, we are no longer detaching input tensors,
+  // so the profiles will have outdated requires_grad=False, update them
+  UpdateDifferentiableGraphRequiresGrad(subgraph, true);
   SubgraphUtils::unmergeSubgraph(node);
   return next_node;
 }
