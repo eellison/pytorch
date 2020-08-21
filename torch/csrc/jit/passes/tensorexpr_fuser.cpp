@@ -116,20 +116,15 @@ bool tensorExprFuserEnabled() {
   return true;
 }
 
-const Symbol& getTensorExprSymbol() {
-  static Symbol s = Symbol::fromQualString("tensorexpr::Group");
-  return s;
-}
-
 Node* getOrCreateTensorExprSubgraph(
     Node* n,
     std::unordered_map<Value*, Value*>& vmap) {
-  if (n->hasAttribute(attr::Subgraph) && n->kind() == getTensorExprSymbol()) {
+  if (n->hasAttribute(attr::Subgraph) && n->kind() == prim::TensorExprGroup) {
     return n;
   }
-  GRAPH_UPDATE("Creating a tensorexpr::Group node from: ", *n);
+  GRAPH_UPDATE("Creating a prim::TensorExprGroup node from: ", *n);
   auto te_group =
-      SubgraphUtils::createSingletonSubgraph(n, getTensorExprSymbol(), vmap);
+      SubgraphUtils::createSingletonSubgraph(n, prim::TensorExprGroup, vmap);
   return te_group;
 }
 
@@ -209,7 +204,7 @@ class TensorExprFuser {
     }
 
     // Update typeinfo for inputs and outputs of the fusion group
-    if (fusion_group->kind() == getTensorExprSymbol()) {
+    if (fusion_group->kind() == prim::TensorExprGroup) {
       auto subgraph = SubgraphUtils::getSubgraph(fusion_group);
       for (size_t idx = 0; idx < subgraph->inputs().size(); idx++) {
         if (typeinfo_map_.count(subgraph->inputs()[idx])) {
@@ -239,7 +234,7 @@ class TensorExprFuser {
     return fusion_group;
   }
 
-  // Merge fusible nodes into subgraphs in tensorexpr::Group nodes.
+  // Merge fusible nodes into subgraphs in prim::TensorExprGroup nodes.
   void createFusionGroups(Block* block) {
     std::vector<Node*> fusion_groups;
     auto reverse_iter = block->nodes().reverse();
@@ -294,7 +289,7 @@ class TensorExprFuser {
   }
 
   bool inlineIfTooSmall(Node* n) {
-    if (n->kind() != getTensorExprSymbol()) {
+    if (n->kind() != prim::TensorExprGroup) {
       return false;
     }
     auto subgraph = SubgraphUtils::getSubgraph(n);
@@ -411,7 +406,7 @@ class TensorExprFuser {
 
     // Symbolic checks
     REQ(canHandle(producer));
-    AT_ASSERT(canHandle(consumer) || consumer->kind() == getTensorExprSymbol());
+    AT_ASSERT(canHandle(consumer) || consumer->kind() == prim::TensorExprGroup);
 
     // Alias checks
     REQ(aliasDb_->couldMoveBeforeTopologically(producer, consumer));
@@ -426,7 +421,7 @@ class TensorExprFuser {
     }
 
     if (!consumer->hasAttribute(attr::Subgraph) &&
-        consumer->kind() != getTensorExprSymbol()) {
+        consumer->kind() != prim::TensorExprGroup) {
       // Don't initiate a fusion group from prim::ListConstruct
       REQ(consumer->kind() != prim::ListConstruct);
       REQ(consumer->kind() != aten::slice);
@@ -565,7 +560,7 @@ class TensorExprFuser {
       for (Block* b : n->blocks()) {
         guardFusionGroups(b);
       }
-      if (n->kind() == getTensorExprSymbol()) {
+      if (n->kind() == prim::TensorExprGroup) {
         fusion_groups.push_back(n);
       }
     }
@@ -617,7 +612,7 @@ Operation createTensorExprOp(const Node* node) {
 
 RegisterOperators TensorExprOps({
     torch::jit::Operator(
-        getTensorExprSymbol(),
+        prim::TensorExprGroup,
         createTensorExprOp,
         AliasAnalysisKind::PURE_FUNCTION),
 });

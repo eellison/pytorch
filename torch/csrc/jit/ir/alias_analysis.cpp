@@ -501,6 +501,8 @@ void AliasDb::analyzeImpl(Node* node) {
     case prim::DictConstruct:
     case prim::ListConstruct:
       return analyzeContainerConstruct(node);
+    // TODO: think more about TensorExpr alias correctness
+    case prim::TensorExprGroup:
     case prim::TupleUnpack:
     case prim::TupleIndex:
     case prim::TupleSlice:
