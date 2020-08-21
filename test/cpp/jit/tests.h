@@ -109,7 +109,8 @@ namespace jit {
   _(MobileNamedParameters)                        \
   _(MobileSaveLoadData)                           \
   _(LiteSGD)                                      \
-  _(FusionAliasing)
+  _(FusionAliasing)                               \
+  _(TypeCheck)
 
 #if defined(USE_CUDA)
 #define TH_FORALL_TESTS_CUDA(_)   \
