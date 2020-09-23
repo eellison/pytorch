@@ -599,6 +599,22 @@ struct VaryingShape {
   c10::optional<ListOfOptionalElements> dims_;
 };
 
+TORCH_API bool getAllowProfiledTypes();
+
+/** \brief An utility class for .
+ *
+ * When an object of this class is created, it stores the current insertion
+ * point, sets the new one, and restores the original insertion point  when the
+ * object is destroyed.
+ */
+struct WithAllowProfiledTypeAccess {
+  WithAllowProfiledTypeAccess();
+  ~WithAllowProfiledTypeAccess();
+
+ private:
+  bool prev_;
+};
+
 struct TensorType;
 using TensorTypePtr = std::shared_ptr<TensorType>;
 // This type represents a single Tensor with a specific size
@@ -650,18 +666,38 @@ struct CAFFE2_API TensorType : public Type {
   VaryingShape<int64_t> strides() const;
 
   const VaryingShape<Stride>& stride_properties() const {
+    if (dontAccessProfiledProperty()) {
+      return TensorType::get()->stride_properties();
+    }
+
     return strides_;
   }
 
   c10::optional<at::Device> device() const {
+    if (dontAccessProfiledProperty()) {
+      return c10::nullopt;
+    }
+
     return device_;
   }
   c10::optional<at::ScalarType> scalarType() const {
+    if (dontAccessProfiledProperty()) {
+      return c10::nullopt;
+    }
+
     return scalar_type_;
   }
   c10::optional<bool> requiresGrad() const {
+    if (dontAccessProfiledProperty()) {
+      return c10::nullopt;
+    }
+
     return requires_grad_;
   }
+  bool isProfiled() const {
+    return is_profiled_;
+  }
+
   bool requires_grad() const override {
     return requires_grad_ ? *requires_grad_ : true;
   }
@@ -676,6 +712,10 @@ struct CAFFE2_API TensorType : public Type {
   }
 
   c10::optional<size_t> numel() const {
+    if (dontAccessProfiledProperty()) {
+      return c10::nullopt;
+    }
+
     size_t prod = 1;
     const auto& shape = sizes();
 
@@ -759,6 +799,10 @@ struct CAFFE2_API TensorType : public Type {
   // in the type-hierarchy. Excluding require_grad and undefined allows
   // this to match the old behavior.
   bool isComplete() const {
+    if (dontAccessProfiledProperty()) {
+      return false;
+    }
+
     return scalar_type_ && device_ && sizes_.isComplete() && strides_.isComplete();
   }
 
@@ -768,10 +812,13 @@ struct CAFFE2_API TensorType : public Type {
 
   static TensorTypePtr getInferred() {
     static auto valueInferred = TensorType::create(
-      /*scalar_type=*/{}, /*device=*/{},
-      /*sizes=*/SymbolicShape(),
-      /*stride=*/VaryingShape<Stride>{}, /*requires_grad=*/{},
-      /*undefined=*/false, /*is_inferred=*/true);
+                                    /*scalar_type=*/{},
+                                    /*device=*/{},
+                                    /*sizes=*/SymbolicShape(),
+                                    /*stride=*/VaryingShape<Stride>{},
+                                    /*requires_grad=*/{},
+                                    /*undefined=*/false)
+                                    ->withInferred();
     return valueInferred;
   }
 
@@ -788,13 +835,31 @@ struct CAFFE2_API TensorType : public Type {
     return r;
   }
 
+  TensorTypePtr withInferred() {
+    auto r = clone();
+    r->is_inferred_ = true;
+    return r;
+  }
+
+  TensorTypePtr withProfiledType(bool profiled) {
+    auto r = clone();
+    r->is_profiled_ = profiled;
+    return r;
+  }
+
   TensorTypePtr withPossiblyUndefined() {
     auto r = clone();
     r->undefined_ = c10::nullopt;
     return r;
   }
 
-  c10::optional<bool> undefined() const { return undefined_; }
+  c10::optional<bool> undefined() const {
+    if (dontAccessProfiledProperty()) {
+      return c10::nullopt;
+    }
+
+    return undefined_;
+  }
 
   static TensorTypePtr get();
 
@@ -807,11 +872,22 @@ struct CAFFE2_API TensorType : public Type {
       const SymbolicShape& sizes,
       const VaryingShape<Stride>& strides,
       c10::optional<bool> requires_grad,
-      c10::optional<bool> undefined = false);
+      c10::optional<bool> undefined = false,
+      bool is_profiled = false);
 
   TensorTypePtr clone() const {
     return TensorTypePtr(new TensorType(
-        scalar_type_, device_, sizes_, strides_, requires_grad_, undefined_));
+        scalar_type_,
+        device_,
+        sizes_,
+        strides_,
+        requires_grad_,
+        undefined_,
+        is_profiled_));
+  }
+
+  bool dontAccessProfiledProperty() const {
+    return !getAllowProfiledTypes() && is_profiled_;
   }
 
   static std::vector<int64_t> contiguousStridesOf(at::IntArrayRef sizes) {
@@ -849,6 +925,8 @@ struct CAFFE2_API TensorType : public Type {
   c10::optional<bool> undefined_;
   // Represents whether or not this type was inferred.
   bool is_inferred_ = false;
+
+  bool is_profiled_ = false;
 };
 
 struct ListType;

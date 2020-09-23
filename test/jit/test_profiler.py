@@ -7,6 +7,7 @@ import torch
 pytorch_test_dir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 sys.path.append(pytorch_test_dir)
 from torch.testing._internal.jit_utils import JitTestCase, warmup_backward, FileCheck
+from torch._C import parse_ir
 
 if __name__ == '__main__':
     raise RuntimeError("This test file is not meant to be run directly, use:\n\n"
@@ -191,3 +192,32 @@ class TestProfiler(JitTestCase):
 
         g = torch.jit.last_executed_optimized_graph()
         FileCheck().check("fallback_function").check_next("CallFunction").run(g)
+
+    def test_only_guarding_profiled_type(self):
+        graph_str = """
+        graph(%a : Float(128:1, device=cpu),
+            %b : Float(128:1, device=cpu)):
+                %x : Float(128:1, device=cpu) = aten::mul(%a, %a)
+                %y : Float(128:1, device=cpu) = aten::mul(%b, %b)
+                return (%x, %y)
+        """
+        graph = parse_ir(graph_str)
+        self.run_pass("fuse_tensorexprs", graph)
+        FileCheck().check_count("TensorExprGroup", 2, exactly=True).run(graph)
+        FileCheck().check_not("prim::If").run(graph)
+        FileCheck().check_not("Profiled").run(graph)
+
+        # Now that the types are profiled (not guaranteed to be correct)
+        # The fuser must insert its own guards
+
+        graph_str = """
+        graph(%a : Profiled[Float(128:1, device=cpu)],
+            %b : Profiled[Float(128:1, device=cpu)]):
+                %x : Profiled[Float(128:1, device=cpu)] = aten::mul(%a, %a)
+                %y : Profiled[Float(128:1, device=cpu)] = aten::mul(%b, %b)
+                return (%x, %y)
+        """
+        graph = parse_ir(graph_str)
+        self.run_pass("fuse_tensorexprs", graph)
+        FileCheck().check_count("TensorExprGroup", 2, exactly=True).run(graph)
+        FileCheck().check("prim::If").check("FallbackGraph").run(graph)

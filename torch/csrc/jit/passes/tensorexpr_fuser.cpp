@@ -230,7 +230,9 @@ void removeProfileNodesAndSpecializeTypes(Block* b) {
       GRAPH_DEBUG("Removing prim::profile: %", it->output()->debugName());
       it->output()->replaceAllUsesWith(it->input());
       if (!profiledWithDifferentTypes(it->input())) {
-        it->input()->setType(it->ty(attr::profiled_type));
+        it->input()->setType(it->ty(attr::profiled_type)
+                                 ->expect<TensorType>()
+                                 ->withProfiledType(true));
       } else {
         GRAPH_DEBUG(
             "Ignoring value with differently typed profiles :%",
@@ -293,6 +295,8 @@ class TensorExprFuser {
         disable_shape_checks_(disable_shape_checks) {}
 
   void run() {
+    // Within this pass, we access
+    at::WithAllowProfiledTypeAccess guard;
     aliasDb_ = torch::make_unique<AliasDb>(graph_);
     RemoveRedundantProfiles(graph_);
     GRAPH_DUMP("After removing redundant profile nodes: ", graph_);
@@ -728,6 +732,26 @@ class TensorExprFuser {
   }
 #undef REQ
 
+  void updateFusionProfiledTypes(Node* fusion_group) {
+    for (Value* v : fusion_group->outputs()) {
+      v->setType(v->type()->expect<TensorType>()->withProfiledType(false));
+    }
+
+    auto update_value_list = [](at::ArrayRef<Value*> values) {
+      for (Value* v : values) {
+        if (auto tensor = v->type()->cast<TensorType>()) {
+          v->setType(tensor->withProfiledType(false));
+        }
+      }
+    };
+
+    auto subgraph = SubgraphUtils::getSubgraph(fusion_group);
+    update_value_list(subgraph->inputs());
+    for (Node* n : subgraph->nodes()) {
+      update_value_list(n->outputs());
+    }
+  }
+
   void guardFusionGroup(Node* fusion_group) {
     GRAPH_DEBUG("Inserting a typecheck guard for a node", *fusion_group);
     auto subgraph = SubgraphUtils::getSubgraph(fusion_group);
@@ -741,13 +765,14 @@ class TensorExprFuser {
         continue;
       }
 
-      // fusion outputs are already guarded
-      if (input->node()->kind() == prim::Constant ||
-          input->node()->kind() == prim::FusionGroup) {
-        continue;
+      // we only need to guard it if it's a profiled type
+      if (input->type()->expect<TensorType>()->isProfiled()) {
+        inputs_to_check.push_back(input);
       }
-      inputs_to_check.push_back(input);
     }
+
+    updateFusionProfiledTypes(fusion_group);
+
     if (!inputs_to_check.size()) {
       return;
     }
@@ -774,10 +799,13 @@ class TensorExprFuser {
     }
 
     // Fixup types of the typecheck node outputs, which are used by the op in
-    // execution
+    // execution.
     typecheck_node->output(inputs_to_check.size())->setType(BoolType::get());
     for (size_t i = 0; i < typecheck_node->inputs().size(); ++i) {
-      typecheck_node->output(i)->setType(typecheck_node->input(i)->type());
+      typecheck_node->output(i)->setType(typecheck_node->input(i)
+                                             ->type()
+                                             ->expect<TensorType>()
+                                             ->withProfiledType(false));
     }
 
     // Insert if
@@ -802,9 +830,6 @@ class TensorExprFuser {
       false_block->registerOutput(output);
     }
 
-    // types get copied to the fallback graph, so remove specializations before
-    // replacing
-    removeTensorTypeSpecializations(false_block);
     replaceBlockWithFallbackGraph(false_block, fusion_group->inputs());
 
     // Fill in the true block. It has all inputs type-checked and its

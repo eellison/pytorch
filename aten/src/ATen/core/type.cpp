@@ -18,6 +18,9 @@ TypeVerbosity type_verbosity() {
 
 std::ostream& operator<<(std::ostream & out, const Type & t) {
   if (auto value = t.cast<TensorType>()) {
+    if (value->isProfiled()) {
+      out << "Profiled[";
+    }
     if  (value->scalarType().has_value()) {
       out << toString(*value->scalarType());
       if (!value->sizes().size().has_value()) {
@@ -66,6 +69,9 @@ std::ostream& operator<<(std::ostream & out, const Type & t) {
     if (value->undefined() && *value->undefined()) {
       out << "[Undefined]";
     }
+    if (value->isProfiled()) {
+      out << "]";
+    }
   } else if(t.kind() == TypeKind::ListType) {
     auto prim = t.cast<ListType>()->getElementType();
     out << *prim << "[]";
@@ -98,6 +104,21 @@ std::ostream& operator<<(std::ostream & out, const Type & t) {
      out << t.str();
   }
   return out;
+}
+
+thread_local bool allow_profiled_types = false;
+
+bool getAllowProfiledTypes() {
+  return allow_profiled_types;
+}
+
+WithAllowProfiledTypeAccess::WithAllowProfiledTypeAccess() {
+  prev_ = allow_profiled_types;
+  allow_profiled_types = true;
+}
+
+WithAllowProfiledTypeAccess::~WithAllowProfiledTypeAccess() {
+  allow_profiled_types = prev_;
 }
 
 AnyTypePtr AnyType::get() {
@@ -550,11 +571,16 @@ VaryingShape<int64_t> TensorType::sizes() const {
 }
 
 TensorTypePtr TensorType::merge(TensorTypePtr other, bool merge_sizes) const {
+  if (isProfiled() != other->isProfiled()) {
+    return TensorType::get();
+  }
+
   auto scalar_type = merge_primitive(scalarType(), other->scalarType());
   auto dev = merge_primitive(device(), other->device());
   auto sprops = stride_properties().merge(other->stride_properties());
   auto gr = merge_primitive(requiresGrad(), other->requiresGrad());
   auto undef = merge_primitive(undefined(), other->undefined());
+  auto is_profiled = isProfiled();
   return TensorType::create(
       scalar_type,
       dev,
@@ -562,7 +588,8 @@ TensorTypePtr TensorType::merge(TensorTypePtr other, bool merge_sizes) const {
                   : symbolic_sizes(),
       sprops,
       gr,
-      undef);
+      undef,
+      is_profiled);
 }
 
 template <typename T>
@@ -906,14 +933,16 @@ TensorType::TensorType(
     const SymbolicShape& sizes,
     const VaryingShape<Stride>& strides,
     c10::optional<bool> requires_grad,
-    c10::optional<bool> undefined)
+    c10::optional<bool> undefined,
+    bool is_profiled)
     : Type(TypeKind::TensorType),
       scalar_type_(scalar_type),
       device_(device),
       sizes_(sizes),
       strides_(strides),
       requires_grad_(requires_grad),
-      undefined_(undefined) {}
+      undefined_(undefined),
+      is_profiled_(is_profiled) {}
 
 TensorTypePtr TensorType::create(const at::Tensor& t) {
   VaryingShape<bool> contiguity;

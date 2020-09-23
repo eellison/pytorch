@@ -323,6 +323,19 @@ std::pair<TypePtr, c10::optional<AliasInfo>> SchemaTypeParser::parseType() {
       parseTensorDType(L.cur().text())) {
     value = parseRefinedTensor();
     alias_info = parseAliasAnnotation();
+  } else if (
+      complete_tensor_types && L.cur().kind == TK_IDENT &&
+      L.cur().text() == "Profiled") {
+    L.next();
+    L.expect('[');
+    if (L.cur().text() == "Tensor") {
+      value = TensorType::get()->withProfiledType(true);
+    } else {
+      value =
+          parseRefinedTensor()->expect<TensorType>()->withProfiledType(true);
+    }
+    L.expect(']');
+    alias_info = parseAliasAnnotation();
   } else if (L.cur().kind == TK_IDENT && L.cur().text() == "__torch__") {
     L.next();
     L.expect('.');

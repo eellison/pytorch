@@ -930,6 +930,8 @@ Node* replaceBlockWithFallbackGraph(Block* b, ArrayRef<Value*> inputs) {
     it.destroyCurrent();
   }
 
+  RemoveTensorTypeSpecializations(graph);
+
   return fallback;
 }
 
