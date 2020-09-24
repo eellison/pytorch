@@ -109,6 +109,32 @@ void RemoveTensorTypeSpecializations(std::shared_ptr<Graph>& graph) {
   removeTensorTypeSpecializations(graph->block());
 }
 
+void eraseProfiledTypes(Value* v) {
+  if (auto ten_type = v->type()->cast<TensorType>()) {
+    if (ten_type->isProfiled()) {
+      v->setType(TensorType::get());
+    }
+  }
+}
+
+void eraseProfiledTypes(Block* block) {
+  for (Value* v : block->inputs()) {
+    eraseProfiledTypes(v);
+  }
+  for (Node* n : block->nodes()) {
+    for (Block* b : n->blocks()) {
+      eraseProfiledTypes(b);
+    }
+    for (Value* v : n->outputs()) {
+      removeTensorTypeSpecialization(v);
+    }
+  }
+}
+
+void EraseProfiledTypes(std::shared_ptr<Graph>& graph) {
+  eraseProfiledTypes(graph->block());
+}
+
 // TODO: if a value has differently typed uses, temporarrily insert a node
 // specializing the type for each use and later remove, instead of bailing
 bool profiledWithDifferentTypes(Value* v) {
@@ -214,7 +240,8 @@ void guardFusionGroup(Node* fusion_group) {
           ->create(prim::If, {typecheck_result}, fusion_group->outputs().size())
           ->insertAfter(typecheck_node);
   for (size_t idx = 0; idx < fusion_group->outputs().size(); ++idx) {
-    versioning_if->output(idx)->setType(fusion_group->output(idx)->type());
+    versioning_if->output(idx)->setType(
+        unshapedType(fusion_group->output(idx)->type()));
     fusion_group->output(idx)->replaceAllUsesWith(versioning_if->output(idx));
   }
   auto true_block = versioning_if->addBlock();

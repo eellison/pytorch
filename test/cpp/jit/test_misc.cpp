@@ -8,6 +8,7 @@
 
 #include <torch/csrc/jit/ir/type_hashing.h>
 #include <torch/csrc/jit/passes/canonicalize.h>
+#include <torch/csrc/jit/passes/utils/fuser_utils.h>
 #include "torch/csrc/autograd/generated/variable_factories.h"
 #include "torch/csrc/autograd/variable.h"
 #include "torch/csrc/jit/codegen/fuser/interface.h"
@@ -1213,8 +1214,8 @@ void testFallbackGraphs() {
   static const auto nestGraphIntoFallbackGraph =
       [](const std::shared_ptr<Graph>& graph) {
         ProfilingRecord::removeProfileCounter(graph->block());
-        auto fallback =
-            replaceBlockWithFallbackGraph(graph->block(), graph->inputs());
+        auto fallback = FuserUtils::replaceBlockWithFallbackGraph(
+            graph->block(), graph->inputs());
         for (size_t i = 0; i < graph->outputs().size(); i++) {
           graph->outputs()[i]->replaceAllUsesWith(fallback->output(i));
           fallback->output(i)->copyMetadata(graph->outputs()[i]);
@@ -1260,7 +1261,8 @@ void testFallbackGraphs() {
         auto opt_graph = lastExecutedOptimizedGraph();
         // this is safe to do since we are done profiling
         ProfilingRecord::removeProfileCounter(opt_graph->block());
-        replaceBlockWithFallbackGraph(opt_graph->block(), opt_graph->inputs());
+        FuserUtils::replaceBlockWithFallbackGraph(
+            opt_graph->block(), opt_graph->inputs());
         auto it = opt_graph->block()->nodes().begin();
         ASSERT_EQ(it->kind(), prim::FallbackGraph);
         auto fallback = *it++;

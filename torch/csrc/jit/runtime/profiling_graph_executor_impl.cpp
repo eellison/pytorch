@@ -28,6 +28,7 @@
 #include <torch/csrc/jit/passes/shape_analysis.h>
 #include <torch/csrc/jit/passes/specialize_autogradzero.h>
 #include <torch/csrc/jit/passes/tensorexpr_fuser.h>
+#include <torch/csrc/jit/passes/utils/fuser_utils.h>
 
 C10_DECLARE_bool();
 
@@ -245,7 +246,7 @@ void runDiffGraphPasses(std::shared_ptr<Graph>& graph) {
       // inserting proper type checks. Once we're done with these optimizations
       // we will wipe the tensor type information from the IR, so that it's not
       // accidentally used by any other pass.
-      RemoveProfileNodesAndSpecializeTypes(graph);
+      FuserUtils::RemoveProfileNodesAndSpecializeTypes(graph);
       GRAPH_DEBUG(
           "After RemoveProfileNodesAndSpecializeTypes, before BatchMM\n",
           *graph);
@@ -258,7 +259,7 @@ void runDiffGraphPasses(std::shared_ptr<Graph>& graph) {
           "After Fusion, before RemoveTensorTypeSpecializations\n", *graph);
 
       // Wipe tensor type info from the IR
-      RemoveTensorTypeSpecializations(graph);
+      FuserUtils::RemoveTensorTypeSpecializations(graph);
       GRAPH_DEBUG(
           "After RemoveTensorTypeSpecializations, before customPostPasses\n",
           *graph);
@@ -304,7 +305,7 @@ void runNoGradOptimizations(std::shared_ptr<Graph>& graph) {
       // inserting proper type checks. Once we're done with these optimizations
       // we will wipe the tensor type information from the IR, so that it's not
       // accidentally used by any other pass.
-      RemoveProfileNodesAndSpecializeTypes(graph);
+      FuserUtils::RemoveProfileNodesAndSpecializeTypes(graph);
       GRAPH_DEBUG(
           "After RemoveProfileNodesAndSpecializeTypes, before BatchMM\n",
           *graph);
@@ -317,7 +318,7 @@ void runNoGradOptimizations(std::shared_ptr<Graph>& graph) {
           "After Fusion, before RemoveTensorTypeSpecializations\n", *graph);
 
       // Wipe tensor type info from the IR
-      RemoveTensorTypeSpecializations(graph);
+      FuserUtils::RemoveTensorTypeSpecializations(graph);
       GRAPH_DEBUG(
           "After RemoveTensorTypeSpecializations, before customPostPasses\n",
           *graph);
@@ -350,6 +351,7 @@ void ProfilingGraphExecutorImpl::runProfilingOptimizations(
   runPreAutodiffPassPipeline(copy);
 
   if (needsGradientInProfilingMode(copy->block())) {
+    FuserUtils::RemoveProfileNodesAndSpecializeTypes(copy);
     auto diff_nodes = CreateAutodiffSubgraphs(
         copy,
         getAutodiffSubgraphInlining() ? autodiffSubgraphNodeThreshold : 1);
@@ -376,6 +378,7 @@ void ProfilingGraphExecutorImpl::runProfilingOptimizations(
   } else {
     runNoGradOptimizations(copy);
   }
+  FuserUtils::EraseProfiledTypes(copy);
   EliminateDeadCode(copy);
   GRAPH_DEBUG("After runProfilingOptimizations:\n", *copy);
 }

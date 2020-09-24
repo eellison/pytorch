@@ -3,6 +3,7 @@
 #include <torch/csrc/jit/ir/ir.h>
 #include <torch/csrc/jit/jit_log.h>
 #include <torch/csrc/jit/passes/clear_undefinedness.h>
+#include <torch/csrc/jit/passes/utils/fuser_utils.h>
 #include <torch/csrc/jit/runtime/graph_executor.h>
 
 namespace torch {
@@ -112,7 +113,7 @@ struct AutogradZeroSpecializer {
     replaceBlockInputsWithGraphInputs(true_block);
     false_block->cloneFrom(graph_->block(), value_map);
     replaceBlockInputsWithGraphInputs(false_block);
-    replaceBlockWithFallbackGraph(false_block, graph_->inputs());
+    FuserUtils::replaceBlockWithFallbackGraph(false_block, graph_->inputs());
 
     WithInsertPoint wip{graph_->block()->param_node()->next()};
     Value* none_val = graph_->insertConstant(IValue());

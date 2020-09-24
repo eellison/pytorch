@@ -1,10 +1,11 @@
 #include <torch/csrc/jit/passes/create_autodiff_subgraphs.h>
-
 #include <c10/util/Exception.h>
 #include <torch/csrc/jit/ir/alias_analysis.h>
 #include <torch/csrc/jit/ir/ir.h>
 #include <torch/csrc/jit/passes/canonicalize.h>
 #include <torch/csrc/jit/passes/common_subexpression_elimination.h>
+#include <torch/csrc/jit/passes/tensorexpr_fuser.h>
+#include <torch/csrc/jit/passes/utils/fuser_utils.h>
 #include <torch/csrc/jit/passes/utils/subgraph_utils.h>
 #include <torch/csrc/jit/runtime/autodiff.h>
 
@@ -279,6 +280,12 @@ class SubgraphSlicer {
     if (isViewOp(node)) {
       return false;
     }
+    {
+      at::WithAllowProfiledTypeAccess guard;
+      if (tensorExprFuserEnabled() && !tensorexpr::isSupported(node)) {
+        return false;
+      }
+    }
     return isDifferentiable(node);
   }
 
@@ -328,6 +335,13 @@ class SubgraphSlicer {
   AliasDb& aliasDb_;
   std::vector<Node*>& diff_nodes_;
 };
+
+void guardDiffGroups(std::vector<Node*>& diff_nodes) {
+  for (Node* n : diff_nodes) {
+    FuserUtils::guardFusionGroup(n);
+  }
+}
+
 } // anonymous namespace
 
 std::vector<Node*> CreateAutodiffSubgraphs(
@@ -336,6 +350,9 @@ std::vector<Node*> CreateAutodiffSubgraphs(
   std::vector<Node*> diff_nodes;
   AliasDb db(graph);
   SubgraphSlicer(graph->block(), graph, threshold, db, diff_nodes).run();
+  if (tensorExprFuserEnabled()) {
+    guardDiffGroups(diff_nodes);
+  }
   return diff_nodes;
 }
 } // namespace jit

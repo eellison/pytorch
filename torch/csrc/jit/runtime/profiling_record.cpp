@@ -205,6 +205,19 @@ bool needsProfiledOutput(Node* n) {
   }
 }
 
+void ProfilingRecord::removeProfilingNodes(Block* b) {
+  for (auto it = b->nodes().begin(); it != b->nodes().end(); it++) {
+    if (it->kind() == prim::profile || it->kind() == prim::profile_optional) {
+      it->output()->replaceAllUsesWith(it->input());
+      it.destroyCurrent();
+    } else {
+      for (Block* ib : it->blocks()) {
+        removeProfilingNodes(ib);
+      }
+    }
+  }
+}
+
 void ProfilingRecord::removeProfileCounter(Block* b) {
   for (auto it = b->nodes().rbegin(); it != b->nodes().rend();) {
     auto n = *it;
@@ -277,19 +290,6 @@ void ProfilingRecord::instrumentBlock(Block* block) {
     auto i = block->return_node()->input(offset);
     if (i->type()->isSubtypeOf(TensorType::get())) {
       insertShapeProfile(block->return_node(), offset);
-    }
-  }
-}
-
-void ProfilingRecord::removeProfilingNodes(Block* b) {
-  for (auto it = b->nodes().begin(); it != b->nodes().end(); it++) {
-    if (it->kind() == prim::profile || it->kind() == prim::profile_optional) {
-      it->output()->replaceAllUsesWith(it->input());
-      it.destroyCurrent();
-    } else {
-      for (Block* ib : it->blocks()) {
-        removeProfilingNodes(ib);
-      }
     }
   }
 }
