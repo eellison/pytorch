@@ -18,6 +18,8 @@ TORCH_API void RemoveTensorTypeSpecializations(std::shared_ptr<Graph>& graph);
 TORCH_API void RemoveProfileNodesAndSpecializeTypes(
     std::shared_ptr<Graph>& graph);
 
+TORCH_API void guardFusionGroup(Node* fusion_group);
+
 } // namespace FuserUtils
 } // namespace jit
 } // namespace torch
