@@ -203,7 +203,8 @@ core_sources_full = [
     "torch/csrc/jit/passes/subgraph_rewrite.cpp",
     "torch/csrc/jit/passes/tensorexpr_fuser.cpp",
     "torch/csrc/jit/passes/utils/memory_dag.cpp",
-    "torch/csrc/jit/passes/utils/subgraph_utils.cpp",
+    "torch/csrc/jit/passes/utils/subgraph_utils.cpp",a
+    "torch/csrc/jit/passes/utils/fuser_utils.cpp",
     "torch/csrc/jit/passes/xnnpack_rewrite.cpp",
     "torch/csrc/jit/passes/vulkan_rewrite.cpp",
     "torch/csrc/jit/passes/quantization/helper.cpp",
