@@ -282,6 +282,12 @@ struct PeepholeOptimizeImpl {
               output->debugName());
           node->output()->replaceAllUsesWith(output);
         }
+      } else if (node->matches("aten::dim(Tensor self) -> int") && node->input()->node()->kind() == aten::conv2d) {
+        WithInsertPoint guard(node);
+        // Any Value whose type is None should be replaced with a Constant
+        // This can occur if a module has an optional attribute, and it is
+        // initialized as None.
+        node->output()->replaceAllUsesWith(graph_->insertConstant(4));
       } else if (
           node->matches("aten::dim(Tensor self) -> int") && shape_peepholes_) {
         auto ptt = node->input()->type()->expect<TensorType>();
@@ -312,7 +318,6 @@ struct PeepholeOptimizeImpl {
           node->output()->replaceAllUsesWith(output);
         }
       }
-
       // [aliasing sensitive optimizations]
       // aliasing sensitive peephole transforms are not run at the moment,
       // because compilation cost of creating alias db is not worth

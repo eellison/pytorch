@@ -73,6 +73,7 @@
 #include <torch/csrc/jit/python/python_tree_views.h>
 #include <torch/csrc/jit/python/script_init.h>
 #include <torch/csrc/jit/runtime/argument_spec.h>
+#include <torch/csrc/jit/passes/fold_conv_bn.h>
 #include <torch/csrc/jit/runtime/autodiff.h>
 #include <torch/csrc/jit/runtime/graph_executor.h>
 #include <torch/csrc/jit/runtime/jit_exception.h>
@@ -125,6 +126,71 @@ bool loadPythonClasses() {
 #if !defined(__HIP_PLATFORM_HCC__)
 TORCH_API void runJITCPPTests();
 #endif
+
+bool nonConstantParameter(Node * n, Node * conv) {
+  for (Node * checking_constants: {n, conv}) {
+    for (size_t i = 1; i < checking_constants->inputs().size(); i++) {
+      if (checking_constants->inputs().at(i)->node()->kind() != prim::Constant) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+void fuseBatchNormConv(Block * b) {
+  for (Node * n : b->nodes()) {
+    if (n->kind() == aten::batch_norm && n->inputs().at(0)->node()->kind() == aten::conv2d) {
+      auto conv = n->inputs().at(0)->node();
+      if (nonConstantParameter(n, conv)) {
+        continue;
+      }
+      auto bn_rm = constant_as<Tensor>(n->input(3)).value();
+      auto bn_rv = constant_as<Tensor>(n->input(4)).value();
+      auto bn_eps = constant_as<double>(n->input(7)).value();
+
+      auto conv_w = constant_as<Tensor>(conv->input(1)).value();
+      at::Tensor conv_b;
+      if (conv->input(2)->type() == NoneType::get()) {
+        conv_b = torch::zeros_like(bn_rm);
+      } else {
+        conv_b = constant_as<Tensor>(conv->input(2)).value();
+      }
+      at::Tensor bn_w;
+      if (n->input(1)->type() == NoneType::get()) {
+        bn_w = torch::zeros_like(bn_rm);
+      } else {
+        bn_w = constant_as<Tensor>(n->input(1)).value();
+      }
+      at::Tensor bn_b;
+      if (n->input(2)->type() == NoneType::get()) {
+        bn_b = torch::zeros_like(bn_rm);
+      } else {
+        bn_b = constant_as<Tensor>(n->input(2)).value();
+      }
+      // auto conv_b = constant_as<Tensor>(conv->input(2)).value();
+      // Tensor input, Tensor? weight, Tensor? bias, Tensor? running_mean, Tensor? running_var, bool training, float momentum, float eps, bool cudnn_enabled)
+      // auto bn_b = constant_as<Tensor>(n->input(2)).value();
+
+      ConvBNParameters params;
+      params.conv_w = conv_w;
+      params.conv_b = conv_b;
+      params.bn_rm = bn_rm;
+      params.bn_rv = bn_rv;
+      params.bn_eps = bn_eps;
+      params.bn_w = bn_w;
+      params.bn_b = bn_b;
+      std::tuple<at::Tensor, at::Tensor> out = torch::jit::computeUpdatedConvWeightAndBias(params);
+      WithInsertPoint guard(conv);
+      auto fused_conv_w = b->owningGraph()->insertConstant(std::get<0>(out));
+      auto fused_conv_b = b->owningGraph()->insertConstant(std::get<0>(out));
+      // todo set debugname
+      conv->replaceInput(1, fused_conv_w);
+      conv->replaceInput(2, fused_conv_b);
+      n->output()->replaceAllUsesWith(conv->output());
+    }
+  }
+}
 
 void initJITBindings(PyObject* module) {
   auto m = py::handle(module).cast<py::module>();
@@ -362,6 +428,12 @@ void initJITBindings(PyObject* module) {
           },
           py::arg("graph"),
           py::arg("addmm_fusion_enabled") = false)
+      .def(
+          "_jit_pass_fold_batch_conv",
+          [](const std::shared_ptr<Graph>& g) {
+            fuseBatchNormConv(g->block());
+            EliminateDeadCode(g);
+          })
       .def(
           "_jit_pass_fuse_addmm",
           [](std::shared_ptr<Graph>& g) { return FuseAddMM(g); })
