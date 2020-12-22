@@ -145,32 +145,30 @@ void fuseBatchNormConv(Block * b) {
       if (nonConstantParameter(n, conv)) {
         continue;
       }
-      auto bn_rm = constant_as<Tensor>(n->input(3)).value();
-      auto bn_rv = constant_as<Tensor>(n->input(4)).value();
-      auto bn_eps = constant_as<double>(n->input(7)).value();
 
-      auto conv_w = constant_as<Tensor>(conv->input(1)).value();
+      auto bn_rm = constant_as<Tensor>(n->namedInput("running_mean")).value();
+      auto bn_rv = constant_as<Tensor>(n->namedInput("running_var")).value();
+      auto bn_eps = constant_as<double>(n->namedInput("eps")).value();
+
+      auto conv_w = constant_as<Tensor>(conv->namedInput("weight")).value();
       at::Tensor conv_b;
-      if (conv->input(2)->type() == NoneType::get()) {
+      if (conv->namedInput("bias")->type() == NoneType::get()) {
         conv_b = torch::zeros_like(bn_rm);
       } else {
-        conv_b = constant_as<Tensor>(conv->input(2)).value();
+        conv_b = constant_as<Tensor>(conv->namedInput("bias")).value();
       }
       at::Tensor bn_w;
-      if (n->input(1)->type() == NoneType::get()) {
-        bn_w = torch::zeros_like(bn_rm);
+      if (n->namedInput("weight")->type() == NoneType::get()) {
+        bn_w = torch::ones_like(bn_rm);
       } else {
-        bn_w = constant_as<Tensor>(n->input(1)).value();
+        bn_w = constant_as<Tensor>(n->namedInput("weight")).value();
       }
       at::Tensor bn_b;
-      if (n->input(2)->type() == NoneType::get()) {
+      if (n->namedInput("bias")->type() == NoneType::get()) {
         bn_b = torch::zeros_like(bn_rm);
       } else {
-        bn_b = constant_as<Tensor>(n->input(2)).value();
+        bn_b = constant_as<Tensor>(n->namedInput("bias")).value();
       }
-      // auto conv_b = constant_as<Tensor>(conv->input(2)).value();
-      // Tensor input, Tensor? weight, Tensor? bias, Tensor? running_mean, Tensor? running_var, bool training, float momentum, float eps, bool cudnn_enabled)
-      // auto bn_b = constant_as<Tensor>(n->input(2)).value();
 
       ConvBNParameters params;
       params.conv_w = conv_w;
@@ -183,10 +181,11 @@ void fuseBatchNormConv(Block * b) {
       std::tuple<at::Tensor, at::Tensor> out = torch::jit::computeUpdatedConvWeightAndBias(params);
       WithInsertPoint guard(conv);
       auto fused_conv_w = b->owningGraph()->insertConstant(std::get<0>(out));
-      auto fused_conv_b = b->owningGraph()->insertConstant(std::get<0>(out));
+      auto fused_conv_b = b->owningGraph()->insertConstant(std::get<1>(out));
       // todo set debugname
-      conv->replaceInput(1, fused_conv_w);
-      conv->replaceInput(2, fused_conv_b);
+      conv->replaceInputWith(conv->namedInput("weight"), fused_conv_w);
+      conv->replaceInputWith(conv->namedInput("bias"), fused_conv_b);
+
       n->output()->replaceAllUsesWith(conv->output());
     }
   }
