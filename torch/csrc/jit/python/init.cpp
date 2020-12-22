@@ -138,6 +138,46 @@ bool nonConstantParameter(Node * n, Node * conv) {
   return false;
 }
 
+void fuseConvMulAdd(Block * b) {
+  for (auto it = b->nodes().begin(); it != b->nodes().end();) {
+    Node* n = *it;
+    it++;
+    if (n->kind() == aten::conv2d) {
+      if (!(n->output()->node()->kind() == aten::mul) || !(n->output()->node()->output()->node()->kind() == aten::add)) {
+        continue;
+      }
+      auto conv = n;
+      auto mul = n->output()->node();
+      auto add = n->output()->node()->output()->node();
+      if (nonConstantParameter(n, mul) || nonConstantParameter(n, add)) {
+        continue;
+      }
+      Tensor conv_w = constant_as<Tensor>(conv->namedInput("weight")).value();
+      Tensor new_conv_w = constant_as<Tensor>(mul->input(1)).value() * conv_w;
+      if (add->inputs().size() != 3 && add->inputs().at(2)->type() != IntType::get()) {
+        continue;
+      }
+      Tensor conv_b;
+      if (conv->namedInput("bias")->type() == NoneType::get()) {
+        conv_b = torch::zeros_like(constant_as<Tensor>(add->input(1)).value());
+      } else {
+        conv_b = constant_as<Tensor>(conv->namedInput("bias")).value();
+      }
+      Tensor new_conv_bias = (conv_b * constant_as<int64_t>(add->inputs().at(2)).value()) + constant_as<Tensor>(add->input(1)).value();
+      auto fused_conv_w = b->owningGraph()->insertConstant(new_conv_w);
+      auto fused_conv_b = b->owningGraph()->insertConstant(new_conv_bias);
+      WithInsertPoint guard(conv);
+      conv->replaceInputWith(conv->namedInput("weight"), fused_conv_w);
+      conv->replaceInputWith(conv->namedInput("bias"), fused_conv_b);
+      add->output()->replaceAllUsesWith(conv->output());
+      add->destroy();
+      mul->destroy();
+      it = conv->iterator();
+      it++;
+    }
+  }
+}
+
 void fuseBatchNormConv(Block * b) {
   for (Node * n : b->nodes()) {
     if (n->kind() == aten::batch_norm && n->inputs().at(0)->node()->kind() == aten::conv2d) {
@@ -431,6 +471,7 @@ void initJITBindings(PyObject* module) {
           "_jit_pass_fold_batch_conv",
           [](const std::shared_ptr<Graph>& g) {
             fuseBatchNormConv(g->block());
+            fuseConvMulAdd(g->block());
             EliminateDeadCode(g);
           })
       .def(

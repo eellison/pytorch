@@ -6,8 +6,8 @@ model = model_orig
 model.eval()
 
 model = (torch.jit.script(model))
-import pdb; pdb.set_trace()
-torch._C._jit_pass_fold_convbn(model._c)
+# import pdb; pdb.set_trace()
+# torch._C._jit_pass_fold_convbn(model._c)
 model = torch.jit.freeze(model)
 import pdb; pdb.set_trace()
 torch._C._jit_pass_fold_batch_conv(model.graph)
@@ -15,8 +15,8 @@ torch._C._jit_pass_lint(model.graph)
 # print(model.graph)
 
 # inp = torch.rand([N, 3, 480, 480], device=device)
-inp = [torch.rand(3, 300, 400), torch.rand(3, 500, 400)]
-# inp = torch.ones(1, 3, 224, 224)
+# inp = [torch.rand(3, 300, 400), torch.rand(3, 500, 400)]
+inp = torch.ones(1, 3, 224, 224)
 
 for m in [model_orig, model]:
     import time
