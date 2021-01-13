@@ -214,16 +214,20 @@ void unroll(Node* loop) {
            graph->insert(aten::mul, {unrolled_iter_count, kUnrollFactor})}));
 }
 
-void UnrollLoops(Block* block) {
+void UnrollLoops(Block* block, bool constant_only) {
   for (auto it = block->nodes().begin(); it != block->nodes().end();) {
     // XXX: unroll might destroy the current node, so we need to pre-increment
     // the iterator
     Node* node = *it;
     ++it;
     for (Block* subblock : node->blocks()) {
-      UnrollLoops(subblock);
+      UnrollLoops(subblock, constant_only);
     }
     if (isForLoop(node)) {
+      if (constant_only &&
+          node->inputs().at(0)->node()->kind() != prim::Constant) {
+        continue;
+      }
       unroll(node);
     }
   }
@@ -361,7 +365,12 @@ Node* PeelLoop(Node* n, size_t times) {
 }
 
 void UnrollLoops(std::shared_ptr<Graph>& graph) {
-  UnrollLoops(graph->block());
+  UnrollLoops(graph->block(), false);
+  EliminateDeadCode(graph);
+}
+
+void UnrollConstantLoops(std::shared_ptr<Graph>& graph) {
+  UnrollLoops(graph->block(), true);
   EliminateDeadCode(graph);
 }
 

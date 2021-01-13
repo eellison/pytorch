@@ -7,6 +7,8 @@ namespace jit {
 
 TORCH_API void UnrollLoops(std::shared_ptr<Graph>& graph);
 
+TORCH_API void UnrollConstantLoops(std::shared_ptr<Graph>& graph);
+
 TORCH_API Node* PeelLoop(Node* n, size_t times);
 
 TORCH_API void PeelProfilingLoops(const std::shared_ptr<Graph>& graph);
