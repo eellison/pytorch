@@ -32,6 +32,29 @@ c10::optional<size_t> normIndex(int64_t index, size_t len) {
   }
 }
 
+void PeepholeOptimizeExceptionBlocks(Block * b) {
+    for (Node * n: b->nodes()) {
+        for (Block * block: n->blocks()) {
+            PeepholeOptimizeExceptionBlocks(block);
+        }
+        if (n->kind() == prim::If) {
+            auto true_block = n->blocks().at(0);
+            auto false_block = n->blocks().at(1);
+            for (size_t i = 0; i < n->outputs().size(); ++i) {
+
+
+            }
+        }
+
+
+
+    }
+
+
+
+}
+
+
 struct SymbolicShapeAnalyzer {
   void replaceWithIValue(Value* v, IValue val) {
     WithInsertPoint guard(*v->node()->owningBlock()->nodes().begin());
@@ -63,8 +86,8 @@ struct SymbolicShapeAnalyzer {
   c10::SymbolicShape run() {
       // TODO: if all inputs dont have uses (have been replaced with constant values)
       // just run graph
-      //TODO Inliner
-      for (size_t i = 0; i < 5; i++) {
+      // TODO Inliner
+      for (size_t i = 0; i < 6; i++) {
         inputInputTensorProperties();
         LowerSimpleTuples(graph_);
         RemoveListMutation(graph_);
@@ -92,7 +115,7 @@ struct SymbolicShapeAnalyzer {
           case aten::__getitem__: {
               auto index = constant_as<int64_t>(use.user->inputs().at(1));
               if (index) {
-                auto norm_index = normIndex(*shape.rank(), *shape.rank());
+                auto norm_index = normIndex(*index, *shape.rank());
                   // TODO: HANDLE non-static present value
                 if (norm_index && shape[*norm_index].is_static()) {
                     replaceWithIValue(use.user->output(), shape[*norm_index].static_size());

@@ -17,13 +17,13 @@ def conv2d_output_shape(input: List[int], weight: List[int], stride: List[int], 
     return [n, out_channels, hout, wout]
 
 
-# m = nn.Conv2d(16, 33, (3, 5), stride=(2, 1), padding=(4, 2), dilation=(3, 1))
-# m = torch.jit.script(m)
-# torch._C._jit_pass_inline(m.graph)
-# # torch._C._jit_pass_symbolic_shape_analysis(m.graph.findNode("aten::conv2d"), conv2d_output_shape.graph)
-# m = torch.jit.freeze(m.eval())
-# torch._C._jit_pass_symbolic_shape_analysis(m.graph.findNode("aten::conv2d"), conv2d_output_shape.graph)
-# print(m.graph)
+m = nn.Conv2d(16, 33, (3, 5), stride=(2, 1), padding=(4, 2), dilation=(3, 1))
+m = torch.jit.script(m)
+torch._C._jit_pass_inline(m.graph)
+torch._C._jit_pass_symbolic_shape_analysis(m.graph.findNode("aten::conv2d"), conv2d_output_shape.graph)
+m = torch.jit.freeze(m.eval())
+torch._C._jit_pass_symbolic_shape_analysis(m.graph.findNode("aten::conv2d"), conv2d_output_shape.graph)
+print(m.graph)
 
 def broadcast_dim(dim1: int, dim2: int):
     if dim1 == dim2:
@@ -68,7 +68,6 @@ inputs[1].setType(inputs[1].type().with_sizes([7, 1, 5]))
 torch._C._jit_pass_symbolic_shape_analysis(foo.graph.findNode("aten::mul"), broadcast.graph)
 
 print(foo.graph)
-
 
 # input = torch.randn(20, 16, 50, 100)
 # output = m(input)
