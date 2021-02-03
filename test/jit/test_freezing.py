@@ -1580,6 +1580,12 @@ class TestFrozenOptimizations(JitTestCase):
                 scripted_mod = torch.jit.script(mod)
                 inp = torch.rand(inp_shape)
 
+                n = torch.jit.freeze(torch.jit.script(nn.Sequential(mod, mod).eval()))
+                self.run_pass("convert_frozen_ops_to_mkldnn", n.graph)
+                print(n.graph)
+                return
+
+
                 self.run_pass("inline", scripted_mod.graph)
                 FileCheck().check("aten::linear").run(scripted_mod.graph)
                 # successfully no-ops with non-const inputs

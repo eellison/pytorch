@@ -249,12 +249,34 @@ void ConvertFrozenOpsToMKLDNN(Block* b) {
   }
 }
 
+void CoalesceAdjacentMKLDNNLayoutChanges(Block * block) {
+  for (Node * n: block->nodes()) {
+    if (n->kind() == prim::ConvertToMKLDNN && n->input()->node()->kind() == prim::ConvertFromMKLDNN) {
+      // auto inp = n->input();
+      // if (inp->uses().size() != 1) {
+      //   continue;
+      // }
+
+      // n->outputs().at(1)->replaceAllUsesWith(inp)
+
+
+    }
+  }
+
+
+}
+
+
+
 } // namespace
 
 void ConvertFrozenOpsToMKLDNN(std::shared_ptr<Graph>& graph) {
 #if AT_MKLDNN_ENABLED()
   graph_rewrite_helper::replaceConvolutionWithAtenConv(graph);
   ConvertFrozenConvParamsToMKLDNN(graph->block());
+
+
+
   EliminateDeadCode(graph);
 #endif
 }

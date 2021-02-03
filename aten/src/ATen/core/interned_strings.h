@@ -32,6 +32,7 @@ namespace c10 {
   _(prim, Constant)                  \
   _(prim, ChunkSizes)                \
   _(prim, ConvertToMKLDNN)           \
+  _(prim, ConvertFromMKLDNN)         \
   _(prim, ConstantMKLDNNTensor)      \
   _(prim, Drop)                      \
   _(prim, Eval)                      \
