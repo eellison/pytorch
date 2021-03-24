@@ -326,7 +326,7 @@ struct ConstantPropagator {
 
   AliasDb* getOrCreateAliasDb() {
     if (!aliasDb_) {
-      aliasDb_ = std::make_shared<AliasDb>(graph_);
+      aliasDb_ = std::make_unique<AliasDb>(graph_);
     }
     return aliasDb_.get();
   }
@@ -383,7 +383,7 @@ struct ConstantPropagator {
   }
 
   std::shared_ptr<Graph> graph_;
-  std::shared_ptr<AliasDb> aliasDb_ = nullptr;
+  std::unique_ptr<AliasDb> aliasDb_ = nullptr;
   bool aliasing_types_;
   bool made_change_ = false;
   bool ignore_custom_classes_;
@@ -400,6 +400,7 @@ bool ConstantPropagation(
     EliminateDeadCode(graph);
   }
   GRAPH_DUMP("After ConstantPropagation: ", graph);
+  return made_change;
 }
 
 bool ConstantPropagationImmutableTypes(std::shared_ptr<Graph>& graph) {
@@ -409,6 +410,7 @@ bool ConstantPropagationImmutableTypes(std::shared_ptr<Graph>& graph) {
     EliminateDeadCode(graph);
   }
   GRAPH_DUMP("After ConstantPropagation: ", graph);
+  return made_change;
 }
 
 } // namespace jit
