@@ -4795,6 +4795,7 @@ op_db: List[OpInfo] = [
            supports_gradgrad=True,
            supports_out=False,
            autodiff_fusible_nodes=["aten::gelu"],
+           aten_name="gelu",
            autodiff_nonfusible_nodes=[]),  # TODO: dont automatically propagate this
     OpInfo('nn.functional.hardswish',
            supports_autograd=True,
