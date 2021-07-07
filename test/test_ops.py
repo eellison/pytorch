@@ -394,6 +394,7 @@ class TestCommon(JitCommonTestCase):
             samples = op.sample_inputs(device, dtype, requires_grad=False)
 
         tested = False
+        # import pdb; pdb.set_trace()
         for sample in samples:
             # Test traced and scripted consistency
             for func_type, variant in variants.items():
@@ -404,8 +405,8 @@ class TestCommon(JitCommonTestCase):
                 # lambdas are typically used as a way to simulate methods without
                 # functional variants, so rely on the other variant for testing
                 # for now
-                if isinstance(variant, LambdaType):
-                    continue
+                # if isinstance(variant, LambdaType):
+                #     continue
 
                 tested = True
 
@@ -415,6 +416,8 @@ class TestCommon(JitCommonTestCase):
                 # run with disable_autodiff_subgraph_inlining(True) to test
                 #   autodiff support. Context manager forces the graph to contain
                 #   DifferentiableGraph nodes if they are present
+                torch._C._debug_set_fusion_group_inlining(True)
+                torch._C._jit_override_can_fuse_on_cpu(True)
                 with disable_autodiff_subgraph_inlining():
                     # Check scripted forward, grad, and grad grad
                     script_fn = create_script_fn(self, name, func_type)
@@ -428,6 +431,9 @@ class TestCommon(JitCommonTestCase):
                     def get_sample():
                         return clone_input_helper(sample.input) if op.name[-1] == '_' else sample.input
 
+                    # if _requires_grad: 
+                    #     import pdb; pdb.set_trace()
+
                     check_against_reference(self,
                                             script_fn,
                                             func,
@@ -436,9 +442,13 @@ class TestCommon(JitCommonTestCase):
                                             sample.kwargs,
                                             no_grad=not _requires_grad, no_gradgrad=not op.supports_gradgrad)
 
+                    # if _requires_grad: 
+                    #     import pdb; pdb.set_trace()
+
                     # Check traced forward, grad, and grad grad
                     # TODO: fix tracing here
                     supports_tracing = not op.has_fake_function
+                    supports_tracing = False
                     if supports_tracing:
                         traced_fn = create_traced_fn(self, variant)
                         check_against_reference(self,
@@ -480,9 +490,10 @@ class TestCommon(JitCommonTestCase):
                         else:
                             nonfusible_nodes = op.autodiff_nonfusible_nodes
                             fusible_nodes = op.autodiff_fusible_nodes
+                        # import pdb; pdb.set_trace()
 
-                        if supports_tracing:
-                            self.assertAutodiffNode(traced_fn.last_graph, op.assert_autodiffed, nonfusible_nodes, fusible_nodes)
+                        # if supports_tracing:
+                        #     self.assertAutodiffNode(traced_fn.last_graph, op.assert_autodiffed, nonfusible_nodes, fusible_nodes)
                         self.assertAutodiffNode(script_fn.last_graph, op.assert_autodiffed, nonfusible_nodes, fusible_nodes)
         assert tested, "JIT Test does not execute any logic"
 

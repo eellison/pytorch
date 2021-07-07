@@ -283,10 +283,12 @@ class OpInfo(object):
 
         self.assert_autodiffed = assert_autodiffed
         self.autodiff_fusible_nodes = autodiff_fusible_nodes if autodiff_fusible_nodes else []
-        if autodiff_nonfusible_nodes is None:
-            self.autodiff_nonfusible_nodes = ['aten::' + self.name]
-        else:
+        if autodiff_nonfusible_nodes is not None:
             self.autodiff_nonfusible_nodes = autodiff_nonfusible_nodes
+        elif self.assert_autodiffed:
+            self.autodiff_nonfusible_nodes  = []
+        else:
+            self.autodiff_nonfusible_nodes = ['aten::' + (self.name if self.aten_name is None else self.aten_name)]
 
         # autograd support
         self.supports_autograd = supports_autograd
@@ -5443,8 +5445,7 @@ op_db: List[OpInfo] = [
            sample_inputs_func=sample_inputs_hardswish,
            dtypesIfCUDA=floating_types_and(torch.half, torch.bfloat16),
            supports_gradgrad=False,
-           supports_out=False,
-           autodiff_nonfusible_nodes=["aten::hardswish"]),
+           supports_out=False,),
     OpInfo('nn.functional.leaky_relu',
            aliases=None,
            aten_name="leaky_relu",
@@ -5506,8 +5507,7 @@ op_db: List[OpInfo] = [
            assert_autodiffed=True,
            sample_inputs_func=sample_inputs_hardshrink_hardtanh,
            supports_gradgrad=True,
-           supports_out=False,
-           autodiff_nonfusible_nodes=["aten::relu6"]),
+           supports_out=False,),
     OpInfo('mm',
            dtypes=floating_and_complex_types_and(torch.half),
            dtypesIfCPU=all_types_and_complex_and(torch.float16, torch.bfloat16),

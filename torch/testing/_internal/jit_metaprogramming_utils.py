@@ -304,11 +304,17 @@ def create_script_fn(self, method_name, func_type):
     # function returns tuple containing original output and
     # filtered output to be used in checking gradients
     def script_fn(*args, **kwargs):
+        import pdb; pdb.set_trace()
         fn, tensors = gen_script_fn_and_args(method_name, func_type, *args, **kwargs)
-        self.assertExportImport(fn.graph, tensors)
+        if hasattr(script_fn, "already_gen_function"):
+            fn = script_fn.already_gen_function
+        else:
+            print("generating function")
+        # self.assertExportImport(fn.graph, tensors)
         output = fn(*tensors)
         # skip type annotate function attributes for now, see: https://github.com/python/mypy/issues/2087
         script_fn.last_graph = fn.graph_for(*tensors)  # type: ignore[attr-defined]
+        script_fn.already_gen_function = fn  # type: ignore[attr-defined]
         return output
     return script_fn
 
@@ -326,6 +332,7 @@ def partial_apply_nontensors(fn, args, **kwargs):
 
 # create a trace function from input fn
 def create_traced_fn(self, fn):
+
     def traced_fn(*inputs, **kwargs):
         fn_tensors, inputs_tensors = partial_apply_nontensors(fn, inputs, **kwargs)
         # `check_trace` is set to False because check_trace is run with @no_grad
@@ -333,10 +340,13 @@ def create_traced_fn(self, fn):
         # against python function
         traced = torch.jit.trace(fn_tensors, inputs_tensors, check_trace=False)
         self.assertExportImport(traced.graph, inputs_tensors)
+        # if hasattr(traced_fn, "already_gen_function"):
+        #     traced = traced_fn.already_gen_function
         output = traced(*inputs_tensors)
         # skip type annotate function attributes for now, see: https://github.com/python/mypy/issues/2087
         traced_fn.last_graph = traced.graph_for(*inputs_tensors)  # type: ignore[attr-defined]
         traced_fn.graph = traced.graph # type: ignore[attr-defined]
+        traced_fn.already_gen_function = traced
         return output
     return traced_fn
 

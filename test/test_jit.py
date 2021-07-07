@@ -13851,6 +13851,7 @@ dedent """
                 y = 2 * x
 
             z = y * 2
+            return y
             if z == 8:
                 return 1
 

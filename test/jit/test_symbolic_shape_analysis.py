@@ -20,7 +20,7 @@ class TestSymbolicShapeAnalysis(JitTestCase):
     def tearDown(self):
         torch._C._jit_set_symbolic_shapes_test_mode(self.prev_symbolic_shapes_test_enabled)
 
-    def test_shape_analysis(self):
+    def test_shape_analysis_elias(self):
         @torch.jit.script
         def foo(x, y):
             return x * y
@@ -56,6 +56,7 @@ class TestSymbolicShapeAnalysis(JitTestCase):
         sym3 = torch._C._new_symbolic_shape_symbol()
         prop_shapes_on_graph([sym1, 1, sym3], [1, sym2, sym3])
         output_shape = foo.graph.findNode("aten::mul").output().type().symbolic_sizes()
+        print(foo.graph)
         self.assertEqual(output_shape[0], sym1)
         self.assertEqual(output_shape[1], sym2)
         self.assertEqual(output_shape[2], sym3)
