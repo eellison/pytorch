@@ -10,12 +10,16 @@ namespace jit {
 
 TORCH_API void PropagateShapesOnGraph(std::shared_ptr<Graph>& graph);
 
+TORCH_API c10::optional<std::shared_ptr<Graph>> PropagateShapesAndBuildLargeShapeComputeGraph(std::shared_ptr<Graph>& graph, Node *beg, c10::optional<Node*> end = c10::nullopt);
+
 // don't insert complete tensor shapes in shape compute graphs and instead
 // rely on our partial evaluation pipeline to propagate information.
 // this is a good proxy for our ability to propagate non-complete shape
 // information.
 TORCH_API bool setSymbolicShapeAnalysisTestMode(bool value);
 TORCH_API bool symbolicShapeAnalysisTestModeEnabled();
+TORCH_API bool shapeGraphCleanupPasses(std::shared_ptr<Graph> graph);
+
 
 } // namespace jit
 } // namespace torch

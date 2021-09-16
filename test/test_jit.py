@@ -8875,49 +8875,49 @@ dedent """
         self.assertTrue(imported.unpack_called.item())
         torch.testing.assert_close(imported(x), x + torch.neg(torch.ones(3, 4, dtype=torch.float)))
 
-    @unittest.skipIf(not TEST_MKL, "PyTorch is built without MKL support")
-    @unittest.skipIf(True, "Skipping while landing PR stack")
+    # @unittest.skipIf(not TEST_MKL, "PyTorch is built without MKL support")
+    # @unittest.skipIf(True, "Skipping while landing PR stack")
     def test_torch_functional(self):
-        def stft(input, n_fft):
-            # type: (Tensor, int) -> Tensor
-            return torch.stft(input, n_fft, return_complex=True)
+        # def stft(input, n_fft):
+        #     # type: (Tensor, int) -> Tensor
+        #     return torch.stft(input, n_fft, return_complex=True)
 
-        inps = (torch.randn(10), 7)
-        self.assertEqual(stft(*inps), torch.jit.script(stft)(*inps))
+        # inps = (torch.randn(10), 7)
+        # self.assertEqual(stft(*inps), torch.jit.script(stft)(*inps))
 
-        def istft(input, n_fft):
-            # type: (Tensor, int) -> Tensor
-            return torch.istft(input, n_fft)
+        # def istft(input, n_fft):
+        #     # type: (Tensor, int) -> Tensor
+        #     return torch.istft(input, n_fft)
 
-        inps2 = (stft(*inps), inps[1])
-        self.assertEqual(istft(*inps2), torch.jit.script(istft)(*inps2))
+        # inps2 = (stft(*inps), inps[1])
+        # self.assertEqual(istft(*inps2), torch.jit.script(istft)(*inps2))
 
-        def lu(x):
-            # type: (Tensor) -> Tuple[Tensor, Tensor]
-            return torch.lu(x)
+        # def lu(x):
+        #     # type: (Tensor) -> Tuple[Tensor, Tensor]
+        #     return torch.lu(x)
 
-        self.checkScript(lu, (torch.randn(2, 3, 3),))
+        # self.checkScript(lu, (torch.randn(2, 3, 3),))
 
-        def lu_infos(x):
-            # type: (Tensor) -> Tuple[Tensor, Tensor, Tensor]
-            return torch.lu(x, get_infos=True)
+        # def lu_infos(x):
+        #     # type: (Tensor) -> Tuple[Tensor, Tensor, Tensor]
+        #     return torch.lu(x, get_infos=True)
 
-        self.checkScript(lu_infos, (torch.randn(2, 3, 3),))
+        # self.checkScript(lu_infos, (torch.randn(2, 3, 3),))
 
-        def lu_unpack(x):
-            A_LU, pivots = torch.lu(x)
-            return torch.lu_unpack(A_LU, pivots)
+        # def lu_unpack(x):
+        #     A_LU, pivots = torch.lu(x)
+        #     return torch.lu_unpack(A_LU, pivots)
 
-        for shape in ((3, 3), (5, 3, 3), (7, 3, 5, 5), (7, 5, 3, 3, 3)):
-            a = torch.randn(*shape)
-            self.checkScript(lu_unpack, (a,))
+        # for shape in ((3, 3), (5, 3, 3), (7, 3, 5, 5), (7, 5, 3, 3, 3)):
+        #     a = torch.randn(*shape)
+        #     self.checkScript(lu_unpack, (a,))
 
-        def cdist_fn():
-            a = torch.tensor([[0.9041, 0.0196], [-0.3108, -2.4423], [-0.4821, 1.059]])
-            b = torch.tensor([[-2.1763, -0.4713], [-0.6986, 1.3702]])
-            return torch.cdist(a, b, compute_mode="use_mm_for_euclid_dist")
+        # def cdist_fn():
+        #     a = torch.tensor([[0.9041, 0.0196], [-0.3108, -2.4423], [-0.4821, 1.059]])
+        #     b = torch.tensor([[-2.1763, -0.4713], [-0.6986, 1.3702]])
+        #     return torch.cdist(a, b, compute_mode="use_mm_for_euclid_dist")
 
-        self.checkScript(cdist_fn, ())
+        # self.checkScript(cdist_fn, ())
 
         def norm():
             c = torch.tensor([[1, 2, 3], [-1, 1, 4]], dtype=torch.float)
@@ -8925,27 +8925,27 @@ dedent """
 
         self.checkScript(norm, ())
 
-        def torch_unique(dim: Optional[int]):
-            ten = torch.unique(torch.tensor([[1, 3], [2, 3]], dtype=torch.long))
-            a = torch.unique(ten, dim=dim)
-            b = torch.unique(ten, return_counts=True, dim=dim)
-            c = torch.unique(ten, return_inverse=True, dim=dim)
-            d = torch.unique(ten, return_counts=True, return_inverse=True, dim=dim)
-            return a, b, c, d
+        # def torch_unique(dim: Optional[int]):
+        #     ten = torch.unique(torch.tensor([[1, 3], [2, 3]], dtype=torch.long))
+        #     a = torch.unique(ten, dim=dim)
+        #     b = torch.unique(ten, return_counts=True, dim=dim)
+        #     c = torch.unique(ten, return_inverse=True, dim=dim)
+        #     d = torch.unique(ten, return_counts=True, return_inverse=True, dim=dim)
+        #     return a, b, c, d
 
-        self.checkScript(torch_unique, (None,))
-        self.checkScript(torch_unique, (0,))
+        # self.checkScript(torch_unique, (None,))
+        # self.checkScript(torch_unique, (0,))
 
-        def torch_unique_consecutive(dim: Optional[int]):
-            ten = torch.unique(torch.tensor([[1, 3], [3, 2], [3, 2], [2, 3]], dtype=torch.long))
-            a = torch.unique_consecutive(ten, dim=dim)
-            b = torch.unique_consecutive(ten, return_counts=True, dim=dim)
-            c = torch.unique_consecutive(ten, return_inverse=True, dim=dim)
-            d = torch.unique_consecutive(ten, return_counts=True, return_inverse=True, dim=dim)
-            return a, b, c, d
+        # def torch_unique_consecutive(dim: Optional[int]):
+        #     ten = torch.unique(torch.tensor([[1, 3], [3, 2], [3, 2], [2, 3]], dtype=torch.long))
+        #     a = torch.unique_consecutive(ten, dim=dim)
+        #     b = torch.unique_consecutive(ten, return_counts=True, dim=dim)
+        #     c = torch.unique_consecutive(ten, return_inverse=True, dim=dim)
+        #     d = torch.unique_consecutive(ten, return_counts=True, return_inverse=True, dim=dim)
+        #     return a, b, c, d
 
-        self.checkScript(torch_unique_consecutive, (None,))
-        self.checkScript(torch_unique_consecutive, (0,))
+        # self.checkScript(torch_unique_consecutive, (None,))
+        # self.checkScript(torch_unique_consecutive, (0,))
 
     def test_torch_functional_tensordot_int(self):
         def tensordot_dims_int(a: torch.Tensor, b: torch.Tensor, dims: int):

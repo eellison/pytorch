@@ -179,6 +179,13 @@ void initJITBindings(PyObject* module) {
             return shapeComputeGraphForSchema(n->schema());
           })
       .def("_jit_pass_propagate_shapes_on_graph", PropagateShapesOnGraph)
+      .def("_jit_pass_propagate_shapes_on_graph_and_build_compute",
+        [](std::shared_ptr<Graph>& graph) {
+          return PropagateShapesAndBuildLargeShapeComputeGraph(graph, *graph->nodes().begin()); })
+      .def("_jit_pass_propagate_shapes_on_graph_and_build_compute",
+        [](std::shared_ptr<Graph>& graph, Node* beg) {
+          return PropagateShapesAndBuildLargeShapeComputeGraph(graph, beg); })
+      .def("_jit_pass_propagate_shapes_on_graph_and_build_compute", PropagateShapesAndBuildLargeShapeComputeGraph)
       .def("_jit_pass_onnx_function_substitution", ONNXFunctionCallSubstitution)
       .def("_jit_pass_integer_value_refinement", RefineIntegerValues)
       .def(
@@ -514,10 +521,42 @@ void initJITBindings(PyObject* module) {
             return LowerGraph(*graph, self._ivalue());
           })
       .def("_jit_pass_loop_unrolling", UnrollLoops)
+      .def("_jit_pass_constant_loop_unrolling", UnrollConstantLoops)
       .def(
           "_jit_pass_constant_propagation_immutable_types",
           [](std::shared_ptr<Graph>& g) {
             return ConstantPropagationImmutableTypes(g);
+          })
+      .def(
+        "_jit_pass_shape_graph_cleanup_passes",
+        [](std::shared_ptr<Graph>& g) {
+          return shapeGraphCleanupPasses(g);
+        })
+      .def(
+          "_augment_with_length",
+          [](std::shared_ptr<Graph>& g, size_t index, size_t length) {
+            if (auto opt = g->inputs().at(index)->type()->cast<OptionalType>()) {
+                g->inputs().at(index)->setType(opt->getElementType());
+            }
+            WithInsertPoint guard(*g->nodes().begin());
+            auto cons = g->insertConstant(static_cast<int64_t>(length));
+            auto inp_len = g->insert(aten::len, {g->inputs().at(index)});
+            auto eq = g->insert(aten::eq, {cons, inp_len});
+            auto if_n = g->insertNode(g->create(prim::If, {eq}, 0));
+            if_n->addBlock();
+            if_n->addBlock();
+            WithInsertPoint guard2(if_n->blocks().at(1));
+            g->insertNode(g->create(prim::RaiseException, {g->insertConstant("Input Shape Augment")}, 0));
+            return ConstantPropagationImmutableTypes(g);
+          })
+      .def(
+          "_jit_get_shape_compute_graph_for_node",
+          [](Node& n) -> c10::optional<std::shared_ptr<Graph>> {
+            if (auto sch = n.maybeSchema()) {
+              return shapeComputeGraphForSchema(*sch);
+            } else {
+              return c10::nullopt;
+            }
           })
       .def(
           "_jit_pass_constant_propagation",

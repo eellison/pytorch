@@ -501,6 +501,7 @@ void initPythonIRBindings(PyObject* module_) {
           })
       .def("returnNode", [](Block& b) { return b.return_node(); })
       .def("paramNode", [](Block& b) { return b.param_node(); })
+      .def("owningNode", [](Block& b) { return b.owningNode(); })
       .def(
           "addNode",
           [](Block& b, const char* str, const std::vector<Value*>& inputs) {
@@ -525,6 +526,7 @@ void initPythonIRBindings(PyObject* module_) {
       .def("inputsSize", [](Node& n) { return n.inputs().size(); })
       .def("outputsSize", [](Node& n) { return n.outputs().size(); })
       .NS(kind)
+      .def("owningBlock", [](Node& n) { return n.owningBlock(); })
       .def("inputsAt", [](Node& n, size_t i) { return n.inputs().at(i); })
       .def(
           "inputs",
