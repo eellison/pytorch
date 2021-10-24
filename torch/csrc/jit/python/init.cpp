@@ -1,5 +1,6 @@
 #include <torch/csrc/utils/pybind.h>
 #include <torch/csrc/utils/python_arg_parser.h>
+#include <torch/csrc/jit/passes/graph_rewrite_helper.h>
 
 #include <torch/csrc/jit/api/module.h>
 #include <torch/csrc/jit/backends/backend_init.h>
@@ -558,8 +559,43 @@ void initJITBindings(PyObject* module) {
             return ConstantPropagationImmutableTypes(g);
           })
       .def(
+        "_jit_pass_shape_graph_cleanup_passes",
+        [](std::shared_ptr<Graph>& g) {
+          return shapeGraphCleanupPasses(g);
+        })
+      .def(
+          "_augment_with_length",
+          [](std::shared_ptr<Graph>& g, size_t index, size_t length) {
+            if (auto opt = g->inputs().at(index)->type()->cast<OptionalType>()) {
+                g->inputs().at(index)->setType(opt->getElementType());
+            }
+            WithInsertPoint guard(*g->nodes().begin());
+            auto cons = g->insertConstant(static_cast<int64_t>(length));
+            auto inp_len = g->insert(aten::len, {g->inputs().at(index)});
+            auto eq = g->insert(aten::eq, {cons, inp_len});
+            auto if_n = g->insertNode(g->create(prim::If, {eq}, 0));
+            if_n->addBlock();
+            if_n->addBlock();
+            WithInsertPoint guard2(if_n->blocks().at(1));
+            g->insertNode(g->create(prim::RaiseException, {g->insertConstant("Input Shape Augment")}, 0));
+            return ConstantPropagationImmutableTypes(g);
+          })
+      .def(
+          "_jit_get_shape_compute_graph_for_node",
+          [](Node& n) -> c10::optional<std::shared_ptr<Graph>> {
+            if (auto sch = n.maybeSchema()) {
+              return shapeComputeGraphForSchema(*sch);
+            } else {
+              return c10::nullopt;
+            }
+          })
+      .def(
           "_jit_pass_constant_propagation",
           [](std::shared_ptr<Graph>& g) { return ConstantPropagation(g); },
+          py::arg("graph"))
+      .def(
+          "_jit_pass_replace_convolution_with_aten_conv",
+          [](std::shared_ptr<Graph>& g) { return torch::jit::graph_rewrite_helper::replaceConvolutionWithAtenConv(g); },
           py::arg("graph"))
       .def("_jit_pass_erase_shape_information", EraseShapeInformation)
       .def(
