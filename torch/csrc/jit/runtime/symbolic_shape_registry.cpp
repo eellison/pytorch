@@ -864,6 +864,16 @@ c10::optional<std::shared_ptr<Graph>> shapeComputeGraphForSchema(
   if (cache_it != cached_schema_to_graph.end()) {
     return cache_it->second;
   }
+  // looking via pointer may fail if the schema was e.g. copied into
+  // a python object/pointer
+  auto maybe_cached_schema_ref = get_schema_to_function_graph().find(schema);
+  if (maybe_cached_schema_ref) {
+    auto cached_schema_ref = *maybe_cached_schema_ref;
+
+
+  }
+
+
   GRAPH_DEBUG("Could not find schema: ", schema);
 
   return c10::nullopt;

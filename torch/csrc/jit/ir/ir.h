@@ -1633,17 +1633,22 @@ struct OperatorMap {
     return false;
   }
 
-  c10::optional<T> find(const Operator& op) {
-    const auto it = map.find(Symbol::fromQualString(op.schema().name()));
+
+  c10::optional<T> find(const FunctionSchema& schema) const {
+    const auto it = map.find(Symbol::fromQualString(schema.name()));
     if (it == map.end()) {
       return c10::nullopt;
     }
     for (auto vit = it->second.begin(); vit != it->second.end(); ++vit) {
-      if (vit->first->schema() == op.schema()) {
+      if (vit->first->schema() == schema) {
         return vit->second;
       }
     }
     return c10::nullopt;
+  }
+
+  c10::optional<T> find(const Operator& op) const {
+    return find(op.schema());
   }
 
   // TODO: return iterator

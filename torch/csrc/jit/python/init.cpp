@@ -184,6 +184,11 @@ void initJITBindings(PyObject* module) {
             }
             return shapeComputeGraphForSchema(n->schema());
           })
+      .def(
+          "_jit_shape_compute_graph_for_schema",
+          [](const FunctionSchema& schema) -> c10::optional<std::shared_ptr<Graph>> {
+            return shapeComputeGraphForSchema(schema);
+          })
       .def("_jit_pass_propagate_shapes_on_graph", PropagateShapesOnGraph)
       .def(
           "_jit_pass_propagate_shapes_on_graph_and_build_compute",

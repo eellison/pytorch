@@ -34,6 +34,8 @@ struct ShapeComputeGraphMapping {
   std::unordered_map<Value*, int64_t> graph_output_to_symbolic_shape_dim_;
 };
 
+TORCH_API bool shapeGraphCleanupPasses(std::shared_ptr<Graph> graph);
+
 TORCH_API c10::optional<ShapeComputeGraphMapping>
 PropagateShapesAndBuildLargeShapeComputeGraph(
     std::shared_ptr<Graph>& graph,

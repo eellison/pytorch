@@ -168,6 +168,14 @@ c10::optional<size_t> normIndex(int64_t index, size_t len) {
   }
 }
 
+void replaceWithIValue(Value* v, IValue val) {
+  WithInsertPoint guard(*v->node()->owningBlock()->nodes().begin());
+  v->replaceAllUsesWith(v->owningGraph()->insertConstant(val));
+}
+
+} // namespace
+
+
 bool shapeGraphCleanupPasses(std::shared_ptr<Graph> graph) {
   // TODO: lower simple tuples ?
   bool made_change = RemoveListMutation(graph);
@@ -184,12 +192,6 @@ bool shapeGraphCleanupPasses(std::shared_ptr<Graph> graph) {
   return made_change;
 }
 
-void replaceWithIValue(Value* v, IValue val) {
-  WithInsertPoint guard(*v->node()->owningBlock()->nodes().begin());
-  v->replaceAllUsesWith(v->owningGraph()->insertConstant(val));
-}
-
-} // namespace
 
 // Symbolic Shape Analysis works through iteratively partially evaluating
 // a TorchScript shape compute graph by inputing properties from input
