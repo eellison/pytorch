@@ -131,6 +131,16 @@ class ONNXTracedModule(torch.nn.Module):
             self.strict,
             self._force_outplace,
         )
+        unhandled_schemas = set()
+        for node in graph.nodes():
+            if node.schema() == "(no schema)":
+                continue
+            if node.schema() in unhandled_schemas:
+                continue
+            if torch._C._jit_shape_compute_graph_for_node(node) is None:
+                unhandled_schemas.add(node.schema())
+
+        import pdb; pdb.set_trace()
 
         if self._return_inputs:
             return graph, outs[0], ret_inputs[0]
