@@ -117,7 +117,6 @@ def convert_graph_to_z3(graph):
                 inputs_z3 = [names_to_z3[inp.debugName()] for inp in inputs]
             except:
                 import pdb; pdb.set_trace()
-            print('hi')
             if node.kind() == "prim::Constant":
                 if node.output().type() == torch._C.IntType.get() or node.output().type() == torch._C.BoolType.get():
                     ival = node.output().toIValue()
@@ -161,16 +160,17 @@ def convert_graph_to_z3(graph):
 import torchvision.models as models
 resnet18 = models.resnet18()
 
+
 mod = torch.jit.freeze(torch.jit.script(resnet18.eval()))
 torch._C._jit_pass_remove_mutation(mod.graph)
 torch._C._jit_pass_propagate_shapes_on_graph(mod.graph)
 torch._C._jit_pass_peephole(mod.graph)
 torch._C._jit_pass_constant_propagation(mod.graph)
 torch._C._jit_pass_constant_pooling(mod.graph)
-g = (torch._C._jit_pass_propagate_shapes_on_graph_and_build_compute(mod.graph))
-import pdb; pdb.set_trace()
+g = (torch._C._jit_pass_propagate_shapes_on_graph_and_build_compute(mod.graph)).partial_eval_shape_graph()
 func = torch._C._create_function_from_graph("resnet_partial_eval_graph", g)
 s = convert_graph_to_z3(g)
 modeled = (s.model())
-import pdb; pdb.set_trace()
-print(modeled["input.1__0"])
+print(modeled)
+# import pdb; pdb.set_trace()
+# print(modeled["input.1__0"])
