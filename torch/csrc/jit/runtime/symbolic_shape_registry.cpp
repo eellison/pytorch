@@ -664,6 +664,7 @@ static const OperatorMap<std::string>& get_schema_to_function_graph() {
       {"aten::hardtanh(Tensor self, Scalar min_val=-1, Scalar max_val=1) -> Tensor", "unary"},
       {"aten::hardswish(Tensor self) -> Tensor", "unary"},
       {"aten::hardsigmoid(Tensor self) -> Tensor", "unary"},
+      {"aten::sigmoid(Tensor self) -> Tensor", "unary"},
       {"aten::dropout(Tensor input, float p, bool train) -> Tensor", "unary"},
       {"aten::adaptive_avg_pool2d(Tensor self, int[2] output_size) -> Tensor", "adaptive_avg_pool2d"},
       {"aten::gelu(Tensor self) -> Tensor", "unary"},
