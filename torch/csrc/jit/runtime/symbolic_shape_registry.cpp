@@ -68,10 +68,13 @@ const std::string shape_compute_functions =
             dimB = dimsB - dimsA + dimA
             sizeA = a[dimA]
             sizeB = b[dimB] if (dimB >= 0) else 1
-            if sizeA != sizeB and sizeB != 1:
-                # TODO: only assertion error is bound in C++ compilation right now
-                raise AssertionError("The size of tensor a {} must match the size of tensor b ("
-                                "{}) at non-singleton dimension {}".format(sizeA, sizeB, dimA))
+            if dimB >= 0:
+              assert sizeA == sizeB
+            else:
+              if sizeA != sizeB and sizeB != 1:
+                  # TODO: only assertion error is bound in C++ compilation right now
+                  raise AssertionError("The size of tensor a {} must match the size of tensor b ("
+                                  "{}) at non-singleton dimension {}".format(sizeA, sizeB, dimA))
           return _copy(a)
 
         def expand(self: List[int], sizes: List[int]):
@@ -481,18 +484,18 @@ const std::string shape_compute_functions =
           weight_dim = len(weight_sizes)
 
           # TODO: assertions could be expanded with the error messages
-          assert not check_non_negative(padding)
-          assert not check_non_negative(stride)
+          assert not check_non_negative(padding), "negative padding"
+          assert not check_non_negative(stride), "negative stride"
 
-          assert weight_dim == k
-          assert weight_sizes[0] >= groups
-          assert (weight_sizes[0] % groups) == 0
+          assert weight_dim == k, "weight_dim != k"
+          assert weight_sizes[0] >= groups, "weight sizes[0] not >= groups"
+          assert (weight_sizes[0] % groups) == 0, "weight sizes not divisable by groups"
           # only handling not transposed
-          assert input[1] == weight_sizes[1] * groups
+          assert input[1] == weight_sizes[1] * groups, "weight sizes[1] != groups"
           assert bias is None or (len(bias) == 1 and bias[0] == weight_sizes[0])
 
-          for i in range(2, k):
-            assert (input[i] + 2 * padding[i - 2]) >= (dilation[i - 2] * (weight_sizes[i] - 1) + 1)
+          for i in range(k, k):
+            assert (input[i] + 2 * padding[i - 2]) >= (dilation[i - 2] * (weight_sizes[i] - 1) + 1), "kernel size can't be bigger than input size"
 
         # this is not handling transposed convolution yet
         def conv_output_size(input_size: List[int], weight_size: List[int], bias: Optional[List[int]], stride: List[int], padding: List[int], dilation: List[int], groups: int):

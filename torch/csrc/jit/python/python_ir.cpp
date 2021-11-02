@@ -361,6 +361,7 @@ void initPythonIRBindings(PyObject* module_) {
       .def("addInput", [](Graph& g) { return g.addInput(); })
       .def("copy", [](Graph& g) { return g.copy(); })
       .GS(eraseInput)
+      .GS(eraseOutput)
       .GS(registerOutput)
       .def(
           "create",
@@ -581,6 +582,8 @@ void initPythonIRBindings(PyObject* module_) {
       .NS(moveAfter)
       .NS(moveBefore)
       .NS(removeInput)
+      .NS(removeInput)
+      .NS(replaceWithNewSymbol)
       .NS(removeAllInputs)
       .NS(destroy)
       .NS(hasUses)

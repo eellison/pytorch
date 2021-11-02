@@ -402,6 +402,7 @@ struct SymbolicShapeNodeAnalyzer {
     GRAPH_DUMP("Done with partial evaluation", shape_compute_graph_);
 
     extractOutputShape(symbolic_shape_values);
+    GRAPH_UPDATE(getHeader(node_), "done extracting shape");
     return shape_compute_graph_;
   }
 

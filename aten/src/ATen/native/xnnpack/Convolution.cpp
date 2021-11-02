@@ -283,6 +283,78 @@ ContextConv2D create(
   };
 }
 
+static void check_shape_forward(const at::Tensor& input,
+                                const c10::IntArrayRef& weight_sizes, const at::Tensor& bias,
+                                int64_t groups, IntArrayRef padding, IntArrayRef dilation) {
+  int64_t k = input.ndimension();
+  int64_t weight_dim = weight_sizes.size();
+  bool transposed = false;
+  TORCH_CHECK(weight_dim == k,
+           "Expected ", weight_dim, "-dimensional input for ", weight_dim,
+           "-dimensional weight ", weight_sizes, ", but got ", k, "-dimensional input of size ",
+           input.sizes(), " instead");
+  TORCH_CHECK(weight_sizes[0] >= groups,
+           "Given groups=", groups, ", expected weight to be at least ", groups,
+           " at dimension 0, but got weight of size ", weight_sizes, " instead");
+  TORCH_CHECK(weight_sizes[0] % groups == 0,
+           "Given groups=", groups, ", expected weight to be divisible by ",
+           groups, " at dimension 0, but got weight of size [", weight_sizes,
+           "] instead");
+
+  if (!transposed) {
+    std::vector<int64_t> input_shape;
+    std::vector<int64_t> kernel_shape;
+    bool kernel_size_correct = true;
+
+    TORCH_CHECK(input.size(1) == (weight_sizes[1] * groups),
+                "Given groups=", groups, ", weight of size ", weight_sizes,
+                ", expected input", input.sizes(), " to have ",
+                (weight_sizes[1] * groups), " channels, but got ", input.size(1),
+                " channels instead");
+
+    TORCH_CHECK(!bias.defined() || (bias.ndimension() == 1 && bias.size(0) == weight_sizes[0]),
+             "Given weight of size ", weight_sizes,
+             ", expected bias to be 1-dimensional with ", weight_sizes[0], " elements",
+             ", but got bias of size ", bias.sizes(), " instead");
+
+    for (const auto i : c10::irange(2, k)) {
+      input_shape.push_back(input.size(i) + 2 * padding[i-2]);
+      // log new kernel size considering dilation
+      kernel_shape.push_back(dilation[i-2] * (weight_sizes[i]-1) + 1);
+      if (input_shape.back() < kernel_shape.back()) {
+        kernel_size_correct = false;
+      }
+    }
+
+    TORCH_CHECK(input_shape.size() == kernel_shape.size(), "Inconsistent shape between Input and Kernel");
+
+    if (!kernel_size_correct) {
+      // If kernel size is incorrect
+      std::ostringstream input_ss;
+      std::ostringstream kernel_ss;
+      std::string separator = "";
+
+      for (int i = 0, len = input_shape.size(); i < len; ++i) {
+        input_ss << separator << input_shape[i];
+        kernel_ss << separator << kernel_shape[i];
+        separator = " x ";
+      }
+
+      AT_ERROR("Calculated padded input size per channel: (", input_ss.str(), "). "
+               "Kernel size: (", kernel_ss.str(), "). Kernel size can't be greater than actual input size");
+    }
+  } else { // transposed
+    TORCH_CHECK(input.size(1) == weight_sizes[0],
+             "Given transposed=", transposed, ", weight of size ", weight_sizes,
+             ", expected input", input.sizes(), " to have ", weight_sizes[0],
+             " channels, but got ", input.size(1), " channels instead");
+    TORCH_CHECK(!bias.defined() || (bias.ndimension() == 1 && bias.size(0) == weight_sizes[1] * groups),
+             "Given transposed=", transposed, ", weight of size ", weight_sizes,
+             ", expected bias to be 1-dimensional with ", weight_sizes[1] * groups, " elements",
+             ", but got bias of size ", bias.sizes(), " instead");
+  }
+}
+
 Tensor run(
     ContextConv2D& context,
     const Tensor& input) {
@@ -310,6 +382,8 @@ Tensor run(
       MemoryFormat::ChannelsLast,
       padded_input_nhwc.names());
   } else {
+    at::Tensor t;
+    check_shape_forward(padded_input_nhwc, context.weight_size_, t, context.groups_, context.padding_, context.dilation_);
     output = mobile::empty_with_tail_padding(
       conv_output_size(
           padded_input_nhwc.sizes(),

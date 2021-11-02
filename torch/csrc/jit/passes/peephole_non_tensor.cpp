@@ -4,6 +4,7 @@
 #include <c10/util/irange.h>
 #include <torch/csrc/jit/ir/ir_views.h>
 #include <torch/csrc/jit/jit_log.h>
+#include "jit/ir/ir.h"
 
 namespace torch {
 namespace jit {
@@ -206,6 +207,25 @@ struct PeepholeOptimizeNonTensorImpl {
             "Removing ", getHeader(node), " as input is already an integer");
         node->output()->replaceAllUsesWith(node->input());
         changed = true;
+      } else if (node->kind() == aten::Int || node->kind() == aten::ceil) {
+        auto input_k = node->input()->node()->kind();
+        if (input_k == aten::sub || input_k == aten::mul || input_k == aten::add) {
+          auto input_node = node->input()->node();
+          for (size_t i = 0; i < 2; ++i) {
+            if (input_node->input(i)->type()->cast<FloatType>() && input_node->input(1 - i)->type()->cast<IntType>()) {
+              auto float_const = constant_as<double>(input_node->input(i));
+              if (float_const && trunc(*float_const) == *float_const) {
+                WithInsertPoint guard(input_node);
+                auto int_const = graph_->insertConstant(static_cast<int64_t>(trunc(*float_const)));
+                input_node->replaceInput(i, int_const);
+                node->output()->replaceAllUsesWith(node->input());
+                node->input()->setType(IntType::get());
+                changed = true;
+                break;
+              }
+            }
+          }
+        }
       } else if (node->kind() == aten::ne || node->kind() == aten::eq) {
         if (node->inputs().size() != 2 ||
             node->inputs().at(0) != node->inputs().at(1)) {
