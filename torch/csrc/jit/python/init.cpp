@@ -446,8 +446,9 @@ void initJITBindings(PyObject* module) {
       .def(
           "_jit_pass_remove_mutation",
           [](std::shared_ptr<Graph>& g) {
-            RemoveListMutation(g);
-            return RemoveTensorMutation(g);
+            auto changed = RemoveListMutation(g);
+            auto changed2 = RemoveDictMutation(g);
+            return RemoveTensorMutation(g) || changed || changed2;
           })
       .def(
           "_jit_pass_functional_to_inplace_activation",

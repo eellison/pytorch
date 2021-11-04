@@ -7,11 +7,12 @@ import torchvision
 models = torchvision.models
 
 model_pairs = (
-    # "mobilenet_v3_small", models.mobilenet_v3_small,
-    # "mobilenet_v2", models.mobilenet_v2,
-    # ("inception_v3", models.inception_v3()),
-    ("deeplab", models.segmentation.deeplabv3_resnet50()),
-    # "resnet", models.resnet18,
+    ("mobilenet_v3_small", models.mobilenet_v3_small),
+    ("mobilenet_v2", models.mobilenet_v2),
+    ("inception_v3", models.inception_v3()),
+    ("resnet", models.resnet18)
+    # ("deeplab", models.segmentation.deeplabv3_resnet50()), TODO: need a couple more ops
+
 )
 
 for name, model in model_pairs:
@@ -37,6 +38,10 @@ for name, model in model_pairs:
         for node in model_frozen.graph.findAllNodes("prim::RaiseException"):
             node.destroy()
         torch._C._jit_pass_dce(model_frozen.graph)
+        torch._C._jit_pass_remove_mutation(model_frozen.graph)
+        torch._C._jit_pass_peephole(model_frozen.graph)
+        # TODO - need to add handling of a couple ops, doen't quite work yet
+
 
     inps = list(model_frozen.graph.inputs())
     # None creates a new dynamic dimension,
@@ -45,7 +50,6 @@ for name, model in model_pairs:
     # sym_shape = torch._C._new_symbolic_shape_symbol(); [1, 3, sym_shape, sym_shape] - same width/height dimension
     inps[1].setType(inps[1].type().with_sizes([None, None, None, None]))
     shape_compute_graph = torch._C._jit_pass_propagate_shapes_on_graph_and_build_compute(model_frozen.graph)
-    import pdb; pdb.set_trace()
     g = shape_compute_graph.partial_eval_shape_graph()
     print("model GRAPH \n\n")
     print(model_frozen.graph)

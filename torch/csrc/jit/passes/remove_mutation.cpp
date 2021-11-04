@@ -1,5 +1,6 @@
 #include <torch/csrc/jit/passes/remove_mutation.h>
 #include <torch/csrc/jit/passes/restore_mutation.h>
+#include "jit/ir/ir.h"
 
 namespace torch {
 namespace jit {
@@ -11,6 +12,11 @@ bool MutationRemover::removeListMutation() {
 bool MutationRemover::removeTensorMutation() {
   return RemoveTensorMutation(graph_->block());
 }
+
+bool MutationRemover::removeDictMutation() {
+  return RemoveDictMutation(graph_->block());
+}
+
 
 bool MutationRemover::hasSideEffectOrAlias(Value* v, AliasDb* aliasDb) {
   // bail on nodes with side effects, blocks, or graph / graph inputs
@@ -225,6 +231,66 @@ bool MutationRemover::RemoveListMutation(Block* block) {
   return changed;
 }
 
+bool MutationRemover::dictWriteFollowingDictConstruct(Node* n) {
+  return n->kind() == aten::_set_item &&
+      (n->inputs().at(0)->node()->kind() == prim::DictConstruct || n->inputs().at(0)->node()->kind() == aten::dict);
+}
+
+bool MutationRemover::RemoveDictMutation(Block* block) {
+
+  bool changed = false;
+
+  for (auto it = block->nodes().begin(); it != block->nodes().end();) {
+    auto* node = *it;
+    it++;
+
+    for (Block* sub_block : node->blocks()) {
+      auto changed_sub = RemoveDictMutation(sub_block);
+      changed |= changed_sub;
+    }
+
+    if (!dictWriteFollowingDictConstruct(node)) {
+      continue;
+    }
+
+    Value* mutated_value = node->inputs().at(0);
+    if (!tryMakeCreationAndMutationAtomic(mutated_value, node)) {
+      continue;
+    }
+    changed = true;
+    if (node->inputs().at(0)->node()->kind() == aten::dict) {
+      auto dict_node = node->inputs().at(0)->node();
+      WithInsertPoint g(dict_node);
+      auto dict_type = dict_node->output()->type()->expect<DictType>();
+      auto norm_dict = graph_->insertNode(graph_->createDict(dict_type->getKeyType(), dict_type->getValueType(), {}, {}));
+      norm_dict->copyMetadata(dict_node);
+      norm_dict->output()->copyMetadata(dict_node->output());
+      dict_node->replaceAllUsesWith(norm_dict);
+      aliasDb_->replaceWithNewValue(dict_node->output(), norm_dict->output());
+      dict_node->destroy();
+      mutated_value = norm_dict->output();
+    }
+
+    // We rewrite something like:
+    // x : Dict[int, str] = {}
+    // x[v1] = 2
+    // to:
+    // x = {v1: 2}
+    // We can remove x._set_item from the the alias db list of writes.
+    // All other aliasing properties remain valid.
+    Node* dict_construct = mutated_value->node();
+    dict_construct->addInput(node->inputs().at(1));
+    dict_construct->addInput(node->inputs().at(2));
+    getOrCreateAliasDb()->writeIndex_->erase(node);
+    node->destroy();
+
+    // TODO: don't strictly need to reset write cache, evaluate on models
+    getOrCreateAliasDb()->buildWrittenToLocationsIndex();
+  }
+  return changed;
+}
+
+
 bool MutationRemover::RemoveTensorMutation(Block* block) {
   bool changed = false;
   for (auto it = block->nodes().begin(); it != block->nodes().end();) {
@@ -363,6 +429,11 @@ bool RemoveTensorMutation(
     c10::optional<std::function<bool(Node*)>> mutation_filter) {
   MutationRemover mr(graph, std::move(mutation_filter));
   return mr.removeTensorMutation();
+}
+
+bool RemoveDictMutation(const std::shared_ptr<Graph>& graph) {
+  MutationRemover mr(graph);
+  return mr.removeDictMutation();
 }
 
 static const std::unordered_set<Symbol> activation_ops = []() {

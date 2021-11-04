@@ -23,6 +23,9 @@ struct TORCH_API MutationRemover {
   // return true if graph is modified
   bool removeTensorMutation();
 
+  // return true if graph is modified
+  bool removeDictMutation();
+
   bool isSpecialMappedOp(Node* n) {
     return n->matches("aten::zero_(Tensor(a!) self) -> Tensor(a!)") ||
         n->matches(
@@ -48,6 +51,9 @@ struct TORCH_API MutationRemover {
   bool RemoveListMutation(Block* block);
   // return true if graph is modified
   bool RemoveTensorMutation(Block* block);
+  // return true if grpah is modified
+  bool RemoveDictMutation(Block* block);
+  bool dictWriteFollowingDictConstruct(Node* n);
 
   AliasDb* getOrCreateAliasDb() {
     if (!aliasDb_) {
@@ -73,6 +79,9 @@ TORCH_API bool RemoveListMutation(const std::shared_ptr<Graph>& graph);
 TORCH_API bool RemoveTensorMutation(
     const std::shared_ptr<Graph>& graph,
     c10::optional<std::function<bool(Node*)>> mutation_filter = c10::nullopt);
+
+// Removes dict mutation with functional equivalents
+TORCH_API bool RemoveDictMutation(const std::shared_ptr<Graph>& graph);
 
 // Replaces in-place aten activation ops with their functional equivalence
 TORCH_API bool InplaceToFunctionalActivation(
