@@ -7,11 +7,11 @@ import torchvision
 models = torchvision.models
 
 model_pairs = (
-    ("mobilenet_v3_small", models.mobilenet_v3_small),
-    ("mobilenet_v2", models.mobilenet_v2),
+    # ("mobilenet_v3_small", models.mobilenet_v3_small),
+    # ("mobilenet_v2", models.mobilenet_v2),
     ("inception_v3", models.inception_v3()),
-    ("resnet", models.resnet18)
-    # ("deeplab", models.segmentation.deeplabv3_resnet50()), TODO: need a couple more ops
+    # ("resnet", models.resnet18)
+    # ("deeplab", models.segmentation.deeplabv3_resnet50()), # TODO: need a couple more ops
 
 )
 
@@ -42,7 +42,6 @@ for name, model in model_pairs:
         torch._C._jit_pass_peephole(model_frozen.graph)
         # TODO - need to add handling of a couple ops, doen't quite work yet
 
-
     inps = list(model_frozen.graph.inputs())
     # None creates a new dynamic dimension,
     # alternative inputs:
@@ -55,6 +54,9 @@ for name, model in model_pairs:
     print(model_frozen.graph)
     print("Shape Compute Graph \n\n")
     # here is the encoding of shape arithmetic from the input, represnted as TS graph
+    for node in g.findAllNodes("prim::RaiseException"):
+        node.destroy()
+    torch._C._jit_pass_dce(g)
     print(g)
     print("Mapping from Sym Dim to Shape Compute Graph Output")
     for key, value in shape_compute_graph.graph_output_to_symbolic_shape_dim().items():
@@ -64,4 +66,4 @@ for name, model in model_pairs:
     # to execute jit function it must have a single output
     g.makeMultiOutputIntoTuple()
     func = torch._C._create_function_from_graph("partial_eval_graph", g)
-    print("Calculating dims from input", func([1, 3, 255, 29]))
+    print("Calculating dims from input", func([1, 3, 255, 255]))
