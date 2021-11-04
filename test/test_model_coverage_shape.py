@@ -9,10 +9,9 @@ models = torchvision.models
 model_pairs = (
     # ("mobilenet_v3_small", models.mobilenet_v3_small),
     # ("mobilenet_v2", models.mobilenet_v2),
-    ("inception_v3", models.inception_v3()),
+    # ("inception_v3", models.inception_v3()),
     # ("resnet", models.resnet18)
-    # ("deeplab", models.segmentation.deeplabv3_resnet50()), # TODO: need a couple more ops
-
+    ("deeplab", models.segmentation.deeplabv3_resnet50()), # TODO: need a couple more ops
 )
 
 for name, model in model_pairs:
@@ -20,6 +19,14 @@ for name, model in model_pairs:
     model_frozen = torch.jit.freeze(torch.jit.script(model.eval()))
 
     # until https://github.com/pytorch/pytorch/issues/65643 lands to clean up control flow..
+
+    inps = list(model_frozen.graph.inputs())
+    # None creates a new dynamic dimension,
+    # alternative inputs:
+    # [None, 3, 255, 255] - batch dimension not specified
+    # sym_shape = torch._C._new_symbolic_shape_symbol(); [1, 3, sym_shape, sym_shape] - same width/height dimension
+    inps[1].setType(inps[1].type().with_sizes([None, None, None, None]))
+
     torch._C._jit_pass_propagate_shapes_on_graph(model_frozen.graph)
     torch._C._jit_pass_peephole(model_frozen.graph)
     torch._C._jit_pass_constant_propagation(model_frozen.graph)
@@ -42,12 +49,29 @@ for name, model in model_pairs:
         torch._C._jit_pass_peephole(model_frozen.graph)
         # TODO - need to add handling of a couple ops, doen't quite work yet
 
-    inps = list(model_frozen.graph.inputs())
-    # None creates a new dynamic dimension,
-    # alternative inputs:
-    # [None, 3, 255, 255] - batch dimension not specified
-    # sym_shape = torch._C._new_symbolic_shape_symbol(); [1, 3, sym_shape, sym_shape] - same width/height dimension
-    inps[1].setType(inps[1].type().with_sizes([None, None, None, None]))
+    if name == "deeplab":
+        for node in model_frozen.graph.findAllNodes("aten::size"):
+            if not any(use.user.kind() == "aten::slice" for use in node.output().uses()):
+                continue
+            inp_sym_sizes = node.input().type().symbolic_sizes()
+            if not (inp_sym_sizes):
+                continue
+            li = model_frozen.graph.create("prim::ListConstruct", [], 1)
+            li.insertBefore(node)
+            li.output().setType(torch._C.ListType.ofInts())
+            for i in range(len(inp_sym_sizes)):
+                index = model_frozen.graph.insertConstant(i)
+                size_i = model_frozen.graph.create("aten::size", [node.input(), index])
+                size_i.output().setType(torch._C.IntType.get())
+                size_i.insertBefore(li)
+                li.addInput(size_i.output())
+                index.node().moveBefore(size_i)
+            node.output().replaceAllUsesWith(li.output())
+            node.destroy()
+        torch._C._jit_pass_peephole(model_frozen.graph)
+        import pdb; pdb.set_trace()
+
+
     shape_compute_graph = torch._C._jit_pass_propagate_shapes_on_graph_and_build_compute(model_frozen.graph)
     g = shape_compute_graph.partial_eval_shape_graph()
     print("model GRAPH \n\n")
@@ -66,4 +90,5 @@ for name, model in model_pairs:
     # to execute jit function it must have a single output
     g.makeMultiOutputIntoTuple()
     func = torch._C._create_function_from_graph("partial_eval_graph", g)
+    print(func.code)
     print("Calculating dims from input", func([1, 3, 255, 255]))
