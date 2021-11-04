@@ -294,6 +294,31 @@ const std::string shape_compute_functions =
               result_size.append(self[i])
           return result_size
 
+        def avg_pool2d(input: List[int], kernel_size: List[int], stride: List[int], padding: List[int], ceil_mode: bool, count_include_pad: bool, divisor_override: Optional[int]):
+          assert len(kernel_size) == 1 or len(kernel_size) == 2
+          kH = kernel_size[0]
+          kW = kH if len(kernel_size) == 1 else kernel_size[1]
+
+          assert len(stride) >= 0 or len(stride) <= 2
+          dH = kH if len(stride) == 0 else stride[0]
+          dW = kW if len(stride) == 0 else (dH if len(stride) == 1 else stride[1])
+          assert len(padding) == 1 or len(padding) == 2
+          padH = padding[0]
+          padW = padH if len(padding) == 1 else padding[1]
+
+          assert divisor_override is None or divisor_override != 0
+          nbatch = input[0] if len(input) == 4 else 1
+          nInputPlane = input[-3]
+          inputHeight = input[-2]
+          inputWidth = input[-1]
+          outputHeight = pooling_output_shape(inputHeight, kH, padH, dH, 1, ceil_mode)
+          outputWidth = pooling_output_shape(inputWidth, kW, padW, dW, 1, ceil_mode)
+          pool2d_shape_check(input, kH, kW, dH, dW, padH, padW, 1, 1, nInputPlane, inputHeight, inputWidth, outputHeight, outputWidth)
+          if len(input) == 3:
+            return [nInputPlane, outputHeight, outputWidth]
+          else:
+            return [nbatch, nInputPlane, outputHeight, outputWidth]
+
         def embedding(weight: List[int], indices: List[int], padding_idx:int = -1, scale_grad_by_freq:bool=False, sparse: bool=False):
           assert len(weight) == 2
           if len(indices) == 1:
@@ -670,6 +695,7 @@ static const OperatorMap<std::string>& get_schema_to_function_graph() {
       {"aten::sigmoid(Tensor self) -> Tensor", "unary"},
       {"aten::dropout(Tensor input, float p, bool train) -> Tensor", "unary"},
       {"aten::adaptive_avg_pool2d(Tensor self, int[2] output_size) -> Tensor", "adaptive_avg_pool2d"},
+      {"aten::avg_pool2d(Tensor self, int[2] kernel_size, int[2] stride=[], int[2] padding=0, bool ceil_mode=False, bool count_include_pad=True, int? divisor_override=None) -> Tensor", "avg_pool2d"},
       {"aten::gelu(Tensor self) -> Tensor", "unary"},
       {"aten::tanh(Tensor self) -> Tensor", "unary"},
       {"aten::erf(Tensor self) -> (Tensor)", "unary"},
