@@ -50,6 +50,7 @@ for name, model in model_pairs:
         # TODO - need to add handling of a couple ops, doen't quite work yet
 
     if name == "deeplab":
+        # rewrite slice(size) to [size(0), size(1)]
         for node in model_frozen.graph.findAllNodes("aten::size"):
             if not any(use.user.kind() == "aten::slice" for use in node.output().uses()):
                 continue
@@ -68,8 +69,15 @@ for name, model in model_pairs:
                 index.node().moveBefore(size_i)
             node.output().replaceAllUsesWith(li.output())
             node.destroy()
+        output = next(model_frozen.graph.outputs())
+        assert output.node().kind() == "prim::DictConstruct"
+        # dict with a single element
+        assert len(list(output.node().inputs())) == 2
+        assert len(list(output.uses())) == 1
+        tensor_input = list(output.node().inputs())[1]
+        model_frozen.graph.eraseOutput(0)
+        model_frozen.graph.registerOutput(tensor_input)
         torch._C._jit_pass_peephole(model_frozen.graph)
-        import pdb; pdb.set_trace()
 
 
     shape_compute_graph = torch._C._jit_pass_propagate_shapes_on_graph_and_build_compute(model_frozen.graph)
@@ -82,10 +90,16 @@ for name, model in model_pairs:
         node.destroy()
     torch._C._jit_pass_dce(g)
     print(g)
+    import pdb; pdb.set_trace()
     print("Mapping from Sym Dim to Shape Compute Graph Output")
     for key, value in shape_compute_graph.graph_output_to_symbolic_shape_dim().items():
         print(str(value) + " :", key)
 
+    model_frozen.graph.eraseInput(0)
+    with torch.jit._hide_source_ranges():
+        out = (torch._C._jit_trace_graph(model_frozen.graph, (torch.rand([1, 3, 256, 256]),)))
+        import pdb; pdb.set_trace()
+        print(out)
 
     # to execute jit function it must have a single output
     g.makeMultiOutputIntoTuple()

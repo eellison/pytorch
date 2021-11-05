@@ -22,6 +22,7 @@
 #include <torch/csrc/jit/runtime/exception_message.h>
 #include <torch/csrc/jit/runtime/symbolic_shape_registry.h>
 #include <torch/csrc/utils/memory.h>
+#include <torch/csrc/jit/runtime/graph_iterator.h>
 #include <algorithm>
 #include <memory>
 #include <numeric>
@@ -634,6 +635,7 @@ struct SymbolicShapeGraphAnalyzer {
     std::unordered_map<Node*, std::shared_ptr<Graph>> partial_evaluated_graphs =
         propagateShapesAndGatherPartialEvalShapeGraphs(db);
 
+    std::unordered_set<Value*> non_tensor_non_constants;
     auto stitched_shape_compute_graph = std::make_shared<Graph>();
     // We want to build up a computational graph which computes all shapes
     // we dont know statically - that is, all symbolic shapes within
@@ -647,7 +649,7 @@ struct SymbolicShapeGraphAnalyzer {
       }
       // TODO: generalize logic to for other tensor input ops when they are
       // added
-      if (curr->kind() == prim::ListConstruct) {
+      if (curr->kind() == prim::ListConstruct && isListOfTensors(curr->output()->type())) {
         auto uses = curr->output()->uses();
         if (!std::all_of(uses.begin(), uses.end(), [](const Use& use) {
               return use.user->kind() == aten::cat;
@@ -655,6 +657,40 @@ struct SymbolicShapeGraphAnalyzer {
           GRAPH_DEBUG("Non cat list use ", getHeader(curr));
           return c10::nullopt;
         }
+        continue;
+      }
+      size_t non_tensor_non_constant_count = 0;
+      for (Value * v: curr->outputs()) {
+        if (v->type()->cast<TensorType>()) {
+          continue;
+        }
+        auto contained_types = curr->output()->type()->containedTypes();
+        if (std::none_of(contained_types.begin(), contained_types.end(), [](const TypePtr& type) {
+          return type->cast<TensorType>();
+        })) {
+          non_tensor_non_constants.insert(v);
+          non_tensor_non_constant_count += 1;
+        }
+      }
+      if (non_tensor_non_constant_count == curr->outputs().size()) {
+        if (curr->kind() == aten::size && curr->inputs().at(0)->type()->cast<TensorType>()) {
+          auto tt = curr->inputs().at(0)->type()->cast<TensorType>();
+          auto graph = std::make_shared<Graph>();
+          auto li_input = graph->addInput()->setType(ListType::ofInts());
+          std::vector<Value*> inputs;
+          WithInsertPoint guard(graph->block());
+          for (size_t i = 0; i < *tt->symbolic_sizes().rank(); ++i) {
+            auto index = graph->insertConstant(static_cast<int64_t>(i));
+            auto list_index = graph->insertNode(graph->create(aten::__getitem__, {li_input, index}));
+            list_index->output()->setType(IntType::get());
+            inputs.push_back(list_index->output());
+          }
+          auto out = graph->insertNode(graph->createList(IntType::get(), inputs));
+          graph->registerOutput(out->output());
+
+          WithInsertPoint encompassing_g(curr);
+          joinPartialEvaluatedShapeGraphToLargeShapeGraph(curr->inputs().at(0)->node(), graph, stitched_shape_compute_graph, non_tensor_non_constants);
+         }
         continue;
       }
 
@@ -678,8 +714,11 @@ struct SymbolicShapeGraphAnalyzer {
         }
       }
       auto partial_eval_graph = partial_evaluated_graphs[curr];
-      joinPartialEvaluatedShapeGraphToLargeShapeGraph(
-          curr, partial_eval_graph, stitched_shape_compute_graph);
+      auto success = joinPartialEvaluatedShapeGraphToLargeShapeGraph(
+          curr, partial_eval_graph, stitched_shape_compute_graph, non_tensor_non_constants);
+      if (!success) {
+        return c10::nullopt;
+      }
     }
 
     size_t MAX_ITER = 8;
@@ -760,10 +799,11 @@ struct SymbolicShapeGraphAnalyzer {
     }
   }
 
-  void joinPartialEvaluatedShapeGraphToLargeShapeGraph(
+  bool joinPartialEvaluatedShapeGraphToLargeShapeGraph(
       Node* curr,
       std::shared_ptr<Graph> partial_eval_graph,
-      std::shared_ptr<Graph> stitched_shape_compute_graph) {
+      std::shared_ptr<Graph> stitched_shape_compute_graph,
+      std::unordered_set<Value*>& non_tensor_non_constants) {
     // we are building up the large shape compute graph by iteratively
     // combining partially evaluated individual node shape graphs.
 
@@ -782,6 +822,30 @@ struct SymbolicShapeGraphAnalyzer {
     // dimensions
     // leaving us only compute for calculating the runtime value of symbolic
     // dimensions
+    if (curr->kind() == aten::upsample_bilinear2d) {
+      std::cout << " Hi \n";
+    }
+
+    DepthFirstGraphNodeIterator it(partial_eval_graph);
+    Node* node = it.next();
+    while (node && node->kind() != prim::RaiseException) {
+      node = it.next();
+    }
+    if (curr->outputs().size() == 1 && !node) {
+      auto output = curr->output();
+      auto tt = output->type()->expect<TensorType>();
+      auto symbolic_sizes = tt->symbolic_sizes();
+      TORCH_INTERNAL_ASSERT(symbolic_sizes.rank());
+      bool all_contained = true;
+      for (size_t i = 0; i < *symbolic_sizes.rank(); i++) {
+        auto sym_shape = symbolic_sizes[i];
+        all_contained = all_contained && (sym_shape.is_static() || symbolic_shape_value_to_graph_output_.count(sym_shape.value()));
+      }
+      if (all_contained) {
+        return true;
+      }
+    }
+
 
     std::vector<Value*> node_inputs;
     // TODO: generalize logic
@@ -801,6 +865,12 @@ struct SymbolicShapeGraphAnalyzer {
     std::vector<Value*> partial_eval_inputs;
     for (size_t i = 0; i < node_inputs.size(); ++i) {
       auto node_input = node_inputs[i];
+      if (non_tensor_non_constants.count(node_input)) {
+        if (partial_eval_graph->inputs().at(i)->hasUses()) {
+          GRAPH_DEBUG("Non-tensor non-constant with uses", getHeader(curr));
+          return false;
+        }
+      }
       auto existing_graph_mapping =
           enclosing_graph_value_to_shape_graph_input_.find(node_input);
       if (existing_graph_mapping !=
@@ -855,6 +925,7 @@ struct SymbolicShapeGraphAnalyzer {
                 stitched_shape_compute_graph->outputs().size() - 1);
       }
     }
+    return true;
   }
 
   std::unordered_map<Node*, std::shared_ptr<Graph>>

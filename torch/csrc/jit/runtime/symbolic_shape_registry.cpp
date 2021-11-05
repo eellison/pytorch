@@ -233,8 +233,10 @@ const std::string shape_compute_functions =
             out.append(int(input[2] * scale_factors[0]))
             out.append(int(input[3] * scale_factors[1]))
             return out
-          assert 0, "Either output_size or scale_factors must be presented"
+          assert False, "Either output_size or scale_factors must be presented"
 
+        def upsample_bilinear2d(input: List[int], output_size: List[int], align_corners: bool, scale_factors: Optional[List[float]]):
+          return upsample_nearest2d(input, output_size, scale_factors)
     )"
     R"(
 
@@ -741,7 +743,7 @@ static const OperatorMap<std::string>& get_schema_to_function_graph() {
       {"aten::mean.dim(Tensor self, int[1] dim, bool keepdim=False, *, ScalarType? dtype=None) -> Tensor", "mean_dim"},
       {"aten::addmm(Tensor self, Tensor mat1, Tensor mat2, *, Scalar beta=1, Scalar alpha=1) -> Tensor", "addmm"},
       {"aten::upsample_nearest2d.vec(Tensor input, int[]? output_size, float[]? scale_factors) -> (Tensor)", "upsample_nearest2d"},
-      {"aten::upsample_bilinear2d(Tensor self, int[2] output_size, bool align_corners, float? scales_h=None, float? scales_w=None) -> Tensor", "upsample_bilinear2d"},
+      {"aten::upsample_bilinear2d.vec(Tensor input, int[]? output_size, bool align_corners, float[]? scale_factors) -> Tensor", "upsample_bilinear2d"},
       {"aten::quantize_per_tensor(Tensor self, float scale, int zero_point, ScalarType dtype) -> Tensor", "unary"},
       {"aten::quantize_per_tensor.tensor_qparams(Tensor self, Tensor scale, Tensor zero_point, ScalarType dtype) -> Tensor", "unary"},
       {"aten::dequantize(Tensor self) -> Tensor", "unary"},
