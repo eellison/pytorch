@@ -673,24 +673,74 @@ struct SymbolicShapeGraphAnalyzer {
         }
       }
       if (non_tensor_non_constant_count == curr->outputs().size()) {
-        if (curr->kind() == aten::size && curr->inputs().at(0)->type()->cast<TensorType>()) {
-          auto tt = curr->inputs().at(0)->type()->cast<TensorType>();
-          auto graph = std::make_shared<Graph>();
-          auto li_input = graph->addInput()->setType(ListType::ofInts());
-          std::vector<Value*> inputs;
-          WithInsertPoint guard(graph->block());
-          for (size_t i = 0; i < *tt->symbolic_sizes().rank(); ++i) {
-            auto index = graph->insertConstant(static_cast<int64_t>(i));
-            auto list_index = graph->insertNode(graph->create(aten::__getitem__, {li_input, index}));
-            list_index->output()->setType(IntType::get());
-            inputs.push_back(list_index->output());
+        // TODO: factor into function
+        if (curr->kind() == prim::ListConstruct) {
+          if (db.hasWriters(curr) ||
+              !curr->output()
+                   ->type()
+                   ->expect<ListType>()
+                   ->getElementType()
+                   ->isSubtypeOf(IntType::get())) {
+            continue;
           }
-          auto out = graph->insertNode(graph->createList(IntType::get(), inputs));
-          graph->registerOutput(out->output());
-
-          WithInsertPoint encompassing_g(curr);
-          joinPartialEvaluatedShapeGraphToLargeShapeGraph(curr->inputs().at(0)->node(), graph, stitched_shape_compute_graph, non_tensor_non_constants);
-         }
+          std::vector<Value*> partial_eval_inputs;
+          for (Value* v : curr->inputs()) {
+            if (v->node()->kind() == prim::Constant) {
+              partial_eval_inputs.push_back(
+                  stitched_shape_compute_graph->insertConstant(
+                      constant_as<int64_t>(v)));
+            } else {
+              auto tt = v->node()->inputs().at(0)->type()->expect<TensorType>();
+              auto ss = tt->symbolic_sizes();
+              auto index = constant_as<int64_t>(v->node()->inputs().at(1));
+              if (!index) {
+                break;
+              }
+              auto symbolic_shape = ss.at(*normIndex(*index, *ss.rank()));
+              if (symbolic_shape.is_static()) {
+                partial_eval_inputs.push_back(
+                    stitched_shape_compute_graph->insertConstant(
+                        constant_as<int64_t>(v)));
+              } else {
+                if (!symbolic_shape_value_to_graph_output_.count(
+                        symbolic_shape.value())) {
+                  if (!enclosing_graph_value_to_shape_graph_input_.count(
+                          v->node()->inputs().at(0))) {
+                    auto inp =
+                        stitched_shape_compute_graph->addInput()->setType(
+                            ListType::ofInts());
+                    enclosing_graph_value_to_shape_graph_input_
+                        [v->node()->inputs().at(0)] = inp;
+                  }
+                  auto inp = enclosing_graph_value_to_shape_graph_input_
+                      [v->node()->inputs().at(0)];
+                  WithInsertPoint g(
+                      *stitched_shape_compute_graph->block()->nodes().end());
+                  auto graph_index =
+                      stitched_shape_compute_graph->insertConstant(*index);
+                  auto sym_shape = stitched_shape_compute_graph->insert(
+                      aten::__getitem__, {inp, graph_index});
+                  symbolic_shape_value_to_graph_output_[symbolic_shape
+                                                            .value()] =
+                      sym_shape;
+                }
+                partial_eval_inputs.push_back(
+                    symbolic_shape_value_to_graph_output_[symbolic_shape
+                                                              .value()]);
+              }
+            }
+          }
+          if (partial_eval_inputs.size() != curr->inputs().size()) {
+            continue;
+          }
+          auto list = stitched_shape_compute_graph->createList(
+              IntType::get(), partial_eval_inputs);
+          list->insertBefore(
+              *stitched_shape_compute_graph->block()->nodes().end());
+          enclosing_graph_value_to_shape_graph_input_[curr->output()] =
+              list->output();
+          non_tensor_non_constants.erase(curr->output());
+        }
         continue;
       }
 
@@ -822,30 +872,6 @@ struct SymbolicShapeGraphAnalyzer {
     // dimensions
     // leaving us only compute for calculating the runtime value of symbolic
     // dimensions
-    if (curr->kind() == aten::upsample_bilinear2d) {
-      std::cout << " Hi \n";
-    }
-
-    DepthFirstGraphNodeIterator it(partial_eval_graph);
-    Node* node = it.next();
-    while (node && node->kind() != prim::RaiseException) {
-      node = it.next();
-    }
-    if (curr->outputs().size() == 1 && !node) {
-      auto output = curr->output();
-      auto tt = output->type()->expect<TensorType>();
-      auto symbolic_sizes = tt->symbolic_sizes();
-      TORCH_INTERNAL_ASSERT(symbolic_sizes.rank());
-      bool all_contained = true;
-      for (size_t i = 0; i < *symbolic_sizes.rank(); i++) {
-        auto sym_shape = symbolic_sizes[i];
-        all_contained = all_contained && (sym_shape.is_static() || symbolic_shape_value_to_graph_output_.count(sym_shape.value()));
-      }
-      if (all_contained) {
-        return true;
-      }
-    }
-
 
     std::vector<Value*> node_inputs;
     // TODO: generalize logic

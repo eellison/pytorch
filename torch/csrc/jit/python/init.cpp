@@ -46,6 +46,7 @@
 #include <torch/csrc/jit/passes/onnx.h>
 #include <torch/csrc/jit/passes/onnx/cast_all_constant_to_floating.h>
 #include <torch/csrc/jit/passes/onnx/constant_fold.h>
+#include <torch/csrc/jit/passes/canonicalize_for_shape_analysis.h>
 #include <torch/csrc/jit/passes/onnx/eliminate_unused_items.h>
 #include <torch/csrc/jit/passes/onnx/eval_peephole.h>
 #include <torch/csrc/jit/passes/onnx/fixup_onnx_controlflow.h>
@@ -207,6 +208,7 @@ void initJITBindings(PyObject* module) {
           PropagateShapesAndBuildLargeShapeComputeGraph)
       .def("_jit_pass_onnx_function_substitution", ONNXFunctionCallSubstitution)
       .def("_jit_pass_integer_value_refinement", RefineIntegerValues)
+      .def("_jit_pass_canonicalize_for_shape_analysis", CanonicalizeForShapeAnalysis)
       .def(
           "_jit_set_symbolic_shapes_test_mode",
           &setSymbolicShapeAnalysisTestMode)

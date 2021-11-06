@@ -238,6 +238,7 @@ core_sources_full_mobile_no_backend_interface = [
     "torch/csrc/jit/passes/pass_manager.cpp",
     "torch/csrc/jit/passes/peephole.cpp",
     "torch/csrc/jit/passes/peephole_non_tensor.cpp",
+    "torch/csrc/jit/passes/canonicalize_for_shape_analysis.cpp",
     "torch/csrc/jit/passes/create_functional_graphs.cpp",
     "torch/csrc/jit/passes/remove_mutation.cpp",
     "torch/csrc/jit/passes/prepack_folding.cpp",
