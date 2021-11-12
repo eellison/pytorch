@@ -8,8 +8,10 @@
 #include <torch/csrc/jit/passes/dead_code_elimination.h>
 #include <torch/csrc/jit/passes/freeze_module.h>
 #include <torch/csrc/jit/passes/remove_mutation.h>
+#include <torch/csrc/jit/passes/tensorexpr_fuser.h>
 #include <torch/csrc/jit/passes/utils/subgraph_utils.h>
 #include <torch/csrc/jit/runtime/custom_operator.h>
+#include <torch/csrc/jit/runtime/jit_trace.h>
 #include <torch/csrc/jit/runtime/static/impl.h>
 #include <torch/csrc/jit/runtime/static/ops.h>
 #include <torch/csrc/jit/runtime/static/passes.h>
@@ -317,6 +319,17 @@ void createFusionGroups(Block* block, AliasDb* aliasDb, size_t min_size) {
     }
   }
   inlineSmallFusionGroups(block, min_size);
+}
+
+void performTEFusion(
+    std::shared_ptr<Graph> graph,
+    std::vector<IValue> sample_inputs) {
+  std::cout << "Graph before tracing: " << *graph;
+  auto traced_graph = TraceGraph(graph, sample_inputs);
+  std::cout << "Graph after tracing: " << *traced_graph;
+  FuseTensorExprs(traced_graph);
+  std::cout << "Graph after fusion: " << *traced_graph;
+  graph->block()->cloneFrom(traced_graph->block(), nullptr);
 }
 
 } // namespace jit

@@ -91,6 +91,8 @@ struct TORCH_API StaticModuleOptions {
   // graph, where storage is deallocated outside static runtime
   // (enable_out_variant must be true)
   bool manage_output_tensors{false};
+  // enable fusion of ops at model loading time
+  bool enable_fusion{true};
 };
 
 /// The static runime supports two execution modes.
@@ -145,11 +147,13 @@ class TORCH_API StaticModule {
  public:
   explicit StaticModule(
       std::shared_ptr<torch::jit::Graph> g,
+      std::vector<IValue> sample_inputs = {},
       const StaticModuleOptions& opts = StaticModuleOptions());
 
   explicit StaticModule(
       const torch::jit::Module& m,
       bool is_frozen = false,
+      std::vector<IValue> sample_inputs = {},
       const StaticModuleOptions& opts = StaticModuleOptions());
 
   typedef enum {

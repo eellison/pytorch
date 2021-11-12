@@ -291,6 +291,14 @@ std::shared_ptr<Graph> TraceGraph(std::shared_ptr<Graph> graph, Stack& stack) {
     ni->setType(ni->type());
     td.old_to_new_[inp] = ni;
   }
+  // type inputs
+  for (auto i : c10::irange(stack.size())) {
+    if (stack[i].isTensor()) {
+      td.traced_graph_->inputs().at(i)->setType(
+          tensorTypeInCurrentExecutionContext(stack[i].toTensor()));
+    }
+  }
+
   ProfilingRecord::removeProfileCounter(pr->profiled_graph_->block());
   RemoveProfilingNodes(pr->profiled_graph_);
   insertTracingNodes(pr->profiled_graph_->block(), pr.get(), td);
@@ -301,6 +309,7 @@ std::shared_ptr<Graph> TraceGraph(std::shared_ptr<Graph> graph, Stack& stack) {
   for (auto out : pr->profiled_graph_->outputs()) {
     td.traced_graph_->block()->registerOutput(td.old_to_new_.at(out));
   }
+
   GRAPH_DUMP("Traced graph:", td.traced_graph_);
   return td.traced_graph_;
 }

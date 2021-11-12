@@ -13,6 +13,7 @@
 #include <torch/csrc/jit/passes/dead_code_elimination.h>
 #include <torch/csrc/jit/passes/pass_manager.h>
 #include <torch/csrc/jit/passes/remove_redundant_profiles.h>
+#include <torch/csrc/jit/passes/symbolic_shape_runtime_fusion.h>
 #include <torch/csrc/jit/passes/utils/subgraph_utils.h>
 #include <torch/csrc/jit/runtime/custom_operator.h>
 #include <torch/csrc/jit/runtime/graph_executor.h>
@@ -604,10 +605,12 @@ class TensorExprFuser {
     // fusion is done.
     inlineSmallFusionGroups(graph_->block());
     GRAPH_DUMP("After inlining small fusion groups: ", graph_);
-    prepareFusionGroupAndGuardOutputs(graph_->block());
-    GRAPH_DUMP("After guarding fusion groups: ", graph_);
-    removeTensorTypeSpecializations(graph_->block());
-    GRAPH_DUMP("After removing tensor type specializations: ", graph_);
+    // prepareFusionGroupAndGuardOutputs(graph_->block());
+    // GRAPH_DUMP("After guarding fusion groups: ", graph_);
+    // removeTensorTypeSpecializations(graph_->block());
+    // GRAPH_DUMP("After removing tensor type specializations: ", graph_);
+    generalizeFusionGroups(graph_->block());
+    GRAPH_DUMP("After generalizing fusion groups: ", graph_);
   }
 
  private:
@@ -1243,6 +1246,22 @@ class TensorExprFuser {
     }
   }
 
+  void generalizeFusionGroups(Block* block) {
+    std::vector<Node*> fusion_groups;
+    for (Node* n : block->nodes()) {
+      for (Block* b : n->blocks()) {
+        generalizeFusionGroups(b);
+      }
+      if (n->kind() == prim::TensorExprGroup) {
+        fusion_groups.push_back(n);
+      }
+    }
+    std::cout << "Before generating guard: " << *block->owningGraph();
+    for (Node* fusion_group : fusion_groups) {
+      auto success = GenerateGuard(fusion_group, /*add_composed_op=*/true);
+    }
+  }
+
   // This function parses the option provided by the environment variable
   // "PYTORCH_TENSOREXPR_DONT_FUSE".
   // This variable allows users to disable fusion on a list of specified
@@ -1299,8 +1318,12 @@ void FuseTensorExprs(
 }
 
 Operation createTensorExprOp(const Node* node) {
-  auto kernel =
-      std::make_shared<tensorexpr::TensorExprKernel>(node->g(attr::Subgraph));
+  std::cout << "---- In createTensorExprOp: " << *node << std::endl;
+  auto sym_shapes = node->is(attr::symbolic_shape_inputs);
+  std::unordered_map<c10::Symbol, tensorexpr::NNCLoweringFunction>
+      custom_lowerings;
+  auto kernel = std::make_shared<tensorexpr::TensorExprKernel>(
+      node->g(attr::Subgraph), custom_lowerings, sym_shapes);
   return [kernel](Stack& stack) {
     RECORD_FUNCTION(kernel->getKernelName(), std::vector<c10::IValue>());
     kernel->run(stack);
