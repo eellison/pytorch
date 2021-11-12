@@ -8,12 +8,26 @@ models = torchvision.models
 
 model_pairs = (
     # ("mobilenet_v3_small", models.mobilenet_v3_small),
-    # ("mobilenet_v2", models.mobilenet_v2),
+    ("mobilenet_v2", models.mobilenet_v2()),
     # ("inception_v3", models.inception_v3()),
-    # ("resnet", models.resnet18)
+    # ("resnet", models.resnet18()),
     # ("shufflenet_v2_x1_0", models.shufflenet_v2_x1_0()),
-    ("deeplab", models.segmentation.deeplabv3_resnet50()), # TODO: need a couple more ops
+    # ("deeplab", models.segmentation.deeplabv3_resnet50()), # TODO: need a couple more ops
 )
+
+def compute_number_of_sym_shapes(graph):
+    num_symbols = set()
+
+    for node in graph.nodes():
+        vals = list(node.outputs()) + list(node.inputs())
+        for val in vals:
+            if "Tensor" not in str(val.type()):
+                continue
+            ss = val.type().symbolic_sizes()
+            for shape in ss:
+                if shape < 0:
+                    num_symbols.add(shape)
+    print("Number of symbols", len(num_symbols))
 
 for name, model in model_pairs:
 
@@ -31,10 +45,12 @@ for name, model in model_pairs:
     torch._C._jit_pass_canonicalize_graph_fuser_ops(model_frozen.graph)
     torch._C._jit_pass_propagate_shapes_on_graph(model_frozen.graph)
     torch._C._jit_pass_canonicalize_for_shape_analysis(model_frozen.graph)
-    torch._C._jit_pass_propagate_shapes_on_graph(model_frozen.graph)
+    # torch._C._jit_pass_propagate_shapes_on_graph(model_frozen.graph)
     torch._C._jit_pass_canonicalize_for_shape_analysis(model_frozen.graph)
     torch._C._jit_pass_peephole(model_frozen.graph)
     torch._C._jit_pass_constant_propagation(model_frozen.graph)
+
+    # import pdb; pdb.set_trace()
 
     # unused tuple output, manipulate so we are just returning tensor
     if name == "inception_v3":
@@ -69,6 +85,8 @@ for name, model in model_pairs:
 
     torch._C._jit_pass_canonicalize_for_shape_analysis(model_frozen.graph)
 
+    # inps[1].setType(inps[1].type().with_sizes([None, 3, 255, 255]))
+    torch._C.Graph.set_global_print_source_ranges(False)
     shape_compute_graph = torch._C._jit_pass_propagate_shapes_on_graph_and_build_compute(model_frozen.graph)
     g = shape_compute_graph.partial_eval_shape_graph()
     print("model GRAPH \n\n")
