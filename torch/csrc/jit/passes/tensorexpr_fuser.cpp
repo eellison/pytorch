@@ -31,6 +31,9 @@ namespace jit {
 
 static bool texpr_reductions_enabled = false;
 
+static bool texpr_generalize_enabled = false;
+
+
 bool isSupportedForBlock(Node* node) {
   switch (node->kind()) {
     case aten::add:
@@ -275,6 +278,16 @@ bool setTexprReductionsEnabled(bool value) {
 
 bool texprReductionsEnabled() {
   return texpr_reductions_enabled;
+}
+
+bool setTexprGeneralizeEnabled(bool value) {
+  bool old_value = texpr_generalize_enabled;
+  texpr_generalize_enabled = value;
+  return old_value;
+}
+
+bool texprGeneralizeEnabled() {
+  return texpr_generalize_enabled;
 }
 
 void removeProfileNodesAndSpecializeTypes(Block* b) {
@@ -605,12 +618,18 @@ class TensorExprFuser {
     // fusion is done.
     inlineSmallFusionGroups(graph_->block());
     GRAPH_DUMP("After inlining small fusion groups: ", graph_);
+    // if (!texpr_generalize_enabled) {
+      // prepareFusionGroupAndGuardOutputs(graph_->block());
+      // GRAPH_DUMP("After guarding fusion groups: ", graph_);
+      // removeTensorTypeSpecializations(graph_->block());
+    // } else {
+      generalizeFusionGroups(graph_->block());
+      GRAPH_DUMP("After generalizing fusion groups: ", graph_);
+    // }
     // prepareFusionGroupAndGuardOutputs(graph_->block());
     // GRAPH_DUMP("After guarding fusion groups: ", graph_);
     // removeTensorTypeSpecializations(graph_->block());
     // GRAPH_DUMP("After removing tensor type specializations: ", graph_);
-    generalizeFusionGroups(graph_->block());
-    GRAPH_DUMP("After generalizing fusion groups: ", graph_);
   }
 
  private:

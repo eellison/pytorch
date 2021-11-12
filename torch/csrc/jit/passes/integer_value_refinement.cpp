@@ -135,6 +135,10 @@ struct IntegerValueRefiner {
         }
       }
       for (size_t input = 0; input < n->inputs().size(); ++input) {
+        if (n->kind() == prim::ListConstruct) {
+          std::cout << "hi\n";
+        }
+
         Value* input_v = n->inputs().at(input);
         if (!input_v->type()->cast<IntType>()) {
           continue;
