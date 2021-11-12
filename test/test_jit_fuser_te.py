@@ -496,7 +496,9 @@ class TestTEFuser(JitTestCase):
             z = torch.randint(0, 2, (4, 4), dtype=torch.bool, device=device)
 
             ge = self.checkTrace(f, (x, y, z), inputs_require_grads=False)
-            self.assertAllFused(ge.graph_for(x, y, z))
+            import pdb; pdb.set_trace()
+            print(ge)
+            # self.assertAllFused(ge.graph_for(x, y, z))
 
     def test_div_bool(self):
         for device in self.devices:

@@ -1258,7 +1258,7 @@ class TensorExprFuser {
     }
     std::cout << "Before generating guard: " << *block->owningGraph();
     for (Node* fusion_group : fusion_groups) {
-      auto success = GenerateGuard(fusion_group, /*add_composed_op=*/true);
+      auto success = GenerateGuard(fusion_group);
     }
   }
 
