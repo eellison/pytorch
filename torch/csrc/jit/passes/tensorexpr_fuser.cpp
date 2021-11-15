@@ -618,7 +618,9 @@ class TensorExprFuser {
     // fusion is done.
     inlineSmallFusionGroups(graph_->block());
     GRAPH_DUMP("After inlining small fusion groups: ", graph_);
-    if (!texpr_generalize_enabled) {
+    const char* option = std::getenv("PYTORCH_TENSOREXPR_DONT_FUSE");
+    auto enabled = std::getenv("PYTORCH_TENSOREXPR_DYNAMIC");
+    if (false) {
       prepareFusionGroupAndGuardOutputs(graph_->block());
       GRAPH_DUMP("After guarding fusion groups: ", graph_);
       removeTensorTypeSpecializations(graph_->block());
@@ -1338,7 +1340,7 @@ void FuseTensorExprs(
 }
 
 Operation createTensorExprOp(const Node* node) {
-  std::cout << "---- In createTensorExprOp: " << *node << std::endl;
+  // std::cout << "---- In createTensorExprOp: " << *node << std::endl;
   auto sym_shapes = node->is(attr::symbolic_shape_inputs);
   std::unordered_map<c10::Symbol, tensorexpr::NNCLoweringFunction>
       custom_lowerings;
