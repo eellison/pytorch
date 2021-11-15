@@ -812,8 +812,8 @@ void initJITBindings(PyObject* module) {
       .def("_jit_texpr_set_fallback_allowed", &tensorexpr::setFallbackAllowed)
       .def("_jit_set_texpr_reductions_enabled", &setTexprReductionsEnabled)
       .def("_jit_texpr_reductions_enabled", &texprReductionsEnabled)
-      .def("_jit_set_texpr_reductions_enabled", &setTexprReductionsEnabled)
-      .def("_jit_texpr_reductions_enabled", &texprReductionsEnabled)
+      .def("_jit_set_texpr_generalize_enabled", &setTexprGeneralizeEnabled)
+      .def("_jit_texpr_generalize_enabled", &texprGeneralizeEnabled)
       .def(
           "_jit_set_te_generate_block_code",
           [](bool gen_block_code) {

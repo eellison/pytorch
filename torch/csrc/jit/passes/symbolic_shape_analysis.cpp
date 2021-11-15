@@ -193,6 +193,165 @@ bool shapeGraphCleanupPasses(std::shared_ptr<Graph> graph) {
   return made_change;
 }
 
+void mergeSymbolicShapeSets(const std::vector<Value*>& symbolic_set) {
+  // `symbolic_set` represents a set of Value * which are all equal
+  // to each other. Here, we optimize the graph by replacing values
+  // in the set with other dominating values.
+  // in the following example, where a, b and c are all in the same
+  // symbolic set:
+  // if cond:
+  //    a = li[0]
+  //    b = li[1]
+  //    return [a, b]
+  // else:
+  //    c = li[0]
+  //    return [c, c]
+  // we can replace `b` with `a` because it is dominated by `a`,
+  // but we cannot replace `c` with another dominating value
+
+  // there are ways to compute this more efficiently but typically number of
+  // Values for each symbolic set is low and this is cheap to run
+  for (const auto i : c10::irange(symbolic_set.size())) {
+    Value* v = symbolic_set[i];
+    Value* dominating_value = v;
+    for (const auto& sym_set : symbolic_set) {
+      if (dominating_value->node()->isDominatedBy(sym_set->node())) {
+        dominating_value = sym_set;
+      }
+    }
+    if (dominating_value != v) {
+      v->replaceAllUsesWith(dominating_value);
+    }
+  }
+}
+
+void substituteInputTensorProperties(
+  std::vector<std::pair<int64_t, ShapeArguments>>& shape_args, std::shared_ptr<Graph> shape_compute_graph, std::unordered_map<Value*, int64_t>* symbolic_shape_values) {
+  // clang-format off
+  // here we iteratively substitute properties of the node's input tensors
+  // into the shape compute graph. we can substitute constants into the
+  // like len(inp) or inp[0] if the tensor has a fixed length or a fixed
+  // first dimension. we also try to resolve symbolic shapes of the same
+  // symbolic value to the same Value * in the shape compute graph.
+  // for the shape logic:
+  // dim1 = inp1[0]
+  // dim2 = inp2[0]
+  // return dim1 if dim2 == 1 else dim2
+  // if we see that inp1[0] and inp2[0] both have the same symbolic shape
+  // value, then it is a valid transformation to replace dim2 with dim1 or
+  // vice versa. to do this we collect all Value * for a particular symbolic
+  // shape. Then, we replace all Value * within that set with their dominator.
+  // In the example above, this allows us to infer  that the output will be the
+  // symbolic dimension value of dim1.
+
+  // if `symbolic_shape_values` is not null, record list accesses
+  // which resolve to symbolic dimension values with their concrete symbolic
+  // shape value. Because symbolic dimensions are represented as negative numbers and
+  // are not real values, inserting them as constants in the graph would invalidate
+  // the graph for further use. Instead, we keep track of what their value would be
+  // for extracting output shapes.
+  // clang-format on
+
+  std::unordered_map<int64_t, std::vector<Value*>> symbolic_shape_map;
+
+  for (const auto& index_symbolic_shape : shape_args) {
+    auto index = index_symbolic_shape.first;
+    auto shape_arguments = index_symbolic_shape.second;
+    for (const auto& use : shape_compute_graph->inputs().at(index)->uses()) {
+      // TODO: either decompose composite ops like slice or add handling here
+      switch (use.user->kind()) {
+        case aten::len: {
+          size_t len = shape_arguments.len();
+          replaceWithIValue(use.user->output(), static_cast<int64_t>(len));
+        } break;
+        case aten::__getitem__: {
+          auto index = constant_as<int64_t>(use.user->inputs().at(1));
+          if (!index) {
+            continue;
+          }
+          auto norm_index = normIndex(*index, shape_arguments.len());
+          if (!norm_index) {
+            continue;
+          }
+          auto shape_arg = shape_arguments.at(*norm_index);
+          if (auto const_int = shape_arg.asConstantInt()) {
+            replaceWithIValue(use.user->output(), const_int);
+            continue;
+          }
+          auto maybe_shape_symbol = shape_arg.asShapeSymbol();
+          if (!maybe_shape_symbol) {
+            continue;
+          }
+          auto shape_symbol = *maybe_shape_symbol;
+          if (symbolic_shape_values) {
+            symbolic_shape_values->emplace(
+                use.user->output(), shape_symbol.value());
+          } else {
+            int64_t symbolic_index = shape_symbol.value();
+            symbolic_shape_map[symbolic_index].push_back(use.user->output());
+          }
+          for (const auto& sym_uses : use.user->output()->uses()) {
+            auto k = sym_uses.user->kind();
+            if (k != aten::ge && k != aten::le && k != aten::ne &&
+                k != aten::eq && k != aten::lt && k != aten::gt) {
+              continue;
+            }
+            auto other_index = 1 - sym_uses.offset;
+            auto other_value =
+                constant_as<int64_t>(sym_uses.user->input(other_index));
+            if (!other_value) {
+              continue;
+            }
+
+            // check for dim >= 0, 0 <= dim
+            // dim >= 0
+            if (k == aten::ge && *other_value == 0 && other_index == 1) {
+              replaceWithIValue(sym_uses.user->output(), true);
+              continue;
+            }
+            // 0 <= dim
+            if (k == aten::le && *other_value == 0 && other_index == 0) {
+              replaceWithIValue(sym_uses.user->output(), true);
+              continue;
+            }
+            // dim < 0
+            if (k == aten::lt && *other_value == 0 && other_index == 1) {
+              replaceWithIValue(sym_uses.user->output(), false);
+              continue;
+            }
+            // 0 > dim
+            if (k == aten::gt && *other_value == 0 && other_index == 0) {
+              replaceWithIValue(sym_uses.user->output(), false);
+              continue;
+            }
+            // check for dim comparisons to negative number
+            if (*other_value >= 0) {
+              continue;
+            }
+            if (k == aten::eq || k == aten::ne) {
+              // True if:
+              // -2 != {Positive}
+              replaceWithIValue(sym_uses.user->output(), k == aten::ne);
+            } else {
+              // True if:
+              // -2 <= / < {Positive}
+              // {Positive} >= / > {-2}
+              bool true_val =
+                  ((other_index == 0 && (k == aten::le || k == aten::lt)) ||
+                    (other_index == 1 && (k == aten::ge || k == aten::gt)));
+              replaceWithIValue(sym_uses.user->output(), true_val);
+            }
+          }
+        }
+      }
+    }
+
+    for (const auto& symbolic_set : symbolic_shape_map) {
+      mergeSymbolicShapeSets(symbolic_set.second);
+    }
+  }
+}
+
 
 // Symbolic Shape Analysis works through iteratively partially evaluating
 // a TorchScript shape compute graph by inputing properties from input
@@ -395,170 +554,18 @@ struct SymbolicShapeNodeAnalyzer {
     while (made_change && curr_attempt < MAX_ATTEMPTS) {
       curr_attempt++;
       // symbolic shape concrete values are only used in final shape extraction
-      substituteInputTensorProperties(/*symbolic_shape_values*/ nullptr);
+      substituteInputTensorProperties(node_symbolic_input_indices_, shape_compute_graph_, /*symbolic_shape_values*/ nullptr);
       made_change = shapeGraphCleanupPasses(shape_compute_graph_);
     }
     std::unordered_map<Value*, int64_t> symbolic_shape_values;
-    substituteInputTensorProperties(&symbolic_shape_values);
-    GRAPH_DUMP("Done with partial evaluation", shape_compute_graph_);
-
+    substituteInputTensorProperties(node_symbolic_input_indices_, shape_compute_graph_, &symbolic_shape_values);
+    GRAPH_UPDATE("Done with partial evaluation", shape_compute_graph_);
     extractOutputShape(symbolic_shape_values);
     GRAPH_UPDATE(getHeader(node_), "done extracting shape");
     return shape_compute_graph_;
   }
 
  private:
-  void substituteInputTensorProperties(
-      std::unordered_map<Value*, int64_t>* symbolic_shape_values) {
-    // clang-format off
-    // here we iteratively substitute properties of the node's input tensors
-    // into the shape compute graph. we can substitute constants into the
-    // like len(inp) or inp[0] if the tensor has a fixed length or a fixed
-    // first dimension. we also try to resolve symbolic shapes of the same
-    // symbolic value to the same Value * in the shape compute graph.
-    // for the shape logic:
-    // dim1 = inp1[0]
-    // dim2 = inp2[0]
-    // return dim1 if dim2 == 1 else dim2
-    // if we see that inp1[0] and inp2[0] both have the same symbolic shape
-    // value, then it is a valid transformation to replace dim2 with dim1 or
-    // vice versa. to do this we collect all Value * for a particular symbolic
-    // shape. Then, we replace all Value * within that set with their dominator.
-    // In the example above, this allows us to infer  that the output will be the
-    // symbolic dimension value of dim1.
-
-    // if `symbolic_shape_values` is not null, record list accesses
-    // which resolve to symbolic dimension values with their concrete symbolic
-    // shape value. Because symbolic dimensions are represented as negative numbers and
-    // are not real values, inserting them as constants in the graph would invalidate
-    // the graph for further use. Instead, we keep track of what their value would be
-    // for extracting output shapes.
-    // clang-format on
-
-    std::unordered_map<int64_t, std::vector<Value*>> symbolic_shape_map;
-
-    for (const auto& index_symbolic_shape : node_symbolic_input_indices_) {
-      auto index = index_symbolic_shape.first;
-      auto shape_arguments = index_symbolic_shape.second;
-
-      for (const auto& use : shape_compute_graph_->inputs().at(index)->uses()) {
-        // TODO: either decompose composite ops like slice or add handling here
-        switch (use.user->kind()) {
-          case aten::len: {
-            size_t len = shape_arguments.len();
-            replaceWithIValue(use.user->output(), static_cast<int64_t>(len));
-          } break;
-          case aten::__getitem__: {
-            auto index = constant_as<int64_t>(use.user->inputs().at(1));
-            if (!index) {
-              continue;
-            }
-            auto norm_index = normIndex(*index, shape_arguments.len());
-            if (!norm_index) {
-              continue;
-            }
-            auto shape_arg = shape_arguments.at(*norm_index);
-            if (auto const_int = shape_arg.asConstantInt()) {
-              replaceWithIValue(use.user->output(), const_int);
-              continue;
-            }
-            auto maybe_shape_symbol = shape_arg.asShapeSymbol();
-            if (!maybe_shape_symbol) {
-              continue;
-            }
-            auto shape_symbol = *maybe_shape_symbol;
-            if (symbolic_shape_values) {
-              symbolic_shape_values->emplace(
-                  use.user->output(), shape_symbol.value());
-            } else {
-              int64_t symbolic_index = shape_symbol.value();
-              symbolic_shape_map[symbolic_index].push_back(use.user->output());
-            }
-            for (const auto& sym_uses : use.user->output()->uses()) {
-              auto k = sym_uses.user->kind();
-              if (k != aten::ge && k != aten::le && k != aten::ne &&
-                  k != aten::eq && k != aten::lt && k != aten::gt) {
-                break;
-              }
-              auto other_index = 1 - sym_uses.offset;
-              auto other_value =
-                  constant_as<int64_t>(sym_uses.user->input(other_index));
-              if (!other_value) {
-                continue;
-              }
-
-              // check for dim >= 0, 0 <= dim
-              // dim >= 0
-              if (k == aten::ge && *other_value == 0 && other_index == 1) {
-                replaceWithIValue(sym_uses.user->output(), true);
-                continue;
-              }
-              // 0 <= dim
-              if (k == aten::le && *other_value == 0 && other_index == 0) {
-                replaceWithIValue(sym_uses.user->output(), true);
-                continue;
-              }
-
-              // check for dim comparisons to negative number
-              if (*other_value >= 0) {
-                continue;
-              }
-              if (k == aten::eq || k == aten::ne) {
-                // True if:
-                // -2 != {Positive}
-                replaceWithIValue(sym_uses.user->output(), k == aten::ne);
-              } else {
-                // True if:
-                // -2 <= / < {Positive}
-                // {Positive} >= / > {-2}
-                bool true_val =
-                    ((other_index == 0 && (k == aten::le || k == aten::lt)) ||
-                     (other_index == 1 && (k == aten::ge || k == aten::gt)));
-                replaceWithIValue(sym_uses.user->output(), true_val);
-              }
-            }
-          }
-        }
-      }
-
-      for (const auto& symbolic_set : symbolic_shape_map) {
-        mergeSymbolicShapeSets(symbolic_set.second);
-      }
-    }
-  }
-
-  void mergeSymbolicShapeSets(const std::vector<Value*>& symbolic_set) {
-    // `symbolic_set` represents a set of Value * which are all equal
-    // to each other. Here, we optimize the graph by replacing values
-    // in the set with other dominating values.
-    // in the following example, where a, b and c are all in the same
-    // symbolic set:
-    // if cond:
-    //    a = li[0]
-    //    b = li[1]
-    //    return [a, b]
-    // else:
-    //    c = li[0]
-    //    return [c, c]
-    // we can replace `b` with `a` because it is dominated by `a`,
-    // but we cannot replace `c` with another dominating value
-
-    // there are ways to compute this more efficiently but typically number of
-    // Values for each symbolic set is low and this is cheap to run
-    for (const auto i : c10::irange(symbolic_set.size())) {
-      Value* v = symbolic_set[i];
-      Value* dominating_value = v;
-      for (const auto& sym_set : symbolic_set) {
-        if (dominating_value->node()->isDominatedBy(sym_set->node())) {
-          dominating_value = sym_set;
-        }
-      }
-      if (dominating_value != v) {
-        v->replaceAllUsesWith(dominating_value);
-      }
-    }
-  }
-
   c10::SymbolicShape extractListShape(
       Value* list,
       std::unordered_map<Value*, int64_t>& symbolic_shape_values,
@@ -699,8 +706,7 @@ struct SymbolicShapeGraphAnalyzer {
               auto symbolic_shape = ss.at(*normIndex(*index, *ss.rank()));
               if (symbolic_shape.is_static()) {
                 partial_eval_inputs.push_back(
-                    stitched_shape_compute_graph->insertConstant(
-                        constant_as<int64_t>(v)));
+                    stitched_shape_compute_graph->insertConstant(symbolic_shape.value()));
               } else {
                 if (!symbolic_shape_value_to_graph_output_.count(
                         symbolic_shape.value())) {
@@ -740,6 +746,53 @@ struct SymbolicShapeGraphAnalyzer {
           enclosing_graph_value_to_shape_graph_input_[curr->output()] =
               list->output();
           non_tensor_non_constants.erase(curr->output());
+        } else if (curr->matches("aten::size(Tensor self, int dim) -> int")) {
+          auto tt = curr->input(0)->type()->expect<TensorType>();
+          auto ten_inp = curr->input(0);
+          auto dim = constant_as<int64_t>(curr->input(1));
+          if (!dim || !tt->symbolic_sizes().rank()) {
+            continue;
+          }
+          auto norm_dim = normIndex(*dim, *tt->symbolic_sizes().rank());
+          if (!norm_dim) {
+            continue;
+          }
+          auto sym_shape = tt->symbolic_sizes().at(*norm_dim);
+          if (symbolic_shape_value_to_graph_output_.count(sym_shape.value())) {
+            enclosing_graph_value_to_shape_graph_input_[curr->output()] =
+              symbolic_shape_value_to_graph_output_[sym_shape.value()];
+            continue;
+          }
+
+          dim = *norm_dim;
+          if (!enclosing_graph_value_to_shape_graph_input_.count(ten_inp)) {
+            auto inp = stitched_shape_compute_graph->addInput()->setType(ListType::ofInts());
+            enclosing_graph_value_to_shape_graph_input_[ten_inp] = inp;
+          }
+          auto input = enclosing_graph_value_to_shape_graph_input_[ten_inp];
+          WithInsertPoint guard(stitched_shape_compute_graph->block());
+          auto index = stitched_shape_compute_graph->insertConstant(
+              static_cast<int64_t>(*dim));
+          auto li_index = stitched_shape_compute_graph->insert(
+              aten::__getitem__, {input, index});
+          li_index->setType(IntType::get());
+          enclosing_graph_value_to_shape_graph_input_[curr->output()] = li_index;
+        } else if (curr->matches("aten::add.int(int a, int b) -> int")) {
+          WithInsertPoint guard(stitched_shape_compute_graph->block());
+          std::vector<Value*> graph_inputs;
+          for (size_t i = 0; i < 2; ++i) {
+            if (enclosing_graph_value_to_shape_graph_input_.count(curr->input(i))) {
+              graph_inputs.push_back(enclosing_graph_value_to_shape_graph_input_[curr->input(i)]);
+            } else if (auto ival = toIValue(curr->input(i))) {
+              graph_inputs.push_back(stitched_shape_compute_graph->insertConstant(*ival));
+            }
+          }
+          if (graph_inputs.size() != 2) {
+            continue;
+          }
+          auto out = stitched_shape_compute_graph->insertNode(stitched_shape_compute_graph->create(aten::add, graph_inputs));
+          out->output()->setType(IntType::get());
+          enclosing_graph_value_to_shape_graph_input_[curr->output()] = out->output();
         }
         continue;
       }
@@ -771,11 +824,26 @@ struct SymbolicShapeGraphAnalyzer {
       }
     }
 
-    size_t MAX_ITER = 8;
+    size_t MAX_ITER = 12;
     bool made_change = true;
     size_t i = 0;
+    std::unordered_map<Value*, Value*> stitch_inputs_to_graph_value;
+    for (const auto& pair: enclosing_graph_value_to_shape_graph_input_) {
+      stitch_inputs_to_graph_value[pair.second] = pair.first;
+    }
+    std::vector<std::pair<int64_t, ShapeArguments>> shape_inps;
+    for (size_t i = 0; i  < stitched_shape_compute_graph->inputs().size(); ++i) {
+      auto g_inp = stitch_inputs_to_graph_value[stitched_shape_compute_graph->inputs().at(i)];
+      auto tt = g_inp->type()->cast<TensorType>();
+      if (!tt || !tt->symbolic_sizes().rank()) {
+        continue;
+      }
+      shape_inps.emplace_back(i, tt->symbolic_sizes());
+    }
+
     while (i < MAX_ITER && made_change) {
       i++;
+      substituteInputTensorProperties(shape_inps, stitched_shape_compute_graph, nullptr);
       made_change = shapeGraphCleanupPasses(stitched_shape_compute_graph);
     }
 
@@ -891,7 +959,7 @@ struct SymbolicShapeGraphAnalyzer {
     std::vector<Value*> partial_eval_inputs;
     for (size_t i = 0; i < node_inputs.size(); ++i) {
       auto node_input = node_inputs[i];
-      if (non_tensor_non_constants.count(node_input)) {
+      if (non_tensor_non_constants.count(node_input) && !enclosing_graph_value_to_shape_graph_input_.count(node_input)) {
         if (partial_eval_graph->inputs().at(i)->hasUses()) {
           GRAPH_DEBUG("Non-tensor non-constant with uses", getHeader(curr));
           return false;

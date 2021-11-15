@@ -618,14 +618,14 @@ class TensorExprFuser {
     // fusion is done.
     inlineSmallFusionGroups(graph_->block());
     GRAPH_DUMP("After inlining small fusion groups: ", graph_);
-    // if (!texpr_generalize_enabled) {
-      // prepareFusionGroupAndGuardOutputs(graph_->block());
-      // GRAPH_DUMP("After guarding fusion groups: ", graph_);
-      // removeTensorTypeSpecializations(graph_->block());
-    // } else {
+    if (!texpr_generalize_enabled) {
+      prepareFusionGroupAndGuardOutputs(graph_->block());
+      GRAPH_DUMP("After guarding fusion groups: ", graph_);
+      removeTensorTypeSpecializations(graph_->block());
+    } else {
       generalizeFusionGroups(graph_->block());
       GRAPH_DUMP("After generalizing fusion groups: ", graph_);
-    // }
+    }
     // prepareFusionGroupAndGuardOutputs(graph_->block());
     // GRAPH_DUMP("After guarding fusion groups: ", graph_);
     // removeTensorTypeSpecializations(graph_->block());
@@ -1253,6 +1253,7 @@ class TensorExprFuser {
         prepareFusionGroupAndGuardOutputs(b);
       }
       if (n->kind() == prim::TensorExprGroup) {
+        n->is_(attr::symbolic_shape_inputs, {});
         fusion_groups.push_back(n);
       }
     }
