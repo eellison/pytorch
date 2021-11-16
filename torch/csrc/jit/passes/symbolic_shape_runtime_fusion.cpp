@@ -71,11 +71,22 @@ void insertDynamicShapesGuard(
     Node* guarded_node,
     bool add_composed_op);
 
+std::vector<int64_t> contiguousStridesOf(at::IntArrayRef sizes) {
+  std::vector<int64_t> strides(sizes.size());
+  if (sizes.empty()) // zero-dim case
+    return strides;
+  strides.back() = 1;
+  for (size_t i = strides.size() - 1; i > 0; i--) {
+    strides[i - 1] = strides[i] * sizes[i];
+  }
+  return strides;
+}
+
 // Generalize Complete Shapes inputs to Symbolic Shapes.
 // Dimensions of value 1 will be preserved, otherwise
 // dimensions with the same value will be bucketed to the same
 // symbolic shape.
-// E.g. Tensor(5, 3), Tensor(3, 1) -> Tensor(SS(-1), SS(-2)), Tensor(SS(-2), 1)
+// E.g. Tensor(5, 3), Tensor(3, 1) -> Tensor(SS(-1), SS(-2)),Tensor(SS(-2), 1)
 bool TryGeneralizeInputDimensionsToSymbolicShapes(
     std::shared_ptr<Graph> tensorexpr_graph) {
   std::map<size_t, int64_t> shape_to_sym_shape;
@@ -86,6 +97,14 @@ bool TryGeneralizeInputDimensionsToSymbolicShapes(
     if (!v->type()->expect<TensorType>()->sizes().isComplete()) {
       return false;
     }
+    auto sizes = v->type()->expect<TensorType>()->sizes();
+    auto cont_strides = contiguousStridesOf(*sizes.concrete_sizes());
+    auto strides = *v->type()->expect<TensorType>()->strides().concrete_sizes();
+    if (cont_strides != strides) {
+      GRAPH_DUMP("Non contiguous stride: ", tensorexpr_graph);
+      return false;
+    }
+
     auto tt = v->type()->expect<TensorType>();
     std::vector<at::ShapeSymbol> shape_vec = *tt->symbolic_sizes().sizes();
     auto new_sizes = c10::fmap(shape_vec, [&](const at::ShapeSymbol& shape) {
@@ -124,14 +143,14 @@ bool GenerateGuard(Node* tensorexpr_graph_node, bool add_composed_op) {
     return false;
   }
 
-  std::cout << "Before inserting dynamic shapes guard: "
-            << *tensorexpr_graph_node->owningGraph();
-  std::cout << "-- tensorexpr_graph_node: " << *tensorexpr_graph_node;
+  // std::cout << "Before inserting dynamic shapes guard: "
+  //           << *tensorexpr_graph_node->owningGraph();
+  // std::cout << "-- tensorexpr_graph_node: " << *tensorexpr_graph_node;
   // Insert Guard
   insertDynamicShapesGuard(
       *maybe_shape_compute_mapping, tensorexpr_graph_node, add_composed_op);
-  std::cout << "After inserting dynamic shapes guard: "
-            << *tensorexpr_graph_node->owningGraph();
+  // std::cout << "After inserting dynamic shapes guard: "
+  //           << *tensorexpr_graph_node->owningGraph();
   return true;
 }
 

@@ -1113,8 +1113,11 @@ void CudaCodeGen::call_raw(const std::vector<void*>& raw_args) {
       gpu_block_extents_v[i] = immediateAs<int>(gpu_block_extents[i]);
       continue;
     }
+    auto extent = alloc<Cast>(kInt, gpu_block_extents[i]);
+    // auto extent = alloc(Cast::make(kInt, gpu_block_extents[i]));
+    // Cast::make(in.dtype(), e)
     ExprEval<SimpleIREvaluator> eval(
-        ExprHandle(gpu_block_extents[i]), buffer_args);
+        ExprHandle(extent), buffer_args);
     gpu_block_extents_v[i] = eval.value<int>(raw_args);
   }
   for (size_t i = 0; i < gpu_thread_extents.size(); i++) {

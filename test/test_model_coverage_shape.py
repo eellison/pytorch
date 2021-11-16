@@ -8,11 +8,11 @@ models = torchvision.models
 
 model_pairs = (
     # ("mobilenet_v3_small", models.mobilenet_v3_small),
-    ("mobilenet_v2", models.mobilenet_v2()),
+    # ("mobilenet_v2", models.mobilenet_v2()),
     # ("inception_v3", models.inception_v3()),
     # ("resnet", models.resnet18()),
     # ("shufflenet_v2_x1_0", models.shufflenet_v2_x1_0()),
-    # ("deeplab", models.segmentation.deeplabv3_resnet50()), # TODO: need a couple more ops
+    ("deeplab", models.segmentation.deeplabv3_resnet50()), # TODO: need a couple more ops
 )
 
 def compute_number_of_sym_shapes(graph):
