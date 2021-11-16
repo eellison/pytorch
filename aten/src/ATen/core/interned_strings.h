@@ -35,6 +35,7 @@ namespace c10 {
   _(prim, MKLDNNHardSigmoid)         \
   _(prim, MKLDNNHardTanh)            \
   _(prim, MKLDNNClamp)               \
+  _(prim, RunCounter)                \
   _(prim, Drop)                      \
   _(prim, Eval)                      \
   _(prim, Expand) /* onnx */         \

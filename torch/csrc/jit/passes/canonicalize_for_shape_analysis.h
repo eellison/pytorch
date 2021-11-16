@@ -11,5 +11,9 @@ namespace jit {
 // TODO: expand sym shape analysis more generally
 TORCH_API bool CanonicalizeForShapeAnalysis(std::shared_ptr<Graph> graph);
 
+
+TORCH_API void MarkUniqueBlocksWithCounters(std::shared_ptr<Graph> graph);
+
+
 } // namespace jit
 } // namespace torch

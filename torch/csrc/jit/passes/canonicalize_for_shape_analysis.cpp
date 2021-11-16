@@ -7,6 +7,8 @@
 namespace torch {
 namespace jit {
 
+static std::atomic<int64_t> idx(0);
+
 bool CanonicalizeForShapeAnalysis(std::shared_ptr<Graph> graph) {
 
   DepthFirstGraphNodeIterator graph_it(graph);
@@ -62,6 +64,28 @@ bool CanonicalizeForShapeAnalysis(std::shared_ptr<Graph> graph) {
   }
 
   return changed;
+}
+
+
+void MarkUniqueBlocksWithCounters(Block * b) {
+  if (b->owningNode()) {
+    WithInsertPoint block(*b->nodes().begin());
+    auto g = b->owningGraph();
+    auto node = g->insertNode(g->create(Symbol::prim("RunCounter"), {}, 0));
+    node->i_(attr::value, {0});
+    node->i_(attr::warn_id, idx);
+    idx++;
+  }
+  for (Node * n: b->nodes()) {
+    for (Block * block: n->blocks()) {
+      MarkUniqueBlocksWithCounters(block);
+    }
+  }
+}
+
+
+void MarkUniqueBlocksWithCounters(std::shared_ptr<Graph> graph) {
+  MarkUniqueBlocksWithCounters(graph->block());
 }
 
 } // namespace jit

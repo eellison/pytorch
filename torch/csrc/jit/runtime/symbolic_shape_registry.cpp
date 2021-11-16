@@ -4,6 +4,7 @@
 #include <torch/csrc/jit/runtime/operator.h>
 #include <torch/csrc/jit/runtime/symbolic_shape_registry.h>
 #include <torch/csrc/jit/serialization/import_source.h>
+#include <torch/csrc/jit/passes/dead_code_elimination.h>
 #include <unordered_map>
 
 namespace torch {
@@ -313,7 +314,6 @@ const std::string shape_compute_functions =
           padH = padding[0]
           padW = padH if len(padding) == 1 else padding[1]
 
-          assert divisor_override is None or divisor_override != 0
           nbatch = input[0] if len(input) == 4 else 1
           nInputPlane = input[-3]
           inputHeight = input[-2]
@@ -835,6 +835,7 @@ void registerSchema(
   std::shared_ptr<Graph> graph =
       toGraphFunction(shape_compute_function).graph();
   Inline(*graph);
+  EliminateDeadCode(graph);
 
   // ATEN operators can return multiple unboxed values, this in contrast to
   // functions defined in TorchScript or User-Registered Operators

@@ -277,6 +277,11 @@ class DeadCodeEliminator {
           sweep(block, true);
         }
       }
+      // special handling in DCE dont want it to get in the way of optimizations with AliasDb
+      if (node->kind() == Symbol::prim("RunCounter")) {
+        continue;
+      }
+
       // NB: Checking hasUses() is required. AD graphs are not perfectly
       // valid, as a node in grad_desc.f might be used in reverse_block.
       // Reverse_block is inlined in grad_desc.f before it's separated
