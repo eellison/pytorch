@@ -60,6 +60,10 @@ TORCH_API void insertTypeGuard(
 TORCH_API bool usedOnlyInSize(Value* v);
 TORCH_API Value* broadcastSizes(at::ArrayRef<Value*> sizes, AliasDb* db);
 
+TORCH_API std::unordered_set<int64_t>& executedCounters();
+TORCH_API void clearExecutedCounters();
+
+
 namespace tensorexpr {
 TORCH_API const OperatorSet& supported_eltwise_set();
 TORCH_API bool isSupported(Node* node);

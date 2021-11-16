@@ -29,9 +29,21 @@ C10_DEFINE_bool(
 namespace torch {
 namespace jit {
 
+
+
 static bool texpr_reductions_enabled = false;
 
 static bool texpr_generalize_enabled = false;
+
+std::unordered_set<int64_t> executed_counters;
+
+std::unordered_set<int64_t>& executedCounters() {
+  return executed_counters;
+}
+
+void clearExecutedCounters() {
+  executed_counters.clear();
+}
 
 
 bool isSupportedForBlock(Node* node) {
@@ -1278,7 +1290,7 @@ class TensorExprFuser {
         fusion_groups.push_back(n);
       }
     }
-    std::cout << "Before generating guard: " << *block->owningGraph();
+    // std::cout << "Before generating guard: " << *block->owningGraph();
     for (Node* fusion_group : fusion_groups) {
       auto success = GenerateGuard(fusion_group);
     }
@@ -1359,6 +1371,25 @@ RegisterOperators TensorExprOps({
         createTensorExprOp,
         AliasAnalysisKind::INTERNAL_SPECIAL_CASE),
 });
+
+Operation createRunCounter(const Node* node) {
+  // std::cout << "---- In createTensorExprOp: " << *node << std::endl;
+  int64_t id = node->i(attr::warn_id);
+  return [id](Stack& stack) mutable {
+    executedCounters().insert(id);
+    // just testing if its been run, does not particularly matter how many times
+    return 0;
+  };
+}
+
+
+RegisterOperators RunCounter({
+    torch::jit::Operator(
+        prim::RunCounter,
+        createRunCounter,
+        AliasAnalysisKind::INTERNAL_SPECIAL_CASE),
+});
+
 
 } // namespace jit
 } // namespace torch

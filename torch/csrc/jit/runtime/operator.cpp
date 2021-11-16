@@ -215,7 +215,7 @@ bool printerHasSpecialCaseFor(Symbol sym) {
       prim::CreateObject,  prim::GetAttr,       prim::SetAttr,
       prim::CallFunction,  prim::isinstance,    prim::unchecked_cast,
       prim::tolist,        prim::rpc_async,     prim::rpc_sync,
-      prim::rpc_remote};
+      prim::rpc_remote, Symbol::prim("RunCounter")};
 
   // WARNING: by adding a value to this set, you are asserting that your
   // primitive is only ever added during optimization and does not need
@@ -241,6 +241,7 @@ bool printerHasSpecialCaseFor(Symbol sym) {
       prim::CudaFusionGroup, // optimization pass adds it
       prim::CudaFusionGuard, // optimization pass adds it
       prim::TensorExprGroup, // optimization pass adds it
+      prim::RunCounter,
       prim::TensorExprDynamicGroup, // optimization pass adds it
       prim::StaticSubgraph, // optimization pass adds it
       prim::ConstantMKLDNNTensor, // optimization pass adds it
@@ -282,6 +283,7 @@ bool aliasAnalysisHasSpecialCaseFor(Symbol symbol) {
       prim::CudaFusionGroup,
       prim::DifferentiableGraph,
       prim::TensorExprGroup,
+      prim::RunCounter,
       prim::TensorExprDynamicGroup,
       prim::StaticSubgraph,
       prim::FunctionalGraph,
@@ -289,6 +291,7 @@ bool aliasAnalysisHasSpecialCaseFor(Symbol symbol) {
       prim::Uninitialized,
       prim::DictConstruct,
       prim::ListConstruct,
+      prim::RunCounter,
       prim::TupleConstruct,
       prim::AutogradZero,
       prim::FusedConcat,

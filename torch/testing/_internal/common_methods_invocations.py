@@ -3387,7 +3387,7 @@ def sample_inputs_avgpool2d(op_info, device, dtype, requires_grad, **kwargs):
              ((2, 3, 9, 9), (3, 3), (1, 1), (1, ), True, False, 2),
              ((1, 1, 4, 4), (2, 2), (), (0, ), False, True, -2),
              ((1, 2, 6, 6), (4, 4), (2, 2), (2, ), True, True, None))
-
+    cases = cases[0:2]
     def generator():
         for input_shape, kernel_size, stride, padding, ceil_mode, count_include_pad, divisor_override in cases:
             yield SampleInput(make_arg(input_shape),
@@ -8976,11 +8976,11 @@ op_db: List[OpInfo] = [
            dtypes=floating_types_and(torch.int64),
            dtypesIfCUDA=floating_types_and(torch.float16, torch.bfloat16),
            supports_out=False,
-           decorators=[
-               # RuntimeError: falseINTERNAL ASSERT FAILED at
-               # "../torch/csrc/jit/passes/utils/check_alias_annotation.cpp":185, please report a bug to PyTorch.
-               DecorateInfo(unittest.expectedFailure, 'TestJit', 'test_variant_consistency_jit', dtypes=(torch.float32,))
-           ],
+        #    decorators=[
+        #        # RuntimeError: falseINTERNAL ASSERT FAILED at
+        #        # "../torch/csrc/jit/passes/utils/check_alias_annotation.cpp":185, please report a bug to PyTorch.
+        #        DecorateInfo(unittest.expectedFailure, 'TestJit', 'test_variant_consistency_jit', dtypes=(torch.float32,))
+        #    ],
            sample_inputs_func=sample_inputs_local_response_norm,),
     OpInfo('nn.functional.pad',
            variant_test_name='constant',
@@ -11253,12 +11253,6 @@ op_db: List[OpInfo] = [
         dtypesIfCPU=floating_types_and(torch.float16),
         backward_dtypesIfCPU=floating_types(),
         dtypesIfCUDA=floating_types_and(torch.bfloat16, torch.float16),
-        skips=(
-            # RuntimeError: input->type()->kind() == TypeKind::OptionalType
-            # INTERNAL ASSERT FAILED at "../torch/csrc/jit/passes/utils/check_alias_annotation.cpp":252,
-            # please report a bug to PyTorch.
-            DecorateInfo(unittest.skip("Skipped!"), "TestJit", "test_variant_consistency_jit", dtypes=(torch.float32,),),
-        ),
     ),
     OpInfo(
         "nn.functional.grid_sample",

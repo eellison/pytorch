@@ -209,6 +209,9 @@ void initJITBindings(PyObject* module) {
       .def("_jit_pass_onnx_function_substitution", ONNXFunctionCallSubstitution)
       .def("_jit_pass_integer_value_refinement", RefineIntegerValues)
       .def("_jit_pass_canonicalize_for_shape_analysis", CanonicalizeForShapeAnalysis)
+      .def("_jit_executed_counters", executedCounters)
+      .def("_jit_clear_counters", clearExecutedCounters)
+      .def("_jit_pass_mark_unique_blocks_with_counters", MarkUniqueBlocksWithCounters)
       .def(
           "_jit_set_symbolic_shapes_test_mode",
           &setSymbolicShapeAnalysisTestMode)

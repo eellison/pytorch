@@ -574,7 +574,6 @@ void AliasDb::analyzeImpl(Node* node) {
   const bool hasSpecialCase = aliasAnalysisHasSpecialCaseFor(node->kind());
   if (op) {
     const auto analysis = op->aliasAnalysisKind();
-
     const bool registeredAsSpecialCase =
         analysis == AliasAnalysisKind::INTERNAL_SPECIAL_CASE;
     if (C10_UNLIKELY(registeredAsSpecialCase && !hasSpecialCase)) {
@@ -711,6 +710,7 @@ void AliasDb::analyzeImpl(Node* node) {
       // NB: update safeToChangeAliasingRelationship if changed
       return analyzeConservative(node);
     case prim::Print:
+    case prim::RunCounter:
     case prim::isinstance:
       // These ops do nothing
       return;
