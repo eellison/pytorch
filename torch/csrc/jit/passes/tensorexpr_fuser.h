@@ -61,6 +61,7 @@ TORCH_API bool usedOnlyInSize(Value* v);
 TORCH_API Value* broadcastSizes(at::ArrayRef<Value*> sizes, AliasDb* db);
 
 TORCH_API std::unordered_set<int64_t>& executedCounters();
+TORCH_API void addExecutedCounter(int64_t counter);
 TORCH_API void clearExecutedCounters();
 
 

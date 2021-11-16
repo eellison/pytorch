@@ -45,6 +45,9 @@ void clearExecutedCounters() {
   executed_counters.clear();
 }
 
+void addExecutedCounter(int64_t counter) {
+    executedCounters().insert(counter);
+}
 
 bool isSupportedForBlock(Node* node) {
   switch (node->kind()) {

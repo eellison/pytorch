@@ -75,19 +75,20 @@ class TestZ3Demos(JitTestCase):
         def foo(input, kernel: List[int], stride: List[int], padding: List[int], ceil_mode: bool):
             return torch.nn.functional.avg_pool2d(input, kernel, stride, padding, ceil_mode)
         torch._C._jit_pass_inline(foo.graph)
-        shape_compute_graph = torch._C._jit_get_shape_compute_graph_for_node(foo.graph.findNode("aten::max_pool2d"))
+        shape_compute_graph = torch._C._jit_get_shape_compute_graph_for_node(foo.graph.findNode("aten::avg_pool2d"))
         # print(shape_compute_graph)
-
+        shape_compute_graph = shape_compute_graph.copy()
         torch._C._augment_with_length(shape_compute_graph, 0, 4)
-        for i in range(1, 5):
+        torch._C._jit_pass_mark_unique_blocks_with_counters(shape_compute_graph)
+        for i in range(1, 4):
             torch._C._augment_with_length(shape_compute_graph, i, 2)
         changed = True
         while changed:
             changed = torch._C._jit_pass_shape_graph_cleanup_passes(shape_compute_graph)
 
-        out = generate_all_paths(shape_compute_graph, foo.graph.findNode("aten::max_pool2d"))
+        out = generate_all_paths(shape_compute_graph, foo.graph.findNode("aten::avg_pool2d"))
         for inp in out:
-            print(foo(*inp))
+            print(torch.nn.functional.avg_pool2d(*inp))
 
 
 if __name__ == '__main__':

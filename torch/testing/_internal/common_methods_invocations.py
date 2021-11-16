@@ -3387,7 +3387,6 @@ def sample_inputs_avgpool2d(op_info, device, dtype, requires_grad, **kwargs):
              ((2, 3, 9, 9), (3, 3), (1, 1), (1, ), True, False, 2),
              ((1, 1, 4, 4), (2, 2), (), (0, ), False, True, -2),
              ((1, 2, 6, 6), (4, 4), (2, 2), (2, ), True, True, None))
-    cases = cases[0:2]
     def generator():
         for input_shape, kernel_size, stride, padding, ceil_mode, count_include_pad, divisor_override in cases:
             yield SampleInput(make_arg(input_shape),
@@ -8829,18 +8828,9 @@ op_db: List[OpInfo] = [
     OpInfo('nn.functional.adaptive_avg_pool2d',
            dtypes=floating_types(),
            dtypesIfCUDA=floating_types_and(torch.half, torch.bfloat16),
-           skips=(
-               # RuntimeError:
-               # adaptive_avg_pool2d(Tensor input, int[2] output_size) -> (Tensor):
-               # Expected a value of type 'List[int]' for argument 'output_size' but
-               # instead found type 'Tuple[NoneType, int]'. :
-               #   File "<string>", line 3
-               # def the_method(i0):
-               #     return torch.nn.functional.adaptive_avg_pool2d(i0, (None, 7))
-               #            ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ <--- HERE
-               DecorateInfo(unittest.skip("Skipped!"), 'TestJit', 'test_variant_consistency_jit'),
-           ),
            supports_out=False,
+           supports_scripting=False,
+           aten_name = "adaptive_avg_pool2d",
            gradcheck_nondet_tol=GRADCHECK_NONDET_TOL,
            sample_inputs_func=sample_inputs_adaptive_avg_pool2d),
     OpInfo('nn.functional.adaptive_avg_pool1d',

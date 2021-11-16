@@ -198,18 +198,6 @@ def gatherThrowingBlocks(block, throwing_blocks):
         if n.kind() == "prim::Loop":
             assert False, str(n)
 
-def gatherExecutedBlocks(block, executed_blocks, executed_counters):
-    for n in block.nodes():
-        assert n.kind() != "prim::Loop"
-        if n.kind() == "prim::If":
-            blocks = list(n.blocks())
-            gatherExecutedBlocks(blocks[0], executed_blocks, executed_counters)
-            gatherExecutedBlocks(blocks[1], executed_blocks, executed_counters)
-        if n.kind() == "prim::RunCounter":
-            id = n.i("warn_id")
-            if id in executed_counters:
-                executed_blocks.add(block)
-
 def generate_input_values(graph, names_to_z3, model, input_len_mappings):
     input_values = []
     for i, inp in enumerate(list(graph.inputs())):
@@ -236,10 +224,8 @@ def generate_input_values(graph, names_to_z3, model, input_len_mappings):
                 input_values.append(0)
             elif isinstance(inp.type(), torch._C.OptionalType):
                 input_values.append(None)
-            elif isinstance(inp.type(), torch._C.ListType):
-                input_values.append([])
             else:
-                assert False, str(inp)
+                assert False
         else:
             if inp.type() == torch._C.BoolType.get():
                 input_values.append(is_true(val))
@@ -294,16 +280,14 @@ def generate_all_paths(graph, node_or_graph, force_non_empty_tensors=True):
     torch._C._jit_pass_dce(graph)
     throwing_blocks = set()
     gatherThrowingBlocks(graph, throwing_blocks)
-    executed_blocks = set()
-    executed_counters = torch._C._jit_executed_counters()
-    gatherExecutedBlocks(graph, executed_blocks, executed_counters)
     non_throwing_blocks = set()
     for if_node in graph.findAllNodes("prim::If"):
       for block in if_node.blocks():
-        if block not in throwing_blocks and block not in executed_blocks:
+        if block not in throwing_blocks:
           non_throwing_blocks.add(block)
 
     outputs = []
+    # import pdb; pdb.set_trace()
 
     while len(non_throwing_blocks) != 0:
       constrained_block = non_throwing_blocks.pop()
@@ -392,7 +376,7 @@ def generate_all_paths(graph, node_or_graph, force_non_empty_tensors=True):
                   elif val.type() == torch._C.BoolType.get():
                       z3_val = Bool(val.debugName())
                   else:
-                      raise Exception("unsupported model")
+                      assert False
                   names_to_z3[val.debugName()] = z3_val
                   return z3_val
 
@@ -408,17 +392,8 @@ def generate_all_paths(graph, node_or_graph, force_non_empty_tensors=True):
                   z3_val = construct_z3_val(node.output())
                   li_len = value_to_len[inputs[0].debugName()]
                   index = inputs[1].toIValue()
-                  ind_val = inputs_z3[1]
-                  li = inputs_z3[0]
-                  if index is None:
-                    for iter in range(li_len):
-                        s.add(And(z3_val == li[iter], Or(ind_val == iter, And(ind_val < 0, ind_val + li_len == iter))))
-                  else:
-                        index = index if index >= 0 else index + li_len
-                        if index >= len(inputs_z3[0]):
-                            s.add(0 == 1)
-                        else:
-                            s.add(z3_val == inputs_z3[0][index])
+                  index = index if index >= 0 else index + li_len
+                  s.add(z3_val == inputs_z3[0][index])
                   names_to_z3[node.output().debugName()] = z3_val
               elif node.kind() == "aten::__not__":
                   z3_val = construct_z3_val(node.output())
@@ -461,20 +436,13 @@ def generate_all_paths(graph, node_or_graph, force_non_empty_tensors=True):
         else:
           return is_false(z3_val) and path_taken(owning_node.owningBlock())
 
-      added_inputs = False
       non_throwing_blocks_list = list(non_throwing_blocks)
       for non_throwing_block in non_throwing_blocks_list:
         if path_taken(non_throwing_block):
-          for counter_node in non_throwing_block.nodes():
-            if counter_node.kind() != "prim::RunCounter":
-              continue
-            added_inputs = True
-            print("adding ", counter_node.i("warn_id"))
-            torch._C._jit_add_counter(counter_node.i("warn_id"))
           non_throwing_blocks.remove(non_throwing_block)
-      if added_inputs:
-        input_values_gen = generate_input_values(graph, names_to_z3, modeled, input_len_mappings)
-        outputs.append(input_values_gen)
+
+      input_values_gen = generate_input_values(graph, names_to_z3, modeled, input_len_mappings)
+      outputs.append(input_values_gen)
 
     return translate_z3_vals_to_inputs(outputs, node_or_graph)
 
@@ -487,10 +455,7 @@ def translate_z3_vals_to_inputs(z3_outputs: List[List[Any]], node_or_graph) -> L
         inputs = []
         for i, elem in enumerate(out):
             if node_or_graph_inputs[i].type().isSubtypeOf(torch._C.TensorType.get()):
-                if len(elem):
-                    inputs.append(torch.rand(*elem))
-                else:
-                    inputs.append(torch.rand(elem))
+                inputs.append(torch.rand(*elem))
             else:
                 inputs.append(elem)
         translated_inputs.append(inputs)

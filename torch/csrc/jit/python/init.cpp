@@ -210,6 +210,7 @@ void initJITBindings(PyObject* module) {
       .def("_jit_pass_integer_value_refinement", RefineIntegerValues)
       .def("_jit_pass_canonicalize_for_shape_analysis", CanonicalizeForShapeAnalysis)
       .def("_jit_executed_counters", executedCounters)
+      .def("_jit_add_counter", addExecutedCounter)
       .def("_jit_clear_counters", clearExecutedCounters)
       .def("_jit_pass_mark_unique_blocks_with_counters", MarkUniqueBlocksWithCounters)
       .def(
