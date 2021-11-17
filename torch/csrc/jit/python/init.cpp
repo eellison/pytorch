@@ -588,8 +588,8 @@ void initJITBindings(PyObject* module) {
             auto if_n = g->insertNode(g->create(prim::If, {eq}, 0));
             if_n->addBlock();
             if_n->addBlock();
-            WithInsertPoint guard2(if_n->blocks().at(1));
-            g->insertNode(g->create(prim::RaiseException, {g->insertConstant("Input Shape Augment")}, 0));
+            auto exp = g->create(prim::RaiseException, {g->insertConstant("Input Shape Augment")}, 0);
+            exp->insertBefore(*if_n->blocks().at(1)->nodes().begin());
             return ConstantPropagationImmutableTypes(g);
           })
       .def(

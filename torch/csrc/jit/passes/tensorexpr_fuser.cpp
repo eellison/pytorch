@@ -635,7 +635,7 @@ class TensorExprFuser {
     GRAPH_DUMP("After inlining small fusion groups: ", graph_);
     const char* option = std::getenv("PYTORCH_TENSOREXPR_DONT_FUSE");
     auto enabled = std::getenv("PYTORCH_TENSOREXPR_DYNAMIC");
-    if (false) {
+    if (true) {
       prepareFusionGroupAndGuardOutputs(graph_->block());
       GRAPH_DUMP("After guarding fusion groups: ", graph_);
       removeTensorTypeSpecializations(graph_->block());

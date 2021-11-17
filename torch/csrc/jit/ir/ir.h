@@ -1343,6 +1343,10 @@ struct Graph {
   // for implementation simplicity we only support inserting before a node for
   // now
   void setInsertPoint(Node* n) {
+    if (!(n->owningGraph() == this && n->inBlockList())) {
+      std::cout << "hello\n";
+    }
+
     AT_ASSERT(n->owningGraph() == this && n->inBlockList());
     insert_before_ = n;
   }

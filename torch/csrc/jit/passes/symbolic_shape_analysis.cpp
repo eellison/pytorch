@@ -559,7 +559,7 @@ struct SymbolicShapeNodeAnalyzer {
     }
     std::unordered_map<Value*, int64_t> symbolic_shape_values;
     substituteInputTensorProperties(node_symbolic_input_indices_, shape_compute_graph_, &symbolic_shape_values);
-    GRAPH_UPDATE("Done with partial evaluation", shape_compute_graph_);
+    GRAPH_UPDATE("Done with partial evaluation", *shape_compute_graph_);
     extractOutputShape(symbolic_shape_values);
     GRAPH_UPDATE(getHeader(node_), "done extracting shape");
     return shape_compute_graph_;

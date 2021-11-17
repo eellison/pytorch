@@ -391,18 +391,21 @@ const std::string shape_compute_functions =
           check_cat_no_zero_dim(tensors)
           dim = legacy_cat_wrap_dim(dim, tensors)
           assert len(tensors) > 0
-          not_skipped_tensor: Optional[List[int]] = None
+
+          has_not_skipped_tensor = False
+          not_skipped_tensor: List[int] = []
           for tensor in tensors:
-            if not should_skip(tensor):
+            if len(tensor) != 1 or numel(tensor) != 0:
+              has_not_skipped_tensor = True
               not_skipped_tensor = tensor
-          if not_skipped_tensor is None:
+          if not has_not_skipped_tensor:
             return [0]
 
           cat_dim_size = 0
 
           for i in range(len(tensors)):
             tensor = tensors[i]
-            if not should_skip(tensor):
+            if len(tensor) != 1 or numel(tensor) != 0:
               check_cat_shape_except_dim(not_skipped_tensor, tensor, dim, i)
               cat_dim_size = cat_dim_size + tensor[dim]
 
@@ -481,16 +484,15 @@ const std::string shape_compute_functions =
           ndims = len(self)
           dim0 = maybe_wrap_dim(dim0, ndims)
           dim1 = maybe_wrap_dim(dim1, ndims)
-          if (dim0 == dim1):
-            return _copy(self)
           out: List[int] = []
           for i in range(ndims):
             if i == dim0:
-              out.append(self[dim1])
+              val = self[dim1]
             elif i == dim1:
-              out.append(self[dim0])
+              val = self[dim0]
             else:
-              out.append(self[i])
+              val = self[i]
+            out.append(val)
           return out
     )"
     R"(
