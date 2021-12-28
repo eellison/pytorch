@@ -30,8 +30,24 @@ void inlineCalls(Block* block) {
               fun_type->function()->name(),
               "' to ",
               *cur);
-          GRAPH_UPDATE("Function body: ", graphFunction->optimized_graph());
-          inlineCallTo(cur, graphFunction);
+
+          std::shared_ptr<Graph> g = nullptr;
+          // inline optimized graph for debugging/testing purposes.
+          // we only insert fallback functions in JIT optimized graphs for execution,
+          // not on the Graph that is used for serialization
+          bool fallback_function = cur->input(0)->node()->hasAttribute(Symbol::attr("fallback"));
+          if (fallback_function && graphFunction->get_executor().isOptimized()) {
+            auto exec_plans = graphFunction->get_executor().getDebugState().execution_plans;
+            if (exec_plans.size() != 0) {
+              g = exec_plans.begin()->second.graph;
+            }
+          }
+          if (g == nullptr) {
+            g = graphFunction->optimized_graph();
+          }
+
+          GRAPH_UPDATE("Function body: ", g);
+          inlineCallTo(cur, graphFunction, g.get());
         }
       } break;
       case prim::CallMethod: {
