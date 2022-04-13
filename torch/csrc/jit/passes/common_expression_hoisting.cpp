@@ -9,9 +9,12 @@
 #include <unordered_set>
 #include <vector>
 
+
 namespace torch {
 namespace jit {
 namespace {
+
+int opt_limit = 0;
 
 struct CommonExpressionHoister {
   CommonExpressionHoister(std::shared_ptr<Graph> graph)
@@ -85,6 +88,11 @@ struct CommonExpressionHoister {
         true_block_nodes.erase(uses_node);
       }
 
+      if (opt_limit >= atoi(std::getenv("OPT_LIMIT"))) {
+        continue;
+      }
+      opt_limit += 1;
+
       // Now hoist the statement out of the block
       changed_ = true;
       false_b_node->moveBefore(if_node);
@@ -110,6 +118,11 @@ struct CommonExpressionHoister {
         i++;
         continue;
       }
+
+      if (opt_limit >= atoi(std::getenv("OPT_LIMIT"))) {
+        continue;
+      }
+      opt_limit += 1;
 
       // We have a matching output, and can remove it from the block itself
       if_node->outputs().at(i)->replaceAllUsesWith(true_block_output);
@@ -156,7 +169,6 @@ struct CommonExpressionHoister {
 bool HoistCommonExpression(const std::shared_ptr<Graph>& graph) {
   // This moves common subexpressions from the two sides of an
   // if block out of the if block.
-
   GRAPH_DUMP("Before CEH", graph);
   CommonExpressionHoister ceh(graph);
   bool changed = ceh.run();
