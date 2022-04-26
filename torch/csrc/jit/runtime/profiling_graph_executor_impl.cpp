@@ -416,7 +416,7 @@ void ProfilingGraphExecutorImpl::runNoGradOptimizations(
     // and must be removed for fusion.
     LowerSimpleTuples(graph);
     GRAPH_DEBUG("After LowerSimpleTuples\n", *graph);
-
+    RemoveProfileNodesAndSpecializeTypes(graph);
     if (tensorExprFuserEnabled()) {
       // Remove prim::profile nodes and embed the profile info directly in the
       // IR in value types. We're doing such transformation as optimizations
@@ -426,7 +426,6 @@ void ProfilingGraphExecutorImpl::runNoGradOptimizations(
       // inserting proper type checks. Once we're done with these optimizations
       // we will wipe the tensor type information from the IR, so that it's not
       // accidentally used by any other pass.
-      RemoveProfileNodesAndSpecializeTypes(graph);
       GRAPH_DEBUG(
           "After RemoveProfileNodesAndSpecializeTypes, before BatchMM\n",
           *graph);

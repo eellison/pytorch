@@ -1380,11 +1380,11 @@ Node* Node::replaceWithNewSymbol(Symbol new_symbol) {
   }
   replace_node->copyMetadata(this);
   replace_node->copyAttributes(*this);
-  TORCH_INTERNAL_ASSERT(
-      (replace_node->maybeOperator() != nullptr) == had_operator,
-      "invalid symbol replacement:",
-      new_symbol,
-      kind());
+  // TORCH_INTERNAL_ASSERT(
+  //     (replace_node->maybeOperator() != nullptr) == had_operator,
+  //     "invalid symbol replacement:",
+  //     new_symbol,
+  //     kind());
   return replace_node;
 }
 

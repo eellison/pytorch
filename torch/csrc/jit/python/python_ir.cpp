@@ -7,9 +7,11 @@
 #include <torch/csrc/api/include/torch/python.h>
 #include <torch/csrc/jit/ir/alias_analysis.h>
 #include <torch/csrc/jit/ir/ir.h>
+#include <torch/csrc/jit/ir/subgraph_matcher.h>
 #include <torch/csrc/jit/passes/canonicalize.h>
 #include <torch/csrc/jit/passes/onnx/helper.h>
 #include <torch/csrc/jit/passes/shape_analysis.h>
+#include <torch/csrc/jit/passes/subgraph_rewrite.h>
 #include <torch/csrc/jit/passes/symbolic_shape_analysis.h>
 #include <torch/csrc/jit/python/pybind.h>
 #include <torch/csrc/jit/python/python_tracer.h>
@@ -191,6 +193,41 @@ Node* Graph::createPythonOp(
 
 void initPythonIRBindings(PyObject* module_) {
   auto m = py::handle(module_).cast<py::module>();
+
+  py::class_<torch::jit::SubgraphRewriter, std::shared_ptr<SubgraphRewriter>>(
+      m, "SubgraphRewriter")
+      .def(py::init<>())
+      .def(
+          "register_rewrite_pattern",
+          [](const std::shared_ptr<SubgraphRewriter>& self,
+             const std::string& pattern,
+             const std::string& replacement,
+             const std::vector<std::pair<std::string, std::string>>&
+                 value_name_pair) {
+            self->RegisterRewritePattern(pattern, replacement, value_name_pair);
+          },
+          py::arg("pattern"),
+          py::arg("replacement"),
+          py::arg("value_name_pairs") =
+              std::vector<std::pair<std::string, std::string>>())
+      .def(
+          "run_on_graph",
+          [](const std::shared_ptr<SubgraphRewriter>& self,
+             std::shared_ptr<Graph>& graph,
+             const std::vector<MatchFilter>& filters) {
+            self->runOnGraph(graph, filters);
+          });
+
+  py::class_<torch::jit::Match, std::shared_ptr<Match>>(m, "Match")
+      .def_property_readonly(
+          "nodes_map",
+          [](const std::shared_ptr<Match>& self) { return self->nodes_map; })
+      .def_property_readonly(
+          "values_map",
+          [](const std::shared_ptr<Match>& self) { return self->values_map; })
+      .def_property_readonly("anchor", [](const std::shared_ptr<Match>& self) {
+        return self->anchor;
+      });
 
   py::class_<AliasDb, std::shared_ptr<AliasDb>>(m, "AliasDb")
       .def("dump", &AliasDb::dump)
@@ -639,6 +676,7 @@ void initPythonIRBindings(PyObject* module_) {
           "getModuleHierarchy",
           [](Node& n) { return torch::jit::utils::getNodesModuleHierarchy(n); })
       .NS(addInput)
+      .NS(replaceWithNewSymbol)
       .NS(copyMetadata)
       .NS(replaceInput)
       .NS(replaceInputWith)

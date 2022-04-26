@@ -101,6 +101,7 @@
 #include <pybind11/iostream.h>
 #include <pybind11/operators.h>
 
+#include <jit/passes/pass_manager.h>
 #include <torch/csrc/jit/runtime/profiling_graph_executor_impl.h>
 #include <memory>
 #include <sstream>
@@ -118,6 +119,8 @@ using caffe2::serialize::PyTorchStreamReader;
 using caffe2::serialize::PyTorchStreamWriter;
 
 namespace {
+
+static std::unordered_map<std::string, GraphPass> post_pass_map;
 
 using autograd::variable_list;
 
@@ -369,6 +372,18 @@ void initJITBindings(PyObject* module) {
           py::arg("g"),
           py::arg("value_name_pairs") =
               std::vector<std::pair<std::string, std::string>>())
+      .def(
+          "_jit_register_custom_post_past",
+          [](std::string post_past_name, py::object callable) {
+            std::function<void(std::shared_ptr<Graph>)> cpp_callable =
+                [callable](std::shared_ptr<Graph> g) {
+                  py::gil_scoped_acquire acquire;
+                  callable(g);
+                };
+            // TODO - maybe bad practice, putting here for now
+            post_pass_map[post_past_name] = cpp_callable;
+            registerPostPass(post_pass_map[post_past_name]);
+          })
       .def("_jit_pass_constant_pooling", ConstantPooling)
       // RemoveInplaceOps is used by CoreML so it must be removed with care.
       .def("_jit_pass_propagate_dtype", DtypePropagation)
@@ -376,6 +391,12 @@ void initJITBindings(PyObject* module) {
       .def(
           "_jit_pass_remove_inplace_ops",
           [](const std::shared_ptr<Graph>& g) { return RemoveInplaceOps(g); })
+      .def(
+          "_jit_insert_type_check_node",
+          [](Node* n) {
+            insertTypeGuard(
+                n, [](const TensorTypePtr& t) { return t; }, prim::TypeCheck);
+          })
       .def(
           "_jit_pass_create_functional_graphs",
           [](std::shared_ptr<Graph>& g) { return CreateFunctionalGraphs(g); })
