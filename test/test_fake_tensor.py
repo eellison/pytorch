@@ -334,8 +334,8 @@ class FakeTensorTest(TestCase):
             a = torch.rand([16, 1])
             self.checkType(a.new(10, 10), "cpu", [10, 10])
             self.checkType(a.new([1, 2, 3, 4]), "cpu", [4])
-            b = torch.rand([4, 4])
-            self.checkType(b.new(device='cuda'), "cuda", [4, 4])
+            b = torch.rand([4, 4], device='cuda')
+            self.checkType(b.new(device='cuda'), "cuda", [0])
 
 
 def contains_type(type: torch._C.Type, maybe_contained_type: torch._C.Type):

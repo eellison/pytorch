@@ -1691,8 +1691,6 @@ class TestFakeTensorNonErroring(TestCase):
         for sample_iter, sample in enumerate(samples):
             try:
                 mode = FakeTensorMode(inner=None)
-                # if sample_iter != 4:
-                #     continue
 
                 def map_to_fake(e):
                     if isinstance(e, torch.Tensor):
@@ -1708,7 +1706,7 @@ class TestFakeTensorNonErroring(TestCase):
                     with torch.cuda.amp.autocast(), torch.cpu.amp.autocast():
                         res = op(sample.input, *sample.args, **sample.kwargs)
                 except Exception:
-                    continue    
+                    continue
 
                 with torch.cuda.amp.autocast(), torch.cpu.amp.autocast():
                     with enable_torch_dispatch_mode(mode):

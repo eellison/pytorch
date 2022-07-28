@@ -333,15 +333,14 @@ class FakeTensor(torch.Tensor):
         if device.type == "cuda" and device.index is None:
             device = torch.device(f"cuda:{torch.cuda.current_device()}")
         assert device.type != "meta"
-    
+
         if device.type == "cuda":
             torch._C._set_key(False, "Meta", self)
             torch._C._set_key(True, "CUDA", self)
-        elif device.type == "cpu":
+        else:
+            assert device.type == "cpu"
             torch._C._set_key(False, "Meta", self)
             torch._C._set_key(True, "CPU", self)
-        else:
-            assert False, device.type
 
         self.fake_device = device
         self.fake_mode = fake_mode
@@ -370,23 +369,18 @@ class FakeTensor(torch.Tensor):
         # so in order to use the same pattern as normal invocation of
         # returning meta device within the kernel we need to intercept
         # the call here
-
+        # because it doesn't go through the dispatcher, we run into errors
+        # when attempting to compute an output in meta, so
+        # we compute the real tensor then convert to meta
         out_device = self.fake_device
-        if "device" in kwargs:
-            kwarg_device = kwargs.pop("device")
-            out_device = kwarg_device if kwarg_device else out_device
-            kwargs["device"] = "meta"
+        with no_dispatch():
+            real_out = super().new(*args, **kwargs)
 
-        with in_kernel_invocation_manager(self.fake_mode):
-            with no_dispatch():
-                meta_out = super().new(*args, **kwargs)
-
-        assert not isinstance(meta_out, FakeTensor)
-        if meta_out.device.type != "meta":
-            with no_dispatch():
-                meta_out = MetaConverter()(meta_out)
+        assert not isinstance(real_out, FakeTensor), real_out
+        assert real_out.device.type != "meta", real_out.device
 
         with no_dispatch():
+            meta_out = MetaConverter()(real_out)
             return FakeTensor(self.fake_mode, meta_out, out_device)
 
     @classmethod
@@ -483,6 +477,7 @@ class FakeTensor(torch.Tensor):
 # memory should not significantly incraese.
 
 counter = 0
+
 
 class FakeTensorMode(TorchDispatchMode):
     def __init__(self, allow_fallback_kernels=True):

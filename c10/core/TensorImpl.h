@@ -1133,7 +1133,7 @@ struct C10_API TensorImpl : public c10::intrusive_ptr_target {
     if (value) {
       key_set_ = key_set_.add(key_set);
     } else {
-      for (const auto key: key_set) {
+      for (const auto key : key_set) {
         key_set_ = key_set_.remove(key);
       }
     }

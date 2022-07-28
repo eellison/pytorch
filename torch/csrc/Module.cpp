@@ -15,13 +15,13 @@
 #include <ATen/core/Vitals.h>
 #include <ATen/dlpack.h>
 #include <ATen/native/ConvUtils.h>
+#include <c10/core/DispatchKeySet.h>
 #include <c10/util/Logging.h>
 #include <c10/util/irange.h>
 #include <libshm.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <torch/csrc/THConcat.h>
-#include <c10/core/DispatchKeySet.h>
 #include <cstdlib>
 #include <unordered_map>
 
@@ -1261,9 +1261,9 @@ Call this whenever a new thread is created in order to propagate values from
   });
   py_module.def("_set_key", [](bool value, std::string key, at::Tensor& x) {
     std::unordered_map<std::string, at::DispatchKey> str_to_key = {
-      {"Meta", at::DispatchKey::Meta},
-      {"CUDA", at::DispatchKey::CUDA},
-      {"CPU", at::DispatchKey::CPU},
+        {"Meta", at::DispatchKey::Meta},
+        {"CUDA", at::DispatchKey::CUDA},
+        {"CPU", at::DispatchKey::CPU},
     };
     TORCH_INTERNAL_ASSERT(str_to_key.count(key), key);
     auto device_key = str_to_key[key];
@@ -1278,7 +1278,7 @@ Call this whenever a new thread is created in order to propagate values from
       // x._
     }
   });
-  py_module.def("_move_key_set", [](at::Tensor& x, at::Tensor& y) { 
+  py_module.def("_move_key_set", [](at::Tensor& x, at::Tensor& y) {
     x._set_keyset(y.key_set());
   });
   py_module.def("_set_meta_enabled", [](bool enable) {
@@ -1300,14 +1300,15 @@ Call this whenever a new thread is created in order to propagate values from
     std::cout << toString(local_keyset.excluded_) << "\n";
   });
 
-// }
-// bool is_cpu_enabled() {
-//   return !c10::impl::tls_is_dispatch_key_excluded(DispatchKey::AutocastCPU);
-// }
-// void set_cpu_enabled(bool new_enabled) {
-//   c10::impl::tls_set_dispatch_key_excluded(DispatchKey::AutocastCPU, !new_enabled);
-// }
-
+  // }
+  // bool is_cpu_enabled() {
+  //   return
+  //   !c10::impl::tls_is_dispatch_key_excluded(DispatchKey::AutocastCPU);
+  // }
+  // void set_cpu_enabled(bool new_enabled) {
+  //   c10::impl::tls_set_dispatch_key_excluded(DispatchKey::AutocastCPU,
+  //   !new_enabled);
+  // }
 
   const auto& defaultGenerator = at::detail::getDefaultCPUGenerator();
   THPDefaultCPUGenerator =
