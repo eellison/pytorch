@@ -7,6 +7,7 @@ import unittest
 import itertools
 import torch
 import contextlib
+from collections import defaultdict
 from importlib import import_module
 from torch.utils._pytree import tree_map
 
@@ -1658,6 +1659,13 @@ fake_skips = (
     "nn.functional.one_hot",
 )
 
+fake_autocast_device_skips = defaultdict(dict)
+
+fake_autocast_device_skips["cpu"] = set(
+    ("linalg.pinv",)
+)
+
+
 dynamic_output_op_tests = (
     "argwhere",
     "bincount",
@@ -1679,8 +1687,7 @@ sometimes_dynamic_output_op_test = (
 
 @skipIfSlowGradcheckEnv
 class TestFakeTensorNonErroring(TestCase):
-    @ops(op_db, dtypes=OpDTypes.any_one)
-    def test_fake(self, device, dtype, op):
+    def _test_fake_helper(self, device, dtype, op, context):
         name = op.name
         if op.variant_test_name:
             name += "." + op.variant_test_name
@@ -1703,12 +1710,12 @@ class TestFakeTensorNonErroring(TestCase):
                 kwargs = tree_map(map_to_fake, sample.kwargs)
 
                 try:
-                    with torch.cuda.amp.autocast(), torch.cpu.amp.autocast():
+                    with context():
                         res = op(sample.input, *sample.args, **sample.kwargs)
-                except Exception:
+                except Exception as e:
                     continue
 
-                with torch.cuda.amp.autocast(), torch.cpu.amp.autocast():
+                with context():
                     with enable_torch_dispatch_mode(mode):
                         res_fake = op(input, *args, **kwargs)
 
@@ -1730,6 +1737,17 @@ class TestFakeTensorNonErroring(TestCase):
                 pass
             except torch._subclasses.fake_tensor.DynamicOutputShapeException:
                 self.assertTrue(name in dynamic_output_op_tests or name in sometimes_dynamic_output_op_test)
+
+    @ops(op_db, dtypes=OpDTypes.any_one)
+    def test_fake(self, device, dtype, op):
+        self._test_fake_helper(device, dtype, op, contextlib.nullcontext)
+
+    @ops(op_db, dtypes=OpDTypes.any_one)
+    def test_fake_autocast(self, device, dtype, op):
+        if op.name in fake_autocast_device_skips[device]:
+            self.skipTest("Skip failing test")
+        context = torch.cuda.amp.autocast if device == "cuda" else torch.cpu.amp.autocast
+        self._test_fake_helper(device, dtype, op, context)
 
 
 instantiate_device_type_tests(TestCommon, globals())
