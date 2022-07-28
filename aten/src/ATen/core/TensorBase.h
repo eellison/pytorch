@@ -345,6 +345,19 @@ class TORCH_API TensorBase {
     impl_->_set_neg(negative);
   }
 
+  inline void _set_key(DispatchKey key, bool value) {
+    impl_->_set_key(key, value);
+  }
+
+  inline void _set_key(DispatchKeySet key, bool value) {
+    impl_->_set_key(key, value);
+  }
+
+  inline void _set_keyset(DispatchKeySet key) {
+    impl_->_set_keyset(key);
+  }
+
+
   /// Returns a `Tensor`'s layout.
   Layout layout() const {
     return impl_->layout();

@@ -1121,6 +1121,28 @@ struct C10_API TensorImpl : public c10::intrusive_ptr_target {
     }
   }
 
+  void _set_key(DispatchKey key, bool value) {
+    if (value) {
+      key_set_ = key_set_.add(key);
+    } else {
+      key_set_ = key_set_.remove(key);
+    }
+  }
+
+  void _set_key(DispatchKeySet key_set, bool value) {
+    if (value) {
+      key_set_ = key_set_.add(key_set);
+    } else {
+      for (const auto key: key_set) {
+        key_set_ = key_set_.remove(key);
+      }
+    }
+  }
+
+  void _set_keyset(DispatchKeySet key_set) {
+    key_set_ = key_set;
+  }
+
   /**
    * Whether or not the tensor is a zerotensor
    */

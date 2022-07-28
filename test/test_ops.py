@@ -1688,9 +1688,11 @@ class TestFakeTensorNonErroring(TestCase):
             self.skipTest("Skip failing test")
 
         samples = op.sample_inputs(device, dtype, requires_grad=False)
-        for sample in samples:
+        for sample_iter, sample in enumerate(samples):
             try:
                 mode = FakeTensorMode(inner=None)
+                # if sample_iter != 4:
+                #     continue
 
                 def map_to_fake(e):
                     if isinstance(e, torch.Tensor):
@@ -1702,10 +1704,15 @@ class TestFakeTensorNonErroring(TestCase):
                 args = tree_map(map_to_fake, sample.args)
                 kwargs = tree_map(map_to_fake, sample.kwargs)
 
-                with enable_torch_dispatch_mode(mode):
-                    res_fake = op(input, *args, **kwargs)
+                try:
+                    with torch.cuda.amp.autocast(), torch.cpu.amp.autocast():
+                        res = op(sample.input, *sample.args, **sample.kwargs)
+                except Exception:
+                    continue    
 
-                res = op(sample.input, *sample.args, **sample.kwargs)
+                with torch.cuda.amp.autocast(), torch.cpu.amp.autocast():
+                    with enable_torch_dispatch_mode(mode):
+                        res_fake = op(input, *args, **kwargs)
 
                 for fake_out, real_out in zip(
                     tree_flatten(res_fake)[0], tree_flatten(res)[0]
@@ -1718,6 +1725,7 @@ class TestFakeTensorNonErroring(TestCase):
                     # if you see a shape exception here, you may need to add
                     # a `dynamic_output_shape` tag to an operator
                     prims.utils.compare_tensor_meta(fake_out, real_out)
+
                 self.assertTrue(name not in dynamic_output_op_tests)
 
             except torch._subclasses.fake_tensor.UnsupportedFakeTensorException:
