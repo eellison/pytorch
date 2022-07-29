@@ -1121,6 +1121,8 @@ struct C10_API TensorImpl : public c10::intrusive_ptr_target {
     }
   }
 
+  void _change_backend_component_keys(c10::Device device);
+
   void _set_key(DispatchKey key, bool value) {
     if (value) {
       key_set_ = key_set_.add(key);

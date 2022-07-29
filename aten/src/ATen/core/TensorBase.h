@@ -357,6 +357,9 @@ class TORCH_API TensorBase {
     impl_->_set_keyset(key);
   }
 
+  inline void _change_backend_component_keys(c10::Device device) {
+    impl_->_change_backend_component_keys(device);
+  }
 
   /// Returns a `Tensor`'s layout.
   Layout layout() const {

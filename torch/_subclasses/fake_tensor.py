@@ -333,14 +333,9 @@ class FakeTensor(torch.Tensor):
             device = torch.device(f"cuda:{torch.cuda.current_device()}")
         assert device.type != "meta"
 
-        if device.type == "cuda":
-            torch._C._set_key(False, "Meta", self)
-            torch._C._set_key(True, "CUDA", self)
-        else:
-            assert device.type == "cpu"
-            torch._C._set_key(False, "Meta", self)
-            torch._C._set_key(True, "CPU", self)
-
+        # Note: [Fake Tensor Dispatch Keys]
+        # See note: 
+        torch._C._change_backend_component_keys(self, device)
         self.fake_device = device
         self.fake_mode = fake_mode
         self.has_sym_ints = symbolic_shapes.has_symbolic_sizes_strides(elem)
