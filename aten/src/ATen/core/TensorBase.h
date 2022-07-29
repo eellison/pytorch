@@ -345,18 +345,11 @@ class TORCH_API TensorBase {
     impl_->_set_neg(negative);
   }
 
-  inline void _set_key(DispatchKey key, bool value) {
-    impl_->_set_key(key, value);
-  }
-
-  inline void _set_key(DispatchKeySet key, bool value) {
-    impl_->_set_key(key, value);
-  }
-
-  inline void _set_keyset(DispatchKeySet key) {
-    impl_->_set_keyset(key);
-  }
-
+  /**
+   * XXX: do not use, private api!
+   * Update the backend component related keys to the backend component
+   * corresponding to this device.
+   */
   inline void _change_backend_component_keys(c10::Device device) {
     impl_->_change_backend_component_keys(device);
   }
