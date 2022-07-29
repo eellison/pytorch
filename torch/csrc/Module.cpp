@@ -15,6 +15,7 @@
 #include <ATen/core/Vitals.h>
 #include <ATen/dlpack.h>
 #include <ATen/native/ConvUtils.h>
+#include <c10/core/DispatchKeySet.h>
 #include <c10/util/Logging.h>
 #include <c10/util/irange.h>
 #include <libshm.h>
@@ -1258,6 +1259,56 @@ Call this whenever a new thread is created in order to propagate values from
   py_module.def("_dispatch_key_set", [](const at::Tensor& x) {
     return toString(x.key_set());
   });
+  py_module.def("_set_key", [](bool value, std::string key, at::Tensor& x) {
+    std::unordered_map<std::string, at::DispatchKey> str_to_key = {
+        {"Meta", at::DispatchKey::Meta},
+        {"CUDA", at::DispatchKey::CUDA},
+        {"CPU", at::DispatchKey::CPU},
+    };
+    TORCH_INTERNAL_ASSERT(str_to_key.count(key), key);
+    auto device_key = str_to_key[key];
+    c10::DispatchKeySet key_set({device_key});
+    auto k = key_set.highestBackendKey();
+
+    x._set_key(c10::getAutogradRelatedKeySetFromBackend(k), value);
+    x._set_key(c10::getAutocastRelatedKeySetFromBackend(k), value);
+    if (!value) {
+      x._set_keyset(x.key_set().remove_backend(k));
+    } else {
+      // x._
+    }
+  });
+  py_module.def("_move_key_set", [](at::Tensor& x, at::Tensor& y) {
+    x._set_keyset(y.key_set());
+  });
+  py_module.def("_set_meta_enabled", [](bool enable) {
+    auto local_keyset = c10::impl::tls_local_dispatch_key_set();
+    if (enable) {
+      c10::DispatchKeySet key_set({at::DispatchKey::Meta});
+      local_keyset.included_ = local_keyset.included_ | key_set;
+    } else {
+      c10::DispatchKeySet key_set({at::DispatchKey::Meta});
+      auto k = key_set.highestBackendKey();
+      local_keyset.included_ = local_keyset.included_.remove_backend(k);
+    }
+    c10::impl::_force_tls_local_dispatch_key_set(local_keyset);
+  });
+
+  py_module.def("_dump_local_tls_set", []() {
+    auto local_keyset = c10::impl::tls_local_dispatch_key_set();
+    std::cout << toString(local_keyset.included_) << "\n";
+    std::cout << toString(local_keyset.excluded_) << "\n";
+  });
+
+  // }
+  // bool is_cpu_enabled() {
+  //   return
+  //   !c10::impl::tls_is_dispatch_key_excluded(DispatchKey::AutocastCPU);
+  // }
+  // void set_cpu_enabled(bool new_enabled) {
+  //   c10::impl::tls_set_dispatch_key_excluded(DispatchKey::AutocastCPU,
+  //   !new_enabled);
+  // }
 
   const auto& defaultGenerator = at::detail::getDefaultCPUGenerator();
   THPDefaultCPUGenerator =
