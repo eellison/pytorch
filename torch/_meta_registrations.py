@@ -562,6 +562,60 @@ def meta_cdist_forward(x1, x2, p, compute_mode):
     return x1.new_empty(output_shape)
 
 
+# note, different than forward only
+def embedding_bag_training(
+    weight,
+    indices,
+    offsets,
+    scale_grad_by_freq=False,
+    mode=0,
+    sparse=False,
+    per_sample_weights=None,
+    include_last_offset=False,
+    padding_idx=-1,
+):
+    common_type = torch.promote_types(indices, offsets)
+    indices, offsets = indices.to(common_type), offsets.to(common_type)
+
+    num_indices = indices.size(0)
+    num_bags = offsets.size(0)
+
+    if include_last_offset:
+        assert num_bags >= 1, "include_last_offset: numBags should be at least 1"
+        num_bags -= 1
+    
+    feature_size = weight.size(1)
+    bag_size = indices.new_empty(offsets.sizes())
+    
+    offset2bag = indices.new_empty([indices.size(0)])
+    output = weight.new_empty([numBags, feature_size])
+
+    MODE_SUM, MODE_MEAN, MODE_MAX = range(3)
+
+    if mode == MODE_MAX:
+        max_indices = indices.new_empty([numBags, feature_size])
+    else:
+        # No need to allocate if we aren't doing a backwards pass
+        max_indices = indices.new_empty([0])
+    
+
+    # index_t *input, index_t *offsets, scalar_t *weight, scalar_t *output,
+    # index_t *offset2bag, int64_t numIndices, int64_t numBags,
+    # int64_t featureSize, int64_t weight_stride0, int64_t weight_stride1,
+    # index_t *bag_size, index_t *max_indices,
+    # index_t padding_idx) {
+    # the strategy is that each bag x feature is handled by a single thread
+    
+    if mode == MODE_MAX:
+        num_indices = indices.numel()
+        feature_size = weight.size(1)
+        vocab_size = weight.size(0)
+        num_bags = bag_size.size(0)
+
+
+
+
+
 @torch.library.impl(meta_lib, "_embedding_bag")
 def meta_embedding_bag(
     weight,

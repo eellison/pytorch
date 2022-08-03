@@ -18095,8 +18095,12 @@ torch.cuda.synchronize()
                 es(input, offsets, per_sample_weights)
 
     def _embedding_bag_reference_impl(self, input, weight, offsets=None, mode='sum',
-                                      per_sample_weights=None, include_last_offset=False):
+                                      per_sample_weights=None, include_last_offset=False, padding_idx=-1):
         assert mode == 'sum' or per_sample_weights is None
+
+        # if input.dim() == 2:
+        #     assert offsets is None
+        #     offsets = torch.arange(0, input.numel(), input.size(1), dtype=input.dtype, device=input.device)
         assert offsets is not None
         if per_sample_weights is None:
             per_sample_weights = torch.ones(input.size()).to(
@@ -18106,9 +18110,25 @@ torch.cuda.synchronize()
 
         bags = []
         long_input = input.to(torch.long)
+        # if long_input.dim() == 1:
         embeddings = weight.index_select(0, long_input) * per_sample_weights.unsqueeze(1)
+        # else:
+        #     size = list(long_input.shape)
+        #     for d in weight.shape[1:]:
+        #         size.append(d)
+        #     embedding = weight.index_select(0, long_input.reshape(-1)).view(size)
+        #     if mode == "sum:"
+        #         return torch.sum(embedding, dim=1)
+        #     elif mode =="mean":
+        #         return torch.mean(embedding, dim=1)
+        #     else:
+        #         return torch.mode(embedding, dim=1)
+        # if input.dim() == 2:
+    
+        
         if include_last_offset:
             for index in range(len(offsets) - 1):
+                import pdb; pdb.set_trace()
                 offset = offsets[index]
                 next_offset = offsets[index + 1]
                 length = next_offset - offset
@@ -18128,6 +18148,7 @@ torch.cuda.synchronize()
                         bags.append(embeddings.narrow(0, offset, length).max(0)[0])
         else:
             for index, offset in enumerate(offsets):
+                import pdb; pdb.set_trace()
                 if index + 1 < len(offsets):
                     next_offset = offsets[index + 1]
                 else:
@@ -18222,6 +18243,19 @@ torch.cuda.synchronize()
         for mode, trainable in itertools.product(modes, trainable_scale):
             test_per_sample_weights(mode, trainable)
 
+    def test_elias(self):
+        embedding_sum = nn.EmbeddingBag(10, 3, mode='sum')
+        # a batch of 2 samples of 4 indices each
+        embedding_sum.weight = nn.Parameter(torch.arange(0., 30.).reshape([10, 3]))
+        input = torch.tensor([1,2,4,5,4,3,2,9], dtype=torch.long)
+        offsets = torch.tensor([0, 4], dtype=torch.long)
+        a2 = self._embedding_bag_reference_impl(input, embedding_sum.weight, offsets=offsets, mode='sum')
+        embedding_sum(input, offsets=offsets)
+        # input2 = torch.LongTensor([[1,2,4,5],[4,3,2,9]])
+        # a1 = embedding_sum(input2)
+        # a2 = self._embedding_bag_reference_impl(input2, embedding_sum.weight, mode='sum')
+        # print("hi")
+
     @skipMeta
     @dtypes(*itertools.product((torch.int, torch.long), (torch.int, torch.long), (torch.float, torch.double, torch.half)))
     def test_EmbeddingBag_per_sample_weights_and_new_offsets(self, device, dtypes):
@@ -18244,7 +18278,7 @@ torch.cuda.synchronize()
                 per_sample_weights = None
                 ref_per_sample_weights = None
 
-            reference_weights = es.weight.detach().requires_grad_()
+                
 
             expected = self._embedding_bag_reference_impl(
                 input, reference_weights, offsets, mode, ref_per_sample_weights, include_last_offset)

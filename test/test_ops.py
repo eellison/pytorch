@@ -1733,7 +1733,7 @@ fake_striding_skips = (
     "fft.rfftn",
     "svd",
     "linalg.svd",
-    "nn.functional.conv_transpose2d",
+    # "nn.functional.conv_transpose2d",
 )
 
 
@@ -1747,9 +1747,12 @@ class TestFakeTensorNonErroring(TestCase):
             self.skipTest("Skip failing test")
 
         samples = op.sample_inputs(device, dtype, requires_grad=False)
-        for sample in samples:
+        for sample_iter, sample in enumerate(samples):
             try:
                 mode = FakeTensorMode(inner=None)
+
+                if sample_iter != 6:
+                    continue
 
                 def map_to_fake(e):
                     if isinstance(e, torch.Tensor):
@@ -1757,6 +1760,7 @@ class TestFakeTensorNonErroring(TestCase):
                     else:
                         return e
 
+                import pdb; pdb.set_trace()
                 input = tree_map(map_to_fake, sample.input)
                 args = tree_map(map_to_fake, sample.args)
                 kwargs = tree_map(map_to_fake, sample.kwargs)
