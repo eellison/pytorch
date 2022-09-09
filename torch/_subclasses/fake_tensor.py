@@ -289,7 +289,7 @@ def constructors(fake_mode, func, *args, **kwargs):
     return FakeTensor(fake_mode, r, out_device)
 
 
-@register_op_impl(lambda func: func in (aten.to.prim_Device, aten.to.device))
+@register_op_impl(lambda func: func in (aten.to.prim_Device, aten.to.device, aten.to.dtype_layout))
 def non_kwarg_to(fake_mode, func, *args, **kwargs):
     _, new_kwargs = normalize_function(
         func, args, kwargs, normalize_to_only_use_kwargs=True
@@ -297,6 +297,7 @@ def non_kwarg_to(fake_mode, func, *args, **kwargs):
     input_device = new_kwargs["device"]
     out_device = input_device if input_device else new_kwargs["input"].device
     new_kwargs["device"] = torch.device("meta")
+    args = (new_kwargs.pop("input"),)
     r = func(*args, **new_kwargs)
     return fake_mode.fake_tensor_converter(fake_mode, r, out_device)
 
@@ -753,10 +754,26 @@ class FakeTensorMode(TorchDispatchMode):
         if (
             "prims::" in func._schema.name
             and len(flat_arg_tensors) != 0
-            and hasattr(func, "prim_meta_impl")
+            and hasattr(func, "prim_impl")
         ):
             with self.restore():
-                return func.prim_meta_impl(*args, **kwargs)
+                return func.prim_impl(*args, **kwargs)
+
+        with self.restore():
+            # TODO: Find better approach for this
+            # Avoid circular import
+            from torch._decomp import decomposition_table
+            from torch._meta_registrations import meta_table
+
+            if func in decomposition_table and func not in [
+                aten.lift_fresh.default,
+                aten.lift_fresh_copy.default,
+            ] and func not in getattr(self, "skip_fns", ()):
+                if not hasattr(self, "skip_fns"):
+                    self.skip_fns = set()
+                self.skip_fns.add(func)
+                out = decomposition_table[func](*args, **kwargs)
+                return out
 
         if has_symbolic_sizes:
             constructors = [aten.empty.memory_format]
