@@ -3863,7 +3863,7 @@ def masked_fill(a: TensorLikeType, mask: TensorLikeType, value: TensorOrNumberLi
         )
         value_type = utils.dtype_to_type(value.dtype)
         if utils.is_cpu_scalar_tensor(value):
-            value = value.item()
+            value = prims.to_dtype(value, a.dtype).to(device=a.device)
 
     if value_type is complex:
         # only downcasting from complex to lower type is not allowed.

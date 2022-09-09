@@ -3,6 +3,7 @@ import functools
 import itertools
 import warnings
 import weakref
+from collections import Counter
 from dataclasses import dataclass
 from functools import partial
 from typing import Any, Callable, Dict, List, Optional, Type, TypeVar, Union
@@ -16,6 +17,7 @@ from torch.multiprocessing.reductions import StorageWeakRef
 from torch.overrides import TorchFunctionMode
 from torch.utils._mode_utils import no_dispatch
 from torch.utils._python_dispatch import enable_torch_dispatch_mode, TorchDispatchMode
+import typing
 
 from torch.utils._pytree import PyTree, tree_flatten, tree_map
 
@@ -289,7 +291,9 @@ def constructors(fake_mode, func, *args, **kwargs):
     return FakeTensor(fake_mode, r, out_device)
 
 
-@register_op_impl(lambda func: func in (aten.to.prim_Device, aten.to.device))
+@register_op_impl(
+    lambda func: func in (aten.to.prim_Device, aten.to.device, aten.to.dtype_layout)
+)
 def non_kwarg_to(fake_mode, func, *args, **kwargs):
     _, new_kwargs = normalize_function(
         func, args, kwargs, normalize_to_only_use_kwargs=True
@@ -297,6 +301,7 @@ def non_kwarg_to(fake_mode, func, *args, **kwargs):
     input_device = new_kwargs["device"]
     out_device = input_device if input_device else new_kwargs["input"].device
     new_kwargs["device"] = torch.device("meta")
+    args = (new_kwargs.pop("input"),)
     r = func(*args, **new_kwargs)
     return fake_mode.fake_tensor_converter(fake_mode, r, out_device)
 
@@ -404,6 +409,11 @@ def index_put_(fake_mode, func, *args, **kwargs):
 
     return new_kwargs["input"]
 
+            
+@register_op_impl(lambda fn: fn in _device_not_kwarg_ops)
+def nyi(fake_mode, func, *args, **kwargs):
+    assert func not in _device_not_kwarg_ops, f"NYI: {func}"
+
 
 # Meta tensors give you the ability to run PyTorch code without having to
 # actually do computation through tensors allocated on a `meta` device.
@@ -422,6 +432,18 @@ def in_kernel_invocation_manager(fake_mode):
     finally:
         fake_mode.in_kernel_invocation = False
         torch._C._remove_meta_from_tls_dispatch_include()
+
+
+@contextlib.contextmanager
+def decomp_exclude_manager(fake_mode, operator):
+    decomp_exclude_set = fake_mode.decomp_exclude_set
+    decomp_exclude_set[operator] += 1
+    try:
+        yield
+    finally:
+        decomp_exclude_set[operator] -= 1
+        if decomp_exclude_set[operator] == 0:
+            del decomp_exclude_set[operator]
 
 
 class FakeTensor(torch.Tensor):
@@ -647,6 +669,9 @@ class FakeTensorMode(TorchDispatchMode):
         # the device property
         self.in_kernel_invocation = False
 
+        # some decompositions are circular
+        self.decomp_exclude_set: typing.Counter[torch._ops.OpOverload] = Counter()
+
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
         kwargs = kwargs if kwargs else {}
 
@@ -723,6 +748,13 @@ class FakeTensorMode(TorchDispatchMode):
             # Avoid circular import
             from torch._decomp import decomposition_table
             from torch._meta_registrations import meta_table
+            if (        
+                func in decomposition_table
+                and func not in self.lift_fns
+                and func not in self.decomp_exclude_set
+            ):
+                with decomp_exclude_manager(self, func):
+                    return decomposition_table[func](*args, **kwargs)
 
             with no_dispatch():
                 if symbolic_shapes.is_symbolic_op(func):
@@ -737,29 +769,40 @@ class FakeTensorMode(TorchDispatchMode):
                 if func in meta_table:
                     r = meta_table[func](*args, **kwargs)
                     return r
-                if func in decomposition_table:
-                    return decomposition_table[func](*args, **kwargs)
 
                 # Decomposes CompositeImplicitAutograd ops
                 r = func.decompose(*args, **kwargs)
                 if r is not NotImplemented:
                     return r
 
-        # prims already wrap FakeTensor inputs to FakeTensor outputs
-        # and do device logic, we dont need do anything but run them
-        # and ensure that Meta kernels are dispatched to (see)
-        # Fake Tensor Dispatch Keys
-        # TODO - we should be use the prim aten impl
-        if (
-            "prims::" in func._schema.name
-            and len(flat_arg_tensors) != 0
-            and hasattr(func, "prim_meta_impl")
-        ):
-            with self.restore():
-                return func.prim_meta_impl(*args, **kwargs)
+        with self.restore():
+            # Avoid circular import
+            from torch._decomp import decomposition_table
+
+            if (
+                "prims::" in func._schema.name
+                and len(flat_arg_tensors) != 0
+                and hasattr(func, "prim_impl")
+            ):
+                return func.prim_impl(*args, **kwargs)
+
+            if (
+                func in decomposition_table
+                and func not in self.lift_fns
+                and func not in self.decomp_exclude_set
+            ):
+                with decomp_exclude_manager(self, func):
+                    return decomposition_table[func](*args, **kwargs)
 
         if has_symbolic_sizes:
             constructors = [aten.empty.memory_format]
+
+            name = func.name.split("::")[-1]
+            if hasattr(getattr(torch._prims, name, None), "prim_meta_impl"):
+                with in_kernel_invocation_manager(self):
+                    r = getattr(torch._prims, name).prim_meta_impl(*args, **kwargs)
+                return self.wrap_meta_outputs_with_default_device_logic(r, func, args, kwargs)
+
             if func not in constructors:
                 raise RuntimeError(
                     f"{func} - couldn't find symbolic meta function/decomposition"
@@ -841,28 +884,41 @@ class FakeTensorMode(TorchDispatchMode):
                     self, func, args, kwargs, not_implemented_error
                 )
 
-            # TODO: handle non-kwarg devices
-            assert func not in _device_not_kwarg_ops, f"NYI: {func}"
+            return self.wrap_meta_outputs_with_default_device_logic(r, func, args, kwargs)
 
-            # Lazily initialized, in case there are no tensor returns
-            common_device = None
 
-            def wrap(e, device=None):
-                nonlocal common_device
-                if isinstance(e, torch.Tensor) and not isinstance(e, FakeTensor):
-                    if common_device is None:
-                        common_device = FakeTensor._find_common_device(
-                            func, args, kwargs
-                        )
-                    return converter(self, e, device or common_device)
-                else:
-                    return e
+    def wrap_meta_outputs_with_default_device_logic(self, r, func, args, kwargs):
+        wrap = self.gen_wrap_fn(func, args, kwargs)
 
-            # if device is specified, use that
-            if kwargs.get("device", None):
-                return tree_map(partial(wrap, device=kwargs["device"]), r)
+        # if device is specified, use that
+        if kwargs.get("device", None):
+            return tree_map(partial(wrap, device=kwargs["device"]), r)
 
-            return tree_map(partial(wrap), r)
+        return tree_map(partial(wrap), r)
+
+
+    def gen_wrap_fn(self, func, args, kwargs):
+        converter = self.fake_tensor_converter
+
+        # Lazily initialized, in case there are no tensor returns
+        common_device = None
+
+        def wrap(e, device=None):
+            nonlocal common_device
+            if isinstance(e, torch.Tensor) and not isinstance(e, FakeTensor):
+                if common_device is None:
+                    common_device = FakeTensor._find_common_device(
+                        func, args, kwargs
+                    )
+                return converter(self, e, device or common_device)
+            else:
+                return e
+
+        return wrap
+
+    @property
+    def lift_fns(self):
+        return (aten.lift_fresh.default, aten.lift_fresh_copy.default)
 
     def may_turn_const(self, t):
         return t.numel() <= CONSTANT_NUMEL_LIMIT and not t.is_sparse

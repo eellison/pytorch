@@ -81,11 +81,11 @@ def _enable_mode(mode: T, mode_info: _ModeInfo, *, replace=None, ignore_preexist
 
 
 def _restore_mode(mode, mode_info: _ModeInfo):
-    if not hasattr(mode, "ancestors"):
-        raise RuntimeError(f"{mode} does not have any ancestors. Use the standard version instead of restore")
+    # if not hasattr(mode, "ancestors"):
+    #     raise RuntimeError(f"{mode} does not have any ancestors. Use the standard version instead of restore")
     old = mode_info.get_mode()
-    if old is not None and old not in mode.ancestors:
-        raise RuntimeError(f"{mode} is not valid in the current state because the current mode is not its ancestor")
+    # if old is not None and old not in getattr(mode, "ancestors", ()):
+    #     raise RuntimeError(f"{mode} is not valid in the current state because the current mode is not its ancestor")
     mode_info.set_mode(mode)
     try:
         yield mode

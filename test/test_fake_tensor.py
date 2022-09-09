@@ -61,6 +61,7 @@ class FakeTensorTest(TestCase):
             self.assertEqual(out.device.type, "cpu")
             self.assertTrue(isinstance(out, FakeTensor))
 
+
     @unittest.skipIf(not RUN_CUDA, "requires cuda")
     def test_zero_dim(self):
         mode = FakeTensorMode()
@@ -69,6 +70,20 @@ class FakeTensorTest(TestCase):
             y = torch.rand([4, 4], device="cuda")
             out = x + y
             self.assertEqual(out.shape, (4, 4))
+            self.assertEqual(out.device, y.device)
+            self.assertTrue(isinstance(out, FakeTensor))
+
+    @unittest.skipIf(not RUN_CUDA, "requires cuda")
+    def test_zero_dim_symint(self):
+        from torch.fx.experimental.symbolic_shapes import ShapeEnv
+
+        shape_env = ShapeEnv()
+        sym_int = shape_env.create_symint(f"s{2}", 2)
+
+        with FakeTensorMode():
+            x = torch.empty([sym_int], device='cuda')
+            y = torch.rand([1], device="cuda")
+            out = x + y
             self.assertEqual(out.device, y.device)
             self.assertTrue(isinstance(out, FakeTensor))
 
