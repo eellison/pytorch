@@ -4,6 +4,7 @@
 #include <ATen/Functions.h>
 #include <c10/cuda/CUDACachingAllocator.h>
 #include <c10/cuda/CUDAFunctions.h>
+#include <iostream>
 
 namespace at {
 namespace cuda {
@@ -181,8 +182,10 @@ void CUDAGraph::capture_end() {
 
   // Now that we've instantiated graph_ into graph_exec_,
   // we don't need graph_ anymore.
-  AT_CUDA_CHECK(cudaGraphDestroy(graph_));
-  has_graph_ = false;
+  if (!preserve_graph_) {
+    AT_CUDA_CHECK(cudaGraphDestroy(graph_));
+    has_graph_ = false;
+  }
 #else
   TORCH_CHECK(false, "CUDA graphs may only be used in Pytorch built with CUDA >= 11.0 and not yet supported on ROCM");
 #endif
@@ -269,6 +272,25 @@ MempoolId_t CUDAGraph::pool() {
 #endif
   return mempool_id_;
 }
+
+void CUDAGraph::update_params(std::vector<Tensor> old_params, std::vector<Tensor> new_params) {
+  TORCH_CHECK(preserve_graph_ && has_graph_);
+
+  cudaGraphNode_t* nodes = NULL;
+  size_t numNodes = 0;
+  auto err = cudaGraphGetNodes(graph_, nodes, &numNodes);
+  C10_CUDA_CHECK(err);
+  for (size_t i = 0; i < numNodes; i++ ) {
+    TORCH_CHECK(nodes != NULL);
+    cudaKernelNodeParams* pNodeParams;
+    cudaGraphKernelNodeGetParams(nodes[i], pNodeParams);
+    int64_t addr = (int64_t)&pNodeParams[0];
+    // TODO figure out how to query number of node params
+    // TODO: update from old address to new
+    std::cout << addr;
+  }
+}
+
 
 CUDAGraph::~CUDAGraph() {
   reset();
