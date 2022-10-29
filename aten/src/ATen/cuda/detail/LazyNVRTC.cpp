@@ -167,6 +167,12 @@ CUDA_STUB4(cuLinkCreate, unsigned int, CUjit_option *, void **, CUlinkState *);
 CUDA_STUB3(cuLinkComplete, CUlinkState, void **, size_t *);
 CUDA_STUB3(cuFuncSetAttribute, CUfunction, CUfunction_attribute, int);
 CUDA_STUB3(cuFuncGetAttribute, int*, CUfunction_attribute, CUfunction);
+CUDA_STUB2(cuGraphKernelNodeGetParams, CUgraphNode, CUDA_KERNEL_NODE_PARAMS*)
+CUDA_STUB2(cuGraphKernelNodeSetParams, CUgraphNode, const CUDA_KERNEL_NODE_PARAMS*)
+CUDA_STUB3(cuGraphExecKernelNodeSetParams, CUgraphExec, CUgraphNode, const CUDA_KERNEL_NODE_PARAMS*)
+CUDA_STUB4(cuGraphExecUpdate, CUgraphExec, CUgraph, CUgraphNode*, CUgraphExecUpdateResult*)
+CUDA_STUB1(cuGraphExecDestroy, CUgraphExec)
+
 
 // Irregularly shaped functions
 CUresult CUDAAPI cuLaunchKernel(CUfunction f,
@@ -229,6 +235,15 @@ CUresult CUDAAPI cuModuleLoadDataEx(CUmodule *module,
     throw std::runtime_error("Can't get cuModuleLoadDataEx");
   lazyNVRTC.cuModuleLoadDataEx = fn;
   return fn(module, image, numOptions, options, optionValues);
+}
+
+
+CUresult CUDAAPI cuGraphInstantiate(CUgraphExec *phGraphExec, CUgraph hGraph, CUgraphNode *phErrorNode, char *logBuffer, size_t bufferSize) {
+  auto fn = reinterpret_cast<decltype(&cuGraphInstantiate)>(getCUDALibrary().sym(__func__));
+  if (!fn)
+    throw std::runtime_error("Can't get cuGraphInstantiate");
+  lazyNVRTC.cuGraphInstantiate = fn;
+  return fn(phGraphExec, hGraph, phErrorNode, logBuffer, bufferSize);
 }
 
 CUresult CUDAAPI

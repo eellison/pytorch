@@ -4,6 +4,9 @@
 #include <ATen/Functions.h>
 #include <c10/cuda/CUDACachingAllocator.h>
 #include <c10/cuda/CUDAFunctions.h>
+#include <ATen/cuda/nvrtc_stub/ATenNVRTC.h>
+
+#include <iostream>
 
 namespace at {
 namespace cuda {
@@ -181,8 +184,11 @@ void CUDAGraph::capture_end() {
 
   // Now that we've instantiated graph_ into graph_exec_,
   // we don't need graph_ anymore.
-  AT_CUDA_CHECK(cudaGraphDestroy(graph_));
+  if (!preserve_graph_) {
   has_graph_ = false;
+    AT_CUDA_CHECK(cudaGraphDestroy(graph_));
+    has_graph_ = false;
+  }
 #else
   TORCH_CHECK(false, "CUDA graphs may only be used in Pytorch built with CUDA >= 11.0 and not yet supported on ROCM");
 #endif
@@ -268,6 +274,188 @@ MempoolId_t CUDAGraph::pool() {
   TORCH_CHECK(false, "CUDA graphs may only be used in Pytorch built with CUDA >= 11.0 and not yet supported on ROCM");
 #endif
   return mempool_id_;
+}
+
+inline std::vector<cudaGraphNode_t> CUDAGraph::get_nodes(cudaGraph_t cuda_graph) {
+  size_t numNodes;
+  AT_CUDA_CHECK(cudaGraphGetNodes(cuda_graph, static_cast<cudaGraphNode_t*>(nullptr), &numNodes));
+  if (numNodes == 0)
+    return std::vector<cudaGraphNode_t>();
+  std::vector<cudaGraphNode_t> graphNodes(numNodes);
+  AT_CUDA_CHECK(cudaGraphGetNodes(cuda_graph, graphNodes.data(), &numNodes));
+  return graphNodes;
+}
+
+inline std::string CUDAGraph::get_node_info(const cudaGraphNode_t node) {
+  std::stringstream ss;
+
+  cudaGraphNodeType pType;
+  AT_CUDA_CHECK(cudaGraphNodeGetType(node, &pType));
+  printf("Graph type = %i; ", pType);
+
+  switch (pType) {
+    case cudaGraphNodeTypeKernel: {
+      CUDA_KERNEL_NODE_PARAMS kparams = {0};
+      (at::globalContext().getNVRTC().cuGraphKernelNodeGetParams(node, &kparams));
+
+      ss << "GPUKernel@" << kparams.func;
+      ss << "<<<gridDim=(" << kparams.gridDimX << ", "<< kparams.gridDimY << ", " << kparams.gridDimZ << "), "
+         << "blockDim=(" << kparams.blockDimX << ", "<< kparams.blockDimY << ", "<< kparams.blockDimZ << ")>>>";
+      ss << "(";
+
+      // we'll need to get exact number of parameters
+      int64_t address_start = 1024;
+      for(int64_t i=0; (int64_t)kparams.kernelParams[i] > address_start; i++) {
+        void *ptr = *(void**)kparams.kernelParams[i];
+        ss << reinterpret_cast<int64_t>(ptr) << ", ";
+      }
+
+      ss << ")";
+      if (kparams.sharedMemBytes != 0)
+        ss << ", dynSharedMemBytes=" << kparams.sharedMemBytes;
+    } break;
+    case cudaGraphNodeTypeMemcpy: {
+      cudaMemcpy3DParms mparams = {};
+      AT_CUDA_CHECK(cudaGraphMemcpyNodeGetParams(node, &mparams));
+
+      // If memcpy is seen, return without setting up runnable executor
+      switch (mparams.kind) {
+        case cudaMemcpyHostToHost:
+          ss << "Host->Host ";
+          break;
+        case cudaMemcpyHostToDevice:
+          ss << "Host->Device ";
+          break;
+        case cudaMemcpyDeviceToHost:
+          ss << "Device->Host ";
+          break;
+        case cudaMemcpyDeviceToDevice:
+          ss << "Device->Device ";
+          break;
+        default:
+          break;
+      }
+      ss << "Memcpy";
+    } break;
+    case cudaGraphNodeTypeMemset: {
+      cudaMemsetParams mparams = {};
+      AT_CUDA_CHECK(cudaGraphMemsetNodeGetParams(node, &mparams));
+      if (mparams.height == 1 && mparams.elementSize == 1) {
+        ss << "cudaMemset(devPtr=" << mparams.dst << ", value=" << mparams.value
+           << ", count=" << mparams.width << ")";
+      } else {
+        if (mparams.elementSize == 1)
+          ss << "cudaMemset2D";
+        else
+          ss << "MemSet<elemBytes=" << mparams.elementSize << ">";
+        ss << "(devPtr=" << mparams.dst << ", pitch=" << mparams.pitch
+           << ", value=" << mparams.value << ", width=" << mparams.width
+           << ", height=" << mparams.height << ")";
+      }
+    } break;
+    case cudaGraphNodeTypeHost:
+      ss << "Host (executable) node";
+      break;
+    case cudaGraphNodeTypeGraph:
+      ss << "Node which executes an embedded graph";
+      break;
+    case cudaGraphNodeTypeEmpty:
+      ss << "Empty (no-op) node";
+      break;
+    default:
+      ss << "Unknown/Invalid node type " << pType;
+  }
+
+  return ss.str();
+}
+
+
+template <typename T>
+void check(T result, char const *const func, const char *const file, int const line) {
+  if (result) {
+    fprintf(
+        stderr,
+        "CUDA error at %s:%d code=%d: %s \n",
+        file,
+        line,
+        static_cast<unsigned int>(result),
+        cudaGetErrorString(result));
+    exit(EXIT_FAILURE);
+  }
+}
+
+#define checkCudaErrors(val) check((val), #val, __FILE__, __LINE__)
+
+void CUDAGraph::update_params(std::vector<Tensor> old_params, std::vector<Tensor> new_params) {
+  TORCH_CHECK(preserve_graph_ && has_graph_ && has_graph_exec_);
+
+  std::vector<cudaGraphNode_t> nodes = get_nodes(graph_);
+
+  std::cout << "Length of nodes : " << nodes.size() << "\n";
+
+  for(auto param : old_params) {
+    std::cout<< reinterpret_cast<int64_t>(param.data_ptr()) << '\n';
+  }
+
+  for(auto node : nodes) {
+    TORCH_CHECK(node != NULL);
+    std::cout<<get_node_info(node) << '\n';
+  }
+  auto node = nodes[0];
+  CUDA_KERNEL_NODE_PARAMS kparams = {0};
+  (at::globalContext().getNVRTC().cuGraphKernelNodeGetParams(node, &kparams));
+
+  kparams.kernelParams[0] = new_params[0].data_ptr();
+  kparams.kernelParams[1] = new_params[1].data_ptr();
+  const CUDA_KERNEL_NODE_PARAMS kparams_2 = kparams;
+
+  CUDA_KERNEL_NODE_PARAMS new_kparams = {0};
+  std::vector<int64_t> new_kparams;
+  int64_t address_start = 1024;
+  for(int64_t i=0; (int64_t)kparams.kernelParams[i] > address_start; i++) {
+    void *ptr = *(void**)kparams.kernelParams[i];
+    ss << reinterpret_cast<int64_t>(ptr) << ", ";
+  }
+
+
+
+  std::vector<int64_t> new_vec;
+
+  
+  auto nvrt = at::globalContext().getNVRTC();
+
+  // const cudaKernelNodeParams* const_params = reinterpret_cast<const cudaKernelNodeParams*>(&kparams);
+  std::cout << "1\n"
+  AT_CUDA_DRIVER_CHECK(at::globalContext().getNVRTC().cuGraphExecKernelNodeSetParams(graph_exec_, node, &kparams_2));
+  std::cout << "2\n"
+  // the following segfaults
+  AT_CUDA_DRIVER_CHECK(at::globalContext().getNVRTC().cuGraphKernelNodeSetParams(node, &kparams_2));
+  // checkCudaErrors(cudaGraphExecKernelNodeSetParams(graph_exec_, node, const_params));
+  // checkCudaErrors(cudaGraphKernelNodeSetParams(node, const_params));
+  std::cout << "3\n"
+  cudaGraphExecUpdateResult updateResult;
+  cudaGraphNode_t errorNode;
+  // First we try to update the graph as this is much cheaper than re-instantiation
+  checkCudaErrors(cudaGraphExecUpdate(graph_exec_, graph_, &errorNode, &updateResult));
+  std::cout << "3\n"
+  if (graph_exec_ == nullptr || updateResult != cudaGraphExecUpdateSuccess) {
+    // The update is unsuccessful, need to re-instantiate
+    cudaGetLastError(); // <- Clear the error state
+    if (graph_exec_ != nullptr) { 
+      (cudaGraphExecDestroy(graph_exec_)); 
+    }
+  } else {
+    AT_CUDA_DRIVER_CHECK(at::globalContext().getNVRTC().cuGraphInstantiate(&graph_exec_, graph_, NULL, NULL, 0));
+  }
+
+
+  // for(int64_t i=0; i < 3; i++) {
+  //       void *ptr = *(void**)kparams.kernelParams[i];
+
+  //       ss << reinterpret_cast<int64_t>(ptr) << ", ";
+  // }
+
+
 }
 
 CUDAGraph::~CUDAGraph() {

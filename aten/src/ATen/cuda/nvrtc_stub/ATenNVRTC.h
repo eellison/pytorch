@@ -57,7 +57,13 @@ namespace at { namespace cuda {
   _(cuLinkAddData)                               \
   _(cuLinkComplete)                              \
   _(cuFuncSetAttribute)                          \
-  _(cuFuncGetAttribute)
+  _(cuFuncGetAttribute)                          \
+  _(cuGraphKernelNodeGetParams)                  \
+  _(cuGraphKernelNodeSetParams)                  \
+  _(cuGraphExecKernelNodeSetParams)              \
+  _(cuGraphExecUpdate)                           \
+  _(cuGraphInstantiate)                          \
+  _(cuGraphExecDestroy)
 
 #if defined(CUDA_VERSION) && CUDA_VERSION >= 11010
 #define AT_FORALL_NVRTC(_) \
@@ -110,7 +116,7 @@ namespace at { namespace cuda {
   _(cuCtxGetCurrent)                              \
   _(nvrtcGetLoweredName)                          \
   _(cuModuleUnload)                               \
-  _(cuDevicePrimaryCtxGetState)
+  _(cuDevicePrimaryCtxGetState)                   \
 
 #endif
 
