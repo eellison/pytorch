@@ -48,5 +48,9 @@ void THCPGraph_init(PyObject* module) {
       .def(
           "pool",
           &::at::cuda::CUDAGraph::pool,
+          py::call_guard<py::gil_scoped_release>())
+      .def(
+          "update_params",
+          &::at::cuda::CUDAGraph::update_params,
           py::call_guard<py::gil_scoped_release>());
 }
