@@ -1,0 +1,9 @@
+buf0_buf1: FusedSchedulerNode(NoneType)
+buf0_buf1.writes = 
+    [   MemoryDep(name='buf0', index=c0, size=(12582912,)),
+        MemoryDep(name='buf1', index=c0, size=(12582912,))]
+buf0_buf1.unmet_dependencies = []
+buf0_buf1.met_dependencies = [MemoryDep(name='seed_cuda_0', index=0, size=(12582912,))]
+buf0_buf1.snodes = ['buf0', 'buf1']
+
+

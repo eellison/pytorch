@@ -1,0 +1,84 @@
+buf0: ExternKernelSchedulerNode(MatrixMultiply)
+buf0.writes = [StarDep(name='buf0')]
+buf0.unmet_dependencies = []
+buf0.met_dependencies = [StarDep(name='primals_3'), StarDep(name='primals_4')]
+buf0.node.kernel = aten.mm.out
+
+
+buf1: SchedulerNode(ComputedBuffer)
+buf1.writes = [MemoryDep(name='buf1', index=c0, size=(1572864,))]
+buf1.unmet_dependencies = [   MemoryDep(name='buf0', index=1179648*c0 + 192*c1 + 2304*c2 + c3, size=(4, 12, 512, 64))]
+buf1.met_dependencies = [MemoryDep(name='primals_1', index=64*c1 + c3, size=(4, 12, 512, 64))]
+buf1.group.device = cuda:0
+buf1.group.iteration = (1572864, 1)
+buf1.sizes = ([4, 12, 512, 64], [])
+class buf1_loop_body:
+    var_ranges = {z0: 4, z1: 12, z2: 512, z3: 64}
+    index0 = 1179648*z0 + 192*z1 + 2304*z2 + z3
+    index1 = 64*z1 + z3
+    index2 = 393216*z0 + 32768*z1 + 64*z2 + z3
+    def body(self, ops):
+        get_index = self.get_index('index0')
+        load = ops.load('buf0', get_index)
+        get_index_1 = self.get_index('index1')
+        load_1 = ops.load('primals_1', get_index_1)
+        add = ops.add(load, load_1)
+        constant = ops.constant(64.0, torch.float32)
+        constant_1 = ops.constant(1, torch.float32)
+        mul = ops.mul(constant, constant_1)
+        sqrt = ops.sqrt(mul)
+        div = ops.div(add, sqrt)
+        get_index_2 = self.get_index('index2')
+        store = ops.store('buf1', get_index_2, div, None)
+        return store
+
+
+buf2: SchedulerNode(ComputedBuffer)
+buf2.writes = [MemoryDep(name='buf2', index=c0, size=(1572864,))]
+buf2.unmet_dependencies = [   MemoryDep(name='buf0', index=1179648*c0 + 192*c1 + c2 + 2304*c3 + 64, size=(4, 12, 64, 512))]
+buf2.met_dependencies = []
+buf2.group.device = cuda:0
+buf2.group.iteration = (1572864, 1)
+buf2.sizes = ([4, 12, 64, 512], [])
+class buf2_loop_body:
+    var_ranges = {z0: 4, z1: 12, z2: 64, z3: 512}
+    index0 = 1179648*z0 + 192*z1 + z2 + 2304*z3 + 64
+    index1 = 393216*z0 + 32768*z1 + 512*z2 + z3
+    def body(self, ops):
+        get_index = self.get_index('index0')
+        load = ops.load('buf0', get_index)
+        get_index_1 = self.get_index('index1')
+        store = ops.store('buf2', get_index_1, load, None)
+        return store
+
+
+buf3: ExternKernelSchedulerNode(BatchMatrixMultiply)
+buf3.writes = [StarDep(name='buf3')]
+buf3.unmet_dependencies = [StarDep(name='buf1'), StarDep(name='buf2')]
+buf3.met_dependencies = []
+buf3.node.kernel = aten.bmm.out
+
+
+buf4: SchedulerNode(ComputedBuffer)
+buf4.writes = [MemoryDep(name='buf4', index=c0, size=(1572864,))]
+buf4.unmet_dependencies = [MemoryDep(name='buf0', index=192*c0 + c1 + 128, size=(24576, 64))]
+buf4.met_dependencies = [MemoryDep(name='primals_2', index=c1, size=(2048, 768))]
+buf4.group.device = cuda:0
+buf4.group.iteration = (1572864, 1)
+buf4.sizes = ([2048, 12, 64], [])
+class buf4_loop_body:
+    var_ranges = {z0: 2048, z1: 12, z2: 64}
+    index0 = 2304*z0 + 192*z1 + z2 + 128
+    index1 = 64*z1 + z2
+    index2 = 768*z0 + 64*z1 + z2
+    def body(self, ops):
+        get_index = self.get_index('index0')
+        load = ops.load('buf0', get_index)
+        get_index_1 = self.get_index('index1')
+        load_1 = ops.load('primals_2', get_index_1)
+        add = ops.add(load, load_1)
+        get_index_2 = self.get_index('index2')
+        store = ops.store('buf4', get_index_2, add, None)
+        return store
+
+

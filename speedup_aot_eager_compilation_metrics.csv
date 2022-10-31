@@ -1,0 +1,5 @@
+dev,name,batch_size,convert_frame_assert.<locals>._convert_frame_assert
+cuda,BertForMaskedLM,64,2.245531
+cuda,BertForMaskedLM,64,2.250306
+cuda,MegatronBertForCausalLM,2,10.106645
+cuda,resnet18,16,1.656379

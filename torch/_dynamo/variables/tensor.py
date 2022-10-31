@@ -203,7 +203,7 @@ class TensorVariable(VariableTracker):
                     example_value = _get_real_value(proxy.node, tx.output)
 
             else:
-                proxy.tracer.real_value_cache[proxy.node] = _clone_input(example_value)
+                # proxy.tracer.real_value_cache[proxy.node] = _clone_input(example_value)
                 if use_fake_tensors:
                     fake_wrapper = functools.partial(
                         wrap_to_fake_tensor_and_record, tx=tx
@@ -218,7 +218,7 @@ class TensorVariable(VariableTracker):
             else:
                 specialized_value = None
 
-            example_value = _clone_input(example_value)
+            # example_value = _clone_input(example_value)
             proxy.node.meta["example_value"] = example_value
             specialized_props = cls.specialize(example_value)
             if use_fake_tensors and isinstance(example_value, FakeTensor):

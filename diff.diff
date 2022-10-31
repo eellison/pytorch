@@ -1,0 +1,35 @@
+diff --git a/aten/src/ATen/cuda/detail/LazyNVRTC.cpp b/aten/src/ATen/cuda/detail/LazyNVRTC.cpp
+index 0e75c1842cb..80141865445 100644
+--- a/aten/src/ATen/cuda/detail/LazyNVRTC.cpp
++++ b/aten/src/ATen/cuda/detail/LazyNVRTC.cpp
+@@ -167,6 +167,7 @@ CUDA_STUB4(cuLinkCreate, unsigned int, CUjit_option *, void **, CUlinkState *);
+ CUDA_STUB3(cuLinkComplete, CUlinkState, void **, size_t *);
+ CUDA_STUB3(cuFuncSetAttribute, CUfunction, CUfunction_attribute, int);
+ CUDA_STUB3(cuFuncGetAttribute, int*, CUfunction_attribute, CUfunction);
++CUDA_STUB2(cuGraphKernelNodeGetParams, CUgraphNode, CUDA_KERNEL_NODE_PARAMS*)
+ 
+ // Irregularly shaped functions
+ CUresult CUDAAPI cuLaunchKernel(CUfunction f,
+diff --git a/aten/src/ATen/cuda/nvrtc_stub/ATenNVRTC.h b/aten/src/ATen/cuda/nvrtc_stub/ATenNVRTC.h
+index 5dbe49953cf..c8a37262638 100644
+--- a/aten/src/ATen/cuda/nvrtc_stub/ATenNVRTC.h
++++ b/aten/src/ATen/cuda/nvrtc_stub/ATenNVRTC.h
+@@ -57,7 +57,8 @@ namespace at { namespace cuda {
+   _(cuLinkAddData)                               \
+   _(cuLinkComplete)                              \
+   _(cuFuncSetAttribute)                          \
+-  _(cuFuncGetAttribute)
++  _(cuFuncGetAttribute)                          \
++  _(cuGraphKernelNodeGetParams)
+ 
+ #if defined(CUDA_VERSION) && CUDA_VERSION >= 11010
+ #define AT_FORALL_NVRTC(_) \
+@@ -110,7 +111,7 @@ namespace at { namespace cuda {
+   _(cuCtxGetCurrent)                              \
+   _(nvrtcGetLoweredName)                          \
+   _(cuModuleUnload)                               \
+-  _(cuDevicePrimaryCtxGetState)
++  _(cuDevicePrimaryCtxGetState)                   \
+ 
+ #endif
+ 

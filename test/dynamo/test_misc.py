@@ -1733,6 +1733,7 @@ class MiscTests(torch._dynamo.test_case.TestCase):
 
         mod = torch.nn.Linear(10, 10)
         x = torch.rand([10, 10])
+        x_ref = torch.rand()
         mod_weight_ref = weakref.ref(mod.weight)
         mod_ref = weakref.ref(mod)
 

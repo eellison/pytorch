@@ -1,0 +1,5 @@
+dev,name,batch_size,speedup,compilation_latency,compression_ratio
+cuda,BertForMaskedLM,64,0.9661,6.7151,0.9219
+cuda,BertForMaskedLM,64,0.9657,6.7436,0.9219
+cuda,MegatronBertForCausalLM,2,0.9225,31.2072,0.7614
+cuda,resnet18,16,1.0297,5.1964,0.7792

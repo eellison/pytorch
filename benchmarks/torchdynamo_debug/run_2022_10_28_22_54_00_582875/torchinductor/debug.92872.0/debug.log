@@ -1,0 +1,209 @@
+[logging.py:86 INFO] Step 3: torchinductor compiling FORWARDS graph 0
+[lowering.py:987 WARNING] using triton random, expect difference from eager
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf0'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf1'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf2'), SchedulerNode(name='buf3'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf4'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf5'), <class 'torch._inductor.codegen.triton.DisableReduction'>, SchedulerNode(name='buf417'), <class 'torch._inductor.codegen.triton.EnableReduction'>]
+[scheduler.py:1032 DEBUG] remove_buffer('buf1')
+[scheduler.py:1032 DEBUG] remove_buffer('buf3')
+[scheduler.py:1032 DEBUG] remove_buffer('buf2')
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf9')]
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf10')]
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf12'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf13'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf14'), SchedulerNode(name='buf416')]
+[scheduler.py:1032 DEBUG] remove_buffer('buf12')
+[scheduler.py:1032 DEBUG] remove_buffer('buf13')
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf15')]
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf17')]
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf19'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf20'), SchedulerNode(name='buf21'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf22'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf23'), <class 'torch._inductor.codegen.triton.DisableReduction'>, SchedulerNode(name='buf415'), <class 'torch._inductor.codegen.triton.EnableReduction'>]
+[scheduler.py:1032 DEBUG] remove_buffer('buf20')
+[scheduler.py:1032 DEBUG] remove_buffer('buf21')
+[scheduler.py:1032 DEBUG] remove_buffer('buf19')
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf25'), SchedulerNode(name='buf414')]
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf27'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf28'), SchedulerNode(name='buf29'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf30'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf31'), <class 'torch._inductor.codegen.triton.DisableReduction'>, SchedulerNode(name='buf413'), <class 'torch._inductor.codegen.triton.EnableReduction'>]
+[scheduler.py:1032 DEBUG] remove_buffer('buf27')
+[scheduler.py:1032 DEBUG] remove_buffer('buf28')
+[scheduler.py:1032 DEBUG] remove_buffer('buf29')
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf35')]
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf36')]
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf38'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf39'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf40'), SchedulerNode(name='buf412')]
+[scheduler.py:1032 DEBUG] remove_buffer('buf38')
+[scheduler.py:1032 DEBUG] remove_buffer('buf39')
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf41')]
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf43')]
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf45'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf46'), SchedulerNode(name='buf47'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf48'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf49'), <class 'torch._inductor.codegen.triton.DisableReduction'>, SchedulerNode(name='buf411'), <class 'torch._inductor.codegen.triton.EnableReduction'>]
+[scheduler.py:1032 DEBUG] remove_buffer('buf46')
+[scheduler.py:1032 DEBUG] remove_buffer('buf45')
+[scheduler.py:1032 DEBUG] remove_buffer('buf47')
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf51'), SchedulerNode(name='buf410')]
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf53'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf54'), SchedulerNode(name='buf55'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf56'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf57'), <class 'torch._inductor.codegen.triton.DisableReduction'>, SchedulerNode(name='buf409'), <class 'torch._inductor.codegen.triton.EnableReduction'>]
+[scheduler.py:1032 DEBUG] remove_buffer('buf55')
+[scheduler.py:1032 DEBUG] remove_buffer('buf53')
+[scheduler.py:1032 DEBUG] remove_buffer('buf54')
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf61')]
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf62')]
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf64'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf65'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf66'), SchedulerNode(name='buf408')]
+[scheduler.py:1032 DEBUG] remove_buffer('buf65')
+[scheduler.py:1032 DEBUG] remove_buffer('buf64')
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf67')]
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf69')]
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf71'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf72'), SchedulerNode(name='buf73'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf74'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf75'), <class 'torch._inductor.codegen.triton.DisableReduction'>, SchedulerNode(name='buf407'), <class 'torch._inductor.codegen.triton.EnableReduction'>]
+[scheduler.py:1032 DEBUG] remove_buffer('buf72')
+[scheduler.py:1032 DEBUG] remove_buffer('buf73')
+[scheduler.py:1032 DEBUG] remove_buffer('buf71')
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf77'), SchedulerNode(name='buf406')]
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf79'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf80'), SchedulerNode(name='buf81'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf82'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf83'), <class 'torch._inductor.codegen.triton.DisableReduction'>, SchedulerNode(name='buf405'), <class 'torch._inductor.codegen.triton.EnableReduction'>]
+[scheduler.py:1032 DEBUG] remove_buffer('buf80')
+[scheduler.py:1032 DEBUG] remove_buffer('buf81')
+[scheduler.py:1032 DEBUG] remove_buffer('buf79')
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf87')]
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf88')]
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf90'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf91'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf92'), SchedulerNode(name='buf404')]
+[scheduler.py:1032 DEBUG] remove_buffer('buf90')
+[scheduler.py:1032 DEBUG] remove_buffer('buf91')
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf93')]
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf95')]
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf97'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf98'), SchedulerNode(name='buf99'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf100'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf101'), <class 'torch._inductor.codegen.triton.DisableReduction'>, SchedulerNode(name='buf403'), <class 'torch._inductor.codegen.triton.EnableReduction'>]
+[scheduler.py:1032 DEBUG] remove_buffer('buf99')
+[scheduler.py:1032 DEBUG] remove_buffer('buf97')
+[scheduler.py:1032 DEBUG] remove_buffer('buf98')
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf103'), SchedulerNode(name='buf402')]
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf105'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf106'), SchedulerNode(name='buf107'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf108'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf109'), <class 'torch._inductor.codegen.triton.DisableReduction'>, SchedulerNode(name='buf401'), <class 'torch._inductor.codegen.triton.EnableReduction'>]
+[scheduler.py:1032 DEBUG] remove_buffer('buf105')
+[scheduler.py:1032 DEBUG] remove_buffer('buf106')
+[scheduler.py:1032 DEBUG] remove_buffer('buf107')
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf113')]
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf114')]
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf116'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf117'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf118'), SchedulerNode(name='buf400')]
+[scheduler.py:1032 DEBUG] remove_buffer('buf116')
+[scheduler.py:1032 DEBUG] remove_buffer('buf117')
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf119')]
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf121')]
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf123'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf124'), SchedulerNode(name='buf125'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf126'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf127'), <class 'torch._inductor.codegen.triton.DisableReduction'>, SchedulerNode(name='buf399'), <class 'torch._inductor.codegen.triton.EnableReduction'>]
+[scheduler.py:1032 DEBUG] remove_buffer('buf125')
+[scheduler.py:1032 DEBUG] remove_buffer('buf124')
+[scheduler.py:1032 DEBUG] remove_buffer('buf123')
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf129'), SchedulerNode(name='buf398')]
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf131'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf132'), SchedulerNode(name='buf133'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf134'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf135'), <class 'torch._inductor.codegen.triton.DisableReduction'>, SchedulerNode(name='buf397'), <class 'torch._inductor.codegen.triton.EnableReduction'>]
+[scheduler.py:1032 DEBUG] remove_buffer('buf132')
+[scheduler.py:1032 DEBUG] remove_buffer('buf131')
+[scheduler.py:1032 DEBUG] remove_buffer('buf133')
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf139')]
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf140')]
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf142'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf143'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf144'), SchedulerNode(name='buf396')]
+[scheduler.py:1032 DEBUG] remove_buffer('buf143')
+[scheduler.py:1032 DEBUG] remove_buffer('buf142')
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf145')]
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf147')]
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf149'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf150'), SchedulerNode(name='buf151'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf152'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf153'), <class 'torch._inductor.codegen.triton.DisableReduction'>, SchedulerNode(name='buf395'), <class 'torch._inductor.codegen.triton.EnableReduction'>]
+[scheduler.py:1032 DEBUG] remove_buffer('buf151')
+[scheduler.py:1032 DEBUG] remove_buffer('buf149')
+[scheduler.py:1032 DEBUG] remove_buffer('buf150')
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf155'), SchedulerNode(name='buf394')]
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf157'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf158'), SchedulerNode(name='buf159'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf160'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf161'), <class 'torch._inductor.codegen.triton.DisableReduction'>, SchedulerNode(name='buf393'), <class 'torch._inductor.codegen.triton.EnableReduction'>]
+[scheduler.py:1032 DEBUG] remove_buffer('buf159')
+[scheduler.py:1032 DEBUG] remove_buffer('buf158')
+[scheduler.py:1032 DEBUG] remove_buffer('buf157')
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf165')]
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf166')]
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf168'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf169'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf170'), SchedulerNode(name='buf392')]
+[scheduler.py:1032 DEBUG] remove_buffer('buf168')
+[scheduler.py:1032 DEBUG] remove_buffer('buf169')
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf171')]
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf173')]
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf175'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf176'), SchedulerNode(name='buf177'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf178'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf179'), <class 'torch._inductor.codegen.triton.DisableReduction'>, SchedulerNode(name='buf391'), <class 'torch._inductor.codegen.triton.EnableReduction'>]
+[scheduler.py:1032 DEBUG] remove_buffer('buf175')
+[scheduler.py:1032 DEBUG] remove_buffer('buf177')
+[scheduler.py:1032 DEBUG] remove_buffer('buf176')
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf181'), SchedulerNode(name='buf390')]
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf183'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf184'), SchedulerNode(name='buf185'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf186'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf187'), <class 'torch._inductor.codegen.triton.DisableReduction'>, SchedulerNode(name='buf389'), <class 'torch._inductor.codegen.triton.EnableReduction'>]
+[scheduler.py:1032 DEBUG] remove_buffer('buf183')
+[scheduler.py:1032 DEBUG] remove_buffer('buf184')
+[scheduler.py:1032 DEBUG] remove_buffer('buf185')
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf191')]
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf192')]
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf194'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf195'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf196'), SchedulerNode(name='buf388')]
+[scheduler.py:1032 DEBUG] remove_buffer('buf195')
+[scheduler.py:1032 DEBUG] remove_buffer('buf194')
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf197')]
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf199')]
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf201'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf202'), SchedulerNode(name='buf203'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf204'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf205'), <class 'torch._inductor.codegen.triton.DisableReduction'>, SchedulerNode(name='buf387'), <class 'torch._inductor.codegen.triton.EnableReduction'>]
+[scheduler.py:1032 DEBUG] remove_buffer('buf202')
+[scheduler.py:1032 DEBUG] remove_buffer('buf203')
+[scheduler.py:1032 DEBUG] remove_buffer('buf201')
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf207'), SchedulerNode(name='buf386')]
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf209'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf210'), SchedulerNode(name='buf211'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf212'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf213'), <class 'torch._inductor.codegen.triton.DisableReduction'>, SchedulerNode(name='buf385'), <class 'torch._inductor.codegen.triton.EnableReduction'>]
+[scheduler.py:1032 DEBUG] remove_buffer('buf211')
+[scheduler.py:1032 DEBUG] remove_buffer('buf210')
+[scheduler.py:1032 DEBUG] remove_buffer('buf209')
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf217')]
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf218')]
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf220'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf221'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf222'), SchedulerNode(name='buf384')]
+[scheduler.py:1032 DEBUG] remove_buffer('buf221')
+[scheduler.py:1032 DEBUG] remove_buffer('buf220')
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf223')]
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf225')]
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf227'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf228'), SchedulerNode(name='buf229'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf230'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf231'), <class 'torch._inductor.codegen.triton.DisableReduction'>, SchedulerNode(name='buf383'), <class 'torch._inductor.codegen.triton.EnableReduction'>]
+[scheduler.py:1032 DEBUG] remove_buffer('buf228')
+[scheduler.py:1032 DEBUG] remove_buffer('buf229')
+[scheduler.py:1032 DEBUG] remove_buffer('buf227')
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf233'), SchedulerNode(name='buf382')]
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf235'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf236'), SchedulerNode(name='buf237'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf238'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf239'), <class 'torch._inductor.codegen.triton.DisableReduction'>, SchedulerNode(name='buf381'), <class 'torch._inductor.codegen.triton.EnableReduction'>]
+[scheduler.py:1032 DEBUG] remove_buffer('buf235')
+[scheduler.py:1032 DEBUG] remove_buffer('buf236')
+[scheduler.py:1032 DEBUG] remove_buffer('buf237')
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf243')]
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf244')]
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf246'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf247'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf248'), SchedulerNode(name='buf380')]
+[scheduler.py:1032 DEBUG] remove_buffer('buf247')
+[scheduler.py:1032 DEBUG] remove_buffer('buf246')
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf249')]
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf251')]
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf253'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf254'), SchedulerNode(name='buf255'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf256'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf257'), <class 'torch._inductor.codegen.triton.DisableReduction'>, SchedulerNode(name='buf379'), <class 'torch._inductor.codegen.triton.EnableReduction'>]
+[scheduler.py:1032 DEBUG] remove_buffer('buf253')
+[scheduler.py:1032 DEBUG] remove_buffer('buf255')
+[scheduler.py:1032 DEBUG] remove_buffer('buf254')
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf259'), SchedulerNode(name='buf378')]
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf261'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf262'), SchedulerNode(name='buf263'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf264'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf265'), <class 'torch._inductor.codegen.triton.DisableReduction'>, SchedulerNode(name='buf377'), <class 'torch._inductor.codegen.triton.EnableReduction'>]
+[scheduler.py:1032 DEBUG] remove_buffer('buf262')
+[scheduler.py:1032 DEBUG] remove_buffer('buf261')
+[scheduler.py:1032 DEBUG] remove_buffer('buf263')
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf269')]
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf270')]
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf272'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf273'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf274'), SchedulerNode(name='buf376')]
+[scheduler.py:1032 DEBUG] remove_buffer('buf272')
+[scheduler.py:1032 DEBUG] remove_buffer('buf273')
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf275')]
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf277')]
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf279'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf280'), SchedulerNode(name='buf281'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf282'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf283'), <class 'torch._inductor.codegen.triton.DisableReduction'>, SchedulerNode(name='buf375'), <class 'torch._inductor.codegen.triton.EnableReduction'>]
+[scheduler.py:1032 DEBUG] remove_buffer('buf279')
+[scheduler.py:1032 DEBUG] remove_buffer('buf280')
+[scheduler.py:1032 DEBUG] remove_buffer('buf281')
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf285'), SchedulerNode(name='buf374')]
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf287'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf288'), SchedulerNode(name='buf289'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf290'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf291'), <class 'torch._inductor.codegen.triton.DisableReduction'>, SchedulerNode(name='buf373'), <class 'torch._inductor.codegen.triton.EnableReduction'>]
+[scheduler.py:1032 DEBUG] remove_buffer('buf287')
+[scheduler.py:1032 DEBUG] remove_buffer('buf289')
+[scheduler.py:1032 DEBUG] remove_buffer('buf288')
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf295')]
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf296')]
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf298'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf299'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf300'), SchedulerNode(name='buf372'), SchedulerNode(name='buf331'), SchedulerNode(name='buf334'), SchedulerNode(name='buf337'), SchedulerNode(name='buf340'), SchedulerNode(name='buf343'), SchedulerNode(name='buf346'), SchedulerNode(name='buf349'), SchedulerNode(name='buf352'), SchedulerNode(name='buf355'), SchedulerNode(name='buf358'), SchedulerNode(name='buf361'), SchedulerNode(name='buf364')]
+[scheduler.py:1032 DEBUG] remove_buffer('buf299')
+[scheduler.py:1032 DEBUG] remove_buffer('buf298')
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf301')]
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf303')]
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf305'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf306'), SchedulerNode(name='buf307'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf308'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf309'), <class 'torch._inductor.codegen.triton.DisableReduction'>, SchedulerNode(name='buf371'), <class 'torch._inductor.codegen.triton.EnableReduction'>]
+[scheduler.py:1032 DEBUG] remove_buffer('buf305')
+[scheduler.py:1032 DEBUG] remove_buffer('buf307')
+[scheduler.py:1032 DEBUG] remove_buffer('buf306')
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf311'), SchedulerNode(name='buf370')]
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf313'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf314'), SchedulerNode(name='buf315'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf316'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf317'), SchedulerNode(name='buf330'), SchedulerNode(name='buf332'), SchedulerNode(name='buf333'), SchedulerNode(name='buf335'), SchedulerNode(name='buf336'), SchedulerNode(name='buf338'), SchedulerNode(name='buf339'), SchedulerNode(name='buf341'), SchedulerNode(name='buf342'), SchedulerNode(name='buf344'), SchedulerNode(name='buf345'), SchedulerNode(name='buf347'), SchedulerNode(name='buf348'), SchedulerNode(name='buf350'), SchedulerNode(name='buf351'), SchedulerNode(name='buf353'), SchedulerNode(name='buf354'), SchedulerNode(name='buf356'), SchedulerNode(name='buf357'), SchedulerNode(name='buf359'), SchedulerNode(name='buf360'), SchedulerNode(name='buf362'), SchedulerNode(name='buf363'), SchedulerNode(name='buf365'), SchedulerNode(name='buf366'), <class 'torch._inductor.codegen.triton.DisableReduction'>, SchedulerNode(name='buf369'), <class 'torch._inductor.codegen.triton.EnableReduction'>]
+[scheduler.py:1032 DEBUG] remove_buffer('buf313')
+[scheduler.py:1032 DEBUG] remove_buffer('buf314')
+[scheduler.py:1032 DEBUG] remove_buffer('buf315')
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf319'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf320'), SchedulerNode(name='buf321'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf322'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf323'), SchedulerNode(name='buf368'), <class 'torch._inductor.codegen.triton.DisableReduction'>, SchedulerNode(name='buf367'), <class 'torch._inductor.codegen.triton.EnableReduction'>]
+[scheduler.py:1032 DEBUG] remove_buffer('buf319')
+[scheduler.py:1032 DEBUG] remove_buffer('buf321')
+[scheduler.py:1032 DEBUG] remove_buffer('buf320')
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf325'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf326'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf327')]
+[scheduler.py:1032 DEBUG] remove_buffer('buf326')
+[scheduler.py:1032 DEBUG] remove_buffer('buf325')
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf328'), <class 'torch._inductor.codegen.triton.DisableReduction'>, SchedulerNode(name='buf329'), <class 'torch._inductor.codegen.triton.EnableReduction'>]
+[graph.py:340 CODE] Output code: /tmp/torchinductor_eellison/ck/cckwild35x4rlltyxpmfdgjhzvee7pjvnq3hgyrztnvv2ikpsmq7.py
+[logging.py:86 INFO] Step 3: torchinductor done compiling FORWARDS graph 0
+[debug.py:272 WARNING] BertForMaskedLM_forward_0 debug trace: /scratch/eellison/work/pytorch/benchmarks/torchdynamo_debug/run_2022_10_28_22_54_00_582875/torchinductor/debug.92872.0

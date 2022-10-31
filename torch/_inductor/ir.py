@@ -2260,6 +2260,12 @@ class ExternKernel(InputsKernel):
             return pytree.tree_unflatten(new_args, args_spec)
 
         tensor_args = [cls.realize_input(x) for x in tensor_args]
+        # freeze layout otherwise our output stride calculation might
+        # become incorrect
+        for x in tensor_args:
+            as_storage_and_layout(
+                 x, freeze=True
+            )
 
         # freeze layout otherwise our output stride calculation might
         # become incorrect

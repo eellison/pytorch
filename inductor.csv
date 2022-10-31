@@ -1,0 +1,12 @@
+dev,name,batch_size,speedup,compilation_latency,compression_ratio
+cuda,BertForMaskedLM,64,1.0412,31.6621,0.9220
+cuda,BertForMaskedLM,64,1.0377,18.1809,0.9220
+cuda,BertForMaskedLM,64,0.9508,32.2830,0.9219
+cuda,MT5ForConditionalGeneration,2,1.6508,95.7968,0.6173
+cuda,DebertaForMaskedLM,4,1.0562,40.1085,1.0346
+cuda,DebertaForMaskedLM,4,1.0083,85.9044,0.3860
+cuda,MegatronBertForQuestionAnswering,8,1.2401,68.2029,0.7975
+cuda,MegatronBertForQuestionAnswering,8,1.2209,35.6250,0.9230
+cuda,MegatronBertForQuestionAnswering,8,1.2724,32.8544,0.8244
+cuda,MegatronBertForQuestionAnswering,8,1.2444,32.1689,0.9230
+cuda,MegatronBertForQuestionAnswering,8,1.2232,32.2163,0.9230

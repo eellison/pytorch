@@ -172,6 +172,9 @@ CUDA_STUB2(cuGraphKernelNodeSetParams, CUgraphNode, const CUDA_KERNEL_NODE_PARAM
 CUDA_STUB3(cuGraphExecKernelNodeSetParams, CUgraphExec, CUgraphNode, const CUDA_KERNEL_NODE_PARAMS*)
 CUDA_STUB4(cuGraphExecUpdate, CUgraphExec, CUgraph, CUgraphNode*, CUgraphExecUpdateResult*)
 CUDA_STUB1(cuGraphExecDestroy, CUgraphExec)
+CUDA_STUB3(cuGraphInstantiateWithFlags, CUgraphExec*, CUgraph, unsigned long long)
+CUDA_STUB2(cuGraphLaunch, CUgraphExec, CUstream)
+
 
 
 // Irregularly shaped functions

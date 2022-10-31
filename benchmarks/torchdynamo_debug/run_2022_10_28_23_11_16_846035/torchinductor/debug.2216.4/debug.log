@@ -1,0 +1,5 @@
+[logging.py:86 INFO] Step 3: torchinductor compiling FORWARDS graph 4
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf0')]
+[graph.py:340 CODE] Output code: /tmp/torchinductor_eellison/sh/cshv3tyoootghrdwri4bftqwgegno2m6dfl6aewlpyorrxw7a26y.py
+[logging.py:86 INFO] Step 3: torchinductor done compiling FORWARDS graph 4
+[debug.py:272 WARNING] DebertaForMaskedLM_inference_0 debug trace: /scratch/eellison/work/pytorch/benchmarks/torchdynamo_debug/run_2022_10_28_23_11_16_846035/torchinductor/debug.2216.4

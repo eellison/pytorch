@@ -63,7 +63,9 @@ namespace at { namespace cuda {
   _(cuGraphExecKernelNodeSetParams)              \
   _(cuGraphExecUpdate)                           \
   _(cuGraphInstantiate)                          \
-  _(cuGraphExecDestroy)
+  _(cuGraphExecDestroy)                          \
+  _(cuGraphInstantiateWithFlags)                 \
+  _(cuGraphLaunch)
 
 #if defined(CUDA_VERSION) && CUDA_VERSION >= 11010
 #define AT_FORALL_NVRTC(_) \

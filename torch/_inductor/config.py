@@ -83,11 +83,11 @@ class cpp:
     min_chunk_size = 4096
     cxx = (
         None,  # download gcc12 from conda-forge if conda is installed
+        "g++",
         "g++-12",
         "g++-11",
         "g++-10",
         "clang++",
-        "g++",
     )
 
 
@@ -95,7 +95,7 @@ class cpp:
 class triton:
 
     # Use cudagraphs on output code
-    cudagraphs = True
+    cudagraphs = False
 
     # choose conv backend, "aten" or "triton" or "autotune"
     convolution = "aten"

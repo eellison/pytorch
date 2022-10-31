@@ -1,0 +1,295 @@
+Operator: aten._log_softmax.default
+((T([16, 1000], f16), 1, False), {})
+
+Operator: aten._log_softmax_backward_data.default
+((T([16, 1000], f16), T([16, 1000], f16), 1, f16), {})
+
+Operator: aten._softmax.default
+((T([256, 4, 16, 16], f16), -1, False), {})
+
+((T([128, 8, 50, 64], f16, stride=(76800, 64, 1536, 1)), 2, False), {})
+
+Operator: aten._softmax_backward_data.default
+((T([256, 4, 256, 256], f16), T([256, 4, 256, 256], f16), -1, f16), {})
+
+Operator: aten.add.Tensor
+((T([256, 16, 240], f16), T([256, 16, 240], f16)), {})
+
+((T([64, 96, 32, 32], f16, stride=(196608, 1024, 32, 1)), T([64, 96, 32, 32], f16)), {})
+
+((T([128, 256, 7, 7], f16), T([128, 256, 7, 7], f16, stride=(50176, 49, 7, 1))), {})
+
+Operator: aten.cat.default
+(([T([64, 160, 8, 8], f16), T([64, 160, 8, 8], f16)], 1), {})
+
+Operator: aten.clone.default
+((T([64, 640, 8, 8], f16),), {})
+
+Operator: aten.copy_.default
+((T([1536, 384], f16), T([1536, 384], f16, stride=(1, 1536))), {})
+
+((T([64, 64, 8, 8], f16), T([64, 64, 8, 8], f16, stride=(4096, 1, 512, 64))), {})
+
+Operator: aten.div.Scalar
+((T([64, 640, 8, 8], f16, stride=(640, 1, 0, 0)), 64), {})
+
+Operator: aten.gelu.default
+((T([128, 196, 1536], f16),), {})
+
+Operator: aten.gelu_backward.default
+((T([128, 196, 1536], f16), T([128, 196, 1536], f16)), {})
+
+((T([64, 962, 1024], f16), T([64, 962, 1024], f16)), {})
+
+Operator: aten.lift_fresh_copy.default
+((T([16], i64),), {})
+
+Operator: aten.mean.dim
+((T([64, 640, 8, 8], f16), [-1, -2], True), {})
+
+((T([64, 196, 768], f16, stride=(151296, 768, 1)), [1]), {})
+
+Operator: aten.mul.Tensor
+((T([128, 196, 384], f16, stride=(75264, 1, 196)), T([128, 196, 384], f16, stride=(75264, 1, 196))), {})
+
+((T([256, 4, 16, 16], f16), 0.12909944487358058), {})
+
+((T([128, 256, 16, 16], f16), T([128, 256, 16, 16], f16, stride=(256, 1, 0, 0))), {})
+
+Operator: aten.native_layer_norm.default
+((T([256, 16, 240], f16), [240], T([240], f16), T([240], f16), 1e-05), {})
+
+((T([64, 65, 1024], f16), [1024], T([1024], f16), T([1024], f16), 1e-06), {})
+
+Operator: aten.native_layer_norm_backward.default
+((T([256, 64, 192], f16), T([256, 64, 192], f16), [192], T([256, 64, 1], f32), T([256, 64, 1], f32), T([192], f16), T([192], f16), [True, True, True]), {})
+
+((T([256, 256, 144], f16), T([256, 256, 144], f16), [144], T([256, 256, 1], f32), T([256, 256, 1], f32), T([144], f16), T([144], f16), [True, True, True]), {})
+
+Operator: aten.select_backward.default
+((T([64, 1024], f16), [64, 1, 1024], 1, 0), {})
+
+Operator: aten.slice_backward.default
+((T([128, 38, 56, 56], f16), [128, 38, 56, 56], 0, 0, 9223372036854775807, 1), {})
+
+((T([128, 27, 56, 56], f16, stride=(119168, 3136, 56, 1)), [128, 38, 56, 56], 1, 0, 27, 1), {})
+
+Operator: aten.stack.default
+(([T([256, 4, 256, 36], f16), T([256, 4, 256, 36], f16, stride=(36864, 9216, 1, 256)), T([256, 4, 256, 36], f16)],), {})
+
+Operator: aten.sum.dim_IntList
+((T([65536, 432], f16), [0], True), {})
+
+((T([64, 256, 31, 31], f16, stride=(246272, 1, 7936, 256)), [0], True), {})
+
+Operator: aten.unbind.int
+((T([3, 256, 4, 16, 60], f16, stride=(240, 11520, 60, 720, 1)),), {})
+
+Operator: aten.upsample_bicubic2d.vec
+((T([64, 3, 240, 240], f16), [224, 224], False, None), {})
+
+Operator: aten.native_batch_norm.default
+((T([1, 384, 1536], f16), T([384], f16), None, None, None, True, 0.0, 1e-05), {})
+
+((T([64, 640, 8, 8], f16), T([640], f16), T([640], f16), T([640], f16), T([640], f16), True, 0.1, 1e-05), {})
+
+Operator: aten.native_batch_norm_backward.default
+((T([64, 16, 128, 128], f16), T([64, 16, 128, 128], f16), T([16], f16), T([16], f16), T([16], f16), T([16], f32), T([16], f32), True, 1e-05, [True, True, True]), {})
+
+((T([16, 108, 83, 83], f16), T([16, 108, 83, 83], f16), T([108], f16), T([108], f16), T([108], f16), T([108], f32), T([108], f32), True, 0.001, [True, True, True]), {})
+
+Operator: aten.sigmoid.default
+((T([128, 1044, 1, 1], f16),), {})
+
+Operator: aten.sigmoid_backward.default
+((T([128, 228, 1, 1], f16), T([128, 228, 1, 1], f16)), {})
+
+((T([128, 300, 1, 1], f16), T([128, 300, 1, 1], f16)), {})
+
+Operator: aten.silu_.default
+((T([64, 640, 8, 8], f16),), {})
+
+Operator: aten.silu_backward.default
+((T([64, 64, 128, 128], f16), T([64, 64, 128, 128], f16)), {})
+
+((T([64, 16, 128, 128], f16), T([64, 16, 128, 128], f16)), {})
+
+((T([64, 384, 192], f16), T([64, 384, 192], f16, stride=(147456, 384, 1))), {})
+
+Operator: aten.add_.Tensor
+((T([32, 512, 7, 7], f16, stride=(25088, 1, 3584, 512)), T([32, 512, 7, 7], f16, stride=(25088, 1, 3584, 512))), {})
+
+((T([32, 320, 14, 14], f16, stride=(62720, 1, 4480, 320)), T([32, 320, 14, 14], f16, stride=(62720, 1, 4480, 320))), {})
+
+Operator: aten.hardsigmoid.default
+((T([128, 1104, 1, 1], f16),), {})
+
+Operator: aten.hardsigmoid_backward.default
+((T([128, 720, 1, 1], f16), T([128, 720, 1, 1], f16)), {})
+
+((T([128, 360, 1, 1], f16), T([128, 360, 1, 1], f16)), {})
+
+Operator: aten.new_empty_strided.default
+((T([1536, 384], f16, stride=(1, 1536)), [1536, 384], [384, 1]), {'dtype': f16, 'layout': torch.strided, 'device': 'cuda'})
+
+Operator: aten.new_zeros.default
+((T([32, 1024], f16), [32768]), {})
+
+Operator: aten.relu_.default
+((T([128, 87, 1, 1], f16),), {})
+
+Operator: aten.threshold_backward.default
+((T([128, 25, 1, 1], f16), T([128, 25, 1, 1], f16), 0), {})
+
+((T([128, 64, 28, 28], f16, stride=(200704, 784, 28, 1)), T([128, 64, 28, 28], f16), 0), {})
+
+Operator: aten.im2col.default
+((T([64, 192, 28, 28], f16, stride=(150528, 1, 5376, 192)), [3, 3], [1, 1], [1, 1], [2, 2]), {})
+
+Operator: aten.leaky_relu_.default
+((T([64, 512, 8, 8], f16),), {})
+
+Operator: aten.leaky_relu_backward.default
+((T([64, 128, 128, 128], f16), T([64, 128, 128, 128], f16), 0.01, True), {})
+
+((T([64, 32, 256, 256], f16), T([64, 32, 256, 256], f16), 0.01, True), {})
+
+Operator: aten.relu.default
+((T([16, 4320, 11, 11], f16),), {})
+
+Operator: aten.upsample_nearest2d.vec
+((T([128, 72, 7, 7], f16), None, [2.0, 2.0]), {})
+
+Operator: aten.upsample_nearest2d_backward.vec
+((T([128, 18, 56, 56], f16), None, [128, 18, 28, 28], [2.0, 2.0]), {})
+
+Operator: aten.avg_pool2d.default
+((T([128, 1536, 14, 14], f16), [2, 2], [2, 2], [0, 0], True, False), {})
+
+((T([128, 256, 14, 14], f16, stride=(200704, 196, 14, 1)), [3, 3], [2, 2], [1, 1]), {})
+
+Operator: aten.avg_pool2d_backward.default
+((T([128, 512, 14, 14], f16), T([128, 512, 28, 28], f16), [2, 2], [2, 2], [0, 0], True, False, None), {})
+
+((T([128, 256, 28, 28], f16), T([128, 256, 56, 56], f16), [2, 2], [2, 2], [0, 0], True, False, None), {})
+
+((T([128, 32, 56, 56], f16, stride=(401408, 3136, 56, 1)), T([128, 32, 56, 56], f16, stride=(401408, 3136, 56, 1)), [3, 3], [1, 1], [1, 1], False, True, None), {})
+
+Operator: aten.constant_pad_nd.default
+((T([16, 54, 171, 171], f16), [-3, -3, -3, -3]), {})
+
+((T([64, 240, 14, 14], f16, stride=(188160, 196, 14, 1)), [3, 4, 3, 4], 0.0), {})
+
+Operator: aten.max_pool2d_with_indices.default
+((T([16, 864, 11, 11], f16), [3, 3], [1, 1], [1, 1]), {})
+
+Operator: aten.max_pool2d_with_indices_backward.default
+((T([16, 108, 42, 42], f16, stride=(952560, 1764, 42, 1)), T([16, 108, 85, 85], f16), [3, 3], [2, 2], [0, 0], [1, 1], False, T([16, 108, 42, 42], i64)), {})
+
+((T([16, 96, 83, 83], f16), T([16, 96, 167, 167], f16), [3, 3], [2, 2], [0, 0], [1, 1], False, T([16, 96, 83, 83], i64)), {})
+
+Operator: aten.split_with_sizes.default
+((T([128, 640, 8, 8], f16), [64, 64, 512], 1), {})
+
+((T([128, 512, 7, 7], f16, stride=(76800, 1, 10752, 1536)), [128, 192, 192], 1), {})
+
+Operator: aten.silu.default
+((T([64, 196, 768], f16, stride=(301056, 1536, 1)),), {})
+
+((T([256, 16, 480], f16),), {})
+
+Operator: aten.split.Tensor
+((T([128, 1024, 7, 7], f16), 256, 1), {})
+
+Operator: aten.hardswish_.default
+((T([128, 1984, 1, 1], f16),), {})
+
+Operator: aten.hardswish_backward.default
+((T([128, 64, 112, 112], f16), T([128, 64, 112, 112], f16)), {})
+
+((T([128, 64, 56, 56], f16), T([128, 64, 56, 56], f16)), {})
+
+Operator: aten.bernoulli_.float
+((T([64, 1, 1, 1], f16),), {})
+
+Operator: aten.div_.Tensor
+((T([64, 1, 1, 1], f16), 0.5), {})
+
+Operator: aten.new_empty.default
+((T([64, 1, 196, 512], f16), [64, 1, 1, 1]), {'dtype': f16, 'layout': torch.strided, 'device': 'cuda', 'pin_memory': False})
+
+Operator: aten.roll.default
+((T([64, 56, 56, 128], f16), [3, 3], [2, 1]), {})
+
+Operator: aten.mul_.Tensor
+((T([128, 3072, 6, 6], f16), 1.7015043497085571), {})
+
+((T([128, 768, 6, 6], f16), 1.7015043497085571), {})
+
+Operator: aten.sum.default
+((T([128, 256, 48, 48], f16),), {})
+
+Operator: aten.elu.default
+((T([32, 2688, 7, 7], f16), 1.0), {})
+
+Operator: aten.elu_backward.default
+((T([32, 2688, 7, 7], f16), 1.0, 1, 1, False, T([32, 2688, 7, 7], f16)), {})
+
+Operator: aten.hardtanh_.default
+((T([128, 1280, 7, 7], f16), 0.0, 6.0), {})
+
+Operator: aten.hardtanh_backward.default
+((T([128, 228, 28, 28], f16), T([128, 228, 28, 28], f16), 0.0, 6.0), {})
+
+((T([128, 162, 56, 56], f16), T([128, 162, 56, 56], f16), 0.0, 6.0), {})
+
+Operator: aten.div.Tensor
+((T([64, 1000], f16), 2), {})
+
+Operator: aten.hardswish.default
+((T([128, 16, 384], f16),), {})
+
+Operator: aten.as_strided_.default
+((T([32, 1024, 1, 1], f16), [32, 1024, 1, 1], [1024, 1, 1024, 1024]), {})
+
+Operator: aten.col2im.default
+((T([64, 1728, 196], f16), [28, 28], [3, 3], [1, 1], [1, 1], [2, 2]), {})
+
+Operator: aten.max.dim
+((T([64, 196, 1000], f16), 1), {})
+
+Operator: aten.scatter.src
+((T([64, 196, 1000], f16), 1, T([64, 1, 1000], i64), T([64, 1, 1000], f16)), {})
+
+Operator: aten.native_group_norm.default
+((T([64, 768, 7, 7], f16), T([768], f16), T([768], f16), 64, 768, 49, 1, 1e-05), {})
+
+Operator: aten.native_group_norm_backward.default
+((T([64, 96, 56, 56], f16), T([64, 96, 56, 56], f16), T([64, 1], f16), T([64, 1], f16), T([96], f16), 64, 96, 3136, 1, [True, True, True]), {})
+
+Operator: aten.neg.default
+((T([32, 128, 56, 56], f16, stride=(401408, 1, 7168, 128)),), {})
+
+Operator: aten.sub.Tensor
+((T([32, 512, 14, 14], f16, stride=(100352, 1, 7168, 512)), T([32, 1, 14, 14], f16)), {})
+
+((T([32, 256, 28, 28], f16, stride=(200704, 1, 7168, 256)), T([32, 1, 28, 28], f16)), {})
+
+Operator: aten.mul.Scalar
+((T([1, 1, 384], f16), 1), {})
+
+Operator: aten.pow.Tensor_Scalar
+((T([32, 1, 56, 56], f16), 3), {})
+
+Operator: aten.rsqrt.default
+((T([32, 1, 14, 14], f16),), {})
+
+Operator: aten.var_mean.correction
+((T([32, 512, 14, 14], f16, stride=(100352, 1, 7168, 512)), [1]), {'correction': 0, 'keepdim': True})
+
+Operator: aten.hardtanh.default
+((T([128, 1044, 7, 7], f16), 0.0, 6.0), {})
+
+Operator: aten.addcmul.default
+((T([1, 1, 384], f16), T([1, 1, 384], f16), T([128, 196, 384], f16, stride=(75264, 1, 196))), {})
+

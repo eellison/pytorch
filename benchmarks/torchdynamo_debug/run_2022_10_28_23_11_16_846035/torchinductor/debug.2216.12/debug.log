@@ -1,0 +1,7 @@
+[logging.py:86 INFO] Step 3: torchinductor compiling FORWARDS graph 12
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf0'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf1'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf2'), <class 'torch._inductor.codegen.triton.DisableReduction'>, <class 'torch._inductor.codegen.triton.EnableReduction'>, SchedulerNode(name='buf3'), <class 'torch._inductor.codegen.triton.DisableReduction'>, SchedulerNode(name='buf4'), <class 'torch._inductor.codegen.triton.EnableReduction'>]
+[scheduler.py:1032 DEBUG] remove_buffer('buf0')
+[scheduler.py:1032 DEBUG] remove_buffer('buf2')
+[graph.py:340 CODE] Output code: /tmp/torchinductor_eellison/vj/cvj7axhkyigpet24uqzzgeeol7c4deyduscg33z3uswvqmpa7zqj.py
+[logging.py:86 INFO] Step 3: torchinductor done compiling FORWARDS graph 12
+[debug.py:272 WARNING] DebertaForMaskedLM_forward_0 debug trace: /scratch/eellison/work/pytorch/benchmarks/torchdynamo_debug/run_2022_10_28_23_11_16_846035/torchinductor/debug.2216.12

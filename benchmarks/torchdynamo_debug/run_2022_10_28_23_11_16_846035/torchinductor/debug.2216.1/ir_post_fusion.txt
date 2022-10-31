@@ -1,0 +1,45 @@
+buf1: SchedulerNode(ComputedBuffer)
+buf1.writes = [MemoryDep(name='buf1', index=c0, size=(393216,))]
+buf1.unmet_dependencies = []
+buf1.met_dependencies = 
+    [   MemoryDep(name='primals_4', index=c1 + 768*load(primals_5, d0), size=(512, 768)),
+        MemoryDep(name='primals_5', index=c0, size=(512, 768))]
+buf1.group.device = cuda:0
+buf1.group.iteration = (393216, 1)
+buf1.sizes = ([512, 768], [])
+class buf1_loop_body:
+    var_ranges = {z0: 512, z1: 768}
+    index0 = z0
+    index1 = 768*indirect0 + z1
+    index2 = 768*z0 + z1
+    def body(self, ops):
+        get_index = self.get_index('index0')
+        load = ops.load('primals_5', get_index)
+        set_indirect0 = self.set_indirect0(load)
+        get_index_1 = self.get_index('index1')
+        load_1 = ops.load('primals_4', get_index_1)
+        get_index_2 = self.get_index('index2')
+        store = ops.store('buf1', get_index_2, load_1, None)
+        return store
+
+
+buf0_buf2_buf3_buf4_buf5_buf6: FusedSchedulerNode(NoneType)
+buf0_buf2_buf3_buf4_buf5_buf6.writes = 
+    [   MemoryDep(name='buf0', index=c0, size=(1572864,)),
+        MemoryDep(name='buf2', index=c0, size=(2048, 768)),
+        MemoryDep(name='buf2', index=c0, size=(2048,)),
+        MemoryDep(name='buf3', index=c0, size=(2048, 768)),
+        MemoryDep(name='buf3', index=c0, size=(2048,)),
+        MemoryDep(name='buf4', index=c0, size=(1572864,)),
+        MemoryDep(name='buf5', index=c0, size=(2048,)),
+        MemoryDep(name='buf6', index=c0, size=(2048,))]
+buf0_buf2_buf3_buf4_buf5_buf6.unmet_dependencies = [MemoryDep(name='buf1', index=c1, size=(4, 393216))]
+buf0_buf2_buf3_buf4_buf5_buf6.met_dependencies = 
+    [   MemoryDep(name='primals_1', index=c1, size=(2048, 768)),
+        MemoryDep(name='primals_2', index=c1, size=(2048, 768)),
+        MemoryDep(name='primals_3', index=c1 + 768*load(primals_6, d0), size=(2048, 768)),
+        MemoryDep(name='primals_6', index=c0, size=(2048, 768)),
+        MemoryDep(name='primals_7', index=c0, size=(2048, 768))]
+buf0_buf2_buf3_buf4_buf5_buf6.snodes = ['buf0', 'buf2', 'buf3', 'buf4', 'buf5', 'buf6']
+
+

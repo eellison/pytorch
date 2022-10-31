@@ -1,0 +1,5 @@
+[logging.py:86 INFO] Step 1: torchinductor compiling FORWARDS graph None
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf0')]
+[graph.py:340 CODE] Output code: /tmp/torchinductor_eellison/ad/cadier26anzoo3prnprioob3cahdnm6dd7n37o7ns47idjrm52gh.py
+[logging.py:86 INFO] Step 1: torchinductor done compiling FORWARDS graph None
+[debug.py:272 WARNING] model__0 debug trace: /scratch/eellison/work/pytorch/torchdynamo_debug/run_2022_10_29_19_18_12_804292/torchinductor/debug.76991.0

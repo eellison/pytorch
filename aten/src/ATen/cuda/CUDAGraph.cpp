@@ -163,13 +163,17 @@ void CUDAGraph::capture_end() {
     // Trailing NULL, NULL, 0 arguments were recommended by Cuda driver people,
     // who prefer not to report error message through these arguments moving forward
     // (they prefer return value, or errors on api calls internal to the capture)
-    AT_CUDA_CHECK(cudaGraphInstantiate(&graph_exec_, graph_, NULL, NULL, 0));
+    AT_CUDA_DRIVER_CHECK(at::globalContext().getNVRTC().cuGraphInstantiate(&graph_exec_, graph_, NULL, NULL, 0));
+    // AT_CUDA_CHECK(cudaGraphInstantiate(&graph_exec_, graph_, NULL, NULL, 0));
 #if CUDA_VERSION >= 11040
   } else {
-    AT_CUDA_CHECK(cudaGraphInstantiateWithFlags(&graph_exec_,
-                                                graph_,
-                                                cudaGraphInstantiateFlagAutoFreeOnLaunch));
-  }
+    // AT_CUDA_CHECK(cudaGraphInstantiateWithFlags(&graph_exec_,
+    //                                             graph_,
+    //                                             cudaGraphInstantiateFlagAutoFreeOnLaunch));
+    AT_CUDA_DRIVER_CHECK(at::globalContext().getNVRTC().cuGraphInstantiateWithFlags(&graph_exec_,
+                                            graph_,
+                                            CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH));                       
+}
 #endif
 
   has_graph_exec_ = true;
@@ -185,7 +189,6 @@ void CUDAGraph::capture_end() {
   // Now that we've instantiated graph_ into graph_exec_,
   // we don't need graph_ anymore.
   if (!preserve_graph_) {
-  has_graph_ = false;
     AT_CUDA_CHECK(cudaGraphDestroy(graph_));
     has_graph_ = false;
   }
@@ -213,7 +216,8 @@ void CUDAGraph::replay() {
   offset_extragraph_.fill_(int64_t(rng_engine_inputs.offset_.val));
 
   // graph_exec_ may be replayed in any stream.
-  AT_CUDA_CHECK(cudaGraphLaunch(graph_exec_, at::cuda::getCurrentCUDAStream()));
+  AT_CUDA_DRIVER_CHECK(at::globalContext().getNVRTC().cuGraphLaunch(graph_exec_, at::cuda::getCurrentCUDAStream()));
+  // AT_CUDA_CHECK(cudaGraphLaunch(graph_exec_, at::cuda::getCurrentCUDAStream()));
 
   int version;
   AT_CUDA_CHECK(cudaDriverGetVersion(&version));
@@ -255,10 +259,10 @@ void CUDAGraph::reset() {
     c10::cuda::CUDACachingAllocator::notifyCaptureDestroy(capture_dev_, mempool_id_);
   }
   if (has_graph_) {
-    C10_CUDA_CHECK_WARN(cudaGraphDestroy(graph_));
+    // C10_CUDA_CHECK_WARN(cudaGraphDestroy(graph_));
   }
   if (has_graph_exec_) {
-    C10_CUDA_CHECK_WARN(cudaGraphExecDestroy(graph_exec_));
+    // C10_CUDA_CHECK_WARN(cudaGraphExecDestroy(graph_exec_));
   }
 #else
   TORCH_CHECK(false, "CUDA graphs may only be used in Pytorch built with CUDA >= 11.0 and not yet supported on ROCM");
@@ -405,17 +409,74 @@ void CUDAGraph::update_params(std::vector<Tensor> old_params, std::vector<Tensor
   CUDA_KERNEL_NODE_PARAMS kparams = {0};
   (at::globalContext().getNVRTC().cuGraphKernelNodeGetParams(node, &kparams));
 
-  kparams.kernelParams[0] = new_params[0].data_ptr();
-  kparams.kernelParams[1] = new_params[1].data_ptr();
-  const CUDA_KERNEL_NODE_PARAMS kparams_2 = kparams;
+  CUDA_KERNEL_NODE_PARAMS kparams_copy = kparams;
+  // "new print"
+  std::cout<<get_node_info(node) << '\n';
+  std::stringstream ss;
+  ss << "GPUKernel@" << kparams_copy.func;
+      ss << "<<<gridDim=(" << kparams_copy.gridDimX << ", "<< kparams_copy.gridDimY << ", " << kparams_copy.gridDimZ << "), "
+         << "blockDim=(" << kparams_copy.blockDimX << ", "<< kparams_copy.blockDimY << ", "<< kparams_copy.blockDimZ << ")>>>";
+      ss << "(";
+  
+  std::cout << ss.str();
+  std::cout << "Updating node " << reinterpret_cast<int64_t>(new_params[0].data_ptr()) << "\n";
 
-  CUDA_KERNEL_NODE_PARAMS new_kparams = {0};
-  std::vector<int64_t> new_kparams;
+  // void* vec =malloc
+  int64_t * vec = reinterpret_cast<int64_t*>(malloc(4 * sizeof(int64_t)));
+
+  // std::vector<void*> vec(4);
+  kparams_copy.kernelParams = reinterpret_cast<void**>(vec);
+
+  std::stringstream ss2;
   int64_t address_start = 1024;
-  for(int64_t i=0; (int64_t)kparams.kernelParams[i] > address_start; i++) {
-    void *ptr = *(void**)kparams.kernelParams[i];
-    ss << reinterpret_cast<int64_t>(ptr) << ", ";
+  // (int64_t)kparams.kernelParams[i] > address_start &&
+  for(int64_t i=0; i < 4; i++) {
+    vec[i] = reinterpret_cast<int64_t>(kparams.kernelParams[i]);
+
+    // void *ptr = *(void**)kparams.kernelParams[i];
+    // ss2 << "orig: " << reinterpret_cast<int64_t>(ptr) << ", ";
+    // void *ptr2 = *(void**)kparams_copy.kernelParams[i];
+    // ss2 << "new: " << reinterpret_cast<int64_t>(ptr2) << ", ";
+    // void *ptr = *(void**)kparams_copy.kernelParams[i];
+    // ss2 << reinterpret_cast<int64_t>(ptr) << ", ";
   }
+
+  void *ptr = *(void**)kparams_copy.kernelParams[0];
+  int64_t ptr_val = reinterpret_cast<int64_t>(ptr);
+  std::cout << "\n" << ptr_val << " \n ";
+
+  // need to store a reference to the pointer 
+  // vec[0] = reinterpret_cast<int64_t>(old_params[0].data_ptr());
+
+  for(int64_t i=0; (int64_t)kparams_copy.kernelParams[i] > address_start; i++) {
+    void *ptr = *(void**)kparams_copy.kernelParams[i];
+    std::cout << reinterpret_cast<int64_t>(ptr) << ", ";
+  }
+
+
+
+  // std::cout << "K params Copy : " << kparams.kernelParams[0] << " and data ptr " <<  reinterpret_cast<int64_t>(old_params[0].data_ptr()) << " \n";
+
+  // std::cout << kparams_copy.
+  // kparams_copy.kernelParams[0] = new_params[0].data_ptr();
+  // kparams_copy.kernelParams[1] = new_params[1].data_ptr();
+
+  // ss2 << ")";
+  // std::cout << ss2.str();
+  // // std::cout<<get_node_info(node) << '\n';
+  // return;
+
+
+  // kparams.kernelParams[1] = new_params[1].data_ptr();
+  // const CUDA_KERNEL_NODE_PARAMS kparams_2 = kparams;
+
+  // CUDA_KERNEL_NODE_PARAMS new_kparams = {0};
+  // std::vector<int64_t> new_kparams;
+  // int64_t address_start = 1024;
+  // for(int64_t i=0; (int64_t)kparams.kernelParams[i] > address_start; i++) {
+  //   void *ptr = *(void**)kparams.kernelParams[i];
+  //   ss << reinterpret_cast<int64_t>(ptr) << ", ";
+  // }
 
 
 
@@ -425,19 +486,19 @@ void CUDAGraph::update_params(std::vector<Tensor> old_params, std::vector<Tensor
   auto nvrt = at::globalContext().getNVRTC();
 
   // const cudaKernelNodeParams* const_params = reinterpret_cast<const cudaKernelNodeParams*>(&kparams);
-  std::cout << "1\n"
-  AT_CUDA_DRIVER_CHECK(at::globalContext().getNVRTC().cuGraphExecKernelNodeSetParams(graph_exec_, node, &kparams_2));
-  std::cout << "2\n"
+  std::cout << "1\n";
+  AT_CUDA_DRIVER_CHECK(at::globalContext().getNVRTC().cuGraphKernelNodeSetParams(node, &kparams_copy));
+  std::cout << "2\n";
+  AT_CUDA_DRIVER_CHECK(at::globalContext().getNVRTC().cuGraphExecKernelNodeSetParams(graph_exec_, node, &kparams_copy));
   // the following segfaults
-  AT_CUDA_DRIVER_CHECK(at::globalContext().getNVRTC().cuGraphKernelNodeSetParams(node, &kparams_2));
   // checkCudaErrors(cudaGraphExecKernelNodeSetParams(graph_exec_, node, const_params));
   // checkCudaErrors(cudaGraphKernelNodeSetParams(node, const_params));
-  std::cout << "3\n"
+  std::cout << "3\n";
   cudaGraphExecUpdateResult updateResult;
   cudaGraphNode_t errorNode;
   // First we try to update the graph as this is much cheaper than re-instantiation
   checkCudaErrors(cudaGraphExecUpdate(graph_exec_, graph_, &errorNode, &updateResult));
-  std::cout << "3\n"
+  std::cout << "4\n";
   if (graph_exec_ == nullptr || updateResult != cudaGraphExecUpdateSuccess) {
     // The update is unsuccessful, need to re-instantiate
     cudaGetLastError(); // <- Clear the error state
@@ -447,7 +508,7 @@ void CUDAGraph::update_params(std::vector<Tensor> old_params, std::vector<Tensor
   } else {
     AT_CUDA_DRIVER_CHECK(at::globalContext().getNVRTC().cuGraphInstantiate(&graph_exec_, graph_, NULL, NULL, 0));
   }
-
+  std::cout << "5\n";
 
   // for(int64_t i=0; i < 3; i++) {
   //       void *ptr = *(void**)kparams.kernelParams[i];

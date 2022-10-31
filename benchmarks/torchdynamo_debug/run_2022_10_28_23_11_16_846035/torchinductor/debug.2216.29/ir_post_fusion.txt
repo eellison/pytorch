@@ -1,0 +1,14 @@
+buf0_buf1_buf2: FusedSchedulerNode(NoneType)
+buf0_buf1_buf2.writes = 
+    [   MemoryDep(name='buf0', index=c0, size=(24576, 512)),
+        MemoryDep(name='buf0', index=c0, size=(24576,)),
+        MemoryDep(name='buf1', index=c0, size=(24576, 512)),
+        MemoryDep(name='buf1', index=c0, size=(24576,)),
+        MemoryDep(name='buf2', index=c0, size=(12582912,))]
+buf0_buf1_buf2.unmet_dependencies = []
+buf0_buf1_buf2.met_dependencies = 
+    [   MemoryDep(name='arg0_1', index=c0, size=(12582912,)),
+        MemoryDep(name='arg1_1', index=262144*c0 + c2, size=(4, 12, 262144))]
+buf0_buf1_buf2.snodes = ['buf0', 'buf1', 'buf2']
+
+

@@ -1,0 +1,7 @@
+[logging.py:86 INFO] Step 3: torchinductor compiling FORWARDS graph 41
+[lowering.py:987 WARNING] using triton random, expect difference from eager
+[triton.py:1228 CODE] schedule: [SchedulerNode(name='buf0'), SchedulerNode(name='buf1')]
+[scheduler.py:1032 DEBUG] remove_buffer('buf0')
+[graph.py:340 CODE] Output code: /tmp/torchinductor_eellison/bq/cbqfbxmkd3ee247aicnaozxm275jxtrklahk5fuy7ekzylsxckee.py
+[logging.py:86 INFO] Step 3: torchinductor done compiling FORWARDS graph 41
+[debug.py:272 WARNING] DebertaForMaskedLM_inference_0 debug trace: /scratch/eellison/work/pytorch/benchmarks/torchdynamo_debug/run_2022_10_28_23_11_16_846035/torchinductor/debug.2216.41

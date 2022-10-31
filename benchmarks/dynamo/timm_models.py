@@ -23,7 +23,7 @@ try:
     importlib.import_module("timm")
 except ModuleNotFoundError:
     print("Installing Pytorch Image Models...")
-    pip_install("git+https://github.com/rwightman/pytorch-image-models")
+    # pip_install("git+https://github.com/rwightman/pytorch-image-models")
 finally:
     from timm.data import resolve_data_config
     from timm.models import create_model
@@ -213,7 +213,8 @@ class TimmRunnner(BenchmarkRunner):
                     # drop_block_rate=kwargs.pop('drop_block', None),
                 )
                 success = True
-            except Exception:
+            except Exception as e:
+                breakpoint()
                 wait = retries * 30
                 time.sleep(wait)
                 retries += 1

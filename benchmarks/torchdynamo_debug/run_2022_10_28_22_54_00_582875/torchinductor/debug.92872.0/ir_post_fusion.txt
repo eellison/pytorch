@@ -1,0 +1,2517 @@
+buf0_buf1_buf2_buf3_buf4_buf5_buf417: FusedSchedulerNode(NoneType)
+buf0_buf1_buf2_buf3_buf4_buf5_buf417.writes = 
+    [   MemoryDep(name='buf0', index=c0, size=(6291456,)),
+        MemoryDep(name='buf1', index=c0, size=(8192, 768)),
+        MemoryDep(name='buf1', index=c0, size=(8192,)),
+        MemoryDep(name='buf2', index=c0, size=(8192, 768)),
+        MemoryDep(name='buf2', index=c0, size=(8192,)),
+        MemoryDep(name='buf3', index=c0, size=(8192, 768)),
+        MemoryDep(name='buf3', index=c0, size=(8192,)),
+        MemoryDep(name='buf4', index=c0, size=(6291456,)),
+        MemoryDep(name='buf417', index=c0, size=(8192,)),
+        MemoryDep(name='buf5', index=c0, size=(6291456,))]
+buf0_buf1_buf2_buf3_buf4_buf5_buf417.unmet_dependencies = []
+buf0_buf1_buf2_buf3_buf4_buf5_buf417.met_dependencies = 
+    [   MemoryDep(name='primals_1', index=c1 + 768*load(primals_205, d1 + 128 * d0), size=(8192, 768)),
+        MemoryDep(name='primals_2', index=c1 + 768*load(primals_203, d1), size=(8192, 768)),
+        MemoryDep(name='primals_203', index=c1, size=(64, 128, 768)),
+        MemoryDep(name='primals_204', index=c1, size=(64, 128, 768)),
+        MemoryDep(name='primals_205', index=c0, size=(8192, 768)),
+        MemoryDep(name='primals_3', index=c1 + 768*load(primals_204, d1), size=(8192, 768)),
+        MemoryDep(name='primals_4', index=c1, size=(8192, 768)),
+        MemoryDep(name='primals_5', index=c1, size=(8192, 768)),
+        MemoryDep(name='seed_cuda_0', index=0, size=(6291456,))]
+buf0_buf1_buf2_buf3_buf4_buf5_buf417.snodes = ['buf0', 'buf1', 'buf2', 'buf3', 'buf4', 'buf5', 'buf417']
+
+
+buf6: ExternKernelSchedulerNode(MatrixMultiplyAdd)
+buf6.writes = [StarDep(name='buf6')]
+buf6.unmet_dependencies = [StarDep(name='buf5')]
+buf6.met_dependencies = [StarDep(name='primals_6'), StarDep(name='primals_7')]
+buf6.node.kernel = aten.addmm.out
+
+
+buf7: ExternKernelSchedulerNode(MatrixMultiplyAdd)
+buf7.writes = [StarDep(name='buf7')]
+buf7.unmet_dependencies = [StarDep(name='buf5')]
+buf7.met_dependencies = [StarDep(name='primals_8'), StarDep(name='primals_9')]
+buf7.node.kernel = aten.addmm.out
+
+
+buf8: ExternKernelSchedulerNode(MatrixMultiplyAdd)
+buf8.writes = [StarDep(name='buf8')]
+buf8.unmet_dependencies = [StarDep(name='buf5')]
+buf8.met_dependencies = [StarDep(name='primals_10'), StarDep(name='primals_11')]
+buf8.node.kernel = aten.addmm.out
+
+
+buf9: SchedulerNode(ComputedBuffer)
+buf9.writes = [MemoryDep(name='buf9', index=c0, size=(6291456,))]
+buf9.unmet_dependencies = [   MemoryDep(name='buf6', index=98304*c0 + 64*c1 + 768*c2 + c3, size=(64, 12, 128, 64))]
+buf9.met_dependencies = []
+buf9.group.device = cuda:0
+buf9.group.iteration = (6291456, 1)
+buf9.sizes = ([64, 12, 128, 64], [])
+class buf9_loop_body:
+    var_ranges = {z0: 64, z1: 12, z2: 128, z3: 64}
+    index0 = 98304*z0 + 64*z1 + 768*z2 + z3
+    index1 = 98304*z0 + 8192*z1 + 64*z2 + z3
+    def body(self, ops):
+        get_index = self.get_index('index0')
+        load = ops.load('buf6', get_index)
+        get_index_1 = self.get_index('index1')
+        store = ops.store('buf9', get_index_1, load, None)
+        return store
+
+
+buf10: SchedulerNode(ComputedBuffer)
+buf10.writes = [MemoryDep(name='buf10', index=c0, size=(6291456,))]
+buf10.unmet_dependencies = [MemoryDep(name='buf7', index=98304*c0 + c1 + 768*c2, size=(64, 768, 128))]
+buf10.met_dependencies = []
+buf10.group.device = cuda:0
+buf10.group.iteration = (6291456, 1)
+buf10.sizes = ([64, 768, 128], [])
+class buf10_loop_body:
+    var_ranges = {z0: 64, z1: 768, z2: 128}
+    index0 = 98304*z0 + z1 + 768*z2
+    index1 = 98304*z0 + 128*z1 + z2
+    def body(self, ops):
+        get_index = self.get_index('index0')
+        load = ops.load('buf7', get_index)
+        get_index_1 = self.get_index('index1')
+        store = ops.store('buf10', get_index_1, load, None)
+        return store
+
+
+buf11: ExternKernelSchedulerNode(BatchMatrixMultiply)
+buf11.writes = [StarDep(name='buf11')]
+buf11.unmet_dependencies = [StarDep(name='buf10'), StarDep(name='buf9')]
+buf11.met_dependencies = []
+buf11.node.kernel = aten.bmm.out
+
+
+buf12_buf13_buf14_buf416: FusedSchedulerNode(NoneType)
+buf12_buf13_buf14_buf416.writes = 
+    [   MemoryDep(name='buf12', index=c0, size=(98304, 128)),
+        MemoryDep(name='buf12', index=c0, size=(98304,)),
+        MemoryDep(name='buf13', index=c0, size=(98304, 128)),
+        MemoryDep(name='buf13', index=c0, size=(98304,)),
+        MemoryDep(name='buf14', index=c0, size=(12582912,)),
+        MemoryDep(name='buf416', index=c0, size=(12582912,))]
+buf12_buf13_buf14_buf416.unmet_dependencies = [MemoryDep(name='buf11', index=c0, size=(12582912,))]
+buf12_buf13_buf14_buf416.met_dependencies = [MemoryDep(name='seed_cuda_0', index=0, size=(12582912,))]
+buf12_buf13_buf14_buf416.snodes = ['buf12', 'buf13', 'buf14', 'buf416']
+
+
+buf15: SchedulerNode(ComputedBuffer)
+buf15.writes = [MemoryDep(name='buf15', index=c0, size=(6291456,))]
+buf15.unmet_dependencies = [   MemoryDep(name='buf8', index=98304*c0 + 64*c1 + 768*c2 + c3, size=(64, 12, 128, 64))]
+buf15.met_dependencies = []
+buf15.group.device = cuda:0
+buf15.group.iteration = (6291456, 1)
+buf15.sizes = ([64, 12, 128, 64], [])
+class buf15_loop_body:
+    var_ranges = {z0: 64, z1: 12, z2: 128, z3: 64}
+    index0 = 98304*z0 + 64*z1 + 768*z2 + z3
+    index1 = 98304*z0 + 8192*z1 + 64*z2 + z3
+    def body(self, ops):
+        get_index = self.get_index('index0')
+        load = ops.load('buf8', get_index)
+        get_index_1 = self.get_index('index1')
+        store = ops.store('buf15', get_index_1, load, None)
+        return store
+
+
+buf16: ExternKernelSchedulerNode(BatchMatrixMultiply)
+buf16.writes = [StarDep(name='buf16')]
+buf16.unmet_dependencies = [StarDep(name='buf14'), StarDep(name='buf15')]
+buf16.met_dependencies = []
+buf16.node.kernel = aten.bmm.out
+
+
+buf17: SchedulerNode(ComputedBuffer)
+buf17.writes = [MemoryDep(name='buf17', index=c0, size=(6291456,))]
+buf17.unmet_dependencies = [   MemoryDep(name='buf16', index=98304*c0 + 64*c1 + 8192*c2 + c3, size=(64, 128, 12, 64))]
+buf17.met_dependencies = []
+buf17.group.device = cuda:0
+buf17.group.iteration = (6291456, 1)
+buf17.sizes = ([64, 128, 12, 64], [])
+class buf17_loop_body:
+    var_ranges = {z0: 64, z1: 128, z2: 12, z3: 64}
+    index0 = 98304*z0 + 64*z1 + 8192*z2 + z3
+    index1 = 98304*z0 + 768*z1 + 64*z2 + z3
+    def body(self, ops):
+        get_index = self.get_index('index0')
+        load = ops.load('buf16', get_index)
+        get_index_1 = self.get_index('index1')
+        store = ops.store('buf17', get_index_1, load, None)
+        return store
+
+
+buf18: ExternKernelSchedulerNode(MatrixMultiplyAdd)
+buf18.writes = [StarDep(name='buf18')]
+buf18.unmet_dependencies = [StarDep(name='buf17')]
+buf18.met_dependencies = [StarDep(name='primals_12'), StarDep(name='primals_13')]
+buf18.node.kernel = aten.addmm.out
+
+
+buf19_buf20_buf21_buf22_buf23_buf415: FusedSchedulerNode(NoneType)
+buf19_buf20_buf21_buf22_buf23_buf415.writes = 
+    [   MemoryDep(name='buf19', index=c0, size=(8192, 768)),
+        MemoryDep(name='buf19', index=c0, size=(8192,)),
+        MemoryDep(name='buf20', index=c0, size=(8192, 768)),
+        MemoryDep(name='buf20', index=c0, size=(8192,)),
+        MemoryDep(name='buf21', index=c0, size=(8192, 768)),
+        MemoryDep(name='buf21', index=c0, size=(8192,)),
+        MemoryDep(name='buf22', index=c0, size=(6291456,)),
+        MemoryDep(name='buf23', index=c0, size=(6291456,)),
+        MemoryDep(name='buf415', index=c0, size=(8192,))]
+buf19_buf20_buf21_buf22_buf23_buf415.unmet_dependencies = 
+    [   MemoryDep(name='buf18', index=c0, size=(6291456,)),
+        MemoryDep(name='buf5', index=c0, size=(6291456,))]
+buf19_buf20_buf21_buf22_buf23_buf415.met_dependencies = 
+    [   MemoryDep(name='primals_14', index=c1, size=(8192, 768)),
+        MemoryDep(name='primals_15', index=c1, size=(8192, 768)),
+        MemoryDep(name='seed_cuda_0', index=0, size=(6291456,))]
+buf19_buf20_buf21_buf22_buf23_buf415.snodes = ['buf19', 'buf20', 'buf21', 'buf22', 'buf23', 'buf415']
+
+
+buf24: ExternKernelSchedulerNode(MatrixMultiplyAdd)
+buf24.writes = [StarDep(name='buf24')]
+buf24.unmet_dependencies = [StarDep(name='buf23')]
+buf24.met_dependencies = [StarDep(name='primals_16'), StarDep(name='primals_17')]
+buf24.node.kernel = aten.addmm.out
+
+
+buf25_buf414: FusedSchedulerNode(NoneType)
+buf25_buf414.writes = 
+    [   MemoryDep(name='buf25', index=c0, size=(25165824,)),
+        MemoryDep(name='buf414', index=c0, size=(25165824,))]
+buf25_buf414.unmet_dependencies = [MemoryDep(name='buf24', index=c0, size=(25165824,))]
+buf25_buf414.met_dependencies = []
+buf25_buf414.snodes = ['buf25', 'buf414']
+
+
+buf26: ExternKernelSchedulerNode(MatrixMultiplyAdd)
+buf26.writes = [StarDep(name='buf26')]
+buf26.unmet_dependencies = [StarDep(name='buf25')]
+buf26.met_dependencies = [StarDep(name='primals_18'), StarDep(name='primals_19')]
+buf26.node.kernel = aten.addmm.out
+
+
+buf27_buf28_buf29_buf30_buf31_buf413: FusedSchedulerNode(NoneType)
+buf27_buf28_buf29_buf30_buf31_buf413.writes = 
+    [   MemoryDep(name='buf27', index=c0, size=(8192, 768)),
+        MemoryDep(name='buf27', index=c0, size=(8192,)),
+        MemoryDep(name='buf28', index=c0, size=(8192, 768)),
+        MemoryDep(name='buf28', index=c0, size=(8192,)),
+        MemoryDep(name='buf29', index=c0, size=(8192, 768)),
+        MemoryDep(name='buf29', index=c0, size=(8192,)),
+        MemoryDep(name='buf30', index=c0, size=(6291456,)),
+        MemoryDep(name='buf31', index=c0, size=(6291456,)),
+        MemoryDep(name='buf413', index=c0, size=(8192,))]
+buf27_buf28_buf29_buf30_buf31_buf413.unmet_dependencies = 
+    [   MemoryDep(name='buf23', index=c0, size=(6291456,)),
+        MemoryDep(name='buf26', index=c0, size=(6291456,))]
+buf27_buf28_buf29_buf30_buf31_buf413.met_dependencies = 
+    [   MemoryDep(name='primals_20', index=c1, size=(8192, 768)),
+        MemoryDep(name='primals_21', index=c1, size=(8192, 768)),
+        MemoryDep(name='seed_cuda_0', index=0, size=(6291456,))]
+buf27_buf28_buf29_buf30_buf31_buf413.snodes = ['buf27', 'buf28', 'buf29', 'buf30', 'buf31', 'buf413']
+
+
+buf32: ExternKernelSchedulerNode(MatrixMultiplyAdd)
+buf32.writes = [StarDep(name='buf32')]
+buf32.unmet_dependencies = [StarDep(name='buf31')]
+buf32.met_dependencies = [StarDep(name='primals_22'), StarDep(name='primals_23')]
+buf32.node.kernel = aten.addmm.out
+
+
+buf33: ExternKernelSchedulerNode(MatrixMultiplyAdd)
+buf33.writes = [StarDep(name='buf33')]
+buf33.unmet_dependencies = [StarDep(name='buf31')]
+buf33.met_dependencies = [StarDep(name='primals_24'), StarDep(name='primals_25')]
+buf33.node.kernel = aten.addmm.out
+
+
+buf34: ExternKernelSchedulerNode(MatrixMultiplyAdd)
+buf34.writes = [StarDep(name='buf34')]
+buf34.unmet_dependencies = [StarDep(name='buf31')]
+buf34.met_dependencies = [StarDep(name='primals_26'), StarDep(name='primals_27')]
+buf34.node.kernel = aten.addmm.out
+
+
+buf35: SchedulerNode(ComputedBuffer)
+buf35.writes = [MemoryDep(name='buf35', index=c0, size=(6291456,))]
+buf35.unmet_dependencies = [   MemoryDep(name='buf32', index=98304*c0 + 64*c1 + 768*c2 + c3, size=(64, 12, 128, 64))]
+buf35.met_dependencies = []
+buf35.group.device = cuda:0
+buf35.group.iteration = (6291456, 1)
+buf35.sizes = ([64, 12, 128, 64], [])
+class buf35_loop_body:
+    var_ranges = {z0: 64, z1: 12, z2: 128, z3: 64}
+    index0 = 98304*z0 + 64*z1 + 768*z2 + z3
+    index1 = 98304*z0 + 8192*z1 + 64*z2 + z3
+    def body(self, ops):
+        get_index = self.get_index('index0')
+        load = ops.load('buf32', get_index)
+        get_index_1 = self.get_index('index1')
+        store = ops.store('buf35', get_index_1, load, None)
+        return store
+
+
+buf36: SchedulerNode(ComputedBuffer)
+buf36.writes = [MemoryDep(name='buf36', index=c0, size=(6291456,))]
+buf36.unmet_dependencies = [MemoryDep(name='buf33', index=98304*c0 + c1 + 768*c2, size=(64, 768, 128))]
+buf36.met_dependencies = []
+buf36.group.device = cuda:0
+buf36.group.iteration = (6291456, 1)
+buf36.sizes = ([64, 768, 128], [])
+class buf36_loop_body:
+    var_ranges = {z0: 64, z1: 768, z2: 128}
+    index0 = 98304*z0 + z1 + 768*z2
+    index1 = 98304*z0 + 128*z1 + z2
+    def body(self, ops):
+        get_index = self.get_index('index0')
+        load = ops.load('buf33', get_index)
+        get_index_1 = self.get_index('index1')
+        store = ops.store('buf36', get_index_1, load, None)
+        return store
+
+
+buf37: ExternKernelSchedulerNode(BatchMatrixMultiply)
+buf37.writes = [StarDep(name='buf37')]
+buf37.unmet_dependencies = [StarDep(name='buf35'), StarDep(name='buf36')]
+buf37.met_dependencies = []
+buf37.node.kernel = aten.bmm.out
+
+
+buf38_buf39_buf40_buf412: FusedSchedulerNode(NoneType)
+buf38_buf39_buf40_buf412.writes = 
+    [   MemoryDep(name='buf38', index=c0, size=(98304, 128)),
+        MemoryDep(name='buf38', index=c0, size=(98304,)),
+        MemoryDep(name='buf39', index=c0, size=(98304, 128)),
+        MemoryDep(name='buf39', index=c0, size=(98304,)),
+        MemoryDep(name='buf40', index=c0, size=(12582912,)),
+        MemoryDep(name='buf412', index=c0, size=(12582912,))]
+buf38_buf39_buf40_buf412.unmet_dependencies = [MemoryDep(name='buf37', index=c0, size=(12582912,))]
+buf38_buf39_buf40_buf412.met_dependencies = [MemoryDep(name='seed_cuda_0', index=0, size=(12582912,))]
+buf38_buf39_buf40_buf412.snodes = ['buf38', 'buf39', 'buf40', 'buf412']
+
+
+buf41: SchedulerNode(ComputedBuffer)
+buf41.writes = [MemoryDep(name='buf41', index=c0, size=(6291456,))]
+buf41.unmet_dependencies = [   MemoryDep(name='buf34', index=98304*c0 + 64*c1 + 768*c2 + c3, size=(64, 12, 128, 64))]
+buf41.met_dependencies = []
+buf41.group.device = cuda:0
+buf41.group.iteration = (6291456, 1)
+buf41.sizes = ([64, 12, 128, 64], [])
+class buf41_loop_body:
+    var_ranges = {z0: 64, z1: 12, z2: 128, z3: 64}
+    index0 = 98304*z0 + 64*z1 + 768*z2 + z3
+    index1 = 98304*z0 + 8192*z1 + 64*z2 + z3
+    def body(self, ops):
+        get_index = self.get_index('index0')
+        load = ops.load('buf34', get_index)
+        get_index_1 = self.get_index('index1')
+        store = ops.store('buf41', get_index_1, load, None)
+        return store
+
+
+buf42: ExternKernelSchedulerNode(BatchMatrixMultiply)
+buf42.writes = [StarDep(name='buf42')]
+buf42.unmet_dependencies = [StarDep(name='buf40'), StarDep(name='buf41')]
+buf42.met_dependencies = []
+buf42.node.kernel = aten.bmm.out
+
+
+buf43: SchedulerNode(ComputedBuffer)
+buf43.writes = [MemoryDep(name='buf43', index=c0, size=(6291456,))]
+buf43.unmet_dependencies = [   MemoryDep(name='buf42', index=98304*c0 + 64*c1 + 8192*c2 + c3, size=(64, 128, 12, 64))]
+buf43.met_dependencies = []
+buf43.group.device = cuda:0
+buf43.group.iteration = (6291456, 1)
+buf43.sizes = ([64, 128, 12, 64], [])
+class buf43_loop_body:
+    var_ranges = {z0: 64, z1: 128, z2: 12, z3: 64}
+    index0 = 98304*z0 + 64*z1 + 8192*z2 + z3
+    index1 = 98304*z0 + 768*z1 + 64*z2 + z3
+    def body(self, ops):
+        get_index = self.get_index('index0')
+        load = ops.load('buf42', get_index)
+        get_index_1 = self.get_index('index1')
+        store = ops.store('buf43', get_index_1, load, None)
+        return store
+
+
+buf44: ExternKernelSchedulerNode(MatrixMultiplyAdd)
+buf44.writes = [StarDep(name='buf44')]
+buf44.unmet_dependencies = [StarDep(name='buf43')]
+buf44.met_dependencies = [StarDep(name='primals_28'), StarDep(name='primals_29')]
+buf44.node.kernel = aten.addmm.out
+
+
+buf45_buf46_buf47_buf48_buf49_buf411: FusedSchedulerNode(NoneType)
+buf45_buf46_buf47_buf48_buf49_buf411.writes = 
+    [   MemoryDep(name='buf411', index=c0, size=(8192,)),
+        MemoryDep(name='buf45', index=c0, size=(8192, 768)),
+        MemoryDep(name='buf45', index=c0, size=(8192,)),
+        MemoryDep(name='buf46', index=c0, size=(8192, 768)),
+        MemoryDep(name='buf46', index=c0, size=(8192,)),
+        MemoryDep(name='buf47', index=c0, size=(8192, 768)),
+        MemoryDep(name='buf47', index=c0, size=(8192,)),
+        MemoryDep(name='buf48', index=c0, size=(6291456,)),
+        MemoryDep(name='buf49', index=c0, size=(6291456,))]
+buf45_buf46_buf47_buf48_buf49_buf411.unmet_dependencies = 
+    [   MemoryDep(name='buf31', index=c0, size=(6291456,)),
+        MemoryDep(name='buf44', index=c0, size=(6291456,))]
+buf45_buf46_buf47_buf48_buf49_buf411.met_dependencies = 
+    [   MemoryDep(name='primals_30', index=c1, size=(8192, 768)),
+        MemoryDep(name='primals_31', index=c1, size=(8192, 768)),
+        MemoryDep(name='seed_cuda_0', index=0, size=(6291456,))]
+buf45_buf46_buf47_buf48_buf49_buf411.snodes = ['buf45', 'buf46', 'buf47', 'buf48', 'buf49', 'buf411']
+
+
+buf50: ExternKernelSchedulerNode(MatrixMultiplyAdd)
+buf50.writes = [StarDep(name='buf50')]
+buf50.unmet_dependencies = [StarDep(name='buf49')]
+buf50.met_dependencies = [StarDep(name='primals_32'), StarDep(name='primals_33')]
+buf50.node.kernel = aten.addmm.out
+
+
+buf51_buf410: FusedSchedulerNode(NoneType)
+buf51_buf410.writes = 
+    [   MemoryDep(name='buf410', index=c0, size=(25165824,)),
+        MemoryDep(name='buf51', index=c0, size=(25165824,))]
+buf51_buf410.unmet_dependencies = [MemoryDep(name='buf50', index=c0, size=(25165824,))]
+buf51_buf410.met_dependencies = []
+buf51_buf410.snodes = ['buf51', 'buf410']
+
+
+buf52: ExternKernelSchedulerNode(MatrixMultiplyAdd)
+buf52.writes = [StarDep(name='buf52')]
+buf52.unmet_dependencies = [StarDep(name='buf51')]
+buf52.met_dependencies = [StarDep(name='primals_34'), StarDep(name='primals_35')]
+buf52.node.kernel = aten.addmm.out
+
+
+buf53_buf54_buf55_buf56_buf57_buf409: FusedSchedulerNode(NoneType)
+buf53_buf54_buf55_buf56_buf57_buf409.writes = 
+    [   MemoryDep(name='buf409', index=c0, size=(8192,)),
+        MemoryDep(name='buf53', index=c0, size=(8192, 768)),
+        MemoryDep(name='buf53', index=c0, size=(8192,)),
+        MemoryDep(name='buf54', index=c0, size=(8192, 768)),
+        MemoryDep(name='buf54', index=c0, size=(8192,)),
+        MemoryDep(name='buf55', index=c0, size=(8192, 768)),
+        MemoryDep(name='buf55', index=c0, size=(8192,)),
+        MemoryDep(name='buf56', index=c0, size=(6291456,)),
+        MemoryDep(name='buf57', index=c0, size=(6291456,))]
+buf53_buf54_buf55_buf56_buf57_buf409.unmet_dependencies = 
+    [   MemoryDep(name='buf49', index=c0, size=(6291456,)),
+        MemoryDep(name='buf52', index=c0, size=(6291456,))]
+buf53_buf54_buf55_buf56_buf57_buf409.met_dependencies = 
+    [   MemoryDep(name='primals_36', index=c1, size=(8192, 768)),
+        MemoryDep(name='primals_37', index=c1, size=(8192, 768)),
+        MemoryDep(name='seed_cuda_0', index=0, size=(6291456,))]
+buf53_buf54_buf55_buf56_buf57_buf409.snodes = ['buf53', 'buf54', 'buf55', 'buf56', 'buf57', 'buf409']
+
+
+buf58: ExternKernelSchedulerNode(MatrixMultiplyAdd)
+buf58.writes = [StarDep(name='buf58')]
+buf58.unmet_dependencies = [StarDep(name='buf57')]
+buf58.met_dependencies = [StarDep(name='primals_38'), StarDep(name='primals_39')]
+buf58.node.kernel = aten.addmm.out
+
+
+buf59: ExternKernelSchedulerNode(MatrixMultiplyAdd)
+buf59.writes = [StarDep(name='buf59')]
+buf59.unmet_dependencies = [StarDep(name='buf57')]
+buf59.met_dependencies = [StarDep(name='primals_40'), StarDep(name='primals_41')]
+buf59.node.kernel = aten.addmm.out
+
+
+buf60: ExternKernelSchedulerNode(MatrixMultiplyAdd)
+buf60.writes = [StarDep(name='buf60')]
+buf60.unmet_dependencies = [StarDep(name='buf57')]
+buf60.met_dependencies = [StarDep(name='primals_42'), StarDep(name='primals_43')]
+buf60.node.kernel = aten.addmm.out
+
+
+buf61: SchedulerNode(ComputedBuffer)
+buf61.writes = [MemoryDep(name='buf61', index=c0, size=(6291456,))]
+buf61.unmet_dependencies = [   MemoryDep(name='buf58', index=98304*c0 + 64*c1 + 768*c2 + c3, size=(64, 12, 128, 64))]
+buf61.met_dependencies = []
+buf61.group.device = cuda:0
+buf61.group.iteration = (6291456, 1)
+buf61.sizes = ([64, 12, 128, 64], [])
+class buf61_loop_body:
+    var_ranges = {z0: 64, z1: 12, z2: 128, z3: 64}
+    index0 = 98304*z0 + 64*z1 + 768*z2 + z3
+    index1 = 98304*z0 + 8192*z1 + 64*z2 + z3
+    def body(self, ops):
+        get_index = self.get_index('index0')
+        load = ops.load('buf58', get_index)
+        get_index_1 = self.get_index('index1')
+        store = ops.store('buf61', get_index_1, load, None)
+        return store
+
+
+buf62: SchedulerNode(ComputedBuffer)
+buf62.writes = [MemoryDep(name='buf62', index=c0, size=(6291456,))]
+buf62.unmet_dependencies = [MemoryDep(name='buf59', index=98304*c0 + c1 + 768*c2, size=(64, 768, 128))]
+buf62.met_dependencies = []
+buf62.group.device = cuda:0
+buf62.group.iteration = (6291456, 1)
+buf62.sizes = ([64, 768, 128], [])
+class buf62_loop_body:
+    var_ranges = {z0: 64, z1: 768, z2: 128}
+    index0 = 98304*z0 + z1 + 768*z2
+    index1 = 98304*z0 + 128*z1 + z2
+    def body(self, ops):
+        get_index = self.get_index('index0')
+        load = ops.load('buf59', get_index)
+        get_index_1 = self.get_index('index1')
+        store = ops.store('buf62', get_index_1, load, None)
+        return store
+
+
+buf63: ExternKernelSchedulerNode(BatchMatrixMultiply)
+buf63.writes = [StarDep(name='buf63')]
+buf63.unmet_dependencies = [StarDep(name='buf61'), StarDep(name='buf62')]
+buf63.met_dependencies = []
+buf63.node.kernel = aten.bmm.out
+
+
+buf64_buf65_buf66_buf408: FusedSchedulerNode(NoneType)
+buf64_buf65_buf66_buf408.writes = 
+    [   MemoryDep(name='buf408', index=c0, size=(12582912,)),
+        MemoryDep(name='buf64', index=c0, size=(98304, 128)),
+        MemoryDep(name='buf64', index=c0, size=(98304,)),
+        MemoryDep(name='buf65', index=c0, size=(98304, 128)),
+        MemoryDep(name='buf65', index=c0, size=(98304,)),
+        MemoryDep(name='buf66', index=c0, size=(12582912,))]
+buf64_buf65_buf66_buf408.unmet_dependencies = [MemoryDep(name='buf63', index=c0, size=(12582912,))]
+buf64_buf65_buf66_buf408.met_dependencies = [MemoryDep(name='seed_cuda_0', index=0, size=(12582912,))]
+buf64_buf65_buf66_buf408.snodes = ['buf64', 'buf65', 'buf66', 'buf408']
+
+
+buf67: SchedulerNode(ComputedBuffer)
+buf67.writes = [MemoryDep(name='buf67', index=c0, size=(6291456,))]
+buf67.unmet_dependencies = [   MemoryDep(name='buf60', index=98304*c0 + 64*c1 + 768*c2 + c3, size=(64, 12, 128, 64))]
+buf67.met_dependencies = []
+buf67.group.device = cuda:0
+buf67.group.iteration = (6291456, 1)
+buf67.sizes = ([64, 12, 128, 64], [])
+class buf67_loop_body:
+    var_ranges = {z0: 64, z1: 12, z2: 128, z3: 64}
+    index0 = 98304*z0 + 64*z1 + 768*z2 + z3
+    index1 = 98304*z0 + 8192*z1 + 64*z2 + z3
+    def body(self, ops):
+        get_index = self.get_index('index0')
+        load = ops.load('buf60', get_index)
+        get_index_1 = self.get_index('index1')
+        store = ops.store('buf67', get_index_1, load, None)
+        return store
+
+
+buf68: ExternKernelSchedulerNode(BatchMatrixMultiply)
+buf68.writes = [StarDep(name='buf68')]
+buf68.unmet_dependencies = [StarDep(name='buf66'), StarDep(name='buf67')]
+buf68.met_dependencies = []
+buf68.node.kernel = aten.bmm.out
+
+
+buf69: SchedulerNode(ComputedBuffer)
+buf69.writes = [MemoryDep(name='buf69', index=c0, size=(6291456,))]
+buf69.unmet_dependencies = [   MemoryDep(name='buf68', index=98304*c0 + 64*c1 + 8192*c2 + c3, size=(64, 128, 12, 64))]
+buf69.met_dependencies = []
+buf69.group.device = cuda:0
+buf69.group.iteration = (6291456, 1)
+buf69.sizes = ([64, 128, 12, 64], [])
+class buf69_loop_body:
+    var_ranges = {z0: 64, z1: 128, z2: 12, z3: 64}
+    index0 = 98304*z0 + 64*z1 + 8192*z2 + z3
+    index1 = 98304*z0 + 768*z1 + 64*z2 + z3
+    def body(self, ops):
+        get_index = self.get_index('index0')
+        load = ops.load('buf68', get_index)
+        get_index_1 = self.get_index('index1')
+        store = ops.store('buf69', get_index_1, load, None)
+        return store
+
+
+buf70: ExternKernelSchedulerNode(MatrixMultiplyAdd)
+buf70.writes = [StarDep(name='buf70')]
+buf70.unmet_dependencies = [StarDep(name='buf69')]
+buf70.met_dependencies = [StarDep(name='primals_44'), StarDep(name='primals_45')]
+buf70.node.kernel = aten.addmm.out
+
+
+buf71_buf72_buf73_buf74_buf75_buf407: FusedSchedulerNode(NoneType)
+buf71_buf72_buf73_buf74_buf75_buf407.writes = 
+    [   MemoryDep(name='buf407', index=c0, size=(8192,)),
+        MemoryDep(name='buf71', index=c0, size=(8192, 768)),
+        MemoryDep(name='buf71', index=c0, size=(8192,)),
+        MemoryDep(name='buf72', index=c0, size=(8192, 768)),
+        MemoryDep(name='buf72', index=c0, size=(8192,)),
+        MemoryDep(name='buf73', index=c0, size=(8192, 768)),
+        MemoryDep(name='buf73', index=c0, size=(8192,)),
+        MemoryDep(name='buf74', index=c0, size=(6291456,)),
+        MemoryDep(name='buf75', index=c0, size=(6291456,))]
+buf71_buf72_buf73_buf74_buf75_buf407.unmet_dependencies = 
+    [   MemoryDep(name='buf57', index=c0, size=(6291456,)),
+        MemoryDep(name='buf70', index=c0, size=(6291456,))]
+buf71_buf72_buf73_buf74_buf75_buf407.met_dependencies = 
+    [   MemoryDep(name='primals_46', index=c1, size=(8192, 768)),
+        MemoryDep(name='primals_47', index=c1, size=(8192, 768)),
+        MemoryDep(name='seed_cuda_0', index=0, size=(6291456,))]
+buf71_buf72_buf73_buf74_buf75_buf407.snodes = ['buf71', 'buf72', 'buf73', 'buf74', 'buf75', 'buf407']
+
+
+buf76: ExternKernelSchedulerNode(MatrixMultiplyAdd)
+buf76.writes = [StarDep(name='buf76')]
+buf76.unmet_dependencies = [StarDep(name='buf75')]
+buf76.met_dependencies = [StarDep(name='primals_48'), StarDep(name='primals_49')]
+buf76.node.kernel = aten.addmm.out
+
+
+buf77_buf406: FusedSchedulerNode(NoneType)
+buf77_buf406.writes = 
+    [   MemoryDep(name='buf406', index=c0, size=(25165824,)),
+        MemoryDep(name='buf77', index=c0, size=(25165824,))]
+buf77_buf406.unmet_dependencies = [MemoryDep(name='buf76', index=c0, size=(25165824,))]
+buf77_buf406.met_dependencies = []
+buf77_buf406.snodes = ['buf77', 'buf406']
+
+
+buf78: ExternKernelSchedulerNode(MatrixMultiplyAdd)
+buf78.writes = [StarDep(name='buf78')]
+buf78.unmet_dependencies = [StarDep(name='buf77')]
+buf78.met_dependencies = [StarDep(name='primals_50'), StarDep(name='primals_51')]
+buf78.node.kernel = aten.addmm.out
+
+
+buf79_buf80_buf81_buf82_buf83_buf405: FusedSchedulerNode(NoneType)
+buf79_buf80_buf81_buf82_buf83_buf405.writes = 
+    [   MemoryDep(name='buf405', index=c0, size=(8192,)),
+        MemoryDep(name='buf79', index=c0, size=(8192, 768)),
+        MemoryDep(name='buf79', index=c0, size=(8192,)),
+        MemoryDep(name='buf80', index=c0, size=(8192, 768)),
+        MemoryDep(name='buf80', index=c0, size=(8192,)),
+        MemoryDep(name='buf81', index=c0, size=(8192, 768)),
+        MemoryDep(name='buf81', index=c0, size=(8192,)),
+        MemoryDep(name='buf82', index=c0, size=(6291456,)),
+        MemoryDep(name='buf83', index=c0, size=(6291456,))]
+buf79_buf80_buf81_buf82_buf83_buf405.unmet_dependencies = 
+    [   MemoryDep(name='buf75', index=c0, size=(6291456,)),
+        MemoryDep(name='buf78', index=c0, size=(6291456,))]
+buf79_buf80_buf81_buf82_buf83_buf405.met_dependencies = 
+    [   MemoryDep(name='primals_52', index=c1, size=(8192, 768)),
+        MemoryDep(name='primals_53', index=c1, size=(8192, 768)),
+        MemoryDep(name='seed_cuda_0', index=0, size=(6291456,))]
+buf79_buf80_buf81_buf82_buf83_buf405.snodes = ['buf79', 'buf80', 'buf81', 'buf82', 'buf83', 'buf405']
+
+
+buf84: ExternKernelSchedulerNode(MatrixMultiplyAdd)
+buf84.writes = [StarDep(name='buf84')]
+buf84.unmet_dependencies = [StarDep(name='buf83')]
+buf84.met_dependencies = [StarDep(name='primals_54'), StarDep(name='primals_55')]
+buf84.node.kernel = aten.addmm.out
+
+
+buf85: ExternKernelSchedulerNode(MatrixMultiplyAdd)
+buf85.writes = [StarDep(name='buf85')]
+buf85.unmet_dependencies = [StarDep(name='buf83')]
+buf85.met_dependencies = [StarDep(name='primals_56'), StarDep(name='primals_57')]
+buf85.node.kernel = aten.addmm.out
+
+
+buf86: ExternKernelSchedulerNode(MatrixMultiplyAdd)
+buf86.writes = [StarDep(name='buf86')]
+buf86.unmet_dependencies = [StarDep(name='buf83')]
+buf86.met_dependencies = [StarDep(name='primals_58'), StarDep(name='primals_59')]
+buf86.node.kernel = aten.addmm.out
+
+
+buf87: SchedulerNode(ComputedBuffer)
+buf87.writes = [MemoryDep(name='buf87', index=c0, size=(6291456,))]
+buf87.unmet_dependencies = [   MemoryDep(name='buf84', index=98304*c0 + 64*c1 + 768*c2 + c3, size=(64, 12, 128, 64))]
+buf87.met_dependencies = []
+buf87.group.device = cuda:0
+buf87.group.iteration = (6291456, 1)
+buf87.sizes = ([64, 12, 128, 64], [])
+class buf87_loop_body:
+    var_ranges = {z0: 64, z1: 12, z2: 128, z3: 64}
+    index0 = 98304*z0 + 64*z1 + 768*z2 + z3
+    index1 = 98304*z0 + 8192*z1 + 64*z2 + z3
+    def body(self, ops):
+        get_index = self.get_index('index0')
+        load = ops.load('buf84', get_index)
+        get_index_1 = self.get_index('index1')
+        store = ops.store('buf87', get_index_1, load, None)
+        return store
+
+
+buf88: SchedulerNode(ComputedBuffer)
+buf88.writes = [MemoryDep(name='buf88', index=c0, size=(6291456,))]
+buf88.unmet_dependencies = [MemoryDep(name='buf85', index=98304*c0 + c1 + 768*c2, size=(64, 768, 128))]
+buf88.met_dependencies = []
+buf88.group.device = cuda:0
+buf88.group.iteration = (6291456, 1)
+buf88.sizes = ([64, 768, 128], [])
+class buf88_loop_body:
+    var_ranges = {z0: 64, z1: 768, z2: 128}
+    index0 = 98304*z0 + z1 + 768*z2
+    index1 = 98304*z0 + 128*z1 + z2
+    def body(self, ops):
+        get_index = self.get_index('index0')
+        load = ops.load('buf85', get_index)
+        get_index_1 = self.get_index('index1')
+        store = ops.store('buf88', get_index_1, load, None)
+        return store
+
+
+buf89: ExternKernelSchedulerNode(BatchMatrixMultiply)
+buf89.writes = [StarDep(name='buf89')]
+buf89.unmet_dependencies = [StarDep(name='buf87'), StarDep(name='buf88')]
+buf89.met_dependencies = []
+buf89.node.kernel = aten.bmm.out
+
+
+buf90_buf91_buf92_buf404: FusedSchedulerNode(NoneType)
+buf90_buf91_buf92_buf404.writes = 
+    [   MemoryDep(name='buf404', index=c0, size=(12582912,)),
+        MemoryDep(name='buf90', index=c0, size=(98304, 128)),
+        MemoryDep(name='buf90', index=c0, size=(98304,)),
+        MemoryDep(name='buf91', index=c0, size=(98304, 128)),
+        MemoryDep(name='buf91', index=c0, size=(98304,)),
+        MemoryDep(name='buf92', index=c0, size=(12582912,))]
+buf90_buf91_buf92_buf404.unmet_dependencies = [MemoryDep(name='buf89', index=c0, size=(12582912,))]
+buf90_buf91_buf92_buf404.met_dependencies = [MemoryDep(name='seed_cuda_0', index=0, size=(12582912,))]
+buf90_buf91_buf92_buf404.snodes = ['buf90', 'buf91', 'buf92', 'buf404']
+
+
+buf93: SchedulerNode(ComputedBuffer)
+buf93.writes = [MemoryDep(name='buf93', index=c0, size=(6291456,))]
+buf93.unmet_dependencies = [   MemoryDep(name='buf86', index=98304*c0 + 64*c1 + 768*c2 + c3, size=(64, 12, 128, 64))]
+buf93.met_dependencies = []
+buf93.group.device = cuda:0
+buf93.group.iteration = (6291456, 1)
+buf93.sizes = ([64, 12, 128, 64], [])
+class buf93_loop_body:
+    var_ranges = {z0: 64, z1: 12, z2: 128, z3: 64}
+    index0 = 98304*z0 + 64*z1 + 768*z2 + z3
+    index1 = 98304*z0 + 8192*z1 + 64*z2 + z3
+    def body(self, ops):
+        get_index = self.get_index('index0')
+        load = ops.load('buf86', get_index)
+        get_index_1 = self.get_index('index1')
+        store = ops.store('buf93', get_index_1, load, None)
+        return store
+
+
+buf94: ExternKernelSchedulerNode(BatchMatrixMultiply)
+buf94.writes = [StarDep(name='buf94')]
+buf94.unmet_dependencies = [StarDep(name='buf92'), StarDep(name='buf93')]
+buf94.met_dependencies = []
+buf94.node.kernel = aten.bmm.out
+
+
+buf95: SchedulerNode(ComputedBuffer)
+buf95.writes = [MemoryDep(name='buf95', index=c0, size=(6291456,))]
+buf95.unmet_dependencies = [   MemoryDep(name='buf94', index=98304*c0 + 64*c1 + 8192*c2 + c3, size=(64, 128, 12, 64))]
+buf95.met_dependencies = []
+buf95.group.device = cuda:0
+buf95.group.iteration = (6291456, 1)
+buf95.sizes = ([64, 128, 12, 64], [])
+class buf95_loop_body:
+    var_ranges = {z0: 64, z1: 128, z2: 12, z3: 64}
+    index0 = 98304*z0 + 64*z1 + 8192*z2 + z3
+    index1 = 98304*z0 + 768*z1 + 64*z2 + z3
+    def body(self, ops):
+        get_index = self.get_index('index0')
+        load = ops.load('buf94', get_index)
+        get_index_1 = self.get_index('index1')
+        store = ops.store('buf95', get_index_1, load, None)
+        return store
+
+
+buf96: ExternKernelSchedulerNode(MatrixMultiplyAdd)
+buf96.writes = [StarDep(name='buf96')]
+buf96.unmet_dependencies = [StarDep(name='buf95')]
+buf96.met_dependencies = [StarDep(name='primals_60'), StarDep(name='primals_61')]
+buf96.node.kernel = aten.addmm.out
+
+
+buf97_buf98_buf99_buf100_buf101_buf403: FusedSchedulerNode(NoneType)
+buf97_buf98_buf99_buf100_buf101_buf403.writes = 
+    [   MemoryDep(name='buf100', index=c0, size=(6291456,)),
+        MemoryDep(name='buf101', index=c0, size=(6291456,)),
+        MemoryDep(name='buf403', index=c0, size=(8192,)),
+        MemoryDep(name='buf97', index=c0, size=(8192, 768)),
+        MemoryDep(name='buf97', index=c0, size=(8192,)),
+        MemoryDep(name='buf98', index=c0, size=(8192, 768)),
+        MemoryDep(name='buf98', index=c0, size=(8192,)),
+        MemoryDep(name='buf99', index=c0, size=(8192, 768)),
+        MemoryDep(name='buf99', index=c0, size=(8192,))]
+buf97_buf98_buf99_buf100_buf101_buf403.unmet_dependencies = 
+    [   MemoryDep(name='buf83', index=c0, size=(6291456,)),
+        MemoryDep(name='buf96', index=c0, size=(6291456,))]
+buf97_buf98_buf99_buf100_buf101_buf403.met_dependencies = 
+    [   MemoryDep(name='primals_62', index=c1, size=(8192, 768)),
+        MemoryDep(name='primals_63', index=c1, size=(8192, 768)),
+        MemoryDep(name='seed_cuda_0', index=0, size=(6291456,))]
+buf97_buf98_buf99_buf100_buf101_buf403.snodes = ['buf97', 'buf98', 'buf99', 'buf100', 'buf101', 'buf403']
+
+
+buf102: ExternKernelSchedulerNode(MatrixMultiplyAdd)
+buf102.writes = [StarDep(name='buf102')]
+buf102.unmet_dependencies = [StarDep(name='buf101')]
+buf102.met_dependencies = [StarDep(name='primals_64'), StarDep(name='primals_65')]
+buf102.node.kernel = aten.addmm.out
+
+
+buf103_buf402: FusedSchedulerNode(NoneType)
+buf103_buf402.writes = 
+    [   MemoryDep(name='buf103', index=c0, size=(25165824,)),
+        MemoryDep(name='buf402', index=c0, size=(25165824,))]
+buf103_buf402.unmet_dependencies = [MemoryDep(name='buf102', index=c0, size=(25165824,))]
+buf103_buf402.met_dependencies = []
+buf103_buf402.snodes = ['buf103', 'buf402']
+
+
+buf104: ExternKernelSchedulerNode(MatrixMultiplyAdd)
+buf104.writes = [StarDep(name='buf104')]
+buf104.unmet_dependencies = [StarDep(name='buf103')]
+buf104.met_dependencies = [StarDep(name='primals_66'), StarDep(name='primals_67')]
+buf104.node.kernel = aten.addmm.out
+
+
+buf105_buf106_buf107_buf108_buf109_buf401: FusedSchedulerNode(NoneType)
+buf105_buf106_buf107_buf108_buf109_buf401.writes = 
+    [   MemoryDep(name='buf105', index=c0, size=(8192, 768)),
+        MemoryDep(name='buf105', index=c0, size=(8192,)),
+        MemoryDep(name='buf106', index=c0, size=(8192, 768)),
+        MemoryDep(name='buf106', index=c0, size=(8192,)),
+        MemoryDep(name='buf107', index=c0, size=(8192, 768)),
+        MemoryDep(name='buf107', index=c0, size=(8192,)),
+        MemoryDep(name='buf108', index=c0, size=(6291456,)),
+        MemoryDep(name='buf109', index=c0, size=(6291456,)),
+        MemoryDep(name='buf401', index=c0, size=(8192,))]
+buf105_buf106_buf107_buf108_buf109_buf401.unmet_dependencies = 
+    [   MemoryDep(name='buf101', index=c0, size=(6291456,)),
+        MemoryDep(name='buf104', index=c0, size=(6291456,))]
+buf105_buf106_buf107_buf108_buf109_buf401.met_dependencies = 
+    [   MemoryDep(name='primals_68', index=c1, size=(8192, 768)),
+        MemoryDep(name='primals_69', index=c1, size=(8192, 768)),
+        MemoryDep(name='seed_cuda_0', index=0, size=(6291456,))]
+buf105_buf106_buf107_buf108_buf109_buf401.snodes = ['buf105', 'buf106', 'buf107', 'buf108', 'buf109', 'buf401']
+
+
+buf110: ExternKernelSchedulerNode(MatrixMultiplyAdd)
+buf110.writes = [StarDep(name='buf110')]
+buf110.unmet_dependencies = [StarDep(name='buf109')]
+buf110.met_dependencies = [StarDep(name='primals_70'), StarDep(name='primals_71')]
+buf110.node.kernel = aten.addmm.out
+
+
+buf111: ExternKernelSchedulerNode(MatrixMultiplyAdd)
+buf111.writes = [StarDep(name='buf111')]
+buf111.unmet_dependencies = [StarDep(name='buf109')]
+buf111.met_dependencies = [StarDep(name='primals_72'), StarDep(name='primals_73')]
+buf111.node.kernel = aten.addmm.out
+
+
+buf112: ExternKernelSchedulerNode(MatrixMultiplyAdd)
+buf112.writes = [StarDep(name='buf112')]
+buf112.unmet_dependencies = [StarDep(name='buf109')]
+buf112.met_dependencies = [StarDep(name='primals_74'), StarDep(name='primals_75')]
+buf112.node.kernel = aten.addmm.out
+
+
+buf113: SchedulerNode(ComputedBuffer)
+buf113.writes = [MemoryDep(name='buf113', index=c0, size=(6291456,))]
+buf113.unmet_dependencies = [   MemoryDep(name='buf110', index=98304*c0 + 64*c1 + 768*c2 + c3, size=(64, 12, 128, 64))]
+buf113.met_dependencies = []
+buf113.group.device = cuda:0
+buf113.group.iteration = (6291456, 1)
+buf113.sizes = ([64, 12, 128, 64], [])
+class buf113_loop_body:
+    var_ranges = {z0: 64, z1: 12, z2: 128, z3: 64}
+    index0 = 98304*z0 + 64*z1 + 768*z2 + z3
+    index1 = 98304*z0 + 8192*z1 + 64*z2 + z3
+    def body(self, ops):
+        get_index = self.get_index('index0')
+        load = ops.load('buf110', get_index)
+        get_index_1 = self.get_index('index1')
+        store = ops.store('buf113', get_index_1, load, None)
+        return store
+
+
+buf114: SchedulerNode(ComputedBuffer)
+buf114.writes = [MemoryDep(name='buf114', index=c0, size=(6291456,))]
+buf114.unmet_dependencies = [MemoryDep(name='buf111', index=98304*c0 + c1 + 768*c2, size=(64, 768, 128))]
+buf114.met_dependencies = []
+buf114.group.device = cuda:0
+buf114.group.iteration = (6291456, 1)
+buf114.sizes = ([64, 768, 128], [])
+class buf114_loop_body:
+    var_ranges = {z0: 64, z1: 768, z2: 128}
+    index0 = 98304*z0 + z1 + 768*z2
+    index1 = 98304*z0 + 128*z1 + z2
+    def body(self, ops):
+        get_index = self.get_index('index0')
+        load = ops.load('buf111', get_index)
+        get_index_1 = self.get_index('index1')
+        store = ops.store('buf114', get_index_1, load, None)
+        return store
+
+
+buf115: ExternKernelSchedulerNode(BatchMatrixMultiply)
+buf115.writes = [StarDep(name='buf115')]
+buf115.unmet_dependencies = [StarDep(name='buf113'), StarDep(name='buf114')]
+buf115.met_dependencies = []
+buf115.node.kernel = aten.bmm.out
+
+
+buf116_buf117_buf118_buf400: FusedSchedulerNode(NoneType)
+buf116_buf117_buf118_buf400.writes = 
+    [   MemoryDep(name='buf116', index=c0, size=(98304, 128)),
+        MemoryDep(name='buf116', index=c0, size=(98304,)),
+        MemoryDep(name='buf117', index=c0, size=(98304, 128)),
+        MemoryDep(name='buf117', index=c0, size=(98304,)),
+        MemoryDep(name='buf118', index=c0, size=(12582912,)),
+        MemoryDep(name='buf400', index=c0, size=(12582912,))]
+buf116_buf117_buf118_buf400.unmet_dependencies = [MemoryDep(name='buf115', index=c0, size=(12582912,))]
+buf116_buf117_buf118_buf400.met_dependencies = [MemoryDep(name='seed_cuda_0', index=0, size=(12582912,))]
+buf116_buf117_buf118_buf400.snodes = ['buf116', 'buf117', 'buf118', 'buf400']
+
+
+buf119: SchedulerNode(ComputedBuffer)
+buf119.writes = [MemoryDep(name='buf119', index=c0, size=(6291456,))]
+buf119.unmet_dependencies = [   MemoryDep(name='buf112', index=98304*c0 + 64*c1 + 768*c2 + c3, size=(64, 12, 128, 64))]
+buf119.met_dependencies = []
+buf119.group.device = cuda:0
+buf119.group.iteration = (6291456, 1)
+buf119.sizes = ([64, 12, 128, 64], [])
+class buf119_loop_body:
+    var_ranges = {z0: 64, z1: 12, z2: 128, z3: 64}
+    index0 = 98304*z0 + 64*z1 + 768*z2 + z3
+    index1 = 98304*z0 + 8192*z1 + 64*z2 + z3
+    def body(self, ops):
+        get_index = self.get_index('index0')
+        load = ops.load('buf112', get_index)
+        get_index_1 = self.get_index('index1')
+        store = ops.store('buf119', get_index_1, load, None)
+        return store
+
+
+buf120: ExternKernelSchedulerNode(BatchMatrixMultiply)
+buf120.writes = [StarDep(name='buf120')]
+buf120.unmet_dependencies = [StarDep(name='buf118'), StarDep(name='buf119')]
+buf120.met_dependencies = []
+buf120.node.kernel = aten.bmm.out
+
+
+buf121: SchedulerNode(ComputedBuffer)
+buf121.writes = [MemoryDep(name='buf121', index=c0, size=(6291456,))]
+buf121.unmet_dependencies = [   MemoryDep(name='buf120', index=98304*c0 + 64*c1 + 8192*c2 + c3, size=(64, 128, 12, 64))]
+buf121.met_dependencies = []
+buf121.group.device = cuda:0
+buf121.group.iteration = (6291456, 1)
+buf121.sizes = ([64, 128, 12, 64], [])
+class buf121_loop_body:
+    var_ranges = {z0: 64, z1: 128, z2: 12, z3: 64}
+    index0 = 98304*z0 + 64*z1 + 8192*z2 + z3
+    index1 = 98304*z0 + 768*z1 + 64*z2 + z3
+    def body(self, ops):
+        get_index = self.get_index('index0')
+        load = ops.load('buf120', get_index)
+        get_index_1 = self.get_index('index1')
+        store = ops.store('buf121', get_index_1, load, None)
+        return store
+
+
+buf122: ExternKernelSchedulerNode(MatrixMultiplyAdd)
+buf122.writes = [StarDep(name='buf122')]
+buf122.unmet_dependencies = [StarDep(name='buf121')]
+buf122.met_dependencies = [StarDep(name='primals_76'), StarDep(name='primals_77')]
+buf122.node.kernel = aten.addmm.out
+
+
+buf123_buf124_buf125_buf126_buf127_buf399: FusedSchedulerNode(NoneType)
+buf123_buf124_buf125_buf126_buf127_buf399.writes = 
+    [   MemoryDep(name='buf123', index=c0, size=(8192, 768)),
+        MemoryDep(name='buf123', index=c0, size=(8192,)),
+        MemoryDep(name='buf124', index=c0, size=(8192, 768)),
+        MemoryDep(name='buf124', index=c0, size=(8192,)),
+        MemoryDep(name='buf125', index=c0, size=(8192, 768)),
+        MemoryDep(name='buf125', index=c0, size=(8192,)),
+        MemoryDep(name='buf126', index=c0, size=(6291456,)),
+        MemoryDep(name='buf127', index=c0, size=(6291456,)),
+        MemoryDep(name='buf399', index=c0, size=(8192,))]
+buf123_buf124_buf125_buf126_buf127_buf399.unmet_dependencies = 
+    [   MemoryDep(name='buf109', index=c0, size=(6291456,)),
+        MemoryDep(name='buf122', index=c0, size=(6291456,))]
+buf123_buf124_buf125_buf126_buf127_buf399.met_dependencies = 
+    [   MemoryDep(name='primals_78', index=c1, size=(8192, 768)),
+        MemoryDep(name='primals_79', index=c1, size=(8192, 768)),
+        MemoryDep(name='seed_cuda_0', index=0, size=(6291456,))]
+buf123_buf124_buf125_buf126_buf127_buf399.snodes = ['buf123', 'buf124', 'buf125', 'buf126', 'buf127', 'buf399']
+
+
+buf128: ExternKernelSchedulerNode(MatrixMultiplyAdd)
+buf128.writes = [StarDep(name='buf128')]
+buf128.unmet_dependencies = [StarDep(name='buf127')]
+buf128.met_dependencies = [StarDep(name='primals_80'), StarDep(name='primals_81')]
+buf128.node.kernel = aten.addmm.out
+
+
+buf129_buf398: FusedSchedulerNode(NoneType)
+buf129_buf398.writes = 
+    [   MemoryDep(name='buf129', index=c0, size=(25165824,)),
+        MemoryDep(name='buf398', index=c0, size=(25165824,))]
+buf129_buf398.unmet_dependencies = [MemoryDep(name='buf128', index=c0, size=(25165824,))]
+buf129_buf398.met_dependencies = []
+buf129_buf398.snodes = ['buf129', 'buf398']
+
+
+buf130: ExternKernelSchedulerNode(MatrixMultiplyAdd)
+buf130.writes = [StarDep(name='buf130')]
+buf130.unmet_dependencies = [StarDep(name='buf129')]
+buf130.met_dependencies = [StarDep(name='primals_82'), StarDep(name='primals_83')]
+buf130.node.kernel = aten.addmm.out
+
+
+buf131_buf132_buf133_buf134_buf135_buf397: FusedSchedulerNode(NoneType)
+buf131_buf132_buf133_buf134_buf135_buf397.writes = 
+    [   MemoryDep(name='buf131', index=c0, size=(8192, 768)),
+        MemoryDep(name='buf131', index=c0, size=(8192,)),
+        MemoryDep(name='buf132', index=c0, size=(8192, 768)),
+        MemoryDep(name='buf132', index=c0, size=(8192,)),
+        MemoryDep(name='buf133', index=c0, size=(8192, 768)),
+        MemoryDep(name='buf133', index=c0, size=(8192,)),
+        MemoryDep(name='buf134', index=c0, size=(6291456,)),
+        MemoryDep(name='buf135', index=c0, size=(6291456,)),
+        MemoryDep(name='buf397', index=c0, size=(8192,))]
+buf131_buf132_buf133_buf134_buf135_buf397.unmet_dependencies = 
+    [   MemoryDep(name='buf127', index=c0, size=(6291456,)),
+        MemoryDep(name='buf130', index=c0, size=(6291456,))]
+buf131_buf132_buf133_buf134_buf135_buf397.met_dependencies = 
+    [   MemoryDep(name='primals_84', index=c1, size=(8192, 768)),
+        MemoryDep(name='primals_85', index=c1, size=(8192, 768)),
+        MemoryDep(name='seed_cuda_0', index=0, size=(6291456,))]
+buf131_buf132_buf133_buf134_buf135_buf397.snodes = ['buf131', 'buf132', 'buf133', 'buf134', 'buf135', 'buf397']
+
+
+buf136: ExternKernelSchedulerNode(MatrixMultiplyAdd)
+buf136.writes = [StarDep(name='buf136')]
+buf136.unmet_dependencies = [StarDep(name='buf135')]
+buf136.met_dependencies = [StarDep(name='primals_86'), StarDep(name='primals_87')]
+buf136.node.kernel = aten.addmm.out
+
+
+buf137: ExternKernelSchedulerNode(MatrixMultiplyAdd)
+buf137.writes = [StarDep(name='buf137')]
+buf137.unmet_dependencies = [StarDep(name='buf135')]
+buf137.met_dependencies = [StarDep(name='primals_88'), StarDep(name='primals_89')]
+buf137.node.kernel = aten.addmm.out
+
+
+buf138: ExternKernelSchedulerNode(MatrixMultiplyAdd)
+buf138.writes = [StarDep(name='buf138')]
+buf138.unmet_dependencies = [StarDep(name='buf135')]
+buf138.met_dependencies = [StarDep(name='primals_90'), StarDep(name='primals_91')]
+buf138.node.kernel = aten.addmm.out
+
+
+buf139: SchedulerNode(ComputedBuffer)
+buf139.writes = [MemoryDep(name='buf139', index=c0, size=(6291456,))]
+buf139.unmet_dependencies = [   MemoryDep(name='buf136', index=98304*c0 + 64*c1 + 768*c2 + c3, size=(64, 12, 128, 64))]
+buf139.met_dependencies = []
+buf139.group.device = cuda:0
+buf139.group.iteration = (6291456, 1)
+buf139.sizes = ([64, 12, 128, 64], [])
+class buf139_loop_body:
+    var_ranges = {z0: 64, z1: 12, z2: 128, z3: 64}
+    index0 = 98304*z0 + 64*z1 + 768*z2 + z3
+    index1 = 98304*z0 + 8192*z1 + 64*z2 + z3
+    def body(self, ops):
+        get_index = self.get_index('index0')
+        load = ops.load('buf136', get_index)
+        get_index_1 = self.get_index('index1')
+        store = ops.store('buf139', get_index_1, load, None)
+        return store
+
+
+buf140: SchedulerNode(ComputedBuffer)
+buf140.writes = [MemoryDep(name='buf140', index=c0, size=(6291456,))]
+buf140.unmet_dependencies = [MemoryDep(name='buf137', index=98304*c0 + c1 + 768*c2, size=(64, 768, 128))]
+buf140.met_dependencies = []
+buf140.group.device = cuda:0
+buf140.group.iteration = (6291456, 1)
+buf140.sizes = ([64, 768, 128], [])
+class buf140_loop_body:
+    var_ranges = {z0: 64, z1: 768, z2: 128}
+    index0 = 98304*z0 + z1 + 768*z2
+    index1 = 98304*z0 + 128*z1 + z2
+    def body(self, ops):
+        get_index = self.get_index('index0')
+        load = ops.load('buf137', get_index)
+        get_index_1 = self.get_index('index1')
+        store = ops.store('buf140', get_index_1, load, None)
+        return store
+
+
+buf141: ExternKernelSchedulerNode(BatchMatrixMultiply)
+buf141.writes = [StarDep(name='buf141')]
+buf141.unmet_dependencies = [StarDep(name='buf139'), StarDep(name='buf140')]
+buf141.met_dependencies = []
+buf141.node.kernel = aten.bmm.out
+
+
+buf142_buf143_buf144_buf396: FusedSchedulerNode(NoneType)
+buf142_buf143_buf144_buf396.writes = 
+    [   MemoryDep(name='buf142', index=c0, size=(98304, 128)),
+        MemoryDep(name='buf142', index=c0, size=(98304,)),
+        MemoryDep(name='buf143', index=c0, size=(98304, 128)),
+        MemoryDep(name='buf143', index=c0, size=(98304,)),
+        MemoryDep(name='buf144', index=c0, size=(12582912,)),
+        MemoryDep(name='buf396', index=c0, size=(12582912,))]
+buf142_buf143_buf144_buf396.unmet_dependencies = [MemoryDep(name='buf141', index=c0, size=(12582912,))]
+buf142_buf143_buf144_buf396.met_dependencies = [MemoryDep(name='seed_cuda_0', index=0, size=(12582912,))]
+buf142_buf143_buf144_buf396.snodes = ['buf142', 'buf143', 'buf144', 'buf396']
+
+
+buf145: SchedulerNode(ComputedBuffer)
+buf145.writes = [MemoryDep(name='buf145', index=c0, size=(6291456,))]
+buf145.unmet_dependencies = [   MemoryDep(name='buf138', index=98304*c0 + 64*c1 + 768*c2 + c3, size=(64, 12, 128, 64))]
+buf145.met_dependencies = []
+buf145.group.device = cuda:0
+buf145.group.iteration = (6291456, 1)
+buf145.sizes = ([64, 12, 128, 64], [])
+class buf145_loop_body:
+    var_ranges = {z0: 64, z1: 12, z2: 128, z3: 64}
+    index0 = 98304*z0 + 64*z1 + 768*z2 + z3
+    index1 = 98304*z0 + 8192*z1 + 64*z2 + z3
+    def body(self, ops):
+        get_index = self.get_index('index0')
+        load = ops.load('buf138', get_index)
+        get_index_1 = self.get_index('index1')
+        store = ops.store('buf145', get_index_1, load, None)
+        return store
+
+
+buf146: ExternKernelSchedulerNode(BatchMatrixMultiply)
+buf146.writes = [StarDep(name='buf146')]
+buf146.unmet_dependencies = [StarDep(name='buf144'), StarDep(name='buf145')]
+buf146.met_dependencies = []
+buf146.node.kernel = aten.bmm.out
+
+
+buf147: SchedulerNode(ComputedBuffer)
+buf147.writes = [MemoryDep(name='buf147', index=c0, size=(6291456,))]
+buf147.unmet_dependencies = [   MemoryDep(name='buf146', index=98304*c0 + 64*c1 + 8192*c2 + c3, size=(64, 128, 12, 64))]
+buf147.met_dependencies = []
+buf147.group.device = cuda:0
+buf147.group.iteration = (6291456, 1)
+buf147.sizes = ([64, 128, 12, 64], [])
+class buf147_loop_body:
+    var_ranges = {z0: 64, z1: 128, z2: 12, z3: 64}
+    index0 = 98304*z0 + 64*z1 + 8192*z2 + z3
+    index1 = 98304*z0 + 768*z1 + 64*z2 + z3
+    def body(self, ops):
+        get_index = self.get_index('index0')
+        load = ops.load('buf146', get_index)
+        get_index_1 = self.get_index('index1')
+        store = ops.store('buf147', get_index_1, load, None)
+        return store
+
+
+buf148: ExternKernelSchedulerNode(MatrixMultiplyAdd)
+buf148.writes = [StarDep(name='buf148')]
+buf148.unmet_dependencies = [StarDep(name='buf147')]
+buf148.met_dependencies = [StarDep(name='primals_92'), StarDep(name='primals_93')]
+buf148.node.kernel = aten.addmm.out
+
+
+buf149_buf150_buf151_buf152_buf153_buf395: FusedSchedulerNode(NoneType)
+buf149_buf150_buf151_buf152_buf153_buf395.writes = 
+    [   MemoryDep(name='buf149', index=c0, size=(8192, 768)),
+        MemoryDep(name='buf149', index=c0, size=(8192,)),
+        MemoryDep(name='buf150', index=c0, size=(8192, 768)),
+        MemoryDep(name='buf150', index=c0, size=(8192,)),
+        MemoryDep(name='buf151', index=c0, size=(8192, 768)),
+        MemoryDep(name='buf151', index=c0, size=(8192,)),
+        MemoryDep(name='buf152', index=c0, size=(6291456,)),
+        MemoryDep(name='buf153', index=c0, size=(6291456,)),
+        MemoryDep(name='buf395', index=c0, size=(8192,))]
+buf149_buf150_buf151_buf152_buf153_buf395.unmet_dependencies = 
+    [   MemoryDep(name='buf135', index=c0, size=(6291456,)),
+        MemoryDep(name='buf148', index=c0, size=(6291456,))]
+buf149_buf150_buf151_buf152_buf153_buf395.met_dependencies = 
+    [   MemoryDep(name='primals_94', index=c1, size=(8192, 768)),
+        MemoryDep(name='primals_95', index=c1, size=(8192, 768)),
+        MemoryDep(name='seed_cuda_0', index=0, size=(6291456,))]
+buf149_buf150_buf151_buf152_buf153_buf395.snodes = ['buf149', 'buf150', 'buf151', 'buf152', 'buf153', 'buf395']
+
+
+buf154: ExternKernelSchedulerNode(MatrixMultiplyAdd)
+buf154.writes = [StarDep(name='buf154')]
+buf154.unmet_dependencies = [StarDep(name='buf153')]
+buf154.met_dependencies = [StarDep(name='primals_96'), StarDep(name='primals_97')]
+buf154.node.kernel = aten.addmm.out
+
+
+buf155_buf394: FusedSchedulerNode(NoneType)
+buf155_buf394.writes = 
+    [   MemoryDep(name='buf155', index=c0, size=(25165824,)),
+        MemoryDep(name='buf394', index=c0, size=(25165824,))]
+buf155_buf394.unmet_dependencies = [MemoryDep(name='buf154', index=c0, size=(25165824,))]
+buf155_buf394.met_dependencies = []
+buf155_buf394.snodes = ['buf155', 'buf394']
+
+
+buf156: ExternKernelSchedulerNode(MatrixMultiplyAdd)
+buf156.writes = [StarDep(name='buf156')]
+buf156.unmet_dependencies = [StarDep(name='buf155')]
+buf156.met_dependencies = [StarDep(name='primals_98'), StarDep(name='primals_99')]
+buf156.node.kernel = aten.addmm.out
+
+
+buf157_buf158_buf159_buf160_buf161_buf393: FusedSchedulerNode(NoneType)
+buf157_buf158_buf159_buf160_buf161_buf393.writes = 
+    [   MemoryDep(name='buf157', index=c0, size=(8192, 768)),
+        MemoryDep(name='buf157', index=c0, size=(8192,)),
+        MemoryDep(name='buf158', index=c0, size=(8192, 768)),
+        MemoryDep(name='buf158', index=c0, size=(8192,)),
+        MemoryDep(name='buf159', index=c0, size=(8192, 768)),
+        MemoryDep(name='buf159', index=c0, size=(8192,)),
+        MemoryDep(name='buf160', index=c0, size=(6291456,)),
+        MemoryDep(name='buf161', index=c0, size=(6291456,)),
+        MemoryDep(name='buf393', index=c0, size=(8192,))]
+buf157_buf158_buf159_buf160_buf161_buf393.unmet_dependencies = 
+    [   MemoryDep(name='buf153', index=c0, size=(6291456,)),
+        MemoryDep(name='buf156', index=c0, size=(6291456,))]
+buf157_buf158_buf159_buf160_buf161_buf393.met_dependencies = 
+    [   MemoryDep(name='primals_100', index=c1, size=(8192, 768)),
+        MemoryDep(name='primals_101', index=c1, size=(8192, 768)),
+        MemoryDep(name='seed_cuda_0', index=0, size=(6291456,))]
+buf157_buf158_buf159_buf160_buf161_buf393.snodes = ['buf157', 'buf158', 'buf159', 'buf160', 'buf161', 'buf393']
+
+
+buf162: ExternKernelSchedulerNode(MatrixMultiplyAdd)
+buf162.writes = [StarDep(name='buf162')]
+buf162.unmet_dependencies = [StarDep(name='buf161')]
+buf162.met_dependencies = [StarDep(name='primals_102'), StarDep(name='primals_103')]
+buf162.node.kernel = aten.addmm.out
+
+
+buf163: ExternKernelSchedulerNode(MatrixMultiplyAdd)
+buf163.writes = [StarDep(name='buf163')]
+buf163.unmet_dependencies = [StarDep(name='buf161')]
+buf163.met_dependencies = [StarDep(name='primals_104'), StarDep(name='primals_105')]
+buf163.node.kernel = aten.addmm.out
+
+
+buf164: ExternKernelSchedulerNode(MatrixMultiplyAdd)
+buf164.writes = [StarDep(name='buf164')]
+buf164.unmet_dependencies = [StarDep(name='buf161')]
+buf164.met_dependencies = [StarDep(name='primals_106'), StarDep(name='primals_107')]
+buf164.node.kernel = aten.addmm.out
+
+
+buf165: SchedulerNode(ComputedBuffer)
+buf165.writes = [MemoryDep(name='buf165', index=c0, size=(6291456,))]
+buf165.unmet_dependencies = [   MemoryDep(name='buf162', index=98304*c0 + 64*c1 + 768*c2 + c3, size=(64, 12, 128, 64))]
+buf165.met_dependencies = []
+buf165.group.device = cuda:0
+buf165.group.iteration = (6291456, 1)
+buf165.sizes = ([64, 12, 128, 64], [])
+class buf165_loop_body:
+    var_ranges = {z0: 64, z1: 12, z2: 128, z3: 64}
+    index0 = 98304*z0 + 64*z1 + 768*z2 + z3
+    index1 = 98304*z0 + 8192*z1 + 64*z2 + z3
+    def body(self, ops):
+        get_index = self.get_index('index0')
+        load = ops.load('buf162', get_index)
+        get_index_1 = self.get_index('index1')
+        store = ops.store('buf165', get_index_1, load, None)
+        return store
+
+
+buf166: SchedulerNode(ComputedBuffer)
+buf166.writes = [MemoryDep(name='buf166', index=c0, size=(6291456,))]
+buf166.unmet_dependencies = [MemoryDep(name='buf163', index=98304*c0 + c1 + 768*c2, size=(64, 768, 128))]
+buf166.met_dependencies = []
+buf166.group.device = cuda:0
+buf166.group.iteration = (6291456, 1)
+buf166.sizes = ([64, 768, 128], [])
+class buf166_loop_body:
+    var_ranges = {z0: 64, z1: 768, z2: 128}
+    index0 = 98304*z0 + z1 + 768*z2
+    index1 = 98304*z0 + 128*z1 + z2
+    def body(self, ops):
+        get_index = self.get_index('index0')
+        load = ops.load('buf163', get_index)
+        get_index_1 = self.get_index('index1')
+        store = ops.store('buf166', get_index_1, load, None)
+        return store
+
+
+buf167: ExternKernelSchedulerNode(BatchMatrixMultiply)
+buf167.writes = [StarDep(name='buf167')]
+buf167.unmet_dependencies = [StarDep(name='buf165'), StarDep(name='buf166')]
+buf167.met_dependencies = []
+buf167.node.kernel = aten.bmm.out
+
+
+buf168_buf169_buf170_buf392: FusedSchedulerNode(NoneType)
+buf168_buf169_buf170_buf392.writes = 
+    [   MemoryDep(name='buf168', index=c0, size=(98304, 128)),
+        MemoryDep(name='buf168', index=c0, size=(98304,)),
+        MemoryDep(name='buf169', index=c0, size=(98304, 128)),
+        MemoryDep(name='buf169', index=c0, size=(98304,)),
+        MemoryDep(name='buf170', index=c0, size=(12582912,)),
+        MemoryDep(name='buf392', index=c0, size=(12582912,))]
+buf168_buf169_buf170_buf392.unmet_dependencies = [MemoryDep(name='buf167', index=c0, size=(12582912,))]
+buf168_buf169_buf170_buf392.met_dependencies = [MemoryDep(name='seed_cuda_0', index=0, size=(12582912,))]
+buf168_buf169_buf170_buf392.snodes = ['buf168', 'buf169', 'buf170', 'buf392']
+
+
+buf171: SchedulerNode(ComputedBuffer)
+buf171.writes = [MemoryDep(name='buf171', index=c0, size=(6291456,))]
+buf171.unmet_dependencies = [   MemoryDep(name='buf164', index=98304*c0 + 64*c1 + 768*c2 + c3, size=(64, 12, 128, 64))]
+buf171.met_dependencies = []
+buf171.group.device = cuda:0
+buf171.group.iteration = (6291456, 1)
+buf171.sizes = ([64, 12, 128, 64], [])
+class buf171_loop_body:
+    var_ranges = {z0: 64, z1: 12, z2: 128, z3: 64}
+    index0 = 98304*z0 + 64*z1 + 768*z2 + z3
+    index1 = 98304*z0 + 8192*z1 + 64*z2 + z3
+    def body(self, ops):
+        get_index = self.get_index('index0')
+        load = ops.load('buf164', get_index)
+        get_index_1 = self.get_index('index1')
+        store = ops.store('buf171', get_index_1, load, None)
+        return store
+
+
+buf172: ExternKernelSchedulerNode(BatchMatrixMultiply)
+buf172.writes = [StarDep(name='buf172')]
+buf172.unmet_dependencies = [StarDep(name='buf170'), StarDep(name='buf171')]
+buf172.met_dependencies = []
+buf172.node.kernel = aten.bmm.out
+
+
+buf173: SchedulerNode(ComputedBuffer)
+buf173.writes = [MemoryDep(name='buf173', index=c0, size=(6291456,))]
+buf173.unmet_dependencies = [   MemoryDep(name='buf172', index=98304*c0 + 64*c1 + 8192*c2 + c3, size=(64, 128, 12, 64))]
+buf173.met_dependencies = []
+buf173.group.device = cuda:0
+buf173.group.iteration = (6291456, 1)
+buf173.sizes = ([64, 128, 12, 64], [])
+class buf173_loop_body:
+    var_ranges = {z0: 64, z1: 128, z2: 12, z3: 64}
+    index0 = 98304*z0 + 64*z1 + 8192*z2 + z3
+    index1 = 98304*z0 + 768*z1 + 64*z2 + z3
+    def body(self, ops):
+        get_index = self.get_index('index0')
+        load = ops.load('buf172', get_index)
+        get_index_1 = self.get_index('index1')
+        store = ops.store('buf173', get_index_1, load, None)
+        return store
+
+
+buf174: ExternKernelSchedulerNode(MatrixMultiplyAdd)
+buf174.writes = [StarDep(name='buf174')]
+buf174.unmet_dependencies = [StarDep(name='buf173')]
+buf174.met_dependencies = [StarDep(name='primals_108'), StarDep(name='primals_109')]
+buf174.node.kernel = aten.addmm.out
+
+
+buf175_buf176_buf177_buf178_buf179_buf391: FusedSchedulerNode(NoneType)
+buf175_buf176_buf177_buf178_buf179_buf391.writes = 
+    [   MemoryDep(name='buf175', index=c0, size=(8192, 768)),
+        MemoryDep(name='buf175', index=c0, size=(8192,)),
+        MemoryDep(name='buf176', index=c0, size=(8192, 768)),
+        MemoryDep(name='buf176', index=c0, size=(8192,)),
+        MemoryDep(name='buf177', index=c0, size=(8192, 768)),
+        MemoryDep(name='buf177', index=c0, size=(8192,)),
+        MemoryDep(name='buf178', index=c0, size=(6291456,)),
+        MemoryDep(name='buf179', index=c0, size=(6291456,)),
+        MemoryDep(name='buf391', index=c0, size=(8192,))]
+buf175_buf176_buf177_buf178_buf179_buf391.unmet_dependencies = 
+    [   MemoryDep(name='buf161', index=c0, size=(6291456,)),
+        MemoryDep(name='buf174', index=c0, size=(6291456,))]
+buf175_buf176_buf177_buf178_buf179_buf391.met_dependencies = 
+    [   MemoryDep(name='primals_110', index=c1, size=(8192, 768)),
+        MemoryDep(name='primals_111', index=c1, size=(8192, 768)),
+        MemoryDep(name='seed_cuda_0', index=0, size=(6291456,))]
+buf175_buf176_buf177_buf178_buf179_buf391.snodes = ['buf175', 'buf176', 'buf177', 'buf178', 'buf179', 'buf391']
+
+
+buf180: ExternKernelSchedulerNode(MatrixMultiplyAdd)
+buf180.writes = [StarDep(name='buf180')]
+buf180.unmet_dependencies = [StarDep(name='buf179')]
+buf180.met_dependencies = [StarDep(name='primals_112'), StarDep(name='primals_113')]
+buf180.node.kernel = aten.addmm.out
+
+
+buf181_buf390: FusedSchedulerNode(NoneType)
+buf181_buf390.writes = 
+    [   MemoryDep(name='buf181', index=c0, size=(25165824,)),
+        MemoryDep(name='buf390', index=c0, size=(25165824,))]
+buf181_buf390.unmet_dependencies = [MemoryDep(name='buf180', index=c0, size=(25165824,))]
+buf181_buf390.met_dependencies = []
+buf181_buf390.snodes = ['buf181', 'buf390']
+
+
+buf182: ExternKernelSchedulerNode(MatrixMultiplyAdd)
+buf182.writes = [StarDep(name='buf182')]
+buf182.unmet_dependencies = [StarDep(name='buf181')]
+buf182.met_dependencies = [StarDep(name='primals_114'), StarDep(name='primals_115')]
+buf182.node.kernel = aten.addmm.out
+
+
+buf183_buf184_buf185_buf186_buf187_buf389: FusedSchedulerNode(NoneType)
+buf183_buf184_buf185_buf186_buf187_buf389.writes = 
+    [   MemoryDep(name='buf183', index=c0, size=(8192, 768)),
+        MemoryDep(name='buf183', index=c0, size=(8192,)),
+        MemoryDep(name='buf184', index=c0, size=(8192, 768)),
+        MemoryDep(name='buf184', index=c0, size=(8192,)),
+        MemoryDep(name='buf185', index=c0, size=(8192, 768)),
+        MemoryDep(name='buf185', index=c0, size=(8192,)),
+        MemoryDep(name='buf186', index=c0, size=(6291456,)),
+        MemoryDep(name='buf187', index=c0, size=(6291456,)),
+        MemoryDep(name='buf389', index=c0, size=(8192,))]
+buf183_buf184_buf185_buf186_buf187_buf389.unmet_dependencies = 
+    [   MemoryDep(name='buf179', index=c0, size=(6291456,)),
+        MemoryDep(name='buf182', index=c0, size=(6291456,))]
+buf183_buf184_buf185_buf186_buf187_buf389.met_dependencies = 
+    [   MemoryDep(name='primals_116', index=c1, size=(8192, 768)),
+        MemoryDep(name='primals_117', index=c1, size=(8192, 768)),
+        MemoryDep(name='seed_cuda_0', index=0, size=(6291456,))]
+buf183_buf184_buf185_buf186_buf187_buf389.snodes = ['buf183', 'buf184', 'buf185', 'buf186', 'buf187', 'buf389']
+
+
+buf188: ExternKernelSchedulerNode(MatrixMultiplyAdd)
+buf188.writes = [StarDep(name='buf188')]
+buf188.unmet_dependencies = [StarDep(name='buf187')]
+buf188.met_dependencies = [StarDep(name='primals_118'), StarDep(name='primals_119')]
+buf188.node.kernel = aten.addmm.out
+
+
+buf189: ExternKernelSchedulerNode(MatrixMultiplyAdd)
+buf189.writes = [StarDep(name='buf189')]
+buf189.unmet_dependencies = [StarDep(name='buf187')]
+buf189.met_dependencies = [StarDep(name='primals_120'), StarDep(name='primals_121')]
+buf189.node.kernel = aten.addmm.out
+
+
+buf190: ExternKernelSchedulerNode(MatrixMultiplyAdd)
+buf190.writes = [StarDep(name='buf190')]
+buf190.unmet_dependencies = [StarDep(name='buf187')]
+buf190.met_dependencies = [StarDep(name='primals_122'), StarDep(name='primals_123')]
+buf190.node.kernel = aten.addmm.out
+
+
+buf191: SchedulerNode(ComputedBuffer)
+buf191.writes = [MemoryDep(name='buf191', index=c0, size=(6291456,))]
+buf191.unmet_dependencies = [   MemoryDep(name='buf188', index=98304*c0 + 64*c1 + 768*c2 + c3, size=(64, 12, 128, 64))]
+buf191.met_dependencies = []
+buf191.group.device = cuda:0
+buf191.group.iteration = (6291456, 1)
+buf191.sizes = ([64, 12, 128, 64], [])
+class buf191_loop_body:
+    var_ranges = {z0: 64, z1: 12, z2: 128, z3: 64}
+    index0 = 98304*z0 + 64*z1 + 768*z2 + z3
+    index1 = 98304*z0 + 8192*z1 + 64*z2 + z3
+    def body(self, ops):
+        get_index = self.get_index('index0')
+        load = ops.load('buf188', get_index)
+        get_index_1 = self.get_index('index1')
+        store = ops.store('buf191', get_index_1, load, None)
+        return store
+
+
+buf192: SchedulerNode(ComputedBuffer)
+buf192.writes = [MemoryDep(name='buf192', index=c0, size=(6291456,))]
+buf192.unmet_dependencies = [MemoryDep(name='buf189', index=98304*c0 + c1 + 768*c2, size=(64, 768, 128))]
+buf192.met_dependencies = []
+buf192.group.device = cuda:0
+buf192.group.iteration = (6291456, 1)
+buf192.sizes = ([64, 768, 128], [])
+class buf192_loop_body:
+    var_ranges = {z0: 64, z1: 768, z2: 128}
+    index0 = 98304*z0 + z1 + 768*z2
+    index1 = 98304*z0 + 128*z1 + z2
+    def body(self, ops):
+        get_index = self.get_index('index0')
+        load = ops.load('buf189', get_index)
+        get_index_1 = self.get_index('index1')
+        store = ops.store('buf192', get_index_1, load, None)
+        return store
+
+
+buf193: ExternKernelSchedulerNode(BatchMatrixMultiply)
+buf193.writes = [StarDep(name='buf193')]
+buf193.unmet_dependencies = [StarDep(name='buf191'), StarDep(name='buf192')]
+buf193.met_dependencies = []
+buf193.node.kernel = aten.bmm.out
+
+
+buf194_buf195_buf196_buf388: FusedSchedulerNode(NoneType)
+buf194_buf195_buf196_buf388.writes = 
+    [   MemoryDep(name='buf194', index=c0, size=(98304, 128)),
+        MemoryDep(name='buf194', index=c0, size=(98304,)),
+        MemoryDep(name='buf195', index=c0, size=(98304, 128)),
+        MemoryDep(name='buf195', index=c0, size=(98304,)),
+        MemoryDep(name='buf196', index=c0, size=(12582912,)),
+        MemoryDep(name='buf388', index=c0, size=(12582912,))]
+buf194_buf195_buf196_buf388.unmet_dependencies = [MemoryDep(name='buf193', index=c0, size=(12582912,))]
+buf194_buf195_buf196_buf388.met_dependencies = [MemoryDep(name='seed_cuda_0', index=0, size=(12582912,))]
+buf194_buf195_buf196_buf388.snodes = ['buf194', 'buf195', 'buf196', 'buf388']
+
+
+buf197: SchedulerNode(ComputedBuffer)
+buf197.writes = [MemoryDep(name='buf197', index=c0, size=(6291456,))]
+buf197.unmet_dependencies = [   MemoryDep(name='buf190', index=98304*c0 + 64*c1 + 768*c2 + c3, size=(64, 12, 128, 64))]
+buf197.met_dependencies = []
+buf197.group.device = cuda:0
+buf197.group.iteration = (6291456, 1)
+buf197.sizes = ([64, 12, 128, 64], [])
+class buf197_loop_body:
+    var_ranges = {z0: 64, z1: 12, z2: 128, z3: 64}
+    index0 = 98304*z0 + 64*z1 + 768*z2 + z3
+    index1 = 98304*z0 + 8192*z1 + 64*z2 + z3
+    def body(self, ops):
+        get_index = self.get_index('index0')
+        load = ops.load('buf190', get_index)
+        get_index_1 = self.get_index('index1')
+        store = ops.store('buf197', get_index_1, load, None)
+        return store
+
+
+buf198: ExternKernelSchedulerNode(BatchMatrixMultiply)
+buf198.writes = [StarDep(name='buf198')]
+buf198.unmet_dependencies = [StarDep(name='buf196'), StarDep(name='buf197')]
+buf198.met_dependencies = []
+buf198.node.kernel = aten.bmm.out
+
+
+buf199: SchedulerNode(ComputedBuffer)
+buf199.writes = [MemoryDep(name='buf199', index=c0, size=(6291456,))]
+buf199.unmet_dependencies = [   MemoryDep(name='buf198', index=98304*c0 + 64*c1 + 8192*c2 + c3, size=(64, 128, 12, 64))]
+buf199.met_dependencies = []
+buf199.group.device = cuda:0
+buf199.group.iteration = (6291456, 1)
+buf199.sizes = ([64, 128, 12, 64], [])
+class buf199_loop_body:
+    var_ranges = {z0: 64, z1: 128, z2: 12, z3: 64}
+    index0 = 98304*z0 + 64*z1 + 8192*z2 + z3
+    index1 = 98304*z0 + 768*z1 + 64*z2 + z3
+    def body(self, ops):
+        get_index = self.get_index('index0')
+        load = ops.load('buf198', get_index)
+        get_index_1 = self.get_index('index1')
+        store = ops.store('buf199', get_index_1, load, None)
+        return store
+
+
+buf200: ExternKernelSchedulerNode(MatrixMultiplyAdd)
+buf200.writes = [StarDep(name='buf200')]
+buf200.unmet_dependencies = [StarDep(name='buf199')]
+buf200.met_dependencies = [StarDep(name='primals_124'), StarDep(name='primals_125')]
+buf200.node.kernel = aten.addmm.out
+
+
+buf201_buf202_buf203_buf204_buf205_buf387: FusedSchedulerNode(NoneType)
+buf201_buf202_buf203_buf204_buf205_buf387.writes = 
+    [   MemoryDep(name='buf201', index=c0, size=(8192, 768)),
+        MemoryDep(name='buf201', index=c0, size=(8192,)),
+        MemoryDep(name='buf202', index=c0, size=(8192, 768)),
+        MemoryDep(name='buf202', index=c0, size=(8192,)),
+        MemoryDep(name='buf203', index=c0, size=(8192, 768)),
+        MemoryDep(name='buf203', index=c0, size=(8192,)),
+        MemoryDep(name='buf204', index=c0, size=(6291456,)),
+        MemoryDep(name='buf205', index=c0, size=(6291456,)),
+        MemoryDep(name='buf387', index=c0, size=(8192,))]
+buf201_buf202_buf203_buf204_buf205_buf387.unmet_dependencies = 
+    [   MemoryDep(name='buf187', index=c0, size=(6291456,)),
+        MemoryDep(name='buf200', index=c0, size=(6291456,))]
+buf201_buf202_buf203_buf204_buf205_buf387.met_dependencies = 
+    [   MemoryDep(name='primals_126', index=c1, size=(8192, 768)),
+        MemoryDep(name='primals_127', index=c1, size=(8192, 768)),
+        MemoryDep(name='seed_cuda_0', index=0, size=(6291456,))]
+buf201_buf202_buf203_buf204_buf205_buf387.snodes = ['buf201', 'buf202', 'buf203', 'buf204', 'buf205', 'buf387']
+
+
+buf206: ExternKernelSchedulerNode(MatrixMultiplyAdd)
+buf206.writes = [StarDep(name='buf206')]
+buf206.unmet_dependencies = [StarDep(name='buf205')]
+buf206.met_dependencies = [StarDep(name='primals_128'), StarDep(name='primals_129')]
+buf206.node.kernel = aten.addmm.out
+
+
+buf207_buf386: FusedSchedulerNode(NoneType)
+buf207_buf386.writes = 
+    [   MemoryDep(name='buf207', index=c0, size=(25165824,)),
+        MemoryDep(name='buf386', index=c0, size=(25165824,))]
+buf207_buf386.unmet_dependencies = [MemoryDep(name='buf206', index=c0, size=(25165824,))]
+buf207_buf386.met_dependencies = []
+buf207_buf386.snodes = ['buf207', 'buf386']
+
+
+buf208: ExternKernelSchedulerNode(MatrixMultiplyAdd)
+buf208.writes = [StarDep(name='buf208')]
+buf208.unmet_dependencies = [StarDep(name='buf207')]
+buf208.met_dependencies = [StarDep(name='primals_130'), StarDep(name='primals_131')]
+buf208.node.kernel = aten.addmm.out
+
+
+buf209_buf210_buf211_buf212_buf213_buf385: FusedSchedulerNode(NoneType)
+buf209_buf210_buf211_buf212_buf213_buf385.writes = 
+    [   MemoryDep(name='buf209', index=c0, size=(8192, 768)),
+        MemoryDep(name='buf209', index=c0, size=(8192,)),
+        MemoryDep(name='buf210', index=c0, size=(8192, 768)),
+        MemoryDep(name='buf210', index=c0, size=(8192,)),
+        MemoryDep(name='buf211', index=c0, size=(8192, 768)),
+        MemoryDep(name='buf211', index=c0, size=(8192,)),
+        MemoryDep(name='buf212', index=c0, size=(6291456,)),
+        MemoryDep(name='buf213', index=c0, size=(6291456,)),
+        MemoryDep(name='buf385', index=c0, size=(8192,))]
+buf209_buf210_buf211_buf212_buf213_buf385.unmet_dependencies = 
+    [   MemoryDep(name='buf205', index=c0, size=(6291456,)),
+        MemoryDep(name='buf208', index=c0, size=(6291456,))]
+buf209_buf210_buf211_buf212_buf213_buf385.met_dependencies = 
+    [   MemoryDep(name='primals_132', index=c1, size=(8192, 768)),
+        MemoryDep(name='primals_133', index=c1, size=(8192, 768)),
+        MemoryDep(name='seed_cuda_0', index=0, size=(6291456,))]
+buf209_buf210_buf211_buf212_buf213_buf385.snodes = ['buf209', 'buf210', 'buf211', 'buf212', 'buf213', 'buf385']
+
+
+buf214: ExternKernelSchedulerNode(MatrixMultiplyAdd)
+buf214.writes = [StarDep(name='buf214')]
+buf214.unmet_dependencies = [StarDep(name='buf213')]
+buf214.met_dependencies = [StarDep(name='primals_134'), StarDep(name='primals_135')]
+buf214.node.kernel = aten.addmm.out
+
+
+buf215: ExternKernelSchedulerNode(MatrixMultiplyAdd)
+buf215.writes = [StarDep(name='buf215')]
+buf215.unmet_dependencies = [StarDep(name='buf213')]
+buf215.met_dependencies = [StarDep(name='primals_136'), StarDep(name='primals_137')]
+buf215.node.kernel = aten.addmm.out
+
+
+buf216: ExternKernelSchedulerNode(MatrixMultiplyAdd)
+buf216.writes = [StarDep(name='buf216')]
+buf216.unmet_dependencies = [StarDep(name='buf213')]
+buf216.met_dependencies = [StarDep(name='primals_138'), StarDep(name='primals_139')]
+buf216.node.kernel = aten.addmm.out
+
+
+buf217: SchedulerNode(ComputedBuffer)
+buf217.writes = [MemoryDep(name='buf217', index=c0, size=(6291456,))]
+buf217.unmet_dependencies = [   MemoryDep(name='buf214', index=98304*c0 + 64*c1 + 768*c2 + c3, size=(64, 12, 128, 64))]
+buf217.met_dependencies = []
+buf217.group.device = cuda:0
+buf217.group.iteration = (6291456, 1)
+buf217.sizes = ([64, 12, 128, 64], [])
+class buf217_loop_body:
+    var_ranges = {z0: 64, z1: 12, z2: 128, z3: 64}
+    index0 = 98304*z0 + 64*z1 + 768*z2 + z3
+    index1 = 98304*z0 + 8192*z1 + 64*z2 + z3
+    def body(self, ops):
+        get_index = self.get_index('index0')
+        load = ops.load('buf214', get_index)
+        get_index_1 = self.get_index('index1')
+        store = ops.store('buf217', get_index_1, load, None)
+        return store
+
+
+buf218: SchedulerNode(ComputedBuffer)
+buf218.writes = [MemoryDep(name='buf218', index=c0, size=(6291456,))]
+buf218.unmet_dependencies = [MemoryDep(name='buf215', index=98304*c0 + c1 + 768*c2, size=(64, 768, 128))]
+buf218.met_dependencies = []
+buf218.group.device = cuda:0
+buf218.group.iteration = (6291456, 1)
+buf218.sizes = ([64, 768, 128], [])
+class buf218_loop_body:
+    var_ranges = {z0: 64, z1: 768, z2: 128}
+    index0 = 98304*z0 + z1 + 768*z2
+    index1 = 98304*z0 + 128*z1 + z2
+    def body(self, ops):
+        get_index = self.get_index('index0')
+        load = ops.load('buf215', get_index)
+        get_index_1 = self.get_index('index1')
+        store = ops.store('buf218', get_index_1, load, None)
+        return store
+
+
+buf219: ExternKernelSchedulerNode(BatchMatrixMultiply)
+buf219.writes = [StarDep(name='buf219')]
+buf219.unmet_dependencies = [StarDep(name='buf217'), StarDep(name='buf218')]
+buf219.met_dependencies = []
+buf219.node.kernel = aten.bmm.out
+
+
+buf220_buf221_buf222_buf384: FusedSchedulerNode(NoneType)
+buf220_buf221_buf222_buf384.writes = 
+    [   MemoryDep(name='buf220', index=c0, size=(98304, 128)),
+        MemoryDep(name='buf220', index=c0, size=(98304,)),
+        MemoryDep(name='buf221', index=c0, size=(98304, 128)),
+        MemoryDep(name='buf221', index=c0, size=(98304,)),
+        MemoryDep(name='buf222', index=c0, size=(12582912,)),
+        MemoryDep(name='buf384', index=c0, size=(12582912,))]
+buf220_buf221_buf222_buf384.unmet_dependencies = [MemoryDep(name='buf219', index=c0, size=(12582912,))]
+buf220_buf221_buf222_buf384.met_dependencies = [MemoryDep(name='seed_cuda_0', index=0, size=(12582912,))]
+buf220_buf221_buf222_buf384.snodes = ['buf220', 'buf221', 'buf222', 'buf384']
+
+
+buf223: SchedulerNode(ComputedBuffer)
+buf223.writes = [MemoryDep(name='buf223', index=c0, size=(6291456,))]
+buf223.unmet_dependencies = [   MemoryDep(name='buf216', index=98304*c0 + 64*c1 + 768*c2 + c3, size=(64, 12, 128, 64))]
+buf223.met_dependencies = []
+buf223.group.device = cuda:0
+buf223.group.iteration = (6291456, 1)
+buf223.sizes = ([64, 12, 128, 64], [])
+class buf223_loop_body:
+    var_ranges = {z0: 64, z1: 12, z2: 128, z3: 64}
+    index0 = 98304*z0 + 64*z1 + 768*z2 + z3
+    index1 = 98304*z0 + 8192*z1 + 64*z2 + z3
+    def body(self, ops):
+        get_index = self.get_index('index0')
+        load = ops.load('buf216', get_index)
+        get_index_1 = self.get_index('index1')
+        store = ops.store('buf223', get_index_1, load, None)
+        return store
+
+
+buf224: ExternKernelSchedulerNode(BatchMatrixMultiply)
+buf224.writes = [StarDep(name='buf224')]
+buf224.unmet_dependencies = [StarDep(name='buf222'), StarDep(name='buf223')]
+buf224.met_dependencies = []
+buf224.node.kernel = aten.bmm.out
+
+
+buf225: SchedulerNode(ComputedBuffer)
+buf225.writes = [MemoryDep(name='buf225', index=c0, size=(6291456,))]
+buf225.unmet_dependencies = [   MemoryDep(name='buf224', index=98304*c0 + 64*c1 + 8192*c2 + c3, size=(64, 128, 12, 64))]
+buf225.met_dependencies = []
+buf225.group.device = cuda:0
+buf225.group.iteration = (6291456, 1)
+buf225.sizes = ([64, 128, 12, 64], [])
+class buf225_loop_body:
+    var_ranges = {z0: 64, z1: 128, z2: 12, z3: 64}
+    index0 = 98304*z0 + 64*z1 + 8192*z2 + z3
+    index1 = 98304*z0 + 768*z1 + 64*z2 + z3
+    def body(self, ops):
+        get_index = self.get_index('index0')
+        load = ops.load('buf224', get_index)
+        get_index_1 = self.get_index('index1')
+        store = ops.store('buf225', get_index_1, load, None)
+        return store
+
+
+buf226: ExternKernelSchedulerNode(MatrixMultiplyAdd)
+buf226.writes = [StarDep(name='buf226')]
+buf226.unmet_dependencies = [StarDep(name='buf225')]
+buf226.met_dependencies = [StarDep(name='primals_140'), StarDep(name='primals_141')]
+buf226.node.kernel = aten.addmm.out
+
+
+buf227_buf228_buf229_buf230_buf231_buf383: FusedSchedulerNode(NoneType)
+buf227_buf228_buf229_buf230_buf231_buf383.writes = 
+    [   MemoryDep(name='buf227', index=c0, size=(8192, 768)),
+        MemoryDep(name='buf227', index=c0, size=(8192,)),
+        MemoryDep(name='buf228', index=c0, size=(8192, 768)),
+        MemoryDep(name='buf228', index=c0, size=(8192,)),
+        MemoryDep(name='buf229', index=c0, size=(8192, 768)),
+        MemoryDep(name='buf229', index=c0, size=(8192,)),
+        MemoryDep(name='buf230', index=c0, size=(6291456,)),
+        MemoryDep(name='buf231', index=c0, size=(6291456,)),
+        MemoryDep(name='buf383', index=c0, size=(8192,))]
+buf227_buf228_buf229_buf230_buf231_buf383.unmet_dependencies = 
+    [   MemoryDep(name='buf213', index=c0, size=(6291456,)),
+        MemoryDep(name='buf226', index=c0, size=(6291456,))]
+buf227_buf228_buf229_buf230_buf231_buf383.met_dependencies = 
+    [   MemoryDep(name='primals_142', index=c1, size=(8192, 768)),
+        MemoryDep(name='primals_143', index=c1, size=(8192, 768)),
+        MemoryDep(name='seed_cuda_0', index=0, size=(6291456,))]
+buf227_buf228_buf229_buf230_buf231_buf383.snodes = ['buf227', 'buf228', 'buf229', 'buf230', 'buf231', 'buf383']
+
+
+buf232: ExternKernelSchedulerNode(MatrixMultiplyAdd)
+buf232.writes = [StarDep(name='buf232')]
+buf232.unmet_dependencies = [StarDep(name='buf231')]
+buf232.met_dependencies = [StarDep(name='primals_144'), StarDep(name='primals_145')]
+buf232.node.kernel = aten.addmm.out
+
+
+buf233_buf382: FusedSchedulerNode(NoneType)
+buf233_buf382.writes = 
+    [   MemoryDep(name='buf233', index=c0, size=(25165824,)),
+        MemoryDep(name='buf382', index=c0, size=(25165824,))]
+buf233_buf382.unmet_dependencies = [MemoryDep(name='buf232', index=c0, size=(25165824,))]
+buf233_buf382.met_dependencies = []
+buf233_buf382.snodes = ['buf233', 'buf382']
+
+
+buf234: ExternKernelSchedulerNode(MatrixMultiplyAdd)
+buf234.writes = [StarDep(name='buf234')]
+buf234.unmet_dependencies = [StarDep(name='buf233')]
+buf234.met_dependencies = [StarDep(name='primals_146'), StarDep(name='primals_147')]
+buf234.node.kernel = aten.addmm.out
+
+
+buf235_buf236_buf237_buf238_buf239_buf381: FusedSchedulerNode(NoneType)
+buf235_buf236_buf237_buf238_buf239_buf381.writes = 
+    [   MemoryDep(name='buf235', index=c0, size=(8192, 768)),
+        MemoryDep(name='buf235', index=c0, size=(8192,)),
+        MemoryDep(name='buf236', index=c0, size=(8192, 768)),
+        MemoryDep(name='buf236', index=c0, size=(8192,)),
+        MemoryDep(name='buf237', index=c0, size=(8192, 768)),
+        MemoryDep(name='buf237', index=c0, size=(8192,)),
+        MemoryDep(name='buf238', index=c0, size=(6291456,)),
+        MemoryDep(name='buf239', index=c0, size=(6291456,)),
+        MemoryDep(name='buf381', index=c0, size=(8192,))]
+buf235_buf236_buf237_buf238_buf239_buf381.unmet_dependencies = 
+    [   MemoryDep(name='buf231', index=c0, size=(6291456,)),
+        MemoryDep(name='buf234', index=c0, size=(6291456,))]
+buf235_buf236_buf237_buf238_buf239_buf381.met_dependencies = 
+    [   MemoryDep(name='primals_148', index=c1, size=(8192, 768)),
+        MemoryDep(name='primals_149', index=c1, size=(8192, 768)),
+        MemoryDep(name='seed_cuda_0', index=0, size=(6291456,))]
+buf235_buf236_buf237_buf238_buf239_buf381.snodes = ['buf235', 'buf236', 'buf237', 'buf238', 'buf239', 'buf381']
+
+
+buf240: ExternKernelSchedulerNode(MatrixMultiplyAdd)
+buf240.writes = [StarDep(name='buf240')]
+buf240.unmet_dependencies = [StarDep(name='buf239')]
+buf240.met_dependencies = [StarDep(name='primals_150'), StarDep(name='primals_151')]
+buf240.node.kernel = aten.addmm.out
+
+
+buf241: ExternKernelSchedulerNode(MatrixMultiplyAdd)
+buf241.writes = [StarDep(name='buf241')]
+buf241.unmet_dependencies = [StarDep(name='buf239')]
+buf241.met_dependencies = [StarDep(name='primals_152'), StarDep(name='primals_153')]
+buf241.node.kernel = aten.addmm.out
+
+
+buf242: ExternKernelSchedulerNode(MatrixMultiplyAdd)
+buf242.writes = [StarDep(name='buf242')]
+buf242.unmet_dependencies = [StarDep(name='buf239')]
+buf242.met_dependencies = [StarDep(name='primals_154'), StarDep(name='primals_155')]
+buf242.node.kernel = aten.addmm.out
+
+
+buf243: SchedulerNode(ComputedBuffer)
+buf243.writes = [MemoryDep(name='buf243', index=c0, size=(6291456,))]
+buf243.unmet_dependencies = [   MemoryDep(name='buf240', index=98304*c0 + 64*c1 + 768*c2 + c3, size=(64, 12, 128, 64))]
+buf243.met_dependencies = []
+buf243.group.device = cuda:0
+buf243.group.iteration = (6291456, 1)
+buf243.sizes = ([64, 12, 128, 64], [])
+class buf243_loop_body:
+    var_ranges = {z0: 64, z1: 12, z2: 128, z3: 64}
+    index0 = 98304*z0 + 64*z1 + 768*z2 + z3
+    index1 = 98304*z0 + 8192*z1 + 64*z2 + z3
+    def body(self, ops):
+        get_index = self.get_index('index0')
+        load = ops.load('buf240', get_index)
+        get_index_1 = self.get_index('index1')
+        store = ops.store('buf243', get_index_1, load, None)
+        return store
+
+
+buf244: SchedulerNode(ComputedBuffer)
+buf244.writes = [MemoryDep(name='buf244', index=c0, size=(6291456,))]
+buf244.unmet_dependencies = [MemoryDep(name='buf241', index=98304*c0 + c1 + 768*c2, size=(64, 768, 128))]
+buf244.met_dependencies = []
+buf244.group.device = cuda:0
+buf244.group.iteration = (6291456, 1)
+buf244.sizes = ([64, 768, 128], [])
+class buf244_loop_body:
+    var_ranges = {z0: 64, z1: 768, z2: 128}
+    index0 = 98304*z0 + z1 + 768*z2
+    index1 = 98304*z0 + 128*z1 + z2
+    def body(self, ops):
+        get_index = self.get_index('index0')
+        load = ops.load('buf241', get_index)
+        get_index_1 = self.get_index('index1')
+        store = ops.store('buf244', get_index_1, load, None)
+        return store
+
+
+buf245: ExternKernelSchedulerNode(BatchMatrixMultiply)
+buf245.writes = [StarDep(name='buf245')]
+buf245.unmet_dependencies = [StarDep(name='buf243'), StarDep(name='buf244')]
+buf245.met_dependencies = []
+buf245.node.kernel = aten.bmm.out
+
+
+buf246_buf247_buf248_buf380: FusedSchedulerNode(NoneType)
+buf246_buf247_buf248_buf380.writes = 
+    [   MemoryDep(name='buf246', index=c0, size=(98304, 128)),
+        MemoryDep(name='buf246', index=c0, size=(98304,)),
+        MemoryDep(name='buf247', index=c0, size=(98304, 128)),
+        MemoryDep(name='buf247', index=c0, size=(98304,)),
+        MemoryDep(name='buf248', index=c0, size=(12582912,)),
+        MemoryDep(name='buf380', index=c0, size=(12582912,))]
+buf246_buf247_buf248_buf380.unmet_dependencies = [MemoryDep(name='buf245', index=c0, size=(12582912,))]
+buf246_buf247_buf248_buf380.met_dependencies = [MemoryDep(name='seed_cuda_0', index=0, size=(12582912,))]
+buf246_buf247_buf248_buf380.snodes = ['buf246', 'buf247', 'buf248', 'buf380']
+
+
+buf249: SchedulerNode(ComputedBuffer)
+buf249.writes = [MemoryDep(name='buf249', index=c0, size=(6291456,))]
+buf249.unmet_dependencies = [   MemoryDep(name='buf242', index=98304*c0 + 64*c1 + 768*c2 + c3, size=(64, 12, 128, 64))]
+buf249.met_dependencies = []
+buf249.group.device = cuda:0
+buf249.group.iteration = (6291456, 1)
+buf249.sizes = ([64, 12, 128, 64], [])
+class buf249_loop_body:
+    var_ranges = {z0: 64, z1: 12, z2: 128, z3: 64}
+    index0 = 98304*z0 + 64*z1 + 768*z2 + z3
+    index1 = 98304*z0 + 8192*z1 + 64*z2 + z3
+    def body(self, ops):
+        get_index = self.get_index('index0')
+        load = ops.load('buf242', get_index)
+        get_index_1 = self.get_index('index1')
+        store = ops.store('buf249', get_index_1, load, None)
+        return store
+
+
+buf250: ExternKernelSchedulerNode(BatchMatrixMultiply)
+buf250.writes = [StarDep(name='buf250')]
+buf250.unmet_dependencies = [StarDep(name='buf248'), StarDep(name='buf249')]
+buf250.met_dependencies = []
+buf250.node.kernel = aten.bmm.out
+
+
+buf251: SchedulerNode(ComputedBuffer)
+buf251.writes = [MemoryDep(name='buf251', index=c0, size=(6291456,))]
+buf251.unmet_dependencies = [   MemoryDep(name='buf250', index=98304*c0 + 64*c1 + 8192*c2 + c3, size=(64, 128, 12, 64))]
+buf251.met_dependencies = []
+buf251.group.device = cuda:0
+buf251.group.iteration = (6291456, 1)
+buf251.sizes = ([64, 128, 12, 64], [])
+class buf251_loop_body:
+    var_ranges = {z0: 64, z1: 128, z2: 12, z3: 64}
+    index0 = 98304*z0 + 64*z1 + 8192*z2 + z3
+    index1 = 98304*z0 + 768*z1 + 64*z2 + z3
+    def body(self, ops):
+        get_index = self.get_index('index0')
+        load = ops.load('buf250', get_index)
+        get_index_1 = self.get_index('index1')
+        store = ops.store('buf251', get_index_1, load, None)
+        return store
+
+
+buf252: ExternKernelSchedulerNode(MatrixMultiplyAdd)
+buf252.writes = [StarDep(name='buf252')]
+buf252.unmet_dependencies = [StarDep(name='buf251')]
+buf252.met_dependencies = [StarDep(name='primals_156'), StarDep(name='primals_157')]
+buf252.node.kernel = aten.addmm.out
+
+
+buf253_buf254_buf255_buf256_buf257_buf379: FusedSchedulerNode(NoneType)
+buf253_buf254_buf255_buf256_buf257_buf379.writes = 
+    [   MemoryDep(name='buf253', index=c0, size=(8192, 768)),
+        MemoryDep(name='buf253', index=c0, size=(8192,)),
+        MemoryDep(name='buf254', index=c0, size=(8192, 768)),
+        MemoryDep(name='buf254', index=c0, size=(8192,)),
+        MemoryDep(name='buf255', index=c0, size=(8192, 768)),
+        MemoryDep(name='buf255', index=c0, size=(8192,)),
+        MemoryDep(name='buf256', index=c0, size=(6291456,)),
+        MemoryDep(name='buf257', index=c0, size=(6291456,)),
+        MemoryDep(name='buf379', index=c0, size=(8192,))]
+buf253_buf254_buf255_buf256_buf257_buf379.unmet_dependencies = 
+    [   MemoryDep(name='buf239', index=c0, size=(6291456,)),
+        MemoryDep(name='buf252', index=c0, size=(6291456,))]
+buf253_buf254_buf255_buf256_buf257_buf379.met_dependencies = 
+    [   MemoryDep(name='primals_158', index=c1, size=(8192, 768)),
+        MemoryDep(name='primals_159', index=c1, size=(8192, 768)),
+        MemoryDep(name='seed_cuda_0', index=0, size=(6291456,))]
+buf253_buf254_buf255_buf256_buf257_buf379.snodes = ['buf253', 'buf254', 'buf255', 'buf256', 'buf257', 'buf379']
+
+
+buf258: ExternKernelSchedulerNode(MatrixMultiplyAdd)
+buf258.writes = [StarDep(name='buf258')]
+buf258.unmet_dependencies = [StarDep(name='buf257')]
+buf258.met_dependencies = [StarDep(name='primals_160'), StarDep(name='primals_161')]
+buf258.node.kernel = aten.addmm.out
+
+
+buf259_buf378: FusedSchedulerNode(NoneType)
+buf259_buf378.writes = 
+    [   MemoryDep(name='buf259', index=c0, size=(25165824,)),
+        MemoryDep(name='buf378', index=c0, size=(25165824,))]
+buf259_buf378.unmet_dependencies = [MemoryDep(name='buf258', index=c0, size=(25165824,))]
+buf259_buf378.met_dependencies = []
+buf259_buf378.snodes = ['buf259', 'buf378']
+
+
+buf260: ExternKernelSchedulerNode(MatrixMultiplyAdd)
+buf260.writes = [StarDep(name='buf260')]
+buf260.unmet_dependencies = [StarDep(name='buf259')]
+buf260.met_dependencies = [StarDep(name='primals_162'), StarDep(name='primals_163')]
+buf260.node.kernel = aten.addmm.out
+
+
+buf261_buf262_buf263_buf264_buf265_buf377: FusedSchedulerNode(NoneType)
+buf261_buf262_buf263_buf264_buf265_buf377.writes = 
+    [   MemoryDep(name='buf261', index=c0, size=(8192, 768)),
+        MemoryDep(name='buf261', index=c0, size=(8192,)),
+        MemoryDep(name='buf262', index=c0, size=(8192, 768)),
+        MemoryDep(name='buf262', index=c0, size=(8192,)),
+        MemoryDep(name='buf263', index=c0, size=(8192, 768)),
+        MemoryDep(name='buf263', index=c0, size=(8192,)),
+        MemoryDep(name='buf264', index=c0, size=(6291456,)),
+        MemoryDep(name='buf265', index=c0, size=(6291456,)),
+        MemoryDep(name='buf377', index=c0, size=(8192,))]
+buf261_buf262_buf263_buf264_buf265_buf377.unmet_dependencies = 
+    [   MemoryDep(name='buf257', index=c0, size=(6291456,)),
+        MemoryDep(name='buf260', index=c0, size=(6291456,))]
+buf261_buf262_buf263_buf264_buf265_buf377.met_dependencies = 
+    [   MemoryDep(name='primals_164', index=c1, size=(8192, 768)),
+        MemoryDep(name='primals_165', index=c1, size=(8192, 768)),
+        MemoryDep(name='seed_cuda_0', index=0, size=(6291456,))]
+buf261_buf262_buf263_buf264_buf265_buf377.snodes = ['buf261', 'buf262', 'buf263', 'buf264', 'buf265', 'buf377']
+
+
+buf266: ExternKernelSchedulerNode(MatrixMultiplyAdd)
+buf266.writes = [StarDep(name='buf266')]
+buf266.unmet_dependencies = [StarDep(name='buf265')]
+buf266.met_dependencies = [StarDep(name='primals_166'), StarDep(name='primals_167')]
+buf266.node.kernel = aten.addmm.out
+
+
+buf267: ExternKernelSchedulerNode(MatrixMultiplyAdd)
+buf267.writes = [StarDep(name='buf267')]
+buf267.unmet_dependencies = [StarDep(name='buf265')]
+buf267.met_dependencies = [StarDep(name='primals_168'), StarDep(name='primals_169')]
+buf267.node.kernel = aten.addmm.out
+
+
+buf268: ExternKernelSchedulerNode(MatrixMultiplyAdd)
+buf268.writes = [StarDep(name='buf268')]
+buf268.unmet_dependencies = [StarDep(name='buf265')]
+buf268.met_dependencies = [StarDep(name='primals_170'), StarDep(name='primals_171')]
+buf268.node.kernel = aten.addmm.out
+
+
+buf269: SchedulerNode(ComputedBuffer)
+buf269.writes = [MemoryDep(name='buf269', index=c0, size=(6291456,))]
+buf269.unmet_dependencies = [   MemoryDep(name='buf266', index=98304*c0 + 64*c1 + 768*c2 + c3, size=(64, 12, 128, 64))]
+buf269.met_dependencies = []
+buf269.group.device = cuda:0
+buf269.group.iteration = (6291456, 1)
+buf269.sizes = ([64, 12, 128, 64], [])
+class buf269_loop_body:
+    var_ranges = {z0: 64, z1: 12, z2: 128, z3: 64}
+    index0 = 98304*z0 + 64*z1 + 768*z2 + z3
+    index1 = 98304*z0 + 8192*z1 + 64*z2 + z3
+    def body(self, ops):
+        get_index = self.get_index('index0')
+        load = ops.load('buf266', get_index)
+        get_index_1 = self.get_index('index1')
+        store = ops.store('buf269', get_index_1, load, None)
+        return store
+
+
+buf270: SchedulerNode(ComputedBuffer)
+buf270.writes = [MemoryDep(name='buf270', index=c0, size=(6291456,))]
+buf270.unmet_dependencies = [MemoryDep(name='buf267', index=98304*c0 + c1 + 768*c2, size=(64, 768, 128))]
+buf270.met_dependencies = []
+buf270.group.device = cuda:0
+buf270.group.iteration = (6291456, 1)
+buf270.sizes = ([64, 768, 128], [])
+class buf270_loop_body:
+    var_ranges = {z0: 64, z1: 768, z2: 128}
+    index0 = 98304*z0 + z1 + 768*z2
+    index1 = 98304*z0 + 128*z1 + z2
+    def body(self, ops):
+        get_index = self.get_index('index0')
+        load = ops.load('buf267', get_index)
+        get_index_1 = self.get_index('index1')
+        store = ops.store('buf270', get_index_1, load, None)
+        return store
+
+
+buf271: ExternKernelSchedulerNode(BatchMatrixMultiply)
+buf271.writes = [StarDep(name='buf271')]
+buf271.unmet_dependencies = [StarDep(name='buf269'), StarDep(name='buf270')]
+buf271.met_dependencies = []
+buf271.node.kernel = aten.bmm.out
+
+
+buf272_buf273_buf274_buf376: FusedSchedulerNode(NoneType)
+buf272_buf273_buf274_buf376.writes = 
+    [   MemoryDep(name='buf272', index=c0, size=(98304, 128)),
+        MemoryDep(name='buf272', index=c0, size=(98304,)),
+        MemoryDep(name='buf273', index=c0, size=(98304, 128)),
+        MemoryDep(name='buf273', index=c0, size=(98304,)),
+        MemoryDep(name='buf274', index=c0, size=(12582912,)),
+        MemoryDep(name='buf376', index=c0, size=(12582912,))]
+buf272_buf273_buf274_buf376.unmet_dependencies = [MemoryDep(name='buf271', index=c0, size=(12582912,))]
+buf272_buf273_buf274_buf376.met_dependencies = [MemoryDep(name='seed_cuda_0', index=0, size=(12582912,))]
+buf272_buf273_buf274_buf376.snodes = ['buf272', 'buf273', 'buf274', 'buf376']
+
+
+buf275: SchedulerNode(ComputedBuffer)
+buf275.writes = [MemoryDep(name='buf275', index=c0, size=(6291456,))]
+buf275.unmet_dependencies = [   MemoryDep(name='buf268', index=98304*c0 + 64*c1 + 768*c2 + c3, size=(64, 12, 128, 64))]
+buf275.met_dependencies = []
+buf275.group.device = cuda:0
+buf275.group.iteration = (6291456, 1)
+buf275.sizes = ([64, 12, 128, 64], [])
+class buf275_loop_body:
+    var_ranges = {z0: 64, z1: 12, z2: 128, z3: 64}
+    index0 = 98304*z0 + 64*z1 + 768*z2 + z3
+    index1 = 98304*z0 + 8192*z1 + 64*z2 + z3
+    def body(self, ops):
+        get_index = self.get_index('index0')
+        load = ops.load('buf268', get_index)
+        get_index_1 = self.get_index('index1')
+        store = ops.store('buf275', get_index_1, load, None)
+        return store
+
+
+buf276: ExternKernelSchedulerNode(BatchMatrixMultiply)
+buf276.writes = [StarDep(name='buf276')]
+buf276.unmet_dependencies = [StarDep(name='buf274'), StarDep(name='buf275')]
+buf276.met_dependencies = []
+buf276.node.kernel = aten.bmm.out
+
+
+buf277: SchedulerNode(ComputedBuffer)
+buf277.writes = [MemoryDep(name='buf277', index=c0, size=(6291456,))]
+buf277.unmet_dependencies = [   MemoryDep(name='buf276', index=98304*c0 + 64*c1 + 8192*c2 + c3, size=(64, 128, 12, 64))]
+buf277.met_dependencies = []
+buf277.group.device = cuda:0
+buf277.group.iteration = (6291456, 1)
+buf277.sizes = ([64, 128, 12, 64], [])
+class buf277_loop_body:
+    var_ranges = {z0: 64, z1: 128, z2: 12, z3: 64}
+    index0 = 98304*z0 + 64*z1 + 8192*z2 + z3
+    index1 = 98304*z0 + 768*z1 + 64*z2 + z3
+    def body(self, ops):
+        get_index = self.get_index('index0')
+        load = ops.load('buf276', get_index)
+        get_index_1 = self.get_index('index1')
+        store = ops.store('buf277', get_index_1, load, None)
+        return store
+
+
+buf278: ExternKernelSchedulerNode(MatrixMultiplyAdd)
+buf278.writes = [StarDep(name='buf278')]
+buf278.unmet_dependencies = [StarDep(name='buf277')]
+buf278.met_dependencies = [StarDep(name='primals_172'), StarDep(name='primals_173')]
+buf278.node.kernel = aten.addmm.out
+
+
+buf279_buf280_buf281_buf282_buf283_buf375: FusedSchedulerNode(NoneType)
+buf279_buf280_buf281_buf282_buf283_buf375.writes = 
+    [   MemoryDep(name='buf279', index=c0, size=(8192, 768)),
+        MemoryDep(name='buf279', index=c0, size=(8192,)),
+        MemoryDep(name='buf280', index=c0, size=(8192, 768)),
+        MemoryDep(name='buf280', index=c0, size=(8192,)),
+        MemoryDep(name='buf281', index=c0, size=(8192, 768)),
+        MemoryDep(name='buf281', index=c0, size=(8192,)),
+        MemoryDep(name='buf282', index=c0, size=(6291456,)),
+        MemoryDep(name='buf283', index=c0, size=(6291456,)),
+        MemoryDep(name='buf375', index=c0, size=(8192,))]
+buf279_buf280_buf281_buf282_buf283_buf375.unmet_dependencies = 
+    [   MemoryDep(name='buf265', index=c0, size=(6291456,)),
+        MemoryDep(name='buf278', index=c0, size=(6291456,))]
+buf279_buf280_buf281_buf282_buf283_buf375.met_dependencies = 
+    [   MemoryDep(name='primals_174', index=c1, size=(8192, 768)),
+        MemoryDep(name='primals_175', index=c1, size=(8192, 768)),
+        MemoryDep(name='seed_cuda_0', index=0, size=(6291456,))]
+buf279_buf280_buf281_buf282_buf283_buf375.snodes = ['buf279', 'buf280', 'buf281', 'buf282', 'buf283', 'buf375']
+
+
+buf284: ExternKernelSchedulerNode(MatrixMultiplyAdd)
+buf284.writes = [StarDep(name='buf284')]
+buf284.unmet_dependencies = [StarDep(name='buf283')]
+buf284.met_dependencies = [StarDep(name='primals_176'), StarDep(name='primals_177')]
+buf284.node.kernel = aten.addmm.out
+
+
+buf285_buf374: FusedSchedulerNode(NoneType)
+buf285_buf374.writes = 
+    [   MemoryDep(name='buf285', index=c0, size=(25165824,)),
+        MemoryDep(name='buf374', index=c0, size=(25165824,))]
+buf285_buf374.unmet_dependencies = [MemoryDep(name='buf284', index=c0, size=(25165824,))]
+buf285_buf374.met_dependencies = []
+buf285_buf374.snodes = ['buf285', 'buf374']
+
+
+buf286: ExternKernelSchedulerNode(MatrixMultiplyAdd)
+buf286.writes = [StarDep(name='buf286')]
+buf286.unmet_dependencies = [StarDep(name='buf285')]
+buf286.met_dependencies = [StarDep(name='primals_178'), StarDep(name='primals_179')]
+buf286.node.kernel = aten.addmm.out
+
+
+buf287_buf288_buf289_buf290_buf291_buf373: FusedSchedulerNode(NoneType)
+buf287_buf288_buf289_buf290_buf291_buf373.writes = 
+    [   MemoryDep(name='buf287', index=c0, size=(8192, 768)),
+        MemoryDep(name='buf287', index=c0, size=(8192,)),
+        MemoryDep(name='buf288', index=c0, size=(8192, 768)),
+        MemoryDep(name='buf288', index=c0, size=(8192,)),
+        MemoryDep(name='buf289', index=c0, size=(8192, 768)),
+        MemoryDep(name='buf289', index=c0, size=(8192,)),
+        MemoryDep(name='buf290', index=c0, size=(6291456,)),
+        MemoryDep(name='buf291', index=c0, size=(6291456,)),
+        MemoryDep(name='buf373', index=c0, size=(8192,))]
+buf287_buf288_buf289_buf290_buf291_buf373.unmet_dependencies = 
+    [   MemoryDep(name='buf283', index=c0, size=(6291456,)),
+        MemoryDep(name='buf286', index=c0, size=(6291456,))]
+buf287_buf288_buf289_buf290_buf291_buf373.met_dependencies = 
+    [   MemoryDep(name='primals_180', index=c1, size=(8192, 768)),
+        MemoryDep(name='primals_181', index=c1, size=(8192, 768)),
+        MemoryDep(name='seed_cuda_0', index=0, size=(6291456,))]
+buf287_buf288_buf289_buf290_buf291_buf373.snodes = ['buf287', 'buf288', 'buf289', 'buf290', 'buf291', 'buf373']
+
+
+buf292: ExternKernelSchedulerNode(MatrixMultiplyAdd)
+buf292.writes = [StarDep(name='buf292')]
+buf292.unmet_dependencies = [StarDep(name='buf291')]
+buf292.met_dependencies = [StarDep(name='primals_182'), StarDep(name='primals_183')]
+buf292.node.kernel = aten.addmm.out
+
+
+buf293: ExternKernelSchedulerNode(MatrixMultiplyAdd)
+buf293.writes = [StarDep(name='buf293')]
+buf293.unmet_dependencies = [StarDep(name='buf291')]
+buf293.met_dependencies = [StarDep(name='primals_184'), StarDep(name='primals_185')]
+buf293.node.kernel = aten.addmm.out
+
+
+buf294: ExternKernelSchedulerNode(MatrixMultiplyAdd)
+buf294.writes = [StarDep(name='buf294')]
+buf294.unmet_dependencies = [StarDep(name='buf291')]
+buf294.met_dependencies = [StarDep(name='primals_186'), StarDep(name='primals_187')]
+buf294.node.kernel = aten.addmm.out
+
+
+buf295: SchedulerNode(ComputedBuffer)
+buf295.writes = [MemoryDep(name='buf295', index=c0, size=(6291456,))]
+buf295.unmet_dependencies = [   MemoryDep(name='buf292', index=98304*c0 + 64*c1 + 768*c2 + c3, size=(64, 12, 128, 64))]
+buf295.met_dependencies = []
+buf295.group.device = cuda:0
+buf295.group.iteration = (6291456, 1)
+buf295.sizes = ([64, 12, 128, 64], [])
+class buf295_loop_body:
+    var_ranges = {z0: 64, z1: 12, z2: 128, z3: 64}
+    index0 = 98304*z0 + 64*z1 + 768*z2 + z3
+    index1 = 98304*z0 + 8192*z1 + 64*z2 + z3
+    def body(self, ops):
+        get_index = self.get_index('index0')
+        load = ops.load('buf292', get_index)
+        get_index_1 = self.get_index('index1')
+        store = ops.store('buf295', get_index_1, load, None)
+        return store
+
+
+buf296: SchedulerNode(ComputedBuffer)
+buf296.writes = [MemoryDep(name='buf296', index=c0, size=(6291456,))]
+buf296.unmet_dependencies = [MemoryDep(name='buf293', index=98304*c0 + c1 + 768*c2, size=(64, 768, 128))]
+buf296.met_dependencies = []
+buf296.group.device = cuda:0
+buf296.group.iteration = (6291456, 1)
+buf296.sizes = ([64, 768, 128], [])
+class buf296_loop_body:
+    var_ranges = {z0: 64, z1: 768, z2: 128}
+    index0 = 98304*z0 + z1 + 768*z2
+    index1 = 98304*z0 + 128*z1 + z2
+    def body(self, ops):
+        get_index = self.get_index('index0')
+        load = ops.load('buf293', get_index)
+        get_index_1 = self.get_index('index1')
+        store = ops.store('buf296', get_index_1, load, None)
+        return store
+
+
+buf297: ExternKernelSchedulerNode(BatchMatrixMultiply)
+buf297.writes = [StarDep(name='buf297')]
+buf297.unmet_dependencies = [StarDep(name='buf295'), StarDep(name='buf296')]
+buf297.met_dependencies = []
+buf297.node.kernel = aten.bmm.out
+
+
+buf298_buf299_buf300_buf372_buf331_buf334_buf337_buf340_buf343_buf346_buf349_buf352_buf355_buf358_buf361_buf364: FusedSchedulerNode(NoneType)
+buf298_buf299_buf300_buf372_buf331_buf334_buf337_buf340_buf343_buf346_buf349_buf352_buf355_buf358_buf361_buf364.writes = 
+    [   MemoryDep(name='buf298', index=c0, size=(98304, 128)),
+        MemoryDep(name='buf298', index=c0, size=(98304,)),
+        MemoryDep(name='buf299', index=c0, size=(98304, 128)),
+        MemoryDep(name='buf299', index=c0, size=(98304,)),
+        MemoryDep(name='buf300', index=c0, size=(12582912,)),
+        MemoryDep(name='buf331', index=c0, size=(12582912,)),
+        MemoryDep(name='buf334', index=c0, size=(12582912,)),
+        MemoryDep(name='buf337', index=c0, size=(12582912,)),
+        MemoryDep(name='buf340', index=c0, size=(12582912,)),
+        MemoryDep(name='buf343', index=c0, size=(12582912,)),
+        MemoryDep(name='buf346', index=c0, size=(12582912,)),
+        MemoryDep(name='buf349', index=c0, size=(12582912,)),
+        MemoryDep(name='buf352', index=c0, size=(12582912,)),
+        MemoryDep(name='buf355', index=c0, size=(12582912,)),
+        MemoryDep(name='buf358', index=c0, size=(12582912,)),
+        MemoryDep(name='buf361', index=c0, size=(12582912,)),
+        MemoryDep(name='buf364', index=c0, size=(12582912,)),
+        MemoryDep(name='buf372', index=c0, size=(12582912,))]
+buf298_buf299_buf300_buf372_buf331_buf334_buf337_buf340_buf343_buf346_buf349_buf352_buf355_buf358_buf361_buf364.unmet_dependencies = [MemoryDep(name='buf297', index=c0, size=(12582912,))]
+buf298_buf299_buf300_buf372_buf331_buf334_buf337_buf340_buf343_buf346_buf349_buf352_buf355_buf358_buf361_buf364.met_dependencies = [MemoryDep(name='seed_cuda_0', index=0, size=(12582912,))]
+buf298_buf299_buf300_buf372_buf331_buf334_buf337_buf340_buf343_buf346_buf349_buf352_buf355_buf358_buf361_buf364.snodes = 
+    [   'buf298',
+        'buf299',
+        'buf300',
+        'buf372',
+        'buf331',
+        'buf334',
+        'buf337',
+        'buf340',
+        'buf343',
+        'buf346',
+        'buf349',
+        'buf352',
+        'buf355',
+        'buf358',
+        'buf361',
+        'buf364']
+
+
+buf301: SchedulerNode(ComputedBuffer)
+buf301.writes = [MemoryDep(name='buf301', index=c0, size=(6291456,))]
+buf301.unmet_dependencies = [   MemoryDep(name='buf294', index=98304*c0 + 64*c1 + 768*c2 + c3, size=(64, 12, 128, 64))]
+buf301.met_dependencies = []
+buf301.group.device = cuda:0
+buf301.group.iteration = (6291456, 1)
+buf301.sizes = ([64, 12, 128, 64], [])
+class buf301_loop_body:
+    var_ranges = {z0: 64, z1: 12, z2: 128, z3: 64}
+    index0 = 98304*z0 + 64*z1 + 768*z2 + z3
+    index1 = 98304*z0 + 8192*z1 + 64*z2 + z3
+    def body(self, ops):
+        get_index = self.get_index('index0')
+        load = ops.load('buf294', get_index)
+        get_index_1 = self.get_index('index1')
+        store = ops.store('buf301', get_index_1, load, None)
+        return store
+
+
+buf302: ExternKernelSchedulerNode(BatchMatrixMultiply)
+buf302.writes = [StarDep(name='buf302')]
+buf302.unmet_dependencies = [StarDep(name='buf300'), StarDep(name='buf301')]
+buf302.met_dependencies = []
+buf302.node.kernel = aten.bmm.out
+
+
+buf303: SchedulerNode(ComputedBuffer)
+buf303.writes = [MemoryDep(name='buf303', index=c0, size=(6291456,))]
+buf303.unmet_dependencies = [   MemoryDep(name='buf302', index=98304*c0 + 64*c1 + 8192*c2 + c3, size=(64, 128, 12, 64))]
+buf303.met_dependencies = []
+buf303.group.device = cuda:0
+buf303.group.iteration = (6291456, 1)
+buf303.sizes = ([64, 128, 12, 64], [])
+class buf303_loop_body:
+    var_ranges = {z0: 64, z1: 128, z2: 12, z3: 64}
+    index0 = 98304*z0 + 64*z1 + 8192*z2 + z3
+    index1 = 98304*z0 + 768*z1 + 64*z2 + z3
+    def body(self, ops):
+        get_index = self.get_index('index0')
+        load = ops.load('buf302', get_index)
+        get_index_1 = self.get_index('index1')
+        store = ops.store('buf303', get_index_1, load, None)
+        return store
+
+
+buf304: ExternKernelSchedulerNode(MatrixMultiplyAdd)
+buf304.writes = [StarDep(name='buf304')]
+buf304.unmet_dependencies = [StarDep(name='buf303')]
+buf304.met_dependencies = [StarDep(name='primals_188'), StarDep(name='primals_189')]
+buf304.node.kernel = aten.addmm.out
+
+
+buf305_buf306_buf307_buf308_buf309_buf371: FusedSchedulerNode(NoneType)
+buf305_buf306_buf307_buf308_buf309_buf371.writes = 
+    [   MemoryDep(name='buf305', index=c0, size=(8192, 768)),
+        MemoryDep(name='buf305', index=c0, size=(8192,)),
+        MemoryDep(name='buf306', index=c0, size=(8192, 768)),
+        MemoryDep(name='buf306', index=c0, size=(8192,)),
+        MemoryDep(name='buf307', index=c0, size=(8192, 768)),
+        MemoryDep(name='buf307', index=c0, size=(8192,)),
+        MemoryDep(name='buf308', index=c0, size=(6291456,)),
+        MemoryDep(name='buf309', index=c0, size=(6291456,)),
+        MemoryDep(name='buf371', index=c0, size=(8192,))]
+buf305_buf306_buf307_buf308_buf309_buf371.unmet_dependencies = 
+    [   MemoryDep(name='buf291', index=c0, size=(6291456,)),
+        MemoryDep(name='buf304', index=c0, size=(6291456,))]
+buf305_buf306_buf307_buf308_buf309_buf371.met_dependencies = 
+    [   MemoryDep(name='primals_190', index=c1, size=(8192, 768)),
+        MemoryDep(name='primals_191', index=c1, size=(8192, 768)),
+        MemoryDep(name='seed_cuda_0', index=0, size=(6291456,))]
+buf305_buf306_buf307_buf308_buf309_buf371.snodes = ['buf305', 'buf306', 'buf307', 'buf308', 'buf309', 'buf371']
+
+
+buf310: ExternKernelSchedulerNode(MatrixMultiplyAdd)
+buf310.writes = [StarDep(name='buf310')]
+buf310.unmet_dependencies = [StarDep(name='buf309')]
+buf310.met_dependencies = [StarDep(name='primals_192'), StarDep(name='primals_193')]
+buf310.node.kernel = aten.addmm.out
+
+
+buf311_buf370: FusedSchedulerNode(NoneType)
+buf311_buf370.writes = 
+    [   MemoryDep(name='buf311', index=c0, size=(25165824,)),
+        MemoryDep(name='buf370', index=c0, size=(25165824,))]
+buf311_buf370.unmet_dependencies = [MemoryDep(name='buf310', index=c0, size=(25165824,))]
+buf311_buf370.met_dependencies = []
+buf311_buf370.snodes = ['buf311', 'buf370']
+
+
+buf312: ExternKernelSchedulerNode(MatrixMultiplyAdd)
+buf312.writes = [StarDep(name='buf312')]
+buf312.unmet_dependencies = [StarDep(name='buf311')]
+buf312.met_dependencies = [StarDep(name='primals_194'), StarDep(name='primals_195')]
+buf312.node.kernel = aten.addmm.out
+
+
+buf313_buf314_buf315_buf316_buf317_buf330_buf332_buf333_buf335_buf336_buf338_buf339_buf341_buf342_buf344_buf345_buf347_buf348_buf350_buf351_buf353_buf354_buf356_buf357_buf359_buf360_buf362_buf363_buf365_buf366_buf369: FusedSchedulerNode(NoneType)
+buf313_buf314_buf315_buf316_buf317_buf330_buf332_buf333_buf335_buf336_buf338_buf339_buf341_buf342_buf344_buf345_buf347_buf348_buf350_buf351_buf353_buf354_buf356_buf357_buf359_buf360_buf362_buf363_buf365_buf366_buf369.writes = 
+    [   MemoryDep(name='buf313', index=c0, size=(8192, 768)),
+        MemoryDep(name='buf313', index=c0, size=(8192,)),
+        MemoryDep(name='buf314', index=c0, size=(8192, 768)),
+        MemoryDep(name='buf314', index=c0, size=(8192,)),
+        MemoryDep(name='buf315', index=c0, size=(8192, 768)),
+        MemoryDep(name='buf315', index=c0, size=(8192,)),
+        MemoryDep(name='buf316', index=c0, size=(6291456,)),
+        MemoryDep(name='buf317', index=c0, size=(6291456,)),
+        MemoryDep(name='buf330', index=c0, size=(6291456,)),
+        MemoryDep(name='buf332', index=c0, size=(6291456,)),
+        MemoryDep(name='buf333', index=c0, size=(6291456,)),
+        MemoryDep(name='buf335', index=c0, size=(6291456,)),
+        MemoryDep(name='buf336', index=c0, size=(6291456,)),
+        MemoryDep(name='buf338', index=c0, size=(6291456,)),
+        MemoryDep(name='buf339', index=c0, size=(6291456,)),
+        MemoryDep(name='buf341', index=c0, size=(6291456,)),
+        MemoryDep(name='buf342', index=c0, size=(6291456,)),
+        MemoryDep(name='buf344', index=c0, size=(6291456,)),
+        MemoryDep(name='buf345', index=c0, size=(6291456,)),
+        MemoryDep(name='buf347', index=c0, size=(6291456,)),
+        MemoryDep(name='buf348', index=c0, size=(6291456,)),
+        MemoryDep(name='buf350', index=c0, size=(6291456,)),
+        MemoryDep(name='buf351', index=c0, size=(6291456,)),
+        MemoryDep(name='buf353', index=c0, size=(6291456,)),
+        MemoryDep(name='buf354', index=c0, size=(6291456,)),
+        MemoryDep(name='buf356', index=c0, size=(6291456,)),
+        MemoryDep(name='buf357', index=c0, size=(6291456,)),
+        MemoryDep(name='buf359', index=c0, size=(6291456,)),
+        MemoryDep(name='buf360', index=c0, size=(6291456,)),
+        MemoryDep(name='buf362', index=c0, size=(6291456,)),
+        MemoryDep(name='buf363', index=c0, size=(6291456,)),
+        MemoryDep(name='buf365', index=c0, size=(6291456,)),
+        MemoryDep(name='buf366', index=c0, size=(6291456,)),
+        MemoryDep(name='buf369', index=c0, size=(8192,))]
+buf313_buf314_buf315_buf316_buf317_buf330_buf332_buf333_buf335_buf336_buf338_buf339_buf341_buf342_buf344_buf345_buf347_buf348_buf350_buf351_buf353_buf354_buf356_buf357_buf359_buf360_buf362_buf363_buf365_buf366_buf369.unmet_dependencies = 
+    [   MemoryDep(name='buf309', index=c0, size=(6291456,)),
+        MemoryDep(name='buf312', index=c0, size=(6291456,))]
+buf313_buf314_buf315_buf316_buf317_buf330_buf332_buf333_buf335_buf336_buf338_buf339_buf341_buf342_buf344_buf345_buf347_buf348_buf350_buf351_buf353_buf354_buf356_buf357_buf359_buf360_buf362_buf363_buf365_buf366_buf369.met_dependencies = 
+    [   MemoryDep(name='primals_196', index=c1, size=(8192, 768)),
+        MemoryDep(name='primals_197', index=c1, size=(8192, 768)),
+        MemoryDep(name='seed_cuda_0', index=0, size=(6291456,))]
+buf313_buf314_buf315_buf316_buf317_buf330_buf332_buf333_buf335_buf336_buf338_buf339_buf341_buf342_buf344_buf345_buf347_buf348_buf350_buf351_buf353_buf354_buf356_buf357_buf359_buf360_buf362_buf363_buf365_buf366_buf369.snodes = 
+    [   'buf313',
+        'buf314',
+        'buf315',
+        'buf316',
+        'buf317',
+        'buf330',
+        'buf332',
+        'buf333',
+        'buf335',
+        'buf336',
+        'buf338',
+        'buf339',
+        'buf341',
+        'buf342',
+        'buf344',
+        'buf345',
+        'buf347',
+        'buf348',
+        'buf350',
+        'buf351',
+        'buf353',
+        'buf354',
+        'buf356',
+        'buf357',
+        'buf359',
+        'buf360',
+        'buf362',
+        'buf363',
+        'buf365',
+        'buf366',
+        'buf369']
+
+
+buf318: ExternKernelSchedulerNode(MatrixMultiplyAdd)
+buf318.writes = [StarDep(name='buf318')]
+buf318.unmet_dependencies = [StarDep(name='buf317')]
+buf318.met_dependencies = [StarDep(name='primals_198'), StarDep(name='primals_199')]
+buf318.node.kernel = aten.addmm.out
+
+
+buf319_buf320_buf321_buf322_buf323_buf368_buf367: FusedSchedulerNode(NoneType)
+buf319_buf320_buf321_buf322_buf323_buf368_buf367.writes = 
+    [   MemoryDep(name='buf319', index=c0, size=(8192, 768)),
+        MemoryDep(name='buf319', index=c0, size=(8192,)),
+        MemoryDep(name='buf320', index=c0, size=(8192, 768)),
+        MemoryDep(name='buf320', index=c0, size=(8192,)),
+        MemoryDep(name='buf321', index=c0, size=(8192, 768)),
+        MemoryDep(name='buf321', index=c0, size=(8192,)),
+        MemoryDep(name='buf322', index=c0, size=(6291456,)),
+        MemoryDep(name='buf323', index=c0, size=(6291456,)),
+        MemoryDep(name='buf367', index=c0, size=(8192,)),
+        MemoryDep(name='buf368', index=c0, size=(6291456,))]
+buf319_buf320_buf321_buf322_buf323_buf368_buf367.unmet_dependencies = [MemoryDep(name='buf318', index=c0, size=(6291456,))]
+buf319_buf320_buf321_buf322_buf323_buf368_buf367.met_dependencies = 
+    [   MemoryDep(name='primals_200', index=c1, size=(8192, 768)),
+        MemoryDep(name='primals_201', index=c1, size=(8192, 768))]
+buf319_buf320_buf321_buf322_buf323_buf368_buf367.snodes = ['buf319', 'buf320', 'buf321', 'buf322', 'buf323', 'buf368', 'buf367']
+
+
+buf324: ExternKernelSchedulerNode(MatrixMultiplyAdd)
+buf324.writes = [StarDep(name='buf324')]
+buf324.unmet_dependencies = [StarDep(name='buf323')]
+buf324.met_dependencies = [StarDep(name='primals_1'), StarDep(name='primals_202')]
+buf324.node.kernel = aten.addmm.out
+
+
+buf325_buf326_buf327: FusedSchedulerNode(NoneType)
+buf325_buf326_buf327.writes = 
+    [   MemoryDep(name='buf325', index=c0, size=(8192, 30522)),
+        MemoryDep(name='buf325', index=c0, size=(8192,)),
+        MemoryDep(name='buf326', index=c0, size=(8192, 30522)),
+        MemoryDep(name='buf326', index=c0, size=(8192,)),
+        MemoryDep(name='buf327', index=c0, size=(250036224,))]
+buf325_buf326_buf327.unmet_dependencies = [MemoryDep(name='buf324', index=c0, size=(250036224,))]
+buf325_buf326_buf327.met_dependencies = []
+buf325_buf326_buf327.snodes = ['buf325', 'buf326', 'buf327']
+
+
+buf328_buf329: FusedSchedulerNode(NoneType)
+buf328_buf329.writes = 
+    [   MemoryDep(name='buf328', index=0, size=()),
+        MemoryDep(name='buf328', index=0, size=(8192,)),
+        MemoryDep(name='buf329', index=0, size=())]
+buf328_buf329.unmet_dependencies = [MemoryDep(name='buf327', index=30522*c0 + load(primals_206, d0), size=(8192,))]
+buf328_buf329.met_dependencies = [MemoryDep(name='primals_206', index=c0, size=(8192,))]
+buf328_buf329.snodes = ['buf328', 'buf329']
+
+

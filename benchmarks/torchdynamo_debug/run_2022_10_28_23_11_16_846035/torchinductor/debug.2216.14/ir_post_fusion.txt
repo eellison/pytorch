@@ -1,0 +1,10 @@
+buf0: ExternKernelSchedulerNode(MatrixMultiplyAdd)
+buf0.writes = [StarDep(name='buf0')]
+buf0.unmet_dependencies = []
+buf0.met_dependencies = 
+    [   StarDep(name='primals_1'),
+        StarDep(name='primals_2'),
+        StarDep(name='primals_3')]
+buf0.node.kernel = aten.addmm.out
+
+

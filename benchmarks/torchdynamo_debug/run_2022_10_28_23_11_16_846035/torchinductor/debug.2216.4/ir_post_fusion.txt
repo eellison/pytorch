@@ -1,0 +1,26 @@
+buf0: SchedulerNode(ComputedBuffer)
+buf0.writes = [MemoryDep(name='buf0', index=c0, size=(1048576,))]
+buf0.unmet_dependencies = []
+buf0.met_dependencies = 
+    [   MemoryDep(name='arg0_1', index=512*c0 + c2, size=(4, 512, 512)),
+        MemoryDep(name='arg0_1', index=c0, size=(2048, 512))]
+buf0.group.device = cuda:0
+buf0.group.iteration = (1048576, 1)
+buf0.sizes = ([4, 512, 512], [])
+class buf0_loop_body:
+    var_ranges = {z0: 4, z1: 512, z2: 512}
+    index0 = 512*z0 + z2
+    index1 = 512*z0 + z1
+    index2 = 262144*z0 + 512*z1 + z2
+    def body(self, ops):
+        get_index = self.get_index('index0')
+        load = ops.load('arg0_1', get_index)
+        get_index_1 = self.get_index('index1')
+        load_1 = ops.load('arg0_1', get_index_1)
+        mul = ops.mul(load, load_1)
+        to_dtype = ops.to_dtype(mul, torch.uint8)
+        get_index_2 = self.get_index('index2')
+        store = ops.store('buf0', get_index_2, to_dtype, None)
+        return store
+
+
