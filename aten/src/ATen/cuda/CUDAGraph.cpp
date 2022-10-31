@@ -390,14 +390,14 @@ void check(T result, char const *const func, const char *const file, int const l
 
 #define checkCudaErrors(val) check((val), #val, __FILE__, __LINE__)
 
-void CUDAGraph::update_params(std::vector<Tensor> old_params, std::vector<Tensor> new_params) {
+void CUDAGraph::update_params(std::vector<Tensor> old_tensor_params, std::vector<Tensor> new_tensor_params) {
   TORCH_CHECK(preserve_graph_ && has_graph_ && has_graph_exec_);
 
   std::vector<cudaGraphNode_t> nodes = get_nodes(graph_);
 
   std::cout << "Length of nodes : " << nodes.size() << "\n";
 
-  for(auto param : old_params) {
+  for(auto param : old_tensor_params) {
     std::cout<< reinterpret_cast<int64_t>(param.data_ptr()) << '\n';
   }
 
@@ -409,114 +409,52 @@ void CUDAGraph::update_params(std::vector<Tensor> old_params, std::vector<Tensor
   CUDA_KERNEL_NODE_PARAMS kparams = {0};
   (at::globalContext().getNVRTC().cuGraphKernelNodeGetParams(node, &kparams));
 
+  // Copies over block, grid values but still need to copy over kernelParmas
   CUDA_KERNEL_NODE_PARAMS kparams_copy = kparams;
-  // "new print"
-  std::cout<<get_node_info(node) << '\n';
-  std::stringstream ss;
-  ss << "GPUKernel@" << kparams_copy.func;
-      ss << "<<<gridDim=(" << kparams_copy.gridDimX << ", "<< kparams_copy.gridDimY << ", " << kparams_copy.gridDimZ << "), "
-         << "blockDim=(" << kparams_copy.blockDimX << ", "<< kparams_copy.blockDimY << ", "<< kparams_copy.blockDimZ << ")>>>";
-      ss << "(";
-  
-  std::cout << ss.str();
-  std::cout << "Updating node " << reinterpret_cast<int64_t>(new_params[0].data_ptr()) << "\n";
 
-  // void* vec =malloc
-  int64_t * vec = reinterpret_cast<int64_t*>(malloc(4 * sizeof(int64_t)));
+  // Cudagraphs internally will call free on this pointer - using std::vector
+  // here gives double free error. TODO - malloc right number of parmeters
+  int64_t * new_params = reinterpret_cast<int64_t*>(malloc(4 * sizeof(int64_t)));
 
-  // std::vector<void*> vec(4);
-  kparams_copy.kernelParams = reinterpret_cast<void**>(vec);
+  kparams_copy.kernelParams = reinterpret_cast<void**>(new_params);
 
-  std::stringstream ss2;
-  int64_t address_start = 1024;
-  // (int64_t)kparams.kernelParams[i] > address_start &&
+  // Copy over old parameters
+  // TODO - right number of parameters to copy
   for(int64_t i=0; i < 4; i++) {
-    vec[i] = reinterpret_cast<int64_t>(kparams.kernelParams[i]);
-
-    // void *ptr = *(void**)kparams.kernelParams[i];
-    // ss2 << "orig: " << reinterpret_cast<int64_t>(ptr) << ", ";
-    // void *ptr2 = *(void**)kparams_copy.kernelParams[i];
-    // ss2 << "new: " << reinterpret_cast<int64_t>(ptr2) << ", ";
-    // void *ptr = *(void**)kparams_copy.kernelParams[i];
-    // ss2 << reinterpret_cast<int64_t>(ptr) << ", ";
+    new_params[i] = reinterpret_cast<int64_t>(kparams.kernelParams[i]);
   }
 
-  void *ptr = *(void**)kparams_copy.kernelParams[0];
-  int64_t ptr_val = reinterpret_cast<int64_t>(ptr);
-  std::cout << "\n" << ptr_val << " \n ";
+  // Replace old data pointers with new data pointers. The data pointers 
+  // are passed in as a reference to an address which stores the data pointers,
+  // so we allocate a new vector to store the values and pass pointers to it in.
 
-  // need to store a reference to the pointer 
-  // vec[0] = reinterpret_cast<int64_t>(old_params[0].data_ptr());
-
-  for(int64_t i=0; (int64_t)kparams_copy.kernelParams[i] > address_start; i++) {
-    void *ptr = *(void**)kparams_copy.kernelParams[i];
-    std::cout << reinterpret_cast<int64_t>(ptr) << ", ";
-  }
-
-
-
-  // std::cout << "K params Copy : " << kparams.kernelParams[0] << " and data ptr " <<  reinterpret_cast<int64_t>(old_params[0].data_ptr()) << " \n";
-
-  // std::cout << kparams_copy.
-  // kparams_copy.kernelParams[0] = new_params[0].data_ptr();
-  // kparams_copy.kernelParams[1] = new_params[1].data_ptr();
-
-  // ss2 << ")";
-  // std::cout << ss2.str();
-  // // std::cout<<get_node_info(node) << '\n';
-  // return;
-
-
-  // kparams.kernelParams[1] = new_params[1].data_ptr();
-  // const CUDA_KERNEL_NODE_PARAMS kparams_2 = kparams;
-
-  // CUDA_KERNEL_NODE_PARAMS new_kparams = {0};
-  // std::vector<int64_t> new_kparams;
-  // int64_t address_start = 1024;
-  // for(int64_t i=0; (int64_t)kparams.kernelParams[i] > address_start; i++) {
-  //   void *ptr = *(void**)kparams.kernelParams[i];
-  //   ss << reinterpret_cast<int64_t>(ptr) << ", ";
-  // }
-
-
-
-  std::vector<int64_t> new_vec;
+  // TODO - right size
+  std::vector<int64_t> vec_new(4);
+  new_params[0] = reinterpret_cast<int64_t>(new_tensor_params[0].data_ptr());
+  kparams_copy.kernelParams[0] = (&new_params[0]);
+  new_params[1] = reinterpret_cast<int64_t>(new_tensor_params[1].data_ptr());
+  kparams_copy.kernelParams[1] = (&new_params[1]);
 
   
-  auto nvrt = at::globalContext().getNVRTC();
+  auto nvrtc = at::globalContext().getNVRTC();
 
-  // const cudaKernelNodeParams* const_params = reinterpret_cast<const cudaKernelNodeParams*>(&kparams);
-  std::cout << "1\n";
-  AT_CUDA_DRIVER_CHECK(at::globalContext().getNVRTC().cuGraphKernelNodeSetParams(node, &kparams_copy));
-  std::cout << "2\n";
-  AT_CUDA_DRIVER_CHECK(at::globalContext().getNVRTC().cuGraphExecKernelNodeSetParams(graph_exec_, node, &kparams_copy));
-  // the following segfaults
-  // checkCudaErrors(cudaGraphExecKernelNodeSetParams(graph_exec_, node, const_params));
-  // checkCudaErrors(cudaGraphKernelNodeSetParams(node, const_params));
-  std::cout << "3\n";
+  // Need to use the driver api since Triton kernels are JIT Compiled
+  AT_CUDA_DRIVER_CHECK(nvrtc.cuGraphKernelNodeSetParams(node, &kparams_copy));
+  AT_CUDA_DRIVER_CHECK(nvrtc.cuGraphExecKernelNodeSetParams(graph_exec_, node, &kparams_copy));
+
   cudaGraphExecUpdateResult updateResult;
   cudaGraphNode_t errorNode;
   // First we try to update the graph as this is much cheaper than re-instantiation
   checkCudaErrors(cudaGraphExecUpdate(graph_exec_, graph_, &errorNode, &updateResult));
-  std::cout << "4\n";
   if (graph_exec_ == nullptr || updateResult != cudaGraphExecUpdateSuccess) {
     // The update is unsuccessful, need to re-instantiate
     cudaGetLastError(); // <- Clear the error state
     if (graph_exec_ != nullptr) { 
-      (cudaGraphExecDestroy(graph_exec_)); 
+      C10_CUDA_CHECK_WARN(cudaGraphExecDestroy(graph_exec_)); 
     }
   } else {
     AT_CUDA_DRIVER_CHECK(at::globalContext().getNVRTC().cuGraphInstantiate(&graph_exec_, graph_, NULL, NULL, 0));
   }
-  std::cout << "5\n";
-
-  // for(int64_t i=0; i < 3; i++) {
-  //       void *ptr = *(void**)kparams.kernelParams[i];
-
-  //       ss << reinterpret_cast<int64_t>(ptr) << ", ";
-  // }
-
-
 }
 
 CUDAGraph::~CUDAGraph() {
