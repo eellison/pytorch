@@ -2242,7 +2242,7 @@ class ExternKernel(InputsKernel):
         return pw
 
     @classmethod
-    def process_kernel(cls, kernel, *args, **kwargs):
+    def process_kernel(cls, kernel, freeze_inputs, *args, **kwargs,):
         args_flat, args_spec = pytree.tree_flatten(args)
 
         is_arg_tensor = []
@@ -2266,23 +2266,30 @@ class ExternKernel(InputsKernel):
                     new_args.append(next(it_non_tensors))
             return pytree.tree_unflatten(new_args, args_spec)
 
-        tensor_args = [cls.realize_input(x) for x in tensor_args]
+        if freeze_inputs:
+            tensor_args = [cls.realize_input(x) for x in tensor_args]
 
-        # freeze layout otherwise our output stride calculation might
-        # become incorrect
-        for x in tensor_args:
-            if is_storage_and_layout(x):
-                as_storage_and_layout(x, freeze=True)
+            # freeze layout otherwise our output stride calculation might
+            # become incorrect
+            for x in tensor_args:
+                if is_storage_and_layout(x):
+                    as_storage_and_layout(x, freeze=True)
 
         # We don't have generic shape formulas, so just burn in the
         # shapes and run an example input.
         # TODO(jansel): replace this with dynamic shape formulas
         example_args = []
+        shape_fn = V.graph.sizevars.guard_static_shape if freeze_inputs else V.graph.sizevars.size_hint
+
         for x in tensor_args:
-            size = [V.graph.sizevars.guard_static_shape(s) for s in x.get_size()]
-            stride = [
-                V.graph.sizevars.guard_static_shape(s) for s in x.get_layout().stride
-            ]
+            size = [shape_fn(s) for s in x.get_size()]
+            try:
+                stride = [
+                    shape_fn(s) for s in x.get_layout().stride
+                ]
+            except Exception as e:
+                breakpoint()
+                raise e
             dtype = x.get_dtype()
             device = x.get_device()
             arg = torch.empty_strided(
@@ -2915,7 +2922,7 @@ class FallbackKernel(ExternKernelAlloc):
                 tensor_args,
                 non_tensor_args,
                 unflatten_args,
-            ) = cls.process_kernel(kernel, *args, **kwargs)
+            ) = cls.process_kernel(kernel, True, *args, **kwargs)
 
         if isinstance(example_output, (list, tuple)):
             packed = FallbackKernel(
@@ -3035,6 +3042,7 @@ class Convolution(ExternKernelAlloc):
         with FakeTensorMode():
             output, *_ = cls.process_kernel(
                 torch.ops.aten.convolution,
+                True,
                 x,
                 weight,
                 bias,

@@ -959,10 +959,12 @@ def register_onednn_fusion_ops():
 register_onednn_fusion_ops()
 
 
-def fallback_handler(kernel):
+def fallback_handler(kernel, inp_hook = None):
     fallbacks.add(kernel)
 
     def handler(*args, **kwargs):
+        if inp_hook is not None:
+            args, kwargs = inp_hook(*args, **kwargs)
         result = ir.FallbackKernel.create(kernel, *args, **kwargs)
         if isinstance(result, (list, tuple)):
             return list(map(TensorBox.create, result))
@@ -972,7 +974,7 @@ def fallback_handler(kernel):
     return handler
 
 
-def make_fallback(kernel):
+def make_fallback(kernel, inp_hook=None):
     assert (
         kernel not in decompositions
     ), f"both a fallback and a decomp for same kernel: {kernel}"
@@ -982,7 +984,7 @@ def make_fallback(kernel):
         )
 
     add_needs_realized_inputs(kernel)
-    return register_lowering(kernel, type_promotion_kind=None)(fallback_handler(kernel))
+    return register_lowering(kernel, type_promotion_kind=None)(fallback_handler(kernel, inp_hook))
 
 
 @register_lowering(aten.native_dropout, type_promotion_kind=None)
@@ -1134,6 +1136,23 @@ def philox_rand_like(x, seed, offset):
         ranges=list(size),
     )
 
+def conv_backward(*args, **kwargs):
+    with torch._subclasses.FakeTensorMode():
+        output, *_  = ir.ExternKernel.process_kernel(aten.convolution_backward, False, *args, **kwargs)
+
+    def add_input_constraints(grad_output, input, weight, bias_sizes, stride, padding, dilation, transposed, output_padding, groups, output_mask):
+        output_strides = output[0].stride()
+        stride_order = [b[0] for b in sorted(enumerate(output_strides), key=lambda i: i[1])]
+        grad_output = ir.ExternKernel.require_stride_order(grad_output, stride_order)
+        weight = ir.ExternKernel.require_stride_order(weight, stride_order)
+        # Only make input contiguous when it is necessary for the backwards computation
+        if output_mask[1]:
+            input = ir.ExternKernel.require_stride_order(input, stride_order)
+        
+        return (grad_output, input, weight, bias_sizes, stride, padding, dilation, transposed, output_padding, groups, output_mask), {}
+
+    return add_input_constraints(*args, **kwargs)
+
 
 if has_torchvision_roi_align():
     make_fallback(torch.ops.torchvision.roi_align)
@@ -1142,7 +1161,7 @@ if has_torchvision_roi_align():
 # https://github.com/pytorch/torchdynamo/issues/327
 make_fallback(aten._adaptive_avg_pool2d_backward)
 make_fallback(aten.as_strided_scatter)
-make_fallback(aten.convolution_backward)
+make_fallback(aten.convolution_backward, conv_backward)
 make_fallback(aten._cudnn_rnn)
 make_fallback(aten._cudnn_rnn_backward)
 make_fallback(aten.cumsum)
