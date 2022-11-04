@@ -352,7 +352,11 @@ def call_func_with_args(f, args, steal_args=False, disable_amp=False):
                 "Please wrap it with functorch.compile.make_boxed_func or handle the boxed arguments yourself. "
                 "See https://github.com/pytorch/pytorch/pull/83137#issuecomment-1211320670 for rationale."
             )
-            out = normalize_as_list(f(*args))
+            try:
+                out = normalize_as_list(f(*args))
+            except Exception as e:
+                breakpoint()
+                raise e
     finally:
         if disable_amp:
             del guard
