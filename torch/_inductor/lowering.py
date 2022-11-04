@@ -1157,30 +1157,37 @@ def conv_backward(*args, **kwargs):
     return add_input_constraints(*args, **kwargs)
 
 
+def require_dense(*args, **kwargs):
+    args, kwargs = pytree.tree_map_only(
+            ir.IRNode, lambda t: ir.ExternKernel.require_stride1(t), (args, kwargs)
+    )
+    return args, kwargs
+
+
 if has_torchvision_roi_align():
     make_fallback(torch.ops.torchvision.roi_align)
 
 # TODO(jansel): we should implement decomps or lowerings for these
 # https://github.com/pytorch/torchdynamo/issues/327
-make_fallback(aten._adaptive_avg_pool2d_backward)
+make_fallback(aten._adaptive_avg_pool2d_backward, require_dense)
 make_fallback(aten.as_strided_scatter)
 make_fallback(aten.convolution_backward, conv_backward)
-make_fallback(aten._cudnn_rnn)
-make_fallback(aten._cudnn_rnn_backward)
-make_fallback(aten.cumsum)
-make_fallback(aten._embedding_bag)
-make_fallback(aten._embedding_bag_forward_only)
-make_fallback(aten._fused_moving_avg_obs_fq_helper)
+make_fallback(aten._cudnn_rnn, require_dense)
+make_fallback(aten._cudnn_rnn_backward, require_dense)
+make_fallback(aten.cumsum, require_dense)
+make_fallback(aten._embedding_bag, require_dense)
+make_fallback(aten._embedding_bag_forward_only, require_dense)
+make_fallback(aten._fused_moving_avg_obs_fq_helper, require_dense)
 make_fallback(aten._fused_moving_avg_obs_fq_helper_functional)
-make_fallback(aten.grid_sampler_2d_backward)
+make_fallback(aten.grid_sampler_2d_backward, require_stride1)
 make_fallback(aten.randperm)
 make_fallback(aten.sort)
 make_fallback(aten.sort.stable)
 make_fallback(aten._sparse_coo_tensor_with_dims_and_tensors)
 make_fallback(aten._thnn_fused_lstm_cell)
 make_fallback(aten.topk)
-make_fallback(aten.upsample_bicubic2d_backward)
-make_fallback(aten.upsample_bilinear2d_backward)
+make_fallback(aten.upsample_bicubic2d_backward, require_stride1)
+make_fallback(aten.upsample_bilinear2d_backward, require_stride1)
 
 
 @register_lowering(aten.convolution)
