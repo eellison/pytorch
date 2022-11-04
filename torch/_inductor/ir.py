@@ -103,6 +103,20 @@ def reads_from_conv(buf, var_ranges):
                 return True, addr
     return False, None
 
+def ir_node_to_tensor(x, guard_shape=True):
+    shape_fn = V.graph.sizevars.guard_static_shape if guard_shape else V.graph.sizevars.size_hint
+    size = [shape_fn(s) for s in x.get_size()]
+    if is_storage_and_layout(x):
+        stride = [shape_fn(s) for s in x.get_layout().stride]
+    else:
+        stride = torch._prims_common.make_contiguous_strides_for(size)
+    dtype = x.get_dtype()
+    device = x.get_device()
+    t = torch.empty_strided(
+        size=size, stride=stride, dtype=dtype, device=device
+    ).zero_()
+    return t
+
 
 def layout_priority_idx(reads_bufs, memory_addrs, var_ranges):
     """
@@ -2279,23 +2293,9 @@ class ExternKernel(InputsKernel):
         # shapes and run an example input.
         # TODO(jansel): replace this with dynamic shape formulas
         example_args = []
-        shape_fn = V.graph.sizevars.guard_static_shape if freeze_inputs else V.graph.sizevars.size_hint
 
         for x in tensor_args:
-            size = [shape_fn(s) for s in x.get_size()]
-            try:
-                stride = [
-                    shape_fn(s) for s in x.get_layout().stride
-                ]
-            except Exception as e:
-                breakpoint()
-                raise e
-            dtype = x.get_dtype()
-            device = x.get_device()
-            arg = torch.empty_strided(
-                size=size, stride=stride, dtype=dtype, device=device
-            ).zero_()
-            example_args.append(arg)
+            example_args.append(ir_node_to_tensor(x, guard_shape=True))
 
         example_output = kernel(
             *unflatten_args(example_args, non_tensor_args), **kwargs
@@ -2818,43 +2818,6 @@ class DynamicScalar(IRNode):
 
     def get_reads(self):
         return ()
-
-
-class AdaptiveAvgPool2d(ExternKernelAlloc):
-    kernel = "aten._adaptive_avg_pool2d"
-
-    @classmethod
-    def create(cls, x, target_size):
-        # x = cls.require_stride1(cls.realize_input(x))
-        x = cls.realize_input(x)
-        output_size = [
-            *x.get_size()[: -len(target_size)],
-            *map(sympy.Integer, target_size),
-        ]
-        # contigouse stride order
-        stride_order = list(reversed(range(len(output_size))))
-        return cls(
-            FlexibleLayout(
-                x.get_device(),
-                x.get_dtype(),
-                output_size,
-                # TODO(jansel): fix channels last case
-                # FlexibleLayout.contiguous_strides(output_size),
-                stride_order,
-            ),
-            (x,),
-            (tuple(target_size),),
-        )
-
-    def apply_constraint(self):
-        x = self.inputs[0]
-        if isinstance(x.get_layout(), FixedLayout):
-            # fix self's layout to be the same order as x
-            self.freeze_layout_with_same_order(x.get_layout().stride)
-        else:
-            x = self.require_stride_order(x, self.layout.preferred_stride_order)
-            self.inputs[0] = x
-            self.freeze_layout_with_stride_order(self.layout.preferred_stride_order)
 
 
 @dataclasses.dataclass

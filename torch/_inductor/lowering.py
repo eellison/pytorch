@@ -1138,8 +1138,11 @@ def philox_rand_like(x, seed, offset):
 
 def conv_backward(*args, **kwargs):
     with torch._subclasses.FakeTensorMode():
-        output, *_  = ir.ExternKernel.process_kernel(aten.convolution_backward, False, *args, **kwargs)
-
+        args_fake, kwargs_fake = pytree.tree_map_only(
+            ir.IRNode, lambda t: ir.ir_node_to_tensor(t, guard_shape=False), (args, kwargs)
+        )
+        output = kernel(*args_fake, **kwargs_fake)
+    
     def add_input_constraints(grad_output, input, weight, bias_sizes, stride, padding, dilation, transposed, output_padding, groups, output_mask):
         output_strides = output[0].stride()
         stride_order = [b[0] for b in sorted(enumerate(output_strides), key=lambda i: i[1])]
