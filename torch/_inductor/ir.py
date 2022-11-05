@@ -103,8 +103,13 @@ def reads_from_conv(buf, var_ranges):
                 return True, addr
     return False, None
 
+
 def ir_node_to_tensor(x, guard_shape=True):
-    shape_fn = V.graph.sizevars.guard_static_shape if guard_shape else V.graph.sizevars.size_hint
+    shape_fn = (
+        V.graph.sizevars.guard_static_shape
+        if guard_shape
+        else V.graph.sizevars.size_hint
+    )
     size = [shape_fn(s) for s in x.get_size()]
     if is_storage_and_layout(x):
         stride = [shape_fn(s) for s in x.get_layout().stride]
@@ -2256,7 +2261,13 @@ class ExternKernel(InputsKernel):
         return pw
 
     @classmethod
-    def process_kernel(cls, kernel, freeze_inputs, *args, **kwargs,):
+    def process_kernel(
+        cls,
+        kernel,
+        freeze_inputs,
+        *args,
+        **kwargs,
+    ):
         args_flat, args_spec = pytree.tree_flatten(args)
 
         is_arg_tensor = []
@@ -2388,22 +2399,27 @@ class ExternKernel(InputsKernel):
     @classmethod
     def require_stride_order(cls, x, order):
         # require x to have the layout as strided_ordered as order
-        if isinstance(
-            x.get_layout(), FlexibleLayout
-        ) and is_stride_order_storage_and_layout(x, order):
-            # fix flexiblelayout to be FixedLayout with stride_order
-            as_storage_and_layout(
-                x, freeze=True, want_contiguous=False, stride_order=order
-            )
-            return x
-        elif isinstance(x.get_layout(), FixedLayout) and x.layout.is_stride_ordered(
-            order
-        ):
-            return x
+        if is_storage_and_layout(x):
+            if isinstance(
+                x.get_layout(), FlexibleLayout
+            ) and is_stride_order_storage_and_layout(x, order):
+                # fix flexiblelayout to be FixedLayout with stride_order
+                as_storage_and_layout(
+                    x, freeze=True, want_contiguous=False, stride_order=order
+                )
+                return x
+            elif isinstance(
+                x.get_layout(), FixedLayout
+            ) and x.get_layout().is_stride_ordered(order):
+                return x
         x = cls.copy_input(x)
         as_storage_and_layout(x, freeze=True, want_contiguous=False, stride_order=order)
         assert is_stride_order_storage_and_layout(x, order)
         return x
+
+    @classmethod
+    def require_contiguous(cls, x):
+        return cls.require_stride_order(cls, list(reversed(range(len(x.get_size)))))
 
     def apply_constraint(self):
         pass
