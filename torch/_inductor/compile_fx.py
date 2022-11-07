@@ -224,6 +224,8 @@ cuda_graphs_thread_pool = torch.cuda.graph_pool_handle()
 
 
 class CudaGraphify(object):
+    __slots__ = ('static_input_dxs', 'inps_expanded_dims', 'graph', 'static_outputs', 'run')
+
     def __init__(self, model, inputs, static_input_idxs=()):
         """
         Assumes inputs[static_input_idxs[i]] are always the same memory address
@@ -232,10 +234,8 @@ class CudaGraphify(object):
         self.static_input_idxs = remove_unaligned_input_idxs(inputs, static_input_idxs)
         assert isinstance(inputs, (list, tuple))
 
-        self.static_inputs = [
-            static_input(x) if idx not in static_input_idxs else x.detach()
-            for idx, x in enumerate(inputs)
-        ]
+        non_static_inputs = self.allocate_non_static_inputs(inputs)
+
         self.inps_expanded_dims = [
             get_expanded_dims(x) if idx not in static_input_idxs else []
             for idx, x in enumerate(inputs)
@@ -246,7 +246,76 @@ class CudaGraphify(object):
         self.warmup(stream)
         self.graph = torch.cuda.CUDAGraph()
         self.static_outputs = self.record(stream)
+
         self.run = self.run_size_asserts if config.size_asserts else self.run_no_asserts
+
+
+    def allocate_non_static_inputs(inputs):
+        torch.cuda.synchronize()
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        non_static_inputs = []
+        Graph = torch.cuda.CUDAGraph()
+
+        # inputs should be allocated in the cuda graph memory pool
+        with torch.cuda.graph(pool=cuda_graphs_thread_pool, stream=stream)
+            for i, inp in enumerate(inputs):
+                if i not in self.static_input_idxs:
+                    non_static_inputs.append(self.static_input(inp))
+        
+        # TODO - assert that no kernels were launched here
+
+        # Now that the Graph is no longer recording, zero out inputs
+        # since they may be used in indexing in graph warmup
+        for inp in non_static_inputs:
+            inp.zero_()
+
+        return non_static_inputs
+
+    @staticmethod
+    def tensor_meta_data(x, ignore_storage_offset=True):
+        # We ignore the storage offset for inputs, but not for outputs
+        # TODO: - should we make the storage resizable ?
+        return {
+            "nbytes": x.storage().nbytes(),
+            "data_ptr": x.storage().data_ptr(),
+            "size": x.shape,
+            "stride": x.stride(),
+            "dtype": x.dtype,
+            "device": x.device,
+            "storage_offset": x.storage_offset()
+            if not ignore_storage_offset
+            else 0,
+        }
+
+    
+    def warmup(self, stream):
+        torch.cuda.synchronize()
+        stream.wait_stream(torch.cuda.current_stream())
+        # copy static_inputs because it will be cleared in model
+        with torch.cuda.stream(stream):
+            model(list(self.static_inputs))
+        stream.synchronize()
+        torch.cuda.current_stream().wait_stream(stream)
+        torch.cuda.synchronize()
+
+    def record(self, stream):
+        with torch.cuda.graph(self.graph, stream=stream):
+            static_outputs = model(list(self.static_inputs))
+        if not isinstance(static_outputs, (list, tuple)):
+            static_outputs = (static_outputs,)
+        return static_outputs
+
+    @staticmethod
+    def static_input(x):
+        """
+        Copy input while preserving strides
+        """
+        needed_size = (
+            sum((shape - 1) * stride for shape, stride in zip(x.size(), x.stride())) + 1
+        )
+        buffer = torch.empty_strided(needed_size, dtype=x.dtype, device=x.device)
+        return torch.as_strided(buffer, x.size(), x.stride())
 
     def run_size_asserts(self, new_inputs):
         copy_indices = [
@@ -282,34 +351,6 @@ class CudaGraphify(object):
         new_inputs.clear()
         graph.replay()
         return static_outputs
-
-    def warmup(self, stream):
-        torch.cuda.synchronize()
-        stream.wait_stream(torch.cuda.current_stream())
-        # copy static_inputs because it will be cleared in model
-        with torch.cuda.stream(stream):
-            model(list(self.static_inputs))
-        stream.synchronize()
-        torch.cuda.current_stream().wait_stream(stream)
-        torch.cuda.synchronize()
-
-    def record(self, stream):
-        with torch.cuda.graph(self.graph, stream=stream):
-            static_outputs = model(list(self.static_inputs))
-        if not isinstance(static_outputs, (list, tuple)):
-            static_outputs = (static_outputs,)
-        return static_outputs
-
-    @staticmethod
-    def static_input(x):
-        """
-        Copy and input while preserving strides
-        """
-        needed_size = (
-            sum((shape - 1) * stride for shape, stride in zip(x.size(), x.stride())) + 1
-        )
-        buffer = torch.zeros(needed_size, dtype=x.dtype, device=x.device)
-        return torch.as_strided(buffer, x.size(), x.stride())
 
 
 def cudagraphify_impl(model, inputs, static_input_idxs=()):

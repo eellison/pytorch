@@ -389,10 +389,13 @@ class CudaGraphModule(Module):
 
         if graph is not None:
             pass
-        
 
-        static_input_idxs = [i for i in range(len(args)) if id(args[i]) in self.static_input_id_set]
-        non_static_idxs = [i for i in range(len(args)) if id(args[i]) not in self.static_input_id_set]
+        static_input_idxs = [
+            i for i in range(len(args)) if id(args[i]) in self.static_input_id_set
+        ]
+        non_static_idxs = [
+            i for i in range(len(args)) if id(args[i]) not in self.static_input_id_set
+        ]
 
         # warmup
         torch.cuda.synchronize()
@@ -407,7 +410,8 @@ class CudaGraphModule(Module):
         def alloc_input(x):
             # XXX: do not launch kernel here!
             needed_size = (
-                sum((shape - 1) * stride for shape, stride in zip(x.size(), x.stride())) + 1
+                sum((shape - 1) * stride for shape, stride in zip(x.size(), x.stride()))
+                + 1
             )
             buffer = torch.empty(needed_size, dtype=x.dtype, device=x.device)
             return torch.as_strided(buffer, x.size(), x.stride())
@@ -417,21 +421,22 @@ class CudaGraphModule(Module):
             # TODO: - should we make the storage resizable ?
             # For now, say no
             # Allocator is given for potential future reallocations, however it can be nullptr if the storage
-            # is non-resizable 
+            # is non-resizable
             return {
                 "nbytes": x.storage().nbytes(),
                 "data_ptr": x.storage().data_ptr(),
-                "size": x.shape
+                "size": x.shape,
                 "stride": x.stride(),
                 "dtype": x.dtype,
                 "device": x.device,
-                "storage_offset": x.storage_offset() if not ignore_storage_offset else 0
+                "storage_offset": x.storage_offset()
+                if not ignore_storage_offset
+                else 0,
             }
 
         alloc_inp_meta_data = []
         output_meta_data = []
 
-                
         # we allocate inputs within the cuda graph, so that the inputs are part of the memory pool
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, stream=stream, pool=cuda_graphs_thread_pool):
@@ -440,12 +445,12 @@ class CudaGraphModule(Module):
                 if i in static_input_idxs:
                     inps.append(args[i])
                     continue
-                
-                # TODO: is it actually necessary to zero these args ? 
+
+                # TODO: is it actually necessary to zero these args ?
                 # If so, we dont want to capture the zero_ kernel in the graph
-                # so we would need to make them part of the memory pool for the 
+                # so we would need to make them part of the memory pool for the
                 # graph but not the actual graph recording
-        
+
                 allocated_inp = alloc_input(args[i])
                 inps.append(allocated_inp)
                 alloc_inp_meta_data.append(meta_data(allocated_inp))
@@ -458,7 +463,6 @@ class CudaGraphModule(Module):
 
         def run(new_inputs):
             assert len(static_inputs) == len(new_inputs)
-
 
             for idx, (dst, src, expanded_dims) in enumerate(
                 zip(static_inputs, new_inputs, inps_expanded_dims)
@@ -480,8 +484,6 @@ class CudaGraphModule(Module):
         # implementation with compiled bytecode that copies into static, replays
         # the cuda graph, then copies out.  First condition is the hotpath,
         # needs optimizing
-
-        
 
         if self.graph is not None:
             assert len(args) == len(self.static_inputs)
@@ -564,7 +566,9 @@ def apply_cuda_graphs(gm, static_input_id_set):
             submod = gm.get_submodule(n.target)
             gm.delete_submodule(n.target)
             mutated_inputs = find_input_mutations(submod.graph)
-            gm.add_submodule(n.target, CudaGraphModule(submod, mutated_inputs, static_input_id_set))
+            gm.add_submodule(
+                n.target, CudaGraphModule(submod, mutated_inputs, static_input_id_set)
+            )
     # NB: we didn't actually change the graph, no need for recompile
 
 
@@ -590,6 +594,7 @@ def cudagraphs(model, inputs, num_fixed):
 
     return run
 
+
 def raw_aot_autograd_cudagraphs(model, inputs):
     num_example_inputs = len(inputs)
 
@@ -604,12 +609,12 @@ def raw_aot_autograd_cudagraphs(model, inputs):
         out = cudagraphs(model, example_inputs, num_fixed=fixed)
         out._boxed_call = True
         return out
-    
+
     from .backends import aot_autograd
 
     return aot_autograd(
-        model, 
-        inputs, 
+        model,
+        inputs,
         fw_compiler=fw_compiler,
         bw_compiler=bw_compiler,
     )
