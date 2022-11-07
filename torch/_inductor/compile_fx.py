@@ -219,12 +219,88 @@ def remove_unaligned_input_idxs(inputs, static_input_idxs):
     return static_input_idxs
 
 
-def cudagraphify_impl(model, inputs, static_input_idxs=()):
-    """
-    Assumes inputs[static_input_idxs[i]] are always the same memory address
-    """
-    static_input_idxs = remove_unaligned_input_idxs(inputs, static_input_idxs)
+# TODO - make thread local
+cuda_graphs_thread_pool = torch.cuda.graph_pool_handle()
 
+
+class CudaGraphify(object):
+    def __init__(self, model, inputs, static_input_idxs=()):
+        """
+        Assumes inputs[static_input_idxs[i]] are always the same memory address
+        """
+        self.model = model
+        self.static_input_idxs = remove_unaligned_input_idxs(inputs, static_input_idxs)
+        assert isinstance(inputs, (list, tuple))
+
+        self.static_inputs = [
+            static_input(x) if idx not in static_input_idxs else x.detach()
+            for idx, x in enumerate(inputs)
+        ]
+        self.inps_expanded_dims = [
+            get_expanded_dims(x) if idx not in static_input_idxs else []
+            for idx, x in enumerate(inputs)
+        ]
+
+        stream = torch.cuda.Stream()
+
+        self.warmup(stream)
+        self.graph = torch.cuda.CUDAGraph()
+        self.static_outputs = self.record(stream)
+        self.run = self.run_size_asserts if config.size_asserts else self.run_no_asserts
+
+    def run_size_asserts(self, new_inputs):
+        copy_indices = [
+            idx
+            for idx in range(len(self.static_inputs))
+            if idx not in static_input_idxs
+        ]
+
+        for idx in copy_indices:
+            src = index_expanded_dims(
+                self.static_inputs[idx], self.inps_expanded_dims[idx]
+            )
+            dst = index_expanded_dims(new_inputs[idx], inps_expanded_dims[idx])
+            dst.copy_(src)
+        new_inputs.clear()
+        graph.replay()
+        return static_outputs
+
+    def run_no_asserts(self, new_inputs):
+        assert len(self.static_inputs) == len(new_inputs)
+        for idx, (dst, src, expanded_dims) in enumerate(
+            zip(self.static_inputs, new_inputs, self.inps_expanded_dims)
+        ):
+            if idx in self.static_input_idxs:
+                assert dst.data_ptr() == src.data_ptr()
+            else:
+                # TODO - could make one single op of multiple slices
+                # and avoid dispatch.
+                # Could also pre-index the `dst` tensors
+                dst = index_expanded_dims(dst, expanded_dims)
+                src = index_expanded_dims(src, expanded_dims)
+                dst.copy_(src)
+        new_inputs.clear()
+        graph.replay()
+        return static_outputs
+
+    def warmup(self, stream):
+        torch.cuda.synchronize()
+        stream.wait_stream(torch.cuda.current_stream())
+        # copy static_inputs because it will be cleared in model
+        with torch.cuda.stream(stream):
+            model(list(self.static_inputs))
+        stream.synchronize()
+        torch.cuda.current_stream().wait_stream(stream)
+        torch.cuda.synchronize()
+
+    def record(self, stream):
+        with torch.cuda.graph(self.graph, stream=stream):
+            static_outputs = model(list(self.static_inputs))
+        if not isinstance(static_outputs, (list, tuple)):
+            static_outputs = (static_outputs,)
+        return static_outputs
+
+    @staticmethod
     def static_input(x):
         """
         Copy and input while preserving strides
@@ -235,70 +311,9 @@ def cudagraphify_impl(model, inputs, static_input_idxs=()):
         buffer = torch.zeros(needed_size, dtype=x.dtype, device=x.device)
         return torch.as_strided(buffer, x.size(), x.stride())
 
-    assert isinstance(inputs, (list, tuple))
-    static_inputs = [
-        static_input(x) if idx not in static_input_idxs else x.detach()
-        for idx, x in enumerate(inputs)
-    ]
 
-    inps_expanded_dims = [
-        get_expanded_dims(x) if idx not in static_input_idxs else []
-        for idx, x in enumerate(inputs)
-    ]
-
-    # warmup
-    torch.cuda.synchronize()
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    # copy static_inputs because it will be cleared in model
-    with torch.cuda.stream(stream):
-        model(list(static_inputs))
-    stream.synchronize()
-    torch.cuda.current_stream().wait_stream(stream)
-    torch.cuda.synchronize()
-
-    # record
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph, stream=stream):
-        static_outputs = model(list(static_inputs))
-    if not isinstance(static_outputs, (list, tuple)):
-        static_outputs = (static_outputs,)
-
-    if config.size_asserts:
-
-        def run(new_inputs):
-            assert len(static_inputs) == len(new_inputs)
-            for idx, (dst, src, expanded_dims) in enumerate(
-                zip(static_inputs, new_inputs, inps_expanded_dims)
-            ):
-                if idx in static_input_idxs:
-                    assert dst.data_ptr() == src.data_ptr()
-                else:
-                    # TODO - could make one single op of multiple slices
-                    # and avoid dispatch.
-                    # Could also pre-index the `dst` tensors
-                    dst = index_expanded_dims(dst, expanded_dims)
-                    src = index_expanded_dims(src, expanded_dims)
-                    dst.copy_(src)
-            new_inputs.clear()
-            graph.replay()
-            return static_outputs
-
-    else:
-        copy_indices = [
-            idx for idx in range(len(static_inputs)) if idx not in static_input_idxs
-        ]
-
-        def run(new_inputs):
-            for idx in copy_indices:
-                src = index_expanded_dims(static_inputs[idx], inps_expanded_dims[idx])
-                dst = index_expanded_dims(new_inputs[idx], inps_expanded_dims[idx])
-                dst.copy_(src)
-            new_inputs.clear()
-            graph.replay()
-            return static_outputs
-
-    return run
+def cudagraphify_impl(model, inputs, static_input_idxs=()):
+    return CudaGraphify(model, inputs, static_input_idxs).run
 
 
 def count_tangents(fx_g: torch.fx.GraphModule):
