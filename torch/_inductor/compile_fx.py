@@ -199,6 +199,7 @@ def cudagraphify(model, inputs, static_input_idxs=()):
         nonlocal compiled_fn
         if compiled_fn is None:
             with dynamo_utils.preserve_rng_state():
+                breakpoint()
                 compiled_fn = cudagraphify_impl(model, new_inputs, static_input_idxs)
 
         return compiled_fn(new_inputs)
@@ -220,60 +221,137 @@ def remove_unaligned_input_idxs(inputs, static_input_idxs):
 
 
 # TODO - make thread local
+# TODO - when all references to this die (and when all output tensors are dead)
+# we should release this 
 cuda_graphs_thread_pool = torch.cuda.graph_pool_handle()
 
-
 class CudaGraphify(object):
-    __slots__ = ('static_input_dxs', 'inps_expanded_dims', 'graph', 'static_outputs', 'run')
 
     def __init__(self, model, inputs, static_input_idxs=()):
-        """
-        Assumes inputs[static_input_idxs[i]] are always the same memory address
-        """
         self.model = model
-        self.static_input_idxs = remove_unaligned_input_idxs(inputs, static_input_idxs)
+        static_input_idxs = remove_unaligned_input_idxs(inputs, static_input_idxs)
+        self.static_input_idxs = static_input_idxs
+
         assert isinstance(inputs, (list, tuple))
 
-        non_static_inputs = self.allocate_non_static_inputs(inputs)
 
-        self.inps_expanded_dims = [
+        # TODO - we should check which inputs are outputs from a previous cudagraph, in which case we dont need to copy
+        # and add this as condition to bail
+        # We should use the data_ptr() to check, not the id, since the id is not stable
+        self.static_inputs = [(inputs[i] if i in static_input_idxs else None) for i in range(len(inputs))]
+
+        self.expanded_dims = inps_expanded_dims = [
             get_expanded_dims(x) if idx not in static_input_idxs else []
             for idx, x in enumerate(inputs)
         ]
-
+        
         stream = torch.cuda.Stream()
+        recording_inputs = self.allocate_recording_inputs(inputs)
+        self.non_static_inputs_metadata = [(self.tensor_metadata(x) if idx not in self.static_input_idxs else None) for idx, x in enumerate(recording_inputs)]
 
-        self.warmup(stream)
+        self.warmup(model, stream, recording_inputs)
+
         self.graph = torch.cuda.CUDAGraph()
-        self.static_outputs = self.record(stream)
 
-        self.run = self.run_size_asserts if config.size_asserts else self.run_no_asserts
+        # on the first invocation, return the first recorded outputs, because their memory 
+        # is correctly accounted for in the CUDAGraphs memory pool, so on subsequent cudagraph
+        # invocation it is correctly accounted for. This enforces one cudagraph set of tapes. 
+        # TODO - make the memory pool valid, so that cudagraphs can have multiple, different 
+        # subsequent cudagraph invocation paths so long as its predecessors are the same
+        self.outputs = self.record(model, stream, recording_inputs)
+        self.outputs_metadata = [self.tensor_metadata(x, ignore_storage_offset=False) for x in self.outputs]
 
-
-    def allocate_non_static_inputs(inputs):
+    def allocate_recording_inputs(self, inputs):
         torch.cuda.synchronize()
         stream = torch.cuda.Stream()
         stream.wait_stream(torch.cuda.current_stream())
-        non_static_inputs = []
-        Graph = torch.cuda.CUDAGraph()
+        recording_inputs = []
 
         # inputs should be allocated in the cuda graph memory pool
-        with torch.cuda.graph(pool=cuda_graphs_thread_pool, stream=stream)
+        # graph needs to be kept alive
+        self.inps_alloc_graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self.inps_alloc_graph, pool=cuda_graphs_thread_pool, stream=stream):
             for i, inp in enumerate(inputs):
                 if i not in self.static_input_idxs:
-                    non_static_inputs.append(self.static_input(inp))
-        
+                    recording_inputs.append(self.static_input(inp))
+                else:
+                    recording_inputs.append(inp)
+
         # TODO - assert that no kernels were launched here
+        # TODO: more memory efficient to allocate new input and deallocate 
+        # old input, one by one
 
         # Now that the Graph is no longer recording, zero out inputs
         # since they may be used in indexing in graph warmup
-        for inp in non_static_inputs:
-            inp.zero_()
+        for i, inp in enumerate(recording_inputs):
+            if i not in self.static_input_idxs:
+                inp.zero_()
 
-        return non_static_inputs
+        return recording_inputs
+
+    def warmup(self, model, stream, inps):
+        # TODO - optimize memory pattern
+        torch.cuda.synchronize()
+        stream.wait_stream(torch.cuda.current_stream())
+        # copy inputs because list will get cleared in model invocation
+        with torch.cuda.stream(stream):
+            model(list(inps))
+        stream.synchronize()
+        torch.cuda.current_stream().wait_stream(stream)
+        torch.cuda.synchronize()
+
+    def record(self, model, stream, inputs):
+        with torch.cuda.graph(self.graph, stream=stream, pool=cuda_graphs_thread_pool):
+            static_outputs = model(inputs)
+
+        # running model should reclaim memory
+        assert len(inputs) == 0
+
+        if not isinstance(static_outputs, (list, tuple)):
+            static_outputs = (static_outputs,)
+        return static_outputs
+
+    def run(self, new_inputs):
+        assert len(self.static_inputs) == len(new_inputs)
+        for idx, inp in enumerate(self.static_inputs):
+            if inp is not None:
+                assert inp.data_ptr() == new_inputs[idx].data_ptr()
+            else:
+                dst = self.reconstruct_from_tensor_metadata(self.non_static_inputs_metadata[idx])
+                expanded_dims = self.expanded_dims[idx]
+
+                dst = index_expanded_dims(dst, expanded_dims)
+                src = index_expanded_dims(src, expanded_dims)
+                # TODO - one jit kernel acorss multiple inputs
+                dst.copy_(src)
+
+        new_inputs.clear()
+        self.graph.replay()
+
+        if self.outputs is not None:
+            outputs = self.outputs
+            self.outputs = None
+            return outputs
+
+        # TODO - share the same storage object across aliased outputs
+        return [self.reconstruct_from_tensor_metadata(metadata) for metadata in self.outputs_metadata]
+
 
     @staticmethod
-    def tensor_meta_data(x, ignore_storage_offset=True):
+    def static_input(x):
+        """
+        Copy input while preserving strides
+        """
+        needed_size = (
+            sum((shape - 1) * stride for shape, stride in zip(x.size(), x.stride())) + 1
+        )
+        buffer = torch.empty((needed_size,), dtype=x.dtype, device=x.device)
+        return torch.as_strided(buffer, x.size(), x.stride())
+
+
+    @staticmethod
+    def tensor_metadata(x, ignore_storage_offset=True):
+        assert isinstance(x, torch.Tensor)
         # We ignore the storage offset for inputs, but not for outputs
         # TODO: - should we make the storage resizable ?
         return {
@@ -288,70 +366,12 @@ class CudaGraphify(object):
             else 0,
         }
 
-    
-    def warmup(self, stream):
-        torch.cuda.synchronize()
-        stream.wait_stream(torch.cuda.current_stream())
-        # copy static_inputs because it will be cleared in model
-        with torch.cuda.stream(stream):
-            model(list(self.static_inputs))
-        stream.synchronize()
-        torch.cuda.current_stream().wait_stream(stream)
-        torch.cuda.synchronize()
-
-    def record(self, stream):
-        with torch.cuda.graph(self.graph, stream=stream):
-            static_outputs = model(list(self.static_inputs))
-        if not isinstance(static_outputs, (list, tuple)):
-            static_outputs = (static_outputs,)
-        return static_outputs
-
     @staticmethod
-    def static_input(x):
-        """
-        Copy input while preserving strides
-        """
-        needed_size = (
-            sum((shape - 1) * stride for shape, stride in zip(x.size(), x.stride())) + 1
-        )
-        buffer = torch.empty_strided(needed_size, dtype=x.dtype, device=x.device)
-        return torch.as_strided(buffer, x.size(), x.stride())
-
-    def run_size_asserts(self, new_inputs):
-        copy_indices = [
-            idx
-            for idx in range(len(self.static_inputs))
-            if idx not in static_input_idxs
-        ]
-
-        for idx in copy_indices:
-            src = index_expanded_dims(
-                self.static_inputs[idx], self.inps_expanded_dims[idx]
-            )
-            dst = index_expanded_dims(new_inputs[idx], inps_expanded_dims[idx])
-            dst.copy_(src)
-        new_inputs.clear()
-        graph.replay()
-        return static_outputs
-
-    def run_no_asserts(self, new_inputs):
-        assert len(self.static_inputs) == len(new_inputs)
-        for idx, (dst, src, expanded_dims) in enumerate(
-            zip(self.static_inputs, new_inputs, self.inps_expanded_dims)
-        ):
-            if idx in self.static_input_idxs:
-                assert dst.data_ptr() == src.data_ptr()
-            else:
-                # TODO - could make one single op of multiple slices
-                # and avoid dispatch.
-                # Could also pre-index the `dst` tensors
-                dst = index_expanded_dims(dst, expanded_dims)
-                src = index_expanded_dims(src, expanded_dims)
-                dst.copy_(src)
-        new_inputs.clear()
-        graph.replay()
-        return static_outputs
-
+    def reconstruct_from_tensor_metadata(metadata):
+        s = torch._C._construct_storage_from_data_pointer(metadata["data_ptr"], metadata["device"], metadata["nbytes"])
+        t = torch.empty([0], device=metadata["device"], dtype=metadata["dtype"])
+        t.set_(source=s, storage_offset=metadata["storage_offset"], size=metadata["size"], stride=metadata["stride"])
+        return t
 
 def cudagraphify_impl(model, inputs, static_input_idxs=()):
     return CudaGraphify(model, inputs, static_input_idxs).run
