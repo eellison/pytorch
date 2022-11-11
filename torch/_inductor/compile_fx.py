@@ -231,10 +231,20 @@ def remove_unaligned_input_idxs(inputs, static_input_idxs):
 # manages separate tapes
 class CUDAGraphTapeManger(object):
     def __init__(self):
-        self.recorded_tapes = []
-        self.active_tape = []
+        self.cuda_tapes : List[CUDAGraphTape] = []
+
+        # indexes into the cuda tapes
+        self.active_executing_tape : Optional[int] = None
+        self.active_recording_tape : Optional[int] = None
+
         self.counter = itertools.count(0)
         self.cuda_graphs_thread_pool = torch.cuda.graph_pool_handle()
+
+    def increment_recording_tape(self) -> int:
+        # we need to error if the active execution tape isn't done yet
+
+        if not self.active_recording_tape:
+
 
 
 class CUDAGraphTape(object):
