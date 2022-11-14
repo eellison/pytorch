@@ -262,7 +262,7 @@ class CUDAGraphTapeManger(object):
         # shape might be seen as one long tape
         if (
             self.active_recording_idx is not None
-            and self.tapes[self.active_recording_idx].recorded_outputs_are_dead()
+            and self.tapes[self.active_recording_idx].valid_end_of_recording()
         ):
             self.active_recording_idx = None
 
@@ -283,7 +283,7 @@ class CUDAGraphTapeManger(object):
 
     def increment_execution_tape(self, id: GraphID) -> bool:
         if self.active_recording_idx is not None:
-            if not self.tapes[self.active_recording_idx].recorded_outputs_are_dead():
+            if not self.tapes[self.active_recording_idx].valid_end_of_recording():
                 return False
             self.active_recording_idx = None
 
@@ -293,7 +293,7 @@ class CUDAGraphTapeManger(object):
         if id in self.head_to_tape_idx:
             if (
                 self.active_executing_idx is not None
-                and self.tapes[self.active_executing_idx].valid_end_of_execution()
+                and not self.tapes[self.active_executing_idx].valid_end_of_execution()
             ):
                 return False
 
@@ -307,6 +307,8 @@ class CUDAGraphTapeManger(object):
     def valid_end_of_end_execution(self) -> bool:
         return self.tapes[self.active_executing_idx].valid_end_of_execution()
 
+    def check_liveness_after_graph(self) -> bool:
+        return self.tapes[self.active_executing_idx].check_liveness_after_graph()
     # def check_previous_execution_tape_outputs_all_dead(self, tape):
 
     #     pass
@@ -359,9 +361,7 @@ class CUDAGraphTape(object):
         # for each cudagraph, which inputs are outputs of previous cudagraphs
         self.expected_cudagraph_managed_inputs: List[Dict[int, Tuple[int, int]]] = []
 
-        self.outputs_live_at_final_execution: List[Tuple[int, int]] = []
-
-        self.has_executed = False
+        self.outputs_live_at_last_tape: List[Tuple[int, int]] = []
 
     def increment_recording_tape(self) -> GraphID:
         cnt = GraphID(next(self.tape_manager.counter))
@@ -403,45 +403,19 @@ class CUDAGraphTape(object):
         return weakref.ref(t)
 
     def increment_execution_tape(self, graph_id: GraphID) -> bool:
-
-        # first execution freezes the tape
-        if not self.has_executed:
-            self.has_executed = True
-
-            # on first execution, we need to check that all previous outputs are dead
-            # TODO condition could be relaxed with a config
-            live_outputs = []
-            final_recorded_liveness = self.recorded_liveness_after_graph[-1]
-            for i in range(len(final_recorded_liveness)):
-                for j in range(len(final_recorded_liveness[i])):
-                    if final_recorded_liveness[i][j]:
-                        live_outputs.append((i, j))
-            self.expected_dead_indices_before_graph[0] = live_outputs
-
-        if len(self.executed_tape) > len(self.reorded_tape):
-            self.executed_tape = []
+        self.executed_tape.append(graph_id)
+        idx = len(self.executed_tape) - 1
+        try:
+            if self.executed_tape[-1] != self.recorded_tape[idx]:
+                return False
+        except Exception as e:
+            breakpoint()
+            print(e)
 
         if not self.check_liveness(
-            self.expected_dead_indices_before_graph[0], self.executed_outputs_weakrefs
+            self.expected_dead_indices_before_graph[idx], self.executed_outputs_weakrefs
         ):
             return False
-
-        self.executed_tape.append(graph_id)
-        if self.executed_tape[-1] != self.recorded_tape[len(self.executed_tape) - 1]:
-            return False
-
-        if len(self.executed_tape) == len(self.recorded_tape):
-            # TODO
-            # need to restart all the other executed state as well
-            # for the first input, need to check that the last outputs are dead
-            self.executed_tape = []
-
-        # check that the dead indices are now dead
-        for i, j in self.expected_dead_indices_before_graph(
-            len(self.executed_tape) - 1
-        ):
-            if self.executed_outputs_weakrefs[i][j]() is not None:
-                return False
 
         return True
 
@@ -449,9 +423,8 @@ class CUDAGraphTape(object):
         self.executed_outputs_weakrefs.append([self.map_to_ref(t) for t in outputs])
 
     def check_liveness_after_graph(self):
-        idx = len(self.executed_tape)
         return self.check_liveness(
-            self.expected_dead_indices_after_graph[idx - 1],
+            self.expected_dead_indices_after_graph[len(self.executed_tape) - 1],
             self.executed_outputs_weakrefs,
         )
         
@@ -482,20 +455,42 @@ class CUDAGraphTape(object):
         return dead_indices
 
     @staticmethod
-    def check_liveness(
-        self, indices: List[Tuple[int, int]], output_refs: List[List[bool]]
-    ):
+    def check_liveness(indices: List[Tuple[int, int]], output_refs: List[List[bool]]):
+
         for i, j in indices:
             if output_refs[i][j]() is not None:
                 return False
         return True
 
     def valid_end_of_execution(self):
-        return len(self.executed_tape) == len(
+        valid = len(self.executed_tape) == len(
             self.recorded_tape
         ) and self.check_liveness(
-            self.recorded_liveness_after_graph[-1], self.executed_outputs_weakrefs
+            self.outputs_live_at_last_tape, self.executed_outputs_weakrefs
         )
+        if (valid):
+            self.reset_execution_state()
+        return valid
+
+    def reset_execution_state(self):
+        self.executed_tape = []
+        self.executed_outputs_weakrefs = []
+
+    def valid_end_of_recording(self):
+        for outputs in self.recorded_outputs_weakrefs:
+            for out in outputs:
+                if out is not None and out() is not None:
+                    return False
+
+        live_outputs = []
+        final_recorded_liveness = self.recorded_liveness_after_graph[-1]
+        for i in range(len(final_recorded_liveness)):
+            for j in range(len(final_recorded_liveness[i])):
+                if final_recorded_liveness[i][j]:
+                    live_outputs.append((i, j))
+        
+        self.outputs_live_at_last_tape = live_outputs
+        return True
 
     def recorded_outputs_are_dead(self):
         breakpoint()
