@@ -705,7 +705,7 @@ class CudaGraphify(object):
                 return False
 
         # same order of execution, previous outputs dead
-        if not tape.increment_execution_tape(self.graph_id):
+        if not tape_manager.increment_execution_tape(self.graph_id):
             return False
 
         # the cudagraph managed tensors which died upon recording must also die upon 
@@ -713,7 +713,7 @@ class CudaGraphify(object):
         # because we would have already written over their memory. 
         for idx in self.cudagraph_managed_idxs:
             inputs[idx] = None
-        if not tape.check_liveness_after_graph():
+        if not tape_manager.check_liveness_after_graph():
             for idx in self.self.cudagraph_managed_idxs:
                 inputs[idx] = self.reconstruct_from_tensor_metadata(self.non_static_inputs_metadata[idx])
             return False
