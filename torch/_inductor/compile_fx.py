@@ -5,14 +5,16 @@ import logging
 import sys
 import threading
 
+import weakref
+from typing import Any, Dict, List, Optional, Tuple
+
 import functorch
 from functorch._src.aot_autograd import make_boxed_func
 from functorch.compile import min_cut_rematerialization_partition
 
-import weakref
 import torch.fx
 from torch._subclasses.fake_tensor import FakeTensor
-from  torch.utils import _pytree as pytree
+from torch.utils import _pytree as pytree
 from . import config, overrides
 from .debug import DebugContext
 from .decomposition import select_decomp_table
@@ -24,7 +26,6 @@ from .utils import (
     has_incompatible_cudagraph_ops,
 )
 from .virtualized import V
-from typing import Optional, Tuple, List, Any, Dict
 
 Ref = Any
 
@@ -227,86 +228,115 @@ def remove_unaligned_input_idxs(inputs, static_input_idxs):
 # TODO allow different order of threads
 # We should allow differnt tapes
 
+
 @dataclasses.dataclass(frozen=True)
 class GraphID:
-    id : int
+    id: int
+
 
 # manages separate tapes
 class CUDAGraphTapeManger(object):
     def __init__(self):
-        self.cuda_tapes : List[CUDAGraphTape] = []
+        self.tapes: List[CUDAGraphTape] = []
 
         # indexes into the cuda tapes
-        self.active_executing_tape : Optional[int] = None
-        self.active_recording_tape : Optional[int] = None
+        self.active_executing_idx: Optional[int] = None
+        self.active_recording_idx: Optional[int] = None
 
-        self.head_to_tape_idx : Dict[GraphID, int] = {}
+        self.head_to_tape_idx: Dict[GraphID, int] = {}
 
         self.counter = itertools.count(0)
         self.cuda_graphs_thread_pool = torch.cuda.graph_pool_handle()
 
     def increment_recording_tape(self) -> Optional[GraphID]:
-        # we need to error if the active execution tape isn't finished yet
-        if self.active_executing_tape:
-            pass
+        # we need to check if the active execution tape isn't finished yet
 
-            # Check that its at the end of its tape,
-            # check that the outputs are dead 
-            # set active executing tape to None
+        if self.active_executing_idx:
+            if not self.tapes[self.active_executing_idx].valid_end_of_execution():
+                return None
 
-        first_tape = False
-        if not self.active_executing_tape:
-            self.cuda_tapes.append(CUDAGraphTape(self))
-            self.active_recording_tape = len(self.cuda_tapes) - 1
-            first_tape = True
+            self.active_executing_idx = None
 
-        tape = self.cuda_tapes[self.active_recording_tape]
+        # if we're recording, we want to end the tape when the previous tape no longer
+        # has live outputs. otherwise, invoking a model with one shape, and then a different
+        # shape might be seen as one long tape
+        if (
+            self.active_recording_idx is not None
+            and self.tapes[self.active_recording_idx].recorded_outputs_are_dead()
+        ):
+            self.active_recording_idx = None
+
+        if self.active_recording_idx is None:
+            self.tapes.append(CUDAGraphTape(self))
+            self.active_recording_idx = len(self.tapes) - 1
+
+        tape = self.tapes[self.active_recording_idx]
         graph_id = tape.increment_recording_tape()
 
-        if first_tape:
-            self.head_to_tape_idx[graph_id] = self.active_recording_tape
+        if len(self.head_to_tape_idx) < len(self.tapes):
+            self.head_to_tape_idx[graph_id] = self.active_recording_idx
 
         return graph_id
 
     def record_graph_outputs(self, outputs: List[Optional[torch.Tensor]]) -> None:
-        self.cuda_tapes[self.active_recording_tape].record_graph_outputs(outputs)
+        self.tapes[self.active_recording_idx].record_graph_outputs(outputs)
 
-    def increment_and_check_execution_tape(self, id: GraphID) -> bool:
-        # if we were recording, we need to not record anymore
-        # 
+    def increment_execution_tape(self, id: GraphID) -> bool:
+        if self.active_recording_idx is not None:
+            if not self.tapes[self.active_recording_idx].recorded_outputs_are_dead():
+                return False
+            self.active_recording_idx = None
 
+        if self.active_executing_idx is None and id not in self.head_to_tape_idx:
+            return False
 
-        # if its the head of a previous one, we need to check that the outputs are dead
-        return self.cuda_tapes[self.active_executing_tape].increment_and_check_execution_tape(id)
+        if id in self.head_to_tape_idx:
+            if (
+                self.active_executing_idx is not None
+                and self.tapes[self.active_executing_idx].valid_end_of_execution()
+            ):
+                return False
 
-    def add_outputs_and_check_liveness(self, outputs: List[Optional[torch.Tensor]]):
-        return self.cuda_tapes[self.active_executing_tape].add_outputs_and_check_liveness(outputs)
-    
+            self.active_executing_idx = self.head_to_tape_idx[id]
+
+        return self.tapes[self.active_executing_idx].increment_execution_tape(id)
+
+    def add_executed_outputs(self, outputs: List[Optional[torch.Tensor]]):
+        return self.tapes[self.active_executing_idx].add_executed_outputs(outputs)
+
+    def valid_end_of_end_execution(self) -> bool:
+        return self.tapes[self.active_executing_idx].valid_end_of_execution()
+
     # def check_previous_execution_tape_outputs_all_dead(self, tape):
-
 
     #     pass
 
     def get_cuda_graph_managed_tensors(self, tensors) -> List[int]:
         assert self.in_recording
-        return self.cuda_tapes[self.active_recording_tape].get_cuda_graph_managed_tensors(tensors)
-
+        return self.tapes[self.active_recording_idx].get_cuda_graph_managed_tensors(tensors)
 
     def check_input_liveness(self, new_inputs):
         assert self.in_execution
-        return self.cuda_tapes[self.active_executing_tape].check_input_liveness(self, new_inputs)
+        return self.tapes[self.active_executing_idx].check_input_liveness(new_inputs)
 
     @property
     def in_exeuction(self):
-        return self.active_recording_tape is None and self.active_executing_tape is not None
+        return (
+            self.active_recording_idx is None
+            and self.active_executing_idx is not None
+        )
 
     @property
     def in_recording(self):
-        return self.active_recording_tape is not None and self.active_executing_tape is None
+        return (
+            self.active_recording_idx is not None
+            and self.active_executing_idx is None
+        )
+
 
 class CUDAGraphTape(object):
     def __init__(self, tape_manager):
-        
+
         self.tape_manager = tape_manager
         self.recorded_tape: List[GraphID] = []
         self.executed_tape: List[GraphID] = []
@@ -318,16 +348,16 @@ class CUDAGraphTape(object):
         # for the end, we only need to check which outputs died that
         # are cudagraph managed data pointers
         # in the future, it would be better to check storages
-        self.recorded_liveness_before_graph : List[List[bool]] = []
-        self.recorded_liveness_after_graph : List[List[bool]] = []
+        self.recorded_liveness_before_graph: List[List[bool]] = []
+        self.recorded_liveness_after_graph: List[List[bool]] = []
 
         # indices into graph i for output j
         # we check the delta of tensors which are no longer live
-        self.expected_dead_indices_before_graph : List[Tuple[int, int]] = []
-        self.expected_dead_indices_after_graph : List[Tuple[int, int]] = []
-        
+        self.expected_dead_indices_before_graph: List[Tuple[int, int]] = []
+        self.expected_dead_indices_after_graph: List[Tuple[int, int]] = []
+
         # for each cudagraph, which inputs are outputs of previous cudagraphs
-        self.expected_cudagraph_managed_inputs : List[Dict[int, Tuple[int, int]]] = []
+        self.expected_cudagraph_managed_inputs: List[Dict[int, Tuple[int, int]]] = []
 
         self.outputs_live_at_final_execution: List[Tuple[int, int]] = []
 
@@ -361,7 +391,9 @@ class CUDAGraphTape(object):
         self.expected_dead_indices_after_graph.append(delta)
 
         self.recorded_outputs_weakrefs.append([self.map_to_ref(o) for o in outputs])
-        self.recorded_liveness_after_graph.append(self.get_liveness(self.recorded_outputs_weakrefs))
+        self.recorded_liveness_after_graph.append(
+            self.get_liveness(self.recorded_outputs_weakrefs)
+        )
 
     @staticmethod
     def map_to_ref(t):
@@ -370,7 +402,7 @@ class CUDAGraphTape(object):
             return None
         return weakref.ref(t)
 
-    def increment_and_check_execution_tape(self, graph_id: GraphID) -> bool:
+    def increment_execution_tape(self, graph_id: GraphID) -> bool:
 
         # first execution freezes the tape
         if not self.has_executed:
@@ -386,17 +418,18 @@ class CUDAGraphTape(object):
                         live_outputs.append((i, j))
             self.expected_dead_indices_before_graph[0] = live_outputs
 
-        if (len(self.executed_tape) > len(self.reorded_tape)):
+        if len(self.executed_tape) > len(self.reorded_tape):
             self.executed_tape = []
 
-
-        if not self.check_liveness(self.expected_dead_indices_before_graph[0], self.executed_outputs_weakrefs):
+        if not self.check_liveness(
+            self.expected_dead_indices_before_graph[0], self.executed_outputs_weakrefs
+        ):
             return False
 
         self.executed_tape.append(graph_id)
         if self.executed_tape[-1] != self.recorded_tape[len(self.executed_tape) - 1]:
             return False
-            
+
         if len(self.executed_tape) == len(self.recorded_tape):
             # TODO
             # need to restart all the other executed state as well
@@ -404,18 +437,24 @@ class CUDAGraphTape(object):
             self.executed_tape = []
 
         # check that the dead indices are now dead
-        for i, j in self.expected_dead_indices_before_graph(len(self.executed_tape) - 1):
+        for i, j in self.expected_dead_indices_before_graph(
+            len(self.executed_tape) - 1
+        ):
             if self.executed_outputs_weakrefs[i][j]() is not None:
                 return False
 
         return True
 
-    def add_outputs_and_check_liveness(self, outputs):
+    def add_executed_outputs(self, outputs):
         self.executed_outputs_weakrefs.append([self.map_to_ref(t) for t in outputs])
 
+    def check_liveness_after_graph(self):
         idx = len(self.executed_tape)
-        return self.check_liveness(self.expected_dead_indices_after_graph[idx -1], self.executed_outputs_weakrefs)
-
+        return self.check_liveness(
+            self.expected_dead_indices_after_graph[idx - 1],
+            self.executed_outputs_weakrefs,
+        )
+        
     @staticmethod
     def get_liveness(output_weakrefs) -> List[List[bool]]:
         if len(output_weakrefs) == 0:
@@ -425,11 +464,13 @@ class CUDAGraphTape(object):
             if weak_ref is None:
                 return False
             return weak_ref() is not None
-        
+
         return [pytree.tree_map(is_live, outputs) for outputs in output_weakrefs]
 
     @staticmethod
-    def liveness_delta(prev: List[List[bool]], curr: List[List[bool]]) -> List[Tuple[int, int]]:
+    def liveness_delta(
+        prev: List[List[bool]], curr: List[List[bool]]
+    ) -> List[Tuple[int, int]]:
         dead_indices = []
         assert len(prev) <= len(curr)
         for i, outputs1, outputs2 in enumerate(zip(prev, curr)):
@@ -441,12 +482,27 @@ class CUDAGraphTape(object):
         return dead_indices
 
     @staticmethod
-    def check_liveness(self, indices: List[Tuple[int, int]], output_refs: List[List[bool]]):
+    def check_liveness(
+        self, indices: List[Tuple[int, int]], output_refs: List[List[bool]]
+    ):
         for i, j in indices:
             if output_refs[i][j]() is not None:
                 return False
         return True
 
+    def valid_end_of_execution(self):
+        return len(self.executed_tape) == len(
+            self.recorded_tape
+        ) and self.check_liveness(
+            self.recorded_liveness_after_graph[-1], self.executed_outputs_weakrefs
+        )
+
+    def recorded_outputs_are_dead(self):
+        for i, j in self.recorded_liveness_after_graph[-1]:
+            output = self.recorded_outputs_weakrefs[i][j]
+            if output is not None and output() is not None:
+                return False
+        return True
 
     def get_cuda_graph_managed_tensors(self, tensors):
         cuda_graph_managed_tensors = []
@@ -458,21 +514,21 @@ class CUDAGraphTape(object):
                         cuda_graph_managed_tensors.append(ind)
                         input_to_previous_graph_output[ind] = (i, j)
 
-
         self.expected_cudagraph_managed_inputs.append(input_to_previous_graph_output)
         return cuda_graph_managed_tensors
 
-    
     def __repr__(self):
         return f"""
-            recorded_tape: {self.recorded_tape}, 
+            recorded_tape: {self.recorded_tape},
             executed_tape: {self.executed_tape},
             expected_dead_indices_before_graph: {self.expected_dead_indices_before_graph},
             expected_dead_indices_after_graph: {self.expected_dead_indices_before_graph},
             "executed outputs weakrefs: {self.executed_outputs_weakrefs}
             """
 
+
 tape_manager = CUDAGraphTapeManger()
+
 
 class CudaGraphify(object):
     def __init__(self, model, inputs, static_input_idxs=()):
@@ -488,7 +544,9 @@ class CudaGraphify(object):
         static_input_idxs = remove_unaligned_input_idxs(inputs, static_input_idxs)
 
         # tensors which are outputs of previous graphs in the tape - assume these stay stable
-        self.cudagraph_managed_idxs = tape_manager.get_cuda_graph_managed_tensors(inputs)
+        self.cudagraph_managed_idxs = tape_manager.get_cuda_graph_managed_tensors(
+            inputs
+        )
 
         static_input_idxs = list(
             set(static_input_idxs) | set(self.cudagraph_managed_idxs)
@@ -510,7 +568,11 @@ class CudaGraphify(object):
         recording_inputs = self.allocate_recording_inputs(inputs)
 
         self.non_static_inputs_metadata = [
-            (self.tensor_metadata(x) if idx not in self.static_input_idxs else None)
+            (
+                self.tensor_metadata(x)
+                if idx not in (self.static_input_idxs + self.cudagraph_managed_idxs)
+                else None
+            )
             for idx, x in enumerate(recording_inputs)
         ]
 
@@ -528,7 +590,9 @@ class CudaGraphify(object):
         self.outputs_metadata = []
         for out in self.outputs:
             if isinstance(out, torch.Tensor):
-                self.outputs_metadata.append(self.tensor_metadata(out, ignore_storage_offset=False))
+                self.outputs_metadata.append(
+                    self.tensor_metadata(out, ignore_storage_offset=False)
+                )
             else:
                 assert out is None
                 self.outputs_metadata.append(None)
@@ -541,7 +605,9 @@ class CudaGraphify(object):
 
         # inputs should be allocated in the cuda graph memory pool
         with torch.cuda.graph(
-            self.inps_alloc_graph, pool=tape_manager.cuda_graphs_thread_pool, stream=stream
+            self.inps_alloc_graph,
+            pool=tape_manager.cuda_graphs_thread_pool,
+            stream=stream,
         ):
             for i, inp in enumerate(inputs):
                 if i not in self.static_input_idxs:
@@ -573,7 +639,9 @@ class CudaGraphify(object):
         torch.cuda.synchronize()
 
     def record(self, model, stream, inputs):
-        with torch.cuda.graph(self.graph, stream=stream, pool=tape_manager.cuda_graphs_thread_pool):
+        with torch.cuda.graph(
+            self.graph, stream=stream, pool=tape_manager.cuda_graphs_thread_pool
+        ):
             static_outputs = model(inputs)
 
         # running model should reclaim memory
@@ -607,7 +675,8 @@ class CudaGraphify(object):
         # we can't check after,
         # because their memory would have been already overwritten.
         if self.outputs is None and not self.check_invariants(new_inputs):
-            assert False
+            # TODO: mark globally not to attempt to run tape ?
+            return self.model(new_inputs)
             # TODO Bailout and run model
 
         new_inputs.clear()
@@ -624,29 +693,32 @@ class CudaGraphify(object):
             self.reconstruct_from_tensor_metadata(metadata)
             for metadata in self.outputs_metadata
         ]
-        
-        tape_manager.add_outputs_and_check_liveness(outputs)
+
+        tape_manager.add_executed_outputs(outputs)
 
         return outputs
 
-
     def check_invariants(self, inputs):
-        # same order of execution
-        if not tape.increment_and_check_execution_tape(self.graph_id):
-            return False
-
-        # and not tape_manager.check_input_liveness(new_inputs, self.cudagraph_managed_idxs)
         # previously managed data pointers remain stable
         for idx in self.cudagraph_managed_idxs:
             if inputs[idx].data_ptr() != self.static_input_data_ptrs[idx]:
                 return False
 
-        # the same delta of live tensors that we observed at recording is true now
-        # check the same delta of dead tensors from previous cudagraph is dead now
-        # if they die early, that's not really a problem
+        # same order of execution, previous outputs dead
+        if not tape.increment_execution_tape(self.graph_id):
+            return False
 
-        # if we're the first graph, we should check that all tensors are dead
-        # i suppose
+        # the cudagraph managed tensors which died upon recording must also die upon 
+        # this invocation. it is too late to check after we've replayed the graph, 
+        # because we would have already written over their memory. 
+        for idx in self.cudagraph_managed_idxs:
+            inputs[idx] = None
+        if not tape.check_liveness_after_graph():
+            for idx in self.self.cudagraph_managed_idxs:
+                inputs[idx] = self.reconstruct_from_tensor_metadata(self.non_static_inputs_metadata[idx])
+            return False
+
+        return True
 
     @staticmethod
     def static_input(x):
