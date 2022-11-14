@@ -498,6 +498,7 @@ class CUDAGraphTape(object):
         )
 
     def recorded_outputs_are_dead(self):
+        breakpoint()
         for i, j in self.recorded_liveness_after_graph[-1]:
             output = self.recorded_outputs_weakrefs[i][j]
             if output is not None and output() is not None:
@@ -517,14 +518,14 @@ class CUDAGraphTape(object):
         self.expected_cudagraph_managed_inputs.append(input_to_previous_graph_output)
         return cuda_graph_managed_tensors
 
-    def __repr__(self):
-        return f"""
-            recorded_tape: {self.recorded_tape},
-            executed_tape: {self.executed_tape},
-            expected_dead_indices_before_graph: {self.expected_dead_indices_before_graph},
-            expected_dead_indices_after_graph: {self.expected_dead_indices_before_graph},
-            "executed outputs weakrefs: {self.executed_outputs_weakrefs}
-            """
+    # def __repr__(self):
+    #     return f"""
+    #         recorded_tape: {self.recorded_tape},
+    #         executed_tape: {self.executed_tape},
+    #         expected_dead_indices_before_graph: {self.expected_dead_indices_before_graph},
+    #         expected_dead_indices_after_graph: {self.expected_dead_indices_before_graph},
+    #         "executed outputs weakrefs: {self.executed_outputs_weakrefs}
+    #         """
 
 
 tape_manager = CUDAGraphTapeManger()
