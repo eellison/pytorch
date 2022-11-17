@@ -3,7 +3,7 @@ import functools
 import itertools
 import logging
 import sys
-from typing import List
+from typing import List, Any
 
 import functorch
 from functorch._src.aot_autograd import make_boxed_func
@@ -83,6 +83,13 @@ def _step_logger():
     return dynamo_logging.get_step_logger(log)
 
 
+@dataclasses.dataclass
+class DebugWrapper(object):
+    fn: Any
+
+    def __call__(self, *args, **kwargs):
+        return self.fn(*args, **kwargs)
+
 @DebugContext.wrap
 @torch.utils._python_dispatch._disable_current_modes()
 def compile_fx_inner(
@@ -154,10 +161,10 @@ def compile_fx_inner(
         f"graph {graph_id}",
     )
 
+    result = DebugWrapper(result)
     # aot autograd needs to know to pass in inputs as a list
     result._boxed_call = True
     return result
-
 
 def clone_preserve_strides(x):
     needed_size = (
