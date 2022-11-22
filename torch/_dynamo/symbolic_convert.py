@@ -235,6 +235,7 @@ def generic_jump(truth_fn: typing.Callable, push: bool):
                 raise exc.SkipFrame(msg)
 
             self.push(value)
+            breakpoint()
             self.output.compile_subgraph(
                 self,
                 reason=GraphCompileReason(

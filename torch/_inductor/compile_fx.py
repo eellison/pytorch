@@ -197,6 +197,7 @@ def align_inputs(model, inputs, static_input_idxs=()):
     def run(new_inputs):
         for i in check_inputs:
             if new_inputs[i].data_ptr() % ALIGNMENT:
+                log.warning("Cloning input bc of alignment issue")
                 new_inputs[i] = clone_preserve_strides(new_inputs[i])
         return model(new_inputs)
 
@@ -234,6 +235,13 @@ def remove_unaligned_input_idxs(inputs, static_input_idxs):
         return aligned_static_input_idxs
     return static_input_idxs
 
+def copy_src_to_dst(src, dst, expanded_dims):
+    # TODO - could make one single op of multiple slices
+    # and avoid dispatch.
+    # Could also pre-index the `dst` tensors
+    src = index_expanded_dims(src, expanded_dims)
+    dst = index_expanded_dims(dst, expanded_dims)
+    dst.copy_(src)
 
 def cudagraphify_impl(model, inputs, static_input_idxs=()):
     """
@@ -241,7 +249,7 @@ def cudagraphify_impl(model, inputs, static_input_idxs=()):
     """
     static_input_idxs = remove_unaligned_input_idxs(inputs, static_input_idxs)
 
-    def static_input(x):
+    def static_input(x, expanded_dims):
         """
         Copy and input while preserving strides
         """
@@ -250,17 +258,19 @@ def cudagraphify_impl(model, inputs, static_input_idxs=()):
         needed_size = (
             sum((shape - 1) * stride for shape, stride in zip(x.size(), x.stride())) + 1
         )
-        buffer = torch.zeros(needed_size, dtype=x.dtype, device=x.device)
-        return torch.as_strided(buffer, x.size(), x.stride())
+        buffer = torch.empty(needed_size, dtype=x.dtype, device=x.device)
+        out = torch.as_strided(buffer, x.size(), x.stride())
+        copy_src_to_dst(x, out, expanded_dims)
+        return out
 
     assert isinstance(inputs, (list, tuple))
-    static_inputs = [
-        static_input(x) if idx not in static_input_idxs else x.detach()
+    inps_expanded_dims = [
+        get_expanded_dims(x) if idx not in static_input_idxs else []
         for idx, x in enumerate(inputs)
     ]
 
-    inps_expanded_dims = [
-        get_expanded_dims(x) if idx not in static_input_idxs else []
+    static_inputs = [
+        static_input(x, inps_expanded_dims[idx]) if idx not in static_input_idxs else x.detach()
         for idx, x in enumerate(inputs)
     ]
 
@@ -292,12 +302,7 @@ def cudagraphify_impl(model, inputs, static_input_idxs=()):
                 if idx in static_input_idxs:
                     assert dst.data_ptr() == src.data_ptr()
                 else:
-                    # TODO - could make one single op of multiple slices
-                    # and avoid dispatch.
-                    # Could also pre-index the `dst` tensors
-                    dst = index_expanded_dims(dst, expanded_dims)
-                    src = index_expanded_dims(src, expanded_dims)
-                    dst.copy_(src)
+                    copy_src_to_dst(src, dst, expanded_dims)
             new_inputs.clear()
             graph.replay()
             return static_outputs
@@ -309,9 +314,7 @@ def cudagraphify_impl(model, inputs, static_input_idxs=()):
 
         def run(new_inputs):
             for idx in copy_indices:
-                src = index_expanded_dims(static_inputs[idx], inps_expanded_dims[idx])
-                dst = index_expanded_dims(new_inputs[idx], inps_expanded_dims[idx])
-                dst.copy_(src)
+                copy_src_to_dst(static_inputs[idx], new_inputs[idx], inps_expanded_dims[idx])
             new_inputs.clear()
             graph.replay()
             return static_outputs
@@ -349,9 +352,9 @@ def compile_fx(
 ):
     """Main entrypoint to a compile given FX graph"""
 
-    if not is_aot_autograd_safe_to_run(model_, example_inputs_):
-        log.warning("Aot Autograd is not safe to run, so falling back to eager")
-        return model_
+    # if not is_aot_autograd_safe_to_run(model_, example_inputs_):
+    #     log.warning("Aot Autograd is not safe to run, so falling back to eager")
+    #     return model_
 
     functorch.compile.config.use_functionalize = True
     functorch.compile.config.use_fake_tensor = True
