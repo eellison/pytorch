@@ -345,10 +345,12 @@ class Loops(IRNode):
     @cache_on_self
     def inner_fn_str(self):
         try:
+            handler = V.MockHandler()
             with V.set_ops_handler(V.MockHandler()), patch.object(
                 FlexibleLayout, "allow_indexing", True
             ):
-                return str(self.inner_fn(self._index(self.ranges)))
+                out = str(self.inner_fn(self._index(self.ranges)))
+                return out
         except Exception as e:
             return f"inner_fn(): {e}"
 
@@ -4016,6 +4018,7 @@ class LoopBodyBlock:
             SimplifyIndexing(CaptureIndexing(proxy_ops), self.body.var_ranges)
         ):
             tracer.create_proxy("output", "output", (fn(*args),), {})
+        # breakpoint()
         self.graph = tracer.graph
 
     def __call__(self):

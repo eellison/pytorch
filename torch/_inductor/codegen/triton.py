@@ -168,6 +168,7 @@ class TritonOverrides(OpOverrides):
 
     @staticmethod
     def maximum(a, b):
+        # breakpoint()
         return f"tl.where({a} != {a}, {a}, tl.where({a} > {b}, {a}, {b}))"
 
     @staticmethod
@@ -1294,7 +1295,9 @@ class TritonScheduling:
                 elif node is EnableReduction:
                     stack.close()
                 else:
-                    node.codegen(kernel.split_and_set_ranges(node.get_ranges()))
+                    ranges = kernel.split_and_set_ranges(node.get_ranges())
+                    # breakpoint()
+                    node.codegen(ranges)
 
         wrapper = V.graph.wrapper_code
         src_code = kernel.codegen_kernel()
