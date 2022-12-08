@@ -500,7 +500,7 @@ class IterationRangesEntry(IterationRanges):
     def __eq__(self, other):
         return self.name == other.name
 
-@dataclasses.dataclass
+@dataclasses.dataclass(frozen=True)
 class Range(object):
     lower: Union[sympy.Symbol, int, float]
     upper: Union[sympy.Symbol, int, float]
@@ -513,6 +513,19 @@ class Range(object):
             fn(self.lower, other.lower),
             fn(self.upper, other.upper),
         )
+
+# Range = sympy.Interval
+binary_map = Range.binary_map
+map = Range.map
+
+# def map(self, fn):
+#     return fn(self)
+
+# def binary_map(self, other, fn):
+#     return fn(self, other)
+
+# Range.map = map
+# Range.binary_map = binary_map
 
 class RangeAnalysis(object):
     def __init__(self, loop_body, ranges):
@@ -575,17 +588,18 @@ class RangeAnalysis(object):
         Introduce a call_module to update the indexing.
         """
 
-        def set_indirect(new_var):
-            body_holder.body.replace_indirect(var, V.ops.indirect_indexing(new_var))
+        # def set_indirect(new_var):
+        #     body_holder.body.replace_indirect(var, V.ops.indirect_indexing(new_var))
         
-        var = body_holder.body.add_indirect()
-        tracer.create_proxy(
-            "call_module",
-            body_holder.body.add_submodule(set_indirect, f"set_{var}"),
-            (index_proxy,),
-            {},
-        )
-        return var
+        # breakpoint()
+        # var = body_holder.body.add_indirect()
+        # tracer.create_proxy(
+        #     "call_module",
+        #     body_holder.body.add_submodule(set_indirect, f"set_{var}"),
+        #     (index_proxy,),
+        #     {},
+        # )
+        return index_proxy
 
     @staticmethod
     def to_dtype(x, dtype: torch.dtype):
@@ -593,49 +607,39 @@ class RangeAnalysis(object):
 
     @staticmethod
     def constant(value, dtype):
-        return Range(value, value)
+        if isinstance(value, int):
+            return Range(sympy.core.numbers.Integer(value), sympy.core.numbers.Integer(value))
+        else:
+            return Range(sympy.core.numbers.Float(value), sympy.core.numbers.Float(value))
         # return value
 
     @staticmethod
     def abs(x):
-        return x.map(abs)
+        return map(x, abs)
     
     @staticmethod
     def add(a, b):
-        return a.binary_map(b, operator.add)
+        return binary_map(a, b, operator.add)
 
     @staticmethod
     def mul(a, b):
-        return a.binary_map(b, operator.mul)
+        # need to check for negatives here
+        return binary_map(a, b, operator.mul)
     
     @staticmethod
     def sub(a, b):
-        return a.binary_map(b, operator.sub)
-
-
-    @staticmethod
-    def abs(x):
-        return x.map(abs)
-
-    @staticmethod
-    def libdevice_abs(x):
-        return x.map(abs)
+        return Range(
+            a.lower - b.upper, 
+            a.upper - b.lower,
+        )
 
     @staticmethod
     def exp(x):
-        return x.map(sympy.functions.elementary.exponential.exp)
-
-    @staticmethod
-    def libdevice_exp(x):
-        return x.map(sympy.functions.elementary.exponential.exp)
+        return map(x, sympy.functions.elementary.exponential.exp)
 
     @staticmethod
     def sqrt(x):
-        return x.map(sympy.sqrt)
-
-    @staticmethod
-    def libdevice_sqrt(x):
-        return x.map(sympy.sqrt)
+        return map(x, sympy.sqrt)
 
     @staticmethod
     def relu(x):
@@ -644,25 +648,12 @@ class RangeAnalysis(object):
 
     @staticmethod
     def minimum(a, b):
-        # 
-        return Range(
-            sympy.minimum(a.lower, b.lower),
-            sympy.minimum(sympy.maximum(a.upper, b.upper)),
-        )
+        return binary_map(a, b, sympy.functions.Min)
 
     @staticmethod
     def maximum(a, b):
-        # def max(a, b):
-        #     if not isinstance(a, sympy.Symbol) and not isinstance(b, sympy.Symbol)
-
-        try:
-            return Range(
-                sympy.maximum(sympy.minimum(a.lower, b.lower)),
-                sympy.maximum(a.upper, b.upper),
-            )
-        except Exception as e:
-            breakpoint()
-            assert False
+        # TODO think abt correcness
+        return binary_map(a, b, sympy.functions.Max)
 
     @staticmethod
     def where(a, b, c):
@@ -688,7 +679,7 @@ class RangeAnalysis(object):
 
     def index_expr(self, expr, dtype):
         assert expr in self.ranges
-        return Range(0, self.ranges[expr])
+        return Range(sympy.core.numbers.Integer(0), sympy.core.numbers.Integer(self.ranges[expr]))
 
     @staticmethod
     def masked(mask, body, other):
@@ -699,95 +690,101 @@ class RangeAnalysis(object):
             new_mask, result, TritonOverrides.constant(other, torch.float32)
         )
 
-    @staticmethod
-    def lgamma(x):
-        return NotImplemented
+    # @staticmethod
+    # def lgamma(x):
+    #     breakpoint()
+    #     return NotImplemented
 
-    @staticmethod
-    def erf(x):
-        return NotImplemented
+    # @staticmethod
+    # def erf(x):
+    #     breakpoint()
+    #     return NotImplemented
 
-    @staticmethod
-    def logical_and(a, b):
-        return NotImplemented
+    # @staticmethod
+    # def logical_and(a, b):
+    #     breakpoint()
+    #     return NotImplemented
 
-    @staticmethod
-    def logical_or(a, b):
-        return NotImplemented
+    # @staticmethod
+    # def logical_or(a, b):
+    #     breakpoint()
+    #     return NotImplemented
 
-    @staticmethod
-    def rand(seed, offset, _):  # _ here to keep the contract identical to CPU rand op
-        return NotImplemented
+    # @staticmethod
+    # def rand(seed, offset, _):  # _ here to keep the contract identical to CPU rand op
+    #     return NotImplemented
 
-    @staticmethod
-    def randn(seed, offset, _):  # _ here to keep the contract identical to CPU randn op
-        return NotImplemented
+    # @staticmethod
+    # def randn(seed, offset, _):  # _ here to keep the contract identical to CPU randn op
+    #     breakpoint()
+    #     return NotImplemented
 
-    @staticmethod
-    def rsqrt(x):
-        return NotImplemented
+    # @staticmethod
+    # def rsqrt(x):
+    #     breakpoint()
+    #     return NotImplemented
 
-    @staticmethod
-    def sigmoid(x):
-        return NotImplemented
+    # @staticmethod
+    # def sigmoid(x):
+    #     return NotImplemented
 
-    @staticmethod
-    def libdevice_sigmoid(x):
-        return NotImplemented
+    # @staticmethod
+    # def libdevice_sigmoid(x):
+    #     return NotImplemented
 
-    @staticmethod
-    def signbit(x):
-        return NotImplemented
+    # @staticmethod
+    # def signbit(x):
+    #     return NotImplemented
 
-    @staticmethod
-    def fmod(a, b):
-        return NotImplemented
+    # @staticmethod
+    # def fmod(a, b):
+    #     return NotImplemented
 
-    @staticmethod
-    def pow(a, b):
-        return NotImplemented
+    # @staticmethod
+    # def pow(a, b):
+    #     return NotImplemented
 
-    @staticmethod
-    def log(x):
-        return NotImplemented
+    # @staticmethod
+    # def log(x):
+    #     return NotImplemented
 
-    @staticmethod
-    def libdevice_log(x):
-        return NotImplemented
+    # @staticmethod
+    # def libdevice_log(x):
+    #     return NotImplemented
 
-    @staticmethod
-    def isinf(x):
-        return NotImplemented
+    # @staticmethod
+    # def isinf(x):
+    #     return NotImplemented
 
-    @staticmethod
-    def isnan(x):
-        return NotImplemented
-        return f"tl.libdevice.isnan({x})"
+    # @staticmethod
+    # def isnan(x):
+    #     return NotImplemented
+    #     return f"tl.libdevice.isnan({x})"
 
-    @staticmethod
-    def round(x):
-        return NotImplemented
-        return f"tl.libdevice.nearbyint({x})"
+    # @staticmethod
+    # def round(x):
+    #     return NotImplemented
+    #     return f"tl.libdevice.nearbyint({x})"
 
     @staticmethod
     def floor(x):
-        return NotImplemented
+        return x.map(sympy.functions.elementary.integers.floor)
 
-    @staticmethod
-    def floordiv(a, b):
-        return NotImplemented
+    # @staticmethod
+    # def floordiv(a, b):
+    #     return NotImplemented
 
-    @staticmethod
-    def trunc(x):
-        return NotImplemented
+    # @staticmethod
+    # def trunc(x):
+    #     return NotImplemented
 
-    @staticmethod
-    def truncdiv(a, b):
-        return NotImplemented
+    # @staticmethod
+    # def truncdiv(a, b):
+    #     return NotImplemented
 
-    @staticmethod
-    def ceil(x):
-        return NotImplemented
+    # @staticmethod
+    # def ceil(x):
+    #     return NotImplemented
 
 
 class TritonKernel(Kernel):
@@ -1668,6 +1665,9 @@ class TritonScheduling:
             with V.set_ops_handler(
                 RangeAnalysis(node_schedule[node_idx]._body, ranges)
             ):
+                # set_indirect1
+                
+                # breakpoint()
         #         # may not need to re-trace, could just use
         #         # node_schedule[0]._body.root_block.graph
         #         # this makes the changes persistent
@@ -1676,7 +1676,9 @@ class TritonScheduling:
         #         # node_schedule[node_idx]._body.indexing_exprs_name
         #         # node_schedule[node_idx]._body.var_ranges
         #         # node_schedule[node_idx].indexing gives index mapping values
-                node_schedule[node_idx]._body(*ranges_per_node[node_idx])
+                out = node_schedule[node_idx]._body(*ranges_per_node[node_idx])
+                breakpoint()
+                print(out)
 
         #     graphs.append(tracer.graph)
 

@@ -312,8 +312,6 @@ def make_pointwise(
     allow_alpha=False,
 ):
     def inner(*inputs: List[TensorBox], alpha=None):
-
-        breakpoint()
         inputs = promote_constants(inputs, override_return_dtype)
         if allow_alpha:
             if alpha is not None and alpha != 1:

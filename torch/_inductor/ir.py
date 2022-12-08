@@ -3915,9 +3915,29 @@ class LoopBody:
         """Swap in a variable used in indirect indexing"""
         if str(old) == str(new):
             return
-        self.indexing = {k: sympy_subs(v, {old: new}) for k, v in self.indexing.items()}
+        old_s = str(old)
+        new_s = str(new)
+
+        if old == "indirect0":
+            breakpoint()
+
+        if isinstance(new, torch._inductor.codegen.triton.Range):
+            if not new.lower == 0.0:
+                breakpoint()
+                assert False
+            new = new.upper
+        #     new = sympy.Interval(new.lower, new.upper)
+        #     breakpoint()
+        try:
+            self.indexing = {k: sympy_subs(v, {old: new}) for k, v in self.indexing.items()}
+            # breakpoint()
+        except Exception as e:
+            breakpoint()
+            raise
 
     def get_index(self, name):
+        if "RangeAnalysis" in str(V.ops):
+            breakpoint()
         return self.indexing[name]
 
     def __call__(self, *indices):
@@ -3998,7 +4018,6 @@ class LoopBodyBlock:
                 Flow data from tensors into indexing formulas.
                 Introduce a call_module to update the indexing.
                 """
-
                 def set_indirect(new_var):
                     self.body.replace_indirect(var, V.ops.indirect_indexing(new_var))
 
