@@ -312,6 +312,8 @@ def make_pointwise(
     allow_alpha=False,
 ):
     def inner(*inputs: List[TensorBox], alpha=None):
+
+        breakpoint()
         inputs = promote_constants(inputs, override_return_dtype)
         if allow_alpha:
             if alpha is not None and alpha != 1:
@@ -1706,6 +1708,9 @@ def constant_like(fill_value):
 empty_like = register_lowering(aten.empty_like)(create_tensor_like(empty))
 zeros_like = register_lowering(aten.zeros_like)(create_tensor_like(zeros))
 ones_like = register_lowering(aten.ones_like)(create_tensor_like(ones))
+
+
+
 if not config.fallback_random:
     rand_like = register_lowering(aten.rand_like)(create_tensor_like(rand))
 

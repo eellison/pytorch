@@ -6,7 +6,8 @@ import itertools
 import logging
 import math
 import operator
-from typing import Dict, List
+from typing import Dict, List, Any, Union
+import sympy
 
 import sympy
 
@@ -499,6 +500,295 @@ class IterationRangesEntry(IterationRanges):
     def __eq__(self, other):
         return self.name == other.name
 
+@dataclasses.dataclass
+class Range(object):
+    lower: Union[sympy.Symbol, int, float]
+    upper: Union[sympy.Symbol, int, float]
+
+    def map(self, fn):
+        return Range(fn(self.lower), fn(self.upper))
+
+    def binary_map(self, other, fn):
+        return Range(
+            fn(self.lower, other.lower),
+            fn(self.upper, other.upper),
+        )
+
+class RangeAnalysis(object):
+    def __init__(self, loop_body, ranges):
+        self.loop_body = loop_body
+        self.ranges = ranges
+
+    def add_index(self, expr, category, buf_name=None):
+        breakpoint()
+        add_index = body_holder.body.add_index_expr(expr, category, buf_name)
+        return tracer.create_proxy(
+            "call_module",
+            "get_index",
+            (add_index,),
+            {},
+        )
+
+    def load(self, name: str, index: sympy.Expr):
+        breakpoint()
+        index = self.add_index(index, "reads", name)
+        return self._inner.load(name, index)
+
+    def store(self, name, index, value, mode=None):
+        breakpoint()
+        index = self.add_index(index, "writes", name)
+        return self._inner.store(name, index, value, mode)
+
+    def reduction(self, name, dtype, src_dtype, reduction_type, index, value):
+        breakpoint()
+        index = self.add_index(index, "writes", name)
+        return self._inner.reduction(
+            name, dtype, src_dtype, reduction_type, index, value
+        )
+
+    def index_expr(self, index, dtype):
+        if isinstance(index, (int, sympy.Integer)):
+            return ops.constant(int(index), dtype)
+        index = self.add_index(index, "other")
+        return self._inner.index_expr(index, dtype)
+
+    @staticmethod
+    def masked(mask_proxy, masked_body, other_proxy):
+        """
+        Recursively capture the masked out body in another LoopBodyBlock
+        """
+
+        def shim(mask, other):
+            return V.ops.masked(mask, subblock, other)
+
+        name = body_holder.body.add_submodule(shim, "masked_subblock")
+        subblock = ir.LoopBodyBlock(self.body, masked_body, [])
+        body_holder.body.subblocks[name] = subblock
+        return tracer.create_proxy(
+            "call_module", name, (mask_proxy, other_proxy), {}
+        )
+
+    @staticmethod
+    def indirect_indexing(index_proxy):
+        """
+        Flow data from tensors into indexing formulas.
+        Introduce a call_module to update the indexing.
+        """
+
+        def set_indirect(new_var):
+            body_holder.body.replace_indirect(var, V.ops.indirect_indexing(new_var))
+        
+        var = body_holder.body.add_indirect()
+        tracer.create_proxy(
+            "call_module",
+            body_holder.body.add_submodule(set_indirect, f"set_{var}"),
+            (index_proxy,),
+            {},
+        )
+        return var
+
+    @staticmethod
+    def to_dtype(x, dtype: torch.dtype):
+        return x
+
+    @staticmethod
+    def constant(value, dtype):
+        return Range(value, value)
+        # return value
+
+    @staticmethod
+    def abs(x):
+        return x.map(abs)
+    
+    @staticmethod
+    def add(a, b):
+        return a.binary_map(b, operator.add)
+
+    @staticmethod
+    def mul(a, b):
+        return a.binary_map(b, operator.mul)
+    
+    @staticmethod
+    def sub(a, b):
+        return a.binary_map(b, operator.sub)
+
+
+    @staticmethod
+    def abs(x):
+        return x.map(abs)
+
+    @staticmethod
+    def libdevice_abs(x):
+        return x.map(abs)
+
+    @staticmethod
+    def exp(x):
+        return x.map(sympy.functions.elementary.exponential.exp)
+
+    @staticmethod
+    def libdevice_exp(x):
+        return x.map(sympy.functions.elementary.exponential.exp)
+
+    @staticmethod
+    def sqrt(x):
+        return x.map(sympy.sqrt)
+
+    @staticmethod
+    def libdevice_sqrt(x):
+        return x.map(sympy.sqrt)
+
+    @staticmethod
+    def relu(x):
+        relu = functools.partial(sympy.maximum, 0)
+        return x.map(relu)
+
+    @staticmethod
+    def minimum(a, b):
+        # 
+        return Range(
+            sympy.minimum(a.lower, b.lower),
+            sympy.minimum(sympy.maximum(a.upper, b.upper)),
+        )
+
+    @staticmethod
+    def maximum(a, b):
+        # def max(a, b):
+        #     if not isinstance(a, sympy.Symbol) and not isinstance(b, sympy.Symbol)
+
+        try:
+            return Range(
+                sympy.maximum(sympy.minimum(a.lower, b.lower)),
+                sympy.maximum(a.upper, b.upper),
+            )
+        except Exception as e:
+            breakpoint()
+            assert False
+
+    @staticmethod
+    def where(a, b, c):
+        # if true
+        breakpoint()
+        return f"tl.where({a}, {b}, {c})"
+
+    @staticmethod
+    def cos(x):
+        return x.map(sympy.cos)
+
+    @staticmethod
+    def libdevice_cos(x):
+        return x.map(sympy.cos)
+
+    @staticmethod
+    def sin(x):
+        return x.map(sympy.sin)
+
+    @staticmethod
+    def libdevice_sin(x):
+        return x.map(sympy.sin)
+
+    def index_expr(self, expr, dtype):
+        assert expr in self.ranges
+        return Range(0, self.ranges[expr])
+
+    @staticmethod
+    def masked(mask, body, other):
+        breakpoint()
+        with V.kernel.mask_loads(mask) as new_mask:
+            result = body()
+        return ops.where(
+            new_mask, result, TritonOverrides.constant(other, torch.float32)
+        )
+
+    @staticmethod
+    def lgamma(x):
+        return NotImplemented
+
+    @staticmethod
+    def erf(x):
+        return NotImplemented
+
+    @staticmethod
+    def logical_and(a, b):
+        return NotImplemented
+
+    @staticmethod
+    def logical_or(a, b):
+        return NotImplemented
+
+    @staticmethod
+    def rand(seed, offset, _):  # _ here to keep the contract identical to CPU rand op
+        return NotImplemented
+
+    @staticmethod
+    def randn(seed, offset, _):  # _ here to keep the contract identical to CPU randn op
+        return NotImplemented
+
+    @staticmethod
+    def rsqrt(x):
+        return NotImplemented
+
+    @staticmethod
+    def sigmoid(x):
+        return NotImplemented
+
+    @staticmethod
+    def libdevice_sigmoid(x):
+        return NotImplemented
+
+    @staticmethod
+    def signbit(x):
+        return NotImplemented
+
+    @staticmethod
+    def fmod(a, b):
+        return NotImplemented
+
+    @staticmethod
+    def pow(a, b):
+        return NotImplemented
+
+    @staticmethod
+    def log(x):
+        return NotImplemented
+
+    @staticmethod
+    def libdevice_log(x):
+        return NotImplemented
+
+    @staticmethod
+    def isinf(x):
+        return NotImplemented
+
+    @staticmethod
+    def isnan(x):
+        return NotImplemented
+        return f"tl.libdevice.isnan({x})"
+
+    @staticmethod
+    def round(x):
+        return NotImplemented
+        return f"tl.libdevice.nearbyint({x})"
+
+    @staticmethod
+    def floor(x):
+        return NotImplemented
+
+    @staticmethod
+    def floordiv(a, b):
+        return NotImplemented
+
+    @staticmethod
+    def trunc(x):
+        return NotImplemented
+
+    @staticmethod
+    def truncdiv(a, b):
+        return NotImplemented
+
+    @staticmethod
+    def ceil(x):
+        return NotImplemented
+
 
 class TritonKernel(Kernel):
     overrides = TritonOverrides
@@ -712,7 +1002,6 @@ class TritonKernel(Kernel):
         index_vars = index.free_symbols
         index_str = texpr(self.rename_indexing(self.codegen_indexing(index)))
         indirect_indexing = self.is_indirect_indexing(index)
-
         need_dense = (
             config.triton.dense_indexing
             or dense_indexing
@@ -974,6 +1263,7 @@ class TritonKernel(Kernel):
             self.body.splice(self.compute)
             self.body.splice(self.stores)
         self.body.splice(self.suffix)
+        breakpoint()
         self.indexing_code.clear()
         self.loads.clear()
         self.compute.clear()
@@ -1284,17 +1574,155 @@ class TritonScheduling:
                 reduction_hint_val = ReductionHint.DEFAULT
         else:
             reduction_hint_val = ReductionHint.DEFAULT
+
+        ranges_per_node = []
+        with TritonKernel(*tiled_groups, reduction_hint=reduction_hint_val) as kernel:
+            for node in node_schedule: 
+                ranges_per_node.append(kernel.split_and_set_ranges(node.get_ranges()))
+
+        @dataclasses.dataclass
+        class BodyHolder():
+            body: Any
+
+        body_holder = BodyHolder(node_schedule[0]._body)
+
+        class CaptureIndexing(V.WrapperHandler):
+
+            def add_index(self, expr, category, buf_name=None):
+                add_index = body_holder.body.add_index_expr(expr, category, buf_name)
+                return tracer.create_proxy(
+                    "call_module",
+                    "get_index",
+                    (add_index,),
+                    {},
+                )
+
+            def load(self, name: str, index: sympy.Expr):
+                index = self.add_index(index, "reads", name)
+                return self._inner.load(name, index)
+
+            def store(self, name, index, value, mode=None):
+                index = self.add_index(index, "writes", name)
+                return self._inner.store(name, index, value, mode)
+
+            def reduction(self, name, dtype, src_dtype, reduction_type, index, value):
+                index = self.add_index(index, "writes", name)
+                return self._inner.reduction(
+                    name, dtype, src_dtype, reduction_type, index, value
+                )
+
+            def index_expr(self, index, dtype):
+                if isinstance(index, (int, sympy.Integer)):
+                    return ops.constant(int(index), dtype)
+                index = self.add_index(index, "other")
+                return self._inner.index_expr(index, dtype)
+
+            @staticmethod
+            def masked(mask_proxy, masked_body, other_proxy):
+                """
+                Recursively capture the masked out body in another LoopBodyBlock
+                """
+
+                def shim(mask, other):
+                    return V.ops.masked(mask, subblock, other)
+
+                name = body_holder.body.add_submodule(shim, "masked_subblock")
+                subblock = ir.LoopBodyBlock(self.body, masked_body, [])
+                body_holder.body.subblocks[name] = subblock
+                return tracer.create_proxy(
+                    "call_module", name, (mask_proxy, other_proxy), {}
+                )
+
+            @staticmethod
+            def indirect_indexing(index_proxy):
+                """
+                Flow data from tensors into indexing formulas.
+                Introduce a call_module to update the indexing.
+                """
+
+                def set_indirect(new_var):
+                    body_holder.body.replace_indirect(var, V.ops.indirect_indexing(new_var))
+                
+                var = body_holder.body.add_indirect()
+                tracer.create_proxy(
+                    "call_module",
+                    body_holder.body.add_submodule(set_indirect, f"set_{var}"),
+                    (index_proxy,),
+                    {},
+                )
+                return var
+
+
+        graphs = []
+
+        for node_idx in range(len(node_schedule)):
+
+            tracer = torch.fx.Tracer()
+            tracer.graph = torch.fx.Graph(tracer_cls=tracer.__class__)
+            proxy_ops = tracer.create_proxy("placeholder", "ops", (), {})
+
+            capt_indexing = CaptureIndexing(proxy_ops)
+            body_holder.body = node_schedule[node_idx]._body
+
+            ranges = node_schedule[node_idx].ranges_from_index_vars(ranges_per_node[node_idx])
+            with V.set_ops_handler(
+                RangeAnalysis(node_schedule[node_idx]._body, ranges)
+            ):
+        #         # may not need to re-trace, could just use
+        #         # node_schedule[0]._body.root_block.graph
+        #         # this makes the changes persistent
+        #         breakpoint()
+        #         # node_schedule[node_idx]._body.indexing_exprs_name
+        #         # node_schedule[node_idx]._body.indexing_exprs_name
+        #         # node_schedule[node_idx]._body.var_ranges
+        #         # node_schedule[node_idx].indexing gives index mapping values
+                node_schedule[node_idx]._body(*ranges_per_node[node_idx])
+
+        #     graphs.append(tracer.graph)
+
+        fused_node = self.scheduler.nodes[0]
+        # can find the fused node by fused_node.snodes == node_schedule
+
+        # TODO: check self.scheduler.mutation_real_name
+        last_uses = fused_node.last_usage
+        # intermediary_nodes = {node.get_name() for node in node_schedule} & fused_node.last_usage
+    
+        node_idx = 0
+        breakpoint()
+
+        # with V.set_ops_handler(V.MockHandler()):
+        #     for node, ranges in zip(node_schedule, ranges_per_node):
+        #         node.codegen(ranges)
+                # out_str = node._body(*ranges)
+        
+
         with TritonKernel(*tiled_groups, reduction_hint=reduction_hint_val) as kernel:
             stack = contextlib.ExitStack()
+            # breakpoint()
             for node in node_schedule:
                 if node not in (EnableReduction, DisableReduction):
                     node.mark_run()
+            
+#             for node in node_schedule:
+#                 ranges = kernel.split_and_set_ranges(node.get_ranges())
+#                  str(self.inner_fn(self._index(self.ranges)))
+# # 
             for node in node_schedule:
                 if node is DisableReduction:
                     stack.enter_context(kernel.disable_reduction())
                 elif node is EnableReduction:
                     stack.close()
                 else:
+                    # tracer = torch.fx.Tracer()
+                    # tracer.graph = torch.fx.Graph(tracer_cls=tracer.__class__)
+                    # proxy_ops = tracer.create_proxy("placeholder", "ops", (), {})
+
+                    # with V.set_ops_handler(V.MockHandler()):
+                    #     out = str(node._)
+        
+
+                    # out = str(self.inner_fn(self._index(self.ranges)))
+                    # return out
                     ranges = kernel.split_and_set_ranges(node.get_ranges())
                     # breakpoint()
                     node.codegen(ranges)

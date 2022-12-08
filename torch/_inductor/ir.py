@@ -3946,10 +3946,12 @@ class LoopBodyBlock:
         self.body = body
 
         def add_index(expr, category, buf_name=None):
+            # breakpoint()
+            add_index = self.body.add_index_expr(expr, category, buf_name)
             return tracer.create_proxy(
                 "call_module",
                 "get_index",
-                (self.body.add_index_expr(expr, category, buf_name),),
+                (add_index,),
                 {},
             )
 
@@ -4018,6 +4020,7 @@ class LoopBodyBlock:
             SimplifyIndexing(CaptureIndexing(proxy_ops), self.body.var_ranges)
         ):
             tracer.create_proxy("output", "output", (fn(*args),), {})
+        # breakpoint()
         # breakpoint()
         self.graph = tracer.graph
 
