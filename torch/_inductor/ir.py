@@ -3921,6 +3921,9 @@ class LoopBody:
         if old == "indirect0":
             breakpoint()
 
+        # if "RangeAnalysis" in str(torch._inductor.virtualized.V.ops):
+        #     breakpoint()
+
         if isinstance(new, torch._inductor.codegen.triton.Range):
             if not new.lower == 0.0:
                 breakpoint()
@@ -3936,8 +3939,8 @@ class LoopBody:
             raise
 
     def get_index(self, name):
-        if "RangeAnalysis" in str(V.ops):
-            breakpoint()
+        # if "RangeAnalysis" in str(V.ops):
+        #     breakpoint()
         return self.indexing[name]
 
     def __call__(self, *indices):

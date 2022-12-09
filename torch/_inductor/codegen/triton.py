@@ -528,9 +528,14 @@ map = Range.map
 # Range.binary_map = binary_map
 
 class RangeAnalysis(object):
-    def __init__(self, loop_body, ranges):
+    def __init__(self, node_values, loop_body, ranges, input_buffers, intermediary_buffers, output_buffers, intermediary_buffer_values):
         self.loop_body = loop_body
         self.ranges = ranges
+        self.input_buffers = input_buffers
+        self.intermediary_buffers = intermediary_buffers
+        self.intermediary_buffer_values = intermediary_buffer_values
+        self.output_buffers = output_buffers
+        self.node_values = node_values
 
     def add_index(self, expr, category, buf_name=None):
         breakpoint()
@@ -543,12 +548,22 @@ class RangeAnalysis(object):
         )
 
     def load(self, name: str, index: sympy.Expr):
+        if name in self.input_buffers:
+            # Could technically use dtype here if the buffer is e.g. int8
+            return Range(-math.inf, math.inf)
+        elif name in self.intermediary_buffer_values:
+            return self.intermediary_buffer_values[name]
         breakpoint()
         index = self.add_index(index, "reads", name)
         return self._inner.load(name, index)
 
     def store(self, name, index, value, mode=None):
-        breakpoint()
+        if name in self.intermediary_buffers:
+            # breakpoint()
+            self.intermediary_buffer_values[name] = value
+            return
+        if name in self.output_buffers:
+            return
         index = self.add_index(index, "writes", name)
         return self._inner.store(name, index, value, mode)
 
@@ -587,7 +602,7 @@ class RangeAnalysis(object):
         Flow data from tensors into indexing formulas.
         Introduce a call_module to update the indexing.
         """
-
+        # breakpoint()
         # def set_indirect(new_var):
         #     body_holder.body.replace_indirect(var, V.ops.indirect_indexing(new_var))
         
@@ -769,6 +784,11 @@ class RangeAnalysis(object):
     @staticmethod
     def floor(x):
         return x.map(sympy.functions.elementary.integers.floor)
+
+
+    @staticmethod
+    def ceil(x):
+        return x.map(sympy.functions.elementary.integers.ceiling)
 
     # @staticmethod
     # def floordiv(a, b):
@@ -1651,7 +1671,16 @@ class TritonScheduling:
 
 
         graphs = []
-
+        fused_node = self.scheduler.nodes[0]
+        used_buffer_names = fused_node.used_buffer_names()
+        last_used = set(fused_node.last_usage)
+        instantiated = {node.get_name() for node in node_schedule}
+        input_names = used_buffer_names - instantiated
+        intermediary = instantiated & last_used
+        intermediary_buffer_values = {}
+        output_buffers = used_buffer_names - intermediary - input_names
+        node_values = {}
+        
         for node_idx in range(len(node_schedule)):
 
             tracer = torch.fx.Tracer()
@@ -1662,9 +1691,9 @@ class TritonScheduling:
             body_holder.body = node_schedule[node_idx]._body
 
             ranges = node_schedule[node_idx].ranges_from_index_vars(ranges_per_node[node_idx])
-            with V.set_ops_handler(
-                RangeAnalysis(node_schedule[node_idx]._body, ranges)
-            ):
+            # fused_node.used_buffer_names() - fused_node.last_usage
+            ra = RangeAnalysis(node_values, node_schedule[node_idx]._body, ranges, input_names, intermediary, output_buffers, intermediary_buffer_values)
+            with V.set_ops_handler(ra):
                 # set_indirect1
                 
                 # breakpoint()
@@ -1680,9 +1709,9 @@ class TritonScheduling:
                 breakpoint()
                 print(out)
 
+
         #     graphs.append(tracer.graph)
 
-        fused_node = self.scheduler.nodes[0]
         # can find the fused node by fused_node.snodes == node_schedule
 
         # TODO: check self.scheduler.mutation_real_name

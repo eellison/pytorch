@@ -132,6 +132,7 @@ class Interpreter:
                 if "RangeAnalysis" in str(torch._inductor.virtualized.V.ops):
                     print(node.format_node())
                     print(str(out))
+                    torch._inductor.virtualized.V.ops.node_values[node] = out
                 self.env[node] = out
             except Exception as e:
                 msg = f"While executing {node.format_node()}"
