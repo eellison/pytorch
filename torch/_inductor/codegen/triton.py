@@ -169,7 +169,6 @@ class TritonOverrides(OpOverrides):
 
     @staticmethod
     def maximum(a, b):
-        # breakpoint()
         return f"tl.where({a} != {a}, {a}, tl.where({a} > {b}, {a}, {b}))"
 
     @staticmethod
@@ -231,6 +230,14 @@ class TritonOverrides(OpOverrides):
     @staticmethod
     def rsqrt(x):
         return f"tl.libdevice.rsqrt({x})"
+
+    @staticmethod
+    def log1p(x):
+        return f"tl.libdevice.log1p({x})"
+
+    @staticmethod
+    def expm1(x):
+        return f"tl.libdevice.expm1({x})"
 
     @staticmethod
     def sigmoid(x):
@@ -299,6 +306,7 @@ class TritonOverrides(OpOverrides):
     @staticmethod
     def ceil(x):
         return f"tl.libdevice.ceil({x})"
+
 
 
 @dataclasses.dataclass
@@ -506,7 +514,11 @@ class Range(object):
     upper: Union[sympy.Symbol, int, float]
 
     def map(self, fn):
-        return Range(fn(self.lower), fn(self.upper))
+        try:
+            return Range(fn(self.lower), fn(self.upper))
+        except Exception as e:
+            breakpoint()
+            raise
 
     def binary_map(self, other, fn):
         return Range(
@@ -516,7 +528,7 @@ class Range(object):
 
 # Range = sympy.Interval
 binary_map = Range.binary_map
-map = Range.map
+# map = Range.map
 
 # def map(self, fn):
 #     return fn(self)
@@ -548,6 +560,7 @@ class RangeAnalysis(object):
         )
 
     def load(self, name: str, index: sympy.Expr):
+        return Range(-math.inf, math.inf)
         if name in self.input_buffers:
             # Could technically use dtype here if the buffer is e.g. int8
             return Range(-math.inf, math.inf)
@@ -564,10 +577,12 @@ class RangeAnalysis(object):
             return
         if name in self.output_buffers:
             return
+        return
         index = self.add_index(index, "writes", name)
         return self._inner.store(name, index, value, mode)
 
     def reduction(self, name, dtype, src_dtype, reduction_type, index, value):
+        return Range(-math.inf, math.inf)
         breakpoint()
         index = self.add_index(index, "writes", name)
         return self._inner.reduction(
@@ -577,6 +592,7 @@ class RangeAnalysis(object):
     def index_expr(self, index, dtype):
         if isinstance(index, (int, sympy.Integer)):
             return ops.constant(int(index), dtype)
+        breakpoint()
         index = self.add_index(index, "other")
         return self._inner.index_expr(index, dtype)
 
@@ -658,8 +674,8 @@ class RangeAnalysis(object):
 
     @staticmethod
     def relu(x):
-        relu = functools.partial(sympy.maximum, 0)
-        return x.map(relu)
+        fn = lambda x: x if x > 0 else 0
+        return x.map(fn)
 
     @staticmethod
     def minimum(a, b):
@@ -693,7 +709,15 @@ class RangeAnalysis(object):
         return x.map(sympy.sin)
 
     def index_expr(self, expr, dtype):
-        assert expr in self.ranges
+        # if not isinstance(expr, sympy.Symbol):
+        #     assert isinstance(expr, (int, float))
+        #     return expr
+        try:
+            assert expr in self.ranges
+        except Exception:
+            breakpoint()
+        # todo the following 
+        # return Range(sympy.core.numbers.Integer(0), sympy_symbol(str(expr)))
         return Range(sympy.core.numbers.Integer(0), sympy.core.numbers.Integer(self.ranges[expr]))
 
     @staticmethod
@@ -1280,7 +1304,6 @@ class TritonKernel(Kernel):
             self.body.splice(self.compute)
             self.body.splice(self.stores)
         self.body.splice(self.suffix)
-        breakpoint()
         self.indexing_code.clear()
         self.loads.clear()
         self.compute.clear()
@@ -1697,17 +1720,17 @@ class TritonScheduling:
                 # set_indirect1
                 
                 # breakpoint()
-        #         # may not need to re-trace, could just use
-        #         # node_schedule[0]._body.root_block.graph
-        #         # this makes the changes persistent
-        #         breakpoint()
-        #         # node_schedule[node_idx]._body.indexing_exprs_name
-        #         # node_schedule[node_idx]._body.indexing_exprs_name
-        #         # node_schedule[node_idx]._body.var_ranges
-        #         # node_schedule[node_idx].indexing gives index mapping values
-                out = node_schedule[node_idx]._body(*ranges_per_node[node_idx])
-                breakpoint()
-                print(out)
+                # # may not need to re-trace, could just use
+                # # node_schedule[0]._body.root_block.graph
+                # # this makes the changes persistent
+                # breakpoint()
+                # node_schedule[node_idx]._body.indexing_exprs_name
+                # node_schedule[node_idx]._body.indexing_exprs_name
+                # node_schedule[node_idx]._body.var_ranges
+                # node_schedule[node_idx].indexing gives index mapping values
+                out = node_schedule[node_idx]._body.indexing_dtype_strength_reduction(*ranges_per_node[node_idx])
+                # breakpoint()
+                # print(out)
 
 
         #     graphs.append(tracer.graph)
@@ -1715,11 +1738,11 @@ class TritonScheduling:
         # can find the fused node by fused_node.snodes == node_schedule
 
         # TODO: check self.scheduler.mutation_real_name
-        last_uses = fused_node.last_usage
+        # last_uses = fused_node.last_usage
         # intermediary_nodes = {node.get_name() for node in node_schedule} & fused_node.last_usage
     
         node_idx = 0
-        breakpoint()
+        # breakpoint()
 
         # with V.set_ops_handler(V.MockHandler()):
         #     for node, ranges in zip(node_schedule, ranges_per_node):

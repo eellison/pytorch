@@ -3908,7 +3908,7 @@ class LoopBody:
     def add_indirect(self):
         name = f"indirect{len(self.indirect_vars)}"
         var = sympy_symbol(name)
-        self.indirect_vars.append([var])
+        self.indirect_vars.append(var)
         return var
 
     def replace_indirect(self, old, new):
@@ -3918,12 +3918,33 @@ class LoopBody:
         old_s = str(old)
         new_s = str(new)
 
-        if old == "indirect0":
+        # if "RangeAnalysis" in str(torch._inductor.virtualized.V.ops):
+        #     breakpoint()
+        # breakpoint()
+        if isinstance(new, torch._inductor.codegen.triton.Range):
+            if not new.lower == 0.0:
+                breakpoint()
+                assert False
+            new = new.upper
+        #     new = sympy.Interval(new.lower, new.upper)
+        #     breakpoint()
+        try:
+            self.indexing = {k: sympy_subs(v, {old: new}) for k, v in self.indexing.items()}
+            # breakpoint()
+        except Exception as e:
             breakpoint()
+            raise
 
+    def replace_indirect_new(self, old, new):
+        """Swap in a variable used in indirect indexing"""
+        if str(old) == str(new):
+            return
+
+        # breakpoint()
         # if "RangeAnalysis" in str(torch._inductor.virtualized.V.ops):
         #     breakpoint()
 
+        # if the lower bound is 0, can just the upper boud
         if isinstance(new, torch._inductor.codegen.triton.Range):
             if not new.lower == 0.0:
                 breakpoint()
@@ -3948,6 +3969,7 @@ class LoopBody:
         assert len(index) == len(self.var_ranges), (index, self.var_ranges)
         assert all(v not in self.var_ranges for v in index)
         replacements = dict(zip(self.var_ranges.keys(), index))
+        # replacements = self.var_ranges
         self.indexing = {
             name: sympy_subs(expr, replacements)
             for name, expr in self.indexing_exprs.items()
@@ -3956,6 +3978,22 @@ class LoopBody:
         self.indexing = None
         return result
 
+    def indexing_dtype_strength_reduction(self, *indices):
+        index = list(itertools.chain(*indices))
+        assert len(index) == len(self.var_ranges), (index, self.var_ranges)
+        assert all(v not in self.var_ranges for v in index)
+        replacements = dict(zip(self.var_ranges.keys(), index))
+        # TODO - substitute in the actual var agnes
+        self.indexing = {
+            name: sympy_subs(expr, replacements)
+            for name, expr in self.indexing_exprs.items()
+        }
+        indices_replacements = {
+            val: self.var_ranges[key] for key, val in replacements.items()
+        }
+        result = self.root_block.indexing_dtype_strength_reduction(indices_replacements)
+        self.indexing = None
+        return result
 
 class LoopBodyBlock:
     """
@@ -4025,6 +4063,7 @@ class LoopBodyBlock:
                     self.body.replace_indirect(var, V.ops.indirect_indexing(new_var))
 
                 var = self.body.add_indirect()
+                # breakpoint()
                 tracer.create_proxy(
                     "call_module",
                     self.body.add_submodule(set_indirect, f"set_{var}"),
@@ -4048,7 +4087,7 @@ class LoopBodyBlock:
 
     def __call__(self):
         graph = self.graph
-        submodules = self.body.submodules
+        submodules = dict(self.body.submodules)
 
         class InterpreterShim(torch.fx.Interpreter):
             def __init__(self):
@@ -4073,3 +4112,185 @@ class LoopBodyBlock:
             "",
             code.strip().replace("def forward(", f"def {name}("),
         )
+
+        
+    def indexing_dtype_strength_reduction(self, indices_replacements):
+        graph = self.graph
+        submodules = dict(self.body.submodules)
+
+        def set_indirect(var, new_var):
+            self.body.replace_indirect_new(var, V.ops.indirect_indexing(new_var))
+            return new_var
+
+        keys = list(submodules.keys())
+        for key in keys:
+            if key == "get_index":
+                continue
+            assert "set_indirect" in key
+            idx = int(key[len("set_indirect"):])
+            var = self.body.indirect_vars[idx]
+            indirect = functools.partial(set_indirect, var)
+            submodules[key] = indirect
+
+        indirect_var_set = set(self.body.indirect_vars)
+        self.body.indexing
+
+        index_indirect_dependecies = {
+            index: expr.free_symbols & indirect_var_set for index, expr in self.body.indexing.items()
+        }
+
+        class InterpreterShim(torch.fx.Interpreter):
+            def __init__(self):
+                """
+                We don't call super() here to avoid constructing a
+                GraphModule which is very expensive (it does codegen).
+                """
+                self.module = self
+                self.graph = graph
+                self.submodules = submodules
+                self.garbage_collect_values = False
+                self.env = {}
+                self.fetch_attr = submodules.__getitem__
+
+        # tensor_writing_ops = 
+        # breakpoint()
+        stores = [node for node in graph.nodes if node.target == "store"]
+
+        indirect_writes = [node for node in graph.nodes if "set_indirect" in node.target]
+        assert len(indirect_var_set) == len(indirect_writes)
+
+        
+        used_in_tensor_writing_set = set()
+        # only take value 
+        queue = [node.args[3] for node in stores if isinstance(node.args[3], torch.fx.node.Node)]
+        # breakpoint()
+
+        # we still need to check dependencies for range analysis
+        # if node.target == "get_index":
+        #     indirect_dependencies = index_indirect_dependecies[node.args[0]]
+        #     for dep in indirect_dependencies:
+        #         queue.append(indirect_writes[self.body.indirect_vars.index(dep)])
+        #     breakpoint()
+        #     continue
+
+        while queue:
+            node = queue.pop() 
+            used_in_tensor_writing_set.add(node)
+            try:
+                for inp in node.args:
+                    if inp not in used_in_tensor_writing_set and isinstance(inp, torch.fx.node.Node):
+                        queue.append(inp)
+            except Exception:
+                breakpoint()
+                raise
+
+        not_used_in_tensors = {node for node in graph.nodes if node not in used_in_tensor_writing_set}
+
+        interpreter = InterpreterShim()
+        interpreter.run(V.get_ops_handler())
+
+        def dominated_values(node):
+            queue = [node]
+            visited = set()
+
+            while queue:
+                n = queue.pop()
+                visited.add(n)
+
+                for use in n.users:
+                    if use not in visited:
+                        queue.append(use)
+            
+            return visited
+            
+        # def can_run_in_int32()
+
+        not_expressable_in_int32 = []
+        for node in not_used_in_tensors:
+            node_range = interpreter.env[node]
+
+        indexing_w_bounds = {
+            name: sympy_subs(expr, indices_replacements)
+            for name, expr in self.body.indexing.items()
+        }
+
+        def val_expressable_in_lower_precession(val):
+            if isinstance(val, sympy.Number):
+                assert val.is_constant()
+                if isinstance(val, sympy.Integer):
+                    val = int(val)
+                else:
+                    val = float(val)
+
+            if isinstance(val, float):
+                return val <= (2 ** 24) and val >= -(2 ** 24)
+            if isinstance(val, int):
+                return val <= (2147483647) and val >= -2147483648
+            breakpoint()
+            assert False
+
+        def range_expressable_in_lower_precision(range):
+            return val_expressable_in_lower_precession(range.lower) and val_expressable_in_lower_precession(range.upper)
+
+        int64_dtype_nodes = [node for node in graph.nodes if node.target == "to_dtype" and node.args[2] == torch.int64]
+
+        can_reduce = []
+
+        # TODO we should be checking which nodes 
+        # if a node is not expressable in int32 and we compute that as the descendant of one node,
+        # we should short circuit the other nodes descendants
+
+        for node in int64_dtype_nodes:
+            can_reduce_precision = True
+            for dominated in dominated_values(node):
+
+                if dominated.target in ["store", "output"]:
+                    continue
+
+                if "set_indirect" in dominated.target:
+                    idx = int(dominated.target[len("set_indirect"):])
+                    indirect_var = self.body.indirect_vars[idx]
+
+                    for index, indirect_vals in index_indirect_dependecies.items():
+                        if indirect_var in indirect_vals:
+                            can_reduce_precision = can_reduce_precision and val_expressable_in_lower_precession(indexing_w_bounds[index])
+                    continue
+
+                val = interpreter.env[dominated]
+
+                if isinstance(val, torch._inductor.codegen.triton.Range):
+                    can_reduce_precision = can_reduce_precision and range_expressable_in_lower_precision(val)
+                else:
+                    breakpoint()
+                    print(val)
+
+            if can_reduce_precision:
+                args = list(node.args)
+                args[2] = torch.int32
+                node.args = tuple(args)
+
+        ranges = [interpreter.env[node] for node in not_used_in_tensors]
+        vals = [interpreter.env[node] for node in graph.nodes if node.target == "get_index"]
+
+
+        # breakpoint()
+
+
+        for node in graph.nodes:
+            # if node.target == "store" or node.target == "reduction":
+
+
+            # if any(s in repr(node) for s in ("set_indirect", "to_dtype")):
+            #     breakpoint()
+            # if isinstance()
+            # if node.target == "maximum":
+            #     pass
+            # TODO - we should use non nan-propagating maximum/minimum 
+            # for indexing computation
+            assert node in interpreter.env
+        # print(interpreter.env.keys())
+        # anythin
+        # breakpoint()
+        print(graph)
+        # print(interpreter)
+
