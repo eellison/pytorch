@@ -509,25 +509,25 @@ class IterationRangesEntry(IterationRanges):
         return self.name == other.name
 
 @dataclasses.dataclass(frozen=True)
-class Range(object):
+class RangeValues(object):
     lower: Union[sympy.Symbol, int, float]
     upper: Union[sympy.Symbol, int, float]
 
     def map(self, fn):
         try:
-            return Range(fn(self.lower), fn(self.upper))
+            return RangeValues(fn(self.lower), fn(self.upper))
         except Exception as e:
             breakpoint()
             raise
 
     def binary_map(self, other, fn):
-        return Range(
+        return RangeValues(
             fn(self.lower, other.lower),
             fn(self.upper, other.upper),
         )
 
 # Range = sympy.Interval
-binary_map = Range.binary_map
+binary_map = RangeValues.binary_map
 # map = Range.map
 
 # def map(self, fn):
@@ -539,7 +539,7 @@ binary_map = Range.binary_map
 # Range.map = map
 # Range.binary_map = binary_map
 
-class RangeAnalysis(object):
+class RangeAnalysis(torch._inductor.virtualized.MockHandler):
     def __init__(self, node_values, loop_body, ranges, input_buffers, intermediary_buffers, output_buffers, intermediary_buffer_values):
         self.loop_body = loop_body
         self.ranges = ranges
@@ -560,10 +560,10 @@ class RangeAnalysis(object):
         )
 
     def load(self, name: str, index: sympy.Expr):
-        return Range(-math.inf, math.inf)
+        return RangeValues(-math.inf, math.inf)
         if name in self.input_buffers:
             # Could technically use dtype here if the buffer is e.g. int8
-            return Range(-math.inf, math.inf)
+            return RangeValues(-math.inf, math.inf)
         elif name in self.intermediary_buffer_values:
             return self.intermediary_buffer_values[name]
         breakpoint()
@@ -582,7 +582,7 @@ class RangeAnalysis(object):
         return self._inner.store(name, index, value, mode)
 
     def reduction(self, name, dtype, src_dtype, reduction_type, index, value):
-        return Range(-math.inf, math.inf)
+        return RangeValues(-math.inf, math.inf)
         breakpoint()
         index = self.add_index(index, "writes", name)
         return self._inner.reduction(
@@ -639,9 +639,9 @@ class RangeAnalysis(object):
     @staticmethod
     def constant(value, dtype):
         if isinstance(value, int):
-            return Range(sympy.core.numbers.Integer(value), sympy.core.numbers.Integer(value))
+            return RangeValues(sympy.core.numbers.Integer(value), sympy.core.numbers.Integer(value))
         else:
-            return Range(sympy.core.numbers.Float(value), sympy.core.numbers.Float(value))
+            return RangeValues(sympy.core.numbers.Float(value), sympy.core.numbers.Float(value))
         # return value
 
     @staticmethod
@@ -659,7 +659,7 @@ class RangeAnalysis(object):
     
     @staticmethod
     def sub(a, b):
-        return Range(
+        return RangeValues(
             a.lower - b.upper, 
             a.upper - b.lower,
         )
@@ -688,9 +688,7 @@ class RangeAnalysis(object):
 
     @staticmethod
     def where(a, b, c):
-        # if true
-        breakpoint()
-        return f"tl.where({a}, {b}, {c})"
+        return RangeValues(min(b.lower, c.lower), max(b.upper, c.upper))
 
     @staticmethod
     def cos(x):
@@ -713,12 +711,13 @@ class RangeAnalysis(object):
         #     assert isinstance(expr, (int, float))
         #     return expr
         try:
-            assert expr in self.ranges
+            out = sympy_subs(expr, self.ranges)
+            assert isinstance(out, (int, sympy.Integer))
         except Exception:
             breakpoint()
         # todo the following 
         # return Range(sympy.core.numbers.Integer(0), sympy_symbol(str(expr)))
-        return Range(sympy.core.numbers.Integer(0), sympy.core.numbers.Integer(self.ranges[expr]))
+        return RangeValues(sympy.core.numbers.Integer(0), sympy.core.numbers.Integer(out))
 
     @staticmethod
     def masked(mask, body, other):
@@ -1718,7 +1717,7 @@ class TritonScheduling:
             ra = RangeAnalysis(node_values, node_schedule[node_idx]._body, ranges, input_names, intermediary, output_buffers, intermediary_buffer_values)
             with V.set_ops_handler(ra):
                 # set_indirect1
-                
+                pass
                 # breakpoint()
                 # # may not need to re-trace, could just use
                 # # node_schedule[0]._body.root_block.graph

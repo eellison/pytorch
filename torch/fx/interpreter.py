@@ -135,6 +135,7 @@ class Interpreter:
                     torch._inductor.virtualized.V.ops.node_values[node] = out
                 self.env[node] = out
             except Exception as e:
+                breakpoint()
                 msg = f"While executing {node.format_node()}"
                 msg = '{}\n\n{}'.format(e.args[0], msg) if e.args else str(msg)
                 msg += f"\nOriginal traceback:\n{node.stack_trace}"

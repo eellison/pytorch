@@ -3921,7 +3921,7 @@ class LoopBody:
         # if "RangeAnalysis" in str(torch._inductor.virtualized.V.ops):
         #     breakpoint()
         # breakpoint()
-        if isinstance(new, torch._inductor.codegen.triton.Range):
+        if isinstance(new, torch._inductor.codegen.triton.RangeValues):
             if not new.lower == 0.0:
                 breakpoint()
                 assert False
@@ -3945,9 +3945,16 @@ class LoopBody:
         #     breakpoint()
 
         # if the lower bound is 0, can just the upper boud
-        if isinstance(new, torch._inductor.codegen.triton.Range):
+        if isinstance(new, torch._inductor.codegen.triton.RangeValues):
+            indexing = {}
+            for key, expr in self.indexing.items():
+                if old in expr.free_symbols:
+                    breakpoint()
+                    print(new)
+
             if not new.lower == 0.0:
                 breakpoint()
+                return
                 assert False
             new = new.upper
         #     new = sympy.Interval(new.lower, new.upper)
@@ -4140,7 +4147,7 @@ class LoopBodyBlock:
         }
 
         class InterpreterShim(torch.fx.Interpreter):
-            def __init__(self):
+            def __init__(self, env):
                 """
                 We don't call super() here to avoid constructing a
                 GraphModule which is very expensive (it does codegen).
@@ -4185,8 +4192,12 @@ class LoopBodyBlock:
                 raise
 
         not_used_in_tensors = {node for node in graph.nodes if node not in used_in_tensor_writing_set}
+        import math
+        env = {
+            node: torch._inductor.codegen.triton.RangeValues(-math.inf, math.inf)
+        }
 
-        interpreter = InterpreterShim()
+        interpreter = InterpreterShim(env)
         interpreter.run(V.get_ops_handler())
 
         def dominated_values(node):
