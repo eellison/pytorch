@@ -171,6 +171,14 @@ class ModularIndexing(sympy.Function):
 
     nargs = (3,)
 
+    # def __new__(cls, base, divisor, modulus):
+    #     if base == 1:
+    #         return 
+
+
+    #     return super(ModularIndexing, cls).__new__(cls, base, divisor, modulus):
+
+
     @classmethod
     def eval(cls, base, divisor, modulus):
         if base == 0 or modulus == 1:
@@ -3945,6 +3953,13 @@ class LoopBody:
         #     breakpoint()
 
         # if the lower bound is 0, can just the upper boud
+        if not hasattr(self, "replacement_vals"):
+            self.replacement_vals = {}
+        
+        self.replacement_vals[old] = new
+        return
+        # return
+
         if isinstance(new, torch._inductor.codegen.triton.RangeValues):
             indexing = {}
             for key, expr in self.indexing.items():
@@ -3967,6 +3982,118 @@ class LoopBody:
             raise
 
     def get_index(self, name):
+        # at this point in computation, we should have all of the stuff relevant to plugin values
+        # if "RangeAnalysis" in str(V.ops):
+        #     breakpoint()
+        return self.indexing[name]
+
+    def get_index_new(self, name):
+        if name in self.replacement_vals:
+            return self.replacement_vals[name]
+
+        out = self._get_index_new(name)
+        # if name == "index2":
+        #     breakpoint()
+        print(name)
+        self.replacement_vals[name] = out
+        return out
+
+    def _get_index_new(self, name):
+        expr = self.indexing[name]
+
+        free_symbols = list(expr.free_symbols)
+
+        if len(free_symbols) == 0:
+            return expr
+
+        # make it easier to find maximum and minimum values
+        def simplify_expression_for_derivative(expr):
+            args = [simplify_expression_for_derivative(e) for e in expr.args]
+            if isinstance(expr, ModularIndexing):
+                return (expr.args[0] // args[1]) % expr.args[2]
+            if isinstance(expr, IndexingDiv):
+                return expr.args[0] // args[1]
+            try:
+                return type(expr)(*args)    
+            except Exception as e:
+                breakpoint()
+                raise        
+            
+        def replace_symbols_for_deriv(expr, ignore_mod=False):
+            # for the purposes of finding local, minimum, maximum, assume smoothness
+            if ignore_mod:
+                mod_indexing = lambda x, y, z: (x / y)
+            else:
+                mod_indexing = lambda x, y, z: (x / y) % z
+            indexing_div = lambda x, y: x / y
+            return expr.replace(ModularIndexing, mod_indexing).replace(IndexingDiv, indexing_div)
+
+        if len(free_symbols) > 1:
+            symbols = expr.free_symbols
+            monotonic_increasing = []
+            monotonic_decreasing = []
+            other_symbols = []
+            print(expr)
+            if expr.has(ModularIndexing) and not isinstance(expr, ModularIndexing):
+                breakpoint()
+            #     breakpoint()
+            if isinstance(expr, ModularIndexing):
+                if expr.args[2].is_constant():
+                    expr_deriv = expr.args[0] // expr.args[1]
+            else:
+                expr_deriv = expr
+
+            expr_deriv = replace_symbols_for_deriv(expr_deriv)
+            for symbol in symbols:
+                diff = sympy.diff(expr_deriv, symbol)
+                if isinstance(diff, sympy.Number) and diff >= 0:
+                    monotonic_increasing.append(symbol)
+                elif isinstance(diff, sympy.Number):
+                    monotonic_decreasing.append(symbol)
+                else:
+                    other_symbols.append(symbol)
+
+            if not monotonic_decreasing and not other_symbols:
+                max_val = sympy_subs(expr, {k: v.upper for k, v in self.replacement_vals.items()})
+                min_val = sympy_subs(expr, {k: v.lower for k, v in self.replacement_vals.items()})
+                return torch._inductor.codegen.triton.RangeValues(min_val, max_val)
+
+            # if monotonic_decreasing:
+            #     breakpoint()
+            # if other_symbols:
+            #     breakpoint()
+            # breakpoint()
+            breakpoint()
+            with open("/scratch/eellison/work/torchdynamo/elias_compute.txt", "a") as f:
+                f.write(str(expr))
+
+        # single free variable i can use sympy.calculus
+        try:
+            replacements = {k: v.upper for k, v in self.replacement_vals.items()}
+        except Exception as e:
+            breakpoint()
+            raise
+        if expr in self.replacement_vals:
+            return self.replacement_vals[expr]
+
+        free_symbol = free_symbols[0]
+        diff = sympy.diff(replace_symbols_for_deriv(expr, ignore_mod=True), free_symbol)
+        if diff.is_constant():
+            max_v = sympy_subs(expr, {free_symbols[0]: self.replacement_vals[free_symbol].upper})
+            min_v = sympy_subs(expr, {free_symbols[0]: self.replacement_vals[free_symbol].lower})
+            return torch._inductor.codegen.triton.RangeValues(min(max_v, min_v), max(max_v, min_v))
+        
+        # if expr.has(ModularIndexing):
+        #     replace_symbols_for_deriv(expr, ignore_mod)
+        
+        breakpoint()
+
+        if isinstance(expr, ModularIndexing):
+            return torch._inductor.codegen.triton.RangeValues(0, expr.args[2])
+
+        breakpoint()
+        return sympy_subs(expr, replacements)
+        # at this point in computation, we should have all of the stuff relevant to plugin values
         # if "RangeAnalysis" in str(V.ops):
         #     breakpoint()
         return self.indexing[name]
@@ -4129,10 +4256,44 @@ class LoopBodyBlock:
             self.body.replace_indirect_new(var, V.ops.indirect_indexing(new_var))
             return new_var
 
+        env = {}
+
+        def masked_subblock_new(subblock, env, mask, value):
+            interp = InterpreterShim(subblock.graph)
+            interp.run(V.get_ops_handler(), initial_env=env)
+            output = [node for node in subblock.graph.nodes if node.target == "output"]
+            assert len(output) == 1
+            # since it's load form a buffer range will be (-inf, inf), no need to union with value
+            try:
+                return interp.env[output[0]]
+            except Exception as e:
+                breakpoint()
+                raise
+
         keys = list(submodules.keys())
         for key in keys:
             if key == "get_index":
+                submodules[key] = self.body.get_index_new
                 continue
+            if "masked_subblock" in key:
+                subblock = self.body.subblocks[key]
+                submodules[key] = functools.partial(masked_subblock_new, subblock, env)
+                continue
+
+                # def shim(mask, other):
+                #     return V.ops.masked(mask, subblock, other)
+                # we want to 
+                # name = self.body.add_submodule(shim, "masked_subblock")
+                # subblock = LoopBodyBlock(self.body, masked_body, [])
+                # self.body.subblocks[name] = subblock
+                # return tracer.create_proxy(
+                #     "call_module", name, (mask_proxy, other_proxy), {}
+                # )
+                
+
+                continue
+            if "set_indirect" not in key:
+                breakpoint()
             assert "set_indirect" in key
             idx = int(key[len("set_indirect"):])
             var = self.body.indirect_vars[idx]
@@ -4147,7 +4308,7 @@ class LoopBodyBlock:
         }
 
         class InterpreterShim(torch.fx.Interpreter):
-            def __init__(self, env):
+            def __init__(self, graph):
                 """
                 We don't call super() here to avoid constructing a
                 GraphModule which is very expensive (it does codegen).
@@ -4156,20 +4317,45 @@ class LoopBodyBlock:
                 self.graph = graph
                 self.submodules = submodules
                 self.garbage_collect_values = False
-                self.env = {}
+                self.env = env
                 self.fetch_attr = submodules.__getitem__
 
         # tensor_writing_ops = 
         # breakpoint()
         stores = [node for node in graph.nodes if node.target == "store"]
 
-        indirect_writes = [node for node in graph.nodes if "set_indirect" in node.target]
-        assert len(indirect_var_set) == len(indirect_writes)
-
         
+
+        indirect_writes = [node for node in graph.nodes if "set_indirect" in node.target]
+        for block in self.body.subblocks.values():
+            indirect_writes += [node for node in block.graph.nodes if "set_indirect" in node.target]
+
+        try:
+            assert len(indirect_var_set) == len(indirect_writes)
+        except Exception as e:
+            breakpoint()
+            raise
+
+
+        for k, v in indices_replacements.items():
+            self.body.replace_indirect_new(k, torch._inductor.codegen.triton.RangeValues(0, v))
+
         used_in_tensor_writing_set = set()
         # only take value 
         queue = [node.args[3] for node in stores if isinstance(node.args[3], torch.fx.node.Node)]
+
+        # for node in graph.nodes:
+        #     if node.target == "reduction":
+        #         queue.append(node.args[-1])
+
+        #     # TODO - add masked_subblock here
+        #     # if node.target == "where":
+        #     #     def ignored_use(node, use):
+        #     #         return ("masked_subblock" in use.target and use.args[0] == node) or (use.target == "where" and node == use.args[1])
+
+            #     if all(ignored_use(node.args[1], use) for use in node.args[1].users):
+            #         queue.append(node.args[1])
+
         # breakpoint()
 
         # we still need to check dependencies for range analysis
@@ -4185,20 +4371,33 @@ class LoopBodyBlock:
             used_in_tensor_writing_set.add(node)
             try:
                 for inp in node.args:
-                    if inp not in used_in_tensor_writing_set and isinstance(inp, torch.fx.node.Node):
-                        queue.append(inp)
+                    if "masked_subblock" in node.target:
+                        body = self.body.subblocks[node.target].graph
+                        # is there easier way of getting output?
+                        output = [node for node in body.nodes if node.target == "output"]
+                        assert len(output) == 1
+                        queue.append(output[0])
+                    if inp not in used_in_tensor_writing_set and isinstance(inp, torch.fx.node.Node): 
+                        if inp.target != "load":
+                            queue.append(inp)
             except Exception:
                 breakpoint()
                 raise
-
+        
+        used_in_tensor_writing_set = set()
         not_used_in_tensors = {node for node in graph.nodes if node not in used_in_tensor_writing_set}
         import math
-        env = {
-            node: torch._inductor.codegen.triton.RangeValues(-math.inf, math.inf)
-        }
+        for node in used_in_tensor_writing_set:
+            if "get_index_2" in str(node) or  "get_index_2" in repr(node):
+                breakpoint()
+            if node.target != "ops" and "masked_subblock" not in node.target:
+                env[node] = torch._inductor.codegen.triton.RangeValues(-math.inf, math.inf)
 
-        interpreter = InterpreterShim(env)
-        interpreter.run(V.get_ops_handler())
+        # env = {
+        #     node: torch._inductor.codegen.triton.RangeValues(-math.inf, math.inf) for node in used_in_tensor_writing_set
+        # }
+        interpreter = InterpreterShim(graph)
+        interpreter.run(V.get_ops_handler(), initial_env=env)
 
         def dominated_values(node):
             queue = [node]
@@ -4215,6 +4414,8 @@ class LoopBodyBlock:
             return visited
             
         # def can_run_in_int32()
+        # we are going to be conservative and assume where takes the union of values, 
+        # so pre-populate the where values, as they will be unused
 
         not_expressable_in_int32 = []
         for node in not_used_in_tensors:
@@ -4237,14 +4438,19 @@ class LoopBodyBlock:
                 return val <= (2 ** 24) and val >= -(2 ** 24)
             if isinstance(val, int):
                 return val <= (2147483647) and val >= -2147483648
+
             breakpoint()
+            return False
             assert False
 
         def range_expressable_in_lower_precision(range):
             return val_expressable_in_lower_precession(range.lower) and val_expressable_in_lower_precession(range.upper)
 
         int64_dtype_nodes = [node for node in graph.nodes if node.target == "to_dtype" and node.args[2] == torch.int64]
+        for subblock in self.body.subblocks.values():
+            int64_dtype_nodes += [node for node in subblock.graph.nodes if node.target == "to_dtype" and node.args[2] == torch.int64]
 
+        # TODO - if this is empty, we should just return. until 
         can_reduce = []
 
         # TODO we should be checking which nodes 
@@ -4264,12 +4470,13 @@ class LoopBodyBlock:
 
                     for index, indirect_vals in index_indirect_dependecies.items():
                         if indirect_var in indirect_vals:
-                            can_reduce_precision = can_reduce_precision and val_expressable_in_lower_precession(indexing_w_bounds[index])
+                             #val_expressable_in_lower_precession(indexing_w_bounds[index])
+                            can_reduce_precision = can_reduce_precision and range_expressable_in_lower_precision(self.body.replacement_vals[index])
                     continue
 
                 val = interpreter.env[dominated]
 
-                if isinstance(val, torch._inductor.codegen.triton.Range):
+                if isinstance(val, torch._inductor.codegen.triton.RangeValues):
                     can_reduce_precision = can_reduce_precision and range_expressable_in_lower_precision(val)
                 else:
                     breakpoint()
