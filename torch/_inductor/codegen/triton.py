@@ -6,7 +6,7 @@ import itertools
 import logging
 import math
 import operator
-from typing import Dict, List
+from typing import Any, Dict, List, Union
 
 import sympy
 
@@ -499,6 +499,176 @@ class IterationRangesEntry(IterationRanges):
         return self.name == other.name
 
 
+@dataclasses.dataclass(frozen=True)
+class RangeValues(object):
+    lower: Union[sympy.Symbol, int, float, bool]
+    upper: Union[sympy.Symbol, int, float, bool]
+
+    @classmethod
+    def map(cls, x, fn):
+        x = cls.wrap(x)
+        return RangeValues(fn(x.lower), fn(x.upper))
+
+    @classmethod
+    def checked_map(cls, x, fn):
+        out = cls.map(x, fn)
+        return RangeValues(min(out.lower, out.upper), max(out.lower, out.upper))
+
+    @classmethod
+    def wrap(cls, arg):
+        if isinstance(arg, RangeValues):
+            return arg
+        assert isinstance(arg, (int, float, bool))
+        return RangeValues(arg, arg)
+
+    @classmethod
+    def binary_map_products(cls, a, b, fn):
+        a, b = cls.wrap(a), cls.wrap(b)
+        products = [
+            fn(x, y)
+            for x, y in itertools.product([a.lower, a.upper], [b.lower, b.upper])
+        ]
+        return RangeValues(min(products), max(products))
+
+    @classmethod
+    def binary_map(cls, x, y, fn):
+        x, y, = cls.wrap(
+            x
+        ), cls.wrap(y)
+
+        return RangeValues(
+            fn(x.lower, y.lower),
+            fn(x.upper, y.upper),
+        )
+
+
+binary_map = RangeValues.binary_map
+
+
+class RangeAnalysis(object):
+    def __init__(self):
+        boolean_operators = (
+            "eq",
+            "ne",
+            "lt",
+            "gt",
+            "le",
+            "ge",
+            "and_",
+            "or_",
+            "xor",
+            "logical_and",
+            "logical_or",
+            "logical_not",
+        )
+        for op in boolean_operators:
+            setattr(self, op, self.bool_handler)
+
+    @staticmethod
+    def bool_handler(*args, **kwargs):
+        # just assuming bools can have both values currently
+        return RangeValues(
+            sympy.logic.boolalg.BooleanFalse, sympy.logic.boolalg.BooleanTrue
+        )
+
+    def load(self, name: str, index: sympy.Expr):
+        return RangeValues(-math.inf, math.inf)
+
+    def store(self, name, index, value, mode=None):
+        return
+
+    def reduction(self, name, dtype, src_dtype, reduction_type, index, value):
+        return RangeValues(-math.inf, math.inf)
+
+    def index_expr(self, index, dtype):
+        assert isinstance(index, RangeValues)
+        return index
+
+    @staticmethod
+    def to_dtype(x, dtype: torch.dtype):
+        return x
+
+    @staticmethod
+    def constant(value, dtype):
+        # using nan makes subsequent computation throw, and for the purposes of optimization
+        # returning -math.inf - math.inf is equivalent to giving up
+        if math.isnan(value):
+            return RangeValues(-math.inf, math.inf)
+        if isinstance(value, int):
+            return RangeValues(
+                sympy.core.numbers.Integer(value), sympy.core.numbers.Integer(value)
+            )
+        else:
+            return RangeValues(
+                sympy.core.numbers.Float(value), sympy.core.numbers.Float(value)
+            )
+
+    @staticmethod
+    def reciprocal(x):
+        return RangeValues.checked_map(x, lambda y: 1 / y)
+
+    @staticmethod
+    def abs(x):
+        return RangeValues.checked_map(x, abs)
+
+    @staticmethod
+    def truediv(a, b):
+        return RangeValues.binary_map_products(a, b, operator.div)
+
+    @staticmethod
+    def div(a, b):
+        return RangeValues.binary_map_products(a, b, operator.div)
+
+    @staticmethod
+    def add(a, b):
+        return binary_map(a, b, operator.add)
+
+    @staticmethod
+    def mul(a, b):
+        return RangeValues.binary_map_products(a, b, operator.mul)
+
+    @staticmethod
+    def sub(a, b):
+        return RangeValues.binary_map_products(a, b, operator.sub)
+
+    @staticmethod
+    def exp(x):
+        return RangeValues.map(x, sympy.functions.elementary.exponential.exp)
+
+    @staticmethod
+    def square(x):
+        return RangeValues.checked_map(x, lambda y: y * y)
+
+    @staticmethod
+    def sqrt(x):
+        return RangeValues.map(x, sympy.sqrt)
+
+    @staticmethod
+    def relu(x):
+        fn = lambda x: x if x > 0 else 0
+        return RangeValues.map(x, fn)
+
+    @staticmethod
+    def minimum(a, b):
+        return binary_map(a, b, min)
+
+    @staticmethod
+    def maximum(a, b):
+        return binary_map(a, b, max)
+
+    @staticmethod
+    def where(a, b, c):
+        return RangeValues(min(b.lower, c.lower), max(b.upper, c.upper))
+
+    @staticmethod
+    def floor(x):
+        return RangeValues.map(x, sympy.functions.elementary.integers.floor)
+
+    @staticmethod
+    def ceil(x):
+        return RangeValues.map(x, sympy.functions.elementary.integers.ceiling)
+
+
 class TritonKernel(Kernel):
     overrides = TritonOverrides
     sexpr = texpr
@@ -711,7 +881,6 @@ class TritonKernel(Kernel):
         index_vars = index.free_symbols
         index_str = texpr(self.rename_indexing(self.codegen_indexing(index)))
         indirect_indexing = self.is_indirect_indexing(index)
-
         need_dense = (
             config.triton.dense_indexing
             or dense_indexing
@@ -1283,6 +1452,7 @@ class TritonScheduling:
                 reduction_hint_val = ReductionHint.DEFAULT
         else:
             reduction_hint_val = ReductionHint.DEFAULT
+
         with TritonKernel(*tiled_groups, reduction_hint=reduction_hint_val) as kernel:
             stack = contextlib.ExitStack()
             for node in node_schedule:
@@ -1294,7 +1464,13 @@ class TritonScheduling:
                 elif node is EnableReduction:
                     stack.close()
                 else:
-                    node.codegen(kernel.split_and_set_ranges(node.get_ranges()))
+                    ranges = kernel.split_and_set_ranges(node.get_ranges())
+                    ra = RangeAnalysis()
+                    with V.set_ops_handler(ra):
+                        node._body.indexing_dtype_strength_reduction(
+                            node.ranges_from_index_vars(ranges)
+                        )
+                    node.codegen(ranges)
 
         wrapper = V.graph.wrapper_code
         src_code = kernel.codegen_kernel()

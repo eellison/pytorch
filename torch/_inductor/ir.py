@@ -3,6 +3,7 @@ import dataclasses
 import functools
 import itertools
 import logging
+import math
 import re
 import textwrap
 from collections import OrderedDict
@@ -3849,6 +3850,20 @@ class StorageBox(MutableBox):
         return len(read_writes.reads)
 
 
+class InterpreterShim(torch.fx.Interpreter):
+    def __init__(self, graph, submodules):
+        """
+        We don't call super() here to avoid constructing a
+        GraphModule which is very expensive (it does codegen).
+        """
+        self.module = self
+        self.graph = graph
+        self.submodules = submodules
+        self.garbage_collect_values = False
+        self.env = {}
+        self.fetch_attr = submodules.__getitem__
+
+
 class LoopBody:
     """
     Captures the body of a Loops subclass into an FX graph.  Persists any
@@ -3906,7 +3921,7 @@ class LoopBody:
     def add_indirect(self):
         name = f"indirect{len(self.indirect_vars)}"
         var = sympy_symbol(name)
-        self.indirect_vars.append([var])
+        self.indirect_vars.append(var)
         return var
 
     def replace_indirect(self, old, new):
@@ -3915,19 +3930,114 @@ class LoopBody:
             return
         self.indexing = {k: sympy_subs(v, {old: new}) for k, v in self.indexing.items()}
 
+    def replace_indirect_new(self, old, new):
+        """Swap in a variable used in indirect indexing"""
+        if str(old) == str(new):
+            return
+
+        assert isinstance(new, torch._inductor.codegen.triton.RangeValues)
+        self.replacement_vals[old] = new
+
     def get_index(self, name):
         return self.indexing[name]
+
+    def get_index_new(self, name):
+        if name in self.replacement_vals:
+            return self.replacement_vals[name]
+
+        out = self._get_index_new(name)
+        # cache computation
+        self.replacement_vals[name] = out
+        return out
+
+    def _get_index_new(self, name):
+        expr = self.indexing[name]
+
+        free_symbols = list(expr.free_symbols)
+
+        if len(free_symbols) == 0:
+            return torch._inductor.codegen.triton.RangeValues(expr, expr)
+
+        if expr in self.replacement_vals:
+            return self.replacement_vals[expr]
+
+        def replace_symbols_for_deriv(expr, ignore_mod=False):
+            # for the purposes of finding local, minimum, maximum, assume smoothness
+            def mod_indexing(x, y, z):
+                if z.is_constant():
+                    return x / y
+
+                # never really happens, we'll bail on optimizing
+                return (x / y) % z
+
+            indexing_div = lambda x, y: x / y
+            return expr.replace(ModularIndexing, mod_indexing).replace(
+                IndexingDiv, indexing_div
+            )
+
+        symbols = expr.free_symbols
+        monotonic_increasing = []
+        monotonic_decreasing = []
+        other_symbols = []
+
+        expr_for_deriv = replace_symbols_for_deriv(expr, True)
+        for symbol in symbols:
+            diff = sympy.diff(expr_for_deriv, symbol)
+            if diff.is_positive:
+                monotonic_increasing.append(symbol)
+            elif diff.is_positive is False:  # can return None
+                monotonic_decreasing.append(symbol)
+            else:
+                other_symbols.append(symbol)
+
+        if not other_symbols:
+            max_val = sympy_subs(
+                expr,
+                {
+                    k: (v.upper if k in monotonic_increasing else v.lower)
+                    for k, v in self.replacement_vals.items()
+                },
+            )
+            min_val = sympy_subs(
+                expr,
+                {
+                    k: (v.lower if k in monotonic_increasing else v.upper)
+                    for k, v in self.replacement_vals.items()
+                },
+            )
+            return torch._inductor.codegen.triton.RangeValues(min_val, max_val)
+        else:
+            # bail on optimizing, have not run into this yet
+            return torch._inductor.codegen.triton.RangeValues(-math.inf, math.inf)
 
     def __call__(self, *indices):
         index = list(itertools.chain(*indices))
         assert len(index) == len(self.var_ranges), (index, self.var_ranges)
         assert all(v not in self.var_ranges for v in index)
         replacements = dict(zip(self.var_ranges.keys(), index))
+        # replacements = self.var_ranges
         self.indexing = {
             name: sympy_subs(expr, replacements)
             for name, expr in self.indexing_exprs.items()
         }
         result = self.root_block()
+        self.indexing = None
+        return result
+
+    def indexing_dtype_strength_reduction(self, *indices):
+        index = list(itertools.chain(*indices))
+        assert len(index) == len(self.var_ranges), (index, self.var_ranges)
+        assert all(v not in self.var_ranges for v in index)
+        replacements = dict(zip(self.var_ranges.keys(), index))
+        # TODO - substitute in the actual var agnes
+        self.indexing = {
+            name: sympy_subs(expr, replacements)
+            for name, expr in self.indexing_exprs.items()
+        }
+        indices_replacements = {
+            val: self.var_ranges[key] for key, val in replacements.items()
+        }
+        result = self.root_block.indexing_dtype_strength_reduction(indices_replacements)
         self.indexing = None
         return result
 
@@ -3999,6 +4109,7 @@ class LoopBodyBlock:
                     self.body.replace_indirect(var, V.ops.indirect_indexing(new_var))
 
                 var = self.body.add_indirect()
+                # breakpoint()
                 tracer.create_proxy(
                     "call_module",
                     self.body.add_submodule(set_indirect, f"set_{var}"),
@@ -4016,26 +4127,15 @@ class LoopBodyBlock:
             SimplifyIndexing(CaptureIndexing(proxy_ops), self.body.var_ranges)
         ):
             tracer.create_proxy("output", "output", (fn(*args),), {})
+        # breakpoint()
+        # breakpoint()
         self.graph = tracer.graph
 
     def __call__(self):
         graph = self.graph
         submodules = self.body.submodules
 
-        class InterpreterShim(torch.fx.Interpreter):
-            def __init__(self):
-                """
-                We don't call super() here to avoid constructing a
-                GraphModule which is very expensive (it does codegen).
-                """
-                self.module = self
-                self.graph = graph
-                self.submodules = submodules
-                self.garbage_collect_values = False
-                self.env = {}
-                self.fetch_attr = submodules.__getitem__
-
-        return InterpreterShim().run(V.get_ops_handler())
+        return InterpreterShim(graph, submodules).run(V.get_ops_handler())
 
     def debug_str(self, name="block"):
         code = torch.fx.GraphModule(self.body.submodules, self.graph).code
@@ -4045,3 +4145,186 @@ class LoopBodyBlock:
             "",
             code.strip().replace("def forward(", f"def {name}("),
         )
+
+    @staticmethod
+    def dominated_nodes(initial_queue, skip_filter=None):
+        if isinstance(initial_queue, torch.fx.Node):
+            initial_queue = [initial_queue]
+
+        dominated_set = set(initial_queue)
+
+        while initial_queue:
+            node = initial_queue.pop()
+            for user in node.users:
+                if skip_filter and skip_filter(user):
+                    continue
+                if user not in dominated_set:
+                    dominated_set.add(user)
+                    initial_queue.append(user)
+
+        return dominated_set
+
+    def indexing_dtype_strength_reduction(self, indices_replacements):
+        graph = self.graph
+        submodules = dict(self.body.submodules)
+
+        def set_indirect(var, new_var):
+            self.body.replace_indirect_new(var, new_var)
+            return new_var
+
+        self.body.replacement_vals = {}
+
+        def masked_subblock_new(subblock, env, mask, value):
+            interp = InterpreterShim(subblock.graph, submodules)
+            interp.run(V.get_ops_handler(), initial_env=env)
+            output = [node for node in subblock.graph.nodes if node.target == "output"]
+            assert len(output) == 1
+            # since it's load form a buffer range will be (-inf, inf)
+            return interp.env[output[0]]
+
+        initial_env = {}
+
+        keys = list(submodules.keys())
+        for key in keys:
+            if key == "get_index":
+                submodules[key] = self.body.get_index_new
+            elif "masked_subblock" in key:
+                subblock = self.body.subblocks[key]
+                submodules[key] = functools.partial(
+                    masked_subblock_new, subblock, initial_env
+                )
+            else:
+                assert "set_indirect" in key
+                idx = int(key[len("set_indirect") :])
+                var = self.body.indirect_vars[idx]
+                indirect = functools.partial(set_indirect, var)
+                submodules[key] = indirect
+
+        indirect_var_set = set(self.body.indirect_vars)
+        index_indirect_dependecies = {
+            index: expr.free_symbols & indirect_var_set
+            for index, expr in self.body.indexing.items()
+        }
+
+        for k, v in indices_replacements.items():
+            self.body.replace_indirect_new(
+                k, torch._inductor.codegen.triton.RangeValues(0, v)
+            )
+
+        all_graphs = [graph] + [block.graph for block in self.body.subblocks.values()]
+
+        queue = [
+            node
+            for g in all_graphs
+            for node in g.nodes
+            if node.target in ["load", "reduction"] or "masked_subblock" in node.target
+        ]
+
+        # avoid computing these values, as we will pessimistically assume that they are unbounded
+        used_in_tensor_writing_set = self.dominated_nodes(queue)
+
+        for node in used_in_tensor_writing_set:
+            # we need to evaluate masked_subblock to recurse, and we need to set indirect values
+            if (
+                node.target != "ops"
+                and "masked_subblock" not in node.target
+                and "set_indirect" not in node.target
+            ):
+                initial_env[node] = torch._inductor.codegen.triton.RangeValues(
+                    -math.inf, math.inf
+                )
+
+        interpreter = InterpreterShim(graph, submodules)
+        interpreter.run(V.get_ops_handler(), initial_env=initial_env)
+
+        def val_expressable_in_lower_precession(val):
+            if isinstance(val, sympy.Number):
+                assert val.is_constant()
+                if isinstance(val, sympy.Integer):
+                    val = int(val)
+                else:
+                    val = float(val)
+
+            # after you are outside of mantissa, you lose precission
+            if isinstance(val, float):
+                return val <= (2**24) and val >= -(2**24)
+            if isinstance(val, int):
+                iinfo = torch.iinfo(torch.int32)
+                return val <= iinfo.max and val >= iinfo.min
+
+            return False
+
+        def range_expressable_in_lower_precision(range):
+            return val_expressable_in_lower_precession(
+                range.lower
+            ) and val_expressable_in_lower_precession(range.upper)
+
+        # TODO - if this is empty, we should just return. will do in follow up,
+        # want to stress test this pass.
+
+        int64_dtype_nodes = [
+            node
+            for node in graph.nodes
+            if (node.target == "to_dtype" and node.args[2] == torch.int64 
+            and node not in used_in_tensor_writing_set)
+        ]
+
+        for subblock in self.body.subblocks.values():
+            int64_dtype_nodes += [
+                node
+                for node in subblock.graph.nodes
+                if node.target == "to_dtype" and node.args[2] == torch.int64
+            ]
+
+        # TODO we should be checking which nodes
+        # if a node is not expressable in int32 and we compute that as the descendant of one node,
+        # we should short circuit the other nodes descendants
+        for node in int64_dtype_nodes:
+            can_reduce_precision = True
+
+            # if a downstream use of a node explicitly converts to int32, or float16/float32/float64,
+            # then it's precision is set for that chain of uses, and we don't need to consider those
+            # dominated values
+            skip_filter = lambda node: node.target == "to_dtype" and node.args[2] in (
+                torch.int32,
+                torch.float32,
+                torch.float64,
+            )
+
+            # TODO - there are definitely other dominated uses whose dtype does not depend on whether 
+            # we reduce the precision here, e.g. add(int64, int64) one of the args can be reduced to 
+            # int32 without changing the output precision of the node. however this case hasn't shown up
+
+            for dominated in self.dominated_nodes(node, skip_filter):
+
+                if dominated.target in ["store", "output"]:
+                    continue
+
+                if "set_indirect" in dominated.target:
+                    idx = int(dominated.target[len("set_indirect") :])
+                    indirect_var = self.body.indirect_vars[idx]
+
+                    for index, indirect_vals in index_indirect_dependecies.items():
+                        if indirect_var in indirect_vals:
+                            index_v = self.body.replacement_vals[index]
+                            index_v_int = torch._inductor.codegen.triton.RangeValues(
+                                int(index_v.lower), int(index_v.upper)
+                            )
+                            # all indices are integers, so make sure that we
+                            # use the bounds of integers instead of floats.
+                            # TODO - not sure if we should be doing int/float casts while tracing,
+                            # might interfere with sympy.
+                            reducable = range_expressable_in_lower_precision(
+                                index_v_int
+                            )
+                            can_reduce_precision = can_reduce_precision and reducable
+
+                can_reduce_precision = (
+                    can_reduce_precision
+                    and range_expressable_in_lower_precision(interpreter.env[dominated])
+                )
+
+            if can_reduce_precision:
+                args = list(node.args)
+                args[2] = torch.int32
+                node.args = tuple(args)
