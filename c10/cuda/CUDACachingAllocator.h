@@ -5,6 +5,8 @@
 #include <c10/cuda/CUDAMacros.h>
 #include <c10/cuda/CUDAStream.h>
 #include <c10/util/Registry.h>
+#include <c10/util/Optional.h>
+#include <c10/util/flat_hash_map.h>
 
 #include <array>
 #include <mutex>
@@ -125,7 +127,45 @@ struct SegmentInfo {
   int64_t active_size = 0;
   cudaStream_t stream = 0;
   bool is_large = false;
+  // TODO - use 0,0 to mean no private pool id ?
+  MempoolId_t owner_private_pool_id = {0, 0};
   std::vector<BlockInfo> blocks;
+};
+
+struct BlockState {
+  int device;
+  cudaStream_t stream;
+  // TODO - need so set
+  ska::flat_hash_set<cuda::CUDAStream> stream_uses; // streams on which the block was used
+  size_t size; // block size in bytes
+  // omitting pool - already defined in serialized hierarchy
+  void* ptr; // memory address
+  bool allocated; // in-use flag
+  // assume event_count == 0;
+  int gc_count;
+
+  BlockState* prev = nullptr;
+  BlockState* next = nullptr;
+  // omitting history - could add new history event as part of checkpointing,
+  // dont want to overwrite existing
+};
+
+struct BlockPoolState {
+  std::vector<BlockState> blocks;
+
+  bool is_small;
+  MempoolId_t owner_id;
+};
+
+// this is the information necessary to resume block state from a previous
+// checkpoint
+struct PrivatePoolState {
+  // purposefully omitting use_count
+  int cudaMalloc_count;
+
+  BlockPoolState large_blocks;
+  BlockPoolState small_blocks;
+
 };
 
 struct TraceEntry {
@@ -161,10 +201,13 @@ struct TraceEntry {
   int64_t size_;
 };
 
+using stream_set = ska::flat_hash_set<cuda::CUDAStream>;
+
 struct SnapshotInfo {
   std::vector<SegmentInfo> segments;
   std::vector<std::vector<TraceEntry>> device_traces;
 };
+
 
 C10_CUDA_API void setAllocatorSettings(const std::string& env);
 
@@ -206,6 +249,9 @@ class CUDAAllocator : public Allocator {
       CreateContextFn context_recorder,
       size_t alloc_trace_max_entries,
       bool alloc_trace_record_context) = 0;
+  
+  virtual PrivatePoolState getCheckpointState(MempoolId_t id);
+  virtual void checkpointPoolState(PrivatePoolState& pps) = 0;
   virtual void attachOutOfMemoryObserver(OutOfMemoryObserver observer) = 0;
   virtual bool needsPoolSpecificPeerAccess() = 0;
   virtual std::string name() = 0;
@@ -274,6 +320,16 @@ inline void resetPeakStats(int device) {
 inline SnapshotInfo snapshot() {
   return get()->snapshot();
 }
+
+inline PrivatePoolState getCheckpointState(MempoolId_t id) {
+  TORCH_CHECK(false);
+  // return get()->getCheckpointState(id);
+}
+
+inline void checkpointPoolState(PrivatePoolState& pps) {
+  TORCH_CHECK(false);
+}
+
 
 // CUDAGraph interactions
 inline void notifyCaptureBegin(

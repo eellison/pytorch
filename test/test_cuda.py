@@ -1,7 +1,7 @@
 # Owner(s): ["module: cuda"]
 
 from itertools import repeat, chain, product
-from typing import NamedTuple
+from typing import NamedTuple, Literal, List, Any
 import collections
 import contextlib
 from copy import deepcopy
@@ -17,6 +17,7 @@ import threading
 import unittest
 import warnings
 import subprocess
+import dataclasses
 from random import randint
 
 import torch
@@ -5050,6 +5051,72 @@ class TestCudaComm(TestCase):
         with self.assertRaises(torch.cuda.OutOfMemoryError):
             torch.empty(1024 * 1024 * 1024 * 1024, device='cuda')
         self.assertTrue(x)
+
+
+MIN_BLOCK_SIZE = 512
+SMALL_SIZE = 1048576
+SMALL_BUFFER = 2097152
+LARGE_BUFFER = 20971520
+MIN_LARGE_ALLOC = 10485760
+ROUND_LARGE = 2097152
+ROUND_UP_POWER_OF_TWO_INTERVALS = 16
+
+@dataclasses.dataclass
+class Block(object):
+    size: int
+    state: Any
+    history: Any
+
+@dataclasses.dataclass
+class Segment(object):
+    device: int
+    address: int
+    total_size: int
+    allocated_size: int
+    active_size: int
+    stream: int
+    segment_type: Literal["large", "small"]
+    blocks: List[Block]
+
+class TestBlockStateAbsorbtion(TestCase):
+
+    def test_simple(self):
+        # test small buffer is split
+        import torch._inductor
+        import torch._inductor.config
+        import torch._dynamo
+        torch._inductor.config.triton.cudagraphs = True
+        
+        @torch._dynamo.optimize("inductor")
+        def foo():
+            x = torch.zeros([SMALL_BUFFER * 8], device="cuda", dtype=torch.uint8)
+            x = x + x
+            y = torch.zeros([SMALL_BUFFER], device="cuda", dtype=torch.uint8)
+            z = torch.zeros([LARGE_BUFFER], device="cuda", dtype=torch.uint8)
+            return x, y, z
+    
+        # s = torch.cuda.Stream()
+        # s.wait_stream(torch.cuda.current_stream())
+        # stream_id = s.cuda_stream
+        # with torch.cuda.stream(s):
+        #     x, y, z = foo()
+        inp = torch.rand([4000000], device="cuda")
+        del inp
+
+        foo()
+
+    
+
+        # multiple segments
+        snapshot = torch.cuda.memory._snapshot()
+        segments = snapshot["segments"]
+
+        # segments = [segment for segment in snapshot["segments"] if segment["stream"] == stream_id]
+
+        breakpoint()
+
+
+
 
 
 instantiate_parametrized_tests(TestCuda)

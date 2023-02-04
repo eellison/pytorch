@@ -5,7 +5,6 @@
 #include <c10/cuda/CUDAFunctions.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/util/UniqueVoidPtr.h>
-#include <c10/util/flat_hash_map.h>
 #include <c10/util/irange.h>
 #include <c10/util/llvmMathExtras.h>
 
@@ -19,6 +18,7 @@
 #include <mutex>
 #include <regex>
 #include <set>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -109,7 +109,6 @@ constexpr size_t kRoundUpPowerOfTwoIntervals = 16;
 
 namespace {
 
-using stream_set = ska::flat_hash_set<cuda::CUDAStream>;
 
 using StatTypes = std::array<bool, static_cast<size_t>(StatType::NUM_TYPES)>;
 
@@ -230,6 +229,7 @@ struct Block {
     return (prev != nullptr) || (next != nullptr);
   }
 };
+
 
 static bool BlockComparator(const Block* a, const Block* b) {
   if (a->stream != b->stream) {
@@ -363,6 +363,56 @@ struct PrivatePool {
   BlockPool large_blocks;
   BlockPool small_blocks;
 };
+
+
+BlockState constructBlockState(Block * block) {
+  BlockState bs;
+  bs.stream = block->stream;
+  bs.stream_uses = block->stream_uses;
+  bs.size = block->size;
+  bs.ptr = block->ptr;
+  bs.allocated = block->allocated;
+  bs.gc_count = block->gc_count;
+  return bs;
+};
+
+BlockPoolState constructBlockPoolState(BlockPool* block_pool, MempoolId_t pool_id) {
+  BlockPoolState bps;
+  bps.is_small = block_pool->is_small;
+  bps.owner_id = bps.owner_id;
+
+  std::unordered_map<Block*, BlockState*> mappings;
+
+  bps.blocks.reserve(block_pool->blocks.size());
+
+  for (Block* block: block_pool->blocks) {
+    bps.blocks.emplace_back(constructBlockState(block));
+    mappings[block] = &bps.blocks.back();
+
+    if (block->prev && mappings.count(block->prev)) {
+      BlockState* prev = mappings[block->prev];
+      prev->next = &bps.blocks.back();
+      bps.blocks.back().next = prev;
+    }
+
+    if (block->next && mappings.count(block->next)) {
+      BlockState* next = mappings[block->next];
+      next->prev = &bps.blocks.back();
+      bps.blocks.back().prev = next;
+    }
+  }
+
+  return bps;
+}
+
+PrivatePoolState constructPrivatePoolState(PrivatePool* pool, MempoolId_t pool_id) {
+  PrivatePoolState pps;
+  pps.cudaMalloc_count = pool->cudaMalloc_count;
+  pps.large_blocks = constructBlockPoolState(&pool->large_blocks, pool_id);
+  pps.small_blocks = constructBlockPoolState(&pool->small_blocks, pool_id);
+
+  return pps;
+}
 
 struct MempoolIdHash {
   std::size_t operator()(const MempoolId_t& mempool_id) const noexcept {
@@ -1193,10 +1243,107 @@ class DeviceCachingAllocator {
     reset_peak_stat(stats.oversize_segments);
   }
 
+  PrivatePoolState getCheckpointState(MempoolId_t id) {
+    TORCH_CHECK(false);
+    // return get()->getCheckpointState(id);
+  }
+
+  // void checkpointPoolStateFromSnapshot(
+  //     std::vector<SegmentInfo>& segments,
+  //     MempoolId_t id) {
+  //   std::lock_guard<std::recursive_mutex> lock(mutex);
+
+  //   auto pool = graph_pools.find(id);
+  //   TORCH_CHECK(pool != graph_pools.end());
+  //   PrivatePool* private_pool = pool->second.get();
+
+  //   auto get_head_blocks = [](PrivatePool* private_pool) {
+  //     std::vector<Block*> head_blocks;
+  //     auto add_head_blocks = [](std::vector<Block*>& head_blocks,
+  //                               BlockPool& pool) {
+  //       for (Block* block : pool.blocks) {
+  //         if (block->prev == nullptr) {
+  //           head_blocks.push_back(block);
+  //         }
+  //       }
+  //     };
+  //     add_head_blocks(head_blocks, private_pool->small_blocks);
+  //     add_head_blocks(head_blocks, private_pool->large_blocks);
+  //     return head_blocks;
+  //   };
+
+  //   auto head_blocks = get_head_blocks(private_pool);
+  //   // hmm, this isnt qutie right
+  //   for (Block* block : head_blocks) {
+  //     while (block->next) {
+  //       free(block->next);
+  //     }
+  //     free(block);
+  //   }
+
+    // // the way to do that is to
+
+    // // so now that we have all free blocks, we need to make the Segments
+    // (heads) allocated
+    // // according to the input vector
+
+    // // need to be careful
+    // // std::lock_guard<std::recursive_mutex> lock(mutex);
+
+    // std::unordered_map<int64_t, SegmentInfo&> address_to_segment;
+    // address_to_segment.reserve(segments.size());
+    // for (const auto& segment: segments) {
+    //   address_to_segment[segment.address] = segment;
+    // }
+
+    // // TODO - only need to do segments from one pool in practice
+    // auto all_blocks = get_all_blocks();
+    // // TODO - just need to get the blocks from one memory pool
+    // for (Block* head_block : all_blocks) {
+    //   if (head_block->prev != nullptr) {
+    //     continue;
+    //   }
+
+    //   if
+    //   (!address_to_segment.count(reinterpret_cast<int64_t>(head_block->ptr)))
+    //   {
+    //     continue;
+    //   }
+
+    //   Block * allocated_block_in_segment = nullptr;
+    //   auto block = head_block;
+    //   while (!allocated_block_in_segment && block) {
+    //     if (block->allocated) {
+    //       allocated_block_in_segment = block;
+    //     }
+    //     block = block->next;
+    //   }
+
+    //   if (allocated_block_in_segment) {
+    //     while (block->next) {
+    //       // this aquires mutex
+    //       free(block->next);
+    //     }
+
+    //     free(block);
+    //   }
+
+    // }
+  // }
+
   /** Dump a complete snapshot of the memory held by the allocator. Potentially
    * VERY expensive. **/
   std::vector<SegmentInfo> snapshot() {
     std::lock_guard<std::recursive_mutex> lock(mutex);
+
+    std::unordered_map<PrivatePool*, MempoolId_t> pool_to_id;
+    pool_to_id.reserve(graph_pools.size() + graph_pools_freeable.size());
+    for (const auto& pair : graph_pools) {
+      pool_to_id[pair.second.get()] = pair.first;
+    }
+    for (const auto& pair : graph_pools_freeable) {
+      pool_to_id[pair.second] = pair.first;
+    }
 
     size_t total_active = 0;
     std::vector<SegmentInfo> result;
@@ -1211,8 +1358,13 @@ class DeviceCachingAllocator {
       segment_info.address = reinterpret_cast<int64_t>(head_block->ptr);
       segment_info.stream = head_block->stream;
       segment_info.is_large = (!head_block->pool->is_small);
+      auto mempool_id = pool_to_id.find(head_block->pool->owner_PrivatePool);
+      if (mempool_id != pool_to_id.end()) {
+        segment_info.owner_private_pool_id = mempool_id->second;
+      }
 
       const Block* block = head_block;
+
       while (block != nullptr) {
         segment_info.blocks.emplace_back();
         BlockInfo& block_info = segment_info.blocks.back();
@@ -2131,6 +2283,12 @@ class NativeCachingAllocator : public CUDAAllocator {
     }
     return result;
   }
+  
+  void checkpointPoolState(PrivatePoolState& pps) {
+    // device_allocator[device]->checkpointPoolStateFromSnapshot(segments, id);
+    TORCH_CHECK(false);
+  }
+
   DataPtr allocate(size_t size) const override {
     constexpr size_t one_exa_bytes = 1152921504606846976ULL;
     TORCH_CHECK_WITH(

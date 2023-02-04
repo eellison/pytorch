@@ -220,6 +220,32 @@ PyObject* THCPModule_getDefaultStream_wrap(
   END_HANDLE_TH_ERRORS
 }
 
+// yObject* THCPModule_getDefaultStream_wrap(
+//     PyObject* /* unused */,
+//     PyObject* segments,
+//     PyObject* mempool_id, 
+//     PyObject* int) {
+//   HANDLE_TH_ERRORS
+//   THPUtils_assert(
+//       THPUtils_checkLong(device_index), "invalid argument to getDefaultStream");
+//   int64_t device = THPUtils_unpackLong(device_index);
+//   auto stream = at::cuda::getDefaultCUDAStream(device);
+//   PyObject* output_tuple = PyTuple_New(3);
+//   PyTuple_SetItem(
+//       output_tuple, 0, THPUtils_packInt64(static_cast<int64_t>(stream.id())));
+//   PyTuple_SetItem(
+//       output_tuple,
+//       1,
+//       THPUtils_packInt64(static_cast<int64_t>(stream.device_index())));
+//   PyTuple_SetItem(
+//       output_tuple,
+//       2,
+//       THPUtils_packInt64(static_cast<int64_t>(stream.device_type())));
+//   return output_tuple;
+//   END_HANDLE_TH_ERRORS
+// }
+
+
 PyObject* THCPModule_setStream_wrap(
     PyObject* self,
     PyObject* args,
@@ -567,7 +593,8 @@ PyObject* THCPModule_memoryStats(PyObject* _unused, PyObject* arg) {
   result["oversize_allocations"] = statToDict(stats.oversize_allocations);
   result["oversize_segments"] = statToDict(stats.oversize_segments);
 
-  return result.release().ptr();
+  return result.release().ptr();  
+
   END_HANDLE_TH_ERRORS
 }
 
@@ -647,6 +674,7 @@ PyObject* THCPModule_memorySnapshot(PyObject* _unused, PyObject* noargs) {
   py::str active_size_s = "active_size";
   py::str stream_s = "stream";
   py::str segment_type_s = "segment_type";
+  py::str segment_pool_id = "segment_pool_id";
   py::str large_s = "large";
   py::str small_s = "small";
   py::str size_s = "size";
@@ -694,6 +722,7 @@ PyObject* THCPModule_memorySnapshot(PyObject* _unused, PyObject* noargs) {
     // represent the stream rather than a torch.cuda.stream object
     segmentDict[stream_s] = int64_t(segmentInfo.stream);
     segmentDict[segment_type_s] = (segmentInfo.is_large ? large_s : small_s);
+    segmentDict[segment_pool_id] = segmentInfo.owner_private_pool_id;
 
     py::list blocks;
     for (const auto& blockInfo : segmentInfo.blocks) {
@@ -1025,6 +1054,54 @@ static void registerCudaPluggableAllocator(PyObject* module) {
     return torch::cuda::CUDAPluggableAllocator::createCustomAllocator(
         malloc_fn, free_fn);
   });
+
+  m.def("_cuda_checkpointPoolStateFromSnapshot", [](py::list segments, py::tuple mempool_id) {
+    using c10::cuda::CUDACachingAllocator::BlockInfo;
+    using c10::cuda::CUDACachingAllocator::SegmentInfo;
+
+    const auto dictToSegmentInfo = [&](const py::list segment_list) {
+
+      std::vector<SegmentInfo> segments;
+      for (const auto& segment: segment_list) {
+        SegmentInfo info;
+        auto segment_dict = py::cast<py::dict>(segment);
+
+        info.device = py::cast<int64_t>(segment_dict["device"]);
+        info.address = py::cast<int64_t>(segment_dict["address"]);
+        info.total_size =  py::cast<int64_t>(segment_dict["total_size"]);
+        info.allocated_size= py::cast<int64_t>(segment_dict["allocated_size"]);
+        info.active_size= py::cast<int64_t>(segment_dict["active_size"]);
+        info.is_large = py::cast<bool>(segment_dict["is_large"]);
+
+        auto tup = py::cast<py::tuple>(segment_dict["owner_private_pool_id"]);
+        info.owner_private_pool_id = {py::cast<int64_t>(tup[0]), py::cast<int64_t>(tup[1])};
+
+        auto block_list = py::cast<py::list>(segment["blocks"]);
+        std::vector<BlockInfo> blocks;
+
+        for (auto block: block_list) {
+          auto block_dict = py::cast<py::dict>(block);
+          blocks.emplace_back();
+          blocks.back().size = py::cast<int64_t>(block_dict["size"]);
+          blocks.back().gc_counter = py::cast<int64_t>(block_dict["size"]);
+          blocks.back().allocated = py::cast<bool>(block_dict["allocated"]);
+          blocks.back().active = py::cast<bool>(block_dict["active"]);
+          // wont check point history 
+        }
+        info.blocks = std::move(blocks);
+
+        segments.push_back(std::move(info));
+      };
+
+      return segments;
+    };
+
+    auto segments_parsed = dictToSegmentInfo(segments);
+
+    // c10::cuda::CUDACachingAllocator::checkpointPoolStateFromSnapshot(segments_parsed, MempoolId_t id, int device);
+    
+  });
+
 }
 
 static void bindGetDeviceProperties(PyObject* module) {

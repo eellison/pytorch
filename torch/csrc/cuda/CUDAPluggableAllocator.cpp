@@ -230,6 +230,21 @@ std::shared_ptr<void> CUDAPluggableAllocator::getIpcDevPtr(std::string handle) {
       "If you need it, please file an issue describing your use case.");
 }
 
+void CUDAPluggableAllocator::checkpointPoolState(c10::cuda::CUDACachingAllocator::PrivatePoolState& pps) {
+    TORCH_CHECK(
+        false,
+        "CUDAPluggableAllocator does not yet support checkpointPoolStateFromSnapshot. "
+        "If you need it, please file an issue describing your use case.");
+}
+
+
+c10::cuda::CUDACachingAllocator::PrivatePoolState CUDAPluggableAllocator::getCheckpointState(c10::cuda::MempoolId_t id) {
+    TORCH_CHECK(
+    false,
+    "cudaMallocAsync does not yet support getCheckpointState. "
+    "If you need it, please file an issue describing your use case.");
+}
+
 // CUDAGraph interactions
 void CUDAPluggableAllocator::notifyCaptureBegin(
     int device,

@@ -773,6 +773,11 @@ class FakeTensorMode(TorchDispatchMode):
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
         kwargs = kwargs if kwargs else {}
 
+        # print(func)
+        # if func == aten._local_scalar_dense.default:
+        #     tmp = torch.tensor(1)
+        #     args[0].constant = tmp
+
         if func == torch.ops.prim.device.default:
             assert len(args) == 1 and isinstance(args[0], FakeTensor)
             if args[0].fake_mode.in_kernel_invocation:
@@ -803,7 +808,9 @@ class FakeTensorMode(TorchDispatchMode):
         # If this is a lift, the input tensor is guaranteed to be a
         # constant, so we keep a copy of the original argument along so
         # we can query it if we're asked to item() it at some later point
-        if func in self.lift_fns:
+        if func in self.lift_fns or (torch._C._should_allow_numbers_as_tensors(
+                func.name().split("::")[-1].split(".")[0]
+            ) and not has_symbolic_sizes and not flat_arg_fake_tensors):
             out = func(*args, **kwargs)
             if self.may_turn_const(out):
                 # NB: not in_kernel_invocation_manager because we're doing real
