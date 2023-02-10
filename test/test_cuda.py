@@ -1,7 +1,7 @@
 # Owner(s): ["module: cuda"]
 
 from itertools import repeat, chain, product
-from typing import NamedTuple
+from typing import NamedTuple, Literal, List, Any
 import collections
 import contextlib
 from copy import deepcopy
@@ -17,6 +17,7 @@ import threading
 import unittest
 import warnings
 import subprocess
+import dataclasses
 from random import randint
 
 import torch
@@ -5050,6 +5051,156 @@ class TestCudaComm(TestCase):
         with self.assertRaises(torch.cuda.OutOfMemoryError):
             torch.empty(1024 * 1024 * 1024 * 1024, device='cuda')
         self.assertTrue(x)
+
+
+MIN_BLOCK_SIZE = 512
+SMALL_SIZE = 1048576
+SMALL_BUFFER = 2097152
+LARGE_BUFFER = 20971520
+MIN_LARGE_ALLOC = 10485760
+ROUND_LARGE = 2097152
+ROUND_UP_POWER_OF_TWO_INTERVALS = 16
+
+@dataclasses.dataclass
+class Block(object):
+    size: int
+    state: Any
+    history: Any
+
+@dataclasses.dataclass
+class Segment(object):
+    device: int
+    address: int
+    total_size: int
+    allocated_size: int
+    active_size: int
+    stream: int
+    segment_type: Literal["large", "small"]
+    blocks: List[Block]
+
+def get_cudagraph_segments():
+    print("Calling snapshot")
+    segments = torch.cuda.memory_snapshot()
+    return [segment for segment in segments if segment["segment_pool_id"] != (0, 0)]
+
+def count_block_allocations(segments):
+    active_blocks = 0
+    nonactive_blocks = 0
+    all_blocks = [block for segment in segments for block in segment["blocks"]]
+    for block in all_blocks:
+        active_blocks += block["allocated"]
+        nonactive_blocks += not block["allocated"]
+
+    return active_blocks, nonactive_blocks
+
+class TestBlockStateAbsorbtion(TestCase):
+
+    def check_checkpointed_block(self, before_block, after_block):
+        for field in ("size", "allocated", "state"):
+            self.assertEqual(before_block[field], after_block[field])
+
+    def check_checkpointed_state(self, before_segments, after_segments):
+        # after may contain additional segments, but all of the segments in before
+        # should exactly equivalent to after
+        after_ptr_to_segment = {segment["address"] : segment for segment in after_segments}
+
+        for before_segment in before_segments:
+            self.assertTrue(before_segment["address"] in after_ptr_to_segment)
+            after_segment = after_ptr_to_segment[before_segment["address"]]
+
+            for field in ("device", "total_size", "allocated_size", "active_size", "segment_type", "segment_pool_id"):
+                self.assertEqual(before_segment[field], after_segment[field])
+
+            self.assertEqual(len(before_segment["blocks"]), len(after_segment["blocks"]))
+            for before_block, after_block in zip(before_segment["blocks"], after_segment["blocks"]):
+                self.check_checkpointed_block(before_block, after_block)
+
+    def test_simple(self):
+        # test small buffer is split
+        import torch._inductor
+        import torch._inductor.config
+        import torch._dynamo
+        torch._inductor.config.triton.cudagraphs = True
+
+        def int8_cuda(size):
+            return torch.empty([size], device="cuda", dtype=torch.uint8)
+
+        @torch._dynamo.optimize("inductor")
+        def foo():
+            x = torch.zeros([SMALL_SIZE * 8], device="cuda", dtype=torch.uint8)
+            x = x + x
+            x1 = int8_cuda(SMALL_SIZE) + int8_cuda(SMALL_SIZE) + int8_cuda(SMALL_SIZE)
+            y = torch.zeros([SMALL_SIZE], device="cuda", dtype=torch.uint8) + x1
+            z = torch.zeros([SMALL_SIZE], device="cuda", dtype=torch.uint8)
+            return x, y, z
+
+        out = foo()
+
+        snapshot = torch.cuda.memory._snapshot()
+        segments = snapshot["segments"]
+
+        cudagraph_segments = [segment for segment in segments if segment["segment_pool_id"] != (0, 0)]
+
+        # small allocations are packed in 2 MiB blocks
+        # y allocation should reuse x buffer, and y is buffered up to kLargeBuffer
+        multi_cudagraph_segments = [segment for segment in cudagraph_segments if len(segment["blocks"]) > 1]
+
+        assert len(cudagraph_segments) != 0
+
+        device = cudagraph_segments[0]["device"]
+        pool_id = cudagraph_segments[0]["segment_pool_id"]
+
+        assert all(segment["segment_pool_id"] == pool_id for segment in cudagraph_segments)
+
+        block_ptrs = [cudagraph_segment["address"] for cudagraph_segment in cudagraph_segments]
+
+        print(block_ptrs)
+        print([hex(ptr) for ptr in block_ptrs])
+        active_blocks, nonactive_blocks = count_block_allocations(get_cudagraph_segments())
+        print(f"Active blocks {active_blocks}, Non active Blocks: {nonactive_blocks}")
+
+        stats = torch.cuda.memory_stats(device)
+
+        state = torch._C._cuda_getCheckpointState(device, pool_id)
+        torch._C._cuda_setCheckpointState(device, state)
+
+
+        self.check_checkpointed_state(cudagraph_segments, get_cudagraph_segments())
+
+        active_blocks, nonactive_blocks = count_block_allocations(get_cudagraph_segments())
+        print(f"Active blocks {active_blocks}, Non active Blocks: {nonactive_blocks}")
+
+    def test_resnet(self):
+        # test small buffer is split
+        import torch._inductor
+        import torch._inductor.config
+        import torch._dynamo
+        torch._inductor.config.triton.cudagraphs = True
+
+        @torch._dynamo.optimize("inductor")
+        def foo(m, inp):
+            return m(inp)
+
+        import torchvision
+
+        m = torchvision.models.resnet50()
+        m.eval()
+        m = m.cuda()
+
+        inp = torch.rand([1, 3, 255, 255], device="cuda")
+        out = foo(m, inp)
+
+
+        before = get_cudagraph_segments()
+
+        assert len(before) != 0
+        device = before[0]["device"]
+        pool_id = before[0]["segment_pool_id"]
+
+        state = torch._C._cuda_getCheckpointState(device, pool_id)
+        torch._C._cuda_setCheckpointState(device, state)
+
+        self.check_checkpointed_state(before, get_cudagraph_segments())
 
 
 instantiate_parametrized_tests(TestCuda)
