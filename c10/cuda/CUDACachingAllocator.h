@@ -1,6 +1,7 @@
 #pragma once
 
 #include <c10/core/Allocator.h>
+#include <c10/core/StorageImpl.h>
 #include <c10/cuda/CUDAGraphsC10Utils.h>
 #include <c10/cuda/CUDAMacros.h>
 #include <c10/cuda/CUDAStream.h>
@@ -250,7 +251,15 @@ class CUDAAllocator : public Allocator {
   virtual void attachOutOfMemoryObserver(OutOfMemoryObserver observer) = 0;
   virtual bool needsPoolSpecificPeerAccess() = 0;
   virtual PrivatePoolState getCheckpointState(int device, MempoolId_t id) = 0;
-  virtual void setCheckpointPoolState(int device, PrivatePoolState& pps) = 0;
+  virtual void setCheckpointPoolState(
+      int device,
+      PrivatePoolState& pps,
+      std::vector<c10::StorageImpl*> stale_live_tensors) {
+    TORCH_CHECK(
+        false,
+        name(),
+        " does not implement setCheckpointPoolState. Please file an issue");
+  }
   virtual std::string name() = 0;
 };
 
@@ -322,8 +331,11 @@ inline PrivatePoolState getCheckpointState(int device, MempoolId_t id) {
   return get()->getCheckpointState(device, id);
 }
 
-inline void setCheckpointPoolState(int device, PrivatePoolState& pps) {
-  return get()->setCheckpointPoolState(device, pps);
+inline void setCheckpointPoolState(
+    int device,
+    PrivatePoolState& pps,
+    std::vector<c10::StorageImpl*> stale_live_storages) {
+  return get()->setCheckpointPoolState(device, pps, stale_live_storages);
 }
 
 // CUDAGraph interactions

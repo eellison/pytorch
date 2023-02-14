@@ -291,15 +291,6 @@ c10::cuda::CUDACachingAllocator::PrivatePoolState CUDAPluggableAllocator::
       "If you need it, please file an issue describing your use case.");
 }
 
-void CUDAPluggableAllocator::setCheckpointPoolState(
-    int device,
-    c10::cuda::CUDACachingAllocator::PrivatePoolState& pps) {
-  TORCH_CHECK(
-      false,
-      "CUDAPluggableAllocator does not yet support setCheckpointPoolState. "
-      "If you need it, please file an issue describing your use case.");
-}
-
 bool CUDAPluggableAllocator::needsPoolSpecificPeerAccess() {
   return false;
 }

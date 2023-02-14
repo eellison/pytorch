@@ -11,9 +11,11 @@
 #include <ATen/cuda/Sleep.h>
 #include <ATen/cuda/detail/CUDAHooks.h>
 #include <ATen/cuda/jiterator.h>
+#include <c10/core/StorageImpl.h>
 #include <c10/cuda/CUDACachingAllocator.h>
 #include <c10/cuda/CUDAFunctions.h>
 #include <ATen/cuda/CUDAGraphsUtils.cuh>
+
 #ifdef USE_NCCL
 #include <torch/csrc/cuda/python_nccl.h>
 #endif
@@ -1046,9 +1048,17 @@ static void registerCudaPluggableAllocator(PyObject* module) {
 
   m.def(
       "_cuda_setCheckpointState",
-      [](int device, c10::cuda::CUDACachingAllocator::PrivatePoolState& pps) {
+      [](int device,
+         c10::cuda::CUDACachingAllocator::PrivatePoolState& pps,
+         std::vector<at::Tensor> stale_tensors) {
+        // TODO - is there a way to pass in a vector of StorageImpl* in pybind?
+        std::vector<c10::StorageImpl*> ptrs;
+        for (auto ten : stale_tensors) {
+          ptrs.push_back(ten.storage().unsafeGetStorageImpl());
+          // ptrs.push_back(ten.storage().unsafeGetStorageImpl());
+        }
         return c10::cuda::CUDACachingAllocator::setCheckpointPoolState(
-            device, pps);
+            device, pps, ptrs);
       });
 }
 

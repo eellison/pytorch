@@ -20,6 +20,7 @@
 #include <mutex>
 #include <regex>
 #include <set>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -376,7 +377,7 @@ BlockPoolState constructBlockPoolState(
     const std::vector<Block*>& private_pool_blocks) {
   BlockPoolState bps;
   bps.is_small = block_pool->is_small;
-  bps.owner_id = bps.owner_id;
+  bps.owner_id = pool_id;
 
   for (Block* block : private_pool_blocks) {
     // private pool blocks include both large & small pool blocks - need to
@@ -440,7 +441,8 @@ cudaError_t cudaMallocMaybeCapturing(void** p, size_t size) {
   if (at::cuda::currentStreamCaptureStatusMayInitCtx() ==
       at::cuda::CaptureStatus::None) {
 #endif
-    return C10_CUDA_ERROR_HANDLED(cudaMalloc(p, size));
+    auto tmp = C10_CUDA_ERROR_HANDLED(cudaMalloc(p, size));
+    return tmp;
 #if defined(CUDA_VERSION) && CUDA_VERSION >= 11000
   } else {
     // It's ok to capture cudaMallocs, as long as we never cudaFree those
@@ -448,7 +450,8 @@ cudaError_t cudaMallocMaybeCapturing(void** p, size_t size) {
     // Capturing cudaMalloc behaves nicely: it gives the graph new VA,
     // but is ignored (won't leakily allocate new memory) in replays.
     at::cuda::CUDAStreamCaptureModeGuard g{cudaStreamCaptureModeRelaxed};
-    return C10_CUDA_ERROR_HANDLED(cudaMalloc(p, size));
+    auto tmp = C10_CUDA_ERROR_HANDLED(cudaMalloc(p, size));
+    return tmp;
   }
 #endif
 }
@@ -766,6 +769,10 @@ void CachingAllocatorConfig::parseArgs(const char* env) {
         "roundup_power2_divisions, and garbage_collect_threshold.");
   }
 }
+
+void no_op_delete(void* ptr){
+  std::cout << "\nCalling no op delete " << ptr << "\n";
+};
 
 namespace Native {
 
@@ -1450,7 +1457,9 @@ class DeviceCachingAllocator {
    *                                      |
    *                                      ╰ ---------------> D
    */
-  void setCheckpointPoolState(PrivatePoolState& pps) {
+  void setCheckpointPoolState(
+      PrivatePoolState& pps,
+      std::vector<c10::StorageImpl*> stale_live_storages) {
     // To reset the caching allocator state we will
     // - Free all the blocks currently allocated to the pool (see [live tensors
     // between iterations])
@@ -1469,15 +1478,68 @@ class DeviceCachingAllocator {
 
     // TODO - lock_guard vs unique_guard ??
     std::lock_guard<std::recursive_mutex> lock(mutex);
+    auto id = pps.small_blocks.owner_id;
 
     TORCH_CHECK(
-        !graph_pools_freeable.count(pps.small_blocks.owner_id),
+        !graph_pools_freeable.count(id),
         "Not expected to checkpoint freeable graph");
 
-    auto pool = graph_pools.find(pps.small_blocks.owner_id);
-    TORCH_CHECK(pool != graph_pools.end(), "Could not find private pool id");
+    auto pool = graph_pools.find(id);
+    TORCH_CHECK(
+        pool != graph_pools.end(),
+        "Could not find private pool id",
+        id.first,
+        ", ",
+        id.second);
 
     PrivatePool* private_pool = pool->second.get();
+
+    // the live tensors which we wish to overwrite will still call
+    // free when they deallocate.
+    std::unordered_set<void*> allocated_current_pointers;
+    for (Block* b : active_blocks) {
+      if (b->pool == &private_pool->small_blocks ||
+          b->pool == &private_pool->large_blocks) {
+        allocated_current_pointers.insert(b->ptr);
+      }
+    }
+
+    auto erase_allocd_ptrs = [&](BlockPoolState* pool) {
+      for (const auto& b : pool->blocks) {
+        if (b->allocated) {
+          allocated_current_pointers.erase(b->ptr);
+        }
+      }
+    };
+
+    erase_allocd_ptrs(&pps.small_blocks);
+    erase_allocd_ptrs(&pps.large_blocks);
+
+    std::unordered_set<void*> storage_ptrs;
+
+    for (c10::StorageImpl* stale_storage : stale_live_storages) {
+      auto ptr = stale_storage->data_ptr().get();
+
+      if (storage_ptrs.count(ptr)) {
+        continue;
+      }
+
+      auto allocated_pointer =
+          allocated_current_pointers.find(stale_storage->data_ptr().get());
+      TORCH_CHECK(allocated_pointer != allocated_current_pointers.end());
+      {
+        bool succeeded = stale_storage->data_ptr().compare_exchange_deleter(
+            &local_raw_delete, &no_op_delete);
+        TORCH_CHECK(succeeded);
+      }
+      storage_ptrs.insert(ptr);
+      allocated_current_pointers.erase(ptr);
+    }
+
+    TORCH_CHECK(
+        allocated_current_pointers.empty(),
+        "Any stale tensors which are being manually freed"
+        " must be passed to set checkpoint");
 
     freeBlocksAllocatedToPool(private_pool);
 
@@ -1510,6 +1572,11 @@ class DeviceCachingAllocator {
     checkpoint_pool(pps.large_blocks, private_pool->large_blocks);
 
     private_pool->cudaMalloc_count = pps.cudaMalloc_count;
+  }
+
+  void forcePrivatePoolFree(MempoolId_t id, void* ptr) {
+    std::cout << " being called ";
+    local_raw_delete(ptr);
   }
 
   /** Dump a complete snapshot of the memory held by the allocator. Potentially
@@ -2142,11 +2209,13 @@ class DeviceCachingAllocator {
   }
 
   void release_block(Block* block) {
+    std::cout << "CUDA FREE " << (void*)block->ptr << " \n";
     C10_CUDA_CHECK(cudaFree((void*)block->ptr));
     total_allocated_memory -= block->size;
 
     auto* pool = block->pool;
     if (pool->owner_PrivatePool) {
+      std::cout << " Releasing " << pool << " malloc count " << pool->owner_PrivatePool->cudaMalloc_count << " \n";
       // The cudaFreed block belonged to a CUDA graph's PrivatePool.
       TORCH_INTERNAL_ASSERT(pool->owner_PrivatePool->cudaMalloc_count > 0);
       pool->owner_PrivatePool->cudaMalloc_count--;
@@ -2338,6 +2407,7 @@ static void uncached_delete(void* ptr) {
   if (C10_UNLIKELY(interp)) {
     (*interp)->trace_gpu_memory_deallocation(reinterpret_cast<uintptr_t>(ptr));
   }
+  std::cout << "\nFree " << ptr << "\n";
   C10_CUDA_CHECK(cudaFree(ptr));
 }
 
@@ -2398,6 +2468,7 @@ class NativeCachingAllocator : public CUDAAllocator {
         device,
         ": did you call init?");
     Block* block = device_allocator[device]->malloc(device, size, stream);
+    std::cout << " Malloc " << block->ptr << " size " << size << " \n";
     add_allocated_block(block);
     *devPtr = (void*)block->ptr;
     const c10::impl::PyInterpreter* interp = c10::impl::GPUTrace::get_trace();
@@ -2511,8 +2582,15 @@ class NativeCachingAllocator : public CUDAAllocator {
     return device_allocator[device]->getCheckpointState(id);
   }
 
-  void setCheckpointPoolState(int device, PrivatePoolState& pps) override {
-    device_allocator[device]->setCheckpointPoolState(pps);
+  void setCheckpointPoolState(
+      int device,
+      PrivatePoolState& pps,
+      std::vector<c10::StorageImpl*> stale_live_storages) {
+    device_allocator[device]->setCheckpointPoolState(pps, stale_live_storages);
+  }
+
+  void forcePrivatePoolFree(int device, MempoolId_t id, void* ptr) {
+    device_allocator[device]->forcePrivatePoolFree(id, ptr);
   }
 
   DataPtr allocate(size_t size) const override {
