@@ -5,6 +5,7 @@
 #include <c10/cuda/CUDAMacros.h>
 #include <c10/cuda/CUDAStream.h>
 #include <c10/util/Registry.h>
+#include <c10/util/flat_hash_map.h>
 
 #include <array>
 #include <mutex>
@@ -100,6 +101,8 @@ struct Context {
   virtual ~Context() = default;
 };
 
+using stream_set = ska::flat_hash_set<cuda::CUDAStream>;
+
 typedef std::shared_ptr<Context> (*CreateContextFn)(void);
 
 struct History {
@@ -129,7 +132,41 @@ struct SegmentInfo {
   int64_t active_size = 0;
   cudaStream_t stream = 0;
   bool is_large = false;
+  MempoolId_t owner_private_pool_id = {0, 0};
   std::vector<BlockInfo> blocks;
+};
+
+// BlockState, BlockPoolState, and PrivatePoolState contain the information
+// needed to reconstruct a private pool to a previous state. See note
+// [Checkpointing PrivatePoolState]. The serialized information tends to reflect
+// the objects that are being reconstructed instead of attempting to minimize
+// redundantly serialized information.
+struct BlockState {
+  int device = 0;
+  cudaStream_t stream = 0;
+  stream_set stream_uses = {};
+  size_t size = 0;
+  void* ptr = nullptr;
+  bool allocated = false;
+  int gc_count = 0;
+  // maintain invariant that event_count == 0 ;
+  BlockState* prev = nullptr;
+  BlockState* next = nullptr;
+  // history will be left alone in checkpoint
+};
+
+struct BlockPoolState {
+  std::vector<std::shared_ptr<BlockState>> blocks;
+  bool is_small = false;
+  MempoolId_t owner_id = {0, 0};
+};
+
+struct PrivatePoolState {
+  // omitting use_count
+  int cudaMalloc_count = 0;
+
+  BlockPoolState large_blocks;
+  BlockPoolState small_blocks;
 };
 
 struct TraceEntry {
@@ -212,6 +249,8 @@ class CUDAAllocator : public Allocator {
       bool alloc_trace_record_context) = 0;
   virtual void attachOutOfMemoryObserver(OutOfMemoryObserver observer) = 0;
   virtual bool needsPoolSpecificPeerAccess() = 0;
+  virtual PrivatePoolState getCheckpointState(int device, MempoolId_t id) = 0;
+  virtual void setCheckpointPoolState(int device, PrivatePoolState& pps) = 0;
   virtual std::string name() = 0;
 };
 
@@ -277,6 +316,14 @@ inline void resetPeakStats(int device) {
 
 inline SnapshotInfo snapshot() {
   return get()->snapshot();
+}
+
+inline PrivatePoolState getCheckpointState(int device, MempoolId_t id) {
+  return get()->getCheckpointState(device, id);
+}
+
+inline void setCheckpointPoolState(int device, PrivatePoolState& pps) {
+  return get()->setCheckpointPoolState(device, pps);
 }
 
 // CUDAGraph interactions
