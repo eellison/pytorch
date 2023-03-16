@@ -333,7 +333,7 @@ class ValueRangeAnalysis:
 
     @staticmethod
     def exp(x):
-        return ValueRanges.increasing_map(x, sympy.functions.elementary.exponential.exp)
+        return ValueRangeAnalysis.pow(sympy.E, x)
 
     @staticmethod
     def log(x):
