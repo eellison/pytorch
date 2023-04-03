@@ -126,6 +126,7 @@ class BaseSchedulerNode:
         self.prune_deps()
 
     def used_buffer_names(self) -> Set[str]:
+        # breakpoint()
         return {
             dep.name
             for dep in itertools.chain(self.read_writes.reads, self.read_writes.writes)
@@ -230,14 +231,29 @@ class BaseSchedulerNode:
                 input_node: BaseSchedulerNode = self.scheduler.name_to_node.get(
                     read.name
                 )
-                if input_node and V.graph.wrapper_code.can_reuse(input_node):
+                # if not input_node and read.name in V.graph.donated_input_buffers:
+                #     input_node = V.graph.graph_inputs[read.name]
+
+                # if read.name in V.graph.donated_input_buffers:
+                #     breakpoint()
+                # if V.graph.donated_input_buffers:
+                #     breakpoint()
+                inplace_input_buffer = (
+                    read.name in V.graph.donated_input_buffers and 
+                    read.name in self.last_usage and 
+                    buffer_reuse_key(V.graph.graph_inputs[read.name]) == buffer_reuse_key(self.node)
+                    and V.graph.wrapper_code.can_reuse(V.graph.graph_inputs[read.name])
+                )
+                if inplace_input_buffer:
+                    input_node = V.graph.graph_inputs[read.name]
+                elif input_node and V.graph.wrapper_code.can_reuse(input_node):
                     remaining_uses = [
                         x
                         for x in input_node.users
                         if x.node.get_name()
                         not in self.scheduler.available_buffer_names
                     ]
-                    if (
+                    if not (
                         len(remaining_uses) == 1
                         and remaining_uses[0].can_inplace
                         and remaining_uses[0].node is self
@@ -252,24 +268,38 @@ class BaseSchedulerNode:
                         and buffer_reuse_key(input_node.node)
                         == buffer_reuse_key(self.node)
                     ):
-                        V.graph.wrapper_code.codegen_inplace_reuse(
-                            input_node.node, self.node
-                        )
-                        # hacky check for if V.kernel is a real kernel or NullHandler
-                        if hasattr(V.kernel, "args"):
-                            # if there isn't a triton kernel, then we don't need to call triton-specific things.
-                            # but TODO this might be a convenient place to signal to the Collective kernels to inplace
-                            # (and, can we make "kernel" less generic of a name?)
-                            V.kernel.args.make_inplace(
-                                input_node.get_name(), self.get_name()
-                            )
-                            # mutations not tracked in cpp kernels
-                            if isinstance(
-                                V.kernel, torch._inductor.codegen.triton.TritonKernel
-                            ):
-                                V.kernel.mutations.add(input_node.get_name())
-                                V.kernel.mutations.add(self.get_name())
-                        return
+                        continue
+                else:
+                    continue
+    
+                # breakpoint()
+                if inplace_input_buffer:
+                    # breakpoint()
+                    # pass
+                    V.graph.wrapper_code.codegen_input_inplace_reuse(
+                        input_node, self.node
+                    )
+                else:
+                # if input_node.node.name in V.graph.donated_input_buffers:
+                #     print(f"Donating {input_node.node.name}")
+                    V.graph.wrapper_code.codegen_inplace_reuse(
+                        input_node.node, self.node
+                    )
+                # hacky check for if V.kernel is a real kernel or NullHandler
+                if hasattr(V.kernel, "args"):
+                    # if there isn't a triton kernel, then we don't need to call triton-specific things.
+                    # but TODO this might be a convenient place to signal to the Collective kernels to inplace
+                    # (and, can we make "kernel" less generic of a name?)
+                    V.kernel.args.make_inplace(
+                        input_node.get_name(), self.get_name()
+                    )
+                    # mutations not tracked in cpp kernels
+                    if isinstance(
+                        V.kernel, torch._inductor.codegen.triton.TritonKernel
+                    ):
+                        V.kernel.mutations.add(input_node.get_name())
+                        V.kernel.mutations.add(self.get_name())
+                return
         V.graph.wrapper_code.codegen_allocation(self.node)
 
     def can_free(self):
@@ -328,7 +358,11 @@ class ExternKernelSchedulerNode(BaseSchedulerNode):
         if self.get_aliases() or self.is_template():
             return False
 
-        if read_dep.name not in self.scheduler.name_to_node:
+
+        # if V.graph.donated_input_buffers:
+        #     return True
+
+        if read_dep.name not in self.scheduler.name_to_node:# and read_dep.name not in V.graph.donated_input_buffers:
             # don't allow reuse of an 'input' buffer, we don't own it
             # (would this have been fixed if I tracked mutations properly above?)
             return False
@@ -339,7 +373,9 @@ class ExternKernelSchedulerNode(BaseSchedulerNode):
 
         if len(self.read_writes.writes) == 1:
             write_dep = next(iter(self.read_writes.writes))
-            return read_dep.numbytes_hint() == write_dep.numbytes_hint()
+            out = read_dep.numbytes_hint() == write_dep.numbytes_hint()
+            if out and read_dep.name in self.scheduler.name_to_node:
+                print("Inducing extra inplace\n")
 
         return False
 
@@ -1073,10 +1109,14 @@ class Scheduler:
         """
 
         future_used_buffers = set()
+        # breakpoint()
+        # if V.graph.donated_input_buffers:
+        #     breakpoint()
         for node_name in V.graph.get_output_names():
             future_used_buffers.add(node_name)
 
         for node in reversed(self.nodes):
+            # breakpoint
             used_buffers = node.used_buffer_names()
             used_buffers = {self.mutation_real_name.get(k, k) for k in used_buffers}
             node.last_usage = used_buffers - future_used_buffers
@@ -1184,6 +1224,8 @@ class Scheduler:
     @dynamo_timed
     def codegen(self):
         for node in self.nodes:
+            # if V.graph.donated_input_buffers:
+            #     breakpoint()
             self.enter_context(node)
             self.buffer_names_no_longer_needed.update(node.last_usage)
 

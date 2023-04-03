@@ -140,6 +140,7 @@ class ReuseLine(MemoryPlanningLine):
         return self
 
     def codegen(self, code: IndentedBuffer):
+        breakpoint()
         assert self.node.get_name() not in V.graph.removed_buffers
         assert self.reused_as.get_name() not in V.graph.removed_buffers
         code.writeline(
@@ -580,10 +581,12 @@ class WrapperCodeGen(CodeGen):
     def make_buffer_reuse(self, old, new):
         assert old.get_dtype() == new.get_dtype()
         del_line = ""
-        if old.get_name() not in V.graph.get_output_names():
+        if old.get_name() not in V.graph.get_output_names() and old.get_name() not in V.graph.graph_inputs:
             del_line = f"; {self.make_buffer_free(old)}"
         if old.get_size() == new.get_size() and old.get_stride() == new.get_stride():
             return f"{self.declare}{new.get_name()} = {old.get_name()}{del_line}  {self.comment} reuse"
+
+        breakpoint()
 
         return (
             f"{self.declare}{new.get_name()} = {self.namespace}as_strided({old.get_name()}, "
@@ -646,7 +649,7 @@ class WrapperCodeGen(CodeGen):
         name = buffer.get_name()
         if (
             name in V.graph.removed_buffers
-            or name in V.graph.graph_inputs
+            or (name in V.graph.graph_inputs and name not in V.graph.donated_input_buffers)
             or name in V.graph.constants
             or name in self.freed
         ):
@@ -669,6 +672,9 @@ class WrapperCodeGen(CodeGen):
         self.reuses[output_buffer.get_name()] = input_buffer.get_name()
         self.writeline(ReuseLine(self, input_buffer, output_buffer))
 
+    def codegen_input_inplace_reuse(self, input_buffer, output_buffer):
+        self.reuses[output_buffer.get_name()] = input_buffer.get_name()
+        self.writeline(ReuseLine(self, input_buffer, output_buffer))
 
 class CppWrapperCodeGen(WrapperCodeGen):
     """

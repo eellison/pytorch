@@ -43,6 +43,7 @@ from .utils import (
     sympy_product,
     sympy_subs,
     sympy_symbol,
+    get_dtype_size,
 )
 from .virtualized import ops, V
 
@@ -1930,6 +1931,9 @@ class Buffer(IRNode):
 
     def get_storage_numel(self):
         return self.get_numel()
+
+    def get_bytes_hint(self):
+        return V.graph.sizevars.size_hint(self.get_storage_numel() * get_dtype_size(self.get_dtype()))
 
     def is_extern(self):
         return False

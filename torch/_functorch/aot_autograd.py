@@ -2498,7 +2498,7 @@ def aot_dispatch_autograd(flat_fn, flat_args: List[Any], aot_config: AOTConfig, 
                         context = disable_autocast_manager if disable_amp else nullcontext
                         with context(), track_graph_compiling(aot_config, "backward"):
                             CompiledFunction.compiled_bw = aot_config.bw_compiler(
-                                bw_module, all_args
+                                bw_module, all_args, range(len(ctx.symints), len(ctx.symints) + len(ctx.saved_tensors))
                             )
 
                 ctx.maybe_clear_saved_tensors()

@@ -4,7 +4,7 @@ import os
 import re
 import sys
 import time
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Sequence
 
 import sympy
 
@@ -120,6 +120,7 @@ class GraphLowering(torch.fx.Interpreter):
         num_static_inputs=None,
         graph_id=None,
         aot_mode=False,
+        saved_tensor_idxs=Optional[Sequence[int]],
     ):
         super().__init__(gm)
         self.extra_traceback = False  # we do our own error wrapping
@@ -144,6 +145,8 @@ class GraphLowering(torch.fx.Interpreter):
         self.num_static_inputs = num_static_inputs
         self.mutated_inputs: Set[str] = set()
         self.unaligned_buffers: Set[str] = set()
+        saved_tensor_idxs = [0]
+        self.donated_input_buffers : Set[str] = set() if not saved_tensor_idxs else self.get_donated_input_buffers(saved_tensor_idxs, gm.graph)
         self.randomness_offset = sympy.Integer(0)
         self.randomness_seeds: List[str] = []
         self.name_to_buffer: Dict[str, ir.ComputedBuffer] = {}
@@ -163,6 +166,15 @@ class GraphLowering(torch.fx.Interpreter):
     def add_device_idx(self, idx: Optional[int]):
         if idx is not None:
             self.device_idxs.add(idx)
+
+    def get_donated_input_buffers(self, saved_tensor_idxs: Sequence[int], graph: torch.fx.Graph):
+        donated_input_buffers = set()
+        for i, node in enumerate(graph.nodes):
+            if node.op != "placeholder":
+                break
+            if i in saved_tensor_idxs or i == 0:
+                donated_input_buffers.add(node.target)
+        return donated_input_buffers
 
     @property
     def fake_mode(self):
@@ -620,9 +632,7 @@ class GraphLowering(torch.fx.Interpreter):
                 else:
                     continue
 
-                node_bytes += V.graph.sizevars.size_hint(
-                    sympy_product(buf.get_size())
-                ) * get_dtype_size(buf.get_dtype())
+                node_bytes += buf.get_bytes_hint()
             return node_bytes
 
         total_bytes = 0

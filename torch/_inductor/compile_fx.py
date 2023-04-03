@@ -18,6 +18,7 @@ from torch._dynamo.utils import fake_mode_from_tensors
 from torch._functorch.aot_autograd import make_boxed_func
 from torch._ops import OpOverload
 from torch._subclasses.fake_tensor import FakeTensor
+from typing import Sequence
 from torch.fx.passes.fake_tensor_prop import FakeTensorProp
 
 from .._dynamo.backends.common import aot_autograd
@@ -141,6 +142,7 @@ def compile_fx_inner(
     graph_id=None,
     aot_mode=False,
     is_inference=False,
+    saved_tensor_idxs: Optional[Sequence[int]] = None,
 ):
     if is_tf32_warning_applicable(gm):
         _warn_tf32_disabled()
@@ -188,6 +190,7 @@ def compile_fx_inner(
             num_static_inputs=num_fixed,
             graph_id=graph_id,
             aot_mode=aot_mode,
+            saved_tensor_idxs=saved_tensor_idxs,
         )
         with V.set_graph_handler(graph):
             graph.run(*example_inputs)
@@ -557,7 +560,7 @@ def compile_fx(
     dynamic_shapes = dynamo_config.dynamic_shapes
 
     @dynamo_utils.dynamo_timed
-    def bw_compiler(model: torch.fx.GraphModule, example_inputs):
+    def bw_compiler(model: torch.fx.GraphModule, example_inputs, saved_tensor_idxs):
         with dynamo_config.patch(dynamic_shapes=dynamic_shapes):
             fixed = count_tangents(model)
             return inner_compile(
@@ -567,6 +570,7 @@ def compile_fx(
                 cudagraphs=cudagraphs,
                 is_backward=True,
                 graph_id=graph_id,
+                saved_tensor_idxs=saved_tensor_idxs,
             )
 
     with overrides.patch_functions():

@@ -690,6 +690,7 @@ def speedup_experiment(args, model_iter_fn, model, example_inputs, **kwargs):
         ]
         row.append(kwargs["compilation_latency"])
         row.append(kwargs["compression_ratio"])
+        print(kwargs["eager_peak_mem"], kwargs["dynamo_peak_mem"])
         row.append(kwargs["eager_peak_mem"])
         row.append(kwargs["dynamo_peak_mem"])
     if "dynamo_stats" in kwargs:
@@ -1430,11 +1431,11 @@ class BenchmarkRunner:
             compression_ratio = (
                 eager_peak_mem / dynamo_peak_mem if dynamo_peak_mem else 0.0
             )
-            # print(
-            #     f"memory: eager: {eager_peak_mem:.2f} GB, "
-            #     f"dynamo: {dynamo_peak_mem:.2f} GB, "
-            #     f"ratio: {compression_ratio:.2f}"
-            # )
+            print(
+                f"memory: eager: {eager_peak_mem:.2f} GB, "
+                f"dynamo: {dynamo_peak_mem:.2f} GB, "
+                f"ratio: {compression_ratio:.2f}"
+            )
 
             if experiment.func is speedup_experiment:
                 experiment_kwargs["compilation_latency"] = compilation_time
