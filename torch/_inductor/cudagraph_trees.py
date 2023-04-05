@@ -316,8 +316,7 @@ def cudagraphify(
 def is_live(weak_ref):
     if weak_ref is None:
         return False
-    return weak_ref() is not None
-
+    return weak_ref.is_live()
 
 class StorageWeakRefWrapper:
     """
@@ -348,6 +347,9 @@ class StorageWeakRefWrapper:
 
         return self.ref.cdata
 
+    def is_live(self) -> bool:
+        return self() is not None
+
     def data_ptr(self) -> int:
         "NB: returns the data ptr even if the storage has expired"
         return self._data_ptr
@@ -358,6 +360,34 @@ class StorageWeakRefWrapper:
         else:
             return f"StorageWeakRefWrapper to {self.data_ptr()}; alive"
 
+
+class SparseStorageWeakRefWrapper:
+    indices_storage_ref: Optional[StorageWeakRef]
+    values_storage_ref: Optional[StorageWeakRef]
+
+    def __init__(self, inp: Tensor):
+        assert inp.is_sparse
+
+        self.indices_storage_ref = StorageWeakRefWrapper(inp._indices())
+        self.values_storage_ref = StorageWeakRefWrapper(inp._values())
+
+    
+    def __repr__(self):
+        return f"SparseStorageWeakRefWrapper: indices: {self.indices_storage_ref}, values: {self.values_storage_ref}"
+
+    def is_live(self) -> bool:
+        indices_live = self.indices_storage_ref() is not None
+        values_live = self.values_storage_ref() is not None
+        return indices_live
+
+
+def flatten_refs(x):
+    if isinstance(x, StorageWeakRefWrapper):
+        yield x
+    else:
+        assert isinstance(x, SparseStorageWeakRefWrapper)
+        yield x.indices_storage_ref
+        yield x.values_storage_ref
 
 def is_cuda_tensor(x):
     return isinstance(x, torch.Tensor) and x.device.type == "cuda"
@@ -387,6 +417,8 @@ def map_to_ref(t: Optional[Tensor]) -> Optional[StorageWeakRefWrapper]:
     if not isinstance(t, torch.Tensor):
         assert t is None
         return None
+    if t.is_sparse:
+        return SparseStorageWeakRefWrapper(t)
     return StorageWeakRefWrapper(t)
 
 
@@ -467,13 +499,13 @@ class CUDAWarmupNode:
             out = self.wrapped_function.model(new_inputs)
 
         assert len(new_inputs) == 0
-
+ 
         self.outputs_weakrefs.extend(
             [
                 map_to_ref(o)
                 for o in out
-                if o is not None
-                and o.untyped_storage().data_ptr() not in non_cudagraph_inps
+                if o is not None and 
+                (o.is_sparse or o.untyped_storage().data_ptr() not in non_cudagraph_inps)
             ]
         )
 
@@ -503,7 +535,8 @@ class CUDAWarmupNode:
         for node in reversed(nodes):
             for i, output in enumerate(node.outputs_weakrefs):
                 if is_live(output):
-                    yield output, (node.stack_traces[i] if node.stack_traces else None)
+                    for ref in flatten_refs(output):
+                        yield ref, (node.stack_traces[i] if node.stack_traces else None)
 
     def all_outputs_are_dead(self):
         return not list(self.path_live_weakrefs())
@@ -513,6 +546,74 @@ class CUDAWarmupNode:
 InputList = List  # input indexes
 OutputList = List  # output indexes
 LevelList = List  # levels (distance from root of tree)
+
+
+class StridedTensorMeta:
+    __slots__ = [
+        "nbytes",
+        "data_ptr",
+        "size",
+        "stride",
+        "dtype",
+        "device",
+        "storage_offset",
+    ]
+
+    def __init__(self, x: torch.Tensor, ignore_storage_offset=True):
+        assert isinstance(x, torch.Tensor)
+        self.nbytes = x.untyped_storage().nbytes()
+        self.data_ptr = x.untyped_storage().data_ptr()
+        self.size = x.shape
+        self.stride = x.stride()
+        self.dtype = x.dtype
+        self.device = x.device
+        self.storage_offset = x.storage_offset() if not ignore_storage_offset else 0
+
+    def reconstruct(
+        self, get_or_create_storage: Callable[[StridedTensorMeta], UntypedStorage]
+    ):
+        s = get_or_create_storage(self)
+        t = torch.empty([0], device=self.device, dtype=self.dtype)
+        t.set_(
+            source=s,
+            storage_offset=self.storage_offset,
+            size=self.size,
+            stride=self.stride,
+        )
+        return t
+
+
+class SparseTensorMeta:
+    __slots__ = ["size", "indices_metadata", "values_metadata"]
+
+    def __init__(self, x, ignore_storage_offset):
+        assert x.is_sparse
+        assert x.layout == torch.sparse_coo
+
+        # dont see way to manipulate yet
+        assert x.storage_offset() == 0
+        # do strides matter ?
+        self.size = x.shape
+        self.indices_metadata = StridedTensorMeta(x._indices())
+        self.values_metadata = StridedTensorMeta(x._values())
+    
+
+    def reconstruct(
+        self, get_or_create_storage: Callable[[StridedTensorMeta], UntypedStorage]
+    ):
+        indices_tensor = self.indices_metadata.reconstruct(get_or_create_storage)
+        values_tensor = self.values_metadata.reconstruct(get_or_create_storage)
+    
+        return torch.sparse_coo_tensor(
+            indices=indices_tensor, values=values_tensor, size=self.size
+        )
+
+
+TensorMeta = Union[StridedTensorMeta, SparseTensorMeta]
+
+
+def get_metadata(x, ignore_storage_offset=True):
+    return SparseTensorMeta(x, ignore_storage_offset) if x.is_sparse else StridedTensorMeta(x, ignore_storage_offset)
 
 
 class CUDAGraphNode:
@@ -644,6 +745,9 @@ class CUDAGraphNode:
             self.recorded_liveness_before_graph = curr_liveness
             self.expected_dead_indices_before_graph = different_indices
 
+        # Sparse Inputs Not Supported Yet
+        assert all(not inputs[i].is_sparse for i in range(len(inputs)))
+
         recording_inputs = self._allocate_and_copy_recording_inputs(inputs)
         # recording inputs will copy over memory, so we can free non recording inputs
         inputs.clear()
@@ -657,8 +761,8 @@ class CUDAGraphNode:
         # to reclaim the input memory when the inputs are no longer live. To accomplish this,
         # we record the metadata needed to reconstruct the inputs at their correct memory location,
         # but do not keep them live during the cuda graph recording.
-        self.inputs_metadata: InputList[Dict[str, Any]] = [
-            self._tensor_metadata(x) for x in recording_inputs
+        self.inputs_metadata: InputList[TensorMeta] = [
+            get_metadata(x) for x in recording_inputs
         ]
 
         # DO THE RECORDING!!!
@@ -676,7 +780,7 @@ class CUDAGraphNode:
         self.recording_outputs: OutputList[Optional[torch.Tensor]] = self._record(
             wrapped_function.model, recording_inputs
         )
-        self.outputs_metadata: OutputList[Optional[Dict[str, Any]]] = []
+        self.outputs_metadata: OutputList[Optional[TensorMeta]] = []
 
         # As with inputs, we do not want to keep the outputs permanently alive because that would prevent
         # their memory being reclaimed in subsequent cuda graph recordings. We record the tensor metadata
@@ -684,7 +788,7 @@ class CUDAGraphNode:
         for out in self.recording_outputs:
             if isinstance(out, torch.Tensor):
                 self.outputs_metadata.append(
-                    self._tensor_metadata(out, ignore_storage_offset=False)
+                    get_metadata(out, ignore_storage_offset=False)
                 )
             else:
                 assert out is None
@@ -730,7 +834,7 @@ class CUDAGraphNode:
                 self.add_to_storage_cache(new_inputs[idx].untyped_storage())
             else:
                 # non-static input, need to copy it into CUDA graph
-                dst = self._reconstruct_from_tensor_metadata(self.inputs_metadata[idx])
+                dst = self.inputs_metadata[idx].reconstruct(self.get_or_create_storage)
                 src = new_inputs[idx]
                 self._copy_input(idx, dst, src)
 
@@ -738,7 +842,7 @@ class CUDAGraphNode:
         self.graph.replay()
 
         outputs = [
-            (self._reconstruct_from_tensor_metadata(metadata) if metadata else None)
+            (metadata.reconstruct(self.get_or_create_storage) if metadata else None)
             for metadata in self.outputs_metadata
         ]
 
@@ -809,7 +913,7 @@ class CUDAGraphNode:
         assert len(self.outputs_weakrefs) == 0
         for i, o in enumerate(outputs):
             self.output_is_alias_of_persistent_static_inputs.append(
-                o is not None
+                o is not None and not o.is_sparse
                 and o.untyped_storage().data_ptr()
                 in static_input_persistent_storage_ptrs
             )
@@ -865,6 +969,7 @@ class CUDAGraphNode:
         yield from nodes
 
     def _is_cuda_graph_recorded_tensor(self, t: torch.Tensor):
+        # dont support sparse inputs
         "Is this tensor an output of a node in this path"
         for output_refs in self.path_weakrefs:
             for storage_weak_ref in output_refs:
@@ -982,8 +1087,9 @@ class CUDAGraphNode:
         path = list(self._path_from_root)
         ptrs_to_deallocate = []
         for depth, output_index in _get_different_indices:
+            # Need to do this one
             ptrs_to_deallocate.append(
-                path[depth].outputs_metadata[output_index]["data_ptr"]
+                path[depth].outputs_metadata[output_index].data_ptr
             )
 
         return ptrs_to_deallocate
@@ -992,7 +1098,8 @@ class CUDAGraphNode:
         for i, j in self.live_indices_after_graph:
             out = self.path_weakrefs[i][j]
             if is_live(out):
-                yield out
+                for ref in flatten_refs(out):
+                    yield ref
 
     def path_live_weakrefs_and_stacktraces(
         self,
@@ -1001,42 +1108,14 @@ class CUDAGraphNode:
         for i, j in self.live_indices_after_graph:
             out = self.path_weakrefs[i][j]
             if is_live(out):
-                yield out, self.path_stacktraces[i][j]
+                for ref in flatten_refs(out):
+                    yield ref, self.path_stacktraces[i][j]
 
     def clear_path_state(self):
         "Clear the output lists of all nodes in the path and the storage cache"
         for li in self.path_weakrefs:
             li.clear()
         self.storage_cache.clear()
-
-    @staticmethod
-    def _tensor_metadata(x, ignore_storage_offset=True):
-        assert isinstance(x, torch.Tensor)
-        # We ignore the storage offset for inputs, but not for outputs
-        # TODO: - should we make the storage resizable ?
-        return {
-            "nbytes": x.untyped_storage().nbytes(),
-            "data_ptr": x.untyped_storage().data_ptr(),
-            "size": x.shape,
-            "stride": x.stride(),
-            "dtype": x.dtype,
-            "device": x.device,
-            "storage_offset": x.storage_offset() if not ignore_storage_offset else 0,
-            # ref_cdata was weak pointer of storage observed during recording, it may be
-            # different upon execution
-            "ref_cdata": x.untyped_storage()._cdata,
-        }
-
-    def _reconstruct_from_tensor_metadata(self, metadata: Dict[str, Any]) -> Tensor:
-        s = self.get_or_create_storage(metadata)
-        t = torch.empty([0], device=metadata["device"], dtype=metadata["dtype"])
-        t.set_(
-            source=s,
-            storage_offset=metadata["storage_offset"],
-            size=metadata["size"],
-            stride=metadata["stride"],
-        )
-        return t
 
     def add_to_storage_cache(self, untyped_storage: UntypedStorage):
         self.storage_cache[
@@ -1045,11 +1124,11 @@ class CUDAGraphNode:
 
     def get_or_create_storage(self, metadata):
         storage_wrapper = self.storage_cache.get(
-            (metadata["data_ptr"], metadata["nbytes"]), None
+            (metadata.data_ptr, metadata.nbytes), None
         )
         if storage_wrapper is None or not storage_wrapper():
             s = torch._C._construct_storage_from_data_pointer(
-                metadata["data_ptr"], metadata["device"], metadata["nbytes"]
+                metadata.data_ptr, metadata.device, metadata.nbytes
             )
             self.add_to_storage_cache(s)
         else:
@@ -1147,7 +1226,10 @@ def get_block_addrs(pool_id, live_only=True):
 
 
 def check_memory_pool(pool_id, live_storages_ptrs: List[StorageWeakRefWrapper]):
-    assert all([isinstance(elem, StorageWeakRefWrapper) for elem in live_storages_ptrs])
+    try:
+        assert all([isinstance(elem, StorageWeakRefWrapper) for elem in live_storages_ptrs])
+    except Exception as e:
+        breakpoint()
     gc.collect()
 
     unique_storages = {stor.data_ptr() for stor in live_storages_ptrs if stor()}

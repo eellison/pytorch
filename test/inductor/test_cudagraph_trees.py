@@ -202,6 +202,30 @@ if HAS_CUDA and not TEST_WITH_ASAN:
             # one root with two children
             self.assertEqual(children, [2])
 
+        # def test_sparse(self):
+
+
+        #     def fn(w, i, o):
+        #         return aten._embedding_bag(w, i, o, False, 0, False, None)
+
+        #     inps = (torch.randn([10, 4]), torch.randint(10, [8]), torch.tensor([0, 2, 6]))
+            
+        #     inps = [inp.cuda() for inp in inps]
+
+        #     # def foo():
+        #     #     ind = torch.tensor([[1, 1]], device="cuda").long()
+        #     #     val = torch.tensor([1., 1.], device="cuda")
+        #     #     return torch.sparse_coo_tensor(ind, val, requires_grad=False)
+            
+        #     fn_opt = torch.compile()(fn)
+            
+        #     eager = fn(*inps)
+        #     self.assertEqual(eager, fn_opt(*inps))
+        #     self.assertEqual(eager, fn_opt(*inps))
+        #     self.assertEqual(eager, fn_opt(*inps))
+            
+
+            
         def test_end_recording_early(self):
             def foo(x):
                 y = x * x * x
