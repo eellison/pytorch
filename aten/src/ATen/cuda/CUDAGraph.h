@@ -23,6 +23,9 @@ struct TORCH_CUDA_CPP_API CUDAGraph {
   void capture_end();
   void replay();
   void reset();
+  void update_params(std::vector<Tensor> old_params, std::vector<Tensor> new_params);
+  std::vector<cudaGraphNode_t> get_nodes(cudaGraph_t cuda_graph);
+  std::string get_node_info(const cudaGraphNode_t node);
   MempoolId_t pool();
   void enable_debug_mode();
   void debug_dump(const std::string& debug_path);
@@ -40,6 +43,8 @@ struct TORCH_CUDA_CPP_API CUDAGraph {
   bool has_graph_ = false;
   // Set to true in capture_end if cudaGraphInstantiate succeeded
   bool has_graph_exec_ = false;
+  // TODO - pass in as arg to constructor
+  bool preserve_graph_ = true;
 
   // uuid of this instance's current capture, retrieved from Cuda
   CaptureId_t id_;

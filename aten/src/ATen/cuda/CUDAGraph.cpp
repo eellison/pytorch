@@ -4,6 +4,9 @@
 #include <ATen/Functions.h>
 #include <c10/cuda/CUDACachingAllocator.h>
 #include <c10/cuda/CUDAFunctions.h>
+#include <ATen/cuda/nvrtc_stub/ATenNVRTC.h>
+
+#include <iostream>
 
 namespace at {
 namespace cuda {
@@ -161,17 +164,17 @@ void CUDAGraph::capture_end() {
     // Trailing NULL, NULL, 0 arguments were recommended by Cuda driver people,
     // who prefer not to report error message through these arguments moving forward
     // (they prefer return value, or errors on api calls internal to the capture)
-#if (defined(CUDA_VERSION) && CUDA_VERSION >= 12000)
-    AT_CUDA_CHECK(cudaGraphInstantiate(&graph_exec_, graph_, 0));
-#else
-    AT_CUDA_CHECK(cudaGraphInstantiate(&graph_exec_, graph_, NULL, NULL, 0));
-#endif
-#if (defined(CUDA_VERSION) && CUDA_VERSION >= 11040)
+    AT_CUDA_DRIVER_CHECK(at::globalContext().getNVRTC().cuGraphInstantiate(&graph_exec_, graph_, NULL, NULL, 0));
+    // AT_CUDA_CHECK(cudaGraphInstantiate(&graph_exec_, graph_, NULL, NULL, 0));
+#if CUDA_VERSION >= 11040
   } else {
-    AT_CUDA_CHECK(cudaGraphInstantiateWithFlags(&graph_exec_,
-                                                graph_,
-                                                cudaGraphInstantiateFlagAutoFreeOnLaunch));
-  }
+    // AT_CUDA_CHECK(cudaGraphInstantiateWithFlags(&graph_exec_,
+    //                                             graph_,
+    //                                             cudaGraphInstantiateFlagAutoFreeOnLaunch));
+    AT_CUDA_DRIVER_CHECK(at::globalContext().getNVRTC().cuGraphInstantiateWithFlags(&graph_exec_,
+                                            graph_,
+                                            CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH));                       
+}
 #endif
 
   has_graph_exec_ = true;
@@ -184,21 +187,11 @@ void CUDAGraph::capture_end() {
               "when capture began");
   wholegraph_increment_ = gen->capture_epilogue();
 
-  size_t numCUDAGraphNodes = 0;
-  AT_CUDA_CHECK(cudaGraphGetNodes(graph_, NULL, &numCUDAGraphNodes));
-  if (numCUDAGraphNodes == 0) {
-      TORCH_WARN("The CUDA Graph is empty. This usually means that the graph was ",
-                 "attempted to be captured on wrong device or stream.");
-  }
-
-  // check if debug path is set
-  if (!_cuda_graphs_debug) {
-    // Now that we've instantiated graph_ into graph_exec_,
-    // we don't need graph_ anymore.
+  // Now that we've instantiated graph_ into graph_exec_,
+  // we don't need graph_ anymore.
+  if (!preserve_graph_) {
     AT_CUDA_CHECK(cudaGraphDestroy(graph_));
     has_graph_ = false;
-  } else {
-    TORCH_WARN("DEBUG: TORCH_CUDAGRAPHS_DEBUG_PATH detected. graph_ will not be freed until debug_dump is called.");
   }
 #else
   TORCH_CHECK(false, "CUDA graphs may only be used in Pytorch built with CUDA >= 11.0 or ROCM >= 5.3")
@@ -224,7 +217,8 @@ void CUDAGraph::replay() {
   offset_extragraph_.fill_(int64_t(rng_engine_inputs.offset_.val));
 
   // graph_exec_ may be replayed in any stream.
-  AT_CUDA_CHECK(cudaGraphLaunch(graph_exec_, at::cuda::getCurrentCUDAStream()));
+  AT_CUDA_DRIVER_CHECK(at::globalContext().getNVRTC().cuGraphLaunch(graph_exec_, at::cuda::getCurrentCUDAStream()));
+  // AT_CUDA_CHECK(cudaGraphLaunch(graph_exec_, at::cuda::getCurrentCUDAStream()));
 
   int version;
   AT_CUDA_CHECK(cudaDriverGetVersion(&version));
@@ -292,10 +286,10 @@ void CUDAGraph::reset() {
     c10::cuda::CUDACachingAllocator::releasePool(capture_dev_, mempool_id_);
   }
   if (has_graph_) {
-    C10_CUDA_CHECK_WARN(cudaGraphDestroy(graph_));
+    // C10_CUDA_CHECK_WARN(cudaGraphDestroy(graph_));
   }
   if (has_graph_exec_) {
-    C10_CUDA_CHECK_WARN(cudaGraphExecDestroy(graph_exec_));
+    // C10_CUDA_CHECK_WARN(cudaGraphExecDestroy(graph_exec_));
   }
 #else
   TORCH_CHECK(false, "CUDA graphs may only be used in Pytorch built with CUDA >= 11.0 or ROCM >= 5.3")
@@ -311,6 +305,183 @@ TORCH_CHECK(has_graph_exec_,
   TORCH_CHECK(false, "CUDA graphs may only be used in Pytorch built with CUDA >= 11.0 or ROCM >= 5.3")
 #endif
   return mempool_id_;
+}
+
+inline std::vector<cudaGraphNode_t> CUDAGraph::get_nodes(cudaGraph_t cuda_graph) {
+  size_t numNodes;
+  AT_CUDA_CHECK(cudaGraphGetNodes(cuda_graph, static_cast<cudaGraphNode_t*>(nullptr), &numNodes));
+  if (numNodes == 0)
+    return std::vector<cudaGraphNode_t>();
+  std::vector<cudaGraphNode_t> graphNodes(numNodes);
+  AT_CUDA_CHECK(cudaGraphGetNodes(cuda_graph, graphNodes.data(), &numNodes));
+  return graphNodes;
+}
+
+inline std::string CUDAGraph::get_node_info(const cudaGraphNode_t node) {
+  std::stringstream ss;
+
+  cudaGraphNodeType pType;
+  AT_CUDA_CHECK(cudaGraphNodeGetType(node, &pType));
+  printf("Graph type = %i; ", pType);
+
+  switch (pType) {
+    case cudaGraphNodeTypeKernel: {
+      CUDA_KERNEL_NODE_PARAMS kparams = {0};
+      (at::globalContext().getNVRTC().cuGraphKernelNodeGetParams(node, &kparams));
+
+      ss << "GPUKernel@" << kparams.func;
+      ss << "<<<gridDim=(" << kparams.gridDimX << ", "<< kparams.gridDimY << ", " << kparams.gridDimZ << "), "
+         << "blockDim=(" << kparams.blockDimX << ", "<< kparams.blockDimY << ", "<< kparams.blockDimZ << ")>>>";
+      ss << "(";
+
+      // we'll need to get exact number of parameters
+      int64_t address_start = 1024;
+      for(int64_t i=0; (int64_t)kparams.kernelParams[i] > address_start; i++) {
+        void *ptr = *(void**)kparams.kernelParams[i];
+        ss << reinterpret_cast<int64_t>(ptr) << ", ";
+      }
+
+      ss << ")";
+      if (kparams.sharedMemBytes != 0)
+        ss << ", dynSharedMemBytes=" << kparams.sharedMemBytes;
+    } break;
+    case cudaGraphNodeTypeMemcpy: {
+      cudaMemcpy3DParms mparams = {};
+      AT_CUDA_CHECK(cudaGraphMemcpyNodeGetParams(node, &mparams));
+
+      // If memcpy is seen, return without setting up runnable executor
+      switch (mparams.kind) {
+        case cudaMemcpyHostToHost:
+          ss << "Host->Host ";
+          break;
+        case cudaMemcpyHostToDevice:
+          ss << "Host->Device ";
+          break;
+        case cudaMemcpyDeviceToHost:
+          ss << "Device->Host ";
+          break;
+        case cudaMemcpyDeviceToDevice:
+          ss << "Device->Device ";
+          break;
+        default:
+          break;
+      }
+      ss << "Memcpy";
+    } break;
+    case cudaGraphNodeTypeMemset: {
+      cudaMemsetParams mparams = {};
+      AT_CUDA_CHECK(cudaGraphMemsetNodeGetParams(node, &mparams));
+      if (mparams.height == 1 && mparams.elementSize == 1) {
+        ss << "cudaMemset(devPtr=" << mparams.dst << ", value=" << mparams.value
+           << ", count=" << mparams.width << ")";
+      } else {
+        if (mparams.elementSize == 1)
+          ss << "cudaMemset2D";
+        else
+          ss << "MemSet<elemBytes=" << mparams.elementSize << ">";
+        ss << "(devPtr=" << mparams.dst << ", pitch=" << mparams.pitch
+           << ", value=" << mparams.value << ", width=" << mparams.width
+           << ", height=" << mparams.height << ")";
+      }
+    } break;
+    case cudaGraphNodeTypeHost:
+      ss << "Host (executable) node";
+      break;
+    case cudaGraphNodeTypeGraph:
+      ss << "Node which executes an embedded graph";
+      break;
+    case cudaGraphNodeTypeEmpty:
+      ss << "Empty (no-op) node";
+      break;
+    default:
+      ss << "Unknown/Invalid node type " << pType;
+  }
+
+  return ss.str();
+}
+
+
+template <typename T>
+void check(T result, char const *const func, const char *const file, int const line) {
+  if (result) {
+    fprintf(
+        stderr,
+        "CUDA error at %s:%d code=%d: %s \n",
+        file,
+        line,
+        static_cast<unsigned int>(result),
+        cudaGetErrorString(result));
+    exit(EXIT_FAILURE);
+  }
+}
+
+#define checkCudaErrors(val) check((val), #val, __FILE__, __LINE__)
+
+void CUDAGraph::update_params(std::vector<Tensor> old_tensor_params, std::vector<Tensor> new_tensor_params) {
+  TORCH_CHECK(preserve_graph_ && has_graph_ && has_graph_exec_);
+
+  std::vector<cudaGraphNode_t> nodes = get_nodes(graph_);
+
+  std::cout << "Length of nodes : " << nodes.size() << "\n";
+
+  for(auto param : old_tensor_params) {
+    std::cout<< reinterpret_cast<int64_t>(param.data_ptr()) << '\n';
+  }
+
+  for(auto node : nodes) {
+    TORCH_CHECK(node != NULL);
+    std::cout<<get_node_info(node) << '\n';
+  }
+  auto node = nodes[0];
+  CUDA_KERNEL_NODE_PARAMS kparams = {0};
+  (at::globalContext().getNVRTC().cuGraphKernelNodeGetParams(node, &kparams));
+
+  // Copies over block, grid values but still need to copy over kernelParmas
+  CUDA_KERNEL_NODE_PARAMS kparams_copy = kparams;
+
+  // Cudagraphs internally will call free on this pointer - using std::vector
+  // here gives double free error. TODO - malloc right number of parmeters
+  int64_t * new_params = reinterpret_cast<int64_t*>(malloc(4 * sizeof(int64_t)));
+
+  kparams_copy.kernelParams = reinterpret_cast<void**>(new_params);
+
+  // Copy over old parameters
+  // TODO - right number of parameters to copy
+  for(int64_t i=0; i < 4; i++) {
+    new_params[i] = reinterpret_cast<int64_t>(kparams.kernelParams[i]);
+  }
+
+  // Replace old data pointers with new data pointers. The data pointers 
+  // are passed in as a reference to an address which stores the data pointers,
+  // so we allocate a new vector to store the values and pass pointers to it in.
+
+  // TODO - right size
+  std::vector<int64_t> vec_new(4);
+  new_params[0] = reinterpret_cast<int64_t>(new_tensor_params[0].data_ptr());
+  kparams_copy.kernelParams[0] = (&new_params[0]);
+  new_params[1] = reinterpret_cast<int64_t>(new_tensor_params[1].data_ptr());
+  kparams_copy.kernelParams[1] = (&new_params[1]);
+
+  
+  auto nvrtc = at::globalContext().getNVRTC();
+
+  // Need to use the driver api since Triton kernels are JIT Compiled
+  AT_CUDA_DRIVER_CHECK(nvrtc.cuGraphKernelNodeSetParams(node, &kparams_copy));
+  AT_CUDA_DRIVER_CHECK(nvrtc.cuGraphExecKernelNodeSetParams(graph_exec_, node, &kparams_copy));
+
+  cudaGraphExecUpdateResult updateResult;
+  cudaGraphNode_t errorNode;
+  // First we try to update the graph as this is much cheaper than re-instantiation
+  checkCudaErrors(cudaGraphExecUpdate(graph_exec_, graph_, &errorNode, &updateResult));
+  if (graph_exec_ == nullptr || updateResult != cudaGraphExecUpdateSuccess) {
+    // The update is unsuccessful, need to re-instantiate
+    cudaGetLastError(); // <- Clear the error state
+    if (graph_exec_ != nullptr) { 
+      C10_CUDA_CHECK_WARN(cudaGraphExecDestroy(graph_exec_)); 
+    }
+  } else {
+    AT_CUDA_DRIVER_CHECK(at::globalContext().getNVRTC().cuGraphInstantiate(&graph_exec_, graph_, NULL, NULL, 0));
+  }
 }
 
 CUDAGraph::~CUDAGraph() {

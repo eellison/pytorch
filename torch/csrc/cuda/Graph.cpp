@@ -57,5 +57,9 @@ void THCPGraph_init(PyObject* module) {
           "debug_dump",
           torch::wrap_pybind_function_no_gil(
               &::at::cuda::CUDAGraph::debug_dump),
-          py::arg("debug_path"));
+          py::arg("debug_path"))
+      .def(
+          "update_params",
+          &::at::cuda::CUDAGraph::update_params,
+          py::call_guard<py::gil_scoped_release>());
 }
