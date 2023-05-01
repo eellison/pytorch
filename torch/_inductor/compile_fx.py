@@ -3,10 +3,13 @@ import functools
 import itertools
 import logging
 import sys
+import unittest
 import warnings
 
 from copy import deepcopy
 from typing import Any, Callable, Dict, List, Optional
+
+from functorch import make_fx
 
 from functorch.compile import min_cut_rematerialization_partition
 
@@ -690,7 +693,48 @@ def compile_fx(
         )
 
     fw_compiler = functools.partial(fw_compiler_base, is_inference=False)
-    inference_compiler = functools.partial(fw_compiler_base, is_inference=True)
+
+    # TODO - expand grad required checks
+    if not torch.is_grad_enabled() and config.optimize_for_inference:
+        from torch._inductor.freezing import optimize_for_inference
+
+        def inference_compiler(
+            model: torch.fx.GraphModule, example_inputs, fw_metadata
+        ):
+            # partition_fn won't be called
+            joint_graph_passes(model)
+
+            opt_model, preserved_arg_indices = optimize_for_inference(
+                model_, model, example_inputs, fw_metadata=fw_metadata
+            )
+
+            example_inputs = [example_inputs[ind] for ind in preserved_arg_indices]
+            num_fixed = len(preserved_arg_indices) - num_example_inputs
+
+            fake_mode = detect_fake_mode(example_inputs)
+            with unittest.mock.patch.object(fake_mode, "allow_non_fake_inputs", True):
+                optimized_function = inner_compile(
+                    opt_model,
+                    example_inputs,
+                    num_fixed=num_fixed,
+                    cudagraphs=cudagraphs,
+                    graph_id=graph_id,
+                    is_inference=True,
+                    boxed_forward_device_index=forward_device,
+                )
+
+            def wrapper(args):
+                args_new = [args[ind] for ind in preserved_arg_indices]
+                args.clear()
+                return optimized_function(args_new)
+
+            wrapper._boxed_call = True
+            return wrapper
+
+        setattr(inference_compiler, "call_with_metadata", True)
+
+    else:
+        inference_compiler = functools.partial(fw_compiler_base, is_inference=True)
 
     def partition_fn(graph, joint_inputs, **kwargs):
         joint_graph_passes(graph)

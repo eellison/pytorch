@@ -1175,7 +1175,6 @@ def create_functionalized_graph(
     with enable_python_dispatcher():
         fx_g = make_fx(helper, decomposition_table=aot_config.decompositions)(*args)
 
-
     return fx_g
 
 
@@ -1322,7 +1321,11 @@ def aot_dispatch_base(flat_fn, flat_args: List[Tensor], aot_config: AOTConfig, *
             fake_mode = detect_fake_mode()
             seed, offset = CUDARngStateHelper.get_torch_state_as_tuple(fake_mode)
             flat_args = (seed, offset, *flat_args)
-        compiled_fw = compiler(fw_module, flat_args)
+
+        if hasattr(compiler, "call_with_metadata"):
+            compiled_fw = compiler(fw_module, flat_args, fw_metadata)
+        else:
+            compiled_fw = compiler(fw_module, flat_args)
 
     # Get the RNG functionalization related metadata to be used at runtime.
     rng_metadata = RNGMeta(False, PhiloxTotalOffsets(0, 0))
@@ -3276,6 +3279,7 @@ def aot_module_simplified(
     forward.zero_grad = mod.zero_grad
     forward.named_parameters = mod.named_parameters
     forward.named_buffers = mod.named_buffers
+    forward.params_flat = params_flat
 
     return forward
 
