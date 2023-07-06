@@ -3165,10 +3165,20 @@ def pooling_size(x, i, kernel_size, stride, padding, ceil_mode):
 
 fallback_max_pool2d_with_indices = fallback_handler(aten.max_pool2d_with_indices)
 
+def should_fallback_max_pool2d_with_indices(kernel_size, dilation=1):
+    # Kernel size too big. Results in hard-to-optimize Triton code. Use fallback.
+    kernel_size = pad_listlike(kernel_size, 2)
+    window_size = kernel_size[0] * kernel_size[1]
+    return window_size > 25 or any(d != 1 for d in dilation)
 
-@register_lowering(aten.max_pool2d_with_indices, type_promotion_kind=None)
-def max_pool2d_with_indices(
-    x, kernel_size, stride=None, padding=0, dilation=1, ceil_mode=False
+def increment_to_index(h_incr, w_incr, bh, bw, w, stride, padding):
+    ih = bh * stride[0] + h_incr - padding[0]
+    iw = bw * stride[1] + w_incr - padding[1]
+    return ops.index_expr(ih * w + iw, torch.int64)
+
+
+def max_pool2d_with_indices_impl(
+    x, kernel_size, stride=None, padding=0, dilation=1, ceil_mode=False, *, return_indices_offset=False
 ):
     if padding == 0:
         padding = [0, 0]
@@ -3200,10 +3210,7 @@ def max_pool2d_with_indices(
         x_loader = x.make_loader()
 
     new_size = list(batch) + [h_out, w_out]
-    window_size = kernel_size[0] * kernel_size[1]
-
-    if window_size > 25 or any(d != 1 for d in dilation):
-        # Kernel size too big. Results in hard-to-optimize Triton code. Use fallback.
+    if should_fallback_max_pool2d_with_indices(kernel_size, dilation):
         return fallback_max_pool2d_with_indices(
             x, kernel_size, stride, padding, dilation, ceil_mode
         )
@@ -3212,12 +3219,17 @@ def max_pool2d_with_indices(
         *prefix, bh, bw = idx
         maxval = None
         maxindex = None
-        for ih, iw in itertools.product(range(kernel_size[0]), range(kernel_size[1])):
-            ih = bh * stride[0] + ih - padding[0]
-            iw = bw * stride[1] + iw - padding[1]
+        for h_incr, w_incr in itertools.product(range(kernel_size[0]), range(kernel_size[1])):
+            ih = bh * stride[0] + h_incr - padding[0]
+            iw = bw * stride[1] + w_incr - padding[1]
             val = x_loader([*prefix, ih, iw])
             if return_index:
-                index = ops.index_expr(ih * w + iw, torch.int64)
+                if not return_indices_offset:
+                    index = increment_to_index(h_incr, w_incr, bh, bw, w, stride, padding)
+                else:
+                    # if h_incr == kernel_size[0] - 1 and w_incr == kernel_size[1] - 1:
+                    #     breakpoint()
+                    index = ops.index_expr(h_incr * kernel_size[1] + w_incr, torch.int8)
                 if maxindex is None:
                     maxindex = index
                 else:
@@ -3239,7 +3251,7 @@ def max_pool2d_with_indices(
     )
     r2 = Pointwise.create(
         device=x.get_device(),
-        dtype=torch.int64,
+        dtype=(torch.int64 if not return_indices_offset else torch.int8),
         inner_fn=functools.partial(fn, return_index=True),
         ranges=new_size,
     )
@@ -3247,14 +3259,22 @@ def max_pool2d_with_indices(
     return r1, r2
 
 
+@register_lowering(aten.max_pool2d_with_indices, type_promotion_kind=None)
+def maxpool2d_with_indices(*args, **kwargs):
+    return max_pool2d_with_indices_impl(*args, **kwargs, return_indices_offset=False)
+
+@register_lowering(prims._low_memory_maxpool2d_with_indices, type_promotion_kind=None)
+def low_mem_maxpool2d_with_indices(*args, **kwargs):
+    return max_pool2d_with_indices_impl(*args, **kwargs, return_indices_offset=True)
+
+
 fallback_max_pool2d_with_indices_backward = fallback_handler(
     aten.max_pool2d_with_indices_backward
 )
 
 
-@register_lowering(aten.max_pool2d_with_indices_backward, type_promotion_kind=None)
-def max_pool2d_with_indices_backward(
-    grad_output, x, kernel_size, stride, padding, dilation, ceil_mode, indices
+def max_pool2d_with_indices_backward_impl(
+    grad_output, x, kernel_size, stride, padding, dilation, ceil_mode, indices, indices_are_offsets=False
 ):
     if padding == 0:
         padding = [0, 0]
@@ -3305,13 +3325,11 @@ def max_pool2d_with_indices_backward(
         or config.max_autotune
         or config.max_autotune_pointwise
     )
-    if any(d != 1 for d in dilation) or (is_channels_last and not autotune):
+    if any(d != 1 for d in dilation) or (is_channels_last and not autotune and not indices_are_offsets):
         # don't codegen channels-last when autotune is not enabled, it's very slow
         return fallback_max_pool2d_with_indices_backward(
             grad_output, x, kernel_size, stride, padding, dilation, ceil_mode, indices
         )
-
-    indices.realize_hint()
 
     *batch, height, width = x.get_size()
     *_, pooled_height, pooled_width = grad_output.get_size()
@@ -3381,7 +3399,22 @@ def max_pool2d_with_indices_backward(
                     ),
                 ]
 
-                index_actual = indices_loader(grad_index)
+                if not indices_are_offsets:
+                    index_actual = indices_loader(grad_index)
+                else:
+                    index_offsets = indices_loader(grad_index)
+                    b_h = ops.index_expr(grad_index[-2], torch.int32)
+                    b_w = ops.index_expr(grad_index[-1], torch.int32)
+                    padding_consts = [ops.constant(p, torch.int32) for p in padding]
+                    stride_consts = [ops.constant(s, torch.int32) for s in stride]
+                    kernel_consts = [ops.constant(k, torch.int32) for k in kernel_size]
+                    h_incr = ops.truediv(index_offsets, kernel_consts[1])
+                    w_incr = ops.sub(index_offsets, ops.mul(h_incr, kernel_consts[1]))
+                    ih = b_h * stride_consts[0] + h_incr - padding_consts[0]
+                    iw = b_w * stride_consts[1] + w_incr - padding_consts[1]
+                    width_expr = ops.index_expr(width, torch.int32)
+                    index_actual = ih * width_expr + iw
+
                 grad_part = grad_loader(grad_index)
                 check = ops.eq(index_actual, index_test)
 
@@ -3402,13 +3435,24 @@ def max_pool2d_with_indices_backward(
         assert gradient is not None
         return gradient
 
-    return Pointwise.create(
+    out = Pointwise.create(
         device=grad_output.get_device(),
         dtype=grad_output.get_dtype(),
         inner_fn=fn,
         ranges=new_size,
     )
+    out.realize_hint()
+    return out
 
+
+@register_lowering(aten.max_pool2d_with_indices_backward, type_promotion_kind=None)
+def max_pool2d_with_indices_backward(*args, **kwargs):
+    return max_pool2d_with_indices_backward_impl(*args, **kwargs)
+
+
+@register_lowering(prims._low_mem_maxpool2d_with_indices_backward, type_promotion_kind=None)
+def low_mem_maxpool2d_with_indices(*args, **kwargs):
+    return max_pool2d_with_indices_backward_impl(*args, **kwargs, indices_are_offsets=True)
 
 def pad_adaptive_loader(x):
     *_, h, w = x.get_size()

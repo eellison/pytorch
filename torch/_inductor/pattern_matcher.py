@@ -348,6 +348,7 @@ class _TargetArgsExpr(_TargetExpr):
         ):
             return FailedMatch(f"function_mismatch: node={node}, pattern={self}")
 
+
         if not self._match_users(node, ctx):
             return FailedMatch(f"multiple_users {node}")
 

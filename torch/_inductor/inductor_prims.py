@@ -93,3 +93,90 @@ _bucketize = _prims._make_prim(
     return_type=RETURN_TYPE.NEW,
     doc="Same as torch.bucketize(), but does not get decomposed.",
 )
+
+def _low_mem_maxpool2d_with_indices_meta(*args, **kwargs):
+    out, indices = torch.ops.aten.max_pool2d_with_indices.default(*args, **kwargs)
+    return (out, indices.to(torch.int8))
+
+def _low_mem_maxpool2d_with_indices_aten(*args, **kwargs):
+    out, indices = torch.ops.aten.max_pool2d_with_indices.default(*args, **kwargs)
+    assert False
+
+
+# (Tensor self, int[2] kernel_size, int[2] stride=[], int[2] padding=0, int[2] dilation=1, bool ceil_mode=False) -> (Tensor, Tensor)
+
+class LowMemoryMaxPool2d(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, kernel_size, stride=None, padding=0, dilation=1, ceil_mode=False):
+        with torch._C._AutoDispatchBelowAutograd():
+            old = torch._C._dispatch_tls_is_dispatch_key_excluded(torch._C.DispatchKey.ADInplaceOrView)
+            out, indices_offset = torch.ops.prims._low_memory_maxpool2d_with_indices(x, kernel_size, stride, padding, dilation, ceil_mode)
+
+        ctx.save_for_backward(x, indices_offset)
+        ctx.kernel_size = kernel_size
+        ctx.stride = stride
+        ctx.padding = padding
+        ctx.dilation = dilation
+        ctx.ceil_mode = ceil_mode
+
+        ctx.mark_non_differentiable(indices_offset)
+
+        return (out, indices_offset)
+
+    @staticmethod
+    def backward(ctx, grad_output, indices_offset_inp):
+        self, indices_offset = ctx.saved_tensors
+
+        out = torch.ops.prims._low_mem_maxpool2d_with_indices_backward(grad_output, self, ctx.kernel_size, ctx.stride, ctx.padding, ctx.dilation, ctx.ceil_mode, indices_offset)
+
+
+        # h_incr = indices_offset // ctx.kernel_size[1]
+        # w_incr = indices_offset - (h_incr * ctx.kernel_size[1])
+
+        # bh = torch.arange(0, indices_offset.shape[-2],  device="cuda").view([1, 1, *indices_offset.shape[-2:]])
+        # bw = torch.arange(0, indices_offset.shape[-3], device="cuda").view([1, 1, *indices_offset.shape[-2:]])
+
+        # stride = ctx.stride
+        # padding = ctx.padding
+        # breakpoint()
+        # padding = [padding, padding] if isinstance(padding, int) else padding
+
+        # ih = bh * stride[0] + h_incr - padding[0]
+        # iw = bw * stride[1] + w_incr - padding[1]
+        # w = self.shape[-1]
+
+        # indices = ih * w + iw
+        # # return ops.index_expr(ih * w + iw, torch.int64)
+        # out = torch.ops.aten.max_pool2d_with_indices_backward(grad_output, self, ctx.kernel_size, ctx.stride, ctx.padding, ctx.dilation, ctx.ceil_mode, indices)
+        return (out, None, None, None)
+
+
+_low_mem_maxpool2d_with_indices = _prims._make_prim(
+    schema="_low_memory_maxpool2d_with_indices(Tensor self, int[2] kernel_size, int[2] stride=[], int[2] padding=0, int[2] dilation=1, bool ceil_mode=False) -> (Tensor, Tensor)",
+    meta=_low_mem_maxpool2d_with_indices_meta,
+    impl_aten=_low_mem_maxpool2d_with_indices_aten,
+    return_type=RETURN_TYPE.NEW,
+    doc="Instead of returning indices, returns indices offsets.",
+    autograd_impl=LowMemoryMaxPool2d.apply,
+)
+
+# def _low_mem_maxpool2d_with_indices_meta(grad_output, self, kernel_size, stride, padding, dilation, ceil_mode, indices):
+#     indices = indices.to()
+#     out, indices = torch.ops.aten.max_pool2d_with_indices.default(*args, **kwargs)
+#     return (out, indices.to(torch.int8))
+
+def _low_mem_maxpool2d_with_indices_backward_meta(grad_output, self, kernel_size, stride, padding, dilation, ceil_mode, indices):
+    indices = indices.to(torch.int64)
+    return torch.ops.aten.max_pool2d_with_indices_backward(grad_output, self, kernel_size, stride, padding, dilation, ceil_mode, indices)
+
+def not_implemented(*args, **kwargs):
+    assert False
+
+
+_low_mem_maxpool2d_with_indices_backward = _prims._make_prim(
+    schema="_low_mem_maxpool2d_with_indices_backward(Tensor grad_output, Tensor self, int[2] kernel_size, int[2] stride, int[2] padding, int[2] dilation, bool ceil_mode, Tensor indices) -> (Tensor)",
+    meta=_low_mem_maxpool2d_with_indices_backward_meta,
+    impl_aten=not_implemented,
+    return_type=RETURN_TYPE.NEW,
+    doc="Low Mem Max Pool 2d indices backward.",
+)
