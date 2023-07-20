@@ -85,7 +85,7 @@ add_needs_realized_inputs(
         aten.convolution,
         aten.convolution_backward,
         aten.max_pool2d_with_indices,
-        aten.max_pool2d_with_indices_backward,
+        # aten.max_pool2d_with_indices_backward,
         aten.mm,
         aten.upsample_nearest2d,
         aten.upsample_bicubic2d,
@@ -3225,10 +3225,12 @@ def max_pool2d_with_indices_impl(
             val = x_loader([*prefix, ih, iw])
             if return_index:
                 if not return_indices_offset:
+                    # breakpoint()
                     index = increment_to_index(h_incr, w_incr, bh, bw, w, stride, padding)
                 else:
                     # if h_incr == kernel_size[0] - 1 and w_incr == kernel_size[1] - 1:
                     #     breakpoint()
+                    # breakpoint()
                     index = ops.index_expr(h_incr * kernel_size[1] + w_incr, torch.int8)
                 if maxindex is None:
                     maxindex = index
@@ -3292,6 +3294,7 @@ def max_pool2d_with_indices_backward_impl(
 
     # we will read this many times, so make sure it is computed
     grad_output.realize_hint()
+    x.realize_hint()
     try:
         gO_stride = grad_output.get_stride()
     except AttributeError:
@@ -3325,11 +3328,11 @@ def max_pool2d_with_indices_backward_impl(
         or config.max_autotune
         or config.max_autotune_pointwise
     )
-    if any(d != 1 for d in dilation) or (is_channels_last and not autotune and not indices_are_offsets):
-        # don't codegen channels-last when autotune is not enabled, it's very slow
-        return fallback_max_pool2d_with_indices_backward(
-            grad_output, x, kernel_size, stride, padding, dilation, ceil_mode, indices
-        )
+    # if any(d != 1 for d in dilation) or (is_channels_last and not autotune and not indices_are_offsets):
+    #     # don't codegen channels-last when autotune is not enabled, it's very slow
+    #     return fallback_max_pool2d_with_indices_backward(
+    #         grad_output, x, kernel_size, stride, padding, dilation, ceil_mode, indices
+    #     )
 
     *batch, height, width = x.get_size()
     *_, pooled_height, pooled_width = grad_output.get_size()

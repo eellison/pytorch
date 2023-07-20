@@ -3,6 +3,7 @@ import logging
 import torch
 from torch import _prims
 from torch._prims_common import RETURN_TYPE
+from .utils import pad_listlike
 
 log = logging.getLogger(__name__)
 
@@ -112,6 +113,17 @@ class LowMemoryMaxPool2d(torch.autograd.Function):
             old = torch._C._dispatch_tls_is_dispatch_key_excluded(torch._C.DispatchKey.ADInplaceOrView)
             out, indices_offset = torch.ops.prims._low_memory_maxpool2d_with_indices(x, kernel_size, stride, padding, dilation, ceil_mode)
 
+        if padding == 0:
+            padding = [0, 0]
+        if dilation == 1:
+            dilation = [1, 1]
+        if not stride:
+            stride = kernel_size
+        kernel_size = pad_listlike(kernel_size, 2)
+        stride = pad_listlike(stride, 2)
+        padding = pad_listlike(padding, 2)
+        dilation = pad_listlike(dilation, 2)
+
         ctx.save_for_backward(x, indices_offset)
         ctx.kernel_size = kernel_size
         ctx.stride = stride
@@ -124,10 +136,27 @@ class LowMemoryMaxPool2d(torch.autograd.Function):
         return (out, indices_offset)
 
     @staticmethod
-    def backward(ctx, grad_output, indices_offset_inp):
+    def backward(ctx, grad_output, ind_offset):
         self, indices_offset = ctx.saved_tensors
+        device = ind_offset.device
+        kernel_size = ctx.kernel_size
+        padding = ctx.padding
+        stride = ctx.stride
 
-        out = torch.ops.prims._low_mem_maxpool2d_with_indices_backward(grad_output, self, ctx.kernel_size, ctx.stride, ctx.padding, ctx.dilation, ctx.ceil_mode, indices_offset)
+        h_incr = ind_offset // kernel_size[1]
+        w_incr = ind_offset - (h_incr * kernel_size[1])
+
+
+        height, width = ind_offset.shape[-2:]
+        bh = torch.arange(height, device=device).unsqueeze(1).repeat(1, width)
+        bw = torch.arange(width, device=device).unsqueeze(0).repeat(height, 1)
+
+        w = self.shape[-1]
+        ih = bh * stride[0] + h_incr - padding[0]
+        iw = bw * stride[1] + w_incr - padding[1]
+        new_index = ih * w + iw
+
+        out = torch.ops.aten.max_pool2d_with_indices_backward(grad_output, self, ctx.kernel_size, ctx.stride, ctx.padding, ctx.dilation, ctx.ceil_mode, new_index)
 
 
         # h_incr = indices_offset // ctx.kernel_size[1]
