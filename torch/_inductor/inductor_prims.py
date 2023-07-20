@@ -143,6 +143,10 @@ class LowMemoryMaxPool2d(torch.autograd.Function):
         padding = ctx.padding
         stride = ctx.stride
 
+        out = torch.ops.prims._low_mem_maxpool2d_with_indices_backward(grad_output, self, ctx.kernel_size, ctx.stride, ctx.padding, ctx.dilation, ctx.ceil_mode, indices_offset)
+
+        return (out, None, None, None)
+
         h_incr = ind_offset // kernel_size[1]
         w_incr = ind_offset - (h_incr * kernel_size[1])
 

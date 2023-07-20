@@ -3225,12 +3225,8 @@ def max_pool2d_with_indices_impl(
             val = x_loader([*prefix, ih, iw])
             if return_index:
                 if not return_indices_offset:
-                    # breakpoint()
                     index = increment_to_index(h_incr, w_incr, bh, bw, w, stride, padding)
                 else:
-                    # if h_incr == kernel_size[0] - 1 and w_incr == kernel_size[1] - 1:
-                    #     breakpoint()
-                    # breakpoint()
                     index = ops.index_expr(h_incr * kernel_size[1] + w_incr, torch.int8)
                 if maxindex is None:
                     maxindex = index
@@ -3406,17 +3402,17 @@ def max_pool2d_with_indices_backward_impl(
                     index_actual = indices_loader(grad_index)
                 else:
                     index_offsets = indices_loader(grad_index)
-                    b_h = ops.index_expr(grad_index[-2], torch.int32)
-                    b_w = ops.index_expr(grad_index[-1], torch.int32)
-                    padding_consts = [ops.constant(p, torch.int32) for p in padding]
-                    stride_consts = [ops.constant(s, torch.int32) for s in stride]
-                    kernel_consts = [ops.constant(k, torch.int32) for k in kernel_size]
-                    h_incr = ops.truediv(index_offsets, kernel_consts[1])
-                    w_incr = ops.sub(index_offsets, ops.mul(h_incr, kernel_consts[1]))
-                    ih = b_h * stride_consts[0] + h_incr - padding_consts[0]
-                    iw = b_w * stride_consts[1] + w_incr - padding_consts[1]
-                    width_expr = ops.index_expr(width, torch.int32)
-                    index_actual = ih * width_expr + iw
+                    h_incr = index_offsets // kernel_size[1]
+                    w_incr = index_offsets - (h_incr * kernel_size[1])
+                    ind_height, ind_width = indices.get_size()[-2:]
+                    bh = grad_index[-2]
+                    bw = grad_index[-1]
+                    s_consts = [ops.constant(s, torch.int32) for s in stride]
+                    p_consts = [ops.constant(p, torch.int32) for p in padding]
+                    k_consts = [ops.constant(k, torch.int32) for k in kernel_size]
+                    ih = ops.index_expr(bh, torch.int32) * s_consts[0] + h_incr - p_consts[0]
+                    iw = ops.index_expr(bw, torch.int32) * s_consts[1] + w_incr - p_consts[1]
+                    index_actual = ih * ops.constant(width, torch.int32) + iw
 
                 grad_part = grad_loader(grad_index)
                 check = ops.eq(index_actual, index_test)
