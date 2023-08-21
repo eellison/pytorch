@@ -490,6 +490,9 @@ class CodeGen:
 
                 if isinstance(meta_val, FakeTensor):
                     maybe_type_annotation = f': {dtype_abbrs[meta_val.dtype]}{stringify_shape(meta_val.shape)}'
+                    if not meta_val.is_contiguous(memory_format=torch.contiguous_format):
+                        stride = stringify_shape(meta_val.stride())
+                        maybe_type_annotation = f'{maybe_type_annotation}(stride={stride}'
                 elif isinstance(meta_val, py_sym_types):
                     maybe_type_annotation = f': Sym({meta_val})'
                 elif isinstance(meta_val, TensorMetadata):

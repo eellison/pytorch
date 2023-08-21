@@ -180,8 +180,9 @@ def is_mm_compute_bound(M, K, N, dtype):
     # if we extimate too high there will be unnecessary compilation time increase.
     # TODO - finetune coefficient here. As a reference point, Triton mm model assumes
     # 80% of reads are in cache and cache is 4x faster than dram_gbps
-    machine_balance = machine_balance * 0.5
-
+    machine_balance = machine_balance
+    if not arithmetic_intensity > machine_balance: 
+        print(M, N, K, f"Machine balance: {machine_balance}, arithmetic intensity: {arithmetic_intensity}")
     return arithmetic_intensity > machine_balance
 
 

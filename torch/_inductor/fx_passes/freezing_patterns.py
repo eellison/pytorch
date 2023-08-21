@@ -4,11 +4,14 @@ import torch
 from torch._inductor.compile_fx import fake_tensor_prop
 from ..._dynamo.utils import counters
 
+from typing import List
+from torch._inductor.utils import is_ones, is_zeros
 from .. import config
 from ..pattern_matcher import (
     _return_true,
     CallFunction,
     Ignored,
+    MULTIPLE,
     inference_graph,
     init_once_fakemode,
     KeywordArg,
@@ -190,3 +193,187 @@ def unnecessary_dtype_convert(match: Match, **kwargs):
     node = match.output_node()
     node.replace_all_uses_with(node.args[0])
     graph.erase_node(node)
+
+
+def is_conv_1v1(
+    inp,
+    weight,
+    bias,
+    stride: List[int],
+    padding: List[int],
+    dilation: List[int],
+    transposed: bool,
+    output_padding: List[int],
+    groups: int,
+):
+
+    if not inp.meta["val"].is_cuda or not inp.meta["val"].is_contiguous(memory_format=torch.channels_last):
+        return False
+
+    if not weight.meta["val"].is_contiguous(memory_format=torch.channels_last):
+        return False
+
+    out_chan, in_chan, *kernel_shape = weight.meta["val"].shape
+
+    if not (
+        is_ones(kernel_shape)
+        and is_ones(stride)
+        and is_zeros(padding)
+        and is_ones(dilation)
+        and not transposed
+        and is_zeros(output_padding)
+        and groups == 1
+    ):
+        return False
+
+    return True
+
+    CallFunction(
+        aten.convolution.default, 
+        CallFunction(
+            aten.relu.default,
+            CallFunction(
+                aten.add.Tensor,
+                CallFunction(aten.convolution.default, *[Ignored() for _ in range(9)]),
+                Ignored(),
+            )
+        )
+        *[Ignored() for _ in range(8)]
+    )
+
+
+
+@register_graph_pattern(
+    CallFunction(
+        aten.mm.default, 
+        KeywordArg("arg0"),
+        KeywordArg("arg1"),
+    ),
+    pass_dict=pass_patterns[2],
+)
+def mm_bandwidth_bound(match: Match, arg0, arg1):
+    from torch._inductor.fx_passes.pad_mm import is_mm_compute_bound
+
+    if not is_mm_compute_bound(arg0.meta["val"].shape[0], arg0.meta["val"].shape[1], arg1.meta["val"].shape[1], arg1.meta["val"].dtype):
+        print("Potentially Bandwidth bound mm", arg0.meta["val"].shape[0], arg0.meta["val"].shape[1], arg1.meta["val"].shape[1])
+
+
+@register_graph_pattern(
+    CallFunction(
+        aten.bmm.default, 
+        KeywordArg("arg0"),
+        KeywordArg("arg1"),
+    ),
+    pass_dict=pass_patterns[2],
+)
+def mm_bandwidth_bound(match: Match, arg0, arg1):
+    from torch._inductor.fx_passes.pad_mm import is_mm_compute_bound
+    
+    m, k, n = arg0.meta["val"].shape[1], arg0.meta["val"].shape[2], arg1.meta["val"].shape[2]
+    if not is_mm_compute_bound(m, k, n, arg1.meta["val"].dtype):
+        print("Potentially Bandwidth bound bmm", m, k, n)
+
+
+
+@register_graph_pattern(
+    CallFunction(
+        aten.addmm.default, 
+        Ignored(),
+        KeywordArg("arg0"),
+        KeywordArg("arg1"),
+    ),
+    pass_dict=pass_patterns[2],
+)
+def mm_bandwidth_bound(match: Match, arg0, arg1):
+    from torch._inductor.fx_passes.pad_mm import is_mm_compute_bound
+
+    if not is_mm_compute_bound(arg0.meta["val"].shape[0], arg0.meta["val"].shape[1], arg1.meta["val"].shape[1], arg1.meta["val"].dtype):
+        print("Potentially Bandwidth bound mm", arg0.meta["val"].shape[0], arg0.meta["val"].shape[1], arg1.meta["val"].shape[1])
+
+
+@register_graph_pattern(
+    CallFunction(
+        aten.sum.dim_IntList, 
+        CallFunction(
+            aten.addmm.default, 
+            Ignored(),
+            Ignored(),
+            Ignored(),
+        ),
+        Ignored(),
+        Ignored(),
+    ),
+    pass_dict=pass_patterns[2],
+)
+def mm_bandwidth_bound(match: Match, arg0, arg1):
+    print("matmul -> sum")
+
+
+@register_graph_pattern(
+    CallFunction(
+        aten.sum.dim_IntList, 
+        CallFunction(
+            aten.mm.default, 
+            Ignored(),
+            Ignored(),
+        ),
+        Ignored(),
+        Ignored(),
+    ),
+    pass_dict=pass_patterns[2],
+)
+def mm_bandwidth_bound(match: Match, arg0, arg1):
+    print("matmul -> sum")
+
+# # TODO handle ndim == 3
+# def repl(x, weight, bias):
+#     # special case for 1x1 convolution, which is actually just a matmul
+#     rank = len(weight.size())
+#     weight = weight.squeeze(-1).squeeze(-1)
+#     weight = weight.permute(1, 0)
+#     x_permute = list(range(rank))
+#     x_permute.append(x_permute.pop(1))
+#     x = x.permute(*x_permute)
+#     *sizes, in_chan = x.size()
+#     x = x.reshape(-1, in_chan)
+#     if bias is None:
+#         result = torch.mm(x, weight)
+#     else:
+#         result = torch.addmm(bias, x, weight)
+#     result = result.reshape(*sizes, -1)
+#     result_permute = list(range(rank))
+#     result_permute.insert(1, result_permute.pop(-1))
+#     return result.permute(*result_permute)
+    # with V.fake_mode:
+    #     match.replace_by_example(repl, [inp, weight, bias])
+
+@register_graph_pattern(
+    CallFunction(
+        aten.convolution.default, 
+        CallFunction(
+            aten.relu.default,
+            CallFunction(
+                aten.add.Tensor,
+                CallFunction(aten.convolution.default, *[Ignored() for _ in range(9)]),
+                Ignored(),
+            ),
+            _users=MULTIPLE,
+        ),
+        *[Ignored() for _ in range(8)],
+    ),
+    pass_dict=pass_patterns[2],
+)
+def conv1v1_plus_conv1v1(match: Match):
+    if not is_conv_1v1(*match.output_node().args):
+        return
+
+    if not is_conv_1v1(*match.output_node().args[0].args[0].args[0].args):
+        return
+
+    # breakpoint()
+    
+    print("found pattern")
+    # breakpoint()
+    return
+        
+    # return inductor.kernel.mm_plus_mm.tuned_mm_plus_mm(mat1, mat2, mat3, mat4)
