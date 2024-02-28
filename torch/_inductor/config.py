@@ -699,7 +699,7 @@ class trace:
     output_code = True
 
     # SVG figure showing post-fusion graph
-    graph_diagram = os.environ.get("INDUCTOR_POST_FUSION_SVG", "0") == "1"
+    graph_diagram = os.environ.get("INDUCTOR_POST_FUSION_SVG", "1") == "1"
 
     # SVG figure showing fx with fusion
     draw_orig_fx_graph = os.environ.get("INDUCTOR_ORIG_FX_SVG", "0") == "1"

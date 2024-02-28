@@ -1599,6 +1599,8 @@ class Scheduler:
                 else:
                     # dead code
                     log.debug("removed dead node: %s", node.get_name())
+                    if node.get_name() == "buf29":
+                        breakpoint()
                     V.graph.removed_buffers.add(node.get_name())
 
             again = len(self.nodes) > len(updated_nodes)
@@ -1638,9 +1640,13 @@ class Scheduler:
         name_to_ancestors: Dict[str, Set[str]] = {}
         for node in self.nodes:
             ancestors = set()
-            for dep in node.unmet_dependencies:
-                ancestors.add(dep.name)
-                ancestors |= name_to_ancestors[dep.name]
+            try:
+                for dep in node.unmet_dependencies:
+                    ancestors.add(dep.name)
+                    ancestors |= name_to_ancestors[dep.name]
+            except:
+                breakpoint()
+                raise
             name_to_ancestors[node.get_name()] = ancestors
             node.ancestors = ancestors
 
@@ -1658,6 +1664,8 @@ class Scheduler:
                 "===== attempting fusion (%d/10): %d nodes =====", i + 1, old_len
             )
             self.fuse_nodes_once()
+            if i >= 6:
+                self.inline_for_fusion()
             new_len = len(self.nodes)
             fusion_log.debug(
                 "completed fusion round (%d/10): fused %d nodes into %d nodes\n",
@@ -1665,9 +1673,9 @@ class Scheduler:
                 old_len,
                 new_len,
             )
-            if new_len == old_len or new_len == 1:
-                fusion_log.debug("===== fusion complete (%d iterations) =====", i + 1)
-                break
+            # if new_len == old_len or new_len == 1:
+            #     fusion_log.debug("===== fusion complete (%d iterations) =====", i + 1)
+            #     break
 
     def benchmark_fused_nodes(self, nodes):
         """
@@ -1773,6 +1781,106 @@ class Scheduler:
             )
         return ms_fused < ms1 + ms2
 
+    def inline_for_fusion(self):
+        possible_fusions = []
+        seen = set()
+
+        def check_all_pairs(nodes):
+            for node1_index, node1 in enumerate(nodes):
+                for node2 in nodes[node1_index + 1 :]:
+                    key = (node1, node2)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+
+                    node1 = self.name_to_fused_node[node1.get_first_name()]
+                    node2 = self.name_to_fused_node[node2.get_first_name()]
+
+                    if node1.get_name() == "buf1_buf2_buf3_buf4_buf9" and node2.get_name() == "buf5_buf7" and getattr(torch, "elias", True):
+                        setattr(torch, "elias", False)
+                        
+                        producer_read_names = {dep.name for dep in node1.read_writes.reads}
+                        
+                        read_names = {dep.name for dep in node2.read_writes.reads}
+                        # next(iter(node2.read_writes.reads)).numbytes_hint()
+                        read_buffers = [n for n in node1.snodes if n.get_name() in read_names]
+
+                        def inline_mem_changes(buf):
+                            num_bytes = 0
+                            for dep in buf.read_writes.reads:
+                                if dep in read_names:
+                                    continue
+                                    
+                                # dont handle intermedary deps for now
+                                if dep.name not in producer_read_names:
+                                    return None
+
+                                num_bytes += dep.numbytes_hint()
+
+                            return num_bytes
+
+                        for read_buffer in read_buffers:
+                            bytes_added = inline_mem_changes(read_buffer)
+                            if bytes_added is None:
+                                continue
+                            bytes_reduced = sum(dep.numbytes_hint() for dep in node2.read_writes.reads if dep.name == read_buffer.get_name())
+
+                        copy = ir.TensorBox.create(node1.snodes[0].node.data.make_copy())
+                        copy.realize()
+                
+                        # now i need to update all the reads in node2 buffers to say the new buffer...
+                        new_scheduler_node = self.create_scheduler_node(copy.data.data)
+
+                        self.name_to_node[new_scheduler_node.get_name()] = new_scheduler_node
+                        self.name_to_fused_node[new_scheduler_node.get_name()] = new_scheduler_node
+
+                        new_scheduler_node.min_order = node2.min_order
+                        new_scheduler_node.max_order = node2.max_order
+
+                        from torch._inductor.utils import invalidate_cache
+                        # invalidate the caching 
+
+                        old_name = node1.snodes[0].get_name()
+                        new_name = new_scheduler_node.get_name()
+
+                        def update_loads(graph_nodes):
+                            for node in graph_nodes:
+                                if node.target == "load" and node.args[1] == old_name:
+                                    args = list(node.args)
+                                    args[1] = new_name
+                                    node.args = tuple(args)
+                            
+
+                        invalidate_cache(node2)
+                        for snode in node2.snodes:
+                            invalidate_cache(snode)
+                            invalidate_cache(snode.node)
+
+                            update_loads(snode._body.get_nodes())
+
+                            invalidate_cache(snode._body)
+
+                        self.nodes.append(new_scheduler_node)
+                        for user in node1.snodes[0].users:
+                            if user.get_name() in read_names:
+                                user.node.inverse_users.remove(node1.snodes[0])
+                                user.node.inverse_users.append(new_scheduler_node)
+                                new_scheduler_node.users.append(user)
+
+                        node2.set_read_writes(
+                            dependencies.ReadWrites.merge_list([x.read_writes for x in node2.snodes])
+                        )
+
+        buffer_names_grouping = collections.defaultdict(list)
+        for node in self.nodes:
+            for buf in node.used_buffer_names():
+                buffer_names_grouping[buf].append(node)
+        for node_grouping in buffer_names_grouping.values():
+            check_all_pairs(node_grouping)
+
+        # self.compute_ancestors()
+
+
     def fuse_nodes_once(self):
         """
         Mutates self.nodes to combine nodes into FusedSchedulerNodes.
@@ -1785,6 +1893,7 @@ class Scheduler:
         for node1, node2 in self.get_possible_fusions():
             node1 = self.name_to_fused_node[node1.get_first_name()]
             node2 = self.name_to_fused_node[node2.get_first_name()]
+            
             if self.can_fuse(node1, node2) and not self.will_fusion_create_cycle(
                 node1, node2
             ):
@@ -1910,10 +2019,14 @@ class Scheduler:
         node changes live intervals, and re-computing live intervals and peak
         memory after each fusion can introduce large compilation overhead.
         """
-        proximity_score = max(
-            abs(node1.min_order - node2.max_order),
-            abs(node2.min_order - node1.max_order),
-        )
+        try:
+            proximity_score = max(
+                abs(node1.min_order - node2.max_order),
+                abs(node2.min_order - node1.max_order),
+            )
+        except:
+            breakpoint()
+            raise
         return proximity_score > 64
 
     def can_fuse(self, node1: BaseSchedulerNode, node2: BaseSchedulerNode):
@@ -2186,6 +2299,8 @@ class Scheduler:
         # generate unique arg name.
         log.debug("remove_buffer(%r)", name)
         V.kernel.args.output_buffers[name] = "REMOVED"
+        if name == "buf29":
+            breakpoint()
         V.kernel.removed_buffers.add(name)
 
     def remove_inplace_buffer(self, name):
@@ -2194,6 +2309,9 @@ class Scheduler:
         V.kernel.args.inplace_buffers[name] = inner_name.replace(
             "in_out_ptr", "REMOVED"
         )
+        if name == "buf29":
+            breakpoint()
+
         V.kernel.removed_buffers.add(name)
 
     def flush(self):

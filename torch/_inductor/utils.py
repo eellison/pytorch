@@ -432,6 +432,10 @@ class CachedMethod(Generic[P, RV], Protocol):
     def __call__(self, *args: P.args, **kwargs: P.kwargs) -> RV:
         ...
 
+def invalidate_cache(obj: Any):
+    for attr in getattr(obj, "__inductor_cache_keys", ()):
+        if hasattr(obj, attr):
+            delattr(obj, attr)
 
 # See https://github.com/python/mypy/issues/13222#issuecomment-1193073470 to understand the type signature
 def cache_on_self(fn: Callable[Concatenate[Any, P], RV]) -> CachedMethod[P, RV]:
@@ -439,6 +443,11 @@ def cache_on_self(fn: Callable[Concatenate[Any, P], RV]) -> CachedMethod[P, RV]:
 
     @functools.wraps(fn)
     def wrapper(self):
+        if not hasattr(self, "__inductor_cache_keys"):
+            setattr(self, "__inductor_cache_keys", set())
+
+        self.__inductor_cache_keys.add(key)
+
         if not hasattr(self, key):
             setattr(self, key, fn(self))
         return getattr(self, key)
@@ -449,7 +458,6 @@ def cache_on_self(fn: Callable[Concatenate[Any, P], RV]) -> CachedMethod[P, RV]:
 
     wrapper.clear_cache = clear_cache  # type: ignore[attr-defined]
     return wrapper  # type: ignore[return-value]
-
 
 def aggregate_origins(node_schedule):
     from . import ir

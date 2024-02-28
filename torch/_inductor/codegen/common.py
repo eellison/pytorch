@@ -914,6 +914,8 @@ class KernelArgs:
     def input(self, name):
         if V.graph.scheduler:
             name = V.graph.scheduler.mutation_real_name.get(name, name)
+        if name in V.graph.removed_buffers:
+            breakpoint()
         assert name not in V.graph.removed_buffers, name
         if name in self.output_buffers:
             return self.output_buffers[name]

@@ -494,6 +494,9 @@ class Pointwise(Loops):
         loader = patch.object(ConstantBuffer, "override_device", device)(loader)
         return Pointwise(device, self.dtype, loader, self.ranges)
 
+    def make_copy(self):
+        return Pointwise(self.device, self.dtype, self.make_loader(), self.ranges)
+
 
 @dataclasses.dataclass
 class Scatter(Pointwise):
@@ -6666,7 +6669,7 @@ class StorageBox(MutableBox):
                 or self.has_large_inner_fn()
                 or (is_cpu(self.data) and should_realize_on_cpu(self.data))
             )
-        ):
+        ):  
             self.realize()
 
     @cache_on_self
