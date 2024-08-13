@@ -1466,7 +1466,7 @@ class SIMDScheduling(BaseScheduling):
                     node.codegen(index_vars)
 
     def codegen_template(
-        self, template_node, epilogue_nodes, only_gen_src_code=False
+        self, template_node, epilogue_nodes, prologue_nodes, *, only_gen_src_code=False
     ) -> Optional[str]:
         """
         Codegen a triton template
@@ -1475,29 +1475,58 @@ class SIMDScheduling(BaseScheduling):
         """
         _, (numel, rnumel) = template_node.group
         assert rnumel == 1
+        if epilogue_nodes:
+            breakpoint()
         kernel, render = template_node.node.make_kernel_render(template_node.node)
+    
+        buf_name_to_prologue_node = {}
+        for prologue in prologue_nodes:
+            names = prologue.get_buffer_names()
+            assert len(names) == 1
+            buf_name_to_prologue_node[next(iter(names))] = prologue
+
         with kernel:
             if not only_gen_src_code:
-                for node in [template_node, *epilogue_nodes]:
+                for node in [*prologue_nodes, template_node, *epilogue_nodes]:
                     node.mark_run()
+
+            for buf_name in buf_name_to_prologue_node:
+                kernel.prologue_replaced_args.append(buf_name)
+            
             partial_code = render()
             with kernel.set_subgraph_body("<STORE_OUTPUT>"):
                 for node in epilogue_nodes:
                     node.codegen(kernel.split_and_set_ranges(node.get_ranges()))
 
+            for input_name, buffer in kernel.named_input_nodes.items():
+                if prologue_node := buf_name_to_prologue_node.get(buffer.get_name(), None):
+                    # breakpoint()
+                    # kernel.prologue_replaced_args.append(input_name)
+                    subgraph_name = f"<LOAD_INPUT_{input_name}>"
+                    with kernel.set_subgraph_body(subgraph_name):
+                        prologue_node.codegen(kernel.split_and_set_ranges(prologue_node.get_ranges()))
+
         if not isinstance(partial_code, str):
             partial_code.finalize_hook("<DEF_KERNEL>")
             partial_code.finalize_hook("<ARGDEFS>", strict=False)
+
+
         # finalize must be called after adding epilogue above
         with V.set_kernel_handler(kernel):
             # TODO: Maybe unify CUDATemplateKernel to also use PartialRender for flexible epilogue fusion.
+
+            for input_name in kernel.named_input_nodes.keys():
+                subgraph_name = f"<LOAD_INPUT_{input_name}>"
+                partial_code.finalize_hook(subgraph_name, strict=False)
+
             with kernel.set_subgraph_body("<STORE_OUTPUT>"):
                 if isinstance(partial_code, str):
                     src_code = partial_code
                 else:
                     partial_code.finalize_hook("<STORE_OUTPUT>")
                     src_code = partial_code.code
-            node_schedule = [template_node, *epilogue_nodes]
+        
+            node_schedule = [*prologue_nodes, template_node, *epilogue_nodes]
 
             if config.benchmark_kernel:
                 num_gb = kernel.estimate_kernel_num_bytes() / 1e9

@@ -413,7 +413,7 @@ enabled_metric_tables = os.environ.get("TORCHINDUCTOR_ENABLED_METRIC_TABLES", ""
 
 # For Triton Templates, select fastest of best template + epilogue vs best template + separate epilogue kernel
 benchmark_epilogue_fusion = (
-    os.environ.get("TORCHINDUCTOR_BENCHMARK_EPILOGUE_FUSION", "1") == "1"
+    os.environ.get("TORCHINDUCTOR_BENCHMARK_EPILOGUE_FUSION", "0") == "1"
 )
 
 # Take how many of the top triton kernels to benchmark epilogue

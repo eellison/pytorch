@@ -6,12 +6,17 @@ from torch._inductor import config
 
 config.max_autotune_gemm_backends = "TRITON"
 
+# @torch.compile(mode="max-autotune")
+# def fn(x, y, index):
+#     return (x[index] + 1).to(torch.float) @ y
+
+
 @torch.compile(mode="max-autotune")
 def fn(x, y, index):
-    return x[index] @ y
+    return (x + 1).to(torch.float) @ y
 
 
-x = torch.rand([4096, 4096], device="cuda")
+x = torch.rand([4096, 4096], dtype=torch.bfloat16, device="cuda")
 y = torch.rand([4096, 4096], device="cuda")
 index = torch.randperm(4096, device="cuda")
 

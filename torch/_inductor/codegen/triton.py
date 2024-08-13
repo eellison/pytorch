@@ -1594,6 +1594,9 @@ class TritonKernel(SIMDKernel):
             index_str = f"tl.broadcast_to({index_str}, {expand_str})"
             mask_vars = dense_mask_vars
         elif not have_loop_vars and copy_shape:
+            if copy_shape == "a":
+                breakpoint()
+
             index_str = f"tl.broadcast_to({index_str}, {copy_shape}.shape)"
             mask_vars = dense_mask_vars
 
@@ -1779,6 +1782,8 @@ class TritonKernel(SIMDKernel):
         result_var.mask_vars = indexing.mask_vars  # type: ignore[assignment]
 
         if append_broadcast:
+            if "a.shape" in repr(append_broadcast):
+                breakpoint()
             line = f"tl.broadcast_to({result_var}, {append_broadcast})"
             result_var = self.cse.generate(load_buffer, line)
 

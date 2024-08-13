@@ -2500,6 +2500,7 @@ class Scheduler:
         single fused node.
         """
 
+        return True
         if node1 is node2:
             return False
 
@@ -3017,8 +3018,12 @@ class Scheduler:
             self.buffer_names_to_free.update(node.last_usage)
 
             if node.is_template():
-                node, *epilogue = node.get_nodes()
-                self.get_backend(device).codegen_template(node, epilogue)
+                nodes = list(node.get_nodes())
+                tmp_indices = [i for i, n in enumerate(node.get_nodes()) if n.is_template()]
+                assert len(tmp_indices) == 1
+                ind = tmp_indices[0]
+                prologue, node, epilogue = nodes[:ind], nodes[ind], nodes[ind + 1:]
+                self.get_backend(device).codegen_template(node, epilogue, prologue)
             elif node.is_extern():
                 node = typing.cast(ExternKernelSchedulerNode, node)
                 self.codegen_extern_call(node)
@@ -3108,6 +3113,7 @@ class BaseScheduling:
         self,
         template_node: BaseSchedulerNode,
         epilogue_nodes: Sequence[BaseSchedulerNode],
+        prologue_nodes: Sequence[BaseSchedulerNode]
     ) -> Optional[str]:
         """
         Given a template node, generate a kernel.
