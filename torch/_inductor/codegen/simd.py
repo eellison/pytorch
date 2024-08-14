@@ -1475,8 +1475,6 @@ class SIMDScheduling(BaseScheduling):
         """
         _, (numel, rnumel) = template_node.group
         assert rnumel == 1
-        if epilogue_nodes:
-            breakpoint()
         kernel, render = template_node.node.make_kernel_render(template_node.node)
     
         buf_name_to_prologue_node = {}

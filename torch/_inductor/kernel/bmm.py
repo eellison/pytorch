@@ -28,7 +28,7 @@ def bmm_grid(b, m, n, meta):
     return (cdiv(m, meta["BLOCK_M"]) * cdiv(n, meta["BLOCK_N"]), b, 1)
 
 
-bbmm_template = TritonTemplate(
+bmm_template = TritonTemplate(
     name="bmm",
     grid=bmm_grid,
     source=r"""
