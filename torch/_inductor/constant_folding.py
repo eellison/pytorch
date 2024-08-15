@@ -185,7 +185,10 @@ class ConstantFolder(torch.fx.Interpreter):
             return self.unknown_value
 
         out = self._deduce_value(node)
+        if repr(node) == "where":
+            breakpoint()
         if out == self.unknown_value:
+            # print(node, "unknown value")
             return self.unknown_value
 
         if not is_const_source(node, self.lifted_constants) and isinstance(

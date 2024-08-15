@@ -505,7 +505,7 @@ class BaseSchedulerNode:
     def get_write_buffer_sizes(self) -> int:
         return self.get_read_write_buffers_sizes_impl(include_reads=False, include_writes=True)
 
-    def get_read_write_buffers_sizes_impl(self, include_reads=True, include_writes=True) -> int:
+    def get_read_write_buffers_sizes_impl(self, include_reads, include_writes) -> int:
         """
         Counting the number of bytes accessed for a kernel is
         surprisingly tricky. In particular, there is a differentiation
@@ -528,7 +528,6 @@ class BaseSchedulerNode:
         1. Numel in ranges multiplied by number of deps the buffer has
         2. The buffer size
         """
-        assert include_reads or include_writes
         if isinstance(self, NopKernelSchedulerNode):
             return 0
         if isinstance(self, ExternKernelSchedulerNode) and isinstance(
@@ -548,14 +547,17 @@ class BaseSchedulerNode:
         else:
             node_numel = int(1e9)
         buf_accesses = collections.defaultdict(list)
-        reads = self.read_writes.reads if include_reads else OrderedSet()
-        writes = self.read_writes.writes if include_writes else OrderedSet()
 
-        for dep in reads | writes:
-            buf_accesses[dep.name].append(dep)
+        if include_reads:
+            for dep in self.read_writes.reads:
+                buf_accesses[dep.name].append(dep)
+        
+        if include_writes:
+            for dep in self.read_writes.writes:
+                buf_accesses[dep.name].append(dep)
 
-        read_names = OrderedSet(dep.name for dep in reads)
-        write_names = OrderedSet(dep.name for dep in writes)
+        reads = OrderedSet(dep.name for dep in self.read_writes.reads) if include_reads else OrderedSet()
+        writes = OrderedSet(dep.name for dep in self.read_writes.writes) if include_writes else OrderedSet()
 
         def is_materialized(buf: str, snodes: Sequence[BaseSchedulerNode]) -> bool:
             users = self.scheduler.name_to_buf[buf].users
@@ -566,11 +568,11 @@ class BaseSchedulerNode:
             removed_buffers = OrderedSet(
                 dep for dep in writes if not is_materialized(dep, self.snodes)
             )
-            write_names = write_names - removed_buffers
-            read_names = read_names - removed_buffers
+            writes = writes - removed_buffers
+            reads = reads - removed_buffers
         node_bytes = 0
 
-        for buf_name in read_names | write_names:
+        for buf_name in reads | writes:
             buf_accessed_elems = sum(node_numel for dep in buf_accesses[buf_name])
             buf: Union[ir.Buffer, ir.TensorBox]
             if buf_name in V.graph.name_to_buffer:
@@ -2541,6 +2543,11 @@ class Scheduler:
             return False
 
         if node2.is_template():
+
+            if not config.prologue_fusion:
+                why("prologue fusion turned off")
+                return False
+
             if (node1.has_aliasing_or_mutation() or node1.has_aliasing_or_mutation()):
                 why("template prologue can only fuse functional pointwise nodes")
                 return False
@@ -2557,7 +2564,7 @@ class Scheduler:
             # potential bad cache behavior and shared memory use
             # we want to avoid benchmarking reliably unprofitable fusions like downcasts from fp32 -> fp16 inside kernel. 
             # Could also allow introduce api for template to determine memory bound vs compute bound regime..
-
+            breakpoint()
             #  allowing gathers by allowing increasing write_bytes by small factor - open to other suggestions
             if read_bytes > (write_bytes * 1.1):
                 why("prologue fusion will not increase amount of bytes read in kernel")
