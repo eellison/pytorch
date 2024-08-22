@@ -259,7 +259,7 @@ class UniformValueConstantFolder(ConstantFolder):
         # TODO - do on cpu to avoid syncs
 
         # single-elem attrs
-        
+
         if node.op == "get_attr" or (
             node.op == "call_function"
             and node.target == torch.ops.aten.lift_fresh_copy.default
@@ -355,7 +355,6 @@ def constant_fold_uniform_value(gm: torch.fx.GraphModule):
         constant_data_ptr_count[cf.constant_data_ptrs[node]] += 1
 
     for node, value in node_replacements.items():
-
         # if repr(node) == "where":
         #     breakpoint()
         # we dont have a functional way right now of instantiating a non-contiguous tensor with full/zeros/ones right now
@@ -420,7 +419,7 @@ def constant_fold_uniform_value(gm: torch.fx.GraphModule):
             node.replace_all_uses_with(new_node)
             graph.erase_node(node)
 
-            if value == 0 or (abs(value)-.00000001 <= 0.0):
+            if value == 0 or (abs(value) - 0.00000001 <= 0.0):
                 zeros.add(new_node)
             elif value == 1:
                 ones.add(new_node)

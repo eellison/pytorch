@@ -1781,6 +1781,7 @@ class GraphLowering(torch.fx.Interpreter):
         try:
             linemap = [(line_no, node.stack_trace) for line_no, node in linemap]  # type: ignore[misc]
             key, path = PyCodeCache.write(code)
+            output_code_log.debug("Output written to: \n%s", path)
         except Exception:
             trace_structured(
                 "inductor_output_code",
@@ -1824,8 +1825,8 @@ class GraphLowering(torch.fx.Interpreter):
 
             assert self.cpp_wrapper, "AOT mode only supports C++ wrapper"
             code, linemap = self.codegen_with_cpp_wrapper()
+            breakpoint()
             output_code_log.debug("Output code: \n%s", code)
-            
 
             serialized_extern_kernel_nodes = None
             if self.extern_kernel_nodes:

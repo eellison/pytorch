@@ -563,6 +563,8 @@ def triton_store_type(dtype):
         triton_type_name = "float8e5"
     return f"tl.{triton_type_name}"
 
+triton_compute_type = triton_store_type
+
 
 def triton_acc_type(dtype):
     if is_integer_dtype(dtype) and dtype.is_signed:
