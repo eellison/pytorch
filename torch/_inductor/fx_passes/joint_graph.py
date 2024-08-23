@@ -259,7 +259,6 @@ class UniformValueConstantFolder(ConstantFolder):
         # TODO - do on cpu to avoid syncs
 
         # single-elem attrs
-
         if node.op == "get_attr" or (
             node.op == "call_function"
             and node.target == torch.ops.aten.lift_fresh_copy.default
@@ -421,6 +420,7 @@ def constant_fold_uniform_value(gm: torch.fx.GraphModule):
                 zeros.add(new_node)
             elif value == 1:
                 ones.add(new_node)
+
     remove_no_ops(gm, zeros, ones)
     remove_redundant_views(gm)
 

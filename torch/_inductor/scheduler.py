@@ -2212,7 +2212,9 @@ class Scheduler:
                         red_text(f"{ms_fused / (ms1 + ms2):.3f}"),
                     )
 
-        # we only compare results on the first fusion currently
+        # After the succesful fusion with Template, we finalize its config.
+        # Subsequently we benchmark but dont update. Checking for SchedulerNode, instead of FusedSchedulerNode
+        # accomplishes this.
         if is_multi_template and any(n.get_template_node() is not None and isinstance(n, SchedulerNode) for n in (node1, node2)):
             epilogue_fusion = node1.get_template_node() is not None
             
@@ -2582,7 +2584,7 @@ class Scheduler:
                 why("template prologue can only fuse functional pointwise nodes")
                 return False
 
-            # TODO - could relax constraint if node is used multiple times inside template
+            # TODO - could potentially relax constraint if node is used multiple times inside template
             if (
                 not len(node1.outputs) == 1
                 and len(node1.outputs[0].users) == 1
@@ -2595,10 +2597,10 @@ class Scheduler:
             write_bytes = node1.get_write_buffer_sizes()
 
             # Initially, only do fusions which will result in fewer memory accesses inside of the template to avoid
-            # potential bad cache behavior and shared memory use
-            # we want to avoid benchmarking reliably unprofitable fusions like downcasts from fp32 -> fp16 inside kernel.
-            # Could also allow introduce api for template to determine memory bound vs compute bound regime..
-            #  allowing gathers by allowing increasing write_bytes by small factor - open to other suggestions
+            # potential bad cache behavior and shared memory use.
+            # we also want to avoid benchmarking reliably unprofitable fusions like downcasts from fp32 -> fp16 inside kernel.
+            # allowing gathers by allowing increasing write_bytes by small factor
+            # TODO - make configurable per input, for insance, bias can fuse fp32 -> fp16 profitably
             if read_bytes > (write_bytes * 1.1):
                 why("prologue fusion will not increase amount of bytes read in kernel")
                 return False

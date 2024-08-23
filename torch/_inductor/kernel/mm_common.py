@@ -120,8 +120,8 @@ def filtered_configs(
 # (BLOCK_M, BLOCK_N, BLOCK_K, num_stages, num_warps)
 mm_kernel_configs = (
     [
-        {"config": (32, 32, 32, 1, 2), "cond": True},
-        {"config": (32, 32, 32, 2, 4), "cond": torch.version.hip is None},
+        {"config": (32, 32, 16, 1, 2), "cond": True},
+        {"config": (32, 32, 128, 2, 4), "cond": torch.version.hip is None},
         {"config": (32, 64, 32, 5, 8), "cond": True},
         {"config": (64, 32, 32, 5, 8), "cond": True},
         {"config": (64, 32, 128, 5, 4), "cond": True},
