@@ -91,19 +91,25 @@ mm_template = TritonTemplate(
         offs_b_n = rn % N
     offs_k = tl.arange(0, BLOCK_K)
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_TYPE)
+
+    # TODO - should not need this.. prologue load is causing it
+    XBLOCK: tl.constexpr = 1
+
     for k_idx in range(0, tl.cdiv(K, BLOCK_K)):
         if EVEN_K:
             a_mask = None
             b_mask = None
         else:
-            a_mask = offs_k[None, :] < k
-            b_mask = offs_k[:, None] < k
+            a_mask = offs_k[None, :] < (K - k_idx * BLOCK_K)
+            b_mask = offs_k[:, None] < (K - k_idx * BLOCK_K)
         
         a_k_idx_vals = offs_k[None, :] + (k_idx * BLOCK_K)
         b_k_idx_vals = offs_k[:, None] + (k_idx * BLOCK_K)
 
         idx_m = offs_a_m[:, None]
         idx_n = a_k_idx_vals
+
+        # TODO - load A mask
         {{load_input("A", "a", ("idx_m", "idx_n"), indent_width=8)}}
 
         B_ptr = B + ((offs_k[:, None] + (k_idx * BLOCK_K)) * stride_bk + offs_b_n[None, :] * stride_bn)
@@ -111,7 +117,7 @@ mm_template = TritonTemplate(
         if EVEN_K:
             b = tl.load(B_ptr)
         else:
-            b = tl.load(B_ptr, mask=offs_k[:, None] < k, other=0.)
+            b = tl.load(B_ptr, mask=b_mask, other=0.)
         acc += tl.dot(a, b, allow_tf32=ALLOW_TF32)
 
     # rematerialize rm and rn to save registers
