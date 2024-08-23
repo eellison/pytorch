@@ -2252,7 +2252,6 @@ class Scheduler:
                         ms_fused_choice = choice
 
             log_fusion(min_ms_fused, ms1, ms2)
-            breakpoint()
 
             # after we do a fusion, we finalize a triton template.
             # TODO - could preserve multi template and choices for subsequent fusions

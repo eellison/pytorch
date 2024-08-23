@@ -3851,7 +3851,6 @@ class TemplateBuffer(OperationBuffer):
         name = self.get_name()
         indexer = self.layout.make_indexer()
 
-        # TODO - dummy reads on inputs.... too
         def dummy(index, rindex):
             assert len(rindex) == 0
             return ops.store(name, indexer(index), "fake")

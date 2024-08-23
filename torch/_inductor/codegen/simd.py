@@ -994,21 +994,15 @@ class SIMDScheduling(BaseScheduling):
                 )
                 return False
 
-            if node1.is_template():
-                # Only allow fusion for TritonTemplates for now.
-                # Fusion for CUDATemplates are not supported.
-                is_triton_template = isinstance(node1.node, TritonTemplateBuffer)
-                if not is_triton_template:
-                    why("node1 is not TritonTemplateBuffer")
-                return is_triton_template
 
-            if node2.is_template():
-                # Only allow fusion for TritonTemplates for now.
-                # Fusion for CUDATemplates are not supported.
-                is_triton_template = isinstance(node2.node, TritonTemplateBuffer)
-                if not is_triton_template:
-                    why("node2 is not TritonTemplateBuffer")
-                return is_triton_template
+            for n, node_name in zip((node1, node2), ("node1", "node2"))
+                if n.is_template():
+                    # Only allow fusion for TritonTemplates for now.
+                    # Fusion for CUDATemplates are not supported.
+                    is_triton_template = isinstance(n.node, TritonTemplateBuffer)
+                    if not is_triton_template:
+                        why(f"{node_name} is not TritonTemplateBuffer")
+                    return is_triton_template
 
             # check for a bad combined tiling
             tiling1 = self.select_tiling(node1.get_nodes(), numel1, rnumel1)

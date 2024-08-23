@@ -355,8 +355,6 @@ def constant_fold_uniform_value(gm: torch.fx.GraphModule):
         constant_data_ptr_count[cf.constant_data_ptrs[node]] += 1
 
     for node, value in node_replacements.items():
-        # if repr(node) == "where":
-        #     breakpoint()
         # we dont have a functional way right now of instantiating a non-contiguous tensor with full/zeros/ones right now
         # hasn't shown up to be important yet
         if "val" not in node.meta:
@@ -364,15 +362,15 @@ def constant_fold_uniform_value(gm: torch.fx.GraphModule):
             continue
 
         fake_tensor = node.meta["val"]
-        # if not fake_tensor.is_contiguous(memory_format=torch.contiguous_format):
-        #     continue
+        if not fake_tensor.is_contiguous(memory_format=torch.contiguous_format):
+            continue
 
         # TODO - not sure about lossy uint->python value->uint conversions
         if fake_tensor.dtype in (torch.uint8, torch.uint16, torch.uint32, torch.uint64):
             continue
 
-        # if constant_data_ptr_count[cf.constant_data_ptrs[node]] > 1:
-        #     continue
+        if constant_data_ptr_count[cf.constant_data_ptrs[node]] > 1:
+            continue
 
         with graph.inserting_after(node):
             # the conversion from tensor and back to value can be lossy, just use the original full ctor value
@@ -419,7 +417,7 @@ def constant_fold_uniform_value(gm: torch.fx.GraphModule):
             node.replace_all_uses_with(new_node)
             graph.erase_node(node)
 
-            if value == 0 or (abs(value) - 0.00000001 <= 0.0):
+            if value == 0:
                 zeros.add(new_node)
             elif value == 1:
                 ones.add(new_node)

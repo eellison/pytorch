@@ -1253,7 +1253,7 @@ def compile_fx(
                 )
                 == "1",
                 "triton.autotune_cublasLt": False,
-                # "triton.cudagraphs": False,
+                "triton.cudagraphs": False,
                 "triton.store_cubin": True,
             }
         ), V.set_real_inputs(example_inputs_):

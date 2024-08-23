@@ -105,7 +105,7 @@ benchmark_harness = True
 epilogue_fusion = True
 
 # fuse pointwise into template prologues
-prologue_fusion = True
+prologue_fusion = False
 
 # do epilogue fusions before other fusions
 epilogue_fusion_first = False
@@ -420,7 +420,7 @@ benchmark_epilogue_fusion = (
 )
 
 # Take how many of the top triton kernels to benchmark epilogue
-max_epilogue_benchmarked_choices = 30
+max_epilogue_benchmarked_choices = 1
 
 # how many nodes to allow into a single fusion
 max_fusion_size = 64

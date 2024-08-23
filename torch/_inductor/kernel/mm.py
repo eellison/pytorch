@@ -102,6 +102,9 @@ mm_template = TritonTemplate(
         a_k_idx_vals = offs_k[None, :] + (k_idx * BLOCK_K)
         b_k_idx_vals = offs_k[:, None] + (k_idx * BLOCK_K)
 
+        idx_m = offs_a_m[:, None]
+        idx_n = a_k_idx_vals
+        {{load_input("A", "a", ("idx_m", "idx_n"), indent_width=8)}}
 
         B_ptr = B + ((offs_k[:, None] + (k_idx * BLOCK_K)) * stride_bk + offs_b_n[None, :] * stride_bn)
 
@@ -109,10 +112,6 @@ mm_template = TritonTemplate(
             b = tl.load(B_ptr)
         else:
             b = tl.load(B_ptr, mask=offs_k[:, None] < k, other=0.)
-
-        idx_m = offs_a_m[:, None]
-        idx_n = a_k_idx_vals
-        {{load_input("A", "a", ("idx_m", "idx_n"), indent_width=8)}}
         acc += tl.dot(a, b, allow_tf32=ALLOW_TF32)
 
     # rematerialize rm and rn to save registers
