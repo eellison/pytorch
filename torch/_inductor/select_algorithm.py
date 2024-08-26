@@ -472,7 +472,6 @@ class TritonTemplateKernel(TritonKernel):
         load_code = None
 
         self._inputs_with_prologue_fusion.add(input_name)
-
         with self.create_subgraph_body(f"<LOAD_INPUT_{input_name}>"):
             assert isinstance(indices, (list, tuple))
             assert isinstance(output_name, str)
@@ -507,9 +506,10 @@ class TritonTemplateKernel(TritonKernel):
                 sympy.Integer(1), sympy_product(lengths)
             ).set_name("xindex")
             self.template_mask = mask
-            self.template_out = mask
+            self.template_out = "xindex"
             self.template_indices = indices
             self.named_input_nodes[input_name].data.freeze_layout()
+            self.cse.invalidate(set())
 
             from torch._inductor.codegen.triton import triton_store_type
 
