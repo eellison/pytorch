@@ -9,6 +9,7 @@ from torch._higher_order_ops.invoke_subgraph import (
     invoke_subgraph,
 )
 from torch._higher_order_ops.while_loop import while_loop
+from torch._higher_order_ops.invoke_quant import invoke_quant
 
 
 __all__ = [
@@ -18,4 +19,5 @@ __all__ = [
     "flex_attention",
     "flex_attention_backward",
     "hints_wrapper",
+    "invoke_quant",
 ]

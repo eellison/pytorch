@@ -105,7 +105,8 @@ decomps_to_exclude = [
     aten.split.Tensor,  # inductor lowers this directly
     aten.squeeze,  # inductor lowers this directly
     aten.sum,  # inductor lowers this directly
-    aten.unbind,  # inductor lowers this directly
+    aten.unbind,  # inductor lowers this directly,
+    aten.baddbmm,
 ]
 
 remove_decompositions(decompositions, decomps_to_exclude)

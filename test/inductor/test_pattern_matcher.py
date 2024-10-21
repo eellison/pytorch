@@ -12,9 +12,11 @@ import torch.nn.functional as F
 from torch._dynamo.utils import count_calls, counters
 from torch._higher_order_ops.out_dtype import out_dtype
 from torch._inductor.fx_passes import joint_graph
+import operator
 from torch._inductor.pattern_matcher import (
     Arg,
     CallFunction,
+    CallFunctionVarArgs,
     gen_pattern,
     is_mutation_op,
     KeywordArg,
@@ -1336,6 +1338,50 @@ class TestPatternMatcher(TestCase):
                 actual = torch.compile(fn)(*copy.deepcopy(args))
                 self.assertEqual(counter, 1)
                 torch.testing.assert_close(actual, expected)
+
+    @inductor_config.patch(fx_graph_remote_cache=False)
+    def test_pattern_match_higher_order_op(self):
+        torch.set_default_device("cuda")
+        counter = 0
+        test_pass = PatternMatcherPass()
+
+        invoke_quant = torch._higher_order_ops.invoke_quant
+
+        def gn(x, y):
+            return torch.mul(x, y) + y
+
+        def fn(x, y, z):
+            return invoke_quant(gn, "subgraph", (x, y)) @ z
+
+        x = torch.randn(64, 64, requires_grad=False)
+        y = torch.randn(64, 64, requires_grad=False)
+        z = torch.randn(64, 64, requires_grad=False)
+
+
+        # TODO - getitem here is annoying
+        @register_graph_pattern(
+            CallFunction(
+                torch.ops.aten.mm,
+                CallFunction(
+                    operator.getitem,
+                    CallFunctionVarArgs(torch.ops.higher_order.invoke_quant),
+                    0,
+                ),
+                Arg(),
+            ),
+            pass_dict=test_pass,
+        )
+        def addmm_replacement(match: Match, *args, **kwargs):
+            nonlocal counter
+            counter += 1
+
+        with unittest.mock.patch(
+            "torch._inductor.fx_passes.post_grad.pass_patterns",
+            torch._inductor.fx_passes.post_grad.pass_patterns + [test_pass],
+        ):
+            torch.compile(fn)(x, y, z)
+            self.assertTrue(counter == 1)
+
 
     @inductor_config.patch(fx_graph_remote_cache=False)
     def test_match_equivalent_function_invocations3(self):

@@ -631,9 +631,12 @@ class TorchHigherOrderOperatorVariable(VariableTracker):
             value.__name__ == "auto_functionalized"
             or value.__name__ == "auto_functionalized_v2"
         ):
+            breakpoint()
             return AutoFunctionalizeHigherOrderVariable(value, source, **kwargs)
         elif value.__name__ == "invoke_subgraph":
-            return InvokeSubgraphHigherOrderVariable(value, source, **kwargs)
+            breakpoint()
+        elif value.__name__ == "invoke_quant":
+            return InvokeSubgraphImplHigherOrderVariable(value, source, **kwargs)
         else:
             unimplemented(f"HigherOrderOperator {value.__name__}")
 
@@ -2611,28 +2614,7 @@ def hash_graph_and_inputs(tx, gmod, fake_inputs):
     return key
 
 
-class InvokeSubgraphHigherOrderVariable(WrapHigherOrderVariable):
-    def install_subgraph_in_output_graph(
-        self, tx, fn_vt, fn_args_vt, kwargs, body_gmod, attr_name="invoke_subgraph"
-    ):
-        # Check if the subgraph from speculate_subgraph (body_gmod) and the fake
-        # inputs have already been seen before. If yes, the subgraph is already
-        # installed in the output graph and we can just access the subgraph
-        # using the saved attr name.
-
-        fake_inputs = [arg.as_proxy().node.meta["example_value"] for arg in fn_args_vt]
-
-        key = hash_graph_and_inputs(tx, body_gmod, fake_inputs)
-
-        if key in tx.output.seen_invoke_subgraphs:
-            return tx.output.seen_invoke_subgraphs[key]
-
-        body_name = super().install_subgraph_in_output_graph(
-            tx, fn_vt, fn_args_vt, kwargs, body_gmod, attr_name
-        )
-        tx.output.seen_invoke_subgraphs[key] = body_name
-        return body_name
-
+class InvokeSubgraphImplHigherOrderVariable(WrapHigherOrderVariable):
     def call_function(
         self,
         tx: "InstructionTranslator",
@@ -2669,3 +2651,26 @@ class InvokeSubgraphHigherOrderVariable(WrapHigherOrderVariable):
         return _call_function_and_unflatten_output(
             tx, self.value, tuple(p_args), p_kwargs, flat_example_value, treespec
         )
+
+
+class InvokeSubgraphHigherOrderVariable(InvokeSubgraphImplHigherOrderVariable):
+    def install_subgraph_in_output_graph(
+        self, tx, fn_vt, fn_args_vt, kwargs, body_gmod, attr_name="invoke_subgraph"
+    ):
+        # Check if the subgraph from speculate_subgraph (body_gmod) and the fake
+        # inputs have already been seen before. If yes, the subgraph is already
+        # installed in the output graph and we can just access the subgraph
+        # using the saved attr name.
+
+        fake_inputs = [arg.as_proxy().node.meta["example_value"] for arg in fn_args_vt]
+
+        key = hash_graph_and_inputs(tx, body_gmod, fake_inputs)
+
+        if key in tx.output.seen_invoke_subgraphs:
+            return tx.output.seen_invoke_subgraphs[key]
+
+        body_name = super().install_subgraph_in_output_graph(
+            tx, fn_vt, fn_args_vt, kwargs, body_gmod, attr_name
+        )
+        tx.output.seen_invoke_subgraphs[key] = body_name
+        return body_name

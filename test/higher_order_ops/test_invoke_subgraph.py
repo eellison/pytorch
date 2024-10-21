@@ -7,19 +7,26 @@ import torch._functorch
 import torch._inductor
 import torch._inductor.decomposition
 from functorch.compile import aot_function, nop
+from functorch.experimental.control_flow import UnsupportedAliasMutationException
 from torch._dynamo.testing import EagerAndRecordGraphs
-from torch._higher_order_ops import create_invoke_subgraph_op
-from torch.testing._internal.common_utils import run_tests, skipIfTorchDynamo, TestCase
+from torch.testing._internal.common_utils import run_tests, TestCase
 
 
-@skipIfTorchDynamo("Not a torch._dynamo test")
+def extract_graph(fx_g, _, graph_cell):
+    graph_cell[0] = fx_g
+    return fx_g
+
+
+invoke_subgraph = torch._higher_order_ops.invoke_subgraph
+
+
 class TestInvokeSubgraph(TestCase):
     def test_simple(self):
         def gn(x, y):
             return (torch.mul(x, y),)
 
         def fn(x, y):
-            return create_invoke_subgraph_op(gn, (x, y))[0]
+            return invoke_subgraph(gn, "subgraph", (x, y))[0]
 
         x = torch.randn(8, requires_grad=True)
         y = torch.randn(8, requires_grad=True)
@@ -42,7 +49,7 @@ class TestInvokeSubgraph(TestCase):
             return (torch.mul(x, y),)
 
         def fn(x, y):
-            return create_invoke_subgraph_op(gn, (x, y))[0]
+            return invoke_subgraph(gn, "subgraph", (x, y))[0]
 
         x = torch.randn(8, requires_grad=True)
         y = torch.randn(8, requires_grad=True)
@@ -71,9 +78,9 @@ class TestInvokeSubgraph(TestCase):
             return (torch.sin(x),)
 
         def fn(x):
-            a = create_invoke_subgraph_op(cos, (x,))[0]
-            b = create_invoke_subgraph_op(sin, (a,))[0]
-            return create_invoke_subgraph_op(cos, (b,))[0]
+            a = invoke_subgraph(cos, "subgraph1", (x,))[0]
+            b = invoke_subgraph(sin, "subgraph2", (a,))[0]
+            return invoke_subgraph(cos, "subgraph3", (b,))[0]
 
         x = torch.randn(8, requires_grad=True)
         ref = fn(x)
@@ -81,6 +88,40 @@ class TestInvokeSubgraph(TestCase):
         res = aot_fn(x)
 
         self.assertEqual(ref, res)
+
+    def test_input_mutation(self):
+        def gn(x, y):
+            x.add_(1)
+            return (torch.mul(x, y),)
+
+        def fn(x, y):
+            return invoke_subgraph(gn, "subgraph", (x, y))[0]
+
+        x = torch.randn(8, requires_grad=False)
+        y = torch.randn(8, requires_grad=False)
+
+        with self.assertRaisesRegex(
+            UnsupportedAliasMutationException, "One of invoke_subgraph hop"
+        ):
+            aot_fn = aot_function(fn, nop)
+            res = aot_fn(x, y)
+
+    def test_input_aliasing(self):
+        def gn(x, y):
+            return (x, torch.mul(x, y))
+
+        def fn(x, y):
+            outs = invoke_subgraph(gn, "subgraph", (x, y))
+            return outs[0] * outs[1]
+
+        x = torch.randn(8, requires_grad=False)
+        y = torch.randn(8, requires_grad=False)
+
+        with self.assertRaisesRegex(
+            UnsupportedAliasMutationException, "One of invoke_subgraph hop"
+        ):
+            aot_fn = aot_function(fn, nop)
+            res = aot_fn(x, y)
 
     def test_differing_strides_for_grad_outs(self):
         class CustomOp(torch.autograd.Function):
@@ -97,7 +138,7 @@ class TestInvokeSubgraph(TestCase):
             return (CustomOp.apply(x),)
 
         def fn(x):
-            a = create_invoke_subgraph_op(gn, (x,))[0]
+            a = invoke_subgraph(gn, "subgraph1", (x,))[0]
             # Force stride changes so that backward view causes a failure if
             # contiguous not called.
             b = torch.permute(a, (0, 2, 1))
@@ -118,14 +159,13 @@ class TestInvokeSubgraph(TestCase):
         self.assertEqual(x.grad, x_clone.grad)
 
 
-@skipIfTorchDynamo("Not a torch._dynamo test")
 class TestInvokeSubgraphCompile(TestCase):
     def test_simple(self):
         def gn(x, y):
             return (torch.mul(x, y),)
 
         def fn(x, y):
-            return create_invoke_subgraph_op(gn, (x, y))[0]
+            return invoke_subgraph(gn, "subgraph", (x, y))[0]
 
         x = torch.randn(8, requires_grad=True)
         y = torch.randn(8, requires_grad=True)
@@ -133,7 +173,7 @@ class TestInvokeSubgraphCompile(TestCase):
 
         x_clone = x.clone().detach().requires_grad_(True)
         y_clone = y.clone().detach().requires_grad_(True)
-        res = torch.compile(fn, backend="eager", fullgraph=True)(x_clone, y_clone)
+        res = torch.compile(fn, backend="inductor")(x_clone, y_clone)
 
         # Run backward
         ref.sum().backward()
@@ -148,8 +188,8 @@ class TestInvokeSubgraphCompile(TestCase):
             return (torch.mul(x, y),)
 
         def fn(x, y):
-            a = create_invoke_subgraph_op(gn, (x, y))[0]
-            return create_invoke_subgraph_op(gn, (a, y))[0]
+            a = invoke_subgraph(gn, "subgraph", (x, y))[0]
+            return invoke_subgraph(gn, "subgraph", (a, y))[0]
 
         x = torch.randn(8, requires_grad=True)
         y = torch.randn(8, requires_grad=True)
@@ -158,7 +198,7 @@ class TestInvokeSubgraphCompile(TestCase):
         x_clone = x.clone().detach().requires_grad_(True)
         y_clone = y.clone().detach().requires_grad_(True)
         backend = EagerAndRecordGraphs()
-        res = torch.compile(fn, backend=backend, fullgraph=True)(x_clone, y_clone)
+        res = torch.compile(fn, backend=backend)(x_clone, y_clone)
 
         # Run backward
         ref.sum().backward()
@@ -185,9 +225,9 @@ class TestInvokeSubgraphCompile(TestCase):
 
         def fn(x, y):
             nonlocal counter
-            a = create_invoke_subgraph_op(gn, (x, y))[0]
+            a = invoke_subgraph(gn, "subgraph", (x, y))[0]
             counter = 3
-            return create_invoke_subgraph_op(gn, (a, y))[0]
+            return invoke_subgraph(gn, "subgraph", (a, y))[0]
 
         x = torch.randn(8, requires_grad=True)
         y = torch.randn(8, requires_grad=True)
@@ -197,7 +237,7 @@ class TestInvokeSubgraphCompile(TestCase):
 
         x_clone = x.clone().detach().requires_grad_(True)
         y_clone = y.clone().detach().requires_grad_(True)
-        res = torch.compile(fn, backend="eager")(x_clone, y_clone)
+        res = torch.compile(fn, backend="inductor")(x_clone, y_clone)
 
         # Run backward
         ref.sum().backward()
