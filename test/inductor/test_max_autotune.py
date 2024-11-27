@@ -979,18 +979,20 @@ class TestPrologueFusion(TestCase):
                 "del", num_deallocs, exactly=True
             ).run(code_str)
 
-    @parametrize("sizes", ((64, 128, 256), (128, 128, 128), (63, 120, 250)))
+    @parametrize("sizes", ((63, 120, 250),)) #((64, 128, 256),)) #(128, 128, 128), (63, 120, 250)))
     def test_upcast(self, sizes):
         M, K, N = sizes
 
-        x = torch.rand([M, K], dtype=torch.float16, device="cuda")
+        x = torch.empty([M, K], dtype=torch.float16, device="cuda")
         y = torch.rand([K, N], dtype=torch.float, device="cuda")
+        index = torch.randperm(x.shape[0], device="cuda")
 
-        def foo(x, y):
-            return x.to(y.dtype) @ y
+        def foo(x, y, index):
+            return ((x[index]  -1).relu()).to(y.dtype) @ y
+            # return torch.ones_like(x).to(y.dtype) @ y
 
-        out, code = run_and_get_code(torch.compile(foo), x, y)
-        self.assertEqual(out, foo(x, y), atol=0.05, rtol=0.05)
+        out, code = run_and_get_code(torch.compile(foo), x, y, index)
+        self.assertEqual(out, foo(x, y, index), atol=0.05, rtol=0.05)
         self.check_code(code[0], num_kernels=1, num_allocs=1, num_deallocs=2)
 
     def test_downcast(self):

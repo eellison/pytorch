@@ -24,6 +24,7 @@ from typing import (
 )
 
 import sympy
+from ..analyze_preserves_zero_mask import preserves_zero_mask
 
 import torch
 import torch._logging
@@ -1420,6 +1421,12 @@ class SIMDScheduling(BaseScheduling):
                     with config.patch("triton.codegen_upcast_to_fp32", False):
                         with kernel.set_subgraph_body(subgraph_name):
                             for prologue_node in prologue_group:
+                                print(prologue_node._body)
+                                print(kernel.template_indices)
+                                preserves_zero_mask(prologue_node, prologue_node.get_ranges())
+                                # kernel.split_and_set_ranges(
+                                #         prologue_node.get_ranges()
+                                #     )
                                 prologue_node.codegen(
                                     kernel.split_and_set_ranges(
                                         prologue_node.get_ranges()
