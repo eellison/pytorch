@@ -3639,34 +3639,37 @@ class TritonScheduling(SIMDScheduling):
 
         return kernel_name
 
-    def benchmark_fused_nodes(self, nodes, n_spills_threshold=8):
-        with preserve_rng_state(), torch.cuda.device(
+    def benchmark_fused_nodes(self, nodes, n_spills_threshold=8) -> Tuple[float, str]:
+        """
+        Benchmark fused list of nodes and return the execution time
+        in milliseconds on randomly generated inputs.
+        """
+        src_code = self.generate_kernel_code_from_nodes(nodes, benchmark_kernel=True)
+        mod = PyCodeCache.load(src_code)
+        return self.benchmark_codegened_module(mod, n_spills_threshold)
+
+    def benchmark_codegened_module(self, mod, n_spills_threshold=8) -> Tuple[float, str]:
+        """Benchmark an already compiled module"""
+        def cache_file_path():
+            assert mod.__file__ is not None
+            return os.path.splitext(mod.__file__)[0] + ".kernel_perf"
+        def load_cache():
+            path = cache_file_path()
+            if os.path.exists(path):
+                with open(path) as fd:
+                    return float(fd.read())
+            return None
+        def store_cache():
+            path = cache_file_path()
+            with open(path, "w") as fd:
+                fd.write(str(ms))
+
+        with  torch.cuda.device(
             V.graph.get_current_device_or_throw()
         ):
-            src_code = self.generate_kernel_code_from_nodes(
-                nodes, benchmark_kernel=True
-            )
-            mod = PyCodeCache.load(src_code)
-
-            def cache_file_path():
-                assert mod.__file__ is not None
-                return os.path.splitext(mod.__file__)[0] + ".kernel_perf"
-
-            def load_cache():
-                path = cache_file_path()
-                if os.path.exists(path):
-                    with open(path) as fd:
-                        return float(fd.read())
-                return None
-
-            def store_cache():
-                path = cache_file_path()
-                with open(path, "w") as fd:
-                    fd.write(str(ms))
 
             log.debug(
-                "kernel src code for %s written to: %s",
-                {n.get_name() for n in nodes},
+                "kernel src code written to: %s",
                 mod.__file__,
             )
             ms = load_cache()
@@ -3676,24 +3679,16 @@ class TritonScheduling(SIMDScheduling):
             args = mod.get_args()
             call = mod.call
             wrapped_jit_function = mod.triton_
-
             # call once to trigger the compilation
             try:
                 call(wrapped_jit_function.clone_args(*args)[0])
             except Exception as e:
-                log.debug(
-                    "Exception (%s) in compiling fused nodes %s",
-                    e,
-                    {n.get_name() for n in nodes},
-                )
+                log.debug("Exception in initialization: %s", e)
                 ms = float("inf")
                 store_cache()
                 return ms, mod.__file__
 
             launchers = wrapped_jit_function.launchers
-            assert len(launchers) == 1
-            # n_spills does not necessarily mean it's not profitable to fuse,
-            # and sometimes it can be inaccurate
             if launchers[0].n_spills > n_spills_threshold:
                 # skip benchmarking the kernel if there are register spills
                 ms = float("inf")
@@ -3703,7 +3698,6 @@ class TritonScheduling(SIMDScheduling):
                 ms = benchmarker.benchmark_gpu(
                     lambda: call(wrapped_jit_function.clone_args(*args)[0])
                 )
-
                 # overhead of cloning args gives bias for fusing the kernel
                 # in the case of mutating/in-placeable second fusion
                 # TODO - would be better as a hook in triton do_bench that reset
@@ -3712,10 +3706,9 @@ class TritonScheduling(SIMDScheduling):
                     ms = ms - benchmarker.benchmark_gpu(
                         lambda: wrapped_jit_function.clone_args(*args)
                     )
-
+            
             log.debug(
-                "The fused kernel for %s took %.3f ms to run",
-                {n.get_name() for n in nodes},
+                "The kernel took %.3f ms to run",
                 ms,
             )
             store_cache()

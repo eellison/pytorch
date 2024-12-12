@@ -6978,7 +6978,9 @@ class StorageBox(MutableBox):
         A heuristic to decide if we should realize a tensor
         that is used multiple times.
         """
+        return True
         if users > 1 and isinstance(self.data, (Pointwise, Reduction)):
+            
             if is_cpu(self.data):
                 # Heuristic for realizing reused result of heavy ops on cpu
                 opcount = self.data.inner_fn_opcount()
@@ -6989,6 +6991,7 @@ class StorageBox(MutableBox):
                 self.num_reads() > config.realize_reads_threshold
                 or self.has_large_inner_fn()
             )
+            
         return False
 
     def mark_reuse(self, users: int) -> None:
