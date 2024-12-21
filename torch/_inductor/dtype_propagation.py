@@ -75,12 +75,6 @@ def promote_types(
 
     for arg in args:
         if isinstance(arg, str):
-            # TODO: fix the flex attention instances, enable internally
-            if not config.is_fbcode():
-                assert isinstance(
-                    V.get_ops_handler(),
-                    torch._inductor.select_algorithm.ModificationWrapper,
-                )
             continue
 
         if isinstance(arg, OpsValue):
