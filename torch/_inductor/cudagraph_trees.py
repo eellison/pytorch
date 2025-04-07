@@ -432,6 +432,7 @@ def cudagraphify(
     mutated_input_idxs: tuple[int, ...] = (),
     compile_id: Optional[CompileId] = None,
 ) -> tuple[ModelType, OutputType]:
+    print(static_input_idxs)
     assert not (is_backward and is_inference)
     mode = (
         CompilationMode.BACKWARD

@@ -242,6 +242,7 @@ class InductorChoices:
 
                     WhyNoFuse(node1, node2)("no shared data due to indexing mismatch")
                     return False
+            
             WhyNoFuse(node1, node2)("no shared data")
             return False  # heuristic not needed for correctness
 

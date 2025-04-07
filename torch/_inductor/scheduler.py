@@ -234,6 +234,7 @@ class BaseSchedulerNode:
         buf.splice(
             f"""\
 {name}: {type(self).__name__}({type(getattr(self, "node", None)).__name__})
+{name}.reads = {pformat(self.read_writes.reads)}
 {name}.writes = {pformat(self.read_writes.writes)}
 {name}.unmet_dependencies = {pformat(self.unmet_dependencies)}
 {name}.met_dependencies = {pformat(self.read_writes.reads - self.unmet_dependencies)}
@@ -987,6 +988,32 @@ class SchedulerNode(BaseSchedulerNode):
         self._init_from_node(node)
         self._compute_attrs()
 
+
+    def _compute_attrs_from_sizes_and_body(self, sizes, body):
+        self._sizes = sizes
+        self._body = body
+
+        device = self.node.get_device_or_error()
+        group_fn = self.scheduler.get_backend(device).group_fn
+        self.group = (device, group_fn(self._sizes))
+
+        # Don't normalize since normalization will merge loops which
+        # makes it hard to decide new loop orders.
+        should_normalize = not config.loop_ordering_after_fusion or not is_gpu(
+            device.type
+        )
+
+        if isinstance(self.node, ir.TemplateBuffer):
+            self.set_read_writes(
+                self.node.extract_read_writes(normalize=should_normalize)
+            )
+        else:
+            self.set_read_writes(
+                dependencies.extract_read_writes(
+                    self._body, *self._sizes, normalize=should_normalize
+                )
+            )
+
     def _compute_attrs(
         self,
         extra_indexing_constraints: Optional[tuple[dict[Any, Any], list[Any]]] = None,
@@ -1173,14 +1200,18 @@ class SchedulerNode(BaseSchedulerNode):
             raise
 
     def pointwise_or_reduction_read_writes(
-        self, pointwise: bool = True
+        self, pointwise: bool = True, zero_hidden_vars = True
     ) -> dependencies.ReadWrites:
         """
         Get the memory dependencies in either the pointwise or the reduction axes.
         """
         keep_sizes, ignore_sizes = self._sizes if pointwise else reversed(self._sizes)
+        if zero_hidden_vars:
+            hidden_args=[[sympy.S.Zero] * len(ignore_sizes)]
+        else:
+            hidden_args = [[sympy.Symbol(str(i), integer=True) for i in range(len(ignore_sizes))]]
         return dependencies.extract_read_writes(
-            self._body, keep_sizes, hidden_args=[[sympy.S.Zero] * len(ignore_sizes)]
+            self._body, keep_sizes, hidden_args=hidden_args
         )
 
     @cache_on_self

@@ -17,6 +17,7 @@ from typing_extensions import TypeVar
 import sympy
 
 import torch
+from torch._inductor.lowering import fallback_node_due_to_unsupported_type
 import torch._logging
 from torch.fx.immutable_collections import immutable_dict
 from torch.utils._ordered_set import OrderedSet
@@ -1314,9 +1315,23 @@ class SIMDScheduling(BaseScheduling):
 
         _, (numel, rnumel) = max(nodes, key=lambda x: int(x.is_reduction())).group
 
+        
+        outputs = node.get_buffer_names()
+        inputs = OrderedSet(dep.name for dep in node.read_writes.reads)
+
+        # OrderedSet([MemoryDep('buf0', c0, {c0: 262144}), MemoryDep('buf2', c0, {c0: 8388608}), MemoryDep('buf1', c0, {c0: 262144})])
+        # looking at the dep doesnt give full memory addr, bc it does not include reduction var
+        # 
+
+        # check is reduction before adding in another var ?
+        new_nodes = torch._inductor.utils.get_fused_node_tilings(node, inputs, outputs)
+
+        # breakpoint()
+
         node_schedule = self.generate_node_schedule(nodes, numel, rnumel)
         schedule_log.debug("Schedule:\n %s", node_schedule)
-
+        
+        # breakpoint()
         return self.codegen_node_schedule(
             SIMDKernelFeatures(node_schedule, numel, rnumel)
         )
@@ -1667,11 +1682,11 @@ class SIMDScheduling(BaseScheduling):
     def candidate_tilings(cls, node, numel, reduction_numel) -> list[CandidateTiling]:
         is_pointwise = reduction_numel == 1
 
-        def tile_ranges(is_pointwise: bool, ranges, rw) -> list[CandidateTiling]:
+        def tile_ranges(tiling_pointwise: bool, pw_ranges, red_ranges, rw, red_vars) -> list[CandidateTiling]:
             """
             Compute tiling candidates by dividing up the iteration ranges.
             """
-            assert len(rw.range_vars) == len(ranges), f"{rw.range_vars=} {ranges=}"
+            assert len(rw.range_vars) == len(pw_ranges) + len(red_ranges), f"{rw.range_vars=} {ranges=}"
 
             # isinstance(dep, MemoryDep): this filters out StarDeps. StarDeps refer to reads
             # that need to access the entire tensor; they don't contribute read indexing
@@ -1697,20 +1712,21 @@ class SIMDScheduling(BaseScheduling):
             tilings = [
                 CandidateTiling(
                     tiling=cls.create_partial_tiling(
-                        [collapse_ranges(ranges)], is_pointwise
+                        [collapse_ranges(pw_ranges if tiling_pointwise else rw_ranges)], tiling_pointwise
                     ),
                     name="none",
                     score=0,
                 )
             ]
-
             # Find non-trivial tiling candidates.
             for dep in deps:
                 strides = V.graph.sizevars.stride_hints(dep.index, rw.range_vars)
-                assert len(strides) == len(ranges)
+                assert len(strides) == len(pw_ranges + red_ranges)
+
+                
                 try:
                     split = strides.index(1) + 1
-                    if split == len(ranges):
+                    if split == len(pw_ranges + red_ranges):
                         continue
                     if all(s == 0 for s in strides[split:]):
                         # if this is a broadcasted tensor and all dimensions after split are broadcast,
@@ -1720,17 +1736,28 @@ class SIMDScheduling(BaseScheduling):
                 except ValueError:
                     continue
 
-                tiled_groups = (
-                    collapse_ranges(ranges[:split]),
-                    collapse_ranges(ranges[split:]),
-                )
+                if tiling_pointwise and split >= len(pw_ranges):
+                    continue
+
+                if not tiling_pointwise:
+                    tiled_groups = (
+                        collapse_ranges(red_ranges[:split - len(pw_ranges)]),
+                        collapse_ranges(red_ranges[split - len(pw_ranges):]),
+                    )
+                else:
+                    tiled_groups = (
+                        collapse_ranges(pw_ranges[:split]),
+                        collapse_ranges(pw_ranges[split:]),
+                    )
+
 
                 # score by number of elements
                 score = V.graph.sizevars.size_hint(
                     sympy_product(
-                        size for size, stride in zip(ranges, strides) if stride != 0
+                        size for size, stride in zip(pw_ranges + red_ranges, strides) if stride != 0
                     )
                 )
+
                 if dep.name in write_names:
                     # ngimel said contiguous writes is more important than reads
                     score *= 2
@@ -1741,7 +1768,7 @@ class SIMDScheduling(BaseScheduling):
 
                 if (
                     V.graph.sizevars.size_hint(
-                        score - sympy_product(itertools.chain(ranges, reduction_ranges))
+                        score - sympy_product(itertools.chain(pw_ranges + red_ranges, reduction_ranges))
                     )
                     >= 0
                 ):
@@ -1749,8 +1776,8 @@ class SIMDScheduling(BaseScheduling):
                         CandidateTiling(
                             tiling=cls.create_partial_tiling(
                                 [
-                                    collapse_ranges(ranges[:split]),
-                                    collapse_ranges(ranges[split:]),
+                                    collapse_ranges(pw_ranges + red_ranges[:split]),
+                                    collapse_ranges(pw_ranges + red_ranges[split:]),
                                 ],
                                 reduction_numel,
                             ),
@@ -1767,10 +1794,34 @@ class SIMDScheduling(BaseScheduling):
 
         # Tile either pointwise or reduction dims.
         pointwise_ranges, reduction_ranges = node.get_ranges()
+        tile_pointwise = is_pointwise or len(pointwise_ranges) > 1
+
+        if len(pointwise_ranges) == 2 and reduction_ranges:
+            breakpoint()
+            return [CandidateTiling(
+                tiling=cls.create_tiling(pointwise_ranges, reduction_ranges),
+                score=100000000
+            )]
+
+        ranges_used = pointwise_ranges if tile_pointwise else reduction_ranges
+        if not is_pointwise and tile_pointwise:
+            reads = node.read_writes
+            ranges_used = pointwise_ranges + reduction_ranges
+            # reads = node.pointwise_or_reduction_read_writes(is_pointwise, zero_hidden_vars=False)
+        else:
+            reads = node.pointwise_or_reduction_read_writes(is_pointwise)
+
+        red_vars = OrderedSet()
+        for sub_node in node.get_nodes():
+            _, _, (index_vars, reduce_vars) = node.node.get_default_sizes_body()
+            red_vars |= reduce_vars
+
         partial_tilings = tile_ranges(
-            is_pointwise,
-            pointwise_ranges if is_pointwise else reduction_ranges,
-            node.pointwise_or_reduction_read_writes(is_pointwise),
+            tile_pointwise,
+            pointwise_ranges,
+            reduction_ranges,
+            reads,
+            red_vars,
         )
 
         # Fill in the missing ranges.
@@ -1784,7 +1835,6 @@ class SIMDScheduling(BaseScheduling):
             )
             for tiling in partial_tilings
         ]
-
         return full_tilings
 
     @classmethod
@@ -1794,6 +1844,7 @@ class SIMDScheduling(BaseScheduling):
         """
         Create a tiling dict from pointwise and reduction splits.
         """
+        # breakpoint()
         pw_prefixes = ["z", "y", "x"][-len(pw_tiling) :]
         reduction_prefixes = ["r0_", "r1_"][: len(reduction_tiling)]
         return immutable_dict(
@@ -1948,7 +1999,7 @@ class SIMDScheduling(BaseScheduling):
 
     @classmethod
     def select_tiling(
-        cls, node_schedule, numel, reduction_numel=sympy.S.One
+        cls, node_schedule, numel, reduction_numel=sympy.S.One, 
     ) -> dict[str, sympy.Expr]:
         """
         Heuristics to decide how to tile kernels.
@@ -1958,15 +2009,18 @@ class SIMDScheduling(BaseScheduling):
             `(tile1, tile2, reduction_numel)` s.t. `tile1 * tile2 == numel`
 
         """
+        # breakpoint()
         # If this is a reduction, only tile reduction dims.
         is_pointwise = reduction_numel == 1
 
         # Tiled reductions are gated by a config flag.
+        # breakpoint()
+        # return cls.create_tiling([numel // 64, 64], [reduction_numel])
         default_tiling = cls.create_tiling([numel], [reduction_numel])
         if (
             not is_pointwise and not config.triton.tile_reductions
         ) or config.triton.max_tiles <= 1:
-            # Emit a perf hint in case we miss an opportunity to tile a reduction.
+            # Emit a perf hin in case we miss an opportunity to tile a reduction.
             if perf_hint_log.level <= logging.WARNING:
                 for node in EnableReduction.filter(node_schedule):
                     if (
@@ -1982,6 +2036,7 @@ class SIMDScheduling(BaseScheduling):
                             )
                         )
                         break
+            # breakpoint()
             return default_tiling
 
         seen_names = OrderedSet[str]()
@@ -1993,11 +2048,12 @@ class SIMDScheduling(BaseScheduling):
                 elif candidate_tiling.name is not None:
                     seen_names.add(candidate_tiling.name)
                 candidate_tiles[candidate_tiling] += candidate_tiling.score
-
+        # breakpoint()
         ranked_tilings: list[dict[str, sympy.Expr]] = [
             candidate_tiling.tiling
             for candidate_tiling, score in candidate_tiles.most_common()
         ]
+        # breakpoint()
 
         if config.triton.max_tiles >= 3 and is_pointwise:
             # Consider adding a third dimension of tiling, but only

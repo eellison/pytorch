@@ -297,6 +297,14 @@ class LoopBody:
                 return self.indexing_exprs[entry.index_name]
         raise KeyError(buffer_name)
 
+    def get_all_read_expr(self, buffer_name):
+        # reversed to match old behavior
+        out = []
+        for entry in reversed(self.memory_usage[MemoryUsageType.LOAD]):
+            if entry.buffer_name == buffer_name:
+                out.append(self.indexing_exprs[entry.index_name])
+        return out
+
     def get_write_expr(self, buffer_name):
         for entry in itertools.chain(
             self.memory_usage[MemoryUsageType.STORE],
@@ -305,6 +313,17 @@ class LoopBody:
             if entry.buffer_name == buffer_name:
                 return self.indexing_exprs[entry.index_name]
         raise KeyError(buffer_name)
+
+    def get_all_write_expr(self, buffer_name):
+        out = []
+        for entry in itertools.chain(
+            self.memory_usage[MemoryUsageType.STORE],
+            self.memory_usage[MemoryUsageType.STORE_REDUCTION],
+        ):
+            if entry.buffer_name == buffer_name:
+                out.append(self.indexing_exprs[entry.index_name])
+        return out
+
 
     def get_read_exprs(self):
         return [

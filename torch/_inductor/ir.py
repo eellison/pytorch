@@ -28,6 +28,7 @@ from unittest.mock import patch
 
 import sympy
 from sympy import Expr, Integer, Symbol
+from collections import Counter, defaultdict
 
 import torch._export.serde.schema as export_schema
 import torch._library.utils as library_utils
@@ -56,7 +57,7 @@ from torch.fx.experimental.symbolic_shapes import (
 )
 from torch.utils._ordered_set import OrderedSet
 from torch.utils._sympy.functions import CleanDiv, FloorDiv, ModularIndexing
-from torch.utils._sympy.symbol import SymT
+from torch.utils._sympy.symbol import SymT, symbol_is_type
 
 from . import config, dependencies
 from .codegen.common import (
@@ -4336,12 +4337,164 @@ class ComputedBuffer(OperationBuffer):
             reduce_vars, support_vars, reduce_size, should_merge_loops
         )
 
+        import operator
+        # memory_sizes = [
+        #     functools.reduce(operator.mul, [body.var_ranges[v] for v in addr.free_symbols])
+        #     for addr in memory_addrs
+        # ]
+
+        # Todo deduplicate
+        # Todo: use dtype size
+        def get_score(addr, var_ranges):
+            var_sizes = []
+            for v in addr.free_symbols:
+                v_size = var_ranges.get(v, None)
+                if not symbol_is_type(v, SymT.INDIRECT) and v_size is not None:
+                    var_sizes.append(v_size)
+
+            return V.graph.sizevars.size_hint(
+                sympy_product(
+                    var_sizes
+                )
+            )
+
+        def get_top_level_terms(expr):
+            """
+            Extract the top-level terms that are combined with + or - in a sympy expression.
+            
+            Args:
+                expr: A sympy expression object
+                
+            Returns:
+                List of top-level terms as sympy expressions
+            """
+            # If the expression is an Add object, return its arguments
+            if isinstance(expr, sympy.Add):
+                return list(expr.args)
+            else:
+                # If not, the entire expression is a single term
+                return [expr]
+        
+        def check_with_subs(expr, variables):
+            results = {}
+            base_dict = {v: 0 for v in variables}
+            for var in variables:
+                # Evaluate with var=0, keeping others at 0
+                base_dict = {v: 0 for v in variables}
+                val_at_0 = expr.subs(base_dict)
+                
+                # Evaluate with var=1, keeping others at 0
+                base_dict[var] = 1
+                val_at_1 = expr.subs(base_dict)
+                
+                # Check difference
+                results[var] = val_at_1 - val_at_0
+            
+            return results
+
+        def is_coalesced(addr, var_ranges) -> Optional[sympy.Expr]:
+            # returns the symbol this is coalesced wrt to
+
+            top_level_terms = get_top_level_terms(addr)
+            # todo ignore indirect
+            for v in var_ranges:
+                if v in top_level_terms:
+                    return v
+        
+            # this is approximate. we could also take derivates and will later but 
+            # that seems slower. i wonder what the above check would catch but this wouldnt..
+            free_symbols = addr.free_symbols
+            variables = {v: 0 for v in addr.free_symbols}
+            base_value = sympy_subs(addr, variables)
+            for v in var_ranges.keys():
+                variables[v] = 1
+                new_val = sympy_subs(addr, variables)
+                if new_val - base_value == 1:
+                    return v
+                variables[v] = 0
+
+            return None
+
+        var_ranges = body.var_ranges
+
+ 
+        maybe_tiling = None
+        do_tiling_var = True
+        import os
+        if os.environ.get("DO_TILE", "0") == "1":
+            maybe_tiling = tile_variables(memory_addrs, index_vars, reduce_vars, var_ranges)
+
+
+        prev_iter_vars = index_vars
+        prev_reduce = reduce_vars
+
         # retrace the loop body with simplification and reordering applied
         (iter_vars, reduce_vars), var_ranges = dependencies.index_vars_no_squeeze(
             iter_ranges,
             reduce_ranges,
             prefix="p",
         )
+
+        def get_index(li, v):
+            try:
+                return li.index(v)
+            except:
+                return None
+
+        tile_factor = 2048
+        max_block_size = 2048
+
+        if maybe_tiling:
+            mapping = {}
+            updated_var = maybe_tiling[0]
+            tiling = maybe_tiling[1]
+            for old, new in zip(prev_iter_vars, iter_vars):
+                mapping[old] = new
+            for old, new in zip(prev_reduce, reduce_vars):
+                mapping[old] = new
+
+            v2 = sympy_subs(maybe_tiling[0], mapping)
+            ind = get_index(reduce_vars, v2)
+            if ind is not None:
+                reduce_vars[ind] =  (tiling * ModularIndexing(v2, 1, max_block_size)) + FloorDiv((v2), max_block_size)
+            ind = get_index(iter_vars, v2)
+
+            if ind is not None:
+                rep = ModularIndexing(v2, 1, tiling)  # Range: 0-63
+                rep2 = FloorDiv(v2, 64)  # This becomes our coalescing variable
+                # Substitution
+                q0 = 64 * rep + rep2
+
+                # v1 = q0 % 64  # Range: 0-63
+                # v2 = q0 // 64  # This becomes our coalescing variable
+                # # Substitution
+                # q0 = 64 * v2 + v1
+                # iter_vars[ind] = (tiling * rep) + 
+
+                new_expr = (tiling * ModularIndexing(v2, 1, max_block_size)) + FloorDiv((v2), max_block_size)
+                # breakpoint()
+                # breakpoint()
+                iter_vars[ind] = new_expr
+                # iter_vars[ind] = q0
+            
+
+        # for i, v in enumerate(iter_vars):
+        #     v_str = "q" + str(v)[1:]
+        #     if f"(((32*{v_str}" in repr(memory_addrs):
+        #         replaced = True
+        #         # breakpoint()
+        #         # iter_vars[i] = q(64 * (v % 4096)) + (v) // 4096
+        #         iter_vars[i] = (64 * ModularIndexing(v, 1, tile_factor)) + FloorDiv((v), tile_factor)
+
+        # if not replaced:
+        #     v = iter_vars[0]
+        #     # iter_vars[0] = (64 * (v % 4096)) + (v) // 4096
+        #     iter_vars[0] = (64 * ModularIndexing(v, 1, tile_factor)) + FloorDiv((v), tile_factor)
+
+        # i_v = iter_vars[0]
+        # i_v2 = (64 * (i_v % 4096)) + (i_v) // 4096
+        # iter_vars = [i_v2]
+        is_reduction = isinstance(self.data, Reduction)
         body = LoopBody(
             body,
             [iter_reindex(iter_vars), reduce_reindex(reduce_vars)],
@@ -4349,6 +4502,7 @@ class ComputedBuffer(OperationBuffer):
             iter_vars,
             reduce_vars,
         )
+        # breakpoint()
         return (iter_ranges, reduce_ranges), body
 
     @staticmethod

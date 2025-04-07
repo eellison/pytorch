@@ -22,6 +22,7 @@ import textwrap
 import time
 import unittest
 from collections.abc import Collection, Iterator, Mapping, MutableMapping, MutableSet
+from collections import Counter, defaultdict
 from datetime import datetime
 from io import StringIO
 from typing import (
@@ -37,6 +38,7 @@ from typing import (
     TypeVar,
     Union,
 )
+from torch.utils._sympy.symbol import SymT, symbol_is_type
 from typing_extensions import (
     Concatenate,
     dataclass_transform,
@@ -52,7 +54,8 @@ import torch
 from torch._inductor.runtime.hints import DeviceProperties
 from torch.utils._ordered_set import OrderedSet
 from torch.utils._pytree import tree_map_only
-
+from torch.utils._sympy.functions import FloorDiv, ModularIndexing
+from torch.utils._sympy.solve import try_solve
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Sequence, ValuesView
@@ -305,6 +308,491 @@ def ceildiv(
         f"{numer}: {type(numer)}, {denom}: {type(denom)}"
     )
     return runtime_ceildiv(numer, denom)
+
+
+
+
+def replace_floor_div(expr):
+    def indexing_div_rep(x, y):
+        return x / y
+
+    return expr.replace(
+        FloorDiv, indexing_div_rep
+    )
+
+def replace_modular_indexing(expr):
+    def mod_indexing_rep(x, y, z):
+        return (x / y) % z
+
+    return expr.replace(ModularIndexing, mod_indexing_rep)
+
+def replace_symbols_for_solving(expr):
+
+    return replace_modular_indexing(replace_floor_div(expr))
+
+
+def solve_for_zero(expr) -> Optional[tuple[sympy.Rel, sympy.Expr]]:
+    if expr.is_constant() and not expr == 0:
+        return None
+    elif isinstance(expr, ModularIndexing):
+        return try_solve(sympy.Eq(expr.args[0] / expr.args[1], expr.args[2]), next(iter(expr.free_symbols)))
+    elif isinstance(expr, FloorDiv):
+        return None
+    else:
+        return try_solve(sympy.Eq(expr, 0), next(iter(expr.free_symbols)))
+
+def solve_for_tiling(expr):
+
+    potential_subsitutions = []
+    required_substitutions = []
+    relations = []
+    possible_values = []
+
+    exprs = expr.args if isinstance(expr, sympy.Add) else [expr]
+    for arg in exprs:
+        # try to make mul term 0 as it is likely not dense
+        if isinstance(arg, sympy.Mul):
+            seen = False
+            # TODO: only need one of these to be true
+            for mul_arg in arg.args:
+                out = solve_for_zero(mul_arg)
+                if out is None:
+                    continue
+                
+                seen = True
+                relations.append(out[0])
+                possible_values.append(out[1])
+
+            if not seen:
+                return None
+
+            continue
+        else:
+            free_symbol = next(iter(arg.free_symbols))
+            out = try_solve(sympy.Eq(replace_symbols_for_solving(arg), 1), free_symbol)
+            if out is None:
+                return None
+
+            relations.append(out[0])
+            possible_values.append(out[1])
+
+    if len(set(possible_values)) == 1:
+        return possible_values[0]
+    
+    return None
+
+
+# def apply_tiling_transformation(node, tile_var, tile_size):
+#     """
+#     Apply tiling transformation by splitting the specified variable
+#     according to the tiling factor.
+#     """
+#     # Get the current sizes and body
+#     (index_size, reduce_size), body, (index_vars, reduce_vars) = node.node.get_default_sizes_body()
+    
+#     # Find position of tile_var in index_vars
+#     try:
+#         var_idx = index_vars.index(tile_var)
+#     except ValueError:
+#         # Variable not in index_vars, can't tile
+#         return node
+    
+#     # Create new sizes list by splitting the tiled variable's dimension
+#     new_index_size = list(index_size)
+#     var_size = new_index_size[var_idx]
+    
+#     # Calculate outer and inner sizes
+#     outer_size = sympy.ceiling(var_size / tile_size)
+#     inner_size = tile_size
+    
+#     # Replace the original size with outer size and insert inner size
+#     new_index_size[var_idx] = outer_size
+#     new_index_size.insert(var_idx + 1, inner_size)
+    
+#     # Create a reindexing function to map from new indices to old
+#     def reindex_fn(new_vars):
+#         result = list(new_vars)
+#         # Replace the split variables with the original variable expression
+#         outer_var = result[var_idx]
+#         inner_var = result[var_idx + 1]
+#         # Remove the two split variables
+#         del result[var_idx:var_idx + 2]
+#         # Insert the original variable expression: outer*tile_size + inner
+#         result.insert(var_idx, outer_var * tile_size + inner_var)
+#         return result
+    
+#     # Create the reindexing function object
+#     def reindex(vars_list):
+#         return reindex_fn(vars_list)
+    
+#     # Similar to how the original code handles loop transformations
+#     support_vars = index_vars + reduce_vars
+    
+#     from . import dependencies
+#     from .loop_body import LoopBody
+
+#     # Create new variable ranges and loop body with the transformation
+#     (new_index_vars, reduce_vars), var_ranges = dependencies.index_vars_no_squeeze(
+#         new_index_size,
+#         reduce_size,
+#         prefix="p",  # Use appropriate prefix
+#     )
+    
+#     # Create the new loop body with our reindexing function
+#     new_body = LoopBody(
+#         body,
+#         [reindex(new_index_vars), reduce_vars],  # Apply reindex to the new index vars
+#         var_ranges,
+#         new_index_vars,
+#         reduce_vars,
+#     )
+    
+#     breakpoint()
+#     return new_body
+    
+#     # Update the node with the new sizes and body
+#     # node.update_sizes_and_body((new_index_size, reduce_size), new_body)
+    
+#     return node
+
+
+def apply_tiling_transformation(node, tile_var, tile_size):
+    """
+    Apply tiling transformation and return the new ranges and body
+    following the same interface as simplify_and_reorder.
+    """
+    # Get the current sizes and body
+    (index_size, reduce_size), body, (index_vars, reduce_vars) = node.node.get_default_sizes_body()
+    
+    # Find position of tile_var in index_vars
+    try:
+        var_idx = index_vars.index(tile_var)
+    except ValueError:
+        # Variable not in index_vars, return unchanged
+        return (index_size, reduce_size), body
+    
+    # Create new sizes list by splitting the tiled variable's dimension
+    new_index_size = list(index_size)
+    var_size = new_index_size[var_idx]
+    
+    # Calculate outer and inner sizes
+    outer_size = sympy.ceiling(var_size / tile_size)
+    inner_size = tile_size
+    
+    # Replace the original size with outer size and insert inner size
+    new_index_size[var_idx] = outer_size
+    new_index_size.insert(var_idx + 1, inner_size)
+    
+    # Create a reindexing function similar to those in simplify_and_reorder
+    def iter_reindex(new_vars):
+        result = list(new_vars)
+        if len(result) > len(index_vars):
+            # This means we have the split variables
+            outer_var = result[var_idx]
+            inner_var = result[var_idx + 1]
+            # Calculate the original variable
+            original_var = outer_var * tile_size + inner_var
+            # Replace the two split variables with the original in the mapping
+            old_vars = list(index_vars)
+            old_vars[var_idx] = original_var
+            return old_vars
+        return result
+    
+    # For reduce variables, no change
+    def reduce_reindex(vars_list):
+        return vars_list
+
+    from . import dependencies
+    from .loop_body import LoopBody
+
+    # Create new variable ranges with the transformed structure
+    (new_iter_vars, new_reduce_vars), new_var_ranges = dependencies.index_vars_no_squeeze(
+        new_index_size,
+        reduce_size,
+        prefix="p",  # Use appropriate prefix
+    )
+    
+    # Create the new loop body with the reindexing functions
+    # breakpoint()
+    new_body = LoopBody(
+        body,
+        [iter_reindex(new_iter_vars), reduce_reindex(new_reduce_vars)],
+        new_var_ranges,
+        new_iter_vars,
+        new_reduce_vars,
+    )
+    
+
+    # Return the new ranges and body
+    return (new_index_size, reduce_size), new_body
+
+def apply_tiling_transformation(node_data, tile_var, tile_size):
+    """
+    Apply tiling transformation to the node data.
+    
+    Args:
+        node_data: Tuple of ((index_size, reduce_size), body, (index_vars, reduce_vars))
+        tile_var: The variable to tile
+        tile_size: The tiling factor
+    
+    Returns:
+        Tuple of (new_sizes, new_body)
+    """
+    # Unpack the node data
+    (index_size, reduce_size), body, (index_vars, reduce_vars) = node_data
+    
+    # Find position of tile_var in index_vars
+    try:
+        var_idx = index_vars.index(tile_var)
+    except ValueError:
+        # If var not in this node's index vars, return unchanged
+        return (index_size, reduce_size), body
+    
+    # Create new sizes list by splitting the tiled variable's dimension
+    new_index_size = list(index_size)
+    var_size = new_index_size[var_idx]
+    
+    # Calculate outer and inner sizes
+    from .virtualized import ops, OpsValue, V
+    from . import dependencies
+    from .loop_body import LoopBody
+    outer_size = V.graph.sizevars.simplify(sympy.ceiling(var_size / tile_size))
+    inner_size = tile_size
+    
+    # Replace the original size with outer size and insert inner size
+    new_index_size[var_idx] = outer_size
+    new_index_size.insert(var_idx + 1, inner_size)
+    
+    # Create new variables with the transformed structure
+    (new_index_vars, new_reduce_vars), new_var_ranges = dependencies.index_vars_no_squeeze(
+        new_index_size,
+        reduce_size,
+        prefix="p",  # Use appropriate prefix
+    )
+    
+    # Define the substitution from old vars to new vars
+    substitution = {}
+    for i, old_var in enumerate(index_vars):
+        if i == var_idx:
+            # The tiled variable becomes outer*tile_size + inner
+            substitution[old_var] = new_index_vars[i] * tile_size + new_index_vars[i+1]
+        else:
+            # Other variables just map to corresponding new vars
+            # Adjust index for variables after the tiled one
+            new_idx = i if i < var_idx else i + 1
+            substitution[old_var] = new_index_vars[new_idx]
+    
+    # For reduction variables, keep the mapping straightforward
+    for i, old_var in enumerate(reduce_vars):
+        substitution[old_var] = new_reduce_vars[i]
+    
+    # Function to map from new indices to old indices for the LoopBody constructor
+    def old_from_new(new_indices):
+        result = []
+        for i, old_var in enumerate(index_vars):
+            result.append(substitution[old_var])
+        return result
+    
+    # Create the new loop body
+    # Create a list of reindexed variables for both iter and reduce vars
+    reindexed_vars = []
+    for vars_list in [index_vars, reduce_vars]:
+        reindexed_vars.append([substitution.get(v, v) for v in vars_list])
+        
+    new_body = LoopBody(
+        body,
+        reindexed_vars,
+        new_var_ranges,
+        new_index_vars,
+        new_reduce_vars,
+    )
+    return (new_index_size, reduce_size), new_body
+
+def get_fused_node_tilings(fused_node, inputs, outputs):
+
+    nodes = fused_node.get_nodes()
+    memory_addrs = []
+    reads = []
+    writes = []
+    
+    all_iter_vars = []
+
+    all_index_vars = OrderedSet()
+    all_reduce_vars = OrderedSet()
+    var_ranges = {}
+    node_vars = []
+
+    for node in nodes:
+        (index_size, reduce_size), body, (index_vars, reduce_vars) = node.node.get_default_sizes_body()
+        node_vars.append((index_vars, reduce_vars))
+
+        all_index_vars |= OrderedSet(index_vars)
+        all_reduce_vars |= OrderedSet(reduce_vars)
+
+        assert len(index_size) == len(index_vars)
+        assert len(reduce_size) == len(reduce_vars)
+        for s, i in zip(index_size, index_vars):
+            if ex_s := var_ranges.get(i):
+                assert ex_s == s
+            else:
+                var_ranges[i] = s
+
+        for s, i in zip(reduce_size, reduce_vars):
+            if ex_s := var_ranges.get(i):
+                assert ex_s == s
+            else:
+                var_ranges[i] = s
+
+        all_iter_vars.append((index_vars, reduce_vars))
+        for addr in inputs:
+            memory_addrs.extend(body.get_all_read_expr(addr))
+            reads.extend(body.get_all_read_expr(addr))
+        for addr in outputs:
+            o = body.get_all_write_expr(addr)
+            memory_addrs.extend(o)
+            writes.extend(o)
+
+    tiled_variables = tile_variables(memory_addrs, all_index_vars, all_reduce_vars, var_ranges)
+    print("TIling variables")
+    # breakpoint()
+    if tiled_variables:
+        new_nodes = []
+        tile_var, tile_size, should_split = tiled_variables
+        assert should_split
+        # Apply the tiling transformation to each node
+        for node in nodes:
+            sizes, body = apply_tiling_transformation(node.node.get_default_sizes_body(), tile_var, tile_size)
+            node._compute_attrs_from_sizes_and_body(sizes, body)
+            node.refresh_dependencies(normalize=False, need_clear_tiling_cache=True)
+            new_nodes.append(node)
+            pass    
+
+        # breakpoint()
+        return new_nodes
+
+    if isinstance(fused_node, torch._inductor.scheduler.FusedSchedulerNode):
+        breakpoint()
+        refresh_group_node_dependencies(self)
+
+
+def get_score(addr, var_ranges):
+    var_sizes = []
+    for v in addr.free_symbols:
+        v_size = var_ranges.get(v, None)
+        if not symbol_is_type(v, SymT.INDIRECT) and v_size is not None:
+            var_sizes.append(v_size)
+    from .virtualized import ops, OpsValue, V
+    return V.graph.sizevars.size_hint(
+        sympy_product(
+            var_sizes
+        )
+    )
+
+def get_top_level_terms(expr):
+    """
+    Extract the top-level terms that are combined with + or - in a sympy expression.
+    
+    Args:
+        expr: A sympy expression object
+        
+    Returns:
+        List of top-level terms as sympy expressions
+    """
+    # If the expression is an Add object, return its arguments
+    if isinstance(expr, sympy.Add):
+        return list(expr.args)
+    else:
+        # If not, the entire expression is a single term
+        return [expr]
+
+def check_with_subs(expr, variables):
+    results = {}
+    base_dict = {v: 0 for v in variables}
+    for var in variables:
+        # Evaluate with var=0, keeping others at 0
+        base_dict = {v: 0 for v in variables}
+        val_at_0 = expr.subs(base_dict)
+        
+        # Evaluate with var=1, keeping others at 0
+        base_dict[var] = 1
+        val_at_1 = expr.subs(base_dict)
+        
+        # Check difference
+        results[var] = val_at_1 - val_at_0
+    
+    return results
+
+def is_coalesced(addr, var_ranges) -> Optional[sympy.Expr]:
+    # returns the symbol this is coalesced wrt to
+
+    top_level_terms = get_top_level_terms(addr)
+    # todo ignore indirect
+    for v in var_ranges:
+        if v in top_level_terms:
+            return v
+
+    # this is approximate. we could also take derivates and will later but 
+    # that seems slower. i wonder what the above check would catch but this wouldnt..
+    free_symbols = addr.free_symbols
+    variables = {v: 0 for v in addr.free_symbols}
+    base_value = sympy_subs(addr, variables)
+    for v in var_ranges.keys():
+        variables[v] = 1
+        new_val = sympy_subs(addr, variables)
+        if new_val - base_value == 1:
+            return v
+        variables[v] = 0
+
+    return None
+
+
+def tile_variables(memory_addrs, iter_vars, reduce_vars, var_ranges, skip=False) -> Optional[sympy.Expr, int]:
+
+    coalesced_by_var = Counter()
+    uncoalesced_addrs = {}
+
+    for memory_addr in memory_addrs:
+        # TODO - deduplicate with candidate_tilings
+        score = get_score(memory_addr, var_ranges)
+        maybe_coalesced_var = is_coalesced(memory_addr, var_ranges)
+        if maybe_coalesced_var:
+            coalesced_by_var[maybe_coalesced_var] += score
+        else:
+            uncoalesced_addrs[memory_addr] = score
+
+    # map from var -> tiling -> total_score
+    potential_tiling_scores = defaultdict(Counter)
+
+    for uncoalesced_addr, addr_score in uncoalesced_addrs.items():
+        expr_subs = {v: 0 for v in uncoalesced_addr.free_symbols}
+        for v in uncoalesced_addr.free_symbols:
+            del expr_subs[v]
+            single_var_expr = sympy_subs(uncoalesced_addr, expr_subs)
+            expr_subs[v] = 0
+            tiling_factor = torch._inductor.utils.solve_for_tiling(single_var_expr)
+            # need to be able to tile it a number of times ? TODO, exact number ?
+            if tiling_factor is None or not tiling_factor.is_constant() or (tiling_factor >= (var_ranges[v] // 8)):
+                continue
+
+
+            potential_tiling_scores[v][tiling_factor] += addr_score
+
+    best_tiling = None
+    best_tiling_score = 0
+
+    for var, tiling_counter in potential_tiling_scores.items():
+        for tile, tile_score in tiling_counter.items():
+            score = tile_score - coalesced_by_var[var] 
+            if score > best_tiling_score:
+                best_tiling = (var, tile)
+    
+    if not best_tiling:
+        return None
+
+    breakpoint()
+    should_tile_var = best_tiling[0] in coalesced_by_var
+    return best_tiling[0], best_tiling[1], should_tile_var
+    
 
 
 def _type_of(key: Optional[torch.dtype]) -> str:

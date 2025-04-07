@@ -1745,8 +1745,13 @@ def triton_config_reduction(
     # Convert the linear reduction numel into a multi-dimensional block.
     rnumels = _get_nd_reduction_numels(r, size_hints)
 
+    # if "y" in size_hints and not "r1_" in size_hints:
+    #     return triton_config_tiled_reduction(size_hints, size_hints["x"], size_hints["y"], r)
+
+    # breakpoint()
     # shrink sizes to size hints
     x = min(x, size_hints["x"])
+    # breakpoint()
 
     def total_numel() -> int:
         return conditional_product(x, *rnumels.values())
@@ -1754,7 +1759,7 @@ def triton_config_reduction(
     target = total_numel()
     if conditional_product(*size_hints.values()) < target:
         target //= 8
-
+    # breakpoint()
     # if we are below original block size, scale up where we can
     while x < size_hints["x"] and total_numel() < target:
         x *= 2
@@ -1779,6 +1784,9 @@ def triton_config_reduction(
     cfg = _get_config({"x": x, **rnumels})
     check_max_block(cfg)
     check_config(cfg, xnumel=size_hints["x"])
+    # breakpoint()
+    # cfg = {'XBLOCK': 16, 'YBLOCK': 16, 'R0_BLOCK': 32}
+    # breakpoint()
     return Config(cfg, num_warps=num_warps, num_stages=num_stages)
 
 
@@ -1803,9 +1811,10 @@ def triton_config_tiled_reduction(size_hints, x, y, r, num_stages=1):
     x = min(x, size_hints["x"])
     y = min(y, size_hints["y"])
 
+
     def total_numel() -> int:
         return conditional_product(x, y, *rnumels.values())
-
+        
     target = total_numel()
     if conditional_product(*size_hints.values()) < target:
         target //= 8
@@ -1816,12 +1825,12 @@ def triton_config_tiled_reduction(size_hints, x, y, r, num_stages=1):
     for prefix in sorted(rnumels):
         while rnumels[prefix] < size_hints[prefix] and total_numel() < target:
             rnumels[prefix] *= 2
-    while y < size_hints[1] and total_numel() < target:
+    while y < size_hints["y"] and total_numel() < target:
         y *= 2
 
     cfg = _get_config({"x": x, "y": y, **rnumels})
     num_warps = _num_warps(total_numel() // 256, min_num_warps=1)
-    check_config(cfg, xnumel=size_hints[0], ynumel=size_hints[1])
+    check_config(cfg, xnumel=size_hints["x"], ynumel=size_hints["y"])
     check_max_block(cfg)
     return Config(cfg, num_warps=num_warps, num_stages=num_stages)
 
@@ -2059,14 +2068,35 @@ def _persistent_reduction_configs(
     reduction_hint=False,
     inductor_meta=None,
 ):
+    # breakpoint()
     xnumel = size_hints["x"]
     rnumel = get_total_reduction_numel(size_hints)
+    
+    MAX_PERSISTENT_BLOCK_NUMEL = 4096
 
-    configs = [
-        triton_config_reduction(size_hints, xblock, rnumel, register_intensive=True)
-        for xblock in (1, 8, 32, 128)
-        if xblock == 1 or (rnumel * xblock <= 4096 and xblock <= xnumel)
-    ]
+    if "y" not in size_hints:
+        configs = [
+            triton_config_reduction(size_hints, xblock, rnumel, register_intensive=True)
+            for xblock in (1, 8, 32, 128)
+            if xblock == 1 or (rnumel * xblock <= MAX_PERSISTENT_BLOCK_NUMEL and xblock <= xnumel)
+        ]
+    else:
+        ynumel = size_hints["y"]
+        configs = []
+        for xblock, yblock in itertools.product((1, 8, 16, 32, 64), (1, 8, 16, 32, 64)):
+            if not (xblock == 1 or xblock <= xnumel):
+                continue
+            if not (yblock == 1 or yblock <= ynumel):
+                continue
+            if math.prod([rnumel, xblock, yblock]) > MAX_PERSISTENT_BLOCK_NUMEL:
+                continue
+            print(xblock, yblock)
+            configs.append(triton_config_tiled_reduction(size_hints, xblock, yblock, rnumel))
+
+    # for x, y, z in itertools.product()
+
+    # configs = \
+
 
     # TODO(jansel): we should be able to improve these heuristics
     if reduction_hint == ReductionHint.INNER and rnumel >= 256:
@@ -2107,6 +2137,7 @@ def persistent_reduction(
 
     configs = _persistent_reduction_configs(size_hints, reduction_hint, inductor_meta)
 
+    # breakpoint()
     return cached_autotune(
         size_hints,
         configs,

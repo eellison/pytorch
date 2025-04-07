@@ -1054,7 +1054,7 @@ class triton:
 
     # Allows tiling reductions into multiple dimensions.
     # For best results, this should be used with prefer_nd_tiling.
-    tile_reductions: bool = False
+    tile_reductions: bool = True
 
     # should we stop a fusion to allow better tiling?
     tiling_prevents_pointwise_fusion = True
