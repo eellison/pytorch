@@ -1143,6 +1143,7 @@ class SchedulerNode(BaseSchedulerNode):
         return self.node if isinstance(self.node, ir.TemplateBuffer) else None
 
     def run(self, *index_vars: Sequence[sympy.Expr]) -> None:
+        breakpoint()
         self.decide_inplace_update()
         self.mark_run()
         self.codegen(index_vars)

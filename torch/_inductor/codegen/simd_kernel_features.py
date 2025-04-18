@@ -23,6 +23,7 @@ from ..virtualized import V
 
 if typing.TYPE_CHECKING:
     from collections.abc import Iterable, Sequence
+    from torch._inductor.tiling_utils import TilingInfo
 
 
 class NodeScheduleMarker:
@@ -80,12 +81,14 @@ class SIMDKernelFeatures:
         node_schedule: list[NodeScheduleEntry],
         numel: sympy.Expr,
         reduction_numel: sympy.Expr = sympy.S.One,
+        tiling_info: Optional[TilingInfo] = None,
     ):
         self.node_schedule = node_schedule
         # numel excludes reduction_numel
         self.numel: sympy.Expr = V.graph.sizevars.simplify(numel)
         self.reduction_numel: sympy.Expr = V.graph.sizevars.simplify(reduction_numel)
         self._stats_cache: dict[tuple[sympy.Expr, ...], MemoryStats] = {}
+        self.tiling_info = tiling_info
 
     @cache_on_self
     def is_reduction(self) -> bool:

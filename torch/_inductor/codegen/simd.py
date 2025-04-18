@@ -64,6 +64,7 @@ from .simd_kernel_features import (
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator, Sequence
+    from torch._inductor.tiling_utils import TilingInfo
 
 
 log = logging.getLogger(__name__)
@@ -1312,13 +1313,17 @@ class SIMDScheduling(BaseScheduling):
 
         nodes: list[scheduler.SchedulerNode] = node.get_nodes()  # type: ignore[assignment]
 
+        # breakpoint()
+        from torch._inductor.tiling_utils import tile_variables
+        tiling_info = tile_variables(node)
+        # breakpoint()
         _, (numel, rnumel) = max(nodes, key=lambda x: int(x.is_reduction())).group
 
         node_schedule = self.generate_node_schedule(nodes, numel, rnumel)
         schedule_log.debug("Schedule:\n %s", node_schedule)
 
         return self.codegen_node_schedule(
-            SIMDKernelFeatures(node_schedule, numel, rnumel)
+            SIMDKernelFeatures(node_schedule, numel, rnumel, tiling_info)
         )
 
     @staticmethod
@@ -1351,11 +1356,13 @@ class SIMDScheduling(BaseScheduling):
 
     def codegen_node_schedule(self, kernel_features: SIMDKernelFeatures):
         node_schedule = kernel_features.node_schedule
-        tiling = self.select_tiling(
-            node_schedule, kernel_features.numel, kernel_features.reduction_numel
+
+        tiling, tiling_score = self.get_tiling_and_scores(
+            node_schedule, kernel_features.numel, kernel_features.reduction_numel, kernel_features.tiling_info
         )
+        # TODO - here
         kernels = self.create_kernel_choices(
-            kernel_features, [tiling], {"features": kernel_features}
+            kernel_features, [tiling], {"features": kernel_features, "tiling_scores": tiling_score}
         )
         for kernel in kernels:
             self.codegen_node_schedule_with_kernel(node_schedule, kernel)
@@ -1667,6 +1674,10 @@ class SIMDScheduling(BaseScheduling):
     def candidate_tilings(cls, node, numel, reduction_numel) -> list[CandidateTiling]:
         is_pointwise = reduction_numel == 1
 
+        setattr(torch, "_tmp_count", getattr(torch, "_tmp_count", 0) + 1)
+
+        print("Count" , getattr(torch, "_tmp_count", 0))
+
         def tile_ranges(is_pointwise: bool, ranges, rw) -> list[CandidateTiling]:
             """
             Compute tiling candidates by dividing up the iteration ranges.
@@ -1947,9 +1958,155 @@ class SIMDScheduling(BaseScheduling):
         return ranked_tilings
 
     @classmethod
+    def get_global_tiling_analysis(cls, node_schedule, numel, reduction_numel, tiling_info):
+        tilings = []
+        # Create two separate lists
+        sorted_items = sorted(tiling_info.coalesced_by_var.items(), key=lambda x: x[1])
+        coalescing_vars = [item[0] for item in sorted_items]
+        scores = [item[1] for item in sorted_items]
+        tiling_var = None
+        split_var_info = None
+        
+        if tiling_info.split_var:
+            split_var_info = tiling_info.split_var  # This contains (var, split_size, score)
+            split_var, split_size, split_score = split_var_info
+            tiling_var = split_var_info[0]
+        # TODO - not sure how I should do this.
+        scored_splits = {}
+
+        all_red_vars = OrderedSet()
+        all_iter_vars = OrderedSet()
+        ranges = {}
+        for node in node_schedule:
+            if isinstance(node, scheduler.SchedulerNode):
+                all_red_vars |= node._body.reduce_vars
+                all_iter_vars |= node._body.iter_vars
+                ranges.update(node._body.var_ranges)
+
+        all_iter_vars -= all_red_vars
+
+        pw_ranges = [ranges[v] for v in all_iter_vars]
+        red_ranges = [ranges[v] for v in all_red_vars]
+
+        assert(sympy_product(pw_ranges) == numel)
+        assert(sympy_product(red_ranges) == reduction_numel)
+
+        # scored_splits["default_tiling"] = (0, [numel])
+        scored_sub_split = {}
+        score_split = []
+            
+        def process_node_vars(vars_to_use=(), use_split_var=False, is_pointwise=False):
+            ranges = pw_ranges if is_pointwise else red_ranges
+            if not ranges:
+                return ([], [])
+
+            key = (repr(vars_to_use), use_split_var, is_pointwise)
+            if out := scored_sub_split.get(key, None):
+                return out
+            
+            splitting_vars = all_iter_vars if is_pointwise else all_red_vars 
+            
+            splits = []
+            split_scores = []
+            prod = 1
+            prev_var_coalesced_score = 0
+
+            for v, v_range in zip(splitting_vars, ranges):
+                prod *= v_range
+                if v not in vars_to_use:
+                    prev_var_coalesced_score = tiling_info.coalesced_by_var.get(v, 0)
+                    continue
+
+                # If this is the split variable and we're using it as such
+                if use_split_var and v == tiling_var:
+                    # Add the original range up to this point
+                    if prod > 1:
+                        splits.append(prod // split_size)
+                        split_scores.append(split_score)
+
+                    prod = split_size  # Remaining size
+                    # if we end up splitting on this, v will be coalesced as well
+                    prev_var_coalesced_score = tiling_info.coalesced_by_var.get(v, 0)
+
+                else:
+                    # splitting on this var
+                    splits.append(prod)
+                    split_scores.append(tiling_info.coalesced_by_var.get(v, 0))
+                    prod = 1
+
+            if prod != 1:
+                splits.append(prod)
+                split_scores.append(prev_var_coalesced_score)
+
+            scored_sub_split[key] = (splits, split_scores)
+            return (splits, split_scores)
+
+
+        # add the default tiling
+        score_split.append((
+            process_node_vars(is_pointwise=True),
+            process_node_vars(is_pointwise=False),
+        ))
+
+        if tiling_var:
+            score_split.append((
+                process_node_vars((tiling_var,), use_split_var=True, is_pointwise=True),
+                process_node_vars(is_pointwise=False),
+            ))
+        
+        overlapping_iter_vars = all_iter_vars & coalescing_vars
+
+        for v in overlapping_iter_vars:
+            score_split.append((
+                process_node_vars((v,), is_pointwise=True),
+                process_node_vars(is_pointwise=False),
+            ))
+
+        tilings: list[tuple[CandidateTiling], dict[str, sympy.Expr]] = []
+        for (pw_split, pw_score), (red_split, red_score) in score_split:
+
+            candidate = CandidateTiling(
+                    cls.create_tiling(pw_split, red_split),
+                    score=sum(pw_score) + sum(red_score),
+            )
+            tiling_score = cls.create_tiling(pw_score, red_score)
+            tilings.append((candidate, tiling_score))
+
+        for cand, tiling_score in sorted(tilings, key=lambda t: -t[0].score):
+            if cls.tiling_is_compatible(node_schedule, numel, reduction_numel, cand.tiling):
+                return cand.tiling, tiling_score
+
+        raise RuntimeError("One tiling should have been compatible")
+
+    @classmethod
+    def tiling_is_compatible(cls, node_schedule, numel, reduction_numel, tiling):
+        assert isinstance(tiling, dict)
+        return all(
+            SIMDKernel.is_compatible(
+                tiling.values(), node.get_ranges(), reduction_numel=reduction_numel
+            )
+            for node in node_schedule
+            if isinstance(node, scheduler.SchedulerNode)
+        )
+
+    @classmethod
+    def get_first_compatible_tiling(cls, node_schedule, numel, reduction_numel, ranked_tilings):
+        for tiling in ranked_tilings:
+            if cls.tiling_is_compatible(node_schedule, numel, reduction_numel, tiling):
+                return tiling
+        
+        return None
+
+    @classmethod
     def select_tiling(
-        cls, node_schedule, numel, reduction_numel=sympy.S.One
+        cls, node_schedule, numel, reduction_numel=sympy.S.One, tiling_info: Optional[TilingInfo] = None
     ) -> dict[str, sympy.Expr]:
+        return cls.get_tiling_and_scores(node_schedule, numel, reduction_numel, tiling_info)[0]
+
+    @classmethod
+    def get_tiling_and_scores(
+        cls, node_schedule, numel, reduction_numel=sympy.S.One, tiling_info: Optional[TilingInfo] = None
+    ) -> tuple[dict[str, sympy.Expr], Optional[dict[str, sympy.Expr]]]:
         """
         Heuristics to decide how to tile kernels.
         Currently, we tile based on stride-1 dimensions.
@@ -1962,7 +2119,15 @@ class SIMDScheduling(BaseScheduling):
         is_pointwise = reduction_numel == 1
 
         # Tiled reductions are gated by a config flag.
+        # if tiling_info:
+        #     breakpoint()
+            # return {"x": 262144 // 64, "y": 64, 'r0_': 32}
+            # breakpoint()
         default_tiling = cls.create_tiling([numel], [reduction_numel])
+
+        if tiling_info:
+            return cls.get_global_tiling_analysis(node_schedule, numel, reduction_numel, tiling_info)
+
         if (
             not is_pointwise and not config.triton.tile_reductions
         ) or config.triton.max_tiles <= 1:
@@ -1982,7 +2147,14 @@ class SIMDScheduling(BaseScheduling):
                             )
                         )
                         break
-            return default_tiling
+
+            if tiling_info:
+                gl, tiling_scores = cls.get_global_tiling_analysis(node_schedule, numel, reduction_numel, tiling_info)
+                if not gl == default_tiling:
+                    breakpoint()
+                else:
+                    print("EQUAL TILING")
+            return default_tiling, None
 
         seen_names = OrderedSet[str]()
         candidate_tiles: Counter[CandidateTiling] = collections.Counter()
@@ -2048,18 +2220,19 @@ class SIMDScheduling(BaseScheduling):
                 + ranked_tilings
             )
 
-        for tiling in ranked_tilings:
-            assert isinstance(tiling, dict)
-            if all(
-                SIMDKernel.is_compatible(
-                    tiling.values(), node.get_ranges(), reduction_numel=reduction_numel
-                )
-                for node in node_schedule
-                if isinstance(node, scheduler.SchedulerNode)
-            ):
-                return tiling
+        if tiling := cls.get_first_compatible_tiling(node_schedule, numel, reduction_numel, ranked_tilings):
 
-        return default_tiling
+            if tiling_info:
+                global_tiling, tiling_scores = cls.get_global_tiling_analysis(node_schedule, numel, reduction_numel, tiling_info)
+
+                if (global_tiling and tiling_info) and not tiling == global_tiling:
+                    breakpoint()
+                else:
+                    print("EQUAL TILING")
+
+            return tiling, None
+
+        return default_tiling, None
 
     def flush(self):
         pass
