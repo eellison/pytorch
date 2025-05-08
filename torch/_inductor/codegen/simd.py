@@ -681,7 +681,7 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
                     # need to break size in two
                     if not sv.statically_known_multiple_of(
                         size, remaining[current_group]
-                    ):
+                    ):  
                         raise CantSplit
                     size1 = remaining[current_group]
                     size2 = FloorDiv(size, remaining[current_group])
@@ -1336,6 +1336,7 @@ class SIMDScheduling(BaseScheduling):
 
         nodes: list[scheduler.SchedulerNode] = node.get_nodes()  # type: ignore[assignment]
 
+        # sam
         coalesce_analysis = analyze_memory_coalescing(node)
         _, (numel, rnumel) = max(nodes, key=lambda x: int(x.is_reduction())).group
 
@@ -2117,6 +2118,8 @@ class SIMDScheduling(BaseScheduling):
                 )
             )
 
+        breakpoint()
+
         # TODO, add tests, reduction splits if config.triton.tile_reductions
         overlapping_iter_vars = (
             all_iter_vars & coalesce_analysis.coalesced_by_var.keys()
@@ -2153,13 +2156,16 @@ class SIMDScheduling(BaseScheduling):
                     )
                     continue
 
+                breakpoint()
                 return cand.tiling, tiling_score
 
             # surprisingly, the default tiling is not always read as compatible by `tiling_is_compatible`
             # TODO - look into, occurs with dynamic shapes often
             if cand.tiling == default_tiling:
+                breakpoint()
                 return cand.tiling, tiling_score
 
+        breakpoint()
         return default_tiling, None
 
     @classmethod
