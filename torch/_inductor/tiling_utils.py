@@ -177,6 +177,40 @@ class FusedNormalizedReadsWrites:
     var_ranges: dict[sympy.Symbol, int]
 
 
+
+def get_pw_red_splits(
+    n: "SchedulerNode", pointwise_numel: sympy.Expr, red_numel: sympy.Expr
+) -> tuple[
+    tuple[list[sympy.Symbol], list[int]], tuple[list[sympy.Symbol], list[int]]
+]:
+    if n.is_reduction() or sympy_product(n._body.sizes[0]) == pointwise_numel:
+        return (
+            (n._body.iter_vars, n._body.sizes[0]),
+            (n._body.reduce_vars, n._body.sizes[1]),
+        )  # type: ignore[return-value]
+
+    assert sympy_product(n._body.sizes[0]) == pointwise_numel * red_numel  # type: ignore[operator]
+    i = len(n._body.sizes[0]) - 1
+    prod = 1
+    while i >= 0:
+        prod *= n._body.sizes[0][i]
+        if prod == red_numel:
+            break
+
+    if i >= 0:
+        pw_splits = n._body.sizes[0][0:i]
+        iter_vars = n._body.iter_vars[0:i]
+
+        red_splits = n._body.sizes[0][i:]
+        red_vars = n._body.iter_vars[i:]
+        return (iter_vars, pw_splits), (red_vars, red_splits)  # type: ignore[return-value]
+
+    # TODO - handle
+    raise RuntimeError(
+        f"Unhandled node: size: {n._body.sizes}, pw: {pointwise_numel}, red: {red_numel}"
+    )
+
+
 def _extract_fused_node_meta(
     node: Union["FusedSchedulerNode", "SchedulerNode"],
 ) -> FusedNormalizedReadsWrites:
@@ -201,38 +235,6 @@ def _extract_fused_node_meta(
     # So we find the node with the most number of splits, and
     # normalize the other nodes to use the same iter vars.
 
-    def get_pw_red_splits(
-        n: "SchedulerNode",
-    ) -> tuple[
-        tuple[list[sympy.Symbol], list[int]], tuple[list[sympy.Symbol], list[int]]
-    ]:
-        if n.is_reduction() or sympy_product(n._body.sizes[0]) == pointwise_numel:
-            return (
-                (n._body.iter_vars, n._body.sizes[0]),
-                (n._body.reduce_vars, n._body.sizes[1]),
-            )  # type: ignore[return-value]
-
-        assert sympy_product(n._body.sizes[0]) == pointwise_numel * red_numel  # type: ignore[operator]
-        i = len(n._body.sizes[0]) - 1
-        prod = 1
-        while i >= 0:
-            prod *= n._body.sizes[0][i]
-            if prod == red_numel:
-                break
-
-        if i >= 0:
-            pw_splits = n._body.sizes[0][0:i]
-            iter_vars = n._body.iter_vars[0:i]
-
-            red_splits = n._body.sizes[0][i:]
-            red_vars = n._body.iter_vars[i:]
-            return (iter_vars, pw_splits), (red_vars, red_splits)  # type: ignore[return-value]
-
-        # TODO - handle
-        raise RuntimeError(
-            f"Unhandled node: size: {n._body.sizes}, pw: {pointwise_numel}, red: {red_numel}"
-        )
-
     pw_split_options: dict[int, OrderedSet[tuple[int]]] = defaultdict(OrderedSet)
     red_split_options: dict[int, OrderedSet[tuple[int]]] = defaultdict(OrderedSet)
 
@@ -248,7 +250,7 @@ def _extract_fused_node_meta(
         # vs
         # p0: 768, p1: 64, p2: 196
         # if not divisible.. flatten dims
-        (_, n_pw_splits), (_, n_red_splits) = get_pw_red_splits(n)
+        (_, n_pw_splits), (_, n_red_splits) = get_pw_red_splits(n, pointwise_numel, red_numel)
         pw_split_options[len(n_pw_splits)].add(tuple(n_pw_splits))
         red_split_options[len(n_pw_splits)].add(tuple(n_red_splits))
 
@@ -260,14 +262,6 @@ def _extract_fused_node_meta(
 
     seen_splits = OrderedSet()
 
-    # if len(lengths[1]) == 0 and (
-    #     sizevars.statically_known_equals(
-    #         sympy_product(groups),
-    #         sympy_product(lengths[0]) * reduction_numel,
-    #     )
-    # ):
-    #     lengths = (lengths[0], [reduction_numel])
-
     def try_split(pw, red) -> bool:
         from torch._inductor.codegen.simd import SIMDKernel, CantSplit
 
@@ -275,13 +269,11 @@ def _extract_fused_node_meta(
         for n in node.get_nodes():
             try:
                 inp = list(pw) + list(red)
-                (_, n_pw), (_, n_red) = get_pw_red_splits(n)
+                (_, n_pw), (_, n_red) = get_pw_red_splits(n, pointwise_numel, red_numel)
                 splits, getters = SIMDKernel._split_iteration_ranges(inp, (n_pw, n_red))
             except CantSplit:
                 return False
 
-
-            # breakpoint()
             split_groups = (
             (
 
@@ -354,7 +346,7 @@ def _extract_fused_node_meta(
 
 
     pw_splits, red_splits = get_splits()
-    # pw_splits = [128, 6, 64, 196]
+    pw_splits = [128, 6, 64, 196]
 
     # def map_existing_vars_to_new_vars()
 
@@ -391,8 +383,6 @@ def _extract_fused_node_meta(
 
         return var_map
 
-    # 
-
     def apply_var_mapping(old_vars, new_vars, new_ranges, return_getters_groups):
 
         var_map = {}    
@@ -414,7 +404,6 @@ def _extract_fused_node_meta(
             divis = None
             assert len(group) <= 2
             if len(group) == 2:
-                breakpoint()
                 new_var1 = split_vars[curr_count]
                 new_var2 = split_vars[curr_count + 1]
                 curr_count += 2
@@ -431,9 +420,6 @@ def _extract_fused_node_meta(
         var_map = {}
 
         var_map = defaultdict(list)
-        breakpoint()
-
-        # for expr, new_var in zip(out_exprs, new_vars):
 
         for expr, new_var in zip(out_exprs, new_vars):
             repl_map = dict.fromkeys(expr.free_symbols, 0)
@@ -443,42 +429,7 @@ def _extract_fused_node_meta(
                 repl_map[v] = 0
 
         var_map = {k: sum(v) for k, v in var_map.items()}
-        breakpoint()
         return var_map
-        pass
-
-
-
-
-
-
-            # for reversed(group):
-                
-
-
-            # new_var_map[]
-
-
-
-
-        # for old_v, new_range in (zip(reversed(old_vars, new_ranges))):
-            
-        #     curr_range = 1
-        #     for r in new
-            
-        #     breakpoint()
-        #     pass
-
-
-        breakpoint()    
-        pass
-
-        # for v in 
-
-
-        # for 
-
-
 
     for n in node.get_nodes():
         if not isinstance(n, torch._inductor.scheduler.SchedulerNode):
@@ -492,7 +443,7 @@ def _extract_fused_node_meta(
         for out in outputs:
             n_writes |= body.get_all_write_expr(out)
 
-        (iter_vars, n_pw_splits), (red_vars, n_red_splits) = get_pw_red_splits(n)
+        (iter_vars, n_pw_splits), (red_vars, n_red_splits) = get_pw_red_splits(n, pointwise_numel, red_numel)
         # node_group = n._sizes[0] + n._sizes[1]
 
         new_ranges, return_getters_groups = torch._inductor.codegen.simd.SIMDKernel._split_iteration_ranges(list(n_pw_splits) + list(n_red_splits), [pw_splits, red_splits])
@@ -515,6 +466,7 @@ def _extract_fused_node_meta(
         reads |= n_reads_new
         writes |= n_writes_new
 
+    breakpoint()
     return FusedNormalizedReadsWrites(
         norm_pw_vars,  # type: ignore[arg-type]
         norm_red_vars,  # type: ignore[arg-type]
