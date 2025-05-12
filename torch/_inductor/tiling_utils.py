@@ -1,11 +1,13 @@
 import dataclasses
 import itertools
 from collections import Counter, defaultdict
-from typing import Optional, TYPE_CHECKING, Union
+from typing import Optional, TYPE_CHECKING, Union, Sequence
 
 import sympy
 
 import torch
+import heapq
+
 from torch._inductor import config
 from torch._inductor.dependencies import index_vars_no_squeeze
 from torch._inductor.utils import sympy_product, sympy_subs
@@ -238,9 +240,6 @@ def _extract_fused_node_meta(
     pw_split_options: dict[int, OrderedSet[tuple[int]]] = defaultdict(OrderedSet)
     red_split_options: dict[int, OrderedSet[tuple[int]]] = defaultdict(OrderedSet)
 
-    # pw_split_options: OrderedSet[tuple[int]] = OrderedSet()
-    # red_split_options: OrderedSet[tuple[int]] = OrderedSet()
-
     for n in reversed(node.get_nodes()):
         if not isinstance(n, torch._inductor.scheduler.SchedulerNode):
             continue
@@ -262,9 +261,8 @@ def _extract_fused_node_meta(
 
     seen_splits = OrderedSet()
 
-    def try_split(pw, red) -> bool:
+    def try_get_split(pw: Sequence[sympy.Expr], red: Sequence[sympy.Expr]) -> Optional[tuple[Sequence[sympy.Expr], Sequence[sympy.Expr]]]:
         from torch._inductor.codegen.simd import SIMDKernel, CantSplit
-
 
         for n in node.get_nodes():
             try:
@@ -272,7 +270,7 @@ def _extract_fused_node_meta(
                 (_, n_pw), (_, n_red) = get_pw_red_splits(n, pointwise_numel, red_numel)
                 splits, getters = SIMDKernel._split_iteration_ranges(inp, (n_pw, n_red))
             except CantSplit:
-                return False
+                return None
 
             split_groups = (
             (
@@ -292,6 +290,7 @@ def _extract_fused_node_meta(
                 # This means the split was not cleanly divisible.
                 attempted_split = pw if is_pointwise else red
                 num_split = sum(len(s) for s in group_split)
+                breakpoint()
                 if num_split > len(n_pw if is_pointwise else n_red):
                     out_vars = sympy.symbols(f"v_0:{num_split}")
 
@@ -302,8 +301,6 @@ def _extract_fused_node_meta(
                             var_to_split[out_vars[var_i]] = i
                             var_i += 1
                     
-                    # breakpoint()
-
                     for i, getter in enumerate(group_getter):
                         expr_per_group = getter(out_vars)
                         for v in expr_per_group.free_symbols:
@@ -321,18 +318,19 @@ def _extract_fused_node_meta(
                                 if is_pointwise:
                                     pw_split_options[len(out)].add(tuple(out))
 
-                                return False
+                                return None
 
             
-                    return False
+                    return None
 
-        return True
+        return pw, red
+
+    
 
     def get_splits():
         for diff in range(0, max_pw_splits + max_red_splits):
             for pw_diff in range(0, diff + 1):
                 red_diff = (diff - pw_diff)
-
 
                 pw_options = pw_split_options[max_pw_splits - pw_diff]
                 red_options = red_split_options[max_red_splits - red_diff]
@@ -341,12 +339,23 @@ def _extract_fused_node_meta(
                     pw_options, red_options
                 )
                 for pw, red in pairs:
-                    if try_split(pw, red):
-                        return pw, red
+                    # We maintain a list of candidate splits to try because 
+                    # so, we use maintain a list of
+
+
+
+                    out = try_get_split(pw, red)
+                    if out is not None:
+                        return out
+                    # if out_pw, out_red := try_get_split(pw, red):
+                    #     return out_pw, out_red
+
+        # default to the contiguous split
+        # TODO: 
 
 
     pw_splits, red_splits = get_splits()
-    pw_splits = [128, 6, 64, 196]
+    # pw_splits = [128, 6, 64, 196]
 
     # def map_existing_vars_to_new_vars()
 
@@ -356,32 +365,6 @@ def _extract_fused_node_meta(
     (norm_pw_vars, norm_red_vars), ranges = index_vars_no_squeeze(
         pw_splits, red_splits, prefix="n"
     )
-
-    def norm_to_split(
-        norm_ranges: dict[sympy.Symbol, int],
-        norm_vars: list[sympy.Symbol],
-        curr_sizes: list[int],
-        curr_vars: list[sympy.Symbol],
-        ) -> dict[sympy.Symbol, sympy.Expr]:
-        norm_index = len(norm_vars) - 1
-        var_map: dict[sympy.Symbol, sympy.Expr] = {}
-        for var, size in zip(reversed(curr_vars), reversed(curr_sizes)):
-            var_replacement = []
-            prod = 1
-            while size != 1:
-                norm_var = norm_vars[norm_index]
-                # NYI : non compatible splits - could try again with different splits
-                if not size % norm_ranges[norm_var] == 0:
-                    breakpoint()
-                assert size % norm_ranges[norm_var] == 0
-                size = size // norm_ranges[norm_var]
-                norm_index -= 1
-                var_replacement.append(norm_var * prod)
-                prod *= norm_ranges[norm_var]
-
-            var_map[var] = sum(reversed(var_replacement))
-
-        return var_map
 
     def apply_var_mapping(old_vars, new_vars, new_ranges, return_getters_groups):
 
