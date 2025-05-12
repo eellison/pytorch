@@ -20,6 +20,7 @@ from .virtualized import V
 
 
 if TYPE_CHECKING:
+    Split = tuple[sympy.expr]
     from torch._inductor.scheduler import FusedSchedulerNode, SchedulerNode
 
 
@@ -213,15 +214,143 @@ def get_pw_red_splits(
     )
 
 
-def _extract_fused_node_meta(
-    node: Union["FusedSchedulerNode", "SchedulerNode"],
-) -> FusedNormalizedReadsWrites:
-    """Extracts index variables, reduce variables, read/write expressions, and variable ranges from a fused node."""
-    reads: OrderedSet[sympy.Expr] = OrderedSet()
-    writes: OrderedSet[sympy.Expr] = OrderedSet()
+class NodeSplitGetter():
 
-    outputs = node.get_buffer_names()
-    inputs = OrderedSet(dep.name for dep in node.read_writes.reads)
+    def __init__(self, n: Union["FusedSchedulerNode", "SchedulerNode"],):
+        self.node = n
+        self.pointwise_numel: sympy.Expr = node.group[1][0]
+        self.red_numel: sympy.Expr = node.group[1][1]
+
+        self.pw_split_options: dict[int, OrderedSet[Split]] = defaultdict(OrderedSet)
+        self.red_split_options: dict[int, OrderedSet[Split]] = defaultdict(OrderedSet)
+
+        for n in reversed(node.get_nodes()):
+            if not isinstance(n, torch._inductor.scheduler.SchedulerNode):
+                continue
+
+            # todo - check if same size.. take smaller 
+            # p0: 128, p1: 384, p2: 196
+            # vs
+            # p0: 768, p1: 64, p2: 196
+            # if not divisible.. flatten dims
+            (_, n_pw_splits), (_, n_red_splits) = get_pw_red_splits(n, self.pointwise_numel, self.red_numel)
+            self.pw_split_options[len(n_pw_splits)].add(tuple(n_pw_splits))
+            self.red_split_options[len(n_pw_splits)].add(tuple(n_red_splits))
+        
+        # pw, reduction splits
+        self.seen_split_options: OrderedSet[tuple[Split, Split]] = OrderedSet()
+        
+        # this is a heap of pending splits to try, ordered based on length
+        self.pending_splits: list[tuple[int, tuple[Split, Split]]] = []
+
+        self.max_pw_splits = max(self.pw_split_options.keys())
+        self.max_red_splits = max(self.red_split_options.keys())
+
+
+    def get_node_splits(self):
+        for diff in range(self.max_pw_splits + self.max_red_splits, 0, -1):
+            self.add_pending_splits(diff)   
+
+            while self.pending_splits:
+                _, top_split = self.pending_splits[0]
+                if self.try_split(top_split):
+                    return top_split
+
+                heapq.heappop(self.pending_splits)
+
+        breakpoint()
+        pass
+        # TODO: return Default  
+
+    def add_pending_splits(self, split_len: int) -> None:
+
+        diff = split_len - (self.max_pw_splits + self.max_red_splits)
+        for pw_diff in range(0, diff + 1):
+            red_diff = (diff - pw_diff)
+
+            pw_options = self.pw_split_options[self.max_pw_splits - pw_diff]
+            red_options = self.red_split_options[self.max_red_splits - red_diff]
+
+            pairs = itertools.product(  
+                pw_options, red_options
+            )
+            for pw, red in pairs:  
+                self.add_pending_split(pw, red)
+
+    def add_pending_split(self, pw: Split, red: Split) -> None:
+        if (pw, red) in self.seen_split_options:
+            return
+
+        heapq.heappush(self.pending_splits, (-len(pw) - len(red),(pw, red)))
+        self.seen_split_options.add((pw, red))
+
+
+    def try_split(self, pw_split: Split, red_split: Split):
+        from torch._inductor.codegen.simd import SIMDKernel, CantSplit
+
+        for n in self.node.get_nodes():
+            try:
+                (_, n_pw), (_, n_red) = get_pw_red_splits(n, self.pointwise_numel, self.red_numel)
+                splits, getters = SIMDKernel._split_iteration_ranges(split, (n_pw, n_red))
+            except CantSplit:
+                return None
+
+            split_groups = (
+            (
+
+                splits[:len(pw)],
+                getters[0],
+                True,
+            ), (
+                splits[len(pw):],
+                getters[1], 
+                False
+            ))
+
+            for group_split, group_getter, is_pointwise in split_groups:
+
+                # If the number of returned splits is greater than the input, 
+                # then we had to induce another variable.
+                attempted_split = pw if is_pointwise else red
+                num_split = sum(len(s) for s in group_split)
+                if num_split > len(n_pw if is_pointwise else n_red):
+                    out_vars = sympy.symbols(f"v_0:{num_split}")
+
+                    var_to_split: dict[sympy.Symbol, int] = {}
+                    var_i = 0
+                    for i, s in enumerate(splits):
+                        for _ in range(len(s)):
+                            var_to_split[out_vars[var_i]] = i
+                            var_i += 1
+                    breakpoint()
+                    
+                    for i, getter in enumerate(group_getter):
+                        expr_per_group = getter(out_vars)
+                        for v in expr_per_group.free_symbols:
+                            if var_to_split[v] != i:
+
+                                dim_0, dim_1 = sorted([i, var_to_split[v]])
+                                assert dim_0 == dim_1 - 1
+
+                                # breakpoint()
+                                out = (
+                                    list(attempted_split[:dim_0]) +
+                                    [sympy_product(attempted_split[dim_0:dim_0 + 2])] +
+                                    list(attempted_split[dim_0 + 2:])
+                                )
+                                if is_pointwise:
+                                    pw_split_options[len(out)].add(tuple(out))
+
+                                return None
+
+            
+                    return None
+
+        return pw, red
+
+
+
+def get_node_splits(node):
 
     pointwise_numel = node.group[1][0]
     red_numel = node.group[1][1]
@@ -259,100 +388,25 @@ def _extract_fused_node_meta(
     pw_splits: Optional[tuple[int]] = None
     red_splits: Optional[tuple[int]] = None
 
+
+
     seen_splits = OrderedSet()
 
-    def try_get_split(pw: Sequence[sympy.Expr], red: Sequence[sympy.Expr]) -> Optional[tuple[Sequence[sympy.Expr], Sequence[sympy.Expr]]]:
-        from torch._inductor.codegen.simd import SIMDKernel, CantSplit
-
-        for n in node.get_nodes():
-            try:
-                inp = list(pw) + list(red)
-                (_, n_pw), (_, n_red) = get_pw_red_splits(n, pointwise_numel, red_numel)
-                splits, getters = SIMDKernel._split_iteration_ranges(inp, (n_pw, n_red))
-            except CantSplit:
-                return None
-
-            split_groups = (
-            (
-
-                splits[:len(pw)],
-                getters[0],
-                True,
-            ), (
-                splits[len(pw):],
-                getters[1], 
-                False
-            ))
-
-            for group_split, group_getter, is_pointwise in split_groups:
-
-                # If we have to induce another variable, we will not handle this for now.
-                # This means the split was not cleanly divisible.
-                attempted_split = pw if is_pointwise else red
-                num_split = sum(len(s) for s in group_split)
-                breakpoint()
-                if num_split > len(n_pw if is_pointwise else n_red):
-                    out_vars = sympy.symbols(f"v_0:{num_split}")
-
-                    var_to_split: dict[sympy.Symbol, int] = {}
-                    var_i = 0
-                    for i, s in enumerate(splits):
-                        for _ in range(len(s)):
-                            var_to_split[out_vars[var_i]] = i
-                            var_i += 1
-                    
-                    for i, getter in enumerate(group_getter):
-                        expr_per_group = getter(out_vars)
-                        for v in expr_per_group.free_symbols:
-                            if var_to_split[v] != i:
-
-                                dim_0, dim_1 = sorted([i, var_to_split[v]])
-                                assert dim_0 == dim_1 - 1
-
-                                # breakpoint()
-                                out = (
-                                    list(attempted_split[:dim_0]) +
-                                    [sympy_product(attempted_split[dim_0:dim_0 + 2])] +
-                                    list(attempted_split[dim_0 + 2:])
-                                )
-                                if is_pointwise:
-                                    pw_split_options[len(out)].add(tuple(out))
-
-                                return None
-
-            
-                    return None
-
-        return pw, red
-
-    
-
-    def get_splits():
-        for diff in range(0, max_pw_splits + max_red_splits):
-            for pw_diff in range(0, diff + 1):
-                red_diff = (diff - pw_diff)
-
-                pw_options = pw_split_options[max_pw_splits - pw_diff]
-                red_options = red_split_options[max_red_splits - red_diff]
-
-                pairs = itertools.product(  
-                    pw_options, red_options
-                )
-                for pw, red in pairs:
-                    # We maintain a list of candidate splits to try because 
-                    # so, we use maintain a list of
 
 
 
-                    out = try_get_split(pw, red)
-                    if out is not None:
-                        return out
-                    # if out_pw, out_red := try_get_split(pw, red):
-                    #     return out_pw, out_red
 
-        # default to the contiguous split
-        # TODO: 
 
+
+def _extract_fused_node_meta(
+    node: Union["FusedSchedulerNode", "SchedulerNode"],
+) -> FusedNormalizedReadsWrites:
+    """Extracts index variables, reduce variables, read/write expressions, and variable ranges from a fused node."""
+    reads: OrderedSet[sympy.Expr] = OrderedSet()
+    writes: OrderedSet[sympy.Expr] = OrderedSet()
+
+    outputs = node.get_buffer_names()
+    inputs = OrderedSet(dep.name for dep in node.read_writes.reads)
 
     pw_splits, red_splits = get_splits()
     # pw_splits = [128, 6, 64, 196]
