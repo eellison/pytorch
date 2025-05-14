@@ -644,8 +644,12 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
 
         def add_range(i: int, expr: sympy.Expr) -> int:
             expr = sv.simplify(expr)
-            if not sv.statically_known_multiple_of(remaining[i], expr):
-                raise CantSplit
+            try:
+                if not sv.statically_known_multiple_of(remaining[i], expr):
+                    raise CantSplit
+            except Exception as e:
+                breakpoint()
+                raise
             # guard on the last item out
             remaining[i] = FloorDiv(remaining[i], expr)
             new_ranges[i].append(expr)
@@ -705,7 +709,7 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
         return new_ranges, return_getters_groups
 
     @classmethod
-    def is_compatible(
+    def prepare_split_iteration_lengths(
         cls,
         groups: Iterable[sympy.Expr],
         lengths: Sequence[Sequence[sympy.Expr]],
@@ -719,7 +723,19 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
                 sympy_product(lengths[0]) * reduction_numel,
             )
         ):
-            lengths = (lengths[0], [reduction_numel])
+            return (lengths[0], [reduction_numel])
+
+        return lengths
+
+
+    @classmethod
+    def is_compatible(
+        cls,
+        groups: Iterable[sympy.Expr],
+        lengths: Sequence[Sequence[sympy.Expr]],
+        reduction_numel: sympy.Expr = sympy.S.One,
+    ) -> bool:
+        lengths = cls.prepare_split_iteration_lengths(groups, lengths, reduction_numel)
 
         try:
             cls._split_iteration_ranges(groups, lengths)
