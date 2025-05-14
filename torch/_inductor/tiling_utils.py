@@ -271,8 +271,7 @@ class NodeSplitGetter():
 
         for diff in range(self.max_pw_splits + self.max_red_splits, 0, -1):
             self.add_pending_splits(diff)   
-
-
+            
             self.curr_attempted_split_len = diff
             while self.pending_splits:
                 _, (pw_split, red_split) = heapq.heappop(self.pending_splits)
@@ -280,23 +279,35 @@ class NodeSplitGetter():
                 if self.try_split(pw_split, red_split):
                     return pw_split, red_split
         
+        # default
+        return ((self.pointwise_numel), (self.red_numel))
         assert False
         # TODO: return Default  
 
     def add_pending_splits(self, split_len: int) -> None:
-
-        diff = split_len - (self.max_pw_splits + self.max_red_splits)
-        for pw_diff in range(0, diff + 1):
-            red_diff = (diff - pw_diff)
-
-            pw_options = self.pw_split_options[self.max_pw_splits - pw_diff]
-            red_options = self.red_split_options[self.max_red_splits - red_diff]
-
-            pairs = itertools.product(  
-                pw_options, red_options
-            )
-            for pw, red in pairs:
-                self.add_pending_split(pw, red)
+        """
+        Add all combinations of pointwise and reduction splits that together
+        have exactly the required number of splits (required_split_len).
+        
+        Args:
+            required_split_len: Total number of splits required
+        """
+        # For each possible length of pointwise splits
+        for pw_len in range(min(self.max_pw_splits, split_len) + 1):
+            # Calculate the corresponding length needed for reduction splits
+            red_len = split_len - pw_len
+            
+            # Skip invalid combinations
+            if red_len > self.max_red_splits or red_len < 0:
+                continue
+                
+            # Get all valid pointwise and reduction split options with these lengths
+            pw_options = self.pw_split_options[pw_len]
+            red_options = self.red_split_options[red_len]
+            
+            # Add all combinations as pending splits
+            for pw_split, red_split in itertools.product(pw_options, red_options):
+                self.add_pending_split(pw_split, red_split)
 
     def add_pending_split(self, pw: Split, red: Split) -> None:
         if (pw, red) in self.seen_split_options:
@@ -307,6 +318,8 @@ class NodeSplitGetter():
 
 
     def add_induced_split_option(self, split: Split, is_pointwise: bool):
+        split_options = self.pw_split_options if is_pointwise else self.red_split_options
+        split_options[len(split)].add(split)
 
         other_split_options = self.red_split_options if is_pointwise else self.pw_split_options
         split_len = len(split)
@@ -326,6 +339,7 @@ class NodeSplitGetter():
     def try_split(self, pw: Split, red: Split) -> bool:
         from torch._inductor.codegen.simd import SIMDKernel, CantSplit
         # breakpoint()
+        return True
         for n_pw, n_red in self.all_node_sizes:
             try:
                 groups = pw + red
@@ -339,6 +353,7 @@ class NodeSplitGetter():
                 (splits[:len(pw)], getters[0],True), 
                 (splits[len(pw):], getters[1],False),
             )
+            breakpoint()
 
             all_vars = sympy.symbols(f"v_0:{sum(len(s) for s in splits)}")
             ret = True
@@ -349,14 +364,11 @@ class NodeSplitGetter():
                 attempted_split = pw if is_pointwise else red
                 num_split = sum(len(s) for s in group_split)
                 # breakpoint()
-                if (num_split > len(pw if is_pointwise else red)):
-                    ret = False
-                # breakpoint()
-                if (num_split > len(pw if is_pointwise else red)):
+                if (num_split > len(n_pw if is_pointwise else n_red)):
 
                     # add the flattened split
                     flattened_splits = tuple(itertools.chain.from_iterable(group_split))
-                    # self.add_induced_split_option(flattened_splits, is_pointwise)
+                    self.add_induced_split_option(flattened_splits, is_pointwise)
 
                     var_to_split: dict[sympy.Symbol, int] = {}
                     var_i = 0 if is_pointwise else len(all_vars) - num_split
@@ -382,7 +394,6 @@ class NodeSplitGetter():
                         split[idx_a + 1 : idx_b + 1] = [None for _ in range(idx_b - idx_a)]
 
                     split = tuple([a for a in split if a is not None])
-                    breakpoint()
                     self.add_induced_split_option(split, is_pointwise)
 
                     return False
@@ -521,6 +532,7 @@ def _extract_fused_node_meta(
     node = node
     pointwise_numel: sympy.Expr = node.group[1][0]
     red_numel: sympy.Expr = node.group[1][1]
+    breakpoint()
     
     for n in node.get_nodes():
         if not isinstance(n, torch._inductor.scheduler.SchedulerNode):
@@ -548,6 +560,7 @@ def _extract_fused_node_meta(
             new_ranges, return_getters_groups
         )
         var_map2 = apply_var_mapping(iter_vars, norm_pw_vars, new_ranges[:len(n_pw_splits)], return_getters_groups[0])
+        
         for k, v in var_map2.items():
             assert var_map[k] == v
         # breakpoint()
