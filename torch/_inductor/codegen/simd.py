@@ -644,12 +644,8 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
 
         def add_range(i: int, expr: sympy.Expr) -> int:
             expr = sv.simplify(expr)
-            try:
-                if not sv.statically_known_multiple_of(remaining[i], expr):
-                    raise CantSplit
-            except Exception as e:
-                breakpoint()
-                raise
+            if not sv.statically_known_multiple_of(remaining[i], expr):
+                raise CantSplit
             # guard on the last item out
             remaining[i] = FloorDiv(remaining[i], expr)
             new_ranges[i].append(expr)
@@ -718,7 +714,8 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
         # Fill in the reduction numel, in case the node is missing it.
         sizevars = V.graph.sizevars
         if len(lengths[1]) == 0 and (
-            sizevars.statically_known_equals(
+            not sizevars.is_expr_static_and_true(reduction_numel == sympy.S.One)
+            and sizevars.statically_known_equals(
                 sympy_product(groups),
                 sympy_product(lengths[0]) * reduction_numel,
             )
@@ -2134,7 +2131,7 @@ class SIMDScheduling(BaseScheduling):
                 )
             )
 
-        breakpoint()
+        # breakpoint()
 
         # TODO, add tests, reduction splits if config.triton.tile_reductions
         overlapping_iter_vars = (
@@ -2172,7 +2169,6 @@ class SIMDScheduling(BaseScheduling):
                     )
                     continue
 
-                breakpoint()
                 return cand.tiling, tiling_score
 
             # surprisingly, the default tiling is not always read as compatible by `tiling_is_compatible`

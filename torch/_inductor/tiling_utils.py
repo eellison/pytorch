@@ -2,6 +2,7 @@ import dataclasses
 import itertools
 from collections import Counter, defaultdict
 from operator import is_
+from re import A
 from typing import Optional, TYPE_CHECKING, Union, Sequence
 
 import sympy
@@ -215,16 +216,11 @@ def get_pw_red_splits(
         f"Unhandled node: size: {n._body.sizes}, pw: {pointwise_numel}, red: {red_numel}"
     )
 
-def apply_split_to_node(n, pointwise_numel, red_numel, groups):
-    from torch._inductor.codegen.simd import SIMDKernel, CantSplit
-    (_, n_pw), (_, n_red) = get_pw_red_splits(n, pointwise_numel, red_numel)
-    lengths = (n_pw, n_red)
-    lengths = SIMDKernel.prepare_split_iteration_lengths(groups, lengths, red_numel)
-    return SIMDKernel._split_iteration_ranges(groups, lengths)
 
 class NodeSplitGetter():
 
     def __init__(self, node: Union["FusedSchedulerNode", "SchedulerNode"],):
+        from torch._inductor.codegen.simd import SIMDKernel, CantSplit
         self.node = node
         self.pointwise_numel: sympy.Expr = node.group[1][0]
         self.red_numel: sympy.Expr = node.group[1][1]
@@ -235,6 +231,9 @@ class NodeSplitGetter():
         self.pw_split_options[0].add(())
         self.red_split_options[0].add(())
 
+        self.all_node_sizes: OrderedSet[tuple[Split, Split]] = OrderedSet()
+        
+        fused_group = node.group[1]
         for n in reversed(node.get_nodes()):
             if not isinstance(n, torch._inductor.scheduler.SchedulerNode):
                 continue
@@ -245,9 +244,16 @@ class NodeSplitGetter():
             # p0: 768, p1: 64, p2: 196
             # if not divisible.. flatten dims
             (_, n_pw_splits), (_, n_red_splits) = get_pw_red_splits(n, self.pointwise_numel, self.red_numel)
+                        
+            # fill in reduction size
+            n_pw_splits, n_red_splits = torch._inductor.codegen.simd.SIMDKernel.prepare_split_iteration_lengths(fused_group, (n_pw_splits, n_red_splits), self.red_numel)
+            
             self.pw_split_options[len(n_pw_splits)].add(tuple(n_pw_splits))
             self.red_split_options[len(n_red_splits)].add(tuple(n_red_splits))
-        
+
+            n_size = (tuple(n_pw_splits), tuple(n_red_splits))
+            self.all_node_sizes.add(n_size)
+
         # pw, reduction splits
         self.seen_split_options: OrderedSet[tuple[Split, Split]] = OrderedSet()
         
@@ -260,6 +266,9 @@ class NodeSplitGetter():
 
 
     def get_node_splits(self):
+        # if len(self.all_node_sizes) == 1:
+        #     return next(iter(self.all_node_sizes))
+
         for diff in range(self.max_pw_splits + self.max_red_splits, 0, -1):
             self.add_pending_splits(diff)   
 
@@ -270,8 +279,7 @@ class NodeSplitGetter():
 
                 if self.try_split(pw_split, red_split):
                     return pw_split, red_split
-        pass
-        breakpoint()
+        
         assert False
         # TODO: return Default  
 
@@ -299,111 +307,204 @@ class NodeSplitGetter():
 
 
     def add_induced_split_option(self, split: Split, is_pointwise: bool):
-        if is_pointwise:
 
-            split_len = len(split)
-            curr_split = self.curr_attempted_split_len
-            # we only need to iterate up to and including current split,
-            # since subsequent split options will be iterated on.
-            for i in range(split_len, curr_split - 1, -1):
-                red_options = self.red_split_options[split_len - i]
-                pairs = itertools.product(  
-                    [split], red_options
-                )
-                for pw, red in pairs:  
-                    self.add_pending_split(pw, red)
+        other_split_options = self.red_split_options if is_pointwise else self.pw_split_options
+        split_len = len(split)
+        curr_split = self.curr_attempted_split_len
+        # we only need to iterate up to and including current split,
+        # since subsequent split options will be iterated on.
+        for i in range(split_len, curr_split - 1, -1):
+            other_split = other_split_options[split_len - i]
 
+            pairs = itertools.product(  
+                *(([split], other_split) if is_pointwise else (other_split, [split]))
+            )
+            for pw, red in pairs: 
+                self.add_pending_split(pw, red)
+        
 
-    def try_split(self, pw: Split, red: Split):
+    def try_split(self, pw: Split, red: Split) -> bool:
         from torch._inductor.codegen.simd import SIMDKernel, CantSplit
-
-        for n in self.node.get_nodes():
-            # TODO: if a node is (262), () pw/red and overall node is (262), (32) we dont 
-            # split on red
+        # breakpoint()
+        for n_pw, n_red in self.all_node_sizes:
             try:
-                (_, n_pw), (_, n_red) = get_pw_red_splits(n, self.pointwise_numel, self.red_numel)
                 groups = pw + red
                 lengths = (n_pw, n_red)
-                lengths = SIMDKernel.prepare_split_iteration_lengths(groups, lengths, self.red_numel)
                 splits, getters = SIMDKernel._split_iteration_ranges(groups, lengths)
             except CantSplit:
-                return None
-            except Exception:
-                breakpoint()
-                raise
+                return False
 
             assert len(getters) == 2
             split_groups = (
-            (
+                (splits[:len(pw)], getters[0],True), 
+                (splits[len(pw):], getters[1],False),
+            )
 
-                splits[:len(splits)],
-                getters[0],
-                True,
-            ), (
-                splits[len(splits):],
-                getters[1], 
-                False
-            ))
-
+            all_vars = sympy.symbols(f"v_0:{sum(len(s) for s in splits)}")
+            ret = True
             for group_split, group_getter, is_pointwise in split_groups:
 
                 # If the number of returned splits is greater than the input, 
                 # then we had to induce another variable.
                 attempted_split = pw if is_pointwise else red
                 num_split = sum(len(s) for s in group_split)
-                if num_split > len(pw if is_pointwise else red):
+                # breakpoint()
+                if (num_split > len(pw if is_pointwise else red)):
+                    ret = False
+                # breakpoint()
+                if (num_split > len(pw if is_pointwise else red)):
 
+                    # add the flattened split
                     flattened_splits = tuple(itertools.chain.from_iterable(group_split))
-                    self.add_induced_split_option(flattened_splits, is_pointwise)
-                    out_vars = sympy.symbols(f"v_0:{num_split}")
+                    # self.add_induced_split_option(flattened_splits, is_pointwise)
 
                     var_to_split: dict[sympy.Symbol, int] = {}
-                    var_i = 0
-                    for i, s in enumerate(splits):
-                        try:
-                            for _ in range(len(s)):
-                                var_to_split[out_vars[var_i]] = i
-                                var_i += 1
-                        except Exception as e:
-                            breakpoint()
-                            raise
+                    var_i = 0 if is_pointwise else len(all_vars) - num_split
+                    for i, s in enumerate(group_split):
+                        for _ in range(len(s)):
+                            var_to_split[all_vars[var_i]] = i
+                            var_i += 1
 
-                    out_combined_dims = []
-                    for i, getter in enumerate(group_getter):
-                        expr_per_group = getter(out_vars)
+                    exprs = [g(all_vars) for g in group_getter]
+                    used_iter_vars = [
+                        sorted([var_to_split[s] for s in expr.free_symbols]) for expr in exprs
+                    ]
 
-                        # not a combined dim
-                        if len(expr_per_group.free_symbols) == 1 and var_to_split[next(iter(expr_per_group.free_symbols))] == i:
-                            continue
+                    # assert no dim is combined across three different dims
+                    combine_ranges = [var_list for var_list in used_iter_vars if len(var_list) > 1]
+                    flattened_combined_idxs = [idx for range_list in combine_ranges for idx in range_list]
+                    assert len(flattened_combined_idxs) == len(OrderedSet(flattened_combined_idxs))
 
-                        combined_dims = sorted(var_to_split[v] for v in expr_per_group.free_symbols)
-                        out_combined_dims.append(combined_dims)
-
-                    out_combined_dims.sort(key=lambda x: x[0])
-                    try:
-                        for i in range(len(out_combined_dims) - 1):
-                            assert out_combined_dims[i][1] != out_combined_dims[i + 1][0]
-                    except:
-                        breakpoint()
-                        raise
-
-                    # Need to make sure we dont try to combine multiple dims, if so, coalesce
                     split = list(attempted_split)
-                    for idx_a, idx_b in out_combined_dims:
+                    for idx_a, idx_b in combine_ranges:
                         combined_split = sympy_product(split[idx_a:idx_b + 1])
                         split[idx_a] = combined_split
-                        split[idx_a + 1 : idx_b + 1] = [None for _ in range(idx_b)]
+                        split[idx_a + 1 : idx_b + 1] = [None for _ in range(idx_b - idx_a)]
 
-                    split = [a for a in split if a is not None]
+                    split = tuple([a for a in split if a is not None])
+                    breakpoint()
                     self.add_induced_split_option(split, is_pointwise)
-                    return None
 
-        return pw, red
+                    return False
+                
+        return True
+
+def apply_var_mapping(old_vars, new_vars, new_ranges, return_getters_groups):
+    var_map = {}    
+    num_vars = sum(len(s) for s in new_ranges)
+    new_var_map = {}
+
+    split_vars = sympy.symbols(f"v_0:{num_vars}")
+    var_count = len(split_vars) - 1
+
+    # ([p0, p1, p2], [[128, 6], [64], [196]])
+    
+    curr_count = 0
+    new_var_map = {}
+    for group, old_var in zip(new_ranges, old_vars):
+        
+        divis = None
+        assert len(group) <= 2
+        if len(group) == 2:
+            new_var1 = split_vars[curr_count]
+            new_var2 = split_vars[curr_count + 1]
+            curr_count += 2
+            # TODO _ think about
+            new_var_map[new_var1] = (old_var * group[1])
+            new_var_map[new_var2] = (old_var)
+        else:
+            new_var = split_vars[curr_count]
+            curr_count += 1
+            new_var_map[new_var] = old_var 
+
+    out_exprs = [sympy_subs(g(split_vars), new_var_map) for g in return_getters_groups]
+
+    var_map = {}
+
+    var_map = defaultdict(list)
+
+    for expr, new_var in zip(out_exprs, new_vars):
+        repl_map = dict.fromkeys(expr.free_symbols, 0)
+        for v in expr.free_symbols:
+            repl_map[v] = new_var
+            var_map[v].append(sympy_subs(expr, repl_map))
+            repl_map[v] = 0
+
+    var_map = {k: sum(v) for k, v in var_map.items()}
+    return var_map
+
+def apply_unified_var_mapping(iter_vars, red_vars, norm_pw_vars, norm_red_vars, new_ranges, return_getters_groups):
+    """
+    Apply variable mapping for both pointwise and reduction variables using a unified approach.
+    
+    Args:
+        iter_vars: Iteration variables for pointwise operations
+        red_vars: Reduction variables
+        norm_pw_vars: Normalized pointwise variables
+        norm_red_vars: Normalized reduction variables
+        new_ranges: Ranges for all variables (pointwise + reduction)
+        return_getters_groups: List of lists of getter functions [pw_getters, red_getters]
+        
+    Returns:
+        Combined variable mapping
+    """
+    # Create a flat list of all variables
+    all_old_vars = list(iter_vars) + list(red_vars)
+    all_new_vars = list(norm_pw_vars) + list(norm_red_vars)
+    
+    # Create symbolic variables for all splits
+    num_vars = sum(len(s) for s in new_ranges)
+    split_vars = sympy.symbols(f"v_0:{num_vars}")
+    
+    # Create mapping from split variables to original variable expressions
+    var_idx = 0
+    new_var_map = {}
+    
+    for group, old_var in zip(new_ranges, all_old_vars):
+        if len(group) == 2:
+            # Handle case where a variable is split into two dimensions
+            new_var1 = split_vars[var_idx]
+            new_var2 = split_vars[var_idx + 1]
+            var_idx += 2
+            
+            new_var_map[new_var1] = (old_var * group[1])
+            new_var_map[new_var2] = old_var
+        else:
+            # Handle case where variable is not split
+            new_var = split_vars[var_idx]
+            var_idx += 1
+            new_var_map[new_var] = old_var
+    
+    # Create a unified list of getters with their corresponding output variables
+    unified_getters = []
+    for group_idx, (getters, output_vars) in enumerate(zip(return_getters_groups, [norm_pw_vars, norm_red_vars])):
+        for getter_idx, getter in enumerate(getters):
+            unified_getters.append((getter, output_vars[getter_idx], group_idx))
+    
+    # Process all getters in a single loop
+    var_map = defaultdict(int)
+    
+    for getter, output_var, group_idx in unified_getters:
+        # Apply substitution to get expression in terms of original variables
+        expr = sympy_subs(getter(split_vars), new_var_map)
+        
+        # Map split variables to their contribution in the final expression
+        for v in expr.free_symbols:
+            # Create temporary replacement map to isolate this variable's contribution
+            repl_map = {sym: 0 for sym in expr.free_symbols}
+            repl_map[v] = output_var
+            
+            # Add this contribution to the variable mapping
+            term = sympy_subs(expr, repl_map)
+            var_map[v] += term
+    
+    return var_map
 
 
 def _extract_fused_node_meta(
     node: Union["FusedSchedulerNode", "SchedulerNode"],
 ) -> FusedNormalizedReadsWrites:
+
     """Extracts index variables, reduce variables, read/write expressions, and variable ranges from a fused node."""
     reads: OrderedSet[sympy.Expr] = OrderedSet()
     writes: OrderedSet[sympy.Expr] = OrderedSet()
@@ -412,70 +513,15 @@ def _extract_fused_node_meta(
     inputs = OrderedSet(dep.name for dep in node.read_writes.reads)
 
     pw_splits, red_splits = NodeSplitGetter(node).get_node_splits()
-    # pw_splits = [128, 6, 64, 196]
-
-    # def map_existing_vars_to_new_vars()
-
-    # breakpoint()
 
     # lets use different prefix (`n`) to distinguish
     (norm_pw_vars, norm_red_vars), ranges = index_vars_no_squeeze(
         pw_splits, red_splits, prefix="n"
     )
-    breakpoint()
     node = node
     pointwise_numel: sympy.Expr = node.group[1][0]
     red_numel: sympy.Expr = node.group[1][1]
-
-
-    def apply_var_mapping(old_vars, new_vars, new_ranges, return_getters_groups):
-
-        var_map = {}    
-
-        num_vars = sum(len(s) for s in new_ranges)
-
-        new_var_map = {}
-
-
-        split_vars = sympy.symbols(f"v_0:{num_vars}")
-        var_count = len(split_vars) - 1
-
-        # ([p0, p1, p2], [[128, 6], [64], [196]])
-        
-        curr_count = 0
-        new_var_map = {}
-        for group, old_var in zip(new_ranges, old_vars):
-            
-            divis = None
-            assert len(group) <= 2
-            if len(group) == 2:
-                new_var1 = split_vars[curr_count]
-                new_var2 = split_vars[curr_count + 1]
-                curr_count += 2
-                # TODO _ think about
-                new_var_map[new_var1] = (old_var * group[1])
-                new_var_map[new_var2] = (old_var)
-            else:
-                new_var = split_vars[curr_count]
-                curr_count += 1
-                new_var_map[new_var] = old_var 
-
-        out_exprs = [sympy_subs(g(split_vars), new_var_map) for g in return_getters_groups]
-
-        var_map = {}
-
-        var_map = defaultdict(list)
-
-        for expr, new_var in zip(out_exprs, new_vars):
-            repl_map = dict.fromkeys(expr.free_symbols, 0)
-            for v in expr.free_symbols:
-                repl_map[v] = new_var
-                var_map[v].append(sympy_subs(expr, repl_map))
-                repl_map[v] = 0
-
-        var_map = {k: sum(v) for k, v in var_map.items()}
-        return var_map
-
+    
     for n in node.get_nodes():
         if not isinstance(n, torch._inductor.scheduler.SchedulerNode):
             continue
@@ -489,19 +535,25 @@ def _extract_fused_node_meta(
             n_writes |= body.get_all_write_expr(out)
 
         (iter_vars, n_pw_splits), (red_vars, n_red_splits) = get_pw_red_splits(n, pointwise_numel, red_numel)
-
-        # NEED TO UPDATE THIS TO THE NEW THING
-        new_ranges, return_getters_groups = apply_split_to_node(n, pointwise_numel, red_numel, list(n_pw_splits) + list(n_red_splits))
-        # new_ranges, return_getters_groups = torch._inductor.codegen.simd.SIMDKernel._split_iteration_ranges(list(n_pw_splits) + list(n_red_splits), [pw_splits, red_splits])
+       
+        groups = pw_splits + red_splits
+        lengths = (n_pw_splits, (n_red_splits))
+        lengths = torch._inductor.codegen.simd.SIMDKernel.prepare_split_iteration_lengths(groups, lengths, red_numel)
+        new_ranges, return_getters_groups = torch._inductor.codegen.simd.SIMDKernel._split_iteration_ranges(groups, lengths)
         
-        var_map = apply_var_mapping(iter_vars, norm_pw_vars, new_ranges, return_getters_groups[0])
+        # Apply unified mapping
+        var_map = apply_unified_var_mapping(
+            iter_vars, red_vars, 
+            norm_pw_vars, norm_red_vars, 
+            new_ranges, return_getters_groups
+        )
+        var_map2 = apply_var_mapping(iter_vars, norm_pw_vars, new_ranges[:len(n_pw_splits)], return_getters_groups[0])
+        for k, v in var_map2.items():
+            assert var_map[k] == v
         # breakpoint()
-        try:
-            var_map.update(apply_var_mapping(red_vars, norm_red_vars, new_ranges[len(n_pw_splits):], return_getters_groups[1]))
-        except Exception as e:
-            breakpoint()
-            raise
+        # var_map.update(apply_var_mapping(red_vars, norm_red_vars, new_ranges[len(n_pw_splits):], return_getters_groups[1]))
 
+        breakpoint()
         n_reads_new = [sympy_subs(read, var_map) for read in n_reads]
         n_writes_new = [sympy_subs(read, var_map) for read in n_writes]
 
@@ -596,7 +648,7 @@ def analyze_memory_coalescing(
         else:
             uncoalesced_addrs[memory_expr] = size
 
-    breakpoint()
+    # breakpoint()
     if not uncoalesced_addrs:
         return CoalesceVarAnalysis(
             coalesced_by_var=coalesced_by_var, norm_read_writes=norm_read_writes
@@ -614,8 +666,8 @@ def analyze_memory_coalescing(
             del expr_subs[v]
             single_var_expr = sympy_subs(uncoalesced_expr, expr_subs)
             expr_subs[v] = 0
-            if repr(single_var_expr) == "64*n1":
-                breakpoint()
+            # if repr(single_var_expr) == "64*n1":
+            #     breakpoint()
             tiling_factor = solve_for_tiling(single_var_expr)
             # breakpoint()
             if (
