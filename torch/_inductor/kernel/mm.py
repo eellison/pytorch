@@ -1097,7 +1097,7 @@ def tuned_sparse_semi_structured_mm(
     )
 
 
-add_layout_constraint(aten._scaled_mm.default, constrain_to_fx_strides)
+# add_layout_constraint(aten._scaled_mm.default, constrain_to_fx_strides)
 
 
 @register_lowering(aten._scaled_mm.default, type_promotion_kind=None)  # type: ignore[misc]
