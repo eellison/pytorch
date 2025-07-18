@@ -918,8 +918,6 @@ class GraphLowering(torch.fx.Interpreter):
         assert op.operation_name is None, f"Operation registered twice: {op}"
         assert isinstance(op, ir.Operation)
         name = self.qualify_name(f"op{len(self.operations)}")
-        if name == "op14":
-            breakpoint()
         self.operations.append(op)
         self.name_to_op[name] = op
 
