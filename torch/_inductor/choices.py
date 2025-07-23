@@ -347,9 +347,14 @@ class InductorChoices:
                             ),
                         }
                     )
-
+                    # breakpoint()
+                    # 
+                    #     breakpoint()
                     WhyNoFuse(node1, node2)("no shared data due to indexing mismatch")
                     return False
+
+            # if "op0_op6_op1_op7" in node1.get_name():
+            #     breakpoint()
             WhyNoFuse(node1, node2)("no shared data")
             return False  # heuristic not needed for correctness
 

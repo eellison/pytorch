@@ -161,7 +161,6 @@ def forward(self, arg0_1: "f8e8m0fnu[1703936][1]cuda:0", arg1_1: "f8e4m3fn[13312
     _scaled_mm_2: "bf16[1024, 4096][4096, 1]cuda:0" = torch.ops.aten._scaled_mm.default(view_37, permute_12, view_44, view_48, None, None, torch.bfloat16);  view_37 = permute_12 = view_44 = view_48 = None
     return (_scaled_mm_2,)
 
-
 from torch._dynamo.debug_utils import aot_graph_input_parser
 
 torch.compile(forward)(**aot_graph_input_parser(forward))

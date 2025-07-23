@@ -3594,6 +3594,211 @@ class Scheduler:
 
         return str(reasons)
 
+
+    def shared_data_after_inverting_indexing(
+        self, node1: BaseSchedulerNode, node2: BaseSchedulerNode
+    ) -> int:
+        """
+        If node1 has a contiguous write, and node2 has a contiguous write but a discontiguous read,
+        try inverting the indexing in the read and write so that the two nodes can fuse.
+        to be compatible with node1 if that's more efficient.
+        """
+
+        # TODO Don't do loop reordering for CPU for now.
+        # Should debug more why it does not work for CPU codegen
+        if not config.loop_reindexing_in_fusion or any(
+            n.is_cpu() for n in [node1, node2]
+        ):
+            return 0
+
+        # if getattr(torch, "elias", None) or True:
+        #     return 0 
+
+        node1_buffer_names = node1.read_writes.buffer_names()
+        node2_buffer_names = node2.read_writes.buffer_names()
+
+        if "buf2" in node2_buffer_names:
+            breakpoint()
+
+        # Fast path: no common buffers.
+        common_buffer_names = node1_buffer_names & node2_buffer_names
+        if not common_buffer_names:
+            return 0
+
+        # Initially, only reiter if it fuses all reads
+        node2_unmet_dependencies = OrderedSet(dep.name for dep in node2.unmet_dependencies)
+        if node2_unmet_dependencies - node1_buffer_names:
+            return 0
+
+        if len(node2_unmet_dependencies) > 1:
+            return 0
+
+        node1_writes = {dep.name: dep for dep in node1.read_writes.writes}
+        node1_reads = {dep.name: dep for dep in node1.read_writes.writes}
+
+        node2_reads = {dep.name: dep for dep in node2.read_writes.reads}
+        node2_writes = {dep.name: dep for dep in node2.read_writes.writes}
+        
+        # initially only handle the one dep 
+        if len(node2.read_writes.reads) > 1 or len(node2.read_writes.writes) > 1:
+            # breakpoint()
+            return 0
+
+        node2_read = next(iter(node2.read_writes.reads))
+        node2_write = next(iter(node2.read_writes.writes))
+
+        # interesting - also worth it to reorder if there is contiguous
+        # read on this tensor - saves access
+        # todo:
+        
+
+        if node2_read.name not in node1_writes:
+            return 0
+            # TODO - maybe reorder to dedupe read
+            # if node2_read.name in node2.read_writes.reads:
+            #     node1_write = node1_reads[node2_read.name]
+            # else:
+            #     return 0
+        else:
+            node1_write = node1_writes[node2_read.name]
+        # except Exception as e:
+        #     breakpoint()
+        #     raise
+
+        if node1_write.index != node2_write.index and node1_write.size != node2_write.size:
+            return 0
+
+        # initially only handle single read single write
+        if node2_read.size != node2_write.size or len(node2_read.var_names) != 1:
+            return 0
+
+        if not len(node2._body.indexing_exprs) == 2:
+            # breakpoint()
+            return 0
+
+        assert "index0" in node2._body.indexing_exprs and "index1" in node2._body.indexing_exprs
+
+        node2_read_exprs = OrderedSet(expr for expr in node2._body.get_read_exprs())
+
+        if not len(node2_read_exprs) == 1:
+            # breakpoint()
+            return None
+
+        read_expr = next(iter(node2_read_exprs))
+
+        if read_expr == node2._body.indexing_exprs["index0"]:
+            read_expr_index = "index0"
+            write_index = "index1"
+        else:
+            assert read_expr == node2._body.indexing_exprs["index1"]
+            read_expr_index = "index1"
+            write_index = "index0"
+
+        #  V.graph.scheduler.name_to_buf["buf3"].users
+        # lets only do this optimization if the only 
+        # no possible other fusions
+        # outputs = node2.
+        # breakpoint()
+
+        # V.graph.scheduler.name_to_buf["buf3"].users
+
+        from torch._inductor.invert_expr_analysis import analyze_invertible_indexing
+        
+        index_vars = node2._body.vars[0]
+        assert len(index_vars) == 1
+
+        # breakpoint()
+
+        terms = []
+        for term in sympy.Add.make_args(read_expr):   
+            terms.append(V.graph.sizevars.combine_modular_indexing_pairs(term))
+
+        read_expr = sum(terms)
+
+        # breakpoint()
+        inverse = analyze_invertible_indexing(read_expr, index_vars[0])
+        if not inverse:
+            return None
+
+        # breakpoint()
+        inverse_formula = inverse[1]
+
+        # breakpoint()
+
+        node2._body.indexing_exprs[read_expr_index] = node2._body.indexing_exprs[write_index]
+        node2._body.indexing_exprs[write_index] = inverse_formula
+
+        node2.refresh_dependencies(True, False)
+        score = self.score_fusion_memory(node1, node2)
+
+        fusion_log.info("Shared memory after inversion: " + str(score))
+
+        return score
+        # breakpoint()
+        # pass
+
+
+
+        # TODO - handle multiple, reads, writes
+        # 
+        # 
+
+
+
+        breakpoint()
+        pass
+
+        # # Find the commons buffers that has different loop orders
+        # candidates = []
+        # for buffer_name in common_buffer_names:
+        #     lhs_dep = node1_name2dep[buffer_name]
+        #     rhs_dep = node2_name2dep[buffer_name]
+        #     if (
+        #         lhs_dep.normalize_with_stride_order()
+        #         == rhs_dep.normalize_with_stride_order()
+        #     ):
+        #         candidates.append(
+        #             (
+        #                 V.graph.sizevars.size_hint(lhs_dep.get_numel(), fallback=0),
+        #                 lhs_dep,
+        #                 rhs_dep,
+        #             )
+        #         )
+
+        # if len(candidates) == 0:
+        #     return 0
+
+        # # Pick the largest buffer to guide the loop reordering
+        # _numel, lhs_dep, rhs_dep = max(candidates, key=operator.itemgetter(0))
+
+        # if not isinstance(lhs_dep, MemoryDep) or not isinstance(rhs_dep, MemoryDep):
+        #     return 0
+
+        # if lhs_dep.num_vars != rhs_dep.num_vars:
+        #     # this can happen due to we don't merge loops.
+        #     # We can not do loop reordering in this case right now
+        #     # Simply returning true if the two Deps are the same after
+        #     # normalization (merging loops)
+        #     if lhs_dep.normalize() == rhs_dep.normalize():
+        #         return self.dep_size_hint(lhs_dep)
+        #     return 0
+
+        # # Only reorder loops for pointwise for now
+        # if not node1.is_reduction():
+        #     node1.reorder_loops_by_dep_pair(lhs_dep, rhs_dep)
+        # elif not node2.is_reduction():
+        #     node2.reorder_loops_by_dep_pair(rhs_dep, lhs_dep)
+        # else:
+        #     loop_ordering_log.debug(
+        #         "Don't reorder loops since both nodes are reductions: %s v.s. %s",
+        #         node1.get_name(),
+        #         node2.get_name(),
+        #     )
+
+        return self.score_fusion_memory(node1, node2)
+
+
+
     def shared_data_after_reordering_loop(
         self, node1: BaseSchedulerNode, node2: BaseSchedulerNode
     ) -> int:
@@ -3861,6 +4066,13 @@ class Scheduler:
             and config.loop_ordering_after_fusion
         ):
             shared_data_score = self.shared_data_after_reordering_loop(node1, node2)
+
+        if config.loop_reindexing_in_fusion and shared_data_score < config.score_fusion_memory_threshold:
+            # if "op0_op6_op1_op7" in node1.get_name():
+            #     breakpoint()
+            # pass
+            shared_data_score = self.shared_data_after_inverting_indexing(node1, node2)
+
 
         if loop_ordering_log.isEnabledFor(logging.DEBUG):
             loop_ordering_log.debug(

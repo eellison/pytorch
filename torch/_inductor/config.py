@@ -592,6 +592,8 @@ loop_ordering_after_fusion: bool = (
     os.environ.get("TORCHINDUCTOR_LOOP_ORDERING_AFTER_FUSION", "0") == "1"
 )
 
+loop_reindexing_in_fusion: bool = True
+
 # If fusing two nodes only save less then score_fusion_memory_threshold memory,
 # we should not bother fusing the nodes.
 #
