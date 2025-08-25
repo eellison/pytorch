@@ -1362,13 +1362,15 @@ class SIMDScheduling(BaseScheduling):
                     config.triton.tiling_prevents_reduction_fusion
                     and not node1.is_template()
                 ):
-                    is_reduction_tiling_valid = tuple(
+                    t = tuple(
                         self.select_tiling(node1.get_nodes(), numel1).values()
-                    ) in (
+                    ) 
+                    is_reduction_tiling_valid = t in (
                         (numel1, 1),
                         (numel2, rnumel2, 1),
                     )
                     if not is_reduction_tiling_valid:
+                        # breakpoint()
                         why("invalid tiling for reduction")
                     return is_reduction_tiling_valid
                 return True

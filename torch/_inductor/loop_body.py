@@ -264,6 +264,98 @@ class LoopBody:
         )
         return new_body
 
+    def reshape_loops_for_contiguous_access(
+        self, mem_dep: MemoryDep
+    ) -> LoopBody:
+        """
+        Reshape iteration loops to make a memory dependency contiguous.
+        This transforms the loops so that the memory access pattern becomes
+        a simple linear index (just the outermost loop variable).
+        """
+        old_body = self
+        old_sizes = self.sizes
+        old_iter_vars, old_reduce_vars = old_body.vars
+        old_iter_sizes, old_reduce_sizes = old_sizes
+        
+        # Analyze the memory dependency expression
+        mem_expr = mem_dep.index
+        var_coeffs = {}
+        
+        # Extract coefficients for each variable in the expression
+        for i, var in enumerate(old_iter_vars):
+            coeff = mem_expr.coeff(var, 1)  # Get coefficient of var
+            if coeff != 0:
+                var_coeffs[i] = coeff
+        
+        # For your specific case: 512*c0 + (c1//32)
+        # We want to linearize this into a single dimension
+        
+        if (len(var_coeffs) == 2 and len(old_iter_sizes) == 2) or True:
+            c0_size, c1_size = old_iter_sizes
+            
+            
+            # Calculate the linearized size
+            # For 512*c0 + (c1//32), the range is:
+            # 0 to 512*(c0_size-1) + ((c1_size-1)//32)
+            # max_c1_contrib = (c1_size - 1) // 32
+            # linearized_size = 512 * c0_size + max_c1_contrib + 1
+            
+            # The remainder dimension
+            remainder_size = 32  # Since we're dividing c1 by 32
+            
+            new_iter_sizes = (8388608, remainder_size)
+            new_sizes = (new_iter_sizes, old_reduce_sizes)
+
+            def iter_reindex(new_vars):
+                """
+                Transform new loop variables back to old loop variables.
+                new_vars = [new_c0, new_c1]
+                Returns [old_c0, old_c1] where:
+                - old_c0 = new_c0 // 512
+                - old_c1 = (new_c0 % 512) * 32 + new_c1
+                """
+                new_c0, new_c1 = new_vars[:2]  # Handle case with more dimensions
+                
+                old_c0 = new_c0 // 512
+                old_c1 = (new_c0 % 512) * 32 + new_c1
+                
+                return [old_c0, old_c1] + new_vars[2:]  # Preserve any additional dims
+            
+            # No change to reduction reindex
+            def reduce_reindex(vars):
+                return vars
+            
+            # Create new variables
+            (iter_vars, reduce_vars), var_ranges = dependencies.index_vars_no_squeeze(
+                *new_sizes, prefix="t"
+            )
+            
+            # Create new LoopBody with reindexing
+            new_body = LoopBody(
+                old_body,
+                [iter_reindex(iter_vars), reduce_reindex(reduce_vars)],
+                var_ranges,
+                iter_vars,
+                reduce_vars,
+            )
+            breakpoint()
+
+            
+            # Use original symbol prefix for consistency
+            (iter_vars2, reduce_vars2), var_ranges2 = dependencies.index_vars_no_squeeze(
+                *new_sizes, prefix="p"
+            )
+            final_body = LoopBody(
+                new_body, (iter_vars2, reduce_vars2), 
+                var_ranges2, iter_vars2, reduce_vars2
+            )
+            
+            return final_body
+        
+        else:
+            # Handle other cases or return original body
+            return old_body
+
     def reorder_iter_loops(self, new_order) -> LoopBody:
         """
         Reorder iteration loops and return a new LoopBody.

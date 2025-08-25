@@ -3971,7 +3971,220 @@ class Scheduler:
                 f"Unknown reason: {lhs_dep} v.s. {rhs_dep}. {layout_str}"
             )
 
-        return str(reasons)
+    def shared_data_after_reindexing_loops(
+        self, node1: BaseSchedulerNode, node2: BaseSchedulerNode
+    ) -> int:
+        """
+        For fused nodes with pattern: read = X*p0 + (p1//Y), write = B*p0 + p1
+        Apply a loop reindexing transformation to make all reads contiguous.
+        This enables fusion of kernels with strided read patterns.
+        """
+        
+
+        # Check if there are common buffers
+        common_buffer_names = node1.read_writes.buffer_names() & node2.read_writes.buffer_names()
+        if not common_buffer_names:
+            return 0
+
+        # Get all reads and writes from node2
+        node2_reads = list(node2.read_writes.reads)
+        node2_writes = list(node2.read_writes.writes)
+        
+        if not node2_reads or not node2_writes:
+            return 0
+        
+        # Check that node2 has a LoopBody
+        if not hasattr(node2, '_body') or not isinstance(node2._body, LoopBody):
+            return 0
+        
+        # Detect the strided access pattern across all reads and writes
+        pattern_info = self._detect_strided_access_pattern(node2._body, node2_reads, node2_writes)
+        if not pattern_info:
+            return 0
+        
+        breakpoint()
+        
+        X, Y, A, B = pattern_info
+        
+        fusion_log.debug(f"Found strided access pattern for {node2.get_name()}: X={X}, Y={Y}, A={A}, B={B}")
+        
+        # Create the recompute function for simplify_and_reorder
+        def recompute_with_loop_reindexing(sizes, body, vars):
+            index_size, reduce_size = sizes
+            index_vars, reduce_vars = vars
+            
+            # Only handle 2D iteration space for now
+            if len(index_vars) != 2:
+                return sizes, body, vars
+            
+            p0, p1 = index_vars
+            old_A, old_B = index_size
+            
+            # Verify dimensions match our detected pattern
+            if old_A != A or old_B != B:
+                fusion_log.debug(f"Size mismatch: expected ({A}, {B}), got ({old_A}, {old_B})")
+                return sizes, body, vars
+            
+            # New iteration space after reindexing
+            new_A = A * B // Y
+            new_B = Y
+            
+            # Create new variables
+            from . import dependencies
+            (new_index_vars, new_reduce_vars), new_var_ranges = dependencies.index_vars_no_squeeze(
+                [new_A, new_B], reduce_size, prefix="q"
+            )
+            
+            q0, q1 = new_index_vars
+            
+            # Create substitution mapping for loop reindexing
+            def reindexed_body(*indices):
+                # indices = ([q0, q1], reduce_vars)
+                q0_val, q1_val = indices[0][0], indices[0][1]
+                
+                # Apply inverse transformation: new -> old
+                # p0 = q0 // (B//Y)
+                # p1 = Y * (q0 % (B//Y)) + q1
+                p0_old = q0_val // X  # X = B//Y
+                p1_old = Y * (q0_val % X) + q1_val
+                
+                # Call original body with transformed indices
+                return body([p0_old, p1_old], indices[1] if len(indices) > 1 else [])
+            
+            # Create new LoopBody with reindexed loops
+            new_body = LoopBody(
+                reindexed_body,
+                (new_index_vars, new_reduce_vars),
+                new_var_ranges,
+                new_index_vars,
+                new_reduce_vars
+            )
+            
+            fusion_log.debug(f"Applied loop reindexing: ({A}, {B}) -> ({new_A}, {new_B})")
+            
+            return ([new_A, new_B], reduce_size), new_body, (new_index_vars, new_reduce_vars)
+        
+        breakpoint()
+        # Apply the transformation by recomputing the node
+        node2.recompute_size_and_body(
+            recompute_sizes_body_func=recompute_with_loop_reindexing
+        )
+        
+        # Score the fusion with new indexing
+        score = self.score_fusion_memory(node1, node2)
+        
+        fusion_log.info(f"Shared memory after loop reindexing: {score} (stride={Y}, reads={len(node2_reads)}, writes={len(node2_writes)})")
+        
+        return score
+
+
+    def _detect_strided_access_pattern(
+        self, 
+        body: LoopBody, 
+        reads: list[dependencies.Dep],
+        writes: list[dependencies.Dep]
+    ) -> Optional[tuple[int, int, int, int]]:
+        """
+        Detect if ALL reads/writes match the strided pattern or are already contiguous.
+        Strided pattern: reads = X*p0 + (p1//Y), contiguous pattern: B*p0 + p1
+        Returns (X, Y, A, B) if pattern can be transformed, None otherwise.
+        """
+        
+        # Get iteration variables and their ranges
+        iter_vars = body.iter_vars
+        if len(iter_vars) != 2:
+            return None
+        
+        p0, p1 = iter_vars
+        var_ranges = body.var_ranges
+        A = var_ranges[p0]
+        B = var_ranges[p1]
+        
+        # Get all read and write expressions from the body
+        read_exprs = body.get_read_exprs()
+        write_exprs = body.get_write_exprs()
+        
+        if not read_exprs or not write_exprs:
+            return None
+        
+        # Simplify all expressions
+        read_simplified = [
+            V.graph.sizevars.simplify_with_ranges(expr, var_ranges) 
+            for expr in read_exprs
+        ]
+        write_simplified = [
+            V.graph.sizevars.simplify_with_ranges(expr, var_ranges)
+            for expr in write_exprs
+        ]
+        
+        # Check write patterns - should all be B*p0 + p1 (contiguous)
+        expected_contiguous = B * p0 + p1
+        for write_expr in write_simplified:
+            if write_expr != expected_contiguous:
+                fusion_log.debug(f"Write doesn't match contiguous pattern: {write_expr} != {expected_contiguous}")
+                return None
+        
+        # Check read patterns - need to find consistent stride divisor Y
+        stride_divisors = set()
+        
+        for read_expr in read_simplified:
+            # Check if already contiguous (same as write pattern)
+            if read_expr == expected_contiguous:
+                continue  # Already contiguous, no transformation needed for this read
+            
+            # Try to find the stride divisor Y for this read expression
+            found_divisor = None
+            for divisor in [2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]:
+                if B % divisor == 0:
+                    stride = B // divisor
+                    
+                    # Check different representations of integer division
+                    test_patterns = [
+                        stride * p0 + sympy.floor(p1 / divisor),
+                        stride * p0 + (p1 // divisor),
+                    ]
+                    
+                    # Handle modular indexing representation if present
+                    from sympy import Mod
+                    test_patterns.append(stride * p0 + (p1 - Mod(p1, divisor)) / divisor)
+                    
+                    for test_expr in test_patterns:
+                        test_simplified = V.graph.sizevars.simplify_with_ranges(test_expr, var_ranges)
+                        if read_expr == test_simplified:
+                            found_divisor = divisor
+                            break
+                    
+                    if found_divisor:
+                        break
+            
+            if found_divisor:
+                stride_divisors.add(found_divisor)
+            else:
+                # This read doesn't match any strided pattern
+                fusion_log.debug(f"Read doesn't match strided pattern: {read_expr}")
+                return None
+        
+        # All reads must agree on the same stride divisor (or be already contiguous)
+        if len(stride_divisors) > 1:
+            fusion_log.debug(f"Inconsistent stride divisors: {stride_divisors}")
+            return None
+        
+        if len(stride_divisors) == 0:
+            # All reads are already contiguous, no transformation needed
+            fusion_log.debug("All reads already contiguous")
+            return None
+        
+        Y = stride_divisors.pop()
+        X = B // Y
+        
+        # Verify that the transformation is valid
+        if A * B % Y != 0:
+            fusion_log.debug(f"Invalid transformation: {A}*{B} not divisible by {Y}")
+            return None
+        
+        fusion_log.debug(f"Strided pattern detected: stride={X}, divisor={Y}, dims=({A}, {B})")
+        return (X, Y, A, B)
+
 
     def shared_data_after_reordering_loop(
         self, node1: BaseSchedulerNode, node2: BaseSchedulerNode
@@ -4359,6 +4572,29 @@ class Scheduler:
             smaller_node.expand_dimension_for_pointwise_node(expand_dim, expand_size)
             shared_data_score = self.score_fusion_memory(node1, node2)
 
+        # names = "buf0" 
+        # a = (str(node1.get_output_names())) + str(node2.get_output_names())
+        # if "b" in a:
+        #     breakpoint()
+
+        # print(a)
+        # if names[0] in (node1.get_name() + node2.get_name()) and names[1] in (node1.get_name() + node2.get_name()):
+        #     breakpoint()
+        if "op0_op5_op6" in node1.get_name() and "op1_op2_op3" in node2.get_name():
+            deps = node2.read_writes.reads
+
+            breakpoint()
+
+            for d in deps:
+                if d.name == "buf0":
+                    node2.snodes[0]._body.reshape_loops_for_contiguous_access(d)
+            pass
+
+
+        if shared_data_score < config.score_fusion_memory_threshold:
+            shared_data = self.shared_data_after_reindexing_loops(node1, node2)
+
+
         if loop_ordering_log.isEnabledFor(logging.DEBUG):
             loop_ordering_log.debug(
                 "%s and %s has %s shared data",
@@ -4425,7 +4661,11 @@ class Scheduler:
             #   - MemoryDep("foo", x) != StarDep("foo")
             why("memory deps did not match")
             return False
-
+            # ab =  repr(node1) + repr(node2)
+            # if (not "op0_op1_op2_op3_op4_op5_op6_op7_op8_op9_op10_op11_op12_op14" in ab and "op15" in ab):
+            #     why("memory deps did not match")
+            #     return False
+        ab =  str(node1) + str(node2)
         node1_op_names = node1.get_operation_names()
         for name in remaining_deps:
             op_name = self.name_to_buf[name].defining_op_name()
