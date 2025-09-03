@@ -717,7 +717,7 @@ deterministic = os.getenv("TORCHINDUCTOR_DETERMINISTIC") == "1"
 # non-representative inputs.
 min_num_split = int(os.environ.get("TORCHINDUCTOR_MIN_NUM_SPLIT", 0))
 
-benchmark_kernel = os.environ.get("TORCHINDUCTOR_BENCHMARK_KERNEL", "0") == "1"
+benchmark_kernel = os.environ.get("TORCHINDUCTOR_BENCHMARK_KERNEL", "1") == "1"
 
 # Enable constant and index_expr folding
 constant_and_index_propagation = True

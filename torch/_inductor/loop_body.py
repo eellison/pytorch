@@ -14,6 +14,7 @@ import torch.fx
 from torch._dynamo.utils import identity
 from torch.fx.proxy import Scope, TracerBase
 from torch.utils._sympy.symbol import SymT
+from torch.utils._sympy.functions import FloorDiv, ModularIndexing
 
 from . import config, dependencies
 from .codegen.common import index_prevent_reordering
@@ -266,7 +267,7 @@ class LoopBody:
 
     def reshape_loops_for_contiguous_access(
         self, mem_dep: MemoryDep
-    ) -> LoopBody:
+    ) -> tuple[LoopBody, Any]:
         """
         Reshape iteration loops to make a memory dependency contiguous.
         This transforms the loops so that the memory access pattern becomes
@@ -290,7 +291,7 @@ class LoopBody:
         # For your specific case: 512*c0 + (c1//32)
         # We want to linearize this into a single dimension
         
-        if (len(var_coeffs) == 2 and len(old_iter_sizes) == 2) or True:
+        if (len(old_iter_sizes) == 2):
             c0_size, c1_size = old_iter_sizes
             
             
@@ -316,8 +317,8 @@ class LoopBody:
                 """
                 new_c0, new_c1 = new_vars[:2]  # Handle case with more dimensions
                 
-                old_c0 = new_c0 // 512
-                old_c1 = (new_c0 % 512) * 32 + new_c1
+                old_c0 = FloorDiv(new_c0,  512)
+                old_c1 = ModularIndexing(new_c0, 1, 512) * 32 + new_c1
                 
                 return [old_c0, old_c1] + new_vars[2:]  # Preserve any additional dims
             
@@ -349,10 +350,11 @@ class LoopBody:
                 new_body, (iter_vars2, reduce_vars2), 
                 var_ranges2, iter_vars2, reduce_vars2
             )
-            
-            return final_body
+            # self.sizes = 
+            return final_body, new_sizes
         
         else:
+            return None
             # Handle other cases or return original body
             return old_body
 

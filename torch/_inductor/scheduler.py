@@ -4581,14 +4581,34 @@ class Scheduler:
         # if names[0] in (node1.get_name() + node2.get_name()) and names[1] in (node1.get_name() + node2.get_name()):
         #     breakpoint()
         if "op0_op5_op6" in node1.get_name() and "op1_op2_op3" in node2.get_name():
-            deps = node2.read_writes.reads
-
             breakpoint()
+            if not self.can_fuse_vertical(node1, node2):
+                deps = node2.read_writes.reads
 
-            for d in deps:
-                if d.name == "buf0":
-                    node2.snodes[0]._body.reshape_loops_for_contiguous_access(d)
-            pass
+                breakpoint()
+
+                for d in deps:
+                    if d.name == "buf0":
+                        for snode in node2.snodes:
+                            new_val = snode._body.reshape_loops_for_contiguous_access(d)
+                            if new_val is not None:
+                                snode._body, snode._sizes = new_val
+                                snode.refresh_dependencies(True, True)
+
+                        refresh_group_node_dependencies(node2)
+                        breakpoint()
+                        shared_data_score = self.score_fusion_memory(node1, node2)
+                        
+                        # reads = node2.snodes[0].reads.union(*[snode.reads for snode in snodes in node2.snodes[1:]])
+                        # node2.read_writes.reads = reads
+                        # writes = node2.snodes[0].writes.union(*[snode.writes for snode in snodes in node2.snodes[1:]])
+                        # node2.read_writes.writes = writes
+                        # node2.refresh_dependencies(True, False)  
+                        pass
+                
+                # pass
+                #         node2.snodes[0]._body.reshape_loops_for_contiguous_access(d)
+                # pass
 
 
         if shared_data_score < config.score_fusion_memory_threshold:
