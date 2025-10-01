@@ -12,6 +12,7 @@ import torch
 import torch.fx as fx
 from torch._dynamo.utils import counters, dynamo_timed
 from torch._inductor.fx_passes.bucketing import is_wait_tensor
+from torch._inductor.fx_memory_analysis import FXMemoryAnalyzer, ChainMemoryInfo, suggest_memory_limit_gb
 from torch.utils._mode_utils import no_dispatch
 from torch.utils._ordered_set import OrderedSet
 
@@ -135,6 +136,15 @@ def set_cached_node_time(key: str, value: float) -> None:
 
 
 @dataclass
+class NonCriticalChain:
+    """Information about a chain of non-critical path nodes."""
+
+    nodes: list[fx.Node]
+    memory_info: ChainMemoryInfo
+    priority_score: float  # Lower score = higher priority when memory constrained
+
+
+@dataclass
 class CollectiveInfo:
     """Track info about a collective operation"""
 
@@ -190,12 +200,17 @@ class OverlapScheduler:
         max_in_flight_gb: float = 2.0,
         compute_overlap_multipler: float = 2.0,
         max_coll_distance: int = 1000,
+        memory_limit_safety_factor: float = 1.2,
     ):
         self.gm = gm
         self.graph = gm.graph
         self.compute_overlap_multipler = compute_overlap_multipler
         self.max_node_distance = max_coll_distance
         self.max_in_flight_bytes: int = int(max_in_flight_gb * 1024 * 1024 * 1024)
+
+        # Auto-detect memory limit from graph analysis
+        suggested_limit_gb = suggest_memory_limit_gb(self.graph, memory_limit_safety_factor)
+        self.max_memory_bytes: int = int(suggested_limit_gb * 1024 * 1024 * 1024)
 
         # Build structures
         stable_topological_sort(self.graph)
@@ -204,6 +219,26 @@ class OverlapScheduler:
         self.node_ancestors: dict[fx.Node, OrderedSet[fx.Node]] = (
             self._collect_node_ancestors()
         )
+
+        # Memory analysis using separate utility
+        self.memory_analyzer = FXMemoryAnalyzer(self.graph)
+        self.memory_analysis = self.memory_analyzer.analyze()
+        self.current_memory = 0  # Track current memory during scheduling
+
+        log.debug(
+            f"Memory analysis: peak={self.memory_analysis.peak_memory_bytes // (1024*1024)} MB, "
+            f"auto-detected limit={self.max_memory_bytes // (1024*1024)} MB "
+            f"(safety factor={memory_limit_safety_factor})"
+        )
+
+        # Note: The auto-detected limit should always be >= peak memory due to safety factor
+        # But warn if something unexpected happens
+        if self.memory_analysis.peak_memory_bytes > self.max_memory_bytes:
+            log.warning(
+                f"Unexpected: Graph peak memory ({self.memory_analysis.peak_memory_bytes // (1024*1024)} MB) "
+                f"exceeds auto-detected limit ({self.max_memory_bytes // (1024*1024)} MB). "
+                f"This may indicate an issue with memory analysis."
+            )
 
         # Identify collectives and compute nodes
         self.collective_info: dict[fx.Node, CollectiveInfo] = {}
@@ -240,6 +275,68 @@ class OverlapScheduler:
                 ancestors[node] |= ancestors[input_node]
 
         return ancestors
+
+    def _is_node_on_critical_path(self, node: fx.Node) -> bool:
+        """Check if a node is on the critical path (blocks compute operations)."""
+        # A node is on critical path if it has high compute depth or blocks compute
+        return self.compute_depth[node] >= max(self.compute_depth.values()) - 2
+
+    def _find_memory_reducing_chains(self, max_chain_length: int = 10) -> list[NonCriticalChain]:
+        """Find chains of schedulable ready nodes that reduce memory."""
+        # Get all ready nodes that haven't been scheduled yet
+        ready_nodes = [node for _, node in self.ready if node not in self.scheduled and self._is_node_ready(node)]
+
+        # Look for individual nodes and chains that reduce memory
+        chains = []
+        processed = set()
+
+        for start_node in ready_nodes:
+            if start_node in processed:
+                continue
+
+            # Start with a single node
+            chain = [start_node]
+            processed.add(start_node)
+
+            # Try to extend the chain by following dependencies
+            current = start_node
+            while len(chain) < max_chain_length:
+                # Look for users that are also ready and not yet processed
+                candidates = [
+                    user for user in current.users
+                    if (user in ready_nodes and
+                        user not in processed and
+                        len(user.all_input_nodes) == 1)  # Simple linear dependency
+                ]
+
+                if len(candidates) == 1:
+                    next_node = candidates[0]
+                    chain.append(next_node)
+                    processed.add(next_node)
+                    current = next_node
+                else:
+                    break
+
+            # Analyze memory impact of this chain
+            memory_info = self.memory_analyzer.analyze_chain_memory(
+                chain, self.current_memory
+            )
+
+            # Only keep chains that reduce memory
+            if memory_info.reduces_memory:
+                # Priority: most memory reduction first, then shorter chains
+                priority_score = memory_info.final_memory_change  # More negative = higher priority
+                priority_score += len(chain) * 0.1  # Shorter chains slightly preferred
+
+                chains.append(NonCriticalChain(
+                    nodes=chain,
+                    memory_info=memory_info,
+                    priority_score=priority_score
+                ))
+
+        # Sort by priority (lower/more negative score = higher priority)
+        chains.sort(key=lambda c: c.priority_score)
+        return chains
 
     def _identify_collectives(self) -> None:
         """Identify all collective operations."""
@@ -309,6 +406,10 @@ class OverlapScheduler:
         """Run the scheduling algorithm."""
 
         while self.ready:
+            # Check for memory pressure and try to schedule memory-reducing chains
+            if self._schedule_memory_reducing_chain():
+                continue
+
             if self._should_force_wait_for_memory():
                 self._force_oldest_wait()
                 continue
@@ -341,6 +442,13 @@ class OverlapScheduler:
         assert node not in self.scheduled
         assert all(n in self.scheduled for n in node.all_input_nodes)
         self.scheduled.add(node)
+
+        # Update memory tracking using analysis
+        memory_delta = self._get_memory_delta_for_node(node)
+        self.current_memory += memory_delta
+
+        log.debug(f"Scheduled {node.name}: memory change {memory_delta // (1024*1024)} MB, "
+                 f"current memory: {self.current_memory // (1024*1024)} MB")
 
         for user in node.users:
             self.in_degree[user] -= 1
@@ -392,6 +500,56 @@ class OverlapScheduler:
     def _should_force_wait_for_memory(self) -> bool:
         """Check if we need to force a wait due to memory pressure"""
         return self.in_flight_bytes >= self.max_in_flight_bytes
+
+    def _should_force_memory_reduction(self) -> bool:
+        """Check if we need to force memory reduction due to memory pressure"""
+        return self.current_memory >= self.max_memory_bytes
+
+    def _get_memory_delta_for_node(self, node: fx.Node) -> int:
+        """Get the net memory change if we schedule this node."""
+        node_info = self.memory_analysis.node_memory_info.get(node)
+        if node_info:
+            return node_info.net_change
+        return 0
+
+    def _is_node_ready(self, node: fx.Node) -> bool:
+        """Check if a node is ready to be scheduled (all dependencies met)."""
+        return all(dep in self.scheduled for dep in node.all_input_nodes)
+
+    def _schedule_memory_reducing_chain(self) -> bool:
+        """Schedule a chain of memory-reducing nodes when near memory limit."""
+        if not self._should_force_memory_reduction():
+            return False
+
+        chains = self._find_memory_reducing_chains()
+        if not chains:
+            return False
+
+        # Take the highest priority chain (first in sorted list)
+        best_chain = chains[0]
+
+        log.debug(
+            f"Memory pressure detected. Scheduling chain of {len(best_chain.nodes)} nodes: "
+            f"final memory change: {best_chain.memory_info.final_memory_change // (1024*1024)} MB, "
+            f"temporary peak increase: {best_chain.memory_info.peak_memory_increase // (1024*1024)} MB"
+        )
+
+        # Schedule all nodes in the chain
+        scheduled_count = 0
+        for node in best_chain.nodes:
+            if node not in self.scheduled and self._is_node_ready(node):
+                if is_compute_node(node):
+                    self._handle_compute(node)
+                elif node in self.collective_info:
+                    self._handle_collective_start(node)
+                elif is_wait_tensor(node):
+                    self._handle_wait(node)
+                else:
+                    self._handle_other(node)
+                scheduled_count += 1
+
+        log.debug(f"Successfully scheduled {scheduled_count} nodes from memory-reducing chain")
+        return scheduled_count > 0
 
     def _force_oldest_wait(self) -> None:
         """Schedule the oldest in flight wait"""
@@ -658,6 +816,7 @@ def schedule_overlap_bucketing(
     max_in_flight_gb: float = 2.0,
     compute_overlap_multipler: float = 1.0,
     max_coll_distance: int = 1000,
+    memory_limit_safety_factor: float = 1.2,
 ) -> torch.fx.GraphModule:
     """Schedule nodes to maximize compute-collective overlap.
 
@@ -666,10 +825,12 @@ def schedule_overlap_bucketing(
         max_in_flight_gb: Maximum GB of concurrent collective data.
         compute_overlap_multipler: Scale factor for compute time used to hide collectives.
         max_coll_distance: Maximum node distance for overlap consideration.
+        memory_limit_safety_factor: Safety factor for auto-detected memory limit.
     """
     return OverlapScheduler(
         gm,
         compute_overlap_multipler=compute_overlap_multipler,
         max_in_flight_gb=max_in_flight_gb,
         max_coll_distance=max_coll_distance,
+        memory_limit_safety_factor=memory_limit_safety_factor,
     ).run()
