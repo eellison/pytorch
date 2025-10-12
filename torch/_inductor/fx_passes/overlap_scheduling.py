@@ -12,6 +12,8 @@ import torch
 import torch.fx as fx
 from torch._dynamo.utils import counters, dynamo_timed
 from torch._inductor.fx_passes.bucketing import is_wait_tensor
+from torch._inductor.fx_passes.memory_estimator import MemoryTracker
+from torch._inductor.fx_passes.subgraph_analyzer import SubgraphAnalyzer, SchedulableSubgraph
 from torch.utils._mode_utils import no_dispatch
 from torch.utils._ordered_set import OrderedSet
 
@@ -157,6 +159,16 @@ class CollectiveInfo:
         return self.exposed_time_ms != 0
 
 
+@dataclass
+class CollBucket:
+    """Track information about a bucket of collectives."""
+
+    collectives: list[fx.Node]  # Original collective starts
+    bucketed_start: Optional[fx.Node] = None  # After bucketing
+    bucketed_wait: Optional[fx.Node] = None  # After bucketing
+    total_bytes: int = 0
+
+
 class OverlapScheduler:
     """
     Scheduler that reorders operations to maximize compute-collective overlap.
@@ -212,6 +224,15 @@ class OverlapScheduler:
         self.compute_depth = self._calculate_compute_node_depth()
         self.compute_nodes = [n for n in self.nodes if is_compute_node(n)]
 
+        # Memory tracking using abstracted MemoryTracker
+        def device_filter(device):
+            return device.type != "cpu"
+
+        self.memory_tracker = MemoryTracker(self.graph, device_filter=device_filter)
+
+        # Subgraph analyzer for finding memory-reducing subgraphs
+        self.subgraph_analyzer = SubgraphAnalyzer(self.memory_tracker)
+
         # Scheduling state
         self.potentially_hidden_collectives = (
             self.compute_potential_hidden_collectives()
@@ -227,6 +248,9 @@ class OverlapScheduler:
         self.in_flight: dict[fx.Node, CollectiveInfo] = {}  # start -> info
         self.in_flight_bytes = 0
         self.scheduled: OrderedSet[fx.Node] = OrderedSet()
+
+        # Partial subgraph tracking
+        self.partial_subgraphs: list[SchedulableSubgraph] = []  # Chains with remaining nodes to schedule
 
     def _collect_node_ancestors(self) -> dict[fx.Node, OrderedSet[fx.Node]]:
         """Collect all ancestors for each node."""
@@ -305,6 +329,16 @@ class OverlapScheduler:
     def _align_compute_nodes_runtime_estimations_across_all_distributed_ranks(
         self,
     ) -> None:
+        import torch.distributed as dist
+
+        # Skip alignment if using fake backend (for testing)
+        if hasattr(dist, 'get_backend') and dist.get_backend() == 'fake':
+            log.info("Overlap scheduling: Skipping runtime estimation alignment for fake backend")
+            # Still need to benchmark nodes for individual estimation
+            for n in self.compute_nodes:
+                benchmark_node_with_cache_key(n)
+            return
+
         log.info(
             "Overlap scheduling: Aligning runtime estimations across all distributed ranks"
         )
@@ -315,7 +349,6 @@ class OverlapScheduler:
             runtime_estimations.append(val)
             runtime_estimations_keys.append(key)
 
-        import torch.distributed as dist
         from torch.distributed.distributed_c10d import _get_default_group
 
         world_size = dist.get_world_size()
@@ -349,13 +382,26 @@ class OverlapScheduler:
 
         while self.ready:
             if self._should_force_wait_for_memory():
-                self._force_oldest_wait()
+                # Priority 1: Force hidden waits first (no overlap cost)
+                if self._force_hidden_waits():
+                    continue
+
+                # Priority 2: No additional memory-reducing logic needed here
+                # (subgraphs are built naturally in main loop from non-critical nodes)
+
+                # Fallback: Force any remaining wait
+                if self.in_flight:
+                    self._force_oldest_wait()
                 continue
 
             _, node = heapq.heappop(self.ready)
 
             # we don't always remove nodes from the heap when we schedule them
             if node in self.scheduled:
+                continue
+
+            # Try to build memory-reducing subgraph from this node if it's non-critical
+            if self._try_schedule_memory_reducing_subgraph_from(node):
                 continue
 
             if is_compute_node(node):
@@ -409,7 +455,19 @@ class OverlapScheduler:
         """Schedule a node."""
         assert node not in self.scheduled
         assert all(n in self.scheduled for n in node.all_input_nodes)
+
+        # Update memory tracking and mark as scheduled
+        self.memory_tracker.schedule_node(node)
         self.scheduled.add(node)
+
+        # Notify subgraph analyzer for cache invalidation
+        self.subgraph_analyzer.notify_node_scheduled(node)
+
+        # Update partial subgraphs - mark this node as consumed
+        self._update_partial_subgraphs(node)
+
+        # Check for newly unblocked subgraphs and merge them optimally
+        self._handle_unblocked_subgraphs()
 
         for user in node.users:
             self.in_degree[user] -= 1
@@ -425,7 +483,7 @@ class OverlapScheduler:
             # so as to overlap comm with itself. although exposed comms should bucketed with each other.
             overlappable = info.is_exposed and node in self.potentially_hidden_waits
         else:
-            overlappable = self.in_overlappable_collective_unary_chain(node)
+            overlappable = self.in_overlappable_collective_unary_subgraph(node)
 
         return (
             self.compute_depth[node],  # what depth compute it blocks
@@ -439,7 +497,7 @@ class OverlapScheduler:
             node.target, "tags", ()
         )
 
-    def in_overlappable_collective_unary_chain(self, curr: fx.Node) -> bool:
+    def in_overlappable_collective_unary_subgraph(self, curr: fx.Node) -> bool:
         while True:
             if len(curr.users) != 1:
                 return False
@@ -460,11 +518,92 @@ class OverlapScheduler:
 
     def _should_force_wait_for_memory(self) -> bool:
         """Check if we need to force a wait due to memory pressure"""
-        return self.in_flight_bytes >= self.max_in_flight_bytes
+        # Only force wait if we have in-flight operations to wait for
+        if not self.in_flight:
+            return False
+
+        # Check both in-flight collective bytes and total tracked memory
+        collective_pressure = self.in_flight_bytes >= self.max_in_flight_bytes
+
+        # More aggressive memory pressure detection (lower threshold)
+        current_memory_gb = self.memory_tracker.get_current_memory_bytes() / (1024**3)
+        memory_limit_gb = self.max_in_flight_bytes / (1024**3)
+        memory_pressure = current_memory_gb >= (memory_limit_gb * 0.75)  # 75% threshold instead of 100%
+
+        return collective_pressure or memory_pressure
 
     def _force_oldest_wait(self) -> None:
         """Schedule the oldest in flight wait"""
         self._handle_wait(self._get_oldest_wait())
+
+    def _force_hidden_waits(self) -> bool:
+        """
+        Force waits on hidden collectives (no overlap cost).
+
+        Returns True if any hidden waits were scheduled, False otherwise.
+        """
+        forced_any = False
+
+        # Look for hidden waits we can force without losing overlap
+        for start_node, info in list(self.in_flight.items()):
+            if not info.is_exposed and info.hiding_node:
+                # This collective is already hidden, force its wait
+                self._handle_wait(info.wait_node)
+                forced_any = True
+
+        return forced_any
+
+
+    def _try_schedule_memory_reducing_subgraph_from(self, node: fx.Node) -> bool:
+        """
+        Try to find and schedule a memory-reducing subgraph starting from a specific node.
+
+        Returns True if we scheduled a subgraph, False if we should schedule node normally.
+        """
+        # Try building subgraphs from non-critical path nodes, but also be more aggressive
+        # when memory pressure is high
+        current_memory_gb = self.memory_tracker.get_current_memory_bytes() / (1024**3)
+        memory_limit_gb = self.max_in_flight_bytes / (1024**3)
+        memory_usage_ratio = current_memory_gb / memory_limit_gb
+
+        # Only build subgraphs from non-critical path nodes to avoid scheduling violations
+        if self.compute_depth[node] != sys.maxsize:
+            return False
+
+        # More generous memory headroom calculation - allow temporary spikes
+        available_memory_bytes = max(
+            int(memory_limit_gb * 0.2 * 1024**3),  # At least 20% of limit
+            int((memory_limit_gb - current_memory_gb + memory_limit_gb * 0.1) * 1024**3)  # Current + 10% buffer
+        )
+
+        # Filter function: avoid nodes that would block compute
+        def is_schedulable(n: fx.Node) -> bool:
+            # Allow wait tensors (they free memory)
+            if is_wait_tensor(n):
+                return True
+            # Allow non-blocking nodes
+            if self.compute_depth[n] == sys.maxsize:
+                return True
+            # Don't include compute nodes or collective starts in subgraphs
+            return False
+
+        subgraph = self.subgraph_analyzer.find_subgraph_from_node(
+            start_node=node,
+            scheduled=self.scheduled,
+            available_memory=available_memory_bytes,
+            is_schedulable_fn=is_schedulable,
+        )
+
+        if subgraph:
+            log.debug(f"Scheduling memory-reducing subgraph: {len(subgraph.nodes)} nodes, "
+                     f"peak +{subgraph.peak_increase // (1024*1024)}MB, "
+                     f"net {subgraph.net_change // (1024*1024)}MB")
+
+            for subgraph_node in subgraph.nodes:
+                self._schedule(subgraph_node)
+            return True
+
+        return False
 
     def _handle_collective_start(self, node: fx.Node) -> None:
         """Handle scheduling a collective start."""
@@ -535,6 +674,13 @@ class OverlapScheduler:
                 or compute_node in self.node_ancestors[collective]
             ):
                 continue
+
+            # Check memory pressure before scheduling more collectives
+            current_memory_gb = self.memory_tracker.get_current_memory_bytes() / (1024**3)
+            memory_limit_gb = self.max_in_flight_bytes / (1024**3)
+            if current_memory_gb > memory_limit_gb * 0.8:  # 80% memory threshold
+                log.debug(f"Skipping collective scheduling due to memory pressure: {current_memory_gb:.2f}GB")
+                break
 
             while (
                 self.in_flight
@@ -614,7 +760,7 @@ class OverlapScheduler:
 
             if is_wait_tensor(node):
                 info = self.collective_info[self.wait_to_start[node]]
-                assert not info.hiding_node == curr_compute_node
+                assert info.hiding_node != curr_compute_node
                 self._handle_wait(node)
                 continue
 
@@ -720,6 +866,113 @@ class OverlapScheduler:
         """Compute which wait operations could be hidden by compte."""
         wait_nodes = [info.wait_node for info in self.collective_info.values()]
         return self.compute_potential_hidden_nodes(wait_nodes, limit_coll_per_compute)
+
+    def _update_partial_subgraphs(self, scheduled_node: fx.Node) -> None:
+        """Update partial subgraphs when a node is scheduled."""
+        for subgraph in self.partial_subgraphs:
+            if scheduled_node in subgraph.nodes and scheduled_node not in subgraph.consumed_nodes:
+                subgraph.consumed_nodes.add(scheduled_node)
+
+                # Recalculate remaining net change (simple difference)
+                scheduled_portion_net = self._calculate_net_memory_for_nodes([scheduled_node])
+                subgraph.remaining_net_change -= scheduled_portion_net
+
+    def _handle_unblocked_subgraphs(self) -> None:
+        """Check for newly unblocked cached subgraphs and merge them optimally."""
+        unblocked_subgraphs = self.subgraph_analyzer.get_unblocked_subgraphs(self.scheduled)
+
+        if not unblocked_subgraphs:
+            return
+
+        # Merge unblocked subgraphs optimally based on memory characteristics
+        if len(unblocked_subgraphs) > 1:
+            merged_subgraph = self.subgraph_analyzer.merge_subgraphs_optimally(unblocked_subgraphs)
+            self.partial_subgraphs.append(merged_subgraph)
+        else:
+            self.partial_subgraphs.extend(unblocked_subgraphs)
+
+    def _schedule_subgraph_up_to_collective(self, subgraph: SchedulableSubgraph) -> bool:
+        """
+        Schedule nodes from a subgraph up to the first collective operation.
+
+        Returns True if any nodes were scheduled, False otherwise.
+        """
+        nodes_to_schedule = subgraph.get_nodes_up_to_collective()
+
+        if not nodes_to_schedule:
+            return False
+
+        # Check if all nodes are ready to be scheduled
+        for node in nodes_to_schedule:
+            if not all(inp in self.scheduled for inp in node.all_input_nodes):
+                return False
+
+        # Schedule the nodes
+        scheduled_any = False
+        for node in nodes_to_schedule:
+            if node not in self.scheduled:
+                if node in self.collective_info:
+                    self._handle_collective_start(node)
+                else:
+                    self._schedule(node)
+                scheduled_any = True
+
+        return scheduled_any
+
+    def _schedule_remaining_subgraph_nodes(self, subgraph: SchedulableSubgraph) -> bool:
+        """
+        Schedule remaining nodes from a subgraph (typically after collectives are hidden).
+
+        Returns True if any nodes were scheduled, False otherwise.
+        """
+        remaining_nodes = subgraph.remaining_nodes
+
+        if not remaining_nodes:
+            return False
+
+        # Check if all remaining nodes are ready
+        for node in remaining_nodes:
+            if not all(inp in self.scheduled for inp in node.all_input_nodes):
+                return False
+
+        # Schedule remaining nodes
+        scheduled_any = False
+        for node in remaining_nodes:
+            if node not in self.scheduled:
+                self._schedule(node)
+                scheduled_any = True
+
+        return scheduled_any
+
+    def _calculate_net_memory_for_nodes(self, nodes: list[fx.Node]) -> int:
+        """Calculate net memory change for a list of nodes."""
+        # Simple estimation - could be enhanced with actual memory simulation
+        total_allocated = 0
+        total_freed = 0
+
+        for node in nodes:
+            # Get fresh allocations
+            fresh_allocations = self.memory_tracker.alias_tracker.get_fresh_allocations(node)
+            allocated = sum(
+                self.memory_tracker._get_storage_size(sk) for sk in fresh_allocations
+                if self.memory_tracker.device_filter(sk.device)
+            )
+
+            # Estimate freed memory (simplified)
+            input_storages = self.memory_tracker.alias_tracker.get_storage_uses(node)
+            freed = 0
+            for storage_key in input_storages:
+                all_uses = self.memory_tracker.alias_tracker.storage_to_uses[storage_key]
+                unscheduled_uses = all_uses - self.scheduled
+
+                # If this is the last unscheduled use, count as freed
+                if len(unscheduled_uses) == 1 and node in unscheduled_uses:
+                    freed += self.memory_tracker._get_storage_size(storage_key)
+
+            total_allocated += allocated
+            total_freed += freed
+
+        return total_allocated - total_freed  # Positive = net allocation, negative = net release
 
 
 def schedule_overlap_bucketing(

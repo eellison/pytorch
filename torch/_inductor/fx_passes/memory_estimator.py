@@ -418,6 +418,63 @@ class MemoryTracker:
 
         return freed_storages
 
+    def simulate_subgraph_memory(self, nodes: list[fx.Node]) -> tuple[int, int]:
+        """
+        Simulate memory characteristics of a subgraph without modifying tracker state.
+
+        Returns:
+            (peak_increase, net_change) - both in bytes
+            peak_increase: max additional memory during subgraph execution
+            net_change: net memory change at end (negative = memory released)
+        """
+        total_allocated = 0
+        total_freed = 0
+        running_memory = 0
+        peak_increase = 0
+        processed_nodes = set()
+
+        for node in nodes:
+            processed_nodes.add(node)
+
+            # Memory allocated by this node
+            fresh_allocations = self.alias_tracker.get_fresh_allocations(node)
+            allocated_this_node = sum(
+                self._get_storage_size(sk) for sk in fresh_allocations
+                if self.device_filter(sk.device)
+            )
+
+            # Estimate memory freed: look at input storages that might be freed
+            freed_this_node = 0
+            input_storages = self.alias_tracker.get_storage_uses(node)
+            for storage_key in input_storages:
+                all_uses = self.alias_tracker.storage_to_uses[storage_key]
+                unscheduled_uses = all_uses - self.scheduled
+
+                # Storage can be freed if all unscheduled uses have been processed
+                remaining_unprocessed = unscheduled_uses - processed_nodes - {node}
+
+                if not remaining_unprocessed:
+                    freed_this_node += self._get_storage_size(storage_key)
+
+            # TODO: Optimize memory calculation for cross-subgraph storage sharing
+            # If this subgraph has all but one uses for a storage, and another subgraph
+            # or compute-blocking node scheduled later has the remaining use, we could
+            # potentially update net memory calculation to account for this. Currently
+            # we're conservative and only free storage when ALL uses are within this
+            # subgraph, but we could be smarter about predicting when storage will
+            # actually be freed based on scheduling order and other subgraphs.
+
+            # Update running memory calculation
+            running_memory += allocated_this_node - freed_this_node
+            peak_increase = max(peak_increase, running_memory)
+            total_allocated += allocated_this_node
+            total_freed += freed_this_node
+
+        # Return peak increase and net change
+        net_change = total_allocated - total_freed
+        peak_increase = max(0, peak_increase)
+        return peak_increase, net_change
+
     def _update_memory_for_node(self, node: fx.Node) -> None:
         """Update memory tracking when a node is scheduled."""
         if node.op in ("placeholder", "get_attr", "output"):

@@ -6,12 +6,13 @@ from collections import Counter
 from typing import Callable, Optional
 
 import torch
-from torch._inductor.fx_passes.memory_estimator import build_memory_profile, MemoryTracker
+from torch._inductor.fx_passes.memory_estimator import (
+    build_memory_profile,
+    MemoryTracker,
+)
 from torch._inductor.test_case import run_tests, TestCase as InductorTestCase
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.fx.experimental.proxy_tensor import make_fx
-from torch.testing._internal.common_utils import IS_LINUX
-from torch.testing._internal.inductor_utils import HAS_CUDA_AND_TRITON
 from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils._pytree import tree_map_only
 from torch.utils.weak import WeakIdKeyDictionary
@@ -182,7 +183,7 @@ class TestMemoryTracker(InductorTestCase):
         def fn(x, w1, w2):
             # Create a simple function that allocates intermediate tensors
             h1 = torch.matmul(x, w1)  # Allocates h1
-            h2 = torch.relu(h1)       # h1 can be freed, h2 allocated
+            h2 = torch.relu(h1)  # h1 can be freed, h2 allocated
             out = torch.matmul(h2, w2)  # h2 can be freed, out allocated
             return out
 
@@ -198,7 +199,8 @@ class TestMemoryTracker(InductorTestCase):
 
             # Schedule nodes in original order
             compute_nodes = [
-                node for node in fx_graph.graph.nodes
+                node
+                for node in fx_graph.graph.nodes
                 if node.op not in ("placeholder", "get_attr", "output")
             ]
 
@@ -218,16 +220,20 @@ class TestMemoryTracker(InductorTestCase):
             runtime_peak = profiler.max_memory
 
             # Verify both approaches track meaningful memory usage
-            self.assertGreater(memory_tracker_peak, 0, "MemoryTracker should track memory usage")
-            self.assertGreater(runtime_peak, 0, "Runtime profiler should track memory usage")
+            self.assertGreater(
+                memory_tracker_peak, 0, "MemoryTracker should track memory usage"
+            )
+            self.assertGreater(
+                runtime_peak, 0, "Runtime profiler should track memory usage"
+            )
 
     def test_memory_tracker_different_scheduling(self):
         """Test that different scheduling orders produce different memory usage patterns."""
 
         def foo(primals_1):
             zeros = torch.zeros_like(primals_1)  # Create zeros tensor
-            add_result = zeros + 1               # Use zeros (first use)
-            sum_result = zeros.sum()             # Use zeros (second use)
+            add_result = zeros + 1  # Use zeros (first use)
+            sum_result = zeros.sum()  # Use zeros (second use)
             return add_result, sum_result
 
         with FakeTensorMode():
@@ -239,12 +245,15 @@ class TestMemoryTracker(InductorTestCase):
 
             # Get compute nodes (excluding placeholders, get_attr, output)
             compute_nodes = [
-                node for node in fx_graph.graph.nodes
+                node
+                for node in fx_graph.graph.nodes
                 if node.op not in ("placeholder", "get_attr", "output")
             ]
 
             if len(compute_nodes) < 3:
-                self.skipTest(f"Need at least 3 compute nodes, got {len(compute_nodes)}")
+                self.skipTest(
+                    f"Need at least 3 compute nodes, got {len(compute_nodes)}"
+                )
 
             # Test original order: zeros_like, add, sum
             # zeros gets freed after sum (last use of zeros)
@@ -263,11 +272,15 @@ class TestMemoryTracker(InductorTestCase):
             # Alternative schedule: change which operation is the last use of zeros
             # Original: zeros_like, add, sum (zeros freed after sum)
             # Alternative: zeros_like, sum, add (zeros freed after add)
-            assert len(compute_nodes) == 3, f"Expected 3 compute nodes, got {len(compute_nodes)}"
+            assert len(compute_nodes) == 3, (
+                f"Expected 3 compute nodes, got {len(compute_nodes)}"
+            )
             reordered_nodes = [
                 compute_nodes[0],  # zeros_like: zeros = torch.zeros_like(primals_1)
                 compute_nodes[2],  # sum: sum_result = zeros.sum() (zeros still alive)
-                compute_nodes[1],  # add: add_result = zeros + 1 (last use, zeros freed here)
+                compute_nodes[
+                    1
+                ],  # add: add_result = zeros + 1 (last use, zeros freed here)
             ]
 
             for node in reordered_nodes:
@@ -278,32 +291,49 @@ class TestMemoryTracker(InductorTestCase):
             peak1 = max(memory_profile1)
             peak2 = max(memory_profile2)
 
-
             # Both should end with the same final memory (all intermediate tensors freed)
             self.assertEqual(memory_profile1[-1], memory_profile2[-1])
 
             # The profiles should be different, showing different memory patterns
-            self.assertNotEqual(memory_profile1, memory_profile2, "Different scheduling should produce different memory profiles")
+            self.assertNotEqual(
+                memory_profile1,
+                memory_profile2,
+                "Different scheduling should produce different memory profiles",
+            )
 
             # The different scheduling should produce different peak memory!
             # Original: zeros + add_result both alive → higher peak
             # Reordered: zeros freed before add_result created → lower peak
-            self.assertGreater(peak1, peak2, "Original order should have higher peak memory")
+            self.assertGreater(
+                peak1, peak2, "Original order should have higher peak memory"
+            )
 
             # Specifically, original has both zeros and add_result alive simultaneously
-            self.assertGreater(memory_profile1[1], memory_profile2[1],
-                              "Original order keeps more tensors alive simultaneously")
+            self.assertGreater(
+                memory_profile1[1],
+                memory_profile2[1],
+                "Original order keeps more tensors alive simultaneously",
+            )
 
             # The reordered version should have lower intermediate memory usage
-            self.assertLess(peak2, peak1, "Reordered schedule reduces peak memory through better deallocation timing")
+            self.assertLess(
+                peak2,
+                peak1,
+                "Reordered schedule reduces peak memory through better deallocation timing",
+            )
 
             # Verify the MemoryTracker correctly tracks different scheduling
             # The first tracker should match since we tested accuracy against FakeTensorMemoryProfilerMode
-            self.assertLessEqual(abs(memory_tracker1.peak_memory - peak1), 8,
-                                "First tracker peak should match profile peak")
+            self.assertLessEqual(
+                abs(memory_tracker1.peak_memory - peak1),
+                8,
+                "First tracker peak should match profile peak",
+            )
 
             # The key test: profiles show different peaks due to different deallocation timing
-            self.assertNotEqual(peak1, peak2, "Different scheduling produces different peak memory")
+            self.assertNotEqual(
+                peak1, peak2, "Different scheduling produces different peak memory"
+            )
 
 
 if __name__ == "__main__":
