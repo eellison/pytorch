@@ -26,6 +26,8 @@ class AugmentedGraphHelper:
 
         # Extra dependencies: node depends on dep (dep must come before node)
         self.extra_deps: dict[fx.Node, OrderedSet[fx.Node]] = defaultdict(OrderedSet)
+        # Extra uses: reverse of extra_deps (node is used by user)
+        self.extra_uses: dict[fx.Node, OrderedSet[fx.Node]] = defaultdict(OrderedSet)
         # Note: only reflect original ancestors, not maintained through additional deps
         # or merge sets
         self.node_ancestors = node_ancestors
@@ -33,6 +35,12 @@ class AugmentedGraphHelper:
     def add_extra_dep(self, *, n: fx.Node, dep: fx.Node) -> None:
         """Add extra dependency: node depends on dep."""
         self.extra_deps[n].add(dep)
+        self.extra_uses[dep].add(n)
+
+    def remove_extra_dep(self, *, n: fx.Node, dep: fx.Node) -> None:
+        if dep in self.extra_deps[n]:
+            self.extra_deps[n].discard(dep)
+            self.extra_uses[dep].discard(n)
 
     def merge_to_set(self, existing_node: fx.Node, new_node: fx.Node) -> None:
         """
@@ -123,3 +131,63 @@ class AugmentedGraphHelper:
                 queue.append(dep)
 
         return False
+
+    def transfer_erased_node_deps(
+        self, erased_node: fx.Node, new_node: fx.Node
+    ) -> None:
+        """
+        Transfer all extra dependencies from erased_node (and its merge set) to new_node and clean up.
+
+        This is used when replacing an erased node with a new node during bucketing.
+        The function:
+        1. Gathers all nodes in the merge set of erased_node
+        2. Transfers dependencies FROM merge set to new_node (new_node depends on what they depended on)
+        3. Transfers dependencies TO merge set to new_node (things that depended on them now depend on new_node)
+        4. Cleans up all dependencies from the entire merge set
+
+        Filters out internal dependencies (within the merge set itself).
+        """
+        # Collect all nodes in the merge set of erased_node
+        erased_merge_set = self.merge_sets[erased_node]
+        new_merge_set = self.merge_sets[new_node] if new_node in self.merge_sets else {new_node}
+
+        # Transfer dependencies FROM erased nodes (what they depended on)
+        for old_node in erased_merge_set:
+            for dep in list(self.extra_deps[old_node]):  # list() to avoid modifying during iteration
+                # Skip if dep is in the erased merge set (internal dependency) or new merge set
+                if dep not in erased_merge_set and dep not in new_merge_set:
+                    self.add_extra_dep(n=new_node, dep=dep)
+
+        # Transfer dependencies TO erased nodes (what depended on them)
+        # Use extra_uses to directly find what depends on each erased node
+        for old_node in erased_merge_set:
+            # Get all nodes that depend on this old_node
+            for user in list(self.extra_uses[old_node]):  # list() to avoid modifying during iteration
+                # Skip if user is in the erased merge set (internal) or new merge set
+                if user in erased_merge_set or user in new_merge_set:
+                    continue
+
+                # Replace dependency: user now depends on new_node instead of old_node
+                self.remove_extra_dep(n=user, dep=old_node)
+                self.add_extra_dep(n=user, dep=new_node)
+
+        # Clean up: remove all dependencies from erased nodes and their merge set
+        for old_node in erased_merge_set:
+            # Clear all outgoing dependencies (what this node depended on)
+            for dep in list(self.extra_deps[old_node]):
+                self.remove_extra_dep(n=old_node, dep=dep)
+
+            # Clear all incoming dependencies (what depended on this node)
+            for user in list(self.extra_uses[old_node]):
+                self.remove_extra_dep(n=user, dep=old_node)
+
+    def get_all_extra_deps(self) -> dict[fx.Node, OrderedSet[fx.Node]]:
+        """
+        Get all extra dependencies in a format suitable for topological sort.
+        Returns a copy to avoid external modifications.
+        """
+        return {
+            node: OrderedSet(deps)
+            for node, deps in self.extra_deps.items()
+            if deps  # Only include nodes with non-empty deps
+        }
