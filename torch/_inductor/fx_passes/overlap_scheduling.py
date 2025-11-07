@@ -17,9 +17,11 @@ from torch._inductor.fx_passes.memory_estimator import (
     build_memory_profile,
     MemoryTracker,
 )
+from dataclasses import field
 from torch.fx.operator_schemas import normalize_function
 from torch.utils._ordered_set import OrderedSet
 from torch.utils._python_dispatch import _disable_current_modes
+from torch._logging import trace_structured
 
 
 log = logging.getLogger(__name__)
@@ -44,12 +46,13 @@ def get_group_name(n: fx.Node) -> str:
 
 def get_custom_estimation(
     n: fx.Node,
-    override_size: int | None = None,
     custom_runtime_estimation: Callable[[fx.Node], float | None] | None = None,
+    override_size = None,
 ) -> float | None:
     if custom_runtime_estimation is None:
+        assert False
         return None
-
+    
     return custom_runtime_estimation(n, override_size)
 
 
@@ -59,9 +62,10 @@ def estimate_collective_time(
     custom_runtime_estimation: Callable[[fx.Node], float | None] | None = None,
 ) -> float:
     """Estimate the runtime of a collective operation, optionally with an overridden size."""
-    if (est := get_custom_estimation(n, override_size, custom_runtime_estimation)) is not None:
+    if (est := get_custom_estimation(n, custom_runtime_estimation, override_size)) is not None:
         return est
 
+    assert False
     return torch._inductor.comm_analysis.estimate_nccl_collective_runtime_from_fx_node(
         n, override_size
     )
@@ -192,7 +196,7 @@ class CollectiveInfo:
     size_bytes: int
     estimated_time_ms: float
     exposed_time_ms: float  # How much of this collective is still exposed
-    hiding_node: fx.Node | None = None  # Node that hides this collective
+    hiding_nodes: OrderedSet[fx.Node] = field(default_factory=OrderedSet)
 
     @property
     def is_exposed(self) -> bool:
@@ -453,11 +457,13 @@ class OverlapScheduler:
         additional_deps: dict[fx.Node, OrderedSet[fx.Node]] = defaultdict(OrderedSet)
 
         for start_node, info in self.collective_info.items():
-            if info.hiding_node and not info.is_exposed:
+            if info.is_exposed:
+                continue
+            for hn in info.hiding_nodes:
                 # Compute depends on collective start (compute must wait for collective to start)
-                additional_deps[info.hiding_node].add(start_node)
+                additional_deps[hn].add(start_node)
                 # Wait depends on compute (wait must wait for compute to finish)
-                additional_deps[info.wait_node].add(info.hiding_node)
+                additional_deps[info.wait_node].add(hn)
 
         # Apply effect tokens to preserve these dependencies
         if additional_deps:
@@ -470,17 +476,23 @@ class OverlapScheduler:
         # if str(node) == "convert_element_type_3":
         #     from IPython import embed; embed(); exit()
 
+        # not sure that it's worth it to overlap a collective with 
+        # collective prologue, since that would prevent bucketing.
+        if self.in_overlappable_collective_unary_chain(node):
+            self._schedule(node)
+            return
+
         # TODO: separate overlap time per process group
         # First reduce exposed time of in-flight collectives
         for info in self.in_flight.values():
             if info.exposed_time_ms == 0:
                 continue
+            
             overlap_amount = min(info.exposed_time_ms, available_compute)
             info.exposed_time_ms -= overlap_amount
             available_compute -= overlap_amount
-            if info.exposed_time_ms == 0:
-                info.hiding_node = node
-            elif available_compute == 0:
+            info.hiding_nodes.add(node)
+            if available_compute == 0:
                 break
 
         # Then, look for unscheduled collectives we can overlap
@@ -624,9 +636,8 @@ class OverlapScheduler:
             overlap_amount = min(info.exposed_time_ms, available_compute)
             info.exposed_time_ms -= overlap_amount
             available_compute -= overlap_amount
-            if info.exposed_time_ms == 0:
-                info.hiding_node = node
-            elif available_compute == 0:
+            info.hiding_nodes.add(node)
+            if available_compute == 0:
                 break
 
         # Then, look for unscheduled collectives we can overlap
@@ -729,8 +740,7 @@ class OverlapScheduler:
             #     print(f" 4 - {info=}")
             overlap_amount = min(available_compute_time, info.exposed_time_ms)
             info.exposed_time_ms -= overlap_amount
-            if info.exposed_time_ms == 0:
-                info.hiding_node = compute_node
+            info.hiding_nodes.add(compute_node)
             available_compute_time -= overlap_amount
 
     def _find_schedulable_path(
@@ -757,10 +767,10 @@ class OverlapScheduler:
             # it's fine to schedule it
             if is_wait_tensor(node):
                 info = self.collective_info[self.wait_to_start[node]]
-                if info.hiding_node and info.hiding_node != curr_compute_node:
+                if info.hiding_nodes and curr_compute_node not in info.hiding_nodes:
                     continue
-                elif node not in self.potentially_hidden_waits:
-                    continue
+                # elif node not in self.potentially_hidden_waits:
+                #     continue
 
                 return None
 
@@ -793,7 +803,7 @@ class OverlapScheduler:
     ) -> bool:
         assert is_wait_tensor(wait_node)
         info = self.collective_info[self.wait_to_start[wait_node]]
-        return not info.is_exposed and info.hiding_node != compute_node
+        return not info.is_exposed and compute_node not in info.hiding_nodes
 
     def _schedule_path_to_collective(
         self, path: OrderedSet[fx.Node], curr_compute_node: fx.Node
@@ -812,7 +822,7 @@ class OverlapScheduler:
                     continue
 
                 info = self.collective_info[self.wait_to_start[node]]
-                assert info.hiding_node != curr_compute_node
+                assert curr_compute_node not in info.hiding_nodes
                 self._handle_wait(node)
                 continue
 
@@ -824,6 +834,20 @@ class OverlapScheduler:
             if node.op == "placeholder":
                 continue
             output_node.prepend(node)
+
+        trace_structured(
+            "reordered_graph",
+            payload_fn=lambda: self.graph.owning_module.print_readable(
+                print_output=False,
+                include_stride=True,
+                include_device=True,
+                expanded_def=True,
+            ),
+        )
+        f = open("reordered_graph.txt", "a")
+        f.write(self.graph.owning_module.print_readable(print_output=False))
+        f.close()
+
         self.graph.lint()
 
     def _reorder_graph(self) -> None:
