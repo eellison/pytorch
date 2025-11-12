@@ -1073,6 +1073,64 @@ class TestComputeCommReorderingBucketing(TestComputeCommReorderingMultiProc):
             correct = func(a, b, ranks=ranks)
             self.assertTrue(same(out, correct))
 
+    @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
+    @torch._inductor.config.patch(get_bucket_patches())
+    def test_non_compute_node_overlap(self):
+        """Test that non-compute nodes (like pointwise ops) can also overlap with collectives."""
+
+        # Custom estimator that gives time to both compute and non-compute ops
+        def estimate_with_pointwise(fx_node, override_size=None):
+            if "c10" in str(fx_node.target):
+                return 1.0  # Collective takes 1ms
+            elif fx_node.target == aten.mm.default:
+                return 0.5  # Matmul provides 0.5ms
+            elif fx_node.target in (aten.add.Tensor, aten.mul.Tensor):
+                return 0.3  # Pointwise ops provide 0.3ms each
+            else:
+                return None
+
+        def func(a, b, *, ranks):
+            # One all_gather that needs 1.0ms to hide
+            ag1 = _functional_collectives.all_gather_tensor(a, 0, ranks)
+
+            # Mix of compute and pointwise ops
+            # 0.5 (mm) + 0.3 (add) + 0.3 (mul) = 1.1ms total, enough to hide ag1
+            mm1 = torch.matmul(a, a.T)
+            add1 = a + a
+            mul1 = b * b
+
+            return ag1.sum() + mm1.sum() + add1.sum() + mul1.sum()
+
+        with _dynamo_dist_per_rank_init(
+            self.rank,
+            self.world_size,
+            self.backend(device_type),
+            fake_pg=not at_least_x_gpu(2),
+        ):
+            a = torch.ones(8, 8, dtype=torch.float, device=device_type)
+            b = torch.ones(8, 8, dtype=torch.float, device=device_type) * 2
+            ranks = list(range(self.world_size))
+
+            func_c = functools.partial(func, ranks=ranks)
+
+            # Patch with custom estimation
+            with torch._inductor.config.patch(
+                {
+                    "aten_distributed_optimizations.custom_runtime_estimation": estimate_with_pointwise
+                }
+            ):
+                compiled = torch.compile(func_c)
+                out, aten_graph_str = run_and_get_aten_graph(compiled, a, b)
+
+            # Verify the all_gather is scheduled before all operations
+            FileCheck().check("all_gather_into_tensor").check("aten.mm").check(
+                "aten.add"
+            ).check("aten.mul").check("wait_tensor").run(aten_graph_str)
+
+            # Verify correctness
+            correct = func(a, b, ranks=ranks)
+            self.assertTrue(same(out, correct))
+
 
 if __name__ == "__main__":
     from torch._dynamo.test_case import run_tests
