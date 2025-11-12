@@ -29,7 +29,7 @@ from torch.testing._internal.common_utils import skipIfRocm
 from torch.testing._internal.inductor_utils import HAS_GPU
 
 
-def estimate_aten_runtime(fx_node, compute_multiplier=1.0):
+def estimate_aten_runtime(fx_node, override_size=None, compute_multiplier=1.0):
     # for tests, assume a matmul can hide a single collective
     if "c10" in str(fx_node.target):
         return 1.0
@@ -1023,7 +1023,7 @@ class TestComputeCommReorderingBucketing(TestComputeCommReorderingMultiProc):
 
         # Use 0.5 compute multiplier so each collective needs 2 matmuls to be fully hidden
         def estimate_with_half_compute(fx_node, override_size=None):
-            return estimate_aten_runtime(fx_node, compute_multiplier=0.5)
+            return estimate_aten_runtime(fx_node, override_size, compute_multiplier=0.5)
 
         def func(a, b, *, ranks):
             # Two all_gathers that will be hidden by multiple compute operations
@@ -1052,7 +1052,9 @@ class TestComputeCommReorderingBucketing(TestComputeCommReorderingMultiProc):
 
             # Patch with custom estimation that uses 0.5 multiplier
             with torch._inductor.config.patch(
-                {"aten_distributed_optimizations.custom_runtime_estimation": estimate_with_half_compute}
+                {
+                    "aten_distributed_optimizations.custom_runtime_estimation": estimate_with_half_compute
+                }
             ):
                 compiled = torch.compile(func_c)
                 out, aten_graph_str = run_and_get_aten_graph(compiled, a, b)
@@ -1065,9 +1067,7 @@ class TestComputeCommReorderingBucketing(TestComputeCommReorderingMultiProc):
             # Verify bucketed collective is scheduled before all matmuls
             FileCheck().check("functional.all_gather_into_tensor").check(
                 "aten.mm"
-            ).check("aten.mm").check("aten.mm").check("wait_tensor").run(
-                aten_graph_str
-            )
+            ).check("aten.mm").check("aten.mm").check("wait_tensor").run(aten_graph_str)
 
             # Verify correctness
             correct = func(a, b, ranks=ranks)
