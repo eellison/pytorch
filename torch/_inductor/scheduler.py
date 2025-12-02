@@ -5103,9 +5103,9 @@ class Scheduler:
             log_partition_reason("DeviceCopy ops", node=node)
             return True
 
-        if isinstance(node.node, ir.Conditional):
-            log_partition_reason("Conditional ops", node=node)
-            return True
+        # Note: Conditional nodes are no longer partitioned because they
+        # now support cudagraph capture via CUDA 12.4+ conditional nodes.
+        # The codegen in wrapper.py handles the cudagraph capture path.
 
         if getattr(node.node, "unbacked_bindings", None):
             log_partition_reason("unbacked binding ops", node=node)

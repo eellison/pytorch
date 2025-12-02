@@ -320,6 +320,15 @@ def post_grad_passes(gm: torch.fx.GraphModule, is_inference: bool):
         decompose_map_to_while_loop
     )
 
+    # Pre-allocate outputs for cond operations to support cudagraph conditional nodes.
+    # This must be at the very end, after all mutation passes.
+    if config.triton.cudagraphs:
+        from .cond_prealloc import transform_cond_to_preallocate_outputs
+
+        GraphTransformObserver(gm, "cond_prealloc").apply_graph_pass(
+            transform_cond_to_preallocate_outputs
+        )
+
     gm.recompile()
     gm.graph.lint()
 

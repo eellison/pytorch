@@ -9920,5 +9920,136 @@ instantiate_parametrized_tests(AssociativeScanTests)
 
 instantiate_parametrized_tests(TestControlFlowAndRNG)
 
+
+def _check_compile_inductor_cudagraph(test_case, fn, args):
+    """Test inductor with cudagraphs (reduce-overhead mode)."""
+    # test inductor with cudagraphs via reduce-overhead mode
+    compiled_fn = torch.compile(fn, mode="reduce-overhead")
+    # We run 3 times.
+    # This is what cuda graph trees does for the first 3 runs:
+    # 1) run in eager mode, for warmup.
+    # 2) do stream capture followed by graph replay.
+    # 3 and beyond) do graph replay
+    # So we need to get to iteration 3 to test all ways of running.
+    outputs = []
+    for i in range(3):
+        with check_cudagraphs_not_skipped(test_case):
+            outputs.append(
+                pytree.tree_map(
+                    lambda x: x.clone() if isinstance(x, torch.Tensor) else x,
+                    compiled_fn(*args),
+                )
+            )
+    eager_res = fn(*args)
+    for output in outputs:
+        test_case.assertEqual(eager_res, output)
+
+
+@unittest.skipIf(
+    not TEST_CUDA_GRAPH_CONDITIONAL_NODES,
+    "CUDA 12.4 or greater is required for CUDA Graphs with conditional nodes",
+)
+class TestControlFlowInductorCudagraph(TestCase):
+    """Tests for torch.cond with inductor + cudagraphs (reduce-overhead mode)."""
+
+    def test_cond_simple_inductor_cudagraph(self):
+        """Simple cond with sin/cos branches."""
+
+        def true_fn(x):
+            return x.sin()
+
+        def false_fn(x):
+            return x.cos()
+
+        def f(x, pred):
+            return cond(pred, true_fn, false_fn, [x])
+
+        x = torch.randn(4, device="cuda")
+        _check_compile_inductor_cudagraph(
+            self, f, [x, torch.tensor(True, device="cuda")]
+        )
+        _check_compile_inductor_cudagraph(
+            self, f, [x, torch.tensor(False, device="cuda")]
+        )
+
+    def test_cond_multiple_outputs_inductor_cudagraph(self):
+        """Cond with multiple outputs."""
+
+        def true_fn(x):
+            return x.sin(), x.cos()
+
+        def false_fn(x):
+            return x.cos(), x.sin()
+
+        def f(x, pred):
+            return cond(pred, true_fn, false_fn, [x])
+
+        x = torch.randn(4, device="cuda")
+        _check_compile_inductor_cudagraph(
+            self, f, [x, torch.tensor(True, device="cuda")]
+        )
+        _check_compile_inductor_cudagraph(
+            self, f, [x, torch.tensor(False, device="cuda")]
+        )
+
+    def test_cond_nested_inductor_cudagraph(self):
+        """Nested cond inside cond."""
+
+        def true_fn(x, inner_pred):
+            def inner_true(y):
+                return y.sin()
+
+            def inner_false(y):
+                return y.cos()
+
+            return cond(inner_pred, inner_true, inner_false, [x])
+
+        def false_fn(x, inner_pred):
+            return x * 2
+
+        def f(x, outer_pred, inner_pred):
+            return cond(outer_pred, true_fn, false_fn, [x, inner_pred])
+
+        x = torch.randn(4, device="cuda")
+        outer_pred = torch.tensor(True, device="cuda")
+        inner_pred = torch.tensor(True, device="cuda")
+        _check_compile_inductor_cudagraph(self, f, [x, outer_pred, inner_pred])
+
+        outer_pred = torch.tensor(False, device="cuda")
+        _check_compile_inductor_cudagraph(self, f, [x, outer_pred, inner_pred])
+
+    def test_cond_with_linear_inductor_cudagraph(self):
+        """Cond with linear layers inside branches."""
+
+        class Model(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.fc1 = torch.nn.Linear(16, 32)
+                self.fc2 = torch.nn.Linear(16, 32)
+
+            def forward(self, x, pred):
+                def true_fn(x):
+                    return self.fc1(x)
+
+                def false_fn(x):
+                    return self.fc2(x)
+
+                return cond(pred, true_fn, false_fn, [x])
+
+        model = Model().cuda()
+        x = torch.randn(16, device="cuda")
+        pred = torch.tensor(True, device="cuda")
+        _check_compile_inductor_cudagraph(self, model, [x, pred])
+
+        pred = torch.tensor(False, device="cuda")
+        _check_compile_inductor_cudagraph(self, model, [x, pred])
+
+    def test_cond_dynamic_model_inductor_cudagraph(self):
+        """Test DynamicCondModel with inductor + cudagraphs."""
+        model = DynamicCondModel().cuda()
+        x = torch.randn(16, device="cuda")
+        _check_compile_inductor_cudagraph(self, model, [x])
+
+
 if __name__ == "__main__":
     run_tests()

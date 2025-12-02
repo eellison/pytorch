@@ -3526,32 +3526,107 @@ class PythonWrapperCodegen(CodeGen):
         outer_inputs = [buf.codegen_reference() for buf in conditional.operands]
 
         predicate = conditional.predicate.codegen_reference()
-        if not isinstance(conditional.predicate, ir.ShapeAsConstantBuffer):
-            # move the Tensor predicate to host
-            predicate = f"{predicate}.item()"
+        predicate_is_tensor = not isinstance(
+            conditional.predicate, ir.ShapeAsConstantBuffer
+        )
 
-        self.writeline(f"{name} = [None] * {len(conditional.outputs)}")
-        self.writeline(f"if {predicate}:")
-        self.writeline(EnterSubgraphLine(self, conditional.true_subgraph.graph))
         if V.graph.aot_mode:
+            # AOT mode: use the old inlining approach (no cudagraph support)
+            if predicate_is_tensor:
+                predicate = f"{predicate}.item()"
+
+            self.writeline(f"{name} = [None] * {len(conditional.outputs)}")
+            self.writeline(f"if {predicate}:")
+            self.writeline(EnterSubgraphLine(self, conditional.true_subgraph.graph))
             outer_outputs = [f"{name}[{i}]" for i in range(len(conditional.outputs))]
             self.codegen_subgraph_by_inlining(
                 conditional.true_subgraph, outer_inputs, outer_outputs
             )
-        else:
-            self.codegen_subgraph(conditional.true_subgraph, outer_inputs, name)
-
-        self.writeline(ExitSubgraphLine(self))
-        self.writeline("else:")
-        self.writeline(EnterSubgraphLine(self, conditional.false_subgraph.graph))
-        if V.graph.aot_mode:
+            self.writeline(ExitSubgraphLine(self))
+            self.writeline("else:")
+            self.writeline(EnterSubgraphLine(self, conditional.false_subgraph.graph))
             outer_outputs = [f"{name}[{i}]" for i in range(len(conditional.outputs))]
             self.codegen_subgraph_by_inlining(
                 conditional.false_subgraph, outer_inputs, outer_outputs
             )
+            self.writeline(ExitSubgraphLine(self))
         else:
-            self.codegen_subgraph(conditional.false_subgraph, outer_inputs, name)
-        self.writeline(ExitSubgraphLine(self))
+            # Non-AOT mode: generate subgraph functions and support cudagraph capture
+            # Note: The FX pass in cond_prealloc.py has already transformed the graph to:
+            # 1. Pre-allocate output buffers before the cond
+            # 2. Add copy_ operations in the subgraphs to write to these buffers
+            # 3. Pass the buffers as additional operands
+            # So here we just need to generate the cudagraph conditional node wrapper.
+
+            # First, generate the subgraph functions (codegen only, not the call)
+            self.codegen_subgraph_common(conditional.true_subgraph)
+            self.codegen_subgraph_common(conditional.false_subgraph)
+
+            true_fn_name = conditional.true_subgraph.graph.name
+            false_fn_name = conditional.false_subgraph.graph.name
+            outer_input_names = ", ".join(outer_inputs) + (
+                "," if len(outer_inputs) == 1 else ""
+            )
+
+            # Check if we're capturing a cudagraph
+            self.writeline(
+                "if torch.cuda.graphs.is_current_stream_capturing():"
+            )
+            self.writeline(EnterSubgraphLine(self, conditional.true_subgraph.graph))
+
+            # Cudagraph capture path: use conditional nodes
+            # We need to use Relaxed capture mode to allow stream queries inside the subgraph
+            # This is required because triton kernels need to get the raw stream.
+            self.writeline(
+                "with torch.cuda.graphs.thread_cuda_stream_capture_mode("
+                "torch.cuda.cudart().cudaStreamCaptureMode.Relaxed):"
+            )
+            self.writeline(EnterSubgraphLine(self, conditional.true_subgraph.graph))
+
+            # Get the currently capturing graph
+            self.writeline(
+                f"{name}_cuda_graph = torch.cuda.CUDAGraph.get_currently_capturing_graph()"
+            )
+
+            # True branch: capture with predicate
+            # The subgraph already has copy_ to write into the pre-allocated buffers
+            self.writeline(f"{name}_cuda_graph.begin_capture_to_if_node({predicate})")
+            self.writeline(f"{name}_true_args = [{outer_input_names}]")
+            self.writeline(f"{name} = {true_fn_name}({name}_true_args)")
+            self.writeline(f"{name}_cuda_graph.end_capture_to_conditional_node()")
+
+            # False branch: capture with negated predicate
+            self.writeline(
+                f"{name}_cuda_graph.begin_capture_to_if_node(torch.logical_not({predicate}))"
+            )
+            self.writeline(f"{name}_false_args = [{outer_input_names}]")
+            self.writeline(f"{name} = {false_fn_name}({name}_false_args)")
+            self.writeline(f"{name}_cuda_graph.end_capture_to_conditional_node()")
+
+            self.writeline(ExitSubgraphLine(self))  # Exit Relaxed capture mode context
+            self.writeline(ExitSubgraphLine(self))  # Exit the cudagraph capturing check
+            self.writeline("else:")
+            self.writeline(EnterSubgraphLine(self, conditional.true_subgraph.graph))
+
+            # Non-capturing path: normal if/else
+            if predicate_is_tensor:
+                self.writeline(f"if {predicate}.item():")
+            else:
+                self.writeline(f"if {predicate}:")
+
+            self.writeline(EnterSubgraphLine(self, conditional.true_subgraph.graph))
+            # Call true branch
+            self.writeline(f"{name}_true_args = [{outer_input_names}]")
+            self.writeline(f"{name} = {true_fn_name}({name}_true_args)")
+            self.writeline(ExitSubgraphLine(self))
+
+            self.writeline("else:")
+            self.writeline(EnterSubgraphLine(self, conditional.false_subgraph.graph))
+            # Call false branch
+            self.writeline(f"{name}_false_args = [{outer_input_names}]")
+            self.writeline(f"{name} = {false_fn_name}({name}_false_args)")
+            self.writeline(ExitSubgraphLine(self))
+            self.writeline(ExitSubgraphLine(self))
 
     def codegen_while_loop(self, while_loop, stack_output):
         """while_loop is codegened as a host side while_loop"""
