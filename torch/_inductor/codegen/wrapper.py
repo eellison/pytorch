@@ -3520,6 +3520,21 @@ class PythonWrapperCodegen(CodeGen):
         else:
             self.codegen_subgraph(invoke_subgraph.subgraph, outer_inputs, name)
 
+    def _subgraph_has_non_cudagraph_nodes(self, subgraph) -> bool:
+        """
+        Check if a subgraph has any nodes that would cause cudagraph capture to fail.
+        Uses the same checks as scheduler.should_partition().
+        """
+        if subgraph.graph is None or subgraph.graph.scheduler is None:
+            return False
+
+        scheduler = subgraph.graph.scheduler
+        for node in scheduler.nodes:
+            # Check the same conditions as should_partition
+            if scheduler.should_partition(node):
+                return True
+        return False
+
     def codegen_conditional(self, conditional) -> None:
         name = conditional.get_name()
 
@@ -3568,45 +3583,52 @@ class PythonWrapperCodegen(CodeGen):
                 "," if len(outer_inputs) == 1 else ""
             )
 
-            # Check if we're capturing a cudagraph
-            self.writeline(
-                "if torch.cuda.graphs.is_current_stream_capturing():"
-            )
-            self.writeline(EnterSubgraphLine(self, conditional.true_subgraph.graph))
-
-            # Cudagraph capture path: use conditional nodes
-            # We need to use Relaxed capture mode to allow stream queries inside the subgraph
-            # This is required because triton kernels need to get the raw stream.
-            self.writeline(
-                "with torch.cuda.graphs.thread_cuda_stream_capture_mode("
-                "torch.cuda.cudart().cudaStreamCaptureMode.Relaxed):"
-            )
-            self.writeline(EnterSubgraphLine(self, conditional.true_subgraph.graph))
-
-            # Get the currently capturing graph
-            self.writeline(
-                f"{name}_cuda_graph = torch.cuda.CUDAGraph.get_currently_capturing_graph()"
+            # Check if subgraphs have any nodes that would break cudagraph capture
+            subgraphs_cudagraph_compatible = not (
+                self._subgraph_has_non_cudagraph_nodes(conditional.true_subgraph)
+                or self._subgraph_has_non_cudagraph_nodes(conditional.false_subgraph)
             )
 
-            # True branch: capture with predicate
-            # The subgraph already has copy_ to write into the pre-allocated buffers
-            self.writeline(f"{name}_cuda_graph.begin_capture_to_if_node({predicate})")
-            self.writeline(f"{name}_true_args = [{outer_input_names}]")
-            self.writeline(f"{name} = {true_fn_name}({name}_true_args)")
-            self.writeline(f"{name}_cuda_graph.end_capture_to_conditional_node()")
+            if subgraphs_cudagraph_compatible:
+                # Check if we're capturing a cudagraph
+                self.writeline(
+                    "if torch.cuda.graphs.is_current_stream_capturing():"
+                )
+                self.writeline(EnterSubgraphLine(self, conditional.true_subgraph.graph))
 
-            # False branch: capture with negated predicate
-            self.writeline(
-                f"{name}_cuda_graph.begin_capture_to_if_node(torch.logical_not({predicate}))"
-            )
-            self.writeline(f"{name}_false_args = [{outer_input_names}]")
-            self.writeline(f"{name} = {false_fn_name}({name}_false_args)")
-            self.writeline(f"{name}_cuda_graph.end_capture_to_conditional_node()")
+                # Cudagraph capture path: use conditional nodes
+                # We need to use Relaxed capture mode to allow stream queries inside the subgraph
+                # This is required because triton kernels need to get the raw stream.
+                self.writeline(
+                    "with torch.cuda.graphs.thread_cuda_stream_capture_mode("
+                    "torch.cuda.cudart().cudaStreamCaptureMode.Relaxed):"
+                )
+                self.writeline(EnterSubgraphLine(self, conditional.true_subgraph.graph))
 
-            self.writeline(ExitSubgraphLine(self))  # Exit Relaxed capture mode context
-            self.writeline(ExitSubgraphLine(self))  # Exit the cudagraph capturing check
-            self.writeline("else:")
-            self.writeline(EnterSubgraphLine(self, conditional.true_subgraph.graph))
+                # Get the currently capturing graph
+                self.writeline(
+                    f"{name}_cuda_graph = torch.cuda.CUDAGraph.get_currently_capturing_graph()"
+                )
+
+                # True branch: capture with predicate
+                # The subgraph already has copy_ to write into the pre-allocated buffers
+                self.writeline(f"{name}_cuda_graph.begin_capture_to_if_node({predicate})")
+                self.writeline(f"{name}_true_args = [{outer_input_names}]")
+                self.writeline(f"{name} = {true_fn_name}({name}_true_args)")
+                self.writeline(f"{name}_cuda_graph.end_capture_to_conditional_node()")
+
+                # False branch: capture with negated predicate
+                self.writeline(
+                    f"{name}_cuda_graph.begin_capture_to_if_node(torch.logical_not({predicate}))"
+                )
+                self.writeline(f"{name}_false_args = [{outer_input_names}]")
+                self.writeline(f"{name} = {false_fn_name}({name}_false_args)")
+                self.writeline(f"{name}_cuda_graph.end_capture_to_conditional_node()")
+
+                self.writeline(ExitSubgraphLine(self))  # Exit Relaxed capture mode context
+                self.writeline(ExitSubgraphLine(self))  # Exit the cudagraph capturing check
+                self.writeline("else:")
+                self.writeline(EnterSubgraphLine(self, conditional.true_subgraph.graph))
 
             # Non-capturing path: normal if/else
             if predicate_is_tensor:
@@ -3626,7 +3648,9 @@ class PythonWrapperCodegen(CodeGen):
             self.writeline(f"{name}_false_args = [{outer_input_names}]")
             self.writeline(f"{name} = {false_fn_name}({name}_false_args)")
             self.writeline(ExitSubgraphLine(self))
-            self.writeline(ExitSubgraphLine(self))
+
+            if subgraphs_cudagraph_compatible:
+                self.writeline(ExitSubgraphLine(self))
 
     def codegen_while_loop(self, while_loop, stack_output):
         """while_loop is codegened as a host side while_loop"""
