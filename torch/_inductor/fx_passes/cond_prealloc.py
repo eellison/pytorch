@@ -19,6 +19,10 @@ After transformation:
     cond(pred, true_fn_modified, false_fn_modified, operands + out_buffers)
     cond_result = out_buffers
     # true_fn_modified/false_fn_modified write into out_buffers via copy_
+
+NOTE: In the future, we'd like to use out= variants of ops instead of copy_
+when available (e.g., mm.out instead of mm + copy_). This requires adding
+lowering support for out= ops first - see issue #138280.
 """
 
 import operator
