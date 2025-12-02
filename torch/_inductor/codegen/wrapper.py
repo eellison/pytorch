@@ -3630,21 +3630,28 @@ class PythonWrapperCodegen(CodeGen):
                 self.writeline("else:")
                 self.writeline(EnterSubgraphLine(self, conditional.true_subgraph.graph))
 
-            # Non-capturing path: normal if/else
+            # Non-capturing path: warmup both branches, run real branch last
+            # We run BOTH branches to ensure Triton kernels are compiled for this shape.
+            # The "other" branch runs first (for warmup), then the "real" branch runs
+            # second so its result ends up in the pre-allocated output buffers.
             if predicate_is_tensor:
                 self.writeline(f"if {predicate}.item():")
             else:
                 self.writeline(f"if {predicate}:")
 
             self.writeline(EnterSubgraphLine(self, conditional.true_subgraph.graph))
-            # Call true branch
+            # Predicate is true: warmup false branch first, then run true branch
+            self.writeline(f"{name}_false_args = [{outer_input_names}]")
+            self.writeline(f"_ = {false_fn_name}({name}_false_args)  # warmup")
             self.writeline(f"{name}_true_args = [{outer_input_names}]")
             self.writeline(f"{name} = {true_fn_name}({name}_true_args)")
             self.writeline(ExitSubgraphLine(self))
 
             self.writeline("else:")
             self.writeline(EnterSubgraphLine(self, conditional.false_subgraph.graph))
-            # Call false branch
+            # Predicate is false: warmup true branch first, then run false branch
+            self.writeline(f"{name}_true_args = [{outer_input_names}]")
+            self.writeline(f"_ = {true_fn_name}({name}_true_args)  # warmup")
             self.writeline(f"{name}_false_args = [{outer_input_names}]")
             self.writeline(f"{name} = {false_fn_name}({name}_false_args)")
             self.writeline(ExitSubgraphLine(self))
