@@ -1,6 +1,5 @@
 """Detect fusion regions for overlap scheduling."""
 
-import operator
 from dataclasses import dataclass
 
 import torch
@@ -203,198 +202,68 @@ def build_fusion_regions(
 
 def _topological_sort_region(nodes: list[fx.Node]) -> list[fx.Node]:
     """
-    Topologically sort nodes within a region with sub-group awareness.
+    Topologically sort nodes within a region.
 
-    Strategy:
-    1. Identify sub-groups of nodes that share external inputs
-    2. Sort within each sub-group by dependency order
-    3. Sort sub-groups topologically relative to each other
+    Uses Kahn's algorithm to sort nodes based on their dependencies within the region.
     """
+    if len(nodes) <= 1:
+        return nodes
+
     node_set = set(nodes)
 
-    # First, identify sub-groups based on shared external inputs
-    subgroups = _identify_subgroups_in_region(nodes, node_set)
-
-    # Sort each sub-group internally
-    sorted_subgroups = []
-    for subgroup in subgroups:
-        sorted_subgroup = _sort_subgroup(subgroup, node_set)
-        sorted_subgroups.append(sorted_subgroup)
-
-    # Sort sub-groups relative to each other topologically
-    return _sort_subgroups_topologically(sorted_subgroups, node_set)
-
-
-def _identify_subgroups_in_region(nodes: list[fx.Node], node_set: set[fx.Node]) -> list[list[fx.Node]]:
-    """Identify sub-groups within a region based on shared external inputs."""
-    # Group nodes by their external input signature
-    input_signatures: dict[tuple, list[fx.Node]] = {}
-
+    # Calculate in-degrees (dependencies within the region)
+    in_degree = {n: 0 for n in nodes}
     for node in nodes:
-        external_inputs = tuple(sorted(
-            inp.name for inp in node.all_input_nodes
-            if inp not in node_set
-        ))
-
-        if external_inputs not in input_signatures:
-            input_signatures[external_inputs] = []
-        input_signatures[external_inputs].append(node)
-
-    return list(input_signatures.values())
-
-
-def _sort_subgroup(subgroup: list[fx.Node], node_set: set[fx.Node]) -> list[fx.Node]:
-    """Sort nodes within a sub-group topologically."""
-    if len(subgroup) <= 1:
-        return subgroup
-
-    subgroup_set = set(subgroup)
-    in_degree = {n: 0 for n in subgroup}
-
-    # Calculate in-degrees within the sub-group
-    for node in subgroup:
         for inp in node.all_input_nodes:
-            if inp in subgroup_set:
+            if inp in node_set:
                 in_degree[node] += 1
 
-    # Kahn's algorithm for the sub-group
-    queue = [n for n in subgroup if in_degree[n] == 0]
+    # Kahn's algorithm
+    queue = [n for n in nodes if in_degree[n] == 0]
     result = []
 
     while queue:
-        queue.sort(key=lambda n: n.name)  # Deterministic ordering
+        # Sort by name for deterministic ordering
+        queue.sort(key=lambda n: n.name)
         node = queue.pop(0)
         result.append(node)
 
         for user in node.users:
-            if user in subgroup_set:
+            if user in node_set:
                 in_degree[user] -= 1
                 if in_degree[user] == 0:
                     queue.append(user)
 
-    return result if len(result) == len(subgroup) else subgroup
-
-
-def _sort_subgroups_topologically(sorted_subgroups: list[list[fx.Node]], node_set: set[fx.Node]) -> list[fx.Node]:
-    """Sort sub-groups relative to each other based on inter-subgroup dependencies."""
-    if len(sorted_subgroups) <= 1:
-        return sum(sorted_subgroups, [])  # Flatten single or empty list
-
-    # Build dependency graph between sub-groups
-    subgroup_deps: dict[int, set[int]] = {i: set() for i in range(len(sorted_subgroups))}
-
-    for i, subgroup_i in enumerate(sorted_subgroups):
-        for j, subgroup_j in enumerate(sorted_subgroups):
-            if i != j:
-                # Check if any node in subgroup_i depends on any node in subgroup_j
-                for node_i in subgroup_i:
-                    for inp in node_i.all_input_nodes:
-                        if inp in node_set and any(inp == node_j for node_j in subgroup_j):
-                            subgroup_deps[i].add(j)
-                            break
-
-    # Topologically sort sub-groups
-    in_degree = {i: 0 for i in range(len(sorted_subgroups))}
-    for i, deps in subgroup_deps.items():
-        for dep in deps:
-            in_degree[i] += 1
-
-    queue = [i for i in range(len(sorted_subgroups)) if in_degree[i] == 0]
-    ordered_subgroups = []
-
-    while queue:
-        queue.sort()  # Deterministic ordering
-        subgroup_idx = queue.pop(0)
-        ordered_subgroups.append(sorted_subgroups[subgroup_idx])
-
-        for dependent_idx in range(len(sorted_subgroups)):
-            if subgroup_idx in subgroup_deps[dependent_idx]:
-                in_degree[dependent_idx] -= 1
-                if in_degree[dependent_idx] == 0:
-                    queue.append(dependent_idx)
-
-    # Flatten the ordered sub-groups
-    return sum(ordered_subgroups, [])
-
-
-def _create_fusion_subgraph(
-    graph: fx.Graph,
-    region: "FusionRegion",
-) -> fx.GraphModule:
-    """
-    Create a subgraph GraphModule for a fusion region.
-
-    Args:
-        graph: The parent graph
-        region: The fusion region to wrap
-
-    Returns:
-        A GraphModule containing the subgraph
-    """
-    owning_module = graph.owning_module
-    subgraph = fx.Graph(owning_module)
-
-    # Map from parent graph nodes to subgraph nodes
-    node_map: dict[fx.Node, fx.Node] = {}
-
-    # Create placeholders for external inputs
-    for i, ext_input in enumerate(region.external_inputs):
-        placeholder = subgraph.placeholder(f"input_{i}")
-        if "val" in ext_input.meta:
-            placeholder.meta.update(ext_input.meta)
-        node_map[ext_input] = placeholder
-
-    # Copy region nodes into subgraph
-    for node in region.nodes:
-        # Map args through node_map
-        def map_arg(arg, nm=node_map):
-            if isinstance(arg, fx.Node):
-                return nm.get(arg, arg)
-            elif isinstance(arg, (list, tuple)):
-                return type(arg)(map_arg(a, nm) for a in arg)
-            elif isinstance(arg, dict):
-                return {k: map_arg(v, nm) for k, v in arg.items()}
-            return arg
-
-        new_args = tuple(map_arg(a) for a in node.args)
-        new_kwargs = {k: map_arg(v) for k, v in node.kwargs.items()}
-
-        new_node = subgraph.call_function(
-            node.target,
-            new_args,
-            new_kwargs,
-        )
-        new_node.meta.update(node.meta)
-        node_map[node] = new_node
-
-    # Output the last node (or multiple outputs if needed)
-    nodes_list = list(region.nodes)
-    output_node = node_map[nodes_list[-1]]
-    subgraph.output(output_node)
-
-    return fx.GraphModule(owning_module, subgraph)
+    # Return result if complete, otherwise return original order (cycle detected)
+    return result if len(result) == len(nodes) else nodes
 
 
 def collapse_fusion_regions(
-    graph: fx.Graph,
+    gm: fx.GraphModule,
     region_of: dict[fx.Node, "FusionRegion"],
 ) -> tuple[dict[fx.Node, "FusionRegion"], dict[fx.Node, fx.Node]]:
     """
-    Collapse fusion regions into subgraph HOP nodes.
+    Collapse fusion regions into call_module nodes using fuser_utils.
 
-    Each fusion region is replaced with a single call_function node that
-    invokes a subgraph. The original nodes are stored in the region
-    for later inlining.
+    Each fusion region is replaced with a single call_module node.
+    The original nodes are erased.
 
     Args:
-        graph: The FX graph to modify
+        gm: The GraphModule to modify
         region_of: Mapping of nodes to their fusion regions
 
     Returns:
         (new_region_of, replaced) where:
-        - new_region_of: Mapping from subgraph nodes to their regions
-        - replaced: Mapping from original nodes to subgraph node
+        - new_region_of: Mapping from module nodes to their regions
+        - replaced: Mapping from original nodes to module node
     """
+    from torch.fx.passes.utils.fuser_utils import (
+        erase_nodes,
+        fuse_as_graphmodule,
+        insert_subgm,
+        topo_sort,
+    )
+
     replaced: dict[fx.Node, fx.Node] = {}
 
     if not region_of:
@@ -410,7 +279,6 @@ def collapse_fusion_regions(
             unique_regions.append(region)
 
     new_region_of: dict[fx.Node, FusionRegion] = {}
-    owning_module = graph.owning_module
 
     for region_idx, region in enumerate(unique_regions):
         nodes_list = list(region.nodes)
@@ -420,57 +288,66 @@ def collapse_fusion_regions(
                 new_region_of[nodes_list[0]] = region
             continue
 
-        last_node = nodes_list[-1]
+        # Sort nodes topologically
+        sorted_nodes = topo_sort(nodes_list)
 
-        # Create subgraph GraphModule
-        subgraph_module = _create_fusion_subgraph(graph, region)
-
-        # Register subgraph on owning module
+        # Create subgraph using fuser_utils
         subgraph_name = f"_fusion_region_{region_idx}"
-        setattr(owning_module, subgraph_name, subgraph_module)
-
-        # Create get_attr node for the subgraph
-        with graph.inserting_after(last_node):
-            get_subgraph = graph.get_attr(subgraph_name)
-
-            # Create invoke_subgraph node
-            subgraph_node = graph.call_function(
-                torch.ops.higher_order.invoke_subgraph,
-                args=(get_subgraph, subgraph_name, *tuple(region.external_inputs)),
+        try:
+            sub_gm, orig_inputs, orig_outputs = fuse_as_graphmodule(
+                gm,
+                sorted_nodes,
+                subgraph_name,
             )
-            # Copy metadata from the last node
-            subgraph_node.meta.update(last_node.meta)
+        except AssertionError:
+            # Invalid partition (cycle or other issue), skip this region
+            continue
 
-        # Replace all external uses of region nodes with subgraph node
-        for node in nodes_list:
-            for user in list(node.users.keys()):
-                if user not in region.nodes and user not in (subgraph_node, get_subgraph):
-                    user.replace_input_with(node, subgraph_node)
-            replaced[node] = subgraph_node
+        # Insert the subgraph module into the main graph
+        # This creates a call_module node
+        insert_subgm(gm, sub_gm, orig_inputs, orig_outputs)
 
-        # Erase all region nodes (reverse order)
-        for node in reversed(nodes_list):
-            graph.erase_node(node)
+        # Find the call_module node that was just inserted
+        module_node = None
+        for node in gm.graph.nodes:
+            if node.op == "call_module" and node.target == subgraph_name:
+                module_node = node
+                break
 
-        # Store subgraph info in region for later inlining
-        region.subgraph_node = subgraph_node
-        new_region_of[subgraph_node] = region
+        if module_node is None:
+            continue
+
+        # Map original nodes to module node
+        for node in sorted_nodes:
+            replaced[node] = module_node
+
+        # Erase original nodes
+        erase_nodes(gm, sorted_nodes)
+
+        # Store module info in region
+        region.subgraph_node = module_node
+        new_region_of[module_node] = region
+
+    # Fix graph ordering after insertions
+    from torch._dynamo.graph_deduplication import _stable_topological_sort
+
+    _stable_topological_sort(gm.graph, {})
 
     return new_region_of, replaced
 
 
 def expand_fusion_regions(
-    graph: fx.Graph,
+    gm: fx.GraphModule,
     region_of: dict[fx.Node, "FusionRegion"],
     replaced: dict[fx.Node, fx.Node],
 ) -> dict[fx.Node, fx.Node]:
     """
-    Expand invoke_subgraph HOP nodes back to their original nodes.
+    Expand call_module nodes back to their original nodes.
 
     Args:
-        graph: The FX graph
-        region_of: Mapping from subgraph nodes to their fusion regions
-        replaced: Mapping from original nodes to subgraph nodes (will be updated)
+        gm: The GraphModule
+        region_of: Mapping from module nodes to their fusion regions
+        replaced: Mapping from original nodes to module nodes (will be updated)
 
     Returns:
         Updated replaced mapping (original_node -> new_node)
@@ -478,35 +355,34 @@ def expand_fusion_regions(
     if not region_of:
         return replaced
 
-    owning_module = graph.owning_module
+    graph = gm.graph
 
-    for subgraph_node, region in region_of.items():
-        if subgraph_node not in graph.nodes:
+    for module_node, region in list(region_of.items()):
+        if module_node not in graph.nodes:
+            continue
+
+        if module_node.op != "call_module":
             continue
 
         nodes_list = list(region.nodes)
         if len(nodes_list) < 2:
             continue
 
-        # Get the subgraph from the invoke_subgraph args
-        # args = (get_attr_node, subgraph_name, *inputs)
-        if len(subgraph_node.args) < 2:
-            continue
-
-        get_attr_node = subgraph_node.args[0]
-        subgraph_name = subgraph_node.args[1]
-        subgraph_inputs = subgraph_node.args[2:]
+        # Get the subgraph module name and inputs
+        subgraph_name = module_node.target
+        subgraph_inputs = module_node.args
 
         # Get the subgraph module
-        subgraph_module = getattr(owning_module, subgraph_name, None)
+        subgraph_module = getattr(gm, subgraph_name, None)
         if subgraph_module is None:
             continue
+
+        subgraph_graph = subgraph_module.graph
 
         # Map from subgraph nodes to main graph nodes
         node_map: dict[fx.Node, fx.Node] = {}
 
         # Map subgraph placeholders to actual inputs
-        subgraph_graph = subgraph_module.graph
         placeholder_idx = 0
         for sg_node in subgraph_graph.nodes:
             if sg_node.op == "placeholder":
@@ -514,15 +390,9 @@ def expand_fusion_regions(
                     node_map[sg_node] = subgraph_inputs[placeholder_idx]
                 placeholder_idx += 1
 
-        # Map old region nodes to external inputs for replaced tracking
-        for i, ext_input in enumerate(region.external_inputs):
-            if i < len(subgraph_inputs):
-                # The external input is what's passed to the subgraph
-                pass  # external inputs don't need mapping in replaced
-
         # Inline subgraph nodes into main graph
         last_inlined_node = None
-        with graph.inserting_before(subgraph_node):
+        with graph.inserting_before(module_node):
             for sg_node in subgraph_graph.nodes:
                 if sg_node.op == "placeholder":
                     continue
@@ -553,7 +423,6 @@ def expand_fusion_regions(
                 last_inlined_node = new_node
 
         # Update replaced mapping: map original region nodes to new inlined nodes
-        # We need to match by position in the region
         sg_call_nodes = [n for n in subgraph_graph.nodes if n.op == "call_function"]
         for i, old_node in enumerate(nodes_list):
             if i < len(sg_call_nodes):
@@ -561,18 +430,18 @@ def expand_fusion_regions(
                 if sg_node in node_map:
                     replaced[old_node] = node_map[sg_node]
 
-        # Replace uses of subgraph node with the last inlined node
+        # Replace uses of module node with the last inlined node
         if last_inlined_node is not None:
-            subgraph_node.replace_all_uses_with(last_inlined_node)
+            module_node.replace_all_uses_with(last_inlined_node)
+            # Also add module_node -> last_inlined_node to replaced
+            replaced[module_node] = last_inlined_node
 
-        # Erase the subgraph node and get_attr
-        graph.erase_node(subgraph_node)
-        if get_attr_node.users == {}:
-            graph.erase_node(get_attr_node)
+        # Erase the module node
+        graph.erase_node(module_node)
 
-        # Clean up the subgraph attribute
-        if hasattr(owning_module, subgraph_name):
-            delattr(owning_module, subgraph_name)
+        # Remove the submodule
+        if hasattr(gm, subgraph_name):
+            delattr(gm, subgraph_name)
 
     return replaced
 

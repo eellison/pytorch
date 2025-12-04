@@ -1259,21 +1259,25 @@ class OverlapScheduler:
         self.reorder_graph()
 
     def _bucket_collectives(self) -> None:
+        from torch._inductor.fx_passes.fusion_regions import collapse_fusion_regions
         from torch._inductor.fx_passes.overlap_preserving_bucketer import (
             OverlapPreservingBucketer,
         )
 
-        # Use fusion regions built during __init__ (already used for overlap scheduling)
+        # Collapse fusion regions into call_module nodes before bucketing
+        region_of = self.region_of
         replaced: dict[fx.Node, fx.Node] = {}
+        if region_of:
+            region_of, replaced = collapse_fusion_regions(self.gm, region_of)
 
         bucketer = OverlapPreservingBucketer(
-            graph=self.graph,
+            gm=self.gm,
             collective_info=self.collective_info,
             scheduled=self.scheduled,
             max_bucket_memory_gb=2.0,  # Could make this configurable
             max_coll_distance=self.max_node_distance,
             insert_overlap_deps=self.insert_overlap_deps,
-            region_of=self.region_of,
+            region_of=region_of,
             replaced=replaced,
         )
         bucketer.bucket_collectives()

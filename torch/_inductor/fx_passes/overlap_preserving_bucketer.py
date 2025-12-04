@@ -129,7 +129,7 @@ class OverlapPreservingBucketer:
 
     def __init__(
         self,
-        graph: fx.Graph,
+        gm: fx.GraphModule,
         collective_info: dict[fx.Node, CollectiveInfo],
         scheduled: OrderedSet[fx.Node],
         max_bucket_memory_gb: float = 1.0,
@@ -139,7 +139,8 @@ class OverlapPreservingBucketer:
         region_of: dict[fx.Node, any] = None,
         replaced: dict[fx.Node, fx.Node] = None,
     ):
-        self.graph = graph
+        self.gm = gm
+        self.graph = gm.graph
         self.collective_info = collective_info
         self.max_bucket_memory_gb = max_bucket_memory_gb
         self.max_coll_distance = max_coll_distance
@@ -449,10 +450,13 @@ class OverlapPreservingBucketer:
             from torch._inductor.fx_passes.fusion_regions import expand_fusion_regions
 
             self.replaced = expand_fusion_regions(
-                self.graph, self.region_of, self.replaced
+                self.gm, self.region_of, self.replaced
             )
             # Fixup aug_graph deps to use the new node identities
             self.aug_graph.fixup_replaced_nodes(self.replaced)
+            # Clear region_of since the regions are now inlined
+            # and the mapping is stale (points to erased module nodes)
+            self.region_of = {}
 
         # Extract all dependencies from augmented graph
         # This includes:
