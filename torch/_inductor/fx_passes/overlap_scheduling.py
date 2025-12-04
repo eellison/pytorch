@@ -361,7 +361,7 @@ class OverlapScheduler:
         if torch._inductor.config.test_configs.enable_fusion_regions:
             from torch._inductor.fx_passes.fusion_regions import build_fusion_regions
 
-            self.region_of = build_fusion_regions(self.nodes)
+            self.region_of = build_fusion_regions(self.gm)
             if self.region_of:
                 unique_regions: set[int] = set()
                 for region in self.region_of.values():

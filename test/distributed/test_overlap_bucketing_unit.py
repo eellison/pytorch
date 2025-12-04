@@ -844,13 +844,16 @@ class TestFusionRegions(InductorTestCase):
         add3 = graph.call_function(aten.add.Tensor, (add1, add2))
         graph.output(add3)
 
+        # Wrap in GraphModule
+        gm = fx.GraphModule({}, graph)
+
         # Verify is_fusible_node works
         self.assertTrue(is_fusible_node(add1))
         self.assertTrue(is_fusible_node(add2))
         self.assertTrue(is_fusible_node(add3))
 
         # Build regions
-        region_of = build_fusion_regions(list(graph.nodes))
+        region_of = build_fusion_regions(gm)
 
         # All three add ops should be in the same region
         if region_of:  # May be empty if cost is 0 due to missing metadata
@@ -882,11 +885,11 @@ class TestFusionRegions(InductorTestCase):
         ]
 
         # Build regions (may be empty for non-ATen ops)
-        region_of = build_fusion_regions(list(gm.graph.nodes))
+        region_of = build_fusion_regions(gm)
 
         if region_of:
             # Collapse
-            new_region_of, replaced = collapse_fusion_regions(gm.graph, region_of)
+            new_region_of, replaced = collapse_fusion_regions(gm, region_of)
 
             # Verify subgraph nodes were created
             self.assertTrue(len(new_region_of) > 0)
@@ -917,7 +920,7 @@ class TestFusionRegions(InductorTestCase):
             b = torch.randn(4, 4)
             traced = make_fx(func)(a, b)
 
-        region_of = build_fusion_regions(list(traced.graph.nodes))
+        region_of = build_fusion_regions(traced)
 
         # Should detect fusible regions
         # (may be multiple or one depending on connectivity)

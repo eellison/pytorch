@@ -1,9 +1,11 @@
-"""Detect fusion regions for overlap scheduling."""
+"""Detect fusion regions for overlap scheduling using CapabilityBasedPartitioner."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 import torch.fx as fx
+from torch.fx.passes.infra.partitioner import CapabilityBasedPartitioner, Partition
+from torch.fx.passes.operator_support import OperatorSupportBase
 from torch.utils._ordered_set import OrderedSet
 
 
@@ -12,11 +14,11 @@ class FusionRegion:
     """Represents a connected set of fusible operations that will fuse together."""
 
     nodes: OrderedSet[fx.Node]  # All nodes in topo order
-    cost_ms: float = 0.0  # Estimated cost in milliseconds
-    external_inputs: OrderedSet[fx.Node] = None  # Inputs from outside the region
-    external_outputs: OrderedSet[fx.Node] = None  # Nodes with users outside the region
-    external_users: OrderedSet[fx.Node] = None  # Users outside the region
-    subgraph_node: fx.Node | None = None  # The subgraph node representing this region
+    cost_ms: float = field(default=0.0, init=False)  # Estimated cost in milliseconds
+    external_inputs: OrderedSet[fx.Node] = field(default=None, init=False)
+    external_outputs: OrderedSet[fx.Node] = field(default=None, init=False)
+    external_users: OrderedSet[fx.Node] = field(default=None, init=False)
+    subgraph_node: fx.Node | None = field(default=None, init=False)
 
     def __post_init__(self):
         """Compute cost and external inputs/outputs."""
@@ -42,7 +44,7 @@ class FusionRegion:
                 if user not in region_set:
                     self.external_users.add(user)
 
-        # Calculate cost from tensor metadata of external IO
+        # Calculate cost from tensor metadata of external IO (bandwidth-bound)
         total_bytes = 0
         for node in self.external_inputs | self.external_outputs:
             val = node.meta.get("val")
@@ -72,6 +74,9 @@ def is_fusible_node(n: fx.Node) -> bool:
 
     Excludes: mm/conv, collectives, waits, placeholders, outputs.
     """
+    if n.op != "call_function":
+        return False
+
     # Include pointwise, reduction, views
     tags = getattr(n.target, "tags", ())
     if torch.Tag.pointwise in tags or torch.Tag.reduction in tags:
@@ -88,130 +93,64 @@ def is_fusible_node(n: fx.Node) -> bool:
     return False
 
 
+class FusibleOperatorSupport(OperatorSupportBase):
+    """Operator support for fusible operations (pointwise, reduction, view)."""
+
+    def is_node_supported(
+        self, submodules: dict[str, torch.nn.Module], node: fx.Node
+    ) -> bool:
+        return is_fusible_node(node)
+
+
 def build_fusion_regions(
-    graph_nodes: list[fx.Node],
+    gm: fx.GraphModule,
 ) -> dict[fx.Node, FusionRegion]:
-    """Build fusion regions from the graph.
+    """Build fusion regions using CapabilityBasedPartitioner.
 
     Returns a dict mapping each node to its containing region (if any).
 
-    Algorithm:
-    1. Split graph into segments separated by non-fusible nodes
-    2. Within each segment, group connected nodes via data dependencies
+    Uses CapabilityBasedPartitioner to:
+    1. Identify fusible nodes (pointwise, reduction, view)
+    2. Group connected nodes into partitions
+    3. Convert partitions to FusionRegion objects
     """
-    # Find segments: consecutive fusible nodes separated by non-fusible nodes
-    segments: list[list[fx.Node]] = []
-    current_segment: list[fx.Node] = []
+    operator_support = FusibleOperatorSupport()
+    partitioner = CapabilityBasedPartitioner(
+        gm,
+        operator_support,
+        allows_single_node_partition=False,
+    )
 
-    for node in graph_nodes:
-        if is_fusible_node(node):
-            current_segment.append(node)
-        else:
-            if current_segment:
-                segments.append(current_segment)
-                current_segment = []
+    partitions = partitioner.propose_partitions()
 
-    if current_segment:
-        segments.append(current_segment)
-
-    # Build fusion regions within each segment
+    # Convert partitions to FusionRegion objects
     region_of: dict[fx.Node, FusionRegion] = {}
 
-    for segment in segments:
-        if len(segment) < 2:
+    for partition in partitions:
+        nodes_list = list(partition.nodes.keys())
+        if len(nodes_list) < 2:
             continue
 
-        segment_set = set(segment)
-        # Map each node to its region members (initially just itself)
-        node_to_region: dict[fx.Node, OrderedSet[fx.Node]] = {}
-        for n in segment:
-            node_to_region[n] = OrderedSet([n])
+        # Sort nodes topologically
+        nodes_sorted = _topological_sort_nodes(nodes_list)
+        region = FusionRegion(nodes=OrderedSet(nodes_sorted))
 
-        # Build adjacency mapping for shared inputs
-        input_to_consumers: dict[fx.Node, list[fx.Node]] = {}
-        for node in segment:
-            for inp in node.all_input_nodes:
-                if inp not in segment_set:  # External input
-                    if inp not in input_to_consumers:
-                        input_to_consumers[inp] = []
-                    input_to_consumers[inp].append(node)
-
-        # First, merge nodes that share the same external inputs
-        for inp, consumers in input_to_consumers.items():
-            if len(consumers) > 1:  # Multiple consumers of the same input
-                first_region = node_to_region[consumers[0]]
-                for consumer in consumers[1:]:
-                    consumer_region = node_to_region[consumer]
-                    if first_region is not consumer_region:
-                        # Merge smaller into larger
-                        if len(first_region) < len(consumer_region):
-                            smaller, larger = first_region, consumer_region
-                        else:
-                            smaller, larger = consumer_region, first_region
-
-                        larger |= smaller
-                        for n in smaller:
-                            node_to_region[n] = larger
-                        first_region = larger
-
-        # Second, merge producer-consumer pairs within the segment
-        for node in segment:
-            fusible_inputs = [
-                inp for inp in node.all_input_nodes if inp in segment_set
-            ]
-
-            for inp in fusible_inputs:
-                # Merge regions (union by size)
-                node_region = node_to_region[node]
-                inp_region = node_to_region[inp]
-                if node_region is not inp_region:
-                    # Merge smaller into larger
-                    if len(node_region) < len(inp_region):
-                        smaller, larger = node_region, inp_region
-                    else:
-                        smaller, larger = inp_region, node_region
-
-                    larger |= smaller
-                    for n in smaller:
-                        node_to_region[n] = larger
-
-        # Extract unique regions
-        seen_regions: set[int] = set()
-        for node in segment:
-            region_set = node_to_region[node]
-            region_id = id(region_set)
-            if region_id in seen_regions:
-                continue
-            seen_regions.add(region_id)
-
-            members = list(region_set)
-            if len(members) < 2:
-                continue
-
-            # Topologically sort members based on their dependencies
-            members_sorted = _topological_sort_region(members)
-
-            region = FusionRegion(nodes=OrderedSet(members_sorted))
-            if region.cost_ms > 0:
-                # Map all nodes to this region
-                for n in members_sorted:
-                    region_of[n] = region
+        # Only include regions with positive cost (have tensor I/O)
+        if region.cost_ms > 0:
+            for node in nodes_sorted:
+                region_of[node] = region
 
     return region_of
 
 
-def _topological_sort_region(nodes: list[fx.Node]) -> list[fx.Node]:
-    """
-    Topologically sort nodes within a region.
-
-    Uses Kahn's algorithm to sort nodes based on their dependencies within the region.
-    """
+def _topological_sort_nodes(nodes: list[fx.Node]) -> list[fx.Node]:
+    """Topologically sort nodes based on dependencies."""
     if len(nodes) <= 1:
         return nodes
 
     node_set = set(nodes)
 
-    # Calculate in-degrees (dependencies within the region)
+    # Calculate in-degrees
     in_degree = {n: 0 for n in nodes}
     for node in nodes:
         for inp in node.all_input_nodes:
@@ -223,7 +162,6 @@ def _topological_sort_region(nodes: list[fx.Node]) -> list[fx.Node]:
     result = []
 
     while queue:
-        # Sort by name for deterministic ordering
         queue.sort(key=lambda n: n.name)
         node = queue.pop(0)
         result.append(node)
@@ -234,14 +172,13 @@ def _topological_sort_region(nodes: list[fx.Node]) -> list[fx.Node]:
                 if in_degree[user] == 0:
                     queue.append(user)
 
-    # Return result if complete, otherwise return original order (cycle detected)
     return result if len(result) == len(nodes) else nodes
 
 
 def collapse_fusion_regions(
     gm: fx.GraphModule,
-    region_of: dict[fx.Node, "FusionRegion"],
-) -> tuple[dict[fx.Node, "FusionRegion"], dict[fx.Node, fx.Node]]:
+    region_of: dict[fx.Node, FusionRegion],
+) -> tuple[dict[fx.Node, FusionRegion], dict[fx.Node, fx.Node]]:
     """
     Collapse fusion regions into call_module nodes using fuser_utils.
 
@@ -283,7 +220,6 @@ def collapse_fusion_regions(
     for region_idx, region in enumerate(unique_regions):
         nodes_list = list(region.nodes)
         if len(nodes_list) < 2:
-            # Single node region - keep as is
             if nodes_list:
                 new_region_of[nodes_list[0]] = region
             continue
@@ -304,7 +240,6 @@ def collapse_fusion_regions(
             continue
 
         # Insert the subgraph module into the main graph
-        # This creates a call_module node
         insert_subgm(gm, sub_gm, orig_inputs, orig_outputs)
 
         # Find the call_module node that was just inserted
@@ -338,7 +273,7 @@ def collapse_fusion_regions(
 
 def expand_fusion_regions(
     gm: fx.GraphModule,
-    region_of: dict[fx.Node, "FusionRegion"],
+    region_of: dict[fx.Node, FusionRegion],
     replaced: dict[fx.Node, fx.Node],
 ) -> dict[fx.Node, fx.Node]:
     """
@@ -433,7 +368,6 @@ def expand_fusion_regions(
         # Replace uses of module node with the last inlined node
         if last_inlined_node is not None:
             module_node.replace_all_uses_with(last_inlined_node)
-            # Also add module_node -> last_inlined_node to replaced
             replaced[module_node] = last_inlined_node
 
         # Erase the module node
@@ -456,3 +390,53 @@ def resolve_replacement_chain(
         visited.add(node)
         node = replaced[node]
     return node
+
+
+def transfer_deps_to_region_outputs(
+    region_of: dict[fx.Node, FusionRegion],
+    deps: dict[fx.Node, OrderedSet[fx.Node]],
+) -> dict[fx.Node, OrderedSet[fx.Node]]:
+    """
+    Transfer dependencies from internal region nodes to region outputs.
+
+    For any dependency on an internal node, redirect it to the region's
+    last output node (the anchor).
+
+    Args:
+        region_of: Mapping from nodes to their fusion regions
+        deps: Dependencies to transfer
+
+    Returns:
+        New dependencies with internal nodes redirected to region outputs
+    """
+    if not region_of:
+        return deps
+
+    # Build map from internal nodes to their region's output
+    node_to_output: dict[fx.Node, fx.Node] = {}
+    for node, region in region_of.items():
+        # Use the last node (end) as the output/anchor
+        node_to_output[node] = region.end
+
+    # Transfer dependencies
+    new_deps: dict[fx.Node, OrderedSet[fx.Node]] = {}
+
+    for target, target_deps in deps.items():
+        # Redirect target if it's internal to a region
+        new_target = node_to_output.get(target, target)
+
+        # Redirect each dependency
+        new_target_deps = OrderedSet()
+        for dep in target_deps:
+            new_dep = node_to_output.get(dep, dep)
+            # Avoid self-dependencies
+            if new_dep != new_target:
+                new_target_deps.add(new_dep)
+
+        if new_target_deps:
+            if new_target in new_deps:
+                new_deps[new_target].update(new_target_deps)
+            else:
+                new_deps[new_target] = new_target_deps
+
+    return new_deps
