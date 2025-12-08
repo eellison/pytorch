@@ -343,16 +343,35 @@ class OverlapScheduler:
         )
         self.potentially_hidden_waits = self.compute_potential_hidden_waits()
         self.in_degree = Counter(user for node in self.nodes for user in node.users)
-        self.ready: list[tuple[object, fx.Node]] = []
+
+        # Two separate queues: on-path (domination-based) and off-path (node_idx-based)
+        self.on_path_ready: list[tuple[object, fx.Node]] = []
+        self.off_path_ready: list[tuple[object, fx.Node]] = []
 
         for node in self.nodes:
             if self.in_degree[node] == 0:
-                heapq.heappush(self.ready, (self._compute_score(node), node))
+                self._add_to_ready_queue(node)
 
         self.in_flight: dict[fx.Node, CollectiveInfo] = {}  # start -> info
         self.in_flight_bytes = 0
         self.scheduled: OrderedSet[fx.Node] = OrderedSet()
         self.max_compute_pre_fetch = max_compute_pre_fetch
+
+        # Track the last scheduled on-path node's original index
+        # Used to decide when to schedule off-path nodes
+        self.last_on_path_node_idx = -1
+
+    def _add_to_ready_queue(self, node: fx.Node) -> None:
+        """Add a node to the appropriate ready queue (on-path or off-path)."""
+        if self.off_compute_path(node):
+            # Off-path: sort by node_idx (original order)
+            # But defer exposed waits
+            score = self._compute_off_path_score(node)
+            heapq.heappush(self.off_path_ready, (score, node))
+        else:
+            # On-path: sort by domination (which compute it blocks)
+            score = self._compute_on_path_score(node)
+            heapq.heappush(self.on_path_ready, (score, node))
 
     def _collect_node_ancestors(self) -> dict[fx.Node, OrderedSet[fx.Node]]:
         """Collect all ancestors for each node."""
@@ -650,6 +669,59 @@ class OverlapScheduler:
 
         log.info("Overlap scheduling: Runtime estimations aligned")
 
+    def _get_next_node(self) -> fx.Node | None:
+        """Get the next node to schedule from the appropriate queue.
+
+        Strategy:
+        - Schedule off-path nodes when we've passed their original position
+        - Exception: defer exposed off-path waits until they're hidden
+        - On-path nodes are scheduled by domination order
+        """
+        # First, try to schedule any off-path nodes whose position we've passed
+        # (except exposed waits, which are deferred)
+        while self.off_path_ready:
+            score, node = self.off_path_ready[0]  # peek
+
+            if node in self.scheduled:
+                heapq.heappop(self.off_path_ready)
+                continue
+
+            # score[0] == 0 means non-deferred, score[0] == 1 means deferred (exposed wait)
+            is_deferred = score[0] == 1
+            node_original_idx = self.node_idx[node]
+
+            if is_deferred:
+                # Check if wait is now hidden
+                if _schedulable_wait_node(node):
+                    start_node = self.wait_to_start[node]
+                    info = self.collective_info[start_node]
+                    if not info.is_exposed:
+                        # Now hidden, can schedule
+                        heapq.heappop(self.off_path_ready)
+                        return node
+                # Still exposed, skip for now
+                break
+            else:
+                # Non-deferred off-path node: schedule if we've passed its position
+                if node_original_idx <= self.last_on_path_node_idx:
+                    heapq.heappop(self.off_path_ready)
+                    return node
+                else:
+                    # Haven't passed this node's position yet, wait for on-path progress
+                    break
+
+        # Schedule from on-path queue
+        if self.on_path_ready:
+            _, node = heapq.heappop(self.on_path_ready)
+            return node
+
+        # Only deferred off-path nodes left - force them
+        if self.off_path_ready:
+            _, node = heapq.heappop(self.off_path_ready)
+            return node
+
+        return None
+
     def run(self) -> torch.fx.GraphModule:
         """Run the scheduling algorithm."""
         # All ranks must make identical decisions on overlap reordering,
@@ -657,12 +729,15 @@ class OverlapScheduler:
         # For now we do benchmarking only for compute nodes.
         self._align_compute_nodes_runtime_estimations_across_all_distributed_ranks()
 
-        while self.ready:
+        while self.on_path_ready or self.off_path_ready:
             if self._should_force_wait_for_memory():
                 self._force_oldest_wait()
                 continue
 
-            _, node = heapq.heappop(self.ready)
+            # Get next node from appropriate queue
+            node = self._get_next_node()
+            if node is None:
+                break
 
             # we don't always remove nodes from the heap when we schedule them
             if node in self.scheduled:
@@ -793,6 +868,10 @@ class OverlapScheduler:
         self.scheduled.add(node)
         self.memory_tracker.schedule_node(node)
 
+        # Track progress through on-path nodes
+        if not self.off_compute_path(node):
+            self.last_on_path_node_idx = self.node_idx[node]
+
         log.debug(
             "Scheduled node %s: current_memory=%d bytes, total_scheduled=%d",
             node.name,
@@ -803,11 +882,10 @@ class OverlapScheduler:
         for user in node.users:
             self.in_degree[user] -= 1
             if self.in_degree[user] == 0:
-                heapq.heappush(self.ready, (self._compute_score(user), user))
+                self._add_to_ready_queue(user)
 
-    def _compute_score(self, node: fx.Node) -> object:
-        """Compute priority score for a node"""
-
+    def _compute_on_path_score(self, node: fx.Node) -> object:
+        """Compute priority score for on-path nodes (domination-based)."""
         if _schedulable_wait_node(node):
             info = self.collective_info[self.wait_to_start[node]]
             # defer waits locally if they are exposed.
@@ -826,6 +904,32 @@ class OverlapScheduler:
             compute_local_priority,  # collective_start=-1, wait=1, or neither=0
             self.node_idx[node],  # Original order for stability
         )
+
+    def _compute_off_path_score(self, node: fx.Node) -> object:
+        """Compute priority score for off-path nodes (node_idx-based).
+
+        Off-path nodes are scheduled when we've passed their original position,
+        except exposed waits which are deferred until hidden.
+        """
+        if _schedulable_wait_node(node):
+            info = self.collective_info[self.wait_to_start[node]]
+            if info.is_exposed:
+                # Defer exposed waits: use large value to push to end
+                # They'll be scheduled when hidden or forced by memory pressure
+                return (1, self.node_idx[node])
+            else:
+                # Hidden waits: schedule in order
+                return (0, self.node_idx[node])
+        else:
+            # Non-wait off-path nodes: schedule by original order
+            return (0, self.node_idx[node])
+
+    def _compute_score(self, node: fx.Node) -> object:
+        """Compute priority score for a node (dispatches to on-path or off-path)."""
+        if self.off_compute_path(node):
+            return self._compute_off_path_score(node)
+        else:
+            return self._compute_on_path_score(node)
 
     @staticmethod
     def is_cheap_fn(node: fx.Node) -> bool:
