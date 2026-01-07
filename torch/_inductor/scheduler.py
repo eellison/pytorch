@@ -4427,7 +4427,7 @@ class Scheduler:
         return cycle
 
     def can_fusion_increase_peak_memory(
-        self, node1: BaseSchedulerNode, node2: BaseSchedulerNode
+        self, node1: BaseSchedulerNode, node2: BaseSchedulerNode, shared_data_score: int | None = None
     ) -> bool:
         """
         Return true if fusing the two nodes can potentially increasing peak memory.
@@ -4476,7 +4476,12 @@ class Scheduler:
                 # not an integer. Fallback is to fuse
                 return False
 
-        bw_saving = self.score_fusion_memory(node1, node2)
+        # Use passed-in score if available (e.g., after index inversion)
+        # Otherwise compute it
+        if shared_data_score is not None:
+            bw_saving = shared_data_score
+        else:
+            bw_saving = self.score_fusion_memory(node1, node2)
 
         # The factor 32 here is quite arbitrary.
         if V.graph.sizevars.statically_known_gt(memory_overhead, 32 * bw_saving):
@@ -4639,6 +4644,7 @@ class Scheduler:
             int: Fusion score if successful, 0 if optimization not applicable
         """
 
+
         if not config.loop_index_inversion_in_fusion:
             return -1
 
@@ -4652,6 +4658,7 @@ class Scheduler:
 
         if not common_buffer_names:
             return -1
+
 
         # only invert if node1 is single unmet dep
         node2_unmet_dependencies = OrderedSet(
@@ -4690,13 +4697,21 @@ class Scheduler:
         # normalize node1 not node2.
         node1_write = node1_write.normalize()
 
+        # Compare total elements rather than exact shape to allow fusion
+        # between kernels with different tensor shapes but same element count
+        def total_elements(size):
+            result = 1
+            for s in size:
+                result *= s
+            return result
+
         if (
             node1_write.index != node2_write.index
-            and node1_write.size != node2_write.size
+            and total_elements(node1_write.size) != total_elements(node2_write.size)
         ):
             return -1
 
-        if node2_read.size != node2_write.size or len(node2_read.var_names) != 1:
+        if node2_read.size != node2_write.size:
             return -1
 
         # Verify we have exactly two indexing expressions (one read, one write)
@@ -4729,8 +4744,132 @@ class Scheduler:
             write_expr_index = "index0"
 
         from torch._inductor.invert_expr_analysis import generate_inverse_formula
+        from torch.utils._sympy.functions import FloorDiv, ModularIndexing
 
         index_vars = node2._body.vars[0]  # type: ignore[attr-defined]
+
+        # Handle multi-variable indexing by converting to linear form
+        if len(index_vars) > 1:
+            # Check if write expression is a simple linear combination
+            write_expr = node2._body.indexing_exprs[write_expr_index]  # type: ignore[attr-defined]
+
+            # Compute strides from the size tuple
+            size = node2_write.size
+
+            # Ensure index_vars and size have the same dimensionality
+            # For complex writes with simple reads, use read size to determine iteration space
+            read_size = node2_read.size
+            if len(index_vars) != len(size):
+                # Check if read size matches index_vars dimensionality
+                if len(index_vars) == len(read_size):
+                    # Use read size instead - this is a complex write case
+                    size = read_size
+                else:
+                    return -1
+            strides = []
+            stride = 1
+            for s in reversed(size):
+                strides.insert(0, stride)
+                stride *= s
+
+            # Try to express write_expr as sum of var * stride
+            # Expected form: strides[0]*var[0] + strides[1]*var[1] + ... + strides[n-1]*var[n-1]
+            expected_write = sum(
+                strides[i] * index_vars[i] for i in range(len(index_vars))
+            )
+
+            # Check if write expression matches expected linear form
+            if not V.graph.sizevars.statically_known_equals(
+                sympy.expand(write_expr), sympy.expand(expected_write)
+            ):
+                return -1
+
+            # Create a virtual linear index variable
+            p = sympy.Symbol("_linear_idx", integer=True, nonnegative=True)
+
+            # Substitute vars in read_expr with their linear decomposition
+            # var[i] = (p // product(sizes[i+1:])) % sizes[i]
+            subs = {}
+            for i, var in enumerate(index_vars):
+                if i == 0:
+                    subs[var] = FloorDiv(p, strides[0])
+                else:
+                    divisor = strides[i]
+                    modulo = size[i]
+                    subs[var] = ModularIndexing(p, divisor, modulo)
+
+            read_expr = read_expr.subs(subs)
+
+            # Simplify nested ModularIndexing patterns
+            # ModularIndexing(ModularIndexing(x, d1, m1), 1, m2) where m1 % m2 == 0
+            # simplifies to ModularIndexing(x, d1, m2)
+            def simplify_nested_modular(expr):
+                if isinstance(expr, ModularIndexing):
+                    inner, div, mod = expr.args
+                    if isinstance(inner, ModularIndexing):
+                        inner_x, inner_div, inner_mod = inner.args
+                        # ModularIndexing(ModularIndexing(x, d1, m1), 1, m2) where m2 divides m1
+                        if V.graph.sizevars.statically_known_equals(div, 1):
+                            if V.graph.sizevars.statically_known_multiple_of(inner_mod, mod):
+                                return ModularIndexing(inner_x, inner_div, mod)
+                    return expr
+                elif isinstance(expr, sympy.Add):
+                    return sympy.Add(*[simplify_nested_modular(arg) for arg in expr.args])
+                elif isinstance(expr, sympy.Mul):
+                    return sympy.Mul(*[simplify_nested_modular(arg) for arg in expr.args])
+                elif isinstance(expr, FloorDiv):
+                    base, divisor = expr.args
+                    simplified_base = simplify_nested_modular(base)
+
+                    # Try to simplify FloorDiv(ModularIndexing(x, 1, a) + b*ModularIndexing(x, a, c), d)
+                    # This pattern occurs when reconstructing linear index from multi-dim
+                    # (x % a) + a * ((x // a) % c) = x % (a*c)
+                    # So FloorDiv of this by d becomes ModularIndexing(x, d, (a*c)//d)
+                    if isinstance(simplified_base, sympy.Add) and len(simplified_base.args) == 2:
+                        args = list(simplified_base.args)
+                        mod_term = None
+                        mul_term = None
+                        for arg in args:
+                            if isinstance(arg, ModularIndexing):
+                                mod_term = arg
+                            elif isinstance(arg, sympy.Mul) and len(arg.args) == 2:
+                                mul_term = arg
+
+                        if mod_term is not None and mul_term is not None:
+                            # Check pattern: ModularIndexing(x, 1, a) + a * ModularIndexing(x, a, c)
+                            mod_x, mod_div, mod_mod = mod_term.args
+                            if V.graph.sizevars.statically_known_equals(mod_div, 1):
+                                coef, inner = mul_term.args
+                                if not isinstance(inner, ModularIndexing):
+                                    coef, inner = inner, coef
+                                if isinstance(inner, ModularIndexing):
+                                    inner_x, inner_div, inner_mod = inner.args
+                                    # Check if coef == mod_mod and inner_div == mod_mod
+                                    if (V.graph.sizevars.statically_known_equals(coef, mod_mod) and
+                                        V.graph.sizevars.statically_known_equals(inner_div, mod_mod) and
+                                        V.graph.sizevars.statically_known_equals(mod_x, inner_x)):
+                                        # Total modulus is mod_mod * inner_mod
+                                        total_mod = mod_mod * inner_mod
+                                        # Result is ModularIndexing(x, divisor, total_mod // divisor)
+                                        result_mod = FloorDiv(total_mod, divisor)
+                                        return ModularIndexing(mod_x, divisor, result_mod)
+
+                    return FloorDiv(simplified_base, divisor)
+                return expr
+
+            read_expr = simplify_nested_modular(read_expr)
+
+            # Store the original variables and the linear substitution for later
+            # We'll need to convert back after computing the inverse
+            original_index_vars = index_vars
+            original_strides = strides
+            linear_idx_symbol = p
+            index_vars = [p]
+        else:
+            original_index_vars = None
+            linear_idx_symbol = None
+            original_strides = None
+
         if len(index_vars) != 1:
             return -1
 
@@ -4749,6 +4888,18 @@ class Scheduler:
 
         # === Apply Inversion ===
 
+        # If we used a virtual linear index, substitute it back to original variables
+        if linear_idx_symbol is not None and original_index_vars is not None:
+            # linear_idx = sum(original_index_vars[i] * original_strides[i])
+            linear_to_vars = sum(
+                original_index_vars[i] * original_strides[i]
+                for i in range(len(original_index_vars))
+            )
+            inverse_formula = inverse_formula.subs(linear_idx_symbol, linear_to_vars)
+            # Also need to update the write expression which is currently in terms of
+            # the virtual linear index to be in terms of original variables
+            original_write_expr = node2._body.indexing_exprs[write_expr_index]  # type: ignore[attr-defined]
+
         # Swap the indexing expressions using the inverse formula
         node2._body.indexing_exprs[read_expr_index] = node2._body.indexing_exprs[  # type: ignore[attr-defined]
             write_expr_index
@@ -4757,7 +4908,10 @@ class Scheduler:
 
         # Refresh dependencies and calculate fusion score
         node2.refresh_dependencies(True, False)  # type: ignore[attr-defined]
-        score = self.score_fusion_memory(node1, node2)
+
+        # After successful inversion, the shared data is the intermediate buffer
+        # Compute score as the size of the shared buffer (node1's write = node2's read)
+        score = self.dep_size_hint(node1_write)
         assert isinstance(score, int)
 
         fusion_log.info("Shared memory after inversion: %d", score)
