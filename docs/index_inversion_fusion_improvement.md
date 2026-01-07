@@ -84,6 +84,69 @@ All correctness tests pass.
 - `torch/_inductor/scheduler.py`: Extended `shared_data_after_inverting_indexing()` and `can_fusion_increase_peak_memory()`
 - `torch/_inductor/choices.py`: Pass `shared_data_score` to peak memory check
 
-## Future Work
+## Future Work: Final Fusion (Quantization + Permutation)
 
-To fully match the non-swizzled case (0.040 ms with 1 kernel), the quantization kernel would need to write scales directly in the swizzled format. This requires teaching inductor to fuse "compute + complex permute" patterns where the permutation is on the output side of the producer kernel.
+To fully match the non-swizzled case (0.040 ms with 1 kernel), the quantization kernel would need to write scales directly in the swizzled format.
+
+### Why Final Fusion is Challenging
+
+The remaining gap is between:
+- **Current**: 2 kernels (~0.081 ms)
+- **Goal**: 1 kernel (~0.040 ms)
+
+The blocker is the `slice_scatter` operation in `to_blocked`:
+
+```python
+# In to_blocked:
+padded = torch.zeros((padded_rows, padded_cols), ...)
+padded[:rows, :cols] = input_matrix  # <-- Creates slice_scatter extern kernel
+# ... permutation operations
+```
+
+The `slice_scatter` is an extern kernel that breaks the fusion chain between:
+1. Quantization kernel (produces scales)
+2. Permutation kernel (rearranges scales to swizzled format)
+
+### Approaches Explored
+
+1. **Inverse Swizzle Iteration**: Iterate over output positions and compute which input to process.
+   - Works but is 4x slower (131072 vs 32768 iterations)
+   - 75% of iterations compute redundant results for padding positions
+
+2. **Replace slice_scatter with torch.cat**: Use concatenation instead of assignment.
+   - May help fusion but needs further investigation
+
+3. **index_put/scatter**: Use explicit indexing operations.
+   - These are also extern kernels, don't help fusion
+
+### Recommended Solutions
+
+1. **Short-term: Custom Triton Kernel**
+
+   Write a custom kernel that fuses quantization with swizzled output:
+   ```python
+   @triton.jit
+   def fused_quant_swizzle_kernel(in_ptr, out_scale_ptr, out_data_ptr, ...):
+       # x0 = program_id for each scale block
+       # Read 32 input values, compute scale
+       # Compute swizzled output index
+       swizzled_idx = (x0 // 128) * 512 + (x0 % 32) * 16 + ((x0 % 128) // 32) * 4
+       # Write scale at swizzled position
+       tl.store(out_scale_ptr + swizzled_idx, scale)
+   ```
+
+2. **Long-term: Extend Inductor**
+
+   Teach inductor to recognize "compute + pad + permute" patterns and generate fused kernels with transformed output indices. This requires:
+   - Pattern matching for slice_scatter followed by permutation
+   - Output index transformation during codegen
+   - Handling of padding (write zeros to padding positions)
+
+### Performance Summary
+
+| Configuration | Kernels | Latency | vs Non-swizzled |
+|--------------|---------|---------|-----------------|
+| Original (3 kernels) | 3 | ~0.100 ms | 2.5x slower |
+| After this PR (2 kernels) | 2 | ~0.081 ms | 2.0x slower |
+| Goal (1 kernel) | 1 | ~0.040 ms | 1.0x |
+| Non-swizzled baseline | 1 | ~0.040 ms | baseline |
