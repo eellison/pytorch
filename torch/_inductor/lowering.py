@@ -7678,6 +7678,59 @@ def prepare_softmax_online(x, dim):
         return amax, xsum
 
 
+def _is_sm100_or_later():
+    """Check if we're on SM100+ hardware (Blackwell)."""
+    if not torch.cuda.is_available():
+        return False
+    try:
+        return torch.cuda.get_device_capability() >= (10, 0)
+    except Exception:
+        return False
+
+
+@register_lowering(inductor_prims.cvt_e8m0_rceil, type_promotion_kind=None)
+def cvt_e8m0_rceil_lowering(inp):
+    """
+    Lowering for cvt_e8m0_rceil.
+
+    On SM100+: Uses PTX cvt.rp.satfinite.ue8m0x2.f32 instruction
+    On older hardware: Uses bit manipulation (still fusible)
+    """
+    if _is_sm100_or_later():
+        # Use optimized PTX instruction on Blackwell+
+        fn = functools.partial(
+            ops.inline_asm_elementwise,
+            asm="cvt.rp.satfinite.ue8m0x2.f32 $0, 0.0, $1;",
+            constraints="=h,r",
+            dtype=torch.uint16,
+            is_pure=True,
+            pack=1,
+        )
+        result = make_pointwise(fn)(inp)
+        return to_dtype(result, torch.uint8)
+    else:
+        # Fallback: bit manipulation (still benefits from fusion)
+        def inner_fn(x):
+            # Reinterpret float32 bits as int32
+            x_int = ops.to_dtype_bitcast(x, torch.int32, torch.float32)
+            # Extract biased exponent (bits 23-30)
+            biased_exp = ops.bitwise_and(ops.rshift(x_int, 23), 0xFF)
+            # Extract mantissa (bits 0-22)
+            mantissa = ops.bitwise_and(x_int, 0x7FFFFF)
+            # Check if mantissa is non-zero (needs ceiling)
+            needs_round = ops.ne(mantissa, 0)
+            needs_round_int = ops.to_dtype(needs_round, torch.int32, src_dtype=torch.bool)
+            # Add 1 for ceiling if needed
+            e8m0 = ops.add(biased_exp, needs_round_int)
+            # Clamp to [0, 255]
+            e8m0 = ops.maximum(e8m0, 0)
+            e8m0 = ops.minimum(e8m0, 255)
+            # Convert to uint8
+            return ops.to_dtype(e8m0, torch.uint8, src_dtype=torch.int32)
+
+        return make_pointwise(inner_fn, override_return_dtype=torch.uint8)(inp)
+
+
 # populate lowerings defined in kernel/*
 from . import kernel
 

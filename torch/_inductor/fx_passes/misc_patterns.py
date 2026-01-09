@@ -76,6 +76,57 @@ def _misc_patterns_init():
         scalar_workaround={"slice_shape": 42},
     )
 
+    # Pattern: e8m0 extraction with ceiling rounding (for MX format scaling)
+    # Matches manual bit manipulation and replaces with inductor_prims.cvt_e8m0_rceil
+    # which uses PTX cvt.rp.satfinite.ue8m0x2.f32 on SM100+ (Blackwell)
+    # Only register pattern on SM100+ since that's when the PTX instruction is available
+    if device == "cuda":
+        try:
+            if torch.cuda.get_device_capability() >= (10, 0):
+                from .. import inductor_prims
+
+                def e8m0_rceil_pattern(inp):
+                    """Pattern: manual bit manipulation for e8m0 extraction with ceiling."""
+                    inp_bits = inp.view(torch.int32)
+                    biased_exp = (inp_bits >> 23) & 0xFF
+                    mantissa = inp_bits & 0x7FFFFF
+                    needs_round_up = mantissa != 0
+                    e8m0_biased = biased_exp + needs_round_up.to(torch.int32)
+                    e8m0_biased = torch.clamp(e8m0_biased, 0, 255)
+                    return e8m0_biased.to(torch.uint8)
+
+                def e8m0_rceil_replacement(inp):
+                    """Replacement: use the optimized inductor prim."""
+                    return inductor_prims.cvt_e8m0_rceil(inp)
+
+                def e8m0_extra_check(match):
+                    """Only apply on CUDA float32 tensors."""
+                    inp = match.kwargs.get("inp")
+                    if inp is None:
+                        return False
+                    inp_val = inp.meta.get("val")
+                    if inp_val is None:
+                        return False
+                    if inp_val.device.type != "cuda":
+                        return False
+                    if inp_val.dtype != torch.float32:
+                        return False
+                    return True
+
+                register_replacement(
+                    e8m0_rceil_pattern,
+                    e8m0_rceil_replacement,
+                    [torch.randn(32, device="cuda", dtype=torch.float32)],
+                    fwd_only,
+                    [post_grad_patterns],
+                    extra_check=e8m0_extra_check,
+                )
+        except Exception:
+            pass  # Skip if CUDA not properly initialized
+
+    # TODO: Add pattern for cvt.rn.bf16x2.ue8m0x2 (e8m0 -> bf16 conversion)
+    # This is the inverse operation for MX format dequantization
+
 
 class NumpyCompatNormalization:
     numpy_compat: dict[str, tuple[str, ...]] = {
