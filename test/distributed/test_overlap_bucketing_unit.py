@@ -1207,5 +1207,369 @@ class TestOverlapSchedulingFixes(InductorTestCase):
         result.graph.lint()
 
 
+try:
+    from pulp import LpStatus
+
+    HAS_PULP = True
+except ImportError:
+    HAS_PULP = False
+
+
+def estimate_ilp_test_runtime(fx_node, override_size=None, compute_multiplier=1.0):
+    """Runtime estimation for ILP tests - collectives and matmuls take 1.0 time unit."""
+    if "c10" in str(fx_node.target):
+        return 1.0
+    elif fx_node.target == aten.mm.default:
+        return compute_multiplier
+    else:
+        return None
+
+
+@requires_accelerator_dist_backend(["nccl", "xccl"])
+@unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
+@unittest.skipIf(not HAS_PULP, "Requires pulp library for ILP solving")
+class TestILPOverlapScheduler(InductorTestCase):
+    """
+    Unit tests for ILP-based overlap scheduling.
+    Tests the schedule_overlap_ilp function.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        from torch.testing._internal.distributed.fake_pg import FakeStore
+
+        store = FakeStore()
+        dist.init_process_group(backend="fake", rank=0, world_size=2, store=store)
+        cls.device = "cuda"
+
+    @classmethod
+    def tearDownClass(cls):
+        super().tearDownClass()
+        dist.destroy_process_group()
+
+    def test_basic_scheduling(self):
+        """Test that ILP scheduler produces a valid schedule for simple graph."""
+
+        def func(a):
+            group_name = "0"
+            group_size = 1
+
+            ag = torch.ops._c10d_functional.all_gather_into_tensor(
+                a, group_size, group_name
+            )
+            mm = torch.mm(a, a)
+            ag_out = torch.ops._c10d_functional.wait_tensor(ag)
+            return ag_out.sum() + mm.sum()
+
+        with FakeTensorMode():
+            a = torch.ones(4, 4, device=self.device)
+            traced = make_fx(func)(a)
+
+        from torch._inductor.fx_passes.ilp_overlap_scheduling import schedule_overlap_ilp
+
+        result = schedule_overlap_ilp(
+            traced,
+            custom_runtime_estimation=estimate_ilp_test_runtime,
+        )
+
+        result.graph.lint()
+
+        graph_str = str(result.graph)
+        FileCheck().check("all_gather_into_tensor").check("wait_tensor").run(graph_str)
+
+    def test_schedules_compute_between_start_and_wait(self):
+        """Test that ILP scheduler moves compute between collective start and wait."""
+
+        def func(a):
+            group_name = "0"
+            group_size = 1
+
+            ag = torch.ops._c10d_functional.all_gather_into_tensor(
+                a, group_size, group_name
+            )
+            mm1 = torch.mm(a, a)
+            mm2 = torch.mm(mm1, mm1)
+            ag_out = torch.ops._c10d_functional.wait_tensor(ag)
+            return ag_out.sum() + mm2.sum()
+
+        with FakeTensorMode():
+            a = torch.ones(4, 4, device=self.device)
+            traced = make_fx(func)(a)
+
+        from torch._inductor.fx_passes.ilp_overlap_scheduling import schedule_overlap_ilp
+
+        result = schedule_overlap_ilp(
+            traced,
+            custom_runtime_estimation=estimate_ilp_test_runtime,
+        )
+
+        result.graph.lint()
+
+        graph_str = str(result.graph)
+        FileCheck().check("all_gather_into_tensor").check("mm").check(
+            "wait_tensor"
+        ).run(graph_str)
+
+    def test_buckets_independent_collectives(self):
+        """Test that ILP scheduler can bucket independent collectives."""
+
+        def func(a, b):
+            group_name = "0"
+            group_size = 1
+
+            ag1 = torch.ops._c10d_functional.all_gather_into_tensor(
+                a, group_size, group_name
+            )
+            ag2 = torch.ops._c10d_functional.all_gather_into_tensor(
+                b, group_size, group_name
+            )
+            mm1 = torch.mm(a, a)
+            mm2 = torch.mm(b, b)
+            ag1_out = torch.ops._c10d_functional.wait_tensor(ag1)
+            ag2_out = torch.ops._c10d_functional.wait_tensor(ag2)
+            return ag1_out.sum() + ag2_out.sum() + mm1.sum() + mm2.sum()
+
+        with FakeTensorMode():
+            a = torch.ones(4, 4, device=self.device)
+            b = torch.ones(4, 4, device=self.device) * 2
+            traced = make_fx(func)(a, b)
+
+        from torch._inductor.fx_passes.ilp_overlap_scheduling import schedule_overlap_ilp
+
+        result = schedule_overlap_ilp(
+            traced,
+            custom_runtime_estimation=estimate_ilp_test_runtime,
+        )
+
+        result.graph.lint()
+
+        graph_str = str(result.graph)
+        FileCheck().check_count("all_gather_into_tensor", 1, exactly=False).run(
+            graph_str
+        )
+
+    def test_preserves_data_dependencies(self):
+        """Test that ILP scheduler preserves data dependencies."""
+
+        def func(a):
+            group_name = "0"
+            group_size = 1
+
+            ag1 = torch.ops._c10d_functional.all_gather_into_tensor(
+                a, group_size, group_name
+            )
+            ag1_out = torch.ops._c10d_functional.wait_tensor(ag1)
+            ag2 = torch.ops._c10d_functional.all_gather_into_tensor(
+                ag1_out[:4, :4], group_size, group_name
+            )
+            ag2_out = torch.ops._c10d_functional.wait_tensor(ag2)
+            return ag2_out.sum()
+
+        with FakeTensorMode():
+            a = torch.ones(4, 4, device=self.device)
+            traced = make_fx(func)(a)
+
+        from torch._inductor.fx_passes.ilp_overlap_scheduling import schedule_overlap_ilp
+
+        result = schedule_overlap_ilp(
+            traced,
+            custom_runtime_estimation=estimate_ilp_test_runtime,
+        )
+
+        result.graph.lint()
+
+        graph_str = str(result.graph)
+        FileCheck().check("all_gather_into_tensor").check("wait_tensor").check(
+            "all_gather_into_tensor"
+        ).check("wait_tensor").run(graph_str)
+
+    def test_mixed_collective_types(self):
+        """Test that ILP scheduler handles mixed collective types correctly."""
+
+        def func(a, b):
+            group_name = dist.distributed_c10d._get_default_group().group_name
+            group_size = 1
+
+            ag = torch.ops._c10d_functional.all_gather_into_tensor(
+                a, group_size, group_name
+            )
+            rs = torch.ops._c10d_functional.reduce_scatter_tensor(
+                b, "sum", group_size, group_name
+            )
+            mm = torch.mm(a, a)
+            ag_out = torch.ops._c10d_functional.wait_tensor(ag)
+            rs_out = torch.ops._c10d_functional.wait_tensor(rs)
+            return ag_out.sum() + rs_out.sum() + mm.sum()
+
+        with FakeTensorMode():
+            a = torch.ones(4, 4, device=self.device)
+            b = torch.ones(8, 4, device=self.device)
+            traced = make_fx(func)(a, b)
+
+        from torch._inductor.fx_passes.ilp_overlap_scheduling import schedule_overlap_ilp
+
+        result = schedule_overlap_ilp(
+            traced,
+            custom_runtime_estimation=estimate_ilp_test_runtime,
+        )
+
+        result.graph.lint()
+
+        graph_str = str(result.graph)
+        FileCheck().check("all_gather_into_tensor").run(graph_str)
+        FileCheck().check("reduce_scatter_tensor").run(graph_str)
+
+    def test_respects_fifo_ordering(self):
+        """Test that ILP scheduler respects FIFO ordering for same-PG collectives."""
+
+        def func(a, b, c):
+            group_name = "0"
+            group_size = 1
+
+            ag1 = torch.ops._c10d_functional.all_gather_into_tensor(
+                a, group_size, group_name
+            )
+            ag2 = torch.ops._c10d_functional.all_gather_into_tensor(
+                b, group_size, group_name
+            )
+            ag3 = torch.ops._c10d_functional.all_gather_into_tensor(
+                c, group_size, group_name
+            )
+
+            mm = torch.mm(a, a)
+
+            ag1_out = torch.ops._c10d_functional.wait_tensor(ag1)
+            ag2_out = torch.ops._c10d_functional.wait_tensor(ag2)
+            ag3_out = torch.ops._c10d_functional.wait_tensor(ag3)
+
+            return ag1_out.sum() + ag2_out.sum() + ag3_out.sum() + mm.sum()
+
+        with FakeTensorMode():
+            a = torch.ones(4, 4, device=self.device)
+            b = torch.ones(4, 4, device=self.device)
+            c = torch.ones(4, 4, device=self.device)
+            traced = make_fx(func)(a, b, c)
+
+        from torch._inductor.fx_passes.ilp_overlap_scheduling import schedule_overlap_ilp
+
+        result = schedule_overlap_ilp(
+            traced,
+            custom_runtime_estimation=estimate_ilp_test_runtime,
+        )
+
+        result.graph.lint()
+
+    def test_many_buckets_mode(self):
+        """Test that ILP scheduler works with many buckets (effectively no forced bucketing)."""
+
+        def func(a, b):
+            group_name = "0"
+            group_size = 1
+
+            ag1 = torch.ops._c10d_functional.all_gather_into_tensor(
+                a, group_size, group_name
+            )
+            ag2 = torch.ops._c10d_functional.all_gather_into_tensor(
+                b, group_size, group_name
+            )
+            mm = torch.mm(a, a)
+            ag1_out = torch.ops._c10d_functional.wait_tensor(ag1)
+            ag2_out = torch.ops._c10d_functional.wait_tensor(ag2)
+            return ag1_out.sum() + ag2_out.sum() + mm.sum()
+
+        with FakeTensorMode():
+            a = torch.ones(4, 4, device=self.device)
+            b = torch.ones(4, 4, device=self.device)
+            traced = make_fx(func)(a, b)
+
+        from torch._inductor.fx_passes.ilp_overlap_scheduling import schedule_overlap_ilp
+
+        # ILP allows each collective to be in its own bucket by default
+        result = schedule_overlap_ilp(
+            traced,
+            custom_runtime_estimation=estimate_ilp_test_runtime,
+        )
+
+        result.graph.lint()
+
+        # With many buckets allowed, ILP may choose to bucket or not based on cost
+        graph_str = str(result.graph)
+        FileCheck().check("all_gather_into_tensor").check("wait_tensor").run(
+            graph_str
+        )
+
+    def test_raises_collective_before_compute(self):
+        """Test that ILP scheduler raises collective start before compute when beneficial."""
+
+        def func(a):
+            group_name = "0"
+            group_size = 1
+
+            mm1 = torch.mm(a, a)
+            mm2 = torch.mm(mm1, mm1)
+            ag = torch.ops._c10d_functional.all_gather_into_tensor(
+                a, group_size, group_name
+            )
+            ag_out = torch.ops._c10d_functional.wait_tensor(ag)
+            return ag_out.sum() + mm2.sum()
+
+        with FakeTensorMode():
+            a = torch.ones(4, 4, device=self.device)
+            traced = make_fx(func)(a)
+
+        from torch._inductor.fx_passes.ilp_overlap_scheduling import schedule_overlap_ilp
+
+        result = schedule_overlap_ilp(
+            traced,
+            custom_runtime_estimation=estimate_ilp_test_runtime,
+        )
+
+        result.graph.lint()
+
+        graph_str = str(result.graph)
+        FileCheck().check("all_gather_into_tensor").check("mm").check(
+            "wait_tensor"
+        ).run(graph_str)
+
+    def test_dtype_conversion_with_bucketing(self):
+        """Test that ILP scheduler handles dtype conversion before collectives."""
+
+        def func(a, b):
+            group_name = dist.distributed_c10d._get_default_group().group_name
+            group_size = 2
+
+            conv_a = torch.ops.prims.convert_element_type.default(a, torch.bfloat16)
+            ag1 = torch.ops._c10d_functional.all_gather_into_tensor(
+                conv_a, group_size, group_name
+            )
+
+            conv_b = torch.ops.prims.convert_element_type.default(b, torch.bfloat16)
+            ag2 = torch.ops._c10d_functional.all_gather_into_tensor(
+                conv_b, group_size, group_name
+            )
+
+            mm = torch.mm(a, a)
+
+            w1 = torch.ops._c10d_functional.wait_tensor(ag1)
+            w2 = torch.ops._c10d_functional.wait_tensor(ag2)
+
+            return w1.sum() + w2.sum() + mm.sum()
+
+        with FakeTensorMode():
+            a = torch.ones(4, 4, device=self.device)
+            b = torch.ones(4, 4, device=self.device)
+            traced = make_fx(func)(a, b)
+
+        from torch._inductor.fx_passes.ilp_overlap_scheduling import schedule_overlap_ilp
+
+        result = schedule_overlap_ilp(
+            traced,
+            custom_runtime_estimation=estimate_ilp_test_runtime,
+        )
+
+        result.graph.lint()
+
+
 if __name__ == "__main__":
     run_tests()

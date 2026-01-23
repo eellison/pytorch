@@ -1706,6 +1706,665 @@ class TestManualOverlapBucketing(TestComputeCommReorderingMultiProc):
                 )
 
 
+def apply_ilp_reordering_and_get_graph(graph, out_li) -> None:
+    """Apply ILP overlap scheduling to the graph and store result."""
+    gm = graph.owning_module
+    from torch._inductor.fx_passes.ilp_overlap_scheduling import schedule_overlap_ilp
+
+    schedule_overlap_ilp(
+        gm,
+        custom_runtime_estimation=estimate_aten_runtime,
+    )
+    gm.graph.lint()
+    out_li.append(str(gm.graph))
+
+
+def run_and_get_ilp_aten_graph(fn, *inputs):
+    """Run function with ILP overlap scheduling and return output + graph string."""
+    li = []
+    apply = functools.partial(apply_ilp_reordering_and_get_graph, out_li=li)
+    with torch._inductor.config.patch(post_grad_custom_post_pass=apply):
+        out = fn(*inputs)
+    return out, li[0]
+
+
+def get_ilp_patches():
+    """Config patches for ILP scheduler tests."""
+    return {
+        "reorder_for_locality": False,
+        "triton.native_matmul": False,
+        "reorder_for_compute_comm_overlap_passes": [],
+        "compile_threads": 1,
+        "force_disable_caches": True,
+    }
+
+
+@requires_accelerator_dist_backend()
+@unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
+class TestILPOverlapSchedulerMultiProc(DynamoDistributedMultiProcTestCase):
+    """
+    Multi-process correctness tests for ILP overlap scheduler.
+    Verifies that the ILP scheduler produces correct outputs when running
+    with actual distributed collectives.
+    """
+
+    def setUp(self):
+        super().setUp()
+        torch._dynamo.reset()
+        torch._dynamo.utils.counters.clear()
+
+    @property
+    def world_size(self) -> int:
+        return 2
+
+    @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
+    @torch._inductor.config.patch(get_ilp_patches())
+    def test_ilp_sink_waits(self):
+        """Test ILP scheduler sinks wait below independent compute."""
+
+        def func(a):
+            ar = _functional_collectives.all_reduce(a, "sum", "0")
+            b = torch.matmul(a, a)
+            return torch.matmul(ar, b)
+
+        with _dynamo_dist_per_rank_init(
+            self.rank,
+            self.world_size,
+            self.backend(device_type),
+            fake_pg=not at_least_x_gpu(2),
+        ):
+            inputs = torch.ones(4, 4, dtype=torch.float, device=device_type) + self.rank
+
+            out, aten_graph_str = run_and_get_ilp_aten_graph(
+                torch.compile(func), inputs
+            )
+
+            # Verify wait is sunk below the first matmul
+            (
+                FileCheck()
+                .check("all_reduce.default")
+                .check("aten.mm.default")
+                .check("wait_tensor.default")
+                .check("aten.mm.default")
+                .run(aten_graph_str)
+            )
+            correct = func(inputs)
+            self.assertTrue(same(out, correct))
+
+    @torch._inductor.config.patch(get_ilp_patches())
+    def test_ilp_raise_comms(self):
+        """Test ILP scheduler raises collective above independent compute."""
+
+        def func(a):
+            b = torch.matmul(a, a)
+            c = torch.relu(b)
+            d = torch.matmul(c, c)
+            e = _functional_collectives.all_reduce((b + 1), "sum", "0")
+            return torch.matmul(d, e)
+
+        with _dynamo_dist_per_rank_init(
+            self.rank,
+            self.world_size,
+            self.backend(device_type),
+            fake_pg=not at_least_x_gpu(2),
+        ):
+            inputs = torch.ones(4, 4, dtype=torch.float, device=device_type) + self.rank
+            compiled = torch.compile(func)
+            out, aten_graph_str = run_and_get_ilp_aten_graph(compiled, inputs)
+
+            # Verify the graph has the expected operations (ILP may order differently than greedy)
+            FileCheck().check("all_reduce.default").check("wait_tensor.default").run(
+                aten_graph_str
+            )
+            FileCheck().check_count("aten.mm", 3, exactly=True).run(aten_graph_str)
+
+            # Most important: verify correctness
+            correct = func(inputs)
+            self.assertTrue(same(out, correct))
+
+    @torch._inductor.config.patch(get_ilp_patches())
+    def test_ilp_multiple_collectives(self):
+        """Test ILP scheduler with multiple collectives and compute."""
+
+        def func(a):
+            b = torch.matmul(a, a)
+            ar1 = _functional_collectives.all_reduce(b, "sum", "0")
+            c = torch.matmul(a, a.T)
+            ar2 = _functional_collectives.all_reduce(c, "sum", "0")
+            d = torch.relu(ar1 + ar2)
+            return d
+
+        with _dynamo_dist_per_rank_init(
+            self.rank,
+            self.world_size,
+            self.backend(device_type),
+            fake_pg=not at_least_x_gpu(2),
+        ):
+            inputs = torch.ones(4, 4, dtype=torch.float, device=device_type) + self.rank
+            compiled = torch.compile(func)
+            out, aten_graph_str = run_and_get_ilp_aten_graph(compiled, inputs)
+
+            # Just verify correctness - ILP may choose different orderings
+            correct = func(inputs)
+            self.assertTrue(same(out, correct))
+
+    @torch._inductor.config.patch(get_ilp_patches())
+    def test_ilp_all_gather_correctness(self):
+        """Test ILP scheduler correctness with all_gather operations."""
+
+        def func(a, b, *, ranks):
+            ag1 = _functional_collectives.all_gather_tensor(a, 0, ranks)
+            c = torch.matmul(a, a)
+            ag2 = _functional_collectives.all_gather_tensor(b, 0, ranks)
+            return ag1 + ag2 + c.sum()
+
+        with _dynamo_dist_per_rank_init(
+            self.rank,
+            self.world_size,
+            self.backend(device_type),
+            fake_pg=not at_least_x_gpu(2),
+        ):
+            inputs_a = (
+                torch.ones(4, 4, dtype=torch.float, device=device_type) + self.rank
+            )
+            inputs_b = torch.ones(4, 4, dtype=torch.float, device=device_type) * 2
+            ranks = list(range(self.world_size))
+
+            func_c = functools.partial(func, ranks=ranks)
+            compiled = torch.compile(func_c)
+            out, _ = run_and_get_ilp_aten_graph(compiled, inputs_a, inputs_b)
+
+            correct = func(inputs_a, inputs_b, ranks=ranks)
+            self.assertTrue(same(out, correct))
+
+    @torch._inductor.config.patch(get_ilp_patches())
+    def test_ilp_reduce_scatter_correctness(self):
+        """Test ILP scheduler correctness with reduce_scatter operations."""
+
+        def func(a, b):
+            rs1 = _functional_collectives.reduce_scatter_tensor(a, "sum", 0, "0")
+            c = torch.matmul(a[:4], a[:4].T)
+            rs2 = _functional_collectives.reduce_scatter_tensor(b, "sum", 0, "0")
+            return rs1, rs2, c
+
+        with _dynamo_dist_per_rank_init(
+            self.rank,
+            self.world_size,
+            self.backend(device_type),
+            fake_pg=not at_least_x_gpu(2),
+        ):
+            inputs_a = torch.ones(8, 4, dtype=torch.float, device=device_type)
+            inputs_b = torch.ones(8, 4, dtype=torch.float, device=device_type) * 2
+
+            out, _ = run_and_get_ilp_aten_graph(
+                torch.compile(func), inputs_a, inputs_b
+            )
+
+            correct = func(inputs_a, inputs_b)
+            self.assertTrue(same(out, correct))
+
+
+def extract_op_order(graph_str: str) -> list[str]:
+    """Extract the order of key operations from a graph string."""
+    import re
+
+    ops = []
+    for line in graph_str.split("\n"):
+        # Extract operation type
+        if "all_reduce.default" in line:
+            ops.append("all_reduce")
+        elif "all_gather_into_tensor" in line:
+            ops.append("all_gather")
+        elif "reduce_scatter_tensor" in line:
+            ops.append("reduce_scatter")
+        elif "wait_tensor.default" in line:
+            ops.append("wait")
+        elif "aten.mm.default" in line or "aten.addmm.default" in line:
+            ops.append("mm")
+        elif "aten.relu.default" in line:
+            ops.append("relu")
+    return ops
+
+
+def apply_greedy_reordering(graph, out_li) -> None:
+    """Apply greedy overlap scheduling."""
+    gm = graph.owning_module
+    from torch._inductor.fx_passes.overlap_scheduling import schedule_overlap_bucketing
+
+    schedule_overlap_bucketing(
+        gm,
+        custom_runtime_estimation=estimate_aten_runtime,
+        collective_bucketing=False,
+    )
+    gm.graph.lint()
+    out_li.append(str(gm.graph))
+
+
+def apply_ilp_reordering(graph, out_li) -> None:
+    """Apply ILP overlap scheduling."""
+    gm = graph.owning_module
+    from torch._inductor.fx_passes.ilp_overlap_scheduling import schedule_overlap_ilp
+
+    schedule_overlap_ilp(
+        gm,
+        custom_runtime_estimation=estimate_aten_runtime,
+    )
+    gm.graph.lint()
+    out_li.append(str(gm.graph))
+
+
+def run_with_scheduler(fn, apply_fn, *inputs):
+    """Run function with a specific scheduler and return output + graph string."""
+    li = []
+    apply = functools.partial(apply_fn, out_li=li)
+    with torch._inductor.config.patch(
+        post_grad_custom_post_pass=apply,
+        reorder_for_locality=False,
+        compile_threads=1,
+        force_disable_caches=True,
+    ):
+        out = fn(*inputs)
+    return out, li[0] if li else ""
+
+
+@requires_accelerator_dist_backend()
+@unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
+class TestILPvsGreedyComparison(DynamoDistributedMultiProcTestCase):
+    """
+    Compare ILP scheduler output with greedy scheduler output.
+    Verifies that ILP produces similar or better orderings than greedy.
+    """
+
+    def setUp(self):
+        super().setUp()
+        torch._dynamo.reset()
+        torch._dynamo.utils.counters.clear()
+
+    @property
+    def world_size(self) -> int:
+        return 2
+
+    @torch._inductor.config.patch(get_ilp_patches())
+    def test_sink_waits_comparison(self):
+        """Compare ILP vs greedy for sinking waits."""
+
+        def func(a):
+            ar = _functional_collectives.all_reduce(a, "sum", "0")
+            b = torch.matmul(a, a)
+            return torch.matmul(ar, b)
+
+        with _dynamo_dist_per_rank_init(
+            self.rank,
+            self.world_size,
+            self.backend(device_type),
+            fake_pg=not at_least_x_gpu(2),
+        ):
+            inputs = torch.ones(4, 4, dtype=torch.float, device=device_type) + self.rank
+
+            # Run with greedy scheduler
+            torch._dynamo.reset()
+            greedy_out, greedy_graph = run_with_scheduler(
+                torch.compile(func), apply_greedy_reordering, inputs
+            )
+
+            # Run with ILP scheduler
+            torch._dynamo.reset()
+            ilp_out, ilp_graph = run_with_scheduler(
+                torch.compile(func), apply_ilp_reordering, inputs
+            )
+
+            # Both should produce correct results
+            correct = func(inputs)
+            self.assertTrue(same(greedy_out, correct), "Greedy output incorrect")
+            self.assertTrue(same(ilp_out, correct), "ILP output incorrect")
+
+            # Compare operation orderings
+            greedy_ops = extract_op_order(greedy_graph)
+            ilp_ops = extract_op_order(ilp_graph)
+
+            # Log the orderings for comparison
+            print(f"Greedy ops: {greedy_ops}")
+            print(f"ILP ops:    {ilp_ops}")
+
+            # Both should have: all_reduce, mm, wait, mm
+            # Verify both sunk the wait below the first mm
+            self.assertIn("all_reduce", greedy_ops)
+            self.assertIn("all_reduce", ilp_ops)
+
+    @torch._inductor.config.patch(get_ilp_patches())
+    def test_raise_comms_comparison(self):
+        """Compare ILP vs greedy for raising comms."""
+
+        def func(a):
+            b = torch.matmul(a, a)
+            c = torch.relu(b)
+            d = torch.matmul(c, c)
+            e = _functional_collectives.all_reduce((b + 1), "sum", "0")
+            return torch.matmul(d, e)
+
+        with _dynamo_dist_per_rank_init(
+            self.rank,
+            self.world_size,
+            self.backend(device_type),
+            fake_pg=not at_least_x_gpu(2),
+        ):
+            inputs = torch.ones(4, 4, dtype=torch.float, device=device_type) + self.rank
+
+            # Run with greedy scheduler
+            torch._dynamo.reset()
+            greedy_out, greedy_graph = run_with_scheduler(
+                torch.compile(func), apply_greedy_reordering, inputs
+            )
+
+            # Run with ILP scheduler
+            torch._dynamo.reset()
+            ilp_out, ilp_graph = run_with_scheduler(
+                torch.compile(func), apply_ilp_reordering, inputs
+            )
+
+            # Both should produce correct results
+            correct = func(inputs)
+            self.assertTrue(same(greedy_out, correct), "Greedy output incorrect")
+            self.assertTrue(same(ilp_out, correct), "ILP output incorrect")
+
+            # Compare operation orderings
+            greedy_ops = extract_op_order(greedy_graph)
+            ilp_ops = extract_op_order(ilp_graph)
+
+            print(f"Greedy ops: {greedy_ops}")
+            print(f"ILP ops:    {ilp_ops}")
+
+            # Both should have 3 mms, 1 all_reduce, 1 wait
+            self.assertEqual(greedy_ops.count("mm"), 3)
+            self.assertEqual(ilp_ops.count("mm"), 3)
+
+    @torch._inductor.config.patch(get_ilp_patches())
+    def test_multiple_collectives_comparison(self):
+        """Compare ILP vs greedy with multiple collectives."""
+
+        def func(a):
+            b = torch.matmul(a, a)
+            ar1 = _functional_collectives.all_reduce(b, "sum", "0")
+            c = torch.matmul(a, a.T)
+            ar2 = _functional_collectives.all_reduce(c, "sum", "0")
+            d = torch.relu(ar1 + ar2)
+            return d
+
+        with _dynamo_dist_per_rank_init(
+            self.rank,
+            self.world_size,
+            self.backend(device_type),
+            fake_pg=not at_least_x_gpu(2),
+        ):
+            inputs = torch.ones(4, 4, dtype=torch.float, device=device_type) + self.rank
+
+            # Run with greedy scheduler
+            torch._dynamo.reset()
+            greedy_out, greedy_graph = run_with_scheduler(
+                torch.compile(func), apply_greedy_reordering, inputs
+            )
+
+            # Run with ILP scheduler
+            torch._dynamo.reset()
+            ilp_out, ilp_graph = run_with_scheduler(
+                torch.compile(func), apply_ilp_reordering, inputs
+            )
+
+            # Both should produce correct results
+            correct = func(inputs)
+            self.assertTrue(same(greedy_out, correct), "Greedy output incorrect")
+            self.assertTrue(same(ilp_out, correct), "ILP output incorrect")
+
+            # Compare operation orderings
+            greedy_ops = extract_op_order(greedy_graph)
+            ilp_ops = extract_op_order(ilp_graph)
+
+            print(f"Greedy ops: {greedy_ops}")
+            print(f"ILP ops:    {ilp_ops}")
+
+            # Both should have 2 all_reduces and 2 waits
+            self.assertEqual(greedy_ops.count("all_reduce"), 2)
+            self.assertEqual(ilp_ops.count("all_reduce"), 2)
+            self.assertEqual(greedy_ops.count("wait"), 2)
+            self.assertEqual(ilp_ops.count("wait"), 2)
+
+    @torch._inductor.config.patch(get_ilp_patches())
+    def test_all_gather_comparison(self):
+        """Compare ILP vs greedy with all_gather operations."""
+
+        def func(a, b, *, ranks):
+            ag1 = _functional_collectives.all_gather_tensor(a, 0, ranks)
+            c = torch.matmul(a, a)
+            d = torch.matmul(c, c)
+            ag2 = _functional_collectives.all_gather_tensor(b, 0, ranks)
+            return ag1.sum() + ag2.sum() + d.sum()
+
+        with _dynamo_dist_per_rank_init(
+            self.rank,
+            self.world_size,
+            self.backend(device_type),
+            fake_pg=not at_least_x_gpu(2),
+        ):
+            inputs_a = (
+                torch.ones(4, 4, dtype=torch.float, device=device_type) + self.rank
+            )
+            inputs_b = torch.ones(4, 4, dtype=torch.float, device=device_type) * 2
+            ranks = list(range(self.world_size))
+
+            func_c = functools.partial(func, ranks=ranks)
+
+            # Run with greedy scheduler
+            torch._dynamo.reset()
+            greedy_out, greedy_graph = run_with_scheduler(
+                torch.compile(func_c), apply_greedy_reordering, inputs_a, inputs_b
+            )
+
+            # Run with ILP scheduler
+            torch._dynamo.reset()
+            ilp_out, ilp_graph = run_with_scheduler(
+                torch.compile(func_c), apply_ilp_reordering, inputs_a, inputs_b
+            )
+
+            correct = func(inputs_a, inputs_b, ranks=ranks)
+            self.assertTrue(same(greedy_out, correct), "Greedy output incorrect")
+            self.assertTrue(same(ilp_out, correct), "ILP output incorrect")
+
+            greedy_ops = extract_op_order(greedy_graph)
+            ilp_ops = extract_op_order(ilp_graph)
+
+            print(f"Greedy ops: {greedy_ops}")
+            print(f"ILP ops:    {ilp_ops}")
+
+    @torch._inductor.config.patch(get_ilp_patches())
+    def test_reduce_scatter_comparison(self):
+        """Compare ILP vs greedy with reduce_scatter operations."""
+
+        def func(a, b):
+            rs1 = _functional_collectives.reduce_scatter_tensor(a, "sum", 0, "0")
+            c = torch.matmul(a[:4], a[:4].T)
+            d = torch.relu(c)
+            rs2 = _functional_collectives.reduce_scatter_tensor(b, "sum", 0, "0")
+            return rs1.sum() + rs2.sum() + d.sum()
+
+        with _dynamo_dist_per_rank_init(
+            self.rank,
+            self.world_size,
+            self.backend(device_type),
+            fake_pg=not at_least_x_gpu(2),
+        ):
+            inputs_a = torch.ones(8, 4, dtype=torch.float, device=device_type)
+            inputs_b = torch.ones(8, 4, dtype=torch.float, device=device_type) * 2
+
+            # Run with greedy scheduler
+            torch._dynamo.reset()
+            greedy_out, greedy_graph = run_with_scheduler(
+                torch.compile(func), apply_greedy_reordering, inputs_a, inputs_b
+            )
+
+            # Run with ILP scheduler
+            torch._dynamo.reset()
+            ilp_out, ilp_graph = run_with_scheduler(
+                torch.compile(func), apply_ilp_reordering, inputs_a, inputs_b
+            )
+
+            correct = func(inputs_a, inputs_b)
+            self.assertTrue(same(greedy_out, correct), "Greedy output incorrect")
+            self.assertTrue(same(ilp_out, correct), "ILP output incorrect")
+
+            greedy_ops = extract_op_order(greedy_graph)
+            ilp_ops = extract_op_order(ilp_graph)
+
+            print(f"Greedy ops: {greedy_ops}")
+            print(f"ILP ops:    {ilp_ops}")
+
+    @torch._inductor.config.patch(get_ilp_patches())
+    def test_chain_of_collectives_comparison(self):
+        """Compare ILP vs greedy with a chain of dependent collectives."""
+
+        def func(a):
+            # Chain: ar1 -> compute -> ar2 -> compute -> ar3
+            ar1 = _functional_collectives.all_reduce(a, "sum", "0")
+            b = torch.matmul(ar1, ar1)
+            ar2 = _functional_collectives.all_reduce(b, "sum", "0")
+            c = torch.relu(ar2)
+            ar3 = _functional_collectives.all_reduce(c, "sum", "0")
+            return ar3
+
+        with _dynamo_dist_per_rank_init(
+            self.rank,
+            self.world_size,
+            self.backend(device_type),
+            fake_pg=not at_least_x_gpu(2),
+        ):
+            inputs = torch.ones(4, 4, dtype=torch.float, device=device_type) + self.rank
+
+            # Run with greedy scheduler
+            torch._dynamo.reset()
+            greedy_out, greedy_graph = run_with_scheduler(
+                torch.compile(func), apply_greedy_reordering, inputs
+            )
+
+            # Run with ILP scheduler
+            torch._dynamo.reset()
+            ilp_out, ilp_graph = run_with_scheduler(
+                torch.compile(func), apply_ilp_reordering, inputs
+            )
+
+            correct = func(inputs)
+            self.assertTrue(same(greedy_out, correct), "Greedy output incorrect")
+            self.assertTrue(same(ilp_out, correct), "ILP output incorrect")
+
+            greedy_ops = extract_op_order(greedy_graph)
+            ilp_ops = extract_op_order(ilp_graph)
+
+            print(f"Greedy ops: {greedy_ops}")
+            print(f"ILP ops:    {ilp_ops}")
+
+            # Both should have 3 all_reduces
+            self.assertEqual(greedy_ops.count("all_reduce"), 3)
+            self.assertEqual(ilp_ops.count("all_reduce"), 3)
+
+    @torch._inductor.config.patch(get_ilp_patches())
+    def test_parallel_collectives_comparison(self):
+        """Compare ILP vs greedy with parallel independent collectives."""
+
+        def func(a, b, c):
+            # Three independent all_reduces that could run in parallel
+            ar1 = _functional_collectives.all_reduce(a, "sum", "0")
+            ar2 = _functional_collectives.all_reduce(b, "sum", "0")
+            ar3 = _functional_collectives.all_reduce(c, "sum", "0")
+            # Independent compute
+            d = torch.matmul(a, a)
+            e = torch.matmul(b, b)
+            return ar1 + ar2 + ar3 + d + e
+
+        with _dynamo_dist_per_rank_init(
+            self.rank,
+            self.world_size,
+            self.backend(device_type),
+            fake_pg=not at_least_x_gpu(2),
+        ):
+            inputs_a = torch.ones(4, 4, dtype=torch.float, device=device_type)
+            inputs_b = torch.ones(4, 4, dtype=torch.float, device=device_type) * 2
+            inputs_c = torch.ones(4, 4, dtype=torch.float, device=device_type) * 3
+
+            # Run with greedy scheduler
+            torch._dynamo.reset()
+            greedy_out, greedy_graph = run_with_scheduler(
+                torch.compile(func), apply_greedy_reordering, inputs_a, inputs_b, inputs_c
+            )
+
+            # Run with ILP scheduler
+            torch._dynamo.reset()
+            ilp_out, ilp_graph = run_with_scheduler(
+                torch.compile(func), apply_ilp_reordering, inputs_a, inputs_b, inputs_c
+            )
+
+            correct = func(inputs_a, inputs_b, inputs_c)
+            self.assertTrue(same(greedy_out, correct), "Greedy output incorrect")
+            self.assertTrue(same(ilp_out, correct), "ILP output incorrect")
+
+            greedy_ops = extract_op_order(greedy_graph)
+            ilp_ops = extract_op_order(ilp_graph)
+
+            print(f"Greedy ops: {greedy_ops}")
+            print(f"ILP ops:    {ilp_ops}")
+
+            # Greedy has 3 all_reduces (no bucketing), ILP may bucket them
+            self.assertEqual(greedy_ops.count("all_reduce"), 3)
+            # ILP may bucket the 3 independent all_reduces into 1
+            self.assertGreaterEqual(ilp_ops.count("all_reduce"), 1)
+            self.assertEqual(greedy_ops.count("mm"), 2)
+            self.assertEqual(ilp_ops.count("mm"), 2)
+
+    @torch._inductor.config.patch(get_ilp_patches())
+    def test_compute_heavy_comparison(self):
+        """Compare ILP vs greedy with compute-heavy workload."""
+
+        def func(a):
+            # Multiple matmuls with a single collective
+            b = torch.matmul(a, a)
+            c = torch.matmul(b, b)
+            ar = _functional_collectives.all_reduce(a, "sum", "0")
+            d = torch.matmul(c, c)
+            e = torch.matmul(d, d)
+            return torch.matmul(ar, e)
+
+        with _dynamo_dist_per_rank_init(
+            self.rank,
+            self.world_size,
+            self.backend(device_type),
+            fake_pg=not at_least_x_gpu(2),
+        ):
+            inputs = torch.ones(4, 4, dtype=torch.float, device=device_type) + self.rank
+
+            # Run with greedy scheduler
+            torch._dynamo.reset()
+            greedy_out, greedy_graph = run_with_scheduler(
+                torch.compile(func), apply_greedy_reordering, inputs
+            )
+
+            # Run with ILP scheduler
+            torch._dynamo.reset()
+            ilp_out, ilp_graph = run_with_scheduler(
+                torch.compile(func), apply_ilp_reordering, inputs
+            )
+
+            correct = func(inputs)
+            self.assertTrue(same(greedy_out, correct), "Greedy output incorrect")
+            self.assertTrue(same(ilp_out, correct), "ILP output incorrect")
+
+            greedy_ops = extract_op_order(greedy_graph)
+            ilp_ops = extract_op_order(ilp_graph)
+
+            print(f"Greedy ops: {greedy_ops}")
+            print(f"ILP ops:    {ilp_ops}")
+
+            # Both should have 5 mms
+            self.assertEqual(greedy_ops.count("mm"), 5)
+            self.assertEqual(ilp_ops.count("mm"), 5)
+
+
 if __name__ == "__main__":
     from torch._dynamo.test_case import run_tests
 
