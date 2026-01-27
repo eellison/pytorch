@@ -740,7 +740,7 @@ def add_utilization_annotations(
     This function augments a Chrome trace with performance utilization metrics by:
     1. First ensuring kernel_flop and kernel_num_gb are present (via _augment_trace_helper)
     2. Computing achieved FLOPS% and bandwidth% based on device peak specs
-    3. Computing roofline metrics (arithmetic intensity, ridge point, roofline efficiency)
+    3. Computing roofline metrics (arithmetic intensity, roofline efficiency)
 
     Args:
         data: Chrome trace data (dict with "traceEvents" key)
@@ -755,7 +755,6 @@ def add_utilization_annotations(
 
     Roofline metrics added:
         - arithmetic_intensity: FLOP/byte ratio for the kernel
-        - ridge_point: Device's ridge point (peak_flops / peak_bandwidth)
         - roofline_ceiling_tflops: Theoretical max performance for this kernel
         - roofline_bound: "memory" or "compute" indicating the limiting factor
         - roofline_efficiency_percent: Actual performance / roofline ceiling
@@ -879,9 +878,8 @@ def add_utilization_annotations(
 
         # Calculate roofline metrics
         if kernel_num_gb > 0 and peak_tflops > 0:
-            # Ridge point: where compute and memory ceilings meet
+            # Ridge point: where compute and memory ceilings meet (used internally)
             ridge_point = peak_flops / peak_bw
-            event["args"]["ridge_point"] = ridge_point
 
             if kernel_flop > 0:
                 # Standard roofline: kernel has both FLOPS and memory access
