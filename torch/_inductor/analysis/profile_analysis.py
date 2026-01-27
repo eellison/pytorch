@@ -729,6 +729,269 @@ class ParseException(RuntimeError):
     pass
 
 
+def add_utilization_annotations(
+    data: dict[str, Any],
+    device_name: Optional[str] = None,
+    dtype: Optional[Union[torch.dtype, str]] = None,
+) -> dict[str, Any]:
+    """
+    Add achieved_flops_percent and achieved_bandwidth_percent annotations to trace events.
+
+    This function augments a Chrome trace with performance utilization metrics by:
+    1. First ensuring kernel_flop and kernel_num_gb are present (via _augment_trace_helper)
+    2. Computing achieved FLOPS% and bandwidth% based on device peak specs
+
+    Args:
+        data: Chrome trace data (dict with "traceEvents" key)
+        device_name: Optional device name to use for looking up peak specs.
+                    If None, will try to infer from trace's deviceProperties.
+        dtype: Optional dtype to use for FLOPS calculation. If None, will try
+               to infer from each event's input types.
+
+    Returns:
+        The augmented trace data with achieved_flops_percent and achieved_bandwidth_percent
+        added to kernel events that have flop/bandwidth information.
+    """
+    # First ensure we have kernel_flop and kernel_num_gb
+    data = _augment_trace_helper(data)
+
+    # Look up device info
+    device_info = None
+    if device_name is not None:
+        device_info = lookup_device_info(device_name)
+    elif "deviceProperties" in data and len(data["deviceProperties"]) > 0:
+        # Try to get device info from trace
+        for dev_prop in data["deviceProperties"]:
+            if "name" in dev_prop:
+                device_info = lookup_device_info(dev_prop["name"])
+                if device_info is not None:
+                    break
+
+    if device_info is None:
+        log.warning(
+            "Could not find device info for utilization annotations. "
+            "Specify device_name or ensure trace has deviceProperties."
+        )
+        return data
+
+    # Parse dtype if string
+    resolved_dtype: Optional[torch.dtype] = None
+    if dtype is not None:
+        if isinstance(dtype, torch.dtype):
+            resolved_dtype = dtype
+        elif dtype in _dtype_map:
+            resolved_dtype = _dtype_map[dtype]
+
+    # Add utilization annotations to kernel events and CPU ops with kernel metadata
+    # (Triton kernels may appear as cpu_op with kernel_flop/kernel_num_gb in args)
+    for event in data["traceEvents"]:
+        cat = event.get("cat", "")
+        args = event.get("args", {})
+
+        # Skip events that don't have duration or args
+        if "args" not in event or "dur" not in event:
+            continue
+
+        # Process kernel events OR cpu_op events that have kernel metadata
+        is_kernel_event = cat == "kernel"
+        has_kernel_metadata = "kernel_flop" in args or "kernel_num_gb" in args
+        if not is_kernel_event and not has_kernel_metadata:
+            continue
+
+        dur = event["dur"]  # microseconds
+        if dur == 0:
+            continue
+
+        # Calculate achieved FLOPS%
+        if "kernel_flop" in event["args"] and event["args"]["kernel_flop"] != 0:
+            op_flops = event["args"]["kernel_flop"] / (dur / 1e6)  # FLOPS/s
+
+            # Determine dtype for this event
+            event_dtype = resolved_dtype
+            if event_dtype is None:
+                # Try to infer from event
+                if "Input type" in event["args"]:
+                    input_types = event["args"]["Input type"]
+                    if isinstance(input_types, list) and len(input_types) > 0:
+                        type_str = input_types[0]
+                        if type_str in _dtype_map:
+                            event_dtype = _dtype_map[type_str]
+                # Try from kernel name
+                if event_dtype is None:
+                    name = event.get("name", "")
+                    if "bfloat16" in name:
+                        event_dtype = torch.bfloat16
+                    elif "float16" in name:
+                        event_dtype = torch.float16
+                    else:
+                        event_dtype = torch.float32  # Default
+
+            if event_dtype in device_info.tops:
+                peak_tflops = device_info.tops[event_dtype]
+                achieved_flops_pct = 100 * op_flops / (peak_tflops * 1e12)
+                event["args"]["achieved_flops_percent"] = achieved_flops_pct
+
+        # Calculate achieved bandwidth%
+        if "kernel_num_gb" in event["args"] and event["args"]["kernel_num_gb"] != 0:
+            op_gbps = event["args"]["kernel_num_gb"] / (dur / 1e6)  # GB/s
+            achieved_bw_pct = 100 * op_gbps / device_info.dram_bw_gbs
+            event["args"]["achieved_bandwidth_percent"] = achieved_bw_pct
+
+    return data
+
+
+def augment_trace_file(
+    input_path: str,
+    output_path: Optional[str] = None,
+    device_name: Optional[str] = None,
+    dtype: Optional[Union[torch.dtype, str]] = None,
+    add_utilization: bool = True,
+) -> str:
+    """
+    Augment a Chrome trace file with FLOPS, bandwidth, and utilization annotations.
+
+    This is a convenience function for augmenting trace files with performance metrics.
+    It can be used as a post-processing step after profiler.export_chrome_trace().
+
+    Args:
+        input_path: Path to the input Chrome trace JSON file.
+        output_path: Path to write the augmented trace. If None, overwrites input_path.
+        device_name: Optional device name for utilization calculations.
+        dtype: Optional dtype for FLOPS calculations.
+        add_utilization: If True, also adds achieved_flops_percent and
+                        achieved_bandwidth_percent. Requires device info.
+
+    Returns:
+        The path to the output file.
+
+    Example:
+        >>> from torch.profiler import profile, ProfilerActivity
+        >>> with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        ...     # Do some work
+        ...     pass
+        >>> prof.export_chrome_trace("trace.json")
+        >>> # Now augment the trace with utilization metrics
+        >>> from torch._inductor.analysis.profile_analysis import augment_trace_file
+        >>> augment_trace_file("trace.json", device_name="NVIDIA H100")
+    """
+    with open(input_path) as f:
+        data = json.load(f)
+
+    # Always run basic augmentation
+    data = _augment_trace_helper(data)
+
+    # Optionally add utilization annotations
+    if add_utilization:
+        data = add_utilization_annotations(data, device_name=device_name, dtype=dtype)
+
+    # Write output
+    if output_path is None:
+        output_path = input_path
+
+    with open(output_path, "w") as f:
+        json.dump(data, f)
+
+    return output_path
+
+
+# Global list of callbacks to run before profiler export
+_profiler_export_callbacks: list[Callable[[dict[str, Any]], dict[str, Any]]] = []
+
+
+def register_profiler_export_callback(
+    callback: Callable[[dict[str, Any]], dict[str, Any]]
+) -> None:
+    """
+    Register a callback to run before profiler trace export.
+
+    The callback receives the trace data dict and should return the modified dict.
+    Multiple callbacks are executed in registration order.
+
+    This allows automatic augmentation of profiler traces with metrics like
+    FLOPS utilization and bandwidth utilization.
+
+    Args:
+        callback: A function that takes trace data dict and returns modified dict.
+
+    Example:
+        >>> from torch._inductor.analysis.profile_analysis import (
+        ...     register_profiler_export_callback,
+        ...     add_utilization_annotations,
+        ... )
+        >>> # Register callback to automatically add utilization metrics
+        >>> def my_callback(data):
+        ...     return add_utilization_annotations(data, device_name="NVIDIA H100")
+        >>> register_profiler_export_callback(my_callback)
+    """
+    _profiler_export_callbacks.append(callback)
+
+
+def unregister_profiler_export_callback(
+    callback: Callable[[dict[str, Any]], dict[str, Any]]
+) -> None:
+    """Remove a previously registered profiler export callback."""
+    if callback in _profiler_export_callbacks:
+        _profiler_export_callbacks.remove(callback)
+
+
+def clear_profiler_export_callbacks() -> None:
+    """Remove all registered profiler export callbacks."""
+    _profiler_export_callbacks.clear()
+
+
+def run_profiler_export_callbacks(data: dict[str, Any]) -> dict[str, Any]:
+    """
+    Run all registered profiler export callbacks on the trace data.
+
+    This function is called by the profiler hook system before saving traces.
+    Users typically don't need to call this directly.
+
+    Args:
+        data: The Chrome trace data dict.
+
+    Returns:
+        The modified trace data after all callbacks have been applied.
+    """
+    for callback in _profiler_export_callbacks:
+        try:
+            data = callback(data)
+        except Exception as e:
+            log.warning("Profiler export callback failed: %s", e)
+    return data
+
+
+def create_utilization_callback(
+    device_name: Optional[str] = None,
+    dtype: Optional[Union[torch.dtype, str]] = None,
+) -> Callable[[dict[str, Any]], dict[str, Any]]:
+    """
+    Create a callback that adds utilization annotations to traces.
+
+    This is a convenience function for creating callbacks to register with
+    register_profiler_export_callback().
+
+    Args:
+        device_name: Device name for looking up peak specs.
+        dtype: Dtype for FLOPS calculations.
+
+    Returns:
+        A callback function suitable for register_profiler_export_callback().
+
+    Example:
+        >>> from torch._inductor.analysis.profile_analysis import (
+        ...     register_profiler_export_callback,
+        ...     create_utilization_callback,
+        ... )
+        >>> callback = create_utilization_callback(device_name="NVIDIA H100")
+        >>> register_profiler_export_callback(callback)
+    """
+
+    def callback(data: dict[str, Any]) -> dict[str, Any]:
+        return add_utilization_annotations(data, device_name=device_name, dtype=dtype)
+
+    return callback
+
+
 def main() -> None:
     """
     Main function for the profile analysis script.

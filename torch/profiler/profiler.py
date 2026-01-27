@@ -279,6 +279,11 @@ class _KinetoProfile:
         """
         Exports the collected trace in Chrome JSON format. If kineto is enabled, only
         last cycle in schedule is exported.
+
+        If there are registered profiler export callbacks (via
+        ``torch._inductor.analysis.profile_analysis.register_profiler_export_callback``),
+        they will be executed to augment the trace before saving. This can be used
+        to automatically add FLOPS/bandwidth utilization annotations.
         """
         if self.profiler is None:
             raise AssertionError(
@@ -287,11 +292,47 @@ class _KinetoProfile:
         if path.endswith(".gz"):
             with tempfile.NamedTemporaryFile("w+b", suffix=".json") as fp:
                 retvalue = self.profiler.export_chrome_trace(fp.name)
+                # Run callbacks on the uncompressed trace
+                self._run_export_callbacks(fp.name)
                 with open(fp.name, "rb") as fin, gzip.open(path, "wb") as fout:
                     fout.writelines(fin)
             return retvalue
         else:
-            return self.profiler.export_chrome_trace(path)
+            retvalue = self.profiler.export_chrome_trace(path)
+            # Run callbacks on the trace
+            self._run_export_callbacks(path)
+            return retvalue
+
+    def _run_export_callbacks(self, path: str) -> None:
+        """Run export callbacks and add utilization annotations to the trace file."""
+        try:
+            from torch._inductor.analysis.profile_analysis import (
+                _profiler_export_callbacks,
+                run_profiler_export_callbacks,
+                add_utilization_annotations,
+            )
+        except ImportError:
+            return
+
+        try:
+            with open(path) as f:
+                data = json.load(f)
+
+            # Run any registered callbacks
+            if _profiler_export_callbacks:
+                data = run_profiler_export_callbacks(data)
+
+            # Always add utilization annotations (will auto-detect device from trace)
+            data = add_utilization_annotations(data)
+
+            with open(path, "w") as f:
+                json.dump(data, f)
+        except Exception as e:
+            # Don't fail the export if augmentation fails
+            import logging
+            logging.getLogger(__name__).warning(
+                "Profiler trace augmentation failed: %s", e
+            )
 
     def export_stacks(self, path: str, metric: str = "self_cpu_time_total"):
         """Save stack traces to a file
