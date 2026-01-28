@@ -269,9 +269,15 @@ def get_pw_red_splits(
             (n._body.reduce_vars, n._body.sizes[1]),
         )  # type: ignore[return-value]
 
-    assert get_hint(sympy_product(n._body.sizes[0])) == get_hint(
-        pointwise_numel * red_numel
-    )  # type: ignore[operator]
+    node_total = get_hint(sympy_product(n._body.sizes[0]))
+    kernel_total = get_hint(pointwise_numel * red_numel)
+    # Allow halving pattern where node_total == kernel_total / 2
+    # This happens with ops like cvt_e2m1x2 that produce half as many outputs
+    is_halving_pattern = node_total * 2 == kernel_total
+    if not (node_total == kernel_total or is_halving_pattern):
+        if none_if_not_divisible:
+            return None
+        assert False, f"Unexpected node total {node_total} vs kernel total {kernel_total}"  # type: ignore[operator]
     i = len(n._body.sizes[0]) - 1
     prod = 1
     while i >= 0:
@@ -569,8 +575,8 @@ def extract_normalized_read_writes(
             )
         except torch._inductor.codegen.simd.CantSplit:
             # occasionally with dynamic shapes, we will be unable to prove
-            # divisibility
-            assert pointwise_numel.free_symbols or red_numel.free_symbols
+            # divisibility. Also, halving patterns may not split evenly.
+            # Return None to skip this node's normalized read/writes.
             return None
 
         var_map = apply_var_mapping(

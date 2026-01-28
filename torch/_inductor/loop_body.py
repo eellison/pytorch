@@ -160,6 +160,9 @@ class LoopBody:
         self.indirect_var_ranges: dict[sympy.Symbol, sympy.Expr] = {}
         self.memory_usage = {t: [] for t in MemoryUsageType}
         self.op_counts = collections.Counter()
+        # Tracks dimension expansions: list of (dimension, original_range)
+        # Used to generate masks for loads/stores in expanded dimensions
+        self.expansion_masks: list[tuple[int, sympy.Expr]] = []
         self.root_block = LoopBodyBlock(self, fn, args)  # traces
         self.has_partial_accumulate = self.root_block.graph.find_nodes(
             op="call_method", target="partial_accumulate"
@@ -182,6 +185,8 @@ class LoopBody:
         self.indirect_var_ranges = other.indirect_var_ranges
         self.memory_usage = other.memory_usage
         self.op_counts = other.op_counts
+        # Copy expansion masks from other body
+        self.expansion_masks = list(getattr(other, 'expansion_masks', []))
         self.root_block = other.root_block.clone(self)
         self.has_partial_accumulate = other.has_partial_accumulate
 
@@ -245,6 +250,9 @@ class LoopBody:
         """
         Expand node on `dimension` to `new_range` and rely on index modular to avoid
         out-of-boundary access.
+
+        Records the expansion in `expansion_masks` so that codegen can add
+        appropriate masks to loads/stores that use the expanded dimension.
         """
 
         old_body = self
@@ -284,6 +292,11 @@ class LoopBody:
         new_body = LoopBody(
             loop_body, (iter_vars2, reduce_vars2), var_ranges2, iter_vars2, reduce_vars2
         )
+
+        # Record the expansion mask: (dimension, original_range)
+        # This will be used by codegen to add masks like `iter_var[dimension] < original_range`
+        new_body.expansion_masks.append((dimension, original_range))
+
         return new_body
 
     def reorder_iter_loops(self, new_order) -> LoopBody:
@@ -478,6 +491,34 @@ class LoopBody:
             name: sympy_subs(expr, replacements)
             for name, expr in self.indexing_exprs.items()
         }
+
+    def get_expansion_mask_conditions(
+        self, indices: tuple[Sequence[sympy.Expr], ...]
+    ) -> list[tuple[sympy.Expr, sympy.Expr]]:
+        """
+        Get expansion mask conditions for the given index variables.
+
+        Returns a list of (index_expr, original_range) tuples. Each tuple means
+        that loads/stores using modular indexing on that dimension should be
+        masked with `index_expr < original_range`.
+
+        Args:
+            indices: The current index variables (iter_vars, reduce_vars)
+
+        Returns:
+            List of (index_expr, original_range) for each expansion mask
+        """
+        if not getattr(self, 'expansion_masks', None):
+            return []
+
+        index = [*itertools.chain.from_iterable(indices)]
+        iter_idx = index[: len(self.sizes[0])]
+
+        masks = []
+        for dimension, original_range in self.expansion_masks:
+            if dimension < len(iter_idx):
+                masks.append((iter_idx[dimension], original_range))
+        return masks
 
     def __call__(self, *indices, allow_same_symbol_in_index=False):
         self.indexing = self.indexing_from_args(indices, allow_same_symbol_in_index)

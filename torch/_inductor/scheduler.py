@@ -1709,6 +1709,12 @@ class SchedulerNode(BaseSchedulerNode):
                         the index variables for each dimension of the computation.
         """
         var_ranges = self.ranges_from_index_vars(index_vars)
+
+        # Get expansion mask conditions from the body and pass to kernel
+        expansion_masks = self._body.get_expansion_mask_conditions(index_vars)
+        if hasattr(V.kernel, 'set_expansion_masks'):
+            V.kernel.set_expansion_masks(expansion_masks)
+
         try:
             with (
                 V.set_ops_handler(SimplifyIndexing(V.get_ops_handler(), var_ranges)),
@@ -1718,6 +1724,10 @@ class SchedulerNode(BaseSchedulerNode):
         except Exception:
             log.fatal("Error in codegen for %s", self.node)
             raise
+        finally:
+            # Clear expansion masks after codegen
+            if hasattr(V.kernel, 'set_expansion_masks'):
+                V.kernel.set_expansion_masks([])
 
     def pointwise_or_reduction_read_writes(
         self, pointwise: bool = True
@@ -4923,6 +4933,106 @@ class Scheduler:
 
         return True
 
+    def _check_halving_pattern_expand(
+        self, node1: BaseSchedulerNode, node2: BaseSchedulerNode
+    ) -> Optional[tuple[SchedulerNode, int, sympy.Expr]]:
+        """
+        Check if this is a halving pattern (reduction -> halving pointwise) that
+        can benefit from dimension expansion.
+
+        A halving pattern occurs when:
+        - One node is a reduction with (numel, rnumel) = (N, R)
+        - The other node is a pointwise with 2D structure [N, R/2]
+        - The halving node produces half as many outputs as the reduction consumes
+
+        To fuse these, we expand the halving node's inner dimension from R/2 to R,
+        using modular indexing to produce the correct outputs.
+
+        Returns (halving_node, expand_dim, expand_size, needs_expand) if halving pattern detected,
+        None otherwise.
+        """
+        # Identify reduction and potential halving node
+        if node1.is_reduction() and not node2.is_reduction():
+            reduction_node, halving_candidate = node1, node2
+        elif node2.is_reduction() and not node1.is_reduction():
+            reduction_node, halving_candidate = node2, node1
+        else:
+            return None
+
+        fusion_log.debug("Checking halving pattern: reduction=%s, candidate=%s",
+                         reduction_node.get_name(), halving_candidate.get_name())
+
+        # Only support SchedulerNode for expansion
+        if not isinstance(halving_candidate, SchedulerNode):
+            return None
+
+        # Check for computed buffer (needed for expand_dimension)
+        if not isinstance(halving_candidate.node, ir.ComputedBuffer):
+            return None
+
+        # Get reduction dimensions
+        _, (numel_red, rnumel_red) = reduction_node.group
+        _, (numel_half, rnumel_half) = halving_candidate.group
+
+        # Halving pattern check: halving_numel * 2 == reduction_numel * rnumel
+        # and halving has rnumel=1 (pure pointwise)
+        sv = V.graph.sizevars
+        fusion_log.debug("  groups: red=(%s, %s), half=(%s, %s)",
+                         numel_red, rnumel_red, numel_half, rnumel_half)
+
+        if not sv.statically_known_equals(rnumel_half, sympy.S.One):
+            fusion_log.debug("  Rejected: rnumel_half != 1")
+            return None
+
+        total_red = sv.simplify(numel_red * rnumel_red)
+
+        # Check for halving pattern: halving_numel * 2 == total_red
+        # OR already-expanded halving: halving_numel == total_red (node was previously expanded)
+        is_halving = sv.statically_known_equals(numel_half * 2, total_red)
+        is_already_expanded = sv.statically_known_equals(numel_half, total_red)
+
+        if not is_halving and not is_already_expanded:
+            fusion_log.debug("  Rejected: %s * 2 != %s and %s != %s",
+                             numel_half, total_red, numel_half, total_red)
+            return None
+
+        # Check halving node has 2D structure [outer, inner] where outer == numel_red
+        halving_sizes = halving_candidate._sizes
+        if not halving_sizes or len(halving_sizes[0]) != 2:
+            fusion_log.debug("  Rejected: halving_sizes=%s not 2D", halving_sizes)
+            return None
+
+        outer_dim = sv.simplify(halving_sizes[0][0])
+        inner_dim = sv.simplify(halving_sizes[0][1])
+
+        if not sv.statically_known_equals(outer_dim, numel_red):
+            fusion_log.debug("  Rejected: outer_dim=%s != numel_red=%s", outer_dim, numel_red)
+            return None
+
+        if is_already_expanded:
+            # Already expanded - inner_dim should equal rnumel_red
+            if not sv.statically_known_equals(inner_dim, rnumel_red):
+                fusion_log.debug("  Rejected: already-expanded inner_dim=%s != rnumel_red=%s",
+                                 inner_dim, rnumel_red)
+                return None
+            # No expansion needed, but return the pattern info for fusion allowance
+            # The 4th element (needs_expand=False) indicates this is already expanded
+            fusion_log.info("Found already-expanded halving pattern (dim 1 = %s)", inner_dim)
+            return (halving_candidate, 1, rnumel_red, False)
+        else:
+            # inner_dim should be rnumel_red / 2
+            if not sv.statically_known_equals(inner_dim * 2, rnumel_red):
+                fusion_log.debug("  Rejected: inner_dim=%s * 2 != rnumel_red=%s", inner_dim, rnumel_red)
+                return None
+
+            # Found halving pattern
+            # DON'T expand - use split iteration ranges at codegen time instead
+            # This avoids the overhead of running 16 iterations with half masked off
+            # Set needs_expand=False so the body keeps its original indexing
+            fusion_log.info("Found halving pattern (dim 1 = %s, rnumel = %s) - using split iteration",
+                            inner_dim, rnumel_red)
+            return (halving_candidate, 1, rnumel_red, False)
+
     def get_expand_dim_for_pointwise_nodes(
         self, node1: BaseSchedulerNode, node2: BaseSchedulerNode
     ) -> Optional[tuple[int, SchedulerNode, sympy.Expr]]:
@@ -5171,6 +5281,24 @@ class Scheduler:
             shared_data_score = self.score_fusion_memory(node1, node2)
             assert isinstance(shared_data_score, int)
 
+        # Check for halving pattern: reduction -> pointwise that halves the output
+        # e.g., reduction (numel=65536, rnumel=16) + halving (numel=524288, rnumel=1)
+        # where halving node has 2D structure [65536, 8] (outer=numel, inner=rnumel/2)
+        if (
+            halving_expand := self._check_halving_pattern_expand(node1, node2)
+        ):
+            (halving_node, expand_dim, expand_size, needs_expand) = halving_expand
+            if needs_expand:
+                halving_node.expand_dimension_for_pointwise_node(expand_dim, expand_size)
+            # After expansion (or for already-expanded), score_fusion_memory may return 0
+            # because indexing changed. But we know this is a valid fusion (they share the input data)
+            # Set a positive score to allow fusion
+            shared_data_score = max(
+                self.score_fusion_memory(node1, node2),
+                config.score_fusion_memory_threshold  # Ensure we meet threshold
+            )
+            assert isinstance(shared_data_score, int)
+
         if (
             config.loop_index_inversion_in_fusion
             and shared_data_score < config.score_fusion_memory_threshold
@@ -5200,9 +5328,10 @@ class Scheduler:
                 and self.get_backend(device).can_fuse_vertical(node1, node2)
             )
         else:  # nodes don't depend on each other, but may have common reads
-            return V.choices.can_fuse_horizontal(
-                self, node1, node2, shared_data_score
-            ) and self.get_backend(device).can_fuse_horizontal(node1, node2)
+            return (
+                V.choices.can_fuse_horizontal(self, node1, node2, shared_data_score)
+                and self.get_backend(device).can_fuse_horizontal(node1, node2)
+            )
 
     def can_fuse_vertical(
         self, node1: BaseSchedulerNode, node2: BaseSchedulerNode
@@ -5319,10 +5448,10 @@ class Scheduler:
             ):
                 return False
 
-            if config.loop_ordering_after_fusion and read.num_vars != write.num_vars:
-                # Need merge loops if we do loop ordering after fusion since
-                # we have not merged the loops yet when creating the scheduler
-                # nodes.
+            if config.loop_ordering_after_fusion or read.index != write.index:
+                # Need to normalize if:
+                # 1. loop_ordering_after_fusion is enabled and num_vars differ
+                # 2. indices don't match (may have different variable names due to expansion)
                 read = read.normalize()
                 write = write.normalize()
 

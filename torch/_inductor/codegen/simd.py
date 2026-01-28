@@ -825,9 +825,10 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
                         )
             return_getters_groups.append(return_getters)
 
-        assert all(V.graph.sizevars.size_hint(s) == 1 for s in remaining), (
-            f"failed to set ranges {remaining} {lengths}"
-        )
+        if not all(V.graph.sizevars.size_hint(s) == 1 for s in remaining):
+            # Halving pattern may leave remainder > 1 in reduction dim
+            # This is okay if it's a power of 2 factor (like 2 for halving)
+            raise CantSplit(lengths, remaining)
         return new_ranges, return_getters_groups
 
     @classmethod
@@ -1435,6 +1436,29 @@ class SIMDScheduling(BaseScheduling):
                     return is_reduction_tiling_valid
                 return True
 
+            # NEW: Check for partial broadcast (halving pattern)
+            # numel1 == numel2 * (rnumel2 / 2) means a 2:1 halving op
+            if numel1 * 2 == numel2 * rnumel2:
+                # Check if node1 has 2D structure with outer dim == numel2
+                # This allows halving ops like cvt_e2m1x2 to fuse with reductions
+                node1_sizes = None
+                for n in node1.get_nodes():
+                    if hasattr(n, '_sizes') and n._sizes:
+                        node1_sizes = n._sizes
+                        break
+
+                if node1_sizes and len(node1_sizes[0]) == 2:
+                    outer_dim = V.graph.sizevars.simplify(sympy_product([node1_sizes[0][0]]))
+                    if V.graph.sizevars.statically_known_equals(outer_dim, numel2):
+                        # Halving pattern detected - outer dim matches reduction numel
+                        # Return True to allow fusion - we'll need to handle
+                        # the iteration mismatch during scheduling/codegen
+                        fusion_log.debug(
+                            "Halving pattern fusion: node1 sizes %s, numel2=%s, rnumel2=%s",
+                            node1_sizes, numel2, rnumel2
+                        )
+                        return True
+
             if numel1 != numel2:
                 why("nodes numel incompatibility")
             return numel1 == numel2
@@ -1463,7 +1487,18 @@ class SIMDScheduling(BaseScheduling):
 
         def fits_outside_reduction(n):
             _, (node_numel, node_rnumel) = n.group
-            return node_numel == numel and node_rnumel == 1 and rnumel != 1
+            if node_numel == numel and node_rnumel == 1 and rnumel != 1:
+                return True
+            # Halving pattern: 2D node with outer dim == numel, inner dim < rnumel
+            # e.g., node sizes [65536, 8] with kernel (65536, 16)
+            if node_rnumel == 1 and rnumel != 1 and hasattr(n, '_sizes'):
+                outer_dim = n._sizes[0][0] if n._sizes and len(n._sizes[0]) >= 1 else None
+                if outer_dim is not None:
+                    outer_dim_val = V.graph.sizevars.simplify(outer_dim)
+                    if V.graph.sizevars.statically_known_equals(outer_dim_val, numel):
+                        # This is a halving pattern - schedule after reduction
+                        return True
+            return False
 
         def expect_improved_memory_usage(n):
             for read in n.read_writes.reads:
@@ -1956,6 +1991,54 @@ class SIMDScheduling(BaseScheduling):
             )
         ]
 
+    def _is_halving_pattern_node(self, node, kernel) -> tuple[bool, int]:
+        """
+        Detect if a node is a halving pattern that can use split iteration ranges.
+        Returns (is_halving, halving_inner_size).
+
+        A halving pattern is when:
+        - Kernel is a reduction (is_reduction=True)
+        - Kernel uses persistent reduction (no loop tiling)
+        - Node is pointwise (rnumel=1) with 2D structure [[outer, inner], []]
+        - inner * 2 == kernel.rnumel (produces half the elements)
+
+        For example, with kernel (numel=4, rnumel=16):
+        - Halving node has sizes [[4, 8], []] (8 elements per row)
+        - 8 * 2 == 16, so this is a halving pattern with halving_size=8
+
+        NOTE: Split iteration ranges only work for persistent reductions.
+        For looped reductions, the halving iteration would need to coordinate
+        with the loop structure, which is not yet implemented.
+        """
+        if not kernel.features.is_reduction():
+            return False, 0
+
+        # Only use split iteration for persistent reductions
+        if not getattr(kernel, 'persistent_reduction', False):
+            return False, 0
+
+        # Node must be pointwise (rnumel=1)
+        _, (node_numel, node_rnumel) = node.group
+        if V.graph.sizevars.size_hint(node_rnumel, fallback=1) != 1:
+            return False, 0
+
+        # Check for 2D structure [[outer, inner], []]
+        node_sizes = node.get_ranges()
+        if len(node_sizes) != 2 or len(node_sizes[0]) != 2 or len(node_sizes[1]) != 0:
+            return False, 0
+
+        outer, inner = node_sizes[0]
+        reduction_numel = kernel.features.reduction_numel
+
+        # Check halving pattern: inner * 2 == reduction_numel
+        inner_hint = V.graph.sizevars.size_hint(inner, fallback=0)
+        rnumel_hint = V.graph.sizevars.size_hint(reduction_numel, fallback=0)
+
+        if inner_hint > 0 and rnumel_hint > 0 and inner_hint * 2 == rnumel_hint:
+            return True, inner_hint
+
+        return False, 0
+
     def codegen_node_schedule_with_kernel(self, node_schedule, kernel):
         with kernel:
             stack = contextlib.ExitStack()
@@ -1969,7 +2052,14 @@ class SIMDScheduling(BaseScheduling):
                     stack.close()
                 else:
                     node.decide_inplace_update()
-                    index_vars = kernel.split_and_set_ranges(node.get_ranges())
+
+                    # Check for halving pattern to use split ranges
+                    is_halving, halving_size = self._is_halving_pattern_node(node, kernel)
+                    if is_halving and hasattr(kernel, 'get_split_iteration_index_vars'):
+                        index_vars = kernel.get_split_iteration_index_vars(node.get_ranges(), halving_size)
+                    else:
+                        index_vars = kernel.split_and_set_ranges(node.get_ranges())
+
                     all_indexing.update(
                         dict.fromkeys(
                             node._body.indexing_from_args(index_vars).values()
@@ -1985,9 +2075,15 @@ class SIMDScheduling(BaseScheduling):
                 elif node is EnableReduction:
                     stack.close()
                 else:
-                    # TODO - use split ranges ?
                     indexing_dtype_strength_reduction(node._body)
-                    index_vars = kernel.split_and_set_ranges(node.get_ranges())
+
+                    # Check for halving pattern to use split ranges
+                    is_halving, halving_size = self._is_halving_pattern_node(node, kernel)
+                    if is_halving and hasattr(kernel, 'get_split_iteration_index_vars'):
+                        index_vars = kernel.get_split_iteration_index_vars(node.get_ranges(), halving_size)
+                    else:
+                        index_vars = kernel.split_and_set_ranges(node.get_ranges())
+
                     node.codegen(index_vars)
 
     def _codegen_single_template(

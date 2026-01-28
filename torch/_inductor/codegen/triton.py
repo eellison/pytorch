@@ -63,6 +63,8 @@ from ..utils import (
     Placeholder,
     prefix_is_reduction,
     sympy_dot,
+    sympy_index_symbol,
+    sympy_index_symbol_with_prefix,
     sympy_product,
     sympy_subs,
     triton_type,
@@ -2553,6 +2555,131 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         # We track the store name since a store can be canceled later
         self.stores_with_contiguous_rdim: list[str] = []
 
+        # Expansion masks for halving pattern fusion
+        # List of (index_expr, original_range) tuples for masking loads/stores
+        self._expansion_masks: list[tuple[sympy.Expr, sympy.Expr]] = []
+
+    def set_expansion_masks(
+        self, masks: list[tuple[sympy.Expr, sympy.Expr]]
+    ) -> None:
+        """
+        Set expansion mask conditions for the current node being codegen'd.
+
+        Args:
+            masks: List of (index_expr, original_range) tuples. Each tuple means
+                   that loads/stores using modular indexing should be masked with
+                   `index_expr < original_range`.
+        """
+        self._expansion_masks = masks
+
+    def get_expansion_mask_strs(self) -> list[str]:
+        """
+        Get expansion mask condition strings for use in load/store operations.
+
+        Returns a list of mask condition strings like "(r0_1 < 8)".
+        """
+        masks = []
+        for index_expr, original_range in self._expansion_masks:
+            index_str = self.index_to_str(index_expr)
+            range_str = self.index_to_str(original_range)
+            masks.append(f"({index_str} < {range_str})")
+        return masks
+
+    def get_split_iteration_index_vars(
+        self,
+        lengths: tuple[tuple[sympy.Expr, ...], tuple[sympy.Expr, ...]],
+        halving_size: int,
+    ) -> list[list[sympy.Expr]]:
+        """
+        Create index variables for a halving pattern node using split iteration ranges.
+
+        Instead of mapping the halving node's inner dimension to the kernel's reduction
+        range tree (which creates modular indexing like r0 % 8), this creates a fresh
+        iteration variable that iterates exactly halving_size times.
+
+        This avoids excess computation from running 16 iterations when only 8 are needed.
+
+        NOTE: This only works for persistent reductions where the entire reduction fits
+        in one block. For tiled/looped reductions, the halving iteration would need to
+        coordinate with the loop structure.
+
+        Args:
+            lengths: The node's size tuple, e.g., [[outer, inner], []] where inner is halving_size
+            halving_size: The halving size (e.g., 8)
+
+        Returns:
+            index_vars compatible with the node's codegen: [[x_sym, halving_sym], []]
+        """
+        # Split iteration ranges only work for persistent reductions
+        # For looped reductions, fall back to normal path (which would use dimension expansion)
+        if not self.persistent_reduction:
+            return self.split_and_set_ranges(lengths)
+
+        # Get the outer dimension size
+        outer_size = lengths[0][0] if lengths[0] else sympy.S.One
+
+        # Find the x tree and r0 tree
+        x_tree = None
+        r0_tree = None
+        for tree in self.range_trees:
+            if not tree.is_reduction:
+                x_tree = tree
+            elif tree.prefix == "r0_":
+                r0_tree = tree
+
+        if x_tree is None or r0_tree is None:
+            # Fall back to normal path
+            return self.split_and_set_ranges(lengths)
+
+        # Create the x index using existing range tree
+        x_syms = x_tree.construct([outer_size])
+
+        # Cache the halving symbol to avoid creating it twice (once per codegen pass)
+        cache_key = f"halving_{halving_size}"
+        if not hasattr(self, '_halving_cache'):
+            self._halving_cache = {}
+
+        if cache_key not in self._halving_cache:
+            # Create a fresh halving iteration variable with R0_INDEX type
+            # This is separate from the main r0 tree's iteration
+            halving_idx = next(self.iter_vars_count)
+            halving_sym = sympy_index_symbol_with_prefix(SymT.R0_INDEX, halving_idx)
+            halving_name = f"r0_{halving_idx}"
+
+            # Emit the halving iteration variable directly
+            tensor_dim = self.triton_tensor_ndim()
+            if tensor_dim == 2:
+                shape_str = "[None, :]"  # [1, halving_size] for 2D tensor
+            elif tensor_dim == 1:
+                shape_str = "[:]" if self.no_x_dim else "[:, None]"
+            else:
+                shape_str = ""
+
+            self.body.writeline(f"{halving_name} = tl.arange(0, {halving_size}){shape_str}")
+
+            # Register in range_tree_nodes with a minimal entry that provides needed attributes
+            halving_length = sympy.Integer(halving_size)
+
+            # Create a proper IterationRangesEntry
+            from torch._inductor.codegen.simd import IterationRangesEntry
+            halving_entry = IterationRangesEntry(
+                name=halving_name,
+                divisor=sympy.S.One,
+                length=halving_length,
+                expr=halving_sym,  # The symbol itself as the expression
+                parent=r0_tree,  # Use r0_tree as parent for is_broadcasted checks
+            )
+            # Override the codegen to just return the name (code already emitted)
+            halving_entry.codegen = lambda n=halving_name: n
+            self.range_tree_nodes[halving_sym] = halving_entry
+
+            self._halving_cache[cache_key] = halving_sym
+
+        halving_sym = self._halving_cache[cache_key]
+
+        # Return index_vars matching node's structure: [[x_sym, halving_sym], []]
+        return [[*x_syms, halving_sym], []]
+
     @staticmethod
     def _has_stride1_on_rdim(index) -> bool:
         # These analysis is only needed in deterministic mode so far
@@ -3386,6 +3513,21 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             ),
         )
 
+        # Add masks for modular indexing patterns to avoid redundant loads
+        # (e.g., from dimension expansion in halving pattern fusion)
+        if isinstance(indexing, IndexingOptions):
+            # Prefer explicit expansion masks from LoopBody if available
+            expansion_masks = self.get_expansion_mask_strs()
+            if expansion_masks:
+                for mask in expansion_masks:
+                    indexing.mask_vars.add(mask)
+            else:
+                # Fall back to pattern-matching on Mod expressions
+                mod_masks = self._extract_modular_indexing_masks(original_index)
+                if mod_masks:
+                    for mask in mod_masks:
+                        indexing.mask_vars.add(mask)
+
         if isinstance(indexing, IndexingOptions) and self._has_stride1_on_rdim(
             indexing.index
         ):
@@ -3550,6 +3692,55 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
         return result_var
 
+    def _extract_modular_indexing_masks(self, index: sympy.Expr) -> list[str]:
+        """
+        Extract mask conditions from Mod/ModularIndexing patterns in the index.
+
+        When we see Mod(x, N) in a store index, we add x < N to the mask to
+        avoid redundant stores when the loop iterates beyond N (e.g., due to
+        dimension expansion for halving pattern fusion).
+
+        Returns a list of mask condition strings to add to the store mask.
+        """
+        masks = []
+
+        def process_expr(expr):
+            if isinstance(expr, sympy.Mod):
+                # Mod(x, N) -> add x < N
+                x, n = expr.args
+                if isinstance(n, (int, sympy.Integer)) and n > 0:
+                    # Check if x is a reduction variable (r0_1, etc)
+                    for var in x.free_symbols:
+                        if symbol_is_type(var, TritonSymbols.reduction_types):
+                            # Generate the mask condition
+                            x_str = self.index_to_str(x)
+                            masks.append(f"({x_str} < {n})")
+                            return
+            elif isinstance(expr, ModularIndexing):
+                # ModularIndexing(x, divisor, N) -> add x // divisor < N
+                # equivalent to x < N * divisor
+                x, divisor, n = expr.args
+                if isinstance(n, (int, sympy.Integer)) and n > 0:
+                    for var in x.free_symbols:
+                        if symbol_is_type(var, TritonSymbols.reduction_types):
+                            if divisor == 1:
+                                x_str = self.index_to_str(x)
+                                masks.append(f"({x_str} < {n})")
+                            else:
+                                x_str = self.index_to_str(x)
+                                divisor_str = self.index_to_str(divisor)
+                                masks.append(f"(({x_str} // {divisor_str}) < {n})")
+                            return
+
+            # Recurse into sub-expressions
+            if hasattr(expr, 'args'):
+                for arg in expr.args:
+                    if isinstance(arg, sympy.Basic):
+                        process_expr(arg)
+
+        process_expr(index)
+        return masks
+
     def store(
         self, name: str, index: sympy.Expr, value: CSEVariable, mode: StoreMode = None
     ) -> None:
@@ -3576,6 +3767,21 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             block_ptr=mode is None,
             tma_compatibility_checker=tma_compatibility_checker,
         )
+
+        # Add masks for modular indexing patterns to avoid redundant stores
+        # (e.g., from dimension expansion in halving pattern fusion)
+        if isinstance(indexing, IndexingOptions):
+            # Prefer explicit expansion masks from LoopBody if available
+            expansion_masks = self.get_expansion_mask_strs()
+            if expansion_masks:
+                for mask in expansion_masks:
+                    indexing.mask_vars.add(mask)
+            else:
+                # Fall back to pattern-matching on Mod expressions
+                mod_masks = self._extract_modular_indexing_masks(original_index)
+                if mod_masks:
+                    for mask in mod_masks:
+                        indexing.mask_vars.add(mask)
 
         if isinstance(indexing, IndexingOptions) and self._has_stride1_on_rdim(
             indexing.index
