@@ -1438,7 +1438,10 @@ class SIMDScheduling(BaseScheduling):
 
             # NEW: Check for partial broadcast (halving pattern)
             # numel1 == numel2 * (rnumel2 / 2) means a 2:1 halving op
-            if numel1 * 2 == numel2 * rnumel2:
+            # Only apply this for small reductions that will be persistent
+            # (persistent reduction threshold is ~1024 for INNER hint)
+            rnumel2_hint = V.graph.sizevars.size_hint(rnumel2, fallback=0)
+            if numel1 * 2 == numel2 * rnumel2 and 0 < rnumel2_hint <= 1024:
                 # Check if node1 has 2D structure with outer dim == numel2
                 # This allows halving ops like cvt_e2m1x2 to fuse with reductions
                 node1_sizes = None
@@ -1491,7 +1494,9 @@ class SIMDScheduling(BaseScheduling):
                 return True
             # Halving pattern: 2D node with outer dim == numel, inner dim < rnumel
             # e.g., node sizes [65536, 8] with kernel (65536, 16)
-            if node_rnumel == 1 and rnumel != 1 and hasattr(n, '_sizes'):
+            # Only apply for small reductions that will be persistent
+            rnumel_hint = V.graph.sizevars.size_hint(rnumel, fallback=0)
+            if node_rnumel == 1 and rnumel != 1 and 0 < rnumel_hint <= 1024 and hasattr(n, '_sizes'):
                 outer_dim = n._sizes[0][0] if n._sizes and len(n._sizes[0]) >= 1 else None
                 if outer_dim is not None:
                     outer_dim_val = V.graph.sizevars.simplify(outer_dim)
@@ -2039,10 +2044,61 @@ class SIMDScheduling(BaseScheduling):
 
         return False, 0
 
+    def _detect_bf16_coalesced_pattern(self, node_schedule, kernel):
+        """
+        Detect if node_schedule has a bf16 halving pattern that can use
+        coalesced uint32 loads for maximum performance.
+
+        Returns:
+            (buffer_name, halving_size) if pattern found, None otherwise
+        """
+        if not getattr(kernel, 'persistent_reduction', False):
+            return None
+
+        # Find reduction node and halving node
+        reduction_node = None
+        halving_node = None
+        halving_size = 0
+
+        for node in node_schedule:
+            if node is DisableReduction or node is EnableReduction:
+                continue
+            if hasattr(node, 'is_reduction') and node.is_reduction():
+                reduction_node = node
+            else:
+                is_halving, size = self._is_halving_pattern_node(node, kernel)
+                if is_halving:
+                    halving_node = node
+                    halving_size = size
+
+        if not reduction_node or not halving_node:
+            return None
+
+        # Find shared bf16 input buffer
+        try:
+            red_reads = {dep.name for dep in reduction_node.read_writes.reads}
+            half_reads = {dep.name for dep in halving_node.read_writes.reads}
+            shared_buffers = red_reads & half_reads
+
+            for buf_name in shared_buffers:
+                dtype = V.graph.get_dtype(buf_name)
+                if dtype == torch.bfloat16:
+                    return (buf_name, halving_size)
+        except Exception:
+            pass
+
+        return None
+
     def codegen_node_schedule_with_kernel(self, node_schedule, kernel):
         with kernel:
             stack = contextlib.ExitStack()
             all_indexing = {}
+
+            # Check for bf16 coalesced load optimization opportunity
+            bf16_pattern = self._detect_bf16_coalesced_pattern(node_schedule, kernel)
+            if bf16_pattern and hasattr(kernel, 'setup_bf16_coalesced_load'):
+                buffer_name, halving_size = bf16_pattern
+                kernel.setup_bf16_coalesced_load(buffer_name, halving_size)
 
             # First pass to collect indexing and decide inplace updates
             for node in node_schedule:

@@ -2680,6 +2680,163 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         # Return index_vars matching node's structure: [[x_sym, halving_sym], []]
         return [[*x_syms, halving_sym], []]
 
+    def setup_bf16_coalesced_load(self, buffer_name: str, halving_size: int):
+        """
+        Set up coalesced uint32 load for a bf16 buffer in a halving pattern.
+
+        This emits the optimal v7-style load pattern:
+        1. Cast bf16 pointer to uint32 pointer
+        2. Load 8 uint32 values (= 16 bf16 values coalesced)
+        3. Bit extract to get even/odd (8-wide each)
+        4. Join + reshape to get all_16 (16-wide) for reduction
+
+        The precomputed values are stored so that subsequent loads from this
+        buffer can use them instead of emitting separate loads.
+        """
+        if not hasattr(self, '_bf16_coalesced'):
+            self._bf16_coalesced = {}
+
+        if buffer_name in self._bf16_coalesced:
+            return  # Already set up
+
+        var = self.args.input(buffer_name)
+
+        # Find x tree for the outer dimension
+        x_tree = None
+        for tree in self.range_trees:
+            if not tree.is_reduction:
+                x_tree = tree
+                break
+
+        if x_tree is None:
+            return
+
+        # Get the x index symbol name
+        x_index_name = f"{x_tree.prefix}index"
+
+        # Get mask
+        mask_str = f"{x_index_name} < xnumel" if not self.no_x_dim else "None"
+
+        # Create unique names for the coalesced load variables
+        idx = next(self.iter_vars_count)
+        r0_8_name = f"r0_{idx}"
+        u32_var = f"_u32_{idx}"
+        even_var = f"_even_{idx}"
+        odd_var = f"_odd_{idx}"
+        all_16_var = f"_all16_{idx}"
+
+        # Determine tensor shape string based on kernel dimensions
+        tensor_dim = self.triton_tensor_ndim()
+        if tensor_dim == 2:
+            shape_8 = "[None, :]"
+            xblock_str = "XBLOCK"
+        elif tensor_dim == 1:
+            shape_8 = "[:]" if self.no_x_dim else "[:, None]"
+            xblock_str = "1" if self.no_x_dim else "XBLOCK"
+        else:
+            shape_8 = ""
+            xblock_str = "XBLOCK"
+
+        # Emit the coalesced load pattern into the kernel body
+        self.body.writeline(f"# Coalesced bf16 load for {buffer_name}")
+        self.body.writeline(f"{r0_8_name} = tl.arange(0, {halving_size}){shape_8}")
+        self.body.writeline(f"{var}_u32 = {var}.to(tl.pointer_type(tl.uint32))")
+
+        # The load offset: r0_8 + halving_size * x
+        # For bf16 pairs in uint32: each uint32 holds 2 bf16, so stride is halving_size
+        if self.no_x_dim:
+            load_offset = f"{r0_8_name}"
+        else:
+            load_offset = f"{r0_8_name} + {halving_size}*{x_index_name}"
+
+        self.body.writeline(f"{u32_var} = tl.load({var}_u32 + ({load_offset}), {mask_str}, other=0)")
+
+        # Bit extraction for even/odd
+        self.body.writeline(f"{even_var} = ({u32_var} & 0xFFFF).to(tl.uint16).to(tl.bfloat16, bitcast=True).to(tl.float32)")
+        self.body.writeline(f"{odd_var} = ({u32_var} >> 16).to(tl.uint16).to(tl.bfloat16, bitcast=True).to(tl.float32)")
+
+        # Join + reshape for 16-wide reduction view
+        self.body.writeline(f"_joined_{idx} = tl.join({even_var}, {odd_var})")
+        self.body.writeline(f"{all_16_var} = tl.reshape(_joined_{idx}, [{xblock_str}, {halving_size * 2}])")
+
+        # Store info for load interception
+        self._bf16_coalesced[buffer_name] = {
+            'even': even_var,
+            'odd': odd_var,
+            'all_16': all_16_var,
+            'halving_size': halving_size,
+            'r0_8_name': r0_8_name,
+        }
+
+    def get_bf16_coalesced_var(self, buffer_name: str, index: sympy.Expr):
+        """
+        Check if a load from buffer_name can use precomputed coalesced values.
+
+        Returns a CSEVariable wrapping the precomputed value, or None if not applicable.
+        """
+        if not hasattr(self, '_bf16_coalesced'):
+            return None
+
+        if buffer_name not in self._bf16_coalesced:
+            return None
+
+        coalesced = self._bf16_coalesced[buffer_name]
+        halving_size = coalesced['halving_size']
+
+        # Analyze the index pattern to determine which variable to use
+        # We need to check if the index matches:
+        # - r0_16 pattern (0,1,2,...,15): use all_16
+        # - 2*r0_8 pattern (0,2,4,...,14): use even
+        # - 1+2*r0_8 pattern (1,3,5,...,15): use odd
+
+        index_str = str(index)
+        var_name = None
+
+        # Debug: print index to understand the pattern
+        import logging
+        logging.debug(f"bf16 coalesced check: buffer={buffer_name}, index={index_str!r}")
+
+        # Check for stride-2 patterns (halving loads)
+        # These would have ModularIndexing or explicit 2* multiplier
+        if "2*" in index_str:
+            # Check if it's even (no +1) or odd (+1)
+            # Look for "+ 1" at the end or "1 +" somewhere
+            is_odd = index_str.endswith("+ 1") or index_str.endswith("+1") or "+ 1 +" in index_str
+            logging.debug(f"  stride-2 pattern detected, is_odd={is_odd}")
+            if is_odd:
+                var_name = coalesced['odd']
+            else:
+                var_name = coalesced['even']
+        else:
+            # Check for contiguous 16-wide pattern (reduction load)
+            # If we detect the reduction iteration symbol, use all_16
+            for sym in index.free_symbols:
+                if symbol_is_type(sym, SymT.R0_INDEX):
+                    var_name = coalesced['all_16']
+                    break
+
+        if var_name is None:
+            return None
+
+        # Determine shape based on which variable we're using
+        tensor_dim = self.triton_tensor_ndim()
+        if var_name == coalesced['all_16']:
+            # 16-wide for reduction
+            if tensor_dim == 2:
+                shape = ("XBLOCK", halving_size * 2)
+            else:
+                shape = (halving_size * 2,)
+        else:
+            # 8-wide for halving (even/odd)
+            if tensor_dim == 2:
+                shape = ("XBLOCK", halving_size)
+            else:
+                shape = (halving_size,)
+
+        # Wrap in CSE to get proper variable with use_count, etc.
+        # The variable already exists in the kernel, we just reference it
+        return self.cse.generate(self.loads, var_name, dtype=torch.float32, shape=shape)
+
     @staticmethod
     def _has_stride1_on_rdim(index) -> bool:
         # These analysis is only needed in deterministic mode so far
@@ -3495,6 +3652,12 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         """
         Load from the memory location 'name', offset by some indexing expression 'index'.
         """
+        # Check if this load can use precomputed bf16 coalesced values
+        coalesced_var = self.get_bf16_coalesced_var(name, index)
+        if coalesced_var is not None:
+            # Use the precomputed value instead of emitting a load
+            return coalesced_var
+
         var = self.args.input(name)
         load_counts = self._load_counts
         load_counts[name] += 1
