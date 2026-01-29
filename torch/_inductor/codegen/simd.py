@@ -2044,6 +2044,45 @@ class SIMDScheduling(BaseScheduling):
 
         return False, 0
 
+    def _detect_stride2_coalesced_patterns(self, node_schedule, kernel):
+        """
+        Detect stride-2 load patterns that can use coalesced loads.
+
+        This is a general optimization for:
+        - bf16/fp16 halving patterns (2x 16-bit -> uint32)
+        - complex64 real/imag access (2x 32-bit -> uint64)
+        - 1D pointwise stride-2 patterns
+
+        Returns:
+            List of (even_buffer, odd_buffer, block_size, dtype, is_1d_pointwise) tuples.
+            even_buffer and odd_buffer may be the same (normal) or different (complex64).
+        """
+        results = []
+
+        # Check each node's loop body for stride-2 patterns
+        for node in node_schedule:
+            if node is DisableReduction or node is EnableReduction:
+                continue
+            if not hasattr(node, '_body'):
+                continue
+
+            # Use the LoopBody's detection method
+            try:
+                pairs = node._body.detect_stride2_load_pairs()
+                for even_buf, odd_buf, even_idx, odd_idx, dtype in pairs:
+                    # Check if this is a halving pattern (2D reduction kernel)
+                    is_halving, halving_size = self._is_halving_pattern_node(node, kernel)
+                    if is_halving:
+                        results.append((even_buf, odd_buf, halving_size, dtype, False))
+                    else:
+                        # 1D pointwise stride-2 pattern
+                        # block_size is not used for 1D pointwise, pass 0
+                        results.append((even_buf, odd_buf, 0, dtype, True))
+            except Exception:
+                pass
+
+        return results
+
     def _detect_bf16_coalesced_pattern(self, node_schedule, kernel):
         """
         Detect if node_schedule has a bf16 halving pattern that can use
@@ -2074,7 +2113,17 @@ class SIMDScheduling(BaseScheduling):
         if not reduction_node or not halving_node:
             return None
 
-        # Find shared bf16 input buffer
+        # Use LoopBody's stride-2 detection for the halving node
+        if hasattr(halving_node, '_body'):
+            try:
+                pairs = halving_node._body.detect_stride2_load_pairs()
+                for even_buf, odd_buf, even_idx, odd_idx, dtype in pairs:
+                    # Return the first matching pattern with halving size (not 1D pointwise)
+                    return (even_buf, odd_buf, halving_size, dtype, False)
+            except Exception:
+                pass
+
+        # Fallback to old logic for backward compatibility
         try:
             red_reads = {dep.name for dep in reduction_node.read_writes.reads}
             half_reads = {dep.name for dep in halving_node.read_writes.reads}
@@ -2083,7 +2132,7 @@ class SIMDScheduling(BaseScheduling):
             for buf_name in shared_buffers:
                 dtype = V.graph.get_dtype(buf_name)
                 if dtype == torch.bfloat16:
-                    return (buf_name, halving_size)
+                    return (buf_name, buf_name, halving_size, dtype, False)
         except Exception:
             pass
 
@@ -2094,11 +2143,26 @@ class SIMDScheduling(BaseScheduling):
             stack = contextlib.ExitStack()
             all_indexing = {}
 
-            # Check for bf16 coalesced load optimization opportunity
-            bf16_pattern = self._detect_bf16_coalesced_pattern(node_schedule, kernel)
-            if bf16_pattern and hasattr(kernel, 'setup_bf16_coalesced_load'):
-                buffer_name, halving_size = bf16_pattern
-                kernel.setup_bf16_coalesced_load(buffer_name, halving_size)
+            # First, detect which buffers have stride-1 + stride-2 patterns across nodes
+            # These will be handled by kernel-level derivation, not IR transformation
+            buffers_with_stride1 = self._detect_buffers_with_stride1(node_schedule)
+
+            # Apply stride-2 coalesced load optimization at IR level
+            # This handles stride-2 only patterns like complex64 real/imag
+            # Skip buffers that have stride-1 loads (those use kernel-level derivation)
+            for node in node_schedule:
+                if node is DisableReduction or node is EnableReduction:
+                    continue
+                if hasattr(node, '_body') and node._body is not None:
+                    try:
+                        node._body.transform_stride2_loads(skip_buffers=buffers_with_stride1)
+                    except Exception as e:
+                        log.debug("stride2 transform failed: %s", e)
+                        pass  # Transformation is optional optimization
+
+            # Detect and setup stride-1 derivation for stride-2 patterns across nodes
+            # This handles the 3-load NVFP4 pattern: stride-1 (reduction) + stride-2 pair (halving)
+            self._setup_coalesced_loads_for_schedule(node_schedule, kernel)
 
             # First pass to collect indexing and decide inplace updates
             for node in node_schedule:
@@ -2141,6 +2205,188 @@ class SIMDScheduling(BaseScheduling):
                         index_vars = kernel.split_and_set_ranges(node.get_ranges())
 
                     node.codegen(index_vars)
+
+    def _detect_buffers_with_stride1(self, node_schedule) -> set:
+        """
+        Detect buffers that have stride-1 loads across all nodes in the schedule.
+
+        These buffers should use kernel-level derivation (stride-2 from stride-1)
+        rather than IR-level coalesced loads.
+
+        Returns a set of buffer names that have stride-1 loads.
+        """
+        from ..loop_body import MemoryUsageType
+
+        buffers_with_stride1 = set()
+
+        for node in node_schedule:
+            if node is DisableReduction or node is EnableReduction:
+                continue
+            if not hasattr(node, '_body') or node._body is None:
+                continue
+
+            body = node._body
+            ranges = node.get_ranges()
+            is_reduction_node = len(ranges) > 1 and len(ranges[1]) > 0
+
+            for entry in body.memory_usage.get(MemoryUsageType.LOAD, []):
+                if entry.buffer_name is None:
+                    continue
+                index_expr = body.indexing_exprs.get(entry.index_name)
+                if index_expr is None:
+                    continue
+
+                index_str = str(index_expr)
+                # Check for stride-1 pattern (no 2* multiplier, in reduction context)
+                if "2*" not in index_str and is_reduction_node:
+                    buffers_with_stride1.add(entry.buffer_name)
+
+        return buffers_with_stride1
+
+    def _setup_coalesced_loads_for_schedule(self, node_schedule, kernel):
+        """
+        Detect stride-1 + stride-2 load patterns and setup load deduplication.
+
+        When we have both:
+        - Stride-1 load: all N elements (e.g., for reduction)
+        - Stride-2 loads: even/odd elements (e.g., for halving pattern)
+
+        We can derive the stride-2 values from the stride-1 load via reshape,
+        eliminating redundant memory access.
+
+        This is simpler than coalesced uint32 loads - we just reuse the
+        existing stride-1 load and derive even/odd from it.
+        """
+        from ..loop_body import MemoryUsageType
+        import os
+        debug = os.environ.get("DEBUG_STRIDE2_DEDUP", "0") == "1"
+
+        # Skip if kernel doesn't support the dedup mechanism
+        if not hasattr(kernel, 'register_stride1_for_dedup'):
+            if debug:
+                print(f"DEBUG: kernel {type(kernel).__name__} doesn't have register_stride1_for_dedup")
+            return
+
+        # Supported dtypes
+        SUPPORTED_DTYPES = {torch.bfloat16, torch.float16, torch.float32}
+
+        # Collect all loads across all nodes, grouped by buffer
+        # buffer_name -> list of (index_expr, node, is_reduction_context)
+        loads_by_buffer: dict[str, list[tuple[sympy.Expr, Any, bool]]] = {}
+
+        for node in node_schedule:
+            if node is DisableReduction or node is EnableReduction:
+                continue
+            if not hasattr(node, '_body') or node._body is None:
+                continue
+
+            body = node._body
+            # Check if this node is a reduction (has non-trivial rnumel)
+            ranges = node.get_ranges()
+            is_reduction_node = len(ranges) > 1 and len(ranges[1]) > 0
+
+            for entry in body.memory_usage.get(MemoryUsageType.LOAD, []):
+                if entry.buffer_name is None:
+                    continue
+                index_expr = body.indexing_exprs.get(entry.index_name)
+                if index_expr is None:
+                    continue
+
+                buf = entry.buffer_name
+                if buf not in loads_by_buffer:
+                    loads_by_buffer[buf] = []
+                loads_by_buffer[buf].append((index_expr, node, is_reduction_node))
+
+        # Analyze each buffer for stride patterns
+        for buf_name, loads in loads_by_buffer.items():
+            if len(loads) < 2:
+                continue
+
+            # Get dtype of the buffer
+            try:
+                dtype = V.graph.get_dtype(buf_name)
+            except Exception:
+                continue
+
+            if dtype not in SUPPORTED_DTYPES:
+                continue
+
+            # Classify loads by their access pattern
+            stride1_loads = []  # Contiguous access (for reduction)
+            stride2_even_loads = []  # 2*x pattern
+            stride2_odd_loads = []  # 1 + 2*x pattern
+
+            for index_expr, node, is_reduction in loads:
+                index_str = str(index_expr)
+
+                # Check for stride-2 patterns
+                if "2*" in index_str:
+                    # Check if even (no +1) or odd (+1)
+                    is_odd = (
+                        index_str.endswith("+ 1") or
+                        index_str.endswith("+1") or
+                        "+ 1 +" in index_str or
+                        "1 + 2*" in index_str
+                    )
+                    if is_odd:
+                        stride2_odd_loads.append((index_expr, node, is_reduction))
+                    else:
+                        stride2_even_loads.append((index_expr, node, is_reduction))
+                elif is_reduction:
+                    # Reduction context with no 2* multiplier -> likely stride-1
+                    stride1_loads.append((index_expr, node, is_reduction))
+
+            # If we have stride-1 AND stride-2 pair, register for dedup
+            has_stride2_pair = len(stride2_even_loads) > 0 and len(stride2_odd_loads) > 0
+            has_stride1 = len(stride1_loads) > 0
+
+            if debug:
+                print(f"DEBUG: buffer {buf_name}: stride1={len(stride1_loads)}, stride2_even={len(stride2_even_loads)}, stride2_odd={len(stride2_odd_loads)}")
+                for idx, node, is_red in stride1_loads:
+                    print(f"  stride1: {idx}")
+                for idx, node, is_red in stride2_even_loads:
+                    print(f"  stride2_even: {idx}")
+                for idx, node, is_red in stride2_odd_loads:
+                    print(f"  stride2_odd: {idx}")
+
+            if has_stride1 and has_stride2_pair:
+                # Register this buffer for optimal coalesced uint32 loading
+                # This loads as uint32, extracts even/odd via bit ops, and reconstructs stride-1
+                if debug:
+                    print(f"DEBUG: Registering {buf_name} for coalesced uint32 loads")
+
+                # Get the reduction size from stride-1 loads (e.g., 16 for NVFP4)
+                reduction_size = None
+                for idx_expr, _, _ in stride1_loads:
+                    # Extract the coefficient to get reduction size
+                    # Pattern: r0 + N*x0 -> N is the reduction size
+                    idx_str = str(idx_expr)
+                    import re
+                    match = re.search(r'(\d+)\*x0', idx_str)
+                    if match:
+                        reduction_size = int(match.group(1))
+                        break
+
+                if reduction_size is not None and dtype in {torch.bfloat16, torch.float16}:
+                    try:
+                        if hasattr(kernel, 'register_coalesced_uint32_buffer'):
+                            kernel.register_coalesced_uint32_buffer(buf_name, dtype, reduction_size)
+                            if debug:
+                                print(f"DEBUG: Using coalesced uint32 for {buf_name}, reduction_size={reduction_size}")
+                        else:
+                            kernel.register_stride1_for_dedup(buf_name, dtype)
+                    except Exception as e:
+                        if debug:
+                            print(f"DEBUG: coalesced uint32 registration failed: {e}")
+                        pass
+                else:
+                    # Fallback to reshape/split approach
+                    try:
+                        kernel.register_stride1_for_dedup(buf_name, dtype)
+                    except Exception as e:
+                        if debug:
+                            print(f"DEBUG: register_stride1_for_dedup failed: {e}")
+                        pass
 
     def _codegen_single_template(
         self,

@@ -2440,6 +2440,71 @@ def inductor_force_stride_order(input_tensor, stride):
     return ir.ExternKernel.require_stride_order(input_tensor, stride_order)
 
 
+def _is_sm100_or_later():
+    if not torch.cuda.is_available():
+        return False
+    return torch.cuda.get_device_capability() >= (10, 0)
+
+
+@register_lowering(inductor_prims.cvt_e2m1x2_rn, type_promotion_kind=None)
+def cvt_e2m1x2_rn_lowering(inp):
+    """Lower cvt_e2m1x2_rn to PTX instruction on SM100+."""
+    from torch._inductor.virtualized import ops
+
+    device = inp.get_device()
+    inp_dtype = inp.get_dtype()
+
+    # Ensure float32 input
+    if inp_dtype != torch.float32:
+        inp = to_dtype(inp, torch.float32)
+
+    inp_size = inp.get_size()
+    inp_loader = inp.make_loader()
+
+    # Output shape has last dim halved
+    out_size = list(inp_size)
+    out_size[-1] = out_size[-1] // 2
+
+    use_ptx = _is_sm100_or_later() and device.type == "cuda"
+
+    def inner_fn(idx):
+        # Load two adjacent elements from input
+        idx_list = list(idx)
+        idx_even = idx_list[:-1] + [idx_list[-1] * 2]
+        idx_odd = idx_list[:-1] + [idx_list[-1] * 2 + 1]
+
+        val0 = inp_loader(idx_even)
+        val1 = inp_loader(idx_odd)
+
+        if use_ptx:
+            # Use native PTX instruction: cvt.rn.satfinite.e2m1x2.f32
+            # Takes two f32 values, produces packed byte in low 8 bits of u16
+            # Need to use a temp .b8 register and move to output
+            # Constraints: =h (16-bit output), f (float input), f (float input)
+            return ops.inline_asm_elementwise(
+                val0,
+                val1,
+                asm="{ .reg .b8 temp; cvt.rn.satfinite.e2m1x2.f32 temp, $2, $1; mov.b16 $0, {temp, 0}; }",
+                constraints="=h,f,f",
+                dtype=torch.uint8,
+                is_pure=True,
+                pack=1,
+            )
+        else:
+            # Fallback: bit manipulation path (same as eager)
+            # This is complex, so for non-SM100 we fall through to eager
+            raise NotImplementedError(
+                "cvt_e2m1x2_rn requires SM100+ for PTX lowering"
+            )
+
+    return Pointwise.create(
+        device=device,
+        dtype=torch.uint8,
+        inner_fn=inner_fn,
+        ranges=out_size,
+    )
+
+
 @register_lowering(inductor_prims.seed, type_promotion_kind=None)
 def inductor_seed(device: torch.device):
     raise AssertionError("should be handled in fuse_seed_creation_pass()")

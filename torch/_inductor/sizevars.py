@@ -206,7 +206,11 @@ class SizeVarAllocator:
             return base
 
         def visit_indexing_div(base, divisor):
-            return FloorDiv(remove_zero_terms(base, divisor), divisor)
+            base = remove_zero_terms(base, divisor)
+            # If base >= 0 and base < divisor, then floor(base/divisor) = 0
+            if statically_known(base >= 0) and statically_known(base < divisor):
+                return sympy.S.Zero
+            return FloorDiv(base, divisor)
 
         def visit_modular_indexing(base, divisor, modulus):
             base = remove_zero_terms(base, divisor)

@@ -1709,12 +1709,6 @@ class SchedulerNode(BaseSchedulerNode):
                         the index variables for each dimension of the computation.
         """
         var_ranges = self.ranges_from_index_vars(index_vars)
-
-        # Get expansion mask conditions from the body and pass to kernel
-        expansion_masks = self._body.get_expansion_mask_conditions(index_vars)
-        if hasattr(V.kernel, 'set_expansion_masks'):
-            V.kernel.set_expansion_masks(expansion_masks)
-
         try:
             with (
                 V.set_ops_handler(SimplifyIndexing(V.get_ops_handler(), var_ranges)),
@@ -1724,10 +1718,6 @@ class SchedulerNode(BaseSchedulerNode):
         except Exception:
             log.fatal("Error in codegen for %s", self.node)
             raise
-        finally:
-            # Clear expansion masks after codegen
-            if hasattr(V.kernel, 'set_expansion_masks'):
-                V.kernel.set_expansion_masks([])
 
     def pointwise_or_reduction_read_writes(
         self, pointwise: bool = True
@@ -4437,7 +4427,7 @@ class Scheduler:
         return cycle
 
     def can_fusion_increase_peak_memory(
-        self, node1: BaseSchedulerNode, node2: BaseSchedulerNode
+        self, node1: BaseSchedulerNode, node2: BaseSchedulerNode, shared_data_score: int | None = None
     ) -> bool:
         """
         Return true if fusing the two nodes can potentially increasing peak memory.
@@ -4486,7 +4476,12 @@ class Scheduler:
                 # not an integer. Fallback is to fuse
                 return False
 
-        bw_saving = self.score_fusion_memory(node1, node2)
+        # Use passed-in score if available (e.g., after index inversion)
+        # Otherwise compute it
+        if shared_data_score is not None:
+            bw_saving = shared_data_score
+        else:
+            bw_saving = self.score_fusion_memory(node1, node2)
 
         # The factor 32 here is quite arbitrary.
         if V.graph.sizevars.statically_known_gt(memory_overhead, 32 * bw_saving):
@@ -4649,6 +4644,7 @@ class Scheduler:
             int: Fusion score if successful, 0 if optimization not applicable
         """
 
+
         if not config.loop_index_inversion_in_fusion:
             return -1
 
@@ -4662,6 +4658,7 @@ class Scheduler:
 
         if not common_buffer_names:
             return -1
+
 
         # only invert if node1 is single unmet dep
         node2_unmet_dependencies = OrderedSet(
@@ -4700,13 +4697,21 @@ class Scheduler:
         # normalize node1 not node2.
         node1_write = node1_write.normalize()
 
+        # Compare total elements rather than exact shape to allow fusion
+        # between kernels with different tensor shapes but same element count
+        def total_elements(size):
+            result = 1
+            for s in size:
+                result *= s
+            return result
+
         if (
             node1_write.index != node2_write.index
-            and node1_write.size != node2_write.size
+            and total_elements(node1_write.size) != total_elements(node2_write.size)
         ):
             return -1
 
-        if node2_read.size != node2_write.size or len(node2_read.var_names) != 1:
+        if node2_read.size != node2_write.size:
             return -1
 
         # Verify we have exactly two indexing expressions (one read, one write)
@@ -4739,8 +4744,132 @@ class Scheduler:
             write_expr_index = "index0"
 
         from torch._inductor.invert_expr_analysis import generate_inverse_formula
+        from torch.utils._sympy.functions import FloorDiv, ModularIndexing
 
         index_vars = node2._body.vars[0]  # type: ignore[attr-defined]
+
+        # Handle multi-variable indexing by converting to linear form
+        if len(index_vars) > 1:
+            # Check if write expression is a simple linear combination
+            write_expr = node2._body.indexing_exprs[write_expr_index]  # type: ignore[attr-defined]
+
+            # Compute strides from the size tuple
+            size = node2_write.size
+
+            # Ensure index_vars and size have the same dimensionality
+            # For complex writes with simple reads, use read size to determine iteration space
+            read_size = node2_read.size
+            if len(index_vars) != len(size):
+                # Check if read size matches index_vars dimensionality
+                if len(index_vars) == len(read_size):
+                    # Use read size instead - this is a complex write case
+                    size = read_size
+                else:
+                    return -1
+            strides = []
+            stride = 1
+            for s in reversed(size):
+                strides.insert(0, stride)
+                stride *= s
+
+            # Try to express write_expr as sum of var * stride
+            # Expected form: strides[0]*var[0] + strides[1]*var[1] + ... + strides[n-1]*var[n-1]
+            expected_write = sum(
+                strides[i] * index_vars[i] for i in range(len(index_vars))
+            )
+
+            # Check if write expression matches expected linear form
+            if not V.graph.sizevars.statically_known_equals(
+                sympy.expand(write_expr), sympy.expand(expected_write)
+            ):
+                return -1
+
+            # Create a virtual linear index variable
+            p = sympy.Symbol("_linear_idx", integer=True, nonnegative=True)
+
+            # Substitute vars in read_expr with their linear decomposition
+            # var[i] = (p // product(sizes[i+1:])) % sizes[i]
+            subs = {}
+            for i, var in enumerate(index_vars):
+                if i == 0:
+                    subs[var] = FloorDiv(p, strides[0])
+                else:
+                    divisor = strides[i]
+                    modulo = size[i]
+                    subs[var] = ModularIndexing(p, divisor, modulo)
+
+            read_expr = read_expr.subs(subs)
+
+            # Simplify nested ModularIndexing patterns
+            # ModularIndexing(ModularIndexing(x, d1, m1), 1, m2) where m1 % m2 == 0
+            # simplifies to ModularIndexing(x, d1, m2)
+            def simplify_nested_modular(expr):
+                if isinstance(expr, ModularIndexing):
+                    inner, div, mod = expr.args
+                    if isinstance(inner, ModularIndexing):
+                        inner_x, inner_div, inner_mod = inner.args
+                        # ModularIndexing(ModularIndexing(x, d1, m1), 1, m2) where m2 divides m1
+                        if V.graph.sizevars.statically_known_equals(div, 1):
+                            if V.graph.sizevars.statically_known_multiple_of(inner_mod, mod):
+                                return ModularIndexing(inner_x, inner_div, mod)
+                    return expr
+                elif isinstance(expr, sympy.Add):
+                    return sympy.Add(*[simplify_nested_modular(arg) for arg in expr.args])
+                elif isinstance(expr, sympy.Mul):
+                    return sympy.Mul(*[simplify_nested_modular(arg) for arg in expr.args])
+                elif isinstance(expr, FloorDiv):
+                    base, divisor = expr.args
+                    simplified_base = simplify_nested_modular(base)
+
+                    # Try to simplify FloorDiv(ModularIndexing(x, 1, a) + b*ModularIndexing(x, a, c), d)
+                    # This pattern occurs when reconstructing linear index from multi-dim
+                    # (x % a) + a * ((x // a) % c) = x % (a*c)
+                    # So FloorDiv of this by d becomes ModularIndexing(x, d, (a*c)//d)
+                    if isinstance(simplified_base, sympy.Add) and len(simplified_base.args) == 2:
+                        args = list(simplified_base.args)
+                        mod_term = None
+                        mul_term = None
+                        for arg in args:
+                            if isinstance(arg, ModularIndexing):
+                                mod_term = arg
+                            elif isinstance(arg, sympy.Mul) and len(arg.args) == 2:
+                                mul_term = arg
+
+                        if mod_term is not None and mul_term is not None:
+                            # Check pattern: ModularIndexing(x, 1, a) + a * ModularIndexing(x, a, c)
+                            mod_x, mod_div, mod_mod = mod_term.args
+                            if V.graph.sizevars.statically_known_equals(mod_div, 1):
+                                coef, inner = mul_term.args
+                                if not isinstance(inner, ModularIndexing):
+                                    coef, inner = inner, coef
+                                if isinstance(inner, ModularIndexing):
+                                    inner_x, inner_div, inner_mod = inner.args
+                                    # Check if coef == mod_mod and inner_div == mod_mod
+                                    if (V.graph.sizevars.statically_known_equals(coef, mod_mod) and
+                                        V.graph.sizevars.statically_known_equals(inner_div, mod_mod) and
+                                        V.graph.sizevars.statically_known_equals(mod_x, inner_x)):
+                                        # Total modulus is mod_mod * inner_mod
+                                        total_mod = mod_mod * inner_mod
+                                        # Result is ModularIndexing(x, divisor, total_mod // divisor)
+                                        result_mod = FloorDiv(total_mod, divisor)
+                                        return ModularIndexing(mod_x, divisor, result_mod)
+
+                    return FloorDiv(simplified_base, divisor)
+                return expr
+
+            read_expr = simplify_nested_modular(read_expr)
+
+            # Store the original variables and the linear substitution for later
+            # We'll need to convert back after computing the inverse
+            original_index_vars = index_vars
+            original_strides = strides
+            linear_idx_symbol = p
+            index_vars = [p]
+        else:
+            original_index_vars = None
+            linear_idx_symbol = None
+            original_strides = None
+
         if len(index_vars) != 1:
             return -1
 
@@ -4759,6 +4888,18 @@ class Scheduler:
 
         # === Apply Inversion ===
 
+        # If we used a virtual linear index, substitute it back to original variables
+        if linear_idx_symbol is not None and original_index_vars is not None:
+            # linear_idx = sum(original_index_vars[i] * original_strides[i])
+            linear_to_vars = sum(
+                original_index_vars[i] * original_strides[i]
+                for i in range(len(original_index_vars))
+            )
+            inverse_formula = inverse_formula.subs(linear_idx_symbol, linear_to_vars)
+            # Also need to update the write expression which is currently in terms of
+            # the virtual linear index to be in terms of original variables
+            original_write_expr = node2._body.indexing_exprs[write_expr_index]  # type: ignore[attr-defined]
+
         # Swap the indexing expressions using the inverse formula
         node2._body.indexing_exprs[read_expr_index] = node2._body.indexing_exprs[  # type: ignore[attr-defined]
             write_expr_index
@@ -4767,11 +4908,351 @@ class Scheduler:
 
         # Refresh dependencies and calculate fusion score
         node2.refresh_dependencies(True, False)  # type: ignore[attr-defined]
-        score = self.score_fusion_memory(node1, node2)
+
+        # After successful inversion, the shared data is the intermediate buffer
+        # Compute score as the size of the shared buffer (node1's write = node2's read)
+        score = self.dep_size_hint(node1_write)
         assert isinstance(score, int)
 
         fusion_log.info("Shared memory after inversion: %d", score)
         return score
+
+    def shared_data_after_broadcast_reindexing(
+        self, node1: BaseSchedulerNode, node2: BaseSchedulerNode
+    ) -> int:
+        """
+        Enable fusion between a reduction producer and a pointwise consumer
+        that reads with a broadcast pattern.
+
+        Example pattern:
+        - node1 (reduction): writes buf0[p0] where p0 ∈ [0, N)
+        - node2 (pointwise): reads buf0[A*p0 + (p1//B)] where each value is read B times
+
+        We reshape node2's loops from (p0 ∈ [0, M), p1 ∈ [0, K)) to
+        (q0 ∈ [0, N), q1 ∈ [0, B)) so that the read becomes contiguous.
+
+        Returns:
+            int: Fusion score if successful, -1 if not applicable
+        """
+        fusion_log.debug(
+            "shared_data_after_broadcast_reindexing: checking %s with %s",
+            node1.get_name(),
+            node2.get_name(),
+        )
+
+        if not config.broadcast_loop_reindexing_in_fusion:
+            fusion_log.debug("broadcast_loop_reindexing_in_fusion disabled")
+            return -1
+
+        if any(n.is_cpu() for n in [node1, node2]):
+            fusion_log.debug("CPU nodes not supported")
+            return -1
+
+        # node1 should be the reduction producer, node2 the pointwise consumer
+        if not node1.is_reduction() or node2.is_reduction():
+            fusion_log.debug(
+                "node1.is_reduction()=%s, node2.is_reduction()=%s",
+                node1.is_reduction(),
+                node2.is_reduction(),
+            )
+            return -1
+
+        # Check for shared buffers
+        node1_buffer_names = node1.read_writes.buffer_names()
+        node2_buffer_names = node2.read_writes.buffer_names()
+        common_buffer_names = node1_buffer_names & node2_buffer_names
+
+        fusion_log.debug("common_buffer_names=%s", common_buffer_names)
+
+        if not common_buffer_names:
+            fusion_log.debug("no common buffers")
+            return -1
+
+        # node2's unmet dependencies should only be on node1's buffers
+        node2_unmet_deps = OrderedSet(dep.name for dep in node2.unmet_dependencies)
+        fusion_log.debug(
+            "node2_unmet_deps=%s, node1_buffer_names=%s",
+            node2_unmet_deps,
+            node1_buffer_names,
+        )
+        if node2_unmet_deps - node1_buffer_names:
+            fusion_log.debug("node2 has unmet deps outside node1 buffers")
+            return -1
+
+        # Get node1's write (the reduction output)
+        node1_writes = {dep.name: dep for dep in node1.read_writes.writes}
+        fusion_log.debug("node1_writes=%s", node1_writes)
+        fusion_log.debug("node2.unmet_dependencies=%s", list(node2.unmet_dependencies))
+
+        # Find a broadcast read pattern in node2
+        for dep in node2.unmet_dependencies:
+            fusion_log.debug("  checking dep=%s", dep)
+            if not isinstance(dep, MemoryDep):
+                fusion_log.debug("    not MemoryDep")
+                continue
+            if dep.name not in node1_writes:
+                fusion_log.debug("    dep.name=%s not in node1_writes", dep.name)
+                continue
+
+            node1_write = node1_writes[dep.name]
+            if not isinstance(node1_write, MemoryDep):
+                fusion_log.debug("    node1_write not MemoryDep")
+                continue
+
+            # First check if the read is already contiguous and matches the write
+            # This can happen if reindexing was applied in a previous fusion attempt
+            if dep.num_vars == 1 and node1_write.num_vars >= 1:
+                read_normalized = dep.normalize()
+                write_normalized = node1_write.normalize()
+                fusion_log.debug(
+                    "    checking already-contiguous: read_normalized=%s, write_normalized=%s",
+                    read_normalized,
+                    write_normalized,
+                )
+                if (
+                    read_normalized.index == write_normalized.index
+                    and len(read_normalized.size) >= len(write_normalized.size)
+                    and read_normalized.size[: len(write_normalized.size)]
+                    == write_normalized.size
+                ):
+                    # Already contiguous and matches - return the score
+                    score = self.dep_size_hint(node1_write)
+                    assert isinstance(score, int)
+                    fusion_log.info(
+                        "Already contiguous read matches write: %d",
+                        score,
+                    )
+                    return score
+
+            fusion_log.debug("    calling _detect_broadcast_pattern")
+            # Check if this is a broadcast pattern
+            result = self._detect_broadcast_pattern(node2, dep, node1_write)
+            fusion_log.debug("    result=%s", result)
+            if result is None:
+                continue
+
+            broadcast_factor, read_stride, write_numel = result
+
+            # Apply the loop reindexing transformation
+            success = self._apply_broadcast_reindexing(
+                node2, dep.name, broadcast_factor, read_stride, write_numel
+            )
+            if not success:
+                fusion_log.debug("    apply failed")
+                continue
+
+            # Refresh dependencies and calculate score
+            score = self.dep_size_hint(node1_write)
+            assert isinstance(score, int)
+
+            fusion_log.info(
+                "Shared memory after broadcast reindexing: %d (broadcast_factor=%d)",
+                score,
+                broadcast_factor,
+            )
+            return score
+
+        return -1
+
+    def _detect_broadcast_pattern(
+        self,
+        node2: BaseSchedulerNode,
+        read_dep: MemoryDep,
+        write_dep: MemoryDep,
+    ) -> Optional[tuple[int, int, int]]:
+        """
+        Detect if read_dep follows a broadcast pattern relative to write_dep.
+
+        Pattern: read = stride * p0 + (p1 // broadcast_factor)
+        where write has numel elements and each is read broadcast_factor times.
+
+        Returns (broadcast_factor, read_stride, write_numel) or None if not detected.
+        """
+        from torch.utils._sympy.functions import FloorDiv, ModularIndexing
+
+        fusion_log.debug("_detect_broadcast_pattern: node2=%s", node2.get_name())
+
+        # Get node2's loop body
+        if not hasattr(node2, "_body"):
+            fusion_log.debug("  no _body attribute")
+            return None
+
+        body = node2._body
+        if body is None:
+            fusion_log.debug("  body is None")
+            return None
+
+        fusion_log.debug("  body.vars=%s", body.vars if hasattr(body, "vars") else "N/A")
+        iter_vars = body.vars[0] if hasattr(body, "vars") else []
+        if len(iter_vars) != 2:
+            # Only handle 2D iteration space for now
+            fusion_log.debug("  len(iter_vars)=%d != 2", len(iter_vars))
+            return None
+
+        p0, p1 = iter_vars
+        var_ranges = body.var_ranges if hasattr(body, "var_ranges") else {}
+        fusion_log.debug("  var_ranges=%s", var_ranges)
+        if p0 not in var_ranges or p1 not in var_ranges:
+            fusion_log.debug("  vars not in var_ranges")
+            return None
+
+        p0_range = var_ranges[p0]
+        p1_range = var_ranges[p1]
+        fusion_log.debug("  p0_range=%s, p1_range=%s", p0_range, p1_range)
+
+        # Get the read index expression
+        read_index = read_dep.index
+        fusion_log.debug("  read_index (orig)=%s", read_index)
+
+        # The MemoryDep uses its own symbols (d0, d1) while the LoopBody uses different
+        # symbols (p0, p1). We need to substitute the MemoryDep's symbols with the
+        # LoopBody's symbols based on matching ranges.
+        dep_vars = read_dep.var_names
+        if len(dep_vars) == 2:
+            d0, d1 = dep_vars
+            # Map dep vars to body vars based on position (both have same order)
+            var_subs = {d0: p0, d1: p1}
+            read_index = read_index.subs(var_subs)
+            fusion_log.debug("  read_index (after var subs)=%s", read_index)
+
+        # Try to match pattern: stride * p0 + (p1 // divisor)
+        # or the equivalent with FloorDiv
+        read_index = V.graph.sizevars.simplify_with_ranges(read_index, var_ranges)
+        fusion_log.debug("  read_index (simplified)=%s", read_index)
+
+        # Try common broadcast factors
+        for broadcast_factor in [2, 4, 8, 16, 32, 64, 128]:
+            if p1_range % broadcast_factor != 0:
+                continue
+
+            # Expected read stride is p1_range // broadcast_factor
+            read_stride = p1_range // broadcast_factor
+
+            # Expected pattern: read_stride * p0 + (p1 // broadcast_factor)
+            expected_patterns = [
+                read_stride * p0 + FloorDiv(p1, broadcast_factor),
+                read_stride * p0 + (p1 // broadcast_factor),
+            ]
+
+            for expected in expected_patterns:
+                expected_simplified = V.graph.sizevars.simplify_with_ranges(
+                    expected, var_ranges
+                )
+                fusion_log.debug(
+                    "    trying broadcast_factor=%d, expected_simplified=%s",
+                    broadcast_factor,
+                    expected_simplified,
+                )
+                if V.graph.sizevars.statically_known_equals(
+                    read_index, expected_simplified
+                ):
+                    # Calculate write numel
+                    write_numel = p0_range * read_stride
+                    # Verify this matches write_dep's size (size is a tuple)
+                    write_total = 1
+                    for s in write_dep.size:
+                        write_total *= s
+                    fusion_log.debug(
+                        "    MATCH! write_numel=%s, write_total=%s",
+                        write_numel,
+                        write_total,
+                    )
+                    if write_total == write_numel:
+                        return broadcast_factor, read_stride, write_numel
+
+        return None
+
+    def _apply_broadcast_reindexing(
+        self,
+        node2: BaseSchedulerNode,
+        buffer_name: str,
+        broadcast_factor: int,
+        read_stride: int,
+        write_numel: int,
+    ) -> bool:
+        """
+        Apply loop reindexing to make broadcast reads contiguous.
+
+        Transform from:
+            p0 ∈ [0, M), p1 ∈ [0, K)
+            read = read_stride * p0 + (p1 // broadcast_factor)
+
+        To:
+            q0 ∈ [0, write_numel), q1 ∈ [0, broadcast_factor)
+            read = q0
+
+        Where:
+            p0 = q0 // read_stride
+            p1 = (q0 % read_stride) * broadcast_factor + q1
+        """
+        from torch.utils._sympy.functions import FloorDiv, ModularIndexing
+
+        if not hasattr(node2, "_body") or node2._body is None:
+            return False
+
+        body = node2._body
+        iter_vars = body.vars[0] if hasattr(body, "vars") else []
+        if len(iter_vars) != 2:
+            return False
+
+        p0, p1 = iter_vars
+        var_ranges = body.var_ranges if hasattr(body, "var_ranges") else {}
+
+        p0_range = var_ranges[p0]
+        p1_range = var_ranges[p1]
+
+        # New iteration sizes
+        new_iter_sizes = [write_numel, broadcast_factor]
+        old_reduce_sizes = body.vars[1] if len(body.vars) > 1 else []
+
+        # Create new variables
+        (new_iter_vars, new_reduce_vars), new_var_ranges = dependencies.index_vars_no_squeeze(
+            new_iter_sizes, list(old_reduce_sizes), prefix="q"
+        )
+
+        q0, q1 = new_iter_vars[:2]
+
+        # Create reindexing: old vars as function of new vars
+        def iter_reindex(new_vars):
+            q0_val, q1_val = new_vars[0], new_vars[1]
+            # p0 = q0 // read_stride
+            # p1 = (q0 % read_stride) * broadcast_factor + q1
+            old_p0 = FloorDiv(q0_val, read_stride)
+            old_p1 = ModularIndexing(q0_val, 1, read_stride) * broadcast_factor + q1_val
+            return [old_p0, old_p1]
+
+        def reduce_reindex(vars):
+            return vars
+
+        # Create new LoopBody with reindexed loops
+        new_body = LoopBody(
+            body,
+            [iter_reindex(new_iter_vars), reduce_reindex(new_reduce_vars)],
+            new_var_ranges,
+            new_iter_vars,
+            new_reduce_vars,
+        )
+
+        # Update node2's body and sizes
+        node2._body = new_body
+        node2._sizes = (new_iter_sizes, list(old_reduce_sizes))
+
+        # Update the group to reflect the new iteration sizes
+        # This is critical for fusion checks in simd.py which compare numels
+        device = node2.node.get_device_or_error()
+        group_fn = self.get_backend(device).group_fn
+        node2.group = (device, group_fn(node2._sizes))
+
+        # Refresh dependencies
+        node2.refresh_dependencies(True, True)
+
+        fusion_log.debug(
+            "_apply_broadcast_reindexing: after refresh, node2.unmet_dependencies=%s, node2.group=%s",
+            list(node2.unmet_dependencies),
+            node2.group,
+        )
+
+        return True
 
     def shared_data_after_reordering_loop(
         self, node1: BaseSchedulerNode, node2: BaseSchedulerNode
@@ -4932,106 +5413,6 @@ class Scheduler:
             return False
 
         return True
-
-    def _check_halving_pattern_expand(
-        self, node1: BaseSchedulerNode, node2: BaseSchedulerNode
-    ) -> Optional[tuple[SchedulerNode, int, sympy.Expr]]:
-        """
-        Check if this is a halving pattern (reduction -> halving pointwise) that
-        can benefit from dimension expansion.
-
-        A halving pattern occurs when:
-        - One node is a reduction with (numel, rnumel) = (N, R)
-        - The other node is a pointwise with 2D structure [N, R/2]
-        - The halving node produces half as many outputs as the reduction consumes
-
-        To fuse these, we expand the halving node's inner dimension from R/2 to R,
-        using modular indexing to produce the correct outputs.
-
-        Returns (halving_node, expand_dim, expand_size, needs_expand) if halving pattern detected,
-        None otherwise.
-        """
-        # Identify reduction and potential halving node
-        if node1.is_reduction() and not node2.is_reduction():
-            reduction_node, halving_candidate = node1, node2
-        elif node2.is_reduction() and not node1.is_reduction():
-            reduction_node, halving_candidate = node2, node1
-        else:
-            return None
-
-        fusion_log.debug("Checking halving pattern: reduction=%s, candidate=%s",
-                         reduction_node.get_name(), halving_candidate.get_name())
-
-        # Only support SchedulerNode for expansion
-        if not isinstance(halving_candidate, SchedulerNode):
-            return None
-
-        # Check for computed buffer (needed for expand_dimension)
-        if not isinstance(halving_candidate.node, ir.ComputedBuffer):
-            return None
-
-        # Get reduction dimensions
-        _, (numel_red, rnumel_red) = reduction_node.group
-        _, (numel_half, rnumel_half) = halving_candidate.group
-
-        # Halving pattern check: halving_numel * 2 == reduction_numel * rnumel
-        # and halving has rnumel=1 (pure pointwise)
-        sv = V.graph.sizevars
-        fusion_log.debug("  groups: red=(%s, %s), half=(%s, %s)",
-                         numel_red, rnumel_red, numel_half, rnumel_half)
-
-        if not sv.statically_known_equals(rnumel_half, sympy.S.One):
-            fusion_log.debug("  Rejected: rnumel_half != 1")
-            return None
-
-        total_red = sv.simplify(numel_red * rnumel_red)
-
-        # Check for halving pattern: halving_numel * 2 == total_red
-        # OR already-expanded halving: halving_numel == total_red (node was previously expanded)
-        is_halving = sv.statically_known_equals(numel_half * 2, total_red)
-        is_already_expanded = sv.statically_known_equals(numel_half, total_red)
-
-        if not is_halving and not is_already_expanded:
-            fusion_log.debug("  Rejected: %s * 2 != %s and %s != %s",
-                             numel_half, total_red, numel_half, total_red)
-            return None
-
-        # Check halving node has 2D structure [outer, inner] where outer == numel_red
-        halving_sizes = halving_candidate._sizes
-        if not halving_sizes or len(halving_sizes[0]) != 2:
-            fusion_log.debug("  Rejected: halving_sizes=%s not 2D", halving_sizes)
-            return None
-
-        outer_dim = sv.simplify(halving_sizes[0][0])
-        inner_dim = sv.simplify(halving_sizes[0][1])
-
-        if not sv.statically_known_equals(outer_dim, numel_red):
-            fusion_log.debug("  Rejected: outer_dim=%s != numel_red=%s", outer_dim, numel_red)
-            return None
-
-        if is_already_expanded:
-            # Already expanded - inner_dim should equal rnumel_red
-            if not sv.statically_known_equals(inner_dim, rnumel_red):
-                fusion_log.debug("  Rejected: already-expanded inner_dim=%s != rnumel_red=%s",
-                                 inner_dim, rnumel_red)
-                return None
-            # No expansion needed, but return the pattern info for fusion allowance
-            # The 4th element (needs_expand=False) indicates this is already expanded
-            fusion_log.info("Found already-expanded halving pattern (dim 1 = %s)", inner_dim)
-            return (halving_candidate, 1, rnumel_red, False)
-        else:
-            # inner_dim should be rnumel_red / 2
-            if not sv.statically_known_equals(inner_dim * 2, rnumel_red):
-                fusion_log.debug("  Rejected: inner_dim=%s * 2 != rnumel_red=%s", inner_dim, rnumel_red)
-                return None
-
-            # Found halving pattern
-            # DON'T expand - use split iteration ranges at codegen time instead
-            # This avoids the overhead of running 16 iterations with half masked off
-            # Set needs_expand=False so the body keeps its original indexing
-            fusion_log.info("Found halving pattern (dim 1 = %s, rnumel = %s) - using split iteration",
-                            inner_dim, rnumel_red)
-            return (halving_candidate, 1, rnumel_red, False)
 
     def get_expand_dim_for_pointwise_nodes(
         self, node1: BaseSchedulerNode, node2: BaseSchedulerNode
@@ -5281,30 +5662,28 @@ class Scheduler:
             shared_data_score = self.score_fusion_memory(node1, node2)
             assert isinstance(shared_data_score, int)
 
-        # Check for halving pattern: reduction -> pointwise that halves the output
-        # e.g., reduction (numel=65536, rnumel=16) + halving (numel=524288, rnumel=1)
-        # where halving node has 2D structure [65536, 8] (outer=numel, inner=rnumel/2)
-        if (
-            halving_expand := self._check_halving_pattern_expand(node1, node2)
-        ):
-            (halving_node, expand_dim, expand_size, needs_expand) = halving_expand
-            if needs_expand:
-                halving_node.expand_dimension_for_pointwise_node(expand_dim, expand_size)
-            # After expansion (or for already-expanded), score_fusion_memory may return 0
-            # because indexing changed. But we know this is a valid fusion (they share the input data)
-            # Set a positive score to allow fusion
-            shared_data_score = max(
-                self.score_fusion_memory(node1, node2),
-                config.score_fusion_memory_threshold  # Ensure we meet threshold
-            )
-            assert isinstance(shared_data_score, int)
-
         if (
             config.loop_index_inversion_in_fusion
             and shared_data_score < config.score_fusion_memory_threshold
         ):
             new_shared_data_score = self.shared_data_after_inverting_indexing(
                 node1, node2
+            )
+            if new_shared_data_score >= 0:
+                shared_data_score = new_shared_data_score
+
+        if (
+            config.broadcast_loop_reindexing_in_fusion
+            and shared_data_score < config.score_fusion_memory_threshold
+        ):
+            new_shared_data_score = self.shared_data_after_broadcast_reindexing(
+                node1, node2
+            )
+            fusion_log.debug(
+                "shared_data_after_broadcast_reindexing returned %s for %s and %s",
+                new_shared_data_score,
+                node1.get_name(),
+                node2.get_name(),
             )
             if new_shared_data_score >= 0:
                 shared_data_score = new_shared_data_score
@@ -5318,20 +5697,32 @@ class Scheduler:
             )
 
         if not V.choices.can_fuse(self, node1, node2, shared_data_score):
+            fusion_log.debug(
+                "V.choices.can_fuse returned False for %s and %s, shared_data_score=%s",
+                node1.get_name(),
+                node2.get_name(),
+                shared_data_score,
+            )
             return False
 
         if node1.get_operation_names() & node2.ancestors:
             # node2 depends on node1 outputs
+            cfv_result = self.can_fuse_vertical(node1, node2)
+            fusion_log.debug(
+                "can_fuse_vertical returned %s for %s and %s",
+                cfv_result,
+                node1.get_name(),
+                node2.get_name(),
+            )
             return (
-                self.can_fuse_vertical(node1, node2)
+                cfv_result
                 and V.choices.can_fuse_vertical(self, node1, node2, shared_data_score)
                 and self.get_backend(device).can_fuse_vertical(node1, node2)
             )
         else:  # nodes don't depend on each other, but may have common reads
-            return (
-                V.choices.can_fuse_horizontal(self, node1, node2, shared_data_score)
-                and self.get_backend(device).can_fuse_horizontal(node1, node2)
-            )
+            return V.choices.can_fuse_horizontal(
+                self, node1, node2, shared_data_score
+            ) and self.get_backend(device).can_fuse_horizontal(node1, node2)
 
     def can_fuse_vertical(
         self, node1: BaseSchedulerNode, node2: BaseSchedulerNode
@@ -5448,10 +5839,10 @@ class Scheduler:
             ):
                 return False
 
-            if config.loop_ordering_after_fusion or read.index != write.index:
-                # Need to normalize if:
-                # 1. loop_ordering_after_fusion is enabled and num_vars differ
-                # 2. indices don't match (may have different variable names due to expansion)
+            if config.loop_ordering_after_fusion and read.num_vars != write.num_vars:
+                # Need merge loops if we do loop ordering after fusion since
+                # we have not merged the loops yet when creating the scheduler
+                # nodes.
                 read = read.normalize()
                 write = write.normalize()
 

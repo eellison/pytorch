@@ -4,12 +4,16 @@ from __future__ import annotations
 import collections
 import functools
 import itertools
+import logging
 import re
 from enum import auto, Enum
+
+log = logging.getLogger(__name__)
 from typing import Any, NamedTuple, Optional, TYPE_CHECKING, TypeVar
 
 import sympy
 
+import torch
 import torch.fx
 from torch._dynamo.utils import identity
 from torch.fx.proxy import Scope, TracerBase
@@ -433,6 +437,327 @@ class LoopBody:
             and len(self.submodules) == 1  # get_index
             and self.root_block.contains_only_ops(("load", "store"))
         )
+
+    # Dtypes that support stride-2 coalesced loads
+    # Maps dtype -> (packed_dtype, bits_per_element)
+    STRIDE2_COALESCE_DTYPES: dict[torch.dtype, tuple[torch.dtype, int]] = {
+        torch.bfloat16: (torch.int32, 16),  # 2x bf16 -> uint32
+        torch.float16: (torch.int32, 16),   # 2x fp16 -> uint32
+        torch.float32: (torch.int64, 32),   # 2x fp32 -> uint64 (for complex64)
+    }
+
+    def detect_stride2_load_pairs(self) -> list[tuple[str, str, str, str, torch.dtype]]:
+        """
+        Detect pairs of loads that follow a stride-2 pattern and can be coalesced.
+
+        This is a general optimization for:
+        - bf16/fp16 halving patterns (2x 16-bit -> uint32)
+        - complex64 real/imag access (2x 32-bit -> uint64)
+
+        Returns:
+            List of (even_buffer, odd_buffer, even_index_name, odd_index_name, dtype) tuples
+            for each detected stride-2 pair. even_buffer and odd_buffer may be the same
+            (normal case) or different (complex64 real/imag case).
+        """
+        from .virtualized import V
+
+        # Helper to get base buffer name (unwrap views and MultiOutput)
+        def get_base_buffer(buf_name: str) -> str:
+            from . import ir
+            try:
+                visited = set()
+                while buf_name not in visited:
+                    visited.add(buf_name)
+                    buf = V.graph.get_buffer(buf_name)
+                    log.debug("get_base_buffer(%s): type=%s", buf_name, type(buf).__name__)
+
+                    # Handle MultiOutput (e.g., from view_as_real)
+                    if isinstance(buf, ir.MultiOutput):
+                        if buf.inputs and hasattr(buf.inputs[0], 'get_name'):
+                            new_name = buf.inputs[0].get_name()
+                            log.debug("  MultiOutput -> %s", new_name)
+                            buf_name = new_name
+                            continue
+
+                    # Handle FallbackKernel with aliases (e.g., view_as_real)
+                    # Multiple FallbackKernels may alias the same underlying tensor
+                    if isinstance(buf, ir.FallbackKernel):
+                        aliases = getattr(buf, 'alias_names', None) or []
+                        if aliases:
+                            # Use the first alias as the canonical base
+                            alias_name = aliases[0]
+                            log.debug("  FallbackKernel alias -> %s", alias_name)
+                            return alias_name
+
+                        # For view_as_real and similar ops, trace through inputs
+                        # view_as_real returns a view of the complex tensor as real pairs
+                        if buf.inputs and hasattr(buf.inputs[0], 'get_name'):
+                            new_name = buf.inputs[0].get_name()
+                            log.debug("  FallbackKernel input -> %s", new_name)
+                            buf_name = new_name
+                            continue
+
+                    # Follow the chain of views via data attribute
+                    if hasattr(buf, 'data'):
+                        inner = buf.data
+                        if hasattr(inner, 'get_name'):
+                            new_name = inner.get_name()
+                            log.debug("  data -> %s", new_name)
+                            buf_name = new_name
+                            continue
+
+                    # No more chain to follow
+                    break
+
+                return buf_name
+            except Exception as e:
+                log.debug("get_base_buffer error: %s", e)
+                return buf_name
+
+        # Group loads by BASE buffer name (unwrapping views)
+        loads_by_buffer: dict[str, list[tuple[str, sympy.Expr, str]]] = {}
+        for entry in self.memory_usage[MemoryUsageType.LOAD]:
+            if entry.buffer_name is None:
+                continue
+            index_expr = self.indexing_exprs.get(entry.index_name)
+            if index_expr is None:
+                continue
+
+            base_buf = get_base_buffer(entry.buffer_name)
+            log.debug("Load: buf=%s -> base=%s, idx=%s", entry.buffer_name, base_buf, index_expr)
+
+            if base_buf not in loads_by_buffer:
+                loads_by_buffer[base_buf] = []
+            # Store original buffer name too for tracking
+            loads_by_buffer[base_buf].append((entry.index_name, index_expr, entry.buffer_name))
+
+        result = []
+        for base_buf, loads in loads_by_buffer.items():
+            if len(loads) < 2:
+                continue
+
+            # Look for stride-2 pairs: indices like 2*x and 1+2*x
+            for i, (name1, idx1, orig_buf1) in enumerate(loads):
+                for name2, idx2, orig_buf2 in loads[i + 1:]:
+                    pair = self._is_stride2_pair(idx1, idx2)
+                    if pair is not None:
+                        # Check dtype of the actual load buffer (not base buffer)
+                        try:
+                            dtype = V.graph.get_dtype(orig_buf1)
+                        except Exception:
+                            continue
+                        if dtype not in self.STRIDE2_COALESCE_DTYPES:
+                            log.debug("Skipping pair: dtype %s not supported", dtype)
+                            continue
+
+                        even_idx, odd_idx = pair
+                        # Return both buffer names (may be same or different)
+                        if even_idx == idx1:
+                            result.append((orig_buf1, orig_buf2, name1, name2, dtype))
+                        else:
+                            result.append((orig_buf2, orig_buf1, name2, name1, dtype))
+                        log.debug(
+                            "Found stride-2 pair: even=%s, odd=%s, dtype=%s",
+                            orig_buf1 if even_idx == idx1 else orig_buf2,
+                            orig_buf2 if even_idx == idx1 else orig_buf1,
+                            dtype
+                        )
+
+        return result
+
+    def _is_stride2_pair(
+        self, idx1: sympy.Expr, idx2: sympy.Expr
+    ) -> Optional[tuple[sympy.Expr, sympy.Expr]]:
+        """
+        Check if two index expressions form a stride-2 pair.
+
+        Returns (even_index, odd_index) if they do, None otherwise.
+        A stride-2 pair has indices like:
+        - even: 2*x (or equivalent)
+        - odd: 1 + 2*x (or equivalent)
+        """
+        # Check if difference is 1 or -1
+        diff = sympy.simplify(idx2 - idx1)
+        if diff == 1:
+            # idx1 is even, idx2 is odd
+            return (idx1, idx2)
+        elif diff == -1:
+            # idx2 is even, idx1 is odd
+            return (idx2, idx1)
+
+        # Check for stride-2 pattern in the expressions themselves
+        # Look for patterns like "2*x" vs "1 + 2*x"
+        idx1_str = str(idx1)
+        idx2_str = str(idx2)
+
+        # Simple heuristic: if one has "2*" and diff of +/-1 after factoring
+        if "2*" in idx1_str or "2*" in idx2_str:
+            # Try to detect even/odd pattern
+            # Even pattern: 2*x where x is some expression
+            # Odd pattern: 1 + 2*x
+            for sym in idx1.free_symbols & idx2.free_symbols:
+                # Substitute x=0 and check if one is 0, other is 1
+                idx1_at_0 = idx1.subs(sym, 0)
+                idx2_at_0 = idx2.subs(sym, 0)
+                idx1_at_1 = idx1.subs(sym, 1)
+                idx2_at_1 = idx2.subs(sym, 1)
+
+                # Check for stride-2: (0,1) at x=0 and (2,3) at x=1
+                if idx1_at_0 == 0 and idx2_at_0 == 1:
+                    if idx1_at_1 == 2 and idx2_at_1 == 3:
+                        return (idx1, idx2)
+                elif idx2_at_0 == 0 and idx1_at_0 == 1:
+                    if idx2_at_1 == 2 and idx1_at_1 == 3:
+                        return (idx2, idx1)
+
+        return None
+
+    def transform_stride2_loads(self, skip_buffers: Optional[set] = None) -> bool:
+        """
+        Transform stride-2 load pairs into coalesced loads at the IR level.
+
+        This replaces patterns like:
+            val0 = load(buf, 2*x)
+            val1 = load(buf, 2*x + 1)
+        With:
+            packed = load_reinterpreted(buf, x, wider_dtype)
+            val0 = bitcast(packed & mask, original_dtype)
+            val1 = bitcast(packed >> bits, original_dtype)
+
+        Args:
+            skip_buffers: Set of buffer names to skip (e.g., buffers that have
+                         stride-1 loads which will use kernel-level derivation)
+
+        Returns True if any transformation was made.
+        """
+        pairs = self.detect_stride2_load_pairs()
+        if not pairs:
+            return False
+
+        skip_buffers = skip_buffers or set()
+
+        from .virtualized import V
+
+        # Transform the root_block's graph
+        graph = self.root_block.graph
+        transformed = False
+
+        for even_buf, odd_buf, even_idx_name, odd_idx_name, dtype in pairs:
+            if dtype not in self.STRIDE2_COALESCE_DTYPES:
+                continue
+
+            # Skip buffers that have stride-1 loads (handled by kernel-level derivation)
+            if even_buf in skip_buffers or odd_buf in skip_buffers:
+                log.debug("Skipping %s/%s: has stride-1 load elsewhere", even_buf, odd_buf)
+                continue
+
+            packed_dtype, bits = self.STRIDE2_COALESCE_DTYPES[dtype]
+            even_idx = self.indexing_exprs.get(even_idx_name)
+            odd_idx = self.indexing_exprs.get(odd_idx_name)
+
+            if even_idx is None or odd_idx is None:
+                continue
+
+            # Find the load nodes in the graph
+            # The structure is: get_index('index0') -> load(ops, buf, get_index_result)
+            even_load = None
+            odd_load = None
+            even_get_index = None
+            odd_get_index = None
+
+            # First find the get_index nodes for our index names
+            for node in graph.nodes:
+                if node.op == "call_module" and node.target == "get_index":
+                    if len(node.args) >= 1:
+                        idx_name = node.args[0]
+                        if idx_name == even_idx_name:
+                            even_get_index = node
+                        elif idx_name == odd_idx_name:
+                            odd_get_index = node
+
+            # Now find the loads that use these get_index results
+            for node in graph.nodes:
+                if node.op == "call_method" and node.target == "load":
+                    if len(node.args) >= 3:
+                        node_buf = node.args[1]
+                        node_idx = node.args[2]  # This is the get_index result node
+                        if node_buf == even_buf and node_idx is even_get_index:
+                            even_load = node
+                        elif node_buf == odd_buf and node_idx is odd_get_index:
+                            odd_load = node
+
+            if even_load is None or odd_load is None:
+                log.debug(
+                    "Could not find load nodes for %s[%s] / %s[%s]",
+                    even_buf, even_idx_name, odd_buf, odd_idx_name
+                )
+                continue
+
+            # Compute the coalesced index: even_idx / 2 (since even_idx = 2*x)
+            # For stride-2 pattern, even_idx = 2*x, so coalesced_idx = x
+            coalesced_idx = sympy.simplify(even_idx / 2)
+            # Add the new index expression directly (add_index_expr not available post-init)
+            coalesced_idx_name = f"index{len(self.indexing_exprs)}"
+            self.indexing_exprs[coalesced_idx_name] = coalesced_idx
+            self.memory_usage[MemoryUsageType.LOAD].append(
+                MemoryEntry(coalesced_idx_name, even_buf, None)
+            )
+
+            log.debug(
+                "Transforming: %s[%s] + %s[%s] -> coalesced[%s]",
+                even_buf, even_idx, odd_buf, odd_idx, coalesced_idx
+            )
+
+            # Insert new nodes before the first load
+            with graph.inserting_before(even_load):
+                ops_handler = even_load.args[0]
+
+                # Create get_index for coalesced index
+                coalesced_get_index = graph.call_module("get_index", (coalesced_idx_name,))
+
+                # Load as wider type
+                packed_load = graph.call_method(
+                    "load_reinterpreted",
+                    (ops_handler, even_buf, coalesced_get_index, packed_dtype)
+                )
+
+                # Extract even (lower bits)
+                mask = 0xFFFF if bits == 16 else 0xFFFFFFFF
+                mask_val = graph.call_method("constant", (ops_handler, mask, packed_dtype))
+                even_bits = graph.call_method("bitwise_and", (ops_handler, packed_load, mask_val))
+
+                # Extract odd (upper bits)
+                shift_val = graph.call_method("constant", (ops_handler, bits, packed_dtype))
+                odd_bits = graph.call_method("bitwise_right_shift", (ops_handler, packed_load, shift_val))
+
+                # Bitcast back to original dtype
+                intermediate_dtype = torch.uint16 if bits == 16 else torch.uint32
+                even_as_int = graph.call_method(
+                    "to_dtype", (ops_handler, even_bits, intermediate_dtype, packed_dtype, False)
+                )
+                even_val = graph.call_method(
+                    "to_dtype_bitcast", (ops_handler, even_as_int, dtype, intermediate_dtype)
+                )
+
+                odd_as_int = graph.call_method(
+                    "to_dtype", (ops_handler, odd_bits, intermediate_dtype, packed_dtype, False)
+                )
+                odd_val = graph.call_method(
+                    "to_dtype_bitcast", (ops_handler, odd_as_int, dtype, intermediate_dtype)
+                )
+
+            # Replace uses of old loads with new values
+            even_load.replace_all_uses_with(even_val)
+            odd_load.replace_all_uses_with(odd_val)
+
+            # Remove old load nodes
+            graph.erase_node(even_load)
+            graph.erase_node(odd_load)
+
+            transformed = True
+            log.debug("Transformed stride-2 loads for %s/%s", even_buf, odd_buf)
+
+        return transformed
 
     __repr__ = debug_str
 

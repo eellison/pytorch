@@ -555,7 +555,7 @@ class InductorChoices:
             WhyNoFuse(node1, node2)("exceeds max fusion")
             return False  # heuristic not needed for correctness
 
-        if scheduler.can_fusion_increase_peak_memory(node1, node2):
+        if scheduler.can_fusion_increase_peak_memory(node1, node2, shared_data_score):
             WhyNoFuse(node1, node2)("Fusion will increase peak memory")
             return False
 

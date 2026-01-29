@@ -153,6 +153,11 @@ class DtypePropagationOpsHandler:
         return upcast_compute_type(V.graph.get_dtype(name))
 
     @staticmethod
+    def load_reinterpreted(name: str, index: sympy.Expr, as_dtype: torch.dtype) -> torch.dtype:
+        # Return the reinterpreted dtype, possibly upcasted for computation
+        return upcast_compute_type(as_dtype)
+
+    @staticmethod
     def randint64(seed: int, offset: int, low: int, high: int) -> torch.dtype:
         return torch.int64
 

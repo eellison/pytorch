@@ -2775,6 +2775,13 @@ class CSEProxy(DefaultHandler):
             self.kernel.num_load += 1
         return out
 
+    def load_reinterpreted(self, name: str, index: sympy.Expr, as_dtype: torch.dtype) -> CSEVariable:
+        """Load from buffer reinterpreted as a different dtype (for coalesced loads)."""
+        out = self.kernel.load_reinterpreted(name, index, as_dtype)
+        if out.use_count == 1:
+            self.kernel.num_load += 1
+        return out
+
     def _update_store_cache(self, name: str, value: CSEVariable) -> None:
         self.kernel.cse.store_cache[name] = value
         if self.kernel.current_node and name in V.graph.name_to_buffer:

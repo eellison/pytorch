@@ -219,6 +219,18 @@ class OpsHandler(Generic[T]):
         """
         raise NotImplementedError
 
+    def load_reinterpreted(self, name: str, index: sympy.Expr, as_dtype: torch.dtype) -> T:
+        """
+        Load from memory location 'name' at 'index', reinterpreting the memory as 'as_dtype'.
+
+        This is used for coalesced load optimizations where we load a wider type
+        (e.g., uint32 for two bf16 values, uint64 for two fp32 values) and then
+        extract the individual elements via bit operations.
+
+        The index is in units of as_dtype (not the buffer's native dtype).
+        """
+        raise NotImplementedError
+
     def store(
         self,
         name: str,

@@ -765,6 +765,9 @@ loop_ordering_after_fusion: bool = (
 # so that the nodes can fuse. for more details: https://gist.github.com/eellison/6f9f4a7ec10a860150b15b719f9285a9
 loop_index_inversion_in_fusion: bool = True
 
+# Enable broadcast loop reindexing optimization in fusion
+broadcast_loop_reindexing_in_fusion: bool = True
+
 # If fusing two nodes only save less then score_fusion_memory_threshold memory,
 # we should not bother fusing the nodes.
 #
@@ -1534,6 +1537,10 @@ class triton:
 
     # Always load full blocks (rather than broadcasting inside the block)
     dense_indexing = False
+
+    # Enable load deduplication: derive stride-2 loads from stride-1 loads
+    # using reshape+split instead of issuing separate memory loads
+    load_deduplication = False
 
     # TODO - enable by default
     coalesce_tiling_analysis: bool = (

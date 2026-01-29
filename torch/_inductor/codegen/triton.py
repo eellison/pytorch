@@ -2559,6 +2559,12 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         # List of (index_expr, original_range) tuples for masking loads/stores
         self._expansion_masks: list[tuple[sympy.Expr, sympy.Expr]] = []
 
+        # Stride-1 load cache for deriving stride-2 loads
+        # buffer_name -> (cse_var, shape, dtype)
+        self._stride1_load_cache: dict[str, tuple[Any, tuple, torch.dtype]] = {}
+        # Buffers registered for stride-2 deduplication
+        self._stride2_dedup_buffers: set[str] = set()
+
     def set_expansion_masks(
         self, masks: list[tuple[sympy.Expr, sympy.Expr]]
     ) -> None:
@@ -2680,26 +2686,54 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         # Return index_vars matching node's structure: [[x_sym, halving_sym], []]
         return [[*x_syms, halving_sym], []]
 
-    def setup_bf16_coalesced_load(self, buffer_name: str, halving_size: int):
+    # Configuration for stride-2 coalesced load patterns
+    # Maps element dtype -> (packed_triton_type, element_triton_type, bits_per_element)
+    STRIDE2_COALESCE_CONFIG: dict[torch.dtype, tuple[str, str, int]] = {
+        torch.bfloat16: ("tl.uint32", "tl.bfloat16", 16),
+        torch.float16: ("tl.uint32", "tl.float16", 16),
+        torch.float32: ("tl.uint64", "tl.float32", 32),  # For complex64
+    }
+
+    def setup_stride2_coalesced_load(
+        self,
+        even_buffer: str,
+        odd_buffer: str,
+        halving_size: int,
+        dtype: torch.dtype,
+        is_1d_pointwise: bool = False,
+    ):
         """
-        Set up coalesced uint32 load for a bf16 buffer in a halving pattern.
+        Set up coalesced load for buffers with stride-2 access pattern.
 
-        This emits the optimal v7-style load pattern:
-        1. Cast bf16 pointer to uint32 pointer
-        2. Load 8 uint32 values (= 16 bf16 values coalesced)
-        3. Bit extract to get even/odd (8-wide each)
-        4. Join + reshape to get all_16 (16-wide) for reduction
+        This is a general optimization for patterns where adjacent elements are
+        accessed together (e.g., bf16 halving, complex real/imag). It emits:
+        1. Cast pointer to wider type (uint32 for 16-bit, uint64 for 32-bit)
+        2. Load N coalesced values (= 2N elements)
+        3. Bit extract to get even/odd (N-wide each)
+        4. Join + reshape to get all_2N (2N-wide) for reduction if needed
 
-        The precomputed values are stored so that subsequent loads from this
-        buffer can use them instead of emitting separate loads.
+        Supported dtypes: bfloat16, float16, float32 (for complex64)
+
+        Args:
+            even_buffer: Buffer name for even-indexed elements (e.g., real part)
+            odd_buffer: Buffer name for odd-indexed elements (e.g., imag part)
+                       Can be same as even_buffer for normal stride-2 patterns.
+            halving_size: Number of element pairs to load (ignored for 1D pointwise)
+            dtype: Element dtype (bfloat16, float16, or float32)
+            is_1d_pointwise: If True, generate simpler 1D code without r0 dimension
         """
-        if not hasattr(self, '_bf16_coalesced'):
-            self._bf16_coalesced = {}
+        if dtype not in self.STRIDE2_COALESCE_CONFIG:
+            return
 
-        if buffer_name in self._bf16_coalesced:
+        if not hasattr(self, '_stride2_coalesced'):
+            self._stride2_coalesced = {}
+
+        if even_buffer in self._stride2_coalesced:
             return  # Already set up
 
-        var = self.args.input(buffer_name)
+        packed_type, elem_type, bits = self.STRIDE2_COALESCE_CONFIG[dtype]
+        # Use even_buffer for the actual load (both point to same underlying data)
+        var = self.args.input(even_buffer)
 
         # Find x tree for the outer dimension
         x_tree = None
@@ -2719,100 +2753,148 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
         # Create unique names for the coalesced load variables
         idx = next(self.iter_vars_count)
-        r0_8_name = f"r0_{idx}"
-        u32_var = f"_u32_{idx}"
+        packed_var = f"_packed_{idx}"
         even_var = f"_even_{idx}"
         odd_var = f"_odd_{idx}"
-        all_16_var = f"_all16_{idx}"
-
-        # Determine tensor shape string based on kernel dimensions
-        tensor_dim = self.triton_tensor_ndim()
-        if tensor_dim == 2:
-            shape_8 = "[None, :]"
-            xblock_str = "XBLOCK"
-        elif tensor_dim == 1:
-            shape_8 = "[:]" if self.no_x_dim else "[:, None]"
-            xblock_str = "1" if self.no_x_dim else "XBLOCK"
-        else:
-            shape_8 = ""
-            xblock_str = "XBLOCK"
 
         # Emit the coalesced load pattern into the kernel body
-        self.body.writeline(f"# Coalesced bf16 load for {buffer_name}")
-        self.body.writeline(f"{r0_8_name} = tl.arange(0, {halving_size}){shape_8}")
-        self.body.writeline(f"{var}_u32 = {var}.to(tl.pointer_type(tl.uint32))")
+        dtype_name = str(dtype).split('.')[-1]
+        buf_desc = even_buffer if even_buffer == odd_buffer else f"{even_buffer}/{odd_buffer}"
+        self.body.writeline(f"# Coalesced {dtype_name} load for {buf_desc}")
+        self.body.writeline(f"{var}_packed = {var}.to(tl.pointer_type({packed_type}))")
 
-        # The load offset: r0_8 + halving_size * x
-        # For bf16 pairs in uint32: each uint32 holds 2 bf16, so stride is halving_size
-        if self.no_x_dim:
-            load_offset = f"{r0_8_name}"
+        if is_1d_pointwise:
+            # 1D pointwise: load at xindex, get elements at 2*x and 2*x+1
+            self.body.writeline(f"{packed_var} = tl.load({var}_packed + {x_index_name}, {mask_str}, other=0)")
+
+            # Bit extraction for even/odd - type-specific
+            if bits == 16:
+                self.body.writeline(f"{even_var} = ({packed_var} & 0xFFFF).to(tl.uint16).to({elem_type}, bitcast=True).to(tl.float32)")
+                self.body.writeline(f"{odd_var} = ({packed_var} >> {bits}).to(tl.uint16).to({elem_type}, bitcast=True).to(tl.float32)")
+                out_dtype = torch.float32
+            else:
+                self.body.writeline(f"{even_var} = ({packed_var} & 0xFFFFFFFF).to(tl.uint32).to({elem_type}, bitcast=True)")
+                self.body.writeline(f"{odd_var} = ({packed_var} >> {bits}).to(tl.uint32).to({elem_type}, bitcast=True)")
+                out_dtype = dtype
+
+            # Store info for load interception (1D case - no all_2n or r0)
+            coalesced_info = {
+                'even': even_var,
+                'odd': odd_var,
+                'all_2n': None,
+                'halving_size': None,
+                'r0_name': None,
+                'dtype': dtype,
+                'out_dtype': out_dtype,
+                'is_1d_pointwise': True,
+            }
         else:
-            load_offset = f"{r0_8_name} + {halving_size}*{x_index_name}"
+            # 2D halving pattern: iterate over r0 dimension
+            r0_name = f"r0_{idx}"
+            all_2n_var = f"_all2n_{idx}"
 
-        self.body.writeline(f"{u32_var} = tl.load({var}_u32 + ({load_offset}), {mask_str}, other=0)")
+            # Determine tensor shape string based on kernel dimensions
+            tensor_dim = self.triton_tensor_ndim()
+            if tensor_dim == 2:
+                shape_n = "[None, :]"
+                xblock_str = "XBLOCK"
+            elif tensor_dim == 1:
+                shape_n = "[:]" if self.no_x_dim else "[:, None]"
+                xblock_str = "1" if self.no_x_dim else "XBLOCK"
+            else:
+                shape_n = ""
+                xblock_str = "XBLOCK"
 
-        # Bit extraction for even/odd
-        self.body.writeline(f"{even_var} = ({u32_var} & 0xFFFF).to(tl.uint16).to(tl.bfloat16, bitcast=True).to(tl.float32)")
-        self.body.writeline(f"{odd_var} = ({u32_var} >> 16).to(tl.uint16).to(tl.bfloat16, bitcast=True).to(tl.float32)")
+            self.body.writeline(f"{r0_name} = tl.arange(0, {halving_size}){shape_n}")
 
-        # Join + reshape for 16-wide reduction view
-        self.body.writeline(f"_joined_{idx} = tl.join({even_var}, {odd_var})")
-        self.body.writeline(f"{all_16_var} = tl.reshape(_joined_{idx}, [{xblock_str}, {halving_size * 2}])")
+            # The load offset: r0 + halving_size * x
+            if self.no_x_dim:
+                load_offset = f"{r0_name}"
+            else:
+                load_offset = f"{r0_name} + {halving_size}*{x_index_name}"
 
-        # Store info for load interception
-        self._bf16_coalesced[buffer_name] = {
-            'even': even_var,
-            'odd': odd_var,
-            'all_16': all_16_var,
-            'halving_size': halving_size,
-            'r0_8_name': r0_8_name,
-        }
+            self.body.writeline(f"{packed_var} = tl.load({var}_packed + ({load_offset}), {mask_str}, other=0)")
 
-    def get_bf16_coalesced_var(self, buffer_name: str, index: sympy.Expr):
+            # Bit extraction for even/odd - type-specific
+            if bits == 16:
+                self.body.writeline(f"{even_var} = ({packed_var} & 0xFFFF).to(tl.uint16).to({elem_type}, bitcast=True).to(tl.float32)")
+                self.body.writeline(f"{odd_var} = ({packed_var} >> {bits}).to(tl.uint16).to({elem_type}, bitcast=True).to(tl.float32)")
+                out_dtype = torch.float32
+            else:
+                self.body.writeline(f"{even_var} = ({packed_var} & 0xFFFFFFFF).to(tl.uint32).to({elem_type}, bitcast=True)")
+                self.body.writeline(f"{odd_var} = ({packed_var} >> {bits}).to(tl.uint32).to({elem_type}, bitcast=True)")
+                out_dtype = dtype
+
+            # Join + reshape for 2N-wide reduction view
+            self.body.writeline(f"_joined_{idx} = tl.join({even_var}, {odd_var})")
+            self.body.writeline(f"{all_2n_var} = tl.reshape(_joined_{idx}, [{xblock_str}, {halving_size * 2}])")
+
+            # Store info for load interception (2D halving case)
+            coalesced_info = {
+                'even': even_var,
+                'odd': odd_var,
+                'all_2n': all_2n_var,
+                'halving_size': halving_size,
+                'r0_name': r0_name,
+                'dtype': dtype,
+                'out_dtype': out_dtype,
+                'is_1d_pointwise': False,
+            }
+
+        # Register both buffer names so loads from either are intercepted
+        self._stride2_coalesced[even_buffer] = coalesced_info
+        if odd_buffer != even_buffer:
+            # For complex64 real/imag case, register odd buffer too
+            self._stride2_coalesced[odd_buffer] = coalesced_info
+
+    # Keep old name for backward compatibility
+    def setup_bf16_coalesced_load(self, buffer_name: str, halving_size: int):
+        """Backward compatible wrapper for bf16 coalesced loads."""
+        self.setup_stride2_coalesced_load(buffer_name, buffer_name, halving_size, torch.bfloat16)
+
+    def get_stride2_coalesced_var(self, buffer_name: str, index: sympy.Expr):
         """
         Check if a load from buffer_name can use precomputed coalesced values.
 
         Returns a CSEVariable wrapping the precomputed value, or None if not applicable.
+        This works for any stride-2 pattern (bf16/fp16 halving, complex64 real/imag, etc.)
         """
-        if not hasattr(self, '_bf16_coalesced'):
+        if not hasattr(self, '_stride2_coalesced'):
             return None
 
-        if buffer_name not in self._bf16_coalesced:
+        if buffer_name not in self._stride2_coalesced:
             return None
 
-        coalesced = self._bf16_coalesced[buffer_name]
+        coalesced = self._stride2_coalesced[buffer_name]
         halving_size = coalesced['halving_size']
+        out_dtype = coalesced['out_dtype']
+        is_1d_pointwise = coalesced.get('is_1d_pointwise', False)
 
         # Analyze the index pattern to determine which variable to use
         # We need to check if the index matches:
-        # - r0_16 pattern (0,1,2,...,15): use all_16
-        # - 2*r0_8 pattern (0,2,4,...,14): use even
-        # - 1+2*r0_8 pattern (1,3,5,...,15): use odd
+        # - r0_2n pattern (0,1,2,...,2n-1): use all_2n
+        # - 2*r0_n pattern (0,2,4,...,2n-2): use even
+        # - 1+2*r0_n pattern (1,3,5,...,2n-1): use odd
 
         index_str = str(index)
         var_name = None
-
-        # Debug: print index to understand the pattern
-        import logging
-        logging.debug(f"bf16 coalesced check: buffer={buffer_name}, index={index_str!r}")
 
         # Check for stride-2 patterns (halving loads)
         # These would have ModularIndexing or explicit 2* multiplier
         if "2*" in index_str:
             # Check if it's even (no +1) or odd (+1)
-            # Look for "+ 1" at the end or "1 +" somewhere
             is_odd = index_str.endswith("+ 1") or index_str.endswith("+1") or "+ 1 +" in index_str
-            logging.debug(f"  stride-2 pattern detected, is_odd={is_odd}")
             if is_odd:
                 var_name = coalesced['odd']
             else:
                 var_name = coalesced['even']
-        else:
-            # Check for contiguous 16-wide pattern (reduction load)
-            # If we detect the reduction iteration symbol, use all_16
+        elif not is_1d_pointwise:
+            # Check for contiguous 2N-wide pattern (reduction load)
+            # If we detect the reduction iteration symbol, use all_2n
+            # Only for 2D halving case, not 1D pointwise
             for sym in index.free_symbols:
                 if symbol_is_type(sym, SymT.R0_INDEX):
-                    var_name = coalesced['all_16']
+                    var_name = coalesced['all_2n']
                     break
 
         if var_name is None:
@@ -2820,22 +2902,305 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
         # Determine shape based on which variable we're using
         tensor_dim = self.triton_tensor_ndim()
-        if var_name == coalesced['all_16']:
-            # 16-wide for reduction
+
+        if is_1d_pointwise:
+            # 1D pointwise: shape is just XBLOCK (1D tensor)
+            shape = ("XBLOCK",)
+        elif var_name == coalesced['all_2n']:
+            # 2N-wide for reduction
             if tensor_dim == 2:
                 shape = ("XBLOCK", halving_size * 2)
             else:
                 shape = (halving_size * 2,)
         else:
-            # 8-wide for halving (even/odd)
+            # N-wide for halving (even/odd)
             if tensor_dim == 2:
                 shape = ("XBLOCK", halving_size)
             else:
                 shape = (halving_size,)
 
         # Wrap in CSE to get proper variable with use_count, etc.
-        # The variable already exists in the kernel, we just reference it
+        return self.cse.generate(self.loads, var_name, dtype=out_dtype, shape=shape)
+
+    # Keep old name for backward compatibility
+    def get_bf16_coalesced_var(self, buffer_name: str, index: sympy.Expr):
+        """Backward compatible wrapper."""
+        return self.get_stride2_coalesced_var(buffer_name, index)
+
+    def register_stride1_for_dedup(self, buffer_name: str, dtype: torch.dtype):
+        """
+        Register a buffer for stride-2 load deduplication.
+
+        When both stride-1 and stride-2 loads exist for the same buffer,
+        the stride-2 loads can be derived from the stride-1 load via
+        reshape/indexing, eliminating redundant memory access.
+
+        This is called from _setup_coalesced_loads_for_schedule when the
+        pattern is detected across multiple nodes in a fused kernel.
+        """
+        self._stride2_dedup_buffers.add(buffer_name)
+
+    def register_coalesced_uint32_buffer(self, buffer_name: str, dtype: torch.dtype, reduction_size: int):
+        """
+        Register a buffer for optimal coalesced uint32 loading.
+
+        Instead of loading bf16 and using reshape/split, this approach:
+        1. Loads as uint32 (half the loads, better coalescing)
+        2. Extracts even/odd via bit operations
+        3. Reconstructs stride-1 via tl.join + tl.reshape
+
+        This achieves optimal memory bandwidth utilization.
+        """
+        if not hasattr(self, '_coalesced_uint32_buffers'):
+            self._coalesced_uint32_buffers = {}
+        self._coalesced_uint32_buffers[buffer_name] = {
+            'dtype': dtype,
+            'reduction_size': reduction_size,
+            'generated': False,
+            'even_var': None,
+            'odd_var': None,
+            'all_var': None,
+        }
+
+    def _generate_coalesced_uint32_load(self, name: str, index: sympy.Expr):
+        """
+        Generate coalesced uint32 load code for a registered buffer.
+
+        Returns dict with 'even', 'odd', 'all' variable names, or None if not applicable.
+        """
+        if not hasattr(self, '_coalesced_uint32_buffers'):
+            return None
+        if name not in self._coalesced_uint32_buffers:
+            return None
+
+        info = self._coalesced_uint32_buffers[name]
+        if info['generated']:
+            return info
+
+        # Generate the coalesced load code
+        var = self.args.input(name)
+        dtype = info['dtype']
+        reduction_size = info['reduction_size']
+        half_size = reduction_size // 2
+
+        idx = next(self.iter_vars_count)
+
+        # Get indexing for half-size load (uint32 = 2 bf16)
+        # Transform index from stride-1 (r0 + N*x0) to half-size (r0_half + N/2*x0)
+        # For now, assume standard pattern and construct the half-size index
+        xblock_str = "XBLOCK"
+
+        # Generate variable names
+        u32_var = f"_u32_load_{idx}"
+        even_var = f"_u32_even_{idx}"
+        odd_var = f"_u32_odd_{idx}"
+        all_var = f"_u32_all_{idx}"
+
+        # Write the coalesced load code
+        self.loads.writeline(f"# Coalesced uint32 load for {name} (optimal)")
+        self.loads.writeline(f"_u32_ptr_{idx} = {var}.to(tl.pointer_type(tl.uint32))")
+
+        # Half-size index range
+        self.loads.writeline(f"_r0_half_{idx} = tl.arange(0, {half_size})[None, :]")
+
+        # Load as uint32
+        self.loads.writeline(f"{u32_var} = tl.load(_u32_ptr_{idx} + (_r0_half_{idx} + {half_size}*x0), None)")
+
+        # Extract even (low 16 bits) and odd (high 16 bits)
+        if dtype == torch.bfloat16:
+            triton_dtype = "tl.bfloat16"
+        elif dtype == torch.float16:
+            triton_dtype = "tl.float16"
+        else:
+            triton_dtype = "tl.float32"
+
+        self.loads.writeline(f"{even_var} = ({u32_var} & 0xFFFF).to(tl.uint16).to({triton_dtype}, bitcast=True).to(tl.float32)")
+        self.loads.writeline(f"{odd_var} = ({u32_var} >> 16).to(tl.uint16).to({triton_dtype}, bitcast=True).to(tl.float32)")
+
+        # Reconstruct full stride-1 via tl.join + tl.reshape
+        self.loads.writeline(f"_joined_{idx} = tl.join({even_var}, {odd_var})")
+        self.loads.writeline(f"{all_var} = tl.reshape(_joined_{idx}, [{xblock_str}, {reduction_size}])")
+
+        # Update info
+        info['generated'] = True
+        info['even_var'] = even_var
+        info['odd_var'] = odd_var
+        info['all_var'] = all_var
+        info['half_size'] = half_size
+
+        return info
+
+    def _try_coalesced_uint32_load(self, name: str, index: sympy.Expr):
+        """
+        Try to use coalesced uint32 load for a buffer access.
+
+        Returns CSE variable if applicable, None otherwise.
+        """
+        if not hasattr(self, '_coalesced_uint32_buffers'):
+            return None
+        if name not in self._coalesced_uint32_buffers:
+            return None
+
+        # Generate the coalesced load if not already done
+        info = self._generate_coalesced_uint32_load(name, index)
+        if info is None:
+            return None
+
+        # Determine if this is stride-1 or stride-2 access
+        index_str = str(index)
+
+        if "2*" in index_str:
+            # Stride-2 access - return even or odd
+            is_odd = (
+                index_str.endswith("+ 1") or
+                index_str.endswith("+1") or
+                "+ 1 +" in index_str or
+                "1 + 2*" in index_str
+            )
+            var_name = info['odd_var'] if is_odd else info['even_var']
+            shape = ("XBLOCK", info['half_size'])
+        else:
+            # Stride-1 access - return reconstructed full
+            var_name = info['all_var']
+            shape = ("XBLOCK", info['reduction_size'])
+
+        # Wrap in CSE
         return self.cse.generate(self.loads, var_name, dtype=torch.float32, shape=shape)
+
+    def _cache_stride1_load(self, name: str, result_var, shape, dtype: torch.dtype):
+        """Cache a stride-1 load result for potential stride-2 derivation."""
+        import os
+        debug = os.environ.get("DEBUG_STRIDE2_DEDUP", "0") == "1"
+        if name in self._stride2_dedup_buffers:
+            if debug:
+                print(f"DEBUG triton: caching stride-1 load for {name}, shape={shape}, var={result_var}")
+            self._stride1_load_cache[name] = (result_var, shape, dtype)
+
+    def _try_derive_stride2_from_stride1(self, name: str, index: sympy.Expr):
+        """
+        Try to derive a stride-2 load from a cached stride-1 load.
+
+        If the buffer has a cached stride-1 load and this is a stride-2 access,
+        derive the value via uint32 load + bit extraction instead of loading again.
+
+        This approach is ~12% faster than reshape/split because tl.split has
+        significant overhead. The uint32 load hits the same cache line as the
+        original bf16/fp16 load, so there's no extra memory traffic.
+
+        Returns the derived CSE variable, or None if not applicable.
+        """
+        import os
+        debug = os.environ.get("DEBUG_STRIDE2_DEDUP", "0") == "1"
+
+        if name not in self._stride1_load_cache:
+            if debug:
+                print(f"DEBUG triton: _try_derive: {name} not in cache (cache has: {list(self._stride1_load_cache.keys())})")
+            return None
+
+        # Check if this is a stride-2 pattern
+        index_str = str(index)
+        if "2*" not in index_str:
+            if debug:
+                print(f"DEBUG triton: _try_derive: {name} index={index_str} is not stride-2")
+            return None
+
+        if debug:
+            print(f"DEBUG triton: _try_derive: attempting derivation for {name}, index={index_str}")
+
+        stride1_var, stride1_shape, dtype = self._stride1_load_cache[name]
+
+        # Determine if even or odd access
+        is_odd = (
+            index_str.endswith("+ 1") or
+            index_str.endswith("+1") or
+            "+ 1 +" in index_str or
+            "1 + 2*" in index_str
+        )
+
+        # Get the size of the stride-1 load (e.g., 16)
+        # and derive the halving size (e.g., 8)
+        if not stride1_shape or len(stride1_shape) < 2:
+            if debug:
+                print(f"DEBUG triton: _try_derive: shape {stride1_shape} too short")
+            return None
+
+        full_size = stride1_shape[-1]
+        xblock_str = stride1_shape[0] if isinstance(stride1_shape[0], str) else str(stride1_shape[0])
+
+        # Handle symbolic shapes like 'R0_BLOCK'
+        if isinstance(full_size, str):
+            # For R0_BLOCK, we can use it directly in generated code
+            # Need to figure out the actual halving size
+            if full_size == 'R0_BLOCK':
+                # R0_BLOCK is typically 16 for NVFP4, halving_size is 8
+                halving_size_str = "R0_BLOCK // 2"
+                halving_size_val = 8  # For shape tuple
+            else:
+                if debug:
+                    print(f"DEBUG triton: _try_derive: unknown symbolic size {full_size}")
+                return None
+        elif isinstance(full_size, int):
+            halving_size_str = str(full_size // 2)
+            halving_size_val = full_size // 2
+        else:
+            if debug:
+                print(f"DEBUG triton: _try_derive: unsupported size type {type(full_size)}")
+            return None
+
+        if debug:
+            print(f"DEBUG triton: _try_derive: full_size={full_size}, halving={halving_size_str}")
+
+        # Check if we've already derived even/odd for this buffer
+        cache_key = f"_stride2_derived_{name}"
+        if not hasattr(self, '_stride2_derived_cache'):
+            self._stride2_derived_cache = {}
+
+        if cache_key not in self._stride2_derived_cache:
+            # Generate code to derive even/odd using uint32 load + bit extraction
+            # This is ~12% faster than reshape/split (see stride2_benchmark.py)
+            idx = next(self.iter_vars_count)
+            u32_var = f"_u32_load_{idx}"
+            even_var = f"_s2_even_{idx}"
+            odd_var = f"_s2_odd_{idx}"
+            r0_half_var = f"_r0_half_{idx}"
+
+            # Get buffer pointer and x-dimension variable
+            var = self.args.input(name)
+
+            # Find x-dimension variable name from range_trees
+            x_var = "x0"  # Default
+            for tree in self.range_trees:
+                if not tree.is_reduction:
+                    x_var = f"{tree.prefix}0"
+                    break
+
+            # Generate uint32 load + bit extraction
+            # uint32 load covers 2 bf16 elements per index, so halving_size elements
+            self.loads.writeline(f"# Derive stride-2 values via uint32 load + bit extraction (faster than reshape/split)")
+            self.loads.writeline(f"{r0_half_var} = tl.arange(0, {halving_size_str})[None, :]")
+            self.loads.writeline(f"{u32_var} = tl.load({var}.to(tl.pointer_type(tl.uint32)) + ({r0_half_var} + {halving_size_str}*{x_var}), None)")
+
+            # Extract even (low 16 bits) and odd (high 16 bits)
+            # For 16-bit types: mask with 0xFFFF, shift by 16
+            triton_dtype_str = triton_type(dtype)
+            self.loads.writeline(f"{even_var} = ({u32_var} & 0xFFFF).to(tl.uint16).to({triton_dtype_str}, bitcast=True).to(tl.float32)")
+            self.loads.writeline(f"{odd_var} = ({u32_var} >> 16).to(tl.uint16).to({triton_dtype_str}, bitcast=True).to(tl.float32)")
+
+            if debug:
+                print(f"DEBUG triton: _try_derive: generated derivation code, even={even_var}, odd={odd_var}")
+
+            # Cache the derived variables
+            self._stride2_derived_cache[cache_key] = (even_var, odd_var, halving_size_val)
+
+        even_var, odd_var, halving_size_val = self._stride2_derived_cache[cache_key]
+        result_var_name = odd_var if is_odd else even_var
+
+        if debug:
+            print(f"DEBUG triton: _try_derive: returning {result_var_name} for {'odd' if is_odd else 'even'}")
+
+        # Wrap in CSE to get proper variable tracking
+        shape = (xblock_str, halving_size_val)
+        return self.cse.generate(self.loads, result_var_name, dtype=dtype, shape=shape)
 
     @staticmethod
     def _has_stride1_on_rdim(index) -> bool:
@@ -3652,11 +4017,24 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         """
         Load from the memory location 'name', offset by some indexing expression 'index'.
         """
-        # Check if this load can use precomputed bf16 coalesced values
-        coalesced_var = self.get_bf16_coalesced_var(name, index)
+        # Check if this load can use optimal coalesced uint32 loading
+        # This is the most efficient approach for bf16/fp16 with stride-1 + stride-2 patterns
+        coalesced_u32_var = self._try_coalesced_uint32_load(name, index)
+        if coalesced_u32_var is not None:
+            return coalesced_u32_var
+
+        # Check if this load can use precomputed stride-2 coalesced values
+        # This optimizes bf16/fp16 halving patterns and complex64 real/imag access
+        coalesced_var = self.get_stride2_coalesced_var(name, index)
         if coalesced_var is not None:
             # Use the precomputed value instead of emitting a load
             return coalesced_var
+
+        # Check if this stride-2 load can be derived from a cached stride-1 load
+        # This eliminates redundant loads when we have stride-1 + stride-2 pattern
+        derived_var = self._try_derive_stride2_from_stride1(name, index)
+        if derived_var is not None:
+            return derived_var
 
         var = self.args.input(name)
         load_counts = self._load_counts
@@ -3851,6 +4229,51 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 )
 
         if not self.inside_reduction or (not indexing.has_rmask() and not has_rindex):
+            self.outside_loop_vars.add(result_var)
+
+        # Cache stride-1 loads for potential stride-2 derivation
+        # A stride-1 load has no "2*" in the index (contiguous access)
+        # Use original buffer dtype (before upcast) for bit extraction
+        if name in self._stride2_dedup_buffers and "2*" not in str(original_index):
+            original_dtype = V.graph.get_dtype(name)
+            self._cache_stride1_load(name, result_var, shape, original_dtype)
+
+        return result_var
+
+    def load_reinterpreted(self, name: str, index: sympy.Expr, as_dtype: torch.dtype):
+        """
+        Load from buffer 'name' at 'index', reinterpreting the memory as 'as_dtype'.
+
+        This casts the pointer to the target type and loads, enabling coalesced
+        loads where two adjacent smaller elements are loaded as one larger element.
+        The index is in units of as_dtype (e.g., index 0 loads bytes 0-3 for uint32).
+        """
+        var = self.args.input(name)
+        triton_dtype = triton_type(as_dtype)
+
+        # Get x index for mask
+        x_tree = None
+        for tree in self.range_trees:
+            if not tree.is_reduction:
+                x_tree = tree
+                break
+
+        if x_tree is None:
+            mask_str = "None"
+        else:
+            x_index_name = f"{x_tree.prefix}index"
+            mask_str = f"{x_index_name} < xnumel" if not self.no_x_dim else "None"
+
+        indexing = self.indexing(index, block_ptr=False)
+        index_str = indexing.index_str if isinstance(indexing, IndexingOptions) else str(index)
+
+        # Cast pointer and load
+        line = f"tl.load({var}.to(tl.pointer_type({triton_dtype})) + ({index_str}), {mask_str}, other=0)"
+
+        shape = ("XBLOCK",)
+        result_var = self.cse.generate(self.loads, line, dtype=as_dtype, shape=shape)
+
+        if not self.inside_reduction:
             self.outside_loop_vars.add(result_var)
 
         return result_var

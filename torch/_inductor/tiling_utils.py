@@ -269,15 +269,19 @@ def get_pw_red_splits(
             (n._body.reduce_vars, n._body.sizes[1]),
         )  # type: ignore[return-value]
 
-    node_total = get_hint(sympy_product(n._body.sizes[0]))
-    kernel_total = get_hint(pointwise_numel * red_numel)
-    # Allow halving pattern where node_total == kernel_total / 2
-    # This happens with ops like cvt_e2m1x2 that produce half as many outputs
-    is_halving_pattern = node_total * 2 == kernel_total
-    if not (node_total == kernel_total or is_halving_pattern):
+    # Check if this node's sizes are compatible with pointwise_numel * red_numel
+    # This can fail for broadcast-reindexed nodes where the iteration space is
+    # pointwise_numel * broadcast_factor instead of pointwise_numel * red_numel
+    node_pw_numel = sympy_product(n._body.sizes[0])
+    expected_numel = pointwise_numel * red_numel
+    if get_hint(node_pw_numel) != get_hint(expected_numel):  # type: ignore[operator]
         if none_if_not_divisible:
             return None
-        assert False, f"Unexpected node total {node_total} vs kernel total {kernel_total}"  # type: ignore[operator]
+        # Return the body sizes as-is for incompatible nodes
+        return (
+            (n._body.iter_vars, n._body.sizes[0]),
+            (n._body.reduce_vars, n._body.sizes[1]),
+        )  # type: ignore[return-value]
     i = len(n._body.sizes[0]) - 1
     prod = 1
     while i >= 0:
@@ -326,6 +330,17 @@ class NodeSplitGetter:
         fused_group = node.group[1]
         for n in reversed(node.get_nodes()):
             if not isinstance(n, torch._inductor.scheduler.SchedulerNode):
+                continue
+
+            # Skip nodes whose sizes don't match the fusion's group structure.
+            # This can happen when a node has been broadcast-reindexed (its iteration
+            # space is pointwise_numel * broadcast_factor instead of pointwise_numel * red_numel)
+            node_pw_numel = sympy_product(n._body.sizes[0])
+            expected_numels = (self.pointwise_numel, self.pointwise_numel * self.red_numel)
+            if not any(
+                V.graph.sizevars.statically_known_equals(node_pw_numel, expected)
+                for expected in expected_numels
+            ):
                 continue
 
             # if we can't split the pw ranges into a (pw, red) split,
@@ -538,6 +553,16 @@ def extract_normalized_read_writes(
         if not isinstance(n, torch._inductor.scheduler.SchedulerNode):
             continue
 
+        # Skip nodes whose sizes don't match the fusion's group structure.
+        # This can happen when a node has been broadcast-reindexed.
+        node_pw_numel = sympy_product(n._body.sizes[0])
+        expected_numels = (pointwise_numel, pointwise_numel * red_numel)
+        if not any(
+            V.graph.sizevars.statically_known_equals(node_pw_numel, expected)
+            for expected in expected_numels
+        ):
+            continue
+
         body = n._body
 
         n_reads: dict[sympy.Expr, OrderedSet[str]] = defaultdict(OrderedSet)
@@ -575,8 +600,8 @@ def extract_normalized_read_writes(
             )
         except torch._inductor.codegen.simd.CantSplit:
             # occasionally with dynamic shapes, we will be unable to prove
-            # divisibility. Also, halving patterns may not split evenly.
-            # Return None to skip this node's normalized read/writes.
+            # divisibility
+            assert pointwise_numel.free_symbols or red_numel.free_symbols
             return None
 
         var_map = apply_var_mapping(

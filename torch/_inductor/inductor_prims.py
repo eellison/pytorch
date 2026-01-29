@@ -224,3 +224,72 @@ _low_memory_max_pool_offsets_to_indices = make_prim(
     _low_memory_max_pool_offsets_to_indices_aten,
     doc="Convert small int offsets to regular indices.",
 )
+
+
+def _cvt_e2m1x2_rn_aten(inp: Tensor) -> Tensor:
+    """Convert pairs of float32 to packed e2m1x2 (nvfp4) format.
+
+    Input: Tensor with last dim even, dtype float32
+    Output: Tensor with last dim halved, dtype uint8
+    Each output byte contains two packed fp4 e2m1 values.
+    """
+    if inp.dtype != torch.float32:
+        inp = inp.to(torch.float32)
+
+    # e2m1 constants
+    E2M1_MAX = 6.0
+    MBITS_F32 = 23
+    F32_EXP_BIAS = 127
+    ebits, mbits = 2, 1
+    exp_bias = 1
+    max_int = 7
+    sign_mask = 8
+    min_normal = 1.0
+    magic_adder = (1 << (MBITS_F32 - mbits - 1)) - 1
+    denorm_exp = (F32_EXP_BIAS - exp_bias) + (MBITS_F32 - mbits) + 1
+    denorm_mask_int = denorm_exp << MBITS_F32
+    denorm_mask_float = torch.tensor(denorm_mask_int, dtype=torch.int32).view(torch.float32)
+
+    def f32_to_e2m1(x):
+        x_bits = x.view(torch.int32)
+        sign = x_bits & 0x80000000
+        x_bits = x_bits ^ sign
+        x_abs = x_bits.view(torch.float32)
+
+        saturate_mask = x_abs >= E2M1_MAX
+        denormal_mask = (~saturate_mask) & (x_abs < min_normal)
+        normal_mask = ~(saturate_mask | denormal_mask)
+
+        denormal_x = x_abs + denorm_mask_float
+        denormal_x = denormal_x.view(torch.int32) - denorm_mask_int
+        denormal_x = denormal_x.to(torch.uint8)
+
+        normal_x = x_abs.view(torch.int32)
+        mant_odd = (normal_x >> (MBITS_F32 - mbits)) & 1
+        val_to_add = ((exp_bias - F32_EXP_BIAS) << MBITS_F32) + magic_adder
+        normal_x = normal_x + val_to_add + mant_odd
+        normal_x = (normal_x >> (MBITS_F32 - mbits)).to(torch.uint8)
+
+        result = torch.full_like(x, max_int, dtype=torch.uint8)
+        result = torch.where(denormal_mask, denormal_x, result)
+        result = torch.where(normal_mask, normal_x, result)
+
+        sign_lp = (sign >> (MBITS_F32 + 8 - mbits - ebits)).to(torch.uint8) & sign_mask
+        return result | sign_lp
+
+    orig_shape = inp.shape
+    inp_flat = inp.view(-1, 2)
+    val0 = f32_to_e2m1(inp_flat[:, 0])
+    val1 = f32_to_e2m1(inp_flat[:, 1])
+    packed = val0 | (val1 << 4)
+
+    out_shape = list(orig_shape)
+    out_shape[-1] = out_shape[-1] // 2
+    return packed.view(out_shape)
+
+
+cvt_e2m1x2_rn = make_prim(
+    "inductor_cvt_e2m1x2_rn(Tensor input) -> Tensor",
+    _cvt_e2m1x2_rn_aten,
+    doc="Convert pairs of float32 to packed e2m1x2 (nvfp4). Uses PTX cvt.rn.satfinite.e2m1x2.f32 on SM100+.",
+)
