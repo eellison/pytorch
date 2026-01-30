@@ -399,6 +399,7 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
         override_cooperative_reduction: Optional[bool] = None,
         tiling_scores: Optional[dict[str, sympy.Expr]] = None,
         mix_order_reduction: bool = False,
+        small_reduction_epilogue: Optional[dict[str, Any]] = None,
     ) -> None:
         if pid_cache is None:
             pid_cache = {}
@@ -427,6 +428,9 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
             else self.should_use_persistent_reduction()
         )
         self.mix_order_reduction: bool = mix_order_reduction
+        # Small reduction epilogue: fuse reduction -> small reduction pattern
+        # Config contains: small_numel, reduction_type, numel2, rnumel2, output_buf, etc.
+        self.small_reduction_epilogue: Optional[dict[str, Any]] = small_reduction_epilogue
         self.no_x_dim = self.want_no_x_dim()
         self.code_hash: Optional[str] = None
         # Info to enable multiple store_output calls for epilogue subtiling
@@ -1293,6 +1297,15 @@ class SIMDScheduling(BaseScheduling):
         ):
             return scheduler.ForeachKernelSchedulerNode.can_fuse(node1, node2)
 
+        # FusedSmallReductionEpilogue has special iteration space and cannot
+        # be further fused with other nodes (the current codegen generates
+        # separate kernels that need the intermediate buffer to stay alive)
+        from torch._inductor.scheduler import FusedSmallReductionEpilogue
+        if isinstance(node1, FusedSmallReductionEpilogue) or isinstance(
+            node2, FusedSmallReductionEpilogue
+        ):
+            return False
+
         _, (numel1, rnumel1) = node1.group
         _, (numel2, rnumel2) = node2.group
         why = WhyNoFuse(node1, node2)
@@ -1310,6 +1323,11 @@ class SIMDScheduling(BaseScheduling):
                 from torch._inductor.scheduler import MixOrderReduction
 
                 reduction_can_fuse = MixOrderReduction.can_fuse(node1, node2)
+
+            if not reduction_can_fuse:
+                from torch._inductor.scheduler import SmallReductionEpilogue
+
+                reduction_can_fuse = SmallReductionEpilogue.can_fuse(node1, node2)
 
             if not reduction_can_fuse:
                 why(
@@ -1581,6 +1599,280 @@ class SIMDScheduling(BaseScheduling):
                 )
 
         return node_schedule
+
+    def codegen_small_reduction_epilogue(self, node):
+        """
+        Generate code for fused reduction -> small reduction epilogue.
+
+        node.node1: Main reduction (e.g., amax over 4096)
+        node.node2: Small reduction epilogue (e.g., amax over 16)
+
+        The small reduction consumes the main reduction's output:
+        numel1 == numel2 * rnumel2
+
+        Fusion strategy:
+        - Use numel2 as the X dimension (one block per final output)
+        - Each block computes rnumel2 node1 reductions in parallel
+        - Then reduces those rnumel2 intermediate values to one output
+        - Intermediate buffer is never materialized to global memory
+        """
+        from torch._inductor.scheduler import FusedSmallReductionEpilogue
+
+        assert isinstance(node, FusedSmallReductionEpilogue)
+
+        node1 = node.node1  # Main reduction
+        node2 = node.node2  # Small epilogue reduction
+
+        _, (numel1, rnumel1) = node1.group
+        _, (numel2, rnumel2) = node2.group
+        small_numel = node.small_reduction_numel
+
+        # Check if we can do true fusion
+        # For now, require both to be simple reductions (same type)
+        # TODO: Support different reduction types and more complex cases
+        node1_reduction_types = set()
+        node2_reduction_types = set()
+
+        for snode in node1.get_nodes():
+            if isinstance(snode, scheduler.SchedulerNode) and snode.is_reduction():
+                if isinstance(snode.node, ir.ComputedBuffer):
+                    rtype = snode.node.get_reduction_type()
+                    if rtype:
+                        node1_reduction_types.add(rtype)
+
+        for snode in node2.get_nodes():
+            if isinstance(snode, scheduler.SchedulerNode) and snode.is_reduction():
+                if isinstance(snode.node, ir.ComputedBuffer):
+                    rtype = snode.node.get_reduction_type()
+                    if rtype:
+                        node2_reduction_types.add(rtype)
+
+        # For this first implementation, fall back to separate kernels if:
+        # - Multiple reduction types in either node
+        # - Complex nodes with non-reduction operations
+        # TODO: Implement true fusion for these cases
+        can_fuse = (
+            len(node1_reduction_types) == 1
+            and len(node2_reduction_types) == 1
+            and node1_reduction_types == node2_reduction_types
+        )
+
+        if not can_fuse:
+            fusion_log.debug(
+                "SmallReductionEpilogue: falling back to separate kernels "
+                "(node1_types=%s, node2_types=%s)",
+                node1_reduction_types,
+                node2_reduction_types,
+            )
+            # Fall back to generating two separate kernels
+            self.codegen_node(node1)
+            self.codegen_node(node2)
+            return
+
+        # Generate fused kernel
+        # The key insight is to restructure the iteration space:
+        # - Original: numel1 outputs, each reducing rnumel1 elements
+        # - Fused: numel2 outputs, each processing rnumel2 rows of rnumel1 elements
+        #          then reducing the rnumel2 intermediate values
+        self._codegen_small_reduction_epilogue_fused(
+            node, node1, node2, numel1, rnumel1, numel2, rnumel2, small_numel
+        )
+
+    def _codegen_small_reduction_epilogue_fused(
+        self, node, node1, node2, numel1, rnumel1, numel2, rnumel2, small_numel
+    ):
+        """
+        Generate a fused kernel for small reduction epilogue pattern.
+
+        The kernel structure:
+        1. Each block handles one final output (numel2 blocks total)
+        2. Within each block, process rnumel2 rows of node1's reduction
+        3. Use shared memory to store intermediate results
+        4. Final reduction across rnumel2 values
+
+        Fusion approach:
+        - Restructure iteration space: (numel2, rnumel1 * rnumel2) instead of (numel1, rnumel1)
+        - Each block processes rnumel2 "rows" of the original reduction
+        - Intermediate results are kept in registers/shared memory
+        - Small reduction is applied inline
+        """
+        fusion_log.debug(
+            "SmallReductionEpilogue: generating fused kernel for "
+            "%s -> %s (numel2=%s, rnumel2=%s, rnumel1=%s)",
+            node1.get_name(),
+            node2.get_name(),
+            numel2,
+            rnumel2,
+            rnumel1,
+        )
+
+        # Get the intermediate buffer name that we want to eliminate
+        node1_outputs = node1.get_buffer_names()
+        intermediate_buf_name = None
+        for buf_name in node1_outputs:
+            intermediate_buf_name = buf_name
+            break
+
+        # Get the reduction type from node1
+        reduction_type = None
+        for snode in node1.get_nodes():
+            if isinstance(snode, scheduler.SchedulerNode) and snode.is_reduction():
+                if isinstance(snode.node, ir.ComputedBuffer):
+                    reduction_type = snode.node.get_reduction_type()
+                    break
+
+        # Get output buffer info from node2
+        output_buf_name = None
+        for buf_name in node2.get_buffer_names():
+            output_buf_name = buf_name
+            break
+
+        # Get input buffer info from node1
+        input_buf_name = None
+        for dep in node1.read_writes.reads:
+            if hasattr(dep, 'name'):
+                input_buf_name = dep.name
+                break
+
+        if not input_buf_name or not output_buf_name:
+            # Fall back to separate kernels
+            fusion_log.warning(
+                "SmallReductionEpilogue: could not determine buffer names, "
+                "falling back to separate kernels"
+            )
+            self.codegen_node(node1)
+            self.codegen_node(node2)
+            return
+
+        # Generate the fused kernel
+        self._generate_fused_small_reduction_kernel(
+            node, node1, node2,
+            input_buf_name, intermediate_buf_name, output_buf_name,
+            numel1, rnumel1, numel2, rnumel2, small_numel,
+            reduction_type
+        )
+        fusion_log.info(
+            "SmallReductionEpilogue: generated FUSED single kernel for %s -> %s "
+            "(eliminated buffer %s, numel2=%s, rnumel2=%s, reduction=%s)",
+            node1.get_name(),
+            node2.get_name(),
+            intermediate_buf_name,
+            numel2,
+            rnumel2,
+            reduction_type,
+        )
+
+    def _generate_fused_small_reduction_kernel(
+        self, node, node1, node2,
+        input_buf_name, intermediate_buf_name, output_buf_name,
+        numel1, rnumel1, numel2, rnumel2, small_numel,
+        reduction_type
+    ):
+        """
+        Generate a single fused kernel for the small reduction epilogue pattern.
+
+        Strategy: Use 2D reduction with the existing codegen infrastructure.
+        - X dimension: numel2 (final outputs)
+        - R0 dimension: rnumel2 (small reduction)
+        - R1 dimension: rnumel1 (main reduction)
+
+        The iteration space is (numel2, rnumel2 * rnumel1) with a 2-level reduction.
+        """
+        # Get dtypes from the graph
+        input_dtype = V.graph.get_dtype(input_buf_name)
+        output_dtype = V.graph.get_dtype(output_buf_name)
+
+        if input_dtype is None or output_dtype is None:
+            raise ValueError(f"Could not find dtypes for buffers: input={input_buf_name}, output={output_buf_name}")
+
+        # Configure small reduction epilogue info for the kernel
+        small_reduction_config = {
+            "small_numel": small_numel,
+            "reduction_type": reduction_type,
+            "numel2": numel2,
+            "rnumel2": rnumel2,
+            "numel1": numel1,
+            "rnumel1": rnumel1,
+            "input_buf_name": input_buf_name,
+            "intermediate_buf_name": intermediate_buf_name,
+            "output_buf_name": output_buf_name,
+            "input_dtype": input_dtype,
+            "output_dtype": output_dtype,
+        }
+
+        # Create node schedule from node1's nodes
+        # Use iteration space (numel1, rnumel1) - original node1 iteration space
+        # The small_reduction_epilogue config will handle the grid adjustment
+        node_schedule = self.generate_node_schedule(
+            list(node1.get_nodes()), numel1, rnumel1
+        )
+        kernel_features = SIMDKernelFeatures(node_schedule, numel1, rnumel1)
+
+        # Create kernel with small_reduction_epilogue config
+        # The kernel will have iteration space (numel1, rnumel1) for correct indexing
+        # but codegen_body will generate a loop over rnumel2 with grid size numel2
+        kernel = self.create_kernel_choices(
+            kernel_features,
+            [{"x": numel1, "r0_": rnumel1}],
+            {
+                "features": kernel_features,
+                "tiling_scores": None,
+                "override_persistent_reduction": True,
+                "small_reduction_epilogue": small_reduction_config,
+            },
+        )[0]
+
+        assert kernel.persistent_reduction, "Small reduction epilogue requires persistent reduction"
+
+        # Generate kernel code
+        self.codegen_node_schedule_with_kernel(node_schedule, kernel)
+
+        # Add node2's output buffer as the actual output argument
+        # This will be used for the final store instead of buf0
+        with V.set_kernel_handler(kernel):
+            # Register the real output buffer
+            real_output_var = kernel.args.output(output_buf_name)
+            # Store in config for codegen_body to use
+            small_reduction_config["real_output_var"] = real_output_var
+
+        with kernel:
+            kernel.codegen_body()
+
+        # Override the X dimension to numel2 for grid calculation
+        # This ensures we only launch numel2 blocks instead of numel1
+        kernel.numels["x"] = numel2
+        # Also update the range tree's numel for the kernel call args
+        for tree in kernel.range_trees:
+            if tree.prefix == "x":
+                tree.numel = numel2
+                break
+
+        with V.set_kernel_handler(kernel):
+            src_code = kernel.codegen_kernel()
+
+        kernel_name = self.define_kernel(src_code, node_schedule, kernel)
+        kernel.kernel_name = kernel_name
+        kernel.code_hash = code_hash(src_code)
+
+        # Mark buffers
+        with V.set_kernel_handler(kernel):
+            for snode in kernel_features.scheduler_nodes():
+                snode.mark_run()
+            # Also mark node2's output as run
+            for snode in node2.get_nodes():
+                if hasattr(snode, 'mark_run'):
+                    snode.mark_run()
+
+        # Generate kernel call
+        V.graph.wrapper_code.make_comment("# Call small reduction epilogue fused kernel")
+        self.codegen_comment(node_schedule, None)
+        kernel.call_kernel(kernel.kernel_name)
+        V.graph.removed_buffers |= kernel.removed_buffers
+        V.graph.inplaced_to_remove |= kernel.inplaced_to_remove
+
+        # Mark intermediate buffer as removed since we don't materialize it
+        # (the store_reduction was intercepted and we write directly to the final output)
+        V.graph.removed_buffers.add(intermediate_buf_name)
 
     def codegen_mix_order_reduction(self, node):
         node1, node2 = node.node1, node.node2

@@ -1753,6 +1753,24 @@ class triton:
         == "1"
     )
 
+    # Allow small reductions (<= 32 elements) to fuse as epilogues to upstream reductions.
+    # Allow small reductions (rnumel <= 32, static) to fuse as epilogues
+    # to upstream reductions.
+    # Example: amax(256) -> amax(16) can fuse into 1 kernel.
+    # NOTE: This is experimental and requires additional codegen work to fully support.
+    # Currently disabled by default as the codegen is not yet complete.
+    small_reduction_epilogue = (
+        os.environ.get("TORCHINDUCTOR_SMALL_REDUCTION_EPILOGUE", "0") == "1"
+    )
+
+    # Actually enable fusion of small reductions with upstream reductions.
+    # Requires small_reduction_epilogue=True.
+    # This is separate because the fusion decision logic works, but codegen
+    # requires additional support (FusedSmallReductionEpilogue) that's not yet complete.
+    small_reduction_epilogue_fusion = (
+        os.environ.get("TORCHINDUCTOR_SMALL_REDUCTION_EPILOGUE_FUSION", "0") == "1"
+    )
+
     enable_tlx_templates: bool = (
         os.environ.get("TORCHINDUCTOR_ENABLE_TLX_TEMPLATES", "0") == "1"
     )

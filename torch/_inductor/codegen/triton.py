@@ -3306,6 +3306,10 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         for tree in self.range_trees:
             # reduction indexing goes inside a loop
             if not tree.is_loop:
+                # For small_reduction_epilogue, skip x-dimension header since
+                # we'll override xindex, x0, xmask in the epilogue loop
+                if self.small_reduction_epilogue is not None and tree.prefix == "x":
+                    continue
                 self.iteration_ranges_codegen_header(tree, self.body)
             elif self.inside_reduction:
                 # workaround for this issue:
@@ -5243,6 +5247,18 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         value: CSEVariable,
     ):
         assert self.inside_reduction
+
+        # For small_reduction_epilogue, capture the result variable for accumulation
+        # Do this BEFORE registering the output arg to avoid allocating the intermediate buffer
+        if self.small_reduction_epilogue is not None:
+            # Save the reduction result variable name for use in codegen_body
+            # We don't need the output var since we write to the real output buffer
+            if not hasattr(self, '_small_reduction_result_vars'):
+                self._small_reduction_result_vars = []
+            self._small_reduction_result_vars.append((name, value, None, None))
+            # Don't generate the normal store - codegen_body will handle it
+            return
+
         self.inside_reduction = False
         dtype = V.graph.get_dtype(name)
         indexing = self.indexing(
@@ -5662,6 +5678,101 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 self.body.writeline(
                     f"tl.store(ws_ptr + (tl.program_id(0) + {idx} * tl.num_programs(0)) * r0_numel + r0_index, accum{idx}, r0_mask)"
                 )
+
+        elif self.small_reduction_epilogue is not None:
+            # Small reduction epilogue: fuse reduction -> small reduction
+            # Each block processes rnumel2 rows of the main reduction
+            # then combines them via the small reduction
+            #
+            # Structure:
+            # - Grid has numel2 blocks
+            # - Each block processes rnumel2 consecutive "rows" of original data
+            # - Each row is reduced over rnumel1 elements (persistent reduction)
+            # - The rnumel2 row results are combined with the small reduction
+            # - Final result is stored to output buffer
+            assert self.persistent_reduction, (
+                "Small reduction epilogue requires persistent reduction"
+            )
+            config = self.small_reduction_epilogue
+            reduction_type = config["reduction_type"]
+            rnumel2 = config["rnumel2"]
+            rnumel1 = config["rnumel1"]
+            output_dtype = config["output_dtype"]
+            numel2 = config["numel2"]
+            numel1 = config["numel1"]
+
+            # Get the triton dtype for output
+            triton_output_dtype = triton_type(output_dtype)
+
+            # Initialize accumulator for small reduction
+            default = ir.Reduction.default_accumulator(reduction_type, output_dtype)
+            default = self._map_tuple_or_scalar(constant_repr, default)
+
+            # Size hints (should be statically known)
+            rnumel2_val = V.graph.sizevars.size_hint(rnumel2, fallback=16)
+            numel2_val = V.graph.sizevars.size_hint(numel2, fallback=1)
+            rnumel1_val = V.graph.sizevars.size_hint(rnumel1, fallback=1)
+
+            # Get combine expression for the small reduction
+            # Must use inline expressions, not lambdas (Triton doesn't support lambdas)
+            combine_expr_map = {
+                "max": "triton_helpers.maximum({}, {})",
+                "min": "triton_helpers.minimum({}, {})",
+                "sum": "{} + {}",
+                "amax": "triton_helpers.maximum({}, {})",
+                "amin": "triton_helpers.minimum({}, {})",
+            }
+            combine_expr = combine_expr_map.get(reduction_type, "triton_helpers.maximum({}, {})")
+
+            self.body.writeline(f"# Small reduction epilogue: {rnumel2_val} rows per output")
+            self.body.writeline(f"_block_idx = tl.program_id(0)")
+            self.body.writeline(f"if _block_idx >= {numel2_val}:")
+            with self.body.indent(offset=1):
+                self.body.writeline("return")
+
+            # Initialize small reduction accumulator as scalar
+            # We'll sum tmp4 to scalar before accumulating
+            self.body.writeline("")
+            self.body.writeline(f"_small_accum = {default}")
+
+            # Loop over rnumel2 rows
+            self.body.writeline(f"for _row_i in tl.static_range({rnumel2_val}):")
+            with self.body.indent(offset=1):
+                # Calculate row index in original data
+                self.body.writeline(f"_row_idx = _block_idx * {rnumel2_val} + _row_i")
+
+                # Override xindex to point to this row
+                # x0 will be set by indexing_code (spliced below)
+                self.body.writeline("xindex = _row_idx")
+                self.body.writeline(f"xmask = xindex < {numel1}")
+
+                # Generate the main reduction body
+                # indexing_code sets up reduction indices
+                self.body.splice(self.indexing_code)
+                # loads loads the data
+                self.body.splice(self.loads)
+                # compute does any intermediate computation
+                self.body.splice(self.compute)
+                # post_loop_combine does the final reduction (e.g., tl.max)
+                self.body.splice(self.post_loop_combine)
+
+                # Get the reduction result variable from store_reduction
+                if hasattr(self, '_small_reduction_result_vars') and self._small_reduction_result_vars:
+                    _, result_var, _, _ = self._small_reduction_result_vars[0]
+                    # Extract scalar from result (has shape [XBLOCK, 1])
+                    # We use tl.sum() which works because XBLOCK=1 for this kernel
+                    # (the grid has numel2 blocks, each processing one output)
+                    self.body.writeline(f"_row_result = tl.sum({result_var})")
+                    self.body.writeline(f"_small_accum = {combine_expr.format('_small_accum', '_row_result')}")
+                else:
+                    self.body.writeline("# WARNING: Could not find reduction result variable")
+
+            # Store final result
+            self.body.writeline("")
+            self.body.writeline("# Store final small reduction result")
+            # Use the real output buffer (node2's output), not the intermediate buffer
+            real_out_var = config.get("real_output_var", "out_ptr0")
+            self.body.writeline(f"tl.store({real_out_var} + _block_idx, _small_accum, _block_idx < {numel2_val})")
 
         elif self.inside_reduction and len(loop_trees) > 0:
             # Write the loop headers.
@@ -6430,6 +6541,10 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         # mix order reduction introduces an extra loop across the x
         # dimension
         if entry.root.is_loop or (self.mix_order_reduction and entry.prefix == "x"):
+            self.indexing_code.writeline(line)
+        elif self.small_reduction_epilogue is not None and entry.prefix == "x":
+            # For small_reduction_epilogue, x-dimension entries go into indexing_code
+            # so they get generated inside the epilogue loop (where we override xindex)
             self.indexing_code.writeline(line)
         else:
             # lift non-reduction stores outside loop

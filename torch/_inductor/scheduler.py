@@ -385,6 +385,76 @@ class MixOrderReduction:
         return True
 
 
+class SmallReductionEpilogue:
+    """
+    Allow small reductions to fuse as epilogues to upstream reductions.
+
+    Example: LayerNorm (reduce over 4096) -> amax (reduce over 16)
+
+    The small reduction processes chunks of the upstream output inline,
+    avoiding intermediate buffer materialization.
+
+    Requirements:
+    1. node2 is a reduction with small rnumel (<= THRESHOLD)
+    2. Total elements match: numel1 * rnumel1 == numel2 * rnumel2
+    3. Alignment: rnumel2 divides rnumel1
+    4. Consumer relationship: node2 reads from node1's output
+    """
+
+    THRESHOLD = 32  # Max reduction size for epilogue fusion
+
+    @classmethod
+    def can_fuse(cls, node1: BaseSchedulerNode, node2: BaseSchedulerNode) -> bool:
+        """
+        Check whether node2 (small reduction) can fuse as epilogue to node1 (reduction).
+        """
+        if not config.triton.small_reduction_epilogue:
+            return False
+
+        # TODO: Codegen support not yet implemented.
+        # Fusion is allowed but codegen fails with "unexpected group" error
+        # because we need FusedSmallReductionEpilogue and
+        # codegen_small_reduction_epilogue() to handle different iteration spaces.
+        # Disable fusion until codegen is implemented.
+        if not config.triton.small_reduction_epilogue_fusion:
+            return False
+
+        if not node1.is_reduction() or not node2.is_reduction():
+            return False
+
+        if not node1.is_gpu() or not node2.is_gpu():
+            return False
+
+        _, (numel1, rnumel1) = node1.group
+        _, (numel2, rnumel2) = node2.group
+
+        # Check rnumel2 is small and static (will be persistent)
+        small_numel = node2.get_small_reduction_numel()
+        if small_numel is None:
+            return False
+
+        # Check consumer relationship: first reduction OUTPUT = second reduction INPUT
+        # numel1 (output of reduction1) == numel2 * rnumel2 (input of reduction2)
+        output1 = numel1  # Output elements from first reduction
+        input2 = numel2 * rnumel2  # Input elements to second reduction
+        if not V.graph.sizevars.statically_known_equals(output1, input2):
+            return False
+
+        # Check consumer relationship: node2 reads from node1's output
+        node1_outputs = node1.get_buffer_names()
+        node2_inputs = node2.used_buffer_names()
+        if not (node1_outputs & node2_inputs):
+            return False
+
+        fusion_log.debug(
+            "SmallReductionEpilogue: allowing fusion of %s -> %s "
+            "(numel1=%s, rnumel1=%s, numel2=%s, rnumel2=%s)",
+            node1.get_name(), node2.get_name(),
+            numel1, rnumel1, numel2, rnumel2
+        )
+        return True
+
+
 @dataclasses.dataclass
 class SchedulerBuffer:
     scheduler: Scheduler
@@ -754,6 +824,14 @@ class BaseSchedulerNode:
 
     def is_reduction(self) -> bool:
         return False
+
+    def is_small_reduction(self) -> bool:
+        """Check if this is a SmallReduction node."""
+        return False
+
+    def get_small_reduction_numel(self) -> Optional[int]:
+        """Get the small reduction numel if this is a SmallReduction, else None."""
+        return None
 
     def is_native_matmul(self) -> bool:
         return False
@@ -1660,6 +1738,25 @@ class SchedulerNode(BaseSchedulerNode):
             self._body is None or not self._body.has_partial_accumulate
         )
 
+    def is_small_reduction(self) -> bool:
+        """Check if this is a reduction with small, static rnumel."""
+        if not self.is_reduction():
+            return False
+        return self.get_small_reduction_numel() is not None
+
+    def get_small_reduction_numel(self) -> Optional[int]:
+        """Get the reduction numel if it's small and static, else None."""
+        if not self.is_reduction():
+            return None
+        _, (_, rnumel) = self.group
+        rnumel_hint = V.graph.sizevars.size_hint(rnumel, fallback=0)
+        if rnumel_hint <= 0 or rnumel_hint > SmallReductionEpilogue.THRESHOLD:
+            return None
+        # Must be statically known
+        if not V.graph.sizevars.statically_known_equals(rnumel, rnumel_hint):
+            return None
+        return int(rnumel_hint)
+
     def is_native_matmul(self) -> bool:
         assert isinstance(self.node, ir.ComputedBuffer), f"{type(self.node)=}"
         return self.node.get_reduction_type() == "dot"
@@ -2162,6 +2259,85 @@ class FusedMixOrderReductions(FusedSchedulerNode):
             else:
                 fused_node = backend.fuse(self.node2, other)
                 return FusedMixOrderReductions(self.node1, fused_node)
+
+
+class FusedSmallReductionEpilogue(FusedSchedulerNode):
+    """
+    Fused node for reduction -> small reduction epilogue pattern.
+
+    Example: amax(4096) -> amax(16) where the second consumes first's output.
+
+    The key insight is that the small reduction can be computed inline
+    after the main reduction, avoiding an intermediate buffer.
+    """
+
+    def __init__(self, node1: BaseSchedulerNode, node2: BaseSchedulerNode) -> None:
+        """
+        node1: The main (larger) reduction
+        node2: The epilogue (smaller) reduction - must have small, static rnumel
+        """
+        self.node1 = node1  # Main reduction
+        self.node2 = node2  # Small reduction epilogue
+        super().__init__(
+            node1.scheduler, list(node1.get_nodes()) + list(node2.get_nodes())
+        )
+
+        # Store iteration space info
+        _, (self.numel1, self.rnumel1) = node1.group
+        _, (self.numel2, self.rnumel2) = node2.group
+
+        # The small reduction numel (e.g., 16)
+        self.small_reduction_numel = node2.get_small_reduction_numel()
+        assert self.small_reduction_numel is not None
+
+        # Use the main reduction's group for scheduling
+        # The epilogue will be handled specially in codegen
+        self.group = node1.group
+
+    def can_fuse_with(self, other: BaseSchedulerNode) -> bool:
+        """Check if we can fuse additional nodes into this."""
+        # For now, don't allow further fusion - keep it simple
+        # Could potentially allow pointwise nodes to fuse with node1
+        return False
+
+    def fuse_with(self, other: BaseSchedulerNode) -> BaseSchedulerNode:
+        """Fuse another node into this."""
+        raise NotImplementedError(
+            "FusedSmallReductionEpilogue doesn't support further fusion yet"
+        )
+
+    def get_intermediate_buffer_names(self) -> OrderedSet[str]:
+        """
+        Get buffer names that are intermediate (node1 output consumed by node2).
+
+        These buffers are internal to the fusion and would ideally be eliminated.
+        However, if we're generating separate kernels, they need to stay alive.
+        """
+        node1_outputs = self.node1.get_buffer_names()
+        node2_inputs = self.node2.used_buffer_names()
+        return node1_outputs & node2_inputs
+
+    def set_last_usage(
+        self, future_used_buffers: OrderedSet[str], mutation_real_name: dict[str, str]
+    ) -> None:
+        """
+        Override to ensure intermediate buffers are not freed too early.
+
+        When we're generating separate kernels (not true fusion), the intermediate
+        buffer from node1 must stay alive until node2 completes. We do this by
+        removing intermediate buffers from last_usage.
+        """
+        # Call parent to set up normal last_usage tracking
+        super().set_last_usage(future_used_buffers, mutation_real_name)
+
+        # Get intermediate buffers that connect node1 to node2
+        intermediate_buffers = self.get_intermediate_buffer_names()
+
+        # Remove intermediate buffers from last_usage so they're not freed
+        # until the entire fused node completes
+        # Note: This is a temporary measure for when we generate separate kernels.
+        # With true fusion, these buffers would be kept in registers/shared memory.
+        self.last_usage = self.last_usage - intermediate_buffers
 
 
 class ForeachKernelSchedulerNode(FusedSchedulerNode):
@@ -6861,6 +7037,9 @@ class Scheduler:
             elif isinstance(node, FusedMixOrderReductions):
                 # pyrefly: ignore [unbound-name]
                 self.get_backend(device).codegen_mix_order_reduction(node)
+            elif isinstance(node, FusedSmallReductionEpilogue):
+                # pyrefly: ignore [unbound-name]
+                self.get_backend(device).codegen_small_reduction_epilogue(node)
             elif isinstance(node, (FusedSchedulerNode, SchedulerNode)):
                 # pyrefly: ignore [unbound-name]
                 self.get_backend(device).codegen_node(node)
@@ -7060,6 +7239,10 @@ class BaseScheduling:  # noqa: docstring_linter
         elif MixOrderReduction.are_mix_order_reductions(node1, node2):
             return FusedMixOrderReductions(node1, node2)
         elif isinstance(node1, FusedMixOrderReductions):
+            return node1.fuse_with(node2)
+        elif SmallReductionEpilogue.can_fuse(node1, node2):
+            return FusedSmallReductionEpilogue(node1, node2)
+        elif isinstance(node1, FusedSmallReductionEpilogue):
             return node1.fuse_with(node2)
         else:
             return FusedSchedulerNode.fuse(node1, node2)
