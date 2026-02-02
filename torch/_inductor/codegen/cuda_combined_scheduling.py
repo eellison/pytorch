@@ -151,6 +151,9 @@ class CUDACombinedScheduling(BaseScheduling):
     def codegen_small_reduction_epilogue(self, node):
         return self._triton_scheduling.codegen_small_reduction_epilogue(node)
 
+    def codegen_two_pass_welford(self, node):
+        return self._triton_scheduling.codegen_two_pass_welford(node)
+
     def codegen_node(self, node: Union[FusedSchedulerNode, SchedulerNode]) -> None:
         return self._triton_scheduling.codegen_node(node)
 

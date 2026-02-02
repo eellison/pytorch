@@ -2592,6 +2592,45 @@ def triton_config_tiled_reduction(
     return config
 
 
+def _maybe_filter_configs_for_min_xblock(inductor_meta, configs: list[Config]):
+    """
+    Filter configs to respect min_xblock constraint from small reduction epilogue.
+
+    For small reduction epilogue, XBLOCK must be >= min_xblock (rnumel2) so that
+    each block can hold all the intermediate values for the final in-register
+    reduction. The offset calculation uses SMALL_RNUMEL2 (not XBLOCK) to ensure
+    correct indexing regardless of XBLOCK size.
+
+    NOTE: This only handles XBLOCK. If we ever need to constrain YBLOCK or ZBLOCK,
+    we'd need to generalize this function.
+    """
+    min_xblock = inductor_meta.get("min_xblock")
+    if min_xblock and configs:
+        filtered = [c for c in configs if c.kwargs.get("XBLOCK", 0) >= min_xblock]
+        if filtered:
+            log.debug(
+                "Filtering configs for min_xblock=%d. Input: %d, Output: %d",
+                min_xblock, len(configs), len(filtered)
+            )
+            return filtered
+        else:
+            # No configs satisfy the constraint - add one that does
+            example = configs[0]
+            new_kwargs = {**example.kwargs, "XBLOCK": min_xblock}
+            log.debug(
+                "No configs satisfy min_xblock=%d, creating one with XBLOCK=%d",
+                min_xblock, min_xblock
+            )
+            return [Config(
+                new_kwargs,
+                num_warps=example.num_warps,
+                num_stages=example.num_stages,
+                maxnreg=example.maxnreg,
+                pre_hook=example.pre_hook,
+            )]
+    return configs
+
+
 def _maybe_filter_configs_for_tma_restrictions(inductor_meta, configs: list[Config]):
     tma_min_block_sizes: dict[str, int]
     if (tma_min_block_sizes := inductor_meta.get("tma_min_block_sizes")) and configs:
@@ -3481,6 +3520,7 @@ def persistent_reduction(
     persistent_reduction_key = "persistent_reduction"
     inductor_meta[persistent_reduction_key] = True
     configs = _maybe_filter_configs_for_tma_restrictions(inductor_meta, configs)
+    configs = _maybe_filter_configs_for_min_xblock(inductor_meta, configs)
     inductor_meta.pop(persistent_reduction_key)
 
     max_autotune_enabled = inductor_meta.get("max_autotune") or inductor_meta.get(
@@ -3529,6 +3569,37 @@ def persistent_reduction(
                     newc.num_warps *= 2
                     new_configs.append(newc)
         configs = unique_configs(new_configs)
+
+    # Small reduction epilogue: generate configs with varying XBLOCK values
+    # XBLOCK must be >= SMALL_RNUMEL2 and a multiple of it
+    # Each block produces XBLOCK // SMALL_RNUMEL2 outputs
+    if inductor_meta.get("SMALL_RNUMEL2"):
+        small_rnumel2 = inductor_meta.get("SMALL_RNUMEL2")
+        numel2 = inductor_meta.get("small_reduction_numel2", 1)
+
+        # Generate configs with XBLOCK as multiples of small_rnumel2
+        new_configs = []
+        # Candidate XBLOCK values: 1x, 2x, 4x, 8x of small_rnumel2
+        # But cap at reasonable sizes and don't exceed total x elements
+        max_xblock = min(numel2 * small_rnumel2, 128)
+        xblock_candidates = []
+        xblock = small_rnumel2
+        while xblock <= max_xblock:
+            xblock_candidates.append(xblock)
+            xblock *= 2
+
+        base_config = configs[0] if configs else None
+        if base_config:
+            for xblock in xblock_candidates:
+                c = copy.deepcopy(base_config)
+                c.kwargs["XBLOCK"] = xblock
+                c.kwargs["SMALL_RNUMEL2"] = small_rnumel2
+                new_configs.append(c)
+            configs = unique_configs(new_configs) if new_configs else configs
+        else:
+            for c in configs:
+                c.kwargs["SMALL_RNUMEL2"] = small_rnumel2
+                c.kwargs["XBLOCK"] = small_rnumel2
 
     configs = filter_reduction_configs_for_determinism(inductor_meta, configs)
     return cached_autotune(
@@ -3852,6 +3923,32 @@ class MixOrderReductionGrid(GridExpr):
         assert xblock, "Missing XBLOCK"
         assert split_size % xblock == 0, f"{split_size=}, {xblock=}"
         self.x_grid = self.ceildiv("xnumel", split_size)
+
+
+class SmallReductionEpilogueGrid(GridExpr):
+    """
+    Grid for small reduction epilogue fusion.
+
+    Similar to MixOrderReductionGrid - the grid is based on outputs, not XBLOCK directly.
+    Each block can produce multiple outputs when XBLOCK > SMALL_RNUMEL2.
+
+    outputs_per_block = XBLOCK / SMALL_RNUMEL2
+    Grid = ceil(numel2 / outputs_per_block)
+    """
+
+    def generate(self, meta: dict[str, int]) -> None:
+        numel2 = self.inductor_meta.get("small_reduction_numel2")
+        small_rnumel2 = meta.get("SMALL_RNUMEL2")
+        xblock = meta.get("XBLOCK")
+        assert numel2 is not None, "Missing small_reduction_numel2 in inductor_meta"
+        assert small_rnumel2 is not None, "Missing SMALL_RNUMEL2"
+        assert xblock is not None, "Missing XBLOCK"
+        assert xblock >= small_rnumel2, f"XBLOCK ({xblock}) must be >= SMALL_RNUMEL2 ({small_rnumel2})"
+        assert xblock % small_rnumel2 == 0, f"XBLOCK ({xblock}) must be divisible by SMALL_RNUMEL2 ({small_rnumel2})"
+
+        outputs_per_block = xblock // small_rnumel2
+        # Grid = ceil(numel2 / outputs_per_block)
+        self.x_grid = f"({numel2} + {outputs_per_block} - 1) // {outputs_per_block}"
 
 
 class CooperativeReductionGrid(GridExpr):

@@ -6355,6 +6355,13 @@ def var_mean_sum_(x, axis, correction, keepdim, return_mean):
 
 
 def use_two_step_variance(x, axis, keepdim):
+    # Force two-step variance when SmallReductionEpilogue is enabled.
+    # Two-step creates separate mean + sum reductions which produces
+    # a simpler IR pattern that works better with SmallReductionEpilogue.
+    # The reductions themselves are NOT unrolled - they're regular reductions.
+    if config.triton.small_reduction_epilogue:
+        return True
+
     # Instead of unrolling welford, just unroll the simpler two-step var
     axis = _validate_reduction_axis(x, axis)
     kwargs = _make_reduction_inner(

@@ -1771,6 +1771,20 @@ class triton:
         os.environ.get("TORCHINDUCTOR_SMALL_REDUCTION_EPILOGUE_FUSION", "0") == "1"
     )
 
+    # Enable fusion of reductions with consumers that share the same input.
+    # This enables patterns like:
+    # - LayerNorm + per-group amax (Welford -> normalize -> amax)
+    # - Any reduction + consumer reduction that re-reads the same input
+    # The fused kernel uses two passes:
+    # - Pass 1: Producer reduction (output kept in registers)
+    # - Pass 2: Re-read input, apply producer output, consumer reduction
+    two_pass_reduction_fusion = (
+        os.environ.get("TORCHINDUCTOR_TWO_PASS_REDUCTION_FUSION", "0") == "1"
+        or os.environ.get("TORCHINDUCTOR_TWO_PASS_WELFORD_FUSION", "0") == "1"
+    )
+    # Alias for backwards compatibility
+    two_pass_welford_fusion = two_pass_reduction_fusion
+
     enable_tlx_templates: bool = (
         os.environ.get("TORCHINDUCTOR_ENABLE_TLX_TEMPLATES", "0") == "1"
     )

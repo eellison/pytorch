@@ -518,6 +518,16 @@ class InductorChoices:
             - config.triton.tiling_prevents_reduction_fusion
             - config.aggressive_fusion (will cause this function to be called more times)
         """
+        # Bypass shared_data_score check for special fusion patterns
+        # These have their own detection logic and don't need shared data heuristics
+        if shared_data_score == 0 and node1.is_reduction() and node2.is_reduction():
+            from torch._inductor.scheduler import SmallReductionEpilogue
+            sre_result = SmallReductionEpilogue.can_fuse(node1, node2)
+            if sre_result:
+                # SmallReductionEpilogue handles reduction -> small reduction patterns
+                # The "shared data" may be through producer/consumer relationship
+                return True
+
         if shared_data_score == 0 and (
             not config.aggressive_fusion or node1.is_reduction() or node2.is_reduction()
         ):

@@ -408,19 +408,23 @@ class SmallReductionEpilogue:
         """
         Check whether node2 (small reduction) can fuse as epilogue to node1 (reduction).
         """
+        n1, n2 = node1.get_name(), node2.get_name()
+        fusion_log.debug(
+            "SmallReductionEpilogue.can_fuse: %s (%s) + %s (%s)",
+            n1, type(node1).__name__, n2, type(node2).__name__
+        )
+
         if not config.triton.small_reduction_epilogue:
             return False
 
-        # TODO: Codegen support not yet implemented.
-        # Fusion is allowed but codegen fails with "unexpected group" error
-        # because we need FusedSmallReductionEpilogue and
-        # codegen_small_reduction_epilogue() to handle different iteration spaces.
-        # Disable fusion until codegen is implemented.
         if not config.triton.small_reduction_epilogue_fusion:
             return False
 
         if not node1.is_reduction() or not node2.is_reduction():
             return False
+
+        # Both node1 and node2 can be SchedulerNode or FusedSchedulerNode
+        # as long as they are reductions (already checked above)
 
         if not node1.is_gpu() or not node2.is_gpu():
             return False
@@ -428,16 +432,56 @@ class SmallReductionEpilogue:
         _, (numel1, rnumel1) = node1.group
         _, (numel2, rnumel2) = node2.group
 
+        # Currently only support 1D iteration space (X dimension only).
+        # The codegen does the final reduction over XBLOCK, so we can't
+        # handle Y or Z dimensions yet. Check that numel is a single expression
+        # (not a product of multiple dimensions that would become a multi-D grid).
+        # TODO: Support multi-dimensional iteration spaces by generalizing
+        # the min_xblock constraint to min_yblock/min_zblock as needed.
+        # For now, we rely on the fact that simple reductions have 1D numels.
+
         # Check rnumel2 is small and static (will be persistent)
         small_numel = node2.get_small_reduction_numel()
         if small_numel is None:
             return False
 
-        # Check consumer relationship: first reduction OUTPUT = second reduction INPUT
-        # numel1 (output of reduction1) == numel2 * rnumel2 (input of reduction2)
+        # Triton's tl.arange requires power-of-2 ranges, and small_numel becomes
+        # XBLOCK in the kernel. Reject non-power-of-2 values.
+        if not (small_numel > 0 and (small_numel & (small_numel - 1)) == 0):
+            return False
+
+        # Check consumer relationship
+        # Pattern 1 (cascading): first reduction OUTPUT = second reduction INPUT
+        #   numel1 == numel2 * rnumel2
+        # Pattern 2 (group within row): both operate on same input with different groupings
+        #   numel1 * rnumel1 == numel2 * rnumel2 AND rnumel1 % rnumel2 == 0
+        #   This is the ln-nvfp4 pattern: Welford[64,4096] + amax[16384,16]
         output1 = numel1  # Output elements from first reduction
         input2 = numel2 * rnumel2  # Input elements to second reduction
-        if not V.graph.sizevars.statically_known_equals(output1, input2):
+        total1 = numel1 * rnumel1  # Total elements in first reduction
+        total2 = numel2 * rnumel2  # Total elements in second reduction
+
+        # Check if this is a "group within row" pattern
+        rnumel1_hint = V.graph.sizevars.size_hint(rnumel1, fallback=0)
+        rnumel2_hint = V.graph.sizevars.size_hint(rnumel2, fallback=0)
+        is_group_within_row = (
+            rnumel1_hint > 0 and rnumel2_hint > 0 and
+            rnumel1_hint % rnumel2_hint == 0 and
+            V.graph.sizevars.statically_known_equals(total1, total2)
+        )
+
+        if is_group_within_row:
+            groups_per_row = rnumel1_hint // rnumel2_hint
+            fusion_log.debug(
+                "SmallReductionEpilogue: %s + %s is group_within_row pattern (groups_per_row=%d)",
+                n1, n2, groups_per_row
+            )
+            # Verify: numel1 * groups_per_row should equal numel2
+            numel1_hint = V.graph.sizevars.size_hint(numel1, fallback=0)
+            numel2_hint = V.graph.sizevars.size_hint(numel2, fallback=0)
+            if numel1_hint * groups_per_row != numel2_hint:
+                return False
+        elif not V.graph.sizevars.statically_known_equals(output1, input2):
             return False
 
         # Check consumer relationship: node2 reads from node1's output
@@ -446,6 +490,89 @@ class SmallReductionEpilogue:
         if not (node1_outputs & node2_inputs):
             return False
 
+        # Check if node2 has additional inputs beyond node1's output and its own accumulator
+        # These inputs are for fused pointwise operations (like scale tensor in y * scale)
+        # We now support simple pointwise ops - just log for debugging
+        node2_own_outputs = node2.get_buffer_names()
+        intermediate_inputs = node1_outputs & node2_inputs
+        other_inputs = node2_inputs - intermediate_inputs - node2_own_outputs
+        if other_inputs:
+            fusion_log.debug(
+                "SmallReductionEpilogue: %s -> %s has fused pointwise ops with inputs: %s",
+                node1.get_name(), node2.get_name(), other_inputs
+            )
+
+        # NOTE: Previously we checked if node1 reads from intermediate buffers and
+        # rejected fusion. However, this was too conservative - intermediate buffers
+        # from upstream nodes (like LayerNorm output) will be inlined when fused.
+        # The key checks are:
+        # 1. numel1 == numel2 * rnumel2 (iteration space compatibility)
+        # 2. node1_outputs & node2_inputs (producer-consumer relationship)
+        # 3. intermediate buffer users check (below)
+
+        # Check if node1 has outputs (besides the intermediate buffer) that have
+        # users OUTSIDE the fusion. If so, we can't use small reduction epilogue
+        # because the grid would be numel2 blocks instead of numel1, meaning not
+        # all rows of those outputs would be written.
+        # The intermediate buffer (connection between node1 and node2) can be
+        # eliminated, but other outputs must be fully written.
+        intermediate_bufs = node1_outputs & node2_inputs
+        other_outputs = node1_outputs - intermediate_bufs
+
+        # Check if intermediate buffers have users OTHER than nodes in the fusion.
+        # E.g., max() returns (values, indices) - if we fuse sum+max_values,
+        # the argmax node still needs the intermediate buffer.
+        # NOTE: When node1 is a FusedSchedulerNode, intermediate buffers might have
+        # users WITHIN node1 (e.g., mean buffer used by variance computation).
+        # These internal users are fine since they're part of the fusion.
+        scheduler = V.graph.scheduler if hasattr(V.graph, 'scheduler') else None
+        if scheduler and intermediate_bufs:
+            # Get all node names that will be in this fusion
+            fused_node_names = set()
+            for snode in node1.get_nodes():
+                fused_node_names.add(snode.get_name())
+            for snode in node2.get_nodes():
+                fused_node_names.add(snode.get_name())
+
+            for buf_name in intermediate_bufs:
+                buf_info = scheduler.name_to_buf.get(buf_name)
+                if buf_info:
+                    for user in buf_info.users:
+                        user_name = user.get_name()
+                        # Allow users that are part of the fusion
+                        if user_name not in fused_node_names:
+                            fusion_log.debug(
+                                "SmallReductionEpilogue: rejecting fusion of %s -> %s "
+                                "because intermediate buffer %s has user %s outside the fusion",
+                                node1.get_name(), node2.get_name(), buf_name, user_name
+                            )
+                            return False
+
+        if other_outputs:
+            # Get all node names that will be in this fusion
+            fused_node_names = set()
+            for snode in node1.get_nodes():
+                fused_node_names.add(snode.get_name())
+            for snode in node2.get_nodes():
+                fused_node_names.add(snode.get_name())
+
+            # Check if any of these other outputs have users outside this fusion
+            scheduler = V.graph.scheduler if hasattr(V.graph, 'scheduler') else None
+            if scheduler:
+                for buf_name in other_outputs:
+                    buf_info = scheduler.name_to_buf.get(buf_name)
+                    if buf_info:
+                        for user in buf_info.users:
+                            user_name = user.get_name()
+                            # Check if user is outside the fusion
+                            if user_name not in fused_node_names:
+                                fusion_log.debug(
+                                    "SmallReductionEpilogue: rejecting fusion of %s -> %s "
+                                    "because output buffer %s has user %s outside the fusion",
+                                    node1.get_name(), node2.get_name(), buf_name, user_name
+                                )
+                                return False
+
         fusion_log.debug(
             "SmallReductionEpilogue: allowing fusion of %s -> %s "
             "(numel1=%s, rnumel1=%s, numel2=%s, rnumel2=%s)",
@@ -453,6 +580,157 @@ class SmallReductionEpilogue:
             numel1, rnumel1, numel2, rnumel2
         )
         return True
+
+
+class TwoPassReductionFusion:
+    """
+    Fuse a producer reduction with a consumer that reads the same input.
+
+    This enables fusing patterns like:
+    - LayerNorm + per-group amax: Welford over hidden -> normalize -> amax over groups
+    - Any reduction + consumer reduction that re-reads the same input
+
+    Pattern requirements:
+    - Producer: any reduction (Welford, sum, max, etc.), possibly with pointwise epilogue
+    - Consumer: reads producer's output (directly or through pointwise ops)
+    - Same total elements processed (numel1 * rnumel1 == numel2 * rnumel2)
+
+    The fused kernel:
+    - Pass 1: Producer reduction - compute output (keep in registers)
+    - Pass 2: Re-iterate input, apply producer's output, consumer reduction
+
+    This avoids storing/loading producer's output through global memory.
+    """
+
+    @classmethod
+    def can_fuse(cls, node1: BaseSchedulerNode, node2: BaseSchedulerNode) -> bool:
+        """
+        Check if node1 (any reduction) can fuse with node2 (consumer that shares input).
+
+        Extended to handle the case where node1 is a fused Welford+normalize node
+        and node2 reads the normalized output. In this case, we recognize that
+        the normalize's input (the original data) should be re-read in Pass 2.
+        """
+        # DISABLED: FusedTwoPassWelford is being replaced by SmallReductionEpilogue
+        # which can handle the group_within_row pattern directly.
+        return False
+
+        if not config.triton.two_pass_reduction_fusion:
+            return False
+
+        # Don't create nested FusedTwoPassWelford nodes.
+        # If node2 is already a FusedTwoPassWelford, we should extend it instead
+        # of wrapping it in another FusedTwoPassWelford (which breaks iteration spaces).
+        if isinstance(node2, FusedTwoPassWelford):
+            fusion_log.debug(
+                "TwoPassReductionFusion: %s + %s rejected - node2 is already FusedTwoPassWelford",
+                node1.get_name(), node2.get_name()
+            )
+            return False
+
+        # Both must be reductions
+        if not node1.is_reduction() or not node2.is_reduction():
+            return False
+
+        if not node1.is_gpu() or not node2.is_gpu():
+            return False
+
+        # Get all inputs read by node1
+        node1_input_names: OrderedSet[str] = OrderedSet()
+        # Also track inputs specifically read by reduction nodes in node1
+        node1_reduction_inputs: OrderedSet[str] = OrderedSet()
+        for snode in node1.get_nodes():
+            if isinstance(snode, SchedulerNode):
+                for dep in snode.read_writes.reads:
+                    if hasattr(dep, 'name'):
+                        node1_input_names.add(dep.name)
+                        # Track inputs to reduction nodes specifically
+                        if snode.is_reduction():
+                            node1_reduction_inputs.add(dep.name)
+
+        # Get buffers that node1 outputs and node2 reads
+        node1_outputs = node1.get_buffer_names()
+        node2_inputs = node2.used_buffer_names()
+        shared_buffers = node1_outputs & node2_inputs
+
+        if not shared_buffers:
+            fusion_log.debug(
+                "TwoPassReductionFusion: %s and %s have no shared buffers",
+                node1.get_name(), node2.get_name()
+            )
+            return False
+
+        # Check if node2 reads the same input as node1
+        node2_reads: OrderedSet[str] = OrderedSet()
+        for dep in node2.read_writes.reads:
+            if hasattr(dep, 'name'):
+                node2_reads.add(dep.name)
+
+        # node2 should read some original inputs that node1 also reads
+        shared_original_inputs = node1_input_names & node2_reads
+
+        # Extended check: if node2 reads node1's output and node1 contains
+        # both reduction and pointwise ops (like Welford + normalize),
+        # we can still fuse if the reduction's inputs can be re-read in Pass 2.
+        # This enables LayerNorm + amax fusion even when the normalized output
+        # is consumed by node2 (rather than the original input).
+        if not shared_original_inputs and shared_buffers:
+            # Check if node1 has reduction inputs that are graph inputs or
+            # defined outside node1 (not internal buffers)
+            node1_internal_buffers = node1.get_buffer_names()
+            external_reduction_inputs = node1_reduction_inputs - node1_internal_buffers
+
+            # If node1's reduction reads external inputs, we can potentially
+            # re-read those in Pass 2 along with the normalize transformation
+            if external_reduction_inputs:
+                # This is the LayerNorm + amax pattern:
+                # - node1: Welford (reads x) + normalize (outputs normalized_x)
+                # - node2: amax (reads normalized_x)
+                # We can fuse by re-reading x in Pass 2 and computing normalize inline
+                fusion_log.debug(
+                    "TwoPassReductionFusion: extended match for %s -> %s "
+                    "(reduction inputs: %s, node2 reads: %s)",
+                    node1.get_name(), node2.get_name(),
+                    external_reduction_inputs, node2_reads
+                )
+                shared_original_inputs = external_reduction_inputs
+
+        if not shared_original_inputs:
+            fusion_log.debug(
+                "TwoPassReductionFusion: %s and %s don't share original input "
+                "(node1 inputs: %s, node2 reads: %s)",
+                node1.get_name(), node2.get_name(),
+                node1_input_names, node2_reads
+            )
+            return False
+
+        # Get iteration spaces
+        _, (numel1, rnumel1) = node1.group
+        _, (numel2, rnumel2) = node2.group
+
+        # Check that they process the same total elements
+        total1 = numel1 * rnumel1
+        total2 = numel2 * rnumel2
+
+        if not V.graph.sizevars.statically_known_equals(total1, total2):
+            fusion_log.debug(
+                "TwoPassReductionFusion: total elements don't match "
+                "(node1: %s * %s = %s, node2: %s * %s = %s)",
+                numel1, rnumel1, total1, numel2, rnumel2, total2
+            )
+            return False
+
+        fusion_log.debug(
+            "TwoPassReductionFusion: allowing fusion of %s -> %s "
+            "(numel1=%s, rnumel1=%s, numel2=%s, rnumel2=%s, shared_inputs=%s)",
+            node1.get_name(), node2.get_name(),
+            numel1, rnumel1, numel2, rnumel2, shared_original_inputs
+        )
+        return True
+
+
+# Alias for backwards compatibility
+TwoPassWelfordFusion = TwoPassReductionFusion
 
 
 @dataclasses.dataclass
@@ -968,6 +1246,14 @@ class BaseSchedulerNode:
                         and can_match_buffer_size(input_buf.node, buf.node)
                         and single_index_in_fused_node(input_buf)
                     ):
+                        # Skip make_inplace for inline reduction buffers
+                        # (they are eliminated and kept in registers)
+                        if (
+                            hasattr(V.kernel, 'inline_reduction_buffers')
+                            and buf.get_name() in V.kernel.inline_reduction_buffers
+                        ):
+                            continue
+
                         # if there isn't a triton kernel, then we don't need to call triton-specific things.
                         # but TODO this might be a convenient place to signal to the Collective kernels to inplace
                         # (and, can we make "kernel" less generic of a name?)
@@ -2290,6 +2576,27 @@ class FusedSmallReductionEpilogue(FusedSchedulerNode):
         self.small_reduction_numel = node2.get_small_reduction_numel()
         assert self.small_reduction_numel is not None
 
+        # Detect pattern type:
+        # - "cascading": numel1 == numel2 * rnumel2 (node2 reads from node1 output)
+        # - "group_within_row": numel1 * rnumel1 == numel2 * rnumel2 (same input, different grouping)
+        rnumel1_hint = V.graph.sizevars.size_hint(self.rnumel1, fallback=0)
+        rnumel2_hint = V.graph.sizevars.size_hint(self.rnumel2, fallback=0)
+        numel1_hint = V.graph.sizevars.size_hint(self.numel1, fallback=0)
+        numel2_hint = V.graph.sizevars.size_hint(self.numel2, fallback=0)
+
+        total1 = numel1_hint * rnumel1_hint
+        total2 = numel2_hint * rnumel2_hint
+
+        if (rnumel1_hint > 0 and rnumel2_hint > 0 and
+            rnumel1_hint % rnumel2_hint == 0 and
+            total1 == total2 and
+            numel1_hint * (rnumel1_hint // rnumel2_hint) == numel2_hint):
+            self.pattern_type = "group_within_row"
+            self.groups_per_row = rnumel1_hint // rnumel2_hint
+        else:
+            self.pattern_type = "cascading"
+            self.groups_per_row = 1
+
         # Use the main reduction's group for scheduling
         # The epilogue will be handled specially in codegen
         self.group = node1.group
@@ -2338,6 +2645,178 @@ class FusedSmallReductionEpilogue(FusedSchedulerNode):
         # Note: This is a temporary measure for when we generate separate kernels.
         # With true fusion, these buffers would be kept in registers/shared memory.
         self.last_usage = self.last_usage - intermediate_buffers
+
+
+class FusedTwoPassWelford(FusedSchedulerNode):
+    """
+    Fused node for Welford + consumer pattern.
+
+    Example: LayerNorm (Welford over hidden) -> normalize -> per-group amax
+
+    The key insight is that both operations iterate over the same input,
+    so we can fuse them into a two-pass kernel:
+    - Pass 1: Welford - compute mean/var (keep in registers)
+    - Pass 2: Re-iterate, normalize, apply consumer ops
+
+    Extended pattern:
+    When node1 is a fused Welford+normalize node and node2 reads the
+    normalized output (not the original input), we detect this and
+    set shared_input_names to the Welford's original input.
+    """
+
+    def __init__(self, node1: BaseSchedulerNode, node2: BaseSchedulerNode) -> None:
+        """
+        node1: The Welford reduction (possibly fused with normalize)
+        node2: The consumer (amax + subsequent ops)
+        """
+        self.node1 = node1  # Welford (or Welford + normalize)
+        self.node2 = node2  # Consumer (normalize + amax, or just amax)
+        super().__init__(
+            node1.scheduler, list(node1.get_nodes()) + list(node2.get_nodes())
+        )
+
+        # Store iteration space info from node1 (Welford)
+        _, (self.numel1, self.rnumel1) = node1.group
+        _, (self.numel2, self.rnumel2) = node2.group
+
+        # Find the original input for the two-pass pattern
+        self.shared_input_names: OrderedSet[str] = OrderedSet()
+
+        # Get all external inputs read by node1's reduction ops
+        # (not buffers produced within node1)
+        node1_internal_buffers = node1.get_buffer_names()
+        node1_reduction_inputs: OrderedSet[str] = OrderedSet()
+        for snode in node1.get_nodes():
+            if isinstance(snode, SchedulerNode) and snode.is_reduction():
+                for dep in snode.read_writes.reads:
+                    if hasattr(dep, 'name'):
+                        name = dep.name
+                        # External input (not internal buffer)
+                        if name not in node1_internal_buffers:
+                            node1_reduction_inputs.add(name)
+
+        # Also get direct reads from node1
+        node1_reads: OrderedSet[str] = OrderedSet()
+        for dep in node1.read_writes.reads:
+            if hasattr(dep, 'name') and not dep.name.startswith('buf'):
+                node1_reads.add(dep.name)
+
+        # Check if node2 directly reads any of node1's inputs
+        for dep in node2.read_writes.reads:
+            if hasattr(dep, 'name') and dep.name in node1_reads:
+                self.shared_input_names.add(dep.name)
+
+        # Extended pattern: node2 reads node1's output (not node1's input directly)
+        # In this case, use the Welford's original inputs
+        if not self.shared_input_names and node1_reduction_inputs:
+            # Filter to only external graph inputs (arg*) not internal buffers
+            external_inputs = OrderedSet(
+                name for name in node1_reduction_inputs
+                if name.startswith('arg')
+            )
+            self.shared_input_names = external_inputs
+
+        # Use the Welford's group for scheduling (its iteration space)
+        self.group = node1.group
+
+    def can_fuse_with(self, other: BaseSchedulerNode) -> bool:
+        """
+        Check if we can extend node1 by fusing 'other' into this.
+
+        This is called when considering fusing upstream producers (e.g., mean computation)
+        into an existing FusedTwoPassWelford (e.g., variance + amax).
+
+        The pattern is:
+        - self.node1 = variance reduction
+        - self.node2 = amax consumer
+        - other = mean + pointwise (upstream of variance)
+
+        We allow fusion if:
+        1. 'other' produces something that node1 reads
+        2. 'other' has the same iteration space as node1
+        """
+        if not other.is_gpu():
+            return False
+
+        # Check same iteration space
+        other_group = other.group
+        if other_group[1] != (self.numel1, self.rnumel1):
+            # Different iteration space - can't simply extend node1
+            return False
+
+        # Check if 'other' produces something that node1 reads
+        other_outputs = other.get_buffer_names()
+        node1_inputs = self.node1.used_buffer_names()
+
+        if not (other_outputs & node1_inputs):
+            # No producer-consumer relationship
+            return False
+
+        fusion_log.debug(
+            "FusedTwoPassWelford.can_fuse_with: %s can fuse into %s",
+            other.get_name(), self.get_name()
+        )
+        return True
+
+    def fuse_with(self, other: BaseSchedulerNode) -> "FusedTwoPassWelford":
+        """
+        Extend this FusedTwoPassWelford by adding 'other' to node1.
+
+        Creates a new FusedTwoPassWelford with extended node1.
+        """
+        # Extend node1 with the upstream producer
+        if isinstance(self.node1, FusedSchedulerNode):
+            # node1 is already fused, extend it
+            extended_node1 = FusedSchedulerNode.fuse(other, self.node1)
+        else:
+            # node1 is a simple node, fuse them
+            extended_node1 = FusedSchedulerNode.fuse(other, self.node1)
+
+        # Create new FusedTwoPassWelford with extended node1
+        result = FusedTwoPassWelford(extended_node1, self.node2)
+
+        fusion_log.debug(
+            "FusedTwoPassWelford.fuse_with: extended node1 from %s to %s",
+            self.node1.get_name(), extended_node1.get_name()
+        )
+        return result
+
+    def get_intermediate_buffer_names(self) -> OrderedSet[str]:
+        """
+        Get buffer names that are intermediate (node1 output consumed by node2).
+        These are the mean/var buffers from Welford that should be kept in registers.
+        """
+        node1_outputs = self.node1.get_buffer_names()
+        node2_inputs = self.node2.used_buffer_names()
+        return node1_outputs & node2_inputs
+
+    def set_last_usage(
+        self, future_used_buffers: OrderedSet[str], mutation_real_name: dict[str, str]
+    ) -> None:
+        """
+        Override to ensure buffers shared between node1 and node2 are not freed too early.
+
+        When falling back to separate kernels, we need to keep alive:
+        1. Intermediate buffers (node1 output -> node2 input)
+        2. Shared input buffers (both node1 and node2 read from same input)
+        """
+        super().set_last_usage(future_used_buffers, mutation_real_name)
+
+        # Get intermediate buffers (node1 output consumed by node2)
+        intermediate_buffers = self.get_intermediate_buffer_names()
+
+        # Get shared input buffers (read by both node1 and node2)
+        # These need to stay alive until both kernels complete
+        shared_inputs = self.shared_input_names
+
+        # Also get node2's inputs that aren't from node1 - these need to stay alive
+        node2_inputs = self.node2.used_buffer_names()
+        node1_outputs = self.node1.get_buffer_names()
+        node2_other_inputs = node2_inputs - node1_outputs
+
+        # Remove all these from last_usage so they're not freed prematurely
+        buffers_to_preserve = intermediate_buffers | shared_inputs | node2_other_inputs
+        self.last_usage = self.last_usage - buffers_to_preserve
 
 
 class ForeachKernelSchedulerNode(FusedSchedulerNode):
@@ -3803,7 +4282,13 @@ class Scheduler:
                 config.loop_ordering_after_fusion
                 or config.loop_index_inversion_in_fusion
             ):
-                nodes = self.fuse_nodes_once(nodes, is_reorder_round=True)
+                # Reorder round also needs to loop to handle cascading fusions
+                # (e.g., after fusing A+B, the result AB might now be fusable with C)
+                for i in range(10):
+                    old_len = len(nodes)
+                    nodes = self.fuse_nodes_once(nodes, is_reorder_round=True)
+                    if len(nodes) >= old_len:
+                        break
             return nodes
 
     def process_grouped_nodes(self) -> None:
@@ -5709,6 +6194,20 @@ class Scheduler:
             # right now
             return False
 
+        # SmallReductionEpilogue bypasses normal fusion checks since it has
+        # its own specialized detection logic for epilogue fusion
+        if SmallReductionEpilogue.can_fuse(node1, node2):
+            return True
+        if isinstance(node1, FusedSmallReductionEpilogue):
+            return node1.can_fuse_with(node2)
+
+        # TwoPassWelfordFusion bypasses normal fusion checks since it has
+        # its own specialized detection logic
+        if TwoPassWelfordFusion.can_fuse(node1, node2):
+            return True
+        if isinstance(node1, FusedTwoPassWelford):
+            return node1.can_fuse_with(node2)
+
         why = WhyNoFuse(node1, node2)
 
         if node1.is_template() and self.get_backend(
@@ -6068,6 +6567,17 @@ class Scheduler:
             # fusions only share weight/bias go later.
             score = MixOrderReduction.get_fusion_score(node1, node2)
             return _construct_return_value(score, True)
+
+        # Check for TwoPassWelfordFusion pattern
+        if TwoPassWelfordFusion.can_fuse(node1, node2):
+            # Score based on total elements processed
+            _, (numel1, rnumel1) = node1.group
+            total_elements = V.graph.sizevars.size_hint(numel1 * rnumel1, fallback=1)
+            fusion_log.debug(
+                "TwoPassWelfordFusion score for %s -> %s: %d",
+                node1.get_name(), node2.get_name(), total_elements
+            )
+            return _construct_return_value(total_elements, False)
 
         node1_dep_len = len(node1.read_writes.reads) + len(node1.read_writes.writes)
         node2_dep_len = len(node2.read_writes.reads) + len(node2.read_writes.writes)
@@ -7040,6 +7550,9 @@ class Scheduler:
             elif isinstance(node, FusedSmallReductionEpilogue):
                 # pyrefly: ignore [unbound-name]
                 self.get_backend(device).codegen_small_reduction_epilogue(node)
+            elif isinstance(node, FusedTwoPassWelford):
+                # pyrefly: ignore [unbound-name]
+                self.get_backend(device).codegen_two_pass_welford(node)
             elif isinstance(node, (FusedSchedulerNode, SchedulerNode)):
                 # pyrefly: ignore [unbound-name]
                 self.get_backend(device).codegen_node(node)
@@ -7243,6 +7756,10 @@ class BaseScheduling:  # noqa: docstring_linter
         elif SmallReductionEpilogue.can_fuse(node1, node2):
             return FusedSmallReductionEpilogue(node1, node2)
         elif isinstance(node1, FusedSmallReductionEpilogue):
+            return node1.fuse_with(node2)
+        elif TwoPassWelfordFusion.can_fuse(node1, node2):
+            return FusedTwoPassWelford(node1, node2)
+        elif isinstance(node1, FusedTwoPassWelford):
             return node1.fuse_with(node2)
         else:
             return FusedSchedulerNode.fuse(node1, node2)
