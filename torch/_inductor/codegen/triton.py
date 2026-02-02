@@ -2555,6 +2555,10 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         # Minimum XBLOCK constraint for autotuning (e.g., for small reduction epilogue)
         self.min_xblock: Optional[int] = None
 
+        # Pass 2 context: set during Pass 2 codegen to enable native handling
+        # of group reductions without a custom ops handler
+        self._pass2_context: Optional[dict[str, Any]] = None
+
         # A set of autotuning hints to pass as part of triton_meta
         self.autotune_hints = OrderedSet[AutotuneHint]()
         self.triton_meta: Optional[dict[str, Any]] = None
@@ -4609,6 +4613,9 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         """
         codegen reduction of value to Triton according the reduction_type
         """
+        # Handle Pass 2 group reduction when _pass2_context is set
+        if self._pass2_context is not None:
+            return self._pass2_group_reduction(dtype, src_dtype, reduction_type, value)
 
         def maybe_upcast(value: CSEVariable) -> CSEVariable:
             # Math reductions in FP16/BF16 are less accurate because the Triton compiler does not
@@ -5280,6 +5287,111 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         )
         return peers
 
+    def _pass2_group_reduction(
+        self,
+        dtype: torch.dtype,
+        src_dtype: torch.dtype,
+        reduction_type: ReductionType,
+        value: CSEVariable,
+    ) -> CSEVariable:
+        """
+        Handle reduction during Pass 2 of two-pass fusion.
+
+        Instead of reducing over the r0 dimension, we reshape the data into groups
+        and reduce over the group dimension. This is used when Pass 1 produces
+        [XBLOCK, R0_BLOCK] data and Pass 2 needs to reduce each group of elements.
+        """
+        ctx = self._pass2_context
+        assert ctx is not None
+
+        # Splice compute buffer to body before using value
+        self.body.splice(self.compute)
+        self.compute.clear()
+
+        # Get config from context
+        rnumel2_hint = ctx["rnumel2_hint"]
+        XBLOCK_STR = ctx["XBLOCK_STR"]
+        R0_BLOCK_STR = ctx["R0_BLOCK_STR"]
+
+        # Group reduction: reshape [XBLOCK, R0_BLOCK] to [XBLOCK, groups, group_size]
+        reduce_fn = get_triton_reduction_function(reduction_type)
+        compute_dtype = src_dtype if src_dtype is not None else torch.float32
+        groups_size_str = f"{R0_BLOCK_STR} // {rnumel2_hint}"
+
+        grouped = self.cse.generate(
+            self.body,
+            f"tl.reshape({value}, [{XBLOCK_STR}, {groups_size_str}, {rnumel2_hint}])",
+            dtype=compute_dtype,
+            shape=[XBLOCK_STR, groups_size_str, str(rnumel2_hint)],
+        )
+        reduced = self.cse.generate(
+            self.body,
+            f"{reduce_fn}({grouped}, 2)",
+            dtype=compute_dtype,
+            shape=[XBLOCK_STR, groups_size_str],
+        )
+
+        # Store in context for store_reduction to use
+        ctx["reduced_value"] = reduced
+        return reduced
+
+    def _pass2_store_reduction(
+        self,
+        name: str,
+        index: sympy.Expr,
+        value: CSEVariable,
+    ):
+        """
+        Handle store_reduction during Pass 2 of two-pass fusion.
+
+        Stores the reduced value with group output indexing instead of standard indexing.
+        """
+        ctx = self._pass2_context
+        assert ctx is not None
+
+        rnumel2_hint = ctx["rnumel2_hint"]
+        groups_per_row = ctx["groups_per_row"]
+        output_ptr = ctx["output_ptr"]
+        output_buf = ctx["output_buf"]
+        x_var_name = ctx["x_var_name"]
+        x_mask_name = ctx["x_mask_name"]
+        XBLOCK_STR = ctx["XBLOCK_STR"]
+        R0_BLOCK_STR = ctx["R0_BLOCK_STR"]
+
+        groups_size_str = f"{R0_BLOCK_STR} // {rnumel2_hint}"
+
+        group_idx = self.cse.generate(
+            self.body,
+            f"tl.arange(0, {groups_size_str})[None, :]",
+            dtype=self.index_dtype,
+            shape=["1", groups_size_str],
+        )
+        out_idx = self.cse.generate(
+            self.body,
+            f"{x_var_name} * {groups_per_row} + {group_idx}",
+            dtype=self.index_dtype,
+            shape=[XBLOCK_STR, groups_size_str],
+        )
+
+        # Handle output dtype conversion
+        buf = V.graph.try_get_buffer(output_buf)
+        store_val = value
+        if buf is not None:
+            buf_dtype = buf.get_dtype()
+            if buf_dtype in (torch.bfloat16, torch.float16):
+                triton_dtype = "tl.bfloat16" if buf_dtype == torch.bfloat16 else "tl.float16"
+                store_val = self.cse.generate(
+                    self.body,
+                    f"{value}.to({triton_dtype})",
+                    dtype=buf_dtype,
+                    shape=[XBLOCK_STR, groups_size_str],
+                )
+
+        if x_mask_name:
+            self.body.writeline(f"tl.store({output_ptr} + {out_idx}, {store_val}, {x_mask_name})")
+        else:
+            self.body.writeline(f"tl.store({output_ptr} + {out_idx}, {store_val})")
+
     def store_reduction(
         self,
         name: str,
@@ -5287,6 +5399,10 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         value: CSEVariable,
     ):
         assert self.inside_reduction
+
+        # Handle Pass 2 group store when _pass2_context is set
+        if self._pass2_context is not None:
+            return self._pass2_store_reduction(name, index, value)
 
         # Check if this buffer should be kept inline (in registers) instead of stored.
         # Used for small reduction epilogue fusion where intermediate buffer is eliminated.
@@ -5785,10 +5901,6 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         self.body.writeline("# ===== Pass 2: Using node2 codegen with iteration ranges =====")
 
         kernel = self
-        parent_handler = V.get_ops_handler()
-
-        # Import WrapperHandler for proper ops delegation
-        from torch._inductor.ops_handler import WrapperHandler
 
         # Get block size strings from TritonSymbols for consistency with rest of codebase
         XBLOCK_STR = str(TritonSymbols.block_sizes[x_tree.symt])
@@ -5828,87 +5940,6 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             registered_count, len(buffers_to_register)
         )
 
-        class Pass2OpsHandler(WrapperHandler):
-            """
-            Ops handler for Pass 2 that:
-            - Delegates loads to kernel.load (which checks inline_reduction_buffers)
-            - Delegates math ops to parent handler (generic codegen)
-            - Handles group reduction (reshape + reduce)
-            - Handles group store (proper indexing)
-            """
-            def __init__(handler_self, inner):
-                super().__init__(inner)
-                handler_self.reduced_value = None
-
-            def load(handler_self, name, index):
-                # Delegate to kernel.load - it handles inline_reduction_buffers
-                return kernel.load(name, index)
-
-            def reduction(handler_self, dtype, src_dtype, reduction_type, value):
-                # Splice compute buffer to body before using value
-                kernel.body.splice(kernel.compute)
-                kernel.compute.clear()
-
-                # Group reduction: reshape [XBLOCK, R0_BLOCK] to [XBLOCK, groups, group_size]
-                # and reduce over the group_size dimension
-                reduce_fn = get_triton_reduction_function(reduction_type)
-                compute_dtype = src_dtype if src_dtype is not None else torch.float32
-                groups_size_str = f"{R0_BLOCK_STR} // {rnumel2_hint}"
-
-                # Use CSE for proper variable tracking
-                grouped = kernel.cse.generate(
-                    kernel.body,
-                    f"tl.reshape({value}, [{XBLOCK_STR}, {groups_size_str}, {rnumel2_hint}])",
-                    dtype=compute_dtype,
-                    shape=[XBLOCK_STR, groups_size_str, str(rnumel2_hint)],
-                )
-                reduced = kernel.cse.generate(
-                    kernel.body,
-                    f"{reduce_fn}({grouped}, 2)",
-                    dtype=compute_dtype,
-                    shape=[XBLOCK_STR, groups_size_str],
-                )
-                handler_self.reduced_value = reduced
-                return reduced
-
-            def store_reduction(handler_self, name, index, value):
-                # Compute output index using CSE
-                groups_size_str = f"{R0_BLOCK_STR} // {rnumel2_hint}"
-                index_dtype = kernel.index_dtype
-
-                group_idx = kernel.cse.generate(
-                    kernel.body,
-                    f"tl.arange(0, {groups_size_str})[None, :]",
-                    dtype=index_dtype,
-                    shape=["1", groups_size_str],
-                )
-                out_idx = kernel.cse.generate(
-                    kernel.body,
-                    f"{x_var_name} * {groups_per_row} + {group_idx}",
-                    dtype=index_dtype,
-                    shape=[XBLOCK_STR, groups_size_str],
-                )
-
-                # Handle output dtype conversion
-                buf = V.graph.try_get_buffer(output_buf)
-                store_val = value
-                if buf is not None:
-                    buf_dtype = buf.get_dtype()
-                    if buf_dtype in (torch.bfloat16, torch.float16):
-                        triton_dtype = "tl.bfloat16" if buf_dtype == torch.bfloat16 else "tl.float16"
-                        store_val = kernel.cse.generate(
-                            kernel.body,
-                            f"{value}.to({triton_dtype})",
-                            dtype=buf_dtype,
-                            shape=[XBLOCK_STR, groups_size_str],
-                        )
-
-                # Use derived mask name (or no mask if constant)
-                if x_mask_name:
-                    kernel.body.writeline(f"tl.store({output_ptr} + {out_idx}, {store_val}, {x_mask_name})")
-                else:
-                    kernel.body.writeline(f"tl.store({output_ptr} + {out_idx}, {store_val})")
-
         # Create index_vars using kernel's iteration variables
         # The body will substitute var_ranges keys (p0, p1, p2) with these
         # This transforms node2's iteration space to the kernel's [X, R0] space
@@ -5924,9 +5955,23 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             # duplicate Pass 1 ops when we splice compute in the reduction handler.
             self.compute.clear()
 
-            handler = Pass2OpsHandler(parent_handler)
-            with V.set_ops_handler(handler):
-                reduction_node._body(*index_vars)
+            # Set up Pass 2 context for native kernel methods to use
+            # This enables kernel.reduction() and kernel.store_reduction() to handle
+            # the group reduction pattern without a custom ops handler
+            self._pass2_context = {
+                "rnumel2_hint": rnumel2_hint,
+                "groups_per_row": groups_per_row,
+                "output_ptr": output_ptr,
+                "output_buf": output_buf,
+                "x_var_name": x_var_name,
+                "x_mask_name": x_mask_name,
+                "XBLOCK_STR": XBLOCK_STR,
+                "R0_BLOCK_STR": R0_BLOCK_STR,
+            }
+
+            # Run node2's body - kernel methods will check _pass2_context
+            # and handle reduction/store_reduction specially
+            reduction_node._body(*index_vars)
 
             self.body.writeline("")
             self.body.writeline("# End Pass 2 (via node2 codegen)")
@@ -5937,6 +5982,10 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 "Pass 2 via node2 codegen failed: %s: %s", type(e).__name__, e
             )
             return False
+
+        finally:
+            # Clear Pass 2 context
+            self._pass2_context = None
 
     def codegen_body(self):
         """
