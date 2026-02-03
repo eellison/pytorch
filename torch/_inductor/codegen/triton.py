@@ -5989,6 +5989,13 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         external_per_row = config.get("external_per_row", [])
         external_per_elem = config.get("external_per_elem", [])
 
+        # External per-element buffers (weight/bias) should have been rejected at
+        # pattern matching time. Assert here to catch any bugs.
+        assert not external_per_elem, (
+            f"Unexpected external_per_elem: {external_per_elem}. "
+            "This should have been rejected by can_fuse_small_reduction_epilogue."
+        )
+
         # Find node2's reduction node
         if hasattr(node2, 'get_nodes'):
             nodes = list(node2.get_nodes())

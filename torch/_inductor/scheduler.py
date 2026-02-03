@@ -492,7 +492,6 @@ class SmallReductionEpilogue:
 
         # Check if node2 has additional inputs beyond node1's output and its own accumulator
         # These inputs are for fused pointwise operations (like scale tensor in y * scale)
-        # We now support simple pointwise ops - just log for debugging
         node2_own_outputs = node2.get_buffer_names()
         intermediate_inputs = node1_outputs & node2_inputs
         other_inputs = node2_inputs - intermediate_inputs - node2_own_outputs
@@ -501,6 +500,23 @@ class SmallReductionEpilogue:
                 "SmallReductionEpilogue: %s -> %s has fused pointwise ops with inputs: %s",
                 node1.get_name(), node2.get_name(), other_inputs
             )
+
+        # For group_within_row pattern, check if other_inputs include per-element buffers
+        # (like weight/bias). These aren't supported yet because the custom 3D iteration
+        # structure doesn't map to 1D element indexing.
+        if is_group_within_row and other_inputs:
+            # Check which other_inputs are NOT also read by node1 (per-row data)
+            node1_inputs = {
+                dep.name for dep in node1.read_writes.reads
+                if hasattr(dep, 'name')
+            }
+            per_elem_inputs = other_inputs - node1_inputs
+            if per_elem_inputs:
+                fusion_log.debug(
+                    "SmallReductionEpilogue: group_within_row rejected due to per-element "
+                    "inputs (weight/bias not supported): %s", per_elem_inputs
+                )
+                return False
 
         # NOTE: Previously we checked if node1 reads from intermediate buffers and
         # rejected fusion. However, this was too conservative - intermediate buffers

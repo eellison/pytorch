@@ -1871,48 +1871,9 @@ class SIMDScheduling(BaseScheduling):
             self.codegen_node(node2)
             return
 
-        # For group_within_row pattern, we use the two-pass fusion mechanism
-        # which generates a kernel with:
-        # - Pass 1: node1's reduction (kept in registers via inline_reduction_buffers)
-        # - Pass 2: re-read + transform + group reduction (via _codegen_two_pass_pass2)
+        # Categorize buffers FIRST to detect unsupported cases early
+        # (before we create any kernel context)
         #
-        # This is generic - not specific to LayerNorm/Welford. The transformation
-        # is extracted from node2's IR and applied generically.
-        #
-        # Configure the kernel for two-pass operation
-
-        # Get size hints
-        rnumel1_hint = V.graph.sizevars.size_hint(rnumel1, fallback=4096)
-        rnumel2_hint = V.graph.sizevars.size_hint(rnumel2, fallback=16)
-        numel1_hint = V.graph.sizevars.size_hint(numel1, fallback=64)
-
-        # Create node schedule from node1's nodes
-        node_schedule = self.generate_node_schedule(
-            list(node1.get_nodes()), numel1, rnumel1
-        )
-        kernel_features = SIMDKernelFeatures(node_schedule, numel1, rnumel1)
-
-        # Create kernel with persistent reduction (required for two-pass)
-        kernel = self.create_kernel_choices(
-            kernel_features,
-            [{"x": numel1, "r0_": rnumel1}],
-            {
-                "features": kernel_features,
-                "tiling_scores": None,
-                "override_persistent_reduction": True,
-            },
-        )[0]
-
-        if not kernel.persistent_reduction:
-            fusion_log.warning(
-                "SmallReductionEpilogue: group_within_row requires persistent reduction, "
-                "falling back to separate kernels"
-            )
-            self.codegen_node(node1)
-            self.codegen_node(node2)
-            return
-
-        # Configure two-pass fusion generically
         # Categorize buffers that node2 reads:
         # - pass1_outputs: outputs of node1 (available via inline_reduction_buffers/CSE)
         # - external_per_row: external buffers indexed by row (like mean)
@@ -1967,6 +1928,46 @@ class SIMDScheduling(BaseScheduling):
             "external_per_row=%s, external_per_elem=%s, input_buf=%s",
             pass1_outputs, external_per_row, external_per_elem, input_buf_name
         )
+
+        # External per-element buffers (like weight, bias) aren't supported yet
+        # because the custom 3D iteration structure doesn't map to 1D element indexing.
+        # The pattern matcher should have already rejected these cases.
+        assert not external_per_elem, (
+            f"Unexpected external_per_elem in group_within_row: {external_per_elem}. "
+            "This should have been rejected by can_fuse_small_reduction_epilogue."
+        )
+
+        # Now create the kernel (after we've verified the pattern is supported)
+        # Get size hints
+        rnumel1_hint = V.graph.sizevars.size_hint(rnumel1, fallback=4096)
+        rnumel2_hint = V.graph.sizevars.size_hint(rnumel2, fallback=16)
+        numel1_hint = V.graph.sizevars.size_hint(numel1, fallback=64)
+
+        # Create node schedule from node1's nodes
+        node_schedule = self.generate_node_schedule(
+            list(node1.get_nodes()), numel1, rnumel1
+        )
+        kernel_features = SIMDKernelFeatures(node_schedule, numel1, rnumel1)
+
+        # Create kernel with persistent reduction (required for two-pass)
+        kernel = self.create_kernel_choices(
+            kernel_features,
+            [{"x": numel1, "r0_": rnumel1}],
+            {
+                "features": kernel_features,
+                "tiling_scores": None,
+                "override_persistent_reduction": True,
+            },
+        )[0]
+
+        if not kernel.persistent_reduction:
+            fusion_log.warning(
+                "SmallReductionEpilogue: group_within_row requires persistent reduction, "
+                "falling back to separate kernels"
+            )
+            self.codegen_node(node1)
+            self.codegen_node(node2)
+            return
 
         # Generic config for two-pass fusion
         kernel.two_pass_fusion = {
