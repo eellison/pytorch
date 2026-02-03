@@ -401,7 +401,10 @@ class SmallReductionEpilogue:
     4. Consumer relationship: node2 reads from node1's output
     """
 
-    THRESHOLD = 32  # Max reduction size for epilogue fusion
+    # Max reduction size for epilogue fusion. The small reduction numel becomes
+    # min_xblock, so larger values require larger XBLOCK and more registers.
+    # 64 is a reasonable default that works well on modern GPUs.
+    THRESHOLD = 64
 
     @classmethod
     def can_fuse(cls, node1: BaseSchedulerNode, node2: BaseSchedulerNode) -> bool:
@@ -431,6 +434,17 @@ class SmallReductionEpilogue:
 
         _, (numel1, rnumel1) = node1.group
         _, (numel2, rnumel2) = node2.group
+
+        # Guard against xnumel=1 (single batch): the codegen relies on
+        # XBLOCK > 1 for proper indexing in the multi-group output writes.
+        # When numel1=1, Pass 2 only writes to the first group slot.
+        numel1_hint = V.graph.sizevars.size_hint(numel1, fallback=0)
+        if numel1_hint == 1:
+            fusion_log.debug(
+                "SmallReductionEpilogue: rejecting %s + %s because numel1=1 (scalar batch)",
+                n1, n2
+            )
+            return False
 
         # Currently only support 1D iteration space (X dimension only).
         # The codegen does the final reduction over XBLOCK, so we can't
@@ -476,8 +490,15 @@ class SmallReductionEpilogue:
                 "SmallReductionEpilogue: %s + %s is group_within_row pattern (groups_per_row=%d)",
                 n1, n2, groups_per_row
             )
+            # When groups_per_row=1, the 3D reshape degenerates to 2D and the
+            # reduction axis becomes invalid. Skip fusion in this case.
+            if groups_per_row == 1:
+                fusion_log.debug(
+                    "SmallReductionEpilogue: rejecting %s + %s because groups_per_row=1",
+                    n1, n2
+                )
+                return False
             # Verify: numel1 * groups_per_row should equal numel2
-            numel1_hint = V.graph.sizevars.size_hint(numel1, fallback=0)
             numel2_hint = V.graph.sizevars.size_hint(numel2, fallback=0)
             if numel1_hint * groups_per_row != numel2_hint:
                 return False
@@ -501,11 +522,9 @@ class SmallReductionEpilogue:
                 node1.get_name(), node2.get_name(), other_inputs
             )
 
-        # For group_within_row pattern, check if other_inputs include per-element buffers
-        # (like weight/bias). These aren't supported yet because the custom 3D iteration
-        # structure doesn't map to 1D element indexing.
+        # For group_within_row pattern, log if there are per-element buffers (weight/bias)
+        # These are now supported - we compute 1D indices from 3D coordinates in Pass 2
         if is_group_within_row and other_inputs:
-            # Check which other_inputs are NOT also read by node1 (per-row data)
             node1_inputs = {
                 dep.name for dep in node1.read_writes.reads
                 if hasattr(dep, 'name')
@@ -513,10 +532,9 @@ class SmallReductionEpilogue:
             per_elem_inputs = other_inputs - node1_inputs
             if per_elem_inputs:
                 fusion_log.debug(
-                    "SmallReductionEpilogue: group_within_row rejected due to per-element "
-                    "inputs (weight/bias not supported): %s", per_elem_inputs
+                    "SmallReductionEpilogue: group_within_row with per-element inputs: %s",
+                    per_elem_inputs
                 )
-                return False
 
         # NOTE: Previously we checked if node1 reads from intermediate buffers and
         # rejected fusion. However, this was too conservative - intermediate buffers
@@ -557,6 +575,16 @@ class SmallReductionEpilogue:
                         user_name = user.get_name()
                         # Allow users that are part of the fusion
                         if user_name not in fused_node_names:
+                            # Allow OUTPUT users for inference - the intermediate buffers
+                            # are only needed for backward, not for inference output.
+                            # In inference mode, we can skip writing these intermediates.
+                            if user_name == "OUTPUT" and V.graph.is_inference:
+                                fusion_log.debug(
+                                    "SmallReductionEpilogue: allowing OUTPUT user for "
+                                    "intermediate buffer %s (inference-only optimization)",
+                                    buf_name
+                                )
+                                continue
                             fusion_log.debug(
                                 "SmallReductionEpilogue: rejecting fusion of %s -> %s "
                                 "because intermediate buffer %s has user %s outside the fusion",
@@ -582,6 +610,15 @@ class SmallReductionEpilogue:
                             user_name = user.get_name()
                             # Check if user is outside the fusion
                             if user_name not in fused_node_names:
+                                # Allow OUTPUT users - these are graph outputs that
+                                # we still need to write, but they don't block fusion
+                                if user_name == "OUTPUT":
+                                    fusion_log.debug(
+                                        "SmallReductionEpilogue: allowing OUTPUT user for "
+                                        "output buffer %s",
+                                        buf_name
+                                    )
+                                    continue
                                 fusion_log.debug(
                                     "SmallReductionEpilogue: rejecting fusion of %s -> %s "
                                     "because output buffer %s has user %s outside the fusion",

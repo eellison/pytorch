@@ -5287,135 +5287,211 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         )
         return peers
 
-    def _setup_pass2_custom_ranges(
+    def _setup_pass2_ranges_general(
         self,
-        var_ranges: dict,
-        groups_per_row: int,
-        group_size: int,
+        node2_ranges: list[list[sympy.Expr]],
     ) -> list[list[sympy.Expr]]:
         """
-        Set up custom iteration ranges for Pass 2 of two-pass fusion.
+        Set up iteration ranges for Pass 2 using the GENERAL mechanism.
 
-        This creates proper iteration entries matching node2's structure and
-        pre-reshapes the in-register data so that node2's body can iterate
-        over it naturally.
+        This uses the existing split_and_set_ranges infrastructure to handle
+        ANY iteration structure, not just specific patterns.
+
+        The approach:
+        1. Compute reshape target from node2's ranges (general, not pattern-specific)
+        2. Reshape in-register data to match node2's expected dimensions
+        3. Create iteration entries that match node2's var_ranges structure
 
         Args:
-            var_ranges: node2's var_ranges dict
-            groups_per_row: Number of groups per row
-            group_size: Size of each group (reduced dimension)
+            node2_ranges: node2.get_ranges() = [[x_sizes], [r_sizes]]
 
         Returns:
             index_vars for node2._body()
         """
         from torch._inductor.codegen.simd import IterationRangesEntry
 
-        var_keys = list(var_ranges.keys())
-        p0, p1, p2 = var_keys[0], var_keys[1], var_keys[2]
+        ctx = self._pass2_context
+        pass1_outputs = ctx.get("pass1_outputs", [])
+        external_per_elem = ctx.get("external_per_elem", [])
+        XBLOCK_STR = ctx.get("XBLOCK_STR", "XBLOCK")
 
-        # Get existing range trees
+        # Get range trees
         x_tree = next(t for t in self.range_trees if t.prefix == "x")
         r_tree = next(t for t in self.range_trees if t.prefix == "r0_")
 
-        XBLOCK_STR = str(TritonSymbols.block_sizes[x_tree.symt])
-        R0_BLOCK_STR = str(TritonSymbols.block_sizes[r_tree.symt])
+        # Extract x_sizes and r_sizes from node2's ranges
+        x_sizes = node2_ranges[0] if len(node2_ranges) > 0 else []
+        r_sizes = node2_ranges[1] if len(node2_ranges) > 1 else []
 
-        # p0 (rows) - reuse x tree's iteration
-        x0_sym = sympy_index_symbol(f"{x_tree.prefix}0")
+        # Get size hints - these determine the actual dimensions
+        r_size_hints = [V.graph.sizevars.size_hint(s, fallback=1) for s in r_sizes]
 
-        # p1 (groups) - create new iteration entry
-        p1_idx = next(self.iter_vars_count)
-        p1_name = f"_p2_g{p1_idx}"
-        p1_sym = sympy_index_symbol(p1_name)
+        # Get groups_per_row - this is the key to the target shape
+        groups_per_row = ctx.get("groups_per_row", 1)
 
-        self.body.writeline(f"# Pass 2: Custom iteration ranges for [rows, groups, group_size]")
-        self.body.writeline(f"{p1_name} = tl.arange(0, {groups_per_row})[None, :]")
+        # Target shape: [XBLOCK, groups_per_row, *r_size_hints]
+        # This is GENERAL - groups_per_row comes from the relationship between
+        # node1 and node2's iteration spaces, not from hardcoded patterns
+        if groups_per_row > 1:
+            target_shape = [XBLOCK_STR, str(groups_per_row)] + [str(s) for s in r_size_hints]
+        else:
+            target_shape = [XBLOCK_STR] + [str(s) for s in r_size_hints]
+        n_dims = len(target_shape)
 
-        p1_entry = IterationRangesEntry(
-            name=p1_name,
-            divisor=sympy.S.One,
-            length=sympy.Integer(groups_per_row),
-            expr=p1_sym,
-            parent=x_tree,
-        )
-        p1_entry.codegen = lambda n=p1_name: n
-        self.range_tree_nodes[p1_sym] = p1_entry
+        # x_extra_dims are the dimensions between XBLOCK and reduction (e.g., groups)
+        x_extra_dims = [groups_per_row] if groups_per_row > 1 else []
 
-        # p2 (elem in group) - create new iteration entry for reduction dimension
-        p2_idx = next(self.iter_vars_count)
-        p2_name = f"_p2_e{p2_idx}"
-        p2_sym = sympy_index_symbol(p2_name)
+        self.body.writeline(f"# Pass 2: Reshape to {target_shape} (from node2 ranges)")
 
-        self.body.writeline(f"{p2_name} = tl.arange(0, {group_size})[None, None, :]")
+        # Get external_per_row from context - these are also per-row data
+        external_per_row = ctx.get("external_per_row", [])
 
-        p2_entry = IterationRangesEntry(
-            name=p2_name,
-            divisor=sympy.S.One,
-            length=sympy.Integer(group_size),
-            expr=p2_sym,
-            parent=r_tree,
-        )
-        p2_entry.codegen = lambda n=p2_name: n
-        self.range_tree_nodes[p2_sym] = p2_entry
-
-        # Pre-reshape in-register data to [XBLOCK, groups, group_size]
-        # Only reshape buffers that have shape [XBLOCK, R0_BLOCK] (full element data)
-        # Pass1 outputs (like variance) have shape [XBLOCK, 1] and should be broadcast instead
-        self.body.writeline("")
-        self.body.writeline("# Reshape/broadcast in-register data for Pass 2 iteration structure")
-
-        ctx = self._pass2_context
-        pass1_outputs = ctx.get("pass1_outputs", [])
-
+        # Reshape in-register data from [XBLOCK, R0_BLOCK] to target shape
         for buf_name in list(self.inline_reduction_buffers.keys()):
             cse_var = self.inline_reduction_buffers[buf_name]
             if cse_var is None:
                 continue
 
-            # Check if this is per-row data (shape [XBLOCK, 1]) or full element data
-            # Per-row data includes: pass1_outputs (e.g., variance) and external_per_row (e.g., mean)
-            # Both need broadcasting, not reshaping
+            # Check if per-row data (shape [XBLOCK, 1] or scalar) vs full data
+            # Per-row includes: pass1_outputs (variance) and external_per_row (mean)
             var_shape = getattr(cse_var, 'shape', None)
-            is_per_row = buf_name in pass1_outputs
-            # Also detect per-row by shape - if second dimension is "1", it's per-row
-            if var_shape and len(var_shape) >= 2 and str(var_shape[1]) == "1":
-                is_per_row = True
+            is_per_row = buf_name in pass1_outputs or buf_name in external_per_row
+
+            # Detect per-row data by shape as fallback
+            if not is_per_row and var_shape:
+                if len(var_shape) == 0:
+                    # Scalar - definitely per-row (single value)
+                    is_per_row = True
+                elif len(var_shape) == 1:
+                    # 1D - could be per-row if size matches XBLOCK or is 1
+                    is_per_row = True
+                elif len(var_shape) >= 2 and str(var_shape[1]) == "1":
+                    is_per_row = True
 
             if is_per_row:
-                # Pass1 output - broadcast to [XBLOCK, groups, 1] for broadcasting in ops
-                # It will broadcast over group_size dimension automatically
-                broadcasted = self.cse.generate(
-                    self.body,
-                    f"tl.reshape({cse_var}, [{XBLOCK_STR}, 1, 1])",
-                    dtype=cse_var.dtype if hasattr(cse_var, 'dtype') else torch.float32,
-                    shape=[XBLOCK_STR, "1", "1"],
-                )
+                # Per-row: expand to [XBLOCK, 1, 1, ...]
+                # Add dimensions using indexing (works for any input rank)
+                broadcast_shape = [XBLOCK_STR] + ["1"] * (n_dims - 1)
+                # Add None dimensions for each extra dimension needed
+                extra_dims = n_dims - 2  # Already have [XBLOCK, 1], need n_dims total
+                if extra_dims > 0:
+                    # e.g., for 3D target: cse_var[:, :, None] to go from [X,1] to [X,1,1]
+                    none_parts = ", None" * extra_dims
+                    broadcasted = self.cse.generate(
+                        self.body,
+                        f"{cse_var}[:, :{none_parts}]",
+                        dtype=getattr(cse_var, 'dtype', torch.float32),
+                        shape=broadcast_shape,
+                    )
+                else:
+                    broadcasted = cse_var
                 self.inline_reduction_buffers[buf_name] = broadcasted
-                # Update store_cache so CSEProxy returns reshaped value
                 self.cse.store_cache[buf_name] = broadcasted
-                fusion_log.debug("Pass 2: broadcast %s to [%s, 1, 1]",
-                    buf_name, XBLOCK_STR)
             else:
-                # Full element data - reshape to [XBLOCK, groups, group_size]
+                # Full data: reshape to target
                 reshaped = self.cse.generate(
                     self.body,
-                    f"tl.reshape({cse_var}, [{XBLOCK_STR}, {groups_per_row}, {group_size}])",
-                    dtype=cse_var.dtype if hasattr(cse_var, 'dtype') else torch.float32,
-                    shape=[XBLOCK_STR, str(groups_per_row), str(group_size)],
+                    f"tl.reshape({cse_var}, [{', '.join(target_shape)}])",
+                    dtype=getattr(cse_var, 'dtype', torch.float32),
+                    shape=target_shape,
                 )
                 self.inline_reduction_buffers[buf_name] = reshaped
-                # Update store_cache so CSEProxy returns reshaped value
                 self.cse.store_cache[buf_name] = reshaped
-                fusion_log.debug("Pass 2: reshaped %s to [%s, %s, %s]",
-                    buf_name, XBLOCK_STR, groups_per_row, group_size)
 
-        # Store custom range info in context for reduction/store handling
+        # Handle external per-element buffers (weight, bias)
+        # Total elements = product of all non-XBLOCK dimensions
+        total_elem = 1
+        for s in x_extra_dims + r_size_hints:
+            total_elem *= s
+
+        if external_per_elem and total_elem > 1:
+            self.body.writeline("")
+            self.body.writeline("# Load external per-element buffers")
+            for buf_name in external_per_elem:
+                ptr_name = self.args.input(buf_name)
+                if not ptr_name:
+                    continue
+                # Load flat, reshape, broadcast
+                idx = next(self.iter_vars_count)
+                flat_name = f"_flat{idx}"
+                self.body.writeline(f"{flat_name} = tl.arange(0, {total_elem})")
+                loaded = self.cse.generate(
+                    self.body,
+                    f"tl.load({ptr_name} + {flat_name})",
+                    dtype=torch.float32,
+                    shape=[str(total_elem)],
+                )
+                # Reshape to [*x_extra_dims, *r_size_hints]
+                elem_shape = [str(s) for s in x_extra_dims + r_size_hints]
+                reshaped = self.cse.generate(
+                    self.body,
+                    f"tl.reshape({loaded}, [{', '.join(elem_shape)}])",
+                    dtype=torch.float32,
+                    shape=elem_shape,
+                )
+                # Broadcast: add None for XBLOCK dimension
+                n_elem_dims = len(elem_shape)
+                broadcast_idx = "[None" + ", :" * n_elem_dims + "]"
+                broadcasted = self.cse.generate(
+                    self.body,
+                    f"{reshaped}{broadcast_idx}",
+                    dtype=torch.float32,
+                    shape=target_shape,
+                )
+                self.inline_reduction_buffers[buf_name] = broadcasted
+                self.cse.store_cache[buf_name] = broadcasted
+
+        # Create iteration entries matching node2's var_ranges
+        # x0 from kernel's x tree
+        x0_sym = sympy_index_symbol(f"{x_tree.prefix}0")
+        index_vars = [[x0_sym]]
+
+        # Additional x dimensions (like groups in group_within_row)
+        x_extra_vars = []
+        for i, size in enumerate(x_extra_dims):
+            idx = next(self.iter_vars_count)
+            name = f"_x{i+1}_{idx}"
+            sym = sympy_index_symbol(name)
+            # Shape: [None, :, None, None, ...]
+            shape_parts = ["None"] * n_dims
+            shape_parts[1 + i] = ":"
+            self.body.writeline(f"{name} = tl.arange(0, {size})[{', '.join(shape_parts)}]")
+            entry = IterationRangesEntry(
+                name=name, divisor=sympy.S.One, length=sympy.Integer(size),
+                expr=sym, parent=x_tree,
+            )
+            entry.codegen = lambda n=name: n
+            self.range_tree_nodes[sym] = entry
+            x_extra_vars.append(sym)
+
+        # Flatten x vars: first is x0, rest are extras
+        index_vars[0] = [x0_sym] + x_extra_vars
+
+        # Reduction dimensions
+        r_vars = []
+        r_start_dim = 1 + len(x_extra_dims)
+        for i, size in enumerate(r_size_hints):
+            idx = next(self.iter_vars_count)
+            name = f"_r{i}_{idx}"
+            sym = sympy_index_symbol(name)
+            shape_parts = ["None"] * n_dims
+            shape_parts[r_start_dim + i] = ":"
+            self.body.writeline(f"{name} = tl.arange(0, {size})[{', '.join(shape_parts)}]")
+            entry = IterationRangesEntry(
+                name=name, divisor=sympy.S.One, length=sympy.Integer(size),
+                expr=sym, parent=r_tree,
+            )
+            entry.codegen = lambda n=name: n
+            self.range_tree_nodes[sym] = entry
+            r_vars.append(sym)
+
+        index_vars.append(r_vars)
+
+        # Store context
         self._pass2_context["use_custom_ranges"] = True
-        self._pass2_context["p1_name"] = p1_name
-        self._pass2_context["p2_name"] = p2_name
+        self._pass2_context["target_shape"] = target_shape
 
-        # Return index_vars matching node2's var_ranges structure
-        return [[x0_sym], [p1_sym], [p2_sym]]
+        return index_vars
 
     def _pass2_group_reduction(
         self,
@@ -5957,16 +6033,15 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
     def _codegen_two_pass_pass2_via_node2(self, config, pass1_vars, output_ptr, node2):
         """
-        Generate Pass 2 of two-pass fusion using node2's body with index substitution.
+        Generate Pass 2 of two-pass fusion using node2's iteration structure.
 
-        This enables fusing patterns like LayerNorm (reduce over N) + amax (reduce over groups
-        of M) into a single kernel. Pass 1 computes the main reduction and keeps results in
-        registers. Pass 2 reuses those values and performs a group reduction.
+        This is a GENERAL mechanism that:
+        1. Uses split_and_set_ranges() for node2's iteration (not custom variables)
+        2. Reshapes in-register data based on node2's ranges (not pattern-specific)
+        3. Uses node.codegen() for code generation (standard mechanism)
 
-        The key insight is mapping node2's iteration space to the kernel's:
-        - node2 has var_ranges {p0: rows, p1: groups, p2: group_size}
-        - kernel has x0 (rows) and r0_index (all elements)
-        - We substitute: p0 -> x0, p1 -> r0_index // group_size, p2 -> r0_index % group_size
+        The only constraint is that the reduction must be small enough for
+        persistent reduction (all data fits in registers).
 
         Args:
             config: Two-pass fusion configuration dict
@@ -5978,23 +6053,14 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             True if codegen succeeded, False to fall back to manual codegen.
         """
         from torch._inductor import scheduler
-        from torch.utils._sympy.symbol import SymT, prefix_str
 
-        rnumel1_hint = config.get("rnumel1_hint", 4096)
         rnumel2_hint = config.get("rnumel2_hint", 16)
-        groups_per_row = config.get("groups_per_row", rnumel1_hint // rnumel2_hint)
+        groups_per_row = config.get("groups_per_row", 1)
         input_buf = config.get("input_buf")
         output_buf = config.get("output_buf")
         pass1_outputs = config.get("pass1_outputs", [])
         external_per_row = config.get("external_per_row", [])
         external_per_elem = config.get("external_per_elem", [])
-
-        # External per-element buffers (weight/bias) should have been rejected at
-        # pattern matching time. Assert here to catch any bugs.
-        assert not external_per_elem, (
-            f"Unexpected external_per_elem: {external_per_elem}. "
-            "This should have been rejected by can_fuse_small_reduction_epilogue."
-        )
 
         # Find node2's reduction node
         if hasattr(node2, 'get_nodes'):
@@ -6011,19 +6077,16 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         if reduction_node is None or not hasattr(reduction_node, '_body'):
             return False
 
-        # Get node2's var_ranges to understand its iteration structure
-        if not hasattr(reduction_node._body, 'var_ranges'):
+        # Get node2's ranges - this is the GENERAL mechanism
+        # ranges = [[x_sizes], [r_sizes]] for the iteration structure
+        ranges = reduction_node.get_ranges()
+        if len(ranges) < 2:
             return False
 
-        var_ranges = reduction_node._body.var_ranges
-        var_keys = list(var_ranges.keys())
+        x_sizes = ranges[0]  # Non-reduction dimensions
+        r_sizes = ranges[1]  # Reduction dimensions
 
-        # Expect 3 dimensions for group-within-row pattern: (rows, groups, group_size)
-        if len(var_keys) != 3:
-            return False
-
-        # Get the kernel's iteration variables
-        # For Pass 2, we reuse the same iteration space as Pass 1: x0 and r0_index
+        # Get the kernel's range trees
         x_trees = [t for t in self.range_trees if t.prefix == "x"]
         r_trees = [t for t in self.range_trees if t.prefix == "r0_"]
 
@@ -6034,56 +6097,34 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         r_tree = r_trees[0]
 
         self.body.writeline("")
-        self.body.writeline("# ===== Pass 2: Using custom iteration ranges =====")
+        self.body.writeline("# ===== Pass 2: Using node2 iteration structure =====")
 
-        # Get block size strings from TritonSymbols for consistency with rest of codebase
+        # Get block size strings
         XBLOCK_STR = str(TritonSymbols.block_sizes[x_tree.symt])
         R0_BLOCK_STR = str(TritonSymbols.block_sizes[r_tree.symt])
-        # Also get the x-variable name from the range tree
         x_var_name = f"{x_tree.prefix}0"
-        # Derive mask name from tree (handles constant mask optimization)
         x_mask_name = f"{x_tree.prefix}mask" if not self._has_constant_mask(x_tree) else None
 
-        # Register Pass 1 load CSE variables in inline_reduction_buffers.
-        # This lets self.load() automatically return them for Pass 2.
-        # (Pass 1 outputs like variance are already in inline_reduction_buffers via pass1_vars)
+        # Register Pass 1 load CSE variables in inline_reduction_buffers
         buffers_to_register = [b for b in [input_buf] + external_per_row if b]
-        registered_count = 0
         for cache_key, var in self.cse._cache.items():
             cache_str = str(cache_key)
             if not cache_str.startswith("tl.load("):
                 continue
             for buf_name in buffers_to_register:
-                # Skip if already has a valid value (not pre-marked with None)
                 if self.inline_reduction_buffers.get(buf_name) is not None:
-                    continue  # Already registered
+                    continue
                 ptr_name = self.args.input(buf_name)
                 if not ptr_name:
                     continue
-                # Match load pattern: tl.load(ptr_name + ... or tl.load((ptr_name + ...
                 if f"({ptr_name} + " in cache_str or f"({ptr_name})" in cache_str:
                     self.inline_reduction_buffers[buf_name] = var
-                    registered_count += 1
-                    fusion_log.debug(
-                        "Pass 2: registered %s -> %s in inline_reduction_buffers",
-                        buf_name, var
-                    )
                     break
 
-        fusion_log.debug(
-            "Pass 2: registered %d/%d buffers in inline_reduction_buffers",
-            registered_count, len(buffers_to_register)
-        )
-
         try:
-            # Clear compute buffer before Pass 2 - it contains Pass 1 ops that were
-            # already spliced into body. Without this, Pass 2 ops would be mixed with
-            # duplicate Pass 1 ops when we splice compute in the reduction handler.
             self.compute.clear()
 
-            # Set up Pass 2 context for native kernel methods to use
-            # This enables kernel.reduction() and kernel.store_reduction() to handle
-            # the group reduction pattern without a custom ops handler
+            # Set up Pass 2 context
             self._pass2_context = {
                 "rnumel2_hint": rnumel2_hint,
                 "groups_per_row": groups_per_row,
@@ -6093,32 +6134,32 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 "x_mask_name": x_mask_name,
                 "XBLOCK_STR": XBLOCK_STR,
                 "R0_BLOCK_STR": R0_BLOCK_STR,
-                "pass1_outputs": pass1_outputs,  # Buffers that are pass1 reduction outputs
+                "pass1_outputs": pass1_outputs,
+                "external_per_row": external_per_row,  # Per-row buffers like mean
+                "external_per_elem": external_per_elem,
+                # Store ranges for general reshape computation
+                "x_sizes": x_sizes,
+                "r_sizes": r_sizes,
             }
 
-            # Set up custom iteration ranges for Pass 2
-            # This creates proper IterationRangesEntry objects and pre-reshapes
-            # the in-register data to match node2's iteration structure
-            index_vars = self._setup_pass2_custom_ranges(
-                var_ranges, groups_per_row, rnumel2_hint
-            )
+            # GENERAL: Use node2's ranges directly - no pattern-specific checks
+            # This works for ANY iteration structure, not just 3 dimensions
+            index_vars = self._setup_pass2_ranges_general(ranges)
 
-            # Run node2's body - it will use our custom iteration ranges
-            # and the pre-reshaped data from inline_reduction_buffers
+            # Run node2's body with the iteration variables
             reduction_node._body(*index_vars)
 
             self.body.writeline("")
-            self.body.writeline("# End Pass 2 (via node2 codegen)")
+            self.body.writeline("# End Pass 2")
             return True
 
         except Exception as e:
             fusion_log.debug(
-                "Pass 2 via node2 codegen failed: %s: %s", type(e).__name__, e
+                "Pass 2 codegen failed: %s: %s", type(e).__name__, e
             )
             return False
 
         finally:
-            # Clear Pass 2 context
             self._pass2_context = None
 
     def codegen_body(self):

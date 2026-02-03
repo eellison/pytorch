@@ -1432,7 +1432,12 @@ class SIMDScheduling(BaseScheduling):
 
         if not node1.is_reduction() and node2.is_reduction():
             assert rnumel1 == 1 and rnumel2 != 1
+            import sys
+            print(f"[POI+RED CHECK] numel1={numel1}, numel2={numel2}, rnumel2={rnumel2}, numel2*rnumel2={numel2*rnumel2}", file=sys.stderr)
             if numel1 == numel2 * rnumel2:
+                print(f"[POI+RED MATCH] checking tiling...", file=sys.stderr)
+                for n in node1.get_nodes():
+                    print(f"  node ranges: {n.get_ranges()}", file=sys.stderr)
                 if not all(
                     SIMDKernel.is_compatible((numel2, rnumel2), n.get_ranges())
                     for n in node1.get_nodes()
@@ -1443,13 +1448,14 @@ class SIMDScheduling(BaseScheduling):
                     config.triton.tiling_prevents_reduction_fusion
                     and not node1.is_template()
                 ):
-                    is_reduction_tiling_valid = tuple(
+                    actual_tiling = tuple(
                         self.select_tiling(node1.get_nodes(), numel1).values()
-                    ) in (
-                        (numel1, 1),
-                        (numel2, rnumel2, 1),
                     )
+                    valid_tilings = ((numel1, 1), (numel2, rnumel2, 1))
+                    is_reduction_tiling_valid = actual_tiling in valid_tilings
+                    print(f"[TILING CHECK] actual={actual_tiling}, valid={valid_tilings}, match={is_reduction_tiling_valid}", file=sys.stderr)
                     if not is_reduction_tiling_valid:
+                        print(f"[TILING REJECT] got={actual_tiling} expected={valid_tilings}", file=sys.stderr)
                         why("invalid tiling for reduction")
                     return is_reduction_tiling_valid
                 return True
@@ -1929,15 +1935,10 @@ class SIMDScheduling(BaseScheduling):
             pass1_outputs, external_per_row, external_per_elem, input_buf_name
         )
 
-        # External per-element buffers (like weight, bias) aren't supported yet
-        # because the custom 3D iteration structure doesn't map to 1D element indexing.
-        # The pattern matcher should have already rejected these cases.
-        assert not external_per_elem, (
-            f"Unexpected external_per_elem in group_within_row: {external_per_elem}. "
-            "This should have been rejected by can_fuse_small_reduction_epilogue."
-        )
+        # External per-element buffers (like weight, bias) are now supported.
+        # We handle them in Pass 2 by computing 1D indices from 3D coordinates.
 
-        # Now create the kernel (after we've verified the pattern is supported)
+        # Now create the kernel
         # Get size hints
         rnumel1_hint = V.graph.sizevars.size_hint(rnumel1, fallback=4096)
         rnumel2_hint = V.graph.sizevars.size_hint(rnumel2, fallback=16)
