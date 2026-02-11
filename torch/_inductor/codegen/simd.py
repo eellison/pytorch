@@ -1297,12 +1297,14 @@ class SIMDScheduling(BaseScheduling):
         ):
             return scheduler.ForeachKernelSchedulerNode.can_fuse(node1, node2)
 
-        # FusedSmallReductionEpilogue has special iteration space and cannot
-        # be further fused with other nodes (the current codegen generates
-        # separate kernels that need the intermediate buffer to stay alive)
-        from torch._inductor.scheduler import FusedSmallReductionEpilogue
-        if isinstance(node1, FusedSmallReductionEpilogue) or isinstance(
-            node2, FusedSmallReductionEpilogue
+        # FusedSmallReductionEpilogue and FusedInRegisterReductionEpilogue have
+        # special iteration spaces and cannot be further fused with other nodes
+        from torch._inductor.scheduler import (
+            FusedSmallReductionEpilogue,
+            FusedInRegisterReductionEpilogue,
+        )
+        if isinstance(node1, (FusedSmallReductionEpilogue, FusedInRegisterReductionEpilogue)) or isinstance(
+            node2, (FusedSmallReductionEpilogue, FusedInRegisterReductionEpilogue)
         ):
             return False
 
@@ -1628,89 +1630,58 @@ class SIMDScheduling(BaseScheduling):
         small_numel = node.small_reduction_numel
 
         # Check if we can do true fusion
-        # For fusion to be mathematically correct, both reductions must be the same type:
-        # - max(max(x1), max(x2), ...) = max(all x) ✓
-        # - sum(sum(x1), sum(x2), ...) = sum(all x) ✓
-        # We need to match the reduction producing the INTERFACE buffer (node1 output read by node2)
-        # with the reduction in node2. node1 can have other internal reductions (e.g., Welford).
+        # For now, require both to be simple reductions (same type)
+        # TODO: Support different reduction types and more complex cases
+        node1_reduction_types = set()
+        node2_reduction_types = set()
 
-        # Find the interface buffer: node1 output that node2 reads
-        node1_outputs = node1.get_buffer_names()
-        node2_inputs = node2.used_buffer_names()
-        interface_bufs = node1_outputs & node2_inputs
-
-        # Find the reduction type of the interface buffer
-        interface_reduction_type = None
         for snode in node1.get_nodes():
             if isinstance(snode, scheduler.SchedulerNode) and snode.is_reduction():
                 if isinstance(snode.node, ir.ComputedBuffer):
-                    buf_name = snode.node.get_name()
-                    if buf_name in interface_bufs:
-                        interface_reduction_type = snode.node.get_reduction_type()
-                        break
+                    rtype = snode.node.get_reduction_type()
+                    if rtype:
+                        node1_reduction_types.add(rtype)
 
-        # Find the reduction type of node2
-        node2_reduction_type = None
         for snode in node2.get_nodes():
             if isinstance(snode, scheduler.SchedulerNode) and snode.is_reduction():
                 if isinstance(snode.node, ir.ComputedBuffer):
-                    node2_reduction_type = snode.node.get_reduction_type()
-                    break
+                    rtype = snode.node.get_reduction_type()
+                    if rtype:
+                        node2_reduction_types.add(rtype)
 
-        # Mixed reduction types (sum->max) are now supported!
-        # Pre-reduction ops like clamp are extracted from node2's IR using
-        # _extract_two_pass_consumer_ops and applied before the final reduction.
+        # For this first implementation, fall back to separate kernels if:
+        # - Multiple reduction types in either node
+        # - Complex nodes with non-reduction operations
+        # TODO: Implement true fusion for these cases
         can_fuse = (
-            interface_reduction_type is not None
-            and node2_reduction_type is not None
+            len(node1_reduction_types) == 1
+            and len(node2_reduction_types) == 1
+            and node1_reduction_types == node2_reduction_types
         )
 
         if not can_fuse:
             fusion_log.debug(
                 "SmallReductionEpilogue: falling back to separate kernels "
-                "(interface_type=%s, node2_type=%s, interface_bufs=%s)",
-                interface_reduction_type,
-                node2_reduction_type,
-                interface_bufs,
+                "(node1_types=%s, node2_types=%s)",
+                node1_reduction_types,
+                node2_reduction_types,
             )
             # Fall back to generating two separate kernels
             self.codegen_node(node1)
             self.codegen_node(node2)
             return
 
-        # Check pattern type from the FusedSmallReductionEpilogue node
-        pattern_type = getattr(node, 'pattern_type', 'cascading')
-        groups_per_row = getattr(node, 'groups_per_row', 1)
-
-        fusion_log.debug(
-            "SmallReductionEpilogue: pattern_type=%s, groups_per_row=%d",
-            pattern_type, groups_per_row
+        # Generate fused kernel
+        # The key insight is to restructure the iteration space:
+        # - Original: numel1 outputs, each reducing rnumel1 elements
+        # - Fused: numel2 outputs, each processing rnumel2 rows of rnumel1 elements
+        #          then reducing the rnumel2 intermediate values
+        self._codegen_small_reduction_epilogue_fused(
+            node, node1, node2, numel1, rnumel1, numel2, rnumel2, small_numel
         )
 
-        if pattern_type == "group_within_row":
-            # Group within row pattern: same input, different grouping
-            # e.g., LayerNorm [64, 4096] + amax [16384, 16] where output is [64, 256]
-            # Kernel structure: for each row, reduce over rnumel1, then reshape
-            # and reduce over groups of rnumel2
-            self._codegen_group_within_row_pattern(
-                node, node1, node2, numel1, rnumel1, numel2, rnumel2, small_numel,
-                groups_per_row, interface_reduction_type, node2_reduction_type
-            )
-        else:
-            # Cascading pattern: node2 reads from node1 output
-            # Generate fused kernel
-            # The key insight is to restructure the iteration space:
-            # - Original: numel1 outputs, each reducing rnumel1 elements
-            # - Fused: numel2 outputs, each processing rnumel2 rows of rnumel1 elements
-            #          then reducing the rnumel2 intermediate values (using node2's reduction type)
-            self._codegen_small_reduction_epilogue_fused(
-                node, node1, node2, numel1, rnumel1, numel2, rnumel2, small_numel,
-                interface_reduction_type, node2_reduction_type
-            )
-
     def _codegen_small_reduction_epilogue_fused(
-        self, node, node1, node2, numel1, rnumel1, numel2, rnumel2, small_numel,
-        interface_reduction_type, node2_reduction_type
+        self, node, node1, node2, numel1, rnumel1, numel2, rnumel2, small_numel
     ):
         """
         Generate a fused kernel for small reduction epilogue pattern.
@@ -1737,31 +1708,20 @@ class SIMDScheduling(BaseScheduling):
             rnumel1,
         )
 
-        # Get the intermediate buffer name - must be node1 output that node2 reads
+        # Get the intermediate buffer name that we want to eliminate
         node1_outputs = node1.get_buffer_names()
-        node2_inputs = node2.used_buffer_names()
-        interface_bufs = node1_outputs & node2_inputs
         intermediate_buf_name = None
-        for buf_name in interface_bufs:
+        for buf_name in node1_outputs:
             intermediate_buf_name = buf_name
             break
 
-        # Check if intermediate buffer is a graph output (needed for backward)
-        # If so, we can't eliminate it - fall back to separate kernels
-        graph_outputs = V.graph.get_output_names()
-        if intermediate_buf_name in graph_outputs:
-            fusion_log.debug(
-                "SmallReductionEpilogue: intermediate buffer %s is a graph output "
-                "(needed for backward), falling back to separate kernels",
-                intermediate_buf_name,
-            )
-            self.codegen_node(node1)
-            self.codegen_node(node2)
-            return
-
-        # Use the reduction types passed from codegen_small_reduction_epilogue
-        # interface_reduction_type: type of node1's reduction (e.g., "sum")
-        # node2_reduction_type: type of node2's final reduction (e.g., "max")
+        # Get the reduction type from node1
+        reduction_type = None
+        for snode in node1.get_nodes():
+            if isinstance(snode, scheduler.SchedulerNode) and snode.is_reduction():
+                if isinstance(snode.node, ir.ComputedBuffer):
+                    reduction_type = snode.node.get_reduction_type()
+                    break
 
         # Get output buffer info from node2
         output_buf_name = None
@@ -1791,165 +1751,75 @@ class SIMDScheduling(BaseScheduling):
             node, node1, node2,
             input_buf_name, intermediate_buf_name, output_buf_name,
             numel1, rnumel1, numel2, rnumel2, small_numel,
-            interface_reduction_type, node2_reduction_type
+            reduction_type
         )
         fusion_log.info(
             "SmallReductionEpilogue: generated FUSED single kernel for %s -> %s "
-            "(eliminated buffer %s, numel2=%s, rnumel2=%s, reduction1=%s, reduction2=%s)",
+            "(eliminated buffer %s, numel2=%s, rnumel2=%s, reduction=%s)",
             node1.get_name(),
             node2.get_name(),
             intermediate_buf_name,
             numel2,
             rnumel2,
-            interface_reduction_type,
-            node2_reduction_type,
+            reduction_type,
         )
 
-    def _codegen_group_within_row_pattern(
-        self, node, node1, node2, numel1, rnumel1, numel2, rnumel2, small_numel,
-        groups_per_row, interface_reduction_type, node2_reduction_type
+    def _generate_fused_small_reduction_kernel(
+        self, node, node1, node2,
+        input_buf_name, intermediate_buf_name, output_buf_name,
+        numel1, rnumel1, numel2, rnumel2, small_numel,
+        reduction_type
     ):
         """
-        Generate code for the group_within_row pattern.
+        Generate a single fused kernel for the small reduction epilogue pattern.
 
-        This pattern is used when both reductions operate on the same input data
-        with different groupings:
-        - node1: reduces over rnumel1 per row (e.g., variance over 4096)
-        - node2: reduces over rnumel2 per group (e.g., amax over 16)
-        - groups_per_row: rnumel1 // rnumel2 (e.g., 256 groups of 16 per row)
+        Strategy: Use 2D reduction with the existing codegen infrastructure.
+        - X dimension: numel2 (final outputs)
+        - R0 dimension: rnumel2 (small reduction)
+        - R1 dimension: rnumel1 (main reduction)
 
-        The kernel structure:
-        1. Iterate over rows (numel1 blocks)
-        2. For each row:
-           a. Compute node1's reduction (e.g., variance) - keep in registers
-           b. Re-read input, apply transformation, reshape to groups
-           c. Reduce over each group of rnumel2 elements
-        3. Output: [numel1, groups_per_row] = [64, 256]
-
-        This is essentially a two-pass kernel within the main reduction loop.
+        The iteration space is (numel2, rnumel2 * rnumel1) with a 2-level reduction.
         """
-        fusion_log.info(
-            "SmallReductionEpilogue: generating group_within_row kernel for %s -> %s "
-            "(numel1=%s, rnumel1=%s, groups_per_row=%d, rnumel2=%s)",
-            node1.get_name(),
-            node2.get_name(),
-            numel1, rnumel1, groups_per_row, rnumel2
-        )
+        # Get dtypes from the graph
+        input_dtype = V.graph.get_dtype(input_buf_name)
+        output_dtype = V.graph.get_dtype(output_buf_name)
 
-        # Get buffer names
-        node1_outputs = node1.get_buffer_names()
-        node2_inputs = node2.used_buffer_names()
-        interface_bufs = node1_outputs & node2_inputs
+        if input_dtype is None or output_dtype is None:
+            raise ValueError(f"Could not find dtypes for buffers: input={input_buf_name}, output={output_buf_name}")
 
-        intermediate_buf_name = None
-        for buf_name in interface_bufs:
-            intermediate_buf_name = buf_name
-            break
+        # Note: in_register_reduction is available for cases where we have [XBLOCK, R0_BLOCK]
+        # data and want to reduce over groups within R0_BLOCK. This is a different pattern
+        # than SmallReductionEpilogue (which combines scalar outputs from a full reduction).
+        # For now, use the loop-based approach for SmallReductionEpilogue.
+        # TODO: Add separate detection for in_register_reduction fusion pattern.
 
-        output_buf_name = None
-        for buf_name in node2.get_buffer_names():
-            output_buf_name = buf_name
-            break
-
-        if not intermediate_buf_name or not output_buf_name:
-            fusion_log.warning(
-                "SmallReductionEpilogue: group_within_row - could not determine buffer names"
-            )
-            self.codegen_node(node1)
-            self.codegen_node(node2)
-            return
-
-        # Check if intermediate buffer is a graph output
-        graph_outputs = V.graph.get_output_names()
-        if intermediate_buf_name in graph_outputs:
-            fusion_log.debug(
-                "SmallReductionEpilogue: intermediate buffer %s is graph output, "
-                "falling back to separate kernels",
-                intermediate_buf_name,
-            )
-            self.codegen_node(node1)
-            self.codegen_node(node2)
-            return
-
-        # Categorize buffers FIRST to detect unsupported cases early
-        # (before we create any kernel context)
-        #
-        # Categorize buffers that node2 reads:
-        # - pass1_outputs: outputs of node1 (available via inline_reduction_buffers/CSE)
-        # - external_per_row: external buffers indexed by row (like mean)
-        # - external_per_elem: external buffers indexed by element (like weight, bias)
-        # - input_buf: the main data input (read by both node1 and node2)
-
-        # Find the main input buffer (original data read by both node1 and node2)
-        input_buf_name = None
-        for dep in node1.read_writes.reads:
-            if hasattr(dep, 'name') and dep.name.startswith('arg'):
-                input_buf_name = dep.name
-                break
-
-        # Categorize node2's input buffers
-        pass1_outputs = []  # Buffers produced by node1 (get from CSE)
-        external_per_row = []  # External buffers with per-row indexing
-        external_per_elem = []  # External buffers with per-element indexing
-
-        # ALL node1 outputs that node2 reads are pass1_outputs (e.g., both mean and variance)
-        for buf_name in interface_bufs:
-            pass1_outputs.append(buf_name)
-
-        # Check what other buffers node2 reads (not produced by node1)
-        for dep in node2.read_writes.reads:
-            if not hasattr(dep, 'name'):
-                continue
-            name = dep.name
-
-            # Skip if it's node1's output (already categorized)
-            if name in interface_bufs:
-                continue
-
-            # Skip the main input (handled separately)
-            if name == input_buf_name:
-                continue
-
-            # Check if this buffer is also read by node1 (then it's per-row data)
-            is_node1_input = any(
-                hasattr(d, 'name') and d.name == name
-                for d in node1.read_writes.reads
-            )
-
-            if is_node1_input:
-                # Per-row buffer (like mean, computed by upstream kernel)
-                external_per_row.append(name)
-            else:
-                # Per-element buffer (like weight, bias)
-                external_per_elem.append(name)
-
-        fusion_log.debug(
-            "SmallReductionEpilogue group_within_row: pass1_outputs=%s, "
-            "external_per_row=%s, external_per_elem=%s, input_buf=%s",
-            pass1_outputs, external_per_row, external_per_elem, input_buf_name
-        )
-
-        # External per-element buffers (like weight, bias) aren't supported yet
-        # because the custom 3D iteration structure doesn't map to 1D element indexing.
-        # The pattern matcher should have already rejected these cases.
-        assert not external_per_elem, (
-            f"Unexpected external_per_elem in group_within_row: {external_per_elem}. "
-            "This should have been rejected by can_fuse_small_reduction_epilogue."
-        )
-
-        # Now create the kernel (after we've verified the pattern is supported)
-        # Get size hints
-        rnumel1_hint = V.graph.sizevars.size_hint(rnumel1, fallback=4096)
-        rnumel2_hint = V.graph.sizevars.size_hint(rnumel2, fallback=16)
-        numel1_hint = V.graph.sizevars.size_hint(numel1, fallback=64)
+        # Configure small reduction epilogue info for the kernel
+        small_reduction_config = {
+            "small_numel": small_numel,
+            "reduction_type": reduction_type,
+            "numel2": numel2,
+            "rnumel2": rnumel2,
+            "numel1": numel1,
+            "rnumel1": rnumel1,
+            "input_buf_name": input_buf_name,
+            "intermediate_buf_name": intermediate_buf_name,
+            "output_buf_name": output_buf_name,
+            "input_dtype": input_dtype,
+            "output_dtype": output_dtype,
+            "use_in_register_reduction": False,  # Loop-based for now
+        }
 
         # Create node schedule from node1's nodes
+        # Use iteration space (numel1, rnumel1) - original node1 iteration space
+        # The small_reduction_epilogue config will handle the grid adjustment
         node_schedule = self.generate_node_schedule(
             list(node1.get_nodes()), numel1, rnumel1
         )
         kernel_features = SIMDKernelFeatures(node_schedule, numel1, rnumel1)
 
-        # Create kernel with persistent reduction (required for two-pass)
+        # Create kernel with small_reduction_epilogue config
+        # The kernel will have iteration space (numel1, rnumel1) for correct indexing
+        # but codegen_body will generate a loop over rnumel2 with grid size numel2
         kernel = self.create_kernel_choices(
             kernel_features,
             [{"x": numel1, "r0_": rnumel1}],
@@ -1957,54 +1827,197 @@ class SIMDScheduling(BaseScheduling):
                 "features": kernel_features,
                 "tiling_scores": None,
                 "override_persistent_reduction": True,
+                "small_reduction_epilogue": small_reduction_config,
             },
         )[0]
 
-        if not kernel.persistent_reduction:
-            fusion_log.warning(
-                "SmallReductionEpilogue: group_within_row requires persistent reduction, "
-                "falling back to separate kernels"
+        assert kernel.persistent_reduction, "Small reduction epilogue requires persistent reduction"
+
+        # Generate kernel code
+        self.codegen_node_schedule_with_kernel(node_schedule, kernel)
+
+        # Add node2's output buffer as the actual output argument
+        # This will be used for the final store instead of buf0
+        with V.set_kernel_handler(kernel):
+            # Register the real output buffer
+            real_output_var = kernel.args.output(output_buf_name)
+            # Store in config for codegen_body to use
+            small_reduction_config["real_output_var"] = real_output_var
+
+        with kernel:
+            kernel.codegen_body()
+
+        # Override the X dimension to numel2 for grid calculation
+        # This ensures we only launch numel2 blocks instead of numel1
+        kernel.numels["x"] = numel2
+        # Also update the range tree's numel for the kernel call args
+        for tree in kernel.range_trees:
+            if tree.prefix == "x":
+                tree.numel = numel2
+                break
+
+        with V.set_kernel_handler(kernel):
+            src_code = kernel.codegen_kernel()
+
+        kernel_name = self.define_kernel(src_code, node_schedule, kernel)
+        kernel.kernel_name = kernel_name
+        kernel.code_hash = code_hash(src_code)
+
+        # Mark buffers
+        with V.set_kernel_handler(kernel):
+            for snode in kernel_features.scheduler_nodes():
+                snode.mark_run()
+            # Also mark node2's output as run
+            for snode in node2.get_nodes():
+                if hasattr(snode, 'mark_run'):
+                    snode.mark_run()
+
+        # Generate kernel call
+        V.graph.wrapper_code.make_comment("# Call small reduction epilogue fused kernel")
+        self.codegen_comment(node_schedule, None)
+        kernel.call_kernel(kernel.kernel_name)
+        V.graph.removed_buffers |= kernel.removed_buffers
+        V.graph.inplaced_to_remove |= kernel.inplaced_to_remove
+
+        # Mark intermediate buffer as removed since we don't materialize it
+        # (the store_reduction was intercepted and we write directly to the final output)
+        V.graph.removed_buffers.add(intermediate_buf_name)
+
+    def codegen_in_register_reduction_epilogue(self, node):
+        """
+        Generate code for computation -> in-register reduction epilogue fusion.
+
+        This fuses a small reduction INTO the R0_BLOCK dimension of an upstream
+        computation, using ops.in_register_reduction() to reshape and reduce.
+
+        Example: LayerNorm -> amax
+            - LayerNorm produces [XBLOCK, R0_BLOCK] normalized data in registers
+            - amax reduces groups of 16 within R0_BLOCK
+            - Result: [XBLOCK, R0_BLOCK/16] stored directly
+
+        The key insight is that we use the SAME iteration space as node1,
+        but instead of storing node1's output, we apply in_register_reduction
+        and store the reduced result.
+        """
+        from torch._inductor.scheduler import FusedInRegisterReductionEpilogue
+
+        assert isinstance(node, FusedInRegisterReductionEpilogue)
+
+        node1 = node.node1  # Upstream computation
+        node2 = node.node2  # Small reduction epilogue
+
+        _, (numel1, rnumel1) = node1.group
+        _, (numel2, rnumel2) = node2.group
+        group_size = node.group_size
+
+        fusion_log.debug(
+            "codegen_in_register_reduction_epilogue: %s -> %s "
+            "(numel1=%s, rnumel1=%s, group_size=%s)",
+            node1.get_name(), node2.get_name(),
+            numel1, rnumel1, group_size
+        )
+
+        # Find the intermediate buffer (node1's output that node2 reads)
+        node1_outputs = node1.get_buffer_names()
+        node2_inputs = node2.used_buffer_names()
+        intermediate_bufs = node1_outputs & node2_inputs
+
+        if not intermediate_bufs:
+            fusion_log.debug(
+                "InRegisterReductionEpilogue: no intermediate buffer found, falling back"
             )
             self.codegen_node(node1)
             self.codegen_node(node2)
             return
 
-        # Generic config for two-pass fusion
-        kernel.two_pass_fusion = {
-            "numel1_hint": numel1_hint,
-            "rnumel1_hint": rnumel1_hint,
-            "rnumel2_hint": rnumel2_hint,
-            "groups_per_row": groups_per_row,
-            "input_buf": input_buf_name,
-            "output_buf": output_buf_name,
-            "pass1_outputs": pass1_outputs,  # Buffers from CSE (e.g., variance)
-            "external_per_row": external_per_row,  # Load once per row (e.g., mean)
-            "external_per_elem": external_per_elem,  # Load per element (e.g., weight, bias)
-            "node2": node2,
+        intermediate_buf_name = next(iter(intermediate_bufs))
+
+        # Find node2's output buffer
+        output_buf_name = None
+        for snode in node2.get_nodes():
+            for buf_name in snode.get_buffer_names():
+                if buf_name != intermediate_buf_name:
+                    output_buf_name = buf_name
+                    break
+            if output_buf_name:
+                break
+
+        if not output_buf_name:
+            fusion_log.debug(
+                "InRegisterReductionEpilogue: no output buffer found, falling back"
+            )
+            self.codegen_node(node1)
+            self.codegen_node(node2)
+            return
+
+        # Get reduction type from node2
+        reduction_type = None
+        for snode in node2.get_nodes():
+            if isinstance(snode, scheduler.SchedulerNode) and snode.is_reduction():
+                if isinstance(snode.node, ir.ComputedBuffer):
+                    reduction_type = snode.node.get_reduction_type()
+                    break
+
+        if not reduction_type:
+            fusion_log.debug(
+                "InRegisterReductionEpilogue: could not determine reduction type, falling back"
+            )
+            self.codegen_node(node1)
+            self.codegen_node(node2)
+            return
+
+        # Get dtypes
+        input_dtype = V.graph.get_dtype(intermediate_buf_name)
+        output_dtype = V.graph.get_dtype(output_buf_name)
+
+        fusion_log.debug(
+            "InRegisterReductionEpilogue: fusing with in_register_reduction "
+            "(intermediate=%s, output=%s, reduction_type=%s, group_size=%s)",
+            intermediate_buf_name, output_buf_name, reduction_type, group_size
+        )
+
+        # Configure in_register_reduction info for the kernel
+        in_register_config = {
+            "group_size": group_size,
+            "reduction_type": reduction_type,
+            "intermediate_buf_name": intermediate_buf_name,
+            "output_buf_name": output_buf_name,
+            "input_dtype": input_dtype,
+            "output_dtype": output_dtype,
+            "numel1": numel1,
+            "rnumel1": rnumel1,
+            "numel2": numel2,
+            "rnumel2": rnumel2,
         }
 
-        # Mark pass1_outputs for inline storage (keep in registers)
-        for buf_name in pass1_outputs:
-            kernel.inline_reduction_buffers[buf_name] = None
+        # Generate node schedule from node1's nodes
+        # Use node1's iteration space
+        node_schedule = self.generate_node_schedule(
+            list(node1.get_nodes()), numel1, rnumel1
+        )
+        kernel_features = SIMDKernelFeatures(node_schedule, numel1, rnumel1)
 
-        # Also mark external_per_row buffers for inline storage if they're computed
-        # by earlier ops in this fusion (not currently the case, but for future use)
-        for buf_name in external_per_row:
-            if buf_name.startswith('buf'):
-                kernel.inline_reduction_buffers[buf_name] = None
+        # Create kernel with in_register_reduction config
+        # This tells the kernel to use in_register_reduction instead of normal store
+        kernel = self.create_kernel_choices(
+            kernel_features,
+            [{"x": numel1, "r0_": rnumel1}],
+            {
+                "features": kernel_features,
+                "tiling_scores": None,
+                "override_persistent_reduction": True,
+                "small_reduction_epilogue": {
+                    **in_register_config,
+                    "use_in_register_reduction": True,
+                },
+            },
+        )[0]
 
-        # Generate node1's IR (Pass 1)
+        assert kernel.persistent_reduction, "InRegisterReductionEpilogue requires persistent reduction"
+
+        # Generate kernel code
         self.codegen_node_schedule_with_kernel(node_schedule, kernel)
 
-        # Register node2's output buffer
-        with V.set_kernel_handler(kernel):
-            kernel.args.output(output_buf_name)
-
-        # Generate kernel body (includes Pass 2 via _codegen_two_pass_pass2)
-        with kernel:
-            kernel.codegen_body()
-
-        # Generate kernel source
         with V.set_kernel_handler(kernel):
             src_code = kernel.codegen_kernel()
 
@@ -2028,478 +2041,6 @@ class SIMDScheduling(BaseScheduling):
 
         # Mark intermediate buffer as removed
         V.graph.removed_buffers.add(intermediate_buf_name)
-
-        fusion_log.info(
-            "SmallReductionEpilogue: generated group_within_row kernel for %s -> %s",
-            node1.get_name(), node2.get_name()
-        )
-
-    def _generate_fused_small_reduction_kernel(
-        self, node, node1, node2,
-        input_buf_name, intermediate_buf_name, output_buf_name,
-        numel1, rnumel1, numel2, rnumel2, small_numel,
-        interface_reduction_type, node2_reduction_type
-    ):
-        """
-        Generate a single fused kernel for the small reduction epilogue pattern.
-
-        Strategy: Parallel execution with XBLOCK = rnumel2.
-        - Grid: numel2 blocks (one per final output)
-        - XBLOCK: rnumel2 (process all rows per output in parallel)
-        - RBLOCK: rnumel1 (main reduction dimension)
-
-        Each block:
-        1. Loads and processes rnumel2 rows in parallel
-        2. Reduces each row over rnumel1 → [XBLOCK] intermediate values
-        3. Reduces over XBLOCK → single output value
-
-        The intermediate buffer is eliminated through normal fusion (CSE variable).
-        """
-        # Get dtypes from the graph
-        input_dtype = V.graph.get_dtype(input_buf_name)
-        output_dtype = V.graph.get_dtype(output_buf_name)
-
-        if input_dtype is None or output_dtype is None:
-            raise ValueError(f"Could not find dtypes for buffers: input={input_buf_name}, output={output_buf_name}")
-
-        # Identify additional inputs to node2 (beyond the intermediate buffer)
-        # These are inputs for fused pointwise operations (like scale in y * scale)
-        node2_own_outputs = node2.get_buffer_names()
-        node1_outputs = node1.get_buffer_names()
-        node2_inputs = node2.used_buffer_names()
-        intermediate_inputs = node1_outputs & node2_inputs
-        # Other inputs that node2 needs (beyond intermediate and its own accumulator)
-        additional_inputs = node2_inputs - intermediate_inputs - node2_own_outputs
-
-        # Configure small reduction epilogue info for the kernel
-        # interface_reduction_type: node1's reduction type (for per-row reduction)
-        # node2_reduction_type: node2's reduction type (for final epilogue reduction)
-        small_reduction_config = {
-            "small_numel": small_numel,
-            "reduction_type": interface_reduction_type,  # For compatibility
-            "node2_reduction_type": node2_reduction_type,  # For final reduction
-            "numel2": numel2,
-            "rnumel2": rnumel2,
-            "numel1": numel1,
-            "rnumel1": rnumel1,
-            "input_buf_name": input_buf_name,
-            "intermediate_buf_name": intermediate_buf_name,
-            "output_buf_name": output_buf_name,
-            "input_dtype": input_dtype,
-            "output_dtype": output_dtype,
-            "additional_inputs": list(additional_inputs),
-            "node2": node2,  # Pass node2 for extracting pointwise ops
-        }
-
-        # Create node schedule from node1's nodes
-        # Use iteration space (numel1, rnumel1) for correct indexing
-        node_schedule = self.generate_node_schedule(
-            list(node1.get_nodes()), numel1, rnumel1
-        )
-        kernel_features = SIMDKernelFeatures(node_schedule, numel1, rnumel1)
-
-        # Get size hints
-        rnumel2_val = V.graph.sizevars.size_hint(rnumel2, fallback=16)
-        numel1_val = V.graph.sizevars.size_hint(numel1, fallback=64)
-
-        # Check natural tiling to see if our forced XBLOCK is reasonable
-        # If the heuristics would naturally choose a very different tiling,
-        # we might be making things worse by forcing XBLOCK=rnumel2
-        natural_tiling = self.select_tiling(node_schedule, numel1, rnumel1)
-        fusion_log.debug(
-            "SmallReductionEpilogue: natural tiling=%s, want XBLOCK=%d",
-            natural_tiling, rnumel2_val
-        )
-
-        # If numel1 is small enough that heuristics would use no_x_dim (XBLOCK=1),
-        # but we need XBLOCK=rnumel2, check if this is reasonable.
-        # For now, we require numel1 >= rnumel2 to ensure we have enough elements
-        # to fill one block. This is a conservative check.
-        if numel1_val < rnumel2_val:
-            fusion_log.debug(
-                "SmallReductionEpilogue: numel1=%d < rnumel2=%d, falling back "
-                "(not enough elements to fill XBLOCK)",
-                numel1_val, rnumel2_val
-            )
-            self.codegen_node(node1)
-            self.codegen_node(node2)
-            return
-
-        # Get numel2 size hint for the grid (number of output blocks)
-        numel2_val = V.graph.sizevars.size_hint(numel2, fallback=4)
-
-        # Store the integer value of numel2 for the grid type
-        # The grid will be exactly numel2 blocks, independent of XBLOCK
-        small_reduction_config["numel2"] = numel2_val
-
-        # Create kernel - the SmallReductionEpilogueGrid will use numel2 directly
-        # for the grid size, while min_xblock ensures XBLOCK >= rnumel2 for the
-        # in-register final reduction
-        kernel = self.create_kernel_choices(
-            kernel_features,
-            [{"x": numel1, "r0_": rnumel1}],
-            {
-                "features": kernel_features,
-                "tiling_scores": None,
-                "override_persistent_reduction": True,
-                "small_reduction_epilogue": small_reduction_config,
-            },
-        )[0]
-
-        assert kernel.persistent_reduction, "Small reduction epilogue requires persistent reduction"
-
-        # Verify we have a 1D grid (only X non-reduction dimension)
-        # The small reduction epilogue currently only supports reducing over X
-        non_reduction_dims = [t for t in kernel.range_trees if not t.is_reduction]
-        assert len(non_reduction_dims) == 1 and non_reduction_dims[0].prefix == "x", (
-            f"Small reduction epilogue only supports 1D grids with X dimension, "
-            f"got {[t.prefix for t in non_reduction_dims]}"
-        )
-
-        # Set up inline reduction buffer - this tells store_reduction to keep the
-        # intermediate value in a register instead of storing to memory
-        kernel.inline_reduction_buffers[intermediate_buf_name] = None  # Will be filled by store_reduction
-
-        # Set minimum XBLOCK constraint - must be at least rnumel2 for the
-        # in-register final reduction to work correctly.
-        # NOTE: This is specifically for XBLOCK. If we ever support Y/Z dimensions,
-        # we'd need min_yblock/min_zblock accordingly.
-        kernel.min_xblock = rnumel2_val
-
-        # Generate kernel code
-        self.codegen_node_schedule_with_kernel(node_schedule, kernel)
-
-        # Add node2's output buffer as the actual output argument
-        with V.set_kernel_handler(kernel):
-            real_output_var = kernel.args.output(output_buf_name)
-            small_reduction_config["real_output_var"] = real_output_var
-
-        with kernel:
-            kernel.codegen_body()
-
-        # NOTE: Don't override kernel.numels["x"] here!
-        # Grid is calculated as ceil(numel1 / XBLOCK) = ceil(64 / 16) = 4 = numel2
-        # This is correct because numel1 = numel2 * rnumel2 and XBLOCK = rnumel2
-
-        with V.set_kernel_handler(kernel):
-            src_code = kernel.codegen_kernel()
-
-        kernel_name = self.define_kernel(src_code, node_schedule, kernel)
-        kernel.kernel_name = kernel_name
-        kernel.code_hash = code_hash(src_code)
-
-        # Mark buffers
-        with V.set_kernel_handler(kernel):
-            for snode in kernel_features.scheduler_nodes():
-                snode.mark_run()
-            for snode in node2.get_nodes():
-                if hasattr(snode, 'mark_run'):
-                    snode.mark_run()
-
-        # Generate kernel call
-        self.codegen_comment(node_schedule, None)
-        kernel.call_kernel(kernel.kernel_name)
-        V.graph.removed_buffers |= kernel.removed_buffers
-        V.graph.inplaced_to_remove |= kernel.inplaced_to_remove
-
-        # Mark intermediate buffer as removed (eliminated through fusion)
-        V.graph.removed_buffers.add(intermediate_buf_name)
-
-    def codegen_two_pass_welford(self, node):
-        """
-        Generate code for fused Welford + consumer pattern.
-
-        Generates a true two-pass kernel:
-        - Pass 1: Welford reduction (mean/var kept in registers)
-        - Pass 2: Normalize + consumer ops using in-register mean/var
-
-        Falls back to separate kernels if fusion conditions aren't met.
-        """
-        from torch._inductor.scheduler import FusedTwoPassWelford
-
-        assert isinstance(node, FusedTwoPassWelford)
-
-        node1 = node.node1  # Welford
-        node2 = node.node2  # Consumer
-
-        fusion_log.debug(
-            "TwoPassWelfordFusion: attempting fusion for %s -> %s",
-            node1.get_name(),
-            node2.get_name(),
-        )
-
-        # Check if we can do true two-pass fusion
-        can_fuse, fusion_info = self._can_fuse_two_pass_welford(node, node1, node2)
-
-        if can_fuse:
-            try:
-                self._codegen_two_pass_welford_fused(node, node1, node2, fusion_info)
-                return
-            except Exception as e:
-                import traceback
-                fusion_log.debug(
-                    "TwoPassWelfordFusion: fused codegen failed: %s\n%s",
-                    str(e), traceback.format_exc()
-                )
-
-        # Fall back to separate kernels
-        fusion_log.debug("TwoPassWelfordFusion: falling back to separate kernels")
-        self.codegen_node(node1)
-        self.codegen_node(node2)
-
-    def _can_fuse_two_pass_welford(self, node, node1, node2):
-        """Check if we can generate a true two-pass fused kernel."""
-        from torch._inductor.scheduler import SchedulerNode
-
-        # Get iteration spaces
-        _, (numel1, rnumel1) = node1.group
-        _, (numel2, rnumel2) = node2.group
-
-        # Size hints
-        numel1_hint = V.graph.sizevars.size_hint(numel1, fallback=0)
-        rnumel1_hint = V.graph.sizevars.size_hint(rnumel1, fallback=0)
-        numel2_hint = V.graph.sizevars.size_hint(numel2, fallback=0)
-        rnumel2_hint = V.graph.sizevars.size_hint(rnumel2, fallback=0)
-
-        if numel1_hint == 0 or rnumel1_hint == 0 or rnumel2_hint == 0:
-            return False, None
-
-        # Check rnumel1 is divisible by rnumel2 (groups per row)
-        if rnumel1_hint % rnumel2_hint != 0:
-            fusion_log.debug(
-                "TwoPassWelfordFusion: rnumel1=%d not divisible by rnumel2=%d",
-                rnumel1_hint, rnumel2_hint
-            )
-            return False, None
-
-        groups_per_row = rnumel1_hint // rnumel2_hint
-
-        # Verify numel relationship
-        if numel1_hint * groups_per_row != numel2_hint:
-            fusion_log.debug(
-                "TwoPassWelfordFusion: numel mismatch %d * %d != %d",
-                numel1_hint, groups_per_row, numel2_hint
-            )
-            return False, None
-
-        # Check we have shared inputs
-        if not node.shared_input_names:
-            fusion_log.debug("TwoPassWelfordFusion: no shared inputs")
-            return False, None
-
-        # Find Welford reduction outputs (mean, var) from node1
-        # node1 may be a simple Welford or a fused Welford+normalize
-        mean_buf = None
-        var_buf = None
-        for snode in node1.get_nodes():
-            if isinstance(snode, SchedulerNode) and snode.is_reduction():
-                # Check if this is a Welford reduction
-                buf_names = list(snode.get_buffer_names())
-                if len(buf_names) >= 2:
-                    # Welford produces two outputs: mean and var
-                    mean_buf = buf_names[0]
-                    var_buf = buf_names[1]
-                    break
-
-        # Fallback: use first two buffers from node1
-        if not mean_buf or not var_buf:
-            node1_buffers = list(node1.get_buffer_names())
-            if len(node1_buffers) < 2:
-                fusion_log.debug("TwoPassWelfordFusion: expected at least 2 buffers")
-                return False, None
-            mean_buf = node1_buffers[0]
-            var_buf = node1_buffers[1]
-
-        # Get output buffers from node2
-        node2_buffers = list(node2.get_buffer_names())
-        if not node2_buffers:
-            return False, None
-        # For the extended case (full NVFP4), node2 may have multiple outputs
-        # amax, amax_bf16, even, odd
-        output_buf = node2_buffers[0]  # Primary output (amax f32)
-        # Additional outputs for full NVFP4
-        all_output_bufs = node2_buffers
-
-        # Get shared input
-        input_buf = next(iter(node.shared_input_names))
-
-        # Find weight/bias from node1's reads (they're used in normalize)
-        # In the extended case, node1 contains the normalize so weight/bias are in node1
-        weight_buf = None
-        bias_buf = None
-
-        # First check node1's reads (for extended case where normalize is in node1)
-        for dep in node1.read_writes.reads:
-            if hasattr(dep, 'name'):
-                name = dep.name
-                if name.startswith("arg") and name != input_buf:
-                    if name not in [mean_buf, var_buf]:
-                        if weight_buf is None:
-                            weight_buf = name
-                        elif bias_buf is None:
-                            bias_buf = name
-
-        # Also check node2's reads (for simple case where normalize is in node2)
-        for dep in node2.read_writes.reads:
-            if hasattr(dep, 'name'):
-                name = dep.name
-                if name.startswith("arg") and name != input_buf:
-                    if name not in [mean_buf, var_buf]:
-                        if weight_buf is None:
-                            weight_buf = name
-                        elif bias_buf is None:
-                            bias_buf = name
-
-        fusion_info = {
-            "numel1": numel1,
-            "rnumel1": rnumel1,
-            "numel2": numel2,
-            "rnumel2": rnumel2,
-            "numel1_hint": numel1_hint,
-            "rnumel1_hint": rnumel1_hint,
-            "rnumel2_hint": rnumel2_hint,
-            "groups_per_row": groups_per_row,
-            "mean_buf": mean_buf,
-            "var_buf": var_buf,
-            "input_buf": input_buf,
-            "output_buf": output_buf,
-            "all_output_bufs": all_output_bufs,  # All consumer outputs
-            "weight_buf": weight_buf,
-            "bias_buf": bias_buf,
-            # For extended case, track if node1 contains normalize
-            "node1_has_normalize": len(list(node1.get_buffer_names())) > 2,
-        }
-
-        fusion_log.debug(
-            "TwoPassWelfordFusion: can fuse with info=%s", fusion_info
-        )
-        return True, fusion_info
-
-    def _codegen_two_pass_welford_fused(self, node, node1, node2, fusion_info):
-        """Generate a fused two-pass kernel for Welford + consumer.
-
-        Following mix_order_reduction pattern:
-        1. Generate node_schedule with node1's nodes
-        2. Create kernel with two_pass_welford flag
-        3. codegen_node_schedule_with_kernel processes node1's IR
-        4. Manually register node2's buffers as kernel args
-        5. codegen_body generates Pass 1 (from IR) and Pass 2 (manual)
-        """
-        numel1 = fusion_info["numel1"]
-        rnumel1 = fusion_info["rnumel1"]
-        mean_buf = fusion_info["mean_buf"]
-        var_buf = fusion_info["var_buf"]
-
-        fusion_log.info(
-            "TwoPassWelfordFusion: generating fused kernel "
-            "(numel=%d, rnumel=%d, groups_per_row=%d, group_size=%d)",
-            fusion_info["numel1_hint"], fusion_info["rnumel1_hint"],
-            fusion_info["groups_per_row"], fusion_info["rnumel2_hint"]
-        )
-
-        # Generate node schedule for Welford (node1)
-        node_schedule = self.generate_node_schedule(
-            node1.get_nodes(), numel1, rnumel1
-        )
-        kernel_features = SIMDKernelFeatures(node_schedule, numel1, rnumel1)
-
-        # Create kernel with persistent reduction (required for two-pass)
-        kernel = self.create_kernel_choices(
-            kernel_features,
-            [{"x": numel1, "r0_": rnumel1}],
-            {
-                "features": kernel_features,
-                "tiling_scores": None,
-                "override_persistent_reduction": True,
-            },
-        )[0]
-
-        if not kernel.persistent_reduction:
-            raise RuntimeError("Two-pass Welford requires persistent reduction")
-
-        # Configure two-pass fusion
-        kernel.two_pass_welford = {
-            **fusion_info,
-            "node2": node2,
-        }
-
-        # Mark mean/var buffers for inline storage (kept in registers)
-        kernel.inline_reduction_buffers[mean_buf] = None
-        kernel.inline_reduction_buffers[var_buf] = None
-
-        # Extended case: if node1 includes normalize, also mark the normalized output as inline
-        # because it will be recomputed in Pass 2
-        if fusion_info.get("node1_has_normalize"):
-            # Find the pointwise output buffer from node1 (the normalized output)
-            node1_buffers = list(node1.get_buffer_names())
-            for buf_name in node1_buffers:
-                if buf_name not in [mean_buf, var_buf]:
-                    # This is the normalized output - mark it as inline
-                    kernel.inline_reduction_buffers[buf_name] = None
-                    fusion_log.debug(
-                        "TwoPassWelfordFusion: marking %s as inline (normalized output)",
-                        buf_name
-                    )
-
-        # Generate the kernel IR for node1 (Pass 1)
-        self.codegen_node_schedule_with_kernel(node_schedule, kernel)
-
-        # Now manually register node2's buffers as kernel args
-        # This is done AFTER codegen_node_schedule_with_kernel but BEFORE codegen_kernel
-        # so that the buffers are included in the kernel signature
-        output_buf = fusion_info.get("output_buf")
-        weight_buf = fusion_info.get("weight_buf")
-        bias_buf = fusion_info.get("bias_buf")
-
-        # Pre-register node2's buffers - these will be available in Pass 2 codegen
-        if output_buf:
-            kernel.args.output(output_buf)
-        if weight_buf:
-            kernel.args.input(weight_buf)
-        if bias_buf:
-            kernel.args.input(bias_buf)
-
-        # Generate kernel source code (codegen_body generates Pass 1 + Pass 2)
-        with kernel:
-            kernel.codegen_body()
-
-        with V.set_kernel_handler(kernel):
-            src_code = kernel.codegen_kernel()
-
-        # Define the kernel (add to async_compile)
-        kernel_name = self.define_kernel(src_code, node_schedule, kernel)
-        kernel.kernel_name = kernel_name
-        kernel.code_hash = code_hash(src_code)
-
-        # Allocate output buffers by calling mark_run() on relevant nodes
-        # This is what codegen_node_schedule does (see line ~2544)
-        with V.set_kernel_handler(kernel):
-            # node1's outputs (mean/var) are kept in registers, marked as removed
-            # node2's output (buf3) needs to be allocated
-            for snode in node2.get_nodes():
-                if hasattr(snode, 'mark_run'):
-                    snode.mark_run()
-
-        # Generate the kernel call
-        self.codegen_comment(node_schedule, None)
-
-        with V.set_kernel_handler(kernel):
-            kernel.call_kernel(kernel.kernel_name)
-
-        V.graph.removed_buffers |= kernel.removed_buffers
-        V.graph.inplaced_to_remove |= kernel.inplaced_to_remove
-
-        # Mark intermediate buffers as removed (kept in registers)
-        V.graph.removed_buffers.add(mean_buf)
-        V.graph.removed_buffers.add(var_buf)
-
-        # Extended case: mark normalized output as removed too
-        if fusion_info.get("node1_has_normalize"):
-            node1_buffers = list(node1.get_buffer_names())
-            for buf_name in node1_buffers:
-                if buf_name not in [mean_buf, var_buf]:
-                    V.graph.removed_buffers.add(buf_name)
-
 
     def codegen_mix_order_reduction(self, node):
         node1, node2 = node.node1, node.node2

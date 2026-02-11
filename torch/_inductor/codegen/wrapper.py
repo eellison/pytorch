@@ -737,9 +737,6 @@ class AllocateLine(MemoryPlanningLine):
         key = buffer_reuse_key(self.node)
         if config.allow_buffer_reuse and key in state:
             free_line = state.pop(key)
-            # Don't reuse a buffer that was removed (e.g., fused away)
-            if free_line.node.get_name() in V.graph.removed_buffers:
-                return self
             size = V.graph.sizevars.size_hint(
                 V.graph.get_allocation_storage_size(self.node), fallback=0
             ) * get_dtype_size(self.node.get_dtype())
@@ -828,21 +825,10 @@ class ReuseLine(MemoryPlanningLine):
     delete_old: bool = True
 
     def plan(self, state: MemoryPlanningState) -> MemoryPlanningLine:
-        # node is the OLD buffer, reused_as is the NEW buffer
-        old_removed = self.node.get_name() in V.graph.removed_buffers
-        new_removed = self.reused_as.get_name() in V.graph.removed_buffers
-
-        if old_removed and new_removed:
-            # Both removed (e.g., fused away) - nothing to do
+        if self.node.get_name() in V.graph.removed_buffers:
+            assert self.reused_as.get_name() in V.graph.removed_buffers
             return NullLine(self.wrapper)
-        if old_removed and not new_removed:
-            # Old buffer was removed (e.g., fused), but new buffer still needed
-            # Fall back to fresh allocation for the new buffer
-            return AllocateLine(self.wrapper, self.reused_as)
-        if not old_removed and new_removed:
-            # Old buffer exists but new one was removed - nothing to do
-            return NullLine(self.wrapper)
-        # Neither removed - proceed with reuse
+        assert self.reused_as.get_name() not in V.graph.removed_buffers
         return self
 
     def codegen(self, code: IndentedBuffer) -> None:
