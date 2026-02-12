@@ -2568,6 +2568,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         # Maps buffer name -> CSEVariable for all loads and store_reductions during
         # the parent's codegen, so the child's inner_fn can access them via interception.
         self._in_register_buffers: dict[str, CSEVariable] = {}
+        self._blr_override_mask: Optional[str] = None
 
     def set_expansion_masks(self, masks: list[tuple[sympy.Expr, sympy.Expr]]) -> None:
         """
@@ -4451,8 +4452,9 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         indexing = self.indexing(
             index,
             dense_indexing=True,
-            block_ptr=mode is None,
+            block_ptr=mode is None and self._blr_override_mask is None,
             tma_compatibility_checker=tma_compatibility_checker,
+            override_mask=self._blr_override_mask,
         )
 
         # Add masks for modular indexing patterns to avoid redundant stores
@@ -6024,21 +6026,28 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         self._block_local_parent_result = None
 
     @contextlib.contextmanager
-    def _block_local_store_context(self, dense_sizes):
+    def _block_local_store_context(self, dense_sizes, override_mask=None):
         """Temporarily override iteration context for block-local stores.
 
         Sets inside_reduction=False and overrides dense_size_list() to match
         the child's output shape, so self.store() produces correct indexing
         and masks without manual tl.store calls.
+
+        If override_mask is provided, self.store() will pass it to
+        self.indexing() to replace range-tree masks with a custom mask
+        (needed for across_x where index symbols are TMP-typed and don't
+        intersect any range tree).
         """
         saved_inside_reduction = self.inside_reduction
         self.inside_reduction = False
         self._blr_dense_size_override = dense_sizes
+        self._blr_override_mask = override_mask
         try:
             yield
         finally:
             self.inside_reduction = saved_inside_reduction
             self._blr_dense_size_override = None
+            self._blr_override_mask = None
 
     def _emit_block_local_within_r(self, config):
         """
@@ -6390,9 +6399,6 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         self.body.writeline(f"{reduced} = {triton_fn}({reshaped}, 1)")
 
         # Store the reduction result using the child's output layout.
-        # The reduced value is 1D (groups_per_block,) — can't use self.store()
-        # directly since it would broadcast to the parent's 2D shape.
-        # Instead use self.indexing() with override_mask.
         layout = ir_node.get_layout()
         indexer = layout.make_indexer()
         groups_per_block = f"(XBLOCK // {rnumel2})"
@@ -6415,18 +6421,15 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             if hint == 1:
                 self.body.writeline(f"{cse_var} = tl.full([1], 0, tl.int32)")
             else:
-                # Divisor = product of all dims after this one
                 divisor = 1
                 for j in range(i + 1, len(dim_sizes)):
                     divisor *= dim_sizes[j]
                 if divisor == 1:
-                    # Innermost dim: just mod
                     if i == 0 and len(dim_sizes) == 1:
                         self.body.writeline(f"{cse_var} = {flat_expr}")
                     else:
                         self.body.writeline(f"{cse_var} = ({flat_expr}) % {hint}")
                 elif i == 0:
-                    # Outermost dim: just div
                     self.body.writeline(f"{cse_var} = ({flat_expr}) // {divisor}")
                 else:
                     self.body.writeline(
@@ -6445,14 +6448,12 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         mask_cse.mask_vars = OrderedSet()
         self.body.writeline(f"{mask_cse} = ({flat_expr}) < {numel2_hint}")
 
-        self.inside_reduction = False
-        var = self.args.output(final_buf_name)
-        indexing = self.indexing(store_index, override_mask=mask_name)
-        assert isinstance(indexing, IndexingOptions)
-        self.body.writeline(
-            f"tl.store({var} + ({indexing.index_str}), {reduced}, {indexing.mask_str})"
-        )
-        self.inside_reduction = True
+        with self._block_local_store_context(
+            [groups_per_block], override_mask=mask_name
+        ):
+            self.store(final_buf_name, store_index, reduced)
+            self.body.splice(self.stores)
+            self.stores.clear()
 
     def kernel_benchmark_extra_args(self) -> list[str]:
         args = []
