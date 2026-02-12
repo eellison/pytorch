@@ -342,5 +342,69 @@ class TestBlockLocalReduction(TestCase):
             self.assertEqual(r, e, atol=1e-4, rtol=1e-4)
 
 
+    @unittest.skipUnless(HAS_GPU_AND_TRITON, "requires gpu and triton")
+    @inductor_config.patch(
+        {
+            "triton.block_local_reduction": True,
+        }
+    )
+    def test_intermediate_buf_external_reader(self):
+        """Intermediate buffer (LN output) read by both the block-local child
+        AND a separate downstream kernel. The intermediate must be stored to
+        global memory so the external reader sees valid data."""
+        batch, hidden, group_size = 4, 256, 16
+        weight = torch.randn(hidden, device="cuda")
+        bias = torch.randn(hidden, device="cuda")
+
+        @torch.compile(fullgraph=True)
+        def fn(x):
+            normed = torch.nn.functional.layer_norm(x, [hidden], weight, bias)
+            # Block-local path: normed -> reshape -> abs -> amax
+            amax = normed.view(batch, hidden // group_size, group_size).abs().amax(
+                dim=-1
+            )
+            # External reader: separate op on the same normed buffer
+            normed_sum = normed.sum(dim=-1)
+            return amax, normed_sum
+
+        x = torch.randn(batch, hidden, device="cuda")
+        expected = fn.__wrapped__(x)
+        actual = fn(x)
+        self.assertEqual(actual[0], expected[0])
+        self.assertEqual(actual[1], expected[1], atol=1e-4, rtol=1e-4)
+
+
+    @unittest.skipUnless(HAS_GPU_AND_TRITON, "requires gpu and triton")
+    @inductor_config.patch(
+        {
+            "triton.block_local_reduction": True,
+        }
+    )
+    def test_intermediate_buf_fused_external_reader(self):
+        """Intermediate buffer read by block-local child AND a fused downstream
+        kernel (pointwise chain). This tests that the intermediate buffer
+        analysis correctly accounts for users across fusion boundaries."""
+        batch, hidden, group_size = 4, 256, 16
+        weight = torch.randn(hidden, device="cuda")
+        bias = torch.randn(hidden, device="cuda")
+
+        @torch.compile(fullgraph=True)
+        def fn(x):
+            normed = torch.nn.functional.layer_norm(x, [hidden], weight, bias)
+            amax = normed.view(batch, hidden // group_size, group_size).abs().amax(
+                dim=-1
+            )
+            # Pointwise chain on normed — likely fused into another kernel
+            doubled = normed * 2.0
+            shifted = doubled + 1.0
+            return amax, shifted
+
+        x = torch.randn(batch, hidden, device="cuda")
+        expected = fn.__wrapped__(x)
+        actual = fn(x)
+        self.assertEqual(actual[0], expected[0])
+        self.assertEqual(actual[1], expected[1], atol=1e-4, rtol=1e-4)
+
+
 if __name__ == "__main__":
     run_tests()
