@@ -400,6 +400,7 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
         tiling_scores: Optional[dict[str, sympy.Expr]] = None,
         mix_order_reduction: bool = False,
         small_reduction_epilogue: Optional[dict[str, Any]] = None,
+        block_local_reduction: Optional[dict[str, Any]] = None,
     ) -> None:
         if pid_cache is None:
             pid_cache = {}
@@ -430,7 +431,10 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
         self.mix_order_reduction: bool = mix_order_reduction
         # Small reduction epilogue: fuse reduction -> small reduction pattern
         # Config contains: small_numel, reduction_type, numel2, rnumel2, output_buf, etc.
-        self.small_reduction_epilogue: Optional[dict[str, Any]] = small_reduction_epilogue
+        self.small_reduction_epilogue: Optional[dict[str, Any]] = (
+            small_reduction_epilogue
+        )
+        self.block_local_reduction: Optional[dict[str, Any]] = block_local_reduction
         self.no_x_dim = self.want_no_x_dim()
         self.code_hash: Optional[str] = None
         # Info to enable multiple store_output calls for epilogue subtiling
@@ -588,6 +592,9 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
         return f"[{', '.join(sizes)}]"
 
     def dense_size_list(self) -> list[str]:
+        override = getattr(self, "_blr_dense_size_override", None)
+        if override is not None:
+            return list(override)
         sizes = ["1"] * self.triton_tensor_ndim()
         for tree in self.range_trees:
             if tree.tensor_dim is None:
@@ -1297,14 +1304,12 @@ class SIMDScheduling(BaseScheduling):
         ):
             return scheduler.ForeachKernelSchedulerNode.can_fuse(node1, node2)
 
-        # FusedSmallReductionEpilogue and FusedInRegisterReductionEpilogue have
-        # special iteration spaces and cannot be further fused with other nodes
-        from torch._inductor.scheduler import (
-            FusedSmallReductionEpilogue,
-            FusedInRegisterReductionEpilogue,
-        )
-        if isinstance(node1, (FusedSmallReductionEpilogue, FusedInRegisterReductionEpilogue)) or isinstance(
-            node2, (FusedSmallReductionEpilogue, FusedInRegisterReductionEpilogue)
+        # FusedSmallReductionEpilogue has special iteration spaces and cannot
+        # be further fused with other nodes
+        from torch._inductor.scheduler import FusedSmallReductionEpilogue
+
+        if isinstance(node1, FusedSmallReductionEpilogue) or isinstance(
+            node2, FusedSmallReductionEpilogue
         ):
             return False
 
@@ -1325,6 +1330,11 @@ class SIMDScheduling(BaseScheduling):
                 from torch._inductor.scheduler import MixOrderReduction
 
                 reduction_can_fuse = MixOrderReduction.can_fuse(node1, node2)
+
+            if not reduction_can_fuse:
+                from torch._inductor.scheduler import BlockLocalReduction
+
+                reduction_can_fuse = BlockLocalReduction.can_fuse(node1, node2)
 
             if not reduction_can_fuse:
                 from torch._inductor.scheduler import SmallReductionEpilogue
@@ -1466,19 +1476,23 @@ class SIMDScheduling(BaseScheduling):
                 # This allows halving ops like cvt_e2m1x2 to fuse with reductions
                 node1_sizes = None
                 for n in node1.get_nodes():
-                    if hasattr(n, '_sizes') and n._sizes:
+                    if hasattr(n, "_sizes") and n._sizes:
                         node1_sizes = n._sizes
                         break
 
                 if node1_sizes and len(node1_sizes[0]) == 2:
-                    outer_dim = V.graph.sizevars.simplify(sympy_product([node1_sizes[0][0]]))
+                    outer_dim = V.graph.sizevars.simplify(
+                        sympy_product([node1_sizes[0][0]])
+                    )
                     if V.graph.sizevars.statically_known_equals(outer_dim, numel2):
                         # Halving pattern detected - outer dim matches reduction numel
                         # Return True to allow fusion - we'll need to handle
                         # the iteration mismatch during scheduling/codegen
                         fusion_log.debug(
                             "Halving pattern fusion: node1 sizes %s, numel2=%s, rnumel2=%s",
-                            node1_sizes, numel2, rnumel2
+                            node1_sizes,
+                            numel2,
+                            rnumel2,
                         )
                         return True
 
@@ -1516,8 +1530,15 @@ class SIMDScheduling(BaseScheduling):
             # e.g., node sizes [65536, 8] with kernel (65536, 16)
             # Only apply for small reductions that will be persistent
             rnumel_hint = V.graph.sizevars.size_hint(rnumel, fallback=0)
-            if node_rnumel == 1 and rnumel != 1 and 0 < rnumel_hint <= 1024 and hasattr(n, '_sizes'):
-                outer_dim = n._sizes[0][0] if n._sizes and len(n._sizes[0]) >= 1 else None
+            if (
+                node_rnumel == 1
+                and rnumel != 1
+                and 0 < rnumel_hint <= 1024
+                and hasattr(n, "_sizes")
+            ):
+                outer_dim = (
+                    n._sizes[0][0] if n._sizes and len(n._sizes[0]) >= 1 else None
+                )
                 if outer_dim is not None:
                     outer_dim_val = V.graph.sizevars.simplify(outer_dim)
                     if V.graph.sizevars.statically_known_equals(outer_dim_val, numel):
@@ -1732,7 +1753,7 @@ class SIMDScheduling(BaseScheduling):
         # Get input buffer info from node1
         input_buf_name = None
         for dep in node1.read_writes.reads:
-            if hasattr(dep, 'name'):
+            if hasattr(dep, "name"):
                 input_buf_name = dep.name
                 break
 
@@ -1748,10 +1769,18 @@ class SIMDScheduling(BaseScheduling):
 
         # Generate the fused kernel
         self._generate_fused_small_reduction_kernel(
-            node, node1, node2,
-            input_buf_name, intermediate_buf_name, output_buf_name,
-            numel1, rnumel1, numel2, rnumel2, small_numel,
-            reduction_type
+            node,
+            node1,
+            node2,
+            input_buf_name,
+            intermediate_buf_name,
+            output_buf_name,
+            numel1,
+            rnumel1,
+            numel2,
+            rnumel2,
+            small_numel,
+            reduction_type,
         )
         fusion_log.info(
             "SmallReductionEpilogue: generated FUSED single kernel for %s -> %s "
@@ -1765,10 +1794,19 @@ class SIMDScheduling(BaseScheduling):
         )
 
     def _generate_fused_small_reduction_kernel(
-        self, node, node1, node2,
-        input_buf_name, intermediate_buf_name, output_buf_name,
-        numel1, rnumel1, numel2, rnumel2, small_numel,
-        reduction_type
+        self,
+        node,
+        node1,
+        node2,
+        input_buf_name,
+        intermediate_buf_name,
+        output_buf_name,
+        numel1,
+        rnumel1,
+        numel2,
+        rnumel2,
+        small_numel,
+        reduction_type,
     ):
         """
         Generate a single fused kernel for the small reduction epilogue pattern.
@@ -1785,13 +1823,9 @@ class SIMDScheduling(BaseScheduling):
         output_dtype = V.graph.get_dtype(output_buf_name)
 
         if input_dtype is None or output_dtype is None:
-            raise ValueError(f"Could not find dtypes for buffers: input={input_buf_name}, output={output_buf_name}")
-
-        # Note: in_register_reduction is available for cases where we have [XBLOCK, R0_BLOCK]
-        # data and want to reduce over groups within R0_BLOCK. This is a different pattern
-        # than SmallReductionEpilogue (which combines scalar outputs from a full reduction).
-        # For now, use the loop-based approach for SmallReductionEpilogue.
-        # TODO: Add separate detection for in_register_reduction fusion pattern.
+            raise ValueError(
+                f"Could not find dtypes for buffers: input={input_buf_name}, output={output_buf_name}"
+            )
 
         # Configure small reduction epilogue info for the kernel
         small_reduction_config = {
@@ -1806,7 +1840,6 @@ class SIMDScheduling(BaseScheduling):
             "output_buf_name": output_buf_name,
             "input_dtype": input_dtype,
             "output_dtype": output_dtype,
-            "use_in_register_reduction": False,  # Loop-based for now
         }
 
         # Create node schedule from node1's nodes
@@ -1831,7 +1864,9 @@ class SIMDScheduling(BaseScheduling):
             },
         )[0]
 
-        assert kernel.persistent_reduction, "Small reduction epilogue requires persistent reduction"
+        assert kernel.persistent_reduction, (
+            "Small reduction epilogue requires persistent reduction"
+        )
 
         # Generate kernel code
         self.codegen_node_schedule_with_kernel(node_schedule, kernel)
@@ -1869,11 +1904,13 @@ class SIMDScheduling(BaseScheduling):
                 snode.mark_run()
             # Also mark node2's output as run
             for snode in node2.get_nodes():
-                if hasattr(snode, 'mark_run'):
+                if hasattr(snode, "mark_run"):
                     snode.mark_run()
 
         # Generate kernel call
-        V.graph.wrapper_code.make_comment("# Call small reduction epilogue fused kernel")
+        V.graph.wrapper_code.make_comment(
+            "# Call small reduction epilogue fused kernel"
+        )
         self.codegen_comment(node_schedule, None)
         kernel.call_kernel(kernel.kernel_name)
         V.graph.removed_buffers |= kernel.removed_buffers
@@ -1883,164 +1920,178 @@ class SIMDScheduling(BaseScheduling):
         # (the store_reduction was intercepted and we write directly to the final output)
         V.graph.removed_buffers.add(intermediate_buf_name)
 
-    def codegen_in_register_reduction_epilogue(self, node):
+    def codegen_block_local_reduction(self, node):
         """
-        Generate code for computation -> in-register reduction epilogue fusion.
+        Generate code for reduction -> block-local reduction fusion.
 
-        This fuses a small reduction INTO the R0_BLOCK dimension of an upstream
-        computation, using ops.in_register_reduction() to reshape and reduce.
-
-        Example: LayerNorm -> amax
-            - LayerNorm produces [XBLOCK, R0_BLOCK] normalized data in registers
-            - amax reduces groups of 16 within R0_BLOCK
-            - Result: [XBLOCK, R0_BLOCK/16] stored directly
-
-        The key insight is that we use the SAME iteration space as node1,
-        but instead of storing node1's output, we apply in_register_reduction
-        and store the reduced result.
+        The child reduction operates on data already in registers from
+        the parent's persistent reduction.  After the parent's reduce,
+        the [XBLOCK] results are reshaped to [groups, rnumel2] and
+        reduced again within the same kernel.
         """
-        from torch._inductor.scheduler import FusedInRegisterReductionEpilogue
+        from torch._inductor.scheduler import FusedBlockLocalReduction
 
-        assert isinstance(node, FusedInRegisterReductionEpilogue)
-
-        node1 = node.node1  # Upstream computation
-        node2 = node.node2  # Small reduction epilogue
+        assert isinstance(node, FusedBlockLocalReduction)
+        node1 = node.node1
+        node2 = node.node2
 
         _, (numel1, rnumel1) = node1.group
         _, (numel2, rnumel2) = node2.group
-        group_size = node.group_size
+        rnumel2_hint = V.graph.sizevars.size_hint(rnumel2)
 
-        fusion_log.debug(
-            "codegen_in_register_reduction_epilogue: %s -> %s "
-            "(numel1=%s, rnumel1=%s, group_size=%s)",
-            node1.get_name(), node2.get_name(),
-            numel1, rnumel1, group_size
-        )
-
-        # Find the intermediate buffer (node1's output that node2 reads)
+        # Find intermediate buffer (parent output consumed by child).
+        # Only buffers whose ONLY consumers are inside the fused kernel
+        # can be kept purely in registers; the rest must still be stored.
         node1_outputs = node1.get_buffer_names()
         node2_inputs = node2.used_buffer_names()
-        intermediate_bufs = node1_outputs & node2_inputs
-
-        if not intermediate_bufs:
-            fusion_log.debug(
-                "InRegisterReductionEpilogue: no intermediate buffer found, falling back"
-            )
+        intermediate_bufs_candidates = node1_outputs & node2_inputs
+        if not intermediate_bufs_candidates:
+            fusion_log.warning("BlockLocalReduction: no intermediate buffer, fallback")
             self.codegen_node(node1)
             self.codegen_node(node2)
             return
 
-        intermediate_buf_name = next(iter(intermediate_bufs))
-
-        # Find node2's output buffer
-        output_buf_name = None
-        for snode in node2.get_nodes():
-            for buf_name in snode.get_buffer_names():
-                if buf_name != intermediate_buf_name:
-                    output_buf_name = buf_name
-                    break
-            if output_buf_name:
-                break
-
-        if not output_buf_name:
-            fusion_log.debug(
-                "InRegisterReductionEpilogue: no output buffer found, falling back"
+        fused_node_names = {n.get_name() for n in node1.get_nodes()} | {
+            n.get_name() for n in node2.get_nodes()
+        }
+        intermediate_bufs: set[str] = set()
+        for buf_name in intermediate_bufs_candidates:
+            sched_buf = self.scheduler.name_to_buf.get(buf_name)
+            if sched_buf is None:
+                continue
+            all_internal = all(
+                u.node.get_name() in fused_node_names
+                for u in sched_buf.users
+                if u.node is not None
             )
-            self.codegen_node(node1)
-            self.codegen_node(node2)
-            return
+            if all_internal:
+                intermediate_bufs.add(buf_name)
 
-        # Get reduction type from node2
+        intermediate_buf_name = next(iter(intermediate_bufs_candidates))
+
+        # Find child's output buffer
+        node2_outputs = node2.get_buffer_names()
+        final_buf_name = next(iter(node2_outputs - intermediate_bufs), None)
+        if final_buf_name is None:
+            final_buf_name = next(iter(node2_outputs))
+
+        # Find child's reduction type
         reduction_type = None
         for snode in node2.get_nodes():
             if isinstance(snode, scheduler.SchedulerNode) and snode.is_reduction():
                 if isinstance(snode.node, ir.ComputedBuffer):
                     reduction_type = snode.node.get_reduction_type()
                     break
-
-        if not reduction_type:
-            fusion_log.debug(
-                "InRegisterReductionEpilogue: could not determine reduction type, falling back"
-            )
+        if reduction_type is None:
+            fusion_log.warning("BlockLocalReduction: no reduction type, fallback")
             self.codegen_node(node1)
             self.codegen_node(node2)
             return
 
-        # Get dtypes
-        input_dtype = V.graph.get_dtype(intermediate_buf_name)
-        output_dtype = V.graph.get_dtype(output_buf_name)
-
         fusion_log.debug(
-            "InRegisterReductionEpilogue: fusing with in_register_reduction "
-            "(intermediate=%s, output=%s, reduction_type=%s, group_size=%s)",
-            intermediate_buf_name, output_buf_name, reduction_type, group_size
+            "codegen_block_local_reduction: %s -> %s "
+            "(intermediate=%s, final=%s, reduction=%s, rnumel2=%s)",
+            node1.get_name(),
+            node2.get_name(),
+            intermediate_buf_name,
+            final_buf_name,
+            reduction_type,
+            rnumel2_hint,
         )
 
-        # Configure in_register_reduction info for the kernel
-        in_register_config = {
-            "group_size": group_size,
-            "reduction_type": reduction_type,
+        from torch._inductor.scheduler import BlockLocalReduction
+
+        pattern = BlockLocalReduction._classify(numel1, rnumel1, numel2, rnumel2)
+        rnumel1_hint = V.graph.sizevars.size_hint(rnumel1)
+
+        # Find child's reduction SchedulerNode and its inner_fn
+        child_snode = None
+        node2_snodes = list(node2.get_nodes())
+        for snode in node2_snodes:
+            if isinstance(snode, scheduler.SchedulerNode) and snode.is_reduction():
+                if isinstance(snode.node, ir.ComputedBuffer):
+                    child_snode = snode
+                    break
+
+        # Collect post-reduction pointwise snodes from node2.
+        # These will be emitted after the block-local reduction using
+        # in-register values (e.g., broadcast-back for NVFP4 divide).
+        post_reduction_snodes = [
+            n
+            for n in node2_snodes
+            if isinstance(n, scheduler.SchedulerNode) and not n.is_reduction()
+        ]
+
+        # Buffers the child reads that aren't produced by the parent
+        # (e.g., weight, bias). These need to be pre-registered in the
+        # kernel signature since codegen_body adds them after argdefs.
+        child_external_bufs = node2.used_buffer_names() - intermediate_bufs
+
+        blr_config = {
+            "intermediate_buf_names": intermediate_bufs,
             "intermediate_buf_name": intermediate_buf_name,
-            "output_buf_name": output_buf_name,
-            "input_dtype": input_dtype,
-            "output_dtype": output_dtype,
-            "numel1": numel1,
-            "rnumel1": rnumel1,
+            "final_buf_name": final_buf_name,
+            "rnumel2": rnumel2_hint,
+            "rnumel1": rnumel1_hint,
             "numel2": numel2,
-            "rnumel2": rnumel2,
+            "reduction_type": reduction_type,
+            "pattern": pattern,
+            "child_snode": child_snode,
+            "child_external_bufs": child_external_bufs,
+            "post_reduction_snodes": post_reduction_snodes,
         }
 
-        # Generate node schedule from node1's nodes
-        # Use node1's iteration space
-        node_schedule = self.generate_node_schedule(
-            list(node1.get_nodes()), numel1, rnumel1
+        # Generate the parent kernel's nodes with block_local_reduction config.
+        # We use the parent's iteration space (numel1, rnumel1) and force
+        # persistent reduction so data stays in registers.
+        nodes1 = [
+            n
+            for n in node1.get_nodes()
+            if n.get_name() not in self.scheduler.removed_ops
+        ]
+        if not nodes1:
+            return
+
+        node_schedule = self.generate_node_schedule(nodes1, numel1, rnumel1)
+        (numel, rnumel) = (numel1, rnumel1)
+
+        # Build features for the kernel
+        all_nodes = list(node1.get_nodes()) + list(node2.get_nodes())
+        features = SIMDKernelFeatures(node_schedule, numel, rnumel, all_nodes)
+        tiling, tiling_score = self.get_tiling_and_scores(
+            node_schedule,
+            numel,
+            rnumel,
         )
-        kernel_features = SIMDKernelFeatures(node_schedule, numel1, rnumel1)
-
-        # Create kernel with in_register_reduction config
-        # This tells the kernel to use in_register_reduction instead of normal store
-        kernel = self.create_kernel_choices(
-            kernel_features,
-            [{"x": numel1, "r0_": rnumel1}],
-            {
-                "features": kernel_features,
-                "tiling_scores": None,
-                "override_persistent_reduction": True,
-                "small_reduction_epilogue": {
-                    **in_register_config,
-                    "use_in_register_reduction": True,
-                },
-            },
-        )[0]
-
-        assert kernel.persistent_reduction, "InRegisterReductionEpilogue requires persistent reduction"
-
-        # Generate kernel code
+        kernel = self.kernel_type(
+            tiling,
+            features=features,
+            override_persistent_reduction=True,
+            block_local_reduction=blr_config,
+        )
         self.codegen_node_schedule_with_kernel(node_schedule, kernel)
 
         with V.set_kernel_handler(kernel):
             src_code = kernel.codegen_kernel()
-
         kernel_name = self.define_kernel(src_code, node_schedule, kernel)
         kernel.kernel_name = kernel_name
         kernel.code_hash = code_hash(src_code)
 
-        # Mark buffers
         with V.set_kernel_handler(kernel):
-            for snode in kernel_features.scheduler_nodes():
-                snode.mark_run()
-            for snode in node2.get_nodes():
-                if hasattr(snode, 'mark_run'):
-                    snode.mark_run()
+            for n in all_nodes:
+                n.mark_run()
 
-        # Generate kernel call
-        self.codegen_comment(node_schedule, None)
-        kernel.call_kernel(kernel.kernel_name)
+        self.codegen_comment(
+            [n for n in node_schedule if isinstance(n, scheduler.BaseSchedulerNode)],
+            kernel_name,
+        )
+        kernel.call_kernel(kernel_name)
+
         V.graph.removed_buffers |= kernel.removed_buffers
+        V.graph.removed_buffers |= intermediate_bufs
         V.graph.inplaced_to_remove |= kernel.inplaced_to_remove
 
-        # Mark intermediate buffer as removed
-        V.graph.removed_buffers.add(intermediate_buf_name)
+        self.free_buffers_in_scheduler()
 
     def codegen_mix_order_reduction(self, node):
         node1, node2 = node.node1, node.node2
@@ -2479,7 +2530,7 @@ class SIMDScheduling(BaseScheduling):
             return False, 0
 
         # Only use split iteration for persistent reductions
-        if not getattr(kernel, 'persistent_reduction', False):
+        if not getattr(kernel, "persistent_reduction", False):
             return False, 0
 
         # Node must be pointwise (rnumel=1)
@@ -2523,7 +2574,7 @@ class SIMDScheduling(BaseScheduling):
         for node in node_schedule:
             if node is DisableReduction or node is EnableReduction:
                 continue
-            if not hasattr(node, '_body'):
+            if not hasattr(node, "_body"):
                 continue
 
             # Use the LoopBody's detection method
@@ -2531,7 +2582,9 @@ class SIMDScheduling(BaseScheduling):
                 pairs = node._body.detect_stride2_load_pairs()
                 for even_buf, odd_buf, even_idx, odd_idx, dtype in pairs:
                     # Check if this is a halving pattern (2D reduction kernel)
-                    is_halving, halving_size = self._is_halving_pattern_node(node, kernel)
+                    is_halving, halving_size = self._is_halving_pattern_node(
+                        node, kernel
+                    )
                     if is_halving:
                         results.append((even_buf, odd_buf, halving_size, dtype, False))
                     else:
@@ -2551,7 +2604,7 @@ class SIMDScheduling(BaseScheduling):
         Returns:
             (buffer_name, halving_size) if pattern found, None otherwise
         """
-        if not getattr(kernel, 'persistent_reduction', False):
+        if not getattr(kernel, "persistent_reduction", False):
             return None
 
         # Find reduction node and halving node
@@ -2562,7 +2615,7 @@ class SIMDScheduling(BaseScheduling):
         for node in node_schedule:
             if node is DisableReduction or node is EnableReduction:
                 continue
-            if hasattr(node, 'is_reduction') and node.is_reduction():
+            if hasattr(node, "is_reduction") and node.is_reduction():
                 reduction_node = node
             else:
                 is_halving, size = self._is_halving_pattern_node(node, kernel)
@@ -2574,7 +2627,7 @@ class SIMDScheduling(BaseScheduling):
             return None
 
         # Use LoopBody's stride-2 detection for the halving node
-        if hasattr(halving_node, '_body'):
+        if hasattr(halving_node, "_body"):
             try:
                 pairs = halving_node._body.detect_stride2_load_pairs()
                 for even_buf, odd_buf, even_idx, odd_idx, dtype in pairs:
@@ -2613,12 +2666,14 @@ class SIMDScheduling(BaseScheduling):
             for node in node_schedule:
                 if node is DisableReduction or node is EnableReduction:
                     continue
-                if hasattr(node, '_body') and node._body is not None:
+                if hasattr(node, "_body") and node._body is not None:
                     try:
-                        node._body.transform_stride2_loads(skip_buffers=buffers_with_stride1)
+                        node._body.transform_stride2_loads(
+                            skip_buffers=buffers_with_stride1
+                        )
                     except Exception as e:
                         log.debug("stride2 transform failed: %s", e)
-                        pass  # Transformation is optional optimization
+                        # Transformation is optional optimization
 
             # Detect and setup stride-1 derivation for stride-2 patterns across nodes
             # This handles the 3-load NVFP4 pattern: stride-1 (reduction) + stride-2 pair (halving)
@@ -2634,9 +2689,13 @@ class SIMDScheduling(BaseScheduling):
                     node.decide_inplace_update()
 
                     # Check for halving pattern to use split ranges
-                    is_halving, halving_size = self._is_halving_pattern_node(node, kernel)
-                    if is_halving and hasattr(kernel, 'get_split_iteration_index_vars'):
-                        index_vars = kernel.get_split_iteration_index_vars(node.get_ranges(), halving_size)
+                    is_halving, halving_size = self._is_halving_pattern_node(
+                        node, kernel
+                    )
+                    if is_halving and hasattr(kernel, "get_split_iteration_index_vars"):
+                        index_vars = kernel.get_split_iteration_index_vars(
+                            node.get_ranges(), halving_size
+                        )
                     else:
                         index_vars = kernel.split_and_set_ranges(node.get_ranges())
 
@@ -2658,9 +2717,13 @@ class SIMDScheduling(BaseScheduling):
                     indexing_dtype_strength_reduction(node._body)
 
                     # Check for halving pattern to use split ranges
-                    is_halving, halving_size = self._is_halving_pattern_node(node, kernel)
-                    if is_halving and hasattr(kernel, 'get_split_iteration_index_vars'):
-                        index_vars = kernel.get_split_iteration_index_vars(node.get_ranges(), halving_size)
+                    is_halving, halving_size = self._is_halving_pattern_node(
+                        node, kernel
+                    )
+                    if is_halving and hasattr(kernel, "get_split_iteration_index_vars"):
+                        index_vars = kernel.get_split_iteration_index_vars(
+                            node.get_ranges(), halving_size
+                        )
                     else:
                         index_vars = kernel.split_and_set_ranges(node.get_ranges())
 
@@ -2682,7 +2745,7 @@ class SIMDScheduling(BaseScheduling):
         for node in node_schedule:
             if node is DisableReduction or node is EnableReduction:
                 continue
-            if not hasattr(node, '_body') or node._body is None:
+            if not hasattr(node, "_body") or node._body is None:
                 continue
 
             body = node._body
@@ -2717,14 +2780,18 @@ class SIMDScheduling(BaseScheduling):
         This is simpler than coalesced uint32 loads - we just reuse the
         existing stride-1 load and derive even/odd from it.
         """
-        from ..loop_body import MemoryUsageType
         import os
+
+        from ..loop_body import MemoryUsageType
+
         debug = os.environ.get("DEBUG_STRIDE2_DEDUP", "0") == "1"
 
         # Skip if kernel doesn't support the dedup mechanism
-        if not hasattr(kernel, 'register_stride1_for_dedup'):
+        if not hasattr(kernel, "register_stride1_for_dedup"):
             if debug:
-                print(f"DEBUG: kernel {type(kernel).__name__} doesn't have register_stride1_for_dedup")
+                print(
+                    f"DEBUG: kernel {type(kernel).__name__} doesn't have register_stride1_for_dedup"
+                )
             return
 
         # Supported dtypes
@@ -2737,7 +2804,7 @@ class SIMDScheduling(BaseScheduling):
         for node in node_schedule:
             if node is DisableReduction or node is EnableReduction:
                 continue
-            if not hasattr(node, '_body') or node._body is None:
+            if not hasattr(node, "_body") or node._body is None:
                 continue
 
             body = node._body
@@ -2783,10 +2850,10 @@ class SIMDScheduling(BaseScheduling):
                 if "2*" in index_str:
                     # Check if even (no +1) or odd (+1)
                     is_odd = (
-                        index_str.endswith("+ 1") or
-                        index_str.endswith("+1") or
-                        "+ 1 +" in index_str or
-                        "1 + 2*" in index_str
+                        index_str.endswith("+ 1")
+                        or index_str.endswith("+1")
+                        or "+ 1 +" in index_str
+                        or "1 + 2*" in index_str
                     )
                     if is_odd:
                         stride2_odd_loads.append((index_expr, node, is_reduction))
@@ -2797,11 +2864,15 @@ class SIMDScheduling(BaseScheduling):
                     stride1_loads.append((index_expr, node, is_reduction))
 
             # If we have stride-1 AND stride-2 pair, register for dedup
-            has_stride2_pair = len(stride2_even_loads) > 0 and len(stride2_odd_loads) > 0
+            has_stride2_pair = (
+                len(stride2_even_loads) > 0 and len(stride2_odd_loads) > 0
+            )
             has_stride1 = len(stride1_loads) > 0
 
             if debug:
-                print(f"DEBUG: buffer {buf_name}: stride1={len(stride1_loads)}, stride2_even={len(stride2_even_loads)}, stride2_odd={len(stride2_odd_loads)}")
+                print(
+                    f"DEBUG: buffer {buf_name}: stride1={len(stride1_loads)}, stride2_even={len(stride2_even_loads)}, stride2_odd={len(stride2_odd_loads)}"
+                )
                 for idx, node, is_red in stride1_loads:
                     print(f"  stride1: {idx}")
                 for idx, node, is_red in stride2_even_loads:
@@ -2822,23 +2893,30 @@ class SIMDScheduling(BaseScheduling):
                     # Pattern: r0 + N*x0 -> N is the reduction size
                     idx_str = str(idx_expr)
                     import re
-                    match = re.search(r'(\d+)\*x0', idx_str)
+
+                    match = re.search(r"(\d+)\*x0", idx_str)
                     if match:
                         reduction_size = int(match.group(1))
                         break
 
-                if reduction_size is not None and dtype in {torch.bfloat16, torch.float16}:
+                if reduction_size is not None and dtype in {
+                    torch.bfloat16,
+                    torch.float16,
+                }:
                     try:
-                        if hasattr(kernel, 'register_coalesced_uint32_buffer'):
-                            kernel.register_coalesced_uint32_buffer(buf_name, dtype, reduction_size)
+                        if hasattr(kernel, "register_coalesced_uint32_buffer"):
+                            kernel.register_coalesced_uint32_buffer(
+                                buf_name, dtype, reduction_size
+                            )
                             if debug:
-                                print(f"DEBUG: Using coalesced uint32 for {buf_name}, reduction_size={reduction_size}")
+                                print(
+                                    f"DEBUG: Using coalesced uint32 for {buf_name}, reduction_size={reduction_size}"
+                                )
                         else:
                             kernel.register_stride1_for_dedup(buf_name, dtype)
                     except Exception as e:
                         if debug:
                             print(f"DEBUG: coalesced uint32 registration failed: {e}")
-                        pass
                 else:
                     # Fallback to reshape/split approach
                     try:
@@ -2846,7 +2924,6 @@ class SIMDScheduling(BaseScheduling):
                     except Exception as e:
                         if debug:
                             print(f"DEBUG: register_stride1_for_dedup failed: {e}")
-                        pass
 
     def _codegen_single_template(
         self,

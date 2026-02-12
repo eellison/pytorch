@@ -3449,6 +3449,23 @@ def _persistent_reduction_configs(
                 if conf not in configs:
                     configs.append(conf)
 
+    # Filter configs by minimum XBLOCK (e.g., for block-local reduction)
+    min_xblock = inductor_meta.get("min_xblock", 1) if inductor_meta else 1
+    if min_xblock > 1:
+        filtered = [c for c in configs if c.kwargs.get("XBLOCK", 1) >= min_xblock]
+        if not filtered:
+            # No existing config meets the minimum; try adding one
+            target_xblock = min_xblock
+            if target_xblock * rnumel <= MAX_PERSISTENT_BLOCK_NUMEL and target_xblock <= xnumel:
+                filtered = [
+                    triton_config_reduction(
+                        size_hints, target_xblock, rnumel,
+                        register_intensive=True,
+                    )
+                ]
+        if filtered:
+            configs = filtered
+
     for c in configs:
         # we don't need Rn_BLOCK for persistent reduction
         for prefix in size_hints:

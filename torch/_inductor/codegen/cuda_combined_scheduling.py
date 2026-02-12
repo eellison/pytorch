@@ -151,8 +151,8 @@ class CUDACombinedScheduling(BaseScheduling):
     def codegen_small_reduction_epilogue(self, node):
         return self._triton_scheduling.codegen_small_reduction_epilogue(node)
 
-    def codegen_in_register_reduction_epilogue(self, node):
-        return self._triton_scheduling.codegen_in_register_reduction_epilogue(node)
+    def codegen_block_local_reduction(self, node):
+        return self._triton_scheduling.codegen_block_local_reduction(node)
 
     def codegen_node(self, node: Union[FusedSchedulerNode, SchedulerNode]) -> None:
         return self._triton_scheduling.codegen_node(node)

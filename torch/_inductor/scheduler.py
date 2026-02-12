@@ -449,92 +449,113 @@ class SmallReductionEpilogue:
         fusion_log.debug(
             "SmallReductionEpilogue: allowing fusion of %s -> %s "
             "(numel1=%s, rnumel1=%s, numel2=%s, rnumel2=%s)",
-            node1.get_name(), node2.get_name(),
-            numel1, rnumel1, numel2, rnumel2
+            node1.get_name(),
+            node2.get_name(),
+            numel1,
+            rnumel1,
+            numel2,
+            rnumel2,
         )
         return True
 
 
-class InRegisterReductionEpilogue:
+class BlockLocalReduction:
     """
-    Allow small reductions to fuse as in-register epilogues.
+    Allow a reduction to fuse as a block-local epilogue to an upstream reduction.
 
-    This pattern fuses a small reduction INTO the R0_BLOCK dimension of an
-    upstream computation, avoiding intermediate buffer materialization.
+    The child reduction operates entirely on data already in registers from
+    the parent's persistent reduction.  The child gets its own iteration
+    ranges and reuses the persistent-reduction codegen machinery.
 
-    Example: LayerNorm (produces [batch, 4096]) -> amax (reduce groups of 16)
-        - LayerNorm computes normalized [XBLOCK, R0_BLOCK] data in registers
-        - Instead of storing, apply in_register_reduction with group_size=16
-        - Result: [XBLOCK, R0_BLOCK/16] amax values stored directly
-
-    Requirements:
-    1. node1 produces data with shape [numel1, rnumel1] (can be reduction or pointwise)
-    2. node2 is a small reduction that reads node1's output
-    3. node2's rnumel (group_size) divides node1's rnumel evenly
-    4. node1 uses persistent reduction (all data in registers)
-
-    Unlike SmallReductionEpilogue which combines scalar outputs across X positions,
-    this pattern reduces within the R0_BLOCK dimension using reshape + reduce.
+    Two sub-patterns:
+      (a) across-X: parent produces [XBLOCK] scalars, child groups XBLOCK
+          positions and reduces (e.g. sum(-1).amax(-1)).
+          Constraint: XBLOCK must be >= rnumel2.
+      (b) within-R0_BLOCK: parent stores [XBLOCK, R0_BLOCK] pointwise output,
+          child reshapes to [XBLOCK, groups, group_size] and reduces over
+          group_size (e.g. LayerNorm -> grouped amax for NVFP4).
+          Constraint: rnumel2 divides rnumel1.
     """
 
-    THRESHOLD = 32  # Max group_size for in-register reduction
+    ACROSS_X = "across_x"
+    WITHIN_R = "within_r"
 
     @classmethod
     def can_fuse(cls, node1: BaseSchedulerNode, node2: BaseSchedulerNode) -> bool:
-        """
-        Check whether node2 (small reduction) can fuse as in-register epilogue to node1.
-        """
-        if not config.triton.small_reduction_epilogue:
+        if not config.triton.block_local_reduction:
             return False
 
-        if not config.triton.small_reduction_epilogue_fusion:
+        # Only fuse during the final block-local pass, after all standard
+        # fusions (e.g. amax+divide as reduction+pointwise epilogue) have
+        # stabilized.
+        scheduler = V.graph.scheduler
+        if not getattr(scheduler, "_block_local_fusion_enabled", False):
             return False
 
-        # node2 must be a reduction
-        if not node2.is_reduction():
+        if not node1.is_reduction() or not node2.is_reduction():
             return False
-
         if not node1.is_gpu() or not node2.is_gpu():
             return False
 
         _, (numel1, rnumel1) = node1.group
         _, (numel2, rnumel2) = node2.group
 
-        # Check rnumel2 (group_size) is small and static
-        small_numel = node2.get_small_reduction_numel()
-        if small_numel is None or small_numel > cls.THRESHOLD:
+        # rnumel2 must be statically known
+        rnumel2_hint = V.graph.sizevars.size_hint(rnumel2, fallback=0)
+        if rnumel2_hint <= 0:
+            return False
+        if not V.graph.sizevars.statically_known_equals(rnumel2, rnumel2_hint):
             return False
 
-        # Key condition: group_size divides rnumel1 evenly
-        # This allows reshaping [XBLOCK, rnumel1] to [XBLOCK, groups, group_size]
-        if not V.graph.sizevars.statically_known_multiple_of(rnumel1, rnumel2):
-            return False
-
-        # Check consumer relationship: node2 reads from node1's output
+        # node2 must read from node1's output
         node1_outputs = node1.get_buffer_names()
         node2_inputs = node2.used_buffer_names()
         if not (node1_outputs & node2_inputs):
             return False
 
-        # Check that the shapes align for in-register reduction:
-        # node1's data (pre-reduction or output): numel1 * rnumel1 total elements
-        # node2's input: numel2 * rnumel2 total elements
-        # These must be equal (consumer relationship)
-        total1 = numel1 * rnumel1
-        total2 = numel2 * rnumel2
-        if not V.graph.sizevars.statically_known_equals(total1, total2):
+        pattern = cls._classify(numel1, rnumel1, numel2, rnumel2)
+        if pattern is None:
             return False
 
-        # After in_register_reduction: numel1 * (rnumel1 / rnumel2) outputs = numel2
-        # This is automatically satisfied by the above check
-
         fusion_log.debug(
-            "InRegisterReductionEpilogue: allowing fusion of %s -> %s "
-            "(numel1=%s, rnumel1=%s, numel2=%s, rnumel2=%s, groups=%s)",
-            node1.get_name(), node2.get_name(),
-            numel1, rnumel1, numel2, rnumel2, f"rnumel1/rnumel2"
+            "BlockLocalReduction: allowing fusion of %s -> %s "
+            "(%s, numel1=%s, rnumel1=%s, numel2=%s, rnumel2=%s)",
+            node1.get_name(),
+            node2.get_name(),
+            pattern,
+            numel1,
+            rnumel1,
+            numel2,
+            rnumel2,
         )
         return True
+
+    MAX_PERSISTENT_BLOCK_NUMEL = 4096
+
+    @classmethod
+    def _classify(cls, numel1, rnumel1, numel2, rnumel2):
+        # Pattern (a): across-X
+        # numel1 (parent's output count) == numel2 * rnumel2
+        # Guard: rnumel2 * rnumel1 must fit in MAX_PERSISTENT_BLOCK_NUMEL
+        # so that XBLOCK >= rnumel2 is achievable.
+        if V.graph.sizevars.statically_known_equals(numel1, numel2 * rnumel2):
+            rnumel1_hint = V.graph.sizevars.size_hint(rnumel1, fallback=0)
+            rnumel2_hint = V.graph.sizevars.size_hint(rnumel2, fallback=0)
+            if rnumel1_hint > 0 and rnumel2_hint > 0:
+                if rnumel2_hint * rnumel1_hint <= cls.MAX_PERSISTENT_BLOCK_NUMEL:
+                    return cls.ACROSS_X
+            return None
+
+        # Pattern (b): within-R0_BLOCK
+        # Total elements match and rnumel2 divides rnumel1
+        if V.graph.sizevars.statically_known_equals(numel1 * rnumel1, numel2 * rnumel2):
+            rnumel1_hint = V.graph.sizevars.size_hint(rnumel1, fallback=0)
+            rnumel2_hint = V.graph.sizevars.size_hint(rnumel2, fallback=0)
+            if rnumel1_hint > 0 and rnumel2_hint > 0:
+                if rnumel1_hint % rnumel2_hint == 0:
+                    return cls.WITHIN_R
+
+        return None
 
 
 @dataclasses.dataclass
@@ -2422,23 +2443,17 @@ class FusedSmallReductionEpilogue(FusedSchedulerNode):
         self.last_usage = self.last_usage - intermediate_buffers
 
 
-class FusedInRegisterReductionEpilogue(FusedSchedulerNode):
+class FusedBlockLocalReduction(FusedSchedulerNode):
     """
-    Fused node for computation -> in-register reduction epilogue pattern.
+    Fused node for reduction -> block-local reduction pattern.
 
-    Example: LayerNorm -> amax where the small reduction operates on groups
-    within the R0_BLOCK dimension of the upstream's in-register data.
-
-    Unlike FusedSmallReductionEpilogue (which combines scalar outputs across X),
-    this fuses by reshaping [XBLOCK, R0_BLOCK] to [XBLOCK, groups, group_size]
-    and reducing over the last axis.
+    The child reduction operates on data already in registers from the
+    parent's persistent reduction.  The child gets its own iteration
+    ranges inside the same kernel, gated by EnableBlockLocalReduction /
+    DisableBlockLocalReduction markers.
     """
 
     def __init__(self, node1: BaseSchedulerNode, node2: BaseSchedulerNode) -> None:
-        """
-        node1: The upstream computation (reduction or pointwise)
-        node2: The small reduction epilogue operating on groups within R0_BLOCK
-        """
         self.node1 = node1
         self.node2 = node2
         super().__init__(
@@ -2448,27 +2463,10 @@ class FusedInRegisterReductionEpilogue(FusedSchedulerNode):
         _, (self.numel1, self.rnumel1) = node1.group
         _, (self.numel2, self.rnumel2) = node2.group
 
-        # group_size for in_register_reduction
-        self.group_size = node2.get_small_reduction_numel()
-        assert self.group_size is not None
-
-        # Use node1's group - the in_register_reduction happens within R0_BLOCK
+        # Use the parent reduction's group for kernel launch grid
         self.group = node1.group
 
-    def can_fuse_with(self, other: BaseSchedulerNode) -> bool:
-        """Check if we can fuse additional nodes into this."""
-        # Allow pointwise nodes to fuse with node1 (they become part of the computation)
-        # TODO: Implement this
-        return False
-
-    def fuse_with(self, other: BaseSchedulerNode) -> BaseSchedulerNode:
-        """Fuse another node into this."""
-        raise NotImplementedError(
-            "FusedInRegisterReductionEpilogue doesn't support further fusion yet"
-        )
-
     def get_intermediate_buffer_names(self) -> OrderedSet[str]:
-        """Get buffer names that are intermediate (node1 output consumed by node2)."""
         node1_outputs = self.node1.get_buffer_names()
         node2_inputs = self.node2.used_buffer_names()
         return node1_outputs & node2_inputs
@@ -2476,10 +2474,8 @@ class FusedInRegisterReductionEpilogue(FusedSchedulerNode):
     def set_last_usage(
         self, future_used_buffers: OrderedSet[str], mutation_real_name: dict[str, str]
     ) -> None:
-        """Override to ensure intermediate buffers are not freed too early."""
         super().set_last_usage(future_used_buffers, mutation_real_name)
-        intermediate_buffers = self.get_intermediate_buffer_names()
-        self.last_usage = self.last_usage - intermediate_buffers
+        self.last_usage = self.last_usage - self.get_intermediate_buffer_names()
 
 
 class ForeachKernelSchedulerNode(FusedSchedulerNode):
@@ -3920,6 +3916,12 @@ class Scheduler:
         with dynamo_timed(
             "Scheduler.fused_nodes", log_pt2_compile_event=True, log_waitcounter=True
         ):
+            # Block-local reduction fusion is deferred to after all standard
+            # fusions stabilize.  This ensures e.g. amax+divide fuse as a
+            # normal reduction+pointwise epilogue before the block-local pass
+            # considers fusing that combined node onto an upstream reduction.
+            self._block_local_fusion_enabled = False
+
             for i in range(10):
                 old_len = len(nodes)
                 fusion_log.debug(
@@ -3946,6 +3948,20 @@ class Scheduler:
                 or config.loop_index_inversion_in_fusion
             ):
                 nodes = self.fuse_nodes_once(nodes, is_reorder_round=True)
+
+            # Final pass: block-local reduction fusion
+            if config.triton.block_local_reduction:
+                self._block_local_fusion_enabled = True
+                old_len = len(nodes)
+                nodes = self.fuse_nodes_once(nodes, is_reorder_round=False)
+                new_len = len(nodes)
+                if new_len < old_len:
+                    fusion_log.debug(
+                        "block-local reduction pass: fused %d -> %d nodes",
+                        old_len,
+                        new_len,
+                    )
+
             return nodes
 
     def process_grouped_nodes(self) -> None:
@@ -4745,7 +4761,10 @@ class Scheduler:
         return cycle
 
     def can_fusion_increase_peak_memory(
-        self, node1: BaseSchedulerNode, node2: BaseSchedulerNode, shared_data_score: int | None = None
+        self,
+        node1: BaseSchedulerNode,
+        node2: BaseSchedulerNode,
+        shared_data_score: int | None = None,
     ) -> bool:
         """
         Return true if fusing the two nodes can potentially increasing peak memory.
@@ -4962,7 +4981,6 @@ class Scheduler:
             int: Fusion score if successful, 0 if optimization not applicable
         """
 
-
         if not config.loop_index_inversion_in_fusion:
             return -1
 
@@ -4976,7 +4994,6 @@ class Scheduler:
 
         if not common_buffer_names:
             return -1
-
 
         # only invert if node1 is single unmet dep
         node2_unmet_dependencies = OrderedSet(
@@ -5023,10 +5040,9 @@ class Scheduler:
                 result *= s
             return result
 
-        if (
-            node1_write.index != node2_write.index
-            and total_elements(node1_write.size) != total_elements(node2_write.size)
-        ):
+        if node1_write.index != node2_write.index and total_elements(
+            node1_write.size
+        ) != total_elements(node2_write.size):
             return -1
 
         if node2_read.size != node2_write.size:
@@ -5128,13 +5144,19 @@ class Scheduler:
                         inner_x, inner_div, inner_mod = inner.args
                         # ModularIndexing(ModularIndexing(x, d1, m1), 1, m2) where m2 divides m1
                         if V.graph.sizevars.statically_known_equals(div, 1):
-                            if V.graph.sizevars.statically_known_multiple_of(inner_mod, mod):
+                            if V.graph.sizevars.statically_known_multiple_of(
+                                inner_mod, mod
+                            ):
                                 return ModularIndexing(inner_x, inner_div, mod)
                     return expr
                 elif isinstance(expr, sympy.Add):
-                    return sympy.Add(*[simplify_nested_modular(arg) for arg in expr.args])
+                    return sympy.Add(
+                        *[simplify_nested_modular(arg) for arg in expr.args]
+                    )
                 elif isinstance(expr, sympy.Mul):
-                    return sympy.Mul(*[simplify_nested_modular(arg) for arg in expr.args])
+                    return sympy.Mul(
+                        *[simplify_nested_modular(arg) for arg in expr.args]
+                    )
                 elif isinstance(expr, FloorDiv):
                     base, divisor = expr.args
                     simplified_base = simplify_nested_modular(base)
@@ -5143,7 +5165,10 @@ class Scheduler:
                     # This pattern occurs when reconstructing linear index from multi-dim
                     # (x % a) + a * ((x // a) % c) = x % (a*c)
                     # So FloorDiv of this by d becomes ModularIndexing(x, d, (a*c)//d)
-                    if isinstance(simplified_base, sympy.Add) and len(simplified_base.args) == 2:
+                    if (
+                        isinstance(simplified_base, sympy.Add)
+                        and len(simplified_base.args) == 2
+                    ):
                         args = list(simplified_base.args)
                         mod_term = None
                         mul_term = None
@@ -5163,14 +5188,24 @@ class Scheduler:
                                 if isinstance(inner, ModularIndexing):
                                     inner_x, inner_div, inner_mod = inner.args
                                     # Check if coef == mod_mod and inner_div == mod_mod
-                                    if (V.graph.sizevars.statically_known_equals(coef, mod_mod) and
-                                        V.graph.sizevars.statically_known_equals(inner_div, mod_mod) and
-                                        V.graph.sizevars.statically_known_equals(mod_x, inner_x)):
+                                    if (
+                                        V.graph.sizevars.statically_known_equals(
+                                            coef, mod_mod
+                                        )
+                                        and V.graph.sizevars.statically_known_equals(
+                                            inner_div, mod_mod
+                                        )
+                                        and V.graph.sizevars.statically_known_equals(
+                                            mod_x, inner_x
+                                        )
+                                    ):
                                         # Total modulus is mod_mod * inner_mod
                                         total_mod = mod_mod * inner_mod
                                         # Result is ModularIndexing(x, divisor, total_mod // divisor)
                                         result_mod = FloorDiv(total_mod, divisor)
-                                        return ModularIndexing(mod_x, divisor, result_mod)
+                                        return ModularIndexing(
+                                            mod_x, divisor, result_mod
+                                        )
 
                     return FloorDiv(simplified_base, divisor)
                 return expr
@@ -5386,7 +5421,7 @@ class Scheduler:
 
         Returns (broadcast_factor, read_stride, write_numel) or None if not detected.
         """
-        from torch.utils._sympy.functions import FloorDiv, ModularIndexing
+        from torch.utils._sympy.functions import FloorDiv
 
         fusion_log.debug("_detect_broadcast_pattern: node2=%s", node2.get_name())
 
@@ -5400,7 +5435,9 @@ class Scheduler:
             fusion_log.debug("  body is None")
             return None
 
-        fusion_log.debug("  body.vars=%s", body.vars if hasattr(body, "vars") else "N/A")
+        fusion_log.debug(
+            "  body.vars=%s", body.vars if hasattr(body, "vars") else "N/A"
+        )
         iter_vars = body.vars[0] if hasattr(body, "vars") else []
         if len(iter_vars) != 2:
             # Only handle 2D iteration space for now
@@ -5524,8 +5561,10 @@ class Scheduler:
         old_reduce_sizes = body.vars[1] if len(body.vars) > 1 else []
 
         # Create new variables
-        (new_iter_vars, new_reduce_vars), new_var_ranges = dependencies.index_vars_no_squeeze(
-            new_iter_sizes, list(old_reduce_sizes), prefix="q"
+        (new_iter_vars, new_reduce_vars), new_var_ranges = (
+            dependencies.index_vars_no_squeeze(
+                new_iter_sizes, list(old_reduce_sizes), prefix="q"
+            )
         )
 
         q0, q1 = new_iter_vars[:2]
@@ -6015,13 +6054,20 @@ class Scheduler:
             )
 
         if not V.choices.can_fuse(self, node1, node2, shared_data_score):
-            fusion_log.debug(
-                "V.choices.can_fuse returned False for %s and %s, shared_data_score=%s",
-                node1.get_name(),
-                node2.get_name(),
-                shared_data_score,
-            )
-            return False
+            # Block-local reduction fusion bypasses shared_data_score heuristic
+            # because the child consumes the parent's in-register data (not
+            # through shared memory indexing that score_fusion_memory measures).
+            if not (
+                getattr(self, "_block_local_fusion_enabled", False)
+                and BlockLocalReduction.can_fuse(node1, node2)
+            ):
+                fusion_log.debug(
+                    "V.choices.can_fuse returned False for %s and %s, shared_data_score=%s",
+                    node1.get_name(),
+                    node2.get_name(),
+                    shared_data_score,
+                )
+                return False
 
         if node1.get_operation_names() & node2.ancestors:
             # node2 depends on node1 outputs
@@ -7182,9 +7228,9 @@ class Scheduler:
             elif isinstance(node, FusedSmallReductionEpilogue):
                 # pyrefly: ignore [unbound-name]
                 self.get_backend(device).codegen_small_reduction_epilogue(node)
-            elif isinstance(node, FusedInRegisterReductionEpilogue):
+            elif isinstance(node, FusedBlockLocalReduction):
                 # pyrefly: ignore [unbound-name]
-                self.get_backend(device).codegen_in_register_reduction_epilogue(node)
+                self.get_backend(device).codegen_block_local_reduction(node)
             elif isinstance(node, (FusedSchedulerNode, SchedulerNode)):
                 # pyrefly: ignore [unbound-name]
                 self.get_backend(device).codegen_node(node)
@@ -7385,13 +7431,11 @@ class BaseScheduling:  # noqa: docstring_linter
             return FusedMixOrderReductions(node1, node2)
         elif isinstance(node1, FusedMixOrderReductions):
             return node1.fuse_with(node2)
+        elif BlockLocalReduction.can_fuse(node1, node2):
+            return FusedBlockLocalReduction(node1, node2)
         elif SmallReductionEpilogue.can_fuse(node1, node2):
             return FusedSmallReductionEpilogue(node1, node2)
         elif isinstance(node1, FusedSmallReductionEpilogue):
-            return node1.fuse_with(node2)
-        elif InRegisterReductionEpilogue.can_fuse(node1, node2):
-            return FusedInRegisterReductionEpilogue(node1, node2)
-        elif isinstance(node1, FusedInRegisterReductionEpilogue):
             return node1.fuse_with(node2)
         else:
             return FusedSchedulerNode.fuse(node1, node2)

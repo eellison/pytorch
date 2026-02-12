@@ -63,7 +63,6 @@ from ..utils import (
     Placeholder,
     prefix_is_reduction,
     sympy_dot,
-    sympy_index_symbol,
     sympy_index_symbol_with_prefix,
     sympy_product,
     sympy_subs,
@@ -2007,14 +2006,6 @@ class TritonKernelOverrides(TritonOverrides):
     ) -> None:
         raise NotImplementedError
 
-    @staticmethod
-    def in_register_reduction(
-        value: CSEVariable,
-        reduction_type: str,
-        group_size: int,
-    ) -> CSEVariable:
-        return V.kernel.in_register_reduction(value, reduction_type, group_size)
-
 
 class HelperFunctions:
     """An ordered set of helper functions."""
@@ -2573,9 +2564,12 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         # Buffers registered for stride-2 deduplication
         self._stride2_dedup_buffers: set[str] = set()
 
-    def set_expansion_masks(
-        self, masks: list[tuple[sympy.Expr, sympy.Expr]]
-    ) -> None:
+        # Track in-register CSEVariables for block-local reduction load interception.
+        # Maps buffer name -> CSEVariable for all loads and store_reductions during
+        # the parent's codegen, so the child's inner_fn can access them via interception.
+        self._in_register_buffers: dict[str, CSEVariable] = {}
+
+    def set_expansion_masks(self, masks: list[tuple[sympy.Expr, sympy.Expr]]) -> None:
         """
         Set expansion mask conditions for the current node being codegen'd.
 
@@ -2650,7 +2644,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
         # Cache the halving symbol to avoid creating it twice (once per codegen pass)
         cache_key = f"halving_{halving_size}"
-        if not hasattr(self, '_halving_cache'):
+        if not hasattr(self, "_halving_cache"):
             self._halving_cache = {}
 
         if cache_key not in self._halving_cache:
@@ -2669,13 +2663,16 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             else:
                 shape_str = ""
 
-            self.body.writeline(f"{halving_name} = tl.arange(0, {halving_size}){shape_str}")
+            self.body.writeline(
+                f"{halving_name} = tl.arange(0, {halving_size}){shape_str}"
+            )
 
             # Register in range_tree_nodes with a minimal entry that provides needed attributes
             halving_length = sympy.Integer(halving_size)
 
             # Create a proper IterationRangesEntry
             from torch._inductor.codegen.simd import IterationRangesEntry
+
             halving_entry = IterationRangesEntry(
                 name=halving_name,
                 divisor=sympy.S.One,
@@ -2733,7 +2730,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         if dtype not in self.STRIDE2_COALESCE_CONFIG:
             return
 
-        if not hasattr(self, '_stride2_coalesced'):
+        if not hasattr(self, "_stride2_coalesced"):
             self._stride2_coalesced = {}
 
         if even_buffer in self._stride2_coalesced:
@@ -2766,35 +2763,47 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         odd_var = f"_odd_{idx}"
 
         # Emit the coalesced load pattern into the kernel body
-        dtype_name = str(dtype).split('.')[-1]
-        buf_desc = even_buffer if even_buffer == odd_buffer else f"{even_buffer}/{odd_buffer}"
+        dtype_name = str(dtype).split(".")[-1]
+        buf_desc = (
+            even_buffer if even_buffer == odd_buffer else f"{even_buffer}/{odd_buffer}"
+        )
         self.body.writeline(f"# Coalesced {dtype_name} load for {buf_desc}")
         self.body.writeline(f"{var}_packed = {var}.to(tl.pointer_type({packed_type}))")
 
         if is_1d_pointwise:
             # 1D pointwise: load at xindex, get elements at 2*x and 2*x+1
-            self.body.writeline(f"{packed_var} = tl.load({var}_packed + {x_index_name}, {mask_str}, other=0)")
+            self.body.writeline(
+                f"{packed_var} = tl.load({var}_packed + {x_index_name}, {mask_str}, other=0)"
+            )
 
             # Bit extraction for even/odd - type-specific
             if bits == 16:
-                self.body.writeline(f"{even_var} = ({packed_var} & 0xFFFF).to(tl.uint16).to({elem_type}, bitcast=True).to(tl.float32)")
-                self.body.writeline(f"{odd_var} = ({packed_var} >> {bits}).to(tl.uint16).to({elem_type}, bitcast=True).to(tl.float32)")
+                self.body.writeline(
+                    f"{even_var} = ({packed_var} & 0xFFFF).to(tl.uint16).to({elem_type}, bitcast=True).to(tl.float32)"
+                )
+                self.body.writeline(
+                    f"{odd_var} = ({packed_var} >> {bits}).to(tl.uint16).to({elem_type}, bitcast=True).to(tl.float32)"
+                )
                 out_dtype = torch.float32
             else:
-                self.body.writeline(f"{even_var} = ({packed_var} & 0xFFFFFFFF).to(tl.uint32).to({elem_type}, bitcast=True)")
-                self.body.writeline(f"{odd_var} = ({packed_var} >> {bits}).to(tl.uint32).to({elem_type}, bitcast=True)")
+                self.body.writeline(
+                    f"{even_var} = ({packed_var} & 0xFFFFFFFF).to(tl.uint32).to({elem_type}, bitcast=True)"
+                )
+                self.body.writeline(
+                    f"{odd_var} = ({packed_var} >> {bits}).to(tl.uint32).to({elem_type}, bitcast=True)"
+                )
                 out_dtype = dtype
 
             # Store info for load interception (1D case - no all_2n or r0)
             coalesced_info = {
-                'even': even_var,
-                'odd': odd_var,
-                'all_2n': None,
-                'halving_size': None,
-                'r0_name': None,
-                'dtype': dtype,
-                'out_dtype': out_dtype,
-                'is_1d_pointwise': True,
+                "even": even_var,
+                "odd": odd_var,
+                "all_2n": None,
+                "halving_size": None,
+                "r0_name": None,
+                "dtype": dtype,
+                "out_dtype": out_dtype,
+                "is_1d_pointwise": True,
             }
         else:
             # 2D halving pattern: iterate over r0 dimension
@@ -2821,32 +2830,44 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             else:
                 load_offset = f"{r0_name} + {halving_size}*{x_index_name}"
 
-            self.body.writeline(f"{packed_var} = tl.load({var}_packed + ({load_offset}), {mask_str}, other=0)")
+            self.body.writeline(
+                f"{packed_var} = tl.load({var}_packed + ({load_offset}), {mask_str}, other=0)"
+            )
 
             # Bit extraction for even/odd - type-specific
             if bits == 16:
-                self.body.writeline(f"{even_var} = ({packed_var} & 0xFFFF).to(tl.uint16).to({elem_type}, bitcast=True).to(tl.float32)")
-                self.body.writeline(f"{odd_var} = ({packed_var} >> {bits}).to(tl.uint16).to({elem_type}, bitcast=True).to(tl.float32)")
+                self.body.writeline(
+                    f"{even_var} = ({packed_var} & 0xFFFF).to(tl.uint16).to({elem_type}, bitcast=True).to(tl.float32)"
+                )
+                self.body.writeline(
+                    f"{odd_var} = ({packed_var} >> {bits}).to(tl.uint16).to({elem_type}, bitcast=True).to(tl.float32)"
+                )
                 out_dtype = torch.float32
             else:
-                self.body.writeline(f"{even_var} = ({packed_var} & 0xFFFFFFFF).to(tl.uint32).to({elem_type}, bitcast=True)")
-                self.body.writeline(f"{odd_var} = ({packed_var} >> {bits}).to(tl.uint32).to({elem_type}, bitcast=True)")
+                self.body.writeline(
+                    f"{even_var} = ({packed_var} & 0xFFFFFFFF).to(tl.uint32).to({elem_type}, bitcast=True)"
+                )
+                self.body.writeline(
+                    f"{odd_var} = ({packed_var} >> {bits}).to(tl.uint32).to({elem_type}, bitcast=True)"
+                )
                 out_dtype = dtype
 
             # Join + reshape for 2N-wide reduction view
             self.body.writeline(f"_joined_{idx} = tl.join({even_var}, {odd_var})")
-            self.body.writeline(f"{all_2n_var} = tl.reshape(_joined_{idx}, [{xblock_str}, {halving_size * 2}])")
+            self.body.writeline(
+                f"{all_2n_var} = tl.reshape(_joined_{idx}, [{xblock_str}, {halving_size * 2}])"
+            )
 
             # Store info for load interception (2D halving case)
             coalesced_info = {
-                'even': even_var,
-                'odd': odd_var,
-                'all_2n': all_2n_var,
-                'halving_size': halving_size,
-                'r0_name': r0_name,
-                'dtype': dtype,
-                'out_dtype': out_dtype,
-                'is_1d_pointwise': False,
+                "even": even_var,
+                "odd": odd_var,
+                "all_2n": all_2n_var,
+                "halving_size": halving_size,
+                "r0_name": r0_name,
+                "dtype": dtype,
+                "out_dtype": out_dtype,
+                "is_1d_pointwise": False,
             }
 
         # Register both buffer names so loads from either are intercepted
@@ -2858,7 +2879,9 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
     # Keep old name for backward compatibility
     def setup_bf16_coalesced_load(self, buffer_name: str, halving_size: int):
         """Backward compatible wrapper for bf16 coalesced loads."""
-        self.setup_stride2_coalesced_load(buffer_name, buffer_name, halving_size, torch.bfloat16)
+        self.setup_stride2_coalesced_load(
+            buffer_name, buffer_name, halving_size, torch.bfloat16
+        )
 
     def get_stride2_coalesced_var(self, buffer_name: str, index: sympy.Expr):
         """
@@ -2867,16 +2890,16 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         Returns a CSEVariable wrapping the precomputed value, or None if not applicable.
         This works for any stride-2 pattern (bf16/fp16 halving, complex64 real/imag, etc.)
         """
-        if not hasattr(self, '_stride2_coalesced'):
+        if not hasattr(self, "_stride2_coalesced"):
             return None
 
         if buffer_name not in self._stride2_coalesced:
             return None
 
         coalesced = self._stride2_coalesced[buffer_name]
-        halving_size = coalesced['halving_size']
-        out_dtype = coalesced['out_dtype']
-        is_1d_pointwise = coalesced.get('is_1d_pointwise', False)
+        halving_size = coalesced["halving_size"]
+        out_dtype = coalesced["out_dtype"]
+        is_1d_pointwise = coalesced.get("is_1d_pointwise", False)
 
         # Analyze the index pattern to determine which variable to use
         # We need to check if the index matches:
@@ -2891,18 +2914,22 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         # These would have ModularIndexing or explicit 2* multiplier
         if "2*" in index_str:
             # Check if it's even (no +1) or odd (+1)
-            is_odd = index_str.endswith("+ 1") or index_str.endswith("+1") or "+ 1 +" in index_str
+            is_odd = (
+                index_str.endswith("+ 1")
+                or index_str.endswith("+1")
+                or "+ 1 +" in index_str
+            )
             if is_odd:
-                var_name = coalesced['odd']
+                var_name = coalesced["odd"]
             else:
-                var_name = coalesced['even']
+                var_name = coalesced["even"]
         elif not is_1d_pointwise:
             # Check for contiguous 2N-wide pattern (reduction load)
             # If we detect the reduction iteration symbol, use all_2n
             # Only for 2D halving case, not 1D pointwise
             for sym in index.free_symbols:
                 if symbol_is_type(sym, SymT.R0_INDEX):
-                    var_name = coalesced['all_2n']
+                    var_name = coalesced["all_2n"]
                     break
 
         if var_name is None:
@@ -2914,7 +2941,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         if is_1d_pointwise:
             # 1D pointwise: shape is just XBLOCK (1D tensor)
             shape = ("XBLOCK",)
-        elif var_name == coalesced['all_2n']:
+        elif var_name == coalesced["all_2n"]:
             # 2N-wide for reduction
             if tensor_dim == 2:
                 shape = ("XBLOCK", halving_size * 2)
@@ -2948,7 +2975,9 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         """
         self._stride2_dedup_buffers.add(buffer_name)
 
-    def register_coalesced_uint32_buffer(self, buffer_name: str, dtype: torch.dtype, reduction_size: int):
+    def register_coalesced_uint32_buffer(
+        self, buffer_name: str, dtype: torch.dtype, reduction_size: int
+    ):
         """
         Register a buffer for optimal coalesced uint32 loading.
 
@@ -2959,15 +2988,15 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
         This achieves optimal memory bandwidth utilization.
         """
-        if not hasattr(self, '_coalesced_uint32_buffers'):
+        if not hasattr(self, "_coalesced_uint32_buffers"):
             self._coalesced_uint32_buffers = {}
         self._coalesced_uint32_buffers[buffer_name] = {
-            'dtype': dtype,
-            'reduction_size': reduction_size,
-            'generated': False,
-            'even_var': None,
-            'odd_var': None,
-            'all_var': None,
+            "dtype": dtype,
+            "reduction_size": reduction_size,
+            "generated": False,
+            "even_var": None,
+            "odd_var": None,
+            "all_var": None,
         }
 
     def _generate_coalesced_uint32_load(self, name: str, index: sympy.Expr):
@@ -2976,19 +3005,19 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
         Returns dict with 'even', 'odd', 'all' variable names, or None if not applicable.
         """
-        if not hasattr(self, '_coalesced_uint32_buffers'):
+        if not hasattr(self, "_coalesced_uint32_buffers"):
             return None
         if name not in self._coalesced_uint32_buffers:
             return None
 
         info = self._coalesced_uint32_buffers[name]
-        if info['generated']:
+        if info["generated"]:
             return info
 
         # Generate the coalesced load code
         var = self.args.input(name)
-        dtype = info['dtype']
-        reduction_size = info['reduction_size']
+        dtype = info["dtype"]
+        reduction_size = info["reduction_size"]
         half_size = reduction_size // 2
 
         idx = next(self.iter_vars_count)
@@ -3012,7 +3041,9 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         self.loads.writeline(f"_r0_half_{idx} = tl.arange(0, {half_size})[None, :]")
 
         # Load as uint32
-        self.loads.writeline(f"{u32_var} = tl.load(_u32_ptr_{idx} + (_r0_half_{idx} + {half_size}*x0), None)")
+        self.loads.writeline(
+            f"{u32_var} = tl.load(_u32_ptr_{idx} + (_r0_half_{idx} + {half_size}*x0), None)"
+        )
 
         # Extract even (low 16 bits) and odd (high 16 bits)
         if dtype == torch.bfloat16:
@@ -3022,19 +3053,25 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         else:
             triton_dtype = "tl.float32"
 
-        self.loads.writeline(f"{even_var} = ({u32_var} & 0xFFFF).to(tl.uint16).to({triton_dtype}, bitcast=True).to(tl.float32)")
-        self.loads.writeline(f"{odd_var} = ({u32_var} >> 16).to(tl.uint16).to({triton_dtype}, bitcast=True).to(tl.float32)")
+        self.loads.writeline(
+            f"{even_var} = ({u32_var} & 0xFFFF).to(tl.uint16).to({triton_dtype}, bitcast=True).to(tl.float32)"
+        )
+        self.loads.writeline(
+            f"{odd_var} = ({u32_var} >> 16).to(tl.uint16).to({triton_dtype}, bitcast=True).to(tl.float32)"
+        )
 
         # Reconstruct full stride-1 via tl.join + tl.reshape
         self.loads.writeline(f"_joined_{idx} = tl.join({even_var}, {odd_var})")
-        self.loads.writeline(f"{all_var} = tl.reshape(_joined_{idx}, [{xblock_str}, {reduction_size}])")
+        self.loads.writeline(
+            f"{all_var} = tl.reshape(_joined_{idx}, [{xblock_str}, {reduction_size}])"
+        )
 
         # Update info
-        info['generated'] = True
-        info['even_var'] = even_var
-        info['odd_var'] = odd_var
-        info['all_var'] = all_var
-        info['half_size'] = half_size
+        info["generated"] = True
+        info["even_var"] = even_var
+        info["odd_var"] = odd_var
+        info["all_var"] = all_var
+        info["half_size"] = half_size
 
         return info
 
@@ -3044,7 +3081,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
         Returns CSE variable if applicable, None otherwise.
         """
-        if not hasattr(self, '_coalesced_uint32_buffers'):
+        if not hasattr(self, "_coalesced_uint32_buffers"):
             return None
         if name not in self._coalesced_uint32_buffers:
             return None
@@ -3060,17 +3097,17 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         if "2*" in index_str:
             # Stride-2 access - return even or odd
             is_odd = (
-                index_str.endswith("+ 1") or
-                index_str.endswith("+1") or
-                "+ 1 +" in index_str or
-                "1 + 2*" in index_str
+                index_str.endswith("+ 1")
+                or index_str.endswith("+1")
+                or "+ 1 +" in index_str
+                or "1 + 2*" in index_str
             )
-            var_name = info['odd_var'] if is_odd else info['even_var']
-            shape = ("XBLOCK", info['half_size'])
+            var_name = info["odd_var"] if is_odd else info["even_var"]
+            shape = ("XBLOCK", info["half_size"])
         else:
             # Stride-1 access - return reconstructed full
-            var_name = info['all_var']
-            shape = ("XBLOCK", info['reduction_size'])
+            var_name = info["all_var"]
+            shape = ("XBLOCK", info["reduction_size"])
 
         # Wrap in CSE
         return self.cse.generate(self.loads, var_name, dtype=torch.float32, shape=shape)
@@ -3078,10 +3115,13 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
     def _cache_stride1_load(self, name: str, result_var, shape, dtype: torch.dtype):
         """Cache a stride-1 load result for potential stride-2 derivation."""
         import os
+
         debug = os.environ.get("DEBUG_STRIDE2_DEDUP", "0") == "1"
         if name in self._stride2_dedup_buffers:
             if debug:
-                print(f"DEBUG triton: caching stride-1 load for {name}, shape={shape}, var={result_var}")
+                print(
+                    f"DEBUG triton: caching stride-1 load for {name}, shape={shape}, var={result_var}"
+                )
             self._stride1_load_cache[name] = (result_var, shape, dtype)
 
     def _try_derive_stride2_from_stride1(self, name: str, index: sympy.Expr):
@@ -3098,31 +3138,38 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         Returns the derived CSE variable, or None if not applicable.
         """
         import os
+
         debug = os.environ.get("DEBUG_STRIDE2_DEDUP", "0") == "1"
 
         if name not in self._stride1_load_cache:
             if debug:
-                print(f"DEBUG triton: _try_derive: {name} not in cache (cache has: {list(self._stride1_load_cache.keys())})")
+                print(
+                    f"DEBUG triton: _try_derive: {name} not in cache (cache has: {list(self._stride1_load_cache.keys())})"
+                )
             return None
 
         # Check if this is a stride-2 pattern
         index_str = str(index)
         if "2*" not in index_str:
             if debug:
-                print(f"DEBUG triton: _try_derive: {name} index={index_str} is not stride-2")
+                print(
+                    f"DEBUG triton: _try_derive: {name} index={index_str} is not stride-2"
+                )
             return None
 
         if debug:
-            print(f"DEBUG triton: _try_derive: attempting derivation for {name}, index={index_str}")
+            print(
+                f"DEBUG triton: _try_derive: attempting derivation for {name}, index={index_str}"
+            )
 
         stride1_var, stride1_shape, dtype = self._stride1_load_cache[name]
 
         # Determine if even or odd access
         is_odd = (
-            index_str.endswith("+ 1") or
-            index_str.endswith("+1") or
-            "+ 1 +" in index_str or
-            "1 + 2*" in index_str
+            index_str.endswith("+ 1")
+            or index_str.endswith("+1")
+            or "+ 1 +" in index_str
+            or "1 + 2*" in index_str
         )
 
         # Get the size of the stride-1 load (e.g., 16)
@@ -3133,34 +3180,44 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             return None
 
         full_size = stride1_shape[-1]
-        xblock_str = stride1_shape[0] if isinstance(stride1_shape[0], str) else str(stride1_shape[0])
+        xblock_str = (
+            stride1_shape[0]
+            if isinstance(stride1_shape[0], str)
+            else str(stride1_shape[0])
+        )
 
         # Handle symbolic shapes like 'R0_BLOCK'
         if isinstance(full_size, str):
             # For R0_BLOCK, we can use it directly in generated code
             # Need to figure out the actual halving size
-            if full_size == 'R0_BLOCK':
+            if full_size == "R0_BLOCK":
                 # R0_BLOCK is typically 16 for NVFP4, halving_size is 8
                 halving_size_str = "R0_BLOCK // 2"
                 halving_size_val = 8  # For shape tuple
             else:
                 if debug:
-                    print(f"DEBUG triton: _try_derive: unknown symbolic size {full_size}")
+                    print(
+                        f"DEBUG triton: _try_derive: unknown symbolic size {full_size}"
+                    )
                 return None
         elif isinstance(full_size, int):
             halving_size_str = str(full_size // 2)
             halving_size_val = full_size // 2
         else:
             if debug:
-                print(f"DEBUG triton: _try_derive: unsupported size type {type(full_size)}")
+                print(
+                    f"DEBUG triton: _try_derive: unsupported size type {type(full_size)}"
+                )
             return None
 
         if debug:
-            print(f"DEBUG triton: _try_derive: full_size={full_size}, halving={halving_size_str}")
+            print(
+                f"DEBUG triton: _try_derive: full_size={full_size}, halving={halving_size_str}"
+            )
 
         # Check if we've already derived even/odd for this buffer
         cache_key = f"_stride2_derived_{name}"
-        if not hasattr(self, '_stride2_derived_cache'):
+        if not hasattr(self, "_stride2_derived_cache"):
             self._stride2_derived_cache = {}
 
         if cache_key not in self._stride2_derived_cache:
@@ -3184,27 +3241,45 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
             # Generate uint32 load + bit extraction
             # uint32 load covers 2 bf16 elements per index, so halving_size elements
-            self.loads.writeline(f"# Derive stride-2 values via uint32 load + bit extraction (faster than reshape/split)")
-            self.loads.writeline(f"{r0_half_var} = tl.arange(0, {halving_size_str})[None, :]")
-            self.loads.writeline(f"{u32_var} = tl.load({var}.to(tl.pointer_type(tl.uint32)) + ({r0_half_var} + {halving_size_str}*{x_var}), None)")
+            self.loads.writeline(
+                "# Derive stride-2 values via uint32 load + bit extraction (faster than reshape/split)"
+            )
+            self.loads.writeline(
+                f"{r0_half_var} = tl.arange(0, {halving_size_str})[None, :]"
+            )
+            self.loads.writeline(
+                f"{u32_var} = tl.load({var}.to(tl.pointer_type(tl.uint32)) + ({r0_half_var} + {halving_size_str}*{x_var}), None)"
+            )
 
             # Extract even (low 16 bits) and odd (high 16 bits)
             # For 16-bit types: mask with 0xFFFF, shift by 16
             triton_dtype_str = triton_type(dtype)
-            self.loads.writeline(f"{even_var} = ({u32_var} & 0xFFFF).to(tl.uint16).to({triton_dtype_str}, bitcast=True).to(tl.float32)")
-            self.loads.writeline(f"{odd_var} = ({u32_var} >> 16).to(tl.uint16).to({triton_dtype_str}, bitcast=True).to(tl.float32)")
+            self.loads.writeline(
+                f"{even_var} = ({u32_var} & 0xFFFF).to(tl.uint16).to({triton_dtype_str}, bitcast=True).to(tl.float32)"
+            )
+            self.loads.writeline(
+                f"{odd_var} = ({u32_var} >> 16).to(tl.uint16).to({triton_dtype_str}, bitcast=True).to(tl.float32)"
+            )
 
             if debug:
-                print(f"DEBUG triton: _try_derive: generated derivation code, even={even_var}, odd={odd_var}")
+                print(
+                    f"DEBUG triton: _try_derive: generated derivation code, even={even_var}, odd={odd_var}"
+                )
 
             # Cache the derived variables
-            self._stride2_derived_cache[cache_key] = (even_var, odd_var, halving_size_val)
+            self._stride2_derived_cache[cache_key] = (
+                even_var,
+                odd_var,
+                halving_size_val,
+            )
 
         even_var, odd_var, halving_size_val = self._stride2_derived_cache[cache_key]
         result_var_name = odd_var if is_odd else even_var
 
         if debug:
-            print(f"DEBUG triton: _try_derive: returning {result_var_name} for {'odd' if is_odd else 'even'}")
+            print(
+                f"DEBUG triton: _try_derive: returning {result_var_name} for {'odd' if is_odd else 'even'}"
+            )
 
         # Wrap in CSE to get proper variable tracking
         shape = (xblock_str, halving_size_val)
@@ -4025,51 +4100,6 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             PartialAccumulate(name, reduction_type, val)
         )
 
-    def in_register_reduction(
-        self,
-        value: CSEVariable,
-        reduction_type: str,
-        group_size: int,
-    ) -> CSEVariable:
-        """
-        Perform a reduction on in-register data by reshaping and reducing over groups.
-
-        Takes [XBLOCK, R0_BLOCK] data, reshapes to [XBLOCK, groups, group_size],
-        and reduces over the last axis to produce [XBLOCK, groups].
-        """
-        # Get the shape info - value should be [XBLOCK, R0_BLOCK]
-        # groups = R0_BLOCK // group_size
-        r0_block = "R0_BLOCK"
-        groups_expr = f"({r0_block} // {group_size})"
-
-        # Reshape to [XBLOCK, groups, group_size]
-        if self.no_x_dim:
-            reshape_shape = f"[{groups_expr}, {group_size}]"
-            result_shape = (groups_expr,)
-        else:
-            reshape_shape = f"[XBLOCK, {groups_expr}, {group_size}]"
-            result_shape = ("XBLOCK", groups_expr)
-
-        reshaped = self.cse.generate(
-            self.compute,
-            f"tl.reshape({value}, {reshape_shape})",
-            dtype=value.dtype,
-        )
-
-        # Get the triton reduction function
-        triton_fn = get_triton_reduction_function(reduction_type)
-
-        # Reduce over the last axis (axis=2 for 3D, axis=1 for 2D)
-        reduce_axis = 1 if self.no_x_dim else 2
-        reduced = self.cse.generate(
-            self.compute,
-            f"{triton_fn}({reshaped}, {reduce_axis})",
-            dtype=value.dtype,
-            shape=result_shape,
-        )
-
-        return reduced
-
     def load(self, name: str, index: sympy.Expr):
         """
         Load from the memory location 'name', offset by some indexing expression 'index'.
@@ -4295,6 +4325,9 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             original_dtype = V.graph.get_dtype(name)
             self._cache_stride1_load(name, result_var, shape, original_dtype)
 
+        if self.block_local_reduction is not None:
+            self._in_register_buffers[name] = result_var
+
         return result_var
 
     def load_reinterpreted(self, name: str, index: sympy.Expr, as_dtype: torch.dtype):
@@ -4322,7 +4355,9 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             mask_str = f"{x_index_name} < xnumel" if not self.no_x_dim else "None"
 
         indexing = self.indexing(index, block_ptr=False)
-        index_str = indexing.index_str if isinstance(indexing, IndexingOptions) else str(index)
+        index_str = (
+            indexing.index_str if isinstance(indexing, IndexingOptions) else str(index)
+        )
 
         # Cast pointer and load
         line = f"tl.load({var}.to(tl.pointer_type({triton_dtype})) + ({index_str}), {mask_str}, other=0)"
@@ -4376,7 +4411,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                             return
 
             # Recurse into sub-expressions
-            if hasattr(expr, 'args'):
+            if hasattr(expr, "args"):
                 for arg in expr.args:
                     if isinstance(arg, sympy.Basic):
                         process_expr(arg)
@@ -4390,6 +4425,15 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         """
         store the 'value' to the memory location 'name', offset by some indexing expression 'index'.
         """
+        if self.block_local_reduction is not None:
+            # Track all stores for child's load interception
+            self._in_register_buffers[name] = value
+            intermediate_bufs = self.block_local_reduction.get(
+                "intermediate_buf_names",
+                {self.block_local_reduction["intermediate_buf_name"]},
+            )
+            if name in intermediate_bufs:
+                return
 
         var = self.args.output(name)
         original_index = index
@@ -4864,26 +4908,12 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 result_var = self.prepare_softmax_twopass_fallback(dtype, value)
             else:
                 assert isinstance(masked_value, CSEVariable)
-                # Check if we should use in_register_reduction for small reduction epilogue
-                if (
-                    self.small_reduction_epilogue is not None
-                    and self.small_reduction_epilogue.get("use_in_register_reduction")
-                ):
-                    # Capture pre-reduction data for in_register_reduction
-                    # The epilogue will apply the grouped reduction
-                    rnumel2 = self.small_reduction_epilogue["rnumel2"]
-                    group_size = V.graph.sizevars.size_hint(rnumel2, fallback=16)
-                    epilogue_reduction_type = self.small_reduction_epilogue["reduction_type"]
-                    result_var = self.in_register_reduction(
-                        masked_value, epilogue_reduction_type, group_size
-                    )
-                else:
-                    _result, _dtype, _shape = final_reduction(
-                        self.compute, masked_value, masked_value.dtype
-                    )
-                    result_var = self.cse.generate(
-                        self.compute, _result, dtype=_dtype, shape=_shape
-                    )
+                _result, _dtype, _shape = final_reduction(
+                    self.compute, masked_value, masked_value.dtype
+                )
+                result_var = self.cse.generate(
+                    self.compute, _result, dtype=_dtype, shape=_shape
+                )
         else:
             accumulator = self.cse.namedvar(
                 f"_{result_var}",
@@ -5315,22 +5345,25 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
     ):
         assert self.inside_reduction
 
-        # For small_reduction_epilogue, handle storing based on approach
+        if self.block_local_reduction is not None:
+            # Track all reduction outputs for child's load interception
+            self._in_register_buffers[name] = value
+            intermediate_bufs = self.block_local_reduction.get(
+                "intermediate_buf_names",
+                {self.block_local_reduction["intermediate_buf_name"]},
+            )
+            if name in intermediate_bufs:
+                # Keep value in registers, skip global memory store
+                if self.block_local_reduction.get("pattern") == "across_x":
+                    self._block_local_parent_result = value
+                return
+
+        # For small_reduction_epilogue, capture for accumulation in codegen_body
         if self.small_reduction_epilogue is not None:
-            if self.small_reduction_epilogue.get("use_in_register_reduction"):
-                # With in_register_reduction, the value is already the grouped result
-                # Store it directly to the output buffer
-                # The shape is [XBLOCK, groups] where groups = R0_BLOCK / group_size
-                if not hasattr(self, '_small_reduction_result_vars'):
-                    self._small_reduction_result_vars = []
-                self._small_reduction_result_vars.append((name, value, index, "in_register"))
-                return
-            else:
-                # Loop-based approach: capture for accumulation in codegen_body
-                if not hasattr(self, '_small_reduction_result_vars'):
-                    self._small_reduction_result_vars = []
-                self._small_reduction_result_vars.append((name, value, None, None))
-                return
+            if not hasattr(self, "_small_reduction_result_vars"):
+                self._small_reduction_result_vars = []
+            self._small_reduction_result_vars.append((name, value, None, None))
+            return
 
         self.inside_reduction = False
         dtype = V.graph.get_dtype(name)
@@ -5760,51 +5793,13 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             config = self.small_reduction_epilogue
             reduction_type = config["reduction_type"]
             rnumel2 = config["rnumel2"]
-            rnumel1 = config["rnumel1"]
             output_dtype = config["output_dtype"]
-            numel2 = config["numel2"]
             numel1 = config["numel1"]
-            use_in_register_reduction = config.get("use_in_register_reduction", False)
-
             # Size hints (should be statically known)
             rnumel2_val = V.graph.sizevars.size_hint(rnumel2, fallback=16)
-            numel2_val = V.graph.sizevars.size_hint(numel2, fallback=1)
-            rnumel1_val = V.graph.sizevars.size_hint(rnumel1, fallback=1)
+            numel2_val = V.graph.sizevars.size_hint(config["numel2"], fallback=1)
 
-            if use_in_register_reduction:
-                # In-register reduction approach:
-                # - Data is [XBLOCK, R0_BLOCK] in registers
-                # - in_register_reduction reshapes to [XBLOCK, groups, group_size]
-                # - Reduces over axis 2 to produce [XBLOCK, groups]
-                # - Result is stored directly
-                groups_per_block = rnumel1_val // rnumel2_val
-
-                self.body.writeline(f"# In-register reduction epilogue: {rnumel1_val} -> {groups_per_block} groups of {rnumel2_val}")
-
-                # Generate the standard body (loads, compute, reduction with in_register_reduction)
-                self.body.splice(self.indexing_code)
-                self.body.splice(self.loads)
-                self.body.splice(self.compute)
-                self.body.splice(self.post_loop_combine)
-
-                # Store the result - value is already [XBLOCK, groups] from in_register_reduction
-                if hasattr(self, '_small_reduction_result_vars') and self._small_reduction_result_vars:
-                    name, result_var, index, mode = self._small_reduction_result_vars[0]
-                    if mode == "in_register":
-                        output_buf = config.get("output_buf_name", name)
-                        out_ptr = self.args.output(output_buf)
-                        self.body.writeline("")
-                        self.body.writeline("# Store in-register reduction result")
-                        # result_var has shape [XBLOCK, groups]
-                        # Output indexing: out[x * groups + g] = result[x, g]
-                        self.body.writeline(f"_g_idx = tl.arange(0, {groups_per_block})[None, :]")
-                        self.body.writeline(f"_out_idx = xindex[:, None] * {groups_per_block} + _g_idx")
-                        self.body.writeline(f"_out_mask = xmask[:, None] & (_g_idx < {groups_per_block})")
-                        self.body.writeline(f"tl.store({out_ptr} + _out_idx, {result_var}, _out_mask)")
-                else:
-                    self.body.writeline("# WARNING: Could not find in-register reduction result variable")
-
-            else:
+            if True:
                 # Loop-based approach (original implementation)
                 # Each block processes rnumel2 rows of the main reduction
                 # then combines them via the small reduction
@@ -5831,10 +5826,14 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                     "amax": "triton_helpers.maximum({}, {})",
                     "amin": "triton_helpers.minimum({}, {})",
                 }
-                combine_expr = combine_expr_map.get(reduction_type, "triton_helpers.maximum({}, {})")
+                combine_expr = combine_expr_map.get(
+                    reduction_type, "triton_helpers.maximum({}, {})"
+                )
 
-                self.body.writeline(f"# Small reduction epilogue (loop-based): {rnumel2_val} rows per output")
-                self.body.writeline(f"_block_idx = tl.program_id(0)")
+                self.body.writeline(
+                    f"# Small reduction epilogue (loop-based): {rnumel2_val} rows per output"
+                )
+                self.body.writeline("_block_idx = tl.program_id(0)")
                 self.body.writeline(f"if _block_idx >= {numel2_val}:")
                 with self.body.indent(offset=1):
                     self.body.writeline("return")
@@ -5847,7 +5846,9 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 self.body.writeline(f"for _row_i in tl.static_range({rnumel2_val}):")
                 with self.body.indent(offset=1):
                     # Calculate row index in original data
-                    self.body.writeline(f"_row_idx = _block_idx * {rnumel2_val} + _row_i")
+                    self.body.writeline(
+                        f"_row_idx = _block_idx * {rnumel2_val} + _row_i"
+                    )
 
                     # Override xindex to point to this row
                     self.body.writeline("xindex = _row_idx")
@@ -5860,20 +5861,29 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                     self.body.splice(self.post_loop_combine)
 
                     # Get the reduction result variable from store_reduction
-                    if hasattr(self, '_small_reduction_result_vars') and self._small_reduction_result_vars:
+                    if (
+                        hasattr(self, "_small_reduction_result_vars")
+                        and self._small_reduction_result_vars
+                    ):
                         _, result_var, _, _ = self._small_reduction_result_vars[0]
                         # Extract scalar from result (has shape [XBLOCK, 1])
                         self.body.writeline(f"_row_result = tl.sum({result_var})")
-                        self.body.writeline(f"_small_accum = {combine_expr.format('_small_accum', '_row_result')}")
+                        self.body.writeline(
+                            f"_small_accum = {combine_expr.format('_small_accum', '_row_result')}"
+                        )
                     else:
-                        self.body.writeline("# WARNING: Could not find reduction result variable")
+                        self.body.writeline(
+                            "# WARNING: Could not find reduction result variable"
+                        )
 
                 # Store final result
                 self.body.writeline("")
                 self.body.writeline("# Store final small reduction result")
                 # Use the real output buffer (node2's output), not the intermediate buffer
                 real_out_var = config.get("real_output_var", "out_ptr0")
-                self.body.writeline(f"tl.store({real_out_var} + _block_idx, _small_accum, _block_idx < {numel2_val})")
+                self.body.writeline(
+                    f"tl.store({real_out_var} + _block_idx, _small_accum, _block_idx < {numel2_val})"
+                )
 
         elif self.inside_reduction and len(loop_trees) > 0:
             # Write the loop headers.
@@ -5954,12 +5964,495 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             self.cooperative_reduction_workspace_cache.on_loop_end()
         if not self.mix_order_reduction:
             self.body.splice(self.post_loop_store)
+
+        # Block-local reduction epilogue
+        if self.block_local_reduction is not None:
+            pattern = self.block_local_reduction.get("pattern", "across_x")
+            should_emit = False
+            if pattern == "within_r":
+                # within-R uses inner_fn + load interception from _in_register_buffers
+                should_emit = bool(self._in_register_buffers)
+            else:
+                # across-X needs the intercepted parent result
+                should_emit = (
+                    hasattr(self, "_block_local_parent_result")
+                    and self._block_local_parent_result is not None
+                )
+            if should_emit:
+                self._emit_block_local_reduction()
+
         self.indexing_code.clear()
         self.loads.clear()
         self.compute.clear()
         self.stores.clear()
         self.post_loop_combine.clear()
         self.post_loop_store.clear()
+
+    def _emit_block_local_reduction(self):
+        """
+        Emit a block-local reduction on the parent's in-register result.
+
+        Handles two patterns:
+          across_x: parent result [XBLOCK, 1], reshape [groups, rnumel2], reduce
+          within_r: run child's inner_fn with in-register load interception,
+                    reshape [XBLOCK, R0_BLOCK] -> [XBLOCK, groups, rnumel2], reduce
+        """
+        config = self.block_local_reduction
+        pattern = config.get("pattern", "across_x")
+
+        self.body.writeline("")
+        self.body.writeline("# Block-local reduction epilogue")
+
+        if pattern == "within_r":
+            self._emit_block_local_within_r(config)
+        else:
+            parent_result = self._block_local_parent_result
+            dtype = parent_result.dtype
+            self._emit_block_local_across_x(
+                parent_result,
+                config["rnumel2"],
+                config["reduction_type"],
+                config["final_buf_name"],
+                dtype,
+                config,
+            )
+
+        for buf_name in config.get(
+            "intermediate_buf_names", {config["intermediate_buf_name"]}
+        ):
+            self.removed_buffers.add(buf_name)
+        self._block_local_parent_result = None
+
+    @contextlib.contextmanager
+    def _block_local_store_context(self, dense_sizes):
+        """Temporarily override iteration context for block-local stores.
+
+        Sets inside_reduction=False and overrides dense_size_list() to match
+        the child's output shape, so self.store() produces correct indexing
+        and masks without manual tl.store calls.
+        """
+        saved_inside_reduction = self.inside_reduction
+        self.inside_reduction = False
+        self._blr_dense_size_override = dense_sizes
+        try:
+            yield
+        finally:
+            self.inside_reduction = saved_inside_reduction
+            self._blr_dense_size_override = None
+
+    def _emit_block_local_within_r(self, config):
+        """
+        within-R pattern: the child's iteration space is nested inside the
+        parent's reduction dimension.
+
+        Parent: X=[batch], R=[hidden]
+        Child:  X'=[batch, groups_per_row], R'=[group_size]
+        where hidden = groups_per_row * group_size
+
+        We decompose the parent's R range tree into [groups_per_row, group_size]
+        to create proper index variables for the child. In-register buffers
+        (parent outputs) are intercepted at load time; external buffers
+        (weight, bias) go through normal indexing using the range tree.
+        """
+        from torch._inductor.ops_handler import WrapperHandler
+
+        rnumel2 = config["rnumel2"]
+        rnumel1 = config["rnumel1"]
+        reduction_type = config["reduction_type"]
+        final_buf_name = config["final_buf_name"]
+        groups_per_x = rnumel1 // rnumel2
+        child_snode = config.get("child_snode")
+
+        if child_snode is None:
+            fusion_log.warning("BlockLocalReduction within_r: no child_snode, fallback")
+            return
+
+        ir_node = child_snode.node
+        assert isinstance(ir_node, ir.ComputedBuffer), (
+            f"Expected ComputedBuffer, got {type(ir_node)}"
+        )
+        ir_data = ir_node.data
+        assert isinstance(ir_data, ir.Reduction), (
+            f"Expected Reduction, got {type(ir_data)}"
+        )
+        child_inner_fn = ir_data.inner_fn
+
+        # Build index variables for the child using the parent's range trees.
+        # The child's ranges map to the parent's x-range (first dim) and
+        # r-range (remaining non-trivial dims + reduction dims).
+        # Size-1 dims (e.g., from keepdim) get sympy.S.Zero.
+        x_tree = [t for t in self.range_trees if not t.is_reduction][0]
+        r_tree = [t for t in self.range_trees if t.is_reduction][0]
+
+        # Collect non-trivial (size > 1) dims from ranges[1:] and
+        # all reduction_ranges for r-tree decomposition.
+        r_lengths = []
+        for s in ir_data.ranges[1:]:
+            hint = V.graph.sizevars.size_hint(s)
+            if hint != 1:
+                r_lengths.append(sympy.Integer(hint))
+        for s in ir_data.reduction_ranges:
+            r_lengths.append(sympy.Integer(V.graph.sizevars.size_hint(s)))
+
+        r_sub_entries = r_tree.construct_entries(r_lengths)
+        r_syms = [e.symbol() for e in r_sub_entries]
+
+        # Build child_index: ranges[0] from x-tree, rest from r-tree or Zero
+        x_entries = x_tree.construct(ir_data.ranges[:1])
+        child_index = [x_entries[0]]
+        r_idx = 0
+        for s in ir_data.ranges[1:]:
+            hint = V.graph.sizevars.size_hint(s)
+            if hint == 1:
+                child_index.append(sympy.S.Zero)
+            else:
+                child_index.append(r_syms[r_idx])
+                r_idx += 1
+
+        # Build child_rindex from remaining r-tree symbols
+        child_rindex = r_syms[r_idx:]
+
+        in_register = self._in_register_buffers
+
+        class BlockLocalLoadHandler(WrapperHandler):
+            """Intercept ops.load for in-register buffers."""
+
+            def load(self, name: str, index: sympy.Expr):
+                if name in in_register:
+                    return in_register[name]
+                return self._inner.load(name, index)
+
+        from torch._inductor.codegen.common import CSEProxy
+        from torch._inductor.virtualized import OpsValue
+
+        self.compute.clear()
+        self.loads.clear()
+
+        cse_proxy = CSEProxy(self, self.overrides())
+        with V.set_ops_handler(BlockLocalLoadHandler(cse_proxy)):
+            pre_reduction_value = child_inner_fn(child_index, child_rindex)
+
+        if isinstance(pre_reduction_value, OpsValue):
+            pre_reduction_value = pre_reduction_value.value
+
+        # Splice the child's emitted code (loads then compute) into body.
+        self.body.splice(self.loads)
+        self.body.splice(self.compute)
+        self.loads.clear()
+        self.compute.clear()
+
+        assert isinstance(pre_reduction_value, TritonCSEVariable), (
+            f"Expected TritonCSEVariable, got {type(pre_reduction_value)}"
+        )
+        dtype = pre_reduction_value.dtype
+
+        # pre_reduction_value is [XBLOCK, R0_BLOCK]. Reshape to
+        # [XBLOCK, groups_per_row, group_size] then reduce over last dim.
+        reshaped = self.cse.newvar(
+            dtype=dtype,
+            shape=("XBLOCK", str(groups_per_x), str(rnumel2)),
+        )
+        self.body.writeline(
+            f"{reshaped} = tl.reshape({pre_reduction_value},"
+            f" [XBLOCK, {groups_per_x}, {rnumel2}])"
+        )
+
+        triton_fn = get_triton_reduction_function(reduction_type)
+        reduced = self.cse.newvar(dtype=dtype, shape=("XBLOCK", str(groups_per_x)))
+        self.body.writeline(f"{reduced} = {triton_fn}({reshaped}, 2)")
+
+        # Store the reduction result using the child's output layout.
+        # Batch dimension reuses the parent's x-tree symbol (already defined
+        # in the kernel body with shape [XBLOCK, 1] and proper mask).
+        # Group dimensions use TMP-typed arange variables.
+        layout = ir_node.get_layout()
+        indexer = layout.make_indexer()
+
+        batch_sym = x_tree.construct(ir_data.ranges[:1])[0]
+
+        blr_var_counter = itertools.count()
+        child_store_vars = [batch_sym]
+        for s in ir_data.ranges[1:]:
+            hint = V.graph.sizevars.size_hint(s)
+            if hint == 1:
+                child_store_vars.append(sympy.S.Zero)
+            else:
+                name = f"tmp_blr{next(blr_var_counter)}"
+                sym = sympy.Symbol(name, integer=True)
+                cse_var = self.cse.namedvar(
+                    name,
+                    dtype=torch.int64,
+                    shape=("1", str(hint)),
+                )
+                cse_var.mask_vars = OrderedSet()
+                self.body.writeline(f"{cse_var} = tl.arange(0, {hint})[None, :]")
+                child_store_vars.append(sym)
+
+        store_index = indexer(child_store_vars)
+
+        with self._block_local_store_context(["XBLOCK", str(groups_per_x)]):
+            self.store(final_buf_name, store_index, reduced)
+            self.body.splice(self.stores)
+            self.stores.clear()
+
+        # Register the amax result as in-register for post-reduction ops.
+        # Broadcast from [XBLOCK, groups] to [XBLOCK, groups, group_size]
+        # then reshape to [XBLOCK, R0_BLOCK] so it matches parent's layout.
+        amax_buf_name = ir_node.get_name()
+        post_reduction_snodes = config.get("post_reduction_snodes", [])
+        if post_reduction_snodes and amax_buf_name:
+            broadcast_var = self.cse.newvar(
+                dtype=dtype,
+                shape=("XBLOCK", str(groups_per_x), str(rnumel2)),
+            )
+            self.body.writeline(
+                f"{broadcast_var} = tl.broadcast_to("
+                f"{reduced}[:, :, None], [XBLOCK, {groups_per_x}, {rnumel2}])"
+            )
+            r_tree = [t for t in self.range_trees if t.is_reduction][0]
+            r_block_str = f"{r_tree.prefix.upper()}BLOCK"
+            flat_var = self.cse.newvar(
+                dtype=dtype,
+                shape=("XBLOCK", r_block_str),
+            )
+            self.body.writeline(
+                f"{flat_var} = tl.reshape({broadcast_var}, [XBLOCK, {r_block_str}])"
+            )
+            self._in_register_buffers[amax_buf_name] = flat_var
+
+            self._emit_post_reduction_pointwise(post_reduction_snodes)
+
+    def _emit_post_reduction_pointwise(self, snodes):
+        """Emit post-reduction pointwise ops using in-register values.
+
+        After a block-local reduction (e.g., amax), the reduction result is
+        broadcast back and stored in _in_register_buffers. Post-reduction
+        pointwise ops (e.g., divide by scale) run using the parent's iteration
+        ranges, with loads intercepted from _in_register_buffers.
+        """
+        from torch._inductor.codegen.common import CSEProxy
+        from torch._inductor.ops_handler import WrapperHandler
+        from torch._inductor.virtualized import OpsValue
+
+        in_register = self._in_register_buffers
+
+        x_tree = [t for t in self.range_trees if not t.is_reduction][0]
+        r_tree = [t for t in self.range_trees if t.is_reduction][0]
+
+        class PostReductionLoadHandler(WrapperHandler):
+            def load(self, name: str, index: sympy.Expr):
+                if name in in_register:
+                    return in_register[name]
+                return self._inner.load(name, index)
+
+        for snode in snodes:
+            node = snode.node
+            if not isinstance(node, ir.ComputedBuffer):
+                continue
+            ir_data = node.data
+            if not isinstance(ir_data, ir.Pointwise):
+                continue
+
+            pw_inner_fn = ir_data.inner_fn
+            pw_ranges = ir_data.ranges
+
+            # Build index using parent's range trees.
+            # The pointwise has the same iteration space as the parent
+            # (e.g., [batch, hidden]).
+            full_index = x_tree.construct(pw_ranges[:1]) + r_tree.construct(
+                pw_ranges[1:]
+            )
+
+            self.compute.clear()
+            self.loads.clear()
+
+            cse_proxy = CSEProxy(self, self.overrides())
+            with V.set_ops_handler(PostReductionLoadHandler(cse_proxy)):
+                result_value = pw_inner_fn(full_index)
+
+            if isinstance(result_value, OpsValue):
+                result_value = result_value.value
+
+            self.body.splice(self.loads)
+            self.body.splice(self.compute)
+            self.loads.clear()
+            self.compute.clear()
+
+            # Store using the buffer's layout stride
+            out_buf_name = node.get_name()
+            layout = node.get_layout()
+            store_index = sympy.S.Zero
+            for sym, stride in zip(full_index, layout.stride):
+                store_index += sym * stride
+            self.store(out_buf_name, store_index, result_value)
+            self.body.splice(self.stores)
+            self.stores.clear()
+
+            self._in_register_buffers[out_buf_name] = result_value
+
+    def _emit_block_local_across_x(
+        self, parent_result, rnumel2, reduction_type, final_buf_name, dtype, config
+    ):
+        """
+        across-X pattern: the child's iteration space is nested inside the
+        parent's X dimension.
+
+        Parent: X=[numel1], R=[rnumel1] -> produces [XBLOCK, 1] scalars
+        Child:  X'=[child_ranges...], R'=[rnumel2]
+        where product(child_ranges) * rnumel2 = numel1
+
+        We decompose the parent's X range tree into [*child_ranges, rnumel2]
+        to create proper index variables, then run the child's inner_fn
+        (for element-wise pre-reduction ops like abs), reshape, and reduce.
+        """
+        from torch._inductor.ops_handler import WrapperHandler
+
+        child_snode = config.get("child_snode")
+        numel2 = config["numel2"]
+        blr_rblock = str(rnumel2)
+        blr_groups = f"(XBLOCK // {blr_rblock})"
+
+        if child_snode is not None:
+            ir_node = child_snode.node
+            assert isinstance(ir_node, ir.ComputedBuffer)
+            ir_data = ir_node.data
+            assert isinstance(ir_data, ir.Reduction)
+            child_inner_fn = ir_data.inner_fn
+
+            # Decompose parent's x-range tree into child's dims.
+            # child ranges = [d0, d1, ...], reduction_ranges = [rnumel2]
+            # All come from the parent's x-dimension.
+            x_tree = [t for t in self.range_trees if not t.is_reduction][0]
+            all_lengths = list(ir_data.ranges) + list(ir_data.reduction_ranges)
+            x_sub_entries = x_tree.construct_entries(
+                [sympy.Integer(V.graph.sizevars.size_hint(s)) for s in all_lengths]
+            )
+            n_index = len(ir_data.ranges)
+            child_index = [e.symbol() for e in x_sub_entries[:n_index]]
+            child_rindex = [e.symbol() for e in x_sub_entries[n_index:]]
+
+            in_register = self._in_register_buffers
+
+            class BlockLocalLoadHandler(WrapperHandler):
+                def load(self, name: str, index: sympy.Expr):
+                    if name in in_register:
+                        return in_register[name]
+                    return self._inner.load(name, index)
+
+            from torch._inductor.codegen.common import CSEProxy
+            from torch._inductor.virtualized import OpsValue
+
+            self.compute.clear()
+            self.loads.clear()
+
+            cse_proxy = CSEProxy(self, self.overrides())
+            with V.set_ops_handler(BlockLocalLoadHandler(cse_proxy)):
+                pre_reduction_value = child_inner_fn(child_index, child_rindex)
+
+            if isinstance(pre_reduction_value, OpsValue):
+                pre_reduction_value = pre_reduction_value.value
+
+            self.body.splice(self.loads)
+            self.body.splice(self.compute)
+            self.loads.clear()
+            self.compute.clear()
+
+            assert isinstance(pre_reduction_value, TritonCSEVariable)
+            dtype = pre_reduction_value.dtype
+            result_to_reshape = pre_reduction_value
+        else:
+            result_to_reshape = parent_result
+
+        # Squeeze [XBLOCK, 1] -> [XBLOCK] if needed
+        squeezed = self.cse.newvar(dtype=dtype, shape=("XBLOCK",))
+        self.body.writeline(f"{squeezed} = tl.reshape({result_to_reshape}, [XBLOCK])")
+
+        # Mask out-of-bounds positions
+        default = ir.Reduction.default_value(reduction_type, dtype)
+        default_str = constant_repr(default)
+        blr_xoff = self.cse.newvar(dtype=torch.int64, shape=("1",))
+        self.body.writeline(f"{blr_xoff} = tl.program_id(0) * XBLOCK")
+        xindex_1d = self.cse.newvar(dtype=torch.int64, shape=("XBLOCK",))
+        self.body.writeline(f"{xindex_1d} = {blr_xoff} + tl.arange(0, XBLOCK)")
+        masked = self.cse.newvar(dtype=dtype, shape=("XBLOCK",))
+        self.body.writeline(
+            f"{masked} = tl.where({xindex_1d} < xnumel, {squeezed}, {default_str})"
+        )
+
+        # Reshape [XBLOCK] -> [groups, rnumel2] and reduce
+        reshaped = self.cse.newvar(dtype=dtype, shape=(blr_groups, blr_rblock))
+        self.body.writeline(
+            f"{reshaped} = tl.reshape({masked}, [{blr_groups}, {blr_rblock}])"
+        )
+
+        triton_fn = get_triton_reduction_function(reduction_type)
+        reduced = self.cse.newvar(dtype=dtype, shape=(blr_groups,))
+        self.body.writeline(f"{reduced} = {triton_fn}({reshaped}, 1)")
+
+        # Store the reduction result using the child's output layout.
+        # The reduced value is 1D (groups_per_block,) — can't use self.store()
+        # directly since it would broadcast to the parent's 2D shape.
+        # Instead use self.indexing() with override_mask.
+        layout = ir_node.get_layout()
+        indexer = layout.make_indexer()
+        groups_per_block = f"(XBLOCK // {rnumel2})"
+
+        # Flat group index: maps each group position to its global output index.
+        flat_expr = f"({blr_xoff} // {rnumel2}) + tl.arange(0, {groups_per_block})"
+
+        # Decompose flat group index into per-dim variables via div/mod,
+        # mirroring how construct_entries decomposes iteration ranges.
+        blr_var_counter = itertools.count()
+        dim_sizes = [V.graph.sizevars.size_hint(s) for s in ir_data.ranges]
+        child_store_vars = []
+        for i, hint in enumerate(dim_sizes):
+            name = f"tmp_blr_ax{next(blr_var_counter)}"
+            sym = sympy.Symbol(name, integer=True)
+            cse_var = self.cse.namedvar(
+                name, dtype=torch.int64, shape=(groups_per_block,)
+            )
+            cse_var.mask_vars = OrderedSet()
+            if hint == 1:
+                self.body.writeline(f"{cse_var} = tl.full([1], 0, tl.int32)")
+            else:
+                # Divisor = product of all dims after this one
+                divisor = 1
+                for j in range(i + 1, len(dim_sizes)):
+                    divisor *= dim_sizes[j]
+                if divisor == 1:
+                    # Innermost dim: just mod
+                    if i == 0 and len(dim_sizes) == 1:
+                        self.body.writeline(f"{cse_var} = {flat_expr}")
+                    else:
+                        self.body.writeline(f"{cse_var} = ({flat_expr}) % {hint}")
+                elif i == 0:
+                    # Outermost dim: just div
+                    self.body.writeline(f"{cse_var} = ({flat_expr}) // {divisor}")
+                else:
+                    self.body.writeline(
+                        f"{cse_var} = (({flat_expr}) // {divisor}) % {hint}"
+                    )
+            child_store_vars.append(sym)
+
+        store_index = indexer(child_store_vars)
+
+        # Bounds-check mask: group index < total output elements.
+        numel2_hint = V.graph.sizevars.size_hint(numel2)
+        mask_name = f"tmp_blr_ax{next(blr_var_counter)}"
+        mask_cse = self.cse.namedvar(
+            mask_name, dtype=torch.bool, shape=(groups_per_block,)
+        )
+        mask_cse.mask_vars = OrderedSet()
+        self.body.writeline(f"{mask_cse} = ({flat_expr}) < {numel2_hint}")
+
+        self.inside_reduction = False
+        var = self.args.output(final_buf_name)
+        indexing = self.indexing(store_index, override_mask=mask_name)
+        assert isinstance(indexing, IndexingOptions)
+        self.body.writeline(
+            f"tl.store({var} + ({indexing.index_str}), {reduced}, {indexing.mask_str})"
+        )
+        self.inside_reduction = True
 
     def kernel_benchmark_extra_args(self) -> list[str]:
         args = []
@@ -6223,6 +6716,17 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             if config.benchmark_kernel:
                 code.splice(self.imports_for_benchmark_kernel())
 
+        # Pre-register block-local reduction buffers so they appear in the
+        # kernel signature. codegen_body runs after python_argdefs(), so any
+        # buffers the child's inner_fn loads would otherwise be missing.
+        if self.block_local_reduction is not None:
+            self.args.output(self.block_local_reduction["final_buf_name"])
+            for buf_name in self.block_local_reduction.get("child_external_bufs", []):
+                self.args.input(buf_name)
+            for snode in self.block_local_reduction.get("post_reduction_snodes", []):
+                for buf_name in snode.get_buffer_names():
+                    self.args.output(buf_name)
+
         argdefs, _, signature, _ = self.args.python_argdefs()
         # maps actual expression to SizeArg if it is in sizevars replacements
         for i, arg in enumerate(signature):
@@ -6400,6 +6904,9 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 and mem_ops_per_thread <= 10
             ):
                 inductor_meta["add_persistent_rblock"] = True
+
+        if self.block_local_reduction is not None:
+            inductor_meta["min_xblock"] = self.block_local_reduction.get("rnumel2", 1)
 
         if self.tiling_scores:
             inductor_meta["tiling_scores"] = self.tiling_scores

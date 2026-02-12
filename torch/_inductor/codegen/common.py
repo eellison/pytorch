@@ -2197,21 +2197,6 @@ class Kernel(CodeGen, Generic[CSEVariableType]):
     ) -> None:
         raise NotImplementedError
 
-    def in_register_reduction(
-        self,
-        value: CSEVariable,
-        reduction_type: ReductionType,
-        group_size: int,
-    ) -> CSEVariable:
-        raise NotImplementedError
-
-    def nvfp4_quantize(
-        self,
-        value: CSEVariable,
-        group_size: int = 16,
-    ) -> tuple[CSEVariable, CSEVariable, CSEVariable]:
-        raise NotImplementedError
-
     def scan(
         self,
         dtypes: tuple[torch.dtype, ...],
@@ -2820,21 +2805,6 @@ class CSEProxy(DefaultHandler):
     # pyrefly: ignore [bad-override]
     def partial_accumulate(self, *args: Any) -> None:
         self.kernel.partial_accumulate(*args)
-
-    def in_register_reduction(
-        self,
-        value: CSEVariable,
-        reduction_type: ReductionType,
-        group_size: int,
-    ) -> CSEVariable:
-        return self.kernel.in_register_reduction(value, reduction_type, group_size)
-
-    def nvfp4_quantize(
-        self,
-        value: CSEVariable,
-        group_size: int = 16,
-    ) -> tuple[CSEVariable, CSEVariable, CSEVariable]:
-        return self.kernel.nvfp4_quantize(value, group_size)
 
     def store_reduction(self, name: str, index: sympy.Expr, value: CSEVariable) -> None:
         self.kernel.store_buffer_names.add(name)

@@ -322,67 +322,6 @@ class OpsHandler(Generic[T]):
     ) -> None:
         raise NotImplementedError
 
-    def in_register_reduction(
-        self,
-        value: T,
-        reduction_type: ReductionType,
-        group_size: int,
-    ) -> T:
-        """
-        Perform a reduction on in-register data by reshaping and reducing over groups.
-
-        Takes [XBLOCK, R0_BLOCK] data, reshapes to [XBLOCK, groups, group_size],
-        and reduces over the last axis to produce [XBLOCK, groups].
-
-        This is used when fusing a small reduction into an upstream computation,
-        avoiding an intermediate buffer by operating on data already in registers.
-
-        Example: LayerNorm -> amax fusion
-            x_norm = ...  # [XBLOCK, R0_BLOCK] normalized data
-            x_abs = ops.abs(x_norm)  # apply abs first as normal pointwise op
-            amax = in_register_reduction(x_abs, "max", 16)
-            # Result: [XBLOCK, R0_BLOCK // 16] amax values per group of 16
-
-        Args:
-            value: The in-register data with shape [XBLOCK, R0_BLOCK]
-            reduction_type: Type of reduction (max, min, sum, etc.)
-            group_size: Size of each group to reduce over
-
-        Returns:
-            Reduced data with shape [XBLOCK, R0_BLOCK // group_size]
-        """
-        raise NotImplementedError
-
-    def nvfp4_quantize(
-        self,
-        value: T,
-        group_size: int = 16,
-    ) -> tuple[T, T, T]:
-        """
-        Perform NVFP4 quantization on in-register data.
-
-        Takes [XBLOCK, R0_BLOCK] data, computes per-group amax and scaled
-        even/odd values for FP4 packing.
-
-        Operations:
-            1. Reshape to [XBLOCK, groups, group_size]
-            2. Compute amax = max(abs(data), axis=-1) -> [XBLOCK, groups]
-            3. Extract even elements [0,2,4,...] -> [XBLOCK, groups, group_size//2]
-            4. Extract odd elements [1,3,5,...] -> [XBLOCK, groups, group_size//2]
-            5. Scale: even/odd divided by amax (clamped)
-
-        Args:
-            value: The in-register data with shape [XBLOCK, R0_BLOCK]
-            group_size: Size of each group (default 16 for NVFP4)
-
-        Returns:
-            Tuple of (amax, even_scaled, odd_scaled):
-                - amax: [XBLOCK, R0_BLOCK // group_size]
-                - even_scaled: [XBLOCK, R0_BLOCK // group_size, group_size // 2]
-                - odd_scaled: [XBLOCK, R0_BLOCK // group_size, group_size // 2]
-        """
-        raise NotImplementedError
-
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     # The following ops have semantics that correspond exactly to the torch
     # operation with the same corresponding name.

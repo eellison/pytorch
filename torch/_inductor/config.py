@@ -1771,6 +1771,12 @@ class triton:
         os.environ.get("TORCHINDUCTOR_SMALL_REDUCTION_EPILOGUE_FUSION", "0") == "1"
     )
 
+    # Fuse small block-local reductions (e.g., amax over groups of 16) as epilogues
+    # to upstream persistent reductions, keeping data in registers.
+    block_local_reduction = (
+        os.environ.get("TORCHINDUCTOR_BLOCK_LOCAL_REDUCTION", "0") == "1"
+    )
+
     enable_tlx_templates: bool = (
         os.environ.get("TORCHINDUCTOR_ENABLE_TLX_TEMPLATES", "0") == "1"
     )
