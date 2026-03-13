@@ -1259,7 +1259,9 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
         return OpsWrapper._unwrap((mean, m2, rnumel))
 
     def prepare_softmax_twopass_fallback(self, dtype, value):
-        vmax = ops.reduction(dtype, dtype, "max", value)
+        # Use fast_max (without NaN propagation) since for softmax any NaN
+        # in the input produces NaN output regardless of max behavior
+        vmax = ops.reduction(dtype, dtype, "fast_max", value)
         sub = ops.sub(value, vmax)
         exp = ops.exp(sub)
         vsum = ops.reduction(dtype, dtype, "sum", exp)

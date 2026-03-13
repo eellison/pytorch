@@ -139,6 +139,10 @@ def get_triton_reduction_function(reduction_type):
     module = "triton_helpers" if use_helper else "tl"
     if reduction_type in ("max", "min"):
         return f"{module}.{reduction_type}2"
+    elif reduction_type in ("fast_max", "fast_min"):
+        # Use tl.max/tl.min directly without NaN propagation.
+        # Safe for cases where NaN handling is unnecessary (e.g. softmax).
+        return f"tl.{reduction_type.removeprefix('fast_')}"
     else:
         return f"{module}.{reduction_type}"
 
