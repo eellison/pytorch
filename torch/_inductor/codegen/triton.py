@@ -4626,6 +4626,15 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         """
         codegen reduction of value to Triton according the reduction_type
         """
+        # Auto-upgrade max/min to fast_max/fast_min when NaN propagation is
+        # unnecessary (determined by pre-analysis in _compute_fast_reduction_nodes)
+        if (
+            reduction_type in ("max", "min")
+            and self.current_node is not None
+            and self.current_node.get_name()
+            in getattr(self, "fast_reduction_nodes", set())
+        ):
+            reduction_type = f"fast_{reduction_type}"
 
         def maybe_upcast(value: CSEVariable) -> CSEVariable:
             # Math reductions in FP16/BF16 are less accurate because the Triton compiler does not

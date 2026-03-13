@@ -460,6 +460,7 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
 
         self.rsplit_size = 0
         self.saved_partial_accumulate: list[PartialAccumulate] = []
+        self.fast_reduction_nodes: set[str] = set()
 
     def _get_store_output_subgraph_name(self, i: int) -> str:
         return f"<STORE_OUTPUT_{i}>"
@@ -2600,8 +2601,176 @@ class SIMDScheduling(BaseScheduling):
 
         return None
 
+    @staticmethod
+    def _compute_fast_reduction_nodes(node_schedule):
+        """
+        Determine which max/min reductions can safely skip NaN propagation
+        by analyzing the dataflow graph of the fused kernel.
+
+        A max/min reduction can use tl.max/tl.min (fast, no NaN propagation)
+        instead of triton_helpers.max2/min2 (NaN-safe) when NaN would flow
+        to the same outputs regardless. Specifically: for every output buffer
+        that transitively depends on the max result, the max's unreduced
+        input must also reach that output through a separate path (not
+        through the max). Since standard arithmetic propagates NaN, the
+        output will be NaN either way.
+
+        Example: softmax computes exp(x - max(x)) / sum(exp(x - max(x))).
+        The output depends on max(x), but x also flows directly to exp(),
+        so NaN in x produces NaN output regardless of what max returns.
+
+        Note: This analysis runs before CSE (Common Subexpression Elimination)
+        during codegen. CSE might consolidate duplicate expressions, potentially
+        creating new alternate NaN paths not visible to this static analysis.
+        The analysis errs on the side of safety — only marking reductions as
+        fast when alternate paths can be definitively proven.
+
+        Returns a set of scheduler node names whose max/min reductions are
+        safe to use fast (non-NaN-propagating) versions.
+        """
+        nodes = [
+            node
+            for node in node_schedule
+            if isinstance(node, BaseSchedulerNode)
+        ]
+        if not nodes:
+            return set()
+
+        # Build the dataflow graph:
+        # - writes_map: buffer_name -> node that writes it
+        # - reads_map: node -> set of buffer names it reads
+        # - buf_names_map: node -> set of buffer names it writes
+        writes_map: dict[str, BaseSchedulerNode] = {}
+        reads_map: dict[int, set[str]] = {}
+        buf_names_map: dict[int, set[str]] = {}
+
+        for node in nodes:
+            bufs = node.get_buffer_names()
+            buf_names_map[id(node)] = bufs
+            for buf in bufs:
+                writes_map[buf] = node
+            reads_map[id(node)] = {dep.name for dep in node.read_writes.reads}
+
+        # External inputs: buffers read but not written by any node in kernel
+        all_written = set(writes_map.keys())
+
+        def get_external_inputs(node):
+            """Get the external input buffer names that this node reads."""
+            return reads_map[id(node)] - all_written
+
+        def get_internal_inputs(node):
+            """Get the kernel-internal buffer names that this node reads."""
+            return reads_map[id(node)] & all_written
+
+        # Compute transitive reachability: which external inputs can reach
+        # each node through the internal dataflow graph?
+        reachable_inputs: dict[int, set[str]] = {}
+
+        def compute_reachable(node) -> set[str]:
+            nid = id(node)
+            if nid in reachable_inputs:
+                return reachable_inputs[nid]
+            result = set(get_external_inputs(node))
+            for buf in get_internal_inputs(node):
+                pred = writes_map.get(buf)
+                if pred is not None:
+                    result |= compute_reachable(pred)
+            reachable_inputs[nid] = result
+            return result
+
+        for node in nodes:
+            compute_reachable(node)
+
+        def reachable_without(node, excluded_bufs: frozenset[str]) -> set[str]:
+            """
+            External inputs reachable at `node` through paths that don't
+            read any buffer in `excluded_bufs`.
+            """
+            result = set(get_external_inputs(node))
+            for buf in get_internal_inputs(node):
+                if buf in excluded_bufs:
+                    continue
+                pred = writes_map.get(buf)
+                if pred is not None:
+                    result |= reachable_without(pred, excluded_bufs)
+            return result
+
+        # Identify output nodes: nodes whose buffers are NOT all consumed
+        # internally by other nodes in this kernel.
+        all_internal_reads: set[str] = set()
+        for node in nodes:
+            all_internal_reads |= get_internal_inputs(node)
+
+        output_nodes = []
+        for node in nodes:
+            bufs = buf_names_map[id(node)]
+            if not bufs or not bufs.issubset(all_internal_reads):
+                output_nodes.append(node)
+
+        fast_nodes: set[str] = set()
+        for node in nodes:
+            if not isinstance(node, scheduler.SchedulerNode):
+                continue
+            if not isinstance(node.node, ir.ComputedBuffer):
+                continue
+            if not isinstance(node.node.data, ir.Reduction):
+                continue
+            if node.node.data.reduction_type not in ("max", "min"):
+                continue
+
+            max_inputs = get_external_inputs(node)
+            if not max_inputs:
+                continue
+
+            max_bufs = frozenset(buf_names_map[id(node)])
+
+            # For every output node that transitively depends on this max,
+            # check that the max's inputs also reach it WITHOUT going
+            # through the max.
+            safe = True
+            for out_node in output_nodes:
+                out_internal = get_internal_inputs(out_node)
+                out_all_reachable = reachable_inputs[id(out_node)]
+
+                # If the output doesn't read max's inputs at all
+                # (transitively), it can't be affected by NaN either way
+                if not (out_all_reachable & max_inputs):
+                    continue
+
+                # If output IS the max node itself, it depends on the max
+                # but has no alternate path for NaN propagation
+                if out_node is node:
+                    safe = False
+                    break
+
+                # Check if max's buffers are in this output's transitive deps
+                if not (out_internal & max_bufs) and not any(
+                    max_bufs & reachable_inputs.get(id(writes_map[b]), set())
+                    for b in out_internal
+                    if b in writes_map
+                ):
+                    # Output doesn't depend on max at all
+                    continue
+
+                # Output depends on max. Check if max's inputs also reach
+                # this output without going through max.
+                reachable_alt = reachable_without(out_node, max_bufs)
+                if not max_inputs.issubset(reachable_alt):
+                    safe = False
+                    break
+
+            if safe:
+                fast_nodes.add(node.get_name())
+
+        return fast_nodes
+
     def codegen_node_schedule_with_kernel(self, node_schedule, kernel):
         with kernel:
+            # Pre-analyze which max/min reductions can skip NaN propagation
+            kernel.fast_reduction_nodes = self._compute_fast_reduction_nodes(
+                node_schedule
+            )
+
             stack = contextlib.ExitStack()
             all_indexing = {}
 
