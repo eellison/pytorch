@@ -209,6 +209,70 @@ def get_user_visible_output_strides(g: Graph) -> dict[Node, tuple[int, ...]]:
     return ret
 
 
+def _compute_base_strides_for_view(
+    node: Node, desired_strides: tuple[int, ...],
+) -> tuple[int, ...] | None:
+    """Given a view op node and desired output strides, compute what input strides
+    are needed so the view naturally produces those strides. Returns None if the
+    stride mapping can't be inverted (e.g., reshape with non-trivial index math)."""
+    target = node.target
+    base_val = node.args[0].meta.get("val")  # type: ignore[union-attr]
+    if base_val is None or not isinstance(base_val, torch.Tensor):
+        return None
+
+    if target in (aten.permute.default,):
+        perm = node.args[1]
+        base_strides = [0] * len(perm)
+        for view_dim, base_dim in enumerate(perm):
+            base_strides[base_dim] = desired_strides[view_dim]
+        return tuple(base_strides)
+
+    if target in (aten.transpose.int,):
+        dim0, dim1 = node.args[1], node.args[2]
+        ndim = base_val.ndim
+        dim0 = dim0 % ndim  # type: ignore[operator]
+        dim1 = dim1 % ndim  # type: ignore[operator]
+        base_strides = list(desired_strides)
+        base_strides[dim0], base_strides[dim1] = base_strides[dim1], base_strides[dim0]
+        return tuple(base_strides)
+
+    if target in (aten.t.default,) and base_val.ndim == 2:
+        return (desired_strides[1], desired_strides[0])
+
+    if target in (aten.unsqueeze.default,):
+        dim = node.args[1] % (base_val.ndim + 1)  # type: ignore[operator]
+        return tuple(s for i, s in enumerate(desired_strides) if i != dim)
+
+    return None
+
+
+def _propagate_view_strides_to_base(
+    user_visible_outputs: dict[Node, tuple[int, ...]],
+) -> None:
+    """For user-visible view outputs, compute what strides the non-view base
+    needs so that the view chain naturally produces the desired output strides.
+    Adds entries to user_visible_outputs for base nodes when computable."""
+    for node, strides in list(user_visible_outputs.items()):
+        if strides is None:
+            continue
+        current = node
+        current_strides = strides
+        while (
+            _is_view_op(current.target)
+            and current.args
+            and isinstance(current.args[0], torch.fx.Node)
+        ):
+            base_strides = _compute_base_strides_for_view(current, current_strides)
+            if base_strides is None:
+                break
+            base = current.args[0]
+            # Only set if not already constrained with specific strides
+            if base not in user_visible_outputs:
+                user_visible_outputs[base] = base_strides
+            current = base
+            current_strides = base_strides
+
+
 def extend_user_visible_output_strides(
     user_visible_outputs: dict[Node, tuple[int, ...]],
 ) -> dict[Node, object]:
@@ -503,6 +567,7 @@ class GraphLowering(torch.fx.Interpreter):
         )
         self._warned_fallback = OrderedSet(["aten.convolution_backward"])
         self.user_visible_output_strides = get_user_visible_output_strides(gm.graph)
+        _propagate_view_strides_to_base(self.user_visible_output_strides)
         mark_nodes_dislike_padding(gm.graph, self.user_visible_output_strides)
         self.cache_key: str = ""  # This is the cache key for the compiled artifact
         self.cache_path: str = ""  # This is the path in the filesystem where the compiled artifact is stored
@@ -1892,7 +1957,7 @@ class GraphLowering(torch.fx.Interpreter):
                 # Realize so that outputs are correctly aliased
                 result.realize()
 
-            if (is_output or is_input_for_as_strided) and isinstance(
+            if (is_output or is_input_for_as_strided or is_user_visible) and isinstance(
                 n.meta.get("val"), torch.Tensor
             ):
                 if is_user_visible:
@@ -1922,12 +1987,16 @@ class GraphLowering(torch.fx.Interpreter):
                             result.get_size(), torch.channels_last
                         )
                     if not unbacked_symbols_in_strides and len(strides):
-                        # To avoid converting possible view ops to a copy kernel, we use the previous
-                        # require_exact_strides to handle views. But ultimately it's better to require
-                        # the right strides at the tensor definition.
-                        if n.meta["val"]._is_view() or isinstance(
-                            result.data,
-                            ir.BaseView,
+                        # For views, we generally use require_stride_order to avoid
+                        # unnecessary copies. But for user-visible outputs we need
+                        # exact strides (e.g., pad_mm can create views with padded
+                        # base strides that have the same order but wrong values).
+                        if (
+                            n.meta["val"]._is_view()
+                            or isinstance(result.data, ir.BaseView)
+                        ) and (
+                            not is_user_visible
+                            or n.meta["val"].numel() in (0, 1)
                         ):
                             result = ir.ExternKernel.require_stride_order(
                                 result,
