@@ -2352,6 +2352,23 @@ class FusedNestedReductions(FusedSchedulerNode):
             node1.scheduler, list(node1.get_nodes()) + list(node2.get_nodes())
         )
 
+    def can_fuse_with(self, other: BaseSchedulerNode) -> bool:
+        """Allow downstream pointwise of node2 to fuse in."""
+        if other.is_reduction():
+            return False
+        node2_names = self.node2.get_buffer_names()
+        if not any(dep.name in node2_names for dep in other.unmet_dependencies):
+            return False
+        return self.scheduler.can_fuse(
+            self.node2, other, allow_nested_reduction=False
+        )
+
+    def fuse_with(self, other: BaseSchedulerNode) -> "FusedNestedReductions":
+        device = self.node2.get_device()
+        backend = self.scheduler.get_backend(device)
+        new_node2 = backend.fuse(self.node2, other)
+        return FusedNestedReductions(self.node1, new_node2)
+
 
 class FusedExternTritonKernelSchedulerNode(FusedSchedulerNode):
     def __init__(
@@ -5829,6 +5846,7 @@ class Scheduler:
         node2: BaseSchedulerNode,
         can_reorder: bool = False,
         allow_mix_order_reduction: bool = True,
+        allow_nested_reduction: bool = True,
     ) -> bool:
         """
         Determine if it is possible to combine node1 and node2 into a
@@ -5844,10 +5862,9 @@ class Scheduler:
             if stream1 is not None and stream2 is not None and stream1 != stream2:
                 return False
 
-        if isinstance(node1, FusedNestedReductions) or isinstance(
-            node2, FusedNestedReductions
-        ):
-            # Don't fuse additional nodes into a FusedNestedReductions
+        if isinstance(node1, FusedNestedReductions):
+            return node1.can_fuse_with(node2)
+        if isinstance(node2, FusedNestedReductions):
             return False
 
         if isinstance(node1, FusedMixOrderReductions):
@@ -6014,7 +6031,10 @@ class Scheduler:
         del device2
 
         shared_data_score = self.score_fusion_memory(
-            node1, node2, allow_mix_order_reduction=allow_mix_order_reduction
+            node1,
+            node2,
+            allow_mix_order_reduction=allow_mix_order_reduction,
+            allow_nested_reduction=allow_nested_reduction,
         )
         assert isinstance(shared_data_score, int)
 
@@ -6255,6 +6275,7 @@ class Scheduler:
         count_bytes: bool = True,
         return_is_mix_order_reduction: bool = False,
         allow_mix_order_reduction: bool = True,
+        allow_nested_reduction: bool = True,
     ) -> int | tuple[int, int, bool]:
         """
         The first term in our fusion score that estimates number of saved
@@ -6280,7 +6301,7 @@ class Scheduler:
                 return (score, buffer_overlap_score, is_mix_order_reduction)
             return score + buffer_overlap_score
 
-        if NestedReduction.can_fuse(node1, node2):
+        if allow_nested_reduction and NestedReduction.can_fuse(node1, node2):
             score = NestedReduction.get_fusion_score(node1, node2)
             return _construct_return_value(score, 0, False)
 
@@ -7909,6 +7930,8 @@ class BaseScheduling:  # noqa: docstring_linter
             return FusedNestedReductions(node1, node2)
         elif MixOrderReduction.are_mix_order_reductions(node1, node2):
             return FusedMixOrderReductions(node1, node2)
+        elif isinstance(node1, FusedNestedReductions):
+            return node1.fuse_with(node2)
         elif isinstance(node1, FusedMixOrderReductions):
             return node1.fuse_with(node2)
         elif isinstance(node1, ExternKernelSchedulerNode) and isinstance(

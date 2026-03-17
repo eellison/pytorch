@@ -1884,19 +1884,34 @@ class SIMDScheduling(BaseScheduling):
         topk = rnumel2
         sizevars = V.graph.sizevars
 
+        # Split node2 into the reduction subnode and any epilogue pointwise
+        # subnodes (e.g., fused via can_fuse_with: out * scale + bias).
+        sn2 = None
+        sn2_epilogue: list[scheduler.SchedulerNode] = []
+        for sn in node2.get_nodes():
+            if sn.is_reduction():
+                assert sn2 is None
+                sn2 = sn
+            else:
+                sn2_epilogue.append(sn)
+        assert sn2 is not None
+
         # Determine which dimension contains topk by checking node2's body.
         # iter_vars are ordered [outer, inner]. The outer dim is always
         # batch. If batch == numel1, topk is embedded in r (node1's r dim
         # contains groups*topk). Otherwise topk is in x (node1's x dim
         # contains batch*topk). We check only the outer iter_var to avoid
         # ambiguity when numel1 == rnumel1.
-        sn2 = list(node2.get_nodes())[0]
         body = sn2._body
         small_dim_in_r = sizevars.statically_known_equals(
             body.var_ranges[body.iter_vars[0]], numel1
         )
 
         # ---- Build pass 1 schedule and kernel ----
+        # TODO: kernel_features only sees node1's schedule. Node2 and epilogue
+        # have different iteration spaces so can't be added to the same
+        # schedule, but their buffer accesses could affect heuristics
+        # (persistent reduction, register pressure, index dtype).
         nodes1 = list(node1.get_nodes())
         combined_schedule = self.generate_node_schedule(nodes1, numel1, rnumel1)
         kernel_features = SIMDKernelFeatures(combined_schedule, numel1, rnumel1)
@@ -1923,15 +1938,33 @@ class SIMDScheduling(BaseScheduling):
         }
 
         # ---- Prepare pass 2 output ----
-        node2_write_names = {dep.name for dep in node2.read_writes.writes}
-        node2_output_name = next(iter(node2_write_names))
-        kernel.args.output(node2_output_name)
+        # Find the reduction's output buffer name
+        node2_reduction_write_names = {
+            dep.name for dep in sn2.read_writes.writes
+        }
+        node2_reduction_output_name = next(iter(node2_reduction_write_names))
 
-        epilogue_node, node2_output_name = (
-            self._try_absorb_epilogue_dtype_conversion(
-                kernel, node2_output_name, node2_write_names
+        epilogue_node = None
+        if sn2_epilogue:
+            # Epilogue pointwise was fused via can_fuse_with. The reduction's
+            # intermediate buffer is consumed in-register via CSE cache — no
+            # need to register it as a kernel argument.
+            # Register the final output buffer(s) from the epilogue.
+            for ep_sn in sn2_epilogue:
+                for dep in ep_sn.read_writes.writes:
+                    kernel.args.output(dep.name)
+            node2_output_name = node2_reduction_output_name
+        else:
+            # No fused epilogue subnodes — try the legacy dtype conversion
+            # absorption (single consumer doing only a dtype cast).
+            node2_write_names = {dep.name for dep in node2.read_writes.writes}
+            node2_output_name = node2_reduction_output_name
+            kernel.args.output(node2_output_name)
+            epilogue_node, node2_output_name = (
+                self._try_absorb_epilogue_dtype_conversion(
+                    kernel, node2_output_name, node2_write_names
+                )
             )
-        )
 
         # ---- Find range trees ----
         x_tree = r_tree = None
@@ -2012,6 +2045,17 @@ class SIMDScheduling(BaseScheduling):
             r_bound = _pass2_bound(r_tree)
 
             # ---- Pass 2 ops handler ----
+            has_epilogue = bool(sn2_epilogue)
+            # DeferredLine name: use the final output buffer (not the
+            # intermediate) so lines survive removed_buffers.
+            if sn2_epilogue:
+                last_ep = sn2_epilogue[-1]
+                deferred_line_name = next(
+                    iter(dep.name for dep in last_ep.read_writes.writes)
+                )
+            else:
+                deferred_line_name = node2_output_name
+
             class _Pass2OpsHandler(WrapperHandler):
                 def __init__(self, inner, node1_cse_vars, kernel, store_name):
                     super().__init__(inner)
@@ -2048,20 +2092,30 @@ class SIMDScheduling(BaseScheduling):
                     from ..codegen.common import DeferredLine
 
                     k = self._kernel
-                    var = k.args.output(self._store_name)
                     idx_str = k.index_to_str(index.subs(subs_map))
 
+                    # Emit pass2 coordinate setup to compute buffer so
+                    # epilogue loads can reference pass2_mask.
                     for line in [
                         f"{x_sym} = {x_expr}",
                         f"{r_sym} = {r_expr}",
                         f"pass2_idx = {idx_str}",
                         f"pass2_mask = ({x_sym} < {x_bound})"
                         f" & ({r_sym} < {r_bound})",
-                        f"tl.store({var} + pass2_idx,"
-                        f" {value}, pass2_mask)",
                     ]:
+                        k.compute.writeline(line)
+
+                    if has_epilogue:
+                        # Defer store: save value for epilogue to consume
+                        k.cse.store_cache[name] = value
+                    else:
+                        var = k.args.output(self._store_name)
                         k.stores.writeline(
-                            DeferredLine(self._store_name, line)
+                            DeferredLine(
+                                deferred_line_name,
+                                f"tl.store({var} + pass2_idx,"
+                                f" {value}, pass2_mask)",
+                            )
                         )
 
             handler = _Pass2OpsHandler(
@@ -2074,6 +2128,114 @@ class SIMDScheduling(BaseScheduling):
                     reduce_remapped,
                     allow_same_symbol_in_index=True,
                 )
+
+            # ---- Process epilogue pointwise subnodes ----
+            if sn2_epilogue:
+                # Compute flat index from pass 2's iter_vars for remapping
+                # epilogues that may have a different iteration decomposition.
+                pass2_ranges = [
+                    body.var_ranges[v] for v in body.iter_vars
+                ]
+                pass2_flat = iter_remapped[0]
+                for i in range(1, len(body.iter_vars)):
+                    pass2_flat = (
+                        pass2_flat * pass2_ranges[i] + iter_remapped[i]
+                    )
+
+                for ep_sn in sn2_epilogue:
+                    ep_body = ep_sn._body
+                    # Map epilogue iter_vars to pass 2 variables.
+                    # Try matching by range first (same decomposition).
+                    # Fall back to reconstructing from the flat index.
+                    ep_iter_remapped = []
+                    all_matched = len(ep_body.iter_vars) == len(body.iter_vars)
+                    if all_matched:
+                        for ev, (pv, pr) in zip(
+                            ep_body.iter_vars,
+                            zip(iter_remapped, pass2_ranges),
+                        ):
+                            ev_range = ep_body.var_ranges[ev]
+                            if not sizevars.statically_known_equals(
+                                ev_range, pr
+                            ):
+                                all_matched = False
+                                break
+                            ep_iter_remapped.append(pv)
+
+                    if not all_matched:
+                        # Different decomposition: recompute from flat index
+                        ep_iter_remapped = []
+                        remaining = pass2_flat
+                        ep_vars = list(ep_body.iter_vars)
+                        for i, ev in enumerate(ep_vars):
+                            ev_range = ep_body.var_ranges[ev]
+                            # stride = product of all subsequent ranges
+                            stride = sympy.Integer(1)
+                            for j in range(i + 1, len(ep_vars)):
+                                stride = stride * ep_body.var_ranges[
+                                    ep_vars[j]
+                                ]
+                            ep_iter_remapped.append(
+                                FloorDiv(remaining, stride)
+                            )
+                            remaining = ModularIndexing(
+                                remaining, 1, ev_range
+                            )
+
+                    ep_write_names = {
+                        dep.name for dep in ep_sn.read_writes.writes
+                    }
+                    ep_output_name = next(iter(ep_write_names))
+
+                    class _EpilogueOpsHandler(WrapperHandler):
+                        def __init__(self, inner, kernel, output_name):
+                            super().__init__(inner)
+                            self._kernel = kernel
+                            self._output_name = output_name
+
+                        def load(self, name, index):
+                            k = self._kernel
+                            if name in k.cse.store_cache:
+                                return k.cse.store_cache[name]
+                            # Manual load using pass2 coordinates
+                            var = k.args.input(name)
+                            idx_str = k.index_to_str(
+                                index.subs(subs_map)
+                            )
+                            dtype = V.graph.get_dtype(name)
+                            return k.cse.generate(
+                                k.compute,
+                                f"tl.load({var} + ({idx_str}),"
+                                f" pass2_mask, other=0.0)",
+                                dtype=dtype,
+                                shape=output_shape,
+                            )
+
+                        def store(self, name, index, value, mode=None):
+                            from ..codegen.common import DeferredLine
+
+                            k = self._kernel
+                            var = k.args.output(self._output_name)
+                            idx_str = k.index_to_str(
+                                index.subs(subs_map)
+                            )
+                            k.stores.writeline(
+                                DeferredLine(
+                                    self._output_name,
+                                    f"tl.store({var} + ({idx_str}),"
+                                    f" {value}, pass2_mask)",
+                                )
+                            )
+                            k.cse.store_cache[name] = value
+
+                    ep_handler = _EpilogueOpsHandler(
+                        V.get_ops_handler(),
+                        kernel=kernel,
+                        output_name=ep_output_name,
+                    )
+                    with V.set_ops_handler(ep_handler), \
+                            kernel.set_current_node(ep_sn):
+                        ep_body(ep_iter_remapped)
 
             # Pass 2 stores directly per r-iteration, not after the loop
             kernel.post_loop_combine.clear()
@@ -2096,6 +2258,11 @@ class SIMDScheduling(BaseScheduling):
                 for sn in epilogue_node.get_nodes():
                     sn.mark_run()
                 self.scheduler.removed_ops.add(epilogue_node.get_name())
+
+        # Remove intermediate buffer after codegen (deferred so DeferredLine
+        # doesn't suppress pass2 setup lines during codegen).
+        if sn2_epilogue:
+            V.graph.removed_buffers.add(node2_reduction_output_name)
 
         self.codegen_comment(
             [n for n in combined_schedule if isinstance(n, BaseSchedulerNode)],
