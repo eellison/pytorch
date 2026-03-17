@@ -2640,6 +2640,7 @@ def triton_config_reduction(
     reduction_hint=None,
     min_num_warps=None,
     min_xblock=None,
+    min_rblock=None,
 ) -> Config:
     """
     Construct a reduction triton config with some adjustment heuristics
@@ -2655,6 +2656,12 @@ def triton_config_reduction(
     # Enforce minimum XBLOCK (e.g. for nested reduction reshape)
     if min_xblock is not None:
         x = max(x, min_xblock)
+
+    # Enforce minimum RBLOCK (e.g. for nested reduction reshape in r-dim)
+    if min_rblock is not None:
+        for prefix in sorted(rnumels):
+            rnumels[prefix] = max(rnumels[prefix], min_rblock)
+            break  # only enforce on the innermost r dimension
 
     def total_numel() -> int:
         return conditional_product(x, *rnumels.values())
@@ -3224,6 +3231,7 @@ def _reduction_configs(
             raise NotImplementedError("native matmul only supports mm/bmm pattern")
 
     min_xblock = inductor_meta.get("min_xblock")
+    min_rblock = inductor_meta.get("min_rblock")
 
     def make_config(
         x,
@@ -3260,6 +3268,8 @@ def _reduction_configs(
                 waves_per_eu=waves_per_eu,
                 dynamic_scale_rblock=dynamic_scale_rblock,
                 reduction_hint=reduction_hint,
+                min_xblock=min_xblock,
+                min_rblock=min_rblock,
             )
 
     def outer_config_opt():
@@ -3737,6 +3747,8 @@ def _persistent_reduction_configs(
     else:
         xblock_vals = [1, 8, 32, 128]
 
+    min_xblock = inductor_meta.get("min_xblock") if inductor_meta else None
+    min_rblock = inductor_meta.get("min_rblock") if inductor_meta else None
     if "y" not in size_hints:
         configs = [
             triton_config_reduction(
@@ -3745,6 +3757,8 @@ def _persistent_reduction_configs(
                 rnumel,
                 register_intensive=True,
                 reduction_hint=reduction_hint,
+                min_xblock=min_xblock,
+                min_rblock=min_rblock,
             )
             for xblock in xblock_vals
             if xblock == 1
@@ -3752,7 +3766,6 @@ def _persistent_reduction_configs(
         ]
     else:
         configs = []
-        min_xblock = inductor_meta.get("min_xblock") if inductor_meta else None
         tiling_scores = _get_tiling_scores(inductor_meta, size_hints)
         x_y_scores = {dim: tiling_scores[dim] for dim in ("x", "y")}
         for target_block_size in xblock_vals:

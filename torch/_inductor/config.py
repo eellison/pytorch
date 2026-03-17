@@ -1845,7 +1845,7 @@ class triton:
     # Fuse dependent cross-axis reductions (e.g., reduction over DIM followed
     # by a consumer that re-reads the same large input and reduces over a small
     # dimension like TOPK) into a single kernel with two sequential passes.
-    nested_reduction = False
+    nested_reduction = True
 
     # Map for storing the amount of kernel runs with dumped input tensors
     # Based on hash of Triton source code to avoid bloating the folder

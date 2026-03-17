@@ -426,9 +426,11 @@ class NestedReduction:
     fused into a single kernel with two sequential reduction loops. The pattern
     is: node1 reduces over a large dimension (e.g. DIM) producing a small
     output, and node2 re-reads node1's large input while also consuming
-    node1's output, reducing over a small dimension (e.g. TOPK).
+    node1's output, reducing over a small dimension (e.g. TOPK or group size).
 
-    Example: y = sum_k(rmsnorm(x_k) * w_k) where x is [B, TOPK, DIM].
+    Examples:
+    - rmsnorm + weighted sum: y = sum_k(rmsnorm(x_k) * w_k), x is [B, TOPK, DIM]
+    - layernorm + block amax: amax over groups of 16 after layer_norm
     """
 
     # Maximum size for the "small" reduction in node2 that can be unrolled
@@ -472,9 +474,8 @@ class NestedReduction:
             return False
 
         # node2 must be a reduction with a small, static, power-of-2 rnumel
-        # (TOPK dimension that gets reduced via tl.reshape + tl.sum).
-        # TOPK must be statically known because it's used as tl.constexpr
-        # in the reshape trick.
+        # that gets reduced via tl.reshape + tl.sum/tl.max inside the fused
+        # kernel. Must be statically known for the reshape dimensions.
         if not node2.is_reduction():
             return False
         if not isinstance(rnumel2, (int, sympy.Integer)):
@@ -482,7 +483,7 @@ class NestedReduction:
         rnumel2_hint = int(rnumel2)
         if rnumel2_hint > cls.MAX_SMALL_REDUCTION or rnumel2_hint < 1:
             return False
-        # TOPK must be power of 2 (YBLOCK must be power-of-2 for Triton)
+        # Must be power of 2 for the tl.reshape trick (block sizes are pow2)
         if rnumel2_hint & (rnumel2_hint - 1) != 0:
             return False
 

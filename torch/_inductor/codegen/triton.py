@@ -5636,6 +5636,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
         if self.nested_reduction_min_xblock is not None:
             inductor_meta["min_xblock"] = self.nested_reduction_min_xblock
+        if self.nested_reduction_min_rblock is not None:
+            inductor_meta["min_rblock"] = self.nested_reduction_min_rblock
 
         if self.tma_min_block_sizes:
             inductor_meta["tma_min_block_sizes"] = self.tma_min_block_sizes
