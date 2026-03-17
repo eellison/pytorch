@@ -461,6 +461,7 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
         self.initialize_range_tree(pid_cache)
 
         self.rsplit_size = 0
+        self.nested_reduction_min_xblock: int | None = None
         self.saved_partial_accumulate: list[PartialAccumulate] = []
 
     def codegen_template_body(
@@ -1862,6 +1863,10 @@ class SIMDScheduling(BaseScheduling):
         )
         kernel = kernels[0]
 
+        # XBLOCK must cover the full TOPK so tl.sum(value, 1) is correct.
+        topk_hint = V.graph.sizevars.optimization_hint(topk, fallback=8)
+        kernel.nested_reduction_min_xblock = topk_hint
+
         # Codegen pass 1
         self.codegen_node_schedule_with_kernel(combined_schedule, kernel)
 
@@ -1987,18 +1992,28 @@ class SIMDScheduling(BaseScheduling):
                     return self._inner.load(name, index)
 
                 def reduction(self, dtype, src_dtype, reduction_type, value):
-                    # Sum over x (TOPK): [YBLOCK, XBLOCK, RBLOCK] -> [YBLOCK, RBLOCK]
+                    # Sum over x (TOPK): [YBLOCK, XBLOCK, RBLOCK] -> [YBLOCK, 1, RBLOCK]
+                    # Keep 3D with size-1 x dim so the store's index/mask
+                    # (also [YBLOCK, 1, RBLOCK]) can broadcast against it.
                     return self._kernel.cse.generate(
-                        self._kernel.compute, f"tl.sum({value}, 1)",
+                        self._kernel.compute,
+                        f"tl.sum({value}, 1)[:, None, :]",
                         dtype=dtype,
-                        shape=value.shape[:1] + value.shape[2:],
+                        shape=value.shape[:1] + (1,) + value.shape[2:],
                     )
 
                 def store_reduction(self, name, index, value):
-                    # Store via kernel's codegen (handles indexing + masking).
-                    # Bypass CSEProxy to avoid store_cache lookup on
-                    # current_node (which doesn't own the epilogue buffer).
-                    self._kernel.store(self._store_name, index, value, mode=None)
+                    # The output index only references y and r (not x), so
+                    # use non-dense indexing to get [YBLOCK, 1, RBLOCK]
+                    # index/mask — matching value's shape with no redundant
+                    # writes across the x dimension.
+                    from ..codegen.common import DeferredLine
+
+                    k = self._kernel
+                    var = k.args.output(self._store_name)
+                    indexing = k.indexing(index, dense_indexing=False)
+                    line = f"tl.store({var} + ({indexing.index_str}), {value}, {indexing.mask_str})"
+                    k.stores.writeline(DeferredLine(self._store_name, line))
 
             handler = _Pass2OpsHandler(
                 V.get_ops_handler(), node1_cse_vars, node1_output_names,

@@ -2817,7 +2817,14 @@ def _handle_combo_kernel_per_subkernel_blocks(
 
 
 def triton_config_tiled_reduction(
-    size_hints, x, y, r, num_stages=1, register_intensive=False, waves_per_eu=None
+    size_hints,
+    x,
+    y,
+    r,
+    num_stages=1,
+    register_intensive=False,
+    waves_per_eu=None,
+    min_xblock=None,
 ):
     """
     Construct a tile reduction triton config with some adjustment
@@ -2830,6 +2837,11 @@ def triton_config_tiled_reduction(
     # shrink sizes to size hints
     x = min(x, size_hints["x"])
     y = min(y, size_hints["y"])
+
+    # Enforce minimum XBLOCK (e.g. for nested reduction where
+    # tl.sum over x requires all elements in one block)
+    if min_xblock is not None:
+        x = max(x, min_xblock)
 
     def total_numel() -> int:
         return conditional_product(x, y, *rnumels.values())
@@ -3211,6 +3223,8 @@ def _reduction_configs(
         else:
             raise NotImplementedError("native matmul only supports mm/bmm pattern")
 
+    min_xblock = inductor_meta.get("min_xblock")
+
     def make_config(
         x,
         r,
@@ -3232,6 +3246,7 @@ def _reduction_configs(
                 num_stages=num_stages,
                 register_intensive=register_intensive,
                 waves_per_eu=waves_per_eu,
+                min_xblock=min_xblock,
             )
         else:
             # For other cases, use the original function
@@ -3441,6 +3456,7 @@ def adapt_config_for_tiling(
     register_intensive=False,
     persistent_reduction=False,
     waves_per_eu=None,
+    min_xblock=None,
 ) -> Config:
     """
     Create an adapted configuration based on tiling scores,
@@ -3460,6 +3476,7 @@ def adapt_config_for_tiling(
         num_stages=num_stages,
         register_intensive=register_intensive,
         waves_per_eu=waves_per_eu,
+        min_xblock=min_xblock,
     )
 
 
@@ -3735,6 +3752,7 @@ def _persistent_reduction_configs(
         ]
     else:
         configs = []
+        min_xblock = inductor_meta.get("min_xblock") if inductor_meta else None
         tiling_scores = _get_tiling_scores(inductor_meta, size_hints)
         x_y_scores = {dim: tiling_scores[dim] for dim in ("x", "y")}
         for target_block_size in xblock_vals:
@@ -3746,7 +3764,11 @@ def _persistent_reduction_configs(
             )
             configs.append(
                 triton_config_tiled_reduction(
-                    size_hints, block_sizes["x"], block_sizes["y"], rnumel
+                    size_hints,
+                    block_sizes["x"],
+                    block_sizes["y"],
+                    rnumel,
+                    min_xblock=min_xblock,
                 )
             )
 

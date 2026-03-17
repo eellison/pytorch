@@ -5634,6 +5634,9 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         if self.tiling_scores:
             inductor_meta["tiling_scores"] = self.tiling_scores
 
+        if self.nested_reduction_min_xblock is not None:
+            inductor_meta["min_xblock"] = self.nested_reduction_min_xblock
+
         if self.tma_min_block_sizes:
             inductor_meta["tma_min_block_sizes"] = self.tma_min_block_sizes
 
