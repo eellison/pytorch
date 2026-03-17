@@ -420,6 +420,111 @@ class MixOrderReduction:
         return True
 
 
+class NestedReduction:
+    """
+    Detects when a reduction node (node1) and its consumer (node2) can be
+    fused into a single kernel with two sequential reduction loops. The pattern
+    is: node1 reduces over a large dimension (e.g. DIM) producing a small
+    output, and node2 re-reads node1's large input while also consuming
+    node1's output, reducing over a small dimension (e.g. TOPK).
+
+    Example: y = sum_k(rmsnorm(x_k) * w_k) where x is [B, TOPK, DIM].
+    """
+
+    # Maximum size for the "small" reduction in node2 that can be unrolled
+    MAX_SMALL_REDUCTION = 32
+
+    @classmethod
+    def can_fuse(cls, node1: BaseSchedulerNode, node2: BaseSchedulerNode) -> bool:
+        if not config.triton.nested_reduction:
+            return False
+
+        if V.graph.cpp_wrapper:
+            return False
+
+        if not node1.is_gpu() or not node2.is_gpu():
+            return False
+        device_type = node1.get_device().type  # type: ignore[union-attr]
+        if (
+            device_type not in ("cuda", "xpu")
+            or get_current_backend(device_type) != "triton"
+        ):
+            return False
+
+        # node1 must be a reduction, node2 must depend on node1 (vertical)
+        if not node1.is_reduction():
+            return False
+        if not (node1.get_operation_names() & node2.ancestors):
+            return False
+
+        # Both must read a common input buffer
+        shared_reads = cls.get_shared_input_reads(node1, node2)
+        if not shared_reads:
+            return False
+
+        # Get iteration spaces
+        _, (numel1, rnumel1) = node1.group
+        _, (numel2, rnumel2) = node2.group
+
+        # node1's rnumel (the large reduction dim) should be large
+        rnumel1_hint = V.graph.sizevars.optimization_hint(rnumel1, fallback=0)
+        if rnumel1_hint < 256:
+            return False
+
+        # node2 must be a reduction with a small, static, power-of-2 rnumel
+        # (TOPK dimension that gets reduced via tl.reshape + tl.sum).
+        # TOPK must be statically known because it's used as tl.constexpr
+        # in the reshape trick.
+        if not node2.is_reduction():
+            return False
+        if not isinstance(rnumel2, (int, sympy.Integer)):
+            return False
+        rnumel2_hint = int(rnumel2)
+        if rnumel2_hint > cls.MAX_SMALL_REDUCTION or rnumel2_hint < 1:
+            return False
+        # TOPK must be power of 2 (YBLOCK must be power-of-2 for Triton)
+        if rnumel2_hint & (rnumel2_hint - 1) != 0:
+            return False
+
+        # The total element count should match:
+        # numel1 * rnumel1 == numel2 * rnumel2 (they traverse the same data)
+        total1 = V.graph.sizevars.simplify(numel1 * rnumel1)
+        total2 = V.graph.sizevars.simplify(numel2 * rnumel2)
+        if not V.graph.sizevars.statically_known_equals(total1, total2):
+            return False
+
+        return True
+
+    @classmethod
+    def get_shared_input_reads(
+        cls, node1: BaseSchedulerNode, node2: BaseSchedulerNode
+    ) -> OrderedSet[str]:
+        """Return input buffer names read by both nodes (excluding node1's outputs)."""
+        names1 = {dep.name for dep in node1.read_writes.reads}
+        names2 = {dep.name for dep in node2.read_writes.reads}
+        # Exclude node1's own outputs — those are the intermediate reduction results
+        node1_outputs = node1.get_buffer_names()
+        return OrderedSet((names1 & names2) - node1_outputs)
+
+    @classmethod
+    def get_fusion_score(
+        cls, node1: BaseSchedulerNode, node2: BaseSchedulerNode
+    ) -> int:
+        """Score is the total byte size of shared input buffers."""
+        shared = cls.get_shared_input_reads(node1, node2)
+        score = 0
+        for dep in node1.read_writes.reads:
+            if dep.name in shared:
+                score += V.graph.get_dep_size_hint(dep, count_bytes=True)
+        return score
+
+    @classmethod
+    def are_nested_reductions(
+        cls, node1: BaseSchedulerNode, node2: BaseSchedulerNode
+    ) -> bool:
+        return cls.can_fuse(node1, node2)
+
+
 @dataclasses.dataclass
 class SchedulerBuffer:
     scheduler: Scheduler
@@ -2230,6 +2335,21 @@ class FusedMixOrderReductions(FusedSchedulerNode):
             else:
                 fused_node = backend.fuse(self.node2, other)
                 return FusedMixOrderReductions(self.node1, fused_node)
+
+
+class FusedNestedReductions(FusedSchedulerNode):
+    """
+    Fused node for two dependent reductions that share a large input.
+    node1 is the producer reduction, node2 is the consumer that re-reads
+    the same large input.
+    """
+
+    def __init__(self, node1: BaseSchedulerNode, node2: BaseSchedulerNode) -> None:
+        self.node1 = node1  # the reduction (producer)
+        self.node2 = node2  # the consumer that re-reads the large input
+        super().__init__(
+            node1.scheduler, list(node1.get_nodes()) + list(node2.get_nodes())
+        )
 
 
 class FusedExternTritonKernelSchedulerNode(FusedSchedulerNode):
@@ -5723,6 +5843,12 @@ class Scheduler:
             if stream1 is not None and stream2 is not None and stream1 != stream2:
                 return False
 
+        if isinstance(node1, FusedNestedReductions) or isinstance(
+            node2, FusedNestedReductions
+        ):
+            # Don't fuse additional nodes into a FusedNestedReductions
+            return False
+
         if isinstance(node1, FusedMixOrderReductions):
             return node1.can_fuse_with(node2)
         if isinstance(node2, FusedMixOrderReductions):
@@ -5990,6 +6116,10 @@ class Scheduler:
             # Examples here include:
             #   - MemoryDep("foo", x) != MemoryDep("foo", x + 1)
             #   - MemoryDep("foo", x) != StarDep("foo")
+            # Nested reductions are expected to have mismatched deps because
+            # node2 reads node1's output with a different iteration space.
+            if NestedReduction.can_fuse(node1, node2):
+                return True
             why("memory deps did not match")
             return False
 
@@ -6148,6 +6278,10 @@ class Scheduler:
             if return_is_mix_order_reduction:
                 return (score, buffer_overlap_score, is_mix_order_reduction)
             return score + buffer_overlap_score
+
+        if NestedReduction.can_fuse(node1, node2):
+            score = NestedReduction.get_fusion_score(node1, node2)
+            return _construct_return_value(score, 0, False)
 
         if allow_mix_order_reduction and MixOrderReduction.can_fuse(node1, node2):
             # The fusion score for mix order reduction only count
@@ -7493,6 +7627,9 @@ class Scheduler:
                 else:
                     raise AssertionError(f"{type(self)=}")
                 backend.codegen_combo_kernel(node)
+            elif isinstance(node, FusedNestedReductions):
+                # pyrefly: ignore [unbound-name]
+                self.get_backend(device).codegen_nested_reduction(node)
             elif isinstance(node, FusedMixOrderReductions):
                 # pyrefly: ignore [unbound-name]
                 self.get_backend(device).codegen_mix_order_reduction(node)
@@ -7767,6 +7904,8 @@ class BaseScheduling:  # noqa: docstring_linter
         """
         if node1.is_foreach() or node2.is_foreach():
             return ForeachKernelSchedulerNode.fuse(node1, node2)
+        elif NestedReduction.are_nested_reductions(node1, node2):
+            return FusedNestedReductions(node1, node2)
         elif MixOrderReduction.are_mix_order_reductions(node1, node2):
             return FusedMixOrderReductions(node1, node2)
         elif isinstance(node1, FusedMixOrderReductions):

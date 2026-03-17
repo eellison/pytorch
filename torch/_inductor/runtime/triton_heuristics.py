@@ -2639,6 +2639,7 @@ def triton_config_reduction(
     dynamic_scale_rblock=True,
     reduction_hint=None,
     min_num_warps=None,
+    min_xblock=None,
 ) -> Config:
     """
     Construct a reduction triton config with some adjustment heuristics
@@ -2650,6 +2651,10 @@ def triton_config_reduction(
 
     # shrink sizes to size hints
     x = min(x, size_hints["x"])
+
+    # Enforce minimum XBLOCK (e.g. for nested reduction reshape)
+    if min_xblock is not None:
+        x = max(x, min_xblock)
 
     def total_numel() -> int:
         return conditional_product(x, *rnumels.values())

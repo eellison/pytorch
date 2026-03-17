@@ -1842,6 +1842,11 @@ class triton:
         os.environ.get("TORCHINDUCTOR_MIX_ORDER_REDUCTION_ALLOW_MULTI_STAGES") == "1"
     )
 
+    # Fuse dependent cross-axis reductions (e.g., reduction over DIM followed
+    # by a consumer that re-reads the same large input and reduces over a small
+    # dimension like TOPK) into a single kernel with two sequential passes.
+    nested_reduction = False
+
     # Map for storing the amount of kernel runs with dumped input tensors
     # Based on hash of Triton source code to avoid bloating the folder
     debug_dump_kernel_inputs: dict[str, int] = {}

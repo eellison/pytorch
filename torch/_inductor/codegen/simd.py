@@ -1323,6 +1323,15 @@ class SIMDScheduling(BaseScheduling):
         ):
             return scheduler.ForeachKernelSchedulerNode.can_fuse(node1, node2)
 
+        # Nested reduction bypass: the numel/rnumel compatibility checks below
+        # would reject this fusion because node1 and node2 have different
+        # iteration spaces. The NestedReduction class has already validated
+        # that these can be fused.
+        from torch._inductor.scheduler import NestedReduction
+
+        if NestedReduction.can_fuse(node1, node2):
+            return True
+
         _, (numel1, rnumel1) = node1.group
         _, (numel2, rnumel2) = node2.group
         why = WhyNoFuse(node1, node2)
@@ -1804,6 +1813,238 @@ class SIMDScheduling(BaseScheduling):
 
         if node2_epilogue:
             self._codegen_nodes(node2_epilogue)
+
+        self.free_buffers_in_scheduler()
+
+    def codegen_nested_reduction(self, node):
+        """
+        Generate a single kernel with two sequential reduction passes for
+        dependent cross-axis reductions that share a large input.
+
+        Uses 3D tiling: y=B, x=TOPK, r=DIM.
+
+        Pass 1: node1's reduction (e.g., reduce x over DIM -> [B, TOPK])
+        Coefficient: node2's pointwise sub-nodes that transform node1's output
+                     (e.g., /N, +eps, sqrt) are codegen'd after pass 1 using
+                     the standard codegen infrastructure.
+        Pass 2: second loop over DIM that re-reads the shared input (L1/L2
+                 cache hit), applies the coefficient from above, and sums
+                 over TOPK via tl.sum(value, 1).
+        """
+        node1, node2 = node.node1, node.node2
+
+        _, (numel1, rnumel1) = node1.group  # (B*TOPK, DIM)
+        _, (_, rnumel2) = node2.group  # (B*DIM, TOPK)
+
+        topk = rnumel2
+
+        node1_output_names = set(node1.get_buffer_names())
+
+        # ---- Build pass 1 node schedule ----
+        nodes1 = list(node1.get_nodes())
+        combined_schedule = self.generate_node_schedule(nodes1, numel1, rnumel1)
+
+        kernel_features = SIMDKernelFeatures(combined_schedule, numel1, rnumel1)
+
+        # 3D tiling: y=B, x=TOPK, r=DIM
+        # Order matters: _split_iteration_ranges decomposes flat_iter as
+        # y0*TOPK + x0, so y0=batch (outer) and x0=topk (inner, stride 1),
+        # matching the [B, TOPK] layout of node1's iteration space.
+        batch = FloorDiv(numel1, topk)
+        tiling = self.create_tiling([batch, topk], [rnumel1])
+        kernels = self.create_kernel_choices(
+            kernel_features,
+            [tiling],
+            {
+                "features": kernel_features,
+                "tiling_scores": None,
+            },
+        )
+        kernel = kernels[0]
+
+        # Codegen pass 1
+        self.codegen_node_schedule_with_kernel(combined_schedule, kernel)
+
+        # ---- Get node1's output CSE variables (in-register values) ----
+        # The store still happens (writes to memory) but pass 2 reads the
+        # register value directly via the CSE cache.
+        node1_cse_vars = {}
+        for name in node1_output_names:
+            if name in kernel.cse.store_cache:
+                node1_cse_vars[name] = kernel.cse.store_cache[name]
+
+        # ---- Prepare pass 2 ----
+        node2_write_names = {dep.name for dep in node2.read_writes.writes}
+
+        # Get range tree info (3D: y=B, x=TOPK, r=DIM)
+        y_tree = None
+        x_tree = None
+        r_tree = None
+        for tree in kernel.range_trees:
+            if tree.prefix == "y":
+                y_tree = tree
+            elif tree.prefix == "x":
+                x_tree = tree
+            elif tree.prefix.startswith("r"):
+                r_tree = tree
+        assert y_tree is not None and x_tree is not None and r_tree is not None
+
+        # Register kernel arguments for pass 2 output buffer
+        node2_output_name = None
+        for name in node2_write_names:
+            kernel.args.output(name)
+            node2_output_name = name
+            break
+
+        # ---- Check for epilogue dtype conversion ----
+        # If node2's output has a single pointwise consumer that only reads
+        # node2's output (e.g., a to_dtype conversion), absorb it into the
+        # pass 2 store to avoid an extra kernel + memory round-trip.
+        assert self.scheduler is not None
+        epilogue_node = None
+        if node2_output_name in self.scheduler.name_to_buf:
+            buf = self.scheduler.name_to_buf[node2_output_name]
+            real_users = [u for u in buf.users if not u.is_weak]
+            if len(real_users) == 1:
+                user_node = real_users[0].node
+                if (
+                    isinstance(user_node, scheduler.SchedulerNode)
+                    and not user_node.is_reduction()
+                ):
+                    user_reads = {dep.name for dep in user_node.read_writes.reads}
+                    if user_reads == {node2_output_name}:
+                        user_write_names = {
+                            dep.name for dep in user_node.read_writes.writes
+                        }
+                        if len(user_write_names) == 1:
+                            epilogue_name = next(iter(user_write_names))
+                            epilogue_dtype = V.graph.get_dtype(epilogue_name)
+                            if epilogue_dtype != V.graph.get_dtype(node2_output_name):
+                                epilogue_node = user_node
+                                # Use epilogue's output instead of node2's
+                                kernel.args.output(epilogue_name)
+                                node2_output_name = epilogue_name
+                                # node2's original output is no longer needed
+                                kernel.remove_buffer(next(iter(node2_write_names)))
+
+        # ---- Generate the kernel source code ----
+        # Enter kernel context: sets up CSEProxy ops handler + kernel handler
+        with kernel:
+            # Emit pass 1 reduction loop from staging buffers
+            kernel.codegen_body()
+
+            # ---- Pass 2: run node2's body through the kernel's codegen ----
+            # Map node2's iteration space (B*DIM, TOPK) to the kernel's
+            # 3D range trees: y=B, x=TOPK, r=DIM.
+            sn = list(node2.get_nodes())[0]
+            body = sn._body
+
+            # Get the kernel's range tree symbols
+            y0 = y_tree.construct([batch])[0]
+            x0 = x_tree.construct([topk])[0]
+            r0 = r_tree.construct([rnumel1])[0]
+
+            # node2's body has iter_vars [batch(B), dim(DIM)] and
+            # reduce_vars [topk(TOPK)]. Map them to kernel symbols:
+            #   batch -> y0
+            #   dim   -> r0
+            #   topk  -> x0
+            # Identify the DIM iter_var: find the iter_var with coefficient 1
+            # in an indexing expression that also depends on reduce_vars.
+            dim_var = None
+            for name, expr in body.indexing_exprs.items():
+                uses_reduce = bool(expr.free_symbols & set(body.reduce_vars))
+                if not uses_reduce:
+                    continue
+                for v in body.iter_vars:
+                    coeff = expr.coeff(v)
+                    if coeff == 1:
+                        dim_var = v
+                        break
+                if dim_var is not None:
+                    break
+
+            iter_remapped = [y0 if v != dim_var else r0 for v in body.iter_vars]
+            reduce_remapped = [x0]
+
+            # Install handler that intercepts node1-output loads and
+            # replaces node2's TOPK reduction with a sum over the x dim,
+            # then stores using the kernel's standard store infrastructure.
+            from ..ops_handler import WrapperHandler
+
+            class _Pass2OpsHandler(WrapperHandler):
+                def __init__(self, inner, node1_cse_vars, node1_output_names,
+                             kernel, store_name):
+                    super().__init__(inner)
+                    self._node1_cse_vars = node1_cse_vars
+                    self._node1_output_names = node1_output_names
+                    self._kernel = kernel
+                    self._store_name = store_name
+
+                def load(self, name, index):
+                    if name in self._node1_output_names:
+                        return next(iter(self._node1_cse_vars.values()))
+                    return self._inner.load(name, index)
+
+                def reduction(self, dtype, src_dtype, reduction_type, value):
+                    # Sum over x (TOPK): [YBLOCK, XBLOCK, RBLOCK] -> [YBLOCK, RBLOCK]
+                    return self._kernel.cse.generate(
+                        self._kernel.compute, f"tl.sum({value}, 1)",
+                        dtype=dtype,
+                        shape=value.shape[:1] + value.shape[2:],
+                    )
+
+                def store_reduction(self, name, index, value):
+                    # Store via kernel's codegen (handles indexing + masking).
+                    # Bypass CSEProxy to avoid store_cache lookup on
+                    # current_node (which doesn't own the epilogue buffer).
+                    self._kernel.store(self._store_name, index, value, mode=None)
+
+            handler = _Pass2OpsHandler(
+                V.get_ops_handler(), node1_cse_vars, node1_output_names,
+                kernel=kernel,
+                store_name=node2_output_name,
+            )
+            with V.set_ops_handler(handler):
+                with kernel.set_current_node(sn):
+                    body(
+                        iter_remapped,
+                        reduce_remapped,
+                        allow_same_symbol_in_index=True,
+                    )
+
+            # Clear post-loop buffers — no standard reduction accumulator
+            kernel.post_loop_combine.clear()
+            kernel.post_loop_store.clear()
+
+            # Emit pass 2 reduction loop
+            kernel.codegen_body()
+
+        with V.set_kernel_handler(kernel):
+            src_code = kernel.codegen_kernel()
+        kernel_name = self.define_kernel(src_code, combined_schedule, kernel)
+        kernel.kernel_name = kernel_name
+        kernel.code_hash = code_hash(src_code)
+
+        # Mark all nodes as run
+        with V.set_kernel_handler(kernel):
+            for sn in node1.get_nodes():
+                sn.mark_run()
+            for sn in node2.get_nodes():
+                sn.mark_run()
+            if epilogue_node is not None:
+                for sn in epilogue_node.get_nodes():
+                    sn.mark_run()
+                self.scheduler.removed_ops.add(epilogue_node.get_name())
+
+        # Emit the kernel call
+        self.codegen_comment(
+            [n for n in combined_schedule if isinstance(n, BaseSchedulerNode)],
+            kernel.kernel_name,
+        )
+        kernel.call_kernel(kernel.kernel_name)
+        V.graph.removed_buffers |= kernel.removed_buffers
+        V.graph.inplaced_to_remove |= kernel.inplaced_to_remove
 
         self.free_buffers_in_scheduler()
 
