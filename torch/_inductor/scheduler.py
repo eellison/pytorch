@@ -7649,9 +7649,6 @@ class Scheduler:
                 else:
                     raise AssertionError(f"{type(self)=}")
                 backend.codegen_combo_kernel(node)
-            elif isinstance(node, FusedNestedReductions):
-                # pyrefly: ignore [unbound-name]
-                self.get_backend(device).codegen_nested_reduction(node)
             elif isinstance(node, FusedMixOrderReductions):
                 # pyrefly: ignore [unbound-name]
                 self.get_backend(device).codegen_mix_order_reduction(node)

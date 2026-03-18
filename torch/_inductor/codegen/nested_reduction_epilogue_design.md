@@ -83,3 +83,94 @@ kernel.numels = orig_numels
 
 If epilogues become more complex (e.g., multi-output, indirect indexing, or if
 we want block pointer / TMA optimizations on the epilogue stores).
+
+---
+
+# Follow-up: tiling_utils integration (node2 read/write remapping)
+
+## Problem
+
+`extract_normalized_read_writes` and `analyze_memory_coalescing` in `tiling_utils.py`
+are never called for `FusedNestedReductions` because they bypass `codegen_node`.
+If we want tiling heuristics to account for node2's memory accesses, we need to
+express node2's read/write indices in terms of node1's `(numel, rnumel)` iteration
+space.
+
+## Current state
+
+- `extract_normalized_read_writes` assumes all subnodes share the same
+  `(pw_numel, red_numel)` from `node.group[1]`, decomposed via `get_pw_red_splits`.
+- Node1's subnodes decompose `(B*K, DIM)` or `(B, DIM)` — works as-is.
+- Node2's subnodes decompose a *different* total (e.g., `(B, K*DIM)` for pattern 1,
+  `(B*DIM/G, G)` for pattern 2) — `get_pw_red_splits` cannot handle them in node1's
+  iteration space.
+
+## Approach: shared remapping utility
+
+Factor out the variable remapping logic from `codegen_nested_reduction` into a
+reusable helper. The same `topk_tree`/`other_tree` detection and `x_expr`/`r_expr`
+computation used during codegen would produce a mapping from node2's body iter_vars
+to expressions in node1's `(x, r)` space.
+
+```python
+def compute_nested_reduction_var_mapping(
+    node1, node2, pw_numel, red_numel
+) -> dict[sympy.Symbol, sympy.Expr]:
+    """Map node2's body iter_vars to expressions in node1's (x, r) space."""
+    # Reuse topk_tree/other_tree logic from codegen_nested_reduction
+    # to compute pass2_x, pass2_r in terms of node1's x, r variables.
+    ...
+```
+
+### Concrete remapping per pattern
+
+Pattern 1 (topk in x), node1 space `(x, r)` with `x ∈ [0, B*K)`, `r ∈ [0, DIM)`:
+- `pass2_x = x // K`          (range B)
+- `pass2_r = (x % K)*DIM + r` (range K*DIM, node2 reduces over K)
+
+Pattern 2 (topk in r), node1 space `(x, r)` with `x ∈ [0, B)`, `r ∈ [0, DIM)`:
+- `pass2_x = x*(DIM/G) + r//G` (range B*DIM/G)
+- `pass2_r = r % G`            (range G, node2 reduces over G)
+
+### Substitution chain for node2 subnodes
+
+1. Get read/write expressions in terms of node2's body iter_vars
+2. Substitute `node2_body_var[i]` → `pass2_expr_i(x, r)` (nested reduction remap)
+3. Substitute `x, r` → `norm_pw_vars, norm_red_vars` (standard normalization)
+
+### Integration with extract_normalized_read_writes
+
+```python
+if isinstance(node, FusedNestedReductions):
+    # Use node1's (numel, rnumel) as canonical space
+    pointwise_numel, red_numel = node.node1.group[1]
+
+    # Node1 subnodes: standard get_pw_red_splits path
+    for n in node.node1.get_nodes():
+        ...  # existing code
+
+    # Node2 subnodes: bypass get_pw_red_splits, apply remap directly
+    remap = compute_nested_reduction_var_mapping(...)
+    for n in node.node2.get_nodes():
+        body = n._body
+        for inp in inputs:
+            for expr in body.get_all_read_expr(inp):
+                remapped = sympy_subs(expr, remap)  # now in (x, r) space
+                normalized = sympy_subs(remapped, norm_map)  # now in (n0, n1, ...)
+                reads[normalized].add(inp)
+        # same for writes
+```
+
+### Why node1 dominates tiling decisions anyway
+
+Node1 reads the full shared input (`B*K × DIM` elements). Node2 re-reads the same
+input but also reads node1's reduction output (small, `B*K` elements) and writes
+a smaller output (`B × DIM` or `B × DIM/G`). The shared input dominates memory
+traffic, so node1's access patterns should drive XBLOCK/RBLOCK choices regardless.
+Including node2's accesses would provide marginal improvement in edge cases where
+node2 has additional large external loads.
+
+### When to implement
+
+When nested reductions are integrated into `codegen_node` rather than bypassing it,
+or when tiling quality for nested reduction kernels needs improvement.

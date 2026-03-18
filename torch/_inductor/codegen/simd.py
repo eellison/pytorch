@@ -1914,11 +1914,21 @@ class SIMDScheduling(BaseScheduling):
         # (persistent reduction, register pressure, index dtype).
         nodes1 = list(node1.get_nodes())
         combined_schedule = self.generate_node_schedule(nodes1, numel1, rnumel1)
-        kernel_features = SIMDKernelFeatures(combined_schedule, numel1, rnumel1)
-        tiling = self.select_tiling(combined_schedule, numel1, rnumel1)
+
+        if torch._inductor.config.triton.coalesce_tiling_analysis:
+            coalesce_analysis = analyze_memory_coalescing(node1)
+        else:
+            coalesce_analysis = None
+
+        kernel_features = SIMDKernelFeatures(
+            combined_schedule, numel1, rnumel1, coalesce_analysis
+        )
+        tiling, tiling_score = self.get_tiling_and_scores(
+            combined_schedule, numel1, rnumel1, coalesce_analysis
+        )
         kernel = self.create_kernel_choices(
             kernel_features, [tiling],
-            {"features": kernel_features, "tiling_scores": None},
+            {"features": kernel_features, "tiling_scores": tiling_score},
         )[0]
 
         # Enforce block size >= topk for the dimension containing topk
@@ -2242,7 +2252,9 @@ class SIMDScheduling(BaseScheduling):
             kernel.post_loop_store.clear()
             kernel.codegen_body()
 
-        with V.set_kernel_handler(kernel):
+        config_patches = self._collect_config_patches(combined_schedule)
+
+        with V.set_kernel_handler(kernel), config.patch(**config_patches):
             src_code = kernel.codegen_kernel()
         kernel_name = self.define_kernel(src_code, combined_schedule, kernel)
         kernel.kernel_name = kernel_name
@@ -2264,11 +2276,24 @@ class SIMDScheduling(BaseScheduling):
         if sn2_epilogue:
             V.graph.removed_buffers.add(node2_reduction_output_name)
 
-        self.codegen_comment(
-            [n for n in combined_schedule if isinstance(n, BaseSchedulerNode)],
-            kernel.kernel_name,
-        )
+        base_scheduler_nodes = [
+            n for n in combined_schedule if isinstance(n, BaseSchedulerNode)
+        ]
+        self.codegen_comment(base_scheduler_nodes, kernel.kernel_name)
+        if config.cpp.enable_kernel_profile:
+            V.graph.wrapper_code.write_kernel_context_guard_begin()
+            V.graph.wrapper_code.write_kernel_context_guard(
+                kernel.kernel_name, base_scheduler_nodes,
+            )
         kernel.call_kernel(kernel.kernel_name)
+        if config.cpp.enable_kernel_profile:
+            V.graph.wrapper_code.write_kernel_context_guard_end()
+
+        if config.nan_asserts:
+            kernel.codegen_nan_check()
+        if config.warn_mix_layout:
+            kernel.warn_mix_layout(kernel.kernel_name)
+
         V.graph.removed_buffers |= kernel.removed_buffers
         V.graph.inplaced_to_remove |= kernel.inplaced_to_remove
 
@@ -2300,6 +2325,9 @@ class SIMDScheduling(BaseScheduling):
         """
         Given a set of pre-fused nodes, generate a Triton kernel.
         """
+        if isinstance(node, scheduler.FusedNestedReductions):
+            return self.codegen_nested_reduction(node)
+
         assert self.scheduler
         nodes = [
             node
