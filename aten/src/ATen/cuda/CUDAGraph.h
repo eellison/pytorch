@@ -90,16 +90,51 @@ struct TORCH_CUDA_CPP_API CUDAGraph {
       const Tensor& scalar_cuda_pred_tensor);
 
  public:
-  // Parameterized launch: update kernel pointer params instead of copying data.
-  // After recording + instantiation, scan kernel nodes for parameters matching
-  // given input data_ptrs. Returns (matched_indices, num_opaque_kernel_nodes).
-  // matched_indices: input indices with at least one matching kernel param.
-  // num_opaque_kernel_nodes: kernel nodes we couldn't scan (NULL kernelParams).
+  // Parameterized CUDA graph launch: update kernel pointer params in-place
+  // instead of copying input tensor data to the recorded memory pool.
+  //
+  // This optimization eliminates tensor data copies for Triton-only inputs
+  // while preserving correctness for extern kernels (cuBLAS, etc.) and
+  // saved-for-backward tensors that require stable pool addresses.
+  //
+  // REQUIREMENTS:
+  // - Graph must be captured with keep_graph=True
+  // - Graph must be instantiated (automatically done if needed)
+  // - CUDA Driver API must be available (CUDA 12.0+)
+  //
+  // PARAMETERS:
+  // - input_data_ptrs: data_ptr() values from recording-time input tensors
+  // - kernel_signatures: mapping from kernel names to tensor parameter indices
+  //   (optional, enables signature-aware safety vs conservative fallback)
+  //
+  // RETURNS:
+  // - matched_indices: input indices that matched at least one kernel param
+  // - num_opaque_kernel_nodes: kernel nodes that couldn't be inspected
+  //
+  // THREAD SAFETY: This method is NOT thread-safe. Concurrent calls to
+  // build_param_update_plan or replay_with_params on the same CUDAGraph
+  // instance will have undefined behavior.
   std::tuple<std::vector<int64_t>, int64_t> build_param_update_plan(
       const std::vector<int64_t>& input_data_ptrs,
       const std::unordered_map<std::string, std::vector<int64_t>>& kernel_signatures = {});
 
-  // Apply param updates with new data pointers and launch the graph.
+  // Execute the graph with updated kernel parameters.
+  //
+  // Updates kernel node parameters with new tensor data_ptr values and
+  // launches the graph. Must call build_param_update_plan() first.
+  //
+  // PARAMETERS:
+  // - new_data_ptrs: new data_ptr() values, same length as input_data_ptrs
+  //   passed to build_param_update_plan(). Only non-zero entries are used.
+  //
+  // BEHAVIOR:
+  // - Automatically instantiates the graph if not already instantiated
+  // - Updates kernel parameters for recorded parameter slots
+  // - Replays generator states from recording time
+  // - Launches on the current CUDA stream
+  //
+  // THREAD SAFETY: Not thread-safe with concurrent build_param_update_plan
+  // or replay_with_params calls on the same instance.
   void replay_with_params(
       const std::vector<int64_t>& new_data_ptrs);
 

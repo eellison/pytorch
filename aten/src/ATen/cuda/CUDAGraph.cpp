@@ -656,21 +656,44 @@ std::tuple<std::vector<int64_t>, int64_t> CUDAGraph::build_param_update_plan(
 
   const auto& api = driver_graph_api();
   TORCH_CHECK(api.available,
-      "CUDA driver API not available for parameterized graph launch");
+      "CUDA driver API not available for parameterized graph launch. "
+      "This feature requires CUDA 12.0+ with driver API support.");
+
+  // Additional version check for better error messages
+  if (!api.cuGraphGetNodes || !api.cuGraphNodeGetType || !api.cuGraphKernelNodeGetParams) {
+    TORCH_CHECK(false,
+        "Required CUDA driver API functions not available. "
+        "Parameterized graph launch requires CUDA 12.0 or newer.");
+  }
 
   kernel_node_param_states_.clear();
 
+  // Validate inputs and detect collisions
+  TORCH_CHECK(!input_data_ptrs.empty(),
+      "input_data_ptrs cannot be empty");
+
   // Map data_ptr -> input index for fast lookup
+  // Reserve space to avoid rehashing during insertion
   std::unordered_map<uint64_t, size_t> ptr_to_idx;
+  ptr_to_idx.reserve(input_data_ptrs.size());
+  std::unordered_set<uint64_t> seen_ptrs;
+  seen_ptrs.reserve(input_data_ptrs.size());
   for (size_t i = 0; i < input_data_ptrs.size(); i++) {
     if (input_data_ptrs[i] != 0) {
-      ptr_to_idx[static_cast<uint64_t>(input_data_ptrs[i])] = i;
+      uint64_t ptr = static_cast<uint64_t>(input_data_ptrs[i]);
+      TORCH_CHECK(seen_ptrs.find(ptr) == seen_ptrs.end(),
+          "Duplicate data pointer 0x", std::hex, ptr, std::dec,
+          " found at input index ", i, " (previously seen)");
+      ptr_to_idx[ptr] = i;
+      seen_ptrs.insert(ptr);
     }
   }
 
   // Build CUfunction -> signature mapping (using kernel names as bridge)
   // This eliminates string matching during parameter checking!
   std::unordered_map<uintptr_t, std::vector<int64_t>> func_to_signature;
+  // Estimate: most graphs have < 100 unique kernel functions
+  func_to_signature.reserve(100);
 
   // Enumerate all nodes using driver API
   CUgraph cu_graph = reinterpret_cast<CUgraph>(graph_);
@@ -823,6 +846,11 @@ std::tuple<std::vector<int64_t>, int64_t> CUDAGraph::build_param_update_plan(
             continue;  // Skip non-8-byte parameters (likely not pointers)
           }
         }
+      }
+
+      // Safety check: ensure kernelParams[pi] is not null
+      if (!params.kernelParams[pi]) {
+        continue;  // Skip null parameter slots
       }
 
       uint64_t value = *reinterpret_cast<uint64_t*>(params.kernelParams[pi]);

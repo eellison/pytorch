@@ -5844,6 +5844,56 @@ if HAS_CUDA_AND_TRITON:
                         found = True
             self.assertTrue(found, "No CachingAutotuner found in PyCodeCache")
 
+        def test_edge_cases_and_robustness(self):
+            """Test edge cases: empty inputs, single tensor, very wide kernels."""
+
+            # Test: single input tensor
+            @torch.compile(mode="reduce-overhead")
+            def single_input_fn(x):
+                return x.relu()
+
+            x = torch.randn(32, device="cuda")
+            for _ in range(3):
+                single_input_fn(x)
+
+            x2 = torch.randn(32, device="cuda")
+            result = single_input_fn(x2)
+            self.assertEqual(result, x2.relu())
+
+            # Test: Very wide kernel (stress test parameter handling)
+            @torch.compile(mode="reduce-overhead")
+            def wide_kernel_fn(*tensors):
+                result = tensors[0]
+                for t in tensors[1:]:
+                    result = result + t
+                return result
+
+            many_tensors = [torch.randn(16, device="cuda") for _ in range(16)]
+            for _ in range(3):
+                wide_kernel_fn(*many_tensors)
+
+            many_tensors2 = [torch.randn(16, device="cuda") for _ in range(16)]
+            result = wide_kernel_fn(*many_tensors2)
+            expected = sum(many_tensors2)
+            self.assertEqual(result, expected)
+
+        def test_config_toggle(self):
+            """Test that parameterized launch can be disabled via config."""
+            with config.patch("triton.cudagraph_parameterized", False):
+                @torch.compile(mode="reduce-overhead")
+                def fn(x, y):
+                    return x + y
+
+                x = torch.randn(64, device="cuda")
+                y = torch.randn(64, device="cuda")
+                for _ in range(3):
+                    fn(x, y)
+
+                x2 = torch.randn(64, device="cuda")
+                y2 = torch.randn(64, device="cuda")
+                result = fn(x2, y2)
+                self.assertEqual(result, x2 + y2)
+
     instantiate_parametrized_tests(CudaGraphTreeTests)
     instantiate_parametrized_tests(TestSAC)
 

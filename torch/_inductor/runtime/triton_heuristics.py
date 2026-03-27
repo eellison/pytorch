@@ -512,12 +512,27 @@ class CachingAutotuner(KernelInterface):
         types are "i32", "i64", "fp64", "constexpr", etc.
         """
         self._tensor_param_indices = []
+
+        if not hasattr(self, 'triton_meta'):
+            log.warning("triton_meta not available for %s, skipping signature extraction",
+                       getattr(self.fn, '__name__', 'unknown'))
+            return
+
         sig = self.triton_meta.get("signature", {})
+        if not sig:
+            log.debug("Empty signature for kernel %s", getattr(self.fn, '__name__', 'unknown'))
+            return
+
         # triton_meta["signature"] is {param_name: type_str}
         # e.g. {"in_ptr0": "*fp32", "xnumel": "i32", "XBLOCK": "constexpr"}
         # Pointer types start with "*", constexprs are not runtime params.
         non_constexpr_idx = 0
         for param_name, type_str in sig.items():
+            if not isinstance(type_str, str):
+                log.warning("Invalid type for parameter %s in kernel %s: %s",
+                           param_name, getattr(self.fn, '__name__', 'unknown'), type_str)
+                continue
+
             if type_str == "constexpr":
                 continue
             if type_str.startswith("*"):
