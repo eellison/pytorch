@@ -3355,6 +3355,80 @@ class Scheduler:
         else:
             raise NotImplementedError(node)
 
+    def analyze_input_usage_for_cudagraph_parameterization(
+        self,
+    ) -> tuple[bool, ...]:
+        """Analyze which graph inputs are safe to parameterize in CUDA graphs.
+
+        An input is safe to parameterize (triton-only) if:
+        1. ALL kernels that read from its storage are Triton kernels (not extern),
+        2. It is NOT passed through as a graph output (saved for backward).
+
+        Inputs that appear as graph outputs must be copied to their pool address
+        because downstream graphs (e.g., backward) reference that pool address
+        for saved tensors.
+
+        Returns:
+            Tuple of bools, one per graph input.  True = safe to parameterize,
+            False = must copy to pool address.
+        """
+        graph_input_names = list(V.graph.graph_inputs.keys())
+        n_inputs = len(graph_input_names)
+
+        # name -> input index (direct graph_input names)
+        name_to_input_idx: dict[str, int] = {
+            name: idx for idx, name in enumerate(graph_input_names)
+        }
+
+        # Extend the mapping through mutation renames.  After
+        # compute_dependencies, node reads use renamed buffer names (e.g.
+        # primals_1 → buf0 after an inplace mutation).  mutation_real_name maps
+        # the new name back to the original, so we can trace reads back to
+        # graph inputs.
+        for new_name, real_name in self.mutation_real_name.items():
+            if real_name in name_to_input_idx:
+                name_to_input_idx[new_name] = name_to_input_idx[real_name]
+
+        # Also handle direct mutation_renames chains: if primals_1 -> buf0 and
+        # we didn't catch it via mutation_real_name, check forward mapping too.
+        for old_name, new_name in self.mutation_renames.items():
+            if old_name in name_to_input_idx and new_name not in name_to_input_idx:
+                name_to_input_idx[new_name] = name_to_input_idx[old_name]
+
+        # Per-input: must this input be copied to pool?
+        must_copy = [False] * n_inputs
+
+        # (1) Inputs read by extern kernels must be copied
+        for top_node in self.nodes:
+            for leaf in top_node.get_nodes():
+                if not leaf.is_extern():
+                    continue
+                for dep in leaf.read_writes.reads:
+                    if isinstance(dep, WeakDep) and dep.is_fake:
+                        continue
+                    idx = name_to_input_idx.get(dep.name)
+                    if idx is not None:
+                        must_copy[idx] = True
+
+        # (2) Inputs passed through as graph outputs must be copied — downstream
+        # graphs (backward) reference the pool address for saved tensors.
+        graph_input_name_set = set(graph_input_names)
+        for out in V.graph.graph_outputs:
+            if isinstance(out, (ir.NoneAsConstantBuffer, ir.ShapeAsConstantBuffer)):
+                continue
+            out_name = out.get_name()
+            idx = name_to_input_idx.get(out_name)
+            if idx is not None:
+                must_copy[idx] = True
+
+        result = tuple(not c for c in must_copy)
+        log.debug(
+            "Parameterized CUDA graph analysis: %d/%d inputs safe to parameterize",
+            sum(result),
+            n_inputs,
+        )
+        return result
+
     def create_foreach_nodes(self) -> None:
         removed_node_names: OrderedSet[str] = OrderedSet()
         fe_nodes = []

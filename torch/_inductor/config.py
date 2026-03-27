@@ -1601,6 +1601,13 @@ class triton:
     # Enable cudagraph support for mutated inputs from prior cudagraph pool
     cudagraph_support_input_mutation = not is_fbcode()
 
+    # Enable parameterized CUDA graph launch for Triton kernels.
+    # Instead of copying input data to static addresses before replay,
+    # update kernel node parameters (pointer values) directly.
+    # This elides copies for non-static inputs.
+    # Requires CUDA 12.4+ for cuFuncGetParamInfo, falls back otherwise.
+    cudagraph_parameterized = False
+
     # Maximal number of allowed cudagraph re-record for a function and
     # a cudagraph node due to static input tensor address changes or
     # cudagraph managed tensor data pointer changed.

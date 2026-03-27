@@ -8,7 +8,14 @@
 #include <c10/cuda/CUDAAllocatorConfig.h>
 #include <c10/cuda/CUDAFunctions.h>
 
+#include <cuda.h>
+
 #include <cstddef>
+#include <sstream>
+#include <unordered_set>
+#if !defined(USE_ROCM)
+#include <dlfcn.h>
+#endif
 
 namespace at::cuda {
 
@@ -572,5 +579,398 @@ std::function<bool(cudaStream_t)> CUDAGraph::create_child_allocate_filter() {
 #endif
 }
 
+
+// ============================================================
+// Parameterized CUDA graph launch
+//
+// Uses CUDA driver API for kernel node operations because
+// the runtime API (cudaGraphKernelNodeGetParams) doesn't work
+// with kernels launched via the driver API (e.g., Triton kernels).
+// ============================================================
+
+#if !defined(USE_ROCM)
+
+namespace {
+
+// Dynamically load driver API functions we need
+struct DriverGraphAPI {
+  using GetNodes_t = CUresult (*)(CUgraph, CUgraphNode*, size_t*);
+  using NodeGetType_t = CUresult (*)(CUgraphNode, CUgraphNodeType*);
+  using KernelNodeGetParams_t = CUresult (*)(CUgraphNode, CUDA_KERNEL_NODE_PARAMS*);
+  using KernelNodeSetParams_t = CUresult (*)(CUgraphNode, const CUDA_KERNEL_NODE_PARAMS*);
+  using ExecKernelNodeSetParams_t = CUresult (*)(CUgraphExec, CUgraphNode, const CUDA_KERNEL_NODE_PARAMS*);
+  using FuncGetParamInfo_t = CUresult (*)(CUfunction, size_t, size_t*, size_t*);
+  using FuncGetName_t = CUresult (*)(const char**, CUfunction);
+
+  GetNodes_t cuGraphGetNodes = nullptr;
+  NodeGetType_t cuGraphNodeGetType = nullptr;
+  KernelNodeGetParams_t cuGraphKernelNodeGetParams = nullptr;
+  KernelNodeSetParams_t cuGraphKernelNodeSetParams = nullptr;
+  ExecKernelNodeSetParams_t cuGraphExecKernelNodeSetParams = nullptr;
+  FuncGetParamInfo_t cuFuncGetParamInfo = nullptr;
+  FuncGetName_t cuFuncGetName = nullptr;
+
+  bool available = false;
+  bool has_batch_update = false;
+
+  DriverGraphAPI() {
+    void* handle = dlopen("libcuda.so.1", RTLD_LAZY | RTLD_NOLOAD);
+    if (!handle) return;
+
+    cuGraphGetNodes = reinterpret_cast<GetNodes_t>(
+        dlsym(handle, "cuGraphGetNodes"));
+    cuGraphNodeGetType = reinterpret_cast<NodeGetType_t>(
+        dlsym(handle, "cuGraphNodeGetType"));
+    // Use v2 variants (CUDA 12.0+) which handle both runtime and driver API kernels
+    cuGraphKernelNodeGetParams = reinterpret_cast<KernelNodeGetParams_t>(
+        dlsym(handle, "cuGraphKernelNodeGetParams_v2"));
+    cuGraphKernelNodeSetParams = reinterpret_cast<KernelNodeSetParams_t>(
+        dlsym(handle, "cuGraphKernelNodeSetParams_v2"));
+    cuGraphExecKernelNodeSetParams = reinterpret_cast<ExecKernelNodeSetParams_t>(
+        dlsym(handle, "cuGraphExecKernelNodeSetParams_v2"));
+    // Optional functions
+    cuFuncGetParamInfo = reinterpret_cast<FuncGetParamInfo_t>(
+        dlsym(handle, "cuFuncGetParamInfo"));
+    cuFuncGetName = reinterpret_cast<FuncGetName_t>(
+        dlsym(handle, "cuFuncGetName"));
+
+    available = cuGraphGetNodes && cuGraphNodeGetType &&
+                cuGraphKernelNodeGetParams && cuGraphExecKernelNodeSetParams;
+    has_batch_update = cuGraphKernelNodeSetParams != nullptr;
+  }
+};
+
+const DriverGraphAPI& driver_graph_api() {
+  static DriverGraphAPI api;
+  return api;
+}
+
+} // anonymous namespace
+
+std::tuple<std::vector<int64_t>, int64_t> CUDAGraph::build_param_update_plan(
+    const std::vector<int64_t>& input_data_ptrs,
+    const std::unordered_map<std::string, std::vector<int64_t>>& kernel_signatures) {
+  TORCH_CHECK(has_graph_,
+      "Graph must be captured (with keep_graph=True) before building param "
+      "update plan");
+
+  const auto& api = driver_graph_api();
+  TORCH_CHECK(api.available,
+      "CUDA driver API not available for parameterized graph launch");
+
+  kernel_node_param_states_.clear();
+
+  // Map data_ptr -> input index for fast lookup
+  std::unordered_map<uint64_t, size_t> ptr_to_idx;
+  for (size_t i = 0; i < input_data_ptrs.size(); i++) {
+    if (input_data_ptrs[i] != 0) {
+      ptr_to_idx[static_cast<uint64_t>(input_data_ptrs[i])] = i;
+    }
+  }
+
+  // Build CUfunction -> signature mapping (using kernel names as bridge)
+  // This eliminates string matching during parameter checking!
+  std::unordered_map<uintptr_t, std::vector<int64_t>> func_to_signature;
+
+  // Enumerate all nodes using driver API
+  CUgraph cu_graph = reinterpret_cast<CUgraph>(graph_);
+  size_t num_nodes = 0;
+  CUresult res;
+  res = api.cuGraphGetNodes(cu_graph, nullptr, &num_nodes);
+  TORCH_CHECK(res == CUDA_SUCCESS,
+      "cuGraphGetNodes failed: ", res);
+  std::vector<CUgraphNode> nodes(num_nodes);
+  res = api.cuGraphGetNodes(cu_graph, nodes.data(), &num_nodes);
+  TORCH_CHECK(res == CUDA_SUCCESS,
+      "cuGraphGetNodes(data) failed: ", res);
+
+  // PASS 1: Build CUfunction -> signature mapping
+  for (size_t ni = 0; ni < num_nodes; ni++) {
+    CUgraphNodeType type;
+    res = api.cuGraphNodeGetType(nodes[ni], &type);
+    if (res != CUDA_SUCCESS || type != CU_GRAPH_NODE_TYPE_KERNEL) continue;
+
+    CUDA_KERNEL_NODE_PARAMS params;
+    memset(&params, 0, sizeof(params));
+    if (api.cuGraphKernelNodeGetParams(nodes[ni], &params) != CUDA_SUCCESS) continue;
+
+    CUfunction func = params.func;
+    uintptr_t func_addr = reinterpret_cast<uintptr_t>(func);
+
+    // Skip if we already have a signature for this function
+    if (func_to_signature.find(func_addr) != func_to_signature.end()) continue;
+
+    // Get kernel name to lookup signature
+    std::string kernel_name;
+    if (api.cuFuncGetName) {
+      const char* func_name = nullptr;
+      if (api.cuFuncGetName(&func_name, func) == CUDA_SUCCESS && func_name) {
+        kernel_name = func_name;
+      }
+    }
+
+    if (!kernel_name.empty()) {
+      // Try signature lookup strategies
+      std::vector<int64_t> tensor_indices;
+
+      // Strategy 1: name-based lookup
+      std::string name_key = "name:" + kernel_name;
+      auto name_it = kernel_signatures.find(name_key);
+      if (name_it != kernel_signatures.end()) {
+        tensor_indices = name_it->second;
+      } else {
+        // Strategy 2: legacy lookup
+        auto legacy_it = kernel_signatures.find(kernel_name);
+        if (legacy_it != kernel_signatures.end()) {
+          tensor_indices = legacy_it->second;
+        }
+      }
+
+      if (!tensor_indices.empty()) {
+        // Store CUfunction -> signature mapping
+        func_to_signature[func_addr] = std::move(tensor_indices);
+      }
+    }
+  }
+
+  // PASS 2: Use CUfunction-based lookup for parameter matching
+  int64_t total_updates = 0;
+  int64_t num_opaque_kernel_nodes = 0;
+  std::unordered_set<size_t> matched_input_indices;
+
+  for (size_t ni = 0; ni < num_nodes; ni++) {
+    CUgraphNodeType type;
+    res = api.cuGraphNodeGetType(nodes[ni], &type);
+    TORCH_CHECK(res == CUDA_SUCCESS,
+        "cuGraphNodeGetType failed: ", res);
+    if (type != CU_GRAPH_NODE_TYPE_KERNEL) continue;
+
+    CUgraphNode node = nodes[ni];
+    CUDA_KERNEL_NODE_PARAMS params;
+    memset(&params, 0, sizeof(params));
+    res = api.cuGraphKernelNodeGetParams(node, &params);
+    if (res != CUDA_SUCCESS) {
+      // Some kernel nodes (e.g., from certain runtime API launches) may
+      // not be queryable via the driver API.  Skip rather than crash.
+      num_opaque_kernel_nodes++;
+      continue;
+    }
+    if (!params.kernelParams) {
+      // Kernel uses extra[] or other mechanism — we can't scan its params.
+      num_opaque_kernel_nodes++;
+      continue;
+    }
+
+    CUfunction func = params.func;
+
+    // Determine number of parameters
+    int64_t num_params = -1;
+    if (api.cuFuncGetParamInfo) {
+      num_params = 0;
+      size_t offset, size;
+      while (api.cuFuncGetParamInfo(func, num_params, &offset, &size) == CUDA_SUCCESS) {
+        num_params++;
+      }
+    }
+    if (num_params < 0) {
+      // Fallback: iterate until nullptr (max 64 params).
+      // kernelParams arrays are typically nullptr-terminated by the CUDA
+      // runtime, but we cap at 64 to avoid reading garbage.
+      num_params = 0;
+      for (int64_t p = 0; p < 64 && params.kernelParams[p]; p++) {
+        num_params = p + 1;
+      }
+    }
+    if (num_params == 0) {
+      continue;
+    }
+
+    // Clean CUfunction-based signature lookup (no string matching needed!)
+    uintptr_t func_addr = reinterpret_cast<uintptr_t>(func);
+    auto sig_it = func_to_signature.find(func_addr);
+
+    std::vector<int64_t> tensor_param_indices;
+    if (sig_it != func_to_signature.end()) {
+      // Perfect match using CUfunction as unique identifier
+      tensor_param_indices = sig_it->second;
+
+      // Bounds validation: ensure indices are valid for this specific kernel instance
+      tensor_param_indices.erase(
+        std::remove_if(tensor_param_indices.begin(), tensor_param_indices.end(),
+                       [num_params](int64_t idx) { return idx >= num_params; }),
+        tensor_param_indices.end());
+    }
+
+    // Find which params match input data_ptrs
+    std::vector<std::pair<size_t, size_t>> node_updates;
+    for (size_t pi = 0; pi < static_cast<size_t>(num_params); pi++) {
+      if (!params.kernelParams[pi]) continue;
+
+      // SIGNATURE-AWARE SAFETY: Only check parameters we know are tensor pointers
+      if (!tensor_param_indices.empty()) {
+        bool is_tensor_param = std::find(tensor_param_indices.begin(),
+                                        tensor_param_indices.end(),
+                                        static_cast<int64_t>(pi)) != tensor_param_indices.end();
+        if (!is_tensor_param) {
+          continue;  // Skip non-tensor parameters (sizes, strides, etc.)
+        }
+      } else {
+        // Fallback: Conservative parameter size check when signature unavailable
+        if (api.cuFuncGetParamInfo) {
+          size_t p_offset = 0, p_size = 0;
+          if (api.cuFuncGetParamInfo(func, pi, &p_offset, &p_size) == CUDA_SUCCESS
+              && p_size != 8) {
+            continue;  // Skip non-8-byte parameters (likely not pointers)
+          }
+        }
+      }
+
+      uint64_t value = *reinterpret_cast<uint64_t*>(params.kernelParams[pi]);
+      auto it = ptr_to_idx.find(value);
+      if (it != ptr_to_idx.end()) {
+        node_updates.emplace_back(pi, it->second);
+        matched_input_indices.insert(it->second);
+      }
+    }
+
+    if (node_updates.empty()) continue;
+
+    // Build storage for this node
+    KernelNodeParamState state;
+    state.node = reinterpret_cast<cudaGraphNode_t>(node);
+    state.num_params = static_cast<size_t>(num_params);
+    state.param_vals.resize(num_params);
+    state.param_ptrs.resize(num_params);
+    state.updates = std::move(node_updates);
+
+    for (size_t i = 0; i < static_cast<size_t>(num_params); i++) {
+      state.param_vals[i] =
+          *reinterpret_cast<uint64_t*>(params.kernelParams[i]);
+      state.param_ptrs[i] = &state.param_vals[i];
+    }
+
+    // Cache the full CUDA_KERNEL_NODE_PARAMS so replay_with_params
+    // doesn't need a driver API call per node on the hot path.
+    state.cached_node_params.resize(sizeof(CUDA_KERNEL_NODE_PARAMS));
+    memcpy(state.cached_node_params.data(), &params, sizeof(params));
+
+    total_updates += static_cast<int64_t>(state.updates.size());
+    kernel_node_param_states_.push_back(std::move(state));
+  }
+
+  // Fix up param_ptrs after vector reallocation
+  for (auto& state : kernel_node_param_states_) {
+    for (size_t i = 0; i < state.num_params; i++) {
+      state.param_ptrs[i] = &state.param_vals[i];
+    }
+    // Update cached params to use our stable param_ptrs
+    auto* cached = reinterpret_cast<CUDA_KERNEL_NODE_PARAMS*>(
+        state.cached_node_params.data());
+    cached->kernelParams = state.param_ptrs.data();
+  }
+
+  // Return (matched_indices, num_opaque_kernel_nodes)
+  std::vector<int64_t> result(matched_input_indices.begin(),
+                              matched_input_indices.end());
+  std::sort(result.begin(), result.end());
+  return std::make_tuple(std::move(result), num_opaque_kernel_nodes);
+}
+
+void CUDAGraph::replay_with_params(
+    const std::vector<int64_t>& new_data_ptrs) {
+  TORCH_CHECK(capture_ended_,
+      "Called replay_with_params without a preceding successful capture.");
+  TORCH_CHECK(!kernel_node_param_states_.empty(),
+      "Call build_param_update_plan first");
+
+  // Auto-instantiate like replay() does for keep_graph=True
+  if (!has_graph_exec_) {
+    TORCH_INTERNAL_ASSERT(keep_graph_);
+    instantiate();
+  }
+
+  const auto& api = driver_graph_api();
+  CUgraphExec cu_exec = reinterpret_cast<CUgraphExec>(graph_exec_);
+
+  // Update param values (pure memory writes, no driver calls)
+  for (auto& state : kernel_node_param_states_) {
+    for (auto& [param_idx, input_idx] : state.updates) {
+      TORCH_INTERNAL_ASSERT(
+          input_idx < static_cast<size_t>(new_data_ptrs.size()),
+          "replay_with_params: input_idx ", input_idx,
+          " out of range (got ", new_data_ptrs.size(), " data_ptrs)");
+      state.param_vals[param_idx] =
+          static_cast<uint64_t>(new_data_ptrs[input_idx]);
+    }
+  }
+
+  if (use_batch_update_ && api.has_batch_update && has_graph_) {
+    // Batched path: modify raw graph nodes, then apply all at once via
+    // cudaGraphExecUpdate.  May be faster than per-node exec updates when
+    // many kernel nodes need updating.
+    for (auto& state : kernel_node_param_states_) {
+      CUgraphNode cu_node = reinterpret_cast<CUgraphNode>(state.node);
+      auto* params = reinterpret_cast<const CUDA_KERNEL_NODE_PARAMS*>(
+          state.cached_node_params.data());
+      CUresult res = api.cuGraphKernelNodeSetParams(cu_node, params);
+      TORCH_INTERNAL_ASSERT(res == CUDA_SUCCESS,
+          "cuGraphKernelNodeSetParams_v2 failed: ", res);
+    }
+#if defined(CUDA_VERSION) && CUDA_VERSION >= 12000
+    cudaGraphExecUpdateResultInfo result_info;
+    memset(&result_info, 0, sizeof(result_info));
+    AT_CUDA_CHECK(cudaGraphExecUpdate(graph_exec_, graph_, &result_info));
+#else
+    cudaGraphNode_t error_node = nullptr;
+    cudaGraphExecUpdateResult update_result;
+    AT_CUDA_CHECK(cudaGraphExecUpdate(
+        graph_exec_, graph_, &error_node, &update_result));
+    TORCH_INTERNAL_ASSERT(
+        update_result == cudaGraphExecUpdateSuccess,
+        "cudaGraphExecUpdate failed with result: ",
+        static_cast<int>(update_result));
+#endif
+  } else {
+    // Per-node path: update exec graph directly
+    for (auto& state : kernel_node_param_states_) {
+      CUgraphNode cu_node = reinterpret_cast<CUgraphNode>(state.node);
+      auto* params = reinterpret_cast<const CUDA_KERNEL_NODE_PARAMS*>(
+          state.cached_node_params.data());
+      CUresult res = api.cuGraphExecKernelNodeSetParams(
+          cu_exec, cu_node, params);
+      TORCH_INTERNAL_ASSERT(res == CUDA_SUCCESS,
+          "cuGraphExecKernelNodeSetParams_v2 failed: ", res);
+    }
+  }
+
+  c10::OptionalDeviceGuard device_guard{capture_stream_.device()};
+
+  // Replay generator states (same as normal replay)
+  for (auto& [generator_state, wholegraph_increment] :
+       captured_generator_states_) {
+    generator_state->replay_prologue(wholegraph_increment);
+  }
+
+  // Launch on the current stream (same as replay())
+  AT_CUDA_CHECK(cudaGraphLaunch(graph_exec_, at::cuda::getCurrentCUDAStream()));
+}
+
+#else // USE_ROCM
+
+std::tuple<std::vector<int64_t>, int64_t> CUDAGraph::build_param_update_plan(
+    const std::vector<int64_t>& /*input_data_ptrs*/,
+    const std::unordered_map<std::string, std::vector<int64_t>>& /*kernel_signatures*/) {
+  TORCH_CHECK(false,
+      "Parameterized CUDA graph launch is not supported on ROCm");
+  return {{}, 0};
+}
+
+void CUDAGraph::replay_with_params(
+    const std::vector<int64_t>& /*new_data_ptrs*/) {
+  TORCH_CHECK(false,
+      "Parameterized CUDA graph launch is not supported on ROCm");
+}
+
+#endif // USE_ROCM
 
 } // namespace at::cuda

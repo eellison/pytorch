@@ -5699,6 +5699,151 @@ if HAS_CUDA_AND_TRITON:
                 obs.op_outputs[aten.rand.default][2],
             )
 
+    class CudaGraphParameterizedLaunchTests(TestCase):
+        """Tests for signature-aware parameterized CUDA graph launch."""
+
+        def setUp(self):
+            super().setUp()
+            self.stack = contextlib.ExitStack()
+            self.stack.enter_context(
+                config.patch(
+                    {
+                        "triton.cudagraphs": True,
+                        "triton.cudagraph_trees": True,
+                        "triton.cudagraph_parameterized": True,
+                        "triton.fast_path_cudagraph_asserts": True,
+                    }
+                )
+            )
+            self.stack.enter_context(
+                dynamo_config.patch(automatic_dynamic_shapes=True)
+            )
+            warnings.filterwarnings("ignore")
+
+        def tearDown(self):
+            super().tearDown()
+            torch._dynamo.reset()
+            gc.collect()
+            torch.cuda.empty_cache()
+            self.stack.close()
+            warnings.resetwarnings()
+
+        def test_simple_pointwise(self):
+            @torch.compile(mode="reduce-overhead")
+            def fn(x, y):
+                return x + y * 2.0
+
+            x = torch.randn(64, device="cuda")
+            y = torch.randn(64, device="cuda")
+            for _ in range(3):
+                fn(x, y)
+
+            x2 = torch.randn(64, device="cuda")
+            y2 = torch.randn(64, device="cuda")
+            result = fn(x2, y2)
+            self.assertEqual(result, x2 + y2 * 2.0)
+
+        def test_multi_kernel(self):
+            @torch.compile(mode="reduce-overhead")
+            def fn(x):
+                return x.sin().cos() + x
+
+            x = torch.randn(256, device="cuda")
+            for _ in range(3):
+                fn(x)
+
+            x2 = torch.randn(256, device="cuda")
+            result = fn(x2)
+            self.assertEqual(result, x2.sin().cos() + x2)
+
+        def test_foreach_wide_kernel(self):
+            @torch.compile(mode="reduce-overhead")
+            def fn(params, grads):
+                return torch._foreach_add(params, grads)
+
+            params = [torch.randn(64, device="cuda") for _ in range(8)]
+            grads = [torch.randn(64, device="cuda") for _ in range(8)]
+            for _ in range(3):
+                fn(params, grads)
+
+            params2 = [torch.randn(64, device="cuda") for _ in range(8)]
+            grads2 = [torch.randn(64, device="cuda") for _ in range(8)]
+            result = fn(params2, grads2)
+            expected = [p + g for p, g in zip(params2, grads2)]
+            for r, e in zip(result, expected):
+                self.assertEqual(r, e)
+
+        def test_matmul_with_extern(self):
+            """Matmul uses cublas (extern) — parameterized launch should
+            handle the mixed triton+extern case correctly."""
+
+            @torch.compile(mode="reduce-overhead")
+            def fn(a, b):
+                return (a @ b).relu()
+
+            a = torch.randn(32, 32, device="cuda")
+            b = torch.randn(32, 32, device="cuda")
+            for _ in range(3):
+                fn(a, b)
+
+            a2 = torch.randn(32, 32, device="cuda")
+            b2 = torch.randn(32, 32, device="cuda")
+            result = fn(a2, b2)
+            self.assertEqual(result, (a2 @ b2).relu(), atol=1e-5, rtol=1e-5)
+
+        def test_repeated_replay(self):
+            """Multiple replays with different inputs all produce correct results."""
+
+            @torch.compile(mode="reduce-overhead")
+            def fn(x, y):
+                return x * y + x
+
+            x = torch.randn(128, device="cuda")
+            y = torch.randn(128, device="cuda")
+            for _ in range(3):
+                fn(x, y)
+
+            for _ in range(10):
+                x2 = torch.randn(128, device="cuda")
+                y2 = torch.randn(128, device="cuda")
+                result = fn(x2, y2)
+                self.assertEqual(result, x2 * y2 + x2)
+
+        def test_signature_extraction_types(self):
+            """Verify that triton_meta signature types correctly identify pointers."""
+            from torch._inductor.codecache import PyCodeCache
+            from torch._inductor.runtime.triton_heuristics import CachingAutotuner
+
+            @torch.compile(backend="inductor")
+            def fn(x, y):
+                return x + y
+
+            x = torch.randn(64, device="cuda")
+            y = torch.randn(64, device="cuda")
+            fn(x, y)
+
+            found = False
+            for module in PyCodeCache.modules:
+                for attr_name in dir(module):
+                    if attr_name.startswith("_") or attr_name == "key":
+                        continue
+                    attr = getattr(module, attr_name)
+                    if isinstance(attr, CachingAutotuner):
+                        sig = attr.triton_meta.get("signature", {})
+                        indices = attr.get_tensor_param_indices()
+                        # Verify: every pointer type is in indices
+                        non_constexpr_idx = 0
+                        for name, typ in sig.items():
+                            if typ == "constexpr":
+                                continue
+                            if typ.startswith("*"):
+                                self.assertIn(non_constexpr_idx, indices)
+                            else:
+                                self.assertNotIn(non_constexpr_idx, indices)
+                            non_constexpr_idx += 1
+                        found = True
+            self.assertTrue(found, "No CachingAutotuner found in PyCodeCache")
+
     instantiate_parametrized_tests(CudaGraphTreeTests)
     instantiate_parametrized_tests(TestSAC)
 

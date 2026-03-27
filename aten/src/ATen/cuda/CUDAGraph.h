@@ -10,6 +10,8 @@
 
 #include <limits>
 #include <stack>
+#include <unordered_map>
+#include <string>
 
 #if defined(USE_ROCM) || !(defined(CUDA_VERSION) && CUDA_VERSION >= 12040)
 // this type is not defined until CUDA 12.4, but we use it as a
@@ -87,9 +89,45 @@ struct TORCH_CUDA_CPP_API CUDAGraph {
       cudaGraphConditionalHandle handle,
       const Tensor& scalar_cuda_pred_tensor);
 
+ public:
+  // Parameterized launch: update kernel pointer params instead of copying data.
+  // After recording + instantiation, scan kernel nodes for parameters matching
+  // given input data_ptrs. Returns (matched_indices, num_opaque_kernel_nodes).
+  // matched_indices: input indices with at least one matching kernel param.
+  // num_opaque_kernel_nodes: kernel nodes we couldn't scan (NULL kernelParams).
+  std::tuple<std::vector<int64_t>, int64_t> build_param_update_plan(
+      const std::vector<int64_t>& input_data_ptrs,
+      const std::unordered_map<std::string, std::vector<int64_t>>& kernel_signatures = {});
+
+  // Apply param updates with new data pointers and launch the graph.
+  void replay_with_params(
+      const std::vector<int64_t>& new_data_ptrs);
+
+  bool has_param_update_plan() const {
+    return !kernel_node_param_states_.empty();
+  }
+
  private:
   std::function<bool(cudaStream_t)> create_allocate_filter();
   std::function<bool(cudaStream_t)> create_child_allocate_filter();
+
+  // Parameterized launch: per-node storage with pre-grouped updates
+  struct KernelNodeParamState {
+    cudaGraphNode_t node;
+    size_t num_params;
+    std::vector<void*> param_ptrs;     // our copy of kernelParams pointers
+    std::vector<uint64_t> param_vals;  // storage for parameter values
+    // Updates to apply: (param_idx, input_idx) pairs
+    std::vector<std::pair<size_t, size_t>> updates;
+    // Cached full kernel params from recording (avoids driver API call on replay)
+    std::vector<uint8_t> cached_node_params;
+  };
+
+  std::vector<KernelNodeParamState> kernel_node_param_states_;
+
+  // Whether to use the batched raw-graph-mutation + cudaGraphExecUpdate path
+  // instead of per-node cuGraphExecKernelNodeSetParams calls.
+  bool use_batch_update_ = true;
 
  protected:
   cudaGraph_t graph_ = nullptr;

@@ -487,6 +487,8 @@ class GraphLowering(torch.fx.Interpreter):
         self.graph_id = graph_id
         self.post_grad_graph_id = next(_post_grad_graph_counter)
         self.scheduler: torch._inductor.scheduler.Scheduler = None  # type: ignore[assignment]
+        # Per-input analysis for parameterized CUDA graph launch
+        self.input_triton_only: tuple[bool, ...] | None = None
 
         # record intermediate results for input of UsedDefinedTritonKernels
         # This will be used if autotuning is done in one pass.
@@ -2489,6 +2491,12 @@ class GraphLowering(torch.fx.Interpreter):
 
             self._update_scheduler()
             V.debug.draw_orig_fx_graph(self.orig_gm, self.scheduler.nodes)
+
+            if config.triton.cudagraph_parameterized:
+                self.input_triton_only = (
+                    self.scheduler
+                    .analyze_input_usage_for_cudagraph_parameterization()
+                )
 
             self.wrapper_code.push_codegened_graph(self)
             self.scheduler.codegen()

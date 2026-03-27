@@ -84,6 +84,7 @@ from torch._inductor.cudagraph_utils import (
     PlaceholderInfo,
     WrappedFunction,
 )
+from torch._inductor.virtualized import V
 from torch.multiprocessing.reductions import StorageWeakRef
 from torch.storage import UntypedStorage
 from torch.utils import _pytree as pytree
@@ -399,6 +400,7 @@ def cudagraphify_impl(
     inputs: list[InputType],
     static_input_idxs: Sequence[int],
     *args: Any,
+    input_triton_only: tuple[bool, ...] | None = None,
     **kwargs: Any,
 ) -> ModelType:
     fn_cache: dict[tuple[int, ...], Callable[..., Any]] = {}
@@ -437,7 +439,10 @@ def cudagraphify_impl(
         new_static_input_idxs = remove_unaligned_input_idxs(inputs, static_input_idxs)
         copy_misaligned_inputs(inputs, check_input_idxs)
 
-        fn, out = cudagraphify(model, inputs, new_static_input_idxs, *args, **kwargs)
+        fn, out = cudagraphify(
+            model, inputs, new_static_input_idxs, *args,
+            input_triton_only=input_triton_only, **kwargs,
+        )
         # cudagraph will already clones input locally, no need to copy back
         mutated_input_idxs: OrderedSet[int] = OrderedSet()
         fn = align_inputs_from_check_idxs(
@@ -486,6 +491,7 @@ def cudagraphify(
     placeholders: tuple[PlaceholderInfo, ...] = (),
     mutated_input_idxs: tuple[int, ...] = (),
     compile_id: CompileId | None = None,
+    input_triton_only: tuple[bool, ...] | None = None,
 ) -> tuple[ModelType, OutputType]:
     assert not (is_backward and is_inference)
     mode = (
@@ -507,6 +513,7 @@ def cudagraphify(
         placeholders,
         mutated_input_idxs,
         compile_id,
+        input_triton_only,
     )
 
 
@@ -1018,8 +1025,12 @@ class CUDAGraphNode:
         inputs.clear()
         del inputs
 
-        # graph used for recording model invocation
-        self.graph: torch.cuda.CUDAGraph | None = torch.cuda.CUDAGraph()
+        # graph used for recording model invocation.
+        # keep_graph=True is needed when parameterized launch is used so we
+        # can iterate kernel nodes after recording to build the param plan.
+        self.graph: torch.cuda.CUDAGraph | None = torch.cuda.CUDAGraph(
+            keep_graph=config.triton.cudagraph_parameterized
+        )
 
         # TODO: register_generator_state should potentially take explicit device
         with torch.cuda.device(self.device):
@@ -1077,6 +1088,14 @@ class CUDAGraphNode:
         # are aliases of parameters that are always live.
         self.static_output_tensors: OutputList[Tensor | None] = []
 
+        # Save recording data_ptrs before _record consumes recording_inputs,
+        # needed for building the parameterized launch plan.
+        recording_data_ptrs: list[int] | None = None
+        if config.triton.cudagraph_parameterized:
+            recording_data_ptrs = self._collect_input_data_ptrs(
+                recording_inputs
+            )
+
         # Cleared after recording
         with dynamo_timed_cudagraph("CUDAGraphNode.record", compile_id, mode):
             self.recording_outputs: OutputType | None = self._record(
@@ -1097,7 +1116,254 @@ class CUDAGraphNode:
                 assert isinstance(out, (int, type(None))), type(out)
                 self.outputs_metadata.append(out)
 
+        # Parameterized CUDA graph launch: build a plan to update kernel
+        # pointer parameters instead of copying tensor data on replay.
+        self.parameterized_launch = False
+        self._uncovered_non_static_idx: list[int] = []
+        if recording_data_ptrs is not None and self.graph is not None:
+            self._build_param_update_plan(recording_data_ptrs)
+
         self.graph.replay()
+
+    def _collect_input_data_ptrs(
+        self, recording_inputs: list[InputType]
+    ) -> list[int]:
+        """Collect data_ptrs from recording inputs before they are consumed."""
+        data_ptrs: list[int] = []
+        self._input_idx_to_plan_idx: dict[int, int] = {}
+        for i, inp in enumerate(recording_inputs):
+            if isinstance(inp, torch.Tensor) and inp.data_ptr() != 0:
+                self._input_idx_to_plan_idx[i] = len(data_ptrs)
+                data_ptrs.append(inp.data_ptr())
+        return data_ptrs
+
+    def _collect_kernel_signatures(self) -> dict[str, list[int]]:
+        """Collect tensor parameter indices from compiled kernels.
+
+        Returns mapping optimized for robust kernel identification:
+        - Primary: Maps kernel hash -> tensor parameter indices
+        - Fallback: Maps function name -> tensor parameter indices
+
+        This approach eliminates name collisions by using unique kernel hashes
+        while maintaining compatibility with existing string-based lookup.
+        """
+        from torch._inductor.codecache import PyCodeCache
+        from torch._inductor.runtime.triton_heuristics import CachingAutotuner
+
+        kernel_signatures: dict[str, list[int]] = {}
+
+        # Scan recently compiled kernels for signature information
+        for module in PyCodeCache.modules:
+            for attr_name in dir(module):
+                if attr_name.startswith('_') or attr_name in ['key']:
+                    continue
+
+                attr = getattr(module, attr_name)
+                if isinstance(attr, CachingAutotuner):
+                    if not hasattr(attr, 'get_tensor_param_indices'):
+                        continue
+
+                    tensor_indices = attr.get_tensor_param_indices()
+                    if not tensor_indices:
+                        continue
+
+                    # **PRIMARY: Store by kernel hash (most robust)**
+                    if hasattr(attr, 'launchers') and attr.launchers:
+                        launcher = attr.launchers[0]
+                        if hasattr(launcher, 'cache_hash') and launcher.cache_hash:
+                            kernel_hash = launcher.cache_hash
+                            kernel_signatures[f"hash:{kernel_hash}"] = tensor_indices
+
+                    # **FALLBACK: Store by function name (compatibility)**
+                    kernel_name = attr.fn.__name__
+                    fallback_key = f"name:{kernel_name}"
+                    if fallback_key not in kernel_signatures:
+                        kernel_signatures[fallback_key] = tensor_indices
+
+        return kernel_signatures
+
+    def _build_param_update_plan(
+        self, recording_data_ptrs: list[int]
+    ) -> None:
+        """Build a plan for updating kernel params instead of copying inputs.
+
+        Uses compile-time input usage analysis (input_triton_only) to safely
+        parameterize Triton-only inputs while copying extern-used inputs.
+        Falls back to conservative all-or-nothing when analysis unavailable.
+        """
+        if not recording_data_ptrs:
+            return
+
+        assert self.graph is not None
+
+        # Collect signature information from compiled kernels for safe parameterization
+        kernel_signatures = self._collect_kernel_signatures()
+
+        matched_plan_indices, num_opaque = self.graph.build_param_update_plan(
+            recording_data_ptrs, kernel_signatures
+        )
+
+        non_static_plan_indices = {
+            self._input_idx_to_plan_idx[i]
+            for i in self.non_static_input_idx
+            if i in self._input_idx_to_plan_idx
+        }
+        matched_set = set(matched_plan_indices)
+        covered_non_static = non_static_plan_indices & matched_set
+
+        if not covered_non_static:
+            log.debug(
+                "Parameterized launch: no non-static inputs covered "
+                "(%d input data_ptrs scanned, %d opaque nodes)",
+                len(recording_data_ptrs),
+                num_opaque,
+            )
+            return
+
+        input_triton_only = self.wrapped_function.input_triton_only
+
+        if input_triton_only is not None:
+            # Smart partial parameterization using compile-time analysis.
+            # An input can be parameterized only if:
+            #  1) it is triton-only (no extern kernel reads from its storage)
+            #  2) its data_ptr was matched by at least one kernel param
+            triton_only_inputs: list[int] = []
+            must_copy_inputs: list[int] = []
+
+            for input_idx in self.non_static_input_idx:
+                if input_idx not in self._input_idx_to_plan_idx:
+                    must_copy_inputs.append(input_idx)
+                    continue
+
+                plan_idx = self._input_idx_to_plan_idx[input_idx]
+                if plan_idx not in matched_set:
+                    must_copy_inputs.append(input_idx)
+                    continue
+
+                if (
+                    input_idx < len(input_triton_only)
+                    and input_triton_only[input_idx]
+                ):
+                    triton_only_inputs.append(input_idx)
+                else:
+                    must_copy_inputs.append(input_idx)
+
+            if triton_only_inputs:
+                self.parameterized_launch = True
+                self._uncovered_non_static_idx = must_copy_inputs
+                log.debug(
+                    "Parameterized CUDA graph launch (partial): %d triton-only "
+                    "inputs parameterized, %d extern-used inputs copied",
+                    len(triton_only_inputs),
+                    len(must_copy_inputs),
+                )
+            else:
+                log.debug(
+                    "Parameterized launch disabled: no triton-only inputs "
+                    "(all %d covered inputs used by extern kernels)",
+                    len(covered_non_static),
+                )
+        else:
+            # Conservative fallback: all-or-nothing (pure Triton graphs only)
+            if num_opaque > 0:
+                log.debug(
+                    "Parameterized launch disabled: %d opaque kernel nodes "
+                    "(no compile-time analysis available)",
+                    num_opaque,
+                )
+                return
+
+            if non_static_plan_indices <= matched_set:
+                # Even in conservative mode, we need to detect inputs that are
+                # saved as outputs (for backward) and ensure they're copied to pool.
+                saved_as_output_indices: set[int] = set()
+                graph_input_names = list(V.graph.graph_inputs.keys())
+                for out in V.graph.graph_outputs:
+                    if hasattr(out, 'get_name'):
+                        out_name = out.get_name()
+                        if out_name in graph_input_names:
+                            input_idx = graph_input_names.index(out_name)
+                            if input_idx in self.non_static_input_idx:
+                                saved_as_output_indices.add(input_idx)
+
+                self.parameterized_launch = True
+                # Conservative fallback: copy inputs that are saved as outputs
+                self._uncovered_non_static_idx = list(saved_as_output_indices)
+                log.debug(
+                    "Parameterized CUDA graph launch (conservative): "
+                    "%d inputs parameterized, %d saved-as-output copied (pure Triton graph)",
+                    len(covered_non_static) - len(saved_as_output_indices),
+                    len(saved_as_output_indices),
+                )
+            else:
+                log.debug(
+                    "Parameterized launch disabled: only %d/%d non-static "
+                    "inputs covered by kernel params",
+                    len(covered_non_static),
+                    len(non_static_plan_indices),
+                )
+
+    def _run_with_param_updates(self, new_inputs: list[InputType]) -> None:
+        """Update kernel parameters and launch graph with partial copying.
+
+        For Triton-only inputs: updates kernel node parameters with new data_ptrs.
+        For must-copy inputs (extern-used or saved as output): copies data to
+        static pool addresses, keeps params at the pool address.
+        """
+        uncovered = set(self._uncovered_non_static_idx)
+        non_static = set(self.non_static_input_idx)
+
+        copy_idxs = list(self._uncovered_non_static_idx)
+
+        if copy_idxs:
+            dst_tensors = []
+            src_tensors = []
+            for idx in copy_idxs:
+                if not isinstance(new_inputs[idx], torch.Tensor):
+                    continue
+                expanded_dims = self.expanded_dims[idx]
+                dst_tensors.append(index_expanded_dims(self.reconstructed_inputs[idx], expanded_dims))  # type: ignore[arg-type]
+                src_tensors.append(index_expanded_dims(new_inputs[idx], expanded_dims))  # type: ignore[arg-type]
+            if dst_tensors:
+                torch._foreach_copy_(dst_tensors, src_tensors)
+
+        # Build data_ptrs for replay_with_params.
+        # - Triton-only non-static inputs: send the new user-provided address
+        # - Extern-used or static inputs: send the stable recording address
+        #   (static inputs like saved tensors already live at pool addresses
+        #   and don't change between replays)
+        new_data_ptrs: list[int] = []
+        for i in range(len(new_inputs)):
+            if i in self._input_idx_to_plan_idx:
+                if i not in non_static or i in uncovered:
+                    # Static or extern-used: keep pointing to recording address
+                    rec = self.reconstructed_inputs[i]
+                    if isinstance(rec, torch.Tensor):
+                        new_data_ptrs.append(rec.data_ptr())
+                    else:
+                        new_data_ptrs.append(0)
+                else:
+                    inp = new_inputs[i]
+                    if isinstance(inp, torch.Tensor):
+                        new_data_ptrs.append(inp.data_ptr())
+                    else:
+                        new_data_ptrs.append(0)
+
+        if config.triton.fast_path_cudagraph_asserts:
+            for i in range(len(new_inputs)):
+                if (
+                    i in self._input_idx_to_plan_idx
+                    and i not in uncovered
+                    and i in non_static
+                    and isinstance(new_inputs[i], torch.Tensor)
+                ):
+                    plan_idx = self._input_idx_to_plan_idx[i]
+                    assert new_data_ptrs[plan_idx] != 0, (
+                        f"Parameterized input {i} has null data_ptr"
+                    )
+
+        assert self.graph is not None
+        self.graph.replay_with_params(new_data_ptrs)
 
     def _copy_inputs_and_remove_from_src(
         self, dsts: list[InputType], srcs: list[InputType]
@@ -1150,9 +1416,13 @@ class CUDAGraphNode:
     def run(self, new_inputs: list[InputType]) -> OutputType:
         self.check_static_inputs_are_stable(new_inputs)
 
-        self._copy_inputs_and_remove_from_src(self.reconstructed_inputs, new_inputs)
-
-        self.run_graph()
+        if self.parameterized_launch:
+            self._run_with_param_updates(new_inputs)
+        else:
+            self._copy_inputs_and_remove_from_src(
+                self.reconstructed_inputs, new_inputs
+            )
+            self.run_graph()
 
         outputs = self.reconstruct_outputs()
         new_inputs.clear()
@@ -2434,6 +2704,7 @@ class CUDAGraphTreeManager:
         placeholders: tuple[PlaceholderInfo, ...],
         mutated_input_idxs: tuple[int, ...],
         compile_id: CompileId | None,
+        input_triton_only: tuple[bool, ...] | None = None,
     ) -> tuple[
         ModelType,
         OutputType,
@@ -2447,6 +2718,7 @@ class CUDAGraphTreeManager:
             tuple(t for t in constants if isinstance(t, torch.Tensor) and t.is_cuda),
             placeholders,
             mutated_input_idxs,
+            input_triton_only=input_triton_only,
         )
         self.id_to_mode[id] = mode
         self.id_to_compile_id[id] = compile_id

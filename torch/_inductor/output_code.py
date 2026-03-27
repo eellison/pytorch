@@ -252,6 +252,7 @@ def cudagraph_post_compile(
             constants=tuple(tensor_constants.values()),
             placeholders=placeholders,
             mutated_input_idxs=tuple(compiled_graph.mutated_input_idxs),
+            input_triton_only=cached_info.input_triton_only,
         )
 
     else:
@@ -330,6 +331,7 @@ def cudagraph_partition_post_compile(
         mutated_input_idxs,
         compiled_graph.cudagraph_info.stack_traces,
         tensor_constants,
+        input_triton_only=compiled_graph.cudagraph_info.input_triton_only,
     )
 
     prepare_cudagraph_post_compile(
@@ -356,6 +358,7 @@ def cudagraph_partition_post_compile(
             constants=tuple(partition_metadata.constants.values()),
             placeholders=partition_metadata.placeholders,
             mutated_input_idxs=tuple(partition_metadata.mutated_input_idxs),
+            input_triton_only=partition_metadata.input_triton_only,
         )
         cudagraphify_fns.append(cudagraphify_fn)
 
@@ -617,7 +620,10 @@ class CompiledFxGraph(OutputCode):
                 cudagraph_fail_reasons = [s for b, s in cudagraph_tests if not b]
                 placeholders = tuple(get_placeholder_info(gm.graph))
                 cudagraph_info = CudagraphCachedInfo(
-                    placeholders, stack_traces, cudagraph_fail_reasons
+                    placeholders,
+                    stack_traces,
+                    cudagraph_fail_reasons,
+                    input_triton_only=graph.input_triton_only,
                 )
 
         self.cudagraph_info = cudagraph_info

@@ -126,5 +126,31 @@ void THCPGraph_init(PyObject* module) {
       .def(
           "end_capture_to_conditional_node",
           torch::wrap_pybind_function_no_gil(
-              &::at::cuda::CUDAGraph::end_capture_to_conditional_node));
+              &::at::cuda::CUDAGraph::end_capture_to_conditional_node))
+      .def(
+          "build_param_update_plan",
+          [](::at::cuda::CUDAGraph& self,
+             std::vector<int64_t> input_data_ptrs,
+             std::unordered_map<std::string, std::vector<int64_t>>
+                 kernel_signatures) {
+            py::gil_scoped_release release;
+            return self.build_param_update_plan(
+                input_data_ptrs, kernel_signatures);
+          },
+          py::arg("input_data_ptrs"),
+          py::arg("kernel_signatures") =
+              std::unordered_map<std::string, std::vector<int64_t>>{})
+      .def(
+          "replay_with_params",
+          [](::at::cuda::CUDAGraph& self,
+             std::vector<int64_t> new_data_ptrs) {
+            py::gil_scoped_release release;
+            self.replay_with_params(new_data_ptrs);
+          },
+          py::arg("new_data_ptrs"))
+      .def(
+          "has_param_update_plan",
+          [](::at::cuda::CUDAGraph& self) {
+            return self.has_param_update_plan();
+          });
 }

@@ -409,6 +409,15 @@ class CachingAutotuner(KernelInterface):
         )
         self.filename = filename
 
+        # Extract signature information for safe parameterized CUDA graph launch
+        self._tensor_param_indices: list[int] = []
+        if hasattr(self.fn, 'signature') and hasattr(self.fn, 'constexprs'):
+            try:
+                self._extract_tensor_param_indices()
+            except Exception:
+                # If signature extraction fails, fall back to conservative approach
+                pass
+
         # used for profiling
         self.kernel_hash: str = ""
 
@@ -428,6 +437,7 @@ class CachingAutotuner(KernelInterface):
         self.dump_launch_tensors = (
             os.environ.get("TORCHINDUCTOR_DUMP_LAUNCH_TENSORS", "0") == "1"
         )
+
         self.kernels_to_dump = os.environ.get(
             "TORCHINDUCTOR_KERNELS_TO_DUMP", ""
         ).split(",")
@@ -492,6 +502,52 @@ class CachingAutotuner(KernelInterface):
     def set_compile_info(self, compile_id: CompileId | None, is_backward: bool) -> None:
         self.compile_id = compile_id
         self.is_backward = is_backward
+
+    def _extract_tensor_param_indices(self) -> None:
+        """Extract which parameters are tensor pointers from triton_meta signature.
+
+        Uses the type information from triton_meta["signature"] which maps
+        parameter names to their Triton types. Pointer types (tensor data
+        pointers) start with "*" (e.g., "*fp32", "*fp16"), while scalar
+        types are "i32", "i64", "fp64", "constexpr", etc.
+        """
+        self._tensor_param_indices = []
+        sig = self.triton_meta.get("signature", {})
+        # triton_meta["signature"] is {param_name: type_str}
+        # e.g. {"in_ptr0": "*fp32", "xnumel": "i32", "XBLOCK": "constexpr"}
+        # Pointer types start with "*", constexprs are not runtime params.
+        non_constexpr_idx = 0
+        for param_name, type_str in sig.items():
+            if type_str == "constexpr":
+                continue
+            if type_str.startswith("*"):
+                self._tensor_param_indices.append(non_constexpr_idx)
+            non_constexpr_idx += 1
+
+    def get_tensor_param_indices(self) -> list[int]:
+        """Return the indices of parameters that are tensor pointers."""
+        return self._tensor_param_indices.copy()
+
+    def get_unique_kernel_id(self) -> str:
+        """Get unique identifier for this compiled kernel to avoid name collisions.
+
+        Returns a unique string that combines the function name with identifying
+        information from the compiled kernel (cache_hash, config, etc.) to
+        disambiguate between different variants that might have the same name.
+        """
+        if hasattr(self, 'launchers') and self.launchers:
+            launcher = self.launchers[0]
+            if hasattr(launcher, 'cache_hash'):
+                # Use cache hash as unique identifier (most robust)
+                return f"{self.fn.__name__}#{launcher.cache_hash}"
+            elif hasattr(launcher, 'config'):
+                # Fallback: use config signature
+                config = launcher.config
+                config_sig = f"{getattr(config, 'num_warps', 0)}w{getattr(config, 'num_stages', 0)}s"
+                return f"{self.fn.__name__}#{config_sig}"
+
+        # Fallback: use function name + object id when no launcher available yet
+        return f"{self.fn.__name__}#{id(self.fn)}"
 
     def precompile(
         self,

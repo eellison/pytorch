@@ -65,6 +65,9 @@ class WrappedFunction:
     constants: tuple[torch.Tensor, ...]
     placeholders: Sequence[PlaceholderInfo]
     mutated_input_idxs: Sequence[int]
+    # Per-input: True = triton-only (safe to parameterize), False = extern-used.
+    # None when analysis not available.
+    input_triton_only: tuple[bool, ...] | None = None
 
 
 def get_mutating_use_stack_trace_from_node(
@@ -355,6 +358,10 @@ class CudagraphCachedInfo:
     placeholders: Sequence[PlaceholderInfo]
     stack_traces: list[str | None]
     cudagraph_fail_reasons: list[str]
+    # Per-input: True if input is only read by Triton kernels (safe to
+    # parameterize in CUDA graphs), False if read by any extern kernel.
+    # None when analysis was not performed.
+    input_triton_only: tuple[bool, ...] | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -368,6 +375,7 @@ class CudagraphMetadata:
     mutated_input_idxs: OrderedSet[int]
     stack_traces: list[str | None]
     constants: dict[str, torch.Tensor]
+    input_triton_only: tuple[bool, ...] | None = None
 
 
 def get_partition_cudagraph_metadata(
@@ -415,12 +423,30 @@ def get_partition_cudagraph_metadata(
         name: metadata.constants[name] for name in partition_map.constant_names
     }
 
+    # Map input_triton_only per-partition
+    partition_input_triton_only: tuple[bool, ...] | None = None
+    if metadata.input_triton_only is not None:
+        partition_triton_only_list: list[bool] = []
+        for graph_input_idx in partition_map.input_index_mapping:
+            if (
+                graph_input_idx is not None
+                and graph_input_idx < len(metadata.input_triton_only)
+            ):
+                partition_triton_only_list.append(
+                    metadata.input_triton_only[graph_input_idx]
+                )
+            else:
+                # Unknown partition input — conservatively mark as extern-used
+                partition_triton_only_list.append(False)
+        partition_input_triton_only = tuple(partition_triton_only_list)
+
     return CudagraphMetadata(
         partition_placeholders,
         partition_static_input_idxs,
         partition_mutated_input_idxs,
         partition_stack_traces,
         partition_constants,
+        input_triton_only=partition_input_triton_only,
     )
 
 
