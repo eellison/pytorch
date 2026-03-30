@@ -328,6 +328,110 @@ class NestedReductionTest(TestBase):
         if inductor_config.triton.nested_reduction:
             self.assertEqual(metrics.generated_kernel_count, 1)
 
+    def test_pass3_rmsnorm_nvfp4(self):
+        """Pass 3: fuse pair-wise NVFP4 quantization into the kernel.
+
+        Tests the _IterationRangeContext split/broadcast path end-to-end:
+        full-resolution values are split into even/odd halves, pass 2
+        scale is broadcast, and inline_asm_elementwise runs through
+        the remapped handler.
+        Requires sm_100+ for cvt.rn.satfinite.e2m1x2.f32.
+        """
+        import torch.nn.functional as F
+        from torch._higher_order_ops.inline_asm_elementwise import (
+            inline_asm_elementwise,
+        )
+
+        cc = torch.cuda.get_device_capability()
+        if cc[0] < 10:
+            self.skipTest("requires sm_100+ (Blackwell)")
+
+        B, D, G = 128, 4096, 16
+
+        def f(x, weight):
+            x = F.rms_norm(x, (D,), weight)
+            x = x.view(B, D // G, G)
+            amax = x.abs().amax(dim=-1)
+            scale = (amax / 448.0).clamp(min=1e-12).to(torch.float8_e4m3fn)
+            xg = x.view(B, D // G, G // 2, 2)
+            scale_f = scale.float().unsqueeze(-1)
+            even = xg[..., 0].float() / scale_f
+            odd = xg[..., 1].float() / scale_f
+            packed = inline_asm_elementwise(
+                even, odd,
+                asm_str=(
+                    "{.reg .b8 t;"
+                    " cvt.rn.satfinite.e2m1x2.f32 t, $2, $1;"  # noqa: B950
+                    " cvt.u32.u8 $0, t;}"
+                ),
+                constraints="=r,f,f",
+                dtype=torch.int32,
+                is_pure=True,
+                pack=1,
+            )
+            return packed.to(torch.uint8).view(B, D // 2), scale
+
+        x = torch.randn(B, D, device=GPU_TYPE)
+        w = torch.randn(D, device=GPU_TYPE)
+
+        # inline_asm_elementwise eager uses jiterator which may not
+        # support the target arch, so only verify the compiled path
+        # produces 1 fused kernel and runs without error.
+        compiled = torch.compile(f)
+        compiled(x, w)
+        self.check_fusion()
+        if inductor_config.triton.nested_reduction:
+            self.assertEqual(metrics.generated_kernel_count, 1)
+
+    def test_pass3_rmsnorm_nvfp4_B1(self):
+        """Pass 3 with B=1: edge case where XBLOCK=1.
+
+        Verifies that the iteration range context correctly handles
+        the trivial x-dimension (numel=1).
+        """
+        import torch.nn.functional as F
+        from torch._higher_order_ops.inline_asm_elementwise import (
+            inline_asm_elementwise,
+        )
+
+        cc = torch.cuda.get_device_capability()
+        if cc[0] < 10:
+            self.skipTest("requires sm_100+ (Blackwell)")
+
+        B, D, G = 1, 4096, 16
+
+        def f(x, weight):
+            x = F.rms_norm(x, (D,), weight)
+            x = x.view(B, D // G, G)
+            amax = x.abs().amax(dim=-1)
+            scale = (amax / 448.0).clamp(min=1e-12).to(torch.float8_e4m3fn)
+            xg = x.view(B, D // G, G // 2, 2)
+            scale_f = scale.float().unsqueeze(-1)
+            even = xg[..., 0].float() / scale_f
+            odd = xg[..., 1].float() / scale_f
+            packed = inline_asm_elementwise(
+                even, odd,
+                asm_str=(
+                    "{.reg .b8 t;"
+                    " cvt.rn.satfinite.e2m1x2.f32 t, $2, $1;"  # noqa: B950
+                    " cvt.u32.u8 $0, t;}"
+                ),
+                constraints="=r,f,f",
+                dtype=torch.int32,
+                is_pure=True,
+                pack=1,
+            )
+            return packed.to(torch.uint8).view(B, D // 2), scale
+
+        x = torch.randn(B, D, device=GPU_TYPE)
+        w = torch.randn(D, device=GPU_TYPE)
+        compiled = torch.compile(f)
+        compiled(x, w)
+        self.check_fusion()
+        if inductor_config.triton.nested_reduction:
+            self.assertEqual(metrics.generated_kernel_count, 1)
+
+
 @inductor_config.patch(
     "triton.nested_reduction",
     not inductor_config.triton.nested_reduction,

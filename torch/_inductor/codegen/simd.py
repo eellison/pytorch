@@ -1327,6 +1327,203 @@ def _decompose_flat_index(body, flat):
     return sn_iter
 
 
+class _IterationRangeContext:
+    """Context for running consumer bodies at a remapped iteration range.
+
+    Manages the relationship between a parent iteration range and a
+    derived child range.  The parent's dimension is divided by `factor`
+    to produce the child range; values in registers can then be split
+    (full-resolution), broadcast (reduced-resolution), or passed
+    through (scalar / pre-computed) to match the child range.
+
+    The `parent_last` flag controls which axis of the 2D tile is
+    factored: True means the parent tree maps to the last axis (e.g.
+    r-dimension), False means the first axis (e.g. x-dimension).
+    """
+
+    def __init__(
+        self, kernel, parent_tree, other_tree, factor,
+        *, parent_last,
+    ):
+        self.kernel = kernel
+        self.factor = factor
+
+        tp = parent_tree.prefix.upper()
+        op = other_tree.prefix.upper()
+        child_block = f"{tp}BLOCK // {factor}"
+
+        if parent_last:
+            self._child_shape = (f"{op}BLOCK", child_block)
+        else:
+            self._child_shape = (child_block, f"{op}BLOCK")
+
+        self._tp = tp
+        self._op = op
+        self._child_block = child_block
+        self._parent_last = parent_last
+
+        self._values: dict[str, tuple | object] = {}
+
+        child_len = int(V.graph.sizevars.optimization_hint(
+            parent_tree.numel // factor, fallback=2048
+        ))
+        self._child_sym = kernel.create_sub_range(
+            parent_tree, child_len
+        )
+        # Look up the other tree's iteration variable through the
+        # range tree so the kernel emits it properly (handles edge
+        # cases like XBLOCK=1 where raw symbols aren't defined).
+        other_entry = other_tree.lookup(
+            sympy.Integer(1), other_tree.numel
+        )
+        self._flat_index = (
+            other_entry.symbol() * child_len + self._child_sym
+        )
+
+    def register_split(self, name, value):
+        """Split a full-resolution value into `factor` parts via tl.split.
+
+        The parent dimension is reshaped so that the factor axis is
+        last (as required by tl.split), then split.  When parent_last
+        is False, the value is transposed before reshape and each part
+        is transposed back so the original axis order is preserved.
+
+        If the parent dimension is scalar (size 1), the value is
+        registered as a passthrough instead.
+        """
+        assert self.factor == 2, (
+            f"tl.split only supports factor=2, got {self.factor}"
+        )
+        # Auto-detect scalar parent dim → passthrough.
+        var_shape = getattr(value, 'shape', None)
+        if var_shape and len(var_shape) >= 2:
+            parent_dim_idx = 1 if self._parent_last else 0
+            if str(var_shape[parent_dim_idx]) == "1":
+                self._values[name] = value
+                return
+
+        buf_dtype = (
+            V.graph.get_dtype(name)
+            if name in V.graph.name_to_buffer
+            else torch.float32
+        )
+        # other_dim is the non-parent axis of the 2D tile.
+        if var_shape and len(var_shape) == 2:
+            other_dim = str(var_shape[0] if self._parent_last
+                            else var_shape[1])
+        else:
+            other_dim = f"{self._op}BLOCK"
+
+        # tl.split always splits the last dim, so factor must be last.
+        # Reshape to [other_dim, child_block, factor] with factor last.
+        reshape = f"[{other_dim}, {self._child_block}, {self.factor}]"
+        part_names = [f"_rm_{name}_{i}" for i in range(self.factor)]
+
+        if self._parent_last:
+            # Parent is already the last axis — reshape + split directly.
+            part_shape = (other_dim, self._child_block)
+            self.kernel.compute.writeline(
+                f"{', '.join(part_names)} = tl.split("
+                f"tl.reshape({value}, {reshape}))"
+            )
+        else:
+            # Parent is the first axis (not exercised by current
+            # patterns — all existing nested reductions have group_size in
+            # the r-dimension).  Transpose so parent becomes last,
+            # reshape + split, then transpose each part back.
+            part_shape = (self._child_block, other_dim)
+            t_names = [f"{pn}_t" for pn in part_names]
+            self.kernel.compute.writeline(
+                f"{', '.join(t_names)} = tl.split("
+                f"tl.reshape(tl.trans({value}), {reshape}))"
+            )
+            for pn, tn in zip(part_names, t_names):
+                self.kernel.compute.writeline(
+                    f"{pn} = tl.trans({tn})"
+                )
+
+        parts = []
+        for pn in part_names:
+            parts.append(self.kernel.cse.generate(
+                self.kernel.compute, pn,
+                dtype=buf_dtype, shape=part_shape,
+            ))
+        self._values[name] = tuple(parts)
+
+    def register_broadcast(self, name, value, group_size_str):
+        """Broadcast a reduced-resolution value to the child range.
+
+        The value has one element per group (shape [..., num_groups]).
+        Each element is repeated `group_size // factor` times to fill
+        the child block.
+
+        Args:
+            group_size_str: Triton string expression for the group
+                size (e.g. "16" or a constexpr).  Used to compute
+                the number of groups and elements per group.
+        """
+        bc_dtype = (
+            V.graph.get_dtype(name)
+            if name in V.graph.name_to_buffer
+            else torch.float32
+        )
+        cb = self._child_block
+        gs = f"{self._tp}BLOCK // {group_size_str}"
+        epg = f"{group_size_str} // {self.factor}"
+        op = self._op
+        if self._parent_last:
+            bc = (
+                f"tl.reshape(tl.reshape({value},"
+                f" [{op}BLOCK, {gs}, 1])"
+                f" * tl.full([1, 1, {epg}],"
+                f" 1, tl.float32),"
+                f" [{op}BLOCK, {cb}])"
+            )
+        else:
+            bc = (
+                f"tl.reshape(tl.reshape({value},"
+                f" [{gs}, 1, {op}BLOCK])"
+                f" * tl.full([1, {epg}, 1],"
+                f" 1, tl.float32),"
+                f" [{cb}, {op}BLOCK])"
+            )
+        self._values[name] = self.kernel.cse.generate(
+            self.kernel.compute, bc,
+            dtype=bc_dtype, shape=self._child_shape,
+        )
+
+    def register_by_shape(self, name, value, group_size_str):
+        """Auto-classify and register a value based on its shape.
+
+        Inspects the parent dimension of the value's shape:
+        - Full parent block (e.g. "RBLOCK") → split
+        - Reduced (e.g. "RBLOCK // 16") → broadcast
+        - Scalar ("1") → passthrough (handled by register_split)
+        """
+        var_shape = getattr(value, 'shape', None)
+        if var_shape and len(var_shape) >= 2:
+            parent_dim = str(var_shape[1 if self._parent_last else 0])
+            if parent_dim != f"{self._tp}BLOCK" and parent_dim != "1":
+                self.register_broadcast(name, value, group_size_str)
+                return
+        self.register_split(name, value)
+
+    def is_registered(self, name):
+        return name in self._values
+
+    def get(self, name):
+        """Get mapped value: tuple for split, single value otherwise."""
+        return self._values.get(name)
+
+    @property
+    def flat_index(self):
+        return self._flat_index
+
+    def decompose_into_iter_vars(self, body):
+        """Decompose this context's flat index into body's iter_vars."""
+        return _decompose_flat_index(body, self._flat_index)
+
+
 @dataclasses.dataclass
 class _Pass2Coords:
     """Pass 2 coordinate system for stores and epilogue loads."""
@@ -2407,6 +2604,90 @@ class SIMDScheduling(BaseScheduling):
             kernel.post_loop_combine.clear()
             kernel.post_loop_store.clear()
 
+            # ---- Pass 3: fuse downstream pair-wise consumers ----
+            # When group_size is even, downstream pointwise nodes that
+            # operate at half resolution (numel == pass1 numel // 2)
+            # can be fused by splitting in-register data into
+            # even/odd halves. All reads must be satisfiable from
+            # registers (context values, CSE cache, or graph inputs
+            # loaded in pass 1).
+            pass3_nodes: list[scheduler.SchedulerNode] = []
+            half_numel = numel1 * rnumel1 // 2
+            group_size_is_even = sizevars.statically_known_equals(
+                sympy.Mod(group_size, 2), 0
+            )
+            # Pass 3 requires all split data in one tile.
+            # persistent_reduction guarantees RBLOCK covers rnumel,
+            # so pass 3 works when group_size is in r (parent_last=True).
+            # When group_size is in x (parent_last=False), XBLOCK is
+            # tiled across program IDs and can't be made persistent,
+            # so pass 3 is not supported.
+            if (
+                kernel.persistent_reduction
+                and group_size_is_even
+                and isinstance(rnumel1, (int, sympy.Integer))
+                and small_dim_in_r
+            ):
+                assert self.scheduler is not None
+                available = set(kernel.inline_reduction_buffers.keys())
+                available |= set(kernel.cse.store_cache.keys())
+                available |= set(kernel.graph_input_loads.keys())
+                fused = set(node.get_operation_names())
+
+                to_check: collections.deque[
+                    scheduler.BaseSchedulerNode
+                ] = collections.deque()
+                for bn in available:
+                    if bn not in self.scheduler.name_to_buf:
+                        continue
+                    for u in self.scheduler.name_to_buf[bn].users:
+                        if not u.is_weak and \
+                                u.node.get_name() not in fused:
+                            to_check.append(u.node)
+
+                checked: set[str] = set()
+                while to_check:
+                    c = to_check.popleft()
+                    if not isinstance(c, scheduler.SchedulerNode):
+                        continue
+                    if not hasattr(c, 'read_writes'):
+                        continue
+                    cn = c.get_name()
+                    if cn in checked or cn in fused:
+                        continue
+                    checked.add(cn)
+                    if c.is_reduction():
+                        continue
+                    reads = {d.name for d in c.read_writes.reads}
+                    if not reads.issubset(available):
+                        continue
+                    # Must be exactly half resolution
+                    if not hasattr(c, 'group'):
+                        continue
+                    _, (cn2, _) = c.group
+                    if not sizevars.statically_known_equals(
+                        cn2, half_numel
+                    ):
+                        continue
+                    pass3_nodes.append(c)
+                    fused.add(cn)
+                    available.add(cn)
+                    for d in c.read_writes.writes:
+                        available.add(d.name)
+                        if d.name in self.scheduler.name_to_buf:
+                            for u in self.scheduler.name_to_buf[
+                                d.name
+                            ].users:
+                                if not u.is_weak:
+                                    to_check.append(u.node)
+
+            if pass3_nodes:
+                self._codegen_pass3_consumers(
+                    kernel, node, pass3_nodes,
+                    group_tree, other_tree,
+                    small_dim_in_r, group_size_str,
+                )
+
             kernel.codegen_body()
 
         config_patches = self._collect_config_patches(combined_schedule)
@@ -2628,6 +2909,82 @@ class SIMDScheduling(BaseScheduling):
         handler.maybe_store_for_external_users(
             node.get_operation_names(), self.scheduler,
         )
+
+    def _codegen_pass3_consumers(
+        self, kernel, node, pass3_nodes,
+        group_tree, other_tree, small_dim_in_r, group_size_str,
+    ):
+        """Fuse downstream consumers at a derived iteration range.
+
+        Splits full-resolution in-register data, broadcasts pass 2
+        values, then runs each consumer's body through a remapped
+        handler. All ops (including inline_asm_elementwise) pass
+        through to normal codegen.  Values are auto-classified as
+        split vs broadcast based on their shape.
+        """
+        ctx = _IterationRangeContext(
+            kernel, group_tree, other_tree, factor=2,
+            parent_last=small_dim_in_r,
+        )
+
+        # Register all values that pass 3 consumers read.
+        # register_by_shape auto-classifies each value as split
+        # (full parent resolution), broadcast (reduced), or
+        # passthrough (scalar) based on its shape.
+        pass3_reads: set[str] = set()
+        for sn in pass3_nodes:
+            for d in sn.read_writes.reads:
+                pass3_reads.add(d.name)
+
+        # Sources: inline_reduction_buffers, graph_input_loads,
+        # and store_cache (which includes pass 1 outputs,
+        # and pass 2 outputs).
+        for bname, bval in kernel.inline_reduction_buffers.items():
+            if bval is not None and bname in pass3_reads:
+                ctx.register_by_shape(bname, bval, group_size_str)
+        for bname, bval in kernel.graph_input_loads.items():
+            if not ctx.is_registered(bname) and bname in pass3_reads:
+                ctx.register_by_shape(bname, bval, group_size_str)
+        for bname in pass3_reads:
+            if ctx.is_registered(bname):
+                continue
+            bval = kernel.cse.store_cache.get(bname)
+            if bval is not None:
+                ctx.register_by_shape(bname, bval, group_size_str)
+
+        # 3. Register outputs before body runs.
+        for sn in pass3_nodes:
+            for d in sn.read_writes.writes:
+                kernel.args.output(d.name)
+
+        # 4. Run consumer bodies through the remapped handler.
+        handler = _RemappedOpsHandler(
+            V.get_ops_handler(), kernel=kernel, values=ctx,
+        )
+        for sn in pass3_nodes:
+            sn_iter = ctx.decompose_into_iter_vars(sn._body)
+            with V.set_ops_handler(handler), \
+                    kernel.set_current_node(sn):
+                sn._body(sn_iter)
+
+        # 5. Mark pass3 nodes as run, remove inline buffers.
+        with V.set_kernel_handler(kernel):
+            for sn in pass3_nodes:
+                sn.mark_run()
+                self.scheduler.removed_ops.add(sn.get_name())
+
+        all_fused = set(node.get_operation_names())
+        for sn in pass3_nodes:
+            all_fused.add(sn.get_name())
+        for bname in list(kernel.inline_reduction_buffers.keys()):
+            if bname not in self.scheduler.name_to_buf:
+                continue
+            buf = self.scheduler.name_to_buf[bname]
+            if all(
+                u.is_weak or u.node.get_name() in all_fused
+                for u in buf.users
+            ):
+                V.graph.removed_buffers.add(bname)
 
     def _codegen_nodes(
         self,
