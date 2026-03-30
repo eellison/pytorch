@@ -61,6 +61,7 @@ from ..utils import (
     sympy_subs,
     unique,
 )
+from ..ops_handler import WrapperHandler
 from ..virtualized import ops, OpsWrapper, V
 from .block_analysis import BlockPatternMatcher
 from .common import CSEVariable, index_prevent_reordering, Kernel, PythonPrinter
@@ -461,6 +462,9 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
         self.initialize_range_tree(pid_cache)
 
         self.rsplit_size = 0
+        self.nested_reduction_min_xblock: int | None = None
+        self.nested_reduction_min_rblock: int | None = None
+        self.nested_reduction_max_xblock: int | None = None
         self.saved_partial_accumulate: list[PartialAccumulate] = []
 
     def codegen_template_body(
@@ -1302,6 +1306,235 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
         pass
 
 
+def _flatten_iter_vars(iter_vars, var_ranges, values):
+    """Compute a flat index from iter_vars and their values."""
+    flat = values[0]
+    for i in range(1, len(iter_vars)):
+        flat = flat * var_ranges[iter_vars[i]] + values[i]
+    return flat
+
+
+def _decompose_flat_index(body, flat):
+    """Decompose a flat index into body's iter_vars."""
+    sn_iter = []
+    remaining = flat
+    for i in range(len(body.iter_vars)):
+        se = sympy.Integer(1)
+        for j in range(i + 1, len(body.iter_vars)):
+            se *= body.var_ranges[body.iter_vars[j]]
+        sn_iter.append(FloorDiv(remaining, se))
+        remaining = ModularIndexing(remaining, 1, se)
+    return sn_iter
+
+
+@dataclasses.dataclass
+class _Pass2Coords:
+    """Pass 2 coordinate system for stores and epilogue loads."""
+
+    subs_map: dict
+    x_sym: sympy.Symbol
+    r_sym: sympy.Symbol
+    x_expr: str
+    r_expr: str
+    x_bound: str
+    r_bound: str
+
+
+class _Pass2OpsHandler(WrapperHandler):  # type: ignore[type-arg]
+    """Handler for pass 2 of nested reduction.
+
+    Intercepts loads to return pass 1 CSE values from registers,
+    reshapes + reduces for the group reduction, and stores the
+    result with pass 2 coordinates.
+    """
+
+    def __init__(
+        self, inner, node1_cse_vars, kernel, *,
+        reshape_shape, reduce_axis, output_shape,
+        coords, store_name, deferred_line_name,
+        has_epilogue,
+    ):
+        super().__init__(inner)
+        self._node1_cse_vars = node1_cse_vars
+        self._kernel = kernel
+        self._reshape_shape = reshape_shape
+        self._reduce_axis = reduce_axis
+        self._output_shape = output_shape
+        self._coords = coords
+        self._store_name = store_name
+        self._deferred_line_name = deferred_line_name
+        self._has_epilogue = has_epilogue
+        self._reduction_name: str | None = None
+
+    def load(self, name, index):
+        if name in self._node1_cse_vars:
+            return self._node1_cse_vars[name]
+        return self._inner.load(name, index)
+
+    def reduction(self, dtype, src_dtype, reduction_type, value):
+        k = self._kernel
+        reshaped = k.cse.generate(
+            k.compute,
+            f"tl.reshape({value},"
+            f" [{', '.join(self._reshape_shape)}])",
+            dtype=src_dtype,
+            shape=self._reshape_shape,
+        )
+        from .triton import get_triton_reduction_function
+
+        reduce_fn = get_triton_reduction_function(reduction_type)
+        return k.cse.generate(
+            k.compute,
+            f"{reduce_fn}({reshaped}, {self._reduce_axis})",
+            dtype=dtype,
+            shape=self._output_shape,
+        )
+
+    def store_reduction(self, name, index, value):
+        from ..codegen.common import DeferredLine
+
+        k = self._kernel
+        idx_str = k.index_to_str(index.subs(self._coords.subs_map))
+
+        # Emit pass2 coordinate setup so epilogue loads can
+        # reference pass2_mask.
+        c = self._coords
+        for line in [
+            f"{c.x_sym} = {c.x_expr}",
+            f"{c.r_sym} = {c.r_expr}",
+            f"pass2_idx = {idx_str}",
+            f"pass2_mask = ({c.x_sym} < {c.x_bound})"
+            f" & ({c.r_sym} < {c.r_bound})",
+        ]:
+            k.compute.writeline(line)
+
+        # Save to CSE cache for epilogue / pass 3.
+        self._reduction_name = name
+        k.cse.store_cache[name] = value
+        if not self._has_epilogue:
+            var = k.args.output(self._store_name)
+            k.stores.writeline(
+                DeferredLine(
+                    self._deferred_line_name,
+                    f"tl.store({var} + pass2_idx,"
+                    f" {value}, pass2_mask)",
+                )
+            )
+
+    def maybe_store_for_external_users(self, fused_names, scheduler):
+        """Store the reduction output if external consumers need it.
+
+        Called after the epilogue completes.  The epilogue reads from
+        CSE cache, so this extra store doesn't interfere with it.
+        """
+        from ..codegen.common import DeferredLine
+
+        if not self._has_epilogue:
+            return  # Already stored in store_reduction
+        name = self._reduction_name
+        if name is None or name not in scheduler.name_to_buf:
+            return
+        buf = scheduler.name_to_buf[name]
+        if all(
+            u.is_weak or u.node.get_name() in fused_names
+            for u in buf.users
+        ):
+            return  # All users are internal
+        k = self._kernel
+        var = k.args.output(self._store_name)
+        val = k.cse.store_cache[name]
+        k.stores.writeline(
+            DeferredLine(
+                name,
+                f"tl.store({var} + pass2_idx,"
+                f" {val}, pass2_mask)",
+            )
+        )
+
+
+class _RemappedOpsHandler(WrapperHandler):  # type: ignore[type-arg]
+    """Unified handler for loads/stores at a remapped iteration range.
+
+    Used for:
+    - Pass 2 epilogue (subs_map + mask for pass 2 coordinates)
+    - Full-resolution epilogue (context values + fallthrough)
+    - Pass 3 consumers (context with split/broadcast values)
+
+    Load priority: context values → store_cache → global memory
+    (with subs_map) or inner handler fallthrough.
+    """
+
+    def __init__(
+        self, inner, kernel, *,
+        values=None,
+        subs_map=None,
+        mask=None,
+        output_name=None,
+        output_shape=None,
+    ):
+        super().__init__(inner)
+        self._kernel = kernel
+        self._values = values
+        self._subs_map = subs_map
+        self._mask = mask
+        self._output_name = output_name
+        self._output_shape = output_shape
+
+    def load(self, name, index):
+        # 1. Check pre-computed values (split/broadcast/passthrough)
+        if self._values is not None:
+            val = self._values.get(name)
+            if val is not None:
+                if isinstance(val, tuple):
+                    const = index.subs(
+                        {s: 0 for s in index.free_symbols}
+                    )
+                    return val[int(const) % len(val)]
+                return val
+
+        # 2. Check store_cache
+        if name in self._kernel.cse.store_cache:
+            return self._kernel.cse.store_cache[name]
+
+        # 3. Load from global memory
+        if self._subs_map is not None:
+            var = self._kernel.args.input(name)
+            idx_str = self._kernel.index_to_str(
+                index.subs(self._subs_map)
+            )
+            dtype = V.graph.get_dtype(name)
+            mask_str = f", {self._mask}, other=0.0" if self._mask else ""
+            return self._kernel.cse.generate(
+                self._kernel.compute,
+                f"tl.load({var} + ({idx_str}){mask_str})",
+                dtype=dtype,
+                shape=self._output_shape,
+            )
+
+        # 4. Fall through to inner handler
+        return self._inner.load(name, index)
+
+    def store(self, name, index, value, mode=None):
+        from ..codegen.common import DeferredLine
+
+        k = self._kernel
+        out_name = self._output_name or name
+        var = k.args.output(out_name)
+        if self._subs_map is not None:
+            idx_str = k.index_to_str(index.subs(self._subs_map))
+        else:
+            idx_str = k.index_to_str(index)
+        mask_str = f", {self._mask}" if self._mask else ", None"
+        k.stores.writeline(
+            DeferredLine(
+                out_name,
+                f"tl.store({var} + ({idx_str}),"
+                f" {value}{mask_str})",
+            )
+        )
+        k.cse.store_cache[name] = value
+
+
 class SIMDScheduling(BaseScheduling):
     """
     Single Instruction Multiple Data parent class used for fusion across
@@ -1323,6 +1556,15 @@ class SIMDScheduling(BaseScheduling):
             node2, scheduler.ForeachKernelSchedulerNode
         ):
             return scheduler.ForeachKernelSchedulerNode.can_fuse(node1, node2)
+
+        # Nested reduction bypass: the numel/rnumel compatibility checks below
+        # would reject this fusion because node1 and node2 have different
+        # iteration spaces. The NestedReduction class has already validated
+        # that these can be fused.
+        from torch._inductor.scheduler import NestedReduction
+
+        if NestedReduction.can_fuse(node1, node2):
+            return True
 
         _, (numel1, rnumel1) = node1.group
         _, (numel2, rnumel2) = node2.group
@@ -1814,6 +2056,579 @@ class SIMDScheduling(BaseScheduling):
 
         self.free_buffers_in_scheduler()
 
+    def _try_absorb_epilogue_dtype_conversion(
+        self, kernel, node2_output_name, node2_write_names
+    ):
+        """
+        Check if node2's sole consumer is a single-buffer dtype conversion
+        (e.g. fp32 → bf16). If so, absorb it: register the final output
+        buffer and remove the intermediate.
+
+        Returns (epilogue_node, final_output_name).
+        """
+        assert self.scheduler is not None
+        if node2_output_name not in self.scheduler.name_to_buf:
+            return None, node2_output_name
+        buf = self.scheduler.name_to_buf[node2_output_name]
+        real_users = [u for u in buf.users if not u.is_weak]
+        if len(real_users) != 1:
+            return None, node2_output_name
+        user_node = real_users[0].node
+        if not isinstance(user_node, scheduler.SchedulerNode):
+            return None, node2_output_name
+        if user_node.is_reduction():
+            return None, node2_output_name
+        user_reads = {dep.name for dep in user_node.read_writes.reads}
+        if user_reads != {node2_output_name}:
+            return None, node2_output_name
+        user_write_names = {dep.name for dep in user_node.read_writes.writes}
+        if len(user_write_names) != 1:
+            return None, node2_output_name
+        epilogue_name = next(iter(user_write_names))
+        if V.graph.get_dtype(epilogue_name) == V.graph.get_dtype(node2_output_name):
+            return None, node2_output_name
+        kernel.args.output(epilogue_name)
+        kernel.remove_buffer(next(iter(node2_write_names)))
+        return user_node, epilogue_name
+
+    def codegen_nested_reduction(self, node):
+        """
+        Generate a single kernel with two sequential reduction passes for
+        dependent cross-axis reductions that share a large input.
+
+        Pass 1: node1's full reduction (e.g., Welford over DIM)
+        Pass 2: re-reads the shared input, applies pass 1 results, then
+                reshapes to group the small reduction dim and reduces it.
+
+        Two patterns are supported, determined by where group_size (node2's
+        small reduction dim) is embedded in node1's iteration space:
+
+        - "small dim in x": node1=(B*G, DIM), node2=(B*DIM, G)
+          Reshape XBLOCK → [XBLOCK/G, G, RBLOCK], reduce axis 1.
+          Example: rmsnorm + weighted sum.
+
+        - "small dim in r": node1=(B, DIM), node2=(B*DIM/G, G)
+          Reshape RBLOCK → [XBLOCK, RBLOCK/G, G], reduce axis 2.
+          Example: layernorm + per-block amax (NVFP4 quantization).
+        """
+        from .. import metrics
+
+        node1, node2 = node.node1, node.node2
+        _, (numel1, rnumel1) = node1.group
+        _, (_, rnumel2) = node2.group
+        group_size = rnumel2
+        sizevars = V.graph.sizevars
+
+        # Split node2 into the reduction subnode and any epilogue pointwise
+        # subnodes (e.g., fused via can_fuse_with: out * scale + bias).
+        sn2 = None
+        sn2_epilogue: list[scheduler.SchedulerNode] = []
+        for sn in node2.get_nodes():
+            if sn.is_reduction():
+                assert sn2 is None
+                sn2 = sn
+            else:
+                sn2_epilogue.append(sn)
+        assert sn2 is not None
+
+        # Determine which dimension contains group_size by checking node2's body.
+        body = sn2._body
+        shared_reads = scheduler.NestedReduction.get_shared_input_reads(
+            node1, node2
+        )
+        is_producer_consumer = not shared_reads
+        if len(body.iter_vars) == 2:
+            # Standard case: iter_vars are [outer, inner].
+            # If outer range == numel1, group_size is in r.
+            small_dim_in_r = sizevars.statically_known_equals(
+                body.var_ranges[body.iter_vars[0]], numel1
+            )
+        else:
+            # Single flattened iter_var (producer-consumer or B=1).
+            # For shared-input patterns, determine which axis group_size is
+            # on by checking the stride of the group_size-sized variable in
+            # a shared read: stride 1 → group_size is contiguous → in r;
+            # stride > 1 → group_size is strided → in x.
+            # For producer-consumer (no shared reads), fall back to
+            # divisibility: group_size always divides rnumel1 in that case.
+            small_dim_in_r = self._detect_group_size_axis(
+                sn2, shared_reads, group_size, numel1, rnumel1,
+                sizevars,
+            )
+
+        # ---- Build pass 1 schedule and kernel ----
+        # TODO: kernel_features only sees node1's schedule. Node2 and epilogue
+        # have different iteration spaces so can't be added to the same
+        # schedule, but their buffer accesses could affect heuristics
+        # (persistent reduction, register pressure, index dtype).
+        nodes1 = list(node1.get_nodes())
+        combined_schedule = self.generate_node_schedule(nodes1, numel1, rnumel1)
+
+        if torch._inductor.config.triton.coalesce_tiling_analysis:
+            coalesce_analysis = analyze_memory_coalescing(node1)
+        else:
+            coalesce_analysis = None
+
+        kernel_features = SIMDKernelFeatures(
+            combined_schedule, numel1, rnumel1, coalesce_analysis
+        )
+        tiling, tiling_score = self.get_tiling_and_scores(
+            combined_schedule, numel1, rnumel1, coalesce_analysis
+        )
+
+        metrics.codegen_nested_reduction += 1
+        kernel_kwargs: dict[str, Any] = {
+            "features": kernel_features,
+            "tiling_scores": tiling_score,
+        }
+        # Persistent reduction keeps all data in one tile, enabling
+        # pass 2 reshape and pass 3 split.  For shared-input patterns
+        # with large rnumel, allow the heuristic to choose looped
+        # reduction — pass 2 will re-read from global memory in a
+        # second loop.  Producer-consumer always needs persistent
+        # (pass 2 reads from pass 1's CSE cache).
+        if isinstance(rnumel1, (int, sympy.Integer)):
+            rnumel_hint = int(rnumel1)
+            if is_producer_consumer or rnumel_hint <= 8192:
+                kernel_kwargs["override_persistent_reduction"] = True
+        kernel = self.create_kernel_choices(
+            kernel_features, [tiling], kernel_kwargs,
+        )[0]
+
+        # Enforce block size >= group_size for the dimension containing group_size
+        group_size_hint = sizevars.optimization_hint(group_size, fallback=8)
+        if small_dim_in_r:
+            kernel.nested_reduction_min_rblock = group_size_hint
+        else:
+            kernel.nested_reduction_min_xblock = group_size_hint
+
+        # Constrain XBLOCK so that reshapes (e.g., for pass 3 split)
+        # don't exceed Triton's max tensor numel of 1048576.
+        # Also, when group_size is in x, XBLOCK must not exceed numel1 to
+        # avoid the pass 2 reshape creating invalid batches.
+        max_xblock = None
+        if isinstance(rnumel1, (int, sympy.Integer)):
+            rnumel_hint = int(rnumel1)
+            if rnumel_hint > 0:
+                max_xblock = 1048576 // rnumel_hint
+        if not small_dim_in_r:
+            numel_hint = int(sizevars.optimization_hint(
+                numel1, fallback=2048
+            ))
+            limit = last_power_of_2(numel_hint)
+            max_xblock = (min(max_xblock, limit) if max_xblock
+                          else limit)
+        if max_xblock is not None:
+            kernel.nested_reduction_max_xblock = max_xblock
+
+        # Producer-consumer: mark node1's intermediate output for
+        # inline storage so it stays in registers — but only if all
+        # users are within the fused kernel (no external readers).
+        if is_producer_consumer:
+            assert self.scheduler is not None
+            fused_names = node.get_operation_names()
+            node2_reads = {dep.name for dep in node2.read_writes.reads}
+            for buf_name in node1.get_buffer_names():
+                if buf_name not in node2_reads:
+                    continue
+                if buf_name not in self.scheduler.name_to_buf:
+                    continue
+                buf = self.scheduler.name_to_buf[buf_name]
+                if all(
+                    u.is_weak or u.node.get_name() in fused_names
+                    for u in buf.users
+                ):
+                    kernel.inline_reduction_buffers[buf_name] = None
+
+        self.codegen_node_schedule_with_kernel(combined_schedule, kernel)
+
+        # Capture pass 1 output CSE vars for reuse in pass 2
+        node1_cse_vars = {
+            name: kernel.cse.store_cache[name]
+            for name in node1.get_buffer_names()
+            if name in kernel.cse.store_cache
+        }
+
+        # Graph input loads from pass 1 are tracked on the kernel
+        # (kernel.graph_input_loads) for reuse in pass 3.
+
+        # ---- Prepare pass 2 output ----
+        # Find the reduction's output buffer name
+        node2_reduction_write_names = {
+            dep.name for dep in sn2.read_writes.writes
+        }
+        node2_reduction_output_name = next(iter(node2_reduction_write_names))
+
+        epilogue_node = None
+        if sn2_epilogue:
+            # Epilogue pointwise was fused via can_fuse_with. The reduction's
+            # intermediate buffer is consumed in-register via CSE cache — no
+            # need to register it as a kernel argument.
+            # Register the final output buffer(s) from the epilogue.
+            for ep_sn in sn2_epilogue:
+                for dep in ep_sn.read_writes.writes:
+                    kernel.args.output(dep.name)
+            node2_output_name = node2_reduction_output_name
+        else:
+            # No fused epilogue subnodes — try the legacy dtype conversion
+            # absorption (single consumer doing only a dtype cast).
+            node2_write_names = {dep.name for dep in node2.read_writes.writes}
+            node2_output_name = node2_reduction_output_name
+            kernel.args.output(node2_output_name)
+            epilogue_node, node2_output_name = (
+                self._try_absorb_epilogue_dtype_conversion(
+                    kernel, node2_output_name, node2_write_names
+                )
+            )
+
+        # ---- Find range trees ----
+        x_tree = r_tree = None
+        for tree in kernel.range_trees:
+            if tree.prefix == "x":
+                x_tree = tree
+            elif tree.prefix.startswith("r"):
+                r_tree = tree
+        assert x_tree is not None and r_tree is not None
+
+        # ---- Generate kernel with both passes ----
+        with kernel:
+            kernel.codegen_body()  # pass 1
+
+            group_size_str = kernel.index_to_str(group_size)
+
+            # group_tree: the range tree whose block contains group_size
+            # other_tree: the range tree whose block is unchanged
+            if small_dim_in_r:
+                group_tree, other_tree = r_tree, x_tree
+            else:
+                group_tree, other_tree = x_tree, r_tree
+
+            groups = FloorDiv(group_tree.numel, group_size)
+            non_group_var, group_var = group_tree.construct([groups, group_size])
+            other_var = other_tree.construct([other_tree.numel])[0]
+
+            # Map body.iter_vars → range tree symbols.
+            reduce_remapped = [group_var]
+            if len(body.iter_vars) == 2:
+                # Standard: iter_vars are [outer, inner].
+                if group_tree is r_tree:
+                    iter_remapped = [other_var, non_group_var]
+                else:
+                    iter_remapped = [non_group_var, other_var]
+            else:
+                # Producer-consumer: single flattened iter_var.
+                iter_remapped = [other_var * groups + non_group_var]
+
+            # Reshape: split group_size out of its tree's block into a new axis.
+            # x dims always precede r dims in the block layout.
+            tp = group_tree.prefix.upper()
+            op = other_tree.prefix.upper()
+            split_block = f"{tp}BLOCK // {group_size_str}"
+            if small_dim_in_r:
+                reshape_shape = (f"{op}BLOCK", split_block, group_size_str)
+                reduce_axis = 2
+            else:
+                reshape_shape = (split_block, group_size_str, f"{op}BLOCK")
+                reduce_axis = 1
+            output_shape = tuple(s for s in reshape_shape if s != group_size_str)
+
+            # Store config: after reducing group_size, the group_tree's dim is
+            # compressed by group_size while the other_tree's dim is unchanged.
+            x_sym = sympy.Symbol("pass2_x")
+            r_sym = sympy.Symbol("pass2_r")
+            x_var = non_group_var if group_tree is x_tree else other_var
+            r_var = non_group_var if group_tree is r_tree else other_var
+            subs_map = {x_var: x_sym, r_var: r_sym}
+
+            def _pass2_arange(tree):
+                p, P = tree.prefix, tree.prefix.upper()
+                if tree is group_tree:
+                    return (
+                        f"({p}offset // {group_size_str})"
+                        f" + tl.arange(0, {P}BLOCK // {group_size_str})"
+                    )
+                return f"{p}offset + tl.arange(0, {P}BLOCK)"
+
+            x_expr = _pass2_arange(x_tree) + "[:, None]"
+            r_expr = _pass2_arange(r_tree) + "[None, :]"
+
+            def _pass2_bound(tree):
+                if tree is group_tree:
+                    return kernel.index_to_str(groups)
+                return f"{tree.prefix}numel"
+
+            x_bound = _pass2_bound(x_tree)
+            r_bound = _pass2_bound(r_tree)
+
+            # ---- Pass 2 ops handler ----
+            has_epilogue = bool(sn2_epilogue)
+            # DeferredLine name: use the final output buffer (not the
+            # intermediate) so lines survive removed_buffers.
+            if sn2_epilogue:
+                last_ep = sn2_epilogue[-1]
+                deferred_line_name = next(
+                    iter(dep.name for dep in last_ep.read_writes.writes)
+                )
+            else:
+                deferred_line_name = node2_output_name
+
+            pass2_coords = _Pass2Coords(
+                subs_map=subs_map,
+                x_sym=x_sym, r_sym=r_sym,
+                x_expr=x_expr, r_expr=r_expr,
+                x_bound=x_bound, r_bound=r_bound,
+            )
+            handler = _Pass2OpsHandler(
+                V.get_ops_handler(), node1_cse_vars,
+                kernel=kernel,
+                reshape_shape=reshape_shape,
+                reduce_axis=reduce_axis,
+                output_shape=output_shape,
+                coords=pass2_coords,
+                store_name=node2_output_name,
+                deferred_line_name=deferred_line_name,
+                has_epilogue=has_epilogue,
+            )
+            with V.set_ops_handler(handler), kernel.set_current_node(sn2):
+                body(
+                    iter_remapped,
+                    reduce_remapped,
+                    allow_same_symbol_in_index=True,
+                )
+
+            self._codegen_pass2_epilogue(
+                kernel, node, sn2_epilogue, body,
+                iter_remapped, pass2_coords, output_shape,
+                group_tree, other_tree, group_size_str,
+                small_dim_in_r, handler, sizevars,
+            )
+
+            # Pass 2 stores directly per r-iteration, not after the loop
+            kernel.post_loop_combine.clear()
+            kernel.post_loop_store.clear()
+
+            kernel.codegen_body()
+
+        config_patches = self._collect_config_patches(combined_schedule)
+
+        with V.set_kernel_handler(kernel), config.patch(**config_patches):
+            src_code = kernel.codegen_kernel()
+        kernel_name = self.define_kernel(src_code, combined_schedule, kernel)
+        kernel.kernel_name = kernel_name
+        kernel.code_hash = code_hash(src_code)
+
+        # Mark all nodes as run
+        with V.set_kernel_handler(kernel):
+            for sn in node1.get_nodes():
+                sn.mark_run()
+            for sn in node2.get_nodes():
+                sn.mark_run()
+            if epilogue_node is not None:
+                for sn in epilogue_node.get_nodes():
+                    sn.mark_run()
+                self.scheduler.removed_ops.add(epilogue_node.get_name())
+
+        # Remove intermediate buffer if all consumers are inside this kernel.
+        if sn2_epilogue:
+            assert self.scheduler is not None
+            fused_names = node.get_operation_names()
+            if node2_reduction_output_name in self.scheduler.name_to_buf:
+                buf = self.scheduler.name_to_buf[node2_reduction_output_name]
+                if all(
+                    u.is_weak or u.node.get_name() in fused_names
+                    for u in buf.users
+                ):
+                    V.graph.removed_buffers.add(node2_reduction_output_name)
+
+        base_scheduler_nodes = [
+            n for n in combined_schedule if isinstance(n, BaseSchedulerNode)
+        ]
+        self.codegen_comment(base_scheduler_nodes, kernel.kernel_name)
+        if config.cpp.enable_kernel_profile:
+            V.graph.wrapper_code.write_kernel_context_guard_begin()
+            V.graph.wrapper_code.write_kernel_context_guard(
+                kernel.kernel_name, base_scheduler_nodes,
+            )
+        kernel.call_kernel(kernel.kernel_name)
+        if config.cpp.enable_kernel_profile:
+            V.graph.wrapper_code.write_kernel_context_guard_end()
+
+        if config.nan_asserts:
+            kernel.codegen_nan_check()
+        if config.warn_mix_layout:
+            kernel.warn_mix_layout(kernel.kernel_name)
+
+        V.graph.removed_buffers |= kernel.removed_buffers
+        V.graph.inplaced_to_remove |= kernel.inplaced_to_remove
+
+        self.free_buffers_in_scheduler()
+
+    @staticmethod
+    def _detect_group_size_axis(sn2, shared_reads, group_size, numel1, rnumel1, sizevars):
+        """Determine whether group_size is in the r-dimension or x-dimension.
+
+        For shared-input reads, checks the stride of the group_size-sized
+        index variable: stride 1 means group_size is contiguous (in r),
+        stride > 1 means group_size is strided (in x).  Falls back to
+        divisibility when no shared reads are available.
+        """
+        if shared_reads:
+            for dep in sn2.read_writes.reads:
+                if dep.name not in shared_reads:
+                    continue
+                for var, var_range in dep.ranges.items():
+                    if sizevars.statically_known_equals(var_range, group_size):
+                        return dep.index.coeff(var) == 1
+                break  # only inspect the first shared dep
+        # Divisibility fallback.  If group_size doesn't divide numel1,
+        # it can't be in X — must be in R.
+        if not sizevars.statically_known_equals(
+            sympy.Mod(numel1, group_size), 0
+        ):
+            return True  # group_size in R
+        return sizevars.statically_known_equals(
+            sympy.Mod(rnumel1, group_size), 0
+        )
+
+    def _codegen_pass2_epilogue(
+        self, kernel, node, sn2_epilogue, body,
+        iter_remapped, pass2_coords, output_shape,
+        group_tree, other_tree, group_size_str,
+        small_dim_in_r, handler, sizevars,
+    ):
+        """Process epilogue pointwise subnodes after pass 2.
+
+        Splits epilogues into two groups by resolution:
+        - Pass 2 resolution: same numel as pass 2 output, use
+          _RemappedOpsHandler with subs_map
+        - Full resolution: larger numel, broadcast pass 2 values
+          to full resolution
+        """
+        # Split by resolution
+        pass2_numel = sympy_product(
+            body.var_ranges[v] for v in body.iter_vars
+        )
+        pass2_epilogue = []
+        fullres_epilogue = []
+        for ep_sn in sn2_epilogue:
+            ep_numel = sympy_product(
+                ep_sn._body.var_ranges[v]
+                for v in ep_sn._body.iter_vars
+            )
+            if sizevars.statically_known_equals(ep_numel, pass2_numel):
+                pass2_epilogue.append(ep_sn)
+            else:
+                fullres_epilogue.append(ep_sn)
+
+        # Pass 2 resolution epilogues
+        if pass2_epilogue:
+            pass2_flat = _flatten_iter_vars(
+                body.iter_vars, body.var_ranges, iter_remapped,
+            )
+            for ep_sn in pass2_epilogue:
+                ep_body = ep_sn._body
+                ep_iter = _decompose_flat_index(ep_body, pass2_flat)
+                ep_output_name = next(
+                    iter(d.name for d in ep_sn.read_writes.writes)
+                )
+                ep_handler = _RemappedOpsHandler(
+                    V.get_ops_handler(), kernel=kernel,
+                    subs_map=pass2_coords.subs_map,
+                    mask="pass2_mask",
+                    output_name=ep_output_name,
+                    output_shape=output_shape,
+                )
+                with V.set_ops_handler(ep_handler), \
+                        kernel.set_current_node(ep_sn):
+                    ep_body(ep_iter)
+
+        # Full-resolution epilogues (e.g., FP8 quantization)
+        if fullres_epilogue and small_dim_in_r:
+            tp = group_tree.prefix.upper()
+            op = other_tree.prefix.upper()
+            gs = f"{tp}BLOCK // {group_size_str}"
+
+            for ep_sn in fullres_epilogue:
+                for d in ep_sn.read_writes.writes:
+                    kernel.args.output(d.name)
+
+            # Build value map: broadcast pass 2 values, pass through
+            # full-resolution and scalar values.
+            fullres_values: dict[str, object] = {}
+            fullres_reads: set[str] = set()
+            for ep_sn in fullres_epilogue:
+                for d in ep_sn.read_writes.reads:
+                    fullres_reads.add(d.name)
+
+            for bname in fullres_reads:
+                bval = kernel.cse.store_cache.get(bname)
+                if bval is None:
+                    continue
+                var_shape = getattr(bval, 'shape', None)
+                if var_shape and len(var_shape) >= 2:
+                    parent_dim = str(
+                        var_shape[1] if small_dim_in_r
+                        else var_shape[0]
+                    )
+                    if (parent_dim != f"{tp}BLOCK"
+                            and parent_dim != "1"):
+                        bc_dtype = (
+                            V.graph.get_dtype(bname)
+                            if bname in V.graph.name_to_buffer
+                            else torch.float32
+                        )
+                        bc = (
+                            f"tl.reshape("
+                            f"tl.reshape({bval},"
+                            f" [{op}BLOCK, {gs}, 1])"
+                            f" * tl.full([1, 1,"
+                            f" {group_size_str}],"
+                            f" 1, tl.float32),"
+                            f" [{op}BLOCK, {tp}BLOCK])"
+                        )
+                        fullres_values[bname] = (
+                            kernel.cse.generate(
+                                kernel.compute, bc,
+                                dtype=bc_dtype,
+                                shape=(f"{op}BLOCK", f"{tp}BLOCK"),
+                            )
+                        )
+                        continue
+                fullres_values[bname] = bval
+
+            # Build flat index for full resolution iteration.
+            group_entry = group_tree.lookup(
+                sympy.Integer(1), group_tree.numel
+            )
+            if sizevars.statically_known_equals(
+                other_tree.numel, 1
+            ):
+                fullres_flat = group_entry.symbol()
+            else:
+                other_entry = other_tree.lookup(
+                    sympy.Integer(1), other_tree.numel
+                )
+                fullres_flat = (
+                    other_entry.symbol() * group_tree.numel
+                    + group_entry.symbol()
+                )
+
+            fr_handler = _RemappedOpsHandler(
+                V.get_ops_handler(), kernel=kernel,
+                values=fullres_values,
+            )
+            for ep_sn in fullres_epilogue:
+                ep_iter = _decompose_flat_index(
+                    ep_sn._body, fullres_flat,
+                )
+                with V.set_ops_handler(fr_handler), \
+                        kernel.set_current_node(ep_sn):
+                    ep_sn._body(ep_iter)
+
+        handler.maybe_store_for_external_users(
+            node.get_operation_names(), self.scheduler,
+        )
+
     def _codegen_nodes(
         self,
         nodes: Sequence[scheduler.SchedulerNode],
@@ -1840,6 +2655,9 @@ class SIMDScheduling(BaseScheduling):
         """
         Given a set of pre-fused nodes, generate a Triton kernel.
         """
+        if isinstance(node, scheduler.FusedNestedReductions):
+            return self.codegen_nested_reduction(node)
+
         assert self.scheduler
         nodes = [
             node

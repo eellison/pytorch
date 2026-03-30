@@ -76,6 +76,7 @@ from ..utils import (
     Placeholder,
     prefix_is_reduction,
     sympy_dot,
+    sympy_index_symbol,
     sympy_product,
     sympy_subs,
     triton_type,
@@ -2753,6 +2754,20 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         self._pdl_load_index = 0
         self._pdl_has_wait = False
 
+        # Inline reduction buffers: buffers kept in registers instead of
+        # stored to global memory. When a buffer name is in this dict,
+        # load() returns the register value and store() saves it here
+        # instead of emitting a tl.store. Used for two-pass fusion where
+        # intermediate outputs (e.g., LN output) are consumed by a
+        # second pass without materialization.
+        self.inline_reduction_buffers: dict[str, CSEVariable] = {}
+
+        # Graph input loads: tracks CSE variables for graph inputs
+        # loaded during pass 1 codegen. Used by pass 3 to avoid
+        # re-reading from global memory — the values can be split
+        # into even/odd halves from registers.
+        self.graph_input_loads: dict[str, CSEVariable] = {}
+
         # A set of autotuning hints to pass as part of triton_meta
         self.autotune_hints = OrderedSet[AutotuneHint]()
         self.triton_meta: dict[str, Any] | None = None
@@ -3680,6 +3695,12 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         """
         Load from the memory location 'name', offset by some indexing expression 'index'.
         """
+        # Intercept: return in-register value if buffer was kept inline
+        if name in self.inline_reduction_buffers:
+            val = self.inline_reduction_buffers[name]
+            if val is not None:
+                return val
+
         var = self.args.input(name)
         load_counts = self._load_counts
         load_counts[name] += 1
@@ -3863,6 +3884,10 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         if not self.inside_reduction or (not indexing.has_rmask() and not has_rindex):
             self.outside_loop_vars.add(result_var)
 
+        # Track graph input loads for pass 3 reuse
+        if name in V.graph.graph_inputs and name not in self.graph_input_loads:
+            self.graph_input_loads[name] = result_var
+
         return result_var
 
     def store(
@@ -3871,6 +3896,10 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         """
         store the 'value' to the memory location 'name', offset by some indexing expression 'index'.
         """
+        # Intercept: keep value in registers instead of storing
+        if name in self.inline_reduction_buffers:
+            self.inline_reduction_buffers[name] = value
+            return
 
         var = self.args.output(name)
         original_index = index
@@ -4815,6 +4844,48 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
         exit_stack.close()
 
+    def create_sub_range(
+        self,
+        parent_tree: "IterationRangesRoot",
+        length: int,
+        buf: "IndentedBuffer | None" = None,
+    ) -> sympy.Symbol:
+        """Create a sub-range iteration variable under an existing range tree.
+
+        Used when a consumer pass operates at a different resolution than
+        the kernel's main iteration space (e.g., half-range for paired
+        element processing). Returns a sympy symbol registered in
+        range_tree_nodes so index_to_str can resolve it.
+        """
+        from torch._inductor.codegen.simd import IterationRangesEntry
+
+        if buf is None:
+            buf = self.compute
+
+        name = f"{parent_tree.prefix}0_{length}"
+        sym = sympy_index_symbol(name)
+
+        if sym not in self.range_tree_nodes:
+            # Emit tl.arange with the correct shape for the tree's
+            # position (reduction trees use [None, :], x trees use
+            # [:, None]).
+            if prefix_is_reduction(parent_tree.prefix):
+                buf.writeline(f"{name} = tl.arange(0, {length})[None, :]")
+            else:
+                buf.writeline(f"{name} = tl.arange(0, {length})[:, None]")
+
+            entry = IterationRangesEntry(
+                name=name,
+                divisor=sympy.S.One,
+                length=sympy.Integer(length),
+                expr=sym,
+                parent=parent_tree,
+            )
+            entry.codegen = lambda n=name: n  # type: ignore[assignment]
+            self.range_tree_nodes[sym] = entry
+
+        return sym
+
     def _lift_helper(
         self, fn, values: tuple[CSEVariable, ...], dtypes: tuple[torch.dtype, ...]
     ) -> str:
@@ -5743,6 +5814,13 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
         if self.tiling_scores:
             inductor_meta["tiling_scores"] = self.tiling_scores
+
+        if self.nested_reduction_min_xblock is not None:
+            inductor_meta["min_xblock"] = self.nested_reduction_min_xblock
+        if self.nested_reduction_min_rblock is not None:
+            inductor_meta["min_rblock"] = self.nested_reduction_min_rblock
+        if self.nested_reduction_max_xblock is not None:
+            inductor_meta["max_xblock"] = self.nested_reduction_max_xblock
 
         if self.tma_min_block_sizes:
             inductor_meta["tma_min_block_sizes"] = self.tma_min_block_sizes
