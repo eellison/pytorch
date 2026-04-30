@@ -423,6 +423,388 @@ class MixOrderReduction:
         return True
 
 
+class NestedReduction:
+    """
+    Detects when a reduction node (node1) and its consumer (node2) can be
+    fused into a single kernel with two sequential reduction loops. The pattern
+    is: node1 reduces over a large dimension (e.g. D) producing per-row
+    statistics, and node2 re-reads node1's large input while also consuming
+    node1's output, reducing over a small group dimension (e.g. G).
+
+    Examples:
+    - rmsnorm + weighted sum: y = sum_k(rmsnorm(x_k) * w_k), x is [B, K, D]
+    - layernorm + block amax: amax over groups of G after layer_norm
+    """
+
+    # Maximum group_size for the inner reduction.  Must be power of 2
+    # and fit within a Triton block dimension.  512 covers MXFP8 tile sizes.
+    MAX_SMALL_REDUCTION = 512
+    MAX_GROUP_SIZE_IN_X_REDUCTION = 128
+    SUPPORTED_GROUPED_REDUCTION_TYPES = OrderedSet(
+        ["any", "max", "min", "prod", "sum", "xor_sum"]
+    )
+
+    @classmethod
+    def _is_supported_backend(
+        cls, node1: BaseSchedulerNode, node2: BaseSchedulerNode
+    ) -> bool:
+        if not config.triton.nested_reduction:
+            return False
+
+        # TODO: nested reduction codegen emits Triton kernels with custom
+        # autotuning meta (min_xblock / min_rblock / max_xblock); the cpp
+        # wrapper round-trip hasn't been validated.  Reject conservatively;
+        # lift this guard once cpp wrapper test coverage is in place.
+        if V.graph.cpp_wrapper:
+            return False
+
+        if not node1.is_gpu() or not node2.is_gpu():
+            return False
+        device_type = node1.get_device().type  # type: ignore[union-attr]
+        return (
+            device_type in ("cuda", "xpu")
+            and get_current_backend(device_type) == "triton"
+        )
+
+    @classmethod
+    def _get_grouped_reduction_info(
+        cls, node2: BaseSchedulerNode, rnumel2: sympy.Expr
+    ) -> tuple[BaseSchedulerNode, sympy.Integer] | None:
+        if not node2.is_reduction():
+            return None
+        reductions = [sn for sn in node2.get_nodes() if sn.is_reduction()]
+        if len(reductions) != 1:
+            return None
+        reduction = reductions[0]
+        if (
+            reduction.node is None
+            or reduction.node.get_reduction_type()
+            not in cls.SUPPORTED_GROUPED_REDUCTION_TYPES
+        ):
+            return None
+
+        rnumel2_hint = V.graph.sizevars.optimization_hint(rnumel2, fallback=0)
+        if rnumel2_hint > cls.MAX_SMALL_REDUCTION or rnumel2_hint < 1:
+            return None
+        if rnumel2_hint & (rnumel2_hint - 1) != 0:
+            return None
+
+        group_size = sympy.Integer(rnumel2_hint)
+        if not V.graph.sizevars.statically_known_equals(rnumel2, group_size):
+            return None
+        return reduction, group_size
+
+    @staticmethod
+    def _pointwise_nodes_match_grouped_resolution(
+        pointwise_nodes: Sequence[BaseSchedulerNode],
+        reduction: BaseSchedulerNode,
+        numel2: sympy.Expr,
+        rnumel2: sympy.Expr,
+        *,
+        allow_fullres: bool,
+    ) -> bool:
+        from .codegen.simd import SIMDKernel
+
+        iter_ranges, reduce_ranges = reduction.get_ranges()
+        reduced_output_groups = tuple(iter_ranges)
+        full_resolution_groups = (*iter_ranges, *reduce_ranges)
+        fullres_numel = V.graph.sizevars.simplify(numel2 * rnumel2)
+        for sn in pointwise_nodes:
+            _, (sn_numel, _) = sn.group
+            full_resolution = V.graph.sizevars.statically_known_equals(
+                sn_numel, fullres_numel
+            )
+            reduced_output_resolution = V.graph.sizevars.statically_known_equals(
+                sn_numel, numel2
+            )
+            if not reduced_output_resolution and not (
+                allow_fullres and full_resolution
+            ):
+                return False
+            source_groups = (
+                full_resolution_groups
+                if full_resolution
+                else reduced_output_groups
+            )
+            if not SIMDKernel.is_compatible(source_groups, sn.get_ranges()):
+                return False
+        return True
+
+    @classmethod
+    def _node2_pointwise_nodes_are_supported(
+        cls,
+        node2: BaseSchedulerNode,
+        reduction: BaseSchedulerNode,
+        numel2: sympy.Expr,
+        rnumel2: sympy.Expr,
+        allow_fullres_epilogue: bool,
+    ) -> bool:
+        """node2 may be a fused node, but its pointwise subnodes must be
+        producers or consumers of the single grouped reduction.
+
+        Producer pointwise nodes may run at full resolution or reduced-output
+        resolution. Consumer pointwise nodes may run at reduced-output
+        resolution, or at full resolution when codegen can broadcast reduced
+        values back to the parent tile.
+        """
+        reduction_names = reduction.get_operation_names()
+        for sn in node2.get_nodes():
+            if sn.is_reduction():
+                continue
+            sn_names = sn.get_operation_names()
+            is_prologue = bool(sn_names & reduction.ancestors)
+            is_epilogue = bool(reduction_names & sn.ancestors)
+            if is_prologue == is_epilogue:
+                return False
+            allow_fullres = is_prologue or allow_fullres_epilogue
+            if not cls._pointwise_nodes_match_grouped_resolution(
+                [sn], reduction, numel2, rnumel2, allow_fullres=allow_fullres
+            ):
+                return False
+        return True
+
+    @classmethod
+    def _node1_fullres_epilogues_are_compatible(
+        cls,
+        node1: BaseSchedulerNode,
+        fullres_numel: sympy.Expr,
+        source_groups: Sequence[sympy.Expr],
+    ) -> bool:
+        from .codegen.simd import SIMDKernel
+
+        reduction_names = OrderedSet[str]()
+        for sn in node1.get_nodes():
+            if sn.is_reduction():
+                reduction_names |= sn.get_operation_names()
+        for sn in node1.get_nodes():
+            if sn.is_reduction() or not (reduction_names & sn.ancestors):
+                continue
+            _, (sn_numel, _) = sn.group
+            if not V.graph.sizevars.statically_known_equals(sn_numel, fullres_numel):
+                continue
+            if not SIMDKernel.is_compatible(source_groups, sn.get_ranges()):
+                return False
+        return True
+
+    @classmethod
+    def _is_profitable_group_size_in_x(
+        cls,
+        node1: BaseSchedulerNode,
+        numel1: sympy.Expr,
+        rnumel1: sympy.Expr,
+        group_size: sympy.Integer,
+    ) -> bool:
+        group_cannot_divide_r = V.graph.sizevars.statically_known_true(
+            sympy.Ne(sympy.Mod(rnumel1, group_size), 0)
+        )
+        group_divides_x = V.graph.sizevars.statically_known_equals(
+            sympy.Mod(numel1, group_size), 0
+        )
+        if not (group_divides_x and group_cannot_divide_r):
+            return True
+
+        # group_size is provably in X only. This forces min_xblock =
+        # group_size. Only profitable if X is the coalescing dim. Reject
+        # when R is coalesced (typical for inner reductions with row-major
+        # data). This is only a profitability check: when group_size is in X,
+        # rnumel1 is the passthrough axis, not the axis split by group_size.
+        from torch._inductor.tiling_utils import analyze_memory_coalescing
+
+        coalesce = analyze_memory_coalescing(node1)
+        if coalesce is None:
+            # Can't determine coalescing — conservatively reject
+            # since most reductions are inner (R-coalesced).
+            return False
+
+        nrw = coalesce.norm_read_writes
+        r_coalesce = sum(
+            coalesce.coalesced_by_var.get(v, 0) for v in nrw.reduce_vars
+        )
+        x_coalesce = sum(
+            coalesce.coalesced_by_var.get(v, 0) for v in nrw.index_vars
+        )
+        return r_coalesce <= 2 * x_coalesce
+
+    @classmethod
+    def can_fuse(cls, node1: BaseSchedulerNode, node2: BaseSchedulerNode) -> bool:
+        if not cls._is_supported_backend(node1, node2):
+            return False
+
+        # node1 must be a reduction, node2 must depend on node1 (vertical)
+        if not node1.is_reduction():
+            return False
+        if not (node1.get_operation_names() & node2.ancestors):
+            return False
+
+        # Must share data: either both read a common input buffer,
+        # or node2 reads node1's output (producer-consumer pattern,
+        # e.g. LN materializes buf3, amax reads buf3).
+        shared_reads = cls.get_shared_input_reads(node1, node2)
+        if not shared_reads:
+            node1_outputs = node1.get_buffer_names()
+            node2_reads = {dep.name for dep in node2.read_writes.reads}
+            if not (node1_outputs & node2_reads):
+                return False
+
+        # Get iteration spaces
+        _, (numel1, rnumel1) = node1.group
+        _, (numel2, rnumel2) = node2.group
+
+        # node1's rnumel (the large reduction dim) should be large
+        rnumel1_hint = V.graph.sizevars.optimization_hint(rnumel1, fallback=0)
+        if rnumel1_hint < 256:
+            return False
+
+        # node2 must be a single reduction with a small, power-of-2
+        # block-local rnumel. We specialize the grouped reduction on
+        # that block size, so the optimization hint must reflect an
+        # exact equality guard, not just a profitable guess. Multiple
+        # reductions in node2 (e.g. amax AND sum from the same input)
+        # are not supported.
+        grouped_reduction = cls._get_grouped_reduction_info(node2, rnumel2)
+        if grouped_reduction is None:
+            return False
+        node2_reduction, group_size = grouped_reduction
+
+        # The total element count should match:
+        # numel1 * rnumel1 == numel2 * rnumel2 (they traverse the same data)
+        total1 = V.graph.sizevars.simplify(numel1 * rnumel1)
+        total2 = V.graph.sizevars.simplify(numel2 * rnumel2)
+        if not V.graph.sizevars.statically_known_equals(total1, total2):
+            return False
+
+        group_size_in_r = cls.is_group_size_in_r(
+            node2_reduction, numel1, rnumel1, rnumel2, shared_reads,
+        )
+        if (
+            not group_size_in_r
+            and group_size > cls.MAX_GROUP_SIZE_IN_X_REDUCTION
+        ):
+            return False
+        iter_ranges, reduce_ranges = node2_reduction.get_ranges()
+        if not cls._node1_fullres_epilogues_are_compatible(
+            node1, total1, (*iter_ranges, *reduce_ranges),
+        ):
+            return False
+        if not cls._node2_pointwise_nodes_are_supported(
+            node2, node2_reduction, numel2, rnumel2, group_size_in_r,
+        ):
+            return False
+
+        return cls._is_profitable_group_size_in_x(
+            node1, numel1, rnumel1, group_size
+        )
+
+    @classmethod
+    def get_shared_input_reads(
+        cls, node1: BaseSchedulerNode, node2: BaseSchedulerNode
+    ) -> OrderedSet[str]:
+        """Return input buffer names read by both nodes (excluding node1's outputs)."""
+        names1 = {dep.name for dep in node1.read_writes.reads}
+        names2 = {dep.name for dep in node2.read_writes.reads}
+        # Exclude node1's own outputs — those are the intermediate reduction results
+        node1_outputs = node1.get_buffer_names()
+        return OrderedSet((names1 & names2) - node1_outputs)
+
+    @staticmethod
+    def _flattened_group_size_in_r(
+        sn2_reduction: "SchedulerNode",
+        numel1: sympy.Expr,
+        rnumel1: sympy.Expr,
+        group_size: sympy.Expr,
+        shared_reads: OrderedSet[str],
+    ) -> bool:
+        sizevars = V.graph.sizevars
+        if shared_reads:
+            saw_shared = False
+            for dep in sn2_reduction.read_writes.reads:
+                if dep.name not in shared_reads:
+                    continue
+                saw_shared = True
+                # A group-sized variable is definitive: stride 1 means the
+                # group is in R, stride > 1 means it is in X.
+                for var, var_range in dep.ranges.items():
+                    if sizevars.statically_known_equals(var_range, group_size):
+                        return dep.index.coeff(var) == 1
+                # Fully flattened contiguous R read.
+                if len(dep.ranges) == 1:
+                    (var,) = dep.ranges
+                    var_range = dep.ranges[var]
+                    if (
+                        sizevars.statically_known_equals(var_range, rnumel1)
+                        and dep.index.coeff(var) == 1
+                        and sizevars.statically_known_equals(
+                            sympy.Mod(rnumel1, group_size), 0
+                        )
+                    ):
+                        return True
+            if saw_shared:
+                return False
+
+        # Producer-consumer fallback when node2 reads node1's output rather
+        # than a shared input.
+        if not sizevars.statically_known_equals(
+            sympy.Mod(numel1, group_size), 0
+        ):
+            return True
+        return sizevars.statically_known_equals(
+            sympy.Mod(rnumel1, group_size), 0
+        )
+
+    @staticmethod
+    def is_group_size_in_r(
+        sn2_reduction: "SchedulerNode",
+        numel1: sympy.Expr,
+        rnumel1: sympy.Expr,
+        group_size: sympy.Expr,
+        shared_reads: OrderedSet[str],
+    ) -> bool:
+        """Determine whether group_size is in the R dimension or X dimension.
+
+        Single source of truth used by both the scheduler (can_fuse_with)
+        and codegen (codegen_nested_reduction).
+
+        For 2+ iter vars, checks if the first iter range equals numel1.
+        For flattened (1 iter var), checks the stride of the group_size
+        variable in a shared read: stride 1 means contiguous (in R).
+        Falls back to divisibility when strides are ambiguous.
+        """
+        sizevars = V.graph.sizevars
+        iter_ranges, _ = sn2_reduction.get_ranges()
+
+        if len(iter_ranges) >= 2:
+            return sizevars.statically_known_equals(iter_ranges[0], numel1)
+
+        return NestedReduction._flattened_group_size_in_r(
+            sn2_reduction, numel1, rnumel1, group_size, shared_reads,
+        )
+
+    @classmethod
+    def get_fusion_score(
+        cls, node1: BaseSchedulerNode, node2: BaseSchedulerNode
+    ) -> int:
+        """Score is the total byte size of shared data (input or producer-consumer)."""
+        shared = cls.get_shared_input_reads(node1, node2)
+        score = 0
+        if shared:
+            for dep in node1.read_writes.reads:
+                if dep.name in shared:
+                    score += V.graph.get_dep_size_hint(dep, count_bytes=True)
+        else:
+            # Producer-consumer: score by size of node1's output read by node2
+            node1_outputs = node1.get_buffer_names()
+            for dep in node2.read_writes.reads:
+                if dep.name in node1_outputs:
+                    score += V.graph.get_dep_size_hint(dep, count_bytes=True)
+        return score
+
+    @classmethod
+    def are_nested_reductions(
+        cls, node1: BaseSchedulerNode, node2: BaseSchedulerNode
+    ) -> bool:
+        return cls.can_fuse(node1, node2)
+
+
 @dataclasses.dataclass
 class SchedulerBuffer:
     scheduler: Scheduler
@@ -2287,6 +2669,98 @@ class FusedMixOrderReductions(FusedSchedulerNode):
             else:
                 fused_node = backend.fuse(self.node2, other)
                 return FusedMixOrderReductions(self.node1, fused_node)
+
+
+class FusedNestedReductions(FusedSchedulerNode):
+    """
+    Fused node for two dependent reductions that share a large input.
+    node1 is the producer reduction, node2 is the consumer that re-reads
+    the same large input.
+    """
+
+    def __init__(self, node1: BaseSchedulerNode, node2: BaseSchedulerNode) -> None:
+        self.node1 = node1  # the reduction (producer)
+        self.node2 = node2  # the consumer that re-reads the large input
+        super().__init__(
+            node1.scheduler, list(node1.get_nodes()) + list(node2.get_nodes())
+        )
+        self.ancestors -= self.get_operation_names()
+        # Compute classification once at fusion time so scheduler and codegen
+        # share a single source of truth.
+        _, (_, rnumel2) = node2.group
+        grouped_reduction = NestedReduction._get_grouped_reduction_info(
+            node2, rnumel2
+        )
+        assert grouped_reduction is not None
+        node2_reduction, exact_group_size = grouped_reduction
+        self.node2_reduction: BaseSchedulerNode = node2_reduction
+        self.group_size: sympy.Integer = exact_group_size
+        _, (numel1, rnumel1) = self.node1.group
+        _, (_, rnumel2) = self.node2.group
+        shared_reads = NestedReduction.get_shared_input_reads(
+            self.node1, self.node2
+        )
+        self.group_size_in_r: bool = NestedReduction.is_group_size_in_r(
+            node2_reduction, numel1, rnumel1, rnumel2, shared_reads,
+        )
+
+    def can_fuse_with(self, other: BaseSchedulerNode) -> bool:
+        """Allow downstream pointwise of node2 to fuse in.
+
+        Consumers fused directly into node2 must run at either:
+        - reduced-output resolution (same numel as node2), or
+        - full resolution (same numel as node1's logical output)
+        """
+        if other.is_reduction():
+            return False
+        mutation_renames = self.scheduler.mutation_renames
+        node2_names = OrderedSet(
+            mutation_renames.get(name, name) for name in self.node2.get_buffer_names()
+        )
+        fused_buffer_names = OrderedSet(
+            mutation_renames.get(name, name) for name in self.get_buffer_names()
+        )
+        unmet_names = OrderedSet(
+            mutation_renames.get(dep.name, dep.name)
+            for dep in other.unmet_dependencies
+        )
+        if not (unmet_names & node2_names):
+            return False
+        fused_op_names = self.get_operation_names()
+        for name in unmet_names - fused_buffer_names:
+            buf = self.scheduler.name_to_buf.get(name)
+            if buf is None:
+                continue
+            op_name = buf.defining_op_name()
+            producer = self.scheduler.name_to_fused_node.get(op_name)
+            if producer is not None and fused_op_names & producer.ancestors:
+                return False
+        _, (numel2, rnumel2) = self.node2.group
+
+        if not NestedReduction._pointwise_nodes_match_grouped_resolution(
+            other.get_nodes(),
+            self.node2_reduction,
+            numel2,
+            rnumel2,
+            # group_size-in-X full-resolution epilogues need dependency-aware loop
+            # mapping. Size-only compatibility can map [B, D, K] to [B, K, D]
+            # incorrectly, so keep them out of the nested kernel for now.
+            allow_fullres=self.group_size_in_r,
+        ):
+            return False
+        # Use the backend's can_fuse directly instead of scheduler.can_fuse.
+        # scheduler.can_fuse includes reorder and memory-dep checks that
+        # are too strict for sub-node fusion (e.g., the epilogue reads
+        # the reduction output with different indexing than it was written).
+        device = self.node2.get_device()
+        backend = self.scheduler.get_backend(device)
+        return backend.can_fuse_vertical(self.node2, other)
+
+    def fuse_with(self, other: BaseSchedulerNode) -> "FusedNestedReductions":
+        device = self.node2.get_device()
+        backend = self.scheduler.get_backend(device)
+        new_node2 = backend.fuse(self.node2, other)
+        return FusedNestedReductions(self.node1, new_node2)
 
 
 class FusedExternTritonKernelSchedulerNode(FusedSchedulerNode):
@@ -5992,6 +6466,7 @@ class Scheduler:
         node2: BaseSchedulerNode,
         can_reorder: bool = False,
         allow_mix_order_reduction: bool = True,
+        allow_nested_reduction: bool = True,
     ) -> bool:
         """
         Determine if it is possible to combine node1 and node2 into a
@@ -6006,6 +6481,11 @@ class Scheduler:
             stream2 = self.node_to_stream.get(node2)
             if stream1 is not None and stream2 is not None and stream1 != stream2:
                 return False
+
+        if isinstance(node1, FusedNestedReductions):
+            return node1.can_fuse_with(node2)
+        if isinstance(node2, FusedNestedReductions):
+            return False
 
         if isinstance(node1, FusedMixOrderReductions):
             return node1.can_fuse_with(node2)
@@ -6184,7 +6664,10 @@ class Scheduler:
         del device2
 
         shared_data_score = self.score_fusion_memory(
-            node1, node2, allow_mix_order_reduction=allow_mix_order_reduction
+            node1,
+            node2,
+            allow_mix_order_reduction=allow_mix_order_reduction,
+            allow_nested_reduction=allow_nested_reduction,
         )
         assert isinstance(shared_data_score, int)
 
@@ -6289,6 +6772,10 @@ class Scheduler:
             # Examples here include:
             #   - MemoryDep("foo", x) != MemoryDep("foo", x + 1)
             #   - MemoryDep("foo", x) != StarDep("foo")
+            # Nested reductions are expected to have mismatched deps because
+            # node2 reads node1's output with a different iteration space.
+            if NestedReduction.can_fuse(node1, node2):
+                return True
             why("memory deps did not match")
             return False
 
@@ -6442,6 +6929,7 @@ class Scheduler:
         count_bytes: bool = ...,
         return_is_mix_order_reduction: Literal[False] = ...,
         allow_mix_order_reduction: bool = ...,
+        allow_nested_reduction: bool = ...,
     ) -> int: ...
 
     @overload
@@ -6452,6 +6940,7 @@ class Scheduler:
         count_bytes: bool = ...,
         return_is_mix_order_reduction: Literal[True] = ...,
         allow_mix_order_reduction: bool = ...,
+        allow_nested_reduction: bool = ...,
     ) -> tuple[int, int, bool]: ...
 
     def score_fusion_memory(
@@ -6461,6 +6950,7 @@ class Scheduler:
         count_bytes: bool = True,
         return_is_mix_order_reduction: bool = False,
         allow_mix_order_reduction: bool = True,
+        allow_nested_reduction: bool = True,
     ) -> int | tuple[int, int, bool]:
         """
         The first term in our fusion score that estimates number of saved
@@ -6485,6 +6975,10 @@ class Scheduler:
             if return_is_mix_order_reduction:
                 return (score, buffer_overlap_score, is_mix_order_reduction)
             return score + buffer_overlap_score
+
+        if allow_nested_reduction and NestedReduction.can_fuse(node1, node2):
+            score = NestedReduction.get_fusion_score(node1, node2)
+            return _construct_return_value(score, 0, False)
 
         if allow_mix_order_reduction and MixOrderReduction.can_fuse(node1, node2):
             # The fusion score for mix order reduction only count
@@ -8142,8 +8636,12 @@ class BaseScheduling:  # noqa: docstring_linter
         """
         if node1.is_foreach() or node2.is_foreach():
             return ForeachKernelSchedulerNode.fuse(node1, node2)
+        elif NestedReduction.are_nested_reductions(node1, node2):
+            return FusedNestedReductions(node1, node2)
         elif MixOrderReduction.are_mix_order_reductions(node1, node2):
             return FusedMixOrderReductions(node1, node2)
+        elif isinstance(node1, FusedNestedReductions):
+            return node1.fuse_with(node2)
         elif isinstance(node1, FusedMixOrderReductions):
             return node1.fuse_with(node2)
         elif isinstance(node1, ExternKernelSchedulerNode) and isinstance(

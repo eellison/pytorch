@@ -616,13 +616,20 @@ class CachingAutotuner(KernelInterface):
                 if total_block <= max_blocks_per_sm * device_prop.multi_processor_count:
                     # no need to improve occupancy
                     continue
-                new_config = copy.deepcopy(triton_config)
-
                 # Reduce the largest Rn_BLOCK by a factor of 2.
                 largest_rkwarg: str = max(
                     reduction_kwargs, key=triton_config.kwargs.__getitem__
                 )
-                new_config.kwargs[largest_rkwarg] //= 2
+                new_rblock = triton_config.kwargs[largest_rkwarg] // 2
+                min_rblock = self.inductor_meta.get("min_rblock")
+                if (
+                    min_rblock is not None
+                    and largest_rkwarg == "R0_BLOCK"
+                    and new_rblock < min_rblock
+                ):
+                    continue
+                new_config = copy.deepcopy(triton_config)
+                new_config.kwargs[largest_rkwarg] = new_rblock
 
                 if seen_config_hashes is None:
                     seen_config_hashes = OrderedSet(
@@ -2823,6 +2830,9 @@ def triton_config_reduction(
     dynamic_scale_rblock=True,
     reduction_hint=None,
     min_num_warps=None,
+    min_xblock=None,
+    max_xblock=None,
+    min_rblock=None,
 ) -> Config:
     """
     Construct a reduction triton config with some adjustment heuristics
@@ -2834,6 +2844,20 @@ def triton_config_reduction(
 
     # shrink sizes to size hints
     x = min(x, size_hints["x"])
+
+    # Enforce minimum XBLOCK (e.g. for nested reduction reshape)
+    if min_xblock is not None:
+        x = max(x, min_xblock)
+
+    # Enforce maximum XBLOCK (e.g. for 3D reshape within Triton limits)
+    if max_xblock is not None:
+        x = min(x, max_xblock)
+
+    # Enforce minimum RBLOCK (e.g. for nested reduction reshape in r-dim)
+    if min_rblock is not None:
+        for prefix in sorted(rnumels):
+            rnumels[prefix] = max(rnumels[prefix], min_rblock)
+            break  # only enforce on the innermost r dimension
 
     def total_numel() -> int:
         return conditional_product(x, *rnumels.values())
@@ -3084,7 +3108,14 @@ def _handle_combo_kernel_per_subkernel_blocks(
 
 
 def triton_config_tiled_reduction(
-    size_hints, x, y, r, num_stages=1, register_intensive=False, waves_per_eu=None
+    size_hints,
+    x,
+    y,
+    r,
+    num_stages=1,
+    register_intensive=False,
+    waves_per_eu=None,
+    min_xblock=None,
 ):
     """
     Construct a tile reduction triton config with some adjustment
@@ -3097,6 +3128,11 @@ def triton_config_tiled_reduction(
     # shrink sizes to size hints
     x = min(x, size_hints["x"])
     y = min(y, size_hints["y"])
+
+    # Enforce minimum XBLOCK (e.g. for nested reduction where
+    # tl.sum over x requires all elements in one block)
+    if min_xblock is not None:
+        x = max(x, min_xblock)
 
     def total_numel() -> int:
         return conditional_product(x, y, *rnumels.values())
@@ -3482,6 +3518,10 @@ def _reduction_configs(
         else:
             raise NotImplementedError("native matmul only supports mm/bmm pattern")
 
+    min_xblock = inductor_meta.get("min_xblock")
+    max_xblock = inductor_meta.get("max_xblock")
+    min_rblock = inductor_meta.get("min_rblock")
+
     def make_config(
         x,
         r,
@@ -3503,6 +3543,7 @@ def _reduction_configs(
                 num_stages=num_stages,
                 register_intensive=register_intensive,
                 waves_per_eu=waves_per_eu,
+                min_xblock=min_xblock,
             )
         else:
             # For other cases, use the original function
@@ -3516,6 +3557,9 @@ def _reduction_configs(
                 waves_per_eu=waves_per_eu,
                 dynamic_scale_rblock=dynamic_scale_rblock,
                 reduction_hint=reduction_hint,
+                min_xblock=min_xblock,
+                max_xblock=max_xblock,
+                min_rblock=min_rblock,
             )
 
     def outer_config_opt():
@@ -3714,6 +3758,7 @@ def adapt_config_for_tiling(
     register_intensive=False,
     persistent_reduction=False,
     waves_per_eu=None,
+    min_xblock=None,
 ) -> Config:
     """
     Create an adapted configuration based on tiling scores,
@@ -3733,6 +3778,7 @@ def adapt_config_for_tiling(
         num_stages=num_stages,
         register_intensive=register_intensive,
         waves_per_eu=waves_per_eu,
+        min_xblock=min_xblock,
     )
 
 
@@ -3991,6 +4037,9 @@ def _persistent_reduction_configs(
     else:
         xblock_vals = [1, 8, 32, 128]
 
+    min_xblock = inductor_meta.get("min_xblock") if inductor_meta else None
+    max_xblock = inductor_meta.get("max_xblock") if inductor_meta else None
+    min_rblock = inductor_meta.get("min_rblock") if inductor_meta else None
     if "y" not in size_hints:
         configs = [
             triton_config_reduction(
@@ -3999,6 +4048,9 @@ def _persistent_reduction_configs(
                 rnumel,
                 register_intensive=True,
                 reduction_hint=reduction_hint,
+                min_xblock=min_xblock,
+                max_xblock=max_xblock,
+                min_rblock=min_rblock,
             )
             for xblock in xblock_vals
             if xblock == 1
@@ -4017,7 +4069,11 @@ def _persistent_reduction_configs(
             )
             configs.append(
                 triton_config_tiled_reduction(
-                    size_hints, block_sizes["x"], block_sizes["y"], rnumel
+                    size_hints,
+                    block_sizes["x"],
+                    block_sizes["y"],
+                    rnumel,
+                    min_xblock=min_xblock,
                 )
             )
 
@@ -4026,6 +4082,9 @@ def _persistent_reduction_configs(
             size_hints,
             2 * (256 // rnumel) if rnumel <= 256 else 1,
             rnumel,
+            min_xblock=min_xblock,
+            max_xblock=max_xblock,
+            min_rblock=min_rblock,
         )
     ]
 
@@ -4061,6 +4120,7 @@ def _persistent_reduction_configs(
                         num_warps=num_warps,
                         min_num_warps=min_num_warps,
                         reduction_hint=reduction_hint,
+                        min_xblock=min_xblock,
                     )
                 ]
 

@@ -91,6 +91,13 @@ class CoordescTuner:
         else:
             return get_max_numwarps()
 
+    def min_block_size(self, name: str) -> int | None:
+        if name == "XBLOCK":
+            return self.inductor_meta.get("min_xblock")
+        if name == "R0_BLOCK":
+            return self.inductor_meta.get("min_rblock")
+        return None
+
     def cache_benchmark_result(self, config, timing):
         self.cached_benchmark_results[triton_config_to_hashable(config)] = timing
 
@@ -145,6 +152,9 @@ class CoordescTuner:
         if isinstance(field_limits, dict) and name in field_limits:
             return val > field_limits[name]
 
+        if name == "XBLOCK" and self.inductor_meta.get("max_xblock") is not None:
+            return val > self.inductor_meta["max_xblock"]
+
         block_suffix = "BLOCK"
         if name.endswith(block_suffix):
             prefix = name.strip(block_suffix).lower()
@@ -157,6 +167,10 @@ class CoordescTuner:
         return False
 
     def value_too_small(self, name: str, val: int) -> bool:
+        min_block = self.min_block_size(name)
+        if min_block is not None and val < min_block:
+            return True
+
         # In native matmul, block size should be >= 16 for tl.dot
         if self.is_native_matmul:
             if name in ["YBLOCK", "XBLOCK", "R0_BLOCK"]:
