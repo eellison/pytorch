@@ -939,17 +939,17 @@ print(t.is_pinned())
     def test_invalid_status_for_legacy_api(self):
         torch.backends.cudnn.conv.fp32_precision = "none"
         torch.backends.cudnn.rnn.fp32_precision = "tf32"
-        with self.assertRaisesRegex(RuntimeError, "mix of the legacy and new APIs"):
-            print(torch.backends.cudnn.allow_tf32)
+        with self.assertWarnsRegex(UserWarning, "mix of the legacy and new APIs"):
+            torch.backends.cudnn.allow_tf32
 
         torch.set_float32_matmul_precision("highest")
         torch.backends.cuda.matmul.fp32_precision = "tf32"
-        with self.assertRaisesRegex(RuntimeError, "mix of the legacy and new APIs"):
-            print(torch.get_float32_matmul_precision())
+        with self.assertWarnsRegex(UserWarning, "mix of the legacy and new APIs"):
+            torch.get_float32_matmul_precision()
 
         if not TEST_WITH_ROCM:
-            with self.assertRaisesRegex(RuntimeError, "mix of the legacy and new APIs"):
-                print(torch.backends.cuda.matmul.allow_tf32)
+            with self.assertWarnsRegex(UserWarning, "mix of the legacy and new APIs"):
+                torch.backends.cuda.matmul.allow_tf32
 
     def test_type_conversions(self):
         x = torch.randn(5, 5)

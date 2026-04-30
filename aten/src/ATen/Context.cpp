@@ -186,13 +186,14 @@ bool Context::allowTF32CuDNN(std::optional<Float32Op> op) const {
   if (!op.has_value()) {
     bool allow_tf32_rnn = float32Precision(Float32Backend::CUDA, Float32Op::RNN) == Float32Precision::TF32;
     bool allow_tf32_conv = float32Precision(Float32Backend::CUDA, Float32Op::CONV) == Float32Precision::TF32;
-    TORCH_CHECK(
-        allow_tf32_rnn == allow_tf32_conv && allow_tf32_rnn == allow_tf32_cudnn,
-        "PyTorch is checking whether allow_tf32 is enabled for cuDNN without a specific operator name,",
-        "but the current flag(s) indicate that cuDNN conv and cuDNN RNN have different TF32 flags.",
-        "This combination indicates that you have used a mix of the legacy and new APIs to set the TF32 flags. ",
-        "We suggest only using the new API to set the TF32 flag(s). See also: ",
-        "https://pytorch.org/docs/main/notes/cuda.html#tensorfloat-32-tf32-on-ampere-and-later-devices");
+    if (!(allow_tf32_rnn == allow_tf32_conv && allow_tf32_rnn == allow_tf32_cudnn)) {
+      TORCH_WARN_ONCE(
+          "PyTorch is checking whether allow_tf32 is enabled for cuDNN without a specific operator name, ",
+          "but the current flag(s) indicate that cuDNN conv and cuDNN RNN have different TF32 flags. ",
+          "This combination indicates that you have used a mix of the legacy and new APIs to set the TF32 flags. ",
+          "We suggest only using the new API to set the TF32 flag(s). See also: ",
+          "https://pytorch.org/docs/main/notes/cuda.html#tensorfloat-32-tf32-on-ampere-and-later-devices");
+    }
   } else {
     return float32Precision(Float32Backend::CUDA, op.value()) == Float32Precision::TF32;
   }
@@ -322,12 +323,13 @@ void Context::setImmediateMiopen(bool b) {
 bool Context::allowTF32CuBLAS() const {
   bool legacy_allow_tf32 = float32_matmul_precision != at::Float32MatmulPrecision::HIGHEST;
   bool allow_tf32_new = float32Precision(Float32Backend::CUDA, Float32Op::MATMUL) == Float32Precision::TF32;
-  TORCH_CHECK(
-      legacy_allow_tf32 == allow_tf32_new,
-      "PyTorch is checking whether allow_tf32_new is enabled for cuBlas matmul,",
-      "Current status indicate that you have used mix of the legacy and new APIs to set the TF32 status for cublas matmul. ",
-      "We suggest only using the new API to set the TF32 flag. See also: ",
-      "https://pytorch.org/docs/main/notes/cuda.html#tensorfloat-32-tf32-on-ampere-and-later-devices");
+  if (legacy_allow_tf32 != allow_tf32_new) {
+    TORCH_WARN_ONCE(
+        "PyTorch is checking whether allow_tf32 is enabled for cuBLAS matmul, ",
+        "but the current flags indicate that you have used a mix of the legacy and new APIs to set the TF32 status. ",
+        "We suggest only using the new API to set the TF32 flag. See also: ",
+        "https://pytorch.org/docs/main/notes/cuda.html#tensorfloat-32-tf32-on-ampere-and-later-devices");
+  }
   return allow_tf32_new;
 }
 
@@ -345,12 +347,13 @@ Float32MatmulPrecision Context::float32MatmulPrecision() const {
   invalid = invalid ||
       (float32Precision(Float32Backend::MKLDNN, Float32Op::MATMUL) == Float32Precision::TF32 &&
        float32_matmul_precision != at::Float32MatmulPrecision::HIGH);
-  TORCH_CHECK(
-      !invalid,
-      "PyTorch is checking the matmul precision without a specific backend name,",
-      "Current status indicate that you have used mix of the legacy and new APIs to set the matmul precision. ",
-      "We suggest only using the new API for matmul precision. See also: ",
-      "https://pytorch.org/docs/main/notes/cuda.html#tensorfloat-32-tf32-on-ampere-and-later-devices");
+  if (invalid) {
+    TORCH_WARN_ONCE(
+        "PyTorch is checking the matmul precision without a specific backend name, ",
+        "but the current flags indicate that you have used a mix of the legacy and new APIs to set the matmul precision. ",
+        "We suggest only using the new API for matmul precision. See also: ",
+        "https://pytorch.org/docs/main/notes/cuda.html#tensorfloat-32-tf32-on-ampere-and-later-devices");
+  }
   return float32_matmul_precision;
 }
 
