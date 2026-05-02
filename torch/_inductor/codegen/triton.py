@@ -4972,6 +4972,22 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             shape=shape,
         )
 
+    def emit_split_via_reshape(
+        self,
+        value: "CSEVariable",
+        reshape_shape: Sequence[sympy.Expr | int | str],
+        part_names: Sequence[str],
+    ) -> None:
+        old_shape = getattr(value, "shape", None)
+        reshaped = (
+            triton_reshape(str(value), list(old_shape), list(reshape_shape))
+            if old_shape is not None
+            else f"tl.reshape({value}, {triton_shape_str(reshape_shape)})"
+        )
+        self.compute.writeline(
+            f"{', '.join(part_names)} = tl.split({reshaped})"
+        )
+
     def emit_broadcast_via_reshape(
         self,
         value: "CSEVariable",
@@ -4992,12 +5008,21 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             if old_shape is not None
             else f"tl.reshape({value}, {triton_shape_str(mid_shape)})"
         )
+        broadcast_dtype = dtype
+        if dtype in (
+            torch.float8_e4m3fn,
+            torch.float8_e5m2,
+            torch.float8_e4m3fnuz,
+            torch.float8_e5m2fnuz,
+        ):
+            reshaped = f"{reshaped}.to(tl.float32)"
+            broadcast_dtype = torch.float32
         broadcasted = f"tl.broadcast_to({reshaped}, {triton_shape_str(bc_shape)})"
         line = triton_reshape(broadcasted, list(bc_shape), list(final_shape))
         return self.cse.generate(
             self.compute,
             line,
-            dtype=dtype,
+            dtype=broadcast_dtype,
             shape=out_shape,
         )
 
@@ -6416,10 +6441,13 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 f"{entry.name} = {self.index_to_str(entry.block_offset())} + "
                 f"{self.iteration_ranges_ranges_code(entry)}"
             )
-            code.writeline(
-                f"{entry.mask_name()} = {entry.name} < "
-                f"{self.index_to_str(entry.numel)}"
-            )
+            if self._has_constant_mask(entry):
+                code.writeline(self.create_constant_mask(entry))
+            else:
+                code.writeline(
+                    f"{entry.mask_name()} = {entry.name} < "
+                    f"{self.index_to_str(entry.numel)}"
+                )
             return
 
         x = entry.prefix

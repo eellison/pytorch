@@ -44,6 +44,7 @@ from torch._inductor.ir import TritonTemplateCallerBase
 from torch._inductor.metrics import get_metric_table, is_metric_table_enabled
 from torch._inductor.stream_utils import get_stream_name
 from torch.fx.experimental.symbolic_shapes import free_symbols
+from torch.utils._sympy.functions import FloorDiv
 from torch.utils._sympy.symbol import free_symbol_is_type, symbol_is_type, SymT
 from torch.utils._triton import has_triton
 
@@ -494,41 +495,65 @@ class NestedReduction:
             return None
         return reduction, group_size
 
-    @staticmethod
+    @classmethod
     def _pointwise_nodes_match_grouped_resolution(
+        cls,
         pointwise_nodes: Sequence[BaseSchedulerNode],
         reduction: BaseSchedulerNode,
         numel2: sympy.Expr,
         rnumel2: sympy.Expr,
         *,
         allow_fullres: bool,
+        allow_halfres: bool = False,
     ) -> bool:
         from .codegen.simd import SIMDKernel
 
         iter_ranges, reduce_ranges = reduction.get_ranges()
         reduced_output_groups = tuple(iter_ranges)
         full_resolution_groups = (*iter_ranges, *reduce_ranges)
+        half_resolution_groups = (
+            *iter_ranges,
+            FloorDiv(rnumel2, 2),
+        )
         fullres_numel = V.graph.sizevars.simplify(numel2 * rnumel2)
         for sn in pointwise_nodes:
             _, (sn_numel, _) = sn.group
             full_resolution = V.graph.sizevars.statically_known_equals(
                 sn_numel, fullres_numel
             )
+            half_resolution = cls._is_half_resolution_node(
+                sn, numel2, rnumel2,
+            )
             reduced_output_resolution = V.graph.sizevars.statically_known_equals(
                 sn_numel, numel2
             )
-            if not reduced_output_resolution and not (
-                allow_fullres and full_resolution
+            if not (
+                reduced_output_resolution
+                or (allow_fullres and full_resolution)
+                or (allow_halfres and half_resolution)
             ):
                 return False
-            source_groups = (
-                full_resolution_groups
-                if full_resolution
-                else reduced_output_groups
-            )
+            if half_resolution:
+                source_groups = half_resolution_groups
+            elif full_resolution:
+                source_groups = full_resolution_groups
+            else:
+                source_groups = reduced_output_groups
             if not SIMDKernel.is_compatible(source_groups, sn.get_ranges()):
                 return False
         return True
+
+    @staticmethod
+    def _is_half_resolution_node(
+        sn: BaseSchedulerNode,
+        numel2: sympy.Expr,
+        rnumel2: sympy.Expr,
+    ) -> bool:
+        _, (sn_numel, _) = sn.group
+        return V.graph.sizevars.statically_known_equals(
+            2 * sn_numel,
+            V.graph.sizevars.simplify(numel2 * rnumel2),
+        )
 
     @classmethod
     def _node2_pointwise_nodes_are_supported(
@@ -538,6 +563,7 @@ class NestedReduction:
         numel2: sympy.Expr,
         rnumel2: sympy.Expr,
         allow_fullres_epilogue: bool,
+        allow_halfres_epilogue: bool,
     ) -> bool:
         """node2 may be a fused node, but its pointwise subnodes must be
         producers or consumers of the single grouped reduction.
@@ -557,8 +583,14 @@ class NestedReduction:
             if is_prologue == is_epilogue:
                 return False
             allow_fullres = is_prologue or allow_fullres_epilogue
+            allow_halfres = is_epilogue and allow_halfres_epilogue
             if not cls._pointwise_nodes_match_grouped_resolution(
-                [sn], reduction, numel2, rnumel2, allow_fullres=allow_fullres
+                [sn],
+                reduction,
+                numel2,
+                rnumel2,
+                allow_fullres=allow_fullres,
+                allow_halfres=allow_halfres,
             ):
                 return False
         return True
@@ -687,7 +719,12 @@ class NestedReduction:
         ):
             return False
         if not cls._node2_pointwise_nodes_are_supported(
-            node2, node2_reduction, numel2, rnumel2, group_size_in_r,
+            node2,
+            node2_reduction,
+            numel2,
+            rnumel2,
+            group_size_in_r,
+            group_size_in_r and group_size % 2 == 0,
         ):
             return False
 
@@ -2737,6 +2774,10 @@ class FusedNestedReductions(FusedSchedulerNode):
                 return False
         _, (numel2, rnumel2) = self.node2.group
 
+        half_resolution = any(
+            NestedReduction._is_half_resolution_node(sn, numel2, rnumel2)
+            for sn in other.get_nodes()
+        )
         if not NestedReduction._pointwise_nodes_match_grouped_resolution(
             other.get_nodes(),
             self.node2_reduction,
@@ -2746,8 +2787,18 @@ class FusedNestedReductions(FusedSchedulerNode):
             # mapping. Size-only compatibility can map [B, D, K] to [B, K, D]
             # incorrectly, so keep them out of the nested kernel for now.
             allow_fullres=self.group_size_in_r,
+            allow_halfres=self.group_size_in_r and self.group_size % 2 == 0,
         ):
             return False
+        if half_resolution:
+            if not self._half_resolution_reads_use_constant_lane(
+                other.get_nodes(),
+                numel2,
+                rnumel2,
+                fused_buffer_names,
+            ):
+                return False
+            return True
         # Use the backend's can_fuse directly instead of scheduler.can_fuse.
         # scheduler.can_fuse includes reorder and memory-dep checks that
         # are too strict for sub-node fusion (e.g., the epilogue reads
@@ -2755,6 +2806,35 @@ class FusedNestedReductions(FusedSchedulerNode):
         device = self.node2.get_device()
         backend = self.scheduler.get_backend(device)
         return backend.can_fuse_vertical(self.node2, other)
+
+    def _half_resolution_reads_use_constant_lane(
+        self,
+        nodes: Sequence[BaseSchedulerNode],
+        numel2: sympy.Expr,
+        rnumel2: sympy.Expr,
+        fused_buffer_names: OrderedSet[str],
+    ) -> bool:
+        fullres_numel = V.graph.sizevars.simplify(numel2 * rnumel2)
+        for sn in nodes:
+            if not NestedReduction._is_half_resolution_node(sn, numel2, rnumel2):
+                continue
+            for dep in sn.read_writes.reads:
+                name = self.scheduler.mutation_renames.get(dep.name, dep.name)
+                if name in fused_buffer_names:
+                    continue
+                if not isinstance(dep, MemoryDep):
+                    return False
+                if not V.graph.sizevars.statically_known_equals(
+                    2 * sympy_product(dep.ranges.values()), fullres_numel
+                ):
+                    continue
+                lane = V.graph.sizevars.simplify(sympy.Mod(dep.index, 2))
+                if not any(
+                    V.graph.sizevars.statically_known_equals(lane, value)
+                    for value in (0, 1)
+                ):
+                    return False
+        return True
 
     def fuse_with(self, other: BaseSchedulerNode) -> "FusedNestedReductions":
         device = self.node2.get_device()
@@ -3071,6 +3151,12 @@ class ForeachKernelSchedulerNode(FusedSchedulerNode):
                 "ComboKernels: %d FusedMixOrderReductions nodes are filtered",
                 len(mix_order),
             )
+        nested_reductions = [x for x in nodes if isinstance(x, FusedNestedReductions)]
+        if nested_reductions:
+            log.debug(
+                "ComboKernels: %d FusedNestedReductions nodes are filtered",
+                len(nested_reductions),
+            )
 
         filtered_nodes = [
             x
@@ -3082,6 +3168,7 @@ class ForeachKernelSchedulerNode(FusedSchedulerNode):
                     ExternKernelSchedulerNode,
                     GroupedSchedulerNode,
                     FusedMixOrderReductions,
+                    FusedNestedReductions,
                 ),
             )
         ]

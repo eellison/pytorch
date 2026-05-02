@@ -9,6 +9,7 @@ so this file can stay focused on numerics, fusion policy, and edge cases.
 import torch
 import torch._inductor.config as inductor_config
 from torch._inductor import metrics
+from torch._higher_order_ops.inline_asm_elementwise import inline_asm_elementwise
 from torch._inductor.test_case import run_tests, TestCase
 from torch.testing._internal.common_utils import (
     instantiate_parametrized_tests,
@@ -684,6 +685,75 @@ class _NestedReductionBase:
         x = torch.randn(B, D, device=GPU_TYPE)
         w = torch.randn(D, device=GPU_TYPE)
         self.check_numeric(f, (x, w))
+        self.check_fusion()
+
+    @inductor_config.patch({"combo_kernels": True, "emulate_precision_casts": True})
+    def test_combo_kernels_skip_nested_reductions(self):
+        import torch.nn.functional as F
+
+        B, D, G = 8, 512, 128
+        fp8_max = torch.finfo(torch.float8_e4m3fn).max
+
+        def quant(x, weight):
+            x = F.rms_norm(x, (D,), weight)
+            x_groups = x.view(B, D // G, G)
+            amax = x_groups.abs().amax(dim=-1)
+            scale = (amax / fp8_max).clamp(min=1e-12)
+            x_fp8 = (x_groups / scale.unsqueeze(-1)).to(torch.float8_e4m3fn)
+            return x_fp8.view(B, D).float(), scale
+
+        def f(x0, w0, x1, w1):
+            return quant(x0, w0), quant(x1, w1)
+
+        x0 = torch.randn(B, D, device=GPU_TYPE)
+        x1 = torch.randn(B, D, device=GPU_TYPE)
+        w0 = torch.randn(D, device=GPU_TYPE)
+        w1 = torch.randn(D, device=GPU_TYPE)
+        self.check_numeric(f, (x0, w0, x1, w1))
+        if inductor_config.triton.nested_reduction:
+            self.assertEqual(metrics.codegen_nested_reduction, 2)
+            self.assertEqual(metrics.generated_kernel_count, 2)
+
+    @parametrize("B", [1, 128])
+    def test_producer_consumer_rmsnorm_nvfp4_inline_asm(self, B):
+        if torch.cuda.get_device_capability()[0] < 10:
+            self.skipTest("NVFP4 inline asm requires SM100+")
+
+        import torch.nn.functional as F
+
+        D, G = 4096, 16
+
+        def f(x, weight):
+            x = F.rms_norm(x, (D,), weight)
+            x = x.view(B, D // G, G)
+            amax = x.abs().amax(dim=-1)
+            scale = (amax / 448.0).clamp(min=1e-12).to(torch.float8_e4m3fn)
+            xg = x.view(B, D // G, G // 2, 2)
+            scale_f = scale.float().unsqueeze(-1)
+            even = xg[..., 0].float() / scale_f
+            odd = xg[..., 1].float() / scale_f
+            packed = inline_asm_elementwise(
+                even,
+                odd,
+                asm_str="{.reg .b8 t; cvt.rn.satfinite.e2m1x2.f32 t, $2, $1; cvt.u32.u8 $0, t;}",
+                constraints="=r,f,f",
+                dtype=torch.int32,
+                is_pure=True,
+                pack=1,
+            )
+            return packed.to(torch.uint8).view(B, D // 2), scale.view(B, D // G)
+
+        x = torch.randn(B, D, device=GPU_TYPE, dtype=torch.bfloat16)
+        w = torch.randn(D, device=GPU_TYPE, dtype=torch.bfloat16)
+
+        with inductor_config.patch("triton.nested_reduction", False):
+            ref = torch.compile(f, fullgraph=True)(x, w)
+        torch._dynamo.reset()
+        metrics.reset()
+
+        act = torch.compile(f, fullgraph=True)(x, w)
+        self.assertEqual(act[0], ref[0])
+        self.assertEqual(act[1].float(), ref[1].float(), atol=1e-2, rtol=1e-2)
         self.check_fusion()
 
     def test_no_fullres_epilogue_small_dim_in_x(self):
