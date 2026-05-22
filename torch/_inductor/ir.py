@@ -1688,6 +1688,17 @@ class Reduction(Loops):
 
         split = _maybe_increase_split(split)
 
+        # Suppress split when there is enough x-parallelism to fill the GPU.
+        # This keeps the reduction unsplit so downstream broadcast pointwise
+        # ops (e.g. batch norm epilogue) can fuse into the reduction kernel.
+        if split > 1 and is_gpu(device.type):
+            _numel_hint = V.graph.sizevars.optimization_hint(
+                sympy_product(ranges), fallback=1
+            )
+            _num_sm = DeviceProperties.create(device).multi_processor_count
+            if _numel_hint >= 2 * _num_sm:
+                split = 1
+
         # intermediate reduction in split can contain complex indexing,
         # and num_splits will fail to correctly set the hint
         # reuse the passed hint if available
@@ -2303,6 +2314,19 @@ class WelfordReduction(MultiOutputReduction):
         # reuse the passed hint if available
         if reduction_hint == ReductionHint.DEFAULT:
             reduction_hint = hint
+
+        # Suppress Welford split when there is enough x-parallelism to fill
+        # the GPU. This allows downstream broadcast pointwise ops (e.g. batch
+        # norm's (x - mean) * rsqrt(var + eps)) to fuse into the reduction
+        # epilogue via fits_in_main_body.
+        if split > 1 and is_gpu(device.type):
+            numel_hint = V.graph.sizevars.optimization_hint(
+                sympy_product(ranges), fallback=1
+            )
+            num_sm = DeviceProperties.create(device).multi_processor_count
+            if numel_hint >= 2 * num_sm:
+                split = 1
+
         if split > 1:
             # triton doesn't support reduce to single element well, so break it up
             return cls.create_multilayer(

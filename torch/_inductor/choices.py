@@ -373,6 +373,7 @@ class InductorChoices:
             return False
 
         xhint = V.graph.sizevars.optimization_hint(numel, fallback=2)
+        rhint = V.graph.sizevars.optimization_hint(reduction_numel, fallback=2)
         if xhint <= 8:
             threshold = 32768 * xhint
         elif xhint <= 16:
