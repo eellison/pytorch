@@ -917,6 +917,29 @@ aggressive_fusion = False
 debug_fusion: bool = os.environ.get("TORCHINDUCTOR_DEBUG_FUSION") == "1"
 benchmark_fusion: bool = os.environ.get("TORCHINDUCTOR_BENCHMARK_FUSION") == "1"
 enabled_metric_tables = os.environ.get("TORCHINDUCTOR_ENABLED_METRIC_TABLES", "")
+
+# Default-off issue #21 prototype.  This recognizes large mixed-order producer
+# kernels whose fresh full output is returned and also summed downstream.  The
+# lowering saves producer-body sum partials into a compact workspace, followed
+# by a final reduction of that workspace.
+producer_sum_reduction_accumulation: bool = (
+    os.environ.get("TORCHINDUCTOR_PRODUCER_SUM_REDUCTION_ACCUMULATION", "0") == "1"
+)
+producer_sum_reduction_accumulation_min_bytes: int = int(
+    os.environ.get(
+        "TORCHINDUCTOR_PRODUCER_SUM_REDUCTION_ACCUMULATION_MIN_BYTES",
+        str(64 * 1024 * 1024),
+    )
+)
+producer_sum_reduction_accumulation_mblock: int = int(
+    os.environ.get("TORCHINDUCTOR_PRODUCER_SUM_REDUCTION_ACCUMULATION_MBLOCK", "16")
+)
+producer_sum_reduction_accumulation_min_elements_per_output: int = int(
+    os.environ.get(
+        "TORCHINDUCTOR_PRODUCER_SUM_REDUCTION_ACCUMULATION_MIN_ELEMENTS_PER_OUTPUT",
+        "1024",
+    )
+)
 loop_ordering_after_fusion: bool = (
     os.environ.get(
         "TORCHINDUCTOR_LOOP_ORDERING_AFTER_FUSION", "0" if is_fbcode() else "1"

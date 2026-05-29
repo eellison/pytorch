@@ -148,6 +148,9 @@ class CUDACombinedScheduling(BaseScheduling):
     def codegen_mix_order_reduction(self, node):
         return self._triton_scheduling.codegen_mix_order_reduction(node)
 
+    def codegen_producer_consumer_partial_reduction(self, node):
+        return self._triton_scheduling.codegen_producer_consumer_partial_reduction(node)
+
     def codegen_nested_reduction(self, node):
         return self._triton_scheduling.codegen_nested_reduction(node)
 

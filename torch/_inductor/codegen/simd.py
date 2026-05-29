@@ -2328,28 +2328,28 @@ class SIMDScheduling(BaseScheduling):
     ) -> tuple[float, str]:
         raise NotImplementedError
 
+    def _pick_mix_order_reduction_split_size(
+        self, node: BaseSchedulerNode, numel: sympy.Expr
+    ) -> int:
+        # The override has highest priority.
+        if config.triton.mix_order_reduction_split_size is not None:
+            return config.triton.mix_order_reduction_split_size
+
+        # Heuristic based on number of SMs.
+        device_prop = DeviceProperties.create(node.get_device())
+        num_sm = device_prop.multi_processor_count
+        estimated_num_splits = num_sm * 8
+
+        # split_size is decided based on hint.
+        # optimization_hint is fine here: the result is clamped to [16, 128],
+        # so any fallback value still produces a valid split size.
+        numel_hint = V.graph.sizevars.optimization_hint(numel)
+        split_size = max(last_power_of_2(numel_hint // estimated_num_splits), 16)
+        return min(split_size, 128)
+
     def _codegen_mix_order_reduction(self, node1, node2):
         numel, rnumel = scheduler.MixOrderReduction.get_numel_rnumel(node1)
-
-        def _pick_split_size():
-            # the overridden has highest priority
-            if config.triton.mix_order_reduction_split_size is not None:
-                return config.triton.mix_order_reduction_split_size
-
-            # heuristics based on number of SMs
-            device_prop = DeviceProperties.create(node1.get_device())
-            num_sm = device_prop.multi_processor_count
-            estimated_num_splits = num_sm * 8
-
-            # split_size is decided based on hint.
-            # optimization_hint is fine here: the result is clamped to [16, 128],
-            # so any fallback value still produces a valid split size.
-            numel_hint = V.graph.sizevars.optimization_hint(numel)
-            split_size = max(last_power_of_2(numel_hint // estimated_num_splits), 16)
-            split_size = min(split_size, 128)
-            return split_size
-
-        split_size = _pick_split_size()
+        split_size = self._pick_mix_order_reduction_split_size(node1, numel)
 
         # pyrefly: ignore [bad-assignment]
         metrics.codegen_mix_order_reduction += 1
@@ -2491,6 +2491,163 @@ class SIMDScheduling(BaseScheduling):
 
         if node2_epilogue:
             self._codegen_nodes(node2_epilogue)
+
+        self.free_buffers_in_scheduler()
+
+    def codegen_producer_consumer_partial_reduction(
+        self, node: scheduler.FusedProducerConsumerPartialReduction
+    ) -> None:
+        """
+        Generate the #21 producer/consumer saved-partial prototype.
+
+        This reuses mix-order's saved partial accumulation machinery for an
+        existing mixed-order producer, but adds downstream producer-body sum
+        consumers as extra saved partials instead of rereading the full output.
+        """
+        producer, consumer = node.producer, node.consumer
+        assert isinstance(producer, scheduler.FusedMixOrderReductions)
+        candidate = node.candidate
+        numel = sympy.Integer(candidate.elements_per_reduction_output)
+        rnumel = sympy.Integer(candidate.consumer_output_numel)
+        split_size = self._pick_mix_order_reduction_split_size(producer.node1, numel)
+
+        counters["inductor"]["producer_sum_reduction_accumulation_codegen"] += 1
+        metrics.codegen_mix_order_reduction += 1
+
+        def extract_saved_partial_pointwise_nodes(reduction_owner):
+            reductions, epilogue = self._split_mix_order_reduction_epilogue(
+                reduction_owner
+            )
+            pointwise_nodes = []
+            for subnode in reductions:
+                subnode.cancel_reduction_split()
+                converted_node = subnode.extract_pw_from_reduction()
+                converted_node.swap_pw_red_dimension()
+                pointwise_nodes.append(converted_node)
+            return reductions, pointwise_nodes, epilogue
+
+        producer_nodes = producer.node1.get_nodes()
+        saved_partial_pointwise_nodes = []
+        original_reduction_groups = []
+        delayed_epilogue_nodes = []
+
+        reductions, pointwise_nodes, epilogue = extract_saved_partial_pointwise_nodes(
+            producer.node2
+        )
+        original_reduction_groups.append(reductions)
+        saved_partial_pointwise_nodes.extend(pointwise_nodes)
+        delayed_epilogue_nodes.extend(epilogue)
+
+        for extra_consumer in node.extra_consumers:
+            reductions, pointwise_nodes, epilogue = (
+                extract_saved_partial_pointwise_nodes(extra_consumer)
+            )
+            original_reduction_groups.append(reductions)
+            saved_partial_pointwise_nodes.extend(pointwise_nodes)
+            delayed_epilogue_nodes.extend(epilogue)
+
+        consumer_reductions, pointwise_nodes, consumer_epilogue = (
+            extract_saved_partial_pointwise_nodes(consumer)
+        )
+        original_reduction_groups.append(consumer_reductions)
+        saved_partial_pointwise_nodes.extend(pointwise_nodes)
+        delayed_epilogue_nodes.extend(consumer_epilogue)
+
+        node_schedule = self.generate_node_schedule(
+            producer_nodes + saved_partial_pointwise_nodes, numel, rnumel
+        )
+        kernel_features = SIMDKernelFeatures(node_schedule, numel, rnumel)
+
+        kernel, ws_name, src_code = self._generate_kernel_code_for_mix_order_reduction(
+            kernel_features,
+            split_size=split_size,
+            for_benchmark=False,
+        )
+
+        final_buffer_renames = {}
+        for reductions in original_reduction_groups:
+            if not reductions or not bool(reductions[0].node._split_size):
+                continue
+            # Split reductions first write an internal partial buffer.  Reuse
+            # mix-order's convention of naming the final workspace reduction as
+            # the downstream user buffer and marking the intermediate removed.
+            for subnode in reductions:
+                bufname = subnode.get_outputs()[0].node.get_name()
+                username = (
+                    subnode.get_outputs()[0]
+                    .users[0]
+                    .node.get_outputs()[0]
+                    .node.get_name()
+                )
+                final_buffer_renames[bufname] = username
+                assert self.scheduler
+                self.scheduler.removed_ops.add(
+                    subnode.get_outputs()[0].users[0].node.get_name()
+                )
+                V.graph.removed_buffers.add(bufname)
+
+        if final_buffer_renames:
+            for partial_accum in kernel.saved_partial_accumulate:
+                partial_accum.buffer_name = final_buffer_renames.get(
+                    partial_accum.buffer_name, partial_accum.buffer_name
+                )
+
+        kernel_name = self.define_kernel(src_code, node_schedule, kernel)
+        kernel.kernel_name = kernel_name
+        kernel.code_hash = code_hash(src_code)
+
+        with V.set_kernel_handler(kernel):
+            for subnode in kernel_features.scheduler_nodes():
+                if subnode.get_outputs()[0].node.get_name() not in final_buffer_renames:
+                    subnode.mark_run()
+
+        V.graph.wrapper_code.make_comment(
+            "# Call producer/consumer partial reduction kernel"
+        )
+        self.codegen_comment(node_schedule, None)
+        kernel.call_kernel(kernel.kernel_name, deallocate_ws=False)
+        V.graph.removed_buffers |= kernel.removed_buffers
+        V.graph.inplaced_to_remove |= kernel.inplaced_to_remove
+
+        assert len(saved_partial_pointwise_nodes) == len(
+            kernel.saved_partial_accumulate
+        )
+        nsplit = V.graph.wrapper_code.codegen_python_sizevar(
+            (numel + split_size - 1) // split_size
+        )
+        for idx, partial_accum in enumerate(kernel.saved_partial_accumulate):
+            buffer_name = partial_accum.buffer_name
+            stride_str = f"({nsplit}) * ({rnumel})"
+            start = f"{idx} * {stride_str}"
+            end = f"({idx} + 1) * {stride_str}"
+            reduction_type2op = {
+                "min": "amin",
+                "max": "amax",
+            }
+            opname = reduction_type2op.get(
+                partial_accum.reduction_type, partial_accum.reduction_type
+            )
+            final_reduce = (
+                f"{buffer_name} = {ws_name}[{start} : {end}]"
+                f".view({nsplit}, {rnumel}).{opname}(dim=0)"
+            )
+            buffer = V.graph.get_buffer(buffer_name)
+            if buffer is not None:
+                final_shape = [
+                    V.graph.wrapper_code.codegen_python_sizevar(s)
+                    for s in buffer.get_layout().size
+                ]
+                final_shape_str = f"[{', '.join(final_shape)}]"
+                final_reduce += f".view({final_shape_str})"
+            if (buffer_dtype := V.graph.get_dtype(buffer_name)) != torch.float:
+                final_reduce += f".to({buffer_dtype})"
+            V.graph.wrapper_code.writeline(final_reduce)
+            V.graph.wrapper_code.allocated.add(buffer_name)
+
+        kernel.deallocate_workspaces()
+
+        if delayed_epilogue_nodes:
+            self._codegen_nodes(delayed_epilogue_nodes)
 
         self.free_buffers_in_scheduler()
 

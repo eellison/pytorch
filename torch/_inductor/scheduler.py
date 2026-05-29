@@ -154,6 +154,34 @@ class PendingFusion:
         return (self.node1, self.node2)
 
 
+@dataclasses.dataclass(frozen=True)
+class ProducerConsumerSumReductionCandidate:
+    """
+    Scheduler-level facts for the #21 saved-partial prototype.
+
+    The producer still has to materialize its full output, but exactly one
+    downstream sum reduction also reads that output.  These fields describe the
+    output/consumer pair and the profitability estimate used before creating
+    the fused scheduler carrier.
+    """
+
+    producer_name: str
+    output_name: str
+    consumer_name: str
+    alias_names: tuple[str, ...]
+    user_names: tuple[str, ...]
+    producer_reduction_ancestor_names: tuple[str, ...]
+    output_numel: int
+    consumer_output_numel: int
+    elements_per_reduction_output: int
+    full_output_bytes: int
+    reduction_read_numel: int
+    reduction_read_bytes: int
+    partial_workspace_mblock: int
+    estimated_partial_workspace_bytes: int
+    atomic_contention_estimate: int
+
+
 class _LocalEntry(NamedTuple):
     """One row of the post-rewrite slice the gate builds.
 
@@ -3041,6 +3069,62 @@ class FusedNestedReductions(FusedSchedulerNode):
         return FusedNestedReductions(self.node1, new_node2)
 
 
+class FusedProducerConsumerPartialReduction(FusedSchedulerNode):
+    """
+    Issue #21 carrier for a mixed-order producer whose fresh full output is also
+    consumed by a downstream sum reduction.
+
+    This wraps an existing FusedMixOrderReductions producer and adds compatible
+    producer-body sum consumers as extra saved partials.  The lowering is:
+
+    1. Codegen the producer/full-output kernel as today.
+    2. While each producer tile computes the full output value, also write a
+       compact partial row:
+           workspace[row_block, consumer_output_index] =
+               sum_{producer rows in row_block}(producer_value)
+    3. In the wrapper, reduce the compact workspace:
+           final = workspace.view(workspace_rows, consumer_output_numel)
+                            .sum(dim=0)
+                            .view(final_shape)
+                            .to(final_dtype)
+
+    That reuses the mix-order saved-partial lifetime shape
+    (KernelArgs.workspace + wrapper final reduction), while keeping the
+    producer/consumer removal explicit at the scheduler level.
+    """
+
+    def __init__(
+        self,
+        producer: BaseSchedulerNode,
+        consumer: BaseSchedulerNode,
+        candidate: ProducerConsumerSumReductionCandidate,
+        extra_consumers: tuple[BaseSchedulerNode, ...] = (),
+    ) -> None:
+        self.producer = producer
+        self.consumer = consumer
+        self.extra_consumers = extra_consumers
+        self.candidate = candidate
+        super().__init__(
+            producer.scheduler,
+            list(producer.get_nodes())
+            + list(consumer.get_nodes())
+            + list(
+                itertools.chain.from_iterable(
+                    extra_consumer.get_nodes() for extra_consumer in extra_consumers
+                )
+            ),
+        )
+        # Hide the internal producer -> consumer edge from later scheduling
+        # checks if this carrier is enabled.
+        self.ancestors -= self.get_operation_names()
+
+    def codegen(self, wrapper: PythonWrapperCodegen) -> None:
+        raise NotImplementedError(
+            "FusedProducerConsumerPartialReduction should be lowered by "
+            "BaseScheduling.codegen_producer_consumer_partial_reduction()."
+        )
+
+
 class FusedExternTritonKernelSchedulerNode(FusedSchedulerNode):
     def __init__(
         self,
@@ -3357,6 +3441,14 @@ class ForeachKernelSchedulerNode(FusedSchedulerNode):
                 "ComboKernels: %d FusedNestedReductions nodes are filtered",
                 len(nested_reductions),
             )
+        producer_consumer_partials = [
+            x for x in nodes if isinstance(x, FusedProducerConsumerPartialReduction)
+        ]
+        if producer_consumer_partials:
+            log.debug(
+                "ComboKernels: %d FusedProducerConsumerPartialReduction nodes are filtered",
+                len(producer_consumer_partials),
+            )
 
         filtered_nodes = [
             x
@@ -3369,6 +3461,7 @@ class ForeachKernelSchedulerNode(FusedSchedulerNode):
                     GroupedSchedulerNode,
                     FusedMixOrderReductions,
                     FusedNestedReductions,
+                    FusedProducerConsumerPartialReduction,
                 ),
             )
         ]
@@ -4059,6 +4152,13 @@ class Scheduler:
         self.name_to_fused_node = {n.get_name(): n for n in self.nodes}
         self.compute_ancestors()
         self.compute_input_distances()
+        self.producer_sum_reduction_accumulation_candidates: list[
+            ProducerConsumerSumReductionCandidate
+        ] = []
+        if config.producer_sum_reduction_accumulation:
+            self.producer_sum_reduction_accumulation_candidates = (
+                self.find_producer_sum_reduction_accumulation_candidates()
+            )
 
         # pyrefly: ignore [bad-assignment]
         metrics.ir_nodes_pre_fusion += len(self.nodes)
@@ -4088,6 +4188,8 @@ class Scheduler:
         self._populate_stream_assignments()
 
         self.nodes = self.fuse_nodes(self.nodes)
+        if self.producer_sum_reduction_accumulation_candidates:
+            self.nodes = self._fuse_producer_sum_reduction_accumulations(self.nodes)
         if config._post_fusion_custom_pass is not None:
             self.nodes = config._post_fusion_custom_pass(self.nodes)
 
@@ -4646,6 +4748,497 @@ class Scheduler:
         str = logbuf.getrawvalue().rstrip()
         compute_dependencies_log.debug("BUFFER USER LIST\n")
         compute_dependencies_log.debug("===== AFTER SCHEDULING =====\n%s", str)
+
+    def _producer_sum_accumulation_alias_names(self, buf_name: str) -> OrderedSet[str]:
+        alias_names = OrderedSet([buf_name])
+        changed = True
+        while changed:
+            changed = False
+            for candidate_name, candidate_buf in self.name_to_buf.items():
+                if candidate_name in alias_names:
+                    continue
+                if any(alias in alias_names for alias in candidate_buf.get_aliases()):
+                    alias_names.add(candidate_name)
+                    changed = True
+        return alias_names
+
+    def _buffer_numel_hint(self, buf: SchedulerBuffer) -> int:
+        try:
+            return V.graph.sizevars.optimization_hint(buf.node.get_numel(), fallback=0)
+        except Exception:
+            return 0
+
+    def _buffer_bytes_hint(self, buf: SchedulerBuffer) -> int:
+        try:
+            return self._buffer_numel_hint(buf) * get_dtype_size(buf.node.get_dtype())
+        except Exception:
+            return 0
+
+    def _node_output_numel_hint(self, node: BaseSchedulerNode) -> int:
+        return sum(self._buffer_numel_hint(buf) for buf in node.get_outputs())
+
+    def _single_non_output_user(self, buf: SchedulerBuffer) -> BaseSchedulerNode | None:
+        users = [
+            user.node
+            for user in buf.users
+            if not user.is_weak and not isinstance(user.node, OutputNode)
+        ]
+        if len(users) != 1 or not isinstance(users[0], BaseSchedulerNode):
+            return None
+        return users[0]
+
+    def _terminal_sum_reduction_consumer(
+        self, consumer: BaseSchedulerNode
+    ) -> BaseSchedulerNode:
+        """
+        Follow a single-use sum-reduction chain to the true final output.
+
+        Large #21 repros often split the final reduction into two scheduler
+        nodes.  The immediate consumer's output can be a large partial buffer;
+        profitability needs the terminal reduction output size instead.
+        """
+        terminal = consumer
+        seen: OrderedSet[BaseSchedulerNode] = OrderedSet()
+        while terminal not in seen:
+            seen.add(terminal)
+            outputs = terminal.get_outputs()
+            if len(outputs) != 1:
+                break
+            next_node = self._single_non_output_user(outputs[0])
+            if next_node is None or not next_node.is_reduction():
+                break
+            reduction_types = self._reduction_types(next_node)
+            if not reduction_types or any(rt != "sum" for rt in reduction_types):
+                break
+            terminal = next_node
+        return terminal
+
+    @staticmethod
+    def _reduction_types(node: BaseSchedulerNode) -> list[str]:
+        reduction_types: list[str] = []
+        for subnode in node.get_nodes():
+            if not (
+                isinstance(subnode, SchedulerNode)
+                and isinstance(subnode.node, ir.ComputedBuffer)
+            ):
+                continue
+            reduction_type = subnode.node.get_reduction_type()
+            if reduction_type is not None:
+                reduction_types.append(reduction_type)
+        return reduction_types
+
+    @staticmethod
+    def _read_names(reads: OrderedSet[Dep]) -> OrderedSet[str]:
+        return OrderedSet(dep.name for dep in reads if not isinstance(dep, WeakDep))
+
+    @staticmethod
+    def _node_outputs_all_dtype(node: BaseSchedulerNode, dtype: torch.dtype) -> bool:
+        return all(buf.node.get_dtype() == dtype for buf in node.get_outputs())
+
+    def _consumer_reads_exactly_alias(
+        self,
+        consumer: BaseSchedulerNode,
+        alias_names: OrderedSet[str],
+    ) -> bool:
+        read_names = self._read_names(consumer.read_writes.reads)
+        return bool(read_names & alias_names) and read_names.issubset(alias_names)
+
+    def _producer_sum_accumulation_candidate_for_output(
+        self,
+        producer: BaseSchedulerNode,
+        output: SchedulerBuffer,
+    ) -> ProducerConsumerSumReductionCandidate | None:
+        if output.get_aliases() or output.get_mutations():
+            return None
+
+        output_name = output.get_name()
+        alias_names = self._producer_sum_accumulation_alias_names(output_name)
+        alias_defining_nodes = OrderedSet[BaseSchedulerNode]()
+        for alias_name in alias_names:
+            if alias_name == output_name:
+                continue
+            alias_buf = self.name_to_buf.get(alias_name)
+            if alias_buf is not None and alias_buf.defining_op is not None:
+                alias_defining_nodes.add(alias_buf.defining_op)
+
+        has_output_user = False
+        consumer_nodes = OrderedSet[BaseSchedulerNode]()
+        user_names: list[str] = []
+        for alias_name in alias_names:
+            alias_buf = self.name_to_buf.get(alias_name)
+            if alias_buf is None:
+                continue
+            for user in alias_buf.users:
+                if user.is_weak:
+                    continue
+                user_names.append(user.get_name())
+                if isinstance(user.node, OutputNode):
+                    has_output_user = True
+                elif isinstance(user.node, BaseSchedulerNode):
+                    if user.node in alias_defining_nodes:
+                        continue
+                    consumer_nodes.add(user.node)
+
+        # The intended path only pays off when the full producer output must
+        # still exist independently of the sum reduction.
+        if not has_output_user or len(consumer_nodes) != 1:
+            return None
+
+        consumer = next(iter(consumer_nodes))
+        if not consumer.is_gpu() or not consumer.is_reduction():
+            return None
+
+        reduction_types = self._reduction_types(consumer)
+        if not reduction_types or any(rt != "sum" for rt in reduction_types):
+            return None
+
+        # The saved-partial workspace path currently allocates torch.float
+        # workspace rows. Keep the prototype on fp32 reductions until workspace
+        # dtype is carried through PartialAccumulate/codegen.
+        if output.node.get_dtype() != torch.float:
+            return None
+
+        if not self._consumer_reads_exactly_alias(consumer, alias_names):
+            return None
+
+        output_numel = self._buffer_numel_hint(output)
+        terminal_consumer = self._terminal_sum_reduction_consumer(consumer)
+        if not self._node_outputs_all_dtype(terminal_consumer, torch.float):
+            return None
+        consumer_output_numel = self._node_output_numel_hint(terminal_consumer)
+        full_output_bytes = self._buffer_bytes_hint(output)
+        if (
+            output_numel <= 0
+            or consumer_output_numel <= 0
+            or output_numel <= consumer_output_numel
+            or full_output_bytes < config.producer_sum_reduction_accumulation_min_bytes
+        ):
+            return None
+
+        reduction_read_bytes = sum(
+            self.dep_size_hint(dep)
+            for dep in consumer.read_writes.reads
+            if dep.name in alias_names and not isinstance(dep, WeakDep)
+        )
+        if reduction_read_bytes * 4 < full_output_bytes * 3:
+            return None
+
+        elements_per_reduction_output = math.ceil(output_numel / consumer_output_numel)
+        if (
+            elements_per_reduction_output
+            < config.producer_sum_reduction_accumulation_min_elements_per_output
+        ):
+            return None
+
+        mblock = max(1, config.producer_sum_reduction_accumulation_mblock)
+        partial_workspace_rows = math.ceil(elements_per_reduction_output / mblock)
+        estimated_partial_workspace_bytes = (
+            partial_workspace_rows
+            * consumer_output_numel
+            * get_dtype_size(output.node.get_dtype())
+        )
+        if estimated_partial_workspace_bytes * 4 >= reduction_read_bytes * 3:
+            return None
+
+        reduction_read_numel = sum(
+            self.dep_size_hint(dep, count_bytes=False)
+            for dep in consumer.read_writes.reads
+            if dep.name in alias_names and not isinstance(dep, WeakDep)
+        )
+        producer_reduction_ancestor_names = tuple(
+            sorted(
+                name
+                for name in producer.ancestors
+                if (
+                    self.name_to_node.get(name) is not None
+                    and self.name_to_node[name].is_reduction()
+                )
+            )
+        )
+        if not producer_reduction_ancestor_names:
+            return None
+
+        return ProducerConsumerSumReductionCandidate(
+            producer_name=producer.get_name(),
+            output_name=output_name,
+            consumer_name=consumer.get_name(),
+            alias_names=tuple(alias_names),
+            user_names=tuple(sorted(set(user_names))),
+            producer_reduction_ancestor_names=producer_reduction_ancestor_names,
+            output_numel=output_numel,
+            consumer_output_numel=consumer_output_numel,
+            elements_per_reduction_output=elements_per_reduction_output,
+            full_output_bytes=full_output_bytes,
+            reduction_read_numel=reduction_read_numel,
+            reduction_read_bytes=reduction_read_bytes,
+            partial_workspace_mblock=mblock,
+            estimated_partial_workspace_bytes=estimated_partial_workspace_bytes,
+            atomic_contention_estimate=elements_per_reduction_output,
+        )
+
+    def find_producer_sum_reduction_accumulation_candidates(
+        self,
+    ) -> list[ProducerConsumerSumReductionCandidate]:
+        if V.graph.cpp_wrapper or config.deterministic:
+            return []
+
+        candidates: list[ProducerConsumerSumReductionCandidate] = []
+        for producer in self.nodes:
+            device = producer.get_device()
+            if (
+                device is None
+                or device.type != "cuda"
+                or not producer.is_gpu()
+                or producer.has_side_effects()
+                or producer.has_aliasing_or_mutation()
+            ):
+                continue
+            for output in producer.get_outputs():
+                candidate = self._producer_sum_accumulation_candidate_for_output(
+                    producer, output
+                )
+                if candidate is None:
+                    continue
+                candidates.append(candidate)
+
+        counters["inductor"]["producer_sum_reduction_accumulation_candidates"] += len(
+            candidates
+        )
+        for candidate in candidates:
+            log.info(
+                "producer_sum_reduction_accumulation candidate: "
+                "producer=%s output=%s consumer=%s output_bytes=%d "
+                "read_numel=%d read_bytes=%d reduction_outputs=%d "
+                "elems_per_output=%d "
+                "partial_workspace_mblock=%d partial_workspace_bytes=%d "
+                "atomic_contention_estimate=%d aliases=%s users=%s "
+                "producer_reduction_ancestors=%s",
+                candidate.producer_name,
+                candidate.output_name,
+                candidate.consumer_name,
+                candidate.full_output_bytes,
+                candidate.reduction_read_numel,
+                candidate.reduction_read_bytes,
+                candidate.consumer_output_numel,
+                candidate.elements_per_reduction_output,
+                candidate.partial_workspace_mblock,
+                candidate.estimated_partial_workspace_bytes,
+                candidate.atomic_contention_estimate,
+                candidate.alias_names,
+                candidate.user_names,
+                candidate.producer_reduction_ancestor_names,
+            )
+        return candidates
+
+    def _fuse_producer_sum_reduction_accumulations(
+        self, nodes: list[BaseSchedulerNode]
+    ) -> list[BaseSchedulerNode]:
+        if not self.producer_sum_reduction_accumulation_candidates:
+            return nodes
+
+        def domain_matches_saved_partial_shape(
+            group: tuple[sympy.Expr, sympy.Expr],
+            expected_numel: int,
+            expected_rnumel: int,
+        ) -> bool:
+            return V.graph.sizevars.statically_known_equals(
+                group[0], expected_numel
+            ) and V.graph.sizevars.statically_known_equals(group[1], expected_rnumel)
+
+        def flat_pointwise_domain_matches_saved_partial_shape(
+            group: tuple[sympy.Expr, sympy.Expr],
+            expected_numel: int,
+            expected_rnumel: int,
+        ) -> bool:
+            return V.graph.sizevars.statically_known_equals(
+                group[0], expected_numel * expected_rnumel
+            ) and V.graph.sizevars.statically_known_equals(group[1], 1)
+
+        def node_logical_reduction_group(
+            node: BaseSchedulerNode,
+        ) -> tuple[sympy.Expr, sympy.Expr]:
+            if node.is_reduction():
+                return MixOrderReduction.get_numel_rnumel(node)
+            return typing.cast(tuple[sympy.Expr, sympy.Expr], node.group[1])
+
+        def subnode_domain_matches_saved_partial_shape(
+            subnode: BaseSchedulerNode,
+            expected_numel: int,
+            expected_rnumel: int,
+            *,
+            allow_transposed_reduction: bool,
+        ) -> bool:
+            group = node_logical_reduction_group(subnode)
+            if domain_matches_saved_partial_shape(
+                group, expected_numel, expected_rnumel
+            ) or (
+                not subnode.is_reduction()
+                and flat_pointwise_domain_matches_saved_partial_shape(
+                    group, expected_numel, expected_rnumel
+                )
+            ):
+                return True
+            if not allow_transposed_reduction or not subnode.is_reduction():
+                return False
+            reduction_types = self._reduction_types(subnode)
+            return (
+                bool(reduction_types)
+                and all(rt == "sum" for rt in reduction_types)
+                and domain_matches_saved_partial_shape(
+                    group, expected_rnumel, expected_numel
+                )
+            )
+
+        def compatible_extra_mix_order_sum_consumers(
+            producer: BaseSchedulerNode,
+            consumer: BaseSchedulerNode,
+            candidate: ProducerConsumerSumReductionCandidate,
+            removed: OrderedSet[BaseSchedulerNode],
+        ) -> tuple[BaseSchedulerNode, ...]:
+            if not isinstance(producer, FusedMixOrderReductions):
+                return ()
+
+            expected_numel = candidate.elements_per_reduction_output
+            expected_rnumel = candidate.consumer_output_numel
+            producer_ops = producer.get_operation_names()
+            producer_read_names = self._read_names(producer.read_writes.reads)
+            alias_names = OrderedSet(candidate.alias_names)
+            extras: list[BaseSchedulerNode] = []
+            for node in nodes:
+                if node in removed or node is producer or node is consumer:
+                    continue
+                if (
+                    not node.is_gpu()
+                    or not node.is_reduction()
+                    or node.has_side_effects()
+                    or node.has_aliasing_or_mutation()
+                ):
+                    continue
+                node_ops = node.get_operation_names()
+                if (
+                    node_ops & producer_ops
+                    or node.ancestors & producer_ops
+                    or producer.ancestors & node_ops
+                ):
+                    continue
+                reduction_types = self._reduction_types(node)
+                if not reduction_types or any(rt != "sum" for rt in reduction_types):
+                    continue
+                terminal = self._terminal_sum_reduction_consumer(node)
+                if not self._node_outputs_all_dtype(terminal, torch.float):
+                    continue
+                if self._node_output_numel_hint(terminal) != expected_rnumel:
+                    continue
+                if not subnode_domain_matches_saved_partial_shape(
+                    node,
+                    expected_numel,
+                    expected_rnumel,
+                    allow_transposed_reduction=True,
+                ):
+                    continue
+                read_names = self._read_names(node.read_writes.reads)
+                if read_names & alias_names:
+                    continue
+                if not read_names.issubset(producer_read_names):
+                    continue
+                extras.append(node)
+
+            return tuple(extras)
+
+        name_to_owner: dict[str, BaseSchedulerNode] = {}
+        for node in nodes:
+            for name in node.get_operation_names():
+                name_to_owner[name] = node
+
+        replacements: dict[
+            BaseSchedulerNode, FusedProducerConsumerPartialReduction
+        ] = {}
+        removed: OrderedSet[BaseSchedulerNode] = OrderedSet()
+        for candidate in self.producer_sum_reduction_accumulation_candidates:
+            producer = name_to_owner.get(candidate.producer_name)
+            consumer = name_to_owner.get(candidate.consumer_name)
+            if (
+                producer is None
+                or consumer is None
+                or producer is consumer
+                or producer in removed
+                or consumer in removed
+            ):
+                continue
+            if not isinstance(producer, FusedMixOrderReductions):
+                counters["inductor"][
+                    "producer_sum_reduction_accumulation_reject_not_mix_order"
+                ] += 1
+                continue
+            producer_group = typing.cast(
+                tuple[sympy.Expr, sympy.Expr], producer.group[1]
+            )
+            # Only create the carrier if the fused producer already has the
+            # same logical [output-index, reduction-index] domain that the
+            # saved-partial workspace expects.
+            if not domain_matches_saved_partial_shape(
+                producer_group,
+                candidate.elements_per_reduction_output,
+                candidate.consumer_output_numel,
+            ):
+                counters["inductor"][
+                    "producer_sum_reduction_accumulation_reject_domain_mismatch"
+                ] += 1
+                continue
+            expected_numel = candidate.elements_per_reduction_output
+            expected_rnumel = candidate.consumer_output_numel
+            mix_order_node2_ops = producer.node2.get_operation_names()
+            # Every subnode in the producer carrier must use the same workspace
+            # domain.  For a FusedMixOrderReductions producer, only node2's
+            # existing mixed-order reduction may be transposed; extra consumers
+            # are added separately below when their sum domain is available in
+            # the producer body.
+            if any(
+                not subnode_domain_matches_saved_partial_shape(
+                    subnode,
+                    expected_numel,
+                    expected_rnumel,
+                    allow_transposed_reduction=bool(
+                        subnode.get_operation_names() & mix_order_node2_ops
+                    ),
+                )
+                for subnode in producer.get_nodes()
+            ):
+                counters["inductor"][
+                    "producer_sum_reduction_accumulation_reject_subnode_domain_mismatch"
+                ] += 1
+                continue
+            extra_consumers = compatible_extra_mix_order_sum_consumers(
+                producer, consumer, candidate, removed
+            )
+            fused = FusedProducerConsumerPartialReduction(
+                producer, consumer, candidate, extra_consumers
+            )
+            replacements[producer] = fused
+            removed.add(consumer)
+            for extra_consumer in extra_consumers:
+                removed.add(extra_consumer)
+            counters["inductor"]["producer_sum_reduction_accumulation_selected"] += 1
+            counters["inductor"][
+                "producer_sum_reduction_accumulation_extra_reductions"
+            ] += len(extra_consumers)
+
+        if not replacements:
+            return nodes
+
+        new_nodes: list[BaseSchedulerNode] = []
+        for node in nodes:
+            if node in removed:
+                continue
+            new_nodes.append(replacements.get(node, node))
+
+        self.name_to_node = {n.get_name(): n for n in new_nodes}
+        self.name_to_fused_node = {n.get_name(): n for n in new_nodes}
+        for node in new_nodes:
+            for name in node.get_operation_names():
+                self.name_to_fused_node[name] = node
+                self.name_to_node[name] = node
+        return self.topological_sort_schedule(new_nodes)
 
     def insert_memory_check_nodes(self) -> None:
         from .memory import (
@@ -9364,6 +9957,11 @@ class Scheduler:
             elif isinstance(node, FusedMixOrderReductions):
                 # pyrefly: ignore [unbound-name]
                 self.get_backend(device).codegen_mix_order_reduction(node)
+            elif isinstance(node, FusedProducerConsumerPartialReduction):
+                # pyrefly: ignore [unbound-name]
+                self.get_backend(device).codegen_producer_consumer_partial_reduction(
+                    node
+                )
             elif isinstance(node, (FusedSchedulerNode, SchedulerNode)):
                 # pyrefly: ignore [unbound-name]
                 self.get_backend(device).codegen_node(node)
@@ -9701,6 +10299,11 @@ class BaseScheduling:  # noqa: docstring_linter
         raise NotImplementedError
 
     def codegen_mix_order_reduction(self, node: FusedMixOrderReductions) -> None:
+        raise NotImplementedError
+
+    def codegen_producer_consumer_partial_reduction(
+        self, node: FusedProducerConsumerPartialReduction
+    ) -> None:
         raise NotImplementedError
 
     def codegen_nested_reduction(self, node: FusedNestedReductions) -> None:
