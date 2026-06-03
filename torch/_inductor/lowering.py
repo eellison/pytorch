@@ -73,7 +73,6 @@ from .ir import (
     IRNode,
     is_triton,
     MutableBox,
-    CrossEntropyOnlineReduction,
     OnlineSoftmaxReduction,
     ops_wrapper,
     PermuteView,
@@ -8923,49 +8922,50 @@ def cross_entropy_loss_online(x, targets, dim):
     if V.graph.sizevars.statically_known_geq(
         rnumel, config.unroll_reductions_threshold
     ):
-        # Create a combined inner_fn that returns (logit_value, target_logit_value)
+        # Path B: pre-compute the gather as a separate Pointwise before the
+        # reduction.  This makes the target logit a simple buffer load inside
+        # the reduction kernel, allowing existing loop-invariant hoisting to
+        # move it out of the inner loop.
         logits_loader = x.make_loader()
         targets_loader = targets.make_loader()
 
         x_size = x.get_size()
         dim_normalized = dim if dim >= 0 else dim + len(x_size)
-        axis = OrderedSet[int](_validate_reduction_axis(x, dim))
 
-        kept_idx = []
-        reduced_idx = []
-        for i in range(len(x_size)):
-            if i in axis:
-                reduced_idx.append(i)
-            else:
-                kept_idx.append(i)
+        # The reduction output shape (with keepdims) is kwargs["ranges"],
+        # e.g. [batch, 1] for dim=1 on [batch, vocab].
+        outer_ranges = kwargs["ranges"]  # e.g. [batch, 1]
 
-        def combined_inner_fn(index, reduction_index):
-            # Reconstruct full index for logits load
-            assert len(reduction_index) == len(reduced_idx)
-            outer_index = [index[i] for i in kept_idx]
-            new_index = [None] * (len(outer_index) + len(reduction_index))
-            for idx, var in itertools.chain(
-                zip(kept_idx, outer_index), zip(reduced_idx, reduction_index)
-            ):
-                new_index[idx] = var
-            logit_val = logits_loader(new_index)
-            # Load target logit via indirect indexing:
-            target_col = targets_loader(outer_index)
-            gather_idx = ops.indirect_indexing(target_col, x_size[dim_normalized], wrap_neg=False)
-            gather_index = list(new_index)
-            gather_index[dim_normalized] = gather_idx
-            target_logit_val = logits_loader(gather_index)
-            return (logit_val, target_logit_val)
+        # Build the Pointwise that gathers logits[row, target[row]].
+        # Its output shape matches outer_ranges so it broadcasts correctly
+        # with the reduction outputs (max, sum_exp).
 
-        max_tensor, sum_tensor, target_logit_tensor = (
-            CrossEntropyOnlineReduction.create(
-                input_node=x,
-                num_output=3,
-                inner_fn=combined_inner_fn,
-                **{k: v for k, v in kwargs.items() if k != "inner_fn"},
+        def target_logit_fn(index):
+            # index has shape matching outer_ranges (e.g. [batch_idx, 0])
+            # Build the targets index by dropping the reduced (size-1) dims
+            targets_idx = [index[i] for i in range(len(index)) if i != dim_normalized]
+            target_val = targets_loader(targets_idx)
+            target_col = ops.indirect_indexing(
+                target_val, x_size[dim_normalized], wrap_neg=False
             )
+            # Build the full logits index: outer dims + target column at dim
+            logits_idx = list(index)
+            logits_idx[dim_normalized] = target_col
+            return logits_loader(logits_idx)
+
+        target_logit_buf = Pointwise.create(
+            device=x.get_device(),
+            dtype=x.get_dtype(),
+            inner_fn=target_logit_fn,
+            ranges=list(outer_ranges),
         )
-        return max_tensor, sum_tensor, target_logit_tensor
+        target_logit_buf.realize()
+
+        # Now run the standard online softmax reduction (max + sum_exp only).
+        max_tensor, sum_tensor = OnlineSoftmaxReduction.create(
+            input_node=x, num_output=2, **kwargs
+        )
+        return max_tensor, sum_tensor, target_logit_buf
     else:
         # Fallback: separate computations
         amax = reduce_amax(x, dim, keepdims=True)
