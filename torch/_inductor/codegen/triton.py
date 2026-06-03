@@ -4845,6 +4845,11 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 # tl.reduce doesn't support tl.int1; the non-scalar path
                 # handles this with a .to(tl.int8) cast before final_reduction.
                 and src_dtype != torch.bool
+                # Only beneficial for simple kernels where register pressure
+                # from the vector accumulator dominates. Bandwidth-bound kernels
+                # with many loads pay cross-warp sync cost per iteration without
+                # benefit from register savings.
+                and self.num_load <= 3
             )
 
             accumulator = self.cse.namedvar(
