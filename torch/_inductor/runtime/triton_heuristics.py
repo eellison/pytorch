@@ -4058,8 +4058,24 @@ def _reduction_configs(
     )
 
     device_major = triton_meta["device"].major
-    # Prefer smaller MAX_R0_BLOCK for Blackwell
-    MAX_R0_BLOCK = 1024 if device_major is not None and device_major >= 10 else 2048
+    has_online_softmax = inductor_meta.get("has_online_softmax", False)
+    has_scalar_acc = inductor_meta.get("coordinate_descent_tuning", False) and (
+        loads_and_red <= 3 or has_online_softmax
+    )
+    # When scalar reduction accumulators are active (low register pressure),
+    # allow larger R0_BLOCK to reduce loop iterations.  Online softmax kernels
+    # with scalar accumulators keep only [XBLOCK]-sized state across iterations,
+    # so they benefit significantly from larger tiles.
+    # Cap at rnumel <= 131072 to avoid interfering with split reduction heuristics
+    # for very large reductions (e.g., rnumel=1M triggers split which has different
+    # optimal R0_BLOCK).
+    if has_scalar_acc and 8192 <= rnumel <= 131072:
+        MAX_R0_BLOCK = 4096
+    elif device_major is not None and device_major >= 10:
+        # Prefer smaller MAX_R0_BLOCK for Blackwell by default
+        MAX_R0_BLOCK = 1024
+    else:
+        MAX_R0_BLOCK = 2048
     if size_hints["x"] >= 1024 and loads_and_red >= 10:
         # A heuristics to reduce R0_BLOCK if a kernel potentially need many registers.
         # Consider load and reduction since load need move data into registers and

@@ -141,6 +141,360 @@ def _chain_random_ops_for_ordering(graph: torch.fx.Graph) -> None:
     preserve_node_ordering(graph, additional_deps_map)
 
 
+def _trace_to_topk_dim_size(node: torch.fx.Node):
+    """Trace a node back through views/reshapes/getitem to find a topk source.
+
+    Returns the topk dimension size if the node's values provably come from
+    topk indices, otherwise returns None.
+    """
+    # Walk through view/reshape/expand/getitem operations
+    seen = OrderedSet[torch.fx.Node]()
+    current = node
+    while current is not None and current not in seen:
+        seen.add(current)
+        if current.op != "call_function":
+            return None
+        target = current.target
+        # getitem on topk output (index 1 = indices)
+        if target == operator.getitem:
+            src, idx = current.args[0], current.args[1]
+            if (
+                isinstance(src, torch.fx.Node)
+                and src.op == "call_function"
+                and src.target in (aten.topk.default,)
+                and idx == 1
+            ):
+                # Found topk! The indices are bounded by the topk input's dim size.
+                topk_input = src.args[0]
+                if isinstance(topk_input, torch.fx.Node):
+                    val = topk_input.meta.get("val")
+                    if val is not None and hasattr(val, "shape"):
+                        # topk dim defaults to -1
+                        dim = src.args[2] if len(src.args) > 2 else -1
+                        ndim = len(val.shape)
+                        if dim < 0:
+                            dim = ndim + dim
+                        if 0 <= dim < ndim:
+                            return val.shape[dim]
+            return None
+        # view, reshape, expand, flatten — trace through
+        if target in (
+            aten.view.default,
+            aten.reshape.default,
+            aten.expand.default,
+            aten._unsafe_view.default,
+        ):
+            current = current.args[0] if isinstance(current.args[0], torch.fx.Node) else None
+            continue
+        return None
+    return None
+
+
+def _narrow_sort_to_int32(graph: torch.fx.Graph) -> None:
+    """Cast sort inputs from i64 to i32 when values fit, halving radix sort passes.
+
+    When sort receives i64 values that are known to fit in i32 (e.g., indices
+    from topk over a dimension < 2^31), we insert a cast to i32 before sort
+    and cast the sorted values back to i64 after. This halves the number of
+    radix sort passes on GPU since radix sort complexity is O(n * key_bits).
+    """
+    nodes_to_process = []
+    for node in graph.nodes:
+        if node.op != "call_function":
+            continue
+        if node.target not in (aten.sort.default, aten.sort.stable):
+            continue
+        # Get the input to sort
+        sort_input = node.args[0]
+        if not isinstance(sort_input, torch.fx.Node):
+            continue
+        # Check if input is i64
+        val = sort_input.meta.get("val")
+        if val is None or not hasattr(val, "dtype") or val.dtype != torch.int64:
+            continue
+        # Check if values are bounded to fit i32
+        dim_size = _trace_to_topk_dim_size(sort_input)
+        if dim_size is None:
+            continue
+        # Check that max index fits in i32 (dim_size < 2^31)
+        int32_max = torch.iinfo(torch.int32).max
+        # dim_size might be a SymInt
+        try:
+            if int(dim_size) > int32_max:
+                continue
+        except Exception:
+            continue
+        nodes_to_process.append(node)
+
+    for sort_node in nodes_to_process:
+        sort_input = sort_node.args[0]
+        sort_val = sort_input.meta["val"]
+
+        # Insert cast to i32 before sort
+        with graph.inserting_before(sort_node):
+            to_i32 = graph.call_function(
+                prims.convert_element_type.default,
+                (sort_input, torch.int32),
+            )
+            # Set metadata for the new node
+            to_i32.meta["val"] = sort_val.to(torch.int32)
+            if "tensor_meta" in sort_input.meta:
+                import copy
+
+                to_i32.meta["tensor_meta"] = copy.copy(sort_input.meta["tensor_meta"])
+                to_i32.meta["tensor_meta"] = to_i32.meta["tensor_meta"]._replace(
+                    dtype=torch.int32
+                )
+
+        # Update sort to use i32 input
+        sort_args = list(sort_node.args)
+        sort_args[0] = to_i32
+        sort_node.args = tuple(sort_args)
+
+        # Update sort node metadata to reflect i32 sorted values
+        sort_meta_val = sort_node.meta.get("val")
+        if sort_meta_val is not None and isinstance(sort_meta_val, (list, tuple)):
+            # sort returns (values, indices) — values become i32, indices stay i64
+            new_meta = list(sort_meta_val)
+            new_meta[0] = sort_meta_val[0].to(torch.int32)
+            sort_node.meta["val"] = tuple(new_meta)
+
+        # Find getitem nodes that extract the sorted values (index 0)
+        # and insert cast back to i64 after them
+        for user in list(sort_node.users):
+            if (
+                user.op == "call_function"
+                and user.target == operator.getitem
+                and user.args[1] == 0
+            ):
+                # This is the sorted values output — cast back to i64
+                with graph.inserting_after(user):
+                    to_i64 = graph.call_function(
+                        prims.convert_element_type.default,
+                        (user, torch.int64),
+                    )
+                    to_i64.meta["val"] = user.meta["val"].to(torch.int64) if "val" in user.meta else sort_val
+                    if "tensor_meta" in user.meta:
+                        import copy
+
+                        to_i64.meta["tensor_meta"] = copy.copy(user.meta["tensor_meta"])
+                        to_i64.meta["tensor_meta"] = to_i64.meta["tensor_meta"]._replace(
+                            dtype=torch.int64
+                        )
+                # Update user metadata to i32
+                if "val" in user.meta:
+                    user.meta["val"] = user.meta["val"].to(torch.int32)
+
+                # Replace all uses of the getitem(sorted_values) with the i64 cast
+                # (except the cast node itself)
+                user.replace_all_uses_with(to_i64)
+                # Fix: the to_i64 node should still use 'user' as input
+                to_i64.args = (user, torch.int64)
+
+
+def _cross_entropy_gather_fusion_pass(graph: torch.fx.Graph, gm=None):
+    """
+    Detect the cross-entropy gather-into-softmax pattern and fuse.
+
+    After prepare_softmax_online fires, the graph has:
+        max, sum_exp = prepare_softmax_online(logits, dim)
+        xsub = logits - max
+        log_sum_exp = log(sum_exp)
+        log_softmax = xsub - log_sum_exp
+        target_logprob = gather(log_softmax, dim, targets_unsqueezed)
+
+    This rewrites to use cross_entropy_loss_online which fuses the gather
+    into the online softmax kernel:
+        max, sum_exp, target_logit = cross_entropy_loss_online(logits, targets, dim)
+    And replaces: target_logprob = target_logit - max - log(sum_exp)
+    """
+    from torch._inductor.inductor_prims import cross_entropy_loss_online
+
+    changed = False
+    for node in list(graph.nodes):
+        # Look for prepare_softmax_online calls
+        if not (
+            node.op == "call_function"
+            and node.target == torch.ops.prims.prepare_softmax_online.default
+        ):
+            continue
+
+        logits_node = node.args[0]
+        dim = node.args[1]
+
+        # Find getitem users (max=0, sum_exp=1)
+        max_node = None
+        sum_exp_node = None
+        for user in node.users:
+            if user.op == "call_function" and user.target == operator.getitem:
+                if user.args[1] == 0:
+                    max_node = user
+                elif user.args[1] == 1:
+                    sum_exp_node = user
+
+        if max_node is None or sum_exp_node is None:
+            continue
+
+        # Look for the pattern: sub(logits, max) -> sub(_, log(sum_exp)) -> gather
+        # Find: xsub = sub(logits, max)
+        xsub_node = None
+        for user in max_node.users:
+            if (
+                user.op == "call_function"
+                and user.target == torch.ops.aten.sub.Tensor
+                and user.args[0] is logits_node
+                and user.args[1] is max_node
+            ):
+                xsub_node = user
+                break
+
+        if xsub_node is None:
+            continue
+
+        # Find: log_sum_exp = log(sum_exp)
+        log_node = None
+        for user in sum_exp_node.users:
+            if (
+                user.op == "call_function"
+                and user.target == torch.ops.aten.log.default
+                and user.args[0] is sum_exp_node
+            ):
+                log_node = user
+                break
+
+        if log_node is None:
+            continue
+
+        # Find: log_softmax = sub(xsub, log_sum_exp)
+        log_softmax_node = None
+        for user in xsub_node.users:
+            if (
+                user.op == "call_function"
+                and user.target == torch.ops.aten.sub.Tensor
+                and user.args[0] is xsub_node
+                and user.args[1] is log_node
+            ):
+                log_softmax_node = user
+                break
+
+        if log_softmax_node is None:
+            continue
+
+        # Find: gather(log_softmax, dim, targets_unsqueezed)
+        gather_node = None
+        for user in log_softmax_node.users:
+            if (
+                user.op == "call_function"
+                and user.target == torch.ops.aten.gather.default
+                and user.args[0] is log_softmax_node
+                and user.args[1] == dim
+            ):
+                gather_node = user
+                break
+
+        if gather_node is None:
+            continue
+
+        # Check that log_softmax_node has only one user (the gather)
+        # If it has other users, we can't eliminate it
+        if len(log_softmax_node.users) != 1:
+            continue
+
+        # Also check xsub_node is only used by log_softmax
+        if len(xsub_node.users) != 1:
+            continue
+
+        # Found the full pattern! Now rewrite.
+        # The gather index is targets_unsqueezed (shape [N, 1] for dim=1)
+        targets_unsqueezed = gather_node.args[2]
+
+        # Find the unsqueeze to get the raw targets
+        # targets_unsqueezed = unsqueeze(targets, dim)
+        if (
+            targets_unsqueezed.op == "call_function"
+            and targets_unsqueezed.target == torch.ops.aten.unsqueeze.default
+        ):
+            targets_node = targets_unsqueezed.args[0]
+        else:
+            # Can't easily extract targets, skip
+            continue
+
+        # Insert cross_entropy_loss_online(logits, targets, dim)
+        with graph.inserting_before(node):
+            fused_node = graph.call_function(
+                cross_entropy_loss_online,
+                args=(logits_node, targets_node, dim),
+            )
+            # Copy metadata from original node
+            if hasattr(node, "meta") and "val" in node.meta:
+                orig_max_meta = max_node.meta.get("val") if max_node else None
+                orig_sum_meta = sum_exp_node.meta.get("val") if sum_exp_node else None
+                orig_gather_meta = gather_node.meta.get("val") if gather_node else None
+                if orig_max_meta is not None and orig_sum_meta is not None and orig_gather_meta is not None:
+                    fused_node.meta["val"] = (orig_max_meta, orig_sum_meta, orig_gather_meta)
+
+            # Create getitem nodes for the 3 outputs
+            new_max = graph.call_function(operator.getitem, args=(fused_node, 0))
+            new_sum_exp = graph.call_function(operator.getitem, args=(fused_node, 1))
+            new_target_logit = graph.call_function(operator.getitem, args=(fused_node, 2))
+
+            if max_node.meta.get("val") is not None:
+                new_max.meta["val"] = max_node.meta["val"]
+            if sum_exp_node.meta.get("val") is not None:
+                new_sum_exp.meta["val"] = sum_exp_node.meta["val"]
+            if gather_node.meta.get("val") is not None:
+                new_target_logit.meta["val"] = gather_node.meta["val"]
+
+            # Compute log_softmax_at_target = target_logit - max - log(sum_exp)
+            # This gives the same value as gather(log_softmax, dim, targets)
+            new_log_sum_exp = graph.call_function(
+                torch.ops.aten.log.default, args=(new_sum_exp,)
+            )
+            # target_logit - max
+            sub1 = graph.call_function(
+                torch.ops.aten.sub.Tensor, args=(new_target_logit, new_max)
+            )
+            # (target_logit - max) - log(sum_exp) = log_softmax[target]
+            log_softmax_at_target = graph.call_function(
+                torch.ops.aten.sub.Tensor, args=(sub1, new_log_sum_exp)
+            )
+
+            if gather_node.meta.get("val") is not None:
+                new_log_sum_exp.meta["val"] = sum_exp_node.meta["val"]  # same shape
+                sub1.meta["val"] = gather_node.meta["val"]
+                log_softmax_at_target.meta["val"] = gather_node.meta["val"]
+
+        # Replace uses:
+        # - max_node users -> new_max (ONLY for users other than xsub)
+        # - sum_exp_node users -> new_sum_exp (ONLY for users other than log)
+        # - gather_node users -> log_softmax_at_target (the correct value)
+        max_node.replace_all_uses_with(new_max)
+        sum_exp_node.replace_all_uses_with(new_sum_exp)
+        gather_node.replace_all_uses_with(log_softmax_at_target)
+
+        # Remove old nodes (in reverse order of dependencies)
+        graph.erase_node(gather_node)
+        if len(log_softmax_node.users) == 0:
+            graph.erase_node(log_softmax_node)
+        if len(xsub_node.users) == 0:
+            graph.erase_node(xsub_node)
+        if len(log_node.users) == 0:
+            graph.erase_node(log_node)
+        if len(max_node.users) == 0:
+            graph.erase_node(max_node)
+        if len(sum_exp_node.users) == 0:
+            graph.erase_node(sum_exp_node)
+        if len(node.users) == 0:
+            graph.erase_node(node)
+        # Also clean up targets_unsqueezed if unused
+        if len(targets_unsqueezed.users) == 0:
+            graph.erase_node(targets_unsqueezed)
+
+        changed = True
+
+    return changed
+
+
 def post_grad_passes(gm: torch.fx.GraphModule, is_inference: bool):
     """
     Passes that run on after grad.  This is called once on the forwards
@@ -196,6 +550,11 @@ def post_grad_passes(gm: torch.fx.GraphModule, is_inference: bool):
         _remove_profiler_ops
     )
 
+    # Narrow i64 sort inputs to i32 when values are known to fit (e.g. topk indices)
+    GraphTransformObserver(gm, "narrow_sort_to_int32").apply_graph_pass(
+        _narrow_sort_to_int32
+    )
+
     if config.pattern_matcher:
         lazy_init()
         GraphTransformObserver(gm, "post_grad_custom_pre_pass").apply_graph_pass(
@@ -213,6 +572,42 @@ def post_grad_passes(gm: torch.fx.GraphModule, is_inference: bool):
             GraphTransformObserver(
                 gm, "partitioned_scatter_optimization"
             ).apply_graph_pass(partitioned_scatter_optimization_pass)
+        if config.linear_reduction_elimination:
+            from .linear_reduction_elimination import (
+                linear_reduction_elimination_pass,
+            )
+
+            GraphTransformObserver(
+                gm, "linear_reduction_elimination"
+            ).apply_graph_pass(linear_reduction_elimination_pass)
+        if config.slice_scatter_elision:
+            from .slice_scatter_elision import slice_scatter_elision_pass
+
+            GraphTransformObserver(
+                gm, "slice_scatter_elision"
+            ).apply_graph_pass(slice_scatter_elision_pass)
+        if config.as_strided_scatter_elision:
+            from .as_strided_scatter_elision import (
+                as_strided_scatter_elision_pass,
+            )
+
+            GraphTransformObserver(
+                gm, "as_strided_scatter_elision"
+            ).apply_graph_pass(as_strided_scatter_elision_pass)
+        if config.scatter_reduce_fusion:
+            from .scatter_reduce_fusion import scatter_reduce_fusion_pass
+
+            GraphTransformObserver(
+                gm, "scatter_reduce_fusion"
+            ).apply_graph_pass(scatter_reduce_fusion_pass)
+        if config.layout_transform_store_sinking:
+            from .layout_transform_store_sinking import (
+                layout_transform_store_sinking_pass,
+            )
+
+            GraphTransformObserver(
+                gm, "layout_transform_store_sinking"
+            ).apply_graph_pass(layout_transform_store_sinking_pass)
         for pass_name in config.post_grad_fusion_options:
             # skip all patterns for group batch fusions or quantization patterns
             if pass_name in POST_GRAD_FUSIONS or pass_name in OPTIMUS_EXCLUDE_POST_GRAD:
@@ -237,6 +632,13 @@ def post_grad_passes(gm: torch.fx.GraphModule, is_inference: bool):
                 )
         if config.b2b_gemm_pass:
             B2B_GEMM_PASS.apply(gm.graph)  # type: ignore[arg-type]
+
+        if config.online_softmax:
+            GraphTransformObserver(
+                gm, "cross_entropy_gather_fusion"
+            ).apply_graph_pass(
+                functools.partial(_cross_entropy_gather_fusion_pass, gm=gm)
+            )
 
     if config._micro_pipeline_tp:
         micro_pipeline_tp_pass(gm.graph)
@@ -448,6 +850,35 @@ def prepare_softmax_replacement(x, dim):
     Return xsub since otherwise log-softmax can not be matched
     due to a use of this intermediate node. Same reason to return
     xsub.exp() for softmax.
+    """
+    from torch._inductor.inductor_prims import prepare_softmax_online
+
+    xmax, xsum = prepare_softmax_online(x, dim)
+    xsub = x - xmax
+    return xmax, xsum, xsub, xsub.exp()
+
+
+def prepare_softmax_stable_pattern(x, dim):
+    """
+    Logsumexp-stable softmax variant: where(abs(amax)==inf, 0, amax) guards
+    against infinite max before subtraction.  Mathematically equivalent to the
+    standard pattern for finite inputs (Reformer LSH attention).
+    """
+    xmax = x.amax(dim=dim, keepdim=True)
+    abs_max = xmax.abs()
+    is_inf = abs_max == float("inf")
+    zero = torch.full([], 0.0, dtype=x.dtype, device=x.device)
+    stable_max = torch.where(is_inf, zero, xmax)
+    xsub = x - stable_max
+    xexp = xsub.exp()
+    xsum = xexp.sum(dim=dim, keepdim=True)
+    return stable_max, xsum, xsub, xexp
+
+
+def prepare_softmax_stable_replacement(x, dim):
+    """
+    Same replacement as the standard softmax pattern -- prepare_softmax_online
+    computes the correct max internally.
     """
     from torch._inductor.inductor_prims import prepare_softmax_online
 
@@ -804,6 +1235,22 @@ def lazy_init(input_device: torch.device | None = None):
         prepare_softmax_pattern,
         # pyrefly: ignore [bad-argument-type]
         prepare_softmax_replacement,
+        [torch.empty(4, 8)],
+        scalar_workaround=dict(dim=-1),
+        # pyrefly: ignore [bad-argument-type]
+        trace_fn=fwd_only,
+        # pyrefly: ignore [bad-argument-type]
+        pass_dicts=pass_patterns[1],
+        extra_check=prepare_softmax_extra_check,
+    )
+
+    # Logsumexp-stable softmax: where(abs(amax)==inf, 0, amax) variant
+    # (e.g. Reformer LSH attention)
+    register_replacement(
+        # pyrefly: ignore [bad-argument-type]
+        prepare_softmax_stable_pattern,
+        # pyrefly: ignore [bad-argument-type]
+        prepare_softmax_stable_replacement,
         [torch.empty(4, 8)],
         scalar_workaround=dict(dim=-1),
         # pyrefly: ignore [bad-argument-type]

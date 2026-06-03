@@ -1291,6 +1291,12 @@ def get_reduction_combine_fn(
 
         return welford_combine_fn
 
+    elif reduction_type == "online_softmax_cross_entropy":
+        # Not used in practice (handled specially in codegen), but needed for IR validation
+        def cross_entropy_combine_fn(a, b):
+            raise NotImplementedError("online_softmax_cross_entropy combine not used directly")
+        return cross_entropy_combine_fn
+
     else:
         raise NotImplementedError(f"unknown reduction_type={reduction_type}")
 
@@ -1740,6 +1746,21 @@ class Reduction(Loops):
             reduction_numel,
             input_node,
         )
+        # PROTOTYPE: Reconcile sibling reductions to use same split for fusion
+        if config._sibling_reduction_fusion and split > 1:
+            _sibling_key = (tuple(int(r) for r in ranges), tuple(int(r) for r in reduction_ranges), device)
+            _sibling_registry = getattr(V.graph, "_sibling_reduction_splits", None)
+            if _sibling_registry is None:
+                V.graph._sibling_reduction_splits = {}  # type: ignore[attr-defined]
+                _sibling_registry = V.graph._sibling_reduction_splits
+            if _sibling_key in _sibling_registry:
+                # A sibling reduction with same shape exists - match its split
+                prev_hint, prev_split = _sibling_registry[_sibling_key]
+                if prev_split != split:
+                    hint = prev_hint
+                    split = prev_split
+            else:
+                _sibling_registry[_sibling_key] = (hint, split)
 
         def _maybe_increase_split(split: int) -> int:
             # don't apply min_num_split constraint for static shape case.
@@ -1876,6 +1897,7 @@ class Reduction(Loops):
             "welford_reduce": (zero, zero, zero),
             "welford_combine": (zero, zero, zero),
             "online_softmax_reduce": (float("-inf"), zero),
+            "online_softmax_cross_entropy": (float("-inf"), zero, zero),
         }[reduction_type]
 
     @staticmethod
@@ -2526,6 +2548,92 @@ class OnlineSoftmaxReduction(MultiOutputReduction):
             [split],
             num_output,
             reduction_hint,
+        )
+
+
+class CrossEntropyOnlineReduction(MultiOutputReduction):
+    """
+    Multi-output reduction that computes softmax max/sum AND gathers target logit
+    in one kernel pass. Returns (max, sum_exp, target_logit).
+
+    The inner_fn returns a tuple (logit_value, target_logit_value) where:
+    - logit_value is the logit at the current (row, col) position
+    - target_logit_value is logits[row, target[row]] (same for all cols in row)
+    """
+
+    @classmethod
+    def _create_no_split(
+        cls,
+        device: torch.device,
+        dst_dtype: torch.dtype,
+        src_dtype: torch.dtype,
+        inner_fn: Callable[..., Any],
+        ranges: Sequence[Expr],
+        reduction_ranges: Sequence[Expr],
+        num_output: int,
+        reduction_hint: ReductionHint = ReductionHint.DEFAULT,
+        input_node: IRNode | None = None,
+    ) -> Sequence[TensorBox]:
+        assert num_output == 3
+        results = tuple(
+            TensorBox.create(
+                MultiOutputReduction(
+                    device,
+                    dst_dtype,
+                    inner_fn,
+                    ranges,
+                    reduction_ranges,
+                    "online_softmax_cross_entropy",
+                    src_dtype,
+                    reduction_hint,
+                    output_idx,
+                )
+            )
+            for output_idx in range(num_output)
+        )
+        for t in results:
+            t.realize()
+        return results
+
+    @classmethod
+    def create(  # type: ignore[override]
+        cls,
+        device: torch.device,
+        dst_dtype: torch.dtype,
+        src_dtype: torch.dtype,
+        inner_fn: Callable[..., Any],
+        ranges: Sequence[Expr],
+        reduction_ranges: Sequence[Expr],
+        num_output: int,
+        reduction_hint: ReductionHint = ReductionHint.DEFAULT,
+        input_node: IRNode | None = None,
+    ) -> Sequence[TensorBox]:
+        reduction_numel = V.graph.sizevars.simplify(sympy_product(reduction_ranges))
+        hint, split = Reduction.num_splits(
+            device,
+            dst_dtype,
+            src_dtype,
+            inner_fn,
+            ranges,
+            reduction_ranges,
+            reduction_type="online_softmax_cross_entropy",
+            reduction_numel=reduction_numel,
+            input_node=input_node,
+        )
+        if reduction_hint == ReductionHint.DEFAULT:
+            reduction_hint = hint
+        # For cross-entropy, we don't support split reductions (the gather
+        # complicates multilayer). Fall back to no-split always.
+        return cls._create_no_split(
+            device,
+            dst_dtype,
+            src_dtype,
+            inner_fn,
+            ranges,
+            reduction_ranges,
+            num_output,
+            reduction_hint,
+            input_node,
         )
 
 

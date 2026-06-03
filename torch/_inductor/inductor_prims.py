@@ -265,6 +265,31 @@ prepare_softmax_online = make_prim(
 )
 
 
+def eager_cross_entropy_loss_online(
+    logits: Tensor, targets: Tensor, dim: int
+) -> tuple[Tensor, Tensor, Tensor]:
+    """
+    Fused cross-entropy: computes max, sum_exp, and gathered target logit in one pass.
+    Returns (max, sum_exp, target_logit) where:
+      - max = amax(logits, dim, keepdim=True)
+      - sum_exp = sum(exp(logits - max), dim, keepdim=True)
+      - target_logit = gather(logits, dim, targets.unsqueeze(dim))
+    The loss is then: max + log(sum_exp) - target_logit (negated log_softmax at target).
+    """
+    amax = torch.amax(logits, dim, keepdim=True)
+    sum_exp = torch.sum(torch.exp(logits - amax), dim, keepdim=True)
+    target_logit = torch.gather(logits, dim, targets.unsqueeze(dim))
+    return amax, sum_exp, target_logit
+
+
+cross_entropy_loss_online = make_prim(
+    "cross_entropy_loss_online(Tensor logits, Tensor targets, int dim) -> (Tensor, Tensor, Tensor)",
+    eager_cross_entropy_loss_online,
+    return_type=(_prims.RETURN_TYPE.NEW, _prims.RETURN_TYPE.NEW, _prims.RETURN_TYPE.NEW),
+    doc="Fused cross-entropy online: computes max, sum_exp, and target logit in one reduction pass.",
+)
+
+
 def _flattened_index_to_nd(indices, width):
     import sympy
 

@@ -3206,7 +3206,7 @@ def is_welford_reduction(reduction_type: str) -> bool:
 
 
 def reduction_num_outputs(reduction_type: str) -> int:
-    if is_welford_reduction(reduction_type):
+    if is_welford_reduction(reduction_type) or reduction_type == "online_softmax_cross_entropy":
         return 3
     elif reduction_type in (
         "argmax_with_value",

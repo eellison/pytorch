@@ -1005,6 +1005,9 @@ conv_1x1_as_mm = False
 # enabling both of these will implicitly disable split_reductions
 split_reductions = os.getenv("TORCHINDUCTOR_SPLIT_REDUCTIONS", "1") == "1"
 
+# PROTOTYPE: Force OUTER reductions to use INNER splitting to enable sibling fusion
+_sibling_reduction_fusion = False
+
 # A deterministic mode that skips any on device benchmarking in Inductor
 # if we know they affect numerics.  WARNING: Expect perf hit in this mode.
 deterministic = os.getenv("TORCHINDUCTOR_DETERMINISTIC") == "1"
@@ -1183,6 +1186,34 @@ partitioned_scatter_max_partitions: int = 128
 
 # Memory budget fraction for scatter buffers
 partitioned_scatter_memory_budget: float = 0.10
+
+# Scatter-reduce fusion: eliminates scatter intermediates when reduction follows
+scatter_reduce_fusion = (
+    os.environ.get("TORCHINDUCTOR_SCATTER_REDUCE_FUSION", "0") == "1"
+)
+
+# Linear reduction algebraic elimination: rewrites dependent reductions as scalar algebra
+linear_reduction_elimination = (
+    os.environ.get("TORCHINDUCTOR_LINEAR_REDUCTION_ELIMINATION", "1") == "1"
+)
+
+# Slice-scatter elision: eliminates redundant slice_scatter->slice chains (stencil patterns)
+slice_scatter_elision = (
+    os.environ.get("TORCHINDUCTOR_SLICE_SCATTER_ELISION", "1") == "1"
+)
+
+# As-strided-scatter elision: eliminates redundant full+as_strided_scatter+as_strided chains
+# where the scatter writes ALL elements of a zero-filled buffer (batch-norm backward patterns)
+as_strided_scatter_elision = (
+    os.environ.get("TORCHINDUCTOR_AS_STRIDED_SCATTER_ELISION", "1") == "1"
+)
+
+# Layout-transform store sinking: eliminates layout-transform kernels (view+permute+clone)
+# by rewriting producers to store directly into the consumer's output layout.
+# Currently handles the "channel shuffle" pattern from ShuffleNet.
+layout_transform_store_sinking = (
+    os.environ.get("TORCHINDUCTOR_LAYOUT_TRANSFORM_STORE_SINKING", "1") == "1"
+)
 
 
 class _collective:
@@ -2026,6 +2057,15 @@ class triton:
     # Raise the threshold to 16 to be safe.
     # We should revisit this once we understand more of the source of register spills.
     spill_threshold: int = 32 if torch.version.hip else 16
+
+    # Use scalar accumulators for simple associative reductions (sum, max,
+    # min, prod, xor_sum, any) in non-persistent reduction loops.  This
+    # reduces register pressure by accumulating into a scalar per x-element
+    # instead of keeping the full R0_BLOCK tile alive across iterations.
+    # Only applies when paired with large R0_BLOCK configs (2048/4096).
+    scalar_reduction_accumulators = (
+        os.environ.get("TORCHINDUCTOR_SCALAR_REDUCTION_ACCUMULATORS", "1") == "1"
+    )
 
     # Generate code containing the newer tl.make_block_ptr() API for loads/store
     use_block_ptr = False

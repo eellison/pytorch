@@ -73,6 +73,7 @@ from .ir import (
     IRNode,
     is_triton,
     MutableBox,
+    CrossEntropyOnlineReduction,
     OnlineSoftmaxReduction,
     ops_wrapper,
     PermuteView,
@@ -8904,6 +8905,74 @@ def prepare_softmax_online(x, dim):
         exp = lowerings[aten.exp](sub(x, amax))
         xsum = sum_(exp, dim, keepdims=True)
         return amax, xsum
+
+
+@register_lowering(inductor_prims.cross_entropy_loss_online, type_promotion_kind=None)
+def cross_entropy_loss_online(x, targets, dim):
+    """
+    Lowering inductor_prims.cross_entropy_loss_online to compute max/sum/target_logit
+    with online softmax reductions + gather in one kernel when profitable.
+    Returns (max, sum_exp, target_logit).
+    """
+    kwargs = _make_reduction_inner(
+        x, axis=dim, keepdims=True, dtype=None, override_return_dtype=None
+    )
+
+    rnumel = V.graph.sizevars.simplify(sympy_product(kwargs["reduction_ranges"]))
+
+    if V.graph.sizevars.statically_known_geq(
+        rnumel, config.unroll_reductions_threshold
+    ):
+        # Create a combined inner_fn that returns (logit_value, target_logit_value)
+        logits_loader = x.make_loader()
+        targets_loader = targets.make_loader()
+
+        x_size = x.get_size()
+        dim_normalized = dim if dim >= 0 else dim + len(x_size)
+        axis = OrderedSet[int](_validate_reduction_axis(x, dim))
+
+        kept_idx = []
+        reduced_idx = []
+        for i in range(len(x_size)):
+            if i in axis:
+                reduced_idx.append(i)
+            else:
+                kept_idx.append(i)
+
+        def combined_inner_fn(index, reduction_index):
+            # Reconstruct full index for logits load
+            assert len(reduction_index) == len(reduced_idx)
+            outer_index = [index[i] for i in kept_idx]
+            new_index = [None] * (len(outer_index) + len(reduction_index))
+            for idx, var in itertools.chain(
+                zip(kept_idx, outer_index), zip(reduced_idx, reduction_index)
+            ):
+                new_index[idx] = var
+            logit_val = logits_loader(new_index)
+            # Load target logit via indirect indexing:
+            target_col = targets_loader(outer_index)
+            gather_idx = ops.indirect_indexing(target_col, x_size[dim_normalized], wrap_neg=False)
+            gather_index = list(new_index)
+            gather_index[dim_normalized] = gather_idx
+            target_logit_val = logits_loader(gather_index)
+            return (logit_val, target_logit_val)
+
+        max_tensor, sum_tensor, target_logit_tensor = (
+            CrossEntropyOnlineReduction.create(
+                input_node=x,
+                num_output=3,
+                inner_fn=combined_inner_fn,
+                **{k: v for k, v in kwargs.items() if k != "inner_fn"},
+            )
+        )
+        return max_tensor, sum_tensor, target_logit_tensor
+    else:
+        # Fallback: separate computations
+        amax = reduce_amax(x, dim, keepdims=True)
+        exp = lowerings[aten.exp](sub(x, amax))
+        xsum = sum_(exp, dim, keepdims=True)
+        target_logit = lowerings[aten.gather](x, dim, lowerings[aten.unsqueeze](targets, dim))
+        return amax, xsum, target_logit
 
 
 @register_lowering(inductor_prims.cvt_e8m0_rceil, type_promotion_kind=None)

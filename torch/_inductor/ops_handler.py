@@ -51,6 +51,7 @@ ReductionType = Literal[
     "dot",
     "xor_sum",
     "online_softmax_reduce",
+    "online_softmax_cross_entropy",
 ]
 
 
