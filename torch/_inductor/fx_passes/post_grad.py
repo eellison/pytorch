@@ -580,6 +580,12 @@ def post_grad_passes(gm: torch.fx.GraphModule, is_inference: bool):
             GraphTransformObserver(
                 gm, "linear_reduction_elimination"
             ).apply_graph_pass(linear_reduction_elimination_pass)
+        if config.select_scatter_sparsity:
+            from .select_scatter_sparsity import select_scatter_sparsity_pass
+
+            GraphTransformObserver(
+                gm, "select_scatter_sparsity"
+            ).apply_graph_pass(select_scatter_sparsity_pass)
         if config.slice_scatter_elision:
             from .slice_scatter_elision import slice_scatter_elision_pass
 

@@ -1202,6 +1202,13 @@ slice_scatter_elision = (
     os.environ.get("TORCHINDUCTOR_SLICE_SCATTER_ELISION", "1") == "1"
 )
 
+# Select-scatter sparsity propagation: when full(0) + select_scatter creates a
+# structurally sparse tensor, propagate sparsity through downstream ops and
+# rewrite reductions to operate only on the non-zero slice.
+select_scatter_sparsity = (
+    os.environ.get("TORCHINDUCTOR_SELECT_SCATTER_SPARSITY", "1") == "1"
+)
+
 # As-strided-scatter elision: eliminates redundant full+as_strided_scatter+as_strided chains
 # where the scatter writes ALL elements of a zero-filled buffer (batch-norm backward patterns)
 as_strided_scatter_elision = (
