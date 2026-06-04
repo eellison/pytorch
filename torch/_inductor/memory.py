@@ -271,6 +271,34 @@ def assign_memory_planning_info_for_scheduler_buffers(
             succ_nodes_for_ordering=dep_name_to_succ_nodes_for_ordering[buf_name],
         )
 
+    # Zero out phantom buffers that are internal to fused nodes.
+    # These buffers are produced and consumed within the same FusedSchedulerNode
+    # and live in registers — they are never materialized in memory.
+    from .scheduler import OutputNode
+
+    for node in nodes:
+        if not hasattr(node, "snodes"):
+            continue
+        # Build set of sub-node names within this fused node
+        snode_names = OrderedSet(sn.get_name() for sn in node.snodes)
+        for snode in node.snodes:
+            for buf in snode.get_outputs():
+                buf_name = buf.get_name()
+                if buf_name not in name_to_buf:
+                    continue
+                # Check if all users are within the same fused node
+                users = name_to_buf[buf_name].users
+                if not users:
+                    continue
+                all_internal = all(
+                    not isinstance(u.node, OutputNode)
+                    and u.node.get_name() in snode_names
+                    for u in users
+                )
+                if all_internal:
+                    name_to_buf[buf_name].mpi_buffer.size_alloc = 0
+                    name_to_buf[buf_name].mpi_buffer.size_free = 0
+
 
 def assign_memory_planning_info_for_scheduler_nodes(
     nodes: list[BaseSchedulerNode],
