@@ -1246,6 +1246,13 @@ index_through_norm = (
     os.environ.get("TORCHINDUCTOR_INDEX_THROUGH_NORM", "1") == "1"
 )
 
+# Deduplicate identical graph outputs: when multiple graph outputs compute the
+# exact same value (structurally identical subgraphs), compute once and copy to
+# all output slots. Common in causal mask generation (e.g. LLaVA with 32 heads).
+dedupe_graph_outputs = (
+    os.environ.get("TORCHINDUCTOR_DEDUPE_GRAPH_OUTPUTS", "1") == "1"
+)
+
 
 class _collective:
     auto_select: bool = False

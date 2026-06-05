@@ -683,6 +683,15 @@ def post_grad_passes(gm: torch.fx.GraphModule, is_inference: bool):
 
     GraphTransformObserver(gm, "stable_sort").apply_graph_pass(stable_topological_sort)
 
+    # Deduplicate identical graph outputs: when multiple outputs compute the same
+    # value (e.g. 32 identical causal masks), compute once and reuse.
+    if config.dedupe_graph_outputs:
+        from .dedupe_graph_outputs import dedupe_graph_outputs_pass
+
+        GraphTransformObserver(gm, "dedupe_graph_outputs").apply_graph_pass(
+            dedupe_graph_outputs_pass
+        )
+
     # Replace aten.full nodes at graph output with pre-allocated constant tensors
     # to avoid generating trivial Triton kernels for known constant outputs
     # (e.g. all-False masks from constant-folded iota patterns).
