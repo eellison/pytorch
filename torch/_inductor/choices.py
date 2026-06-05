@@ -584,12 +584,12 @@ class InductorChoices:
             # translate directly to more concurrent memory requests. For scalar
             # reductions (numel_hint=1), the standard heuristic and B200-calibrated
             # thresholds remain appropriate.
-            # Only apply when GPU is truly undersaturated (< 50% SM utilization).
+            # Only apply when GPU is meaningfully undersaturated (< 67% SM utilization).
             # With numel_hint near num_sm (e.g., 128 on 148 SMs = 86%), the extra
             # finalization kernel overhead from split outweighs the parallelism gain.
             if (
                 config.split_reductions_for_undersaturated_gpu
-                and 8 <= numel_hint < num_sm // 2
+                and 8 <= numel_hint < num_sm * 2 // 3
             ):
                 # Minimum work per CTA: 4 elements/thread * num_threads (= 1024 on B200)
                 # This matches oracle patterns that use BLOCK_K=1024
