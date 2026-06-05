@@ -575,10 +575,22 @@ def post_grad_passes(gm: torch.fx.GraphModule, is_inference: bool):
             GraphTransformObserver(gm, f"pass_pattern_{i}").apply_graph_pass(
                 patterns.apply
             )
+        if config.fold_bn_affine:
+            from .bn_affine_folding import bn_affine_folding_pass
+
+            GraphTransformObserver(
+                gm, "bn_affine_folding"
+            ).apply_graph_pass(bn_affine_folding_pass)
         if config.partitioned_scatter_enabled:
             GraphTransformObserver(
                 gm, "partitioned_scatter_optimization"
             ).apply_graph_pass(partitioned_scatter_optimization_pass)
+        if config.cat_through_reduction:
+            from .cat_through_reduction import cat_through_reduction_pass
+
+            GraphTransformObserver(
+                gm, "cat_through_reduction"
+            ).apply_graph_pass(cat_through_reduction_pass)
         if config.linear_reduction_elimination:
             from .linear_reduction_elimination import (
                 linear_reduction_elimination_pass,

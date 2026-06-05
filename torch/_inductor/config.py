@@ -1233,11 +1233,24 @@ as_strided_scatter_elision = (
     os.environ.get("TORCHINDUCTOR_AS_STRIDED_SCATTER_ELISION", "1") == "1"
 )
 
+# BN-inference affine folding: folds decomposed batch normalization inference
+# (sub(x,mean) -> mul(inv_std) -> mul(weight) -> add(bias)) into precomputed
+# scale/shift: output = x * scale + shift. Saves 2 per-channel loads and 3 ops per element.
+fold_bn_affine = os.environ.get("TORCHINDUCTOR_FOLD_BN_AFFINE", "1") == "1"
+
 # Layout-transform store sinking: eliminates layout-transform kernels (view+permute+clone)
 # by rewriting producers to store directly into the consumer's output layout.
 # Currently handles the "channel shuffle" pattern from ShuffleNet.
 layout_transform_store_sinking = (
     os.environ.get("TORCHINDUCTOR_LAYOUT_TRANSFORM_STORE_SINKING", "1") == "1"
+)
+
+# Cat-through-reduction: decomposes reduce(cat([a,b,...], dim=D), reduce_dims)
+# into cat([reduce(a, reduce_dims), reduce(b, reduce_dims), ...], dim=adjusted_D)
+# when D is not in reduce_dims.  Avoids materializing the large concatenated
+# tensor to DRAM before reduction (e.g., Inception multi-branch cat+mean).
+cat_through_reduction = (
+    os.environ.get("TORCHINDUCTOR_CAT_THROUGH_REDUCTION", "1") == "1"
 )
 
 # Index-through-norm: pushes select/index backward through LayerNorm chains
