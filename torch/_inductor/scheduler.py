@@ -4522,14 +4522,13 @@ class Scheduler:
                         name_to_users[buf1_name] = name_to_users[buf2_name]
 
         # pyrefly: ignore [not-a-type]
-        def rename(n: str, _seen: set[str] | None = None) -> str:
-            if n in self.mutation_renames:
-                if _seen is None:
-                    _seen = set()
-                if n in _seen:
-                    return n  # break cycle
-                _seen.add(n)
-                return rename(self.mutation_renames[n], _seen)
+        def rename(n: str) -> str:
+            visited: set[str] = set()
+            while n in self.mutation_renames:
+                if n in visited:
+                    break  # cycle detected
+                visited.add(n)
+                n = self.mutation_renames[n]
             return n
 
         def add_user(
@@ -4943,7 +4942,13 @@ class Scheduler:
         for node in self.nodes:
             ancestors: OrderedSet[str] = OrderedSet()
             for dep in node.unmet_dependencies:
-                dep_node_name = self.name_to_buf[dep.name].defining_op_name()
+                buf_entry = self.name_to_buf.get(dep.name)
+                if buf_entry is None:
+                    continue
+                dep_node_name = buf_entry.defining_op_name()
+                if dep_node_name not in name_to_ancestors:
+                    # dep node was removed (DCE/inlining) or is a self-dep
+                    continue
                 ancestors.add(dep_node_name)
                 ancestors |= name_to_ancestors[dep_node_name]
             name_to_ancestors[node.get_name()] = ancestors
@@ -4966,18 +4971,20 @@ class Scheduler:
                 min_dist = 0
                 max_dist = 0
             else:
-                dep_min_dists = [
-                    name_to_min_distance[self.name_to_buf[dep.name].defining_op_name()]
-                    + 1
-                    for dep in node.unmet_dependencies
-                ]
-                dep_max_dists = [
-                    name_to_max_distance[self.name_to_buf[dep.name].defining_op_name()]
-                    + 1
-                    for dep in node.unmet_dependencies
-                ]
-                min_dist = min(dep_min_dists)
-                max_dist = max(dep_max_dists)
+                dep_min_dists = []
+                dep_max_dists = []
+                for dep in node.unmet_dependencies:
+                    buf_entry = self.name_to_buf.get(dep.name)
+                    if buf_entry is None:
+                        continue
+                    dep_node_name = buf_entry.defining_op_name()
+                    if dep_node_name not in name_to_min_distance:
+                        # dep node was removed (DCE/inlining) or is a self-dep
+                        continue
+                    dep_min_dists.append(name_to_min_distance[dep_node_name] + 1)
+                    dep_max_dists.append(name_to_max_distance[dep_node_name] + 1)
+                min_dist = min(dep_min_dists) if dep_min_dists else 0
+                max_dist = max(dep_max_dists) if dep_max_dists else 0
             name_to_min_distance[node.get_name()] = min_dist
             name_to_max_distance[node.get_name()] = max_dist
             node.min_input_distance = min_dist
@@ -5390,10 +5397,14 @@ class Scheduler:
 
         When a Pointwise producer is "broadcast-dominated" (most of its reads
         are small per-channel parameters relative to the output) and its sole
-        purpose is to feed a stencil consumer (pool, conv-like ops that read
+        purpose is to feed stencil consumers (pool, conv-like ops that read
         at shifted indices), materializing the full intermediate buffer is
         wasteful. This pass inlines the producer's computation into the
-        consumer, eliminating the buffer round-trip.
+        consumer(s), eliminating the buffer round-trip.
+
+        Supports multi-consumer inlining: if a producer feeds multiple stencil
+        consumers (e.g., both value and index outputs of maxpool), it can be
+        inlined into ALL of them, allowing the producer buffer to be eliminated.
 
         The mechanism works by replacing ops.load(producer_buf, flat_idx) calls
         in the consumer's inner_fn with the producer's inner_fn evaluated at
@@ -5411,54 +5422,82 @@ class Scheduler:
                 for buf in node.get_outputs():
                     buf_to_producer[buf.get_name()] = node
 
-        for consumer_node in nodes:
-            if not isinstance(consumer_node, SchedulerNode):
+        # Build a map from producer buffer name -> list of consumer nodes
+        buf_to_consumers: dict[str, list[SchedulerNode]] = {}
+        for node in nodes:
+            if not isinstance(node, SchedulerNode):
                 continue
-            if not isinstance(consumer_node.node, ir.ComputedBuffer):
+            if not isinstance(node.node, ir.ComputedBuffer):
                 continue
-            consumer_data = consumer_node.node.data
-            if not isinstance(consumer_data, (ir.Pointwise, ir.Reduction)):
+            if not isinstance(node.node.data, (ir.Pointwise, ir.Reduction)):
+                continue
+            for dep in node.read_writes.reads:
+                if isinstance(dep, MemoryDep) and dep.name in buf_to_producer:
+                    if dep.name not in buf_to_consumers:
+                        buf_to_consumers[dep.name] = []
+                    if node not in buf_to_consumers[dep.name]:
+                        buf_to_consumers[dep.name].append(node)
+
+        # Iterate over producers and try to inline into ALL consumers
+        processed_producers: OrderedSet[str] = OrderedSet()
+        for producer_buf_name, producer_node in buf_to_producer.items():
+            if producer_node.get_name() in processed_producers:
+                continue
+            if producer_node.get_name() in nodes_to_remove:
+                continue
+            if not isinstance(producer_node.node, ir.ComputedBuffer):
+                continue
+            producer_data = producer_node.node.data
+            if not isinstance(producer_data, ir.Pointwise):
                 continue
 
-            # Find producer buffers this consumer reads from
-            consumer_read_names = consumer_node.node.get_read_names()
-            inlinable_producers = []
-            for read_name in consumer_read_names:
-                if read_name not in buf_to_producer:
-                    continue
-                producer_node = buf_to_producer[read_name]
-                if producer_node.get_name() in nodes_to_remove:
-                    continue
-                if not self._is_inlinable_producer(producer_node, consumer_node, nodes):
-                    continue
-                inlinable_producers.append((read_name, producer_node))
-
-            if not inlinable_producers:
+            # Get all consumers of this producer buffer
+            consumers = buf_to_consumers.get(producer_buf_name, [])
+            if not consumers:
                 continue
 
-            # For each inlinable producer, try to inline it
-            for producer_buf_name, producer_node in inlinable_producers:
-                producer_cb = producer_node.node
-                assert isinstance(producer_cb, ir.ComputedBuffer)
-                producer_data = producer_cb.data
-                assert isinstance(producer_data, ir.Pointwise)
+            # Check inlinability (broadcast-dominated check, ignoring consumer count)
+            if not self._is_inlinable_producer_shape(producer_node):
+                continue
 
+            # Check that ALL consumers are stencil-like (multi-read from producer)
+            # and that inlining is profitable for all of them
+            all_profitable = True
+            for consumer_node in consumers:
                 if not self._is_inline_profitable(
                     producer_node, consumer_node, producer_buf_name
                 ):
-                    continue
+                    all_profitable = False
+                    break
 
+            if not all_profitable:
+                continue
+
+            # Try to inline into all consumers
+            all_success = True
+            inlined_consumers = []
+            producer_cb = producer_node.node
+            for consumer_node in consumers:
                 success = self._do_inline_producer(
                     producer_cb, consumer_node, producer_buf_name
                 )
                 if success:
-                    nodes_to_remove.add(producer_node.get_name())
-                    inlined_count += 1
+                    inlined_consumers.append(consumer_node)
+                else:
+                    all_success = False
+                    break
+
+            if all_success and inlined_consumers:
+                nodes_to_remove.add(producer_node.get_name())
+                inlined_count += 1
+                for cn in inlined_consumers:
                     fusion_log.debug(
                         "inline_recomputable_producers: inlined %s into %s",
                         producer_node.get_name(),
-                        consumer_node.get_name(),
+                        cn.get_name(),
                     )
+
+            processed_producers.add(producer_node.get_name())
 
         if inlined_count > 0:
             counters["inductor"]["inline_recomputable_producers"] = inlined_count
@@ -5496,7 +5535,7 @@ class Scheduler:
         consumer_node: "SchedulerNode",
         all_nodes: list["BaseSchedulerNode"],
     ) -> bool:
-        """Check if a producer is a candidate for inlining.
+        """Check if a producer is a candidate for inlining (legacy single-consumer path).
 
         Requirements:
         - Producer is a Pointwise ComputedBuffer
@@ -5504,8 +5543,31 @@ class Scheduler:
           than the output (per-channel params vs full-tensor output)
         - Producer has no other consumers (otherwise buffer can't be eliminated)
         """
-        pass  # sympy already imported at module level
+        if not self._is_inlinable_producer_shape(producer_node):
+            return False
 
+        # Producer must have no other consumers
+        producer_buf_names = producer_node.get_buffer_names()
+        for other_node in all_nodes:
+            if other_node is consumer_node or other_node is producer_node:
+                continue
+            for dep in other_node.read_writes.reads:
+                if isinstance(dep, MemoryDep) and dep.name in producer_buf_names:
+                    return False
+
+        return True
+
+    def _is_inlinable_producer_shape(
+        self,
+        producer_node: "SchedulerNode",
+    ) -> bool:
+        """Check if a producer has the right shape properties for inlining.
+
+        Requirements:
+        - Producer is a Pointwise ComputedBuffer
+        - Producer is "broadcast-dominated": at least one read is much smaller
+          than the output (per-channel params, scalars, etc.)
+        """
         if not isinstance(producer_node.node, ir.ComputedBuffer):
             return False
         producer_data = producer_node.node.data
@@ -5538,15 +5600,6 @@ class Scheduler:
         if small_reads < 1:
             return False
 
-        # Producer must have no other consumers
-        producer_buf_names = producer_node.get_buffer_names()
-        for other_node in all_nodes:
-            if other_node is consumer_node or other_node is producer_node:
-                continue
-            for dep in other_node.read_writes.reads:
-                if isinstance(dep, MemoryDep) and dep.name in producer_buf_names:
-                    return False
-
         return True
 
     def _is_inline_profitable(
@@ -5555,7 +5608,15 @@ class Scheduler:
         consumer_node: "SchedulerNode",
         producer_buf_name: str,
     ) -> bool:
-        """Check if inlining saves more memory than it costs in recomputation."""
+        """Check if inlining saves more memory than it costs in recomputation.
+
+        The model compares memory traffic saved (eliminating the intermediate
+        buffer write + read) against extra compute from recomputing the producer
+        at each stencil position. On modern GPUs, arithmetic is very cheap
+        compared to memory bandwidth — a single memory access takes ~100x more
+        time than a single arithmetic op. We use a conservative ratio that still
+        favors inlining for typical BN/activation chains before pool ops.
+        """
         pass  # sympy already imported at module level
 
         producer_data = producer_node.node.data
@@ -5582,12 +5643,17 @@ class Scheduler:
             sympy_product(consumer_data.get_size())
         )
 
-        # Total recompute cost
+        # Total recompute cost: each output element of the consumer recomputes
+        # the producer at stencil_reads positions, each costing producer_ops FLOPs
         total_recompute_ops = consumer_output_numel * stencil_reads * producer_ops
-        # Rough model: 1 FLOP ~= 0.1 byte bandwidth on modern GPUs
-        compute_cost_as_bytes = total_recompute_ops * 0.1
 
-        return memory_saved_bytes > compute_cost_as_bytes * 2
+        # Cost model: on modern GPUs (e.g. A100/H100/B200), peak compute is
+        # ~300-2000 TFLOPS while memory bandwidth is ~2-8 TB/s, giving a ratio
+        # of ~0.004-0.01 bytes per FLOP. We use 0.02 as a conservative estimate
+        # that accounts for instruction overhead and register pressure.
+        compute_cost_as_bytes = total_recompute_ops * 0.02
+
+        return memory_saved_bytes > compute_cost_as_bytes
 
     def _do_inline_producer(
         self,
