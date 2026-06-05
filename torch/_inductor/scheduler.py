@@ -5523,12 +5523,13 @@ class Scheduler:
         if not read_sizes:
             return False
 
-        # At most one read close to output size, rest must be small (broadcast)
-        large_reads = sum(1 for s in read_sizes if s > producer_output_numel * 0.5)
+        # The producer must have "broadcast character": at least one read that
+        # is much smaller than the output (per-channel params, scalars, etc.).
+        # Multiple full-size reads are allowed — the profitability check
+        # (_is_inline_profitable) properly accounts for recomputation cost vs
+        # memory savings from eliminating the intermediate buffer.
         small_reads = sum(1 for s in read_sizes if s <= producer_output_numel * 0.1)
 
-        if large_reads > 1:
-            return False
         if small_reads < 1:
             return False
 
