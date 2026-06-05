@@ -1987,9 +1987,18 @@ def _find_scatter_add_into_patterns(graph: fx.Graph) -> list[dict]:
                 if len(ip_users) != 1 or ip_users[0] != node:
                     continue
 
-            # Check that zeros is ONLY used by the index_put
+            # Check that zeros is only used by index_put operations with
+            # accumulate=True. This allows the common pattern where a single
+            # zeros buffer is shared by multiple independent scatter operations
+            # (e.g., MT5 backward with two embedding gradient scatters).
+            # Each index_put reads zeros as its accumulation base without
+            # mutating it, so sharing is semantically equivalent to having
+            # separate zeros buffers.
             zeros_users = list(ip_input.users.keys())
-            if len(zeros_users) != 1 or zeros_users[0] != actual_ip:
+            all_users_are_scatter = all(
+                _is_accumulate_index_put(u) for u in zeros_users
+            )
+            if not all_users_are_scatter:
                 continue
 
             indices = actual_ip.args[1]

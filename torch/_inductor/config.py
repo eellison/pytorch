@@ -1261,6 +1261,14 @@ select_scatter_sparsity = (
     os.environ.get("TORCHINDUCTOR_SELECT_SCATTER_SPARSITY", "1") == "1"
 )
 
+# Scatter read bypass: when a slice/select reads from a region of a
+# slice_scatter/select_scatter that was NOT written, bypass the scatter and
+# read directly from the base. Breaks multi-user dependencies in scatter chains
+# (Longformer attention), enabling fusion of assembly kernels.
+diagonal_skew_elimination = (
+    os.environ.get("TORCHINDUCTOR_DIAGONAL_SKEW_ELIMINATION", "1") == "1"
+)
+
 # As-strided-scatter elision: eliminates redundant full+as_strided_scatter+as_strided chains
 # where the scatter writes ALL elements of a zero-filled buffer (batch-norm backward patterns)
 as_strided_scatter_elision = (
