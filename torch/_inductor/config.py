@@ -1277,6 +1277,18 @@ slice_scatter_elision = (
     os.environ.get("TORCHINDUCTOR_SLICE_SCATTER_ELISION", "1") == "1"
 )
 
+# Slice-scatter partial elision: when a slice reads a range that partially overlaps
+# with a slice_scatter's write range, split into cat of base-slice + src-slice.
+# This eliminates RAW dependencies through the scatter buffer, enabling kernel fusion.
+# (KV-cache update + head-major clone pattern in LLaMA/GPT inference)
+# NOTE: Currently disabled by default as the cat approach adds memory traffic
+# through the intermediate ConcatKernel buffer. The correct fix requires
+# scheduler-level mutation fusion (inlining the mutation source directly into
+# the consumer's conditional load).
+slice_scatter_partial_elision = (
+    os.environ.get("TORCHINDUCTOR_SLICE_SCATTER_PARTIAL_ELISION", "0") == "1"
+)
+
 # Select-scatter sparsity propagation: when full(0) + select_scatter creates a
 # structurally sparse tensor, propagate sparsity through downstream ops and
 # rewrite reductions to operate only on the non-zero slice.

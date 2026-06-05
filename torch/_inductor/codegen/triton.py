@@ -5102,23 +5102,32 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                         """
                     )
 
-                    # In-loop: capture the target logit value.
+                    # Capture the target logit value.
                     # target_logit (from inner_fn) is [XBLOCK, R0_BLOCK] but has the
                     # SAME value across the R0_BLOCK dim (it only depends on outer idx).
-                    # We capture it on the first iteration (when _loaded is False)
-                    # and keep it for subsequent iterations.
-                    # Since the load is loop-invariant (same address each iter),
-                    # the Triton compiler should hoist it via LICM.
-                    if cond:
-                        target_val_expr = f"triton_helpers.max2(tl.where({cond}, {target_idx}.to({acc_type}), float('-inf')), {dim})"
+                    if target_idx in self.outside_loop_vars:
+                        # target_idx is loop-invariant and was hoisted to self.body.
+                        # Reduce it to scalar once before the loop starts.
+                        if cond:
+                            target_val_expr = f"triton_helpers.max2(tl.where(xmask, {target_idx}.to({acc_type}), float('-inf')), {dim})"
+                        else:
+                            target_val_expr = f"triton_helpers.max2({target_idx}.to({acc_type}), {dim})"
+                        self.body.writeline(
+                            f"{accumulator_target} = {target_val_expr}"
+                        )
                     else:
-                        target_val_expr = f"triton_helpers.max2({target_idx}.to({acc_type}), {dim})"
-                    self.compute.splice(
-                        f"""
-                        {accumulator_target} = tl.where({accumulator_target}_loaded, {accumulator_target}, {target_val_expr})
-                        {accumulator_target}_loaded = tl.full({scalar_acc_size_str}, 1, tl.int1)
-                        """
-                    )
+                        # target_idx is inside the loop (due to indirect indexing).
+                        # Capture it on the first iteration using the _loaded flag.
+                        if cond:
+                            target_val_expr = f"triton_helpers.max2(tl.where({cond}, {target_idx}.to({acc_type}), float('-inf')), {dim})"
+                        else:
+                            target_val_expr = f"triton_helpers.max2({target_idx}.to({acc_type}), {dim})"
+                        self.compute.splice(
+                            f"""
+                            {accumulator_target} = tl.where({accumulator_target}_loaded, {accumulator_target}, {target_val_expr})
+                            {accumulator_target}_loaded = tl.full({scalar_acc_size_str}, 1, tl.int1)
+                            """
+                        )
 
                     # Post-loop: reshape accumulators
                     result_max = result_var
