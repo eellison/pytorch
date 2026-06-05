@@ -1222,6 +1222,12 @@ scatter_reduce_fusion = (
 # and the separate add kernel. Common in embedding backward patterns.
 scatter_add_into_fusion = True
 
+# Reduce-scatter distribution: rewrites sum(x, [dim]) -> where -> index_put(acc=True)
+# into a distributed scatter that avoids materializing the full intermediate tensor.
+# The accumulate=True in index_put implicitly performs the summation.
+# Common in LN-backward where the gradient has multiple scatter consumers.
+reduce_scatter_distribution = True
+
 # Linear reduction algebraic elimination: rewrites dependent reductions as scalar algebra
 linear_reduction_elimination = (
     os.environ.get("TORCHINDUCTOR_LINEAR_REDUCTION_ELIMINATION", "1") == "1"

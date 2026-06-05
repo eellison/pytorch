@@ -631,6 +631,12 @@ def post_grad_passes(gm: torch.fx.GraphModule, is_inference: bool):
             GraphTransformObserver(
                 gm, "scatter_add_into_fusion"
             ).apply_graph_pass(scatter_add_into_fusion_pass)
+        if config.reduce_scatter_distribution:
+            from .scatter_reduce_fusion import reduce_scatter_distribution_pass
+
+            GraphTransformObserver(
+                gm, "reduce_scatter_distribution"
+            ).apply_graph_pass(reduce_scatter_distribution_pass)
         if config.layout_transform_store_sinking:
             from .layout_transform_store_sinking import (
                 layout_transform_store_sinking_pass,

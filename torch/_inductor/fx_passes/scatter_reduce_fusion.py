@@ -2045,6 +2045,319 @@ def _rewrite_scatter_add_into(graph: fx.Graph, chain_info: dict) -> bool:
 
 
 # ============================================================================
+# Reduce-scatter distribution pass
+# ============================================================================
+
+
+def _find_reduce_scatter_distribution_patterns(graph: fx.Graph) -> list[dict]:
+    """Find sum(x, [dim]) -> where(mask, fill, sum) -> index_put(zeros, [idx], val, acc=True).
+
+    This pattern occurs in LN-backward when the gradient has multiple scatter
+    consumers plus a batch-dim reduction followed by a scatter. The explicit sum
+    forces materialization of the gradient tensor. We can eliminate the sum by
+    distributing the accumulation through the index_put (since accumulate=True
+    performs implicit summation).
+
+    Returns a list of dicts with keys:
+        - index_put_node: the final index_put node
+        - zeros_node: the full(0) initialization
+        - where_node: the where node
+        - sum_node: the sum.dim_IntList node
+        - source_node: the tensor being summed (x)
+        - reduced_dims: the dimensions being reduced
+        - mask_cond_node: the condition for where
+        - fill_node: the fill value for where
+        - idx_node: the index used in index_put
+        - batch_size: size of the reduced dimension
+    """
+    patterns = []
+
+    for node in graph.nodes:
+        if node.op != "call_function":
+            continue
+        if not _is_accumulate_index_put(node):
+            continue
+
+        # Check that input is zeros
+        ip_input = node.args[0]
+        if not isinstance(ip_input, fx.Node):
+            continue
+        if not _is_zeros_init(ip_input):
+            continue
+
+        # Get the index and values
+        indices = node.args[1]  # list of index tensors
+        values_node = node.args[2]
+        if not isinstance(values_node, fx.Node):
+            continue
+
+        # Check if values come from a where node
+        if values_node.op != "call_function":
+            continue
+        if values_node.target != aten.where.self:
+            continue
+
+        where_node = values_node
+        where_cond = where_node.args[0]  # condition
+        where_fill = where_node.args[1]  # fill value (used when cond is True)
+        where_other = where_node.args[2]  # other value (used when cond is False)
+
+        # Check if where_other comes from a sum
+        if not isinstance(where_other, fx.Node):
+            continue
+        if where_other.op != "call_function":
+            continue
+        if where_other.target != aten.sum.dim_IntList:
+            continue
+
+        sum_node = where_other
+        source_node = sum_node.args[0]
+        reduced_dims = sum_node.args[1]
+
+        if not isinstance(source_node, fx.Node):
+            continue
+        if not isinstance(reduced_dims, (list, tuple)):
+            continue
+        if len(reduced_dims) != 1:
+            continue  # Only handle single-dim reduction for now
+
+        # Get source shape
+        source_meta = _get_tensor_meta(source_node)
+        if source_meta is None:
+            continue
+
+        reduced_dim = reduced_dims[0]
+        if reduced_dim < 0:
+            reduced_dim += source_meta["ndim"]
+
+        batch_size = source_meta["shape"][reduced_dim]
+        if batch_size <= 1:
+            continue  # No point in distributing
+
+        # Get index info - must be a single index tensor
+        if not isinstance(indices, (list, tuple)) or len(indices) != 1:
+            continue
+        idx_node = indices[0]
+        if not isinstance(idx_node, fx.Node):
+            continue
+
+        # Check that index doesn't vary over the reduced dimension
+        idx_meta = _get_tensor_meta(idx_node)
+        if idx_meta is None:
+            continue
+        # The index should have size 1 or be absent in the reduced dimension
+        # e.g., idx shape [1, 512] for source shape [64, 512, 128] with reduced_dim=0
+        idx_shape = idx_meta["shape"]
+
+        # Verify the index is broadcast-compatible with source but doesn't
+        # vary over the reduced dimension
+        if len(idx_shape) > source_meta["ndim"]:
+            continue
+        # Pad idx_shape with leading 1s to match source ndim
+        padded_idx_shape = [1] * (source_meta["ndim"] - len(idx_shape)) + list(idx_shape)
+        # The reduced dimension in the padded shape should be 1
+        if padded_idx_shape[reduced_dim] != 1:
+            continue  # Index varies over reduced dim, can't distribute
+
+        # Check that where_node only has this one user (the index_put)
+        if len(list(where_node.users.keys())) != 1:
+            continue
+
+        # Check that sum_node only has this one user (the where)
+        if len(list(sum_node.users.keys())) != 1:
+            continue
+
+        # Check that zeros_node only has this one user (the index_put)
+        zeros_users = list(ip_input.users.keys())
+        if len(zeros_users) != 1 or zeros_users[0] != node:
+            continue
+
+        # Get fill value - must be a scalar or 0-dim tensor node
+        if not isinstance(where_fill, fx.Node):
+            continue
+        fill_meta = _get_tensor_meta(where_fill)
+        if fill_meta is not None and fill_meta["ndim"] > 0:
+            # Fill must be scalar (0-dim)
+            if fill_meta["numel"] != 1:
+                continue
+
+        # Get mask/condition info
+        if not isinstance(where_cond, fx.Node):
+            continue
+
+        patterns.append({
+            "index_put_node": node,
+            "zeros_node": ip_input,
+            "where_node": where_node,
+            "sum_node": sum_node,
+            "source_node": source_node,
+            "reduced_dim": reduced_dim,
+            "mask_cond_node": where_cond,
+            "fill_node": where_fill,
+            "idx_node": idx_node,
+            "batch_size": batch_size,
+        })
+
+    return patterns
+
+
+def _rewrite_reduce_scatter_distribution(graph: fx.Graph, pattern: dict) -> bool:
+    """Rewrite sum -> where -> scatter_add into distributed scatter_add.
+
+    The key algebraic identity:
+        index_put(zeros, [idx], where(cond, fill, sum(x, [batch_dim])), acc=True)
+        = index_put(zeros, [idx_expanded], where(cond, fill/B, x), acc=True)
+
+    This works because:
+    - For unmasked positions: accumulating B copies = sum over batch (correct)
+    - For masked positions: accumulating B copies of fill/B = fill (correct)
+
+    The index_put naturally handles multi-dimensional indexing: when idx has shape
+    [B, S] and values has shape [B, S, H], for each (b, s): output[idx[b,s], :] += values[b, s, :].
+    Since idx doesn't vary over the batch dimension (it's broadcast from [1, S]),
+    this is equivalent to summing over batch first then scattering.
+    """
+    index_put_node = pattern["index_put_node"]
+    zeros_node = pattern["zeros_node"]
+    where_node = pattern["where_node"]
+    sum_node = pattern["sum_node"]
+    source_node = pattern["source_node"]
+    reduced_dim = pattern["reduced_dim"]
+    mask_cond_node = pattern["mask_cond_node"]
+    fill_node = pattern["fill_node"]
+    idx_node = pattern["idx_node"]
+    batch_size = pattern["batch_size"]
+
+    source_meta = _get_tensor_meta(source_node)
+    zeros_meta = _get_tensor_meta(zeros_node)
+    idx_meta = _get_tensor_meta(idx_node)
+    if source_meta is None or zeros_meta is None or idx_meta is None:
+        return False
+
+    source_shape = source_meta["shape"]
+    idx_shape = idx_meta["shape"]
+
+    # Only handle the case where reduced_dim == 0 for now
+    # (batch dimension is the first dimension)
+    if reduced_dim != 0:
+        return False
+
+    # The index_put semantics:
+    # index_put(self[S, H], [idx[1, S]], values[1, S, H], acc=True)
+    # means: for each (i, j) in idx shape: self[idx[i,j], :] += values[i, j, :]
+    #
+    # After expansion:
+    # index_put(self[S, H], [idx_expanded[B, S]], values[B, S, H], acc=True)
+    # means: for each (b, s) in idx_expanded shape: self[idx[b,s], :] += values[b, s, :]
+    # Since idx is broadcast from [1, S], idx[b,s] = idx[0,s] for all b
+    # So this sums over batch implicitly.
+
+    # Determine the expand shape for the index
+    # idx is [1, S] or similar, needs to be [B, S]
+    # source is [B, S, H], so expand_shape for idx is source_shape[:-1]
+    # But we need to be careful: idx may have fewer dims than source[:-1]
+    # (e.g., idx [1, 512] for source [64, 512, 128])
+    # The expand target should match the non-hidden dimensions of source
+    idx_expand_shape = list(source_shape[:source_meta["ndim"] - (zeros_meta["ndim"] - 1)])
+    # For source [64, 512, 128], zeros [512, 128], ndim diff is 3 - (2-1) = 2
+    # So idx_expand_shape = source_shape[:2] = [64, 512]
+    # Wait, that formula is wrong. Let me just use source_shape up to the same
+    # number of dims as the index, but replacing the batch dim.
+
+    # Simpler: idx has shape matching the "prefix" dims of the sum output.
+    # sum output is [1, 512, 128], idx is [1, 512].
+    # We want idx to be [64, 512] to match the source's prefix.
+    # Just replace the first dim (which is 1 from keepdim) with batch_size.
+    idx_expand_shape = [batch_size] + list(idx_shape[1:]) if len(idx_shape) > 0 else [batch_size]
+
+    with graph.inserting_before(index_put_node):
+        # 1. Create fill / batch_size
+        fill_divided = graph.call_function(
+            aten.div.Tensor,
+            args=(fill_node, batch_size),
+        )
+        if hasattr(fill_node, "meta") and "val" in fill_node.meta:
+            fill_divided.meta["val"] = fill_node.meta["val"] / batch_size
+
+        # 2. Create where(cond, fill/B, source) - broadcasts correctly
+        # cond is e.g. [1, 512, 1], source is [64, 512, 128]
+        # The where broadcasts cond over the batch and hidden dims
+        adjusted_values = graph.call_function(
+            aten.where.self,
+            args=(mask_cond_node, fill_divided, source_node),
+        )
+        if hasattr(source_node, "meta") and "val" in source_node.meta:
+            adjusted_values.meta["val"] = source_node.meta["val"].clone()
+
+        # 3. Expand the index to cover the batch dimension
+        # idx [1, 512] -> [64, 512]
+        idx_expanded = graph.call_function(
+            aten.expand.default,
+            args=(idx_node, idx_expand_shape),
+        )
+        if hasattr(idx_node, "meta") and "val" in idx_node.meta:
+            idx_expanded.meta["val"] = idx_node.meta["val"].expand(idx_expand_shape)
+
+        # 4. Create new index_put with expanded index and full-batch values
+        # index_put(zeros[512, 128], [idx_expanded[64, 512]], values[64, 512, 128], acc=True)
+        new_index_put = graph.call_function(
+            aten.index_put_.default if index_put_node.target == aten.index_put_.default
+            else aten.index_put.default,
+            args=(zeros_node, [idx_expanded], adjusted_values, True),
+        )
+        if hasattr(index_put_node, "meta"):
+            new_index_put.meta = dict(index_put_node.meta)
+
+    # Replace the original index_put with the new one
+    index_put_node.replace_all_uses_with(new_index_put)
+
+    log.info(
+        "reduce_scatter_distribution: REWROTE reduce->scatter pattern! "
+        "Eliminated sum over dim %d (batch_size=%d) for source shape %s. "
+        "This removes materialization of %d-element intermediate.",
+        reduced_dim,
+        batch_size,
+        source_shape,
+        source_meta["numel"],
+    )
+    return True
+
+
+def reduce_scatter_distribution_pass(graph: fx.Graph) -> fx.Graph:
+    """Distribute batch reduction through scatter-add to avoid intermediate materialization.
+
+    Rewrites: sum(x, [batch_dim]) -> where(mask, fill, sum) -> index_put(zeros, [idx], val, acc=True)
+    Into: where(mask, fill/B, x) -> reshape -> index_put(zeros, [idx_expanded], val_flat, acc=True)
+
+    This eliminates the need to materialize the full [B, S, H] intermediate tensor
+    when it's only consumed by a scatter that implicitly sums. The accumulate=True
+    in index_put performs the summation implicitly.
+
+    Controlled by: config.reduce_scatter_distribution (default True)
+    """
+    if not getattr(config, "reduce_scatter_distribution", True):
+        return graph
+
+    num_rewritten = 0
+    patterns = _find_reduce_scatter_distribution_patterns(graph)
+    if patterns:
+        log.info(
+            "reduce_scatter_distribution: found %d reduce->scatter pattern(s)",
+            len(patterns),
+        )
+        for pattern in patterns:
+            if _rewrite_reduce_scatter_distribution(graph, pattern):
+                num_rewritten += 1
+                counters["inductor"]["reduce_scatter_distribution_applied"] += 1
+
+    if num_rewritten > 0:
+        graph.eliminate_dead_code()
+        graph.lint()
+
+    return graph
+
+
+# ============================================================================
 # Pass registration and entry point
 # ============================================================================
 
