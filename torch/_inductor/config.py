@@ -1217,6 +1217,11 @@ scatter_reduce_fusion = (
     os.environ.get("TORCHINDUCTOR_SCATTER_REDUCE_FUSION", "0") == "1"
 )
 
+# Scatter-add-into fusion: rewrites add(A, index_put(zeros, idx, val, accumulate=True))
+# into index_put(A, idx, val, accumulate=True), eliminating the zeros initialization
+# and the separate add kernel. Common in embedding backward patterns.
+scatter_add_into_fusion = True
+
 # Linear reduction algebraic elimination: rewrites dependent reductions as scalar algebra
 linear_reduction_elimination = (
     os.environ.get("TORCHINDUCTOR_LINEAR_REDUCTION_ELIMINATION", "1") == "1"
@@ -2059,6 +2064,16 @@ class triton:
     # use alternate codegen for smaller reductions
     persistent_reductions = (
         os.environ.get("TORCHINDUCTOR_PERSISTENT_REDUCTIONS", "1") == "1"
+    )
+
+    # Maximum reduction numel for which persistent reduction is used for
+    # INNER reductions (reduction over contiguous elements). Raising this
+    # threshold allows patterns like BN-training (rnumel=N*H*W) to use
+    # persistent reduction, avoiding a second pass over the input for the
+    # normalization epilogue. The persistent kernel holds all reduction
+    # elements in registers/L1, computing stats and epilogue in one pass.
+    persistent_reduction_threshold_inner: int = int(
+        os.environ.get("TORCHINDUCTOR_PERSISTENT_REDUCTION_THRESHOLD_INNER", "4096")
     )
 
     # Decompose sort-based ops (sort, mode, median) to generate Triton

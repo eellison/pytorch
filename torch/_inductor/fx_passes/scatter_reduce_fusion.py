@@ -330,6 +330,21 @@ def scatter_reduce_fusion_pass(graph: fx.Graph) -> fx.Graph:
                 num_rewritten += 1
                 counters["inductor"]["scatter_reduce_fusion_applied"] += 1
 
+    # Phase 1c: Detect add(A, index_put(zeros, idx, val, accumulate=True))
+    # and rewrite to index_put(A, idx, val, accumulate=True).
+    # This eliminates the zeros initialization and the add kernel.
+    # Pattern: embedding backward where scattered gradient is added to existing weight grad.
+    scatter_add_into_chains = _find_scatter_add_into_patterns(graph)
+    if scatter_add_into_chains:
+        log.info(
+            "scatter_reduce_fusion: found %d scatter-add-into pattern(s)",
+            len(scatter_add_into_chains),
+        )
+        for chain_info in scatter_add_into_chains:
+            if _rewrite_scatter_add_into(graph, chain_info):
+                num_rewritten += 1
+                counters["inductor"]["scatter_add_into_fusion_applied"] += 1
+
     if num_rewritten > 0:
         log.info(
             "scatter_reduce_fusion: rewrote %d chain(s)", num_rewritten
@@ -1873,6 +1888,158 @@ def _emit_gather_reduce_for_bilinear(
         len(rewrite_targets),
         len(non_rewritable_users),
         output_shape,
+    )
+    return True
+
+
+# ============================================================================
+# Phase 1c: Scatter-add-into fusion (embedding backward pattern)
+# ============================================================================
+#
+# Pattern:
+#   full(shape, 0) -> index_put(full, [idx], values, accumulate=True) -> add(A, result)
+#
+# Algebraic identity:
+#   add(A, index_put(zeros, [idx], val, accumulate=True)) == index_put(A, [idx], val, accumulate=True)
+#
+# This eliminates:
+#   - The full(0) initialization of the scatter target buffer
+#   - The add kernel that reads both A and the scatter result
+# The rewritten form scatters directly into a copy of A.
+
+
+def _find_scatter_add_into_patterns(graph: fx.Graph) -> list[dict]:
+    """Find add(A, index_put(zeros, idx, val, accumulate=True)) patterns.
+
+    Returns a list of dicts with keys:
+        - add_node: the add node to replace
+        - index_put_node: the index_put node
+        - zeros_node: the full(0) node
+        - other_node: the tensor A being added to
+        - indices: the index list from index_put
+        - values_node: the values being scattered
+    """
+    patterns = []
+
+    for node in graph.nodes:
+        if node.op != "call_function":
+            continue
+        if node.target != aten.add.Tensor:
+            continue
+
+        # Try both orderings: add(A, index_put) or add(index_put, A)
+        for i, j in [(0, 1), (1, 0)]:
+            arg_ip = node.args[i]
+            arg_other = node.args[j]
+
+            if not isinstance(arg_ip, fx.Node) or not isinstance(arg_other, fx.Node):
+                continue
+
+            if not _is_accumulate_index_put(arg_ip):
+                continue
+
+            # Check that the index_put's input is a zeros tensor
+            ip_input = arg_ip.args[0]
+            if not isinstance(ip_input, fx.Node):
+                continue
+            if not _is_zeros_init(ip_input):
+                continue
+
+            # Check that the zeros tensor has the same shape as `other`
+            zeros_meta = _get_tensor_meta(ip_input)
+            other_meta = _get_tensor_meta(arg_other)
+            if zeros_meta is None or other_meta is None:
+                continue
+            if zeros_meta["shape"] != other_meta["shape"]:
+                continue
+
+            # Check that index_put result is ONLY used by this add
+            ip_users = list(arg_ip.users.keys())
+            if len(ip_users) != 1 or ip_users[0] != node:
+                continue
+
+            # Check that zeros is ONLY used by the index_put
+            zeros_users = list(ip_input.users.keys())
+            if len(zeros_users) != 1 or zeros_users[0] != arg_ip:
+                continue
+
+            indices = arg_ip.args[1]
+            values_node = arg_ip.args[2]
+
+            patterns.append({
+                "add_node": node,
+                "index_put_node": arg_ip,
+                "zeros_node": ip_input,
+                "other_node": arg_other,
+                "indices": indices,
+                "values_node": values_node,
+            })
+            break  # Found pattern for this add node
+
+    return patterns
+
+
+def scatter_add_into_fusion_pass(graph: fx.Graph) -> fx.Graph:
+    """Standalone pass for scatter-add-into optimization.
+
+    Rewrites add(A, index_put(zeros, idx, val, accumulate=True))
+    into index_put(A, idx, val, accumulate=True).
+
+    Controlled by: config.scatter_add_into_fusion (default True)
+    """
+    if not getattr(config, "scatter_add_into_fusion", False):
+        return graph
+
+    num_rewritten = 0
+    patterns = _find_scatter_add_into_patterns(graph)
+    if patterns:
+        log.info(
+            "scatter_add_into_fusion: found %d scatter-add-into pattern(s)",
+            len(patterns),
+        )
+        for chain_info in patterns:
+            if _rewrite_scatter_add_into(graph, chain_info):
+                num_rewritten += 1
+                counters["inductor"]["scatter_add_into_fusion_applied"] += 1
+
+    if num_rewritten > 0:
+        graph.eliminate_dead_code()
+        graph.lint()
+
+    return graph
+
+
+def _rewrite_scatter_add_into(graph: fx.Graph, chain_info: dict) -> bool:
+    """Rewrite add(A, index_put(zeros, idx, val, True)) -> index_put(A, idx, val, True).
+
+    This is safe because:
+        index_put(A, idx, val, accumulate=True) = A.clone() + scatter_add(zeros, idx, val)
+        = A + scatter_add(zeros, idx, val)  [when used as a new output, not in-place]
+        = add(A, index_put(zeros, idx, val, accumulate=True))
+    """
+    add_node = chain_info["add_node"]
+    index_put_node = chain_info["index_put_node"]
+    other_node = chain_info["other_node"]
+    indices = chain_info["indices"]
+    values_node = chain_info["values_node"]
+
+    with graph.inserting_before(add_node):
+        # Create new index_put with A as the input instead of zeros
+        new_index_put = graph.call_function(
+            aten.index_put.default,
+            args=(other_node, indices, values_node, True),
+        )
+        # Copy metadata from the add node (same output shape/dtype)
+        if hasattr(add_node, "meta"):
+            new_index_put.meta = dict(add_node.meta)
+
+    add_node.replace_all_uses_with(new_index_put)
+
+    log.info(
+        "scatter_reduce_fusion: REWROTE scatter-add-into pattern! "
+        "Eliminated full(0) init + add kernel for shape=%s",
+        _get_tensor_meta(chain_info["zeros_node"])["shape"]
+        if _get_tensor_meta(chain_info["zeros_node"]) else "unknown",
     )
     return True
 
