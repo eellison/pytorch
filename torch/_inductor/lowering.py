@@ -2283,6 +2283,14 @@ def cat(inputs, dim=0):
         Example: split → SwiGLU → cat where both halves compute sigmoid from
         the same input; pointwise_cat doubles the iteration and re-computes
         sigmoid, while ConcatKernel iterates once with two stores.
+
+        We detect this by checking that:
+        1. Cat inputs share multiple read buffers (indicating shared computation,
+           not just reading different slices of one input), and
+        2. At least one input has significant computation (many ops).
+
+        Simple patterns like split→add→cat read only 1 buffer each and are
+        excluded. Complex patterns like SwiGLU read 2+ shared buffers.
         """
         threshold = config.prefer_concat_kernel_shared_reads_threshold
         if threshold <= 0:
@@ -2292,38 +2300,38 @@ def cat(inputs, dim=0):
         if not all(should_lower_cat_input(inp) for inp in inputs):
             return False
 
-        def get_all_reads(x):
-            """Recursively collect all read buffer names from a Pointwise tree."""
+        def _get_opcount_info(x):
+            """Get inner_fn_opcount for a cat input."""
             if isinstance(x, (TensorBox, ir.StorageBox)):
-                return get_all_reads(unwrap_tensor(x))
+                return _get_opcount_info(unwrap_tensor(x))
             if isinstance(x, ir.Pointwise):
-                reads = OrderedSet(x.get_read_names())
-                for read in list(reads):
-                    buf = V.graph.get_buffer(read)
-                    if buf is not None:
-                        reads |= get_all_reads(buf)
-                return reads
-            return OrderedSet()
+                return x.inner_fn_opcount()
+            return None
 
-        # Collect reads for each input
-        input_reads = [get_all_reads(inp) for inp in inputs]
+        opcounts = [_get_opcount_info(inp) for inp in inputs]
 
-        # Check if any pair of inputs shares reads
-        has_shared = False
-        for i in range(len(input_reads)):
-            for j in range(i + 1, len(input_reads)):
-                if input_reads[i] & input_reads[j]:
-                    has_shared = True
-                    break
-            if has_shared:
-                break
-
-        if not has_shared:
+        # All inputs must be Pointwise
+        if any(opc is None for opc in opcounts):
             return False
 
-        # Check that inputs have enough ops to make the duplication costly
-        total_ops = sum(op_count(t) for t in inputs)
-        return total_ops >= threshold
+        # Check that at least one input has enough ops to justify
+        # avoiding the pointwise_cat duplication
+        max_ops = max(opc.num_ops for opc in opcounts)
+        if max_ops < threshold:
+            return False
+
+        # Check that inputs share at least 2 unique buffer reads.
+        # This distinguishes "both read from the same slice" (shared computation)
+        # from "each reads a different slice of one buffer" (independent).
+        # With split→compute→cat, each input reads only 1 buffer (its own slice).
+        # With split→shared_compute→cat, inputs read 2+ buffers (multiple slices
+        # or multiple inputs) indicating shared intermediate computation.
+        read_sets = [OrderedSet(opc.read_buffers) for opc in opcounts]
+        shared_buffers = read_sets[0]
+        for rs in read_sets[1:]:
+            shared_buffers = shared_buffers & rs
+
+        return len(shared_buffers) >= 2
 
     if len(inputs) <= config.max_complex_pointwise_cat_inputs or (
         (len(inputs) <= config.max_pointwise_cat_inputs)

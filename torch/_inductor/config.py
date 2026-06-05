@@ -1021,12 +1021,13 @@ max_pointwise_cat_inputs = 8
 # force concat to be generated as a pointwise op with masked loads
 force_pointwise_cat = False
 
-# When cat inputs share reads and have total ops above this threshold,
-# prefer ConcatKernel over pointwise_cat to avoid redundant computation.
-# With pointwise_cat, each output element re-evaluates all cat inputs (masked);
-# with ConcatKernel, the scheduler fuses writes into one kernel sharing intermediates.
-# Set to 0 to disable (always allow pointwise_cat).
-prefer_concat_kernel_shared_reads_threshold = 4
+# When cat inputs share reads and the most complex input has ops at or above
+# this threshold, prefer ConcatKernel over pointwise_cat to avoid redundant
+# computation. With pointwise_cat, each output element re-evaluates all cat
+# inputs (masked); with ConcatKernel, the scheduler fuses writes into one
+# kernel sharing intermediates.  Set to 0 to disable.
+# Calibration: simple chunk->add->cat has ~3 ops per input; SwiGLU has 10-18.
+prefer_concat_kernel_shared_reads_threshold = 6
 
 # replace small reductions with pointwise, disable with `= 1`
 unroll_reductions_threshold = 8
