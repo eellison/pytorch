@@ -2054,18 +2054,6 @@ class triton:
         os.environ.get("TORCHINDUCTOR_PERSISTENT_REDUCTIONS", "1") == "1"
     )
 
-    # Maximum rnumel for INNER reductions to use persistent mode (keeps
-    # intermediates in registers instead of a looped 2-pass variant).  The
-    # old default of 1024 was too conservative for many BN-style reductions
-    # where rnumel is 3136-8192 (e.g. N*H*W for batch-norm over channels).
-    # Raising to 8192 covers these cases without register pressure issues on
-    # modern GPUs (A100/H100 have 256 registers per thread, 8192 elements
-    # with 4-byte accumulators fit comfortably with multi-element vectorized
-    # loads).
-    persistent_reduction_threshold_inner: int = int(
-        os.environ.get("TORCHINDUCTOR_PERSISTENT_REDUCTION_THRESHOLD_INNER", "8192")
-    )
-
     # Decompose sort-based ops (sort, mode, median) to generate Triton
     # kernels instead of falling back to ATen eager.  When enabled, sort
     # removes the default 512-element dimension limit and uses int32
