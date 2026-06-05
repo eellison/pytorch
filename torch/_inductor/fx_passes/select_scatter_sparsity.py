@@ -563,8 +563,11 @@ def _apply_select_scatter_reduction_rewrite(
                     continue
 
                 # Now reconstruct: select_scatter(zeros, rebuilt, sparse_dim, idx)
-                # This produces the same sparse output but with computation only on the slice
-                with graph.inserting_before(output_node):
+                # This produces the same sparse output but with computation only on the slice.
+                # Insert before materialize_node (not output_node) to maintain
+                # topological ordering -- users of materialize_node appear after it,
+                # so the replacement node must also appear before those users.
+                with graph.inserting_before(materialize_node):
                     full_node = graph.call_function(
                         aten.full.default,
                         args=(list(scatter_shape), 0),
@@ -584,9 +587,10 @@ def _apply_select_scatter_reduction_rewrite(
                         full_node.meta["tensor_meta"] = materialize_node.meta["tensor_meta"]
 
                     # Replace the materialize_node with new_scatter in the view chain
-                    materialize_node.replace_all_uses_with(new_scatter)
-                    # But new_scatter shouldn't replace itself as its own input
-                    # (since it was inserted after materialize_node's users were updated)
+                    materialize_node.replace_all_uses_with(
+                        new_scatter,
+                        delete_user_cb=lambda user: user is not new_scatter,
+                    )
 
                 num_rewrites += 1
                 log.debug(
