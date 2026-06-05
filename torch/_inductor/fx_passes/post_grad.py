@@ -625,14 +625,6 @@ def post_grad_passes(gm: torch.fx.GraphModule, is_inference: bool):
             GraphTransformObserver(
                 gm, "as_strided_scatter_elision"
             ).apply_graph_pass(as_strided_scatter_elision_pass)
-        if config.degenerate_dropout_elimination:
-            from .degenerate_dropout_elimination import (
-                degenerate_dropout_elimination_pass,
-            )
-
-            GraphTransformObserver(
-                gm, "degenerate_dropout_elimination"
-            ).apply_graph_pass(degenerate_dropout_elimination_pass)
         if config.scatter_reduce_fusion:
             from .scatter_reduce_fusion import scatter_reduce_fusion_pass
 

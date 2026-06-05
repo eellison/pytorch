@@ -1298,13 +1298,6 @@ as_strided_scatter_elision = (
     os.environ.get("TORCHINDUCTOR_AS_STRIDED_SCATTER_ELISION", "1") == "1"
 )
 
-# Degenerate dropout elimination: folds dropout patterns where the keep probability
-# is effectively 1.0 (threshold < 1e-10, scale == 1.0) to identity. Common in
-# Longformer/FNet training graphs that use `rand > 1e-30` as a no-op dropout mask.
-degenerate_dropout_elimination = (
-    os.environ.get("TORCHINDUCTOR_DEGENERATE_DROPOUT_ELIMINATION", "1") == "1"
-)
-
 # BN-inference affine folding: folds decomposed batch normalization inference
 # (sub(x,mean) -> mul(inv_std) -> mul(weight) -> add(bias)) into precomputed
 # scale/shift: output = x * scale + shift. Saves 2 per-channel loads and 3 ops per element.
