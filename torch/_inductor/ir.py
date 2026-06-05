@@ -10200,6 +10200,14 @@ class StorageBox(MutableBox):
                 ]
                 if any(x in opcount.used_ops for x in transcendental_ops):
                     return True
+            # Indirect indexing (gather) ops involve random-access memory
+            # lookups that are expensive to replay.  When a gathered result
+            # is reused across multiple consumers (e.g., a small bias table
+            # gathered via an index and broadcast into a larger softmax),
+            # materializing it avoids replaying the gather for each consumer.
+            if config.realize_indirect_indexing_on_reuse:
+                if "indirect_indexing" in opcount.used_ops:
+                    return True
             return (
                 self.num_reads() > config.realize_reads_threshold
                 or self.has_large_inner_fn()

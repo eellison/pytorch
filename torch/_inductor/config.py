@@ -876,6 +876,15 @@ realize_opcount_threshold = 30
 # [4,32,512,128] RoPE kernels saves 128x recomputation per element).
 realize_heavy_transcendentals_on_reuse: bool = True
 
+# When True, materialize multi-user pointwise nodes that contain indirect
+# indexing (gather) operations.  Indirect indexing involves random-access
+# memory lookups that are expensive to replay many times — particularly when
+# the node is broadcast into a larger consumer (e.g., a [32, 49, 49] relative
+# position bias gathered via an index table and broadcast into [128, 32, 49, 49]
+# for attention softmax).  Materializing the small gathered result avoids
+# replaying the gather for each element of the larger consumer.
+realize_indirect_indexing_on_reuse: bool = True
+
 # When True, skip realize_hint for cheap pointwise producers (BN+ReLU, simple
 # arithmetic) before pooling/stencil consumers. This allows the pointwise to be
 # recomputed inline at each stencil position rather than materializing a large
