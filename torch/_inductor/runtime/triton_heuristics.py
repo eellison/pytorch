@@ -4633,6 +4633,18 @@ def _persistent_reduction_configs(
         xblock_vals = [1, 8, 32, 128]
 
     if "y" not in size_hints:
+        # For large persistent reductions (rnumel > 8192), cap num_warps to ensure
+        # good SM occupancy. With xnumel programs on num_sm SMs, we want at least
+        # 2 programs per SM. Each SM has max_threads_per_sm threads, so we need
+        # num_warps * 32 <= max_threads_per_sm / programs_per_sm.
+        occupancy_num_warps = None
+        if rnumel > 8192 and xnumel >= 64:
+            # Target ~4 programs per SM for good occupancy
+            # B200: 148 SMs, 2048 threads/SM -> 512 threads per program = 16 warps max
+            # But for xnumel >> num_sm (e.g., 960 channels on 148 SMs), we want 8 warps
+            # to allow 8 programs per SM (full utilization)
+            occupancy_num_warps = 8
+
         configs = [
             triton_config_reduction(
                 size_hints,
@@ -4640,6 +4652,7 @@ def _persistent_reduction_configs(
                 rnumel,
                 register_intensive=True,
                 reduction_hint=reduction_hint,
+                num_warps=occupancy_num_warps,
             )
             for xblock in xblock_vals
             if xblock == 1

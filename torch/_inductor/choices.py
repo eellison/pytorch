@@ -465,6 +465,29 @@ class InductorChoices:
                 V.graph.sizevars.optimization_hint(features.numel), 32
             )
 
+        # On Blackwell+ GPUs (cc >= 10.0), the larger register file (65536 regs/SM)
+        # makes persistent reductions profitable for larger rnumel values. BN-training
+        # patterns (rnumel = N*H*W, typically 3136-25088) benefit greatly from
+        # persistent mode: the kernel reads input data once and computes both the
+        # reduction statistics and the normalization epilogue in a single pass,
+        # avoiding a 2x bandwidth penalty from re-reading the input.
+        if (
+            features.get_reduction_hint() == ReductionHint.INNER
+            and not cooperative_reduction
+        ):
+            try:
+                device = V.graph.get_current_device_or_throw()
+                if device.type == "cuda":
+                    props = DeviceProperties.create(device)
+                    if props.major is not None and props.major >= 10:
+                        # Blackwell: raise threshold to cover BN-training patterns
+                        # (rnumel up to ~8192 for common image BN: 128*8*8, 64*7*7)
+                        # Cap at 16384 to avoid Triton compilation failures with
+                        # very large persistent blocks (R0_BLOCK=32768+ can fail)
+                        threshold = max(threshold, 16384)
+            except Exception:
+                pass
+
         # If multi_kernel is enabled, we do more aggressive persistent reduction.
         # This may result in some persistent reductions slower than the
         # corresponding non-persistent reductions. MultiKernel will do benchmarking
@@ -507,6 +530,26 @@ class InductorChoices:
             # we leak reduction autotune configs here, and will need to refactor to avoid this later
             if numel_hint >= 2 * num_sm:  # don't split if there are enough outputs
                 return 1
+            # Prefer cooperative reduction over split when the cooperative heuristic
+            # would trigger. Cooperative reductions keep the epilogue in the same
+            # kernel (second pass over cached data), avoiding a separate pointwise
+            # kernel that re-reads all inputs. Split reductions produce separate
+            # partial-reduce + finalize + epilogue kernels, losing this fusion.
+            # E.g., BN-backward with xhint=48, rnumel=131072: cooperative fuses
+            # the gradient computation with the channel sum, while split creates
+            # 3 separate kernels.
+            if config.triton.cooperative_reductions and device.type != "cpu":
+                cooperative_would_trigger = False
+                if numel_hint <= 8:
+                    cooperative_would_trigger = (
+                        reduction_numel_hint >= 32768 * numel_hint
+                    )
+                elif numel_hint <= 16:
+                    cooperative_would_trigger = reduction_numel_hint >= 2097152
+                elif numel_hint <= 64:
+                    cooperative_would_trigger = reduction_numel_hint >= 65536
+                if cooperative_would_trigger:
+                    return 1
             # based on sum(x[N]) on GB200, split reduction provides higher performance when N >= 1M
             # TODO: test more hardwares
             no_split_threshold = (
@@ -541,9 +584,12 @@ class InductorChoices:
             # translate directly to more concurrent memory requests. For scalar
             # reductions (numel_hint=1), the standard heuristic and B200-calibrated
             # thresholds remain appropriate.
+            # Only apply when GPU is truly undersaturated (< 50% SM utilization).
+            # With numel_hint near num_sm (e.g., 128 on 148 SMs = 86%), the extra
+            # finalization kernel overhead from split outweighs the parallelism gain.
             if (
                 config.split_reductions_for_undersaturated_gpu
-                and 8 <= numel_hint < num_sm
+                and 8 <= numel_hint < num_sm // 2
             ):
                 # Minimum work per CTA: 4 elements/thread * num_threads (= 1024 on B200)
                 # This matches oracle patterns that use BLOCK_K=1024

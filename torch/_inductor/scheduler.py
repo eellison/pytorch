@@ -4522,9 +4522,14 @@ class Scheduler:
                         name_to_users[buf1_name] = name_to_users[buf2_name]
 
         # pyrefly: ignore [not-a-type]
-        def rename(n: str) -> str:
+        def rename(n: str, _seen: set[str] | None = None) -> str:
             if n in self.mutation_renames:
-                return rename(self.mutation_renames[n])
+                if _seen is None:
+                    _seen = set()
+                if n in _seen:
+                    return n  # break cycle
+                _seen.add(n)
+                return rename(self.mutation_renames[n], _seen)
             return n
 
         def add_user(
