@@ -4119,6 +4119,9 @@ class Scheduler:
         if config._pre_fusion_custom_pass is not None:
             self.nodes = config._pre_fusion_custom_pass(self.nodes)
 
+        if config.split_reductions_for_fusion:
+            self.nodes = self.split_reductions_for_fusion(self.nodes)
+
         if config.distributed_max_autotune_gemm:
             from . import distributed_autotune
 
@@ -4980,6 +4983,379 @@ class Scheduler:
                 # There is still an issue due to different snode in a
                 # FusedSchedulerNode having different merged loops.
                 # Skip CPU backend for now.
+
+    # Associative reduction ops that can be safely split into partial + final
+    _SPLITTABLE_REDUCTION_OPS = frozenset({"any", "sum", "prod", "amax", "amin"})
+
+    def split_reductions_for_fusion(
+        self, nodes: list[BaseSchedulerNode]
+    ) -> list[BaseSchedulerNode]:
+        """
+        Split flat/full reductions for fusion opportunity.
+
+        When a flat reduction (reducing all dims to scalar) has an input produced
+        by a row-wise kernel, split it into a partial reduction (matching the
+        producer's iteration shape) + a final reduction over the partial result.
+        This enables the partial reduction to fuse into the producer kernel.
+
+        Example:
+          - Kernel 1: layernorm over [512, 768] (per-row persistent reduction)
+          - Kernel 2: any(isfinite(output)) over all 393K elements -> scalar bool
+          - After split: any(any(isfinite(output), dim=-1)) -- the per-row any
+            fuses into Kernel 1, leaving only a trivial scalar reduction over 512 bools
+        """
+        new_nodes: list[BaseSchedulerNode] = []
+        split_count = 0
+
+        for node in nodes:
+            if not self._is_splittable_flat_reduction(node):
+                new_nodes.append(node)
+                continue
+
+            split_result = self._try_split_reduction_for_fusion(node, nodes)
+            if split_result is not None:
+                partial_node, final_node = split_result
+                new_nodes.append(partial_node)
+                new_nodes.append(final_node)
+                split_count += 1
+                fusion_log.debug(
+                    "split_reductions_for_fusion: split %s into %s + %s",
+                    node.get_name(),
+                    partial_node.get_name(),
+                    final_node.get_name(),
+                )
+            else:
+                new_nodes.append(node)
+
+        if split_count > 0:
+            counters["inductor"]["split_reductions_for_fusion"] += split_count
+            # Recompute dependencies and topology after graph modification
+            self.nodes = new_nodes
+            self.name_to_node = {n.get_name(): n for n in self.nodes}
+            self.name_to_fused_node = self.name_to_node.copy()
+            self.name_to_buf = {
+                buf.get_name(): buf
+                for node in self.nodes
+                for buf in node.get_outputs()
+            }
+            self.compute_dependencies()
+            self.nodes = self.topological_sort_schedule(self.nodes)
+            self.dead_node_elimination()
+            self.name_to_fused_node = {n.get_name(): n for n in self.nodes}
+            self.compute_ancestors()
+            self.compute_input_distances()
+            new_nodes = list(self.nodes)
+
+        return new_nodes
+
+    def _is_splittable_flat_reduction(self, node: BaseSchedulerNode) -> bool:
+        """Check if a node is a flat/full reduction that can potentially be split."""
+        if not isinstance(node, SchedulerNode):
+            return False
+        if not node.is_reduction():
+            return False
+        if not isinstance(node.node, ir.ComputedBuffer):
+            return False
+        data = node.node.data
+        if not isinstance(data, ir.Reduction):
+            return False
+
+        # Must be a splittable (associative) reduction type
+        if data.reduction_type not in self._SPLITTABLE_REDUCTION_OPS:
+            return False
+
+        # Must be a "flat" reduction: ranges are empty or all 1s (scalar output)
+        ranges = data.ranges
+        if ranges and sympy_product(ranges) != 1:
+            return False
+
+        # Must have a non-trivial reduction (at least 2 dimensions worth)
+        reduction_ranges = data.reduction_ranges
+        non_unit = [r for r in reduction_ranges if r != 1]
+        if len(non_unit) < 2:
+            return False
+
+        return True
+
+    def _try_split_reduction_for_fusion(
+        self, node: SchedulerNode, all_nodes: list[BaseSchedulerNode]
+    ) -> tuple[SchedulerNode, SchedulerNode] | None:
+        """
+        Try to split a flat reduction to enable fusion with its producer.
+
+        Returns (partial_node, final_node) if split is profitable, else None.
+        """
+        assert isinstance(node.node, ir.ComputedBuffer)
+        data = node.node.data
+        assert isinstance(data, ir.Reduction)
+
+        # Find the producer buffer(s) this reduction reads from
+        read_names = [dep.name for dep in node.read_writes.reads]
+        if not read_names:
+            return None
+
+        # Find the producer's iteration shape
+        producer_ranges = self._get_producer_iteration_ranges(read_names, all_nodes)
+        if producer_ranges is None:
+            return None
+
+        # producer_ranges is the iteration shape of the producer kernel
+        # e.g., [512, 768] for a row-wise pointwise/reduction epilogue
+        # We want to split our flat reduction into:
+        #   partial: ranges=producer_ranges[:-1], reduction_ranges=[producer_ranges[-1]]
+        #   final: ranges=[], reduction_ranges=producer_ranges[:-1]
+        # Actually, we want the partial to MATCH the producer's iteration shape
+        # so: partial ranges = producer_ranges[:-1], reduce over last dim
+        # But the most natural split for fusion is:
+        #   partial: ranges = all-but-last of reduction_ranges, reduce over last dim
+        # where "all-but-last" matches the producer's outer iteration dims
+
+        # The reduction_ranges of the flat reduction represents the full tensor shape
+        # We split it so that the partial reduction's (ranges, reduction_ranges) together
+        # match the producer's full iteration shape.
+        # For a producer with iteration [512, 768]:
+        #   partial: ranges=[512], reduction_ranges=[768]
+        #   final: ranges=[], reduction_ranges=[512]
+
+        reduction_ranges = list(data.reduction_ranges)
+        # Remove leading 1s from reduction_ranges to get the effective shape
+        effective_reduction = [r for r in reduction_ranges if r != 1]
+        if len(effective_reduction) < 2:
+            return None
+
+        # Check if the effective reduction matches the producer iteration
+        # The producer_ranges should be a prefix/suffix of effective_reduction
+        # or the product should match
+        partial_iter_ranges, partial_red_ranges = self._compute_split_shapes(
+            reduction_ranges, producer_ranges
+        )
+        if partial_iter_ranges is None:
+            return None
+
+        # Check minimum size threshold: only split if total elements >= 4096
+        total_numel = sympy_product(reduction_ranges)
+        if isinstance(total_numel, sympy.Integer) and int(total_numel) < 4096:
+            return None
+
+        # Create the split at IR level
+        return self._create_split_reduction_nodes(
+            node, partial_iter_ranges, partial_red_ranges, data
+        )
+
+    def _get_producer_iteration_ranges(
+        self, read_names: list[str], all_nodes: list[BaseSchedulerNode]
+    ) -> list[sympy.Expr] | None:
+        """
+        Get the iteration ranges of the producer node(s).
+        Returns the producer's iteration shape if it has a compatible row-wise shape.
+        """
+        for buf_name in read_names:
+            # Use the scheduler's name_to_buf to find the defining op
+            sched_buf = self.name_to_buf.get(buf_name)
+            if sched_buf is None:
+                continue
+            producer_snode = sched_buf.defining_op
+            if producer_snode is None:
+                continue
+            if not isinstance(producer_snode, SchedulerNode):
+                continue
+
+            # Only consider pointwise producers (not reductions)
+            # A pointwise producer with ranges=[512, 768] is the ideal fusion target
+            if producer_snode.is_reduction():
+                # For reduction producers, the iteration shape is ranges
+                # but fusion would need the reduction to have completed
+                # Skip for now - only fuse with pointwise
+                continue
+
+            # Get producer's ranges (iteration shape)
+            producer_sizes = producer_snode.get_ranges()
+            if not producer_sizes:
+                continue
+
+            # producer_sizes is a tuple of (iter_ranges, reduce_ranges)
+            iter_ranges = producer_sizes[0]
+            if not iter_ranges:
+                continue
+
+            # Must have at least 2 effective dimensions (to split into row + col)
+            effective_iter = [r for r in iter_ranges if r != 1]
+            if len(effective_iter) >= 2:
+                return list(iter_ranges)
+
+        return None
+
+    def _compute_split_shapes(
+        self,
+        reduction_ranges: list[sympy.Expr],
+        producer_ranges: list[sympy.Expr],
+    ) -> tuple[list[sympy.Expr] | None, list[sympy.Expr] | None]:
+        """
+        Compute the split shapes: (partial_iter_ranges, partial_reduction_ranges).
+
+        The partial reduction should have:
+        - iter_ranges: the leading dims of reduction_ranges (matching producer's outer dims)
+        - reduction_ranges: the trailing dim (matching producer's inner/last dim)
+
+        Together, partial_iter + partial_red reconstructs the original flat reduction domain.
+        For fusion, the partial's (iter, red) shape must be compatible with the producer.
+
+        Example: reduction_ranges=[1, 512, 768], producer_ranges=[512, 768]
+          -> partial_iter=[1, 512], partial_red=[768]
+          -> The partial is a per-row reduction fusable with the [512, 768] pointwise producer.
+        """
+        # Must have at least 2 effective (non-unit) dimensions to split
+        effective_red = [(i, r) for i, r in enumerate(reduction_ranges) if r != 1]
+        if len(effective_red) < 2:
+            return None, None
+
+        effective_producer = [r for r in producer_ranges if r != 1]
+        if not effective_producer:
+            return None, None
+
+        # Split at the last dimension boundary:
+        # partial_iter = reduction_ranges[:-1], partial_red = [reduction_ranges[-1]]
+        partial_iter = list(reduction_ranges[:-1])
+        partial_red = [reduction_ranges[-1]]
+
+        # Validate: total elements must match between the split and producer
+        partial_total = sympy_product(partial_iter) * sympy_product(partial_red)
+        producer_total = sympy_product(producer_ranges)
+
+        sizevars = V.graph.sizevars
+        if not sizevars.statically_known_equals(partial_total, producer_total):
+            return None, None
+
+        # Validate: the reduction dimension must match producer's last dim
+        # (this ensures the partial reduction iterates in the same pattern as producer)
+        if not sizevars.statically_known_equals(partial_red[0], producer_ranges[-1]):
+            return None, None
+
+        return partial_iter, partial_red
+
+    def _create_split_reduction_nodes(
+        self,
+        orig_node: SchedulerNode,
+        partial_iter_ranges: list[sympy.Expr],
+        partial_red_ranges: list[sympy.Expr],
+        orig_data: ir.Reduction,
+    ) -> tuple[SchedulerNode, SchedulerNode] | None:
+        """
+        Create the partial and final reduction IR nodes and scheduler nodes.
+
+        Splits the original flat reduction into:
+        1. A partial reduction: iterates over partial_iter_ranges, reduces over
+           partial_red_ranges (matching the producer's iteration domain)
+        2. A final reduction: iterates over [] (scalar), reduces over
+           partial_iter_ranges (the output of the partial)
+        """
+        device = orig_data.device
+        dtype = orig_data.dtype
+        src_dtype = orig_data.src_dtype
+        reduction_type = orig_data.reduction_type
+        inner_fn = orig_data.inner_fn
+
+        # --- Create partial reduction ---
+        # The original inner_fn takes (index=[], rindex=[r0, r1, ...r_n])
+        # where rindex covers the full reduction_ranges.
+        # The partial's inner_fn takes (index=[i0, ...i_k], rindex=[r0, ...r_m])
+        # where [i0...i_k, r0...r_m] = original reduction_ranges
+
+        def partial_inner_fn(index, rindex):
+            # Combine index and rindex to form the original full reduction index
+            full_rindex = list(index) + list(rindex)
+            return inner_fn([], full_rindex)
+
+        # For intermediate dtype: keep the same dtype for bool reductions (any/all)
+        # For numeric types, use fp32 for fp16/bf16 intermediates
+        if dtype in (torch.float16, torch.bfloat16):
+            intermediate_dtype = torch.float32
+        else:
+            intermediate_dtype = dtype
+
+        # Create the partial reduction ComputedBuffer
+        partial_layout = ir.FixedLayout(
+            device=device,
+            dtype=intermediate_dtype,
+            size=partial_iter_ranges,
+        )
+
+        partial_data = ir.Reduction(
+            device=device,
+            dtype=intermediate_dtype,
+            inner_fn=partial_inner_fn,
+            ranges=partial_iter_ranges,
+            reduction_ranges=partial_red_ranges,
+            reduction_type=reduction_type,
+            src_dtype=src_dtype,
+            reduction_hint=ReductionHint.INNER,
+        )
+
+        partial_buffer = ir.ComputedBuffer(
+            name=None,
+            layout=partial_layout,
+            data=partial_data,
+        )
+        # Register the buffer in the graph (assigns name)
+        partial_buffer.name = V.graph.register_buffer(partial_buffer)
+        V.graph.register_operation(partial_buffer)
+        partial_buffer.origins = orig_node.node.origins
+        partial_buffer.traceback = getattr(orig_node.node, 'traceback', None)
+        partial_buffer.stream_idx = getattr(orig_data, 'stream_idx', None)
+
+        partial_buf_name = partial_buffer.name
+
+        # --- Create final reduction ---
+        # Reads from the partial buffer and reduces to scalar
+        final_iter_ranges = list(orig_data.ranges)  # [] (scalar output)
+        final_red_ranges = list(partial_iter_ranges)  # reduce over the partial's output dims
+
+        # The final inner_fn loads from the partial buffer
+        # partial buffer indexer: maps rindex -> flat index
+        partial_indexer = partial_layout.make_indexer()
+
+        def final_inner_fn(index, rindex):
+            # rindex covers partial_iter_ranges (the shape of the partial output)
+            return ir.ops.load(partial_buf_name, partial_indexer(rindex))
+
+        # Replace the original buffer entry in the graph
+        orig_buf_name = orig_node.node.name
+
+        final_layout = ir.FixedLayout(
+            device=device,
+            dtype=dtype,
+            size=final_iter_ranges,  # [] for scalar
+        )
+
+        final_data = ir.Reduction(
+            device=device,
+            dtype=dtype,
+            inner_fn=final_inner_fn,
+            ranges=final_iter_ranges,
+            reduction_ranges=final_red_ranges,
+            reduction_type=reduction_type,
+            src_dtype=intermediate_dtype,
+            reduction_hint=ReductionHint.INNER,
+        )
+
+        final_buffer = ir.ComputedBuffer(
+            name=orig_buf_name,
+            layout=final_layout,
+            data=final_data,
+        )
+        # Replace in graph's buffer registry
+        V.graph.name_to_buffer[orig_buf_name] = final_buffer
+        # Don't re-register operation -- keep the original operation_name
+        final_buffer.operation_name = orig_node.node.operation_name
+        final_buffer.origins = orig_node.node.origins
+        final_buffer.traceback = getattr(orig_node.node, 'traceback', None)
+        final_buffer.stream_idx = getattr(orig_data, 'stream_idx', None)
+
+        # --- Create scheduler nodes ---
+        partial_snode = SchedulerNode(self, partial_buffer)
+        final_snode = SchedulerNode(self, final_buffer)
+
+        return partial_snode, final_snode
 
     def fuse_nodes(self, nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
         """

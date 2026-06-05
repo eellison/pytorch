@@ -555,6 +555,13 @@ def post_grad_passes(gm: torch.fx.GraphModule, is_inference: bool):
         _narrow_sort_to_int32
     )
 
+    if config.index_through_norm:
+        from .index_through_norm import index_through_norm_pass
+
+        GraphTransformObserver(gm, "index_through_norm").apply_graph_pass(
+            index_through_norm_pass
+        )
+
     if config.pattern_matcher:
         lazy_init()
         GraphTransformObserver(gm, "post_grad_custom_pre_pass").apply_graph_pass(

@@ -4537,10 +4537,123 @@ def index_impl_helper(x, indices, check, wrap_neg=True):
     return output_size, inner_fn, index_inner_fn
 
 
+def _can_elide_index_bounds_check(x, indices):
+    """
+    Check if all index tensors are graph constants with values provably in [0, dim_size).
+    If so, runtime bounds checks (tl.device_assert) can be safely elided.
+
+    Returns True only when config.elide_constant_index_asserts is enabled and
+    every non-None index tensor traces back to a constant whose values are
+    all non-negative and strictly less than the corresponding dimension size.
+    """
+    if not config.elide_constant_index_asserts:
+        return False
+
+    current_node = V.graph.current_node
+    if current_node is None:
+        return False
+
+    # Get the FX node args for the indices (second argument to aten.index.Tensor)
+    try:
+        fx_indices = current_node.args[1]
+    except (IndexError, AttributeError):
+        return False
+
+    if not isinstance(fx_indices, (list, tuple)):
+        return False
+
+    x_size = x.get_size()
+
+    dim_idx = 0
+    for fx_node in fx_indices:
+        if fx_node is None:
+            dim_idx += 1
+            continue
+
+        if dim_idx >= len(x_size):
+            return False
+
+        # Determine the dimension size for this index position
+        dim_size = x_size[dim_idx]
+        dim_idx += 1
+
+        # Try to get a concrete int for dim_size
+        try:
+            dim_size_int = int(dim_size)
+        except (TypeError, ValueError):
+            # Symbolic dimension size - cannot prove bounds statically
+            return False
+
+        # Trace through the FX node to find the underlying constant tensor
+        const_tensor = _get_constant_tensor_from_fx_node(fx_node)
+        if const_tensor is None:
+            return False
+
+        # Check that all values are in [0, dim_size)
+        if const_tensor.numel() == 0:
+            continue
+
+        # Use min/max for efficient bounds checking
+        min_val = const_tensor.min().item()
+        max_val = const_tensor.max().item()
+        if min_val < 0 or max_val >= dim_size_int:
+            return False
+
+    return True
+
+
+def _get_constant_tensor_from_fx_node(fx_node):
+    """
+    Given an FX node, try to retrieve the underlying constant tensor value.
+    Handles:
+    - get_attr nodes: frozen parameters/buffers stored on the graph module
+    - placeholder nodes: checks if the name is in V.graph.constants
+    - Traces through value-preserving ops like lift_fresh_copy and clone.
+    Returns the tensor if found, None otherwise.
+    """
+    if not isinstance(fx_node, torch.fx.Node):
+        return None
+
+    # Direct get_attr node - constant tensor stored on the module (frozen params/buffers)
+    if fx_node.op == "get_attr":
+        # First check V.graph.constants (most common for frozen params)
+        target = fx_node.target
+        if target in V.graph.constants:
+            return V.graph.constants[target]
+        # Fall back to getattr on the module
+        try:
+            from .graph import getattr_recursive
+            value = getattr_recursive(V.graph.module, target)
+            if isinstance(value, torch.Tensor):
+                return value
+        except (AttributeError, RuntimeError):
+            pass
+        return None
+
+    # Placeholder node - check if it corresponds to a constant in V.graph.constants
+    if fx_node.op == "placeholder":
+        name = fx_node.name
+        if name in V.graph.constants:
+            return V.graph.constants[name]
+        return None
+
+    # Trace through value-preserving ops: lift_fresh_copy, clone
+    if fx_node.op == "call_function":
+        _VALUE_PRESERVING_OPS = (
+            torch.ops.aten.lift_fresh_copy.default,
+            torch.ops.aten.clone.default,
+        )
+        if fx_node.target in _VALUE_PRESERVING_OPS and len(fx_node.args) >= 1:
+            return _get_constant_tensor_from_fx_node(fx_node.args[0])
+
+    return None
+
+
 @register_lowering(aten.index, type_promotion_kind=None)
 def index(x, indices):
     try:
-        return index_impl(x, indices, check=True)
+        check_bounds = not _can_elide_index_bounds_check(x, indices)
+        return index_impl(x, indices, check=check_bounds)
     except NotImplementedError:
         # Fallback to ATen for boolean indexing
         x.realize()

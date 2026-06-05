@@ -76,11 +76,63 @@ class BoundVars:
             ):
                 self._bounds[node] = ValueRanges[Expr].unknown()
 
+        # Override with tight bounds for loads from constant buffers whose
+        # values are known at compile time. This allows device_assert elision
+        # for constant index tensors with provably in-bounds values.
+        if V.graph and hasattr(V.graph, "constants"):
+            self._set_constant_load_bounds()
+
         with V.set_ops_handler(ValueRangeAnalysis()):
             interpreter = InterpreterShim(self.loop_body.root_block.graph, submodules)
             log.debug("get_bounds:\n%s", self.loop_body.root_block.graph)
             interpreter.run(V.get_ops_handler(), initial_env=self._bounds)
         return self._bounds
+
+    def _set_constant_load_bounds(self) -> None:
+        """
+        For load nodes that read from constant buffers (e.g., frozen parameters
+        or graph constants), compute tight value ranges based on the actual tensor
+        data. This enables automatic elision of device_assert bounds checks when
+        constant index tensors have provably in-bounds values.
+        """
+        from . import config
+
+        if not config.elide_constant_index_asserts:
+            return
+
+        constants = V.graph.constants
+        if not constants:
+            return
+
+        for node in self.unbounded_vars:
+            if not isinstance(node.target, str) or node.target != "load":
+                continue
+            # Load node args: (ops, buffer_name, index_expr)
+            if len(node.args) < 2:
+                continue
+            buffer_name = node.args[1]
+            if not isinstance(buffer_name, str):
+                continue
+            if buffer_name not in constants:
+                continue
+
+            tensor_data = constants[buffer_name]
+            if not isinstance(tensor_data, torch.Tensor):
+                continue
+            if tensor_data.numel() == 0:
+                continue
+            # Only compute bounds for integer tensors (index tensors)
+            if not tensor_data.dtype.is_floating_point and tensor_data.dtype != torch.bool:
+                try:
+                    min_val = int(tensor_data.min().item())
+                    max_val = int(tensor_data.max().item())
+                    self._bounds[node] = ValueRanges[Expr](min_val, max_val)
+                    log.debug(
+                        "Set constant load bounds for %s: [%d, %d]",
+                        buffer_name, min_val, max_val,
+                    )
+                except (RuntimeError, OverflowError):
+                    pass
 
     def swap_submodules(
         self, submodules: dict[str, Callable[..., Any]]

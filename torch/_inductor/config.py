@@ -1008,6 +1008,12 @@ split_reductions = os.getenv("TORCHINDUCTOR_SPLIT_REDUCTIONS", "1") == "1"
 # PROTOTYPE: Force OUTER reductions to use INNER splitting to enable sibling fusion
 _sibling_reduction_fusion = False
 
+# Split flat/full reductions for fusion: when a flat reduction (reducing all dims to scalar)
+# has an input produced by a row-wise kernel, the scheduler splits it into a partial reduction
+# (matching the producer's iteration shape) + a final reduction over the partial result.
+# This enables the partial reduction to fuse into the producer kernel.
+split_reductions_for_fusion = True
+
 # A deterministic mode that skips any on device benchmarking in Inductor
 # if we know they affect numerics.  WARNING: Expect perf hit in this mode.
 deterministic = os.getenv("TORCHINDUCTOR_DETERMINISTIC") == "1"
@@ -1032,6 +1038,11 @@ always_keep_tensor_constants = False
 
 # assert that indirect indexing does not read / write out of bounds
 assert_indirect_indexing = True
+
+# When True, elide tl.device_assert bounds checks for index tensors that are
+# graph constants with provably in-bounds values (all values in [0, dim_size)).
+# This is safe because constant values cannot change at runtime.
+elide_constant_index_asserts = True
 
 # skip emitting runtime assertions for unbacked symbols in generated code
 do_not_emit_runtime_assertions = False
@@ -1220,6 +1231,13 @@ as_strided_scatter_elision = (
 # Currently handles the "channel shuffle" pattern from ShuffleNet.
 layout_transform_store_sinking = (
     os.environ.get("TORCHINDUCTOR_LAYOUT_TRANSFORM_STORE_SINKING", "1") == "1"
+)
+
+# Index-through-norm: pushes select/index backward through LayerNorm chains
+# when the selected dimension is not a normalization dimension, narrowing the
+# iteration domain for the norm computation.
+index_through_norm = (
+    os.environ.get("TORCHINDUCTOR_INDEX_THROUGH_NORM", "1") == "1"
 )
 
 
