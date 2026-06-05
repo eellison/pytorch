@@ -401,6 +401,14 @@ class InductorChoices:
             threshold = 32768 * xhint
         elif xhint <= 16:
             threshold = 2097152
+        elif xhint <= 64:
+            # For moderate xhint (17-64), cooperative reductions help when
+            # the GPU would otherwise be severely underutilized. E.g., xhint=40
+            # on 148 SMs means only 40 CTAs without cooperation. With RSPLIT,
+            # we can achieve xhint * RSPLIT CTAs (bounded by SM count).
+            # Use a higher threshold since the benefit is smaller with
+            # limited RSPLIT headroom.
+            threshold = 65536
         else:
             return False
         # TODO(jansel): should this default on for dynamic shapes?
@@ -584,31 +592,50 @@ class InductorChoices:
         if shared_data_score == 0 and (
             not config.aggressive_fusion or node1.is_reduction() or node2.is_reduction()
         ):
-            if is_metric_table_enabled("fusion_failure_due_to_indexing_mismatch"):
-                common_buf_names: OrderedSet[str] = (
-                    node1.read_writes.buffer_names() & node2.read_writes.buffer_names()
+            # Allow sibling reductions that share buffer names (e.g., reading
+            # different slices of the same tensor) to be fused horizontally.
+            # This enables multi-accumulator reduction kernels where independent
+            # reductions over the same iteration space are computed in one pass.
+            _is_sibling_reduction_with_shared_bufs = (
+                node1.is_reduction()
+                and node2.is_reduction()
+                and node1.group == node2.group
+                and (
+                    node1.read_writes.buffer_names()
+                    & node2.read_writes.buffer_names()
                 )
-                if len(common_buf_names) > 0:
-                    get_metric_table("fusion_failure_due_to_indexing_mismatch").add_row(
-                        # pyrefly: ignore [bad-argument-type]
-                        lambda: {
-                            "pre_grad_graph_id": V.graph.graph_id,
-                            "post_grad_graph_id": V.graph.post_grad_graph_id,
-                            "node1_name": node1.get_name(),
-                            "node2_name": node2.get_name(),
-                            "node1_debug_str": write_text(node1.debug_str()),
-                            "node2_debug_str": write_text(node2.debug_str()),
-                            "common_buffer_names": list(common_buf_names),  # type: ignore[dict-item]
-                            "failure_reason": scheduler.decide_fusion_fail_reason(
-                                node1, node2, common_buf_names
-                            ),
-                        }
+            )
+            if not _is_sibling_reduction_with_shared_bufs:
+                if is_metric_table_enabled("fusion_failure_due_to_indexing_mismatch"):
+                    common_buf_names: OrderedSet[str] = (
+                        node1.read_writes.buffer_names()
+                        & node2.read_writes.buffer_names()
                     )
+                    if len(common_buf_names) > 0:
+                        get_metric_table(
+                            "fusion_failure_due_to_indexing_mismatch"
+                        ).add_row(
+                            # pyrefly: ignore [bad-argument-type]
+                            lambda: {
+                                "pre_grad_graph_id": V.graph.graph_id,
+                                "post_grad_graph_id": V.graph.post_grad_graph_id,
+                                "node1_name": node1.get_name(),
+                                "node2_name": node2.get_name(),
+                                "node1_debug_str": write_text(node1.debug_str()),
+                                "node2_debug_str": write_text(node2.debug_str()),
+                                "common_buffer_names": list(common_buf_names),  # type: ignore[dict-item]
+                                "failure_reason": scheduler.decide_fusion_fail_reason(
+                                    node1, node2, common_buf_names
+                                ),
+                            }
+                        )
 
-                    WhyNoFuse(node1, node2)("no shared data due to indexing mismatch")
-                    return False
-            WhyNoFuse(node1, node2)("no shared data")
-            return False  # heuristic not needed for correctness
+                        WhyNoFuse(node1, node2)(
+                            "no shared data due to indexing mismatch"
+                        )
+                        return False
+                WhyNoFuse(node1, node2)("no shared data")
+                return False  # heuristic not needed for correctness
 
         if (
             not node1.is_foreach()
@@ -656,6 +683,18 @@ class InductorChoices:
         if MixOrderReduction.can_fuse(node1, node2):
             # For mix order reduction, we disregard shared data or
             # distance.
+            return True
+        # Allow sibling reductions with shared buffer names to fuse even when
+        # shared_data_score is below threshold (index mismatch from slicing).
+        if (
+            node1.is_reduction()
+            and node2.is_reduction()
+            and node1.group == node2.group
+            and (
+                node1.read_writes.buffer_names()
+                & node2.read_writes.buffer_names()
+            )
+        ):
             return True
         if shared_data_score < config.score_fusion_memory_threshold:
             WhyNoFuse(node1, node2)("score_fusion_memory_threshold")
