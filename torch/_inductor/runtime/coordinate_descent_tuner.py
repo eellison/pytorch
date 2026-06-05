@@ -135,6 +135,17 @@ class CoordescTuner:
             out.append("num_stages")
             out.remove("ZBLOCK")  # ZBLOCK=1 always in native matmul
 
+        # For memory-bound pointwise kernels with many loads (>=4),
+        # tuning num_stages enables software pipelining which overlaps
+        # memory loads with computation.
+        if (
+            not self.is_mm
+            and not self.is_native_matmul
+            and "num_stages" not in out
+            and self.inductor_meta.get("num_load", 0) >= 4
+        ):
+            out.append("num_stages")
+
         if self.is_mix_order_reduction:
             # unlike TritonConfig.num_stages, this one is
             # put in TritonConfig.kwargs["NUM_STAGES"] and is used to
@@ -163,6 +174,8 @@ class CoordescTuner:
             return val > self.get_config_max(prefix)
         if name == "num_warps":
             return val > self.get_warpsmax()
+        if name == "num_stages":
+            return val > 5
         if name == "waves_per_eu":
             return val > 8
 
