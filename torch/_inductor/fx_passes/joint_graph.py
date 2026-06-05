@@ -333,6 +333,16 @@ class UniformValueConstantFolder(ConstantFolder):
         return True
 
     def add_node_replacement(self, node: torch.fx.Node, tensor: torch.Tensor) -> None:
+        # Only record replacement for uniform tensors (all elements equal).
+        # Non-uniform tensors are still kept in self.env for downstream folding
+        # but should NOT be replaced with aten.full (which assumes uniform value).
+        if tensor.numel() > 1:
+            flat = tensor.flatten()
+            if not torch.equal(flat, flat[0:1].expand_as(flat)):
+                # Non-uniform tensor: don't add to replacements, but the value
+                # is still stored in self.env by the caller (run_node) so
+                # downstream ops can use it for further constant folding.
+                return
         self.node_replacements[node] = tensor.flatten()[0].item()
         self.node_replacements_shapes[node] = node.meta["val"].shape
         self.constant_data_ptrs[node] = StorageWeakRef(tensor.untyped_storage())
@@ -392,12 +402,17 @@ class UniformValueConstantFolder(ConstantFolder):
             return super(ConstantFolder, self).run_node(node)
 
         # view ops, return input tensor, the first argument
+        # This pass-through only works when the input is a uniform size-1 substitute.
+        # If the input is a full (non-uniform) tensor from actual evaluation, we
+        # fall through to the fallback handler which runs the op correctly.
         if hasattr(node.target, "overloadpacket") and (
             node.target.overloadpacket in self.view_op_packets
             or node.target.overloadpacket in self.indexing_op_packets
         ):
             assert isinstance(node.args[0], torch.fx.Node)
-            return self.env[node.args[0]]
+            input_val = self.env[node.args[0]]
+            if isinstance(input_val, torch.Tensor) and input_val.numel() == 1:
+                return input_val
 
         # we don't want to return unknown value for symints so that we can
         # still constant fold through their use in constructors or views
@@ -422,6 +437,33 @@ class UniformValueConstantFolder(ConstantFolder):
             kwargs.pop("memory_format", None)
 
             return node.target(*args, **kwargs)
+
+        # Fallback: for data-independent ops producing small tensors (e.g.,
+        # prims.iota, aten.cat, aten.slice on known inputs), actually run
+        # the node. This enables folding chains like:
+        #   iota -> slice -> cat -> sub -> ne(1) -> constant False mask
+        # The result may be non-uniform; add_node_replacement will skip
+        # recording it if so, but env still holds the value for downstream ops.
+        if node.op == "call_function" and "val" in node.meta:
+            fake_val = node.meta["val"]
+            if isinstance(fake_val, torch.Tensor):
+                # Only fold small tensors to avoid excessive memory usage
+                max_elements = 8192
+                if fake_val.numel() <= max_elements:
+                    args, kwargs = self.fetch_args_kwargs_from_env(node)
+                    flattened_inputs = pytree.arg_tree_leaves(*args, **kwargs)
+                    # All inputs must be known (tensors or scalars, not unknown)
+                    if not any(
+                        type(self.unknown_value) is type(inp)
+                        and self.unknown_value == inp
+                        for inp in flattened_inputs
+                    ) and not any(
+                        isinstance(inp, torch.SymInt) for inp in flattened_inputs
+                    ):
+                        try:
+                            return super(ConstantFolder, self).run_node(node)
+                        except Exception:
+                            pass
 
         return self.unknown_value
 

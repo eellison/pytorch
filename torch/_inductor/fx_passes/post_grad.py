@@ -683,6 +683,13 @@ def post_grad_passes(gm: torch.fx.GraphModule, is_inference: bool):
 
     GraphTransformObserver(gm, "stable_sort").apply_graph_pass(stable_topological_sort)
 
+    # Replace aten.full nodes at graph output with pre-allocated constant tensors
+    # to avoid generating trivial Triton kernels for known constant outputs
+    # (e.g. all-False masks from constant-folded iota patterns).
+    GraphTransformObserver(
+        gm, "materialize_constant_full_outputs"
+    ).apply_gm_pass(materialize_constant_full_outputs)
+
     GraphTransformObserver(gm, "move_constructors_to_cuda").apply_graph_pass(
         move_constructors_to_gpu
     )
@@ -2579,6 +2586,66 @@ class ConstructorMoverPass:
             all_cannot_move_to_gpu.update(equal_constructor_sets[constructor])
 
         return OrderedSet(constructors) - all_cannot_move_to_gpu
+
+
+def materialize_constant_full_outputs(gm: fx.GraphModule) -> None:
+    """
+    Replace aten.full nodes with constant scalar args that are graph outputs
+    with pre-allocated constant tensors.  This avoids generating a trivial
+    Triton kernel just to fill a tensor with a known compile-time constant
+    (e.g. an all-False mask produced by constant folding).
+    """
+    from torch._inductor.constant_folding import replace_node_with_constant
+
+    graph = gm.graph
+    aten = torch.ops.aten
+
+    # Find the output node
+    output_node = next(
+        (n for n in graph.nodes if n.op == "output"), None
+    )
+    if output_node is None:
+        return
+
+    # Collect nodes directly used by the output
+    output_args = pytree.arg_tree_leaves(*output_node.args, **output_node.kwargs)
+    output_nodes = {n for n in output_args if isinstance(n, torch.fx.Node)}
+
+    nodes_to_replace: list[tuple[torch.fx.Node, torch.Tensor]] = []
+    for node in list(graph.nodes):
+        if (
+            node.op == "call_function"
+            and node.target is aten.full.default
+            and node in output_nodes
+            and "val" in node.meta
+        ):
+            fake_val = node.meta["val"]
+            if not isinstance(fake_val, torch.Tensor):
+                continue
+            # Only handle static, small shapes to avoid memory bloat
+            if not all(isinstance(s, int) for s in fake_val.shape):
+                continue
+            if fake_val.numel() > 8192:
+                continue
+            # Get the fill value (second positional arg of aten.full.default)
+            fill_value = node.args[1]
+            if not isinstance(fill_value, (bool, int, float)):
+                continue
+            constant = torch.full(
+                list(fake_val.shape),
+                fill_value,
+                dtype=fake_val.dtype,
+                device=fake_val.device,
+            )
+            nodes_to_replace.append((node, constant))
+
+    for node, constant in nodes_to_replace:
+        replace_node_with_constant(gm, node, constant)
+
+    if nodes_to_replace:
+        graph.eliminate_dead_code()
+        graph.lint()
+        gm.recompile()
 
 
 def move_constructors_to_gpu(graph: fx.Graph) -> None:
