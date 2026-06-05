@@ -5376,7 +5376,7 @@ class Scheduler:
         in the consumer's inner_fn with the producer's inner_fn evaluated at
         the coordinates corresponding to flat_idx.
         """
-        import sympy as _sympy
+        pass  # sympy already imported at module level
 
         inlined_count = 0
         nodes_to_remove: OrderedSet[str] = OrderedSet()
@@ -5439,6 +5439,14 @@ class Scheduler:
 
         if inlined_count > 0:
             counters["inductor"]["inline_recomputable_producers"] = inlined_count
+            # Collect buffer names from removed producers and mark them as
+            # "available" so that dependency pruning doesn't choke on stale refs
+            for node_name in nodes_to_remove:
+                removed_node = self.name_to_node.get(node_name)
+                if removed_node is not None:
+                    for buf in removed_node.get_outputs():
+                        self.available_buffer_names.add(buf.get_name())
+
             new_nodes = [n for n in nodes if n.get_name() not in nodes_to_remove]
             self.nodes = new_nodes
             self.name_to_node = {n.get_name(): n for n in self.nodes}
@@ -5473,7 +5481,7 @@ class Scheduler:
           than the output (per-channel params vs full-tensor output)
         - Producer has no other consumers (otherwise buffer can't be eliminated)
         """
-        import sympy as _sympy
+        pass  # sympy already imported at module level
 
         if not isinstance(producer_node.node, ir.ComputedBuffer):
             return False
@@ -5482,8 +5490,8 @@ class Scheduler:
             return False
 
         # Check broadcast-dominated
-        producer_output_numel = V.graph.sizevars.size_hint(
-            _sympy.prod(producer_data.get_size())  # type: ignore[arg-type]
+        producer_output_numel = V.graph.sizevars.optimization_hint(
+            sympy_product(producer_data.get_size())
         )
         if producer_output_numel == 0:
             return False
@@ -5524,13 +5532,13 @@ class Scheduler:
         producer_buf_name: str,
     ) -> bool:
         """Check if inlining saves more memory than it costs in recomputation."""
-        import sympy as _sympy
+        pass  # sympy already imported at module level
 
         producer_data = producer_node.node.data
         assert isinstance(producer_data, ir.Pointwise)
 
-        producer_output_numel = V.graph.sizevars.size_hint(
-            _sympy.prod(producer_data.get_size())  # type: ignore[arg-type]
+        producer_output_numel = V.graph.sizevars.optimization_hint(
+            sympy_product(producer_data.get_size())
         )
         dtype_size = 4  # f32
         memory_saved_bytes = producer_output_numel * dtype_size * 2  # write + read back
@@ -5546,8 +5554,8 @@ class Scheduler:
         )
 
         consumer_data = consumer_node.node.data
-        consumer_output_numel = V.graph.sizevars.size_hint(
-            _sympy.prod(consumer_data.get_size())  # type: ignore[arg-type]
+        consumer_output_numel = V.graph.sizevars.optimization_hint(
+            sympy_product(consumer_data.get_size())
         )
 
         # Total recompute cost
@@ -5564,8 +5572,6 @@ class Scheduler:
         producer_buf_name: str,
     ) -> bool:
         """Rewrite consumer's inner_fn to inline the producer's computation."""
-        import sympy
-
         from torch.utils._sympy.functions import FloorDiv, ModularIndexing
 
         producer_data = producer_cb.data
@@ -5581,12 +5587,12 @@ class Scheduler:
 
         try:
             producer_sizes = [
-                int(V.graph.sizevars.size_hint(s)) for s in producer_layout.size
+                int(V.graph.sizevars.optimization_hint(s)) for s in producer_layout.size
             ]
             producer_strides = [
-                int(V.graph.sizevars.size_hint(s)) for s in producer_layout.stride
+                int(V.graph.sizevars.optimization_hint(s)) for s in producer_layout.stride
             ]
-            producer_offset = int(V.graph.sizevars.size_hint(producer_layout.offset))
+            producer_offset = int(V.graph.sizevars.optimization_hint(producer_layout.offset))
         except Exception:
             return False
 
@@ -5628,40 +5634,59 @@ class Scheduler:
         old_inner_fn = consumer_data.inner_fn
 
         def make_new_inner_fn(old_fn, prod_buf_name, prod_fn, inv_indexer):
-            """Create a new inner_fn that inlines the producer."""
-            def new_inner_fn(index, *extra_args):
-                from torch._inductor.virtualized import ops as _ops
+            """Create a new inner_fn that inlines the producer.
 
-                handler = _ops._get_handler()
-                original_load = handler.load
+            Uses a WrapperHandler to intercept loads from the producer buffer
+            and redirect them to the producer's inner_fn. This works correctly
+            in all ops handler contexts (dependency extraction, codegen, etc.)
+            """
+            from torch._inductor.ops_handler import WrapperHandler
+            from torch._inductor.virtualized import OpsValue
 
-                def patched_load(name, idx, *args, **kwargs):
+            class InlineProducerHandler(WrapperHandler):
+                def load(self, name, index, *args, **kwargs):
                     if name == prod_buf_name:
-                        coords = inv_indexer(idx)
-                        return prod_fn(coords)
-                    return original_load(name, idx, *args, **kwargs)
+                        coords = inv_indexer(index)
+                        result = prod_fn(coords)
+                        # prod_fn returns through the OpsWrapper layer which
+                        # wraps in OpsValue. We must unwrap since we're inside
+                        # the handler chain (OpsWrapper will re-wrap our return).
+                        if isinstance(result, OpsValue):
+                            return result.value
+                        return result
+                    return self._inner.load(name, index, *args, **kwargs)
 
-                handler.load = patched_load
-                try:
+            def new_inner_fn(index, *extra_args):
+                from torch._inductor.virtualized import V as _V
+
+                current_handler = _V.get_ops_handler()
+                wrapper = InlineProducerHandler(current_handler)
+                with _V.set_ops_handler(wrapper):
                     if extra_args:
                         return old_fn(index, *extra_args)
                     else:
                         return old_fn(index)
-                finally:
-                    handler.load = original_load
 
             return new_inner_fn
 
-        consumer_data.inner_fn = make_new_inner_fn(
+        new_fn = make_new_inner_fn(
             old_inner_fn, producer_buf_name, producer_inner_fn, inverse_indexer
         )
+        # Frozen dataclass: use object.__setattr__ to bypass
+        object.__setattr__(consumer_data, "inner_fn", new_fn)
+
+        # Clear the cached LoopBody so it gets re-traced with the new inner_fn
+        consumer_cb.get_default_sizes_body.clear_cache(consumer_cb)
 
         # Re-trace the LoopBody with the new inner_fn
         try:
             consumer_node.recompute_size_and_body()
-        except Exception:
+        except Exception as e:
             # If re-tracing fails, revert the change
-            consumer_data.inner_fn = old_inner_fn
+            import traceback as _tb
+            print(f"INLINE FAILED: {_tb.format_exc()}", flush=True)
+            object.__setattr__(consumer_data, "inner_fn", old_inner_fn)
+            consumer_cb.get_default_sizes_body.clear_cache(consumer_cb)
             return False
 
         return True

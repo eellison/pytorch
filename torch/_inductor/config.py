@@ -921,7 +921,7 @@ aggressive_fusion = False
 # per-channel params) and its sole consumer reads it at shifted/stencil indices,
 # the scheduler will inline the producer's computation into the consumer,
 # eliminating the intermediate buffer materialization.
-inline_recomputable_producers = True
+inline_recomputable_producers = False
 
 # For each fused kernel in the wrapper, comment with the nodes that get fused.
 # Useful for debugging fusion.
