@@ -1219,7 +1219,10 @@ REDUCTION_COMBINE_FN: dict[str, Callable[..., OpsValue]] = {
 
 
 def get_reduction_combine_fn(
-    reduction_type: str, dtype: torch.dtype, arg_break_ties_left: bool = True
+    reduction_type: str,
+    dtype: torch.dtype,
+    arg_break_ties_left: bool = True,
+    unrolled_in_order: bool = False,
 ) -> Callable[..., object]:
     if reduction_type in REDUCTION_COMBINE_FN:
         return REDUCTION_COMBINE_FN[reduction_type]
@@ -1239,24 +1242,54 @@ def get_reduction_combine_fn(
             a_value, a_index = a
             b_value, b_index = b
 
-            if reduction_type in ("argmin", "argmin_value", "argmin_with_value"):
-                mask = ops.lt(a_value, b_value)
+            if unrolled_in_order and arg_break_ties_left:
+                # Optimized path for unrolled reductions processed in ascending
+                # index order with first-index-wins tie-breaking.
+                # functools.reduce processes elements left-to-right, so the
+                # accumulator (a) always has a lower index than the new element
+                # (b). Using >= (or <=) keeps 'a' on tie since mask=True keeps
+                # 'a' and mask=False takes 'b'.
+                if reduction_type in (
+                    "argmin",
+                    "argmin_value",
+                    "argmin_with_value",
+                ):
+                    # keep a if a <= b (i.e., DON'T take b unless b is strictly less)
+                    mask = ops.le(a_value, b_value)
+                else:
+                    # keep a if a >= b (i.e., DON'T take b unless b is strictly greater)
+                    mask = ops.ge(a_value, b_value)
+
+                if is_float_dtype(dtype):
+                    # NaN propagation: if a is NaN, keep a (mask=True)
+                    a_isnan = ops.ne(a_value, a_value)
+                    mask = ops.logical_or(mask, a_isnan)
             else:
-                mask = ops.gt(a_value, b_value)
+                if reduction_type in (
+                    "argmin",
+                    "argmin_value",
+                    "argmin_with_value",
+                ):
+                    mask = ops.lt(a_value, b_value)
+                else:
+                    mask = ops.gt(a_value, b_value)
 
-            equal = ops.eq(a_value, b_value)
-            if is_float_dtype(dtype):
-                a_isnan = ops.ne(a_value, a_value)
-                b_isnan = ops.ne(b_value, b_value)
-                mask = ops.logical_or(mask, ops.gt(a_isnan, b_isnan))
-                equal = ops.logical_or(equal, ops.logical_and(a_isnan, b_isnan))
+                equal = ops.eq(a_value, b_value)
+                if is_float_dtype(dtype):
+                    a_isnan = ops.ne(a_value, a_value)
+                    b_isnan = ops.ne(b_value, b_value)
+                    mask = ops.logical_or(mask, ops.gt(a_isnan, b_isnan))
+                    equal = ops.logical_or(
+                        equal, ops.logical_and(a_isnan, b_isnan)
+                    )
 
-            tie = (
-                ops.lt(a_index, b_index)
-                if arg_break_ties_left
-                else ops.gt(a_index, b_index)
-            )
-            mask = ops.logical_or(mask, ops.logical_and(equal, tie))
+                tie = (
+                    ops.lt(a_index, b_index)
+                    if arg_break_ties_left
+                    else ops.gt(a_index, b_index)
+                )
+                mask = ops.logical_or(mask, ops.logical_and(equal, tie))
+
             return (
                 ops.where(mask, a_value, b_value),
                 ops.where(mask, a_index, b_index),
@@ -1594,7 +1627,13 @@ class Reduction(Loops):
         """Convert inner_fn from a reduction to an pointwise"""
         reduction_ranges = V.graph.sizevars.guard_int_seq(reduction_ranges)
 
-        combine_fn = get_reduction_combine_fn(reduction_type, src_dtype)
+        # For unrolled arg reductions processed in ascending index order,
+        # tie-breaking is implicit: strict > (or <) already keeps the first
+        # (lower-index) element on tie, matching arg_break_ties_left=True.
+        # Use the optimized combine function that skips explicit tie-breaking.
+        combine_fn = get_reduction_combine_fn(
+            reduction_type, src_dtype, unrolled_in_order=True
+        )
 
         def fn(index: Sequence[_IntLike]) -> Any:
             return functools.reduce(
@@ -10074,7 +10113,50 @@ class StorageBox(MutableBox):
             isinstance(self.data, (Pointwise, Reduction))
             and self.data.inner_fn_opcount().nontrivial_read_count > 1
         ):
+            if config.smart_realize_hint and self._is_broadcast_dominated():
+                return
             self.realize()
+
+    def _is_broadcast_dominated(self) -> bool:
+        """
+        Check if the producer's reads are broadcast-dominated, meaning most
+        reads access far fewer elements than the output. In that case,
+        recomputing is cheaper than materializing the full output buffer.
+
+        For example, a BN+ReLU pointwise op reading [C]-shaped stats into
+        a [N,C,H,W] output: the stats reads are tiny broadcasts and the
+        overall recompute cost is dominated by the single large input read.
+        """
+        try:
+            output_numel = V.graph.sizevars.optimization_hint(
+                sympy_product(self.data.ranges), fallback=0
+            )
+            if output_numel == 0:
+                return False
+
+            reads = self.data.get_reads()
+            if not reads:
+                return False
+
+            # Count reads that are broadcasts (numel much smaller than output)
+            broadcast_threshold = output_numel // 8  # 8x smaller = broadcast
+            broadcast_count = 0
+            total_reads = 0
+            for dep in reads:
+                if not hasattr(dep, "numel_hint"):
+                    continue
+                total_reads += 1
+                dep_numel = dep.numel_hint()
+                if dep_numel <= broadcast_threshold:
+                    broadcast_count += 1
+
+            if total_reads == 0:
+                return False
+
+            # If majority of reads are broadcasts, skip realization
+            return broadcast_count > total_reads // 2
+        except Exception:
+            return False
 
     def has_accumulated_enough_reads_by_size(self, threshold: int) -> bool:
         from torch._inductor.utils import is_nonfreeable_buffers

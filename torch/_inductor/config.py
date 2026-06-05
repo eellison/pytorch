@@ -885,6 +885,12 @@ delay_realize_cheap_outputs: bool = Config(
     default=True,
 )
 
+# Skip realize_hint when the producer's reads are broadcast-dominated.
+# When most reads in a pointwise producer access far fewer elements than the
+# output (e.g., [C] BN stats into a [N,C,H,W] kernel), recomputing is cheaper
+# than materializing the full intermediate buffer.
+smart_realize_hint: bool = True
+
 # fallback to eager for random/dropout, this is slow but useful for debugging
 fallback_random = False
 
