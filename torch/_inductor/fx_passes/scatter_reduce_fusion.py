@@ -421,6 +421,12 @@ class ScatterAddReduceChain:
         # The add node between view and where, and the skip tensor
         self.skip_add_node: Optional[fx.Node] = None
         self.skip_tensor_node: Optional[fx.Node] = None
+        # For channel-slice pattern (SqueezeNet fire modules):
+        # scatter_add -> view[B, C, H, W] -> slice(dim=1, start, end) -> where -> sum
+        # The slice selects a subset of channels from the scatter output.
+        self.slice_node: Optional[fx.Node] = None
+        self.channel_slice_start: Optional[int] = None
+        self.channel_slice_end: Optional[int] = None
 
 
 def _get_tensor_meta(node: fx.Node) -> Optional[dict]:
@@ -741,6 +747,32 @@ def _trace_scatter_add_chain(
     # Handle optional skip-connection add: scatter_add -> view -> add(skip, viewed)
     current = scattered_viewed_node
 
+    # Check for slice node (SqueezeNet fire module pattern):
+    # where(mask, fill, slice(view(scatter_add), dim=1, start, end))
+    if (current.op == "call_function"
+            and current.target == aten.slice.Tensor):
+        slice_node = current
+        slice_input = current.args[0]
+        slice_dim = current.args[1] if len(current.args) > 1 else 0
+        slice_start = current.args[2] if len(current.args) > 2 else 0
+        slice_end = current.args[3] if len(current.args) > 3 else None
+
+        # Only handle slices along the channel dimension (dim=1)
+        if slice_dim == 1 and isinstance(slice_start, int) and isinstance(slice_end, int):
+            # Check that the slice is only used by the where
+            slice_users = list(slice_node.users.keys())
+            if len(slice_users) == 1 and slice_users[0] == where_node:
+                chain.slice_node = slice_node
+                chain.channel_slice_start = slice_start
+                chain.channel_slice_end = slice_end
+                # Get the sliced view_shape (what the where sees)
+                slice_meta = _get_tensor_meta(slice_node)
+                if slice_meta is not None:
+                    chain.view_shape = slice_meta["shape"]
+                current = slice_input
+                if not isinstance(current, fx.Node):
+                    return None
+
     # Check for add node (UNet skip-connection pattern):
     # where(mask, fill, add(skip, scatter_view))
     if (current.op == "call_function" and current.target == aten.add.Tensor):
@@ -777,18 +809,34 @@ def _trace_scatter_add_chain(
             current = scatter_arg
         # else: not the skip pattern, fall through to check if it's view/scatter directly
 
-    # Check for view node between scatter and where (or between scatter and add)
+    # Check for view node between scatter and where (or between scatter and add/slice)
     if _is_view_node(current):
         chain.view_node = current
         view_meta = _get_tensor_meta(current)
         if view_meta is not None:
-            chain.view_shape = view_meta["shape"]
+            # If we have a channel slice, view_shape was already set from the slice
+            # Keep the full view shape for computing the channel offset
+            if chain.slice_node is None:
+                chain.view_shape = view_meta["shape"]
+            # Store the full view shape separately for channel offset calc
+            chain._full_view_shape = view_meta["shape"]
 
-        # Check the view is only used by the where or the skip-add
+        # Check the view's users - should be used only by slice nodes or by
+        # the where/skip-add/slice
         view_users = list(current.users.keys())
-        expected_view_user = chain.skip_add_node if chain.skip_add_node is not None else chain.mask_node
-        if len(view_users) != 1 or view_users[0] != expected_view_user:
-            return None
+        if chain.slice_node is not None:
+            # For slice pattern: view may have multiple slice users (one per channel half)
+            # All users of the view should be slice.Tensor nodes
+            all_slices = all(
+                u.op == "call_function" and u.target == aten.slice.Tensor
+                for u in view_users
+            )
+            if not all_slices:
+                return None
+        else:
+            expected_view_user = chain.skip_add_node if chain.skip_add_node is not None else chain.mask_node
+            if len(view_users) != 1 or view_users[0] != expected_view_user:
+                return None
 
         current = current.args[0]
         if not isinstance(current, fx.Node):
@@ -835,12 +883,16 @@ def _trace_scatter_add_chain(
 
     log.debug(
         "Found scatter_add-reduce chain: scatter_dim=%d, view_shape=%s, "
-        "reduction_dims=%s, num_rewrite_targets=%d, has_skip=%s",
+        "reduction_dims=%s, num_rewrite_targets=%d, has_skip=%s, "
+        "has_slice=%s (ch %s:%s)",
         chain.scatter_dim,
         chain.view_shape,
         reduction_dims,
         len(rewrite_targets),
         chain.skip_add_node is not None,
+        chain.slice_node is not None,
+        chain.channel_slice_start,
+        chain.channel_slice_end,
     )
 
     return chain
@@ -901,29 +953,65 @@ def _rewrite_scatter_add_reduce_chain(
         return False
 
     has_skip = chain.skip_add_node is not None
+    has_slice = chain.slice_node is not None
+
+    # For channel slice pattern, determine the full channel count
+    # src is [B*C_full, S_src], and we need to slice to [B, C_sliced, S_src]
+    if has_slice:
+        # Get full view shape to determine C_full
+        full_view_shape = getattr(chain, "_full_view_shape", None)
+        if full_view_shape is None or len(full_view_shape) != 4:
+            return False
+        C_full = full_view_shape[1]
+        ch_start = chain.channel_slice_start
+        ch_end = chain.channel_slice_end
+        if ch_start is None or ch_end is None:
+            return False
+        # C should equal ch_end - ch_start (the sliced channel count)
+        if C != ch_end - ch_start:
+            return False
+    else:
+        C_full = C
+        ch_start = 0
+        ch_end = C
 
     # Process each rewrite target (sum node) independently
     num_rewritten = 0
     for target_sum_node, multiplier_node in chain.rewrite_targets:
         with graph.inserting_before(target_sum_node):
             # === Build the scatter contribution via gather-mask-reduce ===
-            # src_3d = view(src, [B, C, S_src])
+            # For channel slice: src[B*C_full, S_src] -> view[B, C_full, S_src] -> slice[:, ch_start:ch_end, :]
+            # For no slice: src[B*C, S_src] -> view[B, C, S_src]
             src_3d = graph.call_function(
                 aten.view.default,
-                args=(chain.src_node, [B, C, S_src]),
+                args=(chain.src_node, [B, C_full, S_src]),
             )
             if hasattr(chain.src_node, "meta") and "val" in chain.src_node.meta:
                 val = chain.src_node.meta["val"]
-                src_3d.meta = {"val": val.view(B, C, S_src) if hasattr(val, "view") else val}
+                src_3d.meta = {"val": val.view(B, C_full, S_src) if hasattr(val, "view") else val}
 
-            # index_3d = view(index, [B, C, S_src])
+            # index_3d = view(index, [B, C_full, S_src])
             index_3d = graph.call_function(
                 aten.view.default,
-                args=(chain.index_node, [B, C, S_src]),
+                args=(chain.index_node, [B, C_full, S_src]),
             )
             if hasattr(chain.index_node, "meta") and "val" in chain.index_node.meta:
                 val = chain.index_node.meta["val"]
-                index_3d.meta = {"val": val.view(B, C, S_src) if hasattr(val, "view") else val}
+                index_3d.meta = {"val": val.view(B, C_full, S_src) if hasattr(val, "view") else val}
+
+            # If channel slice, select only the relevant channels
+            if has_slice:
+                src_3d = graph.call_function(
+                    aten.slice.Tensor,
+                    args=(src_3d, 1, ch_start, ch_end),
+                )
+                src_3d.meta = {"val": torch.empty(B, C, S_src, dtype=src_meta["dtype"], device="meta")}
+
+                index_3d = graph.call_function(
+                    aten.slice.Tensor,
+                    args=(index_3d, 1, ch_start, ch_end),
+                )
+                index_3d.meta = {"val": torch.empty(B, C, S_src, dtype=index_meta["dtype"], device="meta")}
 
             # mask_flat = view(mask, [B, C, H*W])
             mask_flat = graph.call_function(
@@ -1136,12 +1224,15 @@ def _rewrite_scatter_add_reduce_chain(
         log.info(
             "scatter_reduce_fusion: REWROTE scatter_add-reduce chain! "
             "scatter_dim=%d, view_shape=%s, %d/%d sum targets rewritten, "
-            "has_skip=%s -> index-mask-reduce aten ops",
+            "has_skip=%s, has_slice=%s (ch %s:%s) -> index-mask-reduce aten ops",
             chain.scatter_dim,
             chain.view_shape,
             num_rewritten,
             len(chain.rewrite_targets),
             has_skip,
+            has_slice,
+            chain.channel_slice_start,
+            chain.channel_slice_end,
         )
     return num_rewritten > 0
 
