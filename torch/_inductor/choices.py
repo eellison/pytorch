@@ -528,6 +528,41 @@ class InductorChoices:
                 no_split_threshold = 8192
             if reduction_numel_hint <= no_split_threshold:
                 return 1
+            # For undersaturated GPUs (numel_hint < num_sm), use aggressive splitting
+            # to maximize parallelism. The standard min_elements_per_thread=32 gives
+            # each CTA 8192 elements (32*256), resulting in too few total CTAs.
+            # E.g., xhint=40, rnumel=100K -> only 13 splits (520 CTAs) with the
+            # default, but the optimal decomposition uses ~98 splits (3920 CTAs).
+            # For memory-bound reductions, saturating the memory system requires many
+            # concurrent memory requests. Use min 4 elements/thread (1024 elements/CTA)
+            # to achieve enough waves for full memory bandwidth utilization.
+            # Only apply for multi-output reductions (numel_hint >= 8) where the
+            # x-dimension provides enough base parallelism that increased splits
+            # translate directly to more concurrent memory requests. For scalar
+            # reductions (numel_hint=1), the standard heuristic and B200-calibrated
+            # thresholds remain appropriate.
+            if (
+                config.split_reductions_for_undersaturated_gpu
+                and 8 <= numel_hint < num_sm
+            ):
+                # Minimum work per CTA: 4 elements/thread * num_threads (= 1024 on B200)
+                # This matches oracle patterns that use BLOCK_K=1024
+                aggressive_min_ept = 4
+                aggressive_elements_per_cta = num_threads * aggressive_min_ept
+                max_split_from_work = reduction_numel_hint // aggressive_elements_per_cta
+                # Target enough waves to saturate memory bandwidth. On modern GPUs,
+                # ~8 waves (each wave = num_sm CTAs) is sufficient for bandwidth
+                # saturation. Cap at the work-derived limit.
+                target_waves = 8
+                target_total_ctas = num_sm * target_waves
+                target_split = (target_total_ctas + numel_hint - 1) // numel_hint
+                # Use the minimum of target_split and max_split_from_work to avoid
+                # pathologically tiny per-CTA work
+                split = min(target_split, max_split_from_work)
+                # Hard cap to avoid excessive finalization overhead
+                split = min(split, 256)
+                if split > 1:
+                    return split
             if reduction_numel_hint * numel_hint <= min_elements_per_device:
                 split_size = min_elements_per_thread
             elif reduction_numel_hint * numel_hint < max_elements_per_device:
