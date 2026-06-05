@@ -18405,9 +18405,8 @@ if RUN_GPU:
             self.assertEqual(
                 code.count("tl.store"), 2 if config.triton.multi_kernel else 1
             )
-            # The intermediate pointwise (a - b) should not be materialized
-            # as a separate output. The final result is in out_ptr0.
-            self.assertTrue("out_ptr0" in code)
+            self.assertTrue("out_ptr1" in code)
+            self.assertFalse("out_ptr0" in code)
             self.assertEqual(fn_opt(*inps), fn(*inps))
 
         def test_reduction_hint_inner_with_high_tiling_ratio(self):
