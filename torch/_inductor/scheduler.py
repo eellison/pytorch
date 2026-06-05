@@ -2910,11 +2910,29 @@ class FusedMixOrderReductions(FusedSchedulerNode):
             ):
                 return False
 
-        return (
-            not node2.is_reduction()
-            or self.scheduler.score_fusion_memory(node1, node2, count_bytes=False)
+        if not node2.is_reduction():
+            return True
+
+        if (
+            self.scheduler.score_fusion_memory(node1, node2, count_bytes=False)
             >= self.numel
-        )
+        ):
+            return True
+
+        # Allow fusing sibling split reductions that share input reads into
+        # the MOR's non-contiguous (column) side.  These are split reductions
+        # over the same data that benefit from a shared row-iteration loop
+        # even though score_fusion_memory returns 0 (shared inputs aren't
+        # counted as eliminated intermediates).
+        if (
+            not MixOrderReduction.is_contiguous_node(node1)
+            and MixOrderReduction.is_split_reduction(node1)
+            and MixOrderReduction.is_split_reduction(node2)
+            and (node1.used_buffer_names() & node2.used_buffer_names())
+        ):
+            return True
+
+        return False
 
     def can_fuse_with(self, other: BaseSchedulerNode):
         # Limit tl.load() count in the fused RSPLIT loop to avoid register

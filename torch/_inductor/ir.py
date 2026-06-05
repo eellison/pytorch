@@ -78,7 +78,7 @@ from torch.utils._sympy.functions import (
     Mod,
     ModularIndexing,
 )
-from torch.utils._sympy.symbol import SymT
+from torch.utils._sympy.symbol import symbol_is_type, SymT
 
 from . import config, dependencies
 from .codegen.common import (
@@ -1557,12 +1557,37 @@ class Reduction(Loops):
                 for var in reduction_vars
                 if isinstance(var, Expr) and not isinstance(var, sympy.Number)
             ]
+            # When indirect indexing is present, a read may reference all data
+            # dimensions through indirect variables (e.g., load(idx_buf, d2) then
+            # load(data_buf, ... indirect_var ...)).  Treat a read as "full-size"
+            # if its free_symbols contain at least one indirect/tmp symbol,
+            # indicating it accesses data through dynamic index computation.
+            # TMP symbols arise from ops.indirect_indexing calls.
+            has_indirect = any(
+                symbol_is_type(v, (SymT.TMP, SymT.INDIRECT))
+                for md_check in read_writes.reads
+                for v in md_check.index.free_symbols
+            )
             indices = []
             broadcasted_reduction_indices = []
             changed = False
             for md in sorted(read_writes.reads, key=lambda x: x.name):
                 free_symbols = md.index.free_symbols
                 is_full_size_read = all(var in free_symbols for var in range_vars)
+                # When indirect indexing is used, a data read may access all
+                # elements but with some range_vars replaced by tmp/indirect
+                # symbols (from ops.indirect_indexing).  Treat it as full-size
+                # if it contains at least one TMP/INDIRECT symbol, indicating
+                # it accesses data through dynamic index computation.
+                if (
+                    not is_full_size_read
+                    and has_indirect
+                    and any(
+                        symbol_is_type(v, (SymT.TMP, SymT.INDIRECT))
+                        for v in free_symbols
+                    )
+                ):
+                    is_full_size_read = True
                 # Prefer full-size reads, but fall back to reads that still
                 # vary across the reduction.  Missing reduction vars are
                 # zero-stride broadcasts, not proof of an inner reduction.
