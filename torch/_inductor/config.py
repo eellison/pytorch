@@ -916,6 +916,13 @@ inductor_choices_class: Callable[[], "InductorChoices"] | None = None
 # fuse even in cases without common reads
 aggressive_fusion = False
 
+# Inline cheap pointwise producers into stencil/pool consumers at the scheduler
+# level.  When a pointwise buffer is broadcast-dominated (most reads are cheap
+# per-channel params) and its sole consumer reads it at shifted/stencil indices,
+# the scheduler will inline the producer's computation into the consumer,
+# eliminating the intermediate buffer materialization.
+inline_recomputable_producers = True
+
 # For each fused kernel in the wrapper, comment with the nodes that get fused.
 # Useful for debugging fusion.
 debug_fusion: bool = os.environ.get("TORCHINDUCTOR_DEBUG_FUSION") == "1"

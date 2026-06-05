@@ -4122,6 +4122,9 @@ class Scheduler:
         if config.split_reductions_for_fusion:
             self.nodes = self.split_reductions_for_fusion(self.nodes)
 
+        if config.inline_recomputable_producers and hasattr(self, "inline_recomputable_producers"):
+            self.nodes = self.inline_recomputable_producers(self.nodes)
+
         if config.distributed_max_autotune_gemm:
             from . import distributed_autotune
 
@@ -5356,6 +5359,312 @@ class Scheduler:
         final_snode = SchedulerNode(self, final_buffer)
 
         return partial_snode, final_snode
+
+    def inline_recomputable_producers(
+        self, nodes: list[BaseSchedulerNode]
+    ) -> list[BaseSchedulerNode]:
+        """Inline cheap pointwise producers into stencil/pool consumers.
+
+        When a Pointwise producer is "broadcast-dominated" (most of its reads
+        are small per-channel parameters relative to the output) and its sole
+        purpose is to feed a stencil consumer (pool, conv-like ops that read
+        at shifted indices), materializing the full intermediate buffer is
+        wasteful. This pass inlines the producer's computation into the
+        consumer, eliminating the buffer round-trip.
+
+        The mechanism works by replacing ops.load(producer_buf, flat_idx) calls
+        in the consumer's inner_fn with the producer's inner_fn evaluated at
+        the coordinates corresponding to flat_idx.
+        """
+        import sympy as _sympy
+
+        inlined_count = 0
+        nodes_to_remove: OrderedSet[str] = OrderedSet()
+
+        # Build a map from buffer name -> producing scheduler node
+        buf_to_producer: dict[str, SchedulerNode] = {}
+        for node in nodes:
+            if isinstance(node, SchedulerNode) and isinstance(node.node, ir.ComputedBuffer):
+                for buf in node.get_outputs():
+                    buf_to_producer[buf.get_name()] = node
+
+        for consumer_node in nodes:
+            if not isinstance(consumer_node, SchedulerNode):
+                continue
+            if not isinstance(consumer_node.node, ir.ComputedBuffer):
+                continue
+            consumer_data = consumer_node.node.data
+            if not isinstance(consumer_data, (ir.Pointwise, ir.Reduction)):
+                continue
+
+            # Find producer buffers this consumer reads from
+            consumer_read_names = consumer_node.node.get_read_names()
+            inlinable_producers = []
+            for read_name in consumer_read_names:
+                if read_name not in buf_to_producer:
+                    continue
+                producer_node = buf_to_producer[read_name]
+                if producer_node.get_name() in nodes_to_remove:
+                    continue
+                if not self._is_inlinable_producer(producer_node, consumer_node, nodes):
+                    continue
+                inlinable_producers.append((read_name, producer_node))
+
+            if not inlinable_producers:
+                continue
+
+            # For each inlinable producer, try to inline it
+            for producer_buf_name, producer_node in inlinable_producers:
+                producer_cb = producer_node.node
+                assert isinstance(producer_cb, ir.ComputedBuffer)
+                producer_data = producer_cb.data
+                assert isinstance(producer_data, ir.Pointwise)
+
+                if not self._is_inline_profitable(
+                    producer_node, consumer_node, producer_buf_name
+                ):
+                    continue
+
+                success = self._do_inline_producer(
+                    producer_cb, consumer_node, producer_buf_name
+                )
+                if success:
+                    nodes_to_remove.add(producer_node.get_name())
+                    inlined_count += 1
+                    fusion_log.debug(
+                        "inline_recomputable_producers: inlined %s into %s",
+                        producer_node.get_name(),
+                        consumer_node.get_name(),
+                    )
+
+        if inlined_count > 0:
+            counters["inductor"]["inline_recomputable_producers"] = inlined_count
+            new_nodes = [n for n in nodes if n.get_name() not in nodes_to_remove]
+            self.nodes = new_nodes
+            self.name_to_node = {n.get_name(): n for n in self.nodes}
+            self.name_to_fused_node = self.name_to_node.copy()
+            self.name_to_buf = {
+                buf.get_name(): buf
+                for node in self.nodes
+                for buf in node.get_outputs()
+            }
+            self.compute_dependencies()
+            self.nodes = self.topological_sort_schedule(self.nodes)
+            self.dead_node_elimination()
+            self.name_to_fused_node = {n.get_name(): n for n in self.nodes}
+            self.compute_ancestors()
+            self.compute_input_distances()
+            new_nodes = list(self.nodes)
+            return new_nodes
+
+        return nodes
+
+    def _is_inlinable_producer(
+        self,
+        producer_node: "SchedulerNode",
+        consumer_node: "SchedulerNode",
+        all_nodes: list["BaseSchedulerNode"],
+    ) -> bool:
+        """Check if a producer is a candidate for inlining.
+
+        Requirements:
+        - Producer is a Pointwise ComputedBuffer
+        - Producer is "broadcast-dominated": most reads are much smaller
+          than the output (per-channel params vs full-tensor output)
+        - Producer has no other consumers (otherwise buffer can't be eliminated)
+        """
+        import sympy as _sympy
+
+        if not isinstance(producer_node.node, ir.ComputedBuffer):
+            return False
+        producer_data = producer_node.node.data
+        if not isinstance(producer_data, ir.Pointwise):
+            return False
+
+        # Check broadcast-dominated
+        producer_output_numel = V.graph.sizevars.size_hint(
+            _sympy.prod(producer_data.get_size())  # type: ignore[arg-type]
+        )
+        if producer_output_numel == 0:
+            return False
+
+        read_sizes = []
+        for dep in producer_node.read_writes.reads:
+            if isinstance(dep, MemoryDep):
+                size_hint = self.dep_size_hint(dep)
+                read_sizes.append(size_hint)
+
+        if not read_sizes:
+            return False
+
+        # At most one read close to output size, rest must be small (broadcast)
+        large_reads = sum(1 for s in read_sizes if s > producer_output_numel * 0.5)
+        small_reads = sum(1 for s in read_sizes if s <= producer_output_numel * 0.1)
+
+        if large_reads > 1:
+            return False
+        if small_reads < 1:
+            return False
+
+        # Producer must have no other consumers
+        producer_buf_names = producer_node.get_buffer_names()
+        for other_node in all_nodes:
+            if other_node is consumer_node or other_node is producer_node:
+                continue
+            for dep in other_node.read_writes.reads:
+                if isinstance(dep, MemoryDep) and dep.name in producer_buf_names:
+                    return False
+
+        return True
+
+    def _is_inline_profitable(
+        self,
+        producer_node: "SchedulerNode",
+        consumer_node: "SchedulerNode",
+        producer_buf_name: str,
+    ) -> bool:
+        """Check if inlining saves more memory than it costs in recomputation."""
+        import sympy as _sympy
+
+        producer_data = producer_node.node.data
+        assert isinstance(producer_data, ir.Pointwise)
+
+        producer_output_numel = V.graph.sizevars.size_hint(
+            _sympy.prod(producer_data.get_size())  # type: ignore[arg-type]
+        )
+        dtype_size = 4  # f32
+        memory_saved_bytes = producer_output_numel * dtype_size * 2  # write + read back
+
+        opcount = producer_data.inner_fn_opcount()
+        producer_ops = max(opcount.num_ops, 1)
+
+        # Count stencil reads from the producer
+        stencil_reads = sum(
+            1
+            for dep in consumer_node.read_writes.reads
+            if isinstance(dep, MemoryDep) and dep.name == producer_buf_name
+        )
+
+        consumer_data = consumer_node.node.data
+        consumer_output_numel = V.graph.sizevars.size_hint(
+            _sympy.prod(consumer_data.get_size())  # type: ignore[arg-type]
+        )
+
+        # Total recompute cost
+        total_recompute_ops = consumer_output_numel * stencil_reads * producer_ops
+        # Rough model: 1 FLOP ~= 0.1 byte bandwidth on modern GPUs
+        compute_cost_as_bytes = total_recompute_ops * 0.1
+
+        return memory_saved_bytes > compute_cost_as_bytes * 2
+
+    def _do_inline_producer(
+        self,
+        producer_cb: "ir.ComputedBuffer",
+        consumer_node: "SchedulerNode",
+        producer_buf_name: str,
+    ) -> bool:
+        """Rewrite consumer's inner_fn to inline the producer's computation."""
+        import sympy
+
+        from torch.utils._sympy.functions import FloorDiv, ModularIndexing
+
+        producer_data = producer_cb.data
+        assert isinstance(producer_data, ir.Pointwise)
+        producer_inner_fn = producer_data.inner_fn
+        producer_layout = producer_cb.layout
+
+        if not isinstance(producer_layout, (ir.FixedLayout, ir.FlexibleLayout)):
+            return False
+
+        if isinstance(producer_layout, ir.FlexibleLayout):
+            producer_layout = producer_layout.as_fixed()
+
+        try:
+            producer_sizes = [
+                int(V.graph.sizevars.size_hint(s)) for s in producer_layout.size
+            ]
+            producer_strides = [
+                int(V.graph.sizevars.size_hint(s)) for s in producer_layout.stride
+            ]
+            producer_offset = int(V.graph.sizevars.size_hint(producer_layout.offset))
+        except Exception:
+            return False
+
+        ndim = len(producer_sizes)
+        # Sort dims by stride descending for decomposition
+        dim_order = sorted(range(ndim), key=lambda d: -producer_strides[d])
+
+        # Verify invertibility (no zero strides except size-1 dims)
+        for d in range(ndim):
+            if producer_strides[d] == 0 and producer_sizes[d] != 1:
+                return False
+
+        # Filter out size-1 dimensions from the decomposition order
+        dim_order_nontriv = [d for d in dim_order if producer_sizes[d] > 1]
+
+        def inverse_indexer(flat_idx):
+            """Convert flat index to multi-dimensional coordinates."""
+            coords = [sympy.Integer(0)] * ndim
+            remainder = flat_idx
+            if producer_offset != 0:
+                remainder = remainder - sympy.Integer(producer_offset)
+
+            for i, d in enumerate(dim_order_nontriv):
+                stride = sympy.Integer(producer_strides[d])
+                size = sympy.Integer(producer_sizes[d])
+                if i < len(dim_order_nontriv) - 1:
+                    coords[d] = FloorDiv(remainder, stride)
+                    remainder = ModularIndexing(remainder, sympy.Integer(1), stride)
+                else:
+                    # Last dimension: just divide
+                    coords[d] = FloorDiv(remainder, stride)
+
+            return coords
+
+        # Rewrite the consumer's inner_fn
+        consumer_cb = consumer_node.node
+        assert isinstance(consumer_cb, ir.ComputedBuffer)
+        consumer_data = consumer_cb.data
+        old_inner_fn = consumer_data.inner_fn
+
+        def make_new_inner_fn(old_fn, prod_buf_name, prod_fn, inv_indexer):
+            """Create a new inner_fn that inlines the producer."""
+            def new_inner_fn(index, *extra_args):
+                from torch._inductor.virtualized import ops as _ops
+
+                handler = _ops._get_handler()
+                original_load = handler.load
+
+                def patched_load(name, idx, *args, **kwargs):
+                    if name == prod_buf_name:
+                        coords = inv_indexer(idx)
+                        return prod_fn(coords)
+                    return original_load(name, idx, *args, **kwargs)
+
+                handler.load = patched_load
+                try:
+                    if extra_args:
+                        return old_fn(index, *extra_args)
+                    else:
+                        return old_fn(index)
+                finally:
+                    handler.load = original_load
+
+            return new_inner_fn
+
+        consumer_data.inner_fn = make_new_inner_fn(
+            old_inner_fn, producer_buf_name, producer_inner_fn, inverse_indexer
+        )
+
+        # Re-trace the LoopBody with the new inner_fn
+        try:
+            consumer_node.recompute_size_and_body()
+        except Exception:
+            # If re-tracing fails, revert the change
+            consumer_data.inner_fn = old_inner_fn
+            return False
+
+        return True
 
     def fuse_nodes(self, nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
         """

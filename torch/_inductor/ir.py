@@ -1219,7 +1219,10 @@ REDUCTION_COMBINE_FN: dict[str, Callable[..., OpsValue]] = {
 
 
 def get_reduction_combine_fn(
-    reduction_type: str, dtype: torch.dtype, arg_break_ties_left: bool = True
+    reduction_type: str,
+    dtype: torch.dtype,
+    arg_break_ties_left: bool = True,
+    unrolled_ascending_indices: bool = False,
 ) -> Callable[..., object]:
     if reduction_type in REDUCTION_COMBINE_FN:
         return REDUCTION_COMBINE_FN[reduction_type]
@@ -1239,24 +1242,53 @@ def get_reduction_combine_fn(
             a_value, a_index = a
             b_value, b_index = b
 
-            if reduction_type in ("argmin", "argmin_value", "argmin_with_value"):
-                mask = ops.lt(a_value, b_value)
-            else:
-                mask = ops.gt(a_value, b_value)
-
-            equal = ops.eq(a_value, b_value)
-            if is_float_dtype(dtype):
-                a_isnan = ops.ne(a_value, a_value)
-                b_isnan = ops.ne(b_value, b_value)
-                mask = ops.logical_or(mask, ops.gt(a_isnan, b_isnan))
-                equal = ops.logical_or(equal, ops.logical_and(a_isnan, b_isnan))
-
-            tie = (
-                ops.lt(a_index, b_index)
-                if arg_break_ties_left
-                else ops.gt(a_index, b_index)
+            is_argmin = reduction_type in (
+                "argmin",
+                "argmin_value",
+                "argmin_with_value",
             )
-            mask = ops.logical_or(mask, ops.logical_and(equal, tie))
+
+            if unrolled_ascending_indices and arg_break_ties_left:
+                # Optimization: when indices are processed in ascending order
+                # (which is always true for unrolled reductions) and we break
+                # ties to the left (lowest index), the tie-break comparison
+                # a_index < b_index is always True. This simplifies:
+                #   mask = better OR (equal AND True) = better OR equal = ge/le
+                # For ints, no NaN handling needed — just one comparison.
+                # For floats, we still need to keep a if a is NaN (NaN propagates
+                # as "extreme" value in argmax/argmin).
+                if is_argmin:
+                    mask = ops.le(a_value, b_value)
+                else:
+                    mask = ops.ge(a_value, b_value)
+
+                if is_float_dtype(dtype):
+                    # ge/le returns False when a is NaN, but we want to keep a
+                    # (first NaN wins). Add: mask = mask OR a_is_nan
+                    a_isnan = ops.ne(a_value, a_value)
+                    mask = ops.logical_or(mask, a_isnan)
+            else:
+                if is_argmin:
+                    mask = ops.lt(a_value, b_value)
+                else:
+                    mask = ops.gt(a_value, b_value)
+
+                equal = ops.eq(a_value, b_value)
+                if is_float_dtype(dtype):
+                    a_isnan = ops.ne(a_value, a_value)
+                    b_isnan = ops.ne(b_value, b_value)
+                    mask = ops.logical_or(mask, ops.gt(a_isnan, b_isnan))
+                    equal = ops.logical_or(
+                        equal, ops.logical_and(a_isnan, b_isnan)
+                    )
+
+                tie = (
+                    ops.lt(a_index, b_index)
+                    if arg_break_ties_left
+                    else ops.gt(a_index, b_index)
+                )
+                mask = ops.logical_or(mask, ops.logical_and(equal, tie))
+
             return (
                 ops.where(mask, a_value, b_value),
                 ops.where(mask, a_index, b_index),
@@ -1594,7 +1626,9 @@ class Reduction(Loops):
         """Convert inner_fn from a reduction to an pointwise"""
         reduction_ranges = V.graph.sizevars.guard_int_seq(reduction_ranges)
 
-        combine_fn = get_reduction_combine_fn(reduction_type, src_dtype)
+        combine_fn = get_reduction_combine_fn(
+            reduction_type, src_dtype, unrolled_ascending_indices=True
+        )
 
         def fn(index: Sequence[_IntLike]) -> Any:
             return functools.reduce(
