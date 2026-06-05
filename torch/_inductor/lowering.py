@@ -2271,6 +2271,60 @@ def cat(inputs, dim=0):
     def additional_pointwise_ops(op: torch._ops.OpOverload):
         return op in (aten.cat.default, aten.constant_pad_nd.default)
 
+    def _cat_inputs_share_expensive_reads() -> bool:
+        """Check if cat inputs share reads and have significant op counts.
+
+        When cat inputs share reads (read from the same buffers) and have high
+        op counts, pointwise_cat is inefficient because it iterates over the
+        full output dimension with conditional branching, re-evaluating shared
+        computation for each half. ConcatKernel is better because the scheduler
+        fuses the writes into one kernel that naturally shares intermediates.
+
+        Example: split → SwiGLU → cat where both halves compute sigmoid from
+        the same input; pointwise_cat doubles the iteration and re-computes
+        sigmoid, while ConcatKernel iterates once with two stores.
+        """
+        threshold = config.prefer_concat_kernel_shared_reads_threshold
+        if threshold <= 0:
+            return False
+
+        # Only applies when all inputs can realize into ConcatKernel
+        if not all(should_lower_cat_input(inp) for inp in inputs):
+            return False
+
+        def get_all_reads(x):
+            """Recursively collect all read buffer names from a Pointwise tree."""
+            if isinstance(x, (TensorBox, ir.StorageBox)):
+                return get_all_reads(unwrap_tensor(x))
+            if isinstance(x, ir.Pointwise):
+                reads = OrderedSet(x.get_read_names())
+                for read in list(reads):
+                    buf = V.graph.get_buffer(read)
+                    if buf is not None:
+                        reads |= get_all_reads(buf)
+                return reads
+            return OrderedSet()
+
+        # Collect reads for each input
+        input_reads = [get_all_reads(inp) for inp in inputs]
+
+        # Check if any pair of inputs shares reads
+        has_shared = False
+        for i in range(len(input_reads)):
+            for j in range(i + 1, len(input_reads)):
+                if input_reads[i] & input_reads[j]:
+                    has_shared = True
+                    break
+            if has_shared:
+                break
+
+        if not has_shared:
+            return False
+
+        # Check that inputs have enough ops to make the duplication costly
+        total_ops = sum(op_count(t) for t in inputs)
+        return total_ops >= threshold
+
     if len(inputs) <= config.max_complex_pointwise_cat_inputs or (
         (len(inputs) <= config.max_pointwise_cat_inputs)
         and all(op_count(t) <= MAX_SIMPLE_OP_COUNT for t in inputs)
@@ -2328,7 +2382,12 @@ def cat(inputs, dim=0):
             all(should_lower_cat_input(inp) for inp in inputs) and not fusable_reduction
         )
 
-        if not has_multi_consumers and (fuse_pointwise_use or horizontal_fuse_cat):
+        # Skip pointwise_cat when cat inputs share reads and have significant
+        # computation — ConcatKernel avoids redundant re-evaluation of shared
+        # intermediates by letting the scheduler fuse writes into one kernel.
+        shared_expensive_reads = _cat_inputs_share_expensive_reads()
+
+        if not has_multi_consumers and not shared_expensive_reads and (fuse_pointwise_use or horizontal_fuse_cat):
             return pointwise_cat(inputs, dim)
 
     return TensorBox(ir.ConcatKernel.create(inputs, dim))
@@ -4373,10 +4432,19 @@ def embedding(weight, indices, padding_idx=-1, scale_grad_by_freq=False, sparse=
     indices_ndim = len(indices.get_size())
     weight_size = weight.get_size()
     new_size = [*indices.get_size(), *weight_size[1:]]
+    clamp_indices = config.clamp_embedding_indices
 
     def fn(idx):
         assert len(idx) == len(new_size), f"{idx} != {new_size}"
         var_index = indices_loader(idx[:indices_ndim])
+        if clamp_indices:
+            # Clamp indices to [0, vocab_size-1] to make bounds provably
+            # in-range, eliding expensive tl.device_assert checks.  This is
+            # a no-op for valid indices and prevents UB for invalid ones.
+            zero = ops.constant(0, torch.int64)
+            upper = ops.index_expr(weight_size[0] - 1, torch.int64)
+            var_index = ops.maximum(var_index, zero)
+            var_index = ops.minimum(var_index, upper)
         weight_idx = [
             ops.indirect_indexing(var_index, weight_size[0], wrap_neg=False)
         ] + [*idx[indices_ndim:]]

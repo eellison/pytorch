@@ -1021,6 +1021,13 @@ max_pointwise_cat_inputs = 8
 # force concat to be generated as a pointwise op with masked loads
 force_pointwise_cat = False
 
+# When cat inputs share reads and have total ops above this threshold,
+# prefer ConcatKernel over pointwise_cat to avoid redundant computation.
+# With pointwise_cat, each output element re-evaluates all cat inputs (masked);
+# with ConcatKernel, the scheduler fuses writes into one kernel sharing intermediates.
+# Set to 0 to disable (always allow pointwise_cat).
+prefer_concat_kernel_shared_reads_threshold = 4
+
 # replace small reductions with pointwise, disable with `= 1`
 unroll_reductions_threshold = 8
 
@@ -1082,6 +1089,12 @@ assert_indirect_indexing = True
 # graph constants with provably in-bounds values (all values in [0, dim_size)).
 # This is safe because constant values cannot change at runtime.
 elide_constant_index_asserts = True
+
+# When True, embedding indices are clamped to [0, vocab_size-1] before the
+# indirect load.  This makes bounds provably in-range, eliding the expensive
+# tl.device_assert without changing behaviour for valid indices (clamp is a
+# no-op when indices are already in range) and preventing UB for invalid ones.
+clamp_embedding_indices = True
 
 # skip emitting runtime assertions for unbacked symbols in generated code
 do_not_emit_runtime_assertions = False

@@ -897,6 +897,13 @@ class SymPyValueRangeAnalysis:
     def log(x):
         x = ValueRanges.wrap(x)
         if x.lower <= 0:
+            # log is undefined/negative-infinity for x <= 0, but if the upper
+            # bound is positive we can still bound log from above since log is
+            # monotonically increasing.  This preserves upper-bound information
+            # through chains like T5 bucket computation where log(0) is never
+            # actually reached due to a downstream where/minimum guard.
+            if x.upper > 0:
+                return ValueRanges(-sympy.oo, OpaqueUnaryFn_log(x.upper))
             return ValueRanges.unknown()
         return ValueRanges.increasing_map(x, OpaqueUnaryFn_log)
 
@@ -904,6 +911,8 @@ class SymPyValueRangeAnalysis:
     def log2(x):
         x = ValueRanges.wrap(x)
         if x.lower <= 0:
+            if x.upper > 0:
+                return ValueRanges(-sympy.oo, OpaqueUnaryFn_log2(x.upper))
             return ValueRanges.unknown()
         return ValueRanges.increasing_map(x, OpaqueUnaryFn_log2)
 
