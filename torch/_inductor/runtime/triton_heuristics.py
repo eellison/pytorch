@@ -4673,6 +4673,26 @@ def _persistent_reduction_configs(
         )
     ]
 
+    # For persistent reductions with small rnumel (<=128) and large xnumel,
+    # add single-warp configs. When the reduction dimension is tiny, each
+    # program does very little work, and multi-warp overhead (shared memory
+    # synchronization) dominates. Single-warp configs avoid this and let the
+    # autotuner discover better occupancy via more concurrent blocks per SM.
+    if rnumel <= 128 and xnumel >= 4096:
+        for low_warp_xblock in [8, 16]:
+            low_warp_xblock = min(low_warp_xblock, xnumel)
+            if low_warp_xblock * rnumel <= MAX_PERSISTENT_BLOCK_NUMEL:
+                low_warp_config = triton_config_reduction(
+                    size_hints,
+                    low_warp_xblock,
+                    rnumel,
+                    register_intensive=True,
+                    num_warps=1,
+                    min_num_warps=1,
+                    reduction_hint=reduction_hint,
+                )
+                configs.append(low_warp_config)
+
     # defer to more autotuning, initially
     if "y" in size_hints:
         pass
