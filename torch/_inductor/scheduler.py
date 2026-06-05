@@ -5626,22 +5626,48 @@ class Scheduler:
         # Filter out size-1 dimensions from the decomposition order
         dim_order_nontriv = [d for d in dim_order if producer_sizes[d] > 1]
 
-        def inverse_indexer(flat_idx):
-            """Convert flat index to multi-dimensional coordinates."""
-            coords = [sympy.Integer(0)] * ndim
-            remainder = flat_idx
-            if producer_offset != 0:
-                remainder = remainder - sympy.Integer(producer_offset)
+        # Verify the layout is "regularly strided": each stride must equal
+        # the product of all smaller strides' (stride * size) relationships.
+        # Specifically, for sorted dims d0, d1, ..., dN (stride desc),
+        # stride[d_i] == stride[d_{i+1}] * size[d_{i+1}] must hold for
+        # the direct ModularIndexing formula to be valid.
+        for i in range(len(dim_order_nontriv) - 1):
+            d_cur = dim_order_nontriv[i]
+            d_next = dim_order_nontriv[i + 1]
+            if producer_strides[d_cur] != producer_strides[d_next] * producer_sizes[d_next]:
+                # Layout is not regularly strided (e.g. has gaps or overlaps);
+                # fall back to not inlining rather than producing wrong results.
+                return False
 
-            for i, d in enumerate(dim_order_nontriv):
-                stride = sympy.Integer(producer_strides[d])
-                size = sympy.Integer(producer_sizes[d])
-                if i < len(dim_order_nontriv) - 1:
-                    coords[d] = FloorDiv(remainder, stride)
-                    remainder = ModularIndexing(remainder, sympy.Integer(1), stride)
+        def inverse_indexer(flat_idx):
+            """Convert flat index to multi-dimensional coordinates.
+
+            Uses the direct coordinate mapper formula:
+                coord_d = ModularIndexing(flat_idx, stride_d, size_d)
+                       = (flat_idx // stride_d) % size_d
+
+            This produces single-level ModularIndexing expressions that
+            sympy can simplify well (stripping terms divisible by
+            stride_d * size_d from the base). In contrast, the old
+            sequential remainder approach produced deeply nested
+            ModularIndexing(ModularIndexing(...)) that Triton codegen
+            could not simplify, generating incorrect values for some
+            stencil positions.
+            """
+            coords = [sympy.Integer(0)] * ndim
+            idx = flat_idx
+            if producer_offset != 0:
+                idx = idx - sympy.Integer(producer_offset)
+
+            for d in range(ndim):
+                if producer_sizes[d] == 1:
+                    # Size-1 dims always have coordinate 0
+                    coords[d] = sympy.Integer(0)
                 else:
-                    # Last dimension: just divide
-                    coords[d] = FloorDiv(remainder, stride)
+                    stride = sympy.Integer(producer_strides[d])
+                    size = sympy.Integer(producer_sizes[d])
+                    # Direct formula: (flat_idx // stride) % size
+                    coords[d] = ModularIndexing(idx, stride, size)
 
             return coords
 
