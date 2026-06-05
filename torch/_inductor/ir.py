@@ -10147,9 +10147,9 @@ class StorageBox(MutableBox):
         that is used multiple times.
         """
         if users > 1 and isinstance(self.data, (Pointwise, Reduction)):
+            opcount = self.data.inner_fn_opcount()
             if is_cpu(self.data):
                 # Heuristic for realizing reused result of heavy ops on cpu
-                opcount = self.data.inner_fn_opcount()
                 heavy_ops = [
                     "exp",
                     "log",
@@ -10159,6 +10159,21 @@ class StorageBox(MutableBox):
                     "sigmoid",
                 ]
                 if any(x in opcount.used_ops for x in heavy_ops):
+                    return True
+            # Transcendental ops (sin, cos, etc.) are expensive on all devices.
+            # Materialize multi-user nodes that contain them to avoid redundant
+            # recomputation, especially when broadcast into larger consumers.
+            if config.realize_heavy_transcendentals_on_reuse:
+                transcendental_ops = [
+                    "sin",
+                    "cos",
+                    "tan",
+                    "asin",
+                    "acos",
+                    "atan",
+                    "atan2",
+                ]
+                if any(x in opcount.used_ops for x in transcendental_ops):
                     return True
             return (
                 self.num_reads() > config.realize_reads_threshold

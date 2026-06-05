@@ -869,6 +869,13 @@ warn_mix_layout = os.environ.get("TORCHINDUCTOR_WARN_MIX_LAYOUT") == "1"
 realize_reads_threshold = 4
 realize_opcount_threshold = 30
 
+# When True, materialize multi-user pointwise nodes that contain expensive
+# transcendental ops (sin, cos, tan, asin, acos, atan, atan2) to avoid
+# redundant recomputation.  This is especially beneficial when the node is
+# broadcast into larger consumers (e.g., a [1,512,128] sin table used by
+# [4,32,512,128] RoPE kernels saves 128x recomputation per element).
+realize_heavy_transcendentals_on_reuse: bool = True
+
 # Threshold to prevent excessive accumulation of ops in one buffer during lowering
 realize_acc_reads_threshold = 8
 realize_acc_reads_size_threshold: int | None = (
