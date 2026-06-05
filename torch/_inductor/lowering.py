@@ -5547,6 +5547,83 @@ def max_pool_checks(
     return kernel_size, stride, padding, dilation, use_fallback
 
 
+# Expensive ops that justify materializing a producer before a stencil consumer.
+# If the producer contains only cheap arithmetic (FMA, relu, comparisons), it's
+# better to recompute inline (9x for 3x3 pool) than materialize a huge buffer.
+_EXPENSIVE_STENCIL_OPS = frozenset([
+    "exp",
+    "exp2",
+    "log",
+    "log2",
+    "log10",
+    "log1p",
+    "sin",
+    "cos",
+    "tan",
+    "asin",
+    "acos",
+    "atan",
+    "atan2",
+    "sinh",
+    "cosh",
+    "tanh",
+    "sigmoid",
+    "pow",
+    "erf",
+    "erfc",
+    "erfinv",
+    "lgamma",
+    "indirect_indexing",
+])
+
+
+def _should_realize_for_stencil(x, kernel_size) -> bool:
+    """Decide whether to materialize a producer before a pooling/stencil consumer.
+
+    Returns True if the producer is expensive and should be materialized (the
+    traditional behavior). Returns False if the producer is cheap enough to
+    recompute at each position in the stencil window, saving the memory traffic
+    of materializing a large intermediate buffer.
+
+    The heuristic: skip realize_hint when:
+    1. The producer is a Pointwise (not a Reduction)
+    2. The producer uses only cheap ops (arithmetic, relu, rsqrt, comparisons)
+    3. The stencil window is small (product of kernel_size <= 25)
+    4. The opcount is modest (< realize_opcount_threshold)
+
+    This is controlled by config.inline_cheap_producers_into_stencils.
+    """
+    if not config.inline_cheap_producers_into_stencils:
+        return True  # conservative: always realize
+
+    # Only applies for small stencil windows
+    window_size = 1
+    for k in kernel_size:
+        window_size *= k
+    if window_size > 25:
+        return True  # large window, recomputation cost too high
+
+    # Check if x wraps a cheap Pointwise
+    data = x.data if hasattr(x, 'data') else None
+    if data is None:
+        return True
+    inner = data.data if hasattr(data, 'data') else data
+    if not isinstance(inner, Pointwise):
+        return True  # Reductions should always be materialized
+
+    opcount = inner.inner_fn_opcount()
+
+    # If the producer has expensive ops, materialize it
+    if opcount.used_ops & _EXPENSIVE_STENCIL_OPS:
+        return True
+
+    # If the producer is too complex, materialize it
+    if opcount.num_ops > config.realize_opcount_threshold:
+        return True
+
+    return False  # cheap producer, skip materialization
+
+
 def _max_pool_with_offsets(
     x,
     kernel_size,
@@ -5557,7 +5634,10 @@ def _max_pool_with_offsets(
     *,
     n_dim,
 ):
-    x.realize_hint()
+    if not _should_realize_for_stencil(x, kernel_size):
+        pass  # skip realize_hint: cheap producer, prefer inline recomputation
+    else:
+        x.realize_hint()
     batch = x.shape[:-n_dim]
     dhw = x.shape[-n_dim:]
 

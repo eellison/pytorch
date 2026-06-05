@@ -512,6 +512,20 @@ class InductorChoices:
             no_split_threshold = (
                 524288 if props.major is not None and props.major >= 10 else 8192
             )
+            # When the number of outputs is too small to saturate the GPU,
+            # use a lower threshold so we split for parallelism. With numel_hint
+            # outputs and num_sm SMs, we need splitting to get enough CTAs.
+            # E.g., BN var_mean with 64 channels on 148 SMs: only 43% utilization
+            # without splitting. The B200 threshold of 524K was calibrated for
+            # scalar reductions (numel_hint=1); for multi-output reductions that
+            # still can't fill the GPU, use the legacy threshold.
+            if (
+                config.split_reductions_for_undersaturated_gpu
+                and numel_hint < num_sm
+                and props.major is not None
+                and props.major >= 10
+            ):
+                no_split_threshold = 8192
             if reduction_numel_hint <= no_split_threshold:
                 return 1
             if reduction_numel_hint * numel_hint <= min_elements_per_device:

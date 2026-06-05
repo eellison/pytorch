@@ -876,6 +876,16 @@ realize_opcount_threshold = 30
 # [4,32,512,128] RoPE kernels saves 128x recomputation per element).
 realize_heavy_transcendentals_on_reuse: bool = True
 
+# When True, skip realize_hint for cheap pointwise producers (BN+ReLU, simple
+# arithmetic) before pooling/stencil consumers. This allows the pointwise to be
+# recomputed inline at each stencil position rather than materializing a large
+# intermediate buffer. Beneficial when the producer is cheap (just FMAs) and the
+# buffer is large (e.g., [N,C,H,W] before a 3x3 maxpool).
+# NOTE: Currently disabled by default because the pool kernel with inline
+# recomputation tends to be slower than reading from L2-cached materialized
+# buffer (the materialization write is overlapped with the reduction kernel).
+inline_cheap_producers_into_stencils: bool = False
+
 # Threshold to prevent excessive accumulation of ops in one buffer during lowering
 realize_acc_reads_threshold = 8
 realize_acc_reads_size_threshold: int | None = (
@@ -1018,6 +1028,12 @@ conv_1x1_as_mm = False
 #   triton.cooperative_reductions: uses cross thread-block synchronization to gain more parallelism
 # enabling both of these will implicitly disable split_reductions
 split_reductions = os.getenv("TORCHINDUCTOR_SPLIT_REDUCTIONS", "1") == "1"
+
+# When the number of reduction outputs is less than the SM count (GPU underutilized),
+# lower the no-split threshold to enable split reductions for better parallelism.
+# E.g., BN var_mean with 64 channels on 148 SMs: without this, the B200 threshold
+# of 524K prevents splitting a 401K-element reduction, leaving 56% of SMs idle.
+split_reductions_for_undersaturated_gpu: bool = True
 
 # PROTOTYPE: Force OUTER reductions to use INNER splitting to enable sibling fusion
 _sibling_reduction_fusion = False
