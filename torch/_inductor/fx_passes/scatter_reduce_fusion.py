@@ -1911,6 +1911,9 @@ def _emit_gather_reduce_for_bilinear(
 def _find_scatter_add_into_patterns(graph: fx.Graph) -> list[dict]:
     """Find add(A, index_put(zeros, idx, val, accumulate=True)) patterns.
 
+    Also handles the variant with a dtype cast in between:
+        add(A, convert_element_type(index_put(zeros, idx, val, accumulate=True)))
+
     Returns a list of dicts with keys:
         - add_node: the add node to replace
         - index_put_node: the index_put node
@@ -1918,8 +1921,12 @@ def _find_scatter_add_into_patterns(graph: fx.Graph) -> list[dict]:
         - other_node: the tensor A being added to
         - indices: the index list from index_put
         - values_node: the values being scattered
+        - convert_node: (optional) the convert_element_type node if present
+        - target_dtype: (optional) the target dtype for the cast
     """
     patterns = []
+
+    prims_convert = torch.ops.prims.convert_element_type.default
 
     for node in graph.nodes:
         if node.op != "call_function":
@@ -1935,17 +1942,35 @@ def _find_scatter_add_into_patterns(graph: fx.Graph) -> list[dict]:
             if not isinstance(arg_ip, fx.Node) or not isinstance(arg_other, fx.Node):
                 continue
 
-            if not _is_accumulate_index_put(arg_ip):
+            # Check for direct index_put or convert(index_put) pattern
+            convert_node = None
+            target_dtype = None
+            actual_ip = arg_ip
+
+            if (arg_ip.op == "call_function"
+                    and arg_ip.target == prims_convert
+                    and isinstance(arg_ip.args[0], fx.Node)):
+                # Pattern: add(A, convert(index_put(...)))
+                convert_node = arg_ip
+                target_dtype = arg_ip.args[1]
+                actual_ip = arg_ip.args[0]
+                # Check that convert is only used by this add
+                convert_users = list(convert_node.users.keys())
+                if len(convert_users) != 1 or convert_users[0] != node:
+                    continue
+
+            if not _is_accumulate_index_put(actual_ip):
                 continue
 
             # Check that the index_put's input is a zeros tensor
-            ip_input = arg_ip.args[0]
+            ip_input = actual_ip.args[0]
             if not isinstance(ip_input, fx.Node):
                 continue
             if not _is_zeros_init(ip_input):
                 continue
 
             # Check that the zeros tensor has the same shape as `other`
+            # (shape must match, dtype may differ when convert is present)
             zeros_meta = _get_tensor_meta(ip_input)
             other_meta = _get_tensor_meta(arg_other)
             if zeros_meta is None or other_meta is None:
@@ -1953,27 +1978,36 @@ def _find_scatter_add_into_patterns(graph: fx.Graph) -> list[dict]:
             if zeros_meta["shape"] != other_meta["shape"]:
                 continue
 
-            # Check that index_put result is ONLY used by this add
-            ip_users = list(arg_ip.users.keys())
-            if len(ip_users) != 1 or ip_users[0] != node:
-                continue
+            # Check that index_put result is ONLY used by this add (or by the convert)
+            ip_users = list(actual_ip.users.keys())
+            if convert_node is not None:
+                if len(ip_users) != 1 or ip_users[0] != convert_node:
+                    continue
+            else:
+                if len(ip_users) != 1 or ip_users[0] != node:
+                    continue
 
             # Check that zeros is ONLY used by the index_put
             zeros_users = list(ip_input.users.keys())
-            if len(zeros_users) != 1 or zeros_users[0] != arg_ip:
+            if len(zeros_users) != 1 or zeros_users[0] != actual_ip:
                 continue
 
-            indices = arg_ip.args[1]
-            values_node = arg_ip.args[2]
+            indices = actual_ip.args[1]
+            values_node = actual_ip.args[2]
 
-            patterns.append({
+            pattern_info = {
                 "add_node": node,
-                "index_put_node": arg_ip,
+                "index_put_node": actual_ip,
                 "zeros_node": ip_input,
                 "other_node": arg_other,
                 "indices": indices,
                 "values_node": values_node,
-            })
+            }
+            if convert_node is not None:
+                pattern_info["convert_node"] = convert_node
+                pattern_info["target_dtype"] = target_dtype
+
+            patterns.append(pattern_info)
             break  # Found pattern for this add node
 
     return patterns
@@ -1984,6 +2018,10 @@ def scatter_add_into_fusion_pass(graph: fx.Graph) -> fx.Graph:
 
     Rewrites add(A, index_put(zeros, idx, val, accumulate=True))
     into index_put(A, idx, val, accumulate=True).
+
+    Also handles the variant with a dtype cast in between:
+    add(A, convert(index_put(zeros, idx, val, accumulate=True)))
+    -> convert(index_put(convert(A), idx, val, accumulate=True))
 
     Controlled by: config.scatter_add_into_fusion (default True)
     """
@@ -2012,22 +2050,64 @@ def scatter_add_into_fusion_pass(graph: fx.Graph) -> fx.Graph:
 def _rewrite_scatter_add_into(graph: fx.Graph, chain_info: dict) -> bool:
     """Rewrite add(A, index_put(zeros, idx, val, True)) -> index_put(A, idx, val, True).
 
+    Also handles the convert variant:
+        add(A, convert(index_put(zeros, idx, val, True)))
+        -> index_put(A, idx, convert(val), True)
+
+    This eliminates:
+        - The full(0) initialization of the scatter target buffer
+        - The add kernel that reads both A and the scatter result
+        - For the convert variant: the full-size cast (replaced by a much smaller
+          cast on just the values tensor)
+
     This is safe because:
         index_put(A, idx, val, accumulate=True) = A.clone() + scatter_add(zeros, idx, val)
         = A + scatter_add(zeros, idx, val)  [when used as a new output, not in-place]
         = add(A, index_put(zeros, idx, val, accumulate=True))
+
+    For the convert variant:
+        add(A_bf16, convert_bf16(index_put(zeros_f32, idx, val_f32, True)))
+        = add(A_bf16, convert_bf16(scatter_add(zeros_f32, idx, val_f32)))
+        = index_put(A_bf16, idx, convert_bf16(val_f32), True)
+
+    Note: When multiple source rows map to the same target index, the original
+    accumulates in f32 then casts. The rewrite accumulates in bf16. This is
+    acceptable because embedding gradients typically have very few collisions.
     """
     add_node = chain_info["add_node"]
     index_put_node = chain_info["index_put_node"]
     other_node = chain_info["other_node"]
     indices = chain_info["indices"]
     values_node = chain_info["values_node"]
+    convert_node = chain_info.get("convert_node")
+    target_dtype = chain_info.get("target_dtype")
 
     with graph.inserting_before(add_node):
+        effective_values = values_node
+
+        if convert_node is not None and target_dtype is not None:
+            # Convert variant: cast the values to the target dtype first
+            # This replaces a full-size cast (e.g., [128256, 2048]) with a
+            # much smaller cast on just the scattered values (e.g., [4, 512, 2048])
+            effective_values = graph.call_function(
+                torch.ops.prims.convert_element_type.default,
+                args=(values_node, target_dtype),
+            )
+            # Set metadata for the converted values
+            values_meta = _get_tensor_meta(values_node)
+            if values_meta is not None:
+                effective_values.meta = {
+                    "val": torch.empty(
+                        values_meta["shape"],
+                        dtype=target_dtype,
+                        device="meta",
+                    )
+                }
+
         # Create new index_put with A as the input instead of zeros
         new_index_put = graph.call_function(
             aten.index_put.default,
-            args=(other_node, indices, values_node, True),
+            args=(other_node, indices, effective_values, True),
         )
         # Copy metadata from the add node (same output shape/dtype)
         if hasattr(add_node, "meta"):
@@ -2037,9 +2117,10 @@ def _rewrite_scatter_add_into(graph: fx.Graph, chain_info: dict) -> bool:
 
     log.info(
         "scatter_reduce_fusion: REWROTE scatter-add-into pattern! "
-        "Eliminated full(0) init + add kernel for shape=%s",
+        "Eliminated full(0) init + add kernel for shape=%s%s",
         _get_tensor_meta(chain_info["zeros_node"])["shape"]
         if _get_tensor_meta(chain_info["zeros_node"]) else "unknown",
+        f" (with dtype cast to {target_dtype})" if convert_node else "",
     )
     return True
 
