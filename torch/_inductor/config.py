@@ -1277,16 +1277,13 @@ slice_scatter_elision = (
     os.environ.get("TORCHINDUCTOR_SLICE_SCATTER_ELISION", "1") == "1"
 )
 
-# Slice-scatter partial elision: when a slice reads a range that partially overlaps
-# with a slice_scatter's write range, split into cat of base-slice + src-slice.
-# This eliminates RAW dependencies through the scatter buffer, enabling kernel fusion.
+# Slice-scatter partial overlap rewrite: when a slice reads a range that partially
+# overlaps with a slice_scatter's write range, rewrite as a small slice_scatter over
+# only the read range. This produces a fusible Pointwise IR node (output-sized) that
+# eliminates RAW dependencies through the full scatter buffer.
 # (KV-cache update + head-major clone pattern in LLaMA/GPT inference)
-# NOTE: Currently disabled by default as the cat approach adds memory traffic
-# through the intermediate ConcatKernel buffer. The correct fix requires
-# scheduler-level mutation fusion (inlining the mutation source directly into
-# the consumer's conditional load).
 slice_scatter_partial_elision = (
-    os.environ.get("TORCHINDUCTOR_SLICE_SCATTER_PARTIAL_ELISION", "0") == "1"
+    os.environ.get("TORCHINDUCTOR_SLICE_SCATTER_PARTIAL_ELISION", "1") == "1"
 )
 
 # Select-scatter sparsity propagation: when full(0) + select_scatter creates a
@@ -1308,6 +1305,13 @@ diagonal_skew_elimination = (
 # where the scatter writes ALL elements of a zero-filled buffer (batch-norm backward patterns)
 as_strided_scatter_elision = (
     os.environ.get("TORCHINDUCTOR_AS_STRIDED_SCATTER_ELISION", "1") == "1"
+)
+
+# Expand-sum elision: simplifies sum(expand(x) / N, dims) -> sum(x, reduced_dims)
+# when expand dims cancel with the division and are all included in the sum dims.
+# Eliminates expensive spatial expansion in avg_pool2d_backward patterns.
+expand_sum_elision = (
+    os.environ.get("TORCHINDUCTOR_EXPAND_SUM_ELISION", "1") == "1"
 )
 
 # BN-inference affine folding: folds decomposed batch normalization inference

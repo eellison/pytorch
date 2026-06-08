@@ -625,6 +625,12 @@ def post_grad_passes(gm: torch.fx.GraphModule, is_inference: bool):
             GraphTransformObserver(
                 gm, "as_strided_scatter_elision"
             ).apply_graph_pass(as_strided_scatter_elision_pass)
+        if config.expand_sum_elision:
+            from .expand_sum_elision import expand_sum_elision_pass
+
+            GraphTransformObserver(
+                gm, "expand_sum_elision"
+            ).apply_graph_pass(expand_sum_elision_pass)
         if config.scatter_reduce_fusion:
             from .scatter_reduce_fusion import scatter_reduce_fusion_pass
 
