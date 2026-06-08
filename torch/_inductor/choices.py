@@ -562,53 +562,21 @@ class InductorChoices:
             # without splitting. The B200 threshold of 524K was calibrated for
             # scalar reductions (numel_hint=1); for multi-output reductions that
             # still can't fill the GPU, use the legacy threshold.
+            # Only lower threshold when GPU is severely undersaturated (< 50%
+            # utilization). For numel > num_sm // 2, the persistent reduction
+            # with full B200 threshold provides better performance because each
+            # CTA can efficiently loop through moderate-sized reductions without
+            # finalization overhead.
             if (
                 config.split_reductions_for_undersaturated_gpu
-                and numel_hint < num_sm
+                and numel_hint < num_sm // 2
                 and props.major is not None
                 and props.major >= 10
             ):
                 no_split_threshold = 8192
             if reduction_numel_hint <= no_split_threshold:
                 return 1
-            # For undersaturated GPUs (numel_hint < num_sm), use aggressive splitting
-            # to maximize parallelism. The standard min_elements_per_thread=32 gives
-            # each CTA 8192 elements (32*256), resulting in too few total CTAs.
-            # E.g., xhint=40, rnumel=100K -> only 13 splits (520 CTAs) with the
-            # default, but the optimal decomposition uses ~98 splits (3920 CTAs).
-            # For memory-bound reductions, saturating the memory system requires many
-            # concurrent memory requests. Use min 4 elements/thread (1024 elements/CTA)
-            # to achieve enough waves for full memory bandwidth utilization.
-            # Only apply for multi-output reductions (numel_hint >= 8) where the
-            # x-dimension provides enough base parallelism that increased splits
-            # translate directly to more concurrent memory requests. For scalar
-            # reductions (numel_hint=1), the standard heuristic and B200-calibrated
-            # thresholds remain appropriate.
-            # Only apply when GPU is meaningfully undersaturated (< 67% SM utilization).
-            # With numel_hint near num_sm (e.g., 128 on 148 SMs = 86%), the extra
-            # finalization kernel overhead from split outweighs the parallelism gain.
-            if (
-                config.split_reductions_for_undersaturated_gpu
-                and 8 <= numel_hint < num_sm * 2 // 3
-            ):
-                # Minimum work per CTA: 4 elements/thread * num_threads (= 1024 on B200)
-                # This matches oracle patterns that use BLOCK_K=1024
-                aggressive_min_ept = 4
-                aggressive_elements_per_cta = num_threads * aggressive_min_ept
-                max_split_from_work = reduction_numel_hint // aggressive_elements_per_cta
-                # Target enough waves to saturate memory bandwidth. On modern GPUs,
-                # ~8 waves (each wave = num_sm CTAs) is sufficient for bandwidth
-                # saturation. Cap at the work-derived limit.
-                target_waves = 8
-                target_total_ctas = num_sm * target_waves
-                target_split = (target_total_ctas + numel_hint - 1) // numel_hint
-                # Use the minimum of target_split and max_split_from_work to avoid
-                # pathologically tiny per-CTA work
-                split = min(target_split, max_split_from_work)
-                # Hard cap to avoid excessive finalization overhead
-                split = min(split, 256)
-                if split > 1:
-                    return split
+            # Compute the standard split factor first.
             if reduction_numel_hint * numel_hint <= min_elements_per_device:
                 split_size = min_elements_per_thread
             elif reduction_numel_hint * numel_hint < max_elements_per_device:
@@ -632,9 +600,52 @@ class InductorChoices:
                     split_size = closest
                 else:
                     split_size = max_elements_per_thread
-            return (reduction_numel_hint + split_size * num_threads - 1) // (
-                split_size * num_threads
-            )
+            standard_split = (
+                reduction_numel_hint + split_size * num_threads - 1
+            ) // (split_size * num_threads)
+            # For undersaturated GPUs (numel_hint < num_sm // 2), use aggressive
+            # splitting to maximize parallelism, but ONLY if it produces more
+            # splits than the standard heuristic. The standard
+            # min_elements_per_thread=32 gives each CTA 8192 elements (32*256),
+            # which can result in too few total CTAs for small numel_hint with
+            # moderate reduction sizes.
+            # E.g., xhint=40, rnumel=100K -> standard gives 13 splits (520 CTAs),
+            # but optimal is ~30 splits (1200 CTAs) with 4 elements/thread.
+            # Only apply when the aggressive split exceeds the standard split to
+            # avoid regressions where the standard path already provides adequate
+            # parallelism. Gate on < num_sm // 2 (50% utilization) to avoid
+            # triggering for near-saturated cases where persistent reduction or
+            # the standard heuristic works well.
+            if (
+                config.split_reductions_for_undersaturated_gpu
+                and 8 <= numel_hint < num_sm // 2
+            ):
+                # Minimum work per CTA: 4 elements/thread * num_threads (= 1024 on B200)
+                # This matches oracle patterns that use BLOCK_K=1024
+                aggressive_min_ept = 4
+                aggressive_elements_per_cta = num_threads * aggressive_min_ept
+                max_split_from_work = (
+                    reduction_numel_hint // aggressive_elements_per_cta
+                )
+                # Target enough waves to saturate memory bandwidth. On modern GPUs,
+                # ~8 waves (each wave = num_sm CTAs) is sufficient for bandwidth
+                # saturation. Cap at the work-derived limit.
+                target_waves = 8
+                target_total_ctas = num_sm * target_waves
+                target_split = (
+                    (target_total_ctas + numel_hint - 1) // numel_hint
+                )
+                # Use the minimum of target_split and max_split_from_work to avoid
+                # pathologically tiny per-CTA work
+                aggressive_split = min(target_split, max_split_from_work)
+                # Hard cap to avoid excessive finalization overhead
+                aggressive_split = min(aggressive_split, 256)
+                # Only use aggressive split if it INCREASES parallelism beyond the
+                # standard heuristic. This prevents regressions where the standard
+                # path already gives a good split factor.
+                if aggressive_split > standard_split:
+                    return aggressive_split
+            return standard_split
         else:
             # TODO the best heuristic currently has XBLOCK (corresponding to numel_hint) 128
             # extend to even smaller number of outputs
