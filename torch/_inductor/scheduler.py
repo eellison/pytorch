@@ -5423,6 +5423,7 @@ class Scheduler:
                     buf_to_producer[buf.get_name()] = node
 
         # Build a map from producer buffer name -> list of consumer nodes
+        # (only consumers eligible for inlining: SchedulerNode + ComputedBuffer + Pointwise/Reduction)
         buf_to_consumers: dict[str, list[SchedulerNode]] = {}
         for node in nodes:
             if not isinstance(node, SchedulerNode):
@@ -5438,7 +5439,20 @@ class Scheduler:
                     if node not in buf_to_consumers[dep.name]:
                         buf_to_consumers[dep.name].append(node)
 
+        # Build the complete set of all buffer reads across ALL nodes
+        # (including non-SchedulerNode, non-ComputedBuffer, etc.) so we can
+        # verify no other node still references a buffer we want to remove.
+        buf_all_reader_nodes: dict[str, list[BaseSchedulerNode]] = {}
+        for node in nodes:
+            for dep in node.read_writes.reads:
+                if isinstance(dep, MemoryDep) and dep.name in buf_to_producer:
+                    if dep.name not in buf_all_reader_nodes:
+                        buf_all_reader_nodes[dep.name] = []
+                    if node not in buf_all_reader_nodes[dep.name]:
+                        buf_all_reader_nodes[dep.name].append(node)
+
         # Iterate over producers and try to inline into ALL consumers
+        graph_output_names = OrderedSet(V.graph.get_output_names())
         processed_producers: OrderedSet[str] = OrderedSet()
         for producer_buf_name, producer_node in buf_to_producer.items():
             if producer_node.get_name() in processed_producers:
@@ -5451,9 +5465,21 @@ class Scheduler:
             if not isinstance(producer_data, ir.Pointwise):
                 continue
 
+            # Never inline a producer whose buffer is a graph output —
+            # removing it would leave the output referencing an unallocated buffer
+            if producer_buf_name in graph_output_names:
+                continue
+
             # Get all consumers of this producer buffer
             consumers = buf_to_consumers.get(producer_buf_name, [])
             if not consumers:
+                continue
+
+            # Verify that ALL readers of this buffer are in our tracked consumers.
+            # If there are readers we didn't track (e.g., non-ComputedBuffer nodes,
+            # non-Pointwise/Reduction nodes), we cannot safely remove this producer.
+            all_readers = buf_all_reader_nodes.get(producer_buf_name, [])
+            if len(all_readers) != len(consumers):
                 continue
 
             # Check inlinability (broadcast-dominated check, ignoring consumer count)
@@ -5501,31 +5527,60 @@ class Scheduler:
 
         if inlined_count > 0:
             counters["inductor"]["inline_recomputable_producers"] = inlined_count
-            # Collect buffer names from removed producers and mark them as
-            # "available" so that dependency pruning doesn't choke on stale refs
+
+            # Safety check: after inlining (which re-traces consumer inner_fns),
+            # verify that no remaining node still reads the producer buffer.
+            # A consumer may still reference the buffer if recompute_size_and_body
+            # didn't fully eliminate the load (e.g., multi-output nodes, template
+            # buffers, etc.). In that case, keep the producer alive.
+            actually_removable: OrderedSet[str] = OrderedSet()
             for node_name in nodes_to_remove:
                 removed_node = self.name_to_node.get(node_name)
-                if removed_node is not None:
-                    for buf in removed_node.get_outputs():
-                        self.available_buffer_names.add(buf.get_name())
+                if removed_node is None:
+                    continue
+                buf_names = {buf.get_name() for buf in removed_node.get_outputs()}
+                # Check if any non-removed node still reads from this buffer
+                still_referenced = False
+                for other_node in nodes:
+                    if other_node.get_name() in nodes_to_remove:
+                        continue
+                    if other_node.get_name() == node_name:
+                        continue
+                    for dep in other_node.read_writes.reads:
+                        if isinstance(dep, MemoryDep) and dep.name in buf_names:
+                            still_referenced = True
+                            break
+                    if still_referenced:
+                        break
+                if not still_referenced:
+                    actually_removable.add(node_name)
 
-            new_nodes = [n for n in nodes if n.get_name() not in nodes_to_remove]
-            self.nodes = new_nodes
-            self.name_to_node = {n.get_name(): n for n in self.nodes}
-            self.name_to_fused_node = self.name_to_node.copy()
-            self.name_to_buf = {
-                buf.get_name(): buf
-                for node in self.nodes
-                for buf in node.get_outputs()
-            }
-            self.compute_dependencies()
-            self.nodes = self.topological_sort_schedule(self.nodes)
-            self.dead_node_elimination()
-            self.name_to_fused_node = {n.get_name(): n for n in self.nodes}
-            self.compute_ancestors()
-            self.compute_input_distances()
-            new_nodes = list(self.nodes)
-            return new_nodes
+            if actually_removable:
+                # Collect buffer names from removed producers and mark them as
+                # "available" so that dependency pruning doesn't choke on stale refs
+                for node_name in actually_removable:
+                    removed_node = self.name_to_node.get(node_name)
+                    if removed_node is not None:
+                        for buf in removed_node.get_outputs():
+                            self.available_buffer_names.add(buf.get_name())
+
+                new_nodes = [n for n in nodes if n.get_name() not in actually_removable]
+                self.nodes = new_nodes
+                self.name_to_node = {n.get_name(): n for n in self.nodes}
+                self.name_to_fused_node = self.name_to_node.copy()
+                self.name_to_buf = {
+                    buf.get_name(): buf
+                    for node in self.nodes
+                    for buf in node.get_outputs()
+                }
+                self.compute_dependencies()
+                self.nodes = self.topological_sort_schedule(self.nodes)
+                self.dead_node_elimination()
+                self.name_to_fused_node = {n.get_name(): n for n in self.nodes}
+                self.compute_ancestors()
+                self.compute_input_distances()
+                new_nodes = list(self.nodes)
+                return new_nodes
 
         return nodes
 
@@ -5670,6 +5725,16 @@ class Scheduler:
         producer_layout = producer_cb.layout
 
         if not isinstance(producer_layout, (ir.FixedLayout, ir.FlexibleLayout)):
+            return False
+
+        # Don't inline into split-reduction consumers: their _original_inner_fn
+        # is stashed before our pass runs and cancel_reduction_split() will
+        # restore it during codegen, re-introducing the removed buffer reference.
+        consumer_cb_node = consumer_node.node
+        if (
+            isinstance(consumer_cb_node, ir.ComputedBuffer)
+            and getattr(consumer_cb_node, "_original_inner_fn", None) is not None
+        ):
             return False
 
         if isinstance(producer_layout, ir.FlexibleLayout):
