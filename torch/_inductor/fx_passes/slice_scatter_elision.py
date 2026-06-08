@@ -269,7 +269,9 @@ def slice_scatter_elision_pass(graph: fx.Graph) -> fx.Graph:
     # Second pass: handle partial overlap where read extends beyond the scatter
     # region (e.g., read [0:33] from scatter that wrote [1:33]).
     # Rewrite: slice(slice_scatter(base, src, dim, a, b), dim, a2, b2)
-    # where a2 < a and b2 <= b -> cat([clone(slice(base, dim, a2, a)), slice(src, dim, 0, b2-a)], dim)
+    # → slice_scatter(slice(base, dim, a2, b2), src_overlap, dim, a-a2, min(b,b2)-a2)
+    # This creates a SMALL slice_scatter (output-sized) that Inductor lowers to a
+    # fusible Pointwise node, avoiding the ConcatKernel overhead of the cat approach.
     if getattr(config, "slice_scatter_partial_elision", True):
         num_partial = _partial_overlap_elision(graph)
         if num_partial > 0:
@@ -283,16 +285,13 @@ def _partial_overlap_elision(graph: fx.Graph) -> int:
 
     Pattern: slice(slice_scatter(base, src, dim, a, b), dim, a2, b2)
     where the read range [a2, b2) partially overlaps with the write range [a, b).
-    Specifically, we handle:
-      - a2 < a and b2 <= b: read extends before scatter start
-        -> cat([slice(base, dim, a2, a), slice(src, dim, 0, b2-a)], dim)
-      - a2 >= a and b2 > b: read extends after scatter end
-        -> cat([slice(src, dim, a2-a, b-a), slice(base, dim, b, b2)], dim)
-      - a2 < a and b2 > b: read extends on both sides
-        -> cat([slice(base, dim, a2, a), src, slice(base, dim, b, b2)], dim)
 
-    This eliminates data dependencies through the scatter buffer, enabling
-    fusion of the read-path kernel with the write-path kernel.
+    Rewrite to a small slice_scatter over only the read range:
+        slice_scatter(slice(base, dim, a2, b2), src_overlap, dim, max(a,a2)-a2, min(b,b2)-a2)
+
+    This produces a Pointwise IR node of size (b2-a2) instead of the full base size,
+    which can fuse with downstream consumers (permute, clone, etc.) without
+    materializing an intermediate ConcatKernel buffer.
     """
     num_elisions = 0
     nodes_to_erase = []
@@ -344,10 +343,6 @@ def _partial_overlap_elision(graph: fx.Graph) -> int:
         if sl_start >= s_start and sl_end <= s_end:
             continue
 
-        # Check partial overlap conditions
-        has_left_extension = sl_start < s_start
-        has_right_extension = sl_end > s_end
-
         # Verify there IS overlap (not completely disjoint)
         if sl_end <= s_start or sl_start >= s_end:
             continue
@@ -365,87 +360,57 @@ def _partial_overlap_elision(graph: fx.Graph) -> int:
         if base_dim_size is None:
             continue
 
-        # Build the replacement using cat with cloned base slices.
-        # The base slices are cloned and placed BEFORE the scatter node to:
-        # 1. Break storage aliasing (clone creates new storage)
-        # 2. Ensure reads from the base happen before the scatter mutation
-        # This allows the reinplace pass to efficiently convert the scatter to
-        # an in-place write of just the modified slice.
-        prefix = None
-        suffix = None
+        # Compute the overlap region in src coordinates
+        overlap_start_in_src = max(0, sl_start - s_start)
+        overlap_end_in_src = min(src_dim_size, sl_end - s_start)
 
-        # Insert base reads + clones BEFORE the scatter node
+        # Compute where src data lands in the output (read-range-relative coordinates)
+        new_scatter_start = max(s_start, sl_start) - sl_start
+        new_scatter_end = min(s_end, sl_end) - sl_start
+
+        # Build the replacement: slice_scatter(slice(base, dim, a2, b2), src_overlap, dim, offset_start, offset_end)
+        # IMPORTANT: Insert BEFORE the original scatter node, not before the consumer.
+        # This ensures the new nodes are ordered before the scatter in the graph,
+        # which allows the reinplace pass to still convert the original scatter+copy_
+        # to an in-place mutation (reinplace checks for views used AFTER the scatter).
         with graph.inserting_before(scatter_node):
-            if has_left_extension:
-                prefix_slice = graph.call_function(
-                    aten.slice.Tensor,
-                    args=(scatter_base, s_dim, sl_start, s_start, 1),
-                )
-                if "val" in scatter_base.meta:
-                    base_val = scatter_base.meta["val"]
-                    prefix_slice.meta["val"] = base_val.narrow(s_dim, sl_start, s_start - sl_start)
-                prefix = graph.call_function(
-                    aten.clone.default,
-                    args=(prefix_slice,),
-                )
-                if prefix_slice.meta.get("val") is not None:
-                    prefix.meta["val"] = prefix_slice.meta["val"].clone()
+            # Create a view of base covering the read range [a2, b2)
+            base_slice = graph.call_function(
+                aten.slice.Tensor,
+                args=(scatter_base, s_dim, sl_start, sl_end, 1),
+            )
+            if "val" in scatter_base.meta:
+                base_val = scatter_base.meta["val"]
+                base_slice.meta["val"] = base_val.narrow(s_dim, sl_start, sl_end - sl_start)
 
-            if has_right_extension:
-                suffix_slice = graph.call_function(
-                    aten.slice.Tensor,
-                    args=(scatter_base, s_dim, s_end, sl_end, 1),
-                )
-                if "val" in scatter_base.meta:
-                    base_val = scatter_base.meta["val"]
-                    suffix_slice.meta["val"] = base_val.narrow(s_dim, s_end, sl_end - s_end)
-                suffix = graph.call_function(
-                    aten.clone.default,
-                    args=(suffix_slice,),
-                )
-                if suffix_slice.meta.get("val") is not None:
-                    suffix.meta["val"] = suffix_slice.meta["val"].clone()
-
-        # Build the cat BEFORE the consumer node
-        with graph.inserting_before(node):
-            # Middle part from src
-            overlap_start_in_src = max(0, sl_start - s_start)
-            overlap_end_in_src = min(src_dim_size, sl_end - s_start)
+            # Get the src overlap portion
             if overlap_start_in_src == 0 and overlap_end_in_src == src_dim_size:
-                mid = scatter_src
+                src_overlap = scatter_src
             else:
-                mid = graph.call_function(
+                src_overlap = graph.call_function(
                     aten.slice.Tensor,
                     args=(scatter_src, s_dim, overlap_start_in_src, overlap_end_in_src, 1),
                 )
                 if "val" in scatter_src.meta:
                     src_val = scatter_src.meta["val"]
-                    mid.meta["val"] = src_val.narrow(s_dim, overlap_start_in_src, overlap_end_in_src - overlap_start_in_src)
+                    src_overlap.meta["val"] = src_val.narrow(
+                        s_dim, overlap_start_in_src, overlap_end_in_src - overlap_start_in_src
+                    )
 
-            # Assemble parts
-            all_parts = []
-            if prefix is not None:
-                all_parts.append(prefix)
-            all_parts.append(mid)
-            if suffix is not None:
-                all_parts.append(suffix)
-
-            if len(all_parts) == 1:
-                replacement = all_parts[0]
-            else:
-                replacement = graph.call_function(
-                    aten.cat.default,
-                    args=(all_parts, s_dim),
-                )
-                if "val" in node.meta:
-                    replacement.meta["val"] = node.meta["val"]
+            # Create the small slice_scatter over the read range
+            replacement = graph.call_function(
+                aten.slice_scatter.default,
+                args=(base_slice, src_overlap, s_dim, new_scatter_start, new_scatter_end, 1),
+            )
+            if "val" in node.meta:
+                replacement.meta["val"] = node.meta["val"]
 
         node.replace_all_uses_with(replacement)
         nodes_to_erase.append(node)
         num_elisions += 1
         log.info(
-            "slice_scatter_elision: partial overlap - replaced %s with cat "
-            "(read [%d:%d] from scatter [%d:%d], dim=%d)",
+            "slice_scatter_elision: partial overlap - replaced %s with small "
+            "slice_scatter (read [%d:%d] from scatter [%d:%d], dim=%d)",
             node.name,
             sl_start,
             sl_end,
