@@ -4810,6 +4810,20 @@ class Scheduler:
         # we have visited (and potentially removed) all users before visiting a
         # given node.
         updated_nodes = []
+
+        # Graph output buffers must never be eliminated — the wrapper return
+        # statement references them even though no scheduler node reads them.
+        graph_output_names = OrderedSet(V.graph.get_output_names())
+
+        # Mutation targets: if a buffer B is the physical storage that another
+        # buffer M mutates into (mutation_real_name[M] = B), then B must be
+        # kept alive as long as M is alive.  We track which mutation targets
+        # are still live (their mutating buffer hasn't been removed yet).
+        live_mutation_targets: OrderedSet[str] = OrderedSet()
+        for mutating_buf, target_buf in self.mutation_real_name.items():
+            if mutating_buf not in V.graph.removed_buffers:
+                live_mutation_targets.add(target_buf)
+
         for node in reversed(self.nodes):
 
             def can_eliminate_user(user: NodeUser) -> bool:
@@ -4817,10 +4831,13 @@ class Scheduler:
 
             active_buffers = False
             for buf in node.get_outputs():
-                can_eliminate = all(can_eliminate_user(u) for u in buf.users)
-                if can_eliminate:
-                    log.debug("removed dead buffer: %s", buf.get_name())
-                    V.graph.removed_buffers.add(buf.get_name())
+                buf_name = buf.get_name()
+                if buf_name in graph_output_names or buf_name in live_mutation_targets:
+                    # This buffer is a graph output or a live mutation target
+                    active_buffers = True
+                elif all(can_eliminate_user(u) for u in buf.users):
+                    log.debug("removed dead buffer: %s", buf_name)
+                    V.graph.removed_buffers.add(buf_name)
                 else:
                     active_buffers = True
 
