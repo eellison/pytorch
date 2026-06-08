@@ -2575,13 +2575,44 @@ def refresh_group_node_dependencies(
         dependencies.ReadWrites.merge_list([x.read_writes for x in snodes])
     )
 
+    group_buf_names = group_snode.get_buffer_names()
+
+    # Writes with a non-None mode are mutations (e.g., atomic_add from scatter).
+    # They don't allocate the buffer — they assume it already exists.
+    # When scatter nodes are fused, they produce mutation outputs (buf9, buf11)
+    # that share names with the buffers they mutate. A dependency on such a
+    # buffer cannot be satisfied by the scatter's own write — the buffer must
+    # be pre-allocated by an external node. We resolve this by replacing deps
+    # on mutation-write buffer names with deps on their pre-mutation real names
+    # (via mutation_real_name), which point to the actual allocator nodes.
+    mutation_write_names: OrderedSet[str] = OrderedSet()
+    for dep in group_snode.read_writes.writes:
+        if isinstance(dep, MemoryDep) and dep.mode is not None:
+            mutation_write_names.add(dep.name)
+
+    # For buffer names that are only produced via mutation writes within the
+    # group, translate deps to their real (pre-mutation) names so the dependency
+    # points to the actual buffer allocator instead of creating a self-cycle.
+    scheduler = group_snode.scheduler
+    raw_unmet = OrderedSet.union(*[x.unmet_dependencies for x in snodes])
+    translated_unmet: OrderedSet[Dep] = OrderedSet()
+    for dep in raw_unmet:
+        dep_name = dep.name if hasattr(dep, "name") else None
+        if dep_name is not None and dep_name in mutation_write_names:
+            # This dep is on a buffer that is only mutated (not allocated) in
+            # the group. Translate to the real buffer name so we depend on the
+            # allocator node instead of creating a self-dependency.
+            real_name = scheduler.mutation_real_name.get(dep_name, dep_name)
+            if real_name != dep_name and real_name not in group_buf_names:
+                # Replace with a StarDep on the real buffer
+                translated_unmet.add(StarDep(real_name))
+                continue
+        if dep_name is not None and dep_name in group_buf_names:
+            continue
+        translated_unmet.add(dep)
+
     group_snode.unmet_dependencies = (
-        OrderedSet(
-            dep
-            for dep in OrderedSet.union(*[x.unmet_dependencies for x in snodes])
-            if dep.name not in group_snode.get_buffer_names()
-        )
-        - group_snode.read_writes.writes
+        translated_unmet - group_snode.read_writes.writes
     )
 
 
@@ -5441,11 +5472,17 @@ class Scheduler:
 
         # Build a map from producer buffer name -> list of consumer nodes
         # (only consumers eligible for inlining: SchedulerNode + ComputedBuffer + Pointwise/Reduction)
+        # Scatter nodes are excluded despite inheriting from Pointwise — their
+        # indirect write semantics (tl.store at data-dependent indices) break the
+        # InlineProducerHandler approach which assumes loads can be redirected
+        # without affecting write-side indexing.
         buf_to_consumers: dict[str, list[SchedulerNode]] = {}
         for node in nodes:
             if not isinstance(node, SchedulerNode):
                 continue
             if not isinstance(node.node, ir.ComputedBuffer):
+                continue
+            if isinstance(node.node.data, ir.Scatter):
                 continue
             if not isinstance(node.node.data, (ir.Pointwise, ir.Reduction)):
                 continue
@@ -5487,6 +5524,21 @@ class Scheduler:
             if producer_buf_name in graph_output_names:
                 continue
 
+            # Never inline a producer that reads mutation-chain buffers.
+            # If the producer reads a buffer involved in a mutation (e.g.,
+            # buf1 which is the mutated version of buf0), inlining spreads
+            # that dependency to all consumers. This can create cycles when
+            # the mutation source (buf0's producer) gets fused with the
+            # consumers, creating a circular dependency through the mutation.
+            mutation_bufs = set(self.mutation_renames.keys()) | set(self.mutation_renames.values())
+            producer_reads_mutation = False
+            for dep in producer_node.read_writes.reads:
+                if isinstance(dep, MemoryDep) and dep.name in mutation_bufs:
+                    producer_reads_mutation = True
+                    break
+            if producer_reads_mutation:
+                continue
+
             # Get all consumers of this producer buffer
             consumers = buf_to_consumers.get(producer_buf_name, [])
             if not consumers:
@@ -5519,13 +5571,20 @@ class Scheduler:
             # Try to inline into all consumers
             all_success = True
             inlined_consumers = []
+            # Save old inner_fns for rollback if not all consumers succeed
+            saved_inner_fns: list[tuple["SchedulerNode", Any]] = []
             producer_cb = producer_node.node
             for consumer_node in consumers:
+                # Save old inner_fn before attempting inline
+                consumer_cb_node = consumer_node.node
+                assert isinstance(consumer_cb_node, ir.ComputedBuffer)
+                old_fn = consumer_cb_node.data.inner_fn
                 success = self._do_inline_producer(
                     producer_cb, consumer_node, producer_buf_name
                 )
                 if success:
                     inlined_consumers.append(consumer_node)
+                    saved_inner_fns.append((consumer_node, old_fn))
                 else:
                     all_success = False
                     break
@@ -5539,6 +5598,19 @@ class Scheduler:
                         producer_node.get_name(),
                         cn.get_name(),
                     )
+            elif not all_success and inlined_consumers:
+                # Revert already-inlined consumers since we can't remove the
+                # producer (not all consumers could be inlined). Leaving them
+                # with rewritten inner_fns would cause stale user-list issues:
+                # the consumer now reads the producer's inputs directly, but
+                # the user lists on those buffers don't reflect this new reader,
+                # leading to incorrect buffer elimination during codegen.
+                for consumer_node, old_fn in saved_inner_fns:
+                    consumer_cb_node = consumer_node.node
+                    assert isinstance(consumer_cb_node, ir.ComputedBuffer)
+                    object.__setattr__(consumer_cb_node.data, "inner_fn", old_fn)
+                    consumer_cb_node.get_default_sizes_body.clear_cache(consumer_cb_node)
+                    consumer_node.recompute_size_and_body()
 
             processed_producers.add(producer_node.get_name())
 
@@ -5669,10 +5741,25 @@ class Scheduler:
         # memory savings from eliminating the intermediate buffer.
         small_reads = sum(1 for s in read_sizes if s <= producer_output_numel * 0.1)
 
-        if small_reads < 1:
-            return False
+        if small_reads >= 1:
+            return True
 
-        return True
+        # Alternative path: "cheap producer" inlining.
+        # Even without broadcast dominance, a producer with very few ops
+        # (e.g., index remapping + add) is worth inlining if the intermediate
+        # buffer is large enough. The recomputation cost is negligible compared
+        # to the memory traffic savings from eliminating the buffer round-trip.
+        # This handles Swin-style window-reverse + cyclic shift + residual add
+        # patterns where both inputs are full-size but the computation is trivial.
+        opcount = producer_data.inner_fn_opcount()
+        # The intermediate buffer that would be eliminated is the producer's
+        # output. Use 4 bytes per element (f32) as a conservative estimate.
+        # Buffer must be >= 4MB to justify inlining without broadcast dominance.
+        intermediate_bytes = producer_output_numel * 4
+        if opcount.num_ops <= 16 and intermediate_bytes >= 4 * 1024 * 1024:
+            return True
+
+        return False
 
     def _is_inline_profitable(
         self,
@@ -5886,6 +5973,51 @@ class Scheduler:
             object.__setattr__(consumer_data, "inner_fn", old_inner_fn)
             consumer_cb.get_default_sizes_body.clear_cache(consumer_cb)
             return False
+
+        # Verify the inline fully eliminated the producer buffer reference.
+        # The InlineProducerHandler only intercepts top-level ops.load calls.
+        # Loads inside ops.masked() sub-blocks are traced separately and won't
+        # be intercepted, leaving stale references. If the producer buffer is
+        # still in the consumer's reads, revert the change.
+        for dep in consumer_node.read_writes.reads:
+            if isinstance(dep, MemoryDep) and dep.name == producer_buf_name:
+                # Inline didn't fully eliminate the load (e.g., load inside
+                # masked sub-block). Revert to avoid dangling buffer reference.
+                object.__setattr__(consumer_data, "inner_fn", old_inner_fn)
+                consumer_cb.get_default_sizes_body.clear_cache(consumer_cb)
+                consumer_node.recompute_size_and_body()
+                return False
+
+        # Cycle detection: after inlining, the consumer's re-traced inner_fn may
+        # reference pre-mutation buffer names (since inner_fns use original names,
+        # not the renamed versions from update_mutated_names). If the consumer now
+        # reads a buffer that is a pre-mutation source (a key in mutation_renames),
+        # this creates a cycle in memory planning:
+        #   - The mutation node must run after all readers of the pre-mutation buffer
+        #   - So the mutation node would depend on this consumer
+        #   - But this consumer already depends on the mutation result (post-mutation buffer)
+        #   - Cycle: consumer -> mutation_node -> consumer
+        #
+        # Similarly, if the consumer reads any buffer involved in a mutation chain
+        # (either as source or target), and the consumer's existing dependencies
+        # include a node on the other side of that mutation, we risk a cycle.
+        # Check both directions of the mutation chain for safety.
+        if self.mutation_renames:
+            consumer_new_reads = OrderedSet(
+                dep.name for dep in consumer_node.read_writes.reads
+                if isinstance(dep, MemoryDep)
+            )
+            # A pre-mutation buffer name in the consumer's reads means the inner_fn
+            # bypassed mutation renaming. This WILL create a cycle.
+            mutation_sources = set(self.mutation_renames.keys())
+            cycle_inducing_reads = consumer_new_reads & mutation_sources
+            if cycle_inducing_reads:
+                # Revert: consumer reads pre-mutation buffer(s) that would create
+                # a dependency cycle through the mutation ordering constraints.
+                object.__setattr__(consumer_data, "inner_fn", old_inner_fn)
+                consumer_cb.get_default_sizes_body.clear_cache(consumer_cb)
+                consumer_node.recompute_size_and_body()
+                return False
 
         return True
 
@@ -7640,7 +7772,7 @@ class Scheduler:
             return -1
 
         # Currently only handle single read/write operations
-        if len(node2.read_writes.reads) > 1 or len(node2.read_writes.writes) > 1:
+        if len(node2.read_writes.reads) != 1 or len(node2.read_writes.writes) != 1:
             return -1
 
         node2_read = next(iter(node2.read_writes.reads))
