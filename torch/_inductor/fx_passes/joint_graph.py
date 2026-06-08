@@ -329,6 +329,62 @@ class UniformValueConstantFolder(ConstantFolder):
     def _support_dynamic_shape(self):
         return True
 
+    def _is_uniform_tensor(self, t: torch.Tensor) -> bool:
+        """Check if a tensor has all elements equal (uniform value)."""
+        if t.numel() <= 1:
+            return True
+        flat = t.flatten()
+        return torch.equal(flat, flat[0:1].expand_as(flat))
+
+    def run_node(self, node: torch.fx.Node) -> Any:
+        """Override run_node to propagate uniform values through view/expand ops
+        even when shape arguments are unknown (e.g., from placeholder params).
+
+        The base ConstantFolder.run_node short-circuits when any input is unknown.
+        But for view/expand ops, if the tensor input is a known uniform value,
+        the output is still uniform regardless of the target shape.
+        This enables further folding of patterns like:
+            iota(N) >= 0 -> full(True) -> expand(unknown_shape) -> where(_, 0.0, -inf) -> full(0.0)
+        """
+        if node.target == "output":
+            return super().run_node(node)
+
+        args, kwargs = self.fetch_args_kwargs_from_env(node)
+        flattened_inputs = pytree.arg_tree_leaves(*args, **kwargs)
+
+        has_unknown = any(
+            type(self.unknown_value) is type(input_) and self.unknown_value == input_
+            for input_ in flattened_inputs
+        )
+
+        if has_unknown and node.op == "call_function":
+            # For view/reshape/expand ops on uniform tensors: the tensor input (first arg)
+            # being uniform means the output is also uniform with the same scalar value,
+            # regardless of the output shape.
+            if (
+                hasattr(node.target, "overloadpacket")
+                and (
+                    node.target.overloadpacket in self.view_op_packets
+                    or node.target.overloadpacket in self.indexing_op_packets
+                )
+                and len(node.args) >= 1
+                and isinstance(node.args[0], torch.fx.Node)
+            ):
+                input_val = self.env.get(node.args[0])
+                if isinstance(input_val, torch.Tensor) and self._is_uniform_tensor(
+                    input_val
+                ):
+                    # Uniform tensor through a view/expand - still uniform.
+                    # Reduce to a size-1 tensor for downstream propagation.
+                    out = input_val.flatten()[0:1]
+                    self.add_node_replacement(node, out)
+                    return out
+
+            return self.unknown_value
+
+        # No unknown inputs - fall through to normal processing
+        return super().run_node(node)
+
     def insertable_tensor_check(self, t: torch.Tensor) -> bool:
         return True
 
@@ -402,17 +458,20 @@ class UniformValueConstantFolder(ConstantFolder):
             return super(ConstantFolder, self).run_node(node)
 
         # view ops, return input tensor, the first argument
-        # This pass-through only works when the input is a uniform size-1 substitute.
-        # If the input is a full (non-uniform) tensor from actual evaluation, we
-        # fall through to the fallback handler which runs the op correctly.
+        # This pass-through works when the input is a uniform substitute (all
+        # elements equal). A uniform tensor stays uniform through any view/expand.
+        # We reduce to a size-1 tensor for efficient downstream propagation.
         if hasattr(node.target, "overloadpacket") and (
             node.target.overloadpacket in self.view_op_packets
             or node.target.overloadpacket in self.indexing_op_packets
         ):
             assert isinstance(node.args[0], torch.fx.Node)
             input_val = self.env[node.args[0]]
-            if isinstance(input_val, torch.Tensor) and input_val.numel() == 1:
-                return input_val
+            if isinstance(input_val, torch.Tensor):
+                if input_val.numel() == 1:
+                    return input_val
+                if self._is_uniform_tensor(input_val):
+                    return input_val.flatten()[0:1]
 
         # we don't want to return unknown value for symints so that we can
         # still constant fold through their use in constructors or views
