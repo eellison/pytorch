@@ -2139,13 +2139,38 @@ class Reduction(Loops):
         )
 
         assert original_ranges == new_ranges[: len(original_ranges)]
+        second_step_reduction_ranges = new_ranges[len(original_ranges) :]
+        second_step_numel_hint = V.graph.sizevars.optimization_hint(
+            sympy_product(second_step_reduction_ranges)
+        )
+        # When the second step reduction is still large (e.g., summing 1M+ row
+        # partials to a scalar), use Reduction.create() so the split heuristic
+        # can further decompose it. Pass input_node=None to avoid infinite
+        # recursion (the intermediate's ranges would trigger -1 split again).
+        if (
+            numel_hint <= 1
+            and second_step_numel_hint > 8192
+            and config.split_reductions
+            and config.split_multilayer_second_step
+        ):
+            return Reduction.create(
+                device,
+                dst_dtype,
+                src_dtype,
+                intermediate_fn,
+                original_ranges,
+                second_step_reduction_ranges,
+                reduction_type,
+                reduction_hint,
+                input_node=None,
+            )
         return TensorBox.create(
             Reduction(
                 device=device,
                 dtype=dst_dtype,
                 inner_fn=intermediate_fn,
                 ranges=original_ranges,
-                reduction_ranges=new_ranges[len(original_ranges) :],
+                reduction_ranges=second_step_reduction_ranges,
                 reduction_type=reduction_type,
                 src_dtype=src_dtype,
                 reduction_hint=reduction_hint,

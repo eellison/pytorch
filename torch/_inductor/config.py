@@ -1061,6 +1061,13 @@ _sibling_reduction_fusion = False
 # This enables the partial reduction to fuse into the producer kernel.
 split_reductions_for_fusion = True
 
+# When create_multilayer_existing_ranges produces a second-step reduction that
+# is still large (> 8192 elements to a single scalar), further split it via
+# Reduction.create() instead of leaving it as a single-CTA serial loop.
+# This helps patterns like sum(rmsnorm(x)) where the row sums (e.g., 1.15M values)
+# would otherwise be reduced sequentially in a single thread block.
+split_multilayer_second_step: bool = True
+
 # A deterministic mode that skips any on device benchmarking in Inductor
 # if we know they affect numerics.  WARNING: Expect perf hit in this mode.
 deterministic = os.getenv("TORCHINDUCTOR_DETERMINISTIC") == "1"
