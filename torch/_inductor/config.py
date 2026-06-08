@@ -1321,14 +1321,6 @@ expand_sum_elision = (
     os.environ.get("TORCHINDUCTOR_EXPAND_SUM_ELISION", "1") == "1"
 )
 
-# Degenerate dropout elimination: folds dropout patterns where the keep probability
-# is effectively 1.0 (threshold < 1e-10, scale == 1.0) to identity. Common in
-# Longformer/DistilGPT2/FNet training graphs that use `rand > 1e-30` as a no-op mask.
-degenerate_dropout_elimination = (
-    os.environ.get("TORCHINDUCTOR_DEGENERATE_DROPOUT_ELIMINATION", "1") == "1"
-)
-
-
 # BN-inference affine folding: folds decomposed batch normalization inference
 # (sub(x,mean) -> mul(inv_std) -> mul(weight) -> add(bias)) into precomputed
 # scale/shift: output = x * scale + shift. Saves 2 per-channel loads and 3 ops per element.
@@ -3181,13 +3173,6 @@ emulate_precision_casts: bool = (
 # forward and backward consume the same precision.
 emulate_precision_casts_on_saved_tensors: bool = (
     os.environ.get("TORCHINDUCTOR_EMULATE_PRECISION_CASTS_ON_SAVED_TENSORS", "1") == "1"
-)
-
-# Masked-softmax any-reduction elimination: when any(x != -inf, dim) is computed
-# on (scores + where(mask, 0, -inf)) and the mask is constant along the reduction
-# dim, replaces the any-reduction with the mask value directly.
-masked_softmax_any_elimination = (
-    os.environ.get("TORCHINDUCTOR_MASKED_SOFTMAX_ANY_ELIMINATION", "1") == "1"
 )
 
 # adds patch, save_config, etc

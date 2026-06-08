@@ -625,28 +625,12 @@ def post_grad_passes(gm: torch.fx.GraphModule, is_inference: bool):
             GraphTransformObserver(
                 gm, "as_strided_scatter_elision"
             ).apply_graph_pass(as_strided_scatter_elision_pass)
-        if config.degenerate_dropout_elimination:
-            from .degenerate_dropout_elimination import (
-                degenerate_dropout_elimination_pass,
-            )
-
-            GraphTransformObserver(
-                gm, "degenerate_dropout_elimination"
-            ).apply_graph_pass(degenerate_dropout_elimination_pass)
         if config.expand_sum_elision:
             from .expand_sum_elision import expand_sum_elision_pass
 
             GraphTransformObserver(
                 gm, "expand_sum_elision"
             ).apply_graph_pass(expand_sum_elision_pass)
-        if config.masked_softmax_any_elimination:
-            from .masked_softmax_any_elimination import (
-                masked_softmax_any_elimination_pass,
-            )
-
-            GraphTransformObserver(
-                gm, "masked_softmax_any_elimination"
-            ).apply_graph_pass(masked_softmax_any_elimination_pass)
         if config.scatter_reduce_fusion:
             from .scatter_reduce_fusion import scatter_reduce_fusion_pass
 
