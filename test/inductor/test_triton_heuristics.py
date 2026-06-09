@@ -4,13 +4,17 @@ import functools
 import os
 import sys
 import tempfile
+import threading
 import unittest
+from types import SimpleNamespace
 from unittest import skipUnless
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import torch
 from torch._dynamo.testing import rand_strided
-from torch._inductor.runtime.triton_compat import HAS_WARP_SPEC
+from torch._dynamo.utils import counters
+from torch._inductor import config, metrics
+from torch._inductor.runtime.triton_compat import HAS_WARP_SPEC, OutOfResources
 from torch._inductor.utils import clone_preserve_strides
 from torch.testing._internal.common_utils import (
     instantiate_parametrized_tests,
@@ -35,7 +39,8 @@ except ImportError:
         sys.exit(0)
     raise unittest.SkipTest("requires triton")  # noqa: B904
 
-from torch._inductor import config
+from torch._inductor.codegen.common import REMOVED
+from torch._inductor.codegen.triton_combo_kernel import ComboKernel
 from torch._inductor.runtime.hints import (
     AttrsDescriptorWrapper,
     AutotuneHint,
@@ -47,10 +52,14 @@ from torch._inductor.runtime.triton_helpers import math as tl_math
 from torch._inductor.runtime.triton_heuristics import (
     autotune_hints_to_configs,
     CachingAutotuner,
+    cached_autotune,
+    hash_configs,
     template,
     triton_config,
 )
+from torch._inductor.runtime.coordinate_descent_tuner import CoordescTuner
 from torch._inductor.test_case import run_tests, TestCase
+
 
 
 @triton.jit
@@ -190,6 +199,952 @@ class TestTritonHeuristics(TestCase):
 
         with self.assertRaisesRegex(AssertionError, "pre_hook"):
             CachingAutotuner(**args)
+
+    def test_coordinate_descent_batch_inactive_fallback_uses_scalar_benchmarking(
+        self,
+    ):
+        order = []
+
+        class Launcher:
+            config = triton.Config({"XBLOCK": 4}, num_warps=4, num_stages=1)
+            cache_hash = "hash"
+            store_cubin = False
+
+            def __call__(self, *args, stream, **kwargs):
+                order.append(("launch", stream))
+
+        launcher = Launcher()
+        autotuner = object.__new__(CachingAutotuner)
+        autotuner.fn = SimpleNamespace(__name__="kernel")
+        autotuner.triton_meta = {"signature": {}}
+        autotuner.inductor_meta = {
+            "coordinate_descent_tuning": True,
+            "coordinate_descent_tuning_batch": True,
+            "coordinate_descent_tuning_batch_policy": "all",
+        }
+        autotuner.device_props = SimpleNamespace(type="cpu")
+        autotuner.triton_interpret = False
+        autotuner.configs = None
+        autotuner.launchers = [launcher]
+        autotuner._cached_launcher = None
+        autotuner._cache_eligible = False
+        autotuner._coordinate_descent_batch_enabled = lambda: True
+        autotuner._recheck_coordesc_cache_before_runtime_tuning = (
+            lambda: order.append("recheck")
+        )
+
+        def prepare_for_benchmark(*args, **kwargs):
+            runtime_coordesc_cache_recheck = kwargs.get(
+                "runtime_coordesc_cache_recheck"
+            )
+            order.append(("prepare", runtime_coordesc_cache_recheck))
+            if runtime_coordesc_cache_recheck:
+                autotuner._recheck_coordesc_cache_before_runtime_tuning()
+
+        autotuner.prepare_for_benchmark = prepare_for_benchmark
+        autotuner._pre_launch = lambda *args, **kwargs: order.append("pre")
+        autotuner._post_launch = lambda: order.append("post")
+
+        def coordinate_descent_tuning(launcher, *args, **kwargs):
+            order.append(("coordesc", kwargs.get("use_batch_benchmarking")))
+            launcher.config.found_by_coordesc = True
+            return launcher
+
+        autotuner.coordinate_descent_tuning = coordinate_descent_tuning
+
+        with (
+            patch(
+                "torch._inductor.runtime.triton_heuristics.TritonBundler.put_winner"
+            ),
+            patch(
+                "torch._inductor.runtime.triton_heuristics.triton.set_allocator",
+                create=True,
+            ),
+        ):
+            autotuner.run("arg", stream=17)
+
+        self.assertEqual(
+            order,
+            [
+                ("prepare", True),
+                "recheck",
+                ("coordesc", False),
+                "pre",
+                ("launch", 17),
+                "post",
+            ],
+        )
+
+    def test_coordinate_descent_batch_skips_benchmark_run(self):
+        order = []
+        test_case = self
+
+        class Launcher:
+            config = triton.Config({"XBLOCK": 4}, num_warps=4, num_stages=1)
+            cache_hash = "hash"
+            store_cubin = False
+
+            def __call__(self, *args, stream, **kwargs):
+                order.append(("launch", stream))
+
+        class Batch:
+            disposable_args = True
+
+            def enqueue(self, *args, **kwargs):
+                test_case.fail("benchmark_run should not enqueue coordesc")
+
+        launcher = Launcher()
+        autotuner = object.__new__(CachingAutotuner)
+        autotuner.fn = SimpleNamespace(__name__="kernel")
+        autotuner.triton_meta = {"signature": {}}
+        autotuner.inductor_meta = {
+            "coordinate_descent_tuning": True,
+            "coordinate_descent_tuning_batch": True,
+            "coordinate_descent_tuning_batch_policy": "all",
+        }
+        autotuner.device_props = SimpleNamespace(type="cpu")
+        autotuner.triton_interpret = False
+        autotuner.configs = None
+        autotuner.launchers = [launcher]
+        autotuner._cached_launcher = None
+        autotuner._cache_eligible = False
+        autotuner._pre_launch = lambda *args, **kwargs: order.append("pre")
+        autotuner._post_launch = lambda: order.append("post")
+
+        with (
+            patch(
+                "torch._inductor.runtime.triton_heuristics.get_active_autotune_queue",
+                return_value=Batch(),
+            ),
+            patch(
+                "torch._inductor.runtime.triton_heuristics.TritonBundler.put_winner"
+            ),
+            patch(
+                "torch._inductor.runtime.triton_heuristics.triton.set_allocator",
+                create=True,
+            ),
+        ):
+            autotuner.run("arg", stream=11, benchmark_run=True)
+
+        self.assertEqual(order, ["pre", ("launch", 11), "post"])
+
+    def test_autotune_to_one_config_can_skip_cache_save(self):
+        class Launcher:
+            def __init__(self, name):
+                self.name = name
+                self.config = triton.Config({"XBLOCK": 4}, num_warps=4, num_stages=1)
+                self.cache_hash = name
+                self.n_regs = 0
+                self.n_spills = 0
+                self.shared = 0
+
+        slow = Launcher("slow")
+        fast = Launcher("fast")
+        autotuner = object.__new__(CachingAutotuner)
+        autotuner.fn = SimpleNamespace(__name__="kernel")
+        autotuner.inductor_meta = {
+            "coordinate_descent_tuning": True,
+            "coordinate_descent_tuning_batch": True,
+            "coordinate_descent_tuning_batch_policy": "all",
+        }
+        autotuner.launchers = [slow, fast]
+        autotuner.precompile_time_taken_ns = 0
+        autotuner.benchmark_failure_reasons = {}
+        autotuner.benchmark_all_configs = lambda *args, **kwargs: {
+            slow: 2.0,
+            fast: 1.0,
+        }
+        autotuner.save_cache_hook = MagicMock(
+            side_effect=AssertionError("benchmark_run should not save autotune cache")
+        )
+
+        with patch(
+            "torch._inductor.runtime.triton_heuristics.TritonBundler.put_winner"
+        ) as put_winner:
+            autotuner.autotune_to_one_config("arg", save_cache=False)
+
+        self.assertEqual(autotuner.launchers, [fast])
+        put_winner.assert_called_once_with("fast")
+        autotuner.save_cache_hook.assert_not_called()
+
+    def test_autotune_to_one_config_does_not_save_pre_coordesc_as_coordesc(self):
+        class Launcher:
+            def __init__(self, name):
+                self.name = name
+                self.config = triton.Config({"XBLOCK": 4}, num_warps=4, num_stages=1)
+                self.cache_hash = name
+                self.n_regs = 0
+                self.n_spills = 0
+                self.shared = 0
+
+        slow = Launcher("slow")
+        fast = Launcher("fast")
+        autotuner = object.__new__(CachingAutotuner)
+        autotuner.fn = SimpleNamespace(__name__="kernel")
+        autotuner.inductor_meta = {
+            "coordinate_descent_tuning": True,
+            "coordinate_descent_tuning_batch": True,
+            "coordinate_descent_tuning_batch_policy": "all",
+        }
+        autotuner.launchers = [slow, fast]
+        autotuner.precompile_time_taken_ns = 0
+        autotuner.benchmark_failure_reasons = {}
+        autotuner.benchmark_all_configs = lambda *args, **kwargs: {
+            slow: 2.0,
+            fast: 1.0,
+        }
+        autotuner.save_cache_hook = MagicMock()
+
+        with patch(
+            "torch._inductor.runtime.triton_heuristics.TritonBundler.put_winner"
+        ):
+            autotuner.autotune_to_one_config("arg")
+
+        autotuner.save_cache_hook.assert_called_once()
+        kwargs = autotuner.save_cache_hook.call_args.kwargs
+        self.assertFalse(kwargs["found_by_coordesc"])
+        self.assertFalse(kwargs["coordinate_descent_tuning_batch"])
+        self.assertIsNone(kwargs["coordinate_descent_tuning_batch_policy"])
+
+    @staticmethod
+    def _coordesc_batch_patch(**overrides):
+        config_values = {
+            "compile_threads": 2,
+            "coordinate_descent_tuning": True,
+            "coordinate_descent_tuning_batch": True,
+        }
+        config_values.update(overrides)
+        return config.patch(config_values)
+
+    def test_finish_coordinate_descent_tuning_clears_process_pool_submitter(self):
+        config0 = triton.Config({"XBLOCK": 1}, num_warps=4, num_stages=1)
+        launcher = SimpleNamespace(
+            config=config0,
+            cache_hash="winner-hash",
+        )
+        autotuner = object.__new__(CachingAutotuner)
+        autotuner.autotune_time_taken_ns = 0
+        autotuner.fn = SimpleNamespace(src="def kernel(): pass")
+        autotuner.inductor_meta = {
+            "coordinate_descent_tuning_batch_policy": "auto",
+        }
+        autotuner.save_cache_hook = None
+        autotuner.size_hints = {"x": 1}
+        autotuner._config_compile_submitter = Mock()
+
+        winner = autotuner._finish_coordinate_descent_tuning(
+            config0,
+            {config0: launcher},
+            coordesc_time_taken_ns=1,
+            save_cache=False,
+        )
+
+        self.assertIs(winner, launcher)
+        self.assertIsNone(autotuner._config_compile_submitter)
+
+    def test_sync_triton_deferred_static_precompile_gets_process_pool_submitter(self):
+        from torch._inductor.async_compile import AsyncCompile, CompiledTritonKernels
+
+        source = "@triton.jit\ndef kernel_sync_deferred():\n    pass\n"
+        precompile_calls = []
+        kernel = object.__new__(CachingAutotuner)
+        kernel._config_compile_submitter = None
+        kernel._static_config_compile_submitter = None
+        kernel._static_triton_bundle_key = None
+        kernel.set_compile_info = lambda compile_id, is_backward: None
+        kernel.autotune_cache_info = {}
+
+        def precompile(**kwargs):
+            precompile_calls.append(kwargs)
+            self.assertIsNone(kernel._config_compile_submitter)
+            self.assertIsNotNone(kernel._static_config_compile_submitter)
+            self.assertIsNotNone(kernel._static_triton_bundle_key)
+
+        kernel.precompile = precompile
+        pool = SimpleNamespace(submit=Mock(return_value="config-future"))
+        candidate_config = triton.Config({"XBLOCK": 2}, num_warps=4, num_stages=1)
+
+        try:
+            with (
+                config.patch({"compile_threads": 2}),
+                patch.object(AsyncCompile, "use_process_pool", return_value=False),
+                patch.object(AsyncCompile, "process_pool", return_value=pool),
+                patch(
+                    "torch._inductor.async_compile._load_triton_kernel_from_source",
+                    return_value=kernel,
+                ),
+                patch(
+                    "torch._inductor.runtime.autotune_common._should_defer_static_autotune_precompile",
+                    return_value=True,
+                ),
+            ):
+                result = AsyncCompile().triton("kernel_sync_deferred", source)
+                self.assertEqual(
+                    result._static_config_compile_submitter([candidate_config]),
+                    "config-future",
+                )
+
+            self.assertIs(result, kernel)
+            self.assertIsNone(result._config_compile_submitter)
+            self.assertIsNotNone(result._static_config_compile_submitter)
+            self.assertEqual(
+                precompile_calls,
+                [
+                    {
+                        "warm_cache_only": False,
+                        "static_triton_bundle_key": None,
+                        "max_configs": 1,
+                    }
+                ],
+            )
+            pool.submit.assert_called_once()
+        finally:
+            CompiledTritonKernels.remove_future(source)
+
+    def test_triton_future_result_is_idempotent_for_deferred_static(self):
+        from torch._inductor.async_compile import AsyncCompile, CompiledTritonKernels
+
+        class Future:
+            def __init__(self, result):
+                self._result = result
+                self.result_calls = 0
+
+            def result(self, timeout=None):
+                self.result_calls += 1
+                return self._result
+
+        source = "@triton.jit\ndef kernel_idempotent():\n    pass\n"
+        precompile_calls = []
+        restore_calls = []
+        kernel = object.__new__(CachingAutotuner)
+        kernel.set_compile_info = lambda compile_id, is_backward: None
+        kernel.restore_after_unpickle = lambda old_values: restore_calls.append(
+            old_values
+        )
+        kernel.precompile = lambda **kwargs: precompile_calls.append(kwargs)
+        kernel.autotune_cache_info = {}
+        task = Future((kernel, 1))
+        pool = SimpleNamespace(submit=Mock(return_value=task))
+
+        try:
+            with (
+                config.patch({"compile_threads": 2}),
+                patch.object(AsyncCompile, "use_process_pool", return_value=True),
+                patch.object(AsyncCompile, "process_pool", return_value=pool),
+                patch(
+                    "torch._inductor.runtime.autotune_common._has_deferred_static_autotune_precompile",
+                    return_value=True,
+                ),
+            ):
+                future = AsyncCompile().triton("kernel_idempotent", source)
+                first = future.result()
+                second = future.result()
+
+            self.assertIs(first, second)
+            self.assertEqual(task.result_calls, 1)
+            self.assertEqual(restore_calls, [None])
+            self.assertEqual(len(precompile_calls), 1)
+            self.assertIsNone(CompiledTritonKernels.get(source))
+        finally:
+            CompiledTritonKernels.remove_future(source)
+
+    def test_caching_state_strips_process_pool_compile_submitters(self):
+        autotuner = object.__new__(CachingAutotuner)
+        autotuner.launchers = []
+        autotuner.compile_results = []
+        autotuner._config_compile_submitter = lambda configs: None
+        autotuner._static_config_compile_submitter = lambda configs: None
+        autotuner._static_triton_bundle_key = "static-key"
+        autotuner.lock = object()
+
+        state = autotuner.__getstate__()
+        self.assertIsNone(state["_config_compile_submitter"])
+        self.assertIsNone(state["_static_config_compile_submitter"])
+        self.assertIsNone(state["_static_triton_bundle_key"])
+
+        autotuner.prepare_for_caching()
+        self.assertIsNone(autotuner._config_compile_submitter)
+        self.assertIsNone(autotuner._static_config_compile_submitter)
+        self.assertIsNone(autotuner._static_triton_bundle_key)
+
+    def test_partial_precompile_skips_invalid_until_first_valid_config(self):
+        bad_config = triton.Config({"XBLOCK": 1}, num_warps=4, num_stages=1)
+        good_config = triton.Config({"XBLOCK": 2}, num_warps=4, num_stages=1)
+        later_config = triton.Config({"XBLOCK": 4}, num_warps=4, num_stages=1)
+        autotuner = object.__new__(CachingAutotuner)
+        autotuner.compile_results = []
+        autotuner.launchers = []
+        autotuner.configs = [bad_config, good_config, later_config]
+
+        def precompile_config(config):
+            if config is bad_config:
+                raise OutOfResources(2, 1, "shared memory")
+            return SimpleNamespace(
+                config=config,
+                kernel=SimpleNamespace(hash=f"hash-{config.kwargs['XBLOCK']}"),
+            )
+
+        autotuner._precompile_config = precompile_config
+
+        autotuner._precompile_worker(max_configs=1)
+
+        self.assertEqual(
+            [result.config for result in autotuner.compile_results],
+            [good_config],
+        )
+        self.assertEqual(autotuner.configs, [later_config])
+
+    def test_benchmark_clone_args_does_not_clone_unmutated_args(self):
+        autotuner = object.__new__(CachingAutotuner)
+        autotuner.fn = SimpleNamespace(arg_names=["inp", "out"])
+        autotuner.inductor_meta = {}
+        autotuner.mutated_arg_names = []
+
+        inp = torch.ones(2)
+        out = torch.zeros(2)
+        cloned_args, cloned_kwargs = autotuner.maybe_clone_args(set(), inp, out)
+
+        self.assertEqual(cloned_kwargs, {})
+        self.assertIs(cloned_args[0], inp)
+        self.assertIs(cloned_args[1], out)
+
+    def test_benchmark_clone_args_clones_mutated_inputs(self):
+        autotuner = object.__new__(CachingAutotuner)
+        autotuner.fn = SimpleNamespace(arg_names=["inp", "out"])
+        autotuner.inductor_meta = {
+            "mutated_input_arg_names": ["inp"],
+        }
+        autotuner.mutated_arg_names = []
+
+        inp = torch.ones(2)
+        out = torch.zeros(2)
+        cloned_args, cloned_kwargs = autotuner.maybe_clone_args(set(), inp, out)
+
+        self.assertEqual(cloned_kwargs, {})
+        self.assertIsNot(cloned_args[0], inp)
+        self.assertIs(cloned_args[1], out)
+        cloned_args[0].add_(1)
+        self.assertEqual(inp, torch.ones_like(inp))
+
+    def test_benchmark_clone_args_clones_reset_to_zero_workspace(self):
+        autotuner = object.__new__(CachingAutotuner)
+        autotuner.fn = SimpleNamespace(arg_names=["inp", "workspace"])
+        autotuner.inductor_meta = {
+            "mutated_input_arg_names": [],
+        }
+        autotuner.mutated_arg_names = []
+        autotuner.reset_to_zero_arg_names = ["workspace"]
+
+        inp = torch.ones(2)
+        workspace = torch.zeros(2)
+        cloned_args, cloned_kwargs = autotuner.maybe_clone_args(
+            set(), inp, workspace
+        )
+
+        self.assertEqual(cloned_kwargs, {})
+        self.assertIs(cloned_args[0], inp)
+        self.assertIsNot(cloned_args[1], workspace)
+        cloned_args[1].add_(1)
+        self.assertEqual(workspace, torch.zeros_like(workspace))
+
+    def test_legacy_benchmark_clone_args_clones_mutated_args(self):
+        autotuner = object.__new__(CachingAutotuner)
+        autotuner.fn = SimpleNamespace(arg_names=["inp", "out"])
+        autotuner.inductor_meta = {}
+        autotuner.mutated_arg_names = ["inp"]
+
+        inp = torch.ones(2)
+        out = torch.zeros(2)
+        cloned_args, cloned_kwargs = autotuner.maybe_clone_args(set(), inp, out)
+
+        self.assertEqual(cloned_kwargs, {})
+        self.assertIsNot(cloned_args[0], inp)
+        self.assertIs(cloned_args[1], out)
+        cloned_args[0].add_(1)
+        self.assertEqual(inp, torch.ones_like(inp))
+
+    def test_combo_kernel_mutated_input_args_include_inplace_inputs(self):
+        combo = object.__new__(ComboKernel)
+        combo.sub_kernels = [
+            SimpleNamespace(
+                mutations=["inplace"],
+                removed_buffers=set(),
+                args=SimpleNamespace(
+                    input_buffers={"inplace": "in_out_ptr0"},
+                    inplace_buffers={},
+                    output_buffers={"out": "out_ptr0", "removed": REMOVED},
+                ),
+            ),
+            SimpleNamespace(
+                mutations=[],
+                removed_buffers=set(),
+                args=SimpleNamespace(
+                    input_buffers={},
+                    inplace_buffers={},
+                    output_buffers={"out": "out_ptr1"},
+                ),
+            ),
+        ]
+
+        self.assertEqual(
+            combo.get_mutated_input_args_sub_kernels(),
+            ["in_out_ptr0"],
+        )
+
+    @skipUnless(HAS_GPU, "requires GPU")
+    def test_copy_args_to_cpu_excludes_unmutated_args(self):
+        autotuner = object.__new__(CachingAutotuner)
+        autotuner.fn = SimpleNamespace(arg_names=["inp", "out"])
+        autotuner.inductor_meta = {}
+        autotuner.mutated_arg_names = []
+        autotuner.optimize_mem = True
+
+        inp = torch.ones(8, device=GPU_TYPE)
+        out = torch.zeros(8, device=GPU_TYPE)
+
+        with (
+            patch("torch.accelerator.current_accelerator", return_value=object()),
+            patch("torch.accelerator.max_memory_allocated", return_value=0),
+            patch("torch.accelerator.memory_allocated", return_value=0),
+        ):
+            cpu_copies = autotuner.copy_args_to_cpu_if_needed(inp, out)
+
+        self.assertEqual(cpu_copies, {})
+
+    @skipUnless(HAS_GPU, "requires GPU")
+    def test_copy_args_to_cpu_includes_mutated_inputs(self):
+        autotuner = object.__new__(CachingAutotuner)
+        autotuner.fn = SimpleNamespace(arg_names=["inp", "out"])
+        autotuner.inductor_meta = {
+            "mutated_input_arg_names": ["inp"],
+        }
+        autotuner.mutated_arg_names = []
+        autotuner.optimize_mem = True
+
+        inp = torch.ones(8, device=GPU_TYPE)
+        out = torch.zeros(8, device=GPU_TYPE)
+
+        with (
+            patch("torch.accelerator.current_accelerator", return_value=object()),
+            patch("torch.accelerator.max_memory_allocated", return_value=0),
+            patch("torch.accelerator.memory_allocated", return_value=0),
+        ):
+            cpu_copies = autotuner.copy_args_to_cpu_if_needed(inp, out)
+
+        self.assertEqual(list(cpu_copies), ["inp"])
+        self.assertIs(cpu_copies["inp"][0], inp)
+
+    def test_prepare_for_benchmark_runs_coordesc_without_cache(self):
+        class Launcher:
+            def __init__(self, name):
+                self.name = name
+                self.config = triton.Config(
+                    {"XBLOCK": 4}, num_warps=4, num_stages=1
+                )
+
+        base = Launcher("base")
+        tuned = Launcher("tuned")
+        calls = []
+        autotuner = object.__new__(CachingAutotuner)
+        autotuner.launchers = [base]
+        autotuner.inductor_meta = {"coordinate_descent_tuning": True}
+
+        def coordinate_descent_tuning(launcher, *args, save_cache=True, **kwargs):
+            calls.append((launcher.name, args, save_cache, kwargs))
+            tuned.config.found_by_coordesc = True
+            return tuned
+
+        autotuner.coordinate_descent_tuning = coordinate_descent_tuning
+
+        result = autotuner.prepare_for_benchmark(
+            "arg",
+            coordinate_descent=True,
+            save_cache=False,
+            kw="value",
+        )
+
+        self.assertIs(result, tuned)
+        self.assertEqual(autotuner.launchers, [tuned])
+        self.assertEqual(calls, [("base", ("arg",), False, {"kw": "value"})])
+
+    def test_prepare_for_benchmark_installs_allocator_before_tuning(self):
+        class Launcher:
+            def __init__(self):
+                self.config = triton.Config(
+                    {"XBLOCK": 4}, num_warps=4, num_stages=1
+                )
+
+        launcher = Launcher()
+        calls = []
+        autotuner = object.__new__(CachingAutotuner)
+        autotuner.launchers = [launcher]
+        autotuner.device_props = SimpleNamespace(type="cpu")
+        autotuner.inductor_meta = {"coordinate_descent_tuning": True}
+
+        def coordinate_descent_tuning(launcher, *args, save_cache=True, **kwargs):
+            calls.append("coordesc")
+            return launcher
+
+        autotuner.coordinate_descent_tuning = coordinate_descent_tuning
+
+        def set_allocator(alloc_fn):
+            calls.append("allocator")
+
+        with patch(
+            "torch._inductor.runtime.triton_heuristics.triton.set_allocator",
+            side_effect=set_allocator,
+            create=True,
+        ):
+            autotuner.prepare_for_benchmark("arg", coordinate_descent=True)
+
+        self.assertEqual(calls, ["allocator", "coordesc"])
+
+    def test_prepare_for_benchmark_forwards_save_cache_to_combo(self):
+        class Launcher:
+            def __init__(self):
+                self.config = triton.Config(
+                    {"XBLOCK": 4}, num_warps=4, num_stages=1
+                )
+
+        launcher = Launcher()
+        calls = []
+        autotuner = object.__new__(CachingAutotuner)
+        autotuner.launchers = [launcher]
+        autotuner.inductor_meta = {"combo_tuning_groups": [{"group": 0}]}
+        autotuner.compile_id = None
+        autotuner.is_backward = False
+
+        def combo(launcher, *args, save_cache=True, **kwargs):
+            calls.append((args, save_cache, kwargs))
+            launcher.config.found_by_combo_autotune = True
+            return launcher
+
+        autotuner._combo_sequential_autotune = combo
+
+        result = autotuner.prepare_for_benchmark(
+            "arg",
+            coordinate_descent=False,
+            save_cache=False,
+            kw="value",
+        )
+
+        self.assertIs(result, launcher)
+        self.assertEqual(calls, [(("arg",), False, {"kw": "value"})])
+
+    def test_coordinate_descent_heuristic_type_maps_split_scan(self):
+        from torch._inductor.codegen.triton import _coordinate_descent_heuristic_type
+
+        self.assertEqual(
+            _coordinate_descent_heuristic_type("split_scan"),
+            HeuristicType.SPLIT_SCAN,
+        )
+
+    @skipUnless(HAS_GPU_AND_TRITON, "requires GPU and Triton")
+    @skipIfXpu(msg="queued coordinate descent tuning requires CUDA")
+    def test_coordinate_descent_batch_generated_compile_time_queue(self):
+        def fn(a):
+            x = (torch.sin(a) * torch.cos(a)).sum(dim=1)
+            return (x * x).sum()
+
+        inp = torch.randn(128, 256, device=GPU_TYPE)
+
+        metrics.reset()
+        counters.clear()
+        torch._dynamo.reset()
+        with config.patch(
+            {
+                "coordinate_descent_tuning": True,
+                "coordinate_descent_tuning_batch": True,
+                "coordinate_descent_tuning_batch_min_kernels": 1,
+                "compile_threads": 2,
+                "triton.autotune_at_compile_time": True,
+                "autotune_local_cache": False,
+                "autotune_remote_cache": False,
+                "fx_graph_cache": False,
+            }
+        ):
+            actual = torch.compile(fn, fullgraph=True)(inp)
+
+        torch.get_device_module(GPU_TYPE).synchronize()
+        self.assertEqual(actual, fn(inp))
+        self.assertGreaterEqual(metrics.generated_kernel_count, 2)
+        self.assertGreaterEqual(
+            counters["inductor"]["autotune_queue_tasks"], 1
+        )
+        self.assertGreater(
+            counters["inductor"]["autotune_queue_process_pool_compiles"], 0
+        )
+
+    @skipUnless(HAS_GPU_AND_TRITON, "requires GPU and Triton")
+    @skipIfXpu(msg="queued coordinate descent tuning requires CUDA")
+    def test_coordinate_descent_batch_per_kernel_alloc_opts_out(self):
+        def fn(a):
+            x = (torch.sin(a) * torch.cos(a)).sum(dim=1)
+            return (x * x).sum()
+
+        inp = torch.randn(128, 256, device=GPU_TYPE)
+
+        metrics.reset()
+        counters.clear()
+        torch._dynamo.reset()
+        with config.patch(
+            {
+                "aot_inductor.autotune_per_kernel_alloc": True,
+                "coordinate_descent_tuning": True,
+                "coordinate_descent_tuning_batch": True,
+                "coordinate_descent_tuning_batch_min_kernels": 1,
+                "compile_threads": 2,
+                "triton.autotune_at_compile_time": True,
+            }
+        ):
+            actual = torch.compile(fn, fullgraph=True)(inp)
+
+        torch.get_device_module(GPU_TYPE).synchronize()
+        self.assertEqual(actual, fn(inp))
+        self.assertGreaterEqual(metrics.generated_kernel_count, 2)
+        self.assertEqual(counters["inductor"]["autotune_queue_tasks"], 0)
+
+    @skipUnless(HAS_GPU_AND_TRITON, "requires GPU and Triton")
+    @skipIfXpu(msg="queued static autotune requires CUDA")
+    def test_static_config_batch_generated_no_coordesc(self):
+        def fn(a):
+            return torch.sum(torch.sin(a), dim=1)
+
+        inp = torch.randn(64, 8192, device=GPU_TYPE)
+
+        metrics.reset()
+        counters.clear()
+        torch._dynamo.reset()
+        with config.patch(
+            {
+                "coordinate_descent_tuning": False,
+                "max_autotune": True,
+                "autotune_queue": True,
+                "autotune_queue_min_kernels": 1,
+                "compile_threads": 2,
+                "triton.autotune_at_compile_time": True,
+                "autotune_local_cache": False,
+                "autotune_remote_cache": False,
+                "fx_graph_cache": False,
+            }
+        ):
+            actual = torch.compile(fn, fullgraph=True)(inp)
+
+        torch.get_device_module(GPU_TYPE).synchronize()
+        self.assertEqual(actual, fn(inp))
+        self.assertGreaterEqual(metrics.generated_kernel_count, 1)
+        self.assertGreaterEqual(
+            counters["inductor"]["autotune_queue_tasks"], 1
+        )
+        self.assertEqual(counters["inductor"]["coordesc_tuning_bench"], 0)
+
+    @skipUnless(HAS_GPU_AND_TRITON, "requires GPU and Triton")
+    @skipIfXpu(msg="queued coordinate descent tuning requires CUDA")
+    def test_coordinate_descent_batch_generated_sample_inputs_stays_scalar(self):
+        def fn(a):
+            x = (torch.sin(a) * torch.cos(a)).sum(dim=1)
+            return (x * x).sum()
+
+        inp = torch.randn(64, 128, device=GPU_TYPE)
+
+        metrics.reset()
+        counters.clear()
+        torch._dynamo.reset()
+        with config.patch(
+            {
+                "coordinate_descent_tuning": True,
+                "coordinate_descent_tuning_batch": True,
+                "coordinate_descent_tuning_batch_min_kernels": 1,
+                "compile_threads": 2,
+                "triton.autotune_at_compile_time": True,
+                "triton.autotune_with_sample_inputs": True,
+            }
+        ):
+            actual = torch.compile(fn, fullgraph=True)(inp)
+
+        torch.get_device_module(GPU_TYPE).synchronize()
+        self.assertEqual(actual, fn(inp))
+        self.assertGreaterEqual(metrics.generated_kernel_count, 2)
+        self.assertEqual(
+            counters["inductor"]["autotune_queue_tasks"], 0
+        )
+
+    @skipUnless(HAS_GPU_AND_TRITON and GPU_TYPE == "cuda", "requires CUDA and Triton")
+    def test_coordinate_descent_batch_generated_split_scan(self):
+        from torch._inductor.runtime import triton_heuristics
+
+        def fn(a):
+            return torch.cumsum(a, 0)
+
+        scan_numel = (
+            (1 << 19) + 1
+            if torch.cuda.get_device_capability()[0] >= 10
+            else 8193
+        )
+        inp = torch.ones(scan_numel, device=GPU_TYPE, dtype=torch.int32)
+        seen_split_scan_autotuners = []
+        orig_split_scan = triton_heuristics.split_scan
+
+        def record_split_scan(*args, **kwargs):
+            decorator = orig_split_scan(*args, **kwargs)
+
+            def wrap(fn):
+                autotuner = decorator(fn)
+                seen_split_scan_autotuners.append(autotuner)
+                return autotuner
+
+            return wrap
+
+        metrics.reset()
+        counters.clear()
+        torch._dynamo.reset()
+        with (
+            config.patch(
+                {
+                    "coordinate_descent_tuning": True,
+                    "coordinate_descent_tuning_batch": True,
+                    "coordinate_descent_tuning_batch_policy": "auto",
+                    "coordinate_descent_tuning_batch_min_kernels": 1,
+                    "compile_threads": 2,
+                    "triton.autotune_at_compile_time": True,
+                    "autotune_local_cache": False,
+                    "autotune_remote_cache": False,
+                    "fx_graph_cache": False,
+                }
+            ),
+            patch(
+                "torch._inductor.runtime.triton_heuristics.split_scan",
+                side_effect=record_split_scan,
+            ),
+            patch.object(CoordescTuner, "has_improvement", return_value=False),
+        ):
+            actual = torch.compile(fn, fullgraph=True)(inp)
+
+        torch.get_device_module(GPU_TYPE).synchronize()
+        self.assertEqual(actual, fn(inp))
+        self.assertEqual(len(seen_split_scan_autotuners), 1)
+        split_scan_autotuner = seen_split_scan_autotuners[0]
+        self.assertEqual(split_scan_autotuner.heuristic_type, HeuristicType.SPLIT_SCAN)
+        self.assertTrue(
+            split_scan_autotuner.inductor_meta["coordinate_descent_tuning_batch"]
+        )
+        self.assertGreaterEqual(metrics.generated_kernel_count, 1)
+        self.assertGreaterEqual(
+            counters["inductor"]["autotune_queue_tasks"], 1
+        )
+        self.assertGreaterEqual(counters["inductor"]["coordesc_tuning_bench"], 1)
+
+    @skipUnless(HAS_GPU_AND_TRITON, "requires GPU and Triton")
+    @skipIfXpu(msg="queued coordinate descent tuning requires CUDA")
+    def test_coordinate_descent_batch_generated_default_min_compile_time_queue(self):
+        def fn(a, b, c):
+            x = (torch.sin(a) * torch.cos(a)).sum(dim=1)
+            y = (torch.tanh(b) * torch.cos(b)).sum(dim=1)
+            z = (torch.sigmoid(c) * torch.cos(c)).sum(dim=1)
+            return ((x * x) + (y * y) + (z * z)).sum()
+
+        inputs = tuple(torch.randn(32, 64, device=GPU_TYPE) for _ in range(3))
+
+        metrics.reset()
+        counters.clear()
+        torch._dynamo.reset()
+        with config.patch(
+            {
+                "coordinate_descent_tuning": True,
+                "coordinate_descent_tuning_batch": True,
+                "coordinate_descent_tuning_batch_min_kernels": 3,
+                "compile_threads": 2,
+                "triton.autotune_at_compile_time": True,
+            }
+        ):
+            actual = torch.compile(fn, fullgraph=True)(*inputs)
+
+        torch.get_device_module(GPU_TYPE).synchronize()
+        self.assertEqual(actual, fn(*inputs))
+        self.assertGreaterEqual(metrics.generated_kernel_count, 3)
+        self.assertGreaterEqual(
+            counters["inductor"]["autotune_queue_tasks"], 2
+        )
+        self.assertGreater(
+            counters["inductor"][
+                "autotune_queue_max_live_retained_arg_bytes"
+            ],
+            0,
+        )
+        self.assertGreater(counters["inductor"]["autotune_queue_frontiers"], 0)
+
+    def test_coordinate_descent_tuning_func_many_fallback_skips_batch_cache_save(self):
+        class Launcher:
+            def __init__(self, config):
+                self.config = config
+                self.n_regs = 1
+                self.n_spills = 0
+                self.shared = 0
+                self.cache_hash = f"hash-{config.kwargs['XBLOCK']}"
+                self.store_cubin = False
+
+        def timing(launcher):
+            return abs(launcher.config.kwargs["XBLOCK"] - 8) + 1.0
+
+        autotuner = object.__new__(CachingAutotuner)
+        autotuner.fn = SimpleNamespace(
+            __name__="kernel",
+            src="def kernel():\n    pass\n",
+        )
+        autotuner.lock = threading.Lock()
+        autotuner.coordesc_tuner = CoordescTuner(
+            name="kernel",
+            size_hints={"x": 16},
+            frozen_fields={"num_warps"},
+        )
+        autotuner.size_hints = {"x": 16}
+        autotuner.heuristic_type = HeuristicType.REDUCTION
+        autotuner.benchmark_failure_reasons = {}
+        autotuner.autotune_time_taken_ns = 0
+        autotuner._ensure_kernel_loaded = lambda: None
+        autotuner._precompile_config = lambda config: SimpleNamespace(
+            make_launcher=lambda: Launcher(config)
+        )
+        save_calls = []
+
+        def finish_coordesc(
+            best_config, config2launcher, elapsed_ns, save_cache=True, **kwargs
+        ):
+            save_calls.append((save_cache, kwargs))
+            winner = config2launcher[best_config]
+            winner.config.found_by_coordesc = True
+            return winner
+
+        autotuner._finish_coordinate_descent_tuning = finish_coordesc
+        grouped_calls = []
+
+        def benchmark_all_launchers(launchers, *args, **kwargs):
+            grouped_calls.append(
+                [launcher.config.kwargs["XBLOCK"] for launcher in launchers]
+            )
+            if len(launchers) > 1:
+                raise RuntimeError("batched timing failed")
+            return {launcher: timing(launcher) for launcher in launchers}
+
+        autotuner.benchmark_all_launchers = benchmark_all_launchers
+        baseline = Launcher(triton.Config({"XBLOCK": 4}, num_warps=4, num_stages=1))
+
+        counters.clear()
+        winner = autotuner._coordinate_descent_tuning(
+            baseline,
+            use_batch_benchmarking=True,
+        )
+
+        self.assertEqual(winner.config.kwargs["XBLOCK"], 8)
+        self.assertIn([8, 2], grouped_calls)
+        self.assertEqual(len(save_calls), 1)
+        save_cache, kwargs = save_calls[0]
+        self.assertFalse(save_cache)
+        self.assertFalse(kwargs["coordinate_descent_tuning_batch"])
+        self.assertGreater(
+            counters["inductor"]["coordesc_tuning_batch_ungrouped_cache_skips"],
+            0,
+        )
 
     def test_autotune_hints_to_configs(self):
         device_props = DeviceProperties.create(torch.device(GPU_TYPE))
@@ -627,6 +1582,209 @@ class TestRecheckAutotuneCache(TestCase):
 
         # Nothing should change
         self.assertEqual(len(autotuner.compile_results), 2)
+
+    @skipUnless(HAS_GPU_AND_TRITON, "requires gpu and triton")
+    def test_recheck_uses_original_configs_hash(self):
+        """
+        A runtime static autotuner can be reconstructed with a narrowed config
+        list after max-autotune, but coordesc winners are cached under the
+        original full config-set hash.
+        """
+        cfg = triton_config({"x": 16}, 64)
+        compile_result = self._make_compile_result(cfg)
+
+        autotuner = self._make_autotuner_with_results([cfg], [compile_result])
+        autotuner.autotune_configs_hash = "original-config-set-hash"
+
+        with patch(
+            "torch._inductor.runtime.triton_heuristics.check_autotune_cache",
+            return_value=([], None, {"autotune_cache_state": "miss"}),
+        ) as mock_check:
+            autotuner.recheck_autotune_cache(reload_kernel_from_src=MagicMock())
+
+        mock_check.assert_called_once()
+        self.assertEqual(
+            mock_check.call_args.kwargs["configs_hash"],
+            "original-config-set-hash",
+        )
+
+    @skipUnless(HAS_GPU_AND_TRITON, "requires gpu and triton")
+    def test_recheck_tolerates_missing_original_configs_hash(self):
+        cfg = triton_config({"x": 16}, 64)
+        compile_result = self._make_compile_result(cfg)
+        autotuner = self._make_autotuner_with_results([cfg], [compile_result])
+        del autotuner.autotune_configs_hash
+
+        with patch(
+            "torch._inductor.runtime.triton_heuristics.check_autotune_cache",
+            return_value=([], None, {"autotune_cache_state": "miss"}),
+        ) as mock_check:
+            autotuner.recheck_autotune_cache(reload_kernel_from_src=MagicMock())
+
+        mock_check.assert_called_once()
+        self.assertIsNone(mock_check.call_args.kwargs["configs_hash"])
+
+    @skipUnless(HAS_GPU_AND_TRITON, "requires gpu and triton")
+    def test_cached_autotune_preserves_original_configs_hash(self):
+        """
+        cached_autotune computes the config-set hash before cache narrowing and
+        passes it to both the initial cache check and the runtime autotuner.
+        """
+        args = TestTritonHeuristics._get_cos_kernel_caching_autotuner_args()
+        expected_hash = hash_configs(args["configs"])
+        mock_cls = MagicMock(return_value="autotuner")
+
+        with patch(
+            "torch._inductor.runtime.triton_heuristics.check_autotune_cache",
+            return_value=(args["configs"][:1], None, {"autotune_cache_state": "hit"}),
+        ) as mock_check:
+            decorator = cached_autotune(
+                size_hints=[16],
+                configs=args["configs"],
+                triton_meta=args["triton_meta"],
+                heuristic_type=args["heuristic_type"],
+                filename="kernel.py",
+                inductor_meta=args["inductor_meta"],
+                caching_autotuner_cls=mock_cls,
+            )
+            autotuner = decorator(args["fn"])
+
+        self.assertEqual(autotuner, "autotuner")
+        self.assertEqual(mock_check.call_args.kwargs["configs_hash"], expected_hash)
+        self.assertEqual(
+            mock_cls.call_args.kwargs["autotune_configs_hash"],
+            expected_hash,
+        )
+
+    def test_cached_autotune_records_effective_coordesc_batch_mode(self):
+        def kernel(XBLOCK):
+            pass
+
+        def run_case(heuristic_type, native_matmul, expected_batch):
+            configs = [triton.Config({"XBLOCK": 16}, num_warps=4, num_stages=1)]
+            inductor_meta = {
+                "coordinate_descent_tuning": True,
+                "coordinate_descent_tuning_batch": True,
+                "coordinate_descent_tuning_batch_policy": "auto",
+            }
+            triton_meta = {
+                "device_type": "cuda",
+                "native_matmul": native_matmul,
+            }
+            mock_cls = MagicMock(return_value="autotuner")
+
+            with (
+                config.patch({"autotune_queue": True}),
+                patch(
+                    "torch._inductor.runtime.autotune_common._coordinate_descent_batch_has_compile_parallelism",
+                    return_value=True,
+                ),
+                patch(
+                    "torch._inductor.runtime.triton_heuristics.check_autotune_cache",
+                    return_value=(configs, None, None),
+                ) as mock_check,
+            ):
+                decorator = cached_autotune(
+                    size_hints=[16],
+                    configs=configs,
+                    triton_meta=triton_meta,
+                    heuristic_type=heuristic_type,
+                    filename="kernel.py",
+                    inductor_meta=inductor_meta,
+                    caching_autotuner_cls=mock_cls,
+                )
+                autotuner = decorator(SimpleNamespace(fn=kernel))
+
+            self.assertEqual(autotuner, "autotuner")
+            self.assertEqual(
+                mock_check.call_args.args[2]["coordinate_descent_tuning_batch"],
+                expected_batch,
+            )
+            self.assertEqual(
+                mock_cls.call_args.kwargs["inductor_meta"][
+                    "coordinate_descent_tuning_batch"
+                ],
+                expected_batch,
+            )
+
+        run_case(HeuristicType.POINTWISE, False, False)
+        run_case(HeuristicType.REDUCTION, False, True)
+        run_case(HeuristicType.POINTWISE, True, True)
+
+    @skipUnless(HAS_GPU_AND_TRITON, "requires gpu and triton")
+    def test_runtime_coordesc_recheck_rebuilds_launchers_once(self):
+        """
+        Runtime coordesc should do one cache recheck before scalar tuning. If
+        that recheck finds a coordesc winner, launchers are rebuilt for the
+        narrowed result and the recheck is not repeated on later calls.
+        """
+        cfg = triton_config({"x": 16}, 64)
+        cfg.found_by_coordesc = False
+        compile_result = self._make_compile_result(cfg)
+
+        autotuner = self._make_autotuner_with_results([cfg], [compile_result])
+        autotuner.filename = "kernel.py"
+        autotuner.inductor_meta["coordinate_descent_tuning"] = True
+        autotuner.launchers = [MagicMock()]
+        autotuner._cached_launcher = MagicMock()
+
+        def recheck_cache(reload_kernel_from_src):
+            compile_result.config.found_by_coordesc = True
+
+        autotuner.recheck_autotune_cache = MagicMock(side_effect=recheck_cache)
+        autotuner._make_launchers = MagicMock()
+
+        autotuner._recheck_coordesc_cache_before_runtime_tuning()
+        autotuner._recheck_coordesc_cache_before_runtime_tuning()
+
+        autotuner.recheck_autotune_cache.assert_called_once()
+        autotuner._make_launchers.assert_called_once()
+        self.assertEqual(autotuner.launchers, [])
+        self.assertIsNone(autotuner._cached_launcher)
+
+    def test_prepare_runtime_coordesc_recheck_runs_before_autotune(self):
+        """
+        Runtime cache recheck must happen before max-autotune can save a
+        non-coordesc cache entry over a compile-time coordesc winner.
+        """
+        order = []
+        autotuner = object.__new__(CachingAutotuner)
+        autotuner.launchers = []
+        autotuner.compile_results = []
+        autotuner.inductor_meta = {}
+        autotuner._install_triton_allocator = lambda: None
+
+        def make_launcher(found_by_coordesc):
+            launcher = MagicMock()
+            launcher.config.found_by_coordesc = found_by_coordesc
+            return launcher
+
+        def precompile():
+            order.append("precompile")
+            autotuner.launchers = [
+                make_launcher(False),
+                make_launcher(False),
+            ]
+
+        def recheck():
+            order.append("recheck")
+            if order.count("recheck") == 1:
+                return
+            autotuner.launchers = [make_launcher(True)]
+
+        def autotune_to_one_config(*args, **kwargs):
+            order.append("autotune")
+
+        autotuner.precompile = precompile
+        autotuner._recheck_coordesc_cache_before_runtime_tuning = recheck
+        autotuner.autotune_to_one_config = autotune_to_one_config
+
+        launcher = autotuner.prepare_for_benchmark(
+            runtime_coordesc_cache_recheck=True
+        )
+
+        self.assertEqual(order, ["recheck", "precompile", "recheck"])
+        self.assertTrue(launcher.config.found_by_coordesc)
 
 
 @triton.jit

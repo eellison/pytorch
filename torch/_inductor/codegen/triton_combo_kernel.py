@@ -682,6 +682,24 @@ class ComboKernel(Kernel):
                     mutated_args.add(arg)
         return sorted(mutated_args)
 
+    def get_mutated_input_args_sub_kernels(self) -> list[str]:
+        mutated_input_args: OrderedSet[str] = OrderedSet()
+        for sub_kernel in self.sub_kernels:
+            for mutation in sub_kernel.mutations:
+                if mutation in sub_kernel.args.input_buffers:
+                    mutated_input_args.add(sub_kernel.args.input_buffers[mutation])
+                if (
+                    mutation in sub_kernel.args.inplace_buffers
+                    and mutation not in V.graph.removed_buffers
+                    and mutation not in sub_kernel.removed_buffers
+                ):
+                    mutated_input_args.add(
+                        cast(
+                            InplacedBuffer, sub_kernel.args.inplace_buffers[mutation]
+                        ).inner_name
+                    )
+        return sorted(mutated_input_args)
+
     def select_dispatch_strategy(self) -> None:
         if self.dispatch_class is not None:
             return
@@ -739,6 +757,7 @@ class ComboKernel(Kernel):
         triton_meta["configs"] = [config_of(signature)]
 
         mutated_args = self.get_mutated_args_sub_kernels()
+        mutated_input_args = self.get_mutated_input_args_sub_kernels()
         dispatch = self.dispatch_class
         assert dispatch is not None
 
@@ -768,6 +787,7 @@ class ComboKernel(Kernel):
             "combo_grid_meta": self.combo_grid_meta(size_hints_list),
             "kernel_name": str(Placeholder.DESCRIPTIVE_NAME),
             "mutated_arg_names": mutated_args,
+            "mutated_input_arg_names": mutated_input_args,
             # Matches triton.py:codegen_kernel(): inference/backward graphs skip
             # CPU-copy of mutated args during autotune retries; training-forward
             # graphs must keep it to preserve benchmark inputs across retries.

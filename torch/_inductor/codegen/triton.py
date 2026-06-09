@@ -54,6 +54,7 @@ from ..runtime.benchmarking import benchmarker
 from ..runtime.hints import (
     AutotuneHint,
     DeviceProperties,
+    HeuristicType,
     ReductionHint,
     TRITON_MAX_BLOCK,
     TRITON_MAX_RSPLIT,
@@ -144,6 +145,17 @@ async_compile = AsyncCompile()
 # Threshold for detecting inner reductions based on tiling score ratio.
 # If r0_tiling_score / x_tiling_score >= this value, upgrade DEFAULT hint to INNER.
 INNER_REDUCTION_RATIO_THRESHOLD = 8
+
+
+def _coordinate_descent_heuristic_type(heuristic: str) -> HeuristicType:
+    return {
+        "fixed_config": HeuristicType.FIXED,
+        "cooperative_reduction": HeuristicType.REDUCTION,
+        "persistent_reduction": HeuristicType.PERSISTENT_REDUCTION,
+        "reduction": HeuristicType.REDUCTION,
+        "split_scan": HeuristicType.SPLIT_SCAN,
+        "pointwise": HeuristicType.POINTWISE,
+    }[heuristic]
 
 
 def get_triton_reduction_function(reduction_type):
@@ -5767,6 +5779,14 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             inductor_meta["profile_bandwidth_with_do_bench_using_profiling"] = (
                 config.profile_bandwidth_with_do_bench_using_profiling
             )
+        inductor_meta["coordinate_descent_tuning_batch_requested"] = (
+            config.coordinate_descent_tuning_batch
+        )
+        if config.coordinate_descent_tuning_batch:
+            inductor_meta["coordinate_descent_tuning_batch_policy"] = (
+                config.coordinate_descent_tuning_batch_policy
+            )
+
         if config.coordinate_descent_tuning:
             inductor_meta["coordinate_descent_tuning"] = (
                 config.coordinate_descent_tuning
@@ -5915,17 +5935,22 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                     )
 
         mutated_args: OrderedSet[str] = OrderedSet()
+        mutated_input_args: OrderedSet[str] = OrderedSet()
         for mutation in self.mutations:
             if mutation in self.args.input_buffers:
-                mutated_args.add(self.args.input_buffers[mutation])
+                arg_name = self.args.input_buffers[mutation]
+                mutated_args.add(arg_name)
+                mutated_input_args.add(arg_name)
             if (
                 mutation in self.args.inplace_buffers
                 and mutation not in V.graph.removed_buffers
                 and mutation not in self.removed_buffers
             ):
-                mutated_args.add(
-                    cast(InplacedBuffer, self.args.inplace_buffers[mutation]).inner_name
-                )
+                arg_name = cast(
+                    InplacedBuffer, self.args.inplace_buffers[mutation]
+                ).inner_name
+                mutated_args.add(arg_name)
+                mutated_input_args.add(arg_name)
             if mutation in self.args.output_buffers:
                 mutation_arg = self.args.output_buffers[mutation]
                 assert not isinstance(mutation_arg, RemovedArg)
@@ -5951,6 +5976,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
         # pyrefly: ignore [bad-assignment]
         mutated_args = sorted(mutated_args)
+        # pyrefly: ignore [bad-assignment]
+        mutated_input_args = sorted(mutated_input_args)
 
         for tree in self.active_range_trees():
             sizearg = SizeArg(f"{tree.prefix}numel", tree.numel)
@@ -6013,10 +6040,25 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             "grid_type": self._get_grid_type().__name__,
             "kernel_name": str(Placeholder.DESCRIPTIVE_NAME),
             "mutated_arg_names": mutated_args,
+            "mutated_input_arg_names": mutated_input_args,
             "optimize_mem": optimize_mem,
             **self.inductor_meta_per_kernel(),
             **self.inductor_meta_common(),
         }
+        if inductor_meta.get("coordinate_descent_tuning"):
+            heuristic_type = _coordinate_descent_heuristic_type(
+                self._get_heuristic()
+            )
+            from torch._inductor.runtime.autotune_common import (
+                apply_effective_coordinate_descent_queue_metadata,
+            )
+
+            apply_effective_coordinate_descent_queue_metadata(
+                inductor_meta,
+                triton_meta,
+                heuristic_type,
+                bool(inductor_meta.get("deterministic", False)),
+            )
 
         # Triton compiler includes equal_to_1 args into constants even
         # when they are not constexpr. otherwise there may be a segfault

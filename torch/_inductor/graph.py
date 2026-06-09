@@ -2717,12 +2717,15 @@ class GraphLowering(torch.fx.Interpreter):
             # sanitize docstrings in kernel defs (#155006)
             kernel_autotune_defs = self.wrapper_code.kernel_autotune_defs.getvalue()
             kernel_autotune_defs = kernel_autotune_defs.replace('"""', '\\"\\"\\"')
+            kernel_autotune_calls = self.wrapper_code.kernel_autotune_calls.getvalue()
+            kernel_autotune_calls = kernel_autotune_calls.replace('"""', '\\"\\"\\"')
 
             tuning_code = (
                 'r"""\n'
                 + "Compile-time auto-tuning block: \n"
                 + kernel_autotune_defs
-                + self.wrapper_code.kernel_autotune_calls.getvalue()
+                + "\n"
+                + kernel_autotune_calls
                 + '"""\n'
             )
             wrapper_code.value = tuning_code + wrapper_code.value

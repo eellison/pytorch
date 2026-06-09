@@ -90,20 +90,97 @@ class CoordescTuner:
         else:
             return get_max_numwarps()
 
-    def cache_benchmark_result(self, config, timing):
-        self.cached_benchmark_results[triton_config_to_hashable(config)] = timing
+    @staticmethod
+    def _resolve_benchmark_mode(benchmark_mode):
+        return benchmark_mode() if callable(benchmark_mode) else benchmark_mode
 
-    def lookup_in_cache(self, config):
-        return self.cached_benchmark_results.get(triton_config_to_hashable(config))
+    def _benchmark_cache_key(self, config, benchmark_mode):
+        return (
+            self._resolve_benchmark_mode(benchmark_mode),
+            triton_config_to_hashable(config),
+        )
 
-    def call_func(self, func, config):
-        found = self.lookup_in_cache(config)
+    def cache_benchmark_result(self, config, timing, *, benchmark_mode=None):
+        key = self._benchmark_cache_key(config, benchmark_mode)
+        self.cached_benchmark_results[key] = timing
+
+    def lookup_in_cache(self, config, *, benchmark_mode=None):
+        return self.cached_benchmark_results.get(
+            self._benchmark_cache_key(config, benchmark_mode)
+        )
+
+    def call_func(self, func, config, *, benchmark_mode=None):
+        found = self.lookup_in_cache(config, benchmark_mode=benchmark_mode)
         if found is not None:
             log.debug("  CACHED")
             return found
         timing = func(config)
-        self.cache_benchmark_result(config, timing)
+        self.cache_benchmark_result(config, timing, benchmark_mode=benchmark_mode)
         return timing
+
+    def call_func_many(self, func, configs, func_many=None, *, benchmark_mode=None):
+        initial_benchmark_mode = self._resolve_benchmark_mode(benchmark_mode)
+        out = {}
+        uncached_configs = []
+        for config in configs:
+            found = self.lookup_in_cache(
+                config, benchmark_mode=initial_benchmark_mode
+            )
+            if found is None:
+                uncached_configs.append(config)
+            else:
+                log.debug("  CACHED")
+                out[config] = found
+
+        if not uncached_configs:
+            return out
+
+        if func_many is None or len(uncached_configs) == 1:
+            for config in uncached_configs:
+                try:
+                    timing = func(config)
+                except Exception as e:
+                    log.debug("Got exception %s", e)
+                    timing = float("inf")
+                self.cache_benchmark_result(
+                    config, timing, benchmark_mode=benchmark_mode
+                )
+                out[config] = timing
+            final_benchmark_mode = self._resolve_benchmark_mode(benchmark_mode)
+            if final_benchmark_mode != initial_benchmark_mode:
+                return self.call_func_many(
+                    func,
+                    configs,
+                    func_many,
+                    benchmark_mode=final_benchmark_mode,
+                )
+            return out
+
+        try:
+            timings = func_many(uncached_configs)
+        except Exception as e:
+            log.debug("Got exception %s", e)
+            timings = {}
+            for config in uncached_configs:
+                try:
+                    timings[config] = func(config)
+                except Exception as e:
+                    log.debug("Got exception %s", e)
+                    timings[config] = float("inf")
+
+        for config in uncached_configs:
+            timing = timings.get(config, float("inf"))
+            self.cache_benchmark_result(config, timing, benchmark_mode=benchmark_mode)
+            out[config] = timing
+        final_benchmark_mode = self._resolve_benchmark_mode(benchmark_mode)
+        if final_benchmark_mode != initial_benchmark_mode:
+            return self.call_func_many(
+                func,
+                configs,
+                func_many,
+                benchmark_mode=final_benchmark_mode,
+            )
+        return out
 
     @property
     def tunable_fields(self) -> list[str]:
@@ -273,25 +350,63 @@ class CoordescTuner:
         func: Callable[["triton.Config"], float],
         best_config,
         best_timing,
+        func_many=None,
+        benchmark_mode=None,
     ):
         """
         Check all directions. We only do this once the regular coordinate
         descent tuning find no better choices any more.
         We only have a few tunable fields, so this should be fine.
         """
+        initial_benchmark_mode = self._resolve_benchmark_mode(benchmark_mode)
         improved = False
-        for candidate_config in self.get_all_tuning_directions(best_config):
-            cmp_res, candidate_timing = self.compare_config(
-                func, candidate_config, best_config, best_timing
+        candidate_configs = self.get_all_tuning_directions(best_config)
+        if func_many is None:
+            for candidate_config in candidate_configs:
+                cmp_res, candidate_timing = self.compare_config(
+                    func,
+                    candidate_config,
+                    best_config,
+                    best_timing,
+                    benchmark_mode=benchmark_mode,
+                )
+                if cmp_res:
+                    improved = True
+                    best_config = candidate_config
+                    best_timing = candidate_timing
+        else:
+            candidate_timings = self.call_func_many(
+                func,
+                candidate_configs,
+                func_many,
+                benchmark_mode=benchmark_mode,
             )
-            if cmp_res:
-                improved = True
-                best_config = candidate_config
-                best_timing = candidate_timing
+            final_benchmark_mode = self._resolve_benchmark_mode(benchmark_mode)
+            if final_benchmark_mode != initial_benchmark_mode:
+                best_timing = self.call_func(
+                    func,
+                    best_config,
+                    benchmark_mode=final_benchmark_mode,
+                )
+            for candidate_config in candidate_configs:
+                candidate_timing = candidate_timings[candidate_config]
+                if self.has_improvement(best_timing, candidate_timing):
+                    log.debug(
+                        "Tune from %s %f -> %s %f",
+                        best_config,
+                        best_timing,
+                        candidate_config,
+                        candidate_timing,
+                    )
+                    improved = True
+                    best_config = candidate_config
+                    best_timing = candidate_timing
 
         return improved, best_config, best_timing
 
-    def compare_config(self, func, candidate_config, best_config, best_timing):
+    def compare_config(
+        self, func, candidate_config, best_config, best_timing, *, benchmark_mode=None
+    ):
         """
         Check if candidate_config is better than best_config.
 
@@ -300,7 +415,9 @@ class CoordescTuner:
         """
         log.debug("Try config %s", candidate_config)
         try:
-            candidate_timing = self.call_func(func, candidate_config)
+            candidate_timing = self.call_func(
+                func, candidate_config, benchmark_mode=benchmark_mode
+            )
         except Exception as e:
             log.debug("Got exception %s", e)
             return False, float("inf")
@@ -346,12 +463,17 @@ class CoordescTuner:
         # pyrefly: ignore [missing-attribute]
         baseline_config: "triton.Config",
         baseline_timing: float | None = None,
+        func_many=None,
+        benchmark_mode=None,
     ) -> "triton.Config":  # pyrefly: ignore  # missing-attribute
         """
         Perform coordinate descent autotuning starting from a baseline configuration.
         """
         if baseline_timing is None:
-            baseline_timing = self.call_func(func, baseline_config)
+            baseline_timing = self.call_func(
+                func, baseline_config, benchmark_mode=benchmark_mode
+            )
+        best_timing_mode = self._resolve_benchmark_mode(benchmark_mode)
 
         log.debug("= Do coordinate descent tuning for %s =", self.name)
         log.debug(
@@ -363,6 +485,18 @@ class CoordescTuner:
         improved = True
         best_config = baseline_config
         best_timing = baseline_timing
+
+        def refresh_best_timing_mode() -> None:
+            nonlocal best_timing, best_timing_mode
+            current_mode = self._resolve_benchmark_mode(benchmark_mode)
+            if current_mode == best_timing_mode:
+                return
+            best_timing = self.call_func(
+                func,
+                best_config,
+                benchmark_mode=current_mode,
+            )
+            best_timing_mode = current_mode
 
         while improved:
             improved = False
@@ -377,21 +511,58 @@ class CoordescTuner:
                 # the field is present.
                 if get_field(best_config, field) is None:
                     continue
-                for candidate_config in self.get_neighbour_configs(best_config, field):
-                    cmp_res, candidate_timing = self.compare_config(
-                        func, candidate_config, best_config, best_timing
+                candidate_configs = self.get_neighbour_configs(best_config, field)
+                if func_many is None:
+                    for candidate_config in candidate_configs:
+                        cmp_res, candidate_timing = self.compare_config(
+                            func,
+                            candidate_config,
+                            best_config,
+                            best_timing,
+                            benchmark_mode=benchmark_mode,
+                        )
+                        if cmp_res:
+                            improved = True
+                            best_config, best_timing = (
+                                candidate_config,
+                                candidate_timing,
+                            )
+                else:
+                    candidate_timings = self.call_func_many(
+                        func,
+                        candidate_configs,
+                        func_many,
+                        benchmark_mode=benchmark_mode,
                     )
-                    if cmp_res:
-                        improved = True
-                        best_config, best_timing = candidate_config, candidate_timing
+                    refresh_best_timing_mode()
+                    for candidate_config in candidate_configs:
+                        candidate_timing = candidate_timings[candidate_config]
+                        if self.has_improvement(best_timing, candidate_timing):
+                            log.debug(
+                                "Tune from %s %f -> %s %f",
+                                best_config,
+                                best_timing,
+                                candidate_config,
+                                candidate_timing,
+                            )
+                            improved = True
+                            best_config, best_timing = (
+                                candidate_config,
+                                candidate_timing,
+                            )
 
             if not improved and self.inductor_meta.get(
                 "coordinate_descent_check_all_directions"
             ):
                 old_best_timing = best_timing
                 improved, best_config, best_timing = self.check_all_tuning_directions(
-                    func, best_config, best_timing
+                    func,
+                    best_config,
+                    best_timing,
+                    func_many,
+                    benchmark_mode=benchmark_mode,
                 )
+                refresh_best_timing_mode()
 
                 if improved:
                     msg = red_text(

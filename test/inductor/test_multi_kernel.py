@@ -8,7 +8,11 @@ import torch
 from torch import nn
 from torch._dynamo.testing import reset_rng_state
 from torch._inductor import config, test_operators
-from torch._inductor.codegen.multi_kernel import MultiKernelCall
+from torch._inductor.codegen.multi_kernel import MultiKernelCall, SizeHintMultiKernelCall
+from torch._inductor.runtime.autotune_queue import (
+    _get_active_coordinate_descent_batch,
+    coordinate_descent_batch,
+)
 from torch._inductor.test_case import TestCase
 from torch._inductor.utils import run_and_get_code
 from torch.nn import functional as F
@@ -200,6 +204,127 @@ class MultiKernelTest(TestCase):
         ):
             torch.compile(f)(x)
         self.assertEqual(picked_kernel, force_kernel)
+
+    @unittest.mock.patch.dict(
+        os.environ, {"TORCHINDUCTOR_DISABLE_MULTI_KERNEL_CACHE": "1"}
+    )
+    def test_multi_kernel_run_suspends_active_coordesc_batch(self):
+        class DeviceProps:
+            type = "cpu"
+
+        class Kernel:
+            device_props = DeviceProps()
+            size_hints = {}
+
+            def __init__(self, name):
+                self.name = name
+                self.inductor_meta = {
+                    "kernel_name": name,
+                    "reduction_hint": None,
+                }
+
+            def clone_args(self, *args, **kwargs):
+                return args, kwargs
+
+            def run(self, *args, **kwargs):
+                calls.append((self.name, _get_active_coordinate_descent_batch()))
+
+        calls = []
+        timings = iter([1.0, 2.0])
+        multi_kernel = MultiKernelCall(
+            "multi_kernel_test",
+            [Kernel("kernel0"), Kernel("kernel1")],
+            [[0], [1]],
+        )
+
+        def benchmark(callable_, **kwargs):
+            callable_()
+            return next(timings)
+
+        with (
+            config.patch(
+                {
+                    "compile_threads": 2,
+                    "coordinate_descent_tuning": True,
+                    "coordinate_descent_tuning_batch": True,
+                    "coordinate_descent_tuning_batch_min_kernels": 1,
+                }
+            ),
+            unittest.mock.patch(
+                "torch._inductor.codegen.multi_kernel.benchmarker.benchmark",
+                side_effect=benchmark,
+            ),
+            coordinate_descent_batch(
+                expected_calls=1,
+                disposable_args=True,
+            ) as batch,
+        ):
+            self.assertIs(_get_active_coordinate_descent_batch(), batch)
+            multi_kernel.run(("arg0",), ("arg1",))
+            self.assertIs(_get_active_coordinate_descent_batch(), batch)
+
+        self.assertEqual(
+            calls,
+            [
+                ("kernel0", None),
+                ("kernel1", None),
+                ("kernel0", None),
+            ],
+        )
+
+    @unittest.mock.patch.dict(
+        os.environ, {"TORCHINDUCTOR_DISABLE_MULTI_KERNEL_CACHE": "1"}
+    )
+    def test_size_hint_multi_kernel_run_suspends_active_coordesc_batch(self):
+        class DeviceProps:
+            type = "cpu"
+
+        class Kernel:
+            device_props = DeviceProps()
+            size_hints = {}
+
+            def __init__(self, name):
+                self.name = name
+                self.inductor_meta = {
+                    "kernel_name": name,
+                    "reduction_hint": None,
+                }
+
+            def clone_args(self, *args, **kwargs):
+                return args, kwargs
+
+            def run(self, *args, **kwargs):
+                calls.append((self.name, _get_active_coordinate_descent_batch()))
+
+        calls = []
+        multi_kernel = SizeHintMultiKernelCall(
+            "size_hint_multi_kernel_test",
+            {
+                (): Kernel("kernel0"),
+                ((8,),): Kernel("kernel1"),
+            },
+            [[0], [0]],
+        )
+
+        with (
+            config.patch(
+                {
+                    "compile_threads": 2,
+                    "coordinate_descent_tuning": True,
+                    "coordinate_descent_tuning_batch": True,
+                    "coordinate_descent_tuning_batch_min_kernels": 1,
+                }
+            ),
+            coordinate_descent_batch(
+                expected_calls=1,
+                disposable_args=True,
+            ) as batch,
+        ):
+            self.assertIs(_get_active_coordinate_descent_batch(), batch)
+            multi_kernel.run(("arg0",))
+            self.assertIs(_get_active_coordinate_descent_batch(), batch)
+
+        self.assertEqual(calls, [("kernel0", None)])
 
     @config.patch("warn_mix_layout", True)
     def test_softmax_warn_mixed_layout(self):

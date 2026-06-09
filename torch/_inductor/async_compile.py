@@ -54,6 +54,7 @@ from torch._inductor.compile_worker.utils import _async_compile_initializer
 from torch._inductor.runtime.compile_tasks import (
     _set_triton_libdevice_path,
     _set_triton_ptxas_path,
+    _worker_compile_triton_configs,
     _worker_compile_triton,
 )
 from torch._inductor.utils import clear_on_fresh_cache
@@ -394,20 +395,13 @@ class AsyncCompile:
         compile_id = torch._guards.CompileContext.current_compile_id()
         is_backward = getattr(V.graph, "is_backward", False)
 
-        if (future := CompiledTritonKernels.get(source_code)) is not None:
-            counters["inductor"]["async_compile_cache_hit"] += 1
-            # Set reload_kernel_from_src properly based on source_code
-            if isinstance(future, StaticAutotunerFuture):
-                # Remove the future now that we've cache hit
-                CompiledTritonKernels.remove_future(source_code)
-                future.reload_kernel_from_src = reload_kernel_in_parent
-            if is_parallel:
-                return future
-            else:
-                return future.result()
+        worker_compile_context: tuple[dict[str, str], dict[str, Any]] | None = None
 
-        # Cache miss
-        if is_parallel:
+        def get_worker_compile_context() -> tuple[dict[str, str], dict[str, Any]]:
+            nonlocal worker_compile_context
+            if worker_compile_context is not None:
+                return worker_compile_context
+
             # Ensure libdevice path is set in os.environ before passing to workers
             _set_triton_libdevice_path()
             # We want to support changing these env vars after (and while) the
@@ -419,7 +413,19 @@ class AsyncCompile:
             ]
             extra_env = {v: os.environ[v] for v in env_vars if v in os.environ}
             extra_config = {
-                "use_static_triton_launcher": torch._inductor.config.use_static_triton_launcher
+                "compile_threads": torch._inductor.config.compile_threads,
+                "coordinate_descent_tuning_batch": (
+                    torch._inductor.config.coordinate_descent_tuning_batch
+                ),
+                "coordinate_descent_tuning_batch_policy": (
+                    torch._inductor.config.coordinate_descent_tuning_batch_policy
+                ),
+                "autotune_queue_static_precompile": (
+                    torch._inductor.config.autotune_queue_static_precompile
+                ),
+                "use_static_triton_launcher": (
+                    torch._inductor.config.use_static_triton_launcher
+                ),
             }
 
             if len(torch._inductor.config.autotune_lookup_table) > 0:
@@ -443,14 +449,74 @@ class AsyncCompile:
                         fn_hash: torch._inductor.config.autotune_lookup_table[fn_hash]
                     }
 
+            worker_compile_context = (extra_env, extra_config)
+            return worker_compile_context
+
+        def submit_config_compile(configs: list[Any]) -> Future[Any]:
+            extra_env, extra_config = get_worker_compile_context()
+            return self.process_pool().submit(
+                _worker_compile_triton_configs,
+                load_kernel,
+                configs,
+                extra_env,
+                extra_config,
+            )
+
+        def attach_config_compile_submitter(kernel: CachingAutotuner) -> CachingAutotuner:
+            if (
+                get_compile_threads() > 1
+                and not torch._inductor.config.triton.proton_profiling
+            ):
+                from torch._inductor.runtime.autotune_common import (
+                    _kernel_would_defer_coordinate_descent,
+                )
+
+                if _kernel_would_defer_coordinate_descent(kernel):
+                    kernel.enable_deferred_config_compiles(submit_config_compile)
+            return kernel
+
+        if (future := CompiledTritonKernels.get(source_code)) is not None:
+            counters["inductor"]["async_compile_cache_hit"] += 1
+            # Set reload_kernel_from_src properly based on source_code
+            if isinstance(future, StaticAutotunerFuture):
+                # Remove the future now that we've cache hit
+                CompiledTritonKernels.remove_future(source_code)
+                future.reload_kernel_from_src = reload_kernel_in_parent
+                static_kernel: CachingAutotuner | None = None
+
+                def get_static_result() -> CachingAutotuner:
+                    nonlocal static_kernel
+                    if static_kernel is None:
+                        static_kernel = attach_config_compile_submitter(future.result())
+                    return static_kernel
+
+                static_future = LambdaFuture(get_static_result)
+                if is_parallel:
+                    return static_future
+                else:
+                    return static_future.result()
+            if is_parallel:
+                return future
+            else:
+                return future.result()
+
+        # Cache miss
+        if is_parallel:
+            extra_env, extra_config = get_worker_compile_context()
+
             task = self.process_pool().submit(
                 _worker_compile_triton,
                 load_kernel,
                 extra_env,
                 extra_config,
             )
+            compiled_kernel: CachingAutotuner | None = None
 
             def get_result() -> CachingAutotuner:
+                nonlocal compiled_kernel
+                if compiled_kernel is not None:
+                    return compiled_kernel
+
                 try:
                     kernel, elapsed_us = task.result()
                 except SubprocException as e:
@@ -463,17 +529,36 @@ class AsyncCompile:
 
                 kernel.restore_after_unpickle(old_values=None)
 
-                kernel.precompile(
-                    warm_cache_only=False,
-                    reload_kernel=reload_kernel_in_parent,
-                    static_triton_bundle_key=CompiledTritonKernels.key(source_code),
+                from torch._inductor.runtime.autotune_common import (
+                    _has_deferred_static_autotune_precompile,
                 )
+
+                static_triton_bundle_key = CompiledTritonKernels.key(source_code)
+                if _has_deferred_static_autotune_precompile(kernel):
+                    kernel.enable_deferred_static_precompile(
+                        submit_config_compile,
+                        static_triton_bundle_key,
+                    )
+                    kernel.precompile(
+                        warm_cache_only=False,
+                        reload_kernel=reload_kernel_in_parent,
+                        static_triton_bundle_key=None,
+                        max_configs=0,
+                    )
+                else:
+                    kernel.precompile(
+                        warm_cache_only=False,
+                        reload_kernel=reload_kernel_in_parent,
+                        static_triton_bundle_key=static_triton_bundle_key,
+                    )
+                    attach_config_compile_submitter(kernel)
                 info = kernel.autotune_cache_info or {}
                 info["compile_time_us"] = elapsed_us
                 _add_triton_kernel_info(kernel_name, info)
                 get_metrics_context().add_top_n(
                     "triton_kernel_compile_times_us", kernel_name, elapsed_us
                 )
+                compiled_kernel = kernel
                 return kernel
 
             future = LambdaFuture(get_result, future=task)
@@ -494,10 +579,27 @@ class AsyncCompile:
                     _set_triton_libdevice_path()
                     kernel = load_kernel()
                     kernel.set_compile_info(compile_id, is_backward)
-                    kernel.precompile(
-                        warm_cache_only=False,
-                        static_triton_bundle_key=CompiledTritonKernels.key(source_code),
+                    static_triton_bundle_key = CompiledTritonKernels.key(source_code)
+                    from torch._inductor.runtime.autotune_common import (
+                        _should_defer_static_autotune_precompile,
                     )
+
+                    if _should_defer_static_autotune_precompile(kernel):
+                        kernel.enable_deferred_static_precompile(
+                            submit_config_compile,
+                            static_triton_bundle_key,
+                        )
+                        kernel.precompile(
+                            warm_cache_only=False,
+                            static_triton_bundle_key=None,
+                            max_configs=1,
+                        )
+                    else:
+                        kernel.precompile(
+                            warm_cache_only=False,
+                            static_triton_bundle_key=static_triton_bundle_key,
+                        )
+                        attach_config_compile_submitter(kernel)
                     elapsed_us = (time_ns() - start_ns) // 1000
                     get_metrics_context().add_top_n(
                         "triton_kernel_compile_times_us", kernel_name, elapsed_us

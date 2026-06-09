@@ -30,7 +30,7 @@ orig_compare_config = CoordescTuner.compare_config
 
 
 def mock_compare_config_prefer_larger_XBLOCK(
-    self, func, candidate_config, best_config, best_timing
+    self, func, candidate_config, best_config, best_timing, **kwargs
 ):
     """
     self is the CoordescTuner object
@@ -45,7 +45,9 @@ def mock_compare_config_prefer_larger_XBLOCK(
             func(candidate_config)
             return True, best_timing * 0.9
 
-    return orig_compare_config(self, func, candidate_config, best_config, best_timing)
+    return orig_compare_config(
+        self, func, candidate_config, best_config, best_timing, **kwargs
+    )
 
 
 class TestCoordinateDescentTuner(TestCase):
@@ -76,6 +78,139 @@ class TestCoordinateDescentTuner(TestCase):
 
         best_config = tuner.autotune(func, baseline_config)
         self.assertTrue(best_config.kwargs.get("XBLOCK") == 1, str(best_config))
+
+    def test_cache_benchmark_result_is_keyed_by_benchmark_mode(self):
+        tuner = CoordescTuner()
+        cfg = triton.Config({"XBLOCK": 4}, num_warps=4, num_stages=1)
+
+        tuner.cache_benchmark_result(cfg, 1.0, benchmark_mode="ungrouped")
+        tuner.cache_benchmark_result(cfg, 2.0, benchmark_mode="grouped")
+
+        self.assertEqual(tuner.lookup_in_cache(cfg, benchmark_mode="ungrouped"), 1.0)
+        self.assertEqual(tuner.lookup_in_cache(cfg, benchmark_mode="grouped"), 2.0)
+        self.assertIsNone(tuner.lookup_in_cache(cfg))
+
+        tuner.cache_benchmark_result(cfg, 3.0)
+        self.assertEqual(tuner.lookup_in_cache(cfg), 3.0)
+
+    def test_autotune_remeasures_best_when_batch_mode_changes(self):
+        mode = "grouped"
+        tuner = CoordescTuner(size_hints={"x": 8}, frozen_fields={"num_warps"})
+        baseline = triton.Config({"XBLOCK": 4}, num_warps=4, num_stages=1)
+        tuner.cache_benchmark_result(baseline, 1.0, benchmark_mode="grouped")
+        calls = []
+
+        def timing(config):
+            xblock = config.kwargs["XBLOCK"]
+            calls.append((mode, xblock))
+            return {2: 20.0, 4: 10.0, 8: 2.0}[xblock]
+
+        def timing_many(configs):
+            nonlocal mode
+            mode = "ungrouped"
+            return {config: timing(config) for config in configs}
+
+        best = tuner.autotune(
+            timing,
+            baseline,
+            func_many=timing_many,
+            benchmark_mode=lambda: mode,
+        )
+
+        self.assertEqual(best.kwargs["XBLOCK"], 8)
+        self.assertIn(("ungrouped", 4), calls)
+
+    def test_autotune_uses_batch_callback_for_neighbors(self):
+        tuner = CoordescTuner(size_hints={"x": 16}, frozen_fields={"num_warps"})
+        baseline_config = triton.Config({"XBLOCK": 4}, num_warps=8, num_stages=1)
+        batch_calls = []
+        single_calls = []
+
+        def timing(config):
+            single_calls.append(config.kwargs["XBLOCK"])
+            return abs(config.kwargs["XBLOCK"] - 16) + 1
+
+        def timing_many(configs):
+            batch_calls.append([config.kwargs["XBLOCK"] for config in configs])
+            return {
+                config: abs(config.kwargs["XBLOCK"] - 16) + 1
+                for config in configs
+            }
+
+        best_config = tuner.autotune(timing, baseline_config, func_many=timing_many)
+        self.assertEqual(best_config.kwargs["XBLOCK"], 16)
+        self.assertEqual(batch_calls[0], [8, 2])
+        self.assertEqual(single_calls, [4, 16])
+
+    def test_autotune_batch_callback_falls_back_to_scalar_on_error(self):
+        tuner = CoordescTuner(size_hints={"x": 16}, frozen_fields={"num_warps"})
+        baseline_config = triton.Config({"XBLOCK": 4}, num_warps=8, num_stages=1)
+        batch_calls = []
+        single_calls = []
+
+        def timing(config):
+            single_calls.append(config.kwargs["XBLOCK"])
+            return abs(config.kwargs["XBLOCK"] - 8) + 1
+
+        def timing_many(configs):
+            batch_calls.append([config.kwargs["XBLOCK"] for config in configs])
+            raise RuntimeError("batch failed")
+
+        best_config = tuner.autotune(timing, baseline_config, func_many=timing_many)
+        self.assertEqual(best_config.kwargs["XBLOCK"], 8)
+        self.assertEqual(batch_calls[0], [8, 2])
+        self.assertIn(8, single_calls)
+
+    def test_autotune_batch_callback_matches_scalar_all_directions(self):
+        def key(config):
+            return (
+                tuple(sorted(config.kwargs.items())),
+                config.num_warps,
+                config.num_stages,
+            )
+
+        def timing(config):
+            values = (config.kwargs["XBLOCK"], config.kwargs["YBLOCK"])
+            if values == (8, 8):
+                return 1.0
+            if values == (4, 4):
+                return 10.0
+            return 11.0
+
+        inductor_meta = {"coordinate_descent_check_all_directions": True}
+        scalar_tuner = CoordescTuner(
+            size_hints={"x": 8, "y": 8},
+            inductor_meta=inductor_meta,
+            frozen_fields={"num_warps"},
+        )
+        batch_tuner = CoordescTuner(
+            size_hints={"x": 8, "y": 8},
+            inductor_meta=inductor_meta,
+            frozen_fields={"num_warps"},
+        )
+        scalar_baseline = triton.Config(
+            {"XBLOCK": 4, "YBLOCK": 4}, num_warps=4, num_stages=1
+        )
+        batch_baseline = triton.Config(
+            {"XBLOCK": 4, "YBLOCK": 4}, num_warps=4, num_stages=1
+        )
+        batch_calls = []
+
+        def timing_many(configs):
+            batch_calls.extend(key(config) for config in configs)
+            return {config: timing(config) for config in configs}
+
+        scalar_best = scalar_tuner.autotune(timing, scalar_baseline)
+        batch_best = batch_tuner.autotune(
+            timing, batch_baseline, func_many=timing_many
+        )
+
+        expected = key(
+            triton.Config({"XBLOCK": 8, "YBLOCK": 8}, num_warps=4, num_stages=1)
+        )
+        self.assertEqual(key(batch_best), key(scalar_best))
+        self.assertEqual(key(batch_best), expected)
+        self.assertIn(expected, batch_calls)
 
     def test_get_neighbour_values(self):
         tuner = CoordescTuner()

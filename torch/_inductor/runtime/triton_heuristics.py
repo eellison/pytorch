@@ -4,7 +4,6 @@ from __future__ import annotations
 import builtins
 import copy
 import dataclasses
-import enum
 import functools
 import hashlib
 import inspect
@@ -19,7 +18,7 @@ import sys
 import threading
 import time
 from collections import namedtuple
-from typing import Any, Generic, Literal, TYPE_CHECKING, TypeVar
+from typing import Any, Callable, Generic, Literal, TYPE_CHECKING, TypeVar
 
 import torch
 from torch._dynamo.utils import counters, set_feature_use
@@ -39,8 +38,26 @@ from ..utils import (
 )
 from . import triton_helpers
 from .autotune_cache import AutotuneCache
-from .benchmarking import benchmarker
+from .autotune_benchmarking import benchmark_launchers
+from .autotune_common import (
+    BenchmarkFailureReason,
+    NoTritonConfigsError,
+    _can_coordinate_descent_tune_for,
+    _COORDESC_BENCHMARK_MODE_GROUPED,
+    _COORDESC_BENCHMARK_MODE_UNGROUPED,
+    _COORDESC_UNGROUPED_BENCHMARK_KEY,
+    _coordinate_descent_batch_enabled_for_kernel,
+    _coordinate_descent_batch_policy,
+    _has_ungrouped_coordesc_benchmark,
+    _is_expected_compile_config_failure,
+    _static_autotune_batch_enabled_for,
+    _STATIC_AUTOTUNE_BATCH_MIN_CONFIGS,
+    _static_autotune_config_count,
+    apply_effective_coordinate_descent_queue_metadata,
+)
+from .benchmarking import is_invalid_configuration_error
 from .coordinate_descent_tuner import CoordescTuner
+from .autotune_queue_state import get_active_autotune_queue
 from .hints import (
     _NUM_THREADS_PER_WARP,
     AutotuneHint,
@@ -90,11 +107,6 @@ from .triton_compat import (
 from .triton_helpers import get_constexprs
 
 
-class BenchmarkFailureReason(enum.Enum):
-    """Reasons why a triton config benchmark may return float('inf')."""
-
-    REGISTER_SPILLING = "register_spilling"
-    INVALID_CONFIG = "invalid_config"
 
 
 class InductorConfig(Config):
@@ -104,9 +116,6 @@ class InductorConfig(Config):
         super().__init__(*args, **kwargs)
         self.dynamic_scale_rblock = dynamic_scale_rblock
 
-
-class NoTritonConfigsError(RuntimeError):
-    pass
 
 
 if TYPE_CHECKING:
@@ -273,7 +282,10 @@ def _dump_launch_tensors(args, kernel_path, kernel_hash, kernel_name):
 
 
 def check_autotune_cache(
-    configs: list[Config], filename: str | None, inductor_meta: dict[str, Any]
+    configs: list[Config],
+    filename: str | None,
+    inductor_meta: dict[str, Any],
+    configs_hash: str | None = None,
 ) -> tuple[list[Config], AutotuneCache | None, dict[str, Any]]:
     """
     Given a list of configs, checks autotune cache and return metadata
@@ -287,7 +299,8 @@ def check_autotune_cache(
         and (len(configs) > 1 or inductor_meta.get("coordinate_descent_tuning"))
         and os.environ.get("TRITON_INTERPRET", "0") != "1"
     ):
-        configs_hash = hash_configs(configs)
+        if configs_hash is None:
+            configs_hash = hash_configs(configs)
 
         autotune_cache = AutotuneCache.create(inductor_meta, filename, configs_hash)
         if autotune_cache:
@@ -321,6 +334,7 @@ def check_autotune_cache(
     return configs, autotune_cache, autotune_cache_info
 
 
+
 class CachingAutotuner(KernelInterface):
     """
     Simplified version of Triton autotuner that has no invalidation
@@ -344,6 +358,7 @@ class CachingAutotuner(KernelInterface):
         filename: str | None = None,
         reset_to_zero_arg_names: list[str] | None = None,
         autotune_cache_info: dict[str, Any] | None = None,
+        autotune_configs_hash: str | None = None,
     ):
         super().__init__()
 
@@ -381,6 +396,7 @@ class CachingAutotuner(KernelInterface):
         self.cuda_kernel_saved = False
         self.cpu_kernel_saved = False
         self.autotune_cache_info = autotune_cache_info
+        self.autotune_configs_hash = autotune_configs_hash
         if log.isEnabledFor(logging.DEBUG):
             log.debug(
                 "CachingAutotuner gets %d configs for %s",
@@ -443,6 +459,7 @@ class CachingAutotuner(KernelInterface):
         # Cached launcher for fast path — bypasses all preamble after first
         # successful steady-state launch.  Set to None until populated.
         self._cached_launcher: LauncherType | None = None
+        self._coordesc_cache_rechecked = False
         # Pre-compute static eligibility for launcher caching.  These flags
         # are set once in __init__ and never change, so we avoid re-checking
         # them on every kernel launch.
@@ -455,6 +472,9 @@ class CachingAutotuner(KernelInterface):
         # Compile-time info included in runtime logginging
         self.compile_id: CompileId | None = None
         self.is_backward = False
+        self._config_compile_submitter = None
+        self._static_config_compile_submitter = None
+        self._static_triton_bundle_key = None
 
         # Mode for launch grid calculation
         self.grid_mode: Literal["python", "cpp"] = "python"
@@ -482,7 +502,10 @@ class CachingAutotuner(KernelInterface):
         configs = [result.config for result in self.compile_results]
 
         (cached_configs, _, autotune_cache_info) = check_autotune_cache(
-            configs, self.filename, self.inductor_meta
+            configs,
+            self.filename,
+            self.inductor_meta,
+            configs_hash=getattr(self, "autotune_configs_hash", None),
         )
         self.autotune_cache_info = autotune_cache_info
         # I.e. there was an autotune cache hit
@@ -507,18 +530,65 @@ class CachingAutotuner(KernelInterface):
                         self.fn = reload_kernel_from_src().fn
                     self.compile_results = [self._precompile_config(best_config)]
 
+    def _recheck_coordesc_cache_before_runtime_tuning(self) -> None:
+        if self._coordesc_cache_rechecked:
+            return
+        if (
+            self.filename is None
+            or not self.inductor_meta.get("coordinate_descent_tuning", False)
+        ):
+            self._coordesc_cache_rechecked = True
+            return
+        if not self.compile_results:
+            return
+        if not self.is_statically_launchable():
+            self._coordesc_cache_rechecked = True
+            return
+
+        self._coordesc_cache_rechecked = True
+        reload_kernel_from_src = getattr(self, "_reload_kernel", None)
+        if reload_kernel_from_src is None:
+            reload_kernel_from_src = lambda: self
+        self.recheck_autotune_cache(reload_kernel_from_src=reload_kernel_from_src)
+        if len(self.compile_results) != 1 or not getattr(
+            self.compile_results[0].config, "found_by_coordesc", False
+        ):
+            return
+
+        self.launchers = []
+        self._cached_launcher = None
+        self._make_launchers()
+
     def set_compile_info(self, compile_id: CompileId | None, is_backward: bool) -> None:
         self.compile_id = compile_id
         self.is_backward = is_backward
+
+    def enable_deferred_config_compiles(
+        self, submitter: Callable[[list[Any]], Any]
+    ) -> None:
+        self._config_compile_submitter = submitter
+
+    def enable_deferred_static_precompile(
+        self, submitter: Callable[[list[Any]], Any], static_triton_bundle_key: str
+    ) -> None:
+        self._config_compile_submitter = None
+        self._static_config_compile_submitter = submitter
+        self._static_triton_bundle_key = static_triton_bundle_key
+
+    def clear_deferred_compile_state(self) -> None:
+        self._config_compile_submitter = None
+        self._static_config_compile_submitter = None
+        self._static_triton_bundle_key = None
 
     def precompile(
         self,
         warm_cache_only=False,
         reload_kernel: Callable[[], CachingAutotuner] | None = None,
         static_triton_bundle_key: str | None = None,
+        max_configs: int | None = None,
     ):
         if warm_cache_only:
-            self._precompile_worker()
+            self._precompile_worker(max_configs=max_configs)
             return
         with self.lock:
             # Helper function for reloading a kernel generated in a worker
@@ -527,37 +597,117 @@ class CachingAutotuner(KernelInterface):
             # we need to actually run compilation on the parent process
             if reload_kernel is not None:
                 self._reload_kernel = reload_kernel
-            self._precompile_worker()
+            self._precompile_worker(max_configs=max_configs)
             if static_triton_bundle_key is not None and self.is_statically_launchable():
                 TritonBundler.put_static_autotuner(static_triton_bundle_key, self)
             self._make_launchers()
-            self._dynamic_scale_rblock()
+            if self.configs is None:
+                self._dynamic_scale_rblock()
 
-    def _precompile_worker(self):
+    def _precompile_worker(self, max_configs: int | None = None):
         if self.compile_results:
             for result in self.compile_results:
                 TritonBundler.put(
                     triton_hash_to_path_key(result.kernel.hash),  # type: ignore[attr-defined]
                     self.triton_meta.get("device", 0),
                 )
-            return
+            if not self.configs or max_configs == 0:
+                return
         assert not self.launchers
         if not self.configs:
             raise NoTritonConfigsError("No triton configs are available")
 
         compile_results = []
         exc = None
-        for c in self.configs:
+        remaining_configs = None
+        for idx, c in enumerate(self.configs):
+            if max_configs is not None and len(compile_results) >= max_configs:
+                remaining_configs = self.configs[idx:]
+                break
             try:
                 compile_results.append(self._precompile_config(c))
             except (OutOfResources, PTXASError, IntelGPUError) as e:
                 exc = e
-        if len(compile_results) == 0:
+        else:
+            remaining_configs = None
+        if len(compile_results) == 0 and not self.compile_results:
             raise NoTritonConfigsError(
                 f"No valid triton configs. {type(exc).__name__}: {exc}"
             )
-        self.compile_results = compile_results
-        self.configs = None
+        self.compile_results.extend(compile_results)
+        self.configs = remaining_configs or None
+
+    def _accept_deferred_static_compile_result(self, config, result, *, append=True):
+        compiled_autotuner, _elapsed_us = result
+        compiled_autotuner.restore_after_unpickle(old_values=None)
+        if not compiled_autotuner.compile_results:
+            return None
+        compile_result = compiled_autotuner.compile_results[0]
+        compile_result.config = config
+        TritonBundler.put(
+            triton_hash_to_path_key(compile_result.kernel.hash),  # type: ignore[attr-defined]
+            self.triton_meta.get("device", 0),
+        )
+        if append:
+            self.compile_results.append(compile_result)
+        return compile_result
+
+    def _finish_deferred_static_precompile(self, *, use_process_pool: bool = True):
+        if not self.configs:
+            return
+
+        static_triton_bundle_key = self._static_triton_bundle_key
+        submitter = self._static_config_compile_submitter
+        try:
+            if not use_process_pool:
+                self._ensure_kernel_loaded()
+                self.launchers = []
+                self._precompile_worker()
+                self._make_launchers()
+                self._dynamic_scale_rblock()
+                if (
+                    static_triton_bundle_key is not None
+                    and self.is_statically_launchable()
+                ):
+                    TritonBundler.put_static_autotuner(static_triton_bundle_key, self)
+            elif submitter is None:
+                raise RuntimeError(
+                    "Deferred static autotune config compilation requires a "
+                    "process-pool compile submitter"
+                )
+            else:
+                configs = list(self.configs)
+                futures = []
+                for config in configs:
+                    counters["inductor"][
+                        "autotune_queue_process_pool_compiles"
+                    ] += 1
+                    futures.append((config, submitter([config])))
+
+                self.launchers = []
+                for config, future in futures:
+                    try:
+                        self._accept_deferred_static_compile_result(
+                            config, future.result()
+                        )
+                    except Exception as e:
+                        if not _is_expected_compile_config_failure(e):
+                            raise
+                        log.debug(
+                            "Static autotune compile skipped config %s: %s", config, e
+                        )
+                if not self.compile_results:
+                    raise NoTritonConfigsError("No valid triton configs are available")
+                self.configs = None
+                self._make_launchers()
+                self._dynamic_scale_rblock()
+                if (
+                    static_triton_bundle_key is not None
+                    and self.is_statically_launchable()
+                ):
+                    TritonBundler.put_static_autotuner(static_triton_bundle_key, self)
+        finally:
+            self.clear_deferred_compile_state()
 
     def _dynamic_scale_rblock(self):
         # TODO(jansel): we should find a way to move this extra compile into the worker process
@@ -743,6 +893,9 @@ class CachingAutotuner(KernelInterface):
             self.launchers,
             getattr(self.fn, "_hash_lock", None),
             self.benchmark_failure_reasons,
+            self._config_compile_submitter,
+            self._static_config_compile_submitter,
+            self._static_triton_bundle_key,
         )
         self.fn.fn = None
         self.fn.__globals__ = None
@@ -752,6 +905,7 @@ class CachingAutotuner(KernelInterface):
         self._cached_launcher = None
         self.benchmark_failure_reasons = {}
         self.fn._hash_lock = None
+        self.clear_deferred_compile_state()
         return old_values
 
     def restore_after_unpickle(self, old_values: tuple[Any, ...] | None) -> None:
@@ -765,6 +919,9 @@ class CachingAutotuner(KernelInterface):
                 self.launchers,
                 self.fn._hash_lock,
                 self.benchmark_failure_reasons,
+                self._config_compile_submitter,
+                self._static_config_compile_submitter,
+                self._static_triton_bundle_key,
             ) = old_values
         else:
             # even if we don't need/have specific values, we do need the
@@ -780,6 +937,7 @@ class CachingAutotuner(KernelInterface):
             if isinstance(result, StaticTritonCompileResult):
                 # Don't save this in the inductor cache, as it is very large
                 result.kernel.cubin_raw = None
+        self.clear_deferred_compile_state()
 
     def __getstate__(self) -> dict[str, Any]:
         assert not self.launchers, (
@@ -788,6 +946,9 @@ class CachingAutotuner(KernelInterface):
         return {
             **self.__dict__,
             "lock": None,
+            "_config_compile_submitter": None,
+            "_static_config_compile_submitter": None,
+            "_static_triton_bundle_key": None,
         }
 
     def __setstate__(self, state: dict[str, Any]) -> None:
@@ -1008,8 +1169,7 @@ class CachingAutotuner(KernelInterface):
 
         return TritonCompileResult(binary, cfg, compile_meta, self.inductor_meta)
 
-    def bench(self, launcher, *args, with_profiler=False, **kwargs):
-        """Measure the performance of a given launcher."""
+    def _skip_config_due_to_register_spilling(self, launcher) -> bool:
         # we don't skip configs with spilled registers when auto-tuning custom
         # (user-written) Triton kernels, as (i) we don't have any knowledge or
         # control over the kernel code; (ii) there is empirical evidence that
@@ -1029,19 +1189,22 @@ class CachingAutotuner(KernelInterface):
             self.benchmark_failure_reasons[launcher] = (
                 BenchmarkFailureReason.REGISTER_SPILLING
             )
-            return float("inf")
+            return True
+        return False
 
-        device_interface = self.get_device_interface()
-        stream = device_interface.get_raw_stream(device_interface.current_device())
-
-        cpu_copies = self.copy_args_to_cpu_if_needed(*args, **kwargs)
-
+    def _make_benchmark_call(
+        self, launcher, cpu_copies, stream, args, kwargs, clone_args=True
+    ):
         def kernel_call():
-            cloned_args, cloned_kwargs = self.maybe_clone_args(
-                cpu_copies, *args, **kwargs
-            )
+            if clone_args:
+                cloned_args, cloned_kwargs = self.maybe_clone_args(
+                    cpu_copies, *args, **kwargs
+                )
+            else:
+                cloned_args = args
+                cloned_kwargs = kwargs
             # reset to zero before evaluating any config
-            self.reset_to_zero_args(*args, **kwargs)
+            self.reset_to_zero_args(*cloned_args, **cloned_kwargs)
             kernel_name = self.inductor_meta.get("kernel_name", "triton kernel")
             if autograd_profiler._is_profiler_enabled:
                 profiler_kwargs = self.get_profiler_kwargs(stream, launcher)
@@ -1086,30 +1249,67 @@ class CachingAutotuner(KernelInterface):
                     raise
             self.restore_args_from_cpu(cpu_copies)
 
-        # only use profiler when not already in a profiler instance
-        if with_profiler and not autograd_profiler._is_profiler_enabled:
-            from torch._inductor.utils import do_bench_using_profiling
+        return kernel_call
 
-            return do_bench_using_profiling(kernel_call, warmup=10, rep=40)
+    def bench(self, launcher, *args, with_profiler=False, clone_args=True, **kwargs):
+        """Measure the performance of a given launcher."""
+        if not with_profiler or autograd_profiler._is_profiler_enabled:
+            return benchmark_launchers(
+                self,
+                [launcher],
+                args,
+                kwargs,
+                device_idx=getattr(self.device_props, "index", None),
+                clone_args=clone_args,
+            )[launcher]
 
-        benchmark_kwargs = (
-            {}
-            if self.device_props.type == "cpu"
-            else {"rep": 40, "is_vetted_benchmarking": True}
+        if self._skip_config_due_to_register_spilling(launcher):
+            return float("inf")
+        device_interface = self.get_device_interface()
+        stream = device_interface.get_raw_stream(device_interface.current_device())
+
+        cpu_copies = (
+            self.copy_args_to_cpu_if_needed(*args, **kwargs) if clone_args else {}
         )
-        result = benchmarker.benchmark(
-            fn=kernel_call,
-            device=self.device_props.type,
-            **benchmark_kwargs,  # type: ignore[arg-type]
+        kernel_call = self._make_benchmark_call(
+            launcher, cpu_copies, stream, args, kwargs, clone_args=clone_args
         )
-        # benchmarker.benchmark() only returns float("inf") when catching an
-        # "invalid configuration" exception - all other exceptions are re-raised.
-        # Therefore, if result is inf here, it must be due to invalid config.
-        if result == float("inf"):
-            self.benchmark_failure_reasons[launcher] = (
-                BenchmarkFailureReason.INVALID_CONFIG
+
+        from torch._inductor.utils import do_bench_using_profiling
+
+        return do_bench_using_profiling(kernel_call, warmup=10, rep=40)
+
+    def benchmark_all_launchers(
+        self,
+        launchers,
+        *args,
+        benchmark_group_key=None,
+        benchmark_group_state=None,
+        clone_args=True,
+        **kwargs,
+    ):
+        launchers = list(launchers)
+        return benchmark_launchers(
+            self,
+            launchers,
+            args,
+            kwargs,
+            device_idx=self.device_props.index,
+            clone_args=clone_args,
+            benchmark_group_key=benchmark_group_key,
+            benchmark_group_state=benchmark_group_state,
+        )
+
+    def _benchmark_clone_arg_names(self) -> OrderedSet[str]:
+        out = OrderedSet(
+            self.inductor_meta.get(
+                "mutated_input_arg_names",
+                getattr(self, "mutated_arg_names", ()),
             )
-        return result
+        )
+        for name in getattr(self, "reset_to_zero_arg_names", ()):
+            out.add(name)
+        return out
 
     def copy_args_to_cpu_if_needed(self, *args, **kwargs):
         """
@@ -1135,8 +1335,10 @@ class CachingAutotuner(KernelInterface):
             # Possibly a custom CUDA allocator, see https://github.com/pytorch/pytorch/issues/163257
             return {}
 
+        clone_names = self._benchmark_clone_arg_names()
+
         def maybe_copy(name, arg):
-            if name in self.mutated_arg_names and arg.device.type in (
+            if name in clone_names and arg.device.type in (
                 "cuda",
                 "xpu",
             ):
@@ -1185,10 +1387,11 @@ class CachingAutotuner(KernelInterface):
             )
 
     def reset_to_zero_args(self, *args, **kwargs):
-        if not self.reset_to_zero_arg_names:
+        reset_to_zero_arg_names = getattr(self, "reset_to_zero_arg_names", ())
+        if not reset_to_zero_arg_names:
             return
         for i, arg in enumerate(args):
-            if self.fn.arg_names[i] in self.reset_to_zero_arg_names:
+            if self.fn.arg_names[i] in reset_to_zero_arg_names:
                 assert isinstance(
                     arg,
                     torch.Tensor,
@@ -1198,7 +1401,7 @@ class CachingAutotuner(KernelInterface):
                 arg.zero_()
 
         for name, arg in kwargs.items():
-            if name in self.reset_to_zero_arg_names:
+            if name in reset_to_zero_arg_names:
                 assert isinstance(
                     arg,
                     torch.Tensor,
@@ -1218,8 +1421,10 @@ class CachingAutotuner(KernelInterface):
         """
         from ..compile_fx import clone_preserve_strides
 
+        clone_names = self._benchmark_clone_arg_names()
+
         def prepare_arg(name, arg):
-            if name in self.mutated_arg_names and name not in exclude:
+            if name in clone_names and name not in exclude:
                 assert isinstance(arg, torch.Tensor)
                 return clone_preserve_strides(arg)
             else:
@@ -1253,13 +1458,14 @@ class CachingAutotuner(KernelInterface):
             #     str(self.compile_id),
             # ),
         ):
-            timings = {
-                launcher: self.bench(launcher, *args, **kwargs)
-                for launcher in self.launchers
-            }
+            timings = self.benchmark_all_launchers(self.launchers, *args, **kwargs)
 
             for k, v in timings.items():
-                self.coordesc_tuner.cache_benchmark_result(k.config, v)
+                self.coordesc_tuner.cache_benchmark_result(
+                    k.config,
+                    v,
+                    benchmark_mode=_COORDESC_BENCHMARK_MODE_UNGROUPED,
+                )
 
             if log.isEnabledFor(logging.DEBUG):
                 log.debug("Benchmark all input configs for %s, get:", self.fn.__name__)
@@ -1287,7 +1493,7 @@ class CachingAutotuner(KernelInterface):
             self.reset_to_zero_args(*args, **kwargs)
             return timings
 
-    def autotune_to_one_config(self, *args, **kwargs):
+    def autotune_to_one_config(self, *args, save_cache=True, **kwargs):
         """Do the actual autotuning"""
         start_time = time.time_ns()
         timings = self.benchmark_all_configs(*args, **kwargs)
@@ -1352,17 +1558,17 @@ class CachingAutotuner(KernelInterface):
 
         TritonBundler.put_winner(launcher.cache_hash)
 
-        if self.save_cache_hook:
+        if save_cache and self.save_cache_hook:
             self.save_cache_hook(
                 launcher.config,
                 self.autotune_time_taken_ns,
-                found_by_coordesc=self.inductor_meta.get(
-                    "coordinate_descent_tuning", False
-                ),
+                found_by_coordesc=False,
+                coordinate_descent_tuning_batch=False,
+                coordinate_descent_tuning_batch_policy=None,
                 triton_cache_hash=launcher.cache_hash,
             )
 
-    def _combo_sequential_autotune(self, launcher, *args, **kwargs):
+    def _combo_sequential_autotune(self, launcher, *args, save_cache=True, **kwargs):
         """
         Chain block-size decisions for combo kernels: tune one group at a time,
         each step building on the previous winner.
@@ -1385,7 +1591,11 @@ class CachingAutotuner(KernelInterface):
         start_time = time.time_ns()
         best_time = self.bench(launcher, *args, **kwargs)
         counters["inductor"]["combo_autotune_bench"] += 1
-        self.coordesc_tuner.cache_benchmark_result(launcher.config, best_time)
+        self.coordesc_tuner.cache_benchmark_result(
+            launcher.config,
+            best_time,
+            benchmark_mode=_COORDESC_BENCHMARK_MODE_UNGROUPED,
+        )
         log.debug(
             "  Phase 1 baseline: %s warps=%d time=%f",
             dict(current_kwargs),
@@ -1434,7 +1644,11 @@ class CachingAutotuner(KernelInterface):
                     ).make_launcher()
                 trial_time = self.bench(trial_launcher, *args, **kwargs)
                 counters["inductor"]["combo_autotune_bench"] += 1
-                self.coordesc_tuner.cache_benchmark_result(trial_config, trial_time)
+                self.coordesc_tuner.cache_benchmark_result(
+                    trial_config,
+                    trial_time,
+                    benchmark_mode=_COORDESC_BENCHMARK_MODE_UNGROUPED,
+                )
 
                 improved = trial_time < best_time
                 log.debug(
@@ -1483,7 +1697,11 @@ class CachingAutotuner(KernelInterface):
                 trial_launcher = self._precompile_config(trial_config).make_launcher()
             trial_time = self.bench(trial_launcher, *args, **kwargs)
             counters["inductor"]["combo_autotune_bench"] += 1
-            self.coordesc_tuner.cache_benchmark_result(trial_config, trial_time)
+            self.coordesc_tuner.cache_benchmark_result(
+                trial_config,
+                trial_time,
+                benchmark_mode=_COORDESC_BENCHMARK_MODE_UNGROUPED,
+            )
 
             improved = trial_time < best_time
             log.debug(
@@ -1507,7 +1725,7 @@ class CachingAutotuner(KernelInterface):
         )
         launcher.config.found_by_combo_autotune = True
         self.autotune_time_taken_ns += time.time_ns() - start_time
-        if self.save_cache_hook:
+        if save_cache and self.save_cache_hook:
             self.save_cache_hook(launcher.config, self.autotune_time_taken_ns)
         return launcher
 
@@ -1614,7 +1832,24 @@ class CachingAutotuner(KernelInterface):
         )
         self.cpu_kernel_saved = True
 
-    def coordinate_descent_tuning(self, launcher, *args, **kwargs):
+    def _can_coordinate_descent_tune(self) -> bool:
+        return _can_coordinate_descent_tune_for(
+            self.heuristic_type,
+            self.deterministic_mode,
+        )
+
+    def _coordinate_descent_batch_enabled(self) -> bool:
+        return _coordinate_descent_batch_enabled_for_kernel(self)
+
+    def coordinate_descent_tuning(
+        self,
+        launcher,
+        *args,
+        save_cache=True,
+        use_batch_benchmarking: bool | None = None,
+        clone_args=True,
+        **kwargs,
+    ):
         """
         Coordinate descent tuning can be run with or without max-autotune.
 
@@ -1625,24 +1860,7 @@ class CachingAutotuner(KernelInterface):
         Then if coordinate desecnt tuning is run with max-autotune disabled, it will start from C1;
         while if coordinate descent tuning is run with max-autotune enabled, it will start from C3.
         """
-        if self.heuristic_type in (
-            HeuristicType.TEMPLATE,
-            HeuristicType.USER_AUTOTUNE,
-            HeuristicType.FIXED,
-        ):
-            # skip triton template
-            return launcher
-
-        if self.deterministic_mode and self.heuristic_type in (
-            HeuristicType.REDUCTION,
-            HeuristicType.PERSISTENT_REDUCTION,
-            HeuristicType.SPLIT_SCAN,
-        ):
-            # Not only RBLOCK size matters for numericals of reduction.
-            # num_warps also matters since that affect how much data
-            # is handled by each thread, how many warp-reduction we do
-            # in parallel and how much data is there for block
-            # reduction.
+        if not self._can_coordinate_descent_tune():
             return launcher
 
         with dynamo_timed(
@@ -1656,48 +1874,58 @@ class CachingAutotuner(KernelInterface):
             log_waitcounter=True,
             waitcounter_name_override="triton_autotuner",
         ):
-            return self._coordinate_descent_tuning(launcher, *args, **kwargs)
-
-    def _coordinate_descent_tuning(self, launcher, *args, **kwargs):
-        config2launcher = {launcher.config: launcher}
-
-        self._ensure_kernel_loaded()
-
-        def benchmark_one_config(config):
-            with self.lock:
-                launcher = self._precompile_config(config).make_launcher()
-            config2launcher[config] = launcher
-
-            out = self.bench(launcher, *args, **kwargs)
-            counters["inductor"]["coordesc_tuning_bench"] += 1
-            log.debug(
-                "COORDESC: %s: %f, nreg %d, nspill %d, #shared-mem %d",
-                launcher.config,
-                out,
-                launcher.n_regs,
-                launcher.n_spills,
-                launcher.shared,
+            return self._coordinate_descent_tuning(
+                launcher,
+                *args,
+                save_cache=save_cache,
+                use_batch_benchmarking=use_batch_benchmarking,
+                clone_args=clone_args,
+                **kwargs,
             )
-            return out
 
-        assert not (
-            self.heuristic_type == HeuristicType.PERSISTENT_REDUCTION
-            and "R0_BLOCK" in launcher.config.kwargs
-        ), (
-            "Coordinate descent tuner relies on the assumption that persistent reduction's triton config does not have R0_BLOCK"
+    def defer_coordinate_descent_tuning(
+        self, launcher, *args, stream=None, save_kernel=True, **kwargs
+    ):
+        batch = get_active_autotune_queue()
+        assert batch is not None
+        assert self._can_coordinate_descent_tune()
+        enqueue_start_ns = time.time_ns()
+        task = batch.enqueue(self, launcher, args, kwargs, stream, save_kernel)
+        counters["inductor"]["autotune_queue_enqueue_ns"] += (
+            time.time_ns() - enqueue_start_ns
         )
-        start_time = time.time_ns()
-        best_config = self.coordesc_tuner.autotune(
-            benchmark_one_config, launcher.config, None
-        )
-        coordesc_time_taken_ns = time.time_ns() - start_time
+        return self.launchers[0], task if task is not False else None
+
+    def _make_coordesc_launcher_for_config(self, config2launcher, config):
+        with self.lock:
+            launcher = config2launcher.get(config)
+            if launcher is None:
+                launcher = self._precompile_config(config).make_launcher()
+                config2launcher[config] = launcher
+        return launcher
+
+    def _finish_coordinate_descent_tuning(
+        self,
+        best_config,
+        config2launcher,
+        coordesc_time_taken_ns,
+        save_cache=True,
+        *,
+        coordinate_descent_tuning_batch: bool = False,
+    ):
         best_config.found_by_coordesc = True
 
-        if self.save_cache_hook:
+        if save_cache and self.save_cache_hook:
             self.save_cache_hook(
                 best_config,
                 self.autotune_time_taken_ns + coordesc_time_taken_ns,
                 found_by_coordesc=True,
+                coordinate_descent_tuning_batch=coordinate_descent_tuning_batch,
+                coordinate_descent_tuning_batch_policy=(
+                    _coordinate_descent_batch_policy(self.inductor_meta)
+                    if coordinate_descent_tuning_batch
+                    else None
+                ),
             )
 
         if best_config not in config2launcher:
@@ -1709,13 +1937,240 @@ class CachingAutotuner(KernelInterface):
             ).make_launcher()
 
         winner = config2launcher[best_config]
+        # `best_config` can be equal to, but not the same object as, the
+        # launcher's config stored in `config2launcher`.
+        winner.config.found_by_coordesc = True
         TritonBundler.put_winner(winner.cache_hash)
 
         fn_hash = generate_lookup_hash_from_source_code(
             str(self.size_hints), self.fn.src
         )
         log.debug("Function hash %s has best config %s", fn_hash, best_config)
+        self.clear_deferred_compile_state()
         return winner
+
+    def _coordinate_descent_tuning(
+        self,
+        launcher,
+        *args,
+        save_cache=True,
+        use_batch_benchmarking: bool | None = None,
+        clone_args=True,
+        **kwargs,
+    ):
+        config2launcher = {launcher.config: launcher}
+        coordinate_descent_batch_enabled = (
+            self._coordinate_descent_batch_enabled()
+            if use_batch_benchmarking is None
+            else use_batch_benchmarking
+        )
+        benchmark_group_state: dict[str, int] | None = (
+            {} if coordinate_descent_batch_enabled else None
+        )
+
+        self._ensure_kernel_loaded()
+
+        def launcher_for_config(config):
+            return self._make_coordesc_launcher_for_config(config2launcher, config)
+
+        def benchmark_one_config(config):
+            launcher = launcher_for_config(config)
+
+            if benchmark_group_state is not None:
+                timings = self.benchmark_all_launchers(
+                    [launcher],
+                    *args,
+                    benchmark_group_key=self,
+                    benchmark_group_state=benchmark_group_state,
+                    clone_args=clone_args,
+                    **kwargs,
+                )
+                out = timings[launcher]
+            else:
+                out = self.bench(launcher, *args, clone_args=clone_args, **kwargs)
+            counters["inductor"]["coordesc_tuning_bench"] += 1
+            log.debug(
+                "COORDESC: %s: %f, nreg %d, nspill %d, #shared-mem %d",
+                launcher.config,
+                out,
+                launcher.n_regs,
+                launcher.n_spills,
+                launcher.shared,
+            )
+            return out
+
+        def benchmark_many_configs(configs):
+            config_to_launcher = {}
+            config_to_timing = {}
+            for config in configs:
+                try:
+                    launcher = launcher_for_config(config)
+                except Exception as e:
+                    log.debug("COORDESC: got exception %s", e)
+                    config_to_timing[config] = float("inf")
+                    continue
+                config2launcher[config] = launcher
+                config_to_launcher[config] = launcher
+
+            if config_to_launcher:
+                try:
+                    timings = self.benchmark_all_launchers(
+                        list(config_to_launcher.values()),
+                        *args,
+                        benchmark_group_key=self,
+                        benchmark_group_state=benchmark_group_state,
+                        clone_args=clone_args,
+                        **kwargs,
+                    )
+                except Exception:
+                    if benchmark_group_state is not None:
+                        benchmark_group_state[
+                            _COORDESC_UNGROUPED_BENCHMARK_KEY
+                        ] = 1
+                    raise
+                counters["inductor"]["coordesc_tuning_bench"] += len(timings)
+                for config, launcher in config_to_launcher.items():
+                    timing = timings[launcher]
+                    config_to_timing[config] = timing
+                    log.debug(
+                        "COORDESC: %s: %f, nreg %d, nspill %d, #shared-mem %d",
+                        launcher.config,
+                        timing,
+                        launcher.n_regs,
+                        launcher.n_spills,
+                        launcher.shared,
+                    )
+
+            return config_to_timing
+
+        assert not (
+            self.heuristic_type == HeuristicType.PERSISTENT_REDUCTION
+            and "R0_BLOCK" in launcher.config.kwargs
+        ), (
+            "Coordinate descent tuner relies on the assumption that persistent reduction's triton config does not have R0_BLOCK"
+        )
+        start_time = time.time_ns()
+        benchmark_mode = (
+            _COORDESC_BENCHMARK_MODE_GROUPED
+            if coordinate_descent_batch_enabled
+            else _COORDESC_BENCHMARK_MODE_UNGROUPED
+        )
+
+        def current_benchmark_mode():
+            if _has_ungrouped_coordesc_benchmark(benchmark_group_state):
+                return _COORDESC_BENCHMARK_MODE_UNGROUPED
+            return benchmark_mode
+
+        best_config = self.coordesc_tuner.autotune(
+            benchmark_one_config,
+            launcher.config,
+            func_many=(
+                benchmark_many_configs
+                if coordinate_descent_batch_enabled
+                else None
+            ),
+            benchmark_mode=(
+                current_benchmark_mode
+                if coordinate_descent_batch_enabled
+                else benchmark_mode
+            ),
+        )
+        coordesc_time_taken_ns = time.time_ns() - start_time
+        used_ungrouped_batch_benchmark = (
+            coordinate_descent_batch_enabled
+            and _has_ungrouped_coordesc_benchmark(benchmark_group_state)
+        )
+        if used_ungrouped_batch_benchmark and save_cache:
+            counters["inductor"]["coordesc_tuning_batch_ungrouped_cache_skips"] += 1
+        return self._finish_coordinate_descent_tuning(
+            best_config,
+            config2launcher,
+            coordesc_time_taken_ns,
+            save_cache=save_cache and not used_ungrouped_batch_benchmark,
+            coordinate_descent_tuning_batch=coordinate_descent_batch_enabled
+            and not used_ungrouped_batch_benchmark,
+        )
+
+    def prepare_for_benchmark(
+        self,
+        *args,
+        coordinate_descent=False,
+        save_cache=True,
+        runtime_coordesc_cache_recheck=False,
+        defer_static_autotune=False,
+        **kwargs,
+    ):
+        self._install_triton_allocator()
+
+        if runtime_coordesc_cache_recheck and (
+            not self.launchers
+            or not getattr(self.launchers[0].config, "found_by_coordesc", False)
+        ):
+            self._recheck_coordesc_cache_before_runtime_tuning()
+
+        has_deferred_static_configs = bool(self.configs) and len(self.launchers) == 1
+        if len(self.launchers) != 1 or (
+            has_deferred_static_configs and not defer_static_autotune
+        ):
+            if len(self.launchers) == 0 or has_deferred_static_configs:
+                start_time = time.time_ns()
+                if has_deferred_static_configs:
+                    self._finish_deferred_static_precompile(
+                        use_process_pool=self._static_config_compile_submitter
+                        is not None
+                    )
+                else:
+                    self.precompile()
+                self.precompile_time_taken_ns = time.time_ns() - start_time
+            if runtime_coordesc_cache_recheck and (
+                not self.launchers
+                or not getattr(self.launchers[0].config, "found_by_coordesc", False)
+            ):
+                self._recheck_coordesc_cache_before_runtime_tuning()
+            if len(self.launchers) > 1:
+                if defer_static_autotune:
+                    return self.launchers[0]
+                self.autotune_to_one_config(*args, save_cache=save_cache, **kwargs)
+        elif has_deferred_static_configs and defer_static_autotune:
+            return self.launchers[0]
+
+        if self.inductor_meta.get("combo_tuning_groups") and not getattr(
+            self.launchers[0].config, "found_by_combo_autotune", False
+        ):
+            with dynamo_timed(
+                "CachingAutotuner.combo_sequential_autotune",
+                log_pt2_compile_event=False,
+                metadata={"kernel_name": self.inductor_meta.get("kernel_name")},
+                dynamo_compile_column_us="runtime_triton_autotune_time_us",
+                compile_id=self.compile_id,
+                is_backward=self.is_backward,
+                log_waitcounter=True,
+                waitcounter_name_override="triton_autotuner",
+            ):
+                self.launchers = [
+                    self._combo_sequential_autotune(
+                        self.launchers[0],
+                        *args,
+                        save_cache=save_cache,
+                        **kwargs,
+                    )
+                ]
+
+        if (
+            coordinate_descent
+            and not getattr(self.launchers[0].config, "found_by_coordesc", False)
+            and self.inductor_meta.get("coordinate_descent_tuning", False)
+        ):
+            self.launchers = [
+                self.coordinate_descent_tuning(
+                    self.launchers[0],
+                    *args,
+                    save_cache=save_cache,
+                    **kwargs,
+                )
+            ]
+
+        return self.launchers[0]
 
     def get_profiler_kwargs(self, stream, launcher):
         kernel_kwargs_str = ",".join(
@@ -1775,6 +2230,16 @@ class CachingAutotuner(KernelInterface):
             self._debug_call = None
             debug_call.finalize(self.get_device_interface())
 
+    def _install_triton_allocator(self) -> None:
+        if hasattr(triton, "set_allocator"):
+
+            def alloc_fn(size: int, align: int, stream: int | None):
+                return torch.empty(
+                    size, dtype=torch.int8, device=self.device_props.type
+                )
+
+            triton.set_allocator(alloc_fn)
+
     def run(
         self,
         *args,
@@ -1783,6 +2248,12 @@ class CachingAutotuner(KernelInterface):
         **kwargs,
     ):  # type:ignore[override]
         """Launch triton kernel call and return result."""
+        active_coordesc_batch = get_active_autotune_queue()
+        if active_coordesc_batch is not None and not getattr(
+            active_coordesc_batch, "disposable_args", False
+        ):
+            active_coordesc_batch = None
+
         # --- FAST PATH ---
         # After the first successful launch in steady state, cache the launcher
         # and skip all preamble on subsequent calls (~2µs savings).
@@ -1813,15 +2284,6 @@ class CachingAutotuner(KernelInterface):
                 kernel_name=self.fn.__name__, kwargs=kernel_kwargs
             )
 
-        if hasattr(triton, "set_allocator"):
-
-            def alloc_fn(size: int, align: int, stream: int | None):
-                return torch.empty(
-                    size, dtype=torch.int8, device=self.device_props.type
-                )
-
-            triton.set_allocator(alloc_fn)
-
         if self.triton_interpret:
             args, grid = self._interpret_args_grid(args, self.configs[0])
             return self.fn[grid](
@@ -1830,56 +2292,146 @@ class CachingAutotuner(KernelInterface):
                 **self.configs[0].kwargs,
             )
 
-        if len(self.launchers) != 1:
-            if len(self.launchers) == 0:
-                start_time = time.time_ns()
-                self.precompile()
-                self.precompile_time_taken_ns = time.time_ns() - start_time
-            if len(self.launchers) > 1:
-                self.autotune_to_one_config(*args, **kwargs)
+        defer_static_autotune = (
+            active_coordesc_batch is not None
+            and not benchmark_run
+            and not self.inductor_meta.get("coordinate_descent_tuning", False)
+            and not self.inductor_meta.get("combo_tuning_groups")
+            and _static_autotune_batch_enabled_for(
+                self.inductor_meta, self.triton_meta, self.heuristic_type
+            )
+        )
+        self.prepare_for_benchmark(
+            *args,
+            coordinate_descent=False,
+            save_cache=not benchmark_run,
+            runtime_coordesc_cache_recheck=(
+                active_coordesc_batch is None
+                and not benchmark_run
+                and self.inductor_meta.get("coordinate_descent_tuning", False)
+            ),
+            defer_static_autotune=defer_static_autotune,
+            **kwargs,
+        )
 
-        if self.inductor_meta.get("combo_tuning_groups") and not getattr(
-            self.launchers[0].config, "found_by_combo_autotune", False
+        deferred_autotune_task = None
+        if defer_static_autotune and (
+            len(self.launchers) > 1 or bool(self.configs)
         ):
-            with dynamo_timed(
-                "CachingAutotuner.combo_sequential_autotune",
-                log_pt2_compile_event=False,
-                metadata={"kernel_name": self.inductor_meta.get("kernel_name")},
-                dynamo_compile_column_us="runtime_triton_autotune_time_us",
-                compile_id=self.compile_id,
-                is_backward=self.is_backward,
-                log_waitcounter=True,
-                waitcounter_name_override="triton_autotuner",
+            if (
+                active_coordesc_batch is not None
+                and _static_autotune_config_count(self)
+                >= _STATIC_AUTOTUNE_BATCH_MIN_CONFIGS
             ):
-                self.launchers = [
-                    self._combo_sequential_autotune(self.launchers[0], *args, **kwargs)
-                ]
+                deferred_autotune_task = active_coordesc_batch.enqueue_static(
+                    self,
+                    args,
+                    kwargs,
+                    stream,
+                    save_kernel=not benchmark_run,
+                )
+                if deferred_autotune_task:
+                    self.launchers = [self.launchers[0]]
+                else:
+                    deferred_autotune_task = None
+
+            if deferred_autotune_task is None and (
+                len(self.launchers) > 1 or bool(self.configs)
+            ):
+                if self.configs:
+                    self._finish_deferred_static_precompile(
+                        use_process_pool=self._static_config_compile_submitter
+                        is not None
+                    )
+                self.autotune_to_one_config(
+                    *args, save_cache=not benchmark_run, **kwargs
+                )
 
         if not getattr(
             self.launchers[0].config, "found_by_coordesc", False
-        ) and self.inductor_meta.get("coordinate_descent_tuning", False):
-            self.launchers = [
-                self.coordinate_descent_tuning(self.launchers[0], *args, **kwargs)
-            ]
+        ) and (
+            not benchmark_run
+            and self.inductor_meta.get("coordinate_descent_tuning", False)
+        ):
+            if (
+                active_coordesc_batch is not None
+                and self._coordinate_descent_batch_enabled()
+            ):
+                launcher, deferred_coordesc_task = self.defer_coordinate_descent_tuning(
+                    self.launchers[0],
+                    *args,
+                    stream=stream,
+                    save_kernel=not benchmark_run,
+                    **kwargs,
+                )
+                if deferred_coordesc_task is not None:
+                    deferred_autotune_task = deferred_coordesc_task
+                    self.launchers = [
+                        launcher,
+                    ]
+                else:
+                    self.launchers = [
+                        self.coordinate_descent_tuning(
+                            self.launchers[0],
+                            *args,
+                            use_batch_benchmarking=None,
+                            **kwargs,
+                        )
+                    ]
+            else:
+                self.launchers = [
+                    self.coordinate_descent_tuning(
+                        self.launchers[0],
+                        *args,
+                        use_batch_benchmarking=None,
+                        **kwargs,
+                    )
+                ]
+
+        def record_winner_kernel(launcher) -> None:
+            # Ensure the final launcher is marked as a winner for bundle filtering.
+            # For multi-config autotuning and coordesc, put_winner was already called
+            # (this is an idempotent set-add). For single-config kernels that skip
+            # autotuning entirely, this is the only call site that records the winner.
+            TritonBundler.put_winner(launcher.cache_hash)
+            if launcher.store_cubin and (not benchmark_run or not self.cuda_kernel_saved):
+                if self.device_props.type == "cpu":
+                    if not self.cpu_kernel_saved:
+                        self.save_cpu_kernel(launcher)
+                else:
+                    self.save_gpu_kernel(stream, launcher)
 
         (launcher,) = self.launchers
-        # Ensure the final launcher is marked as a winner for bundle filtering.
-        # For multi-config autotuning and coordesc, put_winner was already called
-        # (this is an idempotent set-add). For single-config kernels that skip
-        # autotuning entirely, this is the only call site that records the winner.
-        TritonBundler.put_winner(launcher.cache_hash)
-        if launcher.store_cubin and (not benchmark_run or not self.cuda_kernel_saved):
-            if self.device_props.type == "cpu":
-                if not self.cpu_kernel_saved:
-                    self.save_cpu_kernel(launcher)
-            else:
-                self.save_gpu_kernel(stream, launcher)
+        if deferred_autotune_task is None:
+            record_winner_kernel(launcher)
 
-        try:
-            self._pre_launch(launcher, *args, stream=stream, **kwargs)
-            result = launcher(*args, **kwargs, stream=stream)
-        finally:
-            self._post_launch()
+        while True:
+            fallback_static_autotune = False
+            try:
+                self._pre_launch(launcher, *args, stream=stream, **kwargs)
+                result = launcher(*args, **kwargs, stream=stream)
+            except Exception as e:
+                if not (
+                    deferred_autotune_task is not None
+                    and deferred_autotune_task.should_fallback_on_launch_exception(e)
+                ):
+                    raise
+                fallback_static_autotune = True
+            finally:
+                self._post_launch()
+
+            if not fallback_static_autotune:
+                break
+
+            if active_coordesc_batch is not None:
+                active_coordesc_batch.remove_task(deferred_autotune_task)
+            deferred_autotune_task.run_scalar(
+                save_cache=not benchmark_run,
+                save_kernel=not benchmark_run,
+            )
+            deferred_autotune_task = None
+            (launcher,) = self.launchers
+            record_winner_kernel(launcher)
 
         # Populate fast path: cache the launcher for future calls.  Static
         # conditions (interpret, dump flags) are pre-computed in _cache_eligible;
@@ -1889,6 +2441,7 @@ class CachingAutotuner(KernelInterface):
             and self._cache_eligible
             and not benchmark_run
             and not debug_mode
+            and deferred_autotune_task is None
             and not autograd_profiler._is_profiler_enabled
             and len(self.launchers) == 1
         ):
@@ -2022,6 +2575,7 @@ class CachingAutotuner(KernelInterface):
         if self.inductor_meta.get("extra_launcher_args"):
             args = args[: -len(self.inductor_meta["extra_launcher_args"])]
         return args, grid
+
 
 
 class _ConstRepr:
@@ -2714,11 +3268,25 @@ def cached_autotune(
     has additional debugging, error handling, and on-disk caching.
     """
     configs = unique_configs(configs)
+    autotune_configs_hash = hash_configs(configs)
     assert len(configs) == 1 or filename
     inductor_meta = {} if inductor_meta is None else inductor_meta
+    # Store the effective per-kernel batch mode in the generated autotuner
+    # metadata. The global flag alone is not enough for cache compatibility:
+    # policy="auto" intentionally leaves pointwise kernels on scalar coordesc.
+    apply_effective_coordinate_descent_queue_metadata(
+        inductor_meta,
+        triton_meta,
+        heuristic_type,
+        bool(inductor_meta.get("deterministic", False)),
+        keep_disabled=True,
+    )
 
     configs, autotune_cache, autotune_cache_info = check_autotune_cache(
-        configs, filename, inductor_meta
+        configs,
+        filename,
+        inductor_meta,
+        configs_hash=autotune_configs_hash,
     )
     mutated_arg_names = inductor_meta.pop("mutated_arg_names", ())
     optimize_mem = inductor_meta.pop("optimize_mem", True)
@@ -2762,6 +3330,7 @@ def cached_autotune(
                 custom_kernel=custom_kernel,
                 filename=filename,
                 with_bandwidth_info=True,
+                autotune_configs_hash=autotune_configs_hash,
             )
         return caching_autotuner_cls(
             fn,
@@ -2777,6 +3346,7 @@ def cached_autotune(
             custom_kernel=custom_kernel,
             filename=filename,
             autotune_cache_info=autotune_cache_info,
+            autotune_configs_hash=autotune_configs_hash,
         )
 
     return decorator

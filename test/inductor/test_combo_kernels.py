@@ -1703,6 +1703,15 @@ class ComboKernelMetadataTests(TestCase):
         self.assertIn("'optimize_mem': True", code)
 
     @requires_gpu_and_triton
+    def test_combo_inductor_meta_has_mutated_input_arg_names(self):
+        def fn(a, b):
+            return torch.relu(a), torch.sigmoid(b)
+
+        inps = [torch.rand(1024, device=GPU_TYPE) for _ in range(2)]
+        code = self._combo_code(fn, inps)
+        FileCheck().check("'mutated_input_arg_names': []").run(code)
+
+    @requires_gpu_and_triton
     def test_combo_inductor_meta_optimize_mem_false_in_training_forward(self):
         def fn(a, b):
             return torch.relu(a), torch.sigmoid(b)

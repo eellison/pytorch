@@ -50,6 +50,10 @@ from ..remote_cache import (
     RemoteCache,
     RemoteCacheJsonSerde,
 )
+from .autotune_common import (
+    _coordinate_descent_batch_enabled_from_meta,
+    _coordinate_descent_batch_policy,
+)
 from .triton_compat import Config, HAS_WARP_SPEC
 
 
@@ -57,6 +61,26 @@ log = logging.getLogger(__name__)
 
 
 _InductorMetaTy = dict[str, object]
+
+
+def _coordinate_descent_cache_components(
+    inductor_meta: _InductorMetaTy,
+) -> tuple[str, ...]:
+    if not inductor_meta.get("coordinate_descent_tuning", False):
+        return ()
+    components = (
+        "coordinate_descent_tuning",
+        "1",
+        "coordinate_descent_tuning_batch",
+        "1" if _coordinate_descent_batch_enabled_from_meta(inductor_meta) else "0",
+    )
+    if not _coordinate_descent_batch_enabled_from_meta(inductor_meta):
+        return components
+    return (
+        *components,
+        "coordinate_descent_tuning_batch_policy",
+        _coordinate_descent_batch_policy(inductor_meta),
+    )
 
 
 def inductor_meta_from_config() -> _InductorMetaTy:
@@ -81,6 +105,13 @@ def inductor_meta_from_config() -> _InductorMetaTy:
         "backend_hash": backend_hash,
         "bundled_autotune_remote_cache": config.bundled_autotune_remote_cache,
         "coordinate_descent_tuning": config.coordinate_descent_tuning,
+        "coordinate_descent_tuning_batch_requested": (
+            config.coordinate_descent_tuning_batch
+        ),
+        "coordinate_descent_tuning_batch": config.coordinate_descent_tuning_batch,
+        "coordinate_descent_tuning_batch_policy": (
+            config.coordinate_descent_tuning_batch_policy
+        ),
         "is_fbcode": config.is_fbcode(),
         "is_hip": is_hip,
     }
@@ -117,6 +148,8 @@ class AutotuneCache:
     local_cache: tuple[RemoteCache[JsonDataTy], str] | None = None
     remote_cache: tuple[RemoteCache[JsonDataTy], str] | None = None
     artifact_recorder: CacheArtifactRecorder | None = None
+    coordesc_cache_batch_mode: bool = False
+    coordesc_cache_batch_policy: str | None = None
 
     # Create a AutotuneCache. Returns None if none of the caches can be used.
     @staticmethod
@@ -124,7 +157,15 @@ class AutotuneCache:
         inductor_meta: _InductorMetaTy, filename: str, configs_hash: str
     ) -> AutotuneCache | None:
         cache = AutotuneCache(configs_hash)
-        key = AutotuneCache._prepare_key(filename)
+        cache.coordesc_cache_batch_mode = _coordinate_descent_batch_enabled_from_meta(
+            inductor_meta
+        )
+        cache.coordesc_cache_batch_policy = (
+            _coordinate_descent_batch_policy(inductor_meta)
+            if cache.coordesc_cache_batch_mode
+            else None
+        )
+        key = AutotuneCache._prepare_cache_key(filename, inductor_meta)
         local_cache_key = AutotuneCache._make_local_cache_key(
             os.path.dirname(filename), key
         )
@@ -147,6 +188,14 @@ class AutotuneCache:
         # base of filename is already sha256 hash the source contents
         key = f"{os.path.basename(filename)}:{cconfig.cache_key_tag}"
         return AUTOTUNE_CACHE_KEY_STRATEGY.key(key)
+
+    @staticmethod
+    def _prepare_cache_key(filename: str, inductor_meta: _InductorMetaTy) -> str:
+        key = AutotuneCache._prepare_key(filename)
+        components = _coordinate_descent_cache_components(inductor_meta)
+        if components:
+            key = AUTOTUNE_CACHE_KEY_STRATEGY.key(key, *components)
+        return key
 
     @staticmethod
     def _make_local_cache_key(dirname: str, cache_key: str) -> str:
@@ -172,28 +221,21 @@ class AutotuneCache:
             recorder.record(data)
 
     # Read the best config options from the most local cache and return it.
-    def _read(self) -> dict[str, JsonDataTy] | None:
+    def _read(self) -> tuple[dict[str, JsonDataTy], str | None] | None:
         if local_cache := self.local_cache:
             cache, key = local_cache
             AutotuneCacheBundler.sync()
             best_config = cache.get(key)
             if best_config is not None:
                 assert isinstance(best_config, dict)
-                # Imagine we have a new model that reuses some existing kernels that
-                # have already been compiled. If we didn't put() here on cache hit,
-                # then the new model would only bundle newly compiled kernels, not
-                # existing kernels that were already compiled and cached.
-                AutotuneCacheBundler.put(key, best_config)
-                self._record_artifact(best_config)
                 if best_config:
-                    return best_config
+                    return best_config, key
 
         if remote_cache := self.remote_cache:
             cache, key = remote_cache
             if best_config := cache.get(key):
                 if isinstance(best_config, dict):
-                    self._record_artifact(best_config)
-                    return best_config
+                    return best_config, None
 
         return None
 
@@ -202,10 +244,20 @@ class AutotuneCache:
     def read_best(
         self, inductor_meta: _InductorMetaTy, configs: list[Config]
     ) -> Config | None:
-        if best := self._read():
-            return _load_cached_autotuning(
-                best, self.configs_hash, configs, inductor_meta
+        if cached := self._read():
+            best_config, local_key = cached
+            loaded_config = _load_cached_autotuning(
+                best_config.copy(), self.configs_hash, configs, inductor_meta
             )
+            if loaded_config is not None:
+                if local_key is not None:
+                    # Imagine we have a new model that reuses some existing kernels
+                    # that have already been compiled. If we didn't put() here on a
+                    # validated cache hit, then the new model would only bundle newly
+                    # compiled kernels, not existing kernels that were already cached.
+                    AutotuneCacheBundler.put(local_key, best_config)
+                self._record_artifact(best_config)
+            return loaded_config
         return None
 
     # Set up local filesystem caching information
@@ -304,6 +356,9 @@ class AutotuneCache:
         time_taken_ns: int,
         found_by_coordesc: bool = False,
         triton_cache_hash: str | None = None,
+        *,
+        coordinate_descent_tuning_batch: bool | None = None,
+        coordinate_descent_tuning_batch_policy: str | None = None,
     ) -> None:
         data: dict[str, JsonDataTy] = {
             # pyrefly: ignore [missing-attribute]
@@ -317,6 +372,29 @@ class AutotuneCache:
             "time_taken_ms": time_taken_ns // 1000000,  # Convert from NS to MS
             "triton_cache_hash": triton_cache_hash,
         }
+        if found_by_coordesc:
+            actual_batch_mode = (
+                False
+                if coordinate_descent_tuning_batch is None
+                else coordinate_descent_tuning_batch
+            )
+            if actual_batch_mode != getattr(self, "coordesc_cache_batch_mode", False):
+                return
+            if actual_batch_mode:
+                actual_batch_policy = (
+                    None
+                    if coordinate_descent_tuning_batch_policy is None
+                    else str(coordinate_descent_tuning_batch_policy).lower()
+                )
+                if actual_batch_policy != getattr(
+                    self, "coordesc_cache_batch_policy", None
+                ):
+                    return
+            data["coordinate_descent_tuning_batch"] = actual_batch_mode
+            if coordinate_descent_tuning_batch_policy is not None:
+                data["coordinate_descent_tuning_batch_policy"] = (
+                    coordinate_descent_tuning_batch_policy
+                )
         # Save extra_options if present on the config. This allows third-party
         # backends to store custom tuned options alongside the standard config.
         if extra_options := getattr(config, "extra_options", None):
@@ -498,7 +576,6 @@ class AutotuneCacheBundler:
         # self.put()). For now create the AutotuneCacheBundler and try to load
         # from the cache.
 
-        salt = "bundled-autotune-best-configs-v1"
         backend_hash = _AutotuneCacheBundlerImpl._get_backend_hash(inductor_meta)
         # TODO: The autotune cache includes configs_hash in the key. The problem
         # is that the configs_hash includes info from the individual pointwise()
@@ -506,6 +583,7 @@ class AutotuneCacheBundler:
         # that info is basically present in the `code_hash` (since it's a
         # parameter to the pointwise decorator) - but is there other info we
         # need to include from inductor_meta?
+        salt = "bundled-autotune-best-configs-v1"
         key = AUTOTUNE_CACHE_KEY_STRATEGY.key(code_hash, backend_hash, salt)
 
         bundler = _AutotuneCacheBundlerImpl(key, cache)
@@ -591,10 +669,33 @@ def _load_cached_autotuning(
     # Extract extra_options if present. This allows third-party backends
     # to restore custom tuned options from the cache.
     extra_options = best_config.pop("extra_options", None)
+    found_by_coordesc = bool(best_config.pop("found_by_coordesc", False))
+    coordinate_descent_tuning_batch = best_config.pop(
+        "coordinate_descent_tuning_batch", None
+    )
+    coordinate_descent_tuning_batch_policy = best_config.pop(
+        "coordinate_descent_tuning_batch_policy", None
+    )
 
-    if inductor_meta.get("coordinate_descent_tuning") and best_config.pop(
-        "found_by_coordesc", False
-    ):
+    if found_by_coordesc:
+        if not inductor_meta.get("coordinate_descent_tuning"):
+            return None
+        if coordinate_descent_tuning_batch is None:
+            return None
+        coordinate_descent_tuning_batch = bool(coordinate_descent_tuning_batch)
+        if coordinate_descent_tuning_batch != _coordinate_descent_batch_enabled_from_meta(
+            inductor_meta
+        ):
+            return None
+        if coordinate_descent_tuning_batch:
+            if coordinate_descent_tuning_batch_policy is None:
+                return None
+            if (
+                str(coordinate_descent_tuning_batch_policy).lower()
+                != _coordinate_descent_batch_policy(inductor_meta)
+            ):
+                return None
+
         num_warps = best_config.pop("num_warps")
         num_stages = best_config.pop("num_stages")
 

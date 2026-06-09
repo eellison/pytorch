@@ -13,6 +13,7 @@ import os
 import random
 import re
 import tempfile
+import time
 from collections.abc import Callable
 from itertools import chain, count
 from typing import Any, TYPE_CHECKING
@@ -46,7 +47,7 @@ from torch.utils._sympy.symbol import symbol_is_type, SymT
 from .. import async_compile, config, ir
 from ..codecache import output_code_log
 from ..ir import IRNode, ReinterpretView
-from ..runtime import triton_heuristics
+from ..runtime import autotune_common, autotune_queue, triton_heuristics
 from ..runtime.hints import DeviceProperties
 from ..stream_constants import DEFAULT_STREAM, DEFAULT_STREAM_IDX, STREAM_NAME_TEMPLATE
 from ..stream_utils import get_stream_name
@@ -2072,8 +2073,9 @@ class PythonWrapperCodegen(CodeGen):
         kernel_defs = self.multi_kernel_state.kernel_defs
         if config.triton.autotune_at_compile_time:
             self.kernel_autotune_defs.splice(kernel_defs)
-        else:
-            self.header.splice(kernel_defs)
+            if V.graph.cpp_wrapper:
+                return
+        self.header.splice(kernel_defs)
 
     def _generate(self, is_inference):
         if config.profile_bandwidth:
@@ -2177,10 +2179,20 @@ class PythonWrapperCodegen(CodeGen):
                 self.get_autotuning_input_name(idx): v  # type: ignore[attr-defined]
                 for idx, v in enumerate(V.graph.autotuning_inputs)
             }
-        tuning_code = (
-            self.kernel_autotune_defs.getvalue()
-            + "\n"
-            + self.kernel_autotune_calls.getvalue()
+        queue_enabled_for_defs = self._has_enough_autotune_kernels_for_queue()
+        defs_code = self.kernel_autotune_defs.getvalue()
+        call_code = self.kernel_autotune_calls.getvalue()
+        tuning_code = defs_code + "\n" + call_code
+        tuning_code_for_trace = (
+            "# Autotune execution metadata:\n"
+            "# defs config patch: "
+            f"autotune_queue_static_precompile={queue_enabled_for_defs}, "
+            "coordinate_descent_tuning_batch="
+            f"{config.coordinate_descent_tuning_batch and queue_enabled_for_defs}\n"
+            "# calls: run_kernel_autotune_calls computes eligible queue calls "
+            f"for {list(self.kernel_autotune_names)!r} and opens autotune_queue "
+            f"only when expected_calls >= {self._autotune_queue_min_kernels()}\n"
+            + tuning_code
         )
         if output_code_log.level == logging.DEBUG:
             # Save the autotuning code block into a file
@@ -2188,7 +2200,7 @@ class PythonWrapperCodegen(CodeGen):
             with tempfile.NamedTemporaryFile(
                 dir=cache_dir(), suffix=".py", delete=False
             ) as f:
-                f.write(tuning_code.encode("utf-8"))
+                f.write(tuning_code_for_trace.encode("utf-8"))
                 file_path = f.name
             output_code_log.debug(
                 "Auto-tuning code written to %s",
@@ -2200,13 +2212,60 @@ class PythonWrapperCodegen(CodeGen):
                 "name": "inductor_autotune_at_compile_time_code",
                 "encoding": "string",
             },
-            payload_fn=lambda: tuning_code,
+            payload_fn=lambda: tuning_code_for_trace,
         )
         # Execute the code to autotune kernels
+        autotune_start_ns = time.time_ns()
         try:
-            exec(tuning_code, scope)
+            with config.patch(
+                autotune_queue_static_precompile=queue_enabled_for_defs,
+                coordinate_descent_tuning_batch=(
+                    config.coordinate_descent_tuning_batch and queue_enabled_for_defs
+                ),
+            ):
+                exec(defs_code, scope)
+            self.run_kernel_autotune_calls(scope)
         except Exception as e:
             raise RuntimeError(f"Failed to run autotuning code block: {e}") from e
+        finally:
+            counters["inductor"]["compile_time_autotune_block_ns"] += (
+                time.time_ns() - autotune_start_ns
+            )
+
+    def _should_batch_kernel_autotune_calls(self):
+        if not config.autotune_queue:
+            return False
+        if config.triton.autotune_with_sample_inputs:
+            return False
+        return not config.aot_inductor.autotune_per_kernel_alloc
+
+    def _autotune_queue_min_kernels(self):
+        return max(1, config.autotune_queue_min_kernels)
+
+    def _has_enough_autotune_kernels_for_queue(self):
+        if not self._should_batch_kernel_autotune_calls():
+            return False
+        return len(self.kernel_autotune_names) >= self._autotune_queue_min_kernels()
+
+    def _should_defer_static_autotune_precompile(self):
+        return self._has_enough_autotune_kernels_for_queue()
+
+    def run_kernel_autotune_calls(self, scope):
+        call_code = self.kernel_autotune_calls.getvalue()
+        if not self._should_batch_kernel_autotune_calls():
+            exec(call_code, scope)
+            return
+
+        kernels = [scope[name] for name in self.kernel_autotune_names]
+        expected_calls = autotune_common.expected_autotune_queue_calls(kernels)
+        if expected_calls < self._autotune_queue_min_kernels():
+            exec(call_code, scope)
+            return
+        with autotune_queue.autotune_queue(
+            expected_calls=expected_calls,
+            disposable_args=True,
+        ):
+            exec(call_code, scope)
 
     def memory_plan(self):
         from .memory_planning import MemoryPlanner

@@ -115,6 +115,27 @@ torch._dynamo.config.fake_tensor_cache_crosscheck_enabled = True
 STATIC_LAUNCHER_DEVICES = ("cuda", "xpu")
 
 
+class _RecordingKeyStrategy:
+    def __init__(self):
+        self.components = []
+
+    def key(self, *components):
+        self.components.append(components)
+        return f"key{len(self.components)}"
+
+
+def _coordesc_meta(
+    *, tuning: bool = True, batch: bool = False, policy: str | None = None
+) -> dict[str, Any]:
+    meta: dict[str, Any] = {
+        "coordinate_descent_tuning": tuning,
+        "coordinate_descent_tuning_batch": batch,
+    }
+    if policy is not None:
+        meta["coordinate_descent_tuning_batch_policy"] = policy
+    return meta
+
+
 class TestCacheKeyStrategy(TestCase):
     def _compact_sha256(self, data: bytes) -> str:
         return (
@@ -234,10 +255,152 @@ class TestCacheKeyStrategy(TestCase):
                 fake_strategy,
             ),
             torch.compiler.config.patch({"cache_key_tag": "tag"}),
+            config.patch({"compile_threads": 2}),
         ):
             self.assertEqual(AutotuneCache._prepare_key("/tmp/cabcdef.py"), "sentinel")
 
         self.assertEqual(fake_strategy.components, ("cabcdef.py:tag",))
+
+    def test_autotune_prepare_cache_key_includes_coordesc_batch_mode(self):
+        from torch._inductor.runtime.autotune_cache import AutotuneCache
+
+        fake_strategy = _RecordingKeyStrategy()
+        metas = [
+            _coordesc_meta(tuning=False),
+            _coordesc_meta(),
+            _coordesc_meta(batch=True, policy="all"),
+            _coordesc_meta(batch=True, policy="auto"),
+            _coordesc_meta(batch=True),
+        ]
+        with (
+            mock.patch(
+                "torch._inductor.runtime.autotune_cache.AUTOTUNE_CACHE_KEY_STRATEGY",
+                fake_strategy,
+            ),
+            torch.compiler.config.patch({"cache_key_tag": "tag"}),
+        ):
+            (
+                heuristic_key,
+                scalar_key,
+                batched_all_key,
+                batched_auto_key,
+                batched_missing_policy_key,
+            ) = [
+                AutotuneCache._prepare_cache_key("/tmp/cabcdef.py", meta)
+                for meta in metas
+            ]
+
+        self.assertNotEqual(heuristic_key, scalar_key)
+        self.assertNotEqual(scalar_key, batched_all_key)
+        self.assertNotEqual(scalar_key, batched_auto_key)
+        self.assertNotEqual(scalar_key, batched_missing_policy_key)
+        self.assertEqual(
+            fake_strategy.components,
+            [
+                ("cabcdef.py:tag",),
+                ("cabcdef.py:tag",),
+                (
+                    "key2",
+                    "coordinate_descent_tuning",
+                    "1",
+                    "coordinate_descent_tuning_batch",
+                    "0",
+                ),
+                ("cabcdef.py:tag",),
+                (
+                    "key4",
+                    "coordinate_descent_tuning",
+                    "1",
+                    "coordinate_descent_tuning_batch",
+                    "1",
+                    "coordinate_descent_tuning_batch_policy",
+                    "all",
+                ),
+                ("cabcdef.py:tag",),
+                (
+                    "key6",
+                    "coordinate_descent_tuning",
+                    "1",
+                    "coordinate_descent_tuning_batch",
+                    "1",
+                    "coordinate_descent_tuning_batch_policy",
+                    "auto",
+                ),
+                ("cabcdef.py:tag",),
+                (
+                    "key8",
+                    "coordinate_descent_tuning",
+                    "1",
+                    "coordinate_descent_tuning_batch",
+                    "1",
+                    "coordinate_descent_tuning_batch_policy",
+                    "auto",
+                ),
+            ],
+        )
+
+    def test_autotune_cache_key_uses_current_compile_parallelism(self):
+        from torch._inductor.runtime.autotune_cache import AutotuneCache
+        from torch._inductor.runtime.autotune_cache import inductor_meta_from_config
+
+        meta = _coordesc_meta(batch=True, policy="all")
+
+        for compile_threads in (1, 2):
+            with config.patch({"compile_threads": compile_threads, **meta}):
+                self.assertTrue(
+                    inductor_meta_from_config()["coordinate_descent_tuning_batch"]
+                )
+
+        fake_strategy = _RecordingKeyStrategy()
+        with (
+            mock.patch(
+                "torch._inductor.runtime.autotune_cache.AUTOTUNE_CACHE_KEY_STRATEGY",
+                fake_strategy,
+            ),
+            torch.compiler.config.patch({"cache_key_tag": "tag"}),
+        ):
+            with config.patch({"compile_threads": 1}):
+                scalar_key = AutotuneCache._prepare_cache_key("/tmp/cabcdef.py", meta)
+            with config.patch({"compile_threads": 2}):
+                batched_key = AutotuneCache._prepare_cache_key("/tmp/cabcdef.py", meta)
+            with config.patch(
+                {"compile_threads": 2, "triton.proton_profiling": True}
+            ):
+                proton_key = AutotuneCache._prepare_cache_key("/tmp/cabcdef.py", meta)
+
+        self.assertNotEqual(scalar_key, batched_key)
+        self.assertIsNotNone(proton_key)
+        self.assertEqual(
+            fake_strategy.components,
+            [
+                ("cabcdef.py:tag",),
+                (
+                    "key1",
+                    "coordinate_descent_tuning",
+                    "1",
+                    "coordinate_descent_tuning_batch",
+                    "0",
+                ),
+                ("cabcdef.py:tag",),
+                (
+                    "key3",
+                    "coordinate_descent_tuning",
+                    "1",
+                    "coordinate_descent_tuning_batch",
+                    "1",
+                    "coordinate_descent_tuning_batch_policy",
+                    "all",
+                ),
+                ("cabcdef.py:tag",),
+                (
+                    "key5",
+                    "coordinate_descent_tuning",
+                    "1",
+                    "coordinate_descent_tuning_batch",
+                    "0",
+                ),
+            ],
+        )
 
 
 class LogCaptureHandler(logging.Handler):
@@ -3518,7 +3681,7 @@ class TestAutotuneCache(TestCase):
         self.assertEqual(cache_info.autotune_artifacts, [expected_artifact_key])
 
         CacheArtifactManager.clear()
-        self.assertIsNotNone(autotune_cache._read())
+        self.assertIsNotNone(autotune_cache.read_best(inductor_meta, [ConfigStub()]))
         artifacts = torch.compiler.save_cache_artifacts()
         self.assertIsNotNone(artifacts)
         artifacts = cast(tuple[bytes, CacheInfo], artifacts)
@@ -4069,6 +4232,74 @@ class TestAutotuneCacheExtraOptions(TestCase):
     extra_options is correctly preserved when saving and loading from cache.
     """
 
+    @staticmethod
+    def _cached_config(**overrides):
+        cached_config = {
+            "BLOCK_M": 64,
+            "BLOCK_N": 64,
+            "num_warps": 4,
+            "num_stages": 2,
+            "configs_hash": "test_hash",
+        }
+        cached_config.update(overrides)
+        return cached_config
+
+    @staticmethod
+    def _triton_config():
+        from triton import Config
+
+        return Config(
+            {"BLOCK_M": 64, "BLOCK_N": 64},
+            num_warps=4,
+            num_stages=2,
+        )
+
+    @staticmethod
+    def _new_autotune_cache(
+        *,
+        coordesc_cache_batch_mode=None,
+        coordesc_cache_batch_policy=None,
+        local_backend=None,
+        record_artifact=False,
+    ):
+        from torch._inductor.runtime.autotune_cache import AutotuneCache
+
+        cache = AutotuneCache.__new__(AutotuneCache)
+        cache.configs_hash = "test_hash"
+        if coordesc_cache_batch_mode is not None:
+            cache.coordesc_cache_batch_mode = coordesc_cache_batch_mode
+            cache.coordesc_cache_batch_policy = coordesc_cache_batch_policy
+
+        if local_backend is None:
+            local_backend = mock.MagicMock()
+        cache.local_cache = (local_backend, "test_key")
+        cache.remote_cache = None
+        if record_artifact:
+            cache._record_artifact = mock.MagicMock()
+        return cache, local_backend
+
+    def _assert_coordesc_save_skipped(self, **save_kwargs):
+        triton_config = self._triton_config()
+        cache, mock_local_backend = self._new_autotune_cache(
+            coordesc_cache_batch_mode=True,
+            coordesc_cache_batch_policy="auto",
+            record_artifact=True,
+        )
+
+        with mock.patch(
+            "torch._inductor.runtime.autotune_cache.AutotuneCacheBundler"
+        ) as bundler:
+            cache.save(
+                triton_config,
+                time_taken_ns=1000000,
+                found_by_coordesc=True,
+                **save_kwargs,
+            )
+
+        mock_local_backend.put.assert_not_called()
+        bundler.put.assert_not_called()
+        cache._record_artifact.assert_not_called()
+
     @requires_triton()
     def test_load_cached_autotuning_preserves_extra_options_with_coordesc(self):
         """
@@ -4077,16 +4308,11 @@ class TestAutotuneCacheExtraOptions(TestCase):
         """
         from torch._inductor.runtime.autotune_cache import _load_cached_autotuning
 
-        # Simulate a cached config with extra_options and found_by_coordesc=True
-        best_config = {
-            "BLOCK_M": 64,
-            "BLOCK_N": 64,
-            "num_warps": 4,
-            "num_stages": 2,
-            "configs_hash": "test_hash",
-            "found_by_coordesc": True,
-            "extra_options": {"custom_option": "value", "another_option": 42},
-        }
+        best_config = self._cached_config(
+            found_by_coordesc=True,
+            coordinate_descent_tuning_batch=False,
+            extra_options={"custom_option": "value", "another_option": 42},
+        )
 
         # Empty configs list since coordesc path creates a new config
         configs = []
@@ -4103,32 +4329,138 @@ class TestAutotuneCacheExtraOptions(TestCase):
         self.assertTrue(result.found_by_coordesc)
 
     @requires_triton()
+    def test_load_cached_autotuning_rejects_coordesc_batch_mismatch(self):
+        from torch._inductor.runtime.autotune_cache import _load_cached_autotuning
+
+        best_config = self._cached_config(
+            found_by_coordesc=True,
+            coordinate_descent_tuning_batch=False,
+        )
+
+        def load(cached_config, inductor_meta):
+            return _load_cached_autotuning(
+                cached_config.copy(),
+                "test_hash",
+                [],
+                inductor_meta,
+            )
+
+        legacy_config_missing_batch_mode = dict(best_config)
+        legacy_config_missing_batch_mode.pop("coordinate_descent_tuning_batch")
+        self.assertIsNone(load(legacy_config_missing_batch_mode, _coordesc_meta()))
+
+        with config.patch({"compile_threads": 2}):
+            self.assertIsNone(load(best_config, _coordesc_meta(batch=True)))
+
+        with config.patch({"compile_threads": 1}):
+            result = load(best_config, _coordesc_meta(batch=True))
+        self.assertIsNotNone(result)
+        self.assertTrue(result.found_by_coordesc)
+
+        result = load(best_config, _coordesc_meta())
+        self.assertIsNotNone(result)
+        self.assertTrue(result.found_by_coordesc)
+
+        best_config_with_policy = {
+            **best_config,
+            "coordinate_descent_tuning_batch": True,
+            "coordinate_descent_tuning_batch_policy": "all",
+        }
+        result = load(
+            best_config_with_policy,
+            _coordesc_meta(batch=True, policy="auto"),
+        )
+        self.assertIsNone(result)
+
+        with config.patch({"compile_threads": 2}):
+            result = load(
+                best_config_with_policy,
+                _coordesc_meta(batch=True, policy="all"),
+            )
+        self.assertIsNotNone(result)
+        self.assertTrue(result.found_by_coordesc)
+
+        best_config_with_default_policy = {
+            **best_config,
+            "coordinate_descent_tuning_batch": True,
+            "coordinate_descent_tuning_batch_policy": "auto",
+        }
+        with config.patch({"compile_threads": 2}):
+            result = load(best_config_with_default_policy, _coordesc_meta(batch=True))
+        self.assertIsNotNone(result)
+        self.assertTrue(result.found_by_coordesc)
+
+        legacy_batched_config = {
+            **best_config,
+            "coordinate_descent_tuning_batch": True,
+        }
+        self.assertIsNone(
+            load(legacy_batched_config, _coordesc_meta(policy="auto"))
+        )
+
+    @requires_triton()
+    def test_load_cached_autotuning_rejects_coordesc_when_disabled(self):
+        from torch._inductor.runtime.autotune_cache import _load_cached_autotuning
+
+        cached_config = self._cached_config(
+            found_by_coordesc=True,
+            coordinate_descent_tuning_batch=False,
+        )
+        configs = [self._triton_config()]
+
+        self.assertIsNone(
+            _load_cached_autotuning(
+                cached_config.copy(),
+                "test_hash",
+                configs,
+                {"coordinate_descent_tuning": False},
+            )
+        )
+
+    @requires_triton()
+    def test_autotune_cache_read_does_not_bundle_rejected_coordesc_hit(self):
+        cached_config = self._cached_config(
+            found_by_coordesc=True,
+            coordinate_descent_tuning_batch=False,
+        )
+
+        class FakeLocalCache:
+            def get(self, key):
+                return cached_config
+
+        cache, _ = self._new_autotune_cache(
+            coordesc_cache_batch_mode=True,
+            coordesc_cache_batch_policy="auto",
+            local_backend=FakeLocalCache(),
+            record_artifact=True,
+        )
+
+        with mock.patch(
+            "torch._inductor.runtime.autotune_cache.AutotuneCacheBundler"
+        ) as bundler:
+            result = cache.read_best(
+                _coordesc_meta(batch=True),
+                [],
+            )
+
+        self.assertIsNone(result)
+        bundler.put.assert_not_called()
+        cache._record_artifact.assert_not_called()
+
+    @requires_triton()
     def test_load_cached_autotuning_preserves_extra_options_with_matched_config(self):
         """
         Test that extra_options is preserved when loading by matching an
         existing config from the configs list.
         """
-        from triton import Config
-
         from torch._inductor.runtime.autotune_cache import _load_cached_autotuning
 
-        # Create a config that matches what's in the cache
-        original_config = Config(
-            {"BLOCK_M": 64, "BLOCK_N": 64},
-            num_warps=4,
-            num_stages=2,
-        )
+        original_config = self._triton_config()
         configs = [original_config]
 
-        # Simulate a cached config with extra_options
-        best_config = {
-            "BLOCK_M": 64,
-            "BLOCK_N": 64,
-            "num_warps": 4,
-            "num_stages": 2,
-            "configs_hash": "test_hash",
-            "extra_options": {"backend_specific": "option"},
-        }
+        best_config = self._cached_config(
+            extra_options={"backend_specific": "option"},
+        )
 
         inductor_meta = {"coordinate_descent_tuning": False}
 
@@ -4147,26 +4479,12 @@ class TestAutotuneCacheExtraOptions(TestCase):
         Test that _load_cached_autotuning handles missing extra_options gracefully
         (returns None for the attribute).
         """
-        from triton import Config
-
         from torch._inductor.runtime.autotune_cache import _load_cached_autotuning
 
-        # Create a config that matches what's in the cache
-        original_config = Config(
-            {"BLOCK_M": 64, "BLOCK_N": 64},
-            num_warps=4,
-            num_stages=2,
-        )
+        original_config = self._triton_config()
         configs = [original_config]
 
-        # Simulate a cached config WITHOUT extra_options
-        best_config = {
-            "BLOCK_M": 64,
-            "BLOCK_N": 64,
-            "num_warps": 4,
-            "num_stages": 2,
-            "configs_hash": "test_hash",
-        }
+        best_config = self._cached_config()
 
         inductor_meta = {"coordinate_descent_tuning": False}
 
@@ -4183,28 +4501,10 @@ class TestAutotuneCacheExtraOptions(TestCase):
         """
         Test that AutotuneCache.save() includes extra_options in the saved data.
         """
-        from unittest.mock import MagicMock
-
-        from triton import Config
-
-        from torch._inductor.runtime.autotune_cache import AutotuneCache
-
-        # Create a config with extra_options
-        config_with_extra = Config(
-            {"BLOCK_M": 64, "BLOCK_N": 64},
-            num_warps=4,
-            num_stages=2,
-        )
+        config_with_extra = self._triton_config()
         config_with_extra.extra_options = {"custom_key": "custom_value"}
 
-        # Create an AutotuneCache instance with mocked caches
-        cache = AutotuneCache.__new__(AutotuneCache)
-        cache.configs_hash = "test_hash"
-
-        # Mock the local cache to capture what's being saved
-        mock_local_backend = MagicMock()
-        cache.local_cache = (mock_local_backend, "test_key")
-        cache.remote_cache = None
+        cache, mock_local_backend = self._new_autotune_cache()
 
         with mock.patch("torch._inductor.runtime.autotune_cache.AutotuneCacheBundler"):
             cache.save(config_with_extra, time_taken_ns=1000000)
@@ -4220,27 +4520,8 @@ class TestAutotuneCacheExtraOptions(TestCase):
         """
         Test that AutotuneCache.save() does not include extra_options when it's None.
         """
-        from unittest.mock import MagicMock
-
-        from triton import Config
-
-        from torch._inductor.runtime.autotune_cache import AutotuneCache
-
-        # Create a config without extra_options
-        config_without_extra = Config(
-            {"BLOCK_M": 64, "BLOCK_N": 64},
-            num_warps=4,
-            num_stages=2,
-        )
-
-        # Create an AutotuneCache instance with mocked caches
-        cache = AutotuneCache.__new__(AutotuneCache)
-        cache.configs_hash = "test_hash"
-
-        # Mock the local cache to capture what's being saved
-        mock_local_backend = MagicMock()
-        cache.local_cache = (mock_local_backend, "test_key")
-        cache.remote_cache = None
+        config_without_extra = self._triton_config()
+        cache, mock_local_backend = self._new_autotune_cache()
 
         with mock.patch("torch._inductor.runtime.autotune_cache.AutotuneCacheBundler"):
             cache.save(config_without_extra, time_taken_ns=1000000)
@@ -4249,6 +4530,77 @@ class TestAutotuneCacheExtraOptions(TestCase):
         mock_local_backend.put.assert_called_once()
         saved_data = mock_local_backend.put.call_args[0][1]
         self.assertNotIn("extra_options", saved_data)
+
+    @requires_triton()
+    def test_autotune_cache_save_includes_coordesc_batch_mode(self):
+        triton_config = self._triton_config()
+        cache, mock_local_backend = self._new_autotune_cache(
+            coordesc_cache_batch_mode=True,
+            coordesc_cache_batch_policy="auto",
+        )
+
+        with mock.patch("torch._inductor.runtime.autotune_cache.AutotuneCacheBundler"):
+            cache.save(
+                triton_config,
+                time_taken_ns=1000000,
+                found_by_coordesc=True,
+                coordinate_descent_tuning_batch=True,
+                coordinate_descent_tuning_batch_policy="auto",
+            )
+
+        mock_local_backend.put.assert_called_once()
+        saved_data = mock_local_backend.put.call_args[0][1]
+        self.assertTrue(saved_data["coordinate_descent_tuning_batch"])
+        self.assertEqual(saved_data["coordinate_descent_tuning_batch_policy"], "auto")
+
+    @requires_triton()
+    def test_autotune_cache_save_skips_coordesc_batch_mode_mismatch(self):
+        self._assert_coordesc_save_skipped(coordinate_descent_tuning_batch=False)
+
+    @requires_triton()
+    def test_autotune_cache_save_skips_coordesc_batch_policy_mismatch(self):
+        self._assert_coordesc_save_skipped(
+            coordinate_descent_tuning_batch=True,
+            coordinate_descent_tuning_batch_policy="all",
+        )
+
+    @requires_triton()
+    def test_autotune_cache_save_preserves_triton_hash_positional_abi(self):
+        triton_config = self._triton_config()
+        cache, mock_local_backend = self._new_autotune_cache()
+
+        with mock.patch("torch._inductor.runtime.autotune_cache.AutotuneCacheBundler"):
+            cache.save(triton_config, 1000000, False, "legacy_hash")
+
+        mock_local_backend.put.assert_called_once()
+        saved_data = mock_local_backend.put.call_args[0][1]
+        self.assertEqual(saved_data["triton_cache_hash"], "legacy_hash")
+        self.assertNotIn("coordinate_descent_tuning_batch", saved_data)
+
+    @requires_triton()
+    def test_triton_kernel_meta_includes_coordesc_batch_request(self):
+        from torch._inductor.codegen.triton import TritonKernel
+
+        with (
+            config.patch(
+                {
+                    "coordinate_descent_tuning": True,
+                    "coordinate_descent_tuning_batch": True,
+                    "coordinate_descent_tuning_batch_policy": "reductions",
+                }
+            ),
+            mock.patch(
+                "torch.utils._triton.triton_hash_with_backend",
+                return_value="test_hash",
+            ),
+        ):
+            inductor_meta = TritonKernel.inductor_meta_common()
+
+        self.assertTrue(inductor_meta["coordinate_descent_tuning_batch_requested"])
+        self.assertNotIn("coordinate_descent_tuning_batch", inductor_meta)
+        self.assertEqual(
+            inductor_meta["coordinate_descent_tuning_batch_policy"], "reductions"
+        )
 
 
 if __name__ == "__main__":

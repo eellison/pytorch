@@ -21,6 +21,12 @@ from .common import TensorArg, WorkspaceArg
 log = logging.getLogger(__name__)
 
 
+def _suspend_autotune_queue():
+    from ..runtime.autotune_queue_state import suspend_autotune_queue
+
+    return suspend_autotune_queue()
+
+
 class MultiKernelState:
     """
     Maintain state of multi-kernel compilation so we don't define duplicated
@@ -439,6 +445,10 @@ class MultiKernelCall:
         return V.graph.multi_kernel_to_choice[multi_kernel_name]
 
     def run(self, *args, **kwargs):
+        with _suspend_autotune_queue():
+            self._run_with_suspended_autotune_queue(*args, **kwargs)
+
+    def _run_with_suspended_autotune_queue(self, *args, **kwargs):
         if self.picked_kernel is None:
             timings = self.benchmark_sub_kernels(*args, **kwargs)
             self.picked_kernel = timings.index(min(timings))
@@ -570,6 +580,10 @@ class SizeHintMultiKernelCall(MultiKernelCall):
         return out
 
     def run(self, *args, **kwargs):
+        with _suspend_autotune_queue():
+            self._run_with_suspended_autotune_queue(*args, **kwargs)
+
+    def _run_with_suspended_autotune_queue(self, *args, **kwargs):
         cache_key = self._get_shape_cache_key(*args, **kwargs)
         cached_choice = self._get_cached_shape_choice(cache_key)
         if cached_choice is not None:

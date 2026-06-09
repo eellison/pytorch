@@ -1,3 +1,4 @@
+import contextlib
 import functools
 import inspect
 import time
@@ -110,6 +111,10 @@ def may_ban_benchmarking() -> None:
         """)
 
 
+def is_invalid_configuration_error(e: Exception) -> bool:
+    return "invalid configuration" in str(e).lower()
+
+
 def time_and_count(
     fn: Callable[Concatenate[Any, P], T],
 ) -> Callable[Concatenate[Any, P], T]:
@@ -136,6 +141,8 @@ class Benchmarker:
     A device-agnostic benchmarking utility for measuring the runtime of
     inductor generated callables.
     """
+
+    supports_grouped_benchmark_many = False
 
     def __init__(self: Self) -> None:
         pass
@@ -243,6 +250,8 @@ class Benchmarker:
                 inferred_device.type
             )
             if benchmark_fn is not None:
+                if inferred_device.type == "cuda":
+                    kwargs["device"] = inferred_device
                 return benchmark_fn(self, _callable, warmup=warmup, rep=rep, **kwargs)
 
             # Backward-compatible default:
@@ -286,6 +295,30 @@ class Benchmarker:
 
         run_for(warmup)
         return median(run_for(rep))
+
+    @time_and_count
+    def benchmark_many(
+        self: Self,
+        callables: list[Callable[[], Any]],
+        device: str | torch.device | None = None,
+        setup_fns: list[Callable[[], Any]] | None = None,
+        **kwargs: Any,
+    ) -> list[Any]:
+        if setup_fns is None:
+            setup_fns = [lambda: None] * len(callables)
+        assert len(setup_fns) == len(callables)
+
+        return [
+            self.benchmark(
+                fn=lambda setup_fn=setup_fn, _callable=_callable: (
+                    setup_fn(),
+                    _callable(),
+                )[-1],
+                device=device,
+                **kwargs,
+            )
+            for setup_fn, _callable in zip(setup_fns, callables)
+        ]
 
     @time_and_count
     def benchmark_gpu(self: Self, *args: Any, **kwargs: Any) -> float:
@@ -385,23 +418,40 @@ class TritonBenchmarker(Benchmarker):
         except Exception as e:
             # ErrorInvalidConfiguration
             # Return inf to skip this config during autotuning
-            error_str = str(e).lower()
-            if "invalid configuration" in error_str:
+            if is_invalid_configuration_error(e):
                 logger.warning(
                     "Skipping benchmark due to invalid configuration error: %s",
-                    error_str,
+                    str(e).lower(),
                 )
                 return float("inf")
             raise
 
 
 class InductorBenchmarker(TritonBenchmarker):  # noqa: docstring_linter
-    @cached_property
+    supports_grouped_benchmark_many = True
+
+    @property
     def L2_cache_size(self: Self) -> int:
         """Get the L2 cache size, in bytes, of the current device."""
-        device = torch.cuda.current_device()
-        props = torch.cuda.get_device_properties(device)
-        return props.L2_cache_size
+        return self._get_l2_cache_size(torch.device("cuda", torch.cuda.current_device()))
+
+    @L2_cache_size.setter
+    def L2_cache_size(self: Self, value: int) -> None:
+        self.__dict__["_l2_cache_size_override"] = value
+
+    def _get_l2_cache_size(self: Self, device: torch.device) -> int:
+        if "_l2_cache_size_override" in self.__dict__:
+            return self.__dict__["_l2_cache_size_override"]
+
+        device_index = device.index
+        if device_index is None:
+            device_index = torch.cuda.current_device()
+
+        l2_cache_sizes = self.__dict__.setdefault("_l2_cache_sizes", {})
+        if device_index not in l2_cache_sizes:
+            props = torch.cuda.get_device_properties(device_index)
+            l2_cache_sizes[device_index] = props.L2_cache_size
+        return l2_cache_sizes[device_index]
 
     def get_event_pairs(
         self: Self, iters: int
@@ -438,6 +488,7 @@ class InductorBenchmarker(TritonBenchmarker):  # noqa: docstring_linter
         return_mode: str = "min",
         grad_to_none: list[torch.Tensor] | None = None,
         is_vetted_benchmarking: bool = False,
+        device: torch.device | str | None = None,
         **kwargs: Any,
     ) -> float | list[float]:
         """Benchmark a GPU callable using a custom benchmarking implementation.
@@ -473,57 +524,85 @@ class InductorBenchmarker(TritonBenchmarker):  # noqa: docstring_linter
         if not is_vetted_benchmarking:
             may_ban_benchmarking()
 
-        # we don't want any outside errors propagating into benchmarking
-        torch.cuda.synchronize()
+        benchmark_device = torch.device(device) if isinstance(device, str) else device
+        if benchmark_device is not None and benchmark_device.index is None:
+            benchmark_device = torch.device("cuda", torch.cuda.current_device())
+        device_ctx = (
+            torch.cuda.device(benchmark_device)
+            if benchmark_device is not None
+            else contextlib.nullcontext()
+        )
 
-        # warmup `_callable` (and catches any failures in the process)
-        _callable()
-        torch.cuda.synchronize()
+        def synchronize() -> None:
+            if benchmark_device is None:
+                torch.cuda.synchronize()
+            else:
+                torch.cuda.synchronize(benchmark_device)
 
-        # see https://github.com/triton-lang/triton/pull/840 for why `dtype=torch.int`
-        buffer = torch.empty(self.L2_cache_size // 4, dtype=torch.int, device="cuda")
-        buffer.zero_()
+        with device_ctx:
+            # we don't want any outside errors propagating into benchmarking
+            synchronize()
 
-        # estimate the runtime of `_callable`
-        event_pairs = self.get_event_pairs(estimation_iters)
-        for start_event, end_event in event_pairs:
-            # Clear gradients before timing (matches triton.testing.do_bench)
-            if grad_to_none is not None:
-                for x in grad_to_none:
-                    x.grad = None
-            buffer.zero_()
-            start_event.record()
+            # warmup `_callable` (and catches any failures in the process)
             _callable()
-            end_event.record()
-        torch.cuda.synchronize()
-        estimated_timing = self.get_event_pairs_min_timing(event_pairs)
+            synchronize()
 
-        # adjust `benchmark_iters` to fit in the maximum benchmarking duration
-        if estimated_timing > 0:
-            benchmark_iters = max(
-                min(benchmark_iters, int(max_benchmark_duration // estimated_timing)), 1
+            if benchmark_device is None:
+                l2_cache_size = self.L2_cache_size
+                buffer_device: torch.device | str = "cuda"
+            else:
+                l2_cache_size = self._get_l2_cache_size(benchmark_device)
+                buffer_device = benchmark_device
+
+            # see https://github.com/triton-lang/triton/pull/840 for why `dtype=torch.int`
+            buffer = torch.empty(
+                l2_cache_size // 4,
+                dtype=torch.int,
+                device=buffer_device,
             )
-
-        # do the memory warmup
-        for _ in range(memory_warmup_iters):
             buffer.zero_()
 
-        # benchmark `_callable`
-        event_pairs = self.get_event_pairs(benchmark_iters)
-        for start_event, end_event in event_pairs:
-            # Clear gradients before timing (matches triton.testing.do_bench)
-            if grad_to_none is not None:
-                for x in grad_to_none:
-                    x.grad = None
-            buffer.zero_()
-            start_event.record()
-            _callable()
-            end_event.record()
-        torch.cuda.synchronize()
+            # estimate the runtime of `_callable`
+            event_pairs = self.get_event_pairs(estimation_iters)
+            for start_event, end_event in event_pairs:
+                # Clear gradients before timing (matches triton.testing.do_bench)
+                if grad_to_none is not None:
+                    for x in grad_to_none:
+                        x.grad = None
+                buffer.zero_()
+                start_event.record()
+                _callable()
+                end_event.record()
+            synchronize()
+            estimated_timing = self.get_event_pairs_min_timing(event_pairs)
 
-        # explicitly delete the buffer, sometimes helps memory
-        # footprint metrics in OSS Inductor performance benchmarks
-        del buffer
+            # adjust `benchmark_iters` to fit in the maximum benchmarking duration
+            if estimated_timing > 0:
+                benchmark_iters = max(
+                    min(benchmark_iters, int(max_benchmark_duration // estimated_timing)),
+                    1,
+                )
+
+            # do the memory warmup
+            for _ in range(memory_warmup_iters):
+                buffer.zero_()
+
+            # benchmark `_callable`
+            event_pairs = self.get_event_pairs(benchmark_iters)
+            for start_event, end_event in event_pairs:
+                # Clear gradients before timing (matches triton.testing.do_bench)
+                if grad_to_none is not None:
+                    for x in grad_to_none:
+                        x.grad = None
+                buffer.zero_()
+                start_event.record()
+                _callable()
+                end_event.record()
+            synchronize()
+
+            # explicitly delete the buffer, sometimes helps memory
+            # footprint metrics in OSS Inductor performance benchmarks
+            del buffer
 
         # Return based on the requested mode
         if return_mode == "all":
@@ -542,6 +621,216 @@ class InductorBenchmarker(TritonBenchmarker):  # noqa: docstring_linter
             raise ValueError(
                 f"Unsupported return_mode: {return_mode}. Use 'min' or 'all'."
             )
+
+    @time_and_count
+    def benchmark_many(
+        self: Self,
+        callables: list[Callable[[], Any]],
+        device: str | torch.device | None = None,
+        setup_fns: list[Callable[[], Any]] | None = None,
+        estimation_iters: int = 5,
+        memory_warmup_iters: int = 100,
+        benchmark_iters: int = 100,
+        max_benchmark_duration: int = 25,
+        return_mode: str = "min",
+        benchmark_group_keys: list[Any] | None = None,
+        benchmark_group_states: list[dict[str, int] | None] | None = None,
+        grad_to_none: list[torch.Tensor] | None = None,
+        is_vetted_benchmarking: bool = False,
+        **kwargs: Any,
+    ) -> list[float] | list[list[float]]:
+        if not callables:
+            return []
+
+        if setup_fns is None:
+            setup_fns = [lambda: None] * len(callables)
+        assert len(setup_fns) == len(callables)
+        if benchmark_group_keys is not None:
+            assert len(benchmark_group_keys) == len(callables)
+        if benchmark_group_states is not None:
+            assert len(benchmark_group_states) == len(callables)
+
+        inferred_device = (
+            torch.device(device) if isinstance(device, str) else device
+        )
+        if inferred_device is None or inferred_device.type != "cuda":
+            fallback_kwargs = dict(kwargs)
+            if inferred_device is not None and inferred_device.type != "cpu":
+                fallback_kwargs["return_mode"] = return_mode
+                fallback_kwargs["is_vetted_benchmarking"] = is_vetted_benchmarking
+                if grad_to_none is not None:
+                    fallback_kwargs["grad_to_none"] = grad_to_none
+            return [
+                self.benchmark(
+                    fn=lambda setup_fn=setup_fn, _callable=_callable: (
+                        setup_fn(),
+                        _callable(),
+                    )[-1],
+                    device=device,
+                    **fallback_kwargs,
+                )
+                for setup_fn, _callable in zip(setup_fns, callables)
+            ]
+
+        if return_mode not in ("min", "all"):
+            raise ValueError(
+                f"Unsupported return_mode: {return_mode}. Use 'min' or 'all'."
+            )
+
+        if inferred_device.index is None:
+            inferred_device = torch.device("cuda", torch.cuda.current_device())
+
+        if not is_vetted_benchmarking:
+            may_ban_benchmarking()
+
+        def clear_grads() -> None:
+            if grad_to_none is not None:
+                for x in grad_to_none:
+                    x.grad = None
+
+        invalid_result: float | list[float]
+        if return_mode == "all":
+            invalid_result = [float("inf")]
+        else:
+            invalid_result = float("inf")
+        results: list[float | list[float] | None] = [None] * len(callables)
+        valid_callables: list[Callable[[], Any]] = []
+        valid_indices: list[int] = []
+
+        with torch.cuda.device(inferred_device):
+            torch.cuda.synchronize(inferred_device)
+            for index, (_callable, setup_fn) in enumerate(zip(callables, setup_fns)):
+                clear_grads()
+                try:
+                    setup_fn()
+                    _callable()
+                    torch.cuda.synchronize(inferred_device)
+                except Exception as e:
+                    if is_invalid_configuration_error(e):
+                        logger.warning(
+                            "Skipping benchmark due to invalid configuration error: %s",
+                            str(e).lower(),
+                        )
+                        results[index] = invalid_result
+                    else:
+                        raise
+                else:
+                    valid_callables.append(_callable)
+                    valid_indices.append(index)
+
+            if not valid_callables:
+                distorted_results = may_distort_benchmarking_result(lambda: results)()
+                return distorted_results  # type: ignore[return-value]
+
+            buffer = torch.empty(
+                self._get_l2_cache_size(inferred_device) // 4,
+                dtype=torch.int,
+                device=inferred_device,
+            )
+            buffer.zero_()
+
+            estimated_mins = []
+            valid_setup_fns = [setup_fns[index] for index in valid_indices]
+
+            for _callable, setup_fn in zip(valid_callables, valid_setup_fns):
+                event_pairs = self.get_event_pairs(estimation_iters)
+                for start_event, end_event in event_pairs:
+                    clear_grads()
+                    buffer.zero_()
+                    setup_fn()
+                    start_event.record()
+                    _callable()
+                    end_event.record()
+                torch.cuda.synchronize(inferred_device)
+                estimated_mins.append(self.get_event_pairs_min_timing(event_pairs))
+            iters_per_callable = [
+                max(min(benchmark_iters, int(max_benchmark_duration // timing)), 1)
+                if timing > 0
+                else benchmark_iters
+                for timing in estimated_mins
+            ]
+            if benchmark_group_keys is not None:
+                valid_group_keys = [
+                    benchmark_group_keys[index] for index in valid_indices
+                ]
+                valid_group_states = (
+                    [benchmark_group_states[index] for index in valid_indices]
+                    if benchmark_group_states is not None
+                    else [None] * len(valid_indices)
+                )
+                iters_per_group: dict[Any, int] = {}
+                states_per_group: dict[Any, list[dict[str, int]]] = {}
+                for group_key, group_state, iters in zip(
+                    valid_group_keys, valid_group_states, iters_per_callable
+                ):
+                    previous_iters = (
+                        group_state.get("benchmark_iters", 0)
+                        if group_state is not None
+                        else 0
+                    )
+                    iters_per_group[group_key] = max(
+                        iters_per_group.get(group_key, 0),
+                        previous_iters,
+                        iters,
+                    )
+                for group_key, group_state in zip(
+                    valid_group_keys, valid_group_states
+                ):
+                    if group_state is not None:
+                        states_per_group.setdefault(group_key, []).append(group_state)
+                for group_key, group_states in states_per_group.items():
+                    for group_state in group_states:
+                        group_state["benchmark_iters"] = iters_per_group[group_key]
+                iters_per_callable = [
+                    iters_per_group[group_key] for group_key in valid_group_keys
+                ]
+
+            benchmarked_results = []
+            for _callable, setup_fn, iters in zip(
+                valid_callables, valid_setup_fns, iters_per_callable
+            ):
+                for _ in range(memory_warmup_iters):
+                    buffer.zero_()
+                event_pairs = self.get_event_pairs(iters)
+                for start_event, end_event in event_pairs:
+                    clear_grads()
+                    buffer.zero_()
+                    setup_fn()
+                    start_event.record()
+                    _callable()
+                    end_event.record()
+                torch.cuda.synchronize(inferred_device)
+                if return_mode == "all":
+                    benchmarked_results.append(
+                        [
+                            start_event.elapsed_time(end_event)
+                            for start_event, end_event in event_pairs
+                        ]
+                    )
+                else:
+                    benchmarked_results.append(
+                        self.get_event_pairs_min_timing(event_pairs)
+                    )
+
+            del buffer
+
+            if return_mode == "all":
+                for index, result in zip(valid_indices, benchmarked_results):
+                    results[index] = result
+                distorted_results = may_distort_benchmarking_result(lambda: results)()
+                return distorted_results  # type: ignore[return-value]
+
+            benchmarked_mins = benchmarked_results
+            valid_results = [
+                min(estimated_timing, benchmarked_timing)
+                for estimated_timing, benchmarked_timing in zip(
+                    estimated_mins, benchmarked_mins
+                )
+            ]
+            for index, result in zip(valid_indices, valid_results):
+                results[index] = result
+            distorted_results = may_distort_benchmarking_result(lambda: results)()
+            return distorted_results  # type: ignore[return-value]
 
 
 benchmarker = (

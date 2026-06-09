@@ -740,6 +740,112 @@ collective_benchmark_timeout = float(
 coordinate_descent_tuning = (
     os.environ.get("TORCHINDUCTOR_COORDINATE_DESCENT_TUNING") == "1"
 )
+
+
+def _get_first_env(names: tuple[str, ...], default: str) -> str:
+    for name in names:
+        value = os.environ.get(name)
+        if value is not None:
+            return value
+    return default
+
+
+def _get_first_bool_env(names: tuple[str, ...], default: bool = False) -> bool:
+    return _get_first_env(names, "1" if default else "0") == "1"
+
+
+# Opt-in queue that batches generated-kernel autotuning work. Prefer the
+# autotune_queue alias and TORCHINDUCTOR_AUTOTUNE_QUEUE env var for new usage.
+# Coordinate descent kernels require coordinate_descent_tuning above; eligible
+# non-coordinate-descent static-config autotune can also use the queue.
+coordinate_descent_tuning_batch = _get_first_bool_env(
+    (
+        "TORCHINDUCTOR_AUTOTUNE_QUEUE",
+        "TORCHINDUCTOR_COORDINATE_DESCENT_TUNING_BATCH",
+    )
+)
+# Allowed values:
+# - auto: batch reduction-like and native-matmul coordinate descent kernels,
+#   plus reduction-like and native-matmul non-coordinate-descent static-config
+#   autotune kernels
+# - reductions: batch only reduction-like coordinate descent kernels
+# - all: batch all eligible coordinate descent kernels, plus eligible
+#   non-coordinate-descent static-config autotune kernels
+# - none: disable the queue even when coordinate_descent_tuning_batch is true
+_coordinate_descent_tuning_batch_default_policy = "auto"
+coordinate_descent_tuning_batch_policy = _get_first_env(
+    (
+        "TORCHINDUCTOR_AUTOTUNE_QUEUE_POLICY",
+        "TORCHINDUCTOR_COORDINATE_DESCENT_TUNING_BATCH_POLICY",
+    ),
+    _coordinate_descent_tuning_batch_default_policy,
+)
+# Avoid queue overhead when a wrapper block has too few eligible kernels.
+# Values below 1 are treated as 1.
+coordinate_descent_tuning_batch_min_kernels = int(
+    _get_first_env(
+        (
+            "TORCHINDUCTOR_AUTOTUNE_QUEUE_MIN_KERNELS",
+            "TORCHINDUCTOR_COORDINATE_DESCENT_TUNING_BATCH_MIN_KERNELS",
+        ),
+        "3",
+    )
+)
+# Maximum tensor bytes retained by the queued tuner before falling back or
+# draining. Values <= 0 disable the retained tensor budget.
+coordinate_descent_tuning_batch_max_live_bytes = int(
+    _get_first_env(
+        (
+            "TORCHINDUCTOR_AUTOTUNE_QUEUE_MAX_LIVE_BYTES",
+            "TORCHINDUCTOR_COORDINATE_DESCENT_TUNING_BATCH_MAX_LIVE_BYTES",
+        ),
+        str(64 * 1024 * 1024),
+    )
+)
+# Maximum number of live queued kernels before draining the queue. Values <= 0
+# disable this cap. This protects cases with many tiny kernels where tensor
+# bytes are small but compiled launchers/events can still accumulate.
+coordinate_descent_tuning_batch_max_live_kernels = int(
+    _get_first_env(
+        (
+            "TORCHINDUCTOR_AUTOTUNE_QUEUE_MAX_LIVE_KERNELS",
+            "TORCHINDUCTOR_COORDINATE_DESCENT_TUNING_BATCH_MAX_LIVE_KERNELS",
+        ),
+        "64",
+    )
+)
+# Maximum number of compiled candidates to benchmark in one grouped frontier
+# chunk. Values <= 0 disable chunking.
+coordinate_descent_tuning_batch_max_frontier_candidates = int(
+    _get_first_env(
+        (
+            "TORCHINDUCTOR_AUTOTUNE_QUEUE_MAX_FRONTIER_CANDIDATES",
+            "TORCHINDUCTOR_COORDINATE_DESCENT_TUNING_BATCH_MAX_FRONTIER_CANDIDATES",
+        ),
+        "1024",
+    )
+)
+autotune_queue: bool = Config(
+    alias="torch._inductor.config.coordinate_descent_tuning_batch"
+)
+autotune_queue_policy: str = Config(
+    alias="torch._inductor.config.coordinate_descent_tuning_batch_policy"
+)
+autotune_queue_min_kernels: int = Config(
+    alias="torch._inductor.config.coordinate_descent_tuning_batch_min_kernels"
+)
+autotune_queue_max_live_bytes: int = Config(
+    alias="torch._inductor.config.coordinate_descent_tuning_batch_max_live_bytes"
+)
+autotune_queue_max_live_kernels: int = Config(
+    alias="torch._inductor.config.coordinate_descent_tuning_batch_max_live_kernels"
+)
+autotune_queue_max_frontier_candidates: int = Config(
+    alias="torch._inductor.config.coordinate_descent_tuning_batch_max_frontier_candidates"
+)
+# Internal wrapper-scoped switch. Static autotune precompile can only be deferred
+# while defining kernels for a wrapper block that may activate the queue.
+autotune_queue_static_precompile = False
 coordinate_descent_check_all_directions = (
     os.environ.get("TORCHINDUCTOR_COORDINATE_DESCENT_CHECK_ALL_DIRECTIONS") == "1"
 )

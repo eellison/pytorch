@@ -4693,7 +4693,7 @@ class Scheduler:
             future_and_mod_l1_fused = self.compile_kernel(node_list_fused)
 
             def benchmark_when_ready() -> bool:
-                from torch._inductor.runtime.triton_heuristics import (
+                from torch._inductor.runtime.autotune_common import (
                     NoTritonConfigsError,
                 )
 
