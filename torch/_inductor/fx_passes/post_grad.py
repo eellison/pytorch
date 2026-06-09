@@ -631,6 +631,14 @@ def post_grad_passes(gm: torch.fx.GraphModule, is_inference: bool):
             GraphTransformObserver(
                 gm, "expand_sum_elision"
             ).apply_graph_pass(expand_sum_elision_pass)
+        if config.one_hot_reduction_elimination:
+            from .one_hot_reduction_elimination import (
+                one_hot_reduction_elimination_pass,
+            )
+
+            GraphTransformObserver(
+                gm, "one_hot_reduction_elimination"
+            ).apply_graph_pass(one_hot_reduction_elimination_pass)
         if config.scatter_reduce_fusion:
             from .scatter_reduce_fusion import scatter_reduce_fusion_pass
 

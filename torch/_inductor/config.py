@@ -1321,6 +1321,13 @@ expand_sum_elision = (
     os.environ.get("TORCHINDUCTOR_EXPAND_SUM_ELISION", "1") == "1"
 )
 
+# One-hot reduction elimination: recognizes sum(where(eq(label, iota), a, b) * scale, dim=vocab)
+# patterns from cross-entropy backward and replaces them with scalar arithmetic.
+# Eliminates dense [batch, vocab] intermediate materialization.
+one_hot_reduction_elimination = (
+    os.environ.get("TORCHINDUCTOR_ONE_HOT_REDUCTION_ELIMINATION", "1") == "1"
+)
+
 # BN-inference affine folding: folds decomposed batch normalization inference
 # (sub(x,mean) -> mul(inv_std) -> mul(weight) -> add(bias)) into precomputed
 # scale/shift: output = x * scale + shift. Saves 2 per-channel loads and 3 ops per element.
