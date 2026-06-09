@@ -639,6 +639,12 @@ def post_grad_passes(gm: torch.fx.GraphModule, is_inference: bool):
             GraphTransformObserver(
                 gm, "one_hot_reduction_elimination"
             ).apply_graph_pass(one_hot_reduction_elimination_pass)
+        if config.rotate_half_gather:
+            from .rotate_half_gather import rotate_half_gather_pass
+
+            GraphTransformObserver(
+                gm, "rotate_half_gather"
+            ).apply_graph_pass(rotate_half_gather_pass)
         if config.scatter_reduce_fusion:
             from .scatter_reduce_fusion import scatter_reduce_fusion_pass
 
