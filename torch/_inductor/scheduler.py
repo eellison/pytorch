@@ -5496,10 +5496,12 @@ class Scheduler:
         # Build the complete set of all buffer reads across ALL nodes
         # (including non-SchedulerNode, non-ComputedBuffer, etc.) so we can
         # verify no other node still references a buffer we want to remove.
+        # NOTE: We check all Dep subclasses (MemoryDep AND StarDep) because
+        # ExternKernelSchedulerNodes use StarDep for their read dependencies.
         buf_all_reader_nodes: dict[str, list[BaseSchedulerNode]] = {}
         for node in nodes:
             for dep in node.read_writes.reads:
-                if isinstance(dep, MemoryDep) and dep.name in buf_to_producer:
+                if hasattr(dep, 'name') and dep.name in buf_to_producer:
                     if dep.name not in buf_all_reader_nodes:
                         buf_all_reader_nodes[dep.name] = []
                     if node not in buf_all_reader_nodes[dep.name]:
@@ -5622,6 +5624,11 @@ class Scheduler:
             # A consumer may still reference the buffer if recompute_size_and_body
             # didn't fully eliminate the load (e.g., multi-output nodes, template
             # buffers, etc.). In that case, keep the producer alive.
+            #
+            # NOTE: ExternKernelSchedulerNodes use StarDep (not MemoryDep) for
+            # their read dependencies. We must check all Dep subclasses, not just
+            # MemoryDep, to catch extern kernel reads that would be broken by
+            # removing the producer buffer.
             actually_removable: OrderedSet[str] = OrderedSet()
             for node_name in nodes_to_remove:
                 removed_node = self.name_to_node.get(node_name)
@@ -5636,7 +5643,7 @@ class Scheduler:
                     if other_node.get_name() == node_name:
                         continue
                     for dep in other_node.read_writes.reads:
-                        if isinstance(dep, MemoryDep) and dep.name in buf_names:
+                        if hasattr(dep, 'name') and dep.name in buf_names:
                             still_referenced = True
                             break
                     if still_referenced:
@@ -5662,6 +5669,15 @@ class Scheduler:
                     for node in self.nodes
                     for buf in node.get_outputs()
                 }
+                # Clear mutation state before recomputing dependencies from
+                # scratch. compute_dependencies() builds mutation_renames
+                # incrementally as it processes nodes; stale entries from the
+                # prior call would corrupt the rename() function, causing user
+                # registrations to go to wrong buffers (e.g., registering an
+                # ExternKernel reader under the post-mutation name before the
+                # mutation node has been processed).
+                self.mutation_renames = {}
+                self.mutation_real_name = {}
                 self.compute_dependencies()
                 self.nodes = self.topological_sort_schedule(self.nodes)
                 self.dead_node_elimination()
