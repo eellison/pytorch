@@ -2185,6 +2185,16 @@ class Kernel(CodeGen, Generic[CSEVariableType]):
         self.min_elem_per_thread = 1
         self.kernel_name: str | None = None
 
+    def get_compute_buffer(
+        self, name: str, args: tuple[Any, ...], kwargs: dict[str, Any]
+    ) -> IndentedBuffer:
+        """Buffer that a pointwise compute op should be emitted into. Backends
+        may override to hoist loop-invariant ops out of reduction loops."""
+        return self.compute
+
+    def mark_hoisted_compute(self, var: CSEVariableType) -> None:
+        """Called when a compute op was emitted outside the reduction loop."""
+
     @contextlib.contextmanager
     def set_current_node(self, node: SchedulerNode) -> Iterator[None]:
         prior = self.current_node
@@ -2683,6 +2693,8 @@ class CSEProxy(DefaultHandler):
             assert output_dtype is not None
 
         output_idx = 0
+        compute_buffer = V.kernel.get_compute_buffer(name, args, kwargs)
+        hoisted = compute_buffer is not V.kernel.compute
 
         def do_cse(v: str | CSEVariable) -> CSEVariable:
             # we tree_map over the output, so we need to fetch corresponding dtype
@@ -2709,12 +2721,16 @@ class CSEProxy(DefaultHandler):
                     v.shape = var_shape
 
             csevar = V.kernel.cse.generate(
-                V.kernel.compute,
+                compute_buffer,
                 v,
                 bounds=bounds,
                 dtype=output_dtype,
                 shape=output_shape,
             )
+            if hoisted and not isinstance(v, CSEVariable):
+                # if v was already a CSEVariable its code was emitted elsewhere
+                # (e.g. directly into kernel.compute by the op override)
+                V.kernel.mark_hoisted_compute(csevar)
 
             csevar.update_on_args(name, args, kwargs)
 

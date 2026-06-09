@@ -3941,6 +3941,19 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
     def get_load_buffer(self, indexing):
         if indexing.has_indirect() or indexing.has_tmpmask():
+            if (
+                config.hoist_invariant_compute
+                and self.inside_reduction
+                and self.range_trees[-1].is_loop
+                and self._load_mask is None
+                and not indexing.has_tmpmask()
+                and not indexing.has_rindex()
+                and self._is_loop_invariant_arg(indexing.index)
+            ):
+                # indirect load whose index chain is loop-invariant (e.g. the
+                # target-logit gather in cross entropy): lift it out of the
+                # reduction loop along with its hoisted index computation
+                return self.body
             # Masked loads must come after the mask is computed
             return self.compute
         elif (
@@ -3953,6 +3966,41 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             return self.body
         else:
             return self.loads
+
+    def get_compute_buffer(self, name, args, kwargs):
+        if not (
+            config.hoist_invariant_compute
+            and self.inside_reduction
+            and self.range_trees[-1].is_loop
+            and self._load_mask is None
+        ):
+            return self.compute
+        if all(
+            self._is_loop_invariant_arg(arg)
+            for arg in itertools.chain(args, kwargs.values())
+        ):
+            return self.body
+        return self.compute
+
+    def _is_loop_invariant_arg(self, arg) -> bool:
+        if isinstance(arg, CSEVariable):
+            return arg in self.outside_loop_vars
+        if isinstance(arg, sympy.Expr):
+            for sym in arg.free_symbols:
+                if symbol_is_type(sym, SymT.TMP):
+                    cse_var = self.cse.varname_map.get(sym.name)
+                    if cse_var not in self.outside_loop_vars:
+                        return False
+                elif TritonSymbols.is_reduction_index_symbol(self, sym):
+                    return False
+            return True
+        if isinstance(arg, (int, float, bool, str, torch.dtype, type(None))):
+            return True
+        # graph bodies (masked) and anything else we can't analyze
+        return False
+
+    def mark_hoisted_compute(self, var):
+        self.outside_loop_vars.add(var)
 
     GDC_WAIT = "tl.extra.cuda.gdc_wait()"
     GDC_LAUNCH = "tl.extra.cuda.gdc_launch_dependents()"

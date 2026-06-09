@@ -1328,6 +1328,15 @@ one_hot_reduction_elimination = (
     os.environ.get("TORCHINDUCTOR_ONE_HOT_REDUCTION_ELIMINATION", "1") == "1"
 )
 
+# Rotate-half gather: rewrites RoPE half-rotation patterns
+# (cat/slice_scatter-into-zeros of (-x2, x1) halves of the same tensor) into a
+# single-load modular gather with a register-only sign select. Avoids the dual
+# masked loads and branchy index arithmetic produced by the slice_scatter /
+# pointwise_cat lowerings.
+rotate_half_gather = (
+    os.environ.get("TORCHINDUCTOR_ROTATE_HALF_GATHER", "1") == "1"
+)
+
 # BN-inference affine folding: folds decomposed batch normalization inference
 # (sub(x,mean) -> mul(inv_std) -> mul(weight) -> add(bias)) into precomputed
 # scale/shift: output = x * scale + shift. Saves 2 per-channel loads and 3 ops per element.
@@ -1338,6 +1347,18 @@ fold_bn_affine = os.environ.get("TORCHINDUCTOR_FOLD_BN_AFFINE", "1") == "1"
 # count in decomposed BN-inference normalization (sqrt(var+eps) -> 1/...).
 rsqrt_canonicalization = (
     os.environ.get("TORCHINDUCTOR_RSQRT_CANONICALIZATION", "1") == "1"
+)
+
+# Hoist reduction-invariant compute (and indirect loads with loop-invariant
+# index chains) out of the reduction loop in looped-reduction Triton kernels.
+# Loads with r-independent direct indices are already hoisted; this extends the
+# same treatment to pure elementwise ops whose inputs are all loop-invariant
+# (e.g. the rsqrt(var+eps)*weight chain of a fused BN) and to gathers like the
+# CE target logit. Default OFF: measured neutral on B200 — looped reductions
+# are memory-bound and the redundant in-loop work is latency-hidden (see
+# better_benchmark investigation_results/inductor_writeups/loop_invariant_hoisting.md).
+hoist_invariant_compute = (
+    os.environ.get("TORCHINDUCTOR_HOIST_INVARIANT_COMPUTE", "0") == "1"
 )
 
 # Layout-transform store sinking: eliminates layout-transform kernels (view+permute+clone)
