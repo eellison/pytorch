@@ -3363,6 +3363,17 @@ def _get_nd_reduction_numels(r: int, size_hints: dict[str, int]) -> dict[str, in
         [prefix for prefix in size_hints if prefix_is_reduction(prefix)]
     )
 
+    # Also clamp r to the maximum representable numel given TRITON_MAX_BLOCK caps.
+    # Without this, a single reduction dimension with size_hints > TRITON_MAX_BLOCK
+    # would leave r unrepresentable after capping each dimension.
+    max_representable = conditional_product(
+        *[
+            min(size_hints[f"r{idx}_"], TRITON_MAX_BLOCK[f"R{idx}_"])
+            for idx in range(num_reduction_dims)
+        ]
+    )
+    r = min(r, max_representable)
+
     remaining = r
     rnumels = {}
     for idx in range(num_reduction_dims - 1, -1, -1):
