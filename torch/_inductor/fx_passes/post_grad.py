@@ -2133,7 +2133,12 @@ def cat_splitwithsizes_replace(match, input_):
 # Algebraic simplification: reciprocal(sqrt(x)) -> rsqrt(x)
 # This is a universally correct identity: 1/sqrt(x) == rsqrt(x)
 # Saves one op in the generated kernel.
+# Gated by config.rsqrt_canonicalization (default True).
 ################################################################################
+
+
+def _rsqrt_canonicalization_enabled(match):
+    return config.rsqrt_canonicalization
 
 
 @register_graph_pattern(
@@ -2143,6 +2148,7 @@ def cat_splitwithsizes_replace(match, input_):
     ),
     # pyrefly: ignore [bad-argument-type]
     pass_dict=pass_patterns[1],
+    extra_check=_rsqrt_canonicalization_enabled,
 )
 def reciprocal_sqrt_to_rsqrt(match: Match, x):
     """reciprocal(sqrt(x)) -> rsqrt(x)"""
@@ -2161,6 +2167,7 @@ def reciprocal_sqrt_to_rsqrt(match: Match, x):
     ),
     # pyrefly: ignore [bad-argument-type]
     pass_dict=pass_patterns[1],
+    extra_check=_rsqrt_canonicalization_enabled,
 )
 def div_one_sqrt_to_rsqrt(match: Match, one, x):
     """div(1, sqrt(x)) -> rsqrt(x) when the numerator is 1"""

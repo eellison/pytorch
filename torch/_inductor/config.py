@@ -1333,6 +1333,13 @@ one_hot_reduction_elimination = (
 # scale/shift: output = x * scale + shift. Saves 2 per-channel loads and 3 ops per element.
 fold_bn_affine = os.environ.get("TORCHINDUCTOR_FOLD_BN_AFFINE", "1") == "1"
 
+# Rsqrt canonicalization: rewrites reciprocal(sqrt(x)) and div(1, sqrt(x)) into a
+# single rsqrt(x) in the post-grad graph. Halves the transcendental instruction
+# count in decomposed BN-inference normalization (sqrt(var+eps) -> 1/...).
+rsqrt_canonicalization = (
+    os.environ.get("TORCHINDUCTOR_RSQRT_CANONICALIZATION", "1") == "1"
+)
+
 # Layout-transform store sinking: eliminates layout-transform kernels (view+permute+clone)
 # by rewriting producers to store directly into the consumer's output layout.
 # Currently handles the "channel shuffle" pattern from ShuffleNet.
