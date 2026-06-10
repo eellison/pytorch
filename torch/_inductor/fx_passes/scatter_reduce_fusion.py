@@ -359,6 +359,69 @@ def scatter_reduce_fusion_pass(graph: fx.Graph) -> fx.Graph:
     return graph
 
 
+def scatter_add_gather_reduce_pass(graph: fx.Graph) -> fx.Graph:
+    """Eliminate scatter_add feeding full reductions via gather-predicate rewrite.
+
+    When scatter_add(full(0), dim, idx, src) is consumed ONLY by sum
+    reductions that fully reduce every dimension the scatter writes to
+    (possibly through view / channel-slice / where(mask, fill, x) chains),
+    the dense scratch buffer is eliminable: iterate SOURCE elements and gate
+    each contribution by the mask gathered at its computed destination:
+
+        sum(where(mask, fill, scatter_add(zeros, idx, src)[slice]), [0,2,3])
+            == sum(src[slice] * !mask[gathered at dest], [0,2])
+               + fill * sum(mask, [0,2,3])
+
+    The rewrite uses a two-stage reduction (spatial dims -> [B, C] partials,
+    then batch -> [C]) so the reduction exposes B*C parallel rows instead of
+    only C.
+
+    This is the same detection/rewrite machinery as Phase 1a of
+    scatter_reduce_fusion_pass, exposed under its own default-on flag.
+
+    Controlled by: config.scatter_add_reduce_elimination (default True)
+    """
+    if not getattr(config, "scatter_add_reduce_elimination", True):
+        return graph
+    # Avoid double application when the umbrella experimental pass (which
+    # also runs the scatter_add chain phase) is enabled.
+    if getattr(config, "scatter_reduce_fusion", False):
+        return graph
+
+    num_rewritten = 0
+    scatter_add_chains = _find_scatter_add_reduce_chains(graph)
+    if scatter_add_chains:
+        log.info(
+            "scatter_add_gather_reduce: found %d scatter_add-reduce chain(s)",
+            len(scatter_add_chains),
+        )
+        for chain in scatter_add_chains:
+            # The skip-connection / multiplier variants (UNet BN backward:
+            # where(mask, fill, skip + scatter_view) consumed by
+            # sum(where * mult)) measured net-negative under this default-on
+            # pass: the multiplier must be gathered at destination positions
+            # in f32 (random access) and the skip/fill terms re-read the
+            # full output space, which outweighs eliminating the scratch
+            # buffer at small batch sizes. They remain available under the
+            # experimental config.scatter_reduce_fusion flag.
+            if chain.skip_add_node is not None:
+                continue
+            if any(mult is not None for _, mult in chain.rewrite_targets):
+                continue
+            if _rewrite_scatter_add_reduce_chain(graph, chain):
+                num_rewritten += 1
+                counters["inductor"]["scatter_add_gather_reduce_applied"] += 1
+
+    if num_rewritten > 0:
+        log.info(
+            "scatter_add_gather_reduce: rewrote %d chain(s)", num_rewritten
+        )
+        graph.eliminate_dead_code()
+        graph.lint()
+
+    return graph
+
+
 class ScatterReduceChain:
     """Represents a detected scatter-then-reduce pattern."""
 
@@ -447,6 +510,7 @@ def _get_tensor_meta(node: fx.Node) -> Optional[dict]:
             "dtype": val.dtype,
             "numel": val.numel() if hasattr(val, "numel") else 0,
             "ndim": len(val.shape),
+            "device": getattr(val, "device", None),
         }
     return None
 
@@ -533,6 +597,25 @@ def _is_sum_reduction(node: fx.Node) -> Optional[list[int]]:
             if isinstance(dims, (list, tuple)):
                 return list(dims)
     return None
+
+
+def _is_plain_sum_reduction(node: fx.Node) -> Optional[list[int]]:
+    """Like _is_sum_reduction but rejects keepdim=True and dtype overrides.
+
+    The scatter_add gather-reduce rewrite replaces the sum with a chain whose
+    final node is sum(x, [0]) (keepdim=False, no dtype cast), so it is only
+    valid for plain sums.
+    """
+    dims = _is_sum_reduction(node)
+    if dims is None:
+        return None
+    if len(node.args) >= 3 and node.args[2] is not False:
+        return None
+    if node.kwargs.get("keepdim", False):
+        return None
+    if node.kwargs.get("dtype") is not None:
+        return None
+    return dims
 
 
 def _get_scatter_indices_info(node: fx.Node) -> Optional[dict]:
@@ -625,8 +708,9 @@ def _find_scatter_add_reduce_chains(graph: fx.Graph) -> list[ScatterAddReduceCha
     claimed_sums = set()
 
     for node in graph.nodes:
-        # Start from sum reduction nodes
-        reduction_dims = _is_sum_reduction(node)
+        # Start from sum reduction nodes (plain: keepdim=False, no dtype cast,
+        # since the rewrite replaces the sum with a [B,C]->[C] sum chain)
+        reduction_dims = _is_plain_sum_reduction(node)
         if reduction_dims is None:
             continue
         if node in claimed_sums:
@@ -704,7 +788,7 @@ def _trace_scatter_add_chain(
 
     for user in where_users:
         if user.op == "call_function":
-            dims = _is_sum_reduction(user)
+            dims = _is_plain_sum_reduction(user)
             if dims is not None:
                 norm = sorted([d % 4 for d in dims])
                 if norm == [0, 2, 3]:
@@ -716,7 +800,7 @@ def _trace_scatter_add_chain(
                 mul_users = list(user.users.keys())
                 if len(mul_users) == 1:
                     mul_user = mul_users[0]
-                    dims = _is_sum_reduction(mul_user)
+                    dims = _is_plain_sum_reduction(mul_user)
                     if dims is not None:
                         norm = sorted([d % 4 for d in dims])
                         if norm == [0, 2, 3]:
@@ -927,10 +1011,13 @@ def _rewrite_scatter_add_reduce_chain(
         result = sum(unmasked_src, [0, 2]) + fill * sum(mask, [0,2,3])
 
     Rewritten (with skip-connection):
-        scatter_part = sum(where(gathered_mask, 0, src_3d), [0, 2])
-        skip_part = sum(where(mask, 0, skip), [0, 2, 3])
-        fill_part = fill * sum(mask, [0, 2, 3])
-        result = scatter_part + skip_part + fill_part
+        scatter_part = sum(where(gathered_mask, 0, src_3d), [2])      # [B, C]
+        skip_part = sum(where(mask, 0, skip), [2, 3])                 # [B, C]
+        fill_part = fill * sum(mask, [2, 3])                          # [B, C]
+        result = sum(scatter_part + skip_part + fill_part, [0])       # [C]
+
+    All contributions are accumulated as [B, C] partials first (two-stage
+    reduction) so the heavy reduction kernels have B*C parallel rows.
     """
     if chain.scatter_add_node is None:
         return False
@@ -942,6 +1029,9 @@ def _rewrite_scatter_add_reduce_chain(
         return False
     if not chain.rewrite_targets:
         return False
+    # The rewrite assumes scatter along the spatial dim of [B*C, S] tensors
+    if chain.scatter_dim != 1:
+        return False
 
     B, C, H, W = chain.view_shape
 
@@ -951,9 +1041,23 @@ def _rewrite_scatter_add_reduce_chain(
         return False
     S_src = src_meta["shape"][1]
 
-    # Get index dtype for casting
+    # Get index dtype for casting; index must be elementwise-aligned with src
     index_meta = _get_tensor_meta(chain.index_node)
     if index_meta is None:
+        return False
+    if index_meta["shape"] != src_meta["shape"]:
+        return False
+
+    # Mask must be exactly the (sliced) view shape: the rewrite views it as
+    # [B, C, H*W] and gathers along the flattened spatial dim
+    cond_meta = _get_tensor_meta(chain.condition_node)
+    if cond_meta is None or cond_meta["shape"] != [B, C, H, W]:
+        return False
+
+    # Fill value must be a 0-dim scalar tensor for the
+    # fill * sum(mask, [2,3]) decomposition
+    fill_meta = _get_tensor_meta(chain.fill_value_node)
+    if fill_meta is None or fill_meta["ndim"] != 0:
         return False
 
     has_skip = chain.skip_add_node is not None
@@ -978,6 +1082,17 @@ def _rewrite_scatter_add_reduce_chain(
         C_full = C
         ch_start = 0
         ch_end = C
+
+    # The src rows must factor exactly as [B, C_full] for the 3D view
+    if src_meta["shape"][0] != B * C_full:
+        return False
+
+    # Device for materialized arange/scalar nodes. Only rewrite GPU graphs:
+    # the two-stage gather-reduce targets SM-parallelism / atomic-scatter
+    # costs that don't apply on CPU.
+    graph_device = src_meta.get("device")
+    if graph_device is None or graph_device.type != "cuda":
+        return False
 
     # Process each rewrite target (sum node) independently
     num_rewritten = 0
@@ -1030,7 +1145,7 @@ def _rewrite_scatter_add_reduce_chain(
             batch_idx = graph.call_function(
                 aten.arange.start_step,
                 args=(0, B),
-                kwargs={"dtype": torch.int64, "device": torch.device("cuda")},
+                kwargs={"dtype": torch.int64, "device": graph_device},
             )
             batch_idx.meta = {"val": torch.arange(B, dtype=torch.int64, device="meta")}
             batch_idx = graph.call_function(
@@ -1048,7 +1163,7 @@ def _rewrite_scatter_add_reduce_chain(
             chan_idx = graph.call_function(
                 aten.arange.start_step,
                 args=(0, C),
-                kwargs={"dtype": torch.int64, "device": torch.device("cuda")},
+                kwargs={"dtype": torch.int64, "device": graph_device},
             )
             chan_idx.meta = {"val": torch.arange(C, dtype=torch.int64, device="meta")}
             chan_idx = graph.call_function(
@@ -1078,7 +1193,7 @@ def _rewrite_scatter_add_reduce_chain(
                 aten.scalar_tensor.default,
                 args=(0.0,),
                 kwargs={"dtype": src_meta["dtype"],
-                        "device": torch.device("cuda")},
+                        "device": graph_device},
             )
             if hasattr(src_3d, "meta") and "val" in src_3d.meta:
                 zero_scalar.meta = {
@@ -1121,15 +1236,22 @@ def _rewrite_scatter_add_reduce_chain(
             if hasattr(src_3d, "meta"):
                 unmasked_src.meta = dict(src_3d.meta)
 
-            # scatter_contribution = sum(unmasked_src, [0, 2])  -> [C]
-            scatter_contribution = graph.call_function(
+            # Two-stage reduction: reduce spatial dims first, keeping the
+            # batch dim -> [B, C] partials. This exposes B*C parallel
+            # reduction rows instead of only C, which matters when C is
+            # small relative to the SM count (e.g. C=128 on a 148-SM GPU).
+            # The batch dim is reduced in a tiny [B, C] -> [C] follow-up
+            # that also folds in the fill-value and skip contributions.
+            # scatter_partial = sum(unmasked_src, [2])  -> [B, C]
+            scatter_partial = graph.call_function(
                 aten.sum.dim_IntList,
-                args=(unmasked_src, [0, 2]),
+                args=(unmasked_src, [2]),
             )
-            if hasattr(target_sum_node, "meta"):
-                scatter_contribution.meta = dict(target_sum_node.meta)
+            scatter_partial.meta = {
+                "val": torch.empty(B, C, dtype=src_meta["dtype"], device="meta")
+            }
 
-            accumulated = scatter_contribution
+            accumulated = scatter_partial
 
             # === Handle skip-connection (UNet pattern) ===
             # sum(where(mask, fill, scatter + skip), dims)
@@ -1144,7 +1266,7 @@ def _rewrite_scatter_add_reduce_chain(
                     aten.scalar_tensor.default,
                     args=(0.0,),
                     kwargs={"dtype": src_meta["dtype"],
-                            "device": torch.device("cuda")},
+                            "device": graph_device},
                 )
                 zero_scalar_4d.meta = {"val": torch.tensor(0.0, dtype=src_meta["dtype"], device="meta")}
 
@@ -1157,7 +1279,7 @@ def _rewrite_scatter_add_reduce_chain(
                     unmasked_skip.meta = dict(chain.skip_tensor_node.meta)
 
                 if multiplier_node is not None:
-                    # sum(where(mask, 0, skip) * mult, [0,2,3])
+                    # sum(where(mask, 0, skip) * mult, [2,3]) -> [B, C]
                     skip_times_mult = graph.call_function(
                         aten.mul.Tensor,
                         args=(unmasked_skip, multiplier_node),
@@ -1166,28 +1288,30 @@ def _rewrite_scatter_add_reduce_chain(
                         skip_times_mult.meta = dict(chain.skip_tensor_node.meta)
                     skip_contribution = graph.call_function(
                         aten.sum.dim_IntList,
-                        args=(skip_times_mult, [0, 2, 3]),
+                        args=(skip_times_mult, [2, 3]),
                     )
                 else:
-                    # sum(where(mask, 0, skip), [0,2,3])
+                    # sum(where(mask, 0, skip), [2,3]) -> [B, C]
                     skip_contribution = graph.call_function(
                         aten.sum.dim_IntList,
-                        args=(unmasked_skip, [0, 2, 3]),
+                        args=(unmasked_skip, [2, 3]),
                     )
-                if hasattr(target_sum_node, "meta"):
-                    skip_contribution.meta = dict(target_sum_node.meta)
+                skip_contribution.meta = {
+                    "val": torch.empty(B, C, dtype=src_meta["dtype"], device="meta")
+                }
 
                 accumulated = graph.call_function(
                     aten.add.Tensor,
                     args=(accumulated, skip_contribution),
                 )
-                if hasattr(target_sum_node, "meta"):
-                    accumulated.meta = dict(target_sum_node.meta)
+                accumulated.meta = {
+                    "val": torch.empty(B, C, dtype=src_meta["dtype"], device="meta")
+                }
 
-            # === Fill value contribution ===
-            # fill * sum(mask, [0,2,3]) or fill * sum(mask * mult, [0,2,3])
+            # === Fill value contribution (per-batch partials) ===
+            # fill * sum(mask, [2,3]) or fill * sum(mask * mult, [2,3]) -> [B, C]
             if multiplier_node is not None:
-                # fill * sum(mult * mask, [0,2,3])
+                # fill * sum(mult * mask, [2,3])
                 fill_masked_mult = graph.call_function(
                     aten.mul.Tensor,
                     args=(multiplier_node, chain.condition_node),
@@ -1196,27 +1320,38 @@ def _rewrite_scatter_add_reduce_chain(
                     fill_masked_mult.meta = dict(chain.mask_node.meta)
                 fill_sum = graph.call_function(
                     aten.sum.dim_IntList,
-                    args=(fill_masked_mult, [0, 2, 3]),
+                    args=(fill_masked_mult, [2, 3]),
                 )
             else:
-                # fill * sum(mask, [0,2,3])
+                # fill * sum(mask, [2,3])
                 fill_sum = graph.call_function(
                     aten.sum.dim_IntList,
-                    args=(chain.condition_node, [0, 2, 3]),
+                    args=(chain.condition_node, [2, 3]),
                 )
-            if hasattr(target_sum_node, "meta"):
-                fill_sum.meta = dict(target_sum_node.meta)
+            fill_sum.meta = {
+                "val": torch.empty(B, C, dtype=src_meta["dtype"], device="meta")
+            }
 
             fill_contribution = graph.call_function(
                 aten.mul.Tensor,
                 args=(chain.fill_value_node, fill_sum),
             )
-            if hasattr(target_sum_node, "meta"):
-                fill_contribution.meta = dict(target_sum_node.meta)
+            fill_contribution.meta = {
+                "val": torch.empty(B, C, dtype=src_meta["dtype"], device="meta")
+            }
 
-            final_result = graph.call_function(
+            combined_partials = graph.call_function(
                 aten.add.Tensor,
                 args=(accumulated, fill_contribution),
+            )
+            combined_partials.meta = {
+                "val": torch.empty(B, C, dtype=src_meta["dtype"], device="meta")
+            }
+
+            # Final stage: reduce the batch dim of the [B, C] partials -> [C]
+            final_result = graph.call_function(
+                aten.sum.dim_IntList,
+                args=(combined_partials, [0]),
             )
             if hasattr(target_sum_node, "meta"):
                 final_result.meta = dict(target_sum_node.meta)

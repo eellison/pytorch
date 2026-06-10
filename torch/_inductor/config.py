@@ -1263,6 +1263,18 @@ scatter_reduce_fusion = (
     os.environ.get("TORCHINDUCTOR_SCATTER_REDUCE_FUSION", "0") == "1"
 )
 
+# Scatter-add gather-reduce elimination: when a scatter_add into a full(0)
+# base is consumed only by sum reductions over all scattered dimensions
+# (possibly through view/slice/where chains), rewrite each consumer to a
+# reduction over the SOURCE elements with predicates gathered at the computed
+# destination, using a two-stage (spatial -> batch) reduction. This
+# eliminates the dense scratch buffer (zeros init + atomic scatter +
+# re-read). MaxPool backward feeding masked channel sums (SqueezeNet, VGG)
+# is the motivating pattern.
+scatter_add_reduce_elimination = (
+    os.environ.get("TORCHINDUCTOR_SCATTER_ADD_REDUCE_ELIMINATION", "1") == "1"
+)
+
 # Scatter-add-into fusion: rewrites add(A, index_put(zeros, idx, val, accumulate=True))
 # into index_put(A, idx, val, accumulate=True), eliminating the zeros initialization
 # and the separate add kernel. Common in embedding backward patterns.
