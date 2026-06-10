@@ -4167,6 +4167,15 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                     for sym, stride in load_strides.items()
                     if prefix_is_reduction(sym.name)
                 )
+                # Only relevant when the kernel's iteration space exceeds the
+                # L2 working set; small kernels keep evict_first unchanged.
+                and V.graph.sizevars.optimization_hint(
+                    sympy_product(self.numels.values()), fallback=0
+                )
+                * dtype.itemsize
+                > torch.cuda.get_device_properties(
+                    V.graph.get_current_device_or_throw()
+                ).L2_cache_size
             ):
                 # x-contiguous-only load: flag it when any non-unit constant
                 # stride breaks cache-line alignment of the segments. Unknown
