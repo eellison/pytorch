@@ -47,6 +47,9 @@ Safety:
   - The base must be a pointwise op whose ONLY consumers are the compacted
     output views (so no other consumer needs the full base) and the views
     combined must be statically smaller than the base.
+  - The avoided write traffic must exceed `_MIN_SAVED_BYTES`: the clone splits
+    the fused reduction+epilogue kernel in two, so for small bases the extra
+    kernel launch costs more than the avoided full-base write.
 """
 
 import logging
@@ -82,6 +85,15 @@ def _static_numel(val) -> Optional[int]:
 # Output view ops we can compact by cloning. Each takes the base as its first
 # argument and produces a statically-shaped sub-view of it.
 _COMPACTABLE_VIEW_TARGETS = (aten.slice.Tensor, aten.select.int)
+
+# Minimum write traffic (bytes) the compaction must save. Cloning splits the
+# fused reduction+epilogue kernel in two, so below a few MB the extra kernel
+# launch/wave costs more than the avoided full-base write. Measured on B200:
+# 2MB saved -> ~1.5us REGRESSION (llama RMSNorm last-token select,
+# mean_9c0fd9fb28b1); 12MB saved -> ~2.5us win (DenseNet BN-backward slice,
+# sum_sum_98c4811f6ddf); 75MB saved -> ~10us win (DeiT dual token select,
+# var_mean_c5067e6e3750).
+_MIN_SAVED_BYTES = 4 * 1024 * 1024
 
 
 def compact_slice_outputs_pass(graph: fx.Graph) -> None:
@@ -148,7 +160,8 @@ def compact_slice_outputs_pass(graph: fx.Graph) -> None:
         if not ok:
             continue
 
-        base_numel = _static_numel(base.meta.get("val"))
+        base_val = base.meta.get("val")
+        base_numel = _static_numel(base_val)
         if base_numel is None:
             continue
         view_vals = [view_node.meta.get("val") for view_node in view_nodes]
@@ -159,7 +172,13 @@ def compact_slice_outputs_pass(graph: fx.Graph) -> None:
         # epilogue traffic clearly dominates any cost of changing the output
         # layout. (Duplicate output positions share one clone, so each view
         # counts once.)
-        if sum(view_numels) * 2 > base_numel:  # type: ignore[arg-type]
+        total_view_numel = sum(view_numels)  # type: ignore[arg-type]
+        if total_view_numel * 2 > base_numel:
+            continue
+        # Require the avoided write traffic to be large enough to pay for the
+        # extra kernel the clone splits off (see _MIN_SAVED_BYTES).
+        saved_bytes = (base_numel - total_view_numel) * base_val.element_size()
+        if saved_bytes < _MIN_SAVED_BYTES:
             continue
 
         try:
