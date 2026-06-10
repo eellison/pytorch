@@ -4130,9 +4130,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         #   3.2) Its not its last load
         #   3.3) This load will not be lifted to the body
         #
-        is_coalesced = any(
-            i == 1 for i in self.get_strides_of_load(original_index).values()
-        )
+        load_strides = self.get_strides_of_load(original_index)
+        is_coalesced = any(i == 1 for i in load_strides.values())
         if self.is_broadcasted(original_index):
             ep = ", eviction_policy='evict_last'"
         elif not is_coalesced:
@@ -4140,12 +4139,32 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         elif self.inside_reduction and (
             self.persistent_reduction or self.range_trees[-1].is_loop
         ):
+            # evict_first assumes the loaded lines are dead once this
+            # reduction step consumes them. That holds for loads contiguous
+            # in a reduction dim (streaming along r), but not for loads that
+            # are only x-contiguous (e.g. column sums: index x0 + N*r0):
+            # there, cache lines straddle neighboring CTAs' x-tiles, and
+            # evicting them first forces the neighbor to re-read from DRAM.
+            # See config.triton.evict_first_requires_r_contiguous.
+            evict_first_ok = True
+            if (
+                config.triton.evict_first_requires_r_contiguous
+                and V.graph.get_current_device_or_throw().type == "cuda"
+                and torch.cuda.get_device_capability()[0] >= 10
+            ):
+                evict_first_ok = any(
+                    stride == 1
+                    for sym, stride in load_strides.items()
+                    if prefix_is_reduction(sym.name)
+                )
 
             def decide_later():
                 if load_counts[name] > expected_count and (
                     has_rindex or indirect_indexing
                 ):
                     return "evict_last"
+                if not evict_first_ok:
+                    return ""
                 return "evict_first"
 
             expected_count = load_counts[name]

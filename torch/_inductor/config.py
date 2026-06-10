@@ -2336,6 +2336,19 @@ class triton:
     # Skip L1 cache for buffers that are used only once.  Disabled by default
     skip_l1_cache = os.environ.get("TORCHINDUCTOR_SKIP_L1", "0") == "1"
 
+    # Only emit eviction_policy='evict_first' for reduction-loop loads that are
+    # contiguous in a reduction dimension. Loads that are contiguous only in a
+    # pointwise (x) dimension stride through memory across reduction steps
+    # (e.g. column sums of a row-major matrix: index x0 + N*r0). For those,
+    # evict_first evicts cache lines that straddle neighboring CTAs' x-tiles
+    # (row strides are rarely 128B-aligned) before the neighbor consumes them,
+    # forcing re-reads. Measured on B200 (sum_011e69da166d, [1024, 197951]
+    # column sum + side store): 573us -> ~417us from dropping evict_first on
+    # the x-contiguous loads. r-contiguous streaming loads keep evict_first
+    # (the line IS dead after the current reduction step consumes it).
+    # Applied on Blackwell+ (cc >= 10) where this was validated.
+    evict_first_requires_r_contiguous = True
+
     # During autotuning, if one of the kernels/configs fails for some reason,
     # Inductor will usually skip it (and assign its latency to inf).
     # For testing it's helpful to be able to assert that none of the configs fail.
