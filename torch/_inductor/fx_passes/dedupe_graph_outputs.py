@@ -184,15 +184,25 @@ def dedupe_graph_outputs_pass(graph: fx.Graph) -> None:
         hash_groups[h].append((i, n))
 
     # For each group with more than one member, confirm structural equality
-    # and replace duplicates with the canonical (first) node
+    # and replace duplicates with a canonical node.
+    #
+    # The canonical node must be the EARLIEST (in graph order) member of each
+    # equivalence class, not simply the first in the output tuple: duplicates
+    # can have non-output users (e.g. AOT backward graphs where a BN bias-grad
+    # sum also feeds the input-grad computation).  The graph is topologically
+    # sorted when this pass runs (post_grad runs stable_topological_sort just
+    # before it), so every user of a duplicate appears after the duplicate —
+    # and therefore after the earlier canonical node.  Replacing a duplicate
+    # with a LATER node instead would make earlier users reference a
+    # not-yet-defined value ("used before it has been defined" lint failure).
     replacements_made = 0
     memo: dict[tuple[fx.Node, fx.Node], bool] = {}
+    graph_order = {n: i for i, n in enumerate(graph.nodes)}
 
     for h, group in hash_groups.items():
         if len(group) <= 1:
             continue
 
-        # The canonical node is the first in the group
         canonical_idx, canonical_node = group[0]
 
         for dup_idx, dup_node in group[1:]:
@@ -200,7 +210,10 @@ def dedupe_graph_outputs_pass(graph: fx.Graph) -> None:
                 # Already the same node
                 continue
             if _structurally_equal(canonical_node, dup_node, memo):
-                # Replace dup_node with canonical_node in the output
+                # Keep whichever node is defined earlier in graph order;
+                # replace the later one with it.
+                if graph_order[dup_node] < graph_order[canonical_node]:
+                    canonical_node, dup_node = dup_node, canonical_node
                 dup_node.replace_all_uses_with(canonical_node)
                 replacements_made += 1
 
