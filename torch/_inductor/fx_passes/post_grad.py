@@ -749,6 +749,16 @@ def post_grad_passes(gm: torch.fx.GraphModule, is_inference: bool):
         gm, "materialize_constant_full_outputs"
     ).apply_gm_pass(materialize_constant_full_outputs)
 
+    # Clone user-visible output slices of single-use pointwise intermediates so
+    # only the sliced region of the epilogue is materialized instead of the
+    # full base buffer (DenseNet BN-backward channel-slice pattern).
+    if config.compact_slice_outputs:
+        from .slice_output_compaction import compact_slice_outputs_pass
+
+        GraphTransformObserver(gm, "compact_slice_outputs").apply_graph_pass(
+            compact_slice_outputs_pass
+        )
+
     GraphTransformObserver(gm, "move_constructors_to_cuda").apply_graph_pass(
         move_constructors_to_gpu
     )

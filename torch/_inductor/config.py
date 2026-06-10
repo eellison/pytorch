@@ -1397,6 +1397,15 @@ dedupe_graph_outputs = (
     os.environ.get("TORCHINDUCTOR_DEDUPE_GRAPH_OUTPUTS", "1") == "1"
 )
 
+# Compact slice outputs: when a user-visible graph output is a slice of a
+# single-use pointwise intermediate, clone the slice so only the sliced region
+# of the epilogue is computed and stored, instead of realizing the full base
+# buffer and returning a view into it (DenseNet BN-backward channel-slice
+# pattern).
+compact_slice_outputs = (
+    os.environ.get("TORCHINDUCTOR_COMPACT_SLICE_OUTPUTS", "1") == "1"
+)
+
 
 class _collective:
     auto_select: bool = False
