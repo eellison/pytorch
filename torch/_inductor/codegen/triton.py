@@ -3083,6 +3083,10 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         # We track the store name since a store can be canceled later
         self.stores_with_contiguous_rdim: list[str] = []
         self.has_online_softmax = False
+        # Whether this kernel stores a reduction-indexed (full-size) output
+        # inside the reduction loop, e.g. a fused pointwise side output next
+        # to a reduction. Used by the load eviction-policy heuristic.
+        self.has_store_with_rindex = False
 
     def triton_tensor_ndim(self) -> int:
         return sum(int(tree.tensor_dim is not None) for tree in self.range_trees)
@@ -4147,9 +4151,13 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             # column sums: index x0 + 197951*r0), every segment straddles
             # cache lines shared with the neighboring CTA's x-tile;
             # evict_first throws those boundary lines out of L2 before the
-            # neighbor consumes them, forcing DRAM re-reads.
+            # neighbor consumes them. This is harmful when the kernel also
+            # streams a full-size store through L2 in the reduction loop
+            # (fused multi-output reduction + pointwise side output), where
+            # the boundary lines have no chance of surviving; benchmarks
+            # show it is still profitable for pure streaming reductions.
             # See config.triton.evict_first_requires_aligned_strides.
-            evict_first_ok = True
+            evict_first_misaligned_x_only = False
             if (
                 config.triton.evict_first_requires_aligned_strides
                 and V.graph.get_current_device_or_throw().type == "cuda"
@@ -4160,8 +4168,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                     if prefix_is_reduction(sym.name)
                 )
             ):
-                # x-contiguous-only load: require every non-unit constant
-                # stride to keep segments cache-line aligned. Unknown
+                # x-contiguous-only load: flag it when any non-unit constant
+                # stride breaks cache-line alignment of the segments. Unknown
                 # (symbolic) strides conservatively keep evict_first.
                 cache_line_bytes = 128
                 itemsize = dtype.itemsize
@@ -4173,7 +4181,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                         stride_int not in (0, 1)
                         and (stride_int * itemsize) % cache_line_bytes != 0
                     ):
-                        evict_first_ok = False
+                        evict_first_misaligned_x_only = True
                         break
 
             def decide_later():
@@ -4181,7 +4189,9 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                     has_rindex or indirect_indexing
                 ):
                     return ", eviction_policy='evict_last'"
-                if not evict_first_ok:
+                # self.has_store_with_rindex is final by end of codegen,
+                # when DelayReplaceLine resolves this.
+                if evict_first_misaligned_x_only and self.has_store_with_rindex:
                     return ""
                 return ", eviction_policy='evict_first'"
 
@@ -4350,6 +4360,9 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             indexing.index
         ):
             self.stores_with_contiguous_rdim.append(name)
+
+        if self.inside_reduction and indexing.has_rindex():
+            self.has_store_with_rindex = True
 
         # Guard against write-after-read corruption in triton.
         # See # https://github.com/triton-lang/triton/issues/1615
