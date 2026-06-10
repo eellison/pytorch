@@ -1274,6 +1274,17 @@ scatter_reduce_fusion = (
     os.environ.get("TORCHINDUCTOR_SCATTER_REDUCE_FUSION", "0") == "1"
 )
 
+# Structured scatter decode: when index_put(accumulate=True) into a full(0)
+# base uses indices that are an affine function of the source position
+# (as_strided over iota) with a single overlapping-window dimension, decode
+# the scatter into an explicit overlap-add of padded slices. The pad-sum
+# form is pure pointwise (masked loads), so it fuses with consumers and
+# eliminates the zero-memset + atomic scatter + dense re-read. Longformer
+# sliding-window attention backward is the motivating pattern.
+structured_scatter_decode = (
+    os.environ.get("TORCHINDUCTOR_STRUCTURED_SCATTER_DECODE", "1") == "1"
+)
+
 # Scatter-add gather-reduce elimination: when a scatter_add into a full(0)
 # base is consumed only by sum reductions over all scattered dimensions
 # (possibly through view/slice/where chains), rewrite each consumer to a

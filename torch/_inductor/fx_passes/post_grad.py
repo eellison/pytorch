@@ -645,6 +645,14 @@ def post_grad_passes(gm: torch.fx.GraphModule, is_inference: bool):
             GraphTransformObserver(
                 gm, "rotate_half_gather"
             ).apply_graph_pass(rotate_half_gather_pass)
+        if config.structured_scatter_decode:
+            from .structured_scatter_decode import (
+                structured_scatter_decode_pass,
+            )
+
+            GraphTransformObserver(
+                gm, "structured_scatter_decode"
+            ).apply_graph_pass(structured_scatter_decode_pass)
         if config.scatter_reduce_fusion:
             from .scatter_reduce_fusion import scatter_reduce_fusion_pass
 
