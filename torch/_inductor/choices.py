@@ -567,9 +567,28 @@ class InductorChoices:
             # with full B200 threshold provides better performance because each
             # CTA can efficiently loop through moderate-sized reductions without
             # finalization overhead.
+            # Partially saturated (half a wave to one wave of output CTAs):
+            # still worth splitting, but only via the standard heuristic below
+            # (the aggressive path stays gated at num_sm // 2; for moderate
+            # rnumel the standard split factor measured faster, e.g. xhint=80
+            # rnumel=25088 on B200: standard split=4 -> 26.3us vs aggressive
+            # split=15 -> 29.8us).
+            # Additionally gate on total work: if the whole reduction fits
+            # below min_elements_per_device, the unsplit kernel is latency
+            # bound (each CTA has too little work to hide memory latency),
+            # so splitting helps. Above that, the long per-CTA r-loop already
+            # saturates bandwidth and splitting only adds finalize overhead
+            # (e.g. xhint=96, rnumel=200704 on B200 regresses 85.7us->91.7us
+            # if split).
+            severely_undersaturated = numel_hint < num_sm // 2
+            partially_saturated = (
+                config.split_reductions_for_partially_saturated_gpu
+                and num_sm // 2 <= numel_hint < num_sm
+                and reduction_numel_hint * numel_hint <= min_elements_per_device
+            )
             if (
                 config.split_reductions_for_undersaturated_gpu
-                and numel_hint < num_sm // 2
+                and (severely_undersaturated or partially_saturated)
                 and props.major is not None
                 and props.major >= 10
             ):

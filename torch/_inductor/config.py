@@ -1052,6 +1052,17 @@ split_reductions = os.getenv("TORCHINDUCTOR_SPLIT_REDUCTIONS", "1") == "1"
 # of 524K prevents splitting a 401K-element reduction, leaving 56% of SMs idle.
 split_reductions_for_undersaturated_gpu: bool = True
 
+# Extend the undersaturated-GPU no-split-threshold lowering above to PARTIALLY
+# saturated multi-output reductions (num_sm // 2 <= numel_hint < num_sm, i.e.
+# between half a wave and one wave of CTAs). A single partial wave still leaves
+# SMs idle for the whole kernel; splitting via the STANDARD split heuristic
+# (not the aggressive path) recovers parallelism. E.g., GhostNet BN-backward
+# with 80 channels on 148 SMs (rnumel=25088): unsplit runs only 80 CTAs and
+# fuses the full [512,80,7,7] epilogue into that 80-CTA kernel; split=4 runs
+# 320 CTAs for the reduction and frees the epilogue into a fully parallel
+# pointwise kernel (35.6us -> 26.3us on B200).
+split_reductions_for_partially_saturated_gpu: bool = True
+
 # PROTOTYPE: Force OUTER reductions to use INNER splitting to enable sibling fusion
 _sibling_reduction_fusion = False
 
