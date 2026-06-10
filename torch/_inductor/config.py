@@ -1268,6 +1268,13 @@ scatter_reduce_fusion = (
 # and the separate add kernel. Common in embedding backward patterns.
 scatter_add_into_fusion = True
 
+# When multiple chained scatter-add-into patterns are rewritten in one pass
+# invocation (e.g. add(add(A, ip0), ip1) with a shared zeros buffer, as in
+# MT5/T5 embedding backward), resolve each pattern's base tensor through
+# prior rewrites so chained rewrites compose instead of resurrecting the
+# dead add/zeros chain.
+scatter_add_into_fusion_chained = True
+
 # Reduce-scatter distribution: rewrites sum(x, [dim]) -> where -> index_put(acc=True)
 # into a distributed scatter that avoids materializing the full intermediate tensor.
 # The accumulate=True in index_put implicitly performs the summation.

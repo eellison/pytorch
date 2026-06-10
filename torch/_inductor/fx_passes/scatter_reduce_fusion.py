@@ -30,6 +30,7 @@ from typing import Any, Optional
 
 import torch
 import torch.fx as fx
+from torch.utils._ordered_set import OrderedSet
 from torch._dynamo.utils import counters
 from torch._inductor import config
 from torch._inductor.pattern_matcher import (
@@ -340,8 +341,11 @@ def scatter_reduce_fusion_pass(graph: fx.Graph) -> fx.Graph:
             "scatter_reduce_fusion: found %d scatter-add-into pattern(s)",
             len(scatter_add_into_chains),
         )
+        scatter_add_into_replacements: dict[fx.Node, fx.Node] = {}
         for chain_info in scatter_add_into_chains:
-            if _rewrite_scatter_add_into(graph, chain_info):
+            if _rewrite_scatter_add_into(
+                graph, chain_info, scatter_add_into_replacements
+            ):
                 num_rewritten += 1
                 counters["inductor"]["scatter_add_into_fusion_applied"] += 1
 
@@ -2135,8 +2139,9 @@ def scatter_add_into_fusion_pass(graph: fx.Graph) -> fx.Graph:
             "scatter_add_into_fusion: found %d scatter-add-into pattern(s)",
             len(patterns),
         )
+        replacements: dict[fx.Node, fx.Node] = {}
         for chain_info in patterns:
-            if _rewrite_scatter_add_into(graph, chain_info):
+            if _rewrite_scatter_add_into(graph, chain_info, replacements):
                 num_rewritten += 1
                 counters["inductor"]["scatter_add_into_fusion_applied"] += 1
 
@@ -2147,7 +2152,11 @@ def scatter_add_into_fusion_pass(graph: fx.Graph) -> fx.Graph:
     return graph
 
 
-def _rewrite_scatter_add_into(graph: fx.Graph, chain_info: dict) -> bool:
+def _rewrite_scatter_add_into(
+    graph: fx.Graph,
+    chain_info: dict,
+    replacements: Optional[dict[fx.Node, fx.Node]] = None,
+) -> bool:
     """Rewrite add(A, index_put(zeros, idx, val, True)) -> index_put(A, idx, val, True).
 
     Also handles the convert variant:
@@ -2182,6 +2191,20 @@ def _rewrite_scatter_add_into(graph: fx.Graph, chain_info: dict) -> bool:
     convert_node = chain_info.get("convert_node")
     target_dtype = chain_info.get("target_dtype")
 
+    # When multiple chained patterns are rewritten in one pass invocation
+    # (e.g. add_9 = add(add_4, ip1) where add_4 = add(mm, ip0) was itself a
+    # pattern), the recorded `other_node` may be a node that a previous
+    # rewrite already replaced. Using the stale node would resurrect the dead
+    # add (and its zeros + index_put chain), silently undoing the earlier
+    # rewrite after dead code elimination. Resolve through the replacement
+    # map so the new index_put chains onto the previous rewrite's output.
+    # Gated by config.scatter_add_into_fusion_chained (default True).
+    if replacements and getattr(config, "scatter_add_into_fusion_chained", True):
+        seen: OrderedSet[fx.Node] = OrderedSet()
+        while other_node in replacements and other_node not in seen:
+            seen.add(other_node)
+            other_node = replacements[other_node]
+
     with graph.inserting_before(add_node):
         effective_values = values_node
 
@@ -2214,6 +2237,8 @@ def _rewrite_scatter_add_into(graph: fx.Graph, chain_info: dict) -> bool:
             new_index_put.meta = dict(add_node.meta)
 
     add_node.replace_all_uses_with(new_index_put)
+    if replacements is not None:
+        replacements[add_node] = new_index_put
 
     log.info(
         "scatter_reduce_fusion: REWROTE scatter-add-into pattern! "
