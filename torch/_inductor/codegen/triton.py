@@ -4141,34 +4141,52 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         ):
             # evict_first assumes the loaded lines are dead once this
             # reduction step consumes them. That holds for loads contiguous
-            # in a reduction dim (streaming along r), but not for loads that
-            # are only x-contiguous (e.g. column sums: index x0 + N*r0):
-            # there, cache lines straddle neighboring CTAs' x-tiles, and
-            # evicting them first forces the neighbor to re-read from DRAM.
-            # See config.triton.evict_first_requires_r_contiguous.
+            # in a reduction dim (streaming along r), and for x-contiguous
+            # loads whose strided segments are cache-line aligned. But for
+            # loads contiguous only in x with a misaligned stride (e.g.
+            # column sums: index x0 + 197951*r0), every segment straddles
+            # cache lines shared with the neighboring CTA's x-tile;
+            # evict_first throws those boundary lines out of L2 before the
+            # neighbor consumes them, forcing DRAM re-reads.
+            # See config.triton.evict_first_requires_aligned_strides.
             evict_first_ok = True
             if (
-                config.triton.evict_first_requires_r_contiguous
+                config.triton.evict_first_requires_aligned_strides
                 and V.graph.get_current_device_or_throw().type == "cuda"
                 and torch.cuda.get_device_capability()[0] >= 10
-            ):
-                evict_first_ok = any(
+                and not any(
                     stride == 1
                     for sym, stride in load_strides.items()
                     if prefix_is_reduction(sym.name)
                 )
+            ):
+                # x-contiguous-only load: require every non-unit constant
+                # stride to keep segments cache-line aligned. Unknown
+                # (symbolic) strides conservatively keep evict_first.
+                cache_line_bytes = 128
+                itemsize = dtype.itemsize
+                for stride in load_strides.values():
+                    if not isinstance(stride, (int, sympy.Integer)):
+                        continue
+                    stride_int = int(stride)
+                    if (
+                        stride_int not in (0, 1)
+                        and (stride_int * itemsize) % cache_line_bytes != 0
+                    ):
+                        evict_first_ok = False
+                        break
 
             def decide_later():
                 if load_counts[name] > expected_count and (
                     has_rindex or indirect_indexing
                 ):
-                    return "evict_last"
+                    return ", eviction_policy='evict_last'"
                 if not evict_first_ok:
                     return ""
-                return "evict_first"
+                return ", eviction_policy='evict_first'"
 
             expected_count = load_counts[name]
-            ep = ", eviction_policy='<EP>'"
+            ep = "<EP>"
             make_line = functools.partial(DelayReplaceLine, "<EP>", decide_later)
         else:
             ep = ""
