@@ -764,6 +764,18 @@ collective_benchmark_timeout = float(
 coordinate_descent_tuning = (
     os.environ.get("TORCHINDUCTOR_COORDINATE_DESCENT_TUNING") == "1"
 )
+
+# Include large-R0_BLOCK reduction configs for kernels with scalar accumulators
+# (low register pressure: few loads/reductions, or online softmax) in the
+# DEFAULT autotune candidate set, instead of only when coordinate descent
+# tuning is enabled. Also raises the rnumel ceiling for these configs.
+# Historically this knowledge was gated on coordinate_descent_tuning because
+# the pre-fast-combine cost model punished large R0_BLOCK; after the online
+# softmax fast-combine landed, large-R0 configs win outright on large-rnumel
+# reductions (e.g. softmax/cross-entropy over 256K-element rows).
+scalar_acc_configs_without_cd = (
+    os.environ.get("TORCHINDUCTOR_SCALAR_ACC_CONFIGS_WITHOUT_CD", "1") == "1"
+)
 coordinate_descent_check_all_directions = (
     os.environ.get("TORCHINDUCTOR_COORDINATE_DESCENT_CHECK_ALL_DIRECTIONS") == "1"
 )

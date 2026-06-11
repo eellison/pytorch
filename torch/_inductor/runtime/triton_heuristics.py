@@ -4046,6 +4046,21 @@ def _get_tiling_scores(
     return inductor_meta.get("tiling_scores") or dict.fromkeys(size_hints, 1)
 
 
+def _scalar_acc_configs_without_cd(inductor_meta: dict[str, Any]) -> bool:
+    """
+    Whether large-R0_BLOCK reduction configs for scalar-accumulator kernels are
+    included in the default autotune candidate set (instead of only under
+    coordinate descent tuning).  Prefer the value recorded in inductor_meta if
+    present; otherwise read the live config (env-overridable via
+    TORCHINDUCTOR_SCALAR_ACC_CONFIGS_WITHOUT_CD).
+    """
+    if "scalar_acc_configs_without_cd" in inductor_meta:
+        return bool(inductor_meta["scalar_acc_configs_without_cd"])
+    from torch._inductor import config as inductor_config
+
+    return bool(getattr(inductor_config, "scalar_acc_configs_without_cd", True))
+
+
 def _reduction_configs(
     *,
     size_hints: dict[str, int],
@@ -4070,17 +4085,35 @@ def _reduction_configs(
 
     device_major = triton_meta["device"].major
     has_online_softmax = inductor_meta.get("has_online_softmax", False)
-    has_scalar_acc = inductor_meta.get("coordinate_descent_tuning", False) and (
-        loads_and_red <= 3 or has_online_softmax
-    )
     # When scalar reduction accumulators are active (low register pressure),
     # allow larger R0_BLOCK to reduce loop iterations.  Online softmax kernels
     # with scalar accumulators keep only [XBLOCK]-sized state across iterations,
     # so they benefit significantly from larger tiles.
-    # Cap at rnumel <= 131072 to avoid interfering with split reduction heuristics
-    # for very large reductions (e.g., rnumel=1M triggers split which has different
-    # optimal R0_BLOCK).
-    if has_scalar_acc and 8192 <= rnumel <= 131072:
+    has_scalar_acc = loads_and_red <= 3 or has_online_softmax
+    scalar_acc_without_cd = _scalar_acc_configs_without_cd(inductor_meta)
+    if scalar_acc_without_cd:
+        # Large-R0_BLOCK configs are included in the DEFAULT autotune candidate
+        # set (not only under coordinate descent tuning).  The CD-gate and the
+        # old 131072 rnumel ceiling were calibrated against the pre-fast-combine
+        # online softmax cost model; with the cheap combine, large-R0 configs
+        # win outright on large-rnumel rows (e.g. softmax/cross-entropy over
+        # 256K-element rows: ~1.9x faster than the R0_BLOCK<=1024 default on
+        # B200).  Re-measured 2026-06: large-R0 also wins at rnumel=512K
+        # (sum 1478->613us, softmax 3733->1936us) and rnumel=1M (softmax
+        # 3899->2149us), so the ceiling is 1M; beyond that is unmeasured and
+        # split-reduction heuristics own the small-x cases anyway (the post-
+        # split inner kernel has a much smaller rnumel).
+        scalar_acc_rnumel_max = 1048576
+    else:
+        # Legacy behavior: only consider large-R0_BLOCK configs when coordinate
+        # descent tuning is on, and cap at rnumel <= 131072 to avoid interfering
+        # with split reduction heuristics for very large reductions (e.g.,
+        # rnumel=1M triggers split which has different optimal R0_BLOCK).
+        has_scalar_acc = has_scalar_acc and inductor_meta.get(
+            "coordinate_descent_tuning", False
+        )
+        scalar_acc_rnumel_max = 131072
+    if has_scalar_acc and 8192 <= rnumel <= scalar_acc_rnumel_max:
         MAX_R0_BLOCK = 4096
     elif device_major is not None and device_major >= 10:
         # Prefer smaller MAX_R0_BLOCK for Blackwell by default
@@ -4206,6 +4239,26 @@ def _reduction_configs(
         min(rnumel, MAX_R0_BLOCK),
         register_intensive=register_intensive,
     )
+
+    # Extra large-R0_BLOCK candidates for scalar-accumulator kernels.  With the
+    # fast online-softmax combine, looped reductions over long contiguous rows
+    # are fastest with very large R0_BLOCK and moderate warp counts (measured on
+    # B200, rnumel=262144: R0=16384/8 warps and R0=8192/4 warps beat the
+    # R0=4096/16 warps starting point by 1.3-1.9x; CD converges to the same
+    # configs).  Without these candidates the default (non-CD) autotune can
+    # never reach them since the ReductionHint.INNER path returns a single
+    # config.
+    scalar_acc_configs = []
+    if (
+        scalar_acc_without_cd
+        and has_scalar_acc
+        and 8192 <= rnumel <= scalar_acc_rnumel_max
+        and "y" not in size_hints
+    ):
+        scalar_acc_configs = [
+            make_config(1, min(rnumel, 8192), num_warps=4),
+            make_config(1, min(rnumel, 16384), num_warps=8),
+        ]
     tiny_config = make_config(
         2 * (256 // rnumel) if rnumel <= 256 else 1,
         min(rnumel, MAX_R0_BLOCK),
@@ -4238,7 +4291,7 @@ def _reduction_configs(
     elif max_autotune_enabled:
         pass  # skip all these cases
     elif reduction_hint == ReductionHint.INNER:
-        return configs + [contiguous_config]
+        return configs + [contiguous_config] + scalar_acc_configs
     elif reduction_hint == ReductionHint.OUTER:
         return configs + [outer_config]
     elif reduction_hint == ReductionHint.OUTER_TINY:
@@ -4247,17 +4300,21 @@ def _reduction_configs(
     # We continue here under the following conditions:
     # - max_autotune_enabled is True
     # - max_autotune_enabled is False and reduction_hint is NOT one of the above cases
-    result_configs = configs + [
-        contiguous_config,
-        outer_config,
-        tiny_config,
-        make_config(64, 64),
-        make_config(8, 512),
-        # halve the XBLOCK/Rn_BLOCK compared to outer_config
-        # TODO: this may only be beneficial when each iteration of the reduction
-        # is quite heavy. E.g. https://gist.github.com/shunting314/189a8ef69f90db9d614a823385147a72
-        make_config(64, 4, num_warps=8),
-    ]
+    result_configs = (
+        configs
+        + [
+            contiguous_config,
+            outer_config,
+            tiny_config,
+            make_config(64, 64),
+            make_config(8, 512),
+            # halve the XBLOCK/Rn_BLOCK compared to outer_config
+            # TODO: this may only be beneficial when each iteration of the reduction
+            # is quite heavy. E.g. https://gist.github.com/shunting314/189a8ef69f90db9d614a823385147a72
+            make_config(64, 4, num_warps=8),
+        ]
+        + scalar_acc_configs
+    )
 
     if torch.version.hip:
         hip_configs = [
