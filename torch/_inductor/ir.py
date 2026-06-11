@@ -1461,10 +1461,10 @@ class Reduction(Loops):
         num_sm = props.multi_processor_count
         min_elements_per_thread = 32
         if should_split:
-            inner_reduction_splits: Callable[[int, int], int] = functools.partial(
+            inner_reduction_splits: Callable[..., int] = functools.partial(
                 V.choices.reduction_split_factor, device, inner_reduction=True
             )
-            outer_reduction_splits: Callable[[int, int], int] = functools.partial(
+            outer_reduction_splits: Callable[..., int] = functools.partial(
                 V.choices.reduction_split_factor, device, inner_reduction=False
             )
         else:
@@ -1472,6 +1472,7 @@ class Reduction(Loops):
             def inner_reduction_splits(
                 reduction_numel_hint: int,
                 numel_hint: int,
+                inner_segment_hint: int | None = None,
             ) -> int:
                 return 1
 
@@ -1618,8 +1619,33 @@ class Reduction(Loops):
         (_, reduction_vars), ranges1 = dependencies.index_vars_squeeze(
             r.get_size(), r.get_reduction_size()
         )
+
+        def inner_segment_length(strides: Sequence[int]) -> int | None:
+            """Length L of the innermost contiguous run of reduction ranges.
+
+            For a SEGMENTED-contiguous reduction load, the reduction ranges
+            factor as [K..., inner...] where the inner ranges are accessed
+            contiguously (innermost stride 1, each next-outer stride equal to
+            the product of the inner range lengths) and the outer ranges jump.
+            E.g. an NCHW channel sum reads idx = r_hw + HW*x + NStride*r_n:
+            L = H*W. Returns None when the load is not stride-1 in its
+            innermost reduction range or range sizes are not static."""
+            segment = 1
+            for stride, var in zip(reversed(strides), reversed(reduction_vars)):
+                if not isinstance(var, sympy.Symbol):
+                    # squeezed size-1 dim (literal zero); contributes nothing
+                    continue
+                if stride != segment:
+                    break
+                size = ranges1[var]
+                if not _is_static(size):
+                    return None
+                segment *= int(size)
+            return segment if segment > 1 else None
+
         num_outer = 0
         num_inner = 0
+        inner_segment_hints: list[int] = []
         for i in indices:
             j = V.graph.sizevars.simplify_with_ranges(i, ranges1)
             strides = V.graph.sizevars.stride_hints(
@@ -1632,7 +1658,30 @@ class Reduction(Loops):
                 num_outer += 1
             else:
                 num_inner += 1
+                segment = inner_segment_length(strides)
+                if segment is not None:
+                    inner_segment_hints.append(segment)
         if num_inner > num_outer:
+            # Inner contiguous segment length of the reduction loads, used by
+            # the segment-aligned split heuristic. Only meaningful when all
+            # inner loads share alignment (the smallest segment divides all
+            # others, so a segment-aligned chunk is aligned for every load).
+            inner_segment_hint: int | None = None
+            if len(inner_segment_hints) == num_inner:
+                candidate = min(inner_segment_hints)
+                if all(s % candidate == 0 for s in inner_segment_hints):
+                    inner_segment_hint = candidate
+            if inner_segment_hint is not None:
+                try:
+                    return ReductionHint.INNER, inner_reduction_splits(
+                        reduction_numel_hint,
+                        numel_hint,
+                        inner_segment_hint=inner_segment_hint,
+                    )
+                except TypeError:
+                    # out-of-tree InductorChoices subclass with the old
+                    # reduction_split_factor signature
+                    pass
             return ReductionHint.INNER, inner_reduction_splits(
                 reduction_numel_hint, numel_hint
             )

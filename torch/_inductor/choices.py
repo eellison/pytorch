@@ -505,10 +505,16 @@ class InductorChoices:
         reduction_numel_hint: int,
         numel_hint: int,
         inner_reduction: bool,
+        inner_segment_hint: int | None = None,
     ) -> int:
         """Heuristic to decide the RSPLIT used for split reductions.
         When a reduction has a small number of outputs there is not enough parallelism,
-        so we will do the reduction in two phases."""
+        so we will do the reduction in two phases.
+
+        inner_segment_hint, when provided, is the inner contiguous segment
+        length of the dominant reduction loads (the product of the innermost
+        stride-1 run of reduction ranges, e.g. H*W for an NCHW channel sum
+        where rnumel = N*H*W). See the segment-aligned split logic below."""
         props = DeviceProperties.create(device)
         num_sm = props.multi_processor_count
         warp_size = props.warp_size if props.warp_size is not None else 32
@@ -525,11 +531,65 @@ class InductorChoices:
         num_warps = 8
         num_threads = warp_size * num_warps
 
+        def segment_aligned_split(split: int) -> int:
+            """Override `split` for SEGMENTED-contiguous inner reductions.
+
+            When the dominant reduction load consists of contiguous runs of
+            L = inner_segment_hint elements with a stride jump between runs
+            (rnumel = K * L, e.g. NCHW channel sums where L = H*W and K = N),
+            only splits whose chunk is an exact multiple of L avoid div/mod
+            indexing and strided gathers in the phase-1 kernel. Splitting by
+            exactly K makes phase-1 a persistent, perfectly-coalesced segment
+            reduction (one L-length contiguous run per row). Measured on B200:
+            xnumel=1000, rnumel=512*169: no-split 95.3us -> split=512 46.1us
+            (split=676, past alignment, regresses back to 95us); xnumel=16,
+            rnumel=128*12544: misaligned split=74 57.0us -> split=128 45.3us.
+            Only overrides when the existing heuristics chose no-split or a
+            misaligned split; segment-aligned existing splits are kept.
+            """
+            if not config.segment_aligned_split_reductions:
+                return split
+            if inner_segment_hint is None:
+                return split
+            segment = inner_segment_hint
+            # L must be large enough that a phase-1 row is a sensible block of
+            # contiguous work, and small enough that the phase-1 kernel is a
+            # persistent or short-loop streaming row reduction (16384 matches
+            # the Blackwell persistent-reduction threshold; anchor L values
+            # are 169 and 12544).
+            if not (64 <= segment <= 16384):
+                return split
+            if reduction_numel_hint % segment != 0:
+                return split
+            num_segments = reduction_numel_hint // segment
+            if num_segments <= 1:
+                return split
+            # Keep existing splits that are already segment-aligned
+            # (chunk = rnumel / split is an exact multiple of L).
+            if split > 1 and num_segments % split == 0:
+                return split
+            # Skip small reductions: two-phase overhead is not amortized
+            # (matches the legacy no-split threshold).
+            if reduction_numel_hint <= 8192:
+                return split
+            # Phase-1 must have enough rows to saturate the GPU.
+            if numel_hint * num_segments < 2 * num_sm:
+                return split
+            # Split into exactly one segment per phase-1 row (measured best).
+            # If that leaves too many phase-2 partials, fall back to the
+            # largest segment-aligned divisor under the cap.
+            if num_segments > 4096:
+                aligned_divisors = [
+                    d for d in sympy.divisors(num_segments) if d <= 4096
+                ]
+                return max(aligned_divisors)
+            return num_segments
+
         if inner_reduction:
             # do heuristics that's close to eager mode for split inner reduction
             # we leak reduction autotune configs here, and will need to refactor to avoid this later
             if numel_hint >= 2 * num_sm:  # don't split if there are enough outputs
-                return 1
+                return segment_aligned_split(1)
             # Prefer cooperative reduction over split when the cooperative heuristic
             # would trigger. Cooperative reductions keep the epilogue in the same
             # kernel (second pass over cached data), avoiding a separate pointwise
@@ -594,7 +654,7 @@ class InductorChoices:
             ):
                 no_split_threshold = 8192
             if reduction_numel_hint <= no_split_threshold:
-                return 1
+                return segment_aligned_split(1)
             # Compute the standard split factor first.
             if reduction_numel_hint * numel_hint <= min_elements_per_device:
                 split_size = min_elements_per_thread
@@ -663,8 +723,8 @@ class InductorChoices:
                 # standard heuristic. This prevents regressions where the standard
                 # path already gives a good split factor.
                 if aggressive_split > standard_split:
-                    return aggressive_split
-            return standard_split
+                    return segment_aligned_split(aggressive_split)
+            return segment_aligned_split(standard_split)
         else:
             # TODO the best heuristic currently has XBLOCK (corresponding to numel_hint) 128
             # extend to even smaller number of outputs

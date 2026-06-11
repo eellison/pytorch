@@ -1063,6 +1063,22 @@ split_reductions_for_undersaturated_gpu: bool = True
 # pointwise kernel (35.6us -> 26.3us on B200).
 split_reductions_for_partially_saturated_gpu: bool = True
 
+# Segment-aligned split introduction for segmented-contiguous inner reductions.
+# When the dominant reduction load is SEGMENTED-contiguous (contiguous runs of
+# L elements with a stride jump between runs, e.g. NCHW channel sums where
+# rnumel = N*H*W and L = H*W), the optimal split is rnumel / L: phase-1 becomes
+# a perfectly-coalesced segment reduction (one contiguous segment per output
+# row) and phase-2 combines the K = rnumel / L partials. Misaligned splits
+# leave div/mod indexing in phase-1 and strided gathers. E.g. on B200:
+# squeezenet avgpool-backward channel sum (xnumel=1000, rnumel=512*169):
+# no-split 95.3us -> split=512 (chunk = L = 169) 46.1us; nfnet silu-backward
+# channel sum (xnumel=16, rnumel=128*12544): misaligned split=74 57.0us ->
+# aligned split=128 45.3us. Only fires when the existing heuristics chose
+# no-split or a misaligned split.
+segment_aligned_split_reductions = (
+    os.getenv("TORCHINDUCTOR_SEGMENT_ALIGNED_SPLIT_REDUCTIONS", "1") == "1"
+)
+
 # PROTOTYPE: Force OUTER reductions to use INNER splitting to enable sibling fusion
 _sibling_reduction_fusion = False
 
