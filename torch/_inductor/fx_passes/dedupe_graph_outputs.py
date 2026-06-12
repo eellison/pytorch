@@ -24,45 +24,49 @@ def _structural_hash(node: fx.Node, cache: dict[fx.Node, int]) -> int:
 
     Two nodes with the same structural hash are candidates for being identical
     (same op, target, and recursively equivalent arguments).
+
+    Iterative post-order (explicit stack): deep graphs (MobileBert: 1000+
+    node chains) blow the Python recursion limit with the recursive form.
     """
-    if node in cache:
-        return cache[node]
 
-    if node.op in ("placeholder", "get_attr"):
-        # Placeholders and get_attr are unique by identity
-        h = hash(id(node))
-    elif node.op == "call_function":
-        # Hash based on target + structural hashes of args
-        arg_hashes = []
-        for arg in node.args:
-            if isinstance(arg, fx.Node):
-                arg_hashes.append(_structural_hash(arg, cache))
-            else:
-                # For scalar constants, lists, tuples, etc., hash the value
-                try:
-                    arg_hashes.append(hash(arg))
-                except TypeError:
-                    # Unhashable args (e.g., lists) — convert to tuple
-                    arg_hashes.append(hash(str(arg)))
+    def _hash_const(v):
+        try:
+            return hash(v)
+        except TypeError:
+            return hash(str(v))
 
-        kwarg_hashes = []
-        for k in sorted(node.kwargs.keys()):
-            v = node.kwargs[k]
-            if isinstance(v, fx.Node):
-                kwarg_hashes.append((k, _structural_hash(v, cache)))
-            else:
-                try:
-                    kwarg_hashes.append((k, hash(v)))
-                except TypeError:
-                    kwarg_hashes.append((k, hash(str(v))))
-
-        h = hash((node.target, tuple(arg_hashes), tuple(kwarg_hashes)))
-    else:
-        # output, etc. — use identity
-        h = hash(id(node))
-
-    cache[node] = h
-    return h
+    stack = [node]
+    while stack:
+        n = stack[-1]
+        if n in cache:
+            stack.pop()
+            continue
+        if n.op in ("placeholder", "get_attr"):
+            cache[n] = hash(id(n))
+            stack.pop()
+            continue
+        if n.op != "call_function":
+            cache[n] = hash(id(n))
+            stack.pop()
+            continue
+        pending = [
+            a for a in list(n.args) + [n.kwargs[k] for k in sorted(n.kwargs)]
+            if isinstance(a, fx.Node) and a not in cache
+        ]
+        if pending:
+            stack.extend(pending)
+            continue
+        arg_hashes = tuple(
+            cache[a] if isinstance(a, fx.Node) else _hash_const(a)
+            for a in n.args
+        )
+        kwarg_hashes = tuple(
+            (k, cache[v] if isinstance(v, fx.Node) else _hash_const(v))
+            for k, v in ((k, n.kwargs[k]) for k in sorted(n.kwargs))
+        )
+        cache[n] = hash((n.target, arg_hashes, kwarg_hashes))
+        stack.pop()
+    return cache[node]
 
 
 def _structurally_equal(a: fx.Node, b: fx.Node, memo: dict[tuple[fx.Node, fx.Node], bool]) -> bool:
