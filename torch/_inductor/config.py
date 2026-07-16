@@ -273,6 +273,15 @@ benchmark_harness = True
 # fuse pointwise into templates epilogues
 epilogue_fusion = True
 
+# Reassociate eligible GEMM-residual-RMSNorm-GEMM sequences so the row-wise
+# RMS scale is applied after the second GEMM. This changes low-precision rounding
+# and may change overflow behavior for extreme values.
+coda_rms_norm_rewrite = False
+
+# Lower the reassociated graph to CODA-style FlexGEMM epilogues. This implies
+# coda_rms_norm_rewrite and requires SM100+ with CuTeDSL.
+coda_rms_norm_fusion = False
+
 # fuse atomic-add scatter mutations into Triton template epilogues
 # Disabled by default because performance depends on index contention.
 epilogue_fusion_with_atomic_add = False

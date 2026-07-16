@@ -709,6 +709,10 @@ def joint_graph_passes(
     )
 
     lazy_init(input_device)
+    if config.coda_rms_norm_rewrite or config.coda_rms_norm_fusion:
+        from .coda import _coda_init
+
+        _coda_init(input_device)
     count = 0
 
     # must occur before other passes
