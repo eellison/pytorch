@@ -1183,6 +1183,45 @@ class TestFastLauncherDeviceSupport(TestCase):
             self.assertIsNone(autotuner._build_fast_launcher(launcher))
             fast_launcher.assert_not_called()
 
+    def test_pre_first_launch_cache_populated_for_single_launcher(self):
+        autotuner = self._make_autotuner("cuda")
+        launcher = self._make_static_launcher()
+        launcher.cache_hash = "hash"
+        launcher.store_cubin = False
+        autotuner.launchers = [launcher]
+        fast_launcher = object()
+
+        with (
+            patch.object(
+                CachingAutotuner,
+                "_build_fast_launcher",
+                return_value=fast_launcher,
+            ) as build_fast_launcher,
+            patch.object(CachingAutotuner, "_set_triton_allocator") as set_allocator,
+            patch(
+                "torch._inductor.runtime.triton_heuristics.TritonBundler.put_winner"
+            ) as put_winner,
+        ):
+            autotuner._maybe_cache_runtime_launcher(launcher, before_first_launch=True)
+
+        self.assertIs(autotuner._cached_launcher, fast_launcher)
+        build_fast_launcher.assert_called_once_with(launcher)
+        set_allocator.assert_called_once()
+        put_winner.assert_called_once_with("hash")
+
+    def test_pre_first_launch_cache_skips_side_effectful_cases(self):
+        autotuner = self._make_autotuner("cuda")
+        launcher = self._make_static_launcher()
+        launcher.cache_hash = "hash"
+        launcher.store_cubin = True
+        autotuner.launchers = [launcher]
+
+        with patch.object(CachingAutotuner, "_build_fast_launcher") as build:
+            autotuner._maybe_cache_runtime_launcher(launcher, before_first_launch=True)
+
+        self.assertIsNone(autotuner._cached_launcher)
+        build.assert_not_called()
+
 
 class TestDynamicScaleRblockCacheInteraction(TestCase):
     """Tests for _dynamic_scale_rblock + autotune cache interaction.

@@ -4641,6 +4641,7 @@ class TestAutotuneCache(TestCase):
         graph = CompiledFxGraph.__new__(CompiledFxGraph)
         graph.fx_kwargs = {}
         graph._compile_context = None
+        graph.compiled_fn_runner = None
 
         def current_callable(inputs):
             AutotuneCacheBundler.put(
@@ -4663,6 +4664,29 @@ class TestAutotuneCache(TestCase):
         self.assertEqual(len(cache.puts), 1)
         self.assertEqual(cache.puts[0][1], {"entry.best_config": {"ctx": "saved"}})
         self.assertIsNone(graph._compile_context)
+
+    def test_compiled_fx_graph_boxed_runtime_callable(self):
+        from torch._inductor.output_code import CompiledFxGraph
+        from torch._inductor.utils import BoxedBool
+
+        calls = []
+        graph = CompiledFxGraph.__new__(CompiledFxGraph)
+        graph._compile_context = None
+        graph._wrap_compiled_regions = False
+        graph.compiled_fn_runner = None
+
+        def current_callable(inputs):
+            calls.append("fast")
+            return inputs
+
+        graph.current_callable = current_callable
+        graph._refresh_boxed_runtime_callable(BoxedBool(False))
+
+        call = graph.boxed_runtime_callable()
+        self.assertIsNot(call, graph)
+        self.assertTrue(getattr(call, "_boxed_call", False))
+        self.assertEqual(call(["result"]), ["result"])
+        self.assertEqual(calls, ["fast"])
 
     @requires_cuda_and_triton
     @unittest.skipIf(not SM80OrLater, "Requires SM80+")

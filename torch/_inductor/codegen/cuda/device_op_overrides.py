@@ -27,6 +27,9 @@ class CUDADeviceOpOverrides(DeviceOpOverrides):
     def device_guard(self, device_idx: int) -> str:
         return f"torch.cuda._DeviceGuard({device_idx})"
 
+    def device_guard_sets_device(self) -> bool:
+        return True
+
     def current_stream(self) -> str:
         return "torch.cuda.current_stream()"
 

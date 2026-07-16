@@ -89,6 +89,7 @@ from .schemas import (
 )
 from .subclass_utils import compute_inner_mutated_inp_indices_from_subclass_meta
 from .utils import (
+    boxed_runtime_callable,
     contain_metadata_mutation_ops,
     get_default_generator,
     make_boxed_func,
@@ -564,8 +565,7 @@ def _aot_stage2c_make_inference_function(
     wrappers: list[CompilerWrapper],
     entry: GenericAOTAutogradResult[Any, Any] | None,
 ) -> DispatchReturn:
-    if entry is not None:
-        compiled_fw = SerializableCompiledFunction(compiled_fw, lambda: entry)
+    compiled_fw = boxed_runtime_callable(compiled_fw)
 
     disable_amp = torch._C._is_any_autocast_enabled()
     compiled_fn = RuntimeWrapper(
@@ -577,6 +577,9 @@ def _aot_stage2c_make_inference_function(
         aot_config,
         runtime_metadata=fw_metadata,
     )
+
+    if entry is not None:
+        compiled_fn = SerializableCompiledFunction(compiled_fn, lambda: entry)
 
     compiled_fn = post_compile(
         wrappers, compiled_fn, aot_config, runtime_metadata=fw_metadata
@@ -1995,6 +1998,7 @@ def _categorize_saved_tensors_for_backward(
 
     num_symints_saved_for_bw = 0
     num_opaque_objects_saved_for_bw = 0
+    saved_tensor_is_graph_input: list[bool] = []
     for idx, node in enumerate(fw_outs_saved_for_bw):
         if is_sym_node(node):
             num_symints_saved_for_bw += 1
@@ -2002,6 +2006,11 @@ def _categorize_saved_tensors_for_backward(
             num_opaque_objects_saved_for_bw += 1
         elif isinstance(node, torch.fx.Node) and "val" in getattr(node, "meta", {}):
             if isinstance(node.meta["val"], FakeTensor):
+                # If the saved_tensor is a view, a graph intermediate,
+                # and returned from the autograd.Function output, we need to
+                # detach() it to prevent a reference cycle. Record
+                # if the saved_tensor is a graph input here to help.
+                saved_tensor_is_graph_input.append(node.op == "placeholder")
                 # record dynamic tensor activations
                 dynamic_dims: set[int] = {
                     dim
@@ -2012,11 +2021,25 @@ def _categorize_saved_tensors_for_backward(
                     fw_metadata.dynamic_saved_tensors_idxs[idx] = dynamic_dims
             elif isinstance(node.meta["val"], (FakeScriptObject, OpaqueBase)):
                 num_opaque_objects_saved_for_bw += 1
+        else:
+            saved_tensor_is_graph_input.append(False)
 
     fw_metadata.num_symints_saved_for_bw = num_symints_saved_for_bw
     fw_metadata.num_opaque_objects_saved_for_bw = num_opaque_objects_saved_for_bw
+    num_tensors_saved_for_bw = (
+        num_fw_outs_saved_for_bw
+        - num_symints_saved_for_bw
+        - num_opaque_objects_saved_for_bw
+    )
+    if len(saved_tensor_is_graph_input) != num_tensors_saved_for_bw:
+        raise AssertionError(
+            "expected one saved_tensor_is_graph_input entry per saved tensor, "
+            f"got {len(saved_tensor_is_graph_input)} != {num_tensors_saved_for_bw}"
+        )
+    fw_metadata.saved_tensor_is_graph_input = saved_tensor_is_graph_input
     inner_meta.num_symints_saved_for_bw = num_symints_saved_for_bw
     inner_meta.num_opaque_objects_saved_for_bw = num_opaque_objects_saved_for_bw
+    inner_meta.saved_tensor_is_graph_input = saved_tensor_is_graph_input
 
     # See Note [Activations with no version counter checks in eager]
     # Count tensors saved with no version counter check.
@@ -2517,6 +2540,7 @@ def aot_stage2_autograd(
         entry,  # type: ignore[arg-type]
         _indices_of_inps_to_detach,
         num_symints_saved_for_bw,
+        num_fw_outs_saved_for_bw,
     )
 
 
@@ -2535,6 +2559,7 @@ def _aot_stage2c_make_autograd_function(
     entry: GenericAOTAutogradResult[Any, Any] | None,
     _indices_of_inps_to_detach: list[int],
     num_symints_saved_for_bw: int,
+    num_fw_outs_saved_for_bw: int,
 ) -> DispatchReturn:
     backward_state_indices = [
         idx for idx, x in enumerate(flat_args) if isinstance(x, BackwardState)
@@ -2550,6 +2575,7 @@ def _aot_stage2c_make_autograd_function(
         compiled_bw_func=compiled_bw_func,
         maybe_subclass_meta=maybe_subclass_meta,
         num_symints_saved_for_bw=num_symints_saved_for_bw,
+        num_fw_outs_saved_for_bw=num_fw_outs_saved_for_bw,
         backward_state_indices=backward_state_indices,
         disable_amp=disable_amp,
         indices_of_inps_to_detach=_indices_of_inps_to_detach,
@@ -2558,6 +2584,9 @@ def _aot_stage2c_make_autograd_function(
         aot_config=aot_config,
         fw_metadata=fw_metadata,
         try_save_cache_entry=try_save_cache_entry,
+    )
+    compile_spec.compiled_fw_func = boxed_runtime_callable(
+        compile_spec.compiled_fw_func
     )
     compiled_fn = AOTDispatchAutograd.post_compile(compile_spec)
 

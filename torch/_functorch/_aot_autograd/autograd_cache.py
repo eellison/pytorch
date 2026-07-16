@@ -817,12 +817,19 @@ def create_fx_config(
     if compiler_config_extra is None:
         cudagraphs = BoxedBool(torch._inductor.config.triton.cudagraphs)
         boxed_forward_device_index = None
+        pre_aot_input_idxs_to_check = None
     else:
         cudagraphs = compiler_config_extra.cudagraphs
         boxed_forward_device_index = compiler_config_extra.forward_device
+        pre_aot_input_idxs_to_check = (
+            None
+            if compiler_config_extra.pre_aot_input_idxs_to_check is None
+            else tuple(compiler_config_extra.pre_aot_input_idxs_to_check)
+        )
     return {
         "cudagraphs": cudagraphs,
         "boxed_forward_device_index": boxed_forward_device_index,
+        "pre_aot_input_idxs_to_check": pre_aot_input_idxs_to_check,
         "compile_region_name": compile_region_name,  # pyrefly: ignore[bad-typed-dict-key]
     }
 

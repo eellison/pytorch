@@ -20,6 +20,9 @@ class XPUDeviceOpOverrides(DeviceOpOverrides):
     def device_guard(self, device_idx: int) -> str:
         return f"torch.xpu._DeviceGuard({device_idx})"
 
+    def device_guard_sets_device(self) -> bool:
+        return True
+
     def current_stream(self) -> str:
         return "torch.xpu.current_stream()"
 

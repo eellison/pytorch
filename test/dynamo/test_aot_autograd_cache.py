@@ -509,6 +509,44 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
         self.assertEqual(counters["aot_autograd"]["autograd_cache_hit"], 1)
         self.assertEqual(counters["aot_autograd"]["autograd_cache_saved"], 1)
 
+    @inductor_config.patch(
+        {
+            "fx_graph_cache": True,
+            "fx_graph_remote_cache": False,
+            "triton.cudagraphs": False,
+            "wrap_inductor_compiled_regions": False,
+        }
+    )
+    @functorch_config.patch(
+        {"enable_autograd_cache": True, "bundled_autograd_cache": False}
+    )
+    def test_cache_hit_uses_boxed_runtime_callable(self):
+        from torch._inductor.output_code import CompiledFxGraph
+
+        def fn(x, y):
+            return (x.sin() + y.cos()) * 2
+
+        x = torch.randn(8, 8)
+        y = torch.randn(8, 8)
+        compiled_fn = torch.compile(fn, backend="inductor", fullgraph=True)
+
+        self.assertEqual(compiled_fn(x, y), fn(x, y))
+        self.assertEqual(counters["aot_autograd"]["autograd_cache_hit"], 0)
+
+        self._clear_dynamo_and_codecache()
+        counters.clear()
+
+        with patch.object(
+            CompiledFxGraph,
+            "__call__",
+            side_effect=AssertionError(
+                "AOT cache hit did not unwrap boxed_runtime_callable"
+            ),
+        ):
+            self.assertEqual(compiled_fn(x, y), fn(x, y))
+
+        self.assertEqual(counters["aot_autograd"]["autograd_cache_hit"], 1)
+
     @inductor_config.patch("fx_graph_remote_cache", False)
     @inductor_config.patch({"fx_graph_cache": True, "compile_threads": 1})
     @functorch_config.patch({"enable_autograd_cache": True})
@@ -4602,7 +4640,6 @@ class CacheKeyAPITests(torch._dynamo.test_case.TestCase):
         from torch._inductor.compile_fx import create_compiler_config_extra
         from torch._inductor.decomposition import select_decomp_table
 
-        compiler_config_extra = create_compiler_config_extra(fx_graph)
         decompositions = select_decomp_table()
 
         # Match the config patches that compile_fx applies during compilation
@@ -4614,6 +4651,9 @@ class CacheKeyAPITests(torch._dynamo.test_case.TestCase):
                 selective_decompose=inductor_config.selective_decompose,
             ),
         ):
+            compiler_config_extra = create_compiler_config_extra(
+                fx_graph, example_inputs, torch._guards.TracingContext.try_get()
+            )
             return aot_autograd.autograd_cache_key(
                 fx_graph,
                 example_inputs,

@@ -678,6 +678,10 @@ class CachingAutotuner(KernelInterface):
                 TritonBundler.put_static_autotuner(static_triton_bundle_key, self)
             self._make_launchers()
             self._dynamic_scale_rblock()
+            if len(self.launchers) == 1:
+                self._maybe_cache_runtime_launcher(
+                    self.launchers[0], before_first_launch=True
+                )
 
     def _precompile_worker(self):
         if self.compile_results:
@@ -977,6 +981,31 @@ class CachingAutotuner(KernelInterface):
                     f"No valid triton configs. {type(exc).__name__}: {exc}"
                 )
         self.launchers = launchers
+
+    def _set_triton_allocator(self) -> None:
+        if not hasattr(triton, "set_allocator"):
+            return
+
+        def alloc_fn(size: int, align: int, stream: int | None):
+            return torch.empty(size, dtype=torch.int8, device=self.device_props.type)
+
+        triton.set_allocator(alloc_fn)
+
+    def _maybe_cache_runtime_launcher(
+        self, launcher: LauncherType, *, before_first_launch: bool
+    ) -> None:
+        if (
+            self._cached_launcher is not None
+            or not self._cache_eligible
+            or len(self.launchers) != 1
+        ):
+            return
+        if before_first_launch:
+            if self._plugins or getattr(launcher, "store_cubin", False):
+                return
+            self._set_triton_allocator()
+            TritonBundler.put_winner(launcher.cache_hash)
+        self._cached_launcher = self._build_fast_launcher(launcher) or launcher
 
     def _prune_compile_results_to_launcher(self, launcher: LauncherType) -> None:
         if not self.compile_results:
@@ -2310,14 +2339,7 @@ class CachingAutotuner(KernelInterface):
                 kernel_name=self.fn.__name__, kwargs=kernel_kwargs
             )
 
-        if hasattr(triton, "set_allocator"):
-
-            def alloc_fn(size: int, align: int, stream: int | None):
-                return torch.empty(
-                    size, dtype=torch.int8, device=self.device_props.type
-                )
-
-            triton.set_allocator(alloc_fn)
+        self._set_triton_allocator()
 
         if self.triton_interpret:
             args, grid = self._interpret_args_grid(args, self.configs[0])
@@ -2380,6 +2402,17 @@ class CachingAutotuner(KernelInterface):
         # (this is an idempotent set-add). For single-config kernels that skip
         # autotuning entirely, this is the only call site that records the winner.
         TritonBundler.put_winner(launcher.cache_hash)
+        if (
+            not launcher.store_cubin
+            and not benchmark_run
+            and not kwargs
+            and not debug_mode
+            and not autograd_profiler._is_profiler_enabled
+        ):
+            self._maybe_cache_runtime_launcher(launcher, before_first_launch=False)
+            if (fast := self._cached_launcher) is not None:
+                return fast(*args, stream=stream)
+
         if launcher.store_cubin and (not benchmark_run or not self.cuda_kernel_saved):
             if self.device_props.type == "cpu":
                 if not self.cpu_kernel_saved:
@@ -2409,7 +2442,7 @@ class CachingAutotuner(KernelInterface):
             and not autograd_profiler._is_profiler_enabled
             and len(self.launchers) == 1
         ):
-            self._cached_launcher = self._build_fast_launcher(launcher) or launcher
+            self._maybe_cache_runtime_launcher(launcher, before_first_launch=False)
         return result
 
     def _check_launcher_call_args(

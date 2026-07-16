@@ -8734,6 +8734,16 @@ class Scheduler:
 
     def free_buffers(self) -> None:
         """Free any buffers that are no longer needed"""
+        if (
+            config.size_asserts
+            and V.graph.delay_input_asserts_after_first_use
+            and self.current_node is not None
+            and self.current_node.is_gpu()
+        ):
+            V.graph.wrapper_code.codegen_deferred_input_asserts(
+                dep.name for dep in self.current_node.read_writes.reads
+            )
+
         for name in sorted(
             self.buffer_names_to_free
             - V.graph.removed_buffers
@@ -9730,10 +9740,15 @@ class Scheduler:
 
             self.enter_context(node)
 
+            input_names = tuple(dep.name for dep in node.read_writes.reads)
+            delay_input_asserts = (
+                V.graph.delay_input_asserts_after_first_use and node.is_gpu()
+            )
+
             # pyrefly: ignore [unbound-name]
-            if config.size_asserts:
+            if config.size_asserts and not delay_input_asserts:
                 V.graph.wrapper_code.codegen_deferred_input_asserts(
-                    dep.name for dep in node.read_writes.reads
+                    input_names,
                 )
 
             if device := node.get_device():
@@ -9783,7 +9798,7 @@ class Scheduler:
             # TODO: inputs read on multiple streams should be copied in the
             # prologue instead, to avoid cross-stream races.
             V.graph.wrapper_code.codegen_deferred_alignment_copies(
-                dep.name for dep in node.read_writes.reads
+                input_names,
             )
 
             self.current_node = node

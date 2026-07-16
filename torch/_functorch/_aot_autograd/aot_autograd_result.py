@@ -50,7 +50,7 @@ from .runtime_wrappers import (
     SubclassMeta,
 )
 from .schemas import AOTAutogradCacheInfo, AOTConfig  # noqa: F401
-from .utils import simple_wraps
+from .utils import boxed_runtime_callable, simple_wraps
 
 
 if TYPE_CHECKING:
@@ -488,6 +488,7 @@ class GenericAOTAutogradResult(Generic[TForward, TBackward]):
             compiled_fw_func = self.compiled_fw.post_compile(
                 compiled_fw_func, fw_fx_config
             )
+            compiled_fw_func = boxed_runtime_callable(compiled_fw_func)
             compiled_bw_func = self.compiled_bw.post_compile(
                 compiled_bw_func, bw_fx_config
             )
@@ -505,6 +506,7 @@ class GenericAOTAutogradResult(Generic[TForward, TBackward]):
         compiled_fw_func = self.compiled_fw.post_compile(
             compiled_fw_func, inference_fx_config
         )
+        compiled_fw_func = boxed_runtime_callable(compiled_fw_func)
         return compiled_fw_func, None, needs_autograd
 
     def _apply_runtime_wrappers(
@@ -544,6 +546,10 @@ class GenericAOTAutogradResult(Generic[TForward, TBackward]):
         if needs_autograd:
             if self.compiled_bw is None:
                 raise AssertionError("compiled_bw must not be None when needs_autograd")
+            if self.num_fw_outs_saved_for_bw is None:
+                raise AssertionError(
+                    "num_fw_outs_saved_for_bw must not be None when needs_autograd"
+                )
 
             cached_lazy_backward = None
             if self.serialized_bw_module is not None:
@@ -560,6 +566,7 @@ class GenericAOTAutogradResult(Generic[TForward, TBackward]):
                 compiled_bw_func=compiled_bw_func,
                 maybe_subclass_meta=self.maybe_subclass_meta,
                 num_symints_saved_for_bw=self.compiled_bw.num_symints_saved_for_bw_,
+                num_fw_outs_saved_for_bw=self.num_fw_outs_saved_for_bw,
                 backward_state_indices=self.compiled_bw.backward_state_indices,
                 disable_amp=disable_amp,
                 indices_of_inps_to_detach=self.indices_of_inps_to_detach,

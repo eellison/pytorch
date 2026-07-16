@@ -331,6 +331,9 @@ class DeviceOpOverrides:
     def device_guard(self, device_idx: int) -> str:
         raise NotImplementedError
 
+    def device_guard_sets_device(self) -> bool:
+        return False
+
     def current_stream(self) -> str:
         raise NotImplementedError
 

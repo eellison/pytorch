@@ -15587,7 +15587,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @requires_gpu()
     @skip_if_not_triton
-    def test_input_asserts_deferred_to_first_use(self):
+    def test_input_asserts_elided_for_aot_inputs(self):
         def fn(x, y, z):
             a = torch.mm(x, y)
             b = torch.mm(a, z)
@@ -15598,16 +15598,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         z = torch.randn(64, 8, device=self.device)
 
         _, code = run_and_get_code(torch.compile(fn), x, y, z)
-        # z's assert should appear after the first mm, not at the top
-        # with all the other asserts
-        if config.cpp_wrapper:
-            FileCheck().check("inductor_entry_impl").check_count(
-                "assert_size_stride", 2, exactly=True
-            ).check("mm_out").run(code[0])
-        else:
-            FileCheck().check("def call").check_count(
-                "assert_size_stride", 2, exactly=True
-            ).check("extern_kernels.mm(").run(code[0])
+        # AOTAutograd/Dynamo guarded graph inputs before entering the wrapper,
+        # so Inductor does not need redundant input size/stride asserts.
+        self.assertNotIn("assert_size_stride(", code[0])
 
     @requires_gpu()
     @skip_if_not_triton
@@ -15615,7 +15608,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         config.cpp_wrapper,
         "Deferred alignment copies are not generated for cpp_wrapper",
     )
-    def test_alignment_copy_deferred_to_first_use(self):
+    def test_alignment_copy_deferred_to_first_use_for_view_input(self):
         def fn(x, y, z):
             a = torch.mm(x, y)
             b = torch.mm(a, z)
@@ -15623,8 +15616,8 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
         x = torch.randn(16, 32, device=self.device)
         y = torch.randn(32, 64, device=self.device)
-
-        z = torch.randn(64, 8, device=self.device)
+        z_base = torch.randn(64, 8, device=self.device)
+        z = z_base[:, :]
 
         _, code = run_and_get_code(torch.compile(fn), x, y, z)
         # z's alignment check should appear between the two mm calls:
@@ -15632,6 +15625,51 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         FileCheck().check("extern_kernels.mm(").check("copy_if_misaligned").check(
             "extern_kernels.mm("
         ).run(code[0])
+
+    @requires_gpu()
+    @skip_if_not_triton
+    @unittest.skipIf(
+        config.cpp_wrapper,
+        "Deferred alignment copies are not generated for cpp_wrapper",
+    )
+    def test_alignment_copy_not_emitted_for_non_view_input(self):
+        def fn(x, y, z):
+            a = torch.mm(x, y)
+            b = torch.mm(a, z)
+            return b
+
+        x = torch.randn(16, 32, device=self.device)
+        y = torch.randn(32, 64, device=self.device)
+        z = torch.randn(64, 8, device=self.device)
+
+        _, code = run_and_get_code(torch.compile(fn), x, y, z)
+        self.assertNotIn("copy_if_misaligned", code[0])
+
+    @requires_gpu()
+    @skip_if_not_triton
+    @config.patch(assume_aligned_inputs=False)
+    @unittest.skipIf(
+        config.cpp_wrapper,
+        "Deferred alignment copies are not generated for cpp_wrapper",
+    )
+    def test_alignment_guard_recompiles_non_view_to_view(self):
+        failed_guards = []
+
+        def fail(guard):
+            failed_guards.append(str(guard))
+
+        def fn(x):
+            return x.sin() + x.cos()
+
+        x = torch.randn(64, 64, device=self.device)
+        base = torch.randn(64 * 64 + 64, device=self.device)
+        y = torch.as_strided(base, (64, 64), (64, 1), 1)
+
+        torch._dynamo.reset()
+        opt_fn = torch._dynamo.optimize("inductor", guard_fail_fn=fail)(fn)
+        self.assertEqual(opt_fn(x), fn(x))
+        self.assertEqual(opt_fn(y), fn(y))
+        self.assertTrue(any("storage_offset" in guard for guard in failed_guards))
 
     @requires_gpu()
     @skip_if_not_triton
@@ -15646,6 +15684,22 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         _, code = run_and_get_code(torch.compile(fn), x, y)
         # cpp_wrapper should NOT contain Python-syntax alignment copies
         self.assertNotIn("copy_if_misaligned", code[0])
+
+    @requires_gpu()
+    @skip_if_not_triton
+    @unittest.skipIf(
+        config.cpp_wrapper, "batched CUDA allocation is Python wrapper only"
+    )
+    def test_adjacent_cuda_allocations_batched(self):
+        def fn(x):
+            return x.sin(), x.cos()
+
+        x = torch.randn(1024, device=self.device)
+        _, code = run_and_get_code(torch.compile(fn, fullgraph=True), x)
+
+        FileCheck().check("def call").check(
+            "buf0, buf1 = empty_strided_cuda_many"
+        ).check_not("empty_strided_cuda(").check("triton_").run(code[0])
 
     def test_copy_if_misaligned_returns_same_tensor_when_aligned(self):
         import weakref
@@ -20359,6 +20413,15 @@ if RUN_GPU:
                 FileCheck().check_count(
                     "AOTICudaGuard device_guard(0)", 1, exactly=True
                 ).run(code)
+            elif GPU_TYPE == "cuda":
+                FileCheck().check_count(
+                    "prev_device0, raw_stream0 = enter_cuda_device(0)",
+                    1,
+                    exactly=True,
+                ).check_count(
+                    "maybe_exchange_device(prev_device0)", 1, exactly=True
+                ).run(code)
+                self.assertNotIn(f"with torch.{GPU_TYPE}._DeviceGuard(0)", code)
             else:
                 FileCheck().check_count(
                     f"with torch.{GPU_TYPE}._DeviceGuard(0)", 1, exactly=True

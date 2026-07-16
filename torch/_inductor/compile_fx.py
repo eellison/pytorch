@@ -769,6 +769,8 @@ def with_fresh_cache_if_config() -> Generator[None, None, None]:
 class _CompileFxKwargs(TypedDict, total=False):
     cudagraphs: BoxedBool | None
     static_input_idxs: Sequence[int]
+    pre_aot_input_idxs: Sequence[int] | None
+    pre_aot_input_idxs_to_check: Sequence[int] | None
     is_backward: bool
     graph_id: int | None
     cpp_wrapper: bool
@@ -799,6 +801,8 @@ def compile_fx_inner(
 ) -> OutputCode:
     kwargs.setdefault("cudagraphs", None)
     kwargs.setdefault("static_input_idxs", ())
+    kwargs.setdefault("pre_aot_input_idxs", None)
+    kwargs.setdefault("pre_aot_input_idxs_to_check", None)
     kwargs.setdefault("is_backward", False)
     kwargs.setdefault("graph_id", None)
     kwargs.setdefault("cpp_wrapper", False)
@@ -908,7 +912,12 @@ def _compile_fx_inner(
 
     static_input_idxs: Sequence[int] = graph_kwargs.setdefault("static_input_idxs", ())
     static_inputs_log.debug("static input idxs compile_fx_inner: %s", static_input_idxs)
-    inputs_to_check = get_input_idxs_to_check(example_inputs, static_input_idxs)
+    inputs_to_check = get_input_idxs_to_check(
+        example_inputs,
+        static_input_idxs,
+        graph_kwargs.get("pre_aot_input_idxs"),
+        graph_kwargs.get("pre_aot_input_idxs_to_check"),
+    )
 
     if not isinstance(next(iter(reversed(gm.graph.nodes))).args[0], (tuple, list)):
         raise AssertionError(
@@ -1554,6 +1563,7 @@ class _InProcessFxCompile(FxCompile):
                     ),
                     const_module=const_graph,
                     inputs_to_check=inputs_to_check,
+                    skip_input_assert_idxs=graph_kwargs.get("pre_aot_input_idxs"),
                     fx_wrapper=fx_wrapper,
                     get_decomp_fn=get_decomp_fn,
                 )
@@ -1911,15 +1921,82 @@ def fx_codegen_and_compile(
     return scheme.codegen_and_compile(gm, example_inputs, inputs_to_check, graph_kwargs)
 
 
+def _can_guard_storage_offset(input: torch.Tensor) -> bool:
+    if input._is_view():
+        return False
+    if isinstance(input.storage_offset(), torch.SymInt):
+        return False
+    return tensor_is_aligned(input)
+
+
+def _placeholder_sources(gm: GraphModule | GmWrapper) -> list[Any]:
+    if not isinstance(gm, GraphModule):
+        return []
+    return [
+        getattr(node, "_dynamo_source", None)
+        for node in gm.graph.find_nodes(op="placeholder")
+    ]
+
+
+def _try_install_storage_offset_guard(
+    source: Any,
+    tracing_context: torch._guards.TracingContext | None,
+) -> bool:
+    if source is None or tracing_context is None:
+        return False
+
+    from torch._dynamo.guards import GuardBuilder
+    from torch._dynamo.source import TensorProperty, TensorPropertySource
+
+    guard = TensorPropertySource(source, TensorProperty.STORAGE_OFFSET).make_guard(
+        GuardBuilder.CONSTANT_MATCH
+    )
+    tracing_context.guards_context.dynamo_guards.add(guard, skip=1)
+    return True
+
+
+def _get_pre_aot_input_idxs_to_check(
+    gm: GraphModule | GmWrapper,
+    inputs: Sequence[InputType],
+    tracing_context: torch._guards.TracingContext | None,
+) -> Sequence[int]:
+    ids_to_check = []
+    sources = _placeholder_sources(gm)
+
+    for i, input in enumerate(inputs):
+        if not isinstance(input, torch.Tensor):
+            continue
+        if not is_gpu(input.device.type):
+            continue
+        with maybe_get_suppress_shape_guards_ctx():
+            if _can_guard_storage_offset(input):
+                source = sources[i] if i < len(sources) else None
+                if _try_install_storage_offset_guard(source, tracing_context):
+                    continue
+        ids_to_check.append(i)
+
+    return ids_to_check
+
+
 def get_input_idxs_to_check(
     inputs: Sequence[InputType],
     static_input_idxs: Sequence[int],
+    pre_aot_input_idxs: Sequence[int] | None = None,
+    pre_aot_input_idxs_to_check: Sequence[int] | None = None,
 ) -> Sequence[int]:
     """
     This function runs at compile time, and generates a list of indices for which we
     might need to do a copy to preserve alignment requirements.
     """
     ids_to_check = []
+    pre_aot_input_idxs = (
+        None if pre_aot_input_idxs is None else OrderedSet(pre_aot_input_idxs)
+    )
+    pre_aot_input_idxs_to_check = (
+        None
+        if pre_aot_input_idxs_to_check is None
+        else OrderedSet(pre_aot_input_idxs_to_check)
+    )
 
     for i, input in enumerate(inputs):
         if not isinstance(input, torch.Tensor):
@@ -1933,7 +2010,19 @@ def get_input_idxs_to_check(
             # do not add guards on input's storage offset
             if i in static_input_idxs and tensor_is_aligned(input):
                 continue
+            if (
+                pre_aot_input_idxs_to_check is not None
+                and i in pre_aot_input_idxs_to_check
+            ):
+                ids_to_check.append(i)
+                continue
             if not should_assume_input_aligned(input):
+                continue
+            if pre_aot_input_idxs_to_check is not None:
+                if pre_aot_input_idxs is None or i not in pre_aot_input_idxs:
+                    ids_to_check.append(i)
+                elif not _can_guard_storage_offset(input):
+                    ids_to_check.append(i)
                 continue
 
         # if we get here, then
@@ -2461,11 +2550,14 @@ class CompilerConfigExtra:
     graph_id: int
     forward_device: BoxedDeviceIndex
     forward_is_partitioned: BoxedBool
+    pre_aot_input_idxs_to_check: Sequence[int] | None = None
     cudagraphs_bwd_override: bool | None = None
 
 
 def create_compiler_config_extra(
     gm: GraphModule | GmWrapper,
+    example_inputs: Sequence[InputType] | None = None,
+    tracing_context: torch._guards.TracingContext | None = None,
 ) -> CompilerConfigExtra:
     gm_meta = gm.meta if isinstance(gm, GraphModule) else None
 
@@ -2517,10 +2609,17 @@ def create_compiler_config_extra(
     # to have fixed addresses.
     forward_is_partitioned = BoxedBool(False)
 
+    pre_aot_input_idxs_to_check = (
+        _get_pre_aot_input_idxs_to_check(gm, example_inputs, tracing_context)
+        if example_inputs is not None
+        else None
+    )
+
     return CompilerConfigExtra(
         cudagraphs=cudagraphs,
         graph_id=graph_id,
         forward_device=forward_device,
+        pre_aot_input_idxs_to_check=pre_aot_input_idxs_to_check,
         cudagraphs_bwd_override=cudagraphs_bwd_override,
         forward_is_partitioned=forward_is_partitioned,
     )
@@ -2646,11 +2745,27 @@ def compile_fx_forward(
     # original strides
     _recursive_record_user_visible_output_idxs(gm)
 
+    pre_aot_input_idxs_to_check = compiler_config_extra.pre_aot_input_idxs_to_check
+    pre_aot_input_idxs = None
+    if pre_aot_input_idxs_to_check is not None:
+        pre_aot_input_idxs = [
+            fixed + idx
+            for idx in range(num_example_inputs)
+            if fixed + idx < len(example_inputs)
+        ]
+        pre_aot_input_idxs_to_check = [
+            fixed + idx
+            for idx in pre_aot_input_idxs_to_check
+            if fixed + idx < len(example_inputs)
+        ]
+
     with cudagraph_annotation_context(compiler_config_extra.cudagraphs):
         result = inner_compile(
             gm,
             example_inputs,
             static_input_idxs=get_static_input_idxs(fixed),
+            pre_aot_input_idxs=pre_aot_input_idxs,
+            pre_aot_input_idxs_to_check=pre_aot_input_idxs_to_check,
             cudagraphs=compiler_config_extra.cudagraphs,
             graph_id=compiler_config_extra.graph_id,
             is_inference=is_inference,
@@ -3023,7 +3138,17 @@ def _compile_fx_main(
 
         num_example_inputs = len(example_inputs_)
 
-        compiler_config_extra = create_compiler_config_extra(model_)
+        fake_mode = detect_fake_mode(
+            example_inputs_
+        ) or torch._subclasses.FakeTensorMode(allow_non_fake_inputs=True)
+        tracing_context = (
+            torch._guards.TracingContext.try_get()
+            or torch._guards.TracingContext(fake_mode)
+        )
+
+        compiler_config_extra = create_compiler_config_extra(
+            model_, example_inputs_, tracing_context
+        )
 
         decompositions = get_decomp_fn()
         inner_compile = functools.partial(inner_compile, get_decomp_fn=get_decomp_fn)
@@ -3084,14 +3209,6 @@ def _compile_fx_main(
                 )
 
         bw_compiler = SerializableAOTDispatchCompiler(OutputCode, bw_compiler)
-
-        fake_mode = detect_fake_mode(
-            example_inputs_
-        ) or torch._subclasses.FakeTensorMode(allow_non_fake_inputs=True)
-        tracing_context = (
-            torch._guards.TracingContext.try_get()
-            or torch._guards.TracingContext(fake_mode)
-        )
 
         if V.aot_compilation and not config.enable_autograd_for_aot:
             from .utils import is_valid_aoti_model_name
@@ -3408,8 +3525,6 @@ def autograd_cache_key(
             "autograd_cache_key does not support nested container inputs"
         )
 
-    compiler_config_extra = create_compiler_config_extra(graph)
-
     # These context managers replicate the ones that _compile_fx_main sets up
     # before calling aot_autograd, so that the config snapshot captured by
     # autograd_cache_key is identical to a real compile_fx run:
@@ -3426,6 +3541,9 @@ def autograd_cache_key(
     tracing_context = (
         torch._guards.TracingContext.try_get()
         or torch._guards.TracingContext(fake_mode)
+    )
+    compiler_config_extra = create_compiler_config_extra(
+        graph, example_inputs, tracing_context
     )
 
     with (

@@ -641,7 +641,8 @@ class EnterDeviceContextManagerLine(WrapperLine):
             # integers
             code.writeline(f"with {V.graph.device_ops.device_guard(self.device_idx)}:")
             code.do_indent()
-            code.writeline(V.graph.device_ops.set_device(self.device_idx))
+            if not V.graph.device_ops.device_guard_sets_device():
+                code.writeline(V.graph.device_ops.set_device(self.device_idx))
 
     def codegen_fx(self, converter: FxConverter) -> FxConversionFunc:
         return converter._generate_enter_device_context_manager
@@ -654,6 +655,45 @@ class ExitDeviceContextManagerLine(WrapperLine):
 
     def codegen_fx(self, converter: FxConverter) -> FxConversionFunc:
         return converter._generate_exit_device_context_manager
+
+
+@dataclasses.dataclass
+class EnterFastCudaDeviceContextManagerLine(WrapperLine):
+    wrapper: PythonWrapperCodegen
+    device_idx: int
+    prev_device_var: str
+
+    def codegen(self, code: IndentedBuffer) -> None:
+        active = self.wrapper._raw_streams_from_fast_device_guard
+        active[self.device_idx] = active.get(self.device_idx, 0) + 1
+        self.wrapper.write_get_raw_stream.cache_clear()  # type: ignore[attr-defined]
+        raw_stream = get_raw_stream_name(self.device_idx)
+        code.writeline(
+            f"{self.prev_device_var}, {raw_stream} = enter_cuda_device({self.device_idx})"
+        )
+        code.writeline("try:")
+        code.do_indent()
+
+
+@dataclasses.dataclass
+class ExitFastCudaDeviceContextManagerLine(WrapperLine):
+    wrapper: PythonWrapperCodegen
+    device_idx: int
+    prev_device_var: str
+
+    def codegen(self, code: IndentedBuffer) -> None:
+        code.do_unindent()
+        code.writeline("finally:")
+        code.do_indent()
+        code.writeline(f"maybe_exchange_device({self.prev_device_var})")
+        code.do_unindent()
+        active = self.wrapper._raw_streams_from_fast_device_guard
+        depth = active.get(self.device_idx, 0)
+        if depth <= 1:
+            active.pop(self.device_idx, None)
+        else:
+            active[self.device_idx] = depth - 1
+        self.wrapper.write_get_raw_stream.cache_clear()  # type: ignore[attr-defined]
 
 
 @dataclasses.dataclass
@@ -1372,6 +1412,8 @@ class PythonWrapperCodegen(CodeGen):
         self.move_begin = "std::move(" if V.graph.cpp_wrapper else ""
         self.move_end = ")" if V.graph.cpp_wrapper else ""
         self.last_seen_device_guard_index: int | None = None
+        self._fast_cuda_device_guard_stack: list[tuple[bool, int, str | None]] = []
+        self._raw_streams_from_fast_device_guard: dict[int, int] = {}
         self.supports_intermediate_hooks = True
         self.user_defined_kernel_cache: dict[
             tuple[Any, ...], tuple[str, Any, dict[str, Any]]
@@ -1508,6 +1550,9 @@ class PythonWrapperCodegen(CodeGen):
                 empty_strided_cpu = torch._C._dynamo.guards._empty_strided_cpu
                 empty_strided_cpu_pinned = torch._C._dynamo.guards._empty_strided_cpu_pinned
                 empty_strided_cuda = torch._C._dynamo.guards._empty_strided_cuda
+                empty_strided_cuda_many = torch._C._dynamo.guards._empty_strided_cuda_many
+                enter_cuda_device = torch._C._dynamo.guards._cuda_enter_device_get_raw_stream
+                maybe_exchange_device = torch._C._dynamo.guards._cuda_maybe_exchange_device
                 empty_strided_xpu = torch._C._dynamo.guards._empty_strided_xpu
                 empty_strided_mtia = torch._C._dynamo.guards._empty_strided_mtia
                 reinterpret_tensor = torch._C._dynamo.guards._reinterpret_tensor
@@ -1689,6 +1734,8 @@ class PythonWrapperCodegen(CodeGen):
 
             # a graph partition may take an IRNode output from a previous partition
             if name not in V.graph.graph_input_names:
+                continue
+            if V.graph.graph_input_names.index(name) in V.graph.skip_input_assert_idxs:
                 continue
 
             # comparing strides for 0 size tensor is tricky. Ignore them for now.
@@ -1875,8 +1922,10 @@ class PythonWrapperCodegen(CodeGen):
     # that stream caching happens per graph instance. this
     # is important for nested subgraph codegening.
     def write_get_raw_stream(self, device_idx: int, graph_name: str) -> str:
-        self.write_get_raw_stream_header()
         name = get_raw_stream_name(device_idx)
+        if device_idx in self._raw_streams_from_fast_device_guard:
+            return name
+        self.write_get_raw_stream_header()
         if config.triton.autotune_at_compile_time:
             self.kernel_autotune_calls.writeline(
                 f"{name} = get_raw_stream({device_idx})"
@@ -1913,6 +1962,15 @@ class PythonWrapperCodegen(CodeGen):
         num_streams: int = 1,
         stream_idx_to_user_obj_idx: dict[int, int] | None = None,
     ) -> None:
+        use_fast_cuda_device_guard = self._use_fast_cuda_device_guard(num_streams)
+        prev_device_var = (
+            f"prev_device{len(self._fast_cuda_device_guard_stack)}"
+            if use_fast_cuda_device_guard
+            else None
+        )
+        self._fast_cuda_device_guard_stack.append(
+            (use_fast_cuda_device_guard, device_idx, prev_device_var)
+        )
         if num_streams > 1:
             if stream_idx_to_user_obj_idx is None:
                 raise AssertionError("expected stream_idx_to_user_obj_idx to be set")
@@ -1929,6 +1987,12 @@ class PythonWrapperCodegen(CodeGen):
                     num_streams,
                     stream_idx_to_user_obj_idx,
                 ),
+            )
+        elif use_fast_cuda_device_guard:
+            if prev_device_var is None:
+                raise AssertionError("expected prev_device_var to be set")
+            self.writeline(
+                EnterFastCudaDeviceContextManagerLine(self, device_idx, prev_device_var)
             )
         else:
             self.writeline(
@@ -1953,7 +2017,18 @@ class PythonWrapperCodegen(CodeGen):
         self._num_streams: int = num_streams
 
     def codegen_device_guard_exit(self) -> None:
-        if hasattr(self, "_num_streams") and self._num_streams > 1:
+        use_fast_cuda_device_guard, device_idx, prev_device_var = (
+            self._fast_cuda_device_guard_stack.pop()
+            if self._fast_cuda_device_guard_stack
+            else (False, -1, None)
+        )
+        if use_fast_cuda_device_guard:
+            if prev_device_var is None:
+                raise AssertionError("expected prev_device_var to be set")
+            self.writeline(
+                ExitFastCudaDeviceContextManagerLine(self, device_idx, prev_device_var)
+            )
+        elif hasattr(self, "_num_streams") and self._num_streams > 1:
             self.writeline(
                 ExitDeviceContextManagerWithStreamInfoLine(self._num_streams)
             )
@@ -1961,6 +2036,18 @@ class PythonWrapperCodegen(CodeGen):
             self.writeline(ExitDeviceContextManagerLine())
         if config.triton.autotune_at_compile_time:
             self.kernel_autotune_calls.do_unindent()
+
+    def _use_fast_cuda_device_guard(self, num_streams: int) -> bool:
+        return (
+            num_streams == 1
+            and not V.graph.cpp_wrapper
+            and not V.graph.fx_wrapper
+            and not V.graph.aot_mode
+            and not config.triton.autotune_at_compile_time
+            and V.graph.device_type == "cuda"
+            and V.graph.device_ops.device_guard_sets_device()
+            and not is_codegen_graph_partition_subgraph(self)
+        )
 
     def codegen_cuda_stream_enter(
         self,
@@ -2300,12 +2387,39 @@ class PythonWrapperCodegen(CodeGen):
             # At this point, we shouldn't generate any new memory planning lines.
             # Override writeline to point at the wrapper call, in case it gets called.
             with self.set_writeline(self.wrapper_call, self.wrapper_call.writeline):
-                for line in self.lines:
+                i = 0
+                while i < len(self.lines):
+                    line = self.lines[i]
+                    if isinstance(line, AllocateLine) and self._can_batch_cuda_alloc(
+                        line
+                    ):
+                        group = [line]
+                        contexts = []
+                        j = i + 1
+                        while j < len(self.lines):
+                            next_line = self.lines[j]
+                            if isinstance(next_line, LineContext):
+                                contexts.append(next_line)
+                                j += 1
+                                continue
+                            if not isinstance(next_line, AllocateLine):
+                                break
+                            if not self._can_batch_cuda_alloc(next_line, group[0]):
+                                break
+                            group.append(next_line)
+                            j += 1
+                        if len(group) > 1:
+                            for context in contexts:
+                                self.writeline(context)
+                            self.codegen_batched_cuda_allocations(group)
+                            i = j
+                            continue
                     if isinstance(line, WrapperLine):
                         # pyrefly: ignore [missing-attribute]
                         line.codegen(self.wrapper_call)
                     else:
                         self.wrapper_call.writeline(line)
+                    i += 1
 
             self._write_multi_kernel_defs()
 
@@ -4006,6 +4120,46 @@ class PythonWrapperCodegen(CodeGen):
             # need an extra as_strided call
             out = out + f".as_strided({codegen_shape_tuple}, {codegen_stride_tuple})"
         return out
+
+    def _can_batch_cuda_alloc(
+        self, line: AllocateLine, first: AllocateLine | None = None
+    ) -> bool:
+        if line.comm_buffer or config.test_configs.track_memory_lifecycle:
+            return False
+        node = line.node
+        if node.get_name() in V.graph.removed_buffers:
+            return False
+        device = node.get_device()
+        if device is None or device.type != "cuda":
+            return False
+        if first is not None and device != first.node.get_device():
+            return False
+        if node.get_is_pinned():
+            return False
+        shape = tuple(node.get_size())
+        allocation_shape = tuple(V.graph.get_allocation_size(node))
+        if self.codegen_python_shape_tuple(shape) != self.codegen_python_shape_tuple(
+            allocation_shape
+        ):
+            return False
+        return True
+
+    def codegen_batched_cuda_allocations(self, lines: list[AllocateLine]) -> None:
+        names = []
+        specs = []
+        for line in lines:
+            node = line.node
+            shape = tuple(node.get_size())
+            stride = tuple(node.get_stride())
+            names.append(node.get_name())
+            specs.append(
+                f"({self.codegen_python_shape_tuple(shape)}, "
+                f"{self.codegen_python_shape_tuple(stride)}, "
+                f"{node.get_dtype()})"
+            )
+        self.writeline(
+            f"{', '.join(names)} = empty_strided_cuda_many(({', '.join(specs)}))"
+        )
 
     def make_comment(self, line):
         self.writeline(CommentLine(line))

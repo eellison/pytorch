@@ -116,6 +116,16 @@ def make_boxed_func(f: Callable[..., Any]) -> Callable[[list[Any]], Any]:
     return g
 
 
+def boxed_runtime_callable(f: Callable[..., Any]) -> Callable[..., Any]:
+    get_boxed_runtime_callable = getattr(f, "boxed_runtime_callable", None)
+    if get_boxed_runtime_callable is None:
+        return f
+    runtime_callable = get_boxed_runtime_callable()
+    if not getattr(runtime_callable, "_boxed_call", False):
+        raise AssertionError("boxed_runtime_callable must return a boxed callable")
+    return runtime_callable
+
+
 def make_boxed_compiler(
     compiler: Callable[..., Any],
 ) -> Callable[..., Any]:
