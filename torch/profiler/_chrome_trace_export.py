@@ -12,9 +12,13 @@ import gzip
 import json
 import os
 import time as _time
-from typing import IO
+from typing import Any, IO, TYPE_CHECKING
 
 import torch
+
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 
 _TRIMONTH_SECONDS = 7889238
@@ -58,19 +62,44 @@ def _json_escape(s: str) -> str:
 
 
 def _write_metadata_event(
-    f: IO[str], name: str, ts: str, pid, tid, arg_key: str, arg_value: str
+    f: IO[str],
+    name: str,
+    ts: str,
+    pid,
+    tid,
+    arg_key: str,
+    arg_value: str,
+    event_callback: Callable[[dict[str, Any]], None] | None,
 ):
-    f.write(
+    _write_event(
+        f,
         f'{{"ph":"M","name":"{name}","ts":{ts},'
         f'"pid":{pid},"tid":{tid},'
-        f'"args":{{"{arg_key}":{arg_value}}}}},\n'
+        f'"args":{{"{arg_key}":{arg_value}}}}}',
+        event_callback,
     )
+
+
+def _write_event(
+    f: IO[str],
+    event_json: str,
+    event_callback: Callable[[dict[str, Any]], None] | None,
+    *,
+    trailing_comma: bool = True,
+) -> None:
+    if event_callback is not None:
+        event = json.loads(event_json)
+        event_callback(event)
+        event_json = json.dumps(event, separators=(",", ":"))
+    f.write(event_json)
+    f.write(",\n" if trailing_comma else "\n")
 
 
 def export_chrome_trace(
     kineto_results,
     path: str,
     metadata: dict[str, str] | None = None,
+    event_callback: Callable[[dict[str, Any]], None] | None = None,
 ):
     """Export chrome trace from ITraceActivity objects, streaming to disk.
 
@@ -141,9 +170,25 @@ def export_chrome_trace(
                 label = f"GPU {did}"
                 sort_idx = 5000000 + did
 
-            _write_metadata_event(f, "process_name", ts_str, did, 0, "name", '"python"')
             _write_metadata_event(
-                f, "process_labels", ts_str, did, 0, "labels", f'"{label}"'
+                f,
+                "process_name",
+                ts_str,
+                did,
+                0,
+                "name",
+                '"python"',
+                event_callback,
+            )
+            _write_metadata_event(
+                f,
+                "process_labels",
+                ts_str,
+                did,
+                0,
+                "labels",
+                f'"{label}"',
+                event_callback,
             )
             _write_metadata_event(
                 f,
@@ -153,6 +198,7 @@ def export_chrome_trace(
                 0,
                 "sort_index",
                 str(sort_idx),
+                event_callback,
             )
 
         for (did, rid), ts in sorted(seen_resources.items()):
@@ -162,10 +208,24 @@ def export_chrome_trace(
             else:
                 rname = f"stream {rid} "
             _write_metadata_event(
-                f, "thread_name", ts_str, did, rid, "name", f'"{rname}"'
+                f,
+                "thread_name",
+                ts_str,
+                did,
+                rid,
+                "name",
+                f'"{rname}"',
+                event_callback,
             )
             _write_metadata_event(
-                f, "thread_sort_index", ts_str, did, rid, "sort_index", str(rid)
+                f,
+                "thread_sort_index",
+                ts_str,
+                did,
+                rid,
+                "sort_index",
+                str(rid),
+                event_callback,
             )
 
         for act in activities:
@@ -199,39 +259,45 @@ def export_chrome_trace(
                     if linked_md:
                         args_parts.append(linked_md)
 
-            f.write(
+            event_json = (
                 f'{{"ph":"X","cat":{_json_escape(cat)},'
                 f'"name":{_json_escape(name)},'
                 f'"pid":{did},"tid":{rid},'
                 f'"ts":{ts_str},"dur":{dur_str}'
             )
             if args_parts:
-                f.write(f',"args":{{{",".join(args_parts)}}}')
-            f.write("},\n")
+                event_json += f',"args":{{{",".join(args_parts)}}}'
+            _write_event(f, event_json + "}", event_callback)
 
             flow_id = act.flow_id()
             if flow_id > 0:
                 flow_cat = _FLOW_NAMES.get(act.flow_type(), "ac2g")
                 if act.flow_start():
-                    f.write(
+                    _write_event(
+                        f,
                         f'{{"ph":"s","id":{flow_id},'
                         f'"pid":{did},"tid":{rid},'
-                        f'"ts":{ts_str},"cat":"{flow_cat}","name":"{flow_cat}"}},\n'
+                        f'"ts":{ts_str},"cat":"{flow_cat}","name":"{flow_cat}"}}',
+                        event_callback,
                     )
                 else:
-                    f.write(
+                    _write_event(
+                        f,
                         f'{{"ph":"f","id":{flow_id},'
                         f'"pid":{did},"tid":{rid},'
-                        f'"ts":{ts_str},"cat":"{flow_cat}","name":"{flow_cat}","bp":"e"}},\n'
+                        f'"ts":{ts_str},"cat":"{flow_cat}","name":"{flow_cat}","bp":"e"}}',
+                        event_callback,
                     )
 
         if activities:
             its = _rel(min_ts)
             trace_dur = _ns_to_us(max(max_end_ts - min_ts, 0))
-            f.write(
+            _write_event(
+                f,
                 f'{{"ph":"X","cat":"Trace","name":"PyTorch Profiler (0)",'
                 f'"pid":"Spans","tid":"PyTorch Profiler",'
-                f'"ts":{its},"dur":{trace_dur},"args":{{"Op count": 0}}}},\n'
+                f'"ts":{its},"dur":{trace_dur},"args":{{"Op count": 0}}}}',
+                event_callback,
             )
             _write_metadata_event(
                 f,
@@ -241,16 +307,22 @@ def export_chrome_trace(
                 0,
                 "sort_index",
                 str(0x20000000),
+                event_callback,
             )
-            f.write(
+            _write_event(
+                f,
                 f'{{"ph":"i","s":"g","name":"Iteration Start: PyTorch Profiler",'
-                f'"pid":"Traces","tid":"Trace PyTorch Profiler","ts":{its}}},\n'
+                f'"pid":"Traces","tid":"Trace PyTorch Profiler","ts":{its}}}',
+                event_callback,
             )
 
         end_ts = _rel(max_end_ts + 1000)
-        f.write(
+        _write_event(
+            f,
             f'{{"ph":"i","s":"g","name":"Record Window End",'
-            f'"pid":"","tid":"","ts":{end_ts}}}\n'
+            f'"pid":"","tid":"","ts":{end_ts}}}',
+            event_callback,
+            trailing_comma=False,
         )
 
         f.write(f'],\n"traceName": {_json_escape(path)}\n}}\n')

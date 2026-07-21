@@ -285,7 +285,11 @@ class EventList(list):
             time_unit=time_unit,
         )
 
-    def export_chrome_trace(self, path):
+    def export_chrome_trace(
+        self,
+        path,
+        event_callback: Callable[[dict[str, Any]], None] | None = None,
+    ):
         """Export an EventList as a Chrome tracing tools file.
 
         The checkpoint can be later loaded and inspected under ``chrome://tracing`` URL.
@@ -293,6 +297,9 @@ class EventList(list):
         Args:
             path (str): Path where the trace will be written.
         """
+        if event_callback is not None:
+            return self._export_chrome_trace_with_callback(path, event_callback)
+
         import os
 
         device_name = "cuda" if not self._use_device else self._use_device
@@ -339,6 +346,57 @@ class EventList(list):
                 # remove trailing whitespace and comma
                 f.seek(f.tell() - 2, os.SEEK_SET)
                 f.truncate()
+            f.write("]")
+
+    def _export_chrome_trace_with_callback(
+        self, path: str, event_callback: Callable[[dict[str, Any]], None]
+    ) -> None:
+        device_name = "cuda" if not self._use_device else self._use_device
+        with open(path, "w") as f:
+            first = True
+            next_id = 0
+
+            def write_event(event: dict[str, Any]) -> None:
+                nonlocal first
+                if not first:
+                    f.write(", ")
+                event_callback(event)
+                json.dump(event, f, separators=(",", ":"))
+                first = False
+
+            f.write("[")
+            for evt in self:
+                if evt.trace_name is None:
+                    continue
+                write_event(
+                    {
+                        "name": evt.trace_name,
+                        "ph": "X",
+                        "ts": evt.time_range.start,
+                        "dur": evt.time_range.elapsed_us(),
+                        "tid": (
+                            evt.thread
+                            if not evt.is_remote
+                            else f" node_id:{evt.node_id}, thread_id:{evt.thread} "
+                        ),
+                        "pid": "CPU functions",
+                        "args": {},
+                    }
+                )
+                for _ in evt.kernels:
+                    write_event(
+                        {
+                            "name": evt.trace_name,
+                            "ph": "s",
+                            "ts": evt.time_range.start,
+                            "tid": evt.thread,
+                            "pid": "CPU functions",
+                            "id": next_id,
+                            "cat": f"cpu_to_{device_name}",
+                            "args": {},
+                        }
+                    )
+                    next_id += 1
             f.write("]")
 
     def supported_export_stacks_metrics(self):

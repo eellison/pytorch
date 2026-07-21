@@ -913,7 +913,13 @@ class profile:
                         )
         return trace
 
-    def export_chrome_trace(self, path, metadata=None, use_python_export=False):
+    def export_chrome_trace(
+        self,
+        path,
+        metadata=None,
+        use_python_export=False,
+        event_callback=None,
+    ):
         """
         Exports the collected trace in Chrome JSON format. If kineto is enabled, only
         last cycle in schedule is exported.
@@ -923,12 +929,16 @@ class profile:
                 export_chrome_trace as _export,
             )
 
-            _export(self.kineto_results, path, metadata)  # type: ignore[union-attr]
+            _export(  # type: ignore[arg-type]
+                self.kineto_results, path, metadata, event_callback=event_callback
+            )
         elif kineto_available():
             self.kineto_results.save(path)  # type: ignore[union-attr]
         else:
             self._ensure_function_events()
-            return self._function_events.export_chrome_trace(path)  # type: ignore[union-attr]
+            return self._function_events.export_chrome_trace(  # type: ignore[union-attr]
+                path, event_callback=event_callback
+            )
 
         import torch._inductor.config as inductor_config
 

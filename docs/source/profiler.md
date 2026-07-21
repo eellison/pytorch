@@ -17,6 +17,8 @@
 .. autofunction:: supported_activities
 
 .. autofunction:: tensorboard_trace_handler
+
+.. autofunction:: register_export_chrome_trace_callback
 ```
 
 ## API Reference

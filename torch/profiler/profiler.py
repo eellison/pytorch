@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import gzip
 import json
+import logging
 import os
 import shutil
 import tempfile
 from abc import ABC, abstractmethod
+from collections import OrderedDict
 from enum import Enum
 from functools import partial
 from typing import Any, TYPE_CHECKING
@@ -27,6 +29,7 @@ from torch._environment import is_fbcode
 from torch._utils_internal import profiler_allow_cudagraph_cupti_lazy_reinit_cuda12
 from torch.autograd import kineto_available, ProfilerActivity
 from torch.profiler._memory_profiler import MemoryProfile, MemoryProfileTimeline
+from torch.utils.hooks import RemovableHandle
 
 
 if TYPE_CHECKING:
@@ -40,7 +43,40 @@ __all__ = [
     "tensorboard_trace_handler",
     "profile",
     "ExecutionTraceObserver",
+    "register_export_chrome_trace_callback",
 ]
+
+
+log = logging.getLogger(__name__)
+
+_export_chrome_trace_callbacks: OrderedDict[int, Callable[[dict[str, Any]], None]] = (
+    OrderedDict()
+)
+
+
+def register_export_chrome_trace_callback(
+    callback: Callable[[dict[str, Any]], None],
+) -> RemovableHandle:
+    """Register a callback that can modify Chrome trace events during export.
+
+    The callback receives one trace event dictionary at a time and may modify it
+    in place. Callbacks run in registration order. The returned handle removes
+    only this registration, so registering the same callback more than once is
+    well-defined.
+    """
+    handle = RemovableHandle(_export_chrome_trace_callbacks)
+    _export_chrome_trace_callbacks[handle.id] = callback
+    return handle
+
+
+def _run_export_chrome_trace_callbacks(event: dict[str, Any]) -> None:
+    for callback in tuple(_export_chrome_trace_callbacks.values()):
+        try:
+            callback(event)
+        except Exception:
+            log.warning("Profiler export callback failed", exc_info=True)
+
+
 PROFILER_STEP_NAME = "ProfilerStep"
 
 _WARNINGS_SHOWN = set()
@@ -423,6 +459,10 @@ class _KinetoProfile:
         """
         Exports the collected trace in Chrome JSON format. If kineto is enabled, only
         last cycle in schedule is exported.
+
+        Registered export callbacks are applied to each trace event as the Python
+        exporter streams it to disk. Registering a callback automatically selects
+        that streaming exporter.
         """
         if self.profiler is None:
             raise AssertionError(
@@ -450,9 +490,20 @@ class _KinetoProfile:
                 self._cupti_profiler_observer = None
                 self._monitor_window_id = None
             return
+        event_callback = (
+            _run_export_chrome_trace_callbacks
+            if _export_chrome_trace_callbacks
+            else None
+        )
+        if event_callback is not None:
+            use_python_export = True
+
         if use_python_export:
             self.profiler.export_chrome_trace(
-                path, self._trace_metadata, use_python_export=True
+                path,
+                self._trace_metadata,
+                use_python_export=True,
+                event_callback=event_callback,
             )
         elif path.endswith(".gz"):
             with tempfile.NamedTemporaryFile("w+b", suffix=".json") as fp:

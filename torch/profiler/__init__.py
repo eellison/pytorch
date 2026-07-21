@@ -23,6 +23,7 @@ from .profiler import (
     ExecutionTraceObserver,
     profile,
     ProfilerAction,
+    register_export_chrome_trace_callback,
     schedule,
     supported_activities,
     tensorboard_trace_handler,
@@ -40,6 +41,7 @@ __all__ = [
     "DeviceType",
     "record_function",
     "ExecutionTraceObserver",
+    "register_export_chrome_trace_callback",
 ]
 
 from . import itt
