@@ -1133,6 +1133,18 @@ class MemoryCoalescingTest(MockSchedulerTest):
         computed_buf.decide_layout()
         return self._create_scheduler_node(computed_buf)
 
+    def _build_loop_tiling_cohort(self, node, pointwise_tiling):
+        _, (numel, rnumel) = node.group
+        selected_tiling = TritonScheduling.create_tiling(
+            pointwise_tiling, [rnumel]
+        )
+        return TritonScheduling.build_loop_tiling_cohort(
+            [node],
+            numel,
+            rnumel,
+            selected_tiling,
+        )
+
     def test_expensive_operations_static_dependencies(self):
         from torch._inductor import tiling_utils
 
@@ -1145,6 +1157,15 @@ class MemoryCoalescingTest(MockSchedulerTest):
         self.assertEqual(
             analysis.expensive_operations,
             (tiling_utils.ExpensiveOperation("exp", frozenset(analysis.index_vars)),),
+        )
+        cohort = self._build_loop_tiling_cohort(node, sizes)
+        self.assertEqual(cohort["coverage"]["status"], "unsupported")
+        self.assertEqual(
+            cohort["coverage"]["reasons"],
+            ["fewer_than_two_pointwise_dimensions"],
+        )
+        self.assertEqual(
+            cohort["operations"][0]["compatible_contiguous_2d_candidates"], []
         )
 
     def test_expensive_operations_broadcast_load_dependency(self):
@@ -1167,6 +1188,15 @@ class MemoryCoalescingTest(MockSchedulerTest):
                     "exp", frozenset((analysis.index_vars[1],))
                 ),
             ),
+        )
+        cohort = self._build_loop_tiling_cohort(node, (rows, columns))
+        operation = cohort["operations"][0]
+        self.assertEqual(operation["dependencies"], [str(analysis.index_vars[1])])
+        self.assertEqual(
+            operation["compatible_contiguous_2d_candidates"][0][
+                "duplicate_factor"
+            ],
+            {"symbolic": str(rows), "hint": rows},
         )
 
     def test_expensive_operations_dynamic_dependencies_add_no_guards(self):
@@ -1216,6 +1246,16 @@ class MemoryCoalescingTest(MockSchedulerTest):
                 ),
             ),
         )
+        cohort = self._build_loop_tiling_cohort(node, (rows, columns))
+        operation = cohort["operations"][0]
+        self.assertEqual(
+            operation["dependencies"],
+            sorted(str(var) for var in analysis.index_vars),
+        )
+        self.assertEqual(
+            operation["compatible_contiguous_2d_candidates"],
+            [],
+        )
 
     def test_expensive_operations_indirect_gather_broadcast_dependency(self):
         from torch._inductor import tiling_utils
@@ -1242,6 +1282,15 @@ class MemoryCoalescingTest(MockSchedulerTest):
                     "indirect_load", frozenset((analysis.index_vars[0],))
                 ),
             ),
+        )
+        cohort = self._build_loop_tiling_cohort(node, (rows, columns))
+        operation = cohort["operations"][0]
+        self.assertEqual(operation["dependencies"], [str(analysis.index_vars[0])])
+        self.assertEqual(
+            operation["compatible_contiguous_2d_candidates"][0][
+                "duplicate_factor"
+            ],
+            {"symbolic": str(columns), "hint": columns},
         )
 
     def test_expensive_operations_unresolved_indirect_provenance(self):
@@ -1281,6 +1330,144 @@ class MemoryCoalescingTest(MockSchedulerTest):
         unresolved = tiling_utils.extract_normalized_read_writes(node)
         self.assertIsNotNone(unresolved)
         self.assertEqual(unresolved.expensive_operations, ())
+        self.assertEqual(
+            unresolved.incomplete_reasons,
+            ("unresolved_indirect_provenance",),
+        )
+        cohort = self._build_loop_tiling_cohort(node, (rows,))
+        self.assertEqual(cohort["coverage"]["status"], "incomplete")
+        self.assertIn(
+            "unresolved_indirect_provenance",
+            cohort["coverage"]["reasons"],
+        )
+
+    def test_loop_tiling_cohort_dynamic_adds_no_guards(self):
+        shape_env = V.graph.sizevars.shape_env
+        dynamic_rows = shape_env.create_unbacked_symint().node.expr
+        columns = 8
+        load = self._create_input_loader("dynamic_exp_column", (columns,))
+        node = self._create_pointwise_node(
+            (dynamic_rows, columns),
+            lambda index: ops.exp(load([index[1]])),
+        )
+
+        with shape_env.error_on_new_guards():
+            cohort = self._build_loop_tiling_cohort(
+                node, (dynamic_rows, columns)
+            )
+
+        self.assertEqual(cohort["coverage"]["status"], "complete")
+        duplicate_factor = cohort["operations"][0][
+            "compatible_contiguous_2d_candidates"
+        ][0]["duplicate_factor"]
+        self.assertEqual(duplicate_factor["symbolic"], str(dynamic_rows))
+        self.assertIsInstance(duplicate_factor["hint"], int)
+
+    def test_loop_tiling_cohort_analysis_is_opt_in(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        from torch._inductor.codegen import simd as simd_codegen
+
+        kernel = SimpleNamespace()
+        features = SimpleNamespace()
+        with (
+            patch.object(
+                simd_codegen.loop_tiling_log,
+                "isEnabledFor",
+                return_value=False,
+            ),
+            patch.object(
+                TritonScheduling,
+                "build_loop_tiling_cohort",
+            ) as build_cohort,
+        ):
+            TritonScheduling._attach_loop_tiling_cohort(kernel, features)
+
+        build_cohort.assert_not_called()
+        self.assertFalse(hasattr(kernel, "loop_tiling_cohort"))
+
+    def test_loop_tiling_cohort_final_selected_tiling_and_identity(self):
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        from torch._inductor.codegen import triton as triton_codegen
+
+        rows, columns = 4, 8
+        load = self._create_input_loader("final_exp_column", (columns,))
+        node = self._create_pointwise_node(
+            (rows, columns),
+            lambda index: ops.exp(load([index[1]])),
+        )
+        cohort = self._build_loop_tiling_cohort(node, (rows, columns))
+        scheduling = TritonScheduling(None)
+        kernel = SimpleNamespace(loop_tiling_cohort=cohort)
+
+        with (
+            patch.object(
+                triton_codegen.loop_tiling_log,
+                "isEnabledFor",
+                return_value=True,
+            ),
+            patch.object(triton_codegen.loop_tiling_log, "info") as log_info,
+        ):
+            scheduling._emit_final_loop_tiling_record(
+                kernel,
+                [node],
+                kernel_name="triton_poi_fused_0",
+                source_hash="source_hash",
+                source_path="/tmp/source.py",
+            )
+
+        record = json.loads(log_info.call_args.args[0])
+        self.assertEqual(record["selected_tiling"], cohort["selected_tiling"])
+        self.assertEqual(
+            record["kernel"],
+            {
+                "name": "triton_poi_fused_0",
+                "source_hash": "source_hash",
+                "source_nodes": [node.get_name()],
+                "source_path": "/tmp/source.py",
+            },
+        )
+
+    def test_loop_tiling_cohort_unsupported_emission(self):
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        from torch._inductor.codegen import triton as triton_codegen
+
+        node = self._create_pointwise_node(
+            (8,),
+            lambda index: ops.constant(1.0, torch.float32),
+        )
+        scheduling = TritonScheduling(None)
+        kernel = SimpleNamespace(tiling=TritonScheduling.create_tiling([8], [1]))
+
+        with (
+            patch.object(
+                triton_codegen.loop_tiling_log,
+                "isEnabledFor",
+                return_value=True,
+            ),
+            patch.object(triton_codegen.loop_tiling_log, "info") as log_info,
+        ):
+            scheduling._emit_final_loop_tiling_record(
+                kernel,
+                [node],
+                kernel_name="triton_poi_unsupported_0",
+                source_hash="unsupported_hash",
+                source_path="/tmp/unsupported.py",
+            )
+
+        record = json.loads(log_info.call_args.args[0])
+        self.assertEqual(record["coverage"]["status"], "unsupported")
+        self.assertEqual(
+            record["coverage"]["reasons"],
+            ["selector_path_not_supported:SimpleNamespace"],
+        )
 
     def test_expensive_operations_transcendental_methods(self):
         from torch._inductor import tiling_utils

@@ -20,7 +20,10 @@ import torch
 import torch._logging
 from torch._inductor import metrics
 from torch._inductor.ir import MultiTemplateBuffer
-from torch.fx.experimental.symbolic_shapes import free_unbacked_symbols
+from torch.fx.experimental.symbolic_shapes import (
+    free_unbacked_symbols,
+    GuardOnDataDependentSymNode,
+)
 from torch.fx.immutable_collections import immutable_dict
 from torch.utils._ordered_set import OrderedSet
 from torch.utils._sympy.functions import FloorDiv, Identity, ModularIndexing
@@ -97,6 +100,7 @@ log = logging.getLogger(__name__)
 perf_hint_log = torch._logging.getArtifactLogger(__name__, "perf_hints")
 schedule_log = torch._logging.getArtifactLogger(__name__, "schedule")
 fusion_log = torch._logging.getArtifactLogger(__name__, "fusion")
+loop_tiling_log = torch._logging.getArtifactLogger(__name__, "loop_tiling")
 
 
 pexpr = PythonPrinter().doprint
@@ -3151,6 +3155,7 @@ class SIMDScheduling(BaseScheduling):
             {"features": kernel_features, "tiling_scores": tiling_score},
         )
         for kernel in kernels:
+            self._attach_loop_tiling_cohort(kernel, kernel_features)
             self.codegen_node_schedule_with_kernel(node_schedule, kernel)
         MultiKernel.merge_workspaces_inplace(kernels)
 
@@ -3544,6 +3549,7 @@ class SIMDScheduling(BaseScheduling):
             tiling_scores=node_info.tiling_scores,
             **kernel_kwargs,
         )
+        self._attach_loop_tiling_cohort(kernel, node_info.features)
         self.process_kernel(kernel, node_info.node_schedule, only_gen_src_code)
         with V.set_kernel_handler(kernel):
             src_code = kernel.codegen_kernel()
@@ -4442,6 +4448,182 @@ class SIMDScheduling(BaseScheduling):
             )
             for node in node_schedule
             if isinstance(node, scheduler.SchedulerNode)
+        )
+
+    @staticmethod
+    def _loop_tiling_symbolic_hint(expr: sympy.Expr | int) -> dict[str, Any]:
+        return {
+            "symbolic": str(expr),
+            "hint": V.graph.sizevars.optimization_hint(expr, fallback=1),
+        }
+
+    @classmethod
+    def _serialize_loop_tiling(
+        cls, tiling: dict[str, sympy.Expr]
+    ) -> dict[str, dict[str, Any]]:
+        return {
+            axis: cls._loop_tiling_symbolic_hint(extent)
+            for axis, extent in tiling.items()
+        }
+
+    @staticmethod
+    def _loop_tiling_source_nodes(
+        node_schedule: Sequence[NodeScheduleEntry],
+    ) -> list[str]:
+        return [
+            node.get_name()
+            for node in node_schedule
+            if isinstance(node, BaseSchedulerNode)
+        ]
+
+    @classmethod
+    def unsupported_loop_tiling_cohort(
+        cls,
+        selected_tiling: dict[str, sympy.Expr],
+        node_schedule: Sequence[NodeScheduleEntry],
+        reason: str,
+    ) -> dict[str, Any]:
+        return {
+            "schema_version": 1,
+            "record_type": "final_triton_loop_tiling",
+            "coverage": {"status": "unsupported", "reasons": [reason]},
+            "selected_tiling": cls._serialize_loop_tiling(selected_tiling),
+            "operations": [],
+            "kernel": {
+                "source_nodes": cls._loop_tiling_source_nodes(node_schedule),
+            },
+        }
+
+    @classmethod
+    def build_loop_tiling_cohort(
+        cls,
+        node_schedule: list[NodeScheduleEntry],
+        pointwise_numel: sympy.Expr,
+        reduction_numel: sympy.Expr,
+        selected_tiling: dict[str, sympy.Expr],
+    ) -> dict[str, Any]:
+        from torch._inductor.tiling_utils import (
+            extract_normalized_read_writes_for_nodes,
+        )
+
+        payload: dict[str, Any] = {
+            "schema_version": 1,
+            "record_type": "final_triton_loop_tiling",
+            "coverage": {"status": "complete", "reasons": []},
+            "selected_tiling": cls._serialize_loop_tiling(selected_tiling),
+            "operations": [],
+            "kernel": {
+                "source_nodes": cls._loop_tiling_source_nodes(node_schedule),
+            },
+        }
+        reasons: OrderedSet[str] = OrderedSet()
+        unsupported_reasons: OrderedSet[str] = OrderedSet()
+        nodes = list(NodeScheduleMarker.only_nodes(node_schedule))
+        normalized = extract_normalized_read_writes_for_nodes(nodes)
+        if normalized is None:
+            payload["coverage"] = {
+                "status": "incomplete",
+                "reasons": ["normalized_analysis_unavailable"],
+            }
+            return payload
+
+        reasons.update(normalized.incomplete_reasons)
+        if reduction_numel != 1 or normalized.reduce_vars:
+            unsupported_reasons.add("reduction_kernel")
+        if len(normalized.index_vars) < 2:
+            unsupported_reasons.add("fewer_than_two_pointwise_dimensions")
+
+        ranges = normalized.var_ranges
+        index_vars = tuple(normalized.index_vars)
+        for operation in normalized.expensive_operations:
+            operation_record: dict[str, Any] = {
+                "kind": operation.op,
+                "dependencies": sorted(str(var) for var in operation.varying_vars),
+                "compatible_contiguous_2d_candidates": [],
+            }
+            candidates: list[dict[str, Any]] = []
+            seen_candidates: OrderedSet[tuple[str, ...]] = OrderedSet()
+            if not unsupported_reasons:
+                for split in range(1, len(index_vars)):
+                    outer_vars = index_vars[:split]
+                    inner_vars = index_vars[split:]
+                    outer_set = frozenset(outer_vars)
+                    inner_set = frozenset(inner_vars)
+                    if operation.varying_vars.issubset(outer_set):
+                        invariant_vars = inner_vars
+                    elif operation.varying_vars.issubset(inner_set):
+                        invariant_vars = outer_vars
+                    else:
+                        continue
+
+                    candidate_tiling = cls.create_tiling(
+                        [
+                            sympy_product(ranges[var] for var in outer_vars),
+                            sympy_product(ranges[var] for var in inner_vars),
+                        ],
+                        [reduction_numel],
+                    )
+                    try:
+                        compatible = cls.tiling_is_compatible(
+                            node_schedule,
+                            pointwise_numel,
+                            reduction_numel,
+                            candidate_tiling,
+                        )
+                    except GuardOnDataDependentSymNode:
+                        reasons.add("candidate_compatibility_unproven")
+                        continue
+                    if not compatible:
+                        continue
+
+                    duplicate_factor = sympy_product(
+                        ranges[var] for var in invariant_vars
+                    )
+                    candidate_key = tuple(
+                        f"{axis}={extent}" for axis, extent in candidate_tiling.items()
+                    )
+                    if candidate_key in seen_candidates:
+                        continue
+                    seen_candidates.add(candidate_key)
+                    candidates.append(
+                        {
+                            "tiling": cls._serialize_loop_tiling(candidate_tiling),
+                            "invariant_variables": [
+                                str(var) for var in invariant_vars
+                            ],
+                            "duplicate_factor": cls._loop_tiling_symbolic_hint(
+                                duplicate_factor
+                            ),
+                        }
+                    )
+            operation_record["compatible_contiguous_2d_candidates"] = candidates
+            payload["operations"].append(operation_record)
+
+        if reasons:
+            payload["coverage"] = {
+                "status": "incomplete",
+                "reasons": list(reasons),
+            }
+        elif unsupported_reasons:
+            payload["coverage"] = {
+                "status": "unsupported",
+                "reasons": list(unsupported_reasons),
+            }
+        return payload
+
+    @classmethod
+    def _attach_loop_tiling_cohort(
+        cls,
+        kernel: SIMDKernel,
+        features: SIMDKernelFeatures,
+    ) -> None:
+        if not loop_tiling_log.isEnabledFor(logging.INFO):
+            return
+        kernel.loop_tiling_cohort = cls.build_loop_tiling_cohort(
+            features.node_schedule,
+            features.numel,
+            features.reduction_numel,
+            kernel.tiling,
         )
 
     @classmethod

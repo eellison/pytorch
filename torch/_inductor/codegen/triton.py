@@ -8,6 +8,7 @@ import copy
 import dataclasses
 import functools
 import itertools
+import json
 import logging
 import math
 import operator
@@ -153,6 +154,7 @@ log = logging.getLogger(__name__)
 perf_hint_log = torch._logging.getArtifactLogger(__name__, "perf_hints")
 schedule_log = torch._logging.getArtifactLogger(__name__, "schedule")
 fusion_log = torch._logging.getArtifactLogger(__name__, "fusion")
+loop_tiling_log = torch._logging.getArtifactLogger(__name__, "loop_tiling")
 async_compile = AsyncCompile()
 
 
@@ -8140,6 +8142,38 @@ class TritonScheduling(SIMDScheduling):
         metadata_comment += "\n" + origins + "\n" + detailed_origins
         wrapper.define_kernel(kernel_name, compile_wrapper.getvalue(), metadata_comment)
 
+    def _emit_final_loop_tiling_record(
+        self,
+        kernel: Any,
+        node_schedule: Sequence[Any],
+        *,
+        kernel_name: str,
+        source_hash: str,
+        source_path: str,
+    ) -> None:
+        if not loop_tiling_log.isEnabledFor(logging.INFO):
+            return
+
+        cohort = getattr(kernel, "loop_tiling_cohort", None)
+        if cohort is None:
+            cohort = self.unsupported_loop_tiling_cohort(
+                getattr(kernel, "tiling", {}),
+                node_schedule,
+                f"selector_path_not_supported:{type(kernel).__name__}",
+            )
+
+        from torch._inductor.tiling_utils import (
+            finalize_loop_tiling_cohort_record,
+        )
+
+        record = finalize_loop_tiling_cohort_record(
+            cohort,
+            kernel_name=kernel_name,
+            source_hash=source_hash,
+            source_path=source_path,
+        )
+        loop_tiling_log.info(json.dumps(record, sort_keys=True))
+
     def define_kernel(self, src_code, node_schedule, kernel):
         wrapper = V.graph.wrapper_code
         if src_code in wrapper.src_to_kernel:
@@ -8175,7 +8209,8 @@ class TritonScheduling(SIMDScheduling):
             # not use BracesBuffer, so we have no good indicator of a C++ buffer atm.
             src_code = src_code.replace("#pragma CMT", "#")
 
-            _basename, _, kernel_path = get_path(code_hash(src_code.strip()), "py")
+            source_hash = code_hash(src_code.strip())
+            _basename, _, kernel_path = get_path(source_hash, "py")
 
             self._emit_kernel_to_wrapper(
                 wrapper,
@@ -8186,6 +8221,13 @@ class TritonScheduling(SIMDScheduling):
                 node_schedule,
                 kernel_path,
                 get_kernel_metadata,
+            )
+            self._emit_final_loop_tiling_record(
+                kernel,
+                node_schedule,
+                kernel_name=kernel_name,
+                source_hash=source_hash,
+                source_path=kernel_path,
             )
 
             # log kernel metadata for offline analysis.

@@ -292,6 +292,7 @@ class FusedNormalizedReadsWrites:
     writes: dict[sympy.Expr, OrderedSet[str]]
     var_ranges: dict[sympy.Symbol, int]
     expensive_operations: tuple[ExpensiveOperation, ...]
+    incomplete_reasons: tuple[str, ...]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -588,11 +589,12 @@ def apply_var_mapping(
 
 def _extract_expensive_operations(
     body: "LoopBody",
-) -> tuple[ExpensiveOperation, ...]:
+) -> tuple[tuple[ExpensiveOperation, ...], tuple[str, ...]]:
     """Extract expensive operations and their dependencies in a LoopBody's vars."""
     varying_vars = body.var_ranges.keys()
     indirect_dependencies: dict[sympy.Symbol, _VariableDependencies] = {}
     operations: list[ExpensiveOperation] = []
+    incomplete_reasons: OrderedSet[str] = OrderedSet()
 
     def value_dependencies(
         value: Any, env: dict[torch.fx.Node, _VariableDependencies]
@@ -631,6 +633,7 @@ def _extract_expensive_operations(
                 continue
             producer_dependencies = indirect_dependencies.get(symbol)
             if producer_dependencies is None:
+                incomplete_reasons.add("unresolved_indirect_provenance")
                 return None
             dependencies.update(producer_dependencies)
         return frozenset(dependencies)
@@ -714,7 +717,7 @@ def _extract_expensive_operations(
         return output_dependencies
 
     analyze_graph(body.root_block.graph)
-    return tuple(operations)
+    return tuple(operations), tuple(incomplete_reasons)
 
 
 def _normalize_expensive_operations(
@@ -745,6 +748,7 @@ def extract_normalized_read_writes(
     reads: dict[sympy.Expr, OrderedSet[str]] = defaultdict(OrderedSet)
     writes: dict[sympy.Expr, OrderedSet[str]] = defaultdict(OrderedSet)
     expensive_operations: list[ExpensiveOperation] = []
+    incomplete_reasons: OrderedSet[str] = OrderedSet()
 
     all_output_names = node.get_buffer_names()
     op_names = node.get_operation_names()
@@ -775,7 +779,10 @@ def extract_normalized_read_writes(
             continue
 
         body = n._body
-        n_expensive_operations = _extract_expensive_operations(body)
+        n_expensive_operations, n_incomplete_reasons = _extract_expensive_operations(
+            body
+        )
+        incomplete_reasons.update(n_incomplete_reasons)
 
         n_reads: dict[sympy.Expr, OrderedSet[str]] = defaultdict(OrderedSet)
         n_writes: dict[sympy.Expr, OrderedSet[str]] = defaultdict(OrderedSet)
@@ -827,13 +834,14 @@ def extract_normalized_read_writes(
             new_ranges,
             return_getters_groups,
         )
-        expensive_operations.extend(
-            _normalize_expensive_operations(
-                n_expensive_operations,
-                var_map,
-                OrderedSet(norm_pw_vars + norm_red_vars),
-            )
+        normalized_expensive_operations = _normalize_expensive_operations(
+            n_expensive_operations,
+            var_map,
+            OrderedSet(norm_pw_vars + norm_red_vars),
         )
+        if len(normalized_expensive_operations) != len(n_expensive_operations):
+            incomplete_reasons.add("unproven_operation_normalization")
+        expensive_operations.extend(normalized_expensive_operations)
 
         # We create Identity sympy.Functions to prevent expansion to int64,
         # unwrap for tiling analysis.
@@ -868,9 +876,51 @@ def extract_normalized_read_writes(
         writes,
         ranges,
         tuple(expensive_operations),
+        tuple(incomplete_reasons),
     )
     loop_tiling_log.info("Normalized Fused reads: %s", fused_out)
     return fused_out
+
+
+def extract_normalized_read_writes_for_nodes(
+    nodes: Sequence["BaseSchedulerNode"],
+) -> FusedNormalizedReadsWrites | None:
+    """Normalize a final SIMD schedule without running memory-score analysis."""
+    if not nodes:
+        return None
+
+    from torch._inductor import scheduler
+
+    node_types = (scheduler.FusedSchedulerNode, scheduler.SchedulerNode)
+    if not all(isinstance(node, node_types) for node in nodes):
+        return None
+    if len(nodes) == 1:
+        return extract_normalized_read_writes(nodes[0])
+    return extract_normalized_read_writes(
+        _FusedNodeView(
+            nodes=nodes,
+            read_writes=ReadWrites.merge_list([node.read_writes for node in nodes]),
+            group=max(nodes, key=lambda node: int(node.is_reduction())).group,
+        )
+    )
+
+
+def finalize_loop_tiling_cohort_record(
+    cohort: dict[str, Any],
+    *,
+    kernel_name: str,
+    source_hash: str,
+    source_path: str,
+) -> dict[str, Any]:
+    """Add final emitted-source identity to a JSON-ready cohort payload."""
+    record = dict(cohort)
+    record["kernel"] = {
+        **cohort.get("kernel", {}),
+        "name": kernel_name,
+        "source_hash": source_hash,
+        "source_path": source_path,
+    }
+    return record
 
 
 def get_score(
