@@ -29,7 +29,42 @@ loop_tiling_log = torch._logging.getArtifactLogger(__name__, "loop_tiling")
 from torch.utils._sympy.functions import FloorDiv, ModularIndexing
 
 
+_LOOP_IR_TRANSCENDENTAL_OPS = frozenset(
+    {
+        "acos",
+        "acosh",
+        "asin",
+        "asinh",
+        "atan",
+        "atan2",
+        "atanh",
+        "cos",
+        "cosh",
+        "erf",
+        "erfc",
+        "erfinv",
+        "exp",
+        "exp2",
+        "expm1",
+        "lgamma",
+        "log",
+        "log1p",
+        "log2",
+        "log10",
+        "pow",
+        "rsqrt",
+        "sigmoid",
+        "sin",
+        "sinh",
+        "sqrt",
+        "tan",
+        "tanh",
+    }
+)
+
+
 if TYPE_CHECKING:
+    from torch._inductor.loop_body import LoopBody
     from torch._inductor.scheduler import (
         BaseSchedulerNode,
         FusedSchedulerNode,
@@ -234,6 +269,17 @@ def has_indirect_access(memory_expr: sympy.Expr) -> bool:
 
 
 @dataclasses.dataclass(frozen=True)
+class ExpensiveOperation:
+    """
+    A structurally expensive loop-IR operation and the normalized loop variables
+    that can vary its result.
+    """
+
+    op: str
+    varying_vars: frozenset[sympy.Symbol]
+
+
+@dataclasses.dataclass(frozen=True)
 class FusedNormalizedReadsWrites:
     """
     Normalized reads and writes for nodes in the same FusedSchedulerNode.
@@ -244,6 +290,7 @@ class FusedNormalizedReadsWrites:
     reads: dict[sympy.Expr, OrderedSet[str]]
     writes: dict[sympy.Expr, OrderedSet[str]]
     var_ranges: dict[sympy.Symbol, int]
+    expensive_operations: tuple[ExpensiveOperation, ...]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -538,12 +585,145 @@ def apply_var_mapping(
     }
 
 
+def _extract_expensive_operations(
+    body: "LoopBody",
+) -> tuple[ExpensiveOperation, ...]:
+    """Extract expensive operations and their dependencies in a LoopBody's vars."""
+    varying_vars = body.var_ranges.keys()
+    indirect_dependencies: dict[sympy.Symbol, frozenset[sympy.Symbol]] = {}
+    operations: list[ExpensiveOperation] = []
+
+    def value_dependencies(
+        value: Any, env: dict[torch.fx.Node, frozenset[sympy.Symbol]]
+    ) -> frozenset[sympy.Symbol]:
+        if isinstance(value, torch.fx.Node):
+            return env.get(value, frozenset())
+        if isinstance(value, dict):
+            values = itertools.chain(value.keys(), value.values())
+        elif isinstance(value, (list, tuple)):
+            values = iter(value)
+        else:
+            return frozenset()
+        return frozenset().union(*(value_dependencies(v, env) for v in values))
+
+    def index_dependencies(index_name: str) -> frozenset[sympy.Symbol] | None:
+        expr = body.indexing_exprs[index_name]
+        dependencies = set(expr.free_symbols & varying_vars)
+        for symbol in expr.free_symbols:
+            if not symbol_is_type(symbol, SymT.INDIRECT):
+                continue
+            producer_dependencies = indirect_dependencies.get(symbol)
+            if producer_dependencies is None:
+                return None
+            dependencies.update(producer_dependencies)
+        return frozenset(dependencies)
+
+    def analyze_graph(
+        graph: torch.fx.Graph,
+        control_dependencies: frozenset[sympy.Symbol] = frozenset(),
+    ) -> frozenset[sympy.Symbol]:
+        env: dict[torch.fx.Node, frozenset[sympy.Symbol]] = {}
+        output_dependencies: frozenset[sympy.Symbol] = frozenset()
+
+        for fx_node in graph.nodes:
+            dependencies = value_dependencies((fx_node.args, fx_node.kwargs), env)
+            target = fx_node.target
+
+            if fx_node.op == "call_module" and target == "get_index":
+                index_name = fx_node.args[0]
+                if not isinstance(index_name, str):
+                    raise AssertionError(
+                        f"expected get_index name to be str, got {type(index_name)}"
+                    )
+                maybe_dependencies = index_dependencies(index_name)
+                dependencies = maybe_dependencies or frozenset()
+
+            elif (
+                fx_node.op == "call_module"
+                and isinstance(target, str)
+                and target.startswith("set_indirect")
+            ):
+                index = int(target[len("set_indirect") :])
+                indirect_dependencies[body.indirect_vars[index]] = dependencies
+
+            elif (
+                fx_node.op == "call_module"
+                and isinstance(target, str)
+                and target.startswith("masked_subblock")
+            ):
+                mask_dependencies = value_dependencies(fx_node.args[0], env)
+                subblock_dependencies = analyze_graph(
+                    body.subblocks[target].graph,
+                    control_dependencies | mask_dependencies,
+                )
+                dependencies |= subblock_dependencies
+
+            if fx_node.op == "call_method" and isinstance(target, str):
+                expensive_op = target if target in _LOOP_IR_TRANSCENDENTAL_OPS else None
+                if target == "load":
+                    index_arg = fx_node.args[2]
+                    if (
+                        isinstance(index_arg, torch.fx.Node)
+                        and index_arg.op == "call_module"
+                        and index_arg.target == "get_index"
+                    ):
+                        index_name = index_arg.args[0]
+                        if not isinstance(index_name, str):
+                            raise AssertionError(
+                                "expected load get_index name to be str"
+                            )
+                        if any(
+                            symbol_is_type(symbol, SymT.INDIRECT)
+                            for symbol in body.indexing_exprs[index_name].free_symbols
+                        ):
+                            expensive_op = "indirect_load"
+
+                if expensive_op is not None:
+                    operations.append(
+                        ExpensiveOperation(
+                            expensive_op,
+                            dependencies | control_dependencies,
+                        )
+                    )
+
+            env[fx_node] = dependencies
+            if fx_node.op == "output":
+                output_dependencies = dependencies | control_dependencies
+
+        return output_dependencies
+
+    analyze_graph(body.root_block.graph)
+    return tuple(operations)
+
+
+def _normalize_expensive_operations(
+    operations: tuple[ExpensiveOperation, ...],
+    var_map: dict[sympy.Symbol, sympy.Expr],
+    normalized_vars: OrderedSet[sympy.Symbol],
+) -> tuple[ExpensiveOperation, ...]:
+    normalized_operations: list[ExpensiveOperation] = []
+    for operation in operations:
+        if not operation.varying_vars.issubset(var_map):
+            continue
+        dependencies = frozenset().union(
+            *(
+                var_map[var].free_symbols & normalized_vars
+                for var in operation.varying_vars
+            )
+        )
+        normalized_operations.append(
+            ExpensiveOperation(operation.op, frozenset(dependencies))
+        )
+    return tuple(normalized_operations)
+
+
 def extract_normalized_read_writes(
     node: Union["_FusedNodeView", "FusedSchedulerNode", "SchedulerNode"],
 ) -> FusedNormalizedReadsWrites | None:
     """Extracts index variables, reduce variables, read/write expressions, and variable ranges from a fused node."""
     reads: dict[sympy.Expr, OrderedSet[str]] = defaultdict(OrderedSet)
     writes: dict[sympy.Expr, OrderedSet[str]] = defaultdict(OrderedSet)
+    expensive_operations: list[ExpensiveOperation] = []
 
     all_output_names = node.get_buffer_names()
     op_names = node.get_operation_names()
@@ -574,6 +754,7 @@ def extract_normalized_read_writes(
             continue
 
         body = n._body
+        n_expensive_operations = _extract_expensive_operations(body)
 
         n_reads: dict[sympy.Expr, OrderedSet[str]] = defaultdict(OrderedSet)
         n_writes: dict[sympy.Expr, OrderedSet[str]] = defaultdict(OrderedSet)
@@ -588,7 +769,7 @@ def extract_normalized_read_writes(
             for expr in body.get_all_write_expr(out):
                 n_writes[expr].add(out)
 
-        if not n_reads and not n_writes:
+        if not n_reads and not n_writes and not n_expensive_operations:
             continue
 
         (iter_vars, n_pw_splits), (red_vars, n_red_splits) = get_pw_red_splits(
@@ -625,6 +806,13 @@ def extract_normalized_read_writes(
             new_ranges,
             return_getters_groups,
         )
+        expensive_operations.extend(
+            _normalize_expensive_operations(
+                n_expensive_operations,
+                var_map,
+                OrderedSet(norm_pw_vars + norm_red_vars),
+            )
+        )
 
         # We create Identity sympy.Functions to prevent expansion to int64,
         # unwrap for tiling analysis.
@@ -658,6 +846,7 @@ def extract_normalized_read_writes(
         reads,
         writes,
         ranges,
+        tuple(expensive_operations),
     )
     loop_tiling_log.info("Normalized Fused reads: %s", fused_out)
     return fused_out

@@ -1106,6 +1106,174 @@ class MemoryCoalescingTest(MockSchedulerTest):
         s.max_order = 100
         return s
 
+    def _create_input_loader(self, name, sizes):
+        strides = ir.FlexibleLayout.contiguous_strides(sizes)
+        box = ir.TensorBox.create(
+            ir.Buffer(
+                name=name,
+                layout=ir.FixedLayout(
+                    torch.device("cpu"),
+                    dtype=torch.float32,
+                    size=sizes,
+                    stride=strides,
+                ),
+            )
+        )
+        return box.make_loader()
+
+    def _create_pointwise_node(self, sizes, inner_fn):
+        buf = ir.Pointwise.create(
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+            inner_fn=inner_fn,
+            ranges=sizes,
+        )
+        buf.realize()
+        computed_buf = buf.data.data
+        computed_buf.decide_layout()
+        return self._create_scheduler_node(computed_buf)
+
+    def test_expensive_operations_static_dependencies(self):
+        from torch._inductor import tiling_utils
+
+        sizes = (4, 8)
+        load = self._create_input_loader("exp_static", sizes)
+        node = self._create_pointwise_node(sizes, lambda index: ops.exp(load(index)))
+
+        analysis = tiling_utils.extract_normalized_read_writes(node)
+        self.assertIsNotNone(analysis)
+        self.assertEqual(
+            analysis.expensive_operations,
+            (tiling_utils.ExpensiveOperation("exp", frozenset(analysis.index_vars)),),
+        )
+
+    def test_expensive_operations_dynamic_dependencies_add_no_guards(self):
+        from torch._inductor import tiling_utils
+
+        shape_env = V.graph.sizevars.shape_env
+        dynamic_size = shape_env.create_unbacked_symint().node.expr
+        sizes = (dynamic_size, 8)
+        load = self._create_input_loader("exp_dynamic", sizes)
+        node = self._create_pointwise_node(sizes, lambda index: ops.exp(load(index)))
+
+        with shape_env.error_on_new_guards():
+            analysis = tiling_utils.extract_normalized_read_writes(node)
+
+        self.assertIsNotNone(analysis)
+        self.assertEqual(
+            sympy.prod(analysis.var_ranges.values()),
+            sympy.prod(sizes),
+        )
+        self.assertEqual(
+            analysis.expensive_operations[0].varying_vars,
+            frozenset(analysis.index_vars),
+        )
+
+    def test_expensive_operations_indirect_gather_dependencies(self):
+        from torch._inductor import tiling_utils
+
+        rows, columns = 16, 8
+        index_load = self._create_input_loader("gather_index", (rows,))
+        weight_load = self._create_input_loader("gather_weight", (32, columns))
+
+        def inner_fn(index):
+            indirect = ops.indirect_indexing(
+                index_load([index[0]]), 32, check=True, wrap_neg=True
+            )
+            return weight_load([indirect, index[1]])
+
+        node = self._create_pointwise_node((rows, columns), inner_fn)
+        analysis = tiling_utils.extract_normalized_read_writes(node)
+
+        self.assertIsNotNone(analysis)
+        self.assertEqual(
+            analysis.expensive_operations,
+            (
+                tiling_utils.ExpensiveOperation(
+                    "indirect_load", frozenset(analysis.index_vars)
+                ),
+            ),
+        )
+
+    def test_expensive_operations_transcendental_methods(self):
+        from torch._inductor import tiling_utils
+
+        sizes = (4, 8)
+        load = self._create_input_loader("transcendentals", sizes)
+
+        def inner_fn(index):
+            return ops.sin(ops.log1p(load(index)))
+
+        node = self._create_pointwise_node(sizes, inner_fn)
+        analysis = tiling_utils.extract_normalized_read_writes(node)
+
+        self.assertIsNotNone(analysis)
+        self.assertEqual(
+            [operation.op for operation in analysis.expensive_operations],
+            ["log1p", "sin"],
+        )
+        for operation in analysis.expensive_operations:
+            self.assertEqual(operation.varying_vars, frozenset(analysis.index_vars))
+
+    def test_expensive_operations_masked_control_dependencies(self):
+        from torch._inductor import tiling_utils
+
+        sizes = (4, 8)
+        load = self._create_input_loader("masked_exp", (sizes[1],))
+
+        def inner_fn(index):
+            mask = ops.lt(
+                ops.index_expr(index[0], torch.int64),
+                ops.constant(2, torch.int64),
+            )
+            return ops.masked(
+                mask,
+                lambda: ops.exp(load([index[1]])),
+                0.0,
+            )
+
+        node = self._create_pointwise_node(sizes, inner_fn)
+        analysis = tiling_utils.extract_normalized_read_writes(node)
+
+        self.assertIsNotNone(analysis)
+        self.assertEqual(
+            analysis.expensive_operations,
+            (tiling_utils.ExpensiveOperation("exp", frozenset(analysis.index_vars)),),
+        )
+
+    def test_expensive_operations_cheap_op_negative(self):
+        from torch._inductor import tiling_utils
+
+        sizes = (4, 8)
+        load = self._create_input_loader("cheap_add", sizes)
+        node = self._create_pointwise_node(
+            sizes,
+            lambda index: ops.add(
+                load(index),
+                ops.constant(1.0, torch.float32),
+            ),
+        )
+
+        analysis = tiling_utils.extract_normalized_read_writes(node)
+        self.assertIsNotNone(analysis)
+        self.assertEqual(analysis.expensive_operations, ())
+
+    def test_expensive_operations_unprovable_normalization_negative(self):
+        from torch._inductor import tiling_utils
+
+        original_var, unmapped_var, normalized_var = sympy.symbols("p0 p1 n0")
+        operations = (
+            tiling_utils.ExpensiveOperation(
+                "exp", frozenset((original_var, unmapped_var))
+            ),
+        )
+        normalized = tiling_utils._normalize_expensive_operations(
+            operations,
+            {original_var: normalized_var},
+            OrderedSet((normalized_var,)),
+        )
+        self.assertEqual(normalized, ())
+
     @parametrize(
         "inps",
         (
