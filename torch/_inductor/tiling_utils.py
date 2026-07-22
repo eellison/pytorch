@@ -23,6 +23,7 @@ U = TypeVar("U")
 
 Split = tuple[sympy.Expr, ...]
 VarsAndRanges = tuple[list[sympy.Symbol], list[sympy.Expr]]
+_VariableDependencies = frozenset[sympy.Symbol] | None
 
 
 loop_tiling_log = torch._logging.getArtifactLogger(__name__, "loop_tiling")
@@ -590,12 +591,12 @@ def _extract_expensive_operations(
 ) -> tuple[ExpensiveOperation, ...]:
     """Extract expensive operations and their dependencies in a LoopBody's vars."""
     varying_vars = body.var_ranges.keys()
-    indirect_dependencies: dict[sympy.Symbol, frozenset[sympy.Symbol]] = {}
+    indirect_dependencies: dict[sympy.Symbol, _VariableDependencies] = {}
     operations: list[ExpensiveOperation] = []
 
     def value_dependencies(
-        value: Any, env: dict[torch.fx.Node, frozenset[sympy.Symbol]]
-    ) -> frozenset[sympy.Symbol]:
+        value: Any, env: dict[torch.fx.Node, _VariableDependencies]
+    ) -> _VariableDependencies:
         if isinstance(value, torch.fx.Node):
             return env.get(value, frozenset())
         if isinstance(value, dict):
@@ -604,9 +605,25 @@ def _extract_expensive_operations(
             values = iter(value)
         else:
             return frozenset()
-        return frozenset().union(*(value_dependencies(v, env) for v in values))
+        dependencies: set[sympy.Symbol] = set()
+        for item in values:
+            item_dependencies = value_dependencies(item, env)
+            if item_dependencies is None:
+                return None
+            dependencies.update(item_dependencies)
+        return frozenset(dependencies)
 
-    def index_dependencies(index_name: str) -> frozenset[sympy.Symbol] | None:
+    def merge_dependencies(
+        *dependencies: _VariableDependencies,
+    ) -> _VariableDependencies:
+        merged: set[sympy.Symbol] = set()
+        for dependency in dependencies:
+            if dependency is None:
+                return None
+            merged.update(dependency)
+        return frozenset(merged)
+
+    def index_dependencies(index_name: str) -> _VariableDependencies:
         expr = body.indexing_exprs[index_name]
         dependencies = set(expr.free_symbols & varying_vars)
         for symbol in expr.free_symbols:
@@ -620,10 +637,10 @@ def _extract_expensive_operations(
 
     def analyze_graph(
         graph: torch.fx.Graph,
-        control_dependencies: frozenset[sympy.Symbol] = frozenset(),
-    ) -> frozenset[sympy.Symbol]:
-        env: dict[torch.fx.Node, frozenset[sympy.Symbol]] = {}
-        output_dependencies: frozenset[sympy.Symbol] = frozenset()
+        control_dependencies: _VariableDependencies = frozenset(),
+    ) -> _VariableDependencies:
+        env: dict[torch.fx.Node, _VariableDependencies] = {}
+        output_dependencies: _VariableDependencies = frozenset()
 
         for fx_node in graph.nodes:
             dependencies = value_dependencies((fx_node.args, fx_node.kwargs), env)
@@ -635,8 +652,7 @@ def _extract_expensive_operations(
                     raise AssertionError(
                         f"expected get_index name to be str, got {type(index_name)}"
                     )
-                maybe_dependencies = index_dependencies(index_name)
-                dependencies = maybe_dependencies or frozenset()
+                dependencies = index_dependencies(index_name)
 
             elif (
                 fx_node.op == "call_module"
@@ -654,9 +670,9 @@ def _extract_expensive_operations(
                 mask_dependencies = value_dependencies(fx_node.args[0], env)
                 subblock_dependencies = analyze_graph(
                     body.subblocks[target].graph,
-                    control_dependencies | mask_dependencies,
+                    merge_dependencies(control_dependencies, mask_dependencies),
                 )
-                dependencies |= subblock_dependencies
+                dependencies = merge_dependencies(dependencies, subblock_dependencies)
 
             if fx_node.op == "call_method" and isinstance(target, str):
                 expensive_op = target if target in _LOOP_IR_TRANSCENDENTAL_OPS else None
@@ -678,17 +694,22 @@ def _extract_expensive_operations(
                         ):
                             expensive_op = "indirect_load"
 
-                if expensive_op is not None:
+                operation_dependencies = merge_dependencies(
+                    dependencies, control_dependencies
+                )
+                if expensive_op is not None and operation_dependencies is not None:
                     operations.append(
                         ExpensiveOperation(
                             expensive_op,
-                            dependencies | control_dependencies,
+                            operation_dependencies,
                         )
                     )
 
             env[fx_node] = dependencies
             if fx_node.op == "output":
-                output_dependencies = dependencies | control_dependencies
+                output_dependencies = merge_dependencies(
+                    dependencies, control_dependencies
+                )
 
         return output_dependencies
 

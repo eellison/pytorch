@@ -1147,6 +1147,28 @@ class MemoryCoalescingTest(MockSchedulerTest):
             (tiling_utils.ExpensiveOperation("exp", frozenset(analysis.index_vars)),),
         )
 
+    def test_expensive_operations_broadcast_load_dependency(self):
+        from torch._inductor import tiling_utils
+
+        rows, columns = 4, 8
+        load = self._create_input_loader("exp_column", (columns,))
+        node = self._create_pointwise_node(
+            (rows, columns),
+            lambda index: ops.exp(load([index[1]])),
+        )
+
+        analysis = tiling_utils.extract_normalized_read_writes(node)
+        self.assertIsNotNone(analysis)
+        self.assertEqual(len(analysis.index_vars), 2)
+        self.assertEqual(
+            analysis.expensive_operations,
+            (
+                tiling_utils.ExpensiveOperation(
+                    "exp", frozenset((analysis.index_vars[1],))
+                ),
+            ),
+        )
+
     def test_expensive_operations_dynamic_dependencies_add_no_guards(self):
         from torch._inductor import tiling_utils
 
@@ -1194,6 +1216,71 @@ class MemoryCoalescingTest(MockSchedulerTest):
                 ),
             ),
         )
+
+    def test_expensive_operations_indirect_gather_broadcast_dependency(self):
+        from torch._inductor import tiling_utils
+
+        rows, columns = 16, 8
+        index_load = self._create_input_loader("broadcast_gather_index", (rows,))
+        weight_load = self._create_input_loader("broadcast_gather_weight", (32,))
+
+        def inner_fn(index):
+            indirect = ops.indirect_indexing(
+                index_load([index[0]]), 32, check=True, wrap_neg=True
+            )
+            return weight_load([indirect])
+
+        node = self._create_pointwise_node((rows, columns), inner_fn)
+        analysis = tiling_utils.extract_normalized_read_writes(node)
+
+        self.assertIsNotNone(analysis)
+        self.assertEqual(len(analysis.index_vars), 2)
+        self.assertEqual(
+            analysis.expensive_operations,
+            (
+                tiling_utils.ExpensiveOperation(
+                    "indirect_load", frozenset((analysis.index_vars[0],))
+                ),
+            ),
+        )
+
+    def test_expensive_operations_unresolved_indirect_provenance(self):
+        from torch._inductor import tiling_utils
+
+        rows = 16
+        index_load = self._create_input_loader("unresolved_gather_index", (rows,))
+        weight_load = self._create_input_loader("unresolved_gather_weight", (32,))
+
+        def inner_fn(index):
+            indirect = ops.indirect_indexing(
+                index_load([index[0]]), 32, check=True, wrap_neg=True
+            )
+            return ops.exp(weight_load([indirect]))
+
+        node = self._create_pointwise_node((rows,), inner_fn)
+        resolved = tiling_utils.extract_normalized_read_writes(node)
+        self.assertIsNotNone(resolved)
+        self.assertEqual(
+            [operation.op for operation in resolved.expensive_operations],
+            ["indirect_load", "exp"],
+        )
+        for operation in resolved.expensive_operations:
+            self.assertTrue(operation.varying_vars)
+
+        graph = node._body.root_block.graph
+        set_indirect = [
+            fx_node
+            for fx_node in graph.nodes
+            if fx_node.op == "call_module"
+            and isinstance(fx_node.target, str)
+            and fx_node.target.startswith("set_indirect")
+        ]
+        self.assertEqual(len(set_indirect), 1)
+        graph.erase_node(set_indirect[0])
+
+        unresolved = tiling_utils.extract_normalized_read_writes(node)
+        self.assertIsNotNone(unresolved)
+        self.assertEqual(unresolved.expensive_operations, ())
 
     def test_expensive_operations_transcendental_methods(self):
         from torch._inductor import tiling_utils
