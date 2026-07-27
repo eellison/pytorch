@@ -19902,6 +19902,40 @@ if RUN_GPU:
             self.assertFalse("out_ptr0" in code)
             self.assertEqual(fn_opt(*inps), fn(*inps))
 
+        @requires_gpu_and_triton
+        @parametrize("dynamic", [False, True])
+        @config.patch(
+            {
+                "triton.multi_kernel": False,
+                "triton.persistent_reductions": False,
+            }
+        )
+        def test_loop_invariant_indirect_load_in_reduction(self, dynamic):
+            def fn(data, table, index):
+                scale = table[index].exp()
+                return (data * scale[:, None]).sum(dim=1)
+
+            inps = (
+                torch.randn(17, 257, device=GPU_TYPE),
+                torch.randn(31, device=GPU_TYPE),
+                torch.randint(31, (17,), device=GPU_TYPE),
+            )
+            fn_opt = torch.compile(
+                fn, backend="inductor", fullgraph=True, dynamic=dynamic
+            )
+            actual, (code,) = run_and_get_code(fn_opt, *inps)
+            self.assertEqual(actual, fn(*inps))
+
+            kernel_start = code.index("def triton_")
+            loop_start = code.index("    for r0_offset", kernel_start)
+            kernel_end = code.index("\n\n", loop_start)
+            prologue = code[kernel_start:loop_start]
+            loop_body = code[loop_start:kernel_end]
+
+            self.assertRegex(prologue, r"tl\.load\(in_ptr\d+ \+ \(tmp\d+\)")
+            self.assertRegex(prologue, r"\b(?:libdevice|tl_math)\.exp\(tmp\d+\)")
+            self.assertRegex(loop_body, r"tl\.load\(in_ptr\d+ \+ \([^\n]*\br0")
+
         @config.patch("triton.coalesce_tiling_analysis", True)
         def test_reduction_hint_inner_with_high_tiling_ratio(self):
             """Test inner reduction hint with high tiling score ratio."""

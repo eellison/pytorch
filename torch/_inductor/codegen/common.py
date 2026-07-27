@@ -2004,6 +2004,8 @@ class CSEVariable:
         self.use_count = 1  # track how many times this expression is used
         self.dtype = dtype
         self.shape = shape
+        self.codegen_buffer: IndentedBuffer | None = None
+        self.read_names: OrderedSet[str] = OrderedSet()
 
     def __str__(self) -> str:
         return self.name
@@ -2143,6 +2145,7 @@ class CSE(Generic[CSEVariableType, AugmentedKeyT]):
             var = self.newvar(bounds, dtype, shape)
             self.put(cache_key, var)
             if write:
+                var.codegen_buffer = buffer
                 if V.kernel.current_node:
                     V.kernel.current_node.codegen_originating_info(
                         buffer, only_once=True
@@ -2269,6 +2272,24 @@ class Kernel(CodeGen, Generic[CSEVariableType]):
         # Set minimum number of elements processed per thread.
         self.min_elem_per_thread = 1
         self.kernel_name: str | None = None
+
+    def get_cse_codegen_buffer(
+        self,
+        name: str,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+        shape: BlockShapeType,
+    ) -> IndentedBuffer:
+        return self.compute
+
+    def on_cse_codegen(
+        self,
+        value: CSEVariableType,
+        buffer: IndentedBuffer,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+    ) -> None:
+        pass
 
     @contextlib.contextmanager
     def set_current_node(self, node: SchedulerNode) -> Iterator[None]:
@@ -2809,14 +2830,19 @@ class CSEProxy(DefaultHandler):
                 if v.shape is None:
                     v.shape = var_shape
 
-            csevar = V.kernel.cse.generate(
-                V.kernel.compute,
+            buffer = self.kernel.get_cse_codegen_buffer(
+                name, args, kwargs, var_shape
+            )
+            csevar = self.kernel.cse.generate(
+                buffer,
                 v,
                 bounds=bounds,
                 # pyrefly: ignore[bad-argument-type]
                 dtype=output_dtype,
                 shape=output_shape,
             )
+            self.kernel.on_cse_codegen(csevar, buffer, args, kwargs)
+            declaration_buffer = csevar.codegen_buffer or buffer
 
             csevar.update_on_args(name, args, kwargs)
 
@@ -2824,7 +2850,7 @@ class CSEProxy(DefaultHandler):
                 config.test_configs.runtime_triton_dtype_assert
                 or config.test_configs.static_cpp_dtype_assert
             ) and var_dtype is not None:
-                check_dtype(V.kernel.compute, csevar, var_dtype)
+                check_dtype(declaration_buffer, csevar, var_dtype)
 
             if (
                 config.test_configs.runtime_triton_shape_assert
@@ -2832,10 +2858,10 @@ class CSEProxy(DefaultHandler):
             ):
                 shape_to_check = csevar.shape if csevar.shape is not None else var_shape
                 if shape_to_check is not None:
-                    check_shape(V.kernel.compute, csevar, shape_to_check)
+                    check_shape(declaration_buffer, csevar, shape_to_check)
 
             if config.runtime_triton_nan_asserts:
-                check_nan(V.kernel.compute, csevar)
+                check_nan(declaration_buffer, csevar)
 
             return csevar
 

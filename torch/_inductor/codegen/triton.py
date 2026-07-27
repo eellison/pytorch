@@ -2488,13 +2488,17 @@ class TritonKernelOverrides(TritonOverrides):
         # dtype.  For example, float16 requests emit tl.float32 when compute
         # upcasting is enabled, and should be recorded as torch.float32.
         output_dtype = upcast_compute_type(cast_dtype)
+        buffer = V.kernel.get_cse_codegen_buffer(
+            "index_expr", (expr, dtype), {}, shape
+        )
         var = V.kernel.cse.generate(
-            V.kernel.compute,
+            buffer,
             cls.to_dtype(f"({indexing.index_str})", cast_dtype),
             dtype=output_dtype,
             bounds=get_bounds_index_expr(expr),
             shape=shape,
         )
+        V.kernel.on_cse_codegen(var, buffer, (expr, dtype), {})
 
         var.mask_vars = indexing.mask_vars
         return var
@@ -2514,12 +2518,17 @@ class TritonKernelOverrides(TritonOverrides):
         finally:
             V.kernel._index_dtype = real_index_dtype
         if real_index_dtype != dtype or var.dtype != dtype:
-            var = V.kernel.cse.generate(
-                V.kernel.compute,
-                f"({var}).to({triton_type(dtype)})",
-                dtype=dtype,
-                shape=var.shape,
+            input_var = var
+            buffer = V.kernel.get_cse_codegen_buffer(
+                "value_expr_cast", (input_var, dtype), {}, input_var.shape
             )
+            var = V.kernel.cse.generate(
+                buffer,
+                f"({input_var}).to({triton_type(dtype)})",
+                dtype=dtype,
+                shape=input_var.shape,
+            )
+            V.kernel.on_cse_codegen(var, buffer, (input_var, dtype), {})
         return var
 
     @staticmethod
@@ -4465,20 +4474,91 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         buffer = self.get_load_buffer(indexing)
         self.cse.generate(buffer, line, assignment=False, dtype=torch.int32)
 
-    def get_load_buffer(self, indexing):
-        if indexing.has_indirect() or indexing.has_tmpmask():
-            # Masked loads must come after the mask is computed
+    def _is_loop_invariant_expr(self, expr: sympy.Expr) -> bool:
+        for symbol in expr.free_symbols:
+            if TritonSymbols.is_reduction_index_symbol(self, symbol):
+                return False
+            if symbol_is_type(symbol, SymT.TMP):
+                value = self.cse.varname_map.get(symbol.name)
+                if value is None or not self._is_loop_invariant_cse_var(value):
+                    return False
+        return True
+
+    def _is_loop_invariant_cse_var(self, value: TritonCSEVariable) -> bool:
+        return (
+            value.codegen_buffer is self.body or value in self.outside_loop_vars
+        ) and value.read_names.isdisjoint(self.mutations)
+
+    def get_load_buffer(self, indexing, name: str | None = None):
+        if indexing.has_tmpmask() or indexing.has_rmask():
+            # Masked loads must remain after their mask is computed.
             return self.compute
-        elif (
+        if indexing.has_indirect():
+            if (
+                self.inside_reduction
+                and self.range_trees[-1].is_loop
+                and not indexing.has_rindex()
+                and name is not None
+                and name not in self.mutations
+                and self._is_loop_invariant_expr(indexing.index)
+            ):
+                # Hoist read-only loads with loop-invariant indirect indices.
+                return self.body
+            return self.compute
+        if (
             self.inside_reduction
             and self.range_trees[-1].is_loop
             and not indexing.has_rindex()
         ):
             # can lift a common load outside of reduction loop
-            # One exception is when this is an indirect_load.
             return self.body
-        else:
-            return self.loads
+        return self.loads
+
+    def get_cse_codegen_buffer(
+        self,
+        name: str,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+        shape: BlockShapeType,
+    ) -> IndentedBuffer:
+        if not (
+            self.inside_reduction
+            and self.range_trees[-1].is_loop
+        ):
+            return self.compute
+
+        for value in pytree.tree_leaves((args, kwargs)):
+            if isinstance(value, TritonCSEVariable):
+                if not self._is_loop_invariant_cse_var(value):
+                    return self.compute
+            elif isinstance(value, sympy.Expr):
+                if not self._is_loop_invariant_expr(value):
+                    return self.compute
+            elif not isinstance(
+                value, (int, float, bool, str, torch.dtype, type(None))
+            ):
+                return self.compute
+
+        return self.body
+
+    def on_cse_codegen(
+        self,
+        value: TritonCSEVariable,
+        buffer: IndentedBuffer,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+    ) -> None:
+        for arg in pytree.tree_leaves((args, kwargs)):
+            if isinstance(arg, TritonCSEVariable):
+                value.read_names.update(arg.read_names)
+            elif isinstance(arg, sympy.Expr):
+                for symbol in arg.free_symbols:
+                    if symbol_is_type(symbol, SymT.TMP):
+                        dependency = self.cse.varname_map.get(symbol.name)
+                        if dependency is not None:
+                            value.read_names.update(dependency.read_names)
+        if value.codegen_buffer is self.body:
+            self.outside_loop_vars.add(value)
 
     def _range_tree_mask_shape(self, mask: str) -> BlockShapeType:
         for tree in self.active_range_trees():
@@ -4909,7 +4989,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 line += ".to(tl.int1)"
                 dtype = torch.bool
 
-        load_buffer = self.get_load_buffer(indexing)
+        load_buffer = self.get_load_buffer(indexing, name)
         self._handle_pdl_before_access(load_buffer, name)
         result_var = self.cse.generate(
             load_buffer, make_line(line), dtype=dtype, shape=shape
@@ -4919,6 +4999,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             load_counts[name] -= 1  # don't double count cache hit
         if not isinstance(result_var, TritonCSEVariable):
             raise AssertionError(f"expected TritonCSEVariable, got {type(result_var)}")
+        result_var.read_names.add(name)
         result_var.mask_vars = indexing.mask_vars  # type: ignore[assignment]
 
         if append_broadcast:
@@ -4951,7 +5032,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                     ),
                 )
 
-        if not self.inside_reduction or (not indexing.has_rmask() and not has_rindex):
+        result_var.read_names.add(name)
+        if not self.inside_reduction or load_buffer is self.body:
             self.outside_loop_vars.add(result_var)
 
         return result_var
