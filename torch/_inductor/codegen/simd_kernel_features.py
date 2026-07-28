@@ -4,12 +4,14 @@ import collections
 import dataclasses
 import functools
 import itertools
+import operator
 import typing
 from typing import Any
 
 import sympy
 
 import torch
+import torch.fx
 
 from ...utils._ordered_set import OrderedSet
 from ...utils._sympy.functions import FloorDiv, Min, ModularIndexing
@@ -18,7 +20,7 @@ from ..dependencies import Dep, extract_loop_body_with_args, MemoryDep
 from ..runtime.hints import ReductionHint
 from ..runtime.runtime_utils import next_power_of_2
 from ..scheduler import SchedulerNode
-from ..utils import cache_on_self
+from ..utils import boolean_ops, cache_on_self, reduction_num_outputs
 from ..virtualized import V
 
 
@@ -31,6 +33,276 @@ if typing.TYPE_CHECKING:
 _INNER_REDUCTION_RATIO = 32
 _SMALL_INNER_REDUCTION_RATIO = 16
 _SMALL_INNER_REDUCTION_MAX_RBLOCK = 512
+_SUPPORTED_MULTI_OUTPUT_REDUCTIONS = frozenset(
+    ("online_softmax_reduce", "welford_combine", "welford_reduce")
+)
+_UNSUPPORTED_LIVENESS_OPS = frozenset(
+    ("bucketize", "frexp", "indirect_indexing", "scan", "sort")
+)
+
+
+def _dtype_from_meta(node: torch.fx.Node) -> torch.dtype | None:
+    opt_ctx = node.meta.get("opt_ctx")
+    dtype = getattr(opt_ctx, "dtype", None)
+    if isinstance(dtype, torch.dtype):
+        return dtype
+
+    dtype = node.meta.get("dtype")
+    if isinstance(dtype, torch.dtype):
+        return dtype
+
+    dtype = getattr(node.meta.get("val"), "dtype", None)
+    return dtype if isinstance(dtype, torch.dtype) else None
+
+
+def _promote_reduction_compute_dtype(dtype: torch.dtype) -> torch.dtype:
+    # Triton reduction inputs normally use compute types before reduction.
+    if dtype in (torch.bfloat16, torch.float16):
+        return torch.float32
+    return dtype
+
+
+def _dtype_words(dtype: torch.dtype) -> int:
+    # A sub-word scalar still occupies at least one register-sized word.
+    return max(1, (dtype.itemsize + 3) // 4)
+
+
+def _has_nested_fx_value(value: Any) -> bool:
+    if isinstance(value, torch.fx.Node):
+        return False
+    if isinstance(value, dict):
+        return any(_has_nested_fx_value(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(
+            isinstance(item, torch.fx.Node) or _has_nested_fx_value(item)
+            for item in value
+        )
+    return False
+
+
+def _estimate_reduction_live_tile_words(block: Any) -> int | None:
+    """
+    Estimate peak live reduction-varying 32-bit tile words in one FX block.
+
+    This is a pressure proxy over FX SSA values, not an estimate of n_regs.
+    Padded RBLOCK and worker-thread conversion is intentionally left out because
+    reduction state and tile-valued SSA do not share one clean shape conversion.
+    """
+    body = getattr(block, "body", None)
+    graph = getattr(block, "graph", None)
+    if body is None or not isinstance(graph, torch.fx.Graph):
+        return None
+    if getattr(body, "subblocks", None) or getattr(body, "indirect_vars", None):
+        return None
+
+    reduce_vars = set(getattr(body, "reduce_vars", ()))
+    indexing_exprs = getattr(body, "indexing_exprs", None)
+    if not isinstance(indexing_exprs, dict):
+        return None
+
+    nodes = list(graph.nodes)
+    positions = {node: index for index, node in enumerate(nodes)}
+    dtypes: dict[torch.fx.Node, torch.dtype | tuple[torch.dtype, ...] | None] = {}
+    reduction_varying: dict[torch.fx.Node, bool] = {}
+    live_words: dict[torch.fx.Node, int] = {}
+
+    def input_nodes(node: torch.fx.Node) -> list[torch.fx.Node]:
+        return [item for item in node.all_input_nodes if item.op != "placeholder"]
+
+    def scalar_input_dtypes(node: torch.fx.Node) -> list[torch.dtype] | None:
+        result: list[torch.dtype] = []
+        for item in input_nodes(node):
+            dtype = dtypes.get(item)
+            if not isinstance(dtype, torch.dtype):
+                return None
+            result.append(dtype)
+        return result
+
+    def promoted_input_dtype(node: torch.fx.Node) -> torch.dtype | None:
+        inputs = scalar_input_dtypes(node)
+        if not inputs:
+            return None
+        return _promote_reduction_compute_dtype(
+            functools.reduce(torch.promote_types, inputs)
+        )
+
+    for node in nodes:
+        if node.op == "placeholder":
+            dtypes[node] = None
+            reduction_varying[node] = False
+            continue
+
+        if node.op == "call_module":
+            if node.target != "get_index" or len(node.args) != 1:
+                return None
+            expr = indexing_exprs.get(node.args[0])
+            if not isinstance(expr, sympy.Expr):
+                return None
+            dtypes[node] = torch.int64
+            reduction_varying[node] = bool(expr.free_symbols & reduce_vars)
+            continue
+
+        if node.op == "call_function":
+            if node.target is not operator.getitem or len(node.args) != 2:
+                return None
+            source, index = node.args
+            if not isinstance(source, torch.fx.Node) or not isinstance(index, int):
+                return None
+            source_dtype = dtypes.get(source)
+            if (
+                not isinstance(source_dtype, tuple)
+                or not 0 <= index < len(source_dtype)
+            ):
+                return None
+            dtypes[node] = source_dtype[index]
+            reduction_varying[node] = reduction_varying[source]
+            # getitem aliases one component of reduction state.
+            continue
+
+        if node.op == "output":
+            dtypes[node] = None
+            reduction_varying[node] = False
+            continue
+
+        if node.op != "call_method" or not isinstance(node.target, str):
+            return None
+        target = node.target
+        if target in _UNSUPPORTED_LIVENESS_OPS:
+            return None
+
+        varying = any(reduction_varying[item] for item in input_nodes(node))
+
+        if target == "reduction":
+            if len(node.args) != 5:
+                return None
+            _, dtype, src_dtype, reduction_type, value = node.args
+            if (
+                not isinstance(dtype, torch.dtype)
+                or not isinstance(src_dtype, torch.dtype)
+                or not isinstance(reduction_type, str)
+            ):
+                return None
+
+            outputs = reduction_num_outputs(reduction_type)
+            if outputs > 1 and reduction_type not in _SUPPORTED_MULTI_OUTPUT_REDUCTIONS:
+                return None
+            if reduction_type == "online_softmax_reduce":
+                if isinstance(value, tuple):
+                    if len(value) != 2 or not all(
+                        isinstance(item, torch.fx.Node) for item in value
+                    ):
+                        return None
+                elif not isinstance(value, torch.fx.Node):
+                    return None
+            elif reduction_type == "welford_combine":
+                if (
+                    not isinstance(value, tuple)
+                    or len(value) != 3
+                    or not all(isinstance(item, torch.fx.Node) for item in value)
+                ):
+                    return None
+            elif not isinstance(value, torch.fx.Node):
+                return None
+
+            state_dtype = _promote_reduction_compute_dtype(dtype)
+            dtypes[node] = (
+                tuple(state_dtype for _ in range(outputs))
+                if outputs > 1
+                else state_dtype
+            )
+            reduction_varying[node] = True
+            live_words[node] = outputs * _dtype_words(state_dtype)
+            continue
+
+        if any(_has_nested_fx_value(arg) for arg in node.args[1:]) or any(
+            _has_nested_fx_value(value) for value in node.kwargs.values()
+        ):
+            return None
+
+        if target in ("store", "store_reduction", "partial_accumulate"):
+            dtypes[node] = None
+            reduction_varying[node] = False
+            continue
+
+        dtype: torch.dtype | None
+        if target in ("load", "load_seed"):
+            if len(node.args) < 2 or not isinstance(node.args[1], str):
+                return None
+            try:
+                dtype = V.graph.get_dtype(node.args[1])
+            except (
+                AssertionError,
+                AttributeError,
+                KeyError,
+                NotImplementedError,
+                RuntimeError,
+            ):
+                dtype = _dtype_from_meta(node)
+            if dtype is not None:
+                dtype = _promote_reduction_compute_dtype(dtype)
+        elif target == "constant":
+            dtype = node.args[-1] if isinstance(node.args[-1], torch.dtype) else None
+            if dtype is not None:
+                dtype = _promote_reduction_compute_dtype(dtype)
+        elif target in ("index_expr", "value_expr"):
+            dtype = node.args[-1] if isinstance(node.args[-1], torch.dtype) else None
+        elif target in ("to_dtype", "to_dtype_bitcast"):
+            dtype_arg = node.kwargs.get(
+                "dtype", node.args[2] if len(node.args) > 2 else None
+            )
+            dtype = dtype_arg if isinstance(dtype_arg, torch.dtype) else None
+            if dtype is not None and node.kwargs.get("use_compute_types", True):
+                dtype = _promote_reduction_compute_dtype(dtype)
+        elif target in boolean_ops():
+            dtype = torch.bool
+        elif target in ("rand", "randn", "rand_eager"):
+            dtype = torch.float32
+        else:
+            dtype = _dtype_from_meta(node)
+            if dtype is not None:
+                dtype = _promote_reduction_compute_dtype(dtype)
+            else:
+                dtype = promoted_input_dtype(node)
+
+        if dtype is None:
+            return None
+        dtypes[node] = dtype
+        reduction_varying[node] = varying
+        if varying:
+            live_words[node] = _dtype_words(dtype)
+
+    last_uses: dict[torch.fx.Node, int] = {}
+    for node in live_words:
+        users = list(node.users)
+        dtype = dtypes[node]
+        if isinstance(dtype, tuple):
+            if not users or any(
+                user.op != "call_function" or user.target is not operator.getitem
+                for user in users
+            ):
+                return None
+            users = [
+                component_user
+                for getitem in users
+                for component_user in getitem.users
+            ]
+        last_uses[node] = max(
+            (positions[user] for user in users), default=positions[node]
+        )
+
+    expiring: dict[int, list[torch.fx.Node]] = collections.defaultdict(list)
+    for node, last_use in last_uses.items():
+        expiring[last_use].append(node)
+
+    current_words = 0
+    peak_words = 0
+    for index, node in enumerate(nodes):
+        current_words += live_words.get(node, 0)
+        peak_words = max(peak_words, current_words)
+        for expired in expiring[index]:
+            current_words -= live_words[expired]
+
+    return peak_words
 
 
 def tiling_scores_suggest_inner_reduction(
@@ -159,6 +431,32 @@ class SIMDKernelFeatures:
         for node in self.scheduler_nodes():
             counts.update(node._body.op_counts)
         return counts
+
+    @cache_on_self
+    def persistent_reduction_live_tile_words(self) -> int | None:
+        """
+        Return a pre-codegen pressure proxy in live 32-bit tile words.
+
+        The estimate is the maximum block-local FX SSA liveness peak. It is not
+        n_regs and intentionally excludes padded RBLOCK and worker-thread
+        conversion. Unsupported graph structure returns None.
+        """
+        if not self.is_reduction():
+            return None
+
+        peak = 0
+        found_block = False
+        for node in self.scheduler_nodes():
+            body = getattr(node, "_body", None)
+            block = getattr(body, "root_block", None)
+            if block is None:
+                return None
+            block_peak = _estimate_reduction_live_tile_words(block)
+            if block_peak is None:
+                return None
+            peak = max(peak, block_peak)
+            found_block = True
+        return peak if found_block else None
 
     def contains_op(self, op_name: str) -> bool:
         """True if V.ops.{op_name} is used in node_schedule"""
