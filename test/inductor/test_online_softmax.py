@@ -6,7 +6,7 @@ import os
 import torch
 import torch._inductor.config as inductor_config
 import torch.nn.functional as F
-from torch._dynamo.utils import rmse, same
+from torch._dynamo.utils import counters, rmse, same
 from torch._inductor.runtime.hints import DeviceProperties
 from torch._inductor.test_case import run_tests, TestCase
 from torch._inductor.utils import run_and_get_code
@@ -178,6 +178,101 @@ class TestOnlineSoftmax(TestCase):
                 # A single loop due to online softmax
                 expected_num_loop = 1
             self.assertEqual(code.count("for r0_offset in"), expected_num_loop)
+
+    @parametrize("reuse", (False, True))
+    def test_reuse_broadcast_bias_in_softmax(self, reuse):
+        def f(scores, index, table):
+            scores = torch.ops.aten.view.default(scores, [128, 32, 49, 49])
+            index = torch.ops.aten.view.default(index, [-1])
+            bias = torch.ops.aten.index.Tensor(table, [index])
+            bias = torch.ops.aten.view.default(bias, [49, 49, 32])
+            bias = torch.ops.aten.permute.default(bias, [2, 0, 1])
+            bias = torch.ops.aten.clone.default(
+                bias, memory_format=torch.contiguous_format
+            )
+            bias = torch.ops.aten.unsqueeze.default(bias, 0)
+            x = torch.ops.prims.convert_element_type.default(
+                torch.ops.aten.add.Tensor(scores, bias), torch.float32
+            )
+            xmax = x.amax(dim=-1, keepdim=True)
+            xexp = (x - xmax).exp()
+            result = (xexp / xexp.sum(dim=-1, keepdim=True)).to(torch.bfloat16)
+            return torch.ops.aten.expand.default(result, [128, 32, 49, 49])
+
+        scores = torch.randn(
+            128, 32, 49, 49, device=GPU_TYPE, dtype=torch.bfloat16
+        )
+        index = torch.randint(0, 169, (49, 49), device=GPU_TYPE)
+        table = torch.randn(169, 32, device=GPU_TYPE, dtype=torch.bfloat16)
+        patches = {
+            "triton.broadcast_reuse_tiling": reuse,
+            "triton.dense_indexing": True,
+            "triton.max_tiles": 3,
+        }
+        prior = counters["inductor"]["broadcast_reuse_tiling"]
+        with inductor_config.patch(patches):
+            actual, (code,) = run_and_get_code(
+                torch.compile(f), scores, index, table
+            )
+
+        self.assertEqual(f(scores, index, table), actual, atol=1e-2, rtol=1e-2)
+        self.assertEqual(code.count("def triton"), 1)
+        self.assertIn("prepare_softmax_online", code)
+        self.assertEqual(
+            counters["inductor"]["broadcast_reuse_tiling"] - prior, int(reuse)
+        )
+        compact_code = code.replace(" ", "")
+        self.assertEqual("YBLOCK:tl.constexpr" in compact_code, reuse)
+        self.assertEqual("[1,XBLOCK,R0_BLOCK]" in compact_code, reuse)
+
+    def test_broadcast_reuse_tiling_requires_indirect_load(self):
+        def f(x, scale, bias):
+            y = x + scale[None, :, None, None]
+            return (y + bias[None, :, None, None]).mean(dim=(-1, -2))
+
+        x = torch.empty(
+            (128, 768, 7, 7),
+            device=GPU_TYPE,
+            memory_format=torch.channels_last,
+        ).normal_()
+        scale = torch.randn(768, device=GPU_TYPE)
+        bias = torch.randn(768, device=GPU_TYPE)
+        prior = counters["inductor"]["broadcast_reuse_tiling"]
+        patches = {
+            "triton.broadcast_reuse_tiling": True,
+            "triton.max_tiles": 3,
+        }
+        with inductor_config.patch(patches):
+            actual = torch.compile(f)(x, scale, bias)
+
+        self.assertEqual(f(x, scale, bias), actual)
+        self.assertEqual(counters["inductor"]["broadcast_reuse_tiling"], prior)
+
+    def test_broadcast_reuse_tiling_requires_related_indirect_load(self):
+        def f(x, scale, bias, index, table):
+            gathered = torch.ops.aten.index.Tensor(table, [index])
+            y = x + scale[None, :, None, None]
+            return (y + bias[None, :, None, None] + gathered).mean(dim=(-1, -2))
+
+        x = torch.empty(
+            (128, 768, 7, 7),
+            device=GPU_TYPE,
+            memory_format=torch.channels_last,
+        ).normal_()
+        scale = torch.randn(768, device=GPU_TYPE)
+        bias = torch.randn(768, device=GPU_TYPE)
+        index = torch.randint(0, 32, (), device=GPU_TYPE)
+        table = torch.randn(32, device=GPU_TYPE)
+        prior = counters["inductor"]["broadcast_reuse_tiling"]
+        patches = {
+            "triton.broadcast_reuse_tiling": True,
+            "triton.max_tiles": 3,
+        }
+        with inductor_config.patch(patches):
+            actual = torch.compile(f)(x, scale, bias, index, table)
+
+        self.assertEqual(f(x, scale, bias, index, table), actual)
+        self.assertEqual(counters["inductor"]["broadcast_reuse_tiling"], prior)
 
     def test_prepare_softmax_after_partitioning(self):
         from torch._dynamo.backends.common import aot_autograd

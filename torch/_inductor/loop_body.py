@@ -14,7 +14,7 @@ import torch.fx
 from torch._dynamo.utils import identity
 from torch.fx.proxy import Scope, TracerBase
 from torch.utils._sympy.functions import Mod
-from torch.utils._sympy.symbol import SymT
+from torch.utils._sympy.symbol import symbol_is_type, SymT
 
 from . import config, dependencies
 from .codegen.common import index_prevent_reordering
@@ -667,7 +667,77 @@ class LoopBodyBlock:
         graph = self.graph
         submodules = self.body.submodules
 
+        if getattr(V.kernel, "broadcast_reuse_tiling", False):
+            graph = torch.fx.Graph()
+            graph.output(graph.graph_copy(self.graph, {}))
+            self.schedule_broadcast_loads(graph)
+
         return InterpreterShim(graph, submodules).run(V.get_ops_handler())
+
+    def schedule_broadcast_loads(self, graph: torch.fx.Graph) -> None:
+        if self.body.indexing is None or not hasattr(V.kernel, "range_trees"):
+            return
+        if sum(not tree.is_reduction for tree in V.kernel.range_trees) < 2:
+            return
+
+        nodes = list(graph.nodes)
+        node_pos = {node: pos for pos, node in enumerate(nodes)}
+        loads = []
+        for node in nodes:
+            if node.op != "call_method" or node.target != "load":
+                continue
+            index_node = node.args[2]
+            if (
+                not isinstance(index_node, torch.fx.Node)
+                or index_node.op != "call_module"
+                or index_node.target != "get_index"
+            ):
+                continue
+            index = self.body.indexing[index_node.args[0]]
+            if any(
+                symbol_is_type(symbol, (SymT.INDIRECT, SymT.TMP))
+                for symbol in index.free_symbols
+            ):
+                continue
+            strides = V.kernel.get_strides_of_load(index)
+            varying_dims = sum(
+                not tree.is_reduction
+                and not V.graph.sizevars.statically_known_equals(stride, 0)
+                for tree, stride in zip(
+                    V.kernel.range_trees, strides.values(), strict=True
+                )
+            )
+            loads.append((node_pos[node], varying_dims, index_node, node))
+
+        for load_pos, varying_dims, index_node, load in loads:
+            if load.args[1] in V.graph.mutated_buffers:
+                continue
+            if len(index_node.users) != 1:
+                continue
+            if any(
+                user.op == "call_module"
+                and str(user.target).startswith("set_indirect")
+                for user in load.users
+            ):
+                continue
+            later_broadcast_loads = [
+                other_pos
+                for other_pos, other_dims, _, _ in loads
+                if other_pos > load_pos and other_dims < varying_dims
+            ]
+            if not later_broadcast_loads:
+                continue
+
+            users = [user for user in load.users if node_pos[user] > load_pos]
+            if not users:
+                continue
+            first_user = min(users, key=node_pos.__getitem__)
+            if node_pos[first_user] <= max(later_broadcast_loads):
+                continue
+            first_user.prepend(index_node)
+            first_user.prepend(load)
+            graph.lint()
+            return
 
     def debug_str(self, name="block"):
         code = torch.fx.GraphModule(self.body.submodules, self.graph).code

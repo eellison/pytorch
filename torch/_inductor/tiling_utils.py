@@ -1,13 +1,13 @@
 import dataclasses
 import itertools
 from collections import Counter, defaultdict
-from collections.abc import Callable
-from typing import Literal, overload, TYPE_CHECKING, TypeVar, Union
+from collections.abc import Callable, Mapping, Sequence
+from typing import Any, Literal, overload, TYPE_CHECKING, TypeVar, Union
 
 import sympy
 
 import torch
-from torch._inductor.dependencies import index_vars_no_squeeze
+from torch._inductor.dependencies import index_vars_no_squeeze, ReadWrites
 from torch._inductor.utils import sympy_product, sympy_subs
 from torch.utils._ordered_set import OrderedSet
 from torch.utils._sympy.functions import Identity
@@ -30,7 +30,11 @@ from torch.utils._sympy.functions import FloorDiv, ModularIndexing
 
 
 if TYPE_CHECKING:
-    from torch._inductor.scheduler import FusedSchedulerNode, SchedulerNode
+    from torch._inductor.scheduler import (
+        BaseSchedulerNode,
+        FusedSchedulerNode,
+        SchedulerNode,
+    )
 
 
 def solve_for_zero(expr: sympy.Expr) -> sympy.Expr | None:
@@ -229,6 +233,40 @@ def has_indirect_access(memory_expr: sympy.Expr) -> bool:
     return any(symbol_is_type(s, SymT.INDIRECT) for s in memory_expr.free_symbols)
 
 
+def _get_indirect_index_buffer_names(
+    fused_node: Union["_FusedNodeView", "FusedSchedulerNode", "SchedulerNode"],
+) -> OrderedSet[str]:
+    from torch._inductor.scheduler import FusedSchedulerNode, SchedulerNode
+
+    result: OrderedSet[str] = OrderedSet()
+    sched_nodes = itertools.chain.from_iterable(
+        node.get_nodes() if isinstance(node, FusedSchedulerNode) else (node,)
+        for node in fused_node.get_nodes()
+    )
+    for sched_node in sched_nodes:
+        if not isinstance(sched_node, SchedulerNode):
+            continue
+        body = sched_node._body
+        for block in itertools.chain((body.root_block,), body.subblocks.values()):
+            for set_indirect in block.graph.find_nodes(op="call_module"):
+                if not str(set_indirect.target).startswith("set_indirect"):
+                    continue
+                pending = list(set_indirect.all_input_nodes)
+                visited: OrderedSet[torch.fx.Node] = OrderedSet()
+                while pending:
+                    node = pending.pop()
+                    if node in visited:
+                        continue
+                    visited.add(node)
+                    if node.op == "call_method" and node.target == "load":
+                        buffer_name = node.args[1]
+                        if isinstance(buffer_name, str):
+                            result.add(buffer_name)
+                    else:
+                        pending.extend(node.all_input_nodes)
+    return result
+
+
 @dataclasses.dataclass(frozen=True)
 class FusedNormalizedReadsWrites:
     """
@@ -240,6 +278,22 @@ class FusedNormalizedReadsWrites:
     reads: dict[sympy.Expr, OrderedSet[str]]
     writes: dict[sympy.Expr, OrderedSet[str]]
     var_ranges: dict[sympy.Symbol, int]
+
+
+@dataclasses.dataclass(frozen=True)
+class _FusedNodeView:
+    nodes: Sequence["BaseSchedulerNode"]
+    read_writes: ReadWrites
+    group: Any
+
+    def get_nodes(self) -> Sequence["BaseSchedulerNode"]:
+        return self.nodes
+
+    def get_buffer_names(self) -> OrderedSet[str]:
+        return OrderedSet.union(*(node.get_buffer_names() for node in self.nodes))
+
+    def get_operation_names(self) -> OrderedSet[str]:
+        return OrderedSet(node.get_name() for node in self.nodes)
 
 
 @overload
@@ -317,7 +371,7 @@ class NodeSplitGetter:
 
     def __init__(
         self,
-        node: Union["FusedSchedulerNode", "SchedulerNode"],
+        node: Union["_FusedNodeView", "FusedSchedulerNode", "SchedulerNode"],
     ):
         self.node = node
         self.pointwise_numel: sympy.Expr = node.group[1][0]
@@ -519,7 +573,7 @@ def apply_var_mapping(
 
 
 def extract_normalized_read_writes(
-    node: Union["FusedSchedulerNode", "SchedulerNode"],
+    node: Union["_FusedNodeView", "FusedSchedulerNode", "SchedulerNode"],
 ) -> FusedNormalizedReadsWrites | None:
     """Extracts index variables, reduce variables, read/write expressions, and variable ranges from a fused node."""
     reads: dict[sympy.Expr, OrderedSet[str]] = defaultdict(OrderedSet)
@@ -699,9 +753,52 @@ class CoalesceVarAnalysis:
 
     suggested_split: VarTiling | None = None
 
+    broadcast_by_var: dict[sympy.Expr, int] = dataclasses.field(default_factory=dict)
+
+    def is_broadcast_reuse_tiling(
+        self, tiling: Mapping[str, sympy.Expr]
+    ) -> bool:
+        pointwise_tiling = tuple(
+            size for name, size in tiling.items() if name in ("z", "y", "x")
+        )
+        if len(pointwise_tiling) < 2:
+            return False
+
+        index_vars = self.norm_read_writes.index_vars
+        var_ranges = self.norm_read_writes.var_ranges
+        for broadcast_var, score in self.broadcast_by_var.items():
+            if score <= 0:
+                continue
+            splits = []
+            product = sympy.S.One
+            for var in index_vars:
+                product *= var_ranges[var]
+                if var == broadcast_var:
+                    splits.append(product)
+                    product = sympy.S.One
+            if product != 1:
+                splits.append(product)
+            if len(splits) != len(pointwise_tiling):
+                continue
+            if all(
+                V.graph.sizevars.statically_known_equals(actual, expected)
+                for actual, expected in zip(
+                    splits, pointwise_tiling, strict=True
+                )
+            ):
+                return True
+        return False
+
+
+# Keep the initial heuristic conservative until loop tilings can be autotuned.
+_MIN_BROADCAST_REUSE_BYTES = 4096
+# This lets eight reused rows fit in a 512-element persistent block.
+_MAX_BROADCAST_REUSE_REDUCTION_NUMEL = 64
+_BROADCAST_REUSE_OUTPUT_SLICE_MULTIPLIER = 16
+
 
 def _analyze_memory_coalescing(
-    fused_node: Union["FusedSchedulerNode", "SchedulerNode"],
+    fused_node: Union["_FusedNodeView", "FusedSchedulerNode", "SchedulerNode"],
 ) -> CoalesceVarAnalysis | None:
     """
     Implementation for BaseSchedulerNode.get_coalesce_analysis().
@@ -727,13 +824,23 @@ def _analyze_memory_coalescing(
     reads = norm_read_writes.reads
     writes = norm_read_writes.writes
     var_ranges = norm_read_writes.var_ranges
+    has_indirect_read = any(has_indirect_access(expr) for expr in reads)
+    indirect_index_buffers = (
+        _get_indirect_index_buffer_names(fused_node)
+        if has_indirect_read
+        else OrderedSet()
+    )
 
     coalesced_by_var: dict[sympy.Symbol, int] = Counter()
+    broadcast_by_var: dict[sympy.Symbol, int] = Counter()
+    broadcast_bytes_by_var: dict[sympy.Symbol, int] = Counter()
+    output_slice_bytes_by_var: dict[sympy.Symbol, int] = Counter()
     uncoalesced_addrs: dict[sympy.Expr, int] = Counter()
 
     # Only check pointwise-only kernels
     index_vars = norm_read_writes.index_vars
     reduce_vars = norm_read_writes.reduce_vars
+    reduction_numel = get_hint(sympy_product(var_ranges[var] for var in reduce_vars))
     innermost_var = (
         next(reversed(index_vars)) if index_vars and not reduce_vars else None
     )
@@ -761,13 +868,35 @@ def _analyze_memory_coalescing(
                 maybe_coalesced_var = find_broadcast_var(memory_expr, var_ranges)
 
         total_score = 0
+        indirect_index_score = 0
         for buf_name in buf_names:
             if (buf := V.graph.try_get_buffer(buf_name)) and (
                 buf_size := try_get_buf_size(buf_name)
             ):
                 # constrain by buf size since we'll read at most that many elements
                 # score could be more through either masking or by broadcasting (e.g. x // 16)
-                total_score += min(buf_size, size) * buf.dtype.itemsize
+                buf_score = min(buf_size, size) * buf.dtype.itemsize
+                total_score += buf_score
+                if buf_name in indirect_index_buffers:
+                    indirect_index_score += buf_score
+
+        if (
+            is_read
+            and not indirect_expr
+            and has_indirect_read
+            and indirect_index_score
+            and reduce_vars
+            and reduction_numel <= _MAX_BROADCAST_REUSE_REDUCTION_NUMEL
+        ):
+            for var in index_vars:
+                if var not in memory_expr.free_symbols:
+                    broadcast_bytes_by_var[var] += indirect_index_score
+        elif not is_read:
+            for var in index_vars:
+                if var in memory_expr.free_symbols:
+                    output_slice_bytes_by_var[var] += total_score // get_hint(
+                        var_ranges[var]
+                    )
 
         # coalesced writes more important
         total_score *= 1 if is_read else 2
@@ -802,11 +931,26 @@ def _analyze_memory_coalescing(
         else:
             uncoalesced_addrs[memory_expr] += total_score
 
+    if torch._inductor.config.triton.broadcast_reuse_tiling:
+        for var, broadcast_bytes in broadcast_bytes_by_var.items():
+            output_slice_bytes = output_slice_bytes_by_var[var]
+            if (
+                broadcast_bytes < _MIN_BROADCAST_REUSE_BYTES
+                or output_slice_bytes == 0
+                or broadcast_bytes * _BROADCAST_REUSE_OUTPUT_SLICE_MULTIPLIER
+                < output_slice_bytes
+            ):
+                continue
+            reuse_score = broadcast_bytes * max(get_hint(var_ranges[var]) - 1, 0)
+            coalesced_by_var[var] += reuse_score
+            broadcast_by_var[var] += reuse_score
+
     if not uncoalesced_addrs:
         return CoalesceVarAnalysis(
             coalesced_by_var=coalesced_by_var,
             uncoalesced_addrs=uncoalesced_addrs,
             norm_read_writes=norm_read_writes,
+            broadcast_by_var=broadcast_by_var,
         )
 
     # map from var -> tiling -> total_score
@@ -862,6 +1006,7 @@ def _analyze_memory_coalescing(
             coalesced_by_var=coalesced_by_var,
             uncoalesced_addrs=uncoalesced_addrs,
             norm_read_writes=norm_read_writes,
+            broadcast_by_var=broadcast_by_var,
         )
 
     best_tiling: tuple[sympy.Expr, int] | None = None
@@ -878,6 +1023,7 @@ def _analyze_memory_coalescing(
             coalesced_by_var=coalesced_by_var,
             uncoalesced_addrs=uncoalesced_addrs,
             norm_read_writes=norm_read_writes,
+            broadcast_by_var=broadcast_by_var,
         )
 
     # TODO - for strictly pointwise fusions,
@@ -889,4 +1035,39 @@ def _analyze_memory_coalescing(
         uncoalesced_addrs=uncoalesced_addrs,
         norm_read_writes=norm_read_writes,
         suggested_split=VarTiling(best_tiling[0], best_tiling[1], best_tiling_score),
+        broadcast_by_var=broadcast_by_var,
+    )
+
+
+def analyze_memory_coalescing_for_nodes(
+    nodes: Sequence["BaseSchedulerNode"],
+) -> CoalesceVarAnalysis | None:
+    if not nodes:
+        return None
+
+    from torch._inductor import scheduler
+
+    node_types = (scheduler.FusedSchedulerNode, scheduler.SchedulerNode)
+    if not all(isinstance(node, node_types) for node in nodes):
+        return None
+
+    if len(nodes) == 1:
+        return nodes[0].get_coalesce_analysis()
+
+    graph_scheduler = getattr(V.graph, "scheduler", None)
+    if graph_scheduler is not None:
+        fused_node = graph_scheduler.name_to_fused_node.get(nodes[0].get_first_name())
+        if fused_node is not None:
+            fused_nodes = list(fused_node.get_nodes())
+            if len(fused_nodes) == len(nodes) and all(
+                fused is node for fused, node in zip(fused_nodes, nodes, strict=True)
+            ):
+                return fused_node.get_coalesce_analysis()
+
+    return _analyze_memory_coalescing(
+        _FusedNodeView(
+            nodes=nodes,
+            read_writes=ReadWrites.merge_list([node.read_writes for node in nodes]),
+            group=max(nodes, key=lambda node: int(node.is_reduction())).group,
+        )
     )

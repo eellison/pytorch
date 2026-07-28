@@ -645,6 +645,17 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
     def index_dtype(self) -> str:
         return self.dtype_to_str(self.get_index_dtype_as_torch_dtype())
 
+    @functools.cached_property
+    def broadcast_reuse_tiling(self) -> bool:
+        analysis = self.features.coalesce_analysis
+        enabled = (
+            self.inside_reduction
+            and analysis is not None
+            and analysis.is_broadcast_reuse_tiling(self.tiling)
+        )
+        counters["inductor"]["broadcast_reuse_tiling"] += int(enabled)
+        return enabled
+
     def want_no_x_dim(self) -> bool:
         return False
 
@@ -4598,10 +4609,26 @@ class SIMDScheduling(BaseScheduling):
         if not any(n.is_template() for n in nodes):
             _, (numel, rnumel) = max(nodes, key=lambda x: int(x.is_reduction())).group
             node_schedule = self.generate_node_schedule(nodes, numel, rnumel)
-            tiling = self.select_tiling(node_schedule, numel, rnumel)
+            coalesce_analysis = None
+            if torch._inductor.config.triton.coalesce_tiling_analysis:
+                from torch._inductor.tiling_utils import (
+                    analyze_memory_coalescing_for_nodes,
+                )
+
+                coalesce_analysis = analyze_memory_coalescing_for_nodes(nodes)
+            features = SIMDKernelFeatures(
+                node_schedule, numel, rnumel, coalesce_analysis=coalesce_analysis
+            )
+            tiling, tiling_scores = self.get_tiling_and_scores(
+                node_schedule,
+                numel,
+                rnumel,
+                features.coalesce_analysis,
+            )
             kernel = self.kernel_type(
                 tiling,
-                features=SIMDKernelFeatures(node_schedule, numel, rnumel),
+                features=features,
+                tiling_scores=tiling_scores,
             )
             self.codegen_node_schedule_with_kernel(node_schedule, kernel)
             # Collect config_patches from operations

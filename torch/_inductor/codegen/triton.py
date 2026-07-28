@@ -3395,6 +3395,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         block_ptr=False,
         tma_compatibility_checker: TMACompatibilityChecker | None = None,
         mask_constant_index=False,
+        preserve_broadcast_shape=False,
     ):
         """
         Compute the index and mask to pass to tl.load() or tl.store()
@@ -3843,6 +3844,24 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 expand_str = "[" + ",".join(map(str, expand_list)) + "]"
                 expand_shape = tuple(expand_list)
                 index_str = f"tl.broadcast_to({index_str}, {expand_str})"
+            elif preserve_broadcast_shape and self.broadcast_reuse_tiling:
+                load_shape = self._broadcast_shape_with_masks(
+                    TritonSymbols.get_block_shape(index), mask_vars
+                )
+                if self._load_mask:
+                    load_shape = self._broadcast_shape_with_masks(
+                        load_shape, OrderedSet([self._load_mask])
+                    )
+
+                if load_shape is None:
+                    expand_str, expand_shape = _get_expand_str()
+                    mask_vars = dense_mask_vars
+                else:
+                    expand_shape = load_shape
+                    if load_shape:
+                        expand_str = "[" + ",".join(map(str, load_shape)) + "]"
+                if expand_str is not None:
+                    index_str = f"tl.broadcast_to({index_str}, {expand_str})"
             else:
                 expand_str, expand_shape = _get_expand_str()
                 index_str = f"tl.broadcast_to({index_str}, {expand_str})"
@@ -4216,6 +4235,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         indexing = self.indexing(
             index,
             block_ptr=True,
+            preserve_broadcast_shape=True,
             tma_compatibility_checker=self.tma_compatibility_checker_cls(
                 self,
                 dtype,

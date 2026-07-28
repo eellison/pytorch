@@ -1921,6 +1921,12 @@ class triton:
         == "1"
     )
 
+    # Tile pointwise dimensions to reuse broadcast loads inside reductions.
+    broadcast_reuse_tiling: bool = Config(
+        env_name_force="TORCHINDUCTOR_BROADCAST_REUSE_TILING",
+        default=True,
+    )
+
     # limit tiling dimensions
     #   - max_tiles=1 disables tiling
     #   - max_tiles=2
