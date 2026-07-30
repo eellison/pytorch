@@ -2081,6 +2081,36 @@ class MemoryCoalescingTest(MockSchedulerTest):
 layouts = ("cont", "NHWC", "T")
 
 
+def broadcasted_work(x, logits, mean0, mean1, labels, scale, substantial=True):
+    """A fused pointwise region with both row-only and full-domain work."""
+    cols = x.shape[1]
+    values = (logits.float() - mean0 - mean1).bfloat16()
+    valid = (labels >= 0) & (labels < cols)
+    row = torch.where(labels != -100, scale / 3.0, 0.0)
+    if substantial:
+        row = row * 1.25
+        miss = torch.where(torch.isfinite(row), 0.0, row * 0.0)
+        hit = torch.where(valid, -row, 0.0)
+        compact = torch.where(miss == 0, hit, miss)
+    else:
+        compact = torch.where(valid, -row, 0.0)
+    lanes = torch.arange(cols, device=x.device)[None, :]
+    dense = torch.where(labels == lanes, -row, 0.0)
+    return x + (dense - values * compact).bfloat16()
+
+
+def broadcasted_work_args(rows, cols):
+    x = torch.randn(rows, cols, device=GPU_TYPE, dtype=torch.bfloat16)
+    return (
+        x,
+        torch.randn_like(x),
+        torch.randn(rows, 1, device=GPU_TYPE),
+        torch.randn(rows, 1, device=GPU_TYPE),
+        torch.randint(-1, cols, (rows, 1), device=GPU_TYPE),
+        torch.randn((), device=GPU_TYPE),
+    )
+
+
 @inductor_config.patch(
     {
         "triton.unique_kernel_names": True,
@@ -2328,6 +2358,305 @@ class TestTiling(TestCase):
         out, code = run_and_get_code(torch.compile(f), src, features)
         FileCheck().check_not("ynumel").run(code[0])
         self.assertEqual(out, f(src, features))
+
+    @parametrize("full_domain_epilogue", (False, True))
+    @inductor_config.patch(force_disable_caches=True)
+    @skipUnless(
+        GPU_TYPE == "cuda" and torch.version.hip is None,
+        "NVIDIA CUDA-only optimization",
+    )
+    def test_broadcasted_computation_picks_2d(self, full_domain_epilogue):
+        """Preserve row-only work with and without a full-domain epilogue."""
+        rows, cols = 128, 8008
+        args = broadcasted_work_args(rows, cols)
+
+        def fn(*args):
+            value = broadcasted_work(*args)
+            if full_domain_epilogue:
+                value = torch.exp(value.float() * 0.01).bfloat16()
+            return value
+
+        def assert_analysis(nodes):
+            analysis = nodes[0].get_coalesce_analysis()
+            self.assertIsNotNone(analysis.broadcast_work)
+            self.assertIsNone(analysis.suggested_split)
+            self.assertTrue(analysis.uncoalesced_addrs)
+            self.assertTrue(
+                all(not expr.free_symbols for expr in analysis.uncoalesced_addrs)
+            )
+            return nodes
+
+        with inductor_config.patch(_post_fusion_custom_pass=assert_analysis):
+            out, code = run_and_get_code(torch.compile(fn), *args)
+        FileCheck().check("ynumel = 128").check("xnumel = 8008").run(code[0])
+        self.assertEqual(out, fn(*args), atol=1e-2, rtol=2e-2)
+
+    @parametrize("dynamic_dim", (0, 1))
+    @inductor_config.patch(force_disable_caches=True)
+    def test_broadcasted_computation_dynamic_shapes_fail_closed(self, dynamic_dim):
+        rows, cols = 128, 8008
+        args = broadcasted_work_args(rows, cols)
+        x, logits = args[:2]
+        torch._dynamo.mark_dynamic(x, dynamic_dim)
+        torch._dynamo.mark_dynamic(logits, dynamic_dim)
+
+        def assert_analysis(nodes):
+            analysis = nodes[0].get_coalesce_analysis()
+            self.assertIsNone(analysis.broadcast_work)
+            return nodes
+
+        with inductor_config.patch(_post_fusion_custom_pass=assert_analysis):
+            out = torch.compile(broadcasted_work)(*args)
+        self.assertEqual(out, broadcasted_work(*args), atol=1e-2, rtol=2e-2)
+
+    @inductor_config.patch(force_disable_caches=True)
+    @skipUnless(
+        GPU_TYPE == "cuda" and torch.version.hip is None,
+        "NVIDIA CUDA-only optimization",
+    )
+    def test_internal_mapping_cant_split_preserves_coalescing(self):
+        """Optional lineage failures must not discard legacy coalescing."""
+        from torch._inductor.codegen.simd import CantSplit, SIMDKernel
+
+        def f(x):
+            first = torch.ops._inductor_test.realize(x + 1)
+            middle = torch.ops._inductor_test.realize(first * 2)
+            return middle + 3
+
+        def assert_analysis(nodes):
+            fused_node = nodes[0]
+            self.assertEqual(len(fused_node.get_nodes()), 3)
+            original = SIMDKernel._split_iteration_ranges
+            calls = 0
+
+            def fail_internal_mapping(*args, **kwargs):
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    raise CantSplit(sympy.Integer(2), sympy.Integer(3))
+                return original(*args, **kwargs)
+
+            with mock.patch.object(
+                SIMDKernel,
+                "_split_iteration_ranges",
+                side_effect=fail_internal_mapping,
+            ):
+                analysis = fused_node.get_coalesce_analysis()
+            self.assertEqual(calls, 3)
+            self.assertIsNotNone(analysis)
+            self.assertTrue(analysis.norm_read_writes.reads)
+            self.assertTrue(analysis.norm_read_writes.writes)
+            self.assertIsNone(analysis.broadcast_work)
+            return nodes
+
+        x = torch.randn(128, 8008, device=GPU_TYPE)
+        torch._dynamo.mark_dynamic(x, 0)
+        compiled = torch.compile(f)
+        with inductor_config.patch(_post_fusion_custom_pass=assert_analysis):
+            out = compiled(x)
+        self.assertEqual(out, f(x))
+        for rows in (16, 2048):
+            dynamic_x = torch.randn(rows, 8008, device=GPU_TYPE)
+            self.assertEqual(compiled(dynamic_x), f(dynamic_x))
+
+    @inductor_config.patch(force_disable_caches=True)
+    def test_broadcast_analysis_skipped_for_uncoalesced_accesses(self):
+        """An existing split analysis takes precedence over broadcast work."""
+
+        def forward(permute):
+            clone = torch.ops.aten.clone.default(
+                permute, memory_format=torch.contiguous_format
+            )
+            view = torch.ops.aten.view.default(clone, [-1, 32])
+            return torch.ops.aten.amax.default(view, [1])
+
+        def assert_analysis(nodes):
+            analysis = nodes[0].get_coalesce_analysis()
+            self.assertTrue(analysis.uncoalesced_addrs)
+            self.assertIsNotNone(analysis.suggested_split)
+            self.assertIsNone(analysis.broadcast_work)
+            return nodes
+
+        arg = torch.randn([2048, 4096], device=GPU_TYPE, dtype=torch.bfloat16)
+        permute = torch.ops.aten.permute.default(arg, [1, 0])
+        with (
+            mock.patch(
+                "torch._inductor.tiling_utils._analyze_broadcast_work",
+                side_effect=AssertionError("broadcast analysis must be skipped"),
+            ),
+            inductor_config.patch(_post_fusion_custom_pass=assert_analysis),
+        ):
+            out = torch.compile(forward)(permute)
+        self.assertEqual(out, forward(permute))
+
+    @inductor_config.patch(force_disable_caches=True)
+    def test_broadcasted_computation_below_work_boundary_stays_1d(self):
+        """A short cheap chain does not pay for another tile dimension."""
+        rows, cols = 128, 8008
+        args = (*broadcasted_work_args(rows, cols), False)
+
+        out, code = run_and_get_code(torch.compile(broadcasted_work), *args)
+        FileCheck().check_not("ynumel").run(code[0])
+        self.assertEqual(out, broadcasted_work(*args), atol=1e-2, rtol=2e-2)
+
+    @parametrize("variant", ("many_loads", "many_outputs", "full_domain_work"))
+    @inductor_config.patch(force_disable_caches=True)
+    def test_broadcasted_computation_pressure_stays_1d(self, variant):
+        """Reject candidates with high load, store, or compute pressure."""
+        rows, cols = 128, 256
+        args = broadcasted_work_args(rows, cols)
+        if variant == "many_loads":
+            extra = tuple(
+                torch.randn(rows, cols, device=GPU_TYPE, dtype=torch.bfloat16)
+                for _ in range(4)
+            )
+
+            def fn(*all_args):
+                base_args, extra_args = all_args[:-4], all_args[-4:]
+                result = broadcasted_work(*base_args).float()
+                for value in extra_args:
+                    result = result + value.float()
+                return result.bfloat16()
+
+            args = (*args, *extra)
+        elif variant == "many_outputs":
+
+            def fn(*args):
+                value = broadcasted_work(*args).float()
+                return tuple(
+                    (value * (1.01 + index * 0.01) + index * 0.1).bfloat16()
+                    for index in range(5)
+                )
+
+        else:
+
+            def fn(*args):
+                result = broadcasted_work(*args).float()
+                for index in range(12):
+                    result = torch.sin(result * (1.01 + index * 0.01) + index * 0.1)
+                return result.bfloat16()
+
+        out, code = run_and_get_code(torch.compile(fn), *args)
+        FileCheck().check_not("ynumel").run(code[0])
+        self.assertEqual(out, fn(*args), atol=0.25, rtol=0.1)
+
+    @inductor_config.patch(force_disable_caches=True)
+    def test_broadcasted_computation_internal_fanout_stays_1d(self):
+        """Removed internal buffers retain CSE identity across deferred outputs."""
+        x = torch.randn(128, 256, device=GPU_TYPE)
+        row = torch.randn(128, 1, device=GPU_TYPE)
+
+        def internal_fanout(x, row):
+            broadcast = row
+            for index in range(8):
+                broadcast = torch.sin(broadcast + index * 0.01)
+            producer = torch.ops._inductor_test.realize(x + 1.0)
+            return (
+                producer * 2.0 + broadcast,
+                (x * 4.0 + x * 5.0) + broadcast,
+                producer * 3.0 + broadcast,
+                producer * 4.0 + broadcast,
+            )
+
+        out, code = run_and_get_code(torch.compile(internal_fanout), x, row)
+        FileCheck().check_not("ynumel").run(code[0])
+        self.assertEqual(out, internal_fanout(x, row))
+
+    @inductor_config.patch(force_disable_caches=True)
+    def test_indirect_broadcast_work_stays_1d(self):
+        """Indirectly indexed row work is outside the conservative analysis."""
+        rows, cols = 128, 8008
+        x = torch.randn(rows, cols, device=GPU_TYPE)
+        table = torch.randn(rows * 2, device=GPU_TYPE)
+        index = torch.randperm(rows * 2, device=GPU_TYPE)[:rows]
+
+        def f(x, table, index):
+            value = table[index] + 1
+            value = value * 2
+            value = torch.where(value > 0, value, -value)
+            value = value + 3
+            value = value * 4
+            value = value + 5
+            return x + value[:, None]
+
+        out, code = run_and_get_code(torch.compile(f), x, table, index)
+        FileCheck().check_not("ynumel").run(code[0])
+        self.assertEqual(out, f(x, table, index))
+
+    @parametrize("cols, expect_2d", ((31, False), (32, True)))
+    @inductor_config.patch(force_disable_caches=True)
+    @skipUnless(
+        GPU_TYPE == "cuda" and torch.version.hip is None,
+        "NVIDIA CUDA-only optimization",
+    )
+    def test_broadcasted_computation_inner_extent_boundary(self, cols, expect_2d):
+        rows = 128
+        args = broadcasted_work_args(rows, cols)
+
+        out, code = run_and_get_code(torch.compile(broadcasted_work), *args)
+        checker = FileCheck()
+        if expect_2d:
+            checker.check("ynumel = 128").check("xnumel = 32")
+        else:
+            checker.check_not("ynumel")
+        checker.run(code[0])
+        self.assertEqual(out, broadcasted_work(*args), atol=1e-2, rtol=2e-2)
+
+    def test_unknown_broadcast_op_cost_fails_closed(self):
+        from torch._inductor.tiling_utils import _broadcast_op_cost
+
+        graph = torch.fx.Graph()
+        ops = graph.placeholder("ops")
+        identity = graph.call_method("identity", (ops,))
+        unknown = graph.call_method("future_unclassified_op", (ops,))
+        self.assertEqual(_broadcast_op_cost(identity), 0)
+        self.assertIsNone(_broadcast_op_cost(unknown))
+
+    def test_broadcast_mutation_fails_closed(self):
+        from types import SimpleNamespace
+
+        from torch._inductor.tiling_utils import _analyze_broadcast_work
+
+        node = SimpleNamespace(has_aliasing_or_mutation=lambda: True)
+        fused_node = SimpleNamespace(
+            get_device=lambda: torch.device("cuda"),
+            get_nodes=lambda: (node,),
+        )
+        self.assertIsNone(
+            _analyze_broadcast_work(
+                fused_node,
+                SimpleNamespace(),
+            )
+        )
+
+    def test_broadcast_expression_ids_use_normalized_indices(self):
+        from torch._inductor.tiling_utils import _fx_expression_id
+
+        def get_index_node(name):
+            graph = torch.fx.Graph()
+            return graph.call_module("get_index", (name,))
+
+        outer, inner = sympy.symbols("outer inner")
+        interned = {}
+        outer_id = _fx_expression_id(get_index_node("index0"), {}, interned, outer)
+        same_outer_id = _fx_expression_id(get_index_node("index1"), {}, interned, outer)
+        inner_id = _fx_expression_id(get_index_node("index0"), {}, interned, inner)
+
+        self.assertEqual(outer_id, same_outer_id)
+        self.assertNotEqual(outer_id, inner_id)
+
+    def test_normalized_access_collisions_preserve_all_buffers(self):
+        from torch._inductor.tiling_utils import _group_accesses_by_index
+
+        i, j = sympy.symbols("i j")
+        accesses = {
+            i: OrderedSet(("input0",)),
+            j: OrderedSet(("input1",)),
+        }
+        self.assertEqual(
+            _group_accesses_by_index(accesses, lambda _: sympy.S.Zero),
+            {sympy.S.Zero: OrderedSet(("input0", "input1"))},
+        )
 
     def test_cont_plus_transposed_picks_2d(self):
         """Contiguous + transposed addition should still pick 2D tiling."""

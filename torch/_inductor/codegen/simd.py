@@ -4626,15 +4626,39 @@ class SIMDScheduling(BaseScheduling):
                     )
                 )
 
-        tilings: list[tuple[CandidateTiling, immutable_dict[str, sympy.Expr], int]] = []
-        for pw, red in score_split:
+        tilings: list[
+            tuple[CandidateTiling, immutable_dict[str, sympy.Expr], int, int]
+        ] = []
+
+        def append_tiling(
+            pw: _SubSplit,
+            red: _SubSplit,
+            operation_savings: int = 0,
+        ) -> None:
             candidate = CandidateTiling(
                 cls.create_tiling(pw.splits, red.splits),
                 score=sum(pw.split_scores) + sum(red.split_scores),
             )
             tiling_score = cls.create_tiling(pw.split_scores, red.split_scores)
             tilings.append(
-                (candidate, tiling_score, pw.coalesced_memory + red.coalesced_memory)
+                (
+                    candidate,
+                    tiling_score,
+                    pw.coalesced_memory + red.coalesced_memory,
+                    # This affects candidate ranking only. _TilingSelection.memory
+                    # remains the exact current-main coalescing accounting.
+                    operation_savings,
+                )
+            )
+
+        for pw, red in score_split:
+            append_tiling(pw, red)
+
+        if broadcast_work := coalesce_analysis.broadcast_work:
+            append_tiling(
+                process_node_vars((broadcast_work.split_var,), is_pointwise=True),
+                process_node_vars(is_pointwise=False),
+                broadcast_work.score,
             )
 
         default_tiling = cls.create_tiling([pointwise_numel], [reduction_numel])
@@ -4663,7 +4687,7 @@ class SIMDScheduling(BaseScheduling):
             # from dominating large amounts of uncoalesced memory
             uncoalesced_penalty = total_uncoalesced * 0.05
 
-            return -(t[0].score + uncoalesced_penalty) * score_factor
+            return -(t[0].score + t[3] + uncoalesced_penalty) * score_factor
 
         def make_selection(
             tiling: dict[str, sympy.Expr],
@@ -4680,7 +4704,7 @@ class SIMDScheduling(BaseScheduling):
             )
 
         # apply penalty for longer tilings that don't increase score much
-        for cand, tiling_score, coalesced_memory in sorted(tilings, key=score_mod):
+        for cand, tiling_score, coalesced_memory, _ in sorted(tilings, key=score_mod):
             if (
                 cls.tiling_is_compatible(
                     node_schedule, pointwise_numel, reduction_numel, cand.tiling

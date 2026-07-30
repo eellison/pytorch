@@ -7,7 +7,8 @@ from typing import Any, Literal, overload, TYPE_CHECKING, TypeVar, Union
 import sympy
 
 import torch
-from torch._inductor.dependencies import index_vars_no_squeeze, ReadWrites
+from torch._inductor import ir
+from torch._inductor.dependencies import index_vars_no_squeeze, MemoryDep, ReadWrites
 from torch._inductor.utils import sympy_product, sympy_subs
 from torch.utils._ordered_set import OrderedSet
 from torch.utils._sympy.functions import Identity
@@ -250,6 +251,7 @@ class FusedNormalizedReadsWrites:
     reads: dict[sympy.Expr, OrderedSet[str]]
     writes: dict[sympy.Expr, OrderedSet[str]]
     var_ranges: dict[sympy.Symbol, int]
+    node_var_mappings: dict[str, dict[sympy.Symbol, sympy.Expr]]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -257,6 +259,9 @@ class _FusedNodeView:
     nodes: Sequence["BaseSchedulerNode"]
     read_writes: ReadWrites
     group: Any
+
+    def get_device(self) -> torch.device | None:
+        return self.nodes[0].get_device()
 
     def get_nodes(self) -> Sequence["BaseSchedulerNode"]:
         return self.nodes
@@ -266,6 +271,26 @@ class _FusedNodeView:
 
     def get_operation_names(self) -> OrderedSet[str]:
         return OrderedSet(node.get_name() for node in self.nodes)
+
+
+def _supports_broadcast_work_node(
+    node: Union["_FusedNodeView", "FusedSchedulerNode", "SchedulerNode"],
+) -> bool:
+    if torch.version.hip is not None:
+        return False
+    device = node.get_device()
+    return (
+        device is not None
+        and device.type == "cuda"
+        and not any(child.has_aliasing_or_mutation() for child in node.get_nodes())
+    )
+
+
+def _supports_broadcast_work_domain(
+    index_vars: Sequence[sympy.Symbol] | OrderedSet[sympy.Symbol],
+    reduce_vars: Sequence[sympy.Symbol] | OrderedSet[sympy.Symbol],
+) -> bool:
+    return not reduce_vars and len(index_vars) == 2
 
 
 @overload
@@ -544,12 +569,23 @@ def apply_var_mapping(
     }
 
 
+def _group_accesses_by_index(
+    accesses: dict[sympy.Expr, OrderedSet[str]],
+    normalize: Callable[[sympy.Expr], sympy.Expr],
+) -> dict[sympy.Expr, OrderedSet[str]]:
+    result: dict[sympy.Expr, OrderedSet[str]] = defaultdict(OrderedSet)
+    for expr, buffer_names in accesses.items():
+        result[normalize(expr)] |= buffer_names
+    return dict(result)
+
+
 def extract_normalized_read_writes(
     node: Union["_FusedNodeView", "FusedSchedulerNode", "SchedulerNode"],
 ) -> FusedNormalizedReadsWrites | None:
     """Extracts index variables, reduce variables, read/write expressions, and variable ranges from a fused node."""
     reads: dict[sympy.Expr, OrderedSet[str]] = defaultdict(OrderedSet)
     writes: dict[sympy.Expr, OrderedSet[str]] = defaultdict(OrderedSet)
+    node_var_mappings: dict[str, dict[sympy.Symbol, sympy.Expr]] = {}
 
     all_output_names = node.get_buffer_names()
     op_names = node.get_operation_names()
@@ -574,6 +610,9 @@ def extract_normalized_read_writes(
     (norm_pw_vars, norm_red_vars), ranges = index_vars_no_squeeze(
         pw_splits, red_splits, prefix="n"
     )
+    retain_node_var_mappings = _supports_broadcast_work_domain(
+        norm_pw_vars, norm_red_vars
+    ) and _supports_broadcast_work_node(node)
 
     for n in list(node.get_nodes()):
         if not isinstance(n, torch._inductor.scheduler.SchedulerNode):
@@ -594,7 +633,8 @@ def extract_normalized_read_writes(
             for expr in body.get_all_write_expr(out):
                 n_writes[expr].add(out)
 
-        if not n_reads and not n_writes:
+        mapping_only = not n_reads and not n_writes
+        if mapping_only and not retain_node_var_mappings:
             continue
 
         (iter_vars, n_pw_splits), (red_vars, n_red_splits) = get_pw_red_splits(
@@ -615,6 +655,11 @@ def extract_normalized_read_writes(
                 )
             )
         except torch._inductor.codegen.simd.CantSplit as e:
+            if mapping_only:
+                # This body is needed only by the optional broadcast-work
+                # analysis. Missing lineage makes that analysis fail closed,
+                # but must not discard the existing read/write analysis.
+                continue
             # occasionally with dynamic shapes, we will be unable to prove
             # divisibility
             if not (pointwise_numel.free_symbols or red_numel.free_symbols):
@@ -631,32 +676,33 @@ def extract_normalized_read_writes(
             new_ranges,
             return_getters_groups,
         )
+        if retain_node_var_mappings:
+            node_var_mappings[n.get_name()] = var_map
 
         # We create Identity sympy.Functions to prevent expansion to int64,
         # unwrap for tiling analysis.
         def remove_identity(expr: sympy.Expr) -> sympy.Expr:
             return expr.replace(Identity, lambda x: x)
 
-        n_reads_new = {
-            sympy_subs(remove_identity(read), var_map): v for read, v in n_reads.items()
-        }
-        n_writes_new = {
-            sympy_subs(remove_identity(write), var_map): v
-            for write, v in n_writes.items()
-        }
-
-        for expr, buf_names in n_reads_new.items():
+        for expr, buf_names in _group_accesses_by_index(
+            n_reads,
+            lambda expr: sympy_subs(remove_identity(expr), var_map),
+        ).items():
             reads[expr] |= buf_names
-
-        for expr, buf_names in n_writes_new.items():
+        for expr, buf_names in _group_accesses_by_index(
+            n_writes,
+            lambda expr: sympy_subs(remove_identity(expr), var_map),
+        ).items():
             writes[expr] |= buf_names
 
-    reads = {
-        V.graph.sizevars.simplify_with_ranges(r, ranges): v for r, v in reads.items()
-    }
-    writes = {
-        V.graph.sizevars.simplify_with_ranges(w, ranges): v for w, v in writes.items()
-    }
+    reads = _group_accesses_by_index(
+        reads,
+        lambda expr: V.graph.sizevars.simplify_with_ranges(expr, ranges),
+    )
+    writes = _group_accesses_by_index(
+        writes,
+        lambda expr: V.graph.sizevars.simplify_with_ranges(expr, ranges),
+    )
 
     fused_out = FusedNormalizedReadsWrites(
         norm_pw_vars,  # type: ignore[arg-type]
@@ -664,6 +710,7 @@ def extract_normalized_read_writes(
         reads,
         writes,
         ranges,
+        node_var_mappings,
     )
     loop_tiling_log.info("Normalized Fused reads: %s", fused_out)
     return fused_out
@@ -713,6 +760,23 @@ class VarTiling:
 
 
 @dataclasses.dataclass(frozen=True)
+class BroadcastWork:
+    """Work saved by preserving one normalized pointwise split."""
+
+    split_var: sympy.Symbol
+    score: int
+
+
+@dataclasses.dataclass(frozen=True)
+class _BroadcastValue:
+    node: torch.fx.Node
+    inputs: OrderedSet[int]
+    dependencies: OrderedSet[sympy.Symbol]
+    words: int
+    row_lineage: bool
+
+
+@dataclasses.dataclass(frozen=True)
 class CoalesceVarAnalysis:
     # Var -> Memory Score - not strictly the amount of memory
     # because we multiply writes x2
@@ -724,6 +788,669 @@ class CoalesceVarAnalysis:
     norm_read_writes: FusedNormalizedReadsWrites
 
     suggested_split: VarTiling | None = None
+    broadcast_work: BroadcastWork | None = None
+
+
+_BROADCAST_OP_COSTS = {
+    op: cost
+    for cost, names in (
+        (0, "constant identity index_expr load store"),
+        (
+            1,
+            "abs add and_ bitwise_and bitwise_not bitwise_or bitwise_xor eq ge "
+            "gt le logical_and logical_not logical_or logical_xor lt maximum "
+            "minimum mul ne neg or_ relu sub to_dtype to_dtype_bitcast where xor",
+        ),
+        (
+            4,
+            "div floordiv fmod mod reciprocal remainder rsqrt sqrt truediv",
+        ),
+        (
+            8,
+            "acos acosh asin asinh atan atan2 atanh cos cosh erf erfc erfinv "
+            "exp exp2 expm1 lgamma log log1p log2 sigmoid sin sinh tan tanh",
+        ),
+    )
+    for op in names.split()
+}
+_MIN_BROADCAST_INNER_RANGE = 32
+_BROADCAST_REPLAY_FACTOR = 8
+_MIN_BROADCAST_WORK = 8
+_MIN_SAVED_WORK_PER_BYTE = 2
+_MAX_BROADCAST_LIVE_FULL_DOMAIN_WORDS = 5
+_BROADCAST_PRESSURE_DTYPES = frozenset(
+    {
+        torch.bool,
+        torch.uint8,
+        torch.uint16,
+        torch.uint32,
+        torch.uint64,
+        torch.int8,
+        torch.int16,
+        torch.int32,
+        torch.int64,
+        torch.float16,
+        torch.bfloat16,
+        torch.float32,
+        torch.float64,
+        torch.complex64,
+        torch.complex128,
+    }
+)
+
+
+def _broadcast_op_cost(node: torch.fx.Node) -> int | None:
+    if node.op != "call_method":
+        return None
+    return _BROADCAST_OP_COSTS.get(str(node.target))
+
+
+def _fx_expression_id(
+    node: torch.fx.Node,
+    expression_ids: dict[torch.fx.Node, int],
+    interned_expressions: dict[tuple[Any, ...], int],
+    normalized_index: sympy.Expr | None = None,
+) -> int:
+    def convert(arg: Any) -> Any:
+        if isinstance(arg, torch.fx.Node):
+            return ("node", expression_ids[arg])
+        if isinstance(arg, tuple):
+            return tuple(convert(item) for item in arg)
+        if isinstance(arg, list):
+            return ("list", *(convert(item) for item in arg))
+        if isinstance(arg, dict):
+            return tuple(
+                (repr(key), convert(value))
+                for key, value in sorted(arg.items(), key=lambda item: repr(item[0]))
+            )
+        return ("literal", type(arg).__qualname__, repr(arg))
+
+    if normalized_index is not None:
+        key = ("normalized_index", normalized_index)
+    else:
+        key = (node.op, str(node.target), convert(node.args), convert(node.kwargs))
+    if key not in interned_expressions:
+        interned_expressions[key] = len(interned_expressions)
+    return interned_expressions[key]
+
+
+def _is_dense_row_major_iteration(
+    index: sympy.Expr,
+    outer_var: sympy.Symbol,
+    inner_var: sympy.Symbol,
+    inner_range: sympy.Expr | int,
+) -> bool:
+    origin = sympy_subs(index, {outer_var: 0, inner_var: 0})
+    inner_stride = sympy_subs(index, {outer_var: 0, inner_var: 1}) - origin
+    outer_stride = sympy_subs(index, {outer_var: 1, inner_var: 0}) - origin
+    return (
+        V.graph.sizevars.statically_known_equals(inner_stride, 1)
+        and V.graph.sizevars.statically_known_geq(outer_stride, inner_range)
+        and V.graph.sizevars.statically_known_equals(
+            index,
+            origin + outer_var * outer_stride + inner_var,
+        )
+    )
+
+
+def _loop_body_op_arg(
+    node: torch.fx.Node,
+    position: int,
+    name: str,
+) -> Any:
+    if len(node.args) > position:
+        return node.args[position]
+    return node.kwargs.get(name)
+
+
+def _normalized_get_index(
+    node: Any,
+    body: Any,
+    var_map: dict[sympy.Symbol, sympy.Expr],
+    var_ranges: dict[sympy.Symbol, sympy.Expr],
+) -> sympy.Expr | None:
+    if (
+        not isinstance(node, torch.fx.Node)
+        or node.op != "call_module"
+        or node.target != "get_index"
+    ):
+        return None
+    index_name = _loop_body_op_arg(node, 0, "name")
+    if not isinstance(index_name, str):
+        return None
+    index = body.indexing_exprs.get(index_name)
+    if index is None:
+        return None
+    return V.graph.sizevars.simplify_with_ranges(
+        sympy_subs(index, var_map),
+        var_ranges,
+    )
+
+
+def _dtype_words(dtype: torch.dtype) -> int:
+    return max(1, (dtype.itemsize + 3) // 4)
+
+
+def _loop_body_value_words(body: Any) -> dict[torch.fx.Node, int] | None:
+    """Propagate exact value widths without retaining analysis metadata."""
+    from torch._inductor.codegen.common import DataTypePropagation
+
+    graph = body.root_block.graph
+
+    def has_nested_node(value: Any) -> bool:
+        found = False
+
+        def mark(_: torch.fx.Node) -> None:
+            nonlocal found
+            found = True
+
+        if not isinstance(value, torch.fx.Node):
+            torch.fx.map_arg(value, mark)
+        return found
+
+    missing = object()
+    previous = [
+        (
+            node,
+            node.meta.get("opt_ctx", missing),
+            getattr(node.meta.get("opt_ctx"), "dtype", missing),
+        )
+        for node in graph.nodes
+    ]
+    try:
+        DataTypePropagation.propagate_loopbody(body)
+        result: dict[torch.fx.Node, int] = {}
+        for node in graph.nodes:
+            if node.op in ("placeholder", "output"):
+                continue
+            if node.op == "call_module":
+                if node.target != "get_index":
+                    return None
+                continue
+            if (
+                node.op != "call_method"
+                or not isinstance(node.target, str)
+                or node.target not in _BROADCAST_OP_COSTS
+                or any(has_nested_node(arg) for arg in node.args[1:])
+                or any(has_nested_node(arg) for arg in node.kwargs.values())
+            ):
+                return None
+            if node.target == "store":
+                continue
+            dtype = getattr(node.meta.get("opt_ctx"), "dtype", None)
+            if (
+                not isinstance(dtype, torch.dtype)
+                or dtype not in _BROADCAST_PRESSURE_DTYPES
+            ):
+                return None
+            result[node] = _dtype_words(dtype)
+        return result
+    except (
+        AssertionError,
+        AttributeError,
+        IndexError,
+        KeyError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+    ):
+        return None
+    finally:
+        for node, context, dtype in previous:
+            if context is missing:
+                node.meta.pop("opt_ctx", None)
+            else:
+                if dtype is missing:
+                    try:
+                        del context.dtype
+                    except AttributeError:
+                        pass
+                else:
+                    context.dtype = dtype
+                node.meta["opt_ctx"] = context
+
+
+def _scheduled_peak_live_words(
+    value_order: Sequence[int],
+    direct_load_values: OrderedSet[int],
+    value_inputs: dict[int, OrderedSet[int]],
+    value_words: dict[int, int],
+    root_values: OrderedSet[int],
+    reachable: OrderedSet[int],
+) -> int | None:
+    """Estimate pressure in Triton's indexing, loads, compute, stores order."""
+    scheduled_values = [
+        value_id
+        for value_id in value_order
+        if value_id in reachable and value_id in direct_load_values
+    ]
+    scheduled_values.extend(
+        value_id
+        for value_id in value_order
+        if value_id in reachable and value_id not in direct_load_values
+    )
+    definitions = {
+        value_id: position for position, value_id in enumerate(scheduled_values)
+    }
+    last_uses = definitions.copy()
+    for value_id in scheduled_values:
+        position = definitions[value_id]
+        for input_id in value_inputs.get(value_id, ()):
+            if input_id in reachable:
+                last_uses[input_id] = max(last_uses[input_id], position)
+
+    # Triton queues stores until after all compute. Consequently all externally
+    # stored values are simultaneously live immediately before the first store.
+    store_position = len(scheduled_values)
+    for value_id in root_values:
+        if value_id in reachable:
+            last_uses[value_id] = max(last_uses[value_id], store_position)
+
+    starts: dict[int, int] = defaultdict(int)
+    expires: dict[int, int] = defaultdict(int)
+    for value_id in reachable:
+        words = value_words.get(value_id, 0)
+        if not words:
+            continue
+        definition = definitions.get(value_id)
+        if definition is None:
+            return None
+        starts[definition] += words
+        expires[last_uses.get(value_id, definition)] += words
+
+    live = peak = 0
+    for position in sorted(starts.keys() | expires.keys()):
+        live += starts[position]
+        peak = max(peak, live)
+        live -= expires[position]
+    return peak
+
+
+def _external_memory_footprint_bytes(
+    normalized: FusedNormalizedReadsWrites,
+) -> int | None:
+    """Estimate the accessed external-memory footprint of the fused region."""
+    total = 0
+    for memory_expr, buffer_names in itertools.chain(
+        normalized.reads.items(),
+        normalized.writes.items(),
+    ):
+        access_numel = get_score(
+            memory_expr,
+            normalized.var_ranges,
+            buffer_names,
+        )
+        for name in buffer_names:
+            buffer = V.graph.try_get_buffer(name)
+            buffer_numel = try_get_buf_size(name)
+            if buffer is None or buffer_numel is None:
+                return None
+            total += min(access_numel, buffer_numel) * buffer.dtype.itemsize
+    return total or None
+
+
+def _analyze_broadcast_work(
+    fused_node: Union["_FusedNodeView", "FusedSchedulerNode", "SchedulerNode"],
+    normalized: FusedNormalizedReadsWrites,
+) -> BroadcastWork | None:
+    """
+    Find pointwise work whose value domain omits a large inner iteration axis.
+
+    This intentionally recognizes only a clean two-dimensional, row-major case.
+    More general candidates need to account for layout conflicts, indirect
+    indexing, and the cost of additional masks and block dimensions.
+    """
+    if not _supports_broadcast_work_node(fused_node):
+        return None
+    if not _supports_broadcast_work_domain(
+        normalized.index_vars, normalized.reduce_vars
+    ):
+        return None
+
+    outer_var, inner_var = normalized.index_vars
+    outer_range = normalized.var_ranges[outer_var]
+    inner_range = normalized.var_ranges[inner_var]
+    if getattr(outer_range, "free_symbols", ()) or getattr(
+        inner_range, "free_symbols", ()
+    ):
+        return None
+    inner_hint = V.graph.sizevars.optimization_hint(inner_range, fallback=1)
+    if inner_hint < _MIN_BROADCAST_INNER_RANGE:
+        return None
+    replay_factor = min(inner_hint, _BROADCAST_REPLAY_FACTOR)
+
+    all_accesses = (*normalized.reads, *normalized.writes)
+    if any(has_indirect_access(expr) for expr in all_accesses):
+        return None
+
+    expected_write = outer_var * inner_range + inner_var
+    if not normalized.writes or any(
+        not V.graph.sizevars.statically_known_equals(expr, expected_write)
+        for expr in normalized.writes
+    ):
+        return None
+    supported_broadcast_indices = (sympy.S.Zero, outer_var, inner_var)
+
+    def is_supported_index(index: sympy.Expr) -> bool:
+        return any(
+            V.graph.sizevars.statically_known_equals(index, supported)
+            for supported in supported_broadcast_indices
+        ) or _is_dense_row_major_iteration(
+            index,
+            outer_var,
+            inner_var,
+            inner_range,
+        )
+
+    if any(not is_supported_index(expr) for expr in normalized.reads):
+        return None
+
+    total_numel = outer_range * inner_range
+    output_names = OrderedSet[str]()
+    for names in normalized.writes.values():
+        output_names.update(names)
+    if not output_names:
+        return None
+    for name in output_names:
+        try:
+            output_numel = V.graph.get_numel(name)
+        except KeyError:
+            return None
+        if not V.graph.sizevars.statically_known_equals(output_numel, total_numel):
+            return None
+    total_numel_hint = V.graph.sizevars.optimization_hint(total_numel, fallback=0)
+    external_memory_footprint_bytes = _external_memory_footprint_bytes(normalized)
+    if not total_numel_hint or external_memory_footprint_bytes is None:
+        return None
+
+    row_input_names = OrderedSet[str]()
+    for expr, names in normalized.reads.items():
+        if V.graph.sizevars.statically_known_equals(expr, outer_var):
+            row_input_names.update(names)
+    if not row_input_names:
+        return None
+
+    scheduler_nodes = [
+        node
+        for node in fused_node.get_nodes()
+        if isinstance(node, torch._inductor.scheduler.SchedulerNode)
+    ]
+    if not scheduler_nodes:
+        return None
+    if any(
+        isinstance(dep, MemoryDep) and dep.mode is not None
+        for node in scheduler_nodes
+        for dep in node.read_writes.writes
+    ):
+        return None
+    if any(
+        node._body.indirect_vars or node._body.subblocks for node in scheduler_nodes
+    ):
+        return None
+
+    index_vars = OrderedSet((outer_var, inner_var))
+    work = 0
+    full_domain_work = 0
+    interned_expressions: dict[tuple[Any, ...], int] = {}
+    expression_ids: dict[torch.fx.Node, int] = {}
+    values: dict[int, _BroadcastValue] = {}
+    value_order: list[int] = []
+    direct_load_values = OrderedSet[int]()
+    stored_values: dict[str, int] = {}
+    root_values = OrderedSet[int]()
+    external_input_names = OrderedSet[str]()
+    for names in normalized.reads.values():
+        external_input_names.update(names)
+
+    # Reductions are excluded above, so get_nodes() is the pointwise codegen
+    # schedule. Replay its LoopBody SSA in that order. A fused store/load pair
+    # aliases one value, matching codegen's store_cache behavior.
+    for scheduler_node in scheduler_nodes:
+        body = scheduler_node._body
+        var_map = normalized.node_var_mappings.get(scheduler_node.get_name())
+        if var_map is None:
+            return None
+        block_value_words = _loop_body_value_words(body)
+        if block_value_words is None:
+            return None
+
+        for node in body.root_block.graph.nodes:
+            try:
+                input_ids = OrderedSet(
+                    expression_ids[input_node] for input_node in node.all_input_nodes
+                )
+            except KeyError:
+                return None
+            node_dependencies = OrderedSet[sympy.Symbol]()
+            for input_id in input_ids:
+                node_dependencies.update(values[input_id].dependencies)
+
+            normalized_index = _normalized_get_index(
+                node,
+                body,
+                var_map,
+                normalized.var_ranges,
+            )
+            if (
+                node.op == "call_module"
+                and node.target == "get_index"
+                and normalized_index is None
+            ):
+                return None
+            if normalized_index is not None:
+                if not is_supported_index(normalized_index):
+                    loop_tiling_log.info(
+                        "Rejecting broadcast-work candidate: unsupported "
+                        "normalized index %s",
+                        normalized_index,
+                    )
+                    return None
+                node_dependencies.update(normalized_index.free_symbols & index_vars)
+
+            if node.op == "call_method" and node.target == "load":
+                load_name = _loop_body_op_arg(node, 1, "name")
+                if not isinstance(load_name, str):
+                    return None
+                if load_name in stored_values:
+                    value_id = stored_values[load_name]
+                    expression_ids[node] = value_id
+                    continue
+                if load_name not in external_input_names:
+                    return None
+
+            expression_id = _fx_expression_id(
+                node,
+                expression_ids,
+                interned_expressions,
+                normalized_index,
+            )
+            expression_ids[node] = expression_id
+
+            if node.op == "call_method" and node.target == "store":
+                store_name = _loop_body_op_arg(node, 1, "name")
+                store_index = _normalized_get_index(
+                    _loop_body_op_arg(node, 2, "index"),
+                    body,
+                    var_map,
+                    normalized.var_ranges,
+                )
+                store_value = _loop_body_op_arg(node, 3, "value")
+                store_mode = _loop_body_op_arg(node, 4, "mode")
+                if (
+                    not isinstance(store_name, str)
+                    or store_index is None
+                    or not isinstance(store_value, torch.fx.Node)
+                    or store_mode is not None
+                ):
+                    return None
+                store_value_id = expression_ids.get(store_value)
+                if store_value_id is None:
+                    return None
+                previous_store = stored_values.setdefault(store_name, store_value_id)
+                if previous_store != store_value_id:
+                    return None
+                if store_name not in output_names:
+                    continue
+
+                store_buffer = V.graph.try_get_buffer(store_name)
+                if not isinstance(store_buffer, (ir.Buffer, ir.TensorBox)):
+                    return None
+                try:
+                    store_layout = store_buffer.get_layout()
+                except NotImplementedError:
+                    return None
+                store_numel = sympy_product(store_layout.size)
+                store_offset = store_layout.offset
+                store_origin = sympy_subs(
+                    store_index,
+                    {outer_var: 0, inner_var: 0},
+                )
+                if not (
+                    V.graph.sizevars.statically_known_equals(store_numel, total_numel)
+                    and V.graph.sizevars.statically_known_equals(
+                        store_offset, store_origin
+                    )
+                    and _is_dense_row_major_iteration(
+                        store_index,
+                        outer_var,
+                        inner_var,
+                        inner_range,
+                    )
+                ):
+                    return None
+                root_values.add(store_value_id)
+                continue
+
+            if node.op == "output":
+                continue
+
+            if expression_id in values:
+                continue
+
+            row_lineage = any(values[input_id].row_lineage for input_id in input_ids)
+            if (
+                not row_lineage
+                and node.op == "call_method"
+                and node.target == "load"
+                and _loop_body_op_arg(node, 1, "name") in row_input_names
+                and node_dependencies == OrderedSet([outer_var])
+            ):
+                row_lineage = True
+            words = block_value_words.get(node, 0)
+            values[expression_id] = _BroadcastValue(
+                node,
+                input_ids,
+                node_dependencies,
+                words if inner_var in node_dependencies else 0,
+                row_lineage,
+            )
+            value_order.append(expression_id)
+            if node.op == "call_method" and node.target == "load":
+                direct_load_values.add(expression_id)
+
+    reachable_values = OrderedSet[int]()
+    pending = list(root_values)
+    while pending:
+        value_id = pending.pop()
+        if value_id in reachable_values:
+            continue
+        reachable_values.add(value_id)
+        pending.extend(values[value_id].inputs)
+
+    peak_live_full_domain_words = _scheduled_peak_live_words(
+        value_order,
+        direct_load_values,
+        {value_id: value.inputs for value_id, value in values.items()},
+        {value_id: value.words for value_id, value in values.items()},
+        root_values,
+        reachable_values,
+    )
+    if peak_live_full_domain_words is None:
+        return None
+    loop_tiling_log.info(
+        "Broadcast-work candidate: peak_live_full_domain_words=%s",
+        peak_live_full_domain_words,
+    )
+    if peak_live_full_domain_words > _MAX_BROADCAST_LIVE_FULL_DOMAIN_WORDS:
+        loop_tiling_log.info(
+            "Rejecting broadcast-work candidate: peak_live_full_domain_words=%s",
+            peak_live_full_domain_words,
+        )
+        return None
+
+    for value_id in reachable_values:
+        value = values[value_id]
+        node = value.node
+        node_dependencies = value.dependencies
+        if node.op == "call_method" and inner_var in node_dependencies:
+            op_cost = _broadcast_op_cost(node)
+            if op_cost is None:
+                loop_tiling_log.info(
+                    "Rejecting broadcast-work candidate: unknown full-domain op %s",
+                    node.target,
+                )
+                return None
+            full_domain_work += op_cost
+        if (
+            value.row_lineage
+            and node_dependencies
+            and inner_var not in node_dependencies
+        ):
+            op_cost = _broadcast_op_cost(node)
+            if op_cost is None:
+                loop_tiling_log.info(
+                    "Rejecting broadcast-work candidate: unknown op %s",
+                    node.target,
+                )
+                return None
+            work += op_cost
+
+    loop_tiling_log.info(
+        "Broadcast-work candidate: split=%s work=%d full_domain_work=%d "
+        "replay=%d numel=%d external_footprint_bytes=%d",
+        outer_var,
+        work,
+        full_domain_work,
+        replay_factor,
+        total_numel_hint,
+        external_memory_footprint_bytes,
+    )
+    if work < _MIN_BROADCAST_WORK:
+        return None
+
+    saved_work = work * (replay_factor - 1)
+    one_lane_work = work + full_domain_work
+    if saved_work < one_lane_work:
+        loop_tiling_log.info(
+            "Rejecting broadcast-work candidate: saved_work=%d full_domain_work=%d",
+            saved_work,
+            full_domain_work,
+        )
+        return None
+
+    # The 1D kernel evaluates row-only expressions as lane vectors. A 2D
+    # kernel broadcasts them across its inner tile. Require the savings over
+    # eight lanes to cover one lane of the whole expression. The default and
+    # first tuned 2D config use a 32-wide inner tile, so this remains a
+    # conservative estimate of reuse.
+    saved_work_numerator = saved_work * total_numel_hint
+    required_work_numerator = (
+        _MIN_SAVED_WORK_PER_BYTE * external_memory_footprint_bytes * replay_factor
+    )
+    if saved_work_numerator < required_work_numerator:
+        loop_tiling_log.info(
+            "Rejecting broadcast-work candidate: saved_work=%d required_work=%d",
+            saved_work_numerator,
+            required_work_numerator,
+        )
+        return None
+
+    # The work/traffic model is an eligibility gate, not a conversion from
+    # operations to bytes. Give the eligible split a small preference on the
+    # same scale as the existing memory-coalescing scores.
+    score = max(1, external_memory_footprint_bytes // 20)
+    loop_tiling_log.info("Accepting broadcast-work candidate: score=%d", score)
+    return BroadcastWork(split_var=outer_var, score=score)
 
 
 def _analyze_memory_coalescing(
@@ -753,6 +1480,7 @@ def _analyze_memory_coalescing(
     reads = norm_read_writes.reads
     writes = norm_read_writes.writes
     var_ranges = norm_read_writes.var_ranges
+    broadcast_work: BroadcastWork | None = None
 
     coalesced_by_var: dict[sympy.Symbol, int] = Counter()
     uncoalesced_addrs: dict[sympy.Expr, int] = Counter()
@@ -828,11 +1556,18 @@ def _analyze_memory_coalescing(
         else:
             uncoalesced_addrs[memory_expr] += total_score
 
+    has_varying_uncoalesced_addr = any(
+        memory_expr.free_symbols & var_ranges.keys()
+        for memory_expr in uncoalesced_addrs
+    )
+    if not has_varying_uncoalesced_addr:
+        broadcast_work = _analyze_broadcast_work(fused_node, norm_read_writes)
     if not uncoalesced_addrs:
         return CoalesceVarAnalysis(
             coalesced_by_var=coalesced_by_var,
             uncoalesced_addrs=uncoalesced_addrs,
             norm_read_writes=norm_read_writes,
+            broadcast_work=broadcast_work,
         )
 
     # map from var -> tiling -> total_score
@@ -888,6 +1623,7 @@ def _analyze_memory_coalescing(
             coalesced_by_var=coalesced_by_var,
             uncoalesced_addrs=uncoalesced_addrs,
             norm_read_writes=norm_read_writes,
+            broadcast_work=broadcast_work,
         )
 
     best_tiling: tuple[sympy.Expr, int] | None = None
@@ -904,6 +1640,7 @@ def _analyze_memory_coalescing(
             coalesced_by_var=coalesced_by_var,
             uncoalesced_addrs=uncoalesced_addrs,
             norm_read_writes=norm_read_writes,
+            broadcast_work=broadcast_work,
         )
 
     # TODO - for strictly pointwise fusions,
@@ -915,6 +1652,7 @@ def _analyze_memory_coalescing(
         uncoalesced_addrs=uncoalesced_addrs,
         norm_read_writes=norm_read_writes,
         suggested_split=VarTiling(best_tiling[0], best_tiling[1], best_tiling_score),
+        broadcast_work=broadcast_work,
     )
 
 
