@@ -1981,6 +1981,8 @@ class _GroupedReductionLayout:
         self,
         family: _DerivedIterationFamily,
         factor: int,
+        output_lanes: int = 1,
+        output_lane: int = 0,
     ) -> _IterationSpace:
         """The iteration space one lane sees: the grouped axis divided by ``factor``.
 
@@ -1991,13 +1993,19 @@ class _GroupedReductionLayout:
         group_var, pair_var = sub_parent_tree.construct(
             [self.num_groups, FloorDiv(self.local_reduction_size, factor)]
         )
+        source_groups = [
+            self.x_tree.numel,
+            self.num_groups,
+            FloorDiv(self.local_reduction_size, factor) * output_lanes,
+        ]
+        source_values = [
+            self.x_tree.full_range().symbol(),
+            group_var,
+            pair_var * output_lanes + output_lane,
+        ]
         return _IterationSpace(
-            [
-                self.x_tree.numel,
-                self.num_groups,
-                FloorDiv(self.local_reduction_size, factor),
-            ],
-            [self.x_tree.full_range().symbol(), group_var, pair_var],
+            source_groups,
+            source_values,
         )
 
     def maybe_broadcast_value_to_parent_resolution(
@@ -2724,8 +2732,15 @@ class SIMDScheduling(BaseScheduling):
         if node1.is_reduction() == node2.is_reduction():
             return False
         reduction_node = node1 if node1.is_reduction() else node2
+        consumer_node = node2 if node1.is_reduction() else node1
         _, (numel, rnumel) = reduction_node.group
         nodes = [*node1.get_nodes(), *node2.get_nodes()]
+        complete_plan = self._sub_parent_epilogue_plan(nodes, numel, rnumel)
+        if complete_plan is not None and all(
+            node in complete_plan.sub_parent_stages[0].epilogue_nodes
+            for node in consumer_node.get_nodes()
+        ):
+            return False
         plan = self._sub_parent_epilogue_plan(nodes, numel, rnumel, check_leaves=False)
         if plan is None:
             # No sub-parent plan covers the combined set, so a sub-parent-shaped
@@ -3741,24 +3756,65 @@ class SIMDScheduling(BaseScheduling):
         numel = plan.parent_numel
         rnumel = plan.parent_rnumel
         sub_parent_epilogue_nodes = stage.epilogue_nodes
-        reduction_schedule = self.generate_node_schedule(
-            list(plan.parent_nodes),
+        sub_parent_source_layouts = dict(stage.source_layouts)
+        parent_nodes = list(plan.parent_nodes)
+        internal_source_names = OrderedSet(sub_parent_source_layouts) & OrderedSet(
+            name for node in parent_nodes for name in node.get_buffer_names()
+        )
+        if internal_source_names:
+            # Keep the source chain last so a looped kernel emits it and the
+            # derived epilogue together in the final reduction loop.
+            source_nodes = [
+                node
+                for node in parent_nodes
+                if internal_source_names & node.get_buffer_names()
+            ]
+            source_ancestors = OrderedSet(
+                name
+                for node in source_nodes
+                for name in (*node.ancestors, *node.get_operation_names())
+            )
+            reduction_ancestors = OrderedSet(
+                name
+                for node in parent_nodes
+                if node.is_reduction()
+                for name in node.ancestors
+            )
+            deferred_nodes = [
+                node
+                for node in parent_nodes
+                if not node.is_reduction()
+                and node.get_operation_names() & source_ancestors
+                and not node.get_operation_names() & reduction_ancestors
+                and SIMDKernel.is_compatible((numel, rnumel), node.get_ranges())
+            ]
+            deferred_names = OrderedSet(
+                name for node in deferred_nodes for name in node.get_operation_names()
+            )
+            deferred_node_set = OrderedSet(deferred_nodes)
+            leading_nodes = [
+                node for node in parent_nodes if node not in deferred_node_set
+            ]
+            if not any(node.ancestors & deferred_names for node in leading_nodes):
+                parent_nodes = [*leading_nodes, *deferred_nodes]
+        parent_schedule = self.generate_node_schedule(
+            parent_nodes,
             numel,
             rnumel,
         )
         schedule_log.debug(
-            "Schedule:\n %s\nHalf-resolution epilogue:\n %s",
-            reduction_schedule,
+            "Schedule:\n %s\nSub-parent epilogue:\n %s",
+            parent_schedule,
             sub_parent_epilogue_nodes,
         )
         combined_schedule = cast(
             list[NodeScheduleEntry],
-            [*reduction_schedule, *sub_parent_epilogue_nodes],
+            [*parent_schedule, *sub_parent_epilogue_nodes],
         )
-        # Feature analysis uses the grid-owning reduction schedule. Half epilogue
-        # nodes run in a derived range, so generic feature mapping cannot model
-        # them against the parent (numel, rnumel) domain.
-        kernel_features = SIMDKernelFeatures(reduction_schedule, numel, rnumel, None)
+        # Feature analysis uses the grid-owning parent schedule. Sub-parent
+        # epilogue nodes run in a derived range, so generic feature mapping cannot
+        # model them against the parent (numel, rnumel) domain.
+        kernel_features = SIMDKernelFeatures(parent_schedule, numel, rnumel, None)
         # Force the 2D tiling rather than re-running the heuristic. The lanes
         # are derived from the parent's R axis and cannot be expressed under a
         # y/z tiling, and _sub_parent_tiling_is_2d already declined the fusion
@@ -3779,7 +3835,6 @@ class SIMDScheduling(BaseScheduling):
         metrics.codegen_nested_reduction += 1
         sub_parent_factor = stage.factor
         parent_rnumel = plan.parent_rnumel
-        sub_parent_source_layouts = dict(stage.source_layouts)
         # Only min_rblock is a legality constraint: the lanes are derived from
         # the parent's R axis, so the tile has to hold a whole lane group --
         # the entire parent row when persistent, and at least one group of
@@ -3800,8 +3855,15 @@ class SIMDScheduling(BaseScheduling):
         )
         sub_parent_family = layout.make_sub_parent_family(sub_parent_factor)
         epilogue_source_layouts = (
-            sub_parent_source_layouts if kernel.persistent_reduction else {}
+            sub_parent_source_layouts
+            if kernel.persistent_reduction
+            else {
+                name: source_layout
+                for name, source_layout in sub_parent_source_layouts.items()
+                if name in internal_source_names
+            }
         )
+        must_materialize_names = OrderedSet(stage.must_materialize_names)
         with kernel:
             handler: OpsHandler[Any] = V.get_ops_handler()
             if kernel.persistent_reduction:
@@ -3814,23 +3876,36 @@ class SIMDScheduling(BaseScheduling):
                     sub_parent_factor=sub_parent_factor,
                 )
             with V.set_ops_handler(handler):
-                self._codegen_node_schedule_body(reduction_schedule, kernel)
-            if not kernel.persistent_reduction:
+                self._codegen_node_schedule_body(parent_schedule, kernel)
+            if not kernel.persistent_reduction and not internal_source_names:
                 kernel.codegen_body()
         with kernel:
-            sub_parent_source = layout.sub_parent_iteration_values(
-                sub_parent_family, sub_parent_factor
-            )
-            self._codegen_sub_parent_pointwise(
-                kernel,
+            nodes_and_lanes = zip(
                 sub_parent_epilogue_nodes,
-                layout,
-                sub_parent_family,
-                sub_parent_source,
-                must_materialize_names=OrderedSet(stage.must_materialize_names),
-                source_layouts=epilogue_source_layouts,
-                sub_parent_factor=sub_parent_factor,
+                stage.output_lanes,
+                strict=True,
             )
+            for output_lanes, stage in itertools.groupby(
+                nodes_and_lanes, key=operator.itemgetter(1)
+            ):
+                stage_nodes = tuple(node for node, _lanes in stage)
+                for output_lane in range(output_lanes):
+                    sub_parent_source = layout.sub_parent_iteration_values(
+                        sub_parent_family,
+                        sub_parent_factor,
+                        output_lanes,
+                        output_lane,
+                    )
+                    self._codegen_sub_parent_pointwise(
+                        kernel,
+                        stage_nodes,
+                        layout,
+                        sub_parent_family,
+                        sub_parent_source,
+                        must_materialize_names=must_materialize_names,
+                        source_layouts=epilogue_source_layouts,
+                        sub_parent_factor=sub_parent_factor,
+                    )
             # Removed reduction-stage stores can leave sub-parent stores
             # undercounted in metadata; keep metadata aligned with emitted stores.
             kernel.num_store = max(kernel.num_store, len(kernel.store_buffer_names))
