@@ -1509,7 +1509,15 @@ class _IterationSpace:
     values: Sequence[sympy.Expr]
 
 
-RemappedRangeValue = CSEVariable | tuple[CSEVariable, ...]
+@dataclasses.dataclass(frozen=True)
+class _ContiguousSubParentRemappedValue:
+    parts: tuple[CSEVariable, ...]
+    parent_extent: sympy.Expr
+
+
+RemappedRangeValue = (
+    CSEVariable | tuple[CSEVariable, ...] | _ContiguousSubParentRemappedValue
+)
 
 
 def _select_lane(
@@ -1553,11 +1561,23 @@ class _DerivedIterationFamily:
     def resolve_load(self, name: str, index: sympy.Expr) -> CSEVariable | None:
         """The pre-materialized value for ``name``, or None if there is none.
 
-        A tuple entry in ``remapped_values`` is a lane tuple: the parent tile
-        was split into ``len(value)`` lanes, and ``index`` selects one of them
-        as ``index % len(value)``. Non-tuple entries are already the value.
+        Lane tuples select interleaved lanes with ``index % factor``. Contiguous
+        lanes select from the index's constant offset within the parent extent.
+        Non-lane entries are already the value.
         """
         value = self.remapped_values.get(name)
+        if isinstance(value, _ContiguousSubParentRemappedValue):
+            factor = len(value.parts)
+            lane = scheduler.NestedReduction.sub_parent_contiguous_lane(
+                index, factor, value.parent_extent
+            )
+            part = _select_lane(value.parts, lane)
+            if part is None:
+                raise AssertionError(
+                    "sub-parent planner invariant violated: contiguous load "
+                    f"for {name!r} has non-constant lane for index {index}"
+                )
+            return part
         if not isinstance(value, tuple):
             return value
         lane = scheduler.NestedReduction.interleaved_sub_parent_lane(
@@ -1934,7 +1954,7 @@ class _GroupedReductionLayout:
             numel=FloorDiv(self.group_tree.numel, factor),
             block_size=FloorDiv(self.group_tree.block_size(), factor),
             block_offset=FloorDiv(self.group_tree.block_offset(), factor),
-            name_suffix=f"half{factor}",
+            name_suffix=f"lane{factor}",
             named_constants=self._grouped_axis_named_constants(self.group_tree),
         )
         lane_index_subs = scheduler.NestedReduction.sub_parent_extent_subs(
@@ -2054,27 +2074,37 @@ class _GroupedReductionLayout:
             return True
         if not self.is_parent_tile_shaped(value):
             return False
-        interleaved = scheduler.NestedReduction.SubParentSourceLayout.INTERLEAVED
-        if source_layout is not interleaved:
+        if source_layout is None:
             return False
+        source_layout_kind = scheduler.NestedReduction.SubParentSourceLayout
         sub_parent_tree = family.sub_parent_tree()
         child_block = sub_parent_tree.block_size_str()
         factor_dim = str(factor)
         shape = value.shape
         assert shape is not None  # noqa: S101
-        if len(shape) == 2:
-            passthrough_dim = str(shape[1 - self.parent_axis])
-            reshape_shape = (passthrough_dim, child_block, factor_dim)
-            part_shape = (passthrough_dim, child_block)
-        else:
-            reshape_shape = (child_block, factor_dim)
-            part_shape = (child_block,)
+        # parent_dim() only accepts rank-1/2 tiles.
+        prefix = (str(shape[1 - self.parent_axis]),) if len(shape) == 2 else ()
         parts = tuple(
-            kernel.cse.newvar(dtype=value.dtype, shape=part_shape)
+            kernel.cse.newvar(dtype=value.dtype, shape=(*prefix, child_block))
             for _ in range(factor)
         )
-        kernel.emit_split_via_reshape(value, reshape_shape, tuple(map(str, parts)))
-        family.remapped_values[name] = parts
+        part_names = tuple(map(str, parts))
+        if source_layout is source_layout_kind.CONTIGUOUS:
+            reshape_shape = (*prefix, factor_dim, child_block)
+            permute_dims = (0, 2, 1) if prefix else (1, 0)
+            kernel.emit_split_via_reshape_permute(
+                value, reshape_shape, permute_dims, part_names
+            )
+            family.remapped_values[name] = _ContiguousSubParentRemappedValue(
+                parts,
+                self.local_reduction_size,
+            )
+        else:
+            assert source_layout is source_layout_kind.INTERLEAVED  # noqa: S101
+            kernel.emit_split_via_reshape(
+                value, (*prefix, child_block, factor_dim), part_names
+            )
+            family.remapped_values[name] = parts
         return True
 
     def _broadcast_value_to_axis_resolution(
@@ -2715,7 +2745,8 @@ class SIMDScheduling(BaseScheduling):
         # The scheduler-global map also contains later mutations and would
         # collapse distinct temporal versions inside this legality check.
         epilogue_node_set = OrderedSet(epilogue_nodes)
-        if not scheduler.NestedReduction._sub_parent_epilogue_outputs_unread(
+        nested_reduction = scheduler.NestedReduction
+        if not nested_reduction._sub_parent_epilogue_outputs_unread(
             nodes, epilogue_node_set
         ):
             return True
@@ -2725,21 +2756,13 @@ class SIMDScheduling(BaseScheduling):
             if node.is_reduction()
             for dep in node.read_writes.reads
         )
-        for node in nodes:
-            if node in epilogue_node_set:
-                continue
-            if not node.is_reduction():
-                _, (node_numel, node_rnumel) = node.group
-                if not (
-                    V.graph.sizevars.statically_known_equals(node_numel, numel)
-                    and V.graph.sizevars.statically_known_equals(node_rnumel, 1)
-                ):
-                    return True
-        nested_reduction = scheduler.NestedReduction
-        source_free = nested_reduction._sub_parent_siblings_are_source_free
-        if not source_free(nodes, epilogue_node_set, numel, parent_source_names):
-            return True
-        return False
+        return not nested_reduction._sub_parent_siblings_are_source_free(
+            nodes,
+            epilogue_node_set,
+            numel,
+            parent_source_names,
+            reject_group_mismatch=True,
+        )
 
     def _sub_parent_epilogue_plan(
         self,
