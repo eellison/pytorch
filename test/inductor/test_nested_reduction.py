@@ -6,6 +6,7 @@ import re
 
 import torch
 import torch._inductor.config as inductor_config
+import torch.nn.functional as F
 from torch._higher_order_ops.inline_asm_elementwise import inline_asm_elementwise
 from torch._inductor import metrics
 from torch._inductor.choices import InductorChoices
@@ -32,6 +33,11 @@ MXFP4_RECIP_UE8M0_ASM = (
     "setp.eq.u32 p_zero, $1, 0; sub.s32 neg_exp, 127, $1; "
     "cvt.rn.f32.s32 neg_exp_f, neg_exp; ex2.approx.f32 result, neg_exp_f; "
     "selp.f32 $0, 0f00000000, result, p_zero;}"
+)
+
+
+E2M1X2_PACK_ASM = (
+    "{.reg .b8 t; cvt.rn.satfinite.e2m1x2.f32 t, $2, $1; cvt.u32.u8 $0, t;}"
 )
 
 
@@ -167,6 +173,9 @@ def _mxfp6_preshuffled_quantize(x, shifted=False):
 
 
 def _float_to_mxfp6_e2m3(x):
+    # NB: the op count here is load-bearing, not just the numerics -- replacing
+    # this with a plain round()/mask changes the fusion decision for the
+    # preshuffled tests (codegen_nested_reduction drops to 0).
     sign = (x < 0).to(torch.int32)
     absolute = torch.clamp(torch.abs(x), max=7.5)
     subnormal_mantissa = torch.round(absolute * 8.0).to(torch.int32)
@@ -205,8 +214,6 @@ def _swizzle_scale(scale):
 
 
 def _rmsnorm_block_scale_swizzle(x, weight, G):
-    import torch.nn.functional as F
-
     B, D = x.shape
     x = F.rms_norm(x, (D,), weight)
     x_groups = x.view(B, D // G, G)
@@ -217,7 +224,6 @@ def _rmsnorm_block_scale_swizzle(x, weight, G):
 
 
 def _rmsnorm_mxfp8_scale_swizzle(x, weight, G):
-    import torch.nn.functional as F
     from torch._inductor import inductor_prims
 
     B, D = x.shape
@@ -504,7 +510,6 @@ class _NestedReductionBase:
 
     def test_dynamic_shapes_varying_batch_and_dim(self):
         """Dynamic shapes: vary both B and D at runtime."""
-        import torch.nn.functional as F
 
         def f(x, weight):
             x = F.rms_norm(x, (x.shape[-1],), weight)
@@ -528,8 +533,6 @@ class _NestedReductionBase:
     @parametrize("B", [1, 128])
     def test_producer_consumer_rmsnorm_amax(self, B):
         """RMS norm materializes output, amax reads it."""
-        import torch.nn.functional as F
-
         D, G = 4096, 16
 
         def f(x, weight):
@@ -560,8 +563,6 @@ class _NestedReductionBase:
         pointwise_kind,
         epilogue_resolution,
     ):
-        import torch.nn.functional as F
-
         B, D, G = 128, 4096, 128
 
         def f(x, weight, prologue_extra, epilogue_extra):
@@ -672,8 +673,6 @@ class _NestedReductionBase:
 
     def test_multi_op_prologue_and_epilogue(self):
         """Prologue does mul+add+relu, epilogue does log1p+clamp."""
-        import torch.nn.functional as F
-
         B, D, G = 64, 4096, 128
 
         def f(x, weight, bias, scale):
@@ -692,8 +691,6 @@ class _NestedReductionBase:
     @inductor_config.patch(emulate_precision_casts=True)
     def test_fullres_epilogue_with_multiple_outputs(self):
         """Full-res epilogue producing both converted output and scale."""
-        import torch.nn.functional as F
-
         B, D, G = 64, 4096, 128
         qmax = 448.0
 
@@ -712,8 +709,6 @@ class _NestedReductionBase:
 
     def test_grouped_reduction_with_weight_mul(self):
         """Grouped reduction input involves element-wise weight multiply."""
-        import torch.nn.functional as F
-
         B, D, G = 128, 4096, 32
 
         def f(x, weight, group_weight):
@@ -733,8 +728,6 @@ class _NestedReductionBase:
     @inductor_config.patch(emulate_precision_casts=True)
     def test_producer_consumer_rmsnorm_scale(self):
         """RMS norm + amax + converted scale epilogue."""
-        import torch.nn.functional as F
-
         B, D, G = 128, 4096, 16
 
         def f(x, weight):
@@ -753,8 +746,6 @@ class _NestedReductionBase:
     @parametrize("B", [128, 1])
     def test_producer_consumer_rmsnorm_quant(self, B):
         """RMS norm + amax + scale + full-res convert epilogue."""
-        import torch.nn.functional as F
-
         D, G = 4096, 128
         qmax = 448.0
 
@@ -873,8 +864,6 @@ class _NestedReductionBase:
     def test_producer_consumer_rmsnorm_interleaved_pair_epilogue(
         self, D, G, benchmark_fusion
     ):
-        import torch.nn.functional as F
-
         B = 32
 
         def f(x, weight):
@@ -893,8 +882,6 @@ class _NestedReductionBase:
 
     @parametrize("dynamic_axis", ["batch", "reduction"])
     def test_dynamic_sub_parent_epilogue(self, dynamic_axis):
-        import torch.nn.functional as F
-
         G = 16
 
         def f(x, weight):
@@ -931,8 +918,6 @@ class _NestedReductionBase:
 
     @parametrize("gate", ["max_fusion_size", "no_fuse_buffer"])
     def test_sub_parent_append_respects_fusion_gate(self, gate):
-        import torch.nn.functional as F
-
         B, D, G = 32, 1024, 16
 
         def f(x, weight):
@@ -971,8 +956,6 @@ class _NestedReductionBase:
         if torch.cuda.get_device_capability()[0] < 10:
             self.skipTest("NVFP4 inline asm requires SM100+")
 
-        import torch.nn.functional as F
-
         D, G = 4096, 16
 
         def f(x, weight):
@@ -987,10 +970,7 @@ class _NestedReductionBase:
             packed = inline_asm_elementwise(
                 even,
                 odd,
-                asm_str=(
-                    "{.reg .b8 t; cvt.rn.satfinite.e2m1x2.f32 t, "
-                    "$2, $1; cvt.u32.u8 $0, t;}"
-                ),
+                asm_str=E2M1X2_PACK_ASM,
                 constraints="=r,f,f",
                 dtype=torch.int32,
                 is_pure=True,
@@ -1038,8 +1018,6 @@ class _NestedReductionBase:
         self.check_fusion()
 
     def test_producer_consumer_rmsnorm_chunk_swiglu(self):
-        import torch.nn.functional as F
-
         B, D = 32, 1024
 
         def f(x, residual, weight):
@@ -1056,8 +1034,6 @@ class _NestedReductionBase:
         self.check_fusion()
 
     def test_dynamic_batch_rmsnorm_chunk_swiglu(self):
-        import torch.nn.functional as F
-
         D = 1024
 
         def f(x, residual, weight):
@@ -1089,8 +1065,6 @@ class _NestedReductionBase:
         self.check_fusion()
 
     def test_producer_consumer_rmsnorm_chunk4_gating(self):
-        import torch.nn.functional as F
-
         B, D = 32, 1024
 
         def f(x, residual, weight):
@@ -1127,8 +1101,6 @@ class _NestedReductionBase:
         self.assertGreater(metrics.generated_kernel_count, 1)
 
     def test_producer_consumer_rejects_chunk_padded_rblock(self):
-        import torch.nn.functional as F
-
         B, D = 32, 1000
 
         def f(x, residual, weight):
@@ -1146,8 +1118,6 @@ class _NestedReductionBase:
         self.assertGreater(metrics.generated_kernel_count, 1)
 
     def test_producer_consumer_rejects_chunk3_contiguous_sub_parent_source(self):
-        import torch.nn.functional as F
-
         B, D = 32, 960
 
         def f(x, residual, weight):
@@ -1165,8 +1135,6 @@ class _NestedReductionBase:
         self.assertGreater(metrics.generated_kernel_count, 1)
 
     def test_producer_consumer_rejects_reduced_sidecar_parent_source(self):
-        import torch.nn.functional as F
-
         B, D = 32, 1024
 
         def f(x, residual, weight):
@@ -1196,8 +1164,6 @@ class _NestedReductionBase:
         self.assertEqual(metrics.generated_kernel_count, 1)
 
     def test_producer_consumer_rejects_shifted_contiguous_sub_parent_source(self):
-        import torch.nn.functional as F
-
         B, D = 32, 1024
 
         def f(x, residual, weight):
@@ -1217,8 +1183,6 @@ class _NestedReductionBase:
 
     @parametrize("layout", ("strided", "shifted_offset"))
     def test_rejects_noncanonical_contiguous_sub_parent_source(self, layout):
-        import torch.nn.functional as F
-
         B, D = 32, 1024
         offset = D // 2 + 8
 
@@ -1236,8 +1200,6 @@ class _NestedReductionBase:
         self._check_rejected(f, (base,))
 
     def test_rejects_trailing_chunk_of_flattened_reduction(self):
-        import torch.nn.functional as F
-
         K, D = 2, 512
 
         def f(x, residual, weight):
@@ -1251,8 +1213,6 @@ class _NestedReductionBase:
         self._check_rejected(f, (x, torch.randn_like(x), torch.randn_like(x)))
 
     def test_producer_consumer_rmsnorm_chunk_large_rnumel(self):
-        import torch.nn.functional as F
-
         B, D = 8, 8192
 
         def f(x, residual, weight):
@@ -1269,8 +1229,6 @@ class _NestedReductionBase:
         self.check_fusion()
 
     def test_producer_consumer_rejects_broadcast_parent_source(self):
-        import torch.nn.functional as F
-
         B, D, G = 32, 1024, 16
 
         def f(x, weight):
@@ -1288,8 +1246,6 @@ class _NestedReductionBase:
         self.assertGreater(metrics.generated_kernel_count, 1)
 
     def test_producer_consumer_rejects_conflicting_parent_source_index(self):
-        import torch.nn.functional as F
-
         B, D, G = 32, 1024, 16
 
         def f(x, weight):
@@ -1310,8 +1266,6 @@ class _NestedReductionBase:
         self.assertGreater(metrics.generated_kernel_count, 1)
 
     def test_producer_consumer_rejects_sub_parent_grouped_axis_x(self):
-        import torch.nn.functional as F
-
         B, K, D = 8, 16, 1024
 
         def f(x, weight):
@@ -1328,8 +1282,6 @@ class _NestedReductionBase:
         self.assertEqual(metrics.generated_kernel_count, 2)
 
     def test_producer_consumer_rejects_sub_parent_output_reader(self):
-        import torch.nn.functional as F
-
         B, D, G = 32, 1024, 16
 
         def f(x, weight):
@@ -1348,8 +1300,6 @@ class _NestedReductionBase:
         self.check_non_leaf_epilogue_fallback()
 
     def test_producer_consumer_rejects_shifted_sub_parent_intermediate(self):
-        import torch.nn.functional as F
-
         B, D, G = 32, 1024, 16
 
         def f(x, weight):
@@ -1367,8 +1317,6 @@ class _NestedReductionBase:
         self.check_non_leaf_epilogue_fallback()
 
     def test_producer_consumer_sub_parent_intermediate(self):
-        import torch.nn.functional as F
-
         B, D, G = 32, 1024, 16
 
         def f(x, weight):
@@ -1385,8 +1333,6 @@ class _NestedReductionBase:
         self.check_fusion()
 
     def test_producer_consumer_rejects_shifted_parent_full_intermediate(self):
-        import torch.nn.functional as F
-
         B, D, G = 32, 1024, 16
 
         def f(x, weight):
@@ -1404,8 +1350,6 @@ class _NestedReductionBase:
         self.assertGreater(metrics.generated_kernel_count, 1)
 
     def test_producer_consumer_rejects_sub_parent_output_fullres_reader(self):
-        import torch.nn.functional as F
-
         B, D, G = 32, 1024, 16
 
         def f(x, weight):
@@ -1424,8 +1368,6 @@ class _NestedReductionBase:
         self.check_non_leaf_epilogue_fallback()
 
     def test_producer_consumer_rejects_sub_parent_output_reduction_reader(self):
-        import torch.nn.functional as F
-
         B, D, G = 32, 1024, 16
 
         def f(x, weight):
@@ -1462,10 +1404,7 @@ class _NestedReductionBase:
             packed = inline_asm_elementwise(
                 even,
                 odd,
-                asm_str=(
-                    "{.reg .b8 t; cvt.rn.satfinite.e2m1x2.f32 t, "
-                    "$2, $1; cvt.u32.u8 $0, t;}"
-                ),
+                asm_str=E2M1X2_PACK_ASM,
                 constraints="=r,f,f",
                 dtype=torch.int32,
                 is_pure=True,
@@ -1507,10 +1446,7 @@ class _NestedReductionBase:
             packed = inline_asm_elementwise(
                 even,
                 odd,
-                asm_str=(
-                    "{.reg .b8 t; cvt.rn.satfinite.e2m1x2.f32 t, "
-                    "$2, $1; cvt.u32.u8 $0, t;}"
-                ),
+                asm_str=E2M1X2_PACK_ASM,
                 constraints="=r,f,f",
                 dtype=torch.int32,
                 is_pure=True,
@@ -2001,7 +1937,6 @@ class _NestedReductionBase:
 
     def test_epilogue_rejects_intermediate_dependency(self):
         """Do not fuse a pointwise epilogue before another dependent node."""
-        import torch.nn.functional as F
         from torch._inductor.scheduler import FusedNestedReductions
 
         B, D, G = 64, 4096, 128
@@ -2302,7 +2237,6 @@ def _capture_amax_kernel_sources(
     batch_size: int, *, force_persistent_outer_reduction: bool | None = None
 ) -> tuple[str, str]:
     B, D, G = batch_size, 4096, 16
-    import torch.nn.functional as F
 
     def f(x, weight):
         x = F.rms_norm(x, (D,), weight)
@@ -2322,7 +2256,6 @@ def _capture_producer_scale_kernel_sources(
     batch_size: int, *, force_persistent_outer_reduction: bool | None = None
 ) -> tuple[str, str]:
     B, D, G = batch_size, 4096, 16
-    import torch.nn.functional as F
 
     def f(x, weight):
         x = F.rms_norm(x, (D,), weight)
@@ -2346,7 +2279,6 @@ def _capture_fullres_kernel_sources(
 ) -> tuple[str, str]:
     B, D, G = batch_size, 4096, 128
     qmax = 448.0
-    import torch.nn.functional as F
 
     def f(x, weight):
         x = F.rms_norm(x, (D,), weight)
@@ -2406,7 +2338,6 @@ def _capture_nvfp4_kernel_sources(
     batch_size: int, *, force_persistent_outer_reduction: bool | None = None
 ) -> tuple[str, str]:
     B, D, G = batch_size, 4096, 16
-    import torch.nn.functional as F
 
     def f(x, weight):
         x = F.rms_norm(x, (D,), weight)
@@ -2420,9 +2351,7 @@ def _capture_nvfp4_kernel_sources(
         packed = inline_asm_elementwise(
             even,
             odd,
-            asm_str=(
-                "{.reg .b8 t; cvt.rn.satfinite.e2m1x2.f32 t, $2, $1; cvt.u32.u8 $0, t;}"
-            ),
+            asm_str=E2M1X2_PACK_ASM,
             constraints="=r,f,f",
             dtype=torch.int32,
             is_pure=True,
@@ -2441,7 +2370,6 @@ def _capture_nvfp4_kernel_sources(
 
 
 def _rmsnorm_mxfp4(x, weight, G):
-    import torch.nn.functional as F
     from torch._inductor import inductor_prims
 
     B, D = x.shape
@@ -2463,9 +2391,7 @@ def _rmsnorm_mxfp4(x, weight, G):
     packed = inline_asm_elementwise(
         even,
         odd,
-        asm_str=(
-            "{.reg .b8 t; cvt.rn.satfinite.e2m1x2.f32 t, $2, $1; cvt.u32.u8 $0, t;}"
-        ),
+        asm_str=E2M1X2_PACK_ASM,
         constraints="=r,f,f",
         dtype=torch.int32,
         is_pure=True,
@@ -2501,7 +2427,6 @@ def _capture_rmsnorm_chunk_kernel_sources(
     force_persistent_outer_reduction: bool | None = None,
 ) -> tuple[str, str]:
     B = batch_size
-    import torch.nn.functional as F
 
     def f(x, residual, weight):
         h = x + residual
@@ -2546,9 +2471,7 @@ def _capture_standalone_nvfp4_kernel_sources(
         packed = inline_asm_elementwise(
             even,
             odd,
-            asm_str=(
-                "{.reg .b8 t; cvt.rn.satfinite.e2m1x2.f32 t, $2, $1; cvt.u32.u8 $0, t;}"
-            ),
+            asm_str=E2M1X2_PACK_ASM,
             constraints="=r,f,f",
             dtype=torch.int32,
             is_pure=True,
