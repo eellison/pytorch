@@ -7,11 +7,14 @@ from torch import fx
 from torch._inductor import config
 from torch._inductor.fx_passes.dedupe_graph_outputs import (
     _compute_structural_classes,
+    _is_shareable_node,
+    _MIN_IDENTICAL_GRAPH_OUTPUTS,
     dedupe_graph_outputs_pass,
     is_output_computation_sharing_supported,
 )
 from torch._inductor.test_case import run_tests, TestCase
 from torch._subclasses.fake_tensor import FakeTensorMode
+from torch.fx.experimental.proxy_tensor import make_fx
 from torch.fx.passes.fake_tensor_prop import FakeTensorProp
 
 
@@ -27,8 +30,7 @@ class TestDedupeGraphOutputs(TestCase):
         graph = fx.Graph()
         x = graph.placeholder("x")
         outputs = [
-            graph.call_function(torch.ops.aten.sin.default, (x,))
-            for _ in range(count)
+            graph.call_function(torch.ops.aten.sin.default, (x,)) for _ in range(count)
         ]
         graph.output(tuple(outputs))
         gm = fx.GraphModule({}, graph)
@@ -44,7 +46,7 @@ class TestDedupeGraphOutputs(TestCase):
         siblings = [
             graph.call_function(torch.ops.aten.sin.default, (x,)) for _ in range(6)
         ]
-        graph.output((used_internally, output_only, *siblings, internal))
+        graph.output((output_only, used_internally, *siblings, internal))
         gm = fx.GraphModule({}, graph)
         _propagate(gm, torch.randn(8))
 
@@ -74,6 +76,39 @@ class TestDedupeGraphOutputs(TestCase):
                 ]
             ),
             7,
+        )
+
+    def test_mutation_between_equivalent_outputs_fails_closed(self):
+        graph = fx.Graph()
+        x = graph.placeholder("x")
+        replacement = graph.placeholder("replacement")
+        before = [
+            graph.call_function(torch.ops.aten.sin.default, (x,)) for _ in range(4)
+        ]
+        graph.call_function(torch.ops.aten.copy_.default, (x, replacement))
+        after = [
+            graph.call_function(torch.ops.aten.sin.default, (x,)) for _ in range(4)
+        ]
+        graph.output((*before, *after))
+        gm = fx.GraphModule({}, graph)
+        _propagate(gm, torch.zeros(8), torch.ones(8))
+
+        dedupe_graph_outputs_pass(graph)
+        graph.lint()
+        gm.recompile()
+
+        result = gm(torch.zeros(8), torch.ones(8))
+        for output in result[:4]:
+            torch.testing.assert_close(output, torch.zeros(8))
+        for output in result[4:]:
+            torch.testing.assert_close(output, torch.sin(torch.ones(8)))
+        self.assertEqual(
+            sum(node.target is torch.ops.aten.sin.default for node in graph.nodes),
+            8,
+        )
+        self.assertEqual(
+            sum(node.target is torch.ops.aten.clone.default for node in graph.nodes),
+            0,
         )
 
     def test_sparse_output_metadata_fails_closed(self):
@@ -165,6 +200,22 @@ class TestDedupeGraphOutputs(TestCase):
                 self.assertEqual(len(sin_nodes), count)
                 self.assertEqual(len(clone_nodes), 0)
 
+    def test_dynamic_output_shapes_fail_closed(self):
+        def fn(x):
+            return tuple(torch.sin(x) for _ in range(8))
+
+        gm = make_fx(fn, tracing_mode="symbolic")(torch.randn(5))
+        dedupe_graph_outputs_pass(gm.graph)
+
+        self.assertEqual(
+            sum(node.target is torch.ops.aten.sin.default for node in gm.graph.nodes),
+            8,
+        )
+        self.assertEqual(
+            sum(node.target is torch.ops.aten.clone.default for node in gm.graph.nodes),
+            0,
+        )
+
     def test_random_outputs_are_not_shared(self):
         graph = fx.Graph()
         x = graph.placeholder("x")
@@ -204,6 +255,78 @@ class TestDedupeGraphOutputs(TestCase):
             if node.target is torch.ops.aten.empty_like.default
         ]
         self.assertEqual(len(empty_nodes), 8)
+
+    def test_quantized_uninitialized_outputs_are_not_shareable(self):
+        graph = fx.Graph()
+        scales = graph.placeholder("scales")
+        zero_points = graph.placeholder("zero_points")
+        qtensor = graph.placeholder("qtensor")
+        nodes = [
+            graph.call_function(
+                torch.ops.aten._empty_affine_quantized.default,
+                ((8,),),
+                {
+                    "dtype": torch.quint8,
+                    "scale": 1.0,
+                    "zero_point": 0,
+                },
+            ),
+            graph.call_function(
+                torch.ops.aten._empty_per_channel_affine_quantized.default,
+                ((8,),),
+                {
+                    "scales": scales,
+                    "zero_points": zero_points,
+                    "axis": 0,
+                    "dtype": torch.quint8,
+                },
+            ),
+            graph.call_function(
+                torch.ops.aten.empty_quantized.default,
+                ((8,), qtensor),
+            ),
+        ]
+
+        self.assertTrue(all(not _is_shareable_node(node) for node in nodes))
+
+    def test_lazy_metadata_views_are_not_shared(self):
+        for target, metadata_predicate, dtype in (
+            (
+                torch.ops.aten._conj.default,
+                torch.Tensor.is_conj,
+                torch.complex64,
+            ),
+            (torch.ops.aten._neg_view.default, torch.Tensor.is_neg, torch.float32),
+        ):
+            with self.subTest(target=target):
+                graph = fx.Graph()
+                x = graph.placeholder("x")
+                outputs = [
+                    graph.call_function(target, (x,))
+                    for _ in range(_MIN_IDENTICAL_GRAPH_OUTPUTS)
+                ]
+                graph.output(tuple(outputs))
+                gm = fx.GraphModule({}, graph)
+                example = torch.randn(8, dtype=dtype)
+                _propagate(gm, example)
+
+                dedupe_graph_outputs_pass(graph)
+                graph.lint()
+                gm.recompile()
+
+                result = gm(example)
+                self.assertTrue(all(metadata_predicate(output) for output in result))
+                self.assertEqual(
+                    sum(node.target is target for node in graph.nodes),
+                    _MIN_IDENTICAL_GRAPH_OUTPUTS,
+                )
+                self.assertEqual(
+                    sum(
+                        node.target is torch.ops.aten.clone.default
+                        for node in graph.nodes
+                    ),
+                    0,
+                )
 
     def test_collective_outputs_are_not_shared(self):
         import torch.distributed._functional_collectives

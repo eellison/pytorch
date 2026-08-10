@@ -39,11 +39,16 @@ _REJECTED_OP_TAGS = OrderedSet(
         torch.Tag.out_variant,
     ]
 )
-_UNINITIALIZED_OP_PACKETS = OrderedSet(
+_REJECTED_OP_PACKETS = OrderedSet(
     [
+        torch.ops.aten._conj,
+        torch.ops.aten._empty_affine_quantized,
+        torch.ops.aten._empty_per_channel_affine_quantized,
+        torch.ops.aten._neg_view,
         torch.ops.aten.empty,
         torch.ops.aten.empty_like,
         torch.ops.aten.empty_permuted,
+        torch.ops.aten.empty_quantized,
         torch.ops.aten.empty_strided,
         torch.ops.aten.new_empty,
         torch.ops.aten.new_empty_strided,
@@ -121,7 +126,7 @@ def _is_shareable_node(node: fx.Node) -> bool:
         node.op != "call_function"
         or not isinstance(node.target, torch._ops.OpOverload)
         or node.target.namespace not in _SAFE_OP_NAMESPACES
-        or node.target.overloadpacket in _UNINITIALIZED_OP_PACKETS
+        or node.target.overloadpacket in _REJECTED_OP_PACKETS
     ):
         return False
 
@@ -133,6 +138,27 @@ def _is_shareable_node(node: fx.Node) -> bool:
         arg.alias_info is not None and arg.alias_info.is_write
         for arg in node.target._schema.arguments
     )
+
+
+def _is_pure_functional_graph(graph: fx.Graph) -> bool:
+    """
+    Reject graphs whose effects are not represented in data dependencies.
+
+    Structural equivalence alone cannot distinguish reads of a tensor before
+    and after an in-graph mutation. The audited inference case is entirely
+    functional, so fail closed instead of attempting mutation versioning here.
+    """
+    for node in graph.nodes:
+        if node.op in ("placeholder", "get_attr", "output"):
+            continue
+        if (
+            node.op != "call_function"
+            or not isinstance(node.target, torch._ops.OpOverload)
+            or node.target.namespace not in _SAFE_OP_NAMESPACES
+            or node.is_impure()
+        ):
+            return False
+    return True
 
 
 def _storage_key(value) -> _StorageKey | None:
@@ -245,7 +271,7 @@ def dedupe_graph_outputs_pass(graph: fx.Graph) -> None:
 
     output_args = pytree.arg_tree_leaves(*output_node.args, **output_node.kwargs)
     output_nodes = [node for node in output_args if isinstance(node, fx.Node)]
-    if len(output_nodes) <= 1:
+    if len(output_nodes) <= 1 or not _is_pure_functional_graph(graph):
         return
 
     structural_classes = _compute_structural_classes(graph)
@@ -254,9 +280,7 @@ def dedupe_graph_outputs_pass(graph: fx.Graph) -> None:
         equivalent_groups.setdefault(structural_classes[node], OrderedSet()).add(node)
 
     if not any(
-        _MIN_IDENTICAL_GRAPH_OUTPUTS
-        <= len(group)
-        <= _MAX_IDENTICAL_GRAPH_OUTPUTS
+        _MIN_IDENTICAL_GRAPH_OUTPUTS <= len(group) <= _MAX_IDENTICAL_GRAPH_OUTPUTS
         for group in equivalent_groups.values()
     ):
         return
@@ -276,9 +300,7 @@ def dedupe_graph_outputs_pass(graph: fx.Graph) -> None:
     replacements_made = 0
     for group in equivalent_groups.values():
         if not (
-            _MIN_IDENTICAL_GRAPH_OUTPUTS
-            <= len(group)
-            <= _MAX_IDENTICAL_GRAPH_OUTPUTS
+            _MIN_IDENTICAL_GRAPH_OUTPUTS <= len(group) <= _MAX_IDENTICAL_GRAPH_OUTPUTS
         ):
             continue
 
@@ -292,18 +314,31 @@ def dedupe_graph_outputs_pass(graph: fx.Graph) -> None:
         if len(eligible_nodes) < _MIN_IDENTICAL_GRAPH_OUTPUTS:
             continue
 
-        canonical_node = eligible_nodes[0]
-        for duplicate_node in eligible_nodes[1:]:
-            if (
-                len(duplicate_node.users) == 1
-                and output_node in duplicate_node.users
-            ):
-                with graph.inserting_before(output_node):
-                    output_copy = graph.call_function(
-                        torch.ops.aten.clone.default, (canonical_node,)
-                    )
-                duplicate_node.replace_all_uses_with(output_copy)
-                replacements_made += 1
+        def is_output_only(node: fx.Node) -> bool:
+            return len(node.users) == 1 and output_node in node.users
+
+        # Prefer a node that must remain for an internal user. Otherwise output
+        # order can leave that computation live after sharing the output-only
+        # branches.
+        canonical_node = next(
+            (node for node in eligible_nodes if not is_output_only(node)),
+            eligible_nodes[0],
+        )
+        duplicate_nodes = [
+            node
+            for node in eligible_nodes
+            if node is not canonical_node and is_output_only(node)
+        ]
+        if len(duplicate_nodes) + 1 < _MIN_IDENTICAL_GRAPH_OUTPUTS:
+            continue
+
+        for duplicate_node in duplicate_nodes:
+            with graph.inserting_before(output_node):
+                output_copy = graph.call_function(
+                    torch.ops.aten.clone.default, (canonical_node,)
+                )
+            duplicate_node.replace_all_uses_with(output_copy)
+            replacements_made += 1
 
     if replacements_made > 0:
         graph.eliminate_dead_code()
