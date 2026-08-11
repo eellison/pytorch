@@ -385,6 +385,14 @@ class SIMDKernelFeatures:
             )
         return result
 
+    def pointwise_memory_summary(
+        self, groups: Sequence[sympy.Expr]
+    ) -> TiledMemorySummary:
+        """Summarize pointwise memory behavior for an arbitrary tiled domain."""
+        if self.is_reduction() or not groups:
+            raise ValueError("expected a non-empty pointwise domain")
+        return MemoryEstimator(self, groups).tiled_summary()
+
 
 class MemoryEstimator:
     """
@@ -508,6 +516,28 @@ class MemoryEstimator:
                 return True
         return False
 
+    def tiled_summary(self) -> TiledMemorySummary:
+        """Summarize external traffic and read scope after codegen simulation."""
+        stats = MemoryStats.compute(self).persistent.memory
+        read_names = OrderedSet(self.persistent.reads)
+        read_names_omitting_dim = tuple(
+            OrderedSet(
+                name
+                for name, deps in self.persistent.reads.items()
+                if deps
+                and all(
+                    not dep.is_indirect() and symbol not in dep.index.free_symbols
+                    for dep in deps
+                )
+            )
+            for symbol in self.symbols
+        )
+        return TiledMemorySummary(
+            external_memory_bytes=stats.bytes,
+            external_read_names=read_names,
+            read_names_omitting_dim=read_names_omitting_dim,
+        )
+
     def set_ranges(self, *lengths: list[list[sympy.Expr]]) -> list[list[sympy.Expr]]:
         if len(self.kernel_sizes) != len(lengths):
             raise AssertionError(
@@ -560,6 +590,15 @@ class MemoryEstimate:
             reads={[*itertools.chain.from_iterable(self.reads.values())]!r},
             writes={[*itertools.chain.from_iterable(self.writes.values())]!r}
         )"""
+
+
+@dataclasses.dataclass(frozen=True)
+class TiledMemorySummary:
+    """MemoryEstimator results needed by tiled scheduling policies."""
+
+    external_memory_bytes: sympy.Expr
+    external_read_names: OrderedSet[str]
+    read_names_omitting_dim: tuple[OrderedSet[str], ...]
 
 
 @dataclasses.dataclass
@@ -666,7 +705,7 @@ class StatsForReadsOrWrites:
             dim=[a + b for a, b in zip(self.dim, other.dim)],
             loop=[a + b for a, b in zip(self.loop, other.loop)],
             bytes_contiguous_or_broadcast=self.bytes_contiguous_or_broadcast
-            + self.bytes_contiguous_or_broadcast,
+            + other.bytes_contiguous_or_broadcast,
             bytes_non_contiguous=self.bytes_non_contiguous + other.bytes_non_contiguous,
         )
 

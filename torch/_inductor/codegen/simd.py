@@ -4627,14 +4627,29 @@ class SIMDScheduling(BaseScheduling):
                 )
 
         tilings: list[tuple[CandidateTiling, immutable_dict[str, sympy.Expr], int]] = []
-        for pw, red in score_split:
+
+        def append_tiling(
+            pw: _SubSplit,
+            red: _SubSplit,
+            score_bonus: int = 0,
+        ) -> None:
             candidate = CandidateTiling(
                 cls.create_tiling(pw.splits, red.splits),
-                score=sum(pw.split_scores) + sum(red.split_scores),
+                score=sum(pw.split_scores) + sum(red.split_scores) + score_bonus,
             )
             tiling_score = cls.create_tiling(pw.split_scores, red.split_scores)
             tilings.append(
                 (candidate, tiling_score, pw.coalesced_memory + red.coalesced_memory)
+            )
+
+        for pw, red in score_split:
+            append_tiling(pw, red)
+
+        if broadcast_work := coalesce_analysis.broadcast_work:
+            append_tiling(
+                process_node_vars((broadcast_work.split_var,), is_pointwise=True),
+                process_node_vars(is_pointwise=False),
+                broadcast_work.operation_score_bonus,
             )
 
         default_tiling = cls.create_tiling([pointwise_numel], [reduction_numel])
