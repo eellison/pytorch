@@ -1308,7 +1308,14 @@ class CachingAutotuner(KernelInterface):
 
         return TritonCompileResult(binary, cfg, compile_meta, self.inductor_meta)
 
-    def bench(self, launcher, *args, with_profiler=False, **kwargs):
+    def bench(
+        self,
+        launcher,
+        *args,
+        with_profiler=False,
+        _benchmark_kwargs=None,
+        **kwargs,
+    ):
         """Measure the performance of a given launcher."""
         # we don't skip configs with spilled registers when auto-tuning custom
         # (user-written) Triton kernels, as (i) we don't have any knowledge or
@@ -1401,6 +1408,8 @@ class CachingAutotuner(KernelInterface):
             if self.device_props.type == "cpu"
             else {"rep": 40, "is_vetted_benchmarking": True}
         )
+        if _benchmark_kwargs is not None:
+            benchmark_kwargs.update(_benchmark_kwargs)
         result = benchmarker.benchmark(
             fn=kernel_call,
             device=self.device_props.type,
@@ -1649,6 +1658,32 @@ class CachingAutotuner(KernelInterface):
 
         autotuning_inputs_log.debug("=" * 60)
 
+    def _reduction_racing_finalists(self, *args, **kwargs):
+        screen_timings = {
+            launcher: self.bench(
+                launcher,
+                *args,
+                _benchmark_kwargs={"benchmark_iters": 40},
+                **kwargs,
+            )
+            for launcher in self.launchers
+        }
+        leaders = sorted(screen_timings, key=screen_timings.__getitem__)[:2]
+        finalists = OrderedSet([self.launchers[0], *leaders])
+        return [launcher for launcher in self.launchers if launcher in finalists]
+
+    def _use_reduction_racing(self) -> bool:
+        if not inductor_triton_config.autotune_reduction_racing:
+            return False
+
+        from torch._inductor import config as inductor_config
+
+        return (
+            inductor_config.use_experimental_benchmarker
+            and self.heuristic_type == HeuristicType.REDUCTION
+            and len(self.launchers) >= 5
+        )
+
     def benchmark_all_configs(self, *args, **kwargs):
         with (
             dynamo_timed(
@@ -1667,10 +1702,18 @@ class CachingAutotuner(KernelInterface):
             #     str(self.compile_id),
             # ),
         ):
+            launchers = self.launchers
+            if self._use_reduction_racing():
+                finalists = self._reduction_racing_finalists(*args, **kwargs)
+                for launcher in launchers:
+                    if launcher not in finalists:
+                        self._close_static_launcher(launcher)
+                launchers = finalists
+
             timings = {}
             best_launcher = None
             best_timing = float("inf")
-            for launcher in self.launchers:
+            for launcher in launchers:
                 timing = self.bench(launcher, *args, **kwargs)
                 timings[launcher] = timing
                 # Close losing static launchers eagerly so exhaustive autotuning

@@ -1946,6 +1946,11 @@ class triton:
     # Setting to None means uninitialized
     autotune_at_compile_time: bool | None = autotune_at_compile_time_default()
 
+    # Screen large reduction config sets with a shorter benchmark, then run the
+    # normal exhaustive-quality benchmark on the two leaders and the original
+    # heuristic config. Experimental and disabled by default.
+    autotune_reduction_racing: bool = False
+
     # We use random tensors for autotune by default. Setting this as true will let us
     # use inputs from sample inputs to autotune user defined triton kernels.
     # Side effect for this option is increased memory footprint during first pass compilation.

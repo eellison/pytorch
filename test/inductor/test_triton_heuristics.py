@@ -308,6 +308,60 @@ class TestTritonHeuristics(TestCase):
         with self.assertRaisesRegex(AssertionError, "pre_hook"):
             CachingAutotuner(**args)
 
+    def test_reduction_racing_keeps_leaders_and_heuristic_config(self):
+        autotuner = CachingAutotuner.__new__(CachingAutotuner)
+        autotuner.launchers = [object() for _ in range(5)]
+        screen_timings = dict(zip(autotuner.launchers, [3.0, 1.0, 2.0, 5.0, 4.0]))
+        autotuner.bench = MagicMock(
+            side_effect=lambda launcher, *args, **kwargs: screen_timings[launcher]
+        )
+
+        finalists = autotuner._reduction_racing_finalists("arg")
+
+        self.assertEqual(finalists, autotuner.launchers[:3])
+        self.assertEqual(autotuner.bench.call_count, 5)
+        for call in autotuner.bench.call_args_list:
+            self.assertEqual(call.kwargs["_benchmark_kwargs"], {"benchmark_iters": 40})
+
+    def test_reduction_racing_deduplicates_heuristic_config(self):
+        autotuner = CachingAutotuner.__new__(CachingAutotuner)
+        autotuner.launchers = [object() for _ in range(5)]
+        screen_timings = dict(zip(autotuner.launchers, [1.0, 2.0, 3.0, 4.0, 5.0]))
+        autotuner.bench = MagicMock(
+            side_effect=lambda launcher, *args, **kwargs: screen_timings[launcher]
+        )
+
+        finalists = autotuner._reduction_racing_finalists()
+
+        self.assertEqual(finalists, autotuner.launchers[:2])
+
+    def test_reduction_racing_is_disabled_and_bounded(self):
+        autotuner = CachingAutotuner.__new__(CachingAutotuner)
+        autotuner.launchers = [object() for _ in range(5)]
+        autotuner.heuristic_type = HeuristicType.REDUCTION
+
+        cases = (
+            ({}, False),
+            ({"triton.autotune_reduction_racing": True}, True),
+            (
+                {
+                    "triton.autotune_reduction_racing": True,
+                    "use_experimental_benchmarker": False,
+                },
+                False,
+            ),
+        )
+        for config_patch, expected in cases:
+            with self.subTest(config_patch=config_patch), config.patch(config_patch):
+                self.assertEqual(autotuner._use_reduction_racing(), expected)
+
+        with config.patch({"triton.autotune_reduction_racing": True}):
+            autotuner.heuristic_type = HeuristicType.POINTWISE
+            self.assertFalse(autotuner._use_reduction_racing())
+            autotuner.heuristic_type = HeuristicType.REDUCTION
+            autotuner.launchers.pop()
+            self.assertFalse(autotuner._use_reduction_racing())
+
     def test_autotune_hints_to_configs(self):
         device_props = DeviceProperties.create(torch.device(GPU_TYPE))
         device_props = device_props._replace(warp_size=8)
