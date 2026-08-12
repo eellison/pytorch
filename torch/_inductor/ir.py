@@ -7246,7 +7246,7 @@ class ExternKernel(InputsKernel):
     def codegen_comment(
         self, wrapper: PythonWrapperCodegen, kernel_name: str | None = None
     ) -> None:
-        origin_str, _detailed_origin_str = get_kernel_metadata(self, wrapper)
+        origin_str, _ = get_kernel_metadata(self, wrapper, include_detailed=False)
         if origin_str:
             wrapper.make_comment(origin_str)
 

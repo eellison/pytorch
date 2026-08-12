@@ -1542,13 +1542,6 @@ class BaseSchedulerNode:
         ):
             return
 
-        # NOTE remove V.graph.removed_operations once deps issue is fixed
-        inconsequential_nodes = (
-            self.ancestors
-            | V.graph.removed_operations
-            | self.scheduler.completed_operations
-        )
-
         def single_index_in_fused_node(buf_to_be_inplaced: SchedulerBuffer) -> bool:
             # Inside of NodeUser, we track that the read and write are equivalent
             # before deciding if the use can be inplace.
@@ -1615,7 +1608,10 @@ class BaseSchedulerNode:
                     remaining_uses = [
                         x
                         for x in input_buf.users
-                        if x.node.get_name() not in inconsequential_nodes
+                        if (name := x.node.get_name()) not in self.ancestors
+                        # NOTE remove this check once deps issue is fixed
+                        and name not in V.graph.removed_operations
+                        and name not in self.scheduler.completed_operations
                     ]
                     has_cross_stream_hazard = self.scheduler.has_cross_stream_hazard(
                         read.name, self
@@ -7661,22 +7657,17 @@ class Scheduler:
         self,
         node1: BaseSchedulerNode,
         node2: BaseSchedulerNode,
-        unfused_memory: tuple[MemoryCoalescing, ...] | None,
+        get_unfused_memory: Callable[[], tuple[MemoryCoalescing, ...] | None],
     ) -> bool:
         """Did reindexing make the fused kernel's memory access worse?
 
-        `unfused_memory` is measured before reindexing, so this compares the two
-        original kernels against the single reindexed one.
+        Analyze the fused kernel first so sufficiently low-cost results can
+        skip the per-node analysis. `get_unfused_memory` measures the original
+        kernels before reindexing when that comparison is needed.
         """
-        if unfused_memory is None:
-            return False
         fused_memory = self._selected_tiling_memory([node1, node2])
         if fused_memory is None:
             return False
-
-        # The fused analysis omits removable intermediates, so saved
-        # materialization traffic offsets coalescing regressions here.
-        unfused_cost = sum(memory.weighted_cost() for memory in unfused_memory)
         fused_cost = fused_memory.weighted_cost()
         try:
             dram_gbps = get_gpu_dram_gbps()
@@ -7684,6 +7675,18 @@ class Scheduler:
         except Exception:
             dram_gbps = 0
             valid_dram_gbps = False
+        if valid_dram_gbps and fused_cost <= (
+            dram_gbps * _REINDEXING_FUSION_LAUNCH_OVERHEAD_NS
+        ):
+            return False
+
+        unfused_memory = get_unfused_memory()
+        if unfused_memory is None:
+            return False
+
+        # The fused analysis omits removable intermediates, so saved
+        # materialization traffic offsets coalescing regressions here.
+        unfused_cost = sum(memory.weighted_cost() for memory in unfused_memory)
         if valid_dram_gbps:
             # GB/s is numerically bytes/ns, so division converts the
             # byte-equivalent costs to estimated time in nanoseconds.
@@ -7707,6 +7710,38 @@ class Scheduler:
             )
             return True
         return False
+
+    def _has_intermediate_node_dependency(
+        self, node1: BaseSchedulerNode, dep_names: Iterable[str]
+    ) -> bool:
+        node1_op_names = node1.get_operation_names()
+        for name in dep_names:
+            op_name = self.name_to_buf[name].defining_op_name()
+            if node1_op_names & self.name_to_fused_node[op_name].ancestors:
+                return True
+        return False
+
+    def _reindexing_cannot_help_vertical(
+        self, node1: BaseSchedulerNode, node2: BaseSchedulerNode
+    ) -> bool:
+        producer_names = OrderedSet(
+            self.mutation_renames.get(name, name) for name in node1.get_buffer_names()
+        )
+        producer_names.update(
+            self.mutation_renames.get(dep.name, dep.name)
+            for dep in node1.read_writes.writes
+            if isinstance(dep, (MemoryDep, StarDep))
+        )
+
+        unmatched_names = []
+        for dep in node2.unmet_dependencies:
+            name = self.mutation_renames.get(dep.name, dep.name)
+            if name in producer_names:
+                continue
+            if isinstance(dep, WeakDep) and self.fusable_weak_dep(dep, node1, node2):
+                continue
+            unmatched_names.append(dep.name)
+        return self._has_intermediate_node_dependency(node1, unmatched_names)
 
     def _try_reindex_pointwise_for_reduction(
         self,
@@ -7767,13 +7802,6 @@ class Scheduler:
         if all(tuple(sn._sizes[0]) == target_iter_sizes for sn in snodes):
             return False
 
-        # Measure each node's memory access before mutating any loops, so the
-        # coalescing guard below can compare against the un-reindexed kernels.
-        unfused_memory: tuple[MemoryCoalescing, ...] | None = None
-        memory = tuple(self._selected_tiling_memory([node]) for node in (node1, node2))
-        if all(m is not None for m in memory):
-            unfused_memory = typing.cast("tuple[MemoryCoalescing, ...]", memory)
-
         # Local rollback is still needed even with _LoopMutationTracker: this
         # helper is also used by shared_data_after_reordering_loop(), where a
         # failed reindex attempt returns -1 and the caller may keep evaluating
@@ -7801,11 +7829,25 @@ class Scheduler:
             rollback_snapshot.restore()
             return False
 
-        # TODO: Measure fused memory first so coalesced fusions skip per-node analysis.
         # Reindexing the pointwise onto the reduction's split can make its own
         # accesses uncoalesced. Undo the reindex when that costs more than the
         # traffic saved by fusing.
-        if self._reindexing_regresses_memory_coalescing(node1, node2, unfused_memory):
+        def get_unfused_memory() -> tuple[MemoryCoalescing, ...] | None:
+            reindexed_snapshot = _LoopStateSnapshot.create((pw_node,))
+            rollback_snapshot.restore()
+            try:
+                memory = tuple(
+                    self._selected_tiling_memory([node]) for node in (node1, node2)
+                )
+                if all(m is not None for m in memory):
+                    return typing.cast("tuple[MemoryCoalescing, ...]", memory)
+                return None
+            finally:
+                reindexed_snapshot.restore()
+
+        if self._reindexing_regresses_memory_coalescing(
+            node1, node2, get_unfused_memory
+        ):
             rollback_snapshot.restore()
             return False
 
@@ -8076,12 +8118,16 @@ class Scheduler:
         rolled back if the fusion decision ultimately fails.
         """
         tracker = _LoopMutationTracker.create((node1, node2))
-        can_fuse = self._can_fuse_impl(
-            node1,
-            node2,
-            can_reorder=can_reorder,
-            allow_mix_order_reduction=allow_mix_order_reduction,
-        )
+        try:
+            can_fuse = self._can_fuse_impl(
+                node1,
+                node2,
+                can_reorder=can_reorder,
+                allow_mix_order_reduction=allow_mix_order_reduction,
+            )
+        except BaseException:
+            tracker.finish(rollback=True)
+            raise
         tracker.finish(rollback=not can_fuse)
         return can_fuse
 
@@ -8373,6 +8419,11 @@ class Scheduler:
             return False
         del device2
 
+        is_vertical = bool(node1.get_operation_names() & node2.ancestors)
+        if is_vertical and self._reindexing_cannot_help_vertical(node1, node2):
+            why("intermediate nodes between node1 & node2")
+            return False
+
         if index_equivalent_dep_names is None:
             index_equivalent_dep_names = self._nested_index_equivalent_dep_names(
                 node1, node2
@@ -8427,7 +8478,7 @@ class Scheduler:
         if not V.choices.can_fuse(self, node1, node2, shared_data_score):
             return False
 
-        if node1.get_operation_names() & node2.ancestors:
+        if is_vertical:
             # node2 depends on node1 outputs
             if (
                 self.can_fuse_vertical(
@@ -8530,12 +8581,9 @@ class Scheduler:
             why("memory deps did not match")
             return False
 
-        node1_op_names = node1.get_operation_names()
-        for name in remaining_deps:
-            op_name = self.name_to_buf[name].defining_op_name()
-            if node1_op_names & self.name_to_fused_node[op_name].ancestors:
-                why("intermediate nodes between node1 & node2")
-                return False
+        if self._has_intermediate_node_dependency(node1, remaining_deps):
+            why("intermediate nodes between node1 & node2")
+            return False
 
         return True
 
@@ -9709,8 +9757,10 @@ class Scheduler:
                 name for name in partition_input_names if name in V.graph.constants
             ]
 
-            symbol_inputs = self.get_graph_partition_symbol_inputs(
-                partition, input_nodes
+            symbol_inputs = (
+                OrderedSet()
+                if skip_cudagraph
+                else self.get_graph_partition_symbol_inputs(partition, input_nodes)
             )
 
             partition_signature = GraphPartitionSignature(

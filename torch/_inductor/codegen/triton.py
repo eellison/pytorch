@@ -7118,7 +7118,17 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         looped_red = self.features.is_reduction() and not self.persistent_reduction
         tiling_scores = self.tiling_scores
         two_d_red = len(self.tiling) == 2
-        if looped_red and two_d_red:
+        if (
+            looped_red
+            and two_d_red
+            and V.graph.sizevars.statically_known_leq(
+                self.features.reduction_numel, 32768
+            )
+            # We will already generate a persistent config in this case
+            and V.graph.sizevars.statically_known_gt(
+                self.features.reduction_numel, 2048
+            )
+        ):
             memory_stats = self.features.memory_stats(self.tiling)
             dim_stats = memory_stats.persistent.memory.dim[0]
             mem_ops_per_thread = dim_stats.count_per_thread
@@ -7151,13 +7161,6 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 saved_bytes_ratio >= 1.3
                 and contiguous_red
                 # TODO - need more detailed register analysis
-                and V.graph.sizevars.statically_known_leq(
-                    self.features.reduction_numel, 32768
-                )
-                # We will already generate a persistent config in this case
-                and V.graph.sizevars.statically_known_gt(
-                    self.features.reduction_numel, 2048
-                )
                 and mem_ops_per_thread <= 10
             ):
                 return True
@@ -8106,7 +8109,7 @@ class TritonScheduling(SIMDScheduling):
 
     def codegen_comment(self, node_schedule, kernel_name=None):
         wrapper = V.graph.wrapper_code
-        origins, _detailed_origins = get_kernel_metadata(node_schedule, wrapper)
+        origins, _ = get_kernel_metadata(node_schedule, wrapper, include_detailed=False)
         if origins:
             wrapper.make_comment(origins)
 

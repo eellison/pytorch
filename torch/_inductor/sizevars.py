@@ -3,11 +3,13 @@ import dataclasses
 import functools
 import itertools
 import logging
+from collections import OrderedDict
 from collections.abc import Callable, Iterable, Sequence
 from typing import Any, cast
 
 import sympy
 from sympy import Expr
+from sympy.core.parameters import global_parameters
 
 from torch import SymInt
 from torch.fx.experimental._size_hinting import (
@@ -245,6 +247,15 @@ def statically_known_true(
     return False
 
 
+@functools.lru_cache(256, typed=True)
+def _make_statically_known_eq(
+    left: Expr | int,
+    right: Expr | int,
+    sympy_state: tuple[bool, bool, bool],
+) -> sympy.Basic | bool:
+    return sympy.Eq(left, right, evaluate=sympy_state[0])
+
+
 # This class is a little awkward, because ShapeEnv is doing most of the heavy
 # lifting and in some cases we should be directly passing through to ShapeEnv,
 # but there is some extra inductor logic that needs to be handled here
@@ -284,9 +295,26 @@ class SizeVarAllocator:
         self.stride_vars = self.make_stride_vars_cache()
         self.simplify_with_ranges = self.make_simplify_with_ranges_cache()
         self._simplify_loops = self.make_simplify_loops_cache()
+        self._record_load_store_normalize_cache: OrderedDict[
+            tuple[Any, ...],
+            tuple[Expr, tuple[sympy.Symbol, ...], tuple[Expr, ...]],
+        ] = OrderedDict()
+        self._record_load_store_normalize_cache_replacements = tuple(
+            (type(symbol), symbol, type(value), value)
+            for symbol, value in self.replacements.items()
+        )
 
     def simplify(self, expr: Expr):
         return sympy.expand(expr).xreplace(self.replacements)
+
+    def simplify_with_ranges_state(self) -> tuple[int, int, bool, bool, bool]:
+        return (
+            self.shape_env._version_counter,
+            self.shape_env._replacements_version_counter,
+            global_parameters.evaluate,
+            global_parameters.distribute,
+            global_parameters.exp_is_pow,
+        )
 
     def make_simplify_with_ranges_cache(self) -> Callable[[Expr, VarRanges], Expr]:
         """
@@ -546,7 +574,17 @@ class SizeVarAllocator:
         """
         Returns a bool indicating if it is sound to optimize as if left and right are equal.
         """
-        return self.statically_known_true(sympy.Eq(left, right))  # type: ignore[arg-type]
+        return self.statically_known_true(
+            _make_statically_known_eq(
+                left,
+                right,
+                (
+                    global_parameters.evaluate,
+                    global_parameters.distribute,
+                    global_parameters.exp_is_pow,
+                ),
+            )
+        )
 
     def statically_known_list_equals(
         self, left: Sequence[Expr], right: Sequence[Expr]
@@ -1523,7 +1561,7 @@ def join_dimensions(expr: Expr) -> Expr:
     return _join_dimensions_cached(expr)
 
 
-@functools.lru_cache(256)
+@functools.lru_cache(512)
 def _join_dimensions_cached(expr: Expr) -> Expr:
     """
     ModularIndexing(i0, 1, 32) + 32 * ModularIndexing(i0, 32, 4)
@@ -1543,15 +1581,17 @@ def _join_dimensions_cached(expr: Expr) -> Expr:
     divisor = sympy.Wild("divisor", integer=True)
     mod1 = sympy.Wild("modulus", integer=True)
     mod2 = sympy.Wild("modulus2", integer=True)
-    for term1 in expr.args:
-        m1 = term1.match(scale * ModularIndexing(base, divisor, mod1))
+    term1_pattern = scale * ModularIndexing(base, divisor, mod1)
+    modular_terms = [(term, term.match(term1_pattern)) for term in expr.args]
+    for term1, m1 in modular_terms:
         if m1:
+            pattern = (
+                m1[scale]
+                * m1[mod1]
+                * ModularIndexing(m1[base], m1[divisor] * m1[mod1], mod2)
+            )
             for term2 in expr.args:
-                m2 = term2.match(
-                    m1[scale]
-                    * m1[mod1]
-                    * ModularIndexing(m1[base], m1[divisor] * m1[mod1], mod2)
-                )
+                m2 = term2.match(pattern)
                 if m2 and term1 != term2:
                     expr = join_dimensions(
                         expr
@@ -1561,13 +1601,11 @@ def _join_dimensions_cached(expr: Expr) -> Expr:
                         * ModularIndexing(m1[base], m1[divisor], m1[mod1] * m2[mod2])
                     )
                     return expr
-    for term1 in expr.args:
-        m1 = term1.match(scale * ModularIndexing(base, divisor, mod1))
+    for term1, m1 in modular_terms:
         if m1:
+            pattern = m1[scale] * m1[mod1] * FloorDiv(m1[base], m1[divisor] * m1[mod1])
             for term2 in expr.args:
-                m2 = term2.match(
-                    m1[scale] * m1[mod1] * FloorDiv(m1[base], m1[divisor] * m1[mod1])
-                )
+                m2 = term2.match(pattern)
                 if m2 is not None:  # in case of success we get an empty dict here
                     expr = join_dimensions(
                         expr

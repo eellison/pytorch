@@ -105,6 +105,7 @@ class LoopBody:
     root_block: LoopBodyBlock
     memory_usage: dict[MemoryUsageType, list[MemoryEntry]]
     op_counts: collections.Counter[str]
+    indexing_exprs_simplification_state: tuple[int, int, bool, bool, bool] | None
 
     # defined only temporarily
     indexing_exprs_name: dict[sympy.Expr, str]
@@ -142,6 +143,9 @@ class LoopBody:
         else:
             self._init_with_tracing(fn, args)
 
+        self.indexing_exprs_simplification_state = (
+            V.graph.sizevars.simplify_with_ranges_state()
+        )
         self.indexing = None
 
     def get_original_num_rdims(self) -> int:
@@ -265,6 +269,8 @@ class LoopBody:
             allow_same_symbol_in_index=True,
         )
         new_body.indexing_exprs.update(replacements)
+        if replacements:
+            new_body.indexing_exprs_simplification_state = None
         return new_body
 
     def expand_dimension_for_pointwise_node(

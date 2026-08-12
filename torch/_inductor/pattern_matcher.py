@@ -1234,6 +1234,24 @@ class MultiOutputPattern(PatternExpr):
         )
 
 
+def _has_required_target_args(pattern: PatternExpr, node: torch.fx.Node) -> bool:
+    if type(pattern) is MultiOutputPattern:
+        pattern = typing.cast(PatternExpr, pattern.outputs[0])
+    if type(pattern) not in (CallFunction, CallMethod, CallModule):
+        return True
+    pattern = typing.cast(_TargetArgsExpr, pattern)
+    if len(node.args) != len(pattern.args):
+        return False
+    if len(node.kwargs) < len(pattern.kwargs):
+        return True
+
+    if not pattern.args or type(pattern.args[0]) is not CallFunction:
+        return True
+    return isinstance(node.args[0], torch.fx.Node) and pattern.args[0]._match_fns(
+        node.args[0]
+    )
+
+
 class RepeatedExpr(PatternExpr):
     """
     Checks for a repeated pattern. Useful for repeated operations after a node such as `split` or `unbind`
@@ -2653,6 +2671,11 @@ class PatternMatcherPass:
                 for entry in self.patterns[(node.op, target)]:
                     if node._erased:
                         break
+                    debug_node = False
+                    if not _has_required_target_args(entry.pattern, node):
+                        debug_node = _should_debug_node(node.name)
+                        if not debug_node:
+                            continue
                     m = entry.pattern.match(node)
                     # pattern match crosses mutation barrier - discard
                     if (
@@ -2679,7 +2702,7 @@ class PatternMatcherPass:
                         != 1
                     ):
                         continue
-                    if _should_debug_node(node.name):
+                    if debug_node or _should_debug_node(node.name):
                         log.warning("%s%s %s %s", node, node.args, m, entry.pattern)
 
                     if is_match(m) and guard_or_false(entry.extra_check(m)):

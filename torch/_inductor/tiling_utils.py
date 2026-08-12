@@ -42,11 +42,11 @@ def solve_for_zero(expr: sympy.Expr) -> sympy.Expr | None:
     Given an expr with a single free symbol, solve for a constant relation that would make
     this expression 0.
     """
-    if expr.is_constant():
-        return None
-    elif isinstance(expr, FloorDiv):
+    if isinstance(expr, FloorDiv):
         return None
 
+    if expr.is_constant():
+        return None
     if len(expr.free_symbols) != 1:
         raise AssertionError(
             f"expected exactly 1 free symbol, got {len(expr.free_symbols)}"
@@ -574,6 +574,7 @@ def extract_normalized_read_writes(
     (norm_pw_vars, norm_red_vars), ranges = index_vars_no_squeeze(
         pw_splits, red_splits, prefix="n"
     )
+    needs_simplification = False
 
     for n in list(node.get_nodes()):
         if not isinstance(n, torch._inductor.scheduler.SchedulerNode):
@@ -608,29 +609,54 @@ def extract_normalized_read_writes(
                 groups, lengths, red_numel
             )
         )
-        try:
-            new_ranges, return_getters_groups = (
-                torch._inductor.codegen.simd.SIMDKernel._split_iteration_ranges(
-                    groups, lengths
+        if (
+            tuple(lengths[0]) == tuple(pw_splits)
+            and tuple(lengths[1]) == tuple(red_splits)
+            and len(iter_vars) == len(norm_pw_vars)
+            and len(red_vars) == len(norm_red_vars)
+        ):
+            var_map = dict(
+                zip(
+                    [*iter_vars, *red_vars],
+                    [*norm_pw_vars, *norm_red_vars],
+                    strict=True,
                 )
             )
-        except torch._inductor.codegen.simd.CantSplit as e:
-            # occasionally with dynamic shapes, we will be unable to prove
-            # divisibility
-            if not (pointwise_numel.free_symbols or red_numel.free_symbols):
-                raise AssertionError(
-                    "expected dynamic shapes (free symbols) when split fails"
-                ) from e
-            return None
+            needs_simplification |= (
+                body.indexing_exprs_simplification_state
+                != V.graph.sizevars.simplify_with_ranges_state()
+                or bool(pointwise_numel.free_symbols or red_numel.free_symbols)
+                or any(
+                    expr.has(Identity)
+                    or not expr.free_symbols.issubset(body.var_ranges)
+                    for expr in itertools.chain(n_reads, n_writes)
+                )
+            )
+        else:
+            needs_simplification = True
+            try:
+                new_ranges, return_getters_groups = (
+                    torch._inductor.codegen.simd.SIMDKernel._split_iteration_ranges(
+                        groups, lengths
+                    )
+                )
+            except torch._inductor.codegen.simd.CantSplit as e:
+                # occasionally with dynamic shapes, we will be unable to prove
+                # divisibility
+                if not (pointwise_numel.free_symbols or red_numel.free_symbols):
+                    raise AssertionError(
+                        "expected dynamic shapes (free symbols) when split fails"
+                    ) from e
+                return None
 
-        var_map = apply_var_mapping(
-            iter_vars,
-            red_vars,
-            norm_pw_vars,
-            norm_red_vars,
-            new_ranges,
-            return_getters_groups,
-        )
+            var_map = apply_var_mapping(
+                iter_vars,
+                red_vars,
+                norm_pw_vars,
+                norm_red_vars,
+                new_ranges,
+                return_getters_groups,
+            )
 
         # We create Identity sympy.Functions to prevent expansion to int64,
         # unwrap for tiling analysis.
@@ -651,12 +677,15 @@ def extract_normalized_read_writes(
         for expr, buf_names in n_writes_new.items():
             writes[expr] |= buf_names
 
-    reads = {
-        V.graph.sizevars.simplify_with_ranges(r, ranges): v for r, v in reads.items()
-    }
-    writes = {
-        V.graph.sizevars.simplify_with_ranges(w, ranges): v for w, v in writes.items()
-    }
+    if needs_simplification:
+        reads = {
+            V.graph.sizevars.simplify_with_ranges(r, ranges): v
+            for r, v in reads.items()
+        }
+        writes = {
+            V.graph.sizevars.simplify_with_ranges(w, ranges): v
+            for w, v in writes.items()
+        }
 
     fused_out = FusedNormalizedReadsWrites(
         norm_pw_vars,  # type: ignore[arg-type]

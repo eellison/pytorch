@@ -26,6 +26,7 @@ from torch._inductor.pattern_matcher import (
     is_mutation_op,
     KeywordArg,
     Match,
+    MultiOutputPattern,
     PatternMatcherPass,
     PatternPrettyPrinter,
     register_graph_pattern,
@@ -81,6 +82,102 @@ register_custom_class(OpaqueScaleFactor, typ="constant", hoist=True)
 @instantiate_parametrized_tests
 class TestPatternMatcher(TestCase):
     device_type = GPU_TYPE
+
+    def test_required_target_args_prefilter(self):
+        graph = torch.fx.Graph()
+        x = graph.placeholder("x")
+        wrong = graph.call_function(torch.cos, (x,))
+        root = graph.call_function(torch.sin, (wrong,))
+        graph.output(root)
+        gm = torch.fx.GraphModule({}, graph)
+
+        child = CallFunction(torch.relu, Arg())
+        pattern = CallFunction(torch.sin, child)
+        patterns = PatternMatcherPass()
+
+        @register_graph_pattern(pattern, pass_dict=patterns)
+        def handler(match, arg):
+            raise AssertionError("mismatched pattern was applied")
+
+        with (
+            unittest.mock.patch(
+                "torch._inductor.pattern_matcher.fallback_node_due_to_unsupported_type",
+                return_value=False,
+            ),
+            unittest.mock.patch.object(pattern, "match", wraps=pattern.match) as match,
+        ):
+            self.assertEqual(patterns.apply(gm), 0)
+        match.assert_not_called()
+
+        with (
+            unittest.mock.patch(
+                "torch._inductor.pattern_matcher.fallback_node_due_to_unsupported_type",
+                return_value=False,
+            ),
+            unittest.mock.patch.dict(
+                os.environ, {"TORCHINDUCTOR_PATTERN_MATCH_DEBUG": root.name}
+            ),
+            unittest.mock.patch.object(pattern, "match", wraps=pattern.match) as match,
+            self.assertLogs(pattern_matcher.log, level="WARNING"),
+        ):
+            self.assertEqual(patterns.apply(gm), 0)
+        match.assert_called_once_with(root)
+
+        multi_output = MultiOutputPattern([CallFunction(torch.sin, child)])
+        self.assertFalse(pattern_matcher._has_required_target_args(multi_output, root))
+
+        normalizing = CallFunction(torch.sin, child, dim=KeywordArg("dim"))
+        self.assertTrue(pattern_matcher._has_required_target_args(normalizing, root))
+
+        class CustomCallFunction(CallFunction):
+            pass
+
+        custom = CustomCallFunction(torch.sin, child)
+        self.assertTrue(pattern_matcher._has_required_target_args(custom, root))
+        nested_custom = CallFunction(torch.sin, CustomCallFunction(torch.relu, Arg()))
+        self.assertTrue(pattern_matcher._has_required_target_args(nested_custom, root))
+
+        class RaisingPattern(pattern_matcher.PatternExpr):
+            def _match(self, node, ctx):
+                raise RuntimeError("custom match")
+
+        custom_sibling = CallFunction(
+            torch.add, RaisingPattern(), CallFunction(torch.relu, Arg())
+        )
+        add = graph.call_function(torch.add, (x, wrong))
+        self.assertTrue(pattern_matcher._has_required_target_args(custom_sibling, add))
+        with self.assertRaisesRegex(RuntimeError, "custom match"):
+            custom_sibling.match(add)
+
+    def test_required_target_args_prefilter_rechecks_after_mutation(self):
+        graph = torch.fx.Graph()
+        x = graph.placeholder("x")
+        wrong = graph.call_function(torch.cos, (x,))
+        required = graph.call_function(torch.relu, (x,))
+        root = graph.call_function(torch.sin, (wrong,))
+        graph.output(root)
+        gm = torch.fx.GraphModule({}, graph)
+        patterns = PatternMatcherPass()
+        events = []
+
+        @register_graph_pattern(CallFunction(torch.sin, Arg()), pass_dict=patterns)
+        def mutate(match, arg):
+            events.append("mutate")
+            root.args = (required,)
+
+        @register_graph_pattern(
+            CallFunction(torch.sin, CallFunction(torch.relu, Arg())),
+            pass_dict=patterns,
+        )
+        def match_after_mutation(match, arg):
+            events.append("match")
+
+        with unittest.mock.patch(
+            "torch._inductor.pattern_matcher.fallback_node_due_to_unsupported_type",
+            return_value=False,
+        ):
+            self.assertEqual(patterns.apply(gm), 2)
+        self.assertEqual(events, ["mutate", "match"])
 
     def common(
         self,

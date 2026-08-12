@@ -12,6 +12,7 @@ import unittest
 import warnings
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
+from unittest import mock
 
 import torch
 import torch._dynamo.config as dynamo_config
@@ -4380,6 +4381,30 @@ if HAS_CUDA_AND_TRITON:
 
             # 2 graph partitions lead to 2 cudagraph
             self.assertEqual(self.get_manager().new_graph_id().id, 2)
+
+        @torch._inductor.config.patch(
+            {
+                "fx_graph_cache": False,
+                "graph_partition": True,
+                "triton.cudagraph_min_partition_size": 2,
+            }
+        )
+        def test_skipped_graph_partition_does_not_collect_symbol_inputs(self):
+            from torch._inductor.scheduler import Scheduler
+
+            def f(x):
+                return x.sin().view(x.shape[0], 1)
+
+            x = torch.randn(8, device="cuda")
+            with mock.patch.object(
+                Scheduler,
+                "get_graph_partition_symbol_inputs",
+                side_effect=AssertionError,
+            ):
+                compiled = torch.compile(f, fullgraph=True, dynamic=True)
+                self.assertEqual(compiled(x), f(x))
+                y = torch.randn(11, device="cuda")
+                self.assertEqual(compiled(y), f(y))
 
         @unittest.skip(
             "Disabled due to CI failures; see "

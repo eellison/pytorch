@@ -4,6 +4,7 @@ import sys
 import types
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import sympy
 
@@ -16,6 +17,7 @@ from torch._inductor.codegen.wrapper import pexpr
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.runtime.benchmarking import benchmarker
 from torch._inductor.sizevars import (
+    _make_statically_known_eq,
     simplify_index_in_vec_range,
     SizeVarAllocator,
     stride_at_vec_range,
@@ -49,6 +51,41 @@ DO_PERF_TEST = os.environ.get("DO_PERF_TEST") == "1"
 
 
 class TestIndexingSimplification(InductorTestCase):
+    def test_statically_known_equals_caches_only_expression(self):
+        sizevars = SizeVarAllocator()
+        symbol = sympy.Symbol("cache_eq", integer=True)
+        _make_statically_known_eq.cache_clear()
+
+        with (
+            mock.patch("torch._inductor.sizevars.sympy.Eq", wraps=sympy.Eq) as make_eq,
+            mock.patch.object(
+                sizevars, "statically_known_true", side_effect=(True, False)
+            ) as known_true,
+        ):
+            self.assertTrue(sizevars.statically_known_equals(symbol, 1))
+            self.assertFalse(sizevars.statically_known_equals(symbol, 1))
+
+        self.assertEqual(make_eq.call_count, 1)
+        self.assertEqual(known_true.call_count, 2)
+
+        self.assertIs(
+            _make_statically_known_eq(symbol, symbol, (True, True, False)), sympy.true
+        )
+        self.assertIsInstance(
+            _make_statically_known_eq(symbol, symbol, (False, True, False)),
+            sympy.Equality,
+        )
+
+        _make_statically_known_eq.cache_clear()
+        self.assertEqual(
+            _make_statically_known_eq(True, symbol, (True, True, False)),
+            sympy.Eq(True, symbol),
+        )
+        self.assertEqual(
+            _make_statically_known_eq(1, symbol, (True, True, False)),
+            sympy.Eq(1, symbol),
+        )
+
     def test_simplify_index_in_vec_range(self):
         i = sympy.Symbol("i", integer=True, nonnegative=True)
 

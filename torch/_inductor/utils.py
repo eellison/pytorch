@@ -983,6 +983,8 @@ def get_fused_kernel_name(
 def get_kernel_metadata(
     node_schedule: Sequence[BaseSchedulerNode] | ExternKernel,
     wrapper: PythonWrapperCodegen,
+    *,
+    include_detailed: bool = True,
 ) -> tuple[str, str]:
     """
     Retrieves metadata information for a kernel.
@@ -991,6 +993,8 @@ def get_kernel_metadata(
             Either a sequence of BaseSchedulerNode objects or an ExternKernel instance.
         wrapper (PythonWrapperCodegen):
             An instance of PythonWrapperCodegen, used to define the code comment format.
+        include_detailed (bool):
+            Whether to include source mappings and the graph fragment.
     Returns:
         tuple[str, str]:
             A tuple containing two strings:
@@ -1041,6 +1045,8 @@ def get_kernel_metadata(
         f"{wrapper.comment} {sort_str} Source Nodes: [{', '.join(from_node_dict.keys())}], "
         f"Original ATen: [{', '.join(original_aten_dict.keys())}]"
     )
+    if not include_detailed:
+        return metadata, ""
 
     # trace back to original node here
     detailed_metadata = [f"{wrapper.comment} Source node to ATen node mapping:"]

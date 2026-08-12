@@ -11,7 +11,7 @@ import torch._inductor.ir as ir
 import torch._inductor.metrics as metrics
 import torch.utils.flop_counter
 from torch._dynamo.utils import counters
-from torch._inductor.dependencies import Dep, MemoryDep, ReadWrites
+from torch._inductor.dependencies import Dep, MemoryDep, ReadWrites, StarDep, WeakDep
 from torch._inductor.ir import GraphPartitionSignature
 from torch._inductor.loop_body import MemoryEntry, MemoryUsageType
 from torch._inductor.scheduler import (
@@ -141,6 +141,75 @@ class TestScheduler(TestCase):
                 )
             )
         )
+
+    @parametrize(
+        "write_name,dep_name,mutation_renames,expected",
+        [
+            ("producer", "intermediate", {}, True),
+            ("intermediate", "intermediate", {}, False),
+            (
+                "producer_alias",
+                "consumer_alias",
+                {"producer_alias": "intermediate", "consumer_alias": "intermediate"},
+                False,
+            ),
+        ],
+    )
+    def test_reindexing_cannot_help_vertical(
+        self, write_name, dep_name, mutation_renames, expected
+    ):
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.mutation_renames = mutation_renames
+
+        producer = self._mock_base_snode("producer")
+        producer.get_operation_names.return_value = OrderedSet(["producer"])
+        producer.get_buffer_names.return_value = OrderedSet([write_name])
+        producer.read_writes = Mock(
+            writes=OrderedSet([StarDep(write_name)]), spec=ReadWrites
+        )
+
+        consumer = self._mock_base_snode("consumer")
+        consumer.unmet_dependencies = OrderedSet([StarDep(dep_name)])
+
+        intermediate = Mock()
+        intermediate.defining_op_name.return_value = "intermediate_op"
+        intermediate_node = Mock(ancestors=OrderedSet(["producer"]))
+        scheduler.name_to_buf = {
+            "intermediate": intermediate,
+            "consumer_alias": intermediate,
+        }
+        scheduler.name_to_fused_node = {"intermediate_op": intermediate_node}
+
+        self.assertEqual(
+            scheduler._reindexing_cannot_help_vertical(producer, consumer), expected
+        )
+
+    @parametrize("weak_dep_is_fusable", [False, True])
+    def test_reindexing_cannot_help_vertical_weak_dep(self, weak_dep_is_fusable):
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.mutation_renames = {}
+        scheduler.fusable_weak_dep = Mock(return_value=weak_dep_is_fusable)
+
+        producer = self._mock_base_snode("producer")
+        producer.get_operation_names.return_value = OrderedSet(["producer"])
+        producer.read_writes = Mock(writes=OrderedSet(), spec=ReadWrites)
+
+        consumer = self._mock_base_snode("consumer")
+        dep = WeakDep("intermediate", mutating_buf="mutated")
+        consumer.unmet_dependencies = OrderedSet([dep])
+
+        intermediate = Mock()
+        intermediate.defining_op_name.return_value = "intermediate_op"
+        scheduler.name_to_buf = {"intermediate": intermediate}
+        scheduler.name_to_fused_node = {
+            "intermediate_op": Mock(ancestors=OrderedSet(["producer"]))
+        }
+
+        self.assertEqual(
+            scheduler._reindexing_cannot_help_vertical(producer, consumer),
+            not weak_dep_is_fusable,
+        )
+        scheduler.fusable_weak_dep.assert_called_once_with(dep, producer, consumer)
 
     def test_fuse_two_nodes_propagates_mempool(self):
         scheduler = object.__new__(Scheduler)

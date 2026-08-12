@@ -39,7 +39,7 @@ from torch.testing._internal.common_utils import (
 from torch.testing._internal.inductor_utils import GPU_TYPE, HAS_GPU
 from torch.utils._ordered_set import OrderedSet
 from torch.utils._pytree import tree_map
-from torch.utils._sympy.functions import FloorDiv, ModularIndexing
+from torch.utils._sympy.functions import FloorDiv, Identity, ModularIndexing
 
 
 # set so that metrics appear
@@ -148,6 +148,84 @@ class ImplDetailTest(MockSchedulerTest):
         snode.apply_new_loop_order([1, 0])
         prefix2 = self._get_snode_body_sym_prefix(snode)
         self.assertTrue(prefix2 == "p")
+
+    def test_record_load_store_normalize_cache(self):
+        from torch._inductor.dependencies import _RecordLoadStoreInner
+
+        i = sympy_index_symbol("cache_i")
+        recorder = _RecordLoadStoreInner({i: 32}, normalize=True)
+        first = recorder.canonicalize(2 * i)
+        second_recorder = _RecordLoadStoreInner({i: 32}, normalize=True)
+        with mock.patch.object(
+            _RecordLoadStoreInner,
+            "_normalize_uncached",
+            side_effect=AssertionError,
+        ):
+            second = second_recorder.canonicalize(2 * i)
+
+        self.assertEqual(second, first)
+        self.assertIsNot(second, first)
+        self.assertIsNot(second[1], first[1])
+        self.assertIsNot(second[2], first[2])
+
+    def test_record_load_store_normalize_cache_tracks_replacements(self):
+        from torch._inductor.dependencies import _RecordLoadStoreInner
+
+        i = sympy_index_symbol("cache_replacement_i")
+        size = sympy.Symbol("cache_replacement_size", integer=True, positive=True)
+        recorder = _RecordLoadStoreInner({i: size}, normalize=True)
+        sizevars = V.graph.sizevars
+        original = _RecordLoadStoreInner._normalize_uncached
+        with (
+            mock.patch.dict(sizevars.replacements, {size: sympy.Integer(8)}),
+            mock.patch.object(
+                _RecordLoadStoreInner,
+                "_normalize_uncached",
+                wraps=original,
+            ) as uncached,
+        ):
+            first = recorder.canonicalize(i)
+            sizevars.replacements[size] = sympy.Integer(16)
+            second = recorder.canonicalize(i)
+            with sympy.evaluate(False):
+                third = recorder.canonicalize(i)
+
+        self.assertEqual(first[2], (8,))
+        self.assertEqual(second[2], (16,))
+        self.assertEqual(third[2], (16,))
+        self.assertEqual(uncached.call_count, 3)
+
+        def typed_result(index, var_ranges, current_sizevars):
+            return index, (), (current_sizevars.replacements[size],)
+
+        sizevars._record_load_store_normalize_cache.clear()
+        with (
+            mock.patch.dict(sizevars.replacements, {size: True}),
+            mock.patch.object(
+                _RecordLoadStoreInner,
+                "_normalize_uncached",
+                side_effect=typed_result,
+            ) as uncached,
+        ):
+            first = _RecordLoadStoreInner._normalize(i, {i: sympy.Integer(4)})
+            sizevars.replacements[size] = 1
+            second = _RecordLoadStoreInner._normalize(i, {i: sympy.Integer(4)})
+
+        self.assertIs(first[2][0], True)
+        self.assertEqual(second[2], (1,))
+        self.assertEqual(uncached.call_count, 2)
+
+    def test_indexing_expr_simplification_state(self):
+        snode = SchedulerNode(V.graph.scheduler, self._create_computed_buffer_ax2())
+        body = snode._body
+        self.assertEqual(
+            body.indexing_exprs_simplification_state,
+            V.graph.sizevars.simplify_with_ranges_state(),
+        )
+
+        name, expr = next(iter(body.indexing_exprs.items()))
+        updated = body.with_indexing_exprs({name: expr})
+        self.assertIsNone(updated.indexing_exprs_simplification_state)
 
     def test_reorder_and_merge_loops(self):
         sizes = (1024, 2048)
@@ -310,6 +388,28 @@ class ImplDetailTest(MockSchedulerTest):
         self.assertIs(snode._body, original_body)
         self.assertIsNone(snode._loop_mutation_listener)
 
+    def test_can_fuse_rolls_back_loop_state_on_exception(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        snode1 = SchedulerNode(V.graph.scheduler, self._create_computed_buffer_ax2())
+        snode2 = SchedulerNode(V.graph.scheduler, self._create_computed_buffer_ax2())
+        original_body = snode1._body
+
+        def fail_after_mutation(*args, **kwargs):
+            snode1.apply_new_loop_order([1, 0])
+            raise RuntimeError("fusion analysis failed")
+
+        with (
+            mock.patch.object(
+                scheduler, "_can_fuse_impl", side_effect=fail_after_mutation
+            ),
+            self.assertRaisesRegex(RuntimeError, "fusion analysis failed"),
+        ):
+            scheduler.can_fuse(snode1, snode2)
+
+        self.assertIs(snode1._body, original_body)
+        self.assertIsNone(snode1._loop_mutation_listener)
+        self.assertIsNone(snode2._loop_mutation_listener)
+
     def test_expand_dimension_loop_state_rollback(self):
         snode = SchedulerNode(V.graph.scheduler, self._create_computed_buffer_ax2())
         original_state = snode.snapshot_loop_state()
@@ -411,6 +511,7 @@ class ImplDetailTest(MockSchedulerTest):
             MemoryCoalescing(50_000_000, 0),
         )
         fused_memory = MemoryCoalescing(fused_cost, 0)
+        get_unfused_memory = mock.Mock(return_value=unfused_memory)
 
         with (
             mock.patch(
@@ -422,10 +523,31 @@ class ImplDetailTest(MockSchedulerTest):
         ):
             self.assertEqual(
                 scheduler._reindexing_regresses_memory_coalescing(
-                    mock.Mock(), mock.Mock(), unfused_memory
+                    mock.Mock(), mock.Mock(), get_unfused_memory
                 ),
                 reject,
             )
+        get_unfused_memory.assert_called_once_with()
+
+    def test_reindexing_memory_guard_skips_unfused_with_launch_credit(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        get_unfused_memory = mock.Mock()
+        with (
+            mock.patch(
+                "torch._inductor.scheduler.get_gpu_dram_gbps", return_value=1_000
+            ),
+            mock.patch.object(
+                scheduler,
+                "_selected_tiling_memory",
+                return_value=MemoryCoalescing(100, 1),
+            ),
+        ):
+            self.assertFalse(
+                scheduler._reindexing_regresses_memory_coalescing(
+                    mock.Mock(), mock.Mock(), get_unfused_memory
+                )
+            )
+        get_unfused_memory.assert_not_called()
 
     @parametrize("dram_gbps", [None, 0, -1, float("nan"), float("inf")])
     def test_reindexing_memory_guard_with_invalid_bandwidth(self, dram_gbps):
@@ -438,12 +560,14 @@ class ImplDetailTest(MockSchedulerTest):
             mock.patch.object(
                 scheduler,
                 "_selected_tiling_memory",
-                return_value=MemoryCoalescing(101, 0),
+                return_value=MemoryCoalescing(85, 1),
             ),
         ):
             self.assertTrue(
                 scheduler._reindexing_regresses_memory_coalescing(
-                    mock.Mock(), mock.Mock(), (MemoryCoalescing(100, 0),)
+                    mock.Mock(),
+                    mock.Mock(),
+                    lambda: (MemoryCoalescing(100, 0),),
                 )
             )
 
@@ -457,12 +581,14 @@ class ImplDetailTest(MockSchedulerTest):
             mock.patch.object(
                 scheduler,
                 "_selected_tiling_memory",
-                return_value=MemoryCoalescing(101, 0),
+                return_value=MemoryCoalescing(85, 1),
             ),
         ):
             self.assertTrue(
                 scheduler._reindexing_regresses_memory_coalescing(
-                    mock.Mock(), mock.Mock(), (MemoryCoalescing(100, 0),)
+                    mock.Mock(),
+                    mock.Mock(),
+                    lambda: (MemoryCoalescing(100, 0),),
                 )
             )
 
@@ -513,29 +639,53 @@ class LoopOrderingTest(TestCase):
 
     @contextlib.contextmanager
     def _record_reindexing_memory_decisions(self):
-        """Record (origins, reject, fused_selection) per reindexing guard call."""
+        """Record fused memory selections and reindexing decisions."""
         decisions = []
         original = Scheduler._reindexing_regresses_memory_coalescing
+        original_memory = Scheduler._selected_tiling_memory
         original_selection = SIMDScheduling.select_tiling_with_memory
         last_selection = {}
+        last_fused_memory = {}
+        recording_fused = [False]
 
         def record_selection(*args, **kwargs):
             selection = original_selection(*args, **kwargs)
-            last_selection["value"] = selection
+            if recording_fused[0]:
+                last_selection["value"] = selection
             return selection
 
-        def record(scheduler, node1, node2, unfused_memory):
+        def record_memory(scheduler, nodes):
+            if len(nodes) == 1:
+                return original_memory(scheduler, nodes)
             last_selection.clear()
-            reject = original(scheduler, node1, node2, unfused_memory)
+            recording_fused[0] = True
+            try:
+                memory = original_memory(scheduler, nodes)
+            finally:
+                recording_fused[0] = False
+            last_fused_memory["value"] = memory
+            return memory
+
+        def record(scheduler, node1, node2, get_unfused_memory):
+            last_selection.clear()
+            last_fused_memory.clear()
+            reject = original(scheduler, node1, node2, get_unfused_memory)
             origins = self._get_node_origins(node1) | self._get_node_origins(node2)
-            # The guard's last tiling selection is the fused one, when reached.
-            decisions.append((origins, reject, last_selection.get("value")))
+            decisions.append(
+                (
+                    origins,
+                    reject,
+                    last_selection.get("value"),
+                    last_fused_memory.get("value"),
+                )
+            )
             return reject
 
         with (
             mock.patch.object(
                 Scheduler, "_reindexing_regresses_memory_coalescing", record
             ),
+            mock.patch.object(Scheduler, "_selected_tiling_memory", record_memory),
             mock.patch.object(
                 SIMDScheduling,
                 "select_tiling_with_memory",
@@ -756,6 +906,7 @@ class LoopOrderingTest(TestCase):
             print(f"ms={do_bench(lambda: optf(x))}")
 
     @inductor_config.patch("triton.coalesce_tiling_analysis", True)
+    @inductor_config.patch(fx_graph_cache=False)
     def test_reshape_reindexing_transposed_input(self):
         """
         Same RMS norm pattern but with a transposed input. The reshape
@@ -778,16 +929,29 @@ class LoopOrderingTest(TestCase):
         x = torch.randn(N, M, dtype=torch.bfloat16).T
 
         ref = f(x)
-        with self._record_reindexing_memory_decisions() as decisions:
+        selected_node_counts = []
+        original = Scheduler._selected_tiling_memory
+
+        def record_selected_memory(scheduler, nodes):
+            selected_node_counts.append(len(nodes))
+            return original(scheduler, nodes)
+
+        with (
+            mock.patch.object(
+                Scheduler, "_selected_tiling_memory", record_selected_memory
+            ),
+            self._record_reindexing_memory_decisions() as decisions,
+        ):
             actual = torch.compile(f)(x)
         torch.testing.assert_close(actual, ref, atol=1e-2, rtol=1e-2)
         self.assertEqual(1, metrics.generated_kernel_count)
+        self.assertEqual(selected_node_counts, [2])
         self.assertTrue(
             any(
                 not reject
                 and selection is not None
                 and selection.tiling == {"y": M, "x": 64, "r0_": 128}
-                for origins, reject, selection in decisions
+                for origins, reject, selection, _ in decisions
                 if torch.ops.aten.mean.dim in origins
             )
         )
@@ -1002,9 +1166,9 @@ class LoopOrderingTest(TestCase):
             any(
                 target_origins <= origins
                 and reject
-                and selection is not None
-                and selection.memory.uncoalesced > 0
-                for origins, reject, selection in decisions
+                and fused_memory is not None
+                and fused_memory.uncoalesced > 0
+                for origins, reject, _, fused_memory in decisions
             ),
             decisions,
         )
@@ -1018,8 +1182,8 @@ class LoopOrderingTest(TestCase):
         target_decisions = []
         original = Scheduler._reindexing_regresses_memory_coalescing
 
-        def reject_target(scheduler, node1, node2, unfused_memory):
-            reject = original(scheduler, node1, node2, unfused_memory)
+        def reject_target(scheduler, node1, node2, get_unfused_memory):
+            reject = original(scheduler, node1, node2, get_unfused_memory)
             origins = self._get_node_origins(node1) | self._get_node_origins(node2)
             is_vertical = bool(node1.get_operation_names() & node2.ancestors)
             if target_origins <= origins and not is_vertical:
@@ -1675,13 +1839,57 @@ class MemoryCoalescingTest(MockSchedulerTest):
 
     def test_remapped_reads(self):
         from torch._inductor import tiling_utils
+        from torch._inductor.codegen.simd import SIMDKernel
 
         def fn(nodes):
             if len(nodes) != 1:
                 raise AssertionError(f"Expected 1 node, got {len(nodes)}")
-            fused_norm_read_writes = tiling_utils.extract_normalized_read_writes(
-                nodes[0]
-            )
+            with (
+                mock.patch.object(
+                    SIMDKernel,
+                    "_split_iteration_ranges",
+                    side_effect=AssertionError("direct mapping should not split"),
+                ),
+                mock.patch.object(
+                    V.graph.sizevars,
+                    "simplify_with_ranges",
+                    side_effect=AssertionError("alpha-renaming should not simplify"),
+                ),
+            ):
+                fused_norm_read_writes = tiling_utils.extract_normalized_read_writes(
+                    nodes[0]
+                )
+
+            body = nodes[0]._body
+            state = body.indexing_exprs_simplification_state
+            body.indexing_exprs_simplification_state = None
+            try:
+                with mock.patch.object(
+                    V.graph.sizevars,
+                    "simplify_with_ranges",
+                    wraps=V.graph.sizevars.simplify_with_ranges,
+                ) as simplify:
+                    fallback = tiling_utils.extract_normalized_read_writes(nodes[0])
+                self.assertGreater(simplify.call_count, 0)
+                self.assertEqual(fallback, fused_norm_read_writes)
+            finally:
+                body.indexing_exprs_simplification_state = state
+
+            indexing_exprs = body.indexing_exprs
+            body.indexing_exprs = {
+                name: Identity(expr) for name, expr in indexing_exprs.items()
+            }
+            try:
+                with mock.patch.object(
+                    V.graph.sizevars,
+                    "simplify_with_ranges",
+                    wraps=V.graph.sizevars.simplify_with_ranges,
+                ) as simplify:
+                    fallback = tiling_utils.extract_normalized_read_writes(nodes[0])
+                self.assertGreater(simplify.call_count, 0)
+                self.assertEqual(fallback, fused_norm_read_writes)
+            finally:
+                body.indexing_exprs = indexing_exprs
 
             self.assertTrue(len(fused_norm_read_writes.var_ranges) == 2)
 
@@ -1990,6 +2198,24 @@ class MemoryCoalescingTest(MockSchedulerTest):
         for expr, expected in test_cases:
             result = tiling_utils.solve_for_zero(expr)
             self.assertEqual(result, expected)
+
+        floor_div = FloorDiv(x, 2)
+        with mock.patch.object(FloorDiv, "is_constant", side_effect=AssertionError):
+            self.assertEqual(tiling_utils.solve_for_zero(floor_div), None)
+
+    def test_join_dimensions_power_terms(self):
+        from torch._inductor.sizevars import _join_dimensions_cached, join_dimensions
+
+        p = sympy.Symbol("p", integer=True)
+        q = ModularIndexing(p, 1, 4)
+
+        _join_dimensions_cached.cache_clear()
+        self.assertEqual(
+            join_dimensions(q**2 + 4 * q * ModularIndexing(p, 4, 8)),
+            q * ModularIndexing(p, 1, 32),
+        )
+        self.assertEqual(join_dimensions(q**2 + 4 * q * FloorDiv(p, 4)), p * q)
+        self.assertEqual(join_dimensions(ModularIndexing(p, 1, p) + p), p)
 
     def test_solve_for_tiling(self):
         from torch._inductor import tiling_utils

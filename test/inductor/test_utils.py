@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from collections.abc import Callable, Iterator
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from sympy import I, Max, Min, Symbol, sympify
@@ -28,6 +29,7 @@ from torch._inductor.fx_utils import (
 )
 from torch._inductor.utils import (
     get_device_tflops,
+    get_kernel_metadata,
     load_template,
     python_subprocess_env,
     sympy_str,
@@ -46,10 +48,34 @@ from torch.testing._internal.common_utils import (
     xfailIfNoAcceleratorTriton,
 )
 from torch.utils import _triton as triton_utils
+from torch.utils._ordered_set import OrderedSet
 from torch.utils._sympy.functions import Identity
 
 
 class TestUtils(TestCase):
+    def test_kernel_metadata_without_details_preserves_origins(self):
+        gm = torch.fx.symbolic_trace(lambda x: torch.sin(x))
+        origin = next(node for node in gm.graph.nodes if node.op == "call_function")
+        origin.meta["from_node"] = (origin,)
+        origin.meta["original_aten"] = torch.ops.aten.sin.default
+        schedule = [
+            SimpleNamespace(
+                node=SimpleNamespace(origins=OrderedSet([origin])),
+                read_writes=None,
+            )
+        ]
+        wrapper = SimpleNamespace(comment="#")
+
+        origins, details = get_kernel_metadata(schedule, wrapper)
+        with mock.patch.object(origin, "format_node", side_effect=AssertionError):
+            origins_only, skipped_details = get_kernel_metadata(
+                schedule, wrapper, include_detailed=False
+            )
+
+        self.assertEqual(origins_only, origins)
+        self.assertEqual(skipped_details, "")
+        self.assertIn("Graph fragment", details)
+
     def test_python_subprocess_env_prioritizes_loaded_torch(self):
         torch_package_root = os.path.dirname(
             os.path.dirname(os.path.abspath(torch.__file__))

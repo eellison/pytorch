@@ -9,6 +9,7 @@ from typing_extensions import Self
 from unittest.mock import patch
 
 import sympy
+from sympy.core.parameters import global_parameters
 
 import torch
 from torch._inductor.utils import get_free_symbols
@@ -516,6 +517,8 @@ class ReadWrites:
 
 
 class _RecordLoadStoreInner(V.MockHandler):  # type: ignore[name-defined]
+    _NORMALIZE_CACHE_SIZE = 512
+
     def __init__(self, var_ranges: VarRanges, normalize: bool) -> None:
         super().__init__()
         self._reads: OrderedSet[Dep] = OrderedSet()
@@ -543,15 +546,15 @@ class _RecordLoadStoreInner(V.MockHandler):  # type: ignore[name-defined]
             sizes.pop()
 
     @classmethod
-    def _normalize(
-        cls, index: sympy.Expr, var_ranges: VarRanges
+    def _normalize_uncached(
+        cls, index: sympy.Expr, var_ranges: VarRanges, sizevars: Any
     ) -> tuple[sympy.Expr, tuple[sympy.Symbol, ...], tuple[sympy.Expr, ...]]:
         # Try to further simplify the indexes even if simplify_loops didn't
         # convert it to the simplest form because of the interference from
         # different indexing formulas.
         index_vars = [*var_ranges.keys()]
         sizes = tuple(var_ranges.values())  # type: ignore[assignment]
-        new_sizes, reindex, _prune = V.graph.sizevars._simplify_loops(
+        new_sizes, reindex, _prune = sizevars._simplify_loops(
             index_vars,
             sizes,
             index_prevent_reordering([index], index_vars, sizes),
@@ -567,6 +570,41 @@ class _RecordLoadStoreInner(V.MockHandler):  # type: ignore[name-defined]
         new_sizes = [*new_sizes]
         cls.drop_unused_symbols(index, new_vars, new_sizes)
         return index, tuple(new_vars), tuple(new_sizes)  # type: ignore[arg-type]
+
+    @classmethod
+    def _normalize(
+        cls, index: sympy.Expr, var_ranges: VarRanges
+    ) -> tuple[sympy.Expr, tuple[sympy.Symbol, ...], tuple[sympy.Expr, ...]]:
+        sizevars = V.graph.sizevars
+        cache = sizevars._record_load_store_normalize_cache
+        replacements = tuple(
+            (type(symbol), symbol, type(value), value)
+            for symbol, value in sizevars.replacements.items()
+        )
+        if replacements != sizevars._record_load_store_normalize_cache_replacements:
+            cache.clear()
+            sizevars._record_load_store_normalize_cache_replacements = replacements
+        sympy_state = (
+            global_parameters.evaluate,
+            global_parameters.distribute,
+            global_parameters.exp_is_pow,
+        )
+        ranges = tuple(
+            (type(symbol), symbol, type(value), value)
+            for symbol, value in var_ranges.items()
+        )
+        key = (cls, type(index), index, ranges, sympy_state)
+        try:
+            result = cache[key]
+            cache.move_to_end(key)
+        except KeyError:
+            result = cls._normalize_uncached(index, var_ranges, sizevars)
+            cache[key] = result
+            if len(cache) > cls._NORMALIZE_CACHE_SIZE:
+                cache.popitem(last=False)
+
+        normalized, var_names, sizes = result
+        return normalized, (*var_names,), (*sizes,)
 
     def canonicalize(
         self, index: sympy.Expr

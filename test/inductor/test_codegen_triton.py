@@ -5,7 +5,7 @@ import unittest
 from collections import namedtuple
 from enum import Enum, IntEnum
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import sympy
 
@@ -194,6 +194,21 @@ def helper(x):
 
         self.assertFalse(kernel.persistent_reduction)
         self.assertEqual(seen_scores, [tiling_scores])
+
+    def test_add_persistent_rblock_skips_memory_stats_outside_range(self):
+        memory_stats = Mock(side_effect=AssertionError)
+        kernel = TritonKernel.__new__(TritonKernel)
+        kernel.features = SimpleNamespace(
+            is_reduction=lambda: True,
+            reduction_numel=sympy.Integer(2048),
+            memory_stats=memory_stats,
+        )
+        kernel.persistent_reduction = False
+        kernel.tiling_scores = None
+        kernel.tiling = {"x": sympy.Integer(4), "r0_": sympy.Integer(2048)}
+
+        self.assertFalse(TritonKernel.add_persistent_rblock.func(kernel))
+        memory_stats.assert_not_called()
 
     @inductor_config.patch("triton.divisible_by_16", True)
     def test_config_of_sizearg(self):
