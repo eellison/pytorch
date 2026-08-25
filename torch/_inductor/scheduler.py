@@ -347,6 +347,12 @@ class MixOrderReduction:
             return False
         if not node1.is_reduction() or not node2.is_reduction():
             return False
+        if any(
+            isinstance(subnode.node, ir.ComputedBuffer)
+            and isinstance(subnode.node.data, ir.Sort)
+            for subnode in (*node1.get_nodes(), *node2.get_nodes())
+        ):
+            return False
         if node1.has_strict_reduction() or node2.has_strict_reduction():
             return False
 
