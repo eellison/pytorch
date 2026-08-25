@@ -32,6 +32,7 @@ from ..custom_graph_pass import get_custom_graph_passes
 from ..pattern_matcher import (
     Arg,
     CallFunction,
+    CallFunctionVarArgs,
     init_once_fakemode,
     KeywordArg,
     Match,
@@ -880,6 +881,120 @@ def fix_iota_device(match: Match, length, start, step, dtype, device, requires_g
             repl.meta["val"] = repl.meta["val"].to(user_device)
             node.replace_all_uses_with(repl)
             match.erase_nodes()
+
+
+@register_graph_pattern(
+    CallFunctionVarArgs(aten.index_put.default),
+    # pyrefly: ignore [bad-argument-type]
+    pass_dict=patterns,
+)
+def index_put_with_iota_to_slice_scatter(match: Match, *args, **kwargs):
+    node = match.output_node()
+    if len(node.args) < 3:
+        return
+
+    accumulate = node.kwargs.get(
+        "accumulate", node.args[3] if len(node.args) > 3 else False
+    )
+    if accumulate is not True:
+        return
+
+    base, indices, values = node.args[:3]
+    if not (
+        isinstance(base, torch.fx.Node)
+        and isinstance(values, torch.fx.Node)
+        and isinstance(indices, Sequence)
+    ):
+        return
+
+    indexed_dims = [
+        (dim, index) for dim, index in enumerate(indices) if index is not None
+    ]
+    if len(indexed_dims) != 1:
+        return
+    dim, index = indexed_dims[0]
+    _index_accumulate_with_iota_to_slice_scatter(match, base, dim, index, values)
+
+
+@register_graph_pattern(
+    CallFunctionVarArgs(aten.index_add.default),
+    # pyrefly: ignore [bad-argument-type]
+    pass_dict=patterns,
+)
+def index_add_with_iota_to_slice_scatter(match: Match, *args, **kwargs):
+    node = match.output_node()
+    if len(node.args) < 4 or node.kwargs.get("alpha", 1) != 1:
+        return
+
+    base, dim, index, values = node.args[:4]
+    _index_accumulate_with_iota_to_slice_scatter(match, base, dim, index, values)
+
+
+def _index_accumulate_with_iota_to_slice_scatter(
+    match: Match,
+    base: object,
+    dim: object,
+    index: object,
+    values: object,
+):
+    """
+    Replace a unique contiguous indexed accumulation with pointwise slice ops.
+
+    This pattern commonly appears in index_select backward as index_add or,
+    after decomposition, as index_put with an iota index. The iota proves that
+    every destination is updated exactly once, so atomics are unnecessary.
+    Running this in the joint graph also removes the backward use of the iota
+    before AOTAutograd chooses its saved activations.
+    """
+    if not (
+        isinstance(base, torch.fx.Node)
+        and isinstance(dim, int)
+        and isinstance(index, torch.fx.Node)
+        and isinstance(values, torch.fx.Node)
+        and index.op == "call_function"
+        and index.target == prims.iota.default
+    ):
+        return
+
+    base_val = base.meta.get("val")
+    values_val = values.meta.get("val")
+    if not (
+        isinstance(base_val, torch.Tensor)
+        and isinstance(values_val, torch.Tensor)
+        and base_val.ndim == values_val.ndim
+    ):
+        return
+
+    if dim < 0:
+        dim += base_val.ndim
+    if not 0 <= dim < base_val.ndim:
+        return
+
+    length = index.args[0]
+    if not isinstance(length, int):
+        return
+    if index.kwargs.get("start", 0) != 0 or index.kwargs.get("step", 1) != 1:
+        return
+
+    if not (
+        statically_known_true(sym_eq(values_val.shape[dim], length))
+        and statically_known_true(length <= base_val.shape[dim])
+        and all(
+            statically_known_true(sym_eq(values_val.shape[i], base_val.shape[i]))
+            for i in range(base_val.ndim)
+            if i != dim
+        )
+    ):
+        return
+
+    def repl(base, values):
+        base_slice = aten.slice.Tensor(base, dim, 0, length, 1)
+        updated_slice = aten.add.Tensor(base_slice, values)
+        return aten.slice_scatter.default(base, updated_slice, dim, 0, length, 1)
+
+    # pyrefly: ignore [bad-argument-type]
+    match.replace_by_example(repl, [base, values])
+    counters["inductor"]["index_accumulate_iota_to_slice_scatter"] += 1
 
 
 @register_graph_pattern(

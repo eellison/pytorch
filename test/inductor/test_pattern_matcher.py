@@ -906,6 +906,72 @@ class TestPatternMatcher(TestCase):
         joint_graph.joint_graph_passes(gm)
         self.assertEqual(count_calls(gm.graph), 2)
 
+    def test_index_accumulate_iota_to_slice_scatter(self):
+        def make_fn(op, start, alpha=1):
+            def fn(base, values):
+                index = torch.ops.prims.iota.default(
+                    3,
+                    start=start,
+                    step=1,
+                    dtype=torch.int64,
+                    device=base.device,
+                    requires_grad=False,
+                )
+                if op == torch.ops.aten.index_put.default:
+                    return op(base, (None, index), values, True)
+                return op(base, 1, index, values, alpha=alpha)
+
+            return fn
+
+        base = torch.randn(2, 5, 7, device=GPU_TYPE)
+        values = torch.randn(2, 3, 7, device=GPU_TYPE)
+        for op in (
+            torch.ops.aten.index_put.default,
+            torch.ops.aten.index_add.default,
+        ):
+            with self.subTest(op=op):
+                fn = make_fn(op, 0)
+                expected = fn(base, values)
+                gm = make_fx(fn, tracing_mode="fake")(base, values)
+
+                counters.clear()
+                joint_graph.joint_graph_passes(gm)
+                actual = gm(base, values)
+                torch.testing.assert_close(actual, expected)
+                self.assertEqual(
+                    counters["inductor"]["index_accumulate_iota_to_slice_scatter"],
+                    1,
+                )
+                targets = [
+                    node.target for node in gm.graph.nodes if node.op == "call_function"
+                ]
+                self.assertNotIn(op, targets)
+                self.assertIn(torch.ops.aten.slice_scatter.default, targets)
+
+                # A shifted iota does not describe the leading contiguous slice.
+                gm = make_fx(make_fn(op, 1), tracing_mode="fake")(base, values)
+                counters.clear()
+                joint_graph.joint_graph_passes(gm)
+                self.assertEqual(
+                    counters["inductor"]["index_accumulate_iota_to_slice_scatter"],
+                    0,
+                )
+                targets = [
+                    node.target for node in gm.graph.nodes if node.op == "call_function"
+                ]
+                self.assertIn(op, targets)
+
+        # Non-unit alpha changes the values being accumulated.
+        gm = make_fx(
+            make_fn(torch.ops.aten.index_add.default, 0, alpha=2),
+            tracing_mode="fake",
+        )(base, values)
+        counters.clear()
+        joint_graph.joint_graph_passes(gm)
+        self.assertEqual(
+            counters["inductor"]["index_accumulate_iota_to_slice_scatter"], 0
+        )
+
     # Constant folding was explicitly turned off due to issue #108388
     # Turn it back on for test
     @inductor_config.patch(joint_graph_constant_folding=True)
