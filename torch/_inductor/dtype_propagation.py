@@ -421,8 +421,10 @@ class DtypePropagationOpsHandler:
         values: tuple[T, ...],
         stable: bool,
         descending: bool,
+        top_k: int | None = None,
+        output_dtypes: tuple[torch.dtype, ...] | None = None,
     ) -> tuple[torch.dtype, ...]:
-        return dtypes
+        return output_dtypes or dtypes
 
     @staticmethod
     def trunc(x: DTypeArg) -> torch.dtype:

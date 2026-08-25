@@ -1206,6 +1206,8 @@ class OpOverrides(BasicMathOpsMixin, OpDecompositions, OpsHandler[Any]):
         values: tuple[OpVarT, ...],
         stable: bool,
         descending: bool,
+        top_k: int | None = None,
+        output_dtypes: tuple[torch.dtype, ...] | None = None,
     ) -> tuple[OpVarT, ...]:
         raise NotImplementedError(
             f"{type(self).__name__}: sort should be handled by CSEProxy"
@@ -1397,9 +1399,9 @@ pointwise_overrides_data: dict[str, OverridesData] = dict(
     mul_rn=OverridesData(
         type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.DEFAULT,
         cpp=lambda x, y: f"({x}) * ({y})",  # C++ doesn't need special handling
-        triton=lambda x, y: f"({x}) * ({y})"
-        if torch.version.hip
-        else f"libdevice.mul_rn({x}, {y})",
+        triton=lambda x, y: (
+            f"({x}) * ({y})" if torch.version.hip else f"libdevice.mul_rn({x}, {y})"
+        ),
         name="mul_rn",
     ),
     # erfinv, exp2, expit, gammaln
@@ -1488,8 +1490,9 @@ pointwise_overrides_data: dict[str, OverridesData] = dict(
     ),
     polygamma=OverridesData(
         type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.INT_TO_FLOAT,
-        cpp=lambda x,
-        y: f"{x} == 0 ? calc_digamma({y}) : ({x} == 1 ? trigamma({y}) : calc_polygamma({y}, {x}))",
+        cpp=lambda x, y: (
+            f"{x} == 0 ? calc_digamma({y}) : ({x} == 1 ? trigamma({y}) : calc_polygamma({y}, {x}))"
+        ),
         name="polygamma",
     ),
     # psi - alias to digamma
@@ -2426,6 +2429,8 @@ class Kernel(CodeGen, Generic[CSEVariableType]):
         values: tuple[CSEVariable, ...],
         stable: bool,
         descending: bool,
+        top_k: int | None = None,
+        output_dtypes: tuple[torch.dtype, ...] | None = None,
     ) -> tuple[CSEVariable, ...]:
         raise NotImplementedError
 
@@ -3077,8 +3082,17 @@ class CSEProxy(DefaultHandler):
         values: tuple[CSEVariable, ...],
         stable: bool,
         descending: bool,
+        top_k: int | None = None,
+        output_dtypes: tuple[torch.dtype, ...] | None = None,
     ) -> tuple[CSEVariable, ...]:
-        return self.kernel.sort(dtypes, values, stable, descending)
+        return self.kernel.sort(
+            dtypes,
+            values,
+            stable,
+            descending,
+            top_k=top_k,
+            output_dtypes=output_dtypes,
+        )
 
     def bucketize(
         self,
