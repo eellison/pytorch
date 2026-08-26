@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import atexit
 import contextlib
+import copy
 import dataclasses
 import enum
 import functools
@@ -3001,6 +3002,13 @@ class CSEProxy(DefaultHandler):
         self, expr: sympy.Expr, size: sympy.Expr, lower: bool, upper: bool
     ) -> None:
         return self.kernel.check_bounds(expr, size, lower, upper)
+
+    def set_store_mask(
+        self, value: CSEVariable, mask: CSEVariable
+    ) -> CSEVariable:
+        masked_value = copy.copy(value)
+        masked_value.store_mask = str(mask)  # type: ignore[attr-defined]
+        return masked_value
 
     def load(self, name: str, index: sympy.Expr) -> CSEVariable:
         if name in self.kernel.cse.invalidated_stores:

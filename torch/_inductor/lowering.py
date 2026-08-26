@@ -85,6 +85,7 @@ from .ir import (
     validate_ir,
     View,
 )
+from .tensor_value_ranges import TensorValueRangeAnalysis
 from .utils import (
     ceildiv,
     convert_symint_to_expr,
@@ -7989,8 +7990,70 @@ fallback_cummax = fallback_handler(aten.cummax.default)
 fallback_cummin = fallback_handler(aten.cummin.default)
 
 
+def _get_fx_arg(
+    node: torch.fx.Node,
+    index: int,
+    name: str,
+    default: Any = None,
+) -> Any:
+    if index < len(node.args):
+        return node.args[index]
+    return node.kwargs.get(name, default)
+
+
+def _bounded_group_offsets_for_cumsum(axis, dtype):
+    if axis != 0 or dtype is not torch.int32:
+        return None
+
+    cumsum_node = V.graph.current_node
+    if cumsum_node is None:
+        return None
+    histc_node = _get_fx_arg(cumsum_node, 0, "self")
+    if not (
+        isinstance(histc_node, torch.fx.Node)
+        and histc_node.op == "call_function"
+        and histc_node.target is aten.histc.default
+    ):
+        return None
+    convert_node = _get_fx_arg(histc_node, 0, "self")
+    if not (
+        isinstance(convert_node, torch.fx.Node)
+        and convert_node.op == "call_function"
+        and convert_node.target is prims.convert_element_type.default
+        and _get_fx_arg(convert_node, 1, "dtype") is torch.int32
+    ):
+        return None
+    values_node = _get_fx_arg(convert_node, 0, "self")
+    if not (
+        isinstance(values_node, torch.fx.Node)
+        and values_node.op == "call_function"
+        and values_node.target is operator.getitem
+        and _get_fx_arg(values_node, 1, "index") == 0
+    ):
+        return None
+    sort_node = _get_fx_arg(values_node, 0, "self")
+    if not isinstance(sort_node, torch.fx.Node):
+        return None
+
+    offsets = V.graph.bounded_group_offsets.get(sort_node)
+    if offsets is None:
+        return None
+    upper_bound = offsets.get_size()[0]
+    if not (
+        _get_fx_arg(histc_node, 1, "bins") == upper_bound
+        and _get_fx_arg(histc_node, 2, "min") == 0
+        and _get_fx_arg(histc_node, 3, "max") == upper_bound - 1
+    ):
+        return None
+    return offsets
+
+
 @register_lowering(aten.cumsum)
 def cumsum(x, axis=None, dtype=None):
+    offsets = _bounded_group_offsets_for_cumsum(axis, dtype)
+    if offsets is not None:
+        return offsets
+
     if (
         is_integer_dtype(x.get_dtype()) or is_boolean_dtype(x.get_dtype())
     ) and dtype is None:
@@ -8264,8 +8327,55 @@ def sort_stable(x, *, stable=None, dim=-1, descending=False, top_k=None):
     return values, to_dtype(indices, torch.int64)
 
 
+def _try_bounded_integer_group(x, dim, descending):
+    size = x.get_size()
+    device = x.get_device()
+    if not (
+        len(size) == 1
+        and dim in (-1, 0)
+        and descending is False
+        and x.get_dtype() is torch.int64
+        and device is not None
+        and device.type == "cuda"
+        and torch.version.hip is None
+        and torch.cuda.get_device_capability(device) >= (9, 0)
+        and isinstance(size[0], (int, sympy.Integer))
+        and 1 <= int(size[0]) <= 16384
+    ):
+        return None
+
+    current_node = V.graph.current_node
+    if current_node is None:
+        return None
+    fx_input = _get_fx_arg(current_node, 0, "self")
+    if not isinstance(fx_input, torch.fx.Node):
+        return None
+
+    value_range = TensorValueRangeAnalysis().get(fx_input)
+    if not (
+        value_range.is_int
+        and isinstance(value_range.lower, sympy.Integer)
+        and isinstance(value_range.upper, sympy.Integer)
+        and value_range.lower == 0
+    ):
+        return None
+    upper_bound = int(value_range.upper) + 1
+    if not 1 <= upper_bound <= 256:
+        return None
+
+    from .kernel.bounded_group import bounded_group
+
+    return bounded_group(x, upper_bound)
+
+
 @register_lowering(aten.sort.default, type_promotion_kind=None)
 def sort(x, dim=-1, descending=False):
+    grouped = _try_bounded_integer_group(x, dim, descending)
+    if grouped is not None:
+        sorted_keys, permutation, offsets = grouped
+        V.graph.bounded_group_offsets[V.graph.current_node] = offsets
+        counters["inductor"]["bounded_integer_group"] += 1
+        return sorted_keys, permutation
     return sort_stable(x, stable=False, dim=dim, descending=descending)
 
 
