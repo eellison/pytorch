@@ -4722,6 +4722,91 @@ def _is_atomic_add_mutation_epilogue(
     )
 
 
+def _scan_scatter_epilogue_source(
+    sn: BaseSchedulerNode, scan_scatter_outputs: OrderedSet[str]
+) -> str | None:
+    if (
+        not isinstance(sn, SchedulerNode)
+        or not isinstance(sn.node, ir.ComputedBuffer)
+        or not isinstance(sn.node.data, ir.Pointwise)
+        or sn.has_aliasing_or_mutation()
+        or sn._body.subblocks
+    ):
+        return None
+
+    reads = list(sn.read_writes.reads)
+    writes = list(sn.read_writes.writes)
+    if len(reads) != 1 or len(writes) != 1:
+        return None
+    read, write = reads[0], writes[0]
+    if (
+        not isinstance(read, MemoryDep)
+        or not isinstance(write, MemoryDep)
+        or read.name not in scan_scatter_outputs
+        or read.index != write.index
+        or read.size != write.size
+        or write.mode is not None
+    ):
+        return None
+
+    # The scatter destination replaces the pointwise loop index.  Reject
+    # bodies that use that index as a tensor value rather than only for the
+    # matched load and store.
+    if any(
+        node.op == "call_method"
+        and node.target
+        in {
+            "index_expr",
+            "value_expr",
+            "indirect_indexing",
+            "reduction",
+            "scan",
+            "sort",
+        }
+        for node in sn._body.get_nodes()
+    ):
+        return None
+    return read.name
+
+
+def partition_scan_scatter_epilogues(
+    nodes: Sequence[BaseSchedulerNode],
+) -> tuple[list[BaseSchedulerNode], dict[str, list[SchedulerNode]]]:
+    scan_scatter_outputs = OrderedSet(
+        sn.node.get_name()
+        for sn in nodes
+        if isinstance(sn, SchedulerNode)
+        and isinstance(sn.node, ir.ComputedBuffer)
+        and isinstance(sn.node.data, ir.ScanScatter)
+    )
+    epilogues: dict[str, list[SchedulerNode]] = defaultdict(list)
+    regular_nodes: list[BaseSchedulerNode] = []
+    for sn in nodes:
+        source = _scan_scatter_epilogue_source(sn, scan_scatter_outputs)
+        if source is None:
+            regular_nodes.append(sn)
+        else:
+            if not isinstance(sn, SchedulerNode):
+                raise AssertionError(f"expected SchedulerNode, got {type(sn)}")
+            epilogues[source].append(sn)
+    return regular_nodes, dict(epilogues)
+
+
+def scan_scatter_epilogue_fusion(
+    producer: BaseSchedulerNode,
+    consumer: BaseSchedulerNode,
+) -> dict[str, list[SchedulerNode]] | None:
+    """Find dense unary pointwise consumers that can run at a scatter store."""
+
+    producer_nodes = producer.get_nodes()
+    regular_nodes, result = partition_scan_scatter_epilogues(
+        [*producer_nodes, *consumer.get_nodes()]
+    )
+    if regular_nodes != producer_nodes:
+        return None
+    return result or None
+
+
 def _can_fuse_atomic_add_template_epilogue(
     template_node: BaseSchedulerNode, epilogue_node: BaseSchedulerNode
 ) -> bool:
@@ -9231,12 +9316,20 @@ class Scheduler:
             index_equivalent_dep_names = self._nested_index_equivalent_dep_names(
                 node1, node2
             )
-        shared_data_score = self._score_fusion_memory_for_can_fuse(
-            node1,
-            node2,
-            allow_mix_order_reduction=allow_mix_order_reduction,
-            index_equivalent_dep_names=index_equivalent_dep_names,
-        )
+        scatter_epilogues = scan_scatter_epilogue_fusion(node1, node2)
+        if scatter_epilogues is not None:
+            shared_data_score = sum(
+                self.dep_size_hint(read)
+                for read in node2.read_writes.reads
+                if read.name in scatter_epilogues
+            )
+        else:
+            shared_data_score = self._score_fusion_memory_for_can_fuse(
+                node1,
+                node2,
+                allow_mix_order_reduction=allow_mix_order_reduction,
+                index_equivalent_dep_names=index_equivalent_dep_names,
+            )
 
         if config.expand_dimension_for_pointwise_nodes and (
             expand_analysis := self.get_expand_dim_for_pointwise_nodes(node1, node2)
@@ -9284,6 +9377,10 @@ class Scheduler:
         if node1.get_operation_names() & node2.ancestors:
             # node2 depends on node1 outputs
             backend = self.get_backend(device)
+            if scatter_epilogues is not None:
+                return V.choices.can_fuse_vertical(
+                    self, node1, node2, shared_data_score
+                ) and backend.can_fuse_vertical(node1, node2)
             if (
                 self.can_fuse_vertical(
                     node1,

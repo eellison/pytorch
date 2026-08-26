@@ -3417,6 +3417,31 @@ def triton_poi_fused_add_reflection_pad2d_0(in_ptr0, in_ptr1, out_ptr0, xnumel, 
         FileCheck().check_not("tl.associative_scan").run(code)
 
     @skipCUDAIf(not SM90OrLater, "bounded grouping is enabled on SM90 and newer")
+    def test_bounded_topk_index_group_scatter_epilogue(self):
+        def f(x):
+            _, indices = torch.topk(x, 4, dim=-1)
+            sorted_indices, permutation = torch.sort(indices.flatten())
+            return (
+                indices,
+                sorted_indices,
+                permutation,
+                sorted_indices >= 32,
+                sorted_indices.to(torch.int32),
+            )
+
+        x = torch.randn(1000, 32, dtype=torch.bfloat16, device=device_type)
+        expected = f(x)
+        actual, (code,) = run_and_get_code(torch.compile(f, fullgraph=True), x)
+
+        self.assertEqual(actual[1], expected[1])
+        self.assertEqual(actual[3:], expected[3:])
+        self.assertEqual(actual[0].flatten()[actual[2]], actual[1])
+        self.assertEqual(code.count("async_compile.triton("), 2)
+        FileCheck().check("tl.associative_scan").check(" >= ").check(
+            ".to(tl.int32)"
+        ).check_not("triton_poi").run(code)
+
+    @skipCUDAIf(not SM90OrLater, "bounded grouping is enabled on SM90 and newer")
     def test_bounded_topk_index_group_cost_model_fallback(self):
         def f(x):
             _, indices = torch.topk(x, 4, dim=-1)

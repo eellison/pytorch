@@ -2415,6 +2415,94 @@ class _SubParentSourceLoadResolver(WrapperHandler):  # type: ignore[type-arg]
         return self._sub_parent_family.resolve_load(name, index)
 
 
+class _ScatterEpilogueBodyHandler(WrapperHandler):  # type: ignore[type-arg]
+    def __init__(
+        self,
+        inner,
+        *,
+        source_name: str,
+        source_index: sympy.Expr,
+        source_value: CSEVariable,
+        store_mask: str | None,
+    ):
+        super().__init__(inner)
+        self._source_name = source_name
+        self._source_index = source_index
+        self._source_value = source_value
+        self._store_mask = store_mask
+
+    def load(self, name: str, index: sympy.Expr) -> CSEVariable:
+        if name != self._source_name:
+            raise AssertionError(
+                f"scatter epilogue loaded {name}, expected {self._source_name}"
+            )
+        return self._source_value
+
+    def store(
+        self,
+        name: str,
+        index: sympy.Expr,
+        value: CSEVariable,
+        mode: Any = None,
+    ) -> None:
+        if self._store_mask is not None:
+            value = self._inner.set_store_mask(value, self._store_mask)
+        self._inner.store(name, self._source_index, value, mode=mode)
+
+
+class _ScanScatterEpilogueHandler(WrapperHandler):  # type: ignore[type-arg]
+    def __init__(
+        self,
+        inner,
+        epilogues: dict[str, list[scheduler.SchedulerNode]],
+        fused_operation_names: OrderedSet[str],
+    ):
+        super().__init__(inner)
+        self._epilogues = epilogues
+        graph_scheduler = V.graph.scheduler
+        self._elided_outputs = OrderedSet(
+            name
+            for name in epilogues
+            if name not in graph_scheduler.mutation_renames
+            and name not in graph_scheduler.mutation_real_name
+            and all(
+                user.is_weak
+                or (
+                    isinstance(user.node, scheduler.BaseSchedulerNode)
+                    and user.node.get_operation_names() <= fused_operation_names
+                )
+                for user in graph_scheduler.name_to_buf[name].users
+            )
+        )
+
+    def store(
+        self,
+        name: str,
+        index: sympy.Expr,
+        value: CSEVariable,
+        mode: Any = None,
+    ) -> None:
+        if name in self._elided_outputs:
+            V.kernel.removed_buffers.add(name)
+        else:
+            self._inner.store(name, index, value, mode=mode)
+        store_mask = getattr(value, "store_mask", None)
+        for sn in self._epilogues.get(name, ()):
+            handler = _ScatterEpilogueBodyHandler(
+                self._inner,
+                source_name=name,
+                source_index=index,
+                source_value=value,
+                store_mask=store_mask,
+            )
+            index_vars = [
+                [sympy.S.Zero] * len(sn._sizes[0]),
+                [sympy.S.Zero] * len(sn._sizes[1]),
+            ]
+            with V.set_ops_handler(handler), V.kernel.set_current_node(sn):
+                sn._body(*index_vars)
+
+
 class SIMDScheduling(BaseScheduling):
     """
     Single Instruction Multiple Data parent class used for fusion across
@@ -2454,6 +2542,10 @@ class SIMDScheduling(BaseScheduling):
             looped_topk_ks and len(looped_topk_sorts) != len(sorts)
         ):
             return False
+
+        if scheduler.scan_scatter_epilogue_fusion(node1, node2) is not None:
+            return True
+
         _, (numel1, rnumel1) = node1.group
         _, (numel2, rnumel2) = node2.group
         why = WhyNoFuse(node1, node2)
@@ -3656,6 +3748,9 @@ class SIMDScheduling(BaseScheduling):
         self,
         nodes: Sequence[scheduler.SchedulerNode],
         coalesce_analysis: CoalesceVarAnalysis | None = None,
+        scan_scatter_epilogues: dict[
+            str, list[scheduler.SchedulerNode]
+        ] | None = None,
     ):
         if not self.scheduler:
             raise AssertionError("expected self.scheduler to be set")
@@ -3669,7 +3764,13 @@ class SIMDScheduling(BaseScheduling):
         schedule_log.debug("Schedule:\n %s", node_schedule)
 
         return self.codegen_node_schedule(
-            SIMDKernelFeatures(node_schedule, numel, rnumel, coalesce_analysis)
+            SIMDKernelFeatures(
+                node_schedule,
+                numel,
+                rnumel,
+                coalesce_analysis,
+                scan_scatter_epilogues=scan_scatter_epilogues,
+            )
         )
 
     def _codegen_reduction_with_sub_parent_epilogue(
@@ -3786,6 +3887,9 @@ class SIMDScheduling(BaseScheduling):
         if len(nodes) == 0:
             return
 
+        nodes, scan_scatter_epilogues = scheduler.partition_scan_scatter_epilogues(
+            nodes
+        )
         if torch._inductor.config.triton.coalesce_tiling_analysis:
             if len(nodes) != len(node.get_nodes()):
                 if not self.scheduler:
@@ -3795,7 +3899,11 @@ class SIMDScheduling(BaseScheduling):
         else:
             coalesce_analysis = None
 
-        return self._codegen_nodes(nodes, coalesce_analysis)  # type: ignore[arg-type]
+        return self._codegen_nodes(
+            nodes,  # type: ignore[arg-type]
+            coalesce_analysis,
+            scan_scatter_epilogues,
+        )
 
     @staticmethod
     def can_use_32bit_indexing(
@@ -3908,6 +4016,10 @@ class SIMDScheduling(BaseScheduling):
         with V.set_kernel_handler(final_kernel):
             for node in kernel_features.scheduler_nodes():
                 node.mark_run()
+            for node in itertools.chain.from_iterable(
+                kernel_features.scan_scatter_epilogues.values()
+            ):
+                node.mark_run()
 
         # filter out NodeScheduleMarker
         base_scheduler_nodes: list[BaseSchedulerNode] = [
@@ -4018,6 +4130,21 @@ class SIMDScheduling(BaseScheduling):
 
         kernel.finalize_indexing(all_indexing.keys())
 
+        scan_scatter_epilogues = kernel.features.scan_scatter_epilogues
+        fused_operation_names = OrderedSet.union(
+            *(
+                node.get_operation_names()
+                for node in (
+                    *kernel.features.scheduler_nodes(),
+                    *itertools.chain.from_iterable(scan_scatter_epilogues.values()),
+                )
+            )
+        )
+        for epilogue in itertools.chain.from_iterable(
+            scan_scatter_epilogues.values()
+        ):
+            self._prepare_loop_body(epilogue._body)
+
         # Second pass to do codegen
         for node in node_schedule:
             if node is DisableReduction:
@@ -4028,7 +4155,19 @@ class SIMDScheduling(BaseScheduling):
                 # TODO - use split ranges ?
                 self._prepare_loop_body(node._body)
                 index_vars = kernel.split_and_set_ranges(node.get_ranges())
-                node.codegen(index_vars)
+                handler_context = (
+                    V.set_ops_handler(
+                        _ScanScatterEpilogueHandler(
+                            V.get_ops_handler(),
+                            scan_scatter_epilogues,
+                            fused_operation_names,
+                        )
+                    )
+                    if scan_scatter_epilogues
+                    else contextlib.nullcontext()
+                )
+                with handler_context:
+                    node.codegen(index_vars)
 
     def _codegen_single_template(
         self,

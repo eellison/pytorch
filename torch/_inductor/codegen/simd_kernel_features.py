@@ -125,6 +125,7 @@ class SIMDKernelFeatures:
         tiling_scores: dict[str, sympy.Expr] | None = None,
         *,
         indexing_node_schedule: list[NodeScheduleEntry] | None = None,
+        scan_scatter_epilogues: dict[str, list[SchedulerNode]] | None = None,
     ):
         self.node_schedule = node_schedule
         self.indexing_node_schedule = (
@@ -136,6 +137,7 @@ class SIMDKernelFeatures:
         self._stats_cache: dict[tuple[sympy.Expr, ...], MemoryStats] = {}
         self.coalesce_analysis = coalesce_analysis
         self.tiling_scores = tiling_scores
+        self.scan_scatter_epilogues = scan_scatter_epilogues or {}
 
     def with_tiling_scores(
         self, tiling_scores: dict[str, sympy.Expr] | None
@@ -147,6 +149,7 @@ class SIMDKernelFeatures:
             self.coalesce_analysis,
             tiling_scores,
             indexing_node_schedule=self.indexing_node_schedule,
+            scan_scatter_epilogues=self.scan_scatter_epilogues,
         )
 
     @cache_on_self
