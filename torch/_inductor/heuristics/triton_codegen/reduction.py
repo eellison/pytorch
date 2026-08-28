@@ -237,6 +237,7 @@ class ReductionHeuristic(CodegenConfigHeuristics):
             register_intensive=False,
             dynamic_scale_rblock=True,
             waves_per_eu=None,
+            min_num_warps=None,
         ):
             if "y" in size_hints:
                 tiling_scores = _get_tiling_scores(inductor_meta, size_hints)
@@ -262,8 +263,55 @@ class ReductionHeuristic(CodegenConfigHeuristics):
                     waves_per_eu=waves_per_eu,
                     dynamic_scale_rblock=dynamic_scale_rblock,
                     reduction_hint=reduction_hint,
+                    min_num_warps=min_num_warps,
                     warp_size=warp_size,
                 )
+
+        if top_k := inductor_meta.get("looped_topk"):
+            xnumel = size_hints["x"]
+            if inductor_meta.get("small_topk_reduction"):
+                return [
+                    make_config(
+                        1,
+                        min(512, rnumel),
+                        num_warps=1,
+                        dynamic_scale_rblock=False,
+                        min_num_warps=1,
+                    )
+                ]
+            # The running candidates make both XBLOCK and RBLOCK expensive in
+            # registers. Use larger tiles only when there are too few rows to
+            # expose enough parallelism; max-autotune can explore both regimes.
+            if xnumel <= 128:
+                primary = (1, 512, 4)
+            elif top_k <= 2 and xnumel <= 1024:
+                primary = (1, 256, 1)
+            elif top_k <= 2 and xnumel <= 8192:
+                primary = (1, 128, 1)
+            else:
+                primary = (2, 128, 2)
+
+            candidate_specs = [primary]
+            if max_autotune_enabled:
+                candidate_specs.extend(
+                    [
+                        (1, 128, 1),
+                        (1, 256, 1),
+                        (1, 512, 4),
+                        (2, 128, 2),
+                        (2, 256, 4),
+                        (2, 512, 8),
+                    ]
+                )
+            return [
+                make_config(
+                    x,
+                    min(r, rnumel),
+                    num_warps=num_warps,
+                    dynamic_scale_rblock=False,
+                )
+                for x, r, num_warps in candidate_specs
+            ]
 
         contiguous_config = make_config(
             # Default XBLOCK=2 launches too few programs to fill

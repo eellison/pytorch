@@ -82,6 +82,7 @@ from .simd_kernel_features import (
     NodeScheduleEntry,
     NodeScheduleMarker,
     SIMDKernelFeatures,
+    sort_requires_looped_topk,
 )
 
 
@@ -2437,6 +2438,22 @@ class SIMDScheduling(BaseScheduling):
         ):
             return scheduler.ForeachKernelSchedulerNode.can_fuse(node1, node2)
 
+        sorts = [
+            sn.node.data
+            for sn in (*node1.get_nodes(), *node2.get_nodes())
+            if isinstance(sn.node, ir.ComputedBuffer)
+            and isinstance(sn.node.data, ir.Sort)
+        ]
+        looped_topk_sorts = [sort for sort in sorts if sort_requires_looped_topk(sort)]
+        looped_topk_ks = OrderedSet(
+            next_power_of_2(sort.top_k)
+            for sort in looped_topk_sorts
+            if sort.top_k is not None
+        )
+        if len(looped_topk_ks) > 1 or (
+            looped_topk_ks and len(looped_topk_sorts) != len(sorts)
+        ):
+            return False
         _, (numel1, rnumel1) = node1.group
         _, (numel2, rnumel2) = node2.group
         why = WhyNoFuse(node1, node2)

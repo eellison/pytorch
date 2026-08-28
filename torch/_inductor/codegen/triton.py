@@ -3763,6 +3763,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
     def should_use_persistent_reduction(self) -> bool:
         if not self.inside_reduction:
             return False
+        if self.features.has_looped_topk():
+            return False
         # ops.sort requires persistent reduction (TritonKernel.sort asserts it), so the
         # heuristic must never say otherwise. Enforcing it here covers every construction
         # path, including ones that don't apply apply_feature_required_overrides.
@@ -3773,6 +3775,24 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         features = self.features.with_tiling_scores(self.tiling_scores)
         return V.choices.should_use_persistent_reduction(
             features, self.cooperative_reduction
+        )
+
+    def should_use_small_topk_reduction(self) -> bool:
+        return (
+            self.features.looped_topk_k() in (2, 4, 8)
+            and not torch.version.hip
+            and V.graph.get_current_device_or_throw().type == "cuda"
+            and self.triton_tensor_ndim() == 2
+            and V.graph.sizevars.statically_known_geq(
+                self.features.reduction_numel,
+                256 if self.features.looped_topk_k() == 8 else 512,
+            )
+            and (
+                V.graph.sizevars.statically_known_geq(
+                    self.features.reduction_numel, 1024
+                )
+                or V.graph.sizevars.statically_known_geq(self.features.numel, 8)
+            )
         )
 
     @cache_on_self
@@ -3797,7 +3817,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         self,
         index: sympy.Expr,
         *,
-        copy_shape: str | tuple[str] | None = None,
+        copy_shape: str | BlockShapeType = None,
         dense_indexing=False,
         override_mask=None,
         block_ptr=False,
@@ -6276,11 +6296,38 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
     ):
         if not self.inside_reduction:
             raise AssertionError("expected inside_reduction")
+        reduction_index = getattr(value, "store_reduction_index", None)
+        if reduction_index is not None:
+            reduction_entries = [
+                self.range_tree_nodes[symbol]
+                for symbol in index.free_symbols
+                if symbol in self.range_tree_nodes
+                and self.range_tree_nodes[symbol].root.is_reduction
+            ]
+            if not reduction_entries:
+                raise AssertionError("expected a retained reduction index")
+            reduction_root = reduction_entries[0].root
+            if any(entry.root is not reduction_root for entry in reduction_entries):
+                raise AssertionError("expected one retained reduction range tree")
+            rbase = sympy.Symbol(reduction_index, integer=True, nonnegative=True)
+            index = sympy_subs(
+                index,
+                {
+                    entry.symbol(): sympy_subs(
+                        entry.expr, {reduction_root.index_sym(): rbase}
+                    )
+                    for entry in reduction_entries
+                },
+            )
+
         self.inside_reduction = False
         dtype = V.graph.get_dtype(name)
+        store_mask = getattr(value, "store_mask", None)
         indexing = self.indexing(
             index,
-            block_ptr=True,
+            copy_shape=value.shape if reduction_index is not None else None,
+            dense_indexing=reduction_index is not None,
+            block_ptr=store_mask is None,
             tma_compatibility_checker=self.tma_compatibility_checker_cls(
                 kernel=self,
                 dtype=dtype,
@@ -6289,6 +6336,20 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             ),
         )
         self.inside_reduction = True
+        if reduction_index is not None:
+            if not isinstance(indexing, IndexingOptions):
+                raise AssertionError(
+                    "retained reduction store requires standard indexing"
+                )
+            indexing.mask_vars = OrderedSet(
+                mask for mask in indexing.mask_vars if not prefix_is_reduction(mask[0])
+            )
+        if store_mask is not None:
+            if not isinstance(indexing, IndexingOptions):
+                raise AssertionError(
+                    "masked reduction store requires standard indexing"
+                )
+            indexing.mask_vars.add(store_mask)
         var = self.args.output(name)
 
         exit_stack = contextlib.ExitStack()
@@ -6668,8 +6729,10 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         masks = sorted(masks)
         if self._load_mask:
             raise AssertionError("ops.sort not supported inside ops.masked")
-        if not self.persistent_reduction:
-            raise AssertionError("ops.sort is only supported in persistent reductions")
+        if not self.persistent_reduction and top_k is None:
+            raise AssertionError("full sort is only supported in persistent reductions")
+        accumulator_k = next_power_of_2(top_k) if top_k is not None else None
+        store_k = top_k
 
         cse_compute = functools.partial(self.cse.generate, self.compute)
         dim = self.triton_tensor_ndim() - self.num_reduction_dims
@@ -6696,9 +6759,9 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         def csv(values):
             return " ".join(f"{value}," for value in values)
 
-        def cse_multiple(line, broadcasted_values, masks, dtypes):
+        def cse_multiple(line, broadcasted_values, masks, dtypes, cache_extra=None):
             n = len(broadcasted_values)
-            cache_keys = [f"{line}, {i}, {masks}" for i in range(n)]
+            cache_keys = [f"{line}, {i}, {masks}, {cache_extra}" for i in range(n)]
             if all(self.cse.contains(cache_key) for cache_key in cache_keys):
                 return [self.cse.get(cache_key) for cache_key in cache_keys]
             result_vars = [
@@ -6712,6 +6775,165 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 if masks:
                     result_var.mask_vars = masks  # type: ignore[attr-defined]
                 self.cse.put(cache_key, result_var)
+            return tuple(result_vars)
+
+        def looped_small_topk(broadcasted_values, masks, dtypes, small_k):
+            cache_key = (
+                f"looped_small_topk{small_k}("
+                f"{csv(broadcasted_values)}, {dim}, {store_k})"
+            )
+            cache_keys = [f"{cache_key}, {i}, {masks}" for i in range(len(dtypes))]
+            if all(self.cse.contains(cache_key) for cache_key in cache_keys):
+                return tuple(self.cse.get(cache_key) for cache_key in cache_keys)
+
+            state_shape = list(broadcasted_values[0].shape)
+            state_shape[dim] = 1
+            state_shape = tuple(state_shape)
+            output_shape = list(state_shape)
+            output_shape[dim] = small_k
+            output_shape = tuple(output_shape)
+            state_size = f"[{', '.join(map(str, state_shape))}]"
+            output_size = f"[{', '.join(map(str, output_shape))}]"
+            result_vars = [
+                self.cse.newvar(dtype=dtype, shape=output_shape) for dtype in dtypes
+            ]
+            accumulators = [
+                self.cse.namedvar(
+                    f"_{result_vars[0]}_packed_{rank}",
+                    dtype=torch.uint64,
+                    shape=state_shape,
+                )
+                for rank in range(small_k)
+            ]
+            for accumulator in accumulators:
+                self.body.writeline(
+                    f"{accumulator} = tl.full({state_size}, 0, tl.uint64)"
+                )
+
+            packed = self.cse.newvar(
+                dtype=torch.uint64, shape=broadcasted_values[0].shape
+            )
+            self.compute.writeline(
+                f"{packed} = triton_helpers.pack_topk_keys("
+                f"{broadcasted_values[0]}, {broadcasted_values[1]}, rnumel)"
+            )
+
+            # Extract a sorted tile-local Top-K with ordinary Triton
+            # reductions.  K is known statically, so this emits K reductions
+            # without maintaining a separate helper for each supported K.
+            remaining = packed
+            candidates = []
+            for rank in range(small_k):
+                candidate = self.cse.newvar(dtype=torch.uint64, shape=state_shape)
+                self.compute.writeline(
+                    f"{candidate} = tl.max({remaining}, axis={dim}, keep_dims=True)"
+                )
+                candidates.append(candidate)
+                if rank + 1 < small_k:
+                    next_remaining = self.cse.newvar(
+                        dtype=torch.uint64, shape=broadcasted_values[0].shape
+                    )
+                    self.compute.writeline(
+                        f"{next_remaining} = tl.where("
+                        f"{remaining} == {candidate}, 0, {remaining})"
+                    )
+                    remaining = next_remaining
+
+            # Both lists are descending.  Compare against the reversed tile
+            # list, then emit a bitonic merge network specialized by static K.
+            state = []
+            for accumulator, candidate in zip(accumulators, reversed(candidates)):
+                merged = self.cse.newvar(dtype=torch.uint64, shape=state_shape)
+                self.compute.writeline(
+                    f"{merged} = tl.maximum({accumulator}, {candidate})"
+                )
+                state.append(merged)
+            stride = small_k // 2
+            while stride:
+                for start in range(0, small_k, stride * 2):
+                    for offset in range(stride):
+                        left = start + offset
+                        right = left + stride
+                        high = self.cse.newvar(dtype=torch.uint64, shape=state_shape)
+                        low = self.cse.newvar(dtype=torch.uint64, shape=state_shape)
+                        self.compute.writeline(
+                            f"{high} = tl.maximum({state[left]}, {state[right]})"
+                        )
+                        self.compute.writeline(
+                            f"{low} = tl.minimum({state[left]}, {state[right]})"
+                        )
+                        state[left], state[right] = high, low
+                stride //= 2
+            for accumulator, value in zip(accumulators, state):
+                self.compute.writeline(f"{accumulator} = {value}")
+
+            compact_rbase_shape = ["None"] * len(output_shape)
+            compact_rbase_shape[dim] = ":"
+            self.post_loop_combine.writeline(
+                f"topk_rbase = tl.arange(0, {output_shape[dim]})"
+                f"[{', '.join(compact_rbase_shape)}]"
+            )
+            selected = self.cse.newvar(dtype=torch.uint64, shape=output_shape)
+            self.post_loop_combine.writeline(
+                f"{selected} = tl.full({output_size}, 0, tl.uint64) + {accumulators[0]}"
+            )
+            for rank, accumulator in enumerate(accumulators[1:], 1):
+                next_selected = self.cse.newvar(dtype=torch.uint64, shape=output_shape)
+                self.post_loop_combine.writeline(
+                    f"{next_selected} = tl.where("
+                    f"topk_rbase == {rank}, {accumulator}, {selected})"
+                )
+                selected = next_selected
+            self.post_loop_combine.writeline(
+                f"{csv(result_vars)} = triton_helpers.unpack_topk_keys({selected})"
+            )
+            for result, result_cache_key in zip(result_vars, cache_keys):
+                result.mask_vars = masks  # type: ignore[attr-defined]
+                self.cse.put(result_cache_key, result)
+            return tuple(result_vars)
+
+        def looped_topk(broadcasted_values, masks, dtypes):
+            if accumulator_k is None:
+                raise AssertionError("expected top_k for a looped sort")
+            cache_key = (
+                f"looped_topk("
+                f"{csv(broadcasted_values)}, {accumulator_k}, {store_k}, {dim})"
+            )
+            cache_keys = [f"{cache_key}, {i}, {masks}" for i in range(len(dtypes))]
+            if all(self.cse.contains(cache_key) for cache_key in cache_keys):
+                return tuple(self.cse.get(cache_key) for cache_key in cache_keys)
+
+            result_vars = [
+                self.cse.newvar(dtype=dtype, shape=value.shape)
+                for dtype, value in zip(dtypes, broadcasted_values)
+            ]
+            compact_shape = list(broadcasted_values[0].shape)
+            compact_shape[dim] = accumulator_k
+            compact_shape = tuple(compact_shape)
+            compact_size = f"[{', '.join(map(str, compact_shape))}]"
+            accumulator = self.cse.namedvar(
+                f"_{result_vars[0]}_packed",
+                dtype=torch.uint64,
+                shape=compact_shape,
+            )
+            self.body.writeline(
+                f"{accumulator} = tl.full({compact_size}, 0, tl.uint64)"
+            )
+            next_accumulator = self.cse.newvar(dtype=torch.uint64, shape=compact_shape)
+            self.compute.writeline(
+                f"{next_accumulator} = triton_helpers.packed_topk_accumulate("
+                f"{broadcasted_values[0]}, {broadcasted_values[1]}, rnumel, "
+                f"{accumulator}, {accumulator_k}, {dim})"
+            )
+            self.compute.writeline(f"{accumulator} = {next_accumulator}")
+            output_block = self.dense_size_list()[dim]
+            self.post_loop_combine.writeline(
+                f"{csv(result_vars)} = triton_helpers.unpack_packed_topk("
+                f"{accumulator}, {output_block}, {dim})"
+            )
+            for result, result_cache_key in zip(result_vars, cache_keys):
+                result.mask_vars = masks  # type: ignore[attr-defined]
+                self.cse.put(result_cache_key, result)
             return tuple(result_vars)
 
         if not self.range_trees[-1].is_reduction:
@@ -6729,31 +6951,60 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                     raise AssertionError(
                         "tl.topk only supports unstable descending sort"
                     )
+                if accumulator_k is None:
+                    raise AssertionError("expected accumulator K for Top-K")
                 line = (
                     f"triton_helpers.topk_with_index({broadcasted_values[0]}, {broadcasted_values[1]},"
-                    f" {rnumel}, {top_k}, {dim})"
+                    f" {rnumel}, {accumulator_k}, {dim})"
                 )
-            result_vars = cse_multiple(line, broadcasted_values, masks, input_dtypes)
-            result_vars = tuple(
-                result
-                if input_dtype == result_dtype
-                else cse_compute(
-                    f"{result}.to({triton_type(result_dtype)})",
-                    dtype=result_dtype,
-                    shape=result.shape,
+            if self.persistent_reduction:
+                result_vars = cse_multiple(
+                    line,
+                    broadcasted_values,
+                    masks,
+                    input_dtypes,
+                    cache_extra=store_k,
                 )
-                for result, input_dtype, result_dtype in zip(
-                    result_vars, input_dtypes, result_dtypes
+            elif self.should_use_small_topk_reduction():
+                if accumulator_k is None:
+                    raise AssertionError("expected K for small Top-K")
+                result_vars = looped_small_topk(
+                    broadcasted_values, masks, result_dtypes, accumulator_k
                 )
-            )
-            if top_k is not None:
+            else:
+                result_vars = looped_topk(broadcasted_values, masks, result_dtypes)
+            if self.persistent_reduction:
+                result_vars = tuple(
+                    result
+                    if input_dtype == result_dtype
+                    else cse_compute(
+                        f"{result}.to({triton_type(result_dtype)})",
+                        dtype=result_dtype,
+                        shape=result.shape,
+                    )
+                    for result, input_dtype, result_dtype in zip(
+                        result_vars, input_dtypes, result_dtypes
+                    )
+                )
+            if store_k is not None:
                 for result_var in result_vars:
-                    result_var.store_mask = f"(rindex < {top_k})"
+                    if self.persistent_reduction:
+                        result_var.store_mask = f"(rindex < {store_k})"
+                    elif self.should_use_small_topk_reduction():
+                        result_var.store_mask = f"(topk_rbase < {store_k})"
+                        result_var.store_reduction_index = "topk_rbase"
+                    else:
+                        result_var.store_mask = f"(rbase < {store_k})"
+                        result_var.store_reduction_index = "rbase"
         else:
             raise AssertionError("Unhandled sort")
 
         for result_var, input_var in zip(result_vars, values):
-            result_var.mask_vars = masks  # type: ignore[attr-defined]
+            result_var.mask_vars = OrderedSet(  # type: ignore[attr-defined]
+                masks
+                if self.persistent_reduction
+                else (mask for mask in masks if not prefix_is_reduction(mask[0]))
+            )
             result_var.bounds = input_var.bounds
 
         return tuple(result_vars)
@@ -7278,6 +7529,11 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             out["native_matmul_persistent_rblock"] = rblock
         if self.add_persistent_rblock:
             out["add_persistent_rblock"] = True
+        if (top_k := self.features.looped_topk_k()) is not None:
+            out["looped_topk"] = top_k
+            if self.should_use_small_topk_reduction():
+                out["small_topk_reduction"] = True
+                out["dynamic_scale_rblock"] = False
         if (rblock := self._strict_reduction_rblock()) is not None:
             out["strict_reduction_rblock"] = rblock
         if (
@@ -7552,6 +7808,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             **self.inductor_meta_per_kernel(),
             **self.inductor_meta_common(),
         }
+        if self.should_use_small_topk_reduction():
+            inductor_meta["dynamic_scale_rblock"] = False
 
         # Triton compiler includes equal_to_1 args into constants even
         # when they are not constexpr. otherwise there may be a segfault
@@ -7728,9 +7986,12 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         # bound anyway so taking the hit of non-coalesced loads is okay.
         if (
             kernel_features.contains_op("sort")
-            or kernel_features.has_strict_multirow_reduction()
-        ):
+            and not kernel_features.has_looped_topk()
+        ) or kernel_features.has_strict_multirow_reduction():
             kernel_kwargs["override_persistent_reduction"] = True
+            kernel_kwargs["override_cooperative_reduction"] = False
+        elif kernel_features.has_looped_topk():
+            kernel_kwargs["override_persistent_reduction"] = False
             kernel_kwargs["override_cooperative_reduction"] = False
         # Cannot use persistent reduction with unknown dynamic rnumel.
         if not TritonKernel.has_persistent_RBLOCK(kernel_features.reduction_numel):

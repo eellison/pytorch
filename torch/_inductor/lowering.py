@@ -8286,6 +8286,15 @@ def sort_stable(x, *, stable=None, dim=-1, descending=False, top_k=None):
     if len(shape) == 0:
         return clone(x), _full(0, device, torch.int64, shape)
 
+    def fallback():
+        values, indices = sort_fallback(
+            x, stable=stable, dim=dim, descending=descending
+        )
+        if top_k is not None:
+            values = clone(slice_(values, dim, 0, top_k))
+            indices = clone(slice_(indices, dim, 0, top_k))
+        return values, indices
+
     dim_size = shape[dim] if len(shape) else 1
     # Use int32 indices when decompose_sort_ops is enabled, allowing sort
     # dimensions up to 2^31-1.  Default int16 keeps register pressure low
@@ -8297,7 +8306,7 @@ def sort_stable(x, *, stable=None, dim=-1, descending=False, top_k=None):
     if not V.graph.sizevars.guard_or_false(
         sympy.Lt(dim_size, torch.iinfo(idx_dtype).max)
     ):
-        return sort_fallback(x, stable=stable, dim=dim, descending=descending)
+        return fallback()
 
     indices = iota(
         dim_size, start=0, step=1, dtype=idx_dtype, device=device, requires_grad=False
@@ -8320,7 +8329,7 @@ def sort_stable(x, *, stable=None, dim=-1, descending=False, top_k=None):
         output_dtypes=((x.dtype, torch.int64) if top_k is not None else None),
     )
     if values is None:
-        return sort_fallback(x, stable=stable, dim=dim, descending=descending)
+        return fallback()
 
     if indices is None:
         raise AssertionError("expected: indices is not None")
@@ -8552,6 +8561,11 @@ def topk(self, k, dim=-1, largest=True, sorted=True):
     dim_size = shape[dim]
     device = self.get_device()
     static_k = int(k) if isinstance(k, (int, sympy.Integer)) else None
+    accumulator_k = (
+        1 << (static_k - 1).bit_length()
+        if static_k is not None and static_k >= 2
+        else None
+    )
     static_dim_size = (
         int(dim_size) if isinstance(dim_size, (int, sympy.Integer)) else None
     )
@@ -8563,27 +8577,9 @@ def topk(self, k, dim=-1, largest=True, sorted=True):
     def profitable_triton_topk(rows: int, width: int, top_k: int) -> bool:
         """B200 crossover model for the partial bitonic selection."""
         rblock = 1 << (width - 1).bit_length()
-        if rows == 0:
+        if rows == 0 or top_k > 16:
             return False
-        if top_k <= 4:
-            return True
-        if top_k == 8:
-            if rblock <= 16:
-                return True
-            if rblock == 32:
-                return rows >= 32
-            if rblock <= 128:
-                return True
-            # At RBLOCK=256, register pressure loses in the occupancy regime
-            # between a few blocks and full-device saturation.
-            return rows <= 64
-        if top_k == 16:
-            if rblock <= 16:
-                return True
-            # Larger selections need enough rows to amortize launch overhead,
-            # but spill once the input block grows beyond 64 lanes.
-            return rblock <= 64 and rows >= 128
-        return False
+        return rblock <= (8192 if top_k <= 4 else 4096)
 
     can_use_triton_topk = (
         config.triton.persistent_reductions
@@ -8592,15 +8588,14 @@ def topk(self, k, dim=-1, largest=True, sorted=True):
         and torch.cuda.get_device_capability(device) >= (9, 0)
         and V.graph.has_feature(device, BackendFeature.SORT)
         and self.dtype in (torch.float16, torch.bfloat16, torch.float32)
-        and dim == ndim - 1
         and largest
         and static_k is not None
+        and accumulator_k is not None
         and static_dim_size is not None
         and static_outer_numel is not None
         and 2 <= static_k <= 16
-        and static_k & (static_k - 1) == 0
-        and static_k <= static_dim_size <= 256
-        and profitable_triton_topk(static_outer_numel, static_dim_size, static_k)
+        and static_k <= static_dim_size <= 8192
+        and profitable_triton_topk(static_outer_numel, static_dim_size, accumulator_k)
     )
     if can_use_triton_topk:
         top_values, top_indices = sort_stable(
@@ -8610,9 +8605,7 @@ def topk(self, k, dim=-1, largest=True, sorted=True):
             descending=True,
             top_k=static_k,
         )
-        values = slice_(top_values, dim, 0, static_k)
-        indices = slice_(top_indices, dim, 0, static_k)
-        return values, indices
+        return top_values, top_indices
 
     if not config.triton.decompose_sort_ops:
         return topk_fallback(self, k, dim, largest, sorted)

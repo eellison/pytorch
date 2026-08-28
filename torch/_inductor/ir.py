@@ -3298,12 +3298,13 @@ class Sort(Loops):
         if self.top_k is not None:
             if len(reduction_vars) != 1:
                 raise AssertionError("top-k expects one reduction dimension")
-            # Codegen masks lanes >= top_k. Keep the dependency index within
-            # the compact output allocation while retaining the full input
-            # reduction range used by tl.topk.
+            # Codegen masks lanes outside the logical output K. Keep the
+            # dependency index within that compact allocation while retaining
+            # the full input reduction range used by tl.topk.
             rank = ModularIndexing(reduction_vars[0], 1, self.top_k)
             store_idx = self.reindex(vars, [rank])
-        return ops.store(
+        store = ops.store_reduction if self.top_k is not None else ops.store
+        return store(
             output_name or "unnamed", indexer(store_idx), result[self.output_index]
         )
 
@@ -3375,8 +3376,9 @@ class Sort(Loops):
                 config.triton.persistent_reductions
                 and sizevars.statically_known_true(sympy.Le(sort_numel, max_rblock))
             )
-        if not is_persistent_kernel:
-            # We only support persistent triton kernels
+        if not is_persistent_kernel and top_k is None:
+            # Full sort is only supported in persistent Triton kernels. Top-K
+            # can compact each loop tile and merge the compact results.
             return [None] * len(dtypes)
 
         if len(dtypes) != len(inner_fns):

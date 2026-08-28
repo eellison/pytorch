@@ -1013,6 +1013,83 @@ def topk_with_index(
 
 
 @triton.jit
+def pack_topk_keys(x, idxs, rnumel):
+    """Encode float32 values and indices as totally ordered uint64 keys."""
+    x, idxs = tl.broadcast(x, idxs)
+    tl.static_assert(x.dtype == tl.float32, "packed top-k expects float32 values")
+
+    valid = idxs < rnumel
+    value_bits = x.to(tl.uint32, bitcast=True)
+    sign_mask = 0x80000000
+    ordered = tl.where(
+        (value_bits & sign_mask) != 0,
+        ~value_bits,
+        value_bits ^ sign_mask,
+    )
+    ordered = tl.where((x != x) & valid, 0xFFFFFFFF, ordered)
+    index_key = 0xFFFFFFFF - idxs.to(tl.uint32)
+    packed = (ordered.to(tl.uint64) << 32) | index_key.to(tl.uint64)
+    return tl.where(valid, packed, 0)
+
+
+@triton.jit
+def unpack_topk_keys(packed):
+    """Decode ordered uint64 keys into float32 values and int64 indices."""
+    ordered = (packed >> 32).to(tl.uint32)
+    value_bits = tl.where(
+        (ordered & 0x80000000) != 0,
+        ordered ^ 0x80000000,
+        ~ordered,
+    )
+    values = value_bits.to(tl.float32, bitcast=True)
+    indices = (0xFFFFFFFF - (packed & 0xFFFFFFFF).to(tl.uint32)).to(tl.int64)
+    return values, indices
+
+
+@triton.jit
+def packed_topk_accumulate(
+    x,
+    idxs,
+    rnumel,
+    accumulator,
+    k: tl.constexpr,
+    dim: tl.constexpr = None,
+):
+    """Merge one reduction tile into a compact packed Top-K accumulator."""
+    packed = pack_topk_keys(x, idxs, rnumel)
+    _dim: tl.constexpr = len(packed.shape) - 1 if dim is None else dim
+    tl.static_assert(
+        _dim == len(packed.shape) - 1,
+        "only minor dimension is currently supported",
+    )
+    tile = tl.topk(packed, k, dim=_dim)
+    reverse_accumulator = tl.flip(accumulator, _dim)
+    bitonic_candidates = tl.maximum(tile, reverse_accumulator)
+    return tl.bitonic_merge(bitonic_candidates, dim=_dim, descending=True)
+
+
+@triton.jit
+def unpack_packed_topk(
+    packed,
+    output_block: tl.constexpr,
+    dim: tl.constexpr = None,
+):
+    """Decode compact packed state into full-block value and index tensors."""
+    _dim: tl.constexpr = len(packed.shape) - 1 if dim is None else dim
+    tl.static_assert(
+        _dim == len(packed.shape) - 1, "only minor dimension is currently supported"
+    )
+    k: tl.constexpr = packed.shape[_dim]
+    output_shape: tl.constexpr = packed.shape[:-1] + (output_block,)
+    grouped_shape: tl.constexpr = packed.shape[:-1] + (1, k)
+    tiled_shape: tl.constexpr = packed.shape[:-1] + (output_block // k, k)
+    selected = tl.reshape(packed, grouped_shape)
+    selected = tl.broadcast_to(selected, tiled_shape)
+    selected = tl.reshape(selected, output_shape)
+    return unpack_topk_keys(selected)
+
+
+@triton.jit
 def select_one(x, mask, dim, keep_dims=False):
     idtype = tl.core.get_int_dtype(x.dtype.primitive_bitwidth, signed=False)
     ix = x.to(idtype, bitcast=True)

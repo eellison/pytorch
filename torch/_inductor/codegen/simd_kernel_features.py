@@ -19,7 +19,7 @@ from ..dependencies import Dep, extract_loop_body_with_args, MemoryDep
 from ..runtime.hints import ReductionHint
 from ..runtime.runtime_utils import next_power_of_2
 from ..scheduler import SchedulerNode
-from ..utils import cache_on_self
+from ..utils import cache_on_self, sympy_product
 from ..virtualized import V
 
 
@@ -32,6 +32,14 @@ if typing.TYPE_CHECKING:
 _INNER_REDUCTION_RATIO = 32
 _SMALL_INNER_REDUCTION_RATIO = 16
 _SMALL_INNER_REDUCTION_MAX_RBLOCK = 512
+
+
+def sort_requires_looped_topk(sort: ir.Sort) -> bool:
+    if sort.top_k is None:
+        return False
+    sort_numel = sympy_product(sort.sort_ranges)
+    threshold = 256 if next_power_of_2(sort.top_k) >= 8 else 257
+    return V.graph.sizevars.statically_known_geq(sort_numel, threshold)
 
 
 def tiling_scores_suggest_inner_reduction(
@@ -201,6 +209,27 @@ class SIMDKernelFeatures:
     def contains_op(self, op_name: str) -> bool:
         """True if V.ops.{op_name} is used in node_schedule"""
         return bool(self.op_counts().get(op_name))
+
+    @cache_on_self
+    def looped_topk_k(self) -> int | None:
+        """Return K when a Top-K Sort needs the looped implementation."""
+        top_ks: OrderedSet[int] = OrderedSet()
+        for node in self.reduction_nodes():
+            if not isinstance(node.node, ir.ComputedBuffer) or not isinstance(
+                node.node.data, ir.Sort
+            ):
+                continue
+            sort = node.node.data
+            if sort.top_k is not None and sort_requires_looped_topk(sort):
+                top_ks.add(next_power_of_2(sort.top_k))
+        if not top_ks:
+            return None
+        if len(top_ks) != 1:
+            raise AssertionError("looped Top-K kernel must have a single K")
+        return int(next(iter(top_ks)))
+
+    def has_looped_topk(self) -> bool:
+        return self.looped_topk_k() is not None
 
     def get_mutations(self) -> OrderedSet[str]:
         mutations: OrderedSet[str] = OrderedSet()
