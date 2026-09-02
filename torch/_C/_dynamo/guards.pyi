@@ -395,6 +395,13 @@ class GuardManager:
         verbose_code_parts: list[str],
         user_stack: traceback.StackSummary | None,
     ) -> None: ...
+    def add_autograd_saved_tensors_hooks_guard(
+        self,
+        expected_hook_ids: tuple[int, int] | None,
+        graph_module_type: type,
+        verbose_code_parts: list[str],
+        user_stack: object,
+    ) -> None: ...
     def mark_tag_safe(self) -> None: ...
     def mark_tag_safe_root(self) -> None: ...
 

@@ -1,4 +1,5 @@
 #include <ATen/PythonTorchFunctionTLS.h>
+#include <ATen/SavedTensorHooks.h>
 #include <ATen/autocast_mode.h>
 #include <ATen/core/functional.h>
 #include <c10/core/SafePyObject.h>
@@ -2409,6 +2410,69 @@ class MAPPING_KEYS_MATCH : public LeafGuard {
 
  private:
   py::object _keys;
+};
+
+// Guards the autograd saved-tensor default hooks that AOTAutograd may have
+// inlined into the graph. With no expected ids, passes as long as no
+// inlineable hooks (two fx.GraphModules) are installed; otherwise the
+// installed pair must be the same objects.
+class AUTOGRAD_SAVED_TENSORS_HOOKS : public LeafGuard {
+ public:
+  AUTOGRAD_SAVED_TENSORS_HOOKS(
+      RootGuardManager* root_guard_manager,
+      py::object expected_hook_ids,
+      py::object graph_module_type,
+      py::object verbose_code_parts,
+      py::object user_stack)
+      : LeafGuard(
+            root_guard_manager,
+            std::move(verbose_code_parts),
+            std::move(user_stack)),
+        _graph_module_type(std::move(graph_module_type)) {
+    if (!expected_hook_ids.is_none()) {
+      auto ids = py::cast<std::pair<uintptr_t, uintptr_t>>(expected_hook_ids);
+      _expected_pack = ids.first;
+      _expected_unpack = ids.second;
+      _has_expected = true;
+    }
+  }
+
+  template <typename T>
+  bool check_nopybind_template(T* value) { // borrowed ref
+    auto hooks =
+        at::SavedTensorDefaultHooks::get_hooks(/*ignore_is_tracing=*/true);
+    if (!hooks.has_value()) {
+      return !_has_expected;
+    }
+    PyObject* pack = hooks->first.ptr(getPyInterpreter());
+    PyObject* unpack = hooks->second.ptr(getPyInterpreter());
+    if (_has_expected) {
+      return reinterpret_cast<uintptr_t>(pack) == _expected_pack &&
+          reinterpret_cast<uintptr_t>(unpack) == _expected_unpack;
+    }
+    bool inlineable =
+        PyObject_IsInstance(pack, _graph_module_type.ptr()) == 1 &&
+        PyObject_IsInstance(unpack, _graph_module_type.ptr()) == 1;
+    if (PyErr_Occurred()) {
+      PyErr_Clear();
+      return false;
+    }
+    return !inlineable;
+  }
+
+  bool check_nopybind(PyObject* value) override {
+    return check_nopybind_template(value);
+  }
+
+  bool check_nopybind(FrameLocalsMapping* value) override {
+    return check_nopybind_template(value);
+  }
+
+ private:
+  py::object _graph_module_type;
+  bool _has_expected = false;
+  uintptr_t _expected_pack = 0;
+  uintptr_t _expected_unpack = 0;
 };
 
 class DEFAULT_DEVICE : public LeafGuard {
@@ -7800,6 +7864,18 @@ PyObject* torch_c_dynamo_guards_init() {
       py_m, "DEFAULT_DEVICE")
       .def(py::init<RootGuardManager*, py::list, py::object>())
       .def("__call__", &DEFAULT_DEVICE::check);
+  py::class_<
+      AUTOGRAD_SAVED_TENSORS_HOOKS,
+      LeafGuard,
+      std::shared_ptr<AUTOGRAD_SAVED_TENSORS_HOOKS>>(
+      py_m, "AUTOGRAD_SAVED_TENSORS_HOOKS")
+      .def(py::init<
+           RootGuardManager*,
+           py::object,
+           py::object,
+           py::list,
+           py::object>())
+      .def("__call__", &AUTOGRAD_SAVED_TENSORS_HOOKS::check);
   py::class_<NOT_NONE, LeafGuard, std::shared_ptr<NOT_NONE>>(py_m, "NOT_NONE")
       .def(py::init<RootGuardManager*, py::list, py::object>())
       .def("__call__", &NOT_NONE::check);
@@ -8256,6 +8332,20 @@ PyObject* torch_c_dynamo_guards_init() {
              py::object user_stack) -> void {
             self.add_leaf_guard(std::make_shared<DEFAULT_DEVICE>(
                 self.get_root(),
+                std::move(verbose_code_parts),
+                std::move(user_stack)));
+          })
+      .def(
+          "add_autograd_saved_tensors_hooks_guard",
+          [](GuardManager& self,
+             py::object expected_hook_ids,
+             py::object graph_module_type,
+             py::object verbose_code_parts,
+             py::object user_stack) -> void {
+            self.add_leaf_guard(std::make_shared<AUTOGRAD_SAVED_TENSORS_HOOKS>(
+                self.get_root(),
+                std::move(expected_hook_ids),
+                std::move(graph_module_type),
                 std::move(verbose_code_parts),
                 std::move(user_stack)));
           })

@@ -2747,21 +2747,11 @@ class GuardBuilder(GuardBuilderBase):
         ]
         self._set_guard_export_info(guard, code)
 
-        if guard_hooks_ids is None:
-            # Common case: no inlineable hooks. Call the C accessor directly
-            # so the per-call check is a single Python frame.
-            get_hooks_c = torch._C._autograd._top_saved_tensors_default_hooks
-
-            def fn(x: object) -> bool:
-                return not are_inline_hooks(get_hooks_c(True))
-
-        else:
-
-            def fn(x: object) -> bool:
-                return guard_hooks_ids == hooks_ids_fn(get_hooks())
-
-        self.guard_manager.root.add_lambda_guard(
-            fn, get_verbose_code_parts(code, guard), guard.user_stack
+        self.guard_manager.root.add_autograd_saved_tensors_hooks_guard(
+            guard_hooks_ids,
+            torch.fx.GraphModule,
+            get_verbose_code_parts(code, guard),
+            guard.user_stack,
         )
 
     @register_guard_check_spec(
