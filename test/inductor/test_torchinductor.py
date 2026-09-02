@@ -16345,6 +16345,25 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         config.cpp_wrapper,
         "Deferred alignment copies are not generated for cpp_wrapper",
     )
+    def test_alignment_copies_batched_for_same_first_use(self):
+        def fn(x, y, z):
+            return x + y + z
+
+        x = torch.randn(16, 32, device=self.device)
+        y = torch.randn(16, 32, device=self.device)
+        z = torch.randn(16, 32, device=self.device)
+
+        _, code = run_and_get_code(torch.compile(fn), x, y, z)
+        FileCheck().check("= copy_if_misaligned_many((").check_not(
+            "= copy_if_misaligned("
+        ).run(code[0])
+
+    @requires_gpu()
+    @skip_if_not_triton
+    @unittest.skipIf(
+        config.cpp_wrapper,
+        "Deferred alignment copies are not generated for cpp_wrapper",
+    )
     def test_alignment_copy_deferred_to_first_use(self):
         def fn(x, y, z):
             a = torch.mm(x, y)

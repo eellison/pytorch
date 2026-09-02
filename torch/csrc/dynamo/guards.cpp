@@ -1291,6 +1291,27 @@ static PyObject* _empty_strided_cuda(PyObject* dummy, PyObject* args) {
   return _empty_strided_device(dummy, args, c10::DeviceType::CUDA);
 }
 
+static PyObject* copy_if_misaligned_many(PyObject* dummy, PyObject* items) {
+  HANDLE_TH_ERRORS;
+  TORCH_CHECK(PyTuple_CheckExact(items), "expected a tuple of Tensors");
+  const auto len = PyTuple_GET_SIZE(items);
+  THPObjectPtr result(PyTuple_New(len));
+  if (!result) {
+    // @allow-raw-throw: propagate the CPython error already set
+    throw python_error();
+  }
+  for (Py_ssize_t i = 0; i < len; ++i) {
+    PyObject* item = copy_if_misaligned(dummy, PyTuple_GET_ITEM(items, i));
+    if (item == nullptr) {
+      // @allow-raw-throw: propagate the CPython error already set
+      throw python_error();
+    }
+    PyTuple_SET_ITEM(result.get(), i, item);
+  }
+  return result.release();
+  END_HANDLE_TH_ERRORS;
+}
+
 static PyObject* _empty_strided_cuda_many(PyObject* dummy, PyObject* specs) {
   HANDLE_TH_ERRORS;
   TORCH_CHECK(PyTuple_CheckExact(specs));
@@ -1426,6 +1447,7 @@ static PyMethodDef _methods[] = {
      nullptr},
     {"assert_alignment", assert_alignment, METH_VARARGS, nullptr},
     {"copy_if_misaligned", copy_if_misaligned, METH_O, nullptr},
+    {"copy_if_misaligned_many", copy_if_misaligned_many, METH_O, nullptr},
     {"dict_version", dict_version, METH_O, nullptr},
     {"_empty_strided_cpu", _empty_strided_cpu, METH_VARARGS, nullptr},
     {"_empty_strided_cpu_pinned",

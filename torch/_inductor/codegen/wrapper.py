@@ -2281,7 +2281,7 @@ class PythonWrapperCodegen(CodeGen):
         if self._pending_alignment_copies:
             V.graph._defers_input_alignment = True
             self.imports.writeline(
-                "from torch._C._dynamo.guards import copy_if_misaligned"
+                "from torch._C._dynamo.guards import copy_if_misaligned, copy_if_misaligned_many"
             )
 
     def codegen_deferred_alignment_copies(
@@ -2301,11 +2301,18 @@ class PythonWrapperCodegen(CodeGen):
         """
         if V.graph.cpp_wrapper:
             return
-        for name in input_names:
-            if name in self._pending_alignment_copies:
-                self._pending_alignment_copies.discard(name)
-                self.writeline(f"{name} = copy_if_misaligned({name})")
-            elif name in self._multistream_alignment_copies:
+        names = list(input_names)
+        pending = [n for n in names if n in self._pending_alignment_copies]
+        for name in pending:
+            self._pending_alignment_copies.discard(name)
+        if len(pending) == 1:
+            self.writeline(f"{pending[0]} = copy_if_misaligned({pending[0]})")
+        elif pending:
+            # One C call for all inputs first read by this kernel.
+            lhs = ", ".join(pending)
+            self.writeline(f"{lhs} = copy_if_misaligned_many(({lhs},))")
+        for name in names:
+            if name in self._multistream_alignment_copies:
                 # TODO: if the same input is read again on a stream after an
                 # intervening different stream (e.g. s1, s2, s1) this re-clones
                 # on the second s1 use -- correct, but an extra copy.  Tracking
