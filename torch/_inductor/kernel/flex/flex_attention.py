@@ -152,6 +152,18 @@ flex_attention_template = TritonTemplate(
 )
 
 
+def _unused_template_output(device: torch.device, shape: list[Any]) -> TensorBox:
+    """A kernel argument for a template output that will not be written.
+
+    Returns a zero-stride view, in the expected shape, of a shared 0-d graph
+    constant, so the generated wrapper allocates and frees nothing for it.
+    """
+    with torch.utils._python_dispatch._disable_current_modes():
+        dummy = torch.zeros((), dtype=torch.float32, device=device)
+    constant = V.graph.add_tensor_constant(dummy, "flex_unused_output")
+    return lowerings[aten.as_strided](constant, shape, [0] * len(shape))
+
+
 @register_lowering(torch.ops.higher_order.flex_attention, type_promotion_kind=None)
 def flex_attention(
     query,
@@ -399,19 +411,33 @@ def flex_attention(
         stride=[sympy.sympify(s) for s in out_strides],
     )
     # see NOTE:[TritonTemplates with multiple outputs]
+    # The logsumexp and max scores are always stored in fp32 regardless of
+    # the input dtype. When the template will not write one of them (its
+    # OUTPUT_* flag is off, e.g. inference without return_lse) the kernel
+    # gets a shared 0-d constant instead of a fresh per-call buffer.
     logsumexp_shape = [B, Hq, seq_len_q]
-    logsumexp = empty_strided(
-        logsumexp_shape,
-        None,
-        dtype=torch.float32,  # The logsumexp is always stored in fp32 regardless of the input dtype
-        device=query.get_device(),
-    )
-    max_scores = empty_strided(
-        logsumexp_shape,  # Same shape as logsumexp
-        None,
-        dtype=torch.float32,  # The max scores are always stored in fp32 regardless of the input dtype
-        device=query.get_device(),
-    )
+    output_lse = kernel_options.get("OUTPUT_LOGSUMEXP", True)
+    output_max = kernel_options.get("OUTPUT_MAX", True)
+    unused_output = None
+    if not (output_lse and output_max):
+        unused_output = _unused_template_output(query.get_device(), logsumexp_shape)
+    if output_lse:
+        logsumexp = empty_strided(
+            logsumexp_shape, None, dtype=torch.float32, device=query.get_device()
+        )
+    else:
+        logsumexp = unused_output
+    if output_max:
+        max_scores = empty_strided(
+            logsumexp_shape, None, dtype=torch.float32, device=query.get_device()
+        )
+    else:
+        max_scores = unused_output
+    written_outputs = [
+        buf
+        for buf, written in ((logsumexp, output_lse), (max_scores, output_max))
+        if written
+    ]
     kernel_options.setdefault("SM_SCALE", scale)
 
     # Determine GQA broadcast factor.
@@ -526,10 +552,7 @@ def flex_attention(
                 subgraph_buffer,
                 mask_graph_buffer,
             ],
-            mutated_inputs=[
-                logsumexp,
-                max_scores,
-            ],
+            mutated_inputs=written_outputs,
             call_sizes=query.get_size(),
             **cur_kernel_options,
         )
