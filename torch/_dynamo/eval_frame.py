@@ -121,7 +121,7 @@ from .exc import (
     UserErrorType,
 )
 from .hooks import Hooks
-from .mutation_guard import install_generation_tagging_init
+from .mutation_guard import GenerationTracker, install_generation_tagging_init
 from .utils import (
     _get_error_on_graph_break,
     _set_error_on_graph_break,
@@ -862,6 +862,8 @@ _not_set = object()
 
 
 class _TorchDynamoContext:
+    _tracks_module_generation = False
+
     def __init__(
         self,
         callback: DynamoCallback,
@@ -952,6 +954,8 @@ class _TorchDynamoContext:
                 "to use torch._dynamo.optimize(...) as an annotation/decorator. "
             )
         self.prior = set_eval_frame(None)
+        if self._tracks_module_generation:
+            install_generation_tagging_init()
         self.cleanup_fns = [enter() for enter in self.enter_exit_hooks]
         self.prior_skip_guard_eval_unsafe = set_skip_guard_eval_unsafe(
             _is_skip_guard_eval_unsafe_stance()
@@ -1142,6 +1146,8 @@ class _TorchDynamoContext:
 
         is_jit_tracing = torch._C._is_tracing
         is_fx_symbolic_tracing = torch.fx._symbolic_trace.is_fx_symbolic_tracing
+        _is_fx_tracing_tls = torch.fx._symbolic_trace._is_fx_tracing_tls
+        tracks_module_generation = self._tracks_module_generation
 
         @functools.wraps(fn)
         def compile_wrapper(*args: Any, **kwargs: Any) -> Any:
@@ -1162,7 +1168,7 @@ class _TorchDynamoContext:
             # intentionally enable force_compile_during_fx_trace to get nested
             # subgraphs.
             if (
-                _is_eager_on_nested_compile()
+                getattr(_force_eager_nested_compile, "depth", 0) > 0
                 and not config.force_compile_during_fx_trace
             ):
                 from torch._higher_order_ops.utils import _in_hop_compile
@@ -1192,7 +1198,7 @@ class _TorchDynamoContext:
                 # Skip nested compile during export (but not HOP internal compile)
                 # Only skip if there's an active TracingContext (nested), not for top-level export
                 if (
-                    torch.compiler.is_exporting()
+                    torch.compiler._is_exporting_flag
                     and not config.force_compile_during_fx_trace
                 ):
                     from torch._higher_order_ops.utils import _in_hop_compile
@@ -1202,7 +1208,8 @@ class _TorchDynamoContext:
                             return fn(*args, **kwargs)
                 # Skip nested compile - just inline the function
                 if (
-                    is_fx_symbolic_tracing()
+                    getattr(_is_fx_tracing_tls, "flag", False)
+                    and is_fx_symbolic_tracing()
                     and not config.force_compile_during_fx_trace
                 ):
                     if config.error_on_nested_fx_trace:
@@ -1219,9 +1226,20 @@ class _TorchDynamoContext:
                         "a dynamo-optimized function. This is not supported at the moment."
                     )
 
-                cleanups = [enter() for enter in self.enter_exit_hooks]
+                if tracks_module_generation:
+                    # Inlined install_generation_tagging_init(): the patch is a
+                    # one-time install, the generation bump happens every call.
+                    if getattr(torch.nn.Module, "___needs_generation_tag_patch", True):
+                        install_generation_tagging_init()
+                    else:
+                        GenerationTracker.generation += 1
+                cleanups = (
+                    [enter() for enter in self.enter_exit_hooks]
+                    if self.enter_exit_hooks
+                    else []
+                )
                 prior_skip_guard_eval_unsafe = set_skip_guard_eval_unsafe(
-                    _is_skip_guard_eval_unsafe_stance()
+                    _stance.skip_guard_eval_unsafe
                 )
                 prior_isolate_recompiles_id = set_eval_frame_isolate_recompiles_id(
                     self._isolate_recompiles_id
@@ -1243,7 +1261,11 @@ class _TorchDynamoContext:
                     torch._C._functorch.get_dynamic_layer_stack_depth()
                 )
 
-                _maybe_set_eval_frame(_callback_from_stance(callback))
+                _maybe_set_eval_frame(
+                    callback
+                    if _stance.stance == "default" and _stance.backend is None
+                    else _callback_from_stance(callback)
+                )
 
                 # Snapshot the local dispatch key set onto a C++ thread-local
                 # stack so it can be restored after the compiled call, matching
@@ -1391,6 +1413,10 @@ class _TorchDynamoContext:
 
 
 class OptimizeContext(_TorchDynamoContext):
+    # See install_generation_tagging_init: every compiled call bumps the module
+    # generation so modules created inside compiled code can be detected.
+    _tracks_module_generation = True
+
     def __init__(
         self,
         callback: DynamoCallback,
@@ -1408,12 +1434,8 @@ class OptimizeContext(_TorchDynamoContext):
         isolate_recompiles: bool = False,
         dynamic_shapes: ShapesSpec | ParamsSpec | dict[str, Any] | None = None,
     ) -> None:
-        def on_enter() -> None:
-            install_generation_tagging_init()
-
         super().__init__(
             callback=callback,
-            on_enter=on_enter,
             backend_ctx_ctor=backend_ctx_ctor,
             patch_fn=TorchPatcher.patch,
             first_ctx=first_ctx,
@@ -1528,12 +1550,16 @@ class DisableContext(_TorchDynamoContext):
                 # None ("off") for most stances but False (run-only) for
                 # eager_on_recompile. Install only when non-None (skips the
                 # justknob-guarded _maybe_set_eval_frame on the common path).
-                callback = _callback_from_stance(self.callback)
+                callback = (
+                    self.callback
+                    if _stance.stance == "default" and _stance.backend is None
+                    else _callback_from_stance(self.callback)
+                )
                 if callback is not None:
                     _maybe_set_eval_frame(callback)
                 try:
                     # Only export needs the annotation work.
-                    if torch.compiler.is_exporting():
+                    if torch.compiler._is_exporting_flag:
                         fn_name = getattr(fn, "__name__", type(fn).__name__)
                         # Skip annotation for __torch_dispatch__ (internal detail).
                         if fn_name != "__torch_dispatch__":

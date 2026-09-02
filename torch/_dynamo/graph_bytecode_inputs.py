@@ -51,9 +51,8 @@ def get_external_object_by_index(index: int) -> Any:
 def store_user_object_weakrefs(*args: Any) -> None:
     global index_to_external_object_weakref
     index_to_external_object_weakref.clear()
-    index_to_external_object_weakref.update(
-        {i: weakref.ref(arg) for i, arg in enumerate(args)}
-    )
+    for i, arg in enumerate(args):
+        index_to_external_object_weakref[i] = weakref.ref(arg)
 
 
 def reset_user_object_tracking() -> None:
