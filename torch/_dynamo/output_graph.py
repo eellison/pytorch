@@ -115,7 +115,11 @@ from .exc import (
     unimplemented,
     unimplemented_with_warning,
 )
-from .graph_bytecode_inputs import has_user_objects, index_to_bytecode_constructor
+from .graph_bytecode_inputs import (
+    get_external_object_by_index,
+    has_user_objects,
+    index_to_bytecode_constructor,
+)
 from .graph_deduplication import apply_graph_deduplication
 from .graph_id_filter import (
     get_backend_override_for_compile_id,
@@ -2806,6 +2810,23 @@ class OutputGraph(OutputGraphCommon):
                         restart_reason="source-less requires_grad_() intermediate leaked as output"
                     )
 
+    @staticmethod
+    def _graph_reads_user_objects(gm: torch.fx.GraphModule) -> bool:
+        """The current stream is registered as user object 0 for every graph,
+        but the weakref table is only read by get_external_object_by_index
+        nodes (streams, events, memory pools). Skip the per-call store when
+        nothing in the graph, including HOP subgraphs, reads it."""
+        if len(index_to_bytecode_constructor) > 1:
+            return True
+        for mod in gm.modules():
+            graph = getattr(mod, "graph", None)
+            if graph is None:
+                continue
+            for node in graph.nodes:
+                if node.target is get_external_object_by_index:
+                    return True
+        return False
+
     def compile_and_call_fx_graph(
         self,
         tx: "InstructionTranslatorBase",
@@ -3139,7 +3160,7 @@ class OutputGraph(OutputGraphCommon):
                 raise AssertionError("root_tx must not be None")
             cg = PyCodegen(self.root_tx)
 
-            if has_user_objects():
+            if has_user_objects() and self._graph_reads_user_objects(gm):
                 # NB: This is where we store possible user objects before running the graph
                 # index_to_user_object_weakref is the function used in the graph to translate
                 # the dynamo-generated index into the actual object passed to the compiled function.
