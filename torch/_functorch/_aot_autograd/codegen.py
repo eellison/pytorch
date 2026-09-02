@@ -92,7 +92,10 @@ class PySourceBuilder(IndentedBuffer):
         return "\n".join(self._lines)  # type: ignore[arg-type]
 
     def build(
-        self, *, wrapped_fn: Callable[..., object] | None = None
+        self,
+        *,
+        wrapped_fn: Callable[..., object] | None = None,
+        capture: bool = True,
     ) -> Callable[..., object]:
         if self._fn_name is None or self._artifact_name is None:
             raise AssertionError("build() requires fn_name and artifact_name")
@@ -102,6 +105,7 @@ class PySourceBuilder(IndentedBuffer):
             self._fn_name,
             self._artifact_name,
             wrapped_fn=wrapped_fn,
+            capture=capture,
         )
 
 
@@ -187,8 +191,12 @@ def _compile_and_exec_source(
     fn_name: str,
     artifact_name: str,
     wrapped_fn: Callable[..., object] | None = None,
+    capture: bool = True,
 ) -> Callable[..., object]:
     """Compile generated source, exec it, and return the named function.
+
+    ``capture=False`` keeps a runtime-only variant out of the standalone-source
+    capture sink (see ``capture_generated_sources``).
 
     If wrapped_fn is provided, applies functools.update_wrapper so that
     __wrapped__ and __dict__ (e.g. _fx_graph_cache_key) propagate to the
@@ -218,7 +226,7 @@ def _compile_and_exec_source(
     # closed-over names BEFORE that happens so the captured GeneratedSource holds only
     # the intended closure globals -- not the post-exec dict with the interpreter's
     # ``__builtins__`` -- which is what the standalone composer reconstructs as source.
-    sink = _current_capture_sink()
+    sink = _current_capture_sink() if capture else None
     captured_globals = dict(globals_dict) if sink is not None else globals_dict
     exec(code, globals_dict, local_dict)
     fn = local_dict[fn_name]

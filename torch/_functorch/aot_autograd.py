@@ -1278,15 +1278,23 @@ def aot_module_simplified(
         # historically returned a function that was not the boxed calling
         # convention.  This should get fixed...
         # NB: GraphModule/nn.Module rely on the non-boxed calling convention here
+        if compiled_fn is None:
+            raise AssertionError("compiled_fn must not be None")
+        # SerializableCompiledFunction only forwards __call__; skip that frame
+        # on the hot path (forward.__wrapped__ still exposes the serializable).
+        call_fn = (
+            compiled_fn.compiled_fn
+            if isinstance(compiled_fn, SerializableCompiledFunction)
+            else compiled_fn
+        )
+
         @simple_wraps(compiled_fn)
         def forward(*runtime_args: tuple[Any]) -> Any:
             full_args = []
             full_args.extend(params_buffers_flat)
             # pyrefly: ignore[bad-argument-type]
             full_args.extend(runtime_args)
-            if compiled_fn is None:
-                raise AssertionError("compiled_fn must not be None")
-            return compiled_fn(full_args)
+            return call_fn(full_args)
 
     # Just for convenience
     forward.zero_grad = mod.zero_grad  # type: ignore[attr-defined]

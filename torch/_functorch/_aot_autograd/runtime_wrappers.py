@@ -526,13 +526,12 @@ class _FirstInvocationContext:
         # NB: Don't run the analyzer when you're forcing compile during FX
         # tracing, as the analyzer doesn't play nicely when it's being
         # make_fx'ed through
-        if (
-            self._is_first
-            and config.check_custom_op_aliasing
-            and not torch._dynamo.config.force_compile_during_fx_trace
-        ):
+        if self._is_first and not torch._dynamo.config.force_compile_during_fx_trace:
+            # Flip even when the analyzer is disabled so the runtime wrapper
+            # can switch to its steady-state variant after this call.
             self._is_first = False
-            return _AnalyzeCustomOpInputOutputMode()
+            if config.check_custom_op_aliasing:
+                return _AnalyzeCustomOpInputOutputMode()
         return nullcontext()
 
 
@@ -857,8 +856,11 @@ def _codegen_compiled_fn_invocation(
     trace_joint: bool,
     indices_of_inps_to_detach: list[int],
     disable_amp: bool,
+    with_first_ctx: bool,
 ) -> None:
-    buf.emit("with _first_ctx_():", indent=1)
+    # The steady-state variant skips the first-invocation context manager
+    # entirely; `if True:` keeps the body's indentation and compiles away.
+    buf.emit("with _first_ctx_():" if with_first_ctx else "if True:", indent=1)
     # trace_joint is known at codegen time. Only the joint/training path needs
     # forced view replay; inference wrappers should not touch this TLS state.
     if trace_joint:
@@ -876,7 +878,7 @@ def _codegen_compiled_fn_invocation(
         buf.emit("if not prev_view_replay_enabled:", indent=3)
         buf.emit("torch._C._set_view_replay_enabled(True)", indent=4)
         buf.emit("with torch.enable_grad():", indent=3)
-        buf.emit("_on_before_call_()", indent=4)
+        buf.emit("if _on_before_call_ is not None: _on_before_call_()", indent=4)
         if disable_amp:
             buf.add_global("_DisableAutocast_", torch._C._DisableAutocast)
             buf.emit("with _DisableAutocast_():", indent=4)
@@ -897,7 +899,7 @@ def _codegen_compiled_fn_invocation(
         buf.emit("grad_enabled = torch.is_grad_enabled()", indent=2)
         buf.emit("try:", indent=2)
         buf.emit("if grad_enabled: torch._C._set_grad_enabled(False)", indent=3)
-        buf.emit("_on_before_call_()", indent=3)
+        buf.emit("if _on_before_call_ is not None: _on_before_call_()", indent=3)
         if disable_amp:
             buf.add_global("_DisableAutocast_", torch._C._DisableAutocast)
             buf.emit("with _DisableAutocast_():", indent=3)
@@ -1156,34 +1158,58 @@ def _create_runtime_wrapper(
         + runtime_metadata.num_intermediate_bases
     )
 
-    buf = PySourceBuilder(
-        "_runtime_wrapper",
-        args="_compiled_fn_, _first_ctx_, _on_before_call_, args",
-        artifact_name="runtime_wrapper_orchestration",
-    )
-    buf.bind(torch=torch)
+    def build_runtime_wrapper(with_first_ctx: bool) -> Callable[..., Any]:
+        # Only the steady-state variant is captured for
+        # aot_autograd.compile_to_python; the first-invocation one is runtime-only.
+        buf = PySourceBuilder(
+            "_runtime_wrapper",
+            args="_compiled_fn_, _first_ctx_, _on_before_call_, args",
+            artifact_name=(
+                "runtime_wrapper_orchestration_first"
+                if with_first_ctx
+                else "runtime_wrapper_orchestration"
+            ),
+        )
+        buf.bind(torch=torch)
 
-    _codegen_capture_orig_inputs(buf, epilogue_args_idx)
-    _codegen_increment_mutation_versions(buf, keep_input_mutations, runtime_metadata)
-    _codegen_compiled_fn_invocation(
-        buf, trace_joint, indices_of_inps_to_detach, disable_amp
-    )
-    _codegen_epilogue(
-        buf,
-        runtime_metadata,
-        codegen_apply_mutations,
-        codegen_alias_fn,
-        num_mutated_runtime_inps,
-        expected_outs,
-    )
+        _codegen_capture_orig_inputs(buf, epilogue_args_idx)
+        _codegen_increment_mutation_versions(
+            buf, keep_input_mutations, runtime_metadata
+        )
+        _codegen_compiled_fn_invocation(
+            buf, trace_joint, indices_of_inps_to_detach, disable_amp, with_first_ctx
+        )
+        _codegen_epilogue(
+            buf,
+            runtime_metadata,
+            codegen_apply_mutations,
+            codegen_alias_fn,
+            num_mutated_runtime_inps,
+            expected_outs,
+        )
+        return buf.build(capture=not with_first_ctx)
 
-    _codegen_runtime_wrapper = buf.build()
+    _codegen_runtime_wrapper_first = build_runtime_wrapper(with_first_ctx=True)
+    _codegen_runtime_wrapper = build_runtime_wrapper(with_first_ctx=False)
 
     _inner_compiled_fn = compiled_invoker.compiled_fn
     _first_invocation_ctx = compiled_invoker.first_invocation_ctx
 
     @simple_wraps(_inner_compiled_fn)
     def runtime_wrapper(args: list[Any]) -> Any:
+        if not (
+            torch.autograd.profiler._is_profiler_enabled
+            and dynamo_config.record_runtime_overhead
+        ):
+            fn = (
+                _codegen_runtime_wrapper_first
+                if _first_invocation_ctx._is_first
+                else _codegen_runtime_wrapper
+            )
+            result = fn(_inner_compiled_fn, _first_invocation_ctx, None, args)
+            del args
+            return result
+
         cm = record_runtime_wrapper_prologue_enter()
         prologue_exited = False
 
@@ -1194,12 +1220,12 @@ def _create_runtime_wrapper(
                 prologue_exited = True
 
         try:
-            result = _codegen_runtime_wrapper(
-                _inner_compiled_fn,
-                _first_invocation_ctx,
-                exit_prologue,
-                args,
+            fn = (
+                _codegen_runtime_wrapper_first
+                if _first_invocation_ctx._is_first
+                else _codegen_runtime_wrapper
             )
+            result = fn(_inner_compiled_fn, _first_invocation_ctx, exit_prologue, args)
         finally:
             exit_prologue()
         del args
