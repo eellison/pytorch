@@ -91,6 +91,7 @@ from .schemas import (
 )
 from .subclass_utils import compute_inner_mutated_inp_indices_from_subclass_meta
 from .utils import (
+    boxed_runtime_callable,
     contain_metadata_mutation_ops,
     get_default_generator,
     make_boxed_func,
@@ -566,8 +567,7 @@ def _aot_stage2c_make_inference_function(
     wrappers: list[CompilerWrapper],
     entry: GenericAOTAutogradResult[Any, Any] | None,
 ) -> DispatchReturn:
-    if entry is not None:
-        compiled_fw = SerializableCompiledFunction(compiled_fw, lambda: entry)
+    compiled_fw = boxed_runtime_callable(compiled_fw)
 
     disable_amp = torch._C._is_any_autocast_enabled()
     compiled_fn = RuntimeWrapper(
@@ -579,6 +579,9 @@ def _aot_stage2c_make_inference_function(
         aot_config,
         runtime_metadata=fw_metadata,
     )
+
+    if entry is not None:
+        compiled_fn = SerializableCompiledFunction(compiled_fn, lambda: entry)
 
     compiled_fn = post_compile(
         wrappers, compiled_fn, aot_config, runtime_metadata=fw_metadata
@@ -2633,6 +2636,9 @@ def _aot_stage2c_make_autograd_function(
         aot_config=aot_config,
         fw_metadata=fw_metadata,
         try_save_cache_entry=try_save_cache_entry,
+    )
+    compile_spec.compiled_fw_func = boxed_runtime_callable(
+        compile_spec.compiled_fw_func
     )
     compiled_fn = AOTDispatchAutograd.post_compile(compile_spec)
 

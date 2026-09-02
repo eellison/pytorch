@@ -4050,6 +4050,40 @@ def forward(self, tangents_1):
         inp = [torch.randn(5, requires_grad=True) for _ in range(3)]
         f(*inp).sum().backward()
 
+    def test_boxed_runtime_callable(self):
+        calls = []
+
+        class Compiled:
+            _boxed_call = True
+
+            def __init__(self, gm):
+                self.gm = gm
+
+            def __call__(self, args):
+                calls.append("slow")
+                return self.gm(*args)
+
+            def boxed_runtime_callable(self):
+                calls.append("unwrap")
+
+                def fast(args):
+                    calls.append("fast")
+                    return self.gm(*args)
+
+                fast._boxed_call = True
+                return fast
+
+        def compiler(gm, _):
+            return Compiled(gm)
+
+        def f(x):
+            return x.sin().cos()
+
+        inp = torch.randn(5)
+        out = aot_function(f, compiler)(inp)
+        self.assertEqual(out, f(inp))
+        self.assertEqual(calls, ["unwrap", "fast"])
+
     @patch("torch._functorch.aot_autograd.AOT_COUNTER", new_callable=itertools.count)
     def test_compilation_context(self, counter):
         def f(x):

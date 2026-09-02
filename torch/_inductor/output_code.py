@@ -114,6 +114,9 @@ class OutputCode:
     def __call__(self, inputs: Sequence[Any]) -> Any:
         raise NotImplementedError(type(self))
 
+    def boxed_runtime_callable(self) -> Callable[[list[Any]], Any]:
+        return self
+
     def prepare_for_serialization(self) -> None:
         raise NotImplementedError(type(self))
 
@@ -559,6 +562,7 @@ class CompiledFxGraph(OutputCode):
     inputs_to_check: Sequence[int]
 
     _boxed_call: bool | None = None
+    _boxed_runtime_callable: Callable[[list[Any]], Any] | None = None
     _triton_bundle: TritonBundle | None = None
     _wrap_compiled_regions: bool = False
     _defers_input_alignment: bool = False
@@ -747,6 +751,7 @@ class CompiledFxGraph(OutputCode):
 
         # aot autograd needs to know to pass in inputs as a list
         self._boxed_call = True
+        self._boxed_runtime_callable = None
 
         # Store whether to wrap compiled regions in inductor_compiled_code HOP
         # This is set at compile time to avoid runtime overhead
@@ -838,6 +843,37 @@ class CompiledFxGraph(OutputCode):
                 )
             ):
                 self._compile_context = None
+
+    def _refresh_boxed_runtime_callable(self, cudagraphs: BoxedBool) -> None:
+        self._boxed_runtime_callable = None
+
+        if (
+            cudagraphs
+            or self._compile_context is not None
+            or self._wrap_compiled_regions
+        ):
+            return
+
+        if self.current_callable is None:
+            raise AssertionError("self.current_callable must not be None")
+
+        current_callable = self.current_callable
+
+        # Hold a strong reference: callers keep only this closure alive, and
+        # __del__ tears down the partition runner the callable depends on.
+        def call(inputs: list[Any]) -> Any:
+            if (
+                torch._inductor.debug.RECORD_GRAPH_EXECUTION
+                and torch._inductor.debug.GRAPH_EXECUTION_ORDER is not None
+            ) or torch.autograd.profiler._is_profiler_enabled:
+                return self(inputs)
+            return current_callable(inputs)
+
+        call._boxed_call = True  # type: ignore[attr-defined]
+        self._boxed_runtime_callable = call
+
+    def boxed_runtime_callable(self) -> Callable[[list[Any]], Any]:
+        return self._boxed_runtime_callable or self
 
     def post_compile(
         self,
@@ -993,6 +1029,8 @@ class CompiledFxGraph(OutputCode):
 
             self.current_callable = wrapped_callable
 
+        self._refresh_boxed_runtime_callable(cudagraphs)
+
     def set_triton_bundle(self, triton_bundle: Any) -> None:
         self._triton_bundle = triton_bundle
 
@@ -1003,6 +1041,7 @@ class CompiledFxGraph(OutputCode):
         # models to disk.
         self._compile_context = None
         self.current_callable = None
+        self._boxed_runtime_callable = None
         self.recursively_apply_fns = None
         self.compiled_fn_runner = None
         if self._original_gm is not None:

@@ -50,7 +50,7 @@ from .runtime_wrappers import (
     SubclassMeta,
 )
 from .schemas import AOTAutogradCacheInfo, AOTConfig  # noqa: F401
-from .utils import simple_wraps
+from .utils import boxed_runtime_callable, simple_wraps
 
 
 if TYPE_CHECKING:
@@ -488,6 +488,7 @@ class GenericAOTAutogradResult(Generic[TForward, TBackward]):
             compiled_fw_func = self.compiled_fw.post_compile(
                 compiled_fw_func, fw_fx_config
             )
+            compiled_fw_func = boxed_runtime_callable(compiled_fw_func)
             compiled_bw_func = self.compiled_bw.post_compile(
                 compiled_bw_func, bw_fx_config
             )
@@ -505,6 +506,7 @@ class GenericAOTAutogradResult(Generic[TForward, TBackward]):
         compiled_fw_func = self.compiled_fw.post_compile(
             compiled_fw_func, inference_fx_config
         )
+        compiled_fw_func = boxed_runtime_callable(compiled_fw_func)
         return compiled_fw_func, None, needs_autograd
 
     def _apply_runtime_wrappers(
