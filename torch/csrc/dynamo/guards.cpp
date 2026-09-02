@@ -1291,6 +1291,42 @@ static PyObject* _empty_strided_cuda(PyObject* dummy, PyObject* args) {
   return _empty_strided_device(dummy, args, c10::DeviceType::CUDA);
 }
 
+static PyObject* _empty_strided_cuda_many(PyObject* dummy, PyObject* specs) {
+  HANDLE_TH_ERRORS;
+  TORCH_CHECK(PyTuple_CheckExact(specs));
+  const auto len = PyTuple_GET_SIZE(specs);
+  std::vector<at::Tensor> tensors;
+  tensors.reserve(len);
+  for (Py_ssize_t i = 0; i < len; ++i) {
+    at::SmallVector<int64_t, 8> sizes;
+    at::SmallVector<int64_t, 8> strides;
+    at::ScalarType dtype{at::ScalarType::Undefined};
+    _parse_empty_strided_args(
+        PyTuple_GET_ITEM(specs, i), sizes, strides, dtype);
+#ifdef USE_CUDA
+    tensors.emplace_back(at::detail::empty_strided_cuda(
+        sizes, strides, dtype, c10::DeviceType::CUDA));
+#else
+    TORCH_CHECK(false, "PyTorch compiled without CUDA support.");
+#endif
+  }
+
+  PyObject* result = PyTuple_New(len);
+  if (result == nullptr) {
+    return nullptr;
+  }
+  for (Py_ssize_t i = 0; i < len; ++i) {
+    PyObject* item = THPVariable_Wrap(std::move(tensors[i]));
+    if (item == nullptr) {
+      Py_DECREF(result);
+      return nullptr;
+    }
+    PyTuple_SET_ITEM(result, i, item);
+  }
+  return result;
+  END_HANDLE_TH_ERRORS;
+}
+
 static PyObject* _cuda_enter_device_get_raw_stream(
     PyObject* dummy,
     PyObject* arg) {
@@ -1397,6 +1433,7 @@ static PyMethodDef _methods[] = {
      METH_VARARGS,
      nullptr},
     {"_empty_strided_cuda", _empty_strided_cuda, METH_VARARGS, nullptr},
+    {"_empty_strided_cuda_many", _empty_strided_cuda_many, METH_O, nullptr},
     {"_cuda_enter_device_get_raw_stream",
      _cuda_enter_device_get_raw_stream,
      METH_O,

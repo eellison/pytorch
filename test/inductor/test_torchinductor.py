@@ -16379,6 +16379,22 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         # cpp_wrapper should NOT contain Python-syntax alignment copies
         self.assertNotIn("copy_if_misaligned", code[0])
 
+    @requires_gpu()
+    @skip_if_not_triton
+    @unittest.skipIf(
+        config.cpp_wrapper, "batched CUDA allocation is Python wrapper only"
+    )
+    def test_adjacent_cuda_allocations_batched(self):
+        def fn(x):
+            return x.sin(), x.cos()
+
+        x = torch.randn(1024, device=self.device)
+        _, code = run_and_get_code(torch.compile(fn, fullgraph=True), x)
+
+        FileCheck().check("def call").check(
+            "buf0, buf1 = empty_strided_cuda_many"
+        ).check_not("empty_strided_cuda(").check("triton_").run(code[0])
+
     def test_copy_if_misaligned_returns_same_tensor_when_aligned(self):
         import weakref
 

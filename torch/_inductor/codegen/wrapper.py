@@ -1877,6 +1877,7 @@ class PythonWrapperCodegen(CodeGen):
                 empty_strided_cpu = torch._C._dynamo.guards._empty_strided_cpu
                 empty_strided_cpu_pinned = torch._C._dynamo.guards._empty_strided_cpu_pinned
                 empty_strided_cuda = torch._C._dynamo.guards._empty_strided_cuda
+                empty_strided_cuda_many = torch._C._dynamo.guards._empty_strided_cuda_many
                 enter_cuda_device = torch._C._dynamo.guards._cuda_enter_device_get_raw_stream
                 maybe_exchange_device = torch._C._dynamo.guards._cuda_maybe_exchange_device
                 empty_strided_xpu = torch._C._dynamo.guards._empty_strided_xpu
@@ -2839,12 +2840,39 @@ class PythonWrapperCodegen(CodeGen):
             # At this point, we shouldn't generate any new memory planning lines.
             # Override writeline to point at the wrapper call, in case it gets called.
             with self.set_writeline(self.wrapper_call, self.wrapper_call.writeline):
-                for line in self.lines:
+                i = 0
+                while i < len(self.lines):
+                    line = self.lines[i]
+                    if isinstance(line, AllocateLine) and self._can_batch_cuda_alloc(
+                        line
+                    ):
+                        group = [line]
+                        contexts = []
+                        j = i + 1
+                        while j < len(self.lines):
+                            next_line = self.lines[j]
+                            if isinstance(next_line, LineContext):
+                                contexts.append(next_line)
+                                j += 1
+                                continue
+                            if not isinstance(next_line, AllocateLine):
+                                break
+                            if not self._can_batch_cuda_alloc(next_line, group[0]):
+                                break
+                            group.append(next_line)
+                            j += 1
+                        if len(group) > 1:
+                            for context in contexts:
+                                self.writeline(context)
+                            self.codegen_batched_cuda_allocations(group)
+                            i = j
+                            continue
                     if isinstance(line, WrapperLine):
                         # pyrefly: ignore [missing-attribute]
                         line.codegen(self.wrapper_call)
                     else:
                         self.wrapper_call.writeline(line)
+                    i += 1
 
             self._write_multi_kernel_defs()
 
@@ -4723,6 +4751,46 @@ class PythonWrapperCodegen(CodeGen):
             # need an extra as_strided call
             out = out + f".as_strided({codegen_shape_tuple}, {codegen_stride_tuple})"
         return out
+
+    def _can_batch_cuda_alloc(
+        self, line: AllocateLine, first: AllocateLine | None = None
+    ) -> bool:
+        if line.comm_buffer or config.test_configs.track_memory_lifecycle:
+            return False
+        node = line.node
+        if node.get_name() in V.graph.removed_buffers:
+            return False
+        device = node.get_device()
+        if device is None or device.type != "cuda":
+            return False
+        if first is not None and device != first.node.get_device():
+            return False
+        if node.get_is_pinned():
+            return False
+        shape = tuple(node.get_size())
+        allocation_shape = tuple(V.graph.get_allocation_size(node))
+        if self.codegen_python_shape_tuple(shape) != self.codegen_python_shape_tuple(
+            allocation_shape
+        ):
+            return False
+        return True
+
+    def codegen_batched_cuda_allocations(self, lines: list[AllocateLine]) -> None:
+        names = []
+        specs = []
+        for line in lines:
+            node = line.node
+            shape = tuple(node.get_size())
+            stride = tuple(node.get_stride())
+            names.append(node.get_name())
+            specs.append(
+                f"({self.codegen_python_shape_tuple(shape)}, "
+                f"{self.codegen_python_shape_tuple(stride)}, "
+                f"{node.get_dtype()})"
+            )
+        self.writeline(
+            f"{', '.join(names)} = empty_strided_cuda_many(({', '.join(specs)}))"
+        )
 
     def make_comment(self, line):
         self.writeline(CommentLine(line))
