@@ -997,6 +997,7 @@ def with_fresh_cache_if_config() -> Generator[None, None, None]:
 class _CompileFxKwargs(TypedDict, total=False):
     cudagraphs: BoxedBool | None
     static_input_idxs: Sequence[int]
+    dynamo_guarded_input_idxs: Sequence[int] | None
     is_backward: bool
     graph_id: int | None
     cpp_wrapper: bool
@@ -1027,6 +1028,7 @@ def compile_fx_inner(
 ) -> OutputCode:
     kwargs.setdefault("cudagraphs", None)
     kwargs.setdefault("static_input_idxs", ())
+    kwargs.setdefault("dynamo_guarded_input_idxs", None)
     kwargs.setdefault("is_backward", False)
     kwargs.setdefault("graph_id", None)
     kwargs.setdefault("cpp_wrapper", False)
@@ -1809,6 +1811,7 @@ class _InProcessFxCompile(FxCompile):
                     ),
                     const_module=const_graph,
                     inputs_to_check=inputs_to_check,
+                    skip_input_assert_idxs=graph_kwargs.get("dynamo_guarded_input_idxs"),
                     fx_wrapper=fx_wrapper,
                     get_decomp_fn=get_decomp_fn,
                 )
@@ -2722,6 +2725,7 @@ class CompilerConfigExtra:
     graph_id: int
     forward_device: BoxedDeviceIndex
     forward_is_partitioned: BoxedBool
+    inputs_guarded_by_dynamo: bool = False
     cudagraphs_bwd_override: bool | None = None
 
 
@@ -2778,12 +2782,21 @@ def create_compiler_config_extra(
     # to have fixed addresses.
     forward_is_partitioned = BoxedBool(False)
 
+    # Dynamo tags every placeholder with its source and guards the inputs'
+    # sizes and strides itself. Graphs handed to compile_fx directly (e.g.
+    # standalone_compile) have no such guards and keep Inductor's asserts.
+    inputs_guarded_by_dynamo = isinstance(gm, GraphModule) and all(
+        hasattr(node, "_dynamo_source")
+        for node in gm.graph.find_nodes(op="placeholder")
+    )
+
     return CompilerConfigExtra(
         cudagraphs=cudagraphs,
         graph_id=graph_id,
         forward_device=forward_device,
         cudagraphs_bwd_override=cudagraphs_bwd_override,
         forward_is_partitioned=forward_is_partitioned,
+        inputs_guarded_by_dynamo=inputs_guarded_by_dynamo,
     )
 
 
@@ -2918,11 +2931,20 @@ def compile_fx_forward(
     # original strides
     _recursive_record_user_visible_output_idxs(gm)
 
+    # The first `fixed` inputs are lifted parameters; the rest are the user
+    # inputs Dynamo already guarded, so Inductor skips its asserts for them.
+    dynamo_guarded_input_idxs = (
+        list(range(fixed, len(example_inputs)))
+        if compiler_config_extra.inputs_guarded_by_dynamo
+        else None
+    )
+
     with cudagraph_annotation_context(compiler_config_extra.cudagraphs):
         result = inner_compile(
             gm,
             example_inputs,
             static_input_idxs=get_static_input_idxs(fixed),
+            dynamo_guarded_input_idxs=dynamo_guarded_input_idxs,
             cudagraphs=compiler_config_extra.cudagraphs,
             graph_id=compiler_config_extra.graph_id,
             is_inference=is_inference,

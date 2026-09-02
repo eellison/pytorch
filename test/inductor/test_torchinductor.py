@@ -16229,7 +16229,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             torch.compile(fn),
             a,
         )
-        FileCheck().check("assert_size_stride(").check(
+        # Graph-input asserts are elided (Dynamo guards them); the custom op's
+        # output assert remains.
+        FileCheck().check(
             target_assert_size_stride_str(
                 None, [16, 32], [32, 1], ["s77", "s27"], ["s27", 1]
             )
@@ -16301,7 +16303,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @requires_gpu()
     @skip_if_not_triton
-    def test_input_asserts_deferred_to_first_use(self):
+    def test_input_asserts_elided_for_aot_inputs(self):
         def fn(x, y, z):
             a = torch.mm(x, y)
             b = torch.mm(a, z)
@@ -16312,34 +16314,30 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         z = torch.randn(64, 8, device=self.device)
 
         _, code = run_and_get_code(torch.compile(fn), x, y, z)
-        # z's assert should appear after the first mm, not at the top
-        # with all the other asserts
-        if config.cpp_wrapper:
-            FileCheck().check("inductor_entry_impl").check_count(
-                "assert_size_stride", 2, exactly=True
-            ).check("mm_out").run(code[0])
-        else:
-            FileCheck().check("def call").check("assert_size_stride_grouped(").check(
-                "extern_kernels.mm("
-            ).check("assert_size_stride(").check("extern_kernels.mm(").run(code[0])
+        # AOTAutograd/Dynamo guarded graph inputs before entering the wrapper,
+        # so Inductor does not need redundant input size/stride asserts.
+        self.assertNotIn("assert_size_stride(", code[0])
 
     @requires_gpu()
     @skip_if_not_triton
     def test_input_asserts_grouped_for_same_first_use(self):
-        def fn(x, y, z):
-            return x + y + z
+        # Forward graph inputs are guarded by Dynamo so their asserts are
+        # elided; backward graph inputs are not, and are asserted grouped by
+        # first use.
+        def fn(x, y):
+            return x * y
 
-        x = torch.randn(16, 32, device=self.device)
-        y = torch.randn(16, 32, device=self.device)
-        z = torch.randn(16, 32, device=self.device)
+        x = torch.randn(16, 32, device=self.device, requires_grad=True)
+        y = torch.randn(16, 32, device=self.device, requires_grad=True)
 
-        _, code = run_and_get_code(torch.compile(fn), x, y, z)
+        _, code = run_and_get_code(lambda: torch.compile(fn)(x, y).sum().backward())
+        self.assertEqual(len(code), 2)
         if config.cpp_wrapper:
-            FileCheck().check_count("assert_size_stride", 3, exactly=True).run(code[0])
+            FileCheck().check_count("assert_size_stride", 3, exactly=True).run(code[1])
         else:
             FileCheck().check_count(
                 "assert_size_stride_grouped(", 1, exactly=True
-            ).check_not("assert_size_stride(").run(code[0])
+            ).check_not("assert_size_stride(").run(code[1])
 
     @requires_gpu()
     @skip_if_not_triton
@@ -17738,7 +17736,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             size_assert_pattern = rf"{assert_fn}.[a-z]+[0-9]+, .2{suffix}, 3{suffix}, s12, s80, s80., .3{suffix}\*s12\*s80\*s80, s12\*s80\*s80, 1{suffix}, s12\*s80, s1.."
             FileCheck().check_regex(size_assert_pattern).run(code)
         else:
-            FileCheck().check("assert_size_stride(").check(
+            FileCheck().check(
                 target_assert_size_stride_str(
                     None, [2, 3, 16, 32, 32], [49152, 16384, 1, 512, 16]
                 )

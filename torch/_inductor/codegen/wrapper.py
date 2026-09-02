@@ -2047,6 +2047,9 @@ class PythonWrapperCodegen(CodeGen):
         return V.graph.graph_outputs
 
     def codegen_input_size_asserts(self) -> None:
+        skip_assert_names = OrderedSet(
+            V.graph.graph_input_names[i] for i in V.graph.skip_input_assert_idxs
+        )
         for name, buf in self.get_graph_inputs().items():
             if isinstance(
                 buf,
@@ -2061,6 +2064,8 @@ class PythonWrapperCodegen(CodeGen):
 
             # a graph partition may take an IRNode output from a previous partition
             if name not in V.graph.graph_input_names:
+                continue
+            if name in skip_assert_names:
                 continue
 
             # comparing strides for 0 size tensor is tricky. Ignore them for now.

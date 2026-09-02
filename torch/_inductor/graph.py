@@ -418,6 +418,7 @@ class GraphLowering(torch.fx.Interpreter):
         const_module: GraphLowering | None = None,
         name: str | None = None,
         inputs_to_check: Sequence[int] | None = None,
+        skip_input_assert_idxs: Sequence[int] | None = None,
         fx_wrapper: bool = False,
         get_decomp_fn: Callable[..., dict[Any, Callable[..., Any]]] | None = None,
     ) -> None:
@@ -437,6 +438,7 @@ class GraphLowering(torch.fx.Interpreter):
         self.const_kernel_code = const_kernel_code
         self.const_module = const_module
         self.inputs_to_check = inputs_to_check
+        self.skip_input_assert_idxs = OrderedSet(skip_input_assert_idxs or ())
         self._defers_input_alignment = False
 
         self.extra_traceback = False  # we do our own error wrapping
