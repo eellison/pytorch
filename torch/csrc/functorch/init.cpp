@@ -487,6 +487,12 @@ void popDynamicLayerStackToDepth(size_t depth) {
 
 } // anonymous namespace
 
+// Exposed for torch._C._dynamo.eval_frame.exit_compiled_region, which restores
+// the dynamic layer stack without a Python round trip.
+void dynamo_pop_dynamic_layer_stack_to_depth(size_t depth) {
+  popDynamicLayerStackToDepth(depth);
+}
+
 static std::tuple<Tensor, std::optional<int64_t>> unwrapBatched(
     const Tensor& tensor,
     int64_t level) {

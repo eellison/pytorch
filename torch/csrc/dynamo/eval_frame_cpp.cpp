@@ -1,4 +1,6 @@
 #include <ATen/PythonTorchFunctionTLS.h>
+#include <ATen/functorch/DynamicLayer.h>
+#include <c10/core/impl/LocalDispatchKeySet.h>
 #include <c10/util/Exception.h>
 #include <torch/csrc/dynamo/cache_entry.h>
 #include <torch/csrc/dynamo/cpp_shim.h>
@@ -9,6 +11,7 @@
 #include <torch/csrc/dynamo/extra_state.h>
 #include <torch/csrc/dynamo/framelocals_mapping.h>
 #include <torch/csrc/dynamo/stackref_bridge.h>
+#include <torch/csrc/functorch/init.h>
 
 #include <algorithm>
 #include <optional>
@@ -725,4 +728,70 @@ void dynamo_skip_code_recursive(PyCodeObject* code) {
   FrameExecStrategy strategy =
       FrameExecStrategy{FrameAction::SKIP, FrameAction::SKIP};
   extra_state_set_exec_strategy(extra, strategy);
+}
+
+namespace {
+
+// State that torch.compile's per-call wrapper saves before running compiled
+// code and restores afterwards. Kept on a C++ thread-local stack so the
+// Python wrapper makes one call each way instead of one per field.
+struct CompiledRegionState {
+  bool skip_guard_eval_unsafe = false;
+  int64_t isolate_recompiles_id = 0;
+  size_t dynamic_layer_stack_depth = 0;
+  c10::impl::LocalDispatchKeySet local_dispatch_key_set;
+};
+
+std::vector<CompiledRegionState>& compiled_region_stack() {
+  static thread_local std::vector<CompiledRegionState> stack;
+  return stack;
+}
+
+} // namespace
+
+PyObject* dynamo_enter_compiled_region(PyObject* module, PyObject* args) {
+  PyObject* callback = nullptr;
+  int skip_guard_eval_unsafe = 0;
+  long long isolate_recompiles_id = 0;
+  if (!PyArg_ParseTuple(
+          args,
+          "OpL",
+          &callback,
+          &skip_guard_eval_unsafe,
+          &isolate_recompiles_id)) {
+    return nullptr;
+  }
+  if (!Py_IsNone(callback) && !Py_IsFalse(callback) &&
+      !PyCallable_Check(callback)) {
+    PyErr_SetString(PyExc_TypeError, "expected a callable");
+    return nullptr;
+  }
+  compiled_region_stack().push_back(CompiledRegionState{
+      is_skip_guard_eval_unsafe,
+      get_current_isolate_recompiles_id(),
+      at::functorch::getDynamicLayerStack().size(),
+      c10::impl::tls_local_dispatch_key_set()});
+
+  is_skip_guard_eval_unsafe = skip_guard_eval_unsafe != 0;
+  set_current_isolate_recompiles_id(isolate_recompiles_id);
+  Py_XDECREF(dynamo_set_eval_frame_callback(callback, module));
+  Py_RETURN_NONE;
+}
+
+PyObject* dynamo_exit_compiled_region(PyObject* module, PyObject* noargs) {
+  auto& stack = compiled_region_stack();
+  if (stack.empty()) {
+    PyErr_SetString(
+        PyExc_RuntimeError, "exit_compiled_region called with an empty stack");
+    return nullptr;
+  }
+  const CompiledRegionState state = stack.back();
+  stack.pop_back();
+  Py_XDECREF(dynamo_set_eval_frame_callback(Py_None, module));
+  torch::functorch::impl::dynamo_pop_dynamic_layer_stack_to_depth(
+      state.dynamic_layer_stack_depth);
+  is_skip_guard_eval_unsafe = state.skip_guard_eval_unsafe;
+  set_current_isolate_recompiles_id(state.isolate_recompiles_id);
+  c10::impl::_force_tls_local_dispatch_key_set(state.local_dispatch_key_set);
+  Py_RETURN_NONE;
 }

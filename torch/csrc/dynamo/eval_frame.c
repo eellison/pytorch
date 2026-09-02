@@ -45,7 +45,7 @@ int64_t get_current_isolate_recompiles_id(void) {
   return current_isolate_recompiles_id;
 }
 
-static void set_current_isolate_recompiles_id(int64_t id) {
+void set_current_isolate_recompiles_id(int64_t id) {
   current_isolate_recompiles_id = id;
 }
 
@@ -651,6 +651,12 @@ static PyObject* set_eval_frame(PyObject* new_callback, PyObject* module) {
   return old_callback;
 }
 
+PyObject* dynamo_set_eval_frame_callback(
+    PyObject* new_callback,
+    PyObject* module) {
+  return set_eval_frame(new_callback, module);
+}
+
 static PyObject* set_eval_frame_py(PyObject* module, PyObject* callback) {
   if (!Py_IsNone(callback) && !Py_IsFalse(callback) &&
       !PyCallable_Check(callback)) {
@@ -829,6 +835,8 @@ static PyMethodDef _methods[] = {
      METH_O,
      NULL},
     {"set_eval_frame_isolate_recompiles_id", set_eval_frame_isolate_recompiles_id_py, METH_O, NULL},
+    {"enter_compiled_region", dynamo_enter_compiled_region, METH_VARARGS, NULL},
+    {"exit_compiled_region", dynamo_exit_compiled_region, METH_NOARGS, NULL},
     {"get_eval_frame_isolate_recompiles_id", get_eval_frame_isolate_recompiles_id_py, METH_NOARGS, NULL},
     {NULL, NULL, 0, NULL}};
 

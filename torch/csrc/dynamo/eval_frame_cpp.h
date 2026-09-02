@@ -20,6 +20,8 @@ PyObject* dynamo__custom_eval_frame(
     PyObject* callback);
 
 PyObject* dynamo_set_code_exec_strategy(PyObject* dummy, PyObject* obj);
+PyObject* dynamo_enter_compiled_region(PyObject* module, PyObject* args);
+PyObject* dynamo_exit_compiled_region(PyObject* module, PyObject* noargs);
 void dynamo_skip_code_recursive(PyCodeObject* code);
 
 void dynamo_set_c_recursion_limit(int32_t limit);
