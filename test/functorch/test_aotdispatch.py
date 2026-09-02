@@ -4050,6 +4050,59 @@ def forward(self, tangents_1):
         inp = [torch.randn(5, requires_grad=True) for _ in range(3)]
         f(*inp).sum().backward()
 
+    def test_aot_autograd_save_for_backward_plan(self):
+        import struct
+
+        recorded = {}
+
+        class F(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx, x, y):
+                view = (x * 2)[0]
+                # plan layout: counts (vc, no_vc, symints, opaque), then the
+                # fw_outs index of each saved item, then an is_graph_input flag
+                # per saved tensor (y is the graph input, the view is not).
+                plan = struct.pack("9q", 2, 0, 1, 0, 0, 1, 2, 0, 1)
+                torch._C._aot_autograd_save_for_backward(ctx, [view, y, 7], plan)
+                recorded["symints"] = ctx.symints
+                recorded["opaque"] = ctx.opaque_objects
+                recorded["no_vc"] = ctx._tensors_no_vc_check
+                return x + y
+
+            @staticmethod
+            def backward(ctx, g):
+                saved_view, saved_y = ctx.saved_tensors
+                # graph inputs are saved as-is; intermediate views are detached
+                recorded["saved_y_is_y"] = saved_y is y
+                recorded["saved_view_is_view"] = saved_view._is_view()
+                return g, g
+
+        class G(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx, x):
+                view = x[0]
+                plan = struct.pack("6q", 1, 0, 0, 0, 0, 1)
+                torch._C._aot_autograd_save_for_backward(ctx, [view], plan)
+                return x * 1
+
+            @staticmethod
+            def backward(ctx, g):
+                (saved,) = ctx.saved_tensors
+                recorded["input_view_kept"] = saved._is_view()
+                return g
+
+        x = torch.randn(2, 3, requires_grad=True)
+        y = torch.randn(2, 3, requires_grad=True)
+        F.apply(x, y).sum().backward()
+        G.apply(x).sum().backward()
+        self.assertEqual(recorded["symints"], [7])
+        self.assertEqual(recorded["opaque"], [])
+        self.assertEqual(recorded["no_vc"], [])
+        self.assertTrue(recorded["saved_y_is_y"])
+        self.assertFalse(recorded["saved_view_is_view"])
+        self.assertTrue(recorded["input_view_kept"])
+        self.assertEqual(x.grad, torch.ones_like(x) * 2)
+
     def test_boxed_runtime_callable(self):
         calls = []
 
