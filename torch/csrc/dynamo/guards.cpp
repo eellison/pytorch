@@ -16,6 +16,7 @@
 #include <torch/csrc/autograd/utils/wrap_outputs.h>
 #include <torch/csrc/dynamo/guards.h>
 #include <torch/csrc/inductor/inductor_ops.h>
+#include <torch/csrc/utils/device_lazy_init.h>
 #include <torch/csrc/utils/disable_torch_function.h>
 #include <torch/csrc/utils/python_arg_parser.h>
 #include <torch/csrc/utils/python_numbers.h>
@@ -29,7 +30,9 @@
 #include <nlohmann/json.hpp>
 
 #ifdef USE_CUDA
+#include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/EmptyTensor.h>
+#include <c10/cuda/CUDAFunctions.h>
 #endif
 
 #ifdef USE_XPU
@@ -1288,6 +1291,64 @@ static PyObject* _empty_strided_cuda(PyObject* dummy, PyObject* args) {
   return _empty_strided_device(dummy, args, c10::DeviceType::CUDA);
 }
 
+static PyObject* _cuda_enter_device_get_raw_stream(
+    PyObject* dummy,
+    PyObject* arg) {
+  HANDLE_TH_ERRORS;
+  TORCH_CHECK(THPUtils_checkLong(arg), "invalid argument to CUDA device guard");
+#ifdef USE_CUDA
+  auto device_index = THPUtils_unpackDeviceIndex(arg);
+  TORCH_CHECK(device_index >= 0, "CUDA device index must be non-negative");
+
+  torch::utils::device_lazy_init(at::kCUDA);
+  auto prev_device = c10::cuda::ExchangeDevice(device_index);
+  auto stream = at::cuda::getCurrentCUDAStream(device_index).stream();
+
+  PyObject* prev_device_obj = THPUtils_packDeviceIndex(prev_device);
+  if (prev_device_obj == nullptr) {
+    c10::cuda::MaybeExchangeDevice(prev_device);
+    return nullptr;
+  }
+  PyObject* stream_obj = PyLong_FromVoidPtr(stream);
+  if (stream_obj == nullptr) {
+    c10::cuda::MaybeExchangeDevice(prev_device);
+    Py_DECREF(prev_device_obj);
+    return nullptr;
+  }
+  PyObject* result = PyTuple_New(2);
+  if (result == nullptr) {
+    c10::cuda::MaybeExchangeDevice(prev_device);
+    Py_DECREF(prev_device_obj);
+    Py_DECREF(stream_obj);
+    return nullptr;
+  }
+  PyTuple_SET_ITEM(result, 0, prev_device_obj);
+  PyTuple_SET_ITEM(result, 1, stream_obj);
+  return result;
+#else
+  TORCH_CHECK(false, "PyTorch compiled without CUDA support.");
+#endif
+  END_HANDLE_TH_ERRORS;
+}
+
+static PyObject* _cuda_maybe_exchange_device(PyObject* dummy, PyObject* arg) {
+  HANDLE_TH_ERRORS;
+  TORCH_CHECK(THPUtils_checkLong(arg), "invalid argument to CUDA device guard");
+#ifdef USE_CUDA
+  auto device_index = THPUtils_unpackDeviceIndex(arg);
+  if (device_index < 0) {
+    return THPUtils_packInt32(-1);
+  }
+
+  torch::utils::device_lazy_init(at::kCUDA);
+  auto current_device = c10::cuda::MaybeExchangeDevice(device_index);
+  return THPUtils_packDeviceIndex(current_device);
+#else
+  TORCH_CHECK(false, "PyTorch compiled without CUDA support.");
+#endif
+  END_HANDLE_TH_ERRORS;
+}
+
 static PyObject* _empty_strided_xpu(PyObject* dummy, PyObject* args) {
   // at::empty_strided is surprising slow.  This is lower-overhead.
   return _empty_strided_device(dummy, args, c10::DeviceType::XPU);
@@ -1336,6 +1397,14 @@ static PyMethodDef _methods[] = {
      METH_VARARGS,
      nullptr},
     {"_empty_strided_cuda", _empty_strided_cuda, METH_VARARGS, nullptr},
+    {"_cuda_enter_device_get_raw_stream",
+     _cuda_enter_device_get_raw_stream,
+     METH_O,
+     nullptr},
+    {"_cuda_maybe_exchange_device",
+     _cuda_maybe_exchange_device,
+     METH_O,
+     nullptr},
     {"_empty_strided_xpu", _empty_strided_xpu, METH_VARARGS, nullptr},
     {"_empty_strided_mtia", _empty_strided_mtia, METH_VARARGS, nullptr},
     {"_reinterpret_tensor", _reinterpret_tensor, METH_VARARGS, nullptr},

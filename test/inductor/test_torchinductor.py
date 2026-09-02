@@ -21764,6 +21764,15 @@ if RUN_GPU:
                 FileCheck().check_count(
                     "AOTICudaGuard device_guard(0)", 1, exactly=True
                 ).run(code)
+            elif GPU_TYPE == "cuda":
+                FileCheck().check_count(
+                    "prev_device0, raw_stream0 = enter_cuda_device(0)",
+                    1,
+                    exactly=True,
+                ).check_count(
+                    "maybe_exchange_device(prev_device0)", 1, exactly=True
+                ).run(code)
+                self.assertNotIn(f"with torch.{GPU_TYPE}._DeviceGuard(0)", code)
             else:
                 FileCheck().check_count(
                     f"with torch.{GPU_TYPE}._DeviceGuard(0)", 1, exactly=True

@@ -198,7 +198,6 @@ class TestStreamCodegen(InductorTestCase):
                 CUDADeviceOpOverrides(),
                 """\
 with torch.cuda._DeviceGuard(0):
-    torch.cuda.set_device(0)
     default_stream = torch.cuda.current_stream()
     stream1 = _get_stream_by_index(3)
     with stream1:
@@ -209,7 +208,6 @@ with torch.cuda._DeviceGuard(0):
                 XPUDeviceOpOverrides(),
                 """\
 with torch.xpu._DeviceGuard(0):
-    torch.xpu.set_device(0)
     default_stream = torch.xpu.current_stream()
     stream1 = _get_stream_by_index(3)
     with stream1:
@@ -322,6 +320,26 @@ with torch.xpu._DeviceGuard(0):
 @xfailIfNoAcceleratorTriton
 class TestUserStreamCompile(InductorTestCase):
     """End-to-end tests for torch.compile with user stream contexts."""
+
+    @inductor_config.patch("graph_partition", False)
+    def test_single_stream_uses_fast_cuda_device_guard(self):
+        from torch._inductor.utils import run_and_get_code
+
+        def fn(x):
+            return torch.sin(x)
+
+        x = torch.randn(1024, device="cuda")
+        result, (code,) = run_and_get_code(torch.compile(fn), x)
+        self.assertEqual(result, fn(x))
+
+        call_code = code[code.find("def call(") :]
+        FileCheck().check("prev_device0, raw_stream0 = enter_cuda_device(0)").check(
+            "try:"
+        ).check("stream=raw_stream0").check("finally:").check(
+            "maybe_exchange_device(prev_device0)"
+        ).run(call_code)
+        self.assertNotIn("with torch.cuda._DeviceGuard(0)", call_code)
+        self.assertNotIn("raw_stream0 = get_raw_stream(0)", call_code)
 
     def test_compile_with_user_stream_context(self):
         """Test that user code with stream context compiles and runs correctly."""

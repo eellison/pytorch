@@ -658,6 +658,10 @@ def _coor_device_idx_ref(device_idx: int) -> int | str:
 class EnterDeviceContextManagerLine(WrapperLine):
     device_idx: int
     last_seen_device_guard_index: int | None
+    # Position in the output buffer where the guarded body starts, so the
+    # matching exit line can emit `pass` when nothing was generated inside.
+    # Keyword-only so subclasses keep their positional field order.
+    body_start: int | None = dataclasses.field(default=None, kw_only=True)
 
     def codegen(self, code: IndentedBuffer) -> None:
         if V.graph.cpp_wrapper:
@@ -697,19 +701,77 @@ class EnterDeviceContextManagerLine(WrapperLine):
                 idx = self.device_idx
             code.writeline(f"with {V.graph.device_ops.device_guard(idx)}:")
             code.do_indent()
-            code.writeline(V.graph.device_ops.set_device(idx))
+            if not V.graph.device_ops.device_guard_sets_device():
+                code.writeline(V.graph.device_ops.set_device(idx))
+            self.body_start = len(code._lines)
 
     def codegen_fx(self, converter: FxConverter) -> FxConversionFunc:
         return converter._generate_enter_device_context_manager
 
 
+@dataclasses.dataclass
 class ExitDeviceContextManagerLine(WrapperLine):
+    enter: EnterDeviceContextManagerLine | None = dataclasses.field(
+        default=None, kw_only=True
+    )
+
     def codegen(self, code: IndentedBuffer) -> None:
         if not V.graph.cpp_wrapper:
+            body_start = self.enter.body_start if self.enter is not None else None
+            _close_device_guard_body(code, body_start)
             code.do_unindent()
 
     def codegen_fx(self, converter: FxConverter) -> FxConversionFunc:
         return converter._generate_exit_device_context_manager
+
+
+def _close_device_guard_body(code: IndentedBuffer, body_start: int | None) -> None:
+    # A guarded region with no kernels (e.g. only zero-element buffers) must
+    # not leave the `with`/`try` block syntactically empty.
+    if body_start is not None and len(code._lines) == body_start:
+        code.writeline("pass")
+
+
+@dataclasses.dataclass
+class EnterFastCudaDeviceContextManagerLine(WrapperLine):
+    wrapper: PythonWrapperCodegen
+    device_idx: int
+    prev_device_var: str
+    body_start: int | None = None
+
+    def codegen(self, code: IndentedBuffer) -> None:
+        active = self.wrapper._raw_streams_from_fast_device_guard
+        active[self.device_idx] = active.get(self.device_idx, 0) + 1
+        self.wrapper.write_get_raw_stream.cache_clear()  # type: ignore[attr-defined]
+        raw_stream = get_raw_stream_name(self.device_idx)
+        code.writeline(
+            f"{self.prev_device_var}, {raw_stream} = enter_cuda_device({self.device_idx})"
+        )
+        code.writeline("try:")
+        code.do_indent()
+        self.body_start = len(code._lines)
+
+
+@dataclasses.dataclass
+class ExitFastCudaDeviceContextManagerLine(WrapperLine):
+    wrapper: PythonWrapperCodegen
+    enter: EnterFastCudaDeviceContextManagerLine
+
+    def codegen(self, code: IndentedBuffer) -> None:
+        _close_device_guard_body(code, self.enter.body_start)
+        code.do_unindent()
+        code.writeline("finally:")
+        code.do_indent()
+        code.writeline(f"maybe_exchange_device({self.enter.prev_device_var})")
+        code.do_unindent()
+        active = self.wrapper._raw_streams_from_fast_device_guard
+        device_idx = self.enter.device_idx
+        depth = active.get(device_idx, 0)
+        if depth <= 1:
+            active.pop(device_idx, None)
+        else:
+            active[device_idx] = depth - 1
+        self.wrapper.write_get_raw_stream.cache_clear()  # type: ignore[attr-defined]
 
 
 @dataclasses.dataclass
@@ -1676,6 +1738,8 @@ class PythonWrapperCodegen(CodeGen):
         # [device-as-parameter] CooR harness render mode, resolved once and cached:
         # None = unresolved, False = compile-on-one-rank off, else the current accelerator.
         self._coor_current_accelerator: torch.device | Literal[False] | None = None
+        self._device_guard_enter_lines: list[WrapperLine | None] = []
+        self._raw_streams_from_fast_device_guard: dict[int, int] = {}
         self.supports_intermediate_hooks = True
         self.user_defined_kernel_cache: dict[
             tuple[Any, ...], tuple[str, Any, dict[str, Any]]
@@ -1813,6 +1877,8 @@ class PythonWrapperCodegen(CodeGen):
                 empty_strided_cpu = torch._C._dynamo.guards._empty_strided_cpu
                 empty_strided_cpu_pinned = torch._C._dynamo.guards._empty_strided_cpu_pinned
                 empty_strided_cuda = torch._C._dynamo.guards._empty_strided_cuda
+                enter_cuda_device = torch._C._dynamo.guards._cuda_enter_device_get_raw_stream
+                maybe_exchange_device = torch._C._dynamo.guards._cuda_maybe_exchange_device
                 empty_strided_xpu = torch._C._dynamo.guards._empty_strided_xpu
                 empty_strided_mtia = torch._C._dynamo.guards._empty_strided_mtia
                 reinterpret_tensor = torch._C._dynamo.guards._reinterpret_tensor
@@ -2263,8 +2329,10 @@ class PythonWrapperCodegen(CodeGen):
     # that stream caching happens per graph instance. this
     # is important for nested subgraph codegening.
     def write_get_raw_stream(self, device_idx: int, graph_name: str) -> str:
-        self.write_get_raw_stream_header()
         name = get_raw_stream_name(device_idx)
+        if device_idx in self._raw_streams_from_fast_device_guard:
+            return name
+        self.write_get_raw_stream_header()
         if config.triton.autotune_at_compile_time:
             # compile-on-one-rank: resolve at runtime so the autotune block matches the
             # rank-agnostic call() body (see codegen_device_guard_enter).
@@ -2308,6 +2376,7 @@ class PythonWrapperCodegen(CodeGen):
         num_streams: int = 1,
         stream_idx_to_user_obj_idx: dict[int, int] | None = None,
     ) -> None:
+        enter_line: WrapperLine | None = None
         if num_streams > 1:
             if stream_idx_to_user_obj_idx is None:
                 raise AssertionError("expected stream_idx_to_user_obj_idx to be set")
@@ -2328,12 +2397,18 @@ class PythonWrapperCodegen(CodeGen):
                     setup_stream_cache=setup_stream_cache,
                 ),
             )
-        else:
-            self.writeline(
-                EnterDeviceContextManagerLine(
-                    device_idx, self.last_seen_device_guard_index
-                )
+        elif self._use_fast_cuda_device_guard(num_streams):
+            prev_device_var = f"prev_device{len(self._device_guard_enter_lines)}"
+            enter_line = EnterFastCudaDeviceContextManagerLine(
+                self, device_idx, prev_device_var
             )
+            self.writeline(enter_line)
+        else:
+            enter_line = EnterDeviceContextManagerLine(
+                device_idx, self.last_seen_device_guard_index
+            )
+            self.writeline(enter_line)
+        self._device_guard_enter_lines.append(enter_line)
         if config.triton.autotune_at_compile_time:
             # mimic logic of EnterDeviceContextManagerLine.codegen for the autotune code block
             self.write_triton_header_once()
@@ -2358,14 +2433,35 @@ class PythonWrapperCodegen(CodeGen):
         self._num_streams: int = num_streams
 
     def codegen_device_guard_exit(self) -> None:
-        if hasattr(self, "_num_streams") and self._num_streams > 1:
+        enter_line = (
+            self._device_guard_enter_lines.pop()
+            if self._device_guard_enter_lines
+            else None
+        )
+        if isinstance(enter_line, EnterFastCudaDeviceContextManagerLine):
+            self.writeline(ExitFastCudaDeviceContextManagerLine(self, enter_line))
+        elif hasattr(self, "_num_streams") and self._num_streams > 1:
             self.writeline(
                 ExitDeviceContextManagerWithStreamInfoLine(self._num_streams)
             )
         else:
-            self.writeline(ExitDeviceContextManagerLine())
+            if not isinstance(enter_line, (EnterDeviceContextManagerLine, type(None))):
+                raise AssertionError(f"unexpected device guard enter line {enter_line}")
+            self.writeline(ExitDeviceContextManagerLine(enter=enter_line))
         if config.triton.autotune_at_compile_time:
             self.kernel_autotune_calls.do_unindent()
+
+    def _use_fast_cuda_device_guard(self, num_streams: int) -> bool:
+        return (
+            num_streams == 1
+            and not V.graph.cpp_wrapper
+            and not V.graph.fx_wrapper
+            and not V.graph.aot_mode
+            and not config.triton.autotune_at_compile_time
+            and V.graph.device_type == "cuda"
+            and V.graph.device_ops.device_guard_sets_device()
+            and not is_codegen_graph_partition_subgraph(self)
+        )
 
     def codegen_cuda_stream_enter(
         self,

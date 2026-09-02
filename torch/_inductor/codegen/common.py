@@ -360,6 +360,9 @@ class DeviceOpOverrides:
             f"rank-portable."
         )
 
+    def device_guard_sets_device(self) -> bool:
+        return False
+
     def current_stream(self) -> str:
         raise NotImplementedError
 
