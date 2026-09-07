@@ -1,0 +1,150 @@
+/data/users/eellison/pytorch/torch/_dynamo/pgo.py:605: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+/data/users/eellison/pytorch/torch/_dynamo/pgo.py:605: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+mxfp8_e4m3                         dyn=False on: nested=0 k=1 eq_eager=True | off: k=1 eq_eager=True | on==off True
+/data/users/eellison/pytorch/torch/_dynamo/pgo.py:605: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+/data/users/eellison/pytorch/torch/_dynamo/pgo.py:605: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+rmsnorm+mxfp8_e4m3                 dyn=False on: nested=1 k=1 eq_eager=False | off: k=2 eq_eager=False | on==off True
+/data/users/eellison/pytorch/torch/_dynamo/pgo.py:605: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+/data/users/eellison/pytorch/torch/_dynamo/pgo.py:605: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+mxfp8_e4m3+to_blocked              dyn=False on: nested=0 k=2 eq_eager=True | off: k=2 eq_eager=True | on==off True
+/data/users/eellison/pytorch/torch/_dynamo/pgo.py:605: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+/data/users/eellison/pytorch/torch/_dynamo/pgo.py:605: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+mxfp8_e5m2                         dyn=False on: nested=0 k=1 eq_eager=True | off: k=1 eq_eager=True | on==off True
+/data/users/eellison/pytorch/torch/_dynamo/pgo.py:605: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+/data/users/eellison/pytorch/torch/_dynamo/pgo.py:605: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+rmsnorm+mxfp8_e5m2                 dyn=False on: nested=1 k=1 eq_eager=False | off: k=2 eq_eager=False | on==off True
+/data/users/eellison/pytorch/torch/_dynamo/pgo.py:605: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+/data/users/eellison/pytorch/torch/_dynamo/pgo.py:605: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+mxfp8_e5m2+to_blocked              dyn=False on: nested=0 k=2 eq_eager=True | off: k=2 eq_eager=True | on==off True
+/data/users/eellison/pytorch/torch/_dynamo/pgo.py:605: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+/data/users/eellison/pytorch/torch/_dynamo/pgo.py:605: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+mxfp4                              dyn=False on: nested=0 k=2 eq_eager=True | off: k=2 eq_eager=True | on==off True
+/data/users/eellison/pytorch/torch/_dynamo/pgo.py:605: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+/data/users/eellison/pytorch/torch/_dynamo/pgo.py:605: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+rmsnorm+mxfp4                      dyn=False on: nested=1 k=1 eq_eager=False | off: k=3 eq_eager=False | on==off True
+/data/users/eellison/pytorch/torch/_dynamo/pgo.py:605: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+/data/users/eellison/pytorch/torch/_dynamo/pgo.py:605: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+mxfp4+to_blocked                   dyn=False on: nested=0 k=3 eq_eager=True | off: k=3 eq_eager=True | on==off True
+/data/users/eellison/pytorch/torch/_dynamo/pgo.py:605: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+/data/users/eellison/pytorch/torch/_dynamo/pgo.py:605: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+mxfp4_byte                         dyn=True  on: nested=0 k=2 eq_eager=True | off: k=2 eq_eager=True | on==off True
+/data/users/eellison/pytorch/torch/_dynamo/pgo.py:605: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+/data/users/eellison/pytorch/torch/_dynamo/pgo.py:605: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+rmsnorm+mxfp4_byte                 dyn=True  on: nested=1 k=1 eq_eager=False | off: k=2 eq_eager=False | on==off True
+/data/users/eellison/pytorch/torch/_dynamo/pgo.py:605: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+/data/users/eellison/pytorch/torch/_dynamo/pgo.py:605: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+mxfp4_byte+to_blocked              dyn=True  on: nested=0 k=3 eq_eager=True | off: k=3 eq_eager=True | on==off True
+/data/users/eellison/pytorch/torch/_dynamo/pgo.py:605: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+/data/users/eellison/pytorch/torch/_dynamo/pgo.py:605: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+mxfp6_e2m3                         dyn=True  on: nested=0 k=2 eq_eager=True | off: k=2 eq_eager=True | on==off True
+/data/users/eellison/pytorch/torch/_dynamo/pgo.py:605: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+/data/users/eellison/pytorch/torch/_dynamo/pgo.py:605: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+rmsnorm+mxfp6_e2m3                 dyn=True  on: nested=1 k=1 eq_eager=False | off: k=2 eq_eager=False | on==off True
+/data/users/eellison/pytorch/torch/_dynamo/pgo.py:605: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+/data/users/eellison/pytorch/torch/_dynamo/pgo.py:605: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+mxfp6_e2m3+to_blocked              dyn=True  on: nested=0 k=3 eq_eager=True | off: k=3 eq_eager=True | on==off True
+/data/users/eellison/pytorch/torch/_dynamo/pgo.py:605: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+/data/users/eellison/pytorch/torch/_dynamo/pgo.py:605: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+mxfp6_e3m2                         dyn=True  on: nested=0 k=2 eq_eager=True | off: k=2 eq_eager=True | on==off True
+/data/users/eellison/pytorch/torch/_dynamo/pgo.py:605: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+/data/users/eellison/pytorch/torch/_dynamo/pgo.py:605: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+rmsnorm+mxfp6_e3m2                 dyn=True  on: nested=1 k=1 eq_eager=False | off: k=2 eq_eager=False | on==off True
+/data/users/eellison/pytorch/torch/_dynamo/pgo.py:605: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+/data/users/eellison/pytorch/torch/_dynamo/pgo.py:605: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+mxfp6_e3m2+to_blocked              dyn=True  on: nested=0 k=3 eq_eager=True | off: k=3 eq_eager=True | on==off True
+/data/users/eellison/pytorch/torch/_dynamo/pgo.py:605: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+/data/users/eellison/pytorch/torch/_dynamo/pgo.py:605: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+mxfp6_e2m3_packed                  dyn=True  on: nested=0 k=3 eq_eager=True | off: k=3 eq_eager=True | on==off True
+/data/users/eellison/pytorch/torch/_dynamo/pgo.py:605: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+/data/users/eellison/pytorch/torch/_dynamo/pgo.py:605: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+rmsnorm+mxfp6_e2m3_packed          dyn=True  on: nested=1 k=2 eq_eager=False | off: k=3 eq_eager=False | on==off True
+/data/users/eellison/pytorch/torch/_dynamo/pgo.py:605: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+/data/users/eellison/pytorch/torch/_dynamo/pgo.py:605: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+mxfp6_e2m3_packed+to_blocked       dyn=True  on: nested=0 k=4 eq_eager=True | off: k=4 eq_eager=True | on==off True
+/data/users/eellison/pytorch/torch/_dynamo/pgo.py:605: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+/data/users/eellison/pytorch/torch/_dynamo/pgo.py:605: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+mxfp6_e3m2_packed                  dyn=True  on: nested=0 k=3 eq_eager=True | off: k=3 eq_eager=True | on==off True
+/data/users/eellison/pytorch/torch/_dynamo/pgo.py:605: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+/data/users/eellison/pytorch/torch/_dynamo/pgo.py:605: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+rmsnorm+mxfp6_e3m2_packed          dyn=True  on: nested=1 k=2 eq_eager=False | off: k=3 eq_eager=False | on==off True
+/data/users/eellison/pytorch/torch/_dynamo/pgo.py:605: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+/data/users/eellison/pytorch/torch/_dynamo/pgo.py:605: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+mxfp6_e3m2_packed+to_blocked       dyn=True  on: nested=0 k=4 eq_eager=True | off: k=4 eq_eager=True | on==off True
+/data/users/eellison/pytorch/torch/_dynamo/pgo.py:605: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+/data/users/eellison/pytorch/torch/_dynamo/pgo.py:605: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+nvfp4                              dyn=False on: nested=0 k=3 eq_eager=True | off: k=3 eq_eager=True | on==off True
+/data/users/eellison/pytorch/torch/_dynamo/pgo.py:605: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+/data/users/eellison/pytorch/torch/_dynamo/pgo.py:605: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+rmsnorm+nvfp4                      dyn=False on: nested=1 k=2 eq_eager=False | off: k=4 eq_eager=False | on==off True
+/data/users/eellison/pytorch/torch/_dynamo/pgo.py:605: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+/data/users/eellison/pytorch/torch/_dynamo/pgo.py:605: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+mxfp8_dim0                         dyn=False on: nested=0 k=2 eq_eager=True | off: k=2 eq_eager=True | on==off True
+/data/users/eellison/pytorch/torch/_dynamo/pgo.py:605: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+/data/users/eellison/pytorch/torch/_dynamo/pgo.py:605: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+rmsnorm+mxfp8_dim0                 dyn=False on: nested=0 k=3 eq_eager=False | off: k=3 eq_eager=False | on==off True
+/data/users/eellison/pytorch/torch/_dynamo/pgo.py:605: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+/data/users/eellison/pytorch/torch/_dynamo/pgo.py:605: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+nvfp4_per_tensor                   dyn=False on: nested=0 k=4 eq_eager=False | off: k=4 eq_eager=False | on==off True
+/data/users/eellison/pytorch/torch/_dynamo/pgo.py:605: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+/data/users/eellison/pytorch/torch/_dynamo/pgo.py:605: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+rmsnorm+nvfp4_per_tensor           dyn=False on: nested=0 k=4 eq_eager=False | off: k=4 eq_eager=False | on==off True

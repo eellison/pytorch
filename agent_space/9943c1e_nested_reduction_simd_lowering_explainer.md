@@ -1,0 +1,11 @@
+# Explainer for 9943c1e98713: Lower Nested Reductions in SIMD Codegen
+
+Commit: `9943c1e98713250b9ebf2f840a490cf9a86cdbda`
+
+This commit adds the first SIMD/Triton lowering for nested grouped reductions. The target pattern is an outer reduction such as LayerNorm/RMSNorm over `D`, followed by a local grouped reduction over a small block inside that same `D` axis, for example `x_normed.reshape(B, D // G, G).amax(-1)`. Before this commit, the two reductions used different iteration views of the same logical data: the outer stage saw `(B, D)`, while the grouped stage saw `(B, D // G, G)`. That mismatch meant Inductor had to materialize the intermediate and launch a separate grouped-reduction kernel.
+
+The new lowering keeps the outer reduction as the owner of the Triton kernel's grid, tiling, and persistent/looped reduction choice. After the ordinary SIMD outer reduction is emitted, codegen remaps the grouped reduction body into the same parent tile. For this commit's supported case, the local group splits the parent R axis: `[XBLOCK, RBLOCK]` is reshaped to `[XBLOCK, RBLOCK / G, G]`, then Triton reduces axis 2 to produce `[XBLOCK, RBLOCK / G]`. The kernel also forces `min_rblock = G` so the parent tile always contains at least one whole local group.
+
+Most of the implementation is in `torch/_inductor/codegen/simd.py`. `_GroupedReductionLayout` describes the R-axis grouped geometry, derived iteration families switch codegen between parent-full and reduced-output views, and the nested ops handlers remap loads/stores while emitting reshape, reduce, and broadcast operations through new helpers in `torch/_inductor/codegen/triton.py`. Scheduler dispatch is updated so `FusedNestedReductions` routes to `codegen_nested_reduction`, is excluded from combo kernels, and increments `metrics.codegen_nested_reduction`.
+
+The scope is intentionally conservative. This commit enables `triton.nested_reduction` by default, but only supports grouped reductions that split the parent R axis; `GroupedAxis.X` is still rejected here. Group size must be static, power-of-two, and within the existing min-block limits, and nested lowering still excludes higher-rank grouped layouts, multiple grouped reductions, split reductions, cooperative reduction, C++ wrapper support, and tuple/stateful reductions such as argmax or Welford variance.

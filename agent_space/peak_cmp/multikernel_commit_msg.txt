@@ -1,0 +1,42 @@
+[inductor] Support multi-kernel for nested reductions
+
+Nested reduction codegen hard-disabled multi-kernel at both of its sites
+(the grouped path and the standalone sub-parent epilogue path) by passing
+disable_multi_kernel and taking the first kernel choice. The body codegen
+is already re-runnable per kernel choice, exactly like codegen_node_schedule,
+so both sites now iterate create_kernel_choices, rebuilding the per-kernel
+state (min_rblock/min_xblock, the grouped layout and the value resolver)
+for each choice. The finalizer merges workspaces, defines each kernel and
+wraps them in MultiKernel when there is more than one. The
+disable_multi_kernel kwarg had no other user and is removed.
+
+Only two forms are ever produced, looped and persistent, and only when the
+base kernel is persistent, since add_multi_kernel_choices offers a
+non-persistent alternative to a persistent base and never the reverse.
+Nested reduction forces override_cooperative_reduction off, so the
+cooperative axis stays dead. cpp_wrapper works with
+triton.autotune_at_compile_time, which every multi-kernel cpp_wrapper path
+requires.
+
+This matters in practice: for RMSNorm -> MXFP8 at widths of 2048-4096 the
+single-form nested kernel is looped (INNER persistent threshold 1024) and
+7-16% slower than not fusing, while the persistent form is 8-20% faster;
+multi-kernel measures both at runtime and picks persistent.
+
+The two existing *_multi_kernel_form tests pinned the disabled behaviour;
+they now also check the wrapper for both forms and one dispatcher. A
+test-harness bug is fixed alongside: TRITON_KERNEL_RE chunks run from one
+@triton_heuristics to the next, so a chunk trails the following kernel's
+definition, and the old substring filter matched the looped kernel against
+the persistent signature once two forms existed. It now filters on the
+kernel's own name.
+
+Test Plan:
+
+```
+python test/inductor/test_nested_reduction.py
+python test/inductor/test_multi_kernel.py
+python test/inductor/test_loop_ordering.py
+```
+
+Authored with an AI assistant.

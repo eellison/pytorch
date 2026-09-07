@@ -1,0 +1,599 @@
+[
+ {
+  "case": "mxfp8_e4m3",
+  "dynamic": false,
+  "on_nested": 0,
+  "on_kernels": 1,
+  "on_names": [
+   "triton_per_fused__to_copy_abs_add_amax_bitwise_and_bitwise_left_shift_bitwise_right_shift_clamp_div_isnan_ne_scalar_tensor_unsqueeze_view_where_0"
+  ],
+  "on_eq_eager": true,
+  "off_nested": 0,
+  "off_kernels": 1,
+  "off_names": [
+   "triton_per_fused__to_copy_abs_add_amax_bitwise_and_bitwise_left_shift_bitwise_right_shift_clamp_div_isnan_ne_scalar_tensor_unsqueeze_view_where_0"
+  ],
+  "off_eq_eager": true,
+  "on_eq_off": true
+ },
+ {
+  "case": "rmsnorm+mxfp8_e4m3",
+  "dynamic": false,
+  "on_nested": 1,
+  "on_kernels": 1,
+  "on_names": [
+   "triton_red_fused__fused_rms_norm_0"
+  ],
+  "on_eq_eager": false,
+  "off_nested": 0,
+  "off_kernels": 2,
+  "off_names": [
+   "triton_red_fused__fused_rms_norm_0",
+   "triton_per_fused__fused_rms_norm__to_copy_abs_add_amax_bitwise_and_bitwise_left_shift_bitwise_right_shift_clamp_div_isnan_ne_scalar_tensor_unsqueeze_view_where_1"
+  ],
+  "off_eq_eager": false,
+  "on_eq_off": true
+ },
+ {
+  "case": "mxfp8_e4m3+to_blocked",
+  "dynamic": false,
+  "on_nested": 0,
+  "on_kernels": 2,
+  "on_names": [
+   "triton_per_fused__to_copy_abs_add_amax_bitwise_and_bitwise_left_shift_bitwise_right_shift_clamp_div_isnan_ne_scalar_tensor_unsqueeze_view_where_0",
+   "triton_poi_fused__to_copy__unsafe_view_add_bitwise_and_bitwise_right_shift_clamp_clone_div_isnan_ne_permute_scalar_tensor_squeeze_transpose_unsqueeze_view_where_1"
+  ],
+  "on_eq_eager": true,
+  "off_nested": 0,
+  "off_kernels": 2,
+  "off_names": [
+   "triton_per_fused__to_copy_abs_add_amax_bitwise_and_bitwise_left_shift_bitwise_right_shift_clamp_div_isnan_ne_scalar_tensor_unsqueeze_view_where_0",
+   "triton_poi_fused__to_copy__unsafe_view_add_bitwise_and_bitwise_right_shift_clamp_clone_div_isnan_ne_permute_scalar_tensor_squeeze_transpose_unsqueeze_view_where_1"
+  ],
+  "off_eq_eager": true,
+  "on_eq_off": true
+ },
+ {
+  "case": "mxfp8_e5m2",
+  "dynamic": false,
+  "on_nested": 0,
+  "on_kernels": 1,
+  "on_names": [
+   "triton_per_fused__to_copy_abs_add_amax_bitwise_and_bitwise_left_shift_bitwise_right_shift_clamp_div_isnan_ne_scalar_tensor_unsqueeze_view_where_0"
+  ],
+  "on_eq_eager": true,
+  "off_nested": 0,
+  "off_kernels": 1,
+  "off_names": [
+   "triton_per_fused__to_copy_abs_add_amax_bitwise_and_bitwise_left_shift_bitwise_right_shift_clamp_div_isnan_ne_scalar_tensor_unsqueeze_view_where_0"
+  ],
+  "off_eq_eager": true,
+  "on_eq_off": true
+ },
+ {
+  "case": "rmsnorm+mxfp8_e5m2",
+  "dynamic": false,
+  "on_nested": 1,
+  "on_kernels": 1,
+  "on_names": [
+   "triton_red_fused__fused_rms_norm_0"
+  ],
+  "on_eq_eager": false,
+  "off_nested": 0,
+  "off_kernels": 2,
+  "off_names": [
+   "triton_red_fused__fused_rms_norm_0",
+   "triton_per_fused__fused_rms_norm__to_copy_abs_add_amax_bitwise_and_bitwise_left_shift_bitwise_right_shift_clamp_div_isnan_ne_scalar_tensor_unsqueeze_view_where_1"
+  ],
+  "off_eq_eager": false,
+  "on_eq_off": true
+ },
+ {
+  "case": "mxfp8_e5m2+to_blocked",
+  "dynamic": false,
+  "on_nested": 0,
+  "on_kernels": 2,
+  "on_names": [
+   "triton_per_fused__to_copy_abs_add_amax_bitwise_and_bitwise_left_shift_bitwise_right_shift_clamp_div_isnan_ne_scalar_tensor_unsqueeze_view_where_0",
+   "triton_poi_fused__to_copy__unsafe_view_add_bitwise_and_bitwise_right_shift_clamp_clone_div_isnan_ne_permute_scalar_tensor_squeeze_transpose_unsqueeze_view_where_1"
+  ],
+  "on_eq_eager": true,
+  "off_nested": 0,
+  "off_kernels": 2,
+  "off_names": [
+   "triton_per_fused__to_copy_abs_add_amax_bitwise_and_bitwise_left_shift_bitwise_right_shift_clamp_div_isnan_ne_scalar_tensor_unsqueeze_view_where_0",
+   "triton_poi_fused__to_copy__unsafe_view_add_bitwise_and_bitwise_right_shift_clamp_clone_div_isnan_ne_permute_scalar_tensor_squeeze_transpose_unsqueeze_view_where_1"
+  ],
+  "off_eq_eager": true,
+  "on_eq_off": true
+ },
+ {
+  "case": "mxfp4",
+  "dynamic": false,
+  "on_nested": 0,
+  "on_kernels": 2,
+  "on_names": [
+   "triton_per_fused___rshift____to_copy_abs_add_amax_bitwise_and_bitwise_left_shift_bitwise_or_bitwise_right_shift_clamp_div_full_like_ge_isnan_logical_and_logical_not_logical_or_lt_scalar_tensor_sub_unsqueeze_view_where_0",
+   "triton_poi_fused___lshift___bitwise_or_slice_view_1"
+  ],
+  "on_eq_eager": true,
+  "off_nested": 0,
+  "off_kernels": 2,
+  "off_names": [
+   "triton_per_fused___rshift____to_copy_abs_add_amax_bitwise_and_bitwise_left_shift_bitwise_or_bitwise_right_shift_clamp_div_full_like_ge_isnan_logical_and_logical_not_logical_or_lt_scalar_tensor_sub_unsqueeze_view_where_0",
+   "triton_poi_fused___lshift___bitwise_or_slice_view_1"
+  ],
+  "off_eq_eager": true,
+  "on_eq_off": true
+ },
+ {
+  "case": "rmsnorm+mxfp4",
+  "dynamic": false,
+  "on_nested": 1,
+  "on_kernels": 1,
+  "on_names": [
+   "triton_red_fused__fused_rms_norm_0"
+  ],
+  "on_eq_eager": false,
+  "off_nested": 0,
+  "off_kernels": 3,
+  "off_names": [
+   "triton_red_fused__fused_rms_norm_0",
+   "triton_per_fused___rshift____fused_rms_norm__to_copy_abs_add_amax_bitwise_and_bitwise_left_shift_bitwise_or_bitwise_right_shift_clamp_div_full_like_ge_isnan_logical_and_logical_not_logical_or_lt_scalar_tensor_sub_unsqueeze_view_where_1",
+   "triton_poi_fused___lshift_____rshift____to_copy_add_bitwise_and_bitwise_or_full_like_ge_logical_and_logical_not_logical_or_lt_slice_view_where_2"
+  ],
+  "off_eq_eager": false,
+  "on_eq_off": true
+ },
+ {
+  "case": "mxfp4+to_blocked",
+  "dynamic": false,
+  "on_nested": 0,
+  "on_kernels": 3,
+  "on_names": [
+   "triton_per_fused___rshift____to_copy_abs_add_amax_bitwise_and_bitwise_left_shift_bitwise_or_bitwise_right_shift_clamp_div_full_like_ge_isnan_logical_and_logical_not_logical_or_lt_scalar_tensor_sub_unsqueeze_view_where_0",
+   "triton_poi_fused___lshift___bitwise_or_slice_view_1",
+   "triton_poi_fused__to_copy__unsafe_view_add_bitwise_and_bitwise_right_shift_clamp_clone_isnan_permute_scalar_tensor_squeeze_sub_transpose_unsqueeze_view_where_2"
+  ],
+  "on_eq_eager": true,
+  "off_nested": 0,
+  "off_kernels": 3,
+  "off_names": [
+   "triton_per_fused___rshift____to_copy_abs_add_amax_bitwise_and_bitwise_left_shift_bitwise_or_bitwise_right_shift_clamp_div_full_like_ge_isnan_logical_and_logical_not_logical_or_lt_scalar_tensor_sub_unsqueeze_view_where_0",
+   "triton_poi_fused___lshift___bitwise_or_slice_view_1",
+   "triton_poi_fused__to_copy__unsafe_view_add_bitwise_and_bitwise_right_shift_clamp_clone_isnan_permute_scalar_tensor_squeeze_sub_transpose_unsqueeze_view_where_2"
+  ],
+  "off_eq_eager": true,
+  "on_eq_off": true
+ },
+ {
+  "case": "mxfp4_byte",
+  "dynamic": true,
+  "on_nested": 0,
+  "on_kernels": 2,
+  "on_names": [
+   "triton_red_fused__to_copy_abs_add_amax_bitwise_and_bitwise_right_shift_clamp_isnan_scalar_tensor_sub_unsqueeze_view_where_0",
+   "triton_poi_fused___rshift____to_copy_add_bitwise_and_bitwise_left_shift_bitwise_or_bitwise_right_shift_clamp_div_full_like_ge_isnan_logical_and_logical_not_logical_or_lt_scalar_tensor_sub_unsqueeze_view_where_1"
+  ],
+  "on_eq_eager": true,
+  "off_nested": 0,
+  "off_kernels": 2,
+  "off_names": [
+   "triton_red_fused__to_copy_abs_add_amax_bitwise_and_bitwise_right_shift_clamp_isnan_scalar_tensor_sub_unsqueeze_view_where_0",
+   "triton_poi_fused___rshift____to_copy_add_bitwise_and_bitwise_left_shift_bitwise_or_bitwise_right_shift_clamp_div_full_like_ge_isnan_logical_and_logical_not_logical_or_lt_scalar_tensor_sub_unsqueeze_view_where_1"
+  ],
+  "off_eq_eager": true,
+  "on_eq_off": true
+ },
+ {
+  "case": "rmsnorm+mxfp4_byte",
+  "dynamic": true,
+  "on_nested": 1,
+  "on_kernels": 1,
+  "on_names": [
+   "triton_red_fused__fused_rms_norm_0"
+  ],
+  "on_eq_eager": false,
+  "off_nested": 0,
+  "off_kernels": 2,
+  "off_names": [
+   "triton_red_fused__fused_rms_norm_0",
+   "triton_per_fused___rshift____fused_rms_norm__to_copy_abs_add_amax_bitwise_and_bitwise_left_shift_bitwise_or_bitwise_right_shift_clamp_div_full_like_ge_isnan_logical_and_logical_not_logical_or_lt_scalar_tensor_sub_unsqueeze_view_where_1"
+  ],
+  "off_eq_eager": false,
+  "on_eq_off": true
+ },
+ {
+  "case": "mxfp4_byte+to_blocked",
+  "dynamic": true,
+  "on_nested": 0,
+  "on_kernels": 3,
+  "on_names": [
+   "triton_per_fused_abs_amax_view_0",
+   "triton_poi_fused___rshift____to_copy_add_bitwise_and_bitwise_left_shift_bitwise_or_bitwise_right_shift_clamp_div_full_like_ge_isnan_logical_and_logical_not_logical_or_lt_scalar_tensor_sub_unsqueeze_view_where_1",
+   "triton_poi_fused__to_copy__unsafe_view_add_bitwise_and_bitwise_right_shift_clamp_clone_isnan_permute_scalar_tensor_squeeze_sub_transpose_unsqueeze_view_where_2"
+  ],
+  "on_eq_eager": true,
+  "off_nested": 0,
+  "off_kernels": 3,
+  "off_names": [
+   "triton_per_fused_abs_amax_view_0",
+   "triton_poi_fused___rshift____to_copy_add_bitwise_and_bitwise_left_shift_bitwise_or_bitwise_right_shift_clamp_div_full_like_ge_isnan_logical_and_logical_not_logical_or_lt_scalar_tensor_sub_unsqueeze_view_where_1",
+   "triton_poi_fused__to_copy__unsafe_view_add_bitwise_and_bitwise_right_shift_clamp_clone_isnan_permute_scalar_tensor_squeeze_sub_transpose_unsqueeze_view_where_2"
+  ],
+  "off_eq_eager": true,
+  "on_eq_off": true
+ },
+ {
+  "case": "mxfp6_e2m3",
+  "dynamic": true,
+  "on_nested": 0,
+  "on_kernels": 2,
+  "on_names": [
+   "triton_red_fused__to_copy_abs_add_amax_bitwise_and_bitwise_right_shift_clamp_isnan_scalar_tensor_sub_unsqueeze_view_where_0",
+   "triton_poi_fused___rshift____to_copy_add_bitwise_and_bitwise_left_shift_bitwise_or_bitwise_right_shift_clamp_div_full_like_ge_isnan_logical_and_logical_not_logical_or_lt_scalar_tensor_sub_unsqueeze_view_where_1"
+  ],
+  "on_eq_eager": true,
+  "off_nested": 0,
+  "off_kernels": 2,
+  "off_names": [
+   "triton_red_fused__to_copy_abs_add_amax_bitwise_and_bitwise_right_shift_clamp_isnan_scalar_tensor_sub_unsqueeze_view_where_0",
+   "triton_poi_fused___rshift____to_copy_add_bitwise_and_bitwise_left_shift_bitwise_or_bitwise_right_shift_clamp_div_full_like_ge_isnan_logical_and_logical_not_logical_or_lt_scalar_tensor_sub_unsqueeze_view_where_1"
+  ],
+  "off_eq_eager": true,
+  "on_eq_off": true
+ },
+ {
+  "case": "rmsnorm+mxfp6_e2m3",
+  "dynamic": true,
+  "on_nested": 1,
+  "on_kernels": 1,
+  "on_names": [
+   "triton_red_fused__fused_rms_norm_0"
+  ],
+  "on_eq_eager": false,
+  "off_nested": 0,
+  "off_kernels": 2,
+  "off_names": [
+   "triton_red_fused__fused_rms_norm_0",
+   "triton_per_fused___rshift____fused_rms_norm__to_copy_abs_add_amax_bitwise_and_bitwise_left_shift_bitwise_or_bitwise_right_shift_clamp_div_full_like_ge_isnan_logical_and_logical_not_logical_or_lt_scalar_tensor_sub_unsqueeze_view_where_1"
+  ],
+  "off_eq_eager": false,
+  "on_eq_off": true
+ },
+ {
+  "case": "mxfp6_e2m3+to_blocked",
+  "dynamic": true,
+  "on_nested": 0,
+  "on_kernels": 3,
+  "on_names": [
+   "triton_per_fused_abs_amax_view_0",
+   "triton_poi_fused___rshift____to_copy_add_bitwise_and_bitwise_left_shift_bitwise_or_bitwise_right_shift_clamp_div_full_like_ge_isnan_logical_and_logical_not_logical_or_lt_scalar_tensor_sub_unsqueeze_view_where_1",
+   "triton_poi_fused__to_copy__unsafe_view_add_bitwise_and_bitwise_right_shift_clamp_clone_isnan_permute_scalar_tensor_squeeze_sub_transpose_unsqueeze_view_where_2"
+  ],
+  "on_eq_eager": true,
+  "off_nested": 0,
+  "off_kernels": 3,
+  "off_names": [
+   "triton_per_fused_abs_amax_view_0",
+   "triton_poi_fused___rshift____to_copy_add_bitwise_and_bitwise_left_shift_bitwise_or_bitwise_right_shift_clamp_div_full_like_ge_isnan_logical_and_logical_not_logical_or_lt_scalar_tensor_sub_unsqueeze_view_where_1",
+   "triton_poi_fused__to_copy__unsafe_view_add_bitwise_and_bitwise_right_shift_clamp_clone_isnan_permute_scalar_tensor_squeeze_sub_transpose_unsqueeze_view_where_2"
+  ],
+  "off_eq_eager": true,
+  "on_eq_off": true
+ },
+ {
+  "case": "mxfp6_e3m2",
+  "dynamic": true,
+  "on_nested": 0,
+  "on_kernels": 2,
+  "on_names": [
+   "triton_red_fused__to_copy_abs_add_amax_bitwise_and_bitwise_right_shift_clamp_isnan_scalar_tensor_sub_unsqueeze_view_where_0",
+   "triton_poi_fused___rshift____to_copy_add_bitwise_and_bitwise_left_shift_bitwise_or_bitwise_right_shift_clamp_div_full_like_ge_isnan_logical_and_logical_not_logical_or_lt_scalar_tensor_sub_unsqueeze_view_where_1"
+  ],
+  "on_eq_eager": true,
+  "off_nested": 0,
+  "off_kernels": 2,
+  "off_names": [
+   "triton_red_fused__to_copy_abs_add_amax_bitwise_and_bitwise_right_shift_clamp_isnan_scalar_tensor_sub_unsqueeze_view_where_0",
+   "triton_poi_fused___rshift____to_copy_add_bitwise_and_bitwise_left_shift_bitwise_or_bitwise_right_shift_clamp_div_full_like_ge_isnan_logical_and_logical_not_logical_or_lt_scalar_tensor_sub_unsqueeze_view_where_1"
+  ],
+  "off_eq_eager": true,
+  "on_eq_off": true
+ },
+ {
+  "case": "rmsnorm+mxfp6_e3m2",
+  "dynamic": true,
+  "on_nested": 1,
+  "on_kernels": 1,
+  "on_names": [
+   "triton_red_fused__fused_rms_norm_0"
+  ],
+  "on_eq_eager": false,
+  "off_nested": 0,
+  "off_kernels": 2,
+  "off_names": [
+   "triton_red_fused__fused_rms_norm_0",
+   "triton_per_fused___rshift____fused_rms_norm__to_copy_abs_add_amax_bitwise_and_bitwise_left_shift_bitwise_or_bitwise_right_shift_clamp_div_full_like_ge_isnan_logical_and_logical_not_logical_or_lt_scalar_tensor_sub_unsqueeze_view_where_1"
+  ],
+  "off_eq_eager": false,
+  "on_eq_off": true
+ },
+ {
+  "case": "mxfp6_e3m2+to_blocked",
+  "dynamic": true,
+  "on_nested": 0,
+  "on_kernels": 3,
+  "on_names": [
+   "triton_per_fused_abs_amax_view_0",
+   "triton_poi_fused___rshift____to_copy_add_bitwise_and_bitwise_left_shift_bitwise_or_bitwise_right_shift_clamp_div_full_like_ge_isnan_logical_and_logical_not_logical_or_lt_scalar_tensor_sub_unsqueeze_view_where_1",
+   "triton_poi_fused__to_copy__unsafe_view_add_bitwise_and_bitwise_right_shift_clamp_clone_isnan_permute_scalar_tensor_squeeze_sub_transpose_unsqueeze_view_where_2"
+  ],
+  "on_eq_eager": true,
+  "off_nested": 0,
+  "off_kernels": 3,
+  "off_names": [
+   "triton_per_fused_abs_amax_view_0",
+   "triton_poi_fused___rshift____to_copy_add_bitwise_and_bitwise_left_shift_bitwise_or_bitwise_right_shift_clamp_div_full_like_ge_isnan_logical_and_logical_not_logical_or_lt_scalar_tensor_sub_unsqueeze_view_where_1",
+   "triton_poi_fused__to_copy__unsafe_view_add_bitwise_and_bitwise_right_shift_clamp_clone_isnan_permute_scalar_tensor_squeeze_sub_transpose_unsqueeze_view_where_2"
+  ],
+  "off_eq_eager": true,
+  "on_eq_off": true
+ },
+ {
+  "case": "mxfp6_e2m3_packed",
+  "dynamic": true,
+  "on_nested": 0,
+  "on_kernels": 3,
+  "on_names": [
+   "triton_red_fused__to_copy_abs_add_amax_bitwise_and_bitwise_right_shift_clamp_isnan_scalar_tensor_sub_unsqueeze_view_where_0",
+   "triton_poi_fused___rshift____to_copy_add_bitwise_and_bitwise_left_shift_bitwise_or_bitwise_right_shift_clamp_div_full_like_ge_isnan_logical_and_logical_not_logical_or_lt_scalar_tensor_sub_unsqueeze_view_where_1",
+   "triton_poi_fused___lshift_____rshift___bitwise_or_select_stack_view_2"
+  ],
+  "on_eq_eager": true,
+  "off_nested": 0,
+  "off_kernels": 3,
+  "off_names": [
+   "triton_red_fused__to_copy_abs_add_amax_bitwise_and_bitwise_right_shift_clamp_isnan_scalar_tensor_sub_unsqueeze_view_where_0",
+   "triton_poi_fused___rshift____to_copy_add_bitwise_and_bitwise_left_shift_bitwise_or_bitwise_right_shift_clamp_div_full_like_ge_isnan_logical_and_logical_not_logical_or_lt_scalar_tensor_sub_unsqueeze_view_where_1",
+   "triton_poi_fused___lshift_____rshift___bitwise_or_select_stack_view_2"
+  ],
+  "off_eq_eager": true,
+  "on_eq_off": true
+ },
+ {
+  "case": "rmsnorm+mxfp6_e2m3_packed",
+  "dynamic": true,
+  "on_nested": 1,
+  "on_kernels": 2,
+  "on_names": [
+   "triton_red_fused__fused_rms_norm_0",
+   "triton_poi_fused___lshift_____rshift____to_copy_add_bitwise_and_bitwise_or_full_like_ge_logical_and_logical_not_logical_or_lt_select_stack_view_where_1"
+  ],
+  "on_eq_eager": false,
+  "off_nested": 0,
+  "off_kernels": 3,
+  "off_names": [
+   "triton_red_fused__fused_rms_norm_0",
+   "triton_per_fused___rshift____fused_rms_norm__to_copy_abs_add_amax_bitwise_and_bitwise_left_shift_bitwise_or_bitwise_right_shift_clamp_div_full_like_ge_isnan_logical_and_logical_not_logical_or_lt_scalar_tensor_sub_unsqueeze_view_where_1",
+   "triton_poi_fused___lshift_____rshift____to_copy_add_bitwise_and_bitwise_or_full_like_ge_logical_and_logical_not_logical_or_lt_select_stack_view_where_2"
+  ],
+  "off_eq_eager": false,
+  "on_eq_off": true
+ },
+ {
+  "case": "mxfp6_e2m3_packed+to_blocked",
+  "dynamic": true,
+  "on_nested": 0,
+  "on_kernels": 4,
+  "on_names": [
+   "triton_per_fused_abs_amax_view_0",
+   "triton_poi_fused___rshift____to_copy_add_bitwise_and_bitwise_left_shift_bitwise_or_bitwise_right_shift_clamp_div_full_like_ge_isnan_logical_and_logical_not_logical_or_lt_scalar_tensor_sub_unsqueeze_view_where_1",
+   "triton_poi_fused___lshift_____rshift___bitwise_or_select_stack_view_2",
+   "triton_poi_fused__to_copy__unsafe_view_add_bitwise_and_bitwise_right_shift_clamp_clone_isnan_permute_scalar_tensor_squeeze_sub_transpose_unsqueeze_view_where_3"
+  ],
+  "on_eq_eager": true,
+  "off_nested": 0,
+  "off_kernels": 4,
+  "off_names": [
+   "triton_per_fused_abs_amax_view_0",
+   "triton_poi_fused___rshift____to_copy_add_bitwise_and_bitwise_left_shift_bitwise_or_bitwise_right_shift_clamp_div_full_like_ge_isnan_logical_and_logical_not_logical_or_lt_scalar_tensor_sub_unsqueeze_view_where_1",
+   "triton_poi_fused___lshift_____rshift___bitwise_or_select_stack_view_2",
+   "triton_poi_fused__to_copy__unsafe_view_add_bitwise_and_bitwise_right_shift_clamp_clone_isnan_permute_scalar_tensor_squeeze_sub_transpose_unsqueeze_view_where_3"
+  ],
+  "off_eq_eager": true,
+  "on_eq_off": true
+ },
+ {
+  "case": "mxfp6_e3m2_packed",
+  "dynamic": true,
+  "on_nested": 0,
+  "on_kernels": 3,
+  "on_names": [
+   "triton_red_fused__to_copy_abs_add_amax_bitwise_and_bitwise_right_shift_clamp_isnan_scalar_tensor_sub_unsqueeze_view_where_0",
+   "triton_poi_fused___rshift____to_copy_add_bitwise_and_bitwise_left_shift_bitwise_or_bitwise_right_shift_clamp_div_full_like_ge_isnan_logical_and_logical_not_logical_or_lt_scalar_tensor_sub_unsqueeze_view_where_1",
+   "triton_poi_fused___lshift_____rshift___bitwise_or_select_stack_view_2"
+  ],
+  "on_eq_eager": true,
+  "off_nested": 0,
+  "off_kernels": 3,
+  "off_names": [
+   "triton_red_fused__to_copy_abs_add_amax_bitwise_and_bitwise_right_shift_clamp_isnan_scalar_tensor_sub_unsqueeze_view_where_0",
+   "triton_poi_fused___rshift____to_copy_add_bitwise_and_bitwise_left_shift_bitwise_or_bitwise_right_shift_clamp_div_full_like_ge_isnan_logical_and_logical_not_logical_or_lt_scalar_tensor_sub_unsqueeze_view_where_1",
+   "triton_poi_fused___lshift_____rshift___bitwise_or_select_stack_view_2"
+  ],
+  "off_eq_eager": true,
+  "on_eq_off": true
+ },
+ {
+  "case": "rmsnorm+mxfp6_e3m2_packed",
+  "dynamic": true,
+  "on_nested": 1,
+  "on_kernels": 2,
+  "on_names": [
+   "triton_red_fused__fused_rms_norm_0",
+   "triton_poi_fused___lshift_____rshift____to_copy_add_bitwise_and_bitwise_or_full_like_ge_logical_and_logical_not_logical_or_lt_select_stack_view_where_1"
+  ],
+  "on_eq_eager": false,
+  "off_nested": 0,
+  "off_kernels": 3,
+  "off_names": [
+   "triton_red_fused__fused_rms_norm_0",
+   "triton_per_fused___rshift____fused_rms_norm__to_copy_abs_add_amax_bitwise_and_bitwise_left_shift_bitwise_or_bitwise_right_shift_clamp_div_full_like_ge_isnan_logical_and_logical_not_logical_or_lt_scalar_tensor_sub_unsqueeze_view_where_1",
+   "triton_poi_fused___lshift_____rshift____to_copy_add_bitwise_and_bitwise_or_full_like_ge_logical_and_logical_not_logical_or_lt_select_stack_view_where_2"
+  ],
+  "off_eq_eager": false,
+  "on_eq_off": true
+ },
+ {
+  "case": "mxfp6_e3m2_packed+to_blocked",
+  "dynamic": true,
+  "on_nested": 0,
+  "on_kernels": 4,
+  "on_names": [
+   "triton_per_fused_abs_amax_view_0",
+   "triton_poi_fused___rshift____to_copy_add_bitwise_and_bitwise_left_shift_bitwise_or_bitwise_right_shift_clamp_div_full_like_ge_isnan_logical_and_logical_not_logical_or_lt_scalar_tensor_sub_unsqueeze_view_where_1",
+   "triton_poi_fused___lshift_____rshift___bitwise_or_select_stack_view_2",
+   "triton_poi_fused__to_copy__unsafe_view_add_bitwise_and_bitwise_right_shift_clamp_clone_isnan_permute_scalar_tensor_squeeze_sub_transpose_unsqueeze_view_where_3"
+  ],
+  "on_eq_eager": true,
+  "off_nested": 0,
+  "off_kernels": 4,
+  "off_names": [
+   "triton_per_fused_abs_amax_view_0",
+   "triton_poi_fused___rshift____to_copy_add_bitwise_and_bitwise_left_shift_bitwise_or_bitwise_right_shift_clamp_div_full_like_ge_isnan_logical_and_logical_not_logical_or_lt_scalar_tensor_sub_unsqueeze_view_where_1",
+   "triton_poi_fused___lshift_____rshift___bitwise_or_select_stack_view_2",
+   "triton_poi_fused__to_copy__unsafe_view_add_bitwise_and_bitwise_right_shift_clamp_clone_isnan_permute_scalar_tensor_squeeze_sub_transpose_unsqueeze_view_where_3"
+  ],
+  "off_eq_eager": true,
+  "on_eq_off": true
+ },
+ {
+  "case": "nvfp4",
+  "dynamic": false,
+  "on_nested": 0,
+  "on_kernels": 3,
+  "on_names": [
+   "triton_per_fused___rshift____to_copy_abs_add_amax_bitwise_and_clamp_div_full_like_ge_logical_and_logical_not_logical_or_lt_mul_unsqueeze_view_where_0",
+   "triton_poi_fused___lshift_____rshift____to_copy_bitwise_and_bitwise_or_clamp_mul_slice_unsqueeze_view_1",
+   "triton_poi_fused_lift_fresh_2"
+  ],
+  "on_eq_eager": true,
+  "off_nested": 0,
+  "off_kernels": 3,
+  "off_names": [
+   "triton_per_fused___rshift____to_copy_abs_add_amax_bitwise_and_clamp_div_full_like_ge_logical_and_logical_not_logical_or_lt_mul_unsqueeze_view_where_0",
+   "triton_poi_fused___lshift_____rshift____to_copy_bitwise_and_bitwise_or_clamp_mul_slice_unsqueeze_view_1",
+   "triton_poi_fused_lift_fresh_2"
+  ],
+  "off_eq_eager": true,
+  "on_eq_off": true
+ },
+ {
+  "case": "rmsnorm+nvfp4",
+  "dynamic": false,
+  "on_nested": 1,
+  "on_kernels": 2,
+  "on_names": [
+   "triton_red_fused__fused_rms_norm_0",
+   "triton_poi_fused_lift_fresh_1"
+  ],
+  "on_eq_eager": false,
+  "off_nested": 0,
+  "off_kernels": 4,
+  "off_names": [
+   "triton_red_fused__fused_rms_norm_0",
+   "triton_per_fused___rshift____fused_rms_norm__to_copy_abs_add_amax_bitwise_and_bitwise_or_clamp_div_full_like_ge_logical_and_logical_not_logical_or_lt_mul_unsqueeze_view_where_1",
+   "triton_poi_fused___lshift___bitwise_or_slice_view_2",
+   "triton_poi_fused_lift_fresh_3"
+  ],
+  "off_eq_eager": false,
+  "on_eq_off": true
+ },
+ {
+  "case": "mxfp8_dim0",
+  "dynamic": false,
+  "on_nested": 0,
+  "on_kernels": 2,
+  "on_names": [
+   "triton_per_fused__to_copy_abs_add_amax_bitwise_and_bitwise_right_shift_clamp_div_isnan_ne_scalar_tensor_view_where_0",
+   "triton_poi_fused__to_copy_add_bitwise_and_bitwise_left_shift_bitwise_right_shift_clamp_div_isnan_ne_scalar_tensor_view_where_1"
+  ],
+  "on_eq_eager": true,
+  "off_nested": 0,
+  "off_kernels": 2,
+  "off_names": [
+   "triton_per_fused__to_copy_abs_add_amax_bitwise_and_bitwise_right_shift_clamp_div_isnan_ne_scalar_tensor_view_where_0",
+   "triton_poi_fused__to_copy_add_bitwise_and_bitwise_left_shift_bitwise_right_shift_clamp_div_isnan_ne_scalar_tensor_view_where_1"
+  ],
+  "off_eq_eager": true,
+  "on_eq_off": true
+ },
+ {
+  "case": "rmsnorm+mxfp8_dim0",
+  "dynamic": false,
+  "on_nested": 0,
+  "on_kernels": 3,
+  "on_names": [
+   "triton_red_fused__fused_rms_norm_0",
+   "triton_per_fused__fused_rms_norm__to_copy_abs_add_amax_bitwise_and_bitwise_right_shift_clamp_div_isnan_ne_scalar_tensor_view_where_1",
+   "triton_poi_fused__fused_rms_norm__to_copy_add_bitwise_and_bitwise_left_shift_bitwise_right_shift_clamp_div_isnan_ne_scalar_tensor_view_where_2"
+  ],
+  "on_eq_eager": false,
+  "off_nested": 0,
+  "off_kernels": 3,
+  "off_names": [
+   "triton_red_fused__fused_rms_norm_0",
+   "triton_per_fused__fused_rms_norm__to_copy_abs_add_amax_bitwise_and_bitwise_right_shift_clamp_div_isnan_ne_scalar_tensor_view_where_1",
+   "triton_poi_fused__fused_rms_norm__to_copy_add_bitwise_and_bitwise_left_shift_bitwise_right_shift_clamp_div_isnan_ne_scalar_tensor_view_where_2"
+  ],
+  "off_eq_eager": false,
+  "on_eq_off": true
+ },
+ {
+  "case": "nvfp4_per_tensor",
+  "dynamic": false,
+  "on_nested": 0,
+  "on_kernels": 4,
+  "on_names": [
+   "triton_red_fused__to_copy_abs_amax_0",
+   "triton_per_fused__to_copy_abs_amax_div_1",
+   "triton_per_fused___rshift____to_copy_abs_add_amax_bitwise_and_clamp_div_full_like_ge_logical_and_logical_not_logical_or_lt_mul_unsqueeze_view_where_2",
+   "triton_poi_fused___lshift_____rshift____to_copy_bitwise_and_bitwise_or_clamp_div_mul_slice_unsqueeze_view_3"
+  ],
+  "on_eq_eager": true,
+  "off_nested": 0,
+  "off_kernels": 4,
+  "off_names": [
+   "triton_red_fused__to_copy_abs_amax_0",
+   "triton_per_fused__to_copy_abs_amax_div_1",
+   "triton_per_fused___rshift____to_copy_abs_add_amax_bitwise_and_clamp_div_full_like_ge_logical_and_logical_not_logical_or_lt_mul_unsqueeze_view_where_2",
+   "triton_poi_fused___lshift_____rshift____to_copy_bitwise_and_bitwise_or_clamp_div_mul_slice_unsqueeze_view_3"
+  ],
+  "off_eq_eager": true,
+  "on_eq_off": true
+ },
+ {
+  "case": "rmsnorm+nvfp4_per_tensor",
+  "dynamic": false,
+  "on_nested": 0,
+  "on_kernels": 4,
+  "on_names": [
+   "triton_red_fused__fused_rms_norm__to_copy_abs_amax_0",
+   "triton_red_fused__fused_rms_norm__to_copy_abs_amax_div_1",
+   "triton_per_fused___rshift____fused_rms_norm__to_copy_abs_add_amax_bitwise_and_bitwise_or_clamp_div_full_like_ge_logical_and_logical_not_logical_or_lt_mul_unsqueeze_view_where_2",
+   "triton_poi_fused___lshift_____rshift____fused_rms_norm__to_copy_add_bitwise_and_bitwise_or_clamp_div_full_like_ge_logical_and_logical_not_logical_or_lt_mul_slice_unsqueeze_view_where_3"
+  ],
+  "on_eq_eager": false,
+  "off_nested": 0,
+  "off_kernels": 4,
+  "off_names": [
+   "triton_red_fused__fused_rms_norm__to_copy_abs_amax_0",
+   "triton_red_fused__fused_rms_norm__to_copy_abs_amax_div_1",
+   "triton_per_fused___rshift____fused_rms_norm__to_copy_abs_add_amax_bitwise_and_bitwise_or_clamp_div_full_like_ge_logical_and_logical_not_logical_or_lt_mul_unsqueeze_view_where_2",
+   "triton_poi_fused___lshift_____rshift____fused_rms_norm__to_copy_add_bitwise_and_bitwise_or_clamp_div_full_like_ge_logical_and_logical_not_logical_or_lt_mul_slice_unsqueeze_view_where_3"
+  ],
+  "off_eq_eager": false,
+  "on_eq_off": true
+ }
+]

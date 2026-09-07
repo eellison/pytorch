@@ -1,0 +1,61 @@
+[inductor] Fold sub-parent lane replays onto the parent value
+
+Fused RMSNorm -> NVFP4/MXFP4 kernels were 15-25% slower than they need to
+be. ncu showed the same DRAM traffic as flashinfer's fused CuTe kernel but
+47% more instructions, 52 registers per thread instead of 32, and 30x more
+shared-memory stores. The TTGIR pinned both causes to the sub-parent lane
+epilogue:
+
+The lane replay recomputed the parent's pointwise chain per lane. The
+epilogue body loads x and w at lane indices because lowering inlined the
+normalized value into it, so the resolver split the raw loads and
+re-emitted x * rstd * w for each lane even though that value already
+existed at parent resolution for the block amax.
+
+The per-group scale reached lane width through its own reshape while the
+data lanes came from a split of the parent tile. Triton assigned the two
+different layouts, so every multiply paid a shared-memory convert_layout
+on a full tile.
+
+This change makes _SubParentValueResolver fold a lane pointwise op onto
+the lane of its parent-resolution twin whenever that op, applied to the
+parent operands, is already in the CSE cache. The split is deferred to the
+first consumer that cannot fold, so the chain collapses into one split of
+the normalized value and the raw-load splits are never emitted. Per-group
+values are lifted to the parent tile with the existing broadcast-back path
+and split like the data, so both operands take the same layout route. With
+no CSE match the emitted code is unchanged, and the fold never alters
+arithmetic: every measured kernel reproduces byte-identical payloads and
+scales.
+
+Alternatives considered: realizing the normalized value at lowering time
+gives the same split structure but breaks the fusion into three kernels and
+rounds the intermediate to bf16; a 3D lane iteration family avoids the
+layout mismatch but is a larger refactor and, hand-tested, no faster than
+routing the broadcast through the parent tile.
+
+B200, bf16, median us over CUDA graphs of 100 calls, best mode, compared
+with flashinfer's fused rmsnorm_fp4quant:
+
+  RMSNorm->NVFP4  1024x4096   4.59 -> 3.77   (fi 4.43)
+  RMSNorm->NVFP4  8192x4096   24.6 -> 18.8   (fi 21.2)
+  RMSNorm->NVFP4  65536x2048  111  -> 81.4   (fi 109)
+  RMSNorm->MXFP4  8192x4096   23.6 -> 17.7   (fi 27.1)
+  RMSNorm->MXFP4  65536x2048  102  -> 79.4   (fi 127)
+
+The MXFP6 (4,3) pack path is unchanged within noise with byte-identical
+outputs (dcn_mxfp6 2048x3072: 9.60 -> 9.63 us).
+
+Test Plan:
+
+New test_producer_consumer_lane_fold_splits_computed_value checks that the
+weight lane is never split. test_producer_consumer_inlined_parent_full_source
+now expects two splits (lane source and per-group scale).
+
+```
+python test/inductor/test_nested_reduction.py
+python test/inductor/test_loop_ordering.py
+python test/inductor/test_torchinductor.py
+```
+
+Authored with an AI assistant.

@@ -1,0 +1,36 @@
+[inductor] Iterate the loop-reordering fusion round to a fixpoint
+
+Scheduler.fuse_nodes runs the plain fusion round up to ten times until the
+node count stops changing, then runs the loop-reordering round exactly
+once. A fusion found by reordering can expose a further fusion with the
+newly fused node, and nothing retries it.
+
+The concrete case is the torchao-style FP4 quantizer that QuACK ships: the
+FP4 codes are built from the flat (M, K) reshape, so the codes node reads
+the per-block scale at 96*d0 + d1//32. The plain rounds cannot match that
+against the reduction's write, see "no shared data", and leave reduction
+and codes apart. The single reordering round joins them by re-splitting the
+codes node's ranges, but the nibble pack can only fuse with the result of
+that fusion through the standalone sub-parent planner, and there is no
+further round to offer it. Iterating the reordering round like the plain
+rounds lets the pack join: standalone to_mxfp4 goes from two kernels to
+one, 27-31% faster at 2048x3072 / 8192x4096 / 65536x2048 bf16, byte-exact.
+
+Formulations that build the pairs from the blocked view never hit this;
+their first round already fuses everything, so this only matters for code
+written the torchao way. The loop is bounded like the plain one.
+test_torchinductor's failure set is byte-identical to a same-tree baseline.
+
+Test Plan:
+
+New test_standalone_flat_reshape_pack_fuses mirrors the torchao quantizer
+(flat codes, e8m0 scale, flat-view nibble pack) and asserts one kernel; it
+fails on main with two.
+
+```
+python test/inductor/test_nested_reduction.py
+python test/inductor/test_loop_ordering.py
+python test/inductor/test_torchinductor.py
+```
+
+Authored with an AI assistant.
