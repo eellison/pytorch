@@ -521,6 +521,13 @@ class InductorChoices:
         if config.triton.multi_kernel:
             threshold *= 16
 
+        # A nested reduction's epilogue re-reads the whole reduced row, which
+        # a looped kernel pays for with a second pass over global memory. The
+        # persistent form wins by 8-26% up to 16384 wide (B200, RMSNorm ->
+        # block quantization); beyond that the row no longer fits registers.
+        if features.nested_reduction:
+            threshold = max(threshold, 16384)
+
         return V.graph.sizevars.statically_known_leq(
             features.reduction_numel, threshold
         )  # type: ignore[arg-types]

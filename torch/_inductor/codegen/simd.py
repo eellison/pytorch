@@ -3494,6 +3494,7 @@ class SIMDScheduling(BaseScheduling):
             outer_rnumel,
             coalesce_analysis,
             indexing_node_schedule=indexing_schedule,
+            nested_reduction=True,
         )
         # The outer reduction owns the grid and tiling choice. Index-width
         # analysis still includes every node emitted into that grid.
@@ -3949,6 +3950,7 @@ class SIMDScheduling(BaseScheduling):
             numel,
             rnumel,
             indexing_node_schedule=combined_schedule,
+            nested_reduction=True,
         )
         # Force the 2D tiling rather than re-running the heuristic. The lanes
         # are derived from the parent's R axis and cannot be expressed under a

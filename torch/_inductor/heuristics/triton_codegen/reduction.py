@@ -467,7 +467,31 @@ class ReductionHeuristic(CodegenConfigHeuristics):
         if "y" in size_hints:
             pass
         elif not max_autotune_enabled:
-            if reduction_hint == ReductionHint.INNER and rnumel >= 256:
+            if (
+                inductor_meta.get("nested_reduction")
+                and reduction_hint == ReductionHint.INNER
+                and rnumel > 1024
+            ):
+                # The nested epilogue keeps the row live and reduces it in
+                # blocks, so it runs best with 64-128 elements per thread,
+                # far fewer warps than the r // 128 default. Offer three
+                # candidates around that and let autotuning pick.
+                configs = [
+                    triton_config_reduction(
+                        size_hints,
+                        1,
+                        rnumel,
+                        num_warps=num_warps,
+                        min_num_warps=1,
+                        register_intensive=True,
+                        reduction_hint=reduction_hint,
+                        warp_size=warp_size,
+                    )
+                    for num_warps in sorted(
+                        {min(max(rnumel // d, 1), 16) for d in (4096, 2048, 1024)}
+                    )
+                ]
+            elif reduction_hint == ReductionHint.INNER and rnumel >= 256:
                 if (
                     rnumel > 1024
                     or xnumel // 8 < 128

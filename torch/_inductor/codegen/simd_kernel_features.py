@@ -117,11 +117,15 @@ class SIMDKernelFeatures:
         tiling_scores: dict[str, sympy.Expr] | None = None,
         *,
         indexing_node_schedule: list[NodeScheduleEntry] | None = None,
+        nested_reduction: bool = False,
     ):
         self.node_schedule = node_schedule
         self.indexing_node_schedule = (
             node_schedule if indexing_node_schedule is None else indexing_node_schedule
         )
+        # Set for the outer kernel of a nested or staged reduction, whose
+        # epilogue re-reads the reduced row and so favours the persistent form.
+        self.nested_reduction = nested_reduction
         # numel excludes reduction_numel
         self.numel: sympy.Expr = V.graph.sizevars.simplify(numel)
         self.reduction_numel: sympy.Expr = V.graph.sizevars.simplify(reduction_numel)
@@ -139,6 +143,7 @@ class SIMDKernelFeatures:
             self.coalesce_analysis,
             tiling_scores,
             indexing_node_schedule=self.indexing_node_schedule,
+            nested_reduction=self.nested_reduction,
         )
 
     @cache_on_self
