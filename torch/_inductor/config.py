@@ -2328,6 +2328,8 @@ class triton:
         env_name_force="TORCHINDUCTOR_NESTED_REDUCTION",
         default=True,
     )
+    # EXPERIMENT: allow the X-grouped (band) nested geometry.
+    nested_reduction_allow_x: bool = False
 
     # Map for storing the amount of kernel runs with dumped input tensors
     # Based on hash of Triton source code to avoid bloating the folder

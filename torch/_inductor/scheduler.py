@@ -1049,8 +1049,6 @@ class NestedReduction:
         """
         from .utils import sympy_index_symbol
 
-        if domain_context.grouped_axis is not cls.GroupedAxis.R:
-            return False
         if not all(
             isinstance(node, SchedulerNode) and isinstance(node.node, ComputedBuffer)
             for node in (*outer_node.get_nodes(), *grouped_node.get_nodes())
@@ -1059,26 +1057,44 @@ class NestedReduction:
 
         parent_numel, parent_rnumel = domain_context.parent_full_domain
         group_size = domain_context.group_size
-        group_count = FloorDiv(parent_rnumel, group_size)
-        parent_x = sympy_index_symbol("_nested_parent_x")
-        group_r = sympy_index_symbol("_nested_group_r")
-        local_r = sympy_index_symbol("_nested_local_r")
-        frame_ranges = {
-            parent_x: parent_numel,
-            group_r: group_count,
-            local_r: group_size,
-        }
-
         grouped_reduction = domain_context.grouped_reduction
         iter_ranges, reduce_ranges = grouped_reduction.get_ranges()
-        if len(iter_ranges) == 2:
-            grouped_values = (parent_x, group_r, local_r)
-            reduced_values = (parent_x, group_r)
-        elif len(iter_ranges) == 1:
-            grouped_values = (parent_x * group_count + group_r, local_r)
-            reduced_values = (parent_x * group_count + group_r,)
+        if domain_context.grouped_axis is cls.GroupedAxis.R:
+            group_count = FloorDiv(parent_rnumel, group_size)
+            parent_x = sympy_index_symbol("_nested_parent_x")
+            group_r = sympy_index_symbol("_nested_group_r")
+            local_r = sympy_index_symbol("_nested_local_r")
+            frame_ranges = {
+                parent_x: parent_numel,
+                group_r: group_count,
+                local_r: group_size,
+            }
+            parent_values = (parent_x, group_r * group_size + local_r)
+            if len(iter_ranges) == 2:
+                grouped_values = (parent_x, group_r, local_r)
+                reduced_values = (parent_x, group_r)
+            elif len(iter_ranges) == 1:
+                grouped_values = (parent_x * group_count + group_r, local_r)
+                reduced_values = (parent_x * group_count + group_r,)
+            else:
+                return False
         else:
-            return False
+            # X-grouped: the parent's X axis is tiled by groups of G rows and
+            # the grouped reduction iterates [X/G, R] reducing over the G rows.
+            if len(iter_ranges) != 2:
+                return False
+            group_count = FloorDiv(parent_numel, group_size)
+            group_x = sympy_index_symbol("_nested_group_x")
+            local_x = sympy_index_symbol("_nested_local_x")
+            parent_r = sympy_index_symbol("_nested_parent_r")
+            frame_ranges = {
+                group_x: group_count,
+                local_x: group_size,
+                parent_r: parent_rnumel,
+            }
+            parent_values = (group_x * group_size + local_x, parent_r)
+            grouped_values = (group_x, parent_r, local_x)
+            reduced_values = (group_x, parent_r)
 
         # A coordinate with a single element is always zero. Keep it out of the
         # comparison so a degenerate extent does not look like a stride.
@@ -1146,10 +1162,7 @@ class NestedReduction:
             "tuple[SchedulerNode, ...]", tuple(grouped_node.get_nodes())
         )
         domains_by_node = dict(pointwise_domains)
-        parent_frame: Frame = (
-            (parent_numel, parent_rnumel),
-            (parent_x, group_r * group_size + local_r),
-        )
+        parent_frame: Frame = ((parent_numel, parent_rnumel), parent_values)
         local_frame: Frame = ((*iter_ranges, *reduce_ranges), grouped_values)
         reduced_frame: Frame = (tuple(iter_ranges), reduced_values)
 
@@ -2060,12 +2073,22 @@ class NestedReduction:
             group_size,
             outer_node=parent_reduction,
         )
-        # Splitting X forces a minimum XBLOCK and has consistently lost to the
-        # unfused kernels. Keep nested codegen to one [X, R/G, G] geometry.
-        if grouped_axis is not cls.GroupedAxis.R:
+        # EXPERIMENT: allow the X-grouped (band) geometry.
+        if grouped_axis is not cls.GroupedAxis.R and not config.triton.nested_reduction_allow_x:
             return None
         iter_ranges, _ = block_local_reduction.get_ranges()
-        if len(iter_ranges) == 2:
+        if grouped_axis is cls.GroupedAxis.X:
+            # [X/G, R] geometry: groups tile the parent's X axis.
+            if len(iter_ranges) != 2 or not (
+                V.graph.sizevars.statically_known_equals(
+                    FloorDiv(parent_numel, group_size), iter_ranges[0]
+                )
+                and V.graph.sizevars.statically_known_equals(
+                    iter_ranges[1], parent_rnumel
+                )
+            ):
+                return None
+        elif len(iter_ranges) == 2:
             if not V.graph.sizevars.statically_known_equals(
                 FloorDiv(parent_rnumel, group_size), iter_ranges[1]
             ):
