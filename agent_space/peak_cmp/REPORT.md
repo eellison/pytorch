@@ -186,3 +186,26 @@ without deeper restructuring (packed math, TMA + smem pipelining). Layout
 control matters for the column-group (band/dual) geometry, where the 32-row
 max crosses warps in Triton's row-major layout; that is the handwritten dual
 kernel's advantage and remains a multi-week Gluon-emitter project.
+
+## Update 2026-09-06: Gluon band prototype (RMSNorm -> column-wise MXFP8)
+
+`agent_space/gluon_proto/rms_colwise_mxfp8_gluon.py`: one 32-row band per
+program, each thread owns an RPTxCPT sub-tile (best 8x8, 8 warps, KC=512),
+stats pass then quantize pass over K. Correct to rounding (0-2 scale bytes,
+~1e-6 of payload bytes). Median us, CUDA graphs:
+
+| shape | 3 kernels (cd) | Triton band (cd, flag-on) | Gluon band | Gluon vs 3k |
+|---|---|---|---|---|
+| 8192x4096 | 47 | 63 | 25.7 | 0.55x |
+| 16384x7168 | 208 | 146 | 126 | 0.61x |
+| 32768x4096 | 228 | 161 | 127 | 0.56x |
+| 65536x2048 | 228 | 257 | 113 | 0.50x |
+| 65536x8192 | 922 | 1090 | 550 | 0.60x |
+
+The Gluon band wins at every shape including the ones where the Triton band
+loses, so the band geometry is right and what is missing is codegen quality
+for it: an explicit layout where the 32-row max is thread-local (RPT rows per
+thread plus two shuffles) instead of Triton's row-major layout crossing warps,
+and a sane K-chunk / warp choice. This is the evidence for a Gluon emitter for
+the nested band/dual geometry; the row-wise kernels do not need it (see the
+row-wise prototype above).

@@ -1068,3 +1068,17 @@ dual-no-rms 39.0. Largest unrealized gap in the whole effort (1.7-2x); the
 B1-B4 plan in blockwise2d_design_proposal.md is still draft/unreviewed and
 unimplemented. User's framing 2026-09-06: "the nvfp4 combined dim0/dim1 cast
 in training". Heuristics/configs explicitly out of scope.
+
+2026-09-06 BACKUP pushed to the user's fork github.com/eellison/pytorch (remote
+`myfork`; the `fork` remote's embedded token is stale -- push via
+`git -c 'credential.helper=!f() { echo username=eellison; echo "password=$(gh auth token)"; }; f' push myfork <refspecs>`
+with explicit `refs/heads/X:refs/heads/X` refspecs, otherwise git funnels
+everything to main). Branches: nested-reduction-lane-fold 6d243f4900c,
+nested-reduction-multi-kernel a30f04c119d, nested-reduction-mutation-hoist
+e5196889c55, scheduler-reorder-fixpoint adb23a4d464,
+nested-reduction-persistent-heuristic 9d82f61fcea (WIP), 
+nested-reduction-colwise-mxfp8 3ec14aef47e (WIP), wip-quant-context-20260906
+0c2b9c89417 (agent_space reports/probes/prototypes + a copy of these memory
+notes under agent_space/memory_notes_20260906/, CONTEXT_INDEX.md explains).
+Not published: no PRs opened. User may lose server access; everything needed
+to resume is on the fork.

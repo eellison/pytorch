@@ -40,3 +40,13 @@ default win, and the user scoped heuristics out. Not in any test suite yet.
 Probes: agent_space/peak_cmp/colwise_probe.py, colwise_trace{,2,3}.py,
 colwise_x_probe.py, colwise_x_check.py, colwise_x_shapes.py,
 dual_dim_status.py (refreshed dual baseline).
+
+**Gluon band prototype (2026-09-06, agent_space/gluon_proto/rms_colwise_mxfp8_gluon.py):**
+best config 8x8 per thread, 8 warps, KC=512. rms->col MXFP8 us (3-kernel cd
+/ Triton band cd / Gluon): 8192x4096 47/63/25.7; 16384x7168 208/146/126;
+32768x4096 228/161/127; 65536x2048 228/257/113; 65536x8192 922/1090/550.
+Correct to rounding. Gluon band wins everywhere (1.6-2x vs status quo), incl.
+where the Triton band loses -> geometry right, Triton codegen (row-major
+layout makes the 32-row max cross warps) + config is what loses. Row-wise
+Gluon prototype showed NO gain (see sub-parent-lane-fold.md). Conclusion: a
+Gluon emitter is justified for the band/dual (training) geometry only.
