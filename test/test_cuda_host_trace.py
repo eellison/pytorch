@@ -1264,6 +1264,35 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { m.def("alloc_by_eighth", &alloc_by_ei
             ht.trace(host_read, (x,))
         self.assertFalse(torch._C._host_trace_tracing())
 
+    def test_kernel_less_backward_bodies_are_a_memset_and_a_copy(self):
+        # slice_backward (CompositeExplicitAutograd) and select_backward
+        # (CompositeExplicitAutogradNonFunctional) have no kernel of their own:
+        # eager runs a C++ body at the CUDA key, zeros(input_sizes) then a
+        # copy into a view of it. Under the mode that body runs as eager's own
+        # and its pieces are the tape, the zeros' memset and one copy launch
+        # (a strided copy: eager's kernel, not a memcpy): eager's device work
+        # by the profiler, replayed bitwise (E38)
+        aten = torch.ops.aten
+        M, N = 64, self.N
+        g = torch.randn(M, N - 1, device="cuda", dtype=torch.bfloat16)
+        h = torch.randn(M, device="cuda", dtype=torch.bfloat16)
+        cases = (
+            (aten.slice_backward.default, g, (1, 0, N - 1, 1)),
+            (aten.select_backward.default, h, (1, 3)),
+        )
+        key = ht._explicit_body_key
+        for op, grad, rest in cases:
+
+            def fn(t, op=op, rest=rest):
+                return op(t, [M, N], *rest)
+
+            with mock.patch.object(ht, "_explicit_body_key", wraps=key) as asked:
+                tape = ht.trace(fn, (grad,))
+            self.assertEqual({c.args[0] for c in asked.call_args_list}, {op})
+            self.assertEqual((tape.num_launches, len(tape.memsets)), (1, 1))
+            self._assert_replay_matches_eager(tape, fn, grad)
+        self.assertFalse(torch._C._host_trace_tracing())
+
     def test_view_guards_never_divide_by_zero(self):
         # x.view(M // 4, -1): traced at M=8 the tape guards that M // 4 is
         # nonzero before it divides by it; a replay at M=3 is a miss, not an
@@ -4204,13 +4233,16 @@ class TestCudaHostTraceLayerNormBackward(TestCase):
 
     def test_huge_row_count_path(self, device):
         # M > 64K over a narrow N takes the M-parallel gamma / beta kernel
-        # with a per-block partial buffer and a sum(0) over it: an op of the
-        # reductions sibling, which this commit does not have, so the host
-        # declines by name at the sum; the reductions commit serves the path
+        # with a per-block partial buffer and a sum(0) through the reduction
+        # sibling; traced and replayed like any other path
         N = 256
         base = self._args(self._inputs(70000, device, N=N), N=N)
-        with self.assertRaisesRegex(ht.Declined, "aten.sum.dim_IntList"):
-            ht.trace(layer_norm_backward, base)
+        news = [self._args(self._inputs(66000, device, N=N), N=N)]
+        tape, served = self._roundtrip(layer_norm_backward, base, news)
+        self.assertEqual(served, [True])
+        names = self._kernels(tape)
+        self.assertGreaterEqual(len(names), 3)
+        self.assertTrue(any("GammaBetaBackwardCUDAKernelTemplate" in n for n in names))
 
     def test_two_hints_trace_the_same_backward(self, device):
         two_hint.trace_twice(layer_norm_backward, self._args(self._inputs(64, device)))

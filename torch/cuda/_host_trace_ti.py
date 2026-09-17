@@ -3,13 +3,13 @@ add, sub, rsub, mul, div (their in-place, out= and .Scalar forms too), silu,
 gelu, reciprocal, tanh, sqrt, pow, copy_ (incl. casts), fill_ / zero_ (eager's
 memset over a dense tensor) and the fill factories (full, zeros, ones, *_like,
 new_*), arange, the comparisons eq / ne / lt / le / gt / ge, masked_fill,
-clamp / clamp_min / clamp_max / relu.
+clamp / clamp_min / clamp_max / relu, and the reductions sum, mean, amax / max.
 
-Each entry is what the op's CUDA kernel host does around gpu_kernel, on the
-SymInt-typed sibling iterator in aten/src/ATen/cuda/host_trace/ti. Under a
-trace the mode calls it in place of the op; at a replay's build it runs in
-ordinary mode so the captured graph holds the launches the tape describes.
-Operands must be CUDA tensors of one
+Each entry is what the op's CUDA kernel host does around gpu_kernel or
+gpu_reduce_kernel, on the SymInt-typed sibling iterator in
+aten/src/ATen/cuda/host_trace/ti. Under a trace the mode calls it in place of
+the op; at a replay's build it runs in ordinary mode so the captured graph
+holds the launches the tape describes. Operands must be CUDA tensors of one
 dtype; a binary op may take one CPU scalar operand, the Python number the
 dispatcher unwrapped from its wrapped tensor, whose value is a constant of
 the tape as the real kernel bakes it into its functor. A 0-dim CPU tensor
@@ -668,6 +668,79 @@ for _name, _fn in (
     register_traced_entry(getattr(aten, _name).default, _fn)
     _op_ = getattr(aten, _name + "_").default
     register_traced_entry(_op_, _inplace(_op_, _fn))
+
+# ---- reductions (the entries in ReduceSumProdKernel.cu, ReduceMomentKernel.cu,
+# ReduceMaxValuesKernel.cu): one input of one dtype
+# reduced into an output of the same dtype; dim=None and dim=[] reduce every
+# dim. A dtype argument that differs from the input is the real op's type
+# promotion and declines.
+
+
+def _dims(dim) -> list[int]:
+    if dim is None:
+        return []
+    if isinstance(dim, int):
+        return [dim]
+    return [int(d) for d in dim]
+
+
+def _same_dtype(op, self, dtype) -> None:
+    if dtype is not None and dtype != self.dtype:
+        raise Declined(
+            f"host_trace: {op} with dtype={dtype} on a {self.dtype} input promotes, which is not traced (declined)"
+        )
+
+
+def _sum_dim(self, dim=None, keepdim=False, dtype=None):
+    _cuda_operands(aten.sum.dim_IntList, self)
+    _same_dtype(aten.sum.dim_IntList, self, dtype)
+    return _C._host_trace_ti_sum(self, _dims(dim), bool(keepdim))
+
+
+def _sum(self, dtype=None):
+    _cuda_operands(aten.sum.default, self)
+    _same_dtype(aten.sum.default, self, dtype)
+    return _C._host_trace_ti_sum(self, [], False)
+
+
+def _sum_out(self, dim=None, keepdim=False, dtype=None, *, out):
+    # at::sum_out: the result written into the caller's tensor (flash's
+    # backward sums the GQA head groups of dk / dv into the outputs)
+    _cuda_operands(aten.sum.IntList_out, self, out)
+    _same_dtype(aten.sum.IntList_out, self, dtype)
+    return _C._host_trace_ti_sum(self, _dims(dim), bool(keepdim), out)
+
+
+def _mean_dim(self, dim=None, keepdim=False, dtype=None):
+    _cuda_operands(aten.mean.dim, self)
+    _same_dtype(aten.mean.dim, self, dtype)
+    return _C._host_trace_ti_mean(self, _dims(dim), bool(keepdim))
+
+
+def _mean(self, dtype=None):
+    _cuda_operands(aten.mean.default, self)
+    _same_dtype(aten.mean.default, self, dtype)
+    return _C._host_trace_ti_mean(self, [], False)
+
+
+def _amax(self, dim=(), keepdim=False):
+    _cuda_operands(aten.amax.default, self)
+    return _C._host_trace_ti_amax(self, _dims(dim), bool(keepdim))
+
+
+def _max(self):
+    # max over every dim: max_all_launch_kernel, the same kernel as amax
+    _cuda_operands(aten.max.default, self)
+    return _C._host_trace_ti_amax(self, [], False)
+
+
+register_traced_entry(aten.sum.dim_IntList, _sum_dim)
+register_traced_entry(aten.sum.default, _sum)
+register_traced_entry(aten.sum.IntList_out, _sum_out)
+register_traced_entry(aten.mean.dim, _mean_dim)
+register_traced_entry(aten.mean.default, _mean)
+register_traced_entry(aten.amax.default, _amax)
+register_traced_entry(aten.max.default, _max)
 
 
 # ---- the generated siblings (torchgen/dest/ufunc.py over ti/siblings.yaml

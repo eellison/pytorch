@@ -528,12 +528,27 @@ class TestCudaHostTraceFlashBackward(TestCase):
         self._check_served(variant, self._case(device, 1, 256, 256, scale=None, seed=5))
 
     def test_gqa_sums_the_head_groups(self, device):
-        # fewer key heads than query heads: the host sums the per-query-head
-        # dk / dv over the groups with at::sum_out, an op of the reductions
-        # sibling (commit 4), so here the trace declines by name at it; the
-        # reductions commit serves the path
-        with self.assertRaisesRegex(ht.Declined, "aten.sum.IntList_out"):
-            self._trace(device, 2, 128, 128, H=8, Hk=2)
+        # fewer key heads than query heads: the kernel writes per-query-head
+        # dk / dv into expanded buffers the host allocates and sums over the
+        # groups into the outputs (at::sum_out on the reductions sibling)
+        tape, args = self._trace(device, 2, 128, 128, H=8, Hk=2)
+        self.assertEqual(tape.num_launches, 5)
+        names = _tape_kernels(tape)
+        self.assertEqual(sum("reduce_kernel" in n for n in names), 2)
+        variant = ht.build(tape, flash_bwd, args)
+        for B, Sq, Sk, Hk, seed in [
+            (3, 256, 128, 2, 1),
+            (4, 128, 256, 4, 2),
+            (2, 256, 256, 2, 3),
+        ]:
+            self._check_served(
+                variant, self._case(device, B, Sq, Sk, H=8, Hk=Hk, seed=seed)
+            )
+        # the sibling's iterator coalesces a size-1 dim differently: batch 1
+        # and a single key head (MQA) are guards of the reduction
+        for B, Hk in [(1, 2), (2, 1)]:
+            with self.assertRaisesRegex(ht.Miss, "guard failed"):
+                variant.replay(self._case(device, B, 128, 128, H=8, Hk=Hk, seed=4))
 
     def test_deterministic_flag(self, device):
         # torch.use_deterministic_algorithms(True): the host allocates one dq
@@ -565,6 +580,7 @@ class TestCudaHostTraceFlashBackward(TestCase):
             "plain": dict(),
             "causal": dict(causal=True),
             "dropout": dict(p=0.1),
+            "gqa": dict(H=8, Hk=2),
         }
         for label, kw in cases.items():
             with self.subTest(label):

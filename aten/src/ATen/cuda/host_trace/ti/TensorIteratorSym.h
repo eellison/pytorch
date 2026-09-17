@@ -116,6 +116,11 @@ struct TORCH_CUDA_CPP_API TensorIteratorSym {
   // set_up_comparison_op_config)
   static TensorIteratorSym comparison_op(const Tensor& out, const Tensor& a, const Tensor& b);
 
+  // TensorIterator::reduce_op: `out` is the result viewed with a size-1,
+  // stride-0 dim at every reduced position (ReduceOpsUtils.h
+  // review_reduce_result); the reduced dims come first after reordering.
+  static TensorIteratorSym reduce_op(const Tensor& out, const Tensor& a);
+
   c10::SymDimVector shape_;
   DimVector perm_;
   bool has_coalesced_dimensions_ = false;
@@ -187,6 +192,13 @@ struct TORCH_CUDA_CPP_API TensorIteratorSym {
   }
 
   c10::SymInt numel() const;
+  // the reduction accessors of TensorIteratorBase: reduced dims are those
+  // where the output's stride is 0
+  int num_reduce_dims() const;
+  c10::SymInt num_output_elements() const;
+  ScalarType input_dtype(int64_t arg = 0) const {
+    return operands_[num_outputs_ + arg].current_dtype;
+  }
   bool is_contiguous() const;
   bool has_contiguous_first_dim() const;
   bool can_use_32bit_indexing() const;

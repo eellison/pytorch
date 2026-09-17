@@ -1138,14 +1138,11 @@ class TestCudaHostTraceTI(HostTraceTestCase):
                         (self._values(48, 3000, dtype, offset=8),),
                         (self._values(7, 1000, dtype),),
                     ]
-                    if name in memset_forms:
-                        # eager's cudaMemsetAsync: no memset record in this
-                        # version, so the dense zero forms decline by name
-                        with self.assertRaisesRegex(ht.Declined, "cudaMemsetAsync"):
-                            ht.trace(fn, base)
-                        continue
                     tape, _ = self._replays(fn, base, news)
-                    self.assertEqual((tape.num_launches, tape.num_allocations), (1, 1))
+                    self.assertEqual(
+                        (tape.num_launches, len(tape.memsets), tape.num_allocations),
+                        (0, 1, 1) if name in memset_forms else (1, 0, 1),
+                    )
         # the dtype eager infers from the value (infer_full_options), and the
         # value as a constant of the tape: another value misses on the
         # argument contract
@@ -1630,6 +1627,7 @@ class TestCudaHostTraceTI(HostTraceTestCase):
             "pow": (lambda t: t.pow(2), (x,)),
             "copy_ (strided)": (lambda t: t.t().contiguous(), (x,)),
             "full": (lambda t: torch.full((t.shape[0], 8), 2.0, device=t.device), (x,)),
+            "zeros_like (memset)": (torch.zeros_like, (x,)),
             "zero_ (strided view)": (
                 lambda t: torch.empty(t.shape[0], 8192, device=t.device)[
                     :, ::2
@@ -1644,6 +1642,8 @@ class TestCudaHostTraceTI(HostTraceTestCase):
             "gt.Tensor": (lambda t, u: t > u, (x, w)),
             "masked_fill_": (lambda t, k: (t * 2.0).masked_fill_(k, -1.0), (x, m)),
             "clamp": (lambda t: t.clamp(-0.5, 0.5), (x,)),
+            "sum": (lambda t: t.sum(1), (x,)),
+            "amax": (lambda t: t.amax(1), (x,)),
         }
         for name, (fn, args) in ops.items():
             with self.subTest(op=name):

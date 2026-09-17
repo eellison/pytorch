@@ -1,4 +1,4 @@
-#define TORCH_ASSERT_NO_OPERATORS
+#define TORCH_ASSERT_ONLY_METHOD_OPERATORS
 #include <ATen/native/TensorIterator.h>
 #include <ATen/native/cuda/Reduce.cuh>
 #include <ATen/native/DispatchStub.h>
@@ -10,12 +10,17 @@
 
 namespace at::native {
 
+template <typename acc_t>
+struct SumCombine {
+  __device__ acc_t operator()(acc_t a, acc_t b) const {
+    return a + b;
+  }
+};
+
 template <typename scalar_t, typename acc_t = scalar_t, typename out_t = scalar_t>
 struct sum_functor {
   void operator()(TensorIterator& iter) {
-    const auto sum_combine = [] GPU_LAMBDA(acc_t a, acc_t b) -> acc_t {
-      return a + b;
-    };
+    const SumCombine<acc_t> sum_combine{};
     constexpr bool is_16_bits = sizeof(scalar_t) == 2;
     if constexpr (is_16_bits) {
       gpu_reduce_kernel<scalar_t, out_t, /*vt0=*/4, /*input_vec_size=*/8>(
@@ -276,3 +281,57 @@ REGISTER_DISPATCH(prod_stub, &prod_kernel_cuda)
 REGISTER_DISPATCH(xor_sum_stub, &xor_sum_kernel_cuda)
 
 } // namespace at::native
+
+// ---- host tracing (ATen/cuda/host_trace): the traced sibling of sum_functor, compiled here
+// so the sibling and the real host above instantiate the one kernel over ReduceOp over SumCombine
+// (DECISIONS E36): the tape's launch is eager's function object, not a twin. Outside a trace the
+// entry runs the same launches in ordinary mode, which is how the parity test compares it with
+// the real op.
+#include <ATen/cuda/host_trace/ti/ReduceOps.h>
+#include <ATen/cuda/host_trace/ti/ReduceSym.cuh>
+
+namespace at::cuda::host_trace::ti {
+
+namespace {
+
+template <typename scalar_t, typename acc_t, typename out_t, int vt0, int input_vec_size>
+void sum_launch(TensorIteratorSym& iter) {
+  gpu_reduce_kernel<scalar_t, out_t, vt0, input_vec_size>(
+      iter, at::native::func_wrapper<out_t>(at::native::SumCombine<acc_t>{}));
+}
+
+} // namespace
+
+Tensor sum_traced(const Tensor& self, IntArrayRef dims, bool keepdim, const std::optional<Tensor>& out) {
+  const ScalarType dtype = self.scalar_type();
+  if (!(at::isFloatingType(dtype) || dtype == kLong)) {
+    decline(c10::str("host_trace: sum on ", dtype, " promotes to a wider output, which is not traced (declined)"));
+  }
+  ReductionSym r = make_reduction(self, dims, keepdim, dtype, out);
+  if (r.iter.numel() == 0) {
+    r.result.zero_();
+    return r.result;
+  }
+  switch (dtype) {
+    case kHalf:
+      sum_launch<at::Half, float, at::Half, 4, 8>(r.iter);
+      break;
+    case kBFloat16:
+      sum_launch<at::BFloat16, float, at::BFloat16, 4, 8>(r.iter);
+      break;
+    case kFloat:
+      sum_launch<float, float, float, 4, 4>(r.iter);
+      break;
+    case kDouble:
+      sum_launch<double, double, double, 4, 4>(r.iter);
+      break;
+    case kLong:
+      sum_launch<int64_t, int64_t, int64_t, 4, 4>(r.iter);
+      break;
+    default:
+      decline(c10::str("host_trace: sum on ", dtype, " is not traced (declined)"));
+  }
+  return r.result;
+}
+
+} // namespace at::cuda::host_trace::ti

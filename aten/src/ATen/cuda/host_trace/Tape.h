@@ -108,9 +108,21 @@ struct OpaqueRec {
   std::string domain;
 };
 
+// A cudaMemsetAsync the host issued on the current stream (Reduce.cuh zeroes
+// its semaphores this way): a memset node in the replay's capture, paired by
+// order with these records and updated when dst or bytes change. The trace
+// itself issues nothing: its destination is a storage-less allocation.
+struct MemsetRec {
+  int64_t seq;
+  c10::SymInt dst;
+  int value;
+  c10::SymInt bytes;
+};
+
 struct TORCH_CUDA_CPP_API Tape {
   std::vector<LaunchRec> launches;
   std::vector<OpaqueRec> opaque;
+  std::vector<MemsetRec> memsets;
   // philox offsets one replay consumes; nullopt when the host draws no
   // randomness
   std::optional<c10::SymInt> rng_increment;

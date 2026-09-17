@@ -508,6 +508,23 @@ c10::SymInt opaque(
   return sym;
 }
 
+void memset_async(
+    const c10::SymInt& dst,
+    int value,
+    const c10::SymInt& nbytes,
+    cudaStream_t stream) {
+  TraceState* s = g_active;
+  if (s == nullptr) {
+    C10_CUDA_CHECK(cudaMemsetAsync(
+        reinterpret_cast<void*>(static_cast<uintptr_t>(dst.expect_int())),
+        value,
+        static_cast<size_t>(nbytes.expect_int()),
+        stream));
+    return;
+  }
+  s->t->memsets.push_back(MemsetRec{s->t->seq++, dst, value, nbytes});
+}
+
 int64_t rng_increment(const c10::SymInt& v) {
   TraceState* s = g_active;
   if (s == nullptr) {

@@ -59,11 +59,25 @@ Exec::Exec(at::cuda::CUDAGraph& graph, at::DeviceIndex device)
   for (cudaGraphNode_t node : raw) {
     cudaGraphNodeType type{};
     C10_CUDA_CHECK(cudaGraphNodeGetType(node, &type));
+    if (type == cudaGraphNodeTypeMemset) {
+      MemsetState ms;
+      ms.node = node;
+      C10_CUDA_CHECK(cudaGraphMemsetNodeGetParams(node, &ms.params));
+      if (ms.params.height != 1) {
+        // @allow-raw-throw: registered with pybind11 as _HostTraceTapeMismatch and caught by that name in torch/cuda/_host_trace.py
+        throw TapeMismatch(
+            "the capture contains a two-dimensional memset node, which this "
+            "tape does not describe");
+      }
+      order_.emplace_back(1, memsets_.size());
+      memsets_.push_back(ms);
+      continue;
+    }
     if (type != cudaGraphNodeTypeKernel) {
       // @allow-raw-throw: registered with pybind11 as _HostTraceTapeMismatch and caught by that name in torch/cuda/_host_trace.py
       throw TapeMismatch(
-          "the capture contains a non-kernel node, which this tape does not "
-          "describe");
+          "the capture contains a node that is neither a kernel nor a memset, "
+          "which this tape does not describe");
     }
     NodeState ns;
     ns.node = node;
@@ -82,6 +96,7 @@ Exec::Exec(at::cuda::CUDAGraph& graph, at::DeviceIndex device)
           ns.infos[i].second);
     }
     ns.argptrs.resize(ns.infos.size());
+    order_.emplace_back(0, nodes_.size());
     nodes_.push_back(std::move(ns));
   }
   for (auto& ns : nodes_) { // pointers into the final (non-moving) images
@@ -119,6 +134,19 @@ unsigned Exec::smem(size_t j) const {
   return nodes_.at(j).params.sharedMemBytes;
 }
 
+uint64_t Exec::memset_dst(size_t j) const {
+  return reinterpret_cast<uintptr_t>(memsets_.at(j).params.dst);
+}
+
+uint64_t Exec::memset_bytes(size_t j) const {
+  const auto& p = memsets_.at(j).params;
+  return static_cast<uint64_t>(p.width) * p.elementSize * p.height;
+}
+
+unsigned Exec::memset_value(size_t j) const {
+  return memsets_.at(j).params.value;
+}
+
 void Exec::instantiate(bool replay) {
   c10::cuda::CUDAGuard guard(device_);
   graph_->instantiate();
@@ -135,7 +163,9 @@ void Exec::instantiate(bool replay) {
   instantiated_ = true;
 }
 
-void Exec::run(const std::vector<NodeUpdate>& updates) {
+void Exec::run(
+    const std::vector<NodeUpdate>& updates,
+    const std::vector<MemsetUpdate>& memset_updates) {
   TORCH_CHECK(instantiated_, "host_trace: this exec was never instantiated");
   c10::cuda::CUDAGuard guard(device_);
   for (const NodeUpdate& u : updates) {
@@ -151,7 +181,22 @@ void Exec::run(const std::vector<NodeUpdate>& updates) {
     ns.params.sharedMemBytes = u.smem;
     C10_CUDA_CHECK(cudaGraphExecKernelNodeSetParams(exec_, ns.node, &ns.params));
   }
+  for (const MemsetUpdate& u : memset_updates) {
+    MemsetState& ms = memsets_.at(u.node);
+    cudaMemsetParams& p = ms.params;
+    p.dst = reinterpret_cast<void*>(static_cast<uintptr_t>(u.dst));
+    // one-dimensional: the captured element size when the count still
+    // divides by it, else bytes (value 0 sets the same bytes either way)
+    if (u.bytes % p.elementSize != 0) {
+      p.elementSize = 1;
+    }
+    p.width = static_cast<size_t>(u.bytes / p.elementSize);
+    p.height = 1;
+    p.pitch = p.width * p.elementSize;
+    C10_CUDA_CHECK(cudaGraphExecMemsetNodeSetParams(exec_, ms.node, &p));
+  }
   dirty_nodes_ += static_cast<int64_t>(updates.size());
+  dirty_memset_nodes_ += static_cast<int64_t>(memset_updates.size());
   graph_->replay();
 }
 

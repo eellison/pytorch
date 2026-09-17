@@ -82,6 +82,41 @@ TensorIteratorSym TensorIteratorSym::comparison_op(const Tensor& out, const Tens
   return iter;
 }
 
+TensorIteratorSym TensorIteratorSym::reduce_op(const Tensor& out, const Tensor& a) {
+  TORCH_INTERNAL_ASSERT(out.defined());
+  // TensorIterator::reduce_op: no output resize, is_reduction; the real
+  // config also promotes the input to the common dtype, which v1 declines
+  // in compute_types (the output has the input's dtype)
+  TensorIteratorSymConfig config;
+  config.resize_outputs_ = false;
+  config.is_reduction_ = true;
+  TensorIteratorSym iter;
+  iter.add_output(out);
+  iter.add_input(a);
+  iter.build(config);
+  return iter;
+}
+
+int TensorIteratorSym::num_reduce_dims() const {
+  int count = 0;
+  for (const auto dim : c10::irange(ndim())) {
+    if (operands_[0].stride_bytes[dim] == 0) {
+      count++;
+    }
+  }
+  return count;
+}
+
+c10::SymInt TensorIteratorSym::num_output_elements() const {
+  c10::SymInt elem = 1;
+  for (const auto dim : c10::irange(ndim())) {
+    if (operands_[0].stride_bytes[dim] != 0 || shape_[dim] == 0)  {
+      elem *= shape_[dim];
+    }
+  }
+  return elem;
+}
+
 void TensorIteratorSym::compute_types(const TensorIteratorSymConfig& config) {
   // a CPU scalar beside CUDA operands (TensorIteratorBase::compute_types,
   // allow_cpu_scalars: not an output, dim 0, at most one) takes no part in

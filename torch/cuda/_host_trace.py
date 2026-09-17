@@ -418,6 +418,10 @@ class _Root:
     allocation: bool = False
 
 
+# Exec.node_kinds: the kind of each captured node by position
+_KIND_NAMES = {0: "kernel", 1: "memset"}
+
+
 @dataclass
 class _InputRec:
     position: int
@@ -1950,6 +1954,9 @@ class Tape:
         # replay writes, so its binding materializes a copy-on-write tensor
         # first, as eager's mutable read does (A98)
         self.written_roots: list[str] = list(records["written_roots"])
+        # cudaMemsetAsync calls the host issued (a split reduction's semaphore
+        # reset): memset nodes of the build's capture, paired by order
+        self.memsets = records["memsets"]
         self.outputs = outputs
         # the argument positions among the written roots, in the call's index
         # space: what a binding reads through the mutable accessor first
@@ -2129,6 +2136,15 @@ class Tape:
                     "dtype": str(o.dtype),
                 }
                 for o in self.outputs
+            ],
+            "memsets": [
+                {
+                    "seq": m["seq"],
+                    "dst": e(m["dst"]),
+                    "value": m["value"],
+                    "bytes": e(m["bytes"]),
+                }
+                for m in self.memsets
             ],
             "rng_increment": e(self.rng_increment)
             if self.rng_increment is not None
@@ -2796,6 +2812,10 @@ class Variant:
         smem = int(self.prog.ev(L["smem"], env))
         return bytes(image), grid, block, smem
 
+    def _memset_state(self, j: int, env: dict) -> tuple:
+        m = self.tape.memsets[j]
+        return int(self.prog.ev(m["dst"], env)), int(self.prog.ev(m["bytes"], env))
+
     # ---- build
 
     def _events_from_log(self, log: list, env: dict) -> None:
@@ -2958,21 +2978,26 @@ class Variant:
         # the tape at the build inputs must reproduce the capture byte for byte
         self._events_from_log(log, env)
         # the capture's nodes in the topological order of their edges are the
-        # tape's launches in host order (one stream: a chain, one order
-        # whatever cudaGraphGetNodes returns); _last holds every node's state
-        # by node index, _launch_nodes each launch's node
-        order, ancestors = self._node_order(exec_.dependencies())
+        # tape's launches and memsets in host order (one stream: a chain, one
+        # order whatever cudaGraphGetNodes returns); each entry (kind, index
+        # within the kind, position); _last holds every kernel node's state by
+        # node index, _launch_nodes each launch's node
+        kinds = exec_.node_kinds()
+        topo, ancestors = self._node_order(exec_.dependencies())
+        order = [(_KIND_NAMES[kinds[p][0]], kinds[p][1], p) for p in topo]
+        kernels = [(idx, p) for kind, idx, p in order if kind == "kernel"]
+        memset_nodes = [(idx, p) for kind, idx, p in order if kind == "memset"]
         self._last: list = [None] * exec_.num_nodes
         self._launch_nodes: list[int] = [0] * len(tape.launches)
         distinct: dict = {}
         for j, L in enumerate(tape.launches):
-            nid = order[j]
+            nid, p = kernels[j]
             name = exec_.kernel_name(nid)
             if L["kernel"] != name:
                 raise TapeMismatch(f"launch {j} is {L['kernel']}, node {nid} is {name}")
             image, grid, block, smem = self._launch_state(j, env)
             self._check_distinct(
-                j, nid, (name, image, grid, block, smem), distinct, ancestors
+                j, p, (name, image, grid, block, smem), distinct, ancestors
             )
             got = exec_.image(nid)
             rng = [
@@ -2995,6 +3020,28 @@ class Variant:
                 )
             self._launch_nodes[j] = nid
             self._last[nid] = (image, grid, block, smem)
+        # the memset nodes in the same order: destination, byte count and
+        # value must be what the tape says at the build inputs
+        if exec_.num_memset_nodes != len(tape.memsets):
+            raise TapeMismatch(
+                f"the tape has {len(tape.memsets)} memsets, the capture has {exec_.num_memset_nodes} memset nodes"
+            )
+        self._last_memsets: list = [None] * exec_.num_memset_nodes
+        self._memset_nodes: list[int] = [0] * len(tape.memsets)
+        for j, m in enumerate(tape.memsets):
+            nid, _p = memset_nodes[j]
+            dst, nbytes = self._memset_state(j, env)
+            got = (
+                exec_.memset_dst(nid),
+                exec_.memset_bytes(nid),
+                exec_.memset_value(nid),
+            )
+            if got != (dst, nbytes, m["value"]):
+                raise TapeMismatch(
+                    f"memset {j}: the tape says {(dst, nbytes, m['value'])}, the capture has {got}"
+                )
+            self._memset_nodes[j] = nid
+            self._last_memsets[nid] = (dst, nbytes)
         with torch.cuda.stream(stream):
             # with the warm-up, replays once and waits on this stream only;
             # without it, uploads the exec and launches nothing
@@ -3037,14 +3084,24 @@ class Variant:
                 new_last[nid] = state
                 image, grid, block, smem = state
                 updates.append((nid, image, grid, block, smem))
+        memset_updates = []
+        new_memsets = list(self._last_memsets)
+        for j in range(len(self.tape.memsets)):
+            nid = self._memset_nodes[j]
+            state = self._memset_state(j, env)
+            if state != self._last_memsets[nid]:
+                new_memsets[nid] = state
+                memset_updates.append((nid, *state))
         with torch.cuda.device(self.device):
             try:
-                self.exec.run(updates)
+                self.exec.run(updates, memset_updates)
             except BaseException:
                 # the exec may hold any mix of old and new node state
                 self._last = [None] * len(self._last)
+                self._last_memsets = [None] * len(self._last_memsets)
                 raise
             self._last = new_last
+            self._last_memsets = new_memsets
         self.calls += 1
         outs = []
         for o in self.tape.outputs:

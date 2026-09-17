@@ -362,6 +362,17 @@ TORCH_CUDA_CPP_API c10::SymInt opaque(
 // finish_trace declines a host that consumed offsets without declaring it.
 TORCH_CUDA_CPP_API int64_t rng_increment(const c10::SymInt& v);
 
+// cudaMemsetAsync(dst, value, nbytes, stream) on a traced allocation (the
+// semaphore reset of a split reduction). Ordinary mode: the call. Trace mode:
+// a MemsetRec on the tape and no call, since the destination has no storage;
+// the replay's build pairs the memset node of its ordinary capture with the
+// record by order and updates it per call.
+TORCH_CUDA_CPP_API void memset_async(
+    const c10::SymInt& dst,
+    int value,
+    const c10::SymInt& nbytes,
+    cudaStream_t stream);
+
 // Grid dimensions as SymInts: `Grid g(M); kernel<<<g, ...>>>`. The conversion
 // to dim3 hands the values to the launch record and the hints to the real
 // launch.

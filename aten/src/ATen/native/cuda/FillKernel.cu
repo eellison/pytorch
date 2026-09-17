@@ -66,7 +66,9 @@ Tensor& zero_traced(Tensor& self) {
   // instead of reading a pointer, and the memset's byte count follows it
   const bool has_elements = self.sym_numel().sym_ne(0).guard_bool(__FILE__, __LINE__);
   if (has_elements && self.is_non_overlapping_and_dense()) {
-    decline("host_trace: zero_ over a dense tensor is a cudaMemsetAsync in eager (zero_cuda_), which this version does not record; not traced (declined)");
+    const c10::SymInt nbytes = self.sym_numel() * static_cast<int64_t>(self.dtype().itemsize());
+    memset_async(sym_mutable_data_ptr(self), 0, nbytes, at::cuda::getCurrentCUDAStream(self.device().index()));
+    return self;
   }
   return fill_traced(self, 0);
 }

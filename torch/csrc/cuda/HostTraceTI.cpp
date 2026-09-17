@@ -9,14 +9,15 @@
 
 #include <ATen/HostTraceSiblingBindings.h>
 #include <ATen/cuda/host_trace/ti/Ops.h>
+#include <ATen/cuda/host_trace/ti/ReduceOps.h>
 
 #include <string>
 
-// Python entry points for the elementwise ops that opt into the traced
-// TensorIterator sibling (aten/src/ATen/cuda/host_trace/ti). The trace mode in
-// torch/cuda/_host_trace.py calls them in place of the real op; outside a
-// trace they run the same launches in ordinary mode. Forward declared in
-// torch/csrc/Module.cpp next to THCPHostTrace_init.
+// Python entry points for the elementwise ops and reductions that opt into
+// the traced TensorIterator sibling (aten/src/ATen/cuda/host_trace/ti). The
+// trace mode in torch/cuda/_host_trace.py calls them in place of the real op;
+// outside a trace they run the same launches in ordinary mode. Forward declared
+// in torch/csrc/Module.cpp next to THCPHostTrace_init.
 
 namespace {
 // A binary operand: a tensor, or the Python number the dispatcher unwrapped
@@ -185,6 +186,29 @@ void THCPHostTraceTI_init(PyObject* module) {
       [](const at::Tensor& self, const py::handle& exponent) {
         return ti::pow_tensor_scalar_traced(self, scalar_arg(exponent));
       });
+  // reductions: dims=[] reduces every dim; the output has the input's dtype
+  m.def(
+      "_host_trace_ti_sum",
+      [](const at::Tensor& self,
+         const std::vector<int64_t>& dims,
+         bool keepdim,
+         const std::optional<at::Tensor>& out) {
+        return ti::sum_traced(self, dims, keepdim, out);
+      },
+      py::arg("self"),
+      py::arg("dims"),
+      py::arg("keepdim"),
+      py::arg("out") = std::nullopt);
+  m.def(
+      "_host_trace_ti_mean",
+      [](const at::Tensor& self,
+         const std::vector<int64_t>& dims,
+         bool keepdim) { return ti::mean_traced(self, dims, keepdim); });
+  m.def(
+      "_host_trace_ti_amax",
+      [](const at::Tensor& self,
+         const std::vector<int64_t>& dims,
+         bool keepdim) { return ti::amax_traced(self, dims, keepdim); });
   // the generated siblings (torchgen over ti/siblings.yaml and add's
   // ufunc_inner_loop): _host_trace_ti_gen_<op> and their table
   host_trace_sibling_bindings(m, operand, scalar_arg);

@@ -18,6 +18,7 @@
 namespace {
 
 using at::cuda::host_trace::Exec;
+using at::cuda::host_trace::MemsetUpdate;
 using at::cuda::host_trace::NodeUpdate;
 using at::cuda::host_trace::SymVal;
 using at::cuda::host_trace::Tape;
@@ -159,6 +160,16 @@ py::dict tape_records(const Tape& t) {
     opaque.append(std::move(d));
   }
   out["opaque"] = std::move(opaque);
+  py::list memsets;
+  for (const auto& ms : t.memsets) {
+    py::dict d;
+    d["seq"] = ms.seq;
+    d["dst"] = py::cast(ms.dst);
+    d["value"] = ms.value;
+    d["bytes"] = py::cast(ms.bytes);
+    memsets.append(std::move(d));
+  }
+  out["memsets"] = std::move(memsets);
   out["rng_increment"] = t.rng_increment.has_value()
       ? py::cast(*t.rng_increment)
       : py::object(py::none());
@@ -250,6 +261,7 @@ void THCPHostTrace_init(PyObject* module) {
       .def_property_readonly("num_nodes", &Exec::num_nodes)
       .def("kernel_name", &Exec::kernel_name)
       .def("dependencies", &Exec::dependencies)
+      .def("node_kinds", &Exec::node_kinds)
       .def(
           "image",
           [](const Exec& e, size_t j) {
@@ -259,6 +271,10 @@ void THCPHostTrace_init(PyObject* module) {
       .def("grid", &Exec::grid)
       .def("block", &Exec::block)
       .def("smem", &Exec::smem)
+      .def_property_readonly("num_memset_nodes", &Exec::num_memset_nodes)
+      .def("memset_dst", &Exec::memset_dst)
+      .def("memset_bytes", &Exec::memset_bytes)
+      .def("memset_value", &Exec::memset_value)
       .def("instantiate", &Exec::instantiate, py::arg("replay") = true)
       .def(
           "run",
@@ -268,7 +284,9 @@ void THCPHostTrace_init(PyObject* module) {
                  py::bytes,
                  std::array<unsigned, 3>,
                  std::array<unsigned, 3>,
-                 unsigned>>& updates) {
+                 unsigned>>& updates,
+             const std::vector<std::tuple<size_t, uint64_t, uint64_t>>&
+                 memset_updates) {
             std::vector<NodeUpdate> us;
             us.reserve(updates.size());
             for (const auto& [node, image, grid, block, smem] : updates) {
@@ -277,9 +295,18 @@ void THCPHostTrace_init(PyObject* module) {
               u.image.assign(s.begin(), s.end());
               us.push_back(std::move(u));
             }
-            e.run(us);
-          })
-      .def_property_readonly("dirty_nodes", &Exec::dirty_nodes);
+            std::vector<MemsetUpdate> ms;
+            ms.reserve(memset_updates.size());
+            for (const auto& [node, dst, bytes] : memset_updates) {
+              ms.push_back(MemsetUpdate{node, dst, bytes});
+            }
+            e.run(us, ms);
+          },
+          py::arg("updates"),
+          py::arg("memset_updates") =
+              std::vector<std::tuple<size_t, uint64_t, uint64_t>>{})
+      .def_property_readonly("dirty_nodes", &Exec::dirty_nodes)
+      .def_property_readonly("dirty_memset_nodes", &Exec::dirty_memset_nodes);
 
   m.def("_host_trace_drop_storage", [](const at::Tensor& t) {
     at::cuda::host_trace::drop_storage(t);
