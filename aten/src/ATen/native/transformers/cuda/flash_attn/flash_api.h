@@ -3,9 +3,14 @@
 
 #include <namespace_config.h>
 #include <ATen/core/Tensor.h>
+#include <c10/core/SymFloat.h>
 #include <c10/util/Exception.h>
 
 namespace FLASH_NAMESPACE {
+// The hosts are converted for host tracing (ATen/cuda/host_trace) and sit in
+// the traced scope, where Flash_fwd_params / Flash_bwd_params name the traced
+// proxies.
+namespace traced {
 
 TORCH_API
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
@@ -15,7 +20,7 @@ mha_fwd(const at::Tensor &q,         // batch_size x seqlen_q x num_heads x head
         std::optional<at::Tensor> &out_,             // batch_size x seqlen_q x num_heads x head_size
         std::optional<at::Tensor> &alibi_slopes_, // num_heads or batch_size x num_heads
         const float p_dropout,
-        const float softmax_scale,
+        const c10::SymFloat softmax_scale,
         bool is_causal,
         int window_size_left,
         int window_size_right,
@@ -36,7 +41,7 @@ mha_varlen_fwd(const at::Tensor &q,  // total_q x num_heads x head_size, total_q
                int max_seqlen_q,
                const int max_seqlen_k,
                const float p_dropout,
-               const float softmax_scale,
+               const c10::SymFloat softmax_scale,
                const bool zero_tensors,
                bool is_causal,
                int window_size_left,
@@ -45,7 +50,6 @@ mha_varlen_fwd(const at::Tensor &q,  // total_q x num_heads x head_size, total_q
                const bool return_softmax,
                std::optional<at::Generator> gen_,
                int num_splits = 0);
-
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>
 mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_size_og
@@ -59,7 +63,7 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_si
         std::optional<at::Tensor> &dv_,   // batch_size x seqlen_k x num_heads_k x head_size
         std::optional<at::Tensor> &alibi_slopes_, // num_heads or batch_size x num_heads
         const float p_dropout,         // probability to drop
-        const float softmax_scale,
+        const c10::SymFloat softmax_scale,
         const bool is_causal,
         int window_size_left,
         int window_size_right,
@@ -84,7 +88,7 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
                const int max_seqlen_q,
                const int max_seqlen_k,          // max sequence length to choose the kernel
                const float p_dropout,         // probability to drop
-               const float softmax_scale,
+               const c10::SymFloat softmax_scale,
                const bool zero_tensors,
                const bool is_causal,
                int window_size_left,
@@ -93,5 +97,11 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
                const bool deterministic,
                const at::Tensor philox_seed,
                const at::Tensor philox_offset);
+
+}  // namespace traced
+using traced::mha_fwd;
+using traced::mha_varlen_fwd;
+using traced::mha_bwd;
+using traced::mha_varlen_bwd;
 
 } // namespace FLASH_NAMESPACE

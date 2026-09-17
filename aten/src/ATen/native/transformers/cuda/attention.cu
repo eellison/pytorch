@@ -496,8 +496,14 @@ _flash_attention_forward_impl(
     std::optional<int64_t> num_splits
     ) {
 #if defined(USE_FLASH_ATTENTION)
+#ifdef USE_ROCM
   const auto softmax_scale =
       sdp::calculate_scale(query, scale).expect_float();
+#else
+  // a c10::SymFloat: under a host trace a scale derived from the head dim
+  // stays symbolic
+  const auto softmax_scale = sdp::calculate_scale(query, scale);
+#endif
 
   std::optional<Tensor> seqused_k = _seqused_k;
   std::optional<at::Tensor> block_table = _block_table;

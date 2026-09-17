@@ -231,6 +231,8 @@ class TopologyMiss(Miss):
 _TRACEABLE = {
     aten.native_layer_norm.default,
     aten.native_layer_norm_backward.default,
+    aten._flash_attention_forward.default,
+    aten._flash_attention_backward.default,
 }
 
 # the recorder's message when a host reads a raw pointer of a traced tensor
@@ -1194,10 +1196,16 @@ class _Trace:
 
     def allocate(self, func: Any, args: tuple, kwargs: dict) -> _TracedTensor:
         device = kwargs.get("device")
-        if device is not None and torch.device(device) != self.device:
-            raise Declined(
-                f"host_trace: allocation on {device} inside a trace on {self.device}"
-            )
+        if device is not None:
+            # `device(at::kCUDA)` without an index is the current device
+            dev = torch.device(device)
+            if dev.type != self.device.type or dev.index not in (
+                None,
+                self.device.index,
+            ):
+                raise Declined(
+                    f"host_trace: allocation on {device} inside a trace on {self.device}"
+                )
         if kwargs.get("pin_memory"):
             raise Declined(
                 "host_trace: pinned allocations inside a host are not traced"
@@ -2609,19 +2617,24 @@ class Variant:
     # ---- build
 
     def _events_from_log(self, log: list, env: dict) -> None:
-        # the events at the build inputs, in host order: each allocation root
-        # binds to the address the ordinary call used (the log, in the same
-        # order), each opaque call to its value, and a late guard is checked
-        # as soon as its last symbol is bound (an allocation size may divide
-        # by an opaque result bound just before it)
-        if len(log) != len(self.tape.allocs):
-            raise TapeMismatch(
-                f"the tape has {len(self.tape.allocs)} allocations, the ordinary call made {len(log)}"
-            )
+        # the events at the build inputs, in host order: an opaque call binds
+        # its result (an allocation's size may use it); an allocation with
+        # elements takes the next allocator entry of the ordinary call; one
+        # without elements made no entry (the caching allocator hands out a
+        # null pointer for 0 bytes) and binds 0; a late guard is checked as
+        # soon as its last symbol is bound
         entries = iter(log)
         for (kind, _seq, rec), guards in zip(self.prog.events, self.prog.event_guards):
-            if kind == "alloc":
-                addr, nbytes = next(entries)
+            if kind == "opaque":
+                self._opaque(rec, env, TapeMismatch, "at the build inputs")
+            elif any(int(self.prog.ev(s, env)) == 0 for s in rec.sizes):
+                env[_symbol_name(rec.q)] = 0
+            else:
+                addr, nbytes = next(entries, (None, None))
+                if addr is None:
+                    raise TapeMismatch(
+                        f"the tape has more allocations than the ordinary call made ({len(log)})"
+                    )
                 if addr % 256 != 0:
                     raise TapeMismatch(
                         f"{rec.name} at the build is not 256-byte aligned"
@@ -2632,10 +2645,13 @@ class Variant:
                         f"{rec.name} is {nbytes} bytes at the build, the tape says {want}"
                     )
                 env[_symbol_name(rec.q)] = addr // 256
-            else:
-                self._opaque(rec, env, TapeMismatch, "at the build inputs")
             if guards:
                 self._check(guards, env)
+        extra = list(entries)
+        if extra:
+            raise TapeMismatch(
+                f"the ordinary call made {len(extra)} allocation(s) after the tape's last ({[n for _a, n in extra]} bytes)"
+            )
         self._check(self.prog.tail_guards, env)
 
     def _alloc_nbytes(self, rec: _AllocRec, env: dict) -> int:

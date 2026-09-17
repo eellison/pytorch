@@ -119,7 +119,13 @@ std::tuple<Tensor, Tensor, Tensor> _flash_attention_backward(
     std::optional<int64_t> window_size_left,
     std::optional<int64_t> window_size_right) {
 #if defined(USE_FLASH_ATTENTION)
+#ifdef USE_ROCM
   const auto softmax_scale = sdp::calculate_scale(query, scale).expect_float();
+#else
+  // a c10::SymFloat: under a host trace a scale derived from the head dim
+  // stays symbolic
+  const auto softmax_scale = sdp::calculate_scale(query, scale);
+#endif
   //  CUDA code assumes that dout is contiguous
   auto contiguous_grad_out = grad_out.contiguous();
   auto contiguous_out = out.contiguous();
