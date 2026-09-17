@@ -615,6 +615,23 @@ command = [
 ]
 
 [[linter]]
+code = 'HOSTTRACE_SYNC_API'
+include_patterns = [
+    'aten/**/*.cu',
+    'aten/**/*.cuh',
+    'aten/**/*.cpp',
+    'aten/**/*.h',
+    'torch/csrc/**/*.cpp',
+    'torch/csrc/**/*.h',
+]
+command = [
+    'python3',
+    'tools/linter/adapters/host_trace_sync_api_linter.py',
+    '--',
+    '@{{PATHSFILE}}'
+]
+
+[[linter]]
 code = 'INCLUDE'
 include_patterns = [
     'c10/**',

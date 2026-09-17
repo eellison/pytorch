@@ -1,0 +1,377 @@
+// Host tracing for CUDA C++ kernels: run a kernel's host code once with
+// symbolic sizes and no data pointers, under a stream capture, and record what
+// it did (launches with every argument as a symbolic value, opaque calls, the
+// generator increment) as a Tape that the Python side turns into a replay.
+//
+// What a traceable host does differently: size variables are c10::SymInt,
+// addresses are read with sym_const_data_ptr() for inputs and
+// sym_mutable_data_ptr() for outputs and in-place operands (a traced tensor
+// has no storage, so data_ptr() raises; in ordinary mode the two forms are
+// const_data_ptr() and mutable_data_ptr(), so an input that is copy-on-write
+// stays lazy exactly as it did before the conversion), a by-value parameter
+// struct goes through the Traced<T> proxy of Field.h, and a kernel with bare
+// arguments launches through the typed helper of Launch.h. Everything else
+// stays as written.
+//
+// The symbolic values are ordinary torch.SymInt / SymFloat / SymBool over a
+// ShapeEnv, created on the Python side (torch/cuda/_host_trace.py) together
+// with the traced tensors; C++ sees them as c10::SymInt and never inspects an
+// expression. The one thing the recorder needs from a value is its hint (the
+// value at the traced call), which it reads through Hints::of without
+// recording a guard. That read is private to the recorder's own templates and
+// sources (see Hints): a host guards (guard_int, a recorded branch) or it
+// raises (expect_int), it never reads a hint.
+//
+// The host contract. A traceable host performs no synchronous memory API call
+// (cudaMemcpy, cudaMemcpyToSymbol, cudaMemcpyFromSymbol, cudaMemset), no
+// device or stream synchronize and no cudaMalloc. Asynchronous copies and
+// memsets on the current stream are fine: they become nodes the completeness
+// check sees. The trace is complete with respect to everything the capture
+// sees. The synchronous memory calls are invisible to a stream capture in
+// every mode on CUDA 13.0 (measured: they succeed, run at the trace and at the
+// replay's build, and are absent from the graph), so they are a contract
+// violation, caught by the HOSTTRACE_SYNC_API lint on every translation unit
+// that includes these headers; a host that makes one is already wrong under
+// a plain CUDA graph capture. The other forbidden calls fail inside the
+// thread-local trace capture and the trace declines by the CUDA error's name.
+// One-time initializations (a constant upload, a lazy module load) belong to
+// the warm-up call trace() makes before the symbolic run, never to the host.
+#pragma once
+#include <ATen/core/Tensor.h>
+#include <ATen/cuda/CUDAGraph.h>
+#include <ATen/cuda/host_trace/Tape.h>
+#include <c10/cuda/CUDAStream.h>
+#include <c10/util/ArrayRef.h>
+#include <cuda_runtime.h>
+
+#include <array>
+#include <cstdint>
+#include <cstring>
+#include <memory>
+#include <optional>
+#include <stdexcept>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+namespace at::cuda::host_trace {
+
+// The host did something this tracer does not describe. Registered with
+// pybind11 as torch._C._HostTraceDeclined, which torch/cuda/_host_trace.py
+// exposes as Declined.
+struct TORCH_CUDA_CPP_API Declined : std::runtime_error {
+  using std::runtime_error::runtime_error;
+};
+[[noreturn]] TORCH_CUDA_CPP_API void decline(const std::string& msg);
+
+// The name of a CUDA error that means "illegal inside a stream capture"
+// (cudaErrorStreamCapture* and cudaErrorCapturedEvent), or nullptr for any
+// other code. The Python side classifies a c10::AcceleratorError raised by
+// the host through this, by code, never by message text.
+TORCH_CUDA_CPP_API const char* capture_error_name(int code);
+
+// Complete only inside Recorder.cpp. A translation unit that defines this
+// struct itself reaches the private reader: an ODR violation the language
+// cannot forbid, so the HOSTTRACE_SYNC_API lint flags the name outside the
+// recorder's own sources.
+struct HintsInternal;
+template <class, size_t>
+struct IntField;
+template <class, size_t>
+struct FloatField;
+template <size_t>
+struct PtrField;
+struct Grid;
+namespace launch_detail {
+template <class K, class A>
+void put_arg(
+    K& dst,
+    const A& a,
+    size_t off,
+    std::vector<FieldRec>* rec,
+    const char* kname,
+    size_t i);
+} // namespace launch_detail
+template <class... KArgs, class G, class B, class... Args>
+void launch(
+    void (*kernel)(KArgs...),
+    const G& grid,
+    const B& block,
+    const c10::SymInt& smem,
+    cudaStream_t stream,
+    const Args&... args);
+
+// The value a symbolic scalar had at the traced call, read without a guard.
+// Private: only the recorder's field types (Field.h), the typed launch
+// (Launch.h), Grid and the recorder's own sources may take one, and only for
+// the bytes they hand to the real launch under the capture and to the hint
+// image. A host TU cannot name Hints::of; a host that needs a value guards.
+class TORCH_CUDA_CPP_API Hints {
+  static int64_t of(const c10::SymInt& s);
+  static double of(const c10::SymFloat& s);
+  static bool of(const c10::SymBool& s);
+  friend struct HintsInternal;
+  friend struct Grid;
+  template <class, size_t>
+  friend struct IntField;
+  template <class, size_t>
+  friend struct FloatField;
+  template <size_t>
+  friend struct PtrField;
+  template <class K, class A>
+  friend void launch_detail::put_arg(
+      K& dst,
+      const A& a,
+      size_t off,
+      std::vector<FieldRec>* rec,
+      const char* kname,
+      size_t i);
+  template <class... KArgs, class G, class B, class... Args>
+  friend void launch(
+      void (*kernel)(KArgs...),
+      const G& grid,
+      const B& block,
+      const c10::SymInt& smem,
+      cudaStream_t stream,
+      const Args&... args);
+};
+
+struct RootInfo {
+  c10::SymInt root; // the storage base address as a value: p<k> or 256*q<k>
+  int64_t itemsize = 1;
+  std::string name;
+};
+
+// Capture-based recording: the host runs under a stream capture, its launches
+// are captured rather than executed, and each launch record names the kernel
+// node the capture created for it: the launching stream's capture frontier,
+// which a launch replaces with the new node alone (cudaStreamGetCaptureInfo).
+// A typed launch reads it right after cudaLaunchKernel; a verbatim `<<<>>>`
+// is issued by the host after the Grid or proxy conversion opened its record,
+// so the record reads the frontier of the stream that was current at the
+// conversion when the next recorder event closes it. finish_trace pairs
+// records to nodes by that handle, never by the order cudaGraphGetNodes
+// returns (creation order on the drivers measured, not a documented one).
+// Two kinds of record: a typed launch (Launch.h) is complete at the call,
+// with the function, positional parameters, the bytes it handed the driver
+// and the grid, block and shared-memory values; a verbatim `<<<>>>` leaves
+// the proxy's field snapshot and the Grid values, and its remaining bare
+// arguments are constants.
+struct LaunchPacket {
+  int64_t seq = -1;
+  // the stream the launch targets (verbatim: the current stream at the
+  // conversion) and the kernel node the capture created for it
+  cudaStream_t stream = nullptr;
+  cudaGraphNode_t node = nullptr;
+  // typed launch (Launch.h)
+  bool typed = false;
+  const void* func = nullptr; // the kernel's host symbol
+  std::string kernel;
+  std::vector<FieldRec> params; // absolute image offsets
+  std::vector<uint8_t> image; // the bytes handed to the launch (hints)
+  std::array<int64_t, 3> block{1, 1, 1};
+  std::array<c10::SymInt, 3> block_expr{};
+  c10::SymInt smem{0};
+  // verbatim launch-site events
+  bool has_proxy = false;
+  std::vector<uint8_t> pod;
+  std::vector<FieldRec> fields;
+  bool has_grid = false;
+  std::array<c10::SymInt, 3> grid{};
+};
+
+struct TORCH_CUDA_CPP_API TraceState {
+  Tape* t = nullptr;
+  at::DeviceIndex device = 0;
+  // the traced tensors' roots, by TensorImpl (the Python side registers every
+  // traced tensor and view and keeps them alive for the trace)
+  std::unordered_map<const c10::TensorImpl*, RootInfo> roots;
+  bool capturing = false;
+  // The capture is an at::cuda::CUDAGraph (keep_graph) so the capture id is
+  // registered and the default generator can create its per-capture state.
+  std::unique_ptr<at::cuda::CUDAGraph> capture_graph;
+  std::optional<c10::cuda::CUDAStreamGuard> stream_guard;
+  // the capturing stream and its capture id: a launch on any other stream
+  // would execute for real, with the traced tensors' placeholder addresses
+  cudaStream_t capture_stream = nullptr;
+  unsigned long long capture_id = 0;
+  std::vector<LaunchPacket> packets;
+  LaunchPacket open;
+  bool open_active = false;
+  int captured_nodes = 0;
+  // generator accounting: the default CUDA generator's offset when the trace
+  // began; finish_trace compares what the host consumed with rng_increment
+  uint64_t rng_offset_before = 0;
+  int64_t rng_increment_hint = -1;
+  uint64_t rng_consumed = 0;
+};
+
+TORCH_CUDA_CPP_API TraceState* active();
+
+// Enter/leave trace mode on this thread and begin the capture. The capture is
+// thread-local: cudaMalloc, a device or stream synchronize and an event query
+// from the host error inside it and the trace declines. A synchronous
+// cudaMemcpy / cudaMemset from the host is invisible to any capture mode (see
+// the host contract above): the lint, not the capture, catches it.
+// Construction is transactional: trace mode is entered only after the stream,
+// the capture and the generator state are set up; a failure unwinds them and
+// leaves no trace active.
+struct TORCH_CUDA_CPP_API Scope {
+  explicit Scope(TraceState* s);
+  ~Scope();
+  Scope(const Scope&) = delete;
+  Scope& operator=(const Scope&) = delete;
+  Scope(Scope&&) = delete;
+  Scope& operator=(Scope&&) = delete;
+  TraceState* prev;
+};
+
+// End the capture, read the kernel nodes back and record the launches. Call
+// after the host returned.
+TORCH_CUDA_CPP_API void finish_trace(TraceState* s);
+
+// A traced tensor's root: its storage base address as a value, and the
+// element size. Every traced tensor and every view of one is registered.
+TORCH_CUDA_CPP_API void register_root(
+    const at::TensorBase& t,
+    c10::SymInt root,
+    int64_t itemsize,
+    const std::string& name);
+// Drop a traced tensor's storage so data_ptr() / storage() raise with a
+// message that names the sym_*_data_ptr() accessors.
+TORCH_CUDA_CPP_API void drop_storage(const at::TensorBase& t);
+// The next host-order sequence number (shared with the launches).
+TORCH_CUDA_CPP_API int64_t next_seq();
+
+// The byte address of a tensor's data, storage offset included, as a
+// c10::SymInt. Trace mode: the tensor's root plus its symbolic storage offset
+// times the element size; a real tensor met inside a trace is a constant
+// address. Ordinary mode: the concrete address as an inline SymInt, no
+// allocation. Two forms, mirroring TensorBase: the const form reads through
+// const_data_ptr() and leaves a copy-on-write tensor lazy (use it for every
+// input the kernel only reads); the mutable form reads through
+// mutable_data_ptr() and materializes, as the original host's data_ptr() did
+// (use it for outputs and in-place operands). Under a trace both return the
+// same value: constness is a property of the ordinary path.
+// Upstream placement (not done here): sym_const_data_ptr_custom /
+// sym_mutable_data_ptr_custom virtuals on c10::TensorImpl whose defaults return
+// the concrete address, and the accessors on at::TensorBase next to sym_sizes().
+TORCH_CUDA_CPP_API c10::SymInt sym_const_data_ptr(const at::TensorBase& t);
+TORCH_CUDA_CPP_API c10::SymInt sym_mutable_data_ptr(const at::TensorBase& t);
+// The typed forms: the scalar-type check of const_data_ptr<T>() /
+// mutable_data_ptr<T>() (a host that read a T* keeps it), then the address.
+template <class T>
+c10::SymInt sym_const_data_ptr(const at::TensorBase& t) {
+  TORCH_CHECK(
+      t.scalar_type() == c10::CppTypeToScalarType<T>::value,
+      "expected scalar type ",
+      c10::CppTypeToScalarType<T>::value,
+      " but found ",
+      t.scalar_type());
+  return sym_const_data_ptr(t);
+}
+template <class T>
+c10::SymInt sym_mutable_data_ptr(const at::TensorBase& t) {
+  TORCH_CHECK(
+      t.scalar_type() == c10::CppTypeToScalarType<T>::value,
+      "expected scalar type ",
+      c10::CppTypeToScalarType<T>::value,
+      " but found ",
+      t.scalar_type());
+  return sym_mutable_data_ptr(t);
+}
+// `address % n == 0` on a symbolic address: the alignment test a host writes
+// instead of reading the pointer's bits. A guard when the caller branches on it.
+inline c10::SymBool aligned(const c10::SymInt& p, int64_t n) {
+  return (p % c10::SymInt(n)).sym_eq(c10::SymInt(0));
+}
+
+// A function of ints the host must run on values (a heuristic). Records an
+// opaque record of the given kind ("guard": a selector, a different value at
+// replay is a miss; "rebind": data, re-evaluated per call).
+TORCH_CUDA_CPP_API c10::SymInt opaque(
+    const std::string& fn,
+    std::vector<c10::SymInt> args,
+    int64_t (*impl)(const std::vector<int64_t>&),
+    const char* kind = "guard");
+// The same, for a function whose trace-time inputs are not evaluable on their
+// hints (a lookup keyed by an input's base address, which the trace stands in
+// for): the host supplies the value it obtained itself; replay evaluates
+// `impl` on the real arguments. Outside a trace returns `traced_value` without
+// copying anything, so a host may record several fields of one lookup per call.
+TORCH_CUDA_CPP_API c10::SymInt opaque(
+    const char* fn,
+    c10::ArrayRef<c10::SymInt> args,
+    int64_t (*impl)(const std::vector<int64_t>&),
+    const char* kind,
+    int64_t traced_value);
+// The philox increment a host hands to the generator: the concrete count the
+// generator API needs, and in trace mode the value on the tape.
+// finish_trace declines a host that consumed offsets without declaring it.
+TORCH_CUDA_CPP_API int64_t rng_increment(const c10::SymInt& v);
+
+// Grid dimensions as SymInts: `Grid g(M); kernel<<<g, ...>>>`. The conversion
+// to dim3 hands the values to the launch record and the hints to the real
+// launch.
+struct TORCH_CUDA_CPP_API Grid {
+  c10::SymInt x{1}, y{1}, z{1};
+  Grid() = default;
+  Grid(c10::SymInt x_, c10::SymInt y_ = 1, c10::SymInt z_ = 1)
+      : x(std::move(x_)), y(std::move(y_)), z(std::move(z_)) {}
+  operator dim3() const;
+};
+
+// Decline unless `stream` is the trace's capturing stream (the same capture
+// id). A kernel launched on any other stream from the capturing thread is not
+// captured: it executes for real with the traced tensors' placeholder
+// addresses, and nothing can undo that afterwards. The typed launch checks
+// the stream it was given. A verbatim launch checks the current stream when
+// its Grid or proxy is converted; the contract is that a verbatim launch
+// targets the current stream (the one the trace made the capturing stream,
+// or a stream forked from it with an event). A verbatim launch that names
+// another stream explicitly cannot be seen before it runs: it is outside the
+// contract, the frontier read that closes its record finds no new node on
+// the current stream and declines, and the placeholder addresses make it
+// fault rather than touch real memory. A host that must launch on a stream
+// other than the current one uses the typed launch, which checks the stream
+// it is given.
+TORCH_CUDA_CPP_API void require_capturing_stream(
+    TraceState* s,
+    cudaStream_t stream,
+    const char* what);
+
+// A by-value struct proxy converted for a verbatim launch (Field.h calls this).
+TORCH_CUDA_CPP_API void pending_proxy(
+    const void* pod,
+    size_t size,
+    const std::vector<FieldRec>* fields);
+// Register a typed launch record (Launch.h) before the launch reaches the
+// driver (this closes the verbatim record before it, whose node is read from
+// the frontier the typed launch is about to replace); typed_launched, right
+// after cudaLaunchKernel on `stream`, stores the node the capture created.
+TORCH_CUDA_CPP_API void typed_launch(TraceState* s, LaunchPacket&& pk);
+TORCH_CUDA_CPP_API void typed_launched(TraceState* s, cudaStream_t stream);
+// Test hook: finish_trace reads the captured nodes back in reverse order.
+// The pairing must not depend on that order; a test asserts it does not.
+TORCH_CUDA_CPP_API void test_reverse_node_order(bool on);
+
+// Parameter layout of a host kernel symbol from the driver: (offset, size) per
+// parameter and the image size.
+struct FuncInfo {
+  std::string name;
+  std::vector<std::pair<size_t, size_t>> params;
+  size_t image_size = 0;
+  // the driver handle behind the host symbol, for consumers that build their
+  // own launch records (a runtime host symbol is not a CUfunction)
+  cudaFunction_t cu_function = nullptr;
+};
+TORCH_CUDA_CPP_API const FuncInfo& func_info(const void* host_func);
+
+// Ordinary-mode allocation log for the replay's build: (addr, nbytes) of every
+// caching-allocator allocation on `device` between begin and end, in order.
+// Only allocations made on `stream` are logged: another thread's allocations
+// on the same device are not part of the captured call.
+TORCH_CUDA_CPP_API void alloc_log_begin(at::DeviceIndex device, void* stream);
+TORCH_CUDA_CPP_API std::vector<std::pair<uint64_t, uint64_t>> alloc_log_end();
+
+} // namespace at::cuda::host_trace

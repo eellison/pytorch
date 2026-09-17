@@ -6,6 +6,7 @@
 #include <c10/core/SymBool.h>
 #include <c10/core/SymIntArrayRef.h>
 #include <c10/util/StringUtil.h>
+#include <c10/util/irange.h>
 
 
 namespace at::native {
@@ -99,6 +100,69 @@ C10_ALWAYS_INLINE std::pair<int64_t, int64_t> _check_layer_norm_inputs(
       c10::multiply_integers(input_shape.cbegin() + axis, input_shape.cend());
 
   return std::make_pair(M, N);
+}
+
+// The same checks with symbolic sizes, for a host whose M and N must stay
+// expressions (aten/src/ATen/cuda/host_trace/Recorder.h). normalized_shape is
+// concrete, so the trailing dims are compared against it as guards.
+C10_ALWAYS_INLINE std::pair<c10::SymInt, c10::SymInt>
+_check_layer_norm_inputs_symint(
+    const Tensor& input,
+    IntArrayRef normalized_shape,
+    const Tensor& weight /* optional */,
+    const Tensor& bias /* optional */) {
+  const auto normalized_ndim = static_cast<int64_t>(normalized_shape.size());
+  TORCH_CHECK(
+      normalized_ndim >= 1,
+      "Expected normalized_shape to be at least 1-dimensional, i.e., ",
+      "containing at least one element, but got normalized_shape = ",
+      normalized_shape);
+  const auto shape = c10::fromIntArrayRefSlow(normalized_shape);
+  if (weight.defined()) {
+    TORCH_SYM_CHECK(
+        sym_equals(weight.sym_sizes(), shape),
+        "Expected weight to be of same shape as normalized_shape, but got ",
+        "weight of shape ",
+        weight.sym_sizes(),
+        " and normalized_shape = ",
+        normalized_shape);
+  }
+  if (bias.defined()) {
+    TORCH_SYM_CHECK(
+        sym_equals(bias.sym_sizes(), shape),
+        "Expected bias to be of same shape as normalized_shape, but got ",
+        "bias of shape ",
+        bias.sym_sizes(),
+        " and normalized_shape = ",
+        normalized_shape);
+  }
+  const auto input_ndim = input.dim();
+  const auto input_shape = input.sym_sizes();
+  TORCH_CHECK_VALUE(
+      input_ndim >= normalized_ndim,
+      "Input tensor must have at least ",
+      normalized_ndim,
+      " dimensions, but got ",
+      input_ndim);
+  TORCH_SYM_CHECK(
+      sym_equals(input_shape.slice(input_ndim - normalized_ndim), shape),
+      c10::str(
+          "Given normalized_shape=",
+          normalized_shape,
+          ", expected input with shape [*, ",
+          c10::Join(", ", normalized_shape),
+          "], but got input of size",
+          input_shape));
+
+  const auto axis = input_ndim - normalized_ndim;
+  c10::SymInt M(1), N(1);
+  for (const auto i : c10::irange(axis)) {
+    M = M * input_shape[i];
+  }
+  for (const auto i : c10::irange(axis, input_ndim)) {
+    N = N * input_shape[i];
+  }
+  return std::make_pair(std::move(M), std::move(N));
 }
 
 } // namespace

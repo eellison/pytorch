@@ -11,12 +11,14 @@
 #include <ATen/cuda/detail/IndexUtils.cuh>
 #include <ATen/native/cuda/block_reduce.cuh>
 #include <ATen/native/cuda/thread_constants.h>
+#include <ATen/cuda/host_trace/Launch.h>
 
 #ifndef AT_PER_OPERATOR_HEADERS
 #include <ATen/Functions.h>
 #include <ATen/NativeFunctions.h>
 #else
 #include <ATen/ops/empty.h>
+#include <ATen/ops/empty_like.h>
 #include <ATen/ops/empty_like_native.h>
 #include <ATen/ops/native_layer_norm_native.h>
 #include <ATen/ops/native_layer_norm_backward_native.h>
@@ -49,6 +51,13 @@ template<typename T>
 bool can_vectorize(const T * ptr, int alignment) {
   uint64_t addr = reinterpret_cast<uint64_t>(ptr);
   return addr % alignment == 0;
+};
+
+// The same test on a symbolic address (at::cuda::host_trace::sym_const_data_ptr):
+// a guard on the address expression rather than a read of its bits.
+bool can_vectorize(const c10::SymInt& ptr, int alignment) {
+  return at::cuda::host_trace::aligned(ptr, alignment)
+      .guard_bool(__FILE__, __LINE__);
 };
 
 
@@ -1088,60 +1097,65 @@ void LaunchGammaBetaBackwardCUDAKernel(
 
 template <typename T, typename T_ACC, bool rms_norm = false>
 void launch_vectorized_layer_norm_kernel(
-  int N,
-  int64_t M,
-  T_ACC eps,
-  const T* X_data,
-  const T* gamma_data,
-  const T* beta_data,
-  T* Y_data,
-  T_ACC* mean_data,
-  T_ACC* rstd_data
+  c10::SymInt N,
+  c10::SymInt M,
+  c10::SymFloat eps,
+  const c10::SymInt& X_data,
+  const c10::SymInt& gamma_data,
+  const c10::SymInt& beta_data,
+  const c10::SymInt& Y_data,
+  const c10::SymInt& mean_data,
+  const c10::SymInt& rstd_data
 ) {
+    namespace ht = at::cuda::host_trace;
     //constexpr int alignment = 16; //currently unused to make sure float and half results are bw accurate
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     const int warp_size = at::cuda::warp_size();
     const dim3 threads(warp_size, num_threads() / warp_size, 1);
-    dim3 blocks(M);
+    ht::Grid blocks(M);
 
 #ifdef USE_ROCM
-    uint64_t workgroupSize = static_cast<uint64_t>(blocks.x) * static_cast<uint64_t>(threads.x);
+    int64_t blocks_x = M.guard_int(__FILE__, __LINE__);
+    uint64_t workgroupSize = static_cast<uint64_t>(blocks_x) * static_cast<uint64_t>(threads.x);
     // this caused invalid configuration problem
     if (workgroupSize > std::numeric_limits<uint32_t>::max()) {
       // Fix invalid configuration https://github.com/pytorch/pytorch/issues/136291
-      blocks.x = std::numeric_limits<uint32_t>::max() / threads.x;
+      blocks_x = std::numeric_limits<uint32_t>::max() / threads.x;
     }
+    blocks = ht::Grid(blocks_x);
 #endif
 
     TORCH_INTERNAL_ASSERT_DEBUG_ONLY(threads.y % 2 == 0 || threads.y == 1);
-    int nshared = threads.y > 1 ? threads.y * 3/2 *sizeof(T_ACC) : 0;
-    vectorized_layer_norm_kernel<T, T_ACC, rms_norm><<<blocks, threads, nshared, stream>>>(N, eps, X_data,
-    gamma_data, beta_data, mean_data, rstd_data, Y_data);
+    c10::SymInt nshared = threads.y > 1 ? threads.y * 3/2 *sizeof(T_ACC) : 0;
+    ht::launch(vectorized_layer_norm_kernel<T, T_ACC, rms_norm>, blocks, threads, nshared, stream,
+    N, eps, X_data, gamma_data, beta_data, mean_data, rstd_data, Y_data);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
 #ifdef USE_ROCM
     // the blocks.x contains the max grid x dimension without invalid configuration error
     // Fix invalid configuration https://github.com/pytorch/pytorch/issues/136291
     // Ensure all elements are processed. Prepare for next round
-    int64_t remaining = M - blocks.x;
-    const T* X_data2 = X_data;
-    T_ACC* mean_data2 = mean_data;
-    T_ACC* rstd_data2 = rstd_data;
-    T* Y_data2 = Y_data;
+    const int64_t N_v = N.guard_int(__FILE__, __LINE__);
+    int64_t remaining = M.guard_int(__FILE__, __LINE__) - blocks_x;
+    c10::SymInt X_data2 = X_data;
+    c10::SymInt mean_data2 = mean_data;
+    c10::SymInt rstd_data2 = rstd_data;
+    c10::SymInt Y_data2 = Y_data;
 
     while (remaining > 0) {
-      X_data2 += N * blocks.x;
-      mean_data2 += blocks.x;
-      rstd_data2 += blocks.x;
-      Y_data2 += N * blocks.x;
+      X_data2 = X_data2 + N_v * blocks_x * (int64_t)sizeof(T);
+      mean_data2 = mean_data2 + blocks_x * (int64_t)sizeof(T_ACC);
+      rstd_data2 = rstd_data2 + blocks_x * (int64_t)sizeof(T_ACC);
+      Y_data2 = Y_data2 + N_v * blocks_x * (int64_t)sizeof(T);
 
-      blocks.x = (remaining > blocks.x) ? blocks.x : remaining;
+      blocks_x = (remaining > blocks_x) ? blocks_x : remaining;
+      blocks = ht::Grid(blocks_x);
 
-      vectorized_layer_norm_kernel<T, T_ACC, rms_norm><<<blocks, threads, nshared, stream>>>(N, eps, X_data2,
-        gamma_data, beta_data, mean_data2, rstd_data2, Y_data2);
+      ht::launch(vectorized_layer_norm_kernel<T, T_ACC, rms_norm>, blocks, threads, nshared, stream,
+        N, eps, X_data2, gamma_data, beta_data, mean_data2, rstd_data2, Y_data2);
       C10_CUDA_KERNEL_LAUNCH_CHECK();
 
-      remaining -= blocks.x;
+      remaining -= blocks_x;
     }
 #endif
 
@@ -1152,22 +1166,23 @@ void LayerNormKernelImplInternal(
     const Tensor& X,
     const Tensor& gamma,
     const Tensor& beta,
-    int64_t M,
-    int64_t N,
-    T_ACC eps,
+    c10::SymInt M,
+    c10::SymInt N,
+    c10::SymFloat eps,
     Tensor* Y,
     Tensor* mean,
     Tensor* rstd) {
+  namespace ht = at::cuda::host_trace;
   // assumes input, gamma and beta are of proper shape, this was checked in _check_layer_norm_inputs
   // assumes all tensors are contiguous
   TORCH_CHECK(M <= at::cuda::getCurrentDeviceProperties()->maxGridSize[0], "M should be less than maximum CUDA grid size, \
   file a support request to support bigger batches");
-  const T* X_data = X.const_data_ptr<T>();
-  const T* gamma_data = gamma.defined() ? gamma.const_data_ptr<T>() : nullptr;
-  const T* beta_data = beta.defined() ? beta.const_data_ptr<T>() : nullptr;
-  T* Y_data = Y->data_ptr<T>();
-  T_ACC* mean_data = !rms_norm ? mean->data_ptr<T_ACC>() : nullptr;
-  T_ACC* rstd_data = rstd->data_ptr<T_ACC>();
+  const c10::SymInt X_data = ht::sym_const_data_ptr<T>(X);
+  const c10::SymInt gamma_data = gamma.defined() ? ht::sym_const_data_ptr<T>(gamma) : c10::SymInt(0);
+  const c10::SymInt beta_data = beta.defined() ? ht::sym_const_data_ptr<T>(beta) : c10::SymInt(0);
+  const c10::SymInt Y_data = ht::sym_mutable_data_ptr<T>(*Y);
+  const c10::SymInt mean_data = !rms_norm ? ht::sym_mutable_data_ptr<T_ACC>(*mean) : c10::SymInt(0);
+  const c10::SymInt rstd_data = ht::sym_mutable_data_ptr<T_ACC>(*rstd);
 
   // check if can take fast path - all tensors are properly aligned, N is less than 2^24 (to use float count),
   // N is multiple of vec_size (so that all rows are aligned if tensor is aligned)
@@ -1181,7 +1196,7 @@ void LayerNormKernelImplInternal(
   if ((std::is_same_v<T, float> || std::is_same_v<T, at::Half> || std::is_same_v<T, at::BFloat16>) &&
   N <= static_cast<int64_t>(1ULL << std::numeric_limits<float>::digits) && N % num_vec_elems == 0 &&
   can_vec_X && can_vec_Y && can_vec_gamma && can_vec_beta) {
-    launch_vectorized_layer_norm_kernel<T, T_ACC, rms_norm>(static_cast<int>(N), M, eps, X_data, gamma_data, beta_data, Y_data, mean_data, rstd_data);
+    launch_vectorized_layer_norm_kernel<T, T_ACC, rms_norm>(N, M, eps, X_data, gamma_data, beta_data, Y_data, mean_data, rstd_data);
   } else {
   cudaStream_t cuda_stream = at::cuda::getCurrentCUDAStream();
 #ifdef USE_ROCM
@@ -1189,33 +1204,28 @@ void LayerNormKernelImplInternal(
   // Bound the fallback launch and let each block stride over remaining rows.
   constexpr int64_t max_rowwise_blocks =
       std::numeric_limits<uint32_t>::max() / cuda_utils::kCUDABlockReduceNumThreads;
-  const dim3 blocks(static_cast<uint32_t>(std::min(M, max_rowwise_blocks)));
-  RowwiseMomentsCUDAKernel<T, T_ACC, rms_norm>
-      <<<blocks, cuda_utils::kCUDABlockReduceNumThreads, 0, cuda_stream>>>(
-          M, N, eps, X_data, mean_data, rstd_data);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
-  LayerNormForwardCUDAKernel<T, T_ACC, rms_norm><<<blocks, kCUDANumThreads, 0, cuda_stream>>>(
-      M, N, X_data, mean_data, rstd_data, gamma_data, beta_data, Y_data);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  const ht::Grid blocks(std::min(M, c10::SymInt(max_rowwise_blocks)));
 #else
-  RowwiseMomentsCUDAKernel<T, T_ACC, rms_norm>
-      <<<M, cuda_utils::kCUDABlockReduceNumThreads, 0, cuda_stream>>>(
-          M, N, eps, X_data, mean_data, rstd_data);
+  const ht::Grid blocks(M);
+#endif
+  ht::launch(RowwiseMomentsCUDAKernel<T, T_ACC, rms_norm>, blocks, cuda_utils::kCUDABlockReduceNumThreads, c10::SymInt(0), cuda_stream,
+      M, N, eps, X_data, mean_data, rstd_data);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
-  LayerNormForwardCUDAKernel<T, T_ACC, rms_norm><<<M, kCUDANumThreads, 0, cuda_stream>>>(
+  ht::launch(LayerNormForwardCUDAKernel<T, T_ACC, rms_norm>, blocks, kCUDANumThreads, c10::SymInt(0), cuda_stream,
       M, N, X_data, mean_data, rstd_data, gamma_data, beta_data, Y_data);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
-#endif
   }
 }
 
-void LayerNormKernelImpl(
+// The symbolic entry point: `M`, `N` and `eps` stay expressions so a host
+// trace records the launch shape-generically (ATen/cuda/host_trace).
+void LayerNormKernelImplSymInt(
     const Tensor& X,
     const Tensor& gamma,
     const Tensor& beta,
-    int64_t M,
-    int64_t N,
-    double eps,
+    c10::SymInt M,
+    c10::SymInt N,
+    c10::SymFloat eps,
     Tensor* Y,
     Tensor* mean,
     Tensor* rstd) {
@@ -1227,16 +1237,31 @@ void LayerNormKernelImpl(
       [&]() {
         using acc_t = acc_type<scalar_t, true>;
         LayerNormKernelImplInternal<scalar_t, acc_t>(
-            X, gamma, beta, M, N, static_cast<acc_t>(eps), Y, mean, rstd);
+            X, gamma, beta, M, N, eps, Y, mean, rstd);
       });
+}
+
+// The dispatch stub's signature; the symbolic entry above is what a traceable
+// caller uses.
+void LayerNormKernelImpl(
+    const Tensor& X,
+    const Tensor& gamma,
+    const Tensor& beta,
+    int64_t M,
+    int64_t N,
+    double eps,
+    Tensor* Y,
+    Tensor* mean,
+    Tensor* rstd) {
+  LayerNormKernelImplSymInt(X, gamma, beta, M, N, eps, Y, mean, rstd);
 }
 
 void RmsNormKernelImpl(
   const Tensor& X,
   const Tensor& gamma,
-  int64_t M,
-  int64_t N,
-  double eps,
+  c10::SymInt M,
+  c10::SymInt N,
+  c10::SymFloat eps,
   Tensor* Y,
   Tensor* rstd) {
 AT_DISPATCH_FLOATING_TYPES_AND2(
@@ -1249,7 +1274,7 @@ AT_DISPATCH_FLOATING_TYPES_AND2(
       // rms_norm = true
       LayerNormKernelImplInternal<scalar_t, acc_t, true>(
         // pass in at::Tensor() for gamma and nullptr for mean, it won't be accessed with rms_norm = True
-          X, gamma, at::Tensor(), M, N, static_cast<acc_t>(eps), Y, nullptr, rstd);
+          X, gamma, at::Tensor(), M, N, eps, Y, nullptr, rstd);
     });
 }
 
@@ -1878,14 +1903,14 @@ std::tuple<Tensor, Tensor, Tensor> layer_norm_cuda(
       at::borrow_from_optional_tensor(bias_opt);
   const Tensor& bias = *bias_maybe_owned;
 
-  auto M_N = _check_layer_norm_inputs(input, normalized_shape, weight, bias);
+  auto M_N = _check_layer_norm_inputs_symint(input, normalized_shape, weight, bias);
   auto M = M_N.first;
   auto N = M_N.second;
   auto X = input.expect_contiguous();
   auto gamma = weight.expect_contiguous();
   auto beta = bias.expect_contiguous();
 
-  Tensor Y = at::native::empty_like(
+  Tensor Y = at::empty_like(
       *X,
       std::nullopt /* dtype */,
       std::nullopt /* layout */,
@@ -1893,26 +1918,26 @@ std::tuple<Tensor, Tensor, Tensor> layer_norm_cuda(
       std::nullopt /* pin_memory */,
       LEGACY_CONTIGUOUS_MEMORY_FORMAT);
   auto acc_type = at::toAccumulateType(input.scalar_type(), /*is_cuda=*/true);
-  Tensor mean = at::empty({M}, X->options().dtype(acc_type));
-  Tensor rstd = at::empty({M}, X->options().dtype(acc_type));
+  Tensor mean = at::empty_symint({M}, X->options().dtype(acc_type));
+  Tensor rstd = at::empty_symint({M}, X->options().dtype(acc_type));
   // Calling the kernel for M==0 gives a CUDA error
   // See: https://github.com/pytorch/pytorch/pull/28614
   if (M > 0) {
-    LayerNormKernelImpl(*X, *gamma, *beta, M, N, eps, &Y, &mean, &rstd);
+    LayerNormKernelImplSymInt(*X, *gamma, *beta, M, N, eps, &Y, &mean, &rstd);
   }
-  const auto input_shape = input.sizes();
+  const auto input_shape = input.sym_sizes();
   const size_t axis = input.dim() - normalized_shape.size();
 
-  std::vector<int64_t> stat_shape;
+  std::vector<c10::SymInt> stat_shape;
   for (const auto idx: c10::irange(axis)) {
     stat_shape.push_back(input_shape[idx]);
   }
   for ([[maybe_unused]] const auto idx : c10::irange(axis, input.dim())) {
-    stat_shape.push_back(1);
+    stat_shape.emplace_back(1);
   }
 
-  mean = mean.view(stat_shape);
-  rstd = rstd.view(stat_shape);
+  mean = mean.view_symint(stat_shape);
+  rstd = rstd.view_symint(stat_shape);
 
   return std::make_tuple(std::move(Y), std::move(mean), std::move(rstd));
 }
@@ -2002,7 +2027,7 @@ std::tuple<Tensor, Tensor> _fused_rms_norm_cuda(
   c10::MaybeOwned<Tensor> weight_maybe_owned =
       at::borrow_from_optional_tensor(weight_opt);
   const Tensor& weight = *weight_maybe_owned;
-  auto M_N = _check_layer_norm_inputs(input, normalized_shape, weight, weight);
+  auto M_N = _check_layer_norm_inputs_symint(input, normalized_shape, weight, weight);
   auto M = M_N.first;
   auto N = M_N.second;
   auto X = input.expect_contiguous();
@@ -2016,31 +2041,31 @@ std::tuple<Tensor, Tensor> _fused_rms_norm_cuda(
     eps_val = eps.value_or(std::numeric_limits<double>::epsilon());
   }
 
-  Tensor Y = at::native::empty_like(
+  Tensor Y = at::empty_like(
       *X,
       std::nullopt /* dtype */,
       std::nullopt /* layout */,
       std::nullopt /* device */,
       std::nullopt /* pin_memory */,
       LEGACY_CONTIGUOUS_MEMORY_FORMAT);
-  Tensor rstd = at::empty({M}, X->options().dtype(acc_type));
+  Tensor rstd = at::empty_symint({M}, X->options().dtype(acc_type));
 
   if (M > 0) {
     RmsNormKernelImpl(*X, *gamma, M, N, eps_val, &Y, &rstd);
   }
 
-  const auto input_shape = input.sizes();
+  const auto input_shape = input.sym_sizes();
   const size_t axis = input.dim() - normalized_shape.size();
 
-  std::vector<int64_t> stat_shape;
+  std::vector<c10::SymInt> stat_shape;
   for (const auto idx: c10::irange(axis)) {
     stat_shape.push_back(input_shape[idx]);
   }
   for ([[maybe_unused]] const auto idx : c10::irange(axis, input.dim())) {
-    stat_shape.push_back(1);
+    stat_shape.emplace_back(1);
   }
 
-  rstd = rstd.view(stat_shape);
+  rstd = rstd.view_symint(stat_shape);
 
   return std::make_tuple(std::move(Y), std::move(rstd));
 }

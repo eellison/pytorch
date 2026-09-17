@@ -2415,6 +2415,7 @@ static std::initializer_list<PyMethodDef> TorchMethods = {
 void THCPStream_init(PyObject* module);
 void THCPEvent_init(PyObject* module);
 void THCPGraph_init(PyObject* module);
+void THCPHostTrace_init(PyObject* module);
 void THCPMemPool_init(PyObject* module);
 PyMethodDef* THCPModule_methods();
 namespace torch::cuda {
@@ -2658,6 +2659,7 @@ PyObject* initModule() {
   THCPStream_init(module);
   THCPEvent_init(module);
   THCPGraph_init(module);
+  THCPHostTrace_init(module);
   THCPMemPool_init(module);
 #endif
 
