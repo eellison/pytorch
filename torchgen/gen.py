@@ -2191,8 +2191,15 @@ def gen_headers(
     per_operator_headers: bool,
     native_aot_manifests: dict[tuple[DispatchKey, str], NativeAotManifest]
     | None = None,
+    host_trace_siblings: dict[str, dest.SiblingSpec] | None = None,
 ) -> None:
     native_aot_manifests = native_aot_manifests or {}
+    # the traced siblings of elementwise ops (host tracing, CUDA): headers
+    # the eager kernel files and UfuncCUDA_*.cu include
+    if "cuda" in device_fms and not rocm and host_trace_siblings is not None:
+        dest.gen_host_trace_siblings(
+            grouped_native_functions, host_trace_siblings, device_fms["cuda"]
+        )
     # NB: base names repeat across groups (bmm and bmm.dtype, sum and sum.dim_IntList),
     # so the stub signature must come from the structured group the manifest targets.
     # Validation guarantees exactly one match per manifest.
@@ -2531,6 +2538,7 @@ def gen_source_files(
                             g, backend_indices[dispatch_key]
                         ),
                         "native_definitions": dest.compute_ufunc_cuda(g),
+                        **dest.ufunc_cuda_sibling_env(g, rocm),
                     },
                 )
             else:
@@ -3161,6 +3169,10 @@ def main() -> None:
             if dp_key not in functions_keys:
                 functions_keys.add(dp_key)
 
+    host_trace_siblings = dest.parse_host_trace_siblings(
+        os.path.join(options.source_path, "cuda", "host_trace", "ti", "siblings.yaml")
+    )
+
     if "sources" in options.generate:
         gen_source_files(
             native_functions=native_functions,
@@ -3206,6 +3218,7 @@ def main() -> None:
             rocm=options.rocm,
             per_operator_headers=options.per_operator_headers,
             native_aot_manifests=native_aot_manifests,
+            host_trace_siblings=host_trace_siblings,
         )
 
     if "declarations_yaml" in options.generate:

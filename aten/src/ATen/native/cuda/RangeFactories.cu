@@ -111,6 +111,20 @@ void gpu_kernel_with_index(at::Tensor &output, func_t f) {
 
 namespace at::native {
 
+// range_cuda_out's and arange_cuda_out's lambda as a named functor (the members
+// in the closure's order): the traced sibling of arange at the end of this file
+// launches it too, so the tape holds eager's own kernel (DECISIONS E36)
+template <typename scalar_t, typename accscalar_t>
+struct ArangeFunctor {
+  accscalar_t xstart;
+  accscalar_t xstep;
+  GPU_LAMBDA scalar_t operator()(int64_t ind) const {
+    accscalar_t inc = xstep * static_cast<accscalar_t>(ind);
+    accscalar_t val = xstart + inc;
+    return static_cast<scalar_t>(val);
+  }
+};
+
 Tensor& linspace_cuda_out(const Scalar& start, const Scalar& end, int64_t steps, Tensor& result) {
   TORCH_CHECK(steps >= 0, "number of steps must be non-negative");
 
@@ -233,11 +247,7 @@ Tensor& range_cuda_out(const Scalar& start, const Scalar& end, const Scalar& ste
     bool is_contiguous = result.is_contiguous();
     Tensor r = !is_contiguous ?  at::empty_like(result, LEGACY_CONTIGUOUS_MEMORY_FORMAT) : result;
 
-    gpu_kernel_with_index(r, [xstart, xstep]GPU_LAMBDA(int64_t ind) -> scalar_t {
-        accscalar_t inc = xstep * static_cast<accscalar_t>(ind);
-        accscalar_t val = xstart + inc;
-        return static_cast<scalar_t>(val);
-    });
+    gpu_kernel_with_index(r, ArangeFunctor<scalar_t, accscalar_t>{xstart, xstep});
 
     if(!is_contiguous) {
       result.copy_(r);
@@ -269,11 +279,7 @@ Tensor& arange_cuda_out(const Scalar& start, const Scalar& end, const Scalar& st
     bool is_contiguous = result.is_contiguous();
     Tensor r = !is_contiguous ? at::empty_like(result, LEGACY_CONTIGUOUS_MEMORY_FORMAT) : result;
 
-    gpu_kernel_with_index(r, [xstart, xstep]GPU_LAMBDA(int64_t ind) -> scalar_t {
-        accscalar_t inc = xstep * static_cast<accscalar_t>(ind);
-        accscalar_t val = xstart + inc;
-        return static_cast<scalar_t>(val);
-    });
+    gpu_kernel_with_index(r, ArangeFunctor<scalar_t, accscalar_t>{xstart, xstep});
 
     if(!is_contiguous) {
       result.copy_(r);
@@ -284,3 +290,92 @@ Tensor& arange_cuda_out(const Scalar& start, const Scalar& end, const Scalar& st
 }
 
 } // namespace at::native
+
+// ---- host tracing (ATen/cuda/host_trace): the traced sibling of arange_cuda_out, compiled here
+// so the sibling and the real host above instantiate the one kernel
+// (elementwise_kernel_with_index over ArangeFunctor; DECISIONS E36): the tape's launch is
+// eager's function object, not a twin. Start and step are fields of the functor's proxy (an int
+// field for an integral accumulate type, a float field otherwise), so a bound that is a value of
+// the tape (a cache length) stays one; the registry does what the host does before the launch
+// (RangeUtils.h's checks and size in SymInt arithmetic, the allocation). Outside a trace the
+// entry runs the same launches in ordinary mode, which is how the parity test compares it with
+// the real op.
+#include <ATen/cuda/host_trace/Field.h>
+#include <ATen/cuda/host_trace/Launch.h>
+#include <ATen/cuda/host_trace/Recorder.h>
+#include <ATen/cuda/host_trace/ti/Ops.h>
+
+namespace at::cuda::host_trace {
+
+// arange's start and step: int fields for an integral accumulate type, float
+// fields otherwise (a SymInt bound reaches an int field as it is, a floating
+// arange takes it as a SymFloat)
+template <class T, size_t Off>
+using ScalarField = std::conditional_t<std::is_integral_v<T>, IntField<T, Off>, FloatField<T, Off>>;
+template <class scalar_t, class acc_t>
+struct Traced<at::native::ArangeFunctor<scalar_t, acc_t>> : TracedBase {
+  using P = at::native::ArangeFunctor<scalar_t, acc_t>;
+  P pod{};
+  ScalarField<acc_t, 0> xstart{this, "xstart"};
+  ScalarField<acc_t, sizeof(acc_t)> xstep{this, "xstep"};
+  Traced() : TracedBase(&pod, sizeof(P)) {}
+};
+using ArangeFloatFunctor = at::native::ArangeFunctor<float, float>;
+using ArangeLongFunctor = at::native::ArangeFunctor<int64_t, int64_t>;
+static_assert(offsetof(ArangeFloatFunctor, xstep) == sizeof(float), "ArangeFunctor layout");
+static_assert(offsetof(ArangeLongFunctor, xstep) == sizeof(int64_t), "ArangeFunctor layout");
+
+} // namespace at::cuda::host_trace
+
+namespace at::cuda::host_trace::ti {
+
+namespace {
+// a bound into the functor's field: an int field takes the Scalar's SymInt
+// (a bound of an integral arange is an int or a SymInt); a float field takes
+// a plain integral bound converted to the accumulate type once, as
+// RangeFactories.cu's start.to<accscalar_t>() does, and any other bound as
+// its SymFloat (a float, or a symbolic number kept as an expression)
+template <class T, size_t Off>
+void assign_bound(IntField<T, Off>& field, const Scalar& s) {
+  field = s.toSymInt();
+}
+template <class T, size_t Off>
+void assign_bound(FloatField<T, Off>& field, const Scalar& s) {
+  if (s.isIntegral(/*includeBool=*/true) && !s.isSymbolic()) {
+    field = s.to<T>();
+  } else {
+    field = s.toSymFloat();
+  }
+}
+
+// gpu_kernel_with_index's CUDA branch with the element count as a c10::SymInt
+// and the launch through the typed helper; the kernel is the one above
+template <typename func_t>
+void gpu_kernel_with_index_sym(const Tensor& output, const func_t& f) {
+  const c10::SymInt N = output.sym_numel();
+  if (N == 0) {
+    return;
+  }
+  if (N > std::numeric_limits<int>::max()) {
+    decline("host_trace: arange over more than 2^31 - 1 elements (the 64-bit index kernel) is not traced (declined)");
+  }
+  auto stream = at::cuda::getCurrentCUDAStream();
+  Grid grid((N + ::block_work_size - 1) / ::block_work_size);
+  launch(::elementwise_kernel_with_index<int, pod_t<func_t>>, grid, ::num_threads(), 0, stream, N, f, sym_mutable_data_ptr(output));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+} // namespace
+
+Tensor& arange_traced(const Scalar& start, const Scalar& step, Tensor& out) {
+  TORCH_INTERNAL_ASSERT(out.dim() == 1);
+  AT_DISPATCH_ALL_TYPES_AND2(kHalf, kBFloat16, out.scalar_type(), "arange_traced", [&] {
+    using accscalar_t = at::acc_type<scalar_t, true>;
+    Traced<at::native::ArangeFunctor<scalar_t, accscalar_t>> f;
+    assign_bound(f.xstart, start);
+    assign_bound(f.xstep, step);
+    gpu_kernel_with_index_sym(out, f);
+  });
+  return out;
+}
+
+} // namespace at::cuda::host_trace::ti

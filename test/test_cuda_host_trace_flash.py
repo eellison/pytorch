@@ -536,13 +536,27 @@ class TestCudaHostTraceFlashBackward(TestCase):
             self._trace(device, 2, 128, 128, H=8, Hk=2)
 
     def test_deterministic_flag(self, device):
-        # torch.use_deterministic_algorithms(True): the host allocates the dq
-        # accumulator with at::zeros, an op of the sibling registry (commit
-        # 3), so here the trace declines by name there; the sibling commit
-        # serves the path
+        # torch.use_deterministic_algorithms(True): the host allocates one dq
+        # accumulator slice per key-block group (a zeros allocation, its count
+        # from the SM count and b * h), the kernel grid and the convert's split
+        # count follow it; eager is then bitwise reproducible at any length.
+        # The flag's fill of uninitialized memory is off: eager's empty would
+        # launch a fill kernel per allocation the trace does not record
+        # (a TapeMismatch at the build, see STAGE2B.md)
         with DeterministicGuard(True, fill_uninitialized_memory=False):
-            with self.assertRaisesRegex(ht.Declined, "not a traceable CUDA host"):
-                self._trace(device, 2, 128, 512)
+            tape, args = self._trace(device, 2, 128, 512)
+            parsed = json.loads(tape.to_json())
+            splits = [p for p in parsed["launches"][2]["params"] if p["name"] == ""]
+            self.assertEqual(len(splits), 1)
+            self.assertFalse(splits[0]["const"])
+            self.assertEqual(parsed["launches"][1]["grid"][0], splits[0]["expr"])
+            variant = ht.build(tape, flash_bwd, args)
+            for B, Sq, Sk, seed in [
+                (1, 128, 512, 1),
+                (4, 256, 384, 2),
+                (2, 128, 512, 3),
+            ]:
+                self._check_served(variant, self._case(device, B, Sq, Sk, seed=seed))
 
     def test_tape_holds_the_kernels_eager_launches(self, device):
         # fidelity: the tape's launches are the profiler's kernels of one
@@ -565,6 +579,9 @@ class TestCudaHostTraceFlashBackward(TestCase):
                         self.assertEqual(g.split("<")[0], w.split("<")[0])
                     else:
                         self.assertEqual(g, w)
+        with DeterministicGuard(True, fill_uninitialized_memory=False):
+            tape, args = self._trace(device, 2, 128, 512)
+            self.assertEqual(_tape_kernels(tape), _eager_kernels(flash_bwd, args))
 
     def test_the_varlen_hosts_decline_by_name(self, device):
         # mha_varlen_fwd / mha_varlen_bwd sit in the traced scope unconverted:

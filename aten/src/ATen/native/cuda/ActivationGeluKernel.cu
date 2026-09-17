@@ -1,4 +1,4 @@
-#define TORCH_ASSERT_NO_OPERATORS
+#define TORCH_ASSERT_ONLY_METHOD_OPERATORS
 #define _USE_MATH_DEFINES
 
 #include <ATen/native/Activation.h>
@@ -15,28 +15,43 @@
 #include <ATen/cuda/ApplyGridUtils.cuh>
 #include <ATen/cuda/detail/OffsetCalculator.cuh>
 #include <ATen/native/cuda/Loops.cuh>
+#include <ATen/HostTraceFunctor_gelu_backward.cuh>
 
 namespace at::native {
+
+namespace {
+
+template <typename scalar_t>
+struct GeluTanhFunctor {
+  __device__ scalar_t operator()(scalar_t x) const {
+    using opmath_t = at::opmath_type<scalar_t>;
+    constexpr opmath_t kBeta = M_SQRT2 * M_2_SQRTPI * opmath_t(0.5);
+    constexpr opmath_t kKappa = 0.044715;
+    auto x_cube = static_cast<opmath_t>(x) * static_cast<opmath_t>(x) * static_cast<opmath_t>(x);
+    auto inner = kBeta * (static_cast<opmath_t>(x) + kKappa * x_cube);
+    return opmath_t(0.5) * static_cast<opmath_t>(x) * (opmath_t(1) + c10::cuda::compat::tanh(inner));
+  }
+};
+
+template <typename scalar_t>
+struct GeluErfFunctor {
+  __device__ scalar_t operator()(scalar_t x) const {
+    using opmath_t = at::opmath_type<scalar_t>;
+    constexpr opmath_t kAlpha = M_SQRT1_2;
+    return static_cast<opmath_t>(x) * opmath_t(0.5) * (opmath_t(1) + ::erf(static_cast<opmath_t>(x) * kAlpha));
+  }
+};
+
+} // namespace
 
 void GeluCUDAKernelImpl(TensorIteratorBase& it, GeluType approximate) {
   if (approximate == GeluType::Tanh) {
     AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, it.dtype(), "GeluCUDAKernelImpl", [&]() {
-      gpu_kernel(it, [] GPU_LAMBDA(scalar_t x) -> scalar_t {
-        using opmath_t = at::opmath_type<scalar_t>;
-        constexpr opmath_t kBeta = M_SQRT2 * M_2_SQRTPI * opmath_t(0.5);
-        constexpr opmath_t kKappa = 0.044715;
-        auto x_cube = static_cast<opmath_t>(x) * static_cast<opmath_t>(x) * static_cast<opmath_t>(x);
-        auto inner = kBeta * (static_cast<opmath_t>(x) + kKappa * x_cube);
-        return opmath_t(0.5) * static_cast<opmath_t>(x) * (opmath_t(1) + c10::cuda::compat::tanh(inner));
-      });
+      gpu_kernel(it, GeluTanhFunctor<scalar_t>());
     });
   } else {
     AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, it.dtype(), "GeluCUDAKernelImpl", [&]() {
-      gpu_kernel(it, [] GPU_LAMBDA(scalar_t x) -> scalar_t {
-        using opmath_t = at::opmath_type<scalar_t>;
-        constexpr opmath_t kAlpha = M_SQRT1_2;
-        return static_cast<opmath_t>(x) * opmath_t(0.5) * (opmath_t(1) + ::erf(static_cast<opmath_t>(x) * kAlpha));
-      });
+      gpu_kernel(it, GeluErfFunctor<scalar_t>());
     });
   }
 }
@@ -45,44 +60,51 @@ void GeluBackwardCUDAKernelImpl(TensorIteratorBase& it, GeluType approximate) {
   if (approximate == GeluType::Tanh) {
     AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16,
         it.dtype(), "GeluBackwardCUDAKernelImpl", [&]() {
-          gpu_kernel(it, [] GPU_LAMBDA(scalar_t dy, scalar_t x) -> scalar_t {
-            using opmath_t = at::opmath_type<scalar_t>;
-            constexpr opmath_t kBeta = M_SQRT2 * M_2_SQRTPI * opmath_t(0.5);
-            constexpr opmath_t kKappa = 0.044715;
-            auto x_sq = static_cast<opmath_t>(x) * static_cast<opmath_t>(x);
-            auto x_cube = x_sq * static_cast<opmath_t>(x);
-            auto inner = kBeta * (static_cast<opmath_t>(x) + kKappa * x_cube);
-            auto tanh_inner = c10::cuda::compat::tanh(inner);
-
-            auto left = opmath_t(0.5) * static_cast<opmath_t>(x);
-            auto right = opmath_t(1) + tanh_inner;
-
-            auto left_derivative = opmath_t(0.5) * right;
-
-            auto tanh_derivative = opmath_t(1) - tanh_inner * tanh_inner;
-            auto inner_derivative = kBeta * (opmath_t(1) + opmath_t(3) * kKappa * x_sq);
-            auto right_derivative = left * tanh_derivative * inner_derivative;
-
-            return static_cast<opmath_t>(dy) * (left_derivative + right_derivative);
-        });
+          gpu_kernel(it, CUDAFunctor_gelu_backward_tanh<scalar_t>{});
       });
   } else {
     AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16,
         it.dtype(), "GeluBackwardCUDAKernelImpl", [&]() {
-          gpu_kernel(it, [] GPU_LAMBDA(scalar_t dy, scalar_t x) -> scalar_t {
-            using opmath_t = at::opmath_type<scalar_t>;
-            constexpr opmath_t kBeta = M_2_SQRTPI * M_SQRT1_2 * opmath_t(0.5);
-            constexpr opmath_t kAlpha = M_SQRT1_2;
-            const opmath_t cdf =
-                opmath_t(0.5) * (opmath_t(1) + ::erf(static_cast<opmath_t>(x) * kAlpha));
-            const opmath_t pdf =
-                c10::cuda::compat::exp(
-                    opmath_t(-0.5) * static_cast<opmath_t>(x) * static_cast<opmath_t>(x)) *
-                kBeta;
-            return static_cast<opmath_t>(dy) * (cdf + static_cast<opmath_t>(x) * pdf);
-          });
+          gpu_kernel(it, CUDAFunctor_gelu_backward_none<scalar_t>{});
         });
   }
 }
 
 } // namespace at::native
+
+// ---- host tracing (ATen/cuda/host_trace): the traced sibling of GeluCUDAKernelImpl, compiled here
+// so the sibling and the real host above instantiate the one kernel over GeluTanhFunctor / GeluErfFunctor
+// (DECISIONS E36): the tape's launch is eager's function object, not a twin. Outside a trace the
+// entry runs the same launches in ordinary mode, which is how the parity test compares it with
+// the real op.
+#include <ATen/cuda/host_trace/ti/LoopsSym.cuh>
+#include <ATen/cuda/host_trace/ti/Ops.h>
+
+#include <ATen/native/Gelu.h>
+
+namespace at::cuda::host_trace::ti {
+
+Tensor gelu_traced(const Tensor& self, std::string_view approximate) {
+  const auto kind = at::native::get_gelutype_enum(approximate);
+  TensorIteratorSym iter = TensorIteratorSym::unary_op(Tensor(), self);
+  if (!at::isFloatingType(iter.common_dtype())) {
+    decline(c10::str("host_trace: gelu on ", iter.common_dtype(), " is not traced (declined)"));
+  }
+  AT_DISPATCH_FLOATING_TYPES_AND2(kHalf, kBFloat16, iter.common_dtype(), "gelu_traced", [&] {
+    if (kind == at::native::GeluType::Tanh) {
+      gpu_kernel(iter, at::native::GeluTanhFunctor<scalar_t>());
+    } else {
+      gpu_kernel(iter, at::native::GeluErfFunctor<scalar_t>());
+    }
+  });
+  return iter.output();
+}
+
+} // namespace at::cuda::host_trace::ti
+
+// ---- host tracing (ATen/cuda/host_trace): the traced sibling of GeluBackwardCUDAKernelImpl, compiled here
+// so the sibling and the host above instantiate the one kernel (DECISIONS E36): the tape's
+// launch is eager's function object, not a twin. Generated by torchgen from
+// cuda/host_trace/ti/siblings.yaml or the op's ufunc_inner_loop; the entry, its proxies and
+// its strided views. Outside a trace it runs the same launches in ordinary mode.
+#include <ATen/HostTraceSibling_gelu_backward.cuh>

@@ -1,5 +1,6 @@
 # Owner(s): ["module: cuda"]
 
+import contextlib
 import gc
 import inspect
 import json
@@ -48,6 +49,44 @@ if torch.cuda.is_available():
 # the op whose CUDA host is traced: it returns the output and the two statistics
 layer_norm = torch.ops.aten.native_layer_norm.default
 layer_norm_backward = torch.ops.aten.native_layer_norm_backward.default
+
+
+def _device_work(fn, args):
+    # the device work one call issues, in order: kernels by name, memsets and
+    # memcpys as such (the profiler's device events)
+    from torch.profiler import profile, ProfilerActivity
+
+    fn(*args)
+    torch.cuda.synchronize()
+    with profile(activities=[ProfilerActivity.CUDA]) as p:
+        fn(*args)
+        torch.cuda.synchronize()
+    work = []
+    for e in p.events():
+        if e.device_type != torch.autograd.DeviceType.CUDA:
+            continue
+        low = e.name.lower()
+        kind = next((k for k in ("memset", "memcpy") if low.startswith(k)), "kernel")
+        work.append((kind, e.name if kind == "kernel" else None))
+    return work
+
+
+# a traced sibling launches eager's kernel template with a named functor in
+# place of eager's lambda: the template, its leading integer arguments and
+# the operand array's size identify the launch (the ti suite's rule; a
+# strided launch names no operand array on either side)
+_TEMPLATE = re.compile(
+    r"^(?:void )?(?:\(anonymous namespace\)::|[A-Za-z_]\w*::)*(\w+)<((?:\d+, )*)"
+)
+_OPERANDS = re.compile(r"std::array<char\*, (\d+)ul>")
+
+
+def _launch_shape(name):
+    m = _TEMPLATE.match(name)
+    if m is None:
+        return name
+    arr = _OPERANDS.search(name)
+    return (m.group(1), m.group(2), arr.group(1) if arr else None)
 
 
 # a typed in-place kernel: x += 1.0f per execution (test helper _add_one)
@@ -324,17 +363,21 @@ class TestCudaHostTrace(TestCase):
             return torch.atan(layer_norm(t, shape, weight, bias, eps)[0])
 
         def before(t, shape, weight, bias, eps):
-            return layer_norm(torch.relu(t), shape, weight, bias, eps)
+            return layer_norm(torch.erf(t), shape, weight, bias, eps)
 
         with self.assertRaisesRegex(ht.Declined, "aten.atan.default"):
             ht.trace(after, self._args(x, w, b))
-        with self.assertRaisesRegex(ht.Declined, "aten.relu.default"):
+        with self.assertRaisesRegex(ht.Declined, "aten.erf.default"):
             ht.trace(before, self._args(x, w, b))
-        # a non-contiguous input makes the host copy it: a named decline, not
-        # an internal error
+        # a non-contiguous input makes the host copy it; the copy has a traced
+        # sibling (torch/cuda/_host_trace_ti.py), so the trace holds two launches
         xt = torch.randn(self.N, 8, device="cuda", dtype=torch.bfloat16).t()
-        with self.assertRaisesRegex(ht.Declined, "aten.clone.default"):
-            ht.trace(layer_norm, self._args(xt, w, b))
+        tape = ht.trace(layer_norm, self._args(xt, w, b))
+        self.assertEqual(tape.num_launches, 2)
+        variant = ht.build(tape, layer_norm, self._args(xt, w, b))
+        yt = torch.randn(self.N, 12, device="cuda", dtype=torch.bfloat16).t()
+        _, w2, b2 = self._inputs(12)
+        self._check(variant.replay(self._args(yt, w2, b2)), yt, w2, b2, 12)
         self.assertFalse(torch._C._host_trace_tracing())
 
     def test_outputs_survive_later_replays(self):
@@ -1033,26 +1076,192 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { m.def("alloc_by_eighth", &alloc_by_ei
         self.assertEqual(str(cm.exception), "my own message during capture")
         self.assertFalse(torch._C._host_trace_tracing())
 
-        # the completeness declines from the recorder are the same type
-        def memset_inside(t, shape, weight, bias, eps):
+        # the declines from inside the trace are the same type (an op with no
+        # host after the converted one; zero_ was the example before it got
+        # its fill sibling)
+        def unconverted_inside(t, shape, weight, bias, eps):
             out = layer_norm(t, shape, weight, bias, eps)
-            out[1].zero_()
+            out[1].erf_()
             return out
 
         with self.assertRaises(ht.Declined):
-            ht.trace(memset_inside, self._args(x, w, b))
+            ht.trace(unconverted_inside, self._args(x, w, b))
         self.assertFalse(torch._C._host_trace_tracing())
         tape, _ = self._trace(8)
         self.assertEqual(tape.num_launches, 1)
 
-    def test_unconverted_hosts_that_read_pointers_decline_by_name(self):
-        # an op the trace cannot serve is a decline naming the op, not a bare
-        # RuntimeError: _fused_rms_norm carries a CompositeImplicitAutograd
-        # kernel that dispatch resolves before the converted CUDA host, and its
-        # at::pow is not a traceable host
+    def _composite_ops(self):
+        # two custom ops with a CompositeImplicit body: one with a CUDA kernel
+        # of its own beside it (the shape of _fused_rms_norm), one without
+        def body(t):
+            return t * 2.0 + 1.0
+
+        stack = contextlib.ExitStack()
+        self.addCleanup(stack.close)
+        lib = stack.enter_context(
+            torch.library._scoped_library("host_trace_test_composite", "DEF")
+        )
+        lib.define("kernel_and_body(Tensor x) -> Tensor")
+        lib.impl("kernel_and_body", body, "CompositeImplicitAutograd")
+        lib.impl("kernel_and_body", lambda t: t * 2.0 + 2.0, "CUDA")
+        lib.define("composite_only(Tensor x) -> Tensor")
+        lib.impl("composite_only", body, "CompositeImplicitAutograd")
+        ops = torch.ops.host_trace_test_composite
+        return ops.kernel_and_body.default, ops.composite_only.default
+
+    def test_unconverted_hosts_decline_by_name(self):
+        # an op eager serves with a CUDA kernel of its own is never decomposed
+        # under the trace, whatever CompositeImplicit body it registers beside
+        # the kernel: it is traced by a converted host or declined, and the
+        # decline names the op and that route (DECISIONS A190, E34). The class
+        # is the dispatcher's registrations, not a list of names: a custom op
+        # of _fused_rms_norm's shape declines the same way, at any depth
+        kernel_and_body, composite_only = self._composite_ops()
+        aten = torch.ops.aten
+        own = ht._decomposes_only_off_cuda
+        fused = aten._fused_rms_norm.default
+        silu, mish = aten.silu_backward.default, aten.mish_backward.default
+        for op in (kernel_and_body, fused, silu, mish):
+            self.assertTrue(own(op), op)
+        promote_types, reshape = aten.promote_types.default, aten.reshape.default
+        for op in (composite_only, promote_types, reshape, aten.linear.default):
+            self.assertFalse(own(op), op)
+        route = "runs its own CUDA kernel.*converted host for {} is the way to trace it"
         x, w, _ = self._inputs(8)
-        with self.assertRaisesRegex(ht.Declined, "_fused_rms_norm"):
-            ht.trace(torch.ops.aten._fused_rms_norm.default, (x, [self.N], w, 1e-5))
+        message = "_fused_rms_norm.*" + route.format("aten::_fused_rms_norm")
+        with self.assertRaisesRegex(ht.Declined, message):
+            ht.trace(fused, (x, [self.N], w, 1e-5))
+        with self.assertRaisesRegex(ht.Declined, message):
+            ht.trace(lambda t, g: F.rms_norm(t, (self.N,), g, 1e-5), (x, w))
+
+        def below_autograd(t):
+            with torch._C._AutoDispatchBelowAutograd():
+                return kernel_and_body(t)
+
+        custom = "host_trace_test_composite::kernel_and_body"
+        message = "kernel_and_body.*" + route.format(custom)
+        for fn in (kernel_and_body, below_autograd):
+            with self.assertRaisesRegex(ht.Declined, message):
+                ht.trace(fn, (x,))
+        self.assertFalse(torch._C._host_trace_tracing())
+
+    def test_composite_ops_follow_eager_dispatch(self):
+        # an op with a CompositeImplicit kernel and none of its own is what
+        # eager itself decomposes. At top level the dispatcher decomposes it
+        # at the autograd key, above the mode (reshape, linear: the mode never
+        # sees the op). Below the autograd keys (a host's own at::reshape, no
+        # tensor argument as promote_types) it reaches the mode intact and
+        # the fallback runs the same CompositeImplicit kernel eager runs there.
+        # Either way the tape is eager's own sequence: the replay's device work
+        # is eager's kernel by kernel (the profiler's names, a traced sibling's
+        # twin counted as its kernel) and the output is bitwise eager's (E34)
+        _, composite_only = self._composite_ops()
+        aten = torch.ops.aten
+        x, _, _ = self._inputs(64)
+
+        def reshaped(t):
+            return (t.reshape(2, -1) * 2.0).reshape(-1)
+
+        def promoted(t):
+            return (t * 2.0).to(torch.promote_types(t.dtype, t.dtype))
+
+        def below_autograd(t):
+            with torch._C._AutoDispatchBelowAutograd():
+                return composite_only(t.reshape(2, -1)).reshape(-1)
+
+        own = ht._decomposes_only_off_cuda
+        cases = (
+            (reshaped, set()),
+            (composite_only, set()),
+            (promoted, {aten.promote_types.default}),
+            (below_autograd, {aten.reshape.default, composite_only}),
+        )
+        for fn, want in cases:
+            with mock.patch.object(ht, "_decomposes_only_off_cuda", wraps=own) as asked:
+                tape = ht.trace(fn, (x,))
+            self.assertEqual({c.args[0] for c in asked.call_args_list}, want)
+            self._assert_replay_matches_eager(tape, fn, x)
+        self.assertFalse(torch._C._host_trace_tracing())
+
+    def _assert_replay_matches_eager(self, tape, fn, x):
+        # the replay's device work is eager's kernel by kernel (the profiler's
+        # kinds and names; a traced sibling's twin counted as its kernel) and
+        # the output is bitwise eager's
+        variant = ht.build(tape, fn, (x,))
+        replayed = _device_work(lambda t: variant.replay((t,)), (x,))
+        eager = _device_work(fn, (x,))
+        self.assertEqual(len(replayed), len(eager), (replayed, eager))
+        for (kind, name), (kind_e, name_e) in zip(replayed, eager):
+            self.assertEqual(kind, kind_e, (replayed, eager))
+            if kind == "kernel" and "host_trace" in name:
+                self.assertEqual(_launch_shape(name), _launch_shape(name_e))
+            elif kind == "kernel":
+                self.assertEqual(name, name_e)
+        self.assertTrue(torch.equal(variant.replay((x,))[0], fn(x)))
+
+    def _explicit_ops(self):
+        # custom ops of slice_backward's shape: a CompositeExplicit body under
+        # either alias key and no kernel of their own; one whose body reads
+        # its input on the host; one with a CUDA kernel beside the body
+        def body(t):
+            return t * 2.0 + 1.0
+
+        stack = contextlib.ExitStack()
+        self.addCleanup(stack.close)
+        lib = stack.enter_context(
+            torch.library._scoped_library("host_trace_test_explicit", "DEF")
+        )
+        lib.define("body(Tensor x) -> Tensor")
+        lib.impl("body", body, "CompositeExplicitAutograd")
+        lib.define("nonfunctional(Tensor x) -> Tensor")
+        lib.impl("nonfunctional", body, "CompositeExplicitAutogradNonFunctional")
+        lib.define("host_read(Tensor x) -> Tensor")
+        lib.impl("host_read", lambda t: t * float(t[0, 0]), "CompositeExplicitAutograd")
+        lib.define("body_and_kernel(Tensor x) -> Tensor")
+        lib.impl("body_and_kernel", body, "CompositeExplicitAutograd")
+        lib.impl("body_and_kernel", lambda t: t * 2.0 + 2.0, "CUDA")
+        ops = torch.ops.host_trace_test_explicit
+        names = ("body", "nonfunctional", "host_read", "body_and_kernel")
+        return tuple(getattr(ops, name).default for name in names)
+
+    def test_explicit_bodies_run_as_eager_does(self):
+        # an op with no kernel of its own whose entry at the tensors' key is a
+        # CompositeExplicit body (slice_backward's shape, either alias key)
+        # runs eager's own body under the mode, at top level and below
+        # autograd: its pieces are traced as eager launches them and the
+        # replay's device work is eager's kernel by kernel. The route is the
+        # dispatcher's registrations, not a list of names: a kernel of the
+        # op's own beside the body declines by name as before, and a host
+        # read inside the body declines where it occurs (DECISIONS E38)
+        body, nonfunctional, host_read, body_and_kernel = self._explicit_ops()
+        aten = torch.ops.aten
+        key = ht._explicit_body_key
+        backward = (aten.slice_backward.default, aten.select_backward.default)
+        for op in (body, nonfunctional, *backward):
+            self.assertIsNotNone(key(op, "CUDA"), op)
+        scalar, linear = aten._local_scalar_dense.default, aten.linear.default
+        for op in (body_and_kernel, scalar, linear, aten.reshape.default):
+            self.assertIsNone(key(op, "CUDA"), op)
+        self.assertIsNone(key(aten.full.default, "Undefined"))
+        x, _, _ = self._inputs(64)
+
+        def below_autograd(t):
+            with torch._C._AutoDispatchBelowAutograd():
+                return body(t)
+
+        cases = ((body, body), (nonfunctional, nonfunctional), (below_autograd, body))
+        for fn, want in cases:
+            with mock.patch.object(ht, "_explicit_body_key", wraps=key) as asked:
+                tape = ht.trace(fn, (x,))
+            self.assertEqual({c.args[0] for c in asked.call_args_list}, {want})
+            self.assertEqual(tape.num_launches, 2)
+            self._assert_replay_matches_eager(tape, fn, x)
+        by_name = "body_and_kernel.*is not a traceable CUDA host"
+        with self.assertRaisesRegex(ht.Declined, by_name):
+            ht.trace(body_and_kernel, (x,))
+        message = "_local_scalar_dense.*not a traceable CUDA host.*from .*host_read"
+        with self.assertRaisesRegex(ht.Declined, message):
+            ht.trace(host_read, (x,))
         self.assertFalse(torch._C._host_trace_tracing())
 
     def test_view_guards_never_divide_by_zero(self):

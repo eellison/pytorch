@@ -1,4 +1,4 @@
-#define TORCH_ASSERT_NO_OPERATORS
+#define ${operators_guard}
 
 #include <ATen/native/ufunc/${name}.h>
 #include <ATen/Dispatch.h>
@@ -19,3 +19,4 @@ namespace native {
 ${native_declaration}
 ${native_definitions}
 }} // namespace at::native
+${host_trace_sibling}

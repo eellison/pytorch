@@ -234,6 +234,7 @@ add_custom_command(
       --native-functions-path "aten/src/ATen/native/native_functions.yaml"
       --tags-path "aten/src/ATen/native/tags.yaml"
       --deprecated-functions-path "tools/autograd/deprecated.yaml"
+      --host-trace-siblings-path "aten/src/ATen/cuda/host_trace/ti/siblings.yaml"
     DEPENDS
       "${TORCH_SRC_DIR}/_C/__init__.pyi.in"
       "${TORCH_SRC_DIR}/_C/_VariableFunctions.pyi.in"
@@ -241,6 +242,7 @@ add_custom_command(
       "${TORCH_ROOT}/aten/src/ATen/native/native_functions.yaml"
       "${TORCH_ROOT}/aten/src/ATen/native/tags.yaml"
       "${TORCH_ROOT}/tools/autograd/deprecated.yaml"
+      "${TORCH_ROOT}/aten/src/ATen/cuda/host_trace/ti/siblings.yaml"
       "${TORCH_ROOT}/torch/_torch_docs.py"
       "${TORCH_ROOT}/torch/_tensor_docs.py"
       ${pyi_python}

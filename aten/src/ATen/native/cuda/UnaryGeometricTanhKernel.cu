@@ -1,4 +1,4 @@
-#define TORCH_ASSERT_NO_OPERATORS
+#define TORCH_ASSERT_ONLY_METHOD_OPERATORS
 #include <ATen/AccumulateType.h>
 #include <ATen/Dispatch.h>
 #include <ATen/OpMathType.h>
@@ -15,6 +15,15 @@ namespace at::native {
 #if 0 && AT_USE_JITERATOR()
 constexpr char tanh_name[] = "tanh_impl";
 #endif
+
+namespace {
+template <typename scalar_t>
+struct TanhFunctor {
+  __device__ scalar_t operator()(scalar_t a) const {
+    return ::tanh(a);
+  }
+};
+} // namespace
 
 void tanh_kernel_cuda(TensorIteratorBase& iter) {
   auto common_dtype = iter.common_dtype();
@@ -47,9 +56,7 @@ void tanh_kernel_cuda(TensorIteratorBase& iter) {
         common_dtype,
         "tanh_cuda",
         [&]() {
-          gpu_kernel(iter, [] GPU_LAMBDA(scalar_t a) -> scalar_t {
-            return ::tanh(a);
-          });
+          gpu_kernel(iter, TanhFunctor<scalar_t>());
         });
   }
 }
@@ -57,3 +64,19 @@ void tanh_kernel_cuda(TensorIteratorBase& iter) {
 REGISTER_DISPATCH(tanh_stub, &tanh_kernel_cuda)
 
 } // namespace at::native
+
+// ---- host tracing (ATen/cuda/host_trace): the traced sibling of tanh_kernel_cuda, compiled here
+// so the sibling and the real host above instantiate the one kernel over TanhFunctor
+// (DECISIONS E36): the tape's launch is eager's function object, not a twin. Outside a trace the
+// entry runs the same launches in ordinary mode, which is how the parity test compares it with
+// the real op.
+#include <ATen/cuda/host_trace/ti/Ops.h>
+#include <ATen/cuda/host_trace/ti/UnaryEntry.cuh>
+
+namespace at::cuda::host_trace::ti {
+
+Tensor tanh_traced(const Tensor& self) {
+  return floating_unary<at::native::TanhFunctor>(self, "tanh");
+}
+
+} // namespace at::cuda::host_trace::ti

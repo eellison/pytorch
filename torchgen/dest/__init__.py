@@ -16,4 +16,7 @@ from torchgen.dest.ufunc import (
     compute_ufunc_cpu as compute_ufunc_cpu,
     compute_ufunc_cpu_kernel as compute_ufunc_cpu_kernel,
     compute_ufunc_cuda as compute_ufunc_cuda,
+    gen_host_trace_siblings as gen_host_trace_siblings,
+    parse_host_trace_siblings as parse_host_trace_siblings,
+    ufunc_cuda_sibling_env as ufunc_cuda_sibling_env,
 )

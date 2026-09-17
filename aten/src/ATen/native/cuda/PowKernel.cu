@@ -1,4 +1,4 @@
-#define TORCH_ASSERT_NO_OPERATORS
+#define TORCH_ASSERT_ONLY_METHOD_OPERATORS
 #include <ATen/Context.h>
 #include <ATen/Dispatch.h>
 #include <ATen/native/cuda/Loops.cuh>
@@ -142,6 +142,33 @@ void pow_tensor_tensor_kernel(TensorIteratorBase& iter) {
 }
 
 
+// the general functor holds the exponent as its lambda captured it
+template <typename Base_type>
+struct PowSquareFunctor {
+  __device__ Base_type operator()(Base_type base) const {
+    return base * base;
+  }
+};
+template <typename Base_type>
+struct PowCubeFunctor {
+  __device__ Base_type operator()(Base_type base) const {
+    return base * base * base;
+  }
+};
+template <typename Base_type>
+struct PowInverseSquareFunctor {
+  __device__ Base_type operator()(Base_type base) const {
+    return 1.0 / (base * base);
+  }
+};
+template <typename Base_type, typename Exp_type>
+struct PowFunctor {
+  Exp_type exp;
+  __device__ Base_type operator()(Base_type base) const {
+    return pow_(base, exp);
+  }
+};
+
 template<typename Base_type, typename Exp_type>
 void pow_tensor_scalar_kernel_impl(TensorIteratorBase& iter,
                                                  Exp_type exp) {
@@ -149,21 +176,13 @@ void pow_tensor_scalar_kernel_impl(TensorIteratorBase& iter,
   // .5 (sqrt), -.5 (rsqrt) and -1 (reciprocal) specializations are handled
   // in pow_tensor_scalar_kernel
   if (d_exp == 2) {
-    gpu_kernel(iter, [=]GPU_LAMBDA(Base_type base) -> Base_type {
-      return base * base;
-    });
+    gpu_kernel(iter, PowSquareFunctor<Base_type>());
   } else if (d_exp == 3) {
-    gpu_kernel(iter, [=]GPU_LAMBDA(Base_type base) -> Base_type {
-      return base * base * base;
-    });
+    gpu_kernel(iter, PowCubeFunctor<Base_type>());
   } else if (d_exp == -2) {
-    gpu_kernel(iter, [=]GPU_LAMBDA(Base_type base) -> Base_type {
-      return 1.0 / (base * base);
-    });
+    gpu_kernel(iter, PowInverseSquareFunctor<Base_type>());
   } else {
-    gpu_kernel(iter, [=]GPU_LAMBDA(Base_type base) -> Base_type {
-      return pow_(base, exp);
-    });
+    gpu_kernel(iter, PowFunctor<Base_type, Exp_type>{exp});
   }
 }
 
@@ -213,3 +232,45 @@ REGISTER_DISPATCH(pow_tensor_tensor_stub, &pow_tensor_tensor_kernel)
 REGISTER_DISPATCH(pow_tensor_scalar_stub, &pow_tensor_scalar_kernel)
 
 } // namespace at::native
+
+// ---- host tracing (ATen/cuda/host_trace): the traced sibling of pow_tensor_scalar_kernel, compiled here
+// so the sibling and the real host above instantiate the one kernel over the four pow functors
+// (DECISIONS E36): the tape's launch is eager's function object, not a twin. Outside a trace the
+// entry runs the same launches in ordinary mode, which is how the parity test compares it with
+// the real op.
+#include <ATen/cuda/host_trace/ti/LoopsSym.cuh>
+#include <ATen/cuda/host_trace/ti/Ops.h>
+
+namespace at::cuda::host_trace::ti {
+
+Tensor pow_tensor_scalar_traced(const Tensor& self, const Scalar& exponent) {
+  if (!exponent.isComplex()) {
+    if (exponent.equal(.5)) {
+      return sqrt_traced(self);
+    } else if (exponent.equal(-0.5)) {
+      decline("host_trace: pow with exponent -0.5 routes to rsqrt, which has no traced sibling in this version (declined)");
+    } else if (exponent.equal(-1.0)) {
+      return reciprocal_traced(self);
+    }
+  }
+  TensorIteratorSym iter = TensorIteratorSym::unary_op(Tensor(), self);
+  if (!at::isFloatingType(iter.common_dtype()) || exponent.isComplex()) {
+    decline(c10::str("host_trace: pow on ", iter.common_dtype(), " with exponent ", exponent, " is not traced (declined)"));
+  }
+  AT_DISPATCH_FLOATING_TYPES_AND2(kHalf, kBFloat16, iter.common_dtype(), "pow_traced", [&] {
+    const auto exp = exponent.to<scalar_t>();
+    const auto d_exp = static_cast<double>(exp);
+    if (d_exp == 2) {
+      gpu_kernel(iter, at::native::PowSquareFunctor<scalar_t>());
+    } else if (d_exp == 3) {
+      gpu_kernel(iter, at::native::PowCubeFunctor<scalar_t>());
+    } else if (d_exp == -2) {
+      gpu_kernel(iter, at::native::PowInverseSquareFunctor<scalar_t>());
+    } else {
+      gpu_kernel(iter, at::native::PowFunctor<scalar_t, scalar_t>{exp});
+    }
+  });
+  return iter.output();
+}
+
+} // namespace at::cuda::host_trace::ti

@@ -1,4 +1,4 @@
-#define TORCH_ASSERT_NO_OPERATORS
+#define TORCH_ASSERT_ONLY_METHOD_OPERATORS
 #include <limits>
 #include <ATen/native/UnaryOps.h>
 #include <ATen/native/cuda/Loops.cuh>
@@ -96,14 +96,21 @@ __host__ __device__ static inline c10::complex<T> reciprocal_wrapper(c10::comple
   return one/v;
 }
 
+namespace {
+template <typename scalar_t>
+struct ReciprocalFunctor {
+  __device__ scalar_t operator()(scalar_t a) const {
+    return reciprocal_wrapper(a);
+  }
+};
+} // namespace
+
 void reciprocal_kernel_cuda(TensorIteratorBase& iter) {
   AT_DISPATCH_FLOATING_AND_COMPLEX_TYPES_AND2(
       ScalarType::Half, ScalarType::BFloat16,
       iter.common_dtype(), "reciprocal_cuda",
       [&]() {
-        gpu_kernel(iter, []GPU_LAMBDA(scalar_t a) -> scalar_t {
-          return reciprocal_wrapper(a);
-        });
+        gpu_kernel(iter, ReciprocalFunctor<scalar_t>());
       });
 }
 
@@ -197,3 +204,19 @@ REGISTER_DISPATCH(round_decimals_stub, &round_decimals_kernel_cuda)
 REGISTER_DISPATCH(trunc_stub, &trunc_kernel_cuda)
 
 } // namespace at::native
+
+// ---- host tracing (ATen/cuda/host_trace): the traced sibling of reciprocal_kernel_cuda, compiled here
+// so the sibling and the real host above instantiate the one kernel over ReciprocalFunctor
+// (DECISIONS E36): the tape's launch is eager's function object, not a twin. Outside a trace the
+// entry runs the same launches in ordinary mode, which is how the parity test compares it with
+// the real op.
+#include <ATen/cuda/host_trace/ti/Ops.h>
+#include <ATen/cuda/host_trace/ti/UnaryEntry.cuh>
+
+namespace at::cuda::host_trace::ti {
+
+Tensor reciprocal_traced(const Tensor& self) {
+  return floating_unary<at::native::ReciprocalFunctor>(self, "reciprocal");
+}
+
+} // namespace at::cuda::host_trace::ti

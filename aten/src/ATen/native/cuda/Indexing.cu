@@ -1781,17 +1781,23 @@ Tensor index_select_quantized_cuda(const Tensor& self, int64_t dim, const Tensor
 
 namespace {
 
+// masked_fill_kernel's device function: the value, as its lambda captured it
+template <typename scalar_t>
+struct MaskedFillFunctor {
+  scalar_t value_;
+  __device__ scalar_t operator()(scalar_t self, bool mask) const {
+    if (mask) {
+      return value_;
+    }
+    return self;
+  }
+};
+
 void masked_fill_kernel(TensorIterator& iter, const Scalar& value) {
   AT_DISPATCH_ALL_TYPES_AND_COMPLEX_AND5(
       kBool, kHalf, kBFloat16, kComplexHalf, kBComplex32, iter.common_dtype(), "masked_fill_", [&]() {
         const auto value_ = value.to<scalar_t>();
-        gpu_kernel(
-            iter, [value_] GPU_LAMBDA(scalar_t self, bool mask) -> scalar_t {
-              if (mask) {
-                return value_;
-              }
-              return self;
-            });
+        gpu_kernel(iter, MaskedFillFunctor<scalar_t>{value_});
       });
 }
 
@@ -2044,3 +2050,52 @@ Tensor index_select_sparse_cuda(const Tensor& self, int64_t dim, const Tensor& i
 
 
 } // at::native
+
+// ---- host tracing (ATen/cuda/host_trace): the traced sibling of masked_fill_kernel, compiled here
+// so the sibling and the real host above instantiate the one kernel over MaskedFillFunctor
+// (DECISIONS E36): the tape's launch is eager's function object, not a twin. Outside a trace the
+// entry runs the same launches in ordinary mode, which is how the parity test compares it with
+// the real op.
+#include <ATen/cuda/host_trace/ti/LoopsSym.cuh>
+#include <ATen/cuda/host_trace/ti/Ops.h>
+#include <ATen/cuda/host_trace/ti/TensorIteratorSym.h>
+
+#include <ATen/ExpandUtils.h>
+#include <ATen/MemoryOverlap.h>
+
+namespace at::cuda::host_trace::ti {
+
+Tensor& masked_fill_traced(Tensor& self, const Tensor& mask, const Scalar& value) {
+  TORCH_CHECK(self.device() == mask.device(), "expected self and mask to be on the same device, but got mask on ",
+    mask.device(), " and self on ", self.device());
+  TORCH_CHECK(mask.scalar_type() == kBool,
+    "masked_fill only supports boolean masks, but got dtype ", mask.scalar_type());
+  if (isComplexType(self.scalar_type())) {
+    decline(c10::str("host_trace: masked_fill_ of a ", self.scalar_type(), " tensor is not traced (declined)"));
+  }
+  if (at::has_internal_overlap(self) == MemOverlap::Yes) {
+    TORCH_WARN(
+      "Use of masked_fill_ on expanded tensors is deprecated. "
+      "Please clone() the tensor before performing this operation. "
+      "This also applies to advanced indexing e.g. tensor[mask] = scalar");
+  }
+  assert_no_partial_overlap_sym(self, mask);
+
+  c10::MaybeOwned<Tensor> b_mask = expand_inplace(self, mask, "masked_fill_");
+
+  TensorIteratorSymConfig config;
+  config.check_mem_overlap_ = false;
+  config.check_all_same_dtype_ = false;
+  config.resize_outputs_ = false;
+  TensorIteratorSym iter;
+  iter.add_output(self);
+  iter.add_input(self);
+  iter.add_input(*b_mask);
+  iter.build(config);
+  AT_DISPATCH_ALL_TYPES_AND3(kBool, kHalf, kBFloat16, iter.common_dtype(), "masked_fill_traced", [&] {
+    gpu_kernel(iter, at::native::MaskedFillFunctor<scalar_t>{value.to<scalar_t>()});
+  });
+  return self;
+}
+
+} // namespace at::cuda::host_trace::ti

@@ -1,4 +1,4 @@
-#define TORCH_ASSERT_NO_OPERATORS
+#define TORCH_ASSERT_ONLY_METHOD_OPERATORS
 #include <ATen/NumericUtils.h>
 #include <ATen/Dispatch.h>
 #include <ATen/Dispatch_v2.h>
@@ -58,33 +58,43 @@ void clamp_kernel_impl(TensorIteratorBase& iter) {
   }), AT_EXPAND(AT_ALL_TYPES), AT_EXPAND(AT_BAREBONES_UNSIGNED_TYPES), kHalf, kBFloat16);
 }
 
+// launch_clamp_scalar's device function: the members in the order its lambda captured them
+template <typename scalar_t>
+struct ClampScalarFunctor {
+  using opmath_t = at::opmath_type<scalar_t>;
+  at::native::detail::ClampLimits minmax;
+  opmath_t lim0_val;
+  opmath_t lim1_val;
+  __device__ scalar_t operator()(scalar_t v) const {
+    opmath_t val = static_cast<opmath_t>(v);
+    // Propagate nan, which doesn't propagate automatically for ROCm
+    if (_isnan(static_cast<opmath_t>(v))) {
+      return v;
+    } else if (minmax==at::native::detail::ClampLimits::Min){
+      if (val == lim0_val)
+        return v;
+      return (val < lim0_val) ? static_cast<scalar_t>(lim0_val) : v;
+    } else if (minmax==at::native::detail::ClampLimits::Max){
+      if (val == lim0_val)
+        return v;
+      return (val > lim0_val) ? static_cast<scalar_t>(lim0_val) : v;
+    } else {
+      // The following replaces std::clamp(val, low, high) and is a viable solution for
+      // both CUDA and ROCm since std::clamp and this replacement generates the same PTX.
+      // The replacement should generate the same PTX as std::clamp. See https://godbolt.org/z/Wde9KW3v4
+      opmath_t result = (val < lim0_val) ? lim0_val : val;
+      return scalar_t((lim1_val < result) ? lim1_val : result);
+    }
+  }
+};
+
 void inline launch_clamp_scalar(TensorIteratorBase& iter, Scalar lim0, Scalar lim1, at::native::detail::ClampLimits minmax){
   AT_DISPATCH_V2(iter.common_dtype(), "clamp_scalar_cuda", AT_WRAP([&] {
     using opmath_t = at::opmath_type<scalar_t>;
     auto lim0_val = lim0.to<opmath_t>();
     auto lim1_val = lim1.to<opmath_t>();
 
-    gpu_kernel(iter, [=]GPU_LAMBDA(scalar_t v) -> scalar_t {
-      opmath_t val = static_cast<opmath_t>(v);
-      // Propagate nan, which doesn't propagate automatically for ROCm
-      if (_isnan(static_cast<opmath_t>(v))) {
-        return v;
-      } else if (minmax==at::native::detail::ClampLimits::Min){
-        if (val == lim0_val)
-          return v;
-        return (val < lim0_val) ? static_cast<scalar_t>(lim0_val) : v;
-      } else if (minmax==at::native::detail::ClampLimits::Max){
-        if (val == lim0_val)
-          return v;
-        return (val > lim0_val) ? static_cast<scalar_t>(lim0_val) : v;
-      } else {
-        // The following replaces std::clamp(val, low, high) and is a viable solution for
-        // both CUDA and ROCm since std::clamp and this replacement generates the same PTX.
-        // The replacement should generate the same PTX as std::clamp. See https://godbolt.org/z/Wde9KW3v4
-        opmath_t result = (val < lim0_val) ? lim0_val : val;
-        return scalar_t((lim1_val < result) ? lim1_val : result);
-      }
-    });
+    gpu_kernel(iter, ClampScalarFunctor<scalar_t>{minmax, lim0_val, lim1_val});
   }), AT_EXPAND(AT_ALL_TYPES), AT_EXPAND(AT_BAREBONES_UNSIGNED_TYPES), kHalf, kBFloat16);
 }
 
@@ -150,3 +160,87 @@ void _assert_async_cuda(const Tensor& self_tensor) {
 }
 
 } // namespace at::native
+
+// ---- host tracing (ATen/cuda/host_trace): the traced sibling of launch_clamp_scalar, compiled here
+// so the sibling and the real host above instantiate the one kernel over ClampScalarFunctor
+// (DECISIONS E36): the tape's launch is eager's function object, not a twin. Outside a trace the
+// entry runs the same launches in ordinary mode, which is how the parity test compares it with
+// the real op.
+#include <ATen/cuda/host_trace/ti/LoopsSym.cuh>
+#include <ATen/cuda/host_trace/ti/Ops.h>
+
+#include <c10/util/TypeSafeSignMath.h>
+
+#include <limits>
+
+namespace at::cuda::host_trace::ti {
+
+namespace {
+// TensorCompare.cpp prepare_clamp_bound / clamp_bound_range for the bounds
+// that reach the kernel here: an integral bound on an integral dtype (a
+// floating bound on one is promotion and declined before this)
+std::optional<Scalar> prepare_clamp_bound(const std::optional<Scalar>& bound, ScalarType dtype, bool is_lower_bound) {
+  if (!bound.has_value()) {
+    return std::nullopt;
+  }
+  if (!isIntegralType(dtype, /*includeBool=*/false)) {
+    return bound;
+  }
+  const int64_t value = bound->toLong();
+  bool below = false;
+  bool above = false;
+  AT_DISPATCH_V2(dtype, "prepare_clamp_bound", AT_WRAP([&] {
+    below = c10::less_than_lowest<scalar_t>(value);
+    above = c10::greater_than_max<scalar_t>(value);
+  }), AT_EXPAND(AT_INTEGRAL_TYPES_V2));
+  if (!below && !above) {
+    return bound;
+  }
+  const bool is_noop = is_lower_bound ? below : above;
+  TORCH_CHECK(
+      is_noop,
+      "Clamp ",
+      is_lower_bound ? "min" : "max",
+      " value ",
+      bound->toDouble(),
+      " is outside the representable range of ",
+      dtype);
+  return std::nullopt;
+}
+
+bool is_nan_bound(const std::optional<Scalar>& bound) {
+  return bound.has_value() && bound->toDouble() != bound->toDouble();
+}
+} // namespace
+
+Tensor clamp_scalar_traced(const Tensor& self, const std::optional<Scalar>& min, const std::optional<Scalar>& max, const Tensor& out) {
+  using at::native::detail::ClampLimits;
+  TensorIteratorSym iter = TensorIteratorSym::unary_op(out, self);
+  const ScalarType dtype = iter.common_dtype();
+  if (isComplexType(dtype) || dtype == kBool || isFloat8Type(dtype) || isBitsType(dtype)) {
+    decline(c10::str("host_trace: clamp on ", dtype, " is not traced (declined)"));
+  }
+  Tensor result = iter.output();
+  if (is_nan_bound(min) || is_nan_bound(max)) {
+    return fill_traced(result, std::numeric_limits<double>::quiet_NaN());
+  }
+  const auto lo = prepare_clamp_bound(min, dtype, /*is_lower_bound=*/true);
+  const auto hi = prepare_clamp_bound(max, dtype, /*is_lower_bound=*/false);
+  if (!lo && !hi) {
+    if (!result.is_same(self)) {
+      copy_traced(result, self);
+    }
+    return result;
+  }
+  const Scalar lim0 = lo ? *lo : *hi;
+  const Scalar lim1 = hi ? *hi : *lo;
+  const ClampLimits minmax = (lo && hi) ? ClampLimits::MinMax : (lo ? ClampLimits::Min : ClampLimits::Max);
+  AT_DISPATCH_V2(dtype, "clamp_scalar_traced", AT_WRAP([&] {
+    using opmath_t = at::opmath_type<scalar_t>;
+    Zeroed<at::native::ClampScalarFunctor<scalar_t>> f(minmax, lim0.to<opmath_t>(), lim1.to<opmath_t>());
+    gpu_kernel(iter, f.get());
+  }), AT_EXPAND(AT_ALL_TYPES), AT_EXPAND(AT_BAREBONES_UNSIGNED_TYPES), kHalf, kBFloat16);
+  return result;
+}
+
+} // namespace at::cuda::host_trace::ti

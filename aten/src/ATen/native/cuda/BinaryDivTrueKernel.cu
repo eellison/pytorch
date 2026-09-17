@@ -1,4 +1,4 @@
-#define TORCH_ASSERT_NO_OPERATORS
+#define TORCH_ASSERT_ONLY_METHOD_OPERATORS
 #include <ATen/AccumulateType.h>
 #include <ATen/Dispatch.h>
 #include <ATen/native/BinaryOps.h>
@@ -63,3 +63,39 @@ void div_true_kernel_cuda(TensorIteratorBase& iter) {
 REGISTER_DISPATCH(div_true_stub, &binary_internal::div_true_kernel_cuda)
 
 } // namespace at::native
+
+// ---- host tracing (ATen/cuda/host_trace): the traced sibling of div_true_kernel_cuda, compiled here
+// so the sibling and the real host above instantiate the one kernel over DivFunctor and BUnaryFunctor over MulFunctor
+// (DECISIONS E36): the tape's launch is eager's function object, not a twin. Outside a trace the
+// entry runs the same launches in ordinary mode, which is how the parity test compares it with
+// the real op.
+#undef TORCH_ASSERT_NO_OPERATORS  // BinaryInternal.h's; the file keeps TORCH_ASSERT_ONLY_METHOD_OPERATORS
+#include <ATen/cuda/host_trace/ti/LoopsSym.cuh>
+#include <ATen/cuda/host_trace/ti/Ops.h>
+
+namespace at::cuda::host_trace::ti {
+
+Tensor div_traced(const Tensor& self, const Tensor& other, const Tensor& out) {
+  TensorIteratorSym iter = TensorIteratorSym::binary_op(out, self, other);
+  if (!at::isFloatingType(iter.common_dtype())) {
+    decline(c10::str("host_trace: div on ", iter.common_dtype(), " is not traced (declined)"));
+  }
+  if (iter.is_cpu_scalar(2)) {
+    AT_DISPATCH_FLOATING_TYPES_AND2(kHalf, kBFloat16, iter.common_dtype(), "div_traced", [&] {
+      using opmath_t = at::opmath_type<scalar_t>;
+      using functor_t = at::native::binary_internal::MulFunctor<opmath_t>;
+      auto inv_b = static_cast<opmath_t>(double(1.0) / iter.scalar_value<double>(2));
+      iter.remove_operand(2);
+      ScalarFunctor<at::native::BUnaryFunctor<scalar_t, scalar_t, scalar_t, functor_t>, functor_t, opmath_t> bf(functor_t(), inv_b);
+      gpu_kernel(iter, bf.get());
+    });
+  } else {
+    AT_DISPATCH_FLOATING_TYPES_AND2(kHalf, kBFloat16, iter.common_dtype(), "div_traced", [&] {
+      at::native::binary_internal::DivFunctor<scalar_t> f;
+      gpu_kernel_with_scalars(iter, f);
+    });
+  }
+  return iter.output();
+}
+
+} // namespace at::cuda::host_trace::ti

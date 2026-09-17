@@ -1,4 +1,4 @@
-#define TORCH_ASSERT_NO_OPERATORS
+#define TORCH_ASSERT_ONLY_METHOD_OPERATORS
 #include <ATen/native/UnaryOps.h>
 
 #include <limits>
@@ -132,6 +132,15 @@ void rsqrt_kernel_cuda(TensorIteratorBase& iter) {
 }
 
 constexpr char sqrt_name[] = "sqrt_kernel";
+namespace {
+template <typename scalar_t>
+struct SqrtFunctor {
+  __device__ scalar_t operator()(scalar_t a) const {
+    return std::sqrt(a);
+  }
+};
+} // namespace
+
 void sqrt_kernel_cuda(TensorIteratorBase& iter) {
   auto common_dtype = iter.common_dtype();
   if (at::isComplexType(common_dtype)) {
@@ -158,9 +167,7 @@ void sqrt_kernel_cuda(TensorIteratorBase& iter) {
     #endif
   } else {
     AT_DISPATCH_FLOATING_TYPES_AND2(ScalarType::Half, ScalarType::BFloat16, common_dtype, "sqrt_cuda", [&]() {
-      gpu_kernel(iter, []GPU_LAMBDA(scalar_t a) -> scalar_t {
-        return std::sqrt(a);
-      });
+      gpu_kernel(iter, SqrtFunctor<scalar_t>());
     });
   }
 }
@@ -284,3 +291,19 @@ REGISTER_DISPATCH(nan_to_num_stub, &nan_to_num_kernel_cuda)
 REGISTER_DISPATCH(frexp_stub, &frexp_kernel_cuda)
 
 } // namespace at::native
+
+// ---- host tracing (ATen/cuda/host_trace): the traced sibling of sqrt_kernel_cuda (and exp_kernel_cuda, rsqrt_kernel_cuda from commit 7), compiled here
+// so the sibling and the real host above instantiate the one kernel over SqrtFunctor
+// (DECISIONS E36): the tape's launch is eager's function object, not a twin. Outside a trace the
+// entry runs the same launches in ordinary mode, which is how the parity test compares it with
+// the real op.
+#include <ATen/cuda/host_trace/ti/Ops.h>
+#include <ATen/cuda/host_trace/ti/UnaryEntry.cuh>
+
+namespace at::cuda::host_trace::ti {
+
+Tensor sqrt_traced(const Tensor& self) {
+  return floating_unary<at::native::SqrtFunctor>(self, "sqrt");
+}
+
+} // namespace at::cuda::host_trace::ti

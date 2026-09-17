@@ -46,7 +46,16 @@ from torchgen.api.python import (
     PythonSignatureNativeFunctionPair,
     returns_structseq_pyi,
 )
-from torchgen.gen import parse_native_yaml, parse_tags_yaml
+from torchgen.dest.ufunc import (
+    parse_host_trace_siblings,
+    sibling_ops_for,
+    sibling_pyi_stub,
+)
+from torchgen.gen import (
+    get_grouped_native_functions,
+    parse_native_yaml,
+    parse_tags_yaml,
+)
 from torchgen.model import _TorchDispatchModeKey, DispatchKey, SchemaKind, Variant
 from torchgen.utils import FileManager
 
@@ -1033,6 +1042,7 @@ def gen_pyi(
     tags_yaml_path: str,
     deprecated_yaml_path: str,
     fm: FileManager,
+    host_trace_siblings_path: str | None = None,
 ) -> None:
     """gen_pyi()
 
@@ -1496,6 +1506,17 @@ def gen_pyi(
     native_functions = parse_native_yaml(
         native_yaml_path, tags_yaml_path
     ).native_functions
+    # the generated host-tracing siblings' bindings (torchgen/dest/ufunc.py
+    # over cuda/host_trace/ti/siblings.yaml): one stub per entry
+    host_trace_sibling_hints = [
+        sibling_pyi_stub(op)
+        for op in sibling_ops_for(
+            get_grouped_native_functions(native_functions),
+            parse_host_trace_siblings(host_trace_siblings_path)
+            if host_trace_siblings_path
+            else {},
+        )
+    ]
     native_functions = list(filter(should_generate_py_binding, native_functions))
 
     function_signatures = load_signatures(
@@ -2085,6 +2106,7 @@ def gen_pyi(
         "torch_dispatch_mode_key_hints": torch_dispatch_mode_key_hints,
         "all_directive": all_directive,
         "tag_attributes": tag_attributes,
+        "host_trace_sibling_hints": host_trace_sibling_hints,
     }
     fm.write_with_template(
         "torch/_C/__init__.pyi",
@@ -2130,6 +2152,12 @@ def main() -> None:
         help="path to deprecated.yaml",
     )
     parser.add_argument(
+        "--host-trace-siblings-path",
+        metavar="SIBLINGS",
+        default="aten/src/ATen/cuda/host_trace/ti/siblings.yaml",
+        help="path to the host-tracing siblings.yaml (the generated siblings' stubs)",
+    )
+    parser.add_argument(
         "--out",
         metavar="OUT",
         default=".",
@@ -2149,6 +2177,7 @@ def main() -> None:
         args.tags_path,
         args.deprecated_functions_path,
         fm,
+        args.host_trace_siblings_path,
     )
 
 

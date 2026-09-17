@@ -1,0 +1,15 @@
+#pragma once
+
+#include <c10/macros/Macros.h>
+
+namespace at::native::ufunc {
+
+// BinaryMiscBackwardOpsKernels.cu tanh_backward_kernel_cuda's real-type device
+// body (CUDAFunctor_tanh_backward): (grad_output, output), arithmetic in the
+// tensor dtype
+template <typename T>
+C10_HOST_DEVICE C10_ALWAYS_INLINE T tanh_backward(T a, T b) {
+  return a * (T{1.} - b * b);
+}
+
+} // namespace at::native::ufunc

@@ -101,6 +101,66 @@ def exec_node_states(graph):
     return states
 
 
+def capture_graph(fn):
+    """fn once eagerly, then under stream capture on a side stream that waits
+    for the current one (where the caller made the inputs); the graph kept so
+    its nodes can be read."""
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        fn()
+        g = torch.cuda.CUDAGraph(keep_graph=True)
+        with torch.cuda.graph(g, stream=stream, capture_error_mode="relaxed"):
+            fn()
+    stream.synchronize()
+    return g
+
+
+def graph_functions(graph):
+    """The device function of every kernel node of a graph, the (CUfunction,
+    CUkernel) handles of cuGraphKernelNodeGetParams, in cuGraphGetNodes order;
+    a memcpy node as the string "memcpy", a memset node as "memset". The driver
+    API: the runtime bindings are another cudart instance, where torch's
+    kernels are not registered."""
+    from cuda.bindings import driver as drv
+
+    from torch.cuda._utils import _check_cuda_bindings as check
+
+    raw = graph.raw_cuda_graph()
+    count = check(drv.cuGraphGetNodes(raw, 0))[1]
+    nodes = check(drv.cuGraphGetNodes(raw, count))[0] if count else []
+    kinds = {
+        drv.CUgraphNodeType.CU_GRAPH_NODE_TYPE_MEMCPY: "memcpy",
+        drv.CUgraphNodeType.CU_GRAPH_NODE_TYPE_MEMSET: "memset",
+    }
+    out = []
+    for node in nodes:
+        kind = check(drv.cuGraphNodeGetType(node))
+        if kind == drv.CUgraphNodeType.CU_GRAPH_NODE_TYPE_KERNEL:
+            params = check(drv.cuGraphKernelNodeGetParams(node))
+            out.append((int(params.func), int(params.kern)))
+        else:
+            out.append(kinds.get(kind, str(kind)))
+    return out
+
+
+def assert_eager_function_handles(test, real, args, entry=None, launches=None):
+    """E36's gate for one call: the variant built from the tape of `real(*args)`
+    (and the entry's own capture, when `entry` is given) holds at every node
+    what eager's capture of the same call holds: the kind, and for a kernel
+    node the function handle, so the replay launches eager's own kernel, not
+    a twin. Returns eager's node list."""
+    eager = graph_functions(capture_graph(lambda: real(*args)))
+    if entry is not None:
+        test.assertEqual(graph_functions(capture_graph(lambda: entry(*args))), eager)
+    tape = ht.trace(real, args)
+    variant = ht.build(tape, real, args)
+    test.assertEqual(graph_functions(variant.graph), eager)
+    if launches is not None:
+        test.assertEqual(tape.num_launches, launches)
+    return eager
+
+
 def assert_no_disabled_memset(test, variant, what=""):
     """No memset node of a built exec is disabled: on driver 580.126.20 a kernel
     node behind a disabled memset node launches before the stream's prior work

@@ -264,8 +264,8 @@ if(INTERN_BUILD_ATEN_OPS)
       ${CUSTOM_BUILD_FLAGS}
   )
 
-  file(GLOB_RECURSE headers_templates "${CMAKE_CURRENT_LIST_DIR}/../aten/src/ATen/templates/*\.h")
-  file(GLOB_RECURSE sources_templates "${CMAKE_CURRENT_LIST_DIR}/../aten/src/ATen/templates/*\.cpp")
+  file(GLOB_RECURSE headers_templates "${CMAKE_CURRENT_LIST_DIR}/../aten/src/ATen/templates/*\.h" "${CMAKE_CURRENT_LIST_DIR}/../aten/src/ATen/templates/*\.cuh")
+  file(GLOB_RECURSE sources_templates "${CMAKE_CURRENT_LIST_DIR}/../aten/src/ATen/templates/*\.cpp" "${CMAKE_CURRENT_LIST_DIR}/../aten/src/ATen/templates/*\.cu")
   # The arch list this configure RESOLVED, for tools/native_aot/build_stage2.py to
   # target. Recorded rather than re-derived there: EnvVarForwarding.cmake forwards
   # the environment into the cache only when the variable is undefined, and

@@ -239,6 +239,94 @@ _TRACEABLE = {
 # (Recorder.cpp kNoDataPtr); the trace turns it into a decline naming the op
 _NO_DATA_PTR = "host_trace: data_ptr() / storage() on a traced tensor"
 
+# CUDA ops with a traced sibling host (torch/cuda/_host_trace_ti.py): the trace
+# mode calls the entry in place of the op, and a replay's build runs the same
+# entry in ordinary mode, so the tape and the captured graph describe one host
+_TRACED_ENTRIES: dict[Any, Any] = {}
+# the entries that take the call's SymInt arguments as they are (a factory's
+# sizes, arange's bounds); the mode pins them for every other op
+_SYMINT_ENTRIES: set[Any] = set()
+
+
+@functools.cache
+def _decomposes_only_off_cuda(func: Any) -> bool:
+    # an op with a CUDA kernel (or a CompositeExplicit one) beside a
+    # CompositeImplicit kernel: the dispatcher takes the CompositeImplicit
+    # kernel only on a backend without the other, so eager on CUDA never runs
+    # the decomposition the mode's fallback would run (_fused_rms_norm's
+    # rms_norm_composite)
+    has = torch._C._dispatch_has_kernel_for_dispatch_key
+    name = func.name()
+    return has(name, "CompositeImplicitAutograd") and any(
+        has(name, key)
+        for key in (
+            "CUDA",
+            "CompositeExplicitAutograd",
+            "CompositeExplicitAutogradNonFunctional",
+        )
+    )
+
+
+_EXPLICIT_KERNELS = (
+    "CompositeExplicitAutogradNonFunctional",
+    "CompositeExplicitAutograd",
+)
+
+
+@functools.cache
+def _explicit_body_key(func: Any, key: str) -> Any | None:
+    # the key set to run the op's own eager body at: an op with no kernel of
+    # its own whose computed dispatch entry on the tensors' backend `key`
+    # (Undefined without a tensor) is a CompositeExplicit kernel, the C++
+    # body eager runs one key below the mode (slice_backward: zeros, then a
+    # copy into a view of it). None where eager finds a kernel of the op's
+    # own or a BackendSelect kernel there, or nothing but the
+    # CompositeImplicit kernel decompose() runs (OperatorEntry.cpp
+    # computeDispatchTableEntryWithDebug, steps 1 to 2.2)
+    has = torch._C._dispatch_has_kernel_for_dispatch_key
+    name = func.name()
+    keys = ["BackendSelect", key] if key != "Undefined" else ["BackendSelect"]
+    below = next((k for k in keys + list(_EXPLICIT_KERNELS) if has(name, k)), None)
+    if below not in _EXPLICIT_KERNELS:
+        return None
+    return torch._C.DispatchKeySet(getattr(torch._C.DispatchKey, key))
+
+
+def _key_below(args: tuple, kwargs: dict) -> str:
+    # the backend key eager dispatches the call to below the mode's: the
+    # tensor arguments' highest (CUDA over CPU), Undefined without one
+    key = "Undefined"
+    for a in (*args, *kwargs.values()):
+        for t in a if isinstance(a, (list, tuple)) else (a,):
+            if isinstance(t, torch.Tensor):
+                if t.is_cuda:
+                    return "CUDA"
+                key = "CPU"
+    return key
+
+
+def register_traced_entry(
+    op: Any,
+    entry: Callable[..., Any],
+    *,
+    replace: bool = False,
+    symint: bool = False,
+) -> None:
+    """Stand `entry` in for `op` under a trace (and at a variant's build).
+    An entry takes the op's arguments, runs its traced sibling host or raises
+    Declined; it must not dispatch `op` itself (that re-entry is declined).
+    With `symint` the entry receives the call's SymInt arguments as they are
+    (a factory's sizes, arange's bounds); otherwise the mode pins them, as
+    the CUDA kernels' non-SymInt signatures require."""
+    if not replace and op in _TRACED_ENTRIES:
+        raise ValueError(
+            f"host_trace: {op} already has a traced entry; pass replace=True to substitute it"
+        )
+    _TRACED_ENTRIES[op] = entry
+    if symint:
+        _SYMINT_ENTRIES.add(op)
+
+
 _ALLOC_OPS = {
     aten.empty.memory_format,
     aten.empty_strided.default,
@@ -1653,7 +1741,8 @@ class _TraceMode(TorchDispatchMode):
         super().__init__()
         self.trace = tr
         self.depth = 0
-        self.decomposing: list = []  # composite ops whose decomposition is running
+        self.decomposing: list = []  # composite ops whose decomposition or body runs
+        self.entering: list = []  # ops whose traced entry is running
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
         try:
@@ -1694,14 +1783,29 @@ class _TraceMode(TorchDispatchMode):
             return self.trace.allocate(func, args, kwargs)
         if func in _VIEW_OPS:
             return self.trace.view(func, args, kwargs)
-        if self.depth == 0 and func in _TRACEABLE:
-            # the op under trace: let it reach its CUDA host, which is the
-            # code being recorded; the mode stays on for what the host does
+        # an op with a traced sibling host is traceable at any depth: under
+        # trace, or inside another host (a layer norm copying a non-contiguous
+        # input calls copy_)
+        entry = _TRACED_ENTRIES.get(func)
+        if entry is not None or (self.depth == 0 and func in _TRACEABLE):
+            if entry is not None and func in self.entering:
+                raise Declined(
+                    f"host_trace: the traced entry for {func} dispatched {func} itself; "
+                    "an entry runs its sibling host or declines (declined)"
+                )
+            # the op under trace: let it reach its CUDA host (or the traced
+            # sibling host that stands in for it), which is the code being
+            # recorded; the mode stays on for what the host does
             self.depth += 1
+            if entry is not None:
+                self.entering.append(func)
             try:
                 with self:
-                    args = tuple(_concrete_ints(a) for a in args)
-                    kwargs = {k: _concrete_ints(v) for k, v in kwargs.items()}
+                    if func not in _SYMINT_ENTRIES:
+                        args = tuple(_concrete_ints(a) for a in args)
+                        kwargs = {k: _concrete_ints(v) for k, v in kwargs.items()}
+                    if entry is not None:
+                        return entry(*args, **kwargs)
                     return func.redispatch(
                         torch._C.DispatchKeySet(torch._C.DispatchKey.CUDA),
                         *args,
@@ -1714,11 +1818,30 @@ class _TraceMode(TorchDispatchMode):
             except RuntimeError as e:
                 raise _refused_inside_the_trace(func, e) from e
             finally:
+                if entry is not None:
+                    self.entering.pop()
                 self.depth -= 1
-        # a composite op decomposes under the mode into the ones above
+        # a composite op decomposes under the mode into the ones above only
+        # where eager's dispatcher runs the same CompositeImplicit kernel; one
+        # eager serves with a kernel of its own is traced by a converted host
+        # or declined, never decomposed (DECISIONS A190, E34)
+        if _decomposes_only_off_cuda(func):
+            raise Declined(
+                f"host_trace: {func} runs its own CUDA kernel in eager, not its "
+                f"CompositeImplicit decomposition; a converted host for {func.name()} "
+                "is the way to trace it; the ordinary host serves (declined)"
+            )
+        # an op with no kernel of its own whose entry on the tensors' backend
+        # is a CompositeExplicit body runs that body, eager's own, under the
+        # mode: its pieces reach the mode and are traced as eager launches
+        # them (slice_backward: the zeros' memset and one copy); a host read
+        # inside the body declines where it occurs (DECISIONS E38)
+        body = _explicit_body_key(func, _key_below(args, kwargs))
         self.decomposing.append(func)
         try:
             with self:
+                if body is not None:
+                    return func.redispatch(body, *args, **kwargs)
                 r = func.decompose(*args, **kwargs)
         except Declined:
             raise
@@ -1735,6 +1858,65 @@ class _TraceMode(TorchDispatchMode):
         raise Declined(
             f"host_trace: {func} {where} is not a traceable CUDA host{via} (declined)"
         )
+
+
+class _EntryMode(TorchDispatchMode):
+    """The build's counterpart of the trace mode: an op with a traced sibling
+    runs that sibling in ordinary mode, so the captured graph holds the
+    launches the tape describes; every other op runs as usual, a composite
+    decomposed, or its eager body run under the mode, the way the trace did."""
+
+    @classmethod
+    def _should_skip_dynamo(cls):
+        return False
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.entering: list = []
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        kwargs = kwargs or {}
+        entry = _TRACED_ENTRIES.get(func)
+        # the entry stands in for a CUDA op; a CPU scalar operand (a wrapped
+        # Python number, a 0-dim CPU tensor) rides along as in the trace
+        if entry is not None and all(
+            a.is_cuda or (a.is_cpu and a.dim() == 0)
+            for a in args
+            if isinstance(a, torch.Tensor)
+        ):
+            if func in self.entering:
+                raise Declined(
+                    f"host_trace: the traced entry for {func} dispatched {func} itself; "
+                    "an entry runs its sibling host or declines (declined)"
+                )
+            self.entering.append(func)
+            try:
+                with self:
+                    return entry(*args, **kwargs)
+            finally:
+                self.entering.pop()
+        if func in _TRACEABLE:
+            # a converted CUDA host: the mode stays on for the ops it calls
+            # (a copy of a non-contiguous input), as in the trace
+            with self:
+                return func.redispatch(
+                    torch._C.DispatchKeySet(torch._C.DispatchKey.CUDA), *args, **kwargs
+                )
+        # a composite the trace ran as eager's own body (E38) runs it here
+        # too, under the mode, so its pieces take the entries the tape
+        # describes; a view, an allocation or an entry's op on operands the
+        # entry does not take runs as usual, as the trace never reached its
+        # fallback for those
+        body = None
+        if entry is None and func not in _VIEW_OPS and func not in _ALLOC_OPS:
+            body = _explicit_body_key(func, _key_below(args, kwargs))
+        with self:
+            if body is not None:
+                return func.redispatch(body, *args, **kwargs)
+            r = func.decompose(*args, **kwargs)
+        if r is not NotImplemented:
+            return r
+        return func(*args, **kwargs)
 
 
 class Tape:
@@ -2731,7 +2913,7 @@ class Variant:
         if self.warm_up:
             # two ordinary calls on the variant's own stream, so what a stream
             # initializes on first use happens outside the capture
-            with torch.cuda.stream(stream):
+            with torch.cuda.stream(stream), _EntryMode():
                 self.fn(*args)
                 self.fn(*args)
             stream.synchronize()
@@ -2757,7 +2939,8 @@ class Variant:
             with _gc_hold, torch.cuda.stream(stream):
                 graph.capture_begin(pool=pool, capture_error_mode="relaxed")
                 try:
-                    captured = self.fn(*args)
+                    with _EntryMode():
+                        captured = self.fn(*args)
                 finally:
                     # CUDAGraph ends a capture only on the stream that began
                     # it; the host may have left another stream current
@@ -3037,3 +3220,7 @@ class Entry:
             return self._ordinary(args)
         self.variants.append(variant)
         return variant(args)
+
+
+# registers the TensorIterator entries (add, mul, silu, gelu, copy_)
+from torch.cuda import _host_trace_ti  # noqa: F401

@@ -10,6 +10,8 @@
 #include <ATen/native/Copy.h>
 #include <ATen/native/TensorIterator.h>
 #include <ATen/native/cuda/Loops.cuh>
+#include <ATen/cuda/host_trace/ti/LoopsSym.cuh>
+#include <ATen/cuda/host_trace/ti/Ops.h>
 
 #ifndef AT_PER_OPERATOR_HEADERS
 #include <ATen/Functions.h>
@@ -42,6 +44,16 @@ at::cuda::CUDAEventPool::Event getEventFromPool(const at::DeviceIndex device_idx
 
 void neg_kernel_cuda(TensorIteratorBase &iter);
 void conj_kernel_cuda(TensorIteratorBase &iter);
+
+// the copy lambdas as named functors: the traced sibling at the end of this
+// file instantiates the kernels through them, so both hosts launch the one
+// instantiation of this translation unit
+template <typename scalar_t>
+struct CopyFunctor {
+  __device__ scalar_t operator()(scalar_t x) const {
+    return x;
+  }
+};
 
 void float16_copy_kernel_cuda(TensorIteratorBase &iter) {
     gpu_kernel_nocast(iter, [] GPU_LAMBDA(float value) {
@@ -243,7 +255,7 @@ void direct_copy_kernel_cuda(TensorIteratorBase &iter) {
   } else {
     AT_DISPATCH_V2(
         dtype, "copy_", AT_WRAP([&] {
-          gpu_kernel(iter, [] GPU_LAMBDA(scalar_t x) { return x; });
+          gpu_kernel(iter, CopyFunctor<scalar_t>{});
     }), AT_EXPAND(AT_ALL_TYPES_AND_COMPLEX), kHalf, kBool, kBFloat16, kComplexHalf, kBComplex32, AT_EXPAND(AT_BAREBONES_UNSIGNED_TYPES));
   }
 }
@@ -495,3 +507,40 @@ static void copy_kernel_cuda(TensorIterator& iter, bool non_blocking) {
 REGISTER_DISPATCH(copy_stub, &copy_kernel_cuda)
 
 } // namespace at::native
+
+// ---- host tracing (ATen/cuda/host_trace): the traced sibling of copy_device_to_device's
+// kernel branch (direct_copy_kernel_cuda for two CUDA tensors of one dtype). It lives in this
+// translation unit so that its launches are the instantiations the host above makes: the
+// replay's kernel nodes hold the function handle eager's do, not only its name. The real op
+// copies a contiguous pair with a memcpy rather than a kernel; that case declines, so the tape
+// and the real capture always agree on the kernel nodes.
+namespace at::cuda::host_trace::ti {
+
+Tensor& copy_traced(Tensor& dst, const Tensor& src) {
+  if (dst.scalar_type() != src.scalar_type()) {
+    decline(c10::str(
+        "host_trace: copy_ between ",
+        src.scalar_type(),
+        " and ",
+        dst.scalar_type(),
+        " casts, which is not traced (declined)"));
+  }
+  if (dst.is_conj() || src.is_conj() || dst.is_neg() || src.is_neg()) {
+    decline("host_trace: copy_ with a conjugate or negative bit is not traced (declined)");
+  }
+  TensorIteratorSymConfig config;
+  config.resize_outputs_ = false;
+  TensorIteratorSym iter;
+  iter.add_output(dst);
+  iter.add_input(src);
+  iter.build(config);
+  if (iter.is_contiguous()) {
+    decline("host_trace: a contiguous copy_ is a memcpy in the CUDA copy kernel, not a launch; not traced (declined)");
+  }
+  AT_DISPATCH_ALL_TYPES_AND3(kHalf, kBFloat16, kBool, iter.common_dtype(), "copy_traced", [&] {
+    gpu_kernel(iter, at::native::CopyFunctor<scalar_t>{});
+  });
+  return dst;
+}
+
+} // namespace at::cuda::host_trace::ti

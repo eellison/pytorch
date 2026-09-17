@@ -101,8 +101,8 @@ EXCLUDE(ATen_CORE_SRCS "${ATen_CORE_SRCS}" ${ATen_CORE_TEST_SRCS})
 
 file(GLOB base_h CONFIGURE_DEPENDS "*.h" "detail/*.h" "cpu/*.h" "cpu/vec/vec512/*.h" "cpu/vec/vec128/*.h" "cpu/vec/vec256/*.h" "cpu/vec/vec256/vsx/*.h" "cpu/vec/vec256/zarch/*.h" "cpu/vec/sve/*.h" "cpu/vec/*.h" "quantized/*.h" "functorch/*.h" "accelerator/*.h")
 file(GLOB base_cpp CONFIGURE_DEPENDS "*.cpp" "detail/*.cpp" "cpu/*.cpp" "functorch/*.cpp" "accelerator/*.cpp")
-file(GLOB cuda_h CONFIGURE_DEPENDS "cuda/*.h" "cuda/detail/*.h" "cuda/*.cuh" "cuda/detail/*.cuh" "cuda/tunable/*.cuh" "cuda/tunable/*.h" "cuda/host_trace/*.h")
-file(GLOB cuda_cpp CONFIGURE_DEPENDS "cuda/*.cpp" "cuda/detail/*.cpp" "cuda/tunable/*.cpp" "cuda/host_trace/*.cpp")
+file(GLOB cuda_h CONFIGURE_DEPENDS "cuda/*.h" "cuda/detail/*.h" "cuda/*.cuh" "cuda/detail/*.cuh" "cuda/tunable/*.cuh" "cuda/tunable/*.h" "cuda/host_trace/*.h" "cuda/host_trace/ti/*.h" "cuda/host_trace/ti/*.cuh")
+file(GLOB cuda_cpp CONFIGURE_DEPENDS "cuda/*.cpp" "cuda/detail/*.cpp" "cuda/tunable/*.cpp" "cuda/host_trace/*.cpp" "cuda/host_trace/ti/*.cpp")
 # Hooks.h is the recorder's internal hint-reader interface (Recorder.cpp and the
 # Python bindings only); it is built against in-tree and not installed.
 list(FILTER cuda_h EXCLUDE REGEX "host_trace/Hooks\\.h$")
