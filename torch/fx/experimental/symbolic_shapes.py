@@ -3955,6 +3955,12 @@ class _FrameLocalResult:
 
 
 class ShapeEnv:
+    # Keep float add/sub/mul/neg results in program order (Identity-wrapped in
+    # sym_node.py) so a float guard is re-evaluated as the program computed
+    # it, not as sympy re-associates it. Set by a tracer that replays float
+    # branches exactly (torch.cuda._host_trace); off for everything else.
+    exact_float_arithmetic: bool = False
+
     # This is a wrapper over the actual __init__ function.
     #
     # Where to add a new constructor parameter to ShapeEnv?

@@ -1,0 +1,7 @@
+# HOSTTRACE_SYNC_API allowlist: <repo-relative path> <API name>
+# One-time static initialization of the cuBLAS one/zero device constants: it runs
+# on first use, inside trace()'s warm-up call, never inside a trace.
+aten/src/ATen/cuda/detail/BLASConstants.cu cudaMemcpyToSymbol
+# Allocator plumbing, not a kernel host: the pluggable allocator's copy_data is
+# the caching allocator's storage-copy hook, never reached from a traceable host.
+torch/csrc/cuda/CUDAPluggableAllocator.cpp cudaMemcpy
