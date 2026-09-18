@@ -694,6 +694,26 @@ class CUDAGraph(_CUDAGraph):
             self.instantiate()
         self.capture_end_post()
 
+    def set_generator_increment(
+        self, generator: torch.Generator, increment: int
+    ) -> None:
+        r"""Set how many philox offsets each later replay draws from ``generator``.
+
+        A capture records, for every CUDA generator it used, the offset increment
+        the captured kernels asked for, and each :meth:`replay` advances the
+        generator by that amount so consecutive replays draw fresh random numbers.
+        That recorded increment is fixed at capture. A graph whose random
+        consumption depends on a runtime quantity (a dropout mask over a batch
+        that changes between replays through kernel parameter updates) must set
+        the increment its kernels will actually consume before each replay; a
+        replay that consumes more than the recorded increment would otherwise
+        overlap the next call's random stream, and one that consumes less skips
+        offsets, which is harmless. ``generator`` must have been used during this
+        graph's capture, ``increment`` must be a multiple of 4, and a new capture
+        resets the value to what it records.
+        """
+        super().set_generator_increment(generator, increment)
+
     def instantiate(self) -> None:
         r"""Instantiate the CUDA graph. Will be called by
         ``capture_end`` if ``keep_graph=False``, or by ``replay`` if

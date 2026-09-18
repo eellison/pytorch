@@ -80,6 +80,25 @@ void CUDAGraph::register_generator_state(
   captured_generator_states_[std::move(state)] = 0;
 }
 
+void CUDAGraph::set_generator_increment(
+    const at::Generator& generator,
+    uint64_t increment) {
+  TORCH_CHECK(
+      capture_ended_,
+      "CUDAGraph::set_generator_increment requires a completed capture.");
+  // see Note [Why enforce RNG offset % 4 == 0?] in CUDAGeneratorImpl.cpp
+  TORCH_CHECK(
+      increment % 4 == 0,
+      "CUDAGraph::set_generator_increment: the increment must be a multiple of 4, got ",
+      increment);
+  auto* cuda_gen = at::check_generator<at::CUDAGeneratorImpl>(generator);
+  auto it = captured_generator_states_.find(cuda_gen->state());
+  TORCH_CHECK(
+      it != captured_generator_states_.end(),
+      "CUDAGraph::set_generator_increment: this generator was not used during the graph's capture.");
+  it->second = increment;
+}
+
 bool CUDAGraph::has_retained_pool(MempoolId_t pool) const {
   for (const auto& retained_pool : retained_mempool_ids_) {
     if (retained_pool == pool) {

@@ -71,6 +71,17 @@ struct TORCH_CUDA_CPP_API CUDAGraph {
   CUDAGraph& operator=(CUDAGraph&& other) = delete;
 
   void register_generator_state(c10::intrusive_ptr<at::CUDAGeneratorState> state);
+  // Override, for the following replays, how many philox offsets a replay
+  // consumes from `generator`. capture_end records the increment the captured
+  // kernels asked for and every replay() advances the generator by it; that
+  // value is fixed at capture. A graph whose random consumption scales with a
+  // runtime quantity (a dropout mask over a batch that changes between replays
+  // through parameter updates) sets the increment its kernels will actually
+  // consume before each replay, otherwise a replay that consumes more than the
+  // recorded increment overlaps the next call's random stream. The generator
+  // must have been used during this graph's capture, the increment must be a
+  // multiple of 4, and a new capture resets the value.
+  void set_generator_increment(const at::Generator& generator, uint64_t increment);
   void capture_begin(
       MempoolId_t pool = {0, 0},
       cudaStreamCaptureMode capture_mode = cudaStreamCaptureModeGlobal);
