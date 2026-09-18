@@ -1190,6 +1190,25 @@ register_traced_entry(aten.triu_.default, _triu_tril(aten.triu_.default, True, T
 register_traced_entry(aten.tril_.default, _triu_tril(aten.tril_.default, False, True))
 
 
+# ---- the K = 1 bmm: torch._native's eager override of aten::bmm on CUDA
+# (ops/bmm_outer_product) runs a Triton outer-product kernel for a
+# (B, M, 1) x (B, 1, N) product, one multiply per element in the inputs'
+# dtype (fp32 opmath for the half types, as ATen's mul), so the sibling is
+# the broadcast multiply: bitwise the eager result. The trace routes bmm
+# here only when the override's condition holds (_host_trace._outer_product_bmm);
+# every other bmm is a closed cuBLAS region.
+
+
+def _bmm_outer_product(a, b):
+    _cuda_operands(aten.bmm.default, a, b)
+    if a.dtype is not b.dtype:
+        raise RuntimeError(f"expected scalar type {a.dtype} but found {b.dtype}")
+    return _C._host_trace_ti_mul(a, b)
+
+
+register_traced_entry(aten.bmm.default, _bmm_outer_product)
+
+
 # ---- the generated siblings (torchgen/dest/ufunc.py over ti/siblings.yaml
 # and native_functions.yaml's ufunc_inner_loop; HostTraceSiblingBindings.h):
 # one generic entry per functional overload, bound to the op's schema, and the

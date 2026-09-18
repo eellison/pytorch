@@ -115,6 +115,33 @@ generator where eager leaves it (the exactly-once contract). A tape is bound
 to its device class: hosts fold the SM count into values (dropout's grid cap
 and increment), so a build on a device with another SM count misses.
 
+Closed regions (cuBLAS). aten.mm and aten.addmm inside a traced function are
+not traced through the library: the trace records a closed region (the
+operands as values, the output as a traced allocation, the op and its
+scalars) and issues nothing. The replay's build captures the ordinary call,
+harvests a template for the region's concrete shapes (two raw captures of
+the same library call on scratch buffers at different addresses: the kernel
+nodes, and the image bytes that moved, which must each equal one operand's
+address, are the pointer slots), and pairs the build's nodes with the
+template byte for byte. Per call a region whose concrete shape key is the
+one loaded in the graph rebinds its pointer slots; a different key whose
+template has the same node chain (kernel count and order of kinds: cuBLAS
+adds a reduce kernel and a semaphore memset when it splits K) applies that
+key's template in place (the driver lets an exec node change its kernel),
+harvesting on first sight. The node chain of every region is part of the
+variant's class: the exec holds exactly the nodes of the templates the
+build's shapes selected, never a disabled node, and a key whose template
+has another chain is a TopologyMiss, a Miss that carries the tape: the same
+tape built at that call's inputs (build(tape, fn, args), no re-trace: the
+tape and the templates are cached) is a variant with that chain, kept
+beside the first. The template cache is process-wide per device and keyed
+by everything that decides how the library runs the GEMM: the op, the
+scalars, every operand's dtype, sizes and strides, the SM count and compute
+capability, and a snapshot of the process-global BLAS settings (preferred
+library, TF32 / fp32 precision, reduced-precision reductions, fp16
+accumulation, deterministic algorithms, the workspace configuration).
+gemm_templates() lists the cache.
+
 Every branch on a size is guarded on the value the trace saw, including the
 size-1 branches of the view code: a squeeze of a symbolic dim traced at size 1
 pins the tape to size 1, and traced at size 8 misses at size 1. Contiguity and
@@ -167,12 +194,14 @@ import ctypes
 import functools
 import gc
 import heapq
+import itertools
 import json
 import math
 import os
 import struct
 import sys
 import threading
+import time
 import warnings
 from dataclasses import dataclass
 from typing import Any, Protocol, TYPE_CHECKING
@@ -211,6 +240,8 @@ __all__ = [
     "build",
     "Variant",
     "Entry",
+    "gemm_harvests",
+    "gemm_templates",
 ]
 
 aten = torch.ops.aten
@@ -425,6 +456,39 @@ _ROUTED = {
 }
 
 
+# closed library calls: recorded as regions, never traced into. baddbmm is
+# not one: its structured meta copies the expanded bias into the result with
+# ATen's copy kernel before the library call, and that kernel's argument
+# image carries per-call host bytes no harvest reproduces (measured: a heap
+# address at byte 536 of the StridedOp image differs between the harvest's
+# and the build's captures)
+_CLOSED_OPS = {aten.mm.default, aten.addmm.default, aten.bmm.default}
+
+
+def _outer_product_bmm(func: Any, args: tuple) -> bool:
+    # torch._native's eager override of aten::bmm on CUDA (ops/bmm_outer_product,
+    # _bmm_outer_product_cond): a K = 1 batched product runs its Triton
+    # outer-product kernel, not cuBLAS, so it is not a closed region but the
+    # entry of torch/cuda/_host_trace_ti.py (the broadcast multiply, the same
+    # one rounding). The condition's comparisons are guards of the trace.
+    if func is not aten.bmm.default:
+        return False
+    a, b = args[0], args[1]
+    return (
+        a.dim() == 3
+        and b.dim() == 3
+        and bool(a.shape[2] == 1)
+        and bool(b.shape[1] == 1)
+        and bool(a.numel() > 0)
+        and bool(b.numel() > 0)
+        and not a.is_complex()
+    )
+
+
+_KIND_NAMES = {0: "kernel", 1: "memset", 2: "memcpy"}
+_GEMM_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
+
+
 @dataclass(frozen=True)
 class _Src(Source):
     nm: str
@@ -471,10 +535,6 @@ class _Root:
     allocation: bool = False
 
 
-# Exec.node_kinds: the kind of each captured node by position
-_KIND_NAMES = {0: "kernel", 1: "memset", 2: "memcpy"}
-
-
 @dataclass
 class _InputRec:
     position: int
@@ -511,6 +571,697 @@ class _OutputRec:
     # ("argument", i) or ("output", k) when this output is that very object,
     # as eager returns it; None for a view or a fresh allocation
     identity: tuple[str, int] | None = None
+
+
+@dataclass
+class _RegionOperand:
+    name: str
+    root: _Root
+    address: Any  # the data address as a value: root + offset * itemsize
+    sizes: list
+    strides: list
+    dtype: torch.dtype
+
+
+@dataclass
+class _RegionRec:
+    """A closed library call the host made (aten.mm / aten.addmm / aten.bmm
+    through cuBLAS): its operands and output as values, the op and its
+    scalars. The trace issues nothing for it; the build learns its kernel
+    nodes from a harvested template (see _harvest)."""
+
+    seq: int
+    op: str  # "mm" | "addmm" | "bmm"
+    inputs: list[_RegionOperand]  # mm / bmm: (mat1, mat2); addmm: (bias, mat1, mat2)
+    out: _RegionOperand
+    scalars: tuple  # addmm: (beta, alpha)
+    name: str
+
+
+@dataclass
+class _GemmTemplate:
+    """One cuBLAS variant, harvested once per process for a template key:
+    its nodes in order, kernels (function handle, name, launch configuration,
+    argument image with the pointer slots zeroed, parameter layout) and
+    memsets (value, size, destination role), and per kernel node the slots:
+    (byte offset, operand index, delta) of every qword that is an operand's
+    address, (byte offset, allocation index, delta) of every qword into an
+    allocation the call makes itself, and the qwords that are the stream's
+    workspace or host state of the call."""
+
+    key: tuple
+    nodes: list[dict]
+    harvest_us: float
+    hits: int = 0
+    # the first harvest capture's CUDAGraph, kept: cuBLAS may tie host state
+    # to the graph (its private pool holds the call's own allocations)
+    graph: Any = None
+    # bytes of every allocation the call makes itself, in order (its
+    # workspace, a contiguous copy of an operand): the build's allocation
+    # log skips them behind the region's output, the replay gives the nodes
+    # the arena's buffers instead
+    scratch: list[int] = None  # type: ignore[assignment]
+    kinds: tuple = ()
+    uses_ws: bool = False  # a node holds the stream's workspace base
+    # a key whose harvest refused (its kernels are not rebindable): the miss
+    # is remembered so every later call with the key misses at once
+    miss: str = ""
+
+
+# the process-wide template cache, per device through the key
+_gemm_templates: dict[tuple, _GemmTemplate] = {}
+_gemm_lock = threading.Lock()
+_harvest_streams: dict[int, tuple[torch.cuda.Stream, torch.cuda.Stream]] = {}
+_gemm_harvests = 0
+
+
+class _Arena:
+    """The scratch a closed region's nodes get at replay in place of the
+    library's own: the stream's cuBLAS workspace and the allocations the
+    call made for itself at the harvest (its per-call workspace, a
+    contiguous copy of an operand). One per (device, replay stream): the
+    variants replayed on one stream run in order and share it, a thread on
+    its own stream has its own. Buffers grow to the largest template seen."""
+
+    def __init__(self, device: int) -> None:
+        self.device = device
+        self.ws: torch.Tensor | None = None
+        self.bufs: list[torch.Tensor] = []
+        self._ws_addr = 0
+        self._addrs: list[int] = []
+
+    def addresses(self, sizes: list, ws: bool) -> tuple[int, list]:
+        # (workspace address, base address per allocation of the template)
+        if (
+            (self.ws is not None or not ws)
+            and len(self.bufs) >= len(sizes)
+            and all(b.numel() >= n for b, n in zip(self.bufs, sizes))
+        ):
+            return self._ws_addr, self._addrs[: len(sizes)]
+        # allocated, and an outgrown buffer freed, on the current stream, which
+        # is the arena's (a replay asks on its stream, a build on its own):
+        # the allocator hands the freed block out again in stream order
+        with torch.cuda.device(self.device):
+            if ws and self.ws is None:
+                self.ws = torch.empty(
+                    torch._C._host_trace_blas_workspace_size(),
+                    dtype=torch.uint8,
+                    device=self.device,
+                )
+                self._ws_addr = self.ws.data_ptr()
+            for j, n in enumerate(sizes):
+                if j < len(self.bufs) and self.bufs[j].numel() >= n:
+                    continue
+                buf = torch.empty(max(n, 1), dtype=torch.uint8, device=self.device)
+                if j < len(self.bufs):
+                    self.bufs[j] = buf
+                else:
+                    self.bufs.append(buf)
+        self._addrs = [b.data_ptr() for b in self.bufs]
+        return self._ws_addr, self._addrs[: len(sizes)]
+
+
+_arenas: dict[tuple, _Arena] = {}
+_arena_lock = threading.Lock()
+
+
+def _arena(device: int, stream: int) -> _Arena:
+    # by the raw stream handle
+    key = (device, stream)
+    with _arena_lock:
+        arena = _arenas.get(key)
+        if arena is None:
+            arena = _arenas[key] = _Arena(device)
+        return arena
+
+
+def _slot_value(role: Any, const: int, addrs: list, ws: int, scratch: list) -> int:
+    # the value a classified qword takes for these operands and this arena
+    if role is None:
+        return const
+    what, idx, delta = role
+    if what == "op":
+        return addrs[idx] + delta
+    if what == "scratch":
+        return scratch[idx] + delta
+    return ws
+
+
+def _node_state(n: dict, addrs: list, ws: int, scratch: list) -> tuple:
+    # what a template node pushes for these operands and this arena: a
+    # memset's (dst, bytes, value); a kernel's (image, grid, block, smem,
+    # func, attrs)
+    if n["kind"] == "memset":
+        dst = _slot_value(n["dst_role"], n["dst"], addrs, ws, scratch)
+        return (dst, n["bytes"], n["value"])
+    image = bytearray(n["image"])
+    for off, idx, delta in n["slots"]:
+        image[off : off + 8] = struct.pack("<Q", addrs[idx] + delta)
+    for off, idx, delta in n["scratch_slots"]:
+        image[off : off + 8] = struct.pack("<Q", scratch[idx] + delta)
+    wsb = struct.pack("<Q", ws)
+    for off in n["ws_slots"]:
+        image[off : off + 8] = wsb
+    return (bytes(image), n["grid"], n["block"], n["smem"], n["func"], n["attrs"])
+
+
+def _kinds_text(kinds: Any) -> str:
+    return "[" + ", ".join(kinds) + "]"
+
+
+def _blas_settings() -> tuple:
+    # every process-global switch that changes which kernels cuBLAS runs for
+    # a given shape; part of the template key so a flipped setting is a new
+    # template, never a reused one
+    m = torch.backends.cuda.matmul
+    return (
+        str(torch.backends.cuda.preferred_blas_library()),
+        # fp32_precision covers allow_tf32 (its legacy setter writes it)
+        getattr(m, "fp32_precision", None),
+        getattr(m, "allow_fp16_reduced_precision_reduction", None),
+        getattr(m, "allow_bf16_reduced_precision_reduction", None),
+        getattr(m, "allow_fp16_accumulation", None),
+        torch.are_deterministic_algorithms_enabled(),
+        # TunableOp routes mm/addmm through its own tuned kernels when enabled
+        # (Blas.cpp IsTunableOpEnabled), and tuning mode changes what runs
+        torch.cuda.tunable.is_enabled(),
+        torch.cuda.tunable.tuning_is_enabled(),
+        os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
+        os.environ.get("CUBLASLT_WORKSPACE_SIZE"),
+    )
+
+
+def gemm_harvests() -> int:
+    """How many cuBLAS variants were harvested so far in this process."""
+    return _gemm_harvests
+
+
+def gemm_templates() -> list[dict]:
+    """The closed-region template cache: one entry per harvested cuBLAS
+    variant with its key, kernel names, node count, harvest time and hits."""
+    with _gemm_lock:
+        return [
+            {
+                "key": t.key,
+                "kernels": [n["name"] for n in t.nodes if n["kind"] == "kernel"],
+                "kinds": list(t.kinds),
+                "node_count": len(t.nodes),
+                "scratch": list(t.scratch or []),
+                "harvest_us": t.harvest_us,
+                "hits": t.hits,
+                "miss": t.miss,
+            }
+            for t in _gemm_templates.values()
+        ]
+
+
+def _align_class(address: int) -> int:
+    # the largest power of two dividing the address, capped: cuBLAS picks
+    # kernels by operand alignment (16..256 bytes matter)
+    return min(address & -address, 256) if address else 256
+
+
+def _host_mappings() -> tuple:
+    # the calling thread's stack mapping and the process's heap mappings
+    # ([heap] and anonymous private writable mappings) from /proc/self/maps:
+    # cuBLAS leaves host addresses of the call (alpha / beta on the stack,
+    # per-call-site heap state) in some kernel images
+    probe = torch._C._host_trace_stack_probe()
+    stack = (probe, probe + 1)
+    heaps = []
+    with open("/proc/self/maps") as f:
+        for line in f:
+            parts = line.split()
+            lo, hi = (int(v, 16) for v in parts[0].split("-"))
+            path = parts[5] if len(parts) > 5 else ""
+            if lo <= probe < hi:
+                stack = (lo, hi)
+            elif path == "[heap]" or (path == "" and parts[1].startswith("rw")):
+                heaps.append((lo, hi))
+    return stack, heaps
+
+
+def _host_class(value: int, stack: tuple, heaps: list) -> str | None:
+    if stack[0] <= value < stack[1]:
+        return "stack"
+    if any(lo <= value < hi for lo, hi in heaps):
+        return "heap"
+    return None
+
+
+def _stack_low32(value: int, stack: tuple) -> bool:
+    # a 32-bit field holding the low half of an address in the stack mapping
+    lo, hi = stack
+    return ((value - lo) & 0xFFFFFFFF) < hi - lo
+
+
+_SMEAR = (0xA5, 0xA5, 0xA5, 0x5A)  # _harvest's stack smear pattern per capture
+
+
+def _host_slot_class(off: int, imgs: tuple, stack: tuple, heaps: list) -> str | None:
+    # what a host slot holds, from the four captures' bytes: an address in
+    # the harvesting thread's stack (dead once the call returned) or in a
+    # heap mapping (per-call-site library state the kept harvest graph pins),
+    # the low 32 bits of a stack address in a 32-bit field, or bytes the
+    # stack smear left in uninitialized padding; anything else is per-call
+    # state the template cannot keep, and the harvest misses by name
+    q = int.from_bytes(imgs[0][off : off + 8], "little")
+    cls = _host_class(q, stack, heaps)
+    if cls is not None:
+        return cls
+    diff = [i for i in range(8) if len({img[off + i] for img in imgs}) > 1]
+    if diff and all(tuple(img[off + i] for img in imgs) == _SMEAR for i in diff):
+        return "padding"
+    for half in (0, 4):
+        if all(half <= i < half + 4 for i in diff) and all(
+            _stack_low32(
+                int.from_bytes(img[off + half : off + half + 4], "little"), stack
+            )
+            for img in imgs
+        ):
+            return f"stack32:{half}"
+    return None
+
+
+def _host_slot_matches(cls: str, image: bytes, off: int, mappings: tuple) -> bool:
+    # the build's capture holds host state of the template's kind at the slot
+    stack, heaps = mappings
+    if cls in ("padding", "dead"):
+        return True
+    if cls.startswith("stack32:"):
+        half = int(cls[8:])
+        return _stack_low32(
+            int.from_bytes(image[off + half : off + half + 4], "little"), stack
+        )
+    return (
+        _host_class(int.from_bytes(image[off : off + 8], "little"), stack, heaps) == cls
+    )
+
+
+def _closed_call(op: str, scalars: tuple, tensors: list) -> None:
+    # the same library entry the ordinary host reaches, into a preallocated
+    # output (nothing may allocate inside a raw capture)
+    if op in ("mm", "bmm"):
+        getattr(aten, op).out(tensors[0], tensors[1], out=tensors[-1])
+    else:
+        beta, alpha = scalars
+        aten.addmm.out(
+            tensors[0], tensors[1], tensors[2], beta=beta, alpha=alpha, out=tensors[-1]
+        )
+
+
+def _closed_call_alt(op: str, scalars: tuple, tensors: list) -> None:
+    # the same library entry through another binding path: what differs
+    # from _closed_call's image is host state of the call (see _harvest)
+    if op in ("mm", "bmm"):
+        getattr(torch, op)(tensors[0], tensors[1], out=tensors[-1])
+    else:
+        beta, alpha = scalars
+        torch.addmm(
+            tensors[0], tensors[1], tensors[2], beta=beta, alpha=alpha, out=tensors[-1]
+        )
+
+
+_WINDOW = 1 << 21  # 2 MiB: the address bits varied between the two harvest sets
+
+
+def _harvest_operands(
+    which: int, metas: tuple, aligns: tuple, dev: torch.device
+) -> tuple[list, list]:
+    # each operand at the alignment class of the real one (1..256), carved
+    # from the set's own buffer in 2 MiB windows: the first set at offset
+    # `class` in its window, the second at `class` with every bit above the
+    # class up to the window flipped, so that the two sets share no address
+    # bit between the class and the window (and the two buffers are different
+    # allocations above it): an image field derived from address bits finer
+    # than the class differs between the two captures instead of surviving as
+    # a constant of the template. The buffer lives as long as its set: the
+    # harvest's captures are the only readers, and a buffer kept for the
+    # process held the largest set ever harvested (round 8, F4)
+    itemsizes = [torch.empty(0, dtype=dtype).element_size() for dtype, _s, _t in metas]
+    spans = [
+        (1 + sum((n - 1) * abs(st) for n, st in zip(sizes, strides))) * itemsize
+        for (_dtype, sizes, strides), itemsize in zip(metas, itemsizes)
+    ]
+    windows = [(span + 2 * _WINDOW - 1) // _WINDOW for span in spans]
+    need = (sum(windows) + 1) * _WINDOW
+    buf = torch.empty(need, dtype=torch.uint8, device=dev)
+    out = []
+    cursor = (-buf.data_ptr()) % _WINDOW
+    for (dtype, sizes, strides), align, span, n in zip(metas, aligns, spans, windows):
+        delta = align
+        if which == 1:
+            delta ^= (_WINDOW - 1) & ~(2 * align - 1)
+        flat = buf[cursor + delta : cursor + delta + span].view(dtype)
+        out.append(flat.as_strided(sizes, strides))
+        cursor += n * _WINDOW
+    return out, spans
+
+
+def _harvest_capture(
+    C: Any, st: torch.cuda.Stream, device: int, call: Any, keep: bool, smear: int
+) -> tuple:
+    # one capture of the closed call on `st` with its allocations logged:
+    # (nodes, graph or None, [(address, bytes)])
+    # the library leaves uninitialized padding in some parameter structs
+    # (stack leftovers): the stack is smeared with one pattern before the
+    # first three captures and another before the fourth, so that padding
+    # differs between them and is classified as host state
+    C._host_trace_stack_smear(smear)
+    # a CUDAGraph with its own pool, as a build's: the allocator serves the
+    # call's allocations from it, so the log is read off the pool (Recorder.h
+    # alloc_log_begin). The caller holds every graph until the harvest is
+    # over: a CUDAGraph's reset clears the cuBLAS workspace cached for its
+    # stream (CUDAGraph.cpp), and a capture after that would allocate the
+    # workspace inside itself where the earlier captures did not
+    graph = torch.cuda.CUDAGraph(keep_graph=True)
+    pool = torch.cuda.graph_pool_handle()
+    C._host_trace_alloc_log_begin(device, pool)
+    done = False
+    try:
+        with torch.cuda.stream(st):
+            graph.capture_begin(pool=pool, capture_error_mode="thread_local")
+            try:
+                call()
+                done = True
+            finally:
+                try:
+                    graph.capture_end()
+                except Exception:
+                    if done:
+                        raise
+    finally:
+        log = C._host_trace_alloc_log_end()
+    nodes = C._host_trace_harvest_nodes(graph.raw_cuda_graph())
+    return nodes, graph, log
+
+
+def _harvest(key: tuple, spec: tuple, device: int) -> _GemmTemplate:
+    """Two raw captures of the closed call on scratch operands at different
+    addresses; the qwords that differ between them are the pointer slots,
+    each of which must equal exactly one operand's address in both. The
+    call's own allocations are logged in every capture: a qword into one of
+    them is a scratch slot (the library's per-call workspace, the host's
+    contiguous copy of an operand), which the replay points into its arena.
+    A third capture on another stream finds the workspace slots: cuBLAS
+    gives each stream its own workspace and bakes its base into the image.
+    A fourth, through another binding path, finds the host slots: addresses
+    of the call's own host state (stack and heap) that cuBLAS leaves in some
+    images; they differ per call path and are dead or library-owned at
+    replay, so the template keeps its own and the build accepts the
+    capture's. Memset nodes (a split-K semaphore, a bias path's scratch)
+    are kept with their destination classified the same way."""
+    global _gemm_harvests
+    op, scalars, metas, aligns = spec
+    C = torch._C
+    streams = _harvest_streams.get(device)
+    if streams is None:
+        streams = _harvest_streams[device] = (
+            torch.cuda.Stream(device=device),
+            torch.cuda.Stream(device=device),
+        )
+    stream, other = streams
+    dev = torch.device("cuda", device)
+    with torch.cuda.stream(stream):
+        first, spans = _harvest_operands(0, metas, aligns, dev)
+        second, _ = _harvest_operands(1, metas, aligns, dev)
+        _closed_call(op, scalars, first)  # the library's workspace for this stream
+        stream.synchronize()
+        t0 = time.perf_counter()
+        try:
+            nodes_a, graph, log_a = _harvest_capture(
+                C, stream, device, lambda: _closed_call(op, scalars, first), True, 0xA5
+            )
+        except TapeMismatch as e:
+            # the library's call is more than kernels and memsets (a memcpy
+            # of host scalars for beta / alpha other than 1): a named miss
+            raise Miss(f"closed {op} with scalars {scalars}: {e}") from None
+        nodes_b, graph_b, log_b = _harvest_capture(
+            C, stream, device, lambda: _closed_call(op, scalars, second), False, 0xA5
+        )
+        ws_a = set(C._host_trace_blas_workspaces(stream.cuda_stream))
+        harvest_us = (time.perf_counter() - t0) * 1e6 / 2
+        addrs_a = [t.data_ptr() for t in first]
+        addrs_b = [t.data_ptr() for t in second]
+    with torch.cuda.stream(other):
+        _closed_call(op, scalars, first)  # this stream's workspace
+        other.synchronize()
+        nodes_c, graph_c, log_c = _harvest_capture(
+            C, other, device, lambda: _closed_call(op, scalars, first), False, 0xA5
+        )
+        ws_c = set(C._host_trace_blas_workspaces(other.cuda_stream))
+    with torch.cuda.stream(stream):
+        nodes_d, graph_d, log_d = _harvest_capture(
+            C, stream, device, lambda: _closed_call_alt(op, scalars, first), False, 0x5A
+        )
+    # the three throwaway graphs go together, after the last capture
+    del graph_b, graph_c, graph_d
+    stack, heaps = _host_mappings()
+    _gemm_harvests += 1
+    kinds = tuple(n["kind"] for n in nodes_a)
+    for others in (nodes_b, nodes_c, nodes_d):
+        if tuple(n["kind"] for n in others) != kinds:
+            raise Miss(
+                f"closed {op}: the call's node structure differs between captures at the same shape"
+            )
+    if any(
+        a["kind"] == "kernel"
+        and (
+            a["func"] != b["func"]
+            or a["grid"] != b["grid"]
+            or a["block"] != b["block"]
+            or a["attrs"] != b["attrs"]
+        )
+        for a, b in zip(nodes_a, nodes_b)
+    ):
+        raise Miss(
+            f"closed {op}: two captures at the same shape chose different kernels"
+        )
+    for others in (nodes_c, nodes_d):
+        if any(
+            a["kind"] == "kernel"
+            and (a["func"] != o["func"] or len(a["image"]) != len(o["image"]))
+            for a, o in zip(nodes_a, others)
+        ):
+            raise Miss(
+                f"closed {op}: the call chose another kernel on another stream or path"
+            )
+    scratch = [n for _addr, n in log_a]
+    for log in (log_b, log_c, log_d):
+        if [n for _addr, n in log] != scratch:
+            raise Miss(
+                f"closed {op}: the call's own allocations differ between captures ({scratch} vs {[n for _addr, n in log]} bytes)"
+            )
+
+    def classify(qa: int, qb: int, qc: int, qd: int) -> Any:
+        # the role of one qword across the four captures: ("op", i, delta),
+        # ("scratch", j, delta), ("ws", 0, 0), ("host", 0, 0), None for a
+        # constant, or False for a value that fits no role
+        for j, (ta, n) in enumerate(log_a):
+            if ta <= qa < ta + n:
+                delta = qa - ta
+                if (
+                    qb - log_b[j][0] == delta
+                    and qc - log_c[j][0] == delta
+                    and qd - log_d[j][0] == delta
+                ):
+                    return ("scratch", j, delta)
+                return False
+        if qa != qb:
+            # moved with the operands: an operand address plus a constant
+            # (a tile pointer, a descriptor's base)
+            roles = [
+                (i, qa - x)
+                for i, (x, y) in enumerate(zip(addrs_a, addrs_b))
+                if 0 <= qa - x < spans[i] and qb - y == qa - x
+            ]
+            if len(roles) == 1 and qa == qc:
+                return ("op", *roles[0])
+            return False
+        if qa != qc:
+            # moved with the stream only: the workspace base, which must be
+            # the one cuBLAS registered for the harvesting handle on each
+            # stream (CublasHandlePool.cpp); another stream-dependent value
+            # fits no role
+            return ("ws", 0, 0) if qa == qd and qa in ws_a and qc in ws_c else False
+        if qa != qd or stack[0] <= qa < stack[1]:
+            # host state of the call (a stack or heap address): per call
+            # path, dead or library-owned at replay; kept
+            return ("host", 0, 0)
+        return None
+
+    nodes = []
+    for a, b, c, d in zip(nodes_a, nodes_b, nodes_c, nodes_d):
+        if a["kind"] == "memset":
+            if (a["value"], a["elem"], a["width"]) != (
+                b["value"],
+                b["elem"],
+                b["width"],
+            ) or (
+                a["value"],
+                a["elem"],
+                a["width"],
+            ) != (c["value"], c["elem"], c["width"]):
+                raise Miss(
+                    f"closed {op}: a memset of the call differs between captures"
+                )
+            role = classify(a["dst"], b["dst"], c["dst"], d["dst"])
+            if role is False or (role is not None and role[0] == "host"):
+                raise Miss(
+                    f"closed {op}: a memset of the call targets an address that is not an operand, workspace or scratch of the call: not rebindable"
+                )
+            nodes.append(
+                {
+                    "kind": "memset",
+                    "name": "memset",
+                    "dst_role": role,
+                    "dst": a["dst"],
+                    "value": a["value"],
+                    "elem": a["elem"],
+                    "width": a["width"],
+                    "bytes": a["elem"] * a["width"],
+                }
+            )
+            continue
+        img_a, img_b, img_c, img_d = a["image"], b["image"], c["image"], d["image"]
+        if len(img_a) != len(img_b):
+            raise Miss(
+                f"closed {op}: two captures at the same shape differ in image size"
+            )
+        image = bytearray(img_a)
+        n = len(img_a)
+        slots: list = []  # (offset, operand, delta): the qword is operand + delta
+        scratch_slots: list = []  # (offset, allocation, delta)
+        ws_slots: list = []
+        host_slots: list = []
+        ws_values: set = set()
+        covered = bytearray(n)
+
+        def q(img: bytes, off: int) -> int:
+            return int.from_bytes(img[off : off + 8], "little")
+
+        def free(off: int) -> bool:
+            return not any(covered[off : off + 8])
+
+        # pointers sit at 8-byte offsets in most images and at 4-byte ones in
+        # packed parameter structs (cutlass 2.x); a window is classified on
+        # the aligned pass first so a half-pointer window never wins
+        for start in (0, 4):
+            for off in range(start, n - 7, 8):
+                if not free(off):
+                    continue
+                qa, qb, qc, qd = (
+                    q(img_a, off),
+                    q(img_b, off),
+                    q(img_c, off),
+                    q(img_d, off),
+                )
+                role = classify(qa, qb, qc, qd)
+                if role is False and qa == qb == qd and qa != qc:
+                    raise Miss(
+                        f"closed {op}: {a['name']} holds a stream-dependent pointer at byte {off} ({qa:#x} on the harvest stream, {qc:#x} on the other) that is not the stream's registered cuBLAS workspace ({sorted(map(hex, ws_a))} / {sorted(map(hex, ws_c))}): not rebindable"
+                    )
+                if not role:
+                    continue
+                covered[off : off + 8] = b"\x01" * 8
+                if role[0] == "op":
+                    slots.append((off, role[1], role[2]))
+                    image[off : off + 8] = bytes(8)
+                elif role[0] == "scratch":
+                    scratch_slots.append((off, role[1], role[2]))
+                    image[off : off + 8] = bytes(8)
+                elif role[0] == "ws":
+                    ws_slots.append(off)
+                    ws_values.add((qa, qc))
+                    image[off : off + 8] = bytes(8)
+                else:
+                    cls = _host_slot_class(
+                        off, (img_a, img_b, img_c, img_d), stack, heaps
+                    )
+                    if cls is None:
+                        seen = " / ".join(
+                            img[off : off + 8].hex()
+                            for img in (img_a, img_b, img_c, img_d)
+                        )
+                        raise Miss(
+                            f"closed {op}: {a['name']} carries per-call host state at byte {off} that is neither a stack nor a heap address nor stack-smear padding (qword over the captures: {seen}): not rebindable"
+                        )
+                    host_slots.append((off, cls))
+        # ATen's copy kernel (the host's own contiguous copy of an operand
+        # before the library call) carries the uninitialized entries of its
+        # offset calculator beyond `dims`, stack leftovers the kernel never
+        # reads (OffsetCalculator.cuh fills entries below `dims` only): kept
+        # like host state. Its live fields are the count, the two data
+        # pointers (classified above) and the entries below `dims`.
+        dead_ok = "direct_copy_kernel_cuda" in a["name"]
+        for off in range(n):
+            if covered[off]:
+                continue
+            if (
+                img_a[off] != img_b[off]
+                or img_a[off] != img_c[off]
+                or img_a[off] != img_d[off]
+            ):
+                lo = off - off % 8
+                if dead_ok:
+                    host_slots.append((lo, "dead"))
+                    covered[lo : lo + 8] = b"\x01" * 8
+                    continue
+                seen = " / ".join(
+                    img[lo : lo + 8].hex() for img in (img_a, img_b, img_c, img_d)
+                )
+                raise Miss(
+                    f"closed {op}: {a['name']} carries per-call state at byte {off} that is not an operand, workspace or host address (a descriptor): not rebindable (qword {lo} over the captures: {seen}; the call's allocations: {log_a})"
+                )
+        if len(ws_values) > 1:
+            raise Miss(
+                f"closed {op}: {a['name']} holds more than one stream-dependent pointer; only one workspace base is rebased"
+            )
+        nodes.append(
+            {
+                "kind": "kernel",
+                "func": a["func"],
+                "name": a["name"],
+                "grid": tuple(a["grid"]),
+                "block": tuple(a["block"]),
+                "smem": a["smem"],
+                "image": bytes(image),
+                "layout": a["layout"],
+                "slots": slots,
+                "scratch_slots": scratch_slots,
+                "ws_slots": ws_slots,
+                "host_slots": host_slots,
+                "attrs": tuple(a["attrs"]),
+            }
+        )
+    uses_ws = any(
+        n["ws_slots"] if n["kind"] == "kernel" else (n["dst_role"] or ("",))[0] == "ws"
+        for n in nodes
+    )
+    return _GemmTemplate(
+        key,
+        nodes,
+        harvest_us,
+        graph=graph,
+        scratch=scratch,
+        kinds=kinds,
+        uses_ws=uses_ws,
+    )
+
+
+def _template(key: tuple, spec: tuple, device: int) -> _GemmTemplate:
+    with _gemm_lock:
+        tpl = _gemm_templates.get(key)
+        if tpl is None:
+            try:
+                tpl = _harvest(key, spec, device)
+            except Miss as e:
+                tpl = _GemmTemplate(key, [], 0.0, scratch=[], miss=str(e))
+            _gemm_templates[key] = tpl
+        tpl.hits += 1
+        if tpl.miss:
+            raise Miss(tpl.miss)
+        return tpl
 
 
 _SYM_TYPES = (torch.SymInt, torch.SymFloat, torch.SymBool)
@@ -1278,6 +2029,7 @@ class _Trace:
         self.tensors: list = []
         self.inputs: list[_InputRec] = []
         self.allocs: list[_AllocRec] = []
+        self.regions: list[_RegionRec] = []
         # the real tensor behind each input root (by root name): a host that
         # needs process-lifetime state keyed by the real storage (a symmetric
         # memory handle) looks it up here
@@ -1421,6 +2173,167 @@ class _Trace:
             _AllocRec(self.rec.next_seq(), name, sizes, strides, dtype, root, q)
         )
         return t
+
+    def closed_region(self, func: Any, args: tuple, kwargs: dict) -> _TracedTensor:
+        """aten.mm / aten.addmm / aten.bmm through cuBLAS: record the call
+        as a closed region (operands and output as values), allocate its
+        output, issue nothing. The output is what the ordinary op would
+        allocate: a contiguous [M, N] ([B, M, N] for bmm) of the operands'
+        dtype."""
+        batched = func is aten.bmm.default
+        if func in (aten.mm.default, aten.bmm.default):
+            op = "bmm" if batched else "mm"
+            mats, bias, scalars = (args[0], args[1]), None, ()
+        else:
+            op = "addmm"
+            mats, bias = (args[1], args[2]), args[0]
+            scalars = (kwargs.get("beta", 1), kwargs.get("alpha", 1))
+            if any(s != 1 for s in scalars):
+                # the host then adds the bias itself (a copy kernel of its
+                # own before the library call): not one closed call
+                raise Declined(
+                    f"host_trace: {func} with beta / alpha other than 1 is not recorded as a closed region (declined)"
+                )
+            if not all(isinstance(s, (int, float)) for s in scalars):
+                raise Declined(
+                    f"host_trace: {func} with a symbolic beta / alpha is not recorded as a closed region (declined)"
+                )
+        operands = ([bias] if bias is not None else []) + list(mats)
+        for t in operands:
+            if not isinstance(t, _TracedTensor):
+                raise Declined(
+                    f"host_trace: {func} on a tensor the trace did not create; a closed region's operands must be inputs, allocations or views of them (declined)"
+                )
+            if t.device.type != "cuda":
+                raise Declined(
+                    f"host_trace: {func} on {t.device} inside a trace (declined)"
+                )
+            if t.dtype not in _GEMM_DTYPES:
+                raise Declined(
+                    f"host_trace: {func} in {t.dtype} is not recorded as a closed region (declined)"
+                )
+        a, b = mats
+        nd = 3 if batched else 2
+        if a.dim() != nd or b.dim() != nd:
+            raise Declined(
+                f"host_trace: {func} with {a.dim()}-D and {b.dim()}-D operands; only {nd}-D closed GEMMs are recorded here (declined)"
+            )
+        if a.dtype != b.dtype or (bias is not None and bias.dtype != a.dtype):
+            raise Declined(f"host_trace: {func} with mixed dtypes (declined)")
+        # what the host hands to cuBLAS as is (cuBlasCommonArgs.h
+        # prepare_matrix_for_cublas; Blas.cpp prepare_batch_matrix_for_cublas
+        # for the batched ops): a unit stride along one dimension and a
+        # leading dimension of at least the other extent, or a dense matrix.
+        # Anything else it copies into a temporary of its own first; that
+        # copy's kernel carries stack leftovers in its offset calculator,
+        # which no capture reproduces byte for byte. Decided on the traced
+        # strides without a guard: the strides are in the template key, and
+        # a later layout the host would copy misses by name at its harvest
+        if batched:
+            # the batched host reads the contiguous [B, M, N] result as
+            # column-major when N == 1 (Blas.cpp baddbmm_out_cuda_impl:
+            # result_strides[1] == 1), as C^T = B^T A^T otherwise, and the
+            # roles of the two batches follow that choice
+            m_, k_, n_ = (_hint(v) for v in (a.shape[1], a.shape[2], b.shape[2]))
+            transpose_result = n_ != 1
+            checks = (
+                (("mat1", a, k_, m_), ("mat2", b, n_, k_))
+                if transpose_result
+                else (("mat1", a, m_, k_), ("mat2", b, k_, n_))
+            )
+            for name, t, rows, cols in checks:
+                st = [_hint(v) for v in t._sym_strides]
+                fast, lead = (2, 1) if transpose_result else (1, 2)
+                ready = (
+                    (st[fast] == 1 and st[lead] >= max(1, rows))
+                    or (st[lead] == 1 and st[fast] >= max(1, cols))
+                    or (
+                        st[1] != 0
+                        and st[2] != 0
+                        and all(
+                            bool(_hint(term))
+                            for term in _contiguous_terms(
+                                list(t.shape), list(t._sym_strides)
+                            )
+                        )
+                    )
+                )
+                if not ready:
+                    raise Declined(
+                        f"host_trace: {func}: {name} of shape {tuple(t.shape)} with strides {tuple(t._sym_strides)} is not a cuBLAS batch operand as is; the host would copy it first, which is not recorded as a closed region (declined)"
+                    )
+        else:
+            for name, t in (("mat1", a), ("mat2", b)):
+                rows, cols = (_hint(n) for n in t.shape)
+                s0, s1 = (_hint(st) for st in t._sym_strides)
+                ready = (
+                    (s0 == 1 and s1 >= max(1, rows))
+                    or (s1 == 1 and s0 >= max(1, cols))
+                    or all(
+                        bool(_hint(term))
+                        for term in _dense_terms(list(t.shape), list(t._sym_strides))
+                    )
+                )
+                if not ready:
+                    raise Declined(
+                        f"host_trace: {func}: {name} of shape {tuple(t.shape)} with strides {tuple(t._sym_strides)} is not a cuBLAS operand as is; the host would copy it first, which is not recorded as a closed region (declined)"
+                    )
+        if bias is not None and bias.dim() == 1 and _hint(bias._sym_strides[0]) != 1:
+            raise Declined(
+                f"host_trace: {func}: a bias with stride {bias._sym_strides[0]} is not a cuBLAS operand as is; the host would copy it first, which is not recorded as a closed region (declined)"
+            )
+        # the library's own shape checks, as guards
+        if batched and bool(a.shape[0] != b.shape[0]):
+            raise Declined(
+                f"host_trace: {func}: batch1 and batch2 must have the same number of batches ({a.shape} x {b.shape})"
+            )
+        if bool(a.shape[-1] != b.shape[-2]):
+            raise Declined(
+                f"host_trace: {func}: mat1 and mat2 shapes cannot be multiplied ({a.shape} x {b.shape})"
+            )
+        m, n = a.shape[-2], b.shape[-1]
+        out_shape = [a.shape[0], m, n] if batched else [m, n]
+        if bias is not None:
+            if bias.dim() == 1:
+                if bool(bias.shape[0] != n):
+                    raise Declined(
+                        f"host_trace: {func}: bias of {bias.shape} does not broadcast to [M, {n}]"
+                    )
+            elif bias.dim() == 2:
+                # the host copies a 2-D bias into the output before the GEMM
+                # (a device memcpy the library call does not own)
+                raise Declined(
+                    f"host_trace: {func}: a 2-D bias is not recorded as a closed region (declined)"
+                )
+            else:
+                raise Declined(
+                    f"host_trace: {func}: a {bias.dim()}-D bias is not recorded (declined)"
+                )
+        out = self.allocate(
+            aten.empty.memory_format,
+            (out_shape,),
+            {"dtype": a.dtype, "device": self.device},
+        )
+
+        def desc(name: str, t: _TracedTensor) -> _RegionOperand:
+            address = t._root.sym + t._sym_offset * t.element_size()
+            return _RegionOperand(
+                name, t._root, address, list(t.shape), list(t._sym_strides), t.dtype
+            )
+
+        names = ["bias", "mat1", "mat2"] if bias is not None else ["mat1", "mat2"]
+        k = len(self.regions)
+        self.regions.append(
+            _RegionRec(
+                self.rec.next_seq(),
+                op,
+                [desc(nm, t) for nm, t in zip(names, operands)],
+                desc("out", out),
+                scalars,
+                f"region{k}",
+            )
+        )
+        return out
 
     def reshape_view(self, src: _TracedTensor, shape: list) -> Any:
         # at::native::view: infer_size on the requested shape (one -1 at
@@ -1862,6 +2775,10 @@ class _TraceMode(TorchDispatchMode):
             return self.trace.allocate(func, args, kwargs)
         if func in _VIEW_OPS:
             return self.trace.view(func, args, kwargs)
+        # a closed library call (cuBLAS): recorded as a region, never traced
+        # into; the K = 1 bmm the eager op serves itself takes its entry below
+        if func in _CLOSED_OPS and not _outer_product_bmm(func, args):
+            return self.trace.closed_region(func, args, kwargs)
         # an op with a traced sibling host is traceable at any depth: under
         # trace, or inside another host (a layer norm copying a non-contiguous
         # input calls copy_)
@@ -1959,11 +2876,16 @@ class _EntryMode(TorchDispatchMode):
         kwargs = kwargs or {}
         entry = _TRACED_ENTRIES.get(func)
         # the entry stands in for a CUDA op; a CPU scalar operand (a wrapped
-        # Python number, a 0-dim CPU tensor) rides along as in the trace
-        if entry is not None and all(
-            a.is_cuda or (a.is_cpu and a.dim() == 0)
-            for a in args
-            if isinstance(a, torch.Tensor)
+        # Python number, a 0-dim CPU tensor) rides along as in the trace; a
+        # closed op's entry serves only the case the trace routed to it
+        if (
+            entry is not None
+            and (func not in _CLOSED_OPS or _outer_product_bmm(func, args))
+            and all(
+                a.is_cuda or (a.is_cpu and a.dim() == 0)
+                for a in args
+                if isinstance(a, torch.Tensor)
+            )
         ):
             if func in self.entering:
                 raise Declined(
@@ -2046,6 +2968,16 @@ class Tape:
         # staging buffers
         self.host_buffers = records["host_buffers"]
         self.memcpys = records["memcpys"]
+        # closed library calls (cuBLAS mm / addmm / bmm): kernel nodes of
+        # the build's capture the tape describes only as a shape key, paired
+        # with a harvested template per concrete key
+        self.regions = tr.regions
+        # a region's out operand is written by the library call: its root
+        # joins the written roots (an allocation: the out= and in-place
+        # variants decline, so no input is written through a region)
+        for r in self.regions:
+            if r.out.root.name not in self.written_roots:
+                self.written_roots.append(r.out.root.name)
         self.outputs = outputs
         # the argument positions among the written roots, in the call's index
         # space: what a binding reads through the mutable accessor first
@@ -2117,6 +3049,10 @@ class Tape:
         for m in self.memcpys:
             m["src"], m["dst"] = sub(m["src"]), sub(m["dst"])
             m["bytes"] = sub(m["bytes"])
+        for r in self.regions:
+            for op in (*r.inputs, r.out):
+                op.address = sub(op.address)
+                op.sizes, op.strides = subs(op.sizes), subs(op.strides)
         self.rng_increment = sub(self.rng_increment)
         for slot in self.rng_slots:
             slot["increment"] = sub(slot["increment"])
@@ -2124,6 +3060,10 @@ class Tape:
     @property
     def num_launches(self) -> int:
         return len(self.launches)
+
+    @property
+    def num_regions(self) -> int:
+        return len(self.regions)
 
     @property
     def num_allocations(self) -> int:
@@ -2281,6 +3221,33 @@ class Tape:
                     "kind": m["kind"],
                 }
                 for m in self.memcpys
+            ],
+            "regions": [
+                {
+                    "seq": r.seq,
+                    "name": r.name,
+                    "op": r.op,
+                    "scalars": list(r.scalars),
+                    "inputs": [
+                        {
+                            "name": o.name,
+                            "root": e(o.root.sym),
+                            "address": e(o.address),
+                            "sizes": [e(s) for s in o.sizes],
+                            "strides": [e(s) for s in o.strides],
+                            "dtype": str(o.dtype),
+                        }
+                        for o in r.inputs
+                    ],
+                    "out": {
+                        "root": e(r.out.root.sym),
+                        "address": e(r.out.address),
+                        "sizes": [e(s) for s in r.out.sizes],
+                        "strides": [e(s) for s in r.out.strides],
+                        "dtype": str(r.out.dtype),
+                    },
+                }
+                for r in self.regions
             ],
             "rng_increment": e(self.rng_increment)
             if self.rng_increment is not None
@@ -2728,6 +3695,23 @@ class _Evaluator:
             return v
         return eval(self._compile(v), self.ns, env)
 
+    def compile_seq(self, values: list) -> Any:
+        # one code object evaluating every value to an int, for the per-call
+        # paths (a closed region's key and addresses)
+        parts = []
+        for v in values:
+            if isinstance(v, _SYM_TYPES):
+                v = v.node.expr
+            parts.append(
+                repr(int(v))
+                if isinstance(v, (int, bool))
+                else f"int({self.printer.doprint(v)})"
+            )
+        return compile("(" + ",".join(parts) + ",)", "<host_trace>", "eval")
+
+    def ev_seq(self, code: Any, env: dict) -> tuple:
+        return eval(code, self.ns, env)
+
     def guard_text(self, g: Any) -> str:
         return self.printer.doprint(g)
 
@@ -3020,10 +4004,79 @@ class Variant:
         # trace capture's, freed when the trace ended)
         self._rng_bytes: dict[int, list[tuple[int, int, bytes]]] = {}
         self.calls = 0
+        # closed regions: template applications (a region's concrete key
+        # changed) and pointer-slot rebinds (same key, an operand moved)
+        self.region_applies = 0
+        self.region_rebinds = 0
+        self._region_code: dict[int, Any] = {}
         # replay keeps per-node dirty state (_last); one call at a time
         self._lock = threading.Lock()
         with _build_lock:
             self._build(args)
+
+    # ---- closed regions
+
+    def _region_spec(self, r: _RegionRec, env: dict) -> tuple:
+        # the concrete template key of a region at these inputs, the operand
+        # addresses, and the harvest spec (what to allocate and call)
+        operands = [*r.inputs, r.out]
+        code = self._region_code.get(r.seq)
+        if code is None:
+            values: list = []
+            for o in operands:
+                values += [*o.sizes, *o.strides, o.address]
+            code = self._region_code[r.seq] = self.prog.compile_seq(values)
+        vals = self.prog.ev_seq(code, env)
+        metas = []
+        addrs = []
+        i = 0
+        for o in operands:
+            nd = len(o.sizes)
+            metas.append((o.dtype, vals[i : i + nd], vals[i + nd : i + 2 * nd]))
+            addrs.append(vals[i + 2 * nd])
+            i += 2 * nd + 1
+        metas_t = tuple(metas)
+        aligns = tuple(_align_class(a) for a in addrs)
+        key = (
+            self.device,
+            self.tape.device_identity,
+            r.op,
+            r.scalars,
+            metas_t,
+            aligns,
+            _blas_settings(),
+        )
+        return key, addrs, (r.op, r.scalars, metas_t, aligns)
+
+    def _region_states(self, k: int, env: dict, arena: _Arena) -> list:
+        # per node of site k, in order: the state of the node the variant its
+        # concrete key selects puts there. The site holds exactly the node
+        # chain of the template the build's shapes selected; a template with
+        # another chain is a topology miss, served by the same tape built at
+        # these inputs.
+        r = self.tape.regions[k]
+        key, addrs, spec = self._region_spec(r, env)
+        tpl = _template(key, spec, self.device)
+        if tpl.kinds != self.topology[k]:
+            raise TopologyMiss(
+                f"cuBLAS runs {r.name} ({r.op}) as {_kinds_text(tpl.kinds)} at this shape; this variant's graph holds {_kinds_text(self.topology[k])} (built at another M): build the tape at these inputs",
+                self.tape,
+            )
+        ws, scratch = arena.addresses(tpl.scratch, tpl.uses_ws)
+        return [_node_state(n, addrs, ws, scratch) for n in tpl.nodes]
+
+    def region_stats(self) -> dict:
+        """Counters for tests and debugging: template applications, pointer
+        rebinds, and the process-wide harvest count."""
+        return {
+            "applies": self.region_applies,
+            "rebinds": self.region_rebinds,
+            "harvests": _gemm_harvests,
+            "sites": [
+                {"name": self.tape.regions[k].name, "nodes": list(positions)}
+                for k, (positions, _key) in enumerate(self._sites)
+            ],
+        }
 
     # ---- binding
 
@@ -3151,6 +4204,9 @@ class Variant:
         # at that copy must be what the tape's elements say at these inputs;
         # a late guard is checked as soon as its last symbol is bound
         entries = iter(log)
+        # a closed region's library call allocates behind the region's output
+        # (its workspace); those entries are skipped, counted by the template
+        region_of = {id(r.out.root): (k, r) for k, r in enumerate(self.tape.regions)}
         for (kind, _seq, rec), guards in zip(self.prog.events, self.prog.event_guards):
             if kind == "hbuf":
                 k, hb = rec
@@ -3183,6 +4239,17 @@ class Variant:
                         f"{rec.name} is {nbytes} bytes at the build, the tape says {want}"
                     )
                 env[_symbol_name(rec.q)] = addr // 256
+                site = region_of.get(id(rec.root))
+                if site is not None:
+                    k, r = site
+                    key, _addrs, spec = self._region_spec(r, env)
+                    scratch = _template(key, spec, self.device).scratch
+                    skipped = list(itertools.islice(entries, len(scratch)))
+                    if [n for _a, n in skipped] != scratch:
+                        raise TapeMismatch(
+                            f"{r.name}: the library allocated {[n for _a, n in skipped]} bytes at the build, the harvest saw {scratch}"
+                        )
+                    self._build_scratch[k] = [addr for addr, _n in skipped]
             if guards:
                 self._check(guards, env)
         extra = list(entries)
@@ -3274,6 +4341,9 @@ class Variant:
                 self.fn(*args)
             stream.synchronize()
         graph = torch.cuda.CUDAGraph(keep_graph=True)
+        # the addresses of the allocations each region's call made for itself
+        # at the build, in order (_events_from_log)
+        self._build_scratch: list = [[] for _ in tape.regions]
         # the capture's own pool: the allocator serves the captured call's
         # allocations from it (on the build stream or a side stream forked
         # from it) and no other thread's, so the allocation log is read off
@@ -3309,113 +4379,224 @@ class Variant:
         stream.synchronize()
         del captured
         exec_ = C._HostTraceExec(graph, self.device)
-        if exec_.num_nodes != len(tape.launches):
-            raise TapeMismatch(
-                f"the tape has {len(tape.launches)} launches, the capture has {exec_.num_nodes} kernel nodes"
-            )
         # the tape at the build inputs must reproduce the capture byte for byte
         if len(tables) != len(tape.host_buffers):
             raise TapeMismatch(
                 f"the tape has {len(tape.host_buffers)} host table copies, the ordinary call made {len(tables)}"
             )
         self._events_from_log(log, tables, env)
-        # the capture's nodes in the topological order of their edges are the
-        # tape's launches, memsets and copies in host order (one stream: a chain, one
-        # order whatever cudaGraphGetNodes returns); each entry (kind, index
-        # within the kind, position); _last holds every kernel node's state by
-        # node index, _launch_nodes each launch's node
+        # the capture's nodes in order are the tape's launches, memsets and
+        # copies and the closed regions, in host order; a region's nodes come
+        # from its template at the build's shapes, and that template's node
+        # chain is the site's topology. _last holds every kernel node's
+        # state, (image, grid, block, smem, func, attrs), _last_memsets every
+        # memset node's (dst, bytes, value); launches are found through
+        # _launch_nodes, memsets and copies through _memset_nodes and
+        # _memcpy_nodes, regions through _sites (positions (kind, index))
+        host_maps = _host_mappings() if tape.regions else ((0, 0), [])
+        events = sorted(
+            [("launch", L["seq"], j) for j, L in enumerate(tape.launches)]
+            + [("region", r.seq, k) for k, r in enumerate(tape.regions)]
+            + [("memset", m["seq"], j) for j, m in enumerate(tape.memsets)]
+            + [("memcpy", m["seq"], j) for j, m in enumerate(tape.memcpys)],
+            key=lambda ev: ev[1],
+        )
+        # in the topological order of the capture's edges, creation order
+        # breaking ties (one stream: a chain, one order whatever
+        # cudaGraphGetNodes returns); each entry (kind, index, position)
         kinds = exec_.node_kinds()
         topo, ancestors = self._node_order(exec_.dependencies())
         order = [(_KIND_NAMES[kinds[p][0]], kinds[p][1], p) for p in topo]
-        kernels = [(idx, p) for kind, idx, p in order if kind == "kernel"]
-        memset_nodes = [(idx, p) for kind, idx, p in order if kind == "memset"]
-        memcpy_nodes = [(idx, p) for kind, idx, p in order if kind == "memcpy"]
         self._last: list = [None] * exec_.num_nodes
-        self._launch_nodes: list[int] = [0] * len(tape.launches)
-        distinct: dict = {}
-        for j, L in enumerate(tape.launches):
-            nid, p = kernels[j]
-            name = exec_.kernel_name(nid)
-            if L["kernel"] != name:
-                raise TapeMismatch(f"launch {j} is {L['kernel']}, node {nid} is {name}")
-            image, grid, block, smem = self._launch_state(j, env)
-            self._check_distinct(
-                j, p, (name, image, grid, block, smem), distinct, ancestors
-            )
-            got = exec_.image(nid)
-            rng = [
-                (p["offset"], p["offset"] + p["size"])
-                for p in L["params"]
-                if p["kind"] == "rng"
-            ]
-            for b, (x, y) in enumerate(zip(image, got)):
-                if x != y and not any(lo <= b < hi for lo, hi in rng):
-                    raise TapeMismatch(
-                        f"launch {j} ({L['kernel']}): byte {b} differs between the tape and the capture"
-                    )
-            if rng:
-                # the exec's image from here on: the capture's philox words
-                # in every image this variant renders (_launch_state)
-                self._rng_bytes[j] = [(lo, hi, bytes(got[lo:hi])) for lo, hi in rng]
-                image, grid, block, smem = self._launch_state(j, env)
-            if (
-                tuple(exec_.grid(nid)) != grid
-                or tuple(exec_.block(nid)) != block
-                or exec_.smem(nid) != smem
-            ):
-                raise TapeMismatch(
-                    f"launch {j} ({L['kernel']}): launch configuration differs from the capture"
-                )
-            self._launch_nodes[j] = nid
-            self._last[nid] = (image, grid, block, smem)
-        # the memset nodes in the same order: destination, byte count and
-        # value must be what the tape says at the build inputs
-        if exec_.num_memset_nodes != len(tape.memsets):
-            raise TapeMismatch(
-                f"the tape has {len(tape.memsets)} memsets, the capture has {exec_.num_memset_nodes} memset nodes"
-            )
         self._last_memsets: list = [None] * exec_.num_memset_nodes
-        self._memset_nodes: list[int] = [0] * len(tape.memsets)
-        for j, m in enumerate(tape.memsets):
-            nid, _p = memset_nodes[j]
-            dst, nbytes = self._memset_state(j, env)
-            got = (
-                exec_.memset_dst(nid),
-                exec_.memset_bytes(nid),
-                exec_.memset_value(nid),
-            )
-            if got != (dst, nbytes, m["value"]):
-                raise TapeMismatch(
-                    f"memset {j}: the tape says {(dst, nbytes, m['value'])}, the capture has {got}"
-                )
-            self._memset_nodes[j] = nid
-            self._last_memsets[nid] = (dst, nbytes)
-        # the memcpy nodes in the same order: source, destination and byte count
-        if exec_.num_memcpy_nodes != len(tape.memcpys):
-            raise TapeMismatch(
-                f"the tape has {len(tape.memcpys)} copies, the capture has {exec_.num_memcpy_nodes} memcpy nodes"
-            )
         self._last_memcpys: list = [None] * exec_.num_memcpy_nodes
+        self._launch_nodes: list[int] = [0] * len(tape.launches)
+        self._memset_nodes: list[int] = [0] * len(tape.memsets)
         self._memcpy_nodes: list[int] = [0] * len(tape.memcpys)
-        for j in range(len(tape.memcpys)):
-            nid, _p = memcpy_nodes[j]
-            state = self._memcpy_state(j, env)
-            got = (
-                exec_.memcpy_src(nid),
-                exec_.memcpy_dst(nid),
-                exec_.memcpy_bytes(nid),
+        self._sites: list = [None] * len(tape.regions)
+        self.topology: list[tuple[str, ...]] = [()] * len(tape.regions)
+        distinct: dict = {}
+        pos = 0
+
+        def take(kind: str, what: str) -> tuple[int, int]:
+            nonlocal pos
+            if pos >= len(order):
+                raise TapeMismatch(
+                    f"the tape describes more nodes than the capture has ({len(order)}): {what}"
+                )
+            got, idx, p = order[pos]
+            if got != kind:
+                raise TapeMismatch(
+                    f"{what} is a {kind}, node {pos} of the capture is a {got}"
+                )
+            pos += 1
+            return idx, p
+
+        for kind, _seq, idx in events:
+            if kind == "launch":
+                j = idx
+                L = tape.launches[j]
+                nid, p = take("kernel", f"launch {j} ({L['kernel']})")
+                name = exec_.kernel_name(nid)
+                if L["kernel"] != name:
+                    raise TapeMismatch(
+                        f"launch {j} is {L['kernel']}, node {nid} is {name}"
+                    )
+                image, grid, block, smem = self._launch_state(j, env)
+                self._check_distinct(
+                    j, p, (name, image, grid, block, smem), distinct, ancestors
+                )
+                got = exec_.image(nid)
+                rng = [
+                    (p["offset"], p["offset"] + p["size"])
+                    for p in L["params"]
+                    if p["kind"] == "rng"
+                ]
+                for b, (x, y) in enumerate(zip(image, got)):
+                    if x != y and not any(lo <= b < hi for lo, hi in rng):
+                        raise TapeMismatch(
+                            f"launch {j} ({L['kernel']}): byte {b} differs between the tape and the capture"
+                        )
+                if rng:
+                    # the exec's image from here on: the capture's philox
+                    # words in every image this variant renders (_launch_state)
+                    self._rng_bytes[j] = [(lo, hi, bytes(got[lo:hi])) for lo, hi in rng]
+                    image, grid, block, smem = self._launch_state(j, env)
+                if (
+                    tuple(exec_.grid(nid)) != grid
+                    or tuple(exec_.block(nid)) != block
+                    or exec_.smem(nid) != smem
+                ):
+                    raise TapeMismatch(
+                        f"launch {j} ({L['kernel']}): launch configuration differs from the capture"
+                    )
+                self._launch_nodes[j] = nid
+                self._last[nid] = (image, grid, block, smem, 0, ())
+                continue
+            if kind == "memset":
+                # destination, byte count and value must be what the tape
+                # says at the build inputs
+                j = idx
+                m = tape.memsets[j]
+                nid, _p = take("memset", f"memset {j}")
+                dst, nbytes = self._memset_state(j, env)
+                got = (
+                    exec_.memset_dst(nid),
+                    exec_.memset_bytes(nid),
+                    exec_.memset_value(nid),
+                )
+                if got != (dst, nbytes, m["value"]):
+                    raise TapeMismatch(
+                        f"memset {j}: the tape says {(dst, nbytes, m['value'])}, the capture has {got}"
+                    )
+                self._memset_nodes[j] = nid
+                self._last_memsets[nid] = (dst, nbytes, m["value"])
+                continue
+            if kind == "memcpy":
+                j = idx
+                nid, _p = take("memcpy", f"memcpy {j}")
+                state = self._memcpy_state(j, env)
+                got = (
+                    exec_.memcpy_src(nid),
+                    exec_.memcpy_dst(nid),
+                    exec_.memcpy_bytes(nid),
+                )
+                if got != state:
+                    raise TapeMismatch(
+                        f"memcpy {j}: the tape says {state}, the capture has {got}"
+                    )
+                node_kind = exec_.memcpy_kind(nid)
+                if node_kind not in (tape.memcpys[j]["kind"], "default"):
+                    raise TapeMismatch(
+                        f"memcpy {j}: the tape declares {tape.memcpys[j]['kind']}, the capture's node is {node_kind}"
+                    )
+                self._memcpy_nodes[j] = nid
+                self._last_memcpys[nid] = state
+                continue
+            k = idx
+            r = tape.regions[k]
+            key, addrs, spec = self._region_spec(r, env)
+            tpl = _template(key, spec, self.device)
+            positions: list = []
+            for i, n in enumerate(tpl.nodes):
+                node, _p = take(n["kind"], f"{r.name} ({r.op}) node {i}")
+                # the template's bytes at the build's operands and the call's
+                # own allocations; the capture ran with the build stream's
+                # workspace and its own host stack, so the workspace and host
+                # slots take the capture's values: the first replay rebinds
+                # the workspace to the arena's, the host slots keep the
+                # template's
+                if n["kind"] == "memset":
+                    got = (
+                        exec_.memset_dst(node),
+                        exec_.memset_bytes(node),
+                        exec_.memset_value(node),
+                    )
+                    role = n["dst_role"]
+                    dst = (
+                        got[0]
+                        if role is not None and role[0] == "ws"
+                        else _slot_value(
+                            role, n["dst"], addrs, 0, self._build_scratch[k]
+                        )
+                    )
+                    if got != (dst, n["bytes"], n["value"]):
+                        raise TapeMismatch(
+                            f"{r.name}: memset node {node} is {got}, the template says {(dst, n['bytes'], n['value'])}"
+                        )
+                    positions.append(("memset", node))
+                    self._last_memsets[node] = got
+                    continue
+                # a node the runtime registered (the host's copy of an
+                # operand) is re-read through the driver: every node of a
+                # region may change its kernel at replay
+                exec_.adopt_driver(node)
+                name = exec_.kernel_name(node)
+                if name != n["name"]:
+                    raise TapeMismatch(
+                        f"{r.name}: node {node} is {name}, the harvested template has {n['name']}"
+                    )
+                got = exec_.image(node)
+                image = bytearray(_node_state(n, addrs, 0, self._build_scratch[k])[0])
+                for off in n["ws_slots"]:
+                    image[off : off + 8] = bytes(got[off : off + 8])
+                for off, cls in n["host_slots"]:
+                    # the capture's own host state, of the template's kind
+                    if not _host_slot_matches(cls, got, off, host_maps):
+                        raise TapeMismatch(
+                            f"{r.name} ({n['name']}): the host slot at byte {off} is {cls} in the template, the capture holds {bytes(got[off : off + 8]).hex()}"
+                        )
+                    image[off : off + 8] = bytes(got[off : off + 8])
+                if bytes(image) != bytes(got):
+                    b = next(p for p, (x, y) in enumerate(zip(image, got)) if x != y)
+                    lo = b - b % 8
+                    raise TapeMismatch(
+                        f"{r.name} ({n['name']}): byte {b} differs between the template and the capture (qword {lo}: template {bytes(image[lo : lo + 8]).hex()}, capture {bytes(got[lo : lo + 8]).hex()})"
+                    )
+                if (
+                    tuple(exec_.grid(node)) != n["grid"]
+                    or tuple(exec_.block(node)) != n["block"]
+                    or exec_.smem(node) != n["smem"]
+                    or tuple(exec_.attrs(node)) != n["attrs"]
+                ):
+                    raise TapeMismatch(
+                        f"{r.name} ({n['name']}): launch configuration differs between the template and the capture"
+                    )
+                positions.append(("kernel", node))
+                self._last[node] = (
+                    bytes(image),
+                    n["grid"],
+                    n["block"],
+                    n["smem"],
+                    n["func"],
+                    n["attrs"],
+                )
+            self._sites[k] = (positions, key)
+            self.topology[k] = tpl.kinds
+        if pos != len(order):
+            raise TapeMismatch(
+                f"the tape describes {pos} nodes, the capture has {len(order)}"
             )
-            if got != state:
-                raise TapeMismatch(
-                    f"memcpy {j}: the tape says {state}, the capture has {got}"
-                )
-            kind = exec_.memcpy_kind(nid)
-            if kind not in (tape.memcpys[j]["kind"], "default"):
-                raise TapeMismatch(
-                    f"memcpy {j}: the tape declares {tape.memcpys[j]['kind']}, the capture's node is {kind}"
-                )
-            self._memcpy_nodes[j] = nid
-            self._last_memcpys[nid] = state
         # the staging ring: `staging_depth` pinned slots per host table image
         # (one per copy); the captured copies read the ordinary call's tables
         # until the first replay rebinds them, so those stay alive with the
@@ -3442,6 +4623,46 @@ class Variant:
 
     # ---- replay
 
+    def _region_updates(
+        self,
+        env: dict,
+        new_last: list,
+        new_memsets: list,
+        updates: list,
+        memset_updates: list,
+    ) -> tuple[int, int]:
+        # the closed regions' node updates for this call against the arena
+        # of the current stream; returns (applies, rebinds)
+        applies = region_rebinds = 0
+        arena = _arena(self.device, torch._C._cuda_getCurrentRawStream(self.device))
+        for k in range(len(self.tape.regions)):
+            positions, _key = self._sites[k]
+            for (kind, nid), state in zip(
+                positions, self._region_states(k, env, arena)
+            ):
+                if kind == "memset":
+                    prev = self._last_memsets[nid]
+                    if state == prev:
+                        continue
+                    if prev is None:
+                        applies += 1
+                    else:
+                        region_rebinds += 1
+                    new_memsets[nid] = state
+                    memset_updates.append((nid, *state))
+                    continue
+                prev = self._last[nid]
+                if state == prev:
+                    continue
+                new_last[nid] = state
+                image, grid, block, smem, func, attrs = state
+                if prev is not None and prev[1:] == (grid, block, smem, func, attrs):
+                    region_rebinds += 1
+                else:
+                    applies += 1
+                updates.append((nid, image, grid, block, smem, func, list(attrs)))
+        return applies, region_rebinds
+
     def replay(self, args: tuple) -> list[torch.Tensor]:
         with self._lock:
             return self._replay(args)
@@ -3467,19 +4688,24 @@ class Variant:
         # the push raised: a later call with the same bindings must push again
         # rather than run the exec with the previous call's state
         updates = []
+        memset_updates = []
         new_last = list(self._last)
+        new_memsets = list(self._last_memsets)
         for j in range(len(self.tape.launches)):
             nid = self._launch_nodes[j]
-            state = self._launch_state(j, env)
+            image, grid, block, smem = self._launch_state(j, env)
+            state = (image, grid, block, smem, 0, ())
             if state != self._last[nid]:
                 new_last[nid] = state
-                image, grid, block, smem = state
-                updates.append((nid, image, grid, block, smem))
-        memset_updates = []
-        new_memsets = list(self._last_memsets)
-        for j in range(len(self.tape.memsets)):
+                updates.append((nid, image, grid, block, smem, 0, []))
+        applies = region_rebinds = 0
+        if self.tape.regions:
+            applies, region_rebinds = self._region_updates(
+                env, new_last, new_memsets, updates, memset_updates
+            )
+        for j, m in enumerate(self.tape.memsets):
             nid = self._memset_nodes[j]
-            state = self._memset_state(j, env)
+            state = (*self._memset_state(j, env), m["value"])
             if state != self._last_memsets[nid]:
                 new_memsets[nid] = state
                 memset_updates.append((nid, *state))
@@ -3517,6 +4743,8 @@ class Variant:
             self._last_memsets = new_memsets
             self._last_memcpys = new_memcpys
             self.source_rebinds += rebinds
+            self.region_applies += applies
+            self.region_rebinds += region_rebinds
             if self._host_copies:
                 # the copies of this call read their sources until this event:
                 # ring slots are not rewritten and pinned inputs are not

@@ -28,6 +28,7 @@ C = torch._C
 H, DH = 8, 64
 D = H * DH
 V = 1024
+FF = 4096  # the MLP width: its down projection has K = 4096, where cuBLAS splits K at small M
 LMAX = 64
 DTYPE = torch.bfloat16
 
@@ -40,29 +41,44 @@ def rotate_half(x, neg_one):
 
 
 def decode_step(
-    ids, table, ln_w, ln_b, wq, wk, wv, w_out, cos, sin, neg_one, k_view, v_view
+    ids,
+    table,
+    ln_w,
+    ln_b,
+    wq,
+    wk,
+    wv,
+    w_up,
+    w_down,
+    w_out,
+    cos,
+    sin,
+    neg_one,
+    k_view,
+    v_view,
 ):
-    # ids: pinned int64 (B,); table (V, D); the weights (D,); cos / sin (DH,);
-    # k_view / v_view (B, H, L, DH) views of the caller's caches, position L - 1
-    # is written
+    # ids: pinned int64 (B,); table (V, D); wq / wk / wv (D, D), w_up (FF, D),
+    # w_down (D, FF), w_out (V, D); cos / sin (DH,); k_view / v_view
+    # (B, H, L, DH) views of the caller's caches, position L - 1 is written
     B = ids.shape[0]
     L = k_view.shape[2]
     ids_dev = torch.empty(B, dtype=torch.int64, device="cuda")
     probe().copy_into(ids_dev, ids)  # the ids cross through the H2D path
     x = F.embedding(ids_dev, table)  # the traced index_select sibling
     h = F.layer_norm(x, (D,), ln_w, ln_b)  # the converted CUDA host
-    q = (h * wq).view(B, H, 1, DH)  # projection stand-ins: opted elementwise
+    q = F.linear(h, wq).view(B, H, 1, DH)  # projections: closed cuBLAS regions
     q = q * cos + rotate_half(q, neg_one) * sin  # rotary: mul / cat / add
-    k = h.mul(wk).view(B, H, 1, DH)
+    k = F.linear(h, wk).view(B, H, 1, DH)
     k = k * cos + rotate_half(k, neg_one) * sin
     k_view[:, :, L - 1 : L].copy_(k)  # cache write
-    v_view[:, :, L - 1 : L].copy_(h.mul(wv).view(B, H, 1, DH))
+    v_view[:, :, L - 1 : L].copy_(F.linear(h, wv).view(B, H, 1, DH))
     attn = F.scaled_dot_product_attention(q, k_view, v_view)  # SDPA -> flash
     y = F.silu(attn.reshape(B, D) + x)  # residual add, activation
+    y = y + F.linear(F.silu(F.linear(y, w_up)), w_down)  # MLP: K = 4096 on the way down
     # a float32 softmax over the row and back: two cast copies (sibling) and
     # the converted softmax host
     p = torch.softmax(y.to(torch.float32), -1).to(DTYPE)
-    logits = (p * w_out).sum(-1)  # logit stand-in (no GEMM: closed)
+    logits = F.linear(p, w_out)  # the logit projection
     last = k_view[:, :, L - 1].sum(-1)  # last-position read (SymInt index)
     return logits, last
 
@@ -112,9 +128,12 @@ class TestCudaHostTraceDecode(HostTraceTestCase):
         self.table = torch.randn(V, D, device="cuda", dtype=DTYPE)
         self.ln_w = 1 + 0.1 * torch.randn(D, device="cuda", dtype=DTYPE)
         self.ln_b = 0.1 * torch.randn(D, device="cuda", dtype=DTYPE)
-        self.wq, self.wk, self.wv, self.w_out = (
-            torch.randn(D, device="cuda", dtype=DTYPE) for _ in range(4)
+        self.wq, self.wk, self.wv = (
+            torch.randn(D, D, device="cuda", dtype=DTYPE) / D**0.5 for _ in range(3)
         )
+        self.w_up = torch.randn(FF, D, device="cuda", dtype=DTYPE) / D**0.5
+        self.w_down = torch.randn(D, FF, device="cuda", dtype=DTYPE) / FF**0.5
+        self.w_out = torch.randn(V, D, device="cuda", dtype=DTYPE) / D**0.5
         # rotary tables for one position, laid out as [half, half] over DH
         ang = torch.arange(DH // 2, device="cuda", dtype=torch.float32) * 0.1
         self.cos = torch.cat([ang.cos(), ang.cos()]).to(DTYPE)
@@ -126,6 +145,8 @@ class TestCudaHostTraceDecode(HostTraceTestCase):
             torch.nn.attention.SDPBackend.FLASH_ATTENTION
         )
         self._flash.__enter__()
+        # the variants built from one tape, by the first one's identity
+        self._pool: dict[int, list] = {}
 
     def tearDown(self):
         self._flash.__exit__(None, None, None)
@@ -149,6 +170,8 @@ class TestCudaHostTraceDecode(HostTraceTestCase):
             self.wq,
             self.wk,
             self.wv,
+            self.w_up,
+            self.w_down,
             self.w_out,
             self.cos,
             self.sin,
@@ -164,13 +187,34 @@ class TestCudaHostTraceDecode(HostTraceTestCase):
         variant = ht.build(tape, decode_step, args)
         return tape, variant
 
+    def _serve(self, variant, args):
+        # what an entry does with one tape's variants: the first that serves
+        # the call does; a TopologyMiss (a projection's cuBLAS node chain at
+        # this batch is not the one an exec holds) names the tape, which
+        # built at these inputs (no trace) is a variant with that chain, kept
+        # beside the others; any other Miss is the call's
+        variants = self._pool.setdefault(id(variant), [variant])
+        topology, plain = None, None
+        for v in variants:
+            try:
+                return v.replay(args)
+            except ht.TopologyMiss as e:
+                topology = e
+            except ht.Miss as e:
+                plain = e
+        if topology is None:
+            raise plain
+        variants.append(ht.build(topology.tape, decode_step, args))
+        return variants[-1].replay(args)
+
     def _step(self, variant, B, L, eager_caches, replay_caches):
         # the same ids and the same cache contents on both sides; the replay
         # writes position L - 1 of the caller's cache like the ordinary call
         ids = self._ids(B)
         want = decode_step(*self._args(ids, eager_caches, L))
-        got = variant.try_replay(self._args(ids, replay_caches, L))
-        if got is None:
+        try:
+            got = self._serve(variant, self._args(ids, replay_caches, L))
+        except ht.Miss:
             return False
         for w, g in zip(want, got):
             self._assert_bitwise(g, w)
@@ -186,12 +230,13 @@ class TestCudaHostTraceDecode(HostTraceTestCase):
 
     def test_the_chain_traces_end_to_end(self):
         tape, _ = self._trace(4, 16)
-        # the ids' H2D copy, embedding (index_select), layer norm, the
-        # projection muls, two rotaries (mul, mul, cat as two copies, mul,
-        # add), two cache copies, flash, add, silu, two casts, softmax, mul,
-        # two sums: every launch a converted or sibling host
+        # the ids' H2D copy, embedding (index_select), layer norm, two
+        # rotaries (mul, mul, cat as two copies, mul, add), two cache copies,
+        # flash, add, silu, silu, add, two casts, softmax, a sum: every launch
+        # a converted or sibling host; the six projections are closed regions
         self.assertEqual(tape.num_memcpys, 1)  # the ids
-        self.assertGreaterEqual(tape.num_launches, 20)
+        self.assertEqual(tape.num_regions, 6)
+        self.assertGreaterEqual(tape.num_launches, 18)
         names = " ".join(rec["kernel"] for rec in tape.launches)
         for needle in (
             "layer_norm",
@@ -219,6 +264,44 @@ class TestCudaHostTraceDecode(HostTraceTestCase):
         caches = self._caches(1)
         with self.assertRaisesRegex(ht.Miss, "!= 1"):
             variant.replay(self._args(self._ids(1), caches, 20))
+
+    def test_batch_sweep_across_gemm_variants(self):
+        # one batch-4 tape over B = 1..64: each B is served bitwise or missed
+        # by name. Within the tape's own batch guard (an earlier host pins
+        # B <= 16) the projections cross the cuBLAS tile-M boundaries at 12
+        # and 16 in place; where a projection's node chain changes the same
+        # tape is built again at that batch into another exec (_serve), one
+        # exec per chain vector (on this box the K = 4096 down projection
+        # keeps its split-K chain up to B = 24, so one exec serves 2..16);
+        # batch 1 misses on the elementwise sibling's coalescing
+        _, variant = self._trace(4, 16)
+        h0 = ht.gemm_harvests()
+        served, missed = [], {}
+        for B in range(1, 65):
+            e_caches = self._caches(B)
+            r_caches = tuple(c.clone() for c in e_caches)
+            try:
+                self._serve(variant, self._args(self._ids(B), r_caches, 20))
+            except ht.Miss as e:
+                missed[B] = str(e).split(":")[0][:50]
+                continue
+            self.assertTrue(self._step(variant, B, 20, e_caches, r_caches))
+            served.append(B)
+        variants = self._pool[id(variant)]
+        stats = [v.region_stats() for v in variants]
+        reasons = sorted(set(missed.values()))
+        print(
+            f"\n[decode batch sweep 1..64] served {served} missed {sorted(missed)} reasons {reasons} "
+            f"harvests {ht.gemm_harvests() - h0} execs {len(variants)} "
+            f"chains {[[len(t) for t in v.topology] for v in variants]} "
+            f"applies {[s['applies'] for s in stats]} rebinds {[s['rebinds'] for s in stats]} "
+            f"graph updates {[v.exec.graph_updates for v in variants]}"
+        )
+        chains = {tuple(v.topology) for v in variants}
+        self.assertEqual(len(chains), len(variants))
+        self.assertEqual(served, list(range(2, 17)))
+        self.assertIn(1, missed)
+        self.assertEqual(sorted(k for k in missed if k > 16), list(range(17, 65)))
 
     def test_batch_one_has_its_own_tape(self):
         _, variant = self._trace(1, 16)
@@ -381,17 +464,17 @@ class TestCudaHostTraceDecode(HostTraceTestCase):
             variant.replay(qkv(1, 32))
 
     def test_what_a_real_decode_still_needs(self):
-        # the ops a real decode reaches that this stack does not trace yet: each
-        # declines by name (never a wrong result); the list is the work queue
+        # the ops a real decode reaches, each traced since the commit named
+        # (an op this stack does not trace declines by name, never a wrong
+        # result; nothing of the decode path is left in this list)
         x = torch.randn(4, D, device="cuda", dtype=DTYPE)
         w2 = torch.randn(D, D, device="cuda", dtype=DTYPE)
         ids = torch.randint(0, V, (4,), device="cuda")
-        cases = {
-            "matmul (closed GEMM)": (lambda a, b: a @ b, (x, w2)),
-        }
-        for name, (fn, args) in cases.items():
-            with self.assertRaises(ht.Declined, msg=name):
-                ht.trace(fn, args)
+        # the 2-D GEMM is a closed region since commit 10, and so is the batched
+        # one (bmm over expanded operands: batch stride 0)
+        self.assertEqual(ht.trace(lambda a, b: a @ b, (x, w2)).num_regions, 1)
+        tape = ht.trace(lambda a, b: a @ b, (x.expand(2, 4, D), w2.expand(2, D, D)))
+        self.assertEqual((tape.num_regions, tape.num_launches), (1, 0))
         # softmax, dtype casts and sin / cos trace since commit 7
         for fn in (
             lambda a: torch.softmax(a, -1),

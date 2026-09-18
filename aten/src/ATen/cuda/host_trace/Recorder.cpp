@@ -1067,6 +1067,25 @@ void finish_trace(TraceState* s) {
 // makes no CUDA call: it runs under the allocator's lock on whichever thread
 // allocates, and a capture query on another thread's stream from there raced
 // that thread's cudaStreamEndCapture and faulted inside the driver.
+static void alloc_log_attach() {
+  c10::call_once(g_tracker_once, [] {
+    c10::cuda::CUDACachingAllocator::attachAllocatorTraceTracker(
+        [](const c10::CachingDeviceAllocator::TraceEntry& e) {
+          if (e.action_ != c10::CachingDeviceAllocator::TraceEntry::ALLOC) {
+            return;
+          }
+          std::lock_guard<std::mutex> lock(g_log_mutex);
+          if (!g_log_on || e.device_ != g_log_device) {
+            return;
+          }
+          if (e.mempool_ == g_log_pool) {
+            g_log.emplace_back(
+                static_cast<uint64_t>(e.addr_), static_cast<uint64_t>(e.size_));
+          }
+        });
+  });
+}
+
 void alloc_log_begin(at::DeviceIndex device, c10::cuda::MempoolId_t pool) {
   TORCH_CHECK(
       pool.first != 0 || pool.second != 0,
@@ -1083,20 +1102,7 @@ void alloc_log_begin(at::DeviceIndex device, c10::cuda::MempoolId_t pool) {
         "(PYTORCH_CUDA_ALLOC_CONF=backend:" +
         backend + ")");
   }
-  c10::call_once(g_tracker_once, [] {
-    c10::cuda::CUDACachingAllocator::attachAllocatorTraceTracker(
-        [](const c10::CachingDeviceAllocator::TraceEntry& e) {
-          if (e.action_ != c10::CachingDeviceAllocator::TraceEntry::ALLOC) {
-            return;
-          }
-          std::lock_guard<std::mutex> lock(g_log_mutex);
-          if (g_log_on && e.device_ == g_log_device &&
-              e.mempool_ == g_log_pool) {
-            g_log.emplace_back(
-                static_cast<uint64_t>(e.addr_), static_cast<uint64_t>(e.size_));
-          }
-        });
-  });
+  alloc_log_attach();
   std::lock_guard<std::mutex> lock(g_log_mutex);
   g_log.clear();
   g_log_device = device;

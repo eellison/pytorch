@@ -453,9 +453,10 @@ struct FuncInfo {
 };
 TORCH_CUDA_CPP_API const FuncInfo& func_info(const void* host_func);
 
-// Ordinary-mode allocation log for the replay's build: (addr, nbytes) of every
-// caching-allocator allocation served from `pool`, the build capture's private
-// pool, on `device` between begin and end, in order. The allocator routes an
+// Ordinary-mode allocation log for the replay's build and the closed regions'
+// harvest: (addr, nbytes) of every caching-allocator allocation served from
+// `pool`, the capture's private pool, on `device` between begin and end, in
+// order. The allocator routes an
 // allocation to that pool exactly when its stream is in the capture (the
 // build stream, or a side stream forked from it), so the log holds the
 // captured call's allocations and none of another thread's. The log reads

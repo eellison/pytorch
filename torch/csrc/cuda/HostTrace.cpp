@@ -1,5 +1,6 @@
 #include <torch/csrc/python_headers.h>
 
+#include <ATen/cuda/CUDAContextLight.h>
 #include <ATen/cuda/CUDAGeneratorImpl.h>
 
 #include <pybind11/stl.h>
@@ -14,6 +15,7 @@
 #include <ATen/cuda/host_trace/HostTable.h>
 #include <ATen/cuda/host_trace/Recorder.h>
 
+#include <cstring>
 #include <memory>
 
 // Python entry points for host tracing (aten/src/ATen/cuda/host_trace). The
@@ -308,7 +310,6 @@ void THCPHostTrace_init(PyObject* module) {
       .def_property_readonly("num_nodes", &Exec::num_nodes)
       .def("kernel_name", &Exec::kernel_name)
       .def("dependencies", &Exec::dependencies)
-      .def("node_kinds", &Exec::node_kinds)
       .def(
           "image",
           [](const Exec& e, size_t j) {
@@ -318,6 +319,9 @@ void THCPHostTrace_init(PyObject* module) {
       .def("grid", &Exec::grid)
       .def("block", &Exec::block)
       .def("smem", &Exec::smem)
+      .def("attrs", &Exec::attrs)
+      .def("node_kinds", &Exec::node_kinds)
+      .def("adopt_driver", &Exec::adopt_driver)
       .def_property_readonly("num_memset_nodes", &Exec::num_memset_nodes)
       .def("memset_dst", &Exec::memset_dst)
       .def("memset_bytes", &Exec::memset_bytes)
@@ -336,24 +340,28 @@ void THCPHostTrace_init(PyObject* module) {
                  py::bytes,
                  std::array<unsigned, 3>,
                  std::array<unsigned, 3>,
-                 unsigned>>& updates,
-             const std::vector<std::tuple<size_t, uint64_t, uint64_t>>&
+                 unsigned,
+                 uint64_t,
+                 std::vector<int64_t>>>& updates,
+             const std::vector<
+                 std::tuple<size_t, uint64_t, uint64_t, unsigned>>&
                  memset_updates,
              const std::vector<
                  std::tuple<size_t, uint64_t, uint64_t, uint64_t>>&
                  memcpy_updates) {
             std::vector<NodeUpdate> us;
             us.reserve(updates.size());
-            for (const auto& [node, image, grid, block, smem] : updates) {
+            for (const auto& [node, image, grid, block, smem, func, attrs] :
+                 updates) {
               std::string s = image;
-              NodeUpdate u{node, {}, grid, block, smem};
+              NodeUpdate u{node, {}, grid, block, smem, func, attrs};
               u.image.assign(s.begin(), s.end());
               us.push_back(std::move(u));
             }
             std::vector<MemsetUpdate> ms;
             ms.reserve(memset_updates.size());
-            for (const auto& [node, dst, bytes] : memset_updates) {
-              ms.push_back(MemsetUpdate{node, dst, bytes});
+            for (const auto& [node, dst, bytes, value] : memset_updates) {
+              ms.push_back(MemsetUpdate{node, dst, bytes, value});
             }
             std::vector<MemcpyUpdate> mc;
             mc.reserve(memcpy_updates.size());
@@ -364,13 +372,97 @@ void THCPHostTrace_init(PyObject* module) {
           },
           py::arg("updates"),
           py::arg("memset_updates") =
-              std::vector<std::tuple<size_t, uint64_t, uint64_t>>{},
+              std::vector<std::tuple<size_t, uint64_t, uint64_t, unsigned>>{},
           py::arg("memcpy_updates") =
               std::vector<std::tuple<size_t, uint64_t, uint64_t, uint64_t>>{})
       .def_property_readonly("dirty_nodes", &Exec::dirty_nodes)
       .def_property_readonly("dirty_memset_nodes", &Exec::dirty_memset_nodes)
-      .def_property_readonly("dirty_memcpy_nodes", &Exec::dirty_memcpy_nodes);
+      .def_property_readonly("dirty_memcpy_nodes", &Exec::dirty_memcpy_nodes)
+      .def_property_readonly("graph_updates", &Exec::graph_updates);
 
+  // A raw stream capture of one closed library call (Exec.h): the Python side
+  // begins, runs the call on `stream`, ends and gets the nodes back as dicts:
+  // kernels (func, name, grid, block, smem, image, layout, attrs) and
+  // memsets (dst, value, elem, width), each with its kind.
+  m.def("_host_trace_stack_probe", []() {
+    // an address on the calling thread's stack: classifies the host stack
+    // pointers cuBLAS leaves in a kernel image (see _host_trace.py)
+    volatile int local = 0;
+    return reinterpret_cast<uint64_t>(const_cast<int*>(&local));
+  });
+  m.def("_host_trace_stack_smear", [](int pattern) {
+    // fills the stack below the caller with a pattern, so that a library
+    // call's uninitialized parameter padding reads it (see _harvest)
+    volatile unsigned char buf[1 << 16];
+    std::memset(const_cast<unsigned char*>(buf), pattern, sizeof(buf));
+    return static_cast<int>(buf[sizeof(buf) / 2]);
+  });
+  m.def("_host_trace_blas_workspace_size", []() {
+    // the scratch a closed region's variant owns: the larger of the two
+    // workspaces cuBLAS / cuBLASLt calls are given, so any variant fits
+    return static_cast<int64_t>(std::max(
+        at::cuda::getChosenWorkspaceSize(),
+        at::cuda::getCUDABlasLtWorkspaceSize()));
+  });
+  m.def("_host_trace_blas_workspaces", [](int64_t stream) {
+    // the workspace bases cuBLAS / cuBLASLt hold for this thread's handles
+    // on `stream` (CublasHandlePool.cpp's maps, read without allocating): a
+    // harvest classifies a stream-dependent qword as the workspace only if
+    // it equals one of them
+    void* s = reinterpret_cast<void*>(static_cast<intptr_t>(stream));
+    void* handles[2] = {
+        static_cast<void*>(at::cuda::getCurrentCUDABlasHandle(false)),
+        static_cast<void*>(at::cuda::getCurrentCUDABlasLtHandle())};
+    std::vector<uint64_t> out;
+    for (at::cuda::WorkspaceMapWithMutex* ws :
+         {&at::cuda::cublas_handle_stream_to_workspace(),
+          &at::cuda::cublaslt_handle_stream_to_workspace()}) {
+      std::shared_lock<std::shared_mutex> lock(ws->mutex);
+      for (void* h : handles) {
+        auto it = ws->map.find(std::make_tuple(h, s));
+        if (it != ws->map.end()) {
+          out.push_back(reinterpret_cast<uint64_t>(it->second.first.get()));
+        }
+      }
+    }
+    return out;
+  });
+  // the nodes of a graph a closed call was captured into (the graph's
+  // handle as CUDAGraph.raw_cuda_graph() gives it)
+  m.def(
+      "_host_trace_harvest_nodes",
+      [](int64_t graph, int probe_attr) {
+        // NOLINTNEXTLINE(performance-no-int-to-ptr)
+        auto g = reinterpret_cast<cudaGraph_t>(static_cast<intptr_t>(graph));
+        auto harvested = Exec::harvest_nodes(g, probe_attr);
+        py::list out;
+        for (const auto& h : harvested) {
+          py::dict d;
+          d["kind"] = h.kind == 0 ? "kernel" : "memset";
+          if (h.kind == 1) {
+            d["name"] = h.name;
+            d["dst"] = h.dst;
+            d["value"] = h.value;
+            d["elem"] = h.elem;
+            d["width"] = h.width;
+            out.append(std::move(d));
+            continue;
+          }
+          d["func"] = h.func;
+          d["name"] = h.name;
+          d["grid"] = h.grid;
+          d["block"] = h.block;
+          d["smem"] = h.smem;
+          d["image"] = py::bytes(
+              reinterpret_cast<const char*>(h.image.data()), h.image.size());
+          d["layout"] = h.layout;
+          d["attrs"] = h.attrs;
+          out.append(std::move(d));
+        }
+        return out;
+      },
+      py::arg("graph"),
+      py::arg("probe_attr") = -1);
   m.def("_host_trace_drop_storage", [](const at::Tensor& t) {
     at::cuda::host_trace::drop_storage(t);
   });
