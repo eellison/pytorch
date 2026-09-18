@@ -35,6 +35,15 @@ void bitwise_not_kernel_cuda(TensorIteratorBase& iter) {
 }
 
 constexpr char exp_name[] = "exp_kernel";
+namespace {
+template <typename scalar_t>
+struct ExpFunctor {
+  __device__ scalar_t operator()(scalar_t a) const {
+    return std::exp(a);
+  }
+};
+} // namespace
+
 void exp_kernel_cuda(TensorIteratorBase& iter) {
   auto common_dtype = iter.common_dtype();
   if (at::isComplexType(common_dtype)) {
@@ -61,9 +70,7 @@ void exp_kernel_cuda(TensorIteratorBase& iter) {
     #endif
   } else {
     AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, common_dtype, "exp_cuda", [&]() {
-      gpu_kernel(iter, []GPU_LAMBDA(scalar_t a) -> scalar_t {
-        return std::exp(a);
-      });
+      gpu_kernel(iter, ExpFunctor<scalar_t>());
     });
   }
 }
@@ -93,6 +100,16 @@ C10_HOST_DEVICE static inline c10::complex<T> rsqrt_wrapper(c10::complex<T> v) {
 }
 
 constexpr char rsqrt_name[] = "rsqrt_kernel";
+namespace {
+template <typename scalar_t>
+struct RsqrtFunctor {
+  __device__ scalar_t operator()(scalar_t a) const {
+    // In CUDA, ::rsqrt is overloaded for float and at::Half here is implicitly cast to float.
+    return rsqrt_wrapper(a);
+  }
+};
+} // namespace
+
 void rsqrt_kernel_cuda(TensorIteratorBase& iter) {
   auto common_dtype = iter.common_dtype();
   if (at::isComplexType(common_dtype)) {
@@ -123,10 +140,7 @@ void rsqrt_kernel_cuda(TensorIteratorBase& iter) {
       ScalarType::BFloat16, ScalarType::Half,
       iter.common_dtype(), "rsqrt_cuda",
       [&]() {
-        gpu_kernel(iter, []GPU_LAMBDA(scalar_t a) -> scalar_t {
-          // In CUDA, ::rsqrt is overloaded for float and at::Half here is implicitly cast to float.
-          return rsqrt_wrapper(a);
-        });
+        gpu_kernel(iter, RsqrtFunctor<scalar_t>());
       });
   }
 }
@@ -293,7 +307,7 @@ REGISTER_DISPATCH(frexp_stub, &frexp_kernel_cuda)
 } // namespace at::native
 
 // ---- host tracing (ATen/cuda/host_trace): the traced sibling of sqrt_kernel_cuda (and exp_kernel_cuda, rsqrt_kernel_cuda from commit 7), compiled here
-// so the sibling and the real host above instantiate the one kernel over SqrtFunctor
+// so the sibling and the real host above instantiate the one kernel over SqrtFunctor / ExpFunctor / RsqrtFunctor
 // (DECISIONS E36): the tape's launch is eager's function object, not a twin. Outside a trace the
 // entry runs the same launches in ordinary mode, which is how the parity test compares it with
 // the real op.
@@ -304,6 +318,14 @@ namespace at::cuda::host_trace::ti {
 
 Tensor sqrt_traced(const Tensor& self) {
   return floating_unary<at::native::SqrtFunctor>(self, "sqrt");
+}
+
+Tensor exp_traced(const Tensor& self) {
+  return floating_unary<at::native::ExpFunctor>(self, "exp");
+}
+
+Tensor rsqrt_traced(const Tensor& self) {
+  return floating_unary<at::native::RsqrtFunctor>(self, "rsqrt");
 }
 
 } // namespace at::cuda::host_trace::ti

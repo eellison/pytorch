@@ -8,6 +8,8 @@
 #include <ATen/ScalarOps.h>
 
 #include <ATen/HostTraceSiblingBindings.h>
+#include <ATen/cuda/host_trace/NllLossHost.h>
+#include <ATen/cuda/host_trace/SoftmaxHost.h>
 #include <ATen/cuda/host_trace/ti/Ops.h>
 #include <ATen/cuda/host_trace/ti/ReduceOps.h>
 
@@ -185,6 +187,84 @@ void THCPHostTraceTI_init(PyObject* module) {
       "_host_trace_ti_pow_tensor_scalar",
       [](const at::Tensor& self, const py::handle& exponent) {
         return ti::pow_tensor_scalar_traced(self, scalar_arg(exponent));
+      });
+  m.def("_host_trace_ti_sin", [](const at::Tensor& self) {
+    return ti::sin_traced(self);
+  });
+  m.def("_host_trace_ti_cos", [](const at::Tensor& self) {
+    return ti::cos_traced(self);
+  });
+  m.def("_host_trace_ti_exp", [](const at::Tensor& self) {
+    return ti::exp_traced(self);
+  });
+  m.def("_host_trace_ti_rsqrt", [](const at::Tensor& self) {
+    return ti::rsqrt_traced(self);
+  });
+  m.def("_host_trace_ti_neg", [](const at::Tensor& self) {
+    return ti::neg_traced(self);
+  });
+  // the converted softmax host (SoftMax.cu): the entry allocates the output
+  // through the trace mode, so it is a traced root, and calls the host
+  m.def(
+      "_host_trace_softmax_out",
+      [](const at::Tensor& self,
+         int64_t dim,
+         bool half_to_float,
+         bool log_softmax,
+         at::Tensor out) {
+        return at::native::host_trace_softmax_out(
+            self, dim, half_to_float, log_softmax, out);
+      });
+  m.def(
+      "_host_trace_softmax_backward_out",
+      [](const at::Tensor& grad,
+         const at::Tensor& output,
+         int64_t dim,
+         at::ScalarType input_dtype,
+         bool log_softmax,
+         at::Tensor grad_input) {
+        return at::native::host_trace_softmax_backward_out(
+            grad, output, dim, input_dtype, log_softmax, grad_input);
+      });
+  // the converted nll_loss hosts (Loss.cu): the entries allocate the outputs
+  // through the trace mode, so they are traced roots, and call the hosts
+  m.def(
+      "_host_trace_nll_loss_forward_out",
+      [](const at::Tensor& self,
+         const at::Tensor& target,
+         const std::optional<at::Tensor>& weight,
+         int64_t reduction,
+         int64_t ignore_index,
+         at::Tensor output,
+         at::Tensor total_weight) {
+        return at::native::host_trace_nll_loss_forward_out(
+            self,
+            target,
+            weight,
+            reduction,
+            ignore_index,
+            output,
+            total_weight);
+      });
+  m.def(
+      "_host_trace_nll_loss_backward_out",
+      [](const at::Tensor& grad_output,
+         const at::Tensor& self,
+         const at::Tensor& target,
+         const std::optional<at::Tensor>& weight,
+         int64_t reduction,
+         int64_t ignore_index,
+         const at::Tensor& total_weight,
+         at::Tensor grad_input) {
+        return at::native::host_trace_nll_loss_backward_out(
+            grad_output,
+            self,
+            target,
+            weight,
+            reduction,
+            ignore_index,
+            total_weight,
+            grad_input);
       });
   // reductions: dims=[] reduces every dim; the output has the input's dtype
   m.def(

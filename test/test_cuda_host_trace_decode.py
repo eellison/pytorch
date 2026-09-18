@@ -44,7 +44,10 @@ def decode_step(ids, table, ln_w, ln_b, wq, wk, wv, w_out, k_view, v_view):
     v_view[:, :, L - 1 : L].copy_(h.mul(wv).view(B, H, 1, DH))
     attn = F.scaled_dot_product_attention(q, k_view, v_view)  # SDPA -> flash
     y = F.silu(attn.reshape(B, D) + x)  # residual add, activation
-    logits = (y * w_out).sum(-1)  # logit stand-in (no GEMM: closed)
+    # a float32 softmax over the row and back: two cast copies (sibling) and
+    # the converted softmax host
+    p = torch.softmax(y.to(torch.float32), -1).to(DTYPE)
+    logits = (p * w_out).sum(-1)  # logit stand-in (no GEMM: closed)
     last = k_view[:, :, L - 1].sum(-1)  # last-position read (SymInt index)
     return logits, last
 
@@ -161,11 +164,18 @@ class TestCudaHostTraceDecode(HostTraceTestCase):
     def test_the_chain_traces_end_to_end(self):
         tape, _ = self._trace(4, 16)
         # embedding gather, layer norm, three muls, two cache copies, flash,
-        # add, silu, mul, two sums: every launch a converted or sibling host
+        # add, silu, two casts, softmax, mul, two sums: every launch a
+        # converted or sibling host
         self.assertEqual(tape.num_memcpys, 1)  # the ids
-        self.assertGreaterEqual(tape.num_launches, 11)
+        self.assertGreaterEqual(tape.num_launches, 14)
         names = " ".join(rec["kernel"] for rec in tape.launches)
-        for needle in ("layer_norm", "flash_fwd", "gather_kernel", "reduce_kernel"):
+        for needle in (
+            "layer_norm",
+            "flash_fwd",
+            "gather_kernel",
+            "reduce_kernel",
+            "softmax_warp_forward",
+        ):
             self.assertIn(needle, names)
 
     def test_steps_of_a_growing_cache_serve_without_new_pins(self):
@@ -355,9 +365,7 @@ class TestCudaHostTraceDecode(HostTraceTestCase):
         cases = {
             "matmul (closed GEMM)": (lambda a, b: a @ b, (x, w2)),
             "embedding": (lambda t, i: F.embedding(i, t), (self.table, ids)),
-            "softmax": (lambda a: torch.softmax(a, -1), (x,)),
-            "dtype cast": (lambda a: a.float(), (x,)),
-            "rotary pieces (sin / cat)": (
+            "rotary concat (cat)": (
                 lambda a: torch.cat([a.sin(), a.cos()], -1),
                 (x,),
             ),
@@ -365,6 +373,13 @@ class TestCudaHostTraceDecode(HostTraceTestCase):
         for name, (fn, args) in cases.items():
             with self.assertRaises(ht.Declined, msg=name):
                 ht.trace(fn, args)
+        # softmax, dtype casts and sin / cos trace since commit 7
+        for fn in (
+            lambda a: torch.softmax(a, -1),
+            lambda a: a.float(),
+            lambda a: a.sin() * a.cos(),
+        ):
+            self.assertGreaterEqual(ht.trace(fn, (x,)).num_launches, 1)
 
     def _sdpa_fwd_bwd(self, p):
         # create_graph=False, as loss.backward() runs the backward (the flash

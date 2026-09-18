@@ -248,7 +248,7 @@ Tensor pow_tensor_scalar_traced(const Tensor& self, const Scalar& exponent) {
     if (exponent.equal(.5)) {
       return sqrt_traced(self);
     } else if (exponent.equal(-0.5)) {
-      decline("host_trace: pow with exponent -0.5 routes to rsqrt, which has no traced sibling in this version (declined)");
+      return rsqrt_traced(self);
     } else if (exponent.equal(-1.0)) {
       return reciprocal_traced(self);
     }

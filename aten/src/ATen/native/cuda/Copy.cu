@@ -56,27 +56,26 @@ struct CopyFunctor {
   }
 };
 
+template <typename from_t, typename to_t>
+struct CastCopyFunctor {
+  __device__ to_t operator()(from_t value) const {
+    return static_cast<to_t>(value);
+  }
+};
+
 void float16_copy_kernel_cuda(TensorIteratorBase &iter) {
-    gpu_kernel_nocast(iter, [] GPU_LAMBDA(float value) {
-        return static_cast<at::Half>(value);
-    });
+    gpu_kernel_nocast(iter, CastCopyFunctor<float, at::Half>{});
 }
 
 void bfloat16_copy_kernel_cuda(TensorIteratorBase &iter) {
-    gpu_kernel_nocast(iter, [] GPU_LAMBDA(float value) {
-        return static_cast<at::BFloat16>(value);
-    });
+    gpu_kernel_nocast(iter, CastCopyFunctor<float, at::BFloat16>{});
 }
 
 void bfloat16tofloat32_copy_kernel_cuda(TensorIteratorBase &iter) {
-    gpu_kernel_nocast(iter, [] GPU_LAMBDA(at::BFloat16 value) {
-        return static_cast<float>(value);
-    });
+    gpu_kernel_nocast(iter, CastCopyFunctor<at::BFloat16, float>{});
 }
 void float16tofloat32_copy_kernel_cuda(TensorIteratorBase &iter) {
-    gpu_kernel_nocast(iter, [] GPU_LAMBDA(at::Half value) {
-        return static_cast<float>(value);
-    });
+    gpu_kernel_nocast(iter, CastCopyFunctor<at::Half, float>{});
 }
 
 template <typename SrcT>
@@ -510,48 +509,66 @@ REGISTER_DISPATCH(copy_stub, &copy_kernel_cuda)
 } // namespace at::native
 
 // ---- host tracing (ATen/cuda/host_trace): the traced sibling of copy_device_to_device's
-// kernel branch (direct_copy_kernel_cuda for two CUDA tensors of one dtype). It lives in this
-// translation unit so that its launches are the instantiations the host above makes: the
-// replay's kernel nodes hold the function handle eager's do, not only its name. The real op
-// copies a contiguous pair with a cudaMemcpyAsync rather than a kernel (copy_device_to_device),
-// and so does the sibling, through copy_d2d (HostTable.h): a memcpy record on the tape, a
-// memcpy node in the replay's capture.
+// kernel branch (direct_copy_kernel_cuda for two CUDA tensors). It lives in this translation
+// unit so that its launches are the instantiations the host above makes: the replay's kernel
+// nodes hold the function handle eager's do, not only its name. A pair of one dtype runs
+// CopyFunctor; the real op copies a contiguous pair of one dtype with a cudaMemcpyAsync
+// rather than a kernel, and so does the sibling, through copy_d2d (HostTable.h): a memcpy
+// record on the tape, a memcpy node in the replay's capture. A pair of two dtypes is the real
+// op's cast: float <-> Half / BFloat16 through the four CastCopyFunctor no-cast launches,
+// every other pair through the dynamic-cast path of gpu_kernel dispatched on the destination
+// dtype. Quantized, float8, bits and complex destinations decline by name.
 namespace at::cuda::host_trace::ti {
 
 Tensor& copy_traced(Tensor& dst, const Tensor& src) {
-  if (dst.scalar_type() != src.scalar_type()) {
-    decline(c10::str(
-        "host_trace: copy_ between ",
-        src.scalar_type(),
-        " and ",
-        dst.scalar_type(),
-        " casts, which is not traced (declined)"));
-  }
   if (dst.is_conj() || src.is_conj() || dst.is_neg() || src.is_neg()) {
     decline("host_trace: copy_ with a conjugate or negative bit is not traced (declined)");
   }
+  const ScalarType dtype = dst.scalar_type();
+  const ScalarType other = src.scalar_type();
+  if (isQIntType(dtype) || isFloat8Type(dtype) || isBitsType(dtype) || dtype == ScalarType::Float4_e2m1fn_x2 ||
+      isComplexType(dtype) || isComplexType(other)) {
+    decline(c10::str("host_trace: copy_ from ", other, " to ", dtype, " is not traced (declined)"));
+  }
   TensorIteratorSymConfig config;
   config.resize_outputs_ = false;
+  config.check_all_same_dtype_ = false;
   TensorIteratorSym iter;
   iter.add_output(dst);
   iter.add_input(src);
   iter.build(config);
-  if (iter.is_contiguous()) {
-    // copy_device_to_device's memcpy_eligible branch: one cudaMemcpyAsync of
-    // the whole extent, nothing when the two addresses are one (each
-    // comparison a guard of the trace)
-    if (iter.numel() != 0 && iter.data_ptr(0) != iter.data_ptr(1)) {
-      copy_d2d(
-          iter.data_ptr(0),
-          iter.data_ptr(1),
-          iter.numel() * iter.element_size(0),
-          at::cuda::getCurrentCUDAStream());
+  if (dtype == other) {
+    if (iter.is_contiguous()) {
+      // copy_device_to_device's memcpy_eligible branch: one cudaMemcpyAsync of
+      // the whole extent, nothing when the two addresses are one (each
+      // comparison a guard of the trace)
+      if (iter.numel() != 0 && iter.data_ptr(0) != iter.data_ptr(1)) {
+        copy_d2d(
+            iter.data_ptr(0),
+            iter.data_ptr(1),
+            iter.numel() * iter.element_size(0),
+            at::cuda::getCurrentCUDAStream());
+      }
+      return dst;
     }
+    AT_DISPATCH_ALL_TYPES_AND3(kHalf, kBFloat16, kBool, dtype, "copy_traced", [&] {
+      gpu_kernel(iter, at::native::CopyFunctor<scalar_t>{});
+    });
     return dst;
   }
-  AT_DISPATCH_ALL_TYPES_AND3(kHalf, kBFloat16, kBool, iter.common_dtype(), "copy_traced", [&] {
-    gpu_kernel(iter, at::native::CopyFunctor<scalar_t>{});
-  });
+  if (other == kFloat && dtype == kBFloat16) {
+    gpu_kernel(iter, at::native::CastCopyFunctor<float, at::BFloat16>{});
+  } else if (other == kFloat && dtype == kHalf) {
+    gpu_kernel(iter, at::native::CastCopyFunctor<float, at::Half>{});
+  } else if (other == kBFloat16 && dtype == kFloat) {
+    gpu_kernel(iter, at::native::CastCopyFunctor<at::BFloat16, float>{});
+  } else if (other == kHalf && dtype == kFloat) {
+    gpu_kernel(iter, at::native::CastCopyFunctor<at::Half, float>{});
+  } else {
+    AT_DISPATCH_V2(dtype, "copy_traced", AT_WRAP([&] {
+      gpu_kernel(iter, at::native::CopyFunctor<scalar_t>{});
+    }), AT_EXPAND(AT_ALL_TYPES), kHalf, kBool, kBFloat16, AT_EXPAND(AT_BAREBONES_UNSIGNED_TYPES));
+  }
   return dst;
 }
 

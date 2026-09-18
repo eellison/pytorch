@@ -29,9 +29,8 @@ TORCH_CUDA_CU_API Tensor reciprocal_traced(const Tensor& self);
 TORCH_CUDA_CU_API Tensor tanh_traced(const Tensor& self);
 TORCH_CUDA_CU_API Tensor sqrt_traced(const Tensor& self);
 // pow.Tensor_Scalar's kernel host (PowKernel.cu pow_tensor_scalar_kernel) for
-// a floating base: 0.5 / -1 route to sqrt / reciprocal (-0.5 is the rsqrt
-// route and declines until that sibling exists), 2, 3 and -2 are closed
-// forms, any other exponent is captured in the base's type
+// a floating base: 0.5 / -0.5 / -1 route to sqrt / rsqrt / reciprocal, 2, 3
+// and -2 are closed forms, any other exponent is captured in the base's type
 TORCH_CUDA_CU_API Tensor pow_tensor_scalar_traced(const Tensor& self, const Scalar& exponent);
 // fill_ (FillKernel.cu fill_kernel_cuda): the value baked into the functor
 // as a constant of the variant; the factories (full, zeros, ones, *_like,
@@ -55,5 +54,11 @@ TORCH_CUDA_CU_API Tensor& masked_fill_traced(Tensor& self, const Tensor& mask, c
 // clamp / clamp_min / clamp_max with scalar bounds (TensorCompare.cpp
 // clamp_out and TensorCompare.cu launch_clamp_scalar); `out` as for add
 TORCH_CUDA_CU_API Tensor clamp_scalar_traced(const Tensor& self, const std::optional<Scalar>& min, const std::optional<Scalar>& max, const Tensor& out = {});
+
+TORCH_CUDA_CU_API Tensor sin_traced(const Tensor& self);
+TORCH_CUDA_CU_API Tensor cos_traced(const Tensor& self);
+TORCH_CUDA_CU_API Tensor exp_traced(const Tensor& self);
+TORCH_CUDA_CU_API Tensor rsqrt_traced(const Tensor& self);
+TORCH_CUDA_CU_API Tensor neg_traced(const Tensor& self);
 
 } // namespace at::cuda::host_trace::ti

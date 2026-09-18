@@ -615,6 +615,7 @@
 # /test/test_cuda_host_trace_decode.py
 # /test/test_cuda_host_trace_flash.py
 # /test/test_cuda_host_trace_h2d.py
+# /test/test_cuda_host_trace_ops7.py
 # /test/test_cuda_host_trace_reduce.py
 # /test/test_cuda_host_trace_ti.py
 # /test/test_cuda_multigpu.py

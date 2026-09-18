@@ -1,9 +1,11 @@
 """The CUDA ops with a traced TensorIterator sibling (private): elementwise
 add, sub, rsub, mul, div (their in-place, out= and .Scalar forms too), silu,
-gelu, reciprocal, tanh, sqrt, pow, copy_ (incl. casts), fill_ / zero_ (eager's
-memset over a dense tensor) and the fill factories (full, zeros, ones, *_like,
-new_*), arange, the comparisons eq / ne / lt / le / gt / ge, masked_fill,
-clamp / clamp_min / clamp_max / relu, and the reductions sum, mean, amax / max.
+gelu, sin, cos, exp, rsqrt, neg, reciprocal, tanh, sqrt, pow, copy_ (incl.
+casts), fill_ / zero_ (eager's memset over a dense tensor) and the fill
+factories (full, zeros, ones, *_like, new_*), arange, the comparisons eq / ne /
+lt / le / gt / ge, masked_fill, clamp / clamp_min / clamp_max / relu, and the
+reductions sum, mean, amax / max; plus the converted softmax / log_softmax
+host, whose entry allocates the output.
 
 Each entry is what the op's CUDA kernel host does around gpu_kernel or
 gpu_reduce_kernel, on the SymInt-typed sibling iterator in
@@ -668,6 +670,148 @@ for _name, _fn in (
     register_traced_entry(getattr(aten, _name).default, _fn)
     _op_ = getattr(aten, _name + "_").default
     register_traced_entry(_op_, _inplace(_op_, _fn))
+
+
+def _to_copy(
+    self,
+    dtype=None,
+    layout=None,
+    device=None,
+    pin_memory=None,
+    non_blocking=False,
+    memory_format=None,
+):
+    # at::native::_to_copy for a CUDA tensor changing dtype only: the
+    # allocation empty_like makes (preserve_format unless given), then copy_
+    # through the sibling (a cast copy). A device, layout or pinning change
+    # is a different host and declines.
+    _cuda_operands(aten._to_copy.default, self)
+    if (
+        (device is not None and torch.device(device) != self.device)
+        or (layout is not None and layout != self.layout)
+        or pin_memory
+    ):
+        raise Declined(
+            "host_trace: _to_copy across devices, layouts or into pinned memory is not traced (declined)"
+        )
+    mf = torch.preserve_format if memory_format is None else memory_format
+    out = torch.empty_like(self, dtype=dtype, memory_format=mf)
+    return _C._host_trace_ti_copy_(out, self)
+
+
+register_traced_entry(aten._to_copy.default, _to_copy)
+register_traced_entry(aten.sin.default, _unary(aten.sin.default, _C._host_trace_ti_sin))
+register_traced_entry(aten.cos.default, _unary(aten.cos.default, _C._host_trace_ti_cos))
+register_traced_entry(aten.exp.default, _unary(aten.exp.default, _C._host_trace_ti_exp))
+register_traced_entry(
+    aten.rsqrt.default, _unary(aten.rsqrt.default, _C._host_trace_ti_rsqrt)
+)
+register_traced_entry(aten.neg.default, _unary(aten.neg.default, _C._host_trace_ti_neg))
+
+
+# ---- softmax / log_softmax (SoftMax.cu, the converted host): the structured
+# kernels allocate their output outside the dispatcher, so the entry allocates
+# it here (through the trace mode: a traced root) and calls the host with it.
+# The output is contiguous with the input's dtype, or float32 for
+# half_to_float, as the structured meta sets it.
+
+
+def _softmax_entry(log_softmax):
+    op = aten._log_softmax.default if log_softmax else aten._softmax.default
+
+    def entry(self, dim, half_to_float):
+        _cuda_operands(op, self)
+        if half_to_float and self.dtype is not torch.float16:
+            raise RuntimeError("conversion is supported for Half type only")
+        dtype = torch.float32 if half_to_float else self.dtype
+        out = torch.empty(self.shape, dtype=dtype, device=self.device)
+        return _C._host_trace_softmax_out(
+            self, int(dim), bool(half_to_float), log_softmax, out
+        )
+
+    return entry
+
+
+register_traced_entry(aten._softmax.default, _softmax_entry(False))
+register_traced_entry(aten._log_softmax.default, _softmax_entry(True))
+
+
+def _softmax_backward_entry(log_softmax):
+    op = (
+        aten._log_softmax_backward_data.default
+        if log_softmax
+        else aten._softmax_backward_data.default
+    )
+
+    def entry(grad_output, output, dim, input_dtype):
+        # the structured meta: grad_input has grad's sizes, contiguous, grad's
+        # dtype, or Half for the (Float grad, Half input) pair
+        _cuda_operands(op, grad_output, output)
+        half_pair = grad_output.dtype is torch.float32 and input_dtype is torch.float16
+        dtype = torch.float16 if half_pair else grad_output.dtype
+        out = torch.empty(grad_output.shape, dtype=dtype, device=grad_output.device)
+        return _C._host_trace_softmax_backward_out(
+            grad_output, output, int(dim), input_dtype, log_softmax, out
+        )
+
+    return entry
+
+
+register_traced_entry(
+    aten._softmax_backward_data.default, _softmax_backward_entry(False)
+)
+register_traced_entry(
+    aten._log_softmax_backward_data.default, _softmax_backward_entry(True)
+)
+
+
+# ---- nll_loss forward / backward (Loss.cu, the converted hosts): structured
+# kernels whose outputs the entry allocates as the metas (LossNLL.cpp) shape
+# them: a {batch} loss for reduction none over a 2-D input, else a scalar;
+# total_weight a scalar; grad_input the input's shape, contiguous; all in the
+# input's dtype. The host reads no tensor value (the ignored-index count and
+# total_weight live on the device).
+
+
+def _nll_loss_forward(self, target, weight, reduction, ignore_index):
+    op = aten.nll_loss_forward.default
+    _cuda_operands(op, self, target, *(() if weight is None else (weight,)))
+    shape = (self.shape[0],) if reduction == 0 and self.dim() == 2 else ()
+    output = torch.empty(shape, dtype=self.dtype, device=self.device)
+    total_weight = torch.empty((), dtype=self.dtype, device=self.device)
+    return _C._host_trace_nll_loss_forward_out(
+        self, target, weight, int(reduction), int(ignore_index), output, total_weight
+    )
+
+
+def _nll_loss_backward(
+    grad_output, self, target, weight, reduction, ignore_index, total_weight
+):
+    op = aten.nll_loss_backward.default
+    _cuda_operands(
+        op,
+        grad_output,
+        self,
+        target,
+        total_weight,
+        *(() if weight is None else (weight,)),
+    )
+    grad_input = torch.empty(self.shape, dtype=self.dtype, device=self.device)
+    return _C._host_trace_nll_loss_backward_out(
+        grad_output,
+        self,
+        target,
+        weight,
+        int(reduction),
+        int(ignore_index),
+        total_weight,
+        grad_input,
+    )
+
+
+register_traced_entry(aten.nll_loss_forward.default, _nll_loss_forward)
+register_traced_entry(aten.nll_loss_backward.default, _nll_loss_backward)
+
 
 # ---- reductions (the entries in ReduceSumProdKernel.cu, ReduceMomentKernel.cu,
 # ReduceMaxValuesKernel.cu): one input of one dtype

@@ -1,4 +1,4 @@
-#define TORCH_ASSERT_NO_OPERATORS
+#define TORCH_ASSERT_ONLY_METHOD_OPERATORS
 #include <ATen/AccumulateType.h>
 #include <ATen/Dispatch.h>
 #include <ATen/OpMathType.h>
@@ -15,6 +15,15 @@ namespace at::native {
 #if AT_USE_JITERATOR()
 constexpr char cos_name[] = "cos_impl";
 #endif // AT_USE_JITERATOR()
+
+namespace {
+template <typename scalar_t>
+struct CosFunctor {
+  __device__ scalar_t operator()(scalar_t a) const {
+    return ::cos(a);
+  }
+};
+} // namespace
 
 void cos_kernel_cuda(TensorIteratorBase& iter) {
   auto common_dtype = iter.common_dtype();
@@ -46,8 +55,7 @@ void cos_kernel_cuda(TensorIteratorBase& iter) {
         common_dtype,
         "cos_cuda",
         [&]() {
-          gpu_kernel(
-              iter, [] GPU_LAMBDA(scalar_t a) -> scalar_t { return ::cos(a); });
+          gpu_kernel(iter, CosFunctor<scalar_t>());
         });
   }
 }
@@ -55,3 +63,19 @@ void cos_kernel_cuda(TensorIteratorBase& iter) {
 REGISTER_DISPATCH(cos_stub, &cos_kernel_cuda)
 
 } // namespace at::native
+
+// ---- host tracing (ATen/cuda/host_trace): the traced sibling of cos_kernel_cuda, compiled here
+// so the sibling and the real host above instantiate the one kernel over CosFunctor
+// (DECISIONS E36): the tape's launch is eager's function object, not a twin. Outside a trace the
+// entry runs the same launches in ordinary mode, which is how the parity test compares it with
+// the real op.
+#include <ATen/cuda/host_trace/ti/Ops.h>
+#include <ATen/cuda/host_trace/ti/UnaryEntry.cuh>
+
+namespace at::cuda::host_trace::ti {
+
+Tensor cos_traced(const Tensor& self) {
+  return floating_unary<at::native::CosFunctor>(self, "cos");
+}
+
+} // namespace at::cuda::host_trace::ti

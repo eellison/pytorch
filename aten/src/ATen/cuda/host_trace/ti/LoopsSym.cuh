@@ -6,11 +6,11 @@
 // same functor and array types the real op uses, so the device side is shared
 // and the real launch path is never executed under a trace.
 //
-// Two things could not stay a re-typing of the original. IntDivider's magic
+// One thing could not stay a re-typing of the original. IntDivider's magic
 // number and shift are opaque rebinds of the divisor: the constructor's
 // shift loop would otherwise guard every size into a power-of-two interval.
-// The strided path's lambda has no nameable layout, so StridedOp is a named
-// functor with exactly its captures (data, offset_calc, f) and a proxy over it.
+// The strided path's functor is CUDALoops.cuh's StridedOp / StridedCastOp,
+// the named type eager launches; the proxies below view its members.
 #pragma once
 #include <ATen/cuda/host_trace/Launch.h>
 #include <ATen/cuda/host_trace/ti/Slots.h>
@@ -19,6 +19,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/detail/OffsetCalculator.cuh>
 #include <ATen/native/cuda/Loops.cuh>
+#include <c10/util/bit_cast.h>
 
 #include <array>
 #include <cstddef>
@@ -103,20 +104,10 @@ static OffsetCalculator<N, uint32_t, signed_strides> make_offset_calculator(cons
   return OffsetCalculator<N, uint32_t, signed_strides>(iter.ndim(), iter.shape().data(), strides.data());
 }
 
-// ---- the strided path's functor: what gpu_kernel_impl_nocast's lambda
-// captures, as a named struct, and its proxy
-template <typename func_t, int NTENSORS>
-struct StridedOp {
-  std::array<char*, NTENSORS> data;
-  ::OffsetCalculator<NTENSORS> offset_calc;
-  func_t f;
-  __device__ void operator()(int idx) const {
-    using arg0_t = typename ::function_traits<func_t>::result_type;
-    auto offsets = offset_calc.get(idx);
-    arg0_t* out = (arg0_t*)(data[0] + offsets[0]);
-    *out = at::native::invoke(f, &data[1], &offsets[1], 1);
-  }
-};
+// ---- the strided paths' functors are eager's (CUDALoops.cuh StridedOp /
+// StridedCastOp: data, offset_calc[, dtypes], f); the proxies below view them
+using at::native::StridedOp;
+using at::native::StridedCastOp;
 
 struct IntDividerView {
   using ID = ::at::cuda::detail::IntDivider<unsigned int>;
@@ -199,6 +190,23 @@ struct Traced<ti::StridedOp<F, N>> : TracedBase {
       : TracedBase(pod_bytes, sizeof(P)),
         data(this, offsetof(P, data), ti::SlotName{nullptr, "data"}),
         offset_calc(this, offsetof(P, offset_calc), ti::SlotName{nullptr, "offset_calc"}),
+        f(this, offsetof(P, f), ti::SlotName{nullptr, "f"}) {}
+};
+
+// the dtypes array is a constant of the variant (FunctorView copies a plain value)
+template <class F, int N>
+struct Traced<ti::StridedCastOp<F, N>> : TracedBase {
+  using P = ti::StridedCastOp<F, N>;
+  alignas(P) unsigned char pod_bytes[sizeof(P)] = {};
+  ti::ArrayOf<ti::PtrSlot, sizeof(char*), N> data;
+  ti::OffsetCalculatorView<N> offset_calc;
+  ti::FunctorView<std::array<ScalarType, N>> dtypes;
+  ti::FunctorView<F> f;
+  Traced()
+      : TracedBase(pod_bytes, sizeof(P)),
+        data(this, offsetof(P, data), ti::SlotName{nullptr, "data"}),
+        offset_calc(this, offsetof(P, offset_calc), ti::SlotName{nullptr, "offset_calc"}),
+        dtypes(this, offsetof(P, dtypes), ti::SlotName{nullptr, "dtypes"}),
         f(this, offsetof(P, f), ti::SlotName{nullptr, "f"}) {}
 };
 
@@ -373,8 +381,86 @@ void gpu_kernel_impl_nocast(TensorIteratorSym& iter, const func_t& f) {
   launch_legacy_kernel<128, unroll_factor>(numel, op);
 }
 
-// Loops.cuh's gpu_kernel for one-output ops whose operands share a dtype (the
-// cast path never arises: compute_types declined anything else).
+// CUDALoops.cuh's needs_dynamic_casting on the sibling iterator: an operand
+// whose dtype differs from the functor's static type at that position
+template <typename func_t, int nargs = function_traits<func_t>::arity>
+struct needs_dynamic_casting {
+  static bool check(const TensorIteratorSym& iter) {
+    using traits = function_traits<func_t>;
+    using cpp_type = typename traits::template arg<nargs - 1>::type;
+    if (iter.input_dtype(nargs - 1) != c10::CppTypeToScalarType<cpp_type>::value) {
+      return true;
+    }
+    return needs_dynamic_casting<func_t, nargs - 1>::check(iter);
+  }
+};
+template <typename func_t>
+struct needs_dynamic_casting<func_t, 0> {
+  static bool check(const TensorIteratorSym& iter) {
+    using traits = function_traits<func_t>;
+    using cpp_type = typename traits::result_type;
+    return iter.dtype(0) != c10::CppTypeToScalarType<cpp_type>::value;
+  }
+};
+
+// CUDALoops.cuh's gpu_kernel_impl dynamic-cast branch (the CUDA one: the
+// unrolled kernel with LoadWithCast / StoreWithCast when contiguous, the
+// legacy kernel with fetch_and_cast / cast_and_store otherwise). The cast
+// policies and the dtypes array are constants of the variant.
+template <typename func_t>
+void gpu_kernel_impl_cast(TensorIteratorSym& iter, const func_t& f) {
+  using traits = function_traits<func_t>;
+  constexpr int ntensors = traits::arity + 1;
+
+  TORCH_INTERNAL_ASSERT(iter.can_use_32bit_indexing());
+  TORCH_INTERNAL_ASSERT(iter.ninputs() == traits::arity);
+  TORCH_INTERNAL_ASSERT(iter.noutputs() == 1);
+
+  TracedArray<char*, ntensors> data;
+  std::array<ScalarType, ntensors> dtypes;
+  for (int i = 0; i < ntensors; i++) {
+    data[i] = iter.data_ptr(i);
+    dtypes[i] = iter.dtype(i);
+  }
+  c10::SymInt numel = iter.numel();
+  auto stream = at::cuda::getCurrentCUDAStream();
+
+  if (iter.is_contiguous()) {
+    // the real policies are built from a TensorIteratorBase; the sibling fills
+    // a layout twin and bit-casts (both are trivially copyable, same size)
+    using loader_t = at::native::memory::LoadWithCast<traits::arity>;
+    using storer_t = at::native::memory::StoreWithCast<1>;
+    struct LoaderTwin { typename loader_t::array_t dtypes; typename loader_t::size_array_t element_sizes; } lt{};
+    struct StorerTwin { typename storer_t::array_t dtypes; typename storer_t::size_array_t element_sizes; } st{};
+    static_assert(sizeof(LoaderTwin) == sizeof(loader_t) && sizeof(StorerTwin) == sizeof(storer_t), "cast policy layout");
+    for (int i = 0; i < traits::arity; ++i) {
+      lt.dtypes[i] = iter.dtype(i + 1);
+      lt.element_sizes[i] = static_cast<uint32_t>(c10::elementSize(iter.dtype(i + 1)));
+    }
+    st.dtypes[0] = iter.dtype(0);
+    st.element_sizes[0] = static_cast<uint32_t>(c10::elementSize(iter.dtype(0)));
+    loader_t loader = c10::bit_cast<loader_t>(lt);
+    storer_t storer = c10::bit_cast<storer_t>(st);
+    auto input_calc = TrivialOffsetCalculator<traits::arity>();
+    auto output_calc = TrivialOffsetCalculator<1>();
+    Grid grid((numel + elementwise_block_work_size() - 1) / elementwise_block_work_size());
+    launch(unrolled_elementwise_kernel<pod_t<func_t>, std::array<char*, ntensors>, elementwise_thread_work_size(), decltype(input_calc), decltype(output_calc), loader_t, storer_t>,
+        grid, num_threads(), 0, stream, numel, f, data, input_calc, output_calc, loader, storer);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return;
+  }
+  auto offset_calc = make_offset_calculator<ntensors>(iter);
+  Traced<StridedCastOp<pod_t<func_t>, ntensors>> op;
+  op.data = data;
+  op.offset_calc = offset_calc;
+  op.dtypes = dtypes;
+  op.f = f;
+  launch_legacy_kernel<128, 4>(numel, op);
+}
+
+// Loops.cuh's gpu_kernel for one-output ops: the no-cast path when every
+// operand has the functor's static type at its position, the dynamic-cast
+// path otherwise (a copy_ between dtypes).
 template <typename func_t>
 void gpu_kernel(TensorIteratorSym& iter, const func_t& f) {
   for (int arg = 0; arg < iter.ntensors(); arg++) {
@@ -387,6 +473,9 @@ void gpu_kernel(TensorIteratorSym& iter, const func_t& f) {
   }
   if (!iter.can_use_32bit_indexing()) {
     iter.with_32bit_indexing(); // declines
+  }
+  if (needs_dynamic_casting<func_t>::check(iter)) {
+    return gpu_kernel_impl_cast(iter, f);
   }
   gpu_kernel_impl_nocast(iter, f);
 }

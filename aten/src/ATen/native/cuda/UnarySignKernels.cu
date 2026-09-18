@@ -1,4 +1,4 @@
-#define TORCH_ASSERT_NO_OPERATORS
+#define TORCH_ASSERT_ONLY_METHOD_OPERATORS
 #include <ATen/native/UnaryOps.h>
 #include <ATen/native/cuda/Loops.cuh>
 #include <ATen/native/cuda/JitLoops.cuh>
@@ -23,6 +23,15 @@ void logical_not_kernel_cuda(TensorIteratorBase& iter) {
     gpu_kernel(iter, []GPU_LAMBDA(scalar_t a) -> bool { return !a; });
   });
 }
+
+namespace {
+template <typename scalar_t>
+struct NegFunctor {
+  __device__ scalar_t operator()(scalar_t a) const {
+    return -a;
+  }
+};
+} // namespace
 
 // NB: Ignores the negative bit on tensors
 constexpr char neg_name[] = "neg_kernel";
@@ -52,9 +61,7 @@ void neg_kernel_cuda(TensorIteratorBase& iter) {
 #endif
   } else {
   AT_DISPATCH_ALL_TYPES_AND2(ScalarType::Half, ScalarType::BFloat16, dtype, "neg_cuda", [&]() {
-    gpu_kernel(iter, []GPU_LAMBDA(scalar_t a) -> scalar_t {
-      return -a;
-    });
+    gpu_kernel(iter, NegFunctor<scalar_t>());
   });
   }
 }
@@ -135,3 +142,26 @@ REGISTER_DISPATCH(signbit_stub, &signbit_kernel_cuda)
 REGISTER_DISPATCH(sgn_stub, &sgn_kernel_cuda)
 
 } // namespace at::native
+
+// ---- host tracing (ATen/cuda/host_trace): the traced sibling of neg_kernel_cuda, compiled here
+// so the sibling and the real host above instantiate the one kernel over NegFunctor
+// (DECISIONS E36): the tape's launch is eager's function object, not a twin. Outside a trace the
+// entry runs the same launches in ordinary mode, which is how the parity test compares it with
+// the real op.
+#include <ATen/cuda/host_trace/ti/LoopsSym.cuh>
+#include <ATen/cuda/host_trace/ti/Ops.h>
+
+namespace at::cuda::host_trace::ti {
+
+Tensor neg_traced(const Tensor& self) {
+  TensorIteratorSym iter = TensorIteratorSym::unary_op(Tensor(), self);
+  if (at::isComplexType(iter.common_dtype()) || iter.common_dtype() == kBool) {
+    decline(c10::str("host_trace: neg on ", iter.common_dtype(), " is not traced (declined)"));
+  }
+  AT_DISPATCH_ALL_TYPES_AND2(kHalf, kBFloat16, iter.common_dtype(), "neg_traced", [&] {
+    gpu_kernel(iter, at::native::NegFunctor<scalar_t>());
+  });
+  return iter.output();
+}
+
+} // namespace at::cuda::host_trace::ti

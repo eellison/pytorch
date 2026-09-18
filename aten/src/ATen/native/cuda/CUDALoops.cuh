@@ -698,6 +698,38 @@ C10_HOST_DEVICE typename traits::result_type invoke(
   return invoke_impl<traits>(f, data, strides, dtypes, i, Indices{});
 }
 
+// The functors of the non-contiguous (legacy) launches: what the lambdas
+// they replaced captured, as named types, so that a host in another
+// translation unit (the traced sibling iterator, ATen/cuda/host_trace) can
+// instantiate the same elementwise_kernel.
+template <typename func_t, int ntensors>
+struct StridedOp {
+  std::array<char*, ntensors> data;
+  ::OffsetCalculator<ntensors> offset_calc;
+  func_t f;
+  __device__ void operator()(int idx) const {
+    using arg0_t = typename function_traits<func_t>::result_type;
+    auto offsets = offset_calc.get(idx);
+    arg0_t* out = (arg0_t*)(data[0] + offsets[0]);
+    *out = invoke(f, &data[1], &offsets[1], 1);
+  }
+};
+
+template <typename func_t, int ntensors>
+struct StridedCastOp {
+  std::array<char*, ntensors> data;
+  ::OffsetCalculator<ntensors> offset_calc;
+  std::array<ScalarType, ntensors> dtypes;
+  func_t f;
+  __device__ void operator()(int idx) const {
+    using arg0_t = typename function_traits<func_t>::result_type;
+    auto offsets = offset_calc.get(idx);
+    void* out = data[0] + offsets[0];
+    arg0_t result = invoke(f, &data[1], &offsets[1], &dtypes[1], 1);
+    c10::cast_and_store<arg0_t>(dtypes[0], out, result);
+  }
+};
+
 template <typename func_t>
 void gpu_kernel_impl_nocast(TensorIteratorBase& iter, const func_t& f) {
   using traits = function_traits<func_t>;
@@ -723,11 +755,7 @@ void gpu_kernel_impl_nocast(TensorIteratorBase& iter, const func_t& f) {
   auto offset_calc = ::make_offset_calculator<traits::arity + 1>(iter);
 #ifndef USE_ROCM
   constexpr int unroll_factor = sizeof(arg0_t) >= 4 ? 2 : 4;
-  launch_legacy_kernel<128, unroll_factor>(numel, [=] GPU_LAMBDA(int idx) {
-    auto offsets = offset_calc.get(idx);
-    arg0_t* out = (arg0_t*)(data[0] + offsets[0]);
-    *out = invoke(f, &data[1], &offsets[1], 1);
-  });
+  launch_legacy_kernel<128, unroll_factor>(numel, StridedOp<func_t, ntensors>{data, offset_calc, f});
 #else
   constexpr int unroll_factor = sizeof(arg0_t) >= 4 ? 4 : 8;
   constexpr int grp_sz = 128;
@@ -1020,7 +1048,7 @@ void gpu_kernel_impl(TensorIteratorBase& iter, const func_t& f) {
     return gpu_kernel_impl_nocast(iter, f);
   }
   using traits = function_traits<func_t>;
-  using arg0_t = typename traits::result_type;
+  using arg0_t [[maybe_unused]] = typename traits::result_type;
   constexpr int ntensors = traits::arity + 1;
 
   TORCH_INTERNAL_ASSERT(iter.can_use_32bit_indexing());
@@ -1182,12 +1210,7 @@ void gpu_kernel_impl(TensorIteratorBase& iter, const func_t& f) {
       }
     });
 #else
-    launch_legacy_kernel<128, 4>(numel, [=] GPU_LAMBDA(int idx) {
-      auto offsets = offset_calc.get(idx);
-      void* out = data[0] + offsets[0];
-      arg0_t result = invoke(f, &data[1], &offsets[1], &dtypes[1], 1);
-      c10::cast_and_store<arg0_t>(dtypes[0], out, result);
-    });
+    launch_legacy_kernel<128, 4>(numel, StridedCastOp<func_t, ntensors>{data, offset_calc, dtypes, f});
 #endif
   }
 }

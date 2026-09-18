@@ -7,12 +7,23 @@
 #include <c10/macros/Macros.h>
 
 #include <ATen/cuda/DeviceUtils.cuh>
+#include <ATen/cuda/host_trace/Launch.h>
+#include <c10/core/SymInt.h>
 
 namespace {
 
 int log2_ceil(int value) {
     int log2_value = 0;
     while ((1 << log2_value) < value) ++log2_value;
+    return log2_value;
+}
+
+// the same on a symbolic count: each step a recorded guard, so the kernel the
+// switch below selects is a guard of the trace (a different bucket at replay
+// is a miss)
+inline int log2_ceil(const c10::SymInt& value) {
+    int log2_value = 0;
+    while (c10::SymInt(int64_t(1) << log2_value) < value) ++log2_value;
     return log2_value;
 }
 
@@ -299,8 +310,12 @@ __global__ void softmax_warp_backward(output_t *gradInput, const input_t *grad, 
 
 } // end of anonymous namespace
 
+// The forward dispatch on symbolic counts and addresses (host tracing,
+// ATen/cuda/host_trace): the sizes are c10::SymInt, dst / src are byte
+// addresses (sym_*_data_ptr), the launch goes through the typed helper. In
+// ordinary mode the values are concrete and the helper is cudaLaunchKernel.
 template<typename input_t, typename output_t, typename acc_t, bool is_log_softmax, bool is_masked>
-void dispatch_softmax_forward(output_t *dst, const input_t *src, int softmax_elements, int softmax_elements_stride, int batch_count, const bool *mask = nullptr, int chunk_size = -1, bool is_transformer_mask = false)
+void dispatch_softmax_forward_sym(const c10::SymInt& dst, const c10::SymInt& src, const c10::SymInt& softmax_elements, const c10::SymInt& softmax_elements_stride, const c10::SymInt& batch_count, const bool *mask = nullptr, int chunk_size = -1, bool is_transformer_mask = false)
 {
     TORCH_INTERNAL_ASSERT( softmax_elements >= 0 && softmax_elements <= 2048 );
     if (softmax_elements == 0) {
@@ -321,7 +336,7 @@ void dispatch_softmax_forward(output_t *dst, const input_t *src, int softmax_ele
 
         int warps_per_block = (threads_per_block / warp_size);
         int batches_per_block = warps_per_block * batches_per_warp;
-        int blocks = (batch_count + batches_per_block - 1) / batches_per_block;
+        at::cuda::host_trace::Grid blocks((batch_count + batches_per_block - 1) / batches_per_block);
         dim3 threads(warp_size, warps_per_block, 1);
         // Launch code would be more elegant if C++ supported FOR CONSTEXPR
         switch (log2_elements) {
@@ -329,21 +344,21 @@ void dispatch_softmax_forward(output_t *dst, const input_t *src, int softmax_ele
             // To support ROCm amdgcnspirv target, we must compile both a 32 and 64 warpSize version of each kernel
             #define LAUNCH_SOFTMAX_WARP_FORWARD(L2E) case L2E:                    \
             if (warp_size == 64) { \
-              softmax_warp_forward<input_t, output_t, acc_t, L2E, is_log_softmax, is_masked, 64>   \
-                  <<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(dst,   \
+              at::cuda::host_trace::launch(softmax_warp_forward<input_t, output_t, acc_t, L2E, is_log_softmax, is_masked, 64>, \
+                  blocks, threads, 0, at::cuda::getCurrentCUDAStream(), dst,   \
                       src, batch_count, softmax_elements_stride, softmax_elements, mask, chunk_size, is_transformer_mask); \
             } \
             else { \
-              softmax_warp_forward<input_t, output_t, acc_t, L2E, is_log_softmax, is_masked, 32>   \
-                  <<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(dst,   \
+              at::cuda::host_trace::launch(softmax_warp_forward<input_t, output_t, acc_t, L2E, is_log_softmax, is_masked, 32>, \
+                  blocks, threads, 0, at::cuda::getCurrentCUDAStream(), dst,   \
                       src, batch_count, softmax_elements_stride, softmax_elements, mask, chunk_size, is_transformer_mask); \
             } \
             C10_CUDA_KERNEL_LAUNCH_CHECK();                                       \
             break;
 #else
             #define LAUNCH_SOFTMAX_WARP_FORWARD(L2E) case L2E:                    \
-            softmax_warp_forward<input_t, output_t, acc_t, L2E, is_log_softmax, is_masked, 32>   \
-                <<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(dst,   \
+            at::cuda::host_trace::launch(softmax_warp_forward<input_t, output_t, acc_t, L2E, is_log_softmax, is_masked, 32>, \
+                blocks, threads, 0, at::cuda::getCurrentCUDAStream(), dst,   \
                     src, batch_count, softmax_elements_stride, softmax_elements, mask, chunk_size, is_transformer_mask); \
             C10_CUDA_KERNEL_LAUNCH_CHECK();                                       \
             break;
@@ -367,8 +382,20 @@ void dispatch_softmax_forward(output_t *dst, const input_t *src, int softmax_ele
     }
 }
 
+// The original signature (masked softmax and the nested-tensor kernels call
+// it with pointers and ints): forwards to the symbolic form.
 template<typename input_t, typename output_t, typename acc_t, bool is_log_softmax, bool is_masked>
-void dispatch_softmax_backward(output_t *grad_input, const input_t *grad, const input_t *output, int softmax_elements, int softmax_elements_stride, int batch_count, const bool *mask = nullptr)
+void dispatch_softmax_forward(output_t *dst, const input_t *src, int softmax_elements, int softmax_elements_stride, int batch_count, const bool *mask = nullptr, int chunk_size = -1, bool is_transformer_mask = false)
+{
+    dispatch_softmax_forward_sym<input_t, output_t, acc_t, is_log_softmax, is_masked>(
+        c10::SymInt(reinterpret_cast<int64_t>(dst)), c10::SymInt(reinterpret_cast<int64_t>(src)),
+        softmax_elements, softmax_elements_stride, batch_count, mask, chunk_size, is_transformer_mask);
+}
+
+// The backward dispatch on symbolic counts and addresses (host tracing): the
+// same shape as dispatch_softmax_forward_sym above.
+template<typename input_t, typename output_t, typename acc_t, bool is_log_softmax, bool is_masked>
+void dispatch_softmax_backward_sym(const c10::SymInt& grad_input, const c10::SymInt& grad, const c10::SymInt& output, const c10::SymInt& softmax_elements, const c10::SymInt& softmax_elements_stride, const c10::SymInt& batch_count, const bool *mask = nullptr)
 {
     TORCH_INTERNAL_ASSERT( softmax_elements >= 0 && softmax_elements <= 1024 );
     if (softmax_elements == 0) {
@@ -389,7 +416,7 @@ void dispatch_softmax_backward(output_t *grad_input, const input_t *grad, const 
 
         int warps_per_block = (threads_per_block / warp_size);
         int batches_per_block = warps_per_block * batches_per_warp;
-        int blocks = (batch_count + batches_per_block - 1) / batches_per_block;
+        at::cuda::host_trace::Grid blocks((batch_count + batches_per_block - 1) / batches_per_block);
         dim3 threads(warp_size, warps_per_block, 1);
         // Launch code would be more elegant if C++ supported FOR CONSTEXPR
         switch (log2_elements) {
@@ -397,24 +424,24 @@ void dispatch_softmax_backward(output_t *grad_input, const input_t *grad, const 
             // To support ROCm amdgcnspirv target, we must compile both a 32 and 64 warpSize version of each kernel
             #define LAUNCH_SOFTMAX_WARP_BACKWARD(L2E) case L2E:                      \
             if (warp_size == 64) { \
-              softmax_warp_backward<input_t, output_t, acc_t, L2E, is_log_softmax, is_masked, 64> \
-                  <<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>       \
-                  (grad_input, grad, output, batch_count, softmax_elements_stride, \
+              at::cuda::host_trace::launch(softmax_warp_backward<input_t, output_t, acc_t, L2E, is_log_softmax, is_masked, 64>, \
+                  blocks, threads, 0, at::cuda::getCurrentCUDAStream(),       \
+                  grad_input, grad, output, batch_count, softmax_elements_stride, \
                   softmax_elements, mask);                                              \
             } \
             else { \
-              softmax_warp_backward<input_t, output_t, acc_t, L2E, is_log_softmax, is_masked, 32> \
-                  <<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>       \
-                  (grad_input, grad, output, batch_count, softmax_elements_stride, \
+              at::cuda::host_trace::launch(softmax_warp_backward<input_t, output_t, acc_t, L2E, is_log_softmax, is_masked, 32>, \
+                  blocks, threads, 0, at::cuda::getCurrentCUDAStream(),       \
+                  grad_input, grad, output, batch_count, softmax_elements_stride, \
                   softmax_elements, mask);                                              \
             } \
             C10_CUDA_KERNEL_LAUNCH_CHECK();                                      \
             break;
 #else
             #define LAUNCH_SOFTMAX_WARP_BACKWARD(L2E) case L2E:                      \
-            softmax_warp_backward<input_t, output_t, acc_t, L2E, is_log_softmax, is_masked, 32> \
-                <<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>       \
-                (grad_input, grad, output, batch_count, softmax_elements_stride, \
+            at::cuda::host_trace::launch(softmax_warp_backward<input_t, output_t, acc_t, L2E, is_log_softmax, is_masked, 32>, \
+                blocks, threads, 0, at::cuda::getCurrentCUDAStream(),       \
+                grad_input, grad, output, batch_count, softmax_elements_stride, \
                 softmax_elements, mask);                                              \
             C10_CUDA_KERNEL_LAUNCH_CHECK();                                      \
             break;
@@ -435,4 +462,14 @@ void dispatch_softmax_backward(output_t *grad_input, const input_t *grad, const 
                 break;
         }
     }
+}
+
+// The original signature (masked softmax calls it with pointers and ints):
+// forwards to the symbolic form.
+template<typename input_t, typename output_t, typename acc_t, bool is_log_softmax, bool is_masked>
+void dispatch_softmax_backward(output_t *grad_input, const input_t *grad, const input_t *output, int softmax_elements, int softmax_elements_stride, int batch_count, const bool *mask = nullptr)
+{
+    dispatch_softmax_backward_sym<input_t, output_t, acc_t, is_log_softmax, is_masked>(
+        c10::SymInt(reinterpret_cast<int64_t>(grad_input)), c10::SymInt(reinterpret_cast<int64_t>(grad)),
+        c10::SymInt(reinterpret_cast<int64_t>(output)), softmax_elements, softmax_elements_stride, batch_count, mask);
 }

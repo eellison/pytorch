@@ -97,15 +97,11 @@ def _tape_work(tape):
     return [(kind, name) for kind, _, name in sorted(items, key=lambda i: i[1])]
 
 
-# the rows of the fidelity test whose launch is still a twin of eager's by construction
-# (SAME_KERNEL.md section 3c) until E36's later stages land; literal equality is asserted to
-# FAIL for these, so a row leaves this table the moment its host launches eager's function
-_TWINS_PENDING = {
-    "copy_ (strided)": "the strided wrapper: CUDALoops.cuh's StridedOp (copy L2 patch B, commit 7, A354)",
-    "zero_ (strided view)": "as copy_ (strided)",
-    "gt.Tensor": "the 1-D operand broadcasts: as copy_ (strided)",
-    "add.Tensor": "the 1-D operand broadcasts: as copy_ (strided)",
-}
+# the rows of the fidelity test whose launch is a twin of eager's by construction (none since
+# E36 stage 3: every converted host launches eager's own kernel); a row that must be one
+# again is listed here with its reason, literal equality is asserted to FAIL for it, and it
+# leaves the table the moment its host launches eager's function
+_TWINS_PENDING: dict[str, str] = {}
 
 
 def _assert_or_pending(case, pending, check):
@@ -975,11 +971,10 @@ class TestCudaHostTraceTI(HostTraceTestCase):
     def test_pow_tensor_scalar_follows_the_kernel_host(self):
         # PowKernel.cu routes 0.5 / -0.5 / -1 to sqrt / rsqrt / reciprocal,
         # 2, 3, -2 to closed forms and the rest to pow_ with the exponent
-        # captured: bitwise the real op with the same kernel family (the -0.5
-        # route declines until the rsqrt sibling exists)
+        # captured: bitwise the real op with the same kernel family
         for dtype in (torch.bfloat16, torch.float32, torch.float16):
             x = torch.rand(48, 3000, device="cuda").to(dtype) + 0.5
-            for exp in (0.5, -1.0, 2.0, 3.0, -2.0, 2.5, 3, 2, -3):
+            for exp in (0.5, -0.5, -1.0, 2.0, 3.0, -2.0, 2.5, 3, 2, -3):
                 with self.subTest(exp=exp, dtype=dtype):
                     fn = lambda t: torch.pow(t, exp)  # noqa: E731
                     want = fn(x)
@@ -1629,12 +1624,19 @@ class TestCudaHostTraceTI(HostTraceTestCase):
         x = self._values(64, 4096, torch.float32)
         m = x > 0
         w = torch.ones(4096, device="cuda") * 1.5
+        ln_stats = torch.ops.aten.native_layer_norm.default(x, [4096], w, w, 1e-5)[1:]
+        logp = torch.log_softmax(x, -1)
+        tg = torch.randint(0, 4096, (64,), device="cuda")
+        seed = torch.ones((), device="cuda")
+        total_weight = torch.ops.aten.nll_loss_forward.default(x, tg, None, 1, -100)[1]
         ops = {
             "add.Scalar": (lambda t: t + 1.5, (x,)),
             "add.Tensor": (lambda t, u: t + u, (x, w)),
             "silu": (F.silu, (x,)),
+            "sin": (torch.sin, (x,)),
             "pow": (lambda t: t.pow(2), (x,)),
             "copy_ (strided)": (lambda t: t.t().contiguous(), (x,)),
+            "_to_copy (cast)": (lambda t: t.to(torch.bfloat16), (x,)),
             "full": (lambda t: torch.full((t.shape[0], 8), 2.0, device=t.device), (x,)),
             "zeros_like (memset)": (torch.zeros_like, (x,)),
             "zero_ (strided view)": (
@@ -1653,6 +1655,36 @@ class TestCudaHostTraceTI(HostTraceTestCase):
             "clamp": (lambda t: t.clamp(-0.5, 0.5), (x,)),
             "sum": (lambda t: t.sum(1), (x,)),
             "amax": (lambda t: t.amax(1), (x,)),
+            "softmax (converted host)": (lambda t: t.softmax(-1), (x,)),
+            # the training hosts: layer norm backward (commit 1), the
+            # log_softmax backward and the nll_loss pair (commit 7); the nll
+            # backward zeroes its gradient with a memset before its kernel
+            "native_layer_norm_backward (converted host)": (
+                lambda t, g: torch.ops.aten.native_layer_norm_backward.default(
+                    t, t, [4096], *ln_stats, g, g, [True, True, True]
+                ),
+                (x, w),
+            ),
+            "_log_softmax_backward_data (converted host)": (
+                lambda t: torch.ops.aten._log_softmax_backward_data.default(
+                    t, logp, -1, t.dtype
+                ),
+                (x,),
+            ),
+            "nll_loss_forward mean (converted host)": (
+                lambda t: torch.ops.aten.nll_loss_forward.default(t, tg, None, 1, -100),
+                (x,),
+            ),
+            "nll_loss_forward none (converted host)": (
+                lambda t: torch.ops.aten.nll_loss_forward.default(t, tg, None, 0, -100),
+                (x,),
+            ),
+            "nll_loss_backward mean (converted host)": (
+                lambda t: torch.ops.aten.nll_loss_backward.default(
+                    seed, t, tg, None, 1, -100, total_weight
+                ),
+                (x,),
+            ),
         }
         for name, (fn, args) in ops.items():
             with self.subTest(op=name):
@@ -2255,6 +2287,8 @@ class TestCudaHostTraceTI(HostTraceTestCase):
         # a dtype outside the sibling's set declines by name
         with self.assertRaisesRegex(ht.Declined, "sigmoid on Long"):
             ht.trace(torch.sigmoid, (xi,))
+        with self.assertRaisesRegex(ht.Declined, "exp on Long"):
+            ht.trace(torch.exp, (xi,))
         # a CPU scalar operand of an op eager launches through the plain
         # gpu_kernel (which asserts on one) declines by name
         with self.assertRaisesRegex(ht.Declined, "addcmul with a CPU scalar operand"):
