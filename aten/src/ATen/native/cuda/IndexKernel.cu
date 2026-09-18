@@ -1,4 +1,4 @@
-#define TORCH_ASSERT_NO_OPERATORS
+#define TORCH_ASSERT_ONLY_METHOD_OPERATORS
 #include <ATen/native/cuda/IndexKernel.h>
 #include <ATen/native/IndexKernel.h>
 
@@ -53,6 +53,67 @@ static void launch_kernel(const int64_t N, const func_t& f) {
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+// The lambdas of gpu_index_kernel and index_copy_kernel_impl and the store of
+// index_put_kernel_impl as named functors (the members in the closure's order):
+// the traced siblings at the end of this file launch them too, so the tape
+// holds eager's own kernel (DECISIONS E36)
+template <typename func_t>
+struct IndexFunctor {
+  OffsetCalculator<3> offset_calc;
+  char* out_ptr;
+  char* in_ptr;
+  size_t num_indices;
+  std::array<char*, MAX_DIMS> index_ptrs;
+  std::array<int64_t, MAX_DIMS> sizes;
+  std::array<int64_t, MAX_DIMS> strides;
+  func_t f;
+  C10_DEVICE void operator()(int idx) const {
+    const auto offsets = offset_calc.get(idx);
+    char* const out_data = out_ptr + offsets[0];
+    const char* const in_data = in_ptr + offsets[1];
+
+    int64_t offset = 0;
+    #pragma unroll
+    for (int i = 0; i < num_indices; i++) {
+      int64_t index = *reinterpret_cast<int64_t*>(index_ptrs[i] + offsets[2]);
+      CUDA_KERNEL_ASSERT(-sizes[i] <= index && index < sizes[i] && "index out of bounds");
+      if (index < 0) {
+        index += sizes[i];
+      }
+      offset += index * strides[i];
+    }
+
+    f(out_data, in_data, offset);
+  }
+};
+
+template <typename scalar_t>
+struct IndexPutFunctor {
+  C10_DEVICE void operator()(char* const out_data, const char* const in_data, const int64_t offset) const {
+    *reinterpret_cast<scalar_t*>(out_data + offset) = *reinterpret_cast<const scalar_t*>(in_data);
+  }
+};
+
+template <typename scalar_t>
+struct IndexCopyFunctor {
+  OffsetCalculator<3> offset_calc;
+  char* self_ptr;
+  char* idx_ptr;
+  char* source_ptr;
+  int64_t self_dim_size;
+  int64_t self_dim_stride;
+  C10_DEVICE void operator()(int i) const {
+    const auto offsets = offset_calc.get(i);
+
+    auto* const __restrict__ self_data = reinterpret_cast<scalar_t*>(self_ptr + offsets[0]);
+    auto idx = *reinterpret_cast<int64_t*>(idx_ptr + offsets[1]);
+    const auto* const __restrict__ source_data = reinterpret_cast<scalar_t*>(source_ptr + offsets[2]);
+    CUDA_KERNEL_ASSERT(idx >= 0 && idx < self_dim_size && "index_copy_(): index out of bounds");
+
+    self_data[idx * self_dim_stride] = *source_data;
+  }
+};
+
 template <typename func_t>
 void gpu_index_kernel(TensorIteratorBase& iter, const IntArrayRef index_size, const IntArrayRef index_stride, const func_t& f, const bool is_gather_like) {
   const auto num_indices = index_size.size();
@@ -99,24 +160,8 @@ void gpu_index_kernel(TensorIteratorBase& iter, const IntArrayRef index_size, co
 
 
   auto offset_calc = make_offset_calculator<3>(iter);
-  launch_kernel<launch_size_nd, launch_bound2>(iter.numel(), [=]__device__(int idx) {
-    const auto offsets = offset_calc.get(idx);
-    char* const out_data = out_ptr + offsets[0];
-    const char* const in_data = in_ptr + offsets[1];
-
-    int64_t offset = 0;
-    #pragma unroll
-    for (int i = 0; i < num_indices; i++) {
-      int64_t index = *reinterpret_cast<int64_t*>(index_ptrs[i] + offsets[2]);
-      CUDA_KERNEL_ASSERT(-sizes[i] <= index && index < sizes[i] && "index out of bounds");
-      if (index < 0) {
-        index += sizes[i];
-      }
-      offset += index * strides[i];
-    }
-
-    f(out_data, in_data, offset);
-  });
+  launch_kernel<launch_size_nd, launch_bound2>(
+      iter.numel(), IndexFunctor<func_t>{offset_calc, out_ptr, in_ptr, num_indices, index_ptrs, sizes, strides, f});
 }
 
 // The kernels are templated on an opaque, self-aligned type of the correct
@@ -183,18 +228,8 @@ void index_copy_kernel_impl(
   char* const __restrict__ source_ptr = reinterpret_cast<char*>(iter.data_ptr(2));
 
   const auto offset_calc = make_offset_calculator<3>(iter);
-
-  const auto loop = [=]C10_DEVICE(int i) {
-    const auto offsets = offset_calc.get(i);
-
-    auto* const __restrict__ self_data = reinterpret_cast<scalar_t*>(self_ptr + offsets[0]);
-    auto idx = *reinterpret_cast<int64_t*>(idx_ptr + offsets[1]);
-    const auto* const __restrict__ source_data = reinterpret_cast<scalar_t*>(source_ptr + offsets[2]);
-    CUDA_KERNEL_ASSERT(idx >= 0 && idx < self_dim_size && "index_copy_(): index out of bounds");
-
-    self_data[idx * self_dim_stride] = *source_data;
-  };
-  launch_kernel<launch_size_nd, launch_bound2>(iter.numel(), loop);
+  launch_kernel<launch_size_nd, launch_bound2>(
+      iter.numel(), IndexCopyFunctor<scalar_t>{offset_calc, self_ptr, idx_ptr, source_ptr, self_dim_size, self_dim_stride});
 }
 
 template <typename scalar_t>
@@ -206,9 +241,7 @@ void index_kernel_impl(TensorIteratorBase& iter, const IntArrayRef index_size, c
 
 template <typename scalar_t>
 void index_put_kernel_impl(TensorIterator& iter, const IntArrayRef index_size, const IntArrayRef index_stride) {
-  gpu_index_kernel(iter, index_size, index_stride, []C10_DEVICE(char* const out_data, const char* const in_data, const int64_t offset) {
-    *reinterpret_cast<scalar_t*>(out_data + offset) = *reinterpret_cast<const scalar_t*>(in_data);
-  }, false);
+  gpu_index_kernel(iter, index_size, index_stride, IndexPutFunctor<scalar_t>{}, false);
 }
 
 static void index_kernel(
@@ -521,3 +554,213 @@ REGISTER_DISPATCH(flip_stub, &flip_kernel)
 REGISTER_CUDA_DISPATCH(index_put_kernel_quantized_stub, &index_put_kernel_quantized_cuda)
 
 } // namespace at::native
+
+// ---- host tracing (ATen/cuda/host_trace): the traced sibling of index_copy_kernel_impl and
+// index_put_kernel_impl, compiled here so the sibling and the real host above instantiate the
+// one kernel (index_elementwise_kernel over IndexCopyFunctor and IndexFunctor<IndexPutFunctor>;
+// DECISIONS E36): the tape's launch is eager's function object, not a twin. The dtype is
+// dispatched on the element size as the real kernels do (OpaqueType). The iterator is the one
+// the real hosts build: outputs and inputs restrided by the entry (torch/cuda/_host_trace_ti.py,
+// the view arithmetic of index_copy_out and make_info written out over the traced tensors),
+// mixed dtypes (an int64 index beside the data); the overlap checks are the hosts' own, on the
+// operands as passed (TensorIteratorSym.h), index_put_'s from its Python entry on the original
+// self, value and indices. Outside a trace the entry runs the same launches in ordinary mode,
+// which is how the parity test compares it with the real op.
+#include <ATen/cuda/host_trace/ti/EagerOps.h>
+#include <ATen/cuda/host_trace/ti/LoopsSym.cuh>
+#include <ATen/cuda/host_trace/ti/TensorIteratorSym.h>
+
+#include <ATen/Context.h>
+
+#include <limits>
+#include <vector>
+
+namespace at::cuda::host_trace {
+
+template <class scalar_t>
+struct Traced<at::native::IndexCopyFunctor<scalar_t>> : TracedBase {
+  using P = at::native::IndexCopyFunctor<scalar_t>;
+  alignas(P) unsigned char pod_bytes[sizeof(P)] = {};
+  ti::OffsetCalculatorView<3> offset_calc;
+  ti::PtrSlot self_ptr;
+  ti::PtrSlot idx_ptr;
+  ti::PtrSlot source_ptr;
+  ti::IntSlot<int64_t> self_dim_size;
+  ti::IntSlot<int64_t> self_dim_stride;
+  Traced()
+      : TracedBase(pod_bytes, sizeof(P)),
+        offset_calc(this, offsetof(P, offset_calc), ti::SlotName{nullptr, "offset_calc"}),
+        self_ptr(this, offsetof(P, self_ptr), ti::SlotName{nullptr, "self_ptr"}),
+        idx_ptr(this, offsetof(P, idx_ptr), ti::SlotName{nullptr, "idx_ptr"}),
+        source_ptr(this, offsetof(P, source_ptr), ti::SlotName{nullptr, "source_ptr"}),
+        self_dim_size(this, offsetof(P, self_dim_size), ti::SlotName{nullptr, "self_dim_size"}),
+        self_dim_stride(this, offsetof(P, self_dim_stride), ti::SlotName{nullptr, "self_dim_stride"}) {}
+};
+
+// the store functor (IndexPutFunctor) is empty: its byte stays the zero the
+// proxy was built with
+template <class scalar_t>
+struct Traced<at::native::IndexFunctor<at::native::IndexPutFunctor<scalar_t>>> : TracedBase {
+  using P = at::native::IndexFunctor<at::native::IndexPutFunctor<scalar_t>>;
+  alignas(P) unsigned char pod_bytes[sizeof(P)] = {};
+  ti::OffsetCalculatorView<3> offset_calc;
+  ti::PtrSlot out_ptr;
+  ti::PtrSlot in_ptr;
+  ti::IntSlot<size_t> num_indices;
+  ti::ArrayOf<ti::PtrSlot, sizeof(char*), MAX_DIMS> index_ptrs;
+  ti::ArrayOf<ti::IntSlot<int64_t>, sizeof(int64_t), MAX_DIMS> sizes;
+  ti::ArrayOf<ti::IntSlot<int64_t>, sizeof(int64_t), MAX_DIMS> strides;
+  Traced()
+      : TracedBase(pod_bytes, sizeof(P)),
+        offset_calc(this, offsetof(P, offset_calc), ti::SlotName{nullptr, "offset_calc"}),
+        out_ptr(this, offsetof(P, out_ptr), ti::SlotName{nullptr, "out_ptr"}),
+        in_ptr(this, offsetof(P, in_ptr), ti::SlotName{nullptr, "in_ptr"}),
+        num_indices(this, offsetof(P, num_indices), ti::SlotName{nullptr, "num_indices"}),
+        index_ptrs(this, offsetof(P, index_ptrs), ti::SlotName{nullptr, "index_ptrs"}),
+        sizes(this, offsetof(P, sizes), ti::SlotName{nullptr, "sizes"}),
+        strides(this, offsetof(P, strides), ti::SlotName{nullptr, "strides"}) {}
+};
+
+} // namespace at::cuda::host_trace
+
+namespace at::cuda::host_trace::ti {
+
+namespace {
+
+TensorIteratorSym index_iterator(const Tensor& out, const std::vector<Tensor>& inputs) {
+  // the configs of index_copy_out and make_index_put_iterator: the output is
+  // restrided with zero strides, so no overlap check; the index operands
+  // have their own dtype; no output resize
+  TensorIteratorSymConfig config;
+  config.check_mem_overlap_ = false;
+  config.check_all_same_dtype_ = false;
+  config.resize_outputs_ = false;
+  TensorIteratorSym iter;
+  iter.add_output(out);
+  for (const Tensor& t : inputs) {
+    iter.add_input(t);
+  }
+  iter.build(config);
+  return iter;
+}
+
+// IndexKernel.cu's launch_kernel with the element count as a c10::SymInt and
+// the launch through the typed helper; the kernel is the one above
+template <int nt, int vt, typename func_t>
+void launch_index_kernel(const c10::SymInt& N, const func_t& f) {
+  TORCH_INTERNAL_ASSERT(N >= 0 && N <= std::numeric_limits<int32_t>::max());
+  if (N == 0) {
+    return;
+  }
+  const dim3 block(nt);
+  Grid grid((N + block.x * vt - 1) / (block.x * vt));
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  launch(at::native::index_elementwise_kernel<nt, vt, pod_t<func_t>>, grid, block, 0, stream, N, f);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+template <typename scalar_t>
+void index_copy_impl(TensorIteratorSym& iter, const c10::SymInt& self_dim_size, const c10::SymInt& self_dim_stride) {
+  if (iter.numel() == 0) {
+    return;
+  }
+  if (!iter.can_use_32bit_indexing()) {
+    iter.with_32bit_indexing(); // declines
+  }
+  Traced<at::native::IndexCopyFunctor<scalar_t>> op;
+  op.offset_calc = make_offset_calculator<3>(iter);
+  op.self_ptr = iter.data_ptr(0);
+  op.idx_ptr = iter.data_ptr(1);
+  op.source_ptr = iter.data_ptr(2);
+  op.self_dim_size = self_dim_size;
+  op.self_dim_stride = self_dim_stride;
+  launch_index_kernel<at::native::launch_size_nd, at::native::launch_bound2>(iter.numel(), op);
+}
+
+template <typename scalar_t>
+void index_put_impl(TensorIteratorSym& iter, const std::vector<c10::SymInt>& index_size, const std::vector<c10::SymInt>& index_stride) {
+  const auto num_indices = index_size.size();
+  TORCH_INTERNAL_ASSERT(num_indices == index_stride.size());
+  TORCH_INTERNAL_ASSERT(static_cast<int64_t>(num_indices) == iter.ntensors() - 2);
+  if (iter.numel() == 0) {
+    return;
+  }
+  if (!iter.can_use_32bit_indexing()) {
+    iter.with_32bit_indexing(); // declines
+  }
+  Traced<at::native::IndexFunctor<at::native::IndexPutFunctor<scalar_t>>> op;
+  op.offset_calc = make_offset_calculator<3>(iter);
+  op.out_ptr = iter.data_ptr(0);
+  op.in_ptr = iter.data_ptr(1);
+  op.num_indices = num_indices;
+  for (size_t i = 0; i < num_indices; i++) {
+    op.index_ptrs[i] = iter.data_ptr(static_cast<int64_t>(i) + 2);
+    op.sizes[i] = index_size[i];
+    op.strides[i] = index_stride[i];
+  }
+  launch_index_kernel<at::native::launch_size_nd, at::native::launch_bound2>(iter.numel(), op);
+}
+
+} // namespace
+
+Tensor& index_copy_traced(Tensor& result, int64_t dim, const Tensor& index, const Tensor& source) {
+  // the meta's overlap checks on a defined result (the in-place form), then
+  // TORCH_IMPL_FUNC(index_copy_out) after its copy of self into result
+  assert_no_internal_overlap_sym(result);
+  assert_no_overlap_sym(result, index);
+  assert_no_overlap_sym(result, source);
+  if (at::globalContext().deterministicAlgorithms()) {
+    decline("host_trace: index_copy_ with deterministic algorithms takes the sort-based index_put_, which is not traced (declined)");
+  }
+  Tensor result_nonzero = result.dim() == 0 ? result.unsqueeze(0) : result;
+  Tensor source_nonzero = source.dim() == 0 ? source.unsqueeze(0) : source;
+  std::vector<c10::SymInt> index_sizes(result_nonzero.dim(), c10::SymInt(1));
+  std::vector<c10::SymInt> index_strides(result_nonzero.dim(), c10::SymInt(0));
+  index_sizes[dim] = index.sym_numel();
+  index_strides[dim] = index.dim() > 0 ? index.sym_stride(0) : c10::SymInt(1);
+  Tensor index_restrided = index.as_strided_symint(index_sizes, index_strides);
+  std::vector<c10::SymInt> result_sizes = result_nonzero.sym_sizes().vec();
+  std::vector<c10::SymInt> result_strides = result_nonzero.sym_strides().vec();
+  result_sizes[dim] = index.sym_numel();
+  result_strides[dim] = c10::SymInt(0);
+  Tensor result_restrided = result_nonzero.as_strided_symint(result_sizes, result_strides);
+  TensorIteratorSym iter = index_iterator(result_restrided, {index_restrided, source_nonzero});
+  const c10::SymInt result_dim_size = result_nonzero.sym_size(dim);
+  const c10::SymInt result_dim_stride = result_nonzero.sym_stride(dim);
+  AT_DISPATCH_ALL_TYPES_AND_COMPLEX_AND5(
+    at::ScalarType::Half, at::ScalarType::Bool, at::ScalarType::BFloat16, kComplexHalf,
+    kBComplex32,
+    iter.dtype(), "index_copy_cuda", [&] {
+    index_copy_impl<at::native::OpaqueType<sizeof(scalar_t)>>(iter, result_dim_size, result_dim_stride);
+  });
+  return result;
+}
+
+Tensor& index_put_traced(
+    Tensor& src,
+    const Tensor& value,
+    const std::vector<Tensor>& indices,
+    const std::vector<c10::SymInt>& indexed_sizes,
+    const std::vector<c10::SymInt>& indexed_strides) {
+  std::vector<Tensor> inputs;
+  inputs.reserve(indices.size() + 1);
+  inputs.push_back(value);
+  inputs.insert(inputs.end(), indices.begin(), indices.end());
+  TensorIteratorSym iter = index_iterator(src, inputs);
+  AT_DISPATCH_V2(
+    iter.dtype(),
+    "index_put",
+    AT_WRAP([&] {
+      index_put_impl<at::native::OpaqueType<sizeof(scalar_t)>>(iter, indexed_sizes, indexed_strides);
+    }),
+    AT_EXPAND(AT_ALL_TYPES_AND_COMPLEX),
+    AT_EXPAND(AT_FLOAT8_TYPES),
+    kComplexHalf,
+    kBComplex32,
+    kHalf,
+    kBool,
+    kBFloat16);
+  return src;
+}
+
+} // namespace at::cuda::host_trace::ti

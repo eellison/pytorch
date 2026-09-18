@@ -49,6 +49,8 @@
 #include <limits>
 
 #include <c10/macros/Macros.h>
+#include <ATen/cuda/host_trace/ti/EagerOps.h>
+#include <ATen/cuda/host_trace/ti/EagerViews.cuh>
 
 namespace {
 constexpr uint64_t getDefaultMaxThreadsPerBlock() {
@@ -2050,6 +2052,181 @@ Tensor index_select_sparse_cuda(const Tensor& self, int64_t dim, const Tensor& i
 
 
 } // at::native
+
+// ---- host tracing (ATen/cuda/host_trace): the traced sibling of index_select_out_cuda_impl.
+// The real host above is untouched. This copy has the same body with the sizes as c10::SymInt,
+// the TensorInfo blocks as proxies over the same POD (EagerViews.cuh) and the launches through
+// the typed helper, so a trace records what indexSelectSmallIndex receives; the large-index route
+// restates the conditions of at::gather_out's vectorized fast path as guards and launches that
+// kernel, and declines by name where the real op would take the generic gather kernel. Outside a
+// trace it runs the same launches on real tensors, which is how the parity test compares it with
+// the real op.
+namespace at::native {
+namespace {
+
+namespace ht = at::cuda::host_trace;
+
+template <typename scalar_t>
+void index_select_gather_sym(
+    Tensor& out,
+    const Tensor& self,
+    int64_t dim,
+    const Tensor& index,
+    const c10::SymInt& numIndices) {
+  // at::gather_out(out, self, dim, index.view(tmpSize).expand(newSize)): its CUDA kernel takes
+  // vectorized_gather_kernel when the (slice, index) iterator is 2-D with contiguous 16-byte
+  // aligned slices (fast_gather_kernel_eligible), the generic scatter/gather kernel otherwise.
+  constexpr int64_t alignment = 16;
+  constexpr int64_t es = sizeof(scalar_t);
+  const c10::SymInt out_ptr = ht::sym_mutable_data_ptr(out);
+  const c10::SymInt self_ptr = ht::sym_const_data_ptr(self);
+  const bool eligible = dim == 0 && self.dim() == 2 && index.dim() == 1 && index.is_contiguous() &&
+      out.is_contiguous() && self.sym_stride(1) == c10::SymInt(1) &&
+      numIndices != c10::SymInt(1) && self.sym_size(1) != c10::SymInt(1) &&
+      (self.sym_size(1) * es) % c10::SymInt(alignment) == c10::SymInt(0) &&
+      (self.sym_stride(0) * es) % c10::SymInt(alignment) == c10::SymInt(0) &&
+      ht::ti::alignment_of(out_ptr) == alignment && ht::ti::alignment_of(self_ptr) == alignment &&
+      out.sym_numel() < c10::SymInt(std::numeric_limits<int32_t>::max());
+  if (!eligible) {
+    ht::decline(
+        "host_trace: index_select with more than 16 indices reaches at::gather_out's generic kernel "
+        "here (a non-contiguous or non-16-byte-aligned slice, dim != 0, or a size-1 slice), which is "
+        "not traced (declined)");
+  }
+  AT_DISPATCH_INDEX_TYPES(index.scalar_type(), "index_select_gather_sym", [&]() {
+    vectorized_gather_kernel_launch_sym<alignment, index_t>(
+        out_ptr,
+        self_ptr,
+        ht::sym_const_data_ptr<index_t>(index),
+        numIndices,
+        self.sym_size(1) * es,
+        self.sym_size(0),
+        self.sym_stride(0) * es,
+        out.sym_stride(0) * es,
+        false);
+  });
+}
+
+template <typename scalar_t>
+void index_select_out_sym(Tensor& out, const Tensor& self, int64_t dim, const Tensor& index) {
+  c10::SymInt numIndices = index.sym_numel();
+  auto selfDims = self.dim() == 0 ? 1 : self.dim();
+
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+  TORCH_CHECK(
+      index.dim() <= 1, "Index is supposed to be an empty tensor or a vector");
+  TORCH_CHECK(
+      !(self.dim() == 0 && numIndices != c10::SymInt(1)), "index_select(): Index to scalar can have only 1 value, got ", numIndices, " value(s)");
+  TORCH_CHECK(dim < selfDims, "Indexing dim is out of bounds");
+
+  // `out` was allocated at newSize by index_select_traced; resize_output is the no-op it is upstream
+  c10::SymInt outTotalSize = out.sym_numel();
+  if (outTotalSize == c10::SymInt(0)) {
+    return;
+  }
+
+  bool indContig = index.is_contiguous();
+
+  c10::SymInt selfSelectDimSize = self.dim() == 0 ? c10::SymInt(1) : self.sym_size(dim);
+  c10::SymInt sliceSize = outTotalSize / numIndices;
+
+  int mpc = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+
+#define SMALL_INDEX_SYM(TYPE, DST_DIM, SRC_DIM, IDX_DIM)                                      \
+  ht::launch(indexSelectSmallIndex<scalar_t, index_t, TYPE, DST_DIM, SRC_DIM, IDX_DIM>,       \
+      smallIndexGrid, smallIndexBlock, 0, stream,                                             \
+      outInfo, selfInfo, indicesInfo, outSelectDim, selfSelectDim, sliceSize, selfSelectDimSize)
+
+  const c10::SymInt defaultMaxBlockThreads(static_cast<int64_t>(getDefaultMaxThreadsPerBlock()));
+  ht::Grid smallIndexGrid(ht::ti::ceil_div_sym(sliceSize, defaultMaxBlockThreads).min(c10::SymInt(static_cast<int64_t>(mpc) * 8)));
+  ht::Block smallIndexBlock(sliceSize.min(defaultMaxBlockThreads));
+
+  if (cuda::detail::canUse32BitIndexMath(out) &&
+      cuda::detail::canUse32BitIndexMath(self) &&
+      cuda::detail::canUse32BitIndexMath(index) &&
+      numIndices <= c10::SymInt(16)
+      ) {
+    ht::Traced<cuda::detail::TensorInfo<scalar_t, unsigned int>> outInfo;
+    outInfo.fill(out);
+    outInfo.legacy_if_scalar();
+    int outSelectDim = outInfo.collapseDims(dim);
+    outInfo.reduceDim(outSelectDim);
+
+    ht::Traced<cuda::detail::TensorInfo<const scalar_t, unsigned int>> selfInfo;
+    selfInfo.fill(self);
+    selfInfo.legacy_if_scalar();
+    int selfSelectDim = selfInfo.collapseDims(dim);
+    selfInfo.reduceDim(selfSelectDim);
+
+    AT_DISPATCH_INDEX_TYPES(index.scalar_type(), "index_select_out_cuda_impl", [&] () {
+      ht::Traced<cuda::detail::TensorInfo<const index_t, unsigned int>> indicesInfo;
+      indicesInfo.fill(index);
+      indicesInfo.legacy_if_scalar();
+      indicesInfo.collapseDims();
+
+      if (outInfo.dims == 1 && selfInfo.dims == 1 && indContig) {
+        SMALL_INDEX_SYM(unsigned int, 1, 1, -2);
+      } else if (outInfo.dims == 2 && selfInfo.dims == 2 && indContig) {
+        SMALL_INDEX_SYM(unsigned int, 2, 2, -2);
+      } else if (outInfo.dims == 3 && selfInfo.dims == 3 && indContig) {
+        SMALL_INDEX_SYM(unsigned int, 3, 3, -2);
+      } else {
+        SMALL_INDEX_SYM(unsigned int, -1, -1, -1);
+      }
+    });
+  } else {
+    index_select_gather_sym<scalar_t>(out, self, dim, index, numIndices);
+  }
+#undef SMALL_INDEX_SYM
+}
+
+} // anonymous namespace
+} // namespace at::native
+
+namespace at::cuda::host_trace::ti {
+
+Tensor index_select_traced(const Tensor& self, int64_t dim, const Tensor& index) {
+  // index_select_out_cuda's checks, then the out= allocation the impl's resize_output would make
+  static constexpr std::string_view DIM_WARNING =
+      "Tensor too large or too many (> 25) dimensions";
+  TORCH_CHECK(
+      at::cuda::check_device({self, index}),
+      "Input, output and indices must be on the current device");
+  if (self.is_quantized()) {
+    decline("host_trace: index_select on a quantized tensor is not traced (declined)");
+  }
+  dim = at::maybe_wrap_dim(dim, self);
+  TORCH_CHECK(self.dim() <= MAX_TENSORINFO_DIMS, DIM_WARNING);
+  TORCH_CHECK(index.dim() <= MAX_TENSORINFO_DIMS, DIM_WARNING);
+  TORCH_CHECK(
+      index.scalar_type() == kLong || index.scalar_type() == kInt,
+      "index_select(): Expected dtype int32 or int64 for index");
+  std::vector<c10::SymInt> newSize = self.sym_sizes().vec();
+  if (self.dim() > 0) {
+    newSize[dim] = index.sym_numel();
+  }
+  // a fresh allocation: the overlap asserts of the real op hold by construction
+  Tensor out = at::empty_symint(newSize, self.options());
+  // the real op's dtype list, so the sibling serves exactly what index_select_out_cuda serves
+  AT_DISPATCH_V2(
+      out.scalar_type(),
+      "index_select_cuda",
+      AT_WRAP([&] {
+        at::native::index_select_out_sym<scalar_t>(out, self, dim, index);
+      }),
+      AT_EXPAND(AT_ALL_TYPES_AND_COMPLEX),
+      AT_EXPAND(AT_BAREBONES_UNSIGNED_TYPES),
+      AT_EXPAND(AT_FLOAT8_TYPES),
+      kComplexHalf,
+      kBComplex32,
+      kHalf,
+      kBool,
+      kBFloat16);
+  return out;
+}
+
+} // namespace at::cuda::host_trace::ti
 
 // ---- host tracing (ATen/cuda/host_trace): the traced sibling of masked_fill_kernel, compiled here
 // so the sibling and the real host above instantiate the one kernel over MaskedFillFunctor

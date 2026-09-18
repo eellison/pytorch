@@ -8,6 +8,8 @@
 #include <c10/util/BFloat16.h>
 #include <ATen/native/cuda/Loops.cuh>
 #include <ATen/ceil_div.h>
+#include <ATen/cuda/host_trace/ti/EagerOps.h>
+#include <ATen/cuda/host_trace/ti/EagerViews.cuh>
 
 #include <cstdint>
 #include <type_traits>
@@ -45,6 +47,53 @@ void vectorized_gather_kernel_launch(char * out, char * inp, index_t * idx, int 
   ind_dim_size, inp_stride_bytes, out_stride_bytes, allow_neg_indices);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
+
+// host tracing (ATen/cuda/host_trace): the same launch with its sizes, strides and addresses as
+// SymInts and the kernel through the typed helper; the function above is untouched
+template <int64_t Alignment, typename index_t>
+void vectorized_gather_kernel_launch_sym(
+    const c10::SymInt& out,
+    const c10::SymInt& inp,
+    const c10::SymInt& idx,
+    const c10::SymInt& num_ind,
+    const c10::SymInt& slice_size_in_bytes,
+    const c10::SymInt& ind_dim_size,
+    const c10::SymInt& inp_stride_bytes,
+    const c10::SymInt& out_stride_bytes,
+    bool allow_neg_indices) {
+  namespace ht = at::cuda::host_trace;
+  constexpr int64_t max_num_threads = 256;
+  const c10::SymInt warp(static_cast<int64_t>(at::cuda::warp_size()));
+  const c10::SymInt num_threads =
+      ht::ti::ceil_div_sym(ht::ti::ceil_div_sym(slice_size_in_bytes, c10::SymInt(Alignment)), warp) * warp;
+  const c10::SymInt grid_y =
+      ht::ti::ceil_div_sym(slice_size_in_bytes, c10::SymInt(max_num_threads * Alignment))
+          .min(c10::SymInt(static_cast<int64_t>(at::cuda::getCurrentDeviceProperties()->maxGridSize[1])));
+  ht::Grid grid(num_ind, grid_y, 1);
+  ht::Block block(c10::SymInt(max_num_threads).min(num_threads));
+  ht::launch(
+      vectorized_gather_kernel<static_cast<int>(Alignment), index_t>,
+      grid,
+      block,
+      0,
+      at::cuda::getCurrentCUDAStream(),
+      out,
+      inp,
+      idx,
+      num_ind,
+      slice_size_in_bytes,
+      ind_dim_size,
+      inp_stride_bytes,
+      out_stride_bytes,
+      allow_neg_indices);
+}
+
+template void vectorized_gather_kernel_launch_sym<16, int64_t>(
+    const c10::SymInt&, const c10::SymInt&, const c10::SymInt&, const c10::SymInt&, const c10::SymInt&,
+    const c10::SymInt&, const c10::SymInt&, const c10::SymInt&, bool);
+template void vectorized_gather_kernel_launch_sym<16, int32_t>(
+    const c10::SymInt&, const c10::SymInt&, const c10::SymInt&, const c10::SymInt&, const c10::SymInt&,
+    const c10::SymInt&, const c10::SymInt&, const c10::SymInt&, bool);
 
 // explicit template instantiation
 template void vectorized_gather_kernel_launch<16, int64_t>(char * out, char * inp, int64_t * idx, int num_ind, int64_t slice_size_in_bytes,

@@ -32,15 +32,30 @@ LMAX = 64
 DTYPE = torch.bfloat16
 
 
-def decode_step(ids, table, ln_w, ln_b, wq, wk, wv, w_out, k_view, v_view):
-    # ids: pinned int64 (B,); table (V, D); the weights (D,); k_view / v_view
-    # (B, H, L, DH) views of the caller's caches, position L - 1 is written
-    x = probe().gather(table, ids)  # embedding rows through H2D ids
-    B = x.shape[0]
+def rotate_half(x, neg_one):
+    # the rotary rotation: cat([-x2, x1], -1) over the two halves of the head
+    # dim (x1 a non-contiguous view; the negation is a mul by a device scalar)
+    h = x.shape[-1] // 2
+    return torch.cat([x[..., h:] * neg_one, x[..., :h]], -1)
+
+
+def decode_step(
+    ids, table, ln_w, ln_b, wq, wk, wv, w_out, cos, sin, neg_one, k_view, v_view
+):
+    # ids: pinned int64 (B,); table (V, D); the weights (D,); cos / sin (DH,);
+    # k_view / v_view (B, H, L, DH) views of the caller's caches, position L - 1
+    # is written
+    B = ids.shape[0]
     L = k_view.shape[2]
+    ids_dev = torch.empty(B, dtype=torch.int64, device="cuda")
+    probe().copy_into(ids_dev, ids)  # the ids cross through the H2D path
+    x = F.embedding(ids_dev, table)  # the traced index_select sibling
     h = F.layer_norm(x, (D,), ln_w, ln_b)  # the converted CUDA host
     q = (h * wq).view(B, H, 1, DH)  # projection stand-ins: opted elementwise
-    k_view[:, :, L - 1 : L].copy_(h.mul(wk).view(B, H, 1, DH))  # cache write
+    q = q * cos + rotate_half(q, neg_one) * sin  # rotary: mul / cat / add
+    k = h.mul(wk).view(B, H, 1, DH)
+    k = k * cos + rotate_half(k, neg_one) * sin
+    k_view[:, :, L - 1 : L].copy_(k)  # cache write
     v_view[:, :, L - 1 : L].copy_(h.mul(wv).view(B, H, 1, DH))
     attn = F.scaled_dot_product_attention(q, k_view, v_view)  # SDPA -> flash
     y = F.silu(attn.reshape(B, D) + x)  # residual add, activation
@@ -100,6 +115,11 @@ class TestCudaHostTraceDecode(HostTraceTestCase):
         self.wq, self.wk, self.wv, self.w_out = (
             torch.randn(D, device="cuda", dtype=DTYPE) for _ in range(4)
         )
+        # rotary tables for one position, laid out as [half, half] over DH
+        ang = torch.arange(DH // 2, device="cuda", dtype=torch.float32) * 0.1
+        self.cos = torch.cat([ang.cos(), ang.cos()]).to(DTYPE)
+        self.sin = torch.cat([ang.sin(), ang.sin()]).to(DTYPE)
+        self.neg_one = torch.tensor(-1.0, device="cuda", dtype=DTYPE)
         # the default backend order on the box may prefer cuDNN, whose host is
         # not converted; a decode pins flash the same way
         self._flash = torch.nn.attention.sdpa_kernel(
@@ -130,6 +150,9 @@ class TestCudaHostTraceDecode(HostTraceTestCase):
             self.wk,
             self.wv,
             self.w_out,
+            self.cos,
+            self.sin,
+            self.neg_one,
             k[:, :, :L],
             v[:, :, :L],
         )
@@ -163,16 +186,17 @@ class TestCudaHostTraceDecode(HostTraceTestCase):
 
     def test_the_chain_traces_end_to_end(self):
         tape, _ = self._trace(4, 16)
-        # embedding gather, layer norm, three muls, two cache copies, flash,
-        # add, silu, two casts, softmax, mul, two sums: every launch a
-        # converted or sibling host
+        # the ids' H2D copy, embedding (index_select), layer norm, the
+        # projection muls, two rotaries (mul, mul, cat as two copies, mul,
+        # add), two cache copies, flash, add, silu, two casts, softmax, mul,
+        # two sums: every launch a converted or sibling host
         self.assertEqual(tape.num_memcpys, 1)  # the ids
-        self.assertGreaterEqual(tape.num_launches, 14)
+        self.assertGreaterEqual(tape.num_launches, 20)
         names = " ".join(rec["kernel"] for rec in tape.launches)
         for needle in (
             "layer_norm",
             "flash_fwd",
-            "gather_kernel",
+            "indexSelectSmallIndex",
             "reduce_kernel",
             "softmax_warp_forward",
         ):
@@ -364,11 +388,6 @@ class TestCudaHostTraceDecode(HostTraceTestCase):
         ids = torch.randint(0, V, (4,), device="cuda")
         cases = {
             "matmul (closed GEMM)": (lambda a, b: a @ b, (x, w2)),
-            "embedding": (lambda t, i: F.embedding(i, t), (self.table, ids)),
-            "rotary concat (cat)": (
-                lambda a: torch.cat([a.sin(), a.cos()], -1),
-                (x,),
-            ),
         }
         for name, (fn, args) in cases.items():
             with self.assertRaises(ht.Declined, msg=name):
@@ -380,6 +399,11 @@ class TestCudaHostTraceDecode(HostTraceTestCase):
             lambda a: a.sin() * a.cos(),
         ):
             self.assertGreaterEqual(ht.trace(fn, (x,)).num_launches, 1)
+        # traced since commit 8: embedding (the index_select sibling) and cat
+        tape = ht.trace(lambda t, i: F.embedding(i, t), (self.table, ids))
+        self.assertEqual(tape.num_launches, 1)
+        tape = ht.trace(lambda a: torch.cat([a, a], -1), (x,))
+        self.assertEqual(tape.num_launches, 1)
 
     def _sdpa_fwd_bwd(self, p):
         # create_graph=False, as loss.backward() runs the backward (the flash

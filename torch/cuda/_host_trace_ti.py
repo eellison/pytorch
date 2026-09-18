@@ -1,11 +1,13 @@
 """The CUDA ops with a traced TensorIterator sibling (private): elementwise
 add, sub, rsub, mul, div (their in-place, out= and .Scalar forms too), silu,
 gelu, sin, cos, exp, rsqrt, neg, reciprocal, tanh, sqrt, pow, copy_ (incl.
-casts), fill_ / zero_ (eager's memset over a dense tensor) and the fill
-factories (full, zeros, ones, *_like, new_*), arange, the comparisons eq / ne /
-lt / le / gt / ge, masked_fill, clamp / clamp_min / clamp_max / relu, and the
-reductions sum, mean, amax / max; plus the converted softmax / log_softmax
-host, whose entry allocates the output.
+casts, and the contiguous memcpy), fill_ / zero_ (eager's memset over a dense
+tensor) and the fill factories (full, zeros, ones, *_like, new_*), arange, the
+comparisons eq / ne / lt / le / gt / ge, masked_fill, clamp / clamp_min /
+clamp_max / relu, the reductions sum, mean, amax / max, index_copy_ and
+index_put_; plus the converted softmax / log_softmax host, whose entry
+allocates the output, and the eager hosts with a sibling beside them
+(index_select, embedding, cat, triu / tril).
 
 Each entry is what the op's CUDA kernel host does around gpu_kernel or
 gpu_reduce_kernel, on the SymInt-typed sibling iterator in
@@ -885,6 +887,296 @@ register_traced_entry(aten.mean.dim, _mean_dim)
 register_traced_entry(aten.mean.default, _mean)
 register_traced_entry(aten.amax.default, _amax)
 register_traced_entry(aten.max.default, _max)
+
+
+# ---- eager hosts with a traced sibling beside the real host (EagerOps.h):
+# index_select (Indexing.cu), cat (Shape.cu) and embedding_dense_backward
+# (Embedding.cu). embedding's forward is Embedding.cpp's composite over
+# index_select, written out here so the mode routes the index_select to its
+# sibling.
+
+
+def _index_select(self, dim, index):
+    _cuda_operands(aten.index_select.default, self, index)
+    return _C._host_trace_ti_index_select(self, int(dim), index)
+
+
+def _embedding(weight, indices, padding_idx=-1, scale_grad_by_freq=False, sparse=False):
+    # at::native::embedding_symint: padding_idx, scale_grad_by_freq and sparse
+    # only shape the backward; the forward is an index_select over the rows
+    _cuda_operands(aten.embedding.default, weight, indices)
+    if indices.dtype not in (torch.long, torch.int):
+        raise RuntimeError(
+            "Expected tensor for argument #2 'indices' to have one of the following "
+            f"scalar types: Long, Int; but got {indices.dtype} instead "
+            "(while checking arguments for embedding)"
+        )
+    if indices.dim() == 1:
+        return torch.index_select(weight, 0, indices)
+    size = list(indices.shape) + [weight.shape[-1]]
+    return torch.index_select(weight, 0, indices.reshape(-1)).view(size)
+
+
+def _cat(tensors, dim=0):
+    for t in tensors:
+        _cuda_operands(aten.cat.default, t)
+    return _C._host_trace_ti_cat(list(tensors), int(dim))
+
+
+def _embedding_dense_backward(
+    grad_output, indices, num_weights, padding_idx, scale_grad_by_freq
+):
+    # Embedding.cu embedding_dense_backward_cuda: the zeroed table (a memset
+    # record) and the feature kernel when the index count is at most 3072
+    # without frequency scaling, the real host's route as a guard; the
+    # sort-based route (cub) declines by name in the sibling. num_weights and
+    # padding_idx stay values (registered with symint=True): the table's row
+    # count is the allocation's size, padding_idx a field of the launch
+    _cuda_operands(aten.embedding_dense_backward.default, grad_output, indices)
+    return _C._host_trace_ti_embedding_dense_backward(
+        grad_output, indices, num_weights, padding_idx, bool(scale_grad_by_freq)
+    )
+
+
+register_traced_entry(aten.index_select.default, _index_select)
+register_traced_entry(aten.embedding.default, _embedding)
+register_traced_entry(aten.cat.default, _cat)
+register_traced_entry(
+    aten.embedding_dense_backward.default, _embedding_dense_backward, symint=True
+)
+
+
+# ---- index_copy_ / index_put_ (TensorAdvancedIndexing.cpp; the kernels of
+# IndexKernel.cu through the siblings compiled beside them): the StaticCache
+# writes k_out.index_copy_(2, cache_position, k) and k_out[:, :, pos] = k. The
+# hosts' view arithmetic (the meta's checks, index_copy_out's restrides,
+# make_info's broadcast / transpose / restride_src / reshape_indexer) is
+# written out here over the traced tensors; the sibling builds the iterator
+# and launches. The functional forms fill a fresh result from self first, as
+# the real ops do (a memcpy record for a contiguous self).
+
+
+def _index_copy_checks(self, dim, index, source):
+    # TORCH_PRECOMPUTE_META_FUNC(index_copy): the checks in the meta's order
+    # with its texts; returns the wrapped dim
+    nd = self.dim()
+    span = max(nd, 1)
+    if dim < -span or dim >= span:
+        raise IndexError(
+            f"Dimension out of range (expected to be in range of [{-span}, {span - 1}], but got {dim})"
+        )
+    dim = dim + nd if dim < 0 else dim
+    if index.dim() >= 2:
+        raise IndexError(
+            f"index_copy_(): Index should have dimension 1 or 0 (got {index.dim()})"
+        )
+    num = index.numel()
+    if source.dim() == 0:
+        if not bool(num == 1):
+            raise IndexError(
+                f"index_copy_(): When source is scalar, index should have one element (got {num})"
+            )
+    elif source.dim() != nd and nd != 0:
+        raise IndexError(
+            f"index_copy_(): When source and destination are not scalars, their dimensionality must match. Source dimensionality ({source.dim()}), destination dimensionality ({nd})"
+        )
+    if index.dtype is not torch.int64:
+        raise RuntimeError(
+            f"index_copy_(): Expected a long tensor for index, but got {index.dtype}"
+        )
+    if self.dtype is not source.dtype:
+        raise RuntimeError(
+            f"index_copy_(): self and source expected to have the same dtype, but got (self) {self.dtype} and (source) {source.dtype}"
+        )
+    self_sliced = [s for d, s in enumerate(self.shape) if d != dim]
+    source_sliced = [s for d, s in enumerate(source.shape) if d != dim]
+    if len(self_sliced) != len(source_sliced) or not all(
+        bool(a == b) for a, b in zip(self_sliced, source_sliced)
+    ):
+        raise RuntimeError(
+            f"index_copy_(): Source/destination tensor must have same slice shapes. Destination slice shape: {self_sliced} at dimension {dim} and source slice shape: {source_sliced} at dimension 0."
+        )
+    if source.dim() != 0 and not bool(num == source.shape[dim]):
+        raise IndexError(
+            f"index_copy_(): Number of indices ({num}) should be equal to source.size(dim) ({source.shape[dim]})"
+        )
+    return dim
+
+
+def _index_copy_(self, dim, index, source):
+    _cuda_operands(aten.index_copy_.default, self, index, source)
+    dim = _index_copy_checks(self, dim, index, source)
+    return _C._host_trace_ti_index_copy_(self, dim, index, source)
+
+
+def _index_copy(self, dim, index, source):
+    # the structured kernel's contiguous result, filled from self by copy_,
+    # then the kernel on it
+    _cuda_operands(aten.index_copy.default, self, index, source)
+    dim = _index_copy_checks(self, dim, index, source)
+    out = torch.empty(self.shape, dtype=self.dtype, device=self.device)
+    out.copy_(self)
+    return _C._host_trace_ti_index_copy_(out, dim, index, source)
+
+
+def _expandable_to(shape, desired):
+    # ExpandUtils.h is_expandable_to, each size comparison a guard
+    if len(shape) > len(desired):
+        return False
+    lead = len(desired) - len(shape)
+    return all(
+        bool(sz == 1) or bool(sz == desired[lead + i]) for i, sz in enumerate(shape)
+    )
+
+
+def _index_put_impl(op, self, indices, value, accumulate):
+    # _index_put_impl_ and make_info over the traced tensors: bool / byte
+    # masks (a nonzero, a synchronizing read), a CPU index or value (copied
+    # to the device by the real op) and the sort-based accumulate /
+    # deterministic path decline by name
+    indices = list(indices)
+    if len(indices) > self.dim():
+        raise IndexError(
+            f"too many indices for tensor of dimension {self.dim()} (got {len(indices)})"
+        )
+    for idx in indices:
+        if idx is None:
+            continue
+        if idx.dtype in (torch.bool, torch.uint8):
+            raise Declined(
+                f"host_trace: {op} with a boolean / byte mask index: the mask's nonzero is a synchronizing host read (declined)"
+            )
+        if idx.dtype not in (torch.int64, torch.int32):
+            raise IndexError(
+                "tensors used as indices must be long, int, byte or bool tensors"
+            )
+        _cuda_operands(op, idx)
+    # _index_put_impl_'s assert_no_overlap on self against the value and each
+    # index, before make_info restrides them (an overlap eager rejects declines
+    # by name; between two inputs it is an address guard of the tape)
+    _C._host_trace_ti_assert_no_overlap(self, value)
+    for idx in indices:
+        if idx is not None:
+            _C._host_trace_ti_assert_no_overlap(self, idx)
+    if accumulate or torch.are_deterministic_algorithms_enabled():
+        raise Declined(
+            f"host_trace: {op} with accumulate=True or under deterministic algorithms takes the sort-based kernel (index_put_with_sort), which is not traced (declined)"
+        )
+    defined = [i for i in indices if i is not None]
+    if not defined:
+        raise Declined(
+            f"host_trace: {op} with no index tensor is not traced (declined)"
+        )
+    if len(defined) > 1:
+        defined = list(torch.broadcast_tensors(*defined))
+    it = iter(defined)
+    indices = [None if i is None else next(it) for i in indices]
+    indices += [None] * (self.dim() - len(indices))
+    src = self
+    # transposeToFront: the defined indices made adjacent at the front
+    pos = [d for d, i in enumerate(indices) if i is not None]
+    if pos != list(range(pos[0], pos[0] + len(pos))):
+        dims = pos + [d for d, i in enumerate(indices) if i is None]
+        src = self.permute(dims)
+        indices = [indices[d] for d in dims]
+    indices = [
+        None if i is None else (i if i.dtype is torch.int64 else i.long())
+        for i in indices
+    ]
+    # AdvancedIndex: the indexed dims' sizes and byte strides, self restrided
+    # with the broadcast index shape at stride 0 in their place, the indices
+    # reshaped to broadcast over it
+    element_size = src.element_size()
+    src_sizes, src_strides = list(src.shape), list(src.stride())
+    dims_before = dims_after = dims_indexed = 0
+    replacement: list = []
+    indexed_sizes: list = []
+    indexed_strides: list = []
+    for d, i in enumerate(indices):
+        if i is None:
+            if dims_indexed == 0:
+                dims_before += 1
+            else:
+                dims_after += 1
+        else:
+            dims_indexed += 1
+            replacement = list(i.shape)
+            indexed_sizes.append(src_sizes[d])
+            indexed_strides.append(src_strides[d] * element_size)
+    if any(bool(s == 0) for s in indexed_sizes) and not any(
+        bool(s == 0) for s in replacement
+    ):
+        raise IndexError("index is out of bounds for dimension with size 0")
+    end = dims_before + dims_indexed
+    src_r = src.as_strided(
+        src_sizes[:dims_before] + replacement + src_sizes[end:],
+        src_strides[:dims_before] + [0] * len(replacement) + src_strides[end:],
+    )
+    idx_r = [
+        i.reshape([1] * dims_before + list(i.shape) + [1] * dims_after)
+        for i in indices
+        if i is not None
+    ]
+    if len(idx_r) >= 2 and not all(
+        all(bool(a == b) for a, b in zip(x.stride(), idx_r[0].stride()))
+        for x in idx_r[1:]
+    ):
+        idx_r = [i.contiguous() for i in idx_r]
+    # make_index_put_iterator's checks
+    if not _expandable_to(list(value.shape), list(src_r.shape)):
+        raise RuntimeError(
+            f"shape mismatch: value tensor of shape {tuple(value.shape)} cannot be broadcast to indexing result of shape {tuple(src_r.shape)}"
+        )
+    if value.dtype is not src_r.dtype:
+        raise RuntimeError(
+            f"Index put requires the source and destination dtypes match, got {src_r.dtype} for the destination and {value.dtype} for the source."
+        )
+    _C._host_trace_ti_index_put_(src_r, value, idx_r, indexed_sizes, indexed_strides)
+
+
+def _index_put_(self, indices, values, accumulate=False):
+    _cuda_operands(aten.index_put_.default, self, values)
+    _index_put_impl(aten.index_put_.default, self, indices, values, accumulate)
+    return self
+
+
+def _index_put(self, indices, values, accumulate=False):
+    # TensorAdvancedIndexing.cpp index_put: a preserve-format clone, written
+    # in place
+    _cuda_operands(aten.index_put.default, self, values)
+    out = self.clone(memory_format=torch.preserve_format)
+    _index_put_impl(aten.index_put.default, out, indices, values, accumulate)
+    return out
+
+
+register_traced_entry(aten.index_copy_.default, _index_copy_)
+register_traced_entry(aten.index_copy.default, _index_copy)
+register_traced_entry(aten.index_put_.default, _index_put_)
+register_traced_entry(aten.index_put.default, _index_put)
+
+
+# ---- triu / tril (TriangularOps.cu, the sibling appended to the real host):
+# the structured meta's contiguous result (self for the in-place ops), the
+# diagonal a value of the launch (a SymInt is not pinned: _SYMINT_KERNELS)
+
+
+def _triu_tril(op, upper, inplace):
+    def entry(self, diagonal=0):
+        _cuda_operands(op, self)
+        out = (
+            self
+            if inplace
+            else torch.empty(self.shape, dtype=self.dtype, device=self.device)
+        )
+        return _C._host_trace_ti_triu_tril(self, diagonal, upper, out)
+
+    return entry
+
+
+register_traced_entry(aten.triu.default, _triu_tril(aten.triu.default, True, False))
+register_traced_entry(aten.tril.default, _triu_tril(aten.tril.default, False, False))
+register_traced_entry(aten.triu_.default, _triu_tril(aten.triu_.default, True, True))
+register_traced_entry(aten.tril_.default, _triu_tril(aten.tril_.default, False, True))
 
 
 # ---- the generated siblings (torchgen/dest/ufunc.py over ti/siblings.yaml

@@ -1629,6 +1629,8 @@ class TestCudaHostTraceTI(HostTraceTestCase):
         tg = torch.randint(0, 4096, (64,), device="cuda")
         seed = torch.ones((), device="cuda")
         total_weight = torch.ops.aten.nll_loss_forward.default(x, tg, None, 1, -100)[1]
+        ids = torch.randint(0, 1000, (512,), device="cuda")
+        g = self._values(512, 64, torch.bfloat16)
         ops = {
             "add.Scalar": (lambda t: t + 1.5, (x,)),
             "add.Tensor": (lambda t, u: t + u, (x, w)),
@@ -1684,6 +1686,12 @@ class TestCudaHostTraceTI(HostTraceTestCase):
                     seed, t, tg, None, 1, -100, total_weight
                 ),
                 (x,),
+            ),
+            "embedding_dense_backward (memset + feature kernel)": (
+                lambda t, i: torch.ops.aten.embedding_dense_backward(
+                    t, i, 1000, -1, False
+                ),
+                (g, ids),
             ),
         }
         for name, (fn, args) in ops.items():

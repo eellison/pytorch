@@ -909,6 +909,7 @@ libtorch_python_cuda_core_sources = [
     "torch/csrc/cuda/Graph.cpp",
     "torch/csrc/cuda/HostTrace.cpp",
     "torch/csrc/cuda/HostTraceTI.cpp",
+    "torch/csrc/cuda/HostTraceEager.cpp",
     "torch/csrc/cuda/MemPool.cpp",
     "torch/csrc/cuda/shared/cudart.cpp",
     "torch/csrc/cuda/shared/nvtx.cpp",

@@ -14,6 +14,8 @@
 #include <ATen/native/cuda/SortingCommon.cuh>
 #include <ATen/native/cuda/block_reduce.cuh>
 #include <ATen/native/cuda/thread_constants.h>
+#include <ATen/cuda/host_trace/Launch.h>
+#include <ATen/cuda/host_trace/ti/EagerOps.h>
 
 #ifndef AT_PER_OPERATOR_HEADERS
 #include <ATen/Functions.h>
@@ -419,3 +421,71 @@ Tensor & embedding_renorm_cuda_(Tensor & self, const Tensor & indices,
 
 
 }  // namespace at::native
+
+// ---- host tracing (ATen/cuda/host_trace): the traced sibling of embedding_dense_backward_cuda.
+// The real host above is untouched. This copy has the same body with the sizes as c10::SymInt, the
+// addresses through the recorder's accessors and the launch through the typed helper, so a trace
+// records what embedding_backward_feature_kernel receives; the zeroed table is at::zeros through
+// the dispatcher, which under a trace is an allocation and the memset eager's zero_ issues. The
+// route the real host takes is a guard: at most 3072 indices without frequency scaling launch the
+// feature kernel, anything else is the sort-based route (cub radix_sort_pairs and
+// embedding_backward_cuda_kernel), which declines by name. Outside a trace it runs the same launch
+// on real tensors, which is how the parity test compares it with the real op.
+namespace at::cuda::host_trace::ti {
+
+Tensor embedding_dense_backward_traced(
+    const Tensor& grad_,
+    const Tensor& indices_,
+    const c10::SymInt& num_weights,
+    const c10::SymInt& padding_idx,
+    bool scale_grad_by_freq) {
+  auto grad_arg = TensorArg(grad_, "grad", 1);
+  auto indices_arg = TensorArg(indices_, "indices", 1);
+  checkScalarTypes("embedding_backward", indices_arg, {kLong, kInt});
+  checkSameGPU("embedding_backward", grad_arg, indices_arg);
+
+  auto indices = indices_.contiguous();
+
+  const c10::SymInt num_indices = indices.sym_numel();
+  auto grad = grad_.contiguous().view_symint({num_indices, grad_.sym_size(-1)});
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+  if (num_indices <= 3072 && !scale_grad_by_freq) {
+    auto grad_weight = at::zeros_symint({num_weights, grad_.sym_size(-1)}, grad_.options());
+    const c10::SymInt stride = grad_weight.sym_stride(0);
+    const int warp_size = at::cuda::warp_size();
+    const Grid grid((stride + warp_size - 1) / warp_size);
+    const dim3 block(warp_size, at::native::BLOCKDIMY);
+
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        at::ScalarType::Half, at::ScalarType::BFloat16, grad.scalar_type(), "embedding_backward", [&] {
+          using accscalar_t = acc_type<scalar_t, true>;
+          AT_DISPATCH_INDEX_TYPES(indices.scalar_type(), "embedding_dense_backward_cuda", [&]() {
+            const int64_t smem = static_cast<int64_t>(
+                sizeof(accscalar_t) * warp_size * at::native::BLOCKDIMY +
+                sizeof(int) * warp_size * at::native::BLOCKDIMY);
+            launch(
+                at::native::embedding_backward_feature_kernel<scalar_t, accscalar_t, index_t>,
+                grid,
+                block,
+                smem,
+                stream,
+                sym_const_data_ptr<index_t>(indices),
+                sym_const_data_ptr<scalar_t>(grad),
+                sym_mutable_data_ptr<scalar_t>(grad_weight),
+                num_indices,
+                stride,
+                padding_idx);
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+          });
+        });
+    return grad_weight;
+  }
+
+  decline(
+      "host_trace: embedding_dense_backward with more than 3072 indices or scale_grad_by_freq "
+      "takes the sort-based route (cub radix_sort_pairs, embedding_backward_cuda_kernel), which "
+      "is not traced (declined)");
+}
+
+} // namespace at::cuda::host_trace::ti

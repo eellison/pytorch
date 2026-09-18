@@ -256,11 +256,17 @@ _TRACEABLE = {
 
 # traceable ops whose CUDA kernel takes its SymInt arguments as c10::SymInt
 # (a _symint kernel): no pin is needed before redispatch, the host receives
-# the symbols (flash's max_q / max_k, which the dense path never reads)
+# the symbols (flash's max_q / max_k, which the dense path never reads); and
+# the traced entries whose sibling takes a SymInt argument as a value (the
+# triu / tril diagonal, a field of the launch)
 _SYMINT_KERNELS = {
     aten._flash_attention_forward.default,
     aten._flash_attention_backward.default,
     aten._scaled_dot_product_flash_attention_backward.default,
+    aten.triu.default,
+    aten.tril.default,
+    aten.triu_.default,
+    aten.tril_.default,
 }
 
 # the recorder's message when a host reads a raw pointer of a traced tensor

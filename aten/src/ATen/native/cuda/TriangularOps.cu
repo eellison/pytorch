@@ -209,3 +209,91 @@ Tensor trace_cuda(const Tensor& self) {
 }
 
 } // namespace at::native
+
+// ---- host tracing (ATen/cuda/host_trace): the traced sibling of triu_tril_cuda_template.
+// The real host above is untouched. This copy has the sizes as c10::SymInt, the diagonal as a
+// value, the two TensorInfo blocks as proxies over the same POD (EagerViews.cuh) and the launch
+// through the typed helper, so a trace records what triu_tril_kernel receives (the same
+// instantiations: in place or not, 32- or 64-bit indexing, each choice a guard). Outside a trace
+// it runs the same launches on real tensors, which is how the parity test compares it with the
+// real op.
+#include <ATen/cuda/host_trace/ti/EagerOps.h>
+#include <ATen/cuda/host_trace/ti/EagerViews.cuh>
+
+namespace at::native {
+namespace {
+
+namespace ht = at::cuda::host_trace;
+
+template <bool upper, typename scalar_t>
+void launch_triu_tril_kernel_sym(const Tensor& result, const Tensor& self, const c10::SymInt& k) {
+  constexpr int elements_per_thread = sizeof(scalar_t) < 8 ? 8 / sizeof(scalar_t) : 1;
+  const c10::SymInt ept(static_cast<int64_t>(elements_per_thread));
+  auto sizes = self.sym_sizes();
+  c10::SymInt last_dim_padded = (sizes.back() + (ept - 1)) / ept * ept;
+  c10::SymInt N_padded(1);
+  for (size_t i = 0; i + 1 < sizes.size(); ++i) {
+    N_padded = N_padded * sizes[i];
+  }
+  N_padded = N_padded * last_dim_padded;
+  const ht::Block dim_block(c10::SymInt(static_cast<int64_t>(block_size)));
+  const ht::Grid dim_grid((N_padded / ept + (block_size - 1)) / block_size);
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const bool inplace = self.is_same(result);
+
+  if (cuda::detail::canUse32BitIndexMath(result) && cuda::detail::canUse32BitIndexMath(self)) {
+    ht::Traced<cuda::detail::TensorInfo<scalar_t, int32_t>> result_info;
+    result_info.fill(result);
+    ht::Traced<cuda::detail::TensorInfo<const scalar_t, int32_t>> self_info;
+    self_info.fill(self);
+    BOOL_SWITCH(inplace, kInplace, [&] {
+      ht::launch(triu_tril_kernel<scalar_t, int32_t, upper, elements_per_thread, kInplace>,
+          dim_grid, dim_block, 0, stream, result_info, self_info, k, N_padded, last_dim_padded);
+    });
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  } else {
+    ht::Traced<cuda::detail::TensorInfo<scalar_t, int64_t>> result_info;
+    result_info.fill(result);
+    ht::Traced<cuda::detail::TensorInfo<const scalar_t, int64_t>> self_info;
+    self_info.fill(self);
+    BOOL_SWITCH(inplace, kInplace, [&] {
+      ht::launch(triu_tril_kernel<scalar_t, int64_t, upper, elements_per_thread, kInplace>,
+          dim_grid, dim_block, 0, stream, result_info, self_info, k, N_padded, last_dim_padded);
+    });
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
+}
+
+} // anonymous namespace
+} // namespace at::native
+
+namespace at::cuda::host_trace::ti {
+
+Tensor& triu_tril_traced(const Tensor& self, const c10::SymInt& k, bool upper, Tensor& result) {
+  // TriangularOps.cpp's meta (at least two dimensions; the entry allocated `result` as the
+  // structured kernel would, or passed self for the in-place op), then the impl: nothing is
+  // launched for an empty input
+#if defined(USE_ROCM)
+  decline("host_trace: the triu / tril sibling is CUDA-only in this version (declined)");
+#else
+  TORCH_CHECK(self.dim() >= 2, upper ? "triu" : "tril", ": input tensor must have at least 2 dimensions");
+  if (self.sym_numel() == 0) {
+    return result;
+  }
+  AT_DISPATCH_ALL_TYPES_AND_COMPLEX_AND4(
+      at::ScalarType::ComplexHalf,
+      at::ScalarType::Half,
+      at::ScalarType::BFloat16,
+      at::ScalarType::Bool,
+      self.scalar_type(), "triu_tril_cuda_template", [&] {
+    if (upper) {
+      at::native::launch_triu_tril_kernel_sym<true, scalar_t>(result, self, k);
+    } else {
+      at::native::launch_triu_tril_kernel_sym<false, scalar_t>(result, self, k);
+    }
+  });
+  return result;
+#endif
+}
+
+} // namespace at::cuda::host_trace::ti
