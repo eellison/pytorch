@@ -45,9 +45,14 @@ the build pairs the copy with a memcpy node of its capture, and each replay
 renders the table into a ring of pinned staging slots and updates the node
 when an operand moved. A pinned CPU tensor may be an input of the traced
 call as the source of such a copy; a pageable one declines at the trace and
-misses at replay. Passing a small table by value in the kernel's parameter
-image instead of copying it is the tape's future choice when it fits; not
-done here.
+misses at replay. The replay's copy reads a pinned input asynchronously: a
+caller that rewrites the same pinned buffer in place between calls must call
+wait_for_h2d(buffer) before each rewrite, or a CPU running ahead of the GPU
+hands the copy the next call's bytes. Nothing detects a missing wait (a
+contract, like the synchronous-copy rule); a fresh pinned tensor per call
+needs no wait, the replay holds it until its copy has run. Passing a small
+table by value in the kernel's parameter image instead of copying it is the
+tape's future choice when it fits; not done here.
 
 trace() runs the function once on the real inputs before the symbolic run
 (warm_up=True): one-time initializations (a lazily loaded module, cuBLAS's
@@ -245,6 +250,17 @@ _TRACEABLE = {
     aten.native_layer_norm_backward.default,
     aten._flash_attention_forward.default,
     aten._flash_attention_backward.default,
+    aten._scaled_dot_product_flash_attention.default,
+    aten._scaled_dot_product_flash_attention_backward.default,
+}
+
+# traceable ops whose CUDA kernel takes its SymInt arguments as c10::SymInt
+# (a _symint kernel): no pin is needed before redispatch, the host receives
+# the symbols (flash's max_q / max_k, which the dense path never reads)
+_SYMINT_KERNELS = {
+    aten._flash_attention_forward.default,
+    aten._flash_attention_backward.default,
+    aten._scaled_dot_product_flash_attention_backward.default,
 }
 
 # the recorder's message when a host reads a raw pointer of a traced tensor
@@ -1825,7 +1841,9 @@ class _TraceMode(TorchDispatchMode):
         # trace, or inside another host (a layer norm copying a non-contiguous
         # input calls copy_)
         entry = _TRACED_ENTRIES.get(func)
-        if entry is not None or (self.depth == 0 and func in _TRACEABLE):
+        # a converted host is traceable under trace and inside another
+        # converted host (the SDPA flash entry calls _flash_attention_forward)
+        if entry is not None or func in _TRACEABLE:
             if entry is not None and func in self.entering:
                 raise Declined(
                     f"host_trace: the traced entry for {func} dispatched {func} itself; "
@@ -1839,7 +1857,7 @@ class _TraceMode(TorchDispatchMode):
                 self.entering.append(func)
             try:
                 with self:
-                    if func not in _SYMINT_ENTRIES:
+                    if func not in _SYMINT_KERNELS and func not in _SYMINT_ENTRIES:
                         args = tuple(_concrete_ints(a) for a in args)
                         kwargs = {k: _concrete_ints(v) for k, v in kwargs.items()}
                     if entry is not None:

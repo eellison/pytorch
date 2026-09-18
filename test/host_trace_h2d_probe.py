@@ -78,10 +78,11 @@ __global__ void grouped_mul_kernel(
   }
 }
 
+template <typename T>
 __global__ void gather_kernel(
-    const float* table,
+    const T* table,
     const int64_t* ids,
-    float* out,
+    T* out,
     int rows,
     int cols) {
   const int r = blockIdx.x;
@@ -165,10 +166,35 @@ at::Tensor grouped_mul(
   return out;
 }
 
+template <typename T>
+static void gather_launch(
+    const at::Tensor& table,
+    const at::Tensor& ids_dev,
+    const at::Tensor& out,
+    const c10::SymInt& rows,
+    const c10::SymInt& cols,
+    cudaStream_t stream) {
+  launch(
+      gather_kernel<T>,
+      Grid(rows),
+      128,
+      c10::SymInt(0),
+      stream,
+      sym_const_data_ptr<T>(table),
+      sym_const_data_ptr<int64_t>(ids_dev),
+      sym_mutable_data_ptr<T>(out),
+      rows,
+      cols);
+}
+
 at::Tensor gather(const at::Tensor& table, const at::Tensor& ids) {
+  // float32, float16 or bfloat16 table (a decode's embedding rows in the
+  // attention dtype)
+  const auto st = table.scalar_type();
   TORCH_CHECK(
-      table.dim() == 2 && table.is_cuda() && table.scalar_type() == at::kFloat,
-      "gather: a 2-D float32 CUDA table");
+      table.dim() == 2 && table.is_cuda() &&
+          (st == at::kFloat || st == at::kHalf || st == at::kBFloat16),
+      "gather: a 2-D float32 / float16 / bfloat16 CUDA table");
   TORCH_CHECK(
       ids.dim() == 1 && ids.device().is_cpu() && ids.scalar_type() == at::kLong,
       "gather: 1-D int64 ids on the CPU");
@@ -178,17 +204,13 @@ at::Tensor gather(const at::Tensor& table, const at::Tensor& ids) {
   at::Tensor out = at::empty_symint({rows, cols}, table.options());
   auto stream = at::cuda::getCurrentCUDAStream();
   copy_h2d(sym_mutable_data_ptr(ids_dev), ids, rows * 8, stream);
-  launch(
-      gather_kernel,
-      Grid(rows),
-      128,
-      c10::SymInt(0),
-      stream.stream(),
-      sym_const_data_ptr<float>(table),
-      sym_const_data_ptr<int64_t>(ids_dev),
-      sym_mutable_data_ptr<float>(out),
-      rows,
-      cols);
+  if (st == at::kFloat) {
+    gather_launch<float>(table, ids_dev, out, rows, cols, stream.stream());
+  } else if (st == at::kHalf) {
+    gather_launch<at::Half>(table, ids_dev, out, rows, cols, stream.stream());
+  } else {
+    gather_launch<at::BFloat16>(table, ids_dev, out, rows, cols, stream.stream());
+  }
   return out;
 }
 

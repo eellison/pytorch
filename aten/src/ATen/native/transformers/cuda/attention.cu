@@ -481,8 +481,8 @@ _flash_attention_forward_impl(
     const Tensor& value,
     const std::optional<Tensor>& cumulative_sequence_length_q,
     const std::optional<Tensor>& cumulative_sequence_length_k,
-    int64_t max_seqlen_batch_q,
-    int64_t max_seqlen_batch_k,
+    c10::SymInt max_seqlen_batch_q,
+    c10::SymInt max_seqlen_batch_k,
     double dropout_p,
     bool is_causal,
     bool return_debug_mask,
@@ -558,8 +558,8 @@ _flash_attention_forward_impl(
             seqused_k, /*seqused_k*/
             block_table, /*block_table*/
             alibi_slopes, /*alibi_slopes*/
-            max_seqlen_batch_q,
-            max_seqlen_batch_k,
+            max_seqlen_batch_q.guard_int(__FILE__, __LINE__),
+            max_seqlen_batch_k.guard_int(__FILE__, __LINE__),
             dropout_p,
             softmax_scale,
             false /*zero_tensors*/,
@@ -938,11 +938,11 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, c10::SymInt, c10::SymInt, Tensor, Ten
   // Key   (Batch x Num_heads x KV_seq_len x Dim_per_head)
   // Value (Batch x Num_heads x KV_seq_len x Dim_per_head)
 
-  const int64_t max_seqlen_batch_q = query.size(2);
-  const int64_t max_seqlen_batch_k = key.size(2);
-  const int64_t max_seqlen_batch_v = value.size(2);
-  TORCH_CHECK(
-      max_seqlen_batch_k == max_seqlen_batch_v,
+  const c10::SymInt max_seqlen_batch_q = query.sym_size(2);
+  const c10::SymInt max_seqlen_batch_k = key.sym_size(2);
+  const c10::SymInt max_seqlen_batch_v = value.sym_size(2);
+  TORCH_SYM_CHECK(
+      max_seqlen_batch_k.sym_eq(max_seqlen_batch_v),
       "Key and Value must have the same sequence length");
 
   // Query -> Query(Batch x Q_seq_len  x Num_heads x Dim_per_head)
@@ -958,7 +958,7 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, c10::SymInt, c10::SymInt, Tensor, Ten
        philox_seed,
        philox_offset,
        debug_attn_mask] =
-          at::_flash_attention_forward(
+          at::_flash_attention_forward_symint(
               q_t,
               k_t,
               v_t,
@@ -1491,31 +1491,37 @@ int64_t _fused_sdp_choice_cuda(const Tensor& query_, const Tensor& key, const Te
 }
 
 std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor>
-_flash_attention_forward(
+_flash_attention_forward_symint(
     const Tensor& query,
     const Tensor& key,
     const Tensor& value,
     const std::optional<Tensor>& cumulative_sequence_length_q,
     const std::optional<Tensor>& cumulative_sequence_length_k,
-    int64_t max_seqlen_batch_q,
-    int64_t max_seqlen_batch_k,
+    c10::SymInt max_seqlen_batch_q,
+    c10::SymInt max_seqlen_batch_k,
     double dropout_p,
     bool is_causal,
     bool return_debug_mask,
     std::optional<double> scale,
-    std::optional<int64_t> window_size_left,
-    std::optional<int64_t> window_size_right,
+    std::optional<c10::SymInt> window_size_left,
+    std::optional<c10::SymInt> window_size_right,
     const std::optional<Tensor>& _seqused_k,
     const std::optional<Tensor>& _alibi_slopes,
     const std::optional<Tensor>& _block_table,
     std::optional<int64_t> num_splits
     ) {
+  // the SymInt kernel: max_q / max_k stay symbolic (the dense path never
+  // reads them); a window size is a constant the host reads concretely
+  auto window = [](const std::optional<c10::SymInt>& w) -> std::optional<int64_t> {
+    if (!w.has_value()) return std::nullopt;
+    return w->guard_int(__FILE__, __LINE__);
+  };
   return _flash_attention_forward_impl(
       query, key, value,
       cumulative_sequence_length_q, cumulative_sequence_length_k,
-      max_seqlen_batch_q, max_seqlen_batch_k,
+      std::move(max_seqlen_batch_q), std::move(max_seqlen_batch_k),
       dropout_p, is_causal, return_debug_mask,
-      scale, window_size_left, window_size_right,
+      scale, window(window_size_left), window(window_size_right),
       _seqused_k, _alibi_slopes, _block_table,
       /*out=*/std::nullopt, num_splits);
 }

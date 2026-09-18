@@ -100,7 +100,10 @@ Tensor ensure_mem_eff_attention_bias_alignment(const Tensor& bias) {
 
 } // namespace
 
-std::tuple<Tensor, Tensor, Tensor> _flash_attention_backward(
+// the SymInt kernel: max_q / max_k stay symbolic (the dense path never reads
+// them, the varlen path reads them as guards); a window size is a constant the
+// host reads concretely
+std::tuple<Tensor, Tensor, Tensor> _flash_attention_backward_symint(
     const Tensor& grad_out,
     const Tensor& query,
     const Tensor& key,
@@ -109,16 +112,22 @@ std::tuple<Tensor, Tensor, Tensor> _flash_attention_backward(
     const Tensor& logsumexp,
     const Tensor& cumulative_sequence_length_q,
     const Tensor& cumulative_sequence_length_k,
-    int64_t max_seqlen_batch_q,
-    int64_t max_seqlen_batch_k,
+    c10::SymInt max_seqlen_batch_q,
+    c10::SymInt max_seqlen_batch_k,
     double dropout_p,
     bool is_causal,
     const Tensor& philox_seed,
     const Tensor& philox_offset,
     std::optional<double> scale,
-    std::optional<int64_t> window_size_left,
-    std::optional<int64_t> window_size_right) {
+    std::optional<c10::SymInt> window_size_left_sym,
+    std::optional<c10::SymInt> window_size_right_sym) {
 #if defined(USE_FLASH_ATTENTION)
+  auto window = [](const std::optional<c10::SymInt>& w) -> std::optional<int64_t> {
+    if (!w.has_value()) return std::nullopt;
+    return w->guard_int(__FILE__, __LINE__);
+  };
+  const std::optional<int64_t> window_size_left = window(window_size_left_sym);
+  const std::optional<int64_t> window_size_right = window(window_size_right_sym);
 #ifdef USE_ROCM
   const auto softmax_scale = sdp::calculate_scale(query, scale).expect_float();
 #else
@@ -185,8 +194,8 @@ std::tuple<Tensor, Tensor, Tensor> _flash_attention_backward(
         cumulative_sequence_length_q,
         cumulative_sequence_length_k,
         alibi_slopes,
-        max_seqlen_batch_q,
-        max_seqlen_batch_k,
+        max_seqlen_batch_q.guard_int(__FILE__, __LINE__),
+        max_seqlen_batch_k.guard_int(__FILE__, __LINE__),
         dropout_p,
         softmax_scale,
         false /*zero_tensors*/,
@@ -1007,7 +1016,9 @@ _efficient_attention_backward(
   return std::make_tuple(Tensor{}, Tensor{}, Tensor{}, Tensor{});
 }
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor> _scaled_dot_product_flash_attention_backward_cuda(
+// the SymInt kernel: the lengths the forward returned stay symbolic through
+// autograd into the converted flash backward host
+std::tuple<at::Tensor, at::Tensor, at::Tensor> _scaled_dot_product_flash_attention_backward_symint(
     const at::Tensor& grad_out_,
     const at::Tensor& query,
     const at::Tensor& key,
@@ -1016,8 +1027,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> _scaled_dot_product_flash_attenti
     const at::Tensor& logsumexp,
     const Tensor& cumulative_sequence_length_q,
     const Tensor& cumulative_sequence_length_k,
-    const int64_t max_seqlen_batch_q,
-    const int64_t max_seqlen_batch_k,
+    const c10::SymInt max_seqlen_batch_q,
+    const c10::SymInt max_seqlen_batch_k,
     double dropout_p,
     bool is_causal,
     const at::Tensor& philox_seed,
@@ -1034,7 +1045,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> _scaled_dot_product_flash_attenti
   Tensor grad_out_t = grad_out_.transpose(1,2);
   Tensor out_t = out.transpose(1,2);
 
-  auto [grad_q, grad_k, grad_v] = at::_flash_attention_backward(
+  auto [grad_q, grad_k, grad_v] = at::_flash_attention_backward_symint(
     grad_out_t,
     q_t,
     k_t,
