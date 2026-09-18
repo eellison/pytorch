@@ -73,11 +73,31 @@ Exec::Exec(at::cuda::CUDAGraph& graph, at::DeviceIndex device)
       memsets_.push_back(ms);
       continue;
     }
+    if (type == cudaGraphNodeTypeMemcpy) {
+      MemcpyState mc;
+      mc.node = node;
+      C10_CUDA_CHECK(cudaGraphMemcpyNodeGetParams(node, &mc.params));
+      const cudaMemcpy3DParms& p = mc.params;
+      const bool linear = p.srcArray == nullptr && p.dstArray == nullptr &&
+          p.extent.height == 1 && p.extent.depth == 1 &&
+          (p.kind == cudaMemcpyHostToDevice ||
+           p.kind == cudaMemcpyDeviceToDevice || p.kind == cudaMemcpyDefault);
+      if (!linear) {
+        // @allow-raw-throw: registered with pybind11 as _HostTraceTapeMismatch and caught by that name in torch/cuda/_host_trace.py
+        throw TapeMismatch(
+            "the capture contains a memcpy node that is not a one-dimensional "
+            "host-to-device or device-to-device copy, which this tape does "
+            "not describe");
+      }
+      order_.emplace_back(2, memcpys_.size());
+      memcpys_.push_back(mc);
+      continue;
+    }
     if (type != cudaGraphNodeTypeKernel) {
       // @allow-raw-throw: registered with pybind11 as _HostTraceTapeMismatch and caught by that name in torch/cuda/_host_trace.py
       throw TapeMismatch(
-          "the capture contains a node that is neither a kernel nor a memset, "
-          "which this tape does not describe");
+          "the capture contains a node that is neither a kernel, a memset nor "
+          "a memcpy, which this tape does not describe");
     }
     NodeState ns;
     ns.node = node;
@@ -147,6 +167,29 @@ unsigned Exec::memset_value(size_t j) const {
   return memsets_.at(j).params.value;
 }
 
+uint64_t Exec::memcpy_src(size_t j) const {
+  return reinterpret_cast<uintptr_t>(memcpys_.at(j).params.srcPtr.ptr);
+}
+
+uint64_t Exec::memcpy_dst(size_t j) const {
+  return reinterpret_cast<uintptr_t>(memcpys_.at(j).params.dstPtr.ptr);
+}
+
+uint64_t Exec::memcpy_bytes(size_t j) const {
+  return static_cast<uint64_t>(memcpys_.at(j).params.extent.width);
+}
+
+std::string Exec::memcpy_kind(size_t j) const {
+  switch (memcpys_.at(j).params.kind) {
+    case cudaMemcpyHostToDevice:
+      return "h2d";
+    case cudaMemcpyDeviceToDevice:
+      return "d2d";
+    default:
+      return "default";
+  }
+}
+
 void Exec::instantiate(bool replay) {
   c10::cuda::CUDAGuard guard(device_);
   graph_->instantiate();
@@ -165,7 +208,8 @@ void Exec::instantiate(bool replay) {
 
 void Exec::run(
     const std::vector<NodeUpdate>& updates,
-    const std::vector<MemsetUpdate>& memset_updates) {
+    const std::vector<MemsetUpdate>& memset_updates,
+    const std::vector<MemcpyUpdate>& memcpy_updates) {
   TORCH_CHECK(instantiated_, "host_trace: this exec was never instantiated");
   c10::cuda::CUDAGuard guard(device_);
   for (const NodeUpdate& u : updates) {
@@ -195,8 +239,23 @@ void Exec::run(
     p.pitch = p.width * p.elementSize;
     C10_CUDA_CHECK(cudaGraphExecMemsetNodeSetParams(exec_, ms.node, &p));
   }
+  for (const MemcpyUpdate& u : memcpy_updates) {
+    MemcpyState& mc = memcpys_.at(u.node);
+    cudaMemcpy3DParms& p = mc.params;
+    // the captured copy is linear: pitch and logical width are the byte
+    // count; its kind (host-to-device or device-to-device) stays the capture's
+    p.srcPtr.ptr = reinterpret_cast<void*>(static_cast<uintptr_t>(u.src));
+    p.dstPtr.ptr = reinterpret_cast<void*>(static_cast<uintptr_t>(u.dst));
+    p.srcPtr.pitch = p.dstPtr.pitch = static_cast<size_t>(u.bytes);
+    p.srcPtr.xsize = p.dstPtr.xsize = static_cast<size_t>(u.bytes);
+    p.srcPtr.ysize = p.dstPtr.ysize = 1;
+    p.extent.width = static_cast<size_t>(u.bytes);
+    p.extent.height = p.extent.depth = 1;
+    C10_CUDA_CHECK(cudaGraphExecMemcpyNodeSetParams(exec_, mc.node, &p));
+  }
   dirty_nodes_ += static_cast<int64_t>(updates.size());
   dirty_memset_nodes_ += static_cast<int64_t>(memset_updates.size());
+  dirty_memcpy_nodes_ += static_cast<int64_t>(memcpy_updates.size());
   graph_->replay();
 }
 

@@ -5,8 +5,10 @@
 #include <torch/csrc/utils/pybind.h>
 #include <torch/csrc/utils/python_symnode.h>
 
+#include <ATen/core/CachingHostAllocator.h>
 #include <ATen/cuda/host_trace/Exec.h>
 #include <ATen/cuda/host_trace/Hooks.h>
+#include <ATen/cuda/host_trace/HostTable.h>
 #include <ATen/cuda/host_trace/Recorder.h>
 
 #include <memory>
@@ -18,6 +20,7 @@
 namespace {
 
 using at::cuda::host_trace::Exec;
+using at::cuda::host_trace::MemcpyUpdate;
 using at::cuda::host_trace::MemsetUpdate;
 using at::cuda::host_trace::NodeUpdate;
 using at::cuda::host_trace::SymVal;
@@ -170,6 +173,37 @@ py::dict tape_records(const Tape& t) {
     memsets.append(std::move(d));
   }
   out["memsets"] = std::move(memsets);
+  py::list host_buffers;
+  for (const auto& hb : t.host_buffers) {
+    py::dict d;
+    d["seq"] = hb.seq;
+    d["name"] = hb.name;
+    d["root"] = py::cast(hb.root);
+    d["nbytes"] = hb.nbytes;
+    py::list elements;
+    for (const auto& e : hb.elements) {
+      py::dict q;
+      q["offset"] = e.offset;
+      q["size"] = e.size;
+      q["kind"] = e.kind;
+      q["value"] = to_py(e.v);
+      elements.append(std::move(q));
+    }
+    d["elements"] = std::move(elements);
+    host_buffers.append(std::move(d));
+  }
+  out["host_buffers"] = std::move(host_buffers);
+  py::list memcpys;
+  for (const auto& mc : t.memcpys) {
+    py::dict d;
+    d["seq"] = mc.seq;
+    d["src"] = py::cast(mc.src);
+    d["dst"] = py::cast(mc.dst);
+    d["bytes"] = py::cast(mc.bytes);
+    d["kind"] = mc.kind;
+    memcpys.append(std::move(d));
+  }
+  out["memcpys"] = std::move(memcpys);
   out["rng_increment"] = t.rng_increment.has_value()
       ? py::cast(*t.rng_increment)
       : py::object(py::none());
@@ -275,6 +309,11 @@ void THCPHostTrace_init(PyObject* module) {
       .def("memset_dst", &Exec::memset_dst)
       .def("memset_bytes", &Exec::memset_bytes)
       .def("memset_value", &Exec::memset_value)
+      .def_property_readonly("num_memcpy_nodes", &Exec::num_memcpy_nodes)
+      .def("memcpy_src", &Exec::memcpy_src)
+      .def("memcpy_dst", &Exec::memcpy_dst)
+      .def("memcpy_bytes", &Exec::memcpy_bytes)
+      .def("memcpy_kind", &Exec::memcpy_kind)
       .def("instantiate", &Exec::instantiate, py::arg("replay") = true)
       .def(
           "run",
@@ -286,7 +325,10 @@ void THCPHostTrace_init(PyObject* module) {
                  std::array<unsigned, 3>,
                  unsigned>>& updates,
              const std::vector<std::tuple<size_t, uint64_t, uint64_t>>&
-                 memset_updates) {
+                 memset_updates,
+             const std::vector<
+                 std::tuple<size_t, uint64_t, uint64_t, uint64_t>>&
+                 memcpy_updates) {
             std::vector<NodeUpdate> us;
             us.reserve(updates.size());
             for (const auto& [node, image, grid, block, smem] : updates) {
@@ -300,13 +342,21 @@ void THCPHostTrace_init(PyObject* module) {
             for (const auto& [node, dst, bytes] : memset_updates) {
               ms.push_back(MemsetUpdate{node, dst, bytes});
             }
-            e.run(us, ms);
+            std::vector<MemcpyUpdate> mc;
+            mc.reserve(memcpy_updates.size());
+            for (const auto& [node, src, dst, bytes] : memcpy_updates) {
+              mc.push_back(MemcpyUpdate{node, src, dst, bytes});
+            }
+            e.run(us, ms, mc);
           },
           py::arg("updates"),
           py::arg("memset_updates") =
-              std::vector<std::tuple<size_t, uint64_t, uint64_t>>{})
+              std::vector<std::tuple<size_t, uint64_t, uint64_t>>{},
+          py::arg("memcpy_updates") =
+              std::vector<std::tuple<size_t, uint64_t, uint64_t, uint64_t>>{})
       .def_property_readonly("dirty_nodes", &Exec::dirty_nodes)
-      .def_property_readonly("dirty_memset_nodes", &Exec::dirty_memset_nodes);
+      .def_property_readonly("dirty_memset_nodes", &Exec::dirty_memset_nodes)
+      .def_property_readonly("dirty_memcpy_nodes", &Exec::dirty_memcpy_nodes);
 
   m.def("_host_trace_drop_storage", [](const at::Tensor& t) {
     at::cuda::host_trace::drop_storage(t);
@@ -363,4 +413,38 @@ void THCPHostTrace_init(PyObject* module) {
   m.def("_host_trace_alloc_log_end", []() {
     return at::cuda::host_trace::alloc_log_end();
   });
+  // the table copies the ordinary host issued between the two calls, in
+  // order: (pinned buffer, its bytes at the copy); the build checks the bytes
+  // against the tape's image and binds the image's root to the buffer its
+  // capture copied from
+  m.def("_host_trace_host_table_log_begin", []() {
+    at::cuda::host_trace::host_table_log_begin();
+  });
+  m.def("_host_trace_host_table_log_end", []() {
+    py::list out;
+    for (const auto& c : at::cuda::host_trace::host_table_log_end()) {
+      out.append(py::make_tuple(
+          c.buffer,
+          py::bytes(
+              reinterpret_cast<const char*>(c.bytes.data()), c.bytes.size())));
+    }
+    return out;
+  });
+  // Tensor::copy_'s rule for a pinned block a stream is still reading: the
+  // caching host allocator defers the block's reuse to an event on that
+  // stream. The replay records its staging slots this way after each launch.
+  // Returns whether the allocator owns the block.
+  m.def(
+      "_host_trace_record_host_event",
+      [](const at::Tensor& pinned, int64_t stream) {
+        TORCH_CHECK(
+            pinned.is_cpu(), "_host_trace_record_host_event: a CPU tensor");
+        c10::cuda::CUDAStream s = c10::cuda::getStreamFromExternal(
+            reinterpret_cast<cudaStream_t>(static_cast<intptr_t>(stream)),
+            c10::cuda::current_device());
+        return at::getHostAllocator(at::kCUDA)->record_event(
+            pinned.data_ptr(),
+            pinned.storage().data_ptr().get_context(),
+            s.unwrap());
+      });
 }

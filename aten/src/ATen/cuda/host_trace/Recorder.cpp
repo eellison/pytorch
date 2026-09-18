@@ -65,6 +65,13 @@ void close_packet(TraceState* s) {
 } // namespace
 
 namespace hooks {
+c10::SymInt mint_int_symbol(
+    int64_t hint,
+    const std::string& name,
+    bool positive) {
+  TORCH_CHECK(g_hooks.new_int_sym != nullptr, "host_trace: hooks not installed");
+  return g_hooks.new_int_sym(hint, name, positive);
+}
 void set_hooks(const Hooks& h) {
   g_hooks = h;
 }
@@ -463,8 +470,7 @@ c10::SymInt opaque_symbol(
       fn,
       " declares a positive result but computed ",
       value);
-  TORCH_CHECK(g_hooks.new_int_sym != nullptr, "host_trace: hooks not installed");
-  return g_hooks.new_int_sym(value, fn, positive);
+  return hooks::mint_int_symbol(value, fn, positive);
 }
 } // namespace
 
@@ -842,8 +848,10 @@ void finish_trace(TraceState* s) {
         type == cudaGraphNodeTypeKernel,
         "host_trace: the host produced a ",
         node_type_name(type),
-        " node, which this tape does not describe; memcpy, memset, events and "
-        "child graphs inside a host are not traced (declined)");
+        " node, which this tape does not describe; a host copies through "
+        "copy_h2d / copy_d2d and clears through memset_async (which record and issue "
+        "nothing under the trace), and events and child graphs inside a host "
+        "are not traced (declined)");
   }
   // Completeness, by handle: every captured node is the node of exactly one
   // launch record. The count is the cheap test; membership names the kernel

@@ -119,10 +119,55 @@ struct MemsetRec {
   c10::SymInt bytes;
 };
 
+// A host table (HostTable.h) as one copy_h2d read it: a pinned buffer the
+// host filled and copied to the device. One record per copy, in host order
+// (`seq` is the copy's place, after every element write before it): `root`
+// is this image's address as a value (hb<k>) and is what the copy's `src`
+// names; `elements` describe every slot the host had written by then, by
+// byte offset, as values. A table copied twice has two records, so each copy
+// keeps its own place and its own bytes: a slot rewritten between the copies
+// has its earlier value in the earlier image. The bytes the host wrote are
+// not on the tape: the replay renders each image into its own staging
+// buffer per call.
+struct HostBufferRec {
+  int64_t seq;
+  std::string name;
+  c10::SymInt root;
+  int64_t nbytes;
+  std::vector<FieldRec> elements;
+};
+
+// An asynchronous copy the host issued through copy_h2d or copy_d2d
+// (HostTable.h) on the trace's capturing stream: a memcpy node in the
+// replay's capture, paired by order with these records and updated when src,
+// dst or bytes change. `src` is a host-buffer image's root, a pinned CPU
+// input's address, or (device-to-device: Copy.cu's contiguous copy_) an
+// address over a CUDA input's or allocation's root like `dst`; the node's
+// kind is the capture's. The trace itself issues nothing: its destination is
+// a storage-less allocation, so there is no node in the trace capture for the
+// frontier pairing of launches (A158) to claim; the replay's build pairs the
+// copies with its own capture's memcpy nodes by order. Should a copy ever be
+// issued under the trace, its packet carries `cudaGraphNode_t node = nullptr`
+// filled by the recorder's frontier_node after the call, like a launch. The
+// record has no stream field, so the recorder declines a copy on any stream
+// but the capturing one (HostTable.cpp).
+struct MemcpyRec {
+  int64_t seq;
+  c10::SymInt src;
+  c10::SymInt dst;
+  c10::SymInt bytes;
+  // "h2d" (copy_h2d: a host table image or a pinned input as source) or
+  // "d2d" (copy_d2d), declared by the recording site; a consumer reads it
+  // and derives nothing from the addresses
+  std::string kind;
+};
+
 struct TORCH_CUDA_CPP_API Tape {
   std::vector<LaunchRec> launches;
   std::vector<OpaqueRec> opaque;
   std::vector<MemsetRec> memsets;
+  std::vector<HostBufferRec> host_buffers;
+  std::vector<MemcpyRec> memcpys;
   // philox offsets one replay consumes; nullopt when the host draws no
   // randomness
   std::optional<c10::SymInt> rng_increment;

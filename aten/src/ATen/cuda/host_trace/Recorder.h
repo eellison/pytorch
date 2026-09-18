@@ -36,6 +36,9 @@
 // thread-local trace capture and the trace declines by the CUDA error's name.
 // One-time initializations (a constant upload, a lazy module load) belong to
 // the warm-up call trace() makes before the symbolic run, never to the host.
+// Host-to-device data (a pointer table for a grouped kernel, ids from pinned
+// memory) goes through HostTable and copy_h2d (HostTable.h): an asynchronous
+// copy the tape describes and the replay re-issues from its own staging.
 #pragma once
 #include <ATen/core/Tensor.h>
 #include <ATen/cuda/CUDAGraph.h>
@@ -90,6 +93,7 @@ inline c10::SymFloat round_float32(const c10::SymFloat& value) {
 // cannot forbid, so the HOSTTRACE_SYNC_API lint flags the name outside the
 // recorder's own sources.
 struct HintsInternal;
+struct HostTableBase;
 template <class, size_t>
 struct IntField;
 template <class, size_t>
@@ -126,6 +130,7 @@ class TORCH_CUDA_CPP_API Hints {
   static double of(const c10::SymFloat& s);
   static bool of(const c10::SymBool& s);
   friend struct HintsInternal;
+  friend struct HostTableBase;
   friend struct Grid;
   template <class, size_t>
   friend struct IntField;

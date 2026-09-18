@@ -364,10 +364,15 @@ class TestCudaHostTraceTI(HostTraceTestCase):
             self.assertEqual(len(ours), 1)
             self.assertEqual(_family(ours[0][0]), _family(real_nodes[0][0]))
             self.assertEqual(ours[0][1:4], real_nodes[0][1:4])
-        # a contiguous copy is a memcpy in the real op: declined, not mis-traced
+        # a contiguous copy is a memcpy in the real op, and in the sibling
+        # (copy_d2d): one cudaMemcpyAsync in ordinary mode, a memcpy record and
+        # no launch under a trace
         a = torch.randn(64, device="cuda")
-        with self.assertRaisesRegex(ht.Declined, "memcpy"):
-            C._host_trace_ti_copy_(torch.empty_like(a), a)
+        b = C._host_trace_ti_copy_(torch.empty_like(a), a)
+        torch.cuda.synchronize()
+        self.assertTrue(torch.equal(b, a))
+        tape = ht.trace(lambda t: torch.empty_like(t).copy_(t), (a,))
+        self.assertEqual((tape.num_launches, len(tape.memcpys)), (0, 1))
 
     # ---- traced
 
@@ -546,8 +551,9 @@ class TestCudaHostTraceTI(HostTraceTestCase):
             ht.trace(lambda t: t * 0.5, (xi,))
         with self.assertRaisesRegex(ht.Declined, "div on Long"):
             ht.trace(lambda t: t / 2, (xi,))
-        with self.assertRaisesRegex(ht.Declined, "memcpy"):
-            ht.trace(lambda t: t.clone(), (x,))
+        # a contiguous clone is one memcpy record (copy_d2d), no launch
+        tape = ht.trace(lambda t: t.clone(), (x,))
+        self.assertEqual((tape.num_launches, len(tape.memcpys)), (0, 1))
         self.assertFalse(C._host_trace_tracing())
         tape = ht.trace(torch.add, (x, y))
         self.assertEqual(tape.num_launches, 1)
@@ -1458,11 +1464,14 @@ class TestCudaHostTraceTI(HostTraceTestCase):
             lambda B, L: make(B, L, torch.float32, True),
             [(4, 16), (4, 24), (2, 40)],
         )
-        # the out-of-place form: eager clones self first, which is a memcpy
-        # for a contiguous self (declined until a device-to-device memcpy is
-        # recorded) and a kernel copy for a strided one
-        with self.assertRaisesRegex(ht.Declined, "memcpy"):
-            ht.trace(lambda t, mask: t.masked_fill(mask == 0, 0.0), (x, m))
+        # the out-of-place form: eager clones self first, a memcpy record for
+        # a contiguous self (copy_d2d) and a kernel copy for a strided one
+        tape, _ = self._replays(
+            lambda t, mask: t.masked_fill(mask == 0, 0.0),
+            (x, m),
+            [make(4, 24, torch.float32, True), make(2, 40, torch.float32, False)],
+        )
+        self.assertEqual((tape.num_launches, len(tape.memcpys)), (2, 1))
         tape, _ = self._replays(
             lambda t, mask: t.t().masked_fill(mask.t() == 0, 0.0),
             (x, m),
@@ -1730,8 +1739,10 @@ class TestCudaHostTraceTI(HostTraceTestCase):
             [(self._values(3, 8, torch.int32),)],
         )
         self.assertEqual(tape.num_launches, 1)
-        with self.assertRaisesRegex(ht.Declined, "memcpy"):
-            ht.trace(lambda t: t.clamp(-(2**40), 2**40), (xi32,))
+        # out of place with both bounds dropped: eager's result.copy_(self), a
+        # memcpy record (copy_d2d) and no launch
+        tape = ht.trace(lambda t: t.clamp(-(2**40), 2**40), (xi32,))
+        self.assertEqual((tape.num_launches, len(tape.memcpys)), (0, 1))
         with self.assertRaisesRegex(
             RuntimeError, "Clamp min value .* is outside the representable range of Int"
         ):
@@ -1881,6 +1892,60 @@ class TestCudaHostTraceTI(HostTraceTestCase):
         nodes, _ = self._capture(lambda: torch.add(x, y))
         self.assertEqual(len(nodes), 1)
         self.assertIn(b"CUDAFunctor_add".decode(), nodes[0][0])
+
+    def test_copies_between_allocations_record_a_memcpy(self):
+        # copy_'s `src != dst` between two allocations is decided by root
+        # identity, never by the address hints (placeholders): a clone of an
+        # intermediate, empty_like(a).copy_(a) and a clone chain record the
+        # memcpy eager issues, name the pair as a root fact, and replay at
+        # other shapes
+        def clone_of_product(x):
+            return (x * 2).clone()
+
+        def clone_of_sum(x):
+            y = x + 1
+            return y.clone()
+
+        def empty_like_copy(x):
+            a = x * 2
+            return torch.empty_like(a).copy_(a)
+
+        def chain(x):
+            y = x * 2
+            for _ in range(4):
+                y = y.clone()
+            return y
+
+        x = torch.randn(8, 256, device="cuda")
+        news = [
+            (torch.randn(13, 256, device="cuda"),),
+            (torch.randn(8, 100, device="cuda"),),
+        ]
+        cases = (
+            (clone_of_product, 1),
+            (clone_of_sum, 1),
+            (empty_like_copy, 1),
+            (chain, 4),
+        )
+        for fn, memcpys in cases:
+            with self.subTest(fn=fn.__name__):
+                tape = two_hint.trace_twice(fn, (x,))
+                self.assertEqual((tape.num_launches, tape.num_memcpys), (1, memcpys))
+                pairs = [r for r in tape.root_facts if r[0] != "domain"]
+                self.assertEqual(len(pairs), memcpys)
+                variant = ht.build(tape, fn, (x,))
+                for args in ((x,), *news):
+                    got = variant.replay(args)[0]
+                    self.assertTrue(torch.equal(bits(got), bits(fn(*args))))
+
+        # an empty view into the sibling launches nothing, as eager
+        def empty_add(x):
+            return x[:0] + x[:0]
+
+        tape = ht.trace(empty_add, (x,))
+        self.assertEqual(tape.num_launches, 0)
+        variant = ht.build(tape, empty_add, (x,))
+        self.assertEqual(tuple(variant.replay((x,))[0].shape), (0, 256))
 
     def test_two_hints_name_a_value_taken_from_a_hint(self):
         # an entry that sizes its output from the batch's hint instead of its

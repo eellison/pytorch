@@ -1,6 +1,7 @@
 // The instantiated CUDA graph of a replay: the captured kernel nodes in
-// order, their argument images, the captured memset nodes in order, and one
-// entry point that pushes the nodes whose bytes changed and launches. Which
+// order, their argument images, the captured memset and memcpy nodes in
+// order, and one entry point that pushes the nodes whose bytes changed and
+// launches. Which
 // bytes change, and to what, is decided on the Python side from the tape;
 // nothing here evaluates an expression.
 //
@@ -40,10 +41,20 @@ struct MemsetUpdate {
   uint64_t bytes;
 };
 
+// a one-dimensional copy (host-to-device or device-to-device): new source,
+// destination, byte count; the node keeps its kind
+struct MemcpyUpdate {
+  size_t node;
+  uint64_t src;
+  uint64_t dst;
+  uint64_t bytes;
+};
+
 class TORCH_CUDA_CPP_API Exec {
  public:
-  // Reads the kernel and memset nodes of a captured (not yet instantiated)
-  // graph; any other node type is a TapeMismatch.
+  // Reads the kernel, memset and one-dimensional memcpy nodes (host-to-device
+  // or device-to-device) of a captured (not yet instantiated) graph; any
+  // other node is a TapeMismatch.
   Exec(at::cuda::CUDAGraph& graph, at::DeviceIndex device);
   ~Exec();
   Exec(const Exec&) = delete;
@@ -61,7 +72,7 @@ class TORCH_CUDA_CPP_API Exec {
     return deps_;
   }
   // the captured nodes in capture order as (kind, index within the kind):
-  // kind 0 kernel, 1 memset
+  // kind 0 kernel, 1 memset, 2 memcpy
   std::vector<std::pair<int, size_t>> node_kinds() const {
     return order_;
   }
@@ -79,6 +90,17 @@ class TORCH_CUDA_CPP_API Exec {
   uint64_t memset_bytes(size_t j) const;
   unsigned memset_value(size_t j) const;
 
+  // the memcpy nodes, in capture order: source, destination, byte count
+  size_t num_memcpy_nodes() const {
+    return memcpys_.size();
+  }
+  uint64_t memcpy_src(size_t j) const;
+  uint64_t memcpy_dst(size_t j) const;
+  uint64_t memcpy_bytes(size_t j) const;
+  // the captured node's kind: "h2d", "d2d", or "default" (cudaMemcpyDefault,
+  // which names no direction)
+  std::string memcpy_kind(size_t j) const;
+
   // Instantiate, then either replay once on the current stream and wait for
   // that stream only, or upload the exec without launching it (a node
   // patched before the first upload stays slow either way; a build that must
@@ -87,13 +109,17 @@ class TORCH_CUDA_CPP_API Exec {
   // One call: push the changed nodes and launch on the current stream.
   void run(
       const std::vector<NodeUpdate>& updates,
-      const std::vector<MemsetUpdate>& memset_updates = {});
+      const std::vector<MemsetUpdate>& memset_updates = {},
+      const std::vector<MemcpyUpdate>& memcpy_updates = {});
 
   int64_t dirty_nodes() const {
     return dirty_nodes_;
   }
   int64_t dirty_memset_nodes() const {
     return dirty_memset_nodes_;
+  }
+  int64_t dirty_memcpy_nodes() const {
+    return dirty_memcpy_nodes_;
   }
 
  private:
@@ -108,6 +134,10 @@ class TORCH_CUDA_CPP_API Exec {
     cudaGraphNode_t node = nullptr;
     cudaMemsetParams params{};
   };
+  struct MemcpyState {
+    cudaGraphNode_t node = nullptr;
+    cudaMemcpy3DParms params{};
+  };
   at::DeviceIndex device_;
   at::cuda::CUDAGraph* graph_ = nullptr;
   cudaGraphExec_t exec_ = nullptr;
@@ -116,8 +146,10 @@ class TORCH_CUDA_CPP_API Exec {
   std::vector<std::vector<int64_t>> deps_;
   std::vector<std::pair<int, size_t>> order_;
   std::vector<MemsetState> memsets_;
+  std::vector<MemcpyState> memcpys_;
   int64_t dirty_nodes_ = 0;
   int64_t dirty_memset_nodes_ = 0;
+  int64_t dirty_memcpy_nodes_ = 0;
 };
 
 } // namespace at::cuda::host_trace

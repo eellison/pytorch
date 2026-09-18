@@ -10,6 +10,7 @@
 #include <ATen/native/Copy.h>
 #include <ATen/native/TensorIterator.h>
 #include <ATen/native/cuda/Loops.cuh>
+#include <ATen/cuda/host_trace/HostTable.h>
 #include <ATen/cuda/host_trace/ti/LoopsSym.cuh>
 #include <ATen/cuda/host_trace/ti/Ops.h>
 
@@ -512,8 +513,9 @@ REGISTER_DISPATCH(copy_stub, &copy_kernel_cuda)
 // kernel branch (direct_copy_kernel_cuda for two CUDA tensors of one dtype). It lives in this
 // translation unit so that its launches are the instantiations the host above makes: the
 // replay's kernel nodes hold the function handle eager's do, not only its name. The real op
-// copies a contiguous pair with a memcpy rather than a kernel; that case declines, so the tape
-// and the real capture always agree on the kernel nodes.
+// copies a contiguous pair with a cudaMemcpyAsync rather than a kernel (copy_device_to_device),
+// and so does the sibling, through copy_d2d (HostTable.h): a memcpy record on the tape, a
+// memcpy node in the replay's capture.
 namespace at::cuda::host_trace::ti {
 
 Tensor& copy_traced(Tensor& dst, const Tensor& src) {
@@ -535,7 +537,17 @@ Tensor& copy_traced(Tensor& dst, const Tensor& src) {
   iter.add_input(src);
   iter.build(config);
   if (iter.is_contiguous()) {
-    decline("host_trace: a contiguous copy_ is a memcpy in the CUDA copy kernel, not a launch; not traced (declined)");
+    // copy_device_to_device's memcpy_eligible branch: one cudaMemcpyAsync of
+    // the whole extent, nothing when the two addresses are one (each
+    // comparison a guard of the trace)
+    if (iter.numel() != 0 && iter.data_ptr(0) != iter.data_ptr(1)) {
+      copy_d2d(
+          iter.data_ptr(0),
+          iter.data_ptr(1),
+          iter.numel() * iter.element_size(0),
+          at::cuda::getCurrentCUDAStream());
+    }
+    return dst;
   }
   AT_DISPATCH_ALL_TYPES_AND3(kHalf, kBFloat16, kBool, iter.common_dtype(), "copy_traced", [&] {
     gpu_kernel(iter, at::native::CopyFunctor<scalar_t>{});

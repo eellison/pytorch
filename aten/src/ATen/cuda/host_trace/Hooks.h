@@ -25,5 +25,12 @@ struct Hooks {
       bool positive) = nullptr;
 };
 TORCH_CUDA_CPP_API void set_hooks(const Hooks& h);
+// A fresh integer symbol with this hint (an opaque result, a host table's
+// address), minted by the Python side of the trace in progress; `positive`
+// is the declared domain (>= 1) of an opaque result.
+TORCH_CUDA_CPP_API c10::SymInt mint_int_symbol(
+    int64_t hint,
+    const std::string& name,
+    bool positive = false);
 
 } // namespace at::cuda::host_trace::hooks

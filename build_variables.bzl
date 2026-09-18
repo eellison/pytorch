@@ -1619,6 +1619,7 @@ aten_cuda_cu_source_list = [
     "aten/src/ATen/cuda/tunable/StreamTimer.cpp",
     "aten/src/ATen/cuda/tunable/Tunable.cpp",
     "aten/src/ATen/cuda/host_trace/Exec.cpp",
+    "aten/src/ATen/cuda/host_trace/HostTable.cpp",
     "aten/src/ATen/cuda/host_trace/Recorder.cpp",
     "aten/src/ATen/cuda/host_trace/ti/TensorIteratorSym.cpp",
     "aten/src/ATen/native/cuda/Activation.cpp",

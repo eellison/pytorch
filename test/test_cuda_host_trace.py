@@ -3603,7 +3603,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         x, w, b = self._inputs(8)
         for args, message in (
             ((torch.empty(0, self.N, device="cuda", dtype=x.dtype), w, b), "empty"),
-            ((x.cpu(), w, b), "on cpu"),
+            ((x.cpu(), w, b), "pageable"),
             ((torch._neg_view(x), w, b), "negative view"),
             (([self.N], 1e-5), "no tensor arguments"),
         ):
