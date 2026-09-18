@@ -311,12 +311,13 @@ class TestCudaHostTraceFlash(TestCase):
             else:
                 self.assertIsNone(variant.try_replay(new_args))
 
-    def test_dropout_declines_by_name(self):
+    def test_dropout_declares_its_increment(self):
+        # the host declares b * h * 32 philox offsets per call (rng_increment);
+        # the sequence equality with eager is test_cuda_host_trace_rng.py's
         q, k, v = self._qkv(2, 128, 128, H=8)
-        with self.assertRaisesRegex(RuntimeError, "dropout is not traceable"):
-            ht.trace(flash_dropout, (q, k, v, 0.1))
+        variant = ht.trace(flash_dropout, (q, k, v, 0.1))
+        self.assertIsNotNone(variant.rng_increment)
         self.assertFalse(torch._C._host_trace_tracing())
-        # the ordinary path is unchanged
         out = flash_dropout(q, k, v, 0.1)
         self.assertEqual(out[0].shape, q.shape)
 

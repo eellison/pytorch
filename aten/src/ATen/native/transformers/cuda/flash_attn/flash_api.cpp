@@ -563,13 +563,12 @@ mha_fwd(const at::Tensor &q,         // batch_size x seqlen_q x num_heads x head
         // number of times random will be generated per thread, to offset philox counter in thc random
         // state
         // We use a custom RNG that increases the offset by batch_size * nheads * 32.
-        TORCH_CHECK(ht::active() == nullptr, "host_trace: flash attention with dropout is not traceable (the generator increment is not recorded)");
-        int64_t counter_offset = (params.b * params.h * 32).guard_int(__FILE__, __LINE__);
+        int64_t counter_offset = ht::rng_increment(params.b * params.h * 32);
         // See Note [Acquire lock when using random generators]
         std::lock_guard<std::mutex> lock(gen->mutex_);
         at::PhiloxCudaState philox_state = gen->philox_cuda_state(counter_offset);
         rng_state = at::empty({2}, at::TensorOptions().dtype(c10::kUInt64).device(at::kCUDA));
-        params.rng_state = reinterpret_cast<uint64_t*>(rng_state.data_ptr());
+        params.rng_state = ht::sym_mutable_data_ptr(rng_state);
         new (params.philox_args) at::PhiloxCudaState(philox_state);
     }
 
@@ -808,13 +807,12 @@ mha_varlen_fwd(const at::Tensor &q,  // total_q x num_heads x head_size, total_q
         // number of times random will be generated per thread, to offset philox counter in thc random
         // state
         // We use a custom RNG that increases the offset by batch_size * nheads * 32.
-        TORCH_CHECK(ht::active() == nullptr, "host_trace: flash attention with dropout is not traceable (the generator increment is not recorded)");
-        int64_t counter_offset = (params.b * params.h * 32).guard_int(__FILE__, __LINE__);
+        int64_t counter_offset = ht::rng_increment(params.b * params.h * 32);
         // See Note [Acquire lock when using random generators]
         std::lock_guard<std::mutex> lock(gen->mutex_);
         at::PhiloxCudaState philox_state = gen->philox_cuda_state(counter_offset);
         rng_state = at::empty({2}, at::TensorOptions().dtype(c10::kUInt64).device(at::kCUDA));
-        params.rng_state = reinterpret_cast<uint64_t*>(rng_state.data_ptr());
+        params.rng_state = ht::sym_mutable_data_ptr(rng_state);
         new (params.philox_args) at::PhiloxCudaState(philox_state);
     }
 

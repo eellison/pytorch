@@ -7,6 +7,8 @@
 // functor (DECISIONS E36); add's is generated into UfuncCUDA_add.cu with
 // eager's host (HostTraceSiblingOps.h declares it).
 #pragma once
+#include <optional>
+#include <tuple>
 #include <ATen/core/Tensor.h>
 #include <c10/core/Scalar.h>
 
@@ -24,6 +26,9 @@ TORCH_CUDA_CU_API Tensor mul_traced(const Tensor& self, const Tensor& other, con
 TORCH_CUDA_CU_API Tensor div_traced(const Tensor& self, const Tensor& other, const Tensor& out = {});
 TORCH_CUDA_CU_API Tensor silu_traced(const Tensor& self);
 TORCH_CUDA_CU_API Tensor gelu_traced(const Tensor& self, std::string_view approximate);
+// native_dropout (train mode): (output, bool mask); the philox increment is
+// declared on the tape as an expression of the element count
+TORCH_CUDA_CU_API std::tuple<Tensor, Tensor> native_dropout_traced(const Tensor& self, double p, std::optional<bool> train);
 TORCH_CUDA_CU_API Tensor& copy_traced(Tensor& dst, const Tensor& src);
 TORCH_CUDA_CU_API Tensor reciprocal_traced(const Tensor& self);
 TORCH_CUDA_CU_API Tensor tanh_traced(const Tensor& self);

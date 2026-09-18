@@ -225,10 +225,20 @@ struct TORCH_CUDA_CPP_API TraceState {
   LaunchPacket open;
   bool open_active = false;
   // generator accounting: the default CUDA generator's offset when the trace
-  // began; finish_trace compares what the host consumed with rng_increment
+  // began; finish_trace compares what the host consumed with the declared
+  // increments (rng_increment_hint is their sum, -1 when none was declared)
   uint64_t rng_offset_before = 0;
   int64_t rng_increment_hint = -1;
   uint64_t rng_consumed = 0;
+  // one entry per rng_increment call, in host order, with the index of the
+  // launch that follows it; finish_trace pairs them with the launches whose
+  // arguments carry a philox state (Tape.h RngSlotRec)
+  struct RngDecl {
+    c10::SymInt increment;
+    int64_t hint;
+    size_t first_launch;
+  };
+  std::vector<RngDecl> rng_decls;
 };
 
 TORCH_CUDA_CPP_API TraceState* active();
@@ -363,8 +373,13 @@ TORCH_CUDA_CPP_API c10::SymInt opaque(
     int64_t traced_value,
     const char* domain = "int");
 // The philox increment a host hands to the generator: the concrete count the
-// generator API needs, and in trace mode the value on the tape.
-// finish_trace declines a host that consumed offsets without declaring it.
+// generator API needs, and in trace mode the value on the tape. Declared
+// once per random launch, before it; the launch that follows must receive a
+// philox state through an `rng` field (a proxy's PhiloxCudaState). The tape's
+// increment is the sum; each launch's intragraph offset becomes the prefix
+// sum before it (Tape.h RngSlotRec). finish_trace declines a host that
+// consumed offsets without declaring them, declared without a random launch
+// following, or handed a kernel a philox state without a declaration.
 TORCH_CUDA_CPP_API int64_t rng_increment(const c10::SymInt& v);
 
 // cudaMemsetAsync(dst, value, nbytes, stream) on a traced allocation (the

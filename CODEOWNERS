@@ -618,6 +618,7 @@
 # /test/test_cuda_host_trace_h2d.py
 # /test/test_cuda_host_trace_ops7.py
 # /test/test_cuda_host_trace_reduce.py
+# /test/test_cuda_host_trace_rng.py
 # /test/test_cuda_host_trace_ti.py
 # /test/test_cuda_multigpu.py
 # /test/test_cuda_nvml_based_avail.py

@@ -3,12 +3,14 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/host_trace/Hooks.h>
 #include <ATen/cuda/CUDAGeneratorImpl.h>
+#include <ATen/cuda/PhiloxCudaState.h>
 #include <c10/core/impl/LocalDispatchKeySet.h>
 #include <c10/cuda/CUDACachingAllocator.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/util/Exception.h>
 
 #include <algorithm>
+#include <cstddef>
 #include <cstring>
 #include <mutex>
 
@@ -536,12 +538,18 @@ int64_t rng_increment(const c10::SymInt& v) {
   if (s == nullptr) {
     return v.expect_int();
   }
-  TORCH_CHECK(
-      !s->t->rng_increment.has_value(),
-      "host_trace: rng_increment declared twice in one host");
-  s->t->rng_increment = v;
-  s->rng_increment_hint = HintsInternal::of(v);
-  return s->rng_increment_hint;
+  const int64_t hint = HintsInternal::of(v);
+  // the next launch to be recorded: an open verbatim packet is not pushed
+  // until it closes, so packets.size() is its index either way
+  s->rng_decls.push_back({v, hint, s->packets.size()});
+  if (s->t->rng_increment.has_value()) {
+    s->t->rng_increment = *s->t->rng_increment + v;
+    s->rng_increment_hint += hint;
+  } else {
+    s->t->rng_increment = v;
+    s->rng_increment_hint = hint;
+  }
+  return hint;
 }
 
 // A typed launch record: complete at the call; the node comes from the
@@ -760,7 +768,7 @@ void check_rng_consumption(TraceState* s) {
   if (s->rng_increment_hint >= 0) {
     HT_DECLINE_UNLESS(
         static_cast<uint64_t>(s->rng_increment_hint) == s->rng_consumed,
-        "host_trace: rng_increment declares ",
+        "host_trace: the rng_increment declarations sum to ",
         s->rng_increment_hint,
         " philox offsets but the host consumed ",
         s->rng_consumed,
@@ -774,6 +782,117 @@ void check_rng_consumption(TraceState* s) {
         "read as at::cuda::host_trace::rng_increment(expr) so the tape carries "
         "the value (declined)");
   }
+}
+
+// Pair the rng_increment declarations with the launches whose arguments carry
+// a philox state (an `rng` field), in host order, and give each such launch a
+// u64 param over the state's intragraph offset whose value is the prefix sum
+// of the earlier declarations: at another shape every random kernel then
+// starts where eager's would, and the generator advances by the sum. The
+// pairing is checked against the generator's own accounting: under the trace
+// capture philox_cuda_state hands each declaration the intragraph offset the
+// earlier declarations summed to, so the state a launch carries names the
+// declaration that produced it, and a launch carrying another declaration's
+// state (declared A then B, launched B's kernel first) declines.
+void attach_rng_slots(TraceState* s) {
+  constexpr size_t kIntragraph =
+      offsetof(at::PhiloxCudaState, offset_intragraph_);
+  constexpr size_t kIntragraphSize =
+      sizeof(at::PhiloxCudaState::offset_intragraph_);
+  constexpr size_t kCaptured = offsetof(at::PhiloxCudaState, captured_);
+  static_assert(
+      kIntragraph + kIntragraphSize <= kCaptured, "PhiloxCudaState layout");
+  size_t d = 0;
+  c10::SymInt prefix(0);
+  uint64_t prefix_hint = s->rng_offset_before;
+  for (size_t j = 0; j < s->t->launches.size(); ++j) {
+    LaunchRec& L = s->t->launches[j];
+    std::vector<size_t> rng_fields;
+    for (size_t k = 0; k < L.params.size(); ++k) {
+      if (L.params[k].kind == "rng") {
+        HT_DECLINE_UNLESS(
+            L.params[k].size >= sizeof(at::PhiloxCudaState),
+            "host_trace: the `rng` field of `",
+            L.kernel,
+            "` is smaller than a PhiloxCudaState (declined)");
+        rng_fields.push_back(k);
+      }
+    }
+    if (rng_fields.empty()) {
+      continue;
+    }
+    HT_DECLINE_UNLESS(
+        d < s->rng_decls.size() && s->rng_decls[d].first_launch <= j,
+        "host_trace: `",
+        L.kernel,
+        "` received a philox state without an rng_increment declaration "
+        "before it (declined)");
+    for (size_t k : rng_fields) {
+      const size_t off = L.params[k].offset;
+      const size_t total = L.params[k].size;
+      const uint8_t* state = L.hint_image.data() + off;
+      uint64_t intragraph = 0;
+      std::memcpy(&intragraph, state + kIntragraph, kIntragraphSize);
+      HT_DECLINE_UNLESS(
+          state[kCaptured] != 0,
+          "host_trace: `",
+          L.kernel,
+          "` received a philox state that is not the capture's generator "
+          "state (declined)");
+      HT_DECLINE_UNLESS(
+          intragraph == prefix_hint,
+          "host_trace: `",
+          L.kernel,
+          "` received the philox state of another rng_increment declaration: "
+          "its intragraph offset is ",
+          intragraph,
+          " but the declaration paired with it in host order (number ",
+          d,
+          ") produced ",
+          prefix_hint,
+          " (declined)");
+      // On the tape the state's seed / offset pointers (the capture's own
+      // generator tensors, refilled by CUDAGraph::replay) and the bytes after
+      // the flag (padding) stay `rng`, exempt from the build's byte check;
+      // the intragraph offset is a param the replay writes and the flag a
+      // constant, both byte-checked at the build like every other param.
+      L.params[k].size = kIntragraph;
+      L.params.push_back(
+          {off + kIntragraph,
+           kIntragraphSize,
+           kIntragraphSize == 8 ? "u64" : "u32",
+           SymVal::of(prefix),
+           "philox_offset_intragraph",
+           ""});
+      L.params.push_back(
+          {off + kCaptured, 1, "u8", SymVal::of_int(1), "philox_captured", ""});
+      if (kCaptured + 1 < total) {
+        L.params.push_back(
+            {off + kCaptured + 1,
+             total - kCaptured - 1,
+             "rng",
+             SymVal::of_int(0),
+             "philox_tail",
+             ""});
+      }
+      s->t->rng_slots.push_back(
+          {static_cast<int64_t>(j),
+           off + kIntragraph,
+           kIntragraphSize,
+           s->rng_decls[d].increment});
+    }
+    prefix = prefix + s->rng_decls[d].increment;
+    prefix_hint += static_cast<uint64_t>(s->rng_decls[d].hint);
+    ++d;
+  }
+  HT_DECLINE_UNLESS(
+      d == s->rng_decls.size(),
+      "host_trace: rng_increment was declared ",
+      s->rng_decls.size(),
+      " time(s) but only ",
+      d,
+      " launch(es) received a philox state through an `rng` field: a random "
+      "kernel must take its PhiloxCudaState through a proxy field (declined)");
 }
 
 const char* node_type_name(cudaGraphNodeType type) {
@@ -937,6 +1056,7 @@ void finish_trace(TraceState* s) {
         "` differs from the launch() record");
     emit_typed(s, info, pk);
   }
+  attach_rng_slots(s);
   s->packets.clear();
   s->capture_graph.reset(); // destroys the template and releases the pool
 }

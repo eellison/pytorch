@@ -96,6 +96,25 @@ build uploads its exec instead of launching it once). With warm_up=True a
 build runs the function twice on the variant's own stream and launches the
 exec once at instantiation.
 
+Randomness. A host that draws declares each random launch's philox increment
+(rng_increment) before it; a function may contain several random launches.
+The tape carries every slot and their sum: a replay sets the sum as the
+graph's generator increment and hands each random kernel the prefix sum
+before it as its intragraph offset, so the streams and the generator state
+after the call equal eager's at every shape. The trace and the build consume
+randomness of their own, deterministically: with warm_up=True the trace
+advances the generator by one call's increment (the warm-up; the symbolic
+run under capture draws nothing) and the build by three (two ordinary calls
+and the instantiating replay); with warm_up=False the trace advances it by
+nothing and the build by nothing either (no ordinary calls, the exec uploaded
+rather than launched). A program that traces mid-stream with the warm-ups
+therefore continues from a different generator state than the untraced
+program; reseed after the build when the stream matters, or serve the call
+ordinarily first and trace and build without warm-up, which leaves the
+generator where eager leaves it (the exactly-once contract). A tape is bound
+to its device class: hosts fold the SM count into values (dropout's grid cap
+and increment), so a build on a device with another SM count misses.
+
 Every branch on a size is guarded on the value the trace saw, including the
 size-1 branches of the view code: a squeeze of a symbolic dim traced at size 1
 pins the tape to size 1, and traced at size 8 misses at size 1. Contiguity and
@@ -2012,6 +2031,10 @@ class Tape:
         # replay writes, so its binding materializes a copy-on-write tensor
         # first, as eager's mutable read does (A98)
         self.written_roots: list[str] = list(records["written_roots"])
+        # one slot per random launch (Tape.h RngSlotRec): the launch index, the
+        # u32 param over its philox state's intragraph offset, and its own
+        # increment; rng_increment is their sum
+        self.rng_slots = records["rng_slots"]
         # cudaMemsetAsync calls the host issued (a split reduction's semaphore
         # reset): memset nodes of the build's capture, paired by order
         self.memsets = records["memsets"]
@@ -2095,6 +2118,8 @@ class Tape:
             m["src"], m["dst"] = sub(m["src"]), sub(m["dst"])
             m["bytes"] = sub(m["bytes"])
         self.rng_increment = sub(self.rng_increment)
+        for slot in self.rng_slots:
+            slot["increment"] = sub(slot["increment"])
 
     @property
     def num_launches(self) -> int:
@@ -2261,6 +2286,15 @@ class Tape:
             if self.rng_increment is not None
             else None,
             "all_on_capture_stream": self.all_on_capture_stream,
+            "rng_slots": [
+                {
+                    "launch": r["launch"],
+                    "offset": r["offset"],
+                    "size": r["size"],
+                    "increment": e(r["increment"]),
+                }
+                for r in self.rng_slots
+            ],
             "hints": hints,
         }
         return d
@@ -2980,6 +3014,11 @@ class Variant:
         # an output over an input's storage finds its argument by root name
         self._input_positions = {i.root.name: i.position for i in tape.inputs}
         self.prog = _Program(tape)
+        # per launch, the capture's bytes of its `rng` ranges: the philox seed
+        # and offset pointers are the build capture's per-capture generator
+        # words, which a pushed image must keep naming (the tape's are the
+        # trace capture's, freed when the trace ended)
+        self._rng_bytes: dict[int, list[tuple[int, int, bytes]]] = {}
         self.calls = 0
         # replay keeps per-node dirty state (_last); one call at a time
         self._lock = threading.Lock()
@@ -3081,6 +3120,8 @@ class Variant:
             image[p["offset"] : p["offset"] + p["size"]] = _pack(
                 p["kind"], self.prog.ev(v, env)
             )
+        for lo, hi, captured in self._rng_bytes.get(j, ()):
+            image[lo:hi] = captured
         grid = tuple(int(self.prog.ev(g, env)) for g in L["grid"])
         block = tuple(int(self.prog.ev(b, env)) for b in L["block_expr"])
         smem = int(self.prog.ev(L["smem"], env))
@@ -3312,6 +3353,11 @@ class Variant:
                     raise TapeMismatch(
                         f"launch {j} ({L['kernel']}): byte {b} differs between the tape and the capture"
                     )
+            if rng:
+                # the exec's image from here on: the capture's philox words
+                # in every image this variant renders (_launch_state)
+                self._rng_bytes[j] = [(lo, hi, bytes(got[lo:hi])) for lo, hi in rng]
+                image, grid, block, smem = self._launch_state(j, env)
             if (
                 tuple(exec_.grid(nid)) != grid
                 or tuple(exec_.block(nid)) != block
@@ -3450,6 +3496,15 @@ class Variant:
                 new_memcpys[nid] = state
                 memcpy_updates.append((nid, *state))
         with torch.cuda.device(self.device):
+            if self.tape.rng_increment is not None:
+                # the host declared how many philox offsets one call consumes
+                # as an expression (rng_increment); the graph's replay prologue
+                # advances the default generator by the value set here, so the
+                # generator moves exactly as the ordinary host would move it
+                increment = int(self.prog.ev(self.tape.rng_increment, env))
+                self.graph.set_generator_increment(
+                    torch.cuda.default_generators[self.device], increment
+                )
             try:
                 self.exec.run(updates, memset_updates, memcpy_updates)
             except BaseException:

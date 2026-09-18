@@ -178,6 +178,12 @@ struct TORCH_CUDA_CPP_API CUDAGeneratorImpl : public c10::GeneratorImpl {
   // current state
   PhiloxCudaState philox_cuda_state(uint64_t increment);
 
+  // The graph-safe state this generator draws from. A capture registers it
+  // with the CUDAGraph; CUDAGraph::set_generator_increment looks it up.
+  const c10::intrusive_ptr<CUDAGeneratorState>& state() const {
+    return state_;
+  }
+
   bool reset_rnn_state() {
     return !no_reset_rnn_state_.test_and_set();
   }

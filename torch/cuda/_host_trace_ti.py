@@ -311,7 +311,18 @@ register_traced_entry(
     aten.sqrt.default, _unary(aten.sqrt.default, _C._host_trace_ti_sqrt)
 )
 register_traced_entry(aten.pow.Tensor_Scalar, _pow_tensor_scalar)
+
+
+def _native_dropout(self, p, train):
+    # Dropout.cu's fused kernel through the sibling (train mode only): the
+    # philox increment is an expression of the element count on the tape and
+    # the replay sets it on the graph before each call (commit 9)
+    _cuda_operands(aten.native_dropout.default, self)
+    return _C._host_trace_ti_native_dropout(self, float(p), train)
+
+
 register_traced_entry(aten.clone.default, _clone)
+register_traced_entry(aten.native_dropout.default, _native_dropout)
 
 
 # ---- fills (FillKernel.cu's entry): fill_ and zero_ on a tensor, and the factories

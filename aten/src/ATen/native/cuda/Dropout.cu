@@ -474,3 +474,153 @@ Tensor masked_scale_cuda(const Tensor& self, const Tensor& mask, double scale){
 // cuda/host_trace/ti/siblings.yaml or the op's ufunc_inner_loop; the entry, its proxies and
 // its strided views. Outside a trace it runs the same launches in ordinary mode.
 #include <ATen/HostTraceSibling_native_dropout_backward.cuh>
+
+// ---- host tracing (ATen/cuda/host_trace): the traced sibling of dropout_cuda and its launcher,
+// compiled here so the sibling and the real host above instantiate the one kernel
+// (fused_dropout_kernel_vec / fused_dropout_kernel, this file's anonymous namespace; DECISIONS
+// E36): the tape's launch is eager's function object, not a twin. The kernel's TensorInfo
+// arguments are the one-dimensional proxies the real host's collapseDims leaves (contiguous
+// inputs only; anything else declines by name). The philox state travels as an `rng` field:
+// capture-time generator state the replay never rewrites. The increment the host hands the
+// generator is declared with rng_increment, so the tape carries it as an expression of the
+// element count. Outside a trace the entry runs the same launches in ordinary mode, which is how
+// the parity test compares it with the real op.
+#include <ATen/cuda/host_trace/Field.h>
+#include <ATen/cuda/host_trace/Launch.h>
+#include <ATen/cuda/host_trace/Recorder.h>
+#include <ATen/cuda/host_trace/ti/EagerViews.cuh>
+#include <ATen/cuda/host_trace/ti/Ops.h>
+
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
+
+#include <cstddef>
+#include <limits>
+#include <mutex>
+
+namespace at::cuda::host_trace::ti {
+
+namespace {
+
+// A one-dimensional TensorInfo: data (a pointer from sym_*_data_ptr),
+// sizes[0] = the element count, strides[0] = 1, dims = 1, the shape the real
+// host's collapseDims leaves for a contiguous tensor; the other entries stay
+// zero (the real host leaves them unwritten).
+template <typename Info>
+void flat_info(Info& info, const c10::SymInt& data, const c10::SymInt& numel) {
+  info.data = data;
+  info.sizes[0] = numel;
+  info.strides[0] = 1;
+  info.set_dims(1);
+}
+
+// The philox state as a kernel argument: generator state of the capture,
+// recorded as an `rng` field (never rewritten, never compared) like flash's
+// Flash_fwd_params::philox_args.
+struct TracedPhilox : TracedBase {
+  PhiloxCudaState pod;
+  BytesField<0, sizeof(PhiloxCudaState)> bytes{this, "philox_args"};
+  explicit TracedPhilox(const PhiloxCudaState& st) : TracedBase(&pod, sizeof(PhiloxCudaState)), pod() {
+    new (static_cast<void*>(bytes)) PhiloxCudaState(st);
+  }
+};
+
+// memory::can_vectorize_up_to on the input pointer, as guards on its
+// address; the fresh outputs are allocation roots (256-byte aligned).
+template <typename scalar_t>
+int traced_vector_size(const Tensor& self, const c10::SymInt& self_ptr, const c10::SymInt& numel) {
+  const int optimal = 16 / static_cast<int>(sizeof(scalar_t));
+  int vec_size = 1;
+  for (int v = optimal; v > 1; v /= 2) {
+    if ((self_ptr % c10::SymInt(v * static_cast<int64_t>(sizeof(scalar_t)))).sym_eq(0).guard_bool(__FILE__, __LINE__)) {
+      vec_size = v;
+      break;
+    }
+  }
+  // no remainders: prefer a smaller vector with none over a larger one with one
+  while (vec_size > 1 && !(numel % c10::SymInt(vec_size)).sym_eq(0).guard_bool(__FILE__, __LINE__)) {
+    vec_size /= 2;
+  }
+  return vec_size;
+}
+
+} // namespace
+
+std::tuple<Tensor, Tensor> native_dropout_traced(const Tensor& self, double p, std::optional<bool> train) {
+  if (train.has_value() && !train.value()) {
+    decline("host_trace: native_dropout with train=False is not traced (declined)");
+  }
+  if (p == 1) {
+    decline("host_trace: native_dropout with p == 1 is not traced (declined)");
+  }
+  if (!at::isFloatingType(self.scalar_type())) {
+    decline(c10::str("host_trace: native_dropout on ", self.scalar_type(), " is not traced (declined)"));
+  }
+  if (!self.is_contiguous()) {
+    decline("host_trace: native_dropout on a non-contiguous input is not traced (declined)");
+  }
+  const c10::SymInt nelem = self.sym_numel();
+  if (nelem.sym_eq(0).guard_bool(__FILE__, __LINE__)) {
+    decline("host_trace: native_dropout on an empty input is not traced (declined)");
+  }
+  if (!nelem.sym_lt(c10::SymInt(std::numeric_limits<int>::max())).guard_bool(__FILE__, __LINE__)) {
+    decline("host_trace: native_dropout above 2^31 elements (64-bit indexing) is not traced (declined)");
+  }
+  const double p1m = 1. - p;
+  c10::cuda::CUDAGuard device_guard(self.device());
+  Tensor mask = at::empty_like(self, self.options().dtype(c10::CppTypeToScalarType<bool>::value));
+  Tensor ret = at::empty_like(self);
+
+  const int64_t block_size = 256;
+  const auto* props = at::cuda::getCurrentDeviceProperties();
+  const unsigned int blocks_per_sm = props->maxThreadsPerMultiProcessor / block_size;
+  const c10::SymInt grid_cap(static_cast<int64_t>(props->multiProcessorCount) * blocks_per_sm);
+  const c10::SymInt grid_x = ((nelem + (block_size - 1)) / block_size).min(grid_cap);
+  const c10::SymInt counter_offset = ((nelem - 1) / (block_size * grid_x * at::native::UNROLL) + 1) * at::native::UNROLL;
+  const int64_t increment = rng_increment(counter_offset);
+
+  auto* gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(std::nullopt, at::cuda::detail::getDefaultCUDAGenerator());
+  PhiloxCudaState rng_engine_inputs;
+  {
+    std::lock_guard<std::mutex> lock(gen->mutex_);
+    rng_engine_inputs = gen->philox_cuda_state(increment);
+  }
+  const c10::SymInt self_ptr = sym_const_data_ptr(self);
+  const c10::SymInt ret_ptr = sym_mutable_data_ptr(ret);
+  const c10::SymInt mask_ptr = sym_mutable_data_ptr(mask);
+  auto stream = at::cuda::getCurrentCUDAStream();
+  Grid grid(grid_x);
+  const Block block{c10::SymInt(block_size)};
+
+  AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, self.scalar_type(), "native_dropout_traced", [&] {
+    using accscalar_t = at::acc_type<scalar_t, true>;
+    using index_type = unsigned int;
+    accscalar_t pa = (accscalar_t)(p1m);
+    Traced<at::cuda::detail::TensorInfo<const scalar_t, index_type>> a;
+    Traced<at::cuda::detail::TensorInfo<scalar_t, index_type>> b;
+    Traced<at::cuda::detail::TensorInfo<bool, index_type>> c;
+    flat_info(a, self_ptr, nelem);
+    flat_info(b, ret_ptr, nelem);
+    flat_info(c, mask_ptr, nelem);
+    TracedPhilox philox(rng_engine_inputs);
+    const int vec_size = traced_vector_size<scalar_t>(self, self_ptr, nelem);
+    switch (vec_size) {
+      case 8:
+        launch(at::native::fused_dropout_kernel_vec<scalar_t, accscalar_t, index_type, 1, 8, bool>, grid, block, 0, stream, a, b, c, nelem, pa, philox);
+        break;
+      case 4:
+        launch(at::native::fused_dropout_kernel_vec<scalar_t, accscalar_t, index_type, 1, 4, bool>, grid, block, 0, stream, a, b, c, nelem, pa, philox);
+        break;
+      case 2:
+        launch(at::native::fused_dropout_kernel_vec<scalar_t, accscalar_t, index_type, 1, 2, bool>, grid, block, 0, stream, a, b, c, nelem, pa, philox);
+        break;
+      default:
+        launch(at::native::fused_dropout_kernel<scalar_t, accscalar_t, index_type, 1, 1, bool>, grid, block, 0, stream, a, b, c, nelem, pa, philox);
+        break;
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  });
+  return std::tuple<Tensor, Tensor>(std::move(ret), std::move(mask));
+}
+
+} // namespace at::cuda::host_trace::ti

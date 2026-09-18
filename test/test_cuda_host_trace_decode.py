@@ -460,16 +460,30 @@ class TestCudaHostTraceDecode(HostTraceTestCase):
                 self.assertTrue(torch.equal(g, w))
 
     def test_forward_and_backward_with_dropout_in_one_trace(self):
-        # the forward's philox increment (b * h * 32) is declared by the
-        # randomness commit (commit 9), so here the trace declines by name at
-        # the dropout; that commit restores the served path (the backward
-        # re-derives the mask from the forward's rng_state)
+        # the forward declares its philox increment (b * h * 32); the backward
+        # re-derives the mask from the rng_state the forward kernel stored and
+        # declares nothing: per replay the generator advances by one eager
+        # call's amount and the gradients equal eager's from the same seed
         fwd_bwd = self._sdpa_fwd_bwd(0.1)
         args = self._sdpa_case(2, 128, 0)
-        with self.assertRaisesRegex(
-            ht.Declined, "flash attention with dropout is not traceable"
-        ):
-            ht.trace(fwd_bwd, args)
+        tape = ht.trace(fwd_bwd, args)
+        self.assertIsNotNone(tape.rng_increment)
+        _assert_same_kernels(self, tape, fwd_bwd, args)
+        variant = ht.build(tape, fwd_bwd, args)
+        gen = torch.cuda.default_generators[torch.cuda.current_device()]
+        for B, L, seed in [(2, 128, 1), (3, 256, 2), (4, 128, 3)]:
+            new_args = self._sdpa_case(B, L, seed)
+            torch.manual_seed(seed)
+            before = gen.get_offset()
+            want = fwd_bwd(*new_args)
+            advance = gen.get_offset() - before
+            self.assertEqual(advance, 32 * B * H)
+            torch.manual_seed(seed)
+            got = variant.replay(new_args)
+            torch.cuda.synchronize()
+            self.assertEqual(gen.get_offset() - before, advance)
+            for g, w in zip(got, want):
+                self.assertTrue(torch.equal(g, w))
 
     def test_every_case_traces_the_same_program_under_other_hints(self):
         # the recorder never reads a hint: every trace this class makes, made

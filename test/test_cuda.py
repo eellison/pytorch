@@ -3846,6 +3846,76 @@ torch.cuda.synchronize()
     @unittest.skipIf(
         not TEST_CUDA_GRAPH, "CUDA >= 11.0 or ROCM >= 5.3 required for graphs"
     )
+    def test_graph_set_generator_increment(self):
+        # A capture records how many philox offsets its kernels consume and
+        # every replay advances the generator by that amount. A graph whose
+        # random consumption changes between replays (a batch that grows
+        # through kernel parameter updates) sets the increment the kernels
+        # will actually consume; the offset arithmetic must be exact.
+        gen = torch.cuda.default_generators[torch.cuda.current_device()]
+        x = torch.empty(4, 32, device="cuda")
+        y = torch.empty(4, 32, device="cuda")
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            x.uniform_()
+            y.uniform_()
+        torch.cuda.current_stream().wait_stream(s)
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            x.uniform_()
+            y.uniform_()
+        offset0 = gen.get_offset()
+        g.replay()
+        torch.cuda.synchronize()
+        captured = gen.get_offset() - offset0
+        self.assertGreater(captured, 4)
+        self.assertEqual(captured % 4, 0)
+        first = (x.clone(), y.clone())
+
+        g.set_generator_increment(gen, 2 * captured)
+        before = gen.get_offset()
+        g.replay()
+        torch.cuda.synchronize()
+        self.assertEqual(gen.get_offset() - before, 2 * captured)
+        self.assertFalse(torch.equal(x, first[0]))
+        second = (x.clone(), y.clone())
+
+        # Consuming more than the set increment overlaps streams; the setter
+        # applies exactly what it was given either way.
+        g.set_generator_increment(gen, 4)
+        before = gen.get_offset()
+        g.replay()
+        torch.cuda.synchronize()
+        self.assertEqual(gen.get_offset() - before, 4)
+        self.assertFalse(torch.equal(x, second[0]))
+        third = (x.clone(), y.clone())
+        g.replay()
+        torch.cuda.synchronize()
+        self.assertFalse(torch.equal(x, third[0]))
+
+        # The generator offset is what a replay draws from: restoring it
+        # reproduces the first replay exactly.
+        gen.set_offset(offset0)
+        g.replay()
+        torch.cuda.synchronize()
+        self.assertEqual(x, first[0])
+        self.assertEqual(y, first[1])
+
+        other = torch.Generator(device="cuda")
+        with self.assertRaisesRegex(
+            RuntimeError, "not used during the graph's capture"
+        ):
+            g.set_generator_increment(other, 4)
+        with self.assertRaisesRegex(RuntimeError, "multiple of 4"):
+            g.set_generator_increment(gen, 6)
+        fresh = torch.cuda.CUDAGraph()
+        with self.assertRaisesRegex(RuntimeError, "completed capture"):
+            fresh.set_generator_increment(gen, 4)
+
+    @unittest.skipIf(
+        not TEST_CUDA_GRAPH, "CUDA >= 11.0 or ROCM >= 5.3 required for graphs"
+    )
     def test_memory_stats_of_multiple_generators_and_graphs(self):
         # Function to clear CUDA cache and collect garbage
         def clear_cuda_cache():

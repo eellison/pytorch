@@ -1,6 +1,9 @@
 #include <torch/csrc/python_headers.h>
 
+#include <ATen/cuda/CUDAGeneratorImpl.h>
+
 #include <pybind11/stl.h>
+#include <torch/csrc/Generator.h>
 #include <torch/csrc/autograd/python_variable.h>
 #include <torch/csrc/utils/pybind.h>
 #include <torch/csrc/utils/python_symnode.h>
@@ -207,6 +210,16 @@ py::dict tape_records(const Tape& t) {
   out["rng_increment"] = t.rng_increment.has_value()
       ? py::cast(*t.rng_increment)
       : py::object(py::none());
+  py::list rng_slots;
+  for (const auto& r : t.rng_slots) {
+    py::dict d;
+    d["launch"] = r.launch;
+    d["offset"] = r.offset;
+    d["size"] = r.size;
+    d["increment"] = py::cast(r.increment);
+    rng_slots.append(std::move(d));
+  }
+  out["rng_slots"] = std::move(rng_slots);
   return out;
 }
 
@@ -384,6 +397,23 @@ void THCPHostTrace_init(PyObject* module) {
           }
         }
       });
+  // The generator's per-capture philox pointers on the capturing stream (the
+  // generator is registered with the capturing graph by this call, as a
+  // kernel's own philox request would), and the intragraph offset the next
+  // request would see. Used by replay adapters that write the philox state of
+  // a prepared capture into a launch's rng field.
+  m.def("_host_trace_generator_capture_pointers", [](py::handle generator) {
+    at::Generator gen = THPGenerator_Unwrap(generator.ptr());
+    auto* g = at::check_generator<at::CUDAGeneratorImpl>(gen);
+    std::lock_guard<std::mutex> lock(g->mutex_);
+    at::PhiloxCudaState st = g->philox_cuda_state(0);
+    TORCH_CHECK(
+        st.captured_, "no stream capture is active on the current stream");
+    return py::make_tuple(
+        reinterpret_cast<uintptr_t>(st.seed_.ptr),
+        reinterpret_cast<uintptr_t>(st.offset_.ptr),
+        static_cast<uint64_t>(st.offset_intragraph_));
+  });
   m.def("_host_trace_tracing", []() {
     return at::cuda::host_trace::active() != nullptr;
   });

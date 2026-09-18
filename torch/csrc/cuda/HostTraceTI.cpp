@@ -13,6 +13,7 @@
 #include <ATen/cuda/host_trace/ti/Ops.h>
 #include <ATen/cuda/host_trace/ti/ReduceOps.h>
 
+#include <optional>
 #include <string>
 
 // Python entry points for the elementwise ops and reductions that opt into
@@ -265,6 +266,11 @@ void THCPHostTraceTI_init(PyObject* module) {
             ignore_index,
             total_weight,
             grad_input);
+      });
+  m.def(
+      "_host_trace_ti_native_dropout",
+      [](const at::Tensor& self, double p, std::optional<bool> train) {
+        return ti::native_dropout_traced(self, p, train);
       });
   // reductions: dims=[] reduces every dim; the output has the input's dtype
   m.def(

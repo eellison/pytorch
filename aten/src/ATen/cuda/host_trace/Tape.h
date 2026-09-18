@@ -162,15 +162,31 @@ struct MemcpyRec {
   std::string kind;
 };
 
+// One random launch: the host declared `increment` philox offsets
+// (rng_increment) before it, and the kernel's philox state sits in the
+// launch's argument image. The state's intragraph offset (the offsets the
+// launches before it consumed) is a u32 param of that launch whose value is
+// the prefix sum of the earlier slots' increments, so a replay at another
+// shape hands every random kernel the offset eager would; the seed and the
+// base offset stay the capture's generator pointers, refilled by the replay
+// prologue. `offset` and `size` locate that u32 in the image.
+struct RngSlotRec {
+  int64_t launch;
+  size_t offset;
+  size_t size;
+  c10::SymInt increment;
+};
+
 struct TORCH_CUDA_CPP_API Tape {
   std::vector<LaunchRec> launches;
   std::vector<OpaqueRec> opaque;
   std::vector<MemsetRec> memsets;
   std::vector<HostBufferRec> host_buffers;
   std::vector<MemcpyRec> memcpys;
-  // philox offsets one replay consumes; nullopt when the host draws no
-  // randomness
+  // philox offsets one replay consumes: the sum of the slots' increments;
+  // nullopt when the host draws no randomness
   std::optional<c10::SymInt> rng_increment;
+  std::vector<RngSlotRec> rng_slots;
   // host-order counter shared by every recorded event (launches here, the
   // allocations and views on the Python side)
   int64_t seq = 0;
