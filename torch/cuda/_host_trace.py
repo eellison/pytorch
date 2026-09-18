@@ -2032,7 +2032,7 @@ class _Trace:
         self.regions: list[_RegionRec] = []
         # the real tensor behind each input root (by root name): a host that
         # needs process-lifetime state keyed by the real storage (a symmetric
-        # memory handle) looks it up here
+        # memory handle, torch/cuda/_host_trace_symm.py) looks it up here
         self.real_inputs: dict[str, torch.Tensor] = {}
         # the op whose dispatch raised a decline (the trace mode notes it)
         self.declined_at: Any = None
@@ -4964,3 +4964,7 @@ class Entry:
 
 # registers the TensorIterator entries (add, mul, silu, gelu, copy_)
 from torch.cuda import _host_trace_ti  # noqa: F401
+
+
+if torch.distributed.is_available():
+    from torch.cuda import _host_trace_symm  # noqa: F401

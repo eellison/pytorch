@@ -12,6 +12,9 @@
 #include <ATen/cuda/host_trace/SoftmaxHost.h>
 #include <ATen/cuda/host_trace/ti/Ops.h>
 #include <ATen/cuda/host_trace/ti/ReduceOps.h>
+#if defined(USE_DISTRIBUTED) && defined(USE_C10D)
+#include <torch/csrc/distributed/c10d/symm_mem/HostTraceSymm.hpp>
+#endif
 
 #include <optional>
 #include <string>
@@ -204,6 +207,25 @@ void THCPHostTraceTI_init(PyObject* module) {
   m.def("_host_trace_ti_neg", [](const at::Tensor& self) {
     return ti::neg_traced(self);
   });
+  // the converted one-shot symmetric-memory all-reduce host
+  // (CUDASymmetricMemoryOps.cu): `real` is the buffer the handle is looked up
+  // by, the traced input's real tensor (torch/cuda/_host_trace_symm.py)
+  m.def(
+      "_host_trace_symm_one_shot_all_reduce_out",
+      [](const at::Tensor& input,
+         const at::Tensor& real,
+         const std::optional<at::Tensor>& local_input,
+         const std::string& reduce_op,
+         const std::string& group_name,
+         at::Tensor out) {
+#if defined(USE_DISTRIBUTED) && defined(USE_C10D)
+        return c10d::symmetric_memory::host_trace_one_shot_all_reduce_out(
+            input, real, local_input, reduce_op, group_name, std::move(out));
+#else
+        TORCH_CHECK(false, "host_trace: built without distributed support");
+        return out;
+#endif
+      });
   // the converted softmax host (SoftMax.cu): the entry allocates the output
   // through the trace mode, so it is a traced root, and calls the host
   m.def(
