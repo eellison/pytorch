@@ -187,3 +187,51 @@ void _fused_adamw_amsgrad_cuda_impl_(
 }
 
 } // namespace at::native
+
+// ---- host tracing (ATen/cuda/host_trace): the traced sibling of
+// _fused_adamw_amsgrad_cuda_impl_, compiled here so the sibling and the real
+// host above instantiate the one kernel (multi_tensor_apply_kernel over
+// FusedAdamMathFunctor / FusedAdamMathFunctorMP; DECISIONS E36): the tape's
+// launch is eager's function object, not a twin. multi_tensor_apply_kernel and
+// the metadata structs live in MultiTensorApply.cuh's anonymous namespace, one
+// instantiation per translation unit, so the entry must be compiled where
+// eager's host is; the chunking loop is ti/MultiTensorApplySym.cuh's (the same
+// loop over SymInt numels, the metadata block a proxy, the launches through the
+// typed helper). Outside a trace the entry runs the same launches in ordinary
+// mode, which is how the parity test compares it with the real op.
+#include <ATen/cuda/host_trace/ti/ForeachOps.h>
+#include <ATen/cuda/host_trace/ti/FusedAdamWSym.cuh>
+
+namespace at::cuda::host_trace::ti {
+
+void fused_adamw_amsgrad_traced_impl_(
+    std::vector<std::vector<at::Tensor>>& tensor_lists,
+    at::TensorList state_steps,
+    bool mixed_precision,
+    const c10::SymInt& lr_ptr,
+    double lr,
+    double beta1,
+    double beta2,
+    double weight_decay,
+    double eps,
+    bool maximize,
+    const c10::SymInt& grad_scale_ptr,
+    const c10::SymInt& found_inf_ptr,
+    bool grads_written) {
+  at::native::fused_adamw_sym_<5, true>(
+      tensor_lists,
+      state_steps,
+      mixed_precision,
+      lr_ptr,
+      lr,
+      beta1,
+      beta2,
+      weight_decay,
+      eps,
+      maximize,
+      grad_scale_ptr,
+      found_inf_ptr,
+      grads_written);
+}
+
+} // namespace at::cuda::host_trace::ti

@@ -478,3 +478,94 @@ void foreach_tensor_copy_list_kernel_cuda_(
 #undef AT_DISPATCH_SOURCE_TYPES
 
 } // namespace at::native
+
+// ---- host tracing (ATen/cuda/host_trace): the traced sibling of
+// foreach_tensor_list_op_ (the in-place form), compiled here so the sibling and
+// the real host above instantiate the one kernel (multi_tensor_apply_kernel
+// over BinaryOpListAlphaFunctor; DECISIONS E36): the tape's launch is eager's
+// function object, not a twin. multi_tensor_apply_kernel and the metadata
+// structs live in MultiTensorApply.cuh's anonymous namespace, one instantiation
+// per translation unit, so the entry must be compiled where eager's host is;
+// the chunking loop is ti/MultiTensorApplySym.cuh's (the same loop over SymInt
+// numels, the metadata block a proxy, the launches through the typed helper).
+// Outside a trace the entry runs the same launches in ordinary mode, which is
+// how the parity test compares it with the real op.
+#include <ATen/cuda/host_trace/ti/ForeachOps.h>
+#include <c10/util/irange.h>
+#include <ATen/cuda/host_trace/ti/MultiTensorApplySym.cuh>
+
+#include <functional>
+#include <vector>
+
+namespace at::native {
+namespace {
+
+namespace ht = at::cuda::host_trace;
+
+// ForeachBinaryOpList.cu foreach_tensor_list_op_ (the in-place form, depth 2)
+template <typename T, template <class> class Op>
+void foreach_tensor_list_op_sym_(
+    TensorList tensors1,
+    TensorList tensors2,
+    const Scalar& alpha) {
+  auto tensor_lists = c10::make_nested<Tensor>(tensors1.vec(), tensors2.vec());
+  using opmath_t = at::opmath_type<T>;
+  using functor_t = BinaryOpListAlphaFunctor<
+      T,
+      /*depth*/ 2,
+      /*r_args_depth*/ 2,
+      /*res_arg_index*/ 0>;
+  ht::multi_tensor_apply_sym<2>(
+      multi_tensor_apply_kernel<
+          TensorListMetadata<2>,
+          functor_t,
+          Op<opmath_t>,
+          opmath_t>,
+      {true, false},
+      tensor_lists,
+      functor_t(),
+      Op<opmath_t>(),
+      alpha.to<opmath_t>());
+  increment_version(tensors1);
+}
+
+void foreach_add_list_sym_(
+    TensorList tensors1,
+    TensorList tensors2,
+    const Scalar& alpha) {
+  AT_DISPATCH_ALL_TYPES_AND_COMPLEX_AND3(
+      kBool,
+      kBFloat16,
+      kHalf,
+      tensors1[0].scalar_type(),
+      "foreach_binary_op_list_cuda_",
+      [&]() {
+        foreach_tensor_list_op_sym_<scalar_t, std::plus>(
+            tensors1, tensors2, alpha);
+      });
+}
+
+} // anonymous namespace
+} // namespace at::native
+
+namespace at::cuda::host_trace::ti {
+
+void foreach_add_list_traced_(
+    at::TensorList tensors1,
+    at::TensorList tensors2,
+    const at::Scalar& alpha) {
+  at::native::check_foreach_api_restrictions(tensors1, tensors2);
+  if (!fast_path_restrictions_sym(
+          {tensors1, tensors2},
+          {alpha},
+          /*promotes_integer_inputs_to_float=*/false)) {
+    // ForeachOpsKernels.cpp foreach_tensor_add_list_kernel_slow_
+    for (const auto i : c10::irange(tensors1.size())) {
+      tensors1[i].add_(tensors2[i], alpha);
+    }
+    return;
+  }
+  at::native::foreach_add_list_sym_(tensors1, tensors2, alpha);
+}
+
+} // namespace at::cuda::host_trace::ti

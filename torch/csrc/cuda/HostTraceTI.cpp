@@ -10,6 +10,7 @@
 #include <ATen/HostTraceSiblingBindings.h>
 #include <ATen/cuda/host_trace/NllLossHost.h>
 #include <ATen/cuda/host_trace/SoftmaxHost.h>
+#include <ATen/cuda/host_trace/ti/ForeachOps.h>
 #include <ATen/cuda/host_trace/ti/Ops.h>
 #include <ATen/cuda/host_trace/ti/ReduceOps.h>
 #if defined(USE_DISTRIBUTED) && defined(USE_C10D)
@@ -293,6 +294,56 @@ void THCPHostTraceTI_init(PyObject* module) {
       "_host_trace_ti_native_dropout",
       [](const at::Tensor& self, double p, std::optional<bool> train) {
         return ti::native_dropout_traced(self, p, train);
+      });
+  // foreach / fused optimizers over the traced multi_tensor_apply host
+  // (ti/ForeachOps.h): in place on the lists, the scalars Python numbers
+  m.def(
+      "_host_trace_foreach_add_scalar_",
+      [](const std::vector<at::Tensor>& tensors, const py::handle& scalar) {
+        ti::foreach_add_scalar_traced_(tensors, scalar_arg(scalar));
+      });
+  m.def(
+      "_host_trace_foreach_add_list_",
+      [](const std::vector<at::Tensor>& tensors1,
+         const std::vector<at::Tensor>& tensors2,
+         const py::handle& alpha) {
+        ti::foreach_add_list_traced_(tensors1, tensors2, scalar_arg(alpha));
+      });
+  m.def(
+      "_host_trace_fused_adamw_",
+      [](const std::vector<at::Tensor>& params,
+         const std::vector<at::Tensor>& grads,
+         const std::vector<at::Tensor>& exp_avgs,
+         const std::vector<at::Tensor>& exp_avg_sqs,
+         const std::vector<at::Tensor>& max_exp_avg_sqs,
+         const std::vector<at::Tensor>& state_steps,
+         const std::optional<at::Tensor>& lr_tensor,
+         double lr,
+         double beta1,
+         double beta2,
+         double weight_decay,
+         double eps,
+         bool amsgrad,
+         bool maximize,
+         const std::optional<at::Tensor>& grad_scale,
+         const std::optional<at::Tensor>& found_inf) {
+        ti::fused_adamw_traced_(
+            params,
+            grads,
+            exp_avgs,
+            exp_avg_sqs,
+            max_exp_avg_sqs,
+            state_steps,
+            lr_tensor,
+            lr,
+            beta1,
+            beta2,
+            weight_decay,
+            eps,
+            amsgrad,
+            maximize,
+            grad_scale,
+            found_inf);
       });
   // reductions: dims=[] reduces every dim; the output has the input's dtype
   m.def(

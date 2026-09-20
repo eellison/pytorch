@@ -279,3 +279,82 @@ FOREACH_BINARY_OP_SCALAR(all_types_half_bfloat16, clamp_max, minimum, true);
 FOREACH_BINARY_OP_SCALAR(all_types_half_bfloat16, clamp_min, maximum, true);
 
 } // namespace at::native
+
+// ---- host tracing (ATen/cuda/host_trace): the traced sibling of
+// foreach_binary_op_ (the in- place form), compiled here so the sibling and the
+// real host above instantiate the one kernel (multi_tensor_apply_kernel over
+// BinaryOpScalarFunctor; DECISIONS E36): the tape's launch is eager's function
+// object, not a twin. multi_tensor_apply_kernel and the metadata structs live
+// in MultiTensorApply.cuh's anonymous namespace, one instantiation per
+// translation unit, so the entry must be compiled where eager's host is; the
+// chunking loop is ti/MultiTensorApplySym.cuh's (the same loop over SymInt
+// numels, the metadata block a proxy, the launches through the typed helper).
+// Outside a trace the entry runs the same launches in ordinary mode, which is
+// how the parity test compares it with the real op.
+#include <ATen/cuda/host_trace/ti/ForeachOps.h>
+#include <ATen/cuda/host_trace/ti/MultiTensorApplySym.cuh>
+
+#include <functional>
+#include <vector>
+
+namespace at::native {
+namespace {
+
+namespace ht = at::cuda::host_trace;
+
+// ForeachBinaryOpScalar.cu foreach_binary_op_ (the in-place form, depth 1)
+template <typename T, template <class> class Op>
+void foreach_binary_op_sym_(TensorList tensors, const Scalar& scalar) {
+  auto tensor_lists = c10::make_nested<Tensor>(tensors.vec());
+  using opmath_t = at::opmath_type<T>;
+  using functor_t = BinaryOpScalarFunctor<
+      T,
+      /*depth*/ 1,
+      /*r_args_depth*/ 1,
+      /*res_arg_index*/ 0>;
+  ht::multi_tensor_apply_sym<1>(
+      multi_tensor_apply_kernel<
+          TensorListMetadata<1>,
+          functor_t,
+          Op<opmath_t>,
+          opmath_t>,
+      {true},
+      tensor_lists,
+      functor_t(),
+      Op<opmath_t>(),
+      scalar.to<opmath_t>());
+  increment_version(tensors);
+}
+
+void foreach_add_scalar_sym_(TensorList tensors, const Scalar& scalar) {
+  AT_DISPATCH_ALL_TYPES_AND_COMPLEX_AND3(
+      kBool,
+      kHalf,
+      kBFloat16,
+      tensors[0].scalar_type(),
+      "foreach_binary_op_scalar_cuda_",
+      [&]() { foreach_binary_op_sym_<scalar_t, std::plus>(tensors, scalar); });
+}
+
+} // anonymous namespace
+} // namespace at::native
+
+namespace at::cuda::host_trace::ti {
+
+void foreach_add_scalar_traced_(
+    at::TensorList tensors,
+    const at::Scalar& scalar) {
+  at::native::check_foreach_api_restrictions(tensors);
+  if (!fast_path_restrictions_sym(
+          {tensors}, {scalar}, /*promotes_integer_inputs_to_float=*/false)) {
+    // ForeachOpsKernels.cpp foreach_tensor_add_scalar_kernel_slow_: the
+    // per-tensor op through the dispatcher (its own sibling under a trace)
+    for (const auto& t : tensors) {
+      t.add_(scalar);
+    }
+    return;
+  }
+  at::native::foreach_add_scalar_sym_(tensors, scalar);
+}
+
+} // namespace at::cuda::host_trace::ti

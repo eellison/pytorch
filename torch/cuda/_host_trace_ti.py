@@ -1094,6 +1094,7 @@ def _index_put_impl(op, self, indices, value, accumulate):
         None if i is None else (i if i.dtype is torch.int64 else i.long())
         for i in indices
     ]
+
     # AdvancedIndex: the indexed dims' sizes and byte strides, self restrided
     # with the broadcast index shape at stride 0 in their place, the indices
     # reshaped to broadcast over it
@@ -1327,3 +1328,91 @@ for _name, _binding, _overloads, _ntensors, _hand in _C._host_trace_ti_gen_sibli
             register_traced_entry(_op2, _out_entry(_op2, _entry))
         else:
             register_traced_entry(_op2, _entry)
+
+
+# ---- foreach / fused optimizers (ti/ForeachOps.h): the multi_tensor_apply
+# host over symbolic numels. The lists are CUDA tensors of one dtype per list;
+# the scalars (the .Scalar value, alpha, the hyperparameters) are constants of
+# the tape as eager bakes them into the launch. A fast-route refusal takes the
+# op's own slow path (the per-tensor op, traced through its sibling) inside
+# the entry, as eager does.
+
+
+def _foreach_add_scalar_(self, scalar):
+    op = aten._foreach_add_.Scalar
+    _cuda_operands(op, *self)
+    _C._host_trace_foreach_add_scalar_(list(self), _plain_scalar(op, scalar))
+
+
+def _foreach_add_list_(self, other, alpha=1):
+    op = aten._foreach_add_.List
+    _cuda_operands(op, *self, *other)
+    _C._host_trace_foreach_add_list_(list(self), list(other), _plain_scalar(op, alpha))
+
+
+def _fused_adamw_(
+    self,
+    grads,
+    exp_avgs,
+    exp_avg_sqs,
+    max_exp_avg_sqs,
+    state_steps,
+    *,
+    lr,
+    beta1,
+    beta2,
+    weight_decay,
+    eps,
+    amsgrad,
+    maximize,
+    grad_scale=None,
+    found_inf=None,
+):
+    # the tensor_lr overload reads a CPU lr on the host (lr.item()) at the
+    # trace and never again: declined by name; a CUDA lr is a pointer of the
+    # launch and `lr` the unused 1.0 the eager host passes
+    lr_tensor = None
+    if isinstance(lr, torch.Tensor):
+        op = aten._fused_adamw_.tensor_lr
+        if not lr.is_cuda:
+            raise Declined(
+                f"host_trace: {op} with a {lr.device} tensor lr: read on the host at the trace and never again; pass a float or a CUDA tensor (declined)"
+            )
+        lr_tensor, lr = lr, 1.0
+    else:
+        op = aten._fused_adamw_.default
+    optional = [t for t in (grad_scale, found_inf) if t is not None]
+    _cuda_operands(
+        op,
+        *self,
+        *grads,
+        *exp_avgs,
+        *exp_avg_sqs,
+        *max_exp_avg_sqs,
+        *state_steps,
+        *optional,
+    )
+    _C._host_trace_fused_adamw_(
+        list(self),
+        list(grads),
+        list(exp_avgs),
+        list(exp_avg_sqs),
+        list(max_exp_avg_sqs),
+        list(state_steps),
+        lr_tensor,
+        float(lr),
+        float(beta1),
+        float(beta2),
+        float(weight_decay),
+        float(eps),
+        bool(amsgrad),
+        bool(maximize),
+        grad_scale,
+        found_inf,
+    )
+
+
+register_traced_entry(aten._foreach_add_.Scalar, _foreach_add_scalar_)
+register_traced_entry(aten._foreach_add_.List, _foreach_add_list_)
+register_traced_entry(aten._fused_adamw_.default, _fused_adamw_)
+register_traced_entry(aten._fused_adamw_.tensor_lr, _fused_adamw_)
