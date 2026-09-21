@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import collections
 import functools
-import gc
 import itertools
 import unittest
 from dataclasses import dataclass
@@ -474,21 +473,18 @@ def trace_twice(
     tape = _trace(fn, args, device, warm_up=warm_up)
     hints, points, report = alternate_hints(tape)
     positions = ht._tensor_positions(args)
-    gc_enabled = gc.isenabled()  # as trace(): no collection while a capture is open
-    gc.disable()
     try:
-        try:
+        # as trace(): the process-wide hold, not a per-thread flag (another thread's
+        # build ending its hold would re-enable the collector under this capture)
+        with ht._gc_hold:
             tr, records, outputs = ht._trace_once(
                 fn, args, positions, tape.device.index, hints
             )
-        except ht.Declined as e:
-            raise HintDependence(
-                f"the second hint assignment declined where the first traced: {e}"
-            ) from e
-        second = ht.Tape(tr, records, outputs, args)
-    finally:
-        if gc_enabled:
-            gc.enable()
+    except ht.Declined as e:
+        raise HintDependence(
+            f"the second hint assignment declined where the first traced: {e}"
+        ) from e
+    second = ht.Tape(tr, records, outputs, args)
     diff = compare_tapes(tape, second, points)
     if diff is not None:
         raise HintDependence(

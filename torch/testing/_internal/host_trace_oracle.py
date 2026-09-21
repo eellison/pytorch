@@ -14,7 +14,8 @@ native and interim at the call's inputs, bitwise) or ``expect_miss``. The interi
 run unchanged under ``install()``, which makes ``_host_trace.build`` return an
 ``OracleVariant``: the interim ``Variant`` for every attribute the tests read, with a
 native entry checked on every replay; interim-only, counted, when the native line
-refuses the tape by name (a cell the native path does not serve yet).
+refuses the tape by name (a cell the native path does not serve yet), and for a call
+made under a profiler (a test counting the replay's device work counts one replay).
 
     python -m torch.testing._internal.host_trace_oracle test/test_cuda_host_trace_ti.py
 
@@ -151,6 +152,7 @@ def _note(key, value=1):
                 "missed": 0,
                 "rerun": 0,
                 "other_stream": 0,
+                "profiled": 0,
             },
         )
         if key == "refused":
@@ -260,6 +262,12 @@ class OracleVariant:
         ht = _ht()
         interim = self.interim
         if self.native is None:
+            return interim.try_replay(args) if miss_ok else interim.replay(args)
+        if torch.autograd._profiler_enabled():
+            # a profiled call is the interim's alone: a test that counts the replay's
+            # device work counts one replay, not the native call's plus its argument
+            # clones (its un-profiled calls compared both backends)
+            _note("profiled")
             return interim.try_replay(args) if miss_ok else interim.replay(args)
         clones = _clone_args(args)
         device = interim.device
