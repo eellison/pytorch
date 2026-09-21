@@ -463,33 +463,57 @@ _ROUTED = {
 }
 
 
-# closed library calls: recorded as regions, never traced into. baddbmm is
-# not one: its structured meta copies the expanded bias into the result with
-# ATen's copy kernel before the library call, and that kernel's argument
+# closed library calls: recorded as regions, never traced into, unless
+# torch._native's eager override of the op takes the call (the K = 1 bmm runs
+# the override's Triton kernel, not cuBLAS: _native_override_takes). baddbmm
+# is not one: its structured meta copies the expanded bias into the result
+# with ATen's copy kernel before the library call, and that kernel's argument
 # image carries per-call host bytes no harvest reproduces (measured: a heap
 # address at byte 536 of the StridedOp image differs between the harvest's
 # and the build's captures)
 _CLOSED_OPS = {aten.mm.default, aten.addmm.default, aten.bmm.default}
 
 
-def _outer_product_bmm(func: Any, args: tuple) -> bool:
-    # torch._native's eager override of aten::bmm on CUDA (ops/bmm_outer_product,
-    # _bmm_outer_product_cond): a K = 1 batched product runs its Triton
-    # outer-product kernel, not cuBLAS, so it is not a closed region but the
-    # entry of torch/cuda/_host_trace_ti.py (the broadcast multiply, the same
-    # one rounding). The condition's comparisons are guards of the trace.
-    if func is not aten.bmm.default:
-        return False
-    a, b = args[0], args[1]
-    return (
-        a.dim() == 3
-        and b.dim() == 3
-        and bool(a.shape[2] == 1)
-        and bool(b.shape[1] == 1)
-        and bool(a.numel() > 0)
-        and bool(b.numel() > 0)
-        and not a.is_complex()
-    )
+@functools.cache
+def _native_override_nodes(func: Any) -> tuple:
+    # the torch._native overrides registered on the op's CUDA entry
+    # (torch/_native/registry.py: an eager router at the CUDA key runs the
+    # first active node whose condition holds, else the ATen kernel), by the
+    # registry's key: the op name with its non-default overload
+    from torch._native import registry
+
+    return tuple(registry._graphs.get((func.name().split("::", 1)[1], "CUDA"), ()))
+
+
+def _native_override_takes(func: Any, args: tuple, kwargs: dict) -> bool:
+    """Whether eager serves this call through a torch._native override: the op
+    is one of the overrides' own `_native::<id>` ops (the router's call to the
+    override's implementation), or an active override's condition holds for
+    the call, the first-match rule of the router. Under the trace the
+    condition runs on the traced tensors, so each comparison it makes is a
+    guard, as it is when the router evaluates it one key below."""
+    if func.namespace == "_native":
+        return True
+    for node in _native_override_nodes(func):
+        if not node.active:
+            continue
+        try:
+            taken = node.cond_fn(*args, **kwargs)
+        except Declined:
+            raise
+        except Exception as e:
+            # the override's condition reads what the trace does not give (a raw
+            # data pointer's alignment, the CuTe overrides): eager's route here
+            # is decided by a value the tape has no symbol for
+            first = str(e).splitlines()[0] if str(e) else type(e).__name__
+            raise Declined(
+                f"host_trace: eager routes {func} through torch._native's {node.dsl_name} "
+                f"override, whose condition raised on the traced tensors ({first}); a "
+                f"{node.dsl_name} launch is not recorded on the tape (declined)"
+            ) from e
+        if taken:
+            return True
+    return False
 
 
 _KIND_NAMES = {0: "kernel", 1: "memset", 2: "memcpy"}
@@ -1625,6 +1649,18 @@ class _TracedTensor(torch.Tensor):
             return self._host_read("format()")
         return super().__format__(format_spec)
 
+    # a DLPack export hands the tensor's storage to another runtime (the
+    # CuTe DSL's from_dlpack): a launch the tape does not record yet
+    # (runtime_review/triton_capture/TRITON_CAPTURE.md, the CuTe follow-up)
+    def __dlpack__(self, *args: Any, **kwargs: Any) -> Any:
+        raise Declined(
+            f"host_trace: DLPack export of a traced tensor ({self._root.name}; a CuTe DSL "
+            "kernel's from_dlpack): a CuTe launch is not recorded on the tape yet (declined)"
+        )
+
+    def __dlpack_device__(self) -> Any:
+        return self.__dlpack__()
+
     def __getitem__(self, index: Any) -> Any:
         # Tensor.__getitem__ turns an integer index into a plain int through
         # SymInt.__index__ (a guard_int), so x[M - 1] would pin the tape to the
@@ -2076,6 +2112,12 @@ class _Trace:
         # path asks nothing until a view needs it
         self.fake_mode.cache_enabled = False
         self.rec = torch._C._HostTraceRecorder(device)
+        # the recorder's capture stream is the current one from here (its
+        # scope holds a stream guard): what a launch under the trace goes to
+        self.stream = torch.cuda.current_stream(device)
+        # the Python-launched Triton kernels of this trace
+        # (torch/cuda/_host_trace_triton.py), set by _trace_once
+        self.triton: Any = None
         self.tensors: list = []
         self.inputs: list[_InputRec] = []
         self.allocs: list[_AllocRec] = []
@@ -2825,17 +2867,22 @@ class _TraceMode(TorchDispatchMode):
             return self.trace.allocate(func, args, kwargs)
         if func in _VIEW_OPS:
             return self.trace.view(func, args, kwargs)
-        # a closed library call (cuBLAS): recorded as a region, never traced
-        # into; the K = 1 bmm the eager op serves itself takes its entry below
-        if func in _CLOSED_OPS and not _outer_product_bmm(func, args):
+        # a call eager serves through a torch._native override (the K = 1 bmm:
+        # a Triton kernel, not cuBLAS) takes eager's route: the override's
+        # Python runs under the mode, its allocations traced, its Triton
+        # launch recorded by the hook (torch/cuda/_host_trace_triton.py)
+        with self:
+            native = _native_override_takes(func, args, kwargs)
+        # a closed library call (cuBLAS): recorded as a region, never traced into
+        if func in _CLOSED_OPS and not native:
             return self.trace.closed_region(func, args, kwargs)
         # an op with a traced sibling host is traceable at any depth: under
         # trace, or inside another host (a layer norm copying a non-contiguous
         # input calls copy_)
-        entry = _TRACED_ENTRIES.get(func)
+        entry = None if native else _TRACED_ENTRIES.get(func)
         # a converted host is traceable under trace and inside another
         # converted host (the SDPA flash entry calls _flash_attention_forward)
-        if entry is not None or func in _TRACEABLE:
+        if entry is not None or native or func in _TRACEABLE:
             if entry is not None and func in self.entering:
                 raise Declined(
                     f"host_trace: the traced entry for {func} dispatched {func} itself; "
@@ -2865,6 +2912,15 @@ class _TraceMode(TorchDispatchMode):
                 raise  # trace() classifies these by CUDA error code
             except RuntimeError as e:
                 raise _refused_inside_the_trace(func, e) from e
+            except Exception as e:
+                if not native:
+                    raise
+                # the override's Python on traced tensors (a size used where
+                # only an int serves): nothing the tape describes
+                raise Declined(
+                    f"host_trace: torch._native's override of {func} raised inside the trace: "
+                    f"{type(e).__name__}: {str(e).splitlines()[0] if str(e) else ''} (declined)"
+                ) from e
             finally:
                 if entry is not None:
                     self.entering.pop()
@@ -2924,13 +2980,17 @@ class _EntryMode(TorchDispatchMode):
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
         kwargs = kwargs or {}
+        # a call eager serves through a torch._native override runs eager's
+        # own route (the override's kernel), as the trace recorded it
+        if _native_override_takes(func, args, kwargs):
+            return func(*args, **kwargs)
         entry = _TRACED_ENTRIES.get(func)
         # the entry stands in for a CUDA op; a CPU scalar operand (a wrapped
         # Python number, a 0-dim CPU tensor) rides along as in the trace; a
-        # closed op's entry serves only the case the trace routed to it
+        # closed op has no entry (eager's library call serves at the build)
         if (
             entry is not None
-            and (func not in _CLOSED_OPS or _outer_product_bmm(func, args))
+            and func not in _CLOSED_OPS
             and all(
                 a.is_cuda or (a.is_cpu and a.dim() == 0)
                 for a in args
@@ -3483,16 +3543,25 @@ def _trace_once(
     positions: list[int],
     device: int,
     hints: dict | None,
+    *,
+    triton: list | None = None,
 ) -> tuple[_Trace, dict, list[_OutputRec]]:
-    # one symbolic run under its own recorder scope
+    # one symbolic run under its own recorder scope; `triton` is the warm-up's
+    # observations of Python-launched Triton kernels (None: a run without a
+    # warm-up, where such a launch declines by name)
     tr = _Trace(device, hints)
+    tr.triton = _host_trace_triton.TritonTrace(triton)
     _active.trace = tr
     try:
         traced = list(args)
         for i in positions:
             traced[i] = tr.input(i, args[i])
         try:
-            with _TraceMode(tr):
+            with (
+                _host_trace_triton.hooked(),
+                _host_trace_triton.tracing(),
+                _TraceMode(tr),
+            ):
                 out = fn(*traced)
             tr.rec.finish()
         except torch.AcceleratorError as e:
@@ -3546,6 +3615,7 @@ def _trace_once(
             )
             identities[id(t)] = ("output", k)
         records = tr.rec.records()
+        _host_trace_triton.merge(tr, records)
         _check_host_buffers(tr, records)
         return tr, records, outputs
     except Declined as e:
@@ -3640,51 +3710,63 @@ def trace(
     if getattr(_active, "trace", None) is not None:
         raise Declined("host_trace: a trace is already in progress on this thread")
     result = None
-    if warm_up:
-        # on this thread's current stream, synchronized on that stream only:
-        # a device-wide synchronize would invalidate a capture on another thread
-        before = [_metadata(args[i]) for i in positions]
-        lazy = [torch._C._is_cow_tensor(args[i]) for i in positions]
-        with torch.cuda.device(device):
-            result = fn(*args)
-            torch.cuda.current_stream(device).synchronize()
-        # the warm-up is the call's execution, so values may change; the
-        # metadata the symbolic run binds must not, or the tape would describe
-        # the call eager made of the resized argument, not this one. A
-        # copy-on-write input the call materialized (its storage address moves
-        # and nothing else) is the call as made: eager's first call
-        # materializes it too, and the tape describes the materialized tensor
-        for i, was, was_lazy in zip(positions, before, lazy):
-            now = _metadata(args[i])
-            if now != was:
-                if (
-                    was_lazy
-                    and now[:-1] == was[:-1]
-                    and not torch._C._is_cow_tensor(args[i])
-                ):
-                    continue
-                changes = ", ".join(
-                    "storage replaced" if name == "storage" else f"{name} {a} -> {b}"
-                    for name, a, b in zip(_METADATA, was, now)
-                    if a != b
+    observations = None
+    # Python-launched Triton kernels: observed at the warm-up (the
+    # compilation eager selects for these inputs), intercepted and recorded
+    # under the trace (torch/cuda/_host_trace_triton.py)
+    with _host_trace_triton.hooked():
+        if warm_up:
+            # on this thread's current stream, synchronized on that stream only:
+            # a device-wide synchronize would invalidate a capture on another thread
+            before = [_metadata(args[i]) for i in positions]
+            lazy = [torch._C._is_cow_tensor(args[i]) for i in positions]
+            with (
+                torch.cuda.device(device),
+                _host_trace_triton.observing() as observations,
+            ):
+                result = fn(*args)
+                torch.cuda.current_stream(device).synchronize()
+            # the warm-up is the call's execution, so values may change; the
+            # metadata the symbolic run binds must not, or the tape would describe
+            # the call eager made of the resized argument, not this one. A
+            # copy-on-write input the call materialized (its storage address moves
+            # and nothing else) is the call as made: eager's first call
+            # materializes it too, and the tape describes the materialized tensor
+            for i, was, was_lazy in zip(positions, before, lazy):
+                now = _metadata(args[i])
+                if now != was:
+                    if (
+                        was_lazy
+                        and now[:-1] == was[:-1]
+                        and not torch._C._is_cow_tensor(args[i])
+                    ):
+                        continue
+                    changes = ", ".join(
+                        "storage replaced"
+                        if name == "storage"
+                        else f"{name} {a} -> {b}"
+                        for name, a, b in zip(_METADATA, was, now)
+                        if a != b
+                    )
+                    declined = Declined(
+                        f"host_trace: the warm-up changed the metadata of arg{i} ({changes}); eager resized it "
+                        "in place (an out= of another shape, a resize_ or a set_ inside the call), and a trace "
+                        "after it would describe the resized call, not the one made"
+                    )
+                    declined.warm_up_ran, declined.warm_up_outputs = True, result
+                    raise declined
+        # The trace capture is thread-local. A CUDAGraph finalized while it is open
+        # (an earlier variant's exec and pool, freed by a cyclic collection on this
+        # thread) invalidates it, so hold collections until the trace is over. No
+        # collection before the capture: a full one costs more than the trace.
+        try:
+            with _gc_hold:
+                tr, records, outputs = _trace_once(
+                    fn, args, positions, device, None, triton=observations
                 )
-                declined = Declined(
-                    f"host_trace: the warm-up changed the metadata of arg{i} ({changes}); eager resized it "
-                    "in place (an out= of another shape, a resize_ or a set_ inside the call), and a trace "
-                    "after it would describe the resized call, not the one made"
-                )
-                declined.warm_up_ran, declined.warm_up_outputs = True, result
-                raise declined
-    # The trace capture is thread-local. A CUDAGraph finalized while it is open
-    # (an earlier variant's exec and pool, freed by a cyclic collection on this
-    # thread) invalidates it, so hold collections until the trace is over. No
-    # collection before the capture: a full one costs more than the trace.
-    try:
-        with _gc_hold:
-            tr, records, outputs = _trace_once(fn, args, positions, device, None)
-    except Declined as e:
-        e.warm_up_ran, e.warm_up_outputs = warm_up, result
-        raise
+        except Declined as e:
+            e.warm_up_ran, e.warm_up_outputs = warm_up, result
+            raise
     tape = Tape(tr, records, outputs, args)
     tape.warm_up_outputs = result
     return tape
@@ -5046,7 +5128,7 @@ class Entry:
 
 
 # registers the TensorIterator entries (add, mul, silu, gelu, copy_)
-from torch.cuda import _host_trace_ti  # noqa: F401
+from torch.cuda import _host_trace_ti, _host_trace_triton  # noqa: F401
 
 
 if torch.distributed.is_available():

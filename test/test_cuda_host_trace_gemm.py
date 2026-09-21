@@ -812,14 +812,14 @@ class TestCudaHostTraceGemm(HostTraceTestCase):
         with self.assertRaisesRegex(ht.Declined, "aten.addmm_.default"):
             ht.trace(lambda c, a, b: c.addmm_(a, b), (y, x, wt))
 
-    def test_bmm_k1_rotary_product_takes_the_outer_product_sibling(self):
+    def test_bmm_k1_rotary_product_takes_eagers_triton_override(self):
         # LlamaRotaryEmbedding.forward's inv_freq_expanded @ position_ids_expanded:
         # a (B, 32, 1) x (B, 1, 1) fp32 bmm with batch1 expanded over the batch
         # (batch stride 0), reached through matmul's reshape. Eager serves the
         # K = 1 product with torch._native's Triton outer-product kernel, not
         # cuBLAS (bmm.out would reach cuBLAS's gemmk1 GEMV kernel), so the
-        # trace routes it to the broadcast-multiply sibling: no region, one
-        # launch beside the position cast, bitwise
+        # trace takes the override's own launch (torch/cuda/_host_trace_triton.py):
+        # no region, eager's Triton kernel beside the position cast, bitwise
         def rotary(inv_freq, position_ids):
             inv_freq_expanded = (
                 inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
@@ -835,6 +835,7 @@ class TestCudaHostTraceGemm(HostTraceTestCase):
         base = (inv_freq, pos(4, 16))
         tape = ht.trace(rotary, base)
         self.assertEqual((tape.num_regions, tape.num_launches), (0, 2))
+        self.assertEqual(tape.launches[1]["kernel"], "_bmm_outer_product_kernel")
         h0 = ht.gemm_harvests()
         variant = ht.build(tape, rotary, base)
         self.assertEqual(ht.gemm_harvests() - h0, 0)
@@ -852,7 +853,11 @@ class TestCudaHostTraceGemm(HostTraceTestCase):
                 self.last_miss,
             )
             self.assertEqual(variant.replay(args)[0].stride(), rotary(*args).stride())
-        # the same product in bf16 and with a wider N, straight through bmm
+        # the same product in bf16 and with a wider N, straight through bmm: the
+        # override's block sizes (from M and N) and Triton's specialization of
+        # every integer argument (divisible by 16 or not: M, N, M * N, B) are
+        # guards, so a product in the same class rebinds and one in another
+        # (M = 7: BLOCK_M 8, not 32; N = 130: BLOCK_N 128) misses
         for dtype in (torch.bfloat16, torch.float32):
             a = torch.randn(3, 40, 1, device="cuda", dtype=dtype)
             b = torch.randn(3, 1, 24, device="cuda", dtype=dtype)
@@ -862,13 +867,19 @@ class TestCudaHostTraceGemm(HostTraceTestCase):
             for args in (
                 (a, b),
                 (
-                    torch.randn(5, 7, 1, device="cuda", dtype=dtype),
-                    torch.randn(5, 1, 130, device="cuda", dtype=dtype),
+                    torch.randn(5, 36, 1, device="cuda", dtype=dtype),
+                    torch.randn(5, 1, 20, device="cuda", dtype=dtype),
                 ),
             ):
                 self.assertTrue(
                     self._check(variant, torch.bmm, args, str(dtype)), self.last_miss
                 )
+            other = (
+                torch.randn(5, 7, 1, device="cuda", dtype=dtype),
+                torch.randn(5, 1, 130, device="cuda", dtype=dtype),
+            )
+            self.assertFalse(self._check(variant, torch.bmm, other, str(dtype)))
+            self.assertIn("guard failed", self.last_miss)
         # bmm.out is not the eager override's route: the same product reaches
         # cuBLAS's K = 1 GEMV kernel there, which the harvest can take, but the
         # functional op the trace sees never does
@@ -887,7 +898,7 @@ class TestCudaHostTraceGemm(HostTraceTestCase):
         nodes = torch._C._host_trace_harvest_nodes(g.raw_cuda_graph())
         names = [n["name"] for n in nodes if n["kind"] == "kernel"]
         print(
-            f"\n[bmm K=1] functional: outer-product sibling; bmm.out: {[n[:32] for n in names]}"
+            f"\n[bmm K=1] functional: eager's Triton kernel; bmm.out: {[n[:32] for n in names]}"
         )
         self.assertTrue(any("gemm" in n or "gemv" in n for n in names), names)
 

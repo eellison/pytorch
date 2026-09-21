@@ -930,6 +930,63 @@ class _HostTraceKernelModule(_KernelModule):
         )
 
 
+class _HostTraceTritonModule(_HostTraceKernelModule):
+    """A Triton kernel the traced host launched from Python (torch/cuda/
+    _host_trace_triton.py): eager's own compilation, launched through the
+    function handle Triton loaded for it (the handle an eager capture's node
+    holds), with the parameter layout the runtime's DirectTritonOwner read
+    from the selected compilation. The owner's loaded copy of the cubin is
+    borrowed for the graph's lifetime as the runtime's Triton frontend borrows
+    it; Triton's own module lives with the process (its kernel cache holds the
+    compilation, which the owner retains too)."""
+
+    def __init__(self, launch, device):
+        from cuda.bindings import driver
+
+        self.record = launch
+        owner = launch.owner
+        self.check()
+        if owner.device_index != device:
+            raise HostTraceLoweringDeclined(
+                f"host_trace lowering: Triton kernel {launch.binary.name} was compiled for "
+                f"cuda:{owner.device_index}, the tape is lowered for cuda:{device}"
+            )
+        self.host_symbol = None
+        self._function = int(launch.binary.function)
+        self._layout = tuple(owner.abi_layout)
+        self._block = (owner.module.num_warps * 32, 1, 1)
+        self._shared = int(owner.module.shared)
+        self.name = launch.binary.name
+        self.device_index = device
+        with torch.cuda.device(device):
+            self.context = int(_check_cuda_bindings(driver.cuCtxGetCurrent()))
+        if not self.context:
+            raise HostTraceLoweringDeclined(
+                "host_trace lowering: the tape's device has no CUDA context"
+            )
+
+    def check(self):
+        from torch._inductor.runtime._cudagraph.direct_triton import (
+            DirectTritonDeclined,
+        )
+
+        try:
+            self.record.owner.check()
+        except DirectTritonDeclined as error:
+            raise HostTraceLoweringDeclined(
+                f"host_trace lowering: {error} ({self.record.binary.name})"
+            ) from error
+        function = self.record.binary.function
+        if type(function) is not int or function <= 0:
+            raise HostTraceLoweringDeclined(
+                f"host_trace lowering: Triton kernel {self.record.binary.name} lost its loaded function"
+            )
+
+    def _borrow_for_cudagraph(self):
+        self.check()
+        return self.record.owner.module._borrow_for_cudagraph()
+
+
 @dataclass(frozen=True)
 class _Records:
     input_names: tuple
@@ -1692,9 +1749,13 @@ def lower_tape(
                 # at the preparation shape
                 lowering.require(sympy.Gt(_expr(g), 0))
                 lowering.require(sympy.Le(_expr(g), bound))
-        module = _HostTraceKernelModule(
-            int(L["func"]), layout, block, smem, L["kernel"], device
-        )
+        triton_launch = L.get("triton")
+        if triton_launch is not None:
+            module = _HostTraceTritonModule(triton_launch, device)
+        else:
+            module = _HostTraceKernelModule(
+                int(L["func"]), layout, block, smem, L["kernel"], device
+            )
         calls.append(
             _PhysicalCall(
                 tuple(fields),

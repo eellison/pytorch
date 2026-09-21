@@ -77,17 +77,30 @@ def _bmm_outer_product_kernel(
     )
 
 
+def _next_power_of_2(n, cap: int | None = None):
+    # triton.next_power_of_2 for an int. A symbolic size (a host trace,
+    # torch/cuda/_host_trace.py, hands the override SymInt sizes) has no
+    # bitwise form: the comparison ladder up to `cap`, each step a guard of
+    # the trace; the caller's min() bounds an int result the same way.
+    if type(n) is int:
+        return triton.next_power_of_2(n)
+    p = 1
+    while (cap is None or p < cap) and p < n:
+        p *= 2
+    return p
+
+
 def _pick_block_sizes(m: int, n: int) -> tuple[int, int]:
     """I swept over some shapes and in the future we should figure out @autotune story"""
     if m <= 32:
-        block_m = triton.next_power_of_2(m)
+        block_m = _next_power_of_2(m)
     elif m <= 96:
         block_m = 32
     elif m <= 192:
         block_m = 64
     else:
         block_m = 128
-    return block_m, min(triton.next_power_of_2(n), 128)
+    return block_m, min(_next_power_of_2(n, 128), 128)
 
 
 @functools.lru_cache(maxsize=1024)
@@ -110,7 +123,12 @@ def bmm_outer_product(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 
     out = torch.empty(B, M, N, dtype=a.dtype, device=a.device)
 
-    grid_size, BLOCK_M, BLOCK_N = _bmm_outer_product_launch_config(B, M, N)
+    try:
+        grid_size, BLOCK_M, BLOCK_N = _bmm_outer_product_launch_config(B, M, N)
+    except TypeError:
+        # symbolic sizes (a host trace) are not hashable: the same selection, uncached
+        config = _bmm_outer_product_launch_config.__wrapped__
+        grid_size, BLOCK_M, BLOCK_N = config(B, M, N)
 
     # a and b are read-only inputs; wrap them so a copy-on-write tensor is read
     # through const_data_ptr() and not materialized. out is written directly.

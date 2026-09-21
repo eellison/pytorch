@@ -22,6 +22,19 @@ if torch.cuda.is_available():
     from torch.cuda import _host_trace as ht, _host_trace_ti
 
 C = torch._C
+
+
+def _fused_rms_norm_decline():
+    # F.rms_norm's _fused_rms_norm declines by the route eager takes: its own
+    # CUDA kernel (A190), or torch._native's CuTe DSL override where one is
+    # registered and active (its condition reads the pointers' alignment)
+    from torch._native import registry
+
+    if any(n.active for n in registry._graphs.get(("_fused_rms_norm", "CUDA"), ())):
+        return r"_fused_rms_norm\.default through torch._native's cutedsl override"
+    return r"_fused_rms_norm\.default runs its own CUDA kernel"
+
+
 # a 0-dim CPU tensor operand (not a wrapped number): an implicit CPU scalar
 # input the entry declines by name; made outside the traced function, since
 # torch.tensor inside one is a lift_fresh the trace declines
@@ -1596,9 +1609,7 @@ class TestCudaHostTraceTI(HostTraceTestCase):
         # and the rest of that decomposition
         w = torch.ones(4096, device="cuda") * 1.5
         x = self._values(64, 4096, torch.float32)
-        with self.assertRaisesRegex(
-            ht.Declined, r"aten\._fused_rms_norm\.default runs its own CUDA kernel"
-        ):
+        with self.assertRaisesRegex(ht.Declined, _fused_rms_norm_decline()):
             ht.trace(lambda t, g: F.rms_norm(t, (4096,), g, 1e-5), (x, w))
         self.assertFalse(C._host_trace_tracing())
 
@@ -1702,9 +1713,7 @@ class TestCudaHostTraceTI(HostTraceTestCase):
                     name in _TWINS_PENDING,
                     lambda: self._assert_same_work(tape, eager),
                 )
-        with self.assertRaisesRegex(
-            ht.Declined, r"_fused_rms_norm\.default runs its own"
-        ):
+        with self.assertRaisesRegex(ht.Declined, _fused_rms_norm_decline()):
             ht.trace(lambda t, g: F.rms_norm(t, (4096,), g, 1e-5), (x, w))
         self.assertFalse(C._host_trace_tracing())
 

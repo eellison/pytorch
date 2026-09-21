@@ -1129,6 +1129,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { m.def("alloc_by_eighth", &alloc_by_ei
         route = "runs its own CUDA kernel.*converted host for {} is the way to trace it"
         x, w, _ = self._inputs(8)
         message = "_fused_rms_norm.*" + route.format("aten::_fused_rms_norm")
+        from torch._native import registry
+
+        if any(n.active for n in registry._graphs.get(("_fused_rms_norm", "CUDA"), ())):
+            # eager's route here is torch._native's override (the CuTe DSL rms norm,
+            # whose condition reads the pointers' alignment): the decline names it
+            message = "_fused_rms_norm.*torch._native's cutedsl override.*not recorded"
         with self.assertRaisesRegex(ht.Declined, message):
             ht.trace(fused, (x, [self.N], w, 1e-5))
         with self.assertRaisesRegex(ht.Declined, message):
