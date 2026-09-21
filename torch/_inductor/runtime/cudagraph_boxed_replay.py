@@ -846,6 +846,7 @@ def _make_replay(
     ] = (),
     capture_events: tuple[RecordedKernelLaunch | RecordedGraphNode, ...] | None = None,
     pinned_positions: tuple[int, ...] = (),
+    const_positions: tuple[int, ...] = (),
 ) -> Any:
     """`memsets`: (node, destination, byte count, value) rows for one-dimensional
     byte memset nodes the caller issued in the capture; their destination and
@@ -857,6 +858,9 @@ def _make_replay(
     issued in the capture; the source is a host table index or a PointerSource
     over an input (a pinned CPU tensor). `pinned_positions` identifies those boxed
     inputs for ownership until rebinding and host-allocator submission tracking.
+    `const_positions`: boxed inputs the replay only reads, whose address is taken
+    through the const accessor per call (a copy-on-write tensor there stays lazy);
+    every other input is read through `data_ptr()`, which materializes.
     `templates`: (nodes, site, variant,
     operands, workspace) rows for kernel template sites the caller launched in
     the capture (torch._C._cuda_kernel_template_register): the variant IntExpr
@@ -1406,12 +1410,16 @@ def _make_replay(
         compiled_evaluation = torch._C._CUDAGraphCompiledEvaluation(
             **compiled.registration_kwargs
         )
-    owner_keywords = {"pinned_positions": pinned_positions} if pinned_positions else {}
+    owner_keywords: dict[str, Any] = (
+        {"pinned_positions": pinned_positions} if pinned_positions else {}
+    )
     if pinned_positions:
         # The initial copy-node bindings must survive until the first replay.
         owner_keywords["pinned_examples"] = tuple(
             capture_inputs[position] for position in pinned_positions
         )
+    if const_positions:
+        owner_keywords["const_positions"] = const_positions
     if release_steps is not None:
         release_plan = (
             release_steps,

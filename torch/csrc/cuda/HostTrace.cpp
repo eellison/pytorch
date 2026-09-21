@@ -270,6 +270,10 @@ struct HostTraceBoxer {
     }
     for (auto w : written_) {
       TORCH_CHECK_INDEX(w < n, "_HostTraceBoxer: written position ", w, " of a box of ", n);
+      PyObject* item = PyList_GET_ITEM(box, w);
+      if (THPVariable_Check(item)) {
+        THPVariable_Unpack(item).mutable_data_ptr();
+      }
     }
     return out;
   }
@@ -574,8 +578,12 @@ void THCPHostTrace_init(PyObject* module) {
           }
         }
       });
-  // The served call's box: selected tuple entries as a fresh exact list,
-  // with `arena` appended when given. Validate the written box positions.
+  // The box of a served call in one pass over the argument tuple: the tensors
+  // at `positions` (None: every argument) as a fresh exact list, the box
+  // positions in `written` read through the mutable accessor (a copy-on-write
+  // tensor materializes there, as at the ordinary host's launch; the test
+  // costs one deleter compare per position) and `arena` appended when given.
+  // What list(args) followed by _host_trace_materialize did in two walks.
   py::class_<HostTraceBoxer>(m, "_HostTraceBoxer")
       .def(
           py::init<py::object, std::vector<int64_t>>(),

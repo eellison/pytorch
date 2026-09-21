@@ -683,8 +683,10 @@ struct BoxedNumericPlan {
       return tensor.storage_offset();
     }
     if (instruction.op == Op::Pointer) {
+      // the const accessor: a lazy copy-on-write input is not materialized by
+      // reading its address (the written positions were materialized before)
       return static_cast<int64_t>(
-          reinterpret_cast<uintptr_t>(tensor.data_ptr()));
+          reinterpret_cast<uintptr_t>(tensor.const_data_ptr()));
     }
     TORCH_CHECK_VALUE(
         instruction.second < static_cast<size_t>(tensor.dim()) &&
@@ -1083,7 +1085,8 @@ struct BoxedReplayPlan {
       PyObject* numeric_plan,
       const PythonKernelPointerUpdates& updates,
       std::shared_ptr<CompiledBoxedEvaluation> compiled_evaluation,
-      PyObject* pinned_positions)
+      PyObject* pinned_positions,
+      PyObject* const_positions)
       : input_count(unpack_nonnegative_integer(count, "Input count")),
         input_indices(unpack_input_indices(inputs, input_count)),
         pinned_indices(unpack_input_indices(pinned_positions, input_count)),
@@ -1621,11 +1624,24 @@ struct BoxedReplayPlan {
                   copy_indices.end(),
           "Pinned positions must name used Tensor inputs without alignment copies");
     }
+    // Inputs the replay only reads: their address is taken through the const
+    // accessor per call, so a copy-on-write tensor there stays lazy as it would
+    // under eager. Every other input is read through data_ptr(), which
+    // materializes (a frontend that names no const positions keeps that for
+    // all of them).
+    const_inputs.assign(input_count, false);
+    for (auto index : unpack_input_indices(const_positions, input_count)) {
+      TORCH_CHECK_VALUE(
+          !numeric || !numeric->integer_inputs[index],
+          "Const positions must name Tensor inputs");
+      const_inputs[index] = true;
+    }
   }
 
   size_t input_count;
   std::vector<size_t> input_indices;
   std::vector<size_t> pinned_indices;
+  std::vector<bool> const_inputs;
   const bool has_explicit_output_indices;
   std::vector<BoxedBufferLayout> buffers;
   std::vector<BoxedLayoutValue> layout_values;
@@ -1992,8 +2008,10 @@ class PythonGraphReplayOwner {
         auto& input = invocation.normalized[index]
             ? invocation.normalized[index]
             : invocation.originals[index];
+        const auto& tensor = THPVariable_Unpack(input.get());
         pointers_[index] = reinterpret_cast<uintptr_t>(
-            THPVariable_Unpack(input.get()).data_ptr());
+            plan.const_inputs[index] ? tensor.const_data_ptr()
+                                     : tensor.data_ptr());
       }
       auto* allocator = at::cuda::getCUDADeviceAllocator();
       if (plan.release) {
@@ -3467,7 +3485,8 @@ void THCPGraph_init(PyObject* module) {
                  py::handle release_plan,
                  std::shared_ptr<CompiledBoxedEvaluation> compiled_evaluation,
                  py::handle pinned_positions,
-                 py::handle pinned_examples) {
+                 py::handle pinned_examples,
+                 py::handle const_positions) {
                 if (!THCPStreamClass ||
                     !PyObject_TypeCheck(
                         stream.ptr(),
@@ -3488,7 +3507,8 @@ void THCPGraph_init(PyObject* module) {
                     numeric_plan.ptr(),
                     updates,
                     std::move(compiled_evaluation),
-                    pinned_positions.ptr());
+                    pinned_positions.ptr(),
+                    const_positions.ptr());
                 auto invocation = std::make_unique<BoxedInvocation>(*plan);
                 auto bound_stream =
                     reinterpret_cast<THCPStream*>(stream.ptr())->cuda_stream;
@@ -3520,7 +3540,8 @@ void THCPGraph_init(PyObject* module) {
           py::kw_only(),
           py::arg("compiled_evaluation") = nullptr,
           py::arg("pinned_positions") = py::tuple(),
-          py::arg("pinned_examples") = py::tuple())
+          py::arg("pinned_examples") = py::tuple(),
+          py::arg("const_positions") = py::tuple())
       .def(
           "_prepare_kernel_params",
           torch::wrap_pybind_function([](at::cuda::CUDAGraph& self,
