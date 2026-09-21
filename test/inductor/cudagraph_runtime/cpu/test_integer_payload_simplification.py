@@ -2,6 +2,7 @@
 """Integer simplification preserves native guards and temporary ShapeEnv facts."""
 
 import ctypes
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest import mock
 
@@ -405,6 +406,26 @@ class TestPayloadContractState(TestCase):
         invalid = {self.x: -1, self.y: 0}
         self.assertEqual(result.subs(invalid), self.expression.subs(invalid))
 
+    def test_restored_ranges_do_not_reuse_cached_temporary_range(self):
+        self.environment.constrain_symbol_range(self.x, 0, 16)
+        contract = integer_payload_contract(self.environment)
+        expression = Min(self.x, 4)
+        with mock.patch.dict(
+            self.environment.var_to_range, {self.x: ValueRanges(8, 16)}
+        ):
+            self.assertEqual(
+                self.environment.simplify(expression, axioms=contract.obligations), 4
+            )
+        self.assertTrue(_contract_is_current(contract, self.environment))
+        result, reused = simplify_integer_payload(
+            expression, self.environment, contract
+        )
+        self.assertIs(reused, contract)
+        values = {self.x: 1, self.y: 0}
+        self.assertTrue(all(bool(guard.subs(values)) for guard in contract.obligations))
+        self.assertEqual(result.subs(values), expression.subs(values))
+        self.assertTrue(_contract_is_current(contract, self.environment))
+
     def test_simplification_mutation_rejects_the_result(self):
         contract = integer_payload_contract(self.environment)
         original = self.environment.simplify
@@ -490,6 +511,152 @@ class TestPayloadReplacementChains(TestCase):
         self.assertFalse(_contract_is_current(contract, self.environment))
         with self.assertRaisesRegex(ValueError, "finalized"):
             simplify_integer_payload(a + 1, self.environment, contract)
+
+
+@instantiate_parametrized_tests
+class TestMinMaxContext(TestCase):
+    def test_restored_range_keeps_the_frozen_contract(self):
+        environment = ShapeEnv(duck_shape=False, specialize_zero_one=False)
+        symbol = sympy.Symbol("value", integer=True)
+        environment._update_var_to_range(symbol, ValueRanges(0, 16))
+        contract = integer_payload_contract(environment)
+        atom = Min(symbol, 4)
+        version = environment._version_counter
+        with mock.patch.dict(environment.var_to_range, {symbol: ValueRanges(8, 16)}):
+            self.assertEqual(environment.simplify(atom, axioms=contract.obligations), 4)
+
+        self.assertEqual(environment._version_counter, version)
+        actual, reused = simplify_integer_payload(atom, environment, contract)
+        self.assertIs(reused, contract)
+        self.assertEqual(actual, atom)
+        self.assertEqual(actual.subs(symbol, 1), 1)
+
+    @parametrize("kind", ("min", "max"))
+    @parametrize("explicit_axioms", (False, True))
+    def test_changed_range_in_another_payload(self, kind, explicit_axioms):
+        environment = ShapeEnv(duck_shape=False, specialize_zero_one=False)
+        symbol = sympy.Symbol("value", integer=True)
+        atom = Min(symbol, 4) if kind == "min" else Max(symbol, 0)
+        environment.var_to_range[symbol] = (
+            ValueRanges(8, 16) if kind == "min" else ValueRanges(-8, -1)
+        )
+        options = {"axioms": ()} if explicit_axioms else {}
+        first = environment.simplify(atom + 3, **options)
+        self.assertEqual(first, 7 if kind == "min" else 3)
+
+        version = environment._version_counter
+        environment.var_to_range[symbol] = ValueRanges(-8, 16)
+        self.assertEqual(environment._version_counter, version)
+        second = environment.simplify(atom + 5, **options)
+        self.assertEqual(second, atom + 5)
+        self.assertEqual(second.subs(symbol, -2), 3 if kind == "min" else 5)
+        self.assertEqual(second.subs(symbol, 9), 9 if kind == "min" else 14)
+
+    def test_temporary_fact_does_not_escape_to_another_payload(self):
+        environment = ShapeEnv(duck_shape=False, specialize_zero_one=False)
+        source = LocalSource("value")
+        symbol = environment.create_unspecified_symbol(2, source, DimDynamic.DYNAMIC)
+        atom = Max(symbol, 0)
+        with environment.patch_source_specialization(source, lambda value: value >= 0):
+            contract = integer_payload_contract(environment)
+            first, _ = simplify_integer_payload(atom + 3, environment, contract)
+            self.assertEqual(first, symbol + 3)
+
+        restored = integer_payload_contract(environment)
+        second, _ = simplify_integer_payload(atom + 5, environment, restored)
+        self.assertEqual(second, atom + 5)
+        self.assertEqual(second.subs(symbol, -2), 5)
+        self.assertEqual(second.subs(symbol, 9), 14)
+
+
+@instantiate_parametrized_tests
+class TestFrozenRangeSnapshot(TestCase):
+    @parametrize("representation", ("tuple", "frozenset"))
+    @parametrize("prime", ("default", "explicit"))
+    def test_refine_restore_keeps_original_domain(self, representation, prime):
+        environment = ShapeEnv(duck_shape=False, specialize_zero_one=False)
+        symbol = sympy.Symbol("snapshot_x", integer=True)
+        environment._update_var_to_range(symbol, ValueRanges(0, 16))
+        contract = integer_payload_contract(environment)
+        self.assertIs(type(contract.ranges), frozenset)
+        if representation == "tuple":
+            contract = replace(contract, ranges=tuple(contract.range_map.items()))
+        expression = Min(symbol, 4)
+        version = environment._version_counter
+        with mock.patch.dict(environment.var_to_range, {symbol: ValueRanges(8, 16)}):
+            options = {"axioms": contract.obligations}
+            if prime == "explicit":
+                options["var_to_range"] = frozenset(environment.var_to_range.items())
+            self.assertEqual(environment.simplify(expression, **options), 4)
+        self.assertEqual(environment._version_counter, version)
+        self.assertTrue(_contract_is_current(contract, environment))
+        actual, reused = simplify_integer_payload(expression, environment, contract)
+        self.assertIs(reused, contract)
+        self.assertEqual(actual, expression)
+        for value in (0, 1, 4, 16):
+            self.assertEqual(actual.subs(symbol, value), expression.subs(symbol, value))
+        self.assertEqual(environment.backed_var_to_val, {})
+
+    @parametrize("representation", ("tuple", "frozenset"))
+    def test_changed_range_still_rejects_contract(self, representation):
+        environment = ShapeEnv(duck_shape=False, specialize_zero_one=False)
+        symbol = sympy.Symbol("stale_x", integer=True)
+        environment._update_var_to_range(symbol, ValueRanges(0, 16))
+        contract = integer_payload_contract(environment)
+        self.assertIs(type(contract.ranges), frozenset)
+        if representation == "tuple":
+            contract = replace(contract, ranges=tuple(contract.range_map.items()))
+        with mock.patch.dict(environment.var_to_range, {symbol: ValueRanges(8, 16)}):
+            with self.assertRaisesRegex(ValueError, "finalized original ShapeEnv"):
+                simplify_integer_payload(Min(symbol, 4), environment, contract)
+
+    @parametrize("range_count", (64, 1024))
+    def test_range_snapshot_preserves_values_and_contract(self, range_count):
+        environment = ShapeEnv(duck_shape=False, specialize_zero_one=False)
+        symbols = tuple(
+            sympy.Symbol(f"snapshot_{i}", integer=True) for i in range(range_count)
+        )
+        for symbol in symbols:
+            environment._update_var_to_range(symbol, ValueRanges(2, 128))
+        candidate = integer_payload_contract(environment)
+        self.assertIs(type(candidate.ranges), frozenset)
+        original = replace(candidate, ranges=tuple(candidate.range_map.items()))
+        frozen = frozenset(original.ranges)
+        self.assertEqual(frozen, candidate.ranges)
+        self.assertEqual(dict(candidate.ranges), original.range_map)
+        self.assertIs(candidate.obligations, original.obligations)
+        self.assertIs(candidate.additional_guards, original.additional_guards)
+        expressions = tuple(
+            expression
+            for symbol in symbols[:8]
+            for expression in (FloorDiv(symbol + 3, 4), Min(symbol, 4))
+        )
+        expected = [
+            simplify_integer_payload(expr, environment, original)[0]
+            for expr in expressions
+        ]
+        self.assertEqual(
+            [
+                simplify_integer_payload(expr, environment, candidate)[0]
+                for expr in expressions
+            ],
+            expected,
+        )
+        for contract in (original, candidate):
+            values = [
+                simplify_integer_payload(expr, environment, contract)
+                for expr in expressions
+            ]
+            self.assertEqual([value for value, _ in values], expected)
+            self.assertTrue(all(reused is contract for _, reused in values))
+        for expression, actual in zip(expressions, expected):
+            symbol = next(iter(expression.free_symbols))
+            for value in (2, 4, 128):
+                self.assertEqual(
+                    actual.subs(symbol, value), expression.subs(symbol, value)
+                )
+        self.assertTrue(_contract_is_current(candidate, environment))
+        self.assertEqual(environment.backed_var_to_val, {})
 
 
 if __name__ == "__main__":

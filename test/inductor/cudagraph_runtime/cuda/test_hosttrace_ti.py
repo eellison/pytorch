@@ -211,19 +211,14 @@ class TestHostTraceTI(TestCase):
             self._check(replay, (x, b), twice)
 
     def test_the_boxer_builds_the_box_in_one_pass(self):
-        # the family's box: the tensors at the tape's positions from the call's tuple,
-        # the written positions materialized, the arena appended
         boxer = torch._C._HostTraceBoxer
         base = torch.randn(8, 8, device="cuda")
-        lazy_w, lazy_r = torch._lazy_clone(base), torch._lazy_clone(base)
+        written, read = base.clone(), base.clone()
         arena = torch.empty(16, device="cuda", dtype=torch.uint8)
-        box = boxer(None, [0])((lazy_w, lazy_r), arena)
-        self.assertEqual([id(t) for t in box], [id(lazy_w), id(lazy_r), id(arena)])
-        self.assertFalse(torch._C._is_cow_tensor(lazy_w))
-        self.assertTrue(torch._C._is_cow_tensor(lazy_r))
-        box = boxer([2, 0], [])((lazy_r, 3, base))
-        self.assertEqual([id(t) for t in box], [id(base), id(lazy_r)])
-        self.assertTrue(torch._C._is_cow_tensor(lazy_r))
+        box = boxer(None, [0])((written, read), arena)
+        self.assertEqual([id(t) for t in box], [id(written), id(read), id(arena)])
+        box = boxer([2, 0], [])((read, 3, base))
+        self.assertEqual([id(t) for t in box], [id(base), id(read)])
         with self.assertRaises(RuntimeError):
             boxer(None, [])([base])
         with self.assertRaises(IndexError):
@@ -232,6 +227,17 @@ class TestHostTraceTI(TestCase):
         family = replay._hot
         args = _pair(64, 4096)
         self.assertEqual([id(t) for t in family.box(args)][:2], [id(t) for t in args])
+
+    def test_the_boxer_materializes_only_written_copy_on_write_inputs(self):
+        boxer = torch._C._HostTraceBoxer
+        base = torch.randn(8, 8, device="cuda")
+        lazy_w, lazy_r = torch._lazy_clone(base), torch._lazy_clone(base)
+        arena = torch.empty(16, device="cuda", dtype=torch.uint8)
+        boxer(None, [0])((lazy_w, lazy_r), arena)
+        self.assertFalse(torch._C._is_cow_tensor(lazy_w))
+        self.assertTrue(torch._C._is_cow_tensor(lazy_r))
+        boxer([2, 0], [])((lazy_r, 3, base))
+        self.assertTrue(torch._C._is_cow_tensor(lazy_r))
 
     def test_strided_broadcast_uses_call_rebinds(self):
         # the strided path: IntDivider's magic and shift are the host's own function,

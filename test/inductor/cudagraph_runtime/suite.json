@@ -555,7 +555,7 @@
     "id": "cpu_integer_payload_simplification",
     "script": "cpu/test_integer_payload_simplification.py",
     "device": "cpu",
-    "cases": 49
+    "cases": 64
   },
   {
     "id": "cpu_host_integer_power",
@@ -681,13 +681,13 @@
     "id": "cuda_hosttrace_rng_slots",
     "script": "cuda/test_hosttrace_rng_slots.py",
     "device": "cuda",
-    "cases": 4
+    "cases": 6
   },
   {
     "id": "cuda_hosttrace_ti",
     "script": "cuda/test_hosttrace_ti.py",
     "device": "cuda",
-    "cases": 6
+    "cases": 13
   },
   {
     "id": "cuda_native_minmax",

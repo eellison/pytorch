@@ -270,10 +270,6 @@ struct HostTraceBoxer {
     }
     for (auto w : written_) {
       TORCH_CHECK_INDEX(w < n, "_HostTraceBoxer: written position ", w, " of a box of ", n);
-      PyObject* item = PyList_GET_ITEM(box, w);
-      if (THPVariable_Check(item)) {
-        THPVariable_Unpack(item).mutable_data_ptr();
-      }
     }
     return out;
   }
@@ -534,21 +530,6 @@ void THCPHostTrace_init(PyObject* module) {
     return static_cast<int64_t>(
         reinterpret_cast<uintptr_t>(t.storage().data()));
   });
-  // The tensors of `args` at `positions` (a tape's written inputs) read
-  // through the mutable accessor before a replay binds their addresses: a
-  // copy-on-write tensor materializes here, as it would at the ordinary
-  // host's launch; any other tensor is a pointer read, anything else is
-  // left alone.
-  m.def(
-      "_host_trace_materialize",
-      [](const py::sequence& args, const std::vector<int64_t>& positions) {
-        for (auto p : positions) {
-          py::object item = args[static_cast<size_t>(p)];
-          if (THPVariable_Check(item.ptr())) {
-            THPVariable_Unpack(item.ptr()).mutable_data_ptr();
-          }
-        }
-      });
   // The generator's per-capture philox pointers on the capturing stream (the
   // generator is registered with the capturing graph by this call, as a
   // kernel's own philox request would), and the intragraph offset the next
@@ -593,12 +574,8 @@ void THCPHostTrace_init(PyObject* module) {
           }
         }
       });
-  // The box of a served call in one pass over the argument tuple: the tensors
-  // at `positions` (None: every argument) as a fresh exact list, the box
-  // positions in `written` read through the mutable accessor (a copy-on-write
-  // tensor materializes there, as at the ordinary host's launch; the test
-  // costs one deleter compare per position) and `arena` appended when given.
-  // What list(args) followed by _host_trace_materialize did in two walks.
+  // The served call's box: selected tuple entries as a fresh exact list,
+  // with `arena` appended when given. Validate the written box positions.
   py::class_<HostTraceBoxer>(m, "_HostTraceBoxer")
       .def(
           py::init<py::object, std::vector<int64_t>>(),

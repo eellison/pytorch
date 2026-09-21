@@ -659,7 +659,7 @@ class IntegerPayloadContract:
     shape_env: ShapeEnv
     obligations: tuple[sympy.Basic, ...]
     additional_guards: tuple[sympy.Basic, ...]
-    ranges: tuple
+    ranges: frozenset
     range_map: Mapping
     replacements: Mapping
     axioms: Mapping
@@ -718,7 +718,7 @@ def integer_payload_contract(shape_env: ShapeEnv) -> IntegerPayloadContract:
         shape_env,
         tuple(dict.fromkeys(obligations)),
         tuple(additional),
-        ranges,
+        frozenset(ranges),
         MappingProxyType(dict(ranges)),
         replacements,
         axioms,

@@ -1030,9 +1030,7 @@ class LoweredTape:
     # roots boxed after the tape's tensors, bound per call by the family's
     # AllocatorSequence; None when the tape was lowered without one
     sequence: object = None
-    # boxed positions of the inputs the tape wrote (Tape.written_inputs): a served
-    # call materializes a copy-on-write tensor there before the dispatch binds its
-    # address, as eager's mutable accessor does at the launch
+    # Boxed positions of the inputs the tape wrote (Tape.written_inputs).
     written_positions: tuple = ()
     # output positions over allocations no node writes (eager's at::empty returned as
     # it is): served at the plan's shape, their values indeterminate on both paths
@@ -1453,8 +1451,7 @@ def _symbol_values(lowered, boxed):
 
 
 def _const_data_ptr(t):
-    """`t.data_ptr()` through the storage's const accessor: a copy-on-write tensor in
-    a position the tape never writes stays lazy, as it does under the native call."""
+    """The tensor data address, including its storage offset."""
     return torch._C._data_address(t) + t.element_size() * t.storage_offset()
 
 
@@ -3516,11 +3513,6 @@ def prepare_hosttrace(
         None if outputs is None else outputs.take(),
         None if sequence is None else sequence.roots,
     )
-    # the positions the tape writes are materialized (a copy-on-write example there,
-    # as a served call's); every input address below is read through the const
-    # accessor, so an example in a read position stays lazy
-    if lowered.written_positions:
-        torch._C._host_trace_materialize(boxed, lowered.written_positions)
     device = lowered.device
     identity = _host_trace._device_identity(device)
     for (name, traced), (_, here) in zip(tape.device_identity, identity):
@@ -3881,12 +3873,6 @@ def prepare_hosttrace(
                         and tape.inputs[source.root.index].device.type == "cpu"
                     )
                 ),
-                # the positions the tape never writes are read through the const
-                # accessor per call (a copy-on-write tensor there stays lazy, as under
-                # eager); the written ones are materialized before the dispatch
-                const_positions=tuple(
-                    i for i in range(len(boxed)) if i not in lowered.written_positions
-                ),
                 memsets=tuple(recorded_memsets),
                 host_tables=tuple(
                     (
@@ -4014,9 +4000,7 @@ class _Family:
     # positions of the pinned CPU inputs a served call holds; the variants' device
     pinned: tuple = dataclasses.field(init=False)
     device: int = dataclasses.field(init=False)
-    # boxed positions any variant of the family writes: a copy-on-write tensor there
-    # is materialized before the dispatch reads its address (the union over the
-    # family's tapes; the dispatch does not report which variant serves a call)
+    # Boxed input positions written by any variant of this family.
     written: tuple = dataclasses.field(init=False)
     # the raw stream the family's dispatch is bound to: the current stream at the
     # first variant's preparation (the runtime refuses a hit on another stream by
@@ -4033,9 +4017,8 @@ class _Family:
     # the non-tensor arguments by position, as the family's first call passed them:
     # what a box stands for at those positions (`arguments`)
     constants: dict = dataclasses.field(default_factory=dict)
-    # the box in one C++ pass over the call's tuple: the tensors at the tape's
-    # positions, the written positions materialized, the arena appended; the ring's
-    # block and the sequence roots follow it
+    # The box selects the tape's tensor positions and appends the arena;
+    # the output block and sequence roots follow it.
     boxer: Callable = dataclasses.field(init=False)
 
     def __post_init__(self):
@@ -5024,8 +5007,6 @@ class HostTraceReplay(_Entry):
             box = family.box(args)
         else:
             box = list(family.tensors(args))
-            if family.written:
-                torch._C._host_trace_materialize(box, family.written)
             if family.arena is not None:
                 box.append(family.arena.tensor)
             if family.outputs is not None:

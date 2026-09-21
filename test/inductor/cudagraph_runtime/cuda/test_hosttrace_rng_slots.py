@@ -8,6 +8,7 @@ import unittest.mock
 import torch
 import torch.nn.functional as F
 from torch.testing._internal.common_cuda import PLATFORM_SUPPORTS_FLASH_ATTENTION
+from torch.testing._internal.common_device_type import instantiate_device_type_tests
 from torch.testing._internal.common_utils import run_tests, TestCase
 
 
@@ -199,6 +200,75 @@ class TestHostTraceRngSlots(TestCase):
         self._equal(replay, dropout_then_flash, qkv(4, 128), 5)
         for B in (2, 8):
             self._equal(replay, dropout_then_flash, qkv(B, 128), 3)
+
+
+class TestHostTraceSharedRngTape(TestCase):
+    def test_two_preparations_keep_capture_rng_local(self, device):
+        from torch._inductor.runtime._cudagraph.direct_hosttrace import (
+            lower_tape,
+            prepare_hosttrace,
+        )
+        from torch.cuda import _host_trace
+
+        self.enterContext(torch.cuda.device(device))
+        index = torch.cuda.current_device()
+        self.enterContext(torch.random.fork_rng(devices=[index]))
+        examples = [torch.randn(rows, 4096, device=device) for rows in (4, 8)]
+        tape = _host_trace.trace(two_dropouts, (examples[0],))
+        lowered = lower_tape(tape, (examples[0],))
+        original_calls = lowered.calls
+        original_constants = tuple(call.constants for call in original_calls)
+        original_tape = tape.to_json()
+        original_images = tuple(bytes(launch["hint_image"]) for launch in tape.launches)
+        entries = []
+        for example in examples:
+            entry = prepare_hosttrace(lowered, (example,))
+            self.addCleanup(entry.close)
+            entries.append(entry)
+            self.assertIs(lowered.calls, original_calls)
+            self.assertEqual(
+                tuple(call.constants for call in lowered.calls), original_constants
+            )
+            self.assertEqual(tape.to_json(), original_tape)
+            self.assertEqual(
+                tuple(bytes(launch["hint_image"]) for launch in tape.launches),
+                original_images,
+            )
+
+        samples = [torch.randn(rows, 4096, device=device) for rows in (4, 8, 8, 4)]
+        self.assertEqual(len({sample.data_ptr() for sample in samples}), len(samples))
+        generator = torch.cuda.default_generators[index]
+        generator.manual_seed(SEED)
+        generator.set_offset(64)
+        initial_state = generator.get_state()
+        expected, expected_offsets = [], []
+        for sample in samples:
+            expected.append(two_dropouts(sample))
+            expected_offsets.append(generator.get_offset())
+        final_state = generator.get_state()
+        generator.set_state(initial_state)
+        actual, actual_offsets = [], []
+        for step, sample in enumerate(samples):
+            box = [sample]
+            actual.append(entries[step % 2](box))
+            self.assertEqual(box, [])
+            actual_offsets.append(generator.get_offset())
+        self.assertEqual(actual_offsets, expected_offsets)
+        self.assertEqual(generator.get_state(), final_state)
+        torch.cuda.synchronize(device)
+        self.assertEqual(actual, expected, atol=0, rtol=0)
+        self.assertIs(lowered.calls, original_calls)
+        self.assertEqual(
+            tuple(call.constants for call in lowered.calls), original_constants
+        )
+        self.assertEqual(tape.to_json(), original_tape)
+        self.assertEqual(
+            tuple(bytes(launch["hint_image"]) for launch in tape.launches),
+            original_images,
+        )
+
+
+instantiate_device_type_tests(TestHostTraceSharedRngTape, globals(), only_for="cuda")
 
 
 if __name__ == "__main__":
