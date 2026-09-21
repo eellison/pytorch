@@ -4407,19 +4407,28 @@ class ShapeEnv:
             ):
                 self.replacements[axiom.lhs] = axiom.rhs
                 added_replacements[axiom.lhs] = axiom.rhs
-        self.axioms.update(new_axioms)
+        previous_axioms = self.axioms
+        previous_divisible = self.divisible.copy()
+        self.axioms = {**previous_axioms, **new_axioms}
+        if added_replacements:
+            self._replacements_version_counter += 1
+        self._update_version_counter(force=True)
 
         # We need to freeze the ShapeEnv because any additional modification of
         # the ShapeEnv will cause unsoundness for subsequent specialization calls.
+        previous_frozen = self.frozen
         self.frozen = True
         try:
             yield
         finally:
-            for k in new_axioms:
-                self.axioms.pop(k, None)
+            self.axioms = previous_axioms
+            self.divisible = previous_divisible
             for k in added_replacements:
                 self.replacements.pop(k, None)
-            self.frozen = False
+            if added_replacements:
+                self._replacements_version_counter += 1
+            self._update_version_counter(force=True)
+            self.frozen = previous_frozen
 
     def check_equal(self, other: ShapeEnv) -> None:
         """Compare another ShapeEnv for equivalence"""
@@ -4888,7 +4897,7 @@ class ShapeEnv:
             len(self.real_tensor_prop_unbacked_vals),
         )
 
-    def _update_version_counter(self) -> None:
+    def _update_version_counter(self, *, force: bool = False) -> None:
         # if the change to shape env effects self.divisible set
         # _resimplify_floor_div_axioms.
         # This is used to trigger a resimplication of FloorDiv to CleanDivs
@@ -4900,10 +4909,10 @@ class ShapeEnv:
         # it is changed, so we summarise the cache key into a linearly
         # increasing version counter which is cheaper to check in _lru_cache
 
-        # Only update version counter if the state actually changed
+        # Temporary axioms can change facts without changing this count-based key.
         cur_key = self._get_key()
 
-        if self._prev_cache_key != cur_key:
+        if force or self._prev_cache_key != cur_key:
             self._prev_cache_key = cur_key
             self._version_counter += 1
 
@@ -6193,6 +6202,7 @@ class ShapeEnv:
         # Indicates if we should produce guards for known static values.
         ignore_static: bool = True,
         langs: tuple[str, ...] = ("python", "verbose_python"),
+        _cpp_printer_factory: Callable[..., _ShapeGuardCppPrinter] | None = None,
     ) -> list[_ShapeGuardsHelper]:
         """
         Generates a list of guards strings which, when evaluated in a context that
@@ -6351,7 +6361,7 @@ class ShapeEnv:
                 printers.append(py_printer)
             elif lang == "cpp":
                 printers.append(
-                    _ShapeGuardCppPrinter(
+                    (_cpp_printer_factory or _ShapeGuardCppPrinter)(
                         symbol_to_source, source_ref, self.var_to_sources
                     )
                 )
@@ -8237,6 +8247,8 @@ class ShapeEnv:
         cur_replace = {s: self._find(s) for s in res.free_symbols}
         replaced, changed = self.replacements[a]._xreplace(cur_replace)
         if changed:
+            if self.frozen:
+                return replaced
             self._set_replacement(a, replaced, "find")
         return self.replacements[a]
 

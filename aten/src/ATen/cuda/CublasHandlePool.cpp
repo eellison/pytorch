@@ -1,3 +1,4 @@
+#include <ATen/BlasSettingsEpoch.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/nvrtc_stub/ATenNVRTC.h>
 #include <ATen/cuda/detail/DeviceThreadHandles.h>
@@ -289,18 +290,22 @@ size_t getChosenWorkspaceSize() {
 
 void setChosenWorkspaceSize(size_t size) {
   cublas_workspace_override.store(static_cast<int64_t>(size), std::memory_order_relaxed);
+  at::bumpBlasSettingsEpoch();
 }
 
 void setCUDABlasLtWorkspaceSize(size_t size) {
   cublaslt_workspace_override.store(static_cast<int64_t>(size), std::memory_order_relaxed);
+  at::bumpBlasSettingsEpoch();
 }
 
 void resetChosenWorkspaceSize() {
   cublas_workspace_override.store(-1, std::memory_order_relaxed);
+  at::bumpBlasSettingsEpoch();
 }
 
 void resetCUDABlasLtWorkspaceSize() {
   cublaslt_workspace_override.store(-1, std::memory_order_relaxed);
+  at::bumpBlasSettingsEpoch();
 }
 
 size_t getCUDABlasLtWorkspaceSize() {

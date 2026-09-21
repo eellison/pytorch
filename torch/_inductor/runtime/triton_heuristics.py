@@ -56,6 +56,7 @@ from . import triton_helpers
 from .autotune_cache import AutotuneCache
 from .benchmarking import benchmarker
 from .coordinate_descent_tuner import CoordescTuner
+from .cudagraph_arg_mapping import bind_launcher_arguments, FIXED_GRID_ARGUMENTS, IntExpr
 from .hints import (
     AutotuneHint,
     DeviceProperties,
@@ -2700,6 +2701,9 @@ class CachingAutotuner(KernelInterface):
                 "store_cubin",
                 "_is_static",
                 "_expected_positional_count",
+                "_cudagraph_arg_info",
+                "_cudagraph_grid_recipe",
+                "_cudagraph_grid_args",
             ):
                 val = getattr(launcher, attr, None)
                 if val is not None:
@@ -2928,6 +2932,12 @@ class CompileResult(Generic[_T]):
         # Stash expected positional arg count at codegen time so
         # _check_launcher_call_args can validate without inspect.signature().
         launcher._expected_positional_count = len(def_args)
+        launcher._cudagraph_grid_recipe = grid.recipe
+        launcher._cudagraph_grid_args = (
+            FIXED_GRID_ARGUMENTS if type(grid) is FixedGrid
+            and tuple(self.inductor_meta.get("extra_launcher_args", ())) == FIXED_GRID_ARGUMENTS
+            and tuple(self.inductor_meta.get("fixed_grid", ())) == FIXED_GRID_ARGUMENTS else ()
+        )
         return launcher
 
     def _get_arg_lists(
@@ -3207,6 +3217,20 @@ class StaticTritonCompileResult(CompileResult[_T]):
         launcher.cache_hash = triton_hash_to_path_key(self.kernel.hash)  # type: ignore[attr-defined]
         launcher.store_cubin = False  # type: ignore[attr-defined]
         launcher._is_static = True  # type: ignore[attr-defined]
+        launcher._cudagraph_arg_info = (  # type: ignore[attr-defined]
+            bind_launcher_arguments(
+                getattr(self.kernel, "cudagraph_formal_args", None),
+                self.kernel.arg_names,
+                def_args,
+                call_args,
+                grid_args=launcher._cudagraph_grid_args,
+            )
+            if isinstance(self.kernel, StaticallyLaunchedCudaKernel)
+            and not self.kernel.device_agnostic
+            and not pre_runner_lines
+            and runner_args == ["grid_0", "grid_1", "grid_2", "stream", *call_args]
+            else None
+        )
         return launcher
 
 
@@ -5259,6 +5283,7 @@ class GridExpr:
     x_grid: str | int = 1
     y_grid: str | int = 1
     z_grid: str | int = 1
+    recipe: tuple[IntExpr, IntExpr, IntExpr] | None = None
 
     def __post_init__(self) -> None:
         if self.mode not in ("python", "cpp"):
@@ -5384,7 +5409,16 @@ class GridExpr:
 
 class Grid1D(GridExpr):
     def generate(self, meta: dict[str, int], is_lazy: bool = False) -> None:
-        self.x_grid = self.ceildiv("xnumel", meta.get("XBLOCK"))
+        block = meta.get("XBLOCK")
+        self.recipe = None
+        if is_lazy or (block is not None and (type(block) is not int or block <= 0)):
+            self.x_grid = self.ceildiv("xnumel", block)
+            return
+        expression = IntExpr("formal", "xnumel")
+        if block not in (None, 1):
+            expression = IntExpr("ceildiv", args=(expression, IntExpr("constant", block)))
+        self.recipe = (expression, IntExpr("constant", 1), IntExpr("constant", 1))
+        self.x_grid = expression.render_grid(self.mode)
 
 
 class Grid2D(GridExpr):
@@ -5507,6 +5541,24 @@ class ComboKernelGrid(GridExpr):
                 ynumels.append(combo_meta[f"ynumel_{num}"] or f"ynumel_{num}")
 
         self.x_grid = self.combo_x_grid(xnumels, no_x_dims, meta)
+        if (type(self) is SequentialComboKernelGrid and not is_lazy
+                and not combo_meta["min_blocks"] and not ynumels):
+            terms = []
+            for num, no_x_dim in enumerate(no_x_dims):
+                value = combo_meta[f"xnumel_{num}"]
+                block = 1 if no_x_dim else meta.get("XBLOCK")
+                if (value is not None and (type(value) is not int or value <= 0)
+                        or type(block) is not int or block <= 0):
+                    break
+                extent = IntExpr("formal", f"xnumel_{num}") if value is None else IntExpr("constant", value)
+                terms.append(IntExpr("ceildiv", args=(extent, IntExpr("constant", block))))
+            else:
+                while len(terms) > 1:
+                    terms = [IntExpr("add", args=tuple(terms[index:index + 2]))
+                             if index + 1 < len(terms) else terms[index]
+                             for index in range(0, len(terms), 2)]
+                if terms:
+                    self.recipe = (terms[0], IntExpr("constant", 1), IntExpr("constant", 1))
         if combo_meta["min_blocks"]:
             self.x_grid = self.maximum([self.x_grid, combo_meta["min_blocks"]])
         if ynumels:

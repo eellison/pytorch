@@ -270,8 +270,9 @@ int64_t intern_group(const std::string& name) {
 }
 
 c10::intrusive_ptr<c10d::symmetric_memory::SymmetricMemory> lookup(
-    const std::vector<int64_t>& args) {
-  TORCH_INTERNAL_ASSERT(args.size() == 2);
+    const int64_t* args,
+    size_t count) {
+  TORCH_INTERNAL_ASSERT(count == 2);
   std::string group;
   {
     std::lock_guard<std::mutex> lock(group_names_mutex());
@@ -290,22 +291,22 @@ c10::intrusive_ptr<c10d::symmetric_memory::SymmetricMemory> lookup(
   return symm_mem;
 }
 
-int64_t buffer_ptrs_impl(const std::vector<int64_t>& args) {
-  return static_cast<int64_t>(
-      reinterpret_cast<uintptr_t>(lookup(args)->get_buffer_ptrs_dev()));
+int64_t buffer_ptrs_impl(const int64_t* args, size_t count) {
+  return static_cast<int64_t>(reinterpret_cast<uintptr_t>(
+      lookup(args, count)->get_buffer_ptrs_dev()));
 }
 
-int64_t signal_pad_ptrs_impl(const std::vector<int64_t>& args) {
-  return static_cast<int64_t>(
-      reinterpret_cast<uintptr_t>(lookup(args)->get_signal_pad_ptrs_dev()));
+int64_t signal_pad_ptrs_impl(const int64_t* args, size_t count) {
+  return static_cast<int64_t>(reinterpret_cast<uintptr_t>(
+      lookup(args, count)->get_signal_pad_ptrs_dev()));
 }
 
-int64_t rank_impl(const std::vector<int64_t>& args) {
-  return lookup(args)->get_rank();
+int64_t rank_impl(const int64_t* args, size_t count) {
+  return lookup(args, count)->get_rank();
 }
 
-int64_t world_size_impl(const std::vector<int64_t>& args) {
-  return lookup(args)->get_world_size();
+int64_t world_size_impl(const int64_t* args, size_t count) {
+  return lookup(args, count)->get_world_size();
 }
 
 } // namespace host_trace_symm

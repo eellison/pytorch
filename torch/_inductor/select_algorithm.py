@@ -60,6 +60,8 @@ from .codegen.common import (
     IndentedBuffer,
     KernelTemplate,
     OpOverrides,
+    SizeArg,
+    TensorArg,
     WorkspaceArg,
     WorkspaceZeroMode,
 )
@@ -78,7 +80,7 @@ from .codegen.triton_utils import (
     signature_to_meta,
     triton_meta_device_props,
 )
-from .codegen.wrapper import pexpr
+from .codegen.wrapper import pexpr, PythonWrapperCodegen, TritonCallArgument
 from .exc import CUDACompileError
 from .fx_utils import count_flops_fx
 from .ir import ChoiceCaller, PrimitiveInfoType
@@ -644,6 +646,7 @@ class TritonTemplateKernel(TritonKernel):
         self.epilogue_fn = epilogue_fn
         self.render_hooks = {}  # type: ignore[var-annotated]
         self.triton_meta: TritonMeta | None = triton_meta
+        self.cudagraph_template_meta: dict[str, Any] = {}
         self._index_dtype_override = index_dtype_override
         # For Templated Attention this can be a list of ir.Subgraph
         self.subgraphs: list[ir.ComputedBuffer] | None = subgraphs
@@ -952,6 +955,43 @@ class TritonTemplateKernel(TritonKernel):
             **self.inductor_meta_common(),
             **FixedGrid.setup_grid_as_args(),
         }
+        attrs = triton_meta["configs"][0]
+        self.cudagraph_template_meta = {}
+        if (
+            type(self) is TritonTemplateKernel
+            and type(self.output_node) in (ir.TritonTemplateBuffer, ir.MultiTemplateBuffer)
+            and self.output_node.get_device().type == "cuda"
+            and torch.version.hip is None
+            and type(V.graph.wrapper_code) is PythonWrapperCodegen
+            and not self.output_node.mutated_inputs
+            and not self.args.inplace_buffers
+            and not self.args.workspace_args
+            and not self.subgraphs
+            and not self.host_tma_descriptor_args
+            and not self.tma_store
+            and not self.tma_load_for_template_epilogue
+            and not self.uses_tma
+            and not self.atomic_add_found
+            and not self.has_custom_inline_asm
+            and isinstance(attrs, dict)
+            and all(type(arg) in (TensorArg, SizeArg) for arg in signature)
+        ):
+            outputs = {name for name in self.args.output_buffers.values() if type(name) is str}
+            provenance = {}
+            for index, arg in enumerate(signature):
+                if type(arg) is not TensorArg:
+                    continue
+                alignment = max(
+                    [arg.dtype.itemsize]
+                    + [value for key, value in attrs.get((index,), ()) if key == "tt.divisibility"]
+                )
+                provenance[arg.name] = (arg.buffer, arg.name in outputs, alignment)
+            self.cudagraph_template_meta = {
+                "cudagraph_generated_template": True,
+                "cudagraph_parameter_provenance": provenance,
+                "cudagraph_formal_indices": {arg.name: index for index, arg in enumerate(argdefs)},
+            }
+            inductor_meta.update(self.cudagraph_template_meta)
         if self.host_tma_descriptor_args:
             # This meta is repr'd into the generated module, so epilogue-registered
             # TensorDescriptorOptions must be resolved to plain dims first.
@@ -1933,7 +1973,7 @@ class TritonTemplateKernel(TritonKernel):
         self, name: str, node: ir.IRNode | None = None, deallocate_ws: bool = True
     ):
         wrapper = V.graph.wrapper_code
-        _, call_args, _, arg_types = self.args.python_argdefs()
+        argdefs, call_args, signature, arg_types = self.args.python_argdefs()
 
         additional_call_args, additional_arg_types = (
             self.additional_call_args_and_types()
@@ -1958,6 +1998,12 @@ class TritonTemplateKernel(TritonKernel):
 
         # Use FixedGrid which properly handles grid values passed as arguments
         inductor_meta = FixedGrid.setup_grid_as_args() if additional_call_args else None
+        call_metadata = {}
+        if self.cudagraph_template_meta and len(additional_call_args) == 3 and type(wrapper) is PythonWrapperCodegen:
+            inductor_meta.update(self.cudagraph_template_meta)
+            call_metadata["cudagraph_args"] = tuple(
+                TritonCallArgument(arg, sig) for arg, sig in zip(argdefs, signature)
+            )
         wrapper.generate_kernel_call(
             name,
             call_args,
@@ -1965,6 +2011,7 @@ class TritonTemplateKernel(TritonKernel):
             triton_meta=self.triton_meta,
             inductor_meta=inductor_meta,
             triton=True,
+            **call_metadata,
         )
         self._emit_post_kernel_code(wrapper, name)
         if self.workspace_arg is not None:

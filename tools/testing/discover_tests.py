@@ -75,6 +75,7 @@ TESTS = discover_tests(
         "ao",
         "custom_backend",
         "fx",  # executed by test_fx.py
+        "inductor/cudagraph_runtime/",  # isolated scripts run by test_cudagraph_runtime_{cpu,cuda}.py
         "jit",  # executed by test_jit.py
         "mobile",
         "onnx_caffe2",

@@ -88,6 +88,10 @@ struct LaunchRec {
   // constants of the launch, kept as captured (never assumed to be padding)
   std::vector<uint8_t> hint_image;
 };
+// The ABI of a host's opaque function: its integer arguments as a pointer and
+// a length, so a compiled plan or predicate passes a stack array (no vector
+// per call). `count` is the number of arguments the record carries.
+using OpaqueImpl = int64_t (*)(const int64_t* args, size_t count);
 struct OpaqueRec {
   int64_t seq = 0;
   std::string fn;
@@ -96,7 +100,7 @@ struct OpaqueRec {
   c10::SymInt sym;
   // the host's own function: the tape stays in the process, so replay calls it
   // rather than looking it up by name
-  int64_t (*impl)(const std::vector<int64_t>&) = nullptr;
+  OpaqueImpl impl = nullptr;
   // "guard": a selector, re-evaluated, a different value is a miss;
   // "rebind": data, re-evaluated and bound per call
   std::string kind;

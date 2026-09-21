@@ -4467,19 +4467,17 @@ def shape_env_from_inputs(inputs: Sequence[InputType]) -> ShapeEnv | None:
     return None
 
 
-def align_inputs_from_check_idxs(
-    model: Callable[[list[InputType]], _T],
-    inputs_to_check: Sequence[int],
-    mutated_input_idxs: OrderedSet[int],
-) -> Callable[[list[InputType]], _T]:
-    if len(inputs_to_check) == 0:
-        return model
+@dataclasses.dataclass(frozen=True, eq=False)
+class _InputAlignmentWrapper(Generic[_T]):
+    model: Callable[[list[InputType]], _T]
+    inputs_to_check: tuple[int, ...]
+    mutated_input_idxs: tuple[int, ...]
 
-    def run(new_inputs: list[InputType]) -> Any:
+    def __call__(self, new_inputs: list[InputType]) -> _T:
         old_tensors, new_tensors = copy_misaligned_inputs(
-            new_inputs, inputs_to_check, mutated_input_idxs
+            new_inputs, self.inputs_to_check, self.mutated_input_idxs
         )
-        out = model(new_inputs)
+        out = self.model(new_inputs)
 
         # If a mutated tensor was cloned to be aligned, we need to reflect back the mutation to the
         # original tensor.
@@ -4488,7 +4486,15 @@ def align_inputs_from_check_idxs(
 
         return out
 
-    return run
+
+def align_inputs_from_check_idxs(
+    model: Callable[[list[InputType]], _T],
+    inputs_to_check: Sequence[int],
+    mutated_input_idxs: OrderedSet[int],
+) -> Callable[[list[InputType]], _T]:
+    if len(inputs_to_check) == 0:
+        return model
+    return _InputAlignmentWrapper(model, tuple(inputs_to_check), tuple(mutated_input_idxs))
 
 
 def clone_preserve_strides(x: torch.Tensor) -> torch.Tensor:
@@ -4506,7 +4512,7 @@ def clone_preserve_strides(x: torch.Tensor) -> torch.Tensor:
 def copy_misaligned_inputs(
     new_inputs: list[InputType],
     check_inputs_idxs: Sequence[int],
-    return_pair_idxs: OrderedSet[int] | None = None,
+    return_pair_idxs: Collection[int] | None = None,
 ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
     """
     Clones misaligned tensors which we inferred were aligned. Returns a tuple of [old_tensors], [new_tensors] for every

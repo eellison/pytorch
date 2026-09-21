@@ -44,15 +44,15 @@ constexpr auto calc_io_size() {
 // ---- IntegerDivider.cuh / OffsetCalculator.cuh: host twins with SymInt
 // members; the proxy views below assign from them member for member.
 namespace detail {
-inline int64_t intdivider_shift(const std::vector<int64_t>& a) {
+inline int64_t intdivider_shift(const int64_t* a, size_t) {
   const unsigned int divisor = static_cast<unsigned int>(a[0]);
   unsigned int shift = 0;
   for (shift = 0; shift < 32; shift++) if ((1U << shift) >= divisor) break;
   return shift;
 }
-inline int64_t intdivider_m1(const std::vector<int64_t>& a) {
+inline int64_t intdivider_m1(const int64_t* a, size_t n) {
   const unsigned int divisor = static_cast<unsigned int>(a[0]);
-  const unsigned int shift = static_cast<unsigned int>(intdivider_shift(a));
+  const unsigned int shift = static_cast<unsigned int>(intdivider_shift(a, n));
   uint64_t one = 1;
   uint64_t magic = ((one << 32) * ((one << shift) - divisor)) / divisor + 1;
   return static_cast<int64_t>(static_cast<unsigned int>(magic));

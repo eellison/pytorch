@@ -302,6 +302,7 @@ XPU_TEST = [
 
 # The tests inside these files should never be run in parallel with each other
 RUN_PARALLEL_BLOCKLIST = [
+    "inductor/test_cudagraph_runtime_cuda",
     "test_extension_utils",
     "test_cpp_extensions_jit",
     "test_cpp_extensions_stream_and_event",

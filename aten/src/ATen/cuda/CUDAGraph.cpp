@@ -2,6 +2,7 @@
 #include <ATen/cuda/CUDAContextLight.h>
 #include <ATen/cuda/CUDAGeneratorImpl.h>
 #include <ATen/cuda/CUDAGraph.h>
+#include <c10/cuda/CUDACachingAllocatorPendingGraph.h>
 #include <ATen/cuda/CUDAGraphsUtils.cuh>
 #include <ATen/cuda/Exceptions.h>
 #include <ATen/cuda/MemPool.h>
@@ -77,6 +78,7 @@ CUDAGraph::CUDAGraph(bool keep_graph)
 
 void CUDAGraph::register_generator_state(
     c10::intrusive_ptr<at::CUDAGeneratorState> state) {
+  check_not_owned();
   captured_generator_states_[std::move(state)] = 0;
 }
 
@@ -115,6 +117,7 @@ void CUDAGraph::record_retained_pool(MempoolId_t pool) {
 }
 
 void CUDAGraph::retain_pool(MempoolId_t pool) {
+  check_not_owned();
   TORCH_CHECK(
       capture_id_ != 0 && !capture_ended_,
       "CUDAGraph::retain_pool may only be called during capture.");
@@ -146,6 +149,7 @@ std::function<bool(c10::Stream)> CUDAGraph::create_allocate_filter<c10::Stream>(
 }
 
 void CUDAGraph::capture_begin(MempoolId_t pool/*={0,0}*/, cudaStreamCaptureMode capture_mode) {
+  check_not_owned();
   TORCH_CHECK(!has_graph_exec_,
               "This CUDAGraph instance already owns a captured graph. "
               "To capture a new graph, create a new instance.");
@@ -159,6 +163,7 @@ void CUDAGraph::capture_begin(MempoolId_t pool/*={0,0}*/, cudaStreamCaptureMode 
               "(However, after capture, it's ok to replay them on the "
               "default stream.)");
 
+  kernel_params_.reset();
   capture_stream_ = stream;
   capture_dev_ = c10::cuda::current_device();
 
@@ -230,6 +235,7 @@ void CUDAGraph::capture_begin(MempoolId_t pool/*={0,0}*/, cudaStreamCaptureMode 
 // Python wrapper) so it has a single entry point. capture_end runs the whole
 // sequence for callers that don't need the window.
 void CUDAGraph::capture_end_pre() {
+  check_not_owned();
   auto stream = at::cuda::getCurrentCUDAStream();
 
   TORCH_CHECK(stream.stream() == capture_stream_.stream(),
@@ -279,6 +285,7 @@ void CUDAGraph::capture_end_pre() {
 }
 
 void CUDAGraph::capture_end_post() {
+  check_not_owned();
   // Destroy-only: when keep_graph=false the template is not retained. The graph
   // must already be instantiated (capture_end and the Python wrapper instantiate
   // before calling this).
@@ -297,12 +304,16 @@ void CUDAGraph::capture_end() {
 }
 
 void CUDAGraph::instantiate() {
+  check_not_owned();
   TORCH_CHECK(capture_ended_, "capture_end() must have been called before calling instantiate");
 
   if (has_graph_exec_) {
     TORCH_CHECK(keep_graph_, "instantiate() is intended to be called by the user only when keep_graph=true");
     AT_CUDA_CHECK(cudaGraphExecDestroy(graph_exec_));
+    has_graph_exec_ = false;
+    graph_exec_ = nullptr;
   }
+  clear_kernel_params();
   // In typical graph usage some tensors (e.g. the tensors used for graph IO) are not freed
   // between replays.
   // If Pytorch compiles and runs with a CUDA 11.4+ toolkit, there's a chance the allocator backend
@@ -327,6 +338,11 @@ void CUDAGraph::instantiate() {
 }
 
 void CUDAGraph::replay() {
+  check_not_owned();
+  replay_impl();
+}
+
+void CUDAGraph::replay_impl(c10::cuda::CUDACachingAllocator::PendingGraphInputs* pending) {
   TORCH_CHECK(capture_ended_,
               "Called CUDAGraph::replay without a preceding successful capture.");
   // Instantiating on demand is handled by the Python replay() wrapper (which
@@ -342,10 +358,17 @@ void CUDAGraph::replay() {
     generator_state->replay_prologue(capture_id_, wholegraph_increment);
   }
   // graph_exec_ may be replayed in any stream.
+  if (pending) {
+    pending->beginSubmission();
+  }
   AT_CUDA_CHECK(cudaGraphLaunch(graph_exec_, at::cuda::getCurrentCUDAStream()));
+  if (pending) {
+    pending->finishSubmitted();
+  }
 }
 
 void CUDAGraph::enable_debug_mode() {
+  check_not_owned();
   // Debug mode just retains the template after capture so it can be inspected
   // (e.g. dumped); that is exactly what keep_graph does. Unify on keep_graph_
   // rather than a second flag. dot dumping itself lives in Python now
@@ -354,6 +377,7 @@ void CUDAGraph::enable_debug_mode() {
 }
 
 cudaGraph_t CUDAGraph::raw_cuda_graph() {
+  check_not_owned();
   TORCH_CHECK(has_graph_,
       "No cudaGraph_t is available: either capture_end() has not been called, "
       "or the underlying cudaGraph_t was destroyed (keep_graph=false, and "
@@ -362,6 +386,7 @@ cudaGraph_t CUDAGraph::raw_cuda_graph() {
 }
 
 cudaGraphExec_t CUDAGraph::raw_cuda_graph_exec() {
+  check_not_owned();
   TORCH_CHECK(
       has_graph_exec_,
       "You cannot access the raw cudaGraphExec_t instance until instantiate() has been called");
@@ -369,6 +394,45 @@ cudaGraphExec_t CUDAGraph::raw_cuda_graph_exec() {
 }
 
 void CUDAGraph::reset() {
+  check_not_owned();
+  reset_impl();
+}
+
+void CUDAGraph::check_not_owned() const {
+  TORCH_CHECK(!replay_owner_.load(), "CUDA graph is leased to a native replay owner");
+}
+
+bool CUDAGraph::check_capture_pool_retirement() const {
+  TORCH_CHECK(
+      has_graph_ && has_graph_exec_ && capture_ended_ && !capturing_to_pool_,
+      "Capture pool retirement requires a completed instantiated graph");
+  if (!allocated_pool_) {
+    return false;
+  }
+  TORCH_CHECK(captured_generator_states_.empty(), "Capture pool retirement does not support RNG state");
+  TORCH_CHECK(
+      retained_mempool_ids_.size() == 1 && retained_mempool_ids_.front() == mempool_id_,
+      "Capture pool retirement requires only the main capture pool");
+  TORCH_CHECK(
+      c10::cuda::CUDACachingAllocator::name() == "native",
+      "Capture pool retirement requires the native caching allocator");
+  TORCH_CHECK(
+      c10::cuda::CUDACachingAllocator::getPoolUseCount(capture_dev_, mempool_id_) == 1,
+      "Capture pool retirement requires an unshared capture pool");
+  return true;
+}
+
+void CUDAGraph::release_capture_pools() {
+  for (const auto& pool : retained_mempool_ids_) {
+    c10::cuda::CUDACachingAllocator::releasePool(capture_dev_, pool);
+  }
+  retained_mempool_ids_.clear();
+  at::getHostAllocator(at::kCUDA)->release_pool(mempool_id_);
+  allocated_pool_ = false;
+}
+
+void CUDAGraph::reset_impl() {
+  kernel_params_.reset();
   // These checks warn instead of throwing: reset() is called from the
   // destructor, and at least one CI build refuses to compile with a throwing
   // destructor. Resource cleanup lives here in C++ so it runs on garbage
@@ -397,30 +461,24 @@ void CUDAGraph::reset() {
     capture_id_ = 0;
   }
 
-  if (allocated_pool_) {
-    if (capturing_to_pool_) {
-      // Capture was abandoned before capture_end() ran, so the allocator is
-      // still routing allocations to this pool. Stop that before releasing so
-      // the pool is left in a consistent, freeable state.
-      c10::cuda::CUDACachingAllocator::endAllocateToPool(capture_dev_, mempool_id_);
-      at::getHostAllocator(at::kCUDA)->end_allocate_to_pool(mempool_id_);
-      capturing_to_pool_ = false;
-    }
-
+  if (allocated_pool_ && capturing_to_pool_) {
+    // Capture was abandoned before capture_end() ran, so the allocator is
+    // still routing allocations to this pool. Stop that before releasing so
+    // the pool is left in a consistent, freeable state.
+    c10::cuda::CUDACachingAllocator::endAllocateToPool(capture_dev_, mempool_id_);
+    at::getHostAllocator(at::kCUDA)->end_allocate_to_pool(mempool_id_);
+    capturing_to_pool_ = false;
+  }
+  if (allocated_pool_ || capture_ended_) {
     // Clean up cached cuBLAS workspaces allocated on the capture stream;
     // otherwise live allocations prevent private pool cleanup. CUDA's default
     // eager workspace mode does not populate this cache.
     clearCublasWorkspacesForStream(capture_stream_.stream());
-
-    // notifyCaptureDestroy may throw. How should we handle this?
-    for (const auto& pool : retained_mempool_ids_) {
-      c10::cuda::CUDACachingAllocator::releasePool(capture_dev_, pool);
-    }
-    retained_mempool_ids_.clear();
-    at::getHostAllocator(at::kCUDA)->release_pool(mempool_id_);
-    capture_ended_ = false;
-    allocated_pool_ = false;
   }
+  if (allocated_pool_) {
+    release_capture_pools();
+  }
+  capture_ended_ = false;
   if (has_graph_) {
     C10_CUDA_CHECK_WARN(cudaGraphDestroy(graph_));
     has_graph_ = false;
@@ -438,19 +496,21 @@ void CUDAGraph::reset() {
 
 // Returns an id another graph's capture_begin can use to share the same memory pool as this graph.
 MempoolId_t CUDAGraph::pool() {
+  check_not_owned();
   TORCH_CHECK(capture_ended_,
               "Called CUDAGraph::pool() without a preceding successful capture.");
   return mempool_id_;
 }
 
 std::vector<MempoolId_t> CUDAGraph::pools() {
+  check_not_owned();
   TORCH_CHECK(capture_ended_,
               "Called CUDAGraph::pools() without a preceding successful capture.");
   return retained_mempool_ids_;
 }
 
 CUDAGraph::~CUDAGraph() {
-  reset();
+  reset_impl();
 
 // There are recent HIP changes where hipGraphExecDestroy doesn't immediately free memory.
 // They wait for next sync point in order to free the memory, this is to ensure that all
@@ -479,6 +539,7 @@ CUDAGraph* CUDAGraph::get_currently_capturing_graph() {
 
 void CUDAGraph::begin_capture_to_if_node(
     const at::Tensor& scalar_cuda_pred_tensor) {
+  check_not_owned();
 #if !defined(USE_ROCM) && (defined(CUDA_VERSION) && CUDA_VERSION >= 12040)
   begin_capture_to_conditional_node(
       scalar_cuda_pred_tensor, cudaGraphCondTypeIf);
@@ -492,6 +553,7 @@ void CUDAGraph::begin_capture_to_if_node(
 
 void CUDAGraph::begin_capture_to_while_node(
     const at::Tensor& scalar_cuda_pred_tensor) {
+  check_not_owned();
 #if !defined(USE_ROCM) && (defined(CUDA_VERSION) && CUDA_VERSION >= 12040)
   begin_capture_to_conditional_node(
       scalar_cuda_pred_tensor, cudaGraphCondTypeWhile);
@@ -628,6 +690,7 @@ getCurrentCUDAStream(), &cond_node, nullptr, 1, cudaStreamSetCaptureDependencies
 #endif // !defined(USE_ROCM) && (defined(CUDA_VERSION) && CUDA_VERSION >= 12040)
 
 void CUDAGraph::end_capture_to_conditional_node() {
+  check_not_owned();
 #if !defined(USE_ROCM) && (defined(CUDA_VERSION) && CUDA_VERSION >= 12040)
   TORCH_INTERNAL_ASSERT(
       !conditional_graph_capture_ids_.empty(),
@@ -690,6 +753,7 @@ void CUDAGraph::end_capture_to_conditional_node() {
 
 void CUDAGraph::set_conditional_handle_for_current_node(
     const at::Tensor& scalar_cuda_pred_tensor) {
+  check_not_owned();
 #if !defined(USE_ROCM) && (defined(CUDA_VERSION) && CUDA_VERSION >= 12040)
   TORCH_INTERNAL_ASSERT(
       !conditional_node_handles_.empty(),

@@ -47,7 +47,7 @@ from torch.fx.experimental.symbolic_shapes import (
 from torch.fx.node import _get_qualified_name
 from torch.multiprocessing.reductions import StorageWeakRef
 from torch.utils._ordered_set import OrderedSet
-from torch.utils._sympy.functions import CleanDiv, Max, Min
+from torch.utils._sympy.functions import CeilDiv, CleanDiv, FloorDiv, Max, Min
 from torch.utils._sympy.singleton_int import SingletonInt
 from torch.utils._sympy.symbol import symbol_is_type, SymT
 
@@ -55,6 +55,25 @@ from .. import async_compile, config, debug as inductor_debug, ir
 from ..codecache import output_code_log
 from ..ir import IRNode, ReinterpretView
 from ..runtime import triton_heuristics
+from ..runtime.cudagraph_arg_mapping import (
+    AlignmentCopy,
+    bind_alignment_copies,
+    bind_wrapper_allocations,
+    BufferSource,
+    CallArgument,
+    ExpressionSource,
+    InputSource,
+    IntegerInput,
+    IntegerSource,
+    IntExpr,
+    pointwise_expression_inputs,
+    pointwise_product,
+    KernelCallRecord,
+    OwnedBuffer,
+    BorrowedInputOutput,
+    IntegerOutput,
+    WrapperCallRecords,
+)
 from ..stream_constants import DEFAULT_STREAM, DEFAULT_STREAM_IDX, STREAM_NAME_TEMPLATE
 from ..stream_utils import (
     COOR_DEVICE_IDX_VAR,
@@ -85,7 +104,10 @@ from .common import (
     ArgName,
     CodeGen,
     DeferredLine,
+    KernelArgType,
     PythonPrinter,
+    SizeArg,
+    TensorArg,
     WorkspaceArg,
     WorkspaceZeroMode,
 )
@@ -100,6 +122,7 @@ from .triton_utils import (
 
 
 if TYPE_CHECKING:
+    from ..runtime.cudagraph_multikernel import MultiKernelCallRecord
     from collections.abc import Iterable, Iterator, Sequence
 
     import triton
@@ -718,6 +741,16 @@ class ExitDeviceContextManagerLine(WrapperLine):
 
 
 @dataclasses.dataclass
+class CuTeCallLine(WrapperLine):
+    node: ir.UserDefinedCuTeKernel
+    entry_global: str
+
+    def codegen(self, code: IndentedBuffer) -> None:
+        args = ", ".join(value.codegen_reference() for value in self.node.inputs)
+        code.writeline(f"{self.entry_global}.invoke({args})")
+
+
+@dataclasses.dataclass
 class ExternKernelAllocLine(WrapperLine):
     wrapper: PythonWrapperCodegen
     node: ir.ExternKernelAlloc
@@ -904,6 +937,20 @@ class FreeLine(WrapperLine):
 
 
 @dataclasses.dataclass
+class TritonCallArgument:
+    arg: ArgName
+    signature: KernelArgType
+
+
+@dataclasses.dataclass
+class InputAlignmentLine(WrapperLine):
+    name: str
+
+    def codegen(self, code: IndentedBuffer) -> None:
+        code.writeline(f"{self.name} = copy_if_misaligned({self.name})")
+
+
+@dataclasses.dataclass
 class KernelCallLine(WrapperLine):
     wrapper: PythonWrapperCodegen
     kernel_name: str
@@ -918,6 +965,10 @@ class KernelCallLine(WrapperLine):
     graph_name: str
     original_fxnode_name: str
     current_stream_idx: int | None = None
+    cudagraph_args: tuple[TritonCallArgument, ...] | None = None
+    cudagraph_user: ir.UserDefinedTritonKernel | None = None
+    cudagraph_computations: tuple[ir.ComputedBuffer, ...] | None = None
+    cudagraph_alternatives: tuple[tuple[Any, ...], ...] | None = None
 
     def codegen(self, code: IndentedBuffer) -> None:
         self.wrapper._generate_kernel_call_helper(
@@ -1650,12 +1701,19 @@ def _resolve_nested_output(
     return current_output, remaining_keypath
 
 
+@dataclasses.dataclass
+class _InputSymbolBindingPlan:
+    sources: dict[sympy.Symbol, str] = dataclasses.field(default_factory=dict)
+    input_names: tuple[str, ...] | None = None
+
+
 class PythonWrapperCodegen(CodeGen):
     """
     Generate outer wrapper in Python that calls the kernels.
     """
 
     supports_caching: bool = True  # Whether the output code is cacheable.
+    _input_symbol_binding_plan: _InputSymbolBindingPlan | None = None
 
     def __init__(self):
         super().__init__()
@@ -1702,6 +1760,8 @@ class PythonWrapperCodegen(CodeGen):
         # one has to maintain the depth too.
         self.kernel_profile_scope_depth: int = 0
         self.lines: list[Line] = []
+        self.cute_invocation_entries: dict[str, object] = {}
+        self._collect_cute_prefix = any(type(op) is ir.UserDefinedCuTeKernel for op in V.graph.operations)
         self.declare = ""
         self.declare_maybe_reference = ""
         self.ending = ""
@@ -2269,7 +2329,10 @@ class PythonWrapperCodegen(CodeGen):
         for name in input_names:
             if name in self._pending_alignment_copies:
                 self._pending_alignment_copies.discard(name)
-                self.writeline(f"{name} = copy_if_misaligned({name})")
+                if type(self) is PythonWrapperCodegen:
+                    self.writeline(InputAlignmentLine(name))
+                else:
+                    self.writeline(f"{name} = copy_if_misaligned({name})")
             elif name in self._multistream_alignment_copies:
                 # TODO: if the same input is read again on a stream after an
                 # intervening different stream (e.g. s1, s2, s1) this re-clones
@@ -2767,6 +2830,23 @@ class PythonWrapperCodegen(CodeGen):
         finally:
             self.writeline = old  # type: ignore[method-assign]
 
+    def generate_cute_invocation(self, node):
+        from torch._inductor.runtime._cudagraph._compiler.compiler_cute_handoff.invocation import check_implementation, resolve_entry
+
+        check_implementation()
+        if type(self) is not PythonWrapperCodegen or type(node) is not ir.UserDefinedCuTeKernel:
+            raise RuntimeError("Expected the typed ordinary CuTe invocation")
+        if resolve_entry(node.entry_key) is not node.entry:
+            raise RuntimeError("CuTe IR entry identity changed")
+        name = f"_cute_entry_{node.entry_key}"
+        if name not in self.cute_invocation_entries:
+            self.cute_invocation_entries[name] = node.entry
+            self.header.writeline('from torch._inductor.runtime._cudagraph._compiler.compiler_cute_handoff.invocation import resolve_entry as _resolve_cute_entry')
+            self.header.writeline(f"{name} = _resolve_cute_entry({node.entry_key!r})")
+        elif self.cute_invocation_entries[name] is not node.entry:
+            raise RuntimeError("CuTe wrapper entry binding changed")
+        self.writeline(CuTeCallLine(node, name))
+
     def _write_multi_kernel_defs(self) -> None:
         kernel_defs = self.multi_kernel_state.kernel_defs
         if config.triton.autotune_at_compile_time:
@@ -2786,6 +2866,39 @@ class PythonWrapperCodegen(CodeGen):
                 self.generate_start_graph()
 
             self.run_wrapper_ir_passes(is_inference)
+            trace_terminal = getattr(config.cudagraph_policy, "trace_terminal", False) is True
+            cute_descriptors = None
+            cute_envelope = None
+            cute_mixed_ir = None
+            has_cute_invocation = (
+                config.cudagraph_policy is not None and not trace_terminal
+                and any(type(line) is CuTeCallLine for line in self.lines)
+            )
+            if has_cute_invocation:
+                from torch._inductor.runtime._cudagraph._compiler.compiler_cute_handoff.descriptor import collect_descriptors, DescriptorDeclined, emit_descriptors
+                from torch._inductor.runtime._cudagraph._compiler.compiler_cute_handoff.retained import export_mixed_ir, retain_mixed_wrapper, RetentionDeclined
+
+                try:
+                    cute_mixed_ir = export_mixed_ir(retain_mixed_wrapper(self))
+                except RetentionDeclined:
+                    pass
+
+                try:
+                    cute_descriptors = collect_descriptors(self)
+                except DescriptorDeclined:
+                    pass
+                if cute_descriptors is not None:
+                    from torch._inductor.runtime._cudagraph._compiler.compiler_cute_handoff.envelope import collect_envelope, emit_envelope, EnvelopeDeclined
+
+                    try:
+                        cute_envelope = collect_envelope(self, cute_descriptors)
+                    except EnvelopeDeclined:
+                        pass
+            cudagraph_terminal_metadata = None
+            if trace_terminal:
+                from torch._inductor.runtime._cudagraph.metadata import collect_terminal_metadata, emit_terminal_metadata
+
+                cudagraph_terminal_metadata = collect_terminal_metadata(self)
 
             if config.triton.store_cubin and not config.triton.autotune_at_compile_time:
                 self.generate_reset_kernel_saved_flags()
@@ -2857,6 +2970,18 @@ class PythonWrapperCodegen(CodeGen):
         self.generate_after_suffix(result)
 
         self.generate_end(result)
+        if trace_terminal:
+            emit_terminal_metadata(result, self.launcher_fn_name, cudagraph_terminal_metadata)
+
+        if cute_descriptors is not None:
+            emit_descriptors(result, self.launcher_fn_name, cute_descriptors)
+        if cute_envelope is not None:
+            emit_envelope(result, self.launcher_fn_name, cute_envelope)
+        if has_cute_invocation:
+            result.writeline(f"{self.launcher_fn_name}._cudagraph_mixed_ir = {cute_mixed_ir!r}")
+        if cute_envelope is not None:
+            result.writeline('from torch._inductor.runtime._cudagraph._compiler.compiler_cute_handoff.descriptor import bind_compiler_invocation as _bind_cute_compiler_invocation')
+            result.writeline(f"_bind_cute_compiler_invocation({self.launcher_fn_name})")
 
         self.add_benchmark_harness(result)
 
@@ -2971,6 +3096,614 @@ class PythonWrapperCodegen(CodeGen):
                 self.estimate_peak = EfficientPeakEstimate()
             self.memory_plan_reuse()
 
+    def _cudagraph_literal(self, value: object) -> int | None:
+        if type(value) is SymbolicCallArg:
+            value = value.inner_expr
+        if type(value) is int:
+            return value
+        if isinstance(value, sympy.Expr):
+            value = value.xreplace(V.graph.sizevars.inv_precomputed_replacements)
+            value = V.graph.sizevars.simplify(value)
+            if isinstance(value, sympy.Expr) and not value.free_symbols:
+                value = value.doit()
+            if isinstance(value, sympy.Integer):
+                return int(value)
+        return None
+
+    def _cudagraph_call_record(
+        self,
+        line: KernelCallLine,
+        occurrence: int,
+        sources: dict[str, InputSource | BufferSource],
+        symbols: dict[sympy.Symbol, IntExpr] | None = None,
+    ) -> KernelCallRecord | MultiKernelCallRecord | None:
+        from ..runtime.cudagraph_multikernel import call_sources, KernelCallAlternative, MultiKernelCallRecord
+
+        if line.cudagraph_alternatives is not None:
+            if (type(line.cudagraph_alternatives) is not tuple or len(line.cudagraph_alternatives) < 2
+                    or line.cudagraph_user is not None or line.cudagraph_args is not None
+                    or not line.triton or line.raw_args or line.raw_keys):
+                return None
+            alternatives = []
+            for alternative in line.cudagraph_alternatives:
+                if type(alternative) is not tuple or len(alternative) != 5:
+                    return None
+                name, indices, triton_meta, inductor_meta, arguments = alternative
+                if (type(name) is not str or type(indices) is not tuple or type(arguments) is not tuple
+                        or any(type(index) is not int or not 0 <= index < len(line.call_args) for index in indices)):
+                    return None
+                child = dataclasses.replace(line, kernel_name=name,
+                    call_args=tuple(line.call_args[index] for index in indices), triton_meta=triton_meta,
+                    inductor_meta=inductor_meta, cudagraph_args=arguments, cudagraph_alternatives=None)
+                record = self._cudagraph_call_record(child, occurrence, sources, symbols)
+                if record is None:
+                    return None
+                alternatives.append(KernelCallAlternative(indices, record))
+            operands = []
+            for value in line.call_args:
+                if type(value) is str and value in sources:
+                    operands.append(sources[value])
+                    continue
+                expression = self._cudagraph_integer(value, symbols)
+                if expression is None:
+                    expression = self._cudagraph_template_grid(value, symbols)
+                if type(expression) is IntExpr:
+                    operands.append(ExpressionSource(expression))
+                elif type(expression) is int:
+                    operands.append(IntegerSource(expression))
+                else:
+                    return None
+            result = MultiKernelCallRecord(occurrence, line.kernel_name, tuple(operands), tuple(alternatives))
+            return result if call_sources(result) is not None else None
+        if line.cudagraph_user is not None:
+            return self._cudagraph_user_call_record(line, occurrence, sources, symbols)
+        if not line.triton or type(line.triton_meta) is not dict or type(line.inductor_meta) is not dict:
+            return None
+        meta = line.inductor_meta or {}
+        template = meta.get("cudagraph_generated_template") is True
+        call_args = line.call_args[:-3] if template else line.call_args
+        indices = meta.get("cudagraph_formal_indices")
+        provenance = meta.get("cudagraph_parameter_provenance")
+        signature = line.triton_meta.get("signature", {})
+        constants = line.triton_meta.get("constants", {})
+        if (
+            line.raw_args or line.raw_keys
+            or line.cudagraph_args is None
+            or len(line.cudagraph_args) != len(call_args)
+            or type(indices) is not dict or type(provenance) is not dict
+            or type(signature) is not dict or type(constants) is not dict
+            or any(type(name) is not str or type(index) is not int
+                   for name, index in indices.items())
+            or sorted(indices.values()) != list(range(len(indices)))
+            or any(type(name) is not str or type(ty) is not str or name not in indices
+                   for name, ty in signature.items())
+            or (not template and meta.get("grid_type") not in ("Grid1D", "Grid2D", "Grid3D", "SequentialComboKernelGrid"))
+            or (not template and meta.get("extra_launcher_args")) or meta.get("grid_extra_kwargs")
+            or (template and (len(line.call_args) < 3 or meta.get("grid_type") != "FixedGrid"
+                or tuple(meta.get("fixed_grid", ())) != ("_grid_0", "_grid_1", "_grid_2")
+                or tuple(meta.get("extra_launcher_args", ())) != ("_grid_0", "_grid_1", "_grid_2")))
+            or line.triton_meta.get("launch_pdl")
+            or line.triton_meta.get("launch_cooperative_grid")
+        ):
+            return None
+        arguments = []
+        pointer_formals = set()
+        supplied = set()
+        for call_index, (value, original) in enumerate(zip(call_args, line.cudagraph_args)):
+            if type(original) is not TritonCallArgument or type(original.arg) is not ArgName:
+                return None
+            arg, sig = original.arg, original.signature
+            if type(sig) not in (TensorArg, SizeArg):
+                return None
+            formal = arg.name
+            triton_type = signature.get(formal)
+            if (
+                arg.is_constexpr or formal != sig.name or formal not in indices
+                or formal in supplied or type(triton_type) is not str
+            ):
+                return None
+            supplied.add(formal)
+            source: InputSource | BufferSource | IntegerSource | ExpressionSource
+            if type(sig) is TensorArg:
+                pointer = provenance.get(formal)
+                if (
+                    type(value) is not str or value != sig.buffer or value not in sources
+                    or not triton_type.startswith("*") or V.graph.is_unspec_arg(value)
+                    or type(pointer) is not tuple or len(pointer) != 3 or pointer[0] != sig.buffer
+                ):
+                    return None
+                source = sources[value]
+                # Input normalization can move before the first kernel.
+                if type(source) is InputSource and pointer[1] is not False:
+                    return None
+                pointer_formals.add(formal)
+            elif type(sig) is SizeArg:
+                integer = self._cudagraph_integer(value, symbols)
+                if integer is None or integer != self._cudagraph_integer(sig.expr, symbols):
+                    return None
+                if type(integer) is IntExpr:
+                    if triton_type not in ("i32", "i64"):
+                        return None
+                    source = ExpressionSource(integer)
+                elif triton_type == "constexpr":
+                    constant = constants.get(formal)
+                    if type(constant) is not int or constant != integer:
+                        return None
+                    source = IntegerSource(integer)
+                elif triton_type in ("i32", "i64"):
+                    bits = 32 if triton_type == "i32" else 64
+                    if not -(2 ** (bits - 1)) <= integer < 2 ** (bits - 1):
+                        return None
+                    source = IntegerSource(integer)
+                else:
+                    return None
+            else:
+                return None
+            arguments.append(CallArgument(formal, indices[formal], call_index, triton_type, source))
+        if pointer_formals != set(provenance) or any(
+            signature.get(name) not in (None, "constexpr") for name in indices if name not in supplied
+        ):
+            return None
+        formals = tuple(sorted(indices, key=indices.__getitem__))
+        if template:
+            grid = tuple(self._cudagraph_template_grid(value, symbols) for value in line.call_args[-3:])
+            if any(value is None for value in grid):
+                return None
+            omitted = tuple((name, constants[name]) for name in formals if name not in supplied and name in constants)
+            if len(omitted) != len(formals) - len(supplied):
+                return None
+            return KernelCallRecord(occurrence, line.kernel_name, formals, tuple(arguments),
+                                    "FixedGrid", grid, omitted, True)
+        return KernelCallRecord(occurrence, line.kernel_name, formals, tuple(arguments), meta["grid_type"])
+
+    def _cudagraph_user_call_record(self, line, occurrence, sources, symbols):
+        from ..runtime.cudagraph_arg_mapping import FIXED_GRID_ARGUMENTS
+
+        op, meta = line.cudagraph_user, line.inductor_meta
+        if (type(op) is not ir.UserDefinedTritonKernel or not line.triton
+                or type(line.triton_meta) is not dict
+                or type(line.triton_meta.get("signature")) is not dict
+                or type(line.triton_meta.get("constants")) is not dict
+                or type(meta) is not dict or meta.get("cudagraph_user_kernel") is not True
+                or meta.get("grid_type") != "FixedGrid"
+                or tuple(meta.get("extra_launcher_args", ())) != FIXED_GRID_ARGUMENTS
+                or tuple(meta.get("fixed_grid", ())) != FIXED_GRID_ARGUMENTS
+                or line.cudagraph_args is not None or len(op.grid) != 1
+                or len(op.grid[0]) != 3 or len(line.call_args) < 3
+                or len(line.raw_args) != len(line.call_args) or len(line.raw_keys) != len(line.call_args)
+                or any(key != "" for key in line.raw_keys[-3:])):
+            return None
+        kernel, configs, restore, reset = op.get_kernel_and_metadata()
+        if configs or restore or reset:
+            return None
+        grid = tuple(self._cudagraph_user_grid(value, symbols) for value in op.grid[0])
+        if (any(value is None for value in grid)
+                or tuple(self._cudagraph_user_grid(value, symbols) for value in line.call_args[-3:]) != grid
+                or tuple(self._cudagraph_user_grid(value, symbols) for value in line.raw_args[-3:]) != grid):
+            return None
+        names = tuple(kernel.arg_names)
+        signature = line.triton_meta["signature"]
+        constants = line.triton_meta["constants"]
+        constexprs = {param.name for param in kernel.params if param.is_constexpr}
+        if (set(signature) != set(names) or set(constants) != constexprs
+                or any(type(value) not in (int, float, bool, str, type(None)) for value in constants.values())
+                or tuple(line.raw_keys[:-3]) != tuple(name for name in names if name not in constexprs)):
+            return None
+        arguments = []
+        for index, (name, raw, rendered) in enumerate(zip(line.raw_keys[:-3], line.raw_args[:-3], line.call_args[:-3])):
+            node = op.kwargs.get(name)
+            if raw is not node or type(signature[name]) is not str:
+                return None
+            if type(node) in (ir.ComputedBuffer, ir.InputBuffer):
+                if (type(rendered) is not str or rendered != node.get_name()
+                        or rendered not in sources or not signature[name].startswith("*")
+                        or V.graph.is_unspec_arg(rendered)):
+                    return None
+                source = sources[rendered]
+            else:
+                expression = self._cudagraph_integer(node, symbols)
+                if (not symbols or signature[name] not in ("i32", "i64")
+                        or type(expression) is not IntExpr
+                        or self._cudagraph_integer(rendered, symbols) != expression):
+                    return None
+                source = ExpressionSource(expression)
+            arguments.append(CallArgument(name, names.index(name), index, signature[name], source))
+        scalars = [argument for argument in arguments if type(argument.source) is ExpressionSource]
+        if symbols and (len(scalars) != 1 or len(set(symbols.values())) != 1):
+            return None
+        written = {dep.name for dep in op.arg_accesses.read_writes.writes}
+        if (not written or not written.issubset(line.raw_keys[:-3])
+                or any(type(argument.source) is InputSource and argument.formal in written for argument in arguments)):
+            return None
+        declared = tuple((name, constants[name]) for name in names if name in constexprs)
+        return KernelCallRecord(occurrence, line.kernel_name, names, tuple(arguments), "FixedGrid", grid, declared)
+
+    def _cudagraph_user_grid(self, value, symbols):
+        expression = self._cudagraph_integer(value, symbols)
+        if type(expression) is int:
+            return expression if 0 < expression < 2 ** 31 else None
+        if type(expression) is IntExpr:
+            return expression
+        if type(value) is SymbolicCallArg:
+            value = value.inner_expr
+        if isinstance(value, sympy.Expr):
+            value = V.graph.sizevars.simplify(value.xreplace(V.graph.sizevars.inv_precomputed_replacements))
+            if isinstance(value, (CeilDiv, FloorDiv)):
+                numerator, divisor = value.args
+                if isinstance(divisor, sympy.Integer) and 0 < divisor < 2 ** 31:
+                    if isinstance(value, FloorDiv):
+                        numerator = sympy.expand(numerator - divisor + 1)
+                    numerator = self._cudagraph_integer(numerator, symbols)
+                    if type(numerator) is IntExpr:
+                        return IntExpr("ceildiv", args=(numerator, IntExpr("constant", int(divisor))))
+        return None
+
+    def _cudagraph_integer(
+        self, value: object, symbols: dict[sympy.Symbol, IntExpr] | None
+    ) -> int | IntExpr | None:
+        literal = self._cudagraph_literal(value)
+        if literal is not None or not symbols:
+            return literal
+        if type(value) is SymbolicCallArg:
+            value = value.inner_expr
+        if isinstance(value, sympy.Expr):
+            value = value.xreplace(V.graph.sizevars.inv_precomputed_replacements)
+            value = V.graph.sizevars.simplify(value)
+            if isinstance(value, sympy.Symbol):
+                return symbols.get(value)
+            if isinstance(value, sympy.Mul) and len(value.args) == 2:
+                return pointwise_product(tuple(self._cudagraph_integer(arg, symbols) for arg in value.args))
+        return None
+
+    def _cudagraph_template_grid(self, value, symbols):
+        expression = self._cudagraph_user_grid(value, symbols)
+        if expression is not None:
+            return expression
+        if type(value) is SymbolicCallArg:
+            value = value.inner_expr
+        if isinstance(value, sympy.Expr):
+            value = V.graph.sizevars.simplify(value.xreplace(V.graph.sizevars.inv_precomputed_replacements))
+            if isinstance(value, (sympy.Mul, sympy.Add)):
+                operands = [self._cudagraph_template_grid(arg, symbols) for arg in value.args]
+                if len(operands) >= 2 and all(operand is not None for operand in operands):
+                    operands = [IntExpr("constant", operand) if type(operand) is int else operand for operand in operands]
+                    result = operands[0]
+                    for operand in operands[1:]:
+                        result = IntExpr("multiply" if isinstance(value, sympy.Mul) else "add", args=(result, operand))
+                    return result
+        return None
+
+    def _cudagraph_integer_bindings(self):
+        names = tuple(self.get_graph_input_names())
+        inputs = self.get_graph_inputs()
+        if len(set(names)) != len(names) or any(name not in inputs for name in names):
+            return None
+        # codegen_inputs binds symbols first, in graph_inputs order.
+        if tuple(name for name, value in inputs.items() if isinstance(value, sympy.Symbol)) != tuple(
+            name for name in names if isinstance(inputs[name], sympy.Symbol)
+        ):
+            return None
+        plan = self._input_symbol_binding_plan
+        indices = {name: index for index, name in enumerate(names)}
+        sizevars = V.graph.sizevars
+        rows, symbols, declared, roots = [], {}, set(), set()
+        for index, name in enumerate(names):
+            value = inputs[name]
+            if not isinstance(value, sympy.Expr):
+                continue
+            if not isinstance(value, sympy.Symbol) or value.is_integer is not True or value.name in declared:
+                return None
+            if plan is None or plan.input_names != names:
+                return None
+            canonical = sizevars.simplify(value)
+            if (not isinstance(canonical, sympy.Symbol) or not sizevars.statically_known_gt(canonical, 0)
+                    or value != canonical and sizevars.shape_env.replacements.get(value) != canonical):
+                return None
+            source = plan.sources.get(value)
+            if source is None or plan.sources.get(canonical) != source:
+                return None
+            source_index = indices.get(source)
+            if source_index is None:
+                return None
+            expression = IntExpr("boxed", source_index)
+            if source_index == index:
+                roots.add(index)
+            elif source_index not in roots or symbols.get(canonical) != expression:
+                return None
+            symbols[value] = symbols[canonical] = expression
+            rows.append(IntegerInput(value.name, index, None if source_index == index else source_index))
+            declared.add(value.name)
+        return tuple(rows), symbols
+
+    def collect_cudagraph_call_records(self) -> WrapperCallRecords | None:
+        graph = V.graph
+        if (
+            type(self) is not PythonWrapperCodegen or graph.cpp_wrapper or graph.aot_mode
+            or graph.partition_maps or config.graph_partition or _coor_enabled()
+            or graph.effectful_ops or graph.mutated_inputs or graph.constants
+            or any(type(op) not in (ir.ComputedBuffer, ir.TritonTemplateBuffer, ir.MultiTemplateBuffer,
+                                    ir.UserDefinedTritonKernel) for op in graph.operations)
+            or self._multistream_alignment_copies
+            or config.cuda_backend != "triton" or not config.use_static_triton_launcher
+            or config.generate_intermediate_hooks or config.profiler_mark_wrapper_call
+            or config.profile_bandwidth or config.nan_asserts or config.annotate_training
+            or config.incremental_autotune or config.triton.debug_sync_graph
+            or config.triton.debug_sync_kernel or config.triton.proton_profiling
+            or config.triton.store_cubin
+            or config.aot_inductor.debug_intermediate_value_printer != "0"
+        ):
+            return None
+        device = next((line.device for line in self.lines if type(line) is KernelCallLine), None)
+        if device is None or device.type != "cuda" or device.index is None or torch.version.hip is not None:
+            return None
+
+        input_names = tuple(self.get_graph_input_names())
+        inputs = self.get_graph_inputs()
+        bindings = self._cudagraph_integer_bindings()
+        if bindings is None:
+            return None
+        integer_inputs, symbols = bindings
+        dynamic = bool(integer_inputs)
+        shape_sources = {row.boxed_index for row in integer_inputs if row.source_index is None}
+        user_call = any(type(op) is ir.UserDefinedTritonKernel for op in graph.operations)
+        if dynamic and (
+            not shape_sources or len(input_names) <= len(integer_inputs)
+            or len(set(input_names)) != len(input_names)
+            or not graph.operations
+        ):
+            return None
+        if dynamic:
+            for op in graph.operations:
+                if type(op) in (ir.TritonTemplateBuffer, ir.MultiTemplateBuffer):
+                    if op.mutated_inputs:
+                        return None
+                    continue
+                if type(op) is ir.UserDefinedTritonKernel:
+                    if len(integer_inputs) != 1:
+                        return None
+                    continue
+                if type(op.data) is ir.Pointwise:
+                    continue
+                if not isinstance(op.data, ir.Reduction):
+                    return None
+                ranges = tuple(self._cudagraph_integer(value, symbols) for value in op.data.reduction_ranges)
+                if not ranges or any(value is None or type(value) is int and not 0 < value < 2 ** 63
+                                     for value in ranges):
+                    return None
+
+        def supported_buffer(node: ir.Buffer) -> bool:
+            layout = node.get_layout()
+            if type(layout) is not ir.FixedLayout or layout.device != device:
+                return False
+            literal = all(self._cudagraph_literal(value) is not None
+                          for value in (*layout.size, *layout.stride, layout.offset))
+            if not dynamic or (type(node) in (ir.InputBuffer, ir.DonatedBuffer) and literal):
+                return literal
+            shape = tuple(self._cudagraph_integer(value, symbols) for value in layout.size)
+            numel = pointwise_product(shape)
+            if numel is None or type(numel) is IntExpr and not set(
+                pointwise_expression_inputs(numel) or ()
+            ).issubset(shape_sources):
+                return False
+            stride = (1,) if len(shape) == 1 else (shape[1], 1)
+            return (
+                tuple(self._cudagraph_integer(value, symbols) for value in layout.stride) == stride
+                and self._cudagraph_literal(layout.offset) == 0
+            )
+
+        sources: dict[str, InputSource | BufferSource] = {}
+        for index, name in enumerate(input_names):
+            node = inputs[name]
+            if isinstance(node, sympy.Symbol):
+                continue
+            while type(node) in (ir.TensorBox, ir.StorageBox):
+                node = node.data
+            if type(node) not in (ir.InputBuffer, ir.DonatedBuffer) or node.get_name() != name or not supported_buffer(node):
+                return None
+            sources[name] = InputSource(index)
+
+        calls = []
+        copies = []
+        copied = set()
+        allocations = {}
+        discarded = set()
+        skip_reuse = None
+        depth = 0
+        for index, line in enumerate(self.lines):
+            if index == skip_reuse:
+                skip_reuse = None
+                continue
+            kind = type(line)
+            if kind is EnterDeviceContextManagerLine:
+                if depth or line.device_idx != device.index:
+                    return None
+                depth = 1
+            elif kind is ExitDeviceContextManagerLine:
+                if depth != 1:
+                    return None
+                depth = 0
+            elif kind is InputAlignmentLine:
+                source = sources.get(line.name)
+                if type(source) is not InputSource or source.index in copied:
+                    return None
+                copied.add(source.index)
+                copies.append(AlignmentCopy(source.index, len(calls)))
+            elif kind is AllocateLine:
+                node = line.node
+                if (
+                    depth != 1 or line.comm_buffer or type(node) not in (ir.ComputedBuffer, ir.TritonTemplateBuffer, ir.MultiTemplateBuffer)
+                    or node.get_name() in sources or node.get_name() in allocations or node.get_name() in discarded
+                ):
+                    return None
+                reuse = self.lines[index + 1] if index + 1 < len(self.lines) else None
+                if type(reuse) is ReuseLine:
+                    target = reuse.reused_as
+                    if (
+                        not dynamic or calls or reuse.node is not node or type(target) is not ir.ComputedBuffer
+                        or reuse.delete_old is not True or reuse.comm_buffer
+                        or node.get_name() == target.get_name()
+                        or self._cudagraph_owned_buffer(node, device, symbols) is None
+                    ):
+                        return None
+                    old, new = node.get_layout(), target.get_layout()
+                    if (
+                        type(new) is not ir.FixedLayout or old.device != new.device or old.dtype != new.dtype
+                        or tuple(old.size) != tuple(new.size) or len(old.stride) != len(new.stride)
+                        or self._cudagraph_literal(new.offset) != 0
+                        or any(left != right and self._cudagraph_literal(size) != 1
+                               for size, left, right in zip(old.size, old.stride, new.stride))
+                    ):
+                        return None
+                    names = {node.get_name(), target.get_name()}
+                    operations = [op for op in graph.operations if op.get_name() in names]
+                    if (
+                        len(operations) != 2 or not any(op is node for op in operations)
+                        or not any(op is target for op in operations)
+                        or any(names.intersection(op.get_inputs_that_alias_output()) for op in graph.operations)
+                    ):
+                        return None
+                    # Only metadata changes: capture still executes the original fresh allocation and reuse.
+                    discarded.add(node.get_name())
+                    node = target
+                    skip_reuse = index + 1
+                if (
+                    not supported_buffer(node) or node.get_name() in sources
+                    or node.get_name() in allocations or node.get_name() in discarded
+                ):
+                    return None
+                sources[node.get_name()] = BufferSource(node.get_name())
+                allocations[node.get_name()] = node
+            elif kind in (FreeLine, FreeIfNotReusedLine):
+                if (line.node.get_name() in discarded
+                        or kind is FreeIfNotReusedLine and (line.is_reused or line.comm_buffer)):
+                    return None
+                sources.pop(line.node.get_name(), None)
+            elif kind is KernelCallLine:
+                if depth != 1 or line.device != device or line.current_stream_idx not in (None, DEFAULT_STREAM_IDX):
+                    return None
+                record = self._cudagraph_call_record(line, len(calls), sources, symbols)
+                if record is None:
+                    return None
+                calls.append(record)
+            elif kind is SymbolicCallArgLine:
+                if self._cudagraph_integer(line.arg, symbols) is None and (
+                    (not user_call or self._cudagraph_user_grid(line.arg, symbols) is None)
+                    and self._cudagraph_template_grid(line.arg, symbols) is None
+                ):
+                    return None
+            elif kind not in (
+                CommentLine, LineContext, KernelDefinitionLine, NullLine,
+                AssertSizeStrideLine, GroupedAssertSizeStrideLine, AssertAlignmentLine,
+            ):
+                return None
+        if depth or not calls:
+            return None
+        outputs = self._cudagraph_owned_outputs(allocations, sources, device, symbols)
+        buffers = []
+        for node in allocations.values():
+            layout = self._cudagraph_owned_buffer(node, device, symbols)
+            if layout is None:
+                break
+            buffers.append(layout)
+        complete = tuple(buffers) if len(buffers) == len(allocations) else None
+        if dynamic:
+            from ..runtime.cudagraph_multikernel import MultiKernelCallRecord
+
+            if (
+                any(child.grid_type not in ("Grid1D", "FixedGrid", "SequentialComboKernelGrid")
+                    for call in calls for child in (tuple(choice.call for choice in call.alternatives)
+                        if type(call) is MultiKernelCallRecord else (call,)))
+                or not outputs or not complete
+            ):
+                return None
+        records = WrapperCallRecords(4 if dynamic else 3, device.index, input_names, tuple(calls),
+                                     tuple(copies), outputs, complete, tuple(integer_inputs))
+        if dynamic and (bind_alignment_copies(records) is None or bind_wrapper_allocations(records) is None):
+            return None
+        return records
+
+    def _cudagraph_owned_buffer(
+        self, node: ir.ComputedBuffer, device: torch.device,
+        symbols: dict[sympy.Symbol, IntExpr] | None = None,
+    ) -> OwnedBuffer | None:
+        layout = node.get_layout()
+        if type(layout) is not ir.FixedLayout or layout.device != device or self._cudagraph_literal(layout.offset) != 0:
+            return None
+        size = tuple(self._cudagraph_integer(value, symbols) for value in layout.size)
+        stride = tuple(self._cudagraph_integer(value, symbols) for value in layout.stride)
+        allocation_shape = tuple(V.graph.get_allocation_size(node))
+        allocation_size = tuple(self._cudagraph_integer(value, symbols) for value in allocation_shape)
+        if (
+            any(value is None or (type(value) is int and value < 0) for value in (*size, *stride))
+            or len(size) != len(stride) or allocation_size != size
+            or self.codegen_python_shape_tuple(layout.size) != self.codegen_python_shape_tuple(allocation_shape)
+        ):
+            return None
+        return OwnedBuffer(BufferSource(node.get_name()), layout.dtype, size, stride)
+
+    def _cudagraph_owned_outputs(
+        self,
+        allocations: dict[str, ir.ComputedBuffer],
+        sources: dict[str, InputSource | BufferSource],
+        device: torch.device,
+        symbols: dict[sympy.Symbol, IntExpr] | None = None,
+    ) -> tuple[OwnedBuffer | BorrowedInputOutput | IntegerOutput | None, ...] | None:
+        outputs = []
+        returned = set()
+        for node in self.get_graph_outputs():
+            if node is None or type(node) is ir.NoneAsConstantBuffer:
+                outputs.append(None)
+                continue
+            while type(node) in (ir.TensorBox, ir.StorageBox):
+                node = node.data
+            if type(node) is ir.ShapeAsConstantBuffer:
+                value = self._cudagraph_integer(node.expr, symbols)
+                if value is None or type(value) is int and not -(2 ** 63) <= value < 2 ** 63:
+                    return None
+                outputs.append(IntegerOutput(value))
+                continue
+            if type(node) is ir.InputBuffer:
+                name = node.get_name()
+                source = sources.get(name)
+                names = tuple(self.get_graph_input_names())
+                if (type(source) is not InputSource or type(source.index) is not int
+                        or not 0 <= source.index < len(names) or names[source.index] != name):
+                    return None
+                original = self.get_graph_inputs()[name]
+                while type(original) in (ir.TensorBox, ir.StorageBox):
+                    original = original.data
+                layout = node.get_layout()
+                if (original is not node or type(layout) is not ir.FixedLayout or layout.device != device
+                        or self._cudagraph_literal(layout.offset) != 0):
+                    return None
+                outputs.append(BorrowedInputOutput(source))
+                continue
+            if type(node) not in (ir.ComputedBuffer, ir.TritonTemplateBuffer, ir.MultiTemplateBuffer):
+                return None
+            name = node.get_name()
+            source = sources.get(name)
+            if (
+                allocations.get(name) is not node or type(source) is not BufferSource
+                or name in returned
+            ):
+                return None
+            layout = self._cudagraph_owned_buffer(node, device, symbols)
+            if layout is None:
+                return None
+            outputs.append(layout)
+            returned.add(name)
+        if outputs and not any(type(output) in (OwnedBuffer, BorrowedInputOutput) for output in outputs):
+            return None
+        return tuple(outputs)
+
+    def _write_input_symbol_binding(self, symbol: sympy.Symbol, rhs: str | sympy.Symbol) -> None:
+        self.prefix.writeline(f"{symbol} = {rhs}")
+        plan = self._input_symbol_binding_plan
+        if plan is not None and plan.input_names is None:
+            source = rhs if isinstance(rhs, str) else plan.sources.get(rhs)
+            if source is not None:
+                plan.sources[symbol] = source
+
     def maybe_emit_replacement_aliases(
         self,
         sym: sympy.Symbol,
@@ -2997,7 +3730,7 @@ class PythonWrapperCodegen(CodeGen):
                 and is_backed_symbol(src)
                 and is_backed_symbol(sym)
             ):
-                self.prefix.writeline(f"{src} = {sym}")
+                self._write_input_symbol_binding(src, sym)
                 bound_vars.add(src)
             elif (
                 src == sym
@@ -3006,7 +3739,7 @@ class PythonWrapperCodegen(CodeGen):
                 and is_backed_symbol(sym)
                 and is_backed_symbol(tgt)
             ):
-                self.prefix.writeline(f"{tgt} = {sym}")
+                self._write_input_symbol_binding(tgt, sym)
                 bound_vars.add(tgt)
 
     def codegen_input_symbol_assignment(
@@ -3020,12 +3753,12 @@ class PythonWrapperCodegen(CodeGen):
             raw_value = value
             value = V.graph.sizevars.simplify(raw_value)
             if isinstance(value, sympy.Symbol) and value not in bound_vars:
-                self.prefix.writeline(f"{value} = {name}")
+                self._write_input_symbol_binding(value, name)
                 bound_vars.add(value)
                 self.maybe_emit_replacement_aliases(value, bound_vars)
             if isinstance(raw_value, sympy.Symbol):
                 if raw_value not in bound_vars:
-                    self.prefix.writeline(f"{raw_value} = {name}")
+                    self._write_input_symbol_binding(raw_value, name)
                     bound_vars.add(raw_value)
                 return
             if not isinstance(value, sympy.Symbol):
@@ -3075,6 +3808,9 @@ class PythonWrapperCodegen(CodeGen):
 
     def codegen_inputs(self):
         """Assign input symbolic shapes to wrapper-local variables."""
+        plan = _InputSymbolBindingPlan() if type(self) is PythonWrapperCodegen else None
+        self._input_symbol_binding_plan = plan
+        input_names = tuple(self.get_graph_input_names()) if plan is not None else None
         bound_vars = OrderedSet[sympy.Symbol]()
         # There is a subtle case in the cpp wrapper codegen which requires generating
         # symbol inputs first followed by non-symbol ones.
@@ -3248,6 +3984,8 @@ class PythonWrapperCodegen(CodeGen):
             if not isinstance(value, ir.TensorBox):
                 continue
             _verify_input_symbol_assignment(input_name, value, bound_vars)
+        if plan is not None:
+            plan.input_names = input_names
 
     def ensure_size_computed(self, sym: sympy.Symbol):
         if isinstance(sym, sympy.Symbol) and symbol_is_type(sym, SymT.PRECOMPUTED_SIZE):
@@ -3726,7 +4464,7 @@ class PythonWrapperCodegen(CodeGen):
         """
         from torch._dynamo.device_interface import get_interface_for_device
 
-        from ..runtime.triton_compat import GPUTarget
+        from ..runtime.triton_compat import Config, GPUTarget
         from ..runtime.triton_helpers import try_filter_backend_options_for_target
         from ..runtime.triton_heuristics import (
             config_to_dict,
@@ -3735,7 +4473,6 @@ class PythonWrapperCodegen(CodeGen):
         )
         from .common import (
             ConstexprArg,
-            KernelArgType,
             SizeArg,
             TensorArg,
             TMADescriptorArg,
@@ -3964,6 +4701,41 @@ class PythonWrapperCodegen(CodeGen):
             inductor_meta["declared_constexpr_names"] = [
                 arg_names[i] for i in constexprs
             ]
+
+        declared_constants = {arg_names[i] for i in constexprs}
+        candidate_constants = [triton_meta["constants"]]
+        configs_supported = not configs
+        if configs:
+            # Config fields omitted by config_to_dict must retain their defaults.
+            config_fields = {"kwargs", "num_warps", "num_stages", "num_ctas", "maxnreg", "pre_hook", "ir_override"}
+            config_options = {"num_warps", "num_stages", "num_ctas", "maxnreg", "num_consumer_groups", "num_buffers_warp_spec"}
+            configs_supported = (
+                not config.unsafe_ignore_unsupported_triton_autotune_args
+                and all(
+                    type(cfg) is Config and set(vars(cfg)) == config_fields
+                    and type(cfg.kwargs) is dict
+                    and type(cfg.num_warps) is int and type(cfg.num_stages) is int
+                    and type(cfg.num_ctas) is int and cfg.num_ctas == 1
+                    and cfg.maxnreg is None and cfg.pre_hook is None and cfg.ir_override is None
+                    and not set(cfg.kwargs).intersection(triton_meta["constants"])
+                    and not set(cfg.kwargs).intersection(config_options)
+                    for cfg in configs
+                )
+            )
+            if configs_supported:
+                candidate_constants = [{**triton_meta["constants"], **cfg.kwargs} for cfg in configs]
+
+        if (configs_supported and not restore_value_args and not reset_to_zero_args
+                and grids and (len(grids) == 1 or len(grids) == len(configs))
+                and all(len(grid) == 3 for grid in grids)
+                and not triton_meta.get("backend_options")
+                and all(set(values) == declared_constants
+                        and all(type(value) in (int, bool, float, str, type(None)) for value in values.values())
+                        for values in candidate_constants)
+                and all(type(value) is str and (value.startswith("*") or value in ("constexpr", "i32", "i64"))
+                        for value in triton_signature.values())
+                and epilogue_fusion is None):
+            inductor_meta["cudagraph_user_kernel"] = True
 
         # Distinguish between different functions using function id
         cache_key: Any = [id(kernel.fn)]
@@ -4301,6 +5073,9 @@ class PythonWrapperCodegen(CodeGen):
         triton_meta: TritonMeta | None = None,
         inductor_meta=None,
         original_fxnode_name=None,
+        cudagraph_args: tuple[TritonCallArgument, ...] | None = None,
+        cudagraph_user: ir.UserDefinedTritonKernel | None = None,
+        cudagraph_alternatives: tuple[tuple[Any, ...], ...] | None = None,
     ):
         """
         Generates kernel call code.
@@ -4321,6 +5096,15 @@ class PythonWrapperCodegen(CodeGen):
 
         device = device or V.graph.get_current_device_or_throw()
         current_stream_idx = V.graph.scheduler.current_stream_idx
+        computations = None
+        if self._collect_cute_prefix:
+            from ..scheduler import BaseSchedulerNode
+
+            current = V.graph.scheduler.current_node
+            if isinstance(current, BaseSchedulerNode):
+                group = tuple(node.node for node in current.get_nodes())
+                if group and all(type(node) is ir.ComputedBuffer for node in group):
+                    computations = group
         self.writeline(
             KernelCallLine(
                 self,
@@ -4341,6 +5125,10 @@ class PythonWrapperCodegen(CodeGen):
                 # pyrefly: ignore [bad-argument-type]
                 original_fxnode_name=original_fxnode_name,
                 current_stream_idx=current_stream_idx,
+                cudagraph_args=cudagraph_args,
+                cudagraph_user=cudagraph_user,
+                cudagraph_computations=computations,
+                cudagraph_alternatives=cudagraph_alternatives,
             )
         )
 

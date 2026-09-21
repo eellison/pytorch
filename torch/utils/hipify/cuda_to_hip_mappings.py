@@ -3463,6 +3463,10 @@ C10_MAPPINGS = collections.OrderedDict([
     ("c10/cuda/CUDAAlgorithm.h", "c10/hip/HIPAlgorithm.h"),
     ("c10/cuda/CUDAAllocatorConfig.h", "c10/hip/HIPAllocatorConfig.h"),
     ("c10/cuda/CUDACachingAllocator.h", "c10/hip/HIPCachingAllocator.h"),
+    (
+        "c10/cuda/CUDACachingAllocatorPendingGraph.h",
+        "c10/hip/HIPCachingAllocatorPendingGraph.h",
+    ),
     ("c10/cuda/CUDADeviceAssertion.h", "c10/hip/HIPDeviceAssertion.h"),
     ("c10/cuda/CUDADeviceAssertionHost.h", "c10/hip/HIPDeviceAssertionHost.h"),
     ("c10/cuda/CUDAException.h", "c10/hip/HIPException.h"),

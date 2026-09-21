@@ -6425,11 +6425,47 @@ class LocalMapWrappedHigherOrderVariable(WrapHigherOrderVariable):
         return out
 
 
+class CuTeInvocationHigherOrderVariable(TorchHigherOrderOperatorVariable):
+    _HOP_NAME = "invoke_cute"
+
+    def _call_function(self, tx, args, kwargs):
+        from .builder import wrap_fx_proxy
+        from torch._inductor.runtime._cudagraph._compiler.compiler_cute_handoff.invocation import (
+            check_implementation, invoke_cute, invoke_cute_functional, resolve_entry,
+        )
+
+        args, kwargs = LazyVariableTracker.realize_all((args, kwargs))
+        check_implementation()
+        if (self.value not in (invoke_cute, invoke_cute_functional) or kwargs
+                or len(args) < 3 or not args[0].is_python_constant()
+                or type(args[0].as_python_constant()) is not str
+                or not all(arg.is_tensor() for arg in args[1:])):
+            unimplemented(
+                gb_type="unsupported CuTe invocation",
+                context=str(self.value),
+                explanation="CuTe invocation requires a constant entry key, Tensor sources and a destination Tensor.",
+                hints=[],
+            )
+        key = args[0].as_python_constant()
+        if len(args) - 1 != len(resolve_entry(key).formals):
+            unimplemented(
+                gb_type="unsupported CuTe invocation",
+                context=str(self.value),
+                explanation="CuTe invocation operands must match the registered Tensor formals.",
+                hints=[],
+            )
+        proxy = tx.output.create_proxy("call_function", self.value,
+                                       (key, *(arg.as_proxy() for arg in args[1:])), {})
+        return wrap_fx_proxy(tx=tx, proxy=proxy)
+
+
 from .invoke_subgraph import InvokeSubgraphHigherOrderVariable
 
 
 # Map operator names to their corresponding variable for fast TorchHigherOrderOperatorVariable.make()
 _hop_name_to_variable_class = {
+    "invoke_cute": CuTeInvocationHigherOrderVariable,
+    "invoke_cute_functional": CuTeInvocationHigherOrderVariable,
     "cond": CondHigherOrderVariable,
     "switch": SwitchHigherOrderVariable,
     "while_loop": WhileLoopHigherOrderVariable,

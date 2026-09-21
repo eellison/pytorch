@@ -1,0 +1,48 @@
+{
+  "function": 203709952,
+  "kernel": 203596976,
+  "library": 212785520,
+  "parameters": [
+    {
+      "index": 0,
+      "offset": 0,
+      "size": 32
+    },
+    {
+      "index": 1,
+      "offset": 64,
+      "size": 128
+    },
+    {
+      "index": 2,
+      "offset": 192,
+      "size": 12
+    },
+    {
+      "index": 3,
+      "offset": 256,
+      "size": 128
+    },
+    {
+      "index": 4,
+      "offset": 384,
+      "size": 12
+    },
+    {
+      "index": 5,
+      "offset": 448,
+      "size": 128
+    },
+    {
+      "index": 6,
+      "offset": 576,
+      "size": 12
+    }
+  ],
+  "resources": {
+    "max_dynamic_shared": 232448,
+    "max_threads": 1024,
+    "static_shared": 0
+  },
+  "symbol": "kernel_cutlass_kernel__upstream_blackwell_gemmDenseGemmKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK12812816_TVLayoutA1128161281128_TVLayoutB_0"
+}

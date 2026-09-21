@@ -6,9 +6,12 @@
 #include <c10/cuda/CUDAGraphsC10Utils.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
+#include <c10/util/ArrayRef.h>
 #include <c10/util/flat_hash_map.h>
 
+#include <atomic>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <stack>
 #include <vector>
@@ -19,6 +22,10 @@
 // it the same definition as in CUDA 12.4.
 typedef unsigned long long cudaGraphConditionalHandle;
 #endif // defined(USE_ROCM) || !(defined(CUDA_VERSION) && CUDA_VERSION >= 12040)
+
+namespace c10::cuda::CUDACachingAllocator {
+class PendingGraphInputs;
+}
 
 namespace at {
 
@@ -43,10 +50,29 @@ TORCH_CUDA_CPP_API bool is_graph_capture_active();
 #endif // defined(USE_ROCM)
 
 struct CUDAGraph;
+namespace detail {
+struct KernelNodeUpdate;
+struct KernelPointerBinding;
+struct KernelScalarBinding;
+struct KernelGridBinding;
+struct KernelTensorMapBinding;
+struct KernelMemsetBinding;
+struct KernelHostTableBinding;
+struct KernelMemcpyBinding;
+struct KernelRngBinding;
+struct KernelTemplateBinding;
+struct CapturedGraphSnapshot;
+class KernelParamUpdateBatch;
+class KernelPointerUpdateBatch;
+class KernelParamCache;
+class GraphReplayLease;
+} // namespace detail
 
 TORCH_CUDA_CPP_API CUDAGraph* get_graph_from_capture_id(CaptureId_t capture_id);
 
 struct TORCH_CUDA_CPP_API CUDAGraph {
+  friend class detail::GraphReplayLease;
+
   CUDAGraph(bool keep_graph=false);
   ~CUDAGraph();
 
@@ -93,6 +119,30 @@ struct TORCH_CUDA_CPP_API CUDAGraph {
   void capture_end_pre();
   void capture_end_post();
   void instantiate();
+  std::shared_ptr<detail::KernelParamUpdateBatch> prepare_kernel_params(
+      std::vector<detail::KernelNodeUpdate> updates);
+  void update_kernel_params(const detail::KernelParamUpdateBatch& updates);
+  // Caller serializes mutations and keeps graph, modules and data alive through
+  // completion. These private methods bypass Python replay hooks and tracking.
+  std::shared_ptr<detail::KernelPointerUpdateBatch> prepare_kernel_pointer_updates(
+      std::vector<detail::KernelPointerBinding> bindings, size_t pointer_count);
+  std::shared_ptr<detail::KernelPointerUpdateBatch> prepare_kernel_replay_updates(
+      std::vector<detail::KernelPointerBinding> pointers,
+      size_t pointer_count,
+      std::vector<detail::KernelScalarBinding> scalars,
+      std::vector<detail::KernelGridBinding> grids,
+      size_t value_count,
+      std::vector<detail::KernelTensorMapBinding> tensor_maps,
+      std::vector<detail::KernelMemsetBinding> memsets,
+      std::vector<detail::KernelHostTableBinding> host_tables,
+      std::vector<detail::KernelMemcpyBinding> memcpys,
+      std::vector<detail::KernelRngBinding> rngs,
+      std::vector<detail::KernelTemplateBinding> templates);
+  void replay_kernel_pointer_updates(
+      const detail::KernelPointerUpdateBatch& updates,
+      c10::ArrayRef<uintptr_t> pointers);
+  detail::CapturedGraphSnapshot inspect_captured_kernel_nodes(
+      const std::vector<uintptr_t>& nodes);
   // True once the cudaGraphExec_t has been instantiated (by capture_end when
   // keep_graph=false, or by an explicit instantiate()). The Python replay()
   // wrapper uses this to instantiate on demand for keep_graph=true.
@@ -101,6 +151,7 @@ struct TORCH_CUDA_CPP_API CUDAGraph {
   }
   void replay();
   void reset();
+  void check_not_owned() const;
   MempoolId_t pool();
   std::vector<MempoolId_t> pools();
   void retain_pool(MempoolId_t pool);
@@ -119,6 +170,23 @@ struct TORCH_CUDA_CPP_API CUDAGraph {
       const Tensor& scalar_cuda_pred_tensor);
 
  private:
+  void clear_kernel_params();
+  void replay_impl(c10::cuda::CUDACachingAllocator::PendingGraphInputs* pending = nullptr);
+  void reset_impl();
+  bool check_capture_pool_retirement() const;
+  void release_capture_pools();
+  void validate_pointer_updates(
+      const detail::KernelPointerUpdateBatch& updates, size_t pointer_count) const;
+  void replay_pointer_updates_impl(
+      const detail::KernelPointerUpdateBatch& updates,
+      c10::ArrayRef<uintptr_t> pointers,
+      c10::cuda::CUDACachingAllocator::PendingGraphInputs* pending = nullptr);
+  void replay_kernel_updates_impl(
+      const detail::KernelPointerUpdateBatch& updates,
+      c10::ArrayRef<uintptr_t> pointers,
+      c10::ArrayRef<int64_t> values,
+      c10::cuda::CUDACachingAllocator::PendingGraphInputs* pending = nullptr);
+  std::atomic<const detail::GraphReplayLease*> replay_owner_{nullptr};
   template <typename StreamType>
   std::function<bool(StreamType)> create_allocate_filter() const;
   std::function<bool(cudaStream_t)> create_child_allocate_filter();
@@ -192,6 +260,7 @@ struct TORCH_CUDA_CPP_API CUDAGraph {
   static constexpr c10::DeviceIndex UNDEFINED_DEVICE = -1;
   c10::DeviceIndex capture_dev_{UNDEFINED_DEVICE};
 
+  std::shared_ptr<detail::KernelParamCache> kernel_params_;
   bool keep_graph_;
   cudaStreamCaptureMode capture_mode_{};
 

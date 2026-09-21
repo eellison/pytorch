@@ -1,4 +1,5 @@
 #include <c10/cuda/CUDACachingAllocator.h>
+#include <c10/cuda/CUDACachingAllocatorPendingGraph.h>
 
 #include <c10/core/RingBuffer.h>
 #include <c10/core/impl/GPUTrace.h>
@@ -43,6 +44,7 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <new>
@@ -150,14 +152,16 @@ namespace Native {
  *
  * To guarantee a graph's baked in addresses are safe to reuse in replay,
  * DeviceAllocator satisfies allocations from a graph-private memory pool during
- * capture, and doesn't begin cudaFreeing those addresses until the graph is
- * destroyed.
+ * capture, and doesn't begin cudaFreeing those addresses until the capture's
+ * pool reservation is released. Ordinary graphs retain it until destruction;
+ * an exclusively owned compiler replay may retire it after preparing complete
+ * pointer rebinding, before any subsequent execution.
  *
  * Within the private pool, allocations are freed and reassigned as usual during
  * capture. Memory regions will be used in a consistent order during replay. So
  * a private pool doesn't use memory more wastefully than the default pools
  * during capture, but it does reserve its high-water mark of used memory away
- * from the default pools as long as the capture(s) it served survive
+ * from the default pools as long as the capture(s) retain their pool reservations
  * (regardless whether those captures are idle or replaying).
  *
  * CUDAGraph's requests for private pools are mediated by
@@ -192,6 +196,8 @@ void decrease_stat_array(
 
 struct Block;
 struct PrivatePool;
+struct PendingGraphState;
+using PendingGraphBlocks = std::map<const void*, Block*>;
 
 struct BlockComparatorSizeCounterAddress {
   bool operator()(const Block* a, const Block* b) const;
@@ -210,6 +216,10 @@ struct BlockPool {
   std::set<Block*, BlockComparatorSizeCounterAddress> blocks;
   std::set<Block*, BlockComparatorAddress> blocks_by_addr;
   std::set<Block*, BlockComparatorAddress> unmapped;
+  struct Nodes {
+    decltype(blocks)::node_type by_size;
+    decltype(blocks_by_addr)::node_type by_address;
+  };
   // NOLINTNEXTLINE(cppcoreguidelines-avoid-const-or-ref-data-members)
   const bool is_small;
   PrivatePool* owner_PrivatePool;
@@ -218,6 +228,7 @@ struct BlockPool {
   // Add a Block into blocks set with updating gc counter.
   std::pair<decltype(blocks)::iterator, bool> insert_into_blocks(Block* block);
   size_t erase_from_blocks(Block* block);
+  void insert_into_blocks(Nodes nodes);
 
   MempoolId_t owner_MempoolId() const;
 };
@@ -234,6 +245,7 @@ struct Block {
   BlockPool* pool{nullptr}; // owning memory pool
   void* ptr{nullptr}; // memory address
   bool allocated{false}; // in-use flag
+  PendingGraphState* pending_graph{nullptr};
   bool mapped{true}; // is the virtual address range this Block references
                      // backed by physical pages. Always true when
                      // expandable_segment_ is null. When false
@@ -294,6 +306,23 @@ struct Block {
   }
 };
 
+enum class PendingGraphPhase { Preparing, Submitting, Finished, Quarantined };
+
+struct PendingGraphState {
+  Block* block = nullptr;
+  BlockPool::Nodes free_nodes;
+  PendingGraphBlocks::node_type publication_node;
+  PendingGraphPhase phase = PendingGraphPhase::Preparing;
+  size_t bytes = 0;
+  size_t alignment = 0;
+  size_t max_split_size = 0;
+  cudaStream_t replay_stream = nullptr;
+  bool allow_pending_events = false;
+  bool claimed = false;
+  bool publishing = false;
+  bool oversize = false;
+};
+
 std::pair<decltype(BlockPool::blocks)::iterator, bool> BlockPool::
     insert_into_blocks(Block* block) {
   block->gc_count_base = get_free_blocks_call_count;
@@ -308,6 +337,14 @@ size_t BlockPool::erase_from_blocks(Block* block) {
   auto erased_by_addr = blocks_by_addr.erase(block);
   TORCH_INTERNAL_ASSERT(erased == erased_by_addr);
   return erased;
+}
+
+void BlockPool::insert_into_blocks(Nodes nodes) {
+  Block* block = nodes.by_size.value();
+  block->gc_count_base = get_free_blocks_call_count;
+  auto by_size = blocks.insert(std::move(nodes.by_size));
+  auto by_address = blocks_by_addr.insert(std::move(nodes.by_address));
+  TORCH_INTERNAL_ASSERT(by_size.inserted && by_address.inserted);
 }
 
 struct SegmentRange {
@@ -1513,6 +1550,7 @@ class DeviceCachingAllocator {
   // allocated or in use by a stream. Holds all active allocations,
   // whether they came from graph_pools or one of the BlockPools above.
   ska::flat_hash_set<Block*> active_blocks;
+  size_t pending_graph_count_ = 0;
 
   // Active pool-diversion scopes. Each entry routes allocations matching
   // its filter into a private mempool. Populated by beginAllocateToPool /
@@ -1637,6 +1675,7 @@ class DeviceCachingAllocator {
       bool clearHistory,
       const std::vector<std::string>& skip_actions) {
     std::unique_lock<std::recursive_mutex> lock(mutex);
+    TORCH_CHECK(pending_graph_count_ == 0, "Cannot change allocation history during pending graph use");
     TORCH_CHECK(when == RecordContext::NEVER || context_recorder);
     record_history = enabled;
 
@@ -1729,6 +1768,7 @@ class DeviceCachingAllocator {
 
   void attachAllocatorTraceTracker(AllocatorTraceTracker tracker) {
     std::unique_lock<std::recursive_mutex> lock(mutex);
+    TORCH_CHECK(pending_graph_count_ == 0, "Cannot attach allocation tracing during pending graph use");
     trace_trackers_.emplace_back(std::move(tracker));
   }
 
@@ -2530,6 +2570,217 @@ class DeviceCachingAllocator {
     }
   }
 
+  static c10::monitor::GaugeHandle& allocated_bytes_gauge() {
+    return STATIC_GAUGE(pytorch.CUDACachingAllocator.allocated_bytes);
+  }
+
+  bool pendingGraphPolicy(bool allow_pending_events = false) const {
+    return !record_history && record_context_ == RecordContext::NEVER &&
+        !context_recorder_.load() && trace_trackers_.empty() &&
+        allocation_scopes_.empty() && !capture_tracker_.hasActiveCaptures() &&
+        (allow_pending_events || (cuda_events.empty() && deferred_blocks.empty())) &&
+        !CUDAAllocatorConfig::expandable_segments() &&
+        !c10::impl::GPUTrace::get_trace() &&
+        !c10::ThreadLocalDebugInfo::get(c10::DebugInfoKind::PROFILER_STATE) &&
+        !TORCH_SDT_IS_ENABLED(malloc) && !TORCH_SDT_IS_ENABLED(free);
+  }
+
+  void checkPendingGraphHistoryChange() const {
+    std::lock_guard<std::recursive_mutex> lock(mutex);
+    TORCH_CHECK(
+        pending_graph_count_ == 0,
+        "Cannot change CUDA allocator tracing during a pending graph lease");
+  }
+
+  bool pendingGraphBlock(const PendingGraphState& state, const Block* block) const {
+    return block->allocated && !block->pending_graph && block->device == device_id &&
+        !block->pool->owner_PrivatePool && !block->expandable_segment_ &&
+        block->mapped && !block->event_count && block->requested_size == state.bytes &&
+        reinterpret_cast<uintptr_t>(block->ptr) % state.alignment == 0 &&
+        !block->context_when_allocated && !block->context_when_segment_allocated;
+  }
+
+  void preparePendingGraphState(PendingGraphState& state, Block* block) {
+    TORCH_INTERNAL_ASSERT(active_blocks.count(block));
+    decltype(block->pool->blocks) by_size;
+    decltype(block->pool->blocks_by_addr) by_address;
+    by_size.insert(block);
+    by_address.insert(block);
+    state.free_nodes = {
+        by_size.extract(by_size.begin()),
+        by_address.extract(by_address.begin())};
+    state.max_split_size = AcceleratorAllocatorConfig::max_split_size();
+    state.oversize = block->size >= state.max_split_size;
+  }
+
+  bool armPendingGraphInputs(
+      ArrayRef<PendingGraphState*> states,
+      ArrayRef<Block*> blocks,
+      CUDAStream stream) {
+    std::lock_guard<std::recursive_mutex> lock(mutex);
+    TORCH_INTERNAL_ASSERT(states.size() == blocks.size());
+    if (!pendingGraphPolicy(true)) {
+      return false;
+    }
+    for (size_t index = 0; index < states.size(); ++index) {
+      if (!pendingGraphBlock(*states[index], blocks[index])) {
+        return false;
+      }
+    }
+    std::vector<stream_set> streams;
+    streams.reserve(states.size());
+    for (size_t index = 0; index < states.size(); ++index) {
+      auto& state = *states[index];
+      auto* block = blocks[index];
+      preparePendingGraphState(state, block);
+      streams.push_back(block->stream_uses);
+      if (block->stream != stream.stream()) {
+        streams.back().insert(stream);
+      }
+      state.replay_stream = stream.stream();
+      state.allow_pending_events = true;
+    }
+    // All allocations precede publication of any pending tag or stream use.
+    for (size_t index = 0; index < states.size(); ++index) {
+      auto* block = blocks[index];
+      block->stream_uses.swap(streams[index]);
+      states[index]->block = block;
+      block->pending_graph = states[index];
+      ++pending_graph_count_;
+    }
+    return true;
+  }
+
+  Block* startPendingGraphClaim(PendingGraphState& state) {
+    std::lock_guard<std::recursive_mutex> lock(mutex);
+    TORCH_CHECK(
+        state.phase == PendingGraphPhase::Preparing && !state.publishing,
+        "A pending graph lease permits one claim before submission");
+    if (state.claimed) {
+      return nullptr;
+    }
+    Block* block = state.block;
+    TORCH_INTERNAL_ASSERT(block && block->pending_graph == &state);
+    if (block->allocated || block->stream != state.replay_stream ||
+        !pendingGraphPolicy(state.allow_pending_events) ||
+        !block->stream_uses.empty() || block->event_count ||
+        AcceleratorAllocatorConfig::max_split_size() != state.max_split_size) {
+      return nullptr;
+    }
+    state.publishing = true;
+    return block;
+  }
+
+  void cancelPendingGraphClaim(PendingGraphState& state) {
+    std::lock_guard<std::recursive_mutex> lock(mutex);
+    state.publishing = false;
+  }
+
+  bool commitPendingGraphClaim(
+      PendingGraphState& state,
+      int64_t& allocated_bytes) {
+    std::lock_guard<std::recursive_mutex> lock(mutex);
+    Block* block = state.block;
+    TORCH_INTERNAL_ASSERT(
+        state.publishing && block && block->pending_graph == &state &&
+        !block->allocated);
+    if (!pendingGraphPolicy(state.allow_pending_events) || !block->stream_uses.empty() ||
+        AcceleratorAllocatorConfig::max_split_size() != state.max_split_size) {
+      return false;
+    }
+    const auto stat_types = get_stat_types_for_pool(*block->pool);
+    // Complete the old logical lifetime and start the new one without a
+    // transient increase in active/requested current or peak counters.
+    for_each_selected_stat_type(stat_types, [&](size_t stat_type) {
+      stats.allocation[stat_type].increase(1);
+      stats.allocated_bytes[stat_type].increase(block->size);
+      stats.active[stat_type].decrease(1);
+      stats.active[stat_type].increase(1);
+      stats.active_bytes[stat_type].decrease(block->size);
+      stats.active_bytes[stat_type].increase(block->size);
+      stats.requested_bytes[stat_type].decrease(state.bytes);
+      stats.requested_bytes[stat_type].increase(state.bytes);
+    });
+    if (state.oversize) {
+      stats.oversize_allocations.increase(1);
+    }
+    block->allocated = true;
+    state.claimed = true;
+    state.publishing = false;
+    allocated_bytes =
+        stats.allocated_bytes[static_cast<int64_t>(StatType::AGGREGATE)].current;
+    return true;
+  }
+
+  void beginPendingGraphSubmissions(ArrayRef<PendingGraphState*> states) {
+    std::lock_guard<std::recursive_mutex> lock(mutex);
+    for (auto* state : states) {
+      TORCH_CHECK(
+          state && state->phase == PendingGraphPhase::Preparing && !state->publishing &&
+              state->block && state->block->pending_graph == state &&
+              pendingGraphPolicy(state->allow_pending_events) &&
+              AcceleratorAllocatorConfig::max_split_size() == state->max_split_size,
+          "Pending input submission requires every backing to remain prepared");
+    }
+    for (auto* state : states) {
+      state->phase = PendingGraphPhase::Submitting;
+    }
+  }
+
+  void finishPendingGraph(
+      PendingGraphState& state,
+      CUDAStream stream,
+      bool submitted) {
+    const auto expected = submitted ? PendingGraphPhase::Submitting
+                                    : PendingGraphPhase::Preparing;
+    std::lock_guard<std::recursive_mutex> lock(mutex);
+    TORCH_CHECK(
+        state.phase == expected && !state.publishing,
+        "Pending graph cleanup does not match its submission state");
+    Block* block = state.block;
+    TORCH_INTERNAL_ASSERT(block && block->pending_graph == &state);
+    if (block->allocated) {
+      block->pending_graph = nullptr;
+      state.block = nullptr;
+      state.phase = PendingGraphPhase::Finished;
+      --pending_graph_count_;
+      return;
+    }
+
+    CUDAGuard guard(stream.device_index());
+    cudaStreamCaptureStatus status;
+    C10_CUDA_CHECK(cudaStreamIsCapturing(stream.stream(), &status));
+    TORCH_CHECK(
+        status == cudaStreamCaptureStatusNone,
+        "Cannot release a pending graph lease into a capturing stream");
+    for (auto foreign : block->stream_uses) {
+      CUDAGuard foreign_guard(foreign.device_index());
+      cudaStreamCaptureStatus status;
+      C10_CUDA_CHECK(cudaStreamIsCapturing(foreign.stream(), &status));
+      TORCH_CHECK(
+          status == cudaStreamCaptureStatusNone,
+          "Cannot complete a pending graph lease with a captured foreign use");
+    }
+
+    // Record foreign uses only after enqueue (or a definite abort). Keep the
+    // pending tag until publication succeeds, including partial event failures.
+    try {
+      if (!block->stream_uses.empty()) {
+        insert_events(block);
+      }
+      if (block->event_count == 0) {
+        free_block(block, nullptr, &state.free_nodes);
+      }
+    } catch (...) {
+      state.phase = PendingGraphPhase::Quarantined;
+      throw;
+    }
+    block->pending_graph = nullptr;
+    state.block = nullptr;
+    state.phase = PendingGraphPhase::Finished;
+    --pending_graph_count_;
+  }
+
   void free_locked(
       Block* block,
       const std::shared_ptr<GatheredContext>& context) {
@@ -2560,11 +2811,13 @@ class DeviceCachingAllocator {
         block->pool->owner_MempoolId(),
         context ? context : block->context_when_allocated);
 
-    if (block->size >= AcceleratorAllocatorConfig::max_split_size())
+    if (block->pending_graph ? block->pending_graph->oversize
+                             : block->size >= AcceleratorAllocatorConfig::max_split_size())
       stats.oversize_allocations.decrease(1);
 
-    // If the block has been used on more than one stream, handle accordingly.
-    if (!block->stream_uses.empty()) {
+    // The final deleter retires ownership, but unsubmitted graph backing stays active.
+    if (block->pending_graph) {
+    } else if (!block->stream_uses.empty()) {
       if (C10_UNLIKELY(is_capture_context())) {
         if (CUDAAllocatorConfig::graph_capture_record_stream_reuse()) {
           // record_free_markers returns a vector of free markers,
@@ -3114,7 +3367,7 @@ class DeviceCachingAllocator {
         block_info.requested_size = block->requested_size;
         block_info.allocated = block->allocated;
         block_info.active = block->allocated || (block->event_count > 0) ||
-            !block->stream_uses.empty();
+            !block->stream_uses.empty() || block->pending_graph;
 
         segment_info.total_size += block_info.size;
         if (block_info.allocated) {
@@ -3332,7 +3585,8 @@ class DeviceCachingAllocator {
   // Called by CUDAGraph::reset and MemPool::~MemPool()
   void releasePool(MempoolId_t mempool_id) {
     std::lock_guard<std::recursive_mutex> lock(mutex);
-    // The instantiated cudaGraphExec_t has been destroyed. We can't blindly
+    // The caller destroyed its exec or retired its dependencies on this pool
+    // through an exclusively owned, fully rebound replay plan. We can't blindly
     // delete and cudaFree the mempool its capture used, because
     //  1. other graph(s) might share the same pool
     //  2. the user might still hold references to output tensors allocated
@@ -3636,10 +3890,11 @@ class DeviceCachingAllocator {
   /** moves a block into a pool of cached free blocks */
   void free_block(
       Block* block,
-      const std::shared_ptr<GatheredContext>& context) {
+      const std::shared_ptr<GatheredContext>& context,
+      BlockPool::Nodes* prepared_nodes = nullptr) {
     TORCH_INTERNAL_ASSERT(
         !block->allocated && block->event_count == 0 &&
-        block->stream_uses.empty());
+        block->stream_uses.empty() && (!block->pending_graph || prepared_nodes));
 
     record_trace(
         TraceEntry::FREE_COMPLETED,
@@ -3671,8 +3926,12 @@ class DeviceCachingAllocator {
     // Makes sure the Block* isn't already present in the pool we're freeing it
     // back into.
     // NOLINTNEXTLINE(clang-analyzer-deadcode.DeadStores)
-    bool inserted = pool.insert_into_blocks(block).second;
-    TORCH_INTERNAL_ASSERT(inserted);
+    if (prepared_nodes) {
+      pool.insert_into_blocks(std::move(*prepared_nodes));
+    } else {
+      bool inserted = pool.insert_into_blocks(block).second;
+      TORCH_INTERNAL_ASSERT(inserted);
+    }
 
     if (block->is_split()) {
       net_change_inactive_split_blocks += 1;
@@ -3713,7 +3972,7 @@ class DeviceCachingAllocator {
   /** combine previously split blocks. returns the size of the subsumed block,
    * or 0 on failure. */
   size_t try_merge_blocks(Block* dst, Block* src, BlockPool& pool) {
-    if (!src || src->allocated || src->event_count > 0 ||
+    if (!src || src->allocated || src->pending_graph || src->event_count > 0 ||
         !src->stream_uses.empty() || dst->mapped != src->mapped) {
       return 0;
     }
@@ -4437,7 +4696,7 @@ class DeviceCachingAllocator {
         C10_CUDA_CHECK(cudaEventSynchronize(*event));
 
         block->event_count--;
-        if (block->event_count == 0) {
+        if (block->event_count == 0 && !block->pending_graph) {
           free_block(block, context);
         }
         // We are done with the event, so erase it from the deque
@@ -4500,7 +4759,7 @@ class DeviceCachingAllocator {
         // Events in CUDA Programming Guide).
         remove_cudagraph_stream_uses(block);
         insert_events(block);
-        if (block->event_count == 0) {
+        if (block->event_count == 0 && !block->pending_graph) {
           free_block(block, context);
         }
       }
@@ -4537,7 +4796,7 @@ class DeviceCachingAllocator {
         }
 
         block->event_count--;
-        if (block->event_count == 0) {
+        if (block->event_count == 0 && !block->pending_graph) {
           free_block(block, context);
         }
         it->second.pop_front();
@@ -4660,6 +4919,7 @@ class NativeCachingAllocator : public CUDAAllocator {
  private:
   // allows this allocator to be turned on and off programmatically
   bool enable_ = true;
+  std::mutex pending_graph_policy_mutex;
 
   // Shard allocation region to have independent mutexes to reduce contention.
   static constexpr size_t kNumMutexShard = 67;
@@ -4673,6 +4933,7 @@ class NativeCachingAllocator : public CUDAAllocator {
   // allocated blocks by device pointer
   std::array<ska::flat_hash_map<const void*, Block*>, kNumMutexShard>
       allocated_blocks;
+  std::array<PendingGraphBlocks, kNumMutexShard> pending_graph_blocks;
 
   static size_t get_mutex_shard_id(const void* ptr) {
     return twang_mix64(reinterpret_cast<uintptr_t>(ptr)) % kNumMutexShard;
@@ -4698,7 +4959,15 @@ class NativeCachingAllocator : public CUDAAllocator {
     std::lock_guard<std::mutex> lock(mutex[mutex_shard_id].m);
     auto it = allocated_blocks[mutex_shard_id].find(ptr);
     if (it == allocated_blocks[mutex_shard_id].end()) {
-      return nullptr;
+      auto pending = pending_graph_blocks[mutex_shard_id].find(ptr);
+      if (pending == pending_graph_blocks[mutex_shard_id].end()) {
+        return nullptr;
+      }
+      Block* block = pending->second;
+      if (remove) {
+        pending_graph_blocks[mutex_shard_id].erase(pending);
+      }
+      return block;
     }
     Block* block = it->second;
     if (remove) {
@@ -4832,6 +5101,10 @@ class NativeCachingAllocator : public CUDAAllocator {
       RecordContext when,
       bool clearHistory,
       const std::vector<std::string>& skip_actions) override {
+    std::lock_guard<std::mutex> lock(pending_graph_policy_mutex);
+    for (const auto& allocator : device_allocator) {
+      allocator->checkPendingGraphHistoryChange();
+    }
     record_history = enabled;
     annotation_buffer.setMaxEntries(alloc_buffer_max_entries);
     if (!enabled || clearHistory) {
@@ -4941,6 +5214,10 @@ class NativeCachingAllocator : public CUDAAllocator {
   }
 
   void attachAllocatorTraceTracker(AllocatorTraceTracker tracker) override {
+    std::lock_guard<std::mutex> lock(pending_graph_policy_mutex);
+    for (const auto& allocator : device_allocator) {
+      allocator->checkPendingGraphHistoryChange();
+    }
     for (auto& allocator : device_allocator) {
       allocator->attachAllocatorTraceTracker(tracker);
     }
@@ -5124,6 +5401,69 @@ class NativeCachingAllocator : public CUDAAllocator {
     }
 
     return {devPtr, devPtr, deleteFunc, Device(DeviceType::CUDA, device)};
+  }
+
+  bool armPendingGraphInputs(
+      ArrayRef<PendingGraphState*> states,
+      ArrayRef<Block*> blocks,
+      CUDAStream stream) {
+    DeviceCachingAllocator::allocated_bytes_gauge();
+    std::lock_guard<std::mutex> lock(pending_graph_policy_mutex);
+    return device_allocator[stream.device_index()]->armPendingGraphInputs(states, blocks, stream);
+  }
+
+  std::optional<DataPtr> claimPendingGraph(
+      PendingGraphState& state,
+      CUDAStream stream) {
+    auto& device = *device_allocator[stream.device_index()];
+    Block* block = device.startPendingGraphClaim(state);
+    if (!block) {
+      return std::nullopt;
+    }
+    bool registered = false;
+    bool committed = false;
+    auto rollback = c10::make_scope_exit([&]() {
+      if (!committed) {
+        if (registered) {
+          const auto shard = get_mutex_shard_id(block->ptr);
+          std::lock_guard<std::mutex> lock(mutex[shard].m);
+          auto found = pending_graph_blocks[shard].find(block->ptr);
+          TORCH_INTERNAL_ASSERT(
+              found != pending_graph_blocks[shard].end() && found->second == block);
+          state.publication_node = pending_graph_blocks[shard].extract(found);
+        }
+        device.cancelPendingGraphClaim(state);
+      }
+    });
+    {
+      const auto shard = get_mutex_shard_id(block->ptr);
+      std::lock_guard<std::mutex> lock(mutex[shard].m);
+      TORCH_CHECK(
+          allocated_blocks[shard].find(block->ptr) == allocated_blocks[shard].end() &&
+              pending_graph_blocks[shard].find(block->ptr) == pending_graph_blocks[shard].end(),
+          "Pending graph allocation publication collided with a live pointer");
+      TORCH_INTERNAL_ASSERT(
+          !state.publication_node.empty() &&
+          state.publication_node.key() == block->ptr &&
+          state.publication_node.mapped() == block);
+      auto published = pending_graph_blocks[shard].insert(std::move(state.publication_node));
+      TORCH_INTERNAL_ASSERT(published.inserted);
+      registered = true;
+    }
+    int64_t allocated_bytes = 0;
+    if (!device.commitPendingGraphClaim(state, allocated_bytes)) {
+      return std::nullopt;
+    }
+    committed = true;
+    DataPtr result(
+        block->ptr,
+        block->ptr,
+        &local_raw_delete,
+        Device(DeviceType::CUDA, stream.device_index()));
+    // The normal owner now exists, so even a reporting exception retires it
+    // through the reserved-block final-deleter path.
+    DeviceCachingAllocator::allocated_bytes_gauge().record(allocated_bytes);
+    return result;
   }
 
   DataPtr allocateWithAddress(size_t size, void* addr) override {
@@ -5454,6 +5794,180 @@ void local_raw_delete(void* ptr) {
 }
 
 } // namespace Native
+
+struct PendingGraphInputs::Impl {
+  Impl(CUDAAllocator* expected, CUDAStream replay_stream)
+      : expected_allocator(expected),
+        device_allocator(Native::allocator.device_allocator[replay_stream.device_index()].get()),
+        stream(replay_stream) {}
+
+  void checkCurrent() const {
+    TORCH_CHECK(get() == expected_allocator && expected_allocator->isEnabled(),
+                "The pending graph CUDA allocator changed");
+    c10::DeviceIndex device = 0;
+    C10_CUDA_CHECK(c10::cuda::GetDevice(&device));
+    TORCH_CHECK(device == stream.device_index() && c10::cuda::getCurrentCUDAStream(device) == stream,
+                "The pending graph CUDA device or stream changed");
+    cudaStreamCaptureStatus status;
+    C10_CUDA_CHECK(cudaStreamIsCapturing(stream.stream(), &status));
+    TORCH_CHECK(status == cudaStreamCaptureStatusNone, "Pending graph use requires an uncaptured stream");
+  }
+
+  CUDAAllocator* expected_allocator;
+  Native::DeviceCachingAllocator* device_allocator;
+  CUDAStream stream;
+  Native::PendingGraphPhase phase = Native::PendingGraphPhase::Preparing;
+  std::vector<std::unique_ptr<Native::PendingGraphState>> owners;
+  std::vector<Native::PendingGraphState*> states;
+  std::vector<std::vector<size_t>> input_indices;
+};
+
+PendingGraphInputs::PendingGraphInputs(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
+
+PendingGraphInputs::~PendingGraphInputs() noexcept {
+  if (finished()) {
+    return;
+  }
+  try {
+    if (!submission_started()) {
+      abortUnsubmitted();
+      return;
+    }
+  } catch (...) {
+  }
+  // An unresolved enqueue or failed cleanup must leave Block::pending_graph alive.
+  impl_.release();
+}
+
+std::unique_ptr<PendingGraphInputs> PendingGraphInputs::arm(
+    ArrayRef<PendingGraphInput> inputs, CUDAAllocator* expected_allocator, CUDAStream replay_stream) {
+  if (inputs.empty() || expected_allocator != &Native::allocator || get() != expected_allocator ||
+      !expected_allocator->isEnabled()) {
+    return nullptr;
+  }
+  Native::allocator.assertValidDevice(replay_stream.device_index());
+  auto result = std::unique_ptr<PendingGraphInputs>(
+      new PendingGraphInputs(std::make_unique<Impl>(expected_allocator, replay_stream)));
+  auto& impl = *result->impl_;
+  impl.checkCurrent();
+  impl.owners.reserve(inputs.size());
+  impl.states.reserve(inputs.size());
+  impl.input_indices.reserve(inputs.size());
+  std::vector<Native::Block*> blocks;
+  blocks.reserve(inputs.size());
+  for (size_t index = 0; index < inputs.size(); ++index) {
+    const auto& input = inputs[index];
+    const auto* storage = input.storage;
+    if (!storage || !input.bytes || input.bytes >= (size_t{1} << 60) ||
+        !std::has_single_bit(input.alignment) ||
+        storage->device() != Device(DeviceType::CUDA, replay_stream.device_index()) ||
+        !storage->get() || storage->get_context() != storage->get() ||
+        storage->get_deleter() != &Native::local_raw_delete ||
+        reinterpret_cast<uintptr_t>(storage->get()) % input.alignment) {
+      return nullptr;
+    }
+    auto* block = Native::allocator.get_allocated_block(storage->get());
+    if (!block) {
+      return nullptr;
+    }
+    auto found = std::find(blocks.begin(), blocks.end(), block);
+    if (found != blocks.end()) {
+      auto group = static_cast<size_t>(found - blocks.begin());
+      if (impl.states[group]->bytes != input.bytes) {
+        return nullptr;
+      }
+      impl.states[group]->alignment = std::max(impl.states[group]->alignment, input.alignment);
+      impl.input_indices[group].push_back(index);
+      continue;
+    }
+    auto state = std::make_unique<Native::PendingGraphState>();
+    state->bytes = input.bytes;
+    state->alignment = input.alignment;
+    Native::PendingGraphBlocks publication;
+    publication.emplace(block->ptr, block);
+    state->publication_node = publication.extract(publication.begin());
+    impl.states.push_back(state.get());
+    impl.owners.push_back(std::move(state));
+    impl.input_indices.push_back({index});
+    blocks.push_back(block);
+  }
+  if (!Native::allocator.armPendingGraphInputs(impl.states, blocks, replay_stream)) {
+    return nullptr;
+  }
+  return result;
+}
+
+std::optional<DataPtr> PendingGraphInputs::tryClaim(
+    size_t bytes, size_t alignment, ArrayRef<size_t> eligible_inputs) {
+  TORCH_CHECK(impl_->phase == Native::PendingGraphPhase::Preparing,
+              "Pending input claims require an unsubmitted invocation");
+  TORCH_CHECK(bytes && std::has_single_bit(alignment), "Invalid pending input allocation request");
+  impl_->checkCurrent();
+  for (size_t index = 0; index < impl_->states.size(); ++index) {
+    auto& state = *impl_->states[index];
+    const auto& members = impl_->input_indices[index];
+    if (state.claimed || state.bytes != bytes ||
+        reinterpret_cast<uintptr_t>(state.block->ptr) % alignment ||
+        !std::all_of(members.begin(), members.end(), [&](size_t input) {
+          return std::binary_search(eligible_inputs.begin(), eligible_inputs.end(), input);
+        })) {
+      continue;
+    }
+    auto claimed = Native::allocator.claimPendingGraph(state, impl_->stream);
+    if (claimed) {
+      return claimed;
+    }
+  }
+  return std::nullopt;
+}
+
+void PendingGraphInputs::beginSubmission() {
+  TORCH_CHECK(impl_->phase == Native::PendingGraphPhase::Preparing,
+              "Pending input submission has already started");
+  impl_->checkCurrent();
+  impl_->device_allocator->beginPendingGraphSubmissions(impl_->states);
+  impl_->phase = Native::PendingGraphPhase::Submitting;
+}
+
+void PendingGraphInputs::finishSubmitted() {
+  TORCH_CHECK(impl_->phase == Native::PendingGraphPhase::Submitting,
+              "Pending inputs have no submitted invocation to finish");
+  try {
+    for (auto* state : impl_->states) {
+      if (state->block) {
+        impl_->device_allocator->finishPendingGraph(*state, impl_->stream, true);
+      }
+    }
+  } catch (...) {
+    impl_->phase = Native::PendingGraphPhase::Quarantined;
+    throw;
+  }
+  impl_->phase = Native::PendingGraphPhase::Finished;
+}
+
+void PendingGraphInputs::abortUnsubmitted() {
+  TORCH_CHECK(impl_->phase == Native::PendingGraphPhase::Preparing,
+              "Pending inputs can only abort before submission");
+  try {
+    for (auto* state : impl_->states) {
+      if (state->block) {
+        impl_->device_allocator->finishPendingGraph(*state, impl_->stream, false);
+      }
+    }
+  } catch (...) {
+    impl_->phase = Native::PendingGraphPhase::Quarantined;
+    throw;
+  }
+  impl_->phase = Native::PendingGraphPhase::Finished;
+}
+
+bool PendingGraphInputs::submission_started() const noexcept {
+  return impl_->phase != Native::PendingGraphPhase::Preparing;
+}
+
+bool PendingGraphInputs::finished() const noexcept {
+  return impl_->phase == Native::PendingGraphPhase::Finished;
+}
 
 namespace CudaMallocAsync {
 // If this is put in its own header file, it gets incorrectly renamed in HIPify.

@@ -562,6 +562,12 @@ class CompiledFxGraph(OutputCode):
     _triton_bundle: TritonBundle | None = None
     _wrap_compiled_regions: bool = False
     _defers_input_alignment: bool = False
+    _cudagraph_original_callable: _BoxedCallable | None = dataclasses.field(
+        default=None, init=False, repr=False, compare=False
+    )
+    _cudagraph_installation_owner: object | None = dataclasses.field(
+        default=None, init=False, repr=False, compare=False
+    )
     _compile_context: CompileContext | None = dataclasses.field(
         default=None, init=False, repr=False, compare=False
     )
@@ -593,6 +599,8 @@ class CompiledFxGraph(OutputCode):
         inductor_provenance_stack_traces_str: str | None = None,
     ) -> None:
         self.current_callable = current_callable
+        self._cudagraph_original_callable = current_callable
+        self._cudagraph_installation_owner = None
         self.compiled_fn_runner = compiled_fn_runner
         self.recursively_apply_fns = (
             compiled_fn_runner.recursively_apply_fns
@@ -1003,6 +1011,8 @@ class CompiledFxGraph(OutputCode):
         # models to disk.
         self._compile_context = None
         self.current_callable = None
+        self._cudagraph_original_callable = None
+        self._cudagraph_installation_owner = None
         self.recursively_apply_fns = None
         self.compiled_fn_runner = None
         if self._original_gm is not None:
@@ -1046,6 +1056,8 @@ class CompiledFxGraph(OutputCode):
                     constants.unwrap(self),
                 )
                 self.current_callable = code_cache.call
+                self._cudagraph_original_callable = code_cache.call
+                self._cudagraph_installation_owner = None
                 self.recursively_apply_fns = getattr(
                     code_cache, "recursively_apply_fns", None
                 )

@@ -15,7 +15,7 @@ from ..codecache import code_hash, CodeCacheFuture, get_path, write_atomic
 from ..runtime.benchmarking import benchmarker, gpu_benchmark_lock
 from ..utils import cache_on_self, IndentedBuffer
 from ..virtualized import V
-from .common import TensorArg, WorkspaceArg
+from .common import ArgName, SizeArg, TensorArg, WorkspaceArg
 
 
 log = logging.getLogger(__name__)
@@ -31,6 +31,7 @@ class MultiKernelState:
 
     def __init__(self):
         self.subkernel_to_kernel_name = {}
+        self.kernel_arg_indices = {}
         self.kernel_defs = IndentedBuffer()
 
     def define_kernel(
@@ -96,6 +97,10 @@ class MultiKernelState:
                 arg_index[i] = [slice(0, len(call_args))]
 
         keyed_by_sizes = kernel_shape_keys is not None
+        self.kernel_arg_indices[multi_kernel_name] = tuple(
+            tuple(index for part in arg_index[choice] for index in range(part.start, part.stop))
+            for choice in range(len(kernels))
+        )
         buf = self.kernel_defs
         buf.writeline("")
         buf.writeline("arg_index = {")
@@ -200,6 +205,9 @@ class MultiKernel:
         """
         # Prevent circular import
         from ..select_algorithm import TritonTemplateKernel
+        from ..runtime.triton_heuristics import FixedGrid
+        from .triton import TritonKernel
+        from .wrapper import PythonWrapperCodegen, TritonCallArgument
 
         if kernel_name != self.kernel_name:
             raise AssertionError(
@@ -247,6 +255,33 @@ class MultiKernel:
         for ws in self.kernels[0].args.workspace_args:
             V.graph.wrapper_code.generate_workspace_allocation(ws)
 
+        call_metadata = {}
+        wrapper = V.graph.wrapper_code
+        if type(self) is MultiKernel and type(wrapper) is PythonWrapperCodegen:
+            alternatives = []
+            indices = wrapper.multi_kernel_state.kernel_arg_indices[self.kernel_name]
+            for kernel, argument_indices in zip(self.kernels, indices, strict=True):
+                argdefs, _, signature, _ = kernel.args.python_argdefs()
+                typed = [TritonCallArgument(arg, sig) for arg, sig in zip(argdefs, signature)]
+                if type(kernel) is TritonKernel:
+                    for tree in kernel.range_trees:
+                        if not tree.is_reduction or kernel.inside_reduction:
+                            formal = f"{tree.prefix}numel"
+                            typed.append(TritonCallArgument(ArgName(formal), SizeArg(formal, tree.numel)))
+                    metadata = kernel.inductor_meta
+                    extra = 0
+                elif type(kernel) is TritonTemplateKernel and kernel.cudagraph_template_meta:
+                    metadata = {**FixedGrid.setup_grid_as_args(), **kernel.cudagraph_template_meta}
+                    extra = 3
+                else:
+                    break
+                if (not metadata.get("cudagraph_formal_indices")
+                        or len(argument_indices) != len(typed) + extra):
+                    break
+                alternatives.append((kernel.kernel_name, argument_indices, kernel.triton_meta, metadata, tuple(typed)))
+            if len(alternatives) == len(self.kernels):
+                call_metadata["cudagraph_alternatives"] = tuple(alternatives)
+
         if V.graph.cpp_wrapper:
             # We have already selected the best kernel at compile time
             # so we only have one set of call args. NB: this currently
@@ -257,7 +292,7 @@ class MultiKernel:
             )
         else:
             V.graph.wrapper_code.generate_kernel_call(
-                kernel_name, multi_call_args, arg_types=multi_call_arg_types
+                kernel_name, multi_call_args, arg_types=multi_call_arg_types, **call_metadata
             )
 
         for ws in reversed(self.kernels[0].args.workspace_args):

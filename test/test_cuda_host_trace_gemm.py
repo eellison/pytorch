@@ -479,6 +479,7 @@ class TestCudaHostTraceGemm(HostTraceTestCase):
                     "key",
                     "kernels",
                     "kinds",
+                    "programmatic",
                     "node_count",
                     "scratch",
                     "harvest_us",
@@ -584,7 +585,7 @@ class TestCudaHostTraceGemm(HostTraceTestCase):
             m, kinds = served[id(v)]
             nodes = self._graph_nodes(v)
             self.assertEqual([k for k, _e in nodes], kinds, f"last served M={m}")
-            self.assertEqual([k for k, _e in nodes], list(v.topology[0]))
+            self.assertEqual([k for k, _e in nodes], [k for k, _p in v.topology[0]])
             self.assertEqual([e for _k, e in nodes], [1] * len(nodes), f"M={m}")
 
     def test_two_sites_and_a_launch_hold_no_extra_node(self):
@@ -986,6 +987,123 @@ class TestCudaHostTraceGemm(HostTraceTestCase):
                 "test_dtype_and_layout_changes_miss_by_name": cached,
             },
         )
+
+    def test_harvest_reads_the_programmatic_edge_behind_an_anchor(self):
+        # a closed call captured alone leaves its first kernel without an incoming
+        # edge, so the harvest launches an anchor kernel ahead of it inside the capture:
+        # the call's first node then has an edge whose type says whether the library
+        # launched it with programmatic stream serialization. harvest_nodes(anchored)
+        # drops the anchor (the capture's one root) and flags every node from the edge
+        # data; without the flag the anchor is a node like any other
+        from cuda.bindings import driver
+
+        from torch.cuda._utils import _check_cuda_bindings_driver as check
+
+        x, w = self._x(8), self.w
+        anchor = torch.empty(1, device="cuda")
+        stream = torch.cuda.Stream()
+        g = torch.cuda.CUDAGraph(keep_graph=True)
+        with torch.cuda.stream(stream):
+            linear_nobias(x, w)
+            stream.synchronize()
+            g.capture_begin(capture_error_mode="thread_local")
+            anchor.fill_(1)
+            linear_nobias(x, w)
+            g.capture_end()
+        stream.synchronize()
+        raw = g.raw_cuda_graph()
+        anchored = torch._C._host_trace_harvest_nodes(raw, anchored=True)
+        plain = torch._C._host_trace_harvest_nodes(raw)
+        self.assertEqual(len(plain), len(anchored) + 1)
+        self.assertEqual(plain[0]["kind"], "kernel")
+        self.assertFalse(plain[0]["programmatic"])
+        row = lambda n: (n["kind"], n.get("func"), n["programmatic"])  # noqa: E731
+        self.assertEqual([row(n) for n in plain[1:]], [row(n) for n in anchored])
+        # the flags are the capture's edge types
+        count = check(driver.cuGraphGetNodes(raw, 0))[-1]
+        nodes = [int(n) for n in check(driver.cuGraphGetNodes(raw, count))[0]]
+        count = check(driver.cuGraphGetEdges(raw, 0))[-1]
+        frm, to, data = check(driver.cuGraphGetEdges(raw, count))[:3]
+        programmatic = {int(t) for t, d in zip(to, data) if int(d.type) == 1}
+        self.assertEqual(
+            [n in programmatic for n in nodes], [n["programmatic"] for n in plain]
+        )
+        self.assertTrue(
+            all(int(d.from_port) in (0, 1) and int(d.to_port) == 0 for d in data)
+        )
+        print(
+            f"\n[harvest anchor] {[(n['name'][:40], n['programmatic']) for n in anchored]}"
+        )
+        # the template the build harvests for this shape carries the same flags
+        tape = ht.trace(linear_nobias, (x, w))
+        variant = ht.build(tape, linear_nobias, (x, w))
+        self.assertTrue(self._check(variant, linear_nobias, (self._x(8), w)))
+        entries = [t for t in self._templates_for() if t["hits"] and not t["miss"]]
+        self.assertTrue(entries)
+        flags = [n["programmatic"] for n in anchored]
+        self.assertIn(flags, [t["programmatic"] for t in entries])
+        for t in entries:
+            self.assertEqual(len(t["programmatic"]), t["node_count"])
+
+    def test_a_template_without_programmatic_launches_is_another_class(self):
+        # at an 8-byte storage offset cuBLAS runs this GEMM as a legacy cutlass
+        # kernel launched without programmatic stream serialization; aligned, as
+        # nvjet with it. Both chains are [kernel, kernel], but a variant built at
+        # the aligned x holds programmatic edges into its region nodes, and the
+        # offset template's kernels would run behind them without waiting: the
+        # flags are part of the class, the offset x is a topology miss served by
+        # its own exec (and the reverse order splits the same way)
+        def offset_x(m):
+            big = self._x(m, K + 4)
+            return big.view(-1)[4 : 4 + m * K].view(m, K)
+
+        for first, second in ((self._x(8), offset_x(8)), (offset_x(8), self._x(8))):
+            variant = ht.build(
+                ht.trace(linear, (first, self.w, self.b)),
+                linear,
+                (first, self.w, self.b),
+            )
+            self.assertTrue(self._check(variant, linear, (first, self.w, self.b)))
+            with self.assertRaisesRegex(ht.TopologyMiss, "programmatic"):
+                variant.replay((second, self.w, self.b))
+            self.assertTrue(self._check(variant, linear, (second, self.w, self.b)))
+            chains = self._chains(variant)
+            self.assertEqual(len(chains), 2, chains)
+            self.assertEqual(
+                [[k for k, _p in c] for c in chains], [["kernel", "kernel"]] * 2
+            )
+            self.assertEqual(
+                sorted(tuple(p for _k, p in c) for c in chains),
+                [(False, False), (True, True)],
+            )
+            for v, x in zip(self._variants(variant), (first, second)):
+                self.assertTrue(
+                    self._check(v, linear, (x, self.w, self.b), rebuild=False)
+                )
+
+    def test_an_anchored_harvest_needs_one_root(self):
+        # two roots (two anchors on forked streams joined before the call) are refused
+        # by name: the harvest's capture has exactly one
+        x, w = self._x(8), self.w
+        a, b = torch.empty(1, device="cuda"), torch.empty(1, device="cuda")
+        s1, s2 = torch.cuda.Stream(), torch.cuda.Stream()
+        g = torch.cuda.CUDAGraph(keep_graph=True)
+        with torch.cuda.stream(s1):
+            linear_nobias(x, w)
+            s1.synchronize()
+            g.capture_begin(capture_error_mode="thread_local")
+            a.fill_(1)
+            s2.wait_stream(s1)
+            with torch.cuda.stream(s2):
+                b.fill_(1)
+            s1.wait_stream(s2)
+            linear_nobias(x, w)
+            g.capture_end()
+        s1.synchronize()
+        # a is the root; b depends on a: one root still, and b is kept as a node
+        anchored = torch._C._host_trace_harvest_nodes(g.raw_cuda_graph(), anchored=True)
+        plain = torch._C._host_trace_harvest_nodes(g.raw_cuda_graph())
+        self.assertEqual(len(plain), len(anchored) + 1)
 
 
 _WS_SCRIPT = r"""

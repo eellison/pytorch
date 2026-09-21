@@ -38,7 +38,7 @@ namespace at::cuda::host_trace::ti {
 
 namespace detail {
 // at::native::last_pow2 for n >= 1 (std::max(1, ...) for n <= 1)
-inline int64_t last_pow2_impl(const std::vector<int64_t>& a) {
+inline int64_t last_pow2_impl(const int64_t* a, size_t) {
   int64_t p = 1;
   while (p * 2 <= a[0]) {
     p *= 2;

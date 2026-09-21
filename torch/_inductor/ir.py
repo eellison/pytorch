@@ -8626,6 +8626,38 @@ class SubgraphBuffer(ExternKernel):
         )
 
 
+class UserDefinedCuTeKernel(ExternKernel):
+    def __init__(self, entry_key, *operands):
+        from torch._inductor.runtime._cudagraph._compiler.compiler_cute_handoff.invocation import (
+            check_implementation, InvocationDeclined, resolve_entry,
+        )
+
+        check_implementation()
+        entry = resolve_entry(entry_key)
+        if len(operands) != len(entry.formals) or any(type(value) is not TensorBox for value in operands):
+            raise InvocationDeclined("CuTe invocation operands must match the registered Tensor formals")
+        inputs = [InputsKernel.unwrap_storage_for_input(self.realize_input(value))
+                  for value in operands]
+        device = inputs[0].get_device()
+        if device.type != entry.provider.device_type or any(value.get_device() != device for value in inputs):
+            raise InvocationDeclined("CuTe invocation operand devices disagree with its provider")
+        if V.graph.cpp_wrapper or V.graph.aot_mode:
+            raise InvocationDeclined("CuTe invocation requires the ordinary Python wrapper")
+        super().__init__(None, NoneLayout(device=device), inputs)
+        self.entry_key, self.entry, self.device = entry_key, entry, device
+        self.mutation_outputs = [MutationOutput(NoneLayout(device=device), operands[-1], self)]
+        V.graph.register_operation(self)
+
+    def get_device(self):
+        return self.device
+
+    def get_outputs(self):
+        return self.mutation_outputs
+
+    def codegen(self, wrapper):
+        wrapper.generate_cute_invocation(self)
+
+
 class UserDefinedTritonKernel(ExternKernel):
     """
     A user-defined triton kernel (e.g. via @triton.jit).
@@ -8832,6 +8864,9 @@ class UserDefinedTritonKernel(ExternKernel):
                 raise NotImplementedError(f"Unsupported arg type: {type(arg)}: {arg}")
 
         self.codegen_comment(wrapper, new_name)
+        from .codegen.wrapper import PythonWrapperCodegen
+
+        call_metadata = {"cudagraph_user": self} if type(wrapper) is PythonWrapperCodegen else {}
         wrapper.generate_kernel_call(
             new_name,
             args,
@@ -8843,6 +8878,7 @@ class UserDefinedTritonKernel(ExternKernel):
             triton=True,
             device=self.get_device(),
             original_fxnode_name=self.fx_node.name,
+            **call_metadata,
         )
 
     @cache_on_self_and_args("UserDefinedTritonKernel")

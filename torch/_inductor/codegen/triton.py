@@ -142,7 +142,7 @@ from .triton_utils import (
     use_block_ptr_enabled,
     use_uint8_triton_storage_for_cuda_float8_e4m3fn,
 )
-from .wrapper import SymbolicCallArg
+from .wrapper import PythonWrapperCodegen, SymbolicCallArg, TritonCallArgument
 
 
 if TYPE_CHECKING:
@@ -1823,6 +1823,7 @@ class TritonOverrides(OpOverrides):
         output_index=0,
     ):
         """Emit inline asm and share multiple outputs through kernel CSE."""
+        V.kernel.has_custom_inline_asm = True
         # Use the actual dtype, not the compute type — the asm operates on
         # specific register types and Triton needs to know the real output type.
         all_output_dtypes = output_dtypes or (dtype,)
@@ -3458,6 +3459,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         self._host_tma_non_materializable: OrderedSet[str] = OrderedSet()
         self._host_tma_non_materializable_buffers: OrderedSet[str] | None = None
         self._emitted_device_tma = False
+        self.has_custom_inline_asm = False
         self.hint_override = hint_override
         self._load_counts: collections.Counter[str] = collections.Counter()
         self._pdl_load_index = 0
@@ -7912,6 +7914,54 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             )
         ]
 
+        attrs = triton_meta["configs"][0]
+        if (
+            type(self) is TritonKernel
+            and V.graph.get_current_device_or_throw().type == "cuda"
+            and torch.version.hip is None
+            and not V.graph.cpp_wrapper
+            and not self.is_combo_kernel
+            and not self.features.contains_op("scan")
+            and not self.features.contains_op("sort")
+            and not self.cooperative_reduction
+            and not self.mix_order_reduction
+            and not self.is_native_matmul
+            and not self.atomic_add_found
+            and not self.args.workspace_args
+            and not self.uses_tma
+            and not self.has_custom_inline_asm
+            and isinstance(attrs, dict)
+        ):
+            written_args = set(mutated_args)
+            written_args.update(
+                name for name in self.args.output_buffers.values() if isinstance(name, str)
+            )
+            # Inplace formals can be absent from output_buffers.
+            written_args.update(
+                buf.inner_name
+                for buf in self.args.inplace_buffers.values()
+                if isinstance(buf, InplacedBuffer)
+            )
+            provenance = {}
+            for i, arg in enumerate(signature):
+                if not isinstance(arg, TensorArg):
+                    continue
+                if not triton_meta_signature[arg.name].startswith("*"):
+                    continue
+                alignment = max(
+                    [arg.dtype.itemsize]
+                    + [v for key, v in attrs.get((i,), ()) if key == "tt.divisibility"]
+                )
+                provenance[arg.name] = (
+                    arg.buffer,
+                    arg.name in written_args,
+                    alignment,
+                )
+            inductor_meta["cudagraph_parameter_provenance"] = provenance
+            inductor_meta["cudagraph_formal_indices"] = {
+                arg.name: i for i, arg in enumerate(argdefs)
+            }
+
         for helper in self.helper_functions:
             code.writeline("")
             code.splice(helper)
@@ -8110,7 +8160,9 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             return triton_heuristics.Grid3D
         raise ValueError(f"Unsupported number of dimensions: {n}")
 
-    def add_numel_to_call_args(self, name, call_args, arg_types):
+    def add_numel_to_call_args(
+        self, name, call_args, arg_types, cudagraph_args: list[TritonCallArgument] | None = None
+    ):
         # TODO(jansel): if there are constants, we shouldn't bother passing them as args
         for tree in self.range_trees:
             if isinstance(tree.numel, (sympy.Integer, sympy.Symbol)):
@@ -8121,18 +8173,31 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             if not tree.is_reduction or self.inside_reduction:
                 call_args.append(expr)
                 arg_types.append(type(expr))
+                if cudagraph_args is not None:
+                    formal = f"{tree.prefix}numel"
+                    cudagraph_args.append(
+                        TritonCallArgument(ArgName(formal), SizeArg(formal, tree.numel))
+                    )
 
     def call_kernel(
         self, name: str, node: IRNode | None = None, deallocate_ws: bool = True
     ):
         wrapper = V.graph.wrapper_code
         wrapper.write_triton_header_once()
-        _, call_args, _, arg_types = self.args.python_argdefs()
-        self.add_numel_to_call_args(name, call_args, arg_types)
+        argdefs, call_args, signature, arg_types = self.args.python_argdefs()
+        cudagraph_args = None
+        if type(self) is TritonKernel and type(wrapper) is PythonWrapperCodegen:
+            cudagraph_args = [
+                TritonCallArgument(arg, sig) for arg, sig in zip(argdefs, signature)
+            ]
+            self.add_numel_to_call_args(name, call_args, arg_types, cudagraph_args)
+        else:
+            self.add_numel_to_call_args(name, call_args, arg_types)
 
         for ws in self.args.workspace_args:
             wrapper.generate_workspace_allocation(ws)
 
+        call_metadata = {"cudagraph_args": tuple(cudagraph_args)} if cudagraph_args is not None else {}
         wrapper.generate_kernel_call(
             name,
             call_args,
@@ -8140,6 +8205,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             arg_types=arg_types,
             triton_meta=self.triton_meta,
             inductor_meta=self.inductor_meta,
+            **call_metadata,
         )
 
         if deallocate_ws:

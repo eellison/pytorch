@@ -765,7 +765,7 @@ template <> struct Traced<A> : TracedBase {
 };
 }  // namespace at::cuda::host_trace
 __global__ void fill_r(A a) { for (int i = threadIdx.x; i < a.count; i += blockDim.x) a.data[i] = a.r; }
-int64_t eighth(const std::vector<int64_t>& v) { return v[0] / 8; }
+int64_t eighth(const int64_t* v, size_t) { return v[0] / 8; }
 at::Tensor alloc_by_eighth(const at::Tensor& x) {
   c10::cuda::CUDAGuard g(x.device());
   c10::SymInt n = x.sym_size(0);

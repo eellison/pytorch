@@ -696,7 +696,10 @@ void Exec::run(
   graph_->replay();
 }
 
-std::vector<HarvestedNode> Exec::harvest_nodes(cudaGraph_t g, int probe_attr) {
+std::vector<HarvestedNode> Exec::harvest_nodes(
+    cudaGraph_t g,
+    int probe_attr,
+    bool anchored) {
   std::vector<HarvestedNode> out;
 #ifdef USE_ROCM
   TORCH_CHECK(false, "host_trace: closed regions are CUDA-only in this version");
@@ -706,7 +709,41 @@ std::vector<HarvestedNode> Exec::harvest_nodes(cudaGraph_t g, int probe_attr) {
     C10_CUDA_CHECK(cudaGraphGetNodes(g, nullptr, &n));
     std::vector<cudaGraphNode_t> nodes(n);
     C10_CUDA_CHECK(cudaGraphGetNodes(g, nodes.data(), &n));
+    // per node with an incoming edge: whether one is a programmatic dependent
+    // launch edge (the edge data must be read; the query refuses to drop it)
+    size_t ne = 0;
+    C10_CUDA_CHECK(cudaGraphGetEdges(g, nullptr, nullptr, nullptr, &ne));
+    std::vector<cudaGraphNode_t> from(ne), to(ne);
+    std::vector<cudaGraphEdgeData> data(ne);
+    if (ne != 0) {
+      C10_CUDA_CHECK(
+          cudaGraphGetEdges(g, from.data(), to.data(), data.data(), &ne));
+    }
+    std::unordered_map<cudaGraphNode_t, bool> incoming;
+    for (size_t i = 0; i < ne; ++i) {
+      incoming[to[i]] = incoming[to[i]] ||
+          data[i].type == cudaGraphDependencyTypeProgrammatic;
+    }
+    cudaGraphNode_t anchor = nullptr;
+    if (anchored) {
+      for (cudaGraphNode_t node : nodes) {
+        if (incoming.count(node) == 0) {
+          TORCH_CHECK(
+              anchor == nullptr,
+              "host_trace: an anchored harvest capture has more than one root node");
+          anchor = node;
+        }
+      }
+      TORCH_CHECK(
+          anchor != nullptr,
+          "host_trace: an anchored harvest capture has no root node");
+    }
     for (size_t i = 0; i < n; ++i) {
+      if (nodes[i] == anchor) {
+        continue;
+      }
+      const auto into = incoming.find(nodes[i]);
+      const bool programmatic = into != incoming.end() && into->second;
       cudaGraphNodeType type{};
       C10_CUDA_CHECK(cudaGraphNodeGetType(nodes[i], &type));
       if (type == cudaGraphNodeTypeMemset) {
@@ -721,6 +758,7 @@ std::vector<HarvestedNode> Exec::harvest_nodes(cudaGraph_t g, int probe_attr) {
         HarvestedNode h;
         h.kind = 1;
         h.name = "memset";
+        h.programmatic = programmatic;
         h.dst = reinterpret_cast<uintptr_t>(mp.dst);
         h.value = mp.value;
         h.elem = mp.elementSize;
@@ -752,6 +790,7 @@ std::vector<HarvestedNode> Exec::harvest_nodes(cudaGraph_t g, int probe_attr) {
       const size_t sz = image_size_of(h.layout);
       h.image.assign(image.begin(), image.begin() + sz);
       h.attrs = read_attrs(node, probe_attr);
+      h.programmatic = programmatic;
       out.push_back(std::move(h));
     }
   }

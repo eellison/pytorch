@@ -357,7 +357,7 @@ inline c10::SymBool aligned(const c10::SymInt& p, int64_t n) {
 TORCH_CUDA_CPP_API c10::SymInt opaque(
     const std::string& fn,
     std::vector<c10::SymInt> args,
-    int64_t (*impl)(const std::vector<int64_t>&),
+    OpaqueImpl impl,
     const char* kind = "guard",
     const char* domain = "int");
 // The same, for a function whose trace-time inputs are not evaluable on their
@@ -368,7 +368,7 @@ TORCH_CUDA_CPP_API c10::SymInt opaque(
 TORCH_CUDA_CPP_API c10::SymInt opaque(
     const char* fn,
     c10::ArrayRef<c10::SymInt> args,
-    int64_t (*impl)(const std::vector<int64_t>&),
+    OpaqueImpl impl,
     const char* kind,
     int64_t traced_value,
     const char* domain = "int");

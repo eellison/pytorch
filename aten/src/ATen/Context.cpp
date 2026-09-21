@@ -1,11 +1,13 @@
 #include <ATen/Config.h>
 
+#include <ATen/BlasSettingsEpoch.h>
 #include <ATen/Context.h>
 
 #include <c10/core/CPUAllocator.h>
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
 #include <string>
 #include <string_view>
@@ -188,6 +190,7 @@ bool Context::deterministicAlgorithmsWarnOnly() const {
 void Context::setDeterministicAlgorithms(bool b, bool warn_only = false) {
   _deterministic_algorithms = b;
   _deterministic_algorithms_warn_only = warn_only;
+  bumpBlasSettingsEpoch();
 }
 
 bool Context::deterministicFillUninitializedMemory() const {
@@ -521,6 +524,7 @@ void Context::setFloat32Precision(Float32Backend backend, Float32Op op, Float32P
       "DEFAULT precision is internal and cannot be set explicitly");
 
   it->second = p;
+  bumpBlasSettingsEpoch();
 }
 
 static void _warn_once_magma_deprecation() {
@@ -689,6 +693,7 @@ void Context::setBlasPreferredBackend(at::BlasBackend b) {
     );
   }
   blas_preferred_backend = b;
+  bumpBlasSettingsEpoch();
 #endif
 }
 
@@ -749,6 +754,7 @@ CuBLASReductionOption inline get_reduction_option(bool allow_reduced_precision, 
 
 void Context::setAllowFP16ReductionCuBLAS(bool allow_reduced_precision, bool allow_splitk) {
   allow_fp16_reduction_cublas = get_reduction_option(allow_reduced_precision, allow_splitk);
+  bumpBlasSettingsEpoch();
 }
 
 CuBLASReductionOption Context::allowBF16ReductionCuBLAS() const {
@@ -757,6 +763,7 @@ CuBLASReductionOption Context::allowBF16ReductionCuBLAS() const {
 
 void Context::setAllowBF16ReductionCuBLAS(bool allow_reduced_precision, bool allow_splitk) {
   allow_bf16_reduction_cublas = get_reduction_option(allow_reduced_precision, allow_splitk);
+  bumpBlasSettingsEpoch();
 }
 
 bool Context::allowFP16AccumulationCuBLAS() const {
@@ -765,6 +772,21 @@ bool Context::allowFP16AccumulationCuBLAS() const {
 
 void Context::setAllowFP16AccumulationCuBLAS(bool b) {
   allow_fp16_accumulation_cublas = b;
+  bumpBlasSettingsEpoch();
+}
+
+namespace {
+std::atomic<uint64_t> blas_settings_epoch{0};
+} // namespace
+
+uint64_t blasSettingsEpoch() {
+  return blas_settings_epoch.load(std::memory_order_acquire);
+}
+
+// after the setting's write: a reader that sees the new epoch sees the new
+// value
+void bumpBlasSettingsEpoch() {
+  blas_settings_epoch.fetch_add(1, std::memory_order_release);
 }
 
 std::optional<int32_t> Context::_SMCarveout_EXPERIMENTAL() const {
@@ -778,6 +800,7 @@ void Context::_setSMCarveout_EXPERIMENTAL(std::optional<int32_t> c) {
       "while more robust solutions are developed. It may be removed at any moment without notice.");
   }
   sm_carveout = c;
+  bumpBlasSettingsEpoch();
 }
 
 bool Context::hasMKL() {

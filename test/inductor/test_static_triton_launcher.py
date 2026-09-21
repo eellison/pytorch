@@ -747,6 +747,7 @@ def kernel_many_args(out_tensor, {decl}):
 
             def __init__(self):
                 self.name = "fake_kernel"
+                self._graph_borrows = 0
                 self.module = 0xC0FFEE
                 self.function = 0xF00D
                 self.functions = {}
@@ -1267,25 +1268,54 @@ class TestFastCudaLauncherCompileResult(TestCase):
         from triton.runtime._allocation import _allocator
 
         previous_allocator = _allocator.get()
-        patcher, results = self._patch_build_fast_launcher()
-        alloc_fn = mock.Mock(
-            side_effect=lambda size, _alignment, _stream: torch.empty(
-                size, dtype=torch.uint8, device="cuda"
-            )
-        )
-        triton.set_allocator(alloc_fn)
+        selected, results = [], []
+        original_build = CachingAutotuner._build_fast_launcher
+
+        def build_fast_launcher(autotuner, launcher):
+            selected.append(launcher.__globals__["runner"].__self__)
+            result = original_build(autotuner, launcher)
+            results.append(result is not None)
+            return result
+
+        def allocate(size, alignment, stream):
+            tensor = torch.empty(size, dtype=torch.uint8, device="cuda")
+            self.assertEqual(tensor.data_ptr() % alignment, 0)
+            return tensor
+
+        alloc_fn = mock.Mock(side_effect=allocate)
         try:
-            with patcher:
+            # Autotuner.run replaces the global allocator before the static lookup.
+            with (
+                mock.patch.object(
+                    CachingAutotuner, "_build_fast_launcher", build_fast_launcher
+                ),
+                mock.patch(
+                    "torch._inductor.runtime.static_triton_launcher._triton_allocator_var",
+                    return_value=SimpleNamespace(get=lambda: alloc_fn),
+                ),
+            ):
                 for _ in range(3):
                     a = torch.randn((M, K), device="cuda", dtype=torch.bfloat16)
                     b = torch.randn((N, K), device="cuda", dtype=torch.bfloat16)
+                    allocation_count = alloc_fn.call_count
                     self.assertEqual(gemm(a, b), a @ b.T, atol=1e-2, rtol=1e-2)
+                    self.assertGreater(alloc_fn.call_count, allocation_count)
         finally:
             triton.set_allocator(previous_allocator)
 
-        self.assertGreater(alloc_fn.call_count, 0)
+        self.assertTrue(selected, "_build_fast_launcher was not reached")
+        requirements = {
+            (kernel.global_scratch_size, kernel.global_scratch_align)
+            for kernel in selected
+        }
+        self.assertEqual(len(requirements), 1)
+        scratch_size, scratch_alignment = requirements.pop()
+        self.assertGreater(scratch_size, 0)
         for call in alloc_fn.call_args_list:
-            self.assertGreater(call.args[0], 0)
+            self.assertEqual(
+                call.args[:2],
+                ((M // BLOCK_M) * (N // BLOCK_N) * scratch_size, scratch_alignment),
+            )
         self.assertTrue(results, "_build_fast_launcher was not reached")
         self.assertFalse(
             any(results),

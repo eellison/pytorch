@@ -163,7 +163,7 @@ py::dict tape_records(const Tape& t) {
     d["impl"] = reinterpret_cast<uintptr_t>(impl);
     d["call"] = py::cpp_function([impl](const std::vector<int64_t>& v) {
       TORCH_CHECK(impl != nullptr, "host_trace: opaque call without impl");
-      return impl(v);
+      return impl(v.data(), v.size());
     });
     opaque.append(std::move(d));
   }
@@ -225,6 +225,64 @@ py::dict tape_records(const Tape& t) {
   return out;
 }
 
+} // namespace
+
+namespace {
+// _HostTraceBoxer: the served call's box (see the binding below)
+struct HostTraceBoxer {
+  HostTraceBoxer(py::object positions, std::vector<int64_t> written)
+      : identity_(positions.is_none()) {
+    if (!identity_) {
+      for (auto p : py::cast<std::vector<int64_t>>(positions)) {
+        TORCH_CHECK(p >= 0, "_HostTraceBoxer: a negative position");
+        positions_.push_back(static_cast<Py_ssize_t>(p));
+      }
+    }
+    for (auto w : written) {
+      TORCH_CHECK(w >= 0, "_HostTraceBoxer: a negative written position");
+      written_.push_back(static_cast<Py_ssize_t>(w));
+    }
+  }
+
+  py::list call(py::handle args, py::handle arena) const {
+    TORCH_CHECK(
+        PyTuple_CheckExact(args.ptr()),
+        "_HostTraceBoxer: the arguments must be an exact tuple");
+    const Py_ssize_t nargs = PyTuple_GET_SIZE(args.ptr());
+    const Py_ssize_t n =
+        identity_ ? nargs : static_cast<Py_ssize_t>(positions_.size());
+    const bool with_arena = !arena.is_none();
+    PyObject* box = PyList_New(n + (with_arena ? 1 : 0));
+    if (box == nullptr) {
+      throw py::error_already_set();
+    }
+    py::list out = py::reinterpret_steal<py::list>(box);
+    for (Py_ssize_t i = 0; i < n; ++i) {
+      const Py_ssize_t p = identity_ ? i : positions_[static_cast<size_t>(i)];
+      TORCH_CHECK_INDEX(p < nargs, "_HostTraceBoxer: position ", p, " of ", nargs, " arguments");
+      PyObject* item = PyTuple_GET_ITEM(args.ptr(), p);
+      Py_INCREF(item);
+      PyList_SET_ITEM(box, i, item);
+    }
+    if (with_arena) {
+      Py_INCREF(arena.ptr());
+      PyList_SET_ITEM(box, n, arena.ptr());
+    }
+    for (auto w : written_) {
+      TORCH_CHECK_INDEX(w < n, "_HostTraceBoxer: written position ", w, " of a box of ", n);
+      PyObject* item = PyList_GET_ITEM(box, w);
+      if (THPVariable_Check(item)) {
+        THPVariable_Unpack(item).mutable_data_ptr();
+      }
+    }
+    return out;
+  }
+
+ private:
+  bool identity_;
+  std::vector<Py_ssize_t> positions_;
+  std::vector<Py_ssize_t> written_;
+};
 } // namespace
 
 // NOLINTNEXTLINE(misc-use-internal-linkage)
@@ -431,14 +489,15 @@ void THCPHostTrace_init(PyObject* module) {
   // handle as CUDAGraph.raw_cuda_graph() gives it)
   m.def(
       "_host_trace_harvest_nodes",
-      [](int64_t graph, int probe_attr) {
+      [](int64_t graph, int probe_attr, bool anchored) {
         // NOLINTNEXTLINE(performance-no-int-to-ptr)
         auto g = reinterpret_cast<cudaGraph_t>(static_cast<intptr_t>(graph));
-        auto harvested = Exec::harvest_nodes(g, probe_attr);
+        auto harvested = Exec::harvest_nodes(g, probe_attr, anchored);
         py::list out;
         for (const auto& h : harvested) {
           py::dict d;
           d["kind"] = h.kind == 0 ? "kernel" : "memset";
+          d["programmatic"] = h.programmatic;
           if (h.kind == 1) {
             d["name"] = h.name;
             d["dst"] = h.dst;
@@ -462,7 +521,8 @@ void THCPHostTrace_init(PyObject* module) {
         return out;
       },
       py::arg("graph"),
-      py::arg("probe_attr") = -1);
+      py::arg("probe_attr") = -1,
+      py::arg("anchored") = false);
   m.def("_host_trace_drop_storage", [](const at::Tensor& t) {
     at::cuda::host_trace::drop_storage(t);
   });
@@ -519,6 +579,36 @@ void THCPHostTrace_init(PyObject* module) {
   });
   // the name of a "not permitted inside a stream capture" CUDA error, by
   // code (torch.AcceleratorError.error_code), or None
+  // the tensors of `args` at `positions` (a tape's written inputs), read
+  // through the mutable accessor before a replay binds their addresses: a
+  // copy-on-write tensor materializes here as it would at the ordinary
+  // host's launch; any other tensor is untouched
+  m.def(
+      "_host_trace_materialize",
+      [](const py::sequence& args, const std::vector<int64_t>& positions) {
+        for (auto p : positions) {
+          py::object item = args[static_cast<size_t>(p)];
+          if (THPVariable_Check(item.ptr())) {
+            THPVariable_Unpack(item.ptr()).mutable_data_ptr();
+          }
+        }
+      });
+  // The box of a served call in one pass over the argument tuple: the tensors
+  // at `positions` (None: every argument) as a fresh exact list, the box
+  // positions in `written` read through the mutable accessor (a copy-on-write
+  // tensor materializes there, as at the ordinary host's launch; the test
+  // costs one deleter compare per position) and `arena` appended when given.
+  // What list(args) followed by _host_trace_materialize did in two walks.
+  py::class_<HostTraceBoxer>(m, "_HostTraceBoxer")
+      .def(
+          py::init<py::object, std::vector<int64_t>>(),
+          py::arg("positions"),
+          py::arg("written"))
+      .def(
+          "__call__",
+          &HostTraceBoxer::call,
+          py::arg("args"),
+          py::arg("arena") = py::none());
   m.def("_host_trace_capture_error_name", [](int64_t code) -> py::object {
     const char* name =
         at::cuda::host_trace::capture_error_name(static_cast<int>(code));

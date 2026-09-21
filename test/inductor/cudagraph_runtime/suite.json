@@ -1,0 +1,958 @@
+[
+  {
+    "id": "cpu_saved_input_metadata",
+    "script": "cpu/test_saved_input_metadata.py",
+    "device": "cpu",
+    "cases": 19
+  },
+  {
+    "id": "cpu_release_steps",
+    "script": "cpu/test_release_steps.py",
+    "device": "cpu",
+    "cases": 6
+  },
+  {
+    "id": "cpu_storage_roots",
+    "script": "cpu/test_storage_roots.py",
+    "device": "cpu",
+    "cases": 1
+  },
+  {
+    "id": "cpu_storage_root_dag",
+    "script": "cpu/test_storage_root_dag.py",
+    "device": "cpu",
+    "cases": 12
+  },
+  {
+    "id": "cpu_output_offset_sources",
+    "script": "cpu/test_output_offset_sources.py",
+    "device": "cpu",
+    "cases": 5
+  },
+  {
+    "id": "cpu_storage_offset_sources",
+    "script": "cpu/test_storage_offset_sources.py",
+    "device": "cpu",
+    "cases": 13
+  },
+  {
+    "id": "cuda_empty_view_pointer",
+    "script": "cuda/test_empty_view_pointer.py",
+    "device": "cuda",
+    "cases": 1
+  },
+  {
+    "id": "cuda_dynamic_empty_slice_pointer",
+    "script": "cuda/test_dynamic_empty_slice_pointer.py",
+    "device": "cuda",
+    "cases": 2
+  },
+  {
+    "id": "cuda_storage_offset_equality",
+    "script": "cuda/test_storage_offset_equality.py",
+    "device": "cuda",
+    "cases": 1
+  },
+  {
+    "id": "cuda_scalar_only_updates",
+    "script": "cuda/test_scalar_only_updates.py",
+    "device": "cuda",
+    "cases": 1
+  },
+  {
+    "id": "cuda_guardless_retrace",
+    "script": "cuda/test_guardless_retrace.py",
+    "device": "cuda",
+    "cases": 2
+  },
+  {
+    "id": "cuda_symbolic_addresses",
+    "script": "cuda/test_symbolic_addresses.py",
+    "device": "cuda",
+    "cases": 2
+  },
+  {
+    "id": "cuda_late_address_replay",
+    "script": "cuda/test_late_address_replay.py",
+    "device": "cuda",
+    "cases": 1
+  },
+  {
+    "id": "cuda_storage_offset_replay",
+    "script": "cuda/test_storage_offset_replay.py",
+    "device": "cuda",
+    "cases": 1
+  },
+  {
+    "id": "cuda_triton_pointer_alignment",
+    "script": "cuda/test_triton_pointer_alignment.py",
+    "device": "cuda",
+    "cases": 1
+  },
+  {
+    "id": "cuda_specialized_absolute_address_scalar",
+    "script": "cuda/test_specialized_absolute_address_scalar.py",
+    "device": "cuda",
+    "cases": 1
+  },
+  {
+    "id": "cuda_native_storage_offsets",
+    "script": "cuda/test_native_storage_offsets.py",
+    "device": "cuda",
+    "cases": 6
+  },
+  {
+    "id": "cuda_default_runner",
+    "script": "cuda/test_default_runner.py",
+    "device": "cuda",
+    "cases": 1
+  },
+  {
+    "id": "cuda_saved_input_release",
+    "script": "cuda/test_saved_input_release.py",
+    "device": "cuda",
+    "cases": 4
+  },
+  {
+    "id": "cuda_mixed_mlp",
+    "script": "cuda/mixed_mlp/test_mixed_mlp.py",
+    "device": "cuda",
+    "cases": 1,
+    "requires_cute": true
+  },
+  {
+    "id": "cuda_generated_selection",
+    "script": "cuda/generated/test_generated_selection.py",
+    "device": "cuda",
+    "cases": 2
+  },
+  {
+    "id": "cuda_foreach",
+    "script": "cuda/generated/test_foreach.py",
+    "device": "cuda",
+    "cases": 2
+  },
+  {
+    "id": "cuda_foreach_mutation",
+    "script": "cuda/generated/test_foreach_mutation.py",
+    "device": "cuda",
+    "cases": 1
+  },
+  {
+    "id": "cuda_cute_tma_dynamic_mnk",
+    "script": "cuda/cute/tma/test_tma_dynamic_dimensions.py",
+    "device": "cuda",
+    "cases": 1,
+    "requires_cute": true
+  },
+  {
+    "id": "cuda_cute_tma_composition",
+    "script": "cuda/cute/tma/test_tma_composition.py",
+    "device": "cuda",
+    "cases": 1,
+    "requires_cute": true
+  },
+  {
+    "id": "cuda_cute_tensorop_gemm",
+    "script": "cuda/cute/tensorop_gemm/test_gemm.py",
+    "device": "cuda",
+    "cases": 1,
+    "requires_cute": true
+  },
+  {
+    "id": "cuda_cute_configuration_selection",
+    "script": "cuda/cute/selection/test_selection.py",
+    "device": "cuda",
+    "cases": 1,
+    "requires_cute": true
+  },
+  {
+    "id": "cuda_cute_registered_user_cache",
+    "script": "cuda/cute/observed_cache/test_user_cache.py",
+    "device": "cuda",
+    "cases": 1,
+    "requires_cute": true
+  },
+  {
+    "id": "cuda_cute_typed_direct_example",
+    "script": "cuda/direct_example/test_example.py",
+    "device": "cuda",
+    "cases": 1,
+    "requires_cute": true
+  },
+  {
+    "id": "cuda_cute_dynamic_shared",
+    "script": "cuda/cute/test_dynamic_shared.py",
+    "device": "cuda",
+    "cases": 1,
+    "requires_cute": true
+  },
+  {
+    "id": "cuda_cute_late_scalar_program",
+    "script": "cuda/cute/late_scalars/test_cute_late_scalars.py",
+    "device": "cuda",
+    "cases": 1,
+    "requires_cute": true
+  },
+  {
+    "id": "cuda_cute_absolute_relative_pointer_views",
+    "script": "cuda/cute/test_cute_storage_offset_replay.py",
+    "device": "cuda",
+    "cases": 1,
+    "requires_cute": true
+  },
+  {
+    "id": "cuda_cute_metadata_scalar",
+    "script": "cuda/cute/test_metadata_scalars.py",
+    "device": "cuda",
+    "cases": 1,
+    "requires_cute": true
+  },
+  {
+    "id": "cuda_cute_absolute_address_scalar",
+    "script": "cuda/cute/test_cute_absolute_address_scalar.py",
+    "device": "cuda",
+    "cases": 1,
+    "requires_cute": true
+  },
+  {
+    "id": "cuda_cute_raw_pointer_alignment",
+    "script": "cuda/cute/test_cute_pointer_alignment.py",
+    "device": "cuda",
+    "cases": 1,
+    "requires_cute": true
+  },
+  {
+    "id": "cuda_cute_metadata_floor_division",
+    "script": "cuda/cute/test_metadata_floor_division.py",
+    "device": "cuda",
+    "cases": 1,
+    "requires_cute": true
+  },
+  {
+    "id": "cuda_cute_tma_single_owner",
+    "script": "cuda/cute/tma/test_tma_replay.py",
+    "device": "cuda",
+    "cases": 1,
+    "requires_cute": true
+  },
+  {
+    "id": "cuda_user_triton_autotune",
+    "script": "cuda/direct_autotune/test_autotune.py",
+    "device": "cuda",
+    "cases": 1,
+    "requires_cute": true
+  },
+  {
+    "id": "new_test_numeric_program",
+    "script": "cpu/test_numeric_program.py",
+    "device": "cpu",
+    "cases": 13
+  },
+  {
+    "id": "new_test_signed_boxed_scalars",
+    "script": "cuda/test_signed_boxed_scalars.py",
+    "device": "cuda",
+    "cases": 1
+  },
+  {
+    "id": "cute_host_test_numeric",
+    "script": "cpu/cute_host/test_numeric.py",
+    "device": "cpu",
+    "cases": 37,
+    "requires_cute": true
+  },
+  {
+    "id": "cute_host_test_guards",
+    "script": "cpu/cute_host/test_guards.py",
+    "device": "cpu",
+    "cases": 7,
+    "requires_cute": true
+  },
+  {
+    "id": "cute_host_test_vectors",
+    "script": "cpu/cute_host/test_vectors.py",
+    "device": "cpu",
+    "cases": 17,
+    "requires_cute": true
+  },
+  {
+    "id": "cute_host_test_integer_properties",
+    "script": "cpu/cute_host/test_integer_properties.py",
+    "device": "cpu",
+    "cases": 18,
+    "requires_cute": true
+  },
+  {
+    "id": "cute_host_test_physical_parameters",
+    "script": "cpu/cute_host/test_physical_parameters.py",
+    "device": "cpu",
+    "cases": 7,
+    "requires_cute": true
+  },
+  {
+    "id": "cute_host_test_host_ops",
+    "script": "cpu/cute_host/test_host_ops.py",
+    "device": "cpu",
+    "cases": 4,
+    "requires_cute": true
+  },
+  {
+    "id": "cpu_api",
+    "script": "cpu/test_api.py",
+    "device": "cpu",
+    "cases": 13
+  },
+  {
+    "id": "cpu_sdk_import",
+    "script": "cpu/cute_host/test_sdk_import.py",
+    "device": "cpu",
+    "cases": 8,
+    "requires_cute": true
+  },
+  {
+    "id": "cuda_nonempty_from_empty",
+    "script": "cuda/test_nonempty_view_from_empty.py",
+    "device": "cuda",
+    "cases": 2
+  },
+  {
+    "id": "cuda_host_multi_views_multi_views",
+    "script": "cuda/host_multi_views/test_multi_views.py",
+    "device": "cuda",
+    "cases": 1,
+    "requires_cute": true
+  },
+  {
+    "id": "cuda_generated_compiler_user_autotune",
+    "script": "cuda/generated/test_compiler_user_autotune.py",
+    "device": "cuda",
+    "cases": 1
+  },
+  {
+    "id": "cpu_triton_provider_argument_binding",
+    "script": "cpu/triton/test_provider_argument_binding.py",
+    "device": "cpu",
+    "cases": 3
+  },
+  {
+    "id": "cpu_triton_warmed_selection",
+    "script": "cpu/triton/test_warmed_selection.py",
+    "device": "cpu",
+    "cases": 6
+  },
+  {
+    "id": "cpu_triton_grid_recipe",
+    "script": "cpu/triton/test_grid_recipe.py",
+    "device": "cpu",
+    "cases": 4
+  },
+  {
+    "id": "cpu_cute_host_preprocessing_ownership",
+    "script": "cpu/cute_host/test_preprocessing_ownership.py",
+    "device": "cpu",
+    "cases": 6,
+    "requires_cute": true
+  },
+  {
+    "id": "cpu_cute_host_source_dependencies",
+    "script": "cpu/cute_host/test_source_dependencies.py",
+    "device": "cpu",
+    "cases": 11,
+    "requires_cute": true
+  },
+  {
+    "id": "cpu_address_scalars",
+    "script": "cpu/test_address_scalars.py",
+    "device": "cpu",
+    "cases": 14
+  },
+  {
+    "id": "cpu_early_address_ranges",
+    "script": "cpu/test_early_address_ranges.py",
+    "device": "cpu",
+    "cases": 4
+  },
+  {
+    "id": "cpu_signed_guard_printer",
+    "script": "cpu/test_signed_guard_printer.py",
+    "device": "cpu",
+    "cases": 22
+  },
+  {
+    "id": "cpu_prepared_owner",
+    "script": "cpu/test_prepared_owner.py",
+    "device": "cpu",
+    "cases": 5
+  },
+  {
+    "id": "cuda_generated_generated_axes",
+    "script": "cuda/generated/test_generated_axes.py",
+    "device": "cuda",
+    "cases": 2
+  },
+  {
+    "id": "cuda_allocation_layouts_layouts",
+    "script": "cuda/allocation_layouts/test_layouts.py",
+    "device": "cuda",
+    "cases": 1
+  },
+  {
+    "id": "cuda_alignment_shape_guards",
+    "script": "cuda/test_alignment_shape_guards.py",
+    "device": "cuda",
+    "cases": 2
+  },
+  {
+    "id": "cuda_cute_tma_descriptor_views",
+    "script": "cuda/cute/tma_boundaries/test_descriptor_views.py",
+    "device": "cuda",
+    "cases": 1,
+    "requires_cute": true
+  },
+  {
+    "id": "cpu_triton_tensor_map_binding",
+    "script": "cpu/triton/test_tensor_map_binding.py",
+    "device": "cpu",
+    "cases": 24
+  },
+  {
+    "id": "cuda_triton_device_tma_replay",
+    "script": "cuda/triton_tma/test_tma_replay.py",
+    "device": "cuda",
+    "cases": 1
+  },
+  {
+    "id": "cuda_triton_host_tma_replay",
+    "script": "cuda/triton_tma/test_host_tma_replay.py",
+    "device": "cuda",
+    "cases": 1
+  },
+  {
+    "id": "cuda_triton_mixed_tma_replay",
+    "script": "cuda/triton_tma/test_mixed_tma_replay.py",
+    "device": "cuda",
+    "cases": 1
+  },
+  {
+    "id": "cpu_policy_config",
+    "script": "cpu/test_policy_config.py",
+    "device": "cpu",
+    "cases": 2
+  },
+  {
+    "id": "cuda_default_compile",
+    "script": "cuda/test_default_compile.py",
+    "device": "cuda",
+    "cases": 2
+  },
+  {
+    "id": "cuda_static_input_mutation",
+    "script": "cuda/test_static_input_mutation.py",
+    "device": "cuda",
+    "cases": 1
+  },
+  {
+    "id": "cuda_input_mutation",
+    "script": "cuda/test_input_mutation.py",
+    "device": "cuda",
+    "cases": 1
+  },
+  {
+    "id": "cuda_triton_host_tma_components",
+    "script": "cuda/triton_tma/test_host_tma_components.py",
+    "device": "cuda",
+    "cases": 2
+  },
+  {
+    "id": "cpu_cute_tma_stride_requirements",
+    "script": "cpu/cute_host/test_tma_requirements.py",
+    "device": "cpu",
+    "cases": 24,
+    "requires_cute": true
+  },
+  {
+    "id": "cpu_cute_tma_stride_transport",
+    "script": "cpu/cute_host/test_tma_stride_transport.py",
+    "device": "cpu",
+    "cases": 8,
+    "requires_cute": true
+  },
+  {
+    "id": "cuda_cute_tma_padded_strides",
+    "script": "cuda/cute/tma/test_tma_padded_strides.py",
+    "device": "cuda",
+    "cases": 2,
+    "requires_cute": true
+  },
+  {
+    "id": "cpu_cute_tma_stride_domains",
+    "script": "cpu/cute_host/test_tma_stride_domains.py",
+    "device": "cpu",
+    "cases": 11,
+    "requires_cute": true
+  },
+  {
+    "id": "cpu_tma_dimension_printer",
+    "script": "cpu/test_tma_dimension_printer.py",
+    "device": "cpu",
+    "cases": 10
+  },
+  {
+    "id": "cpu_cute_invocation_operands",
+    "script": "cpu/test_invocation_operands.py",
+    "device": "cpu",
+    "cases": 10
+  },
+  {
+    "id": "cpu_cute_gemm_registration",
+    "script": "cpu/cute_host/test_gemm_registration.py",
+    "device": "cpu",
+    "cases": 1,
+    "requires_cute": true
+  },
+  {
+    "id": "cpu_cute_tma_dimension_domains",
+    "script": "cpu/cute_host/test_tma_dimensions.py",
+    "device": "cpu",
+    "cases": 6,
+    "requires_cute": true
+  },
+  {
+    "id": "cpu_cute_tma_dimension_consumers",
+    "script": "cpu/cute_host/test_tma_dimension_consumers.py",
+    "device": "cpu",
+    "cases": 1,
+    "requires_cute": true
+  },
+  {
+    "id": "cuda_repeated_gemm",
+    "script": "cuda/repeated_gemm/test_repeated_gemm.py",
+    "device": "cuda",
+    "cases": 1,
+    "requires_cute": true
+  },
+  {
+    "id": "cuda_repeated_gemm_metadata",
+    "script": "cuda/repeated_gemm/test_compact_metadata.py",
+    "device": "cuda",
+    "cases": 1,
+    "requires_cute": true
+  },
+  {
+    "id": "cpu_compiled_evaluation",
+    "script": "cpu/test_compiled_evaluation.py",
+    "device": "cpu",
+    "cases": 79
+  },
+  {
+    "id": "cpu_compiled_parameters",
+    "script": "cpu/test_compiled_parameters.py",
+    "device": "cpu",
+    "cases": 142
+  },
+  {
+    "id": "cpu_integer_payload_simplification",
+    "script": "cpu/test_integer_payload_simplification.py",
+    "device": "cpu",
+    "cases": 49
+  },
+  {
+    "id": "cpu_host_integer_power",
+    "script": "cpu/test_host_integer_power.py",
+    "device": "cpu",
+    "cases": 93
+  },
+  {
+    "id": "cpu_numeric_expression_dag",
+    "script": "cpu/test_numeric_expression_dag.py",
+    "device": "cpu",
+    "cases": 38
+  },
+  {
+    "id": "cpu_parameter_expression_dag",
+    "script": "cpu/test_parameter_expression_dag.py",
+    "device": "cpu",
+    "cases": 10
+  },
+  {
+    "id": "cpu_host_evaluation",
+    "script": "cpu/test_host_evaluation.py",
+    "device": "cpu",
+    "cases": 110
+  },
+  {
+    "id": "cpu_block_bindings",
+    "script": "cpu/test_block_bindings.py",
+    "device": "cpu",
+    "cases": 9
+  },
+  {
+    "id": "cuda_block_replay",
+    "script": "cuda/test_block_replay.py",
+    "device": "cuda",
+    "cases": 22
+  },
+  {
+    "id": "cuda_memset_replay",
+    "script": "cuda/test_memset_replay.py",
+    "device": "cuda",
+    "cases": 28
+  },
+  {
+    "id": "cpu_host_minmax_payload",
+    "script": "cpu/test_host_minmax_payload.py",
+    "device": "cpu",
+    "cases": 16
+  },
+  {
+    "id": "cuda_numeric_prepared_values",
+    "script": "cuda/test_numeric_prepared_values.py",
+    "device": "cuda",
+    "cases": 1
+  },
+  {
+    "id": "cuda_host_trace_reduce",
+    "script": "cuda/test_host_trace_reduce.py",
+    "device": "cuda",
+    "cases": 19
+  },
+  {
+    "id": "cpu_int_expr_dag",
+    "script": "cpu/test_int_expr_dag.py",
+    "device": "cpu",
+    "cases": 3
+  },
+  {
+    "id": "cpu_numeric_minmax",
+    "script": "cpu/test_numeric_minmax.py",
+    "device": "cpu",
+    "cases": 16
+  },
+  {
+    "id": "cuda_hosttrace_decode",
+    "script": "cuda/test_hosttrace_decode.py",
+    "device": "cuda",
+    "cases": 4
+  },
+  {
+    "id": "cuda_hosttrace_dropout",
+    "script": "cuda/test_hosttrace_dropout.py",
+    "device": "cuda",
+    "cases": 2
+  },
+  {
+    "id": "cuda_hosttrace_embed_cat",
+    "script": "cuda/test_hosttrace_embed_cat.py",
+    "device": "cuda",
+    "cases": 5
+  },
+  {
+    "id": "cuda_hosttrace_flash",
+    "script": "cuda/test_hosttrace_flash.py",
+    "device": "cuda",
+    "cases": 8
+  },
+  {
+    "id": "cuda_hosttrace_h2d",
+    "script": "cuda/test_hosttrace_h2d.py",
+    "device": "cuda",
+    "cases": 25
+  },
+  {
+    "id": "cuda_hosttrace_layer_norm",
+    "script": "cuda/test_hosttrace_layer_norm.py",
+    "device": "cuda",
+    "cases": 6
+  },
+  {
+    "id": "cuda_hosttrace_ops7",
+    "script": "cuda/test_hosttrace_ops7.py",
+    "device": "cuda",
+    "cases": 5
+  },
+  {
+    "id": "cuda_hosttrace_reduce",
+    "script": "cuda/test_hosttrace_reduce.py",
+    "device": "cuda",
+    "cases": 6
+  },
+  {
+    "id": "cuda_hosttrace_rng_slots",
+    "script": "cuda/test_hosttrace_rng_slots.py",
+    "device": "cuda",
+    "cases": 4
+  },
+  {
+    "id": "cuda_hosttrace_ti",
+    "script": "cuda/test_hosttrace_ti.py",
+    "device": "cuda",
+    "cases": 6
+  },
+  {
+    "id": "cuda_native_minmax",
+    "script": "cuda/test_native_minmax.py",
+    "device": "cuda",
+    "cases": 3
+  },
+  {
+    "id": "cuda_native_tensor_facts",
+    "script": "cuda/test_native_tensor_facts.py",
+    "device": "cuda",
+    "cases": 6
+  },
+  {
+    "id": "cpu_replay_value_bindings",
+    "script": "cpu/test_replay_value_bindings.py",
+    "device": "cpu",
+    "cases": 2
+  },
+  {
+    "id": "cpu_capture_events",
+    "script": "cpu/test_capture_events.py",
+    "device": "cpu",
+    "cases": 42
+  },
+  {
+    "id": "cuda_hosttrace_sequence",
+    "script": "cuda/test_hosttrace_sequence.py",
+    "device": "cuda",
+    "cases": 2
+  },
+  {
+    "id": "cpu_owned_address_guards",
+    "script": "cpu/test_owned_address_guards.py",
+    "device": "cpu",
+    "cases": 7
+  },
+  {
+    "id": "cpu_cuda_tape_import",
+    "script": "cpu/test_cuda_tape_import.py",
+    "device": "cpu",
+    "cases": 16
+  },
+  {
+    "id": "cpu_direct_cuda_host_declines",
+    "script": "cpu/test_direct_cuda_host_declines.py",
+    "device": "cpu",
+    "cases": 11
+  },
+  {
+    "id": "cuda_mixed_cuda_host",
+    "script": "cuda/test_mixed_cuda_host.py",
+    "device": "cuda",
+    "cases": 7
+  },
+  {
+    "id": "cuda_mixed_three_frontends",
+    "script": "cuda/test_mixed_three_frontends.py",
+    "device": "cuda",
+    "cases": 2,
+    "requires_cute": true
+  },
+  {
+    "id": "cpu_computed_integer_guards",
+    "script": "cpu/test_computed_integer_guards.py",
+    "device": "cpu",
+    "cases": 11
+  },
+  {
+    "id": "cpu_mixed_memset_events",
+    "script": "cpu/test_mixed_memset_events.py",
+    "device": "cpu",
+    "cases": 10
+  },
+  {
+    "id": "cuda_mixed_cuda_memset",
+    "script": "cuda/test_mixed_cuda_memset.py",
+    "device": "cuda",
+    "cases": 2
+  },
+  {
+    "id": "cpu_standalone_host_trace_declines",
+    "script": "cpu/test_standalone_host_trace_declines.py",
+    "device": "cpu",
+    "cases": 18
+  },
+  {
+    "id": "cpu_host_trace_gc",
+    "script": "cpu/test_host_trace_gc.py",
+    "device": "cpu",
+    "cases": 16
+  },
+  {
+    "id": "cpu_h2d_capture_helper",
+    "script": "cpu/test_h2d_capture_helper.py",
+    "device": "cpu",
+    "cases": 32
+  },
+  {
+    "id": "cpu_mixed_hosttrace_h2d",
+    "script": "cpu/test_mixed_hosttrace_h2d.py",
+    "device": "cpu",
+    "cases": 12
+  },
+  {
+    "id": "cuda_mixed_hosttrace_h2d",
+    "script": "cuda/test_mixed_hosttrace_h2d.py",
+    "device": "cuda",
+    "cases": 6
+  },
+  {
+    "id": "cuda_pinned_replay",
+    "script": "cuda/test_pinned_replay.py",
+    "device": "cuda",
+    "cases": 11
+  },
+  {
+    "id": "cuda_mixed_pinned_h2d",
+    "script": "cuda/test_mixed_pinned_h2d.py",
+    "device": "cuda",
+    "cases": 6
+  },
+  {
+    "id": "cpu_mixed_rng",
+    "script": "cpu/test_mixed_rng.py",
+    "device": "cpu",
+    "cases": 14
+  },
+  {
+    "id": "cuda_mixed_rng",
+    "script": "cuda/test_mixed_rng.py",
+    "device": "cuda",
+    "cases": 6,
+    "requires_cute": true
+  },
+  {
+    "id": "cpu_cuda_output_identity",
+    "script": "cpu/test_cuda_output_identity.py",
+    "device": "cpu",
+    "cases": 11
+  },
+  {
+    "id": "cpu_output_reference",
+    "script": "cpu/test_output_reference.py",
+    "device": "cpu",
+    "cases": 8
+  },
+  {
+    "id": "cpu_hosttrace_output_reference",
+    "script": "cpu/test_hosttrace_output_reference.py",
+    "device": "cpu",
+    "cases": 22
+  },
+  {
+    "id": "cuda_output_reference",
+    "script": "cuda/test_output_reference.py",
+    "device": "cuda",
+    "cases": 5
+  },
+  {
+    "id": "cuda_hosttrace_output_reference",
+    "script": "cuda/test_hosttrace_output_reference.py",
+    "device": "cuda",
+    "cases": 15
+  },
+  {
+    "id": "cuda_native_output_references",
+    "script": "cuda/test_native_output_references.py",
+    "device": "cuda",
+    "cases": 15
+  },
+  {
+    "id": "cpu_hosttrace_constant_contract",
+    "script": "cpu/test_hosttrace_constant_contract.py",
+    "device": "cpu",
+    "cases": 16
+  },
+  {
+    "id": "cpu_hosttrace_effect_admission",
+    "script": "cpu/test_hosttrace_effect_admission.py",
+    "device": "cpu",
+    "cases": 7
+  },
+  {
+    "id": "cuda_hosttrace_closed_scalar_bits",
+    "script": "cuda/test_hosttrace_closed_scalar_bits.py",
+    "device": "cuda",
+    "cases": 4
+  },
+  {
+    "id": "cuda_native_triton_override",
+    "script": "cuda/test_native_triton_override.py",
+    "device": "cuda",
+    "cases": 3
+  },
+  {
+    "id": "cuda_empty_program",
+    "script": "cuda/test_empty_program.py",
+    "device": "cuda",
+    "cases": 2
+  },
+  {
+    "id": "cuda_direct_triton_declines",
+    "script": "cuda/test_direct_triton_declines.py",
+    "device": "cuda",
+    "cases": 9
+  },
+  {
+    "id": "cpu_hosttrace_payload_domains",
+    "script": "cpu/test_hosttrace_payload_domains.py",
+    "device": "cpu",
+    "cases": 10
+  },
+  {
+    "id": "cuda_hosttrace_arena",
+    "script": "cuda/test_hosttrace_arena.py",
+    "device": "cuda",
+    "cases": 7
+  },
+  {
+    "id": "cuda_hosttrace_output_arena",
+    "script": "cuda/test_hosttrace_output_arena.py",
+    "device": "cuda",
+    "cases": 13
+  },
+  {
+    "id": "cuda_hosttrace_allocseq",
+    "script": "cuda/test_hosttrace_allocseq.py",
+    "device": "cuda",
+    "cases": 14
+  },
+  {
+    "id": "cuda_hosttrace_authority",
+    "script": "cuda/test_hosttrace_authority.py",
+    "device": "cuda",
+    "cases": 6
+  },
+  {
+    "id": "cuda_hosttrace_gemm",
+    "script": "cuda/test_hosttrace_gemm.py",
+    "device": "cuda",
+    "cases": 17
+  },
+  {
+    "id": "cuda_hosttrace_miss",
+    "script": "cuda/test_hosttrace_miss.py",
+    "device": "cuda",
+    "cases": 25
+  },
+  {
+    "id": "cuda_hosttrace_symm",
+    "script": "cuda/test_hosttrace_symm.py",
+    "device": "cuda",
+    "cases": 11
+  },
+  {
+    "id": "cuda_kernel_template_binding",
+    "script": "cuda/test_kernel_template_binding.py",
+    "device": "cuda",
+    "cases": 3
+  },
+  {
+    "id": "cuda_bound_dispatch",
+    "script": "cuda/test_bound_dispatch.py",
+    "device": "cuda",
+    "cases": 2
+  }
+]

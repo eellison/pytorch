@@ -56,6 +56,7 @@ from .common import (
 from .simd import NodeInfo, prefix_is_reduction, SIMDScheduling
 from .simd_kernel_features import SIMDKernelFeatures
 from .triton import TritonKernel
+from .wrapper import PythonWrapperCodegen, TritonCallArgument
 from .triton_utils import (
     config_of,
     equal_1_arg_indices,
@@ -985,6 +986,44 @@ class ComboKernel(Kernel):
         if max_persistent_rblock > 0:
             inductor_meta["max_persistent_rblock"] = max_persistent_rblock
 
+        attrs = triton_meta["configs"][0]
+        if (
+            V.graph.get_current_device_or_throw().type == "cuda"
+            and torch.version.hip is None
+            and not V.graph.cpp_wrapper
+            and not self.per_subkernel_blocks
+            and isinstance(attrs, dict)
+            and all(
+                type(sub) is TritonKernel
+                and sub.args is self.args
+                and not sub.features.contains_op("scan")
+                and not sub.features.contains_op("sort")
+                and not sub.cooperative_reduction
+                and not sub.mix_order_reduction
+                and not sub.is_native_matmul
+                and not sub.atomic_add_found
+                and not sub.args.workspace_args
+                and not sub.uses_tma
+                and not sub.has_custom_inline_asm
+                for sub in self.sub_kernels
+            )
+        ):
+            written = set(mutated_args)
+            written.update(name for name in self.args.output_buffers.values() if isinstance(name, str))
+            written.update(buf.inner_name for buf in self.args.inplace_buffers.values()
+                           if isinstance(buf, InplacedBuffer))
+            provenance = {}
+            for index, arg in enumerate(signature):
+                if isinstance(arg, TensorArg) and triton_meta["signature"][arg.name].startswith("*"):
+                    alignment = max([arg.dtype.itemsize] + [
+                        value for key, value in attrs.get((index,), ()) if key == "tt.divisibility"
+                    ])
+                    provenance[arg.name] = (arg.buffer, arg.name in written, alignment)
+            inductor_meta["cudagraph_parameter_provenance"] = provenance
+            inductor_meta["cudagraph_formal_indices"] = {
+                arg.name: index for index, arg in enumerate(argdefs)
+            }
+
         # Sum per-sub-kernel bandwidth / FLOP estimates for the combo launch.
         sub_metas = [sub.inductor_meta_per_kernel() for sub in self.sub_kernels]
         self._kernel_num_gb = sum(m.get("kernel_num_gb") or 0 for m in sub_metas)
@@ -1102,7 +1141,8 @@ class ComboKernel(Kernel):
         return argdefs
 
     def add_numel_to_call_args(
-        self, name: str, call_args: list[Any], arg_types: list[Any]
+        self, name: str, call_args: list[Any], arg_types: list[Any],
+        cudagraph_args: list[TritonCallArgument] | None = None,
     ) -> None:
         for num, sub_kernel in enumerate(self.sub_kernels):
             for tree in sub_kernel.range_trees:
@@ -1119,6 +1159,10 @@ class ComboKernel(Kernel):
                 if not tree.is_reduction or sub_kernel.inside_reduction:
                     call_args.append(expr)
                     arg_types.append(type(expr))
+                    if cudagraph_args is not None:
+                        cudagraph_args.append(TritonCallArgument(
+                            ArgName(numel_name), SizeArg(numel_name, tree.numel)
+                        ))
 
     def kernel_benchmark_extra_args(self) -> list[str]:
         extra_args = []
@@ -1923,14 +1967,20 @@ class ComboKernel(Kernel):
         return modified
 
     def call_kernel(self, name: str) -> None:
-        _, call_args, _, arg_types = self.args.python_argdefs()
+        argdefs, call_args, signature, arg_types = self.args.python_argdefs()
 
         wrapper = V.graph.wrapper_code
+        cudagraph_args = None
+        if type(wrapper) is PythonWrapperCodegen:
+            cudagraph_args = [
+                TritonCallArgument(arg, sig) for arg, sig in zip(argdefs, signature)
+            ]
         if self.dispatch_class is None:
             raise AssertionError("dispatch_class must not be None")
         if self.dynamic_shape_args:
-            self.add_numel_to_call_args(name, call_args, arg_types)
+            self.add_numel_to_call_args(name, call_args, arg_types, cudagraph_args)
 
+        call_metadata = {"cudagraph_args": tuple(cudagraph_args)} if cudagraph_args is not None else {}
         wrapper.generate_kernel_call(
             name,
             call_args,
@@ -1938,6 +1988,7 @@ class ComboKernel(Kernel):
             arg_types=arg_types,
             triton_meta=self.triton_meta,
             inductor_meta=self.inductor_meta,
+            **call_metadata,
         )
 
     def combo_grid_meta(self, size_hints_list: list[dict[str, int]]) -> dict[str, Any]:

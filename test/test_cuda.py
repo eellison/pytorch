@@ -9,6 +9,7 @@ import json
 import os
 import pickle
 import random
+import struct
 import subprocess
 import sys
 import tempfile
@@ -12068,6 +12069,1045 @@ class TestCompileKernel(TestCase):
 
 @unittest.skipIf(not TEST_CUDA, "CUDA not available, skipping tests")
 class TestCudaDeviceParametrized(TestCase):
+    def _capture_kernel_params_graph(
+        self, device, *, graph=None, two_nodes=False, keep_graph=True
+    ):
+        if _get_torch_cuda_version() < (12, 4):
+            self.skipTest("CUDA >= 12.4 required for kernel parameter queries")
+        from cuda.bindings import runtime
+
+        from torch.cuda import _compile_kernel
+        from torch.cuda._utils import _check_cuda_bindings
+
+        kernel = _compile_kernel(
+            """
+            __global__ void add_bias(
+                const int* x, const int* y, int* out, int n, int bias) {
+                int i = blockIdx.x * blockDim.x + threadIdx.x;
+                if (i < n)
+                    out[i] = x[i] + y[i] + bias;
+            }
+            """,
+            "add_bias",
+        )
+        x = torch.arange(32, dtype=torch.int32, device=device)
+        y = torch.full_like(x, 2)
+        outputs = [torch.empty_like(x) for _ in range(2 if two_nodes else 1)]
+        launches = [[x, y, outputs[0], x.numel(), 3]]
+        if two_nodes:
+            launches.append([x, outputs[0], outputs[1], x.numel(), 5])
+        for args in launches:
+            kernel(block=(32, 1, 1), args=args)
+        for out in outputs:
+            out.fill_(-1)
+
+        if graph is None:
+            graph = torch.cuda.CUDAGraph(keep_graph=keep_graph)
+        stream = torch.cuda.Stream(device=device)
+        nodes = []
+        with torch.cuda.graph(graph, stream=stream):
+            for args in launches:
+                kernel(block=(32, 1, 1), args=args)
+                capture_info = _check_cuda_bindings(
+                    runtime.cudaStreamGetCaptureInfo(stream.cuda_stream)
+                )
+                self.assertEqual(capture_info[-1], 1)
+                nodes.append(int(capture_info[3][0]))
+        return graph, nodes, x, y, outputs
+
+    @onlyCUDA
+    @skipIfRocm
+    @requires_cuda_python_bindings
+    @unittest.skipUnless(TEST_CUDA_GRAPH, "CUDA graphs not available")
+    @parametrize("nondefault_edge", [False, True])
+    def test_graph_inspect_capture_frontier(self, device, nondefault_edge):
+        if _get_torch_cuda_version() < (12, 4):
+            self.skipTest("CUDA >= 12.4 required for graph inspection")
+        from cuda.bindings import runtime
+
+        from torch.cuda import _compile_kernel
+        from torch.cuda._utils import _check_cuda_bindings
+
+        kernel = _compile_kernel(
+            """
+            __global__ void inspect_add_bias(
+                const int* x, const int* y, int* out, int n, int bias) {
+                int i = blockIdx.x * blockDim.x + threadIdx.x;
+                if (i < n)
+                    out[i] = x[i] + y[i] + bias;
+            }
+            """,
+            "inspect_add_bias",
+        )
+        x = torch.arange(32, dtype=torch.int32, device=device)
+        y = torch.full_like(x, 2)
+        intermediate = torch.empty_like(x)
+        out = torch.empty_like(x)
+        launches = [[x, y, intermediate, 32, 3], [x, intermediate, out, 32, 5]]
+        for args in launches:
+            kernel(grid=(2, 1, 1), block=(16, 1, 1), shared_mem=16, args=args)
+        intermediate.fill_(-1)
+        out.fill_(-1)
+        graph = torch.cuda.CUDAGraph(keep_graph=True)
+        stream = torch.cuda.Stream(device=device)
+        frontier = torch._C._cuda_get_capture_frontier
+        self.assertEqual(frontier(stream.cuda_stream), (0, 0, 0, ()))
+        with torch.cuda.graph(graph, stream=stream):
+            before = frontier(stream.cuda_stream)
+            kernel(grid=(2, 1, 1), block=(16, 1, 1), shared_mem=16, args=launches[0])
+            first = frontier(stream.cuda_stream)
+            self.assertEqual(before[0], 1)
+            self.assertEqual(before[3], ())
+            self.assertEqual(first[:3], before[:3])
+            self.assertEqual(len(first[3]), 1)
+            self.assertEqual(first[3][0][1], bytes(8))
+            if nondefault_edge:
+                native = _check_cuda_bindings(runtime.cudaStreamGetCaptureInfo(stream.cuda_stream))
+                edge = runtime.cudaGraphEdgeData()
+                edge.from_port = 2  # CUDA kernel launch-completion port.
+                edge.type = 1  # CUDA programmatic dependency.
+                _check_cuda_bindings(runtime.cudaStreamUpdateCaptureDependencies(
+                    stream.cuda_stream, native[3], [edge], 1,
+                    runtime.cudaStreamUpdateCaptureDependenciesFlags.cudaStreamSetCaptureDependencies,
+                ))
+                annotated = frontier(stream.cuda_stream)
+                self.assertEqual(annotated[:3], before[:3])
+                self.assertEqual(annotated[3], ((first[3][0][0], b"\x02\x00\x01" + bytes(5)),))
+                _check_cuda_bindings(runtime.cudaStreamUpdateCaptureDependencies(
+                    stream.cuda_stream, native[3], [runtime.cudaGraphEdgeData()], 1,
+                    runtime.cudaStreamUpdateCaptureDependenciesFlags.cudaStreamSetCaptureDependencies,
+                ))
+                self.assertEqual(frontier(stream.cuda_stream), first)
+                self.assertEqual(annotated[3][0][1], b"\x02\x00\x01" + bytes(5))
+            kernel(grid=(2, 1, 1), block=(16, 1, 1), shared_mem=16, args=launches[1])
+            second = frontier(stream.cuda_stream)
+        self.assertEqual(frontier(stream.cuda_stream), (0, 0, 0, ()))
+        self.assertEqual(second[:3], before[:3])
+        self.assertEqual(len(second[3]), 1)
+        self.assertEqual(second[3][0][1], bytes(8))
+        first_node, second_node = first[3][0][0], second[3][0][0]
+        self.assertNotEqual(first_node, second_node)
+        self.assertEqual(first[3], ((first_node, bytes(8)),))
+        snapshot = graph._inspect_captured_kernel_nodes((second_node, first_node))
+        self.assertEqual(snapshot[:2], (graph.raw_cuda_graph(), before[1]))
+        self.assertEqual(set(snapshot[2]), {first_node, second_node})
+        self.assertEqual(len(snapshot[2]), 2)
+        self.assertEqual(len(snapshot[3]), 2)
+        self.assertGreater(snapshot[1], 0)
+        for node, args, actual in zip((second_node, first_node), reversed(launches), snapshot[3]):
+            self.assertEqual(actual[:2], (node, kernel.func.value))
+            self.assertEqual(actual[4:8], ((2, 1, 1), (16, 1, 1), 16, False))
+            values = tuple(struct.pack("P", value.data_ptr()) for value in args[:3])
+            values += tuple(struct.pack("i", value) for value in args[3:])
+            self.assertEqual(actual[8], tuple(zip((0, 8, 16, 24, 28), (8, 8, 8, 4, 4), values)))
+        self.assertFalse(graph._has_graph_exec)
+        graph.replay()
+        self.assertEqual(intermediate, x + y + 3)
+        self.assertEqual(out, 2 * x + y + 8)
+        graph.update_kernel_params({first_node: {4: struct.pack("i", 11)}})
+        self.assertEqual(graph._inspect_captured_kernel_nodes((second_node, first_node)), snapshot)
+        graph.replay()
+        self.assertEqual(intermediate, x + y + 11)
+        self.assertEqual(out, 2 * x + y + 16)
+        with self.assertRaises(TypeError):
+            snapshot[3][0][8][0][2][0] = 0
+        graph.reset()
+        self.assertEqual(snapshot[3][1][8][4][2], struct.pack("i", 3))
+        self.assertEqual(first[3], ((first_node, bytes(8)),))
+
+    @onlyCUDA
+    @skipIfRocm
+    @requires_cuda_python_bindings
+    @unittest.skipUnless(TEST_CUDA_GRAPH, "CUDA graphs not available")
+    @parametrize("invalid", ["duplicate", "foreign", "nonkernel", "no_capture", "not_retained"])
+    def test_graph_inspect_validation(self, device, invalid):
+        from cuda.bindings import runtime
+
+        from torch.cuda._utils import _check_cuda_bindings
+
+        graph, (node,), x, y, (out,) = self._capture_kernel_params_graph(
+            device, keep_graph=invalid != "not_retained"
+        )
+        target = graph
+        nodes = (node,)
+        error = ValueError
+        message = "node"
+        if invalid == "duplicate":
+            nodes = (node, node)
+            message = "Duplicate"
+        elif invalid == "foreign":
+            other, (foreign,), other_x, other_y, other_outputs = self._capture_kernel_params_graph(device)
+            nodes = (node, foreign)
+            message = "does not belong"
+        elif invalid == "nonkernel":
+            nonkernel = int(_check_cuda_bindings(runtime.cudaGraphAddEmptyNode(graph.raw_cuda_graph(), [], 0)))
+            nodes = (node, nonkernel)
+            message = "not a kernel"
+            observed = graph._inspect_captured_kernel_nodes((node,))
+            self.assertEqual(set(observed[2]), {node, nonkernel})
+            self.assertEqual(len(observed[3]), 1)
+        elif invalid == "no_capture":
+            target = torch.cuda.CUDAGraph(keep_graph=True)
+            error = RuntimeError
+            message = "completed retained graph capture"
+        elif invalid == "not_retained":
+            error = RuntimeError
+            message = "keep_graph"
+        instantiated = graph._has_graph_exec
+        with self.assertRaisesRegex(error, message):
+            target._inspect_captured_kernel_nodes(nodes)
+        self.assertEqual(graph._has_graph_exec, instantiated)
+        graph.replay()
+        self.assertEqual(out, x + y + 3)
+        graph.reset()
+        with self.assertRaisesRegex(RuntimeError, "capture|keep_graph"):
+            graph._inspect_captured_kernel_nodes((node,))
+
+    @onlyCUDA
+    @skipIfRocm
+    @requires_cuda_python_bindings
+    @unittest.skipUnless(TEST_CUDA_GRAPH, "CUDA graphs not available")
+    def test_graph_inspect_empty_graph(self, device):
+        if _get_torch_cuda_version() < (12, 4):
+            self.skipTest("CUDA >= 12.4 required for graph inspection")
+        graph = torch.cuda.CUDAGraph(keep_graph=True)
+        stream = torch.cuda.Stream(device=device)
+        with (
+            self.assertWarnsRegex(UserWarning, "CUDA Graph is empty"),
+            torch.cuda.graph(graph, stream=stream),
+        ):
+            captured = torch._C._cuda_get_capture_frontier(stream.cuda_stream)
+        snapshot = graph._inspect_captured_kernel_nodes(())
+        self.assertEqual(snapshot, (captured[2], captured[1], (), ()))
+        self.assertFalse(graph._has_graph_exec)
+        graph.reset()
+        self.assertEqual(snapshot[2:], ((), ()))
+
+    @onlyCUDA
+    @skipIfRocm
+    @requires_cuda_python_bindings
+    @unittest.skipUnless(TEST_CUDA_GRAPH, "CUDA graphs not available")
+    @parametrize("instantiate_first", [False, True])
+    def test_graph_update_kernel_params_replay(self, device, instantiate_first):
+        graph, (node,), x, y, (out,) = self._capture_kernel_params_graph(device)
+        if instantiate_first:
+            graph.replay()
+            self.assertEqual(out, x + y + 3)
+        original_out = out.clone()
+        new_x = x + 17
+        new_out = torch.full_like(out, -7)
+        graph.update_kernel_params(
+            {
+                node: {
+                    0: struct.pack("P", new_x.data_ptr()),
+                    2: struct.pack("P", new_out.data_ptr()),
+                    4: struct.pack("i", -5),
+                }
+            }
+        )
+        graph.replay()
+        self.assertEqual(new_out, new_x + y - 5)
+        self.assertEqual(out, original_out)
+
+        new_out.fill_(-9)
+        graph.replay()
+        self.assertEqual(new_out, new_x + y - 5)
+
+        next_x = x + 29
+        graph.update_kernel_params({node: {0: struct.pack("P", next_x.data_ptr())}})
+        graph.replay()
+        self.assertEqual(new_out, next_x + y - 5)
+        graph.update_kernel_params({node: {4: struct.pack("i", 13)}})
+        graph.replay()
+        self.assertEqual(new_out, next_x + y + 13)
+        self.assertEqual(out, original_out)
+
+    @onlyCUDA
+    @skipIfRocm
+    @requires_cuda_python_bindings
+    @unittest.skipUnless(TEST_CUDA_GRAPH, "CUDA graphs not available")
+    def test_graph_update_kernel_params_instantiate_hook(self, device):
+        graph, (node,), x, y, (out,) = self._capture_kernel_params_graph(device)
+        new_x = x + 17
+        with graph.register_post_instantiate_hook(
+            lambda g: g.update_kernel_params({node: {4: struct.pack("i", 19)}})
+        ):
+            graph.update_kernel_params({node: {0: struct.pack("P", new_x.data_ptr())}})
+        graph.replay()
+        self.assertEqual(out, new_x + y + 19)
+
+    @onlyCUDA
+    @skipIfRocm
+    @requires_cuda_python_bindings
+    @unittest.skipUnless(TEST_CUDA_GRAPH, "CUDA graphs not available")
+    def test_graph_update_kernel_params_without_python_bindings(self, device):
+        graph, (node,), x, y, (out,) = self._capture_kernel_params_graph(device)
+        new_x = x + 17
+        with (
+            patch("torch.cuda.graphs._cuda_driver", None),
+            patch("torch.cuda.graphs._cuda_runtime", None),
+            patch(
+                "torch.cuda.graphs._require_cuda_bindings",
+                side_effect=AssertionError("update must use the native driver API"),
+            ),
+        ):
+            graph.update_kernel_params(
+                {node: {0: struct.pack("P", new_x.data_ptr()), 4: struct.pack("i", 9)}}
+            )
+            graph.replay()
+            self.assertEqual(out, new_x + y + 9)
+            graph.update_kernel_params({node: {4: struct.pack("i", 13)}})
+            graph.replay()
+            self.assertEqual(out, new_x + y + 13)
+
+    @onlyCUDA
+    @skipIfRocm
+    @requires_cuda_python_bindings
+    @unittest.skipUnless(TEST_CUDA_GRAPH, "CUDA graphs not available")
+    def test_graph_update_kernel_params_copies_request(self, device):
+        graph, (node,), x, y, (out,) = self._capture_kernel_params_graph(device)
+        new_x = x + 17
+        updates = {node: {0: struct.pack("P", new_x.data_ptr()), 4: struct.pack("i", 9)}}
+        prepared = graph._prepare_kernel_params(updates)
+        updates[node][0] = struct.pack("P", x.data_ptr())
+        updates[node] = {4: struct.pack("i", 29)}
+        graph.instantiate()
+        graph._apply_kernel_params(prepared)
+        graph.replay()
+        self.assertEqual(out, new_x + y + 9)
+
+    @onlyCUDA
+    @skipIfRocm
+    @requires_cuda_python_bindings
+    @unittest.skipUnless(TEST_CUDA_GRAPH, "CUDA graphs not available")
+    @parametrize("invalidate", ["instantiate", "reset", "other_graph"])
+    def test_graph_update_kernel_params_prepared_lifecycle(self, device, invalidate):
+        graph, (node,), x, y, (out,) = self._capture_kernel_params_graph(device)
+        graph.instantiate()
+        prepared = graph._prepare_kernel_params({node: {4: struct.pack("i", 29)}})
+        target = graph
+        bias = 3
+        if invalidate == "instantiate":
+            graph.instantiate()
+        elif invalidate == "reset":
+            graph.reset()
+            target, (node,), x, y, (out,) = self._capture_kernel_params_graph(
+                device, graph=graph
+            )
+            bias = 7
+            target.update_kernel_params({node: {4: struct.pack("i", bias)}})
+        else:
+            target, (node,), x, y, (out,) = self._capture_kernel_params_graph(device)
+            target.instantiate()
+        with self.assertRaisesRegex(RuntimeError, "reset|different graph|instantiate"):
+            target._apply_kernel_params(prepared)
+        target.replay()
+        self.assertEqual(out, x + y + bias)
+
+    @onlyCUDA
+    @skipIfRocm
+    @requires_cuda_python_bindings
+    @unittest.skipUnless(TEST_CUDA_GRAPH, "CUDA graphs not available")
+    def test_graph_update_kernel_params_empty_graph(self, device):
+        graph = torch.cuda.CUDAGraph(keep_graph=True)
+        stream = torch.cuda.Stream(device=device)
+        with (
+            self.assertWarnsRegex(UserWarning, "CUDA Graph is empty"),
+            torch.cuda.graph(graph, stream=stream),
+        ):
+            pass
+        with self.assertRaisesRegex(ValueError, "does not belong to this graph"):
+            graph.update_kernel_params({0: {0: b""}})
+
+    @onlyCUDA
+    @skipIfRocm
+    @requires_cuda_python_bindings
+    @unittest.skipUnless(TEST_CUDA_GRAPH, "CUDA graphs not available")
+    def test_graph_update_kernel_params_multiple_nodes(self, device):
+        graph, nodes, x, y, outputs = self._capture_kernel_params_graph(
+            device, two_nodes=True
+        )
+        graph.replay()
+        self.assertEqual(outputs[0], x + y + 3)
+        self.assertEqual(outputs[1], 2 * x + y + 8)
+        new_x = x + 20
+        new_intermediate = torch.empty_like(x)
+        new_out = torch.empty_like(x)
+        graph.update_kernel_params(
+            {
+                nodes[0]: {
+                    0: struct.pack("P", new_x.data_ptr()),
+                    2: struct.pack("P", new_intermediate.data_ptr()),
+                    4: struct.pack("i", 7),
+                },
+                nodes[1]: {
+                    0: struct.pack("P", new_x.data_ptr()),
+                    1: struct.pack("P", new_intermediate.data_ptr()),
+                    2: struct.pack("P", new_out.data_ptr()),
+                    4: struct.pack("i", -4),
+                },
+            }
+        )
+        graph.replay()
+        self.assertEqual(new_intermediate, new_x + y + 7)
+        self.assertEqual(new_out, 2 * new_x + y + 3)
+        self.assertEqual(outputs[0], x + y + 3)
+        self.assertEqual(outputs[1], 2 * x + y + 8)
+
+    @onlyCUDA
+    @skipIfRocm
+    @requires_cuda_python_bindings
+    @unittest.skipUnless(TEST_CUDA_GRAPH, "CUDA graphs not available")
+    @parametrize("truncated", [False, True])
+    @parametrize("function_handle", [False, True])
+    def test_graph_update_kernel_params_packed(self, device, truncated, function_handle):
+        from cuda.bindings import driver
+
+        from torch.cuda._utils import _check_cuda_bindings
+
+        graph, nodes, x, y, outputs = self._capture_kernel_params_graph(device)
+        out = torch.zeros(1, dtype=torch.int32, device=device)
+        new_out = torch.zeros_like(out)
+        ptx = b"""
+.version 6.0
+.target sm_50
+.address_size 64
+.visible .entry add_params(
+    .param .u64 output_ptr,
+    .param .u32 addend,
+    .param .align 4 .b8 rest[16]
+)
+{
+    .reg .u64 %p;
+    .reg .u32 %a, %b, %c;
+    ld.param.u64 %p, [output_ptr];
+    ld.param.u32 %a, [addend];
+    ld.param.u32 %b, [rest];
+    add.u32 %c, %a, %b;
+    st.global.u32 [%p], %c;
+    ret;
+}
+"""
+        module = _check_cuda_bindings(
+            driver.cuModuleLoadData(ptx)
+            if function_handle
+            else driver.cuLibraryLoadData(ptx, [], [], 0, [], [], 0)
+        )
+        try:
+            params = driver.CUDA_KERNEL_NODE_PARAMS()
+            if function_handle:
+                params.func = _check_cuda_bindings(
+                    driver.cuModuleGetFunction(module, b"add_params")
+                )
+            else:
+                params.kern = _check_cuda_bindings(
+                    driver.cuLibraryGetKernel(module, b"add_params")
+                )
+            params.gridDimX = params.gridDimY = params.gridDimZ = 1
+            params.blockDimX = params.blockDimY = params.blockDimZ = 1
+            payload = struct.pack("PII12x", out.data_ptr(), 5, 7)
+            if truncated:
+                payload = payload[:16]
+            storage = ctypes.create_string_buffer(payload, len(payload))
+            size = ctypes.c_size_t(len(payload))
+            extra = (ctypes.c_void_p * 5)(
+                int(driver.CU_LAUNCH_PARAM_BUFFER_POINTER_AS_INT),
+                ctypes.addressof(storage),
+                int(driver.CU_LAUNCH_PARAM_BUFFER_SIZE_AS_INT),
+                ctypes.addressof(size),
+                int(driver.CU_LAUNCH_PARAM_END_AS_INT),
+            )
+            params.extra = ctypes.addressof(extra)
+            node = int(
+                _check_cuda_bindings(
+                    driver.cuGraphAddKernelNode(graph.raw_cuda_graph(), [], 0, params)
+                )
+            )
+            captured = _check_cuda_bindings(driver.cuGraphKernelNodeGetParams(node))
+            if function_handle:
+                self.assertEqual(int(captured.func), int(params.func))
+            elif int(captured.func):
+                function = _check_cuda_bindings(driver.cuKernelGetFunction(params.kern))
+                self.assertEqual(int(captured.func), int(function))
+            else:
+                self.assertEqual(int(captured.kern), int(params.kern))
+            graph.update_kernel_params({node: {0: struct.pack("P", new_out.data_ptr())}})
+            graph.update_kernel_params({node: {1: struct.pack("I", 11)}})
+            graph.replay()
+            self.assertEqual(new_out, torch.full_like(new_out, 18))
+            self.assertEqual(out, torch.zeros_like(out))
+
+            aggregate = struct.pack("I12x", 3)
+            if truncated:
+                with self.assertRaisesRegex(ValueError, "exceeds.*parameter buffer"):
+                    graph.update_kernel_params(
+                        {node: {1: struct.pack("I", 29), 2: aggregate}}
+                    )
+            else:
+                graph.update_kernel_params({node: {2: aggregate}})
+            graph.replay()
+            self.assertEqual(new_out, torch.full_like(new_out, 18 if truncated else 14))
+        finally:
+            torch.cuda.synchronize(device)
+            graph.reset()
+            _check_cuda_bindings(
+                driver.cuModuleUnload(module)
+                if function_handle
+                else driver.cuLibraryUnload(module)
+            )
+
+    @onlyCUDA
+    @skipIfRocm
+    @requires_cuda_python_bindings
+    @unittest.skipUnless(TEST_CUDA_GRAPH, "CUDA graphs not available")
+    @parametrize("truncated", [False, True])
+    @parametrize("function_handle", [False, True])
+    def test_graph_inspect_packed(self, device, truncated, function_handle):
+        from cuda.bindings import driver
+
+        from torch.cuda._utils import _check_cuda_bindings
+
+        graph, nodes, x, y, outputs = self._capture_kernel_params_graph(device)
+        out = torch.zeros(1, dtype=torch.int32, device=device)
+        ptx = b"""
+.version 6.0
+.target sm_50
+.address_size 64
+.visible .entry add_params(
+    .param .u64 output_ptr,
+    .param .u32 addend,
+    .param .align 4 .b8 rest[16]
+)
+{
+    .reg .u64 %p;
+    .reg .u32 %a, %b, %c;
+    ld.param.u64 %p, [output_ptr];
+    ld.param.u32 %a, [addend];
+    ld.param.u32 %b, [rest];
+    add.u32 %c, %a, %b;
+    st.global.u32 [%p], %c;
+    ret;
+}
+"""
+        module = _check_cuda_bindings(
+            driver.cuModuleLoadData(ptx)
+            if function_handle
+            else driver.cuLibraryLoadData(ptx, [], [], 0, [], [], 0)
+        )
+        try:
+            params = driver.CUDA_KERNEL_NODE_PARAMS()
+            if function_handle:
+                params.func = _check_cuda_bindings(
+                    driver.cuModuleGetFunction(module, b"add_params")
+                )
+            else:
+                params.kern = _check_cuda_bindings(
+                    driver.cuLibraryGetKernel(module, b"add_params")
+                )
+            params.gridDimX = params.gridDimY = params.gridDimZ = 1
+            params.blockDimX = params.blockDimY = params.blockDimZ = 1
+            payload = struct.pack("PII12x", out.data_ptr(), 5, 7)
+            if truncated:
+                payload = payload[:16]
+            storage = ctypes.create_string_buffer(payload, len(payload))
+            size = ctypes.c_size_t(len(payload))
+            extra = (ctypes.c_void_p * 5)(
+                int(driver.CU_LAUNCH_PARAM_BUFFER_POINTER_AS_INT),
+                ctypes.addressof(storage),
+                int(driver.CU_LAUNCH_PARAM_BUFFER_SIZE_AS_INT),
+                ctypes.addressof(size),
+                int(driver.CU_LAUNCH_PARAM_END_AS_INT),
+            )
+            params.extra = ctypes.addressof(extra)
+            node = int(
+                _check_cuda_bindings(
+                    driver.cuGraphAddKernelNode(graph.raw_cuda_graph(), [], 0, params)
+                )
+            )
+            captured = _check_cuda_bindings(driver.cuGraphKernelNodeGetParams(node))
+            if function_handle:
+                self.assertEqual(int(captured.func), int(params.func))
+            elif int(captured.func):
+                resolved = _check_cuda_bindings(driver.cuKernelGetFunction(params.kern))
+                self.assertEqual(int(captured.func), int(resolved))
+            else:
+                self.assertEqual(int(captured.kern), int(params.kern))
+            if truncated:
+                with self.assertRaisesRegex(ValueError, "exceeds.*parameter buffer"):
+                    graph._inspect_captured_kernel_nodes((node,))
+            else:
+                snapshot = graph._inspect_captured_kernel_nodes((node,))
+                self.assertEqual(set(snapshot[2]), set(nodes) | {node})
+                self.assertEqual(len(snapshot[3]), 1)
+                actual = snapshot[3][0]
+                self.assertEqual(actual[:4], (node, int(captured.func), int(captured.kern), int(captured.ctx)))
+                self.assertEqual(actual[4:8], ((1, 1, 1), (1, 1, 1), 0, True))
+                self.assertEqual(actual[8], (
+                    (0, 8, payload[:8]), (8, 4, payload[8:12]), (12, 16, payload[12:28]),
+                ))
+                storage.raw = bytes(len(payload))
+                self.assertEqual(graph._inspect_captured_kernel_nodes((node,)), snapshot)
+            graph.update_kernel_params({node: {1: struct.pack("I", 11)}})
+            graph.replay()
+            self.assertEqual(out, torch.full_like(out, 18))
+            if not truncated:
+                self.assertEqual(graph._inspect_captured_kernel_nodes((node,)), snapshot)
+        finally:
+            torch.cuda.synchronize(device)
+            graph.reset()
+            _check_cuda_bindings(
+                driver.cuModuleUnload(module)
+                if function_handle
+                else driver.cuLibraryUnload(module)
+            )
+
+    @onlyCUDA
+    @skipIfRocm
+    @requires_cuda_python_bindings
+    @unittest.skipUnless(TEST_CUDA_GRAPH, "CUDA graphs not available")
+    def test_graph_update_kernel_params_lifecycle(self, device):
+        graph = torch.cuda.CUDAGraph(keep_graph=True)
+        with self.assertRaisesRegex(RuntimeError, "captur|[Gg]raph"):
+            graph.update_kernel_params({0: {4: struct.pack("i", 9)}})
+        graph, (node,), x, y, (out,) = self._capture_kernel_params_graph(
+            device, graph=graph
+        )
+        graph.update_kernel_params({node: {4: struct.pack("i", 9)}})
+        graph.replay()
+        self.assertEqual(out, x + y + 9)
+
+        graph.instantiate()
+        graph.replay()
+        self.assertEqual(out, x + y + 3)
+        new_x = x + 11
+        graph.update_kernel_params({node: {0: struct.pack("P", new_x.data_ptr())}})
+        graph.replay()
+        self.assertEqual(out, new_x + y + 3)
+
+        graph.reset()
+        with self.assertRaisesRegex(RuntimeError, "captur|[Gg]raph"):
+            graph.update_kernel_params({node: {4: struct.pack("i", 9)}})
+        graph, (node,), x, y, (out,) = self._capture_kernel_params_graph(
+            device, graph=graph
+        )
+        new_y = y + 17
+        graph.update_kernel_params({node: {1: struct.pack("P", new_y.data_ptr())}})
+        graph.replay()
+        self.assertEqual(out, x + new_y + 3)
+
+        graph, (node,), x, y, (out,) = self._capture_kernel_params_graph(
+            device, keep_graph=False
+        )
+        with self.assertRaisesRegex(RuntimeError, "keep_graph"):
+            graph.update_kernel_params({node: {4: struct.pack("i", 9)}})
+        graph.replay()
+        self.assertEqual(out, x + y + 3)
+
+    @onlyCUDA
+    @skipIfRocm
+    @requires_cuda_python_bindings
+    @unittest.skipUnless(TEST_CUDA_GRAPH, "CUDA graphs not available")
+    @parametrize("cached", [False, True])
+    def test_graph_update_kernel_params_duplicate_node(self, device, cached):
+        class NodeHandle(int):
+            def __hash__(self):
+                return id(self)
+
+        graph, (node,), x, y, (out,) = self._capture_kernel_params_graph(device)
+        bias = 7 if cached else 3
+        if cached:
+            graph.update_kernel_params({node: {4: struct.pack("i", bias)}})
+            graph.replay()
+            self.assertEqual(out, x + y + bias)
+
+        first, second = NodeHandle(node), NodeHandle(node)
+        self.assertEqual(int(first), int(second))
+        self.assertNotEqual(hash(first), hash(second))
+        new_x = x + 17
+        updates = {
+            first: {0: struct.pack("P", new_x.data_ptr())},
+            second: {4: struct.pack("i", 29)},
+        }
+        self.assertEqual(len(updates), 2)
+        self.assertEqual(graph._has_graph_exec, cached)
+        with self.assertRaisesRegex(ValueError, "Duplicate kernel node handle"):
+            graph.update_kernel_params(updates)
+        self.assertEqual(graph._has_graph_exec, cached)
+        graph.replay()
+        self.assertEqual(out, x + y + bias)
+
+        graph.update_kernel_params({node: {4: struct.pack("i", 13)}})
+        graph.replay()
+        self.assertEqual(out, x + y + 13)
+
+    @onlyCUDA
+    @skipIfRocm
+    @requires_cuda_python_bindings
+    @unittest.skipUnless(TEST_CUDA_GRAPH, "CUDA graphs not available")
+    @parametrize(
+        "invalid",
+        [
+            "negative_index",
+            "missing_index",
+            "bool_index",
+            "overflow_index",
+            "not_bytes",
+            "short_value",
+            "long_value",
+            "foreign_node",
+            "nonkernel_node",
+        ],
+    )
+    def test_graph_update_kernel_params_validation(self, device, invalid):
+        from cuda.bindings import runtime
+
+        from torch.cuda._utils import _check_cuda_bindings
+
+        graph, nodes, x, y, outputs = self._capture_kernel_params_graph(
+            device, two_nodes=True
+        )
+        bad_node = nodes[1]
+        bad_arg = 4
+        bad_value = struct.pack("i", 19)
+        error = ValueError
+        message = "argument|index|parameter"
+        if invalid == "negative_index":
+            bad_arg = -1
+            error = IndexError
+        elif invalid == "missing_index":
+            bad_arg = 5
+            error = IndexError
+        elif invalid == "bool_index":
+            bad_arg = True
+            error = TypeError
+        elif invalid == "overflow_index":
+            bad_arg = 2**100
+            error = IndexError
+        elif invalid == "not_bytes":
+            bad_value = bytearray(bad_value)
+            error = TypeError
+            message = "bytes"
+        elif invalid == "short_value":
+            bad_value = bad_value[:-1]
+            message = "bytes|size"
+        elif invalid == "long_value":
+            bad_value += b"\x00"
+            message = "bytes|size"
+        elif invalid == "foreign_node":
+            other_graph, (bad_node,), other_x, other_y, other_outputs = (
+                self._capture_kernel_params_graph(device)
+            )
+            error = (ValueError, RuntimeError)
+            message = "node|graph"
+        elif invalid == "nonkernel_node":
+            bad_node = int(
+                _check_cuda_bindings(
+                    runtime.cudaGraphAddEmptyNode(graph.raw_cuda_graph(), [], 0)
+                )
+            )
+            error = (ValueError, RuntimeError)
+            message = "kernel"
+
+        self.assertFalse(graph._has_graph_exec)
+        with self.assertRaisesRegex(error, message):
+            graph.update_kernel_params(
+                {
+                    nodes[0]: {4: struct.pack("i", 29)},
+                    bad_node: {bad_arg: bad_value},
+                }
+            )
+        self.assertFalse(graph._has_graph_exec)
+        graph.replay()
+        self.assertEqual(outputs[0], x + y + 3)
+        self.assertEqual(outputs[1], 2 * x + y + 8)
+
+        graph.update_kernel_params({nodes[1]: {4: struct.pack("i", 13)}})
+        graph.replay()
+        self.assertEqual(outputs[0], x + y + 3)
+        self.assertEqual(outputs[1], 2 * x + y + 16)
+
+    @onlyCUDA
+    @skipIfRocm
+    @requires_cuda_python_bindings
+    @unittest.skipUnless(TEST_CUDA_GRAPH, "CUDA graphs not available")
+    def test_graph_pointer_updates_replay(self, device):
+        graph, nodes, x, y, outputs = self._capture_kernel_params_graph(device, two_nodes=True)
+        self.addCleanup(graph.reset)
+        self.addCleanup(torch.cuda.synchronize, device)
+        graph.instantiate()
+        prepared = graph._prepare_kernel_pointer_updates(
+            ((nodes[0], 0, 0), (nodes[0], 2, 1),
+             (nodes[1], 0, 0), (nodes[1], 1, 1), (nodes[1], 2, 2)), 3
+        )
+        new_x = x + 17
+        middle, out = torch.empty_like(x), torch.empty_like(x)
+        pointers = (new_x.data_ptr(), middle.data_ptr(), out.data_ptr())
+        entry = graph._replay_kernel_pointer_updates
+        calls = []
+
+        def profile(frame, event, arg):
+            if event == "call":
+                calls.append(frame.f_code.co_name)
+
+        def python_probe():
+            pass
+
+        previous = sys.getprofile()
+        try:
+            sys.setprofile(profile)
+            python_probe()
+        finally:
+            sys.setprofile(previous)
+        self.assertIn("python_probe", calls)
+        calls.clear()
+        stream = torch.cuda.Stream(device=device)
+        stream.wait_stream(torch.cuda.current_stream(device))
+        try:
+            with torch.cuda.stream(stream):
+                try:
+                    sys.setprofile(profile)
+                    entry(prepared, pointers)
+                    entry(prepared, pointers)
+                finally:
+                    sys.setprofile(previous)
+        finally:
+            stream.synchronize()
+        self.assertEqual(calls, [])
+        self.assertEqual(middle, new_x + y + 3)
+        self.assertEqual(out, 2 * new_x + y + 8)
+        self.assertEqual(outputs[0], torch.full_like(x, -1))
+        self.assertEqual(outputs[1], torch.full_like(x, -1))
+
+    @onlyCUDA
+    @skipIfRocm
+    @requires_cuda_python_bindings
+    @unittest.skipUnless(TEST_CUDA_GRAPH, "CUDA graphs not available")
+    @parametrize("cached", [False, True])
+    def test_graph_pointer_updates_interleaved(self, device, cached):
+        graph, (node,), x, y, (out,) = self._capture_kernel_params_graph(device)
+        self.addCleanup(graph.reset)
+        self.addCleanup(torch.cuda.synchronize, device)
+        with self.assertRaisesRegex(RuntimeError, "instantiated"):
+            graph._prepare_kernel_pointer_updates(((node, 0, 0),), 1)
+        hook = (
+            graph.register_post_instantiate_hook(
+                lambda g: g.update_kernel_params({node: {4: struct.pack("i", 19)}})
+            ) if cached else contextlib.nullcontext()
+        )
+        with hook:
+            graph.instantiate()
+        first = graph._prepare_kernel_pointer_updates(((node, 0, 0),), 1)
+        second = graph._prepare_kernel_pointer_updates(((node, 0, 0),), 1)
+        new_x, new_y = x + 17, y + 23
+        pointers = (new_x.data_ptr(),)
+        graph._replay_kernel_pointer_updates(first, pointers)
+        self.assertEqual(out, new_x + y + (19 if cached else 3))
+        graph.update_kernel_params({node: {1: struct.pack("P", new_y.data_ptr()), 4: struct.pack("i", 7)}})
+        graph._replay_kernel_pointer_updates(first, pointers)
+        self.assertEqual(out, new_x + new_y + 7)
+        graph._replay_kernel_pointer_updates(second, (x.data_ptr(),))
+        self.assertEqual(out, x + new_y + 7)
+        graph._replay_kernel_pointer_updates(first, pointers)
+        self.assertEqual(out, new_x + new_y + 7)
+        graph.update_kernel_params({node: {0: struct.pack("P", x.data_ptr()), 4: struct.pack("i", 11)}})
+        with self.assertRaisesRegex(ValueError, "bytes"):
+            graph.update_kernel_params({node: {0: struct.pack("P", x.data_ptr()), 4: b"bad"}})
+        graph._replay_kernel_pointer_updates(first, pointers)
+        self.assertEqual(out, new_x + new_y + 11)
+
+    @onlyCUDA
+    @skipIfRocm
+    @requires_cuda_python_bindings
+    @unittest.skipUnless(TEST_CUDA_GRAPH, "CUDA graphs not available")
+    @parametrize("invalid", ["width", "argument", "pointer_index", "duplicate"])
+    def test_graph_pointer_updates_binding_validation(self, device, invalid):
+        graph, (node,), x, y, (out,) = self._capture_kernel_params_graph(device)
+        self.addCleanup(graph.reset)
+        self.addCleanup(torch.cuda.synchronize, device)
+        graph.instantiate()
+        prepared = graph._prepare_kernel_pointer_updates(((node, 0, 0),), 1)
+        bindings = ((node, 0, 0),)
+        error = IndexError
+        if invalid == "width":
+            bindings, error = ((node, 3, 0),), ValueError
+        elif invalid == "argument":
+            bindings = ((node, 9, 0),)
+        elif invalid == "pointer_index":
+            bindings = ((node, 0, 1),)
+        else:
+            class NodeHandle(int):
+                pass
+
+            bindings, error = ((node, 0, 0), (NodeHandle(node), 0, 0)), ValueError
+        with self.assertRaises(error):
+            graph._prepare_kernel_pointer_updates(bindings, 1)
+        new_x = x + 17
+        graph._replay_kernel_pointer_updates(prepared, (new_x.data_ptr(),))
+        self.assertEqual(out, new_x + y + 3)
+
+    @onlyCUDA
+    @skipIfRocm
+    @requires_cuda_python_bindings
+    @unittest.skipUnless(TEST_CUDA_GRAPH, "CUDA graphs not available")
+    @parametrize("invalid", ["count", "tuple", "bool", "overflow"])
+    def test_graph_pointer_updates_values_validation(self, device, invalid):
+        graph, (node,), x, y, (out,) = self._capture_kernel_params_graph(device)
+        self.addCleanup(graph.reset)
+        self.addCleanup(torch.cuda.synchronize, device)
+        graph.instantiate()
+        prepared = graph._prepare_kernel_pointer_updates(((node, 0, 0), (node, 2, 1)), 2)
+        new_x = x + 17
+        new_out = torch.full_like(out, -9)
+        pointers = (new_x.data_ptr(), new_out.data_ptr())
+        if invalid == "count":
+            bad, error = pointers[:1], ValueError
+        elif invalid == "tuple":
+            bad, error = list(pointers), TypeError
+        elif invalid == "bool":
+            bad, error = (pointers[0], True), TypeError
+        else:
+            bad, error = (pointers[0], 2**100), OverflowError
+        with self.assertRaises(error):
+            graph._replay_kernel_pointer_updates(prepared, bad)
+        self.assertEqual(out, torch.full_like(out, -1))
+        self.assertEqual(new_out, torch.full_like(new_out, -9))
+        graph._replay_kernel_pointer_updates(prepared, pointers)
+        self.assertEqual(new_out, new_x + y + 3)
+        self.assertEqual(out, torch.full_like(out, -1))
+
+    @onlyCUDA
+    @skipIfRocm
+    @requires_cuda_python_bindings
+    @unittest.skipUnless(TEST_CUDA_GRAPH, "CUDA graphs not available")
+    @parametrize("invalidate", ["instantiate", "reset", "other_graph"])
+    def test_graph_pointer_updates_lifecycle(self, device, invalidate):
+        graph, (node,), x, y, (out,) = self._capture_kernel_params_graph(device)
+        self.addCleanup(graph.reset)
+        self.addCleanup(torch.cuda.synchronize, device)
+        graph.instantiate()
+        prepared = graph._prepare_kernel_pointer_updates(((node, 0, 0),), 1)
+        target = graph
+        if invalidate == "instantiate":
+            graph.instantiate()
+        elif invalidate == "reset":
+            torch.cuda.synchronize(device)
+            graph.reset()
+            target, (node,), x, y, (out,) = self._capture_kernel_params_graph(device, graph=graph)
+            target.instantiate()
+        else:
+            target, (node,), x, y, (out,) = self._capture_kernel_params_graph(device)
+            self.addCleanup(target.reset)
+            self.addCleanup(torch.cuda.synchronize, device)
+            target.instantiate()
+        with self.assertRaisesRegex(RuntimeError, "reset|different graph|instantiate"):
+            target._replay_kernel_pointer_updates(prepared, (x.data_ptr(),))
+        new_x = x + 17
+        fresh = target._prepare_kernel_pointer_updates(((node, 0, 0),), 1)
+        target._replay_kernel_pointer_updates(fresh, (new_x.data_ptr(),))
+        self.assertEqual(out, new_x + y + 3)
+
+    @onlyCUDA
+    @skipIfRocm
+    @unittest.skipUnless(TEST_CUDA_GRAPH, "CUDA graphs not available")
+    def test_graph_pointer_updates_rng(self, device):
+        if _get_torch_cuda_version() < (12, 4):
+            self.skipTest("CUDA >= 12.4 required for kernel parameter queries")
+        graph = torch.cuda.CUDAGraph(keep_graph=True)
+        self.addCleanup(graph.reset)
+        self.addCleanup(torch.cuda.synchronize, device)
+        with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
+            torch.rand(32, device=device)
+            with torch.cuda.graph(graph):
+                out = torch.rand(32, device=device)
+            graph.instantiate()
+            prepared = graph._prepare_kernel_pointer_updates((), 0)
+            torch.manual_seed(9123)
+            expected = [torch.rand(32, device=device) for _ in range(2)]
+            torch.manual_seed(9123)
+            graph._replay_kernel_pointer_updates(prepared, ())
+            first = out.clone()
+            graph._replay_kernel_pointer_updates(prepared, ())
+            self.assertEqual(first, expected[0])
+            self.assertEqual(out, expected[1])
+
+    @onlyCUDA
+    @skipIfRocm
+    @requires_cuda_python_bindings
+    @unittest.skipUnless(TEST_CUDA_GRAPH, "CUDA graphs not available")
+    @parametrize("truncated", [False, True])
+    @parametrize("function_handle", [False, True])
+    def test_graph_pointer_updates_packed(self, device, truncated, function_handle):
+        from cuda.bindings import driver
+
+        from torch.cuda._utils import _check_cuda_bindings
+
+        graph, nodes, x, y, outputs = self._capture_kernel_params_graph(device)
+        out = torch.zeros(1, dtype=torch.int32, device=device)
+        new_out = torch.zeros_like(out)
+        ptx = b"""
+.version 6.0
+.target sm_50
+.address_size 64
+.visible .entry write_bias(
+    .param .u64 output_ptr,
+    .param .u32 bias,
+    .param .u64 unused_pointer
+)
+{
+    .reg .u64 %p;
+    .reg .u32 %a;
+    ld.param.u64 %p, [output_ptr];
+    ld.param.u32 %a, [bias];
+    st.global.u32 [%p], %a;
+    ret;
+}
+"""
+        module = _check_cuda_bindings(
+            driver.cuModuleLoadData(ptx)
+            if function_handle
+            else driver.cuLibraryLoadData(ptx, [], [], 0, [], [], 0)
+        )
+        try:
+            params = driver.CUDA_KERNEL_NODE_PARAMS()
+            if function_handle:
+                params.func = _check_cuda_bindings(driver.cuModuleGetFunction(module, b"write_bias"))
+            else:
+                params.kern = _check_cuda_bindings(driver.cuLibraryGetKernel(module, b"write_bias"))
+            params.gridDimX = params.gridDimY = params.gridDimZ = 1
+            params.blockDimX = params.blockDimY = params.blockDimZ = 1
+            payload = struct.pack("PI4xP", out.data_ptr(), 7, 0)
+            if truncated:
+                payload = payload[:12]
+            storage = ctypes.create_string_buffer(payload, len(payload))
+            size = ctypes.c_size_t(len(payload))
+            extra = (ctypes.c_void_p * 5)(
+                int(driver.CU_LAUNCH_PARAM_BUFFER_POINTER_AS_INT), ctypes.addressof(storage),
+                int(driver.CU_LAUNCH_PARAM_BUFFER_SIZE_AS_INT), ctypes.addressof(size),
+                int(driver.CU_LAUNCH_PARAM_END_AS_INT),
+            )
+            params.extra = ctypes.addressof(extra)
+            node = int(_check_cuda_bindings(driver.cuGraphAddKernelNode(graph.raw_cuda_graph(), [], 0, params)))
+            graph.instantiate()
+            prepared = graph._prepare_kernel_pointer_updates(((node, 0, 0),), 1)
+            if truncated:
+                with self.assertRaisesRegex(ValueError, "exceeds.*parameter buffer"):
+                    graph._prepare_kernel_pointer_updates(((node, 2, 0),), 1)
+            else:
+                unused = graph._prepare_kernel_pointer_updates(((node, 2, 0),), 1)
+                graph._replay_kernel_pointer_updates(unused, (0,))
+                self.assertEqual(out, torch.full_like(out, 7))
+                out.zero_()
+            graph._replay_kernel_pointer_updates(prepared, (new_out.data_ptr(),))
+            self.assertEqual(new_out, torch.full_like(new_out, 7))
+            graph.update_kernel_params({node: {1: struct.pack("I", 11)}})
+            graph._replay_kernel_pointer_updates(prepared, (new_out.data_ptr(),))
+            self.assertEqual(new_out, torch.full_like(new_out, 11))
+            self.assertEqual(out, torch.zeros_like(out))
+        finally:
+            torch.cuda.synchronize(device)
+            graph.reset()
+            _check_cuda_bindings(driver.cuModuleUnload(module) if function_handle else driver.cuLibraryUnload(module))
+
     @unittest.skipIf(torch.version.rocm == "10.1.0", "HIPRTC issue (AIRUNTIME-2707)")
     @skipIfRocmVersionLessThan((7, 0))
     @skipCUDAIf(

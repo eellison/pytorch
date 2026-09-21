@@ -267,6 +267,11 @@ class _Declined(RuntimeError):
     # what the trace had established when it declined (a _PartialTrace);
     # None when it declined before its inputs were bound. Set by trace().
     partial: _PartialTrace | None = None
+    # whether trace(warm_up=True) had run the warm-up call when it declined,
+    # and that call's return value: the warm-up was the call (E24), so a
+    # consumer returns its result with the decline rather than losing it
+    warm_up_ran: bool = False
+    warm_up_outputs: Any = None
 
 
 # The C++ recorder raises the same type (registered as _HostTraceDeclined),
@@ -274,6 +279,8 @@ class _Declined(RuntimeError):
 Declined: type[_Declined] = _binding("_HostTraceDeclined")
 Declined.__doc__ = _Declined.__doc__
 Declined.partial = None
+Declined.warm_up_ran = False
+Declined.warm_up_outputs = None
 
 
 class Miss(RuntimeError):
@@ -632,6 +639,8 @@ class _GemmTemplate:
 _gemm_templates: dict[tuple, _GemmTemplate] = {}
 _gemm_lock = threading.Lock()
 _harvest_streams: dict[int, tuple[torch.cuda.Stream, torch.cuda.Stream]] = {}
+# per device the anchor a harvest capture launches ahead of the closed call
+_harvest_anchors: dict[int, torch.Tensor] = {}
 _gemm_harvests = 0
 
 
@@ -725,8 +734,18 @@ def _node_state(n: dict, addrs: list, ws: int, scratch: list) -> tuple:
     return (bytes(image), n["grid"], n["block"], n["smem"], n["func"], n["attrs"])
 
 
-def _kinds_text(kinds: Any) -> str:
-    return "[" + ", ".join(kinds) + "]"
+def _chain_class(nodes: list) -> tuple:
+    # a template's chain as the class compares it (E28): per node its kind and
+    # whether its incoming edge is programmatic. An exec's edge types are as
+    # fixed as its node set: a kernel the library launched without programmatic
+    # serialization must not run behind a programmatic edge, whose dependent
+    # may start before the primary completes
+    return tuple((n["kind"], n["programmatic"]) for n in nodes)
+
+
+def _chain_text(chain: Any) -> str:
+    rows = [k + (" (programmatic)" if p else "") for k, p in chain]
+    return "[" + ", ".join(rows) + "]"
 
 
 def _blas_settings() -> tuple:
@@ -765,6 +784,7 @@ def gemm_templates() -> list[dict]:
                 "key": t.key,
                 "kernels": [n["name"] for n in t.nodes if n["kind"] == "kernel"],
                 "kinds": list(t.kinds),
+                "programmatic": [n["programmatic"] for n in t.nodes],
                 "node_count": len(t.nodes),
                 "scratch": list(t.scratch or []),
                 "harvest_us": t.harvest_us,
@@ -919,10 +939,19 @@ def _harvest_operands(
 
 
 def _harvest_capture(
-    C: Any, st: torch.cuda.Stream, device: int, call: Any, keep: bool, smear: int
+    C: Any,
+    st: torch.cuda.Stream,
+    device: int,
+    call: Any,
+    anchor: torch.Tensor,
+    smear: int,
 ) -> tuple:
     # one capture of the closed call on `st` with its allocations logged:
-    # (nodes, graph or None, [(address, bytes)])
+    # (nodes, graph or None, [(address, bytes)]). A kernel on `anchor` runs
+    # ahead of the call inside the capture: the call's first node gets an
+    # incoming edge whose type says whether the library launched it with
+    # programmatic stream serialization (a capture records that as edge
+    # data, not as a node attribute); harvest_nodes drops the anchor
     # the library leaves uninitialized padding in some parameter structs
     # (stack leftovers): the stack is smeared with one pattern before the
     # first three captures and another before the fourth, so that padding
@@ -942,6 +971,7 @@ def _harvest_capture(
         with torch.cuda.stream(st):
             graph.capture_begin(pool=pool, capture_error_mode="thread_local")
             try:
+                anchor.fill_(1)
                 call()
                 done = True
             finally:
@@ -952,7 +982,7 @@ def _harvest_capture(
                         raise
     finally:
         log = C._host_trace_alloc_log_end()
-    nodes = C._host_trace_harvest_nodes(graph.raw_cuda_graph())
+    nodes = C._host_trace_harvest_nodes(graph.raw_cuda_graph(), anchored=True)
     return nodes, graph, log
 
 
@@ -985,19 +1015,27 @@ def _harvest(key: tuple, spec: tuple, device: int) -> _GemmTemplate:
     with torch.cuda.stream(stream):
         first, spans = _harvest_operands(0, metas, aligns, dev)
         second, _ = _harvest_operands(1, metas, aligns, dev)
+        anchor = _harvest_anchors.get(device)
+        if anchor is None:
+            anchor = _harvest_anchors[device] = torch.empty(1, device=dev)
         _closed_call(op, scalars, first)  # the library's workspace for this stream
         stream.synchronize()
         t0 = time.perf_counter()
         try:
             nodes_a, graph, log_a = _harvest_capture(
-                C, stream, device, lambda: _closed_call(op, scalars, first), True, 0xA5
+                C,
+                stream,
+                device,
+                lambda: _closed_call(op, scalars, first),
+                anchor,
+                0xA5,
             )
         except TapeMismatch as e:
             # the library's call is more than kernels and memsets (a memcpy
             # of host scalars for beta / alpha other than 1): a named miss
             raise Miss(f"closed {op} with scalars {scalars}: {e}") from None
         nodes_b, graph_b, log_b = _harvest_capture(
-            C, stream, device, lambda: _closed_call(op, scalars, second), False, 0xA5
+            C, stream, device, lambda: _closed_call(op, scalars, second), anchor, 0xA5
         )
         ws_a = set(C._host_trace_blas_workspaces(stream.cuda_stream))
         harvest_us = (time.perf_counter() - t0) * 1e6 / 2
@@ -1007,12 +1045,17 @@ def _harvest(key: tuple, spec: tuple, device: int) -> _GemmTemplate:
         _closed_call(op, scalars, first)  # this stream's workspace
         other.synchronize()
         nodes_c, graph_c, log_c = _harvest_capture(
-            C, other, device, lambda: _closed_call(op, scalars, first), False, 0xA5
+            C, other, device, lambda: _closed_call(op, scalars, first), anchor, 0xA5
         )
         ws_c = set(C._host_trace_blas_workspaces(other.cuda_stream))
     with torch.cuda.stream(stream):
         nodes_d, graph_d, log_d = _harvest_capture(
-            C, stream, device, lambda: _closed_call_alt(op, scalars, first), False, 0x5A
+            C,
+            stream,
+            device,
+            lambda: _closed_call_alt(op, scalars, first),
+            anchor,
+            0x5A,
         )
     # the three throwaway graphs go together, after the last capture
     del graph_b, graph_c, graph_d
@@ -1031,6 +1074,7 @@ def _harvest(key: tuple, spec: tuple, device: int) -> _GemmTemplate:
             or a["grid"] != b["grid"]
             or a["block"] != b["block"]
             or a["attrs"] != b["attrs"]
+            or a["programmatic"] != b["programmatic"]
         )
         for a, b in zip(nodes_a, nodes_b)
     ):
@@ -1040,11 +1084,15 @@ def _harvest(key: tuple, spec: tuple, device: int) -> _GemmTemplate:
     for others in (nodes_c, nodes_d):
         if any(
             a["kind"] == "kernel"
-            and (a["func"] != o["func"] or len(a["image"]) != len(o["image"]))
+            and (
+                a["func"] != o["func"]
+                or len(a["image"]) != len(o["image"])
+                or a["programmatic"] != o["programmatic"]
+            )
             for a, o in zip(nodes_a, others)
         ):
             raise Miss(
-                f"closed {op}: the call chose another kernel on another stream or path"
+                f"closed {op}: the call chose or launched another kernel on another stream or path"
             )
     scratch = [n for _addr, n in log_a]
     for log in (log_b, log_c, log_d):
@@ -1120,6 +1168,7 @@ def _harvest(key: tuple, spec: tuple, device: int) -> _GemmTemplate:
                     "elem": a["elem"],
                     "width": a["width"],
                     "bytes": a["elem"] * a["width"],
+                    "programmatic": a["programmatic"],
                 }
             )
             continue
@@ -1232,6 +1281,7 @@ def _harvest(key: tuple, spec: tuple, device: int) -> _GemmTemplate:
                 "ws_slots": ws_slots,
                 "host_slots": host_slots,
                 "attrs": tuple(a["attrs"]),
+                "programmatic": a["programmatic"],
             }
         )
     uses_ws = any(
@@ -2931,6 +2981,9 @@ class Tape:
         self.shape_env = tr.shape_env
         self.device = tr.device
         self.args = args  # the call the tape describes; a build captures fn at it
+        # the warm-up call's return value (trace(warm_up=True)); a consumer that
+        # treats the warm-up as the call takes it and clears it, like `args`
+        self.warm_up_outputs: Any = None
         # the argument contract: arity, which positions are tensors, and every
         # other argument by value and type; a build or a replay with any
         # difference is a miss, before it touches the GPU
@@ -3109,6 +3162,7 @@ class Tape:
                 "constants": [repr(c) for c in self.constants],
                 "device": [[k, str(v)] for k, v in self.device_identity],
             },
+            "written_inputs": list(self.written_inputs),
             "inputs": [
                 {
                     "position": i.position,
@@ -3504,8 +3558,10 @@ def _trace_once(
         # an exception above would otherwise leave the capture open until the
         # traceback releases the recorder; end() closes it, and is a no-op
         # after a completed trace
-        tr.rec.end()
-        _active.trace = None
+        try:
+            tr.rec.end()
+        finally:
+            _active.trace = None
 
 
 class _GcHold:
@@ -3583,13 +3639,14 @@ def trace(
             )
     if getattr(_active, "trace", None) is not None:
         raise Declined("host_trace: a trace is already in progress on this thread")
+    result = None
     if warm_up:
         # on this thread's current stream, synchronized on that stream only:
         # a device-wide synchronize would invalidate a capture on another thread
         before = [_metadata(args[i]) for i in positions]
         lazy = [torch._C._is_cow_tensor(args[i]) for i in positions]
         with torch.cuda.device(device):
-            fn(*args)
+            result = fn(*args)
             torch.cuda.current_stream(device).synchronize()
         # the warm-up is the call's execution, so values may change; the
         # metadata the symbolic run binds must not, or the tape would describe
@@ -3611,18 +3668,26 @@ def trace(
                     for name, a, b in zip(_METADATA, was, now)
                     if a != b
                 )
-                raise Declined(
+                declined = Declined(
                     f"host_trace: the warm-up changed the metadata of arg{i} ({changes}); eager resized it "
                     "in place (an out= of another shape, a resize_ or a set_ inside the call), and a trace "
                     "after it would describe the resized call, not the one made"
                 )
+                declined.warm_up_ran, declined.warm_up_outputs = True, result
+                raise declined
     # The trace capture is thread-local. A CUDAGraph finalized while it is open
     # (an earlier variant's exec and pool, freed by a cyclic collection on this
     # thread) invalidates it, so hold collections until the trace is over. No
     # collection before the capture: a full one costs more than the trace.
-    with _gc_hold:
-        tr, records, outputs = _trace_once(fn, args, positions, device, None)
-        return Tape(tr, records, outputs, args)
+    try:
+        with _gc_hold:
+            tr, records, outputs = _trace_once(fn, args, positions, device, None)
+    except Declined as e:
+        e.warm_up_ran, e.warm_up_outputs = warm_up, result
+        raise
+    tape = Tape(tr, records, outputs, args)
+    tape.warm_up_outputs = result
+    return tape
 
 
 _KIND_FMT = {
@@ -4057,9 +4122,9 @@ class Variant:
         r = self.tape.regions[k]
         key, addrs, spec = self._region_spec(r, env)
         tpl = _template(key, spec, self.device)
-        if tpl.kinds != self.topology[k]:
+        if _chain_class(tpl.nodes) != self.topology[k]:
             raise TopologyMiss(
-                f"cuBLAS runs {r.name} ({r.op}) as {_kinds_text(tpl.kinds)} at this shape; this variant's graph holds {_kinds_text(self.topology[k])} (built at another M): build the tape at these inputs",
+                f"cuBLAS runs {r.name} ({r.op}) as {_chain_text(_chain_class(tpl.nodes))} at this shape; this variant's graph holds {_chain_text(self.topology[k])} (built at another M): build the tape at these inputs",
                 self.tape,
             )
         ws, scratch = arena.addresses(tpl.scratch, tpl.uses_ws)
@@ -4414,7 +4479,8 @@ class Variant:
         self._memset_nodes: list[int] = [0] * len(tape.memsets)
         self._memcpy_nodes: list[int] = [0] * len(tape.memcpys)
         self._sites: list = [None] * len(tape.regions)
-        self.topology: list[tuple[str, ...]] = [()] * len(tape.regions)
+        # per site the chain class (_chain_class) the build captured
+        self.topology: list[tuple] = [()] * len(tape.regions)
         distinct: dict = {}
         pos = 0
 
@@ -4592,7 +4658,7 @@ class Variant:
                     n["attrs"],
                 )
             self._sites[k] = (positions, key)
-            self.topology[k] = tpl.kinds
+            self.topology[k] = _chain_class(tpl.nodes)
         if pos != len(order):
             raise TapeMismatch(
                 f"the tape describes {pos} nodes, the capture has {len(order)}"
@@ -4876,6 +4942,10 @@ class Entry:
     replay: a missed or declined call runs `fn` more than once here (the
     warm-up, a build's captures)."""
 
+    # the frame the declined-class warning names: this class's caller, above
+    # __call__ and _miss (a subclass that wraps __call__ raises it by one)
+    warn_stacklevel = 4
+
     def __init__(
         self,
         fn: Callable[..., Any],
@@ -4894,6 +4964,7 @@ class Entry:
         # the classes whose trace declined: by their guards so far, or exactly
         self.declined: list[_PartialTrace] = []
         self.declined_exact: set[tuple] = set()
+        self.declined_reasons: list[str] = []  # why, once per distinct reason
         self.traces = 0  # traces taken: one per variant or declined class
         self.ordinary = 0  # calls the ordinary host served
 
@@ -4930,6 +5001,9 @@ class Entry:
                 tape = e.tape
             except Miss:
                 continue  # decided against by the call itself
+        return self._serve_unmatched(args, tape)
+
+    def _serve_unmatched(self, args: tuple, tape: Tape | None) -> list:
         exact = _exact_class(args)
         if tape is None and (
             exact in self.declined_exact or any(p.matches(args) for p in self.declined)
@@ -4937,29 +5011,38 @@ class Entry:
             return self._ordinary(args)
         if len(self.variants) == self.max_variants:
             raise RuntimeError(
-                f"host_trace: the call misses all {self.max_variants} variants of this entry (max_variants)"
+                f"host_trace: the call misses all {self.max_variants} variants of this entry (max_variants={self.max_variants})"
             )
         try:
             if tape is None:
                 self.traces += 1
                 tape = trace(self.fn, args, warm_up=self.warm_up)
+            # a backend's builder declines like a trace does (Declined, with the
+            # class on `partial` when the builder can name it; a build's decline,
+            # the allocator backend, has no partial and is remembered exactly):
+            # the same memo
             variant = self.build_variant(tape, args)
         except Declined as e:
-            # the exact inputs as made (a warm-up may have resized them)
-            # always; the class by its guards when they can be decided from
-            # the inputs (it then contains these); a build's decline (the
-            # allocator backend) has no partial and is remembered exactly
-            self.declined_exact.add(exact)
-            if e.partial is not None and e.partial.matches(args):
-                self.declined.append(e.partial)
-            warnings.warn(
-                f"host_trace: the trace at these inputs declined, so the ordinary host serves such calls: {e}",
-                RuntimeWarning,
-                stacklevel=3,  # the entry's caller, above __call__ and _miss
-            )
+            self._decline(e, args, exact, self.warn_stacklevel + 1)
             return self._ordinary(args)
         self.variants.append(variant)
         return variant(args)
+
+    def _decline(self, e: Declined, args: tuple, exact: tuple, stacklevel: int) -> None:
+        """Remember the declined class: the exact inputs as made (a warm-up may
+        have resized them) always; the class by its guards when they can be
+        decided from the inputs (it then contains these). Warned at the frame
+        `stacklevel` names, once per decline."""
+        self.declined_exact.add(exact)
+        if e.partial is not None and e.partial.matches(args):
+            self.declined.append(e.partial)
+        if str(e) not in self.declined_reasons:
+            self.declined_reasons.append(str(e))
+        warnings.warn(
+            f"host_trace: the trace at these inputs declined, so the ordinary host serves such calls: {e}",
+            RuntimeWarning,
+            stacklevel=stacklevel,
+        )
 
 
 # registers the TensorIterator entries (add, mul, silu, gelu, copy_)

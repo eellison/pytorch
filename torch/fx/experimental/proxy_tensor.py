@@ -2271,7 +2271,10 @@ class ProxyTorchDispatchMode(TorchDispatchMode):
 
 
 def _sym_register(
-    tracer: _ProxyTracer, func: OpOverload, args: tuple[object, ...], out: object
+    tracer: _ProxyTracer,
+    func: Callable[..., object],
+    args: tuple[object, ...],
+    out: object,
 ) -> None:
     # If func returned a constant, we don't need to trace; we have
     # determined that the result is constant (no matter if the inputs
@@ -2285,7 +2288,10 @@ def _sym_register(
 
 
 def _compute_proxy(
-    tracer: _ProxyTracer, func: OpOverload, args: tuple[object, ...], out: PySymType
+    tracer: _ProxyTracer,
+    func: Callable[..., object],
+    args: tuple[object, ...],
+    out: PySymType,
 ) -> Proxy:
     # Handle torch.sym_sum
     n_args: tuple[object, ...]

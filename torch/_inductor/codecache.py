@@ -1525,6 +1525,7 @@ class FxGraphHashDetails:
                 processed_inputs.append(inp)
         self.example_inputs = processed_inputs
         self.cache_key_tag = cconfig.cache_key_tag
+        self.cudagraph_trace_terminal = getattr(config.cudagraph_policy, "trace_terminal", False) is True
         self.nested_inductor_config_patches = (
             _collect_nested_region_inductor_config_patches_for_hash(gm)
             if gm is not None

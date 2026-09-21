@@ -95,6 +95,10 @@ struct HarvestedNode {
   std::vector<uint8_t> image;
   std::vector<std::pair<size_t, size_t>> layout;
   std::vector<int64_t> attrs; // kNodeAttrs values
+  // the node's incoming edge of the harvested capture is a programmatic
+  // dependent launch edge: the library launched it with programmatic stream
+  // serialization (an edge of the capture, not an attribute of the node)
+  bool programmatic = false;
   uint64_t dst = 0;
   unsigned value = 0;
   unsigned elem = 1;
@@ -188,10 +192,15 @@ class TORCH_CUDA_CPP_API Exec {
   // a build's): kernels and one-dimensional memsets in creation order, a
   // TapeMismatch for anything else. `probe_attr` >= 0 adds one attribute id
   // to every kernel node's census (tests force the driver's refusal with an
-  // id it does not know). The caller keeps the graph alive.
+  // id it does not know). `anchored` drops the capture's one root node: the
+  // anchor kernel the harvest launches ahead of the call, so that the call's
+  // first node has an incoming edge whose type says whether the library
+  // launched it with programmatic stream serialization. The caller keeps the
+  // graph alive.
   static std::vector<HarvestedNode> harvest_nodes(
       cudaGraph_t g,
-      int probe_attr = -1);
+      int probe_attr = -1,
+      bool anchored = false);
 
  private:
   struct NodeState {

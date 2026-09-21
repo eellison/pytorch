@@ -2,10 +2,11 @@ import functools
 import inspect
 import os
 from functools import cached_property
-from typing import Any
+from typing import Any, NoReturn
 from typing_extensions import Unpack
 
 from ..utils import is_rocm
+from .cudagraph_arg_mapping import KernelArgument
 from .triton_compat import ASTSource, CompiledKernel, knobs as triton_knobs
 from .triton_helpers import get_constexprs
 
@@ -76,6 +77,32 @@ def make_host_tma_expander():
     return expand_host_tma_descriptor
 
 
+class _StaticKernelGraphBorrow:
+    __slots__ = ("kernel",)
+
+    def __init__(self, kernel: "StaticallyLaunchedTritonKernel") -> None:
+        self.kernel: StaticallyLaunchedTritonKernel | None = None
+        if (
+            type(kernel) is not StaticallyLaunchedCudaKernel
+            or is_rocm()
+            or kernel.device_agnostic
+            or kernel.module is None
+            or kernel.function is None
+        ):
+            raise RuntimeError("Graph borrowing requires a loaded device-specific CUDA kernel")
+        kernel._graph_borrows += 1
+        self.kernel = kernel
+
+    def __del__(self) -> None:
+        kernel = self.kernel
+        self.kernel = None
+        if kernel is not None:
+            kernel._graph_borrows -= 1
+
+    def __reduce_ex__(self, protocol: int) -> NoReturn:
+        raise TypeError("Graph kernel borrows cannot be copied or serialized")
+
+
 class StaticallyLaunchedTritonKernel:
     """
     Parses the metadata of a CompiledKernel from Triton into a structure that can
@@ -108,6 +135,9 @@ class StaticallyLaunchedTritonKernel:
         raise NotImplementedError
 
     supports_global_scratch = False
+    _graph_borrows: int = 0
+    cudagraph_user_facts = None
+    _cudagraph_user_loaded = None
 
     def __init__(self, kernel: CompiledKernel) -> None:
         # pyrefly: ignore [missing-attribute]
@@ -162,6 +192,7 @@ class StaticallyLaunchedTritonKernel:
         # Newer triton versions pass extra scratch parameters to the compiled kernel.
         # pyrefly: ignore [missing-attribute]
         metadata = kernel.metadata
+        self.num_ctas = getattr(metadata, "num_ctas", 1)
         self.global_scratch_size = getattr(metadata, "global_scratch_size", None)
         self.global_scratch_align = getattr(metadata, "global_scratch_align", 1) or 1
         if (
@@ -181,10 +212,14 @@ class StaticallyLaunchedTritonKernel:
         self._has_tensordesc = False
         # tensordesc<> arg names in signature order; filled by arg_ty_from_signature
         self.tensordesc_arg_names: list[str] = []
+        self.cudagraph_formal_args: tuple[KernelArgument, ...] | None = None
+        self.cudagraph_user_facts = None
+        self._cudagraph_user_loaded = None
         # pyrefly: ignore [missing-attribute]
         self.arg_tys = self.arg_ty_from_signature(kernel.src)
         self.function: int | None = None  # Loaded by load_kernel(on the parent process)
         self.module: int | None = None  # Owns the HIP/CUDA module loaded for function
+        self._graph_borrows = 0
         # compile-on-one-rank: a device-agnostic kernel (no baked device index) can be
         # launched on more than one device within a single process. A loaded module/
         # function is bound to a single device, so when device_agnostic is set we keep
@@ -255,9 +290,21 @@ class StaticallyLaunchedTritonKernel:
             raise AssertionError("cubin_path attribute not set before load_kernel")
         if self.cubin_path is None:
             raise AssertionError("cubin_path must not be None before load_kernel")
+        facts = self.cudagraph_user_facts
+        if facts is not None:
+            from hashlib import sha256
+            from pathlib import Path
+            from .triton_parameter_analysis import SelectedUserKernelFacts
+
+            payload = Path(self.cubin_path).read_bytes()
+            if (type(facts) is not SelectedUserKernelFacts
+                    or sha256(payload).hexdigest() != facts.cubin_sha256
+                    or self.cubin_raw is not None and payload != self.cubin_raw):
+                facts = None
         (self.module, self.function, self.n_regs, self.n_spills) = (
             self.C_impl._load_kernel(self.cubin_path, self.name, self.shared, device)
         )
+        self._cudagraph_user_loaded = (facts, self.module, self.function) if facts is not None else None
         # Don't need the cubin path anymore now that we've loaded
         self.cubin_path = None
         self.cubin_raw = None
@@ -265,7 +312,12 @@ class StaticallyLaunchedTritonKernel:
     def _current_device(self) -> int:
         raise NotImplementedError
 
+    def _borrow_for_cudagraph(self) -> _StaticKernelGraphBorrow:
+        return _StaticKernelGraphBorrow(self)
+
     def close(self) -> None:
+        if self._graph_borrows:
+            raise RuntimeError("Cannot close a static kernel borrowed by a prepared CUDA graph")
         # Clear Python-visible handles first so repeated cleanup is harmless even if
         # the driver reports an error while unloading.
         modules = list(self.modules.values())
@@ -368,7 +420,8 @@ class StaticallyLaunchedTritonKernel:
                 return i
 
         # pyrefly: ignore [missing-attribute]
-        signature = {index_key(key): value for key, value in src.signature.items()}
+        src_signature = src.signature
+        signature = {index_key(key): value for key, value in src_signature.items()}
         # Triton uses these as the main way to filter out constants passed to their cubin
         constants = [index_key(key) for key in getattr(src, "constants", dict())]
         # This value is always a superset of kernel.fn.constexprs: kernel.fn.constexprs are
@@ -380,6 +433,42 @@ class StaticallyLaunchedTritonKernel:
         # completely ignores the constexprs passed into it when generating code.
         # So we can ignore them here too
         params = []
+        source_constants = getattr(src, "constants", {})
+        constant_values = {index_key(key): value for key, value in source_constants.items()}
+        source_attributes = getattr(src, "attrs", None)
+        attributes = None
+        if type(source_attributes) is dict and all(
+            (type(key) is int or type(key) is str and key in self.arg_names
+             or type(key) is tuple and len(key) == 1 and type(key[0]) is int)
+            and type(values) in (list, tuple)
+            and all(type(attr) in (list, tuple) and len(attr) == 2 and type(attr[0]) is str
+                    and type(attr[1]) in (int, float, bool, str, type(None)) for attr in values)
+            for key, values in source_attributes.items()
+        ):
+            normalized = {index_key(key): tuple(tuple(attr) for attr in values)
+                          for key, values in source_attributes.items()}
+            if (len(normalized) == len(source_attributes)
+                    and all(0 <= index < len(self.arg_names) for index in normalized)):
+                attributes = normalized
+        argument_attributes = [None if attributes is None else attributes.get(index, ())
+                               for index in range(len(self.arg_names))]
+        supports_mapping = (
+            not is_rocm()
+            and not self.profile_scratch_size
+            and all(isinstance(ty, str) for ty in src_signature.values())
+            and len(signature) == len(src_signature)
+            and len(constant_values) == len(source_constants)
+            and len(set(self.arg_names)) == len(self.arg_names)
+            and set(signature) | set(constant_values) == set(range(len(self.arg_names)))
+            and all(
+                (type(key) in (int, str) or (
+                    type(key) is tuple and len(key) == 1 and type(key[0]) is int
+                ))
+                for key in (*src_signature, *source_constants)
+            )
+            and all(type(value) in (int, float, bool, str, type(None)) for value in constant_values.values())
+        )
+        formal_args = []
         self._tensordesc_idx = 0
         self.tensordesc_arg_names = []
 
@@ -389,14 +478,34 @@ class StaticallyLaunchedTritonKernel:
             # In older triton versions, there can be constants in src.constants that are not `constexpr` in signature
             # so we check both here
             if ty == "constexpr" or i in constants:
-                pass
+                supports_mapping = supports_mapping and i in constant_values
+                if supports_mapping:
+                    formal_args.append(KernelArgument(self.arg_names[i], i, ty, None, constant_values[i],
+                                                      argument_attributes[i]))
             elif isinstance(ty, str) and ty.startswith("tensordesc<"):
                 self._has_tensordesc = True
                 self.tensordesc_arg_names.append(self.arg_names[i])
+                if supports_mapping:
+                    formal_args.append(KernelArgument(self.arg_names[i], i, ty, sum(map(len, params)), None,
+                                                      argument_attributes[i]))
                 params.append(self._expand_tensordesc_type(ty))
             else:
+                supports_mapping = supports_mapping and (
+                    isinstance(ty, str) and (ty.startswith("*") or ty in ("i32", "i64"))
+                )
+                if supports_mapping:
+                    formal_args.append(KernelArgument(self.arg_names[i], i, ty, sum(map(len, params)), None,
+                                                      argument_attributes[i]))
                 # pyrefly: ignore [bad-argument-type]
                 params.append(self.extract_type(ty))
+        if supports_mapping:
+            for index in constant_values.keys() - signature.keys():
+                formal_args.append(KernelArgument(self.arg_names[index], index, "constexpr", None, constant_values[index],
+                                                  argument_attributes[index]))
+        self.cudagraph_formal_args = (
+            tuple(sorted(formal_args, key=lambda argument: argument.source_arg_index))
+            if supports_mapping else None
+        )
         return "".join(params)
 
     def __getstate__(self) -> dict[str, Any]:
@@ -406,6 +515,8 @@ class StaticallyLaunchedTritonKernel:
         state["module"] = None
         state["functions"] = {}
         state["modules"] = {}
+        state["_graph_borrows"] = 0
+        state["_cudagraph_user_loaded"] = None
         # Cubin paths aren't consistent across processes, so we clear
         # and reload them.
         state["cubin_path"] = None

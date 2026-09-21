@@ -634,6 +634,9 @@ graph_partition: bool = (
 # See ``torch._inductor.cudagraph_utils.CUDAGraphPolicy`` for the base class.
 cudagraph_policy: "CUDAGraphPolicy | None" = None
 
+# Attach cold saved-input schedules for fresh synchronous backward compilation.
+cudagraph_saved_input_schedule: bool = False
+
 # register ops upon which inductor should partition the graph. name format should be
 # "namespace::kernel_name" (e.g., aten::mm) for op overload packet, or
 # "namespace::kernel_name.overload" (e.g., aten::mm.default).
@@ -1767,6 +1770,9 @@ wrap_inductor_compiled_regions: bool = False
 # code using this assumption, and clone tensors before use if they aren't aligned.
 # In the common case, most inputs will be aligned.
 assume_aligned_inputs: bool = False
+
+# Keep alignment normalization for static inputs whose pointers will be rebound.
+normalize_static_input_alignment: bool = False
 
 # assume_32bit_indexing means that we assume 32-bit indexing is always safe; we always
 # use 32-bit indices regardless of tensor sizes. If assume_32bit_indexing contradicts

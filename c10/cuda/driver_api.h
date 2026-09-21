@@ -140,6 +140,23 @@
 #define C10_LIBCUDA_DRIVER_API_12_3(_)
 #endif
 
+#if defined(CUDA_VERSION) && (CUDA_VERSION >= 12040)
+#define C10_LIBCUDA_DRIVER_API_12_4(_)     \
+  _(cuGraphKernelNodeGetParams, 12000)     \
+  _(cuGraphExecKernelNodeSetParams, 12000) \
+  _(cuFuncGetParamInfo, 12040)             \
+  _(cuKernelGetParamInfo, 12040)           \
+  _(cuGraphKernelNodeSetParams, 12000)     \
+  _(cuGraphKernelNodeGetAttribute, 12000)  \
+  _(cuGraphKernelNodeSetAttribute, 12000)  \
+  _(cuGraphNodeSetEnabled, 12000)          \
+  _(cuGraphExecUpdate, 12000)              \
+  _(cuLaunchKernelEx, 12000)              \
+  _(cuKernelGetAttribute, 12000)
+#else
+#define C10_LIBCUDA_DRIVER_API_12_4(_)
+#endif
+
 #if defined(CUDA_VERSION) && (CUDA_VERSION >= 12080)
 #define C10_LIBCUDA_DRIVER_API_12_8(_)  \
   _(cuCtxFromGreenCtx, 12080)           \
@@ -167,6 +184,7 @@
 
 #define C10_LIBCUDA_DRIVER_API_OPTIONAL(_) \
   C10_LIBCUDA_DRIVER_API_12_3(_)           \
+  C10_LIBCUDA_DRIVER_API_12_4(_)           \
   C10_LIBCUDA_DRIVER_API_12_8(_)           \
   C10_LIBCUDA_DRIVER_API_12_9(_)
 

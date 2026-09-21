@@ -1093,7 +1093,7 @@ cunn_SoftMaxBackwardSmem(scalar_t *gradInput, const outscalar_t *output, const o
 
 // SoftMaxForward_getBlockSize on a value, for the opaque rebind in host_softmax:
 // at least one warp for any dim_size >= 1 (a traced size), the declared domain
-int64_t softmax_forward_block_size(const std::vector<int64_t>& a) {
+int64_t softmax_forward_block_size(const int64_t* a, size_t) {
   return static_cast<int64_t>(SoftMaxForward_getBlockSize(static_cast<uint64_t>(a[0])).x);
 }
 

@@ -1226,9 +1226,15 @@ def _compile_fx_inner(
         start_time = time.time_ns()
 
         if use_cache:
-            (key_info, cache_info) = FxGraphCache.prepare_key(
-                gm, example_inputs, graph_kwargs, inputs_to_check, remote
-            )
+            key_context = contextlib.nullcontext()
+            if config.cudagraph_saved_input_schedule or "_cudagraph_saved_input_origin" in gm.meta:
+                from torch._inductor.runtime._cudagraph._compiler.compiler_saved_inputs.transport import saved_input_cache_key
+
+                key_context = saved_input_cache_key(gm)
+            with key_context:
+                (key_info, cache_info) = FxGraphCache.prepare_key(
+                    gm, example_inputs, graph_kwargs, inputs_to_check, remote
+                )
 
             # Attempt a cache lookup
             if key_info is not None:
@@ -2196,7 +2202,11 @@ def get_input_idxs_to_check(
             # Static inputs are address-stable, so compile-time alignment
             # holds for every call and cloning would break the address
             # cudagraphs recorded; see Note: [static_input_idxs semantics].
-            if i in static_input_idxs and tensor_is_aligned(input):
+            if (
+                i in static_input_idxs
+                and not config.normalize_static_input_alignment
+                and tensor_is_aligned(input)
+            ):
                 continue
             if not should_assume_input_aligned(input):
                 continue
@@ -3359,6 +3369,12 @@ def _compile_fx_main(
         init_backend_registration()
 
         decompositions = get_decomp_fn()
+        saved_input_capture = None
+        if config.cudagraph_saved_input_schedule:
+            from torch._inductor.runtime._cudagraph._compiler.compiler_saved_inputs.transport import eligible, SavedInputCapture
+
+            if eligible(inner_compile):
+                saved_input_capture = SavedInputCapture(inner_compile)
         inner_compile = functools.partial(inner_compile, get_decomp_fn=get_decomp_fn)
 
         def fw_compiler_base(
@@ -3371,15 +3387,22 @@ def _compile_fx_main(
                     num_orig_model_outputs = get_num_model_outputs(model_)
                 else:
                     num_orig_model_outputs = get_num_model_outputs(gm)
-                return compile_fx_forward(
-                    gm,
-                    example_inputs,
-                    num_orig_model_outputs=num_orig_model_outputs,
-                    num_example_inputs=num_example_inputs,
-                    compiler_config_extra=compiler_config_extra,
-                    inner_compile=inner_compile,
-                    is_inference=is_inference,
-                )
+                if saved_input_capture is not None:
+                    saved_input_capture.forward(gm, is_inference=is_inference)
+                try:
+                    return compile_fx_forward(
+                        gm,
+                        example_inputs,
+                        num_orig_model_outputs=num_orig_model_outputs,
+                        num_example_inputs=num_example_inputs,
+                        compiler_config_extra=compiler_config_extra,
+                        inner_compile=inner_compile,
+                        is_inference=is_inference,
+                    )
+                except BaseException:
+                    if saved_input_capture is not None:
+                        saved_input_capture.clear()
+                    raise
 
         fw_compiler: Callable[[GraphModule, Sequence[InputType]], OutputCode] = (
             functools.partial(fw_compiler_base, is_inference=False)
@@ -3406,6 +3429,7 @@ def _compile_fx_main(
         ) -> OutputCode:
             with (
                 dynamo_utils.dynamo_timed("compile_fx.<locals>.bw_compiler"),
+                saved_input_capture.backward(gm) if saved_input_capture is not None else contextlib.nullcontext(),
             ):
                 return compile_fx_backward(
                     gm,

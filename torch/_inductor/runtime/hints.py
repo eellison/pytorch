@@ -335,6 +335,8 @@ class InductorMeta(typing.TypedDict, total=False):
     kernel_name: str
     mutated_arg_names: typing.Any
     optimize_mem: bool
+    cudagraph_parameter_provenance: dict[str, tuple[str, bool, int]]
+    cudagraph_formal_indices: dict[str, int]
 
     # Injected at runtime (CachingAutotuner, reduction heuristics, combo kernels)
     warp_size: int | None

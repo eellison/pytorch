@@ -9181,6 +9181,22 @@ from torch._higher_order_ops.auto_functionalize import auto_functionalized
 make_fallback(auto_functionalized)
 
 
+from torch._inductor.runtime._cudagraph._compiler.compiler_cute_handoff.invocation import invoke_cute, invoke_cute_functional
+
+
+@register_lowering(invoke_cute, type_promotion_kind=None)
+def cute_invocation(entry_key, *operands):
+    ir.UserDefinedCuTeKernel(entry_key, *operands)
+    return None
+
+
+@register_lowering(invoke_cute_functional, type_promotion_kind=None)
+def cute_invocation_functional(entry_key, *operands):
+    output = clone(operands[-1])
+    ir.UserDefinedCuTeKernel(entry_key, *operands[:-1], output)
+    return output
+
+
 @register_lowering(triton_kernel_wrapper_mutation)
 def triton_kernel_wrap_(
     *,

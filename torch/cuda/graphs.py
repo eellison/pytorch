@@ -636,6 +636,7 @@ class CUDAGraph(_CUDAGraph):
                     Custom CUDA kernels added outside PyTorch (e.g., via cuLaunchKernel or DLPack) are not
                     tracked by this mechanism.
         """
+        super()._check_not_owned()
         if self._tracker is not None:
             self._tracker.stop()
             self._tracker = None
@@ -737,8 +738,61 @@ class CUDAGraph(_CUDAGraph):
             self._caching_graph_data = False
             self._instantiate_graph_data = None
 
+    def update_kernel_params(self, updates: dict[int, dict[int, bytes]]) -> None:
+        r"""update_kernel_params(updates) -> None
+
+        Update explicitly selected kernel arguments for subsequent graph replays.
+
+        Requires a completed capture with ``keep_graph=True`` and NVIDIA CUDA
+        12.4 or later. Instantiates the graph if needed. Unspecified arguments
+        retain their previous values. Changes affect the executable graph;
+        :meth:`instantiate` restores the arguments
+        from the captured graph and clears the update state.
+
+        Args:
+            updates (dict[int, dict[int, bytes]]): Mapping from raw kernel node
+              handles to argument indices and their exact ABI bytes. Each value
+              must replace one complete argument. Only kernel nodes directly
+              contained in this graph are supported.
+
+        .. note::
+            This method does not infer pointer uses or validate tensor layouts,
+            alignment, aliases, or kernel specialization assumptions. Callers
+            must update every required use and keep referenced memory alive
+            through every replay that uses it, including asynchronous work.
+            The kernel function, grid, block, and shared memory are unchanged.
+
+            Updates affect future launches only. Serialize updates and launches
+            from different host threads. After modifying the captured graph
+            through raw CUDA APIs, call :meth:`instantiate` before updating
+            arguments again. Do not mix these updates with other executable
+            parameter updates. Requests are validated before applying them,
+            but a CUDA error may leave earlier nodes in the request updated.
+
+        Examples::
+
+            >>> # graph was captured with keep_graph=True; node is a kernel node.
+            >>> # Its arguments are (float* input, float* output, int count).
+            >>> import struct
+            >>> graph.update_kernel_params({  # doctest: +SKIP
+            ...     node: {0: struct.pack("P", new_input.data_ptr()),
+            ...            2: struct.pack("i", new_input.numel())}
+            ... })
+            >>> graph.replay()  # doctest: +SKIP
+        """
+        if not updates:
+            return
+        if not self._keep_graph:
+            raise RuntimeError("update_kernel_params requires keep_graph=True")
+
+        prepared = super()._prepare_kernel_params(updates)
+        if not self._has_graph_exec:
+            self.instantiate()
+        super()._apply_kernel_params(prepared)
+
     def replay(self) -> None:
         r"""Replay the CUDA work captured by this graph."""
+        super()._check_not_owned()
         if self._tracker is not None:
             self._tracker.check_alive(self.pools())
         if self._retained.sync_before_fire:
@@ -767,6 +821,7 @@ class CUDAGraph(_CUDAGraph):
 
     def reset(self) -> None:
         r"""Delete the graph currently held by this instance."""
+        super()._check_not_owned()
         self._release_python_resources()
         # also-fire-on-reset: reset() destroys this capture's CUDA resources and
         # the graph may be re-captured, so fire the current destroy callbacks and

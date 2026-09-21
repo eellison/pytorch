@@ -89,7 +89,7 @@ namespace at::cuda::host_trace::ti {
 namespace {
 
 template <typename factor_t>
-int64_t mean_factor_bits(const std::vector<int64_t>& a) {
+int64_t mean_factor_bits(const int64_t* a, size_t) {
   // mean_kernel_impl: static_cast<factor_t>(num_output_elements) / numel
   const factor_t factor = static_cast<factor_t>(a[0]) / static_cast<factor_t>(a[1]);
   if constexpr (sizeof(factor_t) == 8) {

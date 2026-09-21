@@ -479,7 +479,7 @@ c10::SymInt opaque_symbol(
 c10::SymInt opaque(
     const std::string& fn,
     std::vector<c10::SymInt> args,
-    int64_t (*impl)(const std::vector<int64_t>&),
+    OpaqueImpl impl,
     const char* kind,
     const char* domain) {
   std::vector<int64_t> hints;
@@ -487,7 +487,7 @@ c10::SymInt opaque(
   for (const auto& a : args) {
     hints.push_back(HintsInternal::of(a));
   }
-  const int64_t r = impl(hints);
+  const int64_t r = impl(hints.data(), hints.size());
   TraceState* s = g_active;
   if (s == nullptr) {
     return c10::SymInt(r);
@@ -501,7 +501,7 @@ c10::SymInt opaque(
 c10::SymInt opaque(
     const char* fn,
     c10::ArrayRef<c10::SymInt> args,
-    int64_t (*impl)(const std::vector<int64_t>&),
+    OpaqueImpl impl,
     const char* kind,
     int64_t traced_value,
     const char* domain) {

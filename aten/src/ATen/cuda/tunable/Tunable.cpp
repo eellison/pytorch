@@ -8,6 +8,7 @@
 // Copyright (c) Advanced Micro Devices, Inc.
 //
 
+#include <ATen/BlasSettingsEpoch.h>
 #include <ATen/core/functional.h>
 #include <ATen/cuda/CUDAContextLight.h>
 #include <ATen/cuda/tunable/Tunable.h>
@@ -622,6 +623,7 @@ TuningContext::~TuningContext() {
 
 void TuningContext::EnableTunableOp(bool value) {
   enable_ = value;
+  at::bumpBlasSettingsEpoch();
   if (value) {
     TUNABLE_LOG1("Enable TunableOp");
   }
@@ -640,6 +642,7 @@ bool TuningContext::IsTunableOpEnabled() const {
 
 void TuningContext::EnableTuning(bool value) {
   tuning_enable_ = value;
+  at::bumpBlasSettingsEpoch();
   if (value) {
     TUNABLE_LOG1("Enable Tuning for TunableOp");
   }

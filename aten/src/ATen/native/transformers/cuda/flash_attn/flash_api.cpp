@@ -360,7 +360,7 @@ std::tuple<at::Tensor, at::Tensor> set_params_splitkv(Flash_fwd_params &params, 
         if (num_splits < 1) {
             // We multiply number of SMs by 2 to hard-code the fact that we're using 128 threads per block.
             params.num_splits = ht::opaque("num_splits_heuristic", {batch_size * num_heads * num_m_blocks, dprops->multiProcessorCount * 2, num_n_blocks, 128},
-                                           [](const std::vector<int64_t>& a) -> int64_t { return num_splits_heuristic(a[0], a[1], a[2], a[3]); },
+                                           [](const int64_t* a, size_t) -> int64_t { return num_splits_heuristic(a[0], a[1], a[2], a[3]); },
                                            // every return of num_splits_heuristic is 1 or a split index in [1, max_splits]
                                            "guard", "positive");
         }
