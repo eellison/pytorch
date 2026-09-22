@@ -298,13 +298,18 @@ inline bool check_attn_mask_shape(sdp_params const& params, bool debug) {
   auto num_head = params.query.sym_size(1);
 
   // Helper to check if a mask dim is compatible with a target dim.
-  // Compatible means: symbolically equal, or the mask dim is concretely 1
-  // (broadcast). Returns false (conservatively reject) when neither can be
-  // determined without guarding on unbacked symbolic ints.
+  // Compatible means: equal to the target, or 1 (broadcast). A dim with a
+  // hint is compared as a concrete one is (a guard on the equality or the
+  // broadcast), so a symbolic call selects the backend the concrete shapes
+  // select; an unbacked dim is rejected unless the equality is statically
+  // known or the dim is concretely 1, so no data-dependent guard is raised.
   auto dim_compatible = [](const c10::SymInt& mask_dim,
                            const c10::SymInt& target_dim) -> bool {
     if (TORCH_STATICALLY_KNOWN_TRUE(mask_dim == target_dim)) {
       return true;
+    }
+    if (mask_dim.has_hint() && target_dim.has_hint()) {
+      return mask_dim == target_dim || mask_dim == 1;
     }
     auto mask_int = mask_dim.maybe_as_int();
     return mask_int.has_value() && *mask_int == 1;

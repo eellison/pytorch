@@ -139,6 +139,15 @@ library, TF32 / fp32 precision, reduced-precision reductions, fp16
 accumulation, deterministic algorithms, the workspace configuration).
 gemm_templates() lists the cache.
 
+Closed regions (cuDNN attention). aten._scaled_dot_product_cudnn_attention and
+its backward, eager's default SDPA route for a masked bf16 / fp16 call at head
+dims 64 and 128 on sm90 and up, are closed regions the same way
+(torch/cuda/_host_trace_cudnn.py): the region records the call's operands and
+the outputs the host allocates, the harvest runs the op on stand-ins at the
+region's key (every operand's dtype, sizes, strides and alignment class, the
+scalars, the device identity), and its templates share the cache above under
+their own op tags.
+
 Every branch on a size is guarded on the value the trace saw, including the
 size-1 branches of the view code: a squeeze of a symbolic dim traced at size 1
 pins the tape to size 1, and traced at size 8 misses at size 1. Contiguity and
@@ -2755,6 +2764,15 @@ class _Trace:
         _host_trace_cute_dsl.claim(entry.programs)
         return result
 
+    def library_region(self, func: Any, args: tuple, kwargs: dict, entry: Any) -> Any:
+        """A closed library op on the region list of torch/cuda/_host_trace_cudnn.py
+        (cuDNN attention): the call's operands and the outputs the host
+        allocates, as values; nothing issued. The harvest runs the op on
+        stand-ins at the region's key."""
+        inputs, scalars, outputs, result = entry.describe(self, func, args, kwargs)
+        self.region(entry.op, inputs, outputs, scalars)
+        return result
+
     def reshape_view(self, src: _TracedTensor, shape: list) -> Any:
         # at::native::view: infer_size on the requested shape (one -1 at
         # most, the element count must match; each check a guard, a failure
@@ -3263,6 +3281,12 @@ class _TraceMode(TorchDispatchMode):
         ):
             op.route = "region"
             return self.trace.native_region(func, args, kwargs, entry)
+        # a closed library op on the cuDNN attention list: recorded as a
+        # region, never traced into (torch/cuda/_host_trace_cudnn.py)
+        entry = _host_trace_cudnn.REGIONS.get(func)
+        if entry is not None:
+            op.route = "region"
+            return self.trace.library_region(func, args, kwargs, entry)
         # a closed library call (cuBLAS): recorded as a region, never traced into
         # (the out= form the same region over the given allocation)
         if (func in _CLOSED_OPS or func in _CLOSED_OUT_OPS) and not native:
@@ -4623,6 +4647,7 @@ class Entry:
 # registers the TensorIterator entries (add, mul, silu, gelu, copy_); the Python-launched
 # Triton kernels and the CuTe DSL invocations under a trace (the hooks _trace_once enters)
 from torch.cuda import (  # noqa: F401
+    _host_trace_cudnn,
     _host_trace_cute,
     _host_trace_cute_dsl,
     _host_trace_native,
@@ -4631,8 +4656,10 @@ from torch.cuda import (  # noqa: F401
 )
 
 
-# the calls of torch._native's overrides on the closed-region list
+# the calls of torch._native's overrides and of the cuDNN attention ops on the
+# closed-region list
 _closed_calls.update(_host_trace_native.closed_calls())
+_closed_calls.update(_host_trace_cudnn.closed_calls())
 
 
 if torch.distributed.is_available():

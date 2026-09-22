@@ -429,16 +429,66 @@ class TestCudaHostTraceDecode(HostTraceTestCase):
     @unittest.skipIf(
         not PLATFORM_SUPPORTS_CUDNN_ATTENTION, "cuDNN attention not supported"
     )
-    def test_the_cudnn_sdpa_host_declines_by_name(self):
-        # the default backend order may pick cuDNN, whose host is not converted:
-        # the trace declines naming it, never a wrong result; a decode pins flash
+    def test_the_selector_reads_a_masked_calls_shape_as_eager_does(self):
+        # check_attn_mask_shape (sdp_utils_cpp.h) compares the mask's dims with
+        # the query's, the key's, the batch and the heads. Under a trace the
+        # mask's dims are its own symbols, and a "statically equal or
+        # concretely 1" test (E42's dodge) rejected the cuDNN arm eager takes,
+        # so the trace went on to the next backend: another program. Now a
+        # hinted dim is compared as the concrete one is, a guard, and the trace
+        # takes eager's arm: today a decline naming the unconverted cuDNN host
+        # (the cuDNN region, once it lands, keeps the other arms' kernels off
+        # the tape)
+        q, k, v = (
+            torch.randn(2, H, 8, DH, device="cuda", dtype=DTYPE) for _ in range(3)
+        )
+        mask = torch.zeros(2, 1, 8, 8, device="cuda", dtype=DTYPE)
+        args = (q, k, v, mask)
+        cudnn = int(torch.nn.attention.SDPBackend.CUDNN_ATTENTION)
+        # the class pins flash for the decode chain (setUp); this call is the
+        # selector's own choice among every backend
+        backends = [
+            torch.nn.attention.SDPBackend.CUDNN_ATTENTION,
+            torch.nn.attention.SDPBackend.FLASH_ATTENTION,
+            torch.nn.attention.SDPBackend.EFFICIENT_ATTENTION,
+            torch.nn.attention.SDPBackend.MATH,
+        ]
+        with torch.nn.attention.sdpa_kernel(backends):
+            if torch._fused_sdp_choice(*args) != cudnn:
+                self.skipTest(
+                    "eager's selector does not give this masked call to cuDNN"
+                )
+            try:
+                tape = ht.trace(F.scaled_dot_product_attention, args)
+            except ht.Declined as e:
+                self.assertIn("cudnn", str(e))
+            else:
+                other = [
+                    k for k in _tape_kernels(tape) if "fmha" in k or "softmax" in k
+                ]
+                self.assertEqual(other, [])
+
+    @unittest.skipIf(
+        not PLATFORM_SUPPORTS_CUDNN_ATTENTION, "cuDNN attention not supported"
+    )
+    def test_the_cudnn_sdpa_route_is_a_closed_region(self):
+        # the default backend order on this box picks cuDNN attention: a closed
+        # region beside the six projections (torch/cuda/_host_trace_cudnn.py),
+        # served bitwise over the cache lengths as the flash chain is
         caches = self._caches(4)
         args = self._args(self._ids(4), caches, 16)
         with torch.nn.attention.sdpa_kernel(
             torch.nn.attention.SDPBackend.CUDNN_ATTENTION
         ):
-            with self.assertRaisesRegex(ht.Declined, "cudnn"):
-                ht.trace(decode_step, args)
+            tape = ht.trace(decode_step, args)
+            self.assertEqual([r.op for r in tape.regions].count("cudnn_sdpa"), 1)
+            self.assertEqual(tape.num_regions, 7)
+            self.assertNotIn(
+                "flash_fwd", " ".join(rec["kernel"] for rec in tape.launches)
+            )
+            variant = build(tape, decode_step, args)
+            served = self._run_steps(variant, 4, range(16, 25))
+            self.assertEqual(served, list(range(16, 25)))
 
     def test_odd_head_dims_decline_by_name(self):
         # flash pads head dims to a multiple of 8 inside its host
