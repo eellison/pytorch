@@ -24,15 +24,29 @@ if torch.cuda.is_available():
 C = torch._C
 
 
-def _fused_rms_norm_decline():
-    # F.rms_norm's _fused_rms_norm declines by the route eager takes: its own
-    # CUDA kernel (A190), or torch._native's CuTe DSL override where one is
-    # registered and active (its condition reads the pointers' alignment)
+def _assert_fused_rms_norm_route(case, fn, args):
+    # F.rms_norm's _fused_rms_norm follows the route eager takes (the core
+    # suite's test_unconverted_hosts_decline_by_name has the same shape): its
+    # own CUDA kernel declines by name where eager runs ATen (DECISIONS O40 /
+    # A190); where eager's route is torch._native's override (the vendored
+    # QuACK CuTe DSL rms norm) the program is recorded through the DSL-level
+    # hook when compiled in this process, and QuACK's on-disk cache serves a
+    # loaded module the hook cannot re-select, which declines by name
     from torch._native import registry
 
     if any(n.active for n in registry._graphs.get(("_fused_rms_norm", "CUDA"), ())):
-        return r"_fused_rms_norm\.default through torch._native's cutedsl override"
-    return r"_fused_rms_norm\.default runs its own CUDA kernel"
+        from torch._vendor.quack import cache
+
+        if not cache.CACHE_ENABLED:
+            case.assertEqual(ht.trace(fn, args).num_launches, 1)
+            return
+        message = (
+            "CuTe DSL program the recorder does not hook.*loaded from a compiled module"
+        )
+    else:
+        message = r"_fused_rms_norm\.default runs its own CUDA kernel"
+    with case.assertRaisesRegex(ht.Declined, message):
+        ht.trace(fn, args)
 
 
 # a 0-dim CPU tensor operand (not a wrapped number): an implicit CPU scalar
@@ -1605,12 +1619,13 @@ class TestCudaHostTraceTI(HostTraceTestCase):
             )
         # F.rms_norm's _fused_rms_norm has a CUDA kernel beside a
         # CompositeImplicit decomposition eager never runs on CUDA: the mode
-        # declines it by name (DECISIONS O40 / A190) instead of tracing add_
+        # follows eager's route (DECISIONS O40 / A190) instead of tracing add_
         # and the rest of that decomposition
         w = torch.ones(4096, device="cuda") * 1.5
         x = self._values(64, 4096, torch.float32)
-        with self.assertRaisesRegex(ht.Declined, _fused_rms_norm_decline()):
-            ht.trace(lambda t, g: F.rms_norm(t, (4096,), g, 1e-5), (x, w))
+        _assert_fused_rms_norm_route(
+            self, lambda t, g: F.rms_norm(t, (4096,), g, 1e-5), (x, w)
+        )
         self.assertFalse(C._host_trace_tracing())
 
     def _assert_same_work(self, tape, eager):
@@ -1713,8 +1728,9 @@ class TestCudaHostTraceTI(HostTraceTestCase):
                     name in _TWINS_PENDING,
                     lambda: self._assert_same_work(tape, eager),
                 )
-        with self.assertRaisesRegex(ht.Declined, _fused_rms_norm_decline()):
-            ht.trace(lambda t, g: F.rms_norm(t, (4096,), g, 1e-5), (x, w))
+        _assert_fused_rms_norm_route(
+            self, lambda t, g: F.rms_norm(t, (4096,), g, 1e-5), (x, w)
+        )
         self.assertFalse(C._host_trace_tracing())
 
     def test_clamp_with_scalar_bounds(self):
