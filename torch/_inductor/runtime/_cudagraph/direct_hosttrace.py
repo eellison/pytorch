@@ -1388,8 +1388,8 @@ class _RegionArena:
 
 
 def _region_template(region, key, device, identity):
-    """The cuBLAS variant for `key`: harvested once per process or taken from the
-    cache the interim replay shares (commit 10's key: device, device identity, the
+    """The cuBLAS variant for `key`: harvested once per process into the
+    process-wide template cache (commit 10's key: device, device identity, the
     call, the operand shapes and alignment classes, the library settings). Raises the
     harvest's Miss when the variant is not rebindable."""
     from torch.cuda import _host_trace
@@ -1591,11 +1591,10 @@ def lower_tape(
     if getattr(tape, "all_on_capture_stream", True) is False:
         # the recorder accepted a side stream forked from and joined to the capture
         # stream (E19, O33); this preparation re-issues every record on one stream in
-        # host order, a linearization that would replay the branches serialized. The
-        # interim replay keeps the capture's dependency DAG; a native DAG replay is
-        # the runtime team's (O33)
+        # host order, a linearization that would replay the branches serialized. A
+        # replay of the capture's dependency DAG is the runtime team's (O33)
         raise HostTraceLoweringDeclined(
-            f"host_trace lowering: the tape's launches were not all issued on the trace's capturing stream (all_on_capture_stream=False; {len(tape.launches)} launches, {len(tape.memsets)} memsets, {len(tape.memcpys)} copies): the native preparation replays one stream in host order and would serialize the forked branches; the interim replay serves such a tape (a dependency-DAG replay is the runtime team's, O33)"
+            f"host_trace lowering: the tape's launches were not all issued on the trace's capturing stream (all_on_capture_stream=False; {len(tape.launches)} launches, {len(tape.memsets)} memsets, {len(tape.memcpys)} copies): the native preparation replays one stream in host order and would serialize the forked branches (a dependency-DAG replay is the runtime team's, O33)"
         )
     symbols = _Symbols(tape)
     # the runtime team's CPU tests lower bare objects without a device: read lazily
@@ -2602,7 +2601,7 @@ def lower_tape(
             into.append("  if (bad) return 0;")
             if rec.get("domain") == "positive":
                 # the host declared the result positive (cascade 13's opaque
-                # domains): a value outside it misses, as the interim replay does
+                # domains): a value outside it misses
                 into.append(f"  if ({name} < 1) return 0;")
 
     def opaque_term(rec, args, into):
@@ -3298,7 +3297,7 @@ def _shared_guard(lowered, boxed):
 def _region_templates(regions, values, base_address, device, identity):
     """Per closed region its registry key at `values` (the tape's symbols at the
     inputs) and the template the registry serves for it (harvested once per process
-    or taken from the cache the interim replay shares). Operand shapes and
+    into the process-wide template cache). Operand shapes and
     displacements are the tape's expressions at `values`; an input operand's
     alignment class is that of its real address, `base_address(index)` plus the
     displacement (a planned root's block is ALIGN-aligned, so the class is the
@@ -3334,8 +3333,8 @@ def _region_templates(regions, values, base_address, device, identity):
 
 def _register_preparation_regions(lowered, boxed, device, identity):
     """Before the predicate runs at preparation: for every closed region, the
-    template of the preparation shape (harvested once per process or taken from the
-    cache the interim replay shares); the entry's scratch arena sized to them; then
+    template of the preparation shape (harvested once per process into the
+    process-wide template cache); the entry's scratch arena sized to them; then
     each registered for its site, whose chain is that template's node chain (E28: a
     key whose template has another chain is another class of the tape, built as a
     variant of its own). Operand shapes and displacements are the tape's expressions
@@ -3471,7 +3470,7 @@ def _one_new_node(before, after, what):
     return node
 
 
-# a preparation's capture runs one at a time, as the interim build's did (_build_lock)
+# a preparation's capture runs one at a time (the recorder's allocation log is process-wide)
 _prepare_lock = threading.Lock()
 
 
@@ -3479,8 +3478,8 @@ _prepare_lock = threading.Lock()
 def _capture(graph, stream):
     """capture_begin / capture_end directly on `stream`, relaxed, under the recorder's
     gc hold: torch.cuda.graph's prologue synchronizes the whole device and empties
-    both caches, which would invalidate a trace in progress on another thread (the
-    interim build's rule), and its host-cache flush was the two-entry crash's trigger.
+    both caches, which would invalidate a trace in progress on another thread, and
+    its host-cache flush was the two-entry crash's trigger.
     Relaxed: a thread-local capture is invalidated by another thread's allocations
     and stream syncs on this driver; the tape, not the capture, decides what is
     replayed."""
@@ -4484,8 +4483,8 @@ class HostTraceReplay(_Entry):
         (the ordinary host serves it, warned once) and the warm-up's return value is
         kept on `warm_up_outputs`, since that call already happened and its result
         is the caller's. A decline before anything ran raises: the caller decides. A
-        given tape (a test oracle's, prepared beside the interim replay) is prepared
-        as it is: no trace, nothing ran here, and the lowering's own declines raise."""
+        given tape (a test's, the oracle's) is prepared as it is: no trace, nothing
+        ran here, and the lowering's own declines raise."""
         from torch.cuda import _host_trace
 
         exact = _host_trace._exact_class(args)

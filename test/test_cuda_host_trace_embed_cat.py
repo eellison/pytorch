@@ -5,7 +5,12 @@ import re
 import unittest
 
 from host_trace_h2d_probe import probe
-from host_trace_testing import assert_eager_function_handles, bits, HostTraceTestCase
+from host_trace_testing import (
+    assert_eager_function_handles,
+    bits,
+    build,
+    HostTraceTestCase,
+)
 
 import torch
 import torch.nn.functional as F
@@ -269,7 +274,7 @@ class TestCudaHostTraceEmbedCat(HostTraceTestCase):
 
         base = (table, pinned(4))
         tape = ht.trace(fn, base)
-        variant = ht.build(tape, fn, base)
+        variant = build(tape, fn, base)
         self.assertEqual(tape.num_launches, 1)
         for b in (4, 8, 3, 16):
             ids = pinned(b)
@@ -584,8 +589,7 @@ class TestCudaHostTraceEmbedCat(HostTraceTestCase):
         # the HF GPT-2 idiom: a piece of the qkv row viewed (B, 1, H, DH) and
         # permuted, then concatenated onto the cache. The view's size-1 dim
         # takes computeStride's stride (the piece's row length), as eager's
-        # does, so cat's image, which carries the stride table, matches at
-        # the build's byte check
+        # does, so cat's image, which carries the stride table, is eager's
         B, H, L, DH = 4, 12, 15, 64
         past = torch.randn(B, H, L, DH, device="cuda", dtype=torch.bfloat16)
         row = torch.randn(B, 1, 3 * H * DH, device="cuda", dtype=torch.bfloat16)
@@ -599,7 +603,7 @@ class TestCudaHostTraceEmbedCat(HostTraceTestCase):
         want = cat_inside(past, row)
         tape = ht.trace(cat_inside, (past, row))
         self.assertEqual(tape.num_launches, 1)
-        variant = ht.build(tape, cat_inside, (past, row))
+        variant = build(tape, cat_inside, (past, row))
         got = _one(variant.replay((past, row)))
         self.assertEqual(got.stride(), want.stride())
         self.assertTrue(torch.equal(bits(got), bits(want)))
@@ -622,7 +626,7 @@ class TestCudaHostTraceEmbedCat(HostTraceTestCase):
     def test_copy_on_write_inputs_stay_lazy(self):
         # the embedding weight, the ids and cat's inputs are read through the
         # const accessor: lazy clones stay copy-on-write through the ordinary
-        # ops, the trace's warm-up and the build; outputs go through the
+        # ops, the trace's warm-up and a replay; outputs go through the
         # mutable form.
         table = torch.randn(1000, 128, device="cuda", dtype=torch.bfloat16)
         ids = torch.randint(0, 1000, (4,), device="cuda")
@@ -636,7 +640,7 @@ class TestCudaHostTraceEmbedCat(HostTraceTestCase):
             return F.embedding(i, t)
 
         args = (lazy_table, ids)
-        variant = ht.build(ht.trace(emb, args), emb, args)
+        variant = build(ht.trace(emb, args), emb, args)
         self.assertTrue(torch._C._is_cow_tensor(lazy_table))
         self.assertTrue(torch.equal(variant.replay(args)[0], want))
         self.assertTrue(torch._C._is_cow_tensor(lazy_table))
@@ -650,7 +654,7 @@ class TestCudaHostTraceEmbedCat(HostTraceTestCase):
         def cat2(a):
             return torch.cat([a, a], -1)
 
-        variant = ht.build(ht.trace(cat2, (lazy_x,)), cat2, (lazy_x,))
+        variant = build(ht.trace(cat2, (lazy_x,)), cat2, (lazy_x,))
         self.assertTrue(torch.equal(variant.replay((lazy_x,))[0], want_cat))
         self.assertTrue(torch._C._is_cow_tensor(lazy_x))
 
@@ -692,7 +696,7 @@ class TestCudaHostTraceEmbedCat(HostTraceTestCase):
         base = self._cache_args(2, 5)
         tape = ht.trace(write, base)
         self.assertEqual((tape.num_launches, tape.num_memcpys), (1, 0))
-        variant = ht.build(tape, write, base)
+        variant = build(tape, write, base)
         # (batch 1 is the same broadcast question on the batch dim: a trace at
         # batch 2 does not serve it, as for every sibling-iterator op)
         for args in (
@@ -704,7 +708,7 @@ class TestCudaHostTraceEmbedCat(HostTraceTestCase):
         with self.assertRaisesRegex(ht.Miss, "== 1"):
             variant.replay(self._cache_args(2, 0, n=4))
         prefill = self._cache_args(2, 0, n=4)
-        variant = ht.build(ht.trace(write, prefill), write, prefill)
+        variant = build(ht.trace(write, prefill), write, prefill)
         for args in (
             self._cache_args(2, 8, n=4),
             self._cache_args(3, 10, n=3),
@@ -718,7 +722,7 @@ class TestCudaHostTraceEmbedCat(HostTraceTestCase):
 
         tape = ht.trace(functional, base)
         self.assertEqual((tape.num_launches, tape.num_memcpys), (1, 1))
-        variant = ht.build(tape, functional, base)
+        variant = build(tape, functional, base)
         for args in (self._cache_args(2, 9), self._cache_args(5, 1)):
             cache, pos, k = args
             (got,) = variant.replay(args)
@@ -775,7 +779,7 @@ class TestCudaHostTraceEmbedCat(HostTraceTestCase):
         base = self._cache_args(2, 5)
         tape = ht.trace(write, base)
         self.assertEqual((tape.num_launches, tape.num_memcpys), (1, 0))
-        variant = ht.build(tape, write, base)
+        variant = build(tape, write, base)
         for args in (
             self._cache_args(2, 6),
             self._cache_args(3, 17),
@@ -783,7 +787,7 @@ class TestCudaHostTraceEmbedCat(HostTraceTestCase):
         ):
             self._check_write(variant, write, args, f"pos {args[1].tolist()}")
         prefill = self._cache_args(2, 0, n=4)
-        variant = ht.build(ht.trace(write, prefill), write, prefill)
+        variant = build(ht.trace(write, prefill), write, prefill)
         for args in (self._cache_args(2, 8, n=4), self._cache_args(3, 10, n=3)):
             self._check_write(variant, write, args, f"pos {args[1].tolist()}")
 
@@ -804,7 +808,7 @@ class TestCudaHostTraceEmbedCat(HostTraceTestCase):
         base2 = two_args(5, 8)
         tape = ht.trace(two, base2)
         self.assertEqual(tape.num_launches, 1)
-        variant = ht.build(tape, two, base2)
+        variant = build(tape, two, base2)
         for args in (two_args(5, 8), two_args(2, 11), two_args(9, 3)):
             x, i, j, v = args
             want = two(x.clone(), i, j, v)
@@ -817,7 +821,7 @@ class TestCudaHostTraceEmbedCat(HostTraceTestCase):
 
         tape = ht.trace(functional, base)
         self.assertEqual((tape.num_launches, tape.num_memcpys), (1, 1))
-        variant = ht.build(tape, functional, base)
+        variant = build(tape, functional, base)
         cache, pos, k = self._cache_args(2, 11)
         (got,) = variant.replay((cache, pos, k))
         self.assertTrue(torch.equal(got, functional(cache, pos, k)))
@@ -918,7 +922,7 @@ class TestCudaHostTraceEmbedCat(HostTraceTestCase):
                 ]
                 tape = ht.trace(fn, base)
                 self.assertEqual(tape.num_launches, 1)
-                variant = ht.build(tape, fn, base)
+                variant = build(tape, fn, base)
                 for new in news:
                     (got,) = variant.replay(new)
                     self.assertTrue(
@@ -931,7 +935,7 @@ class TestCudaHostTraceEmbedCat(HostTraceTestCase):
                 return real(x, x.shape[1] - 3)
 
             base = (torch.randn(6, 8, device="cuda"),)
-            variant = ht.build(ht.trace(sym, base), sym, base)
+            variant = build(ht.trace(sym, base), sym, base)
             for new in (
                 (torch.randn(6, 5, device="cuda"),),
                 (torch.randn(4, 10, device="cuda"),),
@@ -944,7 +948,7 @@ class TestCudaHostTraceEmbedCat(HostTraceTestCase):
                 return x.triu_(1) if upper else x.tril_(1)
 
             base = (torch.randn(9, 9, device="cuda"),)
-            variant = ht.build(ht.trace(inplace, base), inplace, base)
+            variant = build(ht.trace(inplace, base), inplace, base)
             x = torch.randn(3, 12, device="cuda")
             want = inplace(x.clone())
             (got,) = variant.replay((x,))
@@ -956,7 +960,7 @@ class TestCudaHostTraceEmbedCat(HostTraceTestCase):
             return torch.triu(m, diagonal=1)
 
         base = (torch.full((16, 16), -1e9, device="cuda", dtype=torch.bfloat16),)
-        variant = ht.build(ht.trace(mask, base), mask, base)
+        variant = build(ht.trace(mask, base), mask, base)
         for n in (17, 48, 1):
             m = torch.full((n, n + 3), -1e9, device="cuda", dtype=torch.bfloat16)
             self.assertTrue(torch.equal(variant.replay((m,))[0], mask(m)))
@@ -967,8 +971,8 @@ class TestCudaHostTraceEmbedCat(HostTraceTestCase):
         # eager's data_ptr() of a tensor with no elements is null whatever its
         # storage, and parallel_cat puts that null in its metadata for an
         # empty piece; the recorder's address of an empty traced view is the
-        # same constant 0, so the build's byte check passes and the cat
-        # replays at other sizes of the rest
+        # same constant 0, so the tape's image is eager's and the cat replays
+        # at other sizes of the rest
         x = torch.randn(8, 64, device="cuda")
         cases = {
             "front": lambda t: torch.cat([t[:0], t]),
@@ -988,7 +992,7 @@ class TestCudaHostTraceEmbedCat(HostTraceTestCase):
                     if q["kind"] == "ptr"
                 ]
                 self.assertIn(0, pointers)
-                variant = ht.build(tape, fn, (x,))
+                variant = build(tape, fn, (x,))
                 for t in (x, torch.randn(13, 64, device="cuda")):
                     self.assertTrue(torch.equal(_one(variant.replay((t,))), fn(t)))
 
@@ -1015,7 +1019,7 @@ class TestCudaHostTraceEmbedCat(HostTraceTestCase):
                 self.assertEqual((tape.num_launches, tape.num_memcpys), (2, 1))
                 pairs = [r for r in tape.root_facts if r[0] != "domain"]
                 self.assertEqual(pairs, [("a0", "a1")])
-                variant = ht.build(tape, fn, base)
+                variant = build(tape, fn, base)
                 for a in (base, args(13)):
                     self.assertTrue(torch.equal(_one(variant.replay(a)), fn(*a)))
 
@@ -1101,7 +1105,7 @@ class TestCudaHostTraceEmbedCat(HostTraceTestCase):
                 base = (rows(), i, rows(3))
                 tape = ht.trace(fn, base)
                 self.assertEqual((tape.num_launches, tape.num_memcpys), (1, 0))
-                variant = ht.build(tape, fn, base)
+                variant = build(tape, fn, base)
                 for new in (
                     (rows(), i, rows(3)),
                     (rows(12, 32), idx([11, 0, 3]), rows(3, 32)),
@@ -1123,7 +1127,7 @@ class TestCudaHostTraceEmbedCat(HostTraceTestCase):
         ):
             want = fn(t.clone(), i)
             tape = ht.trace(fn, (t, i))
-            variant = ht.build(tape, fn, (t, i))
+            variant = build(tape, fn, (t, i))
             (got,) = variant.replay((t, i))
             self.assertTrue(torch.equal(got, want))
         self.assertFalse(C._host_trace_tracing())
@@ -1345,7 +1349,7 @@ class TestCudaHostTraceEmbeddingBackward(HostTraceTestCase):
                 base = case(4, 128, 1000, 0)
                 tape = ht.trace(fwd_bwd, base)
                 self.assertEqual((tape.num_launches, len(tape.memsets)), (2, 1))
-                variant = ht.build(tape, fwd_bwd, base)
+                variant = build(tape, fwd_bwd, base)
                 for B, L, V, seed in (
                     (2, 64, 1000, 1),
                     (8, 96, 1500, 2),
@@ -1361,7 +1365,7 @@ class TestCudaHostTraceEmbeddingBackward(HostTraceTestCase):
     def test_copy_on_write_inputs_stay_lazy(self, device):
         # grad and the ids are read through the const accessor: lazy clones
         # stay copy-on-write through the ordinary sibling call, the trace's
-        # warm-up and the build
+        # warm-up and a replay
         grad, ids, V, pad, s = self._case(device, 4, 128)
         lazy = [torch._lazy_clone(t) for t in (grad, ids)]
         for t in lazy:
@@ -1370,7 +1374,7 @@ class TestCudaHostTraceEmbeddingBackward(HostTraceTestCase):
         want = embedding_backward(grad, ids, V, pad, s)
         got = C._host_trace_ti_embedding_dense_backward(*args)
         self._assert_bitwise(got, want)
-        variant = ht.build(ht.trace(embedding_backward, args), embedding_backward, args)
+        variant = build(ht.trace(embedding_backward, args), embedding_backward, args)
         self._assert_bitwise(variant.replay(args)[0], want)
         for t in lazy:
             self.assertTrue(C._is_cow_tensor(t))

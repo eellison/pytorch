@@ -1042,5 +1042,11 @@
     "device": "cuda",
     "cases": 1,
     "requires_cute": true
+  },
+  {
+    "id": "cpu_host_trace_oracle_control",
+    "script": "cpu/test_host_trace_oracle_control.py",
+    "device": "cpu",
+    "cases": 5
   }
 ]

@@ -182,20 +182,12 @@ class TestHostTraceLayerNorm(TestCase):
         finally:
             replay.close()
 
-    def test_agrees_with_the_interim_replay(self):
-        from torch.cuda import _host_trace
-
-        x, w, b = self._inputs(64)
-        replay = self.module.HostTraceReplay(_ln, (x, w, b))
-        try:
-            interim = _host_trace.build(replay.tape, _ln, (x, w, b))
-            for m in (8, 3, 1, 128):
-                x, w, b = self._inputs(m)
-                native = replay(x, w, b)
-                ours = interim.replay((x, w, b))[0]
-                self.assertEqual(native, ours, atol=0, rtol=0)
-        finally:
-            replay.close()
+    def test_agrees_with_eager_at_other_shapes(self):
+        # the oracle: eager on copies of the call's tensors beside the entry,
+        # bitwise output for output and argument for argument
+        oracle = self._oracle(_ln, self._inputs(64))
+        for m in (8, 3, 1, 128):
+            oracle.check(self._inputs(m))
 
     def test_held_outputs_survive_later_replays(self):
         replay = self.module.HostTraceReplay(_ln, self._inputs(64))
@@ -209,8 +201,8 @@ class TestHostTraceLayerNorm(TestCase):
         finally:
             replay.close()
 
-    # ---- retirement stage B (hosttrace_review/interim_retire): one tape, the interim
-    # replay and the native entry prepared from it, compared to eager and to each other
+    # ---- retirement stage B (hosttrace_review/interim_retire): one tape, the native
+    # entry prepared from it, compared to eager (the oracle)
 
     def _oracle(self, fn, args, **kw):
         from torch.testing._internal.host_trace_oracle import Oracle
@@ -222,8 +214,8 @@ class TestHostTraceLayerNorm(TestCase):
     def test_a_forked_side_stream_is_refused_by_name(self):
         # the recorder accepts a side stream forked from and joined to the capture
         # stream (O33); the native preparation replays one stream in host order, so
-        # it refuses such a tape by name with the tape's stream facts, and the interim
-        # replay (which keeps the capture's dependency DAG) serves it
+        # it refuses such a tape by name with the tape's stream facts (the eager
+        # form of the stack's suites serves it; the DAG replay is the runtime's)
         side = torch.cuda.Stream()
 
         def forked(x, w, b):
@@ -238,6 +230,8 @@ class TestHostTraceLayerNorm(TestCase):
         self.assertIs(oracle.tape.all_on_capture_stream, False)
         self.assertIsNone(oracle.native)
         self.assertIn("all_on_capture_stream=False; 1 launches", oracle.refused)
+        # the class is still served at other shapes on the fallback (the tape's
+        # own predicate with eager as the executor), bitwise eager
         for m in (4, 16):
             oracle.check(self._inputs(m))
         # an entry constructed at such a call: the constructor's warm-up ran (E24: it
@@ -265,7 +259,7 @@ class TestHostTraceLayerNorm(TestCase):
         served = []
         for start in (1, 2, 4):
             changed = (second[start : start + 8 * 16].view(8, 16), w, b)
-            out = oracle.variant.try_replay(changed)  # both backends agree
+            out = oracle.try_check(changed)  # served bitwise, or a miss
             if out is not None:
                 served.append(start)
                 self.assertEqual(out[0], real_view(*changed), atol=0, rtol=0)
@@ -284,8 +278,8 @@ class TestHostTraceLayerNorm(TestCase):
 
     def test_preparation_survives_traces_on_other_threads(self):
         # the preparation captures on its own stream in relaxed mode with no
-        # device-wide synchronize (the interim build's rule): traces in flight on
-        # other threads survive it, and several threads trace, prepare and serve at once
+        # device-wide synchronize: traces in flight on other threads survive it,
+        # and several threads trace, prepare and serve at once
         from torch.cuda import _host_trace
 
         stop = threading.Event()
@@ -362,12 +356,10 @@ class TestHostTraceLayerNorm(TestCase):
         with torch.cuda.device(1):
             oracle = self._oracle(_ln, self._inputs(16), tape=tape, device=1)
             self.assertIsNone(oracle.refused)
-            self.assertEqual(
-                (oracle.native.lowered.device, oracle.interim.device), (1, 1)
-            )
+            self.assertEqual(oracle.native.lowered.device, 1)
             (out,) = oracle.check(self._inputs(24))
             self.assertEqual(out.device, torch.device("cuda", 1))
-        # cuda:0 inputs miss the device fact on both backends
+        # cuda:0 inputs miss the device fact
         with torch.cuda.device(1):
             oracle.expect_miss(self._inputs(24, device_index=0))
 

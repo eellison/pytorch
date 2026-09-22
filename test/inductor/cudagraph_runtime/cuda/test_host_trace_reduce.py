@@ -143,16 +143,17 @@ class TestCudaHostTraceNonMemsetReductionReplay(TestCase):
             self.assertEqual(len(replay.variants), variants)
 
     @parametrize("shape", ((32, 4096), (48, 3000), (16, 4096)))
-    def test_agrees_with_interim_replay_and_eager(self, device, shape):
-        from torch.cuda import _host_trace
+    def test_agrees_with_eager(self, device, shape):
+        from torch.testing._internal.host_trace_oracle import Oracle
 
         original = self._input(device, (64, 4096))
         replay = self._start(_sum_last, (original,))
-        tape = replay.variants[0].program.tape
-        interim = _host_trace.build(tape, _sum_last, (original,))
+        oracle = Oracle(_sum_last, (original,), tape=replay.variants[0].program.tape)
+        self.addCleanup(oracle.close)
         tensor = self._input(device, shape)
         (actual,) = self._check(replay, (tensor,))
-        self.assertEqual(actual, interim.replay((tensor,))[0], atol=0, rtol=0)
+        (theirs,) = oracle.check((tensor,))
+        self.assertEqual(actual, theirs, atol=0, rtol=0)
 
     def test_reduction_mutation_occurs_once_on_miss_and_reuse(self, device):
         def update(dst, src):

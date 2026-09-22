@@ -1,30 +1,30 @@
-"""The interim Python replay as a test oracle for the native host-trace line.
+"""Eager as the oracle of the native host-trace replay.
 
-One tape, two backends prepared from it: the interim ``Variant``
-(``torch.cuda._host_trace.build``: the ordinary host captured and checked against the
-tape byte for byte) and the native entry (``direct_hosttrace.HostTraceReplay`` prepared
-from that same tape, no trace of its own, one variant: a call it does not serve is a
-miss, never a re-trace). A served call runs both, the native side on fresh copies of
-the tensor arguments (the same sizes, strides, offsets, dtype, device and pinning over
-another storage, so an in-place write lands beside the interim's), and compares them
-output for output and argument for argument; a miss must be a miss on both sides.
+One tape, prepared on the native replay (``direct_hosttrace.HostTraceReplay``
+from that tape, no trace of its own, one variant: a call it does not serve is a
+miss, never a re-trace), and eager itself as the reference: a served call runs
+eager on fresh copies of the tensor arguments (the same sizes, strides, offsets,
+dtype, device and pinning over another storage, so an in-place write lands beside
+the replay's) and compares the two output for output and argument for argument,
+bitwise through the bytes; a miss is the native entry's, named.
 
-Two uses. A native suite's oracle test builds an ``Oracle`` and calls ``check`` (eager,
-native and interim at the call's inputs, bitwise) or ``expect_miss``. The interim suites
-run unchanged under ``install()``, which makes ``_host_trace.build`` return an
-``OracleVariant``: the interim ``Variant`` for every attribute the tests read, with a
-native entry checked on every replay; interim-only, counted, when the native line
-refuses the tape by name (a cell the native path does not serve yet), and for a call
-made under a profiler (a test counting the replay's device work counts one replay).
+Two uses. A native suite's oracle test builds an ``Oracle`` and calls ``check``
+(eager and native at the call's inputs, bitwise) or ``expect_miss``. The stack's
+suites (test/test_cuda_host_trace*.py, whose replay is ``host_trace_testing.build``)
+run unchanged under ``install()``, which makes ``build`` return an
+``OracleVariant``: the suite's variant with eager run beside every served call;
+a tape the native line refuses by name is served by the eager form alone, counted,
+and a call made under a profiler (a test counting the replay's device work counts
+one replay) runs the native side alone.
 
     python -m torch.testing._internal.host_trace_oracle test/test_cuda_host_trace_ti.py
 
-runs an interim suite that way; ``HOST_TRACE_ORACLE_LOG=<file>`` appends the per-test
-counts (builds, native builds, refusals, calls served by both, misses on both) as JSON.
+runs a stack suite that way; ``HOST_TRACE_ORACLE_LOG=<file>`` appends the per-test
+counts (builds, native builds, refusals, calls compared, misses) as JSON.
 
-Both backends replay under the caller's grad mode without reading it (E32, O48): a
-served call's outputs carry no autograd history on either side, so the oracle's
-comparisons say nothing about grad mode; the runners call the entries under no_grad.
+The replay runs under the caller's grad mode without reading it (E32, O48): a
+served call's outputs carry no autograd history, so the comparisons say nothing
+about grad mode; the runners call the entries under no_grad.
 """
 
 import atexit
@@ -64,11 +64,11 @@ def _symm(t):
 
 def clone_like(t, storages=None):
     """A tensor with the same bytes, sizes, strides, storage offset, dtype, device and
-    pinning over a fresh storage: the native side's argument. Arguments over one
-    storage share its copy (`storages`: the originals' data pointers seen so far), so
-    the aliasing the tape's guards relate is the same. A symmetric-memory buffer (its
-    handle is the storage's) and a math-bit tensor (the recorder declines it; the bit
-    is what the call must see) are passed as they are."""
+    pinning over a fresh storage: eager's argument beside the replay's. Arguments
+    over one storage share its copy (`storages`: the originals' storages seen so
+    far), so the aliasing the tape's guards relate is the same. A symmetric-memory
+    buffer (its handle is the storage's) and a math-bit tensor (the recorder
+    declines it; the bit is what the call must see) are passed as they are."""
     if not isinstance(t, torch.Tensor) or _symm(t) or t.is_neg() or t.is_conj():
         return t
     storage = t.untyped_storage()
@@ -128,6 +128,27 @@ def _same(a, b, what, values=True):
         raise AssertionError(f"oracle: {what}: values differ (max abs {diff})")
 
 
+def _as_list(out):
+    return [out] if isinstance(out, torch.Tensor) else list(out)
+
+
+def compare(native_out, args, eager_out, clones, unwritten=()):
+    """The native replay's outputs at `args` against eager's at `clones` (copies of
+    `args`), output for output, and every argument the replay may have written
+    against eager's copy of it. An output no node writes (eager's at::empty
+    returned as it is, `unwritten`) is compared by its metadata: its values are
+    indeterminate on every path."""
+    if len(native_out) != len(eager_out):
+        raise AssertionError(
+            f"oracle: {len(native_out)} native outputs, {len(eager_out)} eager"
+        )
+    for k, (a, b) in enumerate(zip(native_out, eager_out)):
+        _same(a, b, f"output {k} against eager", values=k not in unwritten)
+    for k, (a, c) in enumerate(zip(args, clones)):
+        if c is not a:
+            _same(a, c, f"argument {k} after the call")
+
+
 _STATS: dict = {}
 _STATS_LOCK = threading.Lock()
 
@@ -148,7 +169,8 @@ def _note(key, value=1):
                 "builds": 0,
                 "native": 0,
                 "refused": [],
-                "both": 0,
+                "compared": 0,
+                "fallback": 0,
                 "missed": 0,
                 "rerun": 0,
                 "other_stream": 0,
@@ -161,9 +183,25 @@ def _note(key, value=1):
             row[key] += value
 
 
+def _testing():
+    """test/host_trace_testing.py, the stack's test module (the eager form of a
+    tape a native line refused): beside the suite on sys.path, else from the
+    repo's test directory."""
+    try:
+        import host_trace_testing
+    except ImportError:
+        test_dir = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(torch.__file__))), "test"
+        )
+        if test_dir not in sys.path:
+            sys.path.append(test_dir)
+        import host_trace_testing
+    return host_trace_testing
+
+
 def _native_entry(fn, tape, args, device, staging_depth):
-    """The native entry prepared from `tape` at copies of `args`, or (None, why) when
-    the native line refuses the tape by name."""
+    """The native entry prepared from `tape` at `args` (no trace, nothing runs), or
+    (None, why) when the native line refuses the tape by name."""
     ht = _ht()
     adapter = _adapter()
     from torch._inductor.runtime.cudagraph_launch_association import UnsupportedCapture
@@ -177,7 +215,7 @@ def _native_entry(fn, tape, args, device, staging_depth):
     try:
         native = adapter.HostTraceReplay(
             fn,
-            _clone_args(args),
+            args,
             tape=tape,
             max_variants=1,
             staging_depth=staging_depth,
@@ -193,41 +231,42 @@ def _native_entry(fn, tape, args, device, staging_depth):
     return native, None
 
 
-class NativeMiss(Exception):
-    pass
-
-
-class OtherStream(Exception):
-    pass
+def _native_call(native, args):
+    """The native entry's outputs as a list, or its miss as `ht.Miss` (the cap error
+    of a one-variant entry read as a miss, with the entry's reason); another
+    stream's refusal (O29) propagates as the RuntimeError it is."""
+    ht = _ht()
+    try:
+        out = native(*args)
+    except RuntimeError as e:
+        if "misses all 1 variants" not in str(e):
+            raise
+        why = native.miss_log[-1][1] if native.miss_log else str(e)
+        raise ht.Miss(why) from None
+    return _as_list(out)
 
 
 class OracleVariant:
-    """The interim Variant with a native entry checked beside it on every replay."""
+    """A stack suite's variant (`host_trace_testing.build`'s: the native replay, or
+    the eager form where the native line refused the tape) with eager run beside
+    every served call and compared to it."""
 
-    def __init__(self, interim, native, refused):
-        self.interim = interim
-        self.native = native
-        self.refused = refused
+    def __init__(self, variant):
+        self.variant = variant
 
-    _own = frozenset(("interim", "native", "refused"))
+    _own = frozenset(("variant",))
 
     def __getattr__(self, name):
-        return getattr(self.interim, name)
+        return getattr(self.variant, name)
 
     def __setattr__(self, name, value):
-        # a test that swaps an internal of the interim Variant (its exec) writes
-        # through to it
         if name in self._own:
             object.__setattr__(self, name, value)
         else:
-            setattr(self.interim, name, value)
-
-    def close(self):
-        if self.native is not None:
-            self.native.close()
+            setattr(self.variant, name, value)
 
     def matches(self, args):
-        return self.interim.matches(args)
+        return self.variant.matches(args)
 
     def __call__(self, args):
         return self.replay(args)
@@ -238,114 +277,78 @@ class OracleVariant:
     def try_replay(self, args):
         return self._both(tuple(args), miss_ok=True)
 
-    def wait_for_h2d(self):
-        self.interim.wait_for_h2d()
-        if self.native is not None:
-            self.native.wait_for_h2d()
-
-    def _native_call(self, clones):
-        native = self.native
-        try:
-            out = native(*clones)
-        except RuntimeError as e:
-            if "bound device and stream" in str(e):
-                # the call is on another stream than the entry's (O29): the
-                # native line refuses it by contract, the interim serves it
-                raise OtherStream(str(e)) from None
-            if "misses all 1 variants" not in str(e):
-                raise
-            why = native.miss_log[-1][1] if native.miss_log else str(e)
-            raise NativeMiss(why) from None
-        return [out] if isinstance(out, torch.Tensor) else list(out)
-
     def _both(self, args, miss_ok):
         ht = _ht()
-        interim = self.interim
-        if self.native is None:
-            return interim.try_replay(args) if miss_ok else interim.replay(args)
-        if torch.autograd._profiler_enabled():
-            # a profiled call is the interim's alone: a test that counts the replay's
-            # device work counts one replay, not the native call's plus its argument
-            # clones (its un-profiled calls compared both backends)
-            _note("profiled")
-            return interim.try_replay(args) if miss_ok else interim.replay(args)
+        variant = self.variant
+        if variant.native is None or torch.autograd._profiler_enabled():
+            # the eager form (nothing to compare it with) or a profiled call (a test
+            # that counts the replay's device work counts one replay, not eager's
+            # beside it): the variant alone
+            if variant.native is not None:
+                _note("profiled")
+            return variant.try_replay(args) if miss_ok else variant.replay(args)
         clones = _clone_args(args)
-        device = interim.device
+        device = variant.device
         state = torch.cuda.get_rng_state(device)
-        native_out, native_miss = None, None
         try:
-            native_out = self._native_call(clones)
-        except NativeMiss as e:
-            native_miss = str(e)
-        except OtherStream:
-            torch.cuda.set_rng_state(state, device)
-            _note("other_stream")
-            return interim.try_replay(args) if miss_ok else interim.replay(args)
-        torch.cuda.set_rng_state(state, device)
-        try:
-            out = interim.replay(args)
-        except (ht.Miss, ht.TopologyMiss) as e:
-            # a TopologyMiss (E28): the call's shapes select another node chain than
-            # the variant's exec holds; an entry builds the same tape at these inputs,
-            # the one-variant native side reports the cap (a miss here)
-            if native_miss is None:
-                raise AssertionError(
-                    f"oracle: the interim replay missed ({e}) where the native entry served"
-                ) from e
+            out = variant.replay(args)
+        except ht.Miss:
+            # the variant's miss (the tape's guards, checked against the native
+            # predicate by host_trace_testing.NativeReplay): eager is not run
             _note("missed")
             if miss_ok:
                 return None
             raise
-        if native_miss is not None:
-            raise AssertionError(
-                f"oracle: the native entry missed ({native_miss}) where the interim replay served"
-            )
-        if len(out) != len(native_out):
-            raise AssertionError(
-                f"oracle: {len(out)} interim outputs, {len(native_out)} native"
-            )
-        unwritten = self.native.lowered.unwritten_outputs
-        for k, (a, b) in enumerate(zip(out, native_out)):
-            # an output no node writes (eager's at::empty returned as it is) is
-            # compared by its metadata: its values are indeterminate on every path
-            _same(a, b, f"output {k}", values=k not in unwritten)
-        for k, (a, c) in enumerate(zip(args, clones)):
-            if c is not a:
-                _same(a, c, f"argument {k} after the call")
-        _note("both")
+        # eager draws from the state the served call started at; the served
+        # call's own advancement is what the caller sees afterwards, as with
+        # any replay (the runtime team's review of the first cut, cascade 18)
+        served = torch.cuda.get_rng_state(device)
+        torch.cuda.set_rng_state(state, device)
+        eager = _as_list(variant.fn(*clones))
+        torch.cuda.set_rng_state(served, device)
+        compare(out, args, eager, clones, variant.lowered.unwritten_outputs)
+        _note("compared")
         return out
 
 
 _ORIGINAL_BUILD = None
+_TESTING = None
 
 
 def install():
-    """Make `_host_trace.build` return an OracleVariant (idempotent)."""
-    global _ORIGINAL_BUILD
-    ht = _ht()
+    """Make `host_trace_testing.build` return an OracleVariant (idempotent)."""
+    global _ORIGINAL_BUILD, _TESTING
     if _ORIGINAL_BUILD is not None:
         return
-    _ORIGINAL_BUILD = original = ht.build
+    import host_trace_testing as testing
 
-    def build(tape, fn, args, device=None, *, warm_up=True, staging_depth=2):
-        interim = original(
-            tape, fn, args, device, warm_up=warm_up, staging_depth=staging_depth
+    _TESTING = testing
+    _ORIGINAL_BUILD = original = testing.build
+
+    def build(tape, fn, args, device=None, *, staging_depth=2, backend=None):
+        variant = original(
+            tape, fn, args, device, staging_depth=staging_depth, backend=backend
         )
-        native, refused = _native_entry(fn, tape, tuple(args), device, staging_depth)
-        return OracleVariant(interim, native, refused)
+        _note("builds")
+        if variant.native is not None:
+            _note("native")
+        elif variant.refused is not None:
+            _note("refused", variant.refused)
+        return OracleVariant(variant)
 
-    ht.build = build
+    testing.build = build
 
 
 def uninstall():
     global _ORIGINAL_BUILD
     if _ORIGINAL_BUILD is not None:
-        _ht().build = _ORIGINAL_BUILD
+        _TESTING.build = _ORIGINAL_BUILD
         _ORIGINAL_BUILD = None
 
 
 class Oracle:
-    """One tape, both backends, for a native suite's oracle test."""
+    """One tape, the native replay prepared from it and eager as its reference, for
+    a native suite's oracle test."""
 
     def __init__(
         self, fn, args, *, tape=None, device=None, staging_depth=2, warm_up=True
@@ -354,60 +357,85 @@ class Oracle:
         self.fn = fn
         args = tuple(args)
         self.tape = tape if tape is not None else ht.trace(fn, args, warm_up=warm_up)
-        interim = (_ORIGINAL_BUILD or ht.build)(
-            self.tape, fn, args, device, warm_up=False, staging_depth=staging_depth
+        self.device = device if device is not None else self.tape.device.index
+        self.native, self.refused = _native_entry(
+            fn, self.tape, args, device, staging_depth
         )
-        native, refused = _native_entry(fn, self.tape, args, device, staging_depth)
-        self.variant = OracleVariant(interim, native, refused)
-
-    @property
-    def native(self):
-        return self.variant.native
-
-    @property
-    def interim(self):
-        return self.variant.interim
-
-    @property
-    def refused(self):
-        return self.variant.refused
 
     def close(self):
-        self.variant.close()
+        if self.native is not None:
+            self.native.close()
 
-    def check(self, args, reference=None):
-        """Eager (or `reference`), the native entry and the interim replay at `args`,
-        bitwise; returns the interim's outputs. Eager runs on its own copies."""
+    def check(self, args, reference=None, *, miss_ok=False):
+        """Eager (or `reference`) and the native entry at `args`, bitwise, output
+        for output and argument for argument; returns the native outputs, or
+        None when the entry misses and `miss_ok`. Eager runs first on its own
+        copies from the device's RNG state at the call, which is restored for
+        the native entry; the entry runs once and its RNG advancement stays, as
+        any replay's does. A tape the native line refused by name is checked on
+        the eager form of the stack's suites (host_trace_testing.build: the
+        tape's own predicate, eager as the executor), so the class it serves at
+        other shapes is exercised and its result is eager's."""
+        ht = _ht()
         args = tuple(args)
-        device = self.interim.device
+        if self.native is None:
+            if self.refused is None:
+                raise AssertionError(
+                    "oracle: no native entry and no refusal; nothing to check"
+                )
+            variant = _testing().build(
+                self.tape, self.fn, args, self.device, backend="eager"
+            )
+            unwritten = ()
+        else:
+            unwritten = self.native.lowered.unwritten_outputs
+        clones = _clone_args(args)
+        state = torch.cuda.get_rng_state(self.device)
         if reference is None:
-            state = torch.cuda.get_rng_state(device)
-            reference = self.fn(*_clone_args(args))
-            torch.cuda.set_rng_state(state, device)
-        reference = (
-            [reference] if isinstance(reference, torch.Tensor) else list(reference)
-        )
-        out = self.variant.replay(args)
-        if len(out) != len(reference):
-            raise AssertionError(f"oracle: {len(out)} outputs, eager {len(reference)}")
-        native = self.native
-        unwritten = () if native is None else native.lowered.unwritten_outputs
-        for k, (a, b) in enumerate(zip(out, reference)):
-            _same(a, b, f"output {k} against eager", values=k not in unwritten)
+            reference = self.fn(*clones)
+            torch.cuda.set_rng_state(state, self.device)
+        reference = _as_list(reference)
+        try:
+            if self.native is None:
+                out = variant.replay(args)
+            else:
+                out = _native_call(self.native, args)
+        except ht.Miss:
+            _note("missed")
+            if miss_ok:
+                return None
+            raise
+        compare(out, args, reference, clones, unwritten)
+        _note("compared" if self.native is not None else "fallback")
         return out
 
+    def try_check(self, args):
+        """`check`, or None when the native entry misses at `args` (the entry runs
+        once either way)."""
+        return self.check(args, miss_ok=True)
+
     def expect_miss(self, args):
-        """Both backends miss at `args` (None from try_replay)."""
-        if self.variant.try_replay(tuple(args)) is not None:
-            raise AssertionError("oracle: the call was served")
+        """The native entry misses at `args` (its predicate, named in the miss log)."""
+        ht = _ht()
+        if self.native is None:
+            raise AssertionError(
+                f"oracle: the native line refused this tape ({self.refused}); nothing to check"
+            )
+        try:
+            _native_call(self.native, tuple(args))
+        except ht.Miss:
+            _note("missed")
+            return
+        raise AssertionError("oracle: the call was served")
 
 
 def _report():
     if not _STATS:
         return
-    oracle = sum(1 for row in _STATS.values() if row["both"])
+    compared = sum(1 for row in _STATS.values() if row["compared"])
     refused = sum(1 for row in _STATS.values() if row["refused"] and not row["native"])
-    line = f"host_trace_oracle: {len(_STATS)} tests built variants, {oracle} compared at least one served call on both backends, {refused} interim-only (refused by name)"
+    fallback = sum(1 for row in _STATS.values() if row["fallback"])
+    line = f"host_trace_oracle: {len(_STATS)} tests built variants, {compared} compared at least one served call with eager, {refused} on the eager form only (refused by name), {fallback} checked a refused tape's eager form"
     print(line, file=sys.stderr, flush=True)
     path = os.environ.get("HOST_TRACE_ORACLE_LOG")
     if path:

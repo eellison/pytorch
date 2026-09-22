@@ -12,7 +12,7 @@ allocates the output, and the eager hosts with a sibling beside them
 Each entry is what the op's CUDA kernel host does around gpu_kernel or
 gpu_reduce_kernel, on the SymInt-typed sibling iterator in
 aten/src/ATen/cuda/host_trace/ti. Under a trace the mode calls it in place of
-the op; at a replay's build it runs in ordinary mode so the captured graph
+the op; in ordinary mode (a test's EntryMode) it runs so a capture
 holds the launches the tape describes. Operands must be CUDA tensors of one
 dtype; a binary op may take one CPU scalar operand, the Python number the
 dispatcher unwrapped from its wrapped tensor, whose value is a constant of

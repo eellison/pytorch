@@ -3,7 +3,7 @@
 import re
 import unittest
 
-from host_trace_testing import assert_eager_function_handles
+from host_trace_testing import assert_eager_function_handles, build, graph_nodes
 
 import torch
 from torch.testing._internal.common_device_type import instantiate_device_type_tests
@@ -128,17 +128,7 @@ class TestCudaHostTraceForeach(TestCase):
             with torch.cuda.graph(g, stream=stream, capture_error_mode="relaxed"):
                 fn()
         stream.synchronize()
-        e = C._HostTraceExec(g, torch.cuda.current_device())
-        return [
-            (
-                e.kernel_name(j),
-                tuple(e.grid(j)),
-                tuple(e.block(j)),
-                e.smem(j),
-                e.image(j),
-            )
-            for j in range(e.num_nodes)
-        ]
+        return graph_nodes(g)[0]
 
     def _same_launches(self, real, ours, plan, depth, fused, tail):
         # the same kernel instantiation and launch configuration per launch;
@@ -348,7 +338,7 @@ class TestCudaHostTraceForeach(TestCase):
             tape = ht.trace(step, self._flat_args(scratch))
             self.assertEqual(tape.num_launches, 2)
             self.assertEqual(tape.num_memcpys, 0)
-            variant = ht.build(tape, step, self._flat_args(scratch))
+            variant = build(tape, step, self._flat_args(scratch))
             self._check_steps(variant, step, lists, 5, what=f"{n} tensors {dtype}")
 
     def test_fused_adamw_amsgrad_weight_decay_and_tensor_lr(self, device):
@@ -365,7 +355,7 @@ class TestCudaHostTraceForeach(TestCase):
                     lr_scratch = lr.clone() if lr is not None else None
                     args = self._flat_args(scratch, lr_scratch)
                     tape = ht.trace(step, args)
-                    variant = ht.build(tape, step, args)
+                    variant = build(tape, step, args)
                     self._check_steps(
                         variant,
                         step,
@@ -408,7 +398,7 @@ class TestCudaHostTraceForeach(TestCase):
 
             scratch = self._clone_lists(lists)
             tape = ht.trace(step, self._flat_args(scratch))
-            variant = ht.build(tape, step, self._flat_args(scratch))
+            variant = build(tape, step, self._flat_args(scratch))
             self._check_steps(variant, step, lists, 3, what=f"found_inf={found}")
 
     def test_fused_adamw_mixed_precision_states(self, device):
@@ -419,7 +409,7 @@ class TestCudaHostTraceForeach(TestCase):
         step = self._step(3, False, self._KW)
         scratch = self._clone_lists(lists)
         tape = ht.trace(step, self._flat_args(scratch))
-        variant = ht.build(tape, step, self._flat_args(scratch))
+        variant = build(tape, step, self._flat_args(scratch))
         self.assertIn("FusedAdamMathFunctorMP", tape.launches[1]["kernel"])
         self._check_steps(variant, step, lists, 3, what="mixed precision")
 
@@ -449,7 +439,7 @@ class TestCudaHostTraceForeach(TestCase):
                 ),
                 tensors,
             )
-        variant = ht.build(tape, step, self._flat_args(scratch))
+        variant = build(tape, step, self._flat_args(scratch))
         self._check_steps(variant, step, lists, 2, what="200 tensors")
         del lists, scratch, variant, tape
 
@@ -462,7 +452,7 @@ class TestCudaHostTraceForeach(TestCase):
         tape = ht.trace(step, self._flat_args(scratch))
         self.assertEqual(tape.num_launches, 1 + len(_launch_plan([1] * n, 4)))
         self.assertEqual(tape.num_launches, 3)
-        variant = ht.build(tape, step, self._flat_args(scratch))
+        variant = build(tape, step, self._flat_args(scratch))
         self._check_steps(variant, step, lists, 2, what=f"{n} tensors")
 
     def test_fused_adamw_serves_the_chunk_class_and_misses_across_it(self, device):
@@ -479,7 +469,7 @@ class TestCudaHostTraceForeach(TestCase):
         step = self._step(3, False, self._KW)
         scratch = self._clone_lists(base)
         tape = ht.trace(step, self._flat_args(scratch))
-        variant = ht.build(tape, step, self._flat_args(scratch))
+        variant = build(tape, step, self._flat_args(scratch))
         self._check_steps(
             variant, step, lists_for(255), 2, what="255 rows"
         )  # 65280: one chunk
@@ -543,15 +533,15 @@ class TestCudaHostTraceForeach(TestCase):
     def test_fused_adamw_grads_stay_lazy_without_a_grad_scale(self, device):
         # without a grad scale the kernel only reads the gradients, so their
         # addresses go through the const accessor: a copy-on-write gradient
-        # stays lazy through the ordinary op, the warm-up, the build and the
-        # replays; the params and moments are written and materialize
+        # stays lazy through the ordinary op, the warm-up and the replays; the
+        # params and moments are written and materialize
         lists = self._adamw_lists(device, self._SHAPES_3, torch.float32, False)
         lazy = [torch._lazy_clone(g) for g in lists[1]]
         self.assertTrue(all(C._is_cow_tensor(g) for g in lazy))
         lists[1] = lazy
         step = self._step(3, False, self._KW)
         args = self._flat_args(lists)
-        variant = ht.build(ht.trace(step, args), step, args)
+        variant = build(ht.trace(step, args), step, args)
         self.assertTrue(all(C._is_cow_tensor(g) for g in lazy))
         variant.replay(args)
         torch.cuda.synchronize()
@@ -574,7 +564,7 @@ class TestCudaHostTraceForeach(TestCase):
         args = tuple(t.clone() for t in steps)
         tape = ht.trace(advance, args)
         self.assertEqual(tape.num_launches, 1)
-        variant = ht.build(tape, advance, args)
+        variant = build(tape, advance, args)
         fresh = tuple(torch.zeros((), device=device) for _ in range(n))
         for k in range(3):
             variant.replay(fresh)
@@ -612,7 +602,7 @@ class TestCudaHostTraceForeach(TestCase):
         )
         tape = ht.trace(axpy, base)
         self.assertEqual(tape.num_launches, 1)
-        variant = ht.build(tape, axpy, base)
+        variant = build(tape, axpy, base)
         for rows in (16, 2, 1000):
             args = make(rows)
             want = [a + 0.5 * b for a, b in zip(args[:3], args[3:])]
@@ -650,7 +640,7 @@ class TestCudaHostTraceForeach(TestCase):
         self.assertFalse(
             any("multi_tensor_apply" in L["kernel"] for L in tape.launches)
         )
-        variant = ht.build(tape, axpy, base)
+        variant = build(tape, axpy, base)
         args = make()
         want = [a + 2 * b for a, b in zip(args[:2], args[2:])]
         variant.replay(args)

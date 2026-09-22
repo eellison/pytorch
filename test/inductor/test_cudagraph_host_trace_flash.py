@@ -273,15 +273,16 @@ class TestCudaHostTraceFlashReplay(TestCase):
             self.assertEqual(output, torch.full_like(output, 7))
 
     @parametrize("shape", [(1, 512, 512), (8, 512, 512), (2, 1024, 256)])
-    def test_agrees_with_interim_replay(self, device, shape):
-        from torch.cuda import _host_trace
+    def test_agrees_with_eager(self, device, shape):
+        from torch.testing._internal.host_trace_oracle import Oracle
 
         replay, original = self._start(device, (4, 512, 512))
-        tape = replay.variants[0].program.tape
-        interim = _host_trace.build(tape, replay.fn, original)
+        oracle = Oracle(replay.fn, original, tape=replay.variants[0].program.tape)
+        self.addCleanup(oracle.close)
         args = self._qkv(device, shape)
         native = self._check(replay, args)
-        self.assertEqual(native[:2], interim.replay(args)[:2], atol=0, rtol=0)
+        theirs = oracle.check(args)
+        self.assertEqual(native[:2], theirs[:2], atol=0, rtol=0)
         self.assertEqual(len(replay.variants), 1)
 
 

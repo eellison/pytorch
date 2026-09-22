@@ -31,7 +31,7 @@ from torch._inductor.runtime.cudagraph_compiled_evaluation import (
     STRICT_FLOAT_FLAGS,
 )
 from torch._inductor.runtime.cudagraph_launch_association import UnsupportedCapture
-from torch.cuda._host_trace import _Program, _round_float32, Float32
+from torch.cuda._host_trace import _Evaluator, _round_float32, Float32
 from torch.fx.experimental.sym_node import SymNode
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 from torch.testing._internal.common_utils import (
@@ -336,10 +336,7 @@ class TestHostEvaluation(TestCase):
         self.assertEqual(rounded.node._expr, Float32(symbol))
         self.assertEqual(_bits(rounded.node.hint), expected)
         self.assertEqual(env.guards, [])
-        tape = SimpleNamespace(
-            inputs=(), guards=(), allocs=(), opaque=(), host_buffers=()
-        )
-        program = _Program(tape)
+        program = _Evaluator()
         self.assertEqual(_bits(program.ev(rounded, {"scale": value})), expected)
 
     def test_float32_keeps_original_symbol_and_fx_provenance(self):

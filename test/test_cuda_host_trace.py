@@ -21,8 +21,13 @@ from unittest import mock
 
 from host_trace_testing import (
     assert_no_disabled_memset,
+    build,
+    capture_graph,
     load_test_extension,
+    make_entry,
+    needs_native_replay,
     needs_two_gpus,
+    replay_backend,
     REPO_ROOT,
     require_nvcc,
 )
@@ -237,22 +242,23 @@ class TestCudaHostTrace(TestCase):
 
     def test_replay_matches_eager_at_other_shapes(self):
         tape, args = self._trace()
-        variant = ht.build(tape, layer_norm, args)
+        variant = build(tape, layer_norm, args)
         for M in (64, 48, 5, 128):
             x, w, b = self._inputs(M)
             self._check(variant.replay(self._args(x, w, b)), x, w, b, M)
 
     @requires_cuda_python_bindings
+    @needs_native_replay
     def test_built_exec_holds_no_disabled_node(self):
-        # the exec holds exactly the capture's nodes and disables none (a
-        # kernel node behind a disabled memset node does not wait for the
-        # stream's prior work on driver 580.126.20; a node chain the exec
-        # does not hold is another exec of the same tape, never an inserted
-        # or disabled node). The shared setUp of the family suites applies the
-        # memset rule to every build; this is the rule on the first exec,
-        # after the build and after a replay at another shape
+        # the prepared graph holds exactly the tape's nodes and disables none
+        # (a kernel node behind a disabled memset node does not wait for the
+        # stream's prior work on driver 580.126.20; a node chain the graph
+        # does not hold is another variant of the same tape, never an
+        # inserted or disabled node). `build` applies the memset rule to every
+        # graph it prepares; this is the rule on the first one, after the
+        # build and after a replay at another shape
         tape, args = self._trace()
-        variant = ht.build(tape, layer_norm, args)
+        variant = build(tape, layer_norm, args)
         states = assert_no_disabled_memset(self, variant, "layer norm build")
         self.assertTrue(all(kind == "kernel" for _, kind, _ in states), states)
         x, w, b = self._inputs(5)
@@ -264,7 +270,7 @@ class TestCudaHostTrace(TestCase):
         # decode traces are taken at batch 1; the contiguity and view checks
         # must not pin the trace there
         tape, args = self._trace(1)
-        variant = ht.build(tape, layer_norm, args)
+        variant = build(tape, layer_norm, args)
         for M in (8, 1, 3):
             x, w, b = self._inputs(M)
             self._check(variant.replay(self._args(x, w, b)), x, w, b, M)
@@ -278,7 +284,7 @@ class TestCudaHostTrace(TestCase):
         moved = [m[0] for m in log[0].moved]
         self.assertTrue(any("arg0.size(0)" in m for m in moved), moved)
         self.assertEqual(log[0].held, [])
-        variant = ht.build(tape, layer_norm, args)
+        variant = build(tape, layer_norm, args)
         for M in (5, 128):
             x, w, b = self._inputs(M)
             self._check(variant.replay(self._args(x, w, b)), x, w, b, M)
@@ -308,14 +314,14 @@ class TestCudaHostTrace(TestCase):
         tape = two_hint.trace_twice(typed, (x,), log=log)
         moved = [m[0] for m in log[0].moved]
         self.assertTrue(any("arg0.size(0)" in m for m in moved), moved)
-        variant = ht.build(tape, typed, (x,))
+        variant = build(tape, typed, (x,))
         variant.replay((torch.empty(8, device="cuda"),))
         torch.cuda.synchronize()
         self.assertEqual(ext.read_observed(), [7, 8])
 
     def test_misaligned_input_misses_on_the_alignment_guard(self):
         tape, args = self._trace()
-        variant = ht.build(tape, layer_norm, args)
+        variant = build(tape, layer_norm, args)
         # the host reads the address of every buffer through an alignment test,
         # so a storage offset that keeps 8-byte alignment replays and one that
         # does not is a named miss
@@ -359,7 +365,7 @@ class TestCudaHostTrace(TestCase):
 
         tape, args = self._trace(16)
         tape = ht.trace(fn, args)
-        variant = ht.build(tape, fn, args)
+        variant = build(tape, fn, args)
         x, w, b = self._inputs(24)
         (out,) = variant.replay(self._args(x, w, b))
         self.assertEqual(tuple(out.shape), (24, 8))
@@ -385,7 +391,7 @@ class TestCudaHostTrace(TestCase):
         xt = torch.randn(self.N, 8, device="cuda", dtype=torch.bfloat16).t()
         tape = ht.trace(layer_norm, self._args(xt, w, b))
         self.assertEqual(tape.num_launches, 2)
-        variant = ht.build(tape, layer_norm, self._args(xt, w, b))
+        variant = build(tape, layer_norm, self._args(xt, w, b))
         yt = torch.randn(self.N, 12, device="cuda", dtype=torch.bfloat16).t()
         _, w2, b2 = self._inputs(12)
         self._check(variant.replay(self._args(yt, w2, b2)), yt, w2, b2, 12)
@@ -393,7 +399,7 @@ class TestCudaHostTrace(TestCase):
 
     def test_outputs_survive_later_replays(self):
         tape, args = self._trace(32)
-        variant = ht.build(tape, layer_norm, args)
+        variant = build(tape, layer_norm, args)
         held = []
         for M in (32, 48, 64, 80):
             x, w, b = self._inputs(M)
@@ -405,7 +411,7 @@ class TestCudaHostTrace(TestCase):
 
     def test_input_contract(self):
         tape, args = self._trace(16)
-        variant = ht.build(tape, layer_norm, args)
+        variant = build(tape, layer_norm, args)
         # dtype, and any non-tensor argument, are part of the variant
         half = self._inputs(16, dtype=torch.float16)
         self.assertIsNone(variant.try_replay(self._args(*half)))
@@ -472,7 +478,7 @@ class TestCudaHostTrace(TestCase):
         try:
             for M in range(16, 36, 2):
                 tape, args = self._trace(M)
-                variant = ht.build(tape, layer_norm, args)
+                variant = build(tape, layer_norm, args)
                 x, w, b = self._inputs(M + 8)
                 out = variant.replay(self._args(x, w, b))
                 self.assertEqual(
@@ -491,10 +497,10 @@ class TestCudaHostTrace(TestCase):
         # the first device is used first, so a process-wide capture stream would
         # be bound to it
         tape, args = self._trace(16)
-        ht.build(tape, layer_norm, args)
+        build(tape, layer_norm, args)
         with torch.cuda.device(1):
             tape1, args1 = self._trace(16)
-            variant = ht.build(tape1, layer_norm, args1)
+            variant = build(tape1, layer_norm, args1)
             x, w, b = self._inputs(40)
             self.assertEqual(x.device.index, 1)
             out = variant.replay(self._args(x, w, b))
@@ -505,7 +511,7 @@ class TestCudaHostTrace(TestCase):
 
     def test_argument_contract_on_the_python_surface(self):
         tape, args = self._trace(16)
-        variant = ht.build(tape, layer_norm, args)
+        variant = build(tape, layer_norm, args)
         x, w, b = self._inputs(16)
         # a tuple or a torch.Size is the same constant as the traced list
         self.assertIsNotNone(variant.try_replay((x, (self.N,), w, b, 1e-5)))
@@ -532,7 +538,7 @@ class TestCudaHostTrace(TestCase):
         )
         tape.device_identity = other
         with self.assertRaisesRegex(ht.Miss, "name=Other GPU"):
-            ht.build(tape, layer_norm, args)
+            build(tape, layer_norm, args)
 
     def test_root_facts_declare_every_input_size_positive(self):
         # the tape's declared facts, not guards: every input size symbol is a
@@ -648,7 +654,7 @@ class TestCudaHostTrace(TestCase):
         self.assertFalse(tape.shape_env.replacements)
         guards, pins, _ = tape.shape_env.tape_guards()
         self.assertEqual(tape.guards, guards)
-        prog = ht._Program(tape)
+        prog = ht._Evaluator()
         hints = {str(k): int(v) for k, v in tape.shape_env.backed_var_to_val.items()}
         self.assertTrue(all(prog.ev(g, hints) for g in tape.guards))
         # a pinned symbol (the normalized width) is a number in every launch
@@ -795,7 +801,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { m.def("alloc_by_eighth", &alloc_by_ei
 
     def test_a_late_domain_guard_is_checked_before_the_allocation_that_divides(self):
         # the division's domain over an opaque result (Ne(r, 0)) is a late
-        # guard, closed by the opaque event: the interim checks it right after
+        # guard, closed by the opaque event: a replay checks it right after
         # that event, before the allocation size computes with it, so a call
         # whose result is zero misses on the guard and never reaches a
         # ZeroDivisionError inside the size (DOMAIN_GUARDS.md follow-up 3)
@@ -810,7 +816,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { m.def("alloc_by_eighth", &alloc_by_ei
         tape = ht.trace(fn, (x,))
         r = next(o for o in tape.opaque if o["fn"] == "eighth")["sym"].node.expr
         self.assertIn(sympy.Ne(r, 0), tape.guards)
-        variant = ht.build(tape, fn, (x,))
+        variant = build(tape, fn, (x,))
         (out,) = variant.replay((torch.randn(40, device="cuda"),))
         self.assertEqual(out.tolist(), [5] * 8)
         self.assertEqual(fn(torch.randn(40, device="cuda")).tolist(), [5] * 8)
@@ -859,7 +865,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { m.def("alloc_by_eighth", &alloc_by_ei
         fields = {q["name"]: q["value"] for L in tape.launches for q in L["params"]}
         self.assertEqual(fields["k"].node.expr, Min(0, FloorDiv(N, ST)))
         self.assertEqual(fields["m"].node.expr, PythonMod(N, ST))
-        variant = ht.build(tape, fn, args)
+        variant = build(tape, fn, args)
         for size, stride in ((16, 3), (15, 2), (7, 5)):
             x, out = inputs(size, stride)
             (got,) = variant.replay((x, out))
@@ -907,7 +913,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { m.def("alloc_by_eighth", &alloc_by_ei
         # the pin is read into the fields: no field mentions the stride
         values = [q["value"] for L in tape.launches for q in L["params"]]
         self.assertFalse(any(str(ST) in ht._free_symbols(v) for v in values))
-        variant = ht.build(tape, fn, args)
+        variant = build(tape, fn, args)
         x, out = inputs(15, 2)
         (got,) = variant.replay((x, out))
         self.assertEqual(got.tolist(), [7, 1])
@@ -941,7 +947,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { m.def("alloc_by_eighth", &alloc_by_ei
         at = start + next(i for i, line in enumerate(lines) if "len(t)" in line)
         self.assertEqual(int(note.rsplit(":", 1)[1]), at)
         self.assertEqual(self._trace(8)[0].guard_notes, {})
-        variant = ht.build(tape, fn, args)
+        variant = build(tape, fn, args)
         x, w, b = self._inputs(8)
         self._check(variant.replay(self._args(x, w, b)), x, w, b, 8)
         with self.assertRaisesRegex(
@@ -963,7 +969,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { m.def("alloc_by_eighth", &alloc_by_ei
                 self._trace(8)
         with DeterministicGuard(True, fill_uninitialized_memory=False):
             tape, args = self._trace(8)
-            variant = ht.build(tape, layer_norm, args)
+            variant = build(tape, layer_norm, args)
             x, w, b = self._inputs(8)
             got = variant.replay(self._args(x, w, b))
             want = layer_norm(*self._args(x, w, b))
@@ -978,14 +984,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { m.def("alloc_by_eighth", &alloc_by_ei
 
         for traced_at, other in ((1, 8), (8, 1)):
             args = self._args(*self._inputs(traced_at))
-            variant = ht.build(ht.trace(fn, args), fn, args)
+            variant = build(ht.trace(fn, args), fn, args)
             (out,) = variant.replay(args)
             self.assertEqual(tuple(out.shape), tuple(fn(*args).shape))
             self.assertEqual(out, fn(*args), atol=2e-2, rtol=2e-2)
             self.assertIsNone(variant.try_replay(self._args(*self._inputs(other))))
         # the plain forward does not depend on it: the batch-1 tape serves 8
         tape, args = self._trace(1)
-        variant = ht.build(tape, layer_norm, args)
+        variant = build(tape, layer_norm, args)
         x, w, b = self._inputs(8)
         self._check(variant.replay(self._args(x, w, b)), x, w, b, 8)
 
@@ -1025,7 +1031,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { m.def("alloc_by_eighth", &alloc_by_ei
         self.assertFalse(ok)
         root = os.path.join(REPO_ROOT, "aten", "src", "ATen", "cuda", "host_trace")
         if os.path.isdir(root):
-            for name in ("Recorder.h", "Field.h", "Launch.h", "Tape.h", "Exec.h"):
+            for name in ("Recorder.h", "Field.h", "Launch.h", "Tape.h", "Harvest.h"):
                 with open(os.path.join(root, name)) as f:
                     self.assertNotIn("Hooks.h", f.read(), name)
         # and the hooks header is not installed at all: an out-of-tree host
@@ -1214,7 +1220,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { m.def("alloc_by_eighth", &alloc_by_ei
         # the replay's device work is eager's kernel by kernel (the profiler's
         # kinds and names; a traced sibling's twin counted as its kernel) and
         # the output is bitwise eager's
-        variant = ht.build(tape, fn, (x,))
+        variant = build(tape, fn, (x,))
         replayed = _device_work(lambda t: variant.replay((t,)), (x,))
         eager = _device_work(fn, (x,))
         self.assertEqual(len(replayed), len(eager), (replayed, eager))
@@ -1329,7 +1335,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { m.def("alloc_by_eighth", &alloc_by_ei
             return out.view(out.shape[0] // 4, -1)
 
         args = self._args(*self._inputs(8))
-        variant = ht.build(ht.trace(fn, args), fn, args)
+        variant = build(ht.trace(fn, args), fn, args)
         (out,) = variant.replay(self._args(*self._inputs(16)))
         self.assertEqual(tuple(out.shape), (4, 4 * self.N))
         for M in (3, 1):
@@ -1368,7 +1374,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { m.def("alloc_by_eighth", &alloc_by_ei
         served = {}
         for traced_at in (1, 8):
             args = self._args(*self._inputs(traced_at))
-            variant = ht.build(ht.trace(fn, args), fn, args)
+            variant = build(ht.trace(fn, args), fn, args)
             for M in (1, 8, 3):
                 x, w, b = self._inputs(M)
                 out = variant.try_replay(self._args(x, w, b))
@@ -1380,7 +1386,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { m.def("alloc_by_eighth", &alloc_by_ei
         self.assertEqual(served, dict.fromkeys(served, True))
         for traced_at, other in ((1, 8), (8, 1)):
             args = self._args(*self._inputs(traced_at))
-            variant = ht.build(ht.trace(pins, args), pins, args)
+            variant = build(ht.trace(pins, args), pins, args)
             self.assertIsNotNone(variant.try_replay(args))
             self.assertIsNone(variant.try_replay(self._args(*self._inputs(other))))
 
@@ -1390,15 +1396,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { m.def("alloc_by_eighth", &alloc_by_ei
         tape, _ = self._trace(64)
         odd = self._args(*self._inputs(64, offset=1))
         with self.assertRaisesRegex(ht.Miss, "guard failed"):
-            ht.build(tape, layer_norm, odd)
-        variant = ht.build(tape, layer_norm, self._args(*self._inputs(64)))
+            build(tape, layer_norm, odd)
+        variant = build(tape, layer_norm, self._args(*self._inputs(64)))
         self.assertEqual(variant.calls, 0)
 
     @needs_two_gpus
     def test_build_uses_the_tapes_device(self):
         tape, args = self._trace(16)
         with torch.cuda.device(1):
-            variant = ht.build(tape, layer_norm, args)
+            variant = build(tape, layer_norm, args)
             x, w, b = self._inputs(24)
         self.assertEqual(x.device.index, 1)
         self.assertEqual(variant.device, 0)
@@ -1447,7 +1453,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { m.def("alloc_by_eighth", &alloc_by_ei
         self.assertGreaterEqual(len(threads), 1)
         self.assertNotIn(threading.get_ident(), threads)
         self.assertFalse(torch._C._host_trace_tracing())
-        variant = ht.build(tape, fwd_bwd, (x, w, b, cot))
+        variant = build(tape, fwd_bwd, (x, w, b, cot))
         for M in (4, 16):
             x, w, b = self._inputs(M)
             cot = torch.randn_like(x)
@@ -1535,7 +1541,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { m.def("alloc_by_eighth", &alloc_by_ei
                 args = self._args(*self._inputs(8))
                 tape = ht.trace(layer_norm, args)
                 while not stop.is_set():
-                    ht.build(tape, layer_norm, args)
+                    build(tape, layer_norm, args)
             except Exception as e:
                 errors.append(e)
 
@@ -1556,7 +1562,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { m.def("alloc_by_eighth", &alloc_by_ei
         def worker(k):
             try:
                 args = self._args(*self._inputs(8 + k))
-                variant = ht.build(ht.trace(layer_norm, args), layer_norm, args)
+                variant = build(ht.trace(layer_norm, args), layer_norm, args)
                 for j in range(5):
                     x, w, b = self._inputs(8 + k + j)
                     out = variant.replay(self._args(x, w, b))
@@ -1575,8 +1581,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { m.def("alloc_by_eighth", &alloc_by_ei
         for got, want in results:
             self.assertEqual(got, want, atol=2e-2, rtol=2e-2)
 
-    def test_the_build_log_is_keyed_by_the_captures_pool_not_by_a_stream_query(self):
-        # The build's allocation log is read off the capture's private pool
+    def test_the_allocation_log_is_keyed_by_the_captures_pool_not_by_a_stream_query(
+        self,
+    ):
+        # The allocation log a closed region's harvest reads is read off the
+        # capture's private pool
         # (the allocator's trace entry names the pool a block came from), and
         # the tracker makes no CUDA call: a capture-status query from the
         # allocating thread while the build thread ends its capture faults
@@ -1629,27 +1638,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { m.def("alloc_by_eighth", &alloc_by_ei
             thread.join()
         self.assertEqual(errors, [])
         self.assertGreater(counted[0], 0)
-
-    def test_the_build_ends_its_capture_on_the_build_stream_whatever_is_current(self):
-        # the build captures the ordinary host on its own stream; a host that
-        # returns with another stream current must not leave that capture open
-        side = torch.cuda.Stream()
-        x, w, b = self._inputs(4)
-
-        def returns_with_side_current(x, w, b):
-            out = layer_norm(x, [self.N], w, b, 1e-5)
-            torch.cuda.set_stream(side)
-            return out
-
-        layer_norm(x, [self.N], w, b, 1e-5)
-        torch.cuda.synchronize()
-        try:
-            tape = ht.trace(returns_with_side_current, (x, w, b), warm_up=False)
-            variant = ht.build(tape, returns_with_side_current, (x, w, b))
-        finally:
-            torch.cuda.set_stream(torch.cuda.default_stream())
-        x2, w2, b2 = self._inputs(4)
-        self._check(variant.replay((x2, w2, b2)), x2, w2, b2, 4)
 
     def test_non_tensor_results_and_foreign_traced_tensors_are_declined(self):
         x, w, b = self._inputs(8)
@@ -1718,7 +1706,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { m.def("alloc_by_eighth", &alloc_by_ei
         self.assertEqual(o.shape, (16, 32))
         # an entry remembers the declined class by the inputs as made, not as
         # the warm-up left them: the next such call runs the ordinary host
-        entry = ht.Entry(fn)
+        entry = make_entry(fn)
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
             for _ in range(2):
@@ -1792,7 +1780,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { m.def("alloc_by_eighth", &alloc_by_ei
         records = json.loads(tape.to_json())
         self.assertEqual(records["written_roots"], ["p0"])
         self.assertEqual(records["written_inputs"], [0])
-        variant = ht.build(tape, fn, args)
+        variant = build(tape, fn, args)
         src = torch.randn(8, device="cuda")
         start = src.clone()
         lazy = torch._lazy_clone(src)
@@ -1831,7 +1819,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { m.def("alloc_by_eighth", &alloc_by_ei
         # destroyed, the pool released; on CUDA no device-wide synchronize),
         # which the driver permits beside a thread-local capture on another
         # thread: variants with replays behind them dropped by refcount and
-        # by an explicit gc.collect() on one thread while another traces
+        # by an explicit gc.collect() on one thread while another traces (the
+        # eager form prepares no graph: the teardown is the native replay's)
         stop = threading.Event()
         errors: list = []
         drops = [0]
@@ -1841,7 +1830,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { m.def("alloc_by_eighth", &alloc_by_ei
                 args = self._args(*self._inputs(8))
                 tape = ht.trace(layer_norm, args)
                 while not stop.is_set():
-                    variant = ht.build(tape, layer_norm, args)
+                    variant = build(tape, layer_norm, args)
                     variant.replay(args)
                     del variant
                     drops[0] += 1
@@ -1862,16 +1851,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { m.def("alloc_by_eighth", &alloc_by_ei
         self.assertEqual(errors, [])
         self.assertGreater(drops[0], 0)
 
-    def test_an_entry_torn_down_inside_the_traced_call_declines_by_name(self):
+    def test_a_graph_torn_down_inside_the_traced_call_declines_by_name(self):
         # the other side of the rule: a CUDAGraph destroyed on the tracing
-        # thread under the capture is a call the capture forbids, so the
-        # driver invalidates it; the trace holds the cyclic collector off
-        # (the collector cannot do this), so the drop is the traced
-        # function's own, named at its next launch; the thread traces again
-        # afterwards
+        # thread under the capture (a variant's, or any other) is a call the
+        # capture forbids, so the driver invalidates it; the trace holds the
+        # cyclic collector off (the collector cannot do this), so the drop is
+        # the traced function's own, named at its next launch; the thread
+        # traces again afterwards
         args = self._args(*self._inputs(8))
-        held = [ht.build(ht.trace(layer_norm, args), layer_norm, args)]
-        held[0].replay(args)
+        held = [capture_graph(lambda: layer_norm(*args))]
+        held[0].replay()
+        torch.cuda.synchronize()
 
         def fn(x, shape, w, b, eps):
             if torch._C._host_trace_tracing() and held:
@@ -1885,7 +1875,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { m.def("alloc_by_eighth", &alloc_by_ei
             ht.trace(fn, self._args(*self._inputs(12)))
         self.assertEqual(held, [])
         tape, args = self._trace(13)
-        variant = ht.build(tape, layer_norm, args)
+        variant = build(tape, layer_norm, args)
         x, w, b = self._inputs(13)
         out = variant.replay(self._args(x, w, b))[0]
         self.assertEqual(
@@ -1962,15 +1952,20 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { m.def("alloc_by_eighth", &alloc_by_ei
             )
             self.assertEqual(r.stdout.strip(), "", (rel, r.stdout))
 
-    def test_a_build_under_the_cudamallocasync_backend_declines_by_name(self):
-        # the build's allocation log is the native caching allocator's trace
-        # tracker, which the cudaMallocAsync backend does not offer: a trace
-        # still records, the build is a Declined naming the backend, and an
-        # entry serves such calls through the ordinary host with the one
-        # warning; the backend is chosen at process start, so in a subprocess
+    def test_the_allocation_log_under_the_cudamallocasync_backend_declines_by_name(
+        self,
+    ):
+        # the allocation log a closed region's harvest reads is the native
+        # caching allocator's trace tracker, which the cudaMallocAsync backend
+        # does not offer: opening it is a Declined naming the backend; a trace
+        # and a replay of a host without closed regions need no log, so an
+        # entry serves such calls from its variant; the backend is chosen at
+        # process start, so in a subprocess
         script = r"""
-import warnings, torch, torch.nn.functional as F
+import sys, warnings, torch, torch.nn.functional as F
 import torch.cuda._host_trace as ht
+sys.path.insert(0, sys.argv[1])
+from host_trace_testing import make_entry
 print("RESULT backend", torch.cuda.get_allocator_backend())
 x, w, b = (torch.randn(8, 64, device="cuda"), torch.randn(64, device="cuda"), torch.randn(64, device="cuda"))
 def layer_norm(x, w, b):
@@ -1978,21 +1973,22 @@ def layer_norm(x, w, b):
 tape = ht.trace(layer_norm, (x, w, b))
 print("RESULT traced", tape.num_launches)
 try:
-    ht.build(tape, layer_norm, (x, w, b))
-    print("RESULT built")
+    torch._C._host_trace_alloc_log_begin(0, torch.cuda.graph_pool_handle())
+    torch._C._host_trace_alloc_log_end()
+    print("RESULT logged")
 except ht.Declined as e:
     print("RESULT declined", str(e).splitlines()[0])
-entry = ht.Entry(layer_norm)
+served = make_entry(layer_norm)
 with warnings.catch_warnings(record=True) as caught:
     warnings.simplefilter("always")
-    first = entry(x, w, b)[0]
-    second = entry(x, w, b)[0]
-warned = sum("the ordinary host serves such calls" in str(c.message) for c in caught)
-print("RESULT entry", entry.traces, entry.ordinary, len(entry.variants), warned, torch.equal(first, layer_norm(x, w, b)), torch.equal(second, first))
+    first = served(x, w, b)[0]
+    second = served(x, w, b)[0]
+warned = sum("host_trace" in str(c.message) for c in caught)
+print("RESULT entry", served.traces, served.ordinary, len(served.variants), warned, torch.equal(first, layer_norm(x, w, b)), torch.equal(second, first))
 """
         env = dict(os.environ, PYTORCH_CUDA_ALLOC_CONF="backend:cudaMallocAsync")
         r = subprocess.run(
-            [sys.executable, "-c", script],
+            [sys.executable, "-c", script, os.path.dirname(os.path.abspath(__file__))],
             capture_output=True,
             text=True,
             env=env,
@@ -2002,12 +1998,12 @@ print("RESULT entry", entry.traces, entry.ordinary, len(entry.variants), warned,
         self.assertEqual(r.returncode, 0, out[-3000:])
         self.assertIn("RESULT backend cudaMallocAsync", out)
         self.assertIn("RESULT traced 1", out)
-        self.assertNotIn("RESULT built", out)
+        self.assertNotIn("RESULT logged", out)
         self.assertRegex(
             out,
-            r"RESULT declined host_trace: a build reads .*cudaMallocAsync allocator backend",
+            r"RESULT declined host_trace: a closed region's harvest reads .*cudaMallocAsync allocator backend",
         )
-        self.assertIn("RESULT entry 1 2 0 1 True True", out)
+        self.assertIn("RESULT entry 1 0 1 0 True True", out)
 
     @needs_two_gpus
     def test_variant_built_on_a_second_device_from_a_trace_on_the_first(self):
@@ -2017,11 +2013,13 @@ print("RESULT entry", entry.traces, entry.ordinary, len(entry.variants), warned,
         tape, _ = self._trace(16)
         with torch.cuda.device(1):
             x1, w1, b1 = self._inputs(16)
-        variant = ht.build(tape, layer_norm, self._args(x1, w1, b1), device=1)
+        variant = build(tape, layer_norm, self._args(x1, w1, b1), device=1)
         self.assertEqual(variant.device, 1)
         with torch.cuda.device(1):
             x, w, b = self._inputs(24)
-        out = variant.replay(self._args(x, w, b))
+            # called under its device: a replay is bound to the device (and
+            # stream) it was prepared on
+            out = variant.replay(self._args(x, w, b))
         self.assertTrue(all(o.device == torch.device("cuda", 1) for o in out))
         self._check(out, x, w, b, 24)
 
@@ -2052,7 +2050,7 @@ print("RESULT entry", entry.traces, entry.ordinary, len(entry.variants), warned,
         for fn in (last_row, half_index, middle_rows, right_half, mixed):
             x, w, b = self._inputs(16)
             tape = ht.trace(fn, (x, w, b))
-            variant = ht.build(tape, fn, (x, w, b))
+            variant = build(tape, fn, (x, w, b))
             for M in (8, 3, 16, 5):
                 x, w, b = self._inputs(M)
                 out = variant.replay((x, w, b))[0]
@@ -2065,7 +2063,7 @@ print("RESULT entry", entry.traces, entry.ordinary, len(entry.variants), warned,
             return layer_norm(x, [N], w, b, 1e-5)[0][8]
 
         x, w, b = self._inputs(16)
-        variant = ht.build(ht.trace(row_eight, (x, w, b)), row_eight, (x, w, b))
+        variant = build(ht.trace(row_eight, (x, w, b)), row_eight, (x, w, b))
         x, w, b = self._inputs(3)
         with self.assertRaises(ht.Miss):
             variant.replay((x, w, b))
@@ -2103,7 +2101,7 @@ print("RESULT entry", entry.traces, entry.ordinary, len(entry.variants), warned,
         tape, args = self._trace(8)
         x, w, b = self._inputs(4)
         self._check(
-            ht.build(tape, layer_norm, args).replay(self._args(x, w, b)), x, w, b, 4
+            build(tape, layer_norm, args).replay(self._args(x, w, b)), x, w, b, 4
         )
 
     def test_a_capture_end_that_fails_after_the_capture_ended_is_not_ended_twice(self):
@@ -2176,7 +2174,7 @@ print("RESULT entry", entry.traces, entry.ordinary, len(entry.variants), warned,
             self.assertFalse(torch._C._host_trace_tracing())
             if tape is None:
                 continue
-            variant = ht.build(tape, fn, (t,))
+            variant = build(tape, fn, (t,))
             out = variant.try_replay((torch.randn_like(t),))
             self.assertIsNotNone(out)
         # the True path records one guard per dim, the False path only the
@@ -2188,7 +2186,7 @@ print("RESULT entry", entry.traces, entry.ordinary, len(entry.variants), warned,
             return F.layer_norm(t, (16,))
 
         tape = ht.trace(fn2, (x,))
-        variant = ht.build(tape, fn2, (x,))
+        variant = build(tape, fn2, (x,))
         y = torch.randn(3, 5, 7, 16, device="cuda")
         self.assertEqual(variant.try_replay((y,))[0], fn2(y))
         self.assertIsNone(variant.try_replay((y.transpose(1, 2),)))
@@ -2240,7 +2238,7 @@ print("RESULT entry", entry.traces, entry.ordinary, len(entry.variants), warned,
             gc.enable()
             for _ in range(4):
                 tape, args = self._trace(16)
-                variant = ht.build(tape, layer_norm, args)
+                variant = build(tape, layer_norm, args)
                 variant.replay(args)
                 cycle = [variant, tape]
                 cycle.append(cycle)
@@ -2330,7 +2328,7 @@ print("RESULT entry", entry.traces, entry.ordinary, len(entry.variants), warned,
         tape, args = self._trace(8)
         x, w, b = self._inputs(4)
         self._check(
-            ht.build(tape, layer_norm, args).replay(self._args(x, w, b)), x, w, b, 4
+            build(tape, layer_norm, args).replay(self._args(x, w, b)), x, w, b, 4
         )
 
     def test_a_return_with_another_stream_current_still_ends_the_capture(self):
@@ -2360,7 +2358,7 @@ print("RESULT entry", entry.traces, entry.ordinary, len(entry.variants), warned,
         tape, args = self._trace(8)
         x, w, b = self._inputs(4)
         self._check(
-            ht.build(tape, layer_norm, args).replay(self._args(x, w, b)), x, w, b, 4
+            build(tape, layer_norm, args).replay(self._args(x, w, b)), x, w, b, 4
         )
 
     def test_a_decline_with_another_stream_current_still_ends_the_capture(self):
@@ -2399,8 +2397,8 @@ print("RESULT entry", entry.traces, entry.ordinary, len(entry.variants), warned,
         # build is a miss before any capture
         for k in (3, 2.0, True):
             with self.assertRaisesRegex(ht.Miss, "non-tensor arguments"):
-                ht.build(tape, head, (x, w, b, k))
-        variant = ht.build(tape, head, (x, w, b, 2))
+                build(tape, head, (x, w, b, k))
+        variant = build(tape, head, (x, w, b, 2))
         self.assertEqual(variant.replay((x, w, b, 2))[0], head(x, w, b, 2))
         self.assertIsNone(variant.try_replay((x, w, b, 3)))
         # a tensor where the trace had a constant
@@ -2413,14 +2411,14 @@ print("RESULT entry", entry.traces, entry.ordinary, len(entry.variants), warned,
         # written), a fresh nan is the traced nan, ints and bools are unchanged
         x, w, b = self._inputs(16)
         tape = ht.trace(layer_norm, self._args(x, w, b, eps=0.0))
-        variant = ht.build(tape, layer_norm, self._args(x, w, b, eps=0.0))
+        variant = build(tape, layer_norm, self._args(x, w, b, eps=0.0))
         self.assertIsNotNone(variant.try_replay(self._args(x, w, b, eps=0.0)))
         self.assertIsNone(variant.try_replay(self._args(x, w, b, eps=-0.0)))
         with self.assertRaisesRegex(ht.Miss, "non-tensor arguments"):
-            ht.build(tape, layer_norm, self._args(x, w, b, eps=-0.0))
+            build(tape, layer_norm, self._args(x, w, b, eps=-0.0))
         nan = float("nan")
         tape = ht.trace(layer_norm, self._args(x, w, b, eps=nan))
-        variant = ht.build(tape, layer_norm, self._args(x, w, b, eps=float("nan")))
+        variant = build(tape, layer_norm, self._args(x, w, b, eps=float("nan")))
         self.assertIsNotNone(variant.try_replay(self._args(x, w, b, eps=float("nan"))))
         self.assertIsNone(variant.try_replay(self._args(x, w, b, eps=-nan)))
         self.assertNotEqual(ht._constant(0.0), ht._constant(-0.0))
@@ -2448,7 +2446,7 @@ print("RESULT entry", entry.traces, entry.ordinary, len(entry.variants), warned,
             want = fn(x)
             tape = ht.trace(fn, (x,))
             self.assertEqual(tape.num_launches, 0)
-            variant = ht.build(tape, fn, (x,))
+            variant = build(tape, fn, (x,))
             (got,) = variant.replay((x,))
             self.assertEqual((got.shape, got.stride()), (want.shape, want.stride()))
             self.assertEqual(got.storage_offset(), want.storage_offset())
@@ -2516,7 +2514,7 @@ print("RESULT entry", entry.traces, entry.ordinary, len(entry.variants), warned,
         with self.assertRaisesRegex(ht.Declined, "negative view"):
             ht.trace(layer_norm, self._args(torch._neg_view(x), w, b))
         tape, args = self._trace(8)
-        variant = ht.build(tape, layer_norm, args)
+        variant = build(tape, layer_norm, args)
         self.assertIsNone(variant.try_replay(self._args(torch._neg_view(x), w, b)))
         self.assertIsNotNone(variant.try_replay(self._args(x, w, b)))
 
@@ -2525,7 +2523,7 @@ print("RESULT entry", entry.traces, entry.ordinary, len(entry.variants), warned,
 
         z = torch.randn(8, 16, device="cuda", dtype=torch.complex64)
         w2, b2 = torch.randn(2, device="cuda"), torch.randn(2, device="cuda")
-        variant = ht.build(ht.trace(real_view, (z, w2, b2)), real_view, (z, w2, b2))
+        variant = build(ht.trace(real_view, (z, w2, b2)), real_view, (z, w2, b2))
         self.assertIsNone(variant.try_replay((z.conj(), w2, b2)))
         self.assertEqual(variant.replay((z, w2, b2))[0], real_view(z, w2, b2))
 
@@ -2538,7 +2536,7 @@ print("RESULT entry", entry.traces, entry.ordinary, len(entry.variants), warned,
         first = torch.randn(8 * 16 + 4, device="cuda", dtype=torch.complex64)
         w, b = torch.randn(2, device="cuda"), torch.randn(2, device="cuda")
         args = (first[: 8 * 16].view(8, 16), w, b)
-        variant = ht.build(ht.trace(real_view, args), real_view, args)
+        variant = build(ht.trace(real_view, args), real_view, args)
         second = torch.randn_like(first)
         # an odd complex offset (8 bytes) may miss on the host's alignment
         # guard; an even one keeps the traced alignment and must serve
@@ -2556,7 +2554,7 @@ print("RESULT entry", entry.traces, entry.ordinary, len(entry.variants), warned,
             return torch.view_as_complex(y.view(x.shape[0], self.N // 2, 2))
 
         x, w, b = self._inputs(8, dtype=torch.float32)
-        variant = ht.build(ht.trace(complex_out, (x, w, b)), complex_out, (x, w, b))
+        variant = build(ht.trace(complex_out, (x, w, b)), complex_out, (x, w, b))
         for M in (8, 3):
             x, w, b = self._inputs(M, dtype=torch.float32)
             out = variant.replay((x, w, b))[0]
@@ -2577,7 +2575,7 @@ print("RESULT entry", entry.traces, entry.ordinary, len(entry.variants), warned,
 
         tape, args = self._trace(8, dtype=torch.float32)
         x, w, b = args[0], args[2], args[3]
-        variant = ht.build(ht.trace(fn, (x, w, b)), fn, (x, w, b))
+        variant = build(ht.trace(fn, (x, w, b)), fn, (x, w, b))
         for M in (8, 6, 2):
             x, w, b = self._inputs(M, dtype=torch.float32)
             out = variant.replay((x, w, b))[0]
@@ -2622,7 +2620,7 @@ print("RESULT entry", entry.traces, entry.ordinary, len(entry.variants), warned,
                     tuple(ht._hint(v) for v in rec.sizes), tuple(want.shape)
                 )
                 self.assertEqual(tuple(ht._hint(v) for v in rec.strides), want.stride())
-                (out,) = ht.build(tape, fn, args).replay(args)
+                (out,) = build(tape, fn, args).replay(args)
                 self.assertEqual(out.stride(), want.stride())
                 self.assertTrue(torch.equal(out, want))
         # a view no stride table can express raises the CUDA op's text
@@ -2665,7 +2663,7 @@ print("RESULT entry", entry.traces, entry.ordinary, len(entry.variants), warned,
                 self.assertEqual(tape.num_launches, 0)
                 want = fn(row)
                 self.assertEqual(len(tape.outputs), len(want))
-                variant = ht.build(tape, fn, (row,))
+                variant = build(tape, fn, (row,))
                 for other in (
                     row,
                     torch.randn(5, 2, 2304, device="cuda", dtype=torch.bfloat16),
@@ -2678,7 +2676,7 @@ print("RESULT entry", entry.traces, entry.ordinary, len(entry.variants), warned,
                         self.assertTrue(torch.equal(g, w))
         # a split size that gives another piece count is a miss, not a wrong count
         tape = ht.trace(split3, (row,))
-        variant = ht.build(tape, split3, (row,))
+        variant = build(tape, split3, (row,))
         self.assertIsNone(
             variant.try_replay(
                 (torch.randn(4, 1, 3072, device="cuda", dtype=torch.bfloat16),)
@@ -2708,7 +2706,7 @@ print("RESULT entry", entry.traces, entry.ordinary, len(entry.variants), warned,
         args = self._args(x, w, b)
         tape = ht.trace(halves, args)
         self.assertEqual(tape.num_launches, 2)
-        variant = ht.build(tape, halves, args)
+        variant = build(tape, halves, args)
         x2, w2, b2 = self._inputs(8)
         got = variant.replay(self._args(x2, w2, b2))
         want = halves(*self._args(x2, w2, b2))
@@ -2724,7 +2722,7 @@ print("RESULT entry", entry.traces, entry.ordinary, len(entry.variants), warned,
         tape, args = self._trace(8)
         x, w, b = self._inputs(4)
         self._check(
-            ht.build(tape, layer_norm, args).replay(self._args(x, w, b)), x, w, b, 4
+            build(tape, layer_norm, args).replay(self._args(x, w, b)), x, w, b, 4
         )
 
     def test_shape_derived_normalized_shape_pins_by_name(self):
@@ -2737,7 +2735,7 @@ print("RESULT entry", entry.traces, entry.ordinary, len(entry.variants), warned,
 
         x, w, b = self._inputs(32)
         tape = ht.trace(fn, (x, w, b))
-        variant = ht.build(tape, fn, (x, w, b))
+        variant = build(tape, fn, (x, w, b))
         y, _, _ = self._inputs(48)
         out = variant.replay((y, w, b))[0]
         self.assertEqual(out, fn(y, w, b), atol=2e-2, rtol=2e-2)
@@ -2745,39 +2743,6 @@ print("RESULT entry", entry.traces, entry.ordinary, len(entry.variants), warned,
         w2 = torch.randn(2048, device="cuda", dtype=torch.bfloat16)
         with self.assertRaisesRegex(ht.Miss, str(self.N)):
             variant.replay((z, w2, w2))
-
-    def test_a_failed_push_does_not_leave_stale_node_state(self):
-        # the exec's node state (_last) is what the exec holds only after a
-        # push succeeded: after a push that raised, the next call with the
-        # same bindings pushes again instead of running the previous state
-        tape, args = self._trace(8)
-        variant = ht.build(tape, layer_norm, args)
-        real_exec = variant.exec
-
-        class FailingOnce:
-            def __init__(self, inner):
-                self.inner, self.failed = inner, False
-
-            def run(self, *a, **k):
-                if not self.failed:
-                    self.failed = True
-                    raise RuntimeError("simulated failure inside exec.run")
-                return self.inner.run(*a, **k)
-
-            def __getattr__(self, name):
-                return getattr(self.inner, name)
-
-        x, w, b = self._inputs(4)
-        variant.exec = FailingOnce(real_exec)
-        try:
-            with self.assertRaisesRegex(RuntimeError, "simulated failure"):
-                variant.replay(self._args(x, w, b))
-        finally:
-            variant.exec = real_exec
-        dirty = real_exec.dirty_nodes
-        out = variant.replay(self._args(x, w, b))
-        self.assertGreater(real_exec.dirty_nodes, dirty)
-        self._check(out, x, w, b, 4)
 
     def test_a_copy_on_write_input_stays_lazy(self):
         # The converted host reads its inputs through the const accessor, which
@@ -2798,7 +2763,7 @@ print("RESULT entry", entry.traces, entry.ordinary, len(entry.variants), warned,
         # the host writes its allocations only: no input position is written
         self.assertEqual(set(tape.written_roots), {a.root.name for a in tape.allocs})
         self.assertEqual(tape.written_inputs, ())
-        variant = ht.build(tape, layer_norm, args)
+        variant = build(tape, layer_norm, args)
         self.assertTrue(torch._C._is_cow_tensor(lazy))
         replayed = variant.replay(args)
         self.assertTrue(torch._C._is_cow_tensor(lazy))
@@ -2837,7 +2802,12 @@ print("RESULT entry", entry.traces, entry.ordinary, len(entry.variants), warned,
         x, w, b = self._inputs(8)
         args = self._args(x, w, b)
         tape = ht.trace(forked, args)
-        variant = ht.build(tape, forked, args)
+        variant = build(tape, forked, args)
+        if replay_backend() == "native":
+            # the native replay refuses the tape by name (its preparation
+            # replays one stream, which would serialize the branches, O33):
+            # the eager form serves it here
+            self.assertIn("all_on_capture_stream=False; 1 launches", variant.refused)
         x, w, b = self._inputs(4)
         self._check(variant.replay(self._args(x, w, b)), x, w, b, 4)
 
@@ -2894,7 +2864,9 @@ print("RESULT entry", entry.traces, entry.ordinary, len(entry.variants), warned,
         args = inputs(8)
         tape = ht.trace(two_branches, args)
         self.assertEqual(tape.num_launches, 2)
-        variant = ht.build(tape, two_branches, args)
+        variant = build(tape, two_branches, args)
+        if replay_backend() == "native":
+            self.assertIn("all_on_capture_stream=False; 2 launches", variant.refused)
         for M in (4, 8, 16):
             a = inputs(M)
             got = variant.replay(a)
@@ -2936,7 +2908,7 @@ print("RESULT entry", entry.traces, entry.ordinary, len(entry.variants), warned,
         self.assertIn("vectorized_layer_norm_kernel", kernels[0])
         self.assertIn("RowwiseMomentsCUDAKernel", kernels[1])
         self.assertIn("LayerNormForwardCUDAKernel", kernels[2])
-        variant = ht.build(tape, two_norms, args)
+        variant = build(tape, two_norms, args)
         for M in (4, 16):
             a = inputs(M)
             got = variant.replay(a)
@@ -2992,7 +2964,7 @@ print("RESULT entry", entry.traces, entry.ordinary, len(entry.variants), warned,
         tape, args = self._trace(8)
         x, w, b = self._inputs(4)
         self._check(
-            ht.build(tape, layer_norm, args).replay(self._args(x, w, b)), x, w, b, 4
+            build(tape, layer_norm, args).replay(self._args(x, w, b)), x, w, b, 4
         )
 
     def test_a_verbatim_launch_naming_another_stream_never_touches_real_memory(self):
@@ -3134,6 +3106,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { m.def("fill", &fill); }
 import sys, torch
 from torch.utils.cpp_extension import load_inline
 import torch.cuda._host_trace as ht
+sys.path.insert(0, sys.argv[2])
+from host_trace_testing import build
 src = open(sys.argv[1]).read()
 ext = load_inline("ht_verbatim_fork_join", cpp_sources="", cuda_sources=src,
                   functions=None, with_cuda=True, verbose=False,
@@ -3170,7 +3144,7 @@ for label, fn, args_of in (("on_side", on_side, fill_args), ("then_join", then_j
     args = args_of(4)
     try:
         tape = ht.trace(fn, args)
-        variant = ht.build(tape, fn, args)
+        variant = build(tape, fn, args)
     except ht.Declined as e:
         print("RESULT", label, "declined", str(e).splitlines()[0])
         continue
@@ -3192,7 +3166,7 @@ for label, fn, args_of in (("on_side", on_side, fill_args), ("then_join", then_j
                 f.write(script)
             env = dict(os.environ, TORCH_EXTENSIONS_DIR=os.path.join(d, "ext"))
             r = subprocess.run(
-                [sys.executable, py, cu],
+                [sys.executable, py, cu, os.path.dirname(os.path.abspath(__file__))],
                 capture_output=True,
                 text=True,
                 env=env,
@@ -3209,10 +3183,10 @@ for label, fn, args_of in (("on_side", on_side, fill_args), ("then_join", then_j
             self.assertIn(line, out, out[-3000:])
 
     def test_a_call_executes_the_user_function_exactly_once(self):
-        # the interim entry (a trace, hits, a miss traced again) executes the
-        # user's function once per call, as eager does: the ordinary call
-        # whose outputs the caller receives is the warm-up, and the trace and
-        # the build that follow with warm_up=False execute nothing; an
+        # an entry (a trace, hits, a miss traced again) executes the user's
+        # function once per call, as eager does: the ordinary call whose
+        # outputs the caller receives is the warm-up, the trace that follows
+        # with warm_up=False executes nothing and the build never does; an
         # in-place function shows every extra execution in its input
         add_one = self._add_one()
 
@@ -3239,7 +3213,7 @@ for label, fn, args_of in (("on_side", on_side, fill_args), ("then_join", then_j
                     return out[0]
             out = fn(x)
             tape = ht.trace(fn, (x,), warm_up=False)
-            variants.append(ht.build(tape, fn, (x,), warm_up=False))
+            variants.append(build(tape, fn, (x,)))
             return out
 
         # a trace, a hit, and a miss (another rank) traced again: one
@@ -3256,15 +3230,14 @@ for label, fn, args_of in (("on_side", on_side, fill_args), ("then_join", then_j
         self.assertEqual(variants[0].calls, 1)
         # no later call touched an earlier input
         self.assertEqual([executions(s, c) for c, s in zip(calls, served)], [1, 1, 1])
-        # the count reads the defaults' executions too: the trace's warm-up
-        # (1), then the build's two ordinary calls and its instantiating
-        # launch (3)
+        # the count reads the default's execution too: the trace's warm-up
+        # (1); the build runs nothing of the function
         x = torch.randn(8, device="cuda")
         start = x.clone()
         tape = ht.trace(fn, (x,))
         self.assertEqual(executions(x, start), 1)
-        ht.build(tape, fn, (x,))
-        self.assertEqual(executions(x, start), 4)
+        build(tape, fn, (x,))
+        self.assertEqual(executions(x, start), 1)
 
     def test_addresses_of_two_roots_are_decided_by_root_identity(self):
         # a host's `dst != src` over two live tensors of different roots is
@@ -3310,7 +3283,7 @@ for label, fn, args_of in (("on_side", on_side, fill_args), ("then_join", then_j
         q0, q1 = (a.q.node.hint for a in tape.allocs[:2])
         self.assertNotEqual(q0, q1)
         self.assertEqual({(256 * q) >> 52 for q in (q0, q1)}, {ht._ALLOC_TAG >> 52})
-        variant = ht.build(tape, fn, args)
+        variant = build(tape, fn, args)
         x, w, b = self._inputs(8)
         self._check(variant.replay(self._args(x, w, b)), x, w, b, 8)
 
@@ -3325,7 +3298,7 @@ for label, fn, args_of in (("on_side", on_side, fill_args), ("then_join", then_j
         tape = ht.trace(same, args)
         self.assertTrue(seen[-1])
         self.assertEqual([r for r in tape.root_facts if r[0] != "domain"], [])
-        variant = ht.build(tape, same, args)
+        variant = build(tape, same, args)
         self._check(variant.replay(args), x, w, w, 8)
         self.assertIsNone(variant.try_replay(self._args(x, w, b)))
 
@@ -3363,7 +3336,7 @@ for label, fn, args_of in (("on_side", on_side, fill_args), ("then_join", then_j
         self.assertIsInstance(traced[5], torch.SymInt)
         # x[8:] is empty at the traced batch only: the null is guarded on the
         # batch, so the trace serves that batch and misses others by name
-        variant = ht.build(tape, fn, args)
+        variant = build(tape, fn, args)
         self._check(variant.replay(args), x, w, b, 8)
         self.assertIsNone(variant.try_replay(self._args(*self._inputs(16))))
 
@@ -3403,7 +3376,7 @@ for label, fn, args_of in (("on_side", on_side, fill_args), ("then_join", then_j
             [o["identity"] for o in json.loads(tape.to_json())["outputs"]],
             [None, ["argument", 0], ["output", 0], None, None, None],
         )
-        variant = ht.build(tape, fn, (x, w, b))
+        variant = build(tape, fn, (x, w, b))
         x2, w2, b2 = self._inputs(16)
         eager = fn(x2, w2, b2)
         self.assertIs(eager[1], x2)
@@ -3447,7 +3420,7 @@ for label, fn, args_of in (("on_side", on_side, fill_args), ("then_join", then_j
         self.assertNotEqual(ht._constant(zero), ht._constant(minus_zero))
         x, w, b = self._inputs(16)
         args = self._args(x, w, b, eps=zero)
-        variant = ht.build(ht.trace(layer_norm, args), layer_norm, args)
+        variant = build(ht.trace(layer_norm, args), layer_norm, args)
         self.assertIsNotNone(variant.try_replay(self._args(x, w, b, eps=zero)))
         self.assertIsNone(variant.try_replay(self._args(x, w, b, eps=minus_zero)))
 
@@ -3464,7 +3437,7 @@ for label, fn, args_of in (("on_side", on_side, fill_args), ("then_join", then_j
         def bits(v):
             return struct.pack("<d", v)
 
-        program = ht._Program(self._trace(8)[0])
+        program = ht._Evaluator()
         for value in (0.0, -0.0, 1.0 + 2**-24, 1e300, -1e300, math.inf, math.nan):
             expected = torch.tensor([value], dtype=torch.float64).float().item()
             self.assertEqual(bits(ht._round_float32(value)), bits(expected))
@@ -3556,7 +3529,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         x = torch.empty(1, 48, device="cuda")
         tape = ht.trace(fn, (x,))
         self.assertIn("Float32(", tape.to_json())
-        variant = ht.build(tape, fn, (x,))
+        variant = build(tape, fn, (x,))
         differing = 0
         for d in (48, 120, 200, 64, 17, 3):
             y = torch.empty(1, d, device="cuda")
@@ -3645,7 +3618,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     def test_a_declined_class_is_remembered_across_sizes(self):
         # a decline whose guards so far do not involve the batch: one trace,
         # one warning, every later size runs the ordinary host at once
-        entry = ht.Entry(self._after_layer_norm)
+        entry = make_entry(self._after_layer_norm)
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
             for M in (8, 16, 5):
@@ -3666,7 +3639,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                 return torch.atan(t)
             return layer_norm(t, [self.N], w, b, 1e-5)[0]
 
-        entry = ht.Entry(sized)
+        entry = make_entry(sized)
 
         def call(M):
             x, w, b = self._inputs(M)
@@ -3688,7 +3661,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         # a decline before the inputs are bound (an empty input) carries no
         # guards: the entry remembers exactly those inputs, and a call of any
         # other exact class is traced (and declines, and is warned) once more
-        entry = ht.Entry(self._after_layer_norm)
+        entry = make_entry(self._after_layer_norm)
         _, w, b = self._inputs(1)
 
         def call(x):
@@ -3714,7 +3687,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     def test_an_entry_serves_misses_by_new_variants_and_never_falls_back(self):
         # a miss is traced and served by a new variant; the outputs are
         # the replay's; the cap raises instead of running the ordinary host
-        entry = ht.Entry(layer_norm, max_variants=1)
+        entry = make_entry(layer_norm, max_variants=1)
         x, w, b = self._inputs(8)
         args = self._args(x, w, b)
         self._check(entry(*args), x, w, b, 8)
@@ -3728,8 +3701,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     def test_an_entry_takes_its_variants_from_its_builder(self):
         # the policy is the entry's and the variants its builder's: a backend
         # that matches by the batch, decides the offset only when called
-        # (Miss) and serves eagerly is dispatched, traced and capped like the
-        # interim replay, with no interim build
+        # (Miss) and serves eagerly is dispatched, traced and capped like any
+        # replay, with no build of its own
         class Served:
             def __init__(self, tape, args):
                 self.key = (args[0].shape[0], args[0].storage_offset())
@@ -3968,7 +3941,7 @@ class TestCudaHostTraceVerbatimFormals(TestCase):
             if isinstance(p["value"], torch.SymInt)
         ]
         self.assertEqual([p["offset"] for p in symbolic], [8])
-        variant = ht.build(tape, host, (x,))
+        variant = build(tape, host, (x,))
         y = torch.empty(8, device=device)
         variant.replay((y,))
         torch.cuda.synchronize()
@@ -3980,7 +3953,7 @@ class TestCudaHostTraceVerbatimFormals(TestCase):
 
         x = torch.empty(7, device=device)
         tape = ht.trace(host, (x,))
-        variant = ht.build(tape, host, (x,))
+        variant = build(tape, host, (x,))
         variant.replay((torch.empty(8, device=device),))
         torch.cuda.synchronize()
         self.assertEqual(self.extension.read_observed(), [11, 8])
@@ -4009,110 +3982,6 @@ class TestCudaHostTraceVerbatimFormals(TestCase):
                 self.extension.verbatim_with_scalar, (torch.empty(7, device=device),)
             )
         self.assertFalse(torch._C._host_trace_tracing())
-
-
-@unittest.skipIf(not torch.cuda.is_available(), "CUDA not available")
-@skipIfRocm(msg="host tracing is CUDA-only in this version")
-class TestCudaHostTraceBuildPairing(TestCase):
-    # what the build checks when it pairs the tape's records with the
-    # capture's nodes and allocations
-    N = 1024
-
-    def _layer_norm(self):
-        w = torch.randn(self.N, device="cuda")
-        b = torch.randn(self.N, device="cuda")
-
-        def fn(x):
-            return F.layer_norm(x, (self.N,), w, b, 1e-5)
-
-        return fn, (torch.randn(8, self.N, device="cuda"),)
-
-    def test_kernel_name_must_be_equal_not_a_substring(self):
-        fn, args = self._layer_norm()
-        tape = ht.trace(fn, args)
-        ht.build(tape, fn, args)
-        name = tape.launches[0]["kernel"]
-        tape.launches[0]["kernel"] = name[:-1]
-        with self.assertRaisesRegex(ht.TapeMismatch, "launch 0 is "):
-            ht.build(tape, fn, args)
-        tape.launches[0]["kernel"] = name
-        ht.build(tape, fn, args)
-
-    def test_identical_launches_with_different_tables_decline(self):
-        # two launches the capture cannot tell apart at the build inputs pair
-        # by the graph's order when it orders their nodes; incomparable nodes
-        # (parallel branches) pair by creation order, exact only when the
-        # symbolic tables agree
-        fn, args = self._layer_norm()
-        tape = ht.trace(fn, args)
-        variant = ht.build(tape, fn, args)
-        state = (tape.launches[0]["kernel"], b"image", (1, 1, 1), (1, 1, 1), 0)
-        chain = [0, 1]  # node 1 depends on node 0
-        parallel = [0, 0]
-        seen: dict = {}
-        variant._check_distinct(0, 0, state, seen, parallel)
-        variant._check_distinct(0, 1, state, seen, parallel)  # the same table: fine
-        table = seen[state][2]
-        seen[state] = (0, 0, (table[0][1:], *table[1:]))
-        variant._check_distinct(0, 1, state, seen, chain)  # ordered by the graph: fine
-        with self.assertRaisesRegex(ht.TapeMismatch, "differ symbolically"):
-            variant._check_distinct(0, 1, state, seen, parallel)
-
-    def test_pairing_follows_the_graphs_edges_not_the_node_array(self):
-        # the build pairs host order with the topological order of the
-        # capture's edges: with the test hook reversing cudaGraphGetNodes'
-        # array the pairing, the byte check and the replay are unchanged
-        w = torch.randn(self.N, device="cuda")
-        b = torch.randn(self.N, device="cuda")
-
-        def fn(x, y):
-            return (
-                F.layer_norm(x, (self.N,), w, b, 1e-5),
-                F.layer_norm(y, (self.N,), w, b, 1e-5),
-            )
-
-        args = (
-            torch.randn(8, self.N, device="cuda"),
-            torch.randn(4, self.N, device="cuda"),
-        )
-        tape = ht.trace(fn, args)
-        self.assertEqual(len(tape.launches), 2)
-        torch._C._host_trace_test_reverse_node_order(True)
-        try:
-            variant = ht.build(tape, fn, args)
-        finally:
-            torch._C._host_trace_test_reverse_node_order(False)
-        new = (
-            torch.randn(3, self.N, device="cuda"),
-            torch.randn(5, self.N, device="cuda"),
-        )
-        got = variant.replay(new)
-        for g, want in zip(got, fn(*new)):
-            self.assertEqual(g, want, atol=0, rtol=0)
-
-    def test_allocation_log_entries_are_checked_by_size_and_exhausted(self):
-        fn, args = self._layer_norm()
-        tape = ht.trace(fn, args)
-        self.assertGreater(len(tape.allocs), 0)
-        real = torch._C._host_trace_alloc_log_end
-
-        def with_extra():
-            return real() + [(256, 4096)]
-
-        def resized():
-            log = real()
-            addr, nbytes = log[0]
-            return [(addr, nbytes * 2)] + log[1:]
-
-        with mock.patch.object(torch._C, "_host_trace_alloc_log_end", with_extra):
-            with self.assertRaisesRegex(ht.TapeMismatch, "allocation"):
-                ht.build(tape, fn, args)
-        with mock.patch.object(torch._C, "_host_trace_alloc_log_end", resized):
-            with self.assertRaisesRegex(
-                ht.TapeMismatch, "bytes at the build, the tape says"
-            ):
-                ht.build(tape, fn, args)
-        ht.build(tape, fn, args)
 
 
 instantiate_device_type_tests(
@@ -4160,7 +4029,7 @@ class TestCudaHostTraceLayerNormBackward(TestCase):
 
     def _roundtrip(self, fn, base, news):
         tape = ht.trace(fn, base)
-        variant = ht.build(tape, fn, base)
+        variant = build(tape, fn, base)
         served = []
         for args in news:
             out = variant.try_replay(args)

@@ -3,6 +3,8 @@
 import json
 import unittest
 
+from host_trace_testing import build
+
 import torch
 from torch.testing._internal.common_cuda import PLATFORM_SUPPORTS_FLASH_ATTENTION
 from torch.testing._internal.common_device_type import instantiate_device_type_tests
@@ -159,7 +161,7 @@ class TestCudaHostTraceFlash(TestCase):
 
     def test_replay_matches_eager_at_other_shapes(self):
         tape, args = self._trace(4, 512, 512)
-        variant = ht.build(tape, flash, args)
+        variant = build(tape, flash, args)
         # sequence lengths that keep the traced kernel's even-MN branch, and
         # batch 1 and 8 from a batch-4 trace
         for B, Sq, Sk in [
@@ -174,7 +176,7 @@ class TestCudaHostTraceFlash(TestCase):
 
     def test_branch_change_is_a_named_miss(self):
         tape, args = self._trace(4, 512, 512)
-        variant = ht.build(tape, flash, args)
+        variant = build(tape, flash, args)
         # seqlen_q 500 is not a multiple of the kernel's block: the even-MN
         # branch flips, a guard on the tape
         with self.assertRaisesRegex(ht.Miss, "guard failed"):
@@ -186,14 +188,14 @@ class TestCudaHostTraceFlash(TestCase):
 
     def test_causal_traces_separately(self):
         tape, args = self._trace(4, 512, 512, causal=True)
-        variant = ht.build(tape, flash, args)
+        variant = build(tape, flash, args)
         for B, Sq, Sk in [(2, 512, 512), (1, 1024, 1024)]:
             self._check_served(variant, self._args(*self._qkv(B, Sq, Sk), causal=True))
 
     def test_scale_from_the_head_dim(self):
         # scale=None: the host derives 1/sqrt(d) from the symbolic head dim
         tape, args = self._trace(4, 512, 512, scale=None)
-        variant = ht.build(tape, flash, args)
+        variant = build(tape, flash, args)
         self._check_served(variant, self._args(*self._qkv(2, 512, 1024), scale=None))
         self.assertEqual(variant.replay(args)[0], flash(*args)[0], atol=0, rtol=0)
 
@@ -210,14 +212,16 @@ class TestCudaHostTraceFlash(TestCase):
                 self.D = d
                 tape, args = self._trace(2, 128, 128, scale=None)
                 self.assertIn("Float32(", tape.to_json())
-                variant = ht.build(tape, flash, args)
-                self._check_served(variant, self._args(*self._qkv(2, 128, 128), scale=None))
+                variant = build(tape, flash, args)
+                self._check_served(
+                    variant, self._args(*self._qkv(2, 128, 128), scale=None)
+                )
         finally:
             self.D = D
 
     def test_gqa_ratio_change(self):
         tape, args = self._trace(4, 512, 512, H=32, Hk=32)
-        variant = ht.build(tape, flash, args)
+        variant = build(tape, flash, args)
         # the head ratio is an expression of the two head counts
         self._check_served(variant, self._args(*self._qkv(4, 512, 512, H=32, Hk=8)))
         self._check_served(variant, self._args(*self._qkv(2, 512, 512, H=32, Hk=4)))
@@ -227,7 +231,7 @@ class TestCudaHostTraceFlash(TestCase):
         # inside the host and a batch stride the host rescales
         # batch 32 keeps the swapped problem (32 x 8 kv heads) on the plain kernel
         tape, args = self._trace(32, 1, 1024, H=32, Hk=8)
-        variant = ht.build(tape, flash, args)
+        variant = build(tape, flash, args)
         for B, Sk in [(32, 1024), (64, 2048), (40, 512)]:
             self._check_served(variant, self._args(*self._qkv(B, 1, Sk, H=32, Hk=8)))
         # at batch 1 the heuristic splits the cache: a miss named after it
@@ -236,7 +240,7 @@ class TestCudaHostTraceFlash(TestCase):
 
     def test_inputs_with_storage_offsets(self):
         tape, args = self._trace(4, 512, 512)
-        variant = ht.build(tape, flash, args)
+        variant = build(tape, flash, args)
         # flash reads its inputs 16 bytes at a time; offsets that keep that
         # alignment replay (the addresses are expressions of the offsets)
         for offset in (8, 64):
@@ -246,7 +250,7 @@ class TestCudaHostTraceFlash(TestCase):
 
     def test_fp16(self):
         tape, args = self._trace(2, 512, 512, dtype=torch.float16)
-        variant = ht.build(tape, flash, args)
+        variant = build(tape, flash, args)
         self._check_served(
             variant, self._args(*self._qkv(4, 512, 256, dtype=torch.float16))
         )
@@ -271,7 +275,7 @@ class TestCudaHostTraceFlash(TestCase):
         splits = parsed["opaque"][0]["expected"]
         self.assertGreater(splits, 1)
         self.assertEqual(tape.num_launches, 2)  # split kernel and combine
-        variant = ht.build(tape, flash, args)
+        variant = build(tape, flash, args)
         self._check_served(variant, self._args(*self._qkv(1, 1, Sk, H=8, Hk=8)))
         # the same heuristic at replay: a different split count is a miss
         # named after it
@@ -302,7 +306,7 @@ class TestCudaHostTraceFlash(TestCase):
         self.assertTrue(ties)
         tape, args = self._trace(ties[0], 1, Sk, H=8, Hk=8)
         splits = json.loads(tape.to_json())["opaque"][0]["expected"]
-        variant = ht.build(tape, flash, args)
+        variant = build(tape, flash, args)
         for B in ties:
             expect = num_splits_heuristic(B * 8, sms, num_n_blocks, 128)
             new_args = self._args(*self._qkv(B, 1, Sk, H=8, Hk=8))
@@ -324,7 +328,7 @@ class TestCudaHostTraceFlash(TestCase):
     def test_a_copy_on_write_input_stays_lazy(self):
         # q, k, v are read through the const accessor: a lazy clone stays
         # copy-on-write through an ordinary flash call, the trace's warm-up
-        # and the build; out and softmax_lse go through the mutable form.
+        # and a replay; out and softmax_lse go through the mutable form.
         q, k, v = self._qkv(2, 128, 128)
         lazy_q, lazy_k = torch._lazy_clone(q), torch._lazy_clone(k)
         self.assertTrue(torch._C._is_cow_tensor(lazy_q))
@@ -335,7 +339,7 @@ class TestCudaHostTraceFlash(TestCase):
         self.assertEqual(out[0], ref[0])
         args = self._args(lazy_q, lazy_k, v)
         tape = ht.trace(flash, args)
-        variant = ht.build(tape, flash, args)
+        variant = build(tape, flash, args)
         self.assertTrue(torch._C._is_cow_tensor(lazy_q))
         self.assertTrue(torch._C._is_cow_tensor(lazy_k))
         self.assertEqual(variant.replay(args)[0], ref[0])
@@ -482,7 +486,7 @@ class TestCudaHostTraceFlashBackward(TestCase):
     @parametrize("p", [0.0, 0.1])
     def test_replay_matches_eager_at_other_shapes(self, device, causal, p):
         tape, args = self._trace(device, 2, 128, 128, causal=causal, p=p)
-        variant = ht.build(tape, flash_bwd, args)
+        variant = build(tape, flash_bwd, args)
         # other batch sizes, lengths and addresses from one trace: the same
         # kernel variant (even-MN, causal and dropout are constants of it)
         for B, Sq, Sk, offset, seed in [
@@ -509,7 +513,7 @@ class TestCudaHostTraceFlashBackward(TestCase):
         # the mask comes from the forward's rng_state; neither eager nor the
         # replay touches the generator
         tape, args = self._trace(device, 2, 128, 128, p=0.1)
-        variant = ht.build(tape, flash_bwd, args)
+        variant = build(tape, flash_bwd, args)
         gen = self._gen(device)
         before = gen.get_offset()
         flash_bwd(*args)
@@ -525,7 +529,7 @@ class TestCudaHostTraceFlashBackward(TestCase):
     def test_scale_from_the_head_dim(self, device):
         # scale=None: the host derives 1/sqrt(d) from the symbolic head dim
         tape, args = self._trace(device, 2, 128, 128, scale=None)
-        variant = ht.build(tape, flash_bwd, args)
+        variant = build(tape, flash_bwd, args)
         self._check_served(variant, self._case(device, 1, 256, 256, scale=None, seed=5))
 
     def test_gqa_sums_the_head_groups(self, device):
@@ -536,7 +540,7 @@ class TestCudaHostTraceFlashBackward(TestCase):
         self.assertEqual(tape.num_launches, 5)
         names = _tape_kernels(tape)
         self.assertEqual(sum("reduce_kernel" in n for n in names), 2)
-        variant = ht.build(tape, flash_bwd, args)
+        variant = build(tape, flash_bwd, args)
         for B, Sq, Sk, Hk, seed in [
             (3, 256, 128, 2, 1),
             (4, 128, 256, 4, 2),
@@ -557,8 +561,8 @@ class TestCudaHostTraceFlashBackward(TestCase):
         # from the SM count and b * h), the kernel grid and the convert's split
         # count follow it; eager is then bitwise reproducible at any length.
         # The flag's fill of uninitialized memory is off: eager's empty would
-        # launch a fill kernel per allocation the trace does not record
-        # (a TapeMismatch at the build, see STAGE2B.md)
+        # launch a fill kernel per allocation the trace does not record (the
+        # trace declines by name at the first allocation, see STAGE2B.md)
         with DeterministicGuard(True, fill_uninitialized_memory=False):
             tape, args = self._trace(device, 2, 128, 512)
             parsed = json.loads(tape.to_json())
@@ -566,7 +570,7 @@ class TestCudaHostTraceFlashBackward(TestCase):
             self.assertEqual(len(splits), 1)
             self.assertFalse(splits[0]["const"])
             self.assertEqual(parsed["launches"][1]["grid"][0], splits[0]["expr"])
-            variant = ht.build(tape, flash_bwd, args)
+            variant = build(tape, flash_bwd, args)
             for B, Sq, Sk, seed in [
                 (1, 128, 512, 1),
                 (4, 256, 384, 2),
@@ -631,8 +635,8 @@ class TestCudaHostTraceFlashBackward(TestCase):
         # the forward's `out` reaches the backward through the forward helper's
         # mutable accessor: the unconverted host read it with data_ptr(), which
         # materializes a copy-on-write tensor, and the converted host does the
-        # same in ordinary mode, at the warm-up and at the build (A98:
-        # materialize where eager did, never elsewhere); the values are bitwise
+        # same in ordinary mode and at the warm-up (A98: materialize where
+        # eager did, never elsewhere); the values are bitwise
         args = self._case(device, 2, 128, 128)
         want = flash_bwd(*args)
         lazy = torch._lazy_clone(args[4])
@@ -646,57 +650,7 @@ class TestCudaHostTraceFlashBackward(TestCase):
         lazy_args = args[:4] + (lazy,) + args[5:]
         tape = ht.trace(flash_bwd, lazy_args)
         self.assertFalse(torch._C._is_cow_tensor(lazy))
-        variant = ht.build(tape, flash_bwd, lazy_args)
-        for g, w in zip(variant.replay(lazy_args), want):
-            self.assertTrue(torch.equal(g, w))
-
-    def test_the_varlen_hosts_decline_by_name(self, device):
-        # mha_varlen_fwd / mha_varlen_bwd sit in the traced scope unconverted:
-        # a call with cu_seqlens declines at their entry, by name, before any
-        # raw read of the lengths
-        B, S, H, D = 2, 64, 4, 64
-        q, k, v = (
-            torch.randn(B * S, H, D, device=device, dtype=torch.bfloat16)
-            for _ in range(3)
-        )
-        cu = torch.arange(0, (B + 1) * S, S, device=device, dtype=torch.int32)
-
-        def fwd(q, k, v, cu_q, cu_k):
-            return flash_forward(q, k, v, cu_q, cu_k, S, S, 0.0, False, False)
-
-        with self.assertRaisesRegex(ht.Declined, "cu_seqlens .mha_varlen_fwd."):
-            ht.trace(fwd, (q, k, v, cu, cu))
-        out, lse, rng_state, unused, _ = fwd(q, k, v, cu, cu)
-        dout = torch.randn_like(out)
-
-        def bwd(dout, q, k, v, out, lse, cu_q, cu_k, rng_state, unused):
-            return flash_backward(
-                dout, q, k, v, out, lse, cu_q, cu_k, S, S, 0.0, False, rng_state, unused
-            )
-
-        with self.assertRaisesRegex(ht.Declined, "cu_seqlens .mha_varlen_bwd."):
-            ht.trace(bwd, (dout, q, k, v, out, lse, cu, cu, rng_state, unused))
-
-    def test_a_lazily_cloned_out_materializes_as_eagers_data_ptr_did(self, device):
-        # the forward's `out` reaches the backward through the forward helper's
-        # mutable accessor: the unconverted host read it with data_ptr(), which
-        # materializes a copy-on-write tensor, and the converted host does the
-        # same in ordinary mode, at the warm-up and at the build (A98:
-        # materialize where eager did, never elsewhere); the values are bitwise
-        args = self._case(device, 2, 128, 128)
-        want = flash_bwd(*args)
-        lazy = torch._lazy_clone(args[4])
-        self.assertTrue(torch._C._is_cow_tensor(lazy))
-        lazy_args = args[:4] + (lazy,) + args[5:]
-        got = flash_bwd(*lazy_args)
-        self.assertFalse(torch._C._is_cow_tensor(lazy))
-        for g, w in zip(got, want):
-            self.assertTrue(torch.equal(g, w))
-        lazy = torch._lazy_clone(args[4])
-        lazy_args = args[:4] + (lazy,) + args[5:]
-        tape = ht.trace(flash_bwd, lazy_args)
-        self.assertFalse(torch._C._is_cow_tensor(lazy))
-        variant = ht.build(tape, flash_bwd, lazy_args)
+        variant = build(tape, flash_bwd, lazy_args)
         for g, w in zip(variant.replay(lazy_args), want):
             self.assertTrue(torch.equal(g, w))
         # the mutable read names out's root among the tape's written roots, so
@@ -714,7 +668,7 @@ class TestCudaHostTraceFlashBackward(TestCase):
     def test_a_copy_on_write_input_stays_lazy(self, device):
         # q, k, v, dout, the logsumexp and rng_state are read through the
         # const accessor: lazy clones stay copy-on-write through an ordinary
-        # call, the trace's warm-up and the build (out goes through the
+        # call, the trace's warm-up and a replay (out goes through the
         # forward helper's mutable form, as its data_ptr() did before)
         args = self._case(device, 2, 128, 128, p=0.1)
         dout, q, k, v, out, lse, rng_state, unused = args[:8]
@@ -738,7 +692,7 @@ class TestCudaHostTraceFlashBackward(TestCase):
         for g, w in zip(got, want):
             self.assertTrue(torch.equal(g, w))
         tape = ht.trace(flash_bwd, lazy_args)
-        variant = ht.build(tape, flash_bwd, lazy_args)
+        variant = build(tape, flash_bwd, lazy_args)
         for t in lazy:
             self.assertTrue(torch._C._is_cow_tensor(t))
         for g, w in zip(variant.replay(lazy_args), want):

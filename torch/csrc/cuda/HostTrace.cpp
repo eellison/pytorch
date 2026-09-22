@@ -10,7 +10,7 @@
 #include <torch/csrc/utils/python_symnode.h>
 
 #include <ATen/core/CachingHostAllocator.h>
-#include <ATen/cuda/host_trace/Exec.h>
+#include <ATen/cuda/host_trace/Harvest.h>
 #include <ATen/cuda/host_trace/Hooks.h>
 #include <ATen/cuda/host_trace/HostTable.h>
 #include <ATen/cuda/host_trace/Recorder.h>
@@ -24,10 +24,6 @@
 
 namespace {
 
-using at::cuda::host_trace::Exec;
-using at::cuda::host_trace::MemcpyUpdate;
-using at::cuda::host_trace::MemsetUpdate;
-using at::cuda::host_trace::NodeUpdate;
 using at::cuda::host_trace::SymVal;
 using at::cuda::host_trace::Tape;
 using at::cuda::host_trace::TraceState;
@@ -361,87 +357,10 @@ void THCPHostTrace_init(PyObject* module) {
              const py::object& /*value*/,
              const py::object& /*tb*/) { e.scope.reset(); });
 
-  py::class_<Exec>(m, "_HostTraceExec")
-      .def(py::init([](at::cuda::CUDAGraph& graph, c10::DeviceIndex device) {
-        return std::make_unique<Exec>(graph, device);
-      }))
-      .def_property_readonly("num_nodes", &Exec::num_nodes)
-      .def("kernel_name", &Exec::kernel_name)
-      .def("dependencies", &Exec::dependencies)
-      .def(
-          "image",
-          [](const Exec& e, size_t j) {
-            auto v = e.image(j);
-            return py::bytes(reinterpret_cast<const char*>(v.data()), v.size());
-          })
-      .def("grid", &Exec::grid)
-      .def("block", &Exec::block)
-      .def("smem", &Exec::smem)
-      .def("attrs", &Exec::attrs)
-      .def("node_kinds", &Exec::node_kinds)
-      .def("adopt_driver", &Exec::adopt_driver)
-      .def_property_readonly("num_memset_nodes", &Exec::num_memset_nodes)
-      .def("memset_dst", &Exec::memset_dst)
-      .def("memset_bytes", &Exec::memset_bytes)
-      .def("memset_value", &Exec::memset_value)
-      .def_property_readonly("num_memcpy_nodes", &Exec::num_memcpy_nodes)
-      .def("memcpy_src", &Exec::memcpy_src)
-      .def("memcpy_dst", &Exec::memcpy_dst)
-      .def("memcpy_bytes", &Exec::memcpy_bytes)
-      .def("memcpy_kind", &Exec::memcpy_kind)
-      .def("instantiate", &Exec::instantiate, py::arg("replay") = true)
-      .def(
-          "run",
-          [](Exec& e,
-             const std::vector<std::tuple<
-                 size_t,
-                 py::bytes,
-                 std::array<unsigned, 3>,
-                 std::array<unsigned, 3>,
-                 unsigned,
-                 uint64_t,
-                 std::vector<int64_t>>>& updates,
-             const std::vector<
-                 std::tuple<size_t, uint64_t, uint64_t, unsigned>>&
-                 memset_updates,
-             const std::vector<
-                 std::tuple<size_t, uint64_t, uint64_t, uint64_t>>&
-                 memcpy_updates) {
-            std::vector<NodeUpdate> us;
-            us.reserve(updates.size());
-            for (const auto& [node, image, grid, block, smem, func, attrs] :
-                 updates) {
-              std::string s = image;
-              NodeUpdate u{node, {}, grid, block, smem, func, attrs};
-              u.image.assign(s.begin(), s.end());
-              us.push_back(std::move(u));
-            }
-            std::vector<MemsetUpdate> ms;
-            ms.reserve(memset_updates.size());
-            for (const auto& [node, dst, bytes, value] : memset_updates) {
-              ms.push_back(MemsetUpdate{node, dst, bytes, value});
-            }
-            std::vector<MemcpyUpdate> mc;
-            mc.reserve(memcpy_updates.size());
-            for (const auto& [node, src, dst, bytes] : memcpy_updates) {
-              mc.push_back(MemcpyUpdate{node, src, dst, bytes});
-            }
-            e.run(us, ms, mc);
-          },
-          py::arg("updates"),
-          py::arg("memset_updates") =
-              std::vector<std::tuple<size_t, uint64_t, uint64_t, unsigned>>{},
-          py::arg("memcpy_updates") =
-              std::vector<std::tuple<size_t, uint64_t, uint64_t, uint64_t>>{})
-      .def_property_readonly("dirty_nodes", &Exec::dirty_nodes)
-      .def_property_readonly("dirty_memset_nodes", &Exec::dirty_memset_nodes)
-      .def_property_readonly("dirty_memcpy_nodes", &Exec::dirty_memcpy_nodes)
-      .def_property_readonly("graph_updates", &Exec::graph_updates);
-
-  // A raw stream capture of one closed library call (Exec.h): the Python side
-  // begins, runs the call on `stream`, ends and gets the nodes back as dicts:
-  // kernels (func, name, grid, block, smem, image, layout, attrs) and
-  // memsets (dst, value, elem, width), each with its kind.
+  // The closed regions' harvest (Harvest.h): the nodes of a graph the Python
+  // side captured one library call into, as dicts: kernels (func, name, grid,
+  // block, smem, image, layout, attrs) and memsets (dst, value, elem, width),
+  // each with its kind; and the host facts the harvest classifies slots by.
   m.def("_host_trace_stack_probe", []() {
     // an address on the calling thread's stack: classifies the host stack
     // pointers cuBLAS leaves in a kernel image (see _host_trace.py)
@@ -492,12 +411,23 @@ void THCPHostTrace_init(PyObject* module) {
       [](int64_t graph, int probe_attr, bool anchored) {
         // NOLINTNEXTLINE(performance-no-int-to-ptr)
         auto g = reinterpret_cast<cudaGraph_t>(static_cast<intptr_t>(graph));
-        auto harvested = Exec::harvest_nodes(g, probe_attr, anchored);
+        auto harvested =
+            at::cuda::host_trace::harvest_nodes(g, probe_attr, anchored);
         py::list out;
         for (const auto& h : harvested) {
           py::dict d;
-          d["kind"] = h.kind == 0 ? "kernel" : "memset";
+          d["kind"] = h.kind == 0 ? "kernel"
+              : h.kind == 1       ? "memset"
+                                  : "memcpy";
           d["programmatic"] = h.programmatic;
+          if (h.kind == 2) {
+            d["name"] = h.name;
+            d["src"] = h.src;
+            d["dst"] = h.dst;
+            d["bytes"] = h.width;
+            out.append(std::move(d));
+            continue;
+          }
           if (h.kind == 1) {
             d["name"] = h.name;
             d["dst"] = h.dst;
@@ -599,9 +529,9 @@ void THCPHostTrace_init(PyObject* module) {
         at::cuda::host_trace::capture_error_name(static_cast<int>(code));
     return name == nullptr ? py::object(py::none()) : py::str(name);
   });
-  // (addr, nbytes) of every caching-allocator allocation the build capture's
-  // pool served between the two calls: how the replay's build binds each
-  // allocation root
+  // (addr, nbytes) of every caching-allocator allocation a capture's pool
+  // served between the two calls: how the closed regions' harvest finds the
+  // library call's own allocations
   m.def(
       "_host_trace_alloc_log_begin",
       [](c10::DeviceIndex device, c10::cuda::MempoolId_t pool) {
@@ -610,26 +540,9 @@ void THCPHostTrace_init(PyObject* module) {
   m.def("_host_trace_alloc_log_end", []() {
     return at::cuda::host_trace::alloc_log_end();
   });
-  // the table copies the ordinary host issued between the two calls, in
-  // order: (pinned buffer, its bytes at the copy); the build checks the bytes
-  // against the tape's image and binds the image's root to the buffer its
-  // capture copied from
-  m.def("_host_trace_host_table_log_begin", []() {
-    at::cuda::host_trace::host_table_log_begin();
-  });
-  m.def("_host_trace_host_table_log_end", []() {
-    py::list out;
-    for (const auto& c : at::cuda::host_trace::host_table_log_end()) {
-      out.append(py::make_tuple(
-          c.buffer,
-          py::bytes(
-              reinterpret_cast<const char*>(c.bytes.data()), c.bytes.size())));
-    }
-    return out;
-  });
   // Tensor::copy_'s rule for a pinned block a stream is still reading: the
   // caching host allocator defers the block's reuse to an event on that
-  // stream. The replay records its staging slots this way after each launch.
+  // stream. A replay records its pinned inputs this way after each call.
   // Returns whether the allocator owns the block.
   m.def(
       "_host_trace_record_host_event",

@@ -5,7 +5,7 @@ import time
 import unittest
 
 from host_trace_h2d_probe import probe
-from host_trace_testing import HostTraceTestCase
+from host_trace_testing import build, HostTraceTestCase, wait_for_h2d
 
 import torch
 import torch.nn.functional as F
@@ -184,15 +184,16 @@ class TestCudaHostTraceDecode(HostTraceTestCase):
         caches = self._caches(B)
         args = self._args(self._ids(B), caches, L)
         tape = ht.trace(decode_step, args, **kw)
-        variant = ht.build(tape, decode_step, args)
+        variant = build(tape, decode_step, args)
         return tape, variant
 
     def _serve(self, variant, args):
         # what an entry does with one tape's variants: the first that serves
         # the call does; a TopologyMiss (a projection's cuBLAS node chain at
-        # this batch is not the one an exec holds) names the tape, which
-        # built at these inputs (no trace) is a variant with that chain, kept
-        # beside the others; any other Miss is the call's
+        # this batch is not the one a variant's graph holds) names the tape,
+        # which built at these inputs (no trace) is a variant with that chain,
+        # kept beside the others; any other Miss is the call's (the eager form
+        # holds no chain: one variant serves every batch its guards admit)
         variants = self._pool.setdefault(id(variant), [variant])
         topology, plain = None, None
         for v in variants:
@@ -204,7 +205,7 @@ class TestCudaHostTraceDecode(HostTraceTestCase):
                 plain = e
         if topology is None:
             raise plain
-        variants.append(ht.build(topology.tape, decode_step, args))
+        variants.append(build(topology.tape, decode_step, args))
         return variants[-1].replay(args)
 
     def _step(self, variant, B, L, eager_caches, replay_caches):
@@ -288,17 +289,29 @@ class TestCudaHostTraceDecode(HostTraceTestCase):
             self.assertTrue(self._step(variant, B, 20, e_caches, r_caches))
             served.append(B)
         variants = self._pool[id(variant)]
-        stats = [v.region_stats() for v in variants]
         reasons = sorted(set(missed.values()))
-        print(
-            f"\n[decode batch sweep 1..64] served {served} missed {sorted(missed)} reasons {reasons} "
-            f"harvests {ht.gemm_harvests() - h0} execs {len(variants)} "
-            f"chains {[[len(t) for t in v.topology] for v in variants]} "
-            f"applies {[s['applies'] for s in stats]} rebinds {[s['rebinds'] for s in stats]} "
-            f"graph updates {[v.exec.graph_updates for v in variants]}"
-        )
-        chains = {tuple(v.topology) for v in variants}
-        self.assertEqual(len(chains), len(variants))
+        if variant.native is not None:
+            stats = [v.native.region_stats() for v in variants]
+            chains = [
+                tuple(
+                    tuple(zip(s["kinds"], s.get("programmatic", [False] * s["nodes"])))
+                    for s in st["sites"]
+                )
+                for st in stats
+            ]
+            print(
+                f"\n[decode batch sweep 1..64] served {served} missed {sorted(missed)} reasons {reasons} "
+                f"harvests {ht.gemm_harvests() - h0} variants {len(variants)} "
+                f"chains {[[len(t) for t in c] for c in chains]} "
+                f"applies {[s['applies'] for s in stats]} "
+                f"graph updates {[s['graph_updates'] for s in stats]}"
+            )
+            # one variant per chain vector
+            self.assertEqual(len(set(chains)), len(variants))
+        else:
+            print(
+                f"\n[decode batch sweep 1..64] served {served} missed {sorted(missed)} reasons {reasons}"
+            )
         self.assertEqual(served, list(range(2, 17)))
         self.assertIn(1, missed)
         self.assertEqual(sorted(k for k in missed if k > 16), list(range(17, 65)))
@@ -365,9 +378,10 @@ class TestCudaHostTraceDecode(HostTraceTestCase):
         # A decode loop written the natural way keeps one pinned ids buffer and
         # rewrites it per step. The replay's copy reads that buffer
         # asynchronously, so a caller running ahead of the GPU must call
-        # ht.wait_for_h2d(ids) before each rewrite; nothing detects a missing
+        # wait_for_h2d(ids) before each rewrite; nothing detects a missing
         # wait (a contract, like the synchronous-copy rule). A fresh pinned
-        # tensor per step needs no wait: the replay holds it until its copy ran.
+        # tensor per step needs no wait: the replay holds it until its copy
+        # ran. (The eager form copies nothing asynchronously.)
         _, variant = self._trace(4, 16)
         big = torch.randn(8192, 8192, device="cuda", dtype=DTYPE)
 
@@ -378,7 +392,7 @@ class TestCudaHostTraceDecode(HostTraceTestCase):
             pairs = []
             for L in range(17, 27):
                 if pattern == "in_place_with_wait":
-                    ht.wait_for_h2d(ids)
+                    wait_for_h2d(ids)
                 if pattern == "fresh":
                     ids = self._ids(4)
                 else:
@@ -454,7 +468,7 @@ class TestCudaHostTraceDecode(HostTraceTestCase):
 
         args = qkv(32, 32)
         tape = ht.trace(sdpa, args)
-        variant = ht.build(tape, sdpa, args)
+        variant = build(tape, sdpa, args)
         for lq, lk in ((32, 48), (48, 48), (33, 47)):
             a = qkv(lq, lk)
             self.assertTrue(torch.equal(variant.replay(a)[0], sdpa(*a)), f"{lq}/{lk}")
@@ -532,7 +546,7 @@ class TestCudaHostTraceDecode(HostTraceTestCase):
             self.assertIn(needle, names)
         _assert_same_kernels(self, tape, fwd_bwd, args)
         self.assertIsNone(tape.rng_increment)
-        variant = ht.build(tape, fwd_bwd, args)
+        variant = build(tape, fwd_bwd, args)
         for B, L, seed in [(2, 128, 1), (3, 256, 2), (4, 128, 3)]:
             new_args = self._sdpa_case(B, L, seed)
             got = variant.replay(new_args)
@@ -552,7 +566,7 @@ class TestCudaHostTraceDecode(HostTraceTestCase):
         tape = ht.trace(fwd_bwd, args)
         self.assertIsNotNone(tape.rng_increment)
         _assert_same_kernels(self, tape, fwd_bwd, args)
-        variant = ht.build(tape, fwd_bwd, args)
+        variant = build(tape, fwd_bwd, args)
         gen = torch.cuda.default_generators[torch.cuda.current_device()]
         for B, L, seed in [(2, 128, 1), (3, 256, 2), (4, 128, 3)]:
             new_args = self._sdpa_case(B, L, seed)

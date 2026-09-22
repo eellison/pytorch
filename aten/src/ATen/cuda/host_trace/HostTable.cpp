@@ -11,7 +11,6 @@
 namespace at::cuda::host_trace {
 
 namespace {
-thread_local std::vector<HostTableCopyLog>* g_table_log = nullptr;
 
 void store_int(uint8_t* dst, size_t size, int64_t v) {
   std::memcpy(dst, &v, size); // little-endian: the low `size` bytes
@@ -263,12 +262,6 @@ void copy_h2d(
         " bytes from a ",
         capacity,
         "-byte host table");
-    if (g_table_log != nullptr) {
-      // the build's check of the image this copy reads: the bytes as written
-      const auto* p = static_cast<const uint8_t*>(src.pinned.data_ptr());
-      g_table_log->push_back(
-          {src.pinned, std::vector<uint8_t>(p, p + src.pinned.numel())});
-    }
     ordinary_copy(
         reinterpret_cast<void*>(static_cast<uintptr_t>(dst.expect_int())),
         src.pinned.data_ptr(),
@@ -381,22 +374,6 @@ void copy_d2d(
   }
   TORCH_CHECK(nbytes.sym_ge(1).guard_bool(__FILE__, __LINE__));
   record_memcpy(s, src, dst, nbytes, "d2d");
-}
-
-void host_table_log_begin() {
-  static thread_local std::vector<HostTableCopyLog> log;
-  log.clear();
-  g_table_log = &log;
-}
-
-std::vector<HostTableCopyLog> host_table_log_end() {
-  std::vector<HostTableCopyLog> out;
-  if (g_table_log != nullptr) {
-    out = std::move(*g_table_log);
-    g_table_log->clear();
-    g_table_log = nullptr;
-  }
-  return out;
 }
 
 } // namespace at::cuda::host_trace

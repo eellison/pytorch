@@ -1089,14 +1089,14 @@ static void alloc_log_attach() {
 void alloc_log_begin(at::DeviceIndex device, c10::cuda::MempoolId_t pool) {
   TORCH_CHECK(
       pool.first != 0 || pool.second != 0,
-      "host_trace: the allocation log needs the build capture's pool");
+      "host_trace: the allocation log needs the capture's pool");
   // the tracker is the native caching allocator's; the other backends
   // (cudaMallocAsync, a pluggable allocator) raise on attaching one
   if (const std::string backend = c10::cuda::CUDACachingAllocator::name();
       backend != "native") {
     decline(
-        "host_trace: a build reads its allocations from the caching "
-        "allocator's trace tracker, which the " +
+        "host_trace: a closed region's harvest reads the library call's "
+        "allocations from the caching allocator's trace tracker, which the " +
         backend +
         " allocator backend does not provide "
         "(PYTORCH_CUDA_ALLOC_CONF=backend:" +

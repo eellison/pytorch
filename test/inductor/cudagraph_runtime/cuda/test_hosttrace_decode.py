@@ -11,8 +11,10 @@ from torch.testing._internal.common_cuda import PLATFORM_SUPPORTS_FLASH_ATTENTIO
 from torch.testing._internal.common_utils import run_tests, TestCase
 
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".."))
-from host_trace_h2d_probe import probe  # noqa: E402
+sys.path.insert(
+    0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..")
+)
+from host_trace_h2d_probe import probe
 
 
 C = torch._C
@@ -133,20 +135,17 @@ class TestHostTraceDecode(TestCase):
             self.assertTrue(self._step(r4, 4, L, e4, c4))
             self.assertTrue(self._step(r2, 2, L, e2, c2))
 
-    def test_agrees_with_the_interim_replay(self):
-        from torch.cuda import _host_trace
+    def test_agrees_with_eager_at_other_lengths(self):
+        # the oracle clones the caches for eager: the same cache contents on
+        # both sides, the cache writes compared after each step
+        from torch.testing._internal.host_trace_oracle import Oracle
 
-        replay = self._replay(4, 16)
-        base = self._args(self._ids(4), self._caches(4), 16)
-        interim = _host_trace.build(replay.tape, decode_step, base)
-        n_caches = self._caches(4)
-        i_caches = tuple(c.clone() for c in n_caches)  # the same cache contents
+        oracle = Oracle(decode_step, self._args(self._ids(4), self._caches(4), 16))
+        self.addCleanup(oracle.close)
+        self.assertIsNone(oracle.refused)
+        caches = self._caches(4)
         for L in (18, 24, 30):
-            ids = self._ids(4)
-            native = replay(*self._args(ids, n_caches, L))
-            ours = interim.replay(self._args(ids, i_caches, L))
-            for a, b in zip(native, ours):
-                self.assertEqual(a, b, atol=0, rtol=0)
+            oracle.check(self._args(self._ids(4), caches, L))
 
 
 if __name__ == "__main__":

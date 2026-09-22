@@ -1,11 +1,11 @@
 # Owner(s): ["module: cuda"]
 """Python-launched Triton kernels on the tape (torch/cuda/_host_trace_triton.py) through the
-interim replay: the build's capture is eager's own call, so its node is eager's kernel, and the
-record's parameters are updated per call like any launch's."""
+replay a test drives (host_trace_testing.build): the record's node is eager's kernel, and its
+parameters are updated per call like any launch's."""
 
 import unittest
 
-from host_trace_testing import HostTraceTestCase
+from host_trace_testing import graph_nodes, HostTraceTestCase
 
 import torch
 from torch.testing._internal.common_utils import run_tests
@@ -133,9 +133,10 @@ class TestHostTraceTriton(HostTraceTestCase):
         # 1000 is not a multiple of 16: Triton compiles another kernel for it
         self.assertIsNotNone(cases[3].miss)
         self.assertIn("% 16", cases[3].miss)
-        # the build's capture holds eager's own kernel: one node, the Triton function
-        self.assertEqual(variant.exec.num_nodes, 1)
-        self.assertEqual(variant.exec.kernel_name(0), "scale_add")
+        if variant.graph is not None:
+            # the replay's graph holds eager's own kernel: one node, the Triton function
+            names = [k[0] for k in graph_nodes(variant.graph)[0]]
+            self.assertEqual(names, ["scale_add"])
 
     def test_bmm_k1_takes_the_override(self):
         a = torch.randn(4, 32, 1, device="cuda")
@@ -155,7 +156,9 @@ class TestHostTraceTriton(HostTraceTestCase):
         self.assertEqual((tape.num_launches, tape.num_regions), (1, 0))
         self.assertEqual(tape.launches[0]["kernel"], "_bmm_outer_product_kernel")
         self.assertEqual([c.miss for c in cases], [None] * 3)
-        self.assertEqual(variant.exec.kernel_name(0), "_bmm_outer_product_kernel")
+        if variant.graph is not None:
+            names = [k[0] for k in graph_nodes(variant.graph)[0]]
+            self.assertEqual(names[0], "_bmm_outer_product_kernel")
 
     def test_written_roots_follow_the_pointer_declarations(self):
         x = torch.randn(2048, device="cuda")
@@ -171,7 +174,7 @@ class TestHostTraceTriton(HostTraceTestCase):
         self.assertEqual(tape.outputs[0].identity, ("argument", 0))
         self.assertEqual([c.miss for c in cases], [None])
 
-    def test_one_tape_every_launch_kind_through_the_interim_replay(self):
+    def test_one_tape_every_launch_kind_through_the_replay(self):
         global EXT
         from host_trace_testing import load_test_extension
 
@@ -189,10 +192,12 @@ class TestHostTraceTriton(HostTraceTestCase):
         self.assertIn("scale_two_plus_one", names[1])  # the mangled symbol
         self.assertEqual(names[2], "scale_add")
         self.assertEqual([c.miss for c in cases], [None, None])
-        # the capture's kernel nodes, in the tape's order, with the region's in between
-        kinds = [variant.exec.kernel_name(i) for i in range(variant.exec.num_nodes)]
-        cpp = next(i for i, k in enumerate(kinds) if "scale_two_plus_one" in k)
-        self.assertLess(cpp, kinds.index("scale_add"))
+        if variant.graph is not None:
+            # the native replay's kernel nodes, in the tape's order, with the
+            # region's in between
+            kinds = [k[0] for k in graph_nodes(variant.graph)[0]]
+            cpp = next(i for i, k in enumerate(kinds) if "scale_two_plus_one" in k)
+            self.assertLess(cpp, kinds.index("scale_add"))
 
     def test_triton_launch_sits_in_host_order_among_aten_launches(self):
         x = torch.randn(4096, device="cuda")
@@ -202,7 +207,9 @@ class TestHostTraceTriton(HostTraceTestCase):
         self.assertEqual(tape.num_launches, 3)
         self.assertEqual(tape.launches[1]["kernel"], "scale_add")
         self.assertEqual([c.miss for c in cases], [None])
-        self.assertEqual(variant.exec.kernel_name(1), "scale_add")
+        if variant.graph is not None:
+            names = [k[0] for k in graph_nodes(variant.graph)[0]]
+            self.assertEqual(names[1], "scale_add")
 
 
 if __name__ == "__main__":

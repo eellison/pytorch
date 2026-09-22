@@ -105,9 +105,13 @@ class TestHostTraceOutputReference(TestCase):
             self.check_outputs(kind, actual, destination, owned)
 
     @parametrize("kind", ("input", "view", "distinct_views", "owned", "full_views"))
-    def test_interim_replay_identity(self, device, kind):
+    def test_a_tape_prepared_from_disposable_inputs_keeps_the_identity_kinds(
+        self, device, kind
+    ):
+        # the tape is traced (no warm-up) and the entry prepared from it on
+        # disposable inputs; the calls that follow bind other storages and
+        # keep eager's output identity per kind
         self.enterContext(mock.patch.dict(globals(), OUTPUT_KIND=kind))
-        # The interim build warms the ordinary host on these disposable inputs.
         build_destination = torch.zeros(65, device=device)[1:].view(8, 8)
         build_args = (
             "fixed",
@@ -115,18 +119,18 @@ class TestHostTraceOutputReference(TestCase):
             torch.full_like(build_destination, 0.25),
         )
         tape = _host_trace.trace(operation, build_args, warm_up=False)
-        interim = _host_trace.build(tape, operation, build_args)
+        runtime = HostTraceReplay(operation, build_args, tape=tape, max_variants=1)
         held = []
         for offset in (1, 5):
             backing = torch.arange(64 + offset, device=device, dtype=torch.float32)
             destination = backing[offset:].view(8, 8)
             increment = torch.full_like(destination, 0.25)
             owned = destination + increment
-            actual = interim.replay(("fixed", destination, increment))
+            actual = runtime("fixed", destination, increment)
             self.assertEqual(destination, owned.t())
             self.check_outputs(kind, actual, destination, owned)
             held.append((actual, destination, owned))
-        del interim
+        runtime.close()
         for actual, destination, owned in held:
             self.check_outputs(kind, actual, destination, owned)
 

@@ -4,7 +4,7 @@ import json
 import unittest
 
 from host_trace_h2d_probe import probe
-from host_trace_testing import HostTraceTestCase
+from host_trace_testing import build, HostTraceTestCase, wait_for_h2d
 
 import torch
 from torch.testing._internal.common_utils import run_tests, skipIfRocm
@@ -89,10 +89,10 @@ class TestCudaHostTraceH2D(HostTraceTestCase):
         ]
         tape, variant, served, missed = self._roundtrip(grouped, base, news)
         self.assertEqual(len(served), 4, missed)
-        # every replay moved the tables (ring slot) and the output: the copies
-        # were re-pointed, the launch's image changed
-        self.assertGreater(variant.exec.dirty_memcpy_nodes, 0)
-        self.assertGreater(variant.exec.dirty_nodes, 0)
+        if variant.native is not None:
+            # every replay moved the tables (staging slot) and the output: the
+            # copies were re-pointed
+            self.assertGreater(variant.native.memcpy_stats[0], 0)
 
     def test_back_to_back_replays_without_a_host_sync(self):
         # two calls in a row, no synchronize in between: the second must not
@@ -100,7 +100,7 @@ class TestCudaHostTraceH2D(HostTraceTestCase):
         base = _groups([4096, 4096, 4096])
         for depth in (1, 2):
             tape = ht.trace(grouped, base)
-            variant = ht.build(tape, grouped, base, staging_depth=depth)
+            variant = build(tape, grouped, base, staging_depth=depth)
             xs = [_groups([4096, 4096, 4096]) for _ in range(6)]
             outs = [variant.replay(x)[0] for x in xs]
             torch.cuda.synchronize()
@@ -117,7 +117,7 @@ class TestCudaHostTraceH2D(HostTraceTestCase):
         self.assertEqual(parsed["inputs"][1]["device"], "cpu")
         self.assertTrue(parsed["inputs"][1]["pinned"])
         self.assertEqual(parsed["inputs"][0]["device"], "cuda")
-        variant = ht.build(tape, gather, base)
+        variant = build(tape, gather, base)
         for n in (32, 1, 8, 200):
             ids = self._ids(n)
             self.assertTrue(
@@ -127,7 +127,7 @@ class TestCudaHostTraceH2D(HostTraceTestCase):
     def test_a_copy_on_write_table_stays_lazy(self):
         # the kernel-read table is an input through the const accessor: a lazy
         # clone stays copy-on-write through an ordinary gather, the trace's
-        # warm-up and the build; the gather's output goes through the mutable form.
+        # warm-up and a replay; the gather's output goes through the mutable form.
         table = self._table()
         lazy = torch._lazy_clone(table)
         self.assertTrue(torch._C._is_cow_tensor(lazy))
@@ -137,7 +137,7 @@ class TestCudaHostTraceH2D(HostTraceTestCase):
         self.assertTrue(torch._C._is_cow_tensor(lazy))
         base = (lazy, ids)
         tape = ht.trace(gather, base)
-        variant = ht.build(tape, gather, base)
+        variant = build(tape, gather, base)
         self.assertTrue(torch._C._is_cow_tensor(lazy))
         self.assertTrue(torch.equal(variant.replay(base)[0], want))
         self.assertTrue(torch._C._is_cow_tensor(lazy))
@@ -148,14 +148,15 @@ class TestCudaHostTraceH2D(HostTraceTestCase):
         table = self._table()
         ids = self._ids(64)
         tape = ht.trace(gather, (table, ids))
-        variant = ht.build(tape, gather, (table, ids))
+        variant = build(tape, gather, (table, ids))
         for _ in range(5):
             variant.wait_for_h2d()
             new = torch.randint(0, self.V, (64,), dtype=torch.int64)
             ids.copy_(new)
             out = variant.replay((table, ids))[0]
             self.assertTrue(torch.equal(out, table[new.cuda()]))
-        self.assertEqual(variant.source_rebinds, 0)
+        if variant.native is not None:
+            self.assertEqual(variant.native.memcpy_stats[1], 0)
 
     def test_fresh_pinned_input_per_call_rebinds_the_source_once(self):
         # pattern (b): a new pinned buffer every call; one source rebind per
@@ -163,7 +164,7 @@ class TestCudaHostTraceH2D(HostTraceTestCase):
         table = self._table()
         base = (table, self._ids(64))
         tape = ht.trace(gather, base)
-        variant = ht.build(tape, gather, base)
+        variant = build(tape, gather, base)
         previous = None
         for step in range(5):
             ids = self._ids(64)
@@ -173,7 +174,8 @@ class TestCudaHostTraceH2D(HostTraceTestCase):
                 variant.wait_for_h2d()
                 previous.fill_(self.V - 1)  # the old buffer: must not matter
             self.assertTrue(torch.equal(out, want))
-            self.assertEqual(variant.source_rebinds, step + 1)
+            if variant.native is not None:
+                self.assertEqual(variant.native.memcpy_stats[1], step + 1)
             previous = ids
 
     def test_pageable_source_declines_at_the_trace_and_misses_at_replay(self):
@@ -182,17 +184,19 @@ class TestCudaHostTraceH2D(HostTraceTestCase):
             ht.trace(gather, (table, self._ids(16, pinned=False)))
         base = (table, self._ids(16))
         tape = ht.trace(gather, base)
-        variant = ht.build(tape, gather, base)
+        variant = build(tape, gather, base)
         before = (
-            variant.exec.dirty_memcpy_nodes,
-            variant.exec.dirty_nodes,
+            variant.native.memcpy_stats if variant.native is not None else None,
             variant.calls,
         )
         with self.assertRaisesRegex(ht.Miss, "pageable"):
             variant.replay((table, self._ids(16, pinned=False)))
         # the miss came before any node was touched
         self.assertEqual(
-            (variant.exec.dirty_memcpy_nodes, variant.exec.dirty_nodes, variant.calls),
+            (
+                variant.native.memcpy_stats if variant.native is not None else None,
+                variant.calls,
+            ),
             before,
         )
         with self.assertRaisesRegex(ht.Miss, "pinned CPU tensor"):
@@ -216,8 +220,8 @@ class TestCudaHostTraceH2D(HostTraceTestCase):
 
     def test_two_variants_interleaved_keep_their_own_staging(self):
         base1, base2 = _groups([128, 256]), _groups([1024, 8])
-        v1 = ht.build(ht.trace(grouped, base1), grouped, base1)
-        v2 = ht.build(ht.trace(grouped, base2), grouped, base2)
+        v1 = build(ht.trace(grouped, base1), grouped, base1)
+        v2 = build(ht.trace(grouped, base2), grouped, base2)
         xs1 = [_groups([128, 256]) for _ in range(4)]
         xs2 = [_groups([1024, 8]) for _ in range(4)]
         outs = []
@@ -241,7 +245,7 @@ class TestCudaHostTraceH2D(HostTraceTestCase):
         copy_count = probe().copy_count
         base = (torch.randn(2, 8, device="cuda"),)
         tape = ht.trace(copy_count, base)
-        variant = ht.build(tape, copy_count, base)
+        variant = build(tape, copy_count, base)
         for n in (3, 4, 2):
             got = variant.replay((torch.randn(n, 8, device="cuda"),))[0]
             self.assertEqual(got.item(), n * 100 + n - 1)
@@ -265,18 +269,20 @@ class TestCudaHostTraceH2D(HostTraceTestCase):
         # takes the buffer itself
         table = self._table()
         ids = self._ids(64)
-        v1 = ht.build(ht.trace(gather, (table, ids)), gather, (table, ids))
-        v2 = ht.build(ht.trace(gather, (table, ids)), gather, (table, ids))
+        v1 = build(ht.trace(gather, (table, ids)), gather, (table, ids))
+        v2 = build(ht.trace(gather, (table, ids)), gather, (table, ids))
         o1 = v1.replay((table, ids))[0]
         o2 = v2.replay((table, ids))[0]
         v1.wait_for_h2d()
-        self.assertTrue(v2._last_event.query())
+        if v2._last_event is not None:
+            self.assertTrue(v2._last_event.query())
         want = table[ids.cuda()]
         self.assertTrue(torch.equal(o1, want) and torch.equal(o2, want))
         o1 = v1.replay((table, ids))[0]
         o2 = v2.replay((table, ids))[0]
-        ht.wait_for_h2d(ids)
-        self.assertTrue(v1._last_event.query() and v2._last_event.query())
+        wait_for_h2d(ids)
+        if v1._last_event is not None:
+            self.assertTrue(v1._last_event.query() and v2._last_event.query())
         ids.copy_(torch.randint(0, self.V, (64,), dtype=torch.int64))
         torch.cuda.synchronize()
         self.assertTrue(torch.equal(o1, want) and torch.equal(o2, want))
@@ -308,7 +314,8 @@ class TestCudaHostTraceH2D(HostTraceTestCase):
     def test_repeated_copies_of_one_table_are_one_image_each(self):
         # one table copied unchanged into two buffers: the tape holds the
         # table once per copy, each image right before its own copy in host
-        # order and read by that copy alone
+        # order and read by that copy alone (a replay stages each image into
+        # slots of its own)
         copy_twice = probe().copy_twice
         base = (torch.randn(3, 8, device="cuda"),)
         tape = ht.trace(copy_twice, base)
@@ -322,8 +329,7 @@ class TestCudaHostTraceH2D(HostTraceTestCase):
         self.assertLess(images[0]["seq"], copies[0]["seq"])
         self.assertLess(copies[0]["seq"], images[1]["seq"])
         self.assertLess(images[1]["seq"], copies[1]["seq"])
-        variant = ht.build(tape, copy_twice, base)
-        self.assertEqual(len(variant._rings), 2)
+        variant = build(tape, copy_twice, base)
         for n in (3, 1, 7):
             x = torch.randn(n, 8, device="cuda")
             want = torch.tensor([n * 100 + i for i in range(4)] * 2, device="cuda")
@@ -340,7 +346,7 @@ class TestCudaHostTraceH2D(HostTraceTestCase):
         first, second = json.loads(tape.to_json())["host_buffers"]
         self.assertEqual((len(first["elements"]), len(second["elements"])), (1, 2))
         self.assertNotEqual(first["elements"][0]["expr"], second["elements"][0]["expr"])
-        variant = ht.build(tape, fn, base)
+        variant = build(tape, fn, base)
         for n in (2, 5, 1):
             x = torch.randn(n, 8, device="cuda")
             want = torch.tensor([n * 100, n * 200, n * 300], device="cuda")
@@ -371,19 +377,6 @@ class TestCudaHostTraceH2D(HostTraceTestCase):
             ht.trace(lambda y: copy_on(y, False), (x,))
         self.assertFalse(C._host_trace_tracing())
 
-    def test_staging_slots_are_recorded_on_the_replay_stream(self):
-        base = _groups([64, 64])
-        variant = ht.build(ht.trace(grouped, base), grouped, base)
-        variant.replay(_groups([64, 64]))
-        stream = torch.cuda.current_stream().cuda_stream
-        for k, ring in enumerate(variant._rings):
-            slot = ring[variant._ring_used[k]]
-            # a caching-host-allocator block: the allocator defers its reuse
-            self.assertTrue(C._host_trace_record_host_event(slot, stream))
-        torch.cuda.synchronize()
-
-    # ---- device-to-device copies (copy_d2d): clone and the contiguous copy_
-
     def test_clone_is_a_memcpy_record(self):
         x = torch.randn(64, 256, device="cuda")
 
@@ -401,9 +394,7 @@ class TestCudaHostTraceH2D(HostTraceTestCase):
         self.assertIn(parsed["inputs"][0]["root"], m["src"])
         self.assertIn(parsed["allocations"][0]["root"], m["dst"])
         self.assertIsInstance(m["bytes"], str)
-        variant = ht.build(tape, clone, (x,))
-        self.assertEqual(variant.exec.num_memcpy_nodes, 1)
-        self.assertEqual(variant.exec.num_nodes, 0)
+        variant = build(tape, clone, (x,))
         for t in (
             x,
             torch.randn(64, 256, device="cuda"),
@@ -413,10 +404,11 @@ class TestCudaHostTraceH2D(HostTraceTestCase):
             (got,) = variant.replay((t,))
             self.assertTrue(torch.equal(got, t))
             self.assertNotEqual(got.data_ptr(), t.data_ptr())
-        self.assertGreater(variant.exec.dirty_memcpy_nodes, 0)
-        # a device-to-device copy holds no host source: no event bookkeeping
-        self.assertFalse(variant._host_copies)
-        self.assertEqual(len(variant._held), 0)
+        if variant.native is not None:
+            # the one memcpy node, re-pointed per call; a device-to-device copy
+            # holds no host source (no pinned input to hold)
+            self.assertGreater(variant.native.memcpy_stats[0], 0)
+            self.assertEqual(variant.native.pinned_positions, ())
         # the ordinary path of the sibling is the same memcpy
         y = torch.empty_like(x)
         C._host_trace_ti_copy_(y, x)
@@ -459,7 +451,7 @@ class TestCudaHostTraceH2D(HostTraceTestCase):
                 self.assertEqual(
                     (tape.num_launches, tape.num_memcpys), (launches, memcpys)
                 )
-                variant = ht.build(tape, fn, base)
+                variant = build(tape, fn, base)
                 for new in (args(48, 96), args(7, 130), args(200, 16)):
                     t, o = new
                     want = fn(t.clone(), o.clone())
@@ -477,7 +469,7 @@ class TestCudaHostTraceH2D(HostTraceTestCase):
     def test_memcpy_records_declare_their_kind(self):
         # the record says which copy it is (declared, not derived from its
         # addresses): the recording site sets kind, the JSON carries it, and
-        # the build pairs the record with a memcpy node of that kind
+        # a replay issues a memcpy node of that kind
         table = self._table()
         tape = ht.trace(gather, (table, self._ids(32)))
         self.assertEqual([m["kind"] for m in tape.memcpys], ["h2d"])
@@ -490,8 +482,9 @@ class TestCudaHostTraceH2D(HostTraceTestCase):
         tape = ht.trace(clone, (table,))
         (m,) = json.loads(tape.to_json())["memcpys"]
         self.assertEqual(m["kind"], "d2d")
-        variant = ht.build(tape, clone, (table,))
-        self.assertEqual(variant.exec.memcpy_kind(0), "d2d")
+        variant = build(tape, clone, (table,))
+        if variant.native is not None:
+            self.assertEqual(variant.lowered.memcpy_kinds, ("d2d",))
 
     def test_d2d_memcpy_between_overlapping_views_declines_and_is_guarded(self):
         # copy_device_to_device's memcpy branch sits behind the iterator's
@@ -542,7 +535,7 @@ class TestCudaHostTraceH2D(HostTraceTestCase):
             base = separate()
             tape = ht.trace(copy_, base)
             self.assertEqual((tape.num_launches, tape.num_memcpys), (0, 1))
-            variant = ht.build(tape, copy_, base)
+            variant = build(tape, copy_, base)
             for new in (separate(), separate()):
                 a, b = new
                 (got,) = variant.replay(new)

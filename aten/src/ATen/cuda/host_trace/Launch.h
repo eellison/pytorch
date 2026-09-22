@@ -193,7 +193,7 @@ void put_arg(K& dst, const A& a, size_t off, std::vector<FieldRec>* rec, const c
 template <class K>
 struct Slot {
   // zeroed: a plain struct's padding and empty members are never written by
-  // its copy, and the image must be the same bytes at the trace and the build
+  // its copy, and the image must be the same bytes at the trace and a replay
   alignas(K) std::array<unsigned char, sizeof(K)> bytes{};
   K& ref() { return *reinterpret_cast<K*>(bytes.data()); }
 };

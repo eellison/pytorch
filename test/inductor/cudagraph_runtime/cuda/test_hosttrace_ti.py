@@ -310,16 +310,14 @@ class TestHostTraceTI(TestCase):
         self._check(replay, (x, x[:1]), torch.add)
         self.assertEqual(replay.misses, 2)
 
-    def test_agrees_with_the_interim_replay(self):
-        from torch.cuda import _host_trace
+    def test_agrees_with_eager_at_other_shapes(self):
+        from torch.testing._internal.host_trace_oracle import Oracle
 
-        base = _pair(64, 4096)
-        replay = self._replay(torch.add, base)
-        interim = _host_trace.build(replay.tape, torch.add, base)
+        oracle = Oracle(torch.add, _pair(64, 4096))
+        self.addCleanup(oracle.close)
+        self.assertIsNone(oracle.refused)
         for args in (_pair(48, 4096), _pair(7, 1000), _pair(3, 8)):
-            native = replay(*args)
-            ours = interim.replay(args)[0]
-            self.assertEqual(native, ours, atol=0, rtol=0)
+            oracle.check(args)
 
 
 def _walk(expr):

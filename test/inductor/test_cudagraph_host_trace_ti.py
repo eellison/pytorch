@@ -185,16 +185,19 @@ class TestCudaHostTraceTIReplay(TestCase):
         self.assertEqual(len(replay.variants), 3)
 
     @parametrize("shape", ((48, 4096), (7, 1000), (3, 8)))
-    def test_agrees_with_interim_replay(self, device, shape):
-        from torch.cuda import _host_trace
+    def test_agrees_with_eager(self, device, shape):
+        # eager on copies of the arguments is the reference (the oracle);
+        # the entry's own output beside it
+        from torch.testing._internal.host_trace_oracle import Oracle
 
         original = self._pair(device, (64, 4096))
         replay = self._start(torch.add, original)
-        tape = replay.variants[0].program.tape
-        interim = _host_trace.build(tape, torch.add, original)
+        oracle = Oracle(torch.add, original, tape=replay.variants[0].program.tape)
+        self.addCleanup(oracle.close)
         args = self._pair(device, shape)
         actual = self._check(replay, args)
-        self.assertEqual(actual, interim.replay(args)[0], atol=0, rtol=0)
+        (theirs,) = oracle.check(args)
+        self.assertEqual(actual, theirs, atol=0, rtol=0)
         self.assertEqual(len(replay.variants), 1)
 
     @parametrize("next_offset", (4, 8))

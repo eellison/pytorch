@@ -1,7 +1,7 @@
 // Host tracing for CUDA C++ kernels: run a kernel's host code once with
 // symbolic sizes and no data pointers, under a stream capture, and record what
 // it did (launches with every argument as a symbolic value, opaque calls, the
-// generator increment) as a Tape that the Python side turns into a replay.
+// generator increment) as a Tape a consumer prepares its replay from.
 //
 // What a traceable host does differently: size variables are c10::SymInt,
 // addresses are read with sym_const_data_ptr() for inputs and
@@ -29,7 +29,7 @@
 // check sees. The trace is complete with respect to everything the capture
 // sees. The synchronous memory calls are invisible to a stream capture in
 // every mode on CUDA 13.0 (measured: they succeed, run at the trace and at the
-// replay's build, and are absent from the graph), so they are a contract
+// replay, and are absent from the graph), so they are a contract
 // violation, caught by the HOSTTRACE_SYNC_API lint on every translation unit
 // that includes these headers; a host that makes one is already wrong under
 // a plain CUDA graph capture. The other forbidden calls fail inside the
@@ -385,7 +385,7 @@ TORCH_CUDA_CPP_API int64_t rng_increment(const c10::SymInt& v);
 // cudaMemsetAsync(dst, value, nbytes, stream) on a traced allocation (the
 // semaphore reset of a split reduction). Ordinary mode: the call. Trace mode:
 // a MemsetRec on the tape and no call, since the destination has no storage;
-// the replay's build pairs the memset node of its ordinary capture with the
+// a replay issues the memset node of its graph from the
 // record by order and updates it per call.
 TORCH_CUDA_CPP_API void memset_async(
     const c10::SymInt& dst,
@@ -453,7 +453,7 @@ struct FuncInfo {
 };
 TORCH_CUDA_CPP_API const FuncInfo& func_info(const void* host_func);
 
-// Ordinary-mode allocation log for the replay's build and the closed regions'
+// Ordinary-mode allocation log for the closed regions'
 // harvest: (addr, nbytes) of every caching-allocator allocation served from
 // `pool`, the capture's private pool, on `device` between begin and end, in
 // order. The allocator routes an

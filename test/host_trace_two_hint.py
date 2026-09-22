@@ -130,7 +130,7 @@ def alternate_hints(tape: ht.Tape) -> tuple[dict[str, int], list[dict], Verifica
     hints by source name for the second run, the extra assignments the
     comparison evaluates expressions at, and what moved and what could not."""
     env = tape.shape_env
-    prog = ht._Program(tape)
+    prog = ht._Evaluator()
     base = _env_values(env)
     source = {
         str(sym): srcs[0].name for sym, srcs in env.var_to_sources.items() if srcs
@@ -350,7 +350,7 @@ def compare_tapes(
         _env_values(second.shape_env),
         *extra_points,
     ]
-    prog = ht._Program(first)
+    prog = ht._Evaluator()
 
     def text(v: Any) -> str:
         if isinstance(v, ht._SYM_TYPES):

@@ -18,7 +18,7 @@
 // {src, dst, bytes} whose src is that image's root; nothing is issued on the
 // capture stream, since the destination is a storage-less allocation with no
 // address yet. A table copied twice is two images, so each copy keeps its
-// place in host order and its own bytes. The replay's build pairs the memcpy
+// place in host order and its own bytes. A replay pairs the memcpy
 // nodes of ITS capture of the ordinary host with the records by order and
 // checks src, dst and bytes; per call it renders each image into a staging
 // slot and updates a node only when an operand moved. A copy must be issued
@@ -220,16 +220,5 @@ struct HostTable : HostTableBase {
     return Ref{this, i};
   }
 };
-
-// Ordinary-mode log of the table copies a host issued between begin and end,
-// in order: the pinned buffer each copy read and its bytes at that moment.
-// The replay's build checks the bytes against the tape's image and binds the
-// image's hb<k> to the buffer its capture copied from.
-struct HostTableCopyLog {
-  at::Tensor buffer;
-  std::vector<uint8_t> bytes;
-};
-TORCH_CUDA_CPP_API void host_table_log_begin();
-TORCH_CUDA_CPP_API std::vector<HostTableCopyLog> host_table_log_end();
 
 } // namespace at::cuda::host_trace

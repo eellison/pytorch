@@ -94,18 +94,15 @@ class TestHostTraceReduce(TestCase):
         self._check(replay, (_x(4, 64, 4096),), fn)
         self.assertEqual(replay.misses, 2)
 
-    def test_agrees_with_the_interim_replay(self):
-        from torch.cuda import _host_trace
+    def test_agrees_with_eager_at_other_shapes(self):
+        from torch.testing._internal.host_trace_oracle import Oracle
 
         fn = lambda t: torch.sum(t, -1)  # noqa: E731
-        base = (_x(64, 4096),)
-        replay = self._replay(fn, base)
-        interim = _host_trace.build(replay.tape, fn, base)
+        oracle = Oracle(fn, (_x(64, 4096),))
+        self.addCleanup(oracle.close)
+        self.assertIsNone(oracle.refused)
         for M, N in ((32, 4096), (48, 3000), (16, 4096)):
-            args = (_x(M, N),)
-            native = replay(*args)
-            ours = interim.replay(args)[0]
-            self.assertEqual(native, ours, atol=0, rtol=0)
+            oracle.check((_x(M, N),))
 
 
 if __name__ == "__main__":

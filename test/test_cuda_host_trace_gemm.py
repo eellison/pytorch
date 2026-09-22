@@ -8,7 +8,13 @@ import time
 import unittest
 from unittest import mock
 
-from host_trace_testing import HostTraceTestCase
+from host_trace_testing import (
+    build,
+    exec_node_states,
+    HostTraceTestCase,
+    needs_native_replay,
+    replay_backend,
+)
 
 import torch
 import torch.nn.functional as F
@@ -33,6 +39,46 @@ def linear(x, w, b):
 
 def linear_nobias(x, w):
     return F.linear(x, w)
+
+
+def _align_class(address):
+    # the largest power of two dividing the address, capped: cuBLAS picks
+    # kernels by operand alignment (16..256 bytes matter)
+    return min(address & -address, 256) if address else 256
+
+
+def _harvest_spec(tape, k, args):
+    """The template key and harvest spec of region k of `tape` at `args`, as a
+    replay computes them (the harvest's own contract, `_template`): the op and
+    its scalars, every operand's dtype, sizes, strides and alignment class at
+    the call (the out operand is an allocation: 256), the device class and the
+    BLAS settings."""
+    r = tape.regions[k]
+    ev = ht._Evaluator()
+    device = tape.device.index
+    env = ht._bind_inputs(tape, ht._input_names(tape.inputs), args, device)
+    metas, aligns = [], []
+    for o in (*r.inputs, r.out):
+        metas.append(
+            (
+                o.dtype,
+                tuple(int(ev.ev(v, env)) for v in o.sizes),
+                tuple(int(ev.ev(v, env)) for v in o.strides),
+            )
+        )
+        aligns.append(256 if o is r.out else _align_class(int(ev.ev(o.address, env))))
+    metas, aligns = tuple(metas), tuple(aligns)
+    settings = ht._blas_settings()
+    key = (device, tape.device_identity, r.op, r.scalars, metas, aligns, settings)
+    return key, (r.op, r.scalars, metas, aligns)
+
+
+def _harvest(tape, args, k=0):
+    """The harvested template of region k of `tape` at `args` (from the
+    process-wide cache when the key was harvested before), or the harvest's
+    Miss by name."""
+    key, spec = _harvest_spec(tape, k, args)
+    return ht._template(key, spec, tape.device.index)
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "CUDA not available")
@@ -78,7 +124,7 @@ class TestCudaHostTraceGemm(HostTraceTestCase):
         else:
             if tape is None or not rebuild:
                 return False
-            v = ht.build(tape, fn, args)
+            v = build(tape, fn, args)
             variants.append(v)
             got = v.replay(args)
         self.last_served = v
@@ -88,43 +134,45 @@ class TestCudaHostTraceGemm(HostTraceTestCase):
     def _variants(self, variant):
         return self._pool.get(id(variant), [variant])
 
+    def _topology(self, variant):
+        # per region of a variant, the chain its graph holds as (node kind,
+        # programmatic edge) per node (the native replay's; the eager form
+        # holds no graph)
+        if variant.native is None:
+            return None
+        return [
+            tuple(zip(s["kinds"], s["programmatic"]))
+            for s in variant.native.region_stats()["sites"]
+        ]
+
+    def _graph_updates(self, variant):
+        return variant.native.region_stats()["graph_updates"]
+
     def _served_kinds(self, variant, fn, args, what):
         # serves the call and returns the variant that served it with the
-        # node kinds of the template the call selected, read from the
-        # template cache (the entry whose hit count the call raised)
+        # node kinds of the template it holds; the template cache is consulted
+        # when the call's template differs from the one bound (a swap in the
+        # chain's class, or the class miss that builds a variant): every entry
+        # the call raised then names the served chain
         before = {t["key"]: t["hits"] for t in ht.gemm_templates()}
         self.assertTrue(self._check(variant, fn, args, what), what)
-        hit = [t for t in ht.gemm_templates() if t["hits"] > before.get(t["key"], 0)]
-        self.assertEqual(len(hit), 1, what)
-        return self.last_served, hit[0]["kinds"]
+        hit = {
+            tuple(t["kinds"])
+            for t in ht.gemm_templates()
+            if t["hits"] > before.get(t["key"], 0)
+        }
+        kinds = self._kinds(self.last_served)
+        self.assertLessEqual(hit, {tuple(kinds)}, what)
+        return self.last_served, kinds
 
     def _graph_nodes(self, variant):
         # what the driver says the variant's graph holds: (kind, enabled in
         # the exec) per node in creation order
         try:
-            from cuda.bindings import runtime as cudart
+            import cuda.bindings  # noqa: F401
         except ImportError:
             self.skipTest("cuda-python (cuda.bindings) is not installed")
-        check = torch.cuda._utils._check_cuda_bindings
-        types = cudart.cudaGraphNodeType
-        names = {
-            types.cudaGraphNodeTypeKernel: "kernel",
-            types.cudaGraphNodeTypeMemset: "memset",
-            types.cudaGraphNodeTypeMemcpy: "memcpy",
-        }
-        graph = variant.graph.raw_cuda_graph()
-        exec_ = variant.graph.raw_cuda_graph_exec()
-        _, count = check(cudart.cudaGraphGetNodes(graph, 0))
-        nodes, count = check(cudart.cudaGraphGetNodes(graph, count))
-        e = variant.exec
-        self.assertEqual(count, e.num_nodes + e.num_memset_nodes + e.num_memcpy_nodes)
-        return [
-            (
-                names.get(check(cudart.cudaGraphNodeGetType(n)), "other"),
-                check(cudart.cudaGraphNodeGetEnabled(exec_, n)),
-            )
-            for n in nodes
-        ]
+        return [(kind, on) for _, kind, on in exec_node_states(variant.graph)]
 
     def test_linear_traces_as_a_closed_region(self):
         x = self._x(4)
@@ -137,15 +185,15 @@ class TestCudaHostTraceGemm(HostTraceTestCase):
         # every input dimension is a symbol on the tape; M and N differ
         self.assertIsInstance(r["out"]["sizes"][0], str)
         self.assertNotEqual(r["out"]["sizes"][0], r["out"]["sizes"][1])
-        variant = ht.build(tape, linear, (x, self.w, self.b))
+        variant = build(tape, linear, (x, self.w, self.b))
         self.assertTrue(self._check(variant, linear, (self._x(4), self.w, self.b)))
-        stats = variant.region_stats()
-        self.assertEqual(len(stats["sites"]), 1)
+        if variant.native is not None:
+            self.assertEqual(len(variant.native.region_stats()["sites"]), 1)
 
     def test_bitwise_m_sweep_crosses_variant_boundaries(self):
         x = self._x(4)
         tape = ht.trace(linear, (x, self.w, self.b))
-        variant = ht.build(tape, linear, (x, self.w, self.b))
+        variant = build(tape, linear, (x, self.w, self.b))
         before = len(self._templates_for())
         served, missed = [], []
         for m in range(1, 65):
@@ -158,43 +206,47 @@ class TestCudaHostTraceGemm(HostTraceTestCase):
             (served if ok else missed).append(m)
         self.assertEqual(missed, [], missed)
         self.assertEqual(served, list(range(1, 65)))
+        if variant.native is None:
+            return  # the eager form selects no template: one variant serves
         used = len(self._templates_for()) - before
-        # one exec per node chain the sweep selected (split-K at small M
-        # adds the reduce kernel), each chain held by exactly one exec
+        # one variant per node chain the sweep selected (split-K at small M
+        # adds the reduce kernel; a chain row is the kind and the programmatic
+        # edge), each chain held by exactly one graph
         variants = self._variants(variant)
-        chains = [v.topology[0] for v in variants]
+        chains = [self._topology(v)[0] for v in variants]
         self.assertEqual(len(set(chains)), len(chains), chains)
         self.assertGreaterEqual(len(variants), 2, chains)
         print(
-            f"\n[gemm M sweep 1..64] templates used {used + 1} execs {len(variants)} chains {chains} applies {[v.region_stats()['applies'] for v in variants]}"
+            f"\n[gemm M sweep 1..64] templates used {used + 1} variants {len(variants)} chains {chains} applies {[v.native.region_stats()['applies'] for v in variants]}"
         )
         # GEMM_FACTS: 5-8 variants over M = 1..128 at this shape
         self.assertGreaterEqual(used + 1, 3)
 
-    def test_split_k_boundary_builds_a_second_exec_from_the_same_tape(self):
+    @needs_native_replay
+    def test_split_k_boundary_builds_a_second_variant_from_the_same_tape(self):
         # M = 8 runs as two nodes (nvjet + splitKreduce), M = 12 as one. A
         # variant holds exactly the chain of the shape it was built at; the
         # other M is a TopologyMiss carrying the tape, and the tape built at
         # that M (no trace; the miss harvested the template, the build finds
         # it) is a second variant with the other chain. Each serves its
-        # class bitwise; neither exec holds a node the other's chain needs.
+        # class bitwise; neither graph holds a node the other's chain needs.
         for m_trace, m_other in ((12, 8), (8, 12), (12, 4), (4, 24)):
             x = self._x(m_trace)
             tape = ht.trace(linear, (x, self.w, self.b))
-            first = ht.build(tape, linear, (x, self.w, self.b))
+            first = build(tape, linear, (x, self.w, self.b))
             other = (self._x(m_other), self.w, self.b)
             with self.assertRaisesRegex(ht.TopologyMiss, "graph holds") as cm:
                 first.replay(other)
             self.assertIs(cm.exception.tape, tape)
             h0 = ht.gemm_harvests()
-            second = ht.build(cm.exception.tape, linear, other)
+            second = build(cm.exception.tape, linear, other)
             self.assertEqual(ht.gemm_harvests(), h0)
-            self.assertIsNot(second.exec, first.exec)
-            chains = (first.topology[0], second.topology[0])
+            self.assertNotEqual(second.graph, first.graph)
+            chains = (self._topology(first)[0], self._topology(second)[0])
             self.assertEqual(sorted(len(c) for c in chains), [1, 2], chains)
             for v in (first, second):
-                nodes = v.region_stats()["sites"][0]["nodes"]
-                self.assertEqual(len(nodes), len(v.topology[0]), nodes)
+                (site,) = v.native.region_stats()["sites"]
+                self.assertEqual(site["nodes"], len(self._topology(v)[0]), site)
             for m in (m_other, m_trace, m_other, m_other, m_trace):
                 serving, idle = (second, first) if m == m_other else (first, second)
                 args, what = (self._x(m), self.w, self.b), f"{m_trace}->{m}"
@@ -203,9 +255,10 @@ class TestCudaHostTraceGemm(HostTraceTestCase):
                 self.assertIn("graph holds", self.last_miss)
             print(
                 f"\n[split-K] traced M={m_trace}: chains {chains} applies "
-                f"{[v.region_stats()['applies'] for v in (first, second)]}"
+                f"{[v.native.region_stats()['applies'] for v in (first, second)]}"
             )
 
+    @needs_native_replay
     def test_cluster_change_goes_through_the_graph(self):
         # 4096 -> 11008: the M = 12 variant launches with an 8x1x1 cluster,
         # the M = 24 variant with 4x1x1 (SUPERSET.md); the exec-level
@@ -213,16 +266,16 @@ class TestCudaHostTraceGemm(HostTraceTestCase):
         w = torch.randn(11008, K, device="cuda", dtype=DTYPE) / K**0.5
         b = torch.randn(11008, device="cuda", dtype=DTYPE)
         # node and cuGraphExecUpdate, and stays bitwise. M = 8 and 16 split
-        # K (two nodes), 12, 24 and 32 do not: two execs, and the cluster
-        # change 8 -> 4 happens inside the one-node exec (12 -> 24)
+        # K (two nodes), 12, 24 and 32 do not: two variants, and the cluster
+        # change 8 -> 4 happens inside the one-node variant (12 -> 24)
         x = self._x(8)
-        variant = ht.build(ht.trace(linear, (x, w, b)), linear, (x, w, b))
+        variant = build(ht.trace(linear, (x, w, b)), linear, (x, w, b))
         seen = []
         for m in (8, 12, 8, 16, 12, 24, 32, 8):
             self.assertTrue(self._check(variant, linear, (self._x(m), w, b), f"M={m}"))
-            seen.append([v.exec.graph_updates for v in self._variants(variant)])
+            seen.append([self._graph_updates(v) for v in self._variants(variant)])
         print(
-            f"\n[cluster change] graph updates per exec after each M in (8,12,8,16,12,24,32,8): {seen}"
+            f"\n[cluster change] graph updates per variant after each M in (8,12,8,16,12,24,32,8): {seen}"
         )
         self.assertEqual(len(seen[-1]), 2, seen)
         self.assertGreater(sum(seen[-1]), 0, seen)
@@ -243,27 +296,27 @@ class TestCudaHostTraceGemm(HostTraceTestCase):
         h0 = ht.gemm_harvests()
         tape = ht.trace(chain, (x, *ws))
         self.assertEqual(tape.num_regions, n_sites)
-        variant = ht.build(tape, chain, (x, *ws))
+        variant = build(tape, chain, (x, *ws))
         # one harvest for the build key, however many sites share the shape
         self.assertLessEqual(ht.gemm_harvests() - h0, 1)
         h1 = ht.gemm_harvests()
         self.assertTrue(self._check(variant, chain, (self._x(16, 1024), *ws)))
         self.assertLessEqual(ht.gemm_harvests() - h1, 1)
         self.assertTrue(self._check(variant, chain, (self._x(4, 1024), *ws)))
-        stats = variant.region_stats()
-        self.assertEqual(len(stats["sites"]), n_sites)
+        if variant.native is not None:
+            self.assertEqual(len(variant.native.region_stats()["sites"]), n_sites)
 
     def test_per_call_cost(self):
         x = self._x(4)
         tape = ht.trace(linear, (x, self.w, self.b))
-        variant = ht.build(tape, linear, (x, self.w, self.b))
+        variant = build(tape, linear, (x, self.w, self.b))
         args = (self._x(4), self.w, self.b)
-        # M = 16 runs as one node where M = 4 splits K: another exec from the
-        # same tape; M = 12 is another kernel of the one-node chain, applied
-        # in place
+        # M = 16 runs as one node where M = 4 splits K: another variant from
+        # the same tape; M = 12 is another kernel of the one-node chain,
+        # applied in place
         other = (self._x(16), self.w, self.b)
         same_chain = (self._x(12), self.w, self.b)
-        v16 = ht.build(tape, linear, other)
+        v16 = build(tape, linear, other)
         for _ in range(5):
             variant.replay(args)
             v16.replay(other)
@@ -296,8 +349,8 @@ class TestCudaHostTraceGemm(HostTraceTestCase):
         apply_ = timed(lambda: v16.replay((other, same_chain)[next(k) % 2]))
         print(
             f"\n[gemm per call CPU us] eager {eager:.1f} replay same {fixed:.1f} "
-            f"pointer rebind {rebind:.1f} exec switch 4<->16 {switch:.1f} "
-            f"kernel switch 16<->12 in one exec {apply_:.1f}"
+            f"pointer rebind {rebind:.1f} variant switch 4<->16 {switch:.1f} "
+            f"kernel switch 16<->12 in one variant {apply_:.1f}"
         )
         self.assertGreater(eager, 0)
 
@@ -308,7 +361,7 @@ class TestCudaHostTraceGemm(HostTraceTestCase):
         a, b, c = self._x(4), self._x(K, N), self.b
         tape = ht.trace(f, (a, b, c))
         self.assertEqual(tape.num_regions, 2)
-        variant = ht.build(tape, f, (a, b, c))
+        variant = build(tape, f, (a, b, c))
         for m in (4, 8, 12, 32):
             args = (self._x(m), b, c)
             self.assertTrue(self._check(variant, f, args, f"M={m}"))
@@ -331,7 +384,7 @@ class TestCudaHostTraceGemm(HostTraceTestCase):
         # some cuBLAS images carry host addresses of the harvesting call
         # (stack and heap); the replays must not depend on what is there now
         x = self._x(4)
-        variant = ht.build(
+        variant = build(
             ht.trace(linear, (x, self.w, self.b)), linear, (x, self.w, self.b)
         )
 
@@ -354,7 +407,7 @@ class TestCudaHostTraceGemm(HostTraceTestCase):
         x = torch.randn(2, 3, K, device="cuda", dtype=DTYPE)
         tape = ht.trace(f, (x, w))
         self.assertEqual(tape.num_regions, 1)
-        variant = ht.build(tape, f, (x, w))
+        variant = build(tape, f, (x, w))
         for s in (3, 5, 8):
             xx = torch.randn(2, s, K, device="cuda", dtype=DTYPE)
             self.assertTrue(self._check(variant, f, (xx, w), f"S={s}"))
@@ -362,7 +415,7 @@ class TestCudaHostTraceGemm(HostTraceTestCase):
     def test_dtype_and_layout_changes_miss_by_name(self):
         x = self._x(4)
         tape = ht.trace(linear_nobias, (x, self.w))
-        variant = ht.build(tape, linear_nobias, (x, self.w))
+        variant = build(tape, linear_nobias, (x, self.w))
         with self.assertRaises(ht.Miss):
             variant.replay((x.half(), self.w.half()))
         with self.assertRaises(ht.Miss):
@@ -372,7 +425,8 @@ class TestCudaHostTraceGemm(HostTraceTestCase):
         wt = self.w.t().contiguous().t()
         h0 = ht.gemm_harvests()
         self.assertTrue(self._check(variant, linear_nobias, (self._x(4), wt)))
-        self.assertGreaterEqual(ht.gemm_harvests() - h0, 1)
+        if variant.native is not None:
+            self.assertGreaterEqual(ht.gemm_harvests() - h0, 1)
         self.assertTrue(self._check(variant, linear_nobias, (self._x(8), wt)))
         self.assertTrue(self._check(variant, linear_nobias, (self._x(8), self.w)))
 
@@ -388,7 +442,7 @@ class TestCudaHostTraceGemm(HostTraceTestCase):
         with mock.patch.object(torch._C, "_host_trace_harvest_nodes", probe):
             tape = ht.trace(linear_nobias, (x, w))
             with self.assertRaisesRegex(ht.Miss, "does not report kernel node"):
-                ht.build(tape, linear_nobias, (x, w)).replay((x, w))
+                _harvest(tape, (x, w))
         key = f"{N + 192}"
         misses = [t["miss"] for t in ht.gemm_templates() if key in str(t["key"])]
         self.assertEqual(len(misses), 1)
@@ -398,7 +452,7 @@ class TestCudaHostTraceGemm(HostTraceTestCase):
         w = self.w.float()
         x = self._x(4).float()
         tape = ht.trace(linear_nobias, (x, w))
-        variant = ht.build(tape, linear_nobias, (x, w))
+        variant = build(tape, linear_nobias, (x, w))
         old = torch.backends.cuda.matmul.fp32_precision
         try:
             torch.backends.cuda.matmul.fp32_precision = (
@@ -411,29 +465,38 @@ class TestCudaHostTraceGemm(HostTraceTestCase):
             # descriptors in their parameters: a named miss, never stale
             if not served:
                 self.assertIn("not rebindable", self.last_miss)
-            self.assertGreaterEqual(ht.gemm_harvests() - h0, 1)
+            if variant.native is not None:
+                self.assertGreaterEqual(ht.gemm_harvests() - h0, 1)
             print(f"\n[fp32 after precision flip] served {served}")
         finally:
             torch.backends.cuda.matmul.fp32_precision = old
         self.assertTrue(self._check(variant, linear_nobias, (self._x(4).float(), w)))
 
     def test_replay_on_another_stream(self):
+        # the native replay is bound to the device and stream it was prepared
+        # on (O29): a call on another stream is refused by name, the bound
+        # stream serves again; the eager form serves any current stream
         x = self._x(4)
         tape = ht.trace(linear, (x, self.w, self.b))
-        variant = ht.build(tape, linear, (x, self.w, self.b))
+        variant = build(tape, linear, (x, self.w, self.b))
         s = torch.cuda.Stream()
         with torch.cuda.stream(s):
-            for m in (4, 8, 16):
-                self.assertTrue(
-                    self._check(variant, linear, (self._x(m), self.w, self.b), f"M={m}")
-                )
+            if replay_backend() == "native":
+                with self.assertRaisesRegex(RuntimeError, "bound device and stream"):
+                    variant.replay((self._x(4), self.w, self.b))
+            else:
+                for m in (4, 8, 16):
+                    self.assertTrue(
+                        self._check(
+                            variant, linear, (self._x(m), self.w, self.b), f"M={m}"
+                        )
+                    )
+        self.assertTrue(self._check(variant, linear, (self._x(4), self.w, self.b)))
 
     def test_two_variants_interleaved(self):
         x4, x32 = self._x(4), self._x(32)
-        v4 = ht.build(
-            ht.trace(linear, (x4, self.w, self.b)), linear, (x4, self.w, self.b)
-        )
-        v32 = ht.build(
+        v4 = build(ht.trace(linear, (x4, self.w, self.b)), linear, (x4, self.w, self.b))
+        v32 = build(
             ht.trace(linear, (x32, self.w, self.b)), linear, (x32, self.w, self.b)
         )
         for m in (1, 8, 12, 16, 24, 32, 48, 64):
@@ -461,15 +524,18 @@ class TestCudaHostTraceGemm(HostTraceTestCase):
                     str(int(o["address"], 0)) if o["address"].isdigit() else "", real
                 )
                 self.assertTrue(any(ch.isalpha() for ch in o["address"]), o["address"])
-        variant = ht.build(tape, linear, (x, self.w, self.b))
+        variant = build(tape, linear, (x, self.w, self.b))
         self.assertTrue(self._check(variant, linear, (self._x(8), self.w, self.b)))
 
     def test_gemm_templates_introspection(self):
         x = self._x(4)
-        variant = ht.build(
+        variant = build(
             ht.trace(linear, (x, self.w, self.b)), linear, (x, self.w, self.b)
         )
         variant.replay((self._x(4), self.w, self.b))
+        if variant.native is None:
+            # the eager form harvests nothing: the harvest itself fills the cache
+            _harvest(variant.tape, (x, self.w, self.b))
         entries = ht.gemm_templates()
         self.assertGreaterEqual(len(entries), 1)
         for e in entries:
@@ -508,10 +574,12 @@ class TestCudaHostTraceGemm(HostTraceTestCase):
         return served, refused
 
     def _chains(self, variant, k=0):
-        return [v.topology[k] for v in self._variants(variant)]
+        return [self._topology(v)[k] for v in self._variants(variant)]
 
     def _kinds(self, variant, k=0):
-        return [kind for kind, _i in variant.region_stats()["sites"][k]["nodes"]]
+        # the node kinds of site k (None on the eager form)
+        topology = self._topology(variant)
+        return None if topology is None else [kind for kind, _p in topology[k]]
 
     def _fp32(self, m):
         return torch.randn(m, K, device="cuda", dtype=torch.float32)
@@ -524,7 +592,7 @@ class TestCudaHostTraceGemm(HostTraceTestCase):
         torch.backends.cuda.matmul.fp32_precision = "ieee"
         try:
             w, b, x = self.w.float(), self.b.float(), self._fp32(4)
-            variant = ht.build(ht.trace(linear, (x, w, b)), linear, (x, w, b))
+            variant = build(ht.trace(linear, (x, w, b)), linear, (x, w, b))
             kinds = self._kinds(variant)
             served, refused = self._serve(
                 variant,
@@ -538,16 +606,17 @@ class TestCudaHostTraceGemm(HostTraceTestCase):
         finally:
             torch.backends.cuda.matmul.fp32_precision = old
 
-    def test_fp32_split_at_large_m_is_another_exec(self):
+    def test_fp32_split_at_large_m_is_another_variant(self):
         # F3: the fp32 SIMT path splits K at large M (cutlass simt + reduce)
         # where M = 4 runs one kernel; a tape traced at M = 4 serves 33 and
-        # 64 through a second exec built from it at those inputs
+        # 64 through a second variant built from it at those inputs
         old = torch.backends.cuda.matmul.fp32_precision
         torch.backends.cuda.matmul.fp32_precision = "ieee"
         try:
             w, x = self.w.float(), self._fp32(4)
-            variant = ht.build(ht.trace(linear_nobias, (x, w)), linear_nobias, (x, w))
-            self.assertEqual(self._kinds(variant), ["kernel"])
+            variant = build(ht.trace(linear_nobias, (x, w)), linear_nobias, (x, w))
+            if variant.native is not None:
+                self.assertEqual(self._kinds(variant), ["kernel"])
             served, refused = self._serve(
                 variant,
                 linear_nobias,
@@ -556,21 +625,23 @@ class TestCudaHostTraceGemm(HostTraceTestCase):
                 "fp32 no-bias",
             )
             self.assertEqual(refused, [])
-            chains = self._chains(variant)
-            self.assertEqual(len(chains), 2, chains)
-            self.assertEqual(sorted(len(c) for c in chains), [1, 2], chains)
-            print(f"\n[fp32 split at large M] chains {chains} served {served}")
+            if variant.native is not None:
+                chains = self._chains(variant)
+                self.assertEqual(len(chains), 2, chains)
+                self.assertEqual(sorted(len(c) for c in chains), [1, 2], chains)
+                print(f"\n[fp32 split at large M] chains {chains} served {served}")
         finally:
             torch.backends.cuda.matmul.fp32_precision = old
 
-    def test_exec_holds_exactly_the_served_templates_nodes(self):
-        # an exec holds the nodes of the template its calls select, one for
-        # one: no other node of any kind (no memset parked on a dummy word,
-        # no kernel of another chain) and none disabled, read back from the
-        # driver after kernel changes in place and the topology miss that
-        # made a second exec
+    @needs_native_replay
+    def test_graph_holds_exactly_the_served_templates_nodes(self):
+        # a variant's graph holds the nodes of the template its calls select,
+        # one for one: no other node of any kind (no memset parked on a dummy
+        # word, no kernel of another chain) and none disabled, read back from
+        # the driver after kernel changes in place and the topology miss that
+        # made a second variant
         x = self._x(4)
-        variant = ht.build(
+        variant = build(
             ht.trace(linear, (x, self.w, self.b)), linear, (x, self.w, self.b)
         )
         served = {}
@@ -585,9 +656,10 @@ class TestCudaHostTraceGemm(HostTraceTestCase):
             m, kinds = served[id(v)]
             nodes = self._graph_nodes(v)
             self.assertEqual([k for k, _e in nodes], kinds, f"last served M={m}")
-            self.assertEqual([k for k, _e in nodes], [k for k, _p in v.topology[0]])
-            self.assertEqual([e for _k, e in nodes], [1] * len(nodes), f"M={m}")
+            self.assertEqual([k for k, _e in nodes], self._kinds(v))
+            self.assertEqual([e for _k, e in nodes], [True] * len(nodes), f"M={m}")
 
+    @needs_native_replay
     def test_two_sites_and_a_launch_hold_no_extra_node(self):
         # the same one for one over a tape with two region sites and the
         # tape's own kernel between them: the graph is site, kernel, site
@@ -601,7 +673,7 @@ class TestCudaHostTraceGemm(HostTraceTestCase):
         tape = ht.trace(two, (x, w1, w2))
         self.assertEqual((tape.num_regions, tape.num_launches), (2, 1))
         self.assertEqual((len(tape.memsets), len(tape.memcpys)), (0, 0))
-        variant = ht.build(tape, two, (x, w1, w2))
+        variant = build(tape, two, (x, w1, w2))
         for m in (4, 16, 64, 4):
             args = (self._x(m, 1024), w1, w2)
             v, kinds = self._served_kinds(variant, two, args, f"M={m}")
@@ -609,7 +681,7 @@ class TestCudaHostTraceGemm(HostTraceTestCase):
             self.assertEqual(
                 [k for k, _e in nodes], kinds + ["kernel"] + kinds, f"M={m}"
             )
-            self.assertEqual([e for _k, e in nodes], [1] * len(nodes), f"M={m}")
+            self.assertEqual([e for _k, e in nodes], [True] * len(nodes), f"M={m}")
 
     def test_odd_and_narrow_shapes(self):
         # F2: N or K = 4097 runs cutlass 2.x behind a semaphore memset; the
@@ -618,7 +690,7 @@ class TestCudaHostTraceGemm(HostTraceTestCase):
             w = torch.randn(n, k, device="cuda", dtype=DTYPE) / k**0.5
             b = torch.randn(n, device="cuda", dtype=DTYPE)
             x = self._x(8, k)
-            variant = ht.build(ht.trace(linear, (x, w, b)), linear, (x, w, b))
+            variant = build(ht.trace(linear, (x, w, b)), linear, (x, w, b))
             kinds = self._kinds(variant)
             served, refused = self._serve(
                 variant,
@@ -639,7 +711,7 @@ class TestCudaHostTraceGemm(HostTraceTestCase):
 
         x = args(8)[0]
         self.assertEqual(x.storage_offset(), 4)
-        variant = ht.build(
+        variant = build(
             ht.trace(linear, (x, self.w, self.b)), linear, (x, self.w, self.b)
         )
         served, refused = self._serve(
@@ -665,7 +737,7 @@ class TestCudaHostTraceGemm(HostTraceTestCase):
         for name, x_of in (("strided", strided), ("expanded", expanded)):
             x = x_of(8)
             try:
-                variant = ht.build(
+                variant = build(
                     ht.trace(linear, (x, self.w, self.b)), linear, (x, self.w, self.b)
                 )
             except ht.Declined as e:
@@ -698,25 +770,23 @@ class TestCudaHostTraceGemm(HostTraceTestCase):
                 self.last_miss,
             )
 
-    def test_arena_shared_across_sites_and_variants(self):
-        # F4: one arena per replay stream; the two sites of a variant and two
-        # variants replayed on one stream share its workspace and scratch,
-        # split-K partials of both sites included
+    def test_two_sites_and_two_variants_interleaved_on_one_stream(self):
+        # F4: the two sites of a variant and two variants replayed on one
+        # stream, interleaved over the split-K boundary (the scratch the
+        # regions' nodes get at replay is the replay's arena: the native
+        # replay's is shared per family, test_hosttrace_arena.py)
         def two(x, w1, b1, w2, b2):
             return F.linear(F.linear(x, w1, b1), w2, b2)
 
         w2 = torch.randn(N, K, device="cuda", dtype=DTYPE) / K**0.5
         b2 = torch.randn(N, device="cuda", dtype=DTYPE)
         x = self._x(8)
-        variant = ht.build(
+        variant = build(
             ht.trace(two, (x, self.w, self.b, w2, b2)), two, (x, self.w, self.b, w2, b2)
         )
-        allocated = torch.cuda.memory_allocated()
-        variant2 = ht.build(
+        variant2 = build(
             ht.trace(linear, (x, self.w, self.b)), linear, (x, self.w, self.b)
         )
-        # the second variant owns no workspace: its graph pool holds the output
-        self.assertLess(torch.cuda.memory_allocated() - allocated, 8 << 20)
         for m in (8, 1, 4, 12, 64, 8, 1):
             self.assertTrue(
                 self._check(
@@ -733,18 +803,8 @@ class TestCudaHostTraceGemm(HostTraceTestCase):
                 ),
                 self.last_miss,
             )
-        # one arena for this stream (the builds' own aside), none per variant
-        stream = torch.cuda.current_stream().cuda_stream
-        arena = ht._arena(x.device.index, stream)
-        self.assertEqual(
-            [k for k in ht._arenas if k[0] == x.device.index and k[1] is not None],
-            [(x.device.index, stream)],
-        )
-        self.assertTrue(arena.bufs)
-        ws = arena.ws.numel() >> 20 if arena.ws is not None else None
-        print(
-            f"\n[arena] sites {[self._kinds(variant, k) for k in range(2)]} workspace {ws} MiB scratch {[b.numel() for b in arena.bufs]}"
-        )
+        if variant.native is not None:
+            print(f"\n[two sites] sites {[self._kinds(variant, k) for k in range(2)]}")
 
     # ---- batched GEMMs (aten.bmm) as closed regions
 
@@ -781,18 +841,22 @@ class TestCudaHostTraceGemm(HostTraceTestCase):
         # harvest streams' workspaces exist from a small key's harvest first;
         # the key is fresh per run of this test: the two-hint family runs it
         # again in this process, and a harvested key is served from its
-        # template)
+        # template); the harvest is driven directly, whichever backend
+        # replays: what it leaves behind is the template's own graph pool
         x = self._x(8)
-        ht.build(ht.trace(linear, (x, self.w, self.b)), linear, (x, self.w, self.b))
+        _harvest(ht.trace(linear, (x, self.w, self.b)), (x, self.w, self.b))
         k = 8256 + 8 * next(_fresh_harvest_keys)
         w = torch.randn(8192, k, device="cuda", dtype=DTYPE) / k**0.5
         b = torch.randn(8192, device="cuda", dtype=DTYPE)
         x = self._x(8, k)
+        tape = ht.trace(linear, (x, w, b))
         harvests = ht.gemm_harvests()
         before = torch.cuda.memory_allocated()
-        variant = ht.build(ht.trace(linear, (x, w, b)), linear, (x, w, b))
+        _harvest(tape, (x, w, b))
         self.assertEqual(ht.gemm_harvests(), harvests + 1)
         self.assertLess(torch.cuda.memory_allocated() - before, 64 << 20)
+        variant = build(tape, linear, (x, w, b))
+        self.assertEqual(ht.gemm_harvests(), harvests + 1)
         self.assertTrue(self._check(variant, linear, (x, w, b), f"8192 x {k}"))
 
     def test_no_input_is_written_through_a_region(self):
@@ -837,7 +901,7 @@ class TestCudaHostTraceGemm(HostTraceTestCase):
         self.assertEqual((tape.num_regions, tape.num_launches), (0, 2))
         self.assertEqual(tape.launches[1]["kernel"], "_bmm_outer_product_kernel")
         h0 = ht.gemm_harvests()
-        variant = ht.build(tape, rotary, base)
+        variant = build(tape, rotary, base)
         self.assertEqual(ht.gemm_harvests() - h0, 0)
         # (B = 1 misses by a guard of the position cast: a one-element
         # iterator is contiguous by numel, the sibling's own rule)
@@ -863,7 +927,7 @@ class TestCudaHostTraceGemm(HostTraceTestCase):
             b = torch.randn(3, 1, 24, device="cuda", dtype=dtype)
             tape = ht.trace(torch.bmm, (a, b))
             self.assertEqual((tape.num_regions, tape.num_launches), (0, 1))
-            variant = ht.build(tape, torch.bmm, (a, b))
+            variant = build(tape, torch.bmm, (a, b))
             for args in (
                 (a, b),
                 (
@@ -914,7 +978,7 @@ class TestCudaHostTraceGemm(HostTraceTestCase):
             base = mk(8, 64)
             tape = ht.trace(torch.bmm, base)
             self.assertEqual((tape.num_regions, tape.num_launches), (1, 0))
-            variant = ht.build(tape, torch.bmm, base)
+            variant = build(tape, torch.bmm, base)
             for args in (mk(8, 64), mk(3, 64), mk(8, 1), mk(8, 17), mk(2, 128)):
                 with self.subTest(dtype=dtype, shape=tuple(args[0].shape)):
                     self.assertTrue(
@@ -925,16 +989,17 @@ class TestCudaHostTraceGemm(HostTraceTestCase):
             # column-major batch): its own key, served without a copy
             a, _b = mk(8, 64)
             bt = torch.randn(8, 64, 64, device="cuda", dtype=dtype).transpose(1, 2)
-            variant_t = ht.build(ht.trace(torch.bmm, (a, bt)), torch.bmm, (a, bt))
+            variant_t = build(ht.trace(torch.bmm, (a, bt)), torch.bmm, (a, bt))
             bt2 = torch.randn(8, 64, 64, device="cuda", dtype=dtype).transpose(1, 2)
             self.assertTrue(
                 self._check(variant_t, torch.bmm, (a, bt2), "transposed"),
                 self.last_miss,
             )
-            stats = variant.region_stats()
-            print(
-                f"\n[bmm 64^3 {dtype}] nodes {stats['sites'][0]['nodes']} applies {stats['applies']} rebinds {stats['rebinds']}"
-            )
+            if variant.native is not None:
+                stats = variant.native.region_stats()
+                print(
+                    f"\n[bmm 64^3 {dtype}] nodes {stats['sites'][0]['kinds']} applies {stats['applies']}"
+                )
 
     def test_bmm_declines_by_name(self):
         a = torch.randn(4, 16, 64, device="cuda", dtype=DTYPE)
@@ -957,9 +1022,10 @@ class TestCudaHostTraceGemm(HostTraceTestCase):
 
     def test_mm_with_no_rows_serves_the_empty_result(self):
         # eager launches nothing for a GEMM with M = 0 and returns the empty
-        # result: the region's site is built with no node (nothing to anchor
-        # the probe rows' nodes at) and serves that; a shape with rows misses
-        # on the empty output's stride guard, before the site
+        # result: the region's site has no node; the native replay's template
+        # registry refuses a variant without nodes by name (a documented
+        # refusal, STAGE_B.md), so the eager form serves it; a shape with rows
+        # misses on the empty output's stride guard, before the site
         def rows(x, w):
             return x[:0] @ w
 
@@ -972,8 +1038,9 @@ class TestCudaHostTraceGemm(HostTraceTestCase):
                 x = self._x(8)
                 tape = ht.trace(fn, (x, w))
                 self.assertEqual((tape.num_regions, tape.num_launches), (1, 0))
-                variant = ht.build(tape, fn, (x, w))
-                self.assertEqual(variant.region_stats()["sites"][0]["nodes"], [])
+                variant = build(tape, fn, (x, w))
+                if replay_backend() == "native":
+                    self.assertIn("needs nodes", variant.refused)
                 for other in (x, self._x(8)):
                     got = variant.replay((other, w))[0]
                     self.assertEqual(tuple(got.shape), (0, N))
@@ -1047,7 +1114,7 @@ class TestCudaHostTraceGemm(HostTraceTestCase):
         )
         # the template the build harvests for this shape carries the same flags
         tape = ht.trace(linear_nobias, (x, w))
-        variant = ht.build(tape, linear_nobias, (x, w))
+        variant = build(tape, linear_nobias, (x, w))
         self.assertTrue(self._check(variant, linear_nobias, (self._x(8), w)))
         entries = [t for t in self._templates_for() if t["hits"] and not t["miss"]]
         self.assertTrue(entries)
@@ -1069,7 +1136,7 @@ class TestCudaHostTraceGemm(HostTraceTestCase):
             return big.view(-1)[4 : 4 + m * K].view(m, K)
 
         for first, second in ((self._x(8), offset_x(8)), (offset_x(8), self._x(8))):
-            variant = ht.build(
+            variant = build(
                 ht.trace(linear, (first, self.w, self.b)),
                 linear,
                 (first, self.w, self.b),
@@ -1122,15 +1189,16 @@ import sys
 from unittest import mock
 import torch, torch.nn.functional as F
 from torch.cuda import _host_trace as ht
+sys.path.insert(0, sys.argv[1])
+from test_cuda_host_trace_gemm import _harvest
 K = N = 4096
 w = torch.randn(N, K, device="cuda", dtype=torch.bfloat16) / K**0.5
 b = torch.randn(N, device="cuda", dtype=torch.bfloat16)
 lin = lambda x, w, b: F.linear(x, w, b)
-x = torch.randn(4, K, device="cuda", dtype=torch.bfloat16)
-v = ht.build(ht.trace(lin, (x, w, b)), lin, (x, w, b))
 for m in (1, 2, 4, 8, 12, 16, 24, 32):
+    x = torch.randn(m, K, device="cuda", dtype=torch.bfloat16)
     try:
-        v.replay((torch.randn(m, K, device="cuda", dtype=torch.bfloat16), w, b))
+        _harvest(ht.trace(lin, (x, w, b)), (x, w, b))
     except ht.Miss as e:
         print("MISS", m, str(e)[:160])
 ws = [t for t in ht._gemm_templates.values() if t.uses_ws]
@@ -1138,13 +1206,14 @@ print("WS_TEMPLATES", len(ws), "of", len(ht._gemm_templates))
 registered = torch._C._host_trace_blas_workspaces(torch.cuda.current_stream().cuda_stream)
 print("REGISTERED", len(registered))
 # a stream-dependent pointer that is not a registered workspace: the harvest of a new key misses by name
+x = torch.randn(4, K, device="cuda", dtype=torch.bfloat16)
 w2 = torch.randn(N // 2, K, device="cuda", dtype=torch.bfloat16) / K**0.5
 b2 = torch.randn(N // 2, device="cuda", dtype=torch.bfloat16)
 with mock.patch.object(torch._C, "_host_trace_blas_workspaces", return_value=[]):
     try:
-        ht.build(ht.trace(lin, (x, w2, b2)), lin, (x, w2, b2)).replay((x, w2, b2))
+        _harvest(ht.trace(lin, (x, w2, b2)), (x, w2, b2))
         print("NEGATIVE served")
-    except (ht.Miss, ht.TapeMismatch) as e:
+    except ht.Miss as e:
         print("NEGATIVE", type(e).__name__, str(e)[:400])
 """
 
@@ -1168,7 +1237,12 @@ class TestCudaHostTraceGemmProvenance(TestCase):
 
         env = dict(os.environ, TORCH_CUBLAS_WORKSPACE_CACHE="1")
         r = subprocess.run(
-            [sys.executable, "-c", _WS_SCRIPT],
+            [
+                sys.executable,
+                "-c",
+                _WS_SCRIPT,
+                os.path.dirname(os.path.abspath(__file__)),
+            ],
             capture_output=True,
             text=True,
             env=env,
@@ -1184,7 +1258,8 @@ class TestCudaHostTraceGemmProvenance(TestCase):
     def test_host_slot_classes(self):
         # S2: a host slot is admitted as a stack or heap address, the low half
         # of a stack address in a 32-bit field, or stack-smear padding;
-        # anything else has no class
+        # anything else has no class (the classification is the harvest's;
+        # a replay keeps the template's own bytes at these slots)
         stack = (0x7F0000000000, 0x7F0000030000)
         heaps = [(0x5000000, 0x6000000)]
 
@@ -1217,31 +1292,6 @@ class TestCudaHostTraceGemmProvenance(TestCase):
                 heaps,
             )
         )
-        maps = (stack, heaps)
-        self.assertTrue(
-            ht._host_slot_matches(
-                "stack", (stack[0] + 4096).to_bytes(8, "little"), 0, maps
-            )
-        )
-        self.assertFalse(
-            ht._host_slot_matches("stack", heaps[0][0].to_bytes(8, "little"), 0, maps)
-        )
-        self.assertTrue(
-            ht._host_slot_matches(
-                "heap", (heaps[0][0] + 1).to_bytes(8, "little"), 0, maps
-            )
-        )
-        self.assertTrue(
-            ht._host_slot_matches(
-                "stack32:0", (lo32 | (7 << 32)).to_bytes(8, "little"), 0, maps
-            )
-        )
-        self.assertFalse(
-            ht._host_slot_matches(
-                "stack32:0", (0x11223344 | (7 << 32)).to_bytes(8, "little"), 0, maps
-            )
-        )
-        self.assertTrue(ht._host_slot_matches("padding", bytes(8), 0, maps))
 
     def test_unclassifiable_host_state_misses_by_name(self):
         # S2, end to end: with no stack or heap mapping admitted, the stack
@@ -1253,24 +1303,7 @@ class TestCudaHostTraceGemmProvenance(TestCase):
         tape = ht.trace(linear, (x, w, b))
         with mock.patch.object(ht, "_host_mappings", return_value=((1, 2), [])):
             with self.assertRaisesRegex(ht.Miss, "neither a stack nor a heap address"):
-                ht.build(tape, linear, (x, w, b))
-
-    def test_build_checks_the_captures_host_slots_by_class(self):
-        # S2, build side: the capture's value at a host slot must be of the
-        # template's kind (a stack slot holds a stack address of the build
-        # thread), not just anything
-        x = torch.randn(4, K, device="cuda", dtype=DTYPE)
-        w = torch.randn(N, K, device="cuda", dtype=DTYPE) / K**0.5
-        b = torch.randn(N, device="cuda", dtype=DTYPE)
-        tape = ht.trace(linear, (x, w, b))
-        variant = ht.build(tape, linear, (x, w, b))
-        self.assertTrue(variant.region_stats()["sites"])
-        stack, heaps = ht._host_mappings()
-        with mock.patch.object(
-            ht, "_host_mappings", return_value=((stack[1], stack[1] + 4096), heaps)
-        ):
-            with self.assertRaisesRegex(ht.TapeMismatch, "host slot at byte"):
-                ht.build(tape, linear, (x, w, b))
+                _harvest(tape, (x, w, b))
 
     def test_harvest_operand_sets_differ_above_the_alignment_class(self):
         # G2: the second operand set flips every address bit between the
@@ -1288,8 +1321,8 @@ class TestCudaHostTraceGemmProvenance(TestCase):
         second, _ = ht._harvest_operands(1, metas, aligns, dev)
         for a, b, c in zip(first, second, aligns):
             pa, pb = a.data_ptr(), b.data_ptr()
-            self.assertEqual(ht._align_class(pa), c)
-            self.assertEqual(ht._align_class(pb), c)
+            self.assertEqual(_align_class(pa), c)
+            self.assertEqual(_align_class(pb), c)
             mask = (ht._WINDOW - 1) & ~(2 * c - 1)
             self.assertEqual((pa ^ pb) & mask, mask)
             self.assertNotEqual(pa >> 21, pb >> 21)

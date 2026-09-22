@@ -3,7 +3,14 @@
 import re
 import unittest
 
-from host_trace_testing import bits, capture_graph, graph_functions, HostTraceTestCase
+from host_trace_testing import (
+    bits,
+    build,
+    capture_graph,
+    graph_functions,
+    graph_nodes,
+    HostTraceTestCase,
+)
 
 import torch
 import torch.nn.functional as F
@@ -383,15 +390,21 @@ class TestCudaHostTraceOps7(HostTraceTestCase):
                 return C._host_trace_ti_copy_(d, view(t))
 
             with self.subTest(row=row):
-                eager = graph_functions(capture_graph(lambda: real(dst, base)))
+                eager_graph = capture_graph(lambda: real(dst, base))
+                eager = graph_functions(eager_graph)
                 ours = graph_functions(capture_graph(lambda: entry(dst, base)))
                 tape = ht.trace(real, (dst, base))
-                variant = ht.build(tape, real, (dst, base))
-                replay = graph_functions(variant.graph)
+                variant = build(tape, real, (dst, base))
                 self.assertEqual(len(eager), 1)
                 self.assertEqual(ours, eager)
-                self.assertEqual(replay, eager)
                 self.assertEqual(tape.num_launches, int(eager != ["memcpy"]))
+                if eager != ["memcpy"]:
+                    # the tape's launch is eager's kernel by name; the native
+                    # replay's graph holds eager's function handle
+                    names = [k[0] for k in graph_nodes(eager_graph)[0]]
+                    self.assertEqual([L["kernel"] for L in tape.launches], names)
+                if variant.graph is not None:
+                    self.assertEqual(graph_functions(variant.graph), eager)
         self.assertFalse(C._host_trace_tracing())
 
     # ---- unary ops
@@ -482,6 +495,7 @@ class _LossHostChecks:
     miss (the softmax backward and nll_loss classes below)."""
 
     def _capture(self, fn):
+        # the launch configuration only: (name, grid, block, smem)
         stream = torch.cuda.Stream()
         stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(stream):
@@ -490,12 +504,7 @@ class _LossHostChecks:
             with torch.cuda.graph(g, stream=stream, capture_error_mode="relaxed"):
                 out = fn()
         stream.synchronize()
-        e = C._HostTraceExec(g, torch.cuda.current_device())
-        nodes = [
-            (e.kernel_name(j), tuple(e.grid(j)), tuple(e.block(j)), e.smem(j))
-            for j in range(e.num_nodes)
-        ]
-        return nodes, out
+        return [k[:4] for k in graph_nodes(g)[0]], out
 
     def _assert_bitwise(self, got, want):
         got = got if isinstance(got, (list, tuple)) else (got,)
@@ -520,7 +529,7 @@ class _LossHostChecks:
 
     def _roundtrip(self, fn, base_args, new_args_list):
         tape = ht.trace(fn, base_args)
-        variant = ht.build(tape, fn, base_args)
+        variant = build(tape, fn, base_args)
         served = []
         for new_args in new_args_list:
             out = variant.try_replay(new_args)

@@ -5,7 +5,6 @@ import gc
 import unittest
 
 import torch
-
 from torch.testing._internal.common_cuda import PLATFORM_SUPPORTS_FLASH_ATTENTION
 from torch.testing._internal.common_utils import run_tests, TestCase
 
@@ -229,18 +228,16 @@ class TestHostTraceFlash(TestCase):
         replay = self._replay(ties[0], 1, Sk, H=8, Hk=8)
         self._check_split_variants(replay, ties, Sk)
 
-    def test_agrees_with_the_interim_replay(self):
-        from torch.cuda import _host_trace
+    def test_agrees_with_eager_at_other_shapes(self):
+        # every output bitwise (the uninitialized auxiliaries by their metadata:
+        # LoweredTape.unwritten_outputs)
+        from torch.testing._internal.host_trace_oracle import Oracle
 
-        replay = self._replay(4, 512, 512)
-        args = (*self._qkv(4, 512, 512), False, 0.125)
-        interim = _host_trace.build(replay.tape, flash, args)
+        oracle = Oracle(flash, (*self._qkv(4, 512, 512), False, 0.125))
+        self.addCleanup(oracle.close)
+        self.assertIsNone(oracle.refused)
         for B, Sq, Sk in [(1, 512, 512), (8, 512, 512), (2, 1024, 256)]:
-            args = (*self._qkv(B, Sq, Sk), False, 0.125)
-            native = replay(*args)
-            ours = interim.replay(args)
-            self.assertEqual(native[0], ours[0], atol=0, rtol=0)
-            self.assertEqual(native[1], ours[1], atol=0, rtol=0)
+            oracle.check((*self._qkv(B, Sq, Sk), False, 0.125))
 
 
 if __name__ == "__main__":

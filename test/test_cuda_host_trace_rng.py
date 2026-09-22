@@ -3,7 +3,7 @@
 import gc
 import unittest
 
-from host_trace_testing import assert_eager_function_handles
+from host_trace_testing import assert_eager_function_handles, build
 
 import torch
 import torch.nn.functional as F
@@ -101,9 +101,9 @@ class TestCudaHostTraceRng(TestCase):
     def _trace(self, fn, args):
         tape = ht.trace(fn, args)
         self.assertIsNotNone(tape.rng_increment)
-        # the build (two ordinary calls, the capture, one instantiating replay)
-        # draws randomness of its own, before the sequences start
-        return ht.build(tape, fn, args)
+        # the trace's warm-up drew one call's randomness before the sequences
+        # start; the build draws nothing
+        return build(tape, fn, args)
 
     def test_the_graph_setter_exists(self):
         # upstream patch 11: the per-replay generator increment
@@ -257,10 +257,9 @@ class TestCudaHostTraceRng(TestCase):
         self._equal_sequences(got, ref, offsets, ref_offsets)
 
     def test_trace_and_build_consumption_is_exact(self):
-        # the trace and the build draw randomness of their own: one call's
-        # increment for the warm-up (none without it), three for the build
-        # with its warm-up (two ordinary calls and the instantiating replay)
-        # and none without it; a drift in these counts changes the stream a
+        # the trace draws randomness of its own: one call's increment for the
+        # warm-up, none without it; the build draws nothing (it runs nothing
+        # of the function); a drift in these counts changes the stream a
         # program sees after tracing
         x = torch.randn(4, 4096, device="cuda")
         torch.cuda.manual_seed(SEED)
@@ -268,28 +267,24 @@ class TestCudaHostTraceRng(TestCase):
         dropout(x, 0.1)
         one = _offset() - o0
         self.assertGreater(one, 0)
-        for warm_up, trace_calls, build_warm_up, build_calls in (
-            (True, 1, True, 3),
-            (False, 0, True, 3),
-            (False, 0, False, 0),
-        ):
+        for warm_up, trace_calls in ((True, 1), (False, 0)):
             torch.cuda.manual_seed(SEED)
             o0 = _offset()
             tape = ht.trace(dropout, (x, 0.1), warm_up=warm_up)
             o1 = _offset()
-            ht.build(tape, dropout, (x, 0.1), warm_up=build_warm_up)
+            build(tape, dropout, (x, 0.1))
             o2 = _offset()
             self.assertEqual(o1 - o0, trace_calls * one)
-            self.assertEqual(o2 - o1, build_calls * one)
+            self.assertEqual(o2 - o1, 0)
 
     def test_a_call_executes_the_user_function_exactly_once(self):
-        # the interim entry (a trace, hits, a miss traced again) executes the
-        # user's function once per call: the ordinary call whose outputs the
-        # caller receives is the warm-up, and the trace and the build follow
-        # with warm_up=False and draw nothing; a function that mutates its
-        # input and draws shows an extra execution in the tensor and in the
-        # generator's advance (test_cuda_host_trace counts the executions of
-        # the mutation-only case)
+        # an entry (a trace, hits, a miss traced again) executes the user's
+        # function once per call: the ordinary call whose outputs the caller
+        # receives is the warm-up, the trace follows with warm_up=False and
+        # draws nothing, and the build draws nothing; a function that mutates
+        # its input and draws shows an extra execution in the tensor and in
+        # the generator's advance (test_cuda_host_trace counts the executions
+        # of the mutation-only case)
         def fn(x):
             return x.add_(torch.native_dropout(x, 0.1, True)[0])
 
@@ -313,7 +308,7 @@ class TestCudaHostTraceRng(TestCase):
                     return out[0]
             out = fn(x)
             tape = ht.trace(fn, (x,), warm_up=False)
-            variants.append(ht.build(tape, fn, (x,), warm_up=False))
+            variants.append(build(tape, fn, (x,)))
             return out
 
         want, want_advances = run(fn)
@@ -328,7 +323,7 @@ class TestCudaHostTraceRng(TestCase):
 
     def test_tape_is_bound_to_its_device_class(self):
         # the SM count is folded into dropout's grid cap and increment: a tape
-        # built on a device with another count misses before any GPU work
+        # replayed on a device with another count misses before any GPU work
         x = torch.randn(4, 4096, device="cuda")
         tape = ht.trace(dropout, (x, 0.1))
         props = torch.cuda.get_device_properties(x.device)
@@ -337,10 +332,10 @@ class TestCudaHostTraceRng(TestCase):
         ident["multi_processor_count"] += 1
         tape.device_identity = tuple(ident.items())
         with self.assertRaisesRegex(ht.Miss, "multi_processor_count"):
-            ht.build(tape, dropout, (x, 0.1))
+            build(tape, dropout, (x, 0.1))
         ident["multi_processor_count"] -= 1
         tape.device_identity = tuple(ident.items())
-        ht.build(tape, dropout, (x, 0.1))
+        build(tape, dropout, (x, 0.1))
 
     def test_composition_with_a_random_stage(self):
         w = 1 + 0.1 * torch.randn(1024, device="cuda")
@@ -366,38 +361,31 @@ class TestCudaHostTraceRng(TestCase):
         for a, b in zip(got, ref):
             self.assertEqual(a, b, atol=0, rtol=0)
 
-    def test_pushed_images_carry_the_build_captures_philox_words(self):
-        # a launch's philox seed / offset pointers are the build capture's
-        # per-capture generator words; the tape's are the trace capture's,
-        # freed when the trace ended, and only the allocator's free list made
-        # them the same block again. A graph freed between the trace and the
-        # build puts its own words on top of that list, so the build's words
-        # are elsewhere: an image a replay pushes (another batch allocates
-        # afresh) must still name the capture's words, and the values stay
-        # eager's. Before the fix the pushed image named the trace's words.
+    def test_a_graph_freed_between_the_trace_and_the_build_keeps_eagers_sequences(
+        self,
+    ):
+        # a launch's philox seed / offset pointers are a replay's per-capture
+        # generator words; the tape's are the trace capture's, freed when the
+        # trace ended, and only the allocator's free list made them the same
+        # block again. A graph freed between the trace and the build puts its
+        # own words on top of that list, so the replay's words are elsewhere:
+        # an image a replay pushes (another batch allocates afresh) must still
+        # name its own capture's words, and the values stay eager's (a replay
+        # naming the trace's freed words draws from another state)
         x = torch.randn(4, 4096, device="cuda")
-        stale = ht.build(ht.trace(dropout, (x, 0.1)), dropout, (x, 0.1))
+        stale = build(ht.trace(dropout, (x, 0.1)), dropout, (x, 0.1))
         tape = ht.trace(dropout, (x, 0.1))
         del stale
         gc.collect()
-        variant = ht.build(tape, dropout, (x, 0.1))
+        variant = build(tape, dropout, (x, 0.1))
         j = tape.rng_slots[0]["launch"]
-        nid = variant._launch_nodes[j]
-        rng = [
-            (p["offset"], p["offset"] + p["size"])
-            for p in tape.launches[j]["params"]
-            if p["kind"] == "rng"
-        ]
+        rng = [p for p in tape.launches[j]["params"] if p["kind"] == "rng"]
         self.assertTrue(rng)
-        captured = bytes(variant.exec.image(nid))
-        words = [captured[lo:hi] for lo, hi in rng]
         for B in (4, 8, 2):
             xb = torch.randn(B, 4096, device="cuda")
             ref, ref_offsets = _sequence(dropout, (xb, 0.1), 3)
             got, offsets = _sequence(_replayer(variant), (xb, 0.1), 3)
             self._equal_sequences(got, ref, offsets, ref_offsets)
-            pushed = bytes(variant.exec.image(nid))
-            self.assertEqual([pushed[lo:hi] for lo, hi in rng], words, B)
 
     def test_generator_capture_pointers_binding(self):
         gen = torch.cuda.default_generators[torch.cuda.current_device()]
@@ -453,7 +441,7 @@ class TestCudaHostTraceFlashDropout(TestCase):
         args = (q, k, v, 0.1)
         t = ht.trace(flash_dropout, args)
         self.assertIsNotNone(t.rng_increment)
-        tape = ht.build(t, flash_dropout, args)
+        tape = build(t, flash_dropout, args)
         ref, ref_offsets = self._sequence(flash_dropout, args, 5)
         got, offsets = self._sequence(_replayer(tape), args, 5)
         self._equal(got, ref, offsets, ref_offsets)
@@ -462,7 +450,7 @@ class TestCudaHostTraceFlashDropout(TestCase):
 
     def test_flash_dropout_other_batches_advance_by_b_h_32(self):
         q, k, v = self._qkv(4, 128)
-        tape = ht.build(
+        tape = build(
             ht.trace(flash_dropout, (q, k, v, 0.1)), flash_dropout, (q, k, v, 0.1)
         )
         for B in (2, 8, 1):
@@ -485,7 +473,7 @@ class TestCudaHostTraceFlashDropout(TestCase):
         args = (q, k, v, 0.1)
         t = ht.trace(fn, args)
         self.assertEqual(len(t.rng_slots), 2)
-        tape = ht.build(t, fn, args)
+        tape = build(t, fn, args)
         ref, ref_offsets = self._sequence(fn, args, 5)
         got, offsets = self._sequence(_replayer(tape), args, 5)
         self._equal(got, ref, offsets, ref_offsets)
@@ -632,7 +620,7 @@ class TestCudaHostTraceRngPairing(TestCase):
             self.assertEqual(
                 sorted(p["size"] for p in params if p["kind"] == "rng"), [7, 16]
             )
-        variant = ht.build(tape, host, (out,))
+        variant = build(tape, host, (out,))
         ref, ref_offsets = _sequence(host, (out,), 3)
         got, offsets = _sequence(_replayer(variant), (out,), 3)
         self.assertEqual(offsets, ref_offsets)

@@ -5,7 +5,13 @@ import math
 import re
 import unittest
 
-from host_trace_testing import assert_eager_function_handles, bits, HostTraceTestCase
+from host_trace_testing import (
+    assert_eager_function_handles,
+    bits,
+    build,
+    EntryMode,
+    HostTraceTestCase,
+)
 
 import torch
 import torch.nn.functional as F
@@ -487,7 +493,7 @@ class TestCudaHostTraceTI(HostTraceTestCase):
     def test_dtype_broadcast_and_alpha_changes_miss(self):
         x, y = self._pair(16, 4096)
         tape = ht.trace(torch.add, (x, y))
-        variant = ht.build(tape, torch.add, (x, y))
+        variant = build(tape, torch.add, (x, y))
         half = self._pair(16, 4096, dtype=torch.float16)
         self.assertIsNone(variant.try_replay(half))
         # a broadcast shape after a same-shape trace: the strides guard misses
@@ -495,7 +501,7 @@ class TestCudaHostTraceTI(HostTraceTestCase):
         # alpha is a constant of the variant
         fn = lambda a, b, alpha: torch.add(a, b, alpha=alpha)  # noqa: E731
         tape = ht.trace(fn, (x, y, 2.0))
-        variant = ht.build(tape, fn, (x, y, 2.0))
+        variant = build(tape, fn, (x, y, 2.0))
         self.assertIsNotNone(variant.try_replay((x, y, 2.0)))
         self.assertIsNone(variant.try_replay((x, y, 3.0)))
 
@@ -505,13 +511,13 @@ class TestCudaHostTraceTI(HostTraceTestCase):
         # to 32 bytes serves
         base = self._pair(64, 4096, offset=8)
         tape = ht.trace(torch.add, base)
-        variant = ht.build(tape, torch.add, base)
+        variant = build(tape, torch.add, base)
         self.assertIsNotNone(variant.try_replay(self._pair(64, 4096, offset=16)))
         self.assertIsNone(variant.try_replay(self._pair(64, 4096, offset=4)))
         # and the other way round: traced at width 4, an aligned pair misses
         base4 = self._pair(64, 4096, offset=4)
         tape = ht.trace(torch.add, base4)
-        variant = ht.build(tape, torch.add, base4)
+        variant = build(tape, torch.add, base4)
         self.assertIsNotNone(variant.try_replay(self._pair(64, 4096, offset=12)))
         self.assertIsNone(variant.try_replay(self._pair(64, 4096, offset=8)))
 
@@ -641,7 +647,7 @@ class TestCudaHostTraceTI(HostTraceTestCase):
                     want = fn(x, scalar)
                     real_nodes, _ = self._capture(lambda: fn(x, scalar))
                     tape = ht.trace(fn, (x, scalar))
-                    variant = ht.build(tape, fn, (x, scalar))
+                    variant = build(tape, fn, (x, scalar))
                     (got,) = variant.replay((x, scalar))
                     torch.cuda.synchronize()
                     self.assertEqual(got.dtype, want.dtype)
@@ -806,7 +812,7 @@ class TestCudaHostTraceTI(HostTraceTestCase):
                 with self.assertRaisesRegex(ht.Declined, message):
                     ht.trace(fn, (x,))
                 with self.assertRaisesRegex(ht.Declined, message):
-                    with ht._EntryMode():
+                    with EntryMode():
                         fn(x)
         pinned = torch.tensor(0.5).pin_memory()
         with self.assertRaisesRegex(ht.Declined, message):
@@ -833,7 +839,7 @@ class TestCudaHostTraceTI(HostTraceTestCase):
             return t * d
 
         tape = ht.trace(times_d, (x,))
-        variant = ht.build(tape, times_d, (x,))
+        variant = build(tape, times_d, (x,))
         d.fill_(0.75)
         (got,) = variant.replay((x,))
         torch.cuda.synchronize()
@@ -865,7 +871,7 @@ class TestCudaHostTraceTI(HostTraceTestCase):
                     with self.assertRaisesRegex(RuntimeError, message):
                         fn(x)
                     with self.assertRaisesRegex(RuntimeError, message):
-                        with ht._EntryMode():
+                        with EntryMode():
                             fn(x)
                     for warm_up in (False, True):
                         with self.assertRaisesRegex(RuntimeError, message):
@@ -902,11 +908,11 @@ class TestCudaHostTraceTI(HostTraceTestCase):
                 y = torch.ones_like(x)
                 want = fn(x, y, alpha)
                 self.assertFalse(torch.equal(want, fn(x, y, float(alpha))))
-                with ht._EntryMode():
+                with EntryMode():
                     got = fn(x, y, alpha)
                 self.assertTrue(torch.equal(bits(got), bits(want)))
                 tape = ht.trace(fn, (x, y, alpha), warm_up=False)
-                variant = ht.build(tape, fn, (x, y, alpha))
+                variant = build(tape, fn, (x, y, alpha))
                 for rows in (8, 12):
                     a = torch.full((rows, 64), fill, device="cuda", dtype=dtype)
                     b = torch.ones_like(a)
@@ -931,16 +937,16 @@ class TestCudaHostTraceTI(HostTraceTestCase):
         for name, fn in forms.items():
             with self.subTest(form=name):
                 tape = ht.trace(fn, (x, 0.0))
-                variant = ht.build(tape, fn, (x, 0.0))
+                variant = build(tape, fn, (x, 0.0))
                 self.assertIsNone(variant.try_replay((x, -0.0)))
                 self.assertIsNotNone(variant.try_replay((x, 0.0)))
-                other = ht.build(ht.trace(fn, (x, -0.0)), fn, (x, -0.0))
+                other = build(ht.trace(fn, (x, -0.0)), fn, (x, -0.0))
                 (got,) = other.replay((x, -0.0))
                 torch.cuda.synchronize()
                 self.assertTrue(torch.equal(bits(got), bits(fn(x, -0.0))))
         fn = self._SCALAR_FORMS["x * 0.5"]
         nan = float("nan")
-        variant = ht.build(ht.trace(fn, (x, nan)), fn, (x, float("nan")))
+        variant = build(ht.trace(fn, (x, nan)), fn, (x, float("nan")))
         self.assertIsNotNone(variant.try_replay((x, float("nan"))))
         self.assertIsNone(variant.try_replay((x, -nan)))
 
@@ -961,11 +967,11 @@ class TestCudaHostTraceTI(HostTraceTestCase):
         for name, fn in forms.items():
             with self.subTest(form=name):
                 want = fn(x)
-                with ht._EntryMode():
+                with EntryMode():
                     sibling = fn(x)
                 tape = ht.trace(fn, (x,))
                 self.assertEqual(tape.num_launches, 0)
-                (got,) = ht.build(tape, fn, (x,)).replay((x,))
+                (got,) = build(tape, fn, (x,)).replay((x,))
                 for out in (sibling, got):
                     self.assertEqual(
                         (out.shape, out.stride(), out.dtype),
@@ -984,7 +990,7 @@ class TestCudaHostTraceTI(HostTraceTestCase):
             x = self._pair(4, 3072, dtype=dtype)[0]
             tape = ht.trace(gelu_new, (x,))
             self.assertEqual(tape.num_launches, 8)
-            variant = ht.build(tape, gelu_new, (x,))
+            variant = build(tape, gelu_new, (x,))
             for y in (
                 x,
                 self._pair(6, 3072, dtype=dtype)[0],
@@ -1013,7 +1019,7 @@ class TestCudaHostTraceTI(HostTraceTestCase):
                     self.assertEqual(_family(ours[0][0]), _family(real_nodes[0][0]))
                     self.assertEqual(ours[0][1:4], real_nodes[0][1:4])
                     tape = ht.trace(fn, (x,))
-                    (got,) = ht.build(tape, fn, (x,)).replay((x,))
+                    (got,) = build(tape, fn, (x,)).replay((x,))
                     self.assertTrue(
                         torch.equal(bits(got), bits(want)),
                         f"pow {exp} differs bitwise",
@@ -1039,7 +1045,7 @@ class TestCudaHostTraceTI(HostTraceTestCase):
         x = self._pair(8, 4096)[0]
         tape = ht.trace(flat, (x,))
         self.assertEqual(tape.num_launches, 1)
-        variant = ht.build(tape, flat, (x,))
+        variant = build(tape, flat, (x,))
         y = self._pair(6, 3000)[0]
         (got,) = variant.replay((y,))
         self.assertEqual(got.stride(), flat(y).stride())
@@ -1051,7 +1057,7 @@ class TestCudaHostTraceTI(HostTraceTestCase):
 
         tape = ht.trace(head, (x,))
         self.assertEqual(tape.num_launches, 0)
-        (out,) = ht.build(tape, head, (x,)).replay((x,))
+        (out,) = build(tape, head, (x,)).replay((x,))
         self.assertEqual(out.stride(), head(x).stride())
 
     # ---- fills, arange, comparisons, masked_fill, clamp and the in-place /
@@ -1079,7 +1085,7 @@ class TestCudaHostTraceTI(HostTraceTestCase):
         # fn does not mutate its inputs: trace and build at base, replay at
         # each of news bitwise eager (shape, strides, dtype, bits)
         tape = ht.trace(fn, base, warm_up=warm_up)
-        variant = ht.build(tape, fn, base)
+        variant = build(tape, fn, base)
         for new in news:
             out = variant.try_replay(new)
             shapes = [tuple(a.shape) for a in new if isinstance(a, torch.Tensor)]
@@ -1097,10 +1103,11 @@ class TestCudaHostTraceTI(HostTraceTestCase):
 
     def _inplace_replays(self, fn, make, shapes):
         # fn mutates its first argument: the trace and the build get their own
-        # copies; each replay runs on a fresh input beside eager on a clone of
-        # it, and the input's storage is what changed on both sides
+        # copies (the build runs nothing); each replay runs on a fresh input
+        # beside eager on a clone of it, and the input's storage is what
+        # changed on both sides
         tape = ht.trace(fn, make(*shapes[0]))
-        variant = ht.build(tape, fn, make(*shapes[0]))
+        variant = build(tape, fn, make(*shapes[0]))
         for shape in shapes:
             args = make(*shape)
             clones = tuple(a.clone() for a in args)
@@ -1183,7 +1190,7 @@ class TestCudaHostTraceTI(HostTraceTestCase):
             fn = lambda t, v: torch.full((t.shape[0], 5), v, device=t.device)  # noqa: E731
             tape = ht.trace(fn, (x, value))
             self.assertEqual(tape.outputs[0].dtype, dtype)
-            variant = ht.build(tape, fn, (x, value))
+            variant = build(tape, fn, (x, value))
             self.assertIsNone(variant.try_replay((x, value + 1)))
             self.assertTrue(torch.equal(variant.replay((x, value))[0], fn(x, value)))
         # the fill kernel is eager's: same family, grid and block, contiguous
@@ -1910,7 +1917,7 @@ class TestCudaHostTraceTI(HostTraceTestCase):
         with self.assertRaisesRegex(ValueError, "already has a traced entry"):
             ht.register_traced_entry(torch.ops.aten.add.Tensor, lambda *a, **k: None)
         # an entry that dispatches the op it stands for is a decline, not a
-        # RecursionError, under the trace and at a build
+        # RecursionError, under the trace and in ordinary mode
         ht.register_traced_entry(atan2, lambda a, b: torch.atan2(a, b))
         try:
             with self.assertRaisesRegex(
@@ -1919,7 +1926,7 @@ class TestCudaHostTraceTI(HostTraceTestCase):
                 ht.trace(torch.atan2, (x, y))
             self.assertFalse(C._host_trace_tracing())
             with self.assertRaisesRegex(ht.Declined, "dispatched"):
-                with ht._EntryMode():
+                with EntryMode():
                     torch.atan2(x, y)
             # a replacement entry runs its sibling (mul stands in: the registry
             # mechanics are what is tested here)
@@ -1936,7 +1943,7 @@ class TestCudaHostTraceTI(HostTraceTestCase):
     def test_a_copy_on_write_input_stays_lazy(self):
         # inputs are read through the const accessor: a lazy clone stays
         # copy-on-write through an ordinary opted add, the trace's warm-up
-        # and the build; the output goes through the mutable form.
+        # and a replay; the output goes through the mutable form.
         x, y = self._pair(64, 4096)
         lazy = torch._lazy_clone(x)
         self.assertTrue(torch._C._is_cow_tensor(lazy))
@@ -1946,7 +1953,7 @@ class TestCudaHostTraceTI(HostTraceTestCase):
         self.assertTrue(torch.equal(out, want))
         args = (lazy, y)
         tape = ht.trace(torch.add, args)
-        variant = ht.build(tape, torch.add, args)
+        variant = build(tape, torch.add, args)
         self.assertTrue(torch._C._is_cow_tensor(lazy))
         self.assertTrue(torch.equal(variant.replay(args)[0], want))
         self.assertTrue(torch._C._is_cow_tensor(lazy))
@@ -1998,7 +2005,7 @@ class TestCudaHostTraceTI(HostTraceTestCase):
                 self.assertEqual((tape.num_launches, tape.num_memcpys), (1, memcpys))
                 pairs = [r for r in tape.root_facts if r[0] != "domain"]
                 self.assertEqual(len(pairs), memcpys)
-                variant = ht.build(tape, fn, (x,))
+                variant = build(tape, fn, (x,))
                 for args in ((x,), *news):
                     got = variant.replay(args)[0]
                     self.assertTrue(torch.equal(bits(got), bits(fn(*args))))
@@ -2009,7 +2016,7 @@ class TestCudaHostTraceTI(HostTraceTestCase):
 
         tape = ht.trace(empty_add, (x,))
         self.assertEqual(tape.num_launches, 0)
-        variant = ht.build(tape, empty_add, (x,))
+        variant = build(tape, empty_add, (x,))
         self.assertEqual(tuple(variant.replay((x,))[0].shape), (0, 256))
 
     def test_two_hints_name_a_value_taken_from_a_hint(self):
@@ -2238,7 +2245,7 @@ class TestCudaHostTraceTI(HostTraceTestCase):
                 with self.subTest(op=name, dtype=dtype):
                     tape = ht.trace(fn, tuple(t.clone() for t in base))
                     self.assertEqual(tape.num_launches, 1)
-                    variant = ht.build(tape, fn, tuple(t.clone() for t in base))
+                    variant = build(tape, fn, tuple(t.clone() for t in base))
                     for shape in ((48, 3000), (7, 1000)):
                         new = tuple(
                             torch.randn(shape, device="cuda").to(dtype)
@@ -2452,7 +2459,7 @@ class TestCudaHostTraceTI(HostTraceTestCase):
                 self.assertFalse(C._host_trace_tracing())
                 base = args()
                 tape = ht.trace(fn, base)
-                variant = ht.build(tape, fn, base)
+                variant = build(tape, fn, base)
                 # the non-overlapping class serves, in either order in memory
                 flat = rand(2 * 8 * 64, 1, dtype).view(-1)
                 lo, hi = flat[: 8 * 64].view(8, 64), flat[8 * 64 :].view(8, 64)
@@ -2476,14 +2483,14 @@ class TestCudaHostTraceTI(HostTraceTestCase):
         # two tensors misses, one traced on two tensors misses on one)
         y = rand(8, 64)
         tape = ht.trace(add_, (y, y))
-        variant = ht.build(tape, add_, (y, y))
+        variant = build(tape, add_, (y, y))
         z = rand(8, 64)
         want = add_(z.clone(), z.clone())
         (got,) = variant.replay((z, z))
         self.assertTrue(torch.equal(got, want))
         self.assertIsNone(variant.try_replay((rand(8, 64), rand(8, 64))))
         base = (rand(8, 64), rand(8, 64))
-        variant = ht.build(ht.trace(add_, base), add_, base)
+        variant = build(ht.trace(add_, base), add_, base)
         self.assertIsNone(variant.try_replay((z, z)))
         self.assertFalse(C._host_trace_tracing())
 
@@ -2523,7 +2530,7 @@ class TestCudaHostTraceTI(HostTraceTestCase):
 
         x = torch.randn(8, 16, device="cuda")
         tape = ht.trace(halves, (x.clone(),), warm_up=False)
-        variant = ht.build(tape, halves, (x.clone(),))
+        variant = build(tape, halves, (x.clone(),))
         for t in (x, torch.randn(5, 16, device="cuda")):
             (got,) = variant.replay((t.clone(),))
             self.assertTrue(torch.equal(got, halves(t.clone())))
@@ -2566,7 +2573,7 @@ class TestCudaHostTraceTI(HostTraceTestCase):
         # an out= of the result's shape traces, builds and replays
         x, y, o = args()
         o = torch.empty(8, 64, device="cuda")
-        variant = ht.build(ht.trace(fn, (x, y, o)), fn, (x, y, o))
+        variant = build(ht.trace(fn, (x, y, o)), fn, (x, y, o))
         (got,) = variant.replay((x, y, torch.empty(8, 64, device="cuda")))
         self.assertTrue(torch.equal(got, x + y))
         self.assertFalse(C._host_trace_tracing())

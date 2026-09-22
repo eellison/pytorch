@@ -4,7 +4,7 @@ import json
 import re
 import unittest
 
-from host_trace_testing import bits, HostTraceTestCase
+from host_trace_testing import bits, build, HostTraceTestCase
 
 import torch
 import torch.nn.functional as F
@@ -274,7 +274,7 @@ class TestCudaHostTraceReduce(HostTraceTestCase):
         fn = lambda t: torch.sum(t, 0)  # noqa: E731
         x0 = torch.randn((), device="cuda")
         tape = ht.trace(fn, (x0,))
-        variant = ht.build(tape, fn, (x0,))
+        variant = build(tape, fn, (x0,))
         self.assertEqual(tape.num_launches, 1)
         y0 = torch.randn((), device="cuda")
         out = variant.replay((y0,))[0]
@@ -342,7 +342,7 @@ class TestCudaHostTraceReduce(HostTraceTestCase):
 
     def test_global_reduce_with_semaphores(self):
         # the split across CTAs: cta_buf and semaphores are allocations, the
-        # semaphore memset a memset node updated per call; two replays in a
+        # semaphore memset a memset node re-pointed per call; two replays in a
         # row are both right (the node re-zeroes the semaphores each launch)
         fn = lambda t: torch.sum(t, -1)  # noqa: E731
         base = (self._x(8, 262144),)
@@ -372,7 +372,6 @@ class TestCudaHostTraceReduce(HostTraceTestCase):
         want = fn(x)
         self.assertTrue(torch.equal(bits(a), bits(want)))
         self.assertTrue(torch.equal(bits(b), bits(want)))
-        self.assertGreater(variant.exec.dirty_memset_nodes, 0)
 
     def test_outer_and_keepdim_and_multi_dim_replay(self):
         # each list: two shapes that keep the traced configuration (served)
@@ -487,13 +486,15 @@ class TestCudaHostTraceReduce(HostTraceTestCase):
         self.assertEqual(block_arithmetic(ht._Trace(0), True), [])
 
     def test_a_rebind_outside_its_declared_domain_misses(self):
-        # the interim re-evaluates last_pow2 per call and binds the result; a
+        # a replay re-evaluates last_pow2 per call and binds the result; a
         # value outside the declared domain is a Miss (the folded domain
-        # guards assumed it), never bound
+        # guards assumed it), never bound. The tape's Python record is mocked
+        # here, which the eager form evaluates; the native predicate calls the
+        # host's function by address (E19) and cannot be mocked
         fn = lambda t: torch.sum(t, -1)  # noqa: E731
         x = self._x(64, 4096)
         tape = ht.trace(fn, (x,))
-        variant = ht.build(tape, fn, (x,))
+        variant = build(tape, fn, (x,), backend="eager")
         rec = next(o for o in tape.opaque if o["fn"] == "last_pow2")
         call = rec["call"]
         rec["call"] = lambda args: 0
@@ -509,14 +510,14 @@ class TestCudaHostTraceReduce(HostTraceTestCase):
         x = self._x(64, 4096)
         fn = lambda t: torch.sum(t, -1)  # noqa: E731
         tape = ht.trace(fn, (x,))
-        variant = ht.build(tape, fn, (x,))
+        variant = build(tape, fn, (x,))
         self.assertIsNone(variant.try_replay((self._x(64, 4096, dtype=torch.float16),)))
         # a transposed input after a contiguous trace: the stride-order guard
         self.assertIsNone(variant.try_replay((self._x(4096, 64).t(),)))
         # dims and keepdim are constants of the variant
         fn2 = lambda t, d, k: torch.sum(t, d, keepdim=k)  # noqa: E731
         tape = ht.trace(fn2, (x, [-1], False))
-        variant = ht.build(tape, fn2, (x, [-1], False))
+        variant = build(tape, fn2, (x, [-1], False))
         self.assertIsNotNone(variant.try_replay((x, [-1], False)))
         self.assertIsNone(variant.try_replay((x, [0], False)))
         self.assertIsNone(variant.try_replay((x, [-1], True)))
@@ -619,7 +620,7 @@ class TestCudaHostTraceReduce(HostTraceTestCase):
         out = torch.empty(2, 64, 32, device="cuda", dtype=x.dtype)
         tape = ht.trace(fn, (x, out))
         self.assertEqual(tape.num_launches, 1)
-        variant = ht.build(tape, fn, (x, out))
+        variant = build(tape, fn, (x, out))
         for B, S in [(2, 64), (3, 128)]:
             y = self._x(B, S, 4, 32)
             o = torch.empty(B, S, 32, device="cuda", dtype=x.dtype)

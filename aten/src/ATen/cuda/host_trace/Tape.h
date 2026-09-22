@@ -113,7 +113,7 @@ struct OpaqueRec {
 };
 
 // A cudaMemsetAsync the host issued on the current stream (Reduce.cuh zeroes
-// its semaphores this way): a memset node in the replay's capture, paired by
+// its semaphores this way): a memset node in a replay's graph, paired by
 // order with these records and updated when dst or bytes change. The trace
 // itself issues nothing: its destination is a storage-less allocation.
 struct MemsetRec {
@@ -143,13 +143,13 @@ struct HostBufferRec {
 
 // An asynchronous copy the host issued through copy_h2d or copy_d2d
 // (HostTable.h) on the trace's capturing stream: a memcpy node in the
-// replay's capture, paired by order with these records and updated when src,
+// replay's graph, paired by order with these records and updated when src,
 // dst or bytes change. `src` is a host-buffer image's root, a pinned CPU
 // input's address, or (device-to-device: Copy.cu's contiguous copy_) an
 // address over a CUDA input's or allocation's root like `dst`; the node's
 // kind is the capture's. The trace itself issues nothing: its destination is
 // a storage-less allocation, so there is no node in the trace capture for the
-// frontier pairing of launches (A158) to claim; the replay's build pairs the
+// frontier pairing of launches (A158) to claim; a replay pairs the
 // copies with its own capture's memcpy nodes by order. Should a copy ever be
 // issued under the trace, its packet carries `cudaGraphNode_t node = nullptr`
 // filled by the recorder's frontier_node after the call, like a launch. The

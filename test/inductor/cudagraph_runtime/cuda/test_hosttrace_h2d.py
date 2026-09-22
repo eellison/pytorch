@@ -8,7 +8,6 @@ from pathlib import Path
 from unittest import mock
 
 import torch
-
 from torch.multiprocessing.reductions import StorageWeakRef
 from torch.testing._internal.common_device_type import instantiate_device_type_tests
 from torch.testing._internal.common_utils import parametrize, run_tests, TestCase
@@ -131,16 +130,14 @@ class TestHostTraceH2D(TestCase):
         self.assertEqual(replay(table, ids), table[ids.cuda()], atol=0, rtol=0)
         self.assertEqual(replay.misses, 2)
 
-    def test_agrees_with_the_interim_replay(self):
-        from torch.cuda import _host_trace
+    def test_agrees_with_eager_at_other_sizes(self):
+        from torch.testing._internal.host_trace_oracle import Oracle
 
-        base = _groups((64, 128, 32))
-        replay = self._replay(grouped, base)
-        interim = _host_trace.build(replay.tape, grouped, base)
+        oracle = Oracle(grouped, _groups((64, 128, 32)))
+        self.addCleanup(oracle.close)
+        self.assertIsNone(oracle.refused)
         for sizes in ((16, 16, 16), (200, 8, 1024)):
-            args = _groups(sizes)
-            ours = interim.replay(args)[0]
-            self.assertEqual(replay(*args), ours, atol=0, rtol=0)
+            oracle.check(_groups(sizes))
 
 
 class TestHostTracePinnedVariants(TestCase):
@@ -586,7 +583,7 @@ class TestHostTraceH2DUnion(TestCase):
     def test_wait_for_h2d_covers_every_entry_reading_a_shared_buffer(self, device):
         # retirement stage B: two entries read the same pinned buffer; one entry's wait
         # covers the other's pending copy from that buffer, and the module-level wait
-        # takes the buffer itself (the interim's wait_for_h2d(pinned))
+        # takes the buffer itself
         from torch.testing._internal.host_trace_oracle import Oracle
 
         table = torch.randn(V, D, device=device)

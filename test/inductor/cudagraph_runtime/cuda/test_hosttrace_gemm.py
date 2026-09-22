@@ -470,11 +470,12 @@ class TestHostTraceGemm(TestCase):
         )
         self.assertEqual(replay.misses, misses)
 
-    def test_another_stream_the_interim_serves_and_the_native_entry_refuses(self):
+    def test_another_stream_is_refused_by_name_and_the_bound_stream_serves_again(
+        self,
+    ):
         # retirement stage B, O29: the shared runtime binds an entry to the stream it
-        # was prepared on and refuses a call on another; the interim replay serves any
-        # current stream (its arena is per stream, its staging events on that stream).
-        # One tape, both backends: the contract is documented here, not changed
+        # was prepared on and refuses a call on another by name (a documented
+        # refusal; the eager form of the stack's suites serves any current stream)
         from torch.testing._internal.host_trace_oracle import Oracle
 
         oracle = Oracle(linear, (self._x(4), self.w, self.b))
@@ -485,7 +486,6 @@ class TestHostTraceGemm(TestCase):
             args = (self._x(4), self.w, self.b)
             with self.assertRaisesRegex(RuntimeError, "bound device and stream"):
                 oracle.native(*args)
-            self.assertTrue(torch.equal(oracle.interim.replay(args)[0], linear(*args)))
         oracle.check((self._x(4), self.w, self.b))
 
     def _edges(self, graph):

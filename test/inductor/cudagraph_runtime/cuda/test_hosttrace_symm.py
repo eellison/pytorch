@@ -4,7 +4,7 @@ peer-pointer table, signal pads and rank are per-call lookups from the buffer's 
 address (E19), lowered as pointer fields whose values the numeric plan's call op computes
 per call (retirement stage B, cell 6). Two ranks; every rank traces the same program at
 the same shapes, so misses, declines and variants are identical on all ranks. Each test
-prepares the interim replay beside the native entry from one tape (host_trace_oracle)."""
+checks the native entry against eager from one tape (host_trace_oracle)."""
 
 import statistics
 import time
@@ -188,7 +188,7 @@ class TestHostTraceSymm(MultiProcContinuousTest):
                     missed.append(B)
                     continue
                 self._fill(buf, xb)
-                got = oracle.variant.try_replay((buf, xb, self.group_name))
+                got = oracle.try_check((buf, xb, self.group_name))
                 if got is None:
                     missed.append(B)
                     continue
@@ -397,12 +397,11 @@ class TestHostTraceSymm(MultiProcContinuousTest):
         for B, seed in ((4, 2), (2, 3), (3, 4), (8, 5), (16, 6)):
             oracle.check((buf, self._x(B, seed), w, gamma, self.group_name))
         self.assertEqual(oracle.native.misses, 0)
-        native, interim = oracle.native, oracle.interim
+        native = oracle.native
         xb = self._x(4, 7)
         call = (buf, xb, w, gamma, self.group_name)
         for _ in range(5):
             native(*call)
-            interim.replay(call)
             tp_layer(*call)
         torch.cuda.synchronize()
         dist.barrier()
@@ -420,9 +419,8 @@ class TestHostTraceSymm(MultiProcContinuousTest):
 
         eager_us = timed(lambda: tp_layer(*call))
         native_us = timed(lambda: native(*call))
-        interim_us = timed(lambda: interim.replay(call))
         print(
-            f"[rank {self.rank}] tp_layer B=4 D={D}: eager {eager_us:.0f} us, native {native_us:.0f} us, interim {interim_us:.0f} us per step",
+            f"[rank {self.rank}] tp_layer B=4 D={D}: eager {eager_us:.0f} us, native {native_us:.0f} us per step",
             flush=True,
         )
 

@@ -4,6 +4,8 @@ import statistics
 import time
 import unittest
 
+from host_trace_testing import build
+
 import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
@@ -161,7 +163,7 @@ class HostTraceSymmTest(MultiProcContinuousTest):
             self.assertTrue(
                 any("one_shot_all_reduce_kernel" in n for n in names), names
             )
-            variant = ht.build(tape, fn, args)
+            variant = build(tape, fn, args)
             served, missed = [], []
             for B, seed in (
                 (4, 2),
@@ -194,7 +196,7 @@ class HostTraceSymmTest(MultiProcContinuousTest):
             x1 = self._x(1, 10)
             self._fill(buf, x1)
             tape1 = ht.trace(fn, (buf, x1, self.group_name))
-            v1 = ht.build(tape1, fn, (buf, x1, self.group_name))
+            v1 = build(tape1, fn, (buf, x1, self.group_name))
             x1b = self._x(1, 11)
             self._fill(buf, x1b)
             self._check(
@@ -220,7 +222,7 @@ class HostTraceSymmTest(MultiProcContinuousTest):
         # at 0 when a collective returns, so replays need no per-call state
         buf = self._init()
         args = (buf, self._x(4, 1), self.group_name)
-        variant = ht.build(ht.trace(all_reduce_copy, args), all_reduce_copy, args)
+        variant = build(ht.trace(all_reduce_copy, args), all_reduce_copy, args)
         self._assert_pads_reset(buf)
         outs = []
         xs = [self._x((4, 8, 2, 16, 3)[i % 5], 20 + i) for i in range(100)]
@@ -235,7 +237,7 @@ class HostTraceSymmTest(MultiProcContinuousTest):
     def test_interleaved_with_eager_collectives(self):
         buf = self._init()
         args = (buf, self._x(4, 1), self.group_name)
-        variant = ht.build(ht.trace(all_reduce_copy, args), all_reduce_copy, args)
+        variant = build(ht.trace(all_reduce_copy, args), all_reduce_copy, args)
         for seed in range(5):
             xb = self._x(4, 30 + seed)
             got = variant.replay((buf, xb, self.group_name))[0]
@@ -266,7 +268,7 @@ class HostTraceSymmTest(MultiProcContinuousTest):
                 "symm_world_size",
             ],
         )
-        variant = ht.build(tape, all_reduce_copy, args)
+        variant = build(tape, all_reduce_copy, args)
         buf2 = symm_mem.empty(B_MAX * D, dtype=torch.bfloat16, device=self.device)
         symm_mem.rendezvous(buf2, group=self.group_name)
         self.assertNotEqual(buf.data_ptr(), buf2.data_ptr())
@@ -277,7 +279,7 @@ class HostTraceSymmTest(MultiProcContinuousTest):
             self._check(got, all_reduce_copy(b, xb, self.group_name))
         # the in-buffer form too: the data sits in each buffer
         args = (buf, self._x(4, 1), self.group_name)
-        v2 = ht.build(ht.trace(all_reduce_in_buffer, args), all_reduce_in_buffer, args)
+        v2 = build(ht.trace(all_reduce_in_buffer, args), all_reduce_in_buffer, args)
         for i in range(4):
             b = (buf2, buf)[i % 2]
             xb = self._x(4, 50 + i)
@@ -293,7 +295,7 @@ class HostTraceSymmTest(MultiProcContinuousTest):
         # tensor in the buffer's slot fails the way eager fails, with no hang
         buf = self._init()
         args = (buf, self._x(4, 1), self.group_name)
-        variant = ht.build(ht.trace(all_reduce_copy, args), all_reduce_copy, args)
+        variant = build(ht.trace(all_reduce_copy, args), all_reduce_copy, args)
         plain = torch.empty(B_MAX * D, dtype=torch.bfloat16, device=self.device)
         xb = self._x(4, 2)
         t0 = time.monotonic()
@@ -316,7 +318,7 @@ class HostTraceSymmTest(MultiProcContinuousTest):
         # the same call, so it does the same, identically on every rank
         buf = self._init()
         args = (buf, self._x(4, 1), self.group_name)
-        variant = ht.build(ht.trace(all_reduce_copy, args), all_reduce_copy, args)
+        variant = build(ht.trace(all_reduce_copy, args), all_reduce_copy, args)
         fresh = symm_mem.empty(B_MAX * D, dtype=torch.bfloat16, device=self.device)
         xb = self._x(4, 2)
         t0 = time.monotonic()
@@ -332,7 +334,7 @@ class HostTraceSymmTest(MultiProcContinuousTest):
         # fresh trace on that group serves
         buf = self._init()
         args = (buf, self._x(4, 1), self.group_name)
-        variant = ht.build(ht.trace(all_reduce_copy, args), all_reduce_copy, args)
+        variant = build(ht.trace(all_reduce_copy, args), all_reduce_copy, args)
         # new_group is collective: every rank creates every single-rank group
         # and uses its own
         groups = [dist.new_group([r]) for r in range(self.world_size)]
@@ -350,7 +352,7 @@ class HostTraceSymmTest(MultiProcContinuousTest):
             )
         self.assertIsNone(variant.try_replay((solo_buf, xb, solo.group_name)))
         solo_args = (solo_buf, xb, solo.group_name)
-        v1 = ht.build(ht.trace(all_reduce_copy, solo_args), all_reduce_copy, solo_args)
+        v1 = build(ht.trace(all_reduce_copy, solo_args), all_reduce_copy, solo_args)
         xc = self._x(4, 3)
         self._check(
             v1.replay((solo_buf, xc, solo.group_name))[0],
@@ -388,7 +390,7 @@ class HostTraceSymmTest(MultiProcContinuousTest):
             )
         # a value computed in the traced function is fine (all_reduce_copy)
         args = (buf, self._x(4, 3), self.group_name)
-        variant = ht.build(ht.trace(all_reduce_copy, args), all_reduce_copy, args)
+        variant = build(ht.trace(all_reduce_copy, args), all_reduce_copy, args)
         xb = self._x(4, 4)
         self._check(
             variant.replay((buf, xb, self.group_name))[0],
@@ -435,7 +437,7 @@ class HostTraceSymmTest(MultiProcContinuousTest):
             ht.trace(buffer_inside, (self._x(4, 1), self.group_name), warm_up=False)
         # the process is clean afterwards: a fresh trace serves
         args = (buf, self._x(4, 1), self.group_name)
-        variant = ht.build(ht.trace(all_reduce_copy, args), all_reduce_copy, args)
+        variant = build(ht.trace(all_reduce_copy, args), all_reduce_copy, args)
         xb = self._x(4, 2)
         self._check(
             variant.replay((buf, xb, self.group_name))[0],
@@ -453,13 +455,13 @@ class HostTraceSymmTest(MultiProcContinuousTest):
         gamma = torch.randn(D, device=self.device).to(torch.bfloat16)
         args = (buf, self._x(4, 1), w, gamma, self.group_name)
         tape = ht.trace(tp_layer, args)
-        variant = ht.build(tape, tp_layer, args)
+        variant = build(tape, tp_layer, args)
         for B, seed in ((4, 2), (2, 3), (3, 4), (8, 5), (16, 6)):
             xb = self._x(B, seed)
             got = variant.replay((buf, xb, w, gamma, self.group_name))[0]
             self._check(got, tp_layer(buf, xb, w, gamma, self.group_name))
-        # per-step cost, eager vs the interim replay (the native lowering is
-        # the other team's evaluator); barrier so both ranks start together
+        # per-step cost, eager vs the replay; barrier so both ranks start
+        # together
         xb = self._x(4, 7)
         for _ in range(5):
             variant.replay((buf, xb, w, gamma, self.group_name))
