@@ -336,6 +336,27 @@ class MemoryDep(Dep):
             return True
         return isinstance(self.index, sympy.Symbol) and self.index in self.var_names
 
+    def is_non_overlapping(self) -> bool:
+        """Prove disjoint affine accesses, allowing gaps in storage."""
+        sizevars = V.graph.sizevars
+        strides = sizevars.stride_vars(self.index, self.var_names)
+        affine = self.get_offset() + sum(
+            stride * var for stride, var in zip(strides, self.var_names)
+        )
+        if not sizevars.statically_known_equals(self.index, affine):
+            return False
+        # Hints choose an order; symbolic inequalities establish its safety.
+        hints = [sizevars.optimization_hint(stride, fallback=1) for stride in strides]
+        span = sympy.S.One
+        for axis in sorted(range(len(strides)), key=hints.__getitem__):
+            stride, size = strides[axis], self.size[axis]
+            if not sizevars.statically_known_gt(size, 0) or not (
+                sizevars.statically_known_geq(stride, span)
+            ):
+                return False
+            span += (size - 1) * stride
+        return True
+
     def stride1_for_last_dim(self, result_for_complex_expression: bool = True) -> bool:
         """
         Whether the stride for the last dimension is 1.

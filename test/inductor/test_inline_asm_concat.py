@@ -251,7 +251,159 @@ class TestInlineAsmConcat(TestCase):
 
 
 class TestNestedAsmLaneInputs(NestedLaneTestCase):
+    @parametrize("dynamic_batch", [False, True])
+    @config.patch(
+        {
+            "triton.nested_reduction": True,
+            "loop_ordering_after_fusion": True,
+            "comprehensive_padding": True,
+            "emulate_precision_casts": True,
+            "triton.multi_kernel": 0,
+            "force_disable_caches": True,
+        }
+    )
+    def test_pitched_layer_norm_lanes(self, device, dynamic_batch):
+        asm, constraints = combine_inputs_asm(3)
+        width = 1056
 
+        def fn(x, weight, bias, native=True):
+            value = torch.nn.functional.layer_norm(
+                x.float(), (width,), weight.float(), bias.float()
+            ).to(torch.bfloat16)
+            groups = value.view(x.shape[0], -1, 32)
+            maximum = groups.abs().amax(-1)
+            bits = groups.view(torch.int16).to(torch.int32) & 65535
+            pairs = bits[..., ::2] | (bits[..., 1::2] << 16)
+            if native:
+                words = inline_asm_elementwise(
+                    *pairs.unbind(-1),
+                    maximum.to(torch.int32),
+                    asm_str=asm,
+                    constraints=constraints,
+                    dtype=(torch.int32,) * 3,
+                )
+            else:
+                words = []
+                for i in range(3):
+                    word = pairs[..., i] ^ maximum.to(torch.int32)
+                    for j in range(i + 3, 16, 3):
+                        word = word ^ pairs[..., j]
+                    words.append(word)
+            packed = torch.stack(words, -1).reshape(x.shape[0], -1)
+            return torch.nn.functional.pad(packed, (0, 9)), maximum
+
+        def make_input(batch):
+            # Repeated signed rows keep BF16 rounding away from midpoints.
+            row = (torch.arange(width, device=device) % 32 - 16).float() / 8
+            signs = (torch.arange(batch, device=device) % 2 * 2 - 1).float()
+            return (signs[:, None] * row[None, :]).half()
+
+        weight = ((torch.arange(width, device=device) % 5 + 1).float() / 8).half()
+        bias = ((torch.arange(width, device=device) % 3 - 1).float() / 16).half()
+        x = make_input(128)
+        if dynamic_batch:
+            torch._dynamo.mark_dynamic(x, 0)
+        counter = CompileCounterWithBackend("inductor")
+        compiled = torch.compile(fn, backend=counter, fullgraph=True)
+        metrics.reset()
+        actual, kernels = run_and_get_kernels(compiled, x, weight, bias)
+        self.assertEqual(actual, fn(x, weight, bias, False), atol=0, rtol=0)
+        for batch in (2, 17, 129) if dynamic_batch else (128,):
+            value = make_input(batch)
+            actual = compiled(value, weight, bias)
+            expected = fn(value, weight, bias, False)
+            self.assertEqual(actual, expected, atol=0, rtol=0)
+            self.assertEqual(
+                tuple(t.stride() for t in actual), tuple(t.stride() for t in expected)
+            )
+        self.assertEqual(counter.frame_count, 1)
+        self.assertEqual(metrics.codegen_nested_reduction, 1)
+        compute = [kernel for kernel in kernels if "tl.load(" in kernel]
+        self.assertEqual(len(compute), 1)
+        self.assertTrue("welford" in compute[0] or "tl.sum(" in compute[0])
+        self.assertIn("triton_helpers.max2(", compute[0])
+        self.assertIn("tl.inline_asm_elementwise(", compute[0])
+        self.assertNotIn("in_ptr3", compute[0])  # No BF16 intermediate input.
+        self.assertEqual(compute[0].count("tl.store("), 2)
+
+    @parametrize(
+        "mode", ["escape", "dynamic", "misaligned", "cross_row", "input_mutation"]
+    )
+    @config.patch(
+        {
+            "triton.nested_reduction": True,
+            "loop_ordering_after_fusion": True,
+            "comprehensive_padding": True,
+            "emulate_precision_casts": True,
+            "triton.multi_kernel": 0,
+            "force_disable_caches": True,
+        }
+    )
+    def test_pitched_group_lanes_and_aliases(self, device, mode):
+        pitch = 14 if mode == "misaligned" else 16
+
+        def fn(x):
+            value = (x - x.mean(-1, keepdim=True)).to(torch.bfloat16)
+            pitched = torch.empty_strided(
+                x.shape, (pitch, 1), dtype=value.dtype, device=x.device
+            )
+            pitched.copy_(value)
+            groups = pitched.view(x.shape[0], 3, 4)
+            lane = groups[..., 1]
+            if mode == "cross_row":
+                lane = lane.roll(1, dims=0)
+            result = groups.abs().amax(-1) + lane
+            if mode == "input_mutation":
+                x.add_(1)
+                return result, x
+            return (result,) if mode == "cross_row" else (result, pitched)
+
+        def make_input(batch):
+            row = (torch.arange(12, device=device) % 4 - 2).float() / 8
+            signs = (torch.arange(batch, device=device) % 2 * 2 - 1).float()
+            return signs[:, None] * row[None, :]
+
+        x = make_input(37)
+        if mode == "dynamic":
+            torch._dynamo.mark_dynamic(x, 0)
+        counter = CompileCounterWithBackend("inductor")
+        compiled = torch.compile(fn, backend=counter, fullgraph=True)
+        expected = fn(x.clone())
+        metrics.reset()
+        actual, kernels = run_and_get_kernels(compiled, x)
+        self.assertEqual(actual, expected, atol=0, rtol=0)
+        self.assertEqual(
+            tuple(t.stride() for t in actual), tuple(t.stride() for t in expected)
+        )
+        if mode == "dynamic":
+            for batch in (2, 17, 129):
+                value = make_input(batch)
+                result, ref = compiled(value), fn(value)
+                self.assertEqual(result, ref, atol=0, rtol=0)
+                self.assertEqual(
+                    tuple(t.stride() for t in result), tuple(t.stride() for t in ref)
+                )
+        self.assertEqual(counter.frame_count, 1)
+        if mode == "input_mutation":
+            self.assertEqual(actual[1].data_ptr(), x.data_ptr())
+        if len(actual) == 2:
+            actual[0].fill_(17)
+            expected[0].fill_(17)
+            self.assertEqual(actual, expected, atol=0, rtol=0)
+            actual[1].add_(5)
+            expected[1].add_(5)
+            self.assertEqual(actual, expected, atol=0, rtol=0)
+        fused = mode not in ("misaligned", "cross_row")
+        self.assertEqual(metrics.codegen_nested_reduction, int(fused))
+        self.assertEqual(len(kernels), 1 if mode in ("escape", "dynamic") else 2)
+        if mode in ("escape", "dynamic"):
+            self.assertIn("tl.sum(", kernels[0])
+            self.assertTrue(
+                "triton_helpers.max2(" in kernels[0]
+                or kernels[0].count("tl.maximum(") >= 3
+            )
+            self.assertNotIn("in_ptr1", kernels[0])
+            self.assertEqual(kernels[0].count("tl.store("), 2)
 
     @parametrize("use_asm", [False, True])
     @parametrize(
