@@ -183,8 +183,9 @@ class TestCudaHostTraceGemm(HostTraceTestCase):
         self.assertEqual(r["op"], "addmm")
         self.assertEqual([i["name"] for i in r["inputs"]], ["bias", "mat1", "mat2"])
         # every input dimension is a symbol on the tape; M and N differ
-        self.assertIsInstance(r["out"]["sizes"][0], str)
-        self.assertNotEqual(r["out"]["sizes"][0], r["out"]["sizes"][1])
+        (out,) = r["outputs"]
+        self.assertIsInstance(out["sizes"][0], str)
+        self.assertNotEqual(out["sizes"][0], out["sizes"][1])
         variant = build(tape, linear, (x, self.w, self.b))
         self.assertTrue(self._check(variant, linear, (self._x(4), self.w, self.b)))
         if variant.native is not None:
@@ -518,7 +519,7 @@ class TestCudaHostTraceGemm(HostTraceTestCase):
         regions = json.loads(tape.to_json())["regions"]
         real = {hex(t.data_ptr()) for t in (x, self.w, self.b)}
         for r in regions:
-            for o in [*r["inputs"], r["out"]]:
+            for o in [*r["inputs"], *r["outputs"]]:
                 self.assertIsInstance(o["address"], str)
                 self.assertNotIn(
                     str(int(o["address"], 0)) if o["address"].isdigit() else "", real
