@@ -1533,12 +1533,16 @@ class _LaneProjection:
     lane is equal and parent resolution used the value itself (a lifted
     per-group value). While ``split`` is False the value is a placeholder
     whose tl.split has not been emitted; consumers that fold onto the parent
-    chain may keep it that way forever.
+    chain may keep it that way forever. ``factor`` counts the remaining lanes
+    in ``parent``. ``source`` identifies their common origin, or is None when
+    pointwise folding combined unrelated sources.
     """
 
     parent: CSEVariable
     lane: int | None
     split: bool
+    factor: int
+    source: CSEVariable | None
 
 
 class _SubParentFusion(enum.Enum):
@@ -1946,6 +1950,8 @@ class _GroupedReductionLayout:
         )
 
     def child_block(self, factor: int) -> str:
+        if factor == self.local_reduction_size:
+            return self.num_groups_str
         return str(FloorDiv(self.group_tree.block_size(), factor))
 
     def make_sub_parent_family(self, factor: int) -> _DerivedIterationFamily:
@@ -1954,7 +1960,11 @@ class _GroupedReductionLayout:
         derived_tree = DerivedIterationRangesRoot(
             self.group_tree,
             numel=FloorDiv(self.group_tree.numel, factor),
-            block_size=FloorDiv(self.group_tree.block_size(), factor),
+            block_size=(
+                self.reduced_block_sym
+                if factor == self.local_reduction_size
+                else FloorDiv(self.group_tree.block_size(), factor)
+            ),
             block_offset=FloorDiv(self.group_tree.block_offset(), factor),
             name_suffix=f"lane{factor}",
             named_constants=self._grouped_axis_named_constants(self.group_tree),
@@ -2104,9 +2114,13 @@ class _GroupedReductionLayout:
         family: _DerivedIterationFamily,
         factor: int,
         shape: Sequence[int | str],
+        *,
+        remaining: int = 1,
     ) -> tuple[tuple[str, ...], tuple[str, ...]]:
-        """Reshape and per-lane shapes that split a parent tile into lanes."""
+        """Shapes for a full or partial split, retaining ``remaining`` lanes."""
         child_block = family.sub_parent_tree().block_size_str()
+        if remaining != 1:
+            child_block = f"({child_block} * {remaining})"
         factor_dim = str(factor)
         if len(shape) == 2:
             # make_sub_parent_family requires the split parent axis to be R,
@@ -2421,6 +2435,24 @@ class _PointwiseRemapHandler(WrapperHandler):  # type: ignore[type-arg]
 class _SubParentValueResolver(WrapperHandler):  # type: ignore[type-arg]
     """Use exhaustive access proofs as a per-name sub-parent replay contract."""
 
+    _hoistable_casts = frozenset(("to_dtype", "to_dtype_bitcast"))
+    _hoistable_binary_ops = frozenset(
+        (
+            "add",
+            "sub",
+            "mul",
+            "bitwise_and",
+            "bitwise_or",
+            "bitwise_xor",
+            "bitwise_left_shift",
+            "bitwise_right_shift",
+            "lshift",
+            "rshift",
+        )
+    )
+
+    _synthesizable_ops = _hoistable_casts | _hoistable_binary_ops
+
     def __init__(
         self,
         inner,
@@ -2436,6 +2468,8 @@ class _SubParentValueResolver(WrapperHandler):  # type: ignore[type-arg]
         self._layout = layout
         self._sub_parent_family = sub_parent_family
         self._sub_parent_factor = sub_parent_factor
+        # CSE owns cache lifetime; this namespace preserves derived-family scope.
+        self._cse_namespace = f"lane_value{next(kernel.cse.iter_buffer_ids)}"
         # Fusion checks each access. Replay only needs their consistent per-name
         # consequences: capture role and any permitted parent lanes.
         relations_by_name: dict[str, list[scheduler.SubParentAccessRelation]] = (
@@ -2478,9 +2512,6 @@ class _SubParentValueResolver(WrapperHandler):  # type: ignore[type-arg]
         self._values: dict[str, OrderedSet[CSEVariable]] = {}
         self._materialized: dict[CSEVariable, MaterializedSubParentValue] = {}
         self._lane_projections: dict[CSEVariable, _LaneProjection] = {}
-        # Pointwise results at parent resolution, recorded as they are
-        # emitted, so a lane replay of the same op can fold onto them.
-        self._parent_twins: dict[str, CSEVariable] = {}
 
     def _default(self, name: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
         folded = self._try_fold_lane_op(name, args, kwargs)
@@ -2491,11 +2522,11 @@ class _SubParentValueResolver(WrapperHandler):  # type: ignore[type-arg]
         self._record_parent_twin(name, args, kwargs, result)
         return result
 
-    @staticmethod
-    def _twin_key(name: str, args: Sequence[Any], kwargs: dict[str, Any]) -> str:
+    def _twin_key(self, name: str, args: Sequence[Any], kwargs: dict[str, Any]) -> str:
         """The same equivalence CSE uses -- op plus operand names -- keyed
         before formatting instead of after."""
-        parts = [name]
+        # Semantic aliases cannot collide with emitted expression strings.
+        parts = [self._cse_namespace, name]
         parts.extend(
             f"v{arg}" if isinstance(arg, CSEVariable) else f"c{arg!r}" for arg in args
         )
@@ -2505,7 +2536,9 @@ class _SubParentValueResolver(WrapperHandler):  # type: ignore[type-arg]
     def _record_parent_twin(
         self, name: str, args: tuple[Any, ...], kwargs: dict[str, Any], result: Any
     ) -> None:
-        if name not in registered_pointwise_ops or self._kernel._load_mask is not None:
+        if (
+            name not in registered_pointwise_ops and name not in self._synthesizable_ops
+        ) or self._kernel._load_mask is not None:
             return
         if not isinstance(result, CSEVariable) or result.shape is None:
             return
@@ -2513,7 +2546,9 @@ class _SubParentValueResolver(WrapperHandler):  # type: ignore[type-arg]
             return
         if any(isinstance(value, CSEVariable) for value in kwargs.values()):
             return
-        self._parent_twins[self._twin_key(name, args, kwargs)] = result
+        self._kernel.cse.put(
+            self._twin_key(name, args, kwargs), cast("TritonCSEVariable", result)
+        )
 
     def _is_lane_invariant(self, value: CSEVariable) -> bool:
         shape = value.shape
@@ -2528,8 +2563,17 @@ class _SubParentValueResolver(WrapperHandler):  # type: ignore[type-arg]
         projection = self._lane_projections.get(value)
         if projection is None or projection.split or projection.lane is None:
             return value
-        materialized = self._materialize(projection.parent)
-        if not isinstance(materialized, tuple):
+        if not self._kernel.cse.contains_value(
+            cast("TritonCSEVariable", projection.parent)
+        ):
+            raise AssertionError("pending lane value lost its parent tile")
+        if projection.factor == 1:
+            self._sub_parent_family.set_value_masks(self._kernel, (projection.parent,))
+            return projection.parent
+        materialized = self._split_parent(
+            projection.parent, projection.factor, projection.factor
+        )
+        if materialized is None:
             raise AssertionError("pending lane value lost its parent tile")
         real = _select_lane(materialized, sympy.Integer(projection.lane))
         if real is None:
@@ -2537,58 +2581,167 @@ class _SubParentValueResolver(WrapperHandler):  # type: ignore[type-arg]
         self._lane_projections[real] = dataclasses.replace(projection, split=True)
         return real
 
+    def _emit_parent_op(
+        self, name: str, args: tuple[Any, ...], kwargs: dict[str, Any]
+    ) -> CSEVariable:
+        result = getattr(self._inner, name)(*args, **kwargs)
+        if not isinstance(result, CSEVariable) or result.shape is None:
+            raise AssertionError(f"ops.{name} must produce a shaped pointwise value")
+        self._kernel.cse.put(
+            self._twin_key(name, args, kwargs), cast("TritonCSEVariable", result)
+        )
+        return result
+
+    def _split_parent(
+        self,
+        value: CSEVariable,
+        factor: int,
+        split_factor: int,
+    ) -> tuple[CSEVariable, ...] | None:
+        """Split a live parent tile, reusing parts in the current CSE scope."""
+        if not self._kernel.cse.contains_value(cast("TritonCSEVariable", value)):
+            return None
+        if split_factor < 2 or factor % split_factor or value.shape is None:
+            raise AssertionError("invalid partial lane split")
+        reshape_shape, part_shape = self._layout.sub_parent_split_shapes(
+            self._sub_parent_family,
+            split_factor,
+            value.shape,
+            remaining=factor // split_factor,
+        )
+        keys = [
+            self._twin_key("lane_split", (value, reshape_shape, part_shape, lane), {})
+            for lane in range(split_factor)
+        ]
+        cached = tuple(self._kernel.cse.try_get(key) for key in keys)
+        if all(part is not None for part in cached):
+            parts = cast("tuple[CSEVariable, ...]", cached)
+        else:
+            parts = tuple(
+                self._kernel.cse.newvar(
+                    bounds=value.bounds, dtype=value.dtype, shape=part_shape
+                )
+                for _ in range(split_factor)
+            )
+            self._kernel.emit_split_via_reshape(
+                value, reshape_shape, tuple(map(str, parts))
+            )
+            for key, part in zip(keys, parts):
+                self._kernel.cse.put(key, cast("TritonCSEVariable", part))
+        if factor == split_factor:
+            self._sub_parent_family.set_value_masks(self._kernel, parts)
+        return parts
+
     def _try_fold_lane_op(
         self, name: str, args: tuple[Any, ...], kwargs: dict[str, Any]
     ) -> CSEVariable | None:
-        """Replay a lane pointwise op as the lane of its parent-resolution twin.
+        """Keep pointwise lane computations before their final split.
 
-        The epilogue body recomputes the parent's pointwise chain per lane from
-        split loads. When the same op ran on the same operands at parent
-        resolution, its recorded result already holds every lane, so the chain
-        collapses into one split of its final value. The split is deferred so
-        intermediate lanes never reach the generated code.
+        Reuse existing unsplit computations or synthesize cheap operations.
+        Aligned neighboring lanes from one source can combine at half width.
+        Other cross-lane operations retain ordinary lane materialization.
         """
-        if name not in registered_pointwise_ops or self._kernel._load_mask is not None:
+        if (
+            name not in registered_pointwise_ops and name not in self._synthesizable_ops
+        ) or self._kernel._load_mask is not None:
             return None
-        if not self._lane_projections or not self._parent_twins:
+        if not self._lane_projections:
             return None
         if any(isinstance(v, CSEVariable) for v in kwargs.values()):
             return None
-        lane: int | None = None
+        projections: list[_LaneProjection] = []
         parent_args: list[Any] = []
+        can_synthesize = True
         for arg in args:
             if isinstance(arg, CSEVariable):
                 projection = self._lane_projections.get(arg)
                 if projection is not None and projection.lane is not None:
-                    if lane is not None and lane != projection.lane:
-                        return None
-                    lane = projection.lane
+                    projections.append(projection)
                     parent_args.append(projection.parent)
                 elif projection is not None or self._is_lane_invariant(arg):
                     parent_args.append(arg)
+                    can_synthesize &= self._is_lane_invariant(arg)
                 else:
                     return None
             elif isinstance(arg, (tuple, list)):
                 return None
             else:
                 parent_args.append(arg)
-        if lane is None:
+        if not projections:
             return None
-        parent_value = self._parent_twins.get(self._twin_key(name, parent_args, kwargs))
+        lane = projections[0].lane
+        factor = projections[0].factor
+        source = projections[0].source
+        if any(projection.factor != factor for projection in projections):
+            return None
+        if any(projection.source is not source for projection in projections):
+            source = None
+        if any(projection.lane != lane for projection in projections):
+            if (
+                name not in self._hoistable_binary_ops
+                or len(args) != 2
+                or len(projections) != 2
+                or source is None
+                or factor < 2
+                or factor % 2
+            ):
+                return None
+            left, right = projections
+            if (
+                left.lane is None
+                or right.lane is None
+                or left.lane // 2 != right.lane // 2
+                or left.lane % 2 == right.lane % 2
+            ):
+                return None
+            halves = [
+                self._split_parent(projection.parent, factor, 2)
+                for projection in projections
+            ]
+            if any(half is None for half in halves):
+                return None
+            parent_args = [
+                half[cast(int, projection.lane) % 2]
+                for half, projection in zip(halves, projections)
+                if half is not None
+            ]
+            factor //= 2
+            lane = left.lane // 2
+        parent_value = self._kernel.cse.try_get(
+            self._twin_key(name, parent_args, kwargs)
+        )
+        if parent_value is None and name in self._synthesizable_ops:
+            # Only cheap pointwise operations may be synthesized. Other folding
+            # continues to require an existing unsplit computation.
+            if not can_synthesize:
+                return None
+            if any(
+                isinstance(arg, CSEVariable)
+                and not self._kernel.cse.contains_value(cast("TritonCSEVariable", arg))
+                for arg in parent_args
+            ):
+                return None
+            parent_value = self._emit_parent_op(name, tuple(parent_args), kwargs)
         if parent_value is None or parent_value.shape is None:
             return None
-        if not self._kernel.cse.contains_value(cast("TritonCSEVariable", parent_value)):
-            return None
-        _, part_shape = self._layout.sub_parent_split_shapes(
-            self._sub_parent_family, self._sub_parent_factor, parent_value.shape
+        return self._defer_lane(
+            _LaneProjection(
+                parent_value, lane, split=False, factor=factor, source=source
+            )
         )
-        placeholder = self._kernel.cse.newvar(
-            bounds=parent_value.bounds, dtype=parent_value.dtype, shape=part_shape
+
+    def _defer_lane(self, projection: _LaneProjection) -> CSEVariable:
+        parent = projection.parent
+        if parent.shape is None:
+            raise AssertionError("a pending lane must have a shaped parent")
+        _, shape = self._layout.sub_parent_split_shapes(
+            self._sub_parent_family, self._sub_parent_factor, parent.shape
         )
-        self._lane_projections[placeholder] = _LaneProjection(
-            parent_value, lane, split=False
+        pending = self._kernel.cse.newvar(
+            bounds=parent.bounds, dtype=parent.dtype, shape=shape
         )
-        return placeholder
+        self._lane_projections[pending] = projection
+        return pending
 
     def _record(self, name: str, value: CSEVariable, *, store: bool) -> None:
         """Cache a value when its operation can produce the planned source."""
@@ -2671,7 +2824,7 @@ class _SubParentValueResolver(WrapperHandler):  # type: ignore[type-arg]
         if not isinstance(materialized, CSEVariable):
             raise AssertionError("group-width value did not materialize")
         self._lane_projections[materialized] = _LaneProjection(
-            materialized, None, split=True
+            materialized, None, split=True, factor=1, source=None
         )
         return materialized
 
@@ -2734,16 +2887,11 @@ class _SubParentValueResolver(WrapperHandler):  # type: ignore[type-arg]
             if not self._kernel.cse.contains_value(cast("TritonCSEVariable", source)):
                 return None
             lane_value = self._planned_lane(name, index)
-            _, part_shape = self._layout.sub_parent_split_shapes(
-                self._sub_parent_family, self._sub_parent_factor, source_shape
+            return self._defer_lane(
+                _LaneProjection(
+                    source, lane_value, False, self._sub_parent_factor, source
+                )
             )
-            pending = self._kernel.cse.newvar(
-                bounds=source.bounds, dtype=source.dtype, shape=part_shape
-            )
-            self._lane_projections[pending] = _LaneProjection(
-                source, lane_value, split=False
-            )
-            return pending
         materialized = self._materialize(source)
         if materialized is None:
             return None
@@ -2753,7 +2901,13 @@ class _SubParentValueResolver(WrapperHandler):  # type: ignore[type-arg]
         value = _select_lane(materialized, sympy.Integer(lane_value))
         if value is None:
             raise AssertionError(f"invalid lane {lane_value} for {name!r}")
-        self._lane_projections[value] = _LaneProjection(source, lane_value, split=True)
+        self._lane_projections[value] = _LaneProjection(
+            source,
+            lane_value,
+            split=True,
+            factor=self._sub_parent_factor,
+            source=source,
+        )
         return value
 
     def _planned_lane(self, name: str, index: sympy.Expr) -> int:
@@ -2996,6 +3150,19 @@ class SIMDScheduling(BaseScheduling):
                     why("nodes numel incompatibility")
 
             if ordinary_fusion and type(node2) is not scheduler.FusedStagedReduction:
+                nodes = [*node2.get_nodes(), *node1.get_nodes()]
+                if not any(
+                    self._is_sub_parent_shaped(node, numel2, rnumel2) for node in nodes
+                ):
+                    return True
+                plan = scheduler.NestedReduction.sub_parent_epilogue_plan(
+                    nodes, numel2, rnumel2
+                )
+                if plan is not None and plan.requires_persistent:
+                    return (
+                        self._sub_parent_epilogue_plan(nodes, numel2, rnumel2)
+                        is not None
+                    )
                 return True
 
             if (
@@ -3118,6 +3285,15 @@ class SIMDScheduling(BaseScheduling):
             return None
         if not self._sub_parent_tiling_is_2d(nodes, parent_numel, parent_rnumel):
             return None
+        if plan.requires_persistent:
+            schedule = self.generate_node_schedule(
+                list(plan.parent_nodes), parent_numel, parent_rnumel
+            )
+            features = SIMDKernelFeatures(schedule, parent_numel, parent_rnumel)
+            if not V.choices.should_use_persistent_reduction(
+                features, cooperative_reduction=False
+            ):
+                return None
         return plan
 
     def _sub_parent_tiling_is_2d(
@@ -3718,17 +3894,20 @@ class SIMDScheduling(BaseScheduling):
                 )
                 sub_parent_family: _DerivedIterationFamily | None = None
                 value_resolver: _SubParentValueResolver | None = None
-                if sub_parent_stage is not None:
-                    sub_parent_family = layout.make_sub_parent_family(
-                        sub_parent_stage.factor
+                if sub_parent_stage is not None or stage.lane_accesses:
+                    factor, relations = (
+                        (sub_parent_stage.factor, sub_parent_stage.access_relations)
+                        if sub_parent_stage is not None
+                        else (local_reduction_size_hint, stage.lane_accesses)
                     )
+                    sub_parent_family = layout.make_sub_parent_family(factor)
                     value_resolver = _SubParentValueResolver(
                         V.get_ops_handler(),
                         kernel,
                         layout,
                         sub_parent_family,
-                        access_relations=sub_parent_stage.access_relations,
-                        sub_parent_factor=sub_parent_stage.factor,
+                        access_relations=relations,
+                        sub_parent_factor=factor,
                     )
                 with V.set_ops_handler(value_resolver or V.get_ops_handler()):
                     self._codegen_node_schedule_body(combined_schedule, kernel)
@@ -3775,6 +3954,7 @@ class SIMDScheduling(BaseScheduling):
                         pointwise_domain_by_node,
                         reduced_output_family,
                         parent_full_family,
+                        value_resolver=value_resolver if stage.lane_accesses else None,
                     )
                 if sub_parent_stage is not None:
                     if sub_parent_family is None or value_resolver is None:
@@ -3848,6 +4028,8 @@ class SIMDScheduling(BaseScheduling):
         ],
         reduced_output_family,
         parent_full_family,
+        *,
+        value_resolver: _SubParentValueResolver | None = None,
     ) -> None:
         """Interpret the local reduction schedule with nested emitters.
 
@@ -3894,6 +4076,7 @@ class SIMDScheduling(BaseScheduling):
                     [sn],
                     reduced_output_family,
                     reduced_source,
+                    value_resolver=value_resolver,
                 )
                 continue
             elif (
@@ -4154,6 +4337,8 @@ class SIMDScheduling(BaseScheduling):
             "tiling_scores": tiling_score,
             "override_cooperative_reduction": False,
         }
+        if plan.requires_persistent:
+            kernel_kwargs["override_persistent_reduction"] = True
         kernels = cast(
             "list[TritonKernel]",
             self.create_kernel_choices(kernel_features, [tiling], kernel_kwargs),
@@ -4162,6 +4347,8 @@ class SIMDScheduling(BaseScheduling):
         sub_parent_factor = stage.factor
         parent_rnumel = plan.parent_rnumel
         for kernel in kernels:
+            if plan.requires_persistent and not kernel.persistent_reduction:
+                raise AssertionError("fixed-lane forwarding requires a persistent tile")
             kernel.min_rblock = sub_parent_factor
             if len(kernel.range_trees) != 2:
                 raise AssertionError("sub-parent codegen requires a 2D kernel")

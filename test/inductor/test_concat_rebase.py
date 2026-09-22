@@ -434,7 +434,7 @@ class TestConcatRebase(RebaseTestCase):
         )
         expected = result((x + 1, x + 2, x + 3))
         actual, expected = self.check(
-            fn, x, rebase=not default_policy, expected=expected, settings=settings
+            fn, x, rebase=True, expected=expected, settings=settings
         )
         if escape == "sibling":
             # The third HOP output escapes; only private materialized inputs move.

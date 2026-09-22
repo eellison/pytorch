@@ -1091,6 +1091,7 @@ class TestScheduler(TestCase):
         consumer.unmet_dependencies = OrderedSet([read])
         relation = SubParentAccessRelation((planned_write,), planned_read, None, True)
         plan = Mock(
+            requires_persistent=False,
             nested_stage=None,
             sub_parent_stages=(
                 Mock(access_relations=(relation,), epilogue_nodes=(consumer,)),
@@ -1130,7 +1131,8 @@ class TestScheduler(TestCase):
         consumer.read_writes.reads = OrderedSet([read])
         consumer.unmet_dependencies = OrderedSet([read])
         plan = Mock(
-            nested_stage=Mock(grouped_nodes=(consumer,))
+            requires_persistent=False,
+            nested_stage=Mock(grouped_nodes=(consumer,), lane_accesses=())
             if ownership != "none"
             else None,
             sub_parent_stages=(Mock(access_relations=(), epilogue_nodes=(consumer,)),)
@@ -1166,6 +1168,7 @@ class TestScheduler(TestCase):
         consumer.read_writes.reads = OrderedSet([read])
         consumer.unmet_dependencies = OrderedSet([read])
         plan = Mock(
+            requires_persistent=False,
             nested_stage=None,
             sub_parent_stages=(Mock(access_relations=(), epilogue_nodes=(consumer,)),),
         )
@@ -1360,8 +1363,10 @@ class TestScheduler(TestCase):
         grouped.get_nodes.return_value = (grouped,)
         context = Mock(grouped_axis=NestedReduction.GroupedAxis.R)
 
-        self.assertFalse(
-            NestedReduction._r_grouped_stage_accesses_match(outer, grouped, context, ())
+        self.assertIsNone(
+            NestedReduction._try_get_r_grouped_lane_accesses(
+                outer, grouped, context, ()
+            )
         )
 
     @parametrize("writer_role", ["parent_stage", "local_input", "reduction"])
