@@ -17,6 +17,7 @@ _METADATA_OPS = {
     "cute.static": ("StaticOp", 0),
     "cute.make_shape": ("MakeShapeOp", None),
     "cute.make_stride": ("MakeStrideOp", None),
+    "cute.make_ordered_layout": ("MakeOrderedLayoutOp", None),
     "cute.make_composed_layout": ("MakeComposedLayoutOp", 3),
     "cute.tile_to_shape": ("TileToShapeOp", 3),
     "cute.raked_product": ("RakedProductOp", 2),
@@ -200,7 +201,9 @@ def _validate_tree(module: Any, operation: Any, kernels: dict[Any, Any]) -> None
             value = operation.attributes["value"]
             result_type = operation.results[0].type
             valid = ((isinstance(value, ir.IntegerAttr) and value.type == result_type)
-                     or (isinstance(value, ir.BoolAttr) and str(result_type) == "i1"))
+                     or (isinstance(value, ir.BoolAttr) and str(result_type) == "i1")
+                     or (isinstance(value, ir.FloatAttr) and value.type == result_type
+                         and str(result_type) in ("f32", "f64")))
     elif operation.name == "arith.cmpi":
         valid = (attrs == {"predicate"} and isinstance(operation.attributes["predicate"], ir.IntegerAttr)
                  and 0 <= operation.attributes["predicate"].value <= 9
@@ -210,7 +213,8 @@ def _validate_tree(module: Any, operation: Any, kernels: dict[Any, Any]) -> None
         kernels[kernel] = _snapshot(kernel)
         valid = True
     if not valid:
-        raise ValueError(f"Unsupported source dependency or effect: {operation.name}, attributes={dict((key, str(operation.attributes[key])) for key in attrs)}")
+        attributes = {key: str(operation.attributes[key]) for key in attrs}
+        raise ValueError(f"Unsupported source dependency or effect: {operation.name}, attributes={attributes}")
 
 
 @dataclass(frozen=True)

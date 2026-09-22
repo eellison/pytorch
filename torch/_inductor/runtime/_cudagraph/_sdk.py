@@ -83,3 +83,8 @@ def activate() -> None:
     elif _FINDER not in sys.meta_path:
         sys.meta_path.insert(0, _FINDER)
     importlib.import_module("cutlass.cute")
+    # the host trace's DSL-level hooks (compiled programs under a trace) are
+    # installed with the SDK, before any conversion snapshots the DSL's runtime
+    from torch.cuda import _host_trace_cute_dsl
+
+    _host_trace_cute_dsl.install()

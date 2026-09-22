@@ -13,6 +13,10 @@ def _type(typ: Any) -> str:
 
     if isinstance(typ, ir.IntegerType) and typ.is_signless:
         return "i" + str(typ.width)
+    if isinstance(typ, ir.F32Type):
+        return "float"
+    if isinstance(typ, ir.F64Type):
+        return "double"
     if isinstance(typ, llvm.PointerType):
         return "ptr" if typ.address_space == 0 else f"ptr addrspace({typ.address_space})"
     vector = _integer_vector_parts(typ)

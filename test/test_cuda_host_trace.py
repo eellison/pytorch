@@ -327,15 +327,26 @@ class TestCudaHostTrace(TestCase):
         with self.assertRaisesRegex(ht.Miss, "guard failed"):
             variant.replay(self._args(*odd))
 
-    def test_raw_data_ptr_on_a_traced_input_raises(self):
+    def test_data_ptr_on_a_traced_input_is_its_address_symbol(self):
+        # a Python read of the address (torch._native's override conditions test
+        # a pointer's alignment): the root's address symbol plus the offset, a
+        # comparison on it a guard of the tape; returned from the call it is no
+        # tensor, and the failed trace leaves nothing behind
         x, w, b = self._inputs(8)
+
+        def aligned(t, shape, weight, bias, eps):
+            return F.layer_norm(t, shape, weight, bias, eps) * (
+                2 if t.data_ptr() % 16 == 0 else 3
+            )
+
+        tape = ht.trace(aligned, self._args(x, w, b))
+        self.assertTrue(any("Mod" in str(g) for g in tape.guards), tape.guards)
 
         def read_pointer(t, shape, weight, bias, eps):
             return t.data_ptr()
 
-        with self.assertRaisesRegex(RuntimeError, "sym_const_data_ptr"):
+        with self.assertRaisesRegex(ht.Declined, "returned SymInt"):
             ht.trace(read_pointer, self._args(x, w, b))
-        # the failed trace left nothing behind
         self.assertFalse(torch._C._host_trace_tracing())
         tape, _ = self._trace(8)
         self.assertEqual(tape.num_launches, 1)
@@ -1132,9 +1143,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { m.def("alloc_by_eighth", &alloc_by_ei
         from torch._native import registry
 
         if any(n.active for n in registry._graphs.get(("_fused_rms_norm", "CUDA"), ())):
-            # eager's route here is torch._native's override (the CuTe DSL rms norm,
-            # whose condition reads the pointers' alignment): the decline names it
-            message = "_fused_rms_norm.*torch._native's cutedsl override.*not recorded"
+            # eager's route here is torch._native's override (the vendored QuACK
+            # CuTe DSL rms norm): its program is recorded through the DSL-level
+            # hook (torch/cuda/_host_trace_cute_dsl.py) when compiled in this
+            # process; QuACK's on-disk cache serves a loaded module instead,
+            # which the hook cannot re-select, and that declines by name
+            from torch._vendor.quack import cache
+
+            if not cache.CACHE_ENABLED:
+                self.assertEqual(
+                    ht.trace(fused, (x, [self.N], w, 1e-5)).num_launches, 1
+                )
+                return
+            message = "CuTe DSL program the recorder does not hook.*loaded from a compiled module"
         with self.assertRaisesRegex(ht.Declined, message):
             ht.trace(fused, (x, [self.N], w, 1e-5))
         with self.assertRaisesRegex(ht.Declined, message):

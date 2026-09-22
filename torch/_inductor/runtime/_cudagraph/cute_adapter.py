@@ -255,20 +255,20 @@ def _symbolic(value, symbols):
     return symbolic_integer(value, symbols, CuTeDeclined)
 
 
-def _condition(predicate, symbols):
+def _condition(predicate, symbolic):
     value = predicate.expression
     if type(value) is Comparison:
         operators = {"eq": sympy.Eq, "ne": sympy.Ne, "slt": sympy.Lt,
                      "sle": sympy.Le, "sgt": sympy.Gt, "sge": sympy.Ge}
         if value.predicate not in operators:
             raise CuTeDeclined("CuTe unsigned predicates need a typed guard lowering")
-        return operators[value.predicate](_symbolic(value.left, symbols), _symbolic(value.right, symbols))
+        return operators[value.predicate](symbolic(value.left), symbolic(value.right))
     if type(value) is IntExpr and predicate.llvm_type == "i1":
-        return sympy.Eq(_symbolic(value, symbols), 1)
+        return sympy.Eq(symbolic(value), 1)
     raise CuTeDeclined("CuTe dispatch has no supported exact predicate")
 
 
-def _check_fields(bound, operands, sources, root_alignments, trace):
+def _check_fields(bound, operands, sources, root_alignments, correspondence):
     owner, site = bound.module, bound.module.site
     artifact = owner.artifact
     if (struct.calcsize("P") != 8 or tuple(size for _, size in owner.parameter_layout) != owner.parameter_sizes
@@ -287,11 +287,11 @@ def _check_fields(bound, operands, sources, root_alignments, trace):
     guards = []
     for key, row in fields.items():
         kind, origin = schema[key]
-        if (row.kind != kind or kind not in ("pointer", "i32", "i64")
+        if (row.kind != ("i32" if kind == "f32" else kind) or kind not in ("pointer", "i32", "i64", "f32")
                 or type(row.parameter) is not int or not 0 <= row.parameter < len(spans)
                 or type(row.byte_offset) is not int or row.byte_offset < 0):
             raise CuTeDeclined("CuTe field changed its physical type or position")
-        spans[row.parameter].append((row.byte_offset, row.byte_offset + (4 if kind == "i32" else 8)))
+        spans[row.parameter].append((row.byte_offset, row.byte_offset + (4 if kind in ("i32", "f32") else 8)))
         expected = (lower_parameter(origin.expression, operands)[0]
                     if origin.kind == "compiler_expression" else operands.field(origin))
         if kind != "pointer" and type(expected) is not ParameterSource:
@@ -299,7 +299,7 @@ def _check_fields(bound, operands, sources, root_alignments, trace):
         if row.source != expected:
             raise CuTeDeclined("CuTe field lost its exact operand property")
         if type(expected) is ParameterSource:
-            if expected.width != (32 if kind == "i32" else 64):
+            if expected.width != (32 if kind in ("i32", "f32") else 64):
                 raise CuTeDeclined("CuTe parameter computation changed its physical width")
             if any(pointer.root not in root_alignments for pointer in expected.pointers):
                 raise CuTeDeclined("CuTe parameter computation lost its traced storage root")
@@ -310,7 +310,7 @@ def _check_fields(bound, operands, sources, root_alignments, trace):
         alignment = formal.data_alignment
         if row.source not in sources:
             raise CuTeDeclined("CuTe pointer lost its traced source")
-        guards.append(pointer_alignment_guard(row.source, alignment, root_alignments, trace))
+        guards.append(correspondence.alignment_guard(row.source, alignment, root_alignments))
     for formal in artifact.formals:
         if formal.kind == "Tensor":
             for constant in formal.constants:
@@ -353,7 +353,7 @@ def _integer_requirement_guards(requirement, value):
     return tuple(guards)
 
 
-def _shared_resources(artifact, site, operands, symbols):
+def _shared_resources(artifact, site, operands, symbolic):
     expected = {("shared", 0), ("kernel_smem", 0),
                 *(("diagnostic", index) for index in range(len(site.diagnostics)))}
     values, obligations = {}, []
@@ -374,16 +374,16 @@ def _shared_resources(artifact, site, operands, symbols):
     if any(value.llvm_type not in ("i32", "i64") or type(value.expression) is not IntExpr
            for value in (shared, needed)):
         raise CuTeDeclined("CuTe shared sizes require exact integer recipes")
-    request, requirement = (_symbolic(value.expression, symbols) for value in (shared, needed))
+    request, requirement = (symbolic(value.expression) for value in (shared, needed))
     guards = [sympy.Ge(request, 0), sympy.Le(request, 2 ** 32 - 1),
               sympy.Ge(requirement, 0), sympy.Ge(request, requirement)]
     for index, diagnostic in enumerate(site.diagnostics):
-        condition = _condition(values["diagnostic", index], symbols)
+        condition = _condition(values["diagnostic", index], symbolic)
         guards.append(condition if diagnostic.expected else sympy.Not(condition))
     return shared.expression, tuple(guards), tuple(obligations)
 
 
-def _tma_values(artifact, site, role, indices, operands, symbols):
+def _tma_values(artifact, site, role, indices, operands, symbolic):
     consumers = tuple(consumer for consumer in artifact.consumers
                       if consumer.site_id == site.site_id and consumer.role == role)
     if tuple(consumer.index for consumer in consumers) != indices:
@@ -395,14 +395,14 @@ def _tma_values(artifact, site, role, indices, operands, symbols):
                 or consumer.result_type not in ("i32", "i64")
                 or type(lowered.values[0].expression) is not IntExpr):
             raise CuTeDeclined(f"CuTe {role} has an unsupported integer recipe")
-        values[consumer.index] = _symbolic(lowered.values[0].expression, symbols)
+        values[consumer.index] = symbolic(lowered.values[0].expression)
         obligations.extend(lowered.obligations)
     return values, tuple(obligations)
 
 
-def _tma_stride_guards(artifact, site, operands, symbols):
+def _tma_stride_guards(artifact, site, operands, symbolic):
     divisors = site.tma_stride_divisors
-    strides, obligations = _tma_values(artifact, site, "tma_stride", tuple(range(len(divisors))), operands, symbols)
+    strides, obligations = _tma_values(artifact, site, "tma_stride", tuple(range(len(divisors))), operands, symbolic)
     guards = []
     for index, divisor in enumerate(divisors):
         if type(divisor) is not int or divisor <= 0:
@@ -418,7 +418,7 @@ def _tma_stride_guards(artifact, site, operands, symbols):
     return tuple(guards), tuple(obligations)
 
 
-def _tma_dimension_guards(artifact, site, operands, symbols):
+def _tma_dimension_guards(artifact, site, operands, symbolic):
     domains = site.tma_dimension_domains
     if any(type(domain) is not TmaDimensionDomain or type(domain.grouped) is not bool
            or not domain.indices or (not domain.grouped and len(domain.indices) != 1)
@@ -427,9 +427,9 @@ def _tma_dimension_guards(artifact, site, operands, symbols):
     indices = tuple(index for domain in domains for index in domain.indices)
     if indices != tuple(range(len(indices))):
         raise CuTeDeclined("CuTe TMA dimension domains must retain every ordered source")
-    shapes, obligations = _tma_values(artifact, site, "tma_shape", indices, operands, symbols)
+    shapes, obligations = _tma_values(artifact, site, "tma_shape", indices, operands, symbolic)
     indices = tuple(index for domain in domains if domain.grouped for index in domain.indices)
-    strides, stride_obligations = _tma_values(artifact, site, "tma_dimension_stride", indices, operands, symbols)
+    strides, stride_obligations = _tma_values(artifact, site, "tma_dimension_stride", indices, operands, symbolic)
     guards = []
     for domain in domains:
         values = (tuple(value for index in domain.indices for value in (shapes[index], strides[index]))
@@ -437,6 +437,34 @@ def _tma_dimension_guards(artifact, site, operands, symbols):
         dimension = TmaDimension(*values)
         guards.extend((sympy.Ge(dimension, 1), sympy.Le(dimension, 1 << 32)))
     return tuple(guards), (*obligations, *stride_obligations)
+
+
+class _TerminalOrigin:
+    """The FX terminal's symbol correspondence for the invocation lowering: its
+    ShapeEnv and preparation hints, the integer sources a guard is written over,
+    the storage-offset and address symbols, its late address scalars and its
+    pointer alignment guards. The recorder supplies its own origin over the tape
+    (torch/_inductor/runtime/_cudagraph/hosttrace_cute.py)."""
+
+    def __init__(self, trace, expression):
+        self.trace, self.expression = trace, expression
+        self.shape_env = trace.shape_env
+        self.hints = trace.shape_env.backed_var_to_val
+        self.storage_offset_indices = tuple(binding.index for binding in trace.storage_offset_bindings)
+        self.symbols = {origin.value: symbol for symbol, origin in trace.symbol_sources.items()}
+        self.symbols.update((("storage_offset", binding.index), binding.symbol)
+                            for binding in trace.storage_offset_bindings)
+        self.address_symbols = {binding.symbol for binding in trace.address_bindings}
+        self.metadata_symbols = {binding.symbol for binding in trace.storage_offset_bindings}
+
+    def symbolic(self, value):
+        return _symbolic(value, self.symbols)
+
+    def late_scalar(self, value, abi_type):
+        return lower_address_scalar(value, abi_type, self.trace, self.expression)
+
+    def alignment_guard(self, pointer, alignment, root_alignments):
+        return pointer_alignment_guard(pointer, alignment, root_alignments, self.trace)
 
 
 def lower_cute_calls(trace, event, tensors, expression, *, stream, preparation, root_alignments):
@@ -461,98 +489,9 @@ def lower_cute_calls(trace, event, tensors, expression, *, stream, preparation, 
                                           metadata=compilation.metadata)
         binding = bind_ordinary_metadata(signature, compilation)
         artifact = preparation.bind(event.entry, binding)
-        common_guards = []
-
-        def parameter_expression(value, abi_type):
-            late = lower_address_scalar(value, abi_type, trace, expression)
-            if late is None:
-                return None
-            source, guards = late
-            common_guards.extend(guards)
-            return source
-
-        operands = _Operands(local, artifact, tensors, expression, parameter_expression=parameter_expression,
-                             storage_offset_indices=(binding.index for binding in trace.storage_offset_bindings))
-        symbols = {origin.value: symbol for symbol, origin in trace.symbol_sources.items()}
-        symbols.update((("storage_offset", binding.index), binding.symbol)
-                       for binding in trace.storage_offset_bindings)
-        address_symbols = {binding.symbol for binding in trace.address_bindings}
-        metadata_symbols = {binding.symbol for binding in trace.storage_offset_bindings}
-        predicates = [item for item in artifact.consumers if item.site_id is None and item.role == "predicate"]
-        decision = condition = None
-        if artifact.sites and all(site.arm is None for site in artifact.sites):
-            if predicates:
-                raise CuTeDeclined("Unconditional CuTe artifact contains a dispatch predicate")
-            sites = artifact.sites
-        else:
-            if len(predicates) != 1:
-                raise CuTeDeclined("CuTe artifact lacks one original dispatch predicate")
-            decision = lower_numeric(predicates[0].numeric, operands.numeric)
-            if len(decision.values) != 1:
-                raise CuTeDeclined("CuTe dispatch predicate has multiple results")
-            condition = _condition(decision.values[0], symbols)
-            selected = condition.xreplace(trace.shape_env.backed_var_to_val)
-            if selected not in (sympy.true, sympy.false):
-                raise CuTeDeclined("CuTe dispatch predicate has no exact preparation value")
-            sites = tuple(site for site in artifact.sites if site.arm is bool(selected))
-            if len(sites) != 1:
-                raise CuTeDeclined("CuTe dispatch does not select exactly one compiler site")
-        uses = {use.path: use for operand in signature.operands if operand.tensor is not None
-                for use in (*operand.tensor.shape, *operand.tensor.strides, operand.tensor.storage_offset)}
-        uses.update((operand.scalar.use.path, operand.scalar.use) for operand in signature.operands
-                    if operand.scalar is not None)
-        for requirement in binding.requirements:
-            if requirement.kind == "effective_pointer_alignment":
-                if (type(requirement.alignment) is not int or requirement.alignment <= 0
-                        or requirement.alignment & (requirement.alignment - 1)):
-                    raise CuTeDeclined("CuTe signature requires a positive power-of-two alignment")
-                matches = [tensors.get(id(operand.tensor.value)) for operand in signature.operands
-                           if operand.tensor is not None and operand.path == requirement.path]
-                if len(matches) != 1 or type(matches[0]) is not PointerSource:
-                    raise CuTeDeclined("CuTe alignment requirement lost its original operand")
-                common_guards.append(pointer_alignment_guard(matches[0], requirement.alignment,
-                                                             root_alignments, trace))
-                continue
-            if requirement.path not in uses:
-                raise CuTeDeclined("CuTe signature has an unsupported runtime requirement")
-            original = uses[requirement.path].value
-            if (type(original) is torch.SymInt and original.node.shape_env is trace.shape_env
-                    and original.node.expr.free_symbols.intersection(address_symbols | metadata_symbols)):
-                value = original.node.expr
-            else:
-                value = _symbolic(expression(original), symbols)
-            common_guards.extend(_integer_requirement_guards(requirement, value))
-        calls = []
-        for site in sites:
-            shared, resource_guards, resource_obligations = _shared_resources(artifact, site, operands, symbols)
-            tma_guards, tma_obligations = _tma_stride_guards(artifact, site, operands, symbols)
-            dimension_guards, dimension_obligations = _tma_dimension_guards(artifact, site, operands, symbols)
-            owner = CuTeKernelOwner(artifact, site, stream=stream,
-                block=tuple(_constant_consumer(artifact, site, "block", axis) for axis in range(3)),
-                shared=shared.value if shared.op == "constant" else None)
-            resources.owners.append(owner)
-            receipt = CuTeReceipt(local, binding, owner, resources)
-            bound, predicate, obligations = _lower_cute_call(artifact, site, owner, operands)
-            if owner.shared is None:
-                bound = replace(bound, shared=shared)
-            field_guards = _check_fields(bound, operands, sources, root_alignments, trace)
-            guards = [*common_guards, *field_guards, *resource_guards, *tma_guards, *dimension_guards,
-                      sympy.Le(_symbolic(shared, symbols), owner.max_dynamic_shared)]
-            if condition is None:
-                if predicate is not None:
-                    raise CuTeDeclined("Unconditional CuTe lowering introduced a dispatch predicate")
-            else:
-                guards.append(condition if site.arm else sympy.Not(condition))
-                if predicate is None or _condition(predicate, symbols) != condition:
-                    raise CuTeDeclined("CuTe physical lowering changed its original predicate")
-            decision_obligations = () if decision is None else decision.obligations
-            for obligation in (*decision_obligations, *obligations, *resource_obligations,
-                               *tma_obligations, *dimension_obligations):
-                value = _symbolic(obligation.expression, symbols)
-                guards.extend((sympy.Ge(value, obligation.lower), sympy.Le(value, obligation.upper)))
-            receipt.check()
-            calls.append(CuTeCall(bound, sources, tuple(guards), receipt))
-        return tuple(calls)
+        return lower_cute_invocation(_TerminalOrigin(trace, expression), local, artifact, binding, tensors,
+                                     sources, expression, stream=stream, resources=resources,
+                                     root_alignments=root_alignments)
     except BaseException as error:
         try:
             resources.close()
@@ -561,3 +500,104 @@ def lower_cute_calls(trace, event, tensors, expression, *, stream, preparation, 
         if isinstance(error, (ValueError, TypeError)) and not isinstance(error, CuTeDeclined):
             raise CuTeDeclined(str(error)) from error
         raise
+
+
+def lower_cute_invocation(origin, local, artifact, binding, tensors, sources, expression, *, stream, resources,
+                          root_alignments, sites=None):
+    """The physical calls of one bound invocation: the FX terminal's and the
+    recorder's shared step after the entry signature, the ordinary binding and the
+    artifact are established. `origin` supplies the caller's symbol correspondence
+    (_TerminalOrigin, or the recorder's over its tape); `sites`, when given, are
+    the launch sites the caller recorded, which the dispatch must select again.
+    The caller closes `resources` on failure and owns the receipts on success."""
+    signature = binding.signature
+    common_guards = []
+
+    def parameter_expression(value, abi_type):
+        late = origin.late_scalar(value, abi_type)
+        if late is None:
+            return None
+        source, guards = late
+        common_guards.extend(guards)
+        return source
+
+    operands = _Operands(local, artifact, tensors, expression, parameter_expression=parameter_expression,
+                         storage_offset_indices=origin.storage_offset_indices)
+    symbolic = origin.symbolic
+    address_symbols, metadata_symbols = origin.address_symbols, origin.metadata_symbols
+    predicates = [item for item in artifact.consumers if item.site_id is None and item.role == "predicate"]
+    decision = condition = None
+    if artifact.sites and all(site.arm is None for site in artifact.sites):
+        if predicates:
+            raise CuTeDeclined("Unconditional CuTe artifact contains a dispatch predicate")
+        selected_sites = artifact.sites
+    else:
+        if len(predicates) != 1:
+            raise CuTeDeclined("CuTe artifact lacks one original dispatch predicate")
+        decision = lower_numeric(predicates[0].numeric, operands.numeric)
+        if len(decision.values) != 1:
+            raise CuTeDeclined("CuTe dispatch predicate has multiple results")
+        condition = _condition(decision.values[0], symbolic)
+        selected = condition.xreplace(origin.hints)
+        if selected not in (sympy.true, sympy.false):
+            raise CuTeDeclined("CuTe dispatch predicate has no exact preparation value")
+        selected_sites = tuple(site for site in artifact.sites if site.arm is bool(selected))
+        if len(selected_sites) != 1:
+            raise CuTeDeclined("CuTe dispatch does not select exactly one compiler site")
+    if sites is not None and tuple(sites) != tuple(selected_sites):
+        raise CuTeDeclined("CuTe dispatch selected other launch sites than the recorded ones")
+    uses = {use.path: use for operand in signature.operands if operand.tensor is not None
+            for use in (*operand.tensor.shape, *operand.tensor.strides, operand.tensor.storage_offset)}
+    uses.update((operand.scalar.use.path, operand.scalar.use) for operand in signature.operands
+                if operand.scalar is not None)
+    for requirement in binding.requirements:
+        if requirement.kind == "effective_pointer_alignment":
+            if (type(requirement.alignment) is not int or requirement.alignment <= 0
+                    or requirement.alignment & (requirement.alignment - 1)):
+                raise CuTeDeclined("CuTe signature requires a positive power-of-two alignment")
+            matches = [tensors.get(id(operand.tensor.value)) for operand in signature.operands
+                       if operand.tensor is not None and operand.path == requirement.path]
+            if len(matches) != 1 or type(matches[0]) is not PointerSource:
+                raise CuTeDeclined("CuTe alignment requirement lost its original operand")
+            common_guards.append(origin.alignment_guard(matches[0], requirement.alignment, root_alignments))
+            continue
+        if requirement.path not in uses:
+            raise CuTeDeclined("CuTe signature has an unsupported runtime requirement")
+        original = uses[requirement.path].value
+        if (type(original) is torch.SymInt and original.node.shape_env is origin.shape_env
+                and original.node.expr.free_symbols.intersection(address_symbols | metadata_symbols)):
+            value = original.node.expr
+        else:
+            value = symbolic(expression(original))
+        common_guards.extend(_integer_requirement_guards(requirement, value))
+    calls = []
+    for site in selected_sites:
+        shared, resource_guards, resource_obligations = _shared_resources(artifact, site, operands, symbolic)
+        tma_guards, tma_obligations = _tma_stride_guards(artifact, site, operands, symbolic)
+        dimension_guards, dimension_obligations = _tma_dimension_guards(artifact, site, operands, symbolic)
+        owner = CuTeKernelOwner(artifact, site, stream=stream,
+            block=tuple(_constant_consumer(artifact, site, "block", axis) for axis in range(3)),
+            shared=shared.value if shared.op == "constant" else None)
+        resources.owners.append(owner)
+        receipt = CuTeReceipt(local, binding, owner, resources)
+        bound, predicate, obligations = _lower_cute_call(artifact, site, owner, operands)
+        if owner.shared is None:
+            bound = replace(bound, shared=shared)
+        field_guards = _check_fields(bound, operands, sources, root_alignments, origin)
+        guards = [*common_guards, *field_guards, *resource_guards, *tma_guards, *dimension_guards,
+                  sympy.Le(symbolic(shared), owner.max_dynamic_shared)]
+        if condition is None:
+            if predicate is not None:
+                raise CuTeDeclined("Unconditional CuTe lowering introduced a dispatch predicate")
+        else:
+            guards.append(condition if site.arm else sympy.Not(condition))
+            if predicate is None or _condition(predicate, symbolic) != condition:
+                raise CuTeDeclined("CuTe physical lowering changed its original predicate")
+        decision_obligations = () if decision is None else decision.obligations
+        for obligation in (*decision_obligations, *obligations, *resource_obligations,
+                           *tma_obligations, *dimension_obligations):
+            value = symbolic(obligation.expression)
+            guards.extend((sympy.Ge(value, obligation.lower), sympy.Le(value, obligation.upper)))
+        receipt.check()
+        calls.append(CuTeCall(bound, sources, tuple(guards), receipt))
+    return tuple(calls)

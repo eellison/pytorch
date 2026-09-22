@@ -43,6 +43,25 @@ GRID = (IntExpr("constant", 1),) * 3
 
 @instantiate_parametrized_tests
 class TestReleaseSteps(TestCase):
+    def test_original_operand_keeps_saved_input_until_launch(self):
+        layout = OwnedBuffer(BufferSource("output"), torch.float32, (8,), (1,))
+        pointer = PointerSource(InputSource(0), ZERO)
+        physical = _PhysicalCall((), None, GRID, (), storage_sources=(pointer,))
+        calls = (_CaptureCall(physical, 1, (1, 1, 1), (), ()),)
+        program = SimpleNamespace(
+            saved_input_indices=(0,),
+            outputs=(layout,),
+            allocations=(layout,),
+            events=(
+                Allocate("output", torch.float32, (8,), (1,)),
+                CuTeCall(physical, (pointer,), (), None),
+            ),
+        )
+        self.assertEqual(
+            _release_steps(program, calls),
+            (("allocate", 0), ("kernel", 0), ("drop", 0)),
+        )
+
     def test_mixed_calls_keep_late_roots_until_final_use(self):
         first = OwnedBuffer(BufferSource("first"), torch.float32, (8,), (1,))
         second = OwnedBuffer(BufferSource("second"), torch.float32, (8,), (1,))

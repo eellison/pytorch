@@ -53,16 +53,20 @@ from torch._inductor.runtime.cudagraph_arg_mapping import (
     BufferSource,
     ExpressionSource,
     InputSource,
+    IntegerSource,
     IntExpr,
     OutputReference,
     OwnedBuffer,
+    ParameterSource,
     PointerSource,
+    storage_roots,
     TensorViewOutput,
 )
 from torch._inductor.runtime.cudagraph_boxed_replay import (
     _KernelModule,
     _make_replay,
     _NumericProgram,
+    _ParameterProgram,
     _PhysicalCall,
     _PhysicalField,
 )
@@ -936,14 +940,15 @@ class _HostTraceTritonModule(_HostTraceKernelModule):
     function handle Triton loaded for it (the handle an eager capture's node
     holds), with the parameter layout the runtime's DirectTritonOwner read
     from the selected compilation. The owner's loaded copy of the cubin is
-    borrowed for the graph's lifetime as the runtime's Triton frontend borrows
-    it; Triton's own module lives with the process (its kernel cache holds the
-    compilation, which the owner retains too)."""
+    borrowed for the graph's lifetime together with the actual CompiledKernel
+    that owns the eager function."""
 
     def __init__(self, launch, device):
         from cuda.bindings import driver
 
         self.record = launch
+        self._function = launch.binary.function
+        self._eager_module = launch.binary.module
         owner = launch.owner
         self.check()
         if owner.device_index != device:
@@ -952,7 +957,6 @@ class _HostTraceTritonModule(_HostTraceKernelModule):
                 f"cuda:{owner.device_index}, the tape is lowered for cuda:{device}"
             )
         self.host_symbol = None
-        self._function = int(launch.binary.function)
         self._layout = tuple(owner.abi_layout)
         self._block = (owner.module.num_warps * 32, 1, 1)
         self._shared = int(owner.module.shared)
@@ -977,14 +981,23 @@ class _HostTraceTritonModule(_HostTraceKernelModule):
                 f"host_trace lowering: {error} ({self.record.binary.name})"
             ) from error
         function = self.record.binary.function
-        if type(function) is not int or function <= 0:
+        if (
+            type(function) is not int
+            or function <= 0
+            or function != self._function
+            or self.record.binary.module is None
+            or self.record.binary.module != self._eager_module
+        ):
             raise HostTraceLoweringDeclined(
                 f"host_trace lowering: Triton kernel {self.record.binary.name} lost its loaded function"
             )
 
     def _borrow_for_cudagraph(self):
         self.check()
-        return self.record.owner.module._borrow_for_cudagraph()
+        return (
+            self.record.binary,
+            self.record.owner.module._borrow_for_cudagraph(),
+        )
 
 
 @dataclass(frozen=True)
@@ -1615,7 +1628,20 @@ def lower_tape(
     )
     calls = []
     rng_fields = []
+    cute = None
     for call_index, L in enumerate(tape.launches):
+        if L.get("cute") is not None:
+            # a CuTe DSL launch site (torch/cuda/_host_trace_cute.py): its fields,
+            # grid, shared bytes and obligations come from the runtime's binder over
+            # the tape's symbols, its module is the runtime's kernel owner
+            if cute is None:
+                from torch._inductor.runtime._cudagraph.hosttrace_cute import (
+                    CuTeLowering,
+                )
+
+                cute = CuTeLowering(tape, lowering, symbols, device)
+            calls.append(cute.lower(L))
+            continue
         layout = tuple(L["param_layout"])
         image = bytes(L["hint_image"])
         fields, constants = [], []
@@ -1965,12 +1991,10 @@ def lower_tape(
             if type(source.root) is BufferSource:
                 owned.add(source.root.name)
     for call in calls:
-        for field in call.fields:
-            if (
-                type(field.source) is PointerSource
-                and type(field.source.root) is BufferSource
-            ):
-                owned.add(field.source.root.name)
+        for source in (*call.storage_sources, *(field.source for field in call.fields)):
+            for root in storage_roots(source):
+                if type(root) is BufferSource:
+                    owned.add(root.name)
     for _, dst, _, _ in memsets:
         if type(dst.root) is BufferSource:
             owned.add(dst.root.name)
@@ -2853,12 +2877,13 @@ def _buffer_uses(tape, calls, memsets, memcpys, host_tables, regions):
                 excluded.add(source.root.name)
 
     def use(source, seq):
-        if type(source) is PointerSource and type(source.root) is BufferSource:
-            uses.setdefault(source.root.name, []).append(seq)
+        for root in storage_roots(source):
+            if type(root) is BufferSource:
+                uses.setdefault(root.name, []).append(seq)
 
     for j, call in enumerate(calls):
-        for field in call.fields:
-            use(field.source, int(tape.launches[j]["seq"]))
+        for source in (*call.storage_sources, *(field.source for field in call.fields)):
+            use(source, int(tape.launches[j]["seq"]))
     for seq, dst, _, _ in memsets:
         use(dst, seq)
     for seq, source, dst, _ in memcpys:
@@ -2868,6 +2893,45 @@ def _buffer_uses(tape, calls, memsets, memcpys, host_tables, regions):
         for source in region.sources:
             use(source, region.seq)
     return uses, excluded
+
+
+def _rebase_call(call, rebase):
+    mapped = {}
+
+    def source(value):
+        if type(value) is not ParameterSource:
+            return rebase(value)
+        pending = [(value, False)]
+        while pending:
+            node, ready = pending.pop()
+            if id(node) in mapped:
+                continue
+            if not ready:
+                pending.append((node, True))
+                pending.extend(
+                    (arg, False)
+                    for arg in reversed(node.args)
+                    if type(arg) is ParameterSource and id(arg) not in mapped
+                )
+                continue
+            mapped[id(node)] = dataclasses.replace(
+                node,
+                value=rebase(node.value) if node.op == "pointer" else node.value,
+                args=tuple(
+                    mapped[id(arg)] if type(arg) is ParameterSource else rebase(arg)
+                    for arg in node.args
+                ),
+            )
+        return mapped[id(value)]
+
+    return dataclasses.replace(
+        call,
+        fields=tuple(
+            dataclasses.replace(field, source=source(field.source))
+            for field in call.fields
+        ),
+        storage_sources=tuple(rebase(value) for value in call.storage_sources),
+    )
 
 
 def _sequence_pass(
@@ -2937,16 +3001,7 @@ def _sequence_pass(
             InputSource(plan.root(source.root.name)), source.byte_offset
         )
 
-    calls = tuple(
-        dataclasses.replace(
-            call,
-            fields=tuple(
-                dataclasses.replace(field, source=rebased(field.source))
-                for field in call.fields
-            ),
-        )
-        for call in calls
-    )
+    calls = tuple(_rebase_call(call, rebased) for call in calls)
     memsets = [(seq, rebased(dst), n, value) for seq, dst, n, value in memsets]
     memcpys = [
         (seq, rebased(source), rebased(dst), n) for seq, source, dst, n in memcpys
@@ -3051,16 +3106,7 @@ def _arena_pass(
             )
         return PointerSource(root, displacement)
 
-    calls = tuple(
-        dataclasses.replace(
-            call,
-            fields=tuple(
-                dataclasses.replace(field, source=rebased(field.source))
-                for field in call.fields
-            ),
-        )
-        for call in calls
-    )
+    calls = tuple(_rebase_call(call, rebased) for call in calls)
     memsets = [(seq, rebased(dst), n, value) for seq, dst, n, value in memsets]
     memcpys = [
         (seq, rebased(source), rebased(dst), n) for seq, source, dst, n in memcpys
@@ -3653,6 +3699,11 @@ def prepare_hosttrace(
             tuple(numeric.add(source.byte_offset) for source in region.sources)
         )
     grids = []
+    parameters = None
+    buffer_indices = {
+        layout.source: len(boxed) + index
+        for index, layout in enumerate(lowered.allocations)
+    }
     for call in lowered.calls:
         grid = tuple(numeric.values[numeric.add(axis)] for axis in call.grid)
         if not (0 < grid[0] < 2**31 and 0 < grid[1] <= 65535 and 0 < grid[2] <= 65535):
@@ -3674,6 +3725,10 @@ def prepare_hosttrace(
                 numeric.add(source.byte_offset)
             elif type(source) is ExpressionSource:
                 numeric.add(source.expression)
+            elif type(source) is ParameterSource:
+                if parameters is None:
+                    parameters = _ParameterProgram(numeric, len(boxed), buffer_indices)
+                parameters.add(source)
     state = _Preparation(lowered, (), tuple(boxed), list(boxed))
     try:
         with torch.cuda.device(device):
@@ -3688,6 +3743,11 @@ def prepare_hosttrace(
                             size, stride, layout.dtype
                         )
                     )
+                parameter_values = (
+                    ()
+                    if parameters is None
+                    else parameters.evaluate(boxed, state.buffers)
+                )
                 stream = state.capture_stream.cuda_stream
                 philox = None
                 rng_slot_fields = {}
@@ -3864,7 +3924,14 @@ def prepare_hosttrace(
                             )
                             payload = struct.pack("P", value)
                         else:
-                            value = numeric.prepared_value(source.expression)
+                            if type(source) is ParameterSource:
+                                value = parameter_values[
+                                    parameters.prepared_index(source)
+                                ]
+                            elif type(source) is IntegerSource:
+                                value = source.value
+                            else:
+                                value = numeric.prepared_value(source.expression)
                             payload = struct.pack(
                                 "i" if field.kind == "i32" else "q", value
                             )  # float fields travel as their bit patterns
@@ -5176,6 +5243,13 @@ class HostTraceReplay(_Entry):
                     family.outputs.clear()
                 if family.sequence is not None:
                     family.sequence.release()
+            # a CuTe launch site's receipt (its loaded kernel, its ordinary borrow)
+            # closes with the replay, once its graph has let the kernel go
+            for variant in self.variants:
+                for call in variant.lowered.calls:
+                    release = getattr(call.module, "release", None)
+                    if release is not None:
+                        release()
             self.variants.clear()
             self._families.clear()
         finally:

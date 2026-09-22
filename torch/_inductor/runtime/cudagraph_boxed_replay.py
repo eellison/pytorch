@@ -454,6 +454,7 @@ class _PhysicalCall:
     shared: IntExpr | None = None
     tensor_maps: tuple[_TensorMapField, ...] = ()
     block: tuple[IntExpr, IntExpr, IntExpr] | None = None
+    storage_sources: tuple[PointerSource, ...] = ()
 
 
 class _ParameterProgram:

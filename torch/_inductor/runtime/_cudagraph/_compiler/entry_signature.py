@@ -423,14 +423,19 @@ def build_entry_signature(trace: _InvocationTrace, call: EntryCall, *, policy: S
             offset = use(source.storage_offset(), (*path, "storage_offset"), fx_argument)
             if offset.shape_env is None and offset.value < 0:
                 raise ValueError("Negative tensor storage offset is unsupported")
-            requirements.extend((RuntimeRequirement("effective_pointer_alignment", path, alignment=policy.assumed_alignment),
+            # the alignment the compiled formal assumes when the compilation is known
+            # (a conversion may declare it per tensor); the policy's otherwise
+            alignment = policy.assumed_alignment
+            if metadata is not None and metadata.params[index].data_alignment:
+                alignment = metadata.params[index].data_alignment
+            requirements.extend((RuntimeRequirement("effective_pointer_alignment", path, alignment=alignment),
                                  RuntimeRequirement("storage_offset_nonnegative", offset.path, minimum=0)))
             fake_values[name] = cute.runtime.make_fake_tensor(
                 _DTYPES[source.dtype], tuple(integer(item, policy.shape_bits, 0) for item in shape),
                 stride=tuple(integer(item, policy.stride_bits, 0) for item in strides),
-                memspace=cute.AddressSpace.gmem, assumed_align=policy.assumed_alignment,
+                memspace=cute.AddressSpace.gmem, assumed_align=alignment,
             )
-            tensor = TensorSpec(source, source.dtype, source.device, shape, strides, offset, policy.assumed_alignment)
+            tensor = TensorSpec(source, source.dtype, source.device, shape, strides, offset, alignment)
             records.append(OperandBinding(index, name, origin, path, operand, fx_argument, tensor=tensor))
         else:
             if parameter.annotation not in _SCALARS:

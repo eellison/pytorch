@@ -189,6 +189,22 @@ class TestTapeImport(TestCase):
         with self.assertRaisesRegex(UnsupportedCapture, "already imported"):
             imported.bind_allocation(record, output)
 
+    def test_original_operand_uses_rebase_without_physical_fields(self):
+        local = PointerSource(InputSource(0), IntExpr("constant", 4))
+        call = _PhysicalCall(
+            (), None, (IntExpr("constant", 1),) * 3, (), storage_sources=(local,)
+        )
+        imported = self.imported.call(call)
+        (source,) = imported.storage_sources
+        self.assertEqual(source.root, self.roots(self.base).root)
+        program = _NumericProgram(
+            SimpleNamespace(input_names=("x", "y"), integer_inputs=()),
+            (torch.empty(8), torch.empty(8)),
+        )
+        self.assertEqual(program.values[program.add(source.byte_offset)], 12)
+        self.assertEqual(imported.fields, ())
+        self.assertEqual(call.storage_sources, (local,))
+
     def test_physical_fields_and_grid_share_outer_numeric_sources(self):
         n = IntExpr("size", 0, (IntExpr("constant", 0),))
         owner = object()

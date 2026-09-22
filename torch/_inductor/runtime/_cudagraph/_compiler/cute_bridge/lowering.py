@@ -105,7 +105,7 @@ class _Operands:
         def bounds(expression):
             if expression.op == "constant":
                 return ValueRanges(expression.value, expression.value)
-            if expression.op == "storage_offset":
+            if expression.op in ("storage_offset", "size", "stride"):
                 return ValueRanges(0, (1 << 63) - 1)
             if expression.op == "boxed":
                 row = self.ranges[expression.value]
@@ -153,9 +153,11 @@ def _lower_cute_call(artifact, site, owner, operands):
     for field in site.fields.integers:
         if field.source.kind == "compiler_expression":
             source, required = lower_parameter(field.source.expression, operands)
-            if source.width != {"i32": 32, "i64": 64}.get(field.dtype):
+            if source.width != {"i32": 32, "i64": 64, "f32": 32}.get(field.dtype):
                 raise LinkDeclined("CuTe computed integer differs from its physical ABI width")
-            fields.append(_PhysicalField(field.parameter, field.byte_offset, field.dtype, source))
+            # an f32 field travels as its bit pattern in a 32-bit physical field
+            kind = "i32" if field.dtype == "f32" else field.dtype
+            fields.append(_PhysicalField(field.parameter, field.byte_offset, kind, source))
             obligations.extend(required)
             continue
         value = operands.field(field.source)

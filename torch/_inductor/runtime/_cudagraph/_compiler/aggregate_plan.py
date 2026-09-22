@@ -44,7 +44,7 @@ def _scalar_leaves(typ: Any, path: tuple[int, ...] = (), active: frozenset[Any] 
     from cutlass._mlir.dialects import llvm
     from torch._inductor.runtime._cudagraph._compiler.llvm_types import integer_array_parts
 
-    if isinstance(typ, (llvm.PointerType, ir.IntegerType)):
+    if isinstance(typ, (llvm.PointerType, ir.IntegerType, ir.F32Type, ir.F64Type)):
         return ((path, str(typ)),)
     vector = _integer_vector_parts(typ)
     if vector is not None:

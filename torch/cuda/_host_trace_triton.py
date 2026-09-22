@@ -240,9 +240,7 @@ def merge(tr: Any, records: dict) -> None:
         )
     if not tt.launches:
         return
-    launches = list(records["launches"]) + tt.launches
-    launches.sort(key=lambda L: L["seq"])
-    records["launches"] = launches
+    _host_trace()._merge_launches(records, tt.launches)
     written = list(records["written_roots"])
     for name in tt.written_roots:
         if name not in written:
@@ -374,6 +372,7 @@ def _intercept(jit: Any, args: tuple, grid: Any, kwargs: dict) -> Any:
                 offset_bytes,
                 alignments.get(row.formal, 1),
                 decline,
+                jit.params[row.source_arg_index],
             )
             params.append(
                 {
@@ -404,7 +403,7 @@ def _intercept(jit: Any, args: tuple, grid: Any, kwargs: dict) -> Any:
             )
         if type(value) is not int and type(value) is not torch.SymInt:
             decline(f"integer argument {row.formal} is a {type(value).__name__}")
-        _int_guards(row, value, bits, decline)
+        _int_guards(row, value, bits, decline, jit.params[row.source_arg_index])
         params.append(
             {
                 "offset": offset,
@@ -540,18 +539,25 @@ def _constant_guard(row: Any, value: Any, decline: Any, ht: Any) -> None:
         )
 
 
-def _int_guards(row: Any, value: Any, bits: int, decline: Any) -> None:
-    # Triton's specialization of an integer argument, each test on the
-    # symbolic value: a 1 is a constexpr (this slot's value was not 1),
-    # divisibility by 16 selects the compilation, and the value's range picks
-    # i32 or i64
-    if bool(value == 1):
+def _int_guards(row: Any, value: Any, bits: int, decline: Any, parameter: Any) -> None:
+    # Record only specialization choices enabled by the JIT declaration.
+    # Selected ABI attributes and signed parameter widths still always hold.
+    if (
+        not parameter.do_not_specialize
+        and bool(value == 1)
+        and not parameter.annotation_type
+    ):
         decline(
             f"integer argument {row.formal} is 1 at the trace, which the warm-up compiled as a slot"
         )
     alignment = max((1, *(v for _, v in row.attributes)))
     modulus = alignment if alignment > 1 else 16
-    if bool(value % modulus == 0) != (alignment > 1):
+    specializes_alignment = not (
+        parameter.do_not_specialize or parameter.do_not_specialize_on_alignment
+    )
+    if (alignment > 1 or specializes_alignment) and (
+        bool(value % modulus == 0) != (alignment > 1)
+    ):
         decline(
             f"integer argument {row.formal}'s divisibility by {modulus} at the trace differs from "
             "the warm-up's"
@@ -560,6 +566,11 @@ def _int_guards(row: Any, value: Any, bits: int, decline: Any) -> None:
         if not (bool(value >= -(2**31)) and bool(value <= 2**31 - 1)):
             decline(
                 f"integer argument {row.formal} is outside the int32 range the warm-up compiled"
+            )
+    elif parameter.annotation_type:
+        if not (bool(value >= -(2**63)) and bool(value <= 2**63 - 1)):
+            decline(
+                f"integer argument {row.formal} is outside its declared int64 range"
             )
     elif not (bool(value > 2**31 - 1) or bool(value < -(2**31))):
         decline(
@@ -574,6 +585,7 @@ def _alignment_guard(
     offset_bytes: Any,
     alignment: int,
     decline: Any,
+    parameter: Any,
 ) -> None:
     # Triton specializes a pointer on its 16-byte alignment (tt.divisibility
     # 16). An input's address is its base symbol plus the view's offset, both
@@ -582,6 +594,10 @@ def _alignment_guard(
     # build and the replay's planner both hold it), so only the offset
     # decides; the base symbol has no predicate source and stays out of the
     # guard
+    if alignment < 16 and (
+        parameter.do_not_specialize or parameter.do_not_specialize_on_alignment
+    ):
+        return
     probe = offset_bytes if tensor._root.allocation else address
     if bool(probe % 16 == 0) != (alignment >= 16):
         decline(

@@ -20,6 +20,10 @@ def symbolic_integer(value, symbols, decline=FXTraceDeclined):
         return symbols[value.value]
     if value.op == "storage_offset" and not value.args and (value.op, value.value) in symbols:
         return symbols[value.op, value.value]
+    if (value.op in ("size", "stride") and len(value.args) == 1 and value.args[0].op == "constant"
+            and (value.op, value.value, value.args[0].value) in symbols):
+        # a host trace's tensor metadata load (its tape has no boxed integers)
+        return symbols[value.op, value.value, value.args[0].value]
     if value.op == "select" and value.value is None and len(value.args) == 3:
         condition, when_true, when_false = (symbolic_integer(arg, symbols, decline) for arg in value.args)
         return sympy.Piecewise((when_true, sympy.Eq(condition, 1)), (when_false, True))

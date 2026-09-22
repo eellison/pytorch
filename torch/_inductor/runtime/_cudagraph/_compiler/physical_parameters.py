@@ -77,10 +77,10 @@ def project_parameters(parameters, compiled_layouts):
                 if type(literal) is not ScalarValue or literal.size != field.size:
                     raise ValueError("Compiler literal size differs from its physical field")
                 constants.append(ParameterLiteral(row, literal.data()))
-            elif kind in ("i32", "i64", "pointer"):
+            elif kind in ("i32", "i64", "pointer", "f32"):
                 with typ.context:
                     _Values(())._defined(source)
-                if field.size != (4 if kind == "i32" else 8):
+                if field.size != (4 if kind in ("i32", "f32") else 8):
                     raise ValueError("Unsupported native scalar or pointer width")
                 fields.append(row)
             else:

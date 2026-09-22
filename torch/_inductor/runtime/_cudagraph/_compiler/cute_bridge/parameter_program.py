@@ -1,5 +1,8 @@
 """Translate compiler-owned scalar SSA into the native typed parameter program."""
 
+import math
+import struct
+
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm
 from torch._inductor.runtime._cudagraph._compiler.cudagraph_cute_runtime.artifact import ParameterExpression
@@ -22,9 +25,10 @@ def lower_parameter(expression, operands):
             return cache[value]
         typ = ir.Type.parse(value.llvm_type)
         pointer = isinstance(typ, llvm.PointerType)
-        width = 64 if pointer else typ.width if isinstance(typ, ir.IntegerType) else None
-        if width not in (1, 32, 64) or not pointer and not typ.is_signless:
-            raise LinkDeclined("Parameter expression requires a pointer or signless i1/i32/i64")
+        floating = isinstance(typ, ir.F32Type)
+        width = 64 if pointer else 32 if floating else typ.width if isinstance(typ, ir.IntegerType) else None
+        if width not in (1, 32, 64) or not pointer and not floating and not typ.is_signless:
+            raise LinkDeclined("Parameter expression requires a pointer, an f32 or signless i1/i32/i64")
         attrs = {name: ir.Attribute.parse(text) for name, text in value.attributes}
         if len(attrs) != len(value.attributes):
             raise LinkDeclined("Parameter expression has duplicate compiler attributes")
@@ -73,6 +77,12 @@ def lower_parameter(expression, operands):
                     integer = int(attr.value)
                 elif isinstance(attr, ir.IntegerAttr) and attr.type == typ:
                     integer = attr.value
+                elif floating and isinstance(attr, ir.FloatAttr) and attr.type == typ:
+                    literal = attr.value
+                    if math.isnan(literal):
+                        raise LinkDeclined("NaN f32 parameter literals are unsupported")
+                    # an f32 literal (a kernel's scalar constant) as its bit pattern
+                    integer = struct.unpack("<I", struct.pack("<f", literal))[0]
                 else:
                     raise LinkDeclined("Parameter literal differs from its compiler integer type")
             result = ParameterSource("constant", width, integer & ((1 << width) - 1))

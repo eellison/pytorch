@@ -9,7 +9,7 @@
     "id": "cpu_release_steps",
     "script": "cpu/test_release_steps.py",
     "device": "cpu",
-    "cases": 6
+    "cases": 7
   },
   {
     "id": "cpu_storage_roots",
@@ -729,7 +729,7 @@
     "id": "cpu_cuda_tape_import",
     "script": "cpu/test_cuda_tape_import.py",
     "device": "cpu",
-    "cases": 16
+    "cases": 17
   },
   {
     "id": "cpu_direct_cuda_host_declines",
@@ -954,5 +954,60 @@
     "script": "cuda/test_bound_dispatch.py",
     "device": "cuda",
     "cases": 2
+  },
+  {
+    "id": "cpu_host_trace_launch_merge",
+    "script": "cpu/test_host_trace_launch_merge.py",
+    "device": "cpu",
+    "cases": 10
+  },
+  {
+    "id": "cpu_hosttrace_cute_sources",
+    "script": "cpu/test_hosttrace_cute_sources.py",
+    "device": "cpu",
+    "cases": 10,
+    "requires_cute": true
+  },
+  {
+    "id": "cpu_hosttrace_triton_contract",
+    "script": "cpu/test_hosttrace_triton_contract.py",
+    "device": "cpu",
+    "cases": 17,
+    "requires_triton": true
+  },
+  {
+    "id": "cuda_host_trace_dsl_rng",
+    "script": "cuda/test_host_trace_dsl_rng.py",
+    "device": "cuda",
+    "cases": 3,
+    "requires_triton": true
+  },
+  {
+    "id": "cuda_hosttrace_triton_specialization",
+    "script": "cuda/test_hosttrace_triton_specialization.py",
+    "device": "cuda",
+    "cases": 3,
+    "requires_triton": true
+  },
+  {
+    "id": "cpu_cute_dispatch_check_snapshots",
+    "script": "cpu/cute_host/test_dispatch_check_snapshots.py",
+    "device": "cpu",
+    "cases": 8,
+    "requires_cute": true
+  },
+  {
+    "id": "cpu_hosttrace_cute_dsl_hook",
+    "script": "cpu/test_hosttrace_cute_dsl_hook.py",
+    "device": "cpu",
+    "cases": 21,
+    "requires_cute": true
+  },
+  {
+    "id": "cpu_cute_f32_literals",
+    "script": "cpu/test_cute_float_parameter.py",
+    "device": "cpu",
+    "cases": 14,
+    "requires_cute": true
   }
 ]

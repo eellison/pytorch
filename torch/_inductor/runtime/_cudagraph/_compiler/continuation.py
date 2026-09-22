@@ -11,7 +11,7 @@ from torch._inductor.runtime._cudagraph._compiler.compiler_owner import TaggedPr
 from torch._inductor.runtime._cudagraph._compiler.dispatch_join import JoinedDispatch
 from torch._inductor.runtime._cudagraph._compiler.entry_signature import snapshot_metadata
 from torch._inductor.runtime._cudagraph._compiler.helpers import DispatchHelpers, DispatchScalarHelper, ScalarRequest, emit_dispatch_helpers
-from torch._inductor.runtime._cudagraph._compiler.source_dispatch import SourceLaunchSite, check_dispatch_source
+from torch._inductor.runtime._cudagraph._compiler.source_dispatch import SourceDispatch, SourceLaunchSite, check_dispatch_source
 
 
 CONTINUATION_VERSION = 1
@@ -86,12 +86,15 @@ class BoundDispatchHelper:
         joined.check()
         self._check_body(joined)
 
-    def _check_body(self, joined: JoinedDispatch) -> None:
+    def _check_body(self, joined: JoinedDispatch, checked_source: SourceDispatch | None = None) -> None:
         from cutlass._mlir import ir
 
         if self.joined is not joined or self._state() != self._seal:
             raise RuntimeError("Dispatch helper consumer ownership changed")
-        self.helper.check()
+        if checked_source is None:
+            self.helper.check()
+        else:
+            DispatchScalarHelper._check_body(self.helper, checked_source)
         self.cfg.check()
         source = joined.admission.source
         program = joined.mapping.program
@@ -140,8 +143,14 @@ def check_dispatch_consumers(joined: JoinedDispatch, consumers: tuple[BoundDispa
         raise TypeError("Expected exact scalar helper and CFG owners")
     seals = tuple(consumer._seal for consumer in consumers)
     joined.check()
-    for consumer in consumers:
-        BoundDispatchHelper._check_body(consumer, joined)
+    sources = tuple(consumer.helper.source for consumer in consumers)
+    unique_sources = {id(source): source for source in sources}
+    for source in unique_sources.values():
+        source.check()
+    for consumer, source in zip(consumers, sources):
+        BoundDispatchHelper._check_body(consumer, joined, source)
+    for source in unique_sources.values():
+        source.check()
     joined.check()
     for consumer, seal in zip(consumers, seals):
         if consumer.joined is not joined or consumer._seal is not seal or consumer._state() != seal:

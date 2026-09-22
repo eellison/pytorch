@@ -485,6 +485,23 @@ def _native_override_nodes(func: Any) -> tuple:
     return tuple(registry._graphs.get((func.name().split("::", 1)[1], "CUDA"), ()))
 
 
+@contextlib.contextmanager
+def _cow_from_roots() -> Any:
+    """torch._C._is_cow_tensor answered for a traced tensor from its root (an
+    input's copy-on-write state at the trace; an allocation is never lazy),
+    while an override's condition runs on the traced tensors."""
+    original = torch._C._is_cow_tensor
+
+    def is_cow(t: Any) -> bool:
+        return t._root.cow if isinstance(t, _TracedTensor) else original(t)
+
+    torch._C._is_cow_tensor = is_cow
+    try:
+        yield
+    finally:
+        torch._C._is_cow_tensor = original
+
+
 def _native_override_takes(func: Any, args: tuple, kwargs: dict) -> bool:
     """Whether eager serves this call through a torch._native override: the op
     is one of the overrides' own `_native::<id>` ops (the router's call to the
@@ -494,11 +511,23 @@ def _native_override_takes(func: Any, args: tuple, kwargs: dict) -> bool:
     guard, as it is when the router evaluates it one key below."""
     if func.namespace == "_native":
         return True
+    # a call an AOT kernel embedded in the ATen implementation serves: the
+    # router declines its Python route ahead of the conditions and the ATen
+    # fallback runs that kernel, which no converted host stands for
+    from torch._native import aot_manifest
+
+    coverage = aot_manifest.get_coverage(func.name().split("::", 1)[1], "CUDA")
+    if coverage is not None and coverage.covers(args, kwargs):
+        raise Declined(
+            f"host_trace: eager serves {func} through torch._native's AOT-embedded kernel (the "
+            "router's ATen fallback), which is not a traced host (declined)"
+        )
     for node in _native_override_nodes(func):
         if not node.active:
             continue
         try:
-            taken = node.cond_fn(*args, **kwargs)
+            with _cow_from_roots():
+                taken = node.cond_fn(*args, **kwargs)
         except Declined:
             raise
         except Exception as e:
@@ -564,6 +593,9 @@ class _Root:
     itemsize: int
     # made inside the traced call (a<k>), never an input's storage
     allocation: bool = False
+    # an input whose storage was copy-on-write at the trace (what a Python
+    # condition's torch._C._is_cow_tensor reads of a traced tensor)
+    cow: bool = False
 
 
 @dataclass
@@ -1643,23 +1675,34 @@ class _TracedTensor(torch.Tensor):
     def numpy(self, *, force: bool = False) -> Any:
         return self._host_read("numpy()")
 
+    # a Python condition's read of the address (torch._native's overrides test
+    # a pointer's alignment): the root's address symbol plus the view's offset,
+    # as the C++ hosts read it through sym_const_data_ptr; a comparison on it
+    # lands in the ShapeEnv's guards
+    def data_ptr(self) -> Any:
+        return self._root.sym + self._sym_offset * self.element_size()
+
+    const_data_ptr = data_ptr
+    mutable_data_ptr = data_ptr
+
+    # a DLPack export hands the storage to another library: a launch the trace
+    # cannot see. The CuTe DSL's from_dlpack is hooked under the trace
+    # (torch/cuda/_host_trace_cute_dsl.py); any other export declines
+    def __dlpack__(self, *args: Any, **kwargs: Any) -> Any:
+        raise Declined(
+            "host_trace: a DLPack export of a traced tensor to a library the recorder does not hook "
+            "(the CuTe DSL's from_dlpack and compiled programs are hooked; a program loaded from a "
+            "compiled module is not): its launch is not recorded on the tape (declined)"
+        )
+
+    def __dlpack_device__(self) -> Any:
+        return self.__dlpack__()
+
     def __format__(self, format_spec: str) -> str:
         # Tensor.__format__ formats item() for a 0-dim tensor
         if self.dim() == 0:
             return self._host_read("format()")
         return super().__format__(format_spec)
-
-    # a DLPack export hands the tensor's storage to another runtime (the
-    # CuTe DSL's from_dlpack): a launch the tape does not record yet
-    # (runtime_review/triton_capture/TRITON_CAPTURE.md, the CuTe follow-up)
-    def __dlpack__(self, *args: Any, **kwargs: Any) -> Any:
-        raise Declined(
-            f"host_trace: DLPack export of a traced tensor ({self._root.name}; a CuTe DSL "
-            "kernel's from_dlpack): a CuTe launch is not recorded on the tape yet (declined)"
-        )
-
-    def __dlpack_device__(self) -> Any:
-        return self.__dlpack__()
 
     def __getitem__(self, index: Any) -> Any:
         # Tensor.__getitem__ turns an integer index into a plain int through
@@ -2118,6 +2161,9 @@ class _Trace:
         # the Python-launched Triton kernels of this trace
         # (torch/cuda/_host_trace_triton.py), set by _trace_once
         self.triton: Any = None
+        # the CuTe DSL invocations of this trace (torch/cuda/_host_trace_cute.py),
+        # set by its tracing scope in _trace_once
+        self.cute: Any = None
         self.tensors: list = []
         self.inputs: list[_InputRec] = []
         self.allocs: list[_AllocRec] = []
@@ -2184,7 +2230,9 @@ class _Trace:
         pinned = t.is_cpu and t.is_pinned()
         hint = base if pinned else _placeholder_address(base)
         sym = self.symbol(hint, f"{name}.base")
-        root = _Root(f"p{position}", sym, t.element_size())
+        root = _Root(
+            f"p{position}", sym, t.element_size(), cow=bool(torch._C._is_cow_tensor(t))
+        )
         self.shape_env.note_root(sym, root.name, alloc=False)
         traced = _TracedTensor(
             self, root, sizes, strides, offset, t.dtype, device=t.device
@@ -2896,7 +2944,12 @@ class _TraceMode(TorchDispatchMode):
                 self.entering.append(func)
             try:
                 with self:
-                    if func not in _SYMINT_KERNELS and func not in _SYMINT_ENTRIES:
+                    # a torch._native override is a Python kernel on the op's
+                    # int schema: its integers are pinned to the traced values
+                    # whatever the op's own SymInt registration
+                    if native or (
+                        func not in _SYMINT_KERNELS and func not in _SYMINT_ENTRIES
+                    ):
                         args = tuple(_concrete_ints(a) for a in args)
                         kwargs = {k: _concrete_ints(v) for k, v in kwargs.items()}
                     if entry is not None:
@@ -2959,6 +3012,7 @@ class _TraceMode(TorchDispatchMode):
             return r
         where = "inside the host" if self.depth else "under trace"
         via = f" (reached from {self.decomposing[0]})" if self.decomposing else ""
+        via += _host_trace_cute_dsl.unmet_hint()
         raise Declined(
             f"host_trace: {func} {where} is not a traceable CUDA host{via} (declined)"
         )
@@ -3285,7 +3339,6 @@ class Tape:
             "guards": [e(g) for g in self.guards],
             "root_facts": [list(f) for f in self.root_facts],
             "written_roots": list(self.written_roots),
-            "written_inputs": list(self.written_inputs),
             "outputs": [
                 {
                     "name": o.name,
@@ -3537,6 +3590,16 @@ def _real_input_of(t: torch.Tensor) -> torch.Tensor | None:
     return tr.real_inputs.get(t._root.name)
 
 
+def _merge_launches(records: dict, extra: list) -> None:
+    launches = [*records["launches"], *extra]
+    order = sorted(range(len(launches)), key=lambda i: launches[i]["seq"])
+    positions = {old: new for new, old in enumerate(order)}
+    # RNG slots name launch-vector positions, not the stable event sequence.
+    for slot in records["rng_slots"]:
+        slot["launch"] = positions[slot["launch"]]
+    records["launches"] = [launches[i] for i in order]
+
+
 def _trace_once(
     fn: Callable[..., Any],
     args: tuple,
@@ -3545,10 +3608,12 @@ def _trace_once(
     hints: dict | None,
     *,
     triton: list | None = None,
+    cute: list | None = None,
 ) -> tuple[_Trace, dict, list[_OutputRec]]:
     # one symbolic run under its own recorder scope; `triton` is the warm-up's
     # observations of Python-launched Triton kernels (None: a run without a
-    # warm-up, where such a launch declines by name)
+    # warm-up, where such a launch declines by name), `cute` the names of the
+    # CuTe DSL programs the warm-up called
     tr = _Trace(device, hints)
     tr.triton = _host_trace_triton.TritonTrace(triton)
     _active.trace = tr
@@ -3560,6 +3625,8 @@ def _trace_once(
             with (
                 _host_trace_triton.hooked(),
                 _host_trace_triton.tracing(),
+                _host_trace_cute.tracing(tr),
+                _host_trace_cute_dsl.tracing(cute) as cute_met,
                 _TraceMode(tr),
             ):
                 out = fn(*traced)
@@ -3616,6 +3683,8 @@ def _trace_once(
             identities[id(t)] = ("output", k)
         records = tr.rec.records()
         _host_trace_triton.merge(tr, records)
+        _host_trace_cute.merge(tr, records)
+        _host_trace_cute_dsl.check_met(cute, cute_met)
         _check_host_buffers(tr, records)
         return tr, records, outputs
     except Declined as e:
@@ -3711,10 +3780,11 @@ def trace(
         raise Declined("host_trace: a trace is already in progress on this thread")
     result = None
     observations = None
+    cute_programs = None
     # Python-launched Triton kernels: observed at the warm-up (the
     # compilation eager selects for these inputs), intercepted and recorded
     # under the trace (torch/cuda/_host_trace_triton.py)
-    with _host_trace_triton.hooked():
+    with _host_trace_triton.hooked(), _host_trace_cute_dsl.hooked():
         if warm_up:
             # on this thread's current stream, synchronized on that stream only:
             # a device-wide synchronize would invalidate a capture on another thread
@@ -3723,6 +3793,7 @@ def trace(
             with (
                 torch.cuda.device(device),
                 _host_trace_triton.observing() as observations,
+                _host_trace_cute_dsl.observing() as cute_programs,
             ):
                 result = fn(*args)
                 torch.cuda.current_stream(device).synchronize()
@@ -3762,7 +3833,13 @@ def trace(
         try:
             with _gc_hold:
                 tr, records, outputs = _trace_once(
-                    fn, args, positions, device, None, triton=observations
+                    fn,
+                    args,
+                    positions,
+                    device,
+                    None,
+                    triton=observations,
+                    cute=cute_programs,
                 )
         except Declined as e:
             e.warm_up_ran, e.warm_up_outputs = warm_up, result
@@ -4125,6 +4202,14 @@ class Variant:
         self._last_pinned: list[int] = []
         self._held: collections.deque = collections.deque()
         self.tape = tape
+        if any(L.get("cute") is not None for L in tape.launches):
+            # the CuTe DSL launch sites are lowered through the runtime's binder
+            # (direct_hosttrace.lower_tape); this replay matches launches by their
+            # traced images, which a CuTe record does not carry in full
+            raise Declined(
+                "host_trace: the interim replay does not serve a tape with a CuTe DSL launch; the "
+                "native replay (HostTraceReplay) does (declined)"
+            )
         # copies that read host memory (a staging slot, a pinned input) hold
         # their source until the call's event; a device-to-device copy has
         # nothing to hold
@@ -5127,8 +5212,14 @@ class Entry:
         )
 
 
-# registers the TensorIterator entries (add, mul, silu, gelu, copy_)
-from torch.cuda import _host_trace_ti, _host_trace_triton  # noqa: F401
+# registers the TensorIterator entries (add, mul, silu, gelu, copy_); the Python-launched
+# Triton kernels and the CuTe DSL invocations under a trace (the hooks _trace_once enters)
+from torch.cuda import (  # noqa: F401
+    _host_trace_cute,
+    _host_trace_cute_dsl,
+    _host_trace_ti,
+    _host_trace_triton,
+)
 
 
 if torch.distributed.is_available():

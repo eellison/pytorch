@@ -402,7 +402,7 @@ class TestHostTraceTriton(TestCase):
         self.assertEqual(cute_host(x), x * 2.0 + 3, atol=0, rtol=0)
         with self.assertRaisesRegex(
             self.ht.Declined,
-            "CuTe DSL kernel's from_dlpack.*not recorded on the tape yet",
+            "CuTe DSL program the recorder does not hook.*not recorded on the tape",
         ):
             self.ht.trace(cute_host, (x,))
 

@@ -96,6 +96,7 @@ def _release_steps(program, calls):
             )
         ]
         if type(bound) is _PhysicalCall:
+            sources.extend(bound.storage_sources)
             sources.extend(field.pointer for field in bound.tensor_maps)
         for source in sources:
             for root in storage_roots(source):
@@ -398,6 +399,11 @@ def prepare_terminal(program, example_inputs):
             bound = event.bound
             if type(bound) is not _PhysicalCall:
                 raise UnsupportedCapture("CuTe call lost its physical compiler binding")
+            used_inputs.update(
+                source.root.index
+                for source in bound.storage_sources
+                if type(source.root) is InputSource
+            )
             parameters = None
             for field in bound.fields:
                 source = field.source

@@ -277,6 +277,9 @@ class TapeSources:
                 replace(field, source=self.source(field.source))
                 for field in value.fields
             ),
+            storage_sources=tuple(
+                self.source(source) for source in value.storage_sources
+            ),
             grid=tuple(self.integer(item) for item in value.grid),
             block=None
             if value.block is None

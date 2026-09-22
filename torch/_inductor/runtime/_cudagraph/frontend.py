@@ -606,6 +606,8 @@ def _lower_terminal(trace, views, cute_calls, extra_guards):
                 )
                 for field in bound.fields:
                     mark_storage_used(field.source, "Converted CUDA host argument")
+                for source in bound.storage_sources:
+                    mark_storage_used(source, "Converted CUDA host operand")
                 events.append(DirectPhysicalCall(owner, bound, rng_fields))
             effects[id(owner)] = owner
         elif type(event) is CuteInvokeEvent:
