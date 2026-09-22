@@ -65,7 +65,7 @@ from torch.utils._sympy.functions import (
 from torch.utils._triton import has_triton_reduction_ordering
 
 from .._dynamo.utils import import_submodule
-from . import config, inductor_prims, ir, test_operators  # NOQA: F401
+from . import concat_rebase, config, inductor_prims, ir, test_operators  # NOQA: F401
 from .decomposition import decompositions, get_decompositions
 from .ir import (
     BaseView,
@@ -1930,7 +1930,7 @@ def pointwise_cat(inputs, dim=0):
     return Pointwise.create(
         device=inputs[0].get_device(),
         dtype=inputs[0].get_dtype(),
-        inner_fn=inner_fn,
+        inner_fn=concat_rebase.copy_loader(inner_fn, inputs, dim),
         ranges=new_size,
     )
 
