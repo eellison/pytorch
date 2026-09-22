@@ -687,6 +687,9 @@ class InductorBenchmarker(TritonBenchmarker):  # noqa: docstring_linter
             and inductor_config.max_autotune
             and not self._in_cudagraph_benchmark
         ):
+            # Finish lazy autotuning before CUDA graph benchmarking sets its
+            # recursion guard. Candidate failures are not graph-capture failures.
+            _callable()
             try:
                 return self.benchmark_gpu_with_cuda_graph(
                     _callable,
