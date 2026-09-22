@@ -447,6 +447,12 @@
     "cases": 2
   },
   {
+    "id": "cuda_hosttrace_policy",
+    "script": "cuda/test_hosttrace_policy.py",
+    "device": "cuda",
+    "cases": 9
+  },
+  {
     "id": "cuda_static_input_mutation",
     "script": "cuda/test_static_input_mutation.py",
     "device": "cuda",

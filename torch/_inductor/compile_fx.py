@@ -64,6 +64,7 @@ from torch._functorch.aot_autograd import (
 )
 from torch._inductor.codecache import code_hash, FxGraphCache, output_code_log
 from torch._inductor.cudagraph_utils import (
+    active_cudagraph_policy,
     BoxedDeviceIndex,
     cudagraph_trees_clone_live_user_visible_outputs,
     cudagraphs_log,
@@ -1227,8 +1228,13 @@ def _compile_fx_inner(
 
         if use_cache:
             key_context = contextlib.nullcontext()
-            if config.cudagraph_saved_input_schedule or "_cudagraph_saved_input_origin" in gm.meta:
-                from torch._inductor.runtime._cudagraph._compiler.compiler_saved_inputs.transport import saved_input_cache_key
+            if (
+                config.cudagraph_saved_input_schedule
+                or "_cudagraph_saved_input_origin" in gm.meta
+            ):
+                from torch._inductor.runtime._cudagraph._compiler.compiler_saved_inputs.transport import (
+                    saved_input_cache_key,
+                )
 
                 key_context = saved_input_cache_key(gm)
             with key_context:
@@ -1448,7 +1454,7 @@ def _compile_fx_inner(
             )
         compiled_graph.post_compile(example_inputs, constants, graph_kwargs)
 
-        policy = config.cudagraph_policy
+        policy = active_cudagraph_policy()
         if policy is not None:
             compiled_graph = policy.wrap_output(compiled_graph)
 
@@ -3371,7 +3377,10 @@ def _compile_fx_main(
         decompositions = get_decomp_fn()
         saved_input_capture = None
         if config.cudagraph_saved_input_schedule:
-            from torch._inductor.runtime._cudagraph._compiler.compiler_saved_inputs.transport import eligible, SavedInputCapture
+            from torch._inductor.runtime._cudagraph._compiler.compiler_saved_inputs.transport import (
+                eligible,
+                SavedInputCapture,
+            )
 
             if eligible(inner_compile):
                 saved_input_capture = SavedInputCapture(inner_compile)
@@ -3429,7 +3438,9 @@ def _compile_fx_main(
         ) -> OutputCode:
             with (
                 dynamo_utils.dynamo_timed("compile_fx.<locals>.bw_compiler"),
-                saved_input_capture.backward(gm) if saved_input_capture is not None else contextlib.nullcontext(),
+                saved_input_capture.backward(gm)
+                if saved_input_capture is not None
+                else contextlib.nullcontext(),
             ):
                 return compile_fx_backward(
                     gm,

@@ -35,6 +35,7 @@ from torch._dynamo.utils import counters, get_runtime_metrics_context
 from torch._guards import compile_context, CompileContext
 from torch._higher_order_ops.wrap import inductor_compiled_code
 from torch._inductor.cudagraph_utils import (
+    active_cudagraph_policy,
     BoxedDeviceIndex,
     cudagraph_trees_clone_live_user_visible_outputs,
     CudagraphCachedInfo,
@@ -294,7 +295,7 @@ def cudagraph_post_compile(
             user_visible_output_idxs=tuple(user_visible_output_idxs),
         )
 
-        policy = config.cudagraph_policy
+        policy = active_cudagraph_policy()
         if policy is not None:
             compiled_graph.current_callable = policy.cudagraphify(
                 current_callable,
@@ -894,7 +895,7 @@ class CompiledFxGraph(OutputCode):
         # outer level via policy.wrap_output), disable cudagraphs for
         # this graph so the rest of post_compile (input realignment,
         # _wrap_compiled_regions) still runs normally.
-        policy = config.cudagraph_policy
+        policy = active_cudagraph_policy()
         if policy is not None and not policy.should_wrap(self):
             counters["inductor"]["cudagraph_skips"] += 1
             BoxedBool.disable(cudagraphs)

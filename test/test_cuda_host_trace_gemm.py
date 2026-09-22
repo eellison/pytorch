@@ -58,7 +58,7 @@ def _harvest_spec(tape, k, args):
     device = tape.device.index
     env = ht._bind_inputs(tape, ht._input_names(tape.inputs), args, device)
     metas, aligns = [], []
-    for o in (*r.inputs, r.out):
+    for o in (*r.inputs, *r.outputs):
         metas.append(
             (
                 o.dtype,
@@ -66,7 +66,9 @@ def _harvest_spec(tape, k, args):
                 tuple(int(ev.ev(v, env)) for v in o.strides),
             )
         )
-        aligns.append(256 if o is r.out else _align_class(int(ev.ev(o.address, env))))
+        aligns.append(
+            256 if o in r.outputs else _align_class(int(ev.ev(o.address, env)))
+        )
     metas, aligns = tuple(metas), tuple(aligns)
     settings = ht._blas_settings()
     key = (device, tape.device_identity, r.op, r.scalars, metas, aligns, settings)
@@ -184,6 +186,7 @@ class TestCudaHostTraceGemm(HostTraceTestCase):
         self.assertEqual([i["name"] for i in r["inputs"]], ["bias", "mat1", "mat2"])
         # every input dimension is a symbol on the tape; M and N differ
         (out,) = r["outputs"]
+        self.assertEqual(out["name"], "out")
         self.assertIsInstance(out["sizes"][0], str)
         self.assertNotEqual(out["sizes"][0], out["sizes"][1])
         variant = build(tape, linear, (x, self.w, self.b))
@@ -726,9 +729,12 @@ class TestCudaHostTraceGemm(HostTraceTestCase):
         )
 
     def test_non_contiguous_and_expanded_x(self):
-        # F2: the host copies such an operand into a temporary of its own
-        # before the library call; the copy kernel is a node of the region
-        # and its temporary is scratch of the arena
+        # F2, in the form of the out= rule's (c): the host clones such an
+        # operand contiguous before the library call; the clone is the tape's
+        # copy (a launch or one memcpy) ahead of the region, which reads the
+        # clone; the layout test that made the host copy is guarded, so a
+        # layout the host takes as is misses by a guard instead of replaying
+        # a copy eager would not make
         def strided(m):
             return self._x(m, 2 * K)[:, ::2]
 
@@ -737,39 +743,38 @@ class TestCudaHostTraceGemm(HostTraceTestCase):
 
         for name, x_of in (("strided", strided), ("expanded", expanded)):
             x = x_of(8)
-            try:
-                variant = build(
-                    ht.trace(linear, (x, self.w, self.b)), linear, (x, self.w, self.b)
-                )
-            except ht.Declined as e:
-                self.assertIn("declined", str(e))
-                print(f"\n[{name} x] declined at trace: {e}")
-                continue
+            tape = ht.trace(linear, (x, self.w, self.b))
+            self.assertEqual(tape.num_regions, 1, name)
+            self.assertEqual(tape.num_launches + len(tape.memcpys), 1, name)
+            variant = build(tape, linear, (x, self.w, self.b))
             kinds = self._kinds(variant)
             served, refused = self._serve(
                 variant,
                 linear,
                 lambda m, x_of=x_of: (x_of(m), self.w, self.b),
-                (8, 1, 4, 64, 8),
+                (8, 4, 64, 8),
                 name,
             )
             self.assertEqual(refused, [], f"{name}: {kinds}")
-            scratch = [
-                t["scratch"]
-                for t in ht.gemm_templates()
-                if t["hits"] and t["kinds"] == kinds
-            ]
-            print(f"\n[{name} x] site {kinds} served {served} scratch {scratch[:1]}")
-            # a contiguous x through the same variant: another key, no copy
-            self.assertTrue(
+            print(f"\n[{name} x] site {kinds} served {served}")
+            # M = 1: served, or another class of the copy (a guard of the
+            # clone's kernel), never a wrong answer
+            if not self._check(
+                variant, linear, (x_of(1), self.w, self.b), f"{name} M=1"
+            ):
+                self.assertIn("guard failed", self.last_miss, f"{name} M=1")
+            # a contiguous x through the same variant misses by the layout
+            # guard: the copy is eager's for the traced layout only
+            self.assertFalse(
                 self._check(
                     variant,
                     linear,
                     (self._x(8), self.w, self.b),
                     f"{name}: contiguous x",
-                ),
-                self.last_miss,
+                    rebuild=False,
+                )
             )
+            self.assertIn("guard failed", self.last_miss, f"{name}: contiguous x")
 
     def test_two_sites_and_two_variants_interleaved_on_one_stream(self):
         # F4: the two sites of a variant and two variants replayed on one
@@ -860,10 +865,13 @@ class TestCudaHostTraceGemm(HostTraceTestCase):
         self.assertEqual(ht.gemm_harvests(), harvests + 1)
         self.assertTrue(self._check(variant, linear, (x, w, b), f"8192 x {k}"))
 
-    def test_no_input_is_written_through_a_region(self):
-        # every out= and in-place GEMM variant declines by name, so a closed
-        # region's out operand is an allocation the call made and never an
-        # input: Tape.written_inputs (commit 1) gets no region entry
+    def test_an_input_is_written_through_a_region_only_by_an_out_into_it(self):
+        # a functional GEMM's out operand is an allocation the call made, so
+        # Tape.written_inputs (commit 1) gets no region entry; the out= form
+        # into an input (eager's cuBLAS host takes the given result as is, and
+        # Inductor's backward writes a bmm into a donated saved activation)
+        # writes that input through the region; the in-place variant still
+        # declines by name
         x = self._x(8)
         tape = ht.trace(linear, (x, self.w, self.b))
         self.assertEqual(len(tape.regions), 1)
@@ -872,8 +880,10 @@ class TestCudaHostTraceGemm(HostTraceTestCase):
         self.assertEqual(tape.written_inputs, ())
         y = torch.empty(8, N, device="cuda", dtype=DTYPE)
         wt = self.w.t().contiguous()
-        with self.assertRaisesRegex(ht.Declined, "aten.mm.out"):
-            ht.trace(lambda a, b, o: torch.mm(a, b, out=o), (x, wt, y))
+        tape = ht.trace(lambda a, b, o: torch.mm(a, b, out=o), (x, wt, y))
+        self.assertEqual(len(tape.regions), 1)
+        self.assertFalse(tape.regions[0].out.root.allocation)
+        self.assertEqual(tape.written_inputs, (2,))
         with self.assertRaisesRegex(ht.Declined, "aten.addmm_.default"):
             ht.trace(lambda c, a, b: c.addmm_(a, b), (y, x, wt))
 
@@ -907,17 +917,28 @@ class TestCudaHostTraceGemm(HostTraceTestCase):
         variant = build(tape, f, (a, b, c))
         for m in (4, 8, 32):
             self.assertTrue(self._check(variant, f, (self._x(m), b, c), f"M={m}"))
-        # an out= into an input, and an out= of another layout than the op's own
-        # dense result (cuBLAS would write it as is, under another key): declined
+        # an out= into an input is the same region writing that input, and an
+        # out= of another layout eager's cuBLAS host takes as is (a unit stride
+        # along one dimension, the other stride at least that extent: the
+        # column-major result here) is the region under its own key; a result
+        # without a unit stride, which the host computes into a copy of and
+        # copies back, declines by name
         y = torch.empty(4, N, device="cuda", dtype=DTYPE)
-        with self.assertRaisesRegex(
-            ht.Declined, "aten.mm.out with out= that is not an allocation of the trace"
-        ):
-            ht.trace(lambda a, b, o: torch.mm(a, b, out=o), (a, b, y))
-        with self.assertRaisesRegex(ht.Declined, "aten.mm.out with out= of shape"):
+        tape = ht.trace(lambda a, b, o: torch.mm(a, b, out=o), (a, b, y))
+        self.assertEqual(tape.num_regions, 1)
+        self.assertFalse(tape.regions[0].out.root.allocation)
+        self.assertEqual(tape.written_inputs, (2,))
+
+        def transposed(a, b):
+            return torch.mm(a, b, out=torch.empty(N, 4, device="cuda", dtype=DTYPE).t())
+
+        tape = ht.trace(transposed, (a, b))
+        self.assertEqual(tape.num_regions, 1)
+        self.assertTrue(self._check(build(tape, transposed, (a, b)), transposed, (a, b)))
+        with self.assertRaisesRegex(ht.Declined, "compute into a copy"):
             ht.trace(
                 lambda a, b: torch.mm(
-                    a, b, out=torch.empty(N, 4, device="cuda", dtype=DTYPE).t()
+                    a, b, out=torch.empty(8, 2 * N, device="cuda", dtype=DTYPE)[::2, ::2]
                 ),
                 (a, b),
             )
@@ -1050,12 +1071,15 @@ class TestCudaHostTraceGemm(HostTraceTestCase):
     def test_bmm_declines_by_name(self):
         a = torch.randn(4, 16, 64, device="cuda", dtype=DTYPE)
         b = torch.randn(4, 64, 24, device="cuda", dtype=DTYPE)
-        # a batch operand the host would copy first (a slice-step layout)
-        with self.assertRaisesRegex(ht.Declined, "not a cuBLAS batch operand as is"):
-            ht.trace(
-                torch.bmm,
-                (a, torch.randn(4, 64, 48, device="cuda", dtype=DTYPE)[:, :, ::2]),
-            )
+        # a batch operand the host copies first (a slice-step layout): eager's
+        # clone before the library call is the tape's copy (a launch or one
+        # memcpy), then the region reads the clone (form (c) of the out= rule)
+        tape = ht.trace(
+            torch.bmm,
+            (a, torch.randn(4, 64, 48, device="cuda", dtype=DTYPE)[:, :, ::2]),
+        )
+        self.assertEqual(tape.num_regions, 1)
+        self.assertEqual(tape.num_launches + len(tape.memcpys), 1)
         # baddbmm is not a closed op: its meta copies the expanded bias into
         # the result with ATen's copy kernel, whose image carries per-call
         # host bytes no harvest reproduces

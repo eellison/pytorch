@@ -401,6 +401,20 @@ def check_lowering_disable_cudagraph(
     )
 
 
+def active_cudagraph_policy() -> CUDAGraphPolicy | None:
+    """The policy post_compile hands its cudagraph wrapping to: the configured
+    instance, else the host-trace policy when config.triton.cudagraph_host_trace is set,
+    else None (the built-in cudagraphify pipeline)."""
+    policy = config.cudagraph_policy
+    if policy is None and config.triton.cudagraph_host_trace:
+        from torch._inductor.runtime._cudagraph.hosttrace_policy import (
+            host_trace_policy,
+        )
+
+        policy = host_trace_policy()
+    return policy
+
+
 def log_cudagraph_skip_and_bump_counter(msg: str) -> None:
     cudagraphs_log.warning(msg)
     counters["inductor"]["cudagraph_skips"] += 1

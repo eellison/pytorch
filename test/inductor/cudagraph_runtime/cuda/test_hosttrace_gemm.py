@@ -646,6 +646,94 @@ class TestHostTraceGemm(TestCase):
             - 1,
         )
 
+    def test_out_forms_the_host_takes_as_is(self):
+        # Inductor's extern GEMMs write into buffers of its own: a row-major buffer
+        # padded beyond N (the host passes its leading dimension) and a buffer that is a
+        # view of an input (a donated buffer the backward reuses); eager's cuBLAS host
+        # takes both as they are, so the region does, with the out's strides in its key
+        # and the input among the tape's written roots
+        wt = self.w.t()
+
+        def padded(x, w):
+            buf = torch.empty(x.shape[0], N + 64, device="cuda", dtype=DTYPE)
+            out = buf[:, :N]
+            torch.mm(x, w, out=out)
+            return out
+
+        replay = self._replay(padded, (self._x(4), wt))
+        (region,) = replay.lowered.regions
+        self.assertEqual(region.op, "mm")
+        self.assertEqual(tuple(int(v) for v in region.metas[-1][2]), (N + 64, 1))
+        for m in (4, 8, 12, 32):
+            self._serve(replay, padded, (self._x(m), wt), f"padded M={m}")
+
+        def into_input(x, w, acc):
+            torch.mm(x, w, out=acc[1])
+            return acc
+
+        def bmm_into_input(x, w, acc):
+            torch.bmm(x, w, out=acc)
+            return acc
+
+        w3 = torch.randn(2, K, 256, device="cuda", dtype=DTYPE) / K**0.5
+        for fn, make in (
+            (
+                into_input,
+                lambda m: (
+                    self._x(m),
+                    wt,
+                    torch.zeros(2, m, N, device="cuda", dtype=DTYPE),
+                ),
+            ),
+            (
+                bmm_into_input,
+                lambda m: (
+                    torch.randn(2, m, K, device="cuda", dtype=DTYPE),
+                    w3,
+                    torch.zeros(2, m, 256, device="cuda", dtype=DTYPE),
+                ),
+            ),
+        ):
+            replay = self._replay(fn, make(8))
+            self.assertEqual(replay.tape.written_inputs, (2,))
+            (region,) = replay.lowered.regions
+            self.assertIsInstance(region.sources[-1].root, self.module.InputSource)
+            for m in (8, 4, 16):
+                x, w, acc = args = make(m)
+                want = torch.bmm(x, w) if fn is bmm_into_input else torch.mm(x, w)
+                got = replay(*args)
+                self.assertEqual(got.data_ptr(), acc.data_ptr(), f"{fn.__name__} M={m}")
+                self.assertTrue(
+                    torch.equal(acc if fn is bmm_into_input else acc[1], want),
+                    f"{fn.__name__} M={m}",
+                )
+                if fn is into_input:
+                    self.assertEqual(acc[0].abs().max().item(), 0)
+
+    def test_out_forms_the_host_would_copy_decline_by_name(self):
+        # a result cuBLAS cannot take (no unit stride) eager computes into a copy and
+        # copies back; a 1-D bias into a non-contiguous result eager copies in with a
+        # kernel of its own before the GEMM: neither is one closed call
+        def strided(x, w):
+            buf = torch.empty(2 * x.shape[0], 2 * N, device="cuda", dtype=DTYPE)
+            out = buf[::2, ::2]
+            torch.mm(x, w, out=out)
+            return out
+
+        with self.assertWarnsRegex(RuntimeWarning, "compute into a copy"):
+            replay = self._replay(strided, (self._x(4), self.w.t()))
+        self.assertEqual((len(replay.variants), len(replay.declines)), (0, 1))
+
+        def bias_into_padded(x, w, b):
+            buf = torch.empty(x.shape[0], N + 64, device="cuda", dtype=DTYPE)
+            out = buf[:, :N]
+            torch.addmm(b, x, w, out=out)
+            return out
+
+        with self.assertWarnsRegex(RuntimeWarning, "copies the bias"):
+            replay = self._replay(bias_into_padded, (self._x(4), self.w.t(), self.b))
+        self.assertEqual((len(replay.variants), len(replay.declines)), (0, 1))
+
     def test_a_template_launched_with_a_cluster_of_one_keeps_the_attribute(self):
         # cuBLAS launches its sm100 nvjet "1x1" kernels (the HF attention's bmm shapes in
         # bf16) with an explicit cluster dimension of (1, 1, 1); the harvest's census keeps
@@ -691,6 +779,48 @@ class TestHostTraceGemm(TestCase):
             )
             dims.append((value.clusterDim.x, value.clusterDim.y, value.clusterDim.z))
         self.assertIn((1, 1, 1), dims, dims)
+
+    def test_an_operand_the_host_clones_is_the_tapes_copy_then_the_region(self):
+        # an operand cuBLAS cannot take as is (TinyLlama under Inductor's math attention
+        # hands bmm a (128, 1, 64) operand with a zero stride on its size-1 dimension; a
+        # 2-D operand with no unit stride) eager's host clones contiguous before the
+        # library call: the tape records eager's copy as a launch and the region reads the
+        # clone, an allocation of the trace
+        base = torch.randn(128, 64, device="cuda", dtype=DTYPE)
+        b3 = torch.randn(128, 64, 128, device="cuda", dtype=DTYPE)
+
+        def zero_stride(base, b):
+            return torch.bmm(base.as_strided((128, 1, 64), (64, 0, 1)), b)
+
+        def no_unit_stride(x, w):
+            return torch.mm(x[:, ::2], w)
+
+        for fn, args, what in (
+            (zero_stride, (base, b3), "bmm mat1 (128, 1, 64) strides (64, 0, 1)"),
+            (
+                no_unit_stride,
+                (self._x(8, 2 * K), self.w.t()),
+                "mm mat1 strides (2K, 2)",
+            ),
+        ):
+            replay = self._replay(fn, args)
+            tape = replay.tape
+            # eager's clone of a source that is contiguous in memory is one cudaMemcpyAsync
+            # (Copy.cu copy_device_to_device), of any other a copy kernel
+            self.assertEqual(tape.num_regions, 1, what)
+            self.assertEqual(
+                (tape.num_launches, len(tape.memcpys)) in ((1, 0), (0, 1)),
+                True,
+                f"{what}: {tape.num_launches} launches, {len(tape.memcpys)} memcpys",
+            )
+            (region,) = replay.lowered.regions
+            # the region's first operand is the clone, an allocation of the trace (planned
+            # into the arena: a source past the call's two inputs), not the input
+            self.assertNotIn(
+                getattr(region.sources[0].root, "index", None), (0, 1), what
+            )
+            self.assertTrue(self._check(replay, fn, args, what))
+            self.assertTrue(self._check(replay, fn, args, what))
 
 
 if __name__ == "__main__":

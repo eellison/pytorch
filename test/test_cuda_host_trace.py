@@ -214,6 +214,30 @@ class TestCudaHostTrace(TestCase):
     def _add_one(self):
         return load_test_extension("ht_exactly_once", _ADD_ONE_SOURCE).add_one_
 
+    def test_empty_like_of_a_strided_source_keeps_its_layout_permutation(self):
+        # at::native::empty_like under preserve_format: a non-overlapping dense
+        # source keeps its strides; a strided source that is not dense (a head
+        # slice of a fused qkv buffer, what Inductor hands the attention ops)
+        # gets infer_dense_strides, its layout permutation, not a contiguous
+        # allocation; an expanded source (a zero stride) the same rule
+        def like(x):
+            return torch.empty_like(x).fill_(1.0)
+
+        cases = {
+            "qkv head slice": torch.randn(512, 2304, device="cuda").as_strided(
+                (4, 12, 128, 64), (294912, 64, 2304, 1)
+            ),
+            "dense permutation": torch.randn(4, 128, 12, 64, device="cuda").transpose(
+                1, 2
+            ),
+            "expanded": torch.randn(1, 64, device="cuda").expand(8, 64),
+        }
+        for name, x in cases.items():
+            want = torch.empty_like(x).stride()
+            tape = ht.trace(like, (x,))
+            got = tuple(int(ht._hint(s)) for s in tape.outputs[0].strides)
+            self.assertEqual(got, want, name)
+
     def test_trace_records_the_forward(self):
         tape, _ = self._trace()
         self.assertEqual(tape.num_launches, 1)

@@ -2085,6 +2085,11 @@ class triton:
     # Use cudagraph trees for memory pooling if `cudagraphs` is True
     cudagraph_trees = True
 
+    # Serve cudagraphs through the host trace of the generated wrapper (the tape,
+    # torch._inductor.runtime._cudagraph.hosttrace_policy) instead of cudagraph trees;
+    # read where config.cudagraph_policy is None
+    cudagraph_host_trace = False
+
     # Should we skip cudagraphing graphs with dynamic shape inputs
     # If False, we will re-record a graph for each unique set of shape inputs
     cudagraph_skip_dynamic_graphs = False

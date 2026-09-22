@@ -1469,6 +1469,57 @@ def _symbol_name(v: Any) -> str | None:
     return None
 
 
+def _infer_dense_strides(sizes: list, strides: list) -> list:
+    # at::infer_dense_strides (ExpandUtils.cpp), what empty_like gives a
+    # strided source that is not dense: the dims sorted by stride with
+    # TensorIterator's insertion sort (a zero stride is an ambiguous
+    # comparison and does not move; equal strides put the smaller size
+    # first), then dense strides in that order (a size of 1 or 0 does not
+    # advance). Every comparison is a guard on the traced value
+    ndim = len(sizes)
+    if ndim == 0:
+        return []
+    if ndim == 1:
+        return [1]
+    perm = list(range(ndim - 1, -1, -1))
+
+    def should_swap(dim0: int, dim1: int) -> int:
+        s0, s1 = strides[dim0], strides[dim1]
+        if bool(s0 == 0) or bool(s1 == 0):
+            return 0
+        if bool(s0 < s1):
+            return -1
+        if bool(s0 > s1):
+            return 1
+        if bool(sizes[dim0] > sizes[dim1]):
+            return 1
+        return 0
+
+    for i in range(1, ndim):
+        dim1 = i
+        for j in range(1, i + 1):
+            dim0 = i - j
+            comparison = should_swap(perm[dim0], perm[dim1])
+            if comparison > 0:
+                perm[dim0], perm[dim1] = perm[dim1], perm[dim0]
+                dim1 = dim0
+            elif comparison < 0:
+                break
+    out: list = [None] * ndim
+    current: Any = 1
+    for idx in perm:
+        out[idx] = current
+        if bool(sizes[idx] > 1):
+            current = current * sizes[idx]
+    return out
+
+
+def _at_least_one(v: Any) -> Any:
+    # std::max<int64_t>(1, v) on a size: the size itself when its hint is at
+    # least one (a size symbol is positive on the tape), the constant 1 otherwise
+    return v if _hint(v) >= 1 else 1
+
+
 def _contiguous_strides(sizes: list) -> list:
     # c10::contiguous_strides: a zero size counts as 1 in the products behind
     # it (torch.empty((16, 0)) has strides (1, 1)); the zero is guarded on the
@@ -2528,17 +2579,20 @@ class _Trace:
         elif func is aten.new_empty_strided.default:
             sizes, strides = list(args[1]), list(args[2])
             dtype = kwargs.get("dtype") or args[0].dtype
-        else:  # empty_like: at::native::empty_like's dense branch
+        else:  # empty_like: at::native::empty_like under preserve_format
             src = args[0]
             sizes = list(src.shape)
             dtype = kwargs.get("dtype") or src.dtype
             src_strides = getattr(src, "_sym_strides", None) or list(src.stride())
-            if mf in (None, torch.preserve_format) and _guard_each(
-                _dense_terms(sizes, src_strides)
-            ):
+            if mf not in (None, torch.preserve_format):
+                strides = _contiguous_strides(sizes)
+            elif _guard_each(_dense_terms(sizes, src_strides)):
+                # a non-overlapping dense source keeps its strides
                 strides = list(src_strides)
             else:
-                strides = _contiguous_strides(sizes)
+                # a strided source that is not dense (a head slice of a fused
+                # qkv buffer) keeps its layout permutation: infer_dense_strides
+                strides = _infer_dense_strides(sizes, src_strides)
             mf = None
         if mf not in (None, torch.contiguous_format, torch.preserve_format):
             raise Declined(
@@ -2563,7 +2617,7 @@ class _Trace:
         as a closed region (operands and output as values), allocate its
         output, issue nothing. The output is what the ordinary op would
         allocate: a contiguous [M, N] ([B, M, N] for bmm) of the operands'
-        dtype."""
+        dtype; for the out= forms, the given tensor."""
         base = _CLOSED_OUT_OPS.get(func, func)
         batched = base is aten.bmm.default
         if base in (aten.mm.default, aten.bmm.default):
@@ -2609,60 +2663,121 @@ class _Trace:
         # prepare_matrix_for_cublas; Blas.cpp prepare_batch_matrix_for_cublas
         # for the batched ops): a unit stride along one dimension and a
         # leading dimension of at least the other extent, or a dense matrix.
-        # Anything else it copies into a temporary of its own first; that
-        # copy's kernel carries stack leftovers in its offset calculator,
-        # which no capture reproduces byte for byte. Decided on the traced
-        # strides without a guard: the strides are in the template key, and
-        # a later layout the host would copy misses by name at its harvest
-        if batched:
-            # the batched host reads the contiguous [B, M, N] result as
-            # column-major when N == 1 (Blas.cpp baddbmm_out_cuda_impl:
-            # result_strides[1] == 1), as C^T = B^T A^T otherwise, and the
-            # roles of the two batches follow that choice
-            m_, k_, n_ = (_hint(v) for v in (a.shape[1], a.shape[2], b.shape[2]))
-            transpose_result = n_ != 1
-            checks = (
-                (("mat1", a, k_, m_), ("mat2", b, n_, k_))
-                if transpose_result
-                else (("mat1", a, m_, k_), ("mat2", b, k_, n_))
-            )
-            for name, t, rows, cols in checks:
-                st = [_hint(v) for v in t._sym_strides]
-                fast, lead = (2, 1) if transpose_result else (1, 2)
-                ready = (
-                    (st[fast] == 1 and st[lead] >= max(1, rows))
-                    or (st[lead] == 1 and st[fast] >= max(1, cols))
-                    or (
-                        st[1] != 0
-                        and st[2] != 0
-                        and all(
-                            bool(_hint(term))
-                            for term in _contiguous_terms(
-                                list(t.shape), list(t._sym_strides)
-                            )
-                        )
-                    )
+        # Anything else it clones into a contiguous temporary of its own
+        # first: eager's copy kernel, recorded as the tape's launch ahead of
+        # the region, which then reads the clone (_operand_copy). Decided on
+        # the traced strides without a guard: the strides are in the template
+        # key, and a later layout is another key or another copy
+        given = kwargs.get("out")
+        if given is not None:
+            # the out= form (Inductor's extern GEMMs write into buffers of
+            # its own): the region writes the given tensor. What eager's host
+            # takes as is (Blas.cpp baddbmm_out_cuda_impl for the batched
+            # ops, cuBlasCommonArgs.h prepare_matrix_for_cublas for a 2-D
+            # result): a unit stride along one dimension with the other
+            # stride at least that extent (a row-major buffer padded beyond
+            # N: the host passes the leading dimension), or a dense layout; a
+            # result it would compute into a copy of and copy back declines.
+            # Decided on the traced strides, as the operands are: the strides
+            # are in the template key. The tensor may be a view of an input
+            # (a buffer the caller reuses: Inductor's donated buffers), which
+            # the region then writes
+            if not isinstance(given, _TracedTensor):
+                raise Declined(
+                    f"host_trace: {func} with out= that is a plain {type(given).__name__} made outside the trace (declined)"
                 )
-                if not ready:
+            if given.dtype != a.dtype or given.dim() != nd:
+                raise Declined(
+                    f"host_trace: {func} with out= of {given.dtype} {tuple(given.shape)} for a {a.dtype} {nd}-D result (declined)"
+                )
+        if batched:
+            # the batched host reads the result as column-major when its
+            # strides say so (Blas.cpp baddbmm_out_cuda_impl: a unit stride
+            # along dim 1 and dim 2's stride at least M), as C^T = B^T A^T
+            # otherwise, and the roles of the two batches follow that choice;
+            # the functional op's contiguous result is column-major exactly
+            # when N == 1
+            m_s, k_s, n_s = a.shape[1], a.shape[2], b.shape[2]
+            n_ = _hint(n_s)
+            if given is None:
+                transpose_result = n_ != 1
+            else:
+                gm, gn = (_hint(v) for v in given.shape[1:])
+                gst = [_hint(v) for v in given._sym_strides]
+                if gst[1] == 1 and (gn == 1 or gst[2] >= max(1, gm)):
+                    transpose_result = False
+                elif gst[2] == 1 and (gm == 1 or gst[1] >= max(1, gn)):
+                    transpose_result = True
+                else:
                     raise Declined(
-                        f"host_trace: {func}: {name} of shape {tuple(t.shape)} with strides {tuple(t._sym_strides)} is not a cuBLAS batch operand as is; the host would copy it first, which is not recorded as a closed region (declined)"
+                        f"host_trace: {func} with out= of shape {tuple(given.shape)} with strides {tuple(given._sym_strides)} is not a cuBLAS result as is; the host would compute into a copy and copy it back (declined)"
                     )
+            checks = (
+                (("mat1", a, k_s, m_s), ("mat2", b, n_s, k_s))
+                if transpose_result
+                else (("mat1", a, m_s, k_s), ("mat2", b, k_s, n_s))
+            )
+            mats = list(mats)
+            for index, (name, t, rows, cols) in enumerate(checks):
+                fast, lead = (2, 1) if transpose_result else (1, 2)
+                sst = t._sym_strides
+                disjuncts = (
+                    (sst[fast] == 1, sst[lead] >= _at_least_one(rows)),
+                    (sst[lead] == 1, sst[fast] >= _at_least_one(cols)),
+                    (
+                        sst[1] != 0,
+                        sst[2] != 0,
+                        *_contiguous_terms(list(t.shape), list(t._sym_strides)),
+                    ),
+                )
+                if not self._operand_ready(disjuncts):
+                    mats[index] = self._operand_copy(t)
+            a, b = mats
         else:
-            for name, t in (("mat1", a), ("mat2", b)):
-                rows, cols = (_hint(n) for n in t.shape)
-                s0, s1 = (_hint(st) for st in t._sym_strides)
+            mats = list(mats)
+            for index, (name, t) in enumerate((("mat1", a), ("mat2", b))):
+                rows, cols = t.shape
+                sst = t._sym_strides
+                disjuncts = (
+                    (sst[0] == 1, sst[1] >= _at_least_one(rows)),
+                    (sst[1] == 1, sst[0] >= _at_least_one(cols)),
+                    tuple(_dense_terms(list(t.shape), list(t._sym_strides))),
+                )
+                if not self._operand_ready(disjuncts):
+                    mats[index] = self._operand_copy(t)
+            a, b = mats
+            if given is not None:
+                rows, cols = (_hint(n) for n in given.shape)
+                s0, s1 = (_hint(st) for st in given._sym_strides)
                 ready = (
                     (s0 == 1 and s1 >= max(1, rows))
                     or (s1 == 1 and s0 >= max(1, cols))
                     or all(
                         bool(_hint(term))
-                        for term in _dense_terms(list(t.shape), list(t._sym_strides))
+                        for term in _dense_terms(
+                            list(given.shape), list(given._sym_strides)
+                        )
                     )
                 )
                 if not ready:
                     raise Declined(
-                        f"host_trace: {func}: {name} of shape {tuple(t.shape)} with strides {tuple(t._sym_strides)} is not a cuBLAS operand as is; the host would copy it first, which is not recorded as a closed region (declined)"
+                        f"host_trace: {func} with out= of shape {tuple(given.shape)} with strides {tuple(given._sym_strides)} is not a cuBLAS result as is; the host would compute into a copy and copy it back (declined)"
                     )
+                if bias is not None and not all(
+                    bool(_hint(term))
+                    for term in _contiguous_terms(
+                        list(given.shape), list(given._sym_strides)
+                    )
+                ):
+                    # Blas.cpp addmm_out_cuda_impl fuses a 1-D bias into the
+                    # library call (the Lt epilogue) for a contiguous result
+                    # only; into any other layout the host copies the bias in
+                    # with a kernel of its own before the GEMM: not one closed
+                    # call
+                    raise Declined(
+                        f"host_trace: {func} with a bias into an out= with strides {tuple(given._sym_strides)} that is not contiguous: the host copies the bias into the result before the GEMM (declined)"
+                    )
+        operands = ([bias] if bias is not None else []) + list(mats)
         if bias is not None and bias.dim() == 1 and _hint(bias._sym_strides[0]) != 1:
             raise Declined(
                 f"host_trace: {func}: a bias with stride {bias._sym_strides[0]} is not a cuBLAS operand as is; the host would copy it first, which is not recorded as a closed region (declined)"
@@ -2698,7 +2813,6 @@ class _Trace:
                 raise Declined(
                     f"host_trace: {func}: a {bias.dim()}-D bias is not recorded (declined)"
                 )
-        given = kwargs.get("out")
         if given is None:
             out = self.allocate(
                 aten.empty.memory_format,
@@ -2706,30 +2820,46 @@ class _Trace:
                 {"dtype": a.dtype, "device": self.device},
             )
         else:
-            # the out= form: the region writes the given tensor, which must be
-            # what the functional op would allocate (a dense [M, N] of the
-            # operands' dtype, an allocation of this trace); each shape and
-            # stride comparison a guard
-            if not isinstance(given, _TracedTensor) or not given._root.allocation:
-                raise Declined(
-                    f"host_trace: {func} with out= that is not an allocation of the trace (declined)"
-                )
-            if given.dtype != a.dtype or given.dim() != len(out_shape):
-                raise Declined(
-                    f"host_trace: {func} with out= of {given.dtype} {tuple(given.shape)} for a {a.dtype} {tuple(out_shape)} result (declined)"
-                )
-            dense = _contiguous_strides(out_shape)
-            for d, (sz, st) in enumerate(zip(out_shape, dense)):
-                if bool(given.shape[d] != sz) or (
-                    bool(given.shape[d] > 1) and bool(given._sym_strides[d] != st)
-                ):
+            # the library's shape check on the given result, as guards
+            for d, sz in enumerate(out_shape):
+                if bool(given.shape[d] != sz):
                     raise Declined(
-                        f"host_trace: {func} with out= of shape {tuple(given.shape)} strides {tuple(given._sym_strides)} where the op allocates {tuple(out_shape)} dense (declined)"
+                        f"host_trace: {func} with out= of shape {tuple(given.shape)} for a {tuple(out_shape)} result (declined)"
                     )
             out = given
         names = ["bias", "mat1", "mat2"] if bias is not None else ["mat1", "mat2"]
         self.region(op, list(zip(names, operands)), [("out", out)], scalars)
         return out
+
+    @staticmethod
+    def _operand_ready(disjuncts: tuple) -> bool:
+        # the host's "as is" test on an operand, a disjunction of conjunctions
+        # over its strides. Decided on the hints when it holds (no guard: the
+        # strides are in the template key, and a later layout the host copies
+        # misses by name at its harvest). When it fails the host copies, and
+        # the tape then holds a copy eager makes for this layout only: one
+        # failing term per disjunct is guarded, so a later layout the host
+        # takes as is misses by a guard (E24) instead of replaying the copy
+        for terms in disjuncts:
+            if all(bool(_hint(term)) for term in terms):
+                return True
+        for terms in disjuncts:
+            for term in terms:
+                if not bool(_hint(term)):
+                    if not bool(term):
+                        break
+                    raise Declined(
+                        "host_trace: a closed GEMM operand's layout test changed under the guard (declined)"
+                    )
+        return False
+
+    def _operand_copy(self, t: _TracedTensor) -> _TracedTensor:
+        # the host's own copy of an operand it cannot hand to cuBLAS as is
+        # (Blas.cpp: tensor.clone(at::MemoryFormat::Contiguous) before the
+        # library call): the traced clone under the mode, eager's copy kernel
+        # as a launch of the tape and its allocation, ahead of the region
+        with self.mode:
+            return t.clone(memory_format=torch.contiguous_format)
 
     def region(
         self, op: str, inputs: list, outputs: list, scalars: tuple
@@ -3234,6 +3364,15 @@ class _TraceMode(TorchDispatchMode):
     def _route(
         self, func: Any, types: Any, args: tuple, kwargs: dict, op: _OpRec
     ) -> Any:
+        if func is aten.resize_.default and isinstance(args[0], _TracedTensor):
+            # eager's out= variants resize their out tensor to the result's size
+            # (Inductor's `aten.randint.low_out(..., out=buf)` for its seeds): a
+            # resize to the tensor's own size is a no-op, each comparison a guard
+            t, size = args[0], list(args[1])
+            if len(size) == t.dim() and all(
+                bool(a == b) for a, b in zip(size, t.shape)
+            ):
+                return t
         if func in _ALLOC_OPS:
             op.route = "alloc"
             if _deterministic_fill():
@@ -3444,8 +3583,8 @@ class Tape:
         # template per concrete key
         self.regions = tr.regions
         # a region's outputs are written by the call: their roots join the
-        # written roots (allocations: the out= and in-place variants decline,
-        # so no input is written through a region)
+        # written roots (an allocation, or the input an out= that is a view
+        # of an input writes through the region)
         for r in self.regions:
             for o in r.outputs:
                 if o.root.name not in self.written_roots:
