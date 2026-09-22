@@ -177,13 +177,42 @@ def lower_numeric(
             if left.op == "constant":
                 left, right = right, left
             if right.op != "constant" or right.value <= 0:
-                raise NumericDeclined("Arithmetic domain requires one boxed leaf and positive constant factors")
+                break
             factor *= right.value
             expression = left
         if expression.op != "boxed":
-            raise NumericDeclined("Arithmetic domain requires one boxed leaf and positive constant factors")
+            expression, factor = value.expression, 1
+            pending, checked = [(expression, False)], set()
+            while pending:
+                node, ready = pending.pop()
+                if id(node) in checked:
+                    continue
+                if not ready:
+                    pending.append((node, True))
+                    pending.extend((arg, False) for arg in reversed(node.args))
+                    continue
+                checked.add(id(node))
+                required = []
+                if node.op in ("add", "multiply"):
+                    required.append((node, -(1 << 63), (1 << 63) - 1, "intermediate"))
+                elif node.op in ("ceildiv", "floordiv"):
+                    required.extend(
+                        (
+                            (node.args[0], 0, (1 << 63) - 1, "dividend"),
+                            (node.args[1], 1, (1 << 63) - 1, "divisor"),
+                        )
+                    )
+                elif node.op in ("select", "and"):
+                    conditions = node.args[:1] if node.op == "select" else node.args
+                    required.extend((arg, 0, 1, "condition") for arg in conditions)
+                for term, lower, upper, role in required:
+                    obligation = RangeObligation(
+                        term, lower, upper, "derived arithmetic " + role
+                    )
+                    if obligation not in obligations:
+                        obligations.append(obligation)
         upper = maximum // factor
-        # Leaf predicates are safe independently of guard ordering and source-width checks.
+        # Derived predicates pass through the same checked export as source-width guards.
         obligation = RangeObligation(expression, 0, upper, "arithmetic " + value.llvm_type + " nsw domain")
         if obligation not in obligations:
             obligations.append(obligation)
@@ -269,18 +298,20 @@ def lower_numeric(
                 condition, yes, no = operands
                 result = NumericValue(flow.llvm_type, IntExpr("select", args=(condition.expression, yes.expression, no.expression)),
                                       min(yes.lower, no.lower), max(yes.upper, no.upper))
-            elif flow.kind in ("llvm.add", "llvm.mul"):
+            elif flow.kind in ("llvm.add", "llvm.sub", "llvm.mul"):
                 if (len(operands) != 2 or flow.attributes or flow.predicate is not None or flow.llvm_type == "i1"
                         or any(value.llvm_type != flow.llvm_type for value in operands)):
                     raise NumericDeclined("Arithmetic lost its exact operand widths or properties")
                 left, right = operands
                 if flow.kind == "llvm.add":
                     lower, upper = left.lower + right.lower, left.upper + right.upper
+                elif flow.kind == "llvm.sub":
+                    lower, upper = left.lower - right.upper, left.upper - right.lower
                 else:
                     products = tuple(a * b for a in (left.lower, left.upper) for b in (right.lower, right.upper))
                     lower, upper = min(products), max(products)
                 if lower < minimum or upper > maximum:
-                    if flags[slot] & _NSW and left.lower >= 0 and right.lower >= 0:
+                    if flow.kind != "llvm.sub" and flags[slot] & _NSW and left.lower >= 0 and right.lower >= 0:
                         if left.expression.op == "constant":
                             left, right = right, left
                         if right.expression.op != "constant" or right.expression.value <= 0:
@@ -295,19 +326,29 @@ def lower_numeric(
                         raise NumericDeclined("Arithmetic lacks a proof against signed overflow or wrapping")
                 if flags[slot] & _NUW:
                     a, b = _unsigned(left), _unsigned(right)
-                    unsigned_max = a[1] + b[1] if flow.kind == "llvm.add" else a[1] * b[1]
-                    if unsigned_max >= 1 << integer_width(flow.llvm_type):
+                    if flow.kind == "llvm.sub":
+                        valid = a[0] >= b[1]
+                    else:
+                        unsigned_max = a[1] + b[1] if flow.kind == "llvm.add" else a[1] * b[1]
+                        valid = unsigned_max < 1 << integer_width(flow.llvm_type)
+                    if not valid:
                         raise NumericDeclined("Arithmetic lacks a proof of its compiler nuw property")
                 a, b = left.expression, right.expression
                 if a.op == b.op == "constant":
-                    number = a.value + b.value if flow.kind == "llvm.add" else a.value * b.value
+                    if flow.kind == "llvm.sub":
+                        number = a.value - b.value
+                    else:
+                        number = a.value + b.value if flow.kind == "llvm.add" else a.value * b.value
                     expr = IntExpr("constant", number)
                 elif left.lower < 0 or right.lower < 0:
                     raise NumericDeclined("Numeric arithmetic requires proven nonnegative operands")
                 elif flow.kind == "llvm.add" and a.op == "constant" and a.value == 0:
                     expr = b
-                elif flow.kind == "llvm.add" and b.op == "constant" and b.value == 0:
+                elif flow.kind in ("llvm.add", "llvm.sub") and b.op == "constant" and b.value == 0:
                     expr = a
+                elif flow.kind == "llvm.sub":
+                    negative = IntExpr("multiply", args=(b, IntExpr("constant", -1)))
+                    expr = IntExpr("add", args=(a, negative))
                 else:
                     expr = IntExpr("add" if flow.kind == "llvm.add" else "multiply", args=(a, b))
                 result = NumericValue(flow.llvm_type, expr, lower, upper)

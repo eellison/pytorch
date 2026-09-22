@@ -98,10 +98,17 @@ class OrdinaryCorrespondence:
                 self.consumers, self.launches, self.properties)
 
     def check(self):
+        from torch._inductor.runtime._cudagraph._compiler.validation_snapshots import validation_snapshots
+
         state = self._state()
         owners = self._owners
         if len(state) != len(owners) or any(value is not old for value, old in zip(state, owners)):
             raise RuntimeError("Ordinary correspondence owners changed")
+        compilation = self.bound.compilation
+        with validation_snapshots(compilation.source_module, compilation.module):
+            self._check(state, owners)
+
+    def _check(self, state, owners):
         self.bound.check()
         self.program.check()
         self.formals.check()

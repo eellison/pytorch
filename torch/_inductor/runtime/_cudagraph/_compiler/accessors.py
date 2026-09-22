@@ -14,10 +14,16 @@ SOURCE_ARGUMENT = "cudagraph.source_arg"
 _CASTS = frozenset({"llvm.trunc", "llvm.zext", "llvm.sext", "llvm.bitcast", "llvm.addrspacecast"})
 
 
-def _snapshot(operation: Any) -> tuple[str, bytes]:
+def _take_snapshot(operation: Any) -> tuple[str, bytes]:
     buffer = io.BytesIO()
     operation.write_bytecode(buffer)
     return operation.get_asm(use_local_scope=True), buffer.getvalue()
+
+
+def _snapshot(operation: Any) -> tuple[str, bytes]:
+    from torch._inductor.runtime._cudagraph._compiler.validation_snapshots import read_snapshot
+
+    return read_snapshot(operation, _take_snapshot, operation)
 
 
 def _function(module: Any, name: str, kind: str) -> Any:

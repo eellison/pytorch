@@ -144,6 +144,21 @@ _PAYLOAD_BOUNDS = os.environ.get("TORCH_HOST_TRACE_PAYLOAD_BOUNDS", "1") != "0"
 _FLOAT_NODES = (sympy.Float, sympy.Rational, ToFloat, FloatPow, FloatTrueDiv, Float32)
 
 
+def _predicate_uses_float(expression):
+    if isinstance(expression, sympy.Integer):
+        return False
+    if isinstance(expression, _FLOAT_NODES):
+        return True
+    if isinstance(expression, Identity):
+        return _predicate_uses_float(expression.args[0])
+    if isinstance(expression, sympy.Pow):
+        exponent = expression.exp
+        return not (exponent.is_Integer and exponent >= 0)
+    if isinstance(expression, (sympy.Add, sympy.Mul)):
+        return any(_predicate_uses_float(arg) for arg in expression.args)
+    return isinstance(expression, sympy.Symbol) and expression.is_integer is False
+
+
 def _checked(op, operands):
     # the predicate's integer sums and products are int64 (the ABI of every value
     # it reads); an overflowing one sets the function's `bad` flag, which fails the
@@ -755,15 +770,11 @@ class _Lowering:
         if rounded is not None:
             return self.cpp(rounded, names)
         if isinstance(e, sympy.Add):
-            if any(
-                isinstance(a, _FLOAT_NODES) or a.is_integer is False for a in e.args
-            ):
+            if _predicate_uses_float(e):
                 return "(" + " + ".join(self.cpp(a, names) for a in e.args) + ")"
             return _checked("ck_add", [self.cpp(a, names) for a in e.args])
         if isinstance(e, sympy.Mul):
-            if any(
-                isinstance(a, _FLOAT_NODES) or a.is_integer is False for a in e.args
-            ):
+            if _predicate_uses_float(e):
                 return "(" + " * ".join(self.cpp(a, names) for a in e.args) + ")"
             return _checked("ck_mul", [self.cpp(a, names) for a in e.args])
         if isinstance(e, FloorDiv):

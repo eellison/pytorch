@@ -259,7 +259,7 @@
     "id": "cute_host_test_numeric",
     "script": "cpu/cute_host/test_numeric.py",
     "device": "cpu",
-    "cases": 37,
+    "cases": 70,
     "requires_cute": true
   },
   {
@@ -1027,6 +1027,20 @@
     "script": "cpu/cute_host/test_operation_snapshot.py",
     "device": "cpu",
     "cases": 7,
+    "requires_cute": true
+  },
+  {
+    "id": "cpu_cute_validation_snapshots",
+    "script": "cpu/cute_host/test_validation_snapshots.py",
+    "device": "cpu",
+    "cases": 10,
+    "requires_cute": true
+  },
+  {
+    "id": "cuda_cute_grid_expressions",
+    "script": "cuda/test_cute_grid_expressions.py",
+    "device": "cuda",
+    "cases": 1,
     "requires_cute": true
   }
 ]

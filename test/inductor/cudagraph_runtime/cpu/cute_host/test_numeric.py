@@ -113,7 +113,10 @@ class TestCuTeNumericLowering(TestCase):
           llvm.return %wide : i64
         } }''', (0,))
         expression = IntExpr("constant", -1) if literal else IntExpr("boxed", 0)
-        resolve = lambda index, path: NumericSource(expression, -1, -1)
+
+        def resolve(index, path):
+            return NumericSource(expression, -1, -1)
+
         if literal:
             lowered = lower_numeric(numeric, resolve)
             self.assertEqual(lowered.values[0].expression, IntExpr("constant", (1 << 32) - 1))
@@ -158,7 +161,10 @@ class TestCuTeNumericLowering(TestCase):
           %sum = llvm.add %n, %c : i32
           llvm.return %sum : i32
         }} }}''', (3,))
-        resolve = lambda index, path: NumericSource(IntExpr("boxed", 0), 2, 513)
+
+        def resolve(index, path):
+            return NumericSource(IntExpr("boxed", 0), 2, 513)
+
         if constant == 0:
             self.assertEqual(lower_numeric(numeric, resolve).values[0].expression, IntExpr("boxed", 0))
         else:
@@ -294,6 +300,557 @@ class TestCuTeNumericLowering(TestCase):
             actual = tape.values[tape.add(expression)]
             self.assertEqual(actual, evaluate_owned(numeric, arguments)[0].integer())
             self.assertEqual(actual, (value + 1) // 2)
+
+    @parametrize("width, flag", ((8, "none"), (8, "both"), (32, "nsw"), (64, "nuw")))
+    def test_subtraction_preserves_width_order_and_flags(self, width, flag):
+        typ = f"i{width}"
+        maximum = (1 << (width - 1)) - 1
+        suffix = (
+            ""
+            if flag == "none"
+            else " overflow<" + ("nsw, nuw" if flag == "both" else flag) + ">"
+        )
+        numeric = self.freeze(
+            f"""module {{ llvm.func @probe(%a: {typ}, %b: {typ}) -> {typ} {{
+          %result = llvm.sub %a, %b{suffix} : {typ}
+          llvm.return %result : {typ}
+        }} }}""",
+            (0, 1),
+        )
+        sources = (
+            NumericSource(IntExpr("boxed", 0), 4, maximum),
+            NumericSource(IntExpr("boxed", 1), 0, 3),
+        )
+        lowered = lower_numeric(numeric, lambda index, path: sources[index])
+        (result,) = lowered.values
+        self.assertEqual(result.llvm_type, typ)
+        self.assertEqual((result.lower, result.upper), (1, maximum))
+        self.assertEqual(lowered.obligations, ())
+        records = SimpleNamespace(
+            input_names=("a", "b"),
+            integer_inputs=(IntegerInput("a", 0), IntegerInput("b", 1)),
+        )
+        for left, right in ((4, 0), (4, 3), (maximum, 3), (maximum, 0)):
+            tape = _NumericProgram(records, (left, right))
+            actual = tape.values[tape.add(result.expression)]
+            expected = evaluate_owned(numeric, (scalar(typ, left), scalar(typ, right)))[
+                0
+            ].integer()
+            self.assertEqual(actual, expected)
+            self.assertEqual(actual, left - right)
+
+    @parametrize("width", (8, 64))
+    def test_subtraction_keeps_negative_results(self, width):
+        typ = f"i{width}"
+        maximum = (1 << (width - 1)) - 1
+        numeric = self.freeze(
+            f"""module {{ llvm.func @probe(%a: {typ}, %b: {typ}) -> {typ} {{
+          %result = llvm.sub %a, %b overflow<nsw> : {typ}
+          llvm.return %result : {typ}
+        }} }}""",
+            (0, 1),
+        )
+        sources = (
+            NumericSource(IntExpr("boxed", 0), 0, 3),
+            NumericSource(IntExpr("boxed", 1), 4, maximum),
+        )
+        lowered = lower_numeric(numeric, lambda index, path: sources[index])
+        (result,) = lowered.values
+        self.assertEqual((result.lower, result.upper), (-maximum, -1))
+        self.assertEqual(lowered.obligations, ())
+        records = SimpleNamespace(
+            input_names=("a", "b"),
+            integer_inputs=(IntegerInput("a", 0), IntegerInput("b", 1)),
+        )
+        for left, right in ((0, maximum), (3, 4), (0, 4)):
+            tape = _NumericProgram(records, (left, right))
+            actual = tape.values[tape.add(result.expression)]
+            self.assertEqual(
+                actual,
+                evaluate_owned(numeric, (scalar(typ, left), scalar(typ, right)))[
+                    0
+                ].integer(),
+            )
+            self.assertEqual(actual, left - right)
+
+    @parametrize(
+        "width, left, right, flag",
+        (
+            (8, -1, -2, "nuw"),
+            (64, -(1 << 63), -(1 << 63), "none"),
+            (8, -2, 0, "none"),
+        ),
+    )
+    def test_subtraction_folds_exact_signed_literals(self, width, left, right, flag):
+        typ = f"i{width}"
+        suffix = "" if flag == "none" else f" overflow<{flag}>"
+        numeric = self.freeze(
+            f"""module {{ llvm.func @probe(%unused: i32) -> {typ} {{
+          %a = llvm.mlir.constant({left} : {typ}) : {typ}
+          %b = llvm.mlir.constant({right} : {typ}) : {typ}
+          %result = llvm.sub %a, %b{suffix} : {typ}
+          llvm.return %result : {typ}
+        }} }}""",
+            (0,),
+        )
+        resolve = mock.Mock(side_effect=AssertionError("Unused source was requested"))
+        lowered = lower_numeric(numeric, resolve)
+        (result,) = lowered.values
+        self.assertEqual(result.expression, IntExpr("constant", left - right))
+        self.assertEqual(
+            (result.llvm_type, result.lower, result.upper),
+            (typ, left - right, left - right),
+        )
+        self.assertEqual(lowered.obligations, ())
+        self.assertEqual(
+            evaluate_owned(numeric, (scalar("i32", 0),))[0].integer(), left - right
+        )
+        resolve.assert_not_called()
+
+    @parametrize(
+        "left, right, flag, wrapped",
+        (
+            (127, -1, "none", -128),
+            (-128, 1, "none", 127),
+            (127, -1, "nsw", None),
+            (0, 1, "nuw", None),
+            (-2, -1, "nuw", None),
+        ),
+    )
+    def test_subtraction_rejects_wrap_and_unsigned_borrow(
+        self, left, right, flag, wrapped
+    ):
+        suffix = "" if flag == "none" else f" overflow<{flag}>"
+        numeric = self.freeze(
+            f"""module {{ llvm.func @probe(%unused: i32) -> i8 {{
+          %a = llvm.mlir.constant({left} : i8) : i8
+          %b = llvm.mlir.constant({right} : i8) : i8
+          %result = llvm.sub %a, %b{suffix} : i8
+          llvm.return %result : i8
+        }} }}""",
+            (0,),
+        )
+        message = "nuw property" if flag == "nuw" else "signed overflow or wrapping"
+        with self.assertRaisesRegex(NumericDeclined, message):
+            lower_numeric(
+                numeric,
+                mock.Mock(side_effect=AssertionError("Unused source was requested")),
+            )
+        if wrapped is None:
+            with self.assertRaisesRegex(ValueError, flag):
+                evaluate_owned(numeric, (scalar("i32", 0),))
+        else:
+            self.assertEqual(
+                evaluate_owned(numeric, (scalar("i32", 0),))[0].integer(), wrapped
+            )
+
+    def test_subtraction_keeps_dynamic_negative_domain_decline(self):
+        numeric = self.freeze(
+            """module { llvm.func @probe(%a: i64, %b: i64) -> i64 {
+          %result = llvm.sub %a, %b : i64
+          llvm.return %result : i64
+        } }""",
+            (0, 1),
+        )
+        values = (-1, -(1 << 63))
+        sources = tuple(
+            NumericSource(IntExpr("boxed", index), value, value)
+            for index, value in enumerate(values)
+        )
+        with self.assertRaisesRegex(NumericDeclined, "proven nonnegative operands"):
+            lower_numeric(numeric, lambda index, path: sources[index])
+        self.assertEqual(
+            evaluate_owned(numeric, tuple(scalar("i64", value) for value in values))[
+                0
+            ].integer(),
+            (1 << 63) - 1,
+        )
+
+    def test_subtraction_does_not_treat_i1_as_signed_arithmetic(self):
+        numeric = self.freeze(
+            """module { llvm.func @probe(%a: i1, %b: i1) -> i1 {
+          %result = llvm.sub %a, %b : i1
+          llvm.return %result : i1
+        } }""",
+            (0, 1),
+        )
+        with self.assertRaisesRegex(
+            NumericDeclined, "exact operand widths or properties"
+        ):
+            lower_numeric(
+                numeric,
+                lambda index, path: NumericSource(IntExpr("boxed", index), 0, 1),
+            )
+        self.assertEqual(
+            evaluate_owned(numeric, (scalar("i1", 0), scalar("i1", 1)))[0].integer(
+                signed=False
+            ),
+            1,
+        )
+
+    def compile_range_guards(self, obligations, symbol, maximum, *, terminal=True):
+        import ctypes
+
+        import sympy
+
+        from torch._dynamo.source import LocalSource
+        from torch._inductor.codecache import CppCodeCache
+        from torch._inductor.runtime._cudagraph.cute_adapter import _symbolic
+        from torch._inductor.runtime._cudagraph.direct_hosttrace import (
+            _Lowering,
+            _PREDICATE_PREAMBLE,
+        )
+        from torch._inductor.runtime._cudagraph.guard_export import _TerminalPrinter
+        from torch.utils._sympy.value_ranges import ValueRanges
+
+        guards = []
+        for obligation in obligations:
+            value = _symbolic(obligation.expression, {("size", 0, 0): symbol})
+            guards.extend(
+                (sympy.Ge(value, obligation.lower), sympy.Le(value, obligation.upper))
+            )
+        lowering = _Lowering(None)
+        checks = [
+            f"if (!({lowering.cpp(guard, {symbol: 'value'})}) || bad) return 0;"
+            for guard in guards
+        ]
+        cpp = [
+            *_PREDICATE_PREAMBLE,
+            'extern "C" int8_t host_guard(int64_t value) {',
+            "bool bad = false;",
+            *checks,
+            "return 1;",
+            "}",
+        ]
+        if terminal:
+            source = LocalSource("value")
+            mapping = {symbol: [source]}
+            printer = _TerminalPrinter(
+                mapping,
+                lambda source: source.name,
+                mapping,
+                sources=(source,),
+                source_domains={id(source): ValueRanges(0, maximum)},
+                symbols=frozenset((symbol,)),
+            )
+            printed = [printer.doprint(guard) for guard in guards]
+            name = printer.source_to_symbol[source].name
+            cpp.extend(
+                (
+                    'extern "C" int8_t terminal_guard(int64_t value) {',
+                    f"const int64_t {name} = value;",
+                    *(f"if (!({guard})) return 0;" for guard in printed),
+                    "return 1;",
+                    "}",
+                )
+            )
+        library = CppCodeCache.load("\n".join(cpp))
+        for name in ("host_guard", "terminal_guard") if terminal else ("host_guard",):
+            function = getattr(library, name)
+            function.argtypes = [ctypes.c_int64]
+            function.restype = ctypes.c_int8
+        return library
+
+    @parametrize("operation", ("add", "mul"))
+    @parametrize("source_kind", ("size", "floordiv"))
+    def test_metadata_arithmetic_domain_uses_compiled_guards(
+        self, operation, source_kind
+    ):
+        import sympy
+
+        import torch
+
+        numeric = self.freeze(
+            f"""module {{ llvm.func @probe(%n: i8) -> i8 {{
+          %seven = llvm.mlir.constant(7 : i8) : i8
+          %result = llvm.{operation} %n, %seven overflow<nsw> : i8
+          llvm.return %result : i8
+        }} }}""",
+            (0,),
+        )
+        expression = IntExpr("size", 0, (IntExpr("constant", 0),))
+        divisor = 1 if source_kind == "size" else 8
+        if divisor != 1:
+            expression = IntExpr(
+                "floordiv", args=(expression, IntExpr("constant", divisor))
+            )
+        lowered = lower_numeric(
+            numeric, lambda index, path: NumericSource(expression, 0, None)
+        )
+        upper = 120 if operation == "add" else 18
+        self.assertEqual(len(lowered.obligations), 2 if source_kind == "size" else 4)
+        width, arithmetic = lowered.obligations[0], lowered.obligations[-1]
+        self.assertEqual(
+            (width.expression, width.lower, width.upper), (expression, -128, 127)
+        )
+        self.assertEqual(
+            (arithmetic.expression, arithmetic.lower, arithmetic.upper),
+            (expression, 0, upper),
+        )
+        if source_kind == "floordiv":
+            self.assertEqual(
+                [
+                    (row.expression, row.lower, row.upper)
+                    for row in lowered.obligations[1:-1]
+                ],
+                [
+                    (expression.args[0], 0, (1 << 63) - 1),
+                    (expression.args[1], 1, (1 << 63) - 1),
+                ],
+            )
+        symbol = sympy.Symbol("size", integer=True)
+        maximum = 128 * divisor
+        library = self.compile_range_guards(lowered.obligations, symbol, maximum)
+        records = SimpleNamespace(input_names=("tensor",), integer_inputs=())
+        for size in (
+            0,
+            divisor - 1,
+            divisor,
+            (upper + 1) * divisor - 1,
+            (upper + 1) * divisor,
+            maximum,
+        ):
+            value = size // divisor
+            expected = int(value <= upper)
+            self.assertEqual(library.host_guard(size), expected)
+            self.assertEqual(library.terminal_guard(size), expected)
+            if expected:
+                tape = _NumericProgram(records, (torch.empty(size),))
+                actual = tape.values[tape.add(lowered.values[0].expression)]
+                self.assertEqual(
+                    actual, evaluate_owned(numeric, (scalar("i8", value),))[0].integer()
+                )
+            else:
+                self.assertGreater(value + 7 if operation == "add" else value * 7, 127)
+
+    def test_derived_guard_overflow_is_rejected(self):
+        import sympy
+
+        from torch._inductor.runtime._cudagraph.address_guard_printer import (
+            GuardExportDeclined,
+        )
+
+        numeric = self.freeze(
+            """module { llvm.func @probe(%n: i8) -> i8 {
+          %seven = llvm.mlir.constant(7 : i8) : i8
+          %result = llvm.add %n, %seven overflow<nsw> : i8
+          llvm.return %result : i8
+        } }""",
+            (0,),
+        )
+        expression = IntExpr(
+            "add",
+            args=(
+                IntExpr("size", 0, (IntExpr("constant", 0),)),
+                IntExpr("constant", 1),
+            ),
+        )
+        lowered = lower_numeric(
+            numeric, lambda index, path: NumericSource(expression, 1, None)
+        )
+        symbol = sympy.Symbol("size", integer=True)
+        maximum = (1 << 63) - 1
+        with self.assertRaisesRegex(GuardExportDeclined, "fit signed int64"):
+            self.compile_range_guards(lowered.obligations, symbol, maximum)
+        library = self.compile_range_guards(
+            lowered.obligations, symbol, maximum, terminal=False
+        )
+        for size in (0, 119, 120, 127, maximum - 1, maximum):
+            self.assertEqual(library.host_guard(size), int(size <= 119))
+
+    @parametrize(
+        "fault", ("overflow", "underflow", "add_overflow", "division", "select", "and")
+    )
+    def test_cancelled_metadata_keeps_raw_arithmetic_domains(self, fault):
+        import ctypes
+
+        import sympy
+
+        import torch
+        from torch._inductor.codecache import CppCodeCache
+        from torch._inductor.runtime._cudagraph._compiler.cute_bridge.lowering import (
+            _Operands,
+        )
+        from torch._inductor.runtime._cudagraph.cute_adapter import _symbolic
+        from torch._inductor.runtime._cudagraph.direct_hosttrace import (
+            _Lowering,
+            _PREDICATE_PREAMBLE,
+        )
+
+        numeric = self.freeze(
+            """module { llvm.func @probe(%n: i8) -> i8 {
+          %seven = llvm.mlir.constant(7 : i8) : i8
+          %result = llvm.add %n, %seven overflow<nsw> : i8
+          llvm.return %result : i8
+        } }""",
+            (0,),
+        )
+        zero = IntExpr("constant", 0)
+        stride = IntExpr("stride", 0, (zero,))
+        size = IntExpr("size", 1, (zero,))
+        if fault in ("overflow", "underflow"):
+            factor = 2 if fault == "overflow" else -2
+            hidden = IntExpr("multiply", args=(stride, IntExpr("constant", factor)))
+            valid = ((1 << 63) - 1) // 2 if factor > 0 else 1 << 62
+            invalid = valid + 1
+        elif fault == "add_overflow":
+            hidden = IntExpr("add", args=(stride, IntExpr("constant", 1)))
+            valid, invalid = (1 << 63) - 2, (1 << 63) - 1
+        elif fault == "division":
+            dividend = IntExpr("add", args=(stride, IntExpr("constant", -1)))
+            hidden = IntExpr("floordiv", args=(dividend, IntExpr("constant", 8)))
+            valid, invalid = 1, 0
+        else:
+            args = (stride, zero, zero) if fault == "select" else (stride, zero)
+            hidden = IntExpr(fault, args=args)
+            valid, invalid = 1, 2
+        expression = IntExpr(
+            "add", args=(IntExpr("multiply", args=(hidden, zero)), size)
+        )
+        operands = _Operands(
+            SimpleNamespace(input_contract=SimpleNamespace(integer_ranges=())),
+            SimpleNamespace(formals=()),
+            {},
+            None,
+            storage_offset_indices=(0, 1),
+        )
+        source = operands.numeric_value(expression)
+        self.assertEqual((source.lower, source.upper), (0, (1 << 63) - 1))
+        lowered = lower_numeric(numeric, lambda index, path: source)
+        x, y = sympy.symbols("stride size", integer=True)
+        symbols = {("stride", 0, 0): x, ("size", 1, 0): y}
+        self.assertEqual(_symbolic(expression, symbols), y)
+        guards = []
+        for row in lowered.obligations:
+            value = _symbolic(row.expression, symbols)
+            guards.extend((sympy.Ge(value, row.lower), sympy.Le(value, row.upper)))
+        lowering = _Lowering(None)
+        checks = [
+            f"if (!({lowering.cpp(guard, {x: 'x', y: 'y'})}) || bad) return 0;"
+            for guard in guards
+        ]
+        cpp = "\n".join(
+            (
+                *_PREDICATE_PREAMBLE,
+                'extern "C" int8_t guard(int64_t x, int64_t y) {',
+                "bool bad = false;",
+                *checks,
+                "return 1;",
+                "}",
+            )
+        )
+        library = CppCodeCache.load(cpp)
+        library.guard.argtypes = [ctypes.c_int64, ctypes.c_int64]
+        library.guard.restype = ctypes.c_int8
+        records = SimpleNamespace(input_names=("strided", "sized"), integer_inputs=())
+        for stride_value, size_value, expected in (
+            (valid, 4, 1),
+            (invalid, 4, 0),
+            (valid, 121, 0),
+            (valid, 4, 1),
+        ):
+            self.assertEqual(library.guard(stride_value, size_value), expected)
+            if expected:
+                args = (
+                    torch.empty_strided(
+                        (1,), (stride_value,), device="meta", dtype=torch.uint8
+                    ),
+                    torch.empty(size_value, device="meta", dtype=torch.uint8),
+                )
+                tape = _NumericProgram(records, args)
+                self.assertEqual(
+                    tape.values[tape.add(lowered.values[0].expression)],
+                    evaluate_owned(numeric, (scalar("i8", size_value),))[0].integer(),
+                )
+
+    @parametrize("kind", ("rational", "float", "to_float", "identity", "sqrt"))
+    def test_guard_arithmetic_retains_floating_values(self, kind):
+        import ctypes
+        import math
+
+        import sympy
+
+        from torch._inductor.codecache import CppCodeCache
+        from torch._inductor.runtime._cudagraph.direct_hosttrace import (
+            _Lowering,
+            _PREDICATE_PREAMBLE,
+        )
+        from torch.utils._sympy.functions import Identity, ToFloat
+
+        symbol = sympy.Symbol("value", integer=True)
+        coefficient = {
+            "rational": sympy.Rational(1, 2),
+            "float": sympy.Float("1.25"),
+            "to_float": ToFloat(symbol),
+            "identity": Identity(sympy.Rational(1, 2)),
+            "sqrt": sympy.Pow(symbol, sympy.Rational(1, 2), evaluate=False),
+        }[kind]
+        expression = sympy.Add(
+            sympy.Mul(coefficient, symbol, evaluate=False), 3, evaluate=False
+        )
+        code = _Lowering(None).cpp(expression, {symbol: "value"})
+        cpp = "\n".join(
+            (
+                *_PREDICATE_PREAMBLE,
+                'extern "C" int probe(int64_t value, double* result) {',
+                "bool bad = false;",
+                f"*result = {code};",
+                "return bad;",
+                "}",
+            )
+        )
+        library = CppCodeCache.load(cpp)
+        library.probe.argtypes = [ctypes.c_int64, ctypes.POINTER(ctypes.c_double)]
+        library.probe.restype = ctypes.c_int
+        for value in (1, 7, 1 << 40):
+            result = ctypes.c_double()
+            self.assertEqual(library.probe(value, ctypes.byref(result)), 0)
+            factor = {
+                "rational": 0.5,
+                "float": 1.25,
+                "to_float": float(value),
+                "identity": 0.5,
+                "sqrt": math.sqrt(value),
+            }[kind]
+            self.assertEqual(result.value, factor * value + 3.0)
+
+    def test_integer_conversion_keeps_checked_parent_arithmetic(self):
+        import ctypes
+
+        import sympy
+
+        from torch._inductor.codecache import CppCodeCache
+        from torch._inductor.runtime._cudagraph.direct_hosttrace import (
+            _Lowering,
+            _PREDICATE_PREAMBLE,
+        )
+        from torch.utils._sympy.functions import FloorToInt, IntTrueDiv
+
+        symbol = sympy.Symbol("value", integer=True, nonnegative=True)
+        converted = FloorToInt(IntTrueDiv(symbol, 2), evaluate=False)
+        maximum = (1 << 63) - 1
+        expression = sympy.Add(converted, maximum, evaluate=False)
+        code = _Lowering(None).cpp(expression, {symbol: "value"})
+        cpp = "\n".join(
+            (
+                *_PREDICATE_PREAMBLE,
+                'extern "C" int probe(int64_t value, int64_t* result) {',
+                "bool bad = false;",
+                f"*result = {code};",
+                "return bad;",
+                "}",
+            )
+        )
+        library = CppCodeCache.load(cpp)
+        library.probe.argtypes = [ctypes.c_int64, ctypes.POINTER(ctypes.c_int64)]
+        library.probe.restype = ctypes.c_int
+        for value in (0, 1, 2, 3):
+            result = ctypes.c_int64()
+            self.assertEqual(
+                library.probe(value, ctypes.byref(result)), int(value >= 2)
+            )
+            if value < 2:
+                self.assertEqual(result.value, maximum)
 
 
 if __name__ == "__main__":

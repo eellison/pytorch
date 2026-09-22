@@ -10,10 +10,16 @@ if TYPE_CHECKING:
     from torch._inductor.runtime._cudagraph._compiler.launch_events import CloneBundle
 
 
-def _snapshot(module: Any) -> tuple[str, bytes]:
+def _take_snapshot(module: Any) -> tuple[str, bytes]:
     buffer = io.BytesIO()
     module.operation.write_bytecode(buffer)
     return str(module), buffer.getvalue()
+
+
+def _snapshot(module: Any) -> tuple[str, bytes]:
+    from torch._inductor.runtime._cudagraph._compiler.validation_snapshots import read_snapshot
+
+    return read_snapshot(module.operation, _take_snapshot, module)
 
 
 @dataclass(frozen=True)
