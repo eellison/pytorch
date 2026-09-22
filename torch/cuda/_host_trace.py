@@ -462,6 +462,14 @@ _ROUTED = {
 # image carries per-call host bytes no harvest reproduces (measured: a heap
 # address at byte 536 of the StridedOp image differs between two captures)
 _CLOSED_OPS = {aten.mm.default, aten.addmm.default, aten.bmm.default}
+# the out= forms of the closed calls (Inductor's generated wrapper writes its extern GEMMs
+# into buffers it allocated: `extern_kernels.mm(a, b, out=buf)`): the same region, its output
+# the given tensor instead of a fresh allocation
+_CLOSED_OUT_OPS = {
+    aten.mm.out: aten.mm.default,
+    aten.addmm.out: aten.addmm.default,
+    aten.bmm.out: aten.bmm.default,
+}
 
 
 @functools.cache
@@ -2547,8 +2555,9 @@ class _Trace:
         output, issue nothing. The output is what the ordinary op would
         allocate: a contiguous [M, N] ([B, M, N] for bmm) of the operands'
         dtype."""
-        batched = func is aten.bmm.default
-        if func in (aten.mm.default, aten.bmm.default):
+        base = _CLOSED_OUT_OPS.get(func, func)
+        batched = base is aten.bmm.default
+        if base in (aten.mm.default, aten.bmm.default):
             op = "bmm" if batched else "mm"
             mats, bias, scalars = (args[0], args[1]), None, ()
         else:
@@ -2680,11 +2689,35 @@ class _Trace:
                 raise Declined(
                     f"host_trace: {func}: a {bias.dim()}-D bias is not recorded (declined)"
                 )
-        out = self.allocate(
-            aten.empty.memory_format,
-            (out_shape,),
-            {"dtype": a.dtype, "device": self.device},
-        )
+        given = kwargs.get("out")
+        if given is None:
+            out = self.allocate(
+                aten.empty.memory_format,
+                (out_shape,),
+                {"dtype": a.dtype, "device": self.device},
+            )
+        else:
+            # the out= form: the region writes the given tensor, which must be
+            # what the functional op would allocate (a dense [M, N] of the
+            # operands' dtype, an allocation of this trace); each shape and
+            # stride comparison a guard
+            if not isinstance(given, _TracedTensor) or not given._root.allocation:
+                raise Declined(
+                    f"host_trace: {func} with out= that is not an allocation of the trace (declined)"
+                )
+            if given.dtype != a.dtype or given.dim() != len(out_shape):
+                raise Declined(
+                    f"host_trace: {func} with out= of {given.dtype} {tuple(given.shape)} for a {a.dtype} {tuple(out_shape)} result (declined)"
+                )
+            dense = _contiguous_strides(out_shape)
+            for d, (sz, st) in enumerate(zip(out_shape, dense)):
+                if bool(given.shape[d] != sz) or (
+                    bool(given.shape[d] > 1) and bool(given._sym_strides[d] != st)
+                ):
+                    raise Declined(
+                        f"host_trace: {func} with out= of shape {tuple(given.shape)} strides {tuple(given._sym_strides)} where the op allocates {tuple(out_shape)} dense (declined)"
+                    )
+            out = given
         names = ["bias", "mat1", "mat2"] if bias is not None else ["mat1", "mat2"]
         self.region(op, list(zip(names, operands)), [("out", out)], scalars)
         return out
@@ -3231,7 +3264,8 @@ class _TraceMode(TorchDispatchMode):
             op.route = "region"
             return self.trace.native_region(func, args, kwargs, entry)
         # a closed library call (cuBLAS): recorded as a region, never traced into
-        if func in _CLOSED_OPS and not native:
+        # (the out= form the same region over the given allocation)
+        if (func in _CLOSED_OPS or func in _CLOSED_OUT_OPS) and not native:
             op.route = "region"
             return self.trace.closed_region(func, args, kwargs)
         # an op with a traced sibling host is traceable at any depth: under

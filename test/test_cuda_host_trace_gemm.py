@@ -876,6 +876,51 @@ class TestCudaHostTraceGemm(HostTraceTestCase):
         with self.assertRaisesRegex(ht.Declined, "aten.addmm_.default"):
             ht.trace(lambda c, a, b: c.addmm_(a, b), (y, x, wt))
 
+    def test_the_out_form_into_a_trace_allocation_is_the_same_region(self):
+        # Inductor's generated wrapper writes every extern GEMM into a buffer it
+        # allocated (extern_kernels.mm(a, b, out=buf)): the out= form of a closed
+        # call is the same region, its output the given dense allocation; an out=
+        # that is an input or another layout declines by name
+        def f(a, b, c):
+            out = torch.empty(a.shape[0], b.shape[1], device=a.device, dtype=a.dtype)
+            torch.mm(a, b, out=out)
+            out2 = torch.empty_like(out)
+            torch.addmm(c, a, b, out=out2)
+            out3 = torch.empty(
+                2, a.shape[0], b.shape[1], device=a.device, dtype=a.dtype
+            )
+            torch.bmm(a.expand(2, *a.shape), b.expand(2, *b.shape), out=out3)
+            # out3[0] (offset 0): a select at a symbolic offset into an allocation
+            # would give the add an alignment guard over the allocation's base
+            # symbol, which the lowering cannot bind (a limit of the view route,
+            # not of the region)
+            return out + out2 + out3[0]
+
+        a, b, c = self._x(4), self._x(K, N), self.b
+        tape = ht.trace(f, (a, b, c))
+        self.assertEqual(tape.num_regions, 3)
+        regions = json.loads(tape.to_json())["regions"]
+        self.assertEqual([r["op"] for r in regions], ["mm", "addmm", "bmm"])
+        self.assertTrue(all(r.out.root.allocation for r in tape.regions))
+        self.assertEqual(tape.written_inputs, ())
+        variant = build(tape, f, (a, b, c))
+        for m in (4, 8, 32):
+            self.assertTrue(self._check(variant, f, (self._x(m), b, c), f"M={m}"))
+        # an out= into an input, and an out= of another layout than the op's own
+        # dense result (cuBLAS would write it as is, under another key): declined
+        y = torch.empty(4, N, device="cuda", dtype=DTYPE)
+        with self.assertRaisesRegex(
+            ht.Declined, "aten.mm.out with out= that is not an allocation of the trace"
+        ):
+            ht.trace(lambda a, b, o: torch.mm(a, b, out=o), (a, b, y))
+        with self.assertRaisesRegex(ht.Declined, "aten.mm.out with out= of shape"):
+            ht.trace(
+                lambda a, b: torch.mm(
+                    a, b, out=torch.empty(N, 4, device="cuda", dtype=DTYPE).t()
+                ),
+                (a, b),
+            )
+
     def test_bmm_k1_rotary_product_takes_eagers_triton_override(self):
         # LlamaRotaryEmbedding.forward's inv_freq_expanded @ position_ids_expanded:
         # a (B, 32, 1) x (B, 1, 1) fp32 bmm with batch1 expanded over the batch

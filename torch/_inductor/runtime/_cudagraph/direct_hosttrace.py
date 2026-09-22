@@ -393,12 +393,14 @@ class _Lowering:
         # the payload roots (`payload`) that carry a signed-range obligation
         self._bounded = OrderedSet()
 
-    def require(self, relation):
+    def require(self, relation, text=None):
         """An obligation: a relation that folds to False is a recorded contradiction
-        (declined by name), one that folds to True says nothing."""
+        (declined by name, with the unfolded relation when the caller names it), one
+        that folds to True says nothing."""
         if relation is sympy.false or relation == False:  # noqa: E712
             raise HostTraceLoweringDeclined(
                 f"host_trace lowering: the obligation {relation} cannot hold"
+                + (f" ({text})" if text else "")
             )
         if not (relation is sympy.true or relation == True):  # noqa: E712
             self.guards.append(relation)
@@ -650,16 +652,24 @@ class _Lowering:
             # the operands first: a nested division's own domain then precedes the
             # relation over its value (the predicate evaluates the obligations in order)
             numerator, denominator = e.args
+            if (
+                isinstance(e, FloorDiv)
+                and isinstance(denominator, sympy.Integer)
+                and denominator < 0
+            ):
+                # Inductor's ceiling division is written -(x // -c) (its grids and split
+                # sizes): floor(x / -c) = -ceil(x / c), on the domain the runtime admits
+                return self.lower(-CeilDiv(numerator, -denominator))
             operands = (self.lower(numerator), self.lower(denominator))
-            self.require(sympy.Ge(numerator, 0))
-            self.require(sympy.Gt(denominator, 0))
+            self.require(sympy.Ge(numerator, 0), f"numerator of {e} >= 0")
+            self.require(sympy.Gt(denominator, 0), f"divisor of {e} > 0")
             op = "floordiv" if isinstance(e, FloorDiv) else "ceildiv"
             return self.node(op, args=operands)
         if isinstance(e, _MODS):
             a, b = e.args
             operands = (self.lower(a), self.lower(b))
-            self.require(sympy.Ge(a, 0))
-            self.require(sympy.Gt(b, 0))
+            self.require(sympy.Ge(a, 0), f"left operand of {e} >= 0")
+            self.require(sympy.Gt(b, 0), f"modulus of {e} > 0")
             # a - (a // b) * b, on the non-negative domain the runtime's floordiv admits
             quotient = self.node("floordiv", args=operands)
             return self.node(
