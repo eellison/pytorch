@@ -33,18 +33,30 @@ C = torch._C
 def _assert_fused_rms_norm_route(case, fn, args):
     # F.rms_norm's _fused_rms_norm is a converted host, never decomposed
     # (DECISIONS O40 / A190; the core suite's test_unconverted_hosts_decline_by_name
-    # has the same shape): traced as ATen's launches where eager runs ATen, and
-    # as a closed region where eager's route is torch._native's override (the
-    # vendored QuACK CuTe DSL rms norm: torch/cuda/_host_trace_native.py)
+    # has the same shape): traced as ATen's launches where eager runs ATen; where
+    # eager's route is torch._native's override (the vendored QuACK CuTe DSL rms
+    # norm: torch/cuda/_host_trace_native.py) it is one launch of the override's
+    # own program recorded from its launch descriptor when the program has one
+    # (A410: built at its compile under the runtime SDK, or read beside QuACK's
+    # cached object; a fact of the cache, not of the call), else one closed region
     from torch._native import registry
 
     override = any(
         n.active for n in registry._graphs.get(("_fused_rms_norm", "CUDA"), ())
     )
     tape = ht.trace(fn, args)
-    case.assertEqual(
-        (tape.num_launches == 0, tape.num_regions), (override, int(override))
-    )
+    kernels = [L["kernel"] for L in tape.launches]
+    if not override:
+        case.assertEqual(tape.num_regions, 0)
+        case.assertGreater(tape.num_launches, 0)
+        return
+    if tape.num_regions:
+        case.assertEqual((tape.num_launches, tape.num_regions), (0, 1), kernels)
+        case.assertEqual(tape.regions[0].op, "_fused_rms_norm")
+    else:
+        case.assertEqual(len(kernels), 1, kernels)
+        case.assertIn("quack", kernels[0].lower(), kernels)
+        case.assertIn("rmsnorm", kernels[0].lower(), kernels)
 
 
 # a 0-dim CPU tensor operand (not a wrapped number): an implicit CPU scalar
