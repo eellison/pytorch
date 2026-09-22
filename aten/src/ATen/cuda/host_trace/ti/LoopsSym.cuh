@@ -463,6 +463,10 @@ void gpu_kernel_impl_cast(TensorIteratorSym& iter, const func_t& f) {
 // path otherwise (a copy_ between dtypes).
 template <typename func_t>
 void gpu_kernel(TensorIteratorSym& iter, const func_t& f) {
+  // everything from here on picks the kernel and its configuration (the
+  // index width, the dynamic cast, the contiguous / vectorized / strided
+  // ladder); the iterator's shape and stride decisions were made in build
+  KernelChoice choice;
   for (int arg = 0; arg < iter.ntensors(); arg++) {
     TORCH_INTERNAL_ASSERT(
       iter.device(arg).is_cuda(),
@@ -541,6 +545,7 @@ void opmath_gpu_kernel_with_scalars(TensorIteratorSym& iter, const func_t& f) {
   using opmath_arg1_t = typename traits::template arg<0>::type;
   using opmath_arg2_t = typename traits::template arg<1>::type;
   static_assert(traits::arity == 2, "gpu_kernel_with_scalars only supports two input arguments");
+  KernelChoice choice; // the scalar-operand route picks the functor
   if (iter.is_cpu_scalar(1)) {
     ScalarFunctor<AUnaryFunctor<arg1_t, arg2_t, return_t, func_t>, func_t, opmath_arg1_t> af(f, iter.scalar_value<opmath_arg1_t>(1));
     iter.remove_operand(1);
@@ -573,6 +578,7 @@ void opmath_symmetric_gpu_kernel_with_scalars(TensorIteratorSym& iter, const fun
   using opmath_arg_t = typename traits::template arg<0>::type;
   static_assert(traits::arity == 2, "gpu_kernel_with_scalars only supports two input arguments");
   static_assert(std::is_same_v<opmath_arg_t, typename traits::template arg<1>::type>, "f is not symmetric");
+  KernelChoice choice; // the scalar-operand route picks the functor
   opmath_arg_t scalar_val{};
   if (iter.is_cpu_scalar(1)) {
     scalar_val = iter.scalar_value<opmath_arg_t>(1);

@@ -1142,6 +1142,7 @@ Tensor host_softmax(const Tensor & input_, const int64_t dim_, const bool half_t
 
     if (inner_size == 1) {
       ht::Grid grid(outer_size);
+      ht::KernelChoice choice; // the output exists: the warp / block route, the block size, its register / smem choice
       AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, input.scalar_type(), "host_softmax", [&] {
         using accscalar_t = acc_type<scalar_t, true>;
         if (!half_to_float) {

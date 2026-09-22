@@ -18,8 +18,10 @@
 #endif
 #include <c10/util/irange.h>
 
+#include <algorithm>
 #include <limits>
 #include <numeric>
+#include <optional>
 
 namespace at::cuda::host_trace::ti {
 
@@ -433,6 +435,9 @@ FastSetupType TensorIteratorSym::compute_fast_setup_type(const TensorIteratorSym
 }
 
 void TensorIteratorSym::coalesce_dimensions() {
+  // the outputs are allocated: which dims merge decides the kernel's index
+  // arithmetic, not any tensor's metadata
+  KernelChoice choice;
   if (ndim() <= 1) {
     return;
   }
@@ -832,6 +837,16 @@ void TensorIteratorSym::build(TensorIteratorSymConfig& config) {
   compute_shape(config);
   mark_resize_outputs(config);
   compute_types(config);
+  // an in-place or out= iterator allocates nothing: past the shape and dtype
+  // checks every decision is how the kernel iterates over the caller's
+  // output (the fast-setup type, the permutation, the coalescing); a
+  // functional one decides the output's strides until allocate_or_resize_outputs
+  std::optional<KernelChoice> in_place;
+  if (std::all_of(operands_.begin(), operands_.begin() + num_outputs_, [](const OperandInfo& op) {
+        return op.tensor_base().defined();
+      })) {
+    in_place.emplace();
+  }
   if (!fast_set_up(config)) {
     compute_strides(config);
     reorder_dimensions();

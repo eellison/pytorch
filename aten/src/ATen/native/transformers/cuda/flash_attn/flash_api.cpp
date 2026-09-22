@@ -287,6 +287,7 @@ void set_params_dgrad(Flash_bwd_params &params,
 }
 
 void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream, bool force_split_kernel=false) {
+    ht::KernelChoice choice; // the launch template's switches pick the kernel
     FP16_SWITCH(!params.is_bf16, [&] {
         HEADDIM_SWITCH(params.d, [&] {
             BOOL_SWITCH(params.is_causal, Is_causal, [&] {
@@ -345,7 +346,7 @@ std::tuple<at::Tensor, at::Tensor> set_params_splitkv(Flash_fwd_params &params, 
     const c10::SymInt num_heads, const c10::SymInt head_size, const c10::SymInt max_seqlen_k, const c10::SymInt max_seqlen_q,
     const c10::SymInt head_size_rounded, const float p_dropout,
     const int num_splits, cudaDeviceProp *dprops, struct c10::TensorOptions opts) {
-
+    ht::KernelChoice choice; // the split count and its accumulators
     // This needs to match with run_mha_fwd_splitkv_dispatch
     const int block_n = head_size <= 64 ? 256 : (head_size <= 128 ? 128 : 64);
     const c10::SymInt num_n_blocks = (max_seqlen_k + block_n - 1) / block_n;
@@ -847,6 +848,7 @@ mha_varlen_fwd(const at::Tensor &q,  // total_q x num_heads x head_size, total_q
 }
 
 void run_mha_bwd(Flash_bwd_params &params, cudaStream_t stream) {
+    ht::KernelChoice choice; // the launch template's switches pick the kernel
     FP16_SWITCH(!params.is_bf16, [&] {
         HEADDIM_SWITCH(params.d, [&] {
             BOOL_SWITCH(params.is_causal, Is_causal, [&] {

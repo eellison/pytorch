@@ -29,7 +29,7 @@ def recorded_guard_pins(tape):
     tape_guards = getattr(tape.shape_env, "tape_guards", None)
     if tape_guards is None:
         return {}
-    guards, pins, _ = tape_guards()
+    guards, pins, *_ = tape_guards()
     return pins if guards == tape.guards else {}
 
 

@@ -107,6 +107,12 @@ struct ThreadEntry {
   std::unique_ptr<at::cuda::host_trace::ThreadScope> scope;
 };
 
+// A kernel-choice context entered from Python (Recorder.h KernelChoice): a
+// closed region's operand broadcast, an override's dispatch condition.
+struct KernelChoiceEntry {
+  std::unique_ptr<at::cuda::host_trace::KernelChoice> scope;
+};
+
 py::dict tape_records(const Tape& t) {
   py::dict out;
   py::list launches;
@@ -324,6 +330,9 @@ void THCPHostTrace_init(PyObject* module) {
       .def(
           "next_seq",
           [](TraceHandle& h) { return at::cuda::host_trace::next_seq(); })
+      // the event counter as it stands (the seq the next event takes): read
+      // at an op's entry and exit for the tape's op table
+      .def("seq", [](TraceHandle& h) { return h.tape->seq; })
       .def(
           "finish",
           [](TraceHandle& h) {
@@ -356,6 +365,25 @@ void THCPHostTrace_init(PyObject* module) {
              const py::object& /*type*/,
              const py::object& /*value*/,
              const py::object& /*tb*/) { e.scope.reset(); });
+
+  py::class_<KernelChoiceEntry>(m, "_HostTraceKernelChoice")
+      .def(py::init([]() { return KernelChoiceEntry{}; }))
+      .def(
+          "__enter__",
+          [](KernelChoiceEntry& e) {
+            TORCH_CHECK(
+                e.scope == nullptr, "host_trace: kernel choice entered twice");
+            e.scope = std::make_unique<at::cuda::host_trace::KernelChoice>();
+          })
+      .def(
+          "__exit__",
+          [](KernelChoiceEntry& e,
+             const py::object& /*type*/,
+             const py::object& /*value*/,
+             const py::object& /*tb*/) { e.scope.reset(); });
+  m.def("_host_trace_kernel_choice_depth", []() {
+    return at::cuda::host_trace::kernel_choice_depth();
+  });
 
   // The closed regions' harvest (Harvest.h): the nodes of a graph the Python
   // side captured one library call into, as dicts: kernels (func, name, grid,

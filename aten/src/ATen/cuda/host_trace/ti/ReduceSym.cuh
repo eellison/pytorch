@@ -530,6 +530,9 @@ struct NoFill {
 template <typename scalar_t, typename out_scalar_t, int vt0=4, int input_vec_size=vt0, typename ops_t, typename ident_t=double, typename FillOps = NoFill>
 inline void gpu_reduce_kernel(TensorIteratorSym& iter, const ops_t& ops, ident_t ident=0, const FillOps& fill_ops = FillOps()) {
   TORCH_INTERNAL_ASSERT(iter.ntensors() - iter.noutputs() == 1 && iter.noutputs() == 1);
+  // the result is allocated (make_reduction): the index width, the block and
+  // split configuration, its scratch and the launch are the kernel choice
+  KernelChoice choice;
 
   using traits = ::function_traits<decltype(&ops_t::reduce)>;
   using arg_t = typename traits::template arg<0>::type;

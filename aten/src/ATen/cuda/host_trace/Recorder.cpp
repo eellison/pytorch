@@ -19,6 +19,7 @@ namespace at::cuda::host_trace {
 namespace {
 
 thread_local TraceState* g_active = nullptr;
+thread_local int64_t g_kernel_choice = 0;
 hooks::Hooks g_hooks;
 
 constexpr const char* kNoDataPtr =
@@ -283,6 +284,22 @@ ThreadScope::ThreadScope(TraceState* s) : prev(g_active) {
 
 ThreadScope::~ThreadScope() {
   g_active = prev;
+}
+
+KernelChoice::KernelChoice() : entered(g_active != nullptr) {
+  if (entered) {
+    ++g_kernel_choice;
+  }
+}
+
+KernelChoice::~KernelChoice() {
+  if (entered) {
+    --g_kernel_choice;
+  }
+}
+
+int64_t kernel_choice_depth() {
+  return g_kernel_choice;
 }
 
 void require_capturing_stream(

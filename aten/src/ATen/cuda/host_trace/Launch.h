@@ -249,6 +249,7 @@ void launch(void (*kernel)(KArgs...), const G& grid_in, const B& block_in, const
     C10_CUDA_CHECK(cudaLaunchKernel(reinterpret_cast<const void*>(kernel), g, b, ptrs.data(), static_cast<size_t>(smem.expect_int()), stream));
     return;
   }
+  KernelChoice choice;
   require_capturing_stream(s, stream, "launch()");
   const FuncInfo& info = func_info(reinterpret_cast<const void*>(kernel));
   if (info.params.size() != n) {

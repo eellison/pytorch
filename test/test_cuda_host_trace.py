@@ -635,7 +635,7 @@ class TestCudaHostTrace(TestCase):
         self.assertTrue(plain.replacements)
         A, B, C, ST = (x.node.expr for x in syms)
         p = PythonPrinter()
-        guards, pins, _ = env.tape_guards()
+        guards, pins, _, _ = env.tape_guards()
         got = [p.doprint(g) for g in guards]
         # after `Eq(a, b)` the later symbol b reads as a, after `Eq(c, 1)` c
         # reads as 1: the pins, read into the guards that follow them
@@ -652,7 +652,7 @@ class TestCudaHostTrace(TestCase):
     def test_a_tape_holds_every_guard_at_its_own_hints(self):
         tape, _ = self._trace()
         self.assertFalse(tape.shape_env.replacements)
-        guards, pins, _ = tape.shape_env.tape_guards()
+        guards, pins, _, _ = tape.shape_env.tape_guards()
         self.assertEqual(tape.guards, guards)
         prog = ht._Evaluator()
         hints = {str(k): int(v) for k, v in tape.shape_env.backed_var_to_val.items()}
@@ -742,7 +742,7 @@ class TestCudaHostTrace(TestCase):
             self.assertEqual(taken, program(plain, order)[0], order)
             raw = want(order, a.node.expr, st.node.expr, zf.node.expr)
             self.assertEqual(texts(g.expr for g in env.guards), texts(raw), order)
-            kept, pins, _ = env.tape_guards()
+            kept, pins, _, _ = env.tape_guards()
             tape = raw[:1] if order == "pin-div" else raw
             self.assertEqual(texts(kept), texts(tape), order)
             self.assertEqual(pins, {st.node.expr: 2} if "pin" in order else {}, order)
@@ -4141,6 +4141,193 @@ class TestCudaHostTraceLayerNormBackward(TestCase):
 
     def test_two_hints_trace_the_same_backward(self, device):
         two_hint.trace_twice(layer_norm_backward, self._args(self._inputs(64, device)))
+
+
+@unittest.skipIf(not torch.cuda.is_available(), "CUDA not available")
+@skipIfRocm(msg="host tracing is CUDA-only in this version")
+class TestCudaHostTraceGuardAttribution(TestCase):
+    """Per raw guard the tape records the op that raised it, the kernel-choice
+    depth the host declared (Recorder.h KernelChoice) and the origin by the
+    op's route; the op table brackets every record by seq; tape_guards returns
+    the kept mapping; a Miss names the guard's op, phase and origin."""
+
+    N = 4096
+
+    def _inputs(self, M, dtype=torch.bfloat16, offset=0):
+        flat = torch.randn(M * self.N + offset, device="cuda", dtype=dtype)
+        x = flat[offset : offset + M * self.N].view(M, self.N)
+        w = torch.randn(self.N, device="cuda", dtype=dtype)
+        b = torch.randn(self.N, device="cuda", dtype=dtype)
+        return x, w, b
+
+    def _args(self, x, w, b):
+        return (x, [self.N], w, b, 1e-5)
+
+    def test_every_kept_guard_maps_to_its_raw_record(self):
+        tape = ht.trace(layer_norm, self._args(*self._inputs(64)))
+        raw = tape.raw_guards()
+        self.assertEqual(len(tape.guard_rows), len(raw))
+        self.assertEqual(len(tape.kept_raw), len(tape.guards))
+        self.assertEqual(tape.kept_raw, sorted(set(tape.kept_raw)))
+        self.assertLess(tape.kept_raw[-1], len(raw))
+        # a kept guard is its raw record with the earlier pins read in: one
+        # over no pinned symbol is the raw text itself, and every raw record
+        # holds at the hints as its kept form does
+        _, pins, _, kept = tape.shape_env.tape_guards()
+        self.assertEqual(kept, tape.kept_raw)
+        pinned = {str(s) for s in pins}
+        prog = ht._Evaluator()
+        hints = {str(k): int(v) for k, v in tape.shape_env.backed_var_to_val.items()}
+        for k, r in enumerate(tape.kept_raw):
+            self.assertTrue(prog.ev(raw[r], hints))
+            if not (ht._free_symbols(raw[r]) & pinned):
+                self.assertEqual(str(raw[r]), str(tape.guards[k]))
+
+    def test_layer_norms_launch_guards_are_kernel_choices(self):
+        # the host's alignment classes and its expect_contiguous tests pick
+        # the kernel (depth > 0: the vectorized route, a copy of a strided
+        # operand); the normalized-shape checks of weight and bias against N
+        # decide validity at depth 0. Every guard is the layer norm op's,
+        # raised from its C++
+        tape = ht.trace(layer_norm, self._args(*self._inputs(64)))
+        rows = [tape.guard_attribution(k) for k in range(len(tape.guards))]
+        self.assertTrue(rows)
+        # the host's own rows; the rest are the views of mean and rstd the
+        # host takes (nested view ops, metadata)
+        own = [r for r in rows if r["op"] == 0]
+        for r in rows:
+            if r["op"] != 0:
+                self.assertEqual(
+                    (r["route"], r["origin"], r["phase"]), ("view", "view-meta", "meta")
+                )
+                self.assertEqual(tape.ops[r["op"]].parent, 0)
+        self.assertEqual({r["func"] for r in own}, {"aten.native_layer_norm.default"})
+        self.assertEqual({r["route"] for r in own}, {"host"})
+        self.assertEqual({r["origin"] for r in own}, {"host-branch"})
+        sizes = {ht._symbol_name(s) for i in tape.inputs for s in i.sizes}
+        kernel = [
+            g
+            for g, r in zip(tape.guards, rows)
+            if r["op"] == 0 and r["phase"] == "kernel"
+        ]
+        meta = [
+            g
+            for g, r in zip(tape.guards, rows)
+            if r["op"] == 0 and r["phase"] == "meta"
+        ]
+        self.assertTrue(any("Mod" in str(g) for g in kernel), kernel)
+        self.assertTrue(meta)
+        for g in meta:
+            self.assertTrue(ht._free_symbols(g) <= sizes, (g, sizes))
+        # the stride tests (expect_contiguous) are kernel choices
+        strides = {ht._symbol_name(s) for i in tape.inputs for s in i.strides}
+        self.assertTrue(any(ht._free_symbols(g) & strides for g in kernel))
+        for g in meta:
+            self.assertFalse(ht._free_symbols(g) & strides, g)
+
+    def test_the_op_table_brackets_every_record_by_seq(self):
+        # every record the host issued (its allocations included) lies in
+        # its op's [seq0, seq1); a nested op's range lies inside its parent's
+        # and holds exactly its own records; an op issuing nothing has an
+        # empty range
+        def fn(x, shape, w, b, eps):
+            return layer_norm(x, shape, w, b, eps)[0].view(-1)
+
+        tape = ht.trace(fn, self._args(*self._inputs(64)))
+        table = tape.op_table()
+        top = [r for r in table if r["parent"] == -1]
+        self.assertEqual([r["route"] for r in top], ["host", "view"])
+        self.assertEqual(top[0]["func"], "aten.native_layer_norm.default")
+        ln, view = top
+        seqs = [L["seq"] for L in tape.launches] + [a.seq for a in tape.allocs]
+        self.assertEqual(len(seqs), len(set(seqs)))
+        for seq in seqs:
+            self.assertTrue(ln["seq"][0] <= seq < ln["seq"][1], (seq, ln["seq"]))
+        self.assertEqual(view["seq"][0], view["seq"][1])
+        self.assertEqual(view["seq"][0], ln["seq"][1])
+        nested = [r for r in table if r["parent"] == ln["index"]]
+        self.assertEqual({r["route"] for r in nested}, {"alloc", "view"})
+        allocs = [r for r in nested if r["route"] == "alloc"]
+        self.assertEqual(len(allocs), len(tape.allocs))
+        for r, a in zip(allocs, tape.allocs):
+            self.assertEqual(r["seq"], [a.seq, a.seq + 1])
+            self.assertEqual(r["outputs"]["root"], a.root.name)
+            self.assertEqual(r["guards"], [])  # an allocation raises no guard
+        for r in nested:
+            self.assertEqual(r["depth"], 1)
+            self.assertTrue(ln["seq"][0] <= r["seq"][0] <= r["seq"][1] <= ln["seq"][1])
+        # the guards the layer norm op raised itself are its rows; the raw
+        # range of the op holds them and its nested ops' (none here)
+        self.assertEqual(sum(len(r["guards"]) for r in table), len(tape.guard_rows))
+        inside = ln["guards"] + [g for r in nested for g in r["guards"]]
+        self.assertEqual(ln["guard_range"], [0, max(inside) + 1])
+        self.assertTrue(all(g >= ln["guard_range"][1] for g in view["guards"]))
+        self.assertEqual(ln["outputs"][0]["root"], tape.allocs[0].root.name)
+        self.assertEqual(ln["args"][0]["root"], "p0")
+        self.assertEqual(view["args"][0]["root"], tape.allocs[0].root.name)
+        self.assertEqual(view["outputs"]["root"], tape.allocs[0].root.name)
+
+    def test_guards_between_ops_belong_to_no_op(self):
+        # the model's own Python (a size test, a len()) raises guards with no
+        # op on the stack: op None, metadata, origin python / python-len
+        def fn(t, shape, weight, bias, eps):
+            # the size test first: after the len() pin the dedupe pass would
+            # read 8 into it and drop it
+            if t.shape[0] > 3 and len(t) != 0:
+                return layer_norm(t, shape, weight, bias, eps)
+            return t
+
+        tape = ht.trace(fn, self._args(*self._inputs(8)))
+        rows = {str(g): tape.guard_attribution(k) for k, g in enumerate(tape.guards)}
+        M = ht._symbol_name(tape.inputs[0].sizes[0])
+        by_len = rows[f"Eq({M}, 8)"]
+        self.assertEqual(
+            (by_len["op"], by_len["phase"], by_len["origin"]),
+            (None, "meta", "python-len"),
+        )
+        # the IR backend's export writes the relation as `3 < s`
+        size_key = next(k for k in rows if k in (f"{M} > 3", f"3 < {M}"))
+        by_size = rows[size_key]
+        self.assertEqual(
+            (by_size["op"], by_size["phase"], by_size["origin"]),
+            (None, "meta", "python"),
+        )
+        others = [r for g, r in rows.items() if g not in (f"Eq({M}, 8)", size_key)]
+        self.assertTrue(others)
+        self.assertEqual({r["op"] for r in others}, {0})
+        self.assertIn(
+            "python between ops, metadata",
+            tape.guard_site(tape.guards[list(rows).index(size_key)]),
+        )
+
+    def test_a_miss_names_the_guards_op_phase_and_origin(self):
+        args = self._args(*self._inputs(64))
+        tape = ht.trace(layer_norm, args)
+        variant = build(tape, layer_norm, args)
+        with self.assertRaisesRegex(
+            ht.Miss,
+            r"guard failed: .* is not true \(op 0 aten\.native_layer_norm\.default: kernel choice, host-branch\)",
+        ):
+            variant.replay(self._args(*self._inputs(64, offset=1)))
+
+    def test_the_kernel_choice_depth_counts_only_under_a_trace(self):
+        seen = []
+
+        def fn(t, shape, weight, bias, eps):
+            with torch._C._HostTraceKernelChoice():
+                seen.append(torch._C._host_trace_kernel_choice_depth())
+            return layer_norm(t, shape, weight, bias, eps)
+
+        self.assertEqual(torch._C._host_trace_kernel_choice_depth(), 0)
+        with torch._C._HostTraceKernelChoice():
+            self.assertEqual(torch._C._host_trace_kernel_choice_depth(), 0)
+        ht.trace(fn, self._args(*self._inputs(8)))
+        # the warm-up outside the trace, then every symbolic run under it (a
+        # runner may trace the call twice)
+        self.assertEqual(seen[0], 0)
+        self.assertGreaterEqual(len(seen), 2)
+        self.assertEqual(set(seen[1:]), {1})
+        self.assertEqual(torch._C._host_trace_kernel_choice_depth(), 0)
 
 
 instantiate_device_type_tests(

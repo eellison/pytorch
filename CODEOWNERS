@@ -603,6 +603,7 @@
 # [backend_cuda]
 /aten/src/ATen/cuda/ @eqy @syed-ahmed @Aidyn-A
 /aten/src/ATen/native/cuda/ @eqy @syed-ahmed @Aidyn-A
+# /test/host_trace_guard_census.py
 # /test/host_trace_h2d_probe.py
 # /test/host_trace_testing.py
 # /test/host_trace_two_hint.py

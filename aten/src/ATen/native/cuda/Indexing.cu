@@ -2126,6 +2126,9 @@ void index_select_out_sym(Tensor& out, const Tensor& self, int64_t dim, const Te
     return;
   }
 
+  // `out` exists: the index layout, the slice arithmetic, the small-index
+  // route and the 32-bit tests pick the kernel
+  ht::KernelChoice choice;
   bool indContig = index.is_contiguous();
 
   c10::SymInt selfSelectDimSize = self.dim() == 0 ? c10::SymInt(1) : self.sym_size(dim);

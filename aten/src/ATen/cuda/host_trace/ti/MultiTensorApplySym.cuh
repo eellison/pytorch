@@ -123,6 +123,7 @@ void multi_tensor_apply_sym(
     const T& callable,
     const Args&... args) {
   TORCH_CHECK(tensor_lists.size() == depth, "Number of tensor lists has to match the depth.");
+  KernelChoice choice; // the chunk tables and launch count: in place, no output metadata
   const size_t n_tensors = tensor_lists[0].size();
   using metadata_t = at::native::TensorListMetadata<depth>;
   Traced<metadata_t> tensorListMeta;
@@ -189,6 +190,7 @@ void multi_tensor_apply_for_fused_optimizer_sym(
     const T& callable,
     const Args&... args) {
   TORCH_CHECK(tensor_lists.size() == depth, "Number of tensor lists has to match the depth");
+  KernelChoice choice; // the chunk tables and launch count: in place, no output metadata
   const auto num_tensors = tensor_lists[0].size();
   using metadata_t = at::native::FusedOptimizerTensorListMetadata<depth>;
   Traced<metadata_t> tensorListMeta;
@@ -251,6 +253,7 @@ inline bool fast_path_restrictions_sym(
     c10::ArrayRef<at::Scalar> scalars = {},
     bool promotes_integer_inputs_to_float = false,
     bool skip_cross_list_dtype_check = false) {
+  KernelChoice choice; // the fused kernel against the per-tensor slow path
   const auto expected_dtype = lists[0][0].dtype();
   const auto expected_device = lists[0][0].device();
   for (const at::TensorList& list : lists) {

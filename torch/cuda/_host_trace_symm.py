@@ -34,15 +34,16 @@ import torch
 import torch.distributed._symmetric_memory as symm_mem
 from torch.cuda._host_trace import (
     _active,
+    _host_bindings,
+    _real_input_of,
     _TracedTensor,
     Declined,
-    _real_input_of,
     register_traced_entry,
 )
 
 
 ops = torch.ops.symm_mem
-_C = torch._C
+_C = _host_bindings  # torch._C's bindings, the innermost op marked while one runs
 
 
 def _symm_buffer(op, input):

@@ -1233,6 +1233,7 @@ void LayerNormKernelImplSymInt(
     Tensor* Y,
     Tensor* mean,
     Tensor* rstd) {
+  at::cuda::host_trace::KernelChoice choice; // the outputs exist: alignment classes and the launch route
   AT_DISPATCH_FLOATING_TYPES_AND2(
       at::ScalarType::Half,
       at::ScalarType::BFloat16,
@@ -1863,6 +1864,7 @@ void LayerNormBackwardKernelImplSymInt(
     Tensor* dX,
     Tensor* dgamma,
     Tensor* dbeta) {
+  at::cuda::host_trace::KernelChoice choice; // the grads exist: alignment classes and the launch route
   AT_DISPATCH_FLOATING_TYPES_AND2(
       at::ScalarType::Half,
       at::ScalarType::BFloat16,
@@ -1930,9 +1932,15 @@ std::tuple<Tensor, Tensor, Tensor> layer_norm_cuda(
   auto M_N = _check_layer_norm_inputs_symint(input, normalized_shape, weight, bias);
   auto M = M_N.first;
   auto N = M_N.second;
-  auto X = input.expect_contiguous();
-  auto gamma = weight.expect_contiguous();
-  auto beta = bias.expect_contiguous();
+  c10::MaybeOwned<Tensor> X, gamma, beta;
+  {
+    // a kernel choice before the allocation: a non-contiguous operand is
+    // copied, the outputs below are contiguous either way
+    at::cuda::host_trace::KernelChoice choice;
+    X = input.expect_contiguous();
+    gamma = weight.expect_contiguous();
+    beta = bias.expect_contiguous();
+  }
 
   Tensor Y = at::empty_like(
       *X,
@@ -1986,9 +1994,13 @@ std::tuple<Tensor, Tensor, Tensor> layer_norm_backward_cuda(
   auto M_N = _check_layer_norm_inputs_symint(input, normalized_shape, weight, bias);
   auto M = M_N.first;
   auto N = M_N.second;
-  auto X = input.expect_contiguous();
-  auto gamma = weight.expect_contiguous();
-  auto beta = bias.expect_contiguous();
+  c10::MaybeOwned<Tensor> X, gamma, beta;
+  {
+    at::cuda::host_trace::KernelChoice choice; // as in the forward: a copy or the operand as is
+    X = input.expect_contiguous();
+    gamma = weight.expect_contiguous();
+    beta = bias.expect_contiguous();
+  }
 
   Tensor dX;
   Tensor dgamma;

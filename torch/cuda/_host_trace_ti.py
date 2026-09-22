@@ -34,11 +34,16 @@ from __future__ import annotations
 import math
 
 import torch
-from torch.cuda._host_trace import _TRACED_ENTRIES, Declined, register_traced_entry
+from torch.cuda._host_trace import (
+    _host_bindings,
+    _TRACED_ENTRIES,
+    Declined,
+    register_traced_entry,
+)
 
 
 aten = torch.ops.aten
-_C = torch._C
+_C = _host_bindings  # torch._C's bindings, the innermost op marked while one runs
 
 
 def _cuda_operands(op, *operands):

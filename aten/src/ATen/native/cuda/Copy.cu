@@ -537,6 +537,8 @@ Tensor& copy_traced(Tensor& dst, const Tensor& src) {
   iter.add_output(dst);
   iter.add_input(src);
   iter.build(config);
+  // the route (one memcpy, the copy kernel, a cast kernel) and its tests
+  KernelChoice choice;
   if (dtype == other) {
     if (iter.is_contiguous()) {
       // copy_device_to_device's memcpy_eligible branch: one cudaMemcpyAsync of

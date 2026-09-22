@@ -352,6 +352,7 @@ void assign_bound(FloatField<T, Off>& field, const Scalar& s) {
 // and the launch through the typed helper; the kernel is the one above
 template <typename func_t>
 void gpu_kernel_with_index_sym(const Tensor& output, const func_t& f) {
+  KernelChoice choice; // the output exists: the empty test, the index width and the launch
   const c10::SymInt N = output.sym_numel();
   if (N == 0) {
     return;

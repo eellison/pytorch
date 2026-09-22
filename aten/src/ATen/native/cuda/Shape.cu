@@ -1036,7 +1036,10 @@ Tensor cat_traced(const ITensorListRef& tensors, int64_t dim) {
       if (!cat_should_skip_tensor(t)) {
         check_cat_shape_except_dim_sym(materialized[valid], t, dim, i);
         size_at_dim += t.sym_size(dim);
-        all_contiguous = all_contiguous && t.is_contiguous();
+        {
+          ht::KernelChoice choice; // the input's contiguity picks the kernel below
+          all_contiguous = all_contiguous && t.is_contiguous();
+        }
       } else {
         // TensorShape.cpp: a skipped (legacy 1-D empty) tensor clears the flag, which routes
         // the list to the non-contiguous batched kernel below, as in eager
@@ -1052,10 +1055,29 @@ Tensor cat_traced(const ITensorListRef& tensors, int64_t dim) {
   if (result.sym_numel() == c10::SymInt(0)) {
     return result;
   }
-  const bool all32BitIndexable = std::all_of(materialized.begin(), materialized.end(),
-    [] (const Tensor& t) {
-      return at::cuda::detail::canUse32BitIndexMath(t);
-    });
+  // the route (the contiguous kernel, the batched strided kernel, or one
+  // copy per input): every test of it is the kernel choice
+  int route = 2;
+  {
+    ht::KernelChoice choice;
+    const bool all32BitIndexable = std::all_of(materialized.begin(), materialized.end(),
+      [] (const Tensor& t) {
+        return at::cuda::detail::canUse32BitIndexMath(t);
+      });
+    if (materialized.size() > 1 &&
+        result.dim() <= CAT_ARRAY_MAX_INPUT_DIMS &&
+        at::cuda::detail::canUse32BitIndexMath(result) &&
+        all_contiguous &&
+        all32BitIndexable) {
+      route = 0;
+    } else if (materialized.size() > 1 &&
+        result.dim() <= CAT_ARRAY_MAX_INPUT_DIMS &&
+        at::cuda::detail::canUse32BitIndexMath(result) &&
+        materialized[valid].get().dim() <= CAT_ARRAY_MAX_INPUT_DIMS &&
+        all32BitIndexable) {
+      route = 1;
+    }
+  }
   int nDims = materialized[valid].get().dim();
 #define HOST_TRACE_CAT_SWITCH(BATCH, STRIDE)                                                       \
   switch (result.element_size()) {                                                                 \
@@ -1077,19 +1099,13 @@ Tensor cat_traced(const ITensorListRef& tensors, int64_t dim) {
     default:                                                                                       \
       decline(c10::str("host_trace: cat on ", out_dtype, " is not traced (declined)"));            \
   }
-  if (materialized.size() > 1 &&
-      result.dim() <= CAT_ARRAY_MAX_INPUT_DIMS &&
-      at::cuda::detail::canUse32BitIndexMath(result) &&
-      all_contiguous &&
-      all32BitIndexable) {
+  if (route == 0) {
+    ht::KernelChoice choice; // the kernel's metadata tables
     HOST_TRACE_CAT_SWITCH(CAT_ARRAY_BATCH_SIZE, 1)
-  } else if (materialized.size() > 1 &&
-      result.dim() <= CAT_ARRAY_MAX_INPUT_DIMS &&
-      at::cuda::detail::canUse32BitIndexMath(result) &&
-      nDims <= CAT_ARRAY_MAX_INPUT_DIMS &&
-      all32BitIndexable) {
+  } else if (route == 1) {
     // cat_out_cuda's second branch: non-contiguous inputs (or a skipped legacy empty) through
     // the batched kernel that carries each input's sizes and strides
+    ht::KernelChoice choice;
     HOST_TRACE_CAT_SWITCH(CAT_ARRAY_BATCH_SIZE / 2, CAT_ARRAY_BATCH_SIZE / 2)
   } else {
     c10::SymInt offset = 0;

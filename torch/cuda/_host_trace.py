@@ -1873,6 +1873,17 @@ class _TraceShapeEnv(ShapeEnv):
         self.root_facts: list[tuple[str, str]] = []  # distinct pairs, by name
         # a guard's origin when a Python construct pinned a symbol (a len())
         self.guard_notes: dict[sympy.Basic, str] = {}
+        # per raw guard (op index, kernel-choice depth, origin): the trace's
+        # attribution at the record (`attribute`, set by the trace; _NO_ROW
+        # for an env used outside one)
+        self.guard_rows: list[tuple[int, int, str]] = []
+        self.attribute: Any = None
+        # a guard evaluated again by another op or the Python between ops (the
+        # record keeps one row per relation): raw index -> the other raisers'
+        # rows, so a consumer deciding by the raiser sees every one of them
+        self.guard_also: dict[int, list[tuple[int, int, str]]] = {}
+        self._raw_index: dict[sympy.Basic, int] = {}
+        self._key_raw: dict[tuple, int] = {}
         # every binary SymNode operation on this ShapeEnv is stored here once
         self._symop_cache = _SymOpMemo(self.domain)
 
@@ -1910,6 +1921,7 @@ class _TraceShapeEnv(ShapeEnv):
         concrete = sympy.sympify(hint)
         key = (orig_expr, concrete)
         if key in self._evaluated:
+            self._also(key, orig_expr)
             return concrete
         self._evaluated.add(key)
         if concrete is sympy.true:
@@ -1924,14 +1936,36 @@ class _TraceShapeEnv(ShapeEnv):
         if g is sympy.false:
             raise AssertionError(f"host_trace: {orig_expr} is not {hint}")
         self._record(g, size_oblivious)
+        raw = self._raw_index.get(g)
+        if raw is not None:
+            self._key_raw[key] = raw
         return concrete
 
-    def _record(self, g: sympy.Basic, size_oblivious: bool = False) -> None:
+    def _also(self, key: tuple, orig_expr: sympy.Basic) -> None:
+        raw = self._key_raw.get(key)
+        if raw is None or self.attribute is None:
+            return
+        row = self.attribute(self, orig_expr)
+        rows = self.guard_also.get(raw)
+        if row == self.guard_rows[raw] or (rows is not None and row in rows):
+            return
+        if rows is None:
+            self.guard_also[raw] = [row]
+        else:
+            rows.append(row)
+
+    def _record(
+        self, g: sympy.Basic, size_oblivious: bool = False, row: tuple | None = None
+    ) -> None:
         # the same relation from another evaluation (`not a < b` and `a >= b`,
         # a division's domain the host then tests itself) is one guard
         if g is not sympy.true and g not in self._recorded:
             self._recorded.add(g)
             self.guards.append(ShapeGuard(g, _NO_SLOC, size_oblivious))
+            self._raw_index[g] = len(self.guards) - 1
+            if row is None:
+                row = _NO_ROW if self.attribute is None else self.attribute(self, g)
+            self.guard_rows.append(row)
 
     def domain(self, lhs: Any, rhs: Any, out: Any) -> None:
         """A partial operation's domain, recorded as a guard at the point the
@@ -1988,7 +2022,7 @@ class _TraceShapeEnv(ShapeEnv):
     def _set_replacement(self, a: sympy.Symbol, tgt: sympy.Expr, msg: str) -> None:
         raise AssertionError(f"host_trace: {a} is never replaced ({msg})")
 
-    def tape_guards(self) -> tuple[list, dict, dict]:
+    def tape_guards(self) -> tuple[list, dict, dict, list]:
         """The recorded guards in order, without those the guards before them
         already imply: a guard that is structurally true once the earlier
         guards' pins (`Eq(s, 1024)`), unifications (`Eq(a, b)`) and relations
@@ -2164,7 +2198,8 @@ class _TraceShapeEnv(ShapeEnv):
 
         out = []
         notes = {}
-        for g in self.guards:
+        kept = []
+        for k, g in enumerate(self.guards):
             expr = g.expr
             e = substitute(expr)
             # facts are kept for the relations a later guard can repeat (a
@@ -2175,6 +2210,7 @@ class _TraceShapeEnv(ShapeEnv):
             ):
                 continue
             out.append(e)
+            kept.append(k)
             note = self.guard_notes.get(expr)
             if note is not None:
                 notes[e] = note
@@ -2185,7 +2221,117 @@ class _TraceShapeEnv(ShapeEnv):
                 facts[canon(e)] = sympy.true
             if isinstance(e, sympy.Eq):
                 pin_or_unify(e)
-        return out, {s: roots(s) for s in parent}, notes
+        return out, {s: roots(s) for s in parent}, notes, kept
+
+
+# a guard's origin by the route the mode took for the innermost op: which code
+# raised it, without a frame walk (a sibling entry's own Python before its
+# C++ binding is "entry-python", the sibling's C++ once the binding runs
+# "entry-host"; a converted host reached by redispatch "host-branch"; a
+# torch._native override's condition "override-cond")
+_ORIGIN_OF_ROUTE = {
+    "host": "host-branch",
+    "view": "view-meta",
+    "alloc": "alloc-meta",
+    "region": "region-record",
+    "composite": "composite-body",
+    "override": "override-cond",
+    None: "recorder",
+}
+# the row of a guard no trace attributes (an env used outside one)
+_NO_ROW = (-1, 0, "python")
+
+
+class _OpRec:
+    """One op the trace mode dispatched: a row of the tape's op table. The
+    route the mode took (alloc, view, region, entry = a traced sibling entry,
+    host = a converted host, override = a torch._native override, composite =
+    a decomposition or an E38 body), the arguments as the op received them
+    (traced tensors by reference), the outputs as returned, the recorder's
+    `seq` at entry and exit (every record the op issued, allocations and
+    memsets included, lies in [seq[0], seq[1])), and the raw guard indices
+    raised while it ran (nested ops' included; the op's own are the rows
+    naming its index)."""
+
+    __slots__ = (
+        "index", "func", "route", "parent", "depth", "args", "kwargs", "seq",
+        "guard_range", "outputs", "declined", "in_host",
+    )  # fmt: skip
+
+    def __init__(
+        self,
+        index: int,
+        func: Any,
+        parent: int,
+        depth: int,
+        args: tuple,
+        kwargs: dict,
+        seq: int,
+        guard: int,
+    ) -> None:
+        self.index = index
+        self.func = func
+        self.route: str | None = None
+        self.parent = parent
+        self.depth = depth
+        self.args = args
+        self.kwargs = kwargs
+        self.seq = [seq, -1]
+        self.guard_range = [guard, -1]
+        self.outputs: Any = None
+        self.declined = False
+        self.in_host = False  # a sibling entry's C++ binding is running
+
+    def origin(self) -> str:
+        # a sibling entry: its own Python before the binding, its C++ after
+        if self.route == "entry":
+            return "entry-host" if self.in_host else "entry-python"
+        return _ORIGIN_OF_ROUTE[self.route]
+
+
+class _HostBindings:
+    """torch._C's host bindings as the sibling entries call them, each marking
+    the innermost op as inside its C++ for the duration: the guards it raises
+    then originate from the host's branch, the entry's own Python checks
+    before the call from the entry (no frame walk)."""
+
+    def __getattr__(self, name: str) -> Any:
+        fn = getattr(torch._C, name)
+
+        @functools.wraps(fn)
+        def call(*args: Any, **kwargs: Any) -> Any:
+            ops = getattr(_active, "ops", None)
+            if not ops:
+                return fn(*args, **kwargs)
+            op = ops[-1]
+            prev, op.in_host = op.in_host, True
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                op.in_host = prev
+
+        setattr(self, name, call)
+        return call
+
+
+def _guard_attribution(env: Any, g: Any) -> tuple[int, int, str]:
+    # per raw guard: the innermost op on this thread's stack (-1 between ops),
+    # the kernel-choice depth (Recorder.h KernelChoice: > 0 picks a kernel or a
+    # launch configuration, 0 decides metadata), and the origin by the op's
+    # route (a len() pin between ops is the model's Python, noted by __len__
+    # before the guard is recorded). A plain function on the env, not a bound
+    # method of the trace: a _Trace dropped without end() (a test's) must free
+    # by refcount, which closes its capture
+    depth = torch._C._host_trace_kernel_choice_depth()
+    ops = getattr(_active, "ops", None)
+    if not ops:
+        origin = "python-len" if g in env.guard_notes else "python"
+        return (-1, depth, origin)
+    op = ops[-1]
+    return (op.index, depth, op.origin())
+
+
+_host_bindings = _HostBindings()
 
 
 class _Trace:
@@ -2221,6 +2367,9 @@ class _Trace:
         self.inputs: list[_InputRec] = []
         self.allocs: list[_AllocRec] = []
         self.regions: list[_RegionRec] = []
+        # the op table, in dispatch order (the trace mode's enter_op / exit_op)
+        self.ops: list[_OpRec] = []
+        self.shape_env.attribute = _guard_attribution
         # the real tensor behind each input root (by root name): a host that
         # needs process-lifetime state keyed by the real storage (a symmetric
         # memory handle, torch/cuda/_host_trace_symm.py) looks it up here
@@ -2234,12 +2383,37 @@ class _Trace:
         # off the tracing thread (the mode's own thread keeps _active.trace
         # for the whole trace, _trace_once)
         prev = getattr(_active, "trace", None)
+        prev_ops = getattr(_active, "ops", None)
         _active.trace = self
+        _active.ops = []
         try:
             with self.rec.on_this_thread():
                 yield
         finally:
             _active.trace = prev
+            _active.ops = prev_ops
+
+    def enter_op(self, func: Any, args: tuple, kwargs: dict) -> _OpRec:
+        stack = _active.ops
+        op = _OpRec(
+            len(self.ops),
+            func,
+            stack[-1].index if stack else -1,
+            len(stack),
+            args,
+            kwargs,
+            self.rec.seq(),
+            len(self.shape_env.guards),
+        )
+        self.ops.append(op)
+        stack.append(op)
+        return op
+
+    def exit_op(self, op: _OpRec, out: Any) -> None:
+        _active.ops.pop()
+        op.seq[1] = self.rec.seq()
+        op.guard_range[1] = len(self.shape_env.guards)
+        op.outputs = out
 
     def symbol(
         self, value: Any, name: str, *, positive: bool = False, fresh: bool = False
@@ -2488,7 +2662,11 @@ class _Trace:
         out_shape = [a.shape[0], m, n] if batched else [m, n]
         if bias is not None:
             if bias.dim() == 1:
-                if bool(bias.shape[0] != n):
+                # a length-1 bias broadcasts to N under another template of
+                # the same output: the region key's decision (a kernel choice)
+                with torch._C._HostTraceKernelChoice():
+                    broadcasts = bool(bias.shape[0] != n)
+                if broadcasts:
                     raise Declined(
                         f"host_trace: {func}: bias of {bias.shape} does not broadcast to [M, {n}]"
                     )
@@ -2989,7 +3167,24 @@ class _TraceMode(TorchDispatchMode):
         kwargs = kwargs or {}
         if func in _ROUTED:
             return _routed(func, args, kwargs)
+        # every other op is a row of the tape's op table: its route, its
+        # record range by seq, the guards raised while it ran, its outputs
+        op = self.trace.enter_op(func, args, kwargs)
+        out = None
+        try:
+            out = self._route(func, types, args, kwargs, op)
+            return out
+        except Declined:
+            op.declined = True
+            raise
+        finally:
+            self.trace.exit_op(op, out)
+
+    def _route(
+        self, func: Any, types: Any, args: tuple, kwargs: dict, op: _OpRec
+    ) -> Any:
         if func in _ALLOC_OPS:
+            op.route = "alloc"
             if _deterministic_fill():
                 # eager's empty*() fills what it allocates under
                 # use_deterministic_algorithms(True) with
@@ -3005,6 +3200,7 @@ class _TraceMode(TorchDispatchMode):
                 )
             return self.trace.allocate(func, args, kwargs)
         if func in _VIEW_OPS:
+            op.route = "view"
             return self.trace.view(func, args, kwargs)
         # a call eager serves through a torch._native override (the K = 1 bmm:
         # a Triton kernel, not cuBLAS) takes eager's route: the override's
@@ -3017,8 +3213,12 @@ class _TraceMode(TorchDispatchMode):
         if entry is not None:
             args = tuple(_concrete_ints(a) for a in args)
             kwargs = {k: _concrete_ints(v) for k, v in kwargs.items()}
-        with self:
+        # the override's condition is a kernel choice (E40, LOCAL_MISS 3.1):
+        # its comparisons are kernel-tagged and originate from the condition
+        op.route = "override"
+        with self, torch._C._HostTraceKernelChoice():
             native = _native_override_takes(func, args, kwargs)
+        op.route = None
         # the override's program has a launch descriptor (what eager's warm-up
         # launched here, read off eager's own call): eager's route under the
         # trace, the program's call recorded from the descriptor
@@ -3028,9 +3228,11 @@ class _TraceMode(TorchDispatchMode):
             and native
             and not _host_trace_cute_dsl.descriptor_ahead(entry.programs)
         ):
+            op.route = "region"
             return self.trace.native_region(func, args, kwargs, entry)
         # a closed library call (cuBLAS): recorded as a region, never traced into
         if func in _CLOSED_OPS and not native:
+            op.route = "region"
             return self.trace.closed_region(func, args, kwargs)
         # an op with a traced sibling host is traceable at any depth: under
         # trace, or inside another host (a layer norm copying a non-contiguous
@@ -3039,6 +3241,9 @@ class _TraceMode(TorchDispatchMode):
         # a converted host is traceable under trace and inside another
         # converted host (the SDPA flash entry calls _flash_attention_forward)
         if entry is not None or native or func in _TRACEABLE:
+            op.route = (
+                "entry" if entry is not None else ("override" if native else "host")
+            )
             if entry is not None and func in self.entering:
                 raise Declined(
                     f"host_trace: the traced entry for {func} dispatched {func} itself; "
@@ -3102,6 +3307,7 @@ class _TraceMode(TorchDispatchMode):
         # them (slice_backward: the zeros' memset and one copy); a host read
         # inside the body declines where it occurs (DECISIONS E38)
         body = _explicit_body_key(func, _key_below(args, kwargs))
+        op.route = "composite"  # a decomposition or an E38 body under the mode
         self.decomposing.append(func)
         try:
             with self:
@@ -3194,7 +3400,14 @@ class Tape:
         self.written_inputs: tuple[int, ...] = tuple(
             i.position for i in self.inputs if i.root.name in written
         )
-        self.guards, pins, self.guard_notes = tr.shape_env.tape_guards()
+        # the op table and, per raw guard of the env's record, (op index,
+        # kernel-choice depth, origin); kept_raw maps each kept guard (a
+        # position in `guards`) to its raw index
+        self.ops = tr.ops
+        self.guard_rows = list(tr.shape_env.guard_rows)
+        self.guard_also = dict(tr.shape_env.guard_also)
+        self.guards, pins, self.guard_notes, self.kept_raw = tr.shape_env.tape_guards()
+        self._kept_index: dict | None = None
         if pins:
             self._pin_uses(pins)
         # what the tape declares rather than guards: every input size symbol
@@ -3264,6 +3477,82 @@ class Tape:
         self.rng_increment = sub(self.rng_increment)
         for slot in self.rng_slots:
             slot["increment"] = sub(slot["increment"])
+
+    def sym_expr(self, v: Any) -> Any:
+        """A traced value (a SymInt / SymFloat / SymBool of the op table's
+        arguments and outputs) as a sympy expression over the tape's
+        shape_env; a number as itself."""
+        return v.node.expr if isinstance(v, _SYM_TYPES) else v
+
+    def raw_guards(self) -> tuple:
+        """The raw guard record as sympy, aligned with `guard_rows`."""
+        return tuple(g.expr for g in self.shape_env.guards)
+
+    def guard_attribution(self, k: int) -> dict:
+        """Kept guard `k`'s attribution: its raw index, the op (index, name,
+        route; None between ops), the phase ("kernel" at a kernel-choice
+        depth > 0, else "meta") and the origin."""
+        raw = self.kept_raw[k]
+        op_index, depth, origin = self.guard_rows[raw]
+        op = self.ops[op_index] if op_index >= 0 else None
+        return {
+            "raw": raw,
+            "op": op_index if op is not None else None,
+            "func": str(op.func) if op is not None else None,
+            "route": op.route if op is not None else None,
+            "phase": "kernel" if depth > 0 else "meta",
+            "depth": depth,
+            "origin": origin,
+            # the other raisers of the same relation (op index, depth, origin)
+            "also": list(self.guard_also.get(raw, ())),
+        }
+
+    def guard_site(self, g: Any) -> str:
+        """Where kept guard `g` came from, for a Miss text: the op, the phase
+        and the origin ("op 3 aten.native_layer_norm.default: kernel choice,
+        host-branch"), or the Python between ops."""
+        if self._kept_index is None:
+            index: dict = {}
+            for k, e in enumerate(self.guards):
+                index.setdefault(e, k)
+            self._kept_index = index
+        k = self._kept_index.get(g)
+        if k is None:
+            return ""
+        a = self.guard_attribution(k)
+        phase = "kernel choice" if a["phase"] == "kernel" else "metadata"
+        if a["op"] is None:
+            return f"{a['origin']} between ops, {phase}"
+        return f"op {a['op']} {a['func']}: {phase}, {a['origin']}"
+
+    def op_table(self) -> list[dict]:
+        """The op table as dicts: per op its index, func, route, parent,
+        depth, the record range [seq0, seq1), the raw guards it raised itself
+        (rows naming its index) and every raw guard raised while it ran
+        (nested ops' included), the arguments and outputs with traced tensors
+        as descriptors (root, sizes, strides, offset, dtype, device; the
+        values symbolic as recorded)."""
+        own: list[list[int]] = [[] for _ in self.ops]
+        for raw, (op_index, _depth, _origin) in enumerate(self.guard_rows):
+            if op_index >= 0:
+                own[op_index].append(raw)
+        return [
+            {
+                "index": o.index,
+                "func": str(o.func),
+                "route": o.route,
+                "parent": o.parent,
+                "depth": o.depth,
+                "seq": list(o.seq),
+                "guards": own[o.index],
+                "guard_range": list(o.guard_range),
+                "args": _describe_args(o.args),
+                "kwargs": {k: _describe_args(v) for k, v in o.kwargs.items()},
+                "outputs": _describe_args(o.outputs),
+                "declined": o.declined,
+            }
+            for o in self.ops
+        ]
 
     @property
     def num_launches(self) -> int:
@@ -3548,6 +3837,33 @@ def _check_host_buffers(tr: _Trace, records: dict) -> None:
             )
 
 
+def _describe_args(a: Any) -> Any:
+    # an op-table argument: a traced tensor as its metadata (symbolic values
+    # as recorded), a real tensor met inside the trace as its concrete
+    # metadata, a list / tuple elementwise, anything else as is
+    if isinstance(a, _TracedTensor):
+        return {
+            "root": a._root.name,
+            "sizes": list(a.shape),
+            "strides": list(a._sym_strides),
+            "offset": a._sym_offset,
+            "dtype": a.dtype,
+            "device": str(a.device),
+        }
+    if isinstance(a, torch.Tensor):
+        return {
+            "root": None,
+            "sizes": list(a.shape),
+            "strides": list(a.stride()),
+            "offset": a.storage_offset(),
+            "dtype": a.dtype,
+            "device": str(a.device),
+        }
+    if isinstance(a, (list, tuple)):
+        return type(a)(_describe_args(x) for x in a)
+    return a
+
+
 def _tensor_positions(args: tuple) -> list[int]:
     return [i for i, a in enumerate(args) if isinstance(a, torch.Tensor)]
 
@@ -3662,6 +3978,7 @@ def _trace_once(
     tr = _Trace(device, hints)
     tr.triton = _host_trace_triton.TritonTrace(triton)
     _active.trace = tr
+    _active.ops = []  # this thread's stack of ops being dispatched
     try:
         traced = list(args)
         for i in positions:
@@ -3746,6 +4063,7 @@ def _trace_once(
             tr.rec.end()
         finally:
             _active.trace = None
+            _active.ops = None
 
 
 class _GcHold:

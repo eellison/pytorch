@@ -191,8 +191,10 @@ class TapeCheck:
                     f"the guard {self.ev.guard_text(g)} reads a symbol no input or opaque call binds ({e}): undecidable without a replay"
                 ) from None
             if not holds:
+                # the guard's note (a len() pin's frame) and its attribution:
+                # the op, the phase (kernel choice or metadata), the origin
                 note = self.tape.guard_notes.get(g)
-                where = f" ({note})" if note else ""
+                where = "".join(f" ({x})" for x in (note, self.tape.guard_site(g)) if x)
                 raise ht.Miss(
                     f"guard failed: {self.ev.guard_text(g)} is not true{where}"
                 )

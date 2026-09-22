@@ -283,6 +283,33 @@ struct TORCH_CUDA_CPP_API ThreadScope {
   TraceState* const prev;
 };
 
+// The kernel-choice context: a thread-local depth a host enters where its
+// kernel decision begins, so that the recorder can tell a guard that picks a
+// kernel or a launch configuration (depth > 0: the LoopsSym contiguity and
+// alignment ladder, TensorIterator's coalescing, a reduction's block and
+// split configuration, the multi_tensor_apply chunk tables, flash's split
+// heuristic and launch template, layer norm's expect_contiguous, cat's
+// route) from one that decides an output's sizes, strides, dtype or aliasing
+// (depth 0: shape inference, stride computation, a view, an allocation, a
+// validity check). The context is declared by the host where its choice
+// begins, never inferred from the query: the same is_contiguous inside
+// reshape decides aliasing. The typed launch helper enters it around the
+// launch. Outside a trace the constructor reads the thread's active trace
+// and does nothing else; a Python entry (a closed region's operand
+// broadcast, a torch._native override's condition) goes through the
+// recorder's binding.
+struct TORCH_CUDA_CPP_API KernelChoice {
+  KernelChoice();
+  ~KernelChoice();
+  KernelChoice(const KernelChoice&) = delete;
+  KernelChoice& operator=(const KernelChoice&) = delete;
+  KernelChoice(KernelChoice&&) = delete;
+  KernelChoice& operator=(KernelChoice&&) = delete;
+  const bool entered;
+};
+// The kernel-choice depth on this thread: 0 outside every context.
+TORCH_CUDA_CPP_API int64_t kernel_choice_depth();
+
 // End the capture, read the kernel nodes back and record the launches. Call
 // after the host returned.
 TORCH_CUDA_CPP_API void finish_trace(TraceState* s);
