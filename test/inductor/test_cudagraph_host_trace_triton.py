@@ -32,6 +32,22 @@ if HAS_TRITON:
         mask = offs < n
         tl.store(y_ptr + offs, tl.load(x_ptr + offs, mask=mask) * alpha, mask=mask)
 
+    @triton.jit
+    def scale_add_typed(x_ptr, y_ptr, n: tl.int32, shift, BLOCK: tl.constexpr):
+        pid = tl.program_id(0)
+        offs = pid * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < n
+        x = tl.load(x_ptr + offs, mask=mask, other=0.0)
+        tl.store(y_ptr + offs, x * 2.0 + shift, mask=mask)
+
+    @triton.jit(do_not_specialize=["shift"])
+    def scale_add_generic_shift(x_ptr, y_ptr, n, shift, BLOCK: tl.constexpr):
+        pid = tl.program_id(0)
+        offs = pid * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < n
+        x = tl.load(x_ptr + offs, mask=mask, other=0.0)
+        tl.store(y_ptr + offs, x * 2.0 + shift, mask=mask)
+
     @triton.autotune(
         configs=[triton.Config({"BLOCK": 256}), triton.Config({"BLOCK": 512})],
         key=["n"],
@@ -62,6 +78,27 @@ def float_host(x):
     y = torch.empty_like(x)
     n = x.numel()
     scale_float[(triton.cdiv(n, 1024),)](x, y, n, 1.5, BLOCK=1024)
+    return y
+
+
+def typed_host(x):
+    y = torch.empty_like(x)
+    n = x.numel()
+    scale_add_typed[(triton.cdiv(n, 1024),)](x, y, n, 3, BLOCK=1024)
+    return y
+
+
+def generic_shift_host(x):
+    y = torch.empty_like(x)
+    n = x.numel()
+    scale_add_generic_shift[(triton.cdiv(n, 1024),)](x, y, n, n // 8, BLOCK=1024)
+    return y
+
+
+def symbolic_option_host(x):
+    y = torch.empty_like(x)
+    n = x.numel()
+    scale_add[(triton.cdiv(n, 1024),)](x, y, n, 3, BLOCK=1024, num_warps=n // 1024)
     return y
 
 
@@ -333,8 +370,44 @@ class TestHostTraceTriton(TestCase):
         self.assertEqual(cold.launches[0]["func"], warm.launches[0]["func"])
         self.assertEqual([str(g) for g in cold.guards], [str(g) for g in warm.guards])
 
+    def test_guards_are_tritons_specialization_of_each_declaration(self):
+        # the guards come from Triton's own binder run on the symbolic values,
+        # per declaration: a typed integer (n: tl.int32) keeps Triton's
+        # equal-to-1 axis (the compile key differs at 1, the code does not),
+        # which a list of "what the type reads" would skip; a do_not_specialize
+        # integer has no axis but its slot's width; a size on the divisibility
+        # class boundary misses to the other compilation
+        x = torch.randn(17, device="cuda")
+        replay = self._replay(typed_host, (x,))
+        guards = [str(g) for g in replay.tape.guards]
+        n = replay.tape.launches[0]["params"][2]["value"]
+        self.assertIn(f"Ne({n}, 1)", guards)
+        self.assertIn(f"Ne(Mod({n}, 16), 0)", guards)
+        one = torch.randn(1, device="cuda")
+        self.assertEqual(replay(one), typed_host(one), atol=0, rtol=0)
+        # at 1 Triton keys another compilation: a miss, then eager's function
+        # object for that key in the new variant (E36), never the traced one
+        self.assertEqual((replay.misses, len(replay.variants)), (1, 2))
+        graph, _ = replay.variants[1].lowered.capture_handles
+        self.assertEqual(_kernel_nodes(graph), self._eager_nodes(typed_host, (one,)))
+        self.assertNotEqual(
+            replay.variants[1].tape.launches[0]["func"],
+            replay.variants[0].tape.launches[0]["func"],
+        )
+        tape = self.ht.trace(generic_shift_host, (torch.randn(4096, device="cuda"),))
+        shift = tape.launches[0]["params"][3]["value"]
+        guards = [str(g) for g in tape.guards]
+        self.assertNotIn(f"Ne({shift}, 1)", guards)
+        self.assertNotIn(f"Mod({shift}, 16)", " ".join(guards))
+        self.assertIn(f"({shift}) <= 2147483647", guards)
+
     def test_declines_by_name(self):
         x = torch.randn(4096, device="cuda")
+        with self.assertRaisesRegex(
+            self.ht.Declined,
+            "Triton kernel scale_add: launch option num_warps is a value of the trace",
+        ):
+            self.ht.trace(symbolic_option_host, (x,))
         with self.assertRaisesRegex(
             self.ht.Declined, "the grid of Triton kernel scale_add.*_local_scalar_dense"
         ):

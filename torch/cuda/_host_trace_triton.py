@@ -17,14 +17,28 @@ The symbolic run intercepts that launcher: the arguments are bound to the
 kernel's formals, and the compilation is selected as eager selects it, by
 Triton's own binder and cache (JITFunction.run with warmup=True: no launch)
 on the traced values, a pointer standing in with its dtype and the address
-value's hint, an integer with its hint. Triton's specialization is a function
-of exactly the facts it reads from those values (a pointer's dtype and
-16-byte alignment, an integer equal to 1, divisible by 16, inside the int32
-range, a constexpr's value, the launch options), and every one of them is
-evaluated on the symbolic value afterwards, so the tape guards the selection
-in the direction the traced call took: the selected compilation is eager's
-for every call the tape serves, and a call whose specialization differs
-misses and retraces to eager's other compilation (E24). When the trace had a
+value's hint, an integer with its hint. The guards of that selection come
+from Triton's own binder run a second time on the values of the trace
+(_select): the same generated binder, whose per-argument specialize_impl is
+replaced by one that reads the symbolic values, so the flags of each
+declaration (do_not_specialize, do_not_specialize_on_alignment, a const or a
+typed annotation, a constexpr) and the compile key's composition are
+Triton's as written, not a list kept here. A pointer stand-in with a symbolic
+address goes through Triton's C++ (native_specialize_impl) under a backend
+view without native tensor specialization, so Triton's own Python
+(get_tensor_specialization) compares the address, and that comparison is a
+guard; an integer's equal-to-1 and width classes are the C++'s rules re-read
+on the symbolic value (the C++ reads a C long, a concrete read: the two are
+compared at the hint here and on every class boundary by the drift test,
+test_cudagraph_host_trace_triton_spec.py), its divisibility Triton's own
+get_int_specialization; a constexpr's value is pinned; a float or bool has no
+value axis. The symbolic run's specialization must equal, argument by
+argument, the one Triton computed for the hints, and its compile key must be
+the key under which Triton's cache holds the selected compilation. So the
+tape guards the selection in the direction the traced call took: the
+selected compilation is eager's for every call the tape serves, and a call
+whose specialization differs misses and retraces to eager's other
+compilation (E24). When the trace had a
 warm-up (trace(warm_up=True)), the launcher is observed while it runs and
 the k-th launch under the trace must select the k-th observed CompiledKernel
 (the object eager launched); a native entry's miss path traces without a
@@ -48,14 +62,19 @@ launch_metadata hook, an Autotuner, a compilation the runtime's owner refuses
 (a float or bool scalar argument, TMA descriptors, host-side scratch), a grid
 of more than three axes or outside the launch bounds, a grid that reads
 tensor data (the host read declines where it occurs), a launch on another
-device or stream than the trace's, and a selection that is not the warm-up's
-or does not hold on the symbolic values (an internal inconsistency).
+device or stream than the trace's, a launch option or an integer class
+that is a value of the trace where Triton reads a constant, a process whose
+Triton adds a pipeline hash to the compile key
+(knobs.runtime.add_stages_inspection_hook), and a selection that is not the
+warm-up's or that the symbolic run does not reproduce (an internal
+inconsistency).
 """
 
 from __future__ import annotations
 
 import contextlib
 import threading
+import types
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -75,6 +94,7 @@ _owners_lock = threading.Lock()
 
 _GRID_LIMITS = (2**31 - 1, 65535, 65535)
 _INT_BITS = {"i32": 32, "i64": 64}
+_SYM_TYPES = (torch.SymInt, torch.SymFloat, torch.SymBool)
 
 
 @dataclass(frozen=True)
@@ -85,17 +105,139 @@ class _Observed:
     device: int
 
 
+def _value_hint(v: Any) -> Any:
+    return v.node.hint if isinstance(v, _SYM_TYPES) else v
+
+
 class _PointerStandIn:
-    """What Triton's binder reads of a pointer argument when selecting a
-    compilation: the dtype and the address (its hint here)."""
+    """What Triton's specialization reads of a pointer argument
+    (native_specialize_impl: the dtype, and data_ptr() where the declaration
+    specializes it): the dtype, and the address as a value of the trace for
+    the symbolic run of the binder or as its hint for the concrete one."""
 
     __slots__ = ("dtype", "_address")
 
-    def __init__(self, dtype: torch.dtype, address: int) -> None:
+    def __init__(self, dtype: torch.dtype, address: Any) -> None:
         self.dtype, self._address = dtype, address
 
-    def data_ptr(self) -> int:
+    def data_ptr(self) -> Any:
         return self._address
+
+    def hinted(self) -> _PointerStandIn:
+        return _PointerStandIn(self.dtype, _value_hint(self._address))
+
+
+class _TensorSpecializationInPython:
+    """Triton's backend as native_specialize_impl reads it, without native
+    tensor specialization: the C++ then hands a tensor argument to the
+    backend's own get_tensor_specialization, whose `data_ptr() % 16 == 0` on
+    a symbolic address is a guard of the trace."""
+
+    supports_native_tensor_specialization = False
+
+    def __init__(self, backend: Any) -> None:
+        self.get_tensor_specialization = backend.get_tensor_specialization
+
+
+class _LazyIntType:
+    """The width class of a symbolic integer, decided (each comparison a
+    guard) only where the binder keeps the value's type: a declared
+    annotation replaces it, and the class is then no input of the
+    selection."""
+
+    __slots__ = ("value",)
+
+    def __init__(self, value: torch.SymInt) -> None:
+        self.value = value
+
+    def resolve(self) -> str:
+        return _int_type(self.value)
+
+
+def _int_type(v: Any) -> str:
+    # native_specialize_impl's integer classes, on the value
+    if bool(v >= -(2**31)) and bool(v <= 2**31 - 1):
+        return "i32"
+    if bool(v >= -(2**63)) and bool(v <= 2**63 - 1):
+        return "i64"
+    if bool(v >= 2**63) and bool(v <= 2**64 - 1):
+        return "u64"
+    raise OverflowError("integer to be specialized too large to represent")
+
+
+class _SymbolicSpecialization:
+    """Triton's per-argument specialization (native_specialize_impl, the
+    binder's specialize_impl) on the values of the trace. A pointer stand-in
+    with a symbolic address goes through the C++ under
+    _TensorSpecializationInPython; an integer's equal-to-1 and width classes
+    are the C++'s rules re-read on the symbolic value, its divisibility the
+    backend's own get_int_specialization; a float or bool has no value axis;
+    a tuple is specialized element-wise as the C++ does; anything else is a
+    constant of the call and is read as the C++ reads it. Where a declaration
+    disables a specialization or its alignment, the value is no input of the
+    result (Triton's rule is `... and align`) and the hint is read."""
+
+    def __init__(self, backend: Any) -> None:
+        self.backend = backend
+
+    def __call__(
+        self, backend: Any, arg: Any, is_const: bool, specialize: bool, align: bool
+    ) -> Any:
+        return self.specialize(arg, is_const, specialize, align)
+
+    def specialize(
+        self, arg: Any, is_const: bool, specialize: bool, align: bool
+    ) -> Any:
+        from triton._C.libtriton import native_specialize_impl
+
+        if type(arg) is _PointerStandIn:
+            if specialize and align and isinstance(arg._address, _SYM_TYPES):
+                view = _TensorSpecializationInPython(self.backend)
+                return native_specialize_impl(view, arg, is_const, specialize, align)
+            return native_specialize_impl(
+                self.backend, arg.hinted(), is_const, specialize, align
+            )
+        if type(arg) is torch.SymInt:
+            if specialize and bool(arg == 1):
+                return ("constexpr", 1)
+            ty = _LazyIntType(arg)
+            if not specialize:
+                return (ty, None)
+            value = arg if align else arg.node.hint
+            return (ty, self.backend.get_int_specialization(value, align=align))
+        if isinstance(arg, _SYM_TYPES):
+            return native_specialize_impl(
+                self.backend, arg.node.hint, is_const, specialize, align
+            )
+        if isinstance(arg, tuple) and _has_symbolic(arg):
+            parts = [self.specialize(a, is_const, specialize, align) for a in arg]
+            return (tuple(p[0] for p in parts), tuple(p[1] for p in parts))
+        return native_specialize_impl(self.backend, arg, is_const, specialize, align)
+
+
+def _has_symbolic(v: Any) -> bool:
+    if isinstance(v, _SYM_TYPES) or type(v) is _LazyIntType:
+        return True
+    if isinstance(v, tuple):
+        return any(_has_symbolic(a) for a in v)
+    return False
+
+
+def _resolve(entry: Any) -> Any:
+    # the symbolic run's specialization entry as Triton's key reads it: a
+    # width class decided now (the binder kept the value's type), a
+    # constexpr's value pinned to its hint (each a guard)
+    if type(entry) is _LazyIntType:
+        return entry.resolve()
+    if isinstance(entry, _SYM_TYPES):
+        hint = entry.node.hint
+        held = bool(entry) is hint if type(entry) is torch.SymBool else entry == hint
+        if not held:
+            raise AssertionError(f"host_trace: {entry} is not {hint}")
+        return hint
+    if isinstance(entry, tuple) and _has_symbolic(entry):
+        return tuple(_resolve(a) for a in entry)
+    return entry
 
 
 @dataclass
@@ -338,15 +480,20 @@ def _intercept(jit: Any, args: tuple, grid: Any, kwargs: dict) -> Any:
         decline("TMA descriptor arguments are not traced")
     if any(spec.size for spec in owner.scratch):
         decline("a nonzero launcher scratch allocation is not traced")
-    alignments = {row.formal: row.alignment for row in owner.pointers}
     layout = tuple(owner.abi_layout)
     params, written, formals = [], [], []
     for row in owner.formals:
         value = bound[row.formal]
         if row.abi_index is None:
             # a declared constexpr, or an integer Triton specialized to 1 and
-            # dropped from the ABI: the compiled constant, as a guard on a value
-            _constant_guard(row, value, decline, ht)
+            # dropped from the ABI: the compiled constant, which the symbolic
+            # run of the binder pinned (_select)
+            hint = ht._hint(value)
+            if type(hint) is not type(row.constant) or hint != row.constant:
+                decline(
+                    f"constexpr {row.formal} is {hint!r} at the trace; the compilation holds "
+                    f"{row.constant!r}"
+                )
             formals.append((row.formal, "constexpr"))
             continue
         offset, size = layout[row.abi_index]
@@ -369,17 +516,7 @@ def _intercept(jit: Any, args: tuple, grid: Any, kwargs: dict) -> Any:
                 decline(f"pointer argument {row.formal} is on {value.device}")
             if size != 8:
                 decline(f"pointer argument {row.formal} has a {size}-byte slot")
-            offset_bytes = value._sym_offset * value.element_size()
-            address = value._root.sym + offset_bytes
-            _alignment_guard(
-                row.formal,
-                value,
-                address,
-                offset_bytes,
-                alignments.get(row.formal, 1),
-                decline,
-                jit.params[row.source_arg_index],
-            )
+            address = value._root.sym + value._sym_offset * value.element_size()
             params.append(
                 {
                     "offset": offset,
@@ -409,7 +546,14 @@ def _intercept(jit: Any, args: tuple, grid: Any, kwargs: dict) -> Any:
             )
         if type(value) is not int and type(value) is not torch.SymInt:
             decline(f"integer argument {row.formal} is a {type(value).__name__}")
-        _int_guards(row, value, bits, decline, jit.params[row.source_arg_index])
+        # the slot's signed width holds whatever decided the type (the value's
+        # class, a guard of the selection, or a declared annotation)
+        low, high = -(2 ** (bits - 1)), 2 ** (bits - 1) - 1
+        if not (bool(value >= low) and bool(value <= high)):
+            decline(
+                f"integer argument {row.formal} is outside the {bits}-bit range of its slot "
+                "at the trace"
+            )
         params.append(
             {
                 "offset": offset,
@@ -499,113 +643,88 @@ def _intercept(jit: Any, args: tuple, grid: Any, kwargs: dict) -> Any:
     return binary
 
 
+def _probe_address(tensor: Any) -> Any:
+    # the address Triton's specialization reads, as a value of the tape: an
+    # input's full address (its base symbol, a pointer slot of the predicate,
+    # plus the view's offset); an allocation's offset alone, its base a
+    # multiple of 256 by construction (the trace's build and the replay's
+    # planner both hold it) with no predicate source
+    offset_bytes = tensor._sym_offset * tensor.element_size()
+    return offset_bytes if tensor._root.allocation else tensor._root.sym + offset_bytes
+
+
 def _select(
     jit: Any, bound: dict, options: tuple, device: int, decline: Any, ht: Any
 ) -> Any:
     # the compilation eager selects for these values: Triton's own binder and
-    # cache on the values' hints, no launch (warmup=True); a pointer stands in
-    # with what the binder reads of it
+    # cache on the values' hints, no launch (warmup=True); then the same
+    # binder on the values of the trace, its per-argument specialization
+    # reading the symbolic values, whose result must be the hints' entry by
+    # entry and whose compile key must be the one the cache holds the
+    # compilation under
+    from triton import knobs
+    from triton.runtime.jit import compute_cache_key
+
     from torch._native.const_tensor_wrapper import ConstTensorWrapper
 
-    values = {}
+    if knobs.runtime.add_stages_inspection_hook is not None:
+        decline(
+            "triton.knobs.runtime.add_stages_inspection_hook is set: the compile key carries "
+            "a pipeline hash the trace does not derive"
+        )
+    for name, value in options:
+        if isinstance(value, _SYM_TYPES):
+            decline(f"launch option {name} is a value of the trace")
+    hinted, symbolic = {}, {}
     for name, value in bound.items():
         if type(value) is ConstTensorWrapper:
             value = value._tensor
         if type(value) is ht._TracedTensor:
-            address = value._root.sym + value._sym_offset * value.element_size()
-            value = _PointerStandIn(value.dtype, ht._hint(address))
-        elif isinstance(value, (torch.SymInt, torch.SymFloat, torch.SymBool)):
-            value = ht._hint(value)
-        values[name] = value
+            probe = _probe_address(value)
+            hinted[name] = _PointerStandIn(value.dtype, ht._hint(probe))
+            symbolic[name] = _PointerStandIn(value.dtype, probe)
+        elif isinstance(value, _SYM_TYPES):
+            hinted[name], symbolic[name] = ht._hint(value), value
+        else:
+            hinted[name] = symbolic[name] = value
+    launch_options = dict(options)
     with torch.cuda.device(device):
-        binary = jit.run(grid=None, warmup=True, **values, **dict(options))
-    if binary is None:
-        decline(
-            "Triton compiled nothing for the traced values (a jit cache hook intervened)"
-        )
-    return binary
-
-
-def _constant_guard(row: Any, value: Any, decline: Any, ht: Any) -> None:
-    constant = row.constant
-    if type(value) is torch.SymInt:
-        if type(constant) is not int or type(constant) is bool:
+        binary = jit.run(grid=None, warmup=True, **hinted, **launch_options)
+        if binary is None:
             decline(
-                f"constexpr {row.formal} is symbolic at the trace; the warm-up compiled {constant!r}"
+                "Triton compiled nothing for the traced values (a jit cache hook intervened)"
             )
-        if not bool(value == constant):
-            decline(
-                f"constexpr {row.formal} is {ht._hint(value)} at the trace; the warm-up compiled "
-                f"{constant}"
-            )
-        return
-    if type(value) is not type(constant) or value != constant:
+        kernel_cache, kernel_key_cache, _, backend, binder = jit.device_caches[device]
+    # JITFunction.run's own key for the hints: it must hold the compilation
+    kwargs = dict(launch_options)
+    kwargs["debug"] = kwargs.get("debug", jit.debug) or knobs.runtime.debug
+    kwargs["instrumentation_mode"] = knobs.compilation.instrumentation_mode
+    _, concrete, opts = binder(**hinted, **kwargs)
+    key = compute_cache_key(kernel_key_cache, concrete, opts)
+    if kernel_cache.get(key) is not binary:
         decline(
-            f"constexpr {row.formal} is {value!r} at the trace; the warm-up compiled {constant!r}"
+            "the compile key of the traced values does not select the compilation Triton "
+            "returned for them"
         )
-
-
-def _int_guards(row: Any, value: Any, bits: int, decline: Any, parameter: Any) -> None:
-    # Record only specialization choices enabled by the JIT declaration.
-    # Selected ABI attributes and signed parameter widths still always hold.
-    if (
-        not parameter.do_not_specialize
-        and bool(value == 1)
-        and not parameter.annotation_type
-    ):
-        decline(
-            f"integer argument {row.formal} is 1 at the trace, which the warm-up compiled as a slot"
-        )
-    alignment = max((1, *(v for _, v in row.attributes)))
-    modulus = alignment if alignment > 1 else 16
-    specializes_alignment = not (
-        parameter.do_not_specialize or parameter.do_not_specialize_on_alignment
+    symbolic_binder = types.FunctionType(
+        binder.__code__,
+        {**binder.__globals__, "specialize_impl": _SymbolicSpecialization(backend)},
+        binder.__name__,
+        binder.__defaults__,
+        binder.__closure__,
     )
-    if (alignment > 1 or specializes_alignment) and (
-        bool(value % modulus == 0) != (alignment > 1)
-    ):
-        decline(
-            f"integer argument {row.formal}'s divisibility by {modulus} at the trace differs from "
-            "the warm-up's"
-        )
-    if bits == 32:
-        if not (bool(value >= -(2**31)) and bool(value <= 2**31 - 1)):
+    _, entries, symbolic_opts = symbolic_binder(**symbolic, **kwargs)
+    if len(entries) != len(concrete) or len(entries) != len(jit.params):
+        decline("the binder's specialization does not cover the kernel's parameters")
+    resolved = []
+    for param, entry, expected in zip(jit.params, entries, concrete):
+        got = _resolve(entry)
+        if got != expected:
             decline(
-                f"integer argument {row.formal} is outside the int32 range the warm-up compiled"
+                f"Triton's specialization of argument {param.name} for the traced values "
+                f"({expected!r}) is not the symbolic run's ({got!r})"
             )
-    elif parameter.annotation_type:
-        if not (bool(value >= -(2**63)) and bool(value <= 2**63 - 1)):
-            decline(
-                f"integer argument {row.formal} is outside its declared int64 range"
-            )
-    elif not (bool(value > 2**31 - 1) or bool(value < -(2**31))):
-        decline(
-            f"integer argument {row.formal} is inside the int32 range; the warm-up compiled i64"
-        )
-
-
-def _alignment_guard(
-    formal: str,
-    tensor: Any,
-    address: Any,
-    offset_bytes: Any,
-    alignment: int,
-    decline: Any,
-    parameter: Any,
-) -> None:
-    # Triton specializes a pointer on its 16-byte alignment (tt.divisibility
-    # 16). An input's address is its base symbol plus the view's offset, both
-    # values of the tape (the base a pointer slot of the predicate). An
-    # allocation's base is a multiple of 256 by construction (the trace's
-    # build and the replay's planner both hold it), so only the offset
-    # decides; the base symbol has no predicate source and stays out of the
-    # guard
-    if alignment < 16 and (
-        parameter.do_not_specialize or parameter.do_not_specialize_on_alignment
-    ):
-        return
-    probe = offset_bytes if tensor._root.allocation else address
-    if bool(probe % 16 == 0) != (alignment >= 16):
-        decline(
-            f"pointer argument {formal}'s 16-byte alignment at the trace differs from the warm-up's"
-        )
+        resolved.append(got)
+    if compute_cache_key({}, resolved, symbolic_opts) != key:
+        decline("the compile key of the symbolic run is not the traced values'")
+    return binary
