@@ -128,6 +128,9 @@ _ARENA_CHECK_DEFAULT = os.environ.get("TORCH_HOST_TRACE_ARENA_CHECK", "0") == "1
 # mode is "hold" (the blocks kept while the sizes fit) or "replay" (a sequence per call)
 _ALLOCSEQ_DEFAULT = os.environ.get("TORCH_HOST_TRACE_ALLOCSEQ", "0") == "1"
 _ALLOCSEQ_MODE_DEFAULT = os.environ.get("TORCH_HOST_TRACE_ALLOCSEQ_MODE", "hold")
+# local misses served by partitioning the program at the op whose kernel-only guards
+# missed (hosttrace_partition, E41); opt-in while it is a prototype
+_PARTITION_DEFAULT = os.environ.get("TORCH_HOST_TRACE_PARTITION", "0") == "1"
 # the predicate's entry points: the facts and guards alone, with the arena terms, with
 # the region selects (the registered dispatch predicate is every part)
 _MODE_FACTS, _MODE_ARENA, _MODE_ALL = 0, 1, 3
@@ -1614,6 +1617,7 @@ def lower_tape(
     output_arena=False,
     allocseq=False,
     device=None,
+    prebound=(),
 ):
     """The tape's records for the shared runtime, with the dispatch predicate compiled.
     With `arena`, the temporaries are planned into one arena input boxed after the
@@ -1624,7 +1628,14 @@ def lower_tape(
     temporaries are roots boxed after the tape's tensors and the output block that
     the family binds by replaying the tape's allocation sequence (hosttrace_allocseq).
     `device` is the CUDA device the variant will be prepared on (the tape's own by
-    default): its kernel handles, device facts and preparation."""
+    default): its kernel handles, device facts and preparation. `prebound` names
+    allocations of the tape that another program or an eager op allocates (a
+    partition's boundary, hosttrace_partition): with `allocseq` they are roots the
+    caller boxes, outside the sequence's program."""
+    if prebound and not allocseq:
+        raise ValueError(
+            "host_trace lowering: prebound allocations need the allocation sequence"
+        )
     if allocseq and arena:
         raise ValueError(
             "host_trace lowering: the allocation sequence replaces the planned arena; lower with one or the other"
@@ -2322,6 +2333,7 @@ def lower_tape(
             hints,
             output_index + 1 if output_plan is not None else len(tape.inputs),
             programmatic_regions,
+            prebound,
         )
     # the predicate over the boxed Tensors: input data pointers, then storage offsets,
     # then the Tensor facts, in the order the native dispatcher fills int_values
@@ -3002,6 +3014,7 @@ def _sequence_pass(
     hints,
     input_index,
     programmatic=(),
+    prebound=(),
 ):
     """Sequence the `candidates` (allocation names) as roots boxed from `input_index`
     on and rewrite every pointer source over one to its root plus the displacement:
@@ -3041,7 +3054,9 @@ def _sequence_pass(
             | {seq for seq, _, _, _ in memcpys}
             | {region.seq for region in regions}
         )
-    plan = plan_sequence(rows, uses, hints, input_index, order, programmatic, nodes)
+    plan = plan_sequence(
+        rows, uses, hints, input_index, order, programmatic, nodes, prebound
+    )
 
     def rebased(source):
         if (
@@ -4439,6 +4454,7 @@ class HostTraceReplay(_Entry):
         allocseq_mode=None,
         tape=None,
         device=None,
+        partition=None,
     ):
         super().__init__(
             fn,
@@ -4487,6 +4503,16 @@ class HostTraceReplay(_Entry):
         self.sequence_rebinds = (
             0  # calls that rebound a family's sequence roots before being served
         )
+        # local misses by partitioning (hosttrace_partition): the partitions built,
+        # the calls they served, the swap checks that refused one
+        self.partition_enabled = (
+            _PARTITION_DEFAULT if partition is None else bool(partition)
+        )
+        self.partitions: list = []
+        self.partition_builds = 0
+        self.partition_serves = 0
+        self.swap_refusals = 0
+        self.partition_why = None  # why the last non-local miss was not a local one
         self._families: list[_Family] = []
         # the first family, once there is one (None for a boxed entry and after close):
         # the hit path of `__call__` is its contract and its dispatch
@@ -4907,6 +4933,16 @@ class HostTraceReplay(_Entry):
             raise RuntimeError(
                 f"host_trace replay: the call runs on stream {stream:#x} while the family's variants are bound to stream {family.stream:#x}; a native replay requires its bound device and stream"
             )
+        if self.partitions:
+            # a partition of this family whose segments accept the call (its cut
+            # ops' kernel-only guards are what the dispatch missed on): the cheap
+            # probe before the regrow and the harvest, which cannot serve a call
+            # that fails a guard
+            from .hosttrace_partition import serve_existing
+
+            outputs = serve_existing(self, family, args, box)
+            if outputs is not None:
+                return outputs
         if family.sequence is not None:
             # the variants of one contract sit in one family per sequence plan (the
             # roots differ): another family of this contract may serve the call
@@ -4943,6 +4979,15 @@ class HostTraceReplay(_Entry):
                         (self.calls, "a closed region's new key", which)
                     )
                     return outputs
+        if self.partition_enabled:
+            # the guards that failed are kernel-only guards of one or a few ops
+            # (LOCAL_MISS 2.3, E41): the program split at those ops serves the call,
+            # the ops through eager, no re-trace
+            from .hosttrace_partition import serve_partitioned
+
+            outputs = serve_partitioned(self, family, args, box)
+            if outputs is not None:
+                return outputs
         if topology is not None:
             # the tape's guards held and the call selects a node chain this
             # variant's exec does not hold: the same tape built at these inputs
@@ -5026,6 +5071,20 @@ class HostTraceReplay(_Entry):
         ordinary = self.ordinary
         variants = len(self.variants)
         try:
+            family = self._hot
+            if (
+                self.partitions
+                and family is not None
+                and family.lowered.contract_holds(args)
+            ):
+                # the hot dispatch missed: a partition of the family may take the call
+                # before the entry's loop dispatches the first variant a second time
+                from .hosttrace_partition import serve_existing
+
+                outputs = serve_existing(self, family, args, family.box(args))
+                if outputs is not None:
+                    self._missed_call = True
+                    return outputs
             return _Entry.__call__(self, *args)
         finally:
             # a miss whether the call served, ran ordinary, or raised on the way
@@ -5301,6 +5360,9 @@ class HostTraceReplay(_Entry):
             self.closed = True
             self._hot = None
             self.warm_up_outputs = None
+            for partition in self.partitions:
+                partition.close()
+            self.partitions.clear()
             for family in self._families:
                 family.dispatch.close()
                 if family.outputs is not None:

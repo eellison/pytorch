@@ -914,6 +914,12 @@
     "cases": 13
   },
   {
+    "id": "cuda_hosttrace_partition",
+    "script": "cuda/test_hosttrace_partition.py",
+    "device": "cuda",
+    "cases": 6
+  },
+  {
     "id": "cuda_hosttrace_allocseq",
     "script": "cuda/test_hosttrace_allocseq.py",
     "device": "cuda",

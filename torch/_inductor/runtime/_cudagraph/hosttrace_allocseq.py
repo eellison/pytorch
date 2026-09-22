@@ -86,6 +86,10 @@ class SequencePlan:
     # the seqs of the nodes behind programmatic edges the free points moved past (the
     # rule's input as planned, sorted)
     programmatic: tuple = ()
+    # root indices the caller binds itself (a partition's boundary: a block another
+    # program or an eager op allocated): in `names` and rebased like any root, never
+    # allocated or freed by the program, outside the peak
+    prebound: tuple = ()
     sizes_address: int = (
         0  # extern "C" int64_t seq_sizes(const int64_t* facts, int64_t* out)
     )
@@ -112,6 +116,7 @@ class SequencePlan:
             tuple(str(s) for s in self.sizes),
             self.size_reads,
             self.stride_reads,
+            self.prebound,
         )
 
     def facts(self, box):
@@ -180,7 +185,9 @@ def _free_points(last, programmatic, nodes):
     return {name: moved[seq] for name, seq in last.items()}
 
 
-def plan_sequence(rows, uses, hints, input_index, order, programmatic=(), nodes=()):
+def plan_sequence(
+    rows, uses, hints, input_index, order, programmatic=(), nodes=(), prebound=()
+):
     """``rows``: (name, byte-size expression) of the temporaries to sequence; ``uses``:
     name -> the seqs of the events touching it; ``order``: name -> the tape's
     allocation index (eager's allocation order); ``hints``: symbol -> value at the
@@ -189,9 +196,12 @@ def plan_sequence(rows, uses, hints, input_index, order, programmatic=(), nodes=
     every edge is a full-completion edge). Each temporary is allocated before the first
     event that touches it (in allocation order among those of one event) and freed
     after the last, or after the programmatic consumers that follow the last
-    (``_free_points``)."""
+    (``_free_points``). Names in ``prebound`` are roots the caller binds (a block
+    allocated outside this program): rebased like the others, with no allocation or
+    free in the program and no share of the peak."""
+    prebound = set(prebound)
     first = {name: min(uses[name]) for name, _ in rows}
-    last = {name: max(uses[name]) for name, _ in rows}
+    last = {name: max(uses[name]) for name, _ in rows if name not in prebound}
     free = _free_points(last, programmatic, nodes)
     names = tuple(
         sorted((name for name, _ in rows), key=lambda n: (first[n], order[n]))
@@ -199,10 +209,10 @@ def plan_sequence(rows, uses, hints, input_index, order, programmatic=(), nodes=
     sizes = dict(rows)
     index = {name: k for k, name in enumerate(names)}
     program = []
-    for seq in sorted({*first.values(), *free.values()}):
-        program.extend(index[n] for n in names if first[n] == seq)
-        program.extend(~index[n] for n in names if free[n] == seq)
-    intervals = [[0, 0] for _ in names]
+    for seq in sorted({*(first[n] for n in last), *free.values()}):
+        program.extend(index[n] for n in names if n in last and first[n] == seq)
+        program.extend(~index[n] for n in names if n in last and free[n] == seq)
+    intervals = [[0, 0] if n not in prebound else [-1, -1] for n in names]
     for position, op in enumerate(program):
         intervals[op if op >= 0 else ~op][0 if op >= 0 else 1] = position
     rounded = [ALIGN * math.ceil(int(sizes[n].xreplace(hints)) / ALIGN) for n in names]
@@ -223,8 +233,9 @@ def plan_sequence(rows, uses, hints, input_index, order, programmatic=(), nodes=
         dict(hints),
         intervals=tuple(tuple(i) for i in intervals),
         peak_at_hints=peak,
-        sum_at_hints=sum(rounded),
+        sum_at_hints=sum(r for r, n in zip(rounded, names) if n not in prebound),
         programmatic=tuple(sorted(programmatic)),
+        prebound=tuple(k for k, n in enumerate(names) if n in prebound),
     )
 
 
@@ -297,7 +308,10 @@ class AllocatorSequence:
             self._counters = self._counters_now()
         addresses = self.run(plan.program, sizes)
         device = torch.device("cuda", self.device)
+        prebound = set(plan.prebound)
         for k, (address, n) in enumerate(zip(addresses, sizes)):
+            if k in prebound:
+                continue  # the caller's block: boxed by the caller, never ours
             if address != self.addresses[k] or n != self.nbytes[k]:
                 self.roots[k].set_(_storage_from(address, device, n), 0, (n,), (1,))
                 self.addresses[k] = address
