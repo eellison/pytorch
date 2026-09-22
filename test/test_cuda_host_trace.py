@@ -1146,9 +1146,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { m.def("alloc_by_eighth", &alloc_by_ei
         route = "runs its own CUDA kernel.*converted host for {} is the way to trace it"
         x, w, _ = self._inputs(8)
         # _fused_rms_norm is a converted host: traced as ATen's launches where
-        # eager runs ATen, and as a closed region where eager's route is
-        # torch._native's override (the vendored QuACK CuTe DSL rms norm:
-        # torch/cuda/_host_trace_native.py), never decomposed
+        # eager runs ATen, and as the one launch of torch._native's override
+        # where that is eager's route (the vendored QuACK CuTe DSL rms norm,
+        # recorded from its launch descriptor with eager's own kernel:
+        # torch/cuda/_host_trace_cute_desc.py), never decomposed
         from torch._native import registry
 
         override = any(
@@ -1159,8 +1160,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { m.def("alloc_by_eighth", &alloc_by_ei
             (lambda t, g: F.rms_norm(t, (self.N,), g, 1e-5), (x, w)),
         ):
             tape = ht.trace(fn, args)
+            self.assertEqual(tape.num_regions, 0)
+            self.assertGreaterEqual(tape.num_launches, 1)
             self.assertEqual(
-                (tape.num_launches == 0, tape.num_regions), (override, int(override))
+                sum(1 for L in tape.launches if L.get("cute_desc")), int(override)
             )
 
         def below_autograd(t):

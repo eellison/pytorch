@@ -61,6 +61,10 @@ _compiles: Any = weakref.WeakKeyDictionary()
 _entries: Any = weakref.WeakKeyDictionary()
 # a from_dlpack value made at the warm-up -> (its torch tensor, read-only)
 _sources: Any = weakref.WeakKeyDictionary()
+# a torch._native program -> the kernel nodes read off eager's call at a warm-up
+# of this process (the function handle and layout are the program's; a trace
+# without a warm-up, the two-hint runner's second run, records from them)
+_eager_facts: Any = weakref.WeakKeyDictionary()
 _counter = 0
 # the last synthesized host's source, for diagnostics
 _last_source = ""
@@ -80,6 +84,79 @@ class _Compile:
     # compiled by the runtime's own observed entry (its trace_finalize_hooks):
     # the registered path records it, the hook leaves its calls alone
     owned: bool = False
+    # the persisted launch descriptor (torch/cuda/_host_trace_cute_desc.py),
+    # built at the compile's finalize or read back beside a cached object
+    descriptor: Any = None
+    # a program loaded from a compiled module has no jit callable: its display
+    # name and module come from the descriptor's recipe
+    name: str | None = None
+    module: str | None = None
+
+
+class LoadedProgram:
+    """A program QuACK's jit_cache loaded from its on-disk object (a bare
+    tvm_ffi.Function, not weak-referenceable and not a hooked class) with its
+    descriptor: the call goes to the function outside a trace and to the
+    recorder under one. The module that owns the object stays alive here."""
+
+    __slots__ = ("function", "descriptor", "module", "native", "__weakref__")
+
+    def __init__(self, function: Any, descriptor: Any, module: Any, native: bool) -> None:
+        self.function, self.descriptor, self.module = function, descriptor, module
+        # a program of torch._native's overrides or the libraries they vendor: the
+        # descriptor route; any other user of QuACK's cache is called as loaded (its
+        # read of a traced tensor declines by name, as before)
+        self.native = native
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        if getattr(_state, "phase", None) is None or getattr(_state, "inside", False) or not self.native:
+            return self.function(*args, **kwargs)
+        if _state.phase == "observe":
+            return _observe(self, self.function, args, kwargs)
+        return _trace(self, args, kwargs)
+
+
+def loaded_program(function: Any, module: Any, descriptor_text: str) -> LoadedProgram:
+    """QuACK's warm path: the loaded function with the descriptor written beside
+    its object, registered with the hook."""
+    from torch.cuda import _host_trace_cute_desc as _desc
+
+    descriptor = _desc.Descriptor.from_json(descriptor_text)
+    callable_ = descriptor.recipe.get("callable") or {}
+    module_name = callable_.get("module") or ""
+    loaded = LoadedProgram(function, descriptor, module, module_name.startswith(_NATIVE_MODULES))
+    _compiles[loaded] = _Compile(
+        None,
+        (),
+        {},
+        False,
+        descriptor,
+        callable_.get("qualname") or descriptor.function_name[:80],
+        module_name,
+    )
+    return loaded
+
+
+def descriptor_json(compiled: Any) -> str | None:
+    """The descriptor of a compile the hook observed, for QuACK's cache to
+    persist beside the object (None: not observed, or this process cannot
+    build one: the SDK's raw value reads are not active)."""
+    if not descriptors_available():
+        return None
+    record = _compiles.get(compiled) if _weakable(compiled) else None
+    if record is None or record.descriptor is None:
+        return None
+    return record.descriptor.to_json()
+
+
+def descriptors_available() -> bool:
+    """Whether this process builds and reads descriptors: the runtime SDK's raw
+    value reads are active (torch._inductor.runtime._cudagraph._sdk.activate()
+    before cutlass was imported). QuACK's cache treats an object without a
+    descriptor as a miss only then; otherwise it loads the object as before."""
+    from torch.cuda import _host_trace_cute_desc as _desc
+
+    return _desc.available()
 
 
 @dataclass(frozen=True)
@@ -170,13 +247,38 @@ def install() -> None:
         compile_call = compiler.CompileCallable.__call__
 
         def compile_observed(self: Any, *args: Any, **kwargs: Any) -> Any:
+            from torch.cuda import _host_trace_cute_desc as _desc
+
+            owned = kwargs.get("trace_finalize_hooks") is not None
+            extracted: dict = {}
+            if args and not owned and _desc.available():
+                # the host's IR at the DSL's finalize (the lowering rewrites the
+                # module in place afterwards): the descriptor's launch part
+                def finalize(owner: Any, module: Any, function_name: str) -> None:
+                    try:
+                        extracted["value"] = _desc.extract_ir(module, function_name)
+                    except _desc.Unexpressed as error:
+                        extracted["value"] = error
+                    except Exception as error:  # a construct the walk did not foresee
+                        extracted["value"] = _desc.Unexpressed(f"{type(error).__name__}: {error}")
+
+                kwargs = {**kwargs, "trace_finalize_hooks": finalize}
             result = compile_call(self, *args, **kwargs)
             if args:
-                owned = kwargs.get("trace_finalize_hooks") is not None
+                given = {k: v for k, v in kwargs.items() if k != "trace_finalize_hooks"}
+                descriptor = None
+                if not owned:
+                    try:
+                        descriptor = _desc.build(
+                            result, args[0], tuple(args[1:]), given, extracted.get("value"), self._compile_options
+                        )
+                    except Exception as error:
+                        descriptor = _desc.Descriptor(
+                            _desc.VERSION, getattr(result, "function_name", ""), (), (), {}, (), {},
+                            f"the descriptor was not built ({type(error).__name__}: {error})",
+                        )
                 try:
-                    _compiles[result] = _Compile(
-                        args[0], tuple(args[1:]), dict(kwargs), owned
-                    )
+                    _compiles[result] = _Compile(args[0], tuple(args[1:]), dict(given), owned, descriptor)
                 except TypeError:
                     pass
             return result
@@ -306,10 +408,46 @@ def _hooked_call(original: Any) -> Any:
     return __call__
 
 
+def arm_raw_values() -> None:
+    """The runtime SDK's raw value reads (torch/_inductor/runtime/_cudagraph/_sdk.py),
+    which the descriptor's walk of a host's IR needs, are a meta-path finder that
+    must be in place before cutlass._mlir.ir is imported: installed here when the
+    DSL is not imported yet (a trace's start, this module's import once the
+    runtime package is loaded). A process that imported the DSL first keeps the
+    closed-region route for the overrides."""
+    if "cutlass._mlir.ir" in sys.modules:
+        return
+    name = "torch._inductor.runtime._cudagraph._sdk"
+    sdk = sys.modules.get(name)
+    if sdk is None:
+        # the module alone (stdlib imports), registered under its name so the
+        # runtime's own `from ... import _sdk` returns this object: its finder
+        # and raw_values identities are what its activate() checks. The
+        # package's import would cost over a second here
+        import importlib.util
+        import os
+
+        path = os.path.join(os.path.dirname(torch.__file__), "_inductor", "runtime", "_cudagraph", "_sdk.py")
+        spec = importlib.util.spec_from_file_location(name, path)
+        if spec is None or spec.loader is None:
+            return
+        sdk = importlib.util.module_from_spec(spec)
+        sys.modules[name] = sdk
+        try:
+            spec.loader.exec_module(sdk)
+        except Exception:
+            sys.modules.pop(name, None)
+            return
+    if sdk._FINDER not in sys.meta_path:
+        sys.meta_path.insert(0, sdk._FINDER)
+
+
 @contextlib.contextmanager
 def hooked() -> Any:
-    """Installs the hooks if the DSL is imported by now; the phases below do the
-    work. Kept for symmetry with the Triton hook's scope."""
+    """Installs the hooks if the DSL is imported by now (and the SDK's raw value
+    reads if it is not); the phases below do the work. Kept for symmetry with
+    the Triton hook's scope."""
+    arm_raw_values()
     install()
     yield
 
@@ -350,10 +488,15 @@ def tracing(observations: list | None = None) -> Any:
 @dataclass(frozen=True)
 class _Observed:
     """A compiled program's call at the warm-up: its display name and the module
-    of its jit callable (a torch._native override's own, or a user's)."""
+    of its jit callable (a torch._native override's own, or a user's); for a
+    program with a launch descriptor, the kernel nodes read off a capture of
+    eager's own call (the descriptor route, torch/cuda/_host_trace_cute_desc.py)
+    or the reason there are none."""
 
     name: str
     module: str
+    eager: tuple | None = None
+    why_not: str | None = None
 
 
 @dataclass
@@ -388,6 +531,24 @@ def unmet_hint() -> str:
         "torch._native override launched: the override's condition answered otherwise on the "
         "traced tensors (one analysing with a TensorIterator, which takes no symbolic shapes)"
     )
+
+
+def descriptor_ahead(programs: tuple) -> bool:
+    """For _dispatch's route of a torch._native override on the closed-region
+    list: whether the program eager's warm-up launched at this point (one of the
+    override's modules) is served by its launch descriptor, in which case the
+    override takes eager's route under the trace and its program's call is
+    recorded from the descriptor; else the closed region serves."""
+    if getattr(_state, "observations", None) is None:
+        # no warm-up: eager's route when a program of the override's modules was
+        # read in this process (a program not read declines by name at its call)
+        return any(
+            (r.module or _module_name(r) or "").startswith(programs)
+            for c, r in list(_compiles.items())
+            if c in _eager_facts
+        )
+    unmet = _next_unmet()
+    return unmet is not None and unmet.module.startswith(programs) and unmet.eager is not None
 
 
 def claim(programs: tuple) -> None:
@@ -428,6 +589,8 @@ def check_met(observations: list | None, met: _Met) -> None:
 
 
 def _display_name(compiled: Any, record: _Compile | None) -> str:
+    if record is not None and record.name is not None:
+        return record.name
     if record is not None:
         function = record.function
         name = getattr(function, "__qualname__", None)
@@ -440,6 +603,8 @@ def _display_name(compiled: Any, record: _Compile | None) -> str:
 def _module_name(record: _Compile | None) -> str:
     if record is None:
         return ""
+    if record.module is not None:
+        return record.module
     function = record.function
     if not isinstance(function, types.FunctionType):
         function = type(function)
@@ -453,11 +618,38 @@ _NATIVE_MODULES = ("torch._native.", "torch._vendor.")
 
 
 def _observe(compiled: Any, original: Any, args: tuple, kwargs: dict) -> Any:
+    from torch.cuda import _host_trace_cute_desc as _desc
+
     record = _compiles.get(compiled)
     module = _module_name(record)
-    _state.observations.append(_Observed(_display_name(compiled, record), module))
+    name = _display_name(compiled, record)
     if module.startswith(_NATIVE_MODULES):
-        return original(compiled, *args, **kwargs)
+        # eager's own call, as written; then its kernel nodes read off a capture
+        # of the same call (nothing runs there) when a descriptor expresses it
+        loaded = type(compiled) is LoadedProgram
+        result = original(*args, **kwargs) if loaded else original(compiled, *args, **kwargs)
+        descriptor = record.descriptor if record is not None else None
+        eager, why_not = None, None
+        if descriptor is None:
+            why_not = "its compile was not observed by the recorder"
+        elif descriptor.declined is not None:
+            why_not = descriptor.declined
+        else:
+            try:
+                call = (lambda: original(*args, **kwargs)) if loaded else (lambda: original(compiled, *args, **kwargs))
+                eager = tuple(_desc.read_eager_launches(call, torch.cuda.current_device()))
+                _desc.verify_eager(descriptor, args, kwargs, list(eager), _real_operand, name)
+                try:
+                    _eager_facts[compiled] = eager
+                except TypeError:
+                    pass
+            except _Refusal as error:
+                eager, why_not = None, f"an argument of eager's call is not one the descriptor binds ({error})"
+            except (_desc.Unexpressed, RuntimeError) as error:
+                eager, why_not = None, f"eager's launch is not the descriptor's ({error})"
+        _state.observations.append(_Observed(name, module, eager, why_not))
+        return result
+    _state.observations.append(_Observed(name, module))
     synth = _entries.get(compiled)
     if synth is None:
         record = _compiles.get(compiled)
@@ -515,16 +707,17 @@ def _trace(compiled: Any, args: tuple, kwargs: dict) -> Any:
     if tr is None:
         decline("called in the trace phase without a trace on this thread")
     met = _state.met
+    observed = _next_unmet()
     met.names.append(name)
     try:
-        return _record(tr, compiled, args, kwargs)
+        return _record(tr, compiled, args, kwargs, observed)
     except BaseException as error:
         if met.failure is None:
             met.failure = error
         raise
 
 
-def _record(tr: Any, compiled: Any, args: tuple, kwargs: dict) -> Any:
+def _record(tr: Any, compiled: Any, args: tuple, kwargs: dict, observed: Any = None) -> Any:
     record = _compiles.get(compiled)
     name = _display_name(compiled, record)
 
@@ -535,11 +728,34 @@ def _record(tr: Any, compiled: Any, args: tuple, kwargs: dict) -> Any:
 
     module = _module_name(record)
     if module.startswith(_NATIVE_MODULES):
-        decline(
-            f"a program of torch._native's override ({module}) reached the symbolic run; an "
-            "override is recorded as a closed region when it is on the list "
-            "(torch/cuda/_host_trace_native.py), never through its program"
-        )
+        # the descriptor route: the launch record from the persisted descriptor
+        # and the call's arguments, with eager's function handle (E36)
+        from torch.cuda import _host_trace_cute_desc as _desc
+
+        if getattr(_state, "observations", None) is None:
+            # no warm-up in this trace: the facts a warm-up of this process read
+            # for the program (the handle and layout are the program's; the
+            # per-call bytes were verified then)
+            eager, verify = _eager_facts.get(compiled), False
+            if eager is None:
+                decline(
+                    "its launch was not read off eager's call in this process; trace(warm_up=True) "
+                    "runs the call as written first, where the recorder reads eager's launch"
+                )
+        else:
+            if observed is None or observed.name != name:
+                decline(
+                    "its program was not the one the warm-up called at this point; trace(warm_up=True) "
+                    "runs the call as written first, where the recorder reads eager's launch"
+                )
+            if observed.eager is None:
+                decline(
+                    f"its launch descriptor does not serve it ({observed.why_not}); an override without one "
+                    "is recorded as a closed region when it is on the list (torch/cuda/_host_trace_native.py)"
+                )
+            eager, verify = observed.eager, True
+        program = _desc.Program(record.descriptor, name, module, compiled)
+        return _desc.record(tr, program, args, kwargs, list(eager), _traced_operand, name, verify=verify)
     synth = _entries.get(compiled)
     if synth is None:
         decline(

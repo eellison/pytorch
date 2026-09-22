@@ -945,6 +945,43 @@ class _HostTraceKernelModule(_KernelModule):
         )
 
 
+class _HostTraceCuTeDescModule(_HostTraceKernelModule):
+    """A CuTe DSL program's kernel recorded from its launch descriptor (torch/
+    cuda/_host_trace_cute_desc.py): eager's own function handle, read off a
+    capture of eager's call at the trace's warm-up, with the parameter layout
+    the driver reported for it; the program's module (the loaded object or
+    the in-process compilation) stays referenced for the graph's lifetime."""
+
+    def __init__(self, launch, device):
+        from cuda.bindings import driver
+
+        self.record = launch["cute_desc"]
+        self._function = int(launch["func"])
+        self.check()
+        self.host_symbol = None
+        self._layout = tuple(tuple(x) for x in launch["param_layout"])
+        self._block = tuple(int(b) for b in launch["block"])
+        self._shared = int(launch["smem"]) if not isinstance(launch["smem"], _SYM_TYPES) else None
+        self.name = launch["kernel"]
+        self.device_index = device
+        with torch.cuda.device(device):
+            self.context = int(_check_cuda_bindings(driver.cuCtxGetCurrent()))
+        if not self.context:
+            raise HostTraceLoweringDeclined(
+                "host_trace lowering: the tape's device has no CUDA context"
+            )
+
+    def check(self):
+        if type(self._function) is not int or self._function <= 0 or self._function != self.record.function:
+            raise HostTraceLoweringDeclined(
+                f"host_trace lowering: CuTe kernel {getattr(self, 'name', '')} lost eager's function handle"
+            )
+        if self.record.program.keep_alive is None:
+            raise HostTraceLoweringDeclined(
+                f"host_trace lowering: CuTe kernel {getattr(self, 'name', '')}'s program is no longer loaded"
+            )
+
+
 class _HostTraceTritonModule(_HostTraceKernelModule):
     """A Triton kernel the traced host launched from Python (torch/cuda/
     _host_trace_triton.py): eager's own compilation, launched through the
@@ -1792,6 +1829,8 @@ def lower_tape(
         triton_launch = L.get("triton")
         if triton_launch is not None:
             module = _HostTraceTritonModule(triton_launch, device)
+        elif L.get("cute_desc") is not None:
+            module = _HostTraceCuTeDescModule(L, device)
         else:
             module = _HostTraceKernelModule(
                 int(L["func"]), layout, block, smem, L["kernel"], device

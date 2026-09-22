@@ -3019,7 +3019,15 @@ class _TraceMode(TorchDispatchMode):
             kwargs = {k: _concrete_ints(v) for k, v in kwargs.items()}
         with self:
             native = _native_override_takes(func, args, kwargs)
-        if entry is not None and native:
+        # the override's program has a launch descriptor (what eager's warm-up
+        # launched here, read off eager's own call): eager's route under the
+        # trace, the program's call recorded from the descriptor
+        # (torch/cuda/_host_trace_cute_desc.py); else the closed region
+        if (
+            entry is not None
+            and native
+            and not _host_trace_cute_dsl.descriptor_ahead(entry.programs)
+        ):
             return self.trace.native_region(func, args, kwargs, entry)
         # a closed library call (cuBLAS): recorded as a region, never traced into
         if func in _CLOSED_OPS and not native:

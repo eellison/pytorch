@@ -40,6 +40,9 @@ import torch._vendor.quack.cache as _state  # noqa: E402  (intentional partial-i
 
 
 EXPORT_FUNC_NAME = "func"
+# the launch descriptor written beside the .o (torch/cuda/_host_trace_cute_desc.py):
+# what a host trace needs to record the loaded object's launch
+DESCRIPTOR_SUFFIX = ".desc.json"
 LOCK_TIMEOUT = 60
 CacheInfo = namedtuple("CacheInfo", ["hits", "misses", "maxsize", "currsize"])
 
@@ -171,6 +174,14 @@ def jit_cache(fn):
             hits += 1
             return cache[cache_key]
 
+        # A host trace records this kernel's launch from a descriptor its compile
+        # hook builds (torch/cuda/_host_trace_cute_dsl.py); the hook installs
+        # itself only once the DSL is imported, which this module guarantees, so
+        # install here before the first compile of a key in the process.
+        from torch.cuda import _host_trace_cute_dsl
+
+        _host_trace_cute_dsl.install()
+
         # 2. Cache disabled: pure in-process compile, no disk side effects.
         if not enabled:
             misses += 1
@@ -182,12 +193,59 @@ def jit_cache(fn):
         cache_path = get_cache_path() / _compute_source_fingerprint()
         cache_path.mkdir(parents=True, exist_ok=True)
         o_path = cache_path / f"{sha}.o"
+        desc_path = cache_path / f"{sha}{DESCRIPTOR_SUFFIX}"
         lock_path = cache_path / f"{sha}.lock"
 
         def _load_cached() -> object:
-            """Load the .o into a callable; caller guarantees existence."""
+            """Load the .o into a callable; caller guarantees existence. In a
+            process that builds descriptors (the recorder's SDK activation), None
+            when the object has no launch descriptor beside it: the entry is a
+            miss, recompiled in-process once and written back with its
+            descriptor (a function of the source and the compile arguments, so
+            the recompile is eager's own cold-cache behaviour); elsewhere the
+            bare loaded function, as before."""
+            from torch.cuda import _host_trace_cute_dsl
+
+            available = _host_trace_cute_dsl.descriptors_available()
+            if available and not desc_path.exists():
+                return None
             m = cute.runtime.load_module(str(o_path), enable_tvm_ffi=True)
-            return m[EXPORT_FUNC_NAME]
+            if not available:
+                return m[EXPORT_FUNC_NAME]
+            return _host_trace_cute_dsl.loaded_program(
+                m[EXPORT_FUNC_NAME], m, desc_path.read_text()
+            )
+
+        def _export(compiled_fn: object) -> None:
+            """The .o and its descriptor, each written to a private temp file and
+            renamed into place (a process killed mid-export must never leave a
+            truncated file at the final path)."""
+            from torch.cuda import _host_trace_cute_dsl
+
+            tmp_path = o_path.with_suffix(f".o.tmp.{os.getpid()}")
+            desc_tmp = desc_path.with_suffix(f".json.tmp.{os.getpid()}")
+            try:
+                compiled_fn.export_to_c(
+                    object_file_path=str(tmp_path),
+                    function_name=EXPORT_FUNC_NAME,
+                )
+                descriptor = _host_trace_cute_dsl.descriptor_json(compiled_fn)
+                if descriptor is not None:
+                    desc_tmp.write_text(descriptor)
+                    os.replace(desc_tmp, desc_path)
+                os.replace(tmp_path, o_path)
+            except Exception as e:
+                warnings.warn(
+                    f"quack cache: export failed for key {sha}: {e} "
+                    f"(this key will recompile every run)",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                for path in (tmp_path, desc_tmp):
+                    try:
+                        path.unlink()
+                    except OSError:
+                        pass
 
         def _quarantine_corrupt(exc: Exception) -> None:
             """A cached .o that fails to load (truncated write from a killed
@@ -218,9 +276,10 @@ def jit_cache(fn):
                             # the slow path (shared lock can't safely delete).
                             _quarantine_corrupt(e)
                         else:
-                            cache[cache_key] = loaded
-                            hits += 1
-                            return loaded
+                            if loaded is not None:
+                                cache[cache_key] = loaded
+                                hits += 1
+                                return loaded
             except RuntimeError:
                 pass  # lock timeout; fall through to slow path
 
@@ -256,9 +315,10 @@ def jit_cache(fn):
                             except Exception as e:
                                 _quarantine_corrupt(e)
                             else:
-                                cache[cache_key] = loaded
-                                hits += 1
-                                return loaded
+                                if loaded is not None:
+                                    cache[cache_key] = loaded
+                                    hits += 1
+                                    return loaded
                 except RuntimeError:
                     pass  # lock timeout; fall through to slow path
             else:  # "failed"
@@ -306,36 +366,14 @@ def jit_cache(fn):
                 except Exception as e:
                     _quarantine_corrupt(e)  # holds the exclusive lock: safe
                 else:
-                    cache[cache_key] = loaded
-                    hits += 1
-                    return loaded
+                    if loaded is not None:
+                        cache[cache_key] = loaded
+                        hits += 1
+                        return loaded
 
             misses += 1
             compiled_fn = fn(*args, **kwargs)
-            # Export to a private temp file, then atomically rename into
-            # place: a process killed mid-export (xdist worker OOM-kill,
-            # timeout) must never leave a truncated .o at the final path —
-            # the advisory flock dies with the process, and a persistent
-            # cache (CI keeps one in $HOME) would then fail every future
-            # run on this key with "Symbols not found: __tvm_ffi_func".
-            tmp_path = o_path.with_suffix(f".o.tmp.{os.getpid()}")
-            try:
-                compiled_fn.export_to_c(
-                    object_file_path=str(tmp_path),
-                    function_name=EXPORT_FUNC_NAME,
-                )
-                os.replace(tmp_path, o_path)
-            except Exception as e:
-                warnings.warn(
-                    f"quack cache: export failed for key {sha}: {e} "
-                    f"(this key will recompile every run)",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
-                try:
-                    tmp_path.unlink()
-                except OSError:
-                    pass
+            _export(compiled_fn)
             cache[cache_key] = compiled_fn
             return compiled_fn
         finally:

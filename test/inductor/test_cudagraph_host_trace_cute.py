@@ -674,12 +674,13 @@ class TestHostTraceCuTeDSL(TestCase):
     def setUp(self):
         super().setUp()
         from torch._inductor.runtime._cudagraph import direct_hosttrace
-        from torch.cuda import _host_trace, _host_trace_cute_dsl
+        from torch.cuda import _host_trace, _host_trace_cute_desc, _host_trace_cute_dsl
 
-        self.module, self.ht, self.dsl = (
+        self.module, self.ht, self.dsl, self.desc = (
             direct_hosttrace,
             _host_trace,
             _host_trace_cute_dsl,
+            _host_trace_cute_desc,
         )
         global COMPILED, SCALE
         COMPILED = compile_affine()
@@ -771,26 +772,58 @@ class TestHostTraceCuTeDSL(TestCase):
     def _templates(self, op):
         return [t for t in self.ht._gemm_templates.values() if t.key[2] == op]
 
-    def test_f_rms_norm_is_a_closed_region_of_eager_s_kernel(self):
-        # eager's route on this box is torch._native's QuACK override: the call is a
-        # closed region whose template is eager's own kernel node (the harvest runs the
-        # op through the router at the region's key); a shape change is a harvest of the
-        # new key applied in place, no re-trace
+    def _descriptor_launches(self, tape):
+        # the launch records made from a program's persisted descriptor
+        # (torch/cuda/_host_trace_cute_desc.py): eager's own kernel handle
+        return [L for L in tape.launches if L.get("cute_desc") is not None]
+
+    def _cache_dir(self):
+        import tempfile
+
+        from torch._vendor.quack import cache
+
+        tmp = tempfile.mkdtemp(prefix="host_trace_cute_desc_")
+        scope = cache.cache_dir_override(tmp)
+        scope.__enter__()
+        self.addCleanup(scope.__exit__, None, None, None)
+        return tmp
+
+    def test_f_rms_norm_is_recorded_from_its_descriptor_with_eager_s_kernel(self):
+        # eager's route on this box is torch._native's QuACK override, whose program
+        # QuACK's jit_cache loads from its on-disk object (the default): the call is
+        # one launch record of the tape, made from the descriptor persisted beside
+        # the object and the call's arguments, with the function handle an eager
+        # capture's node holds (E36); the grid is symbolic, so another row count is
+        # a rebind of the one variant, not a re-trace and not a harvest
         x = torch.randn(4, 2048, device="cuda", dtype=torch.bfloat16)
         w = torch.randn(2048, device="cuda", dtype=torch.bfloat16)
         (eager,) = self._eager_nodes(rms_norm_host, (x, w))
         self.assertIn("quackrmsnormRMSNorm", eager["name"])
         replay = self._replay(rms_norm_host, (x, w))
         tape = replay.tape
-        self.assertEqual((tape.num_launches, tape.num_regions), (0, 1))
-        (region,) = tape.regions
-        self.assertEqual(region.op, "_fused_rms_norm")
+        self.assertEqual((tape.num_launches, tape.num_regions), (1, 0))
+        (record,) = self._descriptor_launches(tape)
+        self.assertEqual(record["func"], eager["func"])
+        self.assertEqual(record["kernel"], eager["name"])
+        self.assertEqual(record["param_layout"], [tuple(x) for x in eager["layout"]])
         self.assertEqual(
-            [o.name for o in (*region.inputs, *region.outputs)],
-            ["input", "weight", "out", "rstd"],
+            [(p["name"], p["kind"], p["access"]) for p in record["params"]],
+            [
+                ("mX.data_ptr", "ptr", "r"),
+                ("mX.shape[0]", "i32", ""),
+                ("mX.stride[0]", "i64", ""),
+                ("mW.data_ptr", "ptr", "r"),
+                ("mO.data_ptr", "ptr", "rw"),
+                ("mO.shape[0]", "i32", ""),
+                ("mO.stride[0]", "i64", ""),
+                ("mRstd.data_ptr", "ptr", "rw"),
+                ("mRstd.shape[0]", "i32", ""),
+                ("eps", "f32", ""),
+            ],
         )
-        self.assertEqual(region.scalars, ((2048,), 1e-6))
+        self.assertIsInstance(record["grid"][0], torch.SymInt)
         self.assertEqual(sorted(tape.written_roots), ["a0", "a1"])
+        self.assertEqual(self._templates("_fused_rms_norm"), [])
         for rows in (4, 7, 64):
             other = torch.randn(rows, 2048, device="cuda", dtype=torch.bfloat16)
             self.assertEqual(replay(other, w), rms_norm_host(other, w), atol=0, rtol=0)
@@ -798,19 +831,111 @@ class TestHostTraceCuTeDSL(TestCase):
             (replay.traces, len(replay.variants), replay.declines, replay.ordinary),
             (1, 1, [], 0),
         )
-        stats = replay.region_stats()
-        self.assertEqual(stats["sites"][0]["kinds"], ["kernel"])
-        self.assertEqual(stats["refused"], {})
-        templates = self._templates("_fused_rms_norm")
-        rows_seen = {t.key[4][0][1][0] for t in templates}
-        self.assertTrue({4, 7, 64} <= rows_seen, rows_seen)
-        for t in templates:
-            # eager's function object, four pointer slots, no scratch; the one
-            # host slot is the out struct's padding behind its 32-bit row count
-            self.assertEqual([n["func"] for n in t.nodes], [eager["func"]])
-            self.assertEqual(len(t.nodes[0]["slots"]), 4)
-            self.assertEqual(t.scratch, [])
-            self.assertLessEqual({cls for _, cls in t.nodes[0]["host_slots"]}, {"dead"})
+        # the descriptor's guards: the static N and the assumed alignment
+        guards = [str(g) for g in tape.guards]
+        self.assertTrue(
+            any(g == "Eq(s75, 2048)" or g.endswith(", 2048)") for g in guards), guards
+        )
+        self.assertTrue(
+            any("PythonMod(" in g and ", 16), 0)" in g for g in guards), guards
+        )
+
+    def test_the_program_compiled_in_process_records_the_same_kernel(self):
+        # the cold cache: QuACK compiles in-process, the recorder's compile hook
+        # builds the descriptor at the DSL's finalize, and the record holds the
+        # in-process program's own function handle (eager's capture holds it too)
+        self._quack_in_process()
+        x = torch.randn(4, 2048, device="cuda", dtype=torch.bfloat16)
+        w = torch.randn(2048, device="cuda", dtype=torch.bfloat16)
+        (eager,) = self._eager_nodes(rms_norm_host, (x, w))
+        replay = self._replay(rms_norm_host, (x, w))
+        (record,) = self._descriptor_launches(replay.tape)
+        self.assertEqual(
+            (record["func"], record["kernel"]), (eager["func"], eager["name"])
+        )
+        for rows in (4, 9):
+            other = torch.randn(rows, 2048, device="cuda", dtype=torch.bfloat16)
+            self.assertEqual(replay(other, w), rms_norm_host(other, w), atol=0, rtol=0)
+        self.assertEqual((replay.traces, len(replay.variants)), (1, 1))
+
+    def test_the_descriptor_is_persisted_beside_the_object_and_an_object_without_one_is_a_miss(
+        self,
+    ):
+        # QuACK's jit_cache writes the descriptor next to the .o; an object without
+        # one (an older cache, an async worker's export) is a cache miss: the key is
+        # recompiled once in-process, eager's own cold-cache behaviour, and both
+        # files are written back (A411: never a stand-in capture)
+        import glob
+        import os
+
+        from torch._native.ops.norm import norms
+        from torch._vendor.quack.cache import jit as qjit
+
+        tmp = self._cache_dir()
+        compile_fn = norms._instrumented_rmsnorm_fwd()
+        compile_fn.cache_clear()
+        x = torch.randn(4, 2048, device="cuda", dtype=torch.bfloat16)
+        w = torch.randn(2048, device="cuda", dtype=torch.bfloat16)
+        rms_norm_host(x, w)
+        (obj,) = glob.glob(os.path.join(tmp, "*", "*.o"))
+        desc = obj[: -len(".o")] + qjit.DESCRIPTOR_SUFFIX
+        self.assertTrue(os.path.exists(desc), desc)
+        descriptor = self.desc.Descriptor.from_json(open(desc).read())
+        self.assertIsNone(descriptor.declined)
+        self.assertEqual(len(descriptor.launches), 1)
+        self.assertEqual(descriptor.recipe["options"], "--enable-tvm-ffi")
+        self.assertEqual(
+            [f.name for f in descriptor.formals if f.kind == "tensor"],
+            ["mX", "mW", "mO", "mRstd"],
+        )
+        self.assertEqual(descriptor.formals[0].shape[1], 2048)
+        self.assertEqual(
+            descriptor.symbols[descriptor.formals[0].stride[0]].divisibility, 8
+        )
+        # a warm load returns the program with its descriptor
+        compile_fn.cache_clear()
+        program = compile_fn(*self._rms_key(), per_head=False)
+        self.assertIs(type(program), self.dsl.LoadedProgram)
+        self.assertEqual(compile_fn.cache_info().hits, 1)
+        # the object without its descriptor: a miss, recompiled, written back
+        os.rename(desc, desc + ".moved")
+        compile_fn.cache_clear()
+        program = compile_fn(*self._rms_key(), per_head=False)
+        self.assertEqual(compile_fn.cache_info().misses, 1)
+        self.assertTrue(os.path.exists(desc))
+        self.assertIsNot(type(program), self.dsl.LoadedProgram)
+        # and the traced call is served either way, with the same function handle
+        (eager,) = self._eager_nodes(rms_norm_host, (x, w))
+        replay = self._replay(rms_norm_host, (x, w))
+        (record,) = self._descriptor_launches(replay.tape)
+        self.assertEqual(record["func"], eager["func"])
+        self.assertEqual(replay(x, w), rms_norm_host(x, w), atol=0, rtol=0)
+
+    def _rms_key(self):
+        from torch._vendor.quack.cute_dsl_utils import torch2cute_dtype_map as m
+
+        # the override's own call of the compile function (norms.quack_rmsnorm_fwd)
+        bf16 = m[torch.bfloat16]
+        return (bf16, bf16, None, bf16, None, None, 2048, True, False, False)
+
+    def test_another_normalized_size_misses_on_the_descriptor_s_guard(self):
+        # N is static in QuACK's compile (one program per N): a call at another N
+        # misses the variant's guard and is traced anew through its own program
+        x = torch.randn(4, 2048, device="cuda", dtype=torch.bfloat16)
+        w = torch.randn(2048, device="cuda", dtype=torch.bfloat16)
+        replay = self._replay(rms_norm_host, (x, w))
+        self.assertEqual(replay(x, w), rms_norm_host(x, w), atol=0, rtol=0)
+
+        def rms_1024(a, b):
+            return torch.nn.functional.rms_norm(a, (1024,), b, eps=1e-6)
+
+        y = torch.randn(4, 1024, device="cuda", dtype=torch.bfloat16)
+        v = torch.randn(1024, device="cuda", dtype=torch.bfloat16)
+        other = self._replay(rms_1024, (y, v))
+        (record,) = self._descriptor_launches(other.tape)
+        (eager,) = self._eager_nodes(rms_1024, (y, v))
+        self.assertEqual(record["func"], eager["func"])
+        self.assertEqual(other(y, v), rms_1024(y, v), atol=0, rtol=0)
 
     def test_a_normalized_shape_from_a_traced_size_declines_by_name(self):
         x = torch.randn(4, 2048, device="cuda", dtype=torch.bfloat16)
@@ -820,13 +945,23 @@ class TestHostTraceCuTeDSL(TestCase):
         ):
             self.ht.trace(rms_norm_sized_host, (x, w))
 
-    def test_an_input_the_override_copies_first_declines_by_name(self):
+    def test_an_input_the_override_copies_first_is_eager_s_copy_and_the_kernel(self):
+        # a non-contiguous input: the override copies it before its kernel, and
+        # under the trace that copy is ATen's converted host, a launch of the tape
+        # ahead of the kernel's record (the closed region declined this by name)
         x = torch.randn(4, 2048, device="cuda", dtype=torch.bfloat16)
         w = torch.randn(2048, device="cuda", dtype=torch.bfloat16)
-        with self.assertRaisesRegex(
-            self.ht.Declined, "copies the non-contiguous input before its kernel"
-        ):
-            self.ht.trace(rms_norm_half_host, (x, w))
+        replay = self._replay(rms_norm_half_host, (x, w))
+        tape = replay.tape
+        self.assertEqual(tape.num_regions, 0)
+        self.assertEqual(len(self._descriptor_launches(tape)), 1)
+        self.assertGreaterEqual(tape.num_launches, 2)
+        self.assertTrue(tape.launches[-1].get("cute_desc"))
+        for rows in (4, 6):
+            other = torch.randn(rows, 2048, device="cuda", dtype=torch.bfloat16)
+            self.assertEqual(
+                replay(other, w), rms_norm_half_host(other, w), atol=0, rtol=0
+            )
 
     def test_with_the_override_off_rms_norm_is_aten_s_launches(self):
         # eager's route with torch._native's override deregistered is ATen's converted
@@ -860,9 +995,9 @@ class TestHostTraceCuTeDSL(TestCase):
 
     def test_a_block_with_rms_norm_is_one_tape(self):
         # the parameters as inputs (functional_call), as the recorder's regions take
-        # them: the RMSNorm a region of eager's CuTe kernel, the linear a cuBLAS
-        # region, the rest converted hosts, one tape. QuACK compiled in-process, so
-        # that the warm-up observes the override's program and the region claims it
+        # them: the RMSNorm a launch record of eager's CuTe kernel (from its
+        # descriptor; QuACK compiled in-process here, the cold cache), the linear a
+        # cuBLAS region, the rest converted hosts, one tape
         self._quack_in_process()
         block = RMSBlock(2048).cuda().to(torch.bfloat16)
         names, params = zip(*block.named_parameters())
@@ -875,9 +1010,10 @@ class TestHostTraceCuTeDSL(TestCase):
         with torch.no_grad():
             replay = self._replay(step, (x, *params))
             tape = replay.tape
-            self.assertEqual([r.op for r in tape.regions], ["_fused_rms_norm", "mm"])
+            self.assertEqual([r.op for r in tape.regions], ["mm"])
             self.assertEqual(sum(1 for L in tape.launches if L.get("cute")), 0)
-            self.assertEqual(tape.num_launches, 2)
+            self.assertEqual(len(self._descriptor_launches(tape)), 1)
+            self.assertEqual(tape.num_launches, 3)
             for rows in (4, 9):
                 other = torch.randn(rows, 2048, device="cuda", dtype=torch.bfloat16)
                 self.assertEqual(
@@ -928,22 +1064,35 @@ class TestHostTraceCuTeDSL(TestCase):
             self.ht.trace(host, (x,))
         self.assertFalse(torch._C._host_trace_tracing())
 
-    def test_topk_is_a_region_of_eager_s_kernel(self):
+    def test_topk_is_recorded_from_its_descriptor_with_eager_s_kernel(self):
         # eager's route is torch._native's register kernel; the override's condition
         # runs on the traced tensors (N against its kernel table and the row count
-        # against the SM count are guards): another row count is a harvest of its
-        # key, no re-trace
+        # against the SM count are guards), the launch is recorded from the
+        # program's descriptor with eager's own function handle; another row count
+        # is a rebind (the grid is a ceil_div of the rows), no re-trace
         x = torch.randn(256, 1024, device="cuda")
         (eager,) = self._eager_nodes(topk_host, (x,))
         self.assertIn("nativeopstopkcutedsl_kernels", eager["name"])
         replay = self._replay(topk_host, (x,))
         tape = replay.tape
-        self.assertEqual((tape.num_launches, tape.num_regions), (0, 1))
-        (region,) = tape.regions
-        self.assertEqual((region.op, region.scalars), ("topk", (16, -1, True, True)))
+        self.assertEqual((tape.num_launches, tape.num_regions), (1, 0))
+        (record,) = self._descriptor_launches(tape)
         self.assertEqual(
-            [o.name for o in (*region.inputs, *region.outputs)],
-            ["self", "values", "indices"],
+            (record["func"], record["kernel"]), (eager["func"], eager["name"])
+        )
+        self.assertEqual(
+            [p["name"] for p in record["params"]],
+            [
+                "mX.data_ptr",
+                "mX.shape[0]",
+                "mX.stride[0]",
+                "mValues.data_ptr",
+                "mValues.shape[0]",
+                "mValues.stride[0]",
+                "mIndices.data_ptr",
+                "mIndices.shape[0]",
+                "mIndices.stride[0]",
+            ],
         )
         for rows in (256, 300):
             other = torch.randn(rows, 1024, device="cuda")
@@ -952,8 +1101,7 @@ class TestHostTraceCuTeDSL(TestCase):
         self.assertEqual(
             (replay.traces, len(replay.variants), replay.declines), (1, 1, [])
         )
-        for t in self._templates("topk"):
-            self.assertEqual([n["func"] for n in t.nodes], [eager["func"]])
+        self.assertEqual(self._templates("topk"), [])
 
     def test_a_topk_eager_serves_from_the_aot_kernel_declines_by_name(self):
         # k = 64 at this N is covered by the AOT-embedded kernel (the router's ATen
@@ -977,6 +1125,17 @@ class TestHostTraceCuTeDSL(TestCase):
             (tape.num_launches, len(tape.memcpys), tape.num_regions), (0, 1, 1)
         )
         self.assertEqual(tape.memcpys[0]["kind"], "d2d")
+        # the closed region serves because the program's descriptor does not
+        # express its launch: the host builds a TMA descriptor over src
+        from torch._native.ops.scatter_add import tma_kernel
+
+        program = tma_kernel._compile_tma_scatter(torch.float32)
+        record = self.dsl._compiles.get(program)
+        self.assertIsNotNone(record.descriptor)
+        self.assertIsNotNone(record.descriptor.declined)
+        self.assertRegex(
+            record.descriptor.declined, "identity_layout|tma|over runtime values"
+        )
         (region,) = tape.regions
         self.assertEqual((region.op, region.scalars), ("scatter_add_", (0,)))
         self.assertEqual(
@@ -1042,11 +1201,12 @@ class TestHostTraceCuTeDSL(TestCase):
             (replay.traces, len(replay.variants), replay.declines), (1, 1, [])
         )
 
-    def test_rms_norm_backward_is_a_region_of_eager_s_three_kernels(self):
-        # the backward override launches QuACK's kernel, then ATen's reduction of
-        # dw_partial and a cast into the returned grad_weight: three nodes of one
-        # region, dw_partial and the float32 sum the call's scratch between its two
-        # returns (the template's layout), grad_input and grad_weight the tape's
+    def test_rms_norm_backward_is_its_descriptor_s_record_and_aten_s_two_launches(self):
+        # the backward override launches QuACK's kernel (recorded from its
+        # descriptor: the persistent grid is the sm_count formal), then ATen's
+        # reduction of dw_partial and a cast into the returned grad_weight, both
+        # converted hosts: three launches of one tape, eager's three function
+        # objects, dw_partial an allocation of the tape
         x = torch.randn(4, 2048, device="cuda", dtype=torch.bfloat16)
         w = torch.randn(2048, device="cuda", dtype=torch.bfloat16)
         _, rstd = torch.ops.aten._fused_rms_norm(x, [2048], w, 1e-6)
@@ -1055,12 +1215,22 @@ class TestHostTraceCuTeDSL(TestCase):
         self.assertIn("RMSNormBackward", eager[0]["name"])
         replay = self._replay(rms_norm_backward_host, (g, x, rstd, w))
         tape = replay.tape
-        self.assertEqual((tape.num_launches, tape.num_regions), (0, 1))
-        (region,) = tape.regions
-        self.assertEqual(region.op, "_fused_rms_norm_backward")
+        self.assertEqual((tape.num_launches, tape.num_regions), (3, 0))
+        (record,) = self._descriptor_launches(tape)
+        self.assertIs(record, tape.launches[0])
+        # the descriptor's record holds the CUfunction eager's node holds; ATen's
+        # two launches record their host symbols (the runtime resolves them)
         self.assertEqual(
-            [o.name for o in (*region.inputs, *region.outputs)],
-            ["grad_out", "input", "rstd", "weight", "grad_input", "grad_weight"],
+            (record["func"], record["kernel"]), (eager[0]["func"], eager[0]["name"])
+        )
+        self.assertEqual(
+            [L["kernel"] for L in tape.launches[1:]], [n["name"] for n in eager[1:]]
+        )
+        # the persistent grid is the sm_count formal, a value of the call
+        self.assertEqual(list(record["grid"]), list(eager[0]["grid"]))
+        self.assertEqual(
+            [p["name"] for p in record["params"]][:3],
+            ["mX.data_ptr", "mX.shape[0]", "mX.stride[0]"],
         )
         for rows in (4, 9):
             other = torch.randn(rows, 2048, device="cuda", dtype=torch.bfloat16)
@@ -1071,22 +1241,7 @@ class TestHostTraceCuTeDSL(TestCase):
         self.assertEqual(
             (replay.traces, len(replay.variants), replay.declines), (1, 1, [])
         )
-        self.assertEqual(replay.region_stats()["sites"][0]["kinds"], ["kernel"] * 3)
-        for t in self._templates("_fused_rms_norm_backward"):
-            self.assertEqual([n["func"] for n in t.nodes], [n["func"] for n in eager])
-            self.assertEqual(t.layout, ("out", "scratch", "scratch", "out"))
-            self.assertEqual(len(t.scratch), 2)
-        # the test seam's build of the same tape serves the call bitwise too
-        sys.path.insert(
-            0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
-        )
-        from host_trace_testing import build
-
-        variant = build(tape, rms_norm_backward_host, (g, x, rstd, w))
-        for got, expected in zip(
-            variant.replay((g, x, rstd, w)), rms_norm_backward_host(g, x, rstd, w)
-        ):
-            self.assertEqual(got, expected, atol=0, rtol=0)
+        self.assertEqual(self._templates("_fused_rms_norm_backward"), [])
 
     def test_without_a_warm_up_the_program_declines_by_name(self):
         x = torch.randn(4, 128, device="cuda")
