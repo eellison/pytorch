@@ -2355,6 +2355,11 @@ class triton:
         default=True,
     )
 
+    # Combine adjacent compatible stores into private concat allocations.
+    coalesce_concat_stores: bool = (
+        os.environ.get("TORCHINDUCTOR_COALESCE_CONCAT_STORES", "1") == "1"
+    )
+
     # Map for storing the amount of kernel runs with dumped input tensors
     # Based on hash of Triton source code to avoid bloating the folder
     debug_dump_kernel_inputs: dict[str, int] = {}
