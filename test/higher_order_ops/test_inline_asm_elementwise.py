@@ -506,8 +506,62 @@ class TestInlineAsmElementwiseErrors(TestCase):
                 dtype=(torch.int32, torch.int32),
             )
 
+    def test_error_clobbers_require_compile(self):
+        x = torch.arange(8, device="cuda", dtype=torch.int32)
+        with self.assertRaisesRegex(RuntimeError, "requires torch.compile for clobber"):
+            inline_asm_elementwise(
+                x,
+                asm_str="v_mov_b32 $0, $1" if torch.version.hip else "mov.b32 $0, $1;",
+                constraints="=v,v,~{v0}" if torch.version.hip else "=r,r,~{memory}",
+                dtype=torch.int32,
+            )
+
+    def test_error_clobbers_do_not_satisfy_input_constraints(self):
+        x = torch.arange(8, device="cuda", dtype=torch.int32)
+        with self.assertRaisesRegex(ValueError, "specifies 1 inputs but got 2"):
+            inline_asm_elementwise(
+                x,
+                x,
+                asm_str="v_mov_b32 $0, $1" if torch.version.hip else "mov.b32 $0, $1;",
+                constraints="=v,v,~{v0}" if torch.version.hip else "=r,r,~{memory}",
+                dtype=torch.int32,
+            )
+
 
 class TestInlineAsmElementwiseMultipleOutputs(TestCase):
+    @onlyCUDA
+    @xfailIfNoAcceleratorTriton
+    @parametrize("multiple_outputs", [False, True])
+    def test_clobber_constraints_compile(self, device, multiple_outputs):
+        def fn(x):
+            if torch.version.hip:
+                asm_str = (
+                    "v_mov_b32 v0, $2\nv_xor_b32 $0, 15, v0\nv_add_u32 $1, 1, v0"
+                    if multiple_outputs
+                    else "v_mov_b32 v0, $1\nv_xor_b32 $0, 15, v0"
+                )
+                constraints = "=&v,=&v,v,~{v0}" if multiple_outputs else "=&v,v,~{v0}"
+            else:
+                asm_str = (
+                    "xor.b32 $0, $2, 15; add.u32 $1, $2, 1;"
+                    if multiple_outputs
+                    else "xor.b32 $0, $1, 15;"
+                )
+                constraints = (
+                    "=&r,=&r,r,~{memory}" if multiple_outputs else "=&r,r,~{memory}"
+                )
+            return inline_asm_elementwise(
+                x,
+                asm_str=asm_str,
+                constraints=constraints,
+                dtype=(torch.int32, torch.int32) if multiple_outputs else torch.int32,
+            )
+
+        x = torch.arange(259, device=device, dtype=torch.int32)
+        actual = torch.compile(fn, fullgraph=True)(x)
+        expected = (x ^ 15, x + 1) if multiple_outputs else x ^ 15
+        self.assertEqual(actual, expected)
+
     def _check_stochastic_rounding(self, device, fn, rng_state):
         halfway = torch.tensor([0x3F808000], device=device, dtype=torch.int32)
         x = halfway.expand(2).view(torch.float32)

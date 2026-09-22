@@ -17,7 +17,7 @@ __all__ = ["inline_asm_elementwise"]
 def _parse_constraints(constraints: str) -> tuple[int, int]:
     parts = [p.strip() for p in constraints.split(",")]
     n_outputs = sum(1 for p in parts if p.startswith("="))
-    n_inputs = len(parts) - n_outputs
+    n_inputs = sum(1 for p in parts if not p.startswith(("=", "~")))
     return n_outputs, n_inputs
 
 
@@ -45,7 +45,8 @@ class InlineAsmElementwiseOp(HigherOrderOperator):
             (e.g. ``$0`` for the first output, ``$1`` for the first input).
         constraints: Inline-asm constraints in LLVM format. Output constraints
             are prefixed with ``=`` (e.g. ``"=f,f,f"`` for one float output
-            and two float inputs).
+            and two float inputs). Clobbers such as ``~{v0}`` do not consume
+            tensor inputs and require ``torch.compile``.
         dtype: Element type of the returned tensor, or a tuple of element types
             for multiple output tensors. Multiple outputs require
             ``torch.compile``.
@@ -205,6 +206,10 @@ def _get_jiterator_fn(
     cuda_asm = _triton_asm_to_cuda_asm(asm_str)
 
     constraint_parts = [p.strip() for p in constraints.split(",")]
+    if any(p.startswith("~") for p in constraint_parts):
+        raise RuntimeError(
+            "inline_asm_elementwise requires torch.compile for clobber constraints"
+        )
     output_constraints = [p.lstrip("=") for p in constraint_parts if p.startswith("=")]
     input_constraints = [p for p in constraint_parts if not p.startswith("=")]
 
