@@ -281,7 +281,7 @@ class TestTritonConcatStores(TestCase):
         x = torch.randn(17, 259, device=device)
         self.assertNotIn("tl.join(", self.check(fn, x))
 
-    @parametrize("nested,persistent", [(False, False)])
+    @parametrize("nested,persistent", [(False, False), (True, False), (True, True)])
     @parametrize("output_count", [2, 3])
     @parametrize("constraints_kind", ["fixed", "early_fixed", "generic"])
     def test_inline_asm_output_constraints(

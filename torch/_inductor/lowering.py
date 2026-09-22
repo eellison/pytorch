@@ -2441,6 +2441,30 @@ def cat(inputs, dim=0):
     if cpu_device:
         return TensorBox(ir.ConcatKernel.create(inputs, dim))
 
+    def multi_output_inline_asm_origins(x):
+        if isinstance(x, (TensorBox, ir.StorageBox)):
+            return multi_output_inline_asm_origins(unwrap_tensor(x))
+        return OrderedSet(
+            origin
+            for origin in x.origins
+            if origin.op == "call_function"
+            and origin.target is torch._higher_order_ops.inline_asm_elementwise
+            and isinstance(origin.kwargs.get("dtype"), tuple)
+            and len(origin.kwargs["dtype"]) > 1
+            and origin.kwargs.get("is_pure", True)
+        )
+
+    # Keep sibling outputs of a pure inline assembly invocation together.
+    # Masked pointwise concat gives each output a different index, preventing
+    # their CSE. Unwrap views to retain the origin of realized outputs.
+    common_inline_asm_origins = multi_output_inline_asm_origins(inputs[0])
+    for inp in inputs[1:]:
+        common_inline_asm_origins &= multi_output_inline_asm_origins(inp)
+        if not common_inline_asm_origins:
+            break
+    if common_inline_asm_origins:
+        return TensorBox(ir.ConcatKernel.create(inputs, dim))
+
     def op_count(x):
         if isinstance(x, (TensorBox, ir.StorageBox)):
             return op_count(unwrap_tensor(x))

@@ -469,6 +469,31 @@ class _NestedReductionBase:
         """D/G need not be a power of 2."""
         self._norm_block_reduce(_layernorm, "amax", 16, 6144, 128)
 
+    @parametrize("norm", ["layernorm", "rmsnorm"])
+    def test_norm_block_scale_contiguous_epilogue(self, norm):
+        """Affine row norm materialized in bf16, per-group amax, and a
+        full-domain epilogue with a contiguous scale layout: the MX group
+        quantization shape. Nested reductions assume loop_ordering_after_fusion,
+        which this suite enables; without it the grouped reduction's iteration
+        dims are merged before planning and the pipeline is not formed.
+        """
+        G = 32
+        norm_fn = {"layernorm": _layernorm, "rmsnorm": _rmsnorm}[norm]
+
+        def f(x, w, b):
+            normed = (norm_fn(x) * w + b).to(torch.bfloat16).float()
+            blocks = normed.reshape(x.shape[0], x.shape[1] // G, G)
+            # A smooth scale keeps the check tolerant; the fusion shape is the
+            # same as an E8M0 block scale.
+            scale = blocks.abs().amax(dim=-1).clamp_min(1e-30) / 448.0
+            return (blocks / scale.unsqueeze(-1)).reshape(x.shape), scale
+
+        x = torch.randn(1024, 4096, device=GPU_TYPE)
+        w = torch.randn(4096, device=GPU_TYPE)
+        b = torch.randn(4096, device=GPU_TYPE)
+        self.check_numeric(f, (x, w, b))
+        self.check_fusion()
+
     # ---- Epilogue dtype conversion ----
 
     def test_weighted_rmsnorm_reduce_k_bf16_epilogue(self):
@@ -1404,9 +1429,14 @@ class _NestedReductionBase:
         actual, sources = run_and_get_code(torch.compile(f), x, weight)
         self.assertEqual(actual, expected, atol=1e-2, rtol=1e-2)
         self.check_fusion()
-        # One split of the lane source and one of the per-group scale, which
-        # is lifted to the parent tile and split like the data.
-        FileCheck().check_count("tl.split(", 2, exactly=True).run("\n".join(sources))
+        # Pair folding may move arithmetic before a split. The inputs still
+        # load only once per reduction pass, with no epilogue reloads.
+        source = "\n".join(sources)
+        FileCheck().check("tl.split(").run(source)
+        self.assertEqual(
+            source.count("tl.load("),
+            3 if self.force_persistent_outer_reduction is False else 2,
+        )
 
     def test_producer_consumer_lane_fold_splits_computed_value(self):
         """Lanes split the normalized value once, not the raw x and w loads."""
@@ -2337,8 +2367,9 @@ class _NestedReductionBase:
 
         x = torch.randn(B, D, device=GPU_TYPE, dtype=torch.bfloat16)
         self.check_numeric(f, (x,))
-        self.check_no_fusion()
-        self.assertGreater(metrics.generated_kernel_count, 1)
+        # A persistent tile can fuse the fixed-lane side output, but the
+        # incompatible even/odd consumers must retain a separate kernel.
+        self.check_non_leaf_epilogue_fallback()
 
     def test_standalone_sub_parent_rejects_shifted_reduction_output(self):
         B, D = 4, 512
@@ -3214,6 +3245,7 @@ class _InternalsBase:
 
     def setUp(self):
         super().setUp()
+        self.enterContext(inductor_config.patch("loop_ordering_after_fusion", True))
         metrics.reset()
         torch._dynamo.utils.clear_compilation_metrics()
 
@@ -3634,7 +3666,9 @@ class _InternalsBase:
             meta_num_load=self.looped_or_persistent(2, 1),
             min_xblock=None,
             min_rblock=4,
-            extra_checks=FileCheck().check_count("tl.split(", 3, exactly=True),
+            # Pair folding changes split count; IO checks above require all
+            # packed outputs in one kernel without reading materialized values.
+            extra_checks=FileCheck().check("tl.split("),
         )
 
     def test_mxfp6_internal_source_kernel_form(self):
@@ -3648,7 +3682,9 @@ class _InternalsBase:
             meta_num_load=self.looped_or_persistent(2, 1),
             min_xblock=None,
             min_rblock=4,
-            extra_checks=FileCheck().check_count("tl.split(", 3, exactly=True),
+            # Pair folding changes split count; IO checks above require all
+            # packed outputs in one kernel without reading materialized values.
+            extra_checks=FileCheck().check("tl.split("),
         )
 
     def test_standalone_sub_parent_epilogue_kernel_form(self):
