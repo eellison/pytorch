@@ -858,15 +858,19 @@ void launch_kernel_image(
     launch_attributes.back().id = id;
     return launch_attributes.back().value;
   };
-  if (attributes[0] > 1 || attributes[1] > 1 || attributes[2] > 1) {
+  // a cluster launch when the harvested node was one (the census reads 0 for a
+  // node launched without the attribute): a cluster of one is explicit too, since
+  // cuBLAS launches its sm100 nvjet "1x1" kernels with it and they raise Warp
+  // Illegal Instruction when transplanted without it
+  if (attributes[0] != 0 || attributes[1] != 0 || attributes[2] != 0) {
     auto& value = add(CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION);
     value.clusterDim.x = static_cast<unsigned int>(std::max<int64_t>(attributes[0], 1));
     value.clusterDim.y = static_cast<unsigned int>(std::max<int64_t>(attributes[1], 1));
     value.clusterDim.z = static_cast<unsigned int>(std::max<int64_t>(attributes[2], 1));
   }
-  // only what differs from what a plain launch reads back (normalize_attributes;
-  // the memory synchronization domain map defaults to default 0, remote 1), so
-  // a device without clusters or domains is never asked to set them
+  // the rest only where it differs from what a plain launch reads back
+  // (normalize_attributes; the memory synchronization domain map defaults to
+  // default 0, remote 1), so a device without domains is never asked to set them
   if (attributes[3] > 1) {
     add(CU_LAUNCH_ATTRIBUTE_CLUSTER_SCHEDULING_POLICY_PREFERENCE).clusterSchedulingPolicyPreference =
         static_cast<CUclusterSchedulingPolicy>(attributes[3]);

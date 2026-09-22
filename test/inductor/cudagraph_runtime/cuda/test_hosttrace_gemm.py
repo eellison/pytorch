@@ -646,6 +646,52 @@ class TestHostTraceGemm(TestCase):
             - 1,
         )
 
+    def test_a_template_launched_with_a_cluster_of_one_keeps_the_attribute(self):
+        # cuBLAS launches its sm100 nvjet "1x1" kernels (the HF attention's bmm shapes in
+        # bf16) with an explicit cluster dimension of (1, 1, 1); the harvest's census keeps
+        # it (0 is a node launched without one), and the transplanted node must carry it:
+        # without the attribute the kernel raises Warp Illegal Instruction
+        from cuda.bindings import driver, runtime
+
+        def f(a, b):
+            return torch.bmm(a, b)
+
+        a = torch.randn(48, 128, 64, device="cuda", dtype=DTYPE)
+        b = torch.randn(48, 64, 128, device="cuda", dtype=DTYPE)
+        replay = self._replay(f, (a, b))
+        kernels = [
+            n
+            for t in self.ht._gemm_templates.values()
+            for n in t.nodes
+            if n["kind"] == "kernel"
+        ]
+        clusters = {tuple(n["attrs"][:3]) for n in kernels}
+        if (1, 1, 1) not in clusters:
+            self.skipTest(
+                f"cuBLAS selected no kernel launched with a cluster of one here: {clusters}"
+            )
+        for _ in range(2):
+            self.assertTrue(self._check(replay, f, (a, b), "cluster of one"))
+        (variant,) = replay.variants
+        graph, _ = variant.lowered.capture_handles
+        count = _check_cuda_bindings(runtime.cudaGraphGetNodes(graph, 0))[1]
+        nodes = _check_cuda_bindings(runtime.cudaGraphGetNodes(graph, count))[0]
+        dims = []
+        for node in nodes:
+            if (
+                _check_cuda_bindings(runtime.cudaGraphNodeGetType(node))
+                != runtime.cudaGraphNodeType.cudaGraphNodeTypeKernel
+            ):
+                continue
+            value = _check_cuda_bindings(
+                driver.cuGraphKernelNodeGetAttribute(
+                    int(node),
+                    driver.CUlaunchAttributeID.CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION,
+                )
+            )
+            dims.append((value.clusterDim.x, value.clusterDim.y, value.clusterDim.z))
+        self.assertIn((1, 1, 1), dims, dims)
+
 
 if __name__ == "__main__":
     run_tests()
