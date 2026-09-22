@@ -2587,6 +2587,9 @@ class PythonBoxedGraphDispatch {
       held.emplace_back(Py_NewRef(item));
     }
     hidden_ = std::move(held);
+    for (auto& variant : variants_) {
+      snapshot_bound_metadata(variant);
+    }
   }
 
   void append(
@@ -2726,6 +2729,7 @@ class PythonBoxedGraphDispatch {
       context_ = owner.context_;
     }
     variants_.push_back(std::move(variant));
+    snapshot_bound_metadata(variants_.back());
   }
 
   py::object call(py::handle inputs) {
@@ -2745,6 +2749,11 @@ class PythonBoxedGraphDispatch {
         throw py::value_error(
             "Boxed graph input count differs from preparation");
       }
+      // the bound inputs' metadata snapshot stands in for the trailing
+      // positions only when the box leaves them to the bound objects; a full
+      // box (the adapter's arena passed live, an output ring block after it)
+      // reads every binding from the box, as before
+      const bool from_bound = given < originals_.size();
       // Pin before any Python allocation; guards and replay use these same
       // objects. A box without the hidden inputs takes the bound ones.
       for (size_t index = 0; index < given; ++index) {
@@ -2769,12 +2778,19 @@ class PythonBoxedGraphDispatch {
           const auto metadata_start = variant.indices.size() +
               variant.pointer_indices.size() +
               variant.storage_offset_indices.size();
-          bool metadata_valid = true;
+          bool metadata_valid = !from_bound || variant.bound_metadata_valid;
           size_t last_input = originals_.size();
           const at::Tensor* tensor = nullptr;
-          for (size_t index = 0; index < variant.metadata_bindings.size();
+          for (size_t index = 0;
+               metadata_valid && index < variant.metadata_bindings.size();
                ++index) {
             const auto& binding = variant.metadata_bindings[index];
+            if (from_bound && binding.input >= visible) {
+              // a bound input the box left to the bound objects: its metadata
+              // was read at the bind (the caller upholds the bound objects;
+              // their pointers are still read per call below)
+              continue;
+            }
             if (binding.input != last_input) {
               auto* value = originals_[binding.input].get();
               if (!THPVariable_CheckExact(value)) {
@@ -2936,7 +2952,36 @@ class PythonBoxedGraphDispatch {
     std::vector<int64_t> values;
     Predicate predicate;
     THPObjectPtr library;
+    // the bound inputs' metadata values hold in `values` from the bind on; false
+    // when a bound input is not a strided Tensor the bindings can read
+    bool bound_metadata_valid = true;
   };
+
+  // The metadata facts of the bound (hidden) inputs, read once per bind into the
+  // variant's value slots: a call reads the visible inputs' metadata only.
+  void snapshot_bound_metadata(Variant& variant) {
+    const auto visible = originals_.size() - hidden_.size();
+    const auto metadata_start = variant.indices.size() +
+        variant.pointer_indices.size() + variant.storage_offset_indices.size();
+    variant.bound_metadata_valid = true;
+    for (size_t index = 0; index < variant.metadata_bindings.size(); ++index) {
+      const auto& binding = variant.metadata_bindings[index];
+      if (binding.input < visible) {
+        continue;
+      }
+      auto* value = hidden_[binding.input - visible].get();
+      if (!THPVariable_CheckExact(value)) {
+        variant.bound_metadata_valid = false;
+        return;
+      }
+      const auto& tensor = THPVariable_Unpack(value);
+      if (tensor.layout() != at::kStrided || tensor.is_nested() ||
+          !binding.read(tensor, variant.values[metadata_start + index])) {
+        variant.bound_metadata_valid = false;
+        return;
+      }
+    }
+  }
 
   void clear_snapshot() {
     for (auto& value : originals_) {
