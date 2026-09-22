@@ -1160,6 +1160,9 @@ class LoweredTape:
     nargs: int = dataclasses.field(init=False, repr=False)
     constant_positions: tuple = dataclasses.field(init=False, repr=False)
     tensors: object = dataclasses.field(init=False, repr=False)
+    # the predicate's marshaller over a box (torch._C._HostTracePredicate), built on
+    # the first check_predicate
+    _probe: object = dataclasses.field(default=None, init=False, repr=False)
 
     def __post_init__(self):
         tape = self.tape
@@ -3257,6 +3260,17 @@ def check_predicate(lowered, boxed, regions=True, *, mode=None):
         _MODE_FACTS: lowered.facts_address,
         _MODE_ARENA: lowered.arena_address,
     }[mode]
+    probe_class = getattr(torch._C, "_HostTracePredicate", None)
+    if probe_class is not None:
+        # one C++ pass over the box (the Python marshalling below read 5-25 values
+        # per tensor through the Python bindings: milliseconds on a model tape)
+        if lowered._probe is None:
+            lowered._probe = probe_class(
+                lowered.pointer_indices,
+                lowered.offset_indices,
+                [(f.kind, f.index, f.dim) for f in lowered.facts],
+            )
+        return lowered._probe(boxed if type(boxed) is list else list(boxed), address)
     predicate = ctypes.CFUNCTYPE(
         ctypes.c_int8, ctypes.POINTER(ctypes.c_int64), ctypes.POINTER(ctypes.c_double)
     )(address)

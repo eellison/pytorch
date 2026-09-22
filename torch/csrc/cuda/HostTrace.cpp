@@ -17,6 +17,7 @@
 
 #include <cstring>
 #include <memory>
+#include <unordered_map>
 
 // Python entry points for host tracing (aten/src/ATen/cuda/host_trace). The
 // user-facing surface is torch/cuda/_host_trace.py; everything here is private.
@@ -285,6 +286,107 @@ struct HostTraceBoxer {
   std::vector<Py_ssize_t> positions_;
   std::vector<Py_ssize_t> written_;
 };
+
+// _HostTracePredicate: a lowered tape's compiled predicate over a box in one
+// pass (see the binding below)
+struct HostTracePredicate {
+  HostTracePredicate(
+      std::vector<int64_t> pointer_indices,
+      std::vector<int64_t> offset_indices,
+      const std::vector<std::tuple<std::string, int64_t, int64_t>>& facts)
+      : pointer_indices_(std::move(pointer_indices)),
+        offset_indices_(std::move(offset_indices)) {
+    static const std::unordered_map<std::string, int> kinds = {
+        {"size", 0},
+        {"stride", 1},
+        {"rank", 2},
+        {"dtype", 3},
+        {"device", 4},
+        {"pinned", 5},
+        {"neg", 6},
+        {"conj", 7}};
+    for (const auto& [kind, index, dim] : facts) {
+      auto it = kinds.find(kind);
+      TORCH_CHECK(
+          it != kinds.end(), "_HostTracePredicate: unknown fact kind ", kind);
+      facts_.emplace_back(it->second, index, dim);
+    }
+    values_.resize(
+        pointer_indices_.size() + offset_indices_.size() + facts_.size());
+  }
+
+  bool call(py::handle box, int64_t address) {
+    TORCH_CHECK(
+        PyList_CheckExact(box.ptr()),
+        "_HostTracePredicate: the box must be an exact list");
+    const Py_ssize_t n = PyList_GET_SIZE(box.ptr());
+    auto tensor = [&](int64_t index) -> const at::Tensor& {
+      TORCH_CHECK_INDEX(
+          index >= 0 && index < n,
+          "_HostTracePredicate: box position ",
+          index,
+          " of ",
+          n);
+      PyObject* item = PyList_GET_ITEM(box.ptr(), index);
+      TORCH_CHECK(
+          THPVariable_Check(item),
+          "_HostTracePredicate: box position ",
+          index,
+          " is not a Tensor");
+      return THPVariable_Unpack(item);
+    };
+    size_t k = 0;
+    for (auto index : pointer_indices_) {
+      const auto& t = tensor(index);
+      // the storage's const data pointer plus the offset, as the dispatcher
+      // reads an input's address (a copy-on-write storage stays lazy)
+      values_[k++] = reinterpret_cast<int64_t>(t.storage().data()) +
+          static_cast<int64_t>(t.element_size()) * t.storage_offset();
+    }
+    for (auto index : offset_indices_) {
+      values_[k++] = tensor(index).storage_offset();
+    }
+    for (const auto& [kind, index, dim] : facts_) {
+      const auto& t = tensor(index);
+      int64_t v = 0;
+      switch (kind) {
+        case 0:
+          v = dim < t.dim() ? t.size(dim) : -1;
+          break;
+        case 1:
+          v = dim < t.dim() ? t.stride(dim) : -1;
+          break;
+        case 2:
+          v = t.dim();
+          break;
+        case 3:
+          v = static_cast<int64_t>(t.scalar_type());
+          break;
+        case 4:
+          v = t.is_cuda() ? t.get_device() : -1;
+          break;
+        case 5:
+          v = (!t.is_cuda() && t.is_pinned()) ? 1 : 0;
+          break;
+        case 6:
+          v = t.is_neg() ? 1 : 0;
+          break;
+        default:
+          v = t.is_conj() ? 1 : 0;
+      }
+      values_[k++] = v;
+    }
+    auto fn = reinterpret_cast<int8_t (*)(int64_t*, double*)>(
+        static_cast<uintptr_t>(address));
+    return fn(values_.empty() ? nullptr : values_.data(), nullptr) == 1;
+  }
+
+ private:
+  std::vector<int64_t> pointer_indices_;
+  std::vector<int64_t> offset_indices_;
+  std::vector<std::tuple<int, int64_t, int64_t>> facts_;
+  std::vector<int64_t> values_;
+};
 } // namespace
 
 // NOLINTNEXTLINE(misc-use-internal-linkage)
@@ -552,6 +654,24 @@ void THCPHostTrace_init(PyObject* module) {
           &HostTraceBoxer::call,
           py::arg("args"),
           py::arg("arena") = py::none());
+  // The compiled predicate of a lowered tape evaluated over a box: the pointer
+  // values, the storage offsets and the Tensor facts marshalled in one pass
+  // (what direct_hosttrace.check_predicate read tensor by tensor in Python),
+  // then the entry point at `address` (the guard, facts or arena entry).
+  py::class_<HostTracePredicate>(m, "_HostTracePredicate")
+      .def(
+          py::init<
+              std::vector<int64_t>,
+              std::vector<int64_t>,
+              const std::vector<std::tuple<std::string, int64_t, int64_t>>&>(),
+          py::arg("pointer_indices"),
+          py::arg("offset_indices"),
+          py::arg("facts"))
+      .def(
+          "__call__",
+          &HostTracePredicate::call,
+          py::arg("box"),
+          py::arg("address"));
   m.def("_host_trace_capture_error_name", [](int64_t code) -> py::object {
     const char* name =
         at::cuda::host_trace::capture_error_name(static_cast<int>(code));
