@@ -1,6 +1,6 @@
 """Read TMA host metadata and preserve fixed launch attributes."""
 
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 import ctypes
 import hashlib
 from pathlib import Path
@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parent / "fixtures"
 from cuda.bindings import driver
 from torch._inductor.runtime._cudagraph._compiler.cute_bridge.provider import CuTeKernelOwner
 from cutlass._mlir import ir
+from torch._inductor.runtime._cudagraph._compiler import emitter_v2
 from torch._inductor.runtime._cudagraph._compiler.emitter_v2 import _snapshot, _validate_tree, emit_scalar_helper
 from torch._inductor.runtime._cudagraph._compiler.source_dispatch import _pure
 from torch.testing._internal.common_utils import instantiate_parametrized_tests, parametrize, run_tests, TestCase
@@ -45,7 +46,7 @@ class TestTmaHostOps(TestCase):
             module = ir.Module.parse(_host_prefix())
             self.assertTrue(module.operation.verify())
             before = _snapshot(module.operation)
-            host = tuple(module.body.operations)[0].operation
+            host = next(iter(module.body.operations)).operation
             operations = tuple(view.operation for view in host.regions[0].blocks[0].operations)
             seen = set()
             for op in operations[:-1]:
@@ -67,7 +68,7 @@ class TestTmaHostOps(TestCase):
         with ir.Context(), ir.Location.unknown(), ir.raw_values():
             module = ir.Module.parse(_host_prefix())
             self.assertTrue(module.operation.verify())
-            host = tuple(module.body.operations)[0].operation
+            host = next(iter(module.body.operations)).operation
             constructor = next(view.operation for view in host.regions[0].blocks[0].operations
                                if view.operation.name == "cute_nvgpu.atom.make_non_exec_tiled_tma_load")
             constructor.attributes["unexpected"] = ir.UnitAttr.get()
@@ -113,6 +114,51 @@ class TestTmaHostOps(TestCase):
                 plain.assert_not_called()
                 extended.assert_called_once()
                 self.assertEqual(observed, [images])
+
+
+class TestSharedMemoryQuerySnapshots(TestCase):
+    def setUp(self):
+        super().setUp()
+        contexts = ExitStack()
+        self.addCleanup(contexts.close)
+        contexts.enter_context(ir.Context())
+        contexts.enter_context(ir.Location.unknown())
+        contexts.enter_context(ir.raw_values())
+        self.module = ir.Module.parse("""module {
+          func.func @host() -> i64 {
+            %size = cute.kernel_smem_size @kernels::@body : i64
+            return %size : i64
+          }
+          gpu.module @kernels {
+            cuda.kernel @body()
+          }
+        }""")
+        self.host = next(iter(self.module.body.operations)).operation
+        gpu_module = tuple(self.module.body.operations)[1].operation
+        self.kernel = next(iter(gpu_module.regions[0].blocks[0].operations)).operation
+        self.query = next(iter(self.host.regions[0].blocks[0].operations)).operation
+
+    def test_dispatch_validation_only_needs_kernel_identity(self):
+        before = _snapshot(self.module.operation)
+        queried = {}
+        with patch.object(emitter_v2, "_snapshot", wraps=emitter_v2._snapshot) as snapshot:
+            for _ in range(16):
+                _pure(self.module, self.query, queried)
+        self.assertEqual(tuple(queried), (self.kernel,))
+        self.assertEqual(snapshot.call_count, 0)
+        self.assertEqual(_snapshot(self.module.operation), before)
+
+    def test_dispatch_validation_rejects_unknown_kernel(self):
+        self.query.attributes["kernel_name"] = ir.SymbolRefAttr.get(["kernels", "missing"])
+        with self.assertRaisesRegex(ValueError, "does not identify an existing cuda.kernel"):
+            _pure(self.module, self.query, {})
+
+    def test_owned_helper_still_checks_original_kernel(self):
+        helper = emit_scalar_helper(self.module, self.host, (self.query.results[0],), "smem")
+        helper.check()
+        self.kernel.attributes["test_marker"] = ir.UnitAttr.get()
+        with self.assertRaisesRegex(RuntimeError, "changed"):
+            helper.check()
 
 
 if __name__ == "__main__":

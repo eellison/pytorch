@@ -3,6 +3,7 @@
 from contextlib import nullcontext
 import ctypes
 from dataclasses import replace
+from functools import partial
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -17,7 +18,7 @@ from cutlass._mlir.dialects import cute, func
 from cutlass.cute import core
 import torch
 from torch._inductor.runtime._cudagraph.api import InputContract, IntegerRange, TensorInput
-from torch._inductor.runtime._cudagraph.cute_adapter import _integer_requirement_guards, _tma_dimension_guards, _tma_stride_guards
+from torch._inductor.runtime._cudagraph.cute_adapter import _integer_requirement_guards, _symbolic, _tma_dimension_guards, _tma_stride_guards
 from torch._inductor.runtime._cudagraph.direct_host import _direct_origin
 from torch._inductor.runtime._cudagraph.extraction import trace_host
 from torch._inductor.runtime._cudagraph.frontend import lower_terminal
@@ -141,13 +142,13 @@ class TestTmaDimensions(TestCase):
                                                 for key, indices in dimension_groups.items())
             resolve_stride = mock.Mock(side_effect=AssertionError("Static stride requested a runtime source"))
             guards, obligations = _tma_stride_guards(SimpleNamespace(consumers=tuple(consumers)), site,
-                                                     SimpleNamespace(numeric=resolve_stride), {0: symbol})
+                                                     SimpleNamespace(numeric=resolve_stride), partial(_symbolic, symbols={0: symbol}))
             resolve_stride.assert_not_called()
             self.assertEqual(obligations, ())
             resolve_shape.reset_mock()
             dimension_guards, dimension_obligations = _tma_dimension_guards(
                 SimpleNamespace(consumers=tuple(consumers)), site,
-                SimpleNamespace(numeric=resolve_shape), {0: symbol})
+                SimpleNamespace(numeric=resolve_shape), partial(_symbolic, symbols={0: symbol}))
             resolve_shape.assert_called_once_with(0, (1, 0))
             self.assertEqual(dimension_obligations, ())
             guards += dimension_guards

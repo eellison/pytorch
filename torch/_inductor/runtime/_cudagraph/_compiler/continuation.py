@@ -86,7 +86,8 @@ class BoundDispatchHelper:
         joined.check()
         self._check_body(joined)
 
-    def _check_body(self, joined: JoinedDispatch, checked_source: SourceDispatch | None = None) -> None:
+    def _check_body(self, joined: JoinedDispatch, checked_source: SourceDispatch | None = None,
+                    checked_cfg: CFGProgram | None = None) -> None:
         from cutlass._mlir import ir
 
         if self.joined is not joined or self._state() != self._seal:
@@ -95,7 +96,13 @@ class BoundDispatchHelper:
             self.helper.check()
         else:
             DispatchScalarHelper._check_body(self.helper, checked_source)
-        self.cfg.check()
+        if checked_cfg is None:
+            self.cfg.check()
+        else:
+            self.cfg._check_state()
+            if (self.cfg.module is not checked_cfg.module or self.cfg.context is not checked_cfg.context
+                    or (self.cfg.text, self.cfg.bytecode) != (checked_cfg.text, checked_cfg.bytecode)):
+                raise RuntimeError("The original LLVM helper Module changed")
         source = joined.admission.source
         program = joined.mapping.program
         helper = self.helper
@@ -147,8 +154,16 @@ def check_dispatch_consumers(joined: JoinedDispatch, consumers: tuple[BoundDispa
     unique_sources = {id(source): source for source in sources}
     for source in unique_sources.values():
         source.check()
-    for consumer, source in zip(consumers, sources):
-        BoundDispatchHelper._check_body(consumer, joined, source)
+    cfg_keys = tuple((id(consumer.cfg.module), id(consumer.cfg.context)) for consumer in consumers)
+    unique_cfgs = {}
+    for consumer, key in zip(consumers, cfg_keys):
+        unique_cfgs.setdefault(key, consumer.cfg)
+    for cfg in unique_cfgs.values():
+        cfg.check()
+    for consumer, source, key in zip(consumers, sources, cfg_keys):
+        BoundDispatchHelper._check_body(consumer, joined, source, unique_cfgs[key])
+    for cfg in unique_cfgs.values():
+        cfg.check()
     for source in unique_sources.values():
         source.check()
     joined.check()

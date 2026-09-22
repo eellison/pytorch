@@ -294,7 +294,7 @@
     "id": "cute_host_test_host_ops",
     "script": "cpu/cute_host/test_host_ops.py",
     "device": "cpu",
-    "cases": 4,
+    "cases": 7,
     "requires_cute": true
   },
   {
@@ -993,7 +993,7 @@
     "id": "cpu_cute_dispatch_check_snapshots",
     "script": "cpu/cute_host/test_dispatch_check_snapshots.py",
     "device": "cpu",
-    "cases": 8,
+    "cases": 17,
     "requires_cute": true
   },
   {
@@ -1008,6 +1008,25 @@
     "script": "cpu/test_cute_float_parameter.py",
     "device": "cpu",
     "cases": 14,
+    "requires_cute": true
+  },
+  {
+    "id": "cpu_host_trace_triton_execution",
+    "script": "cpu/test_host_trace_triton_execution.py",
+    "device": "cpu",
+    "cases": 9
+  },
+  {
+    "id": "cuda_host_trace_triton_execution",
+    "script": "cuda/test_host_trace_triton_execution.py",
+    "device": "cuda",
+    "cases": 2
+  },
+  {
+    "id": "cpu_cute_operation_snapshot",
+    "script": "cpu/cute_host/test_operation_snapshot.py",
+    "device": "cpu",
+    "cases": 7,
     "requires_cute": true
   }
 ]

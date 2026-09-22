@@ -35,6 +35,7 @@ class TestHostTraceLaunchMerge(TestCase):
             written_roots=["native", frontend],
             observations=None,
             position=0,
+            failure=None,
         )
         tr = SimpleNamespace(triton=trace, cute=trace)
         module = _host_trace_triton if frontend == "triton" else _host_trace_cute

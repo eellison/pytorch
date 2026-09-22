@@ -17,7 +17,7 @@ _CASTS = frozenset({"llvm.trunc", "llvm.zext", "llvm.sext", "llvm.bitcast", "llv
 def _snapshot(operation: Any) -> tuple[str, bytes]:
     buffer = io.BytesIO()
     operation.write_bytecode(buffer)
-    return str(operation), buffer.getvalue()
+    return operation.get_asm(use_local_scope=True), buffer.getvalue()
 
 
 def _function(module: Any, name: str, kind: str) -> Any:
@@ -230,7 +230,8 @@ def _tagged_arguments(function: Any) -> dict[int, Any]:
         raise ValueError("Compiled formals lack preserved source argument markers")
     result = {}
     for argument, dictionary in zip(arguments, attrs):
-        marker = dictionary[SOURCE_ARGUMENT] if SOURCE_ARGUMENT in dictionary else None
+        # MLIR DictAttr.get constructs an attribute; it is not a lookup.
+        marker = dictionary[SOURCE_ARGUMENT] if SOURCE_ARGUMENT in dictionary else None  # noqa: SIM401
         if (not isinstance(marker, ir.IntegerAttr) or marker.type != ir.IntegerType.get_signless(64)
                 or marker.value < 0 or marker.value in result):
             raise ValueError("Compiled source argument markers are missing or ambiguous")

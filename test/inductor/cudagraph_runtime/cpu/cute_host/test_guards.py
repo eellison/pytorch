@@ -1,6 +1,7 @@
 """Consumed compiler comparisons and selects retain compiled reuse predicates."""
 
 import ctypes
+from functools import partial
 
 from torch._inductor.runtime._cudagraph._sdk import activate
 
@@ -13,7 +14,7 @@ from torch._inductor.runtime._cudagraph._compiler.decoded_values import prepare_
 from torch._inductor.runtime._cudagraph._compiler.overflow_properties import bind_properties
 from torch._inductor.runtime._cudagraph._compiler.owned_numeric import evaluate_owned, freeze_numeric
 import sympy
-from torch._inductor.runtime._cudagraph.cute_adapter import _condition
+from torch._inductor.runtime._cudagraph.cute_adapter import _condition, _symbolic
 from torch._inductor.runtime._cudagraph.guard_export import _TerminalPrinter
 from torch._dynamo.source import LocalSource
 from torch._inductor.codecache import CppCodeCache
@@ -56,7 +57,7 @@ class TestNumericReuseGuard(TestCase):
         lowered = lower_numeric(numeric, lambda index, path: NumericSource(IntExpr("boxed", index), 2, 9))
         self.assertEqual(lowered.obligations, ())
         symbols, sources, printer = self.printer()
-        expression = _condition(lowered.values[0], dict(enumerate(symbols)))
+        expression = _condition(lowered.values[0], partial(_symbolic, symbols=dict(enumerate(symbols))))
         self.assertTrue(expression.has(sympy.Piecewise))
         printed = printer.doprint(expression)
         self.assertNotIn(printed, ("true", "false"))

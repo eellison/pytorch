@@ -81,8 +81,20 @@ serially in isolated processes. Larger compositions supplement the component
 tests for ABI, guards, arithmetic, views, selection, and lifetime behavior.
 
 CuTe currently requires version 4.6.2 and activation of `_sdk.activate()` before
-importing CuTe. That narrow hook provides raw MLIR values during host inspection;
-it does not replace the installed SDK. `ObservedOrdinaryEntry` checks activation
+importing CuTe or constructing runtime entries:
+
+```python
+from torch._inductor.runtime._cudagraph import _sdk
+
+_sdk.activate()
+
+import cutlass.cute as cute
+```
+
+Activation provides raw MLIR values during host inspection and installs the
+compiled-call hooks before conversion entries snapshot their dependencies.
+Installing hooks after creating an entry changes those dependencies and
+invalidates it. Activation does not replace the installed SDK. `ObservedOrdinaryEntry` checks activation
 before preparing either a direct or Inductor CuTe invocation and reports the
 required import order. Triton-only direct execution does not need CuTe. The
 private compiler interfaces and unsupported launch forms remain prototype

@@ -12,7 +12,7 @@ _sdk.activate()
 
 from cutlass._mlir import ir
 
-from torch._inductor.runtime._cudagraph._compiler import source_dispatch
+from torch._inductor.runtime._cudagraph._compiler import cfg_values, source_dispatch
 from torch._inductor.runtime._cudagraph._compiler.accessors import _function, _snapshot
 from torch._inductor.runtime._cudagraph._compiler.cfg_values import read_cfg_function
 from torch._inductor.runtime._cudagraph._compiler.continuation import (
@@ -201,6 +201,77 @@ class TestDispatchCheckSnapshots(TestCase):
         with self.assertRaisesRegex(RuntimeError, "Original dispatch Module changed"):
             check_dispatch_consumers(self.joined, consumers)
         self.assertEqual(self.bodies.call_count, 1)
+
+    @parametrize("count", (0, 1, 24))
+    def test_shared_compiled_module_snapshot_count(self, count):
+        consumers = []
+        for consumer in self.consumers(count):
+            consumer = replace(consumer, cfg=replace(self.cfg))
+            consumers.append(replace(consumer, _seal=consumer._state()))
+        with mock.patch.object(cfg_values, "_snapshot", wraps=cfg_values._snapshot) as snapshots:
+            check_dispatch_consumers(self.joined, tuple(consumers))
+        self.assertEqual(snapshots.call_count, 2 if count else 0)
+        self.assertEqual(self.bodies.call_count, count)
+
+    def test_compiled_module_mutation_after_helper_is_rejected(self):
+        consumers = self.consumers(2)
+
+        def mutate(helper, source):
+            self.compiled_module.operation.attributes["test.changed"] = ir.UnitAttr.get()
+
+        self.bodies.side_effect = mutate
+        with self.assertRaisesRegex(RuntimeError, "original LLVM helper Module changed"):
+            check_dispatch_consumers(self.joined, consumers)
+        self.assertEqual(self.bodies.call_count, 2)
+
+    def test_compiled_module_mutation_between_checks_is_rejected_then_restored(self):
+        consumers = self.consumers(2)
+        check_dispatch_consumers(self.joined, consumers)
+        self.compiled_module.operation.attributes["test.changed"] = ir.UnitAttr.get()
+        with self.assertRaisesRegex(RuntimeError, "original LLVM helper Module changed"):
+            check_dispatch_consumers(self.joined, consumers)
+        self.assertEqual(self.bodies.call_count, 2)
+        del self.compiled_module.operation.attributes["test.changed"]
+        check_dispatch_consumers(self.joined, consumers)
+        self.assertEqual(self.bodies.call_count, 4)
+
+    def test_each_cfg_fingerprint_is_checked(self):
+        first, second = self.consumers(2)
+        second = replace(second, cfg=replace(self.cfg, blocks=()))
+        second = replace(second, _seal=second._state())
+        with self.assertRaisesRegex(RuntimeError, "typed control flow changed"):
+            check_dispatch_consumers(self.joined, (first, second))
+        self.assertEqual(self.bodies.call_count, 2)
+
+    def test_each_cfg_saved_module_is_checked(self):
+        first, second = self.consumers(2)
+        cfg = replace(self.cfg, text=self.cfg.text + "\n")
+        cfg = replace(cfg, _fingerprint=cfg._digest())
+        second = replace(second, cfg=cfg)
+        second = replace(second, _seal=second._state())
+        with self.assertRaisesRegex(RuntimeError, "original LLVM helper Module changed"):
+            check_dispatch_consumers(self.joined, (first, second))
+        self.assertEqual(self.bodies.call_count, 2)
+
+    def test_failed_body_does_not_reuse_compiled_module_snapshot(self):
+        consumers = self.consumers(2)
+        self.bodies.side_effect = ValueError("helper failed")
+        with self.assertRaisesRegex(ValueError, "helper failed"):
+            check_dispatch_consumers(self.joined, consumers)
+        self.bodies.side_effect = None
+        self.compiled_module.operation.attributes["test.changed"] = ir.UnitAttr.get()
+        with self.assertRaisesRegex(RuntimeError, "original LLVM helper Module changed"):
+            check_dispatch_consumers(self.joined, consumers)
+        self.assertEqual(self.bodies.call_count, 1)
+
+    def test_different_compiled_module_owner_is_rejected(self):
+        (consumer,) = self.consumers(1)
+        module = ir.Module.parse(str(self.compiled_module))
+        cfg = read_cfg_function(module, "helper")
+        consumer = replace(consumer, cfg=cfg)
+        consumer = replace(consumer, _seal=consumer._state())
+        with self.assertRaisesRegex(ValueError, "actual source owner"):
+            check_dispatch_consumers(self.joined, (consumer,))
 
     def test_direct_consumer_check_still_checks_its_source(self):
         (consumer,) = self.consumers(1)

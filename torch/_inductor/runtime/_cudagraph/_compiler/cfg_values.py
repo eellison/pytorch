@@ -111,12 +111,15 @@ class CFGProgram:
         return sha256(repr((CFG_VERSION, self.function_name, self.argument_types, self.result_types,
                             self.types, self.blocks, self.text, self.bytecode)).encode()).hexdigest()
 
-    def check(self) -> None:
-        from cutlass._mlir import ir
-
+    def _check_state(self) -> None:
         if (len(self._owners) != 2 or self.module is not self._owners[0] or self.context is not self._owners[1]
                 or self.module.context != self.context or self._digest() != self._fingerprint):
             raise RuntimeError("LLVM helper program ownership or typed control flow changed")
+
+    def check(self) -> None:
+        from cutlass._mlir import ir
+
+        self._check_state()
         with self.context, ir.Location.unknown(), ir.raw_values():
             if _snapshot(self.module) != (self.text, self.bytecode):
                 raise RuntimeError("The original LLVM helper Module changed")
@@ -265,7 +268,7 @@ def read_cfg_function(module: Any, function_name: str) -> CFGProgram:
             else:
                 raise ValueError(f"Unsupported LLVM helper terminator: {end.name}")
             result_blocks.append(Block(tuple(slots[value] for value in block.arguments), instructions, terminator))
-        successors = [set(edge.block for edge in block.terminator.edges) for block in result_blocks]
+        successors = [{edge.block for edge in block.terminator.edges} for block in result_blocks]
         reachable, pending = set(), [0]
         while pending:
             index = pending.pop()

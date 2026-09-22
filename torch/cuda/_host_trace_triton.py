@@ -108,6 +108,7 @@ class TritonTrace:
     position: int = 0
     launches: list = field(default_factory=list)
     written_roots: list = field(default_factory=list)
+    failure: BaseException | None = None
 
 
 @dataclass(frozen=True)
@@ -142,19 +143,9 @@ def _getitem(self: Any, grid: Any) -> Any:
             return self.run(grid=grid, warmup=False, *args, **kwargs)  # noqa: B026
         from triton.runtime.jit import JITFunction
 
-        if type(self) is not JITFunction:
-            # an Autotuner (or another KernelInterface): its benchmark launches
-            # are no part of the call at the warm-up, and under the trace it
-            # declines by name
-            if phase == "trace":
-                raise _host_trace().Declined(
-                    f"host_trace: Triton {type(self).__name__} {getattr(getattr(self, 'fn', None), 'fn', self).__name__}: "
-                    "an autotuned launch under a trace is not recorded (declined)"
-                )
-            return self.run(grid=grid, warmup=False, *args, **kwargs)  # noqa: B026
         if phase == "observe":
             binary = self.run(grid=grid, warmup=False, *args, **kwargs)  # noqa: B026
-            if binary is not None:
+            if type(self) is JITFunction and binary is not None:
                 _state.observations.append(
                     _Observed(
                         self,
@@ -164,7 +155,18 @@ def _getitem(self: Any, grid: Any) -> Any:
                     )
                 )
             return binary
-        return _intercept(self, args, grid, kwargs)
+        tr = getattr(_host_trace()._active, "trace", None)
+        try:
+            if type(self) is not JITFunction:
+                raise _host_trace().Declined(
+                    f"host_trace: Triton {type(self).__name__} {getattr(getattr(self, 'fn', None), 'fn', self).__name__}: "
+                    "an autotuned launch under a trace is not recorded (declined)"
+                )
+            return _intercept(self, args, grid, kwargs)
+        except BaseException as error:
+            if tr is not None and tr.triton.failure is None:
+                tr.triton.failure = error
+            raise
 
     return launch
 
@@ -231,6 +233,10 @@ def merge(tr: Any, records: dict) -> None:
     tt = tr.triton
     if tt is None:
         return
+    if tt.failure is not None:
+        raise _host_trace().Declined(
+            f"host_trace: a Triton launch failed under the trace: {tt.failure}"
+        ) from tt.failure
     if tt.observations is not None and tt.position != len(tt.observations):
         left = tt.observations[tt.position]
         raise _host_trace().Declined(

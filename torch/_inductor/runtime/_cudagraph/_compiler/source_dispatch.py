@@ -93,7 +93,8 @@ def _pure(module: Any, operation: Any, kernels: dict[Any, Any]) -> None:
             for nested in body[:-1]:
                 _pure(module, nested, kernels)
     else:
-        _validate_tree(module, operation, kernels)
+        # The source owner snapshots the whole module; dispatch only needs kernel identities.
+        _validate_tree(module, operation, kernels, snapshot_kernels=False)
     for nested in _walk(operation):
         for value in (*nested.operands, *nested.results):
             if isinstance(value.type, ir.IntegerType) and str(value.type) not in {"i1", "i32", "i64"}:

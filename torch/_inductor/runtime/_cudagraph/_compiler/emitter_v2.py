@@ -137,7 +137,7 @@ def _kernel(module: Any, operation: Any) -> Any:
     return kernels[0]
 
 
-def _validate_tree(module: Any, operation: Any, kernels: dict[Any, Any]) -> None:
+def _validate_tree(module: Any, operation: Any, kernels: dict[Any, Any], *, snapshot_kernels: bool = True) -> None:
     from cutlass._mlir import ir
     from cutlass._mlir.dialects import cute, cute_nvgpu, vector
 
@@ -157,7 +157,7 @@ def _validate_tree(module: Any, operation: Any, kernels: dict[Any, Any]) -> None
                     or tuple(value.type for value in body[-1].operands) != tuple(value.type for value in operation.results)):
                 raise ValueError("Branch yield does not preserve the selected scalar result types")
             for nested in body[:-1]:
-                _validate_tree(module, nested, kernels)
+                _validate_tree(module, nested, kernels, snapshot_kernels=snapshot_kernels)
         return
     if operation.regions:
         raise ValueError(f"Unsupported source dependency or effect: {operation.name}")
@@ -210,7 +210,7 @@ def _validate_tree(module: Any, operation: Any, kernels: dict[Any, Any]) -> None
                  and all(isinstance(value.type, ir.IntegerType) for value in (*operation.operands, *operation.results)))
     elif operation.name == "cute.kernel_smem_size":
         kernel = _kernel(module, operation)
-        kernels[kernel] = _snapshot(kernel)
+        kernels[kernel] = _snapshot(kernel) if snapshot_kernels else None
         valid = True
     if not valid:
         attributes = {key: str(operation.attributes[key]) for key in attrs}

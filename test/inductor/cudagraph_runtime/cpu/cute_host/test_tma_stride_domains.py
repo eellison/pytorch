@@ -3,6 +3,7 @@
 from contextlib import nullcontext
 import ctypes
 from dataclasses import replace
+from functools import partial
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -16,7 +17,7 @@ from cutlass._mlir import ir
 import sympy
 import torch
 from torch._inductor.runtime._cudagraph.api import InputContract, IntegerRange, TensorInput
-from torch._inductor.runtime._cudagraph.cute_adapter import _integer_requirement_guards, _tma_stride_guards
+from torch._inductor.runtime._cudagraph.cute_adapter import _integer_requirement_guards, _symbolic, _tma_stride_guards
 from torch._inductor.runtime._cudagraph.direct_host import _direct_origin
 from torch._inductor.runtime._cudagraph.extraction import trace_host
 from torch._inductor.runtime._cudagraph.frontend import lower_terminal
@@ -100,7 +101,7 @@ class TestTmaStrideDomain(TestCase):
             site = SimpleNamespace(site_id=0, tma_stride_divisors=tuple(row.divisor for row in requirements),
                                    tma_stride_domains=(TmaStrideDomain((0,), 2), TmaStrideDomain((1,), 2)))
             guards, obligations = _tma_stride_guards(SimpleNamespace(consumers=tuple(consumers)), site,
-                                                     SimpleNamespace(numeric=resolve), {0: symbol})
+                                                     SimpleNamespace(numeric=resolve), partial(_symbolic, symbols={0: symbol}))
             guards += _integer_requirement_guards(RuntimeRequirement("integer_range", (), 0, I64_MAX), symbol)
             for obligation in obligations:
                 self.assertEqual(obligation.expression, IntExpr("boxed", 0))
@@ -172,7 +173,7 @@ class TestTmaStrideDomain(TestCase):
                                    tma_stride_domains=tuple(TmaStrideDomain(indices, 2)
                                                             for indices in ((0,), (1,), (2,), (3, 4))))
             guards, obligations = _tma_stride_guards(SimpleNamespace(consumers=tuple(consumers)), site,
-                                                     SimpleNamespace(numeric=resolve), symbols)
+                                                     SimpleNamespace(numeric=resolve), partial(_symbolic, symbols=symbols))
             for obligation in obligations:
                 self.assertEqual(obligation.expression.op, "boxed")
                 symbol = symbols[obligation.expression.value]
