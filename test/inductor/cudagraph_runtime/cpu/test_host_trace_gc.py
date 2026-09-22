@@ -30,7 +30,9 @@ class TestHostTraceGC(TestCase):
         symbolic, result = object(), SimpleNamespace()
         events = []
         recorder = mock.Mock()
-        trace = SimpleNamespace(rec=recorder, input=mock.Mock(), inputs=[])
+        trace = SimpleNamespace(
+            rec=recorder, input=mock.Mock(), inputs=[], device=torch.device("cuda", 0)
+        )
 
         def construct(device, hints):
             self.assertFalse(gc.isenabled())
