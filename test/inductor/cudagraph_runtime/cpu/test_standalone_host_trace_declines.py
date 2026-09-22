@@ -55,6 +55,7 @@ class TestStandaloneHostTraceDeclines(TestCase):
             arena=None,
             output_arena=None,
             sequence=None,
+            calls=(),
             symbols=SimpleNamespace(positions=[0]),
             nargs=1,
             constant_positions=(),
