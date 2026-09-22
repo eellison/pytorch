@@ -1064,6 +1064,11 @@ max_pointwise_cat_inputs = 8
 # force concat to be generated as a pointwise op with masked loads
 force_pointwise_cat = False
 
+# Redirect private concat producers into their finalized destination allocation.
+rebase_concat_copies: bool = (
+    os.environ.get("TORCHINDUCTOR_REBASE_CONCAT_COPIES", "1") == "1"
+)
+
 # replace small reductions with pointwise, disable with `= 1`
 unroll_reductions_threshold = 8
 

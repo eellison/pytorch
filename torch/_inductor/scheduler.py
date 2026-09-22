@@ -5359,36 +5359,6 @@ def pick_loop_order(
     return order
 
 
-def _replace_operation_buffer(
-    orig_node: ir.MultiTemplateBuffer, new_node: ir.OperationBuffer
-) -> None:
-    replaced_buf_name = new_node.get_name()
-    orig_buf_name = orig_node.get_name()
-    if not (isinstance(orig_buf_name, str) and isinstance(replaced_buf_name, str)):
-        raise AssertionError("expected orig_buf_name and replaced_buf_name to be str")
-
-    replaced_op_name = new_node.get_operation_name()
-    orig_op_name = orig_node.get_operation_name()
-    if not (isinstance(orig_op_name, str) and isinstance(replaced_op_name, str)):
-        raise AssertionError("expected orig_op_name and replaced_op_name to be str")
-
-    del V.graph.name_to_buffer[replaced_buf_name]
-    new_node.name = orig_buf_name
-
-    del V.graph.name_to_op[replaced_op_name]
-    new_node.operation_name = orig_op_name
-
-    orig = V.graph.buffers.index(orig_node)
-    V.graph.buffers.remove(new_node)
-    V.graph.buffers[orig] = new_node
-    V.graph.name_to_buffer[orig_buf_name] = new_node
-
-    orig = V.graph.operations.index(orig_node)
-    V.graph.operations.remove(new_node)
-    V.graph.operations[orig] = new_node
-    V.graph.name_to_op[orig_op_name] = new_node
-
-
 def _estimate_fused_epilogue_runtime(node1, node2, epilogue_runtime) -> float:
     template_write_bytes = node1.get_write_buffer_sizes()
     epilogue_read_bytes = node2.get_read_buffer_sizes()
@@ -7080,7 +7050,7 @@ class Scheduler:
         i: int,
         node: SchedulerNode,
     ) -> None:
-        _replace_operation_buffer(multi_node, out_buffer)
+        V.graph.replace_operation_buffer(multi_node, out_buffer)
         new_scheduler_node = self.create_scheduler_node(out_buffer)
 
         self.nodes[i] = new_scheduler_node

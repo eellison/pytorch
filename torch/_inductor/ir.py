@@ -6896,11 +6896,15 @@ class NopKernel(InputsKernel):
         return OrderedSet()
 
 
+@ir_dataclass(frozen=False)
 class ConcatKernel(NopKernel):
     """
     There isn't actually a real kernel for concat, we just change the
     storage for the upstream data.
     """
+
+    dim: int
+    slices: tuple[tuple[Expr, Expr], ...]
 
     @classmethod
     def create(cls, inputs: Sequence[IRNode], dim: int) -> StorageBox:
@@ -6993,6 +6997,8 @@ class ConcatKernel(NopKernel):
                 is_pinned=is_pinned,
             ),
             inputs=[],
+            dim=dim,
+            slices=tuple(zip(offsets_start, offsets_end)),
         )
         kernel = StorageBox(concat_kernel)
         op_names = []
@@ -7104,10 +7110,12 @@ class ConcatKernel(NopKernel):
                 src.data.layout = NonOwningLayout(dst)
                 return src.data
         # introduce a copy
+        from . import concat_rebase
+
         pw = Pointwise.create(
             device=src.get_device(),
             dtype=src.get_dtype(),
-            inner_fn=src.make_loader(),
+            inner_fn=concat_rebase.copy_loader(src.make_loader(), (src,), 0),
             ranges=[
                 V.graph.sizevars.check_equals_and_simplify(a, b)
                 for a, b in zip(src.get_size(), dst.get_size())

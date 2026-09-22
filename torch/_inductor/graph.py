@@ -56,7 +56,7 @@ from torch.utils._ordered_set import OrderedSet
 from torch.utils._sympy.numbers import int_oo
 from torch.utils._typing_utils import not_none
 
-from . import config, ir
+from . import concat_rebase, config, ir
 from .codegen.common import (
     _uses_gpu_cpp_wrapper,
     BackendFeature,
@@ -1790,9 +1790,42 @@ class GraphLowering(torch.fx.Interpreter):
             self.graph_id if self.graph_id is not None else -1,
         )
 
+    def replace_operation_buffer(
+        self, orig_node: ir.OperationBuffer, new_node: ir.OperationBuffer
+    ) -> None:
+        replaced_buf_name = new_node.get_name()
+        orig_buf_name = orig_node.get_name()
+        if not (isinstance(orig_buf_name, str) and isinstance(replaced_buf_name, str)):
+            raise AssertionError(
+                "expected orig_buf_name and replaced_buf_name to be str"
+            )
+
+        replaced_op_name = new_node.get_operation_name()
+        orig_op_name = orig_node.get_operation_name()
+        if not (isinstance(orig_op_name, str) and isinstance(replaced_op_name, str)):
+            raise AssertionError("expected orig_op_name and replaced_op_name to be str")
+
+        del self.name_to_buffer[replaced_buf_name]
+        new_node.name = orig_buf_name
+
+        del self.name_to_op[replaced_op_name]
+        new_node.operation_name = orig_op_name
+
+        orig = self.buffers.index(orig_node)
+        self.buffers.remove(new_node)
+        self.buffers[orig] = new_node
+        self.name_to_buffer[orig_buf_name] = new_node
+
+        orig = self.operations.index(orig_node)
+        self.operations.remove(new_node)
+        self.operations[orig] = new_node
+        self.name_to_op[orig_op_name] = new_node
+
     def finalize(self) -> None:
         for buf in self.buffers:
             buf.decide_layout()
+        if config.rebase_concat_copies:
+            concat_rebase.rebase_copies(self)
 
     @contextmanager
     def set_current_node(self, node: torch.fx.Node):  # type: ignore[no-untyped-def]
