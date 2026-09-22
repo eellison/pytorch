@@ -112,7 +112,13 @@ def _bmm_outer_product_launch_config(
     The grid has one entry for every (batch, M tile, N tile). Sharing this
     calculation with the safety guard keeps the checked and launched grids identical.
     """
-    block_m, block_n = _pick_block_sizes(m, n)
+    if type(m) is int and type(n) is int:
+        block_m, block_n = _pick_block_sizes(m, n)
+    else:
+        # symbolic sizes (a host trace): the block-size ladder's comparisons
+        # pick the launch configuration, a kernel choice of the trace
+        with torch._C._HostTraceKernelChoice():
+            block_m, block_n = _pick_block_sizes(m, n)
     grid_size = batch * triton.cdiv(m, block_m) * triton.cdiv(n, block_n)
     return grid_size, block_m, block_n
 

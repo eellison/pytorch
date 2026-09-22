@@ -592,7 +592,11 @@ def _intercept(jit: Any, args: tuple, grid: Any, kwargs: dict) -> Any:
     for axis, (extent, limit) in enumerate(zip(dims, _GRID_LIMITS)):
         if type(extent) is not int and type(extent) is not torch.SymInt:
             decline(f"grid axis {axis} is a {type(extent).__name__}")
-        if not (bool(extent >= 1) and bool(extent <= limit)):
+        # the launch bounds on the grid's values: a launch-configuration
+        # check, kernel-tagged as the hosts' grid checks are
+        with torch._C._HostTraceKernelChoice():
+            inside = bool(extent >= 1) and bool(extent <= limit)
+        if not inside:
             decline(f"grid axis {axis} is outside the launch bounds at the traced call")
     with torch.cuda.device(device):
         # eager's loaded module for this compilation (a no-op after its first
@@ -713,18 +717,22 @@ def _select(
         binder.__defaults__,
         binder.__closure__,
     )
-    _, entries, symbolic_opts = symbolic_binder(**symbolic, **kwargs)
-    if len(entries) != len(concrete) or len(entries) != len(jit.params):
-        decline("the binder's specialization does not cover the kernel's parameters")
-    resolved = []
-    for param, entry, expected in zip(jit.params, entries, concrete):
-        got = _resolve(entry)
+    # the specialization's comparisons on the values of the trace decide the
+    # compilation launched: a kernel choice (plan item 38 stage 0), kernel-tagged
+    # as the converted hosts' launch decisions are
+    with torch._C._HostTraceKernelChoice():
+        _, entries, symbolic_opts = symbolic_binder(**symbolic, **kwargs)
+        if len(entries) != len(concrete) or len(entries) != len(jit.params):
+            decline(
+                "the binder's specialization does not cover the kernel's parameters"
+            )
+        resolved = [_resolve(entry) for entry in entries]
+    for param, got, expected in zip(jit.params, resolved, concrete):
         if got != expected:
             decline(
                 f"Triton's specialization of argument {param.name} for the traced values "
                 f"({expected!r}) is not the symbolic run's ({got!r})"
             )
-        resolved.append(got)
     if compute_cache_key({}, resolved, symbolic_opts) != key:
         decline("the compile key of the symbolic run is not the traced values'")
     return binary
