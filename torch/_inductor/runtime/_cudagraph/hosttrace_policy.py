@@ -389,6 +389,17 @@ def _abi_params(prov, rows, kinds, decline):
     mutated = OrderedSet(getattr(prov, "mutated_arg_names", ()) or ())
     params, written = [], []
     for row, val, ty, (offset, size) in rows:
+        # the compiled ABI's specialization attributes: the divisibility Inductor
+        # proved at compile time is the only kind this proxy turns into a guard;
+        # another kind is an axis it does not read (declined by name, as the JIT
+        # hook's owner declines an unsupported specialization)
+        other = sorted(
+            OrderedSet([n for n, _ in (row.attributes or ()) if n != "tt.divisibility"])
+        )
+        if other:
+            decline(
+                f"argument {row.formal} carries specialization attributes {other} this proxy does not read"
+            )
         divisors = [v for n, v in (row.attributes or ()) if n == "tt.divisibility"]
         div = max([1, *divisors])
         if ty == "O":
