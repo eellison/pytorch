@@ -10797,6 +10797,7 @@ class Scheduler:
             and (
                 write.normalize().is_contiguous()
                 or write.normalize_with_stride_order().is_contiguous()
+                or write.is_non_overlapping()
             )
         )
 
