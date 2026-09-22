@@ -2,7 +2,7 @@
 import gc
 import weakref
 from contextlib import nullcontext
-from types import SimpleNamespace
+from types import FunctionType, SimpleNamespace
 from unittest import mock
 
 import triton
@@ -65,6 +65,12 @@ def decline(message):
 
 @instantiate_parametrized_tests
 class TestRecordedTritonSpecialization(TestCase):
+    """The recorder's Triton specialization is Triton's own binder run on the values
+    of the trace (torch/cuda/_host_trace_triton.py `_select`: the kernel's generated
+    binder cloned with `specialize_impl` replaced by `_SymbolicSpecialization`);
+    the record admits a launch when the symbolic run's resolved specialization is
+    the concrete binder's entry by entry, and declines it by name otherwise."""
+
     def setUp(self):
         super().setUp()
         # The binder is target-independent for these argument facts. No device,
@@ -72,18 +78,35 @@ class TestRecordedTritonSpecialization(TestCase):
         self.backend = CUDABackend(GPUTarget("cuda", 80, 32))
         self.assertFalse(torch.cuda.is_initialized())
 
-    def attributes(self, kernel, argument):
+    def sym(self, value):
+        from torch._dynamo.source import ConstantSource
+        from torch.fx.experimental.symbolic_shapes import ShapeEnv
+
+        env = ShapeEnv()
+        symbol = env.create_symbol(value, ConstantSource("n"))
+        return env.create_symintnode(symbol, hint=value)
+
+    def binders(self, kernel):
         binder = create_function_from_signature(
             kernel.signature, kernel.params, self.backend
         )
-        _, (specialization,), _ = binder(argument)
-        kind, descriptor = specialization
-        attributes = (
-            tuple(tuple(row) for row in self.backend.parse_attr(descriptor))
-            if isinstance(descriptor, str)
-            else ()
+        symbolic = FunctionType(
+            binder.__code__,
+            {
+                **binder.__globals__,
+                "specialize_impl": HOOK._SymbolicSpecialization(self.backend),
+            },
+            binder.__name__,
+            binder.__defaults__,
+            binder.__closure__,
         )
-        return kind, attributes
+        return binder, symbolic
+
+    def specializations(self, kernel, concrete, symbolic):
+        binder, symbolic_binder = self.binders(kernel)
+        _, (selected,), _ = binder(concrete)
+        _, (entry,), _ = symbolic_binder(symbolic)
+        return selected, HOOK._resolve(entry)
 
     @parametrize(
         "kernel,value",
@@ -99,18 +122,14 @@ class TestRecordedTritonSpecialization(TestCase):
         ),
     )
     def test_selected_integer_signature_is_admitted(self, kernel, value):
-        kind, attributes = self.attributes(kernel, value)
-        self.assertIn(kind, ("i32", "i64"))
-        row = SimpleNamespace(formal="n", attributes=attributes)
-        try:
-            HOOK._int_guards(
-                row, value, {"i32": 32, "i64": 64}[kind], decline, kernel.params[0]
-            )
-        except Declined as error:
-            self.fail(
-                f"The actual binder selected {kind}, {attributes} for "
-                f"{kernel.fn.__name__}({value}), but its recorder rejected it: {error}"
-            )
+        selected, recorded = self.specializations(kernel, value, self.sym(value))
+        self.assertIn(selected[0], ("i32", "i64", "constexpr"))
+        self.assertEqual(
+            recorded,
+            selected,
+            f"The actual binder selected {selected} for "
+            f"{kernel.fn.__name__}({value}), but its recorder derived {recorded}",
+        )
 
     @parametrize(
         "kernel,address",
@@ -121,38 +140,41 @@ class TestRecordedTritonSpecialization(TestCase):
         ),
     )
     def test_selected_pointer_signature_is_admitted(self, kernel, address):
-        pointer = HOOK._PointerStandIn(torch.float32, address)
-        kind, attributes = self.attributes(kernel, pointer)
-        self.assertEqual(kind, "*fp32")
-        alignment = max((1, *(value for _, value in attributes)))
-        tensor = SimpleNamespace(_root=SimpleNamespace(allocation=False))
-        try:
-            HOOK._alignment_guard(
-                "p", tensor, address, 0, alignment, decline, kernel.params[0]
-            )
-        except Declined as error:
-            self.fail(
-                f"The actual binder selected {kind}, {attributes} for "
-                f"{kernel.fn.__name__} at {address}, but its recorder rejected it: {error}"
-            )
+        selected, recorded = self.specializations(
+            kernel,
+            HOOK._PointerStandIn(torch.float32, address),
+            HOOK._PointerStandIn(torch.float32, self.sym(address)),
+        )
+        self.assertEqual(selected[0], "*fp32")
+        self.assertEqual(
+            recorded,
+            selected,
+            f"The actual binder selected {selected} for "
+            f"{kernel.fn.__name__} at {address}, but its recorder derived {recorded}",
+        )
 
     @parametrize("kind", ("integer", "pointer", "int64_range"))
     def test_required_selected_constraints_still_decline(self, kind):
+        # a value outside the class the compilation was selected under is another
+        # specialization: `_select` declines it by name ("is not the symbolic run's")
         if kind == "integer":
-            _, attributes = self.attributes(ordinary_integer, 16)
-            row = SimpleNamespace(formal="n", attributes=attributes)
-            with self.assertRaisesRegex(Declined, "divisibility"):
-                HOOK._int_guards(row, 3, 32, decline, ordinary_integer.params[0])
+            selected, recorded = self.specializations(ordinary_integer, 16, self.sym(3))
+            self.assertEqual(selected, ("i32", "D"))
+            self.assertNotEqual(recorded, selected)
         elif kind == "pointer":
-            tensor = SimpleNamespace(_root=SimpleNamespace(allocation=False))
-            with self.assertRaisesRegex(Declined, "alignment"):
-                HOOK._alignment_guard(
-                    "p", tensor, 4100, 0, 16, decline, ordinary_pointer.params[0]
-                )
+            selected, recorded = self.specializations(
+                ordinary_pointer,
+                HOOK._PointerStandIn(torch.float32, 4096),
+                HOOK._PointerStandIn(torch.float32, self.sym(4100)),
+            )
+            self.assertEqual(selected, ("*fp32", "D"))
+            self.assertNotEqual(recorded, selected)
         else:
-            row = SimpleNamespace(formal="n", attributes=())
-            with self.assertRaisesRegex(Declined, "int64 range"):
-                HOOK._int_guards(row, 2**63 + 3, 64, decline, explicit_i64.params[0])
+            # the width class of a value above 2**63 - 1 is u64: outside the
+            # 64-bit slot a declared tl.int64 binds, which the record declines
+            self.assertEqual(HOOK._int_type(self.sym(2**63 + 3)), "u64")
+            self.assertEqual(HOOK._int_type(self.sym(2**33)), "i64")
+            self.assertEqual(HOOK._int_type(self.sym(3)), "i32")
 
 
 class _Binary:
