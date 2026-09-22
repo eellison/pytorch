@@ -1145,27 +1145,23 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { m.def("alloc_by_eighth", &alloc_by_ei
             self.assertFalse(own(op), op)
         route = "runs its own CUDA kernel.*converted host for {} is the way to trace it"
         x, w, _ = self._inputs(8)
-        message = "_fused_rms_norm.*" + route.format("aten::_fused_rms_norm")
+        # _fused_rms_norm is a converted host: traced as ATen's launches where
+        # eager runs ATen, and as a closed region where eager's route is
+        # torch._native's override (the vendored QuACK CuTe DSL rms norm:
+        # torch/cuda/_host_trace_native.py), never decomposed
         from torch._native import registry
 
-        if any(n.active for n in registry._graphs.get(("_fused_rms_norm", "CUDA"), ())):
-            # eager's route here is torch._native's override (the vendored QuACK
-            # CuTe DSL rms norm): its program is recorded through the DSL-level
-            # hook (torch/cuda/_host_trace_cute_dsl.py) when compiled in this
-            # process; QuACK's on-disk cache serves a loaded module instead,
-            # which the hook cannot re-select, and that declines by name
-            from torch._vendor.quack import cache
-
-            if not cache.CACHE_ENABLED:
-                self.assertEqual(
-                    ht.trace(fused, (x, [self.N], w, 1e-5)).num_launches, 1
-                )
-                return
-            message = "CuTe DSL program the recorder does not hook.*loaded from a compiled module"
-        with self.assertRaisesRegex(ht.Declined, message):
-            ht.trace(fused, (x, [self.N], w, 1e-5))
-        with self.assertRaisesRegex(ht.Declined, message):
-            ht.trace(lambda t, g: F.rms_norm(t, (self.N,), g, 1e-5), (x, w))
+        override = any(
+            n.active for n in registry._graphs.get(("_fused_rms_norm", "CUDA"), ())
+        )
+        for fn, args in (
+            (fused, (x, [self.N], w, 1e-5)),
+            (lambda t, g: F.rms_norm(t, (self.N,), g, 1e-5), (x, w)),
+        ):
+            tape = ht.trace(fn, args)
+            self.assertEqual(
+                (tape.num_launches == 0, tape.num_regions), (override, int(override))
+            )
 
         def below_autograd(t):
             with torch._C._AutoDispatchBelowAutograd():

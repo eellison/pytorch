@@ -45,7 +45,7 @@ import sys
 import threading
 import types
 import weakref
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import torch
@@ -331,14 +331,15 @@ def observing() -> Any:
 @contextlib.contextmanager
 def tracing(observations: list | None = None) -> Any:
     """The symbolic run: each compiled function's call on this thread is
-    recorded on the active trace; the names of the programs met are yielded.
-    `observations` are the warm-up's program names (None without a warm-up)."""
+    recorded on the active trace; the programs met (and the first failure of
+    a recording) are yielded. `observations` are the warm-up's program names
+    (None without a warm-up)."""
     previous = (
         getattr(_state, "phase", None),
         getattr(_state, "met", None),
         getattr(_state, "observations", None),
     )
-    met: list = []
+    met = _Met()
     _state.phase, _state.met, _state.observations = "trace", met, observations
     try:
         yield met
@@ -346,32 +347,80 @@ def tracing(observations: list | None = None) -> Any:
         _state.phase, _state.met, _state.observations = previous
 
 
-def unmet_hint() -> str:
-    """For a decline of ATen's route during the symbolic run: the CuTe DSL program
-    the warm-up called at this point, if eager's override launched one here."""
+@dataclass(frozen=True)
+class _Observed:
+    """A compiled program's call at the warm-up: its display name and the module
+    of its jit callable (a torch._native override's own, or a user's)."""
+
+    name: str
+    module: str
+
+
+@dataclass
+class _Met:
+    """The symbolic run's side of the warm-up's observations: the programs met,
+    in order, and the first failure of a program's recording after its
+    observation was consumed (a decline is a RuntimeError a host may catch;
+    the run is then refused at the publication boundary, never published
+    without the launch)."""
+
+    names: list = field(default_factory=list)
+    failure: BaseException | None = None
+
+
+def _next_unmet() -> _Observed | None:
     observations = getattr(_state, "observations", None)
     met = getattr(_state, "met", None)
     if getattr(_state, "phase", None) != "trace" or not observations or met is None:
-        return ""
-    if len(met) >= len(observations):
+        return None
+    n = len(met.names)
+    return observations[n] if n < len(observations) else None
+
+
+def unmet_hint() -> str:
+    """For a decline of ATen's route during the symbolic run: the CuTe DSL program
+    the warm-up called at this point, if eager's override launched one here."""
+    unmet = _next_unmet()
+    if unmet is None:
         return ""
     return (
-        f"; the warm-up called the CuTe DSL program {observations[len(met)]} here, which eager's "
+        f"; the warm-up called the CuTe DSL program {unmet.name} here, which eager's "
         "torch._native override launched: the override's condition answered otherwise on the "
         "traced tensors (one analysing with a TensorIterator, which takes no symbolic shapes)"
     )
 
 
-def check_met(observations: list | None, met: list) -> None:
-    """A warm-up that called a program the symbolic run did not meet (or the
-    reverse) means eager's route and the traced route differ: a torch._native
-    override's condition answered otherwise on the traced tensors (one that
-    analyses with a TensorIterator, which takes no symbolic shapes), so the
-    trace went to ATen's route while eager launched the program. Declined."""
-    if observations is None or observations == met:
+def claim(programs: tuple) -> None:
+    """A torch._native override recorded as a closed region at this point of
+    the symbolic run: the programs its warm-up call launched here (those of
+    the override's modules, in order) count as met."""
+    while True:
+        unmet = _next_unmet()
+        if unmet is None or not unmet.module.startswith(programs):
+            return
+        _state.met.names.append(unmet.name)
+
+
+def check_met(observations: list | None, met: _Met) -> None:
+    """The publication boundary. A recording that failed after its observation
+    was consumed (the host caught the error and ran on) is refused: the tape
+    would omit the launch. A warm-up that called a program the symbolic run
+    did not meet (or the reverse) means eager's route and the traced route
+    differ: a torch._native override's condition answered otherwise on the
+    traced tensors (one that analyses with a TensorIterator, which takes no
+    symbolic shapes), so the trace went to ATen's route while eager launched
+    the program. Declined."""
+    if met.failure is not None:
+        raise _host_trace().Declined(
+            f"host_trace: a CuTe DSL program's recording failed under the trace: {met.failure}"
+        ) from met.failure
+    if observations is None:
+        return
+    names = [o.name for o in observations]
+    if names == met.names:
         return
     raise _host_trace().Declined(
-        f"host_trace: the warm-up called the CuTe DSL programs {observations} and the symbolic "
+        f"host_trace: the warm-up called the CuTe DSL programs {names} and the symbolic "
         f"run met {met}: eager's route differs from the traced one (a torch._native override's "
         "condition answered otherwise on the traced tensors, such as one analysing with a "
         "TensorIterator, which takes no symbolic shapes) (declined)"
@@ -388,8 +437,27 @@ def _display_name(compiled: Any, record: _Compile | None) -> str:
     return str(getattr(compiled, "function_name", type(compiled).__name__))[:80]
 
 
+def _module_name(record: _Compile | None) -> str:
+    if record is None:
+        return ""
+    function = record.function
+    if not isinstance(function, types.FunctionType):
+        function = type(function)
+    return getattr(function, "__module__", None) or ""
+
+
+# the modules of torch._native's overrides and the libraries they vendor: their
+# programs are recorded through the overrides' closed regions
+# (torch/cuda/_host_trace_native.py), never re-selected here
+_NATIVE_MODULES = ("torch._native.", "torch._vendor.")
+
+
 def _observe(compiled: Any, original: Any, args: tuple, kwargs: dict) -> Any:
-    _state.observations.append(_display_name(compiled, _compiles.get(compiled)))
+    record = _compiles.get(compiled)
+    module = _module_name(record)
+    _state.observations.append(_Observed(_display_name(compiled, record), module))
+    if module.startswith(_NATIVE_MODULES):
+        return original(compiled, *args, **kwargs)
     synth = _entries.get(compiled)
     if synth is None:
         record = _compiles.get(compiled)
@@ -446,7 +514,32 @@ def _trace(compiled: Any, args: tuple, kwargs: dict) -> Any:
 
     if tr is None:
         decline("called in the trace phase without a trace on this thread")
-    _state.met.append(name)
+    met = _state.met
+    met.names.append(name)
+    try:
+        return _record(tr, compiled, args, kwargs)
+    except BaseException as error:
+        if met.failure is None:
+            met.failure = error
+        raise
+
+
+def _record(tr: Any, compiled: Any, args: tuple, kwargs: dict) -> Any:
+    record = _compiles.get(compiled)
+    name = _display_name(compiled, record)
+
+    def decline(why: str) -> Any:
+        raise _host_trace().Declined(
+            f"host_trace: CuTe DSL kernel {name}: {why} (declined)"
+        )
+
+    module = _module_name(record)
+    if module.startswith(_NATIVE_MODULES):
+        decline(
+            f"a program of torch._native's override ({module}) reached the symbolic run; an "
+            "override is recorded as a closed region when it is on the list "
+            "(torch/cuda/_host_trace_native.py), never through its program"
+        )
     synth = _entries.get(compiled)
     if synth is None:
         decline(

@@ -31,28 +31,20 @@ C = torch._C
 
 
 def _assert_fused_rms_norm_route(case, fn, args):
-    # F.rms_norm's _fused_rms_norm follows the route eager takes (the core
-    # suite's test_unconverted_hosts_decline_by_name has the same shape): its
-    # own CUDA kernel declines by name where eager runs ATen (DECISIONS O40 /
-    # A190); where eager's route is torch._native's override (the vendored
-    # QuACK CuTe DSL rms norm) the program is recorded through the DSL-level
-    # hook when compiled in this process, and QuACK's on-disk cache serves a
-    # loaded module the hook cannot re-select, which declines by name
+    # F.rms_norm's _fused_rms_norm is a converted host, never decomposed
+    # (DECISIONS O40 / A190; the core suite's test_unconverted_hosts_decline_by_name
+    # has the same shape): traced as ATen's launches where eager runs ATen, and
+    # as a closed region where eager's route is torch._native's override (the
+    # vendored QuACK CuTe DSL rms norm: torch/cuda/_host_trace_native.py)
     from torch._native import registry
 
-    if any(n.active for n in registry._graphs.get(("_fused_rms_norm", "CUDA"), ())):
-        from torch._vendor.quack import cache
-
-        if not cache.CACHE_ENABLED:
-            case.assertEqual(ht.trace(fn, args).num_launches, 1)
-            return
-        message = (
-            "CuTe DSL program the recorder does not hook.*loaded from a compiled module"
-        )
-    else:
-        message = r"_fused_rms_norm\.default runs its own CUDA kernel"
-    with case.assertRaisesRegex(ht.Declined, message):
-        ht.trace(fn, args)
+    override = any(
+        n.active for n in registry._graphs.get(("_fused_rms_norm", "CUDA"), ())
+    )
+    tape = ht.trace(fn, args)
+    case.assertEqual(
+        (tape.num_launches == 0, tape.num_regions), (override, int(override))
+    )
 
 
 # a 0-dim CPU tensor operand (not a wrapped number): an implicit CPU scalar

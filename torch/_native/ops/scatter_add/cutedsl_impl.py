@@ -14,12 +14,14 @@ contiguous or row-strided), tried in order:
 
 Eligibility mirrors aten's ``fast_scatter_add_kernel_eligible``
 (IndexKernelUtils.h): we restride ``self`` so its scatter-axis stride
-is 0 and shape matches ``index``, then build a ``TensorIterator`` on
-``(self_restrided, src_restrided, index)``. TensorIterator's coalescing
-and stride-magnitude reordering produces a 2D iterator iff the layout
-is kernel-friendly; we then pattern-match the resulting iter strides
-to confirm slice/index-axis assignment. This delegates the layout
-analysis to ``TensorIterator`` rather than reimplementing it.
+is 0 and shape matches ``index``, then run TensorIterator's dimension
+reordering and coalescing on ``(self_restrided, src_restrided, index)``,
+reproduced here in Python (``_coalesce``, ``_fast_setup``) so that the
+same analysis runs on symbolic sizes and strides under a host trace,
+every comparison it makes a guard. The coalescing and stride-magnitude
+reordering produce a 2D iterator iff the layout is kernel-friendly; we
+then pattern-match the resulting strides to confirm slice/index-axis
+assignment.
 
 Anything else (non-2D-coalescing layout, dtype mismatch, deterministic
 mode) falls through to aten. Aten is competitive or better on those
@@ -34,7 +36,6 @@ intercept the in-place method.
 import functools
 
 import torch
-from torch._tensor_iterator import TensorIterator
 
 from ... import cutedsl_utils as cu
 from ...registry import _OpCondFn, _OpImplFn
@@ -101,13 +102,16 @@ def _base_cond_ok(*tensors: torch.Tensor) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# TI-driven layout analysis.
+# TensorIterator's layout analysis, in Python.
 #
 # Mirrors aten's pattern in ScatterGatherKernel.cu / IndexKernelUtils.h:
 # restride ``self`` so its scatter-axis stride is 0 and its shape matches
-# ``index``, then build a TensorIterator on the three. TensorIterator does
-# the broadcast / coalesce / dim reorder; we then pattern-match the post-
-# build iter strides to recognize the kernel's expected layout.
+# ``index``, then reorder and coalesce the three as TensorIterator does
+# (compute_fast_setup_type, reorder_dimensions, coalesce_dimensions for
+# equally shaped operands; TensorIterator.cpp); we then pattern-match the
+# post-coalesce strides to recognize the kernel's expected layout. In Python
+# so that the analysis runs on symbolic sizes and strides too (a host trace's
+# proxies), where each comparison is a guard on exactly the facts it read.
 # ---------------------------------------------------------------------------
 
 
@@ -115,16 +119,137 @@ def _normalize_dim(dim: int, ndim: int) -> int:
     return dim + ndim if dim < 0 else dim
 
 
+class _CoalescedIter:
+    """The post-coalesce geometry: ``shape``, per operand ``strides(i)`` in
+    bytes, ``ndim``, ``numel``."""
+
+    def __init__(self, shape: list, strides: list) -> None:
+        self.shape = shape
+        self._strides = strides
+
+    @property
+    def ndim(self) -> int:
+        return len(self.shape)
+
+    @property
+    def numel(self):  # type: ignore[no-untyped-def]
+        n = 1
+        for s in self.shape:
+            n = n * s
+        return n
+
+    def strides(self, operand: int) -> list:
+        return self._strides[operand]
+
+
+def _fast_setup(operands: list) -> bool:
+    # TensorIteratorBase::compute_fast_setup_type for equally shaped operands:
+    # every operand contiguous, or every one channels-last, or every one
+    # non-overlapping and dense with the same strides; the iteration is then
+    # one dimension of numel elements
+    if all(t.is_contiguous() for t in operands):
+        return True
+    if all(
+        t.dim() in (4, 5)
+        and t.is_contiguous(
+            memory_format=torch.channels_last
+            if t.dim() == 4
+            else torch.channels_last_3d
+        )
+        for t in operands
+    ):
+        return True
+    if all(torch.ops.aten.is_non_overlapping_and_dense(t) for t in operands):
+        first = list(operands[0].stride())
+        return all(list(t.stride()) == first for t in operands[1:])
+    return False
+
+
+def _coalesce(
+    shape: list, strides: list, itemsizes: list, fast: bool
+) -> _CoalescedIter:
+    # ``shape`` shared by every operand, ``strides[i]`` operand i's element
+    # strides, ``itemsizes[i]`` its element size; the operands in
+    # TensorIterator's order (outputs, then inputs). A size-1 dim keeps its
+    # stride (compute_strides on equal shapes)
+    ndim = len(shape)
+    shape = list(shape)
+    if fast:
+        n = 1
+        for s in shape:
+            n = n * s
+        return _CoalescedIter(
+            [n] if ndim else [], [[size] if ndim else [] for size in itemsizes]
+        )
+    bytes_ = [[st * size for st in strd] for strd, size in zip(strides, itemsizes)]
+
+    def should_swap(dim0: int, dim1: int) -> int:
+        # the first operand with both strides non-zero decides; equal strides
+        # fall to the sizes, else to the next operand
+        for op in bytes_:
+            stride0, stride1 = op[dim0], op[dim1]
+            if stride0 == 0 or stride1 == 0:
+                continue
+            if stride0 < stride1:
+                return -1
+            if stride0 > stride1:
+                return 1
+            if shape[dim0] > shape[dim1]:
+                return 1
+        return 0
+
+    perm = list(range(ndim - 1, -1, -1))
+    for i in range(1, ndim):
+        dim1 = i
+        for dim0 in range(i - 1, -1, -1):
+            comparison = should_swap(perm[dim0], perm[dim1])
+            if comparison > 0:
+                perm[dim0], perm[dim1] = perm[dim1], perm[dim0]
+                dim1 = dim0
+            elif comparison < 0:
+                break
+    shape = [shape[p] for p in perm]
+    bytes_ = [[op[p] for p in perm] for op in bytes_]
+    if ndim <= 1:
+        return _CoalescedIter(shape, bytes_)
+
+    def can_coalesce(dim0: int, dim1: int) -> bool:
+        shape0, shape1 = shape[dim0], shape[dim1]
+        if shape0 == 1 or shape1 == 1:
+            return True
+        return all(shape0 * op[dim0] == op[dim1] for op in bytes_)
+
+    prev = 0
+    for dim in range(1, ndim):
+        if can_coalesce(prev, dim):
+            if shape[prev] == 1:
+                for op in bytes_:
+                    op[prev] = op[dim]
+            shape[prev] = shape[prev] * shape[dim]
+        else:
+            prev += 1
+            if prev != dim:
+                for op in bytes_:
+                    op[prev] = op[dim]
+                shape[prev] = shape[dim]
+    return _CoalescedIter(shape[: prev + 1], [op[: prev + 1] for op in bytes_])
+
+
+# a host trace's decline raised by a proxy inside the analysis is not a
+# layout refusal: it propagates
+_HOST_TRACE_DECLINED = getattr(torch._C, "_HostTraceDeclined", ())
+
+
 def _scatter_add_eligibility(
     self: torch.Tensor, d: int, index: torch.Tensor, src: torch.Tensor
-) -> TensorIterator | None:
-    """Return the analysis TensorIterator if (self, d, index, src) fits the
+) -> _CoalescedIter | None:
+    """Return the coalesced geometry if (self, d, index, src) fits the
     kernel's expected layout, else ``None``. ``d`` is the already-normalized
     scatter axis.
 
     Mirrors aten's ``fast_scatter_add_kernel_eligible`` (IndexKernelUtils.h):
     restride ``self`` so its scatter-axis stride is 0 (shape = ``index.shape``),
-    let TensorIterator coalesce + reorder, then check that the result is
+    coalesce + reorder as TensorIterator does, then check that the result is
     a 2D iter where dim 0 is the contiguous slice axis and dim 1 is the
     scatter (index) axis.
     """
@@ -142,15 +267,16 @@ def _scatter_add_eligibility(
     try:
         self_r = self.as_strided(index.shape, self_strides)
         src_r = src.as_strided(index.shape, src.stride())
-        it = TensorIterator(
-            outputs=[self_r],
-            const_inputs=[src_r, index],
-            check_mem_overlap=False,
-            check_all_same_dtype=False,
-            resize_outputs=False,
-        )
-    except RuntimeError:
+    except RuntimeError as error:
+        if isinstance(error, _HOST_TRACE_DECLINED):
+            raise
         return None
+    it = _coalesce(
+        list(index.shape),
+        [self_strides, list(src.stride()), list(index.stride())],
+        [self.element_size(), src.element_size(), index.element_size()],
+        _fast_setup([self_r, src_r, index]),
+    )
 
     if it.ndim != 2:
         return None
@@ -258,7 +384,7 @@ def _prepare_kernel_inputs(
     d: int,
     index: torch.Tensor,
     src: torch.Tensor,
-    it: TensorIterator,
+    it: _CoalescedIter,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build (self_2d, index_1d, src_2d) for the kernel host functions.
 

@@ -1247,9 +1247,10 @@ class _RngSlot:
 
 @dataclass(frozen=True)
 class _Region:
-    """A closed library call on the tape (aten.mm / aten.addmm through cuBLAS): its
-    kernel nodes come from a template the shared runtime's registry serves per call.
-    `sources` are the operands' addresses (inputs then output), `metas` their (dtype,
+    """A closed library call on the tape (aten.mm / aten.addmm through cuBLAS; an op
+    served by a torch._native override, torch/cuda/_host_trace_native.py): its kernel
+    nodes come from a template the shared runtime's registry serves per call.
+    `sources` are the operands' addresses (inputs then outputs), `metas` their (dtype,
     sizes, strides); `site` is the registry site, `variant` the plan value that reads
     the predicate's selection back."""
 
@@ -1945,13 +1946,13 @@ def lower_tape(
     for r in getattr(tape, "regions", ()):
         # a closed region record the recorder did not write (no operands, no key
         # fields) is never omitted silently: it declines by name
-        if not all(hasattr(r, a) for a in ("inputs", "out", "seq", "name")):
+        if not all(hasattr(r, a) for a in ("inputs", "outputs", "seq", "name")):
             raise HostTraceLoweringDeclined(
                 f"host_trace lowering: unrecognized closed regions record {r!r}"
             )
         if selected_address is None:
             selected_address = torch._C._cuda_kernel_template_selected_at_address()
-        operands = [*r.inputs, r.out]
+        operands = [*r.inputs, *r.outputs]
         sources, metas, exprs, parts = [], [], [], []
         for o in operands:
             source, displacement = _pointer_parts(symbols, o.address)

@@ -295,6 +295,7 @@ class TopologyMiss(Miss):
 _TRACEABLE = {
     aten.native_layer_norm.default,
     aten.native_layer_norm_backward.default,
+    aten._fused_rms_norm.default,
     aten._flash_attention_forward.default,
     aten._flash_attention_backward.default,
     aten._scaled_dot_product_flash_attention.default,
@@ -497,7 +498,8 @@ def _native_override_takes(func: Any, args: tuple, kwargs: dict) -> bool:
     override's implementation), or an active override's condition holds for
     the call, the first-match rule of the router. Under the trace the
     condition runs on the traced tensors, so each comparison it makes is a
-    guard, as it is when the router evaluates it one key below."""
+    guard, as it is when the router evaluates it one key below (E40: the
+    conditions are symbolic-clean)."""
     if func.namespace == "_native":
         return True
     # a call an AOT kernel embedded in the ATen implementation serves: the
@@ -637,16 +639,22 @@ class _RegionOperand:
 @dataclass
 class _RegionRec:
     """A closed library call the host made (aten.mm / aten.addmm / aten.bmm
-    through cuBLAS): its operands and output as values, the op and its
-    scalars. The trace issues nothing for it; a replay learns its kernel
-    nodes from a harvested template (see _harvest)."""
+    through cuBLAS; an op eager serves through a torch._native override,
+    torch/cuda/_host_trace_native.py): its operands and outputs as values,
+    the op and its scalars. The trace issues nothing for it; a replay learns
+    its kernel nodes from a harvested template (see _harvest)."""
 
     seq: int
-    op: str  # "mm" | "addmm" | "bmm"
+    op: str  # "mm" | "addmm" | "bmm" | an override's op ("_fused_rms_norm")
     inputs: list[_RegionOperand]  # mm / bmm: (mat1, mat2); addmm: (bias, mat1, mat2)
-    out: _RegionOperand
-    scalars: tuple  # addmm: (beta, alpha)
+    # a GEMM's out; an override's returns in the order it allocates them
+    outputs: list[_RegionOperand]
+    scalars: tuple  # addmm: (beta, alpha); an override's non-tensor arguments
     name: str
+
+    @property
+    def out(self) -> _RegionOperand:
+        return self.outputs[0]
 
 
 @dataclass
@@ -671,6 +679,9 @@ class _GemmTemplate:
     # workspace, a contiguous copy of an operand): a replay gives the nodes
     # its arena's buffers instead
     scratch: list[int] = None  # type: ignore[assignment]
+    # the call's allocations in order as "out" (a return the tape allocates
+    # ahead of the region) or "scratch"; a GEMM's are all scratch
+    layout: tuple = ()
     kinds: tuple = ()
     uses_ws: bool = False  # a node holds the stream's workspace base
     # a key whose harvest refused (its kernels are not rebindable): the miss
@@ -846,7 +857,46 @@ def _closed_call_alt(op: str, scalars: tuple, tensors: list) -> None:
         )
 
 
+@dataclass(frozen=True)
+class _ClosedCall:
+    """How a closed region's call runs at the harvest: `run(op, scalars,
+    tensors)` makes it on the operands (a GEMM into its preallocated output; a
+    torch._native override's op, which allocates its outputs itself and
+    returns them), `alt` makes it through another binding path, and `outputs`
+    is how many trailing operands of the region are those returns (0: every
+    operand is handed in). Both are plain functions called from the capture's
+    lambda, one Python frame below the stack smear: the smear's reach past
+    the aten.<op>.out binding is marginal, and a partial or wrapper between
+    them puts a cutlass Params struct's padding beyond it."""
+
+    run: Any
+    alt: Any
+    # an int, or a function of the region's scalars
+    outputs: Any = 0
+    # the call's kernels are DSL programs whose parameter structs carry
+    # uninitialized padding (a 32-bit field ahead of a 64-bit one, inside one
+    # driver parameter, so no layout marks it and the stack smear does not
+    # reach it): a qword that differs between captures of the same operand
+    # set (the first, third and fourth) is no value of the call, kept as the
+    # template's own; one that differs only with the operands (the second)
+    # and is no pointer still misses (a descriptor)
+    padding: bool = False
+
+
+_closed_calls: dict[str, _ClosedCall] = {
+    op: _ClosedCall(_closed_call, _closed_call_alt) for op in ("mm", "addmm", "bmm")
+}
+
 _WINDOW = 1 << 21  # 2 MiB: the address bits varied between the two harvest sets
+
+
+def _operand_spans(metas: tuple) -> list[int]:
+    # per operand the bytes from its base to one past its last element
+    return [
+        (1 + sum((n - 1) * abs(st) for n, st in zip(sizes, strides)))
+        * torch.empty(0, dtype=dtype).element_size()
+        for dtype, sizes, strides in metas
+    ]
 
 
 def _harvest_operands(
@@ -862,11 +912,7 @@ def _harvest_operands(
     # a constant of the template. The buffer lives as long as its set: the
     # harvest's captures are the only readers, and a buffer kept for the
     # process held the largest set ever harvested (round 8, F4)
-    itemsizes = [torch.empty(0, dtype=dtype).element_size() for dtype, _s, _t in metas]
-    spans = [
-        (1 + sum((n - 1) * abs(st) for n, st in zip(sizes, strides))) * itemsize
-        for (_dtype, sizes, strides), itemsize in zip(metas, itemsizes)
-    ]
+    spans = _operand_spans(metas)
     windows = [(span + 2 * _WINDOW - 1) // _WINDOW for span in spans]
     need = (sum(windows) + 1) * _WINDOW
     buf = torch.empty(need, dtype=torch.uint8, device=dev)
@@ -947,6 +993,12 @@ def _harvest(key: tuple, spec: tuple, device: int) -> _GemmTemplate:
     are kept with their destination classified the same way."""
     global _gemm_harvests
     op, scalars, metas, aligns = spec
+    closed = _closed_calls[op]
+    # the operands the harvest hands in (all of a GEMM's; an override's
+    # inputs) and, behind them, the ones the call allocates and returns
+    n_out = closed.outputs(scalars) if callable(closed.outputs) else closed.outputs
+    handed = len(metas) - n_out
+    spans = _operand_spans(metas)
     C = torch._C
     streams = _harvest_streams.get(device)
     if streams is None:
@@ -956,13 +1008,19 @@ def _harvest(key: tuple, spec: tuple, device: int) -> _GemmTemplate:
         )
     stream, other = streams
     dev = torch.device("cuda", device)
+    # what the call returned in each capture (an override's outputs), kept
+    # until the harvest is over so that no later capture's pool hands their
+    # addresses out again
+    returned: list = []
+    run, alt = closed.run, closed.alt
     with torch.cuda.stream(stream):
-        first, spans = _harvest_operands(0, metas, aligns, dev)
-        second, _ = _harvest_operands(1, metas, aligns, dev)
+        first, _ = _harvest_operands(0, metas[:handed], aligns[:handed], dev)
+        second, _ = _harvest_operands(1, metas[:handed], aligns[:handed], dev)
         anchor = _harvest_anchors.get(device)
         if anchor is None:
             anchor = _harvest_anchors[device] = torch.empty(1, device=dev)
-        _closed_call(op, scalars, first)  # the library's workspace for this stream
+        # the library's workspace for this stream (an override's first compile)
+        run(op, scalars, first)
         stream.synchronize()
         t0 = time.perf_counter()
         try:
@@ -970,7 +1028,7 @@ def _harvest(key: tuple, spec: tuple, device: int) -> _GemmTemplate:
                 C,
                 stream,
                 device,
-                lambda: _closed_call(op, scalars, first),
+                lambda: returned.append(run(op, scalars, first)),
                 anchor,
                 0xA5,
             )
@@ -979,17 +1037,25 @@ def _harvest(key: tuple, spec: tuple, device: int) -> _GemmTemplate:
             # of host scalars for beta / alpha other than 1): a named miss
             raise Miss(f"closed {op} with scalars {scalars}: {e}") from None
         nodes_b, graph_b, log_b = _harvest_capture(
-            C, stream, device, lambda: _closed_call(op, scalars, second), anchor, 0xA5
+            C,
+            stream,
+            device,
+            lambda: returned.append(run(op, scalars, second)),
+            anchor,
+            0xA5,
         )
         ws_a = set(C._host_trace_blas_workspaces(stream.cuda_stream))
         harvest_us = (time.perf_counter() - t0) * 1e6 / 2
-        addrs_a = [t.data_ptr() for t in first]
-        addrs_b = [t.data_ptr() for t in second]
     with torch.cuda.stream(other):
-        _closed_call(op, scalars, first)  # this stream's workspace
+        run(op, scalars, first)  # this stream's workspace
         other.synchronize()
         nodes_c, graph_c, log_c = _harvest_capture(
-            C, other, device, lambda: _closed_call(op, scalars, first), anchor, 0xA5
+            C,
+            other,
+            device,
+            lambda: returned.append(run(op, scalars, first)),
+            anchor,
+            0xA5,
         )
         ws_c = set(C._host_trace_blas_workspaces(other.cuda_stream))
     with torch.cuda.stream(stream):
@@ -997,7 +1063,7 @@ def _harvest(key: tuple, spec: tuple, device: int) -> _GemmTemplate:
             C,
             stream,
             device,
-            lambda: _closed_call_alt(op, scalars, first),
+            lambda: returned.append(alt(op, scalars, first)),
             anchor,
             0x5A,
         )
@@ -1005,6 +1071,43 @@ def _harvest(key: tuple, spec: tuple, device: int) -> _GemmTemplate:
     del graph_b, graph_c, graph_d
     stack, heaps = _host_mappings()
     _gemm_harvests += 1
+    # per capture every operand's address: the handed set's (the second set in
+    # the second capture, the first in the others), then the call's returns,
+    # each an allocation of the call in the order returned (what the tape
+    # allocates ahead of the region); the other allocations are its scratch,
+    # and the layout of the two among the log is the template's
+    logs = [log_a, log_b, log_c, log_d]
+    addresses = []
+    layout: tuple = ()
+    for x, tensors in enumerate((first, second, first, first)):
+        addrs = [t.data_ptr() for t in tensors]
+        if n_out:
+            outs = returned[x]
+            outs = tuple(outs) if isinstance(outs, (list, tuple)) else (outs,)
+            outs = tuple(t for t in outs if t is not None)
+            bases = [a for a, _n in logs[x]]
+            positions = [
+                bases.index(t.data_ptr()) if t.data_ptr() in bases else -1 for t in outs
+            ]
+            if len(outs) != n_out or positions != sorted(
+                {p for p in positions if p >= 0}
+            ):
+                raise Miss(
+                    f"closed {op}: the call's returns are not distinct allocations of the call in order (returned {[hex(t.data_ptr()) for t in outs]}, allocated {[hex(a) for a in bases]}): not rebindable"
+                )
+            found = tuple(
+                "out" if p in positions else "scratch" for p in range(len(bases))
+            )
+            if x == 0:
+                layout = found
+            elif found != layout:
+                raise Miss(
+                    f"closed {op}: the call's allocations differ between captures ({layout} vs {found})"
+                )
+            addrs += [bases[p] for p in positions]
+            logs[x] = [e for p, e in enumerate(logs[x]) if p not in positions]
+        addresses.append(addrs)
+    log_a, log_b, log_c, log_d = logs
     kinds = tuple(n["kind"] for n in nodes_a)
     for others in (nodes_b, nodes_c, nodes_d):
         if tuple(n["kind"] for n in others) != kinds:
@@ -1060,14 +1163,18 @@ def _harvest(key: tuple, spec: tuple, device: int) -> _GemmTemplate:
                     return ("scratch", j, delta)
                 return False
         if qa != qb:
-            # moved with the operands: an operand address plus a constant
-            # (a tile pointer, a descriptor's base)
+            # moved with the operands: one operand's address plus a constant
+            # (a tile pointer, a descriptor's base) in every capture
             roles = [
-                (i, qa - x)
-                for i, (x, y) in enumerate(zip(addrs_a, addrs_b))
-                if 0 <= qa - x < spans[i] and qb - y == qa - x
+                (i, qa - addresses[0][i])
+                for i in range(len(spans))
+                if 0 <= qa - addresses[0][i] < spans[i]
+                and all(
+                    q - addresses[x][i] == qa - addresses[0][i]
+                    for x, q in ((1, qb), (2, qc), (3, qd))
+                )
             ]
-            if len(roles) == 1 and qa == qc:
+            if len(roles) == 1:
                 return ("op", *roles[0])
             return False
         if qa != qc:
@@ -1130,6 +1237,12 @@ def _harvest(key: tuple, spec: tuple, device: int) -> _GemmTemplate:
         ws_values: set = set()
         covered = bytearray(n)
 
+        # the bytes inside the driver's parameters; the rest is the struct's
+        # padding between them, whatever the launch left there
+        inside = bytearray(n)
+        for start, size in a["layout"]:
+            inside[start : start + size] = b"\x01" * size
+
         def q(img: bytes, off: int) -> int:
             return int.from_bytes(img[off : off + 8], "little")
 
@@ -1150,10 +1263,46 @@ def _harvest(key: tuple, spec: tuple, device: int) -> _GemmTemplate:
                     q(img_d, off),
                 )
                 role = classify(qa, qb, qc, qd)
-                if role is False and qa == qb == qd and qa != qc:
+                if role is False and qa == qb == qd and qa != qc and not closed.padding:
                     raise Miss(
                         f"closed {op}: {a['name']} holds a stream-dependent pointer at byte {off} ({qa:#x} on the harvest stream, {qc:#x} on the other) that is not the stream's registered cuBLAS workspace ({sorted(map(hex, ws_a))} / {sorted(map(hex, ws_c))}): not rebindable"
                     )
+                if (
+                    role is False
+                    and closed.padding
+                    and all(
+                        img[off : off + 4] == img_a[off : off + 4]
+                        for img in (img_b, img_c, img_d)
+                    )
+                ):
+                    # the low half a constant, the high half moving: the
+                    # padding behind a 32-bit field (an address-derived value
+                    # cannot look so: the second operand set flips the address
+                    # bits below the 2 MiB window and lives in another buffer,
+                    # so its low 32 bits differ)
+                    covered[off : off + 8] = b"\x01" * 8
+                    host_slots.append((off, "dead"))
+                    continue
+                if role is None and closed.padding:
+                    # a constant of the four captures that is the low half of
+                    # an address in this thread's stack (an ATen kernel's
+                    # uninitialized functor bytes, the same at every capture
+                    # of one call depth, another at the build's): host state
+                    half = next(
+                        (
+                            h
+                            for h in (0, 4)
+                            if _stack_low32(
+                                int.from_bytes(img_a[off + h : off + h + 4], "little"),
+                                stack,
+                            )
+                        ),
+                        None,
+                    )
+                    if half is not None:
+                        covered[off : off + 8] = b"\x01" * 8
+                        host_slots.append((off, f"stack32:{half}"))
+                        continue
                 if not role:
                     continue
                 covered[off : off + 8] = b"\x01" * 8
@@ -1171,6 +1320,8 @@ def _harvest(key: tuple, spec: tuple, device: int) -> _GemmTemplate:
                     cls = _host_slot_class(
                         off, (img_a, img_b, img_c, img_d), stack, heaps
                     )
+                    if cls is None and closed.padding and (qa != qc or qa != qd):
+                        cls = "dead"
                     if cls is None:
                         seen = " / ".join(
                             img[off : off + 8].hex()
@@ -1190,13 +1341,21 @@ def _harvest(key: tuple, spec: tuple, device: int) -> _GemmTemplate:
         for off in range(n):
             if covered[off]:
                 continue
+            if not inside[off]:
+                lo = off - off % 8
+                host_slots.append((lo, "dead"))
+                covered[lo : lo + 8] = b"\x01" * 8
+                continue
             if (
                 img_a[off] != img_b[off]
                 or img_a[off] != img_c[off]
                 or img_a[off] != img_d[off]
             ):
                 lo = off - off % 8
-                if dead_ok:
+                if dead_ok or (
+                    closed.padding
+                    and (img_a[off] != img_c[off] or img_a[off] != img_d[off])
+                ):
                     host_slots.append((lo, "dead"))
                     covered[lo : lo + 8] = b"\x01" * 8
                     continue
@@ -1236,8 +1395,11 @@ def _harvest(key: tuple, spec: tuple, device: int) -> _GemmTemplate:
         key,
         nodes,
         harvest_us,
-        graph=graph,
+        # an override's kernel ties nothing to the graph, whose pool would
+        # hold the call's outputs for the template's lifetime
+        graph=None if n_out else graph,
         scratch=scratch,
+        layout=layout if n_out else ("scratch",) * len(scratch),
         kinds=kinds,
         uses_ws=uses_ws,
     )
@@ -2052,6 +2214,9 @@ class _Trace:
         # the CuTe DSL invocations of this trace (torch/cuda/_host_trace_cute.py),
         # set by its tracing scope in _trace_once
         self.cute: Any = None
+        # the mode of this trace (_TraceMode sets it): what a closed region's
+        # description traces of its own runs under it
+        self.mode: Any = None
         self.tensors: list = []
         self.inputs: list[_InputRec] = []
         self.allocs: list[_AllocRec] = []
@@ -2342,26 +2507,42 @@ class _Trace:
             (out_shape,),
             {"dtype": a.dtype, "device": self.device},
         )
+        names = ["bias", "mat1", "mat2"] if bias is not None else ["mat1", "mat2"]
+        self.region(op, list(zip(names, operands)), [("out", out)], scalars)
+        return out
 
+    def region(
+        self, op: str, inputs: list, outputs: list, scalars: tuple
+    ) -> _RegionRec:
+        # one closed region at this point of the call, over (name, traced
+        # tensor) operands
         def desc(name: str, t: _TracedTensor) -> _RegionOperand:
             address = t._root.sym + t._sym_offset * t.element_size()
             return _RegionOperand(
                 name, t._root, address, list(t.shape), list(t._sym_strides), t.dtype
             )
 
-        names = ["bias", "mat1", "mat2"] if bias is not None else ["mat1", "mat2"]
         k = len(self.regions)
-        self.regions.append(
-            _RegionRec(
-                self.rec.next_seq(),
-                op,
-                [desc(nm, t) for nm, t in zip(names, operands)],
-                desc("out", out),
-                scalars,
-                f"region{k}",
-            )
+        rec = _RegionRec(
+            self.rec.next_seq(),
+            op,
+            [desc(nm, t) for nm, t in inputs],
+            [desc(nm, t) for nm, t in outputs],
+            scalars,
+            f"region{k}",
         )
-        return out
+        self.regions.append(rec)
+        return rec
+
+    def native_region(self, func: Any, args: tuple, kwargs: dict, entry: Any) -> Any:
+        """An op eager serves through a torch._native override on the closed-
+        region list (torch/cuda/_host_trace_native.py): the call's operands
+        and the outputs the override allocates, as values; nothing issued.
+        The harvest runs the op through the router at the region's key."""
+        inputs, scalars, outputs, result = entry.describe(self, func, args, kwargs)
+        self.region(entry.op, inputs, outputs, scalars)
+        _host_trace_cute_dsl.claim(entry.programs)
+        return result
 
     def reshape_view(self, src: _TracedTensor, shape: list) -> Any:
         # at::native::view: infer_size on the requested shape (one -1 at
@@ -2732,6 +2913,25 @@ class _HostTracePythonPrinter(PythonPrinter):
         return f"_round_float32({self._print(expr.args[0])})"
 
 
+# c10::SymInt::MAX_UNREPRESENTABLE_INT: an int at or below it is the pointer
+# bits of a heap-allocated SymInt (bit 63 set, bit 62 clear)
+_SYMINT_POINTER_BITS = -(1 << 62) - 1
+
+
+def _not_pointer_bits(v: Any) -> None:
+    # an ATen composite that reinterprets a SymIntArrayRef as ints
+    # (layer_norm.cpp rms_norm_symint hands torch.rms_norm's normalized_shape
+    # to _fused_rms_norm so) delivers a traced size here as its node's pointer
+    # bits: nothing the trace can pin
+    if type(v) is int and v <= _SYMINT_POINTER_BITS:
+        raise Declined(
+            "host_trace: an int argument of the call is a traced size's pointer bits (an "
+            "ATen composite passed a SymInt unchecked to an int[] argument: torch.rms_norm's "
+            "normalized_shape written from a traced shape reaches _fused_rms_norm so); write "
+            "it as ints (declined)"
+        )
+
+
 def _concrete_ints(x: Any) -> Any:
     # int and int-list arguments of the op under trace (a normalized_shape
     # written from the input's shape): the CUDA kernels are registered on the
@@ -2741,8 +2941,13 @@ def _concrete_ints(x: Any) -> Any:
     # others by name).
     if isinstance(x, torch.SymInt):
         return int(x)
-    if isinstance(x, (list, tuple)) and any(isinstance(e, torch.SymInt) for e in x):
-        return type(x)(int(e) if isinstance(e, torch.SymInt) else e for e in x)
+    if isinstance(x, (list, tuple)):
+        if any(isinstance(e, torch.SymInt) for e in x):
+            x = type(x)(int(e) if isinstance(e, torch.SymInt) else e for e in x)
+        for e in x:
+            _not_pointer_bits(e)
+        return x
+    _not_pointer_bits(x)
     return x
 
 
@@ -2757,6 +2962,7 @@ class _TraceMode(TorchDispatchMode):
     def __init__(self, tr: _Trace) -> None:
         super().__init__()
         self.trace = tr
+        tr.mode = self
         self.depth = 0
         self.decomposing: list = []  # composite ops whose decomposition or body runs
         self.entering: list = []  # ops whose traced entry is running
@@ -2803,9 +3009,18 @@ class _TraceMode(TorchDispatchMode):
         # a call eager serves through a torch._native override (the K = 1 bmm:
         # a Triton kernel, not cuBLAS) takes eager's route: the override's
         # Python runs under the mode, its allocations traced, its Triton
-        # launch recorded by the hook (torch/cuda/_host_trace_triton.py)
+        # launch recorded by the hook (torch/cuda/_host_trace_triton.py). An
+        # override on the closed-region list (the CuTe ones) is a region
+        # instead: its non-tensor arguments are pinned ahead of its condition
+        # (the region's scalars)
+        entry = _host_trace_native.REGIONS.get(func)
+        if entry is not None:
+            args = tuple(_concrete_ints(a) for a in args)
+            kwargs = {k: _concrete_ints(v) for k, v in kwargs.items()}
         with self:
             native = _native_override_takes(func, args, kwargs)
+        if entry is not None and native:
+            return self.trace.native_region(func, args, kwargs, entry)
         # a closed library call (cuBLAS): recorded as a region, never traced into
         if func in _CLOSED_OPS and not native:
             return self.trace.closed_region(func, args, kwargs)
@@ -2956,12 +3171,13 @@ class Tape:
         # replay's graph the tape describes only as a shape key, a harvested
         # template per concrete key
         self.regions = tr.regions
-        # a region's out operand is written by the library call: its root
-        # joins the written roots (an allocation: the out= and in-place
-        # variants decline, so no input is written through a region)
+        # a region's outputs are written by the call: their roots join the
+        # written roots (allocations: the out= and in-place variants decline,
+        # so no input is written through a region)
         for r in self.regions:
-            if r.out.root.name not in self.written_roots:
-                self.written_roots.append(r.out.root.name)
+            for o in r.outputs:
+                if o.root.name not in self.written_roots:
+                    self.written_roots.append(o.root.name)
         self.outputs = outputs
         # the argument positions among the written roots, in the call's index
         # space: what a binding reads through the mutable accessor first
@@ -3034,7 +3250,7 @@ class Tape:
             m["src"], m["dst"] = sub(m["src"]), sub(m["dst"])
             m["bytes"] = sub(m["bytes"])
         for r in self.regions:
-            for op in (*r.inputs, r.out):
+            for op in (*r.inputs, *r.outputs):
                 op.address = sub(op.address)
                 op.sizes, op.strides = subs(op.sizes), subs(op.strides)
         self.rng_increment = sub(self.rng_increment)
@@ -3223,13 +3439,17 @@ class Tape:
                         }
                         for o in r.inputs
                     ],
-                    "out": {
-                        "root": e(r.out.root.sym),
-                        "address": e(r.out.address),
-                        "sizes": [e(s) for s in r.out.sizes],
-                        "strides": [e(s) for s in r.out.strides],
-                        "dtype": str(r.out.dtype),
-                    },
+                    "outputs": [
+                        {
+                            "name": o.name,
+                            "root": e(o.root.sym),
+                            "address": e(o.address),
+                            "sizes": [e(s) for s in o.sizes],
+                            "strides": [e(s) for s in o.strides],
+                            "dtype": str(o.dtype),
+                        }
+                        for o in r.outputs
+                    ],
                 }
                 for r in self.regions
             ],
@@ -4045,9 +4265,14 @@ class Entry:
 from torch.cuda import (  # noqa: F401
     _host_trace_cute,
     _host_trace_cute_dsl,
+    _host_trace_native,
     _host_trace_ti,
     _host_trace_triton,
 )
+
+
+# the calls of torch._native's overrides on the closed-region list
+_closed_calls.update(_host_trace_native.closed_calls())
 
 
 if torch.distributed.is_available():

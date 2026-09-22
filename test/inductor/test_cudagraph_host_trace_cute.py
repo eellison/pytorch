@@ -363,7 +363,8 @@ class TestHostTraceCuTe(TestCase):
         # the DSL launched outside a registered entry: its from_dlpack reads a traced tensor
         self.assertEqual(plain_host(x), x * 2.0 + 3, atol=0, rtol=0)
         with self.assertRaisesRegex(
-            self.ht.Declined, "CuTe DSL program the recorder does not hook.*not recorded on the tape"
+            self.ht.Declined,
+            "CuTe DSL program the recorder does not hook.*not recorded on the tape",
         ):
             self.ht.trace(plain_host, (x,))
         # an entry that has not run once (a trace without a warm-up on a fresh entry)
@@ -431,12 +432,6 @@ class TestHostTraceCuTe(TestCase):
 
         view = make_cute_trace_view(CUTE, lambda event: None, FakeTensorMode())
         view.check()
-        # the interim replay declines a tape with a CuTe record by name
-        with self.assertRaisesRegex(
-            self.ht.Declined,
-            "interim replay does not serve a tape with a CuTe DSL launch",
-        ):
-            self.ht.Variant(tape, cute_host, (x,), warm_up=False)
 
     def test_one_tape_every_launch_kind_replays_as_one_graph(self):
         # ATen converted hosts, a cuBLAS region, a user CUDA C++ kernel, the CuTe kernel and
@@ -614,9 +609,44 @@ def constant_host(x):
 
 
 def rms_norm_host(x, w):
-    # the normalized shape as a module holds it (ints); one written from a traced
-    # shape declines by name (the override's condition sees the router's copy)
     return torch.nn.functional.rms_norm(x, (2048,), w, eps=1e-6)
+
+
+def rms_norm_sized_host(x, w):
+    # a normalized shape written from a traced size: ATen's rms_norm composite
+    # reinterprets it as ints unchecked (layer_norm.cpp rms_norm_symint), so
+    # _fused_rms_norm receives the size's pointer bits
+    return torch.nn.functional.rms_norm(x, (w.shape[0],), w, eps=1e-6)
+
+
+def rms_norm_half_host(x, w):
+    # a non-contiguous input: the override copies it before its kernel
+    return torch.nn.functional.rms_norm(x[:, :1024], (1024,), w[:1024], eps=1e-6)
+
+
+def rms_norm_backward_host(g, x, rstd, w):
+    return torch.ops.aten._fused_rms_norm_backward(g, x, [2048], rstd, w, [True, True])
+
+
+def topk_host(x):
+    # fp32, k = 16, N = 1024: torch._native's register kernel on this box
+    return torch.topk(x, 16)
+
+
+def scatter_host(dst, idx, src):
+    return dst.scatter_add(0, idx, src)
+
+
+def scatter_inplace_host(dst, idx, src):
+    return dst.scatter_add_(0, idx, src)
+
+
+def scatter_args(rows):
+    # distinct target rows: two sources into one row would add in atomic order,
+    # which is not reproducible in eager either
+    dst = torch.zeros(256, 1024, device="cuda")
+    idx = torch.randperm(256, device="cuda")[:rows].view(rows, 1).expand(rows, 1024)
+    return dst, idx, torch.randn(rows, 1024, device="cuda")
 
 
 class RMSBlock(torch.nn.Module):
@@ -731,38 +761,108 @@ class TestHostTraceCuTeDSL(TestCase):
         cache.CACHE_ENABLED = False
         self.addCleanup(setattr, cache, "CACHE_ENABLED", previous)
 
-    def test_f_rms_norm_through_the_quack_override(self):
-        self._quack_in_process()
+    def _eager_nodes(self, fn, args):
+        # the kernel nodes of eager's own capture of the call
+        g = torch.cuda.CUDAGraph(keep_graph=True)
+        with torch.cuda.graph(g):
+            fn(*args)
+        return torch._C._host_trace_harvest_nodes(g.raw_cuda_graph())
+
+    def _templates(self, op):
+        return [t for t in self.ht._gemm_templates.values() if t.key[2] == op]
+
+    def test_f_rms_norm_is_a_closed_region_of_eager_s_kernel(self):
+        # eager's route on this box is torch._native's QuACK override: the call is a
+        # closed region whose template is eager's own kernel node (the harvest runs the
+        # op through the router at the region's key); a shape change is a harvest of the
+        # new key applied in place, no re-trace
         x = torch.randn(4, 2048, device="cuda", dtype=torch.bfloat16)
         w = torch.randn(2048, device="cuda", dtype=torch.bfloat16)
+        (eager,) = self._eager_nodes(rms_norm_host, (x, w))
+        self.assertIn("quackrmsnormRMSNorm", eager["name"])
         replay = self._replay(rms_norm_host, (x, w))
         tape = replay.tape
-        launches = [L for L in tape.launches if L.get("cute")]
-        self.assertEqual(len(launches), 1)
-        (launch,) = launches
-        self.assertIn("rmsnormRMSNorm", launch["kernel"])
-        record = launch["cute"]
-        self.assertEqual(record.invocation.read_only, frozenset({"mX", "mW"}))
-        access = {
-            p["name"]: p["access"] for p in launch["params"] if p["kind"] == "ptr"
-        }
+        self.assertEqual((tape.num_launches, tape.num_regions), (0, 1))
+        (region,) = tape.regions
+        self.assertEqual(region.op, "_fused_rms_norm")
         self.assertEqual(
-            access,
-            {
-                "mX.data_ptr": "r",
-                "mW.data_ptr": "r",
-                "mO.data_ptr": "rw",
-                "mRstd.data_ptr": "rw",
-            },
+            [o.name for o in (*region.inputs, *region.outputs)],
+            ["input", "weight", "out", "rstd"],
         )
+        self.assertEqual(region.scalars, ((2048,), 1e-6))
+        self.assertEqual(sorted(tape.written_roots), ["a0", "a1"])
         for rows in (4, 7, 64):
             other = torch.randn(rows, 2048, device="cuda", dtype=torch.bfloat16)
             self.assertEqual(replay(other, w), rms_norm_host(other, w), atol=0, rtol=0)
-        self.assertEqual((replay.misses, len(replay.variants)), (0, 1))
+        self.assertEqual(
+            (replay.traces, len(replay.variants), replay.declines, replay.ordinary),
+            (1, 1, [], 0),
+        )
+        stats = replay.region_stats()
+        self.assertEqual(stats["sites"][0]["kinds"], ["kernel"])
+        self.assertEqual(stats["refused"], {})
+        templates = self._templates("_fused_rms_norm")
+        rows_seen = {t.key[4][0][1][0] for t in templates}
+        self.assertTrue({4, 7, 64} <= rows_seen, rows_seen)
+        for t in templates:
+            # eager's function object, four pointer slots, no scratch; the one
+            # host slot is the out struct's padding behind its 32-bit row count
+            self.assertEqual([n["func"] for n in t.nodes], [eager["func"]])
+            self.assertEqual(len(t.nodes[0]["slots"]), 4)
+            self.assertEqual(t.scratch, [])
+            self.assertLessEqual({cls for _, cls in t.nodes[0]["host_slots"]}, {"dead"})
+
+    def test_a_normalized_shape_from_a_traced_size_declines_by_name(self):
+        x = torch.randn(4, 2048, device="cuda", dtype=torch.bfloat16)
+        w = torch.randn(2048, device="cuda", dtype=torch.bfloat16)
+        with self.assertRaisesRegex(
+            self.ht.Declined, "a traced size's pointer bits.*write it as ints"
+        ):
+            self.ht.trace(rms_norm_sized_host, (x, w))
+
+    def test_an_input_the_override_copies_first_declines_by_name(self):
+        x = torch.randn(4, 2048, device="cuda", dtype=torch.bfloat16)
+        w = torch.randn(2048, device="cuda", dtype=torch.bfloat16)
+        with self.assertRaisesRegex(
+            self.ht.Declined, "copies the non-contiguous input before its kernel"
+        ):
+            self.ht.trace(rms_norm_half_host, (x, w))
+
+    def test_with_the_override_off_rms_norm_is_aten_s_launches(self):
+        # eager's route with torch._native's override deregistered is ATen's converted
+        # host: launches on the tape, no region, a shape change a rebind
+        from torch._native.registry import (
+            deregister_op_overrides,
+            reenable_op_overrides,
+        )
+
+        x = torch.randn(4, 2048, device="cuda", dtype=torch.bfloat16)
+        w = torch.randn(2048, device="cuda", dtype=torch.bfloat16)
+        deregister_op_overrides(disable_op_symbols="_fused_rms_norm")
+        try:
+            names = [n["name"] for n in self._eager_nodes(rms_norm_host, (x, w))]
+            self.assertFalse(any("quack" in n for n in names), names)
+            replay = self._replay(rms_norm_host, (x, w))
+            tape = replay.tape
+            self.assertEqual(tape.num_regions, 0)
+            self.assertEqual(tape.num_launches, len(names))
+            for rows in (4, 7):
+                other = torch.randn(rows, 2048, device="cuda", dtype=torch.bfloat16)
+                self.assertEqual(
+                    replay(other, w), rms_norm_host(other, w), atol=0, rtol=0
+                )
+            self.assertEqual(
+                (replay.traces, len(replay.variants), replay.declines), (1, 1, [])
+            )
+            replay.close()
+        finally:
+            reenable_op_overrides(enable_op_symbols="_fused_rms_norm")
 
     def test_a_block_with_rms_norm_is_one_tape(self):
-        # the parameters as inputs (functional_call), as the recorder's regions
-        # take them; the RMSNorm weight is then a traced tensor of the CuTe launch
+        # the parameters as inputs (functional_call), as the recorder's regions take
+        # them: the RMSNorm a region of eager's CuTe kernel, the linear a cuBLAS
+        # region, the rest converted hosts, one tape. QuACK compiled in-process, so
+        # that the warm-up observes the override's program and the region claims it
         self._quack_in_process()
         block = RMSBlock(2048).cuda().to(torch.bfloat16)
         names, params = zip(*block.named_parameters())
@@ -775,13 +875,17 @@ class TestHostTraceCuTeDSL(TestCase):
         with torch.no_grad():
             replay = self._replay(step, (x, *params))
             tape = replay.tape
-            self.assertEqual(sum(1 for L in tape.launches if L.get("cute")), 1)
-            self.assertEqual(tape.num_regions, 1)
+            self.assertEqual([r.op for r in tape.regions], ["_fused_rms_norm", "mm"])
+            self.assertEqual(sum(1 for L in tape.launches if L.get("cute")), 0)
+            self.assertEqual(tape.num_launches, 2)
             for rows in (4, 9):
                 other = torch.randn(rows, 2048, device="cuda", dtype=torch.bfloat16)
                 self.assertEqual(
                     replay(other, *params), step(other, *params), atol=0, rtol=0
                 )
+            self.assertEqual(
+                (replay.traces, len(replay.variants), replay.declines), (1, 1, [])
+            )
 
     def test_a_captured_tensor_declines_by_name(self):
         # a tensor the trace does not own (a parameter the host's closure holds): the
@@ -800,21 +904,189 @@ class TestHostTraceCuTeDSL(TestCase):
         ):
             self.ht.trace(host, (x,))
 
-    def test_the_scatter_add_override_declines_by_name(self):
-        self._quack_in_process()
-        dst = torch.zeros(256, 1024, device="cuda")
-        idx = torch.randint(0, 256, (128, 1), device="cuda").expand(128, 1024)
-        src = torch.randn(128, 1024, device="cuda")
+    def test_a_host_that_catches_the_decline_does_not_publish_without_the_launch(self):
+        # the warm-up ran the program as written; under the trace its recording
+        # declines after its observation is consumed (the captured tensor above),
+        # and a host that catches the RuntimeError and falls back must not yield
+        # a tape without the launch (the runtime team's R36 Triton finding)
+        weight = torch.randn(4, 128, device="cuda")
 
-        def scatter(dst, idx, src):
-            return dst.scatter_add(0, idx, src)
+        def host(x):
+            y = torch.empty_like(x)
+            stream = driver.CUstream(torch.cuda.current_stream().cuda_stream)
+            try:
+                COMPILED(marked(weight, read_only=True), marked(y), x.shape[0], stream)
+            except RuntimeError:
+                return x * 2
+            return y + x
 
-        self.assertFalse(torch.are_deterministic_algorithms_enabled())
+        x = torch.randn(4, 128, device="cuda")
         with self.assertRaisesRegex(
             self.ht.Declined,
-            "the warm-up called the CuTe DSL program .*_launch here.*TensorIterator",
+            "recording failed under the trace.*a tensor the trace does not own",
         ):
-            self.ht.trace(scatter, (dst, idx, src))
+            self.ht.trace(host, (x,))
+        self.assertFalse(torch._C._host_trace_tracing())
+
+    def test_topk_is_a_region_of_eager_s_kernel(self):
+        # eager's route is torch._native's register kernel; the override's condition
+        # runs on the traced tensors (N against its kernel table and the row count
+        # against the SM count are guards): another row count is a harvest of its
+        # key, no re-trace
+        x = torch.randn(256, 1024, device="cuda")
+        (eager,) = self._eager_nodes(topk_host, (x,))
+        self.assertIn("nativeopstopkcutedsl_kernels", eager["name"])
+        replay = self._replay(topk_host, (x,))
+        tape = replay.tape
+        self.assertEqual((tape.num_launches, tape.num_regions), (0, 1))
+        (region,) = tape.regions
+        self.assertEqual((region.op, region.scalars), ("topk", (16, -1, True, True)))
+        self.assertEqual(
+            [o.name for o in (*region.inputs, *region.outputs)],
+            ["self", "values", "indices"],
+        )
+        for rows in (256, 300):
+            other = torch.randn(rows, 1024, device="cuda")
+            for got, expected in zip(replay(other), topk_host(other)):
+                self.assertEqual(got, expected, atol=0, rtol=0)
+        self.assertEqual(
+            (replay.traces, len(replay.variants), replay.declines), (1, 1, [])
+        )
+        for t in self._templates("topk"):
+            self.assertEqual([n["func"] for n in t.nodes], [eager["func"]])
+
+    def test_a_topk_eager_serves_from_the_aot_kernel_declines_by_name(self):
+        # k = 64 at this N is covered by the AOT-embedded kernel (the router's ATen
+        # fallback), not the Python override
+        x = torch.randn(256, 1024, device="cuda")
+        with self.assertRaisesRegex(self.ht.Declined, "AOT-embedded kernel"):
+            self.ht.trace(lambda x: torch.topk(x, 64), (x,))
+
+    def test_scatter_add_is_the_tape_s_copy_and_a_region_of_eager_s_kernel(self):
+        # eager's functional override clones self (a device memcpy) and scatters into
+        # the clone in place: the tape records the copy as its own and the region's
+        # template is the in-place override's kernel, eager's own function. The
+        # condition (TensorIterator's analysis, in Python) runs on the traced tensors
+        self.assertFalse(torch.are_deterministic_algorithms_enabled())
+        args = scatter_args(128)
+        (eager,) = self._eager_nodes(scatter_inplace_host, (args[0].clone(), *args[1:]))
+        self.assertIn("kernel_cutlass", eager["name"])
+        replay = self._replay(scatter_host, args)
+        tape = replay.tape
+        self.assertEqual(
+            (tape.num_launches, len(tape.memcpys), tape.num_regions), (0, 1, 1)
+        )
+        self.assertEqual(tape.memcpys[0]["kind"], "d2d")
+        (region,) = tape.regions
+        self.assertEqual((region.op, region.scalars), ("scatter_add_", (0,)))
+        self.assertEqual(
+            [o.name for o in (*region.inputs, *region.outputs)],
+            ["index", "src", "self"],
+        )
+        self.assertEqual(tape.written_inputs, ())
+        self.assertEqual(replay(*args), scatter_host(*args), atol=0, rtol=0)
+        other = scatter_args(64)
+        self.assertEqual(replay(*other), scatter_host(*other), atol=0, rtol=0)
+        self.assertEqual(
+            (replay.traces, len(replay.variants), replay.declines), (1, 1, [])
+        )
+        for t in self._templates("scatter_add_"):
+            self.assertEqual([n["func"] for n in t.nodes], [eager["func"]])
+
+    def test_scatter_add_s_decision_is_its_condition_s_comparisons(self):
+        # E40: the condition runs on the traced tensors, each comparison it makes a
+        # guard (the coalescing's relations, the alignment reads), no size pinned; a
+        # layout that flips its decision (a dense index) misses at replay into
+        # eager's ATen route, whose scatter_add is not a traced host: served ordinarily
+        args = scatter_args(128)
+        tape = self.ht.trace(scatter_host, args)
+        guards = [str(g) for g in tape.guards]
+        self.assertTrue(any("Mod(" in g for g in guards), guards)
+        self.assertFalse(
+            any(g == f"Eq({s}, 128)" for g in guards for s in ("s26", "s75")), guards
+        )
+        replay = self._replay(scatter_host, args)
+        dst, _, src = args
+        dense = (
+            torch.randperm(256, device="cuda")[:128]
+            .view(128, 1)
+            .expand(128, 1024)
+            .contiguous()
+        )
+        names = [
+            n["name"]
+            for n in self._eager_nodes(scatter_inplace_host, (dst.clone(), dense, src))
+        ]
+        self.assertFalse(any("cutlass" in n for n in names), names)
+        self.assertEqual(
+            replay(dst, dense, src), scatter_host(dst, dense, src), atol=0, rtol=0
+        )
+        self.assertEqual(
+            (replay.misses, replay.traces, len(replay.declines)), (1, 2, 1)
+        )
+        self.assertIn("scatter_add", replay.declines[0])
+
+    def test_scatter_add__writes_the_input_through_the_region(self):
+        args = scatter_args(128)
+        tape = self.ht.trace(scatter_inplace_host, (args[0].clone(), *args[1:]))
+        self.assertEqual(
+            (tape.num_launches, len(tape.memcpys), tape.num_regions), (0, 0, 1)
+        )
+        self.assertEqual(tape.written_inputs, (0,))
+        replay = self._replay(scatter_inplace_host, (args[0].clone(), *args[1:]))
+        got, expected = args[0].clone(), args[0].clone()
+        replay(got, *args[1:])
+        scatter_inplace_host(expected, *args[1:])
+        self.assertEqual(got, expected, atol=0, rtol=0)
+        self.assertEqual(
+            (replay.traces, len(replay.variants), replay.declines), (1, 1, [])
+        )
+
+    def test_rms_norm_backward_is_a_region_of_eager_s_three_kernels(self):
+        # the backward override launches QuACK's kernel, then ATen's reduction of
+        # dw_partial and a cast into the returned grad_weight: three nodes of one
+        # region, dw_partial and the float32 sum the call's scratch between its two
+        # returns (the template's layout), grad_input and grad_weight the tape's
+        x = torch.randn(4, 2048, device="cuda", dtype=torch.bfloat16)
+        w = torch.randn(2048, device="cuda", dtype=torch.bfloat16)
+        _, rstd = torch.ops.aten._fused_rms_norm(x, [2048], w, 1e-6)
+        g = torch.randn_like(x)
+        eager = self._eager_nodes(rms_norm_backward_host, (g, x, rstd, w))
+        self.assertIn("RMSNormBackward", eager[0]["name"])
+        replay = self._replay(rms_norm_backward_host, (g, x, rstd, w))
+        tape = replay.tape
+        self.assertEqual((tape.num_launches, tape.num_regions), (0, 1))
+        (region,) = tape.regions
+        self.assertEqual(region.op, "_fused_rms_norm_backward")
+        self.assertEqual(
+            [o.name for o in (*region.inputs, *region.outputs)],
+            ["grad_out", "input", "rstd", "weight", "grad_input", "grad_weight"],
+        )
+        for rows in (4, 9):
+            other = torch.randn(rows, 2048, device="cuda", dtype=torch.bfloat16)
+            _, other_rstd = torch.ops.aten._fused_rms_norm(other, [2048], w, 1e-6)
+            args = (torch.randn_like(other), other, other_rstd, w)
+            for got, expected in zip(replay(*args), rms_norm_backward_host(*args)):
+                self.assertEqual(got, expected, atol=0, rtol=0)
+        self.assertEqual(
+            (replay.traces, len(replay.variants), replay.declines), (1, 1, [])
+        )
+        self.assertEqual(replay.region_stats()["sites"][0]["kinds"], ["kernel"] * 3)
+        for t in self._templates("_fused_rms_norm_backward"):
+            self.assertEqual([n["func"] for n in t.nodes], [n["func"] for n in eager])
+            self.assertEqual(t.layout, ("out", "scratch", "scratch", "out"))
+            self.assertEqual(len(t.scratch), 2)
+        # the test seam's build of the same tape serves the call bitwise too
+        sys.path.insert(
+            0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+        )
+        from host_trace_testing import build
+
+        variant = build(tape, rms_norm_backward_host, (g, x, rstd, w))
+        for got, expected in zip(
+            variant.replay((g, x, rstd, w)), rms_norm_backward_host(g, x, rstd, w)
+        ):
+            self.assertEqual(got, expected, atol=0, rtol=0)
 
     def test_without_a_warm_up_the_program_declines_by_name(self):
         x = torch.randn(4, 128, device="cuda")
