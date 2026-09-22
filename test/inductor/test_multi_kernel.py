@@ -11,7 +11,13 @@ from torch import nn
 from torch._dynamo.testing import reset_rng_state
 from torch._inductor import config, test_operators
 from torch._inductor.codegen.multi_kernel import MultiKernelCall
-from torch._inductor.runtime.benchmarking import set_gpu_benchmark_lock_context
+from torch._inductor.runtime.benchmarking import (
+    _BENCHMARK_DISPATCH,
+    _default_cuda_bench,
+    InductorBenchmarker,
+    set_gpu_benchmark_lock_context,
+    TritonBenchmarker,
+)
 from torch._inductor.test_case import TestCase
 from torch._inductor.utils import run_and_get_code
 from torch.nn import functional as F
@@ -112,73 +118,263 @@ class MultiKernelTest(TestCase):
         }
         return multi_kernel_call
 
-    def test_benchmark_sub_kernels_holds_gpu_lock_across_candidates(self):
+    def _benchmark_call(self, benchmarker, device_type="cuda"):
         events = []
-        multi_kernel_call = self._benchmark_lock_call(events)
+        multi = self._benchmark_lock_call(events)
+        for kernel in multi.kernels:
+            kernel.device_props.type = device_type
+        for patcher in (
+            unittest.mock.patch.dict(_BENCHMARK_DISPATCH, {}, clear=True),
+            unittest.mock.patch(
+                "torch._inductor.codegen.multi_kernel.benchmarker", benchmarker
+            ),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        return multi, events
+
+    @parametrize("failure", [None, "benchmark", "kernel"])
+    @config.patch({"max_autotune": True, "autotune_cudagraph_benchmarking": True})
+    def test_benchmark_sub_kernels_gpu_lock(self, failure):
+        multi, events = self._benchmark_call(InductorBenchmarker())
 
         @contextlib.contextmanager
-        def benchmark_lock():
-            events.append("lock_enter")
+        def lock():
+            events.append("enter")
             try:
                 yield
             finally:
-                events.append("lock_exit")
+                events.append("exit")
+
+        previous = set_gpu_benchmark_lock_context(lock)
+        self.addCleanup(set_gpu_benchmark_lock_context, previous)
+        if failure == "kernel":
+            multi.kernels[0].run = unittest.mock.Mock(
+                side_effect=RuntimeError("failed")
+            )
+        timings = iter([2.0, 1.0])
 
         def benchmark(fn, **kwargs):
-            index = len([event for event in events if event.startswith("benchmark_")])
-            events.append(f"benchmark_{index}")
+            events.append("benchmark")
+            if failure == "benchmark":
+                raise RuntimeError("failed")
             fn()
-            return 2.0 - index
+            return next(timings)
 
-        previous = set_gpu_benchmark_lock_context(benchmark_lock)
-        try:
-            with unittest.mock.patch(
-                "torch._inductor.codegen.multi_kernel.benchmarker.benchmark",
-                side_effect=benchmark,
-            ):
-                timings = multi_kernel_call.benchmark_sub_kernels("arg")
-        finally:
-            set_gpu_benchmark_lock_context(previous)
-
-        self.assertEqual(timings, [2.0, 1.0])
+        with unittest.mock.patch(
+            "torch._inductor.codegen.multi_kernel.benchmarker.benchmark",
+            side_effect=benchmark,
+        ):
+            if failure:
+                with self.assertRaisesRegex(RuntimeError, "failed"):
+                    multi.benchmark_sub_kernels("arg")
+            else:
+                self.assertEqual(multi.benchmark_sub_kernels("arg"), [2.0, 1.0])
         self.assertEqual(
             events,
-            [
-                "lock_enter",
-                "benchmark_0",
-                "run_0",
-                "benchmark_1",
-                "run_1",
-                "lock_exit",
-            ],
+            ["enter", "benchmark", "exit"]
+            if failure
+            else ["enter", "benchmark", "run_0", "benchmark", "run_1", "exit"],
         )
 
-    def test_benchmark_sub_kernels_releases_gpu_lock_on_failure(self):
-        events = []
-        multi_kernel_call = self._benchmark_lock_call(events)
+    @parametrize("device_type", ["cuda", "hip"])
+    @parametrize("registered_default", [False, True])
+    @config.patch({"max_autotune": True, "autotune_cudagraph_benchmarking": True})
+    def test_benchmark_sub_kernels_autotunes_before_graph_benchmark(
+        self, device_type, registered_default
+    ):
+        bench = InductorBenchmarker()
+        multi, calls = self._benchmark_call(bench, device_type)
+        inputs = (torch.tensor([1.0]), torch.tensor([2.0]))
+        multi.arg_index = {0: [slice(0, 1)], 1: [slice(1, 2)]}
 
-        @contextlib.contextmanager
-        def benchmark_lock():
-            events.append("lock_enter")
-            try:
-                yield
-            finally:
-                events.append("lock_exit")
+        def run(x):
+            calls.append((x.item(), bench._in_cudagraph_benchmark))
+            x.add_(1)
 
-        previous = set_gpu_benchmark_lock_context(benchmark_lock)
-        try:
-            with (
-                unittest.mock.patch(
-                    "torch._inductor.codegen.multi_kernel.benchmarker.benchmark",
-                    side_effect=RuntimeError("benchmark failed"),
-                ),
-                self.assertRaisesRegex(RuntimeError, "benchmark failed"),
+        for kernel in multi.kernels:
+            kernel.clone_args = lambda x: ((x.clone(),), {})
+            kernel.run = run
+
+        def capture(fn, **kwargs):
+            fn()
+            fn()
+            return 1.0
+
+        with (
+            unittest.mock.patch.dict(
+                _BENCHMARK_DISPATCH,
+                {"cuda": _default_cuda_bench} if registered_default else {},
+            ),
+            unittest.mock.patch.object(
+                TritonBenchmarker, "benchmark_gpu_with_cuda_graph", side_effect=capture
+            ),
+        ):
+            self.assertEqual(multi.benchmark_sub_kernels(*inputs), [1.0, 1.0])
+        self.assertEqual(
+            calls, [(x, guard) for x in (1.0, 2.0) for guard in (False, True, True)]
+        )
+        self.assertEqual(inputs, (torch.tensor([1.0]), torch.tensor([2.0])))
+        self.assertFalse(bench._in_cudagraph_benchmark)
+
+    @parametrize("invalid_configuration", [False, True])
+    @config.patch({"max_autotune": True, "autotune_cudagraph_benchmarking": True})
+    def test_benchmark_sub_kernels_preserves_triton_error_handling(
+        self, invalid_configuration
+    ):
+        bench = TritonBenchmarker()
+        multi, events = self._benchmark_call(bench)
+        message = (
+            "CUDA error: invalid configuration argument"
+            if invalid_configuration
+            else "unrelated kernel failure"
+        )
+        multi.kernels[0].run = unittest.mock.Mock(side_effect=RuntimeError(message))
+
+        def benchmark(fn, **kwargs):
+            fn()
+            return 1.0
+
+        with unittest.mock.patch.object(
+            bench, "triton_do_bench", side_effect=benchmark
+        ):
+            if invalid_configuration:
+                self.assertEqual(
+                    multi.benchmark_sub_kernels("arg"), [float("inf"), 1.0]
+                )
+            else:
+                with self.assertRaisesRegex(RuntimeError, message):
+                    multi.benchmark_sub_kernels("arg")
+        multi.kernels[0].run.assert_called_once()
+        self.assertEqual(events, ["run_1"] if invalid_configuration else [])
+
+    @parametrize("route", ["override", "cuda", "hip"])
+    @config.patch({"max_autotune": True, "autotune_cudagraph_benchmarking": True})
+    def test_benchmark_sub_kernels_preserves_dispatch(self, route):
+        bench = InductorBenchmarker()
+        multi, events = self._benchmark_call(bench, "hip" if route == "hip" else "cuda")
+        dispatch = unittest.mock.Mock(return_value=float("inf"))
+        if route == "override":
+            patcher = unittest.mock.patch.object(bench, "benchmark_gpu", dispatch)
+        else:
+            patcher = unittest.mock.patch.dict(_BENCHMARK_DISPATCH, {route: dispatch})
+        with patcher:
+            self.assertEqual(multi.benchmark_sub_kernels("arg"), [float("inf")] * 2)
+        self.assertEqual(dispatch.call_count, 2)
+        self.assertEqual(events, [])
+
+    @parametrize(
+        "reason", ["max_autotune", "graph_disabled", "inside_graph", "cpu", "xpu"]
+    )
+    @config.patch({"max_autotune": True, "autotune_cudagraph_benchmarking": True})
+    def test_benchmark_sub_kernels_skips_inapplicable_prewarm(self, reason):
+        bench = InductorBenchmarker()
+        multi, events = self._benchmark_call(
+            bench, reason if reason in ("cpu", "xpu") else "cuda"
+        )
+        bench._in_cudagraph_benchmark = reason == "inside_graph"
+
+        def benchmark(fn, **kwargs):
+            events.append("benchmark")
+            fn()
+            return 1.0
+
+        with (
+            config.patch(
+                {
+                    "max_autotune": reason != "max_autotune",
+                    "autotune_cudagraph_benchmarking": reason != "graph_disabled",
+                }
+            ),
+            unittest.mock.patch.object(bench, "benchmark", side_effect=benchmark),
+        ):
+            self.assertEqual(multi.benchmark_sub_kernels("arg"), [1.0, 1.0])
+        self.assertEqual(events, ["benchmark", "run_0", "benchmark", "run_1"])
+
+    @config.patch(
+        {
+            "max_autotune": True,
+            "autotune_cudagraph_benchmarking": True,
+            "deterministic": True,
+        }
+    )
+    def test_benchmark_sub_kernels_respects_deterministic_ban(self):
+        multi, events = self._benchmark_call(InductorBenchmarker())
+        with self.assertRaisesRegex(RuntimeError, "deterministic mode of Inductor"):
+            multi.benchmark_sub_kernels("arg")
+        self.assertEqual(events, [])
+
+    @parametrize("has_stream", [False, True])
+    @parametrize("device_type", ["cuda", "hip"])
+    def test_benchmark_sub_kernels_uses_current_stream(self, has_stream, device_type):
+        bench = InductorBenchmarker()
+        multi, events = self._benchmark_call(bench, device_type)
+        stream = [10]
+        interface = SimpleNamespace(
+            current_device=lambda: 0, get_raw_stream=lambda device: stream[0]
+        )
+        for kernel in multi.kernels:
+            kernel.run = lambda *args, **kwargs: events.append(kwargs)
+
+        def benchmark(fn, **kwargs):
+            for stream[0] in (20, 30):
+                fn()
+            return 1.0
+
+        kwargs = {"stream": 10} if has_stream else {}
+        with (
+            unittest.mock.patch.object(bench, "benchmark", side_effect=benchmark),
+            unittest.mock.patch(
+                "torch._dynamo.device_interface.get_interface_for_device",
+                return_value=interface,
+            ) as lookup,
+        ):
+            multi.benchmark_sub_kernels("arg", **kwargs)
+        self.assertEqual(
+            events,
+            [{"stream": s} for s in (20, 30, 20, 30)] if has_stream else [{}] * 4,
+        )
+        self.assertEqual(kwargs, {"stream": 10} if has_stream else {})
+        if has_stream:
+            lookup.assert_has_calls([unittest.mock.call("cuda")] * 4)
+            self.assertEqual(lookup.call_count, 4)
+        else:
+            lookup.assert_not_called()
+
+    @skipIfXpu(msg="uses CUDA graph capture")
+    def test_benchmark_sub_kernels_captures_kernel(self):
+        output = torch.zeros(1, device=GPU_TYPE)
+
+        def run(output, *, stream):
+            with torch.cuda.stream(torch.cuda.ExternalStream(stream)):
+                output.add_(1)
+
+        bench = InductorBenchmarker()
+        multi, _ = self._benchmark_call(bench)
+        multi._kernels = [multi.kernels[0]]
+        multi.kernels[0].run = run
+
+        def benchmark(fn, **kwargs):
+            stream = torch.cuda.Stream()
+            with torch.cuda.stream(stream):
+                fn()
+            stream.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(
+                graph, stream=stream, capture_error_mode="thread_local"
             ):
-                multi_kernel_call.benchmark_sub_kernels("arg")
-        finally:
-            set_gpu_benchmark_lock_context(previous)
+                fn()
+            torch.cuda.synchronize()
+            output.zero_()
+            graph.replay()
+            torch.cuda.synchronize()
+            self.assertEqual(output, torch.ones_like(output))
+            return 1.0
 
-        self.assertEqual(events, ["lock_enter", "lock_exit"])
+        with unittest.mock.patch.object(bench, "benchmark", side_effect=benchmark):
+            multi.benchmark_sub_kernels(
+                output, stream=torch.cuda.current_stream().cuda_stream
+            )
 
     def test_softmax(self, expect_multi_kernel=True):
         x = torch.rand(2, 1024).to(GPU_TYPE)

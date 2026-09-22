@@ -405,6 +405,17 @@ class MultiKernelCall:
             def inner():
                 filtered_args = self._get_filtered_args(args, index)
                 args_clone, kwargs_clone = kernel.clone_args(*filtered_args, **kwargs)
+                if "stream" in kwargs_clone:
+                    from torch._dynamo.device_interface import get_interface_for_device
+
+                    device_interface = get_interface_for_device(
+                        kernel.device_props.type.replace("hip", "cuda")
+                    )
+                    # CUDA graph benchmarking captures on a different stream.
+                    # Resolve it at call time so the kernel is captured too.
+                    kwargs_clone["stream"] = device_interface.get_raw_stream(
+                        device_interface.current_device()
+                    )
                 return kernel.run(*args_clone, **kwargs_clone)
 
             return inner

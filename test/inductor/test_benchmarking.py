@@ -2,14 +2,17 @@
 
 import contextlib
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 from torch._dynamo.utils import counters
+from torch._inductor import config
 from torch._inductor.config import (
     inductor_default_autotune_rep,
     inductor_default_autotune_warmup,
 )
+from torch._inductor.runtime import benchmarking as bm
 from torch._inductor.runtime.benchmarking import (
     Benchmarker,
     InductorBenchmarker,
@@ -564,7 +567,7 @@ class TestBenchmarker(TestCase):
         result, cuda_graph_calls, callable_calls = run_benchmark(max_autotune=True)
         self.assertEqual(result, 7.0)
         self.assertEqual(cuda_graph_calls, 1)
-        self.assertEqual(callable_calls, [])
+        self.assertEqual(callable_calls, ["call"])
 
     @unittest.skipIf(not HAS_GPU, "requires GPU")
     @parametrize(
@@ -609,6 +612,111 @@ class TestBenchmarker(TestCase):
         self.assertGreater(len(captured_buffer_lengths), 0)
         self.assertEqual(captured_buffer_lengths[0], expected_buffer_size_bytes // 4)
         self.assertEqual(captured_buffer_devices[0], device)
+
+
+@config.patch({"max_autotune": True, "autotune_cudagraph_benchmarking": True})
+class TestInductorGraphWarmup(TestCase):
+    def test_nested_autotuning_keeps_graph_path(self):
+        bench = bm.InductorBenchmarker()
+        calls = []
+        initialized = False
+
+        def capture(fn, **kwargs):
+            self.assertTrue(bench._in_cudagraph_benchmark)
+            calls.append("capture")
+            fn()
+            return 1.0
+
+        def inner():
+            calls.append(("inner", bench._in_cudagraph_benchmark))
+
+        def outer():
+            nonlocal initialized
+            calls.append(("outer", bench._in_cudagraph_benchmark))
+            if not initialized:
+                initialized = True
+                self.assertEqual(bench.benchmark_gpu(inner, device_type="cuda"), 1.0)
+
+        with patch.object(
+            bm.TritonBenchmarker, "benchmark_gpu_with_cuda_graph", side_effect=capture
+        ):
+            self.assertEqual(bench.benchmark_gpu(outer, device_type="cuda"), 1.0)
+        self.assertEqual(
+            calls,
+            [
+                ("outer", False),
+                ("inner", False),
+                "capture",
+                ("inner", True),
+                "capture",
+                ("outer", True),
+            ],
+        )
+        self.assertFalse(bench._in_cudagraph_benchmark)
+
+    def test_warmup_failure_propagates_once_with_lock_cleanup(self):
+        bench = bm.InductorBenchmarker()
+        calls = []
+
+        @contextlib.contextmanager
+        def lock():
+            calls.append("enter")
+            try:
+                yield
+            finally:
+                calls.append("exit")
+
+        def fail_once():
+            calls.append("call")
+            if calls.count("call") == 1:
+                raise RuntimeError("transient candidate failure")
+
+        previous = bm.set_gpu_benchmark_lock_context(lock)
+        self.addCleanup(bm.set_gpu_benchmark_lock_context, previous)
+        with (
+            patch.object(bench, "benchmark_gpu_with_cuda_graph") as capture,
+            patch.object(bm.logger, "warning") as warning,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "transient candidate failure"):
+                bench.benchmark_gpu(fail_once, device_type="cuda")
+            capture.assert_not_called()
+            warning.assert_not_called()
+        self.assertEqual(calls, ["enter", "call", "exit"])
+        self.assertFalse(bench._in_cudagraph_benchmark)
+
+    def test_graph_failure_retains_eager_fallback(self):
+        bench = bm.InductorBenchmarker()
+        calls = []
+        event = SimpleNamespace(record=lambda: None, elapsed_time=lambda other: 1.0)
+        with (
+            patch.object(
+                bm.TritonBenchmarker,
+                "benchmark_gpu_with_cuda_graph",
+                side_effect=RuntimeError("capture unsupported"),
+            ),
+            patch.object(bm.logger, "warning") as warning,
+            patch.object(
+                bm,
+                "get_interface_for_device",
+                return_value=SimpleNamespace(synchronize=lambda: None),
+            ),
+            patch.object(
+                bm.torch, "empty", return_value=SimpleNamespace(zero_=lambda: None)
+            ),
+            patch.object(bench, "get_device_cache_size", return_value=4),
+            patch.object(bench, "get_event_pairs", return_value=[(event, event)]),
+        ):
+            result = bench.benchmark_gpu(
+                lambda: calls.append(bench._in_cudagraph_benchmark),
+                device_type="cuda",
+                estimation_iters=1,
+                memory_warmup_iters=0,
+                benchmark_iters=1,
+            )
+        self.assertEqual(result, 1.0)
+        self.assertEqual(calls, [False, False, False, False])
+        warning.assert_called_once()
+        self.assertFalse(bench._in_cudagraph_benchmark)
 
 
 if __name__ == "__main__":
