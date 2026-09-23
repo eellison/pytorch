@@ -297,6 +297,13 @@
     "requires_cute": true
   },
   {
+    "id": "cpu_cute_descriptor_ownership",
+    "script": "cpu/test_cute_descriptor_ownership.py",
+    "device": "cpu",
+    "cases": 14,
+    "requires_cute": true
+  },
+  {
     "id": "cute_host_test_vectors",
     "script": "cpu/cute_host/test_vectors.py",
     "device": "cpu",
