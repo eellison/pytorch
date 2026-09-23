@@ -284,6 +284,22 @@ class Partition:
         for a, b in itertools.pairwise(cuts):
             if a.seq[1] > b.seq[0]:
                 raise PartitionDeclined("the cut ops' record ranges overlap")
+        guards = []
+        for raw, guard in enumerate(tape.raw_guards()):
+            raisers = [tape.guard_rows[raw], *tape.guard_also.get(raw, ())]
+            for index, depth, _ in raisers:
+                if index is None or index < 0 or depth == 0:
+                    break
+                op = tape.ops[index]
+                while op.depth > 0:
+                    op = tape.ops[op.parent]
+                if op.index not in self.op_indices:
+                    break
+            else:
+                continue
+            guards.append(guard)
+        self.guard_tape = _PartTape(tape, [], tape.allocs, [], [], [], guards, [])
+        self.preflight = None
         # the allocation names by the symbol of their base, for the use scan
         by_q = {}
         self.alloc_by_name = {}
@@ -824,6 +840,15 @@ class Partition:
         from . import direct_hosttrace as dh
 
         tape = self.tape
+        if self.preflight is None:
+            try:
+                self.preflight = dh.lower_tape(
+                    self.guard_tape, args, device=self.device
+                )
+            except dh.HostTraceLoweringDeclined as error:
+                raise PartitionDeclined(f"partition preflight: {error}") from error
+        if not dh.check_predicate(self.preflight, box, regions=False):
+            return None
         if not hasattr(self, "_input_index"):
             self._input_index = {inp.root.name: k for k, inp in enumerate(tape.inputs)}
             self._alloc_nbytes = {

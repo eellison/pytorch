@@ -960,10 +960,16 @@
     "cases": 13
   },
   {
+    "id": "cpu_hosttrace_partition_preflight",
+    "script": "cpu/test_hosttrace_partition_preflight.py",
+    "device": "cpu",
+    "cases": 11
+  },
+  {
     "id": "cuda_hosttrace_partition",
     "script": "cuda/test_hosttrace_partition.py",
     "device": "cuda",
-    "cases": 6
+    "cases": 8
   },
   {
     "id": "cuda_hosttrace_allocseq",

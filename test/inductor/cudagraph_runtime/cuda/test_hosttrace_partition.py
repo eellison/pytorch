@@ -10,7 +10,8 @@ import gc
 
 import torch
 import torch.nn.functional as F
-from torch.testing._internal.common_utils import run_tests, TestCase
+from torch.testing._internal.common_device_type import instantiate_device_type_tests
+from torch.testing._internal.common_utils import parametrize, run_tests, TestCase
 
 
 N = 4096
@@ -248,6 +249,74 @@ class TestHostTracePartition(TestCase):
         # their allocation to the suffix's launch, as they do in eager
         self.assertLessEqual(steady_peak, eager_peak)
         self.assertLessEqual(native_peak, eager_peak)
+
+
+class TestHostTraceCachedPartition(TestCase):
+    @parametrize("change", ("dtype", "broadcast"))
+    def test_cached_empty_segments_reject_before_mutation(self, device, change):
+        from torch._inductor.runtime._cudagraph import (
+            direct_hosttrace,
+            hosttrace_partition,
+        )
+
+        def add_(x, y):
+            return x.add_(y)
+
+        examples = (
+            torch.ones(256, device=device),
+            torch.full((256,), 2.0, device=device),
+        )
+        with torch.no_grad():
+            replay = direct_hosttrace.HostTraceReplay(add_, examples, partition=True)
+            self.addCleanup(replay.close)
+            x = torch.ones_like(examples[0])
+            y = _misaligned(examples[1], elements=1)
+            self.assertIs(replay(x, y), x)
+            self.assertEqual(x, torch.full_like(x, 3.0), atol=0, rtol=0)
+        self.assertEqual(replay.traces, 1)
+        self.assertEqual(replay.partition_builds, 1)
+        self.assertEqual(replay.partition_serves, 1)
+        (partition,) = replay.partitions
+        self.assertEqual(
+            [op[1] for op in partition.stats()["ops"]], ["aten.add_.Tensor"]
+        )
+        self.assertEqual(len(partition.segments), 2)
+        self.assertTrue(all(seg.part is None for seg in partition.segments))
+        self.assertTrue(all(seg.lowered is None for seg in partition.segments))
+
+        dtype = torch.float64 if change == "dtype" else torch.float32
+        x = torch.ones(256, device=device, dtype=dtype)
+        y = torch.full(
+            (1 if change == "broadcast" else 256,), 2.0, device=device, dtype=dtype
+        )
+        before = (x.clone(), y.clone())
+        args = (x, y)
+        family = partition.variant.family
+        with torch.no_grad():
+            self.assertIsNone(
+                hosttrace_partition.serve_existing(
+                    replay, family, args, family.box(args)
+                )
+            )
+            self.assertEqual(args, before, atol=0, rtol=0)
+            self.assertEqual(replay.partition_serves, 1)
+            self.assertEqual(replay.traces, 1)
+
+            self.assertIs(replay(*args), x)
+            self.assertEqual(x, before[0] + before[1], atol=0, rtol=0)
+            self.assertEqual(y, before[1], atol=0, rtol=0)
+            self.assertEqual(replay.traces, 2)
+            self.assertEqual(len(replay.variants), 2)
+            self.assertEqual(replay.partition_builds, 1)
+            self.assertEqual(replay.partition_serves, 1)
+            self.assertIs(replay(*args), x)
+            self.assertEqual(x, before[0] + 2 * before[1], atol=0, rtol=0)
+        self.assertEqual(replay.traces, 2)
+        self.assertEqual(replay.ordinary, 0)
+        self.assertEqual(replay.declines, [])
+
+
+instantiate_device_type_tests(TestHostTraceCachedPartition, globals(), only_for="cuda")
 
 
 if __name__ == "__main__":
