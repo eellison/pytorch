@@ -969,7 +969,7 @@
     "id": "cuda_hosttrace_partition",
     "script": "cuda/test_hosttrace_partition.py",
     "device": "cuda",
-    "cases": 9
+    "cases": 10
   },
   {
     "id": "cuda_hosttrace_allocseq",
@@ -1152,5 +1152,11 @@
     "script": "cpu/test_hosttrace_partition_cut_inputs.py",
     "device": "cpu",
     "cases": 11
+  },
+  {
+    "id": "cpu_hosttrace_partition_native_cut",
+    "script": "cpu/test_hosttrace_partition_native_cut.py",
+    "device": "cpu",
+    "cases": 23
   }
 ]

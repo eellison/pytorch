@@ -162,6 +162,8 @@ class _Cut:
     kwargs_leaves: tuple = ()
     args_spec: Any = None
     kwargs_spec: Any = None
+    native: Any = None
+    native_ready: bool = False
     out_spec: Any = None
     out_leaves: list = dataclasses.field(default_factory=list)  # traced output leaves
     eager_s: float = 0.0
@@ -823,26 +825,82 @@ class Partition:
         seg.calls += 1
         return list(outputs)
 
+    def _prepare_cut(self, cut):
+        if cut.args_spec is None or not isinstance(cut.op.func, torch._ops.OpOverload):
+            return None
+
+        def number(value):
+            if isinstance(value, sympy.Basic):
+                return torch._C._CUDAGraphCutValue(self._boundary_indices[value], True)
+            if type(value) is int:
+                return torch._C._CUDAGraphCutValue(value, False)
+            raise TypeError("cut metadata is not an integer")
+
+        def leaf(value):
+            if isinstance(value, _Ref):
+                return torch._C._CUDAGraphCutTensor(
+                    value.root,
+                    self._input_index.get(value.root, -1),
+                    [number(v) for v in value.sizes],
+                    [number(v) for v in value.strides],
+                    number(value.offset),
+                )
+            if isinstance(value, sympy.Basic):
+                return number(value)
+            if type(value) in (
+                type(None),
+                bool,
+                int,
+                float,
+                complex,
+                str,
+                torch.dtype,
+                torch.device,
+                torch.layout,
+                torch.memory_format,
+            ):
+                return value
+            raise TypeError("cut argument is outside the normalized schema")
+
+        try:
+            return torch._C._CUDAGraphCut(
+                cut.op.func._handle,
+                tree_map(leaf, cut.args),
+                tree_map(leaf, cut.kwargs),
+            )
+        except (TypeError, ValueError, OverflowError):
+            return None
+
     def _run_cut(self, j, cut, env, box, boundary, known):
         op = cut.op
-        mat = lambda leaf: self._materialize(leaf, env, box, boundary)  # noqa: E731
-        if cut.args_spec is None:
-            args = tree_map(mat, cut.args)
-            kwargs = tree_map(mat, cut.kwargs)
-            materialized = tree_flatten((args, kwargs))[0]
+        native = None
+        if type(env) is tuple:
+            if not cut.native_ready:
+                cut.native = self._prepare_cut(cut)
+                cut.native_ready = True
+            if cut.native is not None:
+                native = cut.native(box, boundary, env, known)
+        if native is not None:
+            out, cut.eager_s = native
         else:
-            args_leaves = [mat(leaf) for leaf in cut.args_leaves]
-            args = tree_unflatten(args_leaves, cut.args_spec)
-            kwargs_leaves = [mat(leaf) for leaf in cut.kwargs_leaves]
-            kwargs = tree_unflatten(kwargs_leaves, cut.kwargs_spec)
-            materialized = itertools.chain(args_leaves, kwargs_leaves)
-        for t in materialized:
-            if isinstance(t, torch.Tensor):
-                known.add(t.untyped_storage().data_ptr())
-        t0 = time.perf_counter()
-        with torch.no_grad():
-            out = op.func(*args, **kwargs)
-        cut.eager_s = time.perf_counter() - t0
+            mat = lambda leaf: self._materialize(leaf, env, box, boundary)  # noqa: E731
+            if cut.args_spec is None:
+                args = tree_map(mat, cut.args)
+                kwargs = tree_map(mat, cut.kwargs)
+                materialized = tree_flatten((args, kwargs))[0]
+            else:
+                args_leaves = [mat(leaf) for leaf in cut.args_leaves]
+                args = tree_unflatten(args_leaves, cut.args_spec)
+                kwargs_leaves = [mat(leaf) for leaf in cut.kwargs_leaves]
+                kwargs = tree_unflatten(kwargs_leaves, cut.kwargs_spec)
+                materialized = itertools.chain(args_leaves, kwargs_leaves)
+            for t in materialized:
+                if isinstance(t, torch.Tensor):
+                    known.add(t.untyped_storage().data_ptr())
+            t0 = time.perf_counter()
+            with torch.no_grad():
+                out = op.func(*args, **kwargs)
+            cut.eager_s = time.perf_counter() - t0
         leaves = tree_flatten(out)[0]
         if len(leaves) != len(cut.out_leaves):
             raise SwapMismatch(

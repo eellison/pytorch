@@ -253,6 +253,54 @@ class TestHostTracePartition(TestCase):
 
 
 class TestHostTraceCachedPartition(TestCase):
+    def test_repeated_cut_uses_native_views_and_boxed_operator(self, device):
+        from torch._inductor.runtime._cudagraph import direct_hosttrace
+
+        def add_(x, y):
+            return x.add_(y)
+
+        examples = (
+            torch.ones(256, device=device),
+            torch.full((256,), 2.0, device=device),
+        )
+        with torch.no_grad():
+            replay = direct_hosttrace.HostTraceReplay(add_, examples, partition=True)
+            self.addCleanup(replay.close)
+            x = torch.ones_like(examples[0])
+            y = _misaligned(examples[1], elements=1)
+            self.assertIs(replay(x, y), x)
+            self.assertEqual(x, torch.full_like(x, 3.0), atol=0, rtol=0)
+            (partition,) = replay.partitions
+            (cut,) = partition.cuts
+            self.assertIsNotNone(partition._boundary)
+            self.assertIsNotNone(cut.native)
+            with (
+                mock.patch.object(
+                    partition,
+                    "_materialize",
+                    side_effect=AssertionError("Python cut materialization"),
+                ),
+                mock.patch.object(
+                    partition.evaluator,
+                    "ev",
+                    side_effect=AssertionError("Python numeric evaluation"),
+                ),
+            ):
+                for size in (128, 384):
+                    x = torch.ones(size + 4, device=device)[2 : size + 2]
+                    y = torch.full((size + 4,), 2.0, device=device)[1 : size + 1]
+                    self.assertIs(replay(x, y), x)
+                    self.assertEqual(x, torch.full_like(x, 3.0), atol=0, rtol=0)
+                    self.assertIs(replay(x, y), x)
+                    self.assertEqual(x, torch.full_like(x, 5.0), atol=0, rtol=0)
+                    self.assertEqual(y, torch.full_like(y, 2.0), atol=0, rtol=0)
+            self.assertEqual(replay.traces, 1)
+            self.assertEqual(replay.partition_builds, 1)
+            self.assertEqual(replay.partition_serves, 5)
+            self.assertEqual(len(replay.variants), 1)
+        self.assertEqual(replay.ordinary, 0)
+        self.assertEqual(replay.declines, [])
+
     def test_repeated_cut_rebinds_same_tensor_objects(self, device):
         from torch._inductor.runtime._cudagraph import direct_hosttrace
 

@@ -17,16 +17,21 @@
 
 #include <ATen/BlasSettingsEpoch.h>
 #include <ATen/EmptyTensor.h>
+#include <ATen/PythonTorchFunctionTLS.h>
 #include <ATen/core/CachingHostAllocator.h>
+#include <ATen/core/grad_mode.h>
 #include <ATen/cuda/CUDAContextLight.h>
 #include <ATen/cuda/CUDAGraph.h>
 #include <ATen/cuda/CUDAGraphParams.h>
+#include <ATen/ops/as_strided.h>
 #include <c10/core/ScalarTypeToTypeMeta.h>
+#include <c10/core/impl/TorchDispatchModeTLS.h>
 #include <c10/cuda/CUDACachingAllocatorPendingGraph.h>
 #include <c10/cuda/CUDAEvent.h>
 #include <c10/util/safe_numerics.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <deque>
@@ -983,6 +988,265 @@ struct PythonBoxedNumeric {
   const std::shared_ptr<CompiledBoxedEvaluation> compiled;
   const std::vector<size_t> output_indices;
   std::vector<BoxedNumericPlan::Instruction> leaves;
+};
+
+struct CutValue {
+  int64_t value;
+  bool is_index;
+
+  int64_t read(py::tuple values) const {
+    if (!is_index) {
+      return value;
+    }
+    if (value < 0 || static_cast<size_t>(value) >= values.size()) {
+      throw py::value_error("Cut value index is outside the numeric batch");
+    }
+    auto* item = values[value].ptr();
+    if (!PyLong_CheckExact(item)) {
+      throw py::type_error("Cut numeric values must be exact integers");
+    }
+    auto result = PyLong_AsLongLong(item);
+    if (PyErr_Occurred()) {
+      throw py::error_already_set();
+    }
+    return result;
+  }
+};
+
+struct CutTensor {
+  std::string root;
+  int64_t input_index;
+  std::vector<CutValue> sizes;
+  std::vector<CutValue> strides;
+  CutValue offset;
+};
+
+struct PythonCut {
+  struct Binding {
+    size_t argument;
+    int64_t element;
+    std::optional<CutTensor> tensor;
+    CutValue scalar{0, false};
+    enum class Conversion { Integer, Floating, Boolean };
+    Conversion conversion = Conversion::Integer;
+  };
+
+  PythonCut(c10::OperatorHandle op, py::tuple args, py::dict kwargs)
+      : op(std::move(op)) {
+    const auto& schema = this->op.schema();
+    // Only the existing schema converter sees these representative values.
+    const auto example = at::Tensor(at::detail::empty_meta({0}, at::kByte));
+    auto tensor = py::cast(example);
+    auto leaf = [&](py::handle value, size_t argument, int64_t element) {
+      if (py::isinstance<CutTensor>(value)) {
+        auto source = py::cast<CutTensor>(value);
+        if (source.sizes.size() != source.strides.size()) {
+          throw py::value_error("Cut sizes and strides have different ranks");
+        }
+        bindings.push_back({argument, element, std::move(source)});
+        return tensor;
+      }
+      if (py::isinstance<CutValue>(value)) {
+        bindings.push_back(
+            {argument, element, std::nullopt, py::cast<CutValue>(value)});
+        return py::object(py::int_(0));
+      }
+      if (THPVariable_Check(value.ptr())) {
+        throw py::value_error("Cut tensors require prepared root bindings");
+      }
+      return py::reinterpret_borrow<py::object>(value);
+    };
+    auto argument = [&](py::handle value, size_t index) -> py::object {
+      if (PyList_CheckExact(value.ptr()) || PyTuple_CheckExact(value.ptr())) {
+        auto items = py::reinterpret_borrow<py::sequence>(value);
+        py::list result(items.size());
+        for (size_t i = 0; i < items.size(); ++i) {
+          result[i] = leaf(items[i], index, i);
+        }
+        return result;
+      }
+      return leaf(value, index, -1);
+    };
+    py::tuple positional(args.size());
+    for (size_t i = 0; i < args.size(); ++i) {
+      positional[i] = argument(args[i], i);
+    }
+    py::dict keywords;
+    for (auto item : kwargs) {
+      auto name = py::cast<std::string>(item.first);
+      auto found = std::find_if(
+          schema.arguments().begin(),
+          schema.arguments().end(),
+          [&](const c10::Argument& arg) { return arg.name() == name; });
+      if (found == schema.arguments().end()) {
+        throw py::value_error("Cut keyword is absent from the operator schema");
+      }
+      keywords[item.first] =
+          argument(item.second, found - schema.arguments().begin());
+    }
+    try {
+      stack_template = torch::jit::createStackForSchema(
+          schema,
+          positional,
+          py::reinterpret_borrow<py::kwargs>(keywords),
+          std::nullopt);
+    } catch (const torch::jit::schema_match_error& error) {
+      throw py::value_error(error.what());
+    }
+    auto scalar = [&](const c10::IValue& value) {
+      if (value.isTensor()) {
+        const auto& item = value.toTensor();
+        return !item.defined() ||
+            item.unsafeGetTensorImpl() == example.unsafeGetTensorImpl();
+      }
+      return value.isInt() || value.isDouble() || value.isBool() ||
+          value.isComplexDouble() || value.isString() || value.isNone() ||
+          value.isDevice();
+    };
+    for (const auto& value : stack_template) {
+      if (value.isList()) {
+        for (const auto& item : value.toList()) {
+          if (!scalar(item)) {
+            throw py::value_error("Cut arguments require flat schema lists");
+          }
+        }
+      } else if (!scalar(value)) {
+        throw py::value_error("Cut argument is outside the normalized schema");
+      }
+    }
+    for (auto& binding : bindings) {
+      auto value = stack_template.at(binding.argument);
+      if (binding.element >= 0) {
+        if (!value.isList() ||
+            static_cast<size_t>(binding.element) >= value.toList().size()) {
+          throw py::value_error(
+              "Cut list binding differs from schema conversion");
+        }
+        value = value.toList().get(binding.element);
+      }
+      if (binding.tensor) {
+        if (!value.isTensor()) {
+          throw py::value_error(
+              "Cut tensor binding requires a Tensor argument");
+        }
+      } else if (value.isInt()) {
+        binding.conversion = Binding::Conversion::Integer;
+      } else if (value.isDouble()) {
+        binding.conversion = Binding::Conversion::Floating;
+      } else if (value.isBool()) {
+        binding.conversion = Binding::Conversion::Boolean;
+      } else {
+        throw py::value_error("Cut scalar binding requires a numeric argument");
+      }
+    }
+  }
+
+  py::object call(
+      py::list inputs,
+      py::dict boundary,
+      py::tuple values,
+      py::set known) const {
+    if (at::impl::torch_function_mode_enabled() ||
+        c10::impl::TorchDispatchModeTLS::stack_len() != 0) {
+      return py::none();
+    }
+    std::vector<at::Tensor> roots;
+    roots.reserve(bindings.size());
+    for (const auto& binding : bindings) {
+      if (!binding.tensor) {
+        continue;
+      }
+      const auto& source = *binding.tensor;
+      auto key = py::str(source.root);
+      PyObject* root = PyDict_GetItemWithError(boundary.ptr(), key.ptr());
+      if (root == nullptr && PyErr_Occurred()) {
+        throw py::error_already_set();
+      }
+      if (root == nullptr && source.input_index >= 0 &&
+          static_cast<size_t>(source.input_index) < inputs.size()) {
+        root = PyList_GET_ITEM(inputs.ptr(), source.input_index);
+      }
+      if (root == nullptr || !THPVariable_CheckExact(root)) {
+        return py::none();
+      }
+      roots.push_back(THPVariable_Unpack(root));
+    }
+    auto stack = stack_template;
+    for (auto& value : stack) {
+      if (value.isList()) {
+        value = value.toList().copy();
+      }
+    }
+    std::vector<at::Tensor> views;
+    views.reserve(roots.size());
+    for (const auto& binding : bindings) {
+      c10::IValue value;
+      if (binding.tensor) {
+        const auto& source = *binding.tensor;
+        std::vector<int64_t> sizes, strides;
+        for (auto item : source.sizes) {
+          sizes.push_back(item.read(values));
+        }
+        for (auto item : source.strides) {
+          strides.push_back(item.read(values));
+        }
+        auto offset = source.offset.read(values);
+        {
+          py::gil_scoped_release no_gil;
+          views.push_back(
+              at::as_strided(roots[views.size()], sizes, strides, offset));
+        }
+        value = views.back();
+      } else {
+        auto number = binding.scalar.read(values);
+        switch (binding.conversion) {
+          case Binding::Conversion::Integer:
+            value = number;
+            break;
+          case Binding::Conversion::Floating:
+            value = static_cast<double>(number);
+            break;
+          case Binding::Conversion::Boolean:
+            value = static_cast<bool>(number);
+            break;
+        }
+      }
+      if (binding.element < 0) {
+        stack[binding.argument] = std::move(value);
+      } else {
+        stack[binding.argument].toList().set(binding.element, std::move(value));
+      }
+    }
+    for (const auto& view : views) {
+      auto storage = view.storage();
+      auto invalid = storage.data() == nullptr &&
+          storage.device_type() != c10::DeviceType::Meta &&
+          storage.sym_nbytes() != 0;
+      TORCH_CHECK(
+          !invalid,
+          "Attempted to access the data pointer on an invalid python storage.");
+      auto pointer =
+          py::int_(reinterpret_cast<uintptr_t>(storage.mutable_data()));
+      if (PySet_Add(known.ptr(), pointer.ptr()) < 0) {
+        throw py::error_already_set();
+      }
+    }
+    const auto start = std::chrono::steady_clock::now();
+    {
+      at::NoGradGuard no_grad;
+      py::gil_scoped_release no_gil;
+      op.callBoxed(stack);
+    }
+    const auto seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
+            .count();
+    return py::make_tuple(
+        torch::jit::createPyObjectForStack(std::move(stack)), seconds);
+  }
+
+  const c10::OperatorHandle op;
+  torch::jit::Stack stack_template;
+  std::vector<Binding> bindings;
 };
 
 struct BoxedOutput {
@@ -3247,6 +3511,35 @@ void THCPGraph_init(PyObject* module) {
           "__call__",
           torch::wrap_pybind_function(&PythonBoxedNumeric::call),
           py::arg("inputs"));
+
+  py::class_<CutValue>(torch_C_m, "_CUDAGraphCutValue")
+      .def(py::init<int64_t, bool>(), py::arg("value"), py::arg("is_index"));
+  py::class_<CutTensor>(torch_C_m, "_CUDAGraphCutTensor")
+      .def(
+          py::init<
+              std::string,
+              int64_t,
+              std::vector<CutValue>,
+              std::vector<CutValue>,
+              CutValue>(),
+          py::arg("root"),
+          py::arg("input_index"),
+          py::arg("sizes"),
+          py::arg("strides"),
+          py::arg("offset"));
+  shared_ptr_class_<PythonCut>(torch_C_m, "_CUDAGraphCut")
+      .def(
+          py::init<c10::OperatorHandle, py::tuple, py::dict>(),
+          py::arg("operator"),
+          py::arg("args"),
+          py::arg("kwargs"))
+      .def(
+          "__call__",
+          torch::wrap_pybind_function(&PythonCut::call),
+          py::arg("inputs"),
+          py::arg("boundary"),
+          py::arg("values"),
+          py::arg("known"));
 
   torch_C_m.def(
       "_cuda_evaluate_parameter_program",
