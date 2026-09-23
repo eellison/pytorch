@@ -50,6 +50,7 @@
 // MemoryEfficient Attention Specific Imports for CUDA
 #include <ATen/native/transformers/cuda/mem_eff_attention/kernel_backward.h>
 #include <ATen/native/transformers/cuda/mem_eff_attention/kernels/cutlassB.h>
+#include <ATen/native/transformers/cuda/mem_eff_attention/traced_params.h>
 #include <ATen/native/transformers/cuda/mem_eff_attention/gemm_kernel_utils.h>
 #include <ATen/native/transformers/cuda/mem_eff_attention/pytorch_utils.h>
 #else
@@ -80,11 +81,11 @@ int64_t mem_eff_attention_backward_bias_alignment(const Tensor& bias) {
 
 bool has_mem_eff_attention_bias_alignment(const Tensor& bias, int64_t alignment) {
   for (const auto dim : c10::irange(bias.dim() - 1)) {
-    if (bias.stride(dim) % alignment != 0) {
+    if (bias.sym_stride(dim) % alignment != 0) {
       return false;
     }
   }
-  return bias.stride(-1) == 1;
+  return bias.sym_stride(-1) == 1;
 }
 
 Tensor ensure_mem_eff_attention_bias_alignment(const Tensor& bias) {
@@ -93,9 +94,9 @@ Tensor ensure_mem_eff_attention_bias_alignment(const Tensor& bias) {
     return bias;
   }
 
-  const auto last_dim_size = bias.size(-1);
-  const auto pad_count = alignment - (last_dim_size % alignment);
-  return at::pad(bias, {0, pad_count}).slice(-1, 0, last_dim_size);
+  const c10::SymInt last_dim_size = bias.sym_size(-1);
+  const c10::SymInt pad_count = alignment - (last_dim_size % alignment);
+  return at::pad_symint(bias, {c10::SymInt(0), pad_count}).slice_symint(-1, 0, last_dim_size);
 }
 
 } // namespace
@@ -381,8 +382,10 @@ std::tuple<Tensor, Tensor, Tensor> _cudnn_attention_backward(
     }
 }
 
+// the SymInt kernel: the lengths the forward returned stay symbolic through
+// autograd into the host (the dense path reads them as the kernel's sizes)
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>
-_efficient_attention_backward(
+_efficient_attention_backward_symint(
     const at::Tensor& grad_out_,
     const at::Tensor& query,
     const at::Tensor& key,
@@ -396,9 +399,9 @@ _efficient_attention_backward(
     // position of the first key token for batch $b
     const std::optional<at::Tensor>& cu_seqlens_k_dummy,
     // (Mode 1MHK only) Maximum sequence length across batches
-    int64_t max_seqlen_q,
+    c10::SymInt max_seqlen_q,
     // (Mode 1MHK only) Maximum sequence length across batches
-    int64_t max_seqlen_k,
+    c10::SymInt max_seqlen_k,
     const at::Tensor& logsumexp,
     double dropout_p, // dropout probability
     const at::Tensor& philox_seed, // seed using for generating random numbers for dropout
@@ -429,19 +432,19 @@ _efficient_attention_backward(
   TORCH_CHECK(query.dim() == 4);
 
   // batch size
-  TORCH_CHECK(query.size(0) == grad_out_.size(0));
-  TORCH_CHECK(query.size(0) == key.size(0));
-  TORCH_CHECK(query.size(0) == value.size(0));
+  TORCH_CHECK(query.sym_size(0) == grad_out_.sym_size(0));
+  TORCH_CHECK(query.sym_size(0) == key.sym_size(0));
+  TORCH_CHECK(query.sym_size(0) == value.sym_size(0));
 
   // seqlen
-  TORCH_CHECK(key.size(1) == value.size(1));
-  TORCH_CHECK(query.size(1) == grad_out_.size(1));
+  TORCH_CHECK(key.sym_size(1) == value.sym_size(1));
+  TORCH_CHECK(query.sym_size(1) == grad_out_.sym_size(1));
 
   // Num heads
-  const int64_t nH = query.size(2);
-  const int64_t nHkv = key.size(2);
-  TORCH_CHECK(nHkv == value.size(2));
-  TORCH_CHECK(nH == grad_out_.size(2));
+  const c10::SymInt nH = query.sym_size(2);
+  const c10::SymInt nHkv = key.sym_size(2);
+  TORCH_CHECK(nHkv == value.sym_size(2));
+  TORCH_CHECK(nH == grad_out_.sym_size(2));
 #ifdef USE_ROCM
   TORCH_CHECK(nH == nHkv);
 #else
@@ -452,48 +455,61 @@ _efficient_attention_backward(
 #endif
 
   // Embedding per head
-  TORCH_CHECK(query.size(3) == key.size(3));
-  TORCH_CHECK(value.size(3) == grad_out_.size(3));
+  TORCH_CHECK(query.sym_size(3) == key.sym_size(3));
+  TORCH_CHECK(value.sym_size(3) == grad_out_.sym_size(3));
 
   // handle potentially non-contiguous grad_out through a copy
   auto grad_out = grad_out_.contiguous();
   CHECK_NOSPARSE_CONTIGUOUS_CUDA(grad_out);
 
+#ifdef USE_ROCM
   CHECK_NOSPARSE_LASTCONTIGUOUS_CUDA(query);
   CHECK_NOSPARSE_LASTCONTIGUOUS_CUDA(key);
   CHECK_NOSPARSE_LASTCONTIGUOUS_CUDA(value);
+#else
+  CHECK_NOSPARSE_LASTCONTIGUOUS_CUDA_SYM(query);
+  CHECK_NOSPARSE_LASTCONTIGUOUS_CUDA_SYM(key);
+  CHECK_NOSPARSE_LASTCONTIGUOUS_CUDA_SYM(value);
+#endif
 
   TORCH_CHECK(cu_seqlens_q.has_value() == cu_seqlens_k.has_value());
   TORCH_CHECK(
       !(cu_seqlens_q.has_value() && bias.has_value()),
       "cu seqlen + bias not supported");
   if (cu_seqlens_q.has_value()) {
+#ifndef USE_ROCM
+    // the packed path is not traced: a decline by name before any read of
+    // the lengths
+    if (ht::active() != nullptr) {
+      ht::decline("host_trace: memory-efficient attention backward with cu_seqlens is not traced; only the dense path is (declined)");
+    }
+#endif
     TORCH_CHECK(cu_seqlens_q->scalar_type() == at::ScalarType::Int);
     TORCH_CHECK(cu_seqlens_k->scalar_type() == at::ScalarType::Int);
     TORCH_CHECK(cu_seqlens_q->dim() == 1 && cu_seqlens_k->dim() == 1);
     CHECK_NOSPARSE_CONTIGUOUS_CUDA((*cu_seqlens_q));
     CHECK_NOSPARSE_CONTIGUOUS_CUDA((*cu_seqlens_k));
-    TORCH_CHECK(cu_seqlens_q->size(0) == cu_seqlens_k->size(0));
-    TORCH_CHECK(query.size(0) == 1, "cu_seqlen only supports batch_size=1");
+    TORCH_CHECK(cu_seqlens_q->sym_size(0) == cu_seqlens_k->sym_size(0));
+    TORCH_CHECK(query.sym_size(0) == 1, "cu_seqlen only supports batch_size=1");
     TORCH_CHECK(max_seqlen_q > 0, "max_seqlen_q required with `cu_seqlens_q`");
     TORCH_CHECK(max_seqlen_k > 0, "max_seqlen_k required with `cu_seqlens_k`");
     TORCH_CHECK(
-        max_seqlen_k <= key.size(1), "Invalid max_seqlen_k:", max_seqlen_k);
+        max_seqlen_k <= key.sym_size(1), "Invalid max_seqlen_k:", max_seqlen_k);
     TORCH_CHECK(
-        max_seqlen_q <= query.size(1), "Invalid max_seqlen_q:", max_seqlen_q);
+        max_seqlen_q <= query.sym_size(1), "Invalid max_seqlen_q:", max_seqlen_q);
   } else {
-    max_seqlen_q = query.size(1);
-    max_seqlen_k = key.size(1);
+    max_seqlen_q = query.sym_size(1);
+    max_seqlen_k = key.sym_size(1);
   }
 
   at::cuda::CUDAGuard device_guard(query.device());
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-  int64_t B = query.size(0);
-  int64_t M = query.size(1);
-  int64_t N = key.size(1);
-  int64_t K = query.size(3);
-  int64_t Kv = value.size(3);
+  const c10::SymInt B = query.sym_size(0);
+  const c10::SymInt M = query.sym_size(1);
+  const c10::SymInt N = key.sym_size(1);
+  const c10::SymInt K = query.sym_size(3);
+  const c10::SymInt Kv = value.sym_size(3);
 
   // Local windows can fully mask rows. Without a window, shared cumulative
   // metadata proves packed Q/K lengths match without reading them from device.
@@ -516,25 +532,25 @@ _efficient_attention_backward(
     // Creating the gradients with the right layout saves us
     // a `torch.cat` call in the backward pass
     TORCH_CHECK(
-      query.size(1) == key.size(1),
+      M == N,
       "`shared_storage_dqdkdv` is only supported when Q/K/V "
-      "have the same sequence length: got ", query.size(1),
-      " query tokens and ", key.size(1), " key/value tokens"
+      "have the same sequence length: got ", M,
+      " query tokens and ", N, " key/value tokens"
     );
     TORCH_CHECK(
-      query.size(3) == key.size(3) && query.size(3) == value.size(3),
+      K == key.sym_size(3) && K == Kv,
       "`shared_storage_dqdkdv` is only supported when Q/K/V "
-      "have the same embed dim: got ", query.size(3),
-      " for Q, ", key.size(3), " for K, and ", value.size(3), " for V"
+      "have the same embed dim: got ", K,
+      " for Q, ", key.sym_size(3), " for K, and ", Kv, " for V"
     );
-    at::Tensor chunk = at::empty({B, M, 3, nH, K}, query.options());
+    at::Tensor chunk = at::empty_symint({B, M, 3, nH, K}, query.options());
     grad_q = chunk.select(2, 0);
     grad_k = chunk.select(2, 1);
     grad_v = chunk.select(2, 2);
   } else {
-    grad_q = at::empty(query.sizes(), query.options());
-    grad_k = at::empty(key.sizes(), key.options());
-    grad_v = at::empty(value.sizes(), value.options());
+    grad_q = at::empty_symint(query.sym_sizes(), query.options());
+    grad_k = at::empty_symint(key.sym_sizes(), key.options());
+    grad_v = at::empty_symint(value.sym_sizes(), value.options());
   }
   if (may_have_fully_masked_rows) {
     grad_q.zero_();
@@ -544,8 +560,8 @@ _efficient_attention_backward(
   at::Tensor grad_v_expanded = grad_v;
 #ifndef USE_ROCM
   if (nH != nHkv) {
-    grad_k_expanded = at::empty({B, N, nH, K}, key.options());
-    grad_v_expanded = at::empty({B, N, nH, Kv}, value.options());
+    grad_k_expanded = at::empty_symint({B, N, nH, K}, key.options());
+    grad_v_expanded = at::empty_symint({B, N, nH, Kv}, value.options());
   }
 #endif
 
@@ -554,12 +570,12 @@ _efficient_attention_backward(
         bias.has_value(),
         "bias_requires_grad is true but no bias was provided");
     // force alignment for the last dim
-    std::vector<int64_t> sz = bias->sizes().vec();
-    int64_t lastDim = sz[sz.size() - 1];
+    std::vector<c10::SymInt> sz = bias->sym_sizes().vec();
+    const c10::SymInt lastDim = sz[sz.size() - 1];
     int64_t alignTo = 16;
     sz[sz.size() - 1] = alignTo * ((lastDim + alignTo - 1) / alignTo);
-    grad_bias = at::empty(sz, bias->options())
-                    .slice(/*dim=*/-1, /*start=*/0, /*end=*/lastDim);
+    grad_bias = at::empty_symint(sz, bias->options())
+                    .slice_symint(/*dim=*/-1, /*start=*/0, /*end=*/lastDim);
   }
 
   const bool use_dropout = std::fpclassify(dropout_p) != FP_ZERO;
@@ -567,6 +583,12 @@ _efficient_attention_backward(
   // See Note [Seed and Offset Device]
   at::PhiloxCudaState rng_engine_inputs;
   if (use_dropout) {
+#ifndef USE_ROCM
+    // the forward's philox state is not on the tape: a decline by name
+    if (ht::active() != nullptr) {
+      ht::decline("host_trace: memory-efficient attention backward with dropout is not traced (the generator increment is not recorded) (declined)");
+    }
+#endif
     if (at::cuda::currentStreamCaptureStatus() ==
         at::cuda::CaptureStatus::None) {
       rng_engine_inputs = at::PhiloxCudaState(
@@ -612,8 +634,8 @@ _efficient_attention_backward(
                      opt_grad_bias,
                      cu_seqlens_q,
                      cu_seqlens_k,
-                     max_seqlen_q,
-                     max_seqlen_k,
+                     max_seqlen_q.guard_int(__FILE__, __LINE__),
+                     max_seqlen_k.guard_int(__FILE__, __LINE__),
                      float(dropout_p),
                      my_softmax_scale,
                      custom_mask_type == 0 ? false : true, // is_causal
@@ -668,9 +690,9 @@ _efficient_attention_backward(
     at::Tensor dk_t = grad_k.permute({0,2,1,3});
     at::Tensor dv_t = grad_v.permute({0,2,1,3});
     at::Tensor dout_t = grad_out.permute({0,2,1,3});
-    const auto lse_batch_size =
-        cu_seqlens_q.has_value() ? cu_seqlens_q->size(0) - 1 : B;
-    at::Tensor softmax_lse = logsumexp.view({lse_batch_size * nH, max_seqlen_q});
+    const c10::SymInt lse_batch_size =
+        cu_seqlens_q.has_value() ? cu_seqlens_q->sym_size(0) - 1 : B;
+    at::Tensor softmax_lse = logsumexp.view_symint({lse_batch_size * nH, max_seqlen_q});
     using sdp::aotriton_adapter::mk_aotensor;
     using sdp::aotriton_adapter::mk_aoscalartensor;
     using sdp::aotriton_adapter::cast_dtype;
@@ -695,8 +717,8 @@ _efficient_attention_backward(
     params.DQ = mk_aotensor(dq_t, "dq");
     params.DB = bias_requires_grad ? mk_aotensor(grad_bias, "db") : empty_t4;
     params.L = mk_aotensor<2>(softmax_lse, "L");
-    params.Max_seqlen_q = max_seqlen_q;        // Unused if cu_seqlens_q is empty
-    params.Max_seqlen_k = max_seqlen_k;        // Unused if cu_seqlens_k is empty
+    params.Max_seqlen_q = max_seqlen_q.guard_int(__FILE__, __LINE__);        // Unused if cu_seqlens_q is empty
+    params.Max_seqlen_k = max_seqlen_k.guard_int(__FILE__, __LINE__);        // Unused if cu_seqlens_k is empty
     params.dropout_p = float(dropout_p);
     params.philox_seed_ptr = mk_aoscalartensor(aotriton_philox_seed);
     params.philox_offset1 = mk_aoscalartensor(aotriton_philox_offset);
@@ -743,19 +765,20 @@ _efficient_attention_backward(
   }
 
   bool kernel_launched = false;
-  const auto maxK = std::max(query.size(3), value.size(3));
   const auto maxShmem = p->sharedMemPerBlockOptin;
 
   auto launchKernel = [&](auto _k, auto kernel_fn) {
     using Kernel = decltype(_k);
     using scalar_t = typename Kernel::scalar_t;
     (void)_k;
+    ht::KernelChoice choice; // the kernel list's predicates pick the kernel
 
     if (kernel_launched) {
       return;
     }
-    // Check if this kernel is compatible
-    if (Kernel::kMaxK < maxK) {
+    // Check if this kernel is compatible (the head dims one at a time: the
+    // same choice as against their max, two plain guards under a trace)
+    if (Kernel::kMaxK < K || Kernel::kMaxK < Kv) {
       return;
     }
     // Dropout must be supported if we need it
@@ -763,14 +786,14 @@ _efficient_attention_backward(
       return;
     }
     if (Kernel::kKeysQueriesAlignedToBlockSize &&
-        (cu_seqlens_q.has_value() || M % Kernel::kBlockSizeI ||
-         N % Kernel::kBlockSizeJ)) {
+        (cu_seqlens_q.has_value() || M % Kernel::kBlockSizeI != 0 ||
+         N % Kernel::kBlockSizeJ != 0)) {
       return;
     }
     // Alignment
-    if ((query.stride(2) % Kernel::kMinimumAlignment) ||
-        (key.stride(2) % Kernel::kMinimumAlignment) ||
-        (value.stride(2) % Kernel::kMinimumAlignment)) {
+    if (query.sym_stride(2) % Kernel::kMinimumAlignment != 0 ||
+        key.sym_stride(2) % Kernel::kMinimumAlignment != 0 ||
+        value.sym_stride(2) % Kernel::kMinimumAlignment != 0) {
       return;
     }
     // Uses too much shmem
@@ -782,7 +805,7 @@ _efficient_attention_backward(
     kernel_launched = true;
 
     if (M == 0 || N == 0 || B == 0 || nH == 0 ||
-        (cu_seqlens_q.has_value() && cu_seqlens_q->size(0) == 1)) {
+        (cu_seqlens_q.has_value() && cu_seqlens_q->sym_size(0) == 1)) {
       grad_k_expanded.zero_();
       grad_v_expanded.zero_();
       grad_q.zero_();
@@ -792,127 +815,125 @@ _efficient_attention_backward(
     // TODO: Fuse this into a kernel?
     // This is a bottleneck for smaller sequences (M <= 128)
     auto delta = Kernel::kKernelComputesDelta
-        ? at::empty({B, nH, M}, query.options().dtype(at::ScalarType::Float))
+        ? at::empty_symint({B, nH, M}, query.options().dtype(at::ScalarType::Float))
         : (grad_out.to(at::kFloat) * out.to(at::kFloat))
               .sum(-1)
               .transpose(-2, -1)
               .contiguous();
-    TORCH_INTERNAL_ASSERT(delta.size(0) == B);
-    TORCH_INTERNAL_ASSERT(delta.size(1) == nH);
-    TORCH_INTERNAL_ASSERT(delta.size(2) == M);
+    TORCH_INTERNAL_ASSERT(delta.sym_size(0) == B);
+    TORCH_INTERNAL_ASSERT(delta.sym_size(1) == nH);
+    TORCH_INTERNAL_ASSERT(delta.sym_size(2) == M);
 
-    // TODO: Initialize unconditional Params fields with C++20 designated initializers.
-    typename Kernel::Params p;
-    p.query_ptr = (const scalar_t*)query.const_data_ptr();
-    p.key_ptr = (const scalar_t*)key.const_data_ptr();
-    p.value_ptr = (const scalar_t*)value.const_data_ptr();
-    p.logsumexp_ptr = (typename Kernel::lse_scalar_t const *)logsumexp.const_data_ptr();
-    p.output_ptr = (const scalar_t*)out.const_data_ptr();
-    p.grad_output_ptr = (const scalar_t*)grad_out.const_data_ptr();
-    p.grad_query_ptr = (scalar_t*)grad_q.data_ptr();
-    p.grad_key_ptr =
-        static_cast<scalar_t*>(grad_k_expanded.mutable_data_ptr());
-    p.grad_value_ptr =
-        static_cast<scalar_t*>(grad_v_expanded.mutable_data_ptr());
-    p.delta_ptr = (float*)delta.data_ptr();
-    p.head_dim = query.size(3);
-    p.head_dim_value = value.size(3);
+    TracedBackwardParams<typename Kernel::Params> p;
+    p.query_ptr = ht::sym_const_data_ptr(query);
+    p.key_ptr = ht::sym_const_data_ptr(key);
+    p.value_ptr = ht::sym_const_data_ptr(value);
+    p.logsumexp_ptr = ht::sym_const_data_ptr(logsumexp);
+    p.output_ptr = ht::sym_const_data_ptr(out);
+    p.grad_output_ptr = ht::sym_const_data_ptr(grad_out);
+    p.grad_query_ptr = ht::sym_mutable_data_ptr(grad_q);
+    p.grad_key_ptr = ht::sym_mutable_data_ptr(grad_k_expanded);
+    p.grad_value_ptr = ht::sym_mutable_data_ptr(grad_v_expanded);
+    p.delta_ptr = ht::sym_mutable_data_ptr(delta);
+    p.head_dim = K;
+    p.head_dim_value = Kv;
     p.num_queries = max_seqlen_q;
     p.num_keys = max_seqlen_k;
-    p.num_batches = cu_seqlens_q.has_value() ? cu_seqlens_q->size(0) - 1 : B;
+    p.num_batches = cu_seqlens_q.has_value() ? cu_seqlens_q->sym_size(0) - 1 : B;
     p.num_heads = nH;
     p.q_heads_per_kv = nH / nHkv;
     p.custom_mask_type = custom_mask_type;
-    p.scale = sdp::calculate_scale(query, scale).expect_float();
+    // narrowed to the float field as the expect_float() assignment was
+    p.scale = sdp::calculate_scale(query, scale);
     if (cu_seqlens_q.has_value()) {
-      p.cu_seqlens_q_ptr = (const int32_t*)cu_seqlens_q->const_data_ptr();
-      p.cu_seqlens_k_ptr = (const int32_t*)cu_seqlens_k->const_data_ptr();
+      p.cu_seqlens_q_ptr = ht::sym_const_data_ptr(*cu_seqlens_q);
+      p.cu_seqlens_k_ptr = ht::sym_const_data_ptr(*cu_seqlens_k);
     }
     if (window_size.has_value()) {
       p.window_size = *window_size;
     }
 
-    ASSIGN_CHECK_OVERFLOW(p.lse_strideB, logsumexp.stride(0));
-    ASSIGN_CHECK_OVERFLOW(p.lse_strideH, logsumexp.stride(1));
-    ASSIGN_CHECK_OVERFLOW(p.gO_strideB, grad_out.stride(0));
-    ASSIGN_CHECK_OVERFLOW(p.gO_strideM, grad_out.stride(1));
-    ASSIGN_CHECK_OVERFLOW(p.gO_strideH, grad_out.stride(2));
+    assign_check_overflow(p.lse_strideB, logsumexp.sym_stride(0), "logsumexp.stride(0)");
+    assign_check_overflow(p.lse_strideH, logsumexp.sym_stride(1), "logsumexp.stride(1)");
+    assign_check_overflow(p.gO_strideB, grad_out.sym_stride(0), "grad_out.stride(0)");
+    assign_check_overflow(p.gO_strideM, grad_out.sym_stride(1), "grad_out.stride(1)");
+    assign_check_overflow(p.gO_strideH, grad_out.sym_stride(2), "grad_out.stride(2)");
 
-    ASSIGN_CHECK_OVERFLOW(p.o_strideB, out.stride(0));
-    ASSIGN_CHECK_OVERFLOW(p.o_strideH, out.stride(2));
+    assign_check_overflow(p.o_strideB, out.sym_stride(0), "out.stride(0)");
+    assign_check_overflow(p.o_strideH, out.sym_stride(2), "out.stride(2)");
 
-    ASSIGN_CHECK_OVERFLOW(p.gQ_strideB, grad_q.stride(0));
-    ASSIGN_CHECK_OVERFLOW(p.gK_strideB, grad_k_expanded.stride(0));
-    ASSIGN_CHECK_OVERFLOW(p.gV_strideB, grad_v_expanded.stride(0));
-    ASSIGN_CHECK_OVERFLOW(p.gQ_strideH, grad_q.stride(2));
-    ASSIGN_CHECK_OVERFLOW(p.gK_strideH, grad_k_expanded.stride(2));
-    ASSIGN_CHECK_OVERFLOW(p.gV_strideH, grad_v_expanded.stride(2));
+    assign_check_overflow(p.gQ_strideB, grad_q.sym_stride(0), "grad_q.stride(0)");
+    assign_check_overflow(p.gK_strideB, grad_k_expanded.sym_stride(0), "grad_k_expanded.stride(0)");
+    assign_check_overflow(p.gV_strideB, grad_v_expanded.sym_stride(0), "grad_v_expanded.stride(0)");
+    assign_check_overflow(p.gQ_strideH, grad_q.sym_stride(2), "grad_q.stride(2)");
+    assign_check_overflow(p.gK_strideH, grad_k_expanded.sym_stride(2), "grad_k_expanded.stride(2)");
+    assign_check_overflow(p.gV_strideH, grad_v_expanded.sym_stride(2), "grad_v_expanded.stride(2)");
     p.gQKV_strideM_multiplier = shared_storage_dqdkdv ? 3 : 1;
-    TORCH_INTERNAL_ASSERT(p.gQ_strideM() == grad_q.stride(1));
-    TORCH_INTERNAL_ASSERT(p.gK_strideM() == grad_k_expanded.stride(1));
-    TORCH_INTERNAL_ASSERT(p.gV_strideM() == grad_v_expanded.stride(1));
+    TORCH_INTERNAL_ASSERT(p.gQ_strideM() == grad_q.sym_stride(1));
+    TORCH_INTERNAL_ASSERT(p.gK_strideM() == grad_k_expanded.sym_stride(1));
+    TORCH_INTERNAL_ASSERT(p.gV_strideM() == grad_v_expanded.sym_stride(1));
 
-    ASSIGN_CHECK_OVERFLOW(p.q_strideB, query.stride(0));
-    ASSIGN_CHECK_OVERFLOW(p.k_strideB, key.stride(0));
-    ASSIGN_CHECK_OVERFLOW(p.v_strideB, value.stride(0));
-    ASSIGN_CHECK_OVERFLOW(p.q_strideM, query.stride(1));
-    ASSIGN_CHECK_OVERFLOW(p.k_strideM, key.stride(1));
-    ASSIGN_CHECK_OVERFLOW(p.v_strideM, value.stride(1));
-    ASSIGN_CHECK_OVERFLOW(p.q_strideH, query.stride(2));
-    ASSIGN_CHECK_OVERFLOW(p.k_strideH, key.stride(2));
-    ASSIGN_CHECK_OVERFLOW(p.v_strideH, value.stride(2));
-    ASSIGN_CHECK_OVERFLOW(p.delta_strideB, delta.stride(0));
-    ASSIGN_CHECK_OVERFLOW(p.delta_strideH, delta.stride(1));
+    assign_check_overflow(p.q_strideB, query.sym_stride(0), "query.stride(0)");
+    assign_check_overflow(p.k_strideB, key.sym_stride(0), "key.stride(0)");
+    assign_check_overflow(p.v_strideB, value.sym_stride(0), "value.stride(0)");
+    assign_check_overflow(p.q_strideM, query.sym_stride(1), "query.stride(1)");
+    assign_check_overflow(p.k_strideM, key.sym_stride(1), "key.stride(1)");
+    assign_check_overflow(p.v_strideM, value.sym_stride(1), "value.stride(1)");
+    assign_check_overflow(p.q_strideH, query.sym_stride(2), "query.stride(2)");
+    assign_check_overflow(p.k_strideH, key.sym_stride(2), "key.stride(2)");
+    assign_check_overflow(p.v_strideH, value.sym_stride(2), "value.stride(2)");
+    assign_check_overflow(p.delta_strideB, delta.sym_stride(0), "delta.stride(0)");
+    assign_check_overflow(p.delta_strideH, delta.sym_stride(1), "delta.stride(1)");
 
     if (bias.has_value()) {
-      CHECK_NOSPARSE_LASTCONTIGUOUS_CUDA((*bias));
+      CHECK_NOSPARSE_LASTCONTIGUOUS_CUDA_SYM((*bias));
       TORCH_CHECK(
           bias->scalar_type() == CutlassToAtenDtype<scalar_t>::atScalarType(),
           "invalid dtype for bias - should match query's dtype");
 
-      p.bias_ptr = (scalar_t*)bias->data_ptr();
+      // the mutable read the unconverted host made (data_ptr)
+      p.bias_ptr = ht::sym_mutable_data_ptr(*bias);
 
       TORCH_CHECK(bias->dim() == 4, "Bias expected in BMHK format");
       TORCH_CHECK(
-          bias->size(0) == query.size(0),
+          bias->sym_size(0) == query.sym_size(0),
           "attn_bias: wrong shape (batch dimension)");
       TORCH_CHECK(
-          bias->size(1) == query.size(2),
+          bias->sym_size(1) == query.sym_size(2),
           "attn_bias: wrong shape (head dimension)");
       TORCH_CHECK(
-          bias->size(2) == query.size(1),
+          bias->sym_size(2) == query.sym_size(1),
           "attn_bias: wrong shape (seqlenQ dimension)");
       TORCH_CHECK(
-          bias->size(3) == key.size(1),
+          bias->sym_size(3) == key.sym_size(1),
           "attn_bias: wrong shape (seqlenKV dimension)");
       TORCH_CHECK(
-          bias->stride(3) == 1,
+          bias->sym_stride(3) == 1,
           "attn_bias: wrong alignment (last dimension must be contiguous)");
-      ASSIGN_CHECK_OVERFLOW(p.bias_strideB, bias->stride(0));
-      ASSIGN_CHECK_OVERFLOW(p.bias_strideH, bias->stride(1));
-      ASSIGN_CHECK_OVERFLOW(p.bias_strideM, bias->stride(2));
+      assign_check_overflow(p.bias_strideB, bias->sym_stride(0), "bias->stride(0)");
+      assign_check_overflow(p.bias_strideH, bias->sym_stride(1), "bias->stride(1)");
+      assign_check_overflow(p.bias_strideM, bias->sym_stride(2), "bias->stride(2)");
 
       if (bias_requires_grad) {
-        p.grad_bias_ptr = (scalar_t*)grad_bias.data_ptr();
+        p.grad_bias_ptr = ht::sym_mutable_data_ptr(grad_bias);
 
-        ASSIGN_CHECK_OVERFLOW(p.gB_strideB, grad_bias.stride(0));
-        ASSIGN_CHECK_OVERFLOW(p.gB_strideH, grad_bias.stride(1));
-        ASSIGN_CHECK_OVERFLOW(p.gB_strideM, grad_bias.stride(2));
+        assign_check_overflow(p.gB_strideB, grad_bias.sym_stride(0), "grad_bias.stride(0)");
+        assign_check_overflow(p.gB_strideH, grad_bias.sym_stride(1), "grad_bias.stride(1)");
+        assign_check_overflow(p.gB_strideM, grad_bias.sym_stride(2), "grad_bias.stride(2)");
       }
     }
 
     if (use_dropout) {
-      p.rng_engine_inputs = rng_engine_inputs;
+      new (static_cast<void*>(p.rng_engine_inputs)) at::PhiloxCudaState(rng_engine_inputs);
       p.dropout_prob = dropout_p;
     }
 
-    // Heuristic for finding optimal number of splits
-    auto parallelism_without_split_key =
-        p.getBlocksGrid().x * p.getBlocksGrid().y * p.getBlocksGrid().z;
-    p.num_splits_key = cutlass::ceil_div(p.num_keys, Kernel::kBlockSizeJ);
+    // Heuristic for finding optimal number of splits (the grid before the
+    // split: num_splits_key is still its default 1)
+    const c10::SymInt parallelism_without_split_key = p.num_splits_key * p.num_heads * p.num_batches;
+    p.num_splits_key = (p.num_keys + Kernel::kBlockSizeJ - 1) / Kernel::kBlockSizeJ;
     if (num_splits_key.has_value()) {
-      p.num_splits_key =
-          std::min<int64_t>(p.num_splits_key, num_splits_key.value());
+      p.num_splits_key = p.num_splits_key.sym().min(c10::SymInt(num_splits_key.value()));
     } else {
       // Keys splitting heuristic
 
@@ -926,8 +947,7 @@ _efficient_attention_backward(
       // Increasing `split_keys` leads to using more gmem for temporary storage
       // when we need a staging area for gK/gV. let's avoid that
       if (Kernel::kNeedsAccumGradK || Kernel::kNeedsAccumGradV) {
-        p.num_splits_key = std::min(
-            int32_t(p.num_splits_key), 200 / ((int32_t)(p.num_batches * p.num_heads)));
+        p.num_splits_key = p.num_splits_key.sym().min(200 / (p.num_batches * p.num_heads));
       }
     }
     if (!Kernel::kEnableSplitKeys || p.num_splits_key < 1) {
@@ -947,17 +967,17 @@ _efficient_attention_backward(
         p.num_splits_key = 1;
       }
     }
-    int64_t size_bytes = p.workspace_size();
-    if (size_bytes) {
+    const c10::SymInt size_bytes = p.template workspace_size<Kernel>();
+    if (size_bytes != 0) {
       workspace =
-          at::empty({size_bytes}, query.options().dtype(at::ScalarType::Byte));
-      p.workspace = (float*)workspace.data_ptr();
+          at::empty_symint({size_bytes}, query.options().dtype(at::ScalarType::Byte));
+      p.workspace = ht::sym_mutable_data_ptr(workspace);
       if (p.should_zero_workspace()) {
         workspace.zero_();
       }
     }
 
-    Kernel::check_supported(p);
+    check_supported_backward<Kernel>(p);
 
     if (smem_bytes > 0xc000) {
       // https://docs.nvidia.com/cuda/cuda-c-programming-guide/#features-and-technical-specifications-technical-specifications-per-compute-capability
@@ -991,7 +1011,7 @@ _efficient_attention_backward(
         checkBinaryArchMatches(), "Something went wrong in the build process");
 #endif
 
-    kernel_fn<<<p.getBlocksGrid(), p.getThreadsGrid(), smem_bytes, stream>>>(p);
+    ht::launch(kernel_fn, p.template blocks_grid<Kernel>(), p.template threads_grid<Kernel>(), static_cast<int64_t>(smem_bytes), stream, p);
   };
 
   DISPATCH_TYPES(query, ([&]() {
@@ -1002,11 +1022,11 @@ _efficient_attention_backward(
   if (nH != nHkv) {
     at::sum_out(
         grad_k,
-        at::reshape(grad_k_expanded, {B, N, nHkv, nH / nHkv, K}),
+        at::reshape_symint(grad_k_expanded, {B, N, nHkv, nH / nHkv, K}),
         {3});
     at::sum_out(
         grad_v,
-        at::reshape(grad_v_expanded, {B, N, nHkv, nH / nHkv, Kv}),
+        at::reshape_symint(grad_v_expanded, {B, N, nHkv, nH / nHkv, Kv}),
         {3});
   }
 #endif // USE_ROCM
@@ -1089,9 +1109,11 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> _scaled_dot_product_e
     return std::make_tuple(Tensor{}, Tensor{}, Tensor{}, Tensor{});
   }
   constexpr int64_t MAX_BATCH_SIZE = (1LL << 16) - 1;
-  int64_t batch_size = query.size(0);
+  // symbolic under a host trace; the chunked path below pins it
+  const c10::SymInt sym_batch_size = query.sym_size(0);
+  const bool chunked = sym_batch_size > MAX_BATCH_SIZE;
 
-  if (batch_size > MAX_BATCH_SIZE) {
+  if (chunked) {
     TORCH_CHECK(dropout_p == 0.0,
                 "Efficient attention backward cannot handle dropout when "
                 "the batch size exceeds (", MAX_BATCH_SIZE, ").");
@@ -1119,14 +1141,14 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> _scaled_dot_product_e
   // Will add with signauter changes for dropout and bias
   // We are only handling Dense inputs, but this should be passed
   // from forward to backward
-  int64_t max_seqlen_q = query_chunk.size(2);
-  int64_t max_seqlen_k = key_chunk.size(2);
+  const c10::SymInt max_seqlen_q = query_chunk.sym_size(2);
+  const c10::SymInt max_seqlen_k = key_chunk.sym_size(2);
 
   sdp::CustomMaskType custom_mask_type = causal
     ? sdp::CustomMaskType::CausalFromTopLeft
     : sdp::CustomMaskType::NoCustomMask;
   auto [grad_q, grad_k, grad_v, grad_bias] =
-      at::_efficient_attention_backward(
+      at::_efficient_attention_backward_symint(
           grad_out_chunk,
           query_chunk,
           key_chunk,
@@ -1150,7 +1172,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> _scaled_dot_product_e
   };
 
   // process in chunks if batch size exceeds maximum
-  if (batch_size > MAX_BATCH_SIZE) {
+  if (chunked) {
+    const int64_t batch_size = sym_batch_size.guard_int(__FILE__, __LINE__);
     Tensor final_grad_q, final_grad_k, final_grad_v, final_grad_bias;
 
     auto create_permuted_output = [batch_size](const Tensor& tensor) -> Tensor {

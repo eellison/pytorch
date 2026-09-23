@@ -1132,6 +1132,72 @@ class TestCudaHostTraceEmbedCat(HostTraceTestCase):
             self.assertTrue(torch.equal(got, want))
         self.assertFalse(C._host_trace_tracing())
 
+    def test_index_gather_replays_eager_function_handles(self):
+        # k_out[:, :, indices] (HybridCache._sliding_update), a row gather
+        # table[ids] and two broadcast indices x[i, :, j]: the entry launches
+        # eager's index_elementwise_kernel over IndexFunctor<IndexGatherFunctor>
+        # or its vectorized gather (16-byte aligned contiguous rows, one
+        # index), by function handle (E36), bitwise, replayed at new index
+        # values and shapes; a boolean mask, a CPU index and a list index
+        # decline by name
+        def sliding(cache, idx):
+            return cache[:, :, idx]
+
+        def rows(table, ids):
+            return table[ids]
+
+        def two(x, i, j):
+            return x[i, :, j]
+
+        def cache_args(b, length):
+            cache = torch.randn(b, 4, length, 32, device="cuda", dtype=torch.bfloat16)
+            return cache, (torch.arange(length, device="cuda") + 5) % length
+
+        def row_args(n, k):
+            table = torch.randn(n, 128, device="cuda", dtype=torch.bfloat16)
+            return table, torch.randint(0, n, (k,), device="cuda")
+
+        def two_args(n, cols):
+            return (
+                torch.randn(16, 3, cols, device="cuda"),
+                torch.randint(0, 16, (n,), device="cuda"),
+                torch.randint(0, cols, (n,), device="cuda"),
+            )
+
+        cases = {
+            "sliding": (
+                sliding,
+                cache_args(2, 64),
+                [cache_args(3, 64), cache_args(2, 80)],
+            ),
+            "rows": (rows, row_args(1000, 48), [row_args(500, 7), row_args(1000, 3)]),
+            "two indices": (two, two_args(5, 8), [two_args(2, 11), two_args(9, 3)]),
+        }
+        for name, (fn, base, news) in cases.items():
+            with self.subTest(case=name):
+                eager = assert_eager_function_handles(self, fn, base, launches=1)
+                self.assertEqual(len(eager), 1)
+                variant = build(ht.trace(fn, base), fn, base)
+                for new in news:
+                    (got,) = variant.replay(new)
+                    want = fn(*new)
+                    torch.cuda.synchronize()
+                    self.assertTrue(torch.equal(got, want), name)
+                    self.assertEqual(got.stride(), want.stride())
+        # the vectorized gather's route is eager's: a misaligned row length
+        # takes the generic kernel on both sides
+        table, ids = row_args(1000, 48)
+        assert_eager_function_handles(self, rows, (table[:, :100], ids), launches=1)
+        x, i, j = two_args(5, 8)
+        with self.assertRaisesRegex(ht.Declined, "mask"):
+            ht.trace(lambda t, m: t[m], (x, x[:, 0, 0] > 0))
+        cpu_index = i.cpu()
+        with self.assertRaisesRegex(ht.Declined, "sequence or CPU-tensor index"):
+            ht.trace(lambda t: t[cpu_index], (x,))
+        with self.assertRaisesRegex(ht.Declined, "sequence or CPU-tensor index"):
+            ht.trace(lambda t: t[:, [1, 0]], (x,))
+        self.assertFalse(C._host_trace_tracing())
+
     def test_every_case_traces_the_same_program_under_other_hints(self):
         # the recorder never reads a hint: every trace this class makes, made
         # again under other hints, is the same program (host_trace_two_hint)

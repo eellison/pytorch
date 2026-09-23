@@ -35,8 +35,13 @@ TensorIteratorSym TensorIteratorSym::binary_op(const Tensor& out, const Tensor& 
 }
 
 TensorIteratorSym TensorIteratorSym::binary_op(const Tensor& out, const Tensor& a, const Tensor& b) {
+  // TensorIterator.cpp BINARY_OP_CONFIG: a bool or integer operand beside a
+  // floating one is promoted (the 4-D mask builder's bf16 mul_ bool and bf16
+  // add int64), read by this commit's dynamic-cast route of gpu_kernel
   TensorIteratorSymConfig config;
   config.allow_cpu_scalars_ = true;
+  config.promote_inputs_to_common_dtype_ = true;
+  config.cast_common_dtype_to_outputs_ = true;
   return binary_op(out, a, b, config);
 }
 
@@ -71,8 +76,11 @@ TensorIteratorSym TensorIteratorSym::ternary_op(const Tensor& out, const Tensor&
 }
 
 TensorIteratorSym TensorIteratorSym::comparison_op(const Tensor& out, const Tensor& a, const Tensor& b) {
+  // set_up_comparison_op_config promotes the inputs too; the bool result is
+  // the kernel's own store, so no output check
   TensorIteratorSymConfig config;
   config.allow_cpu_scalars_ = true;
+  config.promote_inputs_to_common_dtype_ = true;
   if (!out.defined()) {
     config.static_dtype_ = kBool;
   }
@@ -86,12 +94,13 @@ TensorIteratorSym TensorIteratorSym::comparison_op(const Tensor& out, const Tens
 
 TensorIteratorSym TensorIteratorSym::reduce_op(const Tensor& out, const Tensor& a) {
   TORCH_INTERNAL_ASSERT(out.defined());
-  // TensorIterator::reduce_op: no output resize, is_reduction; the real
-  // config also promotes the input to the common dtype, which v1 declines
-  // in compute_types (the output has the input's dtype)
+  // TensorIterator::reduce_op: no output resize, is_reduction, the input
+  // promoted to the common dtype (the input's own: the result may be of
+  // another dtype, bool for all / any, and the kernel casts inside)
   TensorIteratorSymConfig config;
   config.resize_outputs_ = false;
   config.is_reduction_ = true;
+  config.promote_inputs_to_common_dtype_ = true;
   TensorIteratorSym iter;
   iter.add_output(out);
   iter.add_input(a);
@@ -125,6 +134,8 @@ void TensorIteratorSym::compute_types(const TensorIteratorSymConfig& config) {
   // the device and dtype rules below; its promotion is checked after them
   int cpu_scalars = 0;
   at::native::ResultTypeState state = {};
+  // the CUDA inputs alone: the common dtype where the config promotes
+  at::native::ResultTypeState cuda_state = {};
   for (auto& op : operands_) {
     if (!op.tensor_base().defined()) {
       if (config.static_dtype_.has_value()) {
@@ -145,11 +156,14 @@ void TensorIteratorSym::compute_types(const TensorIteratorSymConfig& config) {
           op.tensor_base().device(),
           " (a CPU scalar or a non-CUDA tensor) is not traced (declined)"));
     }
+    if (!op.is_output) {
+      cuda_state = at::native::update_result_type_state(op.tensor(), cuda_state);
+    }
     if (common_dtype_ == ScalarType::Undefined) {
       common_dtype_ = op.tensor_base().scalar_type();
       common_device_ = op.tensor_base().device();
     }
-    if (config.check_all_same_dtype_ && op.tensor_base().scalar_type() != common_dtype_) {
+    if (config.check_all_same_dtype_ && !config.promote_inputs_to_common_dtype_ && op.tensor_base().scalar_type() != common_dtype_) {
       decline(c10::str(
           "host_trace: TensorIterator operands of different dtypes (",
           common_dtype_,
@@ -159,6 +173,32 @@ void TensorIteratorSym::compute_types(const TensorIteratorSymConfig& config) {
     }
     if (op.tensor_base().device() != common_device_) {
       decline("host_trace: TensorIterator operands on different devices (declined)");
+    }
+  }
+  if (config.promote_inputs_to_common_dtype_) {
+    if (common_dtype_ == ScalarType::Undefined) {
+      decline("host_trace: TensorIterator with no CUDA operand is not traced (declined)");
+    }
+    // TensorIteratorBase::compute_common_dtype over the CUDA inputs (a CPU
+    // scalar's promotion is checked below); a defined output of another
+    // dtype: eager's safe-cast check, then a decline (the store's cast)
+    common_dtype_ = at::native::result_type(cuda_state);
+    for (auto& op : operands_) {
+      if (!op.is_output || !op.tensor_base().defined() || !config.cast_common_dtype_to_outputs_ || op.current_dtype == common_dtype_) {
+        continue;
+      }
+      TORCH_CHECK(
+          canCast(common_dtype_, op.current_dtype),
+          "result type ",
+          common_dtype_,
+          " can't be cast to the desired output type ",
+          op.current_dtype);
+      decline(c10::str(
+          "host_trace: TensorIterator computes in ",
+          common_dtype_,
+          " and writes a ",
+          op.current_dtype,
+          " output: the cast on store is not traced (declined)"));
     }
   }
   if (cpu_scalars > 0) {

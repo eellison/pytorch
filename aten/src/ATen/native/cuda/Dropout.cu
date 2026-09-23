@@ -487,6 +487,7 @@ Tensor masked_scale_cuda(const Tensor& self, const Tensor& mask, double scale){
 // the parity test compares it with the real op.
 #include <ATen/cuda/host_trace/Field.h>
 #include <ATen/cuda/host_trace/Launch.h>
+#include <ATen/cuda/host_trace/Philox.h>
 #include <ATen/cuda/host_trace/Recorder.h>
 #include <ATen/cuda/host_trace/ti/EagerViews.cuh>
 #include <ATen/cuda/host_trace/ti/Ops.h>
@@ -513,17 +514,6 @@ void flat_info(Info& info, const c10::SymInt& data, const c10::SymInt& numel) {
   info.strides[0] = 1;
   info.set_dims(1);
 }
-
-// The philox state as a kernel argument: generator state of the capture,
-// recorded as an `rng` field (never rewritten, never compared) like flash's
-// Flash_fwd_params::philox_args.
-struct TracedPhilox : TracedBase {
-  PhiloxCudaState pod;
-  BytesField<0, sizeof(PhiloxCudaState)> bytes{this, "philox_args"};
-  explicit TracedPhilox(const PhiloxCudaState& st) : TracedBase(&pod, sizeof(PhiloxCudaState)), pod() {
-    new (static_cast<void*>(bytes)) PhiloxCudaState(st);
-  }
-};
 
 // memory::can_vectorize_up_to on the input pointer, as guards on its
 // address; the fresh outputs are allocation roots (256-byte aligned).

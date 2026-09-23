@@ -33,6 +33,16 @@ TORCH_CUDA_CU_API Tensor& index_put_traced(
     const std::vector<Tensor>& indices,
     const std::vector<c10::SymInt>& indexed_sizes,
     const std::vector<c10::SymInt>& indexed_strides);
+// index.Tensor (a gather with tensor indices, k_out[:, :, indices]): the
+// iterator build_index_op builds over the restrided self and the reshaped
+// indices, allocating the result, and IndexKernel.cu's index_kernel (the
+// vectorized gather where eager takes it). The entry does make_info's view
+// arithmetic as for index_put_.
+TORCH_CUDA_CU_API Tensor index_traced(
+    const Tensor& src,
+    const std::vector<Tensor>& indices,
+    const std::vector<c10::SymInt>& indexed_sizes,
+    const std::vector<c10::SymInt>& indexed_strides);
 // triu / tril (TriangularOps.cu triu_tril_cuda_template) into `result`: self
 // for the in-place op, the diagonal as a value
 TORCH_CUDA_CU_API Tensor& triu_tril_traced(const Tensor& self, const c10::SymInt& k, bool upper, Tensor& result);

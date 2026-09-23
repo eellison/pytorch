@@ -2532,6 +2532,41 @@ print("RESULT entry", served.traces, served.ordinary, len(served.variants), warn
                 ht.trace(fn, (x, y), warm_up=False)
         self.assertFalse(torch._C._host_trace_tracing())
 
+    def test_a_sequence_index_on_a_traced_tensor_declines_by_name(self):
+        # x[:, [-1, 0]] (a Python list, a CPU index tensor) would build its
+        # index tensor on the host inside the capture: a decline naming the
+        # form, not the capture's own copy error; a CUDA index tensor takes the
+        # stock path (aten.index.Tensor: its own entry, or a decline by name)
+        x = torch.randn(4, 8, device="cuda")
+        rows = torch.tensor([-1, 0])
+        for fn in (lambda t: t[:, [-1, 0]], lambda t: t[[0, 1]], lambda t: t[rows]):
+            fn(x)
+            with self.assertRaisesRegex(ht.Declined, "sequence or CPU-tensor index"):
+                ht.trace(fn, (x,))
+            self.assertFalse(torch._C._host_trace_tracing())
+        cuda_rows = rows.cuda()
+        tape = ht.trace(lambda t: t[cuda_rows], (x,))
+        self.assertEqual(tape.num_launches, 1)
+        (got,) = build(tape, lambda t: t[cuda_rows], (x,)).replay((x,))
+        self.assertEqual(got, x[cuda_rows])
+        self.assertFalse(torch._C._host_trace_tracing())
+
+    def test_a_composite_body_that_reads_a_size_declines_by_the_callers_op(self):
+        # F.conv2d reaches the mode as aten.convolution (CompositeExplicit: its
+        # C++ body runs under the mode, DECISIONS E38) and _convolution reads
+        # numel() of the traced input: the decline names the op the caller
+        # wrote and the read, not the inner op's raw error
+        x = torch.randn(2, 3, 8, 8, device="cuda")
+        w = torch.randn(4, 3, 3, 3, device="cuda")
+        F.conv2d(x, w)
+        with self.assertRaisesRegex(
+            ht.Declined,
+            r"aten\.convolution\.default is not a traceable CUDA host: its body "
+            r"\(aten\._convolution\.default\) reads numel\(\)",
+        ):
+            ht.trace(F.conv2d, (x, w))
+        self.assertFalse(torch._C._host_trace_tracing())
+
     def test_math_bit_inputs_decline_and_miss(self):
         x, w, b = self._inputs(8)
         with self.assertRaisesRegex(ht.Declined, "negative view"):

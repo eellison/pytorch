@@ -92,6 +92,18 @@ struct TensorIteratorSymConfig {
   // TensorIteratorConfig::allow_cpu_scalars: on for binary_op, so a 0-dim CPU
   // tensor (a wrapped Python number) may join a CUDA computation
   bool allow_cpu_scalars_ = false;
+  // TensorIteratorConfig::promote_inputs_to_common_dtype, as the real
+  // iterator applies it on CUDA: the computation dtype is result_type over
+  // the inputs, each input keeps its own dtype and the kernel casts it on
+  // load (gpu_kernel's dynamic-cast route); takes precedence over
+  // check_all_same_dtype_ (reduce_op, and the binary configs)
+  bool promote_inputs_to_common_dtype_ = false;
+  // TensorIteratorConfig::cast_common_dtype_to_outputs with
+  // enforce_safe_casting_to_output (BINARY_OP_CONFIG): a defined output of
+  // another dtype than the common one passes eager's canCast check and then
+  // declines, since an entry dispatching on the output's dtype would not
+  // launch the kernel eager launches for the common one
+  bool cast_common_dtype_to_outputs_ = false;
   bool is_reduction_ = false;
   bool enforce_linear_iteration_ = false;
   std::optional<c10::SymDimVector> static_shape_;

@@ -13,13 +13,18 @@ namespace at::native {
 
 namespace {
 
+// where_kernel_impl's device function as a named functor: the traced sibling
+// at the end of this file launches it too (DECISIONS E36)
+template <typename scalar_t>
+struct WhereFunctor {
+  __device__ scalar_t operator()(bool cond_val, scalar_t self_val, scalar_t other_val) const {
+    return cond_val ? self_val : other_val;
+  }
+};
+
 void where_kernel_impl(TensorIterator &iter) {
   AT_DISPATCH_V2(opaqueScalarType(iter.dtype()), "where_cuda", [&] {
-      gpu_kernel_opaque(
-        iter,
-        [=] GPU_LAMBDA (bool cond_val, scalar_t self_val, scalar_t other_val) -> scalar_t {
-          return cond_val ? self_val : other_val;
-        });
+      gpu_kernel_opaque(iter, WhereFunctor<scalar_t>{});
   }, AT_EXPAND(AT_OPAQUE_TYPES));
 }
 
@@ -241,6 +246,26 @@ Tensor clamp_scalar_traced(const Tensor& self, const std::optional<Scalar>& min,
     gpu_kernel(iter, f.get());
   }), AT_EXPAND(AT_ALL_TYPES), AT_EXPAND(AT_BAREBONES_UNSIGNED_TYPES), kHalf, kBFloat16);
   return result;
+}
+
+Tensor where_traced(const Tensor& condition, const Tensor& self, const Tensor& other) {
+  // TensorCompare.cpp where_self_out's iterator (check_all_same_dtype off:
+  // the bool condition beside the operands, which the registry's entry
+  // brought to one dtype as the real op does) and where_kernel_impl's launch
+  // over the opaque type of the result's element size
+  TORCH_CHECK(
+      condition.scalar_type() == kBool,
+      "where expected condition to be a boolean tensor, but got a tensor with dtype ",
+      condition.scalar_type());
+  TORCH_INTERNAL_ASSERT(self.scalar_type() == other.scalar_type());
+  TensorIteratorSymConfig config;
+  config.check_all_same_dtype_ = false;
+  config.static_dtype_ = self.scalar_type();
+  TensorIteratorSym iter = TensorIteratorSym::ternary_op(Tensor(), condition, self, other, config);
+  AT_DISPATCH_V2(opaqueScalarType(iter.dtype()), "where_traced", AT_WRAP([&] {
+    gpu_kernel_nocast(iter, at::native::WhereFunctor<scalar_t>{});
+  }), AT_EXPAND(AT_OPAQUE_TYPES));
+  return iter.output();
 }
 
 } // namespace at::cuda::host_trace::ti

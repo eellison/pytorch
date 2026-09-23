@@ -4,6 +4,7 @@ import re
 import unittest
 
 from host_trace_testing import (
+    assert_eager_function_handles,
     bits,
     build,
     capture_graph,
@@ -463,6 +464,95 @@ class TestCudaHostTraceOps7(HostTraceTestCase):
         tape, _, served = self._roundtrip(fn, base, news)
         self.assertEqual(tape.num_launches, 6)
         self.assertEqual(served, [True])
+
+    def test_bool_and_int64_operands_promote_through_eagers_cast_kernels(self):
+        # the 4-D mask builder of transformers' Llama family (its
+        # _prepare_4d_causal_attention_mask_with_cache_position) piece by
+        # piece: a bf16 mask multiplied in place by a bool comparison, a bf16
+        # slice plus an int64 attention mask, and the whole builder. The
+        # sibling iterator computes in the promoted dtype and every operand
+        # keeps its own, read by eager's dynamic-cast kernel (the unrolled
+        # kernel over a contiguous pair, CUDALoops.cuh's StridedCastOp
+        # otherwise): eager's function handles (E36), bitwise, and a replay at
+        # other shapes. A store into a narrower output raises eager's text; a
+        # store into a wider one and a promoting CPU scalar decline by name.
+        B, L, T = 4, 16, 64
+        minv = torch.finfo(torch.bfloat16).min
+
+        def causal(cp):
+            m = torch.full((L, T), minv, dtype=torch.bfloat16, device="cuda")
+            return m.mul_(torch.arange(T, device="cuda") > cp.reshape(-1, 1))
+
+        def padding(mask4d, attention_mask):
+            return mask4d[:, :, :, :L] + attention_mask[:, None, None, :]
+
+        def builder(cp, attention_mask):
+            m = causal(cp)[None, None, :, :].expand(attention_mask.shape[0], 1, -1, -1)
+            m = m.clone()
+            pad = m[:, :, :, :L] + attention_mask[:, None, None, :]
+            m[:, :, :, :L] = m[:, :, :, :L].masked_fill(pad == 0, minv)
+            return m
+
+        def inputs(b, t):
+            cp = torch.arange(t - L, t, device="cuda")
+            am = torch.ones(b, L, dtype=torch.int64, device="cuda")
+            x = torch.randn(b, 1, L, t, device="cuda", dtype=torch.bfloat16)
+            return cp, am, x
+
+        cp, am, x = inputs(B, T)
+        cases = {
+            "mul_ bf16 bool (contiguous: the unrolled cast kernel)": (
+                lambda m, b: m.mul_(b),
+                (x, x > 0),
+            ),
+            "mul bool bf16 (the allocating form computes in bf16)": (
+                lambda b, m: b * m,
+                (x > 0, x),
+            ),
+            "add bf16 int64 over a broadcast (StridedCastOp)": (padding, (x, am)),
+            "eq bf16 int64 (a bool result over the promoted pair)": (
+                lambda a, b: a[:, 0, 0, :L] == b,
+                (x, am),
+            ),
+            "the mask builder": (builder, (cp, am)),
+        }
+        for name, (fn, args) in cases.items():
+            with self.subTest(case=name):
+                want = fn(*[a.clone() for a in args])
+                eager = assert_eager_function_handles(
+                    self, fn, tuple(a.clone() for a in args)
+                )
+                self.assertGreaterEqual(len(eager), 1)
+                fresh = tuple(a.clone() for a in args)
+                variant = build(ht.trace(fn, fresh), fn, fresh)
+                (got,) = variant.replay(tuple(a.clone() for a in args))
+                torch.cuda.synchronize()
+                self.assertTrue(torch.equal(bits(got), bits(want)), name)
+        # other shapes serve
+        cp2, am2, x2 = inputs(2, 40)
+        _, _, served = self._roundtrip(padding, (x, am), [(x2, am2)])
+        self.assertEqual(served, [True])
+        _, _, served = self._roundtrip(builder, (cp, am), [(cp2, am2)])
+        self.assertEqual(served, [True])
+        # the entry's own parity for the promoted pair, both operand orders
+        for a, b in ((x, x > 0), (x > 0, x), (x[:, 0, 0, :L], am)):
+            want = torch.mul(a, b)
+            got = C._host_trace_ti_mul(a, b)
+            torch.cuda.synchronize()
+            self.assertEqual(got.dtype, torch.bfloat16)
+            self.assertTrue(torch.equal(bits(got), bits(want)))
+        xi = torch.arange(64, device="cuda").view(8, 8)
+        xf = torch.randn(8, 8, device="cuda")
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "result type Float can't be cast to the desired output type Long",
+        ):
+            ht.trace(lambda a, b: a.add_(b), (xi.clone(), xf))
+        with self.assertRaisesRegex(ht.Declined, "cast on store"):
+            ht.trace(lambda a, b: a.add_(b), (xf.clone(), xf.double()))
+        with self.assertRaisesRegex(ht.Declined, "promotes its CUDA operand"):
+            ht.trace(lambda t: t * 0.5, (xi,))
+        self.assertFalse(C._host_trace_tracing())
 
     def test_every_case_traces_the_same_program_under_other_hints(self):
         # the recorder never reads a hint: every trace this class makes, made

@@ -118,3 +118,17 @@
   header: ATen/native/ufunc/lerp.h
   ufunc_inner_loop:
     Generic: lerp (Floating, Half, BFloat16)
+# ActivationSiluKernel.cu silu_backward_kernel's device body over (dy, x); the
+# structured op has its own CUDA kernel beside math_silu_backward, so the
+# registry's A190 decline lifts with this row
+- func: silu_backward
+  ufunc_inner_loop:
+    Generic: silu_backward (Floating, Half, BFloat16)
+# BinaryRemainderKernel.cu remainder_kernel_cuda's integral and floating bodies
+# as one constexpr-dispatched body, launched through gpu_kernel_with_scalars;
+# the .Scalar twins serve `t % 4`
+- func: remainder.Tensor
+  scalars: true
+  header: ATen/native/ufunc/remainder.h
+  ufunc_inner_loop:
+    Generic: remainder (All, Half, BFloat16)

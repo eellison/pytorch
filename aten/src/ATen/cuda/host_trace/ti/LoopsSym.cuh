@@ -458,6 +458,25 @@ void gpu_kernel_impl_cast(TensorIteratorSym& iter, const func_t& f) {
   launch_legacy_kernel<128, 4>(numel, op);
 }
 
+// Loops.cuh's gpu_kernel_opaque / gpu_kernel_nocast: the no-cast path over
+// operands the functor reads as opaque values of their size (where's kernel),
+// whatever their dtypes
+template <typename func_t>
+void gpu_kernel_nocast(TensorIteratorSym& iter, const func_t& f) {
+  for (int arg = 0; arg < iter.ntensors(); arg++) {
+    TORCH_INTERNAL_ASSERT(
+      iter.device(arg).is_cuda(),
+      "argument ", arg, ": expected a CUDA device but found ", iter.device(arg));
+  }
+  if (iter.numel() == 0) {
+    return;
+  }
+  if (!iter.can_use_32bit_indexing()) {
+    iter.with_32bit_indexing(); // declines
+  }
+  gpu_kernel_impl_nocast(iter, f);
+}
+
 // Loops.cuh's gpu_kernel for one-output ops: the no-cast path when every
 // operand has the functor's static type at its position, the dynamic-cast
 // path otherwise (a copy_ between dtypes).

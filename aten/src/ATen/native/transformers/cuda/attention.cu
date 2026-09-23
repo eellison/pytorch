@@ -91,6 +91,7 @@
 #include <ATen/native/transformers/cuda/mem_eff_attention/kernel_forward.h>
 #include <ATen/native/transformers/cuda/mem_eff_attention/kernels/cutlassF.h>
 #include <ATen/native/transformers/cuda/mem_eff_attention/pytorch_utils.h>
+#include <ATen/native/transformers/cuda/mem_eff_attention/traced_params.h>
 #else
 // MemoryEfficient Attention Specific Imports for ROCM
 #include <ATen/native/transformers/hip/gemm_kernel_utils.h>
@@ -1362,9 +1363,11 @@ std::tuple<Tensor, Tensor, Tensor, Tensor> _scaled_dot_product_efficient_attenti
   // Used for tracking usage statistics
   C10_LOG_API_USAGE_ONCE("torch.sdpa.mem_efficient_attention");
   constexpr int64_t MAX_BATCH_SIZE = (1LL << 16) - 1;
-  int64_t batch_size = query.size(0);
+  // symbolic under a host trace; the chunked path below pins it
+  const c10::SymInt sym_batch_size = query.sym_size(0);
+  const bool chunked = sym_batch_size > MAX_BATCH_SIZE;
 
-  if (batch_size > MAX_BATCH_SIZE) {
+  if (chunked) {
     TORCH_CHECK(dropout_p == 0.0,
                 "Efficient attention cannot produce valid seed and offset outputs when "
                 "the batch size exceeds (", MAX_BATCH_SIZE, ").");
@@ -1405,7 +1408,8 @@ std::tuple<Tensor, Tensor, Tensor, Tensor> _scaled_dot_product_efficient_attenti
   };
 
   // when bs is larger than allowed maximum, process in chunks
-  if (batch_size > MAX_BATCH_SIZE) {
+  if (chunked) {
+    const int64_t batch_size = sym_batch_size.guard_int(__FILE__, __LINE__);
     int64_t start = 0;
     int64_t end = std::min(start + MAX_BATCH_SIZE, batch_size);
 
@@ -1616,16 +1620,16 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, c10::SymInt, c10::SymInt> _efficient_
   TORCH_CHECK(value.dim() == 4);
 
   // Batch sizes
-  TORCH_CHECK(query.size(0) == key.size(0));
-  TORCH_CHECK(query.size(0) == value.size(0));
+  TORCH_CHECK(query.sym_size(0) == key.sym_size(0));
+  TORCH_CHECK(query.sym_size(0) == value.sym_size(0));
 
   // Sequence length
-  TORCH_CHECK(key.size(1) == value.size(1));
+  TORCH_CHECK(key.sym_size(1) == value.sym_size(1));
 
   // Num heads
-  const int64_t num_heads = query.size(2);
-  const int64_t num_heads_kv = key.size(2);
-  TORCH_CHECK(num_heads_kv == value.size(2));
+  const c10::SymInt num_heads = query.sym_size(2);
+  const c10::SymInt num_heads_kv = key.sym_size(2);
+  TORCH_CHECK(num_heads_kv == value.sym_size(2));
 #ifdef USE_ROCM
   TORCH_CHECK(num_heads == num_heads_kv);
 #else
@@ -1637,39 +1641,51 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, c10::SymInt, c10::SymInt> _efficient_
 #endif
 
   // Embedding per head
-  TORCH_CHECK(query.size(3) == key.size(3));
+  TORCH_CHECK(query.sym_size(3) == key.sym_size(3));
 
-  int64_t max_seqlen_q = 0, max_seqlen_k = 0;
+  c10::SymInt max_seqlen_q = 0, max_seqlen_k = 0;
   TORCH_CHECK(seqstart_q.has_value() == seqstart_k.has_value());
   if (seqstart_q.has_value()) {
+#ifndef USE_ROCM
+    // the packed path is not traced: a decline by name before any read of
+    // the lengths
+    if (ht::active() != nullptr) {
+      ht::decline("host_trace: memory-efficient attention with cu_seqlens (seqstart_q / seqstart_k) is not traced; only the dense path is (declined)");
+    }
+#endif
     TORCH_CHECK(seqstart_q->scalar_type() == at::ScalarType::Int);
     TORCH_CHECK(seqstart_k->scalar_type() == at::ScalarType::Int);
     TORCH_CHECK(seqstart_q->dim() == 1 && seqstart_k->dim() == 1);
     CHECK_NOSPARSE_CONTIGUOUS_CUDA((*seqstart_q));
     CHECK_NOSPARSE_CONTIGUOUS_CUDA((*seqstart_k));
-    TORCH_CHECK(seqstart_q->size(0) == seqstart_k->size(0));
-    TORCH_CHECK(query.size(0) == 1, "cu_seqlen only supports batch_size=1");
+    TORCH_CHECK(seqstart_q->sym_size(0) == seqstart_k->sym_size(0));
+    TORCH_CHECK(query.sym_size(0) == 1, "cu_seqlen only supports batch_size=1");
     TORCH_CHECK(max_seqlen_q_.has_value());
     TORCH_CHECK(max_seqlen_k_.has_value());
     max_seqlen_q = *max_seqlen_q_;
     max_seqlen_k = *max_seqlen_k_;
   } else {
-    max_seqlen_q = query.size(1);
-    max_seqlen_k = key.size(1);
+    max_seqlen_q = query.sym_size(1);
+    max_seqlen_k = key.sym_size(1);
   }
 
+#ifdef USE_ROCM
   CHECK_NOSPARSE_LASTCONTIGUOUS_CUDA(query);
   CHECK_NOSPARSE_LASTCONTIGUOUS_CUDA(key);
   CHECK_NOSPARSE_LASTCONTIGUOUS_CUDA(value);
+#else
+  CHECK_NOSPARSE_LASTCONTIGUOUS_CUDA_SYM(query);
+  CHECK_NOSPARSE_LASTCONTIGUOUS_CUDA_SYM(key);
+  CHECK_NOSPARSE_LASTCONTIGUOUS_CUDA_SYM(value);
+#endif
 
   at::cuda::CUDAGuard device_guard(query.device());
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-  int64_t B = query.size(0);
-  int64_t M = query.size(1);
-  int64_t N = key.size(1);
-  int64_t K = query.size(-1);
-  int64_t Kv = value.size(-1);
+  const c10::SymInt B = query.sym_size(0);
+  const c10::SymInt M = query.sym_size(1);
+  const c10::SymInt N = key.sym_size(1);
+  const c10::SymInt Kv = value.sym_size(-1);
 
   at::Tensor res;
   at::Tensor logsumexp;
@@ -1690,6 +1706,13 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, c10::SymInt, c10::SymInt> _efficient_
       at::cuda::currentStreamCaptureStatus() != at::cuda::CaptureStatus::None;
   auto device = in_capture_stream ? at::kCUDA : at::kCPU;
   if (use_dropout) {
+#ifndef USE_ROCM
+    // the generator increment is not recorded here: a decline by name before
+    // the generator is advanced
+    if (ht::active() != nullptr) {
+      ht::decline("host_trace: memory-efficient attention with dropout is not traced (the generator increment is not recorded) (declined)");
+    }
+#endif
     auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
         std::nullopt, at::cuda::detail::getDefaultCUDAGenerator());
 
@@ -1697,7 +1720,7 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, c10::SymInt, c10::SymInt> _efficient_
     std::lock_guard<std::mutex> lock(gen->mutex_);
     // if using dropout, we produce 1 random number for each element of the
     // attention tensor
-    philox_state = gen->philox_cuda_state(B * num_heads * M * N);
+    philox_state = gen->philox_cuda_state((B * num_heads * M * N).guard_int(__FILE__, __LINE__));
 
     if (in_capture_stream) {
       // The seed and offset will be populated by the kernel
@@ -1727,7 +1750,7 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, c10::SymInt, c10::SymInt> _efficient_
 
   // Need this in both aot and CK case
   const auto softmax_scale = sdp::calculate_scale(query, scale).expect_float();
-  res = at::empty({B, M, num_heads, Kv}, query.options());
+  res = at::empty_symint({B, M, num_heads, Kv}, query.options());
 
   if(at::globalContext().getROCmFAPreferredBackend() ==
     at::ROCmFABackend::Ck) {
@@ -1779,15 +1802,15 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, c10::SymInt, c10::SymInt> _efficient_
     // performance, but for now it requires compact logsumexp tensor, even if
     // compute_logsumexp is false
     constexpr int kAlignLSE = 1;
-    res = at::empty({B, M, num_heads, Kv}, query.options());
-    const auto lse_batch_size =
-        seqstart_q.has_value() ? seqstart_q->size(0) - 1 : B;
+    res = at::empty_symint({B, M, num_heads, Kv}, query.options());
+    const c10::SymInt lse_batch_size =
+        seqstart_q.has_value() ? seqstart_q->sym_size(0) - 1 : B;
     at::Tensor softmax_lse;
-    logsumexp = at::empty(
-      {lse_batch_size, num_heads, compute_logsumexp ? max_seqlen_q : 0},
+    logsumexp = at::empty_symint(
+      {lse_batch_size, num_heads, compute_logsumexp ? max_seqlen_q : c10::SymInt(0)},
       query.options().dtype(at::ScalarType::Float));
     if (compute_logsumexp) {
-      softmax_lse = logsumexp.view({lse_batch_size * num_heads, max_seqlen_q});
+      softmax_lse = logsumexp.view_symint({lse_batch_size * num_heads, max_seqlen_q});
     }
     at::Tensor q_t = query.transpose(1, 2);
     at::Tensor k_t = key.transpose(1, 2);
@@ -1843,8 +1866,8 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, c10::SymInt, c10::SymInt> _efficient_
     params.Sm_scale = softmax_scale;
     params.L = compute_logsumexp ? mk_aotensor<2>(softmax_lse, "M") : empty_t2;
     params.Out = mk_aotensor(output_t, "Out");
-    params.Max_seqlen_q = max_seqlen_q;    // Unused if cu_seqlens_q is empty
-    params.Max_seqlen_k = max_seqlen_k;    // Unused if cu_seqlens_k is empty
+    params.Max_seqlen_q = max_seqlen_q.guard_int(__FILE__, __LINE__);    // Unused if cu_seqlens_q is empty
+    params.Max_seqlen_k = max_seqlen_k.guard_int(__FILE__, __LINE__);    // Unused if cu_seqlens_k is empty
     params.dropout_p = dropout_p;
     params.philox_seed_ptr = seed;
     params.philox_offset1 = offset1;
@@ -1892,6 +1915,7 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, c10::SymInt, c10::SymInt> _efficient_
     using Kernel = decltype(_k);
     using scalar_t = typename Kernel::scalar_t;
     (void)_k;
+    ht::KernelChoice choice; // the kernel list's predicates pick the kernel
 
     if (kernel_launched) {
       return;
@@ -1904,22 +1928,20 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, c10::SymInt, c10::SymInt> _efficient_
       return;
     }
 
-    if (value.size(3) > Kernel::kMaxK || key.size(3) > Kernel::kMaxK) {
+    if (value.sym_size(3) > Kernel::kMaxK || key.sym_size(3) > Kernel::kMaxK) {
       return;
     }
-    // Alignment
-    const auto is_ptr_aligned = [](const void* ptr, int64_t alignment_bytes) {
-      return uint64_t(ptr) % alignment_bytes == 0;
-    };
-    if ((query.stride(2) % Kernel::kAlignmentQ) ||
-        (key.stride(2) % Kernel::kAlignmentK) ||
-        (value.stride(2) % Kernel::kAlignmentV) ||
-        !is_ptr_aligned(
-            query.const_data_ptr(), Kernel::kAlignmentQ * sizeof(scalar_t)) ||
-        !is_ptr_aligned(
-            key.const_data_ptr(), Kernel::kAlignmentK * sizeof(scalar_t)) ||
-        !is_ptr_aligned(
-            value.const_data_ptr(), Kernel::kAlignmentV * sizeof(scalar_t))) {
+    // Alignment (of the strides and of the addresses: guards on the symbolic
+    // address under a trace)
+    if (query.sym_stride(2) % Kernel::kAlignmentQ != 0 ||
+        key.sym_stride(2) % Kernel::kAlignmentK != 0 ||
+        value.sym_stride(2) % Kernel::kAlignmentV != 0 ||
+        !ptr_aligned(
+            ht::sym_const_data_ptr(query), Kernel::kAlignmentQ * sizeof(scalar_t)) ||
+        !ptr_aligned(
+            ht::sym_const_data_ptr(key), Kernel::kAlignmentK * sizeof(scalar_t)) ||
+        !ptr_aligned(
+            ht::sym_const_data_ptr(value), Kernel::kAlignmentV * sizeof(scalar_t))) {
       return;
     }
     // Uses too much shmem
@@ -1941,108 +1963,105 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, c10::SymInt, c10::SymInt> _efficient_
               ? seqlen_k.has_value() || !seqstart_q->is_same(*seqstart_k)
               : max_seqlen_q > max_seqlen_k));
     res = may_have_fully_masked_rows
-        ? at::zeros({B, M, num_heads, Kv}, output_options)
-        : at::empty({B, M, num_heads, Kv}, output_options);
+        ? at::zeros_symint({B, M, num_heads, Kv}, output_options)
+        : at::empty_symint({B, M, num_heads, Kv}, output_options);
 
     // NOTE: Should be aligned (by padding) in case M is
     // not a good number for loading during backward
-    constexpr decltype(M) kAlignLSE = Kernel::kAlignLSE;
-    logsumexp = at::empty(
-        {seqstart_q.has_value() ? seqstart_q->size(0) - 1 : B,
+    constexpr int64_t kAlignLSE = Kernel::kAlignLSE;
+    logsumexp = at::empty_symint(
+        {seqstart_q.has_value() ? seqstart_q->sym_size(0) - 1 : B,
          num_heads,
-         compute_logsumexp ? ceil_div(max_seqlen_q, kAlignLSE) * kAlignLSE : 0},
+         compute_logsumexp ? (max_seqlen_q + kAlignLSE - 1) / kAlignLSE * kAlignLSE : c10::SymInt(0)},
         query.options().dtype(at::ScalarType::Float));
     if (num_heads == 0) {
       return;
     }
-    typename Kernel::Params p;
-    p.query_ptr = (const scalar_t*)query.const_data_ptr();
-    p.key_ptr = (const scalar_t*)key.const_data_ptr();
-    p.value_ptr = (const scalar_t*)value.const_data_ptr();
-    p.logsumexp_ptr = compute_logsumexp
-        ? (typename Kernel::lse_scalar_t*)logsumexp.data_ptr()
-        : nullptr;
+    TracedForwardParams<typename Kernel::Params> p;
+    p.query_ptr = ht::sym_const_data_ptr(query);
+    p.key_ptr = ht::sym_const_data_ptr(key);
+    p.value_ptr = ht::sym_const_data_ptr(value);
+    if (compute_logsumexp) {
+      p.logsumexp_ptr = ht::sym_mutable_data_ptr(logsumexp);
+    }
     at::Tensor output_accum;
     if (Kernel::kNeedsOutputAccumulatorBuffer) {
-      output_accum = at::empty(
+      output_accum = at::empty_symint(
           {B, M, num_heads, Kv},
           query.options().dtype(
               CutlassToAtenDtype<
                   typename Kernel::output_accum_t>::atScalarType()));
-      p.output_accum_ptr =
-          (typename Kernel::output_accum_t*)output_accum.data_ptr();
-    } else {
-      p.output_accum_ptr = nullptr;
+      p.output_accum_ptr = ht::sym_mutable_data_ptr(output_accum);
     }
-    p.output_ptr = (typename Kernel::output_t*)res.data_ptr();
+    p.output_ptr = ht::sym_mutable_data_ptr(res);
 
     if (seqstart_q.has_value()) {
-      p.seqstart_q_ptr = (const int32_t*)seqstart_q->const_data_ptr();
-      p.seqstart_k_ptr = (const int32_t*)seqstart_k->const_data_ptr();
+      p.seqstart_q_ptr = ht::sym_const_data_ptr(*seqstart_q);
+      p.seqstart_k_ptr = ht::sym_const_data_ptr(*seqstart_k);
     }
 
     p.num_heads = num_heads;
     p.q_heads_per_kv = num_heads / num_heads_kv;
-    p.head_dim = query.size(3);
-    p.head_dim_value = value.size(3);
+    p.head_dim = query.sym_size(3);
+    p.head_dim_value = value.sym_size(3);
     p.num_queries = max_seqlen_q;
     p.num_keys = max_seqlen_k;
-    p.num_batches = seqstart_q.has_value() ? seqstart_q->size(0) - 1 : B;
+    p.num_batches = seqstart_q.has_value() ? seqstart_q->sym_size(0) - 1 : B;
     p.custom_mask_type = custom_mask_type;
 
-    p.seqlen_k_ptr = nullptr;
     if (seqlen_k.has_value()) {
-      CHECK_NOSPARSE_LASTCONTIGUOUS_CUDA(seqlen_k.value());
+      CHECK_NOSPARSE_LASTCONTIGUOUS_CUDA_SYM(seqlen_k.value());
       TORCH_CHECK(seqlen_k->scalar_type() == at::ScalarType::Int);
-      p.seqlen_k_ptr = (const int32_t*)seqlen_k->const_data_ptr();
+      p.seqlen_k_ptr = ht::sym_const_data_ptr(*seqlen_k);
     }
     if (window_size.has_value()) {
       p.window_size = *window_size;
     }
-    p.scale = sdp::calculate_scale(query, scale).expect_float();
+    // narrowed to the float field as the expect_float() assignment was
+    p.scale = sdp::calculate_scale(query, scale);
 
-    ASSIGN_CHECK_OVERFLOW(p.q_strideB, query.stride(0));
-    ASSIGN_CHECK_OVERFLOW(p.k_strideB, key.stride(0));
-    ASSIGN_CHECK_OVERFLOW(p.v_strideB, value.stride(0));
-    ASSIGN_CHECK_OVERFLOW(p.q_strideM, query.stride(1));
-    ASSIGN_CHECK_OVERFLOW(p.k_strideM, key.stride(1));
-    ASSIGN_CHECK_OVERFLOW(p.v_strideM, value.stride(1));
-    ASSIGN_CHECK_OVERFLOW(p.q_strideH, query.stride(2));
-    ASSIGN_CHECK_OVERFLOW(p.k_strideH, key.stride(2));
-    ASSIGN_CHECK_OVERFLOW(p.v_strideH, value.stride(2));
-    ASSIGN_CHECK_OVERFLOW(p.o_strideM, res.stride(1));
+    assign_check_overflow(p.q_strideB, query.sym_stride(0), "query.stride(0)");
+    assign_check_overflow(p.k_strideB, key.sym_stride(0), "key.stride(0)");
+    assign_check_overflow(p.v_strideB, value.sym_stride(0), "value.stride(0)");
+    assign_check_overflow(p.q_strideM, query.sym_stride(1), "query.stride(1)");
+    assign_check_overflow(p.k_strideM, key.sym_stride(1), "key.stride(1)");
+    assign_check_overflow(p.v_strideM, value.sym_stride(1), "value.stride(1)");
+    assign_check_overflow(p.q_strideH, query.sym_stride(2), "query.stride(2)");
+    assign_check_overflow(p.k_strideH, key.sym_stride(2), "key.stride(2)");
+    assign_check_overflow(p.v_strideH, value.sym_stride(2), "value.stride(2)");
+    assign_check_overflow(p.o_strideM, res.sym_stride(1), "res.stride(1)");
 
     if (bias.has_value()) {
-      CHECK_NOSPARSE_LASTCONTIGUOUS_CUDA((*bias));
+      CHECK_NOSPARSE_LASTCONTIGUOUS_CUDA_SYM((*bias));
       TORCH_CHECK(
           bias->scalar_type() == CutlassToAtenDtype<scalar_t>::atScalarType(),
           "invalid dtype for bias - should match query's dtype");
-      p.attn_bias_ptr = (const scalar_t*)bias->const_data_ptr();
+      p.attn_bias_ptr = ht::sym_const_data_ptr(*bias);
 
       TORCH_CHECK(bias->dim() == 4, "Bias expected in BMHK format");
       TORCH_CHECK(
-          bias->size(0) == query.size(0),
+          bias->sym_size(0) == query.sym_size(0),
           "attn_bias: wrong shape (batch dimension)");
       TORCH_CHECK(
-          bias->size(1) == query.size(2),
+          bias->sym_size(1) == query.sym_size(2),
           "attn_bias: wrong shape (head dimension)");
       TORCH_CHECK(
-          bias->size(2) == query.size(1),
+          bias->sym_size(2) == query.sym_size(1),
           "attn_bias: wrong shape (seqlenQ dimension)");
       TORCH_CHECK(
-          bias->size(3) == key.size(1),
+          bias->sym_size(3) == key.sym_size(1),
           "attn_bias: wrong shape (seqlenKV dimension)");
-      ASSIGN_CHECK_OVERFLOW(p.bias_strideB, bias->stride(0));
-      ASSIGN_CHECK_OVERFLOW(p.bias_strideH, bias->stride(1));
-      ASSIGN_CHECK_OVERFLOW(p.bias_strideM, bias->stride(2));
+      assign_check_overflow(p.bias_strideB, bias->sym_stride(0), "bias->stride(0)");
+      assign_check_overflow(p.bias_strideH, bias->sym_stride(1), "bias->stride(1)");
+      assign_check_overflow(p.bias_strideM, bias->sym_stride(2), "bias->stride(2)");
       TORCH_CHECK(
-          bias->stride(3) == 1,
+          bias->sym_stride(3) == 1,
           "attn_bias: wrong alignment (last dimension must be contiguous)");
     }
 
     p.use_dropout = use_dropout;
     if (p.use_dropout) {
-      p.rng_engine_inputs = philox_state;
+      new (static_cast<void*>(p.rng_engine_inputs)) at::PhiloxCudaState(philox_state);
       p.dropout_prob = dropout_p;
       p.seed = seed_t.data_ptr<int64_t>();
       p.extragraph_offset = offset_t.data_ptr<int64_t>();
@@ -2058,13 +2077,13 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, c10::SymInt, c10::SymInt> _efficient_
           " kb)");
       AT_CUDA_CHECK(err);
     }
-    auto blocks = p.getBlocksGrid();
-    if (blocks.x * blocks.y * blocks.z == 0 || key.size(1) == 0) {
+    const ht::Grid blocks = p.template blocks_grid<Kernel>();
+    if (blocks.x * blocks.y * blocks.z == 0 || key.sym_size(1) == 0) {
       res.zero_();
       return;
     }
-    Kernel::check_supported(p);
-    kernel_fn<<<blocks, p.getThreadsGrid(), smem_bytes, stream>>>(p);
+    check_supported_forward<Kernel>(p);
+    ht::launch(kernel_fn, blocks, p.template threads_grid<Kernel>(), static_cast<int64_t>(smem_bytes), stream, p);
   };
 
   // Dispatch to the right kernel

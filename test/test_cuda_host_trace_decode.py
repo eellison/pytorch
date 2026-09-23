@@ -5,13 +5,19 @@ import time
 import unittest
 
 from host_trace_h2d_probe import probe
-from host_trace_testing import build, HostTraceTestCase, wait_for_h2d
+from host_trace_testing import (
+    assert_eager_function_handles,
+    build,
+    HostTraceTestCase,
+    wait_for_h2d,
+)
 
 import torch
 import torch.nn.functional as F
 from torch.testing._internal.common_cuda import (
     PLATFORM_SUPPORTS_CUDNN_ATTENTION,
     PLATFORM_SUPPORTS_FLASH_ATTENTION,
+    PLATFORM_SUPPORTS_MEM_EFF_ATTENTION,
 )
 from torch.testing._internal.common_utils import run_tests, skipIfRocm
 
@@ -490,14 +496,33 @@ class TestCudaHostTraceDecode(HostTraceTestCase):
             served = self._run_steps(variant, 4, range(16, 25))
             self.assertEqual(served, list(range(16, 25)))
 
-    def test_odd_head_dims_decline_by_name(self):
-        # flash pads head dims to a multiple of 8 inside its host
-        # (constant_pad_nd, an unconverted op inside a converted host)
-        q, k, v = (
-            torch.randn(2, H, 16, 100, device="cuda", dtype=DTYPE) for _ in range(3)
+    def test_odd_head_dims_pad_through_the_composite(self):
+        # flash takes head dims in multiples of 8: the SDPA composite pads the
+        # inputs (constant_pad_nd, a CompositeExplicit body on the int
+        # signature, which the mode runs with its ints pinned) and slices the
+        # output; the pad's fill and copy are on the tape as eager launches
+        # them. The body reads its sizes as ints, so the tape is that shape's
+        # (another batch misses by name); a symbolic constant_pad_nd body
+        # would lift the pins
+        def sdpa(q, k, v):
+            return F.scaled_dot_product_attention(q, k, v)
+
+        def case(B, seed):
+            torch.manual_seed(seed)
+            return tuple(
+                torch.randn(B, H, 16, 100, device="cuda", dtype=DTYPE) for _ in range(3)
+            )
+
+        args = case(2, 0)
+        tape = ht.trace(sdpa, args)
+        self.assertIn(
+            "flash_fwd_kernel", " ".join(rec["kernel"] for rec in tape.launches)
         )
-        with self.assertRaisesRegex(ht.Declined, "constant_pad_nd"):
-            ht.trace(F.scaled_dot_product_attention, (q, k, v))
+        variant = build(tape, sdpa, args)
+        new = case(2, 1)
+        self._assert_bitwise(variant.replay(new)[0], sdpa(*new))
+        with self.assertRaises(ht.Miss):
+            variant.replay(case(3, 2))
 
     def test_expected_named_misses_of_the_sdpa_path(self):
         # the documented over-pins of the flash host, each a named miss at a
@@ -631,6 +656,231 @@ class TestCudaHostTraceDecode(HostTraceTestCase):
             self.assertEqual(gen.get_offset() - before, advance)
             for g, w in zip(got, want):
                 self.assertTrue(torch.equal(g, w))
+
+    def test_every_case_traces_the_same_program_under_other_hints(self):
+        # the recorder never reads a hint: every trace this class makes, made
+        # again under other hints, is the same program (host_trace_two_hint)
+        two_hint.assert_family(self)
+
+
+# ---- the memory-efficient attention host (the CUTLASS fmha forward and
+# backward), eager's own route for an additive 4-D mask (flash takes none): a
+# padded batch under SDPA. The kernel-choice ladder of _efficient_attention_forward
+# reads the head dims, the strides and the addresses' alignment classes, all
+# guards under a trace. On recent GPUs cuDNN attention sits ahead of it in
+# eager's order for the smaller head dims and its host is not converted, so
+# the tests run under the selector's own order without cuDNN (what a caller
+# with a padded batch uses), except where they read the selector itself.
+EFF_H, EFF_DH = 4, 256
+NO_CUDNN = [
+    torch.nn.attention.SDPBackend.FLASH_ATTENTION,
+    torch.nn.attention.SDPBackend.EFFICIENT_ATTENTION,
+    torch.nn.attention.SDPBackend.MATH,
+]
+EFFICIENT = int(torch.nn.attention.SDPBackend.EFFICIENT_ATTENTION)
+CUDNN = int(torch.nn.attention.SDPBackend.CUDNN_ATTENTION)
+
+
+def masked_sdpa(q, k, v, mask):
+    return F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+
+
+def masked_fwd_bwd(q, k, v, mask, cot):
+    leaves = [t.detach().requires_grad_(True) for t in (q, k, v)]
+    out = F.scaled_dot_product_attention(*leaves, attn_mask=mask)
+    gq, gk, gv = torch.autograd.grad(out, leaves, cot, create_graph=False)
+    return out.detach(), gq, gk, gv
+
+
+def _padded_mask(lengths, lq, lk, dtype):
+    # a left-padded batch: row b attends to its last lengths[b] keys (0 / min
+    # additive, transformers' 4-D form, one head broadcast to all)
+    m = torch.zeros(len(lengths), 1, lq, lk, device="cuda", dtype=dtype)
+    for b, n in enumerate(lengths):
+        m[b, :, :, : lk - n] = torch.finfo(dtype).min
+    return m
+
+
+def _masked_case(lengths, lq, lk, dh=EFF_DH, dtype=DTYPE, seed=0):
+    torch.manual_seed(seed)
+    B = len(lengths)
+    q, k, v = (
+        torch.randn(B, EFF_H, n, dh, device="cuda", dtype=dtype) for n in (lq, lk, lk)
+    )
+    return q, k, v, _padded_mask(lengths, lq, lk, dtype)
+
+
+def _bwd_case(lengths, n, seed, cot_layout="bhld"):
+    # the cotangent in the (B, H, L, D) layout of the output (the backward
+    # entry copies it to (B, L, H, D)), or already in that layout as a view
+    q, k, v, mask = _masked_case(lengths, n, n, seed=seed)
+    cot = torch.randn_like(q)
+    if cot_layout == "blhd":
+        B, H, L, D = q.shape
+        cot = torch.randn(B, L, H, D, device="cuda", dtype=q.dtype).transpose(1, 2)
+    return (q, k, v, mask, cot)
+
+
+def without_cudnn():
+    return torch.nn.attention.sdpa_kernel(NO_CUDNN)
+
+
+@unittest.skipIf(not torch.cuda.is_available(), "CUDA not available")
+@unittest.skipIf(
+    not PLATFORM_SUPPORTS_MEM_EFF_ATTENTION, "memory-efficient attention not supported"
+)
+@skipIfRocm(msg="host tracing is CUDA-only in this version")
+class TestCudaHostTraceEfficientAttention(HostTraceTestCase):
+    def setUp(self):
+        super().setUp()
+        torch.manual_seed(0)
+
+    def test_the_selector_reaches_the_kernel_by_itself_for_a_masked_call(self):
+        # with no pin at all: eager's own selector gives a masked call at this
+        # head dim to the memory-efficient kernel (flash refuses the mask) or,
+        # on the GPUs that prefer it, to cuDNN attention, whose host declines
+        # by name; never a wrong result
+        args = _masked_case([32, 29, 17, 5], 1, 32)
+        choice = torch._fused_sdp_choice(*args)
+        if choice == EFFICIENT:
+            tape = ht.trace(masked_sdpa, args)
+            self.assertIn("fmha_cutlassF", tape.launches[0]["kernel"])
+        else:
+            self.assertEqual(choice, CUDNN)
+            with self.assertRaisesRegex(ht.Declined, "cudnn"):
+                ht.trace(masked_sdpa, args)
+
+    def test_a_masked_decode_call_traces_and_replays_at_other_lengths(self):
+        # one tape at (B=4, Lq=1, Lk=32) serves other key lengths and batch
+        # sizes bitwise; the tape's kernel is the profiler's fmha forward of
+        # the same eager call (the two seed / offset zeros are memsets); the
+        # aligned mask is not padded, as eager does not pad it
+        with without_cudnn():
+            args = _masked_case([32, 29, 17, 5], 1, 32)
+            tape = ht.trace(masked_sdpa, args)
+            self.assertEqual(tape.num_launches, 1)
+            self.assertIn("fmha_cutlassF", tape.launches[0]["kernel"])
+            self.assertEqual(len(tape.memsets), 2)
+            _assert_same_kernels(self, tape, masked_sdpa, args)
+            variant = build(tape, masked_sdpa, args)
+            cases = (
+                ([48, 40, 9, 1], 48),
+                ([64, 3], 64),
+                ([16] * 8, 16),
+                ([32, 20, 20, 31, 2, 7], 32),
+            )
+            for lengths, lk in cases:
+                new = _masked_case(lengths, 1, lk, seed=lk + len(lengths))
+                self._assert_bitwise(
+                    variant.replay(new)[0], masked_sdpa(*new), f"{lengths}"
+                )
+
+    def test_the_named_misses_of_the_host(self):
+        # the branches the kernel ladder and the host's checks take: batch 1
+        # (the bias stride checks are skipped at one batch), more than one
+        # query (the query-block grid and the strideM check), a key length
+        # the composite pads (the mask's stride alignment class)
+        with without_cudnn():
+            args = _masked_case([32, 29, 17, 5], 1, 32)
+            variant = build(ht.trace(masked_sdpa, args), masked_sdpa, args)
+            for lengths, lq, lk in (([32], 1, 32), ([32, 5], 2, 32), ([20, 7], 1, 20)):
+                with self.assertRaises(ht.Miss, msg=f"{lengths} {lq} {lk}"):
+                    variant.replay(_masked_case(lengths, lq, lk))
+
+    def test_a_prefill_call_with_a_square_mask(self):
+        # Lq = Lk (a padded prefill): the query-block grid and the bias strideM
+        # check are on the tape; other lengths and batch sizes serve bitwise
+        with without_cudnn():
+            args = _masked_case([32, 32, 20], 32, 32)
+            tape = ht.trace(masked_sdpa, args)
+            self.assertEqual(tape.num_launches, 1)
+            variant = build(tape, masked_sdpa, args)
+            for lengths, n in (([64, 10], 64), ([128] * 3, 128), ([48, 1, 48, 30], 48)):
+                new = _masked_case(lengths, n, n, seed=n)
+                self._assert_bitwise(
+                    variant.replay(new)[0], masked_sdpa(*new), f"{lengths}"
+                )
+
+    def test_a_smaller_head_dim_reaches_the_kernel_without_cudnn(self):
+        # the Llama-family head dims under the selector's order without cuDNN:
+        # flash refuses the mask, the memory-efficient kernel takes it; the
+        # 64x64 kernel of the ladder (kMaxK 64) rather than the head-dim-256 one
+        with without_cudnn():
+            args = _masked_case([32, 29, 17, 5], 1, 32, dh=64)
+            tape = ht.trace(masked_sdpa, args)
+            self.assertIn("64x64", tape.launches[0]["kernel"])
+            variant = build(tape, masked_sdpa, args)
+            new = _masked_case([48, 2, 48], 1, 48, dh=64, seed=3)
+            self._assert_bitwise(variant.replay(new)[0], masked_sdpa(*new))
+
+    def test_float32_traces_under_eagers_own_selection(self):
+        # float32 has no flash or cuDNN route: the selector reaches the
+        # memory-efficient kernel with no pin (the f32 aligned kernels)
+        args = _masked_case([32, 29, 17, 5], 1, 32, dh=64, dtype=torch.float32)
+        self.assertEqual(torch._fused_sdp_choice(*args), EFFICIENT)
+        tape = ht.trace(masked_sdpa, args)
+        self.assertIn("f32", tape.launches[0]["kernel"])
+        variant = build(tape, masked_sdpa, args)
+        new = _masked_case([64, 7], 1, 64, dh=64, dtype=torch.float32, seed=5)
+        self._assert_bitwise(variant.replay(new)[0], masked_sdpa(*new))
+
+    def test_the_replay_launches_eagers_function(self):
+        # E36: the tape's kernel is the node of an eager capture of the same
+        # call, by name here and by function handle on the native replay
+        with without_cudnn():
+            args = _masked_case([32, 29, 17, 5], 1, 32)
+            assert_eager_function_handles(self, masked_sdpa, args, launches=1)
+
+    def test_dropout_declines_by_name(self):
+        # the generator increment of the fmha forward is not recorded in this
+        # commit: a decline naming the host, before the generator is advanced
+        q, k, v, mask = _masked_case([32, 29, 17, 5], 1, 32)
+
+        def dropout_sdpa(q, k, v, mask):
+            return F.scaled_dot_product_attention(
+                q, k, v, attn_mask=mask, dropout_p=0.1
+            )
+
+        with without_cudnn():
+            with self.assertRaisesRegex(
+                ht.Declined, "memory-efficient attention with dropout"
+            ):
+                ht.trace(dropout_sdpa, (q, k, v, mask))
+
+    def test_forward_and_backward_in_one_trace(self):
+        # torch.autograd.grad through the masked forward: the engine runs the
+        # backward node on its device worker thread, where the trace mode
+        # brings the recorder along; the tape holds the fmha forward, the
+        # copy the backward entry makes (the cotangent transposed contiguous)
+        # and the fmha backward, the kernels eager launches, the lengths
+        # symbolic through the _symint backward kernel; the gradients replay
+        # bitwise at other lengths and batch sizes
+        with without_cudnn():
+            args = _bwd_case([32, 32, 20], 32, 0)
+            tape = ht.trace(masked_fwd_bwd, args)
+            names = " ".join(rec["kernel"] for rec in tape.launches)
+            self.assertIn("fmha_cutlassF", names)
+            self.assertIn("fmha_cutlassB", names)
+            _assert_same_kernels(self, tape, masked_fwd_bwd, args)
+            variant = build(tape, masked_fwd_bwd, args)
+            for lengths, n, seed in (
+                ([32, 32, 20], 32, 1),
+                ([64, 9], 64, 2),
+                ([48] * 4, 48, 3),
+            ):
+                new = _bwd_case(lengths, n, seed)
+                got, want = variant.replay(new), masked_fwd_bwd(*new)
+                for g, w in zip(got, want):
+                    self._assert_bitwise(g, w, f"{lengths} {n}")
+
+    def test_the_backward_launches_eagers_function(self):
+        # E36 over the forward and the backward: the two fmha kernels are the
+        # nodes of an eager capture (the cotangent comes in the layout the
+        # backward reads, so the entry's strided copy, whose function object is
+        # the copy commit's, is not on this tape)
+        with without_cudnn():
+            args = _bwd_case([32, 32, 20], 32, 0, cot_layout="blhd")
+            assert_eager_function_handles(self, masked_fwd_bwd, args, launches=2)
 
     def test_every_case_traces_the_same_program_under_other_hints(self):
         # the recorder never reads a hint: every trace this class makes, made

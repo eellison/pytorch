@@ -200,6 +200,7 @@ import gc
 import json
 import math
 import os
+import re
 import struct
 import sys
 import threading
@@ -309,6 +310,10 @@ _TRACEABLE = {
     aten._flash_attention_backward.default,
     aten._scaled_dot_product_flash_attention.default,
     aten._scaled_dot_product_flash_attention_backward.default,
+    aten._scaled_dot_product_efficient_attention.default,
+    aten._efficient_attention_forward.default,
+    aten._scaled_dot_product_efficient_attention_backward.default,
+    aten._efficient_attention_backward.default,
 }
 
 # traceable ops whose CUDA kernel takes its SymInt arguments as c10::SymInt
@@ -320,6 +325,7 @@ _SYMINT_KERNELS = {
     aten._flash_attention_forward.default,
     aten._flash_attention_backward.default,
     aten._scaled_dot_product_flash_attention_backward.default,
+    aten._efficient_attention_backward.default,
     aten.triu.default,
     aten.tril.default,
     aten.triu_.default,
@@ -657,16 +663,21 @@ class _RegionOperand:
 class _RegionRec:
     """A closed library call the host made (aten.mm / aten.addmm / aten.bmm
     through cuBLAS; an op eager serves through a torch._native override,
-    torch/cuda/_host_trace_native.py): its operands and outputs as values,
+    torch/cuda/_host_trace_native.py; cuDNN attention,
+    torch/cuda/_host_trace_cudnn.py): its operands and outputs as values,
     the op and its scalars. The trace issues nothing for it; a replay learns
     its kernel nodes from a harvested template (see _harvest)."""
 
     seq: int
-    op: str  # "mm" | "addmm" | "bmm" | an override's op ("_fused_rms_norm")
+    # "mm" | "addmm" | "bmm" | an override's op ("_fused_rms_norm") | a
+    # library region's op ("cudnn_sdpa")
+    op: str
     inputs: list[_RegionOperand]  # mm / bmm: (mat1, mat2); addmm: (bias, mat1, mat2)
-    # a GEMM's out; an override's returns in the order it allocates them
+    # a GEMM's out; an override's or a library call's returns in the order it
+    # allocates them
     outputs: list[_RegionOperand]
-    scalars: tuple  # addmm: (beta, alpha); an override's non-tensor arguments
+    # addmm: (beta, alpha); an override's or a library call's non-tensor arguments
+    scalars: tuple
     name: str
 
     @property
@@ -696,8 +707,8 @@ class _GemmTemplate:
     # workspace, a contiguous copy of an operand): a replay gives the nodes
     # its arena's buffers instead
     scratch: list[int] = None  # type: ignore[assignment]
-    # the call's allocations in order as "out" (a return the tape allocates
-    # ahead of the region) or "scratch"; a GEMM's are all scratch
+    # per allocation of the call, in the log's order, "out" for one the call
+    # returns (a region output the tape allocates ahead of it) or "scratch"
     layout: tuple = ()
     kinds: tuple = ()
     uses_ws: bool = False  # a node holds the stream's workspace base
@@ -878,18 +889,18 @@ def _closed_call_alt(op: str, scalars: tuple, tensors: list) -> None:
 class _ClosedCall:
     """How a closed region's call runs at the harvest: `run(op, scalars,
     tensors)` makes it on the operands (a GEMM into its preallocated output; a
-    torch._native override's op, which allocates its outputs itself and
-    returns them), `alt` makes it through another binding path, and `outputs`
-    is how many trailing operands of the region are those returns (0: every
-    operand is handed in). Both are plain functions called from the capture's
-    lambda, one Python frame below the stack smear: the smear's reach past
-    the aten.<op>.out binding is marginal, and a partial or wrapper between
-    them puts a cutlass Params struct's padding beyond it."""
+    torch._native override's or a library op, which allocates its outputs
+    itself and returns them), `alt` makes it through another binding path,
+    and `outputs` is how many trailing operands of the region are those
+    returns (0: every operand is handed in). Both are plain functions called
+    from the capture's lambda, one Python frame below the stack smear: the
+    smear's reach past the aten.<op>.out binding is marginal, and a partial
+    or wrapper between them puts a cutlass Params struct's padding beyond it."""
 
     run: Any
     alt: Any
     # an int, or a function of the region's scalars
-    outputs: Any = 0
+    outputs: int | Callable[[tuple], int] = 0
     # the call's kernels are DSL programs whose parameter structs carry
     # uninitialized padding (a 32-bit field ahead of a 64-bit one, inside one
     # driver parameter, so no layout marks it and the stack smear does not
@@ -1011,9 +1022,10 @@ def _harvest(key: tuple, spec: tuple, device: int) -> _GemmTemplate:
     global _gemm_harvests
     op, scalars, metas, aligns = spec
     closed = _closed_calls[op]
-    # the operands the harvest hands in (all of a GEMM's; an override's
+    # the operands the harvest hands in (all of a GEMM's; a library call's
     # inputs) and, behind them, the ones the call allocates and returns
-    n_out = closed.outputs(scalars) if callable(closed.outputs) else closed.outputs
+    outputs = closed.outputs
+    n_out = outputs(scalars) if callable(outputs) else outputs
     handed = len(metas) - n_out
     spans = _operand_spans(metas)
     C = torch._C
@@ -1025,7 +1037,8 @@ def _harvest(key: tuple, spec: tuple, device: int) -> _GemmTemplate:
         )
     stream, other = streams
     dev = torch.device("cuda", device)
-    # what the call returned in each capture (an override's outputs), kept
+    # what the call returned in each capture (an override's or a library
+    # call's outputs), kept
     # until the harvest is over so that no later capture's pool hands their
     # addresses out again
     returned: list = []
@@ -1412,8 +1425,8 @@ def _harvest(key: tuple, spec: tuple, device: int) -> _GemmTemplate:
         key,
         nodes,
         harvest_us,
-        # an override's kernel ties nothing to the graph, whose pool would
-        # hold the call's outputs for the template's lifetime
+        # an override's or a library call's kernel ties nothing to the graph,
+        # whose pool would hold the call's outputs for the template's lifetime
         graph=None if n_out else graph,
         scratch=scratch,
         layout=layout if n_out else ("scratch",) * len(scratch),
@@ -1829,10 +1842,24 @@ class _TracedTensor(torch.Tensor):
         # to select / slice / unsqueeze on the symbolic value; everything else
         # (plain ints, None, Ellipsis, masks) takes the stock path.
         items = index if isinstance(index, tuple) else (index,)
-        if getattr(_active, "trace", None) is not None and _has_symint(items):
-            out = _sym_getitem(self, items)
-            if out is not NotImplemented:
-                return out
+        if getattr(_active, "trace", None) is not None:
+            # a Python sequence or a CPU tensor among the indices: the stock
+            # path builds a device index tensor from it on the host (a copy
+            # the capture refuses with its own error); advanced indexing is
+            # traced over a CUDA index tensor only (the index entries)
+            for it in items:
+                if isinstance(it, (list, tuple, range)) or (
+                    isinstance(it, torch.Tensor) and not it.is_cuda
+                ):
+                    raise Declined(
+                        "host_trace: a sequence or CPU-tensor index on a traced tensor "
+                        "(x[:, [-1, 0]]) builds its index tensor on the host; index with "
+                        "a CUDA tensor; not traced (declined)"
+                    )
+            if _has_symint(items):
+                out = _sym_getitem(self, items)
+                if out is not NotImplemented:
+                    return out
         return super().__getitem__(index)
 
     def __len__(self) -> int:
@@ -3229,16 +3256,32 @@ def _new_int_symbol(hint: int, name: str, positive: bool) -> torch.SymInt:
     return tr.symbol(hint, f"opaque {name}", positive=positive)
 
 
-def _refused_inside_the_trace(func: Any, e: RuntimeError) -> Declined:
+_SYMBOLIC_READ = re.compile(
+    r"Cannot call (\w+\(\)) on tensor with symbolic sizes/strides"
+)
+
+
+def _refused_inside_the_trace(func: Any, e: RuntimeError, via: Any = None) -> Declined:
     # An op the mode ran during the symbolic run raised: a copy from CPU that
     # the capture forbids, a host's own check on symbolic inputs. Nothing the
-    # tape can describe; the decline names the op and keeps the cause.
+    # tape can describe; the decline names the op and keeps the cause. `via`
+    # is the outermost composite whose body ran `func` (the op the caller
+    # wrote): a C++ body reading a concrete size, stride or count of a traced
+    # tensor is that op having no traceable host here, named as such.
     if _NO_DATA_PTR in str(e):
         return Declined(
             f"host_trace: {func} read a raw data pointer of a traced tensor "
             "inside the trace: its host is not converted (declined)"
         )
     first = str(e).splitlines()[0] if str(e) else type(e).__name__
+    m = _SYMBOLIC_READ.search(first)
+    if m is not None:
+        outer = func if via is None else via
+        body = "its body" if outer is func else f"its body ({func})"
+        return Declined(
+            f"host_trace: {outer} is not a traceable CUDA host: {body} reads "
+            f"{m.group(1)} of a traced tensor (declined)"
+        )
     return Declined(f"host_trace: {func} raised inside the trace: {first} (declined)")
 
 
@@ -3281,7 +3324,9 @@ def _not_pointer_bits(v: Any) -> None:
     # an ATen composite that reinterprets a SymIntArrayRef as ints
     # (layer_norm.cpp rms_norm_symint hands torch.rms_norm's normalized_shape
     # to _fused_rms_norm so) delivers a traced size here as its node's pointer
-    # bits: nothing the trace can pin
+    # bits: nothing the trace can pin. Only an int[] element can be one (the
+    # unchecked cast is the array's); a scalar int this low is a value of the
+    # call (random_.from's lower bound at int64's minimum)
     if type(v) is int and v <= _SYMINT_POINTER_BITS:
         raise Declined(
             "host_trace: an int argument of the call is a traced size's pointer bits (an "
@@ -3305,8 +3350,6 @@ def _concrete_ints(x: Any) -> Any:
             x = type(x)(int(e) if isinstance(e, torch.SymInt) else e for e in x)
         for e in x:
             _not_pointer_bits(e)
-        return x
-    _not_pointer_bits(x)
     return x
 
 
@@ -3509,6 +3552,17 @@ class _TraceMode(TorchDispatchMode):
         try:
             with self:
                 if body is not None:
+                    try:
+                        return func.redispatch(body, *args, **kwargs)
+                    except RuntimeError as e:
+                        # a body registered on the int signature (constant_pad_nd's
+                        # pad): the dispatcher's wrapper refuses a symbolic int before
+                        # the body runs; the ints are pinned as for a kernel and the
+                        # body runs once
+                        if "expected to contain only concrete integers" not in str(e):
+                            raise
+                    args = tuple(_concrete_ints(a) for a in args)
+                    kwargs = {k: _concrete_ints(v) for k, v in kwargs.items()}
                     return func.redispatch(body, *args, **kwargs)
                 r = func.decompose(*args, **kwargs)
         except Declined:
@@ -3516,7 +3570,7 @@ class _TraceMode(TorchDispatchMode):
         except torch.AcceleratorError:
             raise
         except RuntimeError as e:
-            raise _refused_inside_the_trace(func, e) from e
+            raise _refused_inside_the_trace(func, e, self.decomposing[0]) from e
         finally:
             self.decomposing.pop()
         if r is not NotImplemented:

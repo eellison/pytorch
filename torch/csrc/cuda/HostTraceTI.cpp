@@ -193,6 +193,13 @@ void THCPHostTraceTI_init(PyObject* module) {
       [](const at::Tensor& self, const py::handle& exponent) {
         return ti::pow_tensor_scalar_traced(self, scalar_arg(exponent));
       });
+  m.def(
+      "_host_trace_ti_where",
+      [](const at::Tensor& condition,
+         const at::Tensor& self,
+         const at::Tensor& other) {
+        return ti::where_traced(condition, self, other);
+      });
   m.def("_host_trace_ti_sin", [](const at::Tensor& self) {
     return ti::sin_traced(self);
   });
@@ -345,6 +352,81 @@ void THCPHostTraceTI_init(PyObject* module) {
             grad_scale,
             found_inf);
       });
+  // the in-place distributions: the generator argument is the op's (None or
+  // a torch.Generator); the bounds are the op's numbers
+  m.def(
+      "_host_trace_ti_random_from_to",
+      [](at::Tensor self,
+         int64_t from,
+         std::optional<int64_t> to,
+         const std::optional<at::Generator>& generator) {
+        return ti::random_from_to_traced(self, from, to, generator);
+      });
+  m.def(
+      "_host_trace_ti_random",
+      [](at::Tensor self, const std::optional<at::Generator>& generator) {
+        return ti::random_traced(self, generator);
+      });
+  m.def(
+      "_host_trace_ti_uniform",
+      [](at::Tensor self,
+         double from,
+         double to,
+         const std::optional<at::Generator>& generator) {
+        return ti::uniform_traced(self, from, to, generator);
+      });
+  m.def(
+      "_host_trace_ti_normal",
+      [](at::Tensor self,
+         double mean,
+         double std,
+         const std::optional<at::Generator>& generator) {
+        return ti::normal_traced(self, mean, std, generator);
+      });
+  m.def(
+      "_host_trace_ti_bernoulli_scalar",
+      [](at::Tensor self,
+         double p,
+         const std::optional<at::Generator>& generator) {
+        return ti::bernoulli_scalar_traced(self, p, generator);
+      });
+  m.def(
+      "_host_trace_ti_bernoulli_tensor",
+      [](at::Tensor self,
+         const at::Tensor& p,
+         const std::optional<at::Generator>& generator) {
+        return ti::bernoulli_tensor_traced(self, p, generator);
+      });
+  m.def(
+      "_host_trace_ti_exponential",
+      [](at::Tensor self,
+         double lambda,
+         const std::optional<at::Generator>& generator) {
+        return ti::exponential_traced(self, lambda, generator);
+      });
+  m.def(
+      "_host_trace_ti_geometric",
+      [](at::Tensor self,
+         double p,
+         const std::optional<at::Generator>& generator) {
+        return ti::geometric_traced(self, p, generator);
+      });
+  m.def(
+      "_host_trace_ti_cauchy",
+      [](at::Tensor self,
+         double median,
+         double sigma,
+         const std::optional<at::Generator>& generator) {
+        return ti::cauchy_traced(self, median, sigma, generator);
+      });
+  m.def(
+      "_host_trace_ti_log_normal",
+      [](at::Tensor self,
+         double mean,
+         double std,
+         const std::optional<at::Generator>& generator) {
+        return ti::log_normal_traced(self, mean, std, generator);
+      });
   // reductions: dims=[] reduces every dim; the output has the input's dtype
   m.def(
       "_host_trace_ti_sum",
@@ -368,6 +450,14 @@ void THCPHostTraceTI_init(PyObject* module) {
       [](const at::Tensor& self,
          const std::vector<int64_t>& dims,
          bool keepdim) { return ti::amax_traced(self, dims, keepdim); });
+  m.def(
+      "_host_trace_ti_allany",
+      [](const at::Tensor& self,
+         const std::vector<int64_t>& dims,
+         bool keepdim,
+         bool all_of) {
+        return ti::allany_traced(self, dims, keepdim, all_of);
+      });
   // the generated siblings (torchgen over ti/siblings.yaml and add's
   // ufunc_inner_loop): _host_trace_ti_gen_<op> and their table
   host_trace_sibling_bindings(m, operand, scalar_arg);

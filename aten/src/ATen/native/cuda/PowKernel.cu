@@ -254,6 +254,16 @@ Tensor pow_tensor_scalar_traced(const Tensor& self, const Scalar& exponent) {
     }
   }
   TensorIteratorSym iter = TensorIteratorSym::unary_op(Tensor(), self);
+  if (!exponent.isComplex() && (exponent.equal(0) || exponent.equal(false))) {
+    // TORCH_IMPL_FUNC(pow_Tensor_Scalar_out): out.fill_(1) into the
+    // structured allocation (the iterator's); exponent 1 is out.copy_(base)
+    Tensor out = iter.output();
+    return fill_traced(out, 1);
+  }
+  if (!exponent.isComplex() && (exponent.equal(1) || exponent.equal(true))) {
+    Tensor out = iter.output();
+    return copy_traced(out, self);
+  }
   if (!at::isFloatingType(iter.common_dtype()) || exponent.isComplex()) {
     decline(c10::str("host_trace: pow on ", iter.common_dtype(), " with exponent ", exponent, " is not traced (declined)"));
   }

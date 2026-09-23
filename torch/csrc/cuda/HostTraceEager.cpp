@@ -46,6 +46,14 @@ void THCPHostTraceEager_init(PyObject* module) {
         return ti::index_put_traced(
             src, value, indices, indexed_sizes, indexed_strides);
       });
+  m.def(
+      "_host_trace_ti_index",
+      [](const at::Tensor& src,
+         const std::vector<at::Tensor>& indices,
+         const std::vector<c10::SymInt>& indexed_sizes,
+         const std::vector<c10::SymInt>& indexed_strides) {
+        return ti::index_traced(src, indices, indexed_sizes, indexed_strides);
+      });
   // _index_put_impl_'s at::assert_no_overlap on the original operands, which
   // the Python entry restrides before the sibling sees them
   m.def(

@@ -95,6 +95,13 @@ struct IndexPutFunctor {
 };
 
 template <typename scalar_t>
+struct IndexGatherFunctor {
+  C10_DEVICE void operator()(char* const out_data, const char* const in_data, const int64_t offset) const {
+    *reinterpret_cast<scalar_t*>(out_data) = *reinterpret_cast<const scalar_t*>(in_data + offset);
+  }
+};
+
+template <typename scalar_t>
 struct IndexCopyFunctor {
   OffsetCalculator<3> offset_calc;
   char* self_ptr;
@@ -234,9 +241,7 @@ void index_copy_kernel_impl(
 
 template <typename scalar_t>
 void index_kernel_impl(TensorIteratorBase& iter, const IntArrayRef index_size, const IntArrayRef index_stride) {
-  gpu_index_kernel(iter, index_size, index_stride, []C10_DEVICE(char* const out_data, const char* const in_data, const int64_t offset) {
-    *reinterpret_cast<scalar_t*>(out_data) = *reinterpret_cast<const scalar_t*>(in_data + offset);
-  }, true);
+  gpu_index_kernel(iter, index_size, index_stride, IndexGatherFunctor<scalar_t>{}, true);
 }
 
 template <typename scalar_t>
@@ -567,6 +572,7 @@ REGISTER_CUDA_DISPATCH(index_put_kernel_quantized_stub, &index_put_kernel_quanti
 // self, value and indices. Outside a trace the entry runs the same launches in ordinary mode,
 // which is how the parity test compares it with the real op.
 #include <ATen/cuda/host_trace/ti/EagerOps.h>
+#include <ATen/cuda/host_trace/ti/EagerViews.cuh>
 #include <ATen/cuda/host_trace/ti/LoopsSym.cuh>
 #include <ATen/cuda/host_trace/ti/TensorIteratorSym.h>
 
@@ -597,11 +603,12 @@ struct Traced<at::native::IndexCopyFunctor<scalar_t>> : TracedBase {
         self_dim_stride(this, offsetof(P, self_dim_stride), ti::SlotName{nullptr, "self_dim_stride"}) {}
 };
 
-// the store functor (IndexPutFunctor) is empty: its byte stays the zero the
-// proxy was built with
-template <class scalar_t>
-struct Traced<at::native::IndexFunctor<at::native::IndexPutFunctor<scalar_t>>> : TracedBase {
-  using P = at::native::IndexFunctor<at::native::IndexPutFunctor<scalar_t>>;
+// the element functor (IndexPutFunctor's store, IndexGatherFunctor's load)
+// is empty: its byte stays the zero the proxy was built with
+template <class F>
+struct Traced<at::native::IndexFunctor<F>> : TracedBase {
+  static_assert(std::is_empty_v<F>, "IndexFunctor's element functor carries no state");
+  using P = at::native::IndexFunctor<F>;
   alignas(P) unsigned char pod_bytes[sizeof(P)] = {};
   ti::OffsetCalculatorView<3> offset_calc;
   ti::PtrSlot out_ptr;
@@ -701,7 +708,89 @@ void index_put_impl(TensorIteratorSym& iter, const std::vector<c10::SymInt>& ind
   launch_index_kernel<at::native::launch_size_nd, at::native::launch_bound2>(iter.numel(), op);
 }
 
+template <typename scalar_t>
+void index_gather_impl(TensorIteratorSym& iter, const std::vector<c10::SymInt>& index_size, const std::vector<c10::SymInt>& index_stride) {
+  // gpu_index_kernel with is_gather_like: the vectorized gather over 16-byte
+  // aligned contiguous slices when there is one index and the grid fits
+  // (fast_gather_kernel_eligible, each term a guard), the generic kernel
+  // over IndexFunctor<IndexGatherFunctor> otherwise
+  const auto num_indices = index_size.size();
+  TORCH_INTERNAL_ASSERT(num_indices == index_stride.size());
+  TORCH_INTERNAL_ASSERT(static_cast<int64_t>(num_indices) == iter.ntensors() - 2);
+  if (iter.numel() == 0) {
+    return;
+  }
+  if (!iter.can_use_32bit_indexing()) {
+    iter.with_32bit_indexing(); // declines
+  }
+  const c10::SymInt out_ptr = iter.data_ptr(0);
+  const c10::SymInt in_ptr = iter.data_ptr(1);
+  if (num_indices == 1) {
+    constexpr int64_t alignment = 16;
+    constexpr int64_t es = sizeof(scalar_t);
+    const int64_t index_es = iter.element_size(2);
+    const bool eligible = iter.ndim() == 2 && iter.strides(2)[0] == c10::SymInt(0) &&
+        iter.strides(2)[1] == c10::SymInt(index_es) && iter.strides(0)[0] == c10::SymInt(es) &&
+        iter.strides(1)[0] == c10::SymInt(es) && iter.strides(1)[1] == c10::SymInt(0) &&
+        alignment_of(out_ptr) == alignment && alignment_of(in_ptr) == alignment &&
+        alignment_of(iter.shape()[0] * es) == alignment && alignment_of(index_stride[0]) == alignment &&
+        alignment_of(iter.strides(0)[1]) == alignment;
+    if (eligible) {
+      const c10::SymInt slice_size = iter.shape()[0] * es;
+      const c10::SymInt blocks_per_slice_upper =
+          ceil_div_sym(ceil_div_sym(slice_size, c10::SymInt(alignment)), c10::SymInt(at::native::launch_size_nd));
+      const int64_t max_grid_y = at::cuda::getCurrentDeviceProperties()->maxGridSize[1];
+      if (blocks_per_slice_upper <= c10::SymInt(max_grid_y)) {
+        at::native::vectorized_gather_kernel_launch_sym<alignment, int64_t>(
+            out_ptr, in_ptr, iter.data_ptr(2), iter.shape()[1], slice_size, index_size[0], index_stride[0],
+            iter.strides(0)[1], /*allow_neg_indices=*/true);
+        return;
+      }
+    }
+  }
+  Traced<at::native::IndexFunctor<at::native::IndexGatherFunctor<scalar_t>>> op;
+  op.offset_calc = make_offset_calculator<3>(iter);
+  op.out_ptr = out_ptr;
+  op.in_ptr = in_ptr;
+  op.num_indices = num_indices;
+  for (size_t i = 0; i < num_indices; i++) {
+    op.index_ptrs[i] = iter.data_ptr(static_cast<int64_t>(i) + 2);
+    op.sizes[i] = index_size[i];
+    op.strides[i] = index_stride[i];
+  }
+  launch_index_kernel<at::native::launch_size_nd, at::native::launch_bound2>(iter.numel(), op);
+}
+
 } // namespace
+
+Tensor index_traced(
+    const Tensor& src,
+    const std::vector<Tensor>& indices,
+    const std::vector<c10::SymInt>& indexed_sizes,
+    const std::vector<c10::SymInt>& indexed_strides) {
+  // TORCH_META_FUNC(index) / TORCH_IMPL_FUNC(index_out): build_index_op's
+  // iterator over the restrided self and the reshaped indices allocates the
+  // result in self's dtype; index_kernel over it
+  std::vector<Tensor> inputs;
+  inputs.reserve(indices.size() + 1);
+  inputs.push_back(src);
+  inputs.insert(inputs.end(), indices.begin(), indices.end());
+  TensorIteratorSym iter = index_iterator(Tensor(), inputs);
+  AT_DISPATCH_V2(
+    iter.dtype(),
+    "index_cuda",
+    AT_WRAP([&] {
+      index_gather_impl<at::native::OpaqueType<sizeof(scalar_t)>>(iter, indexed_sizes, indexed_strides);
+    }),
+    AT_EXPAND(AT_ALL_TYPES_AND_COMPLEX),
+    AT_EXPAND(AT_FLOAT8_TYPES),
+    kComplexHalf,
+    kBComplex32,
+    kHalf,
+    kBool,
+    kBFloat16);
+  return iter.output();
+}
 
 Tensor& index_copy_traced(Tensor& result, int64_t dim, const Tensor& index, const Tensor& source) {
   // the meta's overlap checks on a defined result (the in-place form), then

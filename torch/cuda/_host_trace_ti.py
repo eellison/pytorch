@@ -5,7 +5,10 @@ casts, and the contiguous memcpy), fill_ / zero_ (eager's memset over a dense
 tensor) and the fill factories (full, zeros, ones, *_like, new_*), arange, the
 comparisons eq / ne / lt / le / gt / ge, masked_fill, clamp / clamp_min /
 clamp_max / relu, the reductions sum, mean, amax / max, index_copy_ and
-index_put_; plus the converted softmax / log_softmax host, whose entry
+index_put_, the in-place distributions random_, uniform_, normal_, bernoulli_,
+exponential_, geometric_, cauchy_ and log_normal_ (the factories rand, randn,
+randint, bernoulli and their _like forms end in them through eager's own
+bodies); plus the converted softmax / log_softmax host, whose entry
 allocates the output, and the eager hosts with a sibling beside them
 (index_select, embedding, cat, triu / tril).
 
@@ -32,6 +35,7 @@ refuses a second registration of an op unless replace=True.
 from __future__ import annotations
 
 import math
+import warnings
 
 import torch
 from torch.cuda._host_trace import (
@@ -253,8 +257,9 @@ def _gelu(self, approximate="none"):
 
 def _pow_tensor_scalar(self, exponent):
     # Pow.cpp's meta and impl for pow.Tensor_Scalar: the numpy check, the
-    # result dtype (a cast of the base declines as promotion), then the
-    # exponents 0 and 1 are a fill and a copy (not traced), the rest the kernel
+    # result dtype (a cast of the base declines as promotion); the sibling
+    # fills for exponent 0, copies for 1 (autograd's pow_backward of pow(2))
+    # and launches the kernel for the rest
     _cuda_operands(aten.pow.Tensor_Scalar, self)
     if isinstance(exponent, torch.SymInt):
         exponent = int(exponent)
@@ -266,10 +271,6 @@ def _pow_tensor_scalar(self, exponent):
     if _promoted(self, exponent) != self.dtype:
         raise Declined(
             f"host_trace: pow of a {self.dtype} base with exponent {exponent} promotes the base, which is not traced (declined)"
-        )
-    if exponent == 0 or exponent == 1:
-        raise Declined(
-            f"host_trace: pow with exponent {exponent} is a fill or a copy in the real op, which is not traced (declined)"
         )
     return _C._host_trace_ti_pow_tensor_scalar(self, exponent)
 
@@ -328,6 +329,230 @@ def _native_dropout(self, p, train):
 
 register_traced_entry(aten.clone.default, _clone)
 register_traced_entry(aten.native_dropout.default, _native_dropout)
+
+
+# ---- the in-place distributions (DistributionTemplates.h's entries in each
+# Distribution*.cu): random_, uniform_, normal_, bernoulli_, exponential_,
+# geometric_, cauchy_, log_normal_; the factories that end in them follow
+# below (rand, randn, randint, normal(float, float, size), Inductor's seed op
+# aten.randint.low_out) or run eager's own bodies (the _like forms,
+# bernoulli). The generator is the op's argument: None or the default CUDA
+# generator, whose philox offset the tape's rng slot advances (commit 9);
+# another generator declines inside the entry. The bounds are constants of
+# the variant, as eager bakes them into the kernel's functor.
+
+
+_RANDOM_FROM = getattr(aten.random_, "from")  # `from` is a keyword
+
+
+def _random_from(self, from_, to=None, *, generator=None):
+    _cuda_operands(_RANDOM_FROM, self)
+    return _C._host_trace_ti_random_from_to(self, from_, to, generator)
+
+
+def _random_to(self, to, *, generator=None):
+    # Distributions.cpp random_(self, to): random_(self, 0, to)
+    _cuda_operands(aten.random_.to, self)
+    return _C._host_trace_ti_random_from_to(self, 0, to, generator)
+
+
+def _random(self, *, generator=None):
+    _cuda_operands(aten.random_.default, self)
+    return _C._host_trace_ti_random(self, generator)
+
+
+def _uniform_(self, from_=0.0, to=1.0, *, generator=None):
+    _cuda_operands(aten.uniform_.default, self)
+    return _C._host_trace_ti_uniform(self, float(from_), float(to), generator)
+
+
+def _normal_(self, mean=0.0, std=1.0, *, generator=None):
+    _cuda_operands(aten.normal_.default, self)
+    return _C._host_trace_ti_normal(self, float(mean), float(std), generator)
+
+
+def _bernoulli_tensor(self, p, *, generator=None):
+    _cuda_operands(aten.bernoulli_.Tensor, self, p)
+    return _C._host_trace_ti_bernoulli_tensor(self, p, generator)
+
+
+def _bernoulli_float(self, p=0.5, *, generator=None):
+    _cuda_operands(aten.bernoulli_.float, self)
+    return _C._host_trace_ti_bernoulli_scalar(self, float(p), generator)
+
+
+def _exponential_(self, lambd=1.0, *, generator=None):
+    _cuda_operands(aten.exponential_.default, self)
+    return _C._host_trace_ti_exponential(self, float(lambd), generator)
+
+
+def _geometric_(self, p, *, generator=None):
+    _cuda_operands(aten.geometric_.default, self)
+    return _C._host_trace_ti_geometric(self, float(p), generator)
+
+
+def _cauchy_(self, median=0.0, sigma=1.0, *, generator=None):
+    _cuda_operands(aten.cauchy_.default, self)
+    return _C._host_trace_ti_cauchy(self, float(median), float(sigma), generator)
+
+
+def _log_normal_(self, mean=1.0, std=2.0, *, generator=None):
+    _cuda_operands(aten.log_normal_.default, self)
+    return _C._host_trace_ti_log_normal(self, float(mean), float(std), generator)
+
+
+register_traced_entry(_RANDOM_FROM, _random_from)
+register_traced_entry(aten.random_.to, _random_to)
+register_traced_entry(aten.random_.default, _random)
+register_traced_entry(aten.uniform_.default, _uniform_)
+register_traced_entry(aten.normal_.default, _normal_)
+register_traced_entry(aten.bernoulli_.Tensor, _bernoulli_tensor)
+register_traced_entry(aten.bernoulli_.float, _bernoulli_float)
+register_traced_entry(aten.exponential_.default, _exponential_)
+register_traced_entry(aten.geometric_.default, _geometric_)
+register_traced_entry(aten.cauchy_.default, _cauchy_)
+register_traced_entry(aten.log_normal_.default, _log_normal_)
+
+
+# ---- the random factories as eager composes them (TensorFactories.cpp rand,
+# randn, randint, normal(float, float, size), randint_out): the allocation,
+# through the trace mode (a traced root), then the in-place distribution.
+# Registered with symint=True so a size derived from a traced shape stays a
+# value of the tape (the CompositeExplicit bodies take plain ints; the _like
+# forms and bernoulli have no size argument and run eager's own bodies).
+
+
+def _random_factory(op, size, dtype, layout, device, pin_memory, fill):
+    dev = _factory_device(op, layout, device, pin_memory)
+    return fill(torch.empty(list(size), dtype=dtype, device=dev))
+
+
+def _pinned_int(v):
+    # an int64 argument of the body: a symbolic bound is pinned, as the
+    # dispatcher's wrapper pins it for eager's body
+    return int(v)
+
+
+def _rand(
+    size, *, generator=None, dtype=None, layout=None, device=None, pin_memory=None
+):
+    return _random_factory(
+        aten.rand.default,
+        size,
+        dtype,
+        layout,
+        device,
+        pin_memory,
+        lambda t: _C._host_trace_ti_uniform(t, 0.0, 1.0, generator),
+    )
+
+
+def _randn(
+    size, *, generator=None, dtype=None, layout=None, device=None, pin_memory=None
+):
+    return _random_factory(
+        aten.randn.default,
+        size,
+        dtype,
+        layout,
+        device,
+        pin_memory,
+        lambda t: _C._host_trace_ti_normal(t, 0.0, 1.0, generator),
+    )
+
+
+def _randint_low(
+    low,
+    high,
+    size,
+    *,
+    generator=None,
+    dtype=None,
+    layout=None,
+    device=None,
+    pin_memory=None,
+):
+    low, high = _pinned_int(low), _pinned_int(high)
+    # the schema's default (`dtype=long`) reaches a body as its argument, but
+    # a dispatch mode's kwargs omit a value equal to the default: None is long
+    return _random_factory(
+        aten.randint.low,
+        size,
+        torch.int64 if dtype is None else dtype,
+        layout,
+        device,
+        pin_memory,
+        lambda t: _C._host_trace_ti_random_from_to(t, low, high, generator),
+    )
+
+
+def _randint(
+    high, size, *, generator=None, dtype=None, layout=None, device=None, pin_memory=None
+):
+    return _randint_low(
+        0,
+        high,
+        size,
+        generator=generator,
+        dtype=dtype,
+        layout=layout,
+        device=device,
+        pin_memory=pin_memory,
+    )
+
+
+def _randint_low_out(low, high, size, *, out):
+    # TensorFactories.cpp randint_out: result.resize_(size) then random_(low,
+    # high). The resize is a no-op on a contiguous out of that size (Inductor's
+    # seed buffer, aten.randint.low_out over int64's limits into a fresh int64
+    # buffer); anything else is a resize inside the trace, declined by name
+    _cuda_operands(aten.randint.low_out, out)
+    size = list(size)
+    same = len(size) == out.dim() and all(bool(a == b) for a, b in zip(size, out.shape))
+    if not same or not out.is_contiguous():
+        raise Declined(
+            f"host_trace: {aten.randint.low_out} with an out= that resize_ would change (a resize inside the trace) is not traced (declined)"
+        )
+    return _C._host_trace_ti_random_from_to(
+        out, _pinned_int(low), _pinned_int(high), None
+    )
+
+
+def _normal_float_float(
+    mean,
+    std,
+    size,
+    *,
+    generator=None,
+    dtype=None,
+    layout=None,
+    device=None,
+    pin_memory=None,
+):
+    return _random_factory(
+        aten.normal.float_float,
+        size,
+        dtype,
+        layout,
+        device,
+        pin_memory,
+        lambda t: _C._host_trace_ti_normal(t, float(mean), float(std), generator),
+    )
+
+
+for _op, _fn in (
+    (aten.rand.default, _rand),
+    (aten.rand.generator, _rand),
+    (aten.randn.default, _randn),
+    (aten.randn.generator, _randn),
+    (aten.randint.default, _randint),
+    (aten.randint.generator, _randint),
+    (aten.randint.low, _randint_low),
+    (aten.randint.low_generator, _randint_low),
+    (aten.randint.low_out, _randint_low_out),
+    (aten.normal.float_float, _normal_float_float),
+):
+    register_traced_entry(_op, _fn, symint=True)
 
 
 # ---- fills (FillKernel.cu's entry): fill_ and zero_ on a tensor, and the factories
@@ -626,6 +851,70 @@ register_traced_entry(aten.masked_fill_.Scalar, _masked_fill_)
 register_traced_entry(aten.masked_fill.Scalar, _masked_fill)
 
 
+# ---- where.self (TensorCompare.cu's entry) and scalar_tensor: the Scalar
+# overloads of where (Gemma-2's torch.where(sliding_window_mask, min_dtype,
+# mask)) are composites over scalar_tensor (empty({}) then fill_ on the
+# operand's device) and where.self; where_self_out's result dtype and casts
+# are the entry's, the kernel's dispatch on the element size the sibling's
+
+
+def _result_type(a, b):
+    # TypeProperties.cpp result_type over two tensors: a dimensioned tensor's
+    # dtype outranks a 0-dim one's within its category, a higher category
+    # wins (combine_categories); no wrapped numbers reach here
+    dim = zero = None
+    for t in (a, b):
+        if t.dim() > 0:
+            dim = t.dtype if dim is None else torch.promote_types(dim, t.dtype)
+        else:
+            zero = t.dtype if zero is None else torch.promote_types(zero, t.dtype)
+    if dim is None or zero is None:
+        return dim if zero is None else zero
+    if dim.is_complex:
+        return dim
+    if zero.is_complex:
+        if dim.is_floating_point:
+            return torch.promote_types(dim, torch.complex32)
+        return zero
+    if dim.is_floating_point:
+        return dim
+    if dim is torch.bool or zero.is_floating_point:
+        return torch.promote_types(dim, zero)
+    return dim
+
+
+def _where(condition, self, other):
+    _cuda_operands(aten.where.self, condition, self, other)
+    result_type = _result_type(self, other)
+    if self.dtype is not result_type:
+        self = self.to(result_type)
+    if other.dtype is not result_type:
+        other = other.to(result_type)
+    if condition.dtype is torch.uint8:
+        warnings.warn(
+            "where received a uint8 condition tensor. This behavior is deprecated and will be removed in a future version of PyTorch. Use a boolean condition instead."
+        )
+        condition = condition.to(torch.bool)
+    if condition.dtype is not torch.bool:
+        raise RuntimeError(
+            f"where expected condition to be a boolean tensor, but got a tensor with dtype {str(condition.dtype).removeprefix('torch.')}"
+        )
+    return _C._host_trace_ti_where(condition, self, other)
+
+
+def _scalar_tensor(s, dtype=None, layout=None, device=None, pin_memory=None):
+    # TensorFactories.cpp scalar_tensor: empty({}, options) then fill_; the
+    # dtype is the default one unless given (no inference from the value)
+    value = _plain_scalar(aten.scalar_tensor.default, s)
+    dev = _factory_device(aten.scalar_tensor.default, layout, device, pin_memory)
+    dtype = torch.get_default_dtype() if dtype is None else dtype
+    return _C._host_trace_ti_fill_(torch.empty((), dtype=dtype, device=dev), value)
+
+
+register_traced_entry(aten.where.self, _where)
+register_traced_entry(aten.scalar_tensor.default, _scalar_tensor)
+
+
 # ---- clamp / clamp_min / clamp_max with scalar bounds (TensorCompare.cu's entry):
 # the structured meta's rules (TensorCompare.cpp): at least one bound, no
 # complex, a non-floating self promoted by its bound is a cast and declines
@@ -905,6 +1194,23 @@ register_traced_entry(aten.amax.default, _amax)
 register_traced_entry(aten.max.default, _max)
 
 
+def _allany(op, all_of):
+    # all / any (ReduceOps.cpp allany_impl through the sibling): the result
+    # bool over the input's own dtype; the bool() a caller applies to the
+    # result is a host read and declines there
+    def entry(self, dim=None, keepdim=False):
+        _cuda_operands(op, self)
+        return _C._host_trace_ti_allany(self, _dims(dim), bool(keepdim), all_of)
+
+    return entry
+
+
+for _name, _all_of in (("all", True), ("any", False)):
+    for _overload in ("default", "dim", "dims"):
+        _op = getattr(getattr(aten, _name), _overload)
+        register_traced_entry(_op, _allany(_op, _all_of))
+
+
 # ---- eager hosts with a traced sibling beside the real host (EagerOps.h):
 # index_select (Indexing.cu), cat (Shape.cu) and embedding_dense_backward
 # (Embedding.cu). embedding's forward is Embedding.cpp's composite over
@@ -1045,11 +1351,10 @@ def _expandable_to(shape, desired):
     )
 
 
-def _index_put_impl(op, self, indices, value, accumulate):
-    # _index_put_impl_ and make_info over the traced tensors: bool / byte
-    # masks (a nonzero, a synchronizing read), a CPU index or value (copied
-    # to the device by the real op) and the sort-based accumulate /
-    # deterministic path decline by name
+def _index_operands(op, self, indices):
+    # the index list as the metas check it: bool / byte masks (a nonzero, a
+    # synchronizing read) and a CPU index (copied to the device by the real
+    # op) decline by name
     indices = list(indices)
     if len(indices) > self.dim():
         raise IndexError(
@@ -1067,17 +1372,14 @@ def _index_put_impl(op, self, indices, value, accumulate):
                 "tensors used as indices must be long, int, byte or bool tensors"
             )
         _cuda_operands(op, idx)
-    # _index_put_impl_'s assert_no_overlap on self against the value and each
-    # index, before make_info restrides them (an overlap eager rejects declines
-    # by name; between two inputs it is an address guard of the tape)
-    _C._host_trace_ti_assert_no_overlap(self, value)
-    for idx in indices:
-        if idx is not None:
-            _C._host_trace_ti_assert_no_overlap(self, idx)
-    if accumulate or torch.are_deterministic_algorithms_enabled():
-        raise Declined(
-            f"host_trace: {op} with accumulate=True or under deterministic algorithms takes the sort-based kernel (index_put_with_sort), which is not traced (declined)"
-        )
+    return indices
+
+
+def _advanced_index(op, self, indices):
+    # make_info over the traced tensors: the defined indices broadcast and
+    # made adjacent at the front, self restrided with the broadcast index
+    # shape at stride 0 in their place, the indices reshaped to broadcast
+    # over it; returns (src, indices, indexed sizes, indexed byte strides)
     defined = [i for i in indices if i is not None]
     if not defined:
         raise Declined(
@@ -1139,6 +1441,25 @@ def _index_put_impl(op, self, indices, value, accumulate):
         for x in idx_r[1:]
     ):
         idx_r = [i.contiguous() for i in idx_r]
+    return src_r, idx_r, indexed_sizes, indexed_strides
+
+
+def _index_put_impl(op, self, indices, value, accumulate):
+    # _index_put_impl_ over the traced tensors; the sort-based accumulate /
+    # deterministic path declines by name
+    indices = _index_operands(op, self, indices)
+    # _index_put_impl_'s assert_no_overlap on self against the value and each
+    # index, before make_info restrides them (an overlap eager rejects declines
+    # by name; between two inputs it is an address guard of the tape)
+    _C._host_trace_ti_assert_no_overlap(self, value)
+    for idx in indices:
+        if idx is not None:
+            _C._host_trace_ti_assert_no_overlap(self, idx)
+    if accumulate or torch.are_deterministic_algorithms_enabled():
+        raise Declined(
+            f"host_trace: {op} with accumulate=True or under deterministic algorithms takes the sort-based kernel (index_put_with_sort), which is not traced (declined)"
+        )
+    src_r, idx_r, indexed_sizes, indexed_strides = _advanced_index(op, self, indices)
     # make_index_put_iterator's checks
     if not _expandable_to(list(value.shape), list(src_r.shape)):
         raise RuntimeError(
@@ -1166,10 +1487,21 @@ def _index_put(self, indices, values, accumulate=False):
     return out
 
 
+def _index(self, indices):
+    # index.Tensor (TensorAdvancedIndexing.cpp's meta: k_out[:, :, indices]):
+    # make_info's view arithmetic as for index_put_, the gather kernel over
+    # the restrided self into the result the sibling iterator allocates
+    _cuda_operands(aten.index.Tensor, self)
+    indices = _index_operands(aten.index.Tensor, self, indices)
+    src_r, idx_r, sizes, strides = _advanced_index(aten.index.Tensor, self, indices)
+    return _C._host_trace_ti_index(src_r, idx_r, sizes, strides)
+
+
 register_traced_entry(aten.index_copy_.default, _index_copy_)
 register_traced_entry(aten.index_copy.default, _index_copy)
 register_traced_entry(aten.index_put_.default, _index_put_)
 register_traced_entry(aten.index_put.default, _index_put)
+register_traced_entry(aten.index.Tensor, _index)
 
 
 # ---- triu / tril (TriangularOps.cu, the sibling appended to the real host):

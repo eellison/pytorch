@@ -170,6 +170,22 @@ aten = torch.ops.aten
 # dtype (the launch image's data pointers follow it)
 GENERATED = {
     "sigmoid": (torch.sigmoid, "sigmoid", 1, _FLOATS, None, lambda d: 1),
+    "silu_backward": (
+        aten.silu_backward,
+        "silu_backward",
+        2,
+        _FLOATS,
+        None,
+        lambda d: 1,
+    ),
+    "remainder": (
+        torch.remainder,
+        "remainder_Tensor",
+        2,
+        _FLOATS + _INTS,
+        "nonzero",
+        lambda d: 1,
+    ),
     "abs": (torch.abs, "abs", 1, _FLOATS + _INTS + (torch.bool,), None, lambda d: 1),
     "log": (torch.log, "log", 1, _FLOATS, "positive", lambda d: 1),
     "leaky_relu(0.2)": (
@@ -575,8 +591,8 @@ class TestCudaHostTraceTI(HostTraceTestCase):
         # would raise its text); the entry declines it by name
         with self.assertRaisesRegex(ht.Declined, "aten.add.Tensor with a cpu tensor"):
             ht.trace(lambda t: t + _CPU_ONES, (x,), warm_up=False)
-        with self.assertRaisesRegex(ht.Declined, "different dtypes"):
-            ht.trace(torch.add, (x, y.float()))
+        # a bf16 and a float32 operand promote through the cast kernel
+        self.assertEqual(ht.trace(torch.add, (x, y.float())).num_launches, 1)
         # a CPU scalar that would promote the CUDA operand (an int tensor
         # times a float) is type promotion, declined like a dtype pair
         xi = torch.arange(64, device="cuda").view(8, 8)
@@ -1028,11 +1044,29 @@ class TestCudaHostTraceTI(HostTraceTestCase):
                         torch.equal(bits(got), bits(want)),
                         f"pow {exp} differs bitwise",
                     )
+        # exponent 0 is eager's fill_(1) into the structured allocation (one
+        # fill launch, an int base too), exponent 1 its copy_(base)
         x = torch.rand(8, 64, device="cuda", dtype=torch.bfloat16) + 0.5
-        for exp, why in ((0.0, "fill or a copy"), (1, "fill or a copy")):
-            with self.assertRaisesRegex(ht.Declined, why):
-                ht.trace(lambda t: torch.pow(t, exp), (x,))
         xi = torch.arange(64, device="cuda").view(8, 8)
+        for base, exp in ((x, 0.0), (x, 0), (xi, 0), (x, False)):
+            with self.subTest(exp=exp, dtype=base.dtype):
+                fn = lambda t: torch.pow(t, exp)  # noqa: E731
+                eager = assert_eager_function_handles(self, fn, (base,), launches=1)
+                self.assertEqual(len(eager), 1)
+                (got,) = build(ht.trace(fn, (base,)), fn, (base,)).replay((base,))
+                self.assertTrue(torch.equal(got, fn(base)))
+        for base, exp in ((x, 1.0), (x, 1), (xi, 1), (x[:, ::2], 1.0), (x, True)):
+            with self.subTest(
+                exp=exp, dtype=base.dtype, strided=not base.is_contiguous()
+            ):
+                fn = lambda t: torch.pow(t, exp)  # noqa: E731
+                tape = ht.trace(fn, (base,))
+                self.assertEqual(
+                    (tape.num_launches, tape.num_memcpys),
+                    (0, 1) if base.is_contiguous() else (1, 0),
+                )
+                (got,) = build(tape, fn, (base,)).replay((base,))
+                self.assertTrue(torch.equal(got, fn(base)))
         with self.assertRaisesRegex(ht.Declined, "promotes the base"):
             ht.trace(lambda t: torch.pow(t, 2.5), (xi,))
         with self.assertRaisesRegex(RuntimeError, "negative integer powers"):
@@ -1438,8 +1472,8 @@ class TestCudaHostTraceTI(HostTraceTestCase):
             ht.Declined, "promotes its CUDA operand from Bool to Long"
         ):
             ht.trace(lambda t: t == 1, (xi > 0,))
-        with self.assertRaisesRegex(ht.Declined, "different dtypes"):
-            ht.trace(lambda t, u: t < u, (xi, xi.float()))
+        # a dtype pair promotes through the cast kernel
+        self.assertEqual(ht.trace(lambda t, u: t < u, (xi, xi.float())).num_launches, 1)
         # the comparison kernels are eager's families
         x = self._values(64, 4096, torch.bfloat16)
         for fn, entry_args in (
@@ -1522,9 +1556,13 @@ class TestCudaHostTraceTI(HostTraceTestCase):
             ht.trace(
                 lambda t, mask: (t * 1.0).masked_fill_(mask, 0.0), (x, m), warm_up=False
             )
-        # the eq of HF's mask test traces; the all() behind it is the next op
-        with self.assertRaisesRegex(ht.Declined, "aten.all.default"):
-            ht.trace(lambda mask: torch.all(mask == 1), (m,))
+        # the eq of HF's mask test and the all() behind it trace (the
+        # comparison and the reduction); the bool() of the result is a host
+        # read and declines by name
+        tape = ht.trace(lambda mask: torch.all(mask == 1), (m,))
+        self.assertEqual(tape.num_launches, 2)
+        with self.assertRaisesRegex(ht.Declined, r"bool\(\)"):
+            ht.trace(lambda mask: bool(torch.all(mask == 1)), (m,))
         self.assertFalse(C._host_trace_tracing())
 
     def test_in_place_scalar_ops_write_the_input_storage(self):
@@ -2142,6 +2180,8 @@ class TestCudaHostTraceTI(HostTraceTestCase):
             x = x.abs() + 0.5
         if prep == "mask":
             y = y > 0
+        if prep == "nonzero":
+            y = y.abs() % 5 + 1
         return (x,) if ntensors == 1 else (x, y) if ntensors == 2 else (x, y, z)
 
     def _assert_generated_parity(self, real, entry, args, ntensors, f_size):
@@ -2203,6 +2243,8 @@ class TestCudaHostTraceTI(HostTraceTestCase):
                 ]
                 if prep == "positive":
                     args = [(a[0].abs() + 0.5, *a[1:]) for a in args]
+                if prep == "nonzero":
+                    args = [(a[0], a[1].abs() % 5 + 1) for a in args]
                 with self.subTest(op=name, dtype=dtype):
                     tape, _, served = self._roundtrip(real, args[0], args[1:])
                     self.assertEqual(tape.num_launches, 1)
@@ -2366,12 +2408,14 @@ class TestCudaHostTraceTI(HostTraceTestCase):
         # CPU scalar input and declines by name (A167)
         with self.assertRaisesRegex(ht.Declined, "implicit CPU scalar input"):
             ht.trace(lambda t: torch.maximum(t, _CPU_TWO), (x,))
-        # type promotion declines
-        with self.assertRaisesRegex(ht.Declined, "different dtypes"):
-            ht.trace(torch.maximum, (x, y.to(torch.bfloat16)))
+        # a promoted binary pair traces through the cast kernel (lerp.Scalar
+        # too); a ternary op's promotion (lerp.Tensor) still declines
+        self.assertEqual(
+            ht.trace(torch.maximum, (x, y.to(torch.bfloat16))).num_launches, 1
+        )
         with self.assertRaisesRegex(ht.Declined, "type promotion"):
             ht.trace(
-                lambda a, b: torch.lerp(a, b, 0.5),
+                lambda a, b: torch.lerp(a, b, a * 0.5),
                 (x, y.to(torch.bfloat16)),
                 warm_up=False,
             )
@@ -2580,6 +2624,66 @@ class TestCudaHostTraceTI(HostTraceTestCase):
         variant = build(ht.trace(fn, (x, y, o)), fn, (x, y, o))
         (got,) = variant.replay((x, y, torch.empty(8, 64, device="cuda")))
         self.assertTrue(torch.equal(got, x + y))
+        self.assertFalse(C._host_trace_tracing())
+
+    def test_where_with_a_python_scalar_traces_through_scalar_tensor(self):
+        # torch.where(mask, min_value, x) (Gemma-2's sliding-window mask): the
+        # ScalarOther / ScalarSelf composites build their scalar operand with
+        # scalar_tensor (an allocation and eager's fill_ kernel over one
+        # element) and call where.self, whose entry launches eager's opaque
+        # where kernel over WhereFunctor: eager's function handles, bitwise,
+        # replayed at new shapes; a non-bool condition raises eager's text
+        minv = torch.finfo(torch.bfloat16).min
+        B, T = 4, 64
+
+        def args(b, t, dtype):
+            x = torch.randn(b, 1, 1, t, device="cuda").to(dtype)
+            y = torch.randn(b, 1, 1, t, device="cuda").to(dtype)
+            return torch.randn(t, device="cuda") > 0, x, y
+
+        cases = {
+            "where(mask, min, x)": (
+                lambda m, x, y: torch.where(m, minv, x),
+                torch.bfloat16,
+            ),
+            "where(mask, x, 0.0)": (
+                lambda m, x, y: torch.where(m, x, 0.0),
+                torch.float32,
+            ),
+            "where(mask, x, y)": (lambda m, x, y: torch.where(m, x, y), torch.bfloat16),
+            "where(mask, 2, x) int": (
+                lambda m, x, y: torch.where(m, 2, x),
+                torch.int64,
+            ),
+        }
+        for name, (fn, dtype) in cases.items():
+            base = args(B, T, dtype)
+            with self.subTest(case=name):
+                eager = assert_eager_function_handles(self, fn, base)
+                self.assertEqual(len(eager), 1 if name == "where(mask, x, y)" else 2)
+                tape, _, served = self._roundtrip(
+                    fn, base, [args(2, 40, dtype), args(3, 8, dtype)]
+                )
+                self.assertEqual(served, 2)
+        # the entry beside the real op: strides and bits over the layout matrix
+        for dtype in (torch.bfloat16, torch.float32, torch.int64):
+            for case, (x, y) in self._matrix(dtype, True).items():
+                if case == "scalar":
+                    continue
+                m = torch.randn(x.shape, device="cuda") > 0
+                with self.subTest(dtype=dtype, case=case):
+                    want = torch.where(m, x, y)
+                    got = C._host_trace_ti_where(m, x, y)
+                    torch.cuda.synchronize()
+                    self._assert_bitwise(got, want, stride=True)
+        m, x, y = args(B, T, torch.bfloat16)
+        with self.assertRaisesRegex(
+            RuntimeError, "where expected condition to be a boolean tensor"
+        ):
+            ht.trace(lambda c, a, b: torch.where(c, a, b), (m.float(), x, y))
+        # scalar_tensor on the CPU (no device given) is not traced
+        with self.assertRaisesRegex(ht.Declined, "scalar_tensor.default on cpu"):
+            ht.trace(lambda a: a * torch.scalar_tensor(2.0).cuda(), (x,), warm_up=False)
         self.assertFalse(C._host_trace_tracing())
 
     def test_every_case_traces_the_same_program_under_other_hints(self):

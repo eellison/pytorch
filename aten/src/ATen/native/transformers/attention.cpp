@@ -594,13 +594,15 @@ std::optional<Tensor> convert_boolean_attn_mask(const std::optional<Tensor>& att
 template<int alignment>
 bool aligned_tensor(const at::Tensor& tensor){
   for(const auto i : c10::irange(tensor.dim() - 1)){
-    auto stride = tensor.sym_stride(i).maybe_as_int();
-    // If the stride is unknown at compilation time, assume it is unaligned
-    // and always pad it. This is helpful to avoid unnecessary guards.
-    if (!stride)
+    const auto stride = tensor.sym_stride(i);
+    // An unbacked stride (no hint) is assumed unaligned and always padded, as
+    // before, so no data-dependent guard is raised; a known one is checked,
+    // a guard on its alignment class, so a symbolic call takes the path the
+    // concrete strides take (a host trace pads exactly when eager pads).
+    if (!stride.has_hint())
       return false;
 
-    if((*stride) % alignment != 0){
+    if(stride % alignment != 0){
       return false;
     }
   }

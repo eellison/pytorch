@@ -4,7 +4,12 @@ import json
 import re
 import unittest
 
-from host_trace_testing import bits, build, HostTraceTestCase
+from host_trace_testing import (
+    assert_eager_function_handles,
+    bits,
+    build,
+    HostTraceTestCase,
+)
 
 import torch
 import torch.nn.functional as F
@@ -658,6 +663,69 @@ class TestCudaHostTraceReduce(HostTraceTestCase):
         self.assertEqual(len(kernels), 1)
         self.assertIn("SumCombine", kernels[0][0])
         self.assertIn("reduce_kernel", kernels[0][0])
+        self.assertFalse(C._host_trace_tracing())
+
+    def test_all_and_any_reduce_to_bool_with_eagers_kernels(self):
+        # all / any over bool, bf16, float32 and int64 inputs: the reduce_op
+        # iterator keeps the input in its own dtype and the result bool (the
+        # dynamic cast inside eager's reduction, TensorIterator's
+        # promote_inputs_to_common_dtype on the sibling), over every dim and
+        # one dim, keepdim: bitwise eager, eager's own kernel by function
+        # handle (E36), a replay at new shapes; the bool() a caller applies to
+        # the result stays a host read (O64), an empty input is the fill
+        def entry(all_of):
+            return lambda t, dims=(), keepdim=False: C._host_trace_ti_allany(
+                t, list(dims), keepdim, all_of
+            )
+
+        def make(shape, dtype):
+            x = torch.randn(*shape, device="cuda")
+            return (x > 0.3) if dtype is torch.bool else (x * 3).to(dtype)
+
+        for dtype in (torch.bool, torch.bfloat16, torch.float32, torch.int64):
+            x = make((48, 3000), dtype)
+            for real, all_of in ((torch.all, True), (torch.any, False)):
+                with self.subTest(op=real.__name__, dtype=dtype):
+                    # one launch (a global reduce adds its semaphore memset)
+                    assert_eager_function_handles(
+                        self, real, (x,), entry(all_of), launches=1
+                    )
+                    got, want = entry(all_of)(x), real(x)
+                    torch.cuda.synchronize()
+                    self._assert_bitwise(got, want, stride=True)
+                    for fn in (
+                        lambda t: real(t, -1),
+                        lambda t: real(t, 0, keepdim=True),
+                        lambda t: real(t, dim=(0, 1)),
+                    ):
+                        assert_eager_function_handles(self, fn, (x,), launches=1)
+                    # the power-of-two neighbours of the traced shape serve, as
+                    # for sum (the block dims are a last_pow2 rebind)
+                    news = [
+                        (make(s, dtype),) for s in ((32, 4096), (128, 4096), (64, 2048))
+                    ]
+                    tape, _, served, misses = self._roundtrip(
+                        lambda t: real(t, -1), (make((64, 4096), dtype),), news
+                    )
+                    self.assertEqual(tape.num_launches, 1)
+                    self.assertEqual(
+                        served, [(32, 4096), (128, 4096), (64, 2048)], misses
+                    )
+        x = make((8, 4096), torch.bfloat16)
+        # the mask idiom: torch.all(mask == 1) is the comparison and the
+        # reduction; bool() of it a host read that declines by name
+        tape = ht.trace(lambda t: torch.all(t > 0), (x,))
+        self.assertEqual(tape.num_launches, 2)
+        with self.assertRaisesRegex(ht.Declined, r"bool\(\)"):
+            ht.trace(lambda t: t * bool(torch.all(t > 0)), (x,))
+        # an empty input: eager fills the result with the identity (no launch
+        # over zero elements on either side)
+        for real in (torch.all, torch.any):
+            tape = ht.trace(lambda t: real(t[:, :0], -1), (x,))
+            self.assertEqual(tape.num_launches, 1)
+        # a Byte input keeps eager's Byte result: declined by name
+        with self.assertRaisesRegex(ht.Declined, "Byte"):
+            ht.trace(torch.any, ((x > 0).to(torch.uint8),))
         self.assertFalse(C._host_trace_tracing())
 
     def test_every_case_traces_the_same_program_under_other_hints(self):

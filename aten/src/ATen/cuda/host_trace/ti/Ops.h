@@ -9,6 +9,7 @@
 #pragma once
 #include <optional>
 #include <tuple>
+#include <ATen/core/Generator.h>
 #include <ATen/core/Tensor.h>
 #include <c10/core/Scalar.h>
 
@@ -30,6 +31,20 @@ TORCH_CUDA_CU_API Tensor gelu_traced(const Tensor& self, std::string_view approx
 // declared on the tape as an expression of the element count
 TORCH_CUDA_CU_API std::tuple<Tensor, Tensor> native_dropout_traced(const Tensor& self, double p, std::optional<bool> train);
 TORCH_CUDA_CU_API Tensor& copy_traced(Tensor& dst, const Tensor& src);
+// the in-place distributions (DistributionTemplates.h's entries in each
+// Distribution*.cu): the generator is the op's argument, the default CUDA
+// generator or none (another declines by name); the philox increment is
+// declared on the tape as an expression of the element count
+TORCH_CUDA_CU_API Tensor& random_from_to_traced(Tensor& self, int64_t from, std::optional<int64_t> to, const std::optional<at::Generator>& gen);
+TORCH_CUDA_CU_API Tensor& random_traced(Tensor& self, const std::optional<at::Generator>& gen);
+TORCH_CUDA_CU_API Tensor& uniform_traced(Tensor& self, double from, double to, const std::optional<at::Generator>& gen);
+TORCH_CUDA_CU_API Tensor& normal_traced(Tensor& self, double mean, double std, const std::optional<at::Generator>& gen);
+TORCH_CUDA_CU_API Tensor& bernoulli_scalar_traced(Tensor& self, double p, const std::optional<at::Generator>& gen);
+TORCH_CUDA_CU_API Tensor& bernoulli_tensor_traced(Tensor& self, const Tensor& p, const std::optional<at::Generator>& gen);
+TORCH_CUDA_CU_API Tensor& exponential_traced(Tensor& self, double lambda, const std::optional<at::Generator>& gen);
+TORCH_CUDA_CU_API Tensor& geometric_traced(Tensor& self, double p, const std::optional<at::Generator>& gen);
+TORCH_CUDA_CU_API Tensor& cauchy_traced(Tensor& self, double median, double sigma, const std::optional<at::Generator>& gen);
+TORCH_CUDA_CU_API Tensor& log_normal_traced(Tensor& self, double mean, double std, const std::optional<at::Generator>& gen);
 TORCH_CUDA_CU_API Tensor reciprocal_traced(const Tensor& self);
 TORCH_CUDA_CU_API Tensor tanh_traced(const Tensor& self);
 TORCH_CUDA_CU_API Tensor sqrt_traced(const Tensor& self);
@@ -59,6 +74,10 @@ TORCH_CUDA_CU_API Tensor& masked_fill_traced(Tensor& self, const Tensor& mask, c
 // clamp / clamp_min / clamp_max with scalar bounds (TensorCompare.cpp
 // clamp_out and TensorCompare.cu launch_clamp_scalar); `out` as for add
 TORCH_CUDA_CU_API Tensor clamp_scalar_traced(const Tensor& self, const std::optional<Scalar>& min, const std::optional<Scalar>& max, const Tensor& out = {});
+// where.self (TensorCompare.cpp where_self_out, TensorCompare.cu
+// where_kernel_impl): a bool condition selecting between two operands of one
+// dtype, dispatched on the element size as the real kernel is
+TORCH_CUDA_CU_API Tensor where_traced(const Tensor& condition, const Tensor& self, const Tensor& other);
 
 TORCH_CUDA_CU_API Tensor sin_traced(const Tensor& self);
 TORCH_CUDA_CU_API Tensor cos_traced(const Tensor& self);

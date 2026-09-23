@@ -20,5 +20,8 @@ namespace at::cuda::host_trace::ti {
 TORCH_CUDA_CU_API Tensor sum_traced(const Tensor& self, IntArrayRef dims, bool keepdim, const std::optional<Tensor>& out = std::nullopt);
 TORCH_CUDA_CU_API Tensor mean_traced(const Tensor& self, IntArrayRef dims, bool keepdim);
 TORCH_CUDA_CU_API Tensor amax_traced(const Tensor& self, IntArrayRef dims, bool keepdim);
+// all / any (ReduceLogicKernel.cu): the input in its own dtype reduced into
+// a bool result, the input's dims=[] form for all.default / any.default
+TORCH_CUDA_CU_API Tensor allany_traced(const Tensor& self, IntArrayRef dims, bool keepdim, bool all_of, const std::optional<Tensor>& out = std::nullopt);
 
 } // namespace at::cuda::host_trace::ti
