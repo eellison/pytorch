@@ -1146,5 +1146,11 @@
     "script": "cpu/test_hosttrace_partition_boundary.py",
     "device": "cpu",
     "cases": 25
+  },
+  {
+    "id": "cpu_hosttrace_partition_cut_inputs",
+    "script": "cpu/test_hosttrace_partition_cut_inputs.py",
+    "device": "cpu",
+    "cases": 11
   }
 ]

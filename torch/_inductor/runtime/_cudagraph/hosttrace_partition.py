@@ -44,7 +44,7 @@ import sympy
 import torch
 from torch.cuda import _host_trace
 from torch.cuda._host_trace import _OutputRec, _SYM_TYPES, _TracedTensor
-from torch.utils._pytree import tree_flatten, tree_map
+from torch.utils._pytree import tree_flatten, tree_map, tree_unflatten
 
 from .hosttrace_allocseq import AllocatorSequence
 
@@ -158,6 +158,10 @@ class _Cut:
     produced: set  # allocation names made inside the op's range
     args: Any = None  # the op's arguments with traced tensors replaced by _Ref rows
     kwargs: Any = None
+    args_leaves: tuple = ()
+    kwargs_leaves: tuple = ()
+    args_spec: Any = None
+    kwargs_spec: Any = None
     out_spec: Any = None
     out_leaves: list = dataclasses.field(default_factory=list)  # traced output leaves
     eager_s: float = 0.0
@@ -528,8 +532,24 @@ class Partition:
                 raise PartitionDeclined(f"op {op.index} takes a real tensor argument")
             return _expr(x) if isinstance(x, _SYM_TYPES) else x
 
-        cut.args = tree_map(ref, op.args)
-        cut.kwargs = tree_map(ref, op.kwargs)
+        args_leaves, args_spec = tree_flatten(op.args)
+        args_leaves = [ref(x) for x in args_leaves]
+        cut.args = tree_unflatten(args_leaves, args_spec)
+        kwargs_leaves, kwargs_spec = tree_flatten(op.kwargs)
+        kwargs_leaves = [ref(x) for x in kwargs_leaves]
+        cut.kwargs = tree_unflatten(kwargs_leaves, kwargs_spec)
+        # Custom unflatten functions may change the materialized tree.
+        pending = [args_spec, kwargs_spec]
+        while pending:
+            spec = pending.pop()
+            if not spec.is_leaf() and spec.type not in (tuple, list, dict):
+                break
+            pending.extend(spec.children())
+        else:
+            cut.args_leaves = tuple(args_leaves)
+            cut.kwargs_leaves = tuple(kwargs_leaves)
+            cut.args_spec = args_spec
+            cut.kwargs_spec = kwargs_spec
         leaves, cut.out_spec = tree_flatten(op.outputs)
         cut.out_leaves = [ref(x) for x in leaves]
         # every root the op made that a later record reads must be one of its outputs
@@ -806,9 +826,17 @@ class Partition:
     def _run_cut(self, j, cut, env, box, boundary, known):
         op = cut.op
         mat = lambda leaf: self._materialize(leaf, env, box, boundary)  # noqa: E731
-        args = tree_map(mat, cut.args)
-        kwargs = tree_map(mat, cut.kwargs)
-        for t in tree_flatten((args, kwargs))[0]:
+        if cut.args_spec is None:
+            args = tree_map(mat, cut.args)
+            kwargs = tree_map(mat, cut.kwargs)
+            materialized = tree_flatten((args, kwargs))[0]
+        else:
+            args_leaves = [mat(leaf) for leaf in cut.args_leaves]
+            args = tree_unflatten(args_leaves, cut.args_spec)
+            kwargs_leaves = [mat(leaf) for leaf in cut.kwargs_leaves]
+            kwargs = tree_unflatten(kwargs_leaves, cut.kwargs_spec)
+            materialized = itertools.chain(args_leaves, kwargs_leaves)
+        for t in materialized:
             if isinstance(t, torch.Tensor):
                 known.add(t.untyped_storage().data_ptr())
         t0 = time.perf_counter()
