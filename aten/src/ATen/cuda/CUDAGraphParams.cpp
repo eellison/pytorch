@@ -712,8 +712,12 @@ void KernelNodeParams::update_replay(
       }) ||
       std::any_of(scalar_slots.begin(), scalar_slots.end(), [&](const auto& slot) {
         const auto value = values[slot.value_index];
+        const uint8_t byte = static_cast<uint8_t>(value);
+        const uint16_t half = static_cast<uint16_t>(value);
         const int32_t narrow = slot.width == sizeof(int32_t) ? static_cast<int32_t>(value) : 0;
-        const void* bytes = slot.width == sizeof(narrow) ? static_cast<const void*>(&narrow) : &value;
+        const void* bytes = slot.width == 1 ? static_cast<const void*>(&byte)
+            : slot.width == 2 ? static_cast<const void*>(&half)
+            : slot.width == 4 ? static_cast<const void*>(&narrow) : &value;
         return std::memcmp(buffer.data() + slot.offset, bytes, slot.width) != 0;
       });
   if (!dirty) {
@@ -730,8 +734,12 @@ void KernelNodeParams::update_replay(
   }
   for (const auto& slot : scalar_slots) {
     const auto value = values[slot.value_index];
+    const uint8_t byte = static_cast<uint8_t>(value);
+    const uint16_t half = static_cast<uint16_t>(value);
     const int32_t narrow = slot.width == sizeof(int32_t) ? static_cast<int32_t>(value) : 0;
-    const void* bytes = slot.width == sizeof(narrow) ? static_cast<const void*>(&narrow) : &value;
+    const void* bytes = slot.width == 1 ? static_cast<const void*>(&byte)
+        : slot.width == 2 ? static_cast<const void*>(&half)
+        : slot.width == 4 ? static_cast<const void*>(&narrow) : &value;
     std::memcpy(staged.data() + slot.offset, bytes, slot.width);
   }
   state.submit(graph_exec, request);
@@ -1509,7 +1517,9 @@ std::shared_ptr<detail::KernelPointerUpdateBatch> CUDAGraph::prepare_kernel_repl
     }
   }
   for (const auto& binding : scalars) {
-    TORCH_CHECK_VALUE(binding.width == 4 || binding.width == 8, "Scalar width must be 4 or 8 bytes");
+    TORCH_CHECK_VALUE(
+        binding.width == 1 || binding.width == 2 || binding.width == 4 || binding.width == 8,
+        "Scalar width must be 1, 2, 4 or 8 bytes");
     TORCH_CHECK_INDEX(binding.value_index < value_count, "Scalar value index is out of range");
     if (positions.emplace(binding.node, requests.size()).second) {
       requests.push_back({binding.node, {}});

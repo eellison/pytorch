@@ -14,6 +14,7 @@ from torch._inductor.runtime._cudagraph.cute_types import CuTeCall
 from torch._inductor.runtime._cudagraph.hosttrace_cute import CuTeLowering
 from torch._inductor.runtime.cudagraph_arg_mapping import (
     BufferSource,
+    ExpressionSource,
     InputSource,
     IntegerSource,
     IntExpr,
@@ -207,6 +208,28 @@ class TestHostTraceCuTeSources(TestCase):
         call, module = self.call(kind, width, value)
         self.prepare_to_launch(call)
         self.assertEqual(module.image, struct.pack("i" if width == 32 else "q", value))
+
+    @parametrize("width,value", ((8, -257), (16, -65537)))
+    def test_narrow_physical_source_reaches_preparation(self, width, value):
+        from torch.cuda._host_trace import _pack
+
+        source = ExpressionSource(IntExpr("constant", value))
+        field = direct_hosttrace._PhysicalField(0, 0, f"i{width}", source)
+        module = _Module(width)
+        one = IntExpr("constant", 1)
+        call = direct_hosttrace._PhysicalCall((field,), module, (one, one, one), ())
+        self.prepare_to_launch(call)
+        self.assertEqual(module.image, _pack("u8" if width == 8 else "i16", value))
+
+    def test_late_pointer_transport_reaches_preparation(self):
+        field = direct_hosttrace._PhysicalField(
+            0, 0, "pointer", ParameterSource("constant", 64, 4096)
+        )
+        module = _Module(64)
+        one = IntExpr("constant", 1)
+        call = direct_hosttrace._PhysicalCall((field,), module, (one, one, one), ())
+        self.prepare_to_launch(call)
+        self.assertEqual(module.image, struct.pack("q", 4096))
 
     def test_parameter_pointer_extends_allocation_use(self):
         root = BufferSource("temporary")

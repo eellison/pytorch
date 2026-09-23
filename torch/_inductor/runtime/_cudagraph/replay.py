@@ -32,6 +32,8 @@ from torch._inductor.runtime.cudagraph_boxed_replay import (
     _make_replay,
     _NumericProgram,
     _ParameterProgram,
+    _physical_scalar_bytes,
+    _PHYSICAL_SCALAR_WIDTHS,
     _PhysicalCall,
     _pointer_value,
     _TensorMapField,
@@ -447,7 +449,7 @@ def prepare_terminal(program, example_inputs):
                             "CuTe pointer has no preceding traced allocation"
                         )
                 elif type(source) in (IntegerSource, ExpressionSource):
-                    if field.kind not in ("i32", "i64"):
+                    if field.kind not in _PHYSICAL_SCALAR_WIDTHS:
                         raise UnsupportedCapture(
                             "CuTe scalar has an unsupported physical type"
                         )
@@ -865,7 +867,7 @@ def prepare_terminal(program, example_inputs):
                             if type(source) is PointerSource
                             else struct.pack("P", value.data_ptr())
                             if type(source) in (InputSource, BufferSource)
-                            else struct.pack({"i32": "i", "i64": "q"}[kind], value)
+                            else _physical_scalar_bytes(kind, value)
                         )
                         if physical:
                             images[argument.parameter][

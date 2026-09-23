@@ -592,6 +592,17 @@ class _ParameterProgram:
         )
 
 
+_PHYSICAL_SCALAR_WIDTHS = {"i8": 1, "i16": 2, "i32": 4, "i64": 8}
+
+
+def _physical_scalar_bytes(kind, value):
+    width = _PHYSICAL_SCALAR_WIDTHS[kind]
+    # The recorder's narrow kinds encode low bits without declaring signedness.
+    if width < 4:
+        return struct.pack("<q", value)[:width]
+    return struct.pack("i" if width == 4 else "q", value)
+
+
 def _pointer_value(pointer, displacement):
     value = pointer + displacement
     if not 0 <= value < 2 ** (8 * struct.calcsize("P")):
@@ -656,11 +667,13 @@ def _bind_physical_call(
     for field in call.fields:
         if type(field) is not _PhysicalField or field.kind not in (
             "pointer",
+            "i8",
+            "i16",
             "i32",
             "i64",
         ):
             raise UnsupportedCapture("Unsupported physical parameter field")
-        width = 4 if field.kind == "i32" else 8
+        width = 8 if field.kind == "pointer" else _PHYSICAL_SCALAR_WIDTHS[field.kind]
         actual = span(field.parameter, field.byte_offset, width)
         source = field.source
         if type(source) is ParameterSource:
@@ -738,11 +751,12 @@ def _bind_physical_call(
                 raise UnsupportedCapture(
                     "Physical integer has no exact symbolic or literal source"
                 )
-            if not -(2 ** (width * 8 - 1)) <= value < 2 ** (width * 8 - 1):
+            bits = 32 if width == 4 else 64
+            if not -(2 ** (bits - 1)) <= value < 2 ** (bits - 1):
                 raise UnsupportedCapture(
                     "Physical integer exceeds its selected ABI width"
                 )
-            if struct.pack("i" if width == 4 else "q", value) != actual:
+            if _physical_scalar_bytes(field.kind, value) != actual:
                 raise UnsupportedCapture(
                     "Physical integer field differs from its recorded source"
                 )

@@ -74,6 +74,7 @@ from torch._inductor.runtime.cudagraph_boxed_replay import (
     _make_replay,
     _NumericProgram,
     _ParameterProgram,
+    _physical_scalar_bytes,
     _PhysicalCall,
     _PhysicalField,
 )
@@ -208,7 +209,7 @@ class HostTraceLoweringDeclined(UnsupportedCapture):
 
 
 _SYM_TYPES = (torch.SymInt, torch.SymFloat, torch.SymBool)
-_INT_KINDS = {"i32": 4, "i64": 8, "u32": 4, "u64": 8}
+_INT_KINDS = {"u8": 1, "i16": 2, "i32": 4, "i64": 8, "u32": 4, "u64": 8}
 _FLOAT_KINDS = {"f32": 4, "f64": 8}
 
 
@@ -1800,9 +1801,7 @@ def lower_tape(
                     expression = _as_i32(lowering, expression)
                 source = ExpressionSource(expression)
                 fields.append(
-                    _PhysicalField(
-                        index, inner, "i64" if kind in ("i64", "u64") else "i32", source
-                    )
+                    _PhysicalField(index, inner, f"i{8 * _INT_KINDS[kind]}", source)
                 )
             elif kind in _FLOAT_KINDS:
                 if _FLOAT_KINDS[kind] != p["size"]:
@@ -1822,7 +1821,7 @@ def lower_tape(
                 )
             else:
                 raise HostTraceLoweringDeclined(
-                    f"host_trace lowering: a symbolic {kind} parameter has no scalar binding in the runtime (only i32/i64 and pointers)"
+                    f"host_trace lowering: a symbolic {kind} parameter has no scalar binding in the runtime (only integer/float bit fields and pointers)"
                 )
         for index, (start, width) in enumerate(layout):
             # bytes no record names (struct padding, fields the host never wrote): the
@@ -1900,7 +1899,7 @@ def lower_tape(
                     )
                 source, _ = _pointer_source(lowering, symbols, value)
                 elements.append((offset, width, source))
-            elif kind in _INT_KINDS or kind in ("i16", "u8"):
+            elif kind in _INT_KINDS:
                 expression = lowering.payload(value)
                 if kind == "u32":
                     expression = _as_i32(lowering, expression)
@@ -4024,9 +4023,11 @@ def prepare_hosttrace(
                                 value = source.value
                             else:
                                 value = numeric.prepared_value(source.expression)
-                            payload = struct.pack(
-                                "i" if field.kind == "i32" else "q", value
-                            )  # float fields travel as their bit patterns
+                            payload = (
+                                struct.pack("i" if field.kind == "i32" else "q", value)
+                                if type(source) is ParameterSource
+                                else _physical_scalar_bytes(field.kind, value)
+                            )
                         images[field.parameter][
                             field.byte_offset : field.byte_offset + len(payload)
                         ] = payload

@@ -60,6 +60,12 @@
     "cases": 1
   },
   {
+    "id": "cuda_narrow_scalar_updates",
+    "script": "cuda/test_narrow_scalar_updates.py",
+    "device": "cuda",
+    "cases": 1
+  },
+  {
     "id": "cuda_guardless_retrace",
     "script": "cuda/test_guardless_retrace.py",
     "device": "cuda",
@@ -1004,8 +1010,14 @@
     "id": "cpu_hosttrace_cute_sources",
     "script": "cpu/test_hosttrace_cute_sources.py",
     "device": "cpu",
-    "cases": 10,
+    "cases": 13,
     "requires_cute": true
+  },
+  {
+    "id": "cpu_hosttrace_narrow_scalars",
+    "script": "cpu/test_hosttrace_narrow_scalars.py",
+    "device": "cpu",
+    "cases": 19
   },
   {
     "id": "cpu_hosttrace_triton_contract",
