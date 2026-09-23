@@ -663,11 +663,35 @@ struct BoxedNumericPlan {
     }
   }
 
+  std::vector<Instruction> leaf_bindings() const {
+    std::vector<Instruction> leaves;
+    for (const auto& instruction : instructions) {
+      if (instruction.op != Op::Boxed && instruction.op != Op::Pointer &&
+          instruction.op != Op::StorageOffset && instruction.op != Op::Size &&
+          instruction.op != Op::Stride) {
+        continue;
+      }
+      const auto duplicate =
+          std::find_if(leaves.begin(), leaves.end(), [&](const auto& leaf) {
+            return leaf.op == instruction.op &&
+                leaf.first == instruction.first &&
+                leaf.second == instruction.second;
+          });
+      if (duplicate == leaves.end()) {
+        leaves.push_back(instruction);
+      }
+    }
+    return leaves;
+  }
+
   static int64_t read_input(
       const Instruction& instruction,
       std::vector<THPObjectPtr>& inputs) {
+    return read_input(instruction, inputs[instruction.first].get());
+  }
+
+  static int64_t read_input(const Instruction& instruction, PyObject* input) {
     if (instruction.op == Op::Boxed) {
-      auto* input = inputs[instruction.first].get();
       if (!PyLong_CheckExact(input)) {
         throw py::type_error(
             "Declared boxed integer inputs must be exact integers");
@@ -678,7 +702,7 @@ struct BoxedNumericPlan {
       }
       return value;
     }
-    const auto& tensor = THPVariable_Unpack(inputs[instruction.first].get());
+    const auto& tensor = THPVariable_Unpack(input);
     if (instruction.op == Op::StorageOffset) {
       return tensor.storage_offset();
     }
@@ -883,6 +907,82 @@ struct BoxedNumericPlan {
   std::vector<size_t> tensor_inputs;
   std::vector<Instruction> instructions;
   std::vector<THPObjectPtr> call_owners;
+};
+
+struct PythonBoxedNumeric {
+  PythonBoxedNumeric(
+      size_t input_count,
+      py::handle numeric_plan,
+      std::shared_ptr<CompiledBoxedEvaluation> compiled,
+      std::vector<size_t> output_indices)
+      : input_count(input_count),
+        compiled(std::move(compiled)),
+        output_indices(std::move(output_indices)) {
+    if (!this->compiled || this->compiled->late_count != 0 ||
+        !PyTuple_CheckExact(numeric_plan.ptr()) ||
+        PyTuple_GET_SIZE(numeric_plan.ptr()) != 2) {
+      throw py::value_error(
+          "Boxed numeric evaluation requires an early-only plan");
+    }
+    BoxedNumericPlan numeric(
+        numeric_plan.ptr(), input_count, this->compiled->early_count);
+    using Op = BoxedNumericPlan::Op;
+    auto* rows = PyTuple_GET_ITEM(numeric_plan.ptr(), 1);
+    for (size_t index = 0; index < numeric.instructions.size(); ++index) {
+      auto op = numeric.instructions[index].op;
+      auto* tag = PyTuple_GET_ITEM(PyTuple_GET_ITEM(rows, index), 0);
+      if (op == Op::Pointer || op == Op::Call || op == Op::PCall ||
+          (op >= Op::FFromInt && op <= Op::FPow) ||
+          PyUnicode_CompareWithASCIIString(tag, "fconst") == 0) {
+        throw py::value_error(
+            "Boxed numeric evaluation requires pure integer instructions");
+      }
+    }
+    leaves = numeric.leaf_bindings();
+    if (leaves.size() != this->compiled->leaf_count ||
+        std::any_of(
+            this->output_indices.begin(),
+            this->output_indices.end(),
+            [&](size_t index) {
+              return index >= this->compiled->early_count;
+            })) {
+      throw py::value_error(
+          "Boxed numeric bindings differ from the compiled plan");
+    }
+  }
+
+  py::object call(py::handle inputs) const {
+    if (!PyList_CheckExact(inputs.ptr()) ||
+        static_cast<size_t>(PyList_GET_SIZE(inputs.ptr())) < input_count) {
+      throw py::type_error(
+          "Boxed numeric inputs require the original input prefix");
+    }
+    std::vector<int64_t> leaf_values(leaves.size());
+    std::vector<int64_t> values(compiled->early_count);
+    for (size_t index = 0; index < leaves.size(); ++index) {
+      const auto& leaf = leaves[index];
+      auto* input = PyList_GET_ITEM(inputs.ptr(), leaf.first);
+      if (leaf.op != BoxedNumericPlan::Op::Boxed &&
+          !THPVariable_CheckExact(input)) {
+        throw py::type_error(
+            "Boxed numeric metadata requires exact Tensor inputs");
+      }
+      leaf_values[index] = BoxedNumericPlan::read_input(leaf, input);
+    }
+    if (compiled->early(leaf_values.data(), values.data()) != 0) {
+      return py::none();
+    }
+    py::tuple result(output_indices.size());
+    for (size_t index = 0; index < output_indices.size(); ++index) {
+      result[index] = py::int_(values[output_indices[index]]);
+    }
+    return result;
+  }
+
+  const size_t input_count;
+  const std::shared_ptr<CompiledBoxedEvaluation> compiled;
+  const std::vector<size_t> output_indices;
+  std::vector<BoxedNumericPlan::Instruction> leaves;
 };
 
 struct BoxedOutput {
@@ -1137,23 +1237,7 @@ struct BoxedReplayPlan {
         throw py::value_error(
             "A nonempty parameter program requires a compiled late function");
       }
-      using Op = BoxedNumericPlan::Op;
-      for (const auto& instruction : numeric->instructions) {
-        if (instruction.op != Op::Boxed && instruction.op != Op::Pointer &&
-            instruction.op != Op::StorageOffset && instruction.op != Op::Size &&
-            instruction.op != Op::Stride) {
-          continue;
-        }
-        const auto duplicate =
-            std::find_if(leaves.begin(), leaves.end(), [&](const auto& leaf) {
-              return leaf.op == instruction.op &&
-                  leaf.first == instruction.first &&
-                  leaf.second == instruction.second;
-            });
-        if (duplicate == leaves.end()) {
-          leaves.push_back(instruction);
-        }
-      }
+      leaves = numeric->leaf_bindings();
       if (compiled->leaf_count != leaves.size()) {
         throw py::value_error(
             "Compiled leaf bindings differ from the prepared numeric plan");
@@ -2335,7 +2419,9 @@ class PythonGraphReplayOwner {
     return {lease_->batch().memcpy_updates(), lease_->batch().source_rebinds()};
   }
   std::pair<int64_t, int64_t> template_stats() const {
-    return {lease_->batch().template_applies(), lease_->batch().template_graph_updates()};
+    return {
+        lease_->batch().template_applies(),
+        lease_->batch().template_graph_updates()};
   }
 
   // Copy nodes retain an allocation binding even when a later pin has the same
@@ -2566,8 +2652,7 @@ class PythonBoxedGraphDispatch {
     if (!PyTuple_CheckExact(bound.ptr())) {
       throw py::type_error("Bound dispatch inputs must be an exact tuple");
     }
-    const auto count =
-        static_cast<size_t>(PyTuple_GET_SIZE(bound.ptr()));
+    const auto count = static_cast<size_t>(PyTuple_GET_SIZE(bound.ptr()));
     if (count > originals_.size()) {
       throw py::value_error(
           "Bound dispatch inputs exceed the prepared input count");
@@ -2952,13 +3037,13 @@ class PythonBoxedGraphDispatch {
     std::vector<int64_t> values;
     Predicate predicate;
     THPObjectPtr library;
-    // the bound inputs' metadata values hold in `values` from the bind on; false
-    // when a bound input is not a strided Tensor the bindings can read
+    // the bound inputs' metadata values hold in `values` from the bind on;
+    // false when a bound input is not a strided Tensor the bindings can read
     bool bound_metadata_valid = true;
   };
 
-  // The metadata facts of the bound (hidden) inputs, read once per bind into the
-  // variant's value slots: a call reads the visible inputs' metadata only.
+  // The metadata facts of the bound (hidden) inputs, read once per bind into
+  // the variant's value slots: a call reads the visible inputs' metadata only.
   void snapshot_bound_metadata(Variant& variant) {
     const auto visible = originals_.size() - hidden_.size();
     const auto metadata_start = variant.indices.size() +
@@ -3146,6 +3231,23 @@ void THCPGraph_init(PyObject* module) {
       .def_readonly("late_count", &CompiledBoxedEvaluation::late_count)
       .def_readonly("pointer_count", &CompiledBoxedEvaluation::pointer_count);
 
+  shared_ptr_class_<PythonBoxedNumeric>(torch_C_m, "_CUDAGraphBoxedNumeric")
+      .def(
+          py::init<
+              size_t,
+              py::handle,
+              std::shared_ptr<CompiledBoxedEvaluation>,
+              std::vector<size_t>>(),
+          py::kw_only(),
+          py::arg("input_count"),
+          py::arg("numeric_plan"),
+          py::arg("compiled_evaluation"),
+          py::arg("output_indices"))
+      .def(
+          "__call__",
+          torch::wrap_pybind_function(&PythonBoxedNumeric::call),
+          py::arg("inputs"));
+
   torch_C_m.def(
       "_cuda_evaluate_parameter_program",
       torch::wrap_pybind_function([](py::handle plan,
@@ -3251,10 +3353,13 @@ void THCPGraph_init(PyObject* module) {
           for (auto slot : row[5].cast<py::tuple>()) {
             auto fields = slot.cast<std::tuple<size_t, size_t, int64_t>>();
             node.slots.push_back(
-                {std::get<0>(fields), std::get<1>(fields), std::get<2>(fields)});
+                {std::get<0>(fields),
+                 std::get<1>(fields),
+                 std::get<2>(fields)});
           }
           node.workspace_slots = row[6].cast<std::vector<size_t>>();
-          node.attributes = row[7].cast<at::cuda::detail::KernelNodeAttributes>();
+          node.attributes =
+              row[7].cast<at::cuda::detail::KernelNodeAttributes>();
           variant.nodes.push_back(std::move(node));
         }
         return at::cuda::detail::register_kernel_template(
@@ -3278,7 +3383,8 @@ void THCPGraph_init(PyObject* module) {
     return at::cuda::detail::take_kernel_template_miss(site);
   });
   torch_C_m.def("_cuda_kernel_template_select_address", []() {
-    return reinterpret_cast<uintptr_t>(&at::cuda::detail::select_kernel_template);
+    return reinterpret_cast<uintptr_t>(
+        &at::cuda::detail::select_kernel_template);
   });
   torch_C_m.def("_cuda_kernel_template_select_key_address", []() {
     return reinterpret_cast<uintptr_t>(
@@ -3306,20 +3412,28 @@ void THCPGraph_init(PyObject* module) {
   });
   torch_C_m.def(
       "_cuda_launch_kernel_image",
-      torch::wrap_pybind_function([](uintptr_t function,
-                                     std::array<unsigned int, 3> grid,
-                                     std::array<unsigned int, 3> block,
-                                     unsigned int shared,
-                                     uintptr_t stream,
-                                     py::bytes image,
-                                     at::cuda::detail::KernelNodeAttributes attributes,
-                                     bool programmatic) {
-        std::string_view bytes = image;
-        std::vector<uint8_t> buffer(bytes.begin(), bytes.end());
-        py::gil_scoped_release release;
-        at::cuda::detail::launch_kernel_image(
-            function, grid, block, shared, stream, buffer, attributes, programmatic);
-      }),
+      torch::wrap_pybind_function(
+          [](uintptr_t function,
+             std::array<unsigned int, 3> grid,
+             std::array<unsigned int, 3> block,
+             unsigned int shared,
+             uintptr_t stream,
+             py::bytes image,
+             at::cuda::detail::KernelNodeAttributes attributes,
+             bool programmatic) {
+            std::string_view bytes = image;
+            std::vector<uint8_t> buffer(bytes.begin(), bytes.end());
+            py::gil_scoped_release release;
+            at::cuda::detail::launch_kernel_image(
+                function,
+                grid,
+                block,
+                shared,
+                stream,
+                buffer,
+                attributes,
+                programmatic);
+          }),
       py::arg("function"),
       py::arg("grid"),
       py::arg("block"),
@@ -3958,7 +4072,8 @@ void THCPGraph_init(PyObject* module) {
                   PyTuple_GET_ITEM(row, 1), "Template site");
               binding.variant_value_index =
                   static_cast<size_t>(unpack_nonnegative_integer(
-                      PyTuple_GET_ITEM(row, 2), "Template variant value index"));
+                      PyTuple_GET_ITEM(row, 2),
+                      "Template variant value index"));
               auto* operands = PyTuple_GET_ITEM(row, 3);
               for (Py_ssize_t index = 0; index < PyTuple_GET_SIZE(operands);
                    ++index) {
@@ -3978,7 +4093,8 @@ void THCPGraph_init(PyObject* module) {
                         ? std::nullopt
                         : std::optional<size_t>(
                               static_cast<size_t>(unpack_nonnegative_integer(
-                                  offset, "Template operand offset value index"))));
+                                  offset,
+                                  "Template operand offset value index"))));
               }
               binding.workspace =
                   static_cast<uintptr_t>(unpack_nonnegative_integer(

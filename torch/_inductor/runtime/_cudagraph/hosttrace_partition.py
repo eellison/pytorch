@@ -366,21 +366,32 @@ class Partition:
             if self.out_plan[i] is None:
                 self.out_plan[i] = self._plan_output(i, o)
         # the symbols the per-call evaluation reads, and how (input facts)
-        needed = set()
+        leaves = []
         for cut in self.cuts:
-            for leaf in tree_flatten((cut.args, cut.kwargs))[0]:
-                needed |= self._ref_symbols(leaf)
-            for leaf in cut.out_leaves:
-                needed |= self._ref_symbols(leaf)
+            leaves.extend(tree_flatten((cut.args, cut.kwargs))[0])
+            leaves.extend(cut.out_leaves)
         for plan in self.out_plan:
             if plan[0] in ("view", "view_cut", "python_alloc"):
-                needed |= self._ref_symbols(plan[1])
+                leaves.append(plan[1])
         for seg in self.segments:
             for rec in seg.python_allocs:
-                for v in (*rec.sizes, *rec.strides):
-                    needed |= _free_symbols(v)
-        for name in self.alloc_by_name:
-            needed |= _raw_nbytes(self.alloc_by_name[name]).free_symbols
+                leaves.extend((*rec.sizes, *rec.strides))
+        leaves.extend(_raw_nbytes(rec) for rec in self.alloc_by_name.values())
+        expressions = {}
+        for leaf in leaves:
+            values = (
+                (*leaf.sizes, *leaf.strides, leaf.offset)
+                if isinstance(leaf, _Ref)
+                else (leaf,)
+            )
+            for value in values:
+                value = _expr(value)
+                if isinstance(value, sympy.Basic):
+                    expressions.setdefault(value, len(expressions))
+        self._boundary_indices = expressions
+        self._boundary = None
+        self._boundary_ready = False
+        needed = set().union(*(e.free_symbols for e in expressions))
         self.reads = []
         opaque = self.lowered_t.symbols.opaque
         for s in sorted(needed, key=sympy.default_sort_key):
@@ -409,14 +420,6 @@ class Partition:
             if seg.lo <= seq < seg.hi:
                 return ("seg", seg.index)
         raise AssertionError(f"seq {seq} is in no segment")
-
-    def _ref_symbols(self, leaf):
-        if isinstance(leaf, _Ref):
-            out = set()
-            for v in (*leaf.sizes, *leaf.strides, leaf.offset):
-                out |= _free_symbols(v)
-            return out
-        return _free_symbols(leaf)
 
     def _name(self, root):
         return self.root_alloc.get(root.name, root.name)
@@ -590,6 +593,55 @@ class Partition:
 
     # ---- the call ----
 
+    def _compile_boundary(self, box):
+        from torch._inductor.runtime.cudagraph_arg_mapping import IntExpr
+        from torch._inductor.runtime.cudagraph_boxed_replay import _NumericProgram
+        from torch._inductor.runtime.cudagraph_compiled_evaluation import (
+            _is_integer_payload,
+            compile_evaluation,
+        )
+        from torch._inductor.runtime.cudagraph_launch_association import (
+            UnsupportedCapture,
+        )
+
+        from . import direct_hosttrace as dh
+
+        expressions = self._boundary_indices
+        if not expressions or not all(_is_integer_payload(e) for e in expressions):
+            return None
+        inputs = len(self.tape.inputs)
+        records = SimpleNamespace(input_names=("",) * inputs, integer_inputs=())
+        symbols = self.lowered_t.symbols
+        constants = {
+            symbol: IntExpr("constant", int(rec["expected"]))
+            for symbol, rec in symbols.opaque.items()
+            if rec["kind"] == "guard"
+        }
+        lowering = dh._Lowering(symbols, integer_sources=constants)
+        try:
+            numeric = _NumericProgram(records, box[:inputs])
+            indices = tuple(numeric.add(lowering.lower(e)) for e in expressions)
+            compiled = compile_evaluation(numeric, pointer_count=inputs)
+        except (UnsupportedCapture, dh.HostTraceLoweringDeclined):
+            return None
+        return torch._C._CUDAGraphBoxedNumeric(
+            input_count=inputs,
+            numeric_plan=(numeric.integer_indices, tuple(numeric.instructions)),
+            compiled_evaluation=torch._C._CUDAGraphCompiledEvaluation(
+                **compiled.registration_kwargs
+            ),
+            output_indices=indices,
+        )
+
+    def _value(self, expression, env):
+        if type(env) is tuple:
+            return (
+                env[self._boundary_indices[expression]]
+                if isinstance(expression, sympy.Basic)
+                else expression
+            )
+        return self.evaluator.ev(expression, env)
+
     def _env(self, box):
         env = {}
         for name, kind, index, dim in self.reads:
@@ -604,8 +656,7 @@ class Partition:
         return env
 
     def _ints(self, values, env):
-        ev = self.evaluator.ev
-        return tuple(int(ev(v, env)) for v in values)
+        return tuple(int(self._value(v, env)) for v in values)
 
     def _base(self, root, box, boundary):
         if root in boundary:
@@ -622,10 +673,10 @@ class Partition:
                 base,
                 self._ints(leaf.sizes, env),
                 self._ints(leaf.strides, env),
-                int(self.evaluator.ev(leaf.offset, env)),
+                int(self._value(leaf.offset, env)),
             )
         if isinstance(leaf, sympy.Basic):
-            v = self.evaluator.ev(leaf, env)
+            v = self._value(leaf, env)
             return (
                 bool(v) if isinstance(v, (bool, sympy.logic.boolalg.BooleanAtom)) else v
             )
@@ -785,7 +836,7 @@ class Partition:
                     f"op {op.index} {op.func}: an output is not a tensor"
                 )
             sizes, strides = self._ints(want.sizes, env), self._ints(want.strides, env)
-            offset = int(self.evaluator.ev(want.offset, env))
+            offset = int(self._value(want.offset, env))
             if (
                 tuple(got.shape) != sizes
                 or got.stride() != strides
@@ -808,7 +859,7 @@ class Partition:
                         f"op {op.index} {op.func}: two outputs of one recorded root ({want.root}) have different storages"
                     )
                 if got.untyped_storage().nbytes() < int(
-                    self.evaluator.ev(self._alloc_nbytes[want.root], env)
+                    self._value(self._alloc_nbytes[want.root], env)
                 ):
                     raise SwapMismatch(
                         f"op {op.index} {op.func}: {want.root} is smaller than recorded"
@@ -865,7 +916,16 @@ class Partition:
                 probe.extend(seg.sequence.roots)
             if not dh.check_predicate(seg.lowered, probe, regions=False):
                 return None
-        env = self._env(box)
+        if not self._boundary_ready:
+            self._boundary = self._compile_boundary(box)
+            self._boundary_ready = True
+        values = None
+        if self._boundary is not None:
+            try:
+                values = self._boundary(box)
+            except (TypeError, ValueError, OverflowError):
+                pass
+        env = self._env(box) if values is None else values
         boundary: dict = {}
         # the storages a cut op's fresh output must not alias: the boundary's and,
         # per op, its own arguments' (added at the cut)

@@ -7,6 +7,7 @@ a metadata miss still re-traces; a misclassified guard is caught at the swap che
 allocator's peak of a partitioned call stays at eager's."""
 
 import gc
+from unittest import mock
 
 import torch
 import torch.nn.functional as F
@@ -252,6 +253,46 @@ class TestHostTracePartition(TestCase):
 
 
 class TestHostTraceCachedPartition(TestCase):
+    def test_repeated_cut_rebinds_same_tensor_objects(self, device):
+        from torch._inductor.runtime._cudagraph import direct_hosttrace
+
+        def add_(x, y):
+            return x.add_(y)
+
+        examples = (
+            torch.ones(256, device=device),
+            torch.full((256,), 2.0, device=device),
+        )
+        with torch.no_grad():
+            replay = direct_hosttrace.HostTraceReplay(add_, examples, partition=True)
+            self.addCleanup(replay.close)
+            x = torch.ones_like(examples[0])
+            y = _misaligned(examples[1], elements=1)
+            self.assertIs(replay(x, y), x)
+            self.assertEqual(x, torch.full_like(x, 3.0), atol=0, rtol=0)
+            (partition,) = replay.partitions
+            self.assertEqual(replay.partition_serves, 1)
+            with mock.patch.object(
+                partition.evaluator, "ev", wraps=partition.evaluator.ev
+            ) as evaluate:
+                for index, size in enumerate((128, 384, 256)):
+                    x_storage = torch.ones(size + 2, device=device)
+                    y_storage = torch.full((size + 2,), 2.0, device=device)
+                    x.set_(x_storage.untyped_storage(), 0, (size,), (1,))
+                    y.set_(y_storage.untyped_storage(), 1, (size,), (1,))
+                    self.assertIs(replay(x, y), x)
+                    self.assertEqual(x, torch.full_like(x, 3.0), atol=0, rtol=0)
+                    self.assertIs(replay(x, y), x)
+                    self.assertEqual(x, torch.full_like(x, 5.0), atol=0, rtol=0)
+                    self.assertEqual(y, torch.full_like(y, 2.0), atol=0, rtol=0)
+                    self.assertEqual(replay.partition_serves, 3 + 2 * index)
+                    self.assertEqual(replay.traces, 1)
+                    self.assertEqual(len(replay.variants), 1)
+                    self.assertEqual(replay.partition_builds, 1)
+            evaluate.assert_not_called()
+        self.assertEqual(replay.ordinary, 0)
+        self.assertEqual(replay.declines, [])
+
     @parametrize("change", ("dtype", "broadcast"))
     def test_cached_empty_segments_reject_before_mutation(self, device, change):
         from torch._inductor.runtime._cudagraph import (
