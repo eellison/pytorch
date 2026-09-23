@@ -35,7 +35,14 @@ from typing import Any
 import sympy
 
 import torch
+from torch._dynamo.source import LocalSource
 from torch._inductor.codecache import CppCodeCache
+from torch._inductor.runtime._cudagraph._compiler.tma_dimension import TmaDimension
+from torch._inductor.runtime._cudagraph.address_guard_printer import (
+    _AddressPrinter,
+    GuardExportDeclined,
+    UIntGCD,
+)
 from torch._inductor.runtime._cudagraph.cuda_tape_import import recorded_guard_pins
 from torch._inductor.runtime._cudagraph.hosttrace_allocseq import (
     AllocatorSequence,
@@ -106,6 +113,7 @@ from torch.utils._sympy.functions import (
     ToFloat,
     TruncToInt,
 )
+from torch.utils._sympy.value_ranges import ValueRanges
 
 
 _MODS = (sympy.Mod, _Mod, PythonMod)
@@ -178,6 +186,7 @@ _PREDICATE_PREAMBLE = (
     "#include <cmath>",
     "#include <cstdint>",
     "#include <cstring>",
+    "#include <numeric>",
     "#include <vector>",
     "#include <c10/util/generic_math.h>",
     "static inline int64_t ck_add(int64_t a, int64_t b, bool& bad) {",
@@ -720,6 +729,36 @@ class _Lowering:
 
     # ---- predicate source
 
+    def predicate_cpp(self, e, names):
+        e = self.subst(e)
+        if not e.has(UIntGCD, TmaDimension):
+            return self.cpp(e, names)
+        if any(symbol.is_integer is not True for symbol in e.free_symbols):
+            raise HostTraceLoweringDeclined(
+                "TMA predicates require integer source slots"
+            )
+        sources = {
+            symbol: LocalSource(self.cpp(symbol, names)) for symbol in e.free_symbols
+        }
+        mapping = {symbol: [source] for symbol, source in sources.items()}
+        printer = _AddressPrinter(
+            mapping,
+            lambda source: source.local_name,
+            mapping,
+            domains={symbol: ValueRanges(-(2**63), 2**63 - 1) for symbol in sources},
+            sources=tuple(sources.values()),
+        )
+        printer.source_to_symbol.update(
+            (source, sympy.Symbol(source.local_name)) for source in sources.values()
+        )
+        # TMA recasts and their surrounding arithmetic keep the shared uint64/int128 semantics.
+        try:
+            return printer.doprint(e)
+        except GuardExportDeclined as error:
+            raise HostTraceLoweringDeclined(
+                f"host_trace TMA predicate: {error}"
+            ) from error
+
     def cpp(self, e, names):
         """The C++ text of an integer, float or boolean expression over the predicate's
         named value slots; opaque rebinds render as inline host-function calls."""
@@ -956,43 +995,6 @@ class _HostTraceKernelModule(_KernelModule):
                 0,
             )
         )
-
-
-class _HostTraceCuTeDescModule(_HostTraceKernelModule):
-    """A CuTe DSL program's kernel recorded from its launch descriptor (torch/
-    cuda/_host_trace_cute_desc.py): eager's own function handle, read off a
-    capture of eager's call at the trace's warm-up, with the parameter layout
-    the driver reported for it; the program's module (the loaded object or
-    the in-process compilation) stays referenced for the graph's lifetime."""
-
-    def __init__(self, launch, device):
-        from cuda.bindings import driver
-
-        self.record = launch["cute_desc"]
-        self._function = int(launch["func"])
-        self.check()
-        self.host_symbol = None
-        self._layout = tuple(tuple(x) for x in launch["param_layout"])
-        self._block = tuple(int(b) for b in launch["block"])
-        self._shared = int(launch["smem"]) if not isinstance(launch["smem"], _SYM_TYPES) else None
-        self.name = launch["kernel"]
-        self.device_index = device
-        with torch.cuda.device(device):
-            self.context = int(_check_cuda_bindings(driver.cuCtxGetCurrent()))
-        if not self.context:
-            raise HostTraceLoweringDeclined(
-                "host_trace lowering: the tape's device has no CUDA context"
-            )
-
-    def check(self):
-        if type(self._function) is not int or self._function <= 0 or self._function != self.record.function:
-            raise HostTraceLoweringDeclined(
-                f"host_trace lowering: CuTe kernel {getattr(self, 'name', '')} lost eager's function handle"
-            )
-        if self.record.program.keep_alive is None:
-            raise HostTraceLoweringDeclined(
-                f"host_trace lowering: CuTe kernel {getattr(self, 'name', '')}'s program is no longer loaded"
-            )
 
 
 class _HostTraceTritonModule(_HostTraceKernelModule):
@@ -1853,8 +1855,6 @@ def lower_tape(
         triton_launch = L.get("triton")
         if triton_launch is not None:
             module = _HostTraceTritonModule(triton_launch, device)
-        elif L.get("cute_desc") is not None:
-            module = _HostTraceCuTeDescModule(L, device)
         else:
             module = _HostTraceKernelModule(
                 int(L["func"]), layout, block, smem, L["kernel"], device
@@ -2635,7 +2635,9 @@ def lower_tape(
         ]
     checks.extend(f"  if (!({fact.name} > int64_t(0))) return 0;" for fact in positive)
     # a size or stride the ShapeEnv expressed through other symbols
-    checks.extend(f"  if (!({lowering.cpp(t, names)}) || bad) return 0;" for t in terms)
+    checks.extend(
+        f"  if (!({lowering.predicate_cpp(t, names)}) || bad) return 0;" for t in terms
+    )
     declared_calls = {}  # (impl, rendered arguments) -> the local holding its value
 
     def declare_rebinds(expression, into):
@@ -2692,11 +2694,12 @@ def lower_tape(
                 opaque_term(rec, args, checks)
                 pending_opaque.remove((rec, args))
         declare_rebinds(t, checks)
-        checks.append(f"  if (!({lowering.cpp(t, names)}) || bad) return 0;")
+        checks.append(f"  if (!({lowering.predicate_cpp(t, names)}) || bad) return 0;")
     for rec, args in pending_opaque:
         opaque_term(rec, args, checks)
     arena_checks = [
-        f"  if (!({lowering.cpp(t, names)}) || bad) return 0;" for t in arena_terms
+        f"  if (!({lowering.predicate_cpp(t, names)}) || bad) return 0;"
+        for t in arena_terms
     ]
     region_checks = []
     if regions:

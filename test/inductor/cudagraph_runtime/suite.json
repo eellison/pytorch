@@ -259,14 +259,35 @@
     "id": "cute_host_test_numeric",
     "script": "cpu/cute_host/test_numeric.py",
     "device": "cpu",
-    "cases": 70,
+    "cases": 134,
     "requires_cute": true
   },
   {
     "id": "cute_host_test_guards",
     "script": "cpu/cute_host/test_guards.py",
     "device": "cpu",
-    "cases": 7,
+    "cases": 11,
+    "requires_cute": true
+  },
+  {
+    "id": "cute_host_test_persistence",
+    "script": "cpu/cute_host/test_persistence.py",
+    "device": "cpu",
+    "cases": 22,
+    "requires_cute": true
+  },
+  {
+    "id": "cpu_cute_cache_pair",
+    "script": "cpu/test_cute_cache_pair.py",
+    "device": "cpu",
+    "cases": 6,
+    "requires_cute": true
+  },
+  {
+    "id": "cpu_cute_captured_kernel",
+    "script": "cpu/test_cute_captured_kernel.py",
+    "device": "cpu",
+    "cases": 23,
     "requires_cute": true
   },
   {
@@ -905,7 +926,13 @@
     "id": "cpu_hosttrace_payload_domains",
     "script": "cpu/test_hosttrace_payload_domains.py",
     "device": "cpu",
-    "cases": 10
+    "cases": 24
+  },
+  {
+    "id": "cpu_hosttrace_tma_guards",
+    "script": "cpu/test_hosttrace_tma_guards.py",
+    "device": "cpu",
+    "cases": 21
   },
   {
     "id": "cuda_hosttrace_arena",
@@ -1060,5 +1087,33 @@
     "script": "cpu/test_host_trace_oracle_control.py",
     "device": "cpu",
     "cases": 5
+  },
+  {
+    "id": "cute_host_test_argument_flow_scope",
+    "script": "cpu/cute_host/test_argument_flow_scope.py",
+    "device": "cpu",
+    "cases": 14,
+    "requires_cute": true
+  },
+  {
+    "id": "cpu_cute_scalar_fields",
+    "script": "cpu/test_cute_scalar_fields.py",
+    "device": "cpu",
+    "cases": 14,
+    "requires_cute": true
+  },
+  {
+    "id": "cute_host_test_captured_descriptor",
+    "script": "cpu/cute_host/test_captured_descriptor.py",
+    "device": "cpu",
+    "cases": 21,
+    "requires_cute": true
+  },
+  {
+    "id": "cuda_cute_cached_numeric",
+    "script": "cuda/test_cute_cached_numeric.py",
+    "device": "cuda",
+    "cases": 2,
+    "requires_cute": true
   }
 ]

@@ -196,6 +196,7 @@ FAST_LINTERS = {
     "CMAKE",
     "DOCSTRING_LINTER",
     "GHA",
+    "HOSTTRACE_SYNC_API",
     "NATIVEFUNCTIONS",
     "PYREFLY",
     "RUFF",

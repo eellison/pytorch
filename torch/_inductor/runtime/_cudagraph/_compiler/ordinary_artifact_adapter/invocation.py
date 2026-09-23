@@ -25,6 +25,7 @@ class _Invocation(NamedTuple):
 def _project(authority):
     from torch._inductor.runtime._cudagraph._compiler.entry import DispatchEntry
     from torch._inductor.runtime._cudagraph._compiler.ordinary_artifact_reuse.correspondence import OrdinaryCorrespondence
+    from torch._inductor.runtime._cudagraph._compiler.ordinary_artifact_capture.captured import CapturedCorrespondence
 
     if type(authority) is DispatchEntry:
         authority.check()
@@ -52,6 +53,23 @@ def _project(authority):
         compilation = bound.compilation
         source_hash = sha256(compilation.source_bytecode).hexdigest()
         compiled_hash = sha256(compilation.module_bytecode).hexdigest()
+    elif type(authority) is CapturedCorrespondence:
+        authority.check()
+        program = authority.program
+        formals, joined, plan = authority.formals, authority.joined, authority.plan
+        metadata = authority.metadata
+        if (formals.program is not program or joined.mapping.program is not program
+                or joined.mapping.formals is not formals or plan.mapping.program is not program
+                or joined.mapping.flow.module is not program.module
+                or metadata != joined.admission.source.metadata):
+            raise ValueError("Captured invocation mixed compiler owners")
+        streams = [row for row in metadata.params if row.kind in ("Stream", "EnvStream")]
+        if (len(streams) != 1 or type(streams[0].ir_arg_index) is not int
+                or any(site.source.stream_source_arg_index != streams[0].ir_arg_index for site in joined.sites)):
+            raise ValueError("Captured invocation lacks one exact compiler stream formal")
+        return _Invocation(authority, None, None, program, metadata, formals, joined, plan,
+                           (), (), authority.consumers, "captured", authority.source_sha256,
+                           authority.compiled_sha256, streams[0].ir_arg_index)
     else:
         raise TypeError("Artifact invocation requires an exact DispatchEntry or OrdinaryCorrespondence")
     metadata = bound.metadata

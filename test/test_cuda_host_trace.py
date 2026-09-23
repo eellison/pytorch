@@ -1175,6 +1175,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { m.def("alloc_by_eighth", &alloc_by_ei
         # recorded from its launch descriptor with eager's own kernel:
         # torch/cuda/_host_trace_cute_desc.py), never decomposed
         from torch._native import registry
+        from torch.cuda._host_trace_cute_desc import Program
 
         override = any(
             n.active for n in registry._graphs.get(("_fused_rms_norm", "CUDA"), ())
@@ -1187,7 +1188,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { m.def("alloc_by_eighth", &alloc_by_ei
             self.assertEqual(tape.num_regions, 0)
             self.assertGreaterEqual(tape.num_launches, 1)
             self.assertEqual(
-                sum(1 for L in tape.launches if L.get("cute_desc")), int(override)
+                sum(
+                    1
+                    for launch in tape.launches
+                    if launch.get("cute") is not None
+                    and isinstance(launch["cute"].invocation.owner, Program)
+                ),
+                int(override),
             )
 
         def below_autograd(t):

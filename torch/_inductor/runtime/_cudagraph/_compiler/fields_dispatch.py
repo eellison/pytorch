@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 from torch._inductor.runtime._cudagraph._compiler.components import DispatchComponents
 from torch._inductor.runtime._cudagraph._compiler.dispatch_join import BoundDispatchSite
 from torch._inductor.runtime._cudagraph._compiler.fields import ConstantField, FieldSource, IntegerField, NodeFields, Padding, PointerField, StaticProperty, UndefinedField
-from torch._inductor.runtime._cudagraph._compiler.lowering import FormalLoweringSet
 from torch._inductor.runtime._cudagraph._compiler.ordinary_artifact_adapter.invocation import ArtifactInvocation
 from torch._inductor.runtime._cudagraph._compiler.target_layout import TargetLayout
+
+if TYPE_CHECKING:
+    from torch._inductor.runtime._cudagraph._compiler.lowering import FormalLoweringSet
 
 
 def _dispatch(components):
@@ -89,8 +91,8 @@ def _records(components: DispatchComponents | ArtifactInvocation, layout: Target
             raise ValueError("Dispatch fields require unchanged whole-formal parameters in actual ABI order")
         source_index = formal.ir_arg_index
         if source_index not in tensors:
-            if formal.metadata.kind != "Var" or value.llvm_type not in ("i32", "i64"):
-                raise ValueError("Unsupported mutable scalar formal; only exact i32/i64 integers are admitted")
+            if formal.metadata.kind != "Var" or value.llvm_type not in ("i32", "i64", "f32"):
+                raise ValueError("Unsupported mutable scalar formal; only exact i32/i64/f32 fields are admitted")
             source = FieldSource("scalar_formal", source_index, formal.metadata.name, formal.metadata.path,
                                  "value", (), value)
             integers.append(IntegerField(parameter.index, 0, value.llvm_type, source))

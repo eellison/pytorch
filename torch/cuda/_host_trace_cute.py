@@ -107,6 +107,7 @@ class CuteInvocation:
     read_only: frozenset = (
         frozenset()
     )  # tensor formals exported read-only: not written roots
+    owner_provider: Any = None
 
 
 @dataclass(frozen=True)
@@ -195,21 +196,24 @@ class _RecorderInvocation:
             self._tensor_state(v) if type(v) is FakeTensor else self._number_state(v)
             for v in operands
         )
+        values = (*call.arguments, *(value for _, value in call.keyword_arguments))
+        paths = tuple(("args", index) for index in range(len(call.arguments)))
+        paths += tuple(("kwargs", name) for name, _ in call.keyword_arguments)
         if (
             self.adapter.owner is not owner
             or call.entry is not owner.entry
             or call.target is not call.entry.target
             or call.config
             or call.entry_index != 0
-            or call.keyword_arguments
             or call.node is not _RECORDER_NODE
-            or len(call.arguments) != len(operands)
+            or len(values) != len(operands)
             or len(call.operands) != len(operands)
+            or any(value is not original for value, original in zip(values, operands))
             or any(
                 operand.value is not value
-                or operand.path != ("args", index)
+                or operand.path != path
                 or operand.fx_argument is not value
-                for index, (operand, value) in enumerate(zip(call.operands, operands))
+                for operand, value, path in zip(call.operands, operands, paths)
             )
             or state != self._operand_state
         ):
@@ -408,9 +412,13 @@ def _specialize(tr, operands, metadata, names, origins, decline):
     compilation holds static (the user's conversion marked the axis static, the
     compiler baked the value in) is pinned by a guard of the tape and handed to
     the binder as that integer, on a twin of the same root, offset and dtype;
-    a dynamic axis keeps its symbol."""
+    shared dynamic symbols are unified only under an exact equality guard."""
     specialized = list(operands)
-    for index, parameter in enumerate(metadata.params):
+    symbols = {}
+    parameters = tuple(
+        row for row in metadata.params if row.kind not in ("Stream", "EnvStream")
+    )
+    for index, parameter in enumerate(parameters):
         if parameter.kind != "Tensor":
             continue
         twin = operands[index]
@@ -429,14 +437,25 @@ def _specialize(tr, operands, metadata, names, origins, decline):
             (strides, parameter.strides, "stride"),
         ):
             for axis, (kind, value) in enumerate(dimensions):
-                if kind != "constant" or type(values[axis]) is not torch.SymInt:
+                if kind == "symbol":
+                    if value not in symbols:
+                        symbols[value] = values[axis]
+                        continue
+                    expected = symbols[value]
+                    if values[axis] is expected:
+                        continue
+                    contract = f"the compiled host shares compiler symbol {value}"
+                elif kind == "constant" and type(values[axis]) is torch.SymInt:
+                    expected = value
+                    contract = f"the compiled host holds it static at {value}"
+                else:
                     continue
-                if not bool(values[axis] == value):
+                if not bool(values[axis] == expected):
                     decline(
                         f"tensor argument {names[index]}'s {what} {axis} is {values[axis]} at the traced call; "
-                        f"the compiled host holds it static at {value}"
+                        f"{contract}"
                     )
-                values[axis], changed = value, True
+                values[axis], changed = expected, True
         if not changed:
             continue
         elem = torch.empty_strided(sizes, strides, dtype=twin.dtype, device="meta")
@@ -461,6 +480,10 @@ def _bind(
     conversion,
     decline,
     read_only=frozenset(),
+    *,
+    binding_factory=None,
+    artifact_factory=None,
+    owner_provider=None,
 ):
     import sympy
 
@@ -487,15 +510,35 @@ def _bind(
     from torch._inductor.runtime.cudagraph_arg_mapping import IntExpr
 
     ht = _host_trace()
+    stream_index = next(
+        index
+        for index, row in enumerate(compilation.metadata.params)
+        if row.name == owner.policy.stream_name
+    )
+    positional = operands[:stream_index]
+    keywords = tuple(
+        (row.name, value)
+        for row, value in zip(
+            compilation.metadata.params[stream_index + 1 :],
+            operands[stream_index:],
+            strict=True,
+        )
+    )
+    call_operands = tuple(
+        Operand(("args", i), value, value) for i, value in enumerate(positional)
+    )
+    call_operands += tuple(
+        Operand(("kwargs", name), value, value) for name, value in keywords
+    )
     call = EntryCall(
         0,
         owner.entry,
         owner.entry.target,
         owner.entry.config,
         _RECORDER_NODE,
-        operands,
-        (),
-        tuple(Operand(("args", i), v, v) for i, v in enumerate(operands)),
+        positional,
+        keywords,
+        call_operands,
     )
     local = _RecorderInvocation(
         adapter,
@@ -511,10 +554,17 @@ def _bind(
         signature = build_entry_signature(
             local, call, policy=owner.policy, metadata=compilation.metadata
         )
-        binding = bind_ordinary_metadata(signature, compilation)
-        if ct.preparation is None:
-            ct.preparation = CuTePreparation()
-        artifact = ct.preparation.bind(adapter, binding)
+        binding = (
+            bind_ordinary_metadata(signature, compilation)
+            if binding_factory is None
+            else binding_factory(signature, owner)
+        )
+        if artifact_factory is None:
+            if ct.preparation is None:
+                ct.preparation = CuTePreparation()
+            artifact = ct.preparation.bind(adapter, binding)
+        else:
+            artifact = artifact_factory(binding)
     except (ValueError, TypeError, RuntimeError) as error:
         decline(
             f"the runtime's binder does not express this invocation ({type(error).__name__}: {error})"
@@ -590,6 +640,7 @@ def _bind(
         sites,
         alignments,
         frozenset(read_only),
+        owner_provider,
     )
 
 
