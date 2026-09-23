@@ -252,34 +252,36 @@ class TestHostTracePolicy(TestCase):
         self.assertEqual(launch["func"], int(binary.function))
         self.assertEqual(installation.summary()["misses"], 0)
 
-    def test_dropout_under_fallback_random_traces_the_training_pair(self, device):
-        # Inductor's own dropout draws its seeds with `aten.randint.low_out` ->
-        # `aten.random_.from`, which no host of the line traces (the trace declines by
-        # name and the policy's log names the configuration); with
-        # config.fallback_random the dropout is ATen's `native_dropout`, a traced host
-        # with its rng slot, and the forward + backward pair traces and replays, each
-        # call the same draw as the artifact's own call from the same generator state
+    @parametrize("fallback_random", [False, True])
+    def test_dropout_traces_the_training_pair(self, device, fallback_random):
+        # Inductor's own dropout draws its seeds with `aten.randint.low_out` (one
+        # int64 buffer of seeds per call, the kernels then compute tl.rand(seed,
+        # offset) themselves): a traced host with an rng slot since the distribution
+        # template's conversion, so the forward + backward pair traces as Inductor
+        # fuses it (E43: no fallback_random needed); with config.fallback_random the
+        # dropout is ATen's `native_dropout` instead, a traced host with its own rng
+        # slot. Either way each replay draws what the artifact's own call draws from
+        # the same generator state
         policy = self._policy()
         module = torch.nn.Sequential(torch.nn.Linear(64, 64), torch.nn.Dropout(0.1)).to(
             device
         )
-        compiled = torch.compile(module, dynamic=False)
         x = torch.randn(32, 64, device=device)
-        compiled(x).sum().backward()
-        (forward,) = [i for i in policy.installations if not i.is_backward]
-        self.assertEqual(forward.status, "declined")
-        self.assertIn("aten.random_.from", forward.decline)
-        self.assertIn("fallback_random", forward.decline)
-        policy.close()
-        torch._dynamo.reset()
-        policy = self._policy()
-        self.enterContext(config.patch(fallback_random=True))
+        self.enterContext(config.patch(fallback_random=fallback_random))
         compiled = torch.compile(module, dynamic=False)
         for _ in range(3):
             torch.manual_seed(3)
             compiled(x).sum().backward()
         installations = self._ready(policy, 2)
         self.assertEqual(sorted(i.is_backward for i in installations), [False, True])
+        (forward,) = [i for i in installations if not i.is_backward]
+        tape = forward.replay.tape
+        kernels = " ".join(rec["kernel"] for rec in tape.launches)
+        if fallback_random:
+            self.assertIn("fused_dropout", kernels)
+        else:
+            self.assertIn("distribution_elementwise_grid_stride_kernel", kernels)
+        self.assertGreaterEqual(len(tape.rng_slots), 1)
         torch.manual_seed(3)
         want = compiled(x).detach().clone()
         for installation in installations:
