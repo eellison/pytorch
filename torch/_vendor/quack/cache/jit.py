@@ -19,6 +19,7 @@ from __future__ import annotations
 import fcntl
 import functools
 import hashlib
+import json
 import os
 import pickle
 import sys
@@ -207,13 +208,24 @@ def jit_cache(fn):
             from torch.cuda import _host_trace_cute_dsl
 
             available = _host_trace_cute_dsl.descriptors_available()
-            if available and not desc_path.exists():
-                return None
+            if available:
+                if not desc_path.exists():
+                    return None
+                try:
+                    descriptor = json.loads(desc_path.read_text())
+                    with o_path.open("rb") as source:
+                        object_hash = hashlib.file_digest(source, "sha256").hexdigest()
+                    if (type(descriptor) is not dict or descriptor.get("version") != 1
+                            or descriptor.get("object_sha256") != object_hash
+                            or type(descriptor.get("descriptor")) is not str):
+                        return None
+                except (OSError, ValueError):
+                    return None
             m = cute.runtime.load_module(str(o_path), enable_tvm_ffi=True)
             if not available:
                 return m[EXPORT_FUNC_NAME]
             return _host_trace_cute_dsl.loaded_program(
-                m[EXPORT_FUNC_NAME], m, desc_path.read_text()
+                m[EXPORT_FUNC_NAME], m, descriptor["descriptor"]
             )
 
         def _export(compiled_fn: object) -> None:
@@ -231,7 +243,13 @@ def jit_cache(fn):
                 )
                 descriptor = _host_trace_cute_dsl.descriptor_json(compiled_fn)
                 if descriptor is not None:
-                    desc_tmp.write_text(descriptor)
+                    with tmp_path.open("rb") as source:
+                        object_hash = hashlib.file_digest(source, "sha256").hexdigest()
+                    desc_tmp.write_text(json.dumps({
+                        "version": 1,
+                        "object_sha256": object_hash,
+                        "descriptor": descriptor,
+                    }))
                     os.replace(desc_tmp, desc_path)
                 os.replace(tmp_path, o_path)
             except Exception as e:

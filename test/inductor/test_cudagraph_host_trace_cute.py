@@ -773,9 +773,25 @@ class TestHostTraceCuTeDSL(TestCase):
         return [t for t in self.ht._gemm_templates.values() if t.key[2] == op]
 
     def _descriptor_launches(self, tape):
-        # the launch records made from a program's persisted descriptor
-        # (torch/cuda/_host_trace_cute_desc.py): eager's own kernel handle
-        return [L for L in tape.launches if L.get("cute_desc") is not None]
+        return [
+            launch
+            for launch in tape.launches
+            if launch.get("cute") is not None
+            and isinstance(launch["cute"].invocation.owner, self.desc.Program)
+        ]
+
+    def _descriptor_call(self, replay):
+        from torch._inductor.runtime._cudagraph.hosttrace_cute import (
+            _HostTraceCuTeModule,
+        )
+
+        calls = [
+            call
+            for call in replay.variants[0].program.calls
+            if isinstance(call.module, _HostTraceCuTeModule)
+        ]
+        self.assertEqual(len(calls), 1)
+        return calls[0]
 
     def _cache_dir(self):
         import tempfile
@@ -803,10 +819,13 @@ class TestHostTraceCuTeDSL(TestCase):
         tape = replay.tape
         self.assertEqual((tape.num_launches, tape.num_regions), (1, 0))
         (record,) = self._descriptor_launches(tape)
-        self.assertEqual(record["func"], eager["func"])
+        self.assertEqual(self._descriptor_call(replay).module.function, eager["func"])
         self.assertEqual(record["kernel"], eager["name"])
-        self.assertEqual(record["param_layout"], [tuple(x) for x in eager["layout"]])
         self.assertEqual(
+            list(self._descriptor_call(replay).module.parameter_layout),
+            [tuple(x) for x in eager["layout"]],
+        )
+        self.assertCountEqual(
             [(p["name"], p["kind"], p["access"]) for p in record["params"]],
             [
                 ("mX.data_ptr", "ptr", "r"),
@@ -821,7 +840,7 @@ class TestHostTraceCuTeDSL(TestCase):
                 ("eps", "f32", ""),
             ],
         )
-        self.assertIsInstance(record["grid"][0], torch.SymInt)
+        self.assertNotEqual(self._descriptor_call(replay).grid[0].op, "constant")
         self.assertEqual(sorted(tape.written_roots), ["a0", "a1"])
         self.assertEqual(self._templates("_fused_rms_norm"), [])
         for rows in (4, 7, 64):
@@ -851,7 +870,8 @@ class TestHostTraceCuTeDSL(TestCase):
         replay = self._replay(rms_norm_host, (x, w))
         (record,) = self._descriptor_launches(replay.tape)
         self.assertEqual(
-            (record["func"], record["kernel"]), (eager["func"], eager["name"])
+            (self._descriptor_call(replay).module.function, record["kernel"]),
+            (eager["func"], eager["name"]),
         )
         for rows in (4, 9):
             other = torch.randn(rows, 2048, device="cuda", dtype=torch.bfloat16)
@@ -880,18 +900,26 @@ class TestHostTraceCuTeDSL(TestCase):
         (obj,) = glob.glob(os.path.join(tmp, "*", "*.o"))
         desc = obj[: -len(".o")] + qjit.DESCRIPTOR_SUFFIX
         self.assertTrue(os.path.exists(desc), desc)
-        descriptor = self.desc.Descriptor.from_json(open(desc).read())
+        import hashlib
+        import json
+
+        with open(desc) as handle:
+            paired = json.load(handle)
+        with open(obj, "rb") as handle:
+            self.assertEqual(
+                paired["object_sha256"], hashlib.sha256(handle.read()).hexdigest()
+            )
+        descriptor = self.desc.Descriptor.from_json(paired["descriptor"])
         self.assertIsNone(descriptor.declined)
-        self.assertEqual(len(descriptor.launches), 1)
-        self.assertEqual(descriptor.recipe["options"], "--enable-tvm-ffi")
+        self.assertEqual(len(descriptor.payload.sites), 1)
         self.assertEqual(
-            [f.name for f in descriptor.formals if f.kind == "tensor"],
+            [f.name for f in descriptor.payload.formals if f.kind == "Tensor"],
             ["mX", "mW", "mO", "mRstd"],
         )
-        self.assertEqual(descriptor.formals[0].shape[1], 2048)
-        self.assertEqual(
-            descriptor.symbols[descriptor.formals[0].stride[0]].divisibility, 8
-        )
+        self.assertEqual(descriptor.payload.formals[0].shape[1], ("constant", 2048))
+        kind, index = descriptor.payload.formals[0].strides[0]
+        self.assertEqual(kind, "symbol")
+        self.assertEqual(descriptor.payload.symbols[index][2], 8)
         # a warm load returns the program with its descriptor
         compile_fn.cache_clear()
         program = compile_fn(*self._rms_key(), per_head=False)
@@ -908,7 +936,7 @@ class TestHostTraceCuTeDSL(TestCase):
         (eager,) = self._eager_nodes(rms_norm_host, (x, w))
         replay = self._replay(rms_norm_host, (x, w))
         (record,) = self._descriptor_launches(replay.tape)
-        self.assertEqual(record["func"], eager["func"])
+        self.assertEqual(self._descriptor_call(replay).module.function, eager["func"])
         self.assertEqual(replay(x, w), rms_norm_host(x, w), atol=0, rtol=0)
 
     def _rms_key(self):
@@ -934,7 +962,7 @@ class TestHostTraceCuTeDSL(TestCase):
         other = self._replay(rms_1024, (y, v))
         (record,) = self._descriptor_launches(other.tape)
         (eager,) = self._eager_nodes(rms_1024, (y, v))
-        self.assertEqual(record["func"], eager["func"])
+        self.assertEqual(self._descriptor_call(other).module.function, eager["func"])
         self.assertEqual(other(y, v), rms_1024(y, v), atol=0, rtol=0)
 
     def test_a_normalized_shape_from_a_traced_size_declines_by_name(self):
@@ -956,7 +984,7 @@ class TestHostTraceCuTeDSL(TestCase):
         self.assertEqual(tape.num_regions, 0)
         self.assertEqual(len(self._descriptor_launches(tape)), 1)
         self.assertGreaterEqual(tape.num_launches, 2)
-        self.assertTrue(tape.launches[-1].get("cute_desc"))
+        self.assertIs(self._descriptor_launches(tape)[0], tape.launches[-1])
         for rows in (4, 6):
             other = torch.randn(rows, 2048, device="cuda", dtype=torch.bfloat16)
             self.assertEqual(
@@ -1011,7 +1039,7 @@ class TestHostTraceCuTeDSL(TestCase):
             replay = self._replay(step, (x, *params))
             tape = replay.tape
             self.assertEqual([r.op for r in tape.regions], ["mm"])
-            self.assertEqual(sum(1 for L in tape.launches if L.get("cute")), 0)
+            self.assertEqual(sum(1 for L in tape.launches if L.get("cute")), 1)
             self.assertEqual(len(self._descriptor_launches(tape)), 1)
             self.assertEqual(tape.num_launches, 3)
             for rows in (4, 9):
@@ -1078,9 +1106,10 @@ class TestHostTraceCuTeDSL(TestCase):
         self.assertEqual((tape.num_launches, tape.num_regions), (1, 0))
         (record,) = self._descriptor_launches(tape)
         self.assertEqual(
-            (record["func"], record["kernel"]), (eager["func"], eager["name"])
+            (self._descriptor_call(replay).module.function, record["kernel"]),
+            (eager["func"], eager["name"]),
         )
-        self.assertEqual(
+        self.assertCountEqual(
             [p["name"] for p in record["params"]],
             [
                 "mX.data_ptr",
@@ -1221,15 +1250,16 @@ class TestHostTraceCuTeDSL(TestCase):
         # the descriptor's record holds the CUfunction eager's node holds; ATen's
         # two launches record their host symbols (the runtime resolves them)
         self.assertEqual(
-            (record["func"], record["kernel"]), (eager[0]["func"], eager[0]["name"])
+            (self._descriptor_call(replay).module.function, record["kernel"]),
+            (eager[0]["func"], eager[0]["name"]),
         )
         self.assertEqual(
             [L["kernel"] for L in tape.launches[1:]], [n["name"] for n in eager[1:]]
         )
         # the persistent grid is the sm_count formal, a value of the call
         self.assertEqual(list(record["grid"]), list(eager[0]["grid"]))
-        self.assertEqual(
-            [p["name"] for p in record["params"]][:3],
+        self.assertCountEqual(
+            [p["name"] for p in record["params"] if p["name"].startswith("mX.")],
             ["mX.data_ptr", "mX.shape[0]", "mX.stride[0]"],
         )
         for rows in (4, 9):

@@ -14,6 +14,10 @@ import sympy
 import torch
 from torch._dynamo.source import LocalSource
 from torch._inductor.runtime._cudagraph import direct_hosttrace
+from torch._inductor.runtime._cudagraph._compiler.fx_adapter.contract import (
+    FXTraceDeclined,
+)
+from torch._inductor.runtime._cudagraph.address_scalars import symbolic_integer
 from torch._inductor.runtime._cudagraph.direct_hosttrace import (
     _HostIntegers,
     _Lowering,
@@ -23,6 +27,7 @@ from torch._inductor.runtime._cudagraph.direct_hosttrace import (
 from torch._inductor.runtime._cudagraph.host_trace_guards import (
     compile_host_trace_guard,
 )
+from torch._inductor.runtime.cudagraph_arg_mapping import IntExpr
 from torch._inductor.runtime.cudagraph_compiled_evaluation import (
     integer_payload_contract_from_guards,
     simplify_integer_payload,
@@ -214,6 +219,74 @@ class TestHostTracePayloadDomains(TestCase):
             lowering.lower(sympy.Max(*symbols[:-1]))
             lowering.lower(sympy.Max(*symbols))
         self.assertEqual(calls, [sympy.Max(*symbols[:-1])])
+
+    @parametrize("columns", (0, 128, 129, 1024))
+    def test_dynamic_floor_divisor_survives_guard_translation(self, columns):
+        size = IntExpr("size", 0, (IntExpr("constant", 0),))
+        chunks = IntExpr(
+            "floordiv",
+            args=(
+                IntExpr("add", args=(IntExpr("constant", 127), size)),
+                IntExpr("constant", 128),
+            ),
+        )
+        recipe = IntExpr(
+            "floordiv",
+            args=(
+                IntExpr(
+                    "add",
+                    args=(
+                        IntExpr("constant", -1),
+                        IntExpr("multiply", args=(IntExpr("constant", 2), chunks)),
+                    ),
+                ),
+                chunks,
+            ),
+        )
+        expression = symbolic_integer(recipe, {("size", 0, 0): self.size})
+        self.assertTrue(expression.has(FloorDiv))
+        _, mapping = self.integers()
+        guard = compile_host_trace_guard(
+            self.tape,
+            mapping,
+            [self.tensor],
+            (sympy.Eq(expression, 1, evaluate=False),),
+        )
+        self.assertEqual(self.evaluate(guard, torch.empty(columns)), int(columns > 0))
+        if columns:
+            count = (columns + 127) // 128
+            self.assertEqual(
+                expression.subs(self.size, columns), (2 * count - 1) // count
+            )
+
+    @parametrize("numerator", ("zero", "same"))
+    @parametrize("stride", (0, 2))
+    def test_translated_floor_keeps_cancelled_denominator_domain(
+        self, numerator, stride
+    ):
+        divisor = IntExpr("stride", 0, (IntExpr("constant", 0),))
+        dividend = IntExpr("constant", 0) if numerator == "zero" else divisor
+        recipe = IntExpr("floordiv", args=(dividend, divisor))
+        expression = symbolic_integer(recipe, {("stride", 0, 0): self.step})
+        self.assertIsInstance(expression, FloorDiv)
+        self.assertEqual(expression.args[1], self.step)
+        _, mapping = self.integers()
+        guard = compile_host_trace_guard(
+            self.tape,
+            mapping,
+            [self.tensor],
+            (sympy.Eq(expression, int(numerator == "same"), evaluate=False),),
+        )
+        tensor = torch.empty(9 * stride + 1).as_strided((9,), (stride,))
+        self.assertEqual(self.evaluate(guard, tensor), int(stride > 0))
+
+    @parametrize("divisor", (0, -1))
+    def test_translated_floor_still_refuses_nonpositive_literal(self, divisor):
+        recipe = IntExpr(
+            "floordiv", args=(IntExpr("constant", 1), IntExpr("constant", divisor))
+        )
+        with self.assertRaisesRegex(FXTraceDeclined, "Guard exceeds"):
+            symbolic_integer(recipe, {})
 
 
 if __name__ == "__main__":

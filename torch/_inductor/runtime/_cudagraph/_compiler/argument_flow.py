@@ -44,7 +44,7 @@ _RUNTIME_ABI = {
 }
 
 
-def _check_host_operations(module: Any) -> None:
+def _check_host_operations(module: Any, function_name: str) -> None:
     from cutlass._mlir import ir
 
     c_convention = ir.Attribute.parse("#llvm.cconv<ccc>")
@@ -67,7 +67,16 @@ def _check_host_operations(module: Any) -> None:
         convention = function.attributes.get("CConv")
         if convention is not None and convention != c_convention:
             raise ValueError(f"Runtime callee has an unsupported calling convention: {name}")
-    for function in functions.values():
+    pending = [function_name, "cuda_num_binaries", "cuda_init", "cuda_load", "cuda_load_to_device"]
+    checked = set()
+    while pending:
+        name = pending.pop()
+        if name in checked:
+            continue
+        if name not in functions:
+            raise ValueError(f"Missing host or registration function: {name}")
+        checked.add(name)
+        function = functions[name]
         for region in function.regions:
             for block in region.blocks:
                 for view in block.operations:
@@ -82,6 +91,7 @@ def _check_host_operations(module: Any) -> None:
                     target = functions[callee.value]
                     if callee.value not in _RUNTIME_ABI and not any(region.blocks for region in target.regions):
                         raise ValueError(f"Unknown external host effect: {callee.value}")
+                    pending.append(callee.value)
                     convention = op.attributes.get("CConv")
                     if callee.value in _RUNTIME_ABI and convention is not None:
                         if convention != c_convention:
@@ -708,7 +718,7 @@ def analyze_argument_flow(module: Any, function_name: str, *, local_pointer_widt
         text, bytecode = _snapshot(module)
         if not module.operation.verify():
             raise ValueError("LLVM-dialect Module failed verification")
-        _check_host_operations(module)
+        _check_host_operations(module, function_name)
         host = _function(module, function_name)
         blocks = list(host.regions[0].blocks)
         host_types = tuple(str(value.type) for value in blocks[0].arguments)

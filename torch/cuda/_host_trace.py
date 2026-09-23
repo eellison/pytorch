@@ -3453,7 +3453,7 @@ class _TraceMode(TorchDispatchMode):
             if entry is not None:
                 self.entering.append(func)
             try:
-                with self:
+                with self, _cow_from_roots() if native else contextlib.nullcontext():
                     # a torch._native override is a Python kernel on the op's
                     # int schema: its integers are pinned to the traced values
                     # whatever the op's own SymInt registration

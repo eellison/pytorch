@@ -241,6 +241,7 @@ class CuTeLowering:
                 resources=resources,
                 root_alignments=self.root_alignments,
                 sites=invocation.sites,
+                owner_provider=invocation.owner_provider,
             )
         except BaseException as error:
             try:
