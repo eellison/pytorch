@@ -4396,6 +4396,96 @@ class TestCudaHostTraceGuardAttribution(TestCase):
         self.assertEqual(torch._C._host_trace_kernel_choice_depth(), 0)
 
 
+class TestHostTraceCowQuery(TestCase):
+    """torch._C._is_cow_tensor under _cow_from_roots: one wrapper for the
+    process while any thread holds a scope, answering from the root only on a
+    thread inside its own scope; the native query back after the last exit on
+    any thread. No device: the scope and the query are Python-level."""
+
+    def _traced(self, ht, cow):
+        # a traced tensor's class and root are all the wrapper reads
+        t = torch.Tensor._make_wrapper_subclass(
+            ht._TracedTensor,
+            [4],
+            [1],
+            storage_offset=0,
+            dtype=torch.float32,
+            device="cpu",
+            dispatch_sizes_strides_policy="strides",
+        )
+        torch._C._host_trace_drop_storage(t)
+        t._root = ht._Root("p0", 0, 4, cow=cow)
+        return t
+
+    def test_nested_scopes_on_one_thread_restore_the_native_query(self):
+        from torch.cuda import _host_trace as ht
+
+        native = torch._C._is_cow_tensor
+        lazy = self._traced(ht, True)
+        with ht._cow_from_roots():
+            with ht._cow_from_roots():
+                self.assertTrue(torch._C._is_cow_tensor(lazy))
+            self.assertTrue(torch._C._is_cow_tensor(lazy))
+            self.assertIsNot(torch._C._is_cow_tensor, native)
+        self.assertIs(torch._C._is_cow_tensor, native)
+        with self.assertRaisesRegex(RuntimeError, "Python tensor subclasses"):
+            torch._C._is_cow_tensor(lazy)
+
+    def test_overlapping_scopes_on_two_threads_restore_the_native_query(self):
+        # A enters, B enters, A exits, B exits: the native query is back only
+        # after B's exit, and each thread's query answers its own root
+        from torch.cuda import _host_trace as ht
+
+        native = torch._C._is_cow_tensor
+        plain = torch.empty(1)
+        a_in, b_in, a_out = threading.Event(), threading.Event(), threading.Event()
+        seen: dict = {}
+        errors: list = []
+
+        def run(name, cow, enter_after, exit_after, entered, exited):
+            try:
+                if enter_after is not None:
+                    self.assertTrue(enter_after.wait(10))
+                mine = self._traced(ht, cow)
+                with ht._cow_from_roots():
+                    seen[name, "installed"] = torch._C._is_cow_tensor
+                    seen[name, "own"] = torch._C._is_cow_tensor(mine)
+                    seen[name, "plain"] = torch._C._is_cow_tensor(plain)
+                    entered.set()
+                    if exit_after is not None:
+                        self.assertTrue(exit_after.wait(10))
+                    seen[name, "own_late"] = torch._C._is_cow_tensor(mine)
+                seen[name, "after"] = torch._C._is_cow_tensor
+                # outside its own scope a thread gets the native query, as on
+                # one thread, whatever the other thread holds
+                with self.assertRaisesRegex(RuntimeError, "Python tensor subclasses"):
+                    torch._C._is_cow_tensor(mine)
+            except BaseException as e:
+                errors.append(e)
+            finally:
+                entered.set()
+                exited.set()
+
+        b_out = threading.Event()
+        a = threading.Thread(target=run, args=("a", True, None, b_in, a_in, a_out))
+        b = threading.Thread(target=run, args=("b", False, a_in, a_out, b_in, b_out))
+        a.start()
+        b.start()
+        a.join(30)
+        b.join(30)
+        self.assertFalse(a.is_alive() or b.is_alive())
+        if errors:
+            raise errors[0]
+        self.assertIs(torch._C._is_cow_tensor, native)
+        self.assertIs(seen["a", "installed"], seen["b", "installed"])
+        self.assertIsNot(seen["a", "installed"], native)
+        self.assertIs(seen["a", "after"], seen["b", "installed"])
+        self.assertIs(seen["b", "after"], native)
+        self.assertEqual([seen["a", "own"], seen["a", "own_late"]], [True, True])
+        self.assertEqual([seen["b", "own"], seen["b", "own_late"]], [False, False])
+        self.assertEqual([seen["a", "plain"], seen["b", "plain"]], [native(plain)] * 2)
+
+
 instantiate_device_type_tests(
     TestCudaHostTraceLayerNormBackward, globals(), only_for="cuda"
 )

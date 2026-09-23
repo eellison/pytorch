@@ -498,21 +498,45 @@ def _native_override_nodes(func: Any) -> tuple:
     return tuple(registry._graphs.get((func.name().split("::", 1)[1], "CUDA"), ()))
 
 
+# torch._C._is_cow_tensor while any thread holds a _cow_from_roots scope: one
+# wrapper for the process (the attribute is process-global, so a save and
+# restore per scope leaves one thread's wrapper installed when two threads'
+# scopes overlap), installed under _cow_lock by the first scope and removed by
+# the last, answering from the root only on a thread inside its own scope
+# (_cow_local.depth; Recorder.h ThreadScope's form). Outside every scope the
+# attribute is the native query: nothing on a replay's path pays for this.
+_cow_lock = threading.Lock()
+_cow_scopes = 0
+_cow_native: Any = None
+_cow_local = threading.local()
+
+
+def _is_cow_from_root(t: Any) -> bool:
+    if getattr(_cow_local, "depth", 0) and isinstance(t, _TracedTensor):
+        return t._root.cow
+    return _cow_native(t)
+
+
 @contextlib.contextmanager
 def _cow_from_roots() -> Any:
     """torch._C._is_cow_tensor answered for a traced tensor from its root (an
     input's copy-on-write state at the trace; an allocation is never lazy),
-    while an override's condition runs on the traced tensors."""
-    original = torch._C._is_cow_tensor
-
-    def is_cow(t: Any) -> bool:
-        return t._root.cow if isinstance(t, _TracedTensor) else original(t)
-
-    torch._C._is_cow_tensor = is_cow
+    while an override's condition runs on the traced tensors on this thread."""
+    global _cow_scopes, _cow_native
+    with _cow_lock:
+        if _cow_scopes == 0:
+            _cow_native = torch._C._is_cow_tensor
+            torch._C._is_cow_tensor = _is_cow_from_root
+        _cow_scopes += 1
+    _cow_local.depth = getattr(_cow_local, "depth", 0) + 1
     try:
         yield
     finally:
-        torch._C._is_cow_tensor = original
+        _cow_local.depth -= 1
+        with _cow_lock:
+            _cow_scopes -= 1
+            if _cow_scopes == 0:
+                torch._C._is_cow_tensor = _cow_native
 
 
 def _native_override_takes(func: Any, args: tuple, kwargs: dict) -> bool:
