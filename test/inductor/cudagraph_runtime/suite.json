@@ -926,7 +926,13 @@
     "id": "cpu_hosttrace_payload_domains",
     "script": "cpu/test_hosttrace_payload_domains.py",
     "device": "cpu",
-    "cases": 20
+    "cases": 24
+  },
+  {
+    "id": "cpu_hosttrace_tma_guards",
+    "script": "cpu/test_hosttrace_tma_guards.py",
+    "device": "cpu",
+    "cases": 21
   },
   {
     "id": "cuda_hosttrace_arena",

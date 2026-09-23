@@ -59,7 +59,12 @@ def symbolic_integer(value, symbols, decline=FXTraceDeclined):
         if value.op == "floordiv" and (
             not isinstance(right, sympy.Integer) or right > 0
         ):
-            return FloorDiv(left, right, evaluate=False)
+            return FloorDiv(
+                left,
+                right,
+                evaluate=isinstance(left, sympy.Integer)
+                and isinstance(right, sympy.Integer),
+            )
         comparisons = {
             "eq": sympy.Eq,
             "ne": sympy.Ne,

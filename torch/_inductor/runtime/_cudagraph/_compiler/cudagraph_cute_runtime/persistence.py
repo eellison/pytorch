@@ -1,16 +1,26 @@
 from hashlib import sha256
 
+from torch.utils._ordered_set import OrderedSet
+
 from ..owned_numeric import (
     _dump_records,
     _load_records,
     _NUMERIC_RECORDS,
     _validate_numeric,
 )
-from .artifact import _Payload, ARTIFACT_VERSION, ParameterExpression
+from .artifact import (
+    _Payload,
+    ARTIFACT_VERSION,
+    ConstantField,
+    IntegerField,
+    Padding,
+    ParameterExpression,
+    UndefinedField,
+)
 from .factory import _immutable, _RECORDS
 
 
-def _validate_payload(payload):
+def _validate_payload(payload: _Payload) -> None:
     if type(payload) is not _Payload or payload.version != ARTIFACT_VERSION:
         raise ValueError("Unsupported dispatch payload version")
     _immutable(payload)
@@ -40,7 +50,7 @@ def _validate_payload(payload):
         )
     ):
         raise ValueError("Payload source formal coverage differs")
-    streams = [item for item in payload.formals if item.kind in {"Stream", "EnvStream"}]
+    streams = [item for item in payload.formals if item.kind in ("Stream", "EnvStream")]
     if len(streams) != 1:
         raise ValueError("Payload requires one original stream formal")
     stream = streams[0]
@@ -63,14 +73,14 @@ def _validate_payload(payload):
             raise ValueError("Invalid compiler dimension symbol")
     for formal in payload.formals:
         if (
-            formal.kind not in {"Tensor", "Var", "Stream", "EnvStream"}
+            formal.kind not in ("Tensor", "Var", "Stream", "EnvStream")
             or formal.size <= 0
             or formal.alignment <= 0
         ):
             raise ValueError("Invalid compiler formal layout")
         for dimensions in (formal.shape, formal.strides):
             if any(
-                kind not in {"constant", "symbol"}
+                kind not in ("constant", "symbol")
                 or kind == "symbol"
                 and not 0 <= value < len(payload.symbols)
                 for kind, value in dimensions
@@ -108,15 +118,17 @@ def _validate_payload(payload):
         ):
             raise ValueError("Consumer lost its exact numeric source mapping")
     sites = payload.sites
-    conditional = len(sites) == 2 and {site.arm for site in sites} == {True, False}
+    conditional = len(sites) == 2 and OrderedSet(
+        site.arm for site in sites
+    ) == OrderedSet((True, False))
     if (
         not sites
         or not (all(site.arm is None for site in sites) or conditional)
         or tuple(site.site_id for site in sites) != tuple(range(len(sites)))
-        or {site.launch_index for site in sites}
-        != set(range(1 + max(site.launch_index for site in sites)))
+        or OrderedSet(site.launch_index for site in sites)
+        != OrderedSet(range(1 + max(site.launch_index for site in sites)))
         or conditional
-        and len({site.callee for site in sites}) != 2
+        and len(OrderedSet(site.callee for site in sites)) != 2
     ):
         raise ValueError("Payload launch coverage differs")
     predicates = [item for item in consumers if item.site_id is None]
@@ -184,18 +196,18 @@ def _validate_payload(payload):
         ):
             if not 0 <= item.parameter < len(ranges):
                 raise ValueError("Native field has no parameter")
-            if hasattr(item, "dtype"):
+            if isinstance(item, IntegerField):
                 if (
-                    item.dtype not in {"i32", "i64", "f32"}
+                    item.dtype not in ("i32", "i64", "f32")
                     or item.source.llvm_type != item.dtype
                 ):
                     raise ValueError(
                         "Unsupported or inconsistent native scalar field type"
                     )
                 size = int(item.dtype[1:]) // 8
-            elif hasattr(item, "byte_size"):
+            elif isinstance(item, (Padding, UndefinedField)):
                 size = item.byte_size
-            elif hasattr(item, "data"):
+            elif isinstance(item, ConstantField):
                 size = len(item.data)
             else:
                 size = 8
@@ -216,8 +228,12 @@ def _validate_payload(payload):
                 raise ValueError("Native fields do not cover their parameter")
         for item in (*fields.pointers, *fields.integers):
             source = item.source
-            if source.kind in {"tensor_property", "scalar_formal"}:
-                formal = formals.get(source.ir_arg_index)
+            if source.kind in ("tensor_property", "scalar_formal"):
+                formal = (
+                    formals.get(source.ir_arg_index)
+                    if source.ir_arg_index is not None
+                    else None
+                )
                 if (
                     formal is None
                     or source.formal_name != formal.name
@@ -225,7 +241,7 @@ def _validate_payload(payload):
                 ):
                     raise ValueError("Native field source binding differs")
             elif (
-                source.kind not in {"compiler_expression", "compiler_constant"}
+                source.kind not in ("compiler_expression", "compiler_constant")
                 or source.ir_arg_index is not None
             ):
                 raise ValueError("Unknown native field source")
@@ -241,7 +257,7 @@ def _validate_payload(payload):
             for item in (*fields.pointers, *fields.integers)
             if item.source.expression is not None
         )
-        seen = set()
+        seen: OrderedSet[int] = OrderedSet()
         while expressions:
             expression = expressions.pop()
             if type(expression) is not ParameterExpression:

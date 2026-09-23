@@ -1139,11 +1139,9 @@ class TestHostTraceCuTeDSL(TestCase):
         with self.assertRaisesRegex(self.ht.Declined, "AOT-embedded kernel"):
             self.ht.trace(lambda x: torch.topk(x, 64), (x,))
 
-    def test_scatter_add_is_the_tape_s_copy_and_a_region_of_eager_s_kernel(self):
-        # eager's functional override clones self (a device memcpy) and scatters into
-        # the clone in place: the tape records the copy as its own and the region's
-        # template is the in-place override's kernel, eager's own function. The
-        # condition (TensorIterator's analysis, in Python) runs on the traced tensors
+    def test_scatter_add_is_recorded_from_its_descriptor_with_eager_s_kernel(self):
+        # The functional override copies self, then its typed TMA launch updates
+        # that allocation using the exact kernel that eager launches.
         self.assertFalse(torch.are_deterministic_algorithms_enabled())
         args = scatter_args(128)
         (eager,) = self._eager_nodes(scatter_inplace_host, (args[0].clone(), *args[1:]))
@@ -1151,35 +1149,36 @@ class TestHostTraceCuTeDSL(TestCase):
         replay = self._replay(scatter_host, args)
         tape = replay.tape
         self.assertEqual(
-            (tape.num_launches, len(tape.memcpys), tape.num_regions), (0, 1, 1)
+            (tape.num_launches, len(tape.memcpys), tape.num_regions), (1, 1, 0)
         )
         self.assertEqual(tape.memcpys[0]["kind"], "d2d")
-        # the closed region serves because the program's descriptor does not
-        # express its launch: the host builds a TMA descriptor over src
         from torch._native.ops.scatter_add import tma_kernel
 
         program = tma_kernel._compile_tma_scatter(torch.float32)
         record = self.dsl._compiles.get(program)
         self.assertIsNotNone(record.descriptor)
-        self.assertIsNotNone(record.descriptor.declined)
-        self.assertRegex(
-            record.descriptor.declined, "identity_layout|tma|over runtime values"
-        )
-        (region,) = tape.regions
-        self.assertEqual((region.op, region.scalars), ("scatter_add_", (0,)))
+        self.assertIsNone(record.descriptor.declined)
+        (launch,) = self._descriptor_launches(tape)
+        call = self._descriptor_call(replay)
         self.assertEqual(
-            [o.name for o in (*region.inputs, *region.outputs)],
-            ["index", "src", "self"],
+            (call.module.function, launch["kernel"]), (eager["func"], eager["name"])
         )
-        self.assertEqual(tape.written_inputs, ())
+        self.assertEqual(
+            list(call.module.parameter_layout),
+            [tuple(item) for item in eager["layout"]],
+        )
+        self.assertNotIn(0, tape.written_inputs)
+        saved = tuple(tensor.clone() for tensor in args)
         self.assertEqual(replay(*args), scatter_host(*args), atol=0, rtol=0)
+        self.assertEqual(args, saved, atol=0, rtol=0)
         other = scatter_args(64)
+        saved = tuple(tensor.clone() for tensor in other)
         self.assertEqual(replay(*other), scatter_host(*other), atol=0, rtol=0)
+        self.assertEqual(other, saved, atol=0, rtol=0)
         self.assertEqual(
             (replay.traces, len(replay.variants), replay.declines), (1, 1, [])
         )
-        for t in self._templates("scatter_add_"):
-            self.assertEqual([n["func"] for n in t.nodes], [eager["func"]])
+        self.assertEqual(self._templates("scatter_add_"), [])
 
     def test_scatter_add_s_decision_is_its_condition_s_comparisons(self):
         # E40: the condition runs on the traced tensors, each comparison it makes a
@@ -1214,18 +1213,20 @@ class TestHostTraceCuTeDSL(TestCase):
         )
         self.assertIn("scatter_add", replay.declines[0])
 
-    def test_scatter_add__writes_the_input_through_the_region(self):
+    def test_scatter_add__writes_the_input_through_its_descriptor(self):
         args = scatter_args(128)
         tape = self.ht.trace(scatter_inplace_host, (args[0].clone(), *args[1:]))
         self.assertEqual(
-            (tape.num_launches, len(tape.memcpys), tape.num_regions), (0, 0, 1)
+            (tape.num_launches, len(tape.memcpys), tape.num_regions), (1, 0, 0)
         )
-        self.assertEqual(tape.written_inputs, (0,))
+        self.assertIn(0, tape.written_inputs)
         replay = self._replay(scatter_inplace_host, (args[0].clone(), *args[1:]))
         got, expected = args[0].clone(), args[0].clone()
+        saved = tuple(tensor.clone() for tensor in args[1:])
         replay(got, *args[1:])
         scatter_inplace_host(expected, *args[1:])
         self.assertEqual(got, expected, atol=0, rtol=0)
+        self.assertEqual(args[1:], saved, atol=0, rtol=0)
         self.assertEqual(
             (replay.traces, len(replay.variants), replay.declines), (1, 1, [])
         )

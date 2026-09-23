@@ -35,7 +35,14 @@ from typing import Any
 import sympy
 
 import torch
+from torch._dynamo.source import LocalSource
 from torch._inductor.codecache import CppCodeCache
+from torch._inductor.runtime._cudagraph._compiler.tma_dimension import TmaDimension
+from torch._inductor.runtime._cudagraph.address_guard_printer import (
+    _AddressPrinter,
+    GuardExportDeclined,
+    UIntGCD,
+)
 from torch._inductor.runtime._cudagraph.cuda_tape_import import recorded_guard_pins
 from torch._inductor.runtime._cudagraph.hosttrace_allocseq import (
     AllocatorSequence,
@@ -106,6 +113,7 @@ from torch.utils._sympy.functions import (
     ToFloat,
     TruncToInt,
 )
+from torch.utils._sympy.value_ranges import ValueRanges
 
 
 _MODS = (sympy.Mod, _Mod, PythonMod)
@@ -178,6 +186,7 @@ _PREDICATE_PREAMBLE = (
     "#include <cmath>",
     "#include <cstdint>",
     "#include <cstring>",
+    "#include <numeric>",
     "#include <vector>",
     "#include <c10/util/generic_math.h>",
     "static inline int64_t ck_add(int64_t a, int64_t b, bool& bad) {",
@@ -719,6 +728,36 @@ class _Lowering:
         )
 
     # ---- predicate source
+
+    def predicate_cpp(self, e, names):
+        e = self.subst(e)
+        if not e.has(UIntGCD, TmaDimension):
+            return self.cpp(e, names)
+        if any(symbol.is_integer is not True for symbol in e.free_symbols):
+            raise HostTraceLoweringDeclined(
+                "TMA predicates require integer source slots"
+            )
+        sources = {
+            symbol: LocalSource(self.cpp(symbol, names)) for symbol in e.free_symbols
+        }
+        mapping = {symbol: [source] for symbol, source in sources.items()}
+        printer = _AddressPrinter(
+            mapping,
+            lambda source: source.local_name,
+            mapping,
+            domains={symbol: ValueRanges(-(2**63), 2**63 - 1) for symbol in sources},
+            sources=tuple(sources.values()),
+        )
+        printer.source_to_symbol.update(
+            (source, sympy.Symbol(source.local_name)) for source in sources.values()
+        )
+        # TMA recasts and their surrounding arithmetic keep the shared uint64/int128 semantics.
+        try:
+            return printer.doprint(e)
+        except GuardExportDeclined as error:
+            raise HostTraceLoweringDeclined(
+                f"host_trace TMA predicate: {error}"
+            ) from error
 
     def cpp(self, e, names):
         """The C++ text of an integer, float or boolean expression over the predicate's
@@ -2596,7 +2635,9 @@ def lower_tape(
         ]
     checks.extend(f"  if (!({fact.name} > int64_t(0))) return 0;" for fact in positive)
     # a size or stride the ShapeEnv expressed through other symbols
-    checks.extend(f"  if (!({lowering.cpp(t, names)}) || bad) return 0;" for t in terms)
+    checks.extend(
+        f"  if (!({lowering.predicate_cpp(t, names)}) || bad) return 0;" for t in terms
+    )
     declared_calls = {}  # (impl, rendered arguments) -> the local holding its value
 
     def declare_rebinds(expression, into):
@@ -2653,11 +2694,12 @@ def lower_tape(
                 opaque_term(rec, args, checks)
                 pending_opaque.remove((rec, args))
         declare_rebinds(t, checks)
-        checks.append(f"  if (!({lowering.cpp(t, names)}) || bad) return 0;")
+        checks.append(f"  if (!({lowering.predicate_cpp(t, names)}) || bad) return 0;")
     for rec, args in pending_opaque:
         opaque_term(rec, args, checks)
     arena_checks = [
-        f"  if (!({lowering.cpp(t, names)}) || bad) return 0;" for t in arena_terms
+        f"  if (!({lowering.predicate_cpp(t, names)}) || bad) return 0;"
+        for t in arena_terms
     ]
     region_checks = []
     if regions:

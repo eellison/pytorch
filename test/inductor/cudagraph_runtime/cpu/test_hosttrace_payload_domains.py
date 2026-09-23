@@ -261,21 +261,30 @@ class TestHostTracePayloadDomains(TestCase):
 
     @parametrize("numerator", ("zero", "same"))
     @parametrize("stride", (0, 2))
+    @parametrize("nested", (False, True))
     def test_translated_floor_keeps_cancelled_denominator_domain(
-        self, numerator, stride
+        self, numerator, stride, nested
     ):
         divisor = IntExpr("stride", 0, (IntExpr("constant", 0),))
         dividend = IntExpr("constant", 0) if numerator == "zero" else divisor
         recipe = IntExpr("floordiv", args=(dividend, divisor))
+        if nested:
+            recipe = IntExpr("floordiv", args=(recipe, IntExpr("constant", 2)))
         expression = symbolic_integer(recipe, {("stride", 0, 0): self.step})
         self.assertIsInstance(expression, FloorDiv)
-        self.assertEqual(expression.args[1], self.step)
+        division = expression.args[0] if nested else expression
+        self.assertIsInstance(division, FloorDiv)
+        self.assertEqual(division.args[1], self.step)
         _, mapping = self.integers()
         guard = compile_host_trace_guard(
             self.tape,
             mapping,
             [self.tensor],
-            (sympy.Eq(expression, int(numerator == "same"), evaluate=False),),
+            (
+                sympy.Eq(
+                    expression, int(numerator == "same" and not nested), evaluate=False
+                ),
+            ),
         )
         tensor = torch.empty(9 * stride + 1).as_strided((9,), (stride,))
         self.assertEqual(self.evaluate(guard, tensor), int(stride > 0))
