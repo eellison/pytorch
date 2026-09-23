@@ -1017,7 +1017,7 @@
     "id": "cpu_hosttrace_cute_sources",
     "script": "cpu/test_hosttrace_cute_sources.py",
     "device": "cpu",
-    "cases": 13,
+    "cases": 19,
     "requires_cute": true
   },
   {

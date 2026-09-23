@@ -659,18 +659,22 @@ def _constant(value, decline):
 
 def _record(tr, ct, invocation, name) -> None:
     """One launch record per selected site, at the invocation's sequence position."""
+    import sympy
+
     from torch._inductor.runtime._cudagraph._compiler.cute_bridge.lowering import (
         _Operands,
     )
     from torch._inductor.runtime._cudagraph._compiler.cute_bridge.numeric import (
         lower_numeric,
+        NumericSource,
     )
     from torch._inductor.runtime._cudagraph._compiler.cute_bridge.provider import (
         _constant_consumer,
     )
     from torch._inductor.runtime._cudagraph.address_scalars import symbolic_integer
-    from torch._inductor.runtime._cudagraph.cute_adapter import CuTeDeclined
+    from torch._inductor.runtime._cudagraph.cute_adapter import _condition, CuTeDeclined
     from torch._inductor.runtime.cudagraph_arg_mapping import IntExpr
+    from torch.utils._sympy.numbers import int_oo
 
     ht = _host_trace()
 
@@ -678,13 +682,66 @@ def _record(tr, ct, invocation, name) -> None:
         raise ht.Declined(f"host_trace: CuTe DSL kernel {name}: {why} (declined)")
 
     artifact, signature = invocation.artifact, invocation.signature
-    hints = _Operands(
+    symbols = {}
+
+    def require(condition):
+        if not tr.shape_env.evaluate_expr(condition):
+            decline(f"its launch configuration violates the integer domain {condition}")
+
+    class SymbolicOperands(_Operands):
+        def numeric_value(self, value):
+            if type(value) is int:
+                return super().numeric_value(value)
+            if (
+                type(value) is not torch.SymInt
+                or value.node.shape_env is not tr.shape_env
+            ):
+                decline("its launch configuration lost its original symbolic integer")
+            expression = value.node.expr
+            interval = tr.shape_env.bound_sympy(expression)
+            if not interval.is_int:
+                decline("its launch configuration has no inherited integer domain")
+            lower, upper = (
+                None if bound in (-int_oo, int_oo) else int(bound)
+                for bound in (interval.lower, interval.upper)
+            )
+            if lower is not None:
+                require(sympy.Ge(expression, lower))
+            if upper is not None:
+                require(sympy.Le(expression, upper))
+            index = len(symbols)
+            symbols[index] = expression
+            return NumericSource(IntExpr("boxed", index), lower, upper)
+
+    operands = SymbolicOperands(
         invocation.local,
         artifact,
         {id(v): None for v in invocation.operands if type(v) is FakeTensor},
-        lambda v: IntExpr("constant", int(ht._hint(v))),
+        lambda value: value,
     )
     formals = {formal.source_arg_index: formal for formal in artifact.formals}
+
+    def symbolic(value):
+        return symbolic_integer(value, symbols, CuTeDeclined)
+
+    def lower(consumer):
+        try:
+            lowered = lower_numeric(consumer.numeric, operands.numeric)
+            (value,) = lowered.values
+        except ValueError as error:
+            decline(f"its {consumer.role} is not lowered by the runtime ({error})")
+        for obligation in lowered.obligations:
+            expression = symbolic(obligation.expression)
+            require(sympy.Ge(expression, obligation.lower))
+            require(sympy.Le(expression, obligation.upper))
+        return value
+
+    if invocation.arm is not None:
+        (predicate,) = (
+            c for c in artifact.consumers if c.site_id is None and c.role == "predicate"
+        )
+        condition = _condition(lower(predicate), symbolic)
+        require(condition if invocation.arm else sympy.Not(condition))
 
     def numeric(site, role, index):
         consumer = next(
@@ -692,18 +749,8 @@ def _record(tr, ct, invocation, name) -> None:
             for c in artifact.consumers
             if c.site_id == site.site_id and c.role == role and c.index == index
         )
-        try:
-            (value,) = lower_numeric(consumer.numeric, hints.numeric).values
-        except ValueError as error:
-            decline(f"its {role} is not lowered by the runtime ({error})")
-        expression = value.expression
-        if expression.op == "constant" and not expression.args:
-            return int(expression.value)
-        # a computed value (a ceil_div of a size): folded over the constant leaves
-        folded = symbolic_integer(expression, {}, CuTeDeclined)
-        if not getattr(folded, "is_Integer", False):
-            decline(f"its {role} did not fold at the traced operands ({folded})")
-        return int(folded)
+        expression = symbolic(lower(consumer).expression)
+        return tr.shape_env.create_symintnode(expression, hint=None)
 
     written = []
     for site_index, site in enumerate(invocation.sites):

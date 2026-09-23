@@ -11,6 +11,7 @@ import unittest
 
 import torch
 from torch.cuda._utils import _check_cuda_bindings
+from torch.testing._internal.common_device_type import instantiate_device_type_tests
 from torch.testing._internal.common_utils import run_tests, TestCase
 from torch.utils.dlpack import ReadOnlyTensorWrapper
 
@@ -47,6 +48,30 @@ if HAS_CUTE:
     ):
         affine(source, destination, bias).launch(
             grid=(source.shape[0], 1, 1), block=(128, 1, 1), smem=0, stream=stream
+        )
+
+    @cute.kernel
+    def affine_four_rows(
+        source: cute.Tensor, destination: cute.Tensor, bias: cutlass.Int32
+    ):
+        thread, _, _ = cute.arch.thread_idx()
+        block, _, _ = cute.arch.block_idx()
+        row, column = block * 4 + thread // 128, thread % 128
+        if row < source.shape[0]:
+            destination[row, column] = source[row, column] * 2.0 + bias
+
+    @cute.jit
+    def launch_four_rows(
+        source: cute.Tensor,
+        destination: cute.Tensor,
+        bias: cutlass.Int32,
+        stream: driver.CUstream,
+    ):
+        affine_four_rows(source, destination, bias).launch(
+            grid=(cute.ceil_div(source.shape[0], 4), 1, 1),
+            block=(512, 1, 1),
+            smem=0,
+            stream=stream,
         )
 
     @cute.jit
@@ -1278,6 +1303,76 @@ class TestHostTraceCuTeDSL(TestCase):
         x = torch.randn(4, 128, device="cuda")
         with self.assertRaisesRegex(self.ht.Declined, "was not met at the warm-up"):
             self.ht.trace(program_host, (x,), warm_up=False)
+
+
+@unittest.skipUnless(
+    torch.cuda.is_available() and HAS_CUTE and torch.version.hip is None,
+    "CUDA and the CuTe DSL required",
+)
+class TestHostTraceCuTeSymbolicLaunch(TestCase):
+    def test_computed_grid_is_symbolic_on_the_tape_and_replays_growing_rows(
+        self, device
+    ):
+        from torch._inductor.runtime._cudagraph.api import (
+            DirectCuTe,
+            ObservedOrdinaryEntry,
+            PythonEntry,
+            SignaturePolicy,
+        )
+        from torch._inductor.runtime._cudagraph.direct_hosttrace import HostTraceReplay
+        from torch.cuda import _host_trace
+
+        owner = ObservedOrdinaryEntry(
+            PythonEntry(launch_four_rows),
+            affine_four_rows,
+            policy=SignaturePolicy(32, 64, 16, "stream"),
+            conversion=convert_arguments,
+        )
+        self.addCleanup(owner.close)
+        entry = DirectCuTe(owner)
+
+        def host(source):
+            destination = torch.full_like(source, -777)
+            entry(source, destination, source.shape[0])
+            return destination
+
+        shapes = ((7, 0), (9, 4), (17, 8), (4, 12), (8, 16), (7, 20))
+        inputs = [
+            torch.randint(
+                -8, 8, (rows * 128 + offset,), device=device, dtype=torch.float32
+            )[offset:].view(rows, 128)
+            for rows, offset in shapes
+        ]
+        tape = _host_trace.trace(host, (inputs[0],))
+        (launch,) = [record for record in tape.launches if record.get("cute")]
+        self.assertIsInstance(launch["grid"][0], torch.SymInt)
+        grid = launch["grid"][0].node.expr
+        rows = tape.inputs[0].sizes[0].node.expr
+        self.assertEqual(grid.free_symbols, rows.free_symbols)
+        for count, _ in shapes:
+            self.assertEqual(grid.subs(rows, count), (count + 3) // 4)
+
+        replay = HostTraceReplay(host, (inputs[0],), tape=tape)
+        self.addCleanup(replay.close)
+        held = []
+        for source in inputs:
+            expected = source * 2 + source.shape[0]
+            self.assertEqual(host(source), expected, atol=0, rtol=0)
+            result = replay(source)
+            self.assertEqual(result, expected, atol=0, rtol=0)
+            held.append((result, expected))
+        self.assertEqual(
+            (replay.misses, len(replay.variants), replay.declines, replay.ordinary),
+            (0, 1, [], 0),
+        )
+        replay.close()
+        for result, expected in held:
+            self.assertEqual(result, expected, atol=0, rtol=0)
+
+
+instantiate_device_type_tests(
+    TestHostTraceCuTeSymbolicLaunch, globals(), only_for="cuda"
+)
 
 
 if __name__ == "__main__":

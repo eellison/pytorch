@@ -1,6 +1,7 @@
 # Owner(s): ["module: inductor"]
 
 import contextlib
+import itertools
 import struct
 from types import SimpleNamespace
 from unittest import mock
@@ -8,6 +9,7 @@ from unittest import mock
 import sympy
 
 import torch
+from torch._dynamo.source import LocalSource
 from torch._inductor.runtime._cudagraph import direct_hosttrace
 from torch._inductor.runtime._cudagraph._sdk import activate
 from torch._inductor.runtime._cudagraph.cute_types import CuTeCall
@@ -349,6 +351,203 @@ class TestHostTraceCuTeSources(TestCase):
         self.assertEqual(node.value, expected)
         self.assertEqual(leaf.value, pointer)
         self.assertIs(call.fields[0].source, encoded)
+
+
+@instantiate_parametrized_tests
+class TestRecordedCuTeLaunchConfig(TestCase):
+    def record(self, body, role, *, arm=None, hint=7):
+        from torch.cuda import _host_trace, _host_trace_cute
+
+        environment = _host_trace._TraceShapeEnv()
+        source = LocalSource("rows")
+        symbol = environment.create_symbol(hint, source)
+        rows = environment.create_symintnode(symbol, hint=hint, source=source)
+
+        def freeze(instructions, result_type="i32"):
+            with ir.Context(), ir.Location.unknown(), ir.raw_values():
+                module = ir.Module.parse(
+                    "module { llvm.func @probe(%n: i32) -> "
+                    + result_type
+                    + " { "
+                    + instructions
+                    + " } }"
+                )
+                self.assertTrue(module.operation.verify())
+                cfg = read_cfg_function(module, "probe")
+                return freeze_numeric(
+                    bind_properties(cfg), prepare_decodings(cfg), (0,)
+                )
+
+        fixed = freeze(
+            "%one = llvm.mlir.constant(1 : i32) : i32 llvm.return %one : i32"
+        )
+        computed = freeze(body, "i1" if role == "predicate" else "i32")
+        leaf = SimpleNamespace(
+            path=(), llvm_type="i32", property="value", property_path=()
+        )
+        formal = SimpleNamespace(
+            source_arg_index=0,
+            operand_index=0,
+            kind="Var",
+            name="rows",
+            leaves=(leaf,),
+        )
+        operand = SimpleNamespace(
+            name="rows",
+            tensor=None,
+            scalar=SimpleNamespace(
+                kind="integer",
+                bits=32,
+                use=SimpleNamespace(value=rows, shape_env=environment),
+            ),
+        )
+        signature = SimpleNamespace(operands=(operand,))
+        roles = (
+            ("grid", 0),
+            ("grid", 1),
+            ("grid", 2),
+            ("block", 0),
+            ("block", 1),
+            ("block", 2),
+            ("shared", 0),
+        )
+        consumers = tuple(
+            Consumer(
+                index,
+                "probe",
+                0,
+                kind,
+                axis,
+                "i32",
+                (0,),
+                computed if (kind, axis) == (role, 0) else fixed,
+            )
+            for index, (kind, axis) in enumerate(roles)
+        )
+        site = SimpleNamespace(
+            site_id=0,
+            arm=arm,
+            parameters=(),
+            fields=SimpleNamespace(pointers=(), integers=(), constants=()),
+            registration=SimpleNamespace(kernel_symbol="probe"),
+            consumer_ids=tuple(range(len(consumers))),
+        )
+        if role == "predicate":
+            consumers += (
+                Consumer(7, "probe", None, "predicate", 0, "i1", (0,), computed),
+            )
+        artifact = SimpleNamespace(
+            formals=(formal,), signature=signature, consumers=consumers, sites=(site,)
+        )
+        local = SimpleNamespace(
+            input_contract=SimpleNamespace(integer_ranges=()),
+            shape_env=environment,
+        )
+        invocation = SimpleNamespace(
+            local=local,
+            artifact=artifact,
+            signature=signature,
+            operands=(rows,),
+            sites=(site,),
+            arm=arm,
+        )
+        trace = SimpleNamespace(
+            shape_env=environment,
+            rec=SimpleNamespace(next_seq=itertools.count().__next__),
+        )
+        state = SimpleNamespace(launches=[], written_roots=[])
+        _host_trace_cute._record(trace, state, invocation, "probe")
+        (launch,) = state.launches
+        return environment, rows, launch
+
+    @parametrize("role", ("grid", "shared"))
+    def test_computed_launch_value_keeps_its_symbolic_source(self, role):
+        environment, rows, launch = self.record(
+            """
+            %three = llvm.mlir.constant(3 : i32) : i32
+            %four = llvm.mlir.constant(4 : i32) : i32
+            %sum = llvm.add %n, %three overflow<nsw> : i32
+            %result = llvm.sdiv %sum, %four : i32
+            llvm.return %result : i32
+            """,
+            role,
+        )
+        value = launch["grid"][0] if role == "grid" else launch["smem"]
+        self.assertIsInstance(value, torch.SymInt)
+        self.assertEqual(value.node.expr.free_symbols, rows.node.expr.free_symbols)
+        for count in (7, 13, 31):
+            self.assertEqual(
+                value.node.expr.subs(rows.node.expr, count), (count + 3) // 4
+            )
+            self.assertTrue(
+                all(
+                    guard.expr.subs(rows.node.expr, count) is sympy.true
+                    for guard in environment.guards
+                )
+            )
+        for constant in (*launch["block"], *launch["grid"][1:]):
+            self.assertIs(type(constant), int)
+            self.assertEqual(constant, 1)
+
+    def test_symbolic_launch_value_keeps_its_compiler_width_guard(self):
+        environment, rows, launch = self.record("llvm.return %n : i32", "grid")
+        self.assertIsInstance(launch["grid"][0], torch.SymInt)
+        self.assertEqual(launch["grid"][0].node.expr, rows.node.expr)
+        guards = [guard.expr for guard in environment.guards]
+        self.assertTrue(guards)
+        for count, expected in ((13, True), (2**31 - 1, True), (2**31, False)):
+            self.assertEqual(
+                all(
+                    guard.subs(rows.node.expr, count) is sympy.true for guard in guards
+                ),
+                expected,
+            )
+
+    def test_constant_launch_result_keeps_original_arithmetic_guard(self):
+        environment, rows, launch = self.record(
+            """
+            %three = llvm.mlir.constant(3 : i32) : i32
+            %zero = llvm.mlir.constant(0 : i32) : i32
+            %sum = llvm.add %n, %three overflow<nsw> : i32
+            %result = llvm.mul %sum, %zero overflow<nsw> : i32
+            llvm.return %result : i32
+            """,
+            "shared",
+        )
+        self.assertIs(type(launch["smem"]), int)
+        self.assertEqual(launch["smem"], 0)
+        guards = [guard.expr for guard in environment.guards]
+        self.assertTrue(guards)
+        for count, expected in ((13, True), (2**31 - 4, True), (2**31 - 3, False)):
+            self.assertEqual(
+                all(
+                    guard.subs(rows.node.expr, count) is sympy.true for guard in guards
+                ),
+                expected,
+            )
+
+    @parametrize("arm", (True, False))
+    def test_selected_dispatch_arm_is_a_tape_guard(self, arm):
+        environment, rows, launch = self.record(
+            """
+            %limit = llvm.mlir.constant(16 : i32) : i32
+            %condition = llvm.icmp "slt" %n, %limit : i32
+            llvm.return %condition : i1
+            """,
+            "predicate",
+            arm=arm,
+            hint=7 if arm else 19,
+        )
+        self.assertEqual(launch["grid"], (1, 1, 1))
+        guards = [guard.expr for guard in environment.guards]
+        self.assertTrue(guards)
+        for count in (3, 7, 15, 16, 19, 31):
+            self.assertEqual(
+                all(
+                    guard.subs(rows.node.expr, count) is sympy.true for guard in guards
+                ),
+                (count < 16) is arm,
+            )
 
 
 if __name__ == "__main__":
