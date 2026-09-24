@@ -281,6 +281,8 @@ CUDA_TYPE_NAME_MAP = collections.OrderedDict([
     ("CUuuid", "hipUUID"),
     ("cudaGraph_t", "hipGraph_t"),
     ("cudaGraphExec_t", "hipGraphExec_t"),
+    ("cudaKernelNodeParams", "hipKernelNodeParams"),
+    ("cudaMemsetParams", "hipMemsetParams"),
     ("__nv_bfloat16", "__hip_bfloat16"),
     ("__nv_bfloat162", "__hip_bfloat162"),
     ("CUfileHandle_t", "hipFileHandle_t"),

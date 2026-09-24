@@ -331,15 +331,18 @@ Tensor rms_norm_symint(
   c10::MaybeOwned<Tensor> weight_maybe_owned = at::borrow_from_optional_tensor(weight_opt);
   const Tensor& weight = *weight_maybe_owned;
   _check_rms_norm_inputs_symint(input, normalized_shape, weight);
+  // a size written from a SymInt (a symbolic or a traced shape) is specialized
+  // here, never reinterpreted as the SymInt's pointer bits
+  const auto normalized_shape_int = C10_AS_INTARRAYREF_SLOW_ALLOC(normalized_shape);
 
   // composite fallback for channels last
   if(input.suggest_memory_format() == c10::MemoryFormat::ChannelsLast || input.suggest_memory_format() == c10::MemoryFormat::ChannelsLast3d){
-    return std::get<0>(rms_norm_composite(input, IntArrayRef(reinterpret_cast<const int64_t*>(normalized_shape.data()), normalized_shape.size()), weight_opt, eps));
+    return std::get<0>(rms_norm_composite(input, normalized_shape_int, weight_opt, eps));
   }
 
   // composite fallback for complex datatypes
   if(input.is_complex()){
-    return std::get<0>(rms_norm_composite(input, IntArrayRef(reinterpret_cast<const int64_t*>(normalized_shape.data()), normalized_shape.size()), weight_opt, eps));
+    return std::get<0>(rms_norm_composite(input, normalized_shape_int, weight_opt, eps));
   }
 
   if (weight_opt.has_value() && weight_opt.value().defined() && weight_opt.value().dtype() != input.dtype()) {
@@ -347,7 +350,7 @@ Tensor rms_norm_symint(
       "Mismatch dtype between input and weight: input dtype = ", input.dtype(),
       ", weight dtype = ", weight_opt.value().dtype(), ", Cannot dispatch to fused implementation."
     );
-    return std::get<0>(rms_norm_composite(input, IntArrayRef(reinterpret_cast<const int64_t*>(normalized_shape.data()), normalized_shape.size()), weight_opt, eps));
+    return std::get<0>(rms_norm_composite(input, normalized_shape_int, weight_opt, eps));
   }
 
   #ifdef USE_MPS
@@ -356,15 +359,15 @@ Tensor rms_norm_symint(
     const bool any_inputs_require_grad = input.requires_grad() || weight.requires_grad();
 
     if (!(GradMode::is_enabled() && any_inputs_require_grad)) {
-      return std::get<0>(at::_fused_rms_norm(input.contiguous(), IntArrayRef(reinterpret_cast<const int64_t*>(normalized_shape.data()), normalized_shape.size()), weight_opt, eps));
+      return std::get<0>(at::_fused_rms_norm(input.contiguous(), normalized_shape_int, weight_opt, eps));
     }
   }
 
   if (input.device().type() == DeviceType::MPS){
-    return std::get<0>(rms_norm_composite(input, IntArrayRef(reinterpret_cast<const int64_t*>(normalized_shape.data()), normalized_shape.size()), weight_opt, eps));
+    return std::get<0>(rms_norm_composite(input, normalized_shape_int, weight_opt, eps));
   }
   #endif
-  return std::get<0>(at::_fused_rms_norm(input, IntArrayRef(reinterpret_cast<const int64_t*>(normalized_shape.data()), normalized_shape.size()), weight_opt, eps));
+  return std::get<0>(at::_fused_rms_norm(input, normalized_shape_int, weight_opt, eps));
 }
 
 } // namespace at::native

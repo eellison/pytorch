@@ -1639,6 +1639,17 @@ def _make_node_magic(method: str, func: Callable[..., sympy.Basic]) -> None:
         # this node.
         if self.shape_env is None:
             raise RuntimeError("shape_env is required for binary op")
+        if (
+            pytype is float
+            and method in ("add", "sub", "mul")
+            and self.shape_env.exact_float_arithmetic
+        ):
+            # A ShapeEnv that replays float guards exactly (host tracing) keeps
+            # every float operation in the order the program performed it:
+            # sympy re-associates (x*0.1)*3 into 0.30000000000000004*x.
+            from torch.utils._sympy.functions import Identity
+
+            out = Identity(out)
         fx_node, _ = self.shape_env._create_fx_call_function(
             op, (self.fx_node, other.fx_node)
         )
@@ -1691,6 +1702,14 @@ def _make_node_magic(method: str, func: Callable[..., sympy.Basic]) -> None:
         else:
             pytype = self.pytype
 
+        if (
+            pytype is float
+            and method == "neg"
+            and self.shape_env.exact_float_arithmetic
+        ):
+            from torch.utils._sympy.functions import Identity
+
+            out = Identity(out)
         fx_node, _ = self.shape_env._create_fx_call_function(op, (self.fx_node,))
         return SymNode(out, self.shape_env, pytype, out_hint, fx_node=fx_node)  # type: ignore[arg-type]
 
