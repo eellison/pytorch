@@ -3900,6 +3900,31 @@ class View(GenericView):
             idx = idx + size
         return idx
 
+    @staticmethod
+    def _unit_dim_reindex(
+        x: IRNode, old_size: Sequence[Expr], new_size: Sequence[Expr]
+    ) -> Callable[[Sequence[Expr]], Sequence[Expr]] | None:
+        """Reindex for a view of a realized, still-flexible buffer that only
+        inserts or removes size-1 dims."""
+        if not (
+            isinstance(x, StorageBox)
+            and isinstance(x.data, ComputedBuffer)
+            and isinstance(x.data.layout, FlexibleLayout)
+        ):
+            return None
+        old_dims = [i for i, s in enumerate(old_size) if s != 1]
+        new_dims = [i for i, s in enumerate(new_size) if s != 1]
+        if [old_size[i] for i in old_dims] != [new_size[i] for i in new_dims]:
+            return None
+
+        def reindex(index: Sequence[Expr]) -> Sequence[Expr]:
+            result: list[Expr] = [sympy.S.Zero] * len(old_size)
+            for old, new in zip(old_dims, new_dims):
+                result[old] = index[new]
+            return result
+
+        return reindex
+
     @classmethod
     @override
     def create(cls, x: IRNode, new_size: Sequence[Expr]) -> IRNode:  # type: ignore[override]
@@ -3962,6 +3987,11 @@ class View(GenericView):
                 return tuple([0] * len(old_size))
 
             return cls(data=x, size=list(new_size), reindex=fake_reindex)
+
+        elif (reindex := cls._unit_dim_reindex(x, old_size, new_size)) is not None:
+            # Freezing would pin the producer to contiguous strides; keep it
+            # flexible so e.g. ConcatKernel can still place it in its output.
+            return cls(data=x, size=list(new_size), reindex=reindex)
 
         # TODO: a new class for FixedTransferLayout that output layout is constrained by input layout
         elif is_contiguous:
@@ -7108,6 +7138,36 @@ class ConcatKernel(NopKernel):
         if isinstance(src, TensorBox):
             # unwrap a TensorBox
             return cls.realize_into(src.data, dst)
+
+        if (
+            type(src) is View
+            and View._unit_dim_reindex(src.data, src.data.get_size(), src.get_size())
+            is not None
+            and cls.can_realize_into_without_copy(src.data)
+        ):
+            layout = dst.get_layout()
+            kept = [i for i, s in enumerate(src.get_size()) if s != 1]
+            inner_size = src.data.get_size()
+            inner_dims = [i for i, s in enumerate(inner_size) if s != 1]
+            stride: list[Expr] = [sympy.S.One] * len(inner_size)
+            for inner, outer in zip(inner_dims, kept):
+                stride[inner] = layout.stride[outer]
+            # Size-1 dims get the stride a contiguous layout would give them;
+            # zero strides read as broadcasts to layout proofs.
+            for i in reversed(range(len(inner_size) - 1)):
+                if inner_size[i] == 1:
+                    stride[i] = stride[i + 1] * inner_size[i + 1]
+            squeezed = ReinterpretView(
+                data=dst.data,
+                layout=FixedLayout(
+                    layout.device,
+                    layout.dtype,
+                    list(inner_size),
+                    stride,
+                    layout.offset,
+                ),
+            )
+            return cls.realize_into(src.data, squeezed)
 
         if isinstance(src, StorageBox):
             src.realize()
