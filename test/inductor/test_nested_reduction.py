@@ -1404,9 +1404,16 @@ class _NestedReductionBase:
         actual, sources = run_and_get_code(torch.compile(f), x, weight)
         self.assertEqual(actual, expected, atol=1e-2, rtol=1e-2)
         self.check_fusion()
-        # One split of the lane source and one of the per-group scale, which
-        # is lifted to the parent tile and split like the data.
-        FileCheck().check_count("tl.split(", 2, exactly=True).run("\n".join(sources))
+        # Pair folding splits the folded pairs; the per-group scale adds one
+        # split when it comes from the shared external source.
+        source = "\n".join(sources)
+        FileCheck().check_count(
+            "tl.split(", 3 if shared_external_source else 2, exactly=True
+        ).run(source)
+        self.assertEqual(
+            source.count("tl.load("),
+            3 if self.force_persistent_outer_reduction is False else 2,
+        )
 
     def test_producer_consumer_lane_fold_splits_computed_value(self):
         """Lanes split the normalized value once, not the raw x and w loads."""
@@ -3634,7 +3641,9 @@ class _InternalsBase:
             meta_num_load=self.looped_or_persistent(2, 1),
             min_xblock=None,
             min_rblock=4,
-            extra_checks=FileCheck().check_count("tl.split(", 3, exactly=True),
+            # Each aligned pair splits its operands in half and its result
+            # once. The unaligned middle pair shares one split of all lanes.
+            extra_checks=FileCheck().check_count("tl.split(", 9, exactly=True),
         )
 
     def test_mxfp6_internal_source_kernel_form(self):
@@ -3648,7 +3657,9 @@ class _InternalsBase:
             meta_num_load=self.looped_or_persistent(2, 1),
             min_xblock=None,
             min_rblock=4,
-            extra_checks=FileCheck().check_count("tl.split(", 3, exactly=True),
+            # Each aligned pair splits its operands in half and its result
+            # once. The unaligned middle pair shares one split of all lanes.
+            extra_checks=FileCheck().check_count("tl.split(", 9, exactly=True),
         )
 
     def test_standalone_sub_parent_epilogue_kernel_form(self):
