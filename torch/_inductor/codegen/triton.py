@@ -80,6 +80,7 @@ from ..utils import (
     _TDM_SUPPORTED_DTYPES,
     _TMA_SUPPORTED_DTYPES,
     cache_on_self,
+    DeferredLineBase,
     DelayReplaceLine,
     device_supports_fp64,
     get_bounds_index_expr,
@@ -1841,6 +1842,10 @@ class TritonOverrides(OpOverrides):
         # constraints, cast back to the original dtype so the asm sees the
         # right register type.
         constraint_parts = [p.strip() for p in constraints.split(",")]
+        if isinstance(V.kernel, TritonKernel) and any(
+            p.startswith("=") and "{" in p for p in constraint_parts
+        ):
+            V.kernel.fixed_register_asm = True
         input_constraints = [p for p in constraint_parts if not p.startswith("=")]
         cast_inputs = []
         for i, (inp, c) in enumerate(zip(inputs, input_constraints[: len(inputs)])):
@@ -3401,6 +3406,52 @@ ARG_REDUCTION_TYPES = (
 PLAIN_REDUCTION_TYPES = ("sum", "prod", "max", "min", "xor_sum")
 
 
+@dataclasses.dataclass(frozen=True)
+class _ConcatStoreInfo:
+    allocation: ir.ConcatKernel
+    offset: sympy.Expr
+    pointer: str
+    index: str
+    mask: str
+    value: CSEVariable
+    dtype: torch.dtype
+    shape: tuple[int | str, ...]
+
+
+class _ConcatStoreLine(DeferredLine):
+    def __init__(self, name: str, line: str, info: _ConcatStoreInfo):
+        super().__init__(name, line)
+        self.info = info
+
+    def _new_line(self, line: str) -> _ConcatStoreLine:
+        return _ConcatStoreLine(self.name, line, self.info)
+
+
+class _CoalescedConcatStoreLine(DeferredLineBase):
+    """Keep each original store removable after code generation."""
+
+    def __init__(self, line: str, *stores: _ConcatStoreLine, kernel: TritonKernel):
+        super().__init__(line)
+        self.stores = stores
+        self.kernel = kernel
+
+    def __call__(self) -> str | None:
+        live = [store for store in self.stores if not is_buffer_removed(store.name)]
+        # Rendered after the whole kernel is generated, so this sees inline asm
+        # from every stage. Triton 3.8.0's AMDGPU backend can crash in LLVM
+        # (LiveIntervals) on joined stores around fixed output registers.
+        if len(live) == len(self.stores) and not self.kernel.fixed_register_asm:
+            return self.line
+        if not live:
+            return None
+        # IndentedBuffer can reindent this line after stores were combined.
+        indent = self.line.removesuffix(self.line.lstrip())
+        return "\n".join(indent + store.line.lstrip() for store in live)
+
+    def _new_line(self, line: str) -> _CoalescedConcatStoreLine:
+        return _CoalescedConcatStoreLine(line, *self.stores, kernel=self.kernel)
+
+
 class TritonKernel(SIMDKernel[TritonCSEVariable]):
     """A class to represent a triton kernel and helpers to generate
     triton kernel programmatically
@@ -3447,6 +3498,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         self.block_ptr_id = itertools.count()
         self.block_ptr_to_buffer = dict[str, str]()
         self.helper_functions = HelperFunctions()
+        # Set when inline asm with a fixed output register is emitted.
+        self.fixed_register_asm = False
         self.pointer_advancements: dict[SymT, dict[str, list[sympy.Expr]]] = (
             collections.defaultdict(dict)
         )
@@ -5370,12 +5423,142 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             exit_stack.enter_context(self.guard_cooperative_store(name, self.stores))
 
         self._handle_pdl_before_access(self.stores, name, consider_reads=True)
-        self.stores.writeline(DeferredLine(name, line))
+        deferred_line = DeferredLine(name, line)
+        if mode is None and isinstance(indexing, IndexingOptions):
+            info = self._concat_store_info(name, var, indexing, value)
+            if info is not None:
+                deferred_line = _ConcatStoreLine(name, line, info)
+        self.stores.writeline(deferred_line)
 
         if not self.inside_reduction:
             self.outside_loop_vars.add(value)
 
         exit_stack.close()
+
+    def _concat_store_info(
+        self,
+        name: str,
+        pointer: str,
+        indexing: IndexingOptions,
+        value: CSEVariable,
+    ) -> _ConcatStoreInfo | None:
+        if (
+            not config.triton.coalesce_concat_stores
+            or self.is_combo_kernel
+            or self.cooperative_reduction
+            or self.mix_order_reduction
+            or self._load_mask is not None
+            or self._enable_pdl_codegen()
+            or indexing.has_indirect()
+            or indexing.has_tmpmask()
+            or is_sympy_integer_like(indexing.index)
+            or not value.shape
+            or value.dtype is None
+        ):
+            return None
+        buffer = V.graph.try_get_buffer(name)
+        layout = buffer.get_layout() if isinstance(buffer, ir.Buffer) else None
+        view = layout.view if isinstance(layout, ir.NonOwningLayout) else None
+        if not (
+            isinstance(view, ir.ReinterpretView)
+            and isinstance(view.data, ir.StorageBox)
+            and isinstance(allocation := view.data.data, ir.ConcatKernel)
+        ):
+            return None
+        return _ConcatStoreInfo(
+            allocation,
+            view.get_layout().offset,
+            pointer,
+            indexing.index_str,
+            indexing.mask_str,
+            value,
+            value.dtype,
+            tuple(value.shape),
+        )
+
+    def _coalesce_concat_stores(self) -> None:
+        """Join adjacent concat slices within this store-buffer flush only."""
+        lines = self.stores.get_lines_ref()
+        combined = []
+        index = 0
+
+        def compatible(offset: int) -> bool:
+            if index + offset >= len(lines):
+                return False
+            first, other = lines[index], lines[index + offset]
+            if not isinstance(other, _ConcatStoreLine):
+                return False
+            left, right = first.info, other.info
+            return (
+                left.allocation is right.allocation
+                and left.dtype == right.dtype
+                and left.shape == right.shape
+                and left.index == right.index
+                and left.mask == right.mask
+                and first.line.removesuffix(first.line.lstrip())
+                == other.line.removesuffix(other.line.lstrip())
+                and V.graph.sizevars.statically_known_equals(
+                    right.offset - left.offset, offset
+                )
+            )
+
+        while index < len(lines):
+            first = lines[index]
+            combined.append(first)
+            if not isinstance(first, _ConcatStoreLine) or not compatible(1):
+                index += 1
+                continue
+            second = lines[index + 1]
+            left, right = first.info, second.info
+            # The joined tile may be stored by other threads than the ones that
+            # computed each value, so a same-kernel readback could race.
+            names = (b.get_name() for b in (left.allocation, *left.allocation.inputs))
+            if any(
+                name in self.args.input_buffers
+                or name in self.args.inplace_buffers
+                or name in self.inplace_update_buffers
+                or name in self.mutations
+                or self._load_counts[name]
+                or self.store_buffer_counts.get(name, 0) > 1
+                for name in names
+            ):
+                index += 1
+                continue
+            mask = "None" if left.mask == "None" else f"tl.expand_dims({left.mask}, -1)"
+            stores = [first, second]
+            width = 2
+            value = f"tl.join({left.value}, {right.value})"
+            # A masked four-lane store of 16-bit elements measured slower
+            # than separate stores; wider elements benefit.
+            if (
+                left.allocation.get_dtype().itemsize >= 4
+                and compatible(2)
+                and not compatible(3)
+            ):
+                third = lines[index + 2]
+                stores.append(third)
+                shape = f"[{', '.join(map(str, left.shape))}]"
+                joined_shape = f"[{', '.join(map(str, (*left.shape, 4)))}]"
+                zero = f"tl.full({shape}, 0, {left.value}.dtype)"
+                value = (
+                    f"tl.reshape(tl.join(tl.join({left.value}, {third.info.value}), "
+                    f"tl.join({right.value}, {zero})), {joined_shape})"
+                )
+                # Match the joined value rank even without a row mask.
+                mask = (
+                    f"tl.reshape(tl.arange(0, 4) < 3, {[1] * len(left.shape) + [4]})"
+                    if mask == "None"
+                    else f"{mask} & (tl.arange(0, 4) < 3)"
+                )
+                width = 4
+            indent = first.line.removesuffix(first.line.lstrip())
+            line = (
+                f"{indent}tl.store({left.pointer} + tl.expand_dims({left.index}, -1)"
+                f" + tl.arange(0, {width}), {value}, {mask})"
+            )
+            combined[-1] = _CoalescedConcatStoreLine(line, *stores, kernel=self)
+            index += len(stores)
+        lines[:] = combined
 
     def device_assert_async(self, cond, msg) -> None:
         self.compute.writeline(f"tl.device_assert({cond}, {repr(msg)})")
@@ -7097,6 +7280,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         ):
             return
 
+        if config.triton.coalesce_concat_stores:
+            self._coalesce_concat_stores()
         loop_trees = [tree for tree in self.range_trees if tree.is_loop]
         if self.mix_order_reduction:
             if not self.persistent_reduction:
