@@ -107,5 +107,30 @@ TensorBase mean(Recorder& rec, const TensorBase& self, IntArrayRef dims, bool ke
   return result;
 }
 
+// std_var_kernel_impl for a floating self and result of its dtype
+TensorBase std_var(Recorder& rec, const TensorBase& self, IntArrayRef dims, double correction, bool keepdim, bool take_sqrt) {
+  const ScalarType dtype = self.scalar_type();
+  if (dtype != kHalf && dtype != kBFloat16 && dtype != kFloat && dtype != kDouble) {
+    decline(c10::str("a ", dtype, " var"));
+  }
+  TensorBase result;
+  auto iter = make_reduction(rec, result, self, dims, keepdim);
+  if (iter.numel() == 0) {
+    decline("an empty var");
+  }
+  // warn_invalid_degrees_of_freedom's warning is eager's
+  const double bound = std::floor(correction);
+  if (!(bound < 1e18) || iter.numel() / iter.num_output_elements() <= static_cast<int64_t>(bound)) {
+    decline("a var of degrees of freedom <= 0");
+  }
+  AT_DISPATCH_FLOATING_TYPES_AND2(kHalf, kBFloat16, dtype, "std_cuda", [&]() {
+    using accscalar_t = at::acc_type<scalar_t, true>;
+    using ops_t = at::native::WelfordOps<scalar_t, accscalar_t, int32_t, thrust::pair<scalar_t, scalar_t>>;
+    const Param<ops_t> ops(ops_t(static_cast<accscalar_t>(correction), take_sqrt));
+    gpu_reduce_kernel<scalar_t, scalar_t, 2>(rec, iter, ops, typename ops_t::acc_t{});
+  });
+  return result;
+}
+
 } // namespace at::cuda::host_trace
 #endif

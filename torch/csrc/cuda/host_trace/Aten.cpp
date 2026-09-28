@@ -5,6 +5,8 @@
 #include <torch/csrc/Exceptions.h>
 #include <torch/csrc/autograd/python_variable.h>
 
+#include <optional>
+#include <tuple>
 #include <variant>
 
 namespace torch::cuda::host_trace {
@@ -34,9 +36,9 @@ struct PyRecorder : ht::Recorder {
   py::module host_trace = py::module::import("torch.cuda._host_trace");
 };
 
-// (out, [(function, offsets, params, fields, grid, block, smem)]), each field
+// [(function, offsets, params, fields, grid, block, smem)], each field
 // (param, offset, width, value, is_pointer)
-py::tuple traced(const PyRecorder& rec, const at::TensorBase& out) {
+py::list records(const PyRecorder& rec) {
   py::list launches;
   for (const auto& r : rec.launches) {
     py::list params;
@@ -56,7 +58,19 @@ py::tuple traced(const PyRecorder& rec, const at::TensorBase& out) {
         py::make_tuple(r.block.x, r.block.y, r.block.z),
         r.smem));
   }
-  return py::make_tuple(at::Tensor(out), launches);
+  return launches;
+}
+
+// (out, records)
+py::tuple traced(const PyRecorder& rec, const at::TensorBase& out) {
+  return py::make_tuple(at::Tensor(out), records(rec));
+}
+
+// a multi-output op's ((outs...), records)
+template <class... T>
+py::tuple traced(const PyRecorder& rec, const std::tuple<T...>& outs) {
+  auto tensors = std::apply([](const auto&... o) { return py::make_tuple(at::Tensor(o)...); }, outs);
+  return py::make_tuple(tensors, records(rec));
 }
 
 } // namespace
@@ -107,6 +121,26 @@ void initHostTraceAtenBindings(py::module& m) {
   m.def("_cuda_hostTraceAmax", torch::wrap_pybind_function([](const at::Tensor& self, const std::vector<int64_t>& dims, bool keepdim) {
     PyRecorder rec;
     return traced(rec, ht::amax(rec, self, dims, keepdim));
+  }));
+  m.def("_cuda_hostTraceStdVar", torch::wrap_pybind_function([](const at::Tensor& self, const std::vector<int64_t>& dims, double correction, bool keepdim, bool take_sqrt) {
+    PyRecorder rec;
+    return traced(rec, ht::std_var(rec, self, dims, correction, keepdim, take_sqrt));
+  }));
+  m.def("_cuda_hostTraceSoftmax", torch::wrap_pybind_function([](const at::Tensor& self, int64_t dim, bool half_to_float) {
+    PyRecorder rec;
+    return traced(rec, ht::softmax(rec, self, dim, half_to_float));
+  }));
+  m.def("_cuda_hostTraceLogSoftmax", torch::wrap_pybind_function([](const at::Tensor& self, int64_t dim, bool half_to_float) {
+    PyRecorder rec;
+    return traced(rec, ht::log_softmax(rec, self, dim, half_to_float));
+  }));
+  m.def("_cuda_hostTraceLayerNorm", torch::wrap_pybind_function([](const at::Tensor& input, int64_t normalized_ndim, const std::optional<at::Tensor>& weight, const std::optional<at::Tensor>& bias, double eps) {
+    PyRecorder rec;
+    return traced(rec, ht::native_layer_norm(rec, input, normalized_ndim, weight.value_or(at::Tensor()), bias.value_or(at::Tensor()), eps));
+  }));
+  m.def("_cuda_hostTraceRmsNorm", torch::wrap_pybind_function([](const at::Tensor& input, int64_t normalized_ndim, const std::optional<at::Tensor>& weight, std::optional<double> eps) {
+    PyRecorder rec;
+    return traced(rec, ht::fused_rms_norm(rec, input, normalized_ndim, weight.value_or(at::Tensor()), eps));
   }));
 }
 

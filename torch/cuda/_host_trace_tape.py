@@ -620,7 +620,7 @@ class _Trace:
                     break
                 reasons.append(why)
             if provider is None and func in _TRACED_ATEN and not self.in_aten:
-                if (traced := self._traced_aten(func, args, kwargs, rets[0])) is not None:
+                if (traced := self._traced_aten(func, args, kwargs, rets)) is not None:
                     self.argument_pairs |= pairs
                     return traced
         if provider is not None:
@@ -689,12 +689,18 @@ class _Trace:
             return result[0]
         return type(out)(result) if result else None  # a tuple or a structseq
 
-    def _traced_aten(self, func: OpOverload, args: tuple, kwargs: dict, fake: torch.Tensor) -> Any:
-        """func's traced ATen host (_TRACED_ATEN): its output,
+    def _traced_aten(self, func: OpOverload, args: tuple, kwargs: dict, fakes: list) -> Any:
+        """func's traced ATen host (_TRACED_ATEN): its output (a tuple for more than one),
         allocated through this trace, and its kernels as KernelLaunches; None
         where the host declines, which leaves the call to EagerCall."""
+        from torch._native.registry import _aten_override_libs
         from torch.cuda._host_trace_launch import KernelLaunch
 
+        # a torch._native override (CuTe DSL, Triton) routes the op on CUDA, so
+        # eager may not run the ATen kernel the traced host mirrors
+        name = func._schema.name.split("::")[1]
+        if {(name, "CUDA"), (f"{name}.{func._overloadname}", "CUDA")} & _aten_override_libs.keys():
+            return None
         rest = func._schema.arguments[len(args) :]
         args = (*args, *(kwargs.get(a.name, a.default_value) for a in rest))
         if any(isinstance(a, (torch.Tensor, *_SYM_TYPES)) and not isinstance(a, _TracedTensor) for a in args):
@@ -713,16 +719,18 @@ class _Trace:
             return None
         finally:
             self.in_aten = False
-        if not isinstance(out, _TracedTensor):
-            raise AssertionError(f"{func}'s traced host returned a {type(out)}")
-        # a size-1 dim's stride is layout-free, and the fake's may differ from
-        # eager's there; the traced host's is eager's
-        pairs = [*zip(out.shape, fake.shape), (out._sym_offset, fake.storage_offset())]
-        pairs += [(a, b) for a, b, n in zip(out._sym_strides, fake.stride(), fake.shape) if n != 1]
-        if out.dtype != fake.dtype or out.dim() != fake.dim() or not _guard_each([a == b for a, b in pairs]):
-            raise AssertionError(f"{func}'s traced host allocated {out!r}, its meta {fake.dtype} {fake.shape} {fake.stride()}")
+        outs = out if isinstance(out, tuple) else (out,)
+        for o, fake in zip(outs, fakes, strict=True):
+            if not isinstance(o, _TracedTensor):
+                raise AssertionError(f"{func}'s traced host returned a {type(o)}")
+            # a size-1 dim's stride is layout-free, and the fake's may differ from
+            # eager's there; the traced host's is eager's
+            pairs = [*zip(o.shape, fake.shape), (o._sym_offset, fake.storage_offset())]
+            pairs += [(a, b) for a, b, n in zip(o._sym_strides, fake.stride(), fake.shape) if n != 1]
+            if o.dtype != fake.dtype or o.dim() != fake.dim() or not _guard_each([a == b for a, b in pairs]):
+                raise AssertionError(f"{func}'s traced host allocated {o!r}, its meta {fake.dtype} {fake.shape} {fake.stride()}")
         made = [a.root for a in self.allocs[marks[0] :]]
-        roots = tuple({id(r): r for r in (*(t._root for t in (*tensors, out)), *made)}.values())
+        roots = tuple({id(r): r for r in (*(t._root for t in (*tensors, *outs)), *made)}.values())
         for function, offsets, params, fields, grid, block, smem in records:
             places, values, is_pointer = [], [], []
             for param, offset, width, value, pointer in fields:
@@ -923,6 +931,13 @@ def _add(a: torch.Tensor, b: torch.Tensor, alpha: Any) -> Any:
     return torch._C._cuda_hostTraceAdd(a, b, alpha)
 
 
+def _std_var(x: torch.Tensor, dim: list[int] | None, correction: Any, keepdim: bool, take_sqrt: bool) -> Any:
+    correction = 1 if correction is None else correction
+    if type(correction) not in (int, float):
+        raise NotImplementedError("a var of a non-number correction")
+    return torch._C._cuda_hostTraceStdVar(x, dim or [], float(correction), keepdim, take_sqrt)
+
+
 def _to_copy(x: torch.Tensor, dtype: Any, layout: Any, device: Any, pin_memory: Any, non_blocking: bool, memory_format: Any) -> Any:
     if layout not in (None, torch.strided) or device not in (None, x.device) or pin_memory:
         raise NotImplementedError("a _to_copy to another layout or device, or pinned")
@@ -945,6 +960,12 @@ _TRACED_ATEN: dict[OpOverload, Callable[..., Any]] = {
     aten.mean.default: lambda x, dtype: _reduce(torch._C._cuda_hostTraceMean, x, [], False, dtype),
     aten.mean.dim: lambda x, dim, keepdim, dtype: _reduce(torch._C._cuda_hostTraceMean, x, dim, keepdim, dtype),
     aten.amax.default: lambda x, dim, keepdim: _reduce(torch._C._cuda_hostTraceAmax, x, dim, keepdim),
+    aten.var.correction: lambda x, dim, correction, keepdim: _std_var(x, dim, correction, keepdim, False),
+    aten.std.correction: lambda x, dim, correction, keepdim: _std_var(x, dim, correction, keepdim, True),
+    aten._softmax.default: lambda x, dim, half_to_float: torch._C._cuda_hostTraceSoftmax(x, dim, half_to_float),
+    aten._log_softmax.default: lambda x, dim, half_to_float: torch._C._cuda_hostTraceLogSoftmax(x, dim, half_to_float),
+    aten.native_layer_norm.default: lambda x, shape, w, b, eps: torch._C._cuda_hostTraceLayerNorm(x, len(shape), w, b, eps),
+    aten._fused_rms_norm.default: lambda x, shape, w, eps: torch._C._cuda_hostTraceRmsNorm(x, len(shape), w, eps),
 }
 
 _ALLOC_OPS = {

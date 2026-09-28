@@ -1,5 +1,7 @@
 # Owner(s): ["module: cuda graphs"]
 
+import contextlib
+import gc
 import unittest
 
 import torch
@@ -64,6 +66,42 @@ REDUCTIONS = {
 }
 
 
+# name: (fn of h, operand shapes as CASES', WelfordOps bytes or None for a
+# kernel of scalar and pointer parameters); rms_norm's normalized_shape is ints,
+# which its composite reads as int64_t
+NORMS = {
+    "softmax": (lambda h: lambda x: torch.softmax(x, -1), ("mh",), None),
+    "log_softmax": (lambda h: lambda x: torch.log_softmax(x, -1), ("mh",), None),
+    "softmax_to_float": (lambda h: lambda x: torch.softmax(x, -1, dtype=torch.float32), ("mh",), None),
+    "var": (lambda h: lambda x: torch.var(x, -1), ("mh",), 5),
+    "std_keepdim": (lambda h: lambda x: torch.std(x, -1, keepdim=True, correction=0), ("mh",), 5),
+    "var_first": (lambda h: lambda x: torch.var(x, 0, correction=0), ("mh",), 5),
+    "var_all": (lambda h: torch.var, ("mh",), 5),
+    "layer_norm": (lambda h: lambda x, w, b: F.layer_norm(x, x.shape[-1:], w, b), ("mh", "h", "h"), None),
+    "layer_norm_no_affine": (lambda h: lambda x: F.layer_norm(x, x.shape[-1:]), ("mh",), None),
+    "rms_norm": (lambda h: lambda x, w: F.rms_norm(x, (h,), w), ("mh", "h"), None),
+    "rms_norm_no_weight": (lambda h: lambda x: F.rms_norm(x, (h,)), ("mh",), None),
+}
+
+
+@contextlib.contextmanager
+def _no_native_rms_norm():
+    # torch._native routes _fused_rms_norm to a CuTe DSL kernel where
+    # nvidia-cutlass-dsl is installed; without it eager runs the ATen kernel
+    from torch._native import registry
+
+    registry.deregister_op_overrides(disable_op_symbols="_fused_rms_norm")
+    try:
+        yield
+    finally:
+        registry.reenable_op_overrides(enable_op_symbols="_fused_rms_norm")
+
+
+def _norm_inputs(case, m, h, dtype):
+    shapes = {"mh": (m, h), "h": (h,)}
+    return [torch.randn(shapes[s], device="cuda", dtype=dtype) for s in NORMS[case][1]]
+
+
 # bytes of ReduceConfig, OffsetCalculator<1, uint32_t> and OffsetCalculator<2, uint32_t>
 REDUCE_CONFIG_BYTES, OFFSET_CALC_1_BYTES, OFFSET_CALC_2_BYTES = 64, 404, 504
 # OffsetCalculator<N>: dims, then sizes_ (MAX_DIMS IntDividers), then strides_
@@ -87,13 +125,18 @@ DECLINES = {
     "python_scalar": (lambda x: x + 2, lambda x, y: (x,), [EagerCall]),
     "integer_rsqrt": (torch.rsqrt, lambda x, y: (x.long(),), [EagerCall]),
     "shared_root_copy": (_shared_root_copy, lambda x, y: (x,), [KernelLaunch, EagerCall]),
+    "softmax_inner": (lambda x: torch.softmax(x, 0), lambda x, y: (x,), [EagerCall]),
+    "softmax_strided": (lambda x: torch.softmax(x.t(), -1), lambda x, y: (x,), [EagerCall]),
+    "var_no_dof": (lambda x: torch.var(x[:1], 0), lambda x, y: (x,), [EagerCall]),
+    "layer_norm_strided": (lambda x: F.layer_norm(x.t(), (64,)), lambda x, y: (x,), [EagerCall]),
 }
 
 
-def _reduce_unread(functor_bytes: int, arg_bytes: int) -> set[tuple[int, int]]:
+def _reduce_unread(functor_bytes: int, arg_bytes: int, arg_align: int | None = None) -> set[tuple[int, int]]:
     # (param, byte) of a ReduceOp that eager copies from stack garbage despite
     # the harvest memset: an empty ops functor's byte and the struct padding
-    ident = -(-max(functor_bytes, 1) // arg_bytes) * arg_bytes
+    arg_align = arg_align or arg_bytes
+    ident = -(-max(functor_bytes, 1) // arg_align) * arg_align
     config = -(-(ident + arg_bytes) // 4) * 4
     calcs_end = config + REDUCE_CONFIG_BYTES + OFFSET_CALC_1_BYTES + OFFSET_CALC_2_BYTES
     src = -(-calcs_end // 8) * 8
@@ -228,6 +271,8 @@ class TestHostTraceAten(TestCase):
         self.assertEqual(entry.eager, 0)
 
     def _assert_replays_like_eager(self, entry, fn, x):
+        # a collection inside the window frees an earlier test's garbage
+        gc.collect()
         torch.cuda.synchronize()
         base = torch.cuda.memory_allocated()
         torch.cuda.reset_peak_memory_stats()
@@ -284,6 +329,82 @@ class TestHostTraceAten(TestCase):
             else:
                 self._assert_launch_matches(launch, node, set(unread))
 
+    def _assert_norm_replays_like_eager(self, entry, fn, args):
+        gc.collect()
+        torch.cuda.synchronize()
+        base = torch.cuda.memory_allocated()
+        torch.cuda.reset_peak_memory_stats()
+        out = entry(*args)
+        torch.cuda.synchronize()
+        replay_peak = torch.cuda.max_memory_allocated() - base
+        ref = fn(*args)
+        self.assertEqual(out, ref, atol=0, rtol=0)
+        self.assertEqual(out.stride(), ref.stride())
+        del out, ref
+        torch.cuda.reset_peak_memory_stats()
+        fn(*args)
+        torch.cuda.synchronize()
+        self.assertEqual(replay_peak, torch.cuda.max_memory_allocated() - base)
+
+    @parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32, torch.float64])
+    @parametrize("case", list(NORMS))
+    def test_norm_replays_new_shapes(self, dtype, case):
+        self.enterContext(_no_native_rms_norm())
+        # h 4096 is softmax's cunn_SoftMaxForwardReg, h 768 its persistent kernel
+        for h in (4096, 768):
+            fn = NORMS[case][0](h)
+            entry = HostTraceReplay(fn)
+            for m in (64, 200, 7, 1):
+                self._assert_norm_replays_like_eager(entry, fn, _norm_inputs(case, m, h, dtype))
+            # at most one variant for m > 1 and one for m == 1, and for a
+            # global var one more where it splits across CTAs
+            self.assertLessEqual(entry.traces, 3 if case == "var_all" else 2)
+            self.assertEqual(entry.eager, 0)
+            args = _norm_inputs(case, 64, h, dtype)
+            self.assertTrue(all(isinstance(c, (KernelLaunch, Memset)) for _, c in trace(fn, tuple(args)).launches))
+
+    @parametrize("dtype", [torch.float16, torch.float32])
+    @parametrize(
+        "case, sizes",
+        [
+            ("softmax", ((64, 600), (7, 700), (129, 1000), (300, 513))),
+            ("log_softmax", ((64, 2100), (3, 3000), (129, 2049))),
+            ("softmax_to_float", ((64, 20), (7, 17), (5, 31))),
+            ("layer_norm", ((64, 768), (7, 1024), (129, 4096), (300, 20000))),
+            ("layer_norm_no_affine", ((64, 767), (7, 1023), (129, 4095))),
+            ("var", ((64, 768), (2, 768), (37, 96), (129, 4096), (600, 200))),
+        ],
+    )
+    def test_norm_one_trace_across_sizes(self, dtype, case, sizes):
+        self.enterContext(_no_native_rms_norm())
+        # sizes that change only launch dims and size parameters: rows, and
+        # a softmax's dim within its kernel's log2 bracket or register count
+        fn = NORMS[case][0](None)
+        entry = HostTraceReplay(fn)
+        for m, h in sizes:
+            self._assert_norm_replays_like_eager(entry, fn, _norm_inputs(case, m, h, dtype))
+        self.assertEqual((entry.traces, entry.eager), (1, 0))
+
+    @parametrize("dtype", [torch.float16, torch.float32])
+    @parametrize("case", list(NORMS))
+    @parametrize("m", [64, 7, 1])
+    @parametrize("h", [4096, 768, 20000, 1022])
+    def test_norm_records_match_eager(self, dtype, case, m, h):
+        self.enterContext(_no_native_rms_norm())
+        make, _, welford_bytes = NORMS[case]
+        fn, args = make(h), _norm_inputs(case, m, h, dtype)
+        unread = set() if welford_bytes is None else _reduce_unread(welford_bytes, 16, 4)
+        launches = [c for _, c in trace(fn, tuple(args)).launches]
+        with _zero_init():
+            nodes = capture_kernel_nodes(lambda s: fn(*args))
+        kinds = [Memset if isinstance(n, MemsetNode) else KernelLaunch for n in nodes]
+        self.assertEqual([type(c) for c in launches], kinds)
+        for launch, node in zip(launches, nodes):
+            if isinstance(node, MemsetNode):
+                self.assertEqual(launch.value, node.value)
+            else:
+                self._assert_launch_matches(launch, node, set(unread))
+
     @parametrize("case", list(DECLINES))
     def test_decline_is_an_eager_call(self, case):
         x = torch.randn(64, 4096, device="cuda", dtype=torch.float16)
@@ -295,6 +416,36 @@ class TestHostTraceAten(TestCase):
         entry = HostTraceReplay(fn)
         entry(*args)
         self.assertEqual(entry(*args), fn(*args), atol=0, rtol=0)
+
+    def test_rms_norm_under_a_native_override_is_an_eager_call(self):
+        from torch._native.registry import _aten_override_libs
+
+        if ("_fused_rms_norm", "CUDA") not in _aten_override_libs:
+            self.skipTest("no torch._native _fused_rms_norm override")
+        fn = NORMS["rms_norm"][0](768)
+        args = _norm_inputs("rms_norm", 64, 768, torch.float16)
+        self.assertEqual([type(c) for _, c in trace(fn, tuple(args)).launches], [EagerCall])
+
+    @parametrize("native", [False, True])
+    def test_rms_norm_of_a_symbolic_shape_replays(self, native):
+        # rms_norm hands _fused_rms_norm (int[] normalized_shape) the traced
+        # symbolic size, which an eager call replays with
+        from torch._native.registry import _aten_override_libs
+
+        if native and ("_fused_rms_norm", "CUDA") not in _aten_override_libs:
+            self.skipTest("no torch._native _fused_rms_norm override")
+
+        def fn(x, w):
+            return F.rms_norm(x, x.shape[-1:], w, 1e-6) * 2
+
+        w = torch.randn(768, device="cuda", dtype=torch.float16)
+        with contextlib.nullcontext() if native else _no_native_rms_norm():
+            entry = HostTraceReplay(fn)
+            for m in (64, 7, 300):
+                x = torch.randn(m, 768, device="cuda", dtype=torch.float16)
+                self.assertEqual(entry(x, w), fn(x, w), atol=0, rtol=0)
+            # the torch._native override's Python host guards on the row count
+            self.assertEqual(entry.traces, 3 if native else 1)
 
     def test_copy_between_arguments_checks_overlap_at_replay(self):
         # arguments disjoint at the trace share storage at the third call: the
