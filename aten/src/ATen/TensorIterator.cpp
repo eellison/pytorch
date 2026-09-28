@@ -479,7 +479,7 @@ StrideVector TensorIteratorBase::compatible_stride(int64_t element_size) const {
 }
 
 DimVector TensorIteratorBase::invert_perm(IntArrayRef input) const {
-  return ti_build::invert_perm(perm_, input, has_coalesced_dimensions_);
+  return ti_build::invert_perm(shape_, perm_, input, has_coalesced_dimensions_);
 }
 
 void TensorIteratorBase::allocate_or_resize_outputs() {

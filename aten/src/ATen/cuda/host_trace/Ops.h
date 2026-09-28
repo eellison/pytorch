@@ -1,5 +1,6 @@
 // Traced hosts of ATen ops (Recorder.h): the op's output, allocated through the
-// dispatcher, and its launches in rec.
+// dispatcher, and its launches in rec. Each is defined in its kernel's .cu, so
+// it names that TU's kernel instantiation, which is the one eager launches.
 #pragma once
 #include <ATen/cuda/host_trace/Recorder.h>
 

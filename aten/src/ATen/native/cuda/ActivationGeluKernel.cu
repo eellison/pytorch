@@ -15,8 +15,10 @@
 #include <ATen/cuda/ApplyGridUtils.cuh>
 #include <ATen/cuda/detail/OffsetCalculator.cuh>
 #include <ATen/native/cuda/Loops.cuh>
+#if !defined(USE_ROCM)
 #include <ATen/cuda/host_trace/LoopsSym.cuh>
 #include <ATen/cuda/host_trace/Ops.h>
+#endif
 
 namespace at::native {
 namespace {
@@ -102,11 +104,16 @@ void GeluBackwardCUDAKernelImpl(TensorIteratorBase& it, GeluType approximate) {
 
 } // namespace at::native
 
+#if !defined(USE_ROCM)
+// Traced host (ATen/cuda/host_trace/Ops.h)
 namespace at::cuda::host_trace {
 
 TensorBase gelu(Recorder& rec, const TensorBase& a, std::string_view approximate) {
   const bool tanh = at::native::get_gelutype_enum(approximate) == at::native::GeluType::Tanh;
   auto iter = TensorIteratorSym::unary_op(rec, a);
+  if (isComplexType(iter.dtype(0))) {
+    decline("complex gelu");
+  }
   AT_DISPATCH_FLOATING_TYPES_AND2(kHalf, kBFloat16, iter.dtype(0), "GeluCUDAKernelImpl", [&]() {
     if (tanh) {
       gpu_kernel(rec, iter, at::native::GeluTanhFunctor<scalar_t>());
@@ -118,3 +125,4 @@ TensorBase gelu(Recorder& rec, const TensorBase& a, std::string_view approximate
 }
 
 } // namespace at::cuda::host_trace
+#endif

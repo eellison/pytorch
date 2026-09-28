@@ -1,9 +1,7 @@
 // gpu_reduce_kernel for a traced host: Reduce.cuh's ReduceConfig,
 // setReduceConfig and launch over a TensorIteratorSym, recording the launch of
-// the reduce_kernel eager launches. Each host decision is eager's, a guard where
-// it reads a size or an address. The block dimensions are guarded to their
-// power-of-two brackets, so a variant's block and shared memory are constants
-// and its grid and ReduceConfig sizes are expressions.
+// the reduce_kernel eager launches. Block dimensions are guarded to their
+// power-of-two brackets, so block and shared memory are per-variant constants.
 #pragma once
 #include <ATen/cuda/host_trace/LoopsSym.cuh>
 #include <ATen/native/cuda/Reduce.cuh>
@@ -147,7 +145,8 @@ void set_input_calculator(Recorder& rec, Param<K>& p, ::OffsetCalculator<1>& cal
   set_offset_calculator(rec, p, calc, num_reduce_dims, iter.shape().data(), strides.data());
 }
 
-// each n % vec_size of eager's on n / sizeof(scalar_t) is on n bytes here
+// eager tests (n / sizeof(scalar_t)) % vec_size; n % (vec_size * sizeof(scalar_t))
+// is the same test, exact on SymInt
 template <typename scalar_t>
 int get_output_vec_size(const TensorIteratorSym& iter) {
   int vec_size = 4;
@@ -225,11 +224,7 @@ ReduceConfig setReduceConfig(const TensorIteratorSym& iter) {
     config.output_mult[0] = config.split_output(block_width);
   }
 
-#ifdef USE_ROCM
-  constexpr int min_values_per_thread = 128;
-#else
   constexpr int min_values_per_thread = 16;
-#endif
   constexpr int max_values_per_thread = 256;
 
   const int warp_split_threshold = std::min<int>(block_height * 16, max_values_per_thread);
@@ -253,9 +248,6 @@ ReduceConfig setReduceConfig(const TensorIteratorSym& iter) {
     // std::clamp(ctas_per_output1, ctas_per_output3, ctas_per_output2), as ctas_per_output3 <= ctas_per_output2
     config.ctas_per_output = ctas_per_output3.max(ctas_per_output1.min(ctas_per_output2));
     if (config.ctas_per_output > 1) {
-#ifdef USE_ROCM
-      config.ctas_per_output = config.ctas_per_output.max(64);
-#endif
       config.input_mult[2] = config.split_input(config.ctas_per_output);
     }
   }
@@ -292,12 +284,12 @@ void gpu_reduce_kernel(Recorder& rec, const TensorIteratorSym& iter, const Param
   TensorBase buffer;
   TensorBase semaphores;
   if (config.should_global_reduce()) {
-    std::tie(buffer, semaphores) = reduce_buffers(config.global_memory_size(), config.semaphore_size(), iter.common_device_);
+    std::tie(buffer, semaphores) = reduce_buffers(config.global_memory_size(), config.semaphore_size(), iter.device());
   }
 
   using reduce_op_t = at::native::ReduceOp<scalar_t, ops_t, uint32_t, out_scalar_t, vt0, input_vec_size>;
   Param<reduce_op_t> reduce;
-  reduce_op_t& r = reduce.pod();
+  reduce_op_t& r = reduce.value();
   reduce.set(r.ops, ops);
   r.ident = ident;
   r.config.element_size_bytes = config.element_size_bytes;

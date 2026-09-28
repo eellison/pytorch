@@ -49,10 +49,8 @@ CASES = {
 }
 
 
-# name: (fn over an (m, h) input, most traces over the m and h sweep, ops
-# functor bytes, whether the accumulator is the input dtype); the block is
-# guarded to the power-of-two brackets of its extents below 512, so the
-# sweep's 150 and 5 reuse 200's and 7's block
+# name: (fn over an (m, h) input, max traces over the sweep, ops functor bytes,
+# whether the accumulator is the input dtype)
 REDUCTIONS = {
     f"{op.__name__}_{form}": (lambda x, op=op, f=f: f(op, x), traces, ops, same)
     for op, ops, same in ((torch.sum, 0, False), (torch.mean, 4, False), (torch.amax, 0, True))
@@ -66,12 +64,38 @@ REDUCTIONS = {
 }
 
 
+# bytes of ReduceConfig, OffsetCalculator<1, uint32_t> and OffsetCalculator<2, uint32_t>
+REDUCE_CONFIG_BYTES, OFFSET_CALC_1_BYTES, OFFSET_CALC_2_BYTES = 64, 404, 504
+# OffsetCalculator<N>: dims, then sizes_ (MAX_DIMS IntDividers), then strides_
+# (MAX_DIMS x N uint32)
+OFFSET_CALC_STRIDES_AT, OFFSET_CALC_STRIDES_BYTES_PER_OPERAND = 304, 100
+
+
+def _shared_root_copy(x):
+    t = x * x
+    return t[:32].copy_(t[32:])
+
+
+# name: (fn, args from (x f16 [64, 4096], y f32 [4096]), the tape's step types)
+DECLINES = {
+    "integer_sum": (lambda x: x.sum(-1), lambda x, y: (x.long(),), [EagerCall]),
+    "sum_with_dtype": (lambda x: x.sum(-1, dtype=torch.float32), lambda x, y: (x,), [EagerCall]),
+    "double_mean": (lambda x: x.mean(-1), lambda x, y: (x.double(),), [EagerCall]),
+    "empty_sum": (lambda x: x[:0].sum(-1), lambda x, y: (x,), [EagerCall]),
+    "mixed_dtypes": (silu_mul, lambda x, y: (x, y), [KernelLaunch, EagerCall]),
+    "memcpy_clone": (torch.clone, lambda x, y: (x,), [EagerCall]),
+    "python_scalar": (lambda x: x + 2, lambda x, y: (x,), [EagerCall]),
+    "integer_rsqrt": (torch.rsqrt, lambda x, y: (x.long(),), [EagerCall]),
+    "shared_root_copy": (_shared_root_copy, lambda x, y: (x,), [KernelLaunch, EagerCall]),
+}
+
+
 def _reduce_unread(functor_bytes: int, arg_bytes: int) -> set[tuple[int, int]]:
     # (param, byte) of a ReduceOp that eager copies from stack garbage despite
     # the harvest memset: an empty ops functor's byte and the struct padding
     ident = -(-max(functor_bytes, 1) // arg_bytes) * arg_bytes
     config = -(-(ident + arg_bytes) // 4) * 4
-    calcs_end = config + 64 + 404 + 504
+    calcs_end = config + REDUCE_CONFIG_BYTES + OFFSET_CALC_1_BYTES + OFFSET_CALC_2_BYTES
     src = -(-calcs_end // 8) * 8
     skipped = [
         *range(functor_bytes, ident),
@@ -104,7 +128,8 @@ def _unread(node: KernelNode, launch: KernelLaunch, functor_bytes: int) -> set[t
     at = 8 * n + (-(-n // 4) * 4 if cast else 0)
     image = node.images[1]
     dims = int.from_bytes(image[at : at + 4], "little")
-    sizes, strides, end = at + 4, at + 304, at + 304 + 100 * n
+    sizes, strides = at + 4, at + OFFSET_CALC_STRIDES_AT
+    end = strides + OFFSET_CALC_STRIDES_BYTES_PER_OPERAND * n
     skipped = [
         *range(9 * n if cast else at, at),
         *range(sizes + 12 * dims, strides),
@@ -116,7 +141,7 @@ def _unread(node: KernelNode, launch: KernelLaunch, functor_bytes: int) -> set[t
 
 @unittest.skipIf(not TEST_CUDA, "requires CUDA")
 @requires_cuda_python_bindings
-@unittest.skipIf(not hasattr(torch._C, "_cuda_hostTraceAten"), "needs traced hosts")
+@unittest.skipIf(not hasattr(torch._C, "_cuda_hostTraceMul"), "needs traced hosts")
 class TestHostTraceAten(TestCase):
     @parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
     @parametrize("case", list(CASES))
@@ -132,8 +157,10 @@ class TestHostTraceAten(TestCase):
                 out = entry(*args)
                 torch.cuda.synchronize()
                 replay_peak = torch.cuda.max_memory_allocated() - base
-                self.assertEqual(out, fn(*args), atol=0, rtol=0)
-                del out
+                ref = fn(*args)
+                self.assertEqual(out, ref, atol=0, rtol=0)
+                self.assertEqual(out.stride(), ref.stride())
+                del out, ref
                 torch.cuda.reset_peak_memory_stats()
                 fn(*args)
                 torch.cuda.synchronize()
@@ -189,8 +216,10 @@ class TestHostTraceAten(TestCase):
                 out = entry(x)
                 torch.cuda.synchronize()
                 replay_peak = torch.cuda.max_memory_allocated() - base
-                self.assertEqual(out, fn(x), atol=0, rtol=0)
-                del out
+                ref = fn(x)
+                self.assertEqual(out, ref, atol=0, rtol=0)
+                self.assertEqual(out.stride(), ref.stride())
+                del out, ref
                 torch.cuda.reset_peak_memory_stats()
                 fn(x)
                 torch.cuda.synchronize()
@@ -218,44 +247,55 @@ class TestHostTraceAten(TestCase):
             else:
                 self._assert_launch_matches(launch, node, set(unread))
 
-    @parametrize(
-        "case",
-        [
-            "integer_sum",
-            "sum_with_dtype",
-            "double_mean",
-            "empty_sum",
-            "mixed_dtypes",
-            "memcpy_clone",
-            "python_scalar",
-            "integer_rsqrt",
-            "shared_root_copy",
-        ],
-    )
+    @parametrize("case", list(DECLINES))
     def test_decline_is_an_eager_call(self, case):
         x = torch.randn(64, 4096, device="cuda", dtype=torch.float16)
         y = torch.randn(4096, device="cuda", dtype=torch.float32)
-
-        def shared_root_copy(x, y):
-            t = x * x
-            return t[:32].copy_(t[32:])
-
-        fn, args, kinds = {
-            "integer_sum": (lambda x: x.sum(-1), (x.long(),), [EagerCall]),
-            "sum_with_dtype": (lambda x: x.sum(-1, dtype=torch.float32), (x,), [EagerCall]),
-            "double_mean": (lambda x: x.mean(-1), (x.double(),), [EagerCall]),
-            "empty_sum": (lambda x: x[:0].sum(-1), (x,), [EagerCall]),
-            "mixed_dtypes": (silu_mul, (x, y), [KernelLaunch, EagerCall]),
-            "memcpy_clone": (torch.clone, (x,), [EagerCall]),
-            "python_scalar": (lambda x: x + 2, (x,), [EagerCall]),
-            "integer_rsqrt": (torch.rsqrt, (x.long(),), [EagerCall]),
-            "shared_root_copy": (shared_root_copy, (x, y), [KernelLaunch, EagerCall]),
-        }[case]
+        fn, args_fn, kinds = DECLINES[case]
+        args = args_fn(x, y)
         tape = trace(fn, args)
         self.assertEqual([type(c) for _, c in tape.launches], kinds)
         entry = HostTraceReplay(fn)
         entry(*args)
         self.assertEqual(entry(*args), fn(*args), atol=0, rtol=0)
+
+    def test_copy_between_arguments_checks_overlap_at_replay(self):
+        # the tape keys layouts, not addresses: arguments distinct at the trace
+        # share storage at the third call, where eager's copy_ raises
+        def pair(shared):
+            buf = torch.arange(64 * 64 + 4, device="cuda", dtype=torch.float32)
+            dst = buf[:4096] if shared else torch.zeros(4096, device="cuda")
+            return dst.view(64, 64).t(), buf[4:].view(64, 64)
+
+        def fn(dst, src):
+            return dst.copy_(src)
+
+        self.assertEqual([type(c) for _, c in trace(fn, pair(False)).launches], [EagerCall])
+        entry = HostTraceReplay(fn)
+        for _ in range(2):
+            self.assertEqual(entry(*pair(False)), fn(*pair(False)), atol=0, rtol=0)
+        overlap = "refer to a single memory location"
+        with self.assertRaisesRegex(RuntimeError, overlap):
+            fn(*pair(True))
+        with self.assertRaisesRegex(RuntimeError, overlap):
+            entry(*pair(True))
+        self.assertEqual(entry.traces, 1)
+
+    def test_size_one_dim_strides_follow_eager(self):
+        # x [1, h] has strides (1, 1): eager's output keeps stride 1 on the
+        # size-1 dim, where the fake's is h
+        def fn(x, r):
+            return x.float() * r
+
+        entry = HostTraceReplay(fn)
+        for h in (64, 4096, 768):
+            x = torch.randn(h, 1, device="cuda", dtype=torch.bfloat16).t()
+            r = torch.ones(1, 1, device="cuda")
+            out, ref = entry(x, r), fn(x, r)
+            self.assertEqual(out, ref, atol=0, rtol=0)
+            self.assertEqual(out.stride(), ref.stride())
+        self.assertEqual(entry.eager, 0)
+        self.assertTrue(all(isinstance(c, KernelLaunch) for _, c in trace(fn, (x, r)).launches))
 
 
 instantiate_parametrized_tests(TestHostTraceAten)

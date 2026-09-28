@@ -17,8 +17,10 @@
 #include <c10/cuda/CUDAMathCompat.h>
 #include <c10/core/Scalar.h>
 #include <c10/util/complex.h>
+#if !defined(USE_ROCM)
 #include <ATen/cuda/host_trace/LoopsSym.cuh>
 #include <ATen/cuda/host_trace/Ops.h>
+#endif
 
 namespace at::native {
 
@@ -292,6 +294,8 @@ REGISTER_DISPATCH(frexp_stub, &frexp_kernel_cuda)
 
 } // namespace at::native
 
+#if !defined(USE_ROCM)
+// Traced host (ATen/cuda/host_trace/Ops.h)
 namespace at::cuda::host_trace {
 
 TensorBase rsqrt(Recorder& rec, const TensorBase& a) {
@@ -306,3 +310,4 @@ TensorBase rsqrt(Recorder& rec, const TensorBase& a) {
 }
 
 } // namespace at::cuda::host_trace
+#endif

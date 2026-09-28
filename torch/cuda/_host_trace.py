@@ -259,6 +259,8 @@ def bit_length(x: IntLikeType) -> IntLikeType:
         return x.bit_length()
     node = x.node
     env, hint = node.shape_env, node.hint
+    if hint is None:
+        raise NotImplementedError("host_trace: the bit length of an unbacked size")
     # pyrefly: ignore [missing-attribute]
     return env.create_symintnode(BitLength(node.expr), hint=hint.bit_length())
 
@@ -283,5 +285,7 @@ def f32_div(a: IntLikeType, b: IntLikeType) -> IntLikeType:
     env = node.shape_env
     exprs = [sympy.Integer(x) if isinstance(x, int) else x.node.expr for x in (a, b)]
     hints = [x if isinstance(x, int) else x.node.hint for x in (a, b)]
+    if None in hints:
+        raise NotImplementedError("host_trace: a float division of an unbacked size")
     # pyrefly: ignore [missing-attribute]
     return env.create_symintnode(F32Div(*exprs), hint=f32_bits(*hints))

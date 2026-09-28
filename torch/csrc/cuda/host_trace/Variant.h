@@ -43,7 +43,7 @@ extern int64_t buffered_runs;
 // the opaque harvest's torch._C._cuda_hostTrace* calls
 void initHarvestBindings(py::module& m);
 #endif
-// torch._C._cuda_hostTraceAten, the traced hosts of ATen ops
+// torch._C._cuda_hostTrace<Op>, the traced hosts of ATen ops
 void initHostTraceAtenBindings(py::module& m);
 
 // One call's state; a call from inside an eager step has its own

@@ -20,6 +20,7 @@ ${native_declaration}
 ${native_definitions}
 }} // namespace at::native
 
-#if __has_include(<ATen/cuda/host_trace/UfuncCUDA_${name}.cuh>)
+// the ufunc's traced host (ATen/cuda/host_trace), if it has one
+#if !defined(USE_ROCM) && __has_include(<ATen/cuda/host_trace/UfuncCUDA_${name}.cuh>)
 #include <ATen/cuda/host_trace/UfuncCUDA_${name}.cuh>
 #endif

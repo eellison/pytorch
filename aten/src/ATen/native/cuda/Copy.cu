@@ -10,8 +10,10 @@
 #include <ATen/native/Copy.h>
 #include <ATen/native/TensorIterator.h>
 #include <ATen/native/cuda/Loops.cuh>
+#if !defined(USE_ROCM)
 #include <ATen/cuda/host_trace/LoopsSym.cuh>
 #include <ATen/cuda/host_trace/Ops.h>
+#endif
 
 #ifndef AT_PER_OPERATOR_HEADERS
 #include <ATen/Functions.h>
@@ -504,6 +506,8 @@ REGISTER_DISPATCH(copy_stub, &copy_kernel_cuda)
 
 } // namespace at::native
 
+#if !defined(USE_ROCM)
+// Traced host (ATen/cuda/host_trace/Ops.h)
 namespace at::cuda::host_trace {
 
 // copy_impl and copy_device_to_device on one GPU; a memcpy is not a kernel
@@ -525,6 +529,7 @@ TensorBase copy_(Recorder& rec, const TensorBase& dst, const TensorBase& src) {
       decline(c10::str("a copy of a ", t, " tensor"));
     }
   }
+  // direct_copy_kernel_cuda's dtype ladder
   using at::native::CastCopyFunctor;
   if (from == kFloat && to == kBFloat16) {
     gpu_kernel_nocast(rec, iter, CastCopyFunctor<float, BFloat16>());
@@ -549,3 +554,4 @@ TensorBase to_copy(Recorder& rec, const TensorBase& src, ScalarType dtype, Memor
 }
 
 } // namespace at::cuda::host_trace
+#endif

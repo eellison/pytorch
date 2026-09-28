@@ -11,6 +11,7 @@ from torch.cuda._host_trace_program import (
     _read_leaf,
     _step,
     compile_program,
+    f32_bits,
     IntegerProgram,
     LEAVES,
     MAX_I64,
@@ -82,6 +83,11 @@ CASES = [
     ("lshift", (1 << 31, 32), S.MULTIPLY_OVERFLOW),
     ("lshift", (1, -1), S.SHIFT_DOMAIN),
     ("lshift", (0, -1), S.SHIFT_DOMAIN),
+    ("f32div", (1, 3), f32_bits(1, 3)),
+    ("f32div", (MAX_I64, 7), f32_bits(MAX_I64, 7)),
+    ("f32div", (0, 5), 0),
+    ("f32div", (1, 0), S.DIVISION_DOMAIN),
+    ("f32div", (-1, 2), S.DIVISION_DOMAIN),
     ("min", (3, MIN_I64, 4), MIN_I64),
     ("max", (3, MAX_I64, 4), MAX_I64),
 ]
@@ -90,8 +96,7 @@ CASES = [
 EDGES = [0, 1, -1, 2, -2, 3, 7, 62, 63, 64, 1 << 31, 1 << 62, -(1 << 62)]
 EDGES += [MIN_I64, MIN_I64 + 1, MAX_I64, MAX_I64 - 1]
 OPS = ["add", "multiply", "floordiv", "ceildiv", "eq", "ne", "lt", "le", "gt", "ge"]
-OPS += ["and", "bitand", "bitor", "bitxor", "bitlength", "lshift", "min", "max"]
-OPS += ["select"]
+OPS += ["and", "bitand", "bitor", "bitxor", "bitlength", "lshift", "f32div", "min", "max", "select"]
 
 
 def _reference(instructions, leaves):
@@ -286,6 +291,7 @@ class TestIntegerProgram(TestCase):
             ([("constant", 1), ("select", 0, 0)], 0),
             ([("constant", 1), ("bitlength", 0, 0)], 0),
             ([("constant", 1), ("lshift", 0)], 0),
+            ([("constant", 1), ("f32div", 0)], 0),
             ([("boxed", 3)], 2),
             ([("pointer", -1)], 2),
             ([("size", 0, -1)], 1),

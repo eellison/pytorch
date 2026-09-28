@@ -7,8 +7,10 @@
 #include <ATen/native/ReduceOps.h>
 #include <ATen/jit_macros.h>
 #include <ATen/OpMathType.h>
+#if !defined(USE_ROCM)
 #include <ATen/cuda/host_trace/Ops.h>
 #include <ATen/cuda/host_trace/ReduceSym.cuh>
+#endif
 
 namespace at::native {
 
@@ -284,6 +286,8 @@ REGISTER_DISPATCH(xor_sum_stub, &xor_sum_kernel_cuda)
 
 } // namespace at::native
 
+#if !defined(USE_ROCM)
+// Traced host (ATen/cuda/host_trace/Ops.h)
 namespace at::cuda::host_trace {
 
 // sum_functor for a floating self and result of its dtype
@@ -310,3 +314,4 @@ TensorBase sum(Recorder& rec, const TensorBase& self, IntArrayRef dims, bool kee
 }
 
 } // namespace at::cuda::host_trace
+#endif

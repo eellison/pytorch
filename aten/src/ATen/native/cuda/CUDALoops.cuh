@@ -320,6 +320,7 @@ __global__ void unrolled_elementwise_kernel(
 }
 
 // this function assume trivial 1d and no dynamic casting
+// Keep in sync with launch_vectorized_kernel in ATen/cuda/host_trace/LoopsSym.cuh
 template <typename func_t, typename array_t>
 static inline void launch_vectorized_kernel(
     int64_t N,
@@ -698,8 +699,8 @@ C10_HOST_DEVICE typename traits::result_type invoke(
   return invoke_impl<traits>(f, data, strides, dtypes, i, Indices{});
 }
 
-// the strided loop body, a named type so that a traced host
-// (ATen/cuda/host_trace/LoopsSym.cuh) launches the same kernel
+// The strided loop body as a named functor rather than a lambda, so host code
+// can construct the kernel's parameter.
 template <typename func_t, int ntensors>
 struct StridedOp {
   using arg0_t = typename function_traits<func_t>::result_type;

@@ -599,7 +599,6 @@ class _Trace:
         if any(roots.count(v._root) > 1 for v in written.values() if isinstance(v, _TracedTensor)):
             reasons.append(f"{func} writes a storage another operand is of")
         else:
-            # the caller's providers go first, the traced ATen host after
             for p in self.opaque:
                 if (why := p.accepts(func, args, kwargs)) is None:
                     provider = p
@@ -673,7 +672,7 @@ class _Trace:
         return type(out)(result) if result else None  # a tuple or a structseq
 
     def _traced_aten(self, func: OpOverload, args: tuple, kwargs: dict, fake: torch.Tensor) -> Any:
-        """func's traced ATen host (torch._C._cuda_hostTraceAten): its output,
+        """func's traced ATen host (_TRACED_ATEN): its output,
         allocated through this trace, and its kernels as KernelLaunches; None
         where the host declines, which leaves the call to EagerCall."""
         from torch.cuda._host_trace_launch import KernelLaunch
@@ -682,12 +681,19 @@ class _Trace:
         args = (*args, *(kwargs.get(a.name, a.default_value) for a in rest))
         if any(isinstance(a, (torch.Tensor, *_SYM_TYPES)) and not isinstance(a, _TracedTensor) for a in args):
             return None
+        # a Python number where the schema takes a Tensor (x + 1)
+        if any(isinstance(s.type, torch.TensorType) and not isinstance(a, _TracedTensor) for s, a in zip(func._schema.arguments, args)):
+            return None
         tensors = [a for a in args if isinstance(a, _TracedTensor)]
+        # the tape keys layouts, not addresses: two argument storages distinct
+        # here may overlap at a replay, which eager's copy_ checks at each call
+        if func._schema.is_mutable and len({t._root.name for t in tensors if t._root.kind == "argument"}) > 1:
+            return None
         marks = len(self.allocs), len(self.launches)
         self.in_aten = True
         try:
             with _TraceMode(self):
-                out, records = torch._C._cuda_hostTraceAten(_TRACED_ATEN[func], args)
+                out, records = _TRACED_ATEN[func](*args)
         except NotImplementedError:
             del self.allocs[marks[0] :], self.launches[marks[1] :]
             return None
@@ -695,13 +701,20 @@ class _Trace:
             self.in_aten = False
         if not isinstance(out, _TracedTensor):
             raise AssertionError(f"{func}'s traced host returned a {type(out)}")
-        meta = (*out.shape, *out._sym_strides, out._sym_offset)
-        want = (*fake.shape, *fake.stride(), fake.storage_offset())
-        if out.dtype != fake.dtype or len(meta) != len(want) or not _guard_each([a == b for a, b in zip(meta, want)]):
-            raise RuntimeError(f"{func}'s traced host allocated {out!r}, its meta {fake.dtype} {fake.shape} {fake.stride()}")
+        # a size-1 dim's stride is layout-free, and the fake's may differ from
+        # eager's there; the traced host's is eager's
+        pairs = [*zip(out.shape, fake.shape), (out._sym_offset, fake.storage_offset())]
+        pairs += [(a, b) for a, b, n in zip(out._sym_strides, fake.stride(), fake.shape) if n != 1]
+        if out.dtype != fake.dtype or out.dim() != fake.dim() or not _guard_each([a == b for a, b in pairs]):
+            raise AssertionError(f"{func}'s traced host allocated {out!r}, its meta {fake.dtype} {fake.shape} {fake.stride()}")
         made = [a.root for a in self.allocs[marks[0] :]]
         roots = tuple({id(r): r for r in (*(t._root for t in (*tensors, out)), *made)}.values())
         for function, offsets, params, fields, grid, block, smem in records:
+            places, values, is_pointer = [], [], []
+            for param, offset, width, value, pointer in fields:
+                places.append((param, offset, width))
+                values.append(value)
+                is_pointer.append(pointer)
             launch = KernelLaunch(
                 str(func),
                 function,
@@ -710,10 +723,10 @@ class _Trace:
                 tuple(grid),
                 tuple(block),
                 smem,
-                tuple(f[3] for f in fields),
+                tuple(values),
                 roots,
-                fields=tuple(f[:3] for f in fields),
-                pointers=frozenset(i for i, f in enumerate(fields) if f[4]),
+                fields=tuple(places),
+                pointers=frozenset(i for i, p in enumerate(is_pointer) if p),
                 images=tuple(params),
                 generator=self.generator,
             )
@@ -884,21 +897,40 @@ def _dense_terms(sizes: list, strides: list) -> list:
 # the in-place metadata ops without the inplace_view tag
 _METADATA_OPS = (aten.resize_, aten.resize_as_, aten.set_)
 # the ops with a traced ATen host, by the name torch._C._cuda_hostTraceAten takes
-_TRACED_ATEN = {
-    aten.mul.Tensor: "mul",
-    aten.add.Tensor: "add",
-    aten.silu.default: "silu",
-    aten.gelu.default: "gelu",
-    aten.rsqrt.default: "rsqrt",
-    aten.where.self: "where",
-    aten.copy_.default: "copy_",
-    aten._to_copy.default: "_to_copy",
-    aten.clone.default: "clone",
-    aten.sum.default: "sum",
-    aten.sum.dim_IntList: "sum",
-    aten.mean.default: "mean",
-    aten.mean.dim: "mean",
-    aten.amax.default: "amax",
+def _reduce(host: Callable[..., Any], x: torch.Tensor, dim: list[int] | None, keepdim: bool, dtype: torch.dtype | None = None) -> Any:
+    if dtype is not None:
+        raise NotImplementedError("a reduction with a dtype")
+    return host(x, dim or [], keepdim)
+
+
+def _add(a: torch.Tensor, b: torch.Tensor, alpha: Any) -> Any:
+    if type(alpha) not in (int, float):
+        raise NotImplementedError("an add of a non-number alpha")
+    return torch._C._cuda_hostTraceAdd(a, b, alpha)
+
+
+def _to_copy(x: torch.Tensor, dtype: Any, layout: Any, device: Any, pin_memory: Any, non_blocking: bool, memory_format: Any) -> Any:
+    if layout not in (None, torch.strided) or device not in (None, x.device) or pin_memory:
+        raise NotImplementedError("a _to_copy to another layout or device, or pinned")
+    return torch._C._cuda_hostTraceToCopy(x, x.dtype if dtype is None else dtype, memory_format or torch.preserve_format)
+
+
+# an op's traced host (torch._C._cuda_hostTrace*) on its schema-ordered args
+_TRACED_ATEN: dict[OpOverload, Callable[..., Any]] = {
+    aten.mul.Tensor: lambda a, b: torch._C._cuda_hostTraceMul(a, b),
+    aten.add.Tensor: _add,
+    aten.silu.default: lambda a: torch._C._cuda_hostTraceSilu(a),
+    aten.gelu.default: lambda a, approximate: torch._C._cuda_hostTraceGelu(a, approximate),
+    aten.rsqrt.default: lambda a: torch._C._cuda_hostTraceRsqrt(a),
+    aten.where.self: lambda cond, a, b: torch._C._cuda_hostTraceWhere(cond, a, b),
+    aten.copy_.default: lambda dst, src, non_blocking: torch._C._cuda_hostTraceCopy_(dst, src),
+    aten._to_copy.default: _to_copy,
+    aten.clone.default: lambda x, memory_format: torch._C._cuda_hostTraceToCopy(x, x.dtype, memory_format or torch.preserve_format),
+    aten.sum.default: lambda x, dtype: _reduce(torch._C._cuda_hostTraceSum, x, [], False, dtype),
+    aten.sum.dim_IntList: lambda x, dim, keepdim, dtype: _reduce(torch._C._cuda_hostTraceSum, x, dim, keepdim, dtype),
+    aten.mean.default: lambda x, dtype: _reduce(torch._C._cuda_hostTraceMean, x, [], False, dtype),
+    aten.mean.dim: lambda x, dim, keepdim, dtype: _reduce(torch._C._cuda_hostTraceMean, x, dim, keepdim, dtype),
+    aten.amax.default: lambda x, dim, keepdim: _reduce(torch._C._cuda_hostTraceAmax, x, dim, keepdim),
 }
 
 _ALLOC_OPS = {

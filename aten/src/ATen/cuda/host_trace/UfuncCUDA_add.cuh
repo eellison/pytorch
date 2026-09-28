@@ -1,5 +1,5 @@
-// The traced host of add.Tensor, included at the end of the generated
-// UfuncCUDA_add.cu for its CUDAFunctor_add kernels.
+// The traced host of add.Tensor. Only the generated UfuncCUDA_add.cu, which
+// holds the CUDAFunctor_add kernels, includes this, so add() is defined once.
 #pragma once
 #include <ATen/cuda/host_trace/LoopsSym.cuh>
 #include <ATen/cuda/host_trace/Ops.h>
@@ -11,7 +11,7 @@ TensorBase add(Recorder& rec, const TensorBase& a, const TensorBase& b, const Sc
   if (isComplexType(iter.common_dtype())) {
     decline("complex add");
   }
-  // alpha_check's (BinaryOps.h redeclares add_stub here); Aten.cpp declines a bool alpha
+  // alpha_check; BinaryOps.h can't be included here (it redeclares add_stub)
   if (!isFloatingType(iter.common_dtype()) && !alpha.isIntegral(false)) {
     decline("an integral add of a floating alpha");
   }

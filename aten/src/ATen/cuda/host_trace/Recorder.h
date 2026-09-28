@@ -1,8 +1,5 @@
-// The kernel launches of an ATen op's traced host: the op's host code run with
-// c10::SymInt sizes and addresses under a host trace (torch/cuda/_host_trace_tape.py)
-// records its launches here instead of launching them. A record is the kernel,
-// each parameter's bytes and the symbolic fields over those bytes; the trace
-// turns it into a KernelLaunch.
+// Records the launches of an ATen op's host code run over c10::SymInt
+// (torch/cuda/_host_trace_tape.py) instead of launching them.
 #pragma once
 #include <ATen/core/TensorBase.h>
 #include <c10/core/SymInt.h>
@@ -75,10 +72,10 @@ struct Param {
   explicit Param(const K& v) {
     new (bytes.data()) K(v);
   }
-  K& pod() {
+  K& value() {
     return *reinterpret_cast<K*>(bytes.data());
   }
-  // a scalar or pointer member of pod(): a constant is written, a symbolic
+  // a scalar or pointer member of value(): a constant is written, a symbolic
   // value recorded (the launch packs a 4-byte field as a signed int32)
   template <class T>
   void set(T& member, const c10::SymInt& v) {
@@ -91,25 +88,42 @@ struct Param {
       }
       return;
     }
-    const size_t offset = reinterpret_cast<uint8_t*>(&member) - bytes.data();
-    fields.push_back({0, offset, sizeof(T), v, std::is_pointer_v<T>});
+    fields.push_back({0, offset_of(member), sizeof(T), v, std::is_pointer_v<T>});
   }
-  // a member of pod() given as a Param of its own
+  // a member of value() given by its bits, e.g. a float's
+  template <class T>
+  void set_bits(T& member, const c10::SymInt& bits) {
+    static_assert(sizeof(T) == 4 || sizeof(T) == 8);
+    if (auto c = bits.maybe_as_int()) {
+      using bits_t = std::conditional_t<sizeof(T) == 4, int32_t, int64_t>;
+      const auto b = static_cast<bits_t>(*c);
+      std::memcpy(static_cast<void*>(&member), &b, sizeof(T));
+      return;
+    }
+    fields.push_back({0, offset_of(member), sizeof(T), bits, false});
+  }
+  // a member of value() given as a Param of its own
   template <class T>
   void set(T& member, const Param<T>& v) {
     std::memcpy(static_cast<void*>(&member), v.bytes.data(), sizeof(T));
-    const size_t offset = reinterpret_cast<uint8_t*>(&member) - bytes.data();
+    const size_t offset = offset_of(member);
     for (Field f : v.fields) {
       f.offset += offset;
       fields.push_back(std::move(f));
     }
   }
+
+ private:
+  template <class T>
+  size_t offset_of(T& member) {
+    return reinterpret_cast<uint8_t*>(&member) - bytes.data();
+  }
 };
 
 template <class K>
-Param<K> scalar(const c10::SymInt& v) {
+Param<K> scalar_param(const c10::SymInt& v) {
   Param<K> p;
-  p.set(p.pod(), v);
+  p.set(p.value(), v);
   return p;
 }
 

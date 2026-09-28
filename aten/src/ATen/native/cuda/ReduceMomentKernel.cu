@@ -6,8 +6,10 @@
 #include <ATen/native/SharedReduceOps.h>
 #include <ATen/Dispatch.h>
 #include <ATen/native/ReduceOps.h>
+#if !defined(USE_ROCM)
 #include <ATen/cuda/host_trace/Ops.h>
 #include <ATen/cuda/host_trace/ReduceSym.cuh>
+#endif
 
 #include <thrust/pair.h>
 
@@ -75,6 +77,8 @@ REGISTER_DISPATCH(mean_stub, &mean_kernel_cuda)
 
 } // namespace at::native
 
+#if !defined(USE_ROCM)
+// Traced host (ATen/cuda/host_trace/Ops.h)
 namespace at::cuda::host_trace {
 
 // mean_kernel_impl for a Half, BFloat16 or float self and result of its dtype;
@@ -93,7 +97,7 @@ TensorBase mean(Recorder& rec, const TensorBase& self, IntArrayRef dims, bool ke
     using ops_t = at::native::MeanOps<scalar_t, float, float, scalar_t>;
     Param<ops_t> ops;
     // factor = static_cast<float>(num_output_elements) / numel
-    ops.set(reinterpret_cast<int32_t&>(ops.pod().factor), rec.f32_div(iter.num_output_elements(), iter.numel()));
+    ops.set_bits(ops.value().factor, rec.f32_div(iter.num_output_elements(), iter.numel()));
     if constexpr (sizeof(scalar_t) == 2) {
       gpu_reduce_kernel<scalar_t, scalar_t, 4, 8>(rec, iter, ops);
     } else {
@@ -104,3 +108,4 @@ TensorBase mean(Recorder& rec, const TensorBase& self, IntArrayRef dims, bool ke
 }
 
 } // namespace at::cuda::host_trace
+#endif

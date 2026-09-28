@@ -6,7 +6,7 @@ import sympy
 from sympy.logic.boolalg import BooleanFalse, BooleanTrue
 
 import torch
-from torch.cuda._host_trace import _TraceShapeEnv, BitLength, Declined
+from torch.cuda._host_trace import _TraceShapeEnv, BitLength, Declined, F32Div
 from torch.cuda._host_trace_lower import Lowering
 from torch.cuda._host_trace_program import (
     compile_program,
@@ -68,6 +68,7 @@ EXPRESSIONS = [
     BitwiseFn_bitwise_xor(P, -T),
     BitLength(S),
     PowByNatural(2, P),
+    F32Div(P, Q),
     # IntDivider's magic number
     FloorDiv(2**32 * (PowByNatural(2, BitLength(P - 1)) - P), P) + 1,
     sympy.Eq(S, T),

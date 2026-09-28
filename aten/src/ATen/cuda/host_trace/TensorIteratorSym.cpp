@@ -1,5 +1,7 @@
+#if !defined(USE_ROCM)
 #include <ATen/cuda/host_trace/TensorIteratorSym.h>
 
+#include <ATen/MemoryOverlap.h>
 #include <ATen/detail/TensorIteratorBuild.h>
 #include <ATen/native/ReduceOpsUtils.h>
 
@@ -50,13 +52,8 @@ TensorIteratorSym TensorIteratorSym::where_op(Recorder& rec, const TensorBase& c
 }
 
 TensorIteratorSym TensorIteratorSym::copy_op(Recorder& rec, const TensorBase& dst, const TensorBase& src) {
-  // assert_no_internal_overlap(dst)
-  if (!dst.is_non_overlapping_and_dense()) {
-    for (const auto d : c10::irange(dst.dim())) {
-      if (dst.sym_size(d) > 1 && dst.sym_stride(d) == 0) {
-        decline("a copy into a tensor with internal overlap");
-      }
-    }
+  if (at::has_internal_overlap(dst) == MemOverlap::Yes) {
+    decline("a copy into a tensor with internal overlap");
   }
   TensorIteratorSym iter({dst, src});
   iter.check_all_same_dtype_ = false;
@@ -163,7 +160,7 @@ void TensorIteratorSym::build(Recorder& rec) {
   if (!is_reduction_ && output().defined() && !output().sym_sizes().equals(shape_)) {
     decline("an output of a shape other than the broadcast shape");
   }
-  auto set_output = [this](int, c10::SymIntArrayRef sizes, c10::SymIntArrayRef strides, std::optional<MemoryFormat> memory_format) {
+  auto set_output = [this](int /*i*/, c10::SymIntArrayRef sizes, c10::SymIntArrayRef strides, std::optional<MemoryFormat> memory_format) {
     auto& out = operands_[0];
     if (out.tensor.defined()) {
       return;
@@ -184,3 +181,4 @@ void TensorIteratorSym::build(Recorder& rec) {
 }
 
 } // namespace at::cuda::host_trace
+#endif

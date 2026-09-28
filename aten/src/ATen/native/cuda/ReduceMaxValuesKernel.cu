@@ -10,8 +10,10 @@
 #include <ATen/native/cuda/ReduceOps.h>
 #include <ATen/cuda/NumericLimits.cuh>
 #include <ATen/native/cuda/Reduce.cuh>
+#if !defined(USE_ROCM)
 #include <ATen/cuda/host_trace/Ops.h>
 #include <ATen/cuda/host_trace/ReduceSym.cuh>
+#endif
 
 #include <thrust/pair.h>
 
@@ -60,6 +62,8 @@ REGISTER_DISPATCH(max_values_stub, &max_values_kernel_cuda)
 
 } // namespace at::native
 
+#if !defined(USE_ROCM)
+// Traced host (ATen/cuda/host_trace/Ops.h)
 namespace at::cuda::host_trace {
 
 // max_values_kernel_cuda_impl
@@ -77,3 +81,4 @@ TensorBase amax(Recorder& rec, const TensorBase& self, IntArrayRef dims, bool ke
 }
 
 } // namespace at::cuda::host_trace
+#endif

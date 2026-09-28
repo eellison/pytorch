@@ -5,113 +5,44 @@
 #include <torch/csrc/Exceptions.h>
 #include <torch/csrc/autograd/python_variable.h>
 
+#include <variant>
+
 namespace torch::cuda::host_trace {
 
 namespace {
 
-// a traced tensor's address is its data_ptr() in Python, its root's symbol
-// plus its offset
-struct PyRecorder : at::cuda::host_trace::Recorder {
+namespace ht = at::cuda::host_trace;
+
+// a traced tensor's data_ptr() is symbolic, so ask Python
+struct PyRecorder : ht::Recorder {
   c10::SymInt data_ptr(const at::TensorBase& t) override {
     auto obj = py::reinterpret_steal<py::object>(THPVariable_Wrap(t));
     return obj.attr("data_ptr")().cast<c10::SymInt>();
   }
   c10::SymInt bit_length(const c10::SymInt& x) override {
-    return py::module::import("torch.cuda._host_trace")
-        .attr("bit_length")(x)
-        .cast<c10::SymInt>();
+    return host_trace.attr("bit_length")(x).cast<c10::SymInt>();
   }
   c10::SymInt pow2(const c10::SymInt& x) override {
     return py::cast(x).attr("__rpow__")(2).cast<c10::SymInt>();
   }
   c10::SymInt f32_div(const c10::SymInt& a, const c10::SymInt& b) override {
-    return py::module::import("torch.cuda._host_trace")
-        .attr("f32_div")(a, b)
-        .cast<c10::SymInt>();
+    return host_trace.attr("f32_div")(a, b).cast<c10::SymInt>();
   }
+  py::module host_trace = py::module::import("torch.cuda._host_trace");
 };
 
-// the op's traced host under the caller's dispatch mode, args as its schema
-// orders them: its output and its launches as (function, param offsets, param
-// bytes, fields, grid, block, smem), a field (param, offset, width, value, is
-// pointer)
-py::tuple traced_aten(const std::string& name, const py::tuple& args) {
-  namespace ht = at::cuda::host_trace;
-  PyRecorder rec;
-  auto tensor = [&](size_t i) {
-    if (!THPVariable_Check(args[i].ptr())) {
-      ht::decline(name + " of a non-tensor operand");
-    }
-    return args[i].cast<at::Tensor>();
-  };
-  at::TensorBase out;
-  if (name == "mul") {
-    out = ht::mul(rec, tensor(0), tensor(1));
-  } else if (name == "add") {
-    const py::handle alpha = args[2];
-    if (py::isinstance<py::bool_>(alpha) ||
-        !(py::isinstance<py::int_>(alpha) || py::isinstance<py::float_>(alpha))) {
-      ht::decline("an add of a non-number alpha");
-    }
-    out = ht::add(
-        rec,
-        tensor(0),
-        tensor(1),
-        py::isinstance<py::int_>(alpha) ? c10::Scalar(alpha.cast<int64_t>())
-                                        : c10::Scalar(alpha.cast<double>()));
-  } else if (name == "silu") {
-    out = ht::silu(rec, tensor(0));
-  } else if (name == "gelu") {
-    out = ht::gelu(rec, tensor(0), args[1].cast<std::string>());
-  } else if (name == "rsqrt") {
-    out = ht::rsqrt(rec, tensor(0));
-  } else if (name == "where") {
-    out = ht::where(rec, tensor(0), tensor(1), tensor(2));
-  } else if (name == "copy_") {
-    out = ht::copy_(rec, tensor(0), tensor(1));
-  } else if (name == "_to_copy" || name == "clone") {
-    const at::Tensor src = tensor(0);
-    auto dtype = src.scalar_type();
-    if (name == "_to_copy") {
-      auto layout = args[2].cast<std::optional<c10::Layout>>();
-      auto device = args[3].cast<std::optional<at::Device>>();
-      if (layout.value_or(c10::kStrided) != c10::kStrided ||
-          device.value_or(src.device()) != src.device() ||
-          args[4].cast<std::optional<bool>>().value_or(false)) {
-        ht::decline("a _to_copy to another layout or device, or pinned");
-      }
-      dtype = args[1].cast<std::optional<at::ScalarType>>().value_or(dtype);
-    }
-    auto memory_format =
-        args[name == "clone" ? 1 : 6].cast<std::optional<at::MemoryFormat>>();
-    out = ht::to_copy(
-        rec, src, dtype, memory_format.value_or(at::MemoryFormat::Preserve));
-  } else if (name == "sum" || name == "mean" || name == "amax") {
-    // sum and mean: (self, dtype) or (self, dim, keepdim, dtype)
-    const bool all = name != "amax" && args.size() == 2;
-    if (name != "amax" && !args[all ? 1 : 3].is_none()) {
-      ht::decline("a " + name + " with a dtype");
-    }
-    const auto dims = all || args[1].is_none()
-        ? std::vector<int64_t>{}
-        : args[1].cast<std::vector<int64_t>>();
-    const bool keepdim = !all && args[2].cast<bool>();
-    auto host = name == "sum" ? ht::sum : name == "mean" ? ht::mean : ht::amax;
-    out = host(rec, tensor(0), dims, keepdim);
-  } else {
-    ht::decline("no traced host for " + name);
-  }
+// (out, [(function, offsets, params, fields, grid, block, smem)]), each field
+// (param, offset, width, value, is_pointer)
+py::tuple traced(const PyRecorder& rec, const at::TensorBase& out) {
   py::list launches;
   for (const auto& r : rec.launches) {
     py::list params;
     for (const auto& p : r.params) {
-      params.append(
-          py::bytes(reinterpret_cast<const char*>(p.data()), p.size()));
+      params.append(py::bytes(reinterpret_cast<const char*>(p.data()), p.size()));
     }
     py::list fields;
     for (const auto& f : r.fields) {
-      fields.append(
-          py::make_tuple(f.param, f.offset, f.width, f.value, f.pointer));
+      fields.append(py::make_tuple(f.param, f.offset, f.width, f.value, f.pointer));
     }
     launches.append(py::make_tuple(
         reinterpret_cast<uintptr_t>(r.function),
@@ -127,8 +58,53 @@ py::tuple traced_aten(const std::string& name, const py::tuple& args) {
 
 } // namespace
 
+// Each op's traced host under the caller's dispatch mode; torch/cuda/_host_trace_tape.py
+// maps an op's schema-ordered args to these
 void initHostTraceAtenBindings(py::module& m) {
-  m.def("_cuda_hostTraceAten", torch::wrap_pybind_function(traced_aten));
+  m.def("_cuda_hostTraceMul", torch::wrap_pybind_function([](const at::Tensor& a, const at::Tensor& b) {
+    PyRecorder rec;
+    return traced(rec, ht::mul(rec, a, b));
+  }));
+  m.def("_cuda_hostTraceAdd", torch::wrap_pybind_function([](const at::Tensor& a, const at::Tensor& b, std::variant<int64_t, double> alpha) {
+    PyRecorder rec;
+    return traced(rec, ht::add(rec, a, b, std::visit([](auto v) { return c10::Scalar(v); }, alpha)));
+  }));
+  m.def("_cuda_hostTraceSilu", torch::wrap_pybind_function([](const at::Tensor& a) {
+    PyRecorder rec;
+    return traced(rec, ht::silu(rec, a));
+  }));
+  m.def("_cuda_hostTraceGelu", torch::wrap_pybind_function([](const at::Tensor& a, const std::string& approximate) {
+    PyRecorder rec;
+    return traced(rec, ht::gelu(rec, a, approximate));
+  }));
+  m.def("_cuda_hostTraceRsqrt", torch::wrap_pybind_function([](const at::Tensor& a) {
+    PyRecorder rec;
+    return traced(rec, ht::rsqrt(rec, a));
+  }));
+  m.def("_cuda_hostTraceWhere", torch::wrap_pybind_function([](const at::Tensor& cond, const at::Tensor& a, const at::Tensor& b) {
+    PyRecorder rec;
+    return traced(rec, ht::where(rec, cond, a, b));
+  }));
+  m.def("_cuda_hostTraceCopy_", torch::wrap_pybind_function([](const at::Tensor& dst, const at::Tensor& src) {
+    PyRecorder rec;
+    return traced(rec, ht::copy_(rec, dst, src));
+  }));
+  m.def("_cuda_hostTraceToCopy", torch::wrap_pybind_function([](const at::Tensor& src, at::ScalarType dtype, at::MemoryFormat memory_format) {
+    PyRecorder rec;
+    return traced(rec, ht::to_copy(rec, src, dtype, memory_format));
+  }));
+  m.def("_cuda_hostTraceSum", torch::wrap_pybind_function([](const at::Tensor& self, const std::vector<int64_t>& dims, bool keepdim) {
+    PyRecorder rec;
+    return traced(rec, ht::sum(rec, self, dims, keepdim));
+  }));
+  m.def("_cuda_hostTraceMean", torch::wrap_pybind_function([](const at::Tensor& self, const std::vector<int64_t>& dims, bool keepdim) {
+    PyRecorder rec;
+    return traced(rec, ht::mean(rec, self, dims, keepdim));
+  }));
+  m.def("_cuda_hostTraceAmax", torch::wrap_pybind_function([](const at::Tensor& self, const std::vector<int64_t>& dims, bool keepdim) {
+    PyRecorder rec;
+    return traced(rec, ht::amax(rec, self, dims, keepdim));
+  }));
 }
 
 } // namespace torch::cuda::host_trace

@@ -742,7 +742,7 @@ class HarvestProvider:
             filler = torch.Generator(operands[0].device).manual_seed(0)
             bases, copies = [], []
             for t, span, align in zip(operands[:placed], spans, key.align):
-                base = torch.empty(span + 256, dtype=torch.uint8, device=t.device)
+                base = torch.empty(-(-(span + 256) // 8), dtype=torch.int64, device=t.device).view(torch.uint8)
                 flat = base[align : align + span].view(t.dtype)
                 if t.dtype.is_floating_point:
                     flat.normal_(generator=filler)
@@ -824,7 +824,7 @@ class HarvestProvider:
                 _launch(b, addrs, [t.data_ptr() for t in scratch], stream, state)
                 for i in sorted(referenced):
                     if i < placed:
-                        ok = torch.equal(*bases[i])
+                        ok = torch.equal(*(b.view(torch.int64) for b in bases[i]))
                     elif i in tolerated:
                         ok = close(ref_out[i - placed], outs[i - placed], spread[i - placed])
                     else:

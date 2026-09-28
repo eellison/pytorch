@@ -1,13 +1,8 @@
 #pragma once
-// TensorIteratorBase's shape, stride and output-layout computation, templated
-// on the integer type: TensorIterator.cpp instantiates int64_t, and the CUDA
-// host trace (ATen/cuda/host_trace/TensorIteratorSym.cpp) c10::SymInt, where
-// every comparison is a guard. Parameters carry the names of the members they
-// bind. An operand is duck-typed on OperandInfo's tensor_base(), stride_bytes,
-// will_resize, is_output, target_dtype, current_dtype and is_type_defined();
-// outputs are allocated through set_output(i, sizes, strides, memory_format).
-// The steps TensorIterator.cpp forwards to are C10_ALWAYS_INLINE, so its
-// member functions cost no extra call over the untemplated originals.
+// TensorIteratorBase's shape/stride/layout build, templated on the integer
+// type (int64_t in TensorIterator.cpp, c10::SymInt in ATen/cuda/host_trace).
+// Operands duck-type at::OperandInfo; outputs are allocated through
+// set_output(i, sizes, strides, memory_format).
 #include <ATen/ExpandUtils.h>
 #include <ATen/TensorIterator.h>
 #include <c10/util/irange.h>
@@ -234,14 +229,14 @@ SmallVector<typename Shape::value_type, 6> compatible_stride(const Shape& shape_
   return stride;
 }
 
-template <typename T>
-DimVectorOf<T> invert_perm(IntArrayRef perm_, c10::ArrayRef<T> input, bool has_coalesced_dimensions_) {
+template <typename Shape, typename T>
+DimVectorOf<T> invert_perm(const Shape& shape_, IntArrayRef perm_, c10::ArrayRef<T> input, bool has_coalesced_dimensions_) {
   // Invert the permutation caused by reorder_dimensions. This is not valid
   // after coalesce_dimensions is called.
   TORCH_INTERNAL_ASSERT(!has_coalesced_dimensions_);
   TORCH_INTERNAL_ASSERT(input.size()==perm_.size());
   auto res = DimVectorOf<T>(input.size()); //no initialization needed, every value in res should be written to.
-  for (const auto dim : c10::irange(perm_.size())) {
+  for (const auto dim : c10::irange(ndim(shape_))) {
     res[perm_[dim]] = input[dim];
   }
   return res;
@@ -264,14 +259,14 @@ C10_ALWAYS_INLINE void allocate_or_resize_outputs(const Shape& shape_, IntArrayR
       TORCH_INTERNAL_ASSERT(op.is_type_defined(), "no type for operand", i);
       auto element_size = elementSize(op.target_dtype);
       op.stride_bytes = compatible_stride(shape_, static_cast<int64_t>(element_size));
-      auto tensor_shape = invert_perm<T>(perm_, shape_, has_coalesced_dimensions_);
+      auto tensor_shape = invert_perm<Shape, T>(shape_, perm_, shape_, has_coalesced_dimensions_);
       if (inverted) {
         // can just return contiguous output
         // it is faster because it avoids allocating 0 size tensor and
         // resizing and restriding it
         set_output(i, tensor_shape, {}, std::nullopt);
       } else {
-        auto tensor_stride = invert_perm<T>(perm_, op.stride_bytes, has_coalesced_dimensions_);
+        auto tensor_stride = invert_perm<Shape, T>(shape_, perm_, op.stride_bytes, has_coalesced_dimensions_);
         for (const auto dim : c10::irange(ndim(shape_))) {
           tensor_stride[dim] /= static_cast<int64_t>(element_size);
         }

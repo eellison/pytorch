@@ -15,8 +15,10 @@
 #include <ATen/cuda/ApplyGridUtils.cuh>
 #include <ATen/cuda/detail/OffsetCalculator.cuh>
 #include <ATen/native/cuda/Loops.cuh>
+#if !defined(USE_ROCM)
 #include <ATen/cuda/host_trace/LoopsSym.cuh>
 #include <ATen/cuda/host_trace/Ops.h>
+#endif
 #include <c10/util/complex.h>
 
 namespace at::native {
@@ -64,10 +66,15 @@ REGISTER_DISPATCH(silu_backward_stub, &silu_backward_kernel)
 
 } // namespace at::native
 
+#if !defined(USE_ROCM)
+// Traced host (ATen/cuda/host_trace/Ops.h)
 namespace at::cuda::host_trace {
 
 TensorBase silu(Recorder& rec, const TensorBase& a) {
   auto iter = TensorIteratorSym::unary_op(rec, a);
+  if (isComplexType(iter.common_dtype())) {
+    decline("complex silu");
+  }
   AT_DISPATCH_FLOATING_TYPES_AND2(kHalf, kBFloat16, iter.common_dtype(), "silu_cuda", [&]() {
     gpu_kernel(rec, iter, at::native::SiluFunctor<scalar_t>());
   });
@@ -75,3 +82,4 @@ TensorBase silu(Recorder& rec, const TensorBase& a) {
 }
 
 } // namespace at::cuda::host_trace
+#endif
