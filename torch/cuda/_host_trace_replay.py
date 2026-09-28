@@ -5,7 +5,9 @@ A HostTraceReplay traces a call, lowers the tape and captures it once
 (a variant). A later call is checked in two phases. Validation has no
 effect: the argument contract selects the family of variants traced under
 the same contract, and one evaluation of a variant's compiled program checks
-every guard, allocation requirement and eager call's arguments. Only a call
+every guard, allocation requirement and eager call's arguments; then that
+no argument a traced step writes overlaps another it reads
+(Tape.argument_pairs), or the call runs eagerly. Only a call
 a variant holds commits, step by step: it allocates as eager would
 (_host_trace_memory); for a run of launches it patches the kernel and
 memset nodes whose parameters changed (a pointer to an eager output is known
@@ -97,16 +99,29 @@ log = logging.getLogger(__name__)
 
 
 def _exact_class(contract: tuple, args: Sequence[Any]) -> tuple:
-    # the contract plus every value a trace reads except addresses
+    # the contract plus every value a trace reads except addresses, and the
+    # groups of arguments whose extents chain into one (Tape.argument_pairs)
     values: list[Any] = []
-    for a in args:
+    extents = []
+    for i, a in enumerate(args):
         if isinstance(a, torch.Tensor):
             strided = a.layout == torch.strided
             values.append((tuple(a.shape), a.stride() if strided else None))
             values.append(a.storage_offset() if strided else None)
+            if strided and a.numel():
+                first = a.const_data_ptr()  # type: ignore[attr-defined]
+                span = sum((n - 1) * s for n, s in zip(a.shape, a.stride()))
+                extents.append((first, first + (span + 1) * a.element_size() - 1, i))
         elif type(a) is int:
             values.append(a)
-    return (contract, tuple(values))
+    groups: list[list[int]] = []
+    end = -1
+    for first, last, i in sorted(extents):
+        if first > end:
+            groups.append([])
+        groups[-1].append(i)
+        end = max(end, last)
+    return (contract, tuple(values), tuple(tuple(g) for g in groups if len(g) > 1))
 
 
 def _piece(site: KeyedSite, binding: OpaqueBinding) -> bool:
@@ -453,6 +468,9 @@ class HostTraceReplay(torch._C._HostTraceEntry):
     def _miss(
         self, contract: tuple, args: Sequence[Any], before: _Variant | None = None
     ) -> Any:
+        if any(v.native.overlaps(tuple(args)) for v in self._families.get(contract, ())):
+            # an assertion, not a dispatch: eager raises its error or runs it
+            return self._eager(args, {}, "arguments overlap that a variant's steps take as disjoint")
         exact = _exact_class(contract, args)
         # under trust a decline is structural: one is the graph's
         structural = contract if self.trusted is not None else exact

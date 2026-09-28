@@ -1,7 +1,12 @@
 #include <torch/csrc/cuda/host_trace/Variant.h>
 
 #if !defined(USE_ROCM)
+#include <torch/csrc/autograd/python_variable.h>
+
+#include <c10/util/SmallVector.h>
+
 #include <algorithm>
+#include <utility>
 
 namespace torch::cuda::host_trace {
 
@@ -71,9 +76,47 @@ bool HostTraceVariant::evaluate_rows(
   frame.args = args;
   frame.count = count;
   frame.values.resize_for_overwrite(program_.num_rows());
-  return program_.evaluate(leaves.data(), frame.values.data()) ==
-      HostTraceProgram::Status::Success &&
-      frame.values[valid_] == 1;
+  if (program_.evaluate(leaves.data(), frame.values.data()) !=
+          HostTraceProgram::Status::Success ||
+      frame.values[valid_] != 1) {
+    return false;
+  }
+  frame.overlapped = !disjoint(args, count);
+  return !frame.overlapped;
+}
+
+// after the rows, which hold only for nonempty tensor arguments
+bool HostTraceVariant::disjoint(PyObject* const* args, size_t count) const {
+  if (argument_pairs_.empty()) {
+    return true;
+  }
+  // each argument's first and last byte
+  c10::SmallVector<std::pair<uintptr_t, uintptr_t>, 8> extents;
+  for (size_t i : pair_arguments_) {
+    if (i >= count || !THPVariable_CheckExact(args[i])) {
+      return false;
+    }
+    const at::Tensor& t = THPVariable_Unpack(args[i]);
+    if (t.layout() != at::kStrided) {
+      return false;
+    }
+    const auto sizes = t.sizes();
+    const auto strides = t.strides();
+    int64_t span = 0;
+    for (size_t d = 0; d < sizes.size(); ++d) {
+      span += (sizes[d] - 1) * strides[d];
+    }
+    const auto first = reinterpret_cast<uintptr_t>(t.const_data_ptr());
+    extents.emplace_back(first, first + (span + 1) * t.itemsize() - 1);
+  }
+  for (const ArgumentPair& p : argument_pairs_) {
+    const auto [a_first, a_last] = extents[p.a];
+    const auto [b_first, b_last] = extents[p.b];
+    if (a_first <= b_last && b_first <= a_last) {
+      return false;
+    }
+  }
+  return true;
 }
 
 bool HostTraceVariant::evaluate(
@@ -131,6 +174,16 @@ int64_t HostTraceVariant::form_of(
     }
   }
   return -1;
+}
+
+bool HostTraceVariant::overlaps_py(py::handle args) const {
+  TORCH_CHECK_TYPE(PyTuple_Check(args.ptr()), "args must be a tuple");
+  Frame frame;
+  evaluate_rows(
+      &PyTuple_GET_ITEM(args.ptr(), 0),
+      static_cast<size_t>(PyTuple_GET_SIZE(args.ptr())),
+      frame);
+  return frame.overlapped;
 }
 
 py::object HostTraceVariant::evaluate_py(py::handle args) const {
@@ -226,9 +279,8 @@ void HostTraceVariant::add_row(
       continue;
     }
     KernelRow& k = e->kernels[i];
-    set_launch(k, n[1], n[2], n[3]);
-    k.constant_grid = true;
-    k.grid = n[4].cast<std::array<int64_t, 3>>();
+    k.dims = set_launch(k, n[1], n[2], n[3], n[4]);
+    k.constant_dims = true;
     append_images(k, n[5], e->image);
     parse_rng(k, segments_[s.segment], n[7], n[8]);
     k.first_field = e->fields.size();

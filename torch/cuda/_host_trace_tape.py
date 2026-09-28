@@ -83,6 +83,7 @@ class _InputRec:
     strides: list
     offset: Any
     root: _Root
+    extent: tuple[int, int]  # the first and last byte of its elements at the trace
 
 
 @dataclass(frozen=True)
@@ -248,6 +249,10 @@ class _Trace:
         self.fake_mode.cache_enabled = False
         self._seq = itertools.count()
         self.inputs: list[_InputRec] = []
+        self.arguments: dict[int, _InputRec] = {}  # by id of its root
+        # argument positions i < j, where a step not run eagerly writes one
+        # and reads the other (Tape.argument_pairs)
+        self.argument_pairs: set[tuple[int, int]] = set()
         self.int_inputs: list[_IntInputRec] = []
         self.allocs: list[_AllocRec] = []
         self.launches: list[tuple[int, Any]] = []  # (seq, launch or EagerCall)
@@ -300,8 +305,11 @@ class _Trace:
         base = t.const_data_ptr() - t.storage_offset() * t.element_size()  # type: ignore[attr-defined]
         sym = env.symbol(_PLACEHOLDER_TAG | (base & _PLACEHOLDER_LOW), f"{name}.base")
         root = _Root(f"p{position}", sym)
-        rec = _InputRec(position, name, t.dtype, sizes, strides, offset, root)
+        first = t.const_data_ptr()  # type: ignore[attr-defined]
+        last = first + (sum((n - 1) * s for n, s in zip(t.shape, t.stride())) + 1) * t.element_size() - 1
+        rec = _InputRec(position, name, t.dtype, sizes, strides, offset, root, (first, last))
         self.inputs.append(rec)
+        self.arguments[id(root)] = rec
         return _TracedTensor(root, sizes, strides, offset, t.dtype, t.device)
 
     def int_input(self, position: int, value: int) -> torch.SymInt:
@@ -594,9 +602,16 @@ class _Trace:
             written[frozenset(a.alias_info.before_set)] = v
 
         reasons, provider, binding = [], None, None
-        # a library kernel may assume its output overlaps no input
+        # a library kernel may assume its output overlaps no input. Arguments
+        # may overlap at one call and not at another: a step not run eagerly
+        # holds only while its written arguments overlap no other operand
         roots = [t._root for t in pytree.tree_leaves((args, kwargs)) if isinstance(t, _TracedTensor)]
-        if any(roots.count(v._root) > 1 for v in written.values() if isinstance(v, _TracedTensor)):
+        writes = [self.arguments[id(v._root)] for v in written.values() if isinstance(v, _TracedTensor) and id(v._root) in self.arguments]
+        reads = {id(r): self.arguments[id(r)] for r in roots if id(r) in self.arguments}.values()
+        others = [(w, o) for w in writes for o in reads if o is not w]
+        pairs = {(min(w.position, o.position), max(w.position, o.position)) for w, o in others}
+        overlap = any(w.extent[0] <= o.extent[1] and o.extent[0] <= w.extent[1] for w, o in others)
+        if overlap or any(roots.count(v._root) > 1 for v in written.values() if isinstance(v, _TracedTensor)):
             reasons.append(f"{func} writes a storage another operand is of")
         else:
             for p in self.opaque:
@@ -606,6 +621,7 @@ class _Trace:
                 reasons.append(why)
             if provider is None and func in _TRACED_ATEN and not self.in_aten:
                 if (traced := self._traced_aten(func, args, kwargs, rets[0])) is not None:
+                    self.argument_pairs |= pairs
                     return traced
         if provider is not None:
             fakes = [o for r, o in zip(schema.returns, rets) if r.alias_info is None]
@@ -614,6 +630,8 @@ class _Trace:
             _guard_each([v == _hint(v) for v in values])
             if refusal is not None:
                 provider, reasons = None, [refusal]
+        if provider is not None:
+            self.argument_pairs |= pairs
         made: list[_TracedTensor] = []  # the binding's fresh outputs
 
         storages = {
@@ -685,10 +703,6 @@ class _Trace:
         if any(isinstance(s.type, torch.TensorType) and not isinstance(a, _TracedTensor) for s, a in zip(func._schema.arguments, args)):
             return None
         tensors = [a for a in args if isinstance(a, _TracedTensor)]
-        # the tape keys layouts, not addresses: two argument storages distinct
-        # here may overlap at a replay, which eager's copy_ checks at each call
-        if func._schema.is_mutable and len({t._root.name for t in tensors if t._root.kind == "argument"}) > 1:
-            return None
         marks = len(self.allocs), len(self.launches)
         self.in_aten = True
         try:
@@ -1488,6 +1502,10 @@ class Tape:
         # every condition the host branched on, in program order; under
         # trusted inputs, only its size-based dispatch decisions
         self.guards = [g.expr for g in tr.shape_env.guards]
+        # (i, j): arguments i < j, disjoint at the trace, where a step not run
+        # eagerly writes one and reads the other. A call where they overlap
+        # runs eagerly; trusted inputs' aliasing is the caller's (none)
+        self.argument_pairs = tuple(sorted(tr.argument_pairs)) if tr.trusted is None else ()
 
     def release_args(self) -> None:
         """Keep only each tensor argument's metadata (sizes, strides, storage

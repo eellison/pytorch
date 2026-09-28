@@ -260,7 +260,7 @@ class TestCaptureTape(TestCase):
             lo, launch=dataclasses.replace(lo.launch, grid=(9, 1, 1))
         )
         wrong_tape = dataclasses.replace(lowered, launches=(wrong,))
-        msg = "grid axis 0 is 8 at the traced call; the trace has 9"
+        msg = "launch dimension 0 is 8 at the traced call; the trace has 9"
         with self.assertRaisesRegex(AssertionError, msg):
             _capture(wrong_tape)
         with (

@@ -71,7 +71,7 @@ def mm_chain(x, w):
 
 
 class TableProvider:
-    """Stands in for a library: `ops` of float32 tensors; aten.mul.Tensor of
+    """Stands in for a library: `ops` of float32 tensors; aten.mul of
     contiguous operands binds to the Triton kernel _mul, anything else is
     refused. With style "scratch" (or "mixed" and n % 256 == 0) the binding
     is a memset of 1.0 into scratch s0, s1 = s0 * x, out = s1 * y. Each
@@ -105,7 +105,7 @@ class TableProvider:
         if key in self.table:
             return None
         self.learned.append((key, operands))
-        ok = key.op is aten.mul.Tensor and len(set(key.sizes)) == 1
+        ok = key.op in (aten.mul.Tensor, aten.mul.out) and len(set(key.sizes)) == 1
         ok = ok and all(t.is_contiguous() for t in operands)
         self.table[key] = self._binding(*operands) if ok else None
         return self.table[key]
@@ -442,6 +442,31 @@ class TestOpaqueCalls(TestCase):
         reasons = [rec.reason for _, rec in tape.launches if type(rec) is EagerCall]
         self.assertEqual(reasons, ["aten.mul.out writes a storage another operand is of"])
         self.assertEqual(len(lower_tape(tape).opaque), 1)
+
+    def test_an_out_argument_overlapping_at_replay_runs_eagerly(self):
+        # the binding writes the argument out: a call where it overlaps x runs
+        # eagerly
+        def fn(x, y, out):
+            torch.mul(x, y, out=out)
+            return add(out)
+
+        def args(shared):
+            buf = torch.randn(576, device="cuda")
+            out = buf[64:] if shared else torch.empty(512, device="cuda")
+            return buf[:512], torch.randn(512, device="cuda"), out
+
+        f = HostTraceReplay(fn, opaque=(TableProvider(ops=(aten.mul.out,)),))
+        for _ in range(3):
+            a = args(False)
+            self.assertEqual(f(*a), fn(*a), atol=0, rtol=0)
+        self.assertEqual(len(bound(f)), 1)
+        traces, eager = f.traces, f.eager
+        overlap = "refer to a single memory location"
+        with self.assertRaisesRegex(RuntimeError, overlap):
+            fn(*args(True))
+        with self.assertRaisesRegex(RuntimeError, overlap):
+            f(*args(True))
+        self.assertEqual((f.traces, f.eager), (traces, eager + 1))
 
     def test_an_out_into_an_eager_output_is_its_argument(self):
         # Inductor reuses a freed eager call's output as an extern mm's out=:

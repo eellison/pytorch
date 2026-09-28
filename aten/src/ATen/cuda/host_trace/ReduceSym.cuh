@@ -1,7 +1,10 @@
-// gpu_reduce_kernel for a traced host: Reduce.cuh's ReduceConfig,
-// setReduceConfig and launch over a TensorIteratorSym, recording the launch of
-// the reduce_kernel eager launches. Block dimensions are guarded to their
-// power-of-two brackets, so block and shared memory are per-variant constants.
+// gpu_reduce_kernel for a traced host over a TensorIteratorSym, recording the
+// launch of the reduce_kernel eager launches. The config computation is
+// Reduce.cuh's setReduceConfig over ReduceConfigSymMath; the config's fields,
+// its plain accessors, get_output_vec_size and the launch mirror Reduce.cuh
+// (keep in sync). The config is size expressions (block, shared bytes, grid and
+// the ReduceOp's config are patched per call); only choices of the kernel
+// instantiation or of global reduction's buffers are guarded.
 #pragma once
 #include <ATen/cuda/host_trace/LoopsSym.cuh>
 #include <ATen/native/cuda/Reduce.cuh>
@@ -13,14 +16,6 @@ namespace at::cuda::host_trace {
 
 inline c10::SymInt div_up(const c10::SymInt& a, const c10::SymInt& b) {
   return (a + b - 1) / b;
-}
-
-// `dim < cap ? last_pow2(dim) : cap` for a power-of-two cap
-inline int last_pow2(const c10::SymInt& dim, int cap) {
-  while (cap > 1 && dim < cap) {
-    cap /= 2;
-  }
-  return cap;
 }
 
 struct ReduceConfig {
@@ -39,23 +34,12 @@ struct ReduceConfig {
   c10::SymInt input_mult[3] = {0, 0, 0};
   c10::SymInt output_mult[2] = {0, 0};
 
-  int block_width = 0;
-  int block_height = 0;
-  int num_threads = 0;
+  c10::SymInt block_width = 0;
+  c10::SymInt block_height = 0;
+  c10::SymInt num_threads = 0;
 
-  bool vectorize_input = false;
+  c10::SymBool vectorize_input = false;
   int output_vec_size = 1;
-
-  template <typename T>
-  void set_block_dimension(const c10::SymInt& dim0, const c10::SymInt& dim1) {
-    const int max_num_threads = at::native::mnt_wrapper<T>::MAX_NUM_THREADS / output_vec_size;
-    int dim0_pow2 = last_pow2(dim0, max_num_threads);
-    int dim1_pow2 = last_pow2(dim1, max_num_threads);
-    block_width = std::min(dim0_pow2, int(at::cuda::warp_size()));
-    block_height = std::min(dim1_pow2, int(max_num_threads / block_width));
-    block_width = std::min(dim0_pow2, int(max_num_threads / block_height));
-    num_threads = block_width * block_height;
-  }
 
   c10::SymInt split_input(const c10::SymInt& parallelism) {
     c10::SymInt step = step_input;
@@ -69,8 +53,8 @@ struct ReduceConfig {
     return step;
   }
 
-  dim3 block() const {
-    return dim3(block_width, block_height);
+  SymDim3 block() const {
+    return SymDim3(block_width, block_height);
   }
 
   SymDim3 grid() const {
@@ -81,19 +65,12 @@ struct ReduceConfig {
     return input_mult[BLOCK_X] != 0;
   }
 
-  bool should_block_y_reduce() const {
-    return input_mult[BLOCK_Y] != 0;
+  c10::SymBool should_block_y_reduce() const {
+    return input_mult[BLOCK_Y].sym_ne(0);
   }
 
   bool should_global_reduce() const {
     return input_mult[CTA] != 0;
-  }
-
-  int shared_memory_size() const {
-    if (!should_block_y_reduce() && (!should_block_x_reduce() || block_width <= at::cuda::warp_size())) {
-      return 0;
-    }
-    return element_size_bytes * num_threads * output_vec_size;
   }
 
   c10::SymInt global_memory_size() const {
@@ -116,6 +93,62 @@ struct ReduceConfig {
 
   c10::SymInt values_per_thread() const {
     return div_up(num_inputs, step_input);
+  }
+};
+
+// Reduce.cuh's ReduceConfigMath over SymInt: a size choice is a select row
+struct ReduceConfigSymMath {
+  using Config = ReduceConfig;
+  using Int = c10::SymInt;
+  using Index = c10::SymInt;
+  using Bool = c10::SymBool;
+  Recorder& rec;
+
+  c10::SymInt select(const c10::SymBool& c, const c10::SymInt& a, const c10::SymInt& b) const {
+    if (auto v = c.maybe_as_bool()) {
+      return *v ? a : b;
+    }
+    return rec.select(c, a, b);
+  }
+  c10::SymInt last_pow2(const c10::SymInt& n) const {
+    if (auto c = n.maybe_as_int()) {
+      return at::native::last_pow2(static_cast<int>(*c));
+    }
+    return rec.pow2((rec.bit_length(n) - 1).max(0));
+  }
+  static c10::SymInt div_up(const c10::SymInt& a, const c10::SymInt& b) {
+    return host_trace::div_up(a, b);
+  }
+  static c10::SymInt min(const c10::SymInt& a, const c10::SymInt& b) {
+    return a.min(b);
+  }
+  static c10::SymInt max(const c10::SymInt& a, const c10::SymInt& b) {
+    return a.max(b);
+  }
+  // std::clamp's value, as its callers have lo <= hi
+  static c10::SymInt clamp(const c10::SymInt& v, const c10::SymInt& lo, const c10::SymInt& hi) {
+    return lo.max(v.min(hi));
+  }
+  static c10::SymBool lt(const c10::SymInt& a, const c10::SymInt& b) {
+    return a.sym_lt(b);
+  }
+  static c10::SymBool le(const c10::SymInt& a, const c10::SymInt& b) {
+    return a.sym_le(b);
+  }
+  static c10::SymBool ge(const c10::SymInt& a, const c10::SymInt& b) {
+    return a.sym_ge(b);
+  }
+  static c10::SymBool ne(const c10::SymInt& a, const c10::SymInt& b) {
+    return a.sym_ne(b);
+  }
+  static c10::SymBool logical_not(const c10::SymBool& a) {
+    return ~a;
+  }
+  static c10::SymBool logical_and(const c10::SymBool& a, const c10::SymBool& b) {
+    return a & b;
+  }
+  static c10::SymBool logical_or(const c10::SymBool& a, const c10::SymBool& b) {
+    return a | b;
   }
 };
 
@@ -145,8 +178,10 @@ void set_input_calculator(Recorder& rec, Param<K>& p, ::OffsetCalculator<1>& cal
   set_offset_calculator(rec, p, calc, num_reduce_dims, iter.shape().data(), strides.data());
 }
 
-// eager tests (n / sizeof(scalar_t)) % vec_size; n % (vec_size * sizeof(scalar_t))
-// is the same test, exact on SymInt
+// Reduce.cuh's, found by the shared setReduceConfig through ADL. Eager tests
+// (n / sizeof(scalar_t)) % vec_size; n % (vec_size * sizeof(scalar_t)) is the
+// same test for an address aligned to sizeof(scalar_t), and exact on SymInt,
+// where a data pointer is only tested for its alignment
 template <typename scalar_t>
 int get_output_vec_size(const TensorIteratorSym& iter) {
   int vec_size = 4;
@@ -171,94 +206,11 @@ int get_output_vec_size(const TensorIteratorSym& iter) {
   return vec_size;
 }
 
-template <typename arg_t, typename scalar_t, int vt0, int input_vec_size = vt0>
-ReduceConfig setReduceConfig(const TensorIteratorSym& iter) {
-  c10::SymInt num_outputs = iter.num_output_elements();
-  c10::SymInt inputs_per_output = iter.numel() / num_outputs;
-  int input_index = iter.ntensors() - 1;
-
-  auto config = ReduceConfig(sizeof(arg_t), num_outputs, inputs_per_output);
-
-  c10::SymInt dim0;
-  c10::SymInt dim1;
-  c10::SymInt fastest_moving_stride;
-  bool reduction_on_fastest_striding_dimension;
-
-  if (iter.ndim() > 0) {
-    reduction_on_fastest_striding_dimension = (iter.num_reduce_dims() == iter.ndim()) ||
-        (iter.strides(input_index)[0] < iter.strides(input_index)[iter.num_reduce_dims()]);
-    if (reduction_on_fastest_striding_dimension) {
-      dim0 = inputs_per_output;
-      dim1 = num_outputs;
-      fastest_moving_stride = iter.strides(input_index)[0];
-    } else {
-      dim0 = num_outputs;
-      dim1 = inputs_per_output;
-      fastest_moving_stride = iter.strides(input_index)[iter.num_reduce_dims()];
-    }
-  } else {
-    reduction_on_fastest_striding_dimension = true;
-    fastest_moving_stride = int64_t(sizeof(scalar_t));
-    dim0 = 1;
-    dim1 = 1;
-  }
-
-  if (fastest_moving_stride == int64_t(sizeof(scalar_t))) {
-    if (reduction_on_fastest_striding_dimension && dim0 >= 128 && iter.num_reduce_dims() == 1) {
-      config.vectorize_input = true;
-      dim0 /= input_vec_size;
-    } else if (!reduction_on_fastest_striding_dimension) {
-      config.output_vec_size = get_output_vec_size<scalar_t>(iter);
-      dim0 /= config.output_vec_size;
-    }
-  }
-
-  config.set_block_dimension<scalar_t>(dim0, dim1);
-
-  int block_width = config.block_width;
-  int block_height = config.block_height;
-
-  if (iter.ndim() == 0 || reduction_on_fastest_striding_dimension) {
-    config.input_mult[0] = config.split_input(block_width);
-  } else {
-    config.output_mult[0] = config.split_output(block_width);
-  }
-
-  constexpr int min_values_per_thread = 16;
-  constexpr int max_values_per_thread = 256;
-
-  const int warp_split_threshold = std::min<int>(block_height * 16, max_values_per_thread);
-  bool split_across_warps = config.values_per_thread() >= warp_split_threshold;
-  const int num_mp = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
-
-  if (split_across_warps) {
-    config.input_mult[1] = config.split_input(block_height);
-  } else {
-    config.output_mult[1] = config.split_output(block_height);
-  }
-
-  int max_threads_per_mp = at::cuda::getCurrentDeviceProperties()->maxThreadsPerMultiProcessor;
-  const int blocks_per_sm = max_threads_per_mp / config.num_threads;
-  const int target_grid_size = num_mp * blocks_per_sm;
-  c10::SymInt grid = config.grid().x;
-  if (config.input_mult[1] != 0 && config.values_per_thread() >= max_values_per_thread && grid <= target_grid_size) {
-    c10::SymInt ctas_per_output1 = div_up(target_grid_size, grid);
-    c10::SymInt ctas_per_output2 = div_up(config.values_per_thread(), min_values_per_thread);
-    c10::SymInt ctas_per_output3 = div_up(config.values_per_thread(), max_values_per_thread);
-    // std::clamp(ctas_per_output1, ctas_per_output3, ctas_per_output2), as ctas_per_output3 <= ctas_per_output2
-    config.ctas_per_output = ctas_per_output3.max(ctas_per_output1.min(ctas_per_output2));
-    if (config.ctas_per_output > 1) {
-      config.input_mult[2] = config.split_input(config.ctas_per_output);
-    }
-  }
-  return config;
-}
-
 template <int max_threads, typename R>
 void launch_reduce_kernel(Recorder& rec, const ReduceConfig& config, const Param<R>& reduction) {
-  dim3 block = config.block();
+  SymDim3 block = config.block();
   SymDim3 grid = config.grid();
-  int shared_memory = config.shared_memory_size();
+  c10::SymInt shared_memory = at::native::shared_memory_size(ReduceConfigSymMath{rec}, config);
   switch (config.output_vec_size) {
     case 4:
       return launch(rec, &at::native::reduce_kernel<max_threads / 4, 4, R>, grid, block, shared_memory, reduction);
@@ -280,7 +232,8 @@ void gpu_reduce_kernel(Recorder& rec, const TensorIteratorSym& iter, const Param
     decline("a reduction beyond 32-bit indexing");
   }
 
-  ReduceConfig config = setReduceConfig<arg_t, scalar_t, vt0, input_vec_size>(iter);
+  const ReduceConfigSymMath math{rec};
+  ReduceConfig config = at::native::setReduceConfig<arg_t, scalar_t, vt0, input_vec_size>(iter, math);
   TensorBase buffer;
   TensorBase semaphores;
   if (config.should_global_reduce()) {
@@ -304,10 +257,10 @@ void gpu_reduce_kernel(Recorder& rec, const TensorIteratorSym& iter, const Param
   for (const auto i : c10::irange(2)) {
     reduce.set(r.config.output_mult[i], config.output_mult[i]);
   }
-  r.config.block_width = config.block_width;
-  r.config.block_height = config.block_height;
-  r.config.num_threads = config.num_threads;
-  r.config.vectorize_input = config.vectorize_input;
+  reduce.set(r.config.block_width, config.block_width);
+  reduce.set(r.config.block_height, config.block_height);
+  reduce.set(r.config.num_threads, config.num_threads);
+  reduce.set(r.config.vectorize_input, math.select(config.vectorize_input, 1, 0));
   r.config.output_vec_size = config.output_vec_size;
   set_input_calculator(rec, reduce, r.input_calc, iter);
   set_output_calculator(rec, reduce, r.output_calc, iter);

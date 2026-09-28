@@ -88,9 +88,8 @@ HostTraceVariant::HostTraceVariant(py::handle spec)
     }
     TORCH_CHECK_VALUE(r.kind == Kind::Kernel, "a record kind");
     KernelRow& k = r.kernel;
-    set_launch(k, t[2], t[3], t[4]);
-    k.grid_rows = t[5].cast<std::array<int64_t, 3>>();
-    for (int64_t row : k.grid_rows) {
+    k.dim_rows = set_launch(k, t[2], t[3], t[4], t[5]);
+    for (int64_t row : k.dim_rows) {
       check_row(row);
     }
     append_images(k, t[6], held_bytes_);
@@ -162,8 +161,8 @@ HostTraceVariant::HostTraceVariant(py::handle spec)
     }
     const KernelRow& k = r.kernel;
     pack(k, trace_rows.data(), trace_bases.data(), k.held);
-    for (size_t i = 0; i < 3; ++i) {
-      r.held_grid[i] = trace_rows[k.grid_rows[i]];
+    for (size_t i = 0; i < k.dim_rows.size(); ++i) {
+      r.held_dims[i] = trace_rows[k.dim_rows[i]];
     }
   }
   // each keyed site's table starts with the traced key, its records' own
@@ -464,6 +463,20 @@ HostTraceVariant::HostTraceVariant(py::handle spec)
         TORCH_CHECK_VALUE(false, "an output kind");
     }
   }
+  auto slot = [this](int64_t arg) {
+    const auto it =
+        std::find(pair_arguments_.begin(), pair_arguments_.end(), arg);
+    if (it != pair_arguments_.end()) {
+      return static_cast<size_t>(it - pair_arguments_.begin());
+    }
+    pair_arguments_.push_back(arg);
+    return pair_arguments_.size() - 1;
+  };
+  for (py::handle p : spec.attr("argument_pairs").cast<py::tuple>()) {
+    auto [a, b] = p.cast<std::tuple<int64_t, int64_t>>();
+    TORCH_CHECK_VALUE(0 <= a && a < b, "an argument pair (", a, ", ", b, ")");
+    argument_pairs_.push_back({slot(a), slot(b)});
+  }
   result_kind_ = spec.attr("result_kind").cast<int64_t>();
   TORCH_CHECK_VALUE(
       result_kind_ >= 0 && result_kind_ <= 3, "a result kind ", result_kind_);
@@ -514,7 +527,8 @@ HostTraceVariant::Field HostTraceVariant::parse_field(
   const auto width = t[2].cast<int64_t>();
   f.pointer = t[3].cast<bool>();
   TORCH_CHECK_VALUE(
-      width == 0 || width == 2 || width == 4 || width == 8,
+      width == 0 || (width == 1 && !f.pointer) || width == 2 || width == 4 ||
+          width == 8,
       "a field of ",
       width,
       " bytes");
@@ -559,17 +573,16 @@ unsigned int HostTraceVariant::check_element_size(py::handle size) {
   return n;
 }
 
-void HostTraceVariant::set_launch(
+std::array<int64_t, 7> HostTraceVariant::set_launch(
     KernelRow& k,
     py::handle function,
     py::handle block,
-    py::handle smem) {
+    py::handle smem,
+    py::handle grid) {
   k.params.func = reinterpret_cast<CUfunction>(function.cast<uintptr_t>());
-  auto b = block.cast<std::array<unsigned int, 3>>();
-  k.params.blockDimX = b[0];
-  k.params.blockDimY = b[1];
-  k.params.blockDimZ = b[2];
-  k.params.sharedMemBytes = smem.cast<unsigned int>();
+  const auto g = grid.cast<std::array<int64_t, 3>>();
+  const auto b = block.cast<std::array<int64_t, 3>>();
+  return {g[0], g[1], g[2], b[0], b[1], b[2], smem.cast<int64_t>()};
 }
 
 void HostTraceVariant::append_images(

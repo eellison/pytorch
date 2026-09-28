@@ -32,6 +32,7 @@ from torch.utils._sympy.functions import (
     Mod,
     PowByNatural,
     PythonMod,
+    Where,
 )
 
 
@@ -156,6 +157,9 @@ class Lowering:
             return self._emit("select", row, self._constant(0), self._constant(1))
         if isinstance(e, Identity):
             return self._lower_integer(e.args[0])
+        if isinstance(e, Where):
+            c, a, b = e.args
+            return self._emit("select", self._lower_boolean(c), self._lower_integer(a), self._lower_integer(b))
         if isinstance(e, (sympy.Add, sympy.Mul)):
             op = "add" if isinstance(e, sympy.Add) else "multiply"
             rows = [self._lower_integer(x) for x in e.args]

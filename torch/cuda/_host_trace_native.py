@@ -15,7 +15,7 @@ without entering Python on a hit.
 
 A launch is one record kind of two, the shape of a KernelLaunch and a
 Memset as lowered:
-  (0, node, function, block, smem, grid rows, per-parameter template
+  (0, node, function, block rows, smem row, grid rows, per-parameter template
    images, fields ((param, offset, width, is pointer, row, base, delta),
    ...), descriptors ((param, first field, dtype, box, swizzle), ...),
    philox fields ((param, offset, kind, delta), ...), philox increment)
@@ -85,6 +85,7 @@ class VariantSpec(NamedTuple):
     replay_hooks: tuple  # the global replay (start, end) hooks
     traced: tuple  # (rows, bases) at the traced call, which the nodes hold
     sites: tuple  # per keyed site (key rows, record indices)
+    argument_pairs: tuple  # Tape.argument_pairs
 
 
 def flatten_variant(
@@ -132,7 +133,7 @@ def flatten_variant(
             fields.append((param, offset, width, not isinstance(slot, ScalarSlot), *_source(slot)))
         images = t.images or tuple(bytes(size) for _, size in t.layout)
         descriptors = tuple((d.param, d.first, d.dtype, d.box, d.swizzle) for d in t.descriptors)
-        kernel = (t.function, t.block, t.smem, lo.grid)
+        kernel = (t.function, lo.block, lo.smem, lo.grid)
         philox = tuple((param, at, _PHILOX.index(kind), delta) for param, at, kind, delta in t.rng)
         launches.append((0, c.node, *kernel, images, tuple(fields), descriptors, philox, t.rng_increment))
     allocations = tuple(
@@ -187,6 +188,7 @@ def flatten_variant(
         (graphs._global_replay_start_hooks, graphs._global_replay_end_hooks),
         (tuple(traced[0]), tuple(traced[1])),
         tuple((site.rows, site.nodes, tuple(site.scratch[j][1] for j in sorted(site.scratch))) for site in lowered.sites),
+        lowered.tape.argument_pairs,
     )
 
 

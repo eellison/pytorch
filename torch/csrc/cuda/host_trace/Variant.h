@@ -61,6 +61,8 @@ struct Frame {
   c10::SmallVector<int32_t, 4> forms;
   // a variant's site lacked the key: the call's binding is not in a table yet
   bool keyed_miss = false;
+  // a variant's rows held and a pair of its arguments overlaps
+  bool overlapped = false;
   // the arguments' tuple when only the call holds it (call_boxed): an
   // argument is dropped after the step of its last use
   PyObject* owned = nullptr;
@@ -101,6 +103,9 @@ class HostTraceVariant {
   // forms lack) at the call, or None when it misses otherwise (a site
   // declines its key); the forms only once no key is missing
   py::object evaluate_py(py::handle args) const;
+  // Whether the call's rows hold and a pair of its arguments overlaps: the
+  // call runs eagerly
+  bool overlaps_py(py::handle args) const;
   // Adds site's row for key: nodes as _host_trace_native.binding_row, or
   // None to decline the key; the site's arm (0 its nodes' launch attributes)
   // the nodes need, whether the arm is a piece (nodes of their own, not the
@@ -141,7 +146,7 @@ class HostTraceVariant {
   struct Field {
     uint32_t param;
     uint32_t offset; // in the parameter's image
-    // 2, 4 or 8; a 4-byte pointer is the address's low half; 0: only a
+    // 1, 2, 4 or 8; a 4-byte pointer is the address's low half; 0: only a
     // descriptor reads it
     uint8_t width;
     bool pointer;
@@ -173,10 +178,11 @@ class HostTraceVariant {
   // What a kernel node runs: its record's own, or a keyed site's row for a
   // key (harvested once, selected by one hash lookup of the key's rows)
   struct KernelRow {
-    CUDA_KERNEL_NODE_PARAMS params; // func, block, smem; grid per call
-    std::array<int64_t, 3> grid_rows;
-    bool constant_grid;
-    std::array<int64_t, 3> grid; // a keyed row's
+    CUDA_KERNEL_NODE_PARAMS params; // func; grid, block, smem per call
+    // grid xyz, block xyz, shared bytes
+    std::array<int64_t, 7> dim_rows;
+    bool constant_dims;
+    std::array<int64_t, 7> dims; // a keyed row's
     size_t first_field; // while built, then fields
     size_t field_count;
     size_t first_descriptor;
@@ -214,7 +220,7 @@ class HostTraceVariant {
     size_t site_pos; // its node's index in the site
     // a kernel's
     KernelRow kernel;
-    std::array<int64_t, 3> held_grid;
+    std::array<int64_t, 7> held_dims;
     // a memset's
     MemsetRow memset;
     std::array<int64_t, 4> held_memset; // address, width, height, pitch
@@ -344,6 +350,13 @@ class HostTraceVariant {
     int64_t segment; // or -1: eager_[eager]
     size_t eager;
   };
+  // Arguments pair_arguments_[a] and pair_arguments_[b], disjoint at the
+  // trace, where a traced step writes one and reads the other
+  // (Tape.argument_pairs)
+  struct ArgumentPair {
+    size_t a;
+    size_t b;
+  };
   enum class OutputKind : uint8_t { Scalar, View, Base, Alias };
   struct Output {
     OutputKind kind;
@@ -371,6 +384,7 @@ class HostTraceVariant {
   int64_t alloc_bytes(int64_t k, const Frame& frame) const;
   at::Tensor run_buffer(const StepMemory& memory, Frame& frame) const;
   bool evaluate_rows(PyObject* const* args, size_t count, Frame& frame) const;
+  bool disjoint(PyObject* const* args, size_t count) const;
   // The key's index in the site's table, or -1
   int64_t find(const Site& s, const int64_t* key) const;
   void insert(Site& s, const int64_t* key, int64_t row);
@@ -391,11 +405,13 @@ class HostTraceVariant {
       py::handle rng,
       py::handle increment) const;
   static unsigned int check_element_size(py::handle size);
-  static void set_launch(
+  // sets k's function; its grid, block and smem as KernelRow::dims
+  static std::array<int64_t, 7> set_launch(
       KernelRow& k,
       py::handle function,
       py::handle block,
-      py::handle smem);
+      py::handle smem,
+      py::handle grid);
   static void append_images(
       KernelRow& k,
       py::handle images,
@@ -452,6 +468,8 @@ class HostTraceVariant {
   std::vector<Step> steps_;
   std::vector<StepMemory> memory_; // per step, then after the last
   std::vector<Output> outputs_;
+  std::vector<ArgumentPair> argument_pairs_;
+  std::vector<size_t> pair_arguments_;
   int64_t result_kind_; // none, tensor, tuple, list
   c10::DeviceIndex device_;
   py::object disagreement_;

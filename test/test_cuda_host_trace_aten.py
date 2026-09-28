@@ -12,7 +12,7 @@ from torch.cuda._host_trace_capture import (
 from torch.cuda._host_trace_harvest import _zero_init
 from torch.cuda._host_trace_launch import KernelLaunch
 from torch.cuda._host_trace_replay import HostTraceReplay
-from torch.cuda._host_trace_tape import _hint, EagerCall, Memset, trace
+from torch.cuda._host_trace_tape import _hint, EagerCall, Memset, trace, TrustedInputs
 from torch.testing._internal.common_utils import (
     instantiate_parametrized_tests,
     parametrize,
@@ -55,11 +55,11 @@ REDUCTIONS = {
     f"{op.__name__}_{form}": (lambda x, op=op, f=f: f(op, x), traces, ops, same)
     for op, ops, same in ((torch.sum, 0, False), (torch.mean, 4, False), (torch.amax, 0, True))
     for form, f, traces in (
-        ("last", lambda op, x: op(x, -1), 8),
-        ("first", lambda op, x: op(x, 0), 4),
-        ("keepdim", lambda op, x: op(x, -1, keepdim=True), 8),
-        ("all", lambda op, x: op(x), 6),
-        ("t", lambda op, x: op(x.t(), -1), 4),
+        ("last", lambda op, x: op(x, -1), 2),
+        ("first", lambda op, x: op(x, 0), 2),
+        ("keepdim", lambda op, x: op(x, -1, keepdim=True), 2),
+        ("all", lambda op, x: op(x), 3),
+        ("t", lambda op, x: op(x.t(), -1), 2),
     )
 }
 
@@ -227,6 +227,43 @@ class TestHostTraceAten(TestCase):
         self.assertLessEqual(entry.traces, most)
         self.assertEqual(entry.eager, 0)
 
+    def _assert_replays_like_eager(self, entry, fn, x):
+        torch.cuda.synchronize()
+        base = torch.cuda.memory_allocated()
+        torch.cuda.reset_peak_memory_stats()
+        out = entry(x)
+        torch.cuda.synchronize()
+        replay_peak = torch.cuda.max_memory_allocated() - base
+        ref = fn(x)
+        self.assertEqual(out, ref, atol=0, rtol=0)
+        del out, ref
+        torch.cuda.reset_peak_memory_stats()
+        fn(x)
+        torch.cuda.synchronize()
+        self.assertEqual(replay_peak, torch.cuda.max_memory_allocated() - base)
+
+    @parametrize("dtype", [torch.float16, torch.float32])
+    @parametrize("case", ["sum_last", "amax_last", "mean_first", "sum_t"])
+    def test_reduction_one_trace_across_brackets(self, dtype, case):
+        # the launch config's power-of-two brackets of both sizes are patched,
+        # not guarded
+        fn = REDUCTIONS[case][0]
+        entry = HostTraceReplay(fn)
+        for m, h in ((64, 768), (2, 768), (37, 96), (129, 4096), (600, 200), (9, 1500), (300, 32)):
+            self._assert_replays_like_eager(entry, fn, torch.randn(m, h, device="cuda", dtype=dtype))
+        self.assertEqual(entry.traces, 1)
+        self.assertEqual(entry.eager, 0)
+
+    def test_global_reduction_replays_new_shapes(self):
+        # a reduction across CTAs: its staging buffer, semaphores and CTAs per
+        # output are sizes of the call
+        fn = REDUCTIONS["sum_last"][0]
+        entry = HostTraceReplay(fn)
+        for m, h in ((2, 1 << 20), (3, 3 << 19), (5, 1 << 21)):
+            self._assert_replays_like_eager(entry, fn, torch.randn(m, h, device="cuda"))
+        self.assertEqual(entry.traces, 1)
+        self.assertEqual(entry.eager, 0)
+
     @parametrize("dtype", [torch.float16, torch.float32])
     @parametrize("case", list(REDUCTIONS))
     @parametrize("m", [4096, 64, 7, 1])
@@ -260,8 +297,8 @@ class TestHostTraceAten(TestCase):
         self.assertEqual(entry(*args), fn(*args), atol=0, rtol=0)
 
     def test_copy_between_arguments_checks_overlap_at_replay(self):
-        # the tape keys layouts, not addresses: arguments distinct at the trace
-        # share storage at the third call, where eager's copy_ raises
+        # arguments disjoint at the trace share storage at the third call: the
+        # variant's argument pair overlaps, so the call runs eagerly
         def pair(shared):
             buf = torch.arange(64 * 64 + 4, device="cuda", dtype=torch.float32)
             dst = buf[:4096] if shared else torch.zeros(4096, device="cuda")
@@ -270,16 +307,85 @@ class TestHostTraceAten(TestCase):
         def fn(dst, src):
             return dst.copy_(src)
 
-        self.assertEqual([type(c) for _, c in trace(fn, pair(False)).launches], [EagerCall])
+        self.assertTrue(all(isinstance(c, KernelLaunch) for _, c in trace(fn, pair(False)).launches))
         entry = HostTraceReplay(fn)
         for _ in range(2):
             self.assertEqual(entry(*pair(False)), fn(*pair(False)), atol=0, rtol=0)
+        self.assertEqual(entry.eager, 0)
         overlap = "refer to a single memory location"
         with self.assertRaisesRegex(RuntimeError, overlap):
             fn(*pair(True))
         with self.assertRaisesRegex(RuntimeError, overlap):
             entry(*pair(True))
-        self.assertEqual(entry.traces, 1)
+        self.assertEqual(entry(*pair(False)), fn(*pair(False)), atol=0, rtol=0)
+        self.assertEqual((entry.traces, entry.eager, len(entry.variants)), (1, 1, 1))
+
+    def test_a_trusted_trace_records_no_argument_pairs(self):
+        # the caller vouches for trusted inputs' aliasing: no replay overlap check
+        def fn(dst, src):
+            return dst.copy_(src)
+
+        args = (torch.zeros(64, 64, device="cuda").t(), torch.randn(64, 64, device="cuda"))
+        self.assertEqual(trace(fn, args).argument_pairs, ((0, 1),))
+        trusted = TrustedInputs(layouts=tuple((tuple(a.shape), a.stride()) for a in args))
+        self.assertEqual(trace(fn, args, trusted=trusted).argument_pairs, ())
+
+    def test_inplace_between_arguments_partially_overlapping_at_replay(self):
+        def fn(a, b):
+            return a.add_(b) * b
+
+        def pair(shift):
+            buf = torch.randn(8192, device="cuda")
+            return buf[:4096], (buf[shift : shift + 4096] if shift else torch.randn(4096, device="cuda"))
+
+        entry = HostTraceReplay(fn)
+        for _ in range(2):
+            a, b = pair(0)
+            self.assertEqual(entry(a.clone(), b), fn(a.clone(), b), atol=0, rtol=0)
+        self.assertEqual(entry.eager, 0)
+        overlap = "refer to a single memory location"
+        with self.assertRaisesRegex(RuntimeError, overlap):
+            fn(*pair(1024))
+        with self.assertRaisesRegex(RuntimeError, overlap):
+            entry(*pair(1024))
+        # disjoint views of one storage hold the disjoint variant
+        buf = torch.randn(8192, device="cuda")
+        ref = buf.clone()
+        self.assertEqual(entry(buf[:4096], buf[4096:]), fn(ref[:4096], ref[4096:]), atol=0, rtol=0)
+
+    @parametrize("traced_alias", [True, False])
+    def test_self_alias_at_trace_or_replay(self, traced_alias):
+        # a variant traced at an overlap runs that step eagerly at every call;
+        # one traced disjoint runs a call whose arguments overlap eagerly
+        def fn(a, b):
+            return a.copy_(b) * b
+
+        def call(f, alias):
+            a = torch.arange(8192, device="cuda", dtype=torch.float32)[::2]
+            return f(a, a) if alias else f(a, torch.ones(8192, device="cuda")[::2])
+
+        entry = HostTraceReplay(fn)
+        for alias in (traced_alias, traced_alias, not traced_alias, not traced_alias, traced_alias):
+            self.assertEqual(call(entry, alias), call(fn, alias), atol=0, rtol=0)
+        steps = [[c.reason for _, c in v.captured.lowered.tape.launches if type(c) is EagerCall] for v in entry.variants]
+        aliased = ["aten.copy_.default writes a storage another operand is of"]
+        self.assertEqual((entry.traces, entry.eager, steps), (1, 0, [aliased]) if traced_alias else (1, 2, [[]]))
+
+    def test_self_alias_decline_is_its_own_class(self):
+        # a tape of only an eager step declines its call's class, which
+        # includes which arguments overlap
+        def fn(a, b):
+            return a.copy_(b)
+
+        def call(f, alias):
+            a = torch.arange(8192, device="cuda", dtype=torch.float32)[::2]
+            return f(a, a) if alias else f(a, torch.ones(8192, device="cuda")[::2])
+
+        entry = HostTraceReplay(fn)
+        for alias, eager in ((True, 1), (False, 1), (True, 2), (False, 2)):
+            self.assertEqual(call(entry, alias), call(fn, alias), atol=0, rtol=0)
+            self.assertEqual(entry.eager, eager)
+        self.assertEqual((entry.traces, len(entry.variants)), (2, 1))
 
     def test_size_one_dim_strides_follow_eager(self):
         # x [1, h] has strides (1, 1): eager's output keeps stride 1 on the

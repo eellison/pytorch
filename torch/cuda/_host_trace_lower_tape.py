@@ -85,9 +85,11 @@ class PointerSlot:
 @dataclass(frozen=True)
 class LoweredLaunch:
     seq: int
-    launch: KernelLaunch  # its function, layout, block and shared bytes
+    launch: KernelLaunch  # its function and layout
     slots: tuple[ScalarSlot | PointerSlot, ...]  # in the launch's slot order
     grid: tuple[int, int, int]  # rows
+    block: tuple[int, int, int]  # rows
+    smem: int  # row
 
 
 @dataclass(frozen=True)
@@ -447,8 +449,9 @@ class _TapeLowering:
             self.pointer(v, launch) if slot in pointers else ScalarSlot(self.row(v))
             for slot, v in enumerate(launch.slots)
         )
-        x, y, z = (self.row(g) for g in launch.grid)
-        return LoweredLaunch(seq, launch, slots, (x, y, z))
+        gx, gy, gz = (self.row(g) for g in launch.grid)
+        bx, by, bz = (self.row(b) for b in launch.block)
+        return LoweredLaunch(seq, launch, slots, (gx, gy, gz), (bx, by, bz), self.row(launch.smem))
 
     def outputs(self) -> tuple[Ref | LoweredView | ScalarSlot, ...]:
         tape, refs = self.tape, []

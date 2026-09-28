@@ -28,6 +28,9 @@ struct PyRecorder : ht::Recorder {
   c10::SymInt f32_div(const c10::SymInt& a, const c10::SymInt& b) override {
     return host_trace.attr("f32_div")(a, b).cast<c10::SymInt>();
   }
+  c10::SymInt select(const c10::SymBool& c, const c10::SymInt& a, const c10::SymInt& b) override {
+    return host_trace.attr("select")(c, a, b).cast<c10::SymInt>();
+  }
   py::module host_trace = py::module::import("torch.cuda._host_trace");
 };
 

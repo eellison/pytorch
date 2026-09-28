@@ -27,9 +27,10 @@ struct Field {
   bool pointer;
 };
 
-// a launch's grid; a SymInt is a one-dimensional grid
+// a launch's grid or block; a SymInt or an integer is one-dimensional
 struct SymDim3 {
   SymDim3(c10::SymInt x, c10::SymInt y = 1, c10::SymInt z = 1) : x(std::move(x)), y(std::move(y)), z(std::move(z)) {}
+  SymDim3(int64_t x) : x(x), y(1), z(1) {}
   c10::SymInt x, y, z;
 };
 
@@ -39,8 +40,8 @@ struct KernelRecord {
   std::vector<std::vector<uint8_t>> params;
   std::vector<Field> fields;
   SymDim3 grid{0};
-  dim3 block;
-  int64_t smem;
+  SymDim3 block{0};
+  c10::SymInt smem;
 };
 
 struct Recorder {
@@ -52,6 +53,8 @@ struct Recorder {
   virtual c10::SymInt pow2(const c10::SymInt& x) = 0;
   // static_cast<float>(a) / static_cast<float>(b)'s bits, as the program's f32div row
   virtual c10::SymInt f32_div(const c10::SymInt& a, const c10::SymInt& b) = 0;
+  // `c ? a : b`, as the program's select row
+  virtual c10::SymInt select(const c10::SymBool& c, const c10::SymInt& a, const c10::SymInt& b) = 0;
   std::vector<KernelRecord> launches;
 };
 
@@ -76,10 +79,10 @@ struct Param {
     return *reinterpret_cast<K*>(bytes.data());
   }
   // a scalar or pointer member of value(): a constant is written, a symbolic
-  // value recorded (the launch packs a 4-byte field as a signed int32)
+  // value recorded (the launch packs a 1- or 4-byte field as a signed integer)
   template <class T>
   void set(T& member, const c10::SymInt& v) {
-    static_assert(sizeof(T) == 4 || sizeof(T) == 8);
+    static_assert(sizeof(T) == 1 || sizeof(T) == 4 || sizeof(T) == 8);
     if (auto c = v.maybe_as_int()) {
       if constexpr (std::is_pointer_v<T>) {
         member = reinterpret_cast<T>(static_cast<uintptr_t>(*c));
@@ -130,7 +133,7 @@ Param<K> scalar_param(const c10::SymInt& v) {
 // `kernel<<<grid, block, smem>>>(params...)`, recorded; parameters are laid out
 // at their natural alignment, as the driver's cuFuncGetParamInfo reports
 template <class... KArgs>
-void launch(Recorder& rec, void (*kernel)(KArgs...), SymDim3 grid, dim3 block, int64_t smem, const Param<KArgs>&... params) {
+void launch(Recorder& rec, void (*kernel)(KArgs...), SymDim3 grid, SymDim3 block, c10::SymInt smem, const Param<KArgs>&... params) {
   KernelRecord r;
   C10_CUDA_CHECK(cudaGetFuncBySymbol(&r.function, reinterpret_cast<const void*>(kernel)));
   size_t end = 0;
@@ -146,8 +149,8 @@ void launch(Recorder& rec, void (*kernel)(KArgs...), SymDim3 grid, dim3 block, i
   };
   (add(params), ...);
   r.grid = std::move(grid);
-  r.block = block;
-  r.smem = smem;
+  r.block = std::move(block);
+  r.smem = std::move(smem);
   rec.launches.push_back(std::move(r));
 }
 

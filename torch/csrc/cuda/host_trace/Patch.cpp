@@ -101,6 +101,15 @@ void HostTraceVariant::pack(
       } else {
         std::memcpy(at, &x, sizeof(x));
       }
+    } else if (f.width == 1) {
+      TORCH_CHECK_VALUE(
+          x >= std::numeric_limits<int8_t>::min() &&
+              x <= std::numeric_limits<int8_t>::max(),
+          "host_trace: ",
+          x,
+          " is not a 1-byte field's");
+      const auto y = static_cast<int8_t>(x);
+      std::memcpy(at, &y, sizeof(y));
     } else if (f.width == 2) {
       TORCH_CHECK_VALUE(
           x >= std::numeric_limits<int16_t>::min() &&
@@ -215,32 +224,38 @@ void HostTraceVariant::patch_and_replay(Segment& run, Frame& frame) {
                              : philox);
       std::memcpy(k.image + k.param_offsets[f.param] + f.offset, &x, sizeof(x));
     }
-    const std::array<int64_t, 3> grid = k.constant_grid
-        ? k.grid
-        : std::array<int64_t, 3>{
-              v[k.grid_rows[0]], v[k.grid_rows[1]], v[k.grid_rows[2]]};
-    if (r.held && r.held_row == row && grid == r.held_grid &&
+    std::array<int64_t, 7> dims = k.dims;
+    if (!k.constant_dims) {
+      for (size_t i = 0; i < dims.size(); ++i) {
+        dims[i] = v[k.dim_rows[i]];
+      }
+    }
+    if (r.held && r.held_row == row && dims == r.held_dims &&
         std::memcmp(k.image, k.held, k.nbytes) == 0) {
       return;
     }
     // a patch cut short leaves the node unknown, never stale
     r.held = false;
-    for (int64_t g : grid) {
+    for (int64_t d : dims) {
       TORCH_CHECK_VALUE(
-          g >= 0 && g <= std::numeric_limits<unsigned int>::max(),
-          "host_trace: a grid axis of ",
-          g);
+          d >= 0 && d <= std::numeric_limits<unsigned int>::max(),
+          "host_trace: a launch dimension of ",
+          d);
     }
-    k.params.gridDimX = static_cast<unsigned int>(grid[0]);
-    k.params.gridDimY = static_cast<unsigned int>(grid[1]);
-    k.params.gridDimZ = static_cast<unsigned int>(grid[2]);
+    k.params.gridDimX = static_cast<unsigned int>(dims[0]);
+    k.params.gridDimY = static_cast<unsigned int>(dims[1]);
+    k.params.gridDimZ = static_cast<unsigned int>(dims[2]);
+    k.params.blockDimX = static_cast<unsigned int>(dims[3]);
+    k.params.blockDimY = static_cast<unsigned int>(dims[4]);
+    k.params.blockDimZ = static_cast<unsigned int>(dims[5]);
+    k.params.sharedMemBytes = static_cast<unsigned int>(dims[6]);
     C10_CUDA_DRIVER_CHECK(
         driver->cuGraphExecKernelNodeSetParams_(exec, node, &k.params));
     TORCH_CHECK(
         fail_after_setter < 0 || fail_after_setter-- != 0,
         "host_trace: a failure injected after a setter");
     std::memcpy(k.held, k.image, k.nbytes);
-    r.held_grid = grid;
+    r.held_dims = dims;
     r.held_row = row;
     r.held = true;
   };

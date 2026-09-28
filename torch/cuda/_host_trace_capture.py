@@ -6,7 +6,7 @@ itself, over the caller's addresses or buffers it allocates, each with the
 parameter bytes the compiled program yields at the traced call
 (launch_images, the same bytes a replay patches). First the compiled program at the traced call must agree
 with the trace: every row equals the value the program computed while it was
-built, and every launch slot, grid axis and allocation extent equals its
+built, and every launch slot, launch dimension and allocation extent equals its
 value in the trace (for a pointer, its displacement from its root, since the
 trace's addresses are placeholders), as must every eager call's argument and
 predicted output rows. Then each launch must add exactly one kernel node to
@@ -74,7 +74,7 @@ raise_trace_disagreements = False
 
 _POINTER = struct.Struct("<Q")
 _POINTERS = {4: struct.Struct("<I"), 8: _POINTER}  # a 4-byte one is the low half
-_SCALARS = {2: struct.Struct("<h"), 4: struct.Struct("<i"), 8: struct.Struct("<q")}
+_SCALARS = {1: struct.Struct("<b"), 2: struct.Struct("<h"), 4: struct.Struct("<i"), 8: struct.Struct("<q")}
 
 
 @dataclass(frozen=True)
@@ -455,8 +455,9 @@ def _check_trace_values(lowered: LoweredTape, values: Sequence[int]) -> None:
             for row, v in zip((lo.width, lo.height, lo.pitch), traced):
                 check(row, _hint(v), f"memset {name} extent")
         else:
-            for axis, (row, v) in enumerate(zip(lo.grid, lo.launch.grid)):
-                check(row, _hint(v), f"kernel {name} grid axis {axis}")
+            dims = zip((*lo.grid, *lo.block, lo.smem), (*lo.launch.grid, *lo.launch.block, lo.launch.smem))
+            for axis, (row, v) in enumerate(dims):
+                check(row, _hint(v), f"kernel {name} launch dimension {axis}")
         for i, (slot, v) in enumerate(zip(lo.slots, lo.launch.slots)):
             if isinstance(slot, ScalarSlot):
                 check(slot.row, _hint(v), f"kernel {name} slot {i}")
@@ -529,8 +530,8 @@ def _launch(
             attributes.append((ids.CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION, 1))
         config = driver.CUlaunchConfig()
         config.gridDimX, config.gridDimY, config.gridDimZ = (values[row] for row in lo.grid)
-        config.blockDimX, config.blockDimY, config.blockDimZ = t.block
-        config.sharedMemBytes = t.smem
+        config.blockDimX, config.blockDimY, config.blockDimZ = (values[row] for row in lo.block)
+        config.sharedMemBytes = values[lo.smem]
         config.hStream = stream
         config.attrs = launch_attributes(attributes)
         config.numAttrs = len(attributes)
@@ -581,8 +582,8 @@ def _verify(
             (p.blockDimX, p.blockDimY, p.blockDimZ),
             p.sharedMemBytes,
         )
-        grid = tuple(values[row] for row in lo.grid)
-        if got != (t.function, grid, t.block, t.smem):
+        grid, block = (tuple(values[row] for row in rows) for rows in (lo.grid, lo.block))
+        if got != (t.function, grid, block, values[lo.smem]):
             raise declined(f"{where} has another launch config")
         plain = plain_attributes(torch.cuda.current_device())
         attributes = {k: v for k, v in node_attributes(node).items() if v != plain.get(k)}

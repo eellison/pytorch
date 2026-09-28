@@ -18,7 +18,7 @@ import sympy
 from torch._guards import GuardSource, ShapeGuard, SLoc, Source
 from torch.fx.experimental.symbolic_shapes import DimDynamic, ShapeEnv
 from torch.cuda._host_trace_program import f32_bits
-from torch.utils._sympy.functions import Mod
+from torch.utils._sympy.functions import Mod, Where
 from torch.utils._sympy.numbers import int_oo
 from torch.utils._sympy.value_ranges import bound_sympy, ValueRanges
 
@@ -263,6 +263,18 @@ def bit_length(x: IntLikeType) -> IntLikeType:
         raise NotImplementedError("host_trace: the bit length of an unbacked size")
     # pyrefly: ignore [missing-attribute]
     return env.create_symintnode(BitLength(node.expr), hint=hint.bit_length())
+
+
+def select(c: torch.SymBool, a: IntLikeType, b: IntLikeType) -> IntLikeType:
+    """`c ? a : b` for a traced host: a Where, which the program lowers to a select
+    row (sym_ite's Piecewise makes sympy fold every expression it enters)."""
+    node = c.node
+    exprs = [sympy.Integer(x) if isinstance(x, int) else x.node.expr for x in (a, b)]
+    hints = [x if isinstance(x, int) else x.node.hint for x in (a, b)]
+    if node.hint is None or None in hints:
+        raise NotImplementedError("host_trace: a select over an unbacked size")
+    # pyrefly: ignore [missing-attribute]
+    return node.shape_env.create_symintnode(Where(node.expr, *exprs), hint=hints[0] if node.hint else hints[1])
 
 
 class F32Div(sympy.Function):

@@ -118,7 +118,7 @@ py::list HostTraceVariant::held_images() const {
         images[i] =
             py::bytes(reinterpret_cast<const char*>(at), k.param_sizes[i]);
       }
-      const auto& g = r.held_grid;
+      const auto& g = r.held_dims;
       out.append(py::make_tuple(py::make_tuple(g[0], g[1], g[2]), images));
     }
   }
@@ -533,6 +533,7 @@ void initHostTraceVariantBindings(PyObject* module) {
       .def(py::init<py::handle>(), py::arg("spec"))
       .def("call", &HostTraceVariant::call_py, py::arg("args"))
       .def("evaluate", &HostTraceVariant::evaluate_py, py::arg("args"))
+      .def("overlaps", &HostTraceVariant::overlaps_py, py::arg("args"))
       .def(
           "add_row",
           &HostTraceVariant::add_row,

@@ -34,8 +34,8 @@ class KernelLaunch:
     abi: TritonABI | None  # None for a CuTe launch, which has `pointers`
     layout: tuple[tuple[int, int], ...]  # (offset, size) of each slot
     grid: tuple[Any, Any, Any]
-    block: tuple[int, int, int]
-    smem: int
+    block: tuple[Any, Any, Any]
+    smem: Any
     slots: tuple[Any, ...]  # each parameter slot's value, in ABI order
     roots: tuple[_Root, ...]  # the pointer arguments' roots; all may be written
     owner: Any = None  # keeps `function` loaded: a CompiledKernel or Inductor's result
