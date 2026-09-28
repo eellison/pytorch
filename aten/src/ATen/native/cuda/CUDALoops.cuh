@@ -698,6 +698,21 @@ C10_HOST_DEVICE typename traits::result_type invoke(
   return invoke_impl<traits>(f, data, strides, dtypes, i, Indices{});
 }
 
+// the strided loop body, a named type so that a traced host
+// (ATen/cuda/host_trace/LoopsSym.cuh) launches the same kernel
+template <typename func_t, int ntensors>
+struct StridedOp {
+  using arg0_t = typename function_traits<func_t>::result_type;
+  std::array<char*, ntensors> data;
+  ::OffsetCalculator<ntensors> offset_calc;
+  func_t f;
+  __device__ void operator()(int idx) const {
+    auto offsets = offset_calc.get(idx);
+    arg0_t* out = (arg0_t*)(data[0] + offsets[0]);
+    *out = invoke(f, &data[1], &offsets[1], 1);
+  }
+};
+
 template <typename func_t>
 void gpu_kernel_impl_nocast(TensorIteratorBase& iter, const func_t& f) {
   using traits = function_traits<func_t>;
@@ -723,11 +738,7 @@ void gpu_kernel_impl_nocast(TensorIteratorBase& iter, const func_t& f) {
   auto offset_calc = ::make_offset_calculator<traits::arity + 1>(iter);
 #ifndef USE_ROCM
   constexpr int unroll_factor = sizeof(arg0_t) >= 4 ? 2 : 4;
-  launch_legacy_kernel<128, unroll_factor>(numel, [=] GPU_LAMBDA(int idx) {
-    auto offsets = offset_calc.get(idx);
-    arg0_t* out = (arg0_t*)(data[0] + offsets[0]);
-    *out = invoke(f, &data[1], &offsets[1], 1);
-  });
+  launch_legacy_kernel<128, unroll_factor>(numel, StridedOp<func_t, ntensors>{data, offset_calc, f});
 #else
   constexpr int unroll_factor = sizeof(arg0_t) >= 4 ? 4 : 8;
   constexpr int grp_sz = 128;

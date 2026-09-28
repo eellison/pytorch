@@ -88,6 +88,8 @@ namespace {
 // synchronization.
 std::atomic<size_t> g_expandable_segments_reserved_bytes{0};
 std::atomic<size_t> g_expandable_segments_count{0};
+// getSegmentReleaseCount(), bumped with DeviceStats::num_device_free
+std::atomic<size_t> g_segment_releases{0};
 } // namespace
 
 #if defined(PYTORCH_C10_DRIVER_API_SUPPORTED) || defined(USE_ROCM)
@@ -1617,6 +1619,10 @@ class DeviceCachingAllocator {
   std::string internal_metadata_tag;
 
  public:
+  std::unique_lock<std::recursive_mutex> lock() const {
+    return std::unique_lock<std::recursive_mutex>(mutex);
+  }
+
   explicit DeviceCachingAllocator(c10::DeviceIndex id)
       : device_id(id),
         large_blocks(/*small=*/false),
@@ -4253,6 +4259,7 @@ class DeviceCachingAllocator {
       const std::shared_ptr<GatheredContext>& context) {
     TORCH_INTERNAL_ASSERT(!block->expandable_segment_);
     stats.num_device_free++;
+    g_segment_releases.fetch_add(1, std::memory_order_relaxed);
     record_trace(
         TraceEntry::SEGMENT_FREE,
         int64_t(block->ptr),
@@ -4369,6 +4376,7 @@ class DeviceCachingAllocator {
     }
 
     stats.num_device_free++;
+    g_segment_releases.fetch_add(1, std::memory_order_relaxed);
     record_trace(
         TraceEntry::SEGMENT_UNMAP,
         int64_t(unmapped.ptr),
@@ -5574,6 +5582,15 @@ size_t getExpandableSegmentsReservedBytes() {
 
 size_t getExpandableSegmentsCount() {
   return g_expandable_segments_count.load(std::memory_order_relaxed);
+}
+
+size_t getSegmentReleaseCount() {
+  return g_segment_releases.load(std::memory_order_relaxed);
+}
+
+std::unique_lock<std::recursive_mutex> lockDeviceAllocator(
+    c10::DeviceIndex device) {
+  return Native::allocator.device_allocator[device]->lock();
 }
 } // namespace cuda::CUDACachingAllocator
 } // namespace c10

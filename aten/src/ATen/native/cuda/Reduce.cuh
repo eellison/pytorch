@@ -11,6 +11,7 @@
 #include <c10/macros/Macros.h>
 #include <c10/cuda/CUDACachingAllocator.h>
 #include <array>
+#include <cstring>
 #include <functional>
 #include <iosfwd>
 #include <type_traits>
@@ -1279,7 +1280,14 @@ inline void gpu_reduce_kernel(TensorIterator& iter, const ops_t& ops, ident_t id
   AT_ASSERT(can_use_32bit_indexing);
   auto output_calc = make_output_calculator<uint32_t>(iter);
   auto input_calc = make_input_calculator<uint32_t>(iter);
-  auto reduce = ReduceOp<scalar_t, ops_t, uint32_t, out_scalar_t, vt0, input_vec_size>(
+  using reduce_op_t = ReduceOp<scalar_t, ops_t, uint32_t, out_scalar_t, vt0, input_vec_size>;
+  // The kernel parameter is this object's bytes; a host trace harvest needs
+  // its padding and empty ops functor zeroed, not left as stack garbage
+  alignas(reduce_op_t) unsigned char reduce_storage[sizeof(reduce_op_t)];
+  if (c10::cuda::isHostTraceHarvesting()) {
+    std::memset(reduce_storage, 0, sizeof(reduce_storage));
+  }
+  auto& reduce = *new (reduce_storage) reduce_op_t(
       ops,
       config,
       input_calc,

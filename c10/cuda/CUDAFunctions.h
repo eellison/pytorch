@@ -129,6 +129,12 @@ C10_CUDA_API void __inline__ stream_synchronize(cudaStream_t stream) {
 C10_CUDA_API bool hasPrimaryContext(DeviceIndex device_index);
 C10_CUDA_API std::optional<DeviceIndex> getDeviceIndexWithPrimaryContext();
 
+// Set on a thread while the host-trace harvest captures an op there: kernel
+// parameter structs that leave unused bytes uninitialized zero them first,
+// so that every byte of a launch's parameters is the same in each capture
+C10_CUDA_API bool isHostTraceHarvesting();
+C10_CUDA_API void setHostTraceHarvesting(bool enabled);
+
 } // namespace c10::cuda
 
 #ifdef USE_ROCM

@@ -1,0 +1,346 @@
+"""Host tracing (private): a replay's allocations, all from the caching
+allocator on the current stream, in one of two modes (HostTraceReplay's
+`memory`; "auto" picks one per variant).
+
+A replay runs the tape's steps in order (a graph per run of launches, or an
+eager call). An allocation is a temporary if only launches of the run it is
+allocated in use it; every other allocation is a tensor, as eager's is: an
+output allocation (one an output is or views) lives while the caller holds
+it; one an eager call reads or writes, or that a later step uses, is dropped
+after its last step, once that step is queued. An eager call's fresh outputs
+are the op's own tensors, dropped after their last step too.
+
+"eager" (HostTraceReplay's default) makes eager's requests: a run's
+allocations are made in tape order, and a temporary is freed right after
+the last launch that uses it, so a later temporary or tensor of the run can
+take its bytes as in eager. A run's graph is one chain in tape order, so a
+block is reused only by a node after the freed one's last node, as eager's
+stream orders it. The
+frees come before the run's graph is queued, while eager's come after its
+kernels are: the native commit (HostTraceVariant::allocate) holds the
+device's allocator lock from the run's first allocation to its launch, so
+no other thread takes a freed temporary's bytes ahead of the graph, and
+checks that no cached segment was released meanwhile (its own allocation's
+OOM retry). Otherwise, or when replay hooks run Python before the launch, it
+places the run's temporaries as "run_buffer" does. The price
+against eager: a tensor is dropped once the step of its last use is queued,
+not right after that use; split_runs splits a run where that holds a tensor
+across the replay's peak. An argument no output is or views is dropped
+after its last step too when the caller hands its references over
+(HostTraceReplay.call_boxed, Inductor's boxed call); otherwise the caller
+holds it anyway. split_runs splits where that holds a freed argument
+(HostTraceReplay's `freed_arguments`) across the peak too.
+
+"auto" (Inductor's default) picks one of the two per variant, by
+auto_memory.
+
+"run_buffer" makes fewer allocator calls and holds more memory: each
+allocation is made at the start of its step, and a run's temporaries are
+placed first fit in one buffer freed once the run's graph is queued; two
+share bytes only if their lifetimes (allocation to last use) do not
+overlap. A tensor cannot reuse a temporary's bytes, and each distinct
+buffer size is its own block, which fragments the allocator's pool when
+the shapes vary.
+"""
+
+from __future__ import annotations
+
+import bisect
+import dataclasses
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+from torch.cuda._host_trace_lower_tape import (
+    LoweredEagerCall,
+    LoweredView,
+    PointerSlot,
+    PredictedOutput,
+    ScalarSlot,
+)
+from torch.cuda._host_trace_tape import _hint
+
+
+if TYPE_CHECKING:
+    from collections.abc import Collection, Mapping, Sequence
+
+    from torch.cuda._host_trace_lower_tape import LoweredTape
+
+
+# the caching allocator's block granularity: a temporary's offset in the
+# buffer keeps its address 256-aligned, as the trace assumed
+_BLOCK = 512
+
+
+@dataclass(frozen=True)
+class StepMemory:
+    tensors: tuple[int, ...]  # allocations made as tensors, in tape order
+    # the run's own temporaries in tape order: (allocation, its seq, the seq
+    # of the last launch that uses it, or its own seq if none does)
+    temporaries: tuple[tuple[int, int, int], ...]
+    # the bases (allocation k, eager output len(allocations) + j) whose last
+    # step this is
+    drops: tuple[int, ...]
+    # "eager" memory, a run with temporaries: its allocations k in tape order,
+    # each temporary's free (-1 - k) right after its last use; else empty
+    order: tuple[int, ...] = ()
+    # the argument positions whose last step this is
+    arguments: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True)
+class MemoryPlan:
+    outputs: tuple[int, ...]  # the output allocations, in tape order
+    # per step of the tape, then one for the allocations after its last step
+    steps: tuple[StepMemory, ...]
+
+
+def plan_memory(lowered: LoweredTape, memory: str = "eager") -> MemoryPlan:
+    allocations, steps = lowered.allocations, lowered.steps
+    n_alloc = len(allocations)
+    escapes = set()
+    for out in lowered.outputs:
+        if isinstance(out, ScalarSlot):
+            continue
+        kind, k = out.base if isinstance(out, LoweredView) else out
+        if kind in ("allocation", "eager"):
+            escapes.add(k if kind == "allocation" else n_alloc + k)
+    # argument position -> the steps that use it; an output's is never dropped
+    args_used: dict[int, set[int]] = {}
+    for out in lowered.outputs:
+        ref = out.base if isinstance(out, LoweredView) else out
+        if isinstance(ref, tuple) and ref[0] == "argument":
+            args_used[ref[1]] = {len(steps)}
+    used: dict[int, set[int]] = {}  # base -> the steps that use it
+    touched = set()  # the bases eager calls read, write or return
+    last_seq = [a.seq for a in allocations]
+    ends = []  # each step's last seq
+    for i, step in enumerate(steps):
+        if isinstance(step, range):
+            ends.append(lowered.launches[step.stop - 1].seq)
+            for lo in lowered.launches[step.start : step.stop]:
+                for slot in lo.slots:
+                    if not isinstance(slot, PointerSlot):
+                        continue
+                    if slot.root[0] == "argument":
+                        args_used.setdefault(slot.root[1], set()).add(i)
+                    elif slot.base is not None:
+                        used.setdefault(slot.base, set()).add(i)
+                        if slot.base < n_alloc:
+                            last_seq[slot.base] = lo.seq
+            continue
+        ends.append(step.seq)
+        bases = [n_alloc + p.root for p in step.outputs if not isinstance(p, int)]
+        for leaf in step.leaves:
+            if not isinstance(leaf, LoweredView):
+                continue
+            kind, k = leaf.base
+            if kind == "argument":
+                args_used.setdefault(k, set()).add(i)
+            else:
+                bases.append(k if kind == "allocation" else n_alloc + k)
+        for b in bases:
+            used.setdefault(b, set()).add(i)
+            touched.add(b)
+    # a keyed site's operands reach its nodes through its table
+    position = {id(rec.root): rec.position for rec in lowered.tape.inputs}
+    step_of = {j: i for i, s in enumerate(steps) if isinstance(s, range) for j in s}
+    for site in lowered.sites:
+        for t in site.site.operands:
+            if id(t._root) in position and site.nodes:
+                args_used.setdefault(position[id(t._root)], set()).add(step_of[site.nodes[0]])
+    last_arg: list[list[int]] = [[] for _ in range(len(steps) + 1)]
+    for a, s in args_used.items():
+        last_arg[max(s)].append(a)
+    holding = [bisect.bisect(ends, a.seq) for a in allocations]
+    local = {
+        k
+        for k in range(n_alloc)
+        if k not in escapes
+        and k not in touched
+        and holding[k] < len(steps)
+        and isinstance(steps[holding[k]], range)
+        and used.get(k, set()) <= {holding[k]}
+    }
+    last = {k: holding[k] for k in range(n_alloc)}
+    for b, s in used.items():
+        last[b] = max(s)
+    made: list[list[int]] = [[] for _ in range(len(steps) + 1)]
+    for k in range(n_alloc):
+        made[holding[k]].append(k)
+    dropped: list[list[int]] = [[] for _ in range(len(steps) + 1)]
+    for b, s in last.items():
+        if b not in escapes and b not in local:
+            dropped[s].append(b)
+    plan = []
+    for i in range(len(steps) + 1):
+        tensors = tuple(k for k in made[i] if k not in local)
+        temporaries = tuple(
+            (k, allocations[k].seq, last_seq[k]) for k in made[i] if k in local
+        )
+        drops = tuple(dropped[i])
+        order: tuple[int, ...] = ()
+        if memory == "eager" and temporaries:
+            events = [(allocations[k].seq, 0, k) for k in tensors]
+            for k, seq, last_use in temporaries:
+                events += [(seq, 0, k), (last_use, 1, -1 - k)]
+            order = tuple(e for *_, e in sorted(events))
+        arguments = tuple(last_arg[i]) if i < len(steps) else ()
+        plan.append(StepMemory(tensors, temporaries, drops, order, arguments))
+    return MemoryPlan(tuple(sorted(k for k in escapes if k < n_alloc)), tuple(plan))
+
+
+def _nbytes(lowered: LoweredTape) -> list[int]:
+    """Each base's bytes at the traced call: allocation k's, then eager output
+    j's at len(allocations) + j, as its predictions extend."""
+    v, n = lowered.program.values, len(lowered.allocations)
+    nbytes = [v[a.nbytes] for a in lowered.allocations]
+    nbytes += [0] * len(lowered.eager_roots)
+    for step in lowered.steps:
+        if not isinstance(step, LoweredEagerCall):
+            continue
+        for p in step.outputs:
+            if isinstance(p, PredictedOutput) and all(v[r] for r in p.sizes):
+                extent = 1 + v[p.offset]
+                extent += sum((v[s] - 1) * v[d] for s, d in zip(p.sizes, p.strides))
+                nbytes[n + p.root] = max(nbytes[n + p.root], extent * p.dtype.itemsize)
+    return nbytes
+
+
+def _argument_nbytes(lowered: LoweredTape, freed: Collection[int]) -> dict[int, int]:
+    """Each freed tensor argument's bytes at the traced call, by position."""
+    nbytes = {}
+    for rec in lowered.tape.inputs:
+        if rec.position not in freed:
+            continue
+        sizes, strides = [_hint(s) for s in rec.sizes], [_hint(s) for s in rec.strides]
+        extent = 1 + _hint(rec.offset) + sum((s - 1) * d for s, d in zip(sizes, strides))
+        nbytes[rec.position] = extent * rec.dtype.itemsize if all(sizes) else 0
+    return nbytes
+
+
+def _peak(
+    lowered: LoweredTape,
+    plan: MemoryPlan,
+    nbytes: Sequence[int],
+    arguments: Mapping[int, int],
+) -> tuple[int, int, int]:
+    """The replay's peak live bytes under `plan`, counting the `arguments` it
+    frees (position -> bytes) until their last step, the step reaching it and
+    the seq of the allocation that does (-1 at a step's start, its run
+    buffer or an eager call's outputs)."""
+    n = len(lowered.allocations)
+    live, peak = sum(arguments.values()), (0, -1, -1)
+    for i, m in enumerate(plan.steps):
+        if m.order:
+            for e in m.order:
+                k = e if e >= 0 else -1 - e
+                live += nbytes[k] if e >= 0 else -nbytes[k]
+                if live > peak[0]:
+                    peak = (live, i, lowered.allocations[k].seq)
+        else:
+            live += sum(nbytes[k] for k in m.tensors)
+            _, buffer = place(m.temporaries, [nbytes[k] for k, *_ in m.temporaries])
+            peak = max(peak, (live + buffer, i, -1))
+        step = lowered.steps[i] if i < len(lowered.steps) else None
+        if isinstance(step, LoweredEagerCall):
+            roots = (p.root for p in step.outputs if isinstance(p, PredictedOutput))
+            live += sum(nbytes[n + j] for j in roots)
+            peak = max(peak, (live, i, -1))
+        live -= sum(nbytes[b] for b in m.drops)
+        live -= sum(arguments.get(a, 0) for a in m.arguments)
+    return peak
+
+
+def split_runs(
+    lowered: LoweredTape, freed: Collection[int] = ()
+) -> tuple[LoweredTape, MemoryPlan]:
+    """The tape with runs split where a tensor or `freed` argument held to
+    its run's end is live at the replay's peak, and its "eager" plan: while
+    the peak is an allocation inside a run that drops either, the run is
+    split just before that allocation's first launch, which drops those used
+    only before it once the first part is queued, if that lowers the peak.
+    Decided at the traced call's sizes; each split costs a graph launch per
+    replay."""
+    nbytes, arguments = _nbytes(lowered), _argument_nbytes(lowered, freed)
+    inside: set[int] = set()  # the launch boundaries inside a keyed site
+    for site in lowered.sites:
+        if site.nodes:
+            inside.update(range(min(site.nodes) + 1, max(site.nodes) + 1))
+    plan = plan_memory(lowered)
+    while True:
+        peak, i, seq = _peak(lowered, plan, nbytes, arguments)
+        run = lowered.steps[i] if 0 <= i < len(lowered.steps) else None
+        m = plan.steps[i]
+        drops = m.drops or any(arguments.get(a) for a in m.arguments)
+        if not isinstance(run, range) or seq < 0 or not drops:
+            return lowered, plan
+        launches = range(run.start, run.stop)
+        cut = next((j for j in launches if lowered.launches[j].seq > seq), run.stop)
+        if cut in (run.start, run.stop) or cut in inside:
+            return lowered, plan
+        steps = (*lowered.steps[:i], range(run.start, cut), range(cut, run.stop))
+        opaque = {k + (k > i): o for k, o in lowered.opaque.items()}
+        split = dataclasses.replace(
+            lowered, steps=steps + lowered.steps[i + 1 :], opaque=opaque
+        )
+        split_plan = plan_memory(split)
+        if _peak(split, split_plan, nbytes, arguments)[0] >= peak:
+            return lowered, plan
+        lowered, plan = split, split_plan
+
+
+def auto_memory(
+    lowered: LoweredTape, freed: Collection[int] = ()
+) -> tuple[LoweredTape, MemoryPlan]:
+    """The "auto" plan: "run_buffer"'s if its peak is at most a margin,
+    max(64 MiB, 5%), above "eager"'s (after split_runs) and no run buffer is
+    larger than the margin; else "eager"'s. "run_buffer" takes split_runs'
+    splits too if they lower its own peak. Decided at the traced call's
+    sizes. Eager order frees and retakes blocks mid-run, so a replay's
+    addresses move with the pool's state and it repatches the nodes that
+    read them; a run buffer's rarely move. But each buffer is a block of its
+    own size, which the pool keeps per variant when the shapes vary."""
+    nbytes, arguments = _nbytes(lowered), _argument_nbytes(lowered, freed)
+    split, eager = split_runs(lowered, freed)
+    peak = _peak(split, eager, nbytes, arguments)[0]
+    tape, buffered = lowered, plan_memory(lowered, "run_buffer")
+    buffered_peak = _peak(tape, buffered, nbytes, arguments)[0]
+    if split is not lowered:
+        split_buffered = plan_memory(split, "run_buffer")
+        split_peak = _peak(split, split_buffered, nbytes, arguments)[0]
+        if split_peak < buffered_peak:
+            tape, buffered, buffered_peak = split, split_buffered, split_peak
+    margin = max(64 << 20, peak // 20)
+    largest = max(
+        place(m.temporaries, [nbytes[k] for k, *_ in m.temporaries])[1]
+        for m in buffered.steps
+    )
+    if largest <= margin and buffered_peak <= peak + margin:
+        return tape, buffered
+    return split, eager
+
+
+def place(
+    temporaries: Sequence[tuple[int, int, int]], nbytes: Sequence[int]
+) -> tuple[list[int], int]:
+    """Each temporary's offset in one buffer (`nbytes` and the result follow
+    `temporaries`), and the buffer's size: a temporary takes the lowest gap
+    among those live at its allocation (first fit). The native commit
+    (HostTraceVariant::allocate) places as this does, per call."""
+    offsets = [0] * len(nbytes)
+    live: list[tuple[int, int, int]] = []  # (offset, end, last use)
+    total = 0
+    for i, ((_, seq, last), n) in enumerate(zip(temporaries, nbytes)):
+        size = -(-n // _BLOCK) * _BLOCK
+        if size == 0:
+            continue
+        live = sorted(b for b in live if b[2] > seq)
+        at = 0
+        for offset, end, _ in live:
+            if offset - at >= size:
+                break
+            at = max(at, end)
+        offsets[i] = at
+        live.append((at, at + size, last))
+        total = max(total, at + size)
+    return offsets, total

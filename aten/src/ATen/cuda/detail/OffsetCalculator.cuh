@@ -2,10 +2,12 @@
 
 #include <array>
 #include <cstdint>
+#include <cstring>
 #include <type_traits>
 #include <c10/macros/Macros.h>
 #include <ATen/native/TensorIterator.h>
 #include <ATen/cuda/detail/IntegerDivider.cuh>
+#include <c10/cuda/CUDAFunctions.h>
 
 // If element_sizes is nullptr, then the strides will be in bytes, otherwise
 // the strides will be in # of elements.
@@ -32,8 +34,12 @@ struct OffsetCalculator {
 
   // if element_sizes is nullptr, then the strides will be in bytes, otherwise
   // the strides will be in # of elements.
-  OffsetCalculator(int dims, const int64_t* sizes, const int64_t* const* strides, const int64_t* element_sizes=nullptr) : dims(dims) {
+  OffsetCalculator(int dims, const int64_t* sizes, const int64_t* const* strides, const int64_t* element_sizes=nullptr) {
     TORCH_CHECK(dims <= MAX_DIMS, "tensor has too many (>", MAX_DIMS, ") dims");
+    if (c10::cuda::isHostTraceHarvesting()) {
+      std::memset(static_cast<void*>(this), 0, sizeof(*this));
+    }
+    this->dims = dims;
     for (int i=0; i < dims; i++){
       sizes_[i] = at::cuda::detail::IntDivider<index_t>(sizes[i]);
       for (int arg = 0; arg < NARGS; arg++) {

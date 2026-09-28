@@ -298,6 +298,8 @@ static Variable applySlicing(
           } else if (PySequence_Check(obj)) {
             return at::indexing::TensorIndex(
                 sequenceToVariable(self.options(), obj));
+          } else if (torch::is_symint(obj)) {
+            return at::indexing::TensorIndex(py::cast<SymInt>(obj));
           } else {
             auto idx = THPObjectPtr(PyNumber_Index(obj));
             if (!idx) {

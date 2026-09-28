@@ -88,12 +88,16 @@ size_hints_regex = re.compile(
 
 
 def _pycodecache_kernel_compile_env() -> dict[str, str | None]:
+    from torch._inductor.runtime.cutedsl_cache import HOST_TRACE_ENV
+
     env_vars = [
         "TORCHINDUCTOR_CACHE_DIR",
         "TRITON_CACHE_DIR",
         "TORCHINDUCTOR_CUTLASS_DIR",
     ]
-    return {v: os.environ.get(v) for v in env_vars}
+    env = {v: os.environ.get(v) for v in env_vars}
+    env[HOST_TRACE_ENV] = "1" if config.triton.cudagraph_host_trace else None
+    return env
 
 
 def pre_fork_setup():

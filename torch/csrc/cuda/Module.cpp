@@ -36,6 +36,7 @@
 #include <torch/csrc/Generator.h>
 #include <torch/csrc/cuda/CUDAPluggableAllocator.h>
 #include <torch/csrc/cuda/GdsFile.h>
+#include <torch/csrc/cuda/host_trace/Variant.h>
 #include <torch/csrc/cuda/THCP.h>
 #include <torch/csrc/cuda/memory_snapshot.h>
 #include <torch/csrc/cuda/python_comm.h>
@@ -2648,6 +2649,7 @@ void initModule(PyObject* module) {
   registerCudaDeviceProperties(module);
   registerCudaPluggableAllocator(module);
   initCudaMethodBindings(module);
+  initHostTraceVariantBindings(module);
 }
 
 } // namespace torch::cuda

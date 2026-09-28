@@ -1,0 +1,260 @@
+"""Host tracing (private): run a CUDA program's host code once over
+symbolic sizes, strides and addresses and record what it launched and
+every condition it branched on, so that a CUDA graph captured once can be
+replayed for other inputs by patching its kernel parameters.
+
+This module holds the trace's ShapeEnv, which records the guards.
+"""
+
+from __future__ import annotations
+
+import functools
+import threading
+from dataclasses import dataclass
+from typing import Any, overload, TYPE_CHECKING
+
+import sympy
+
+from torch._guards import GuardSource, ShapeGuard, SLoc, Source
+from torch.fx.experimental.symbolic_shapes import DimDynamic, ShapeEnv
+from torch.utils._sympy.functions import Mod
+from torch.utils._sympy.numbers import int_oo
+from torch.utils._sympy.value_ranges import bound_sympy, ValueRanges
+
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    import torch
+    from torch.types import FloatLikeType, IntLikeType
+
+
+# the test suites raise an unexpected exception inside a trace, a capture or
+# a harvest instead of declining the call
+raise_unexpected = False
+
+
+class Declined(RuntimeError):
+    """The host did something the tracer does not describe; the call runs
+    eagerly instead."""
+
+    # whether trace() had run its warm-up call when it declined, and that
+    # call's return value: the warm-up was the call, so a consumer returns it
+    warm_up_ran: bool = False
+    warm_up_result: Any = None
+    # whether a later call of the same class may trace: the fallback changed
+    # what the trace depends on (it filled an autotune cache)
+    retry: bool = False
+    # the operator whose fake kernel's metadata disagreed with its real
+    # output at the warm-up: a later trace of a call to it declines too
+    meta_op: Any = None
+    # nothing to capture: every operation runs eagerly, so a replay would
+    # too; not a decline to report
+    uncaptured: bool = False
+
+
+def declined(msg: str) -> Declined:
+    """The decline of `msg`: every decline's message is built here."""
+    return Declined(f"host_trace: {msg} (declined)")
+
+
+class ProcessHold:
+    """A process-wide change held while any thread's trace is inside: the
+    first to enter calls `hold`, the last to leave `release`. Python has no
+    per-thread switch for what is held (a class's methods, the collector)."""
+
+    def __init__(self, hold: Callable[[], None], release: Callable[[], None]) -> None:
+        self._hold, self._release = hold, release
+        self._lock = threading.Lock()
+        self._depth = 0
+
+    def __enter__(self) -> None:
+        with self._lock:
+            if self._depth == 0:
+                self._hold()
+            self._depth += 1
+
+    def __exit__(self, *exc: object) -> None:
+        with self._lock:
+            self._depth -= 1
+            if self._depth == 0:
+                self._release()
+
+
+@dataclass(frozen=True)
+class _Src(Source):
+    nm: str
+
+    @property
+    def _name_template(self) -> str:
+        return self.nm
+
+    @functools.cached_property
+    def guard_source(self) -> GuardSource:
+        return GuardSource.LOCAL
+
+
+_BOOL_ATOMS = (sympy.logic.boolalg.BooleanTrue, sympy.logic.boolalg.BooleanFalse)
+_NO_SLOC = SLoc(None, None)
+# the binary SymNode methods defined on a subset of their operands, by the
+# names sym_node.py memoizes them under
+_DIVISIONS = frozenset({"int_floordiv", "mod", "int_truediv", "float_truediv"})
+
+
+class _SymOpMemo(dict):
+    """ShapeEnv._symop_cache (Note [symbolic op memo]): every new binary
+    SymNode operation is stored here once, so the trace sees a division the
+    moment it is created, before any guard or value is built on it."""
+
+    def __init__(self, on_division: Callable[[Any, Any, Any], None]) -> None:
+        super().__init__()
+        self.on_division = on_division
+
+    def __setitem__(self, key: Any, value: Any) -> None:
+        super().__setitem__(key, value)
+        method, lhs, rhs, _version = key
+        if method in _DIVISIONS:
+            self.on_division(lhs, rhs, value[0])
+
+
+class _TraceShapeEnv(ShapeEnv):
+    """The trace's ShapeEnv: a guard is the expression the host evaluated,
+    decided by its hint.
+
+    A tape's guards are re-evaluated at every replay, so none of the ordinary
+    evaluate_expr's static reasoning is needed: every non-constant expression
+    the host branches on is recorded once, as written, with its value under
+    the hints. Symbols are never replaced and value ranges never refined, so a
+    specialization stays an explicit guard (`Eq(s, 1)`) and a fact the host
+    depended on is never left unrecorded; the price is redundant guards. A
+    partial operation (a division, a modulo) records its domain when it is
+    created (`domain`), so the ordered guard list checks `Ne(divisor, 0)`
+    before anything built on the operation.
+
+    With `trusted` inputs the symbols' ranges are the caller's facts: an
+    expression they decide is no guard.
+    """
+
+    # a key built from sizes (a compile cache's) is a specialization, as any value the host reads
+    hash_symints_by_value = True
+
+    def __init__(self, trusted: bool = False) -> None:
+        super().__init__(duck_shape=False, specialize_zero_one=False)
+        self.trusted = trusted
+        self._recorded: set[sympy.Basic] = set()
+        self._symop_cache = _SymOpMemo(self.domain)
+
+    @overload
+    def symbol(
+        self, value: int, name: str, *, positive: bool = False
+    ) -> torch.SymInt: ...
+
+    @overload
+    def symbol(
+        self, value: float, name: str, *, positive: bool = False
+    ) -> torch.SymFloat: ...
+
+    def symbol(
+        self, value: int | float, name: str, *, positive: bool = False
+    ) -> IntLikeType | FloatLikeType:
+        src = _Src(name)
+        if positive:
+            sym = self.create_symbol(
+                value,
+                src,
+                DimDynamic.DYNAMIC,
+                positive=True,
+                do_not_specialize_zero_one=True,
+            )
+            # create_symbol's range admits 0; a division's domain is decided
+            # against the declared one
+            self.var_to_range[sym] = ValueRanges(1, int_oo)
+        else:
+            sym = self.create_unspecified_symbol(value, src, DimDynamic.DYNAMIC)
+        if isinstance(value, float):
+            return self.create_symfloatnode(sym, hint=value, source=src)
+        return self.create_symintnode(sym, hint=value, source=src)
+
+    def evaluate_expr(
+        self,
+        orig_expr: sympy.Basic,
+        hint: int | bool | float | None = None,
+        fx_node: Any = None,
+        size_oblivious: bool = False,
+        fallback_value: bool | None = None,
+        *,
+        forcing_spec: bool = False,
+    ) -> sympy.Basic:
+        if isinstance(orig_expr, _BOOL_ATOMS) or orig_expr.is_number:
+            return orig_expr
+        if self.trusted:
+            decided = self._maybe_evaluate_static(orig_expr)
+            if decided is not None:
+                return decided
+        if hint is None:
+            hint = self.guarding_hint_or_throw(orig_expr)
+        concrete = sympy.sympify(hint)
+        if concrete is sympy.true:
+            g = orig_expr
+        elif concrete is sympy.false:
+            g = sympy.Not(orig_expr)
+        else:
+            g = sympy.Eq(orig_expr, concrete)
+        # sympy decides a relation from the symbols' declared properties at
+        # construction: a true one is no guard, a false one contradicts the hint
+        if g is sympy.false:
+            raise AssertionError(f"host_trace: {orig_expr} is not {hint}")
+        self._record(g, size_oblivious)
+        return concrete
+
+    def _record(self, g: sympy.Basic, size_oblivious: bool = False) -> None:
+        if g is not sympy.true and g not in self._recorded:
+            self._recorded.add(g)
+            self.guards.append(ShapeGuard(g, _NO_SLOC, size_oblivious))
+
+    def domain(self, lhs: Any, rhs: Any, out: Any) -> None:
+        """A partial operation's domain: the divisor of a floor division, a
+        modulo or a true division is nonzero, and torch's Mod (which
+        sym_node.py builds only when it knows both operands nonnegative) has
+        both operands nonnegative. A condition the declared ranges decide (a
+        size is positive, a literal is nonzero) is no guard."""
+        self._record_undecided(sympy.Ne(rhs, 0), rhs, lambda r: 0 not in r)
+        if isinstance(out, Mod):
+            self._record_undecided(sympy.Ge(lhs, 0), lhs, lambda r: r.lower >= 0)
+            self._record_undecided(sympy.Ge(rhs, 0), rhs, lambda r: r.lower >= 0)
+
+    def _record_undecided(
+        self, g: Any, e: Any, decided: Callable[[ValueRanges], bool]
+    ) -> None:
+        if g is sympy.true:
+            return
+        try:
+            r = bound_sympy(e, self.var_to_range)
+        except (KeyError, NotImplementedError):  # no rule for a function in e
+            r = ValueRanges.unknown()
+        if not decided(r):
+            self._record(g)
+
+    def _set_replacement(self, a: sympy.Symbol, tgt: sympy.Expr, msg: str) -> None:
+        raise AssertionError(f"host_trace: {a} is never replaced ({msg})")
+
+
+class BitLength(sympy.Function):
+    """int.bit_length (of the magnitude): the program's "bitlength" row."""
+
+    is_integer = True
+    is_nonnegative = True
+
+    @classmethod
+    def eval(cls, a: sympy.Expr) -> sympy.Integer | None:
+        return sympy.Integer(int(a).bit_length()) if isinstance(a, sympy.Integer) else None
+
+
+def bit_length(x: IntLikeType) -> IntLikeType:
+    """x.bit_length() for a traced host: a size's is an expression."""
+    if isinstance(x, int):
+        return x.bit_length()
+    node = x.node
+    return node.shape_env.create_symintnode(
+        BitLength(node.expr), hint=node.require_hint().bit_length()
+    )

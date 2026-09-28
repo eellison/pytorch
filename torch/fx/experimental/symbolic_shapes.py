@@ -3955,6 +3955,9 @@ class _FrameLocalResult:
 
 
 class ShapeEnv:
+    # SymInt.__hash__ specializes (a guard on the value) instead of raising TypeError
+    hash_symints_by_value = False
+
     # This is a wrapper over the actual __init__ function.
     #
     # Where to add a new constructor parameter to ShapeEnv?

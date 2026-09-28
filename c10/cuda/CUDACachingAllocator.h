@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_set>
 #include <utility>
@@ -604,6 +605,17 @@ C10_CUDA_API void setDefaultExpandableSegmentReserveFractionForClass(
 // reads; safe to call at any time.
 C10_CUDA_API size_t getExpandableSegmentsReservedBytes();
 C10_CUDA_API size_t getExpandableSegmentsCount();
+
+// Process-wide count of device segments the native caching allocator has
+// released (cudaFree or unmap; DeviceStats::num_device_free over all devices,
+// never reset). A cheap relaxed-atomic read.
+C10_CUDA_API size_t getSegmentReleaseCount();
+
+// Holds the native caching allocator's lock for `device` until destroyed: no
+// other thread allocates, frees or empties the cache on the device meanwhile.
+// The lock is recursive, so the holder's own allocations and frees proceed.
+C10_CUDA_API std::unique_lock<std::recursive_mutex> lockDeviceAllocator(
+    c10::DeviceIndex device);
 
 } // namespace c10::cuda::CUDACachingAllocator
 

@@ -181,6 +181,18 @@ std::optional<DeviceIndex> getDeviceIndexWithPrimaryContext() {
   return std::nullopt;
 }
 
+namespace {
+thread_local bool host_trace_harvesting = false;
+} // namespace
+
+bool isHostTraceHarvesting() {
+  return host_trace_harvesting;
+}
+
+void setHostTraceHarvesting(bool enabled) {
+  host_trace_harvesting = enabled;
+}
+
 namespace _internal {
 static bool dummyHasPrimaryContext([[maybe_unused]] DeviceIndex device_index) {
   TORCH_CHECK(false, "Should never been called");

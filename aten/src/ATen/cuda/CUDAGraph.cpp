@@ -334,7 +334,12 @@ void CUDAGraph::replay() {
   TORCH_CHECK(has_graph_exec_,
               "Called CUDAGraph::replay before the graph was instantiated; "
               "call instantiate() first.");
+  replay_exec(graph_exec_);
+}
 
+void CUDAGraph::replay_exec(cudaGraphExec_t exec) {
+  TORCH_CHECK(capture_ended_,
+              "Called CUDAGraph::replay_exec without a preceding successful capture.");
   c10::OptionalDeviceGuard device_guard{capture_stream_.device()};
 
   for (auto& [generator_state, wholegraph_increment] :
@@ -342,7 +347,7 @@ void CUDAGraph::replay() {
     generator_state->replay_prologue(capture_id_, wholegraph_increment);
   }
   // graph_exec_ may be replayed in any stream.
-  AT_CUDA_CHECK(cudaGraphLaunch(graph_exec_, at::cuda::getCurrentCUDAStream()));
+  AT_CUDA_CHECK(cudaGraphLaunch(exec, at::cuda::getCurrentCUDAStream()));
 }
 
 void CUDAGraph::enable_debug_mode() {

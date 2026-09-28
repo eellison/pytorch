@@ -100,6 +100,9 @@ struct TORCH_CUDA_CPP_API CUDAGraph {
     return has_graph_exec_;
   }
   void replay();
+  // replay() of exec, an instantiation of this graph's template the caller
+  // owns
+  void replay_exec(cudaGraphExec_t exec);
   void reset();
   MempoolId_t pool();
   std::vector<MempoolId_t> pools();

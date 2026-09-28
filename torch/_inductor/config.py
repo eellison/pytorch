@@ -2079,6 +2079,32 @@ class triton:
     # Use cudagraph trees for memory pooling if `cudagraphs` is True
     cudagraph_trees = True
 
+    # Private: if `cudagraphs` is True, wrap compiled graphs with
+    # host tracing (torch.cuda._host_trace_replay) instead of cudagraph trees
+    cudagraph_host_trace = False
+
+    # with cudagraph_host_trace: the op families harvested
+    # (torch.cuda._host_trace_harvest) so they replay inside the graph:
+    # "blas", cuBLAS mm, addmm and bmm; "attention", the cuDNN, flash and
+    # memory-efficient SDPA forwards and backwards; "conv", convolutions and
+    # their backwards; "rng", the default generator's randint, Inductor's
+    # seeds, native_dropout and uniform_, their philox offsets taken per replay;
+    # "reduce", ATen's sum over dims (a mix-order reduction's final sum)
+    cudagraph_host_trace_harvest: tuple[str, ...] = ("blas", "attention", "conv", "rng", "reduce")
+
+    # with cudagraph_host_trace: the keys each harvested family learns per
+    # process (a key is an op's exact sizes, strides and alignments); past it
+    # a new key's call stays eager. Read at each harvest
+    cudagraph_host_trace_harvest_budget = 1024
+
+    # with cudagraph_host_trace: how a replay allocates
+    # (torch/cuda/_host_trace_memory.py). "eager": eager's requests and frees
+    # in eager's order, eager's memory; "run_buffer": a run's temporaries in
+    # one buffer, fewer allocator calls and more memory; "auto": run_buffer
+    # per variant when its peak and each buffer are within max(64 MiB, 5%)
+    # of eager's peak
+    cudagraph_host_trace_replay_memory: Literal["auto", "eager", "run_buffer"] = "auto"
+
     # Should we skip cudagraphing graphs with dynamic shape inputs
     # If False, we will re-record a graph for each unique set of shape inputs
     cudagraph_skip_dynamic_graphs = False
@@ -3208,6 +3234,7 @@ _cache_config_ignore_prefix: list[str] = [
     "_pre_fusion_custom_pass",
     # CUDAGraphPolicy only affects post_compile, not compiled output
     "cudagraph_policy",
+    "triton.cudagraph_host_trace",
     # tests assume that changes here don't invalidate cache
     "force_disable_cudagraph_TESTING_ONLY",
     # timing affects cache structure, not cache content

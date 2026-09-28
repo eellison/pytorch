@@ -10,6 +10,8 @@
 #include <c10/util/TypeSafeSignMath.h>
 #include <ATen/native/cuda/JitLoops.cuh>
 #include <ATen/native/cuda/Loops.cuh>
+#include <ATen/cuda/host_trace/LoopsSym.cuh>
+#include <ATen/cuda/host_trace/Ops.h>
 
 #include <type_traits>
 
@@ -46,3 +48,20 @@ void mul_kernel_cuda(TensorIteratorBase& iter) {
 REGISTER_DISPATCH(mul_stub, &mul_kernel_cuda)
 
 } // namespace at::native
+
+namespace at::cuda::host_trace {
+
+TensorBase mul(Recorder& rec, const TensorBase& a, const TensorBase& b) {
+  auto iter = TensorIteratorSym::binary_op(rec, a, b);
+  if (isComplexType(iter.common_dtype())) {
+    decline("complex mul");
+  }
+  AT_DISPATCH_ALL_TYPES_AND3(kHalf, kBFloat16, kBool, iter.common_dtype(), "mul_cuda", [&]() {
+    using opmath_t = at::opmath_type<scalar_t>;
+    using functor_t = at::native::binary_internal::MulFunctor<opmath_t>;
+    gpu_kernel(rec, iter, at::native::BinaryFunctor<scalar_t, scalar_t, scalar_t, functor_t>(functor_t()));
+  });
+  return iter.output();
+}
+
+} // namespace at::cuda::host_trace

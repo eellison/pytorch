@@ -324,6 +324,9 @@ def jit_cache(fn):
                     object_file_path=str(tmp_path),
                     function_name=EXPORT_FUNC_NAME,
                 )
+                # torch: host trace's host function beside the object (torch/cuda/_host_trace_cute.py)
+                if os.path.exists(f"{tmp_path}.cute_host"):
+                    os.replace(f"{tmp_path}.cute_host", f"{o_path}.cute_host")
                 os.replace(tmp_path, o_path)
             except Exception as e:
                 warnings.warn(
