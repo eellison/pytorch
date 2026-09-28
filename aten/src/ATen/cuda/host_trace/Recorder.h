@@ -12,9 +12,11 @@
 
 #include <array>
 #include <cstdint>
+#include <cstring>
 #include <new>
 #include <string>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace at::cuda::host_trace {
@@ -28,13 +30,19 @@ struct Field {
   bool pointer;
 };
 
+// a launch's grid; a SymInt is a one-dimensional grid
+struct SymDim3 {
+  SymDim3(c10::SymInt x, c10::SymInt y = 1, c10::SymInt z = 1) : x(std::move(x)), y(std::move(y)), z(std::move(z)) {}
+  c10::SymInt x, y, z;
+};
+
 struct KernelRecord {
   cudaFunction_t function;
   std::vector<size_t> offsets;
   std::vector<std::vector<uint8_t>> params;
   std::vector<Field> fields;
-  c10::SymInt grid;
-  int64_t block;
+  SymDim3 grid{0};
+  dim3 block;
   int64_t smem;
 };
 
@@ -45,6 +53,8 @@ struct Recorder {
   // x.bit_length() and 2**x for x >= 0, as the program's bitlength and lshift rows
   virtual c10::SymInt bit_length(const c10::SymInt& x) = 0;
   virtual c10::SymInt pow2(const c10::SymInt& x) = 0;
+  // static_cast<float>(a) / static_cast<float>(b)'s bits, as the program's f32div row
+  virtual c10::SymInt f32_div(const c10::SymInt& a, const c10::SymInt& b) = 0;
   std::vector<KernelRecord> launches;
 };
 
@@ -84,6 +94,16 @@ struct Param {
     const size_t offset = reinterpret_cast<uint8_t*>(&member) - bytes.data();
     fields.push_back({0, offset, sizeof(T), v, std::is_pointer_v<T>});
   }
+  // a member of pod() given as a Param of its own
+  template <class T>
+  void set(T& member, const Param<T>& v) {
+    std::memcpy(static_cast<void*>(&member), v.bytes.data(), sizeof(T));
+    const size_t offset = reinterpret_cast<uint8_t*>(&member) - bytes.data();
+    for (Field f : v.fields) {
+      f.offset += offset;
+      fields.push_back(std::move(f));
+    }
+  }
 };
 
 template <class K>
@@ -96,7 +116,7 @@ Param<K> scalar(const c10::SymInt& v) {
 // `kernel<<<grid, block, smem>>>(params...)`, recorded; parameters are laid out
 // at their natural alignment, as the driver's cuFuncGetParamInfo reports
 template <class... KArgs>
-void launch(Recorder& rec, void (*kernel)(KArgs...), c10::SymInt grid, int64_t block, int64_t smem, const Param<KArgs>&... params) {
+void launch(Recorder& rec, void (*kernel)(KArgs...), SymDim3 grid, dim3 block, int64_t smem, const Param<KArgs>&... params) {
   KernelRecord r;
   C10_CUDA_CHECK(cudaGetFuncBySymbol(&r.function, reinterpret_cast<const void*>(kernel)));
   size_t end = 0;

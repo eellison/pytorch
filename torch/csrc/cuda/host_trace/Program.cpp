@@ -35,6 +35,7 @@ HostTraceProgram::HostTraceProgram(
       {"bitxor", Op::BitXor},
       {"bitlength", Op::BitLength},
       {"lshift", Op::LShift},
+      {"f32div", Op::F32Div},
       {"min", Op::Min},
       {"max", Op::Max},
       {"select", Op::Select},
@@ -236,6 +237,13 @@ HostTraceProgram::Status HostTraceProgram::evaluate(
              c10::mul_overflows(out, int64_t(2), &out))) {
           return Status::MultiplyOverflow;
         }
+        break;
+      case Op::F32Div:
+        if (a < 0 || b <= 0) {
+          return Status::DivisionDomain;
+        }
+        out = std::bit_cast<int32_t>(
+            static_cast<float>(a) / static_cast<float>(b));
         break;
       case Op::Min:
       case Op::Max:

@@ -59,6 +59,7 @@ class HostTraceProgram {
     BitXor,
     BitLength,
     LShift,
+    F32Div,
     Min,
     Max,
     Select,

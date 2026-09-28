@@ -17,6 +17,7 @@ import sympy
 
 from torch._guards import GuardSource, ShapeGuard, SLoc, Source
 from torch.fx.experimental.symbolic_shapes import DimDynamic, ShapeEnv
+from torch.cuda._host_trace_program import f32_bits
 from torch.utils._sympy.functions import Mod
 from torch.utils._sympy.numbers import int_oo
 from torch.utils._sympy.value_ranges import bound_sympy, ValueRanges
@@ -247,7 +248,9 @@ class BitLength(sympy.Function):
 
     @classmethod
     def eval(cls, a: sympy.Expr) -> sympy.Integer | None:
-        return sympy.Integer(int(a).bit_length()) if isinstance(a, sympy.Integer) else None
+        if isinstance(a, sympy.Integer):
+            return sympy.Integer(int(a).bit_length())
+        return None
 
 
 def bit_length(x: IntLikeType) -> IntLikeType:
@@ -255,6 +258,30 @@ def bit_length(x: IntLikeType) -> IntLikeType:
     if isinstance(x, int):
         return x.bit_length()
     node = x.node
-    return node.shape_env.create_symintnode(
-        BitLength(node.expr), hint=node.require_hint().bit_length()
-    )
+    env, hint = node.shape_env, node.hint
+    # pyrefly: ignore [missing-attribute]
+    return env.create_symintnode(BitLength(node.expr), hint=hint.bit_length())
+
+
+class F32Div(sympy.Function):
+    """static_cast<float>(a) / b's bits as an int32: the program's "f32div" row."""
+
+    is_integer = True
+
+    @classmethod
+    def eval(cls, a: sympy.Expr, b: sympy.Expr) -> sympy.Integer | None:
+        if isinstance(a, sympy.Integer) and isinstance(b, sympy.Integer) and b > 0:
+            return sympy.Integer(f32_bits(int(a), int(b)))
+        return None
+
+
+def f32_div(a: IntLikeType, b: IntLikeType) -> IntLikeType:
+    """For a traced host: the bits of float(a) / float(b) in float32."""
+    if isinstance(a, int) and isinstance(b, int):
+        return f32_bits(a, b)
+    node = (b if isinstance(a, int) else a).node
+    env = node.shape_env
+    exprs = [sympy.Integer(x) if isinstance(x, int) else x.node.expr for x in (a, b)]
+    hints = [x if isinstance(x, int) else x.node.hint for x in (a, b)]
+    # pyrefly: ignore [missing-attribute]
+    return env.create_symintnode(F32Div(*exprs), hint=f32_bits(*hints))

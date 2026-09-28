@@ -669,21 +669,17 @@ class TestHostTraceHarvestAttentionAndRng(TestCase):
 
     @parametrize(
         "backend,kernel",
-        [("efficient", "PyTorchMemEffAttention"), ("flash", "elementwise_kernel"), ("dropout", "fused_dropout_kernel")],
+        [("efficient", "PyTorchMemEffAttention"), ("dropout", "fused_dropout_kernel")],
     )
     def test_unexplained_varying_parameter_refuses(self, backend, kernel):
         # without the harvest flag ATen leaves these kernels' unused parameter
-        # bytes uninitialized (Params padding, OffsetCalculator's and
-        # TensorInfo's dims past the tensor's): they vary between captures
+        # bytes uninitialized (Params padding, TensorInfo's dims past the
+        # tensor's): they vary between captures
         q, k, v = (torch.randn(2, 4, 128, 64, device="cuda", dtype=bf16) for _ in range(3))
         if backend == "efficient":
             o, lse, seed, offset = aten._scaled_dot_product_efficient_attention(q, k, v, None, True, 0.0, True)
             args = (torch.randn_like(o), q, k, v, None, o, lse, seed, offset, 0.0, (True, True, True, False), True)
             op = aten._scaled_dot_product_efficient_attention_backward.default
-        elif backend == "flash":
-            o, lse, cq, ck, mq, mk, seed, offset, _ = aten._scaled_dot_product_flash_attention(q, k, v, 0.0, True, False)
-            args = (torch.randn_like(o), q, k, v, o, lse, cq, ck, mq, mk, 0.0, True, seed, offset)
-            op = aten._scaled_dot_product_flash_attention_backward.default
         else:
             args = (torch.randn(64, 256, device="cuda"), 0.1, True)
             op = aten.native_dropout.default

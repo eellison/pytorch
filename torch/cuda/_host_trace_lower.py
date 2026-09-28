@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING
 import sympy
 from sympy.logic.boolalg import BooleanFalse, BooleanTrue
 
-from torch.cuda._host_trace import BitLength, declined
+from torch.cuda._host_trace import BitLength, declined, F32Div
 from torch.cuda._host_trace_program import MAX_I64, MIN_I64, OutOfDomain
 from torch.utils._sympy.functions import (
     BitwiseFn_bitwise_and,
@@ -184,6 +184,9 @@ class Lowering:
             return self._emit(_BITWISE[type(e)], lhs, rhs)
         if isinstance(e, BitLength):
             return self._emit("bitlength", self._lower_integer(e.args[0]))
+        if isinstance(e, F32Div):
+            n, d = (self._lower_integer(x) for x in e.args)
+            return self._emit("f32div", n, d)
         raise declined(f"no integer lowering for {type(e).__name__} in {e}")
 
     def _lower_integer(self, e: sympy.Basic) -> int:
@@ -199,7 +202,8 @@ class Lowering:
     def _power(self, e: sympy.Basic) -> int:
         base, exponent = e.args
         if base == 2 and not isinstance(exponent, sympy.Integer):
-            return self._emit("lshift", self._constant(1), self._lower_integer(exponent))
+            shift = self._lower_integer(exponent)
+            return self._emit("lshift", self._constant(1), shift)
         if not (isinstance(exponent, sympy.Integer) and exponent >= 0):
             raise declined(f"{e} is not a natural power")
         result = self._constant(1)

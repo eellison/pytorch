@@ -6,6 +6,8 @@
 #include <ATen/native/SharedReduceOps.h>
 #include <ATen/Dispatch.h>
 #include <ATen/native/ReduceOps.h>
+#include <ATen/cuda/host_trace/Ops.h>
+#include <ATen/cuda/host_trace/ReduceSym.cuh>
 
 #include <thrust/pair.h>
 
@@ -72,3 +74,33 @@ REGISTER_DISPATCH(std_var_stub, &std_var_kernel_cuda)
 REGISTER_DISPATCH(mean_stub, &mean_kernel_cuda)
 
 } // namespace at::native
+
+namespace at::cuda::host_trace {
+
+// mean_kernel_impl for a Half, BFloat16 or float self and result of its dtype;
+// double's factor is a double, which no program row computes
+TensorBase mean(Recorder& rec, const TensorBase& self, IntArrayRef dims, bool keepdim) {
+  const ScalarType dtype = self.scalar_type();
+  if (dtype != kHalf && dtype != kBFloat16 && dtype != kFloat) {
+    decline(c10::str("a ", dtype, " mean"));
+  }
+  TensorBase result;
+  auto iter = make_reduction(rec, result, self, dims, keepdim);
+  if (iter.numel() == 0) {
+    decline("an empty mean");
+  }
+  AT_DISPATCH_FLOATING_TYPES_AND2(kHalf, kBFloat16, dtype, "mean_cuda", [&]() {
+    using ops_t = at::native::MeanOps<scalar_t, float, float, scalar_t>;
+    Param<ops_t> ops;
+    // factor = static_cast<float>(num_output_elements) / numel
+    ops.set(reinterpret_cast<int32_t&>(ops.pod().factor), rec.f32_div(iter.num_output_elements(), iter.numel()));
+    if constexpr (sizeof(scalar_t) == 2) {
+      gpu_reduce_kernel<scalar_t, scalar_t, 4, 8>(rec, iter, ops);
+    } else {
+      gpu_reduce_kernel<scalar_t, scalar_t>(rec, iter, ops);
+    }
+  });
+  return result;
+}
+
+} // namespace at::cuda::host_trace

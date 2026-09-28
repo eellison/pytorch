@@ -713,6 +713,22 @@ struct StridedOp {
   }
 };
 
+// StridedOp for operands of dtypes other than f's
+template <typename func_t, int ntensors>
+struct StridedCastOp {
+  using arg0_t = typename function_traits<func_t>::result_type;
+  std::array<char*, ntensors> data;
+  std::array<ScalarType, ntensors> dtypes;
+  ::OffsetCalculator<ntensors> offset_calc;
+  func_t f;
+  __device__ void operator()(int idx) const {
+    auto offsets = offset_calc.get(idx);
+    void* out = data[0] + offsets[0];
+    arg0_t result = invoke(f, &data[1], &offsets[1], &dtypes[1], 1);
+    c10::cast_and_store<arg0_t>(dtypes[0], out, result);
+  }
+};
+
 template <typename func_t>
 void gpu_kernel_impl_nocast(TensorIteratorBase& iter, const func_t& f) {
   using traits = function_traits<func_t>;
@@ -1193,12 +1209,7 @@ void gpu_kernel_impl(TensorIteratorBase& iter, const func_t& f) {
       }
     });
 #else
-    launch_legacy_kernel<128, 4>(numel, [=] GPU_LAMBDA(int idx) {
-      auto offsets = offset_calc.get(idx);
-      void* out = data[0] + offsets[0];
-      arg0_t result = invoke(f, &data[1], &offsets[1], &dtypes[1], 1);
-      c10::cast_and_store<arg0_t>(dtypes[0], out, result);
-    });
+    launch_legacy_kernel<128, 4>(numel, StridedCastOp<func_t, ntensors>{data, dtypes, offset_calc, f});
 #endif
   }
 }

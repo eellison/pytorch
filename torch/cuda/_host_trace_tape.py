@@ -593,21 +593,21 @@ class _Trace:
                 raise self.decline(f"{func} writes a CPU buffer on the device's stream")
             written[frozenset(a.alias_info.before_set)] = v
 
-        if func in _TRACED_ATEN and not self.in_aten:
-            if (traced := self._traced_aten(func, args, kwargs, rets[0])) is not None:
-                return traced
-
         reasons, provider, binding = [], None, None
         # a library kernel may assume its output overlaps no input
         roots = [t._root for t in pytree.tree_leaves((args, kwargs)) if isinstance(t, _TracedTensor)]
         if any(roots.count(v._root) > 1 for v in written.values() if isinstance(v, _TracedTensor)):
             reasons.append(f"{func} writes a storage another operand is of")
         else:
+            # the caller's providers go first, the traced ATen host after
             for p in self.opaque:
                 if (why := p.accepts(func, args, kwargs)) is None:
                     provider = p
                     break
                 reasons.append(why)
+            if provider is None and func in _TRACED_ATEN and not self.in_aten:
+                if (traced := self._traced_aten(func, args, kwargs, rets[0])) is not None:
+                    return traced
         if provider is not None:
             fakes = [o for r, o in zip(schema.returns, rets) if r.alias_info is None]
             fakes = [o for o in pytree.tree_leaves(fakes) if isinstance(o, torch.Tensor)]
@@ -678,13 +678,16 @@ class _Trace:
         where the host declines, which leaves the call to EagerCall."""
         from torch.cuda._host_trace_launch import KernelLaunch
 
-        if kwargs or not all(isinstance(a, _TracedTensor) for a in args):
+        rest = func._schema.arguments[len(args) :]
+        args = (*args, *(kwargs.get(a.name, a.default_value) for a in rest))
+        if any(isinstance(a, (torch.Tensor, *_SYM_TYPES)) and not isinstance(a, _TracedTensor) for a in args):
             return None
+        tensors = [a for a in args if isinstance(a, _TracedTensor)]
         marks = len(self.allocs), len(self.launches)
         self.in_aten = True
         try:
             with _TraceMode(self):
-                out, records = torch._C._cuda_hostTraceAten(_TRACED_ATEN[func], list(args))
+                out, records = torch._C._cuda_hostTraceAten(_TRACED_ATEN[func], args)
         except NotImplementedError:
             del self.allocs[marks[0] :], self.launches[marks[1] :]
             return None
@@ -694,17 +697,18 @@ class _Trace:
             raise AssertionError(f"{func}'s traced host returned a {type(out)}")
         meta = (*out.shape, *out._sym_strides, out._sym_offset)
         want = (*fake.shape, *fake.stride(), fake.storage_offset())
-        if len(meta) != len(want) or not _guard_each([a == b for a, b in zip(meta, want)]):
-            raise RuntimeError(f"{func}'s traced host allocated {out!r}, its meta {fake.shape} {fake.stride()}")
-        roots = tuple({id(t._root): t._root for t in (*args, out)}.values())
+        if out.dtype != fake.dtype or len(meta) != len(want) or not _guard_each([a == b for a, b in zip(meta, want)]):
+            raise RuntimeError(f"{func}'s traced host allocated {out!r}, its meta {fake.dtype} {fake.shape} {fake.stride()}")
+        made = [a.root for a in self.allocs[marks[0] :]]
+        roots = tuple({id(r): r for r in (*(t._root for t in (*tensors, out)), *made)}.values())
         for function, offsets, params, fields, grid, block, smem in records:
             launch = KernelLaunch(
                 str(func),
                 function,
                 None,
                 tuple(zip(offsets, map(len, params))),
-                (grid, 1, 1),
-                (block, 1, 1),
+                tuple(grid),
+                tuple(block),
                 smem,
                 tuple(f[3] for f in fields),
                 roots,
@@ -880,7 +884,22 @@ def _dense_terms(sizes: list, strides: list) -> list:
 # the in-place metadata ops without the inplace_view tag
 _METADATA_OPS = (aten.resize_, aten.resize_as_, aten.set_)
 # the ops with a traced ATen host, by the name torch._C._cuda_hostTraceAten takes
-_TRACED_ATEN = {aten.mul.Tensor: "mul", aten.silu.default: "silu"}
+_TRACED_ATEN = {
+    aten.mul.Tensor: "mul",
+    aten.add.Tensor: "add",
+    aten.silu.default: "silu",
+    aten.gelu.default: "gelu",
+    aten.rsqrt.default: "rsqrt",
+    aten.where.self: "where",
+    aten.copy_.default: "copy_",
+    aten._to_copy.default: "_to_copy",
+    aten.clone.default: "clone",
+    aten.sum.default: "sum",
+    aten.sum.dim_IntList: "sum",
+    aten.mean.default: "mean",
+    aten.mean.dim: "mean",
+    aten.amax.default: "amax",
+}
 
 _ALLOC_OPS = {
     aten.empty.memory_format,

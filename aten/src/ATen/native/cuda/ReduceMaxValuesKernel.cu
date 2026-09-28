@@ -10,6 +10,8 @@
 #include <ATen/native/cuda/ReduceOps.h>
 #include <ATen/cuda/NumericLimits.cuh>
 #include <ATen/native/cuda/Reduce.cuh>
+#include <ATen/cuda/host_trace/Ops.h>
+#include <ATen/cuda/host_trace/ReduceSym.cuh>
 
 #include <thrust/pair.h>
 
@@ -57,3 +59,21 @@ void max_all_launch_kernel(TensorIterator &iter) {
 REGISTER_DISPATCH(max_values_stub, &max_values_kernel_cuda)
 
 } // namespace at::native
+
+namespace at::cuda::host_trace {
+
+// max_values_kernel_cuda_impl
+TensorBase amax(Recorder& rec, const TensorBase& self, IntArrayRef dims, bool keepdim) {
+  TensorBase result;
+  auto iter = make_reduction(rec, result, self, dims, keepdim);
+  if (iter.numel() == 0) {
+    decline("an empty amax");
+  }
+  AT_DISPATCH_ALL_TYPES_AND3(kBFloat16, kHalf, kBool, iter.dtype(0), "max_values_cuda", [&]() {
+    Param ops(at::native::func_wrapper<scalar_t>(at::native::MaxNanFunctor<scalar_t>()));
+    gpu_reduce_kernel<scalar_t, scalar_t>(rec, iter, ops, at::numeric_limits<scalar_t>::lower_bound());
+  });
+  return result;
+}
+
+} // namespace at::cuda::host_trace

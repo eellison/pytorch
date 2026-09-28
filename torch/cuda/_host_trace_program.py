@@ -14,6 +14,7 @@ miss.
 from __future__ import annotations
 
 import operator
+import struct
 from enum import IntEnum
 from typing import Any, TYPE_CHECKING
 
@@ -68,10 +69,19 @@ _ARITY = {
     "and": 2,
     "bitlength": 1,
     "lshift": 2,
+    "f32div": 2,
     "select": 3,
     **dict.fromkeys(_COMPARISONS, 2),
     **dict.fromkeys(_BITWISE, 2),
 }
+
+
+def f32_bits(n: int, d: int) -> int:
+    """static_cast<float>(n) / static_cast<float>(d)'s bits as an int32: each
+    rounded to float32, their double quotient rounded once more, which is the
+    float32 quotient."""
+    f = [struct.unpack("<f", struct.pack("<f", x))[0] for x in (n, d)]
+    return struct.unpack("<i", struct.pack("<f", f[0] / f[1]))[0]
 
 
 def _fits(value: int) -> bool:
@@ -102,6 +112,11 @@ def _step(op: str, args: list[int]) -> int | Status:
             return Status.SHIFT_DOMAIN
         r = a << min(b, 64)
         return r if _fits(r) else Status.MULTIPLY_OVERFLOW
+    if op == "f32div":
+        n, d = args
+        if n < 0 or d <= 0:
+            return Status.DIVISION_DOMAIN
+        return f32_bits(n, d)
     if op in ("and", "select"):
         if any(b not in (0, 1) for b in args[: 2 if op == "and" else 1]):
             return Status.BOOLEAN_DOMAIN
@@ -125,6 +140,8 @@ class IntegerProgram:
       ("bitand" | "bitor" | "bitxor", a, b)
       ("bitlength", a)                  a.bit_length(), of |a|
       ("lshift", a, b)                  a * 2**b, for b >= 0
+      ("f32div", a, b)                  float(a) / float(b)'s float32 bits, as
+                                        an int32, for a >= 0 and b > 0
       ("min" | "max", a, b, ...)
       ("select", cond, if_true, if_false)
     where a, b, ... are earlier rows. floordiv and ceildiv are defined for a

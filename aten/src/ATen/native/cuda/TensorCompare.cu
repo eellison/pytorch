@@ -5,6 +5,8 @@
 #include <ATen/native/DispatchStub.h>
 #include <ATen/native/TensorCompare.h>
 #include <ATen/native/cuda/Loops.cuh>
+#include <ATen/cuda/host_trace/LoopsSym.cuh>
+#include <ATen/cuda/host_trace/Ops.h>
 #include <c10/core/Scalar.h>
 #include <c10/core/ScalarType.h>
 
@@ -13,13 +15,16 @@ namespace at::native {
 
 namespace {
 
+template <typename scalar_t>
+struct WhereFunctor {
+  __device__ scalar_t operator()(bool cond_val, scalar_t self_val, scalar_t other_val) const {
+    return cond_val ? self_val : other_val;
+  }
+};
+
 void where_kernel_impl(TensorIterator &iter) {
   AT_DISPATCH_V2(opaqueScalarType(iter.dtype()), "where_cuda", [&] {
-      gpu_kernel_opaque(
-        iter,
-        [=] GPU_LAMBDA (bool cond_val, scalar_t self_val, scalar_t other_val) -> scalar_t {
-          return cond_val ? self_val : other_val;
-        });
+      gpu_kernel_opaque(iter, WhereFunctor<scalar_t>());
   }, AT_EXPAND(AT_OPAQUE_TYPES));
 }
 
@@ -150,3 +155,15 @@ void _assert_async_cuda(const Tensor& self_tensor) {
 }
 
 } // namespace at::native
+
+namespace at::cuda::host_trace {
+
+TensorBase where(Recorder& rec, const TensorBase& cond, const TensorBase& a, const TensorBase& b) {
+  auto iter = TensorIteratorSym::where_op(rec, cond, a, b);
+  AT_DISPATCH_V2(opaqueScalarType(iter.dtype(0)), "where_cuda", [&] {
+    gpu_kernel_nocast(rec, iter, at::native::WhereFunctor<scalar_t>());
+  }, AT_EXPAND(AT_OPAQUE_TYPES));
+  return iter.output();
+}
+
+} // namespace at::cuda::host_trace

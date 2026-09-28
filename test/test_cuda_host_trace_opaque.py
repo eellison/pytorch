@@ -413,7 +413,7 @@ class TestOpaqueCalls(TestCase):
 
         def fn(x):
             h = add(x)
-            return add(torch.mul(h.half(), h.half()).float() - h)
+            return add(torch.mul(h.half(), h) - h)
 
         tape = trace(fn, (x,), opaque=(TableProvider(),))
         eager = [rec for _, rec in tape.launches if isinstance(rec, EagerCall)]

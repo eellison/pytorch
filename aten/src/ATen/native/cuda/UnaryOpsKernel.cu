@@ -17,6 +17,8 @@
 #include <c10/cuda/CUDAMathCompat.h>
 #include <c10/core/Scalar.h>
 #include <c10/util/complex.h>
+#include <ATen/cuda/host_trace/LoopsSym.cuh>
+#include <ATen/cuda/host_trace/Ops.h>
 
 namespace at::native {
 
@@ -92,6 +94,16 @@ C10_HOST_DEVICE static inline c10::complex<T> rsqrt_wrapper(c10::complex<T> v) {
   return one / ::sqrt(v);
 }
 
+namespace {
+template <typename scalar_t>
+struct RsqrtFunctor {
+  __device__ scalar_t operator()(scalar_t a) const {
+    // In CUDA, ::rsqrt is overloaded for float and at::Half here is implicitly cast to float.
+    return rsqrt_wrapper(a);
+  }
+};
+} // namespace
+
 constexpr char rsqrt_name[] = "rsqrt_kernel";
 void rsqrt_kernel_cuda(TensorIteratorBase& iter) {
   auto common_dtype = iter.common_dtype();
@@ -122,12 +134,7 @@ void rsqrt_kernel_cuda(TensorIteratorBase& iter) {
     AT_DISPATCH_FLOATING_TYPES_AND2(
       ScalarType::BFloat16, ScalarType::Half,
       iter.common_dtype(), "rsqrt_cuda",
-      [&]() {
-        gpu_kernel(iter, []GPU_LAMBDA(scalar_t a) -> scalar_t {
-          // In CUDA, ::rsqrt is overloaded for float and at::Half here is implicitly cast to float.
-          return rsqrt_wrapper(a);
-        });
-      });
+      [&]() { gpu_kernel(iter, RsqrtFunctor<scalar_t>()); });
   }
 }
 
@@ -284,3 +291,18 @@ REGISTER_DISPATCH(nan_to_num_stub, &nan_to_num_kernel_cuda)
 REGISTER_DISPATCH(frexp_stub, &frexp_kernel_cuda)
 
 } // namespace at::native
+
+namespace at::cuda::host_trace {
+
+TensorBase rsqrt(Recorder& rec, const TensorBase& a) {
+  if (!isFloatingType(a.scalar_type())) {
+    decline("rsqrt of a non-floating tensor");
+  }
+  auto iter = TensorIteratorSym::unary_op(rec, a);
+  AT_DISPATCH_FLOATING_TYPES_AND2(kBFloat16, kHalf, iter.common_dtype(), "rsqrt_cuda", [&]() {
+    gpu_kernel(rec, iter, at::native::RsqrtFunctor<scalar_t>());
+  });
+  return iter.output();
+}
+
+} // namespace at::cuda::host_trace
