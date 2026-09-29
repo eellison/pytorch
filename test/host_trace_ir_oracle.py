@@ -1167,7 +1167,7 @@ def _meta_traced_aten(tr: Any, func: Any, args: tuple, kwargs: dict, witnessed: 
         return _TRACED_ATEN_CALL(tr, func, args, kwargs, witnessed)
     before = list(env.records), dict(env._index), list(env.owners)
     out = _TRACED_ATEN_CALL(tr, func, args, kwargs, witnessed)
-    if out is None:
+    if out is None or isinstance(out, str):
         return out
 
     def fake() -> Any:

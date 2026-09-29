@@ -6,12 +6,17 @@
 #include <ATen/MemoryOverlap.h>
 #include <ATen/native/Resize.h>
 
+#if !defined(USE_ROCM)
+#include <ATen/cuda/host_trace/Ops.h>
+#endif
+
 #ifndef AT_PER_OPERATOR_HEADERS
 #include <ATen/Functions.h>
 #include <ATen/NativeFunctions.h>
 #else
 #include <ATen/ops/diag.h>
 #include <ATen/ops/diag_native.h>
+#include <ATen/ops/empty.h>
 #include <ATen/ops/trace_native.h>
 #include <ATen/ops/tril_native.h>
 #include <ATen/ops/triu_native.h>
@@ -209,3 +214,55 @@ Tensor trace_cuda(const Tensor& self) {
 }
 
 } // namespace at::native
+
+#if !defined(USE_ROCM)
+// Traced host (ATen/cuda/host_trace/Ops.h)
+namespace at::cuda::host_trace {
+namespace {
+
+// getTensorInfo<T, int32_t>(t)
+template <typename T>
+Param<at::cuda::detail::TensorInfo<T, int32_t>> tensor_info(Recorder& rec, const TensorBase& t) {
+  Param<at::cuda::detail::TensorInfo<T, int32_t>> p;
+  auto& info = p.value();
+  p.set(info.data, rec.data_ptr(t));
+  info.dims = static_cast<int>(t.dim());
+  for (const auto i : c10::irange(t.dim())) {
+    p.set(info.sizes[i], t.sym_size(i));
+    p.set(info.strides[i], t.sym_stride(i));
+  }
+  return p;
+}
+
+} // namespace
+
+TensorBase triu(Recorder& rec, const TensorBase& self, int64_t k) {
+  if (self.dim() < 2) {
+    decline("a triu of fewer than 2 dims");
+  }
+  const TensorBase result = at::empty_symint(self.sym_sizes(), self.options());
+  if (self.sym_numel() == 0) {
+    return result;
+  }
+  // launch_triu_tril_kernel's launch (keep in sync)
+  if (!at::native::canUse32BitIndexMath(result) || !at::native::canUse32BitIndexMath(self)) {
+    decline("a triu beyond 32-bit indexing");
+  }
+  AT_DISPATCH_ALL_TYPES_AND_COMPLEX_AND4(kComplexHalf, kHalf, kBFloat16, kBool, self.scalar_type(), "triu_tril_cuda_template", [&] {
+    constexpr int elements_per_thread = sizeof(scalar_t) < 8 ? 8 / sizeof(scalar_t) : 1;
+    const c10::SymInt last_dim_padded = (self.sym_sizes().back() + elements_per_thread - 1) / elements_per_thread * elements_per_thread;
+    c10::SymInt n_padded = last_dim_padded;
+    for (const auto i : c10::irange(self.dim() - 1)) {
+      n_padded *= self.sym_size(i);
+    }
+    const auto block_size = at::native::block_size;
+    launch(rec, &at::native::triu_tril_kernel<scalar_t, int32_t, true, elements_per_thread, false>,
+           SymDim3((n_padded / elements_per_thread + block_size - 1) / block_size), SymDim3(block_size), 0,
+           tensor_info<scalar_t>(rec, result), tensor_info<const scalar_t>(rec, self), Param<int64_t>(k), scalar_param<int64_t>(n_padded),
+           scalar_param<int32_t>(last_dim_padded));
+  });
+  return result;
+}
+
+} // namespace at::cuda::host_trace
+#endif

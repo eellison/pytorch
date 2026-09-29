@@ -7,6 +7,7 @@ from unittest import mock
 
 import torch
 import torch.nn.functional as F
+import torch.utils._pytree as pytree
 from torch.cuda._host_trace_capture import (
     capture_kernel_nodes,
     KernelNode,
@@ -250,6 +251,87 @@ INDEXING = {
     ),
     "embedding_gather": (lambda i, w: F.embedding(i, w), lambda m, h, d: (torch.randint(0, 300, (2, m + 16), device="cuda"), _randn(300, h, dtype=d))),
 }
+
+
+def _batch_norm(x, w, b, dtype, channels_last=False):
+    c = x.shape[1]
+    stats = (torch.randn(c, device="cuda", dtype=dtype), torch.rand(c, device="cuda", dtype=dtype) + 0.5)
+    params = [None if p is None else torch.randn(c, device="cuda", dtype=p) for p in (w, b)]
+    return (x.contiguous(memory_format=torch.channels_last) if channels_last else x, *params, *stats)
+
+
+def _eval_batch_norm(x, w, b, mean, var):
+    return torch.native_batch_norm(x, w, b, mean, var, False, 0.1, 1e-5)[0]
+
+
+def _class_targets(m, c, ignored=False):
+    t = torch.randint(0, c, (m,), device="cuda")
+    return t.masked_fill(torch.arange(m, device="cuda") % 3 == 1, -100) if ignored else t
+
+
+def _nans(m, h, d):
+    x = _randn(m, h, dtype=d)
+    return (x.masked_fill(torch.rand_like(x) < 0.01, float("nan")),)
+
+
+# name: (fn, args from (m, h, dtype)): ops of their own host
+HOSTS = {
+    "batch_norm_nchw": (_eval_batch_norm, lambda m, h, d: _batch_norm(_randn(m, 32, h // 256, 4, dtype=d), d, d, d)),
+    "batch_norm_channels_last": (_eval_batch_norm, lambda m, h, d: _batch_norm(_randn(m, 32, h // 256, 4, dtype=d), d, d, d, True)),
+    "batch_norm_2d": (_eval_batch_norm, lambda m, h, d: _batch_norm(_randn(m, h, dtype=d), d, d, d)),
+    "batch_norm_float_params": (_eval_batch_norm, lambda m, h, d: _batch_norm(_randn(m, 32, h // 256, 4, dtype=d), torch.float, torch.float, torch.float)),
+    "batch_norm_no_weight": (_eval_batch_norm, lambda m, h, d: _batch_norm(_randn(m, 32, h // 256, 4, dtype=d), None, None, d)),
+    # a bf16 BatchNorm2d in eval, which eager keeps off cudnn
+    "batch_norm_bf16_module": (
+        lambda x, w, b, mean, var: F.batch_norm(x, mean, var, w, b),
+        lambda m, h, d: _batch_norm(_randn(m, 32, h // 256, 4, dtype=torch.bfloat16), *[torch.bfloat16] * 3),
+    ),
+    "arange": (lambda x: torch.arange(x.shape[0], device=x.device), lambda m, h, d: (_randn(m, h, dtype=d),)),
+    "arange_start_step": (lambda x: torch.arange(1, 2 * x.shape[0] + 1, 2, device=x.device, dtype=x.dtype), lambda m, h, d: (_randn(m, h, dtype=d),)),
+    # T5's cache_position[-1] + 1: an alignment guard at an offset into an allocation
+    "arange_last_plus_one": (lambda x: torch.arange(x.shape[0], device=x.device)[-1] + 1, lambda m, h, d: (_randn(m, h, dtype=d),)),
+    "arange_negative_step": (lambda x: torch.arange(x.shape[0], -3, -2, device=x.device), lambda m, h, d: (_randn(m, h, dtype=d),)),
+    "causal_mask_triu": (lambda x: torch.triu(x.new_full((x.shape[0], x.shape[0]), float("-inf")), 1), lambda m, h, d: (_randn(m, h, dtype=d),)),
+    "triu_rectangular": (lambda x: x.triu(-1), lambda m, h, d: (_randn(m, 64, dtype=d),)),
+    "zeros": (lambda x: x + torch.zeros(x.shape[0], 1, device=x.device, dtype=x.dtype), lambda m, h, d: (_randn(m, h, dtype=d),)),
+    "zeros_like": (lambda x: torch.zeros_like(x[:, :64]), lambda m, h, d: (_randn(m, h, dtype=d),)),
+    "repeat_symbolic": (lambda mask: mask.unsqueeze(1).repeat(1, mask.shape[1] + 1, 1), lambda m, h, d: (torch.rand(2, m, device="cuda") > 0.5,)),
+    "repeat_leading": (lambda x: x.repeat(2, 1, 3), lambda m, h, d: (_randn(m, 64, dtype=d),)),
+    "nll_loss_mean": (lambda x, t: F.nll_loss(x, t), lambda m, h, d: (_randn(m, h // 8, dtype=d), _class_targets(m, h // 8))),
+    "nll_loss_sum_ignored": (lambda x, t: F.nll_loss(x, t, reduction="sum"), lambda m, h, d: (_randn(m, h // 8, dtype=d), _class_targets(m, h // 8, True))),
+    "nll_loss_weight": (lambda x, t, w: F.nll_loss(x, t, w), lambda m, h, d: (_randn(m, h // 8, dtype=d), _class_targets(m, h // 8, True), torch.rand(h // 8, device="cuda", dtype=d))),
+    "max_pool2d": (lambda x: F.max_pool2d(x, 3, 2, 1), lambda m, h, d: (_randn(m, 8, h // 128, 16, dtype=d),)),
+    "max_pool2d_ceil_dilation": (lambda x: F.max_pool2d(x, 2, (2, 1), 0, 2, ceil_mode=True), lambda m, h, d: (_randn(m, 8, h // 128, 16, dtype=d),)),
+    "max_pool2d_unbatched": (lambda x: F.max_pool2d(x, 2), lambda m, h, d: (_randn(m, h // 128, 16, dtype=d),)),
+    "adaptive_avg_pool2d": (lambda x: F.adaptive_avg_pool2d(x, (6, 6)), lambda m, h, d: (_randn(m, 8, h // 128, 16, dtype=d),)),
+    "adaptive_avg_pool2d_unbatched": (lambda x: F.adaptive_avg_pool2d(x, (5, 7)), lambda m, h, d: (_randn(m, h // 128, 16, dtype=d),)),
+    "argmax": (lambda x: x.argmax(-1), lambda m, h, d: (_randn(m, h, dtype=d),)),
+    "argmax_keepdim_of_ints": (lambda x: (x > 0).int().argmax(1, keepdim=True), lambda m, h, d: (_randn(m, 8, h // 8, dtype=d),)),
+    "argmax_all": (torch.argmax, lambda m, h, d: (_randn(m, h, dtype=d),)),
+    "argmax_size_one": (lambda x: x[:, :1].argmax(1), lambda m, h, d: (_randn(m, h, dtype=d),)),
+    "argmax_nan": (lambda x: x.argmax(-1), _nans),
+    "argmin": (lambda x: x.argmin(0), lambda m, h, d: (_randn(m, h, dtype=d),)),
+    "argmin_all_keepdim_t": (lambda x: x.t().argmin(keepdim=True), lambda m, h, d: (_randn(m, h, dtype=d),)),
+    "argmin_bf16": (lambda x: x.bfloat16().argmin(-1), lambda m, h, d: (_randn(m, h, dtype=d),)),
+    "amin": (lambda x: x.amin(-1), lambda m, h, d: (_randn(m, h, dtype=d),)),
+    "amin_all_t": (lambda x: x.t().amin(), lambda m, h, d: (_randn(m, h, dtype=d),)),
+    "max_all": (torch.max, lambda m, h, d: (_randn(m, h, dtype=d),)),
+    "max_all_nan": (torch.max, _nans),
+    "min_all_t": (lambda x: x.t().min(), lambda m, h, d: (_randn(m, h, dtype=d),)),
+    "max_dim": (lambda x: tuple(x.max(-1)), lambda m, h, d: (_randn(m, h, dtype=d),)),
+    "max_dim_t": (lambda x: tuple(x.t().max(-1)), lambda m, h, d: (_randn(m, h, dtype=d),)),
+    "max_dim_bf16": (lambda x: tuple(x.bfloat16().max(-1)), lambda m, h, d: (_randn(m, h, dtype=d),)),
+    "max_dim_of_ints": (lambda x: tuple((x * 8).int().max(1)), lambda m, h, d: (_randn(m, 8, h // 8, dtype=d),)),
+    "max_dim_of_bools": (lambda x: tuple((x > 0).max(0)), lambda m, h, d: (_randn(m, h, dtype=d),)),
+    "max_dim_of_0dim": (lambda x: tuple(x[0, 0].max(0)), lambda m, h, d: (_randn(m, h, dtype=d),)),
+    "min_dim_keepdim_first": (lambda x: tuple(x.min(0, keepdim=True)), lambda m, h, d: (_randn(m, h, dtype=d),)),
+    "min_dim_nan": (lambda x: tuple(x.min(1)), _nans),
+    "min_dim_empty": (lambda x: tuple(x[:0].min(-1)), lambda m, h, d: (_randn(m, h, dtype=d),)),
+}
+
+
+def _unread_or_zeros(node: KernelNode, launch: KernelLaunch) -> set[tuple[int, int]]:
+    return _unread(node, launch, 0) if "elementwise_kernel" in node.name else _zeros(launch)
 
 
 def _zeros(launch: KernelLaunch) -> set[tuple[int, int]]:
@@ -564,7 +646,7 @@ class TestHostTraceAten(TestCase):
         traced = entry.traces != traces
         ref = fn(*args)
         self.assertEqual(out, ref, atol=0, rtol=0)
-        self.assertEqual(out.stride(), ref.stride())
+        self.assertEqual([t.stride() for t in pytree.tree_leaves(out)], [t.stride() for t in pytree.tree_leaves(ref)])
         del out, ref
         torch.cuda.reset_peak_memory_stats()
         fn(*args)
@@ -761,12 +843,56 @@ class TestHostTraceAten(TestCase):
     @parametrize("m", [16, 1])
     def test_cat_and_indexing_records_match_eager(self, dtype, case, m):
         fn, args_fn = {**CATS, **INDEXING}[case]
+        self._assert_records_match_eager(fn, args_fn(m, 768, dtype), _unread_or_zeros)
 
-        def unread(node, launch):
-            pointwise = "elementwise_kernel" in node.name
-            return _unread(node, launch, 0) if pointwise else _zeros(launch)
+    @parametrize("dtype", [torch.float16, torch.float32])
+    @parametrize("case", list(HOSTS))
+    def test_host_replays_new_shapes(self, dtype, case):
+        fn, args_fn = HOSTS[case]
+        entry = HostTraceReplay(fn)
+        for h in (4096, 768):
+            for m in (16, 7, 1, 5):
+                self._assert_replays_eager_calls(entry, fn, args_fn(m, h, dtype))
+        self.assertEqual(entry.eager, 0)
 
-        self._assert_records_match_eager(fn, args_fn(m, 768, dtype), unread)
+    @parametrize("dtype", [torch.float16, torch.float32])
+    @parametrize("case", [c for c in HOSTS if not c.startswith(("batch_norm", "zeros", "causal")) and not c.endswith(("_0dim", "_empty"))])
+    @parametrize("m", [16, 1])
+    def test_host_records_match_eager(self, dtype, case, m):
+        fn, args_fn = HOSTS[case]
+        self._assert_records_match_eager(fn, args_fn(m, 768, dtype), _unread_or_zeros)
+
+    @parametrize("case", ["max_dim", "min_dim_keepdim_first", "argmax_all", "argmin", "max_all", "amin"])
+    def test_minmax_replays_new_sizes_in_one_trace(self, case):
+        # a new size re-dispatches the traced reduction with patched launch
+        # parameters; a full reduction's switch to a global one (129 x 4096) is
+        # a second trace, as for sum
+        fn, args_fn = HOSTS[case]
+        entry = HostTraceReplay(fn)
+        for m, h in ((64, 768), (2, 768), (37, 96), (129, 4096), (9, 1500), (300, 32)):
+            self._assert_replays_eager_calls(entry, fn, args_fn(m, h, torch.float32))
+        self.assertEqual((entry.traces, entry.eager), (2 if case.endswith("_all") else 1, 0))
+
+    def test_symbolic_repeat_replays_new_sizes_in_one_trace(self):
+        fn, args_fn = HOSTS["repeat_symbolic"]
+        entry = HostTraceReplay(fn)
+        for m in (16, 7, 5):
+            self._assert_replays_eager_calls(entry, fn, args_fn(m, 768, torch.float32))
+        self.assertEqual((entry.traces, entry.eager), (1, 0))
+
+    @parametrize("static", [True, False])
+    def test_remainder_of_a_size(self, static):
+        # GPT-2's sequence_lengths % input_ids.shape[-1]: remainder.Tensor's arg
+        # parser takes no Python number, its Scalar overload does
+        def fn(x, ids):
+            return (x.argmax(-1) - 1) % (9 if static else ids.shape[-1])
+
+        entry = HostTraceReplay(fn)
+        for n in (9, 5, 9):
+            args = (_randn(4, 64), torch.zeros(4, n, device="cuda"))
+            self.assertEqual(entry(*args), fn(*args), atol=0, rtol=0)
+        kinds = [type(c) for _, c in trace(fn, args).launches]
+        self.assertEqual(kinds.count(EagerCall), 0)
 
     @parametrize("case", list(DECLINES))
     def test_decline_is_an_eager_call(self, case):

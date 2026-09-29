@@ -937,6 +937,24 @@ class TestReplayMemory(TestCase):
             self.assertEqual(torch.cuda.memory_allocated(), before - eager_retained)
         self.assertEqual((f.traces, f.eager), (2, 0))
 
+    def test_host_step_keeps_the_runs_peak(self):
+        # the host step runs first, out of tape order (HF LayerDrop's
+        # torch.rand([])): the run before it still frees its temporaries
+        def fn(x):
+            for _ in range(4):
+                x = add(add(x))
+            torch.rand([])
+            return add(lies_when_small(x))
+
+        f = HostTraceReplay(fn)
+        for _ in range(3):
+            x = torch.randn(1 << 20, device="cuda")
+            want, _, eager_peak = self.measure(fn, x)
+            y, _, peak = self.measure(f, x)
+            self.assertEqual(y, want)
+        self.assertEqual((f.traces, f.replays, f.eager), (1, 2, 0))
+        self.assertLessEqual(peak, eager_peak)
+
     def test_call_boxed_drops_an_argument_after_its_last_use(self):
         # a caller that gives its references up (Inductor's boxed call): x is
         # freed after the first run, before the clone, as eager frees it

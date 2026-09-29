@@ -151,7 +151,9 @@ def plan_memory(lowered: LoweredTape, memory: str = "eager") -> MemoryPlan:
     last_arg: list[list[int]] = [[] for _ in range(len(steps) + 1)]
     for a, s in args_used.items():
         last_arg[max(s)].append(a)
-    holding = [bisect.bisect(ends, a.seq) for a in allocations]
+    # host steps come first, out of tape order, and allocate nothing
+    first = sum(isinstance(s, LoweredEagerCall) and s.call.host for s in steps)
+    holding = [first + bisect.bisect(ends[first:], a.seq) for a in allocations]
     local = {
         k
         for k in range(n_alloc)

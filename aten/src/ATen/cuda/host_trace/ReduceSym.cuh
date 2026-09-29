@@ -221,7 +221,7 @@ void launch_reduce_kernel(Recorder& rec, const ReduceConfig& config, const Param
   }
 }
 
-// one output, no accumulation buffer: 64-bit indexing declines
+// no accumulation buffer: 64-bit indexing declines
 template <typename scalar_t, typename out_scalar_t, int vt0 = 4, int input_vec_size = vt0, typename ops_t, typename ident_t = double>
 void gpu_reduce_kernel(Recorder& rec, const TensorIteratorSym& iter, const Param<ops_t>& ops, ident_t ident = 0) {
   TORCH_INTERNAL_ASSERT(iter.ntensors() - iter.noutputs() == 1);
@@ -266,6 +266,9 @@ void gpu_reduce_kernel(Recorder& rec, const TensorIteratorSym& iter, const Param
   set_output_calculator(rec, reduce, r.output_calc, iter);
   reduce.set(r.src, iter.data_ptr(iter.ntensors() - 1));
   reduce.set(r.dst[0], iter.data_ptr(0));
+  if (iter.noutputs() > 1) {
+    reduce.set(r.dst[1], iter.data_ptr(1));
+  }
   if (config.should_global_reduce()) {
     reduce.set(r.cta_buf, rec.data_ptr(buffer));
     reduce.set(r.semaphores, rec.data_ptr(semaphores));

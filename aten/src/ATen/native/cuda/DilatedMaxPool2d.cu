@@ -13,9 +13,14 @@
 #include <c10/macros/Macros.h>
 #include <ATen/native/cuda/LaunchUtils.h>
 
+#if !defined(USE_ROCM)
+#include <ATen/cuda/host_trace/Ops.h>
+#endif
+
 #ifndef AT_PER_OPERATOR_HEADERS
 #include <ATen/NativeFunctions.h>
 #else
+#include <ATen/ops/empty.h>
 #include <ATen/ops/max_pool2d_with_indices_native.h>
 #include <ATen/ops/max_pool2d_with_indices_backward_native.h>
 #endif
@@ -786,3 +791,76 @@ const Tensor& gradInput) {
 }
 
 } // at::native
+
+#if !defined(USE_ROCM)
+// Traced host (ATen/cuda/host_trace/Ops.h)
+namespace at::cuda::host_trace {
+
+std::tuple<TensorBase, TensorBase> max_pool2d_with_indices(Recorder& rec, const TensorBase& input, IntArrayRef kernel_size, IntArrayRef stride, IntArrayRef padding, IntArrayRef dilation, bool ceil_mode) {
+  if ((input.dim() != 3 && input.dim() != 4) || kernel_size.empty() || padding.empty() || dilation.empty()) {
+    decline("a max_pool2d of other arguments");
+  }
+  if (input.suggest_memory_format() != MemoryFormat::Contiguous || !input.is_contiguous()) {
+    decline("a max_pool2d of an input that is not contiguous");
+  }
+  const int kH = c10::checked_convert<int>(kernel_size[0], "int");
+  const int kW = kernel_size.size() == 1 ? kH : c10::checked_convert<int>(kernel_size[1], "int");
+  const int dH = stride.empty() ? kH : c10::checked_convert<int>(stride[0], "int");
+  const int dW = stride.empty() ? kW : stride.size() == 1 ? dH : c10::checked_convert<int>(stride[1], "int");
+  const int padH = c10::checked_convert<int>(padding[0], "int");
+  const int padW = padding.size() == 1 ? padH : c10::checked_convert<int>(padding[1], "int");
+  const int dilationH = c10::checked_convert<int>(dilation[0], "int");
+  const int dilationW = dilation.size() == 1 ? dilationH : c10::checked_convert<int>(dilation[1], "int");
+  // pooling_output_shape of a nonnegative numerator, as the meta function checks
+  auto output_size = [ceil_mode](const c10::SymInt& in, int64_t k, int64_t pad, int64_t s, int64_t d) {
+    c10::SymInt out = (in + 2 * pad - d * (k - 1) - 1 + (ceil_mode ? s - 1 : 0)) / s + 1;
+    if (ceil_mode && (out - 1) * s >= in + pad) {
+      out = out - 1;
+    }
+    return out;
+  };
+  const c10::SymInt nbatch = input.dim() == 4 ? input.sym_size(-4) : c10::SymInt(1);
+  const c10::SymInt& channels = input.sym_size(-3);
+  const c10::SymInt& height = input.sym_size(-2);
+  const c10::SymInt& width = input.sym_size(-1);
+  const c10::SymInt out_height = output_size(height, kH, padH, dH, dilationH);
+  const c10::SymInt out_width = output_size(width, kW, padW, dW, dilationW);
+  c10::SymDimVector sizes{channels, out_height, out_width};
+  if (input.dim() == 4) {
+    sizes.insert(sizes.begin(), nbatch);
+  }
+  const TensorBase output = at::empty_symint(sizes, input.options());
+  const TensorBase indices = at::empty_symint(sizes, input.options().dtype(kLong));
+  const c10::SymInt nthreads = output.sym_numel();
+  if (nthreads == 0) {
+    return {output, indices};
+  }
+  // the Contiguous case of max_pool2d_with_indices_out_cuda (keep in sync)
+  const int threads = std::min(at::cuda::getCurrentDeviceProperties()->maxThreadsPerBlock, at::native::BLOCK_THREADS);
+  const c10::SymInt blocks = (nthreads + threads - 1) / threads;
+  if (blocks > at::cuda::getCurrentDeviceProperties()->maxGridSize[0]) {
+    decline("a max_pool2d of more blocks than the grid holds");
+  }
+  // can_use_int32_nchw of nonempty sizes
+  constexpr int64_t int_max = std::numeric_limits<int>::max();
+  const bool use_int32 = input.sym_numel() - 1 <= int_max && (nbatch - 1) * out_height * out_width * channels <= int_max && height * width <= int_max;
+  AT_DISPATCH_FLOATING_TYPES_AND2(kHalf, kBFloat16, input.scalar_type(), "max_pool2d_with_indices_out_cuda_frame", [&] {
+    auto run = [&](auto index) {
+      using index_t = decltype(index);
+      launch(rec, &at::native::max_pool_forward_nchw<scalar_t, index_t>, blocks, threads, 0, scalar_param<index_t>(nthreads),
+             scalar_param<const scalar_t*>(rec.data_ptr(input)), scalar_param<int64_t>(channels), scalar_param<int64_t>(height),
+             scalar_param<int64_t>(width), scalar_param<int>(out_height), scalar_param<int>(out_width), Param<int>(kH), Param<int>(kW), Param<int>(dH),
+             Param<int>(dW), Param<int>(padH), Param<int>(padW), Param<int>(dilationH), Param<int>(dilationW),
+             scalar_param<scalar_t*>(rec.data_ptr(output)), scalar_param<int64_t*>(rec.data_ptr(indices)));
+    };
+    if (use_int32) {
+      run(int32_t{});
+    } else {
+      run(int64_t{});
+    }
+  });
+  return {output, indices};
+}
+
+} // namespace at::cuda::host_trace
+#endif

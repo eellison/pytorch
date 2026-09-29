@@ -80,5 +80,26 @@ TensorBase amax(Recorder& rec, const TensorBase& self, IntArrayRef dims, bool ke
   return result;
 }
 
+// max(): max_all_kernel_impl over self.contiguous()
+TensorBase max_all(Recorder& rec, const TensorBase& self) {
+  if (self.sym_numel() == 0) {
+    decline("a max of an empty tensor");
+  }
+  return amax(rec, contiguous(rec, self), {}, false);
+}
+
+// minmax_out_impl, max_kernel_impl
+std::tuple<TensorBase, TensorBase> max_dim(Recorder& rec, const TensorBase& self, int64_t dim, bool keepdim) {
+  TensorBase values;
+  TensorBase indices;
+  if (auto iter = make_minmax_reduction(rec, values, indices, self, dim, keepdim)) {
+    AT_DISPATCH_ALL_TYPES_AND3(kBFloat16, kHalf, kBool, iter->dtype(2), "max_cuda", [&]() {
+      Param ops(at::native::MaxOps<scalar_t>{});
+      gpu_reduce_kernel<scalar_t, scalar_t>(rec, *iter, ops, thrust::pair<scalar_t, int64_t>(at::numeric_limits<scalar_t>::lower_bound(), 0));
+    });
+  }
+  return {values, indices};
+}
+
 } // namespace at::cuda::host_trace
 #endif

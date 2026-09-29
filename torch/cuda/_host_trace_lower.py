@@ -249,8 +249,11 @@ class Lowering:
             # the host rounds a float quotient, exactly so below 2**53
             return self._divide(*e.args[0].args, floor=isinstance(e, FloorToInt))
         if isinstance(e, (PythonMod, Mod)):
-            # n - d * (n // d); torch's Mod is the same on its nonnegative domain
+            # n - d * (n // d); torch's Mod is the same on its nonnegative domain.
+            # A term of n that d divides (an allocation's 256-aligned base, not
+            # yet bound where a guard reads it) leaves it unchanged
             n, d = e.args
+            n = sympy.Add(*(t for t in sympy.Add.make_args(n) if not (t / d).is_integer))
             quotient = self._divide(n, d, floor=True)
             product = self._emit("multiply", self._lower_integer(d), quotient)
             return self._emit("add", self._lower_integer(n), self._negate(product))

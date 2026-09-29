@@ -10,6 +10,10 @@
 #include <c10/util/Exception.h>
 #include <ATen/native/cuda/LaunchUtils.h>
 
+#if !defined(USE_ROCM)
+#include <ATen/cuda/host_trace/Ops.h>
+#endif
+
 #ifndef AT_PER_OPERATOR_HEADERS
 #include <ATen/Functions.h>
 #include <ATen/NativeFunctions.h>
@@ -838,3 +842,54 @@ namespace {
 #undef CUDA_MAX_THREADS
 #undef START_IND
 #undef END_IND
+
+#if !defined(USE_ROCM)
+// Traced host (ATen/cuda/host_trace/Ops.h)
+namespace at::cuda::host_trace {
+
+TensorBase adaptive_avg_pool2d(Recorder& rec, const TensorBase& input, IntArrayRef output_size) {
+  if ((input.dim() != 3 && input.dim() != 4) || output_size.size() != 2) {
+    decline("an adaptive_avg_pool2d of other arguments");
+  }
+  if (input.suggest_memory_format() != MemoryFormat::Contiguous || !input.is_contiguous()) {
+    decline("an adaptive_avg_pool2d of an input that is not contiguous");
+  }
+  // the Contiguous case of adaptive_avg_pool2d_out_cuda_template (keep in sync)
+  const c10::SymInt& sizeD = input.sym_size(-3);
+  const c10::SymInt grid_x = input.dim() == 4 ? input.sym_size(-4) * sizeD : sizeD;
+  const int64_t osizeH = output_size[0];
+  const int64_t osizeW = output_size[1];
+  c10::SymDimVector sizes{sizeD, osizeH, osizeW};
+  if (input.dim() == 4) {
+    sizes.insert(sizes.begin(), input.sym_size(-4));
+  }
+  const TensorBase output = at::empty_symint(sizes, input.options());
+  if (output.sym_numel() == 0) {
+    return output;
+  }
+  if (grid_x > at::cuda::getCurrentDeviceProperties()->maxGridSize[0]) {
+    decline("an adaptive_avg_pool2d of more blocks than the grid holds");
+  }
+  const c10::SymInt blocksH = sizeD >= 16 ? c10::SymInt(1) : 16 / sizeD;
+  // canUse32BitIndexMath of contiguous tensors
+  constexpr int64_t int_max = std::numeric_limits<int32_t>::max();
+  const bool use_int32 = input.sym_numel() < int_max && output.sym_numel() < int_max;
+  AT_DISPATCH_FLOATING_TYPES_AND2(kHalf, kBFloat16, input.scalar_type(), "adaptive_avg_pool2d_cuda", [&] {
+    auto run = [&](auto index) {
+      using index_t = decltype(index);
+      launch(rec, &at::native::adaptive_average_pool<scalar_t, index_t>, SymDim3(grid_x, blocksH), SymDim3(32, 8), 0,
+             scalar_param<const scalar_t*>(rec.data_ptr(input)), scalar_param<scalar_t*>(rec.data_ptr(output)), scalar_param<index_t>(input.sym_size(-2)),
+             scalar_param<index_t>(input.sym_size(-1)), Param<index_t>(osizeH), Param<index_t>(osizeW), scalar_param<int64_t>(input.sym_stride(-3)),
+             scalar_param<int64_t>(input.sym_stride(-2)), scalar_param<int64_t>(input.sym_stride(-1)));
+    };
+    if (use_int32) {
+      run(int32_t{});
+    } else {
+      run(int64_t{});
+    }
+  });
+  return output;
+}
+
+} // namespace at::cuda::host_trace
+#endif

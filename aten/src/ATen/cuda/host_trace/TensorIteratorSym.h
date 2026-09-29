@@ -9,6 +9,7 @@
 #include <c10/util/SmallVector.h>
 
 #include <initializer_list>
+#include <optional>
 #include <utility>
 
 namespace at::cuda::host_trace {
@@ -49,6 +50,8 @@ struct TORCH_CUDA_CPP_API TensorIteratorSym {
   static TensorIteratorSym gather_op(Recorder& rec, const TensorBase& out, const TensorBase& src, const TensorBase& index);
   // out is make_reduction's view of the result
   static TensorIteratorSym reduce_op(Recorder& rec, const TensorBase& out, const TensorBase& a);
+  // values and indices, make_reduction's views
+  static TensorIteratorSym reduce_op(Recorder& rec, const TensorBase& out1, const TensorBase& out2, const TensorBase& a);
   // a structured pointwise op's (TensorIteratorConfig allow_cpu_scalars) with
   // outputs of out_dtypes, each out where defined (in-place and out=); a 0-dim
   // CPU input is removed after the build, as gpu_kernel_with_scalars removes it
@@ -116,9 +119,25 @@ struct TORCH_CUDA_CPP_API TensorIteratorSym {
   Device common_device_ = kCPU;
 };
 
-// meta::make_reduction for a result of self's dtype (shape_from_dim_mask and
-// review_reduce_result on SymInt): allocates result, then iterates its view
-TORCH_CUDA_CPP_API TensorIteratorSym make_reduction(Recorder& rec, TensorBase& result, const TensorBase& self, IntArrayRef dims, bool keepdim);
+// meta::make_reduction for a result of dtype, else self's (shape_from_dim_mask
+// and review_reduce_result on SymInt): allocates result, then iterates its view
+TORCH_CUDA_CPP_API TensorIteratorSym make_reduction(Recorder& rec, TensorBase& result, const TensorBase& self, IntArrayRef dims, bool keepdim, std::optional<ScalarType> dtype = std::nullopt);
+
+// meta::make_reduction's two-output form over values and indices of
+// resize_reduction_with_indices's shape
+TORCH_CUDA_CPP_API TensorIteratorSym make_reduction(Recorder& rec, const TensorBase& values, const TensorBase& indices, const TensorBase& self, int64_t dim, bool keepdim);
+
+// minmax_out_impl up to its stub, with values and indices allocated: the
+// iterator of the reduction, nullopt where it copies a 0-dim self or launches
+// nothing
+TORCH_CUDA_CPP_API std::optional<TensorIteratorSym> make_minmax_reduction(Recorder& rec, TensorBase& values, TensorBase& indices, const TensorBase& self, int64_t dim, bool keepdim);
+
+// argmax_argmin_impl up to its stub, with result allocated: the iterator of the
+// reduction, nullopt where it fills result or launches nothing
+TORCH_CUDA_CPP_API std::optional<TensorIteratorSym> make_arg_reduction(Recorder& rec, TensorBase& result, const TensorBase& self, std::optional<int64_t> dim, bool keepdim);
+
+// Tensor::contiguous
+TORCH_CUDA_CPP_API TensorBase contiguous(Recorder& rec, const TensorBase& t);
 
 // gpu_reduce_kernel's global reduction buffer and its semaphores, zeroed; here
 // because the Reduce*.cu TUs are TORCH_ASSERT_NO_OPERATORS

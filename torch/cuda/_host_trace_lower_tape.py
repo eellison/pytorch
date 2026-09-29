@@ -730,7 +730,7 @@ def fold(
                 same = type(x) is type(y) and {roles.get(id(r)) for r in x.roots} == {lo.roots.get(id(r)) for r in y.roots}
                 if same and isinstance(x, KernelLaunch):
                     same = (x.attributes, x.programmatic) == (y.attributes, y.programmatic)
-                elif same:
+                elif same and isinstance(x, Memset):
                     same = x.element_size == y.element_size and rename(x.height) == _sym_expr(y.height)
                 if not same:
                     raise FoldRefused(f"another launch topology in {a.func}")
