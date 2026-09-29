@@ -1,6 +1,7 @@
 # Owner(s): ["module: cuda graphs"]
 
 import gc
+import math
 import os
 import random
 import subprocess
@@ -12,6 +13,7 @@ from torch.cuda._host_trace_program import (
     _step,
     compile_program,
     f32_bits,
+    f64_bits,
     IntegerProgram,
     LEAVES,
     MAX_I64,
@@ -88,6 +90,26 @@ CASES = [
     ("f32div", (0, 5), 0),
     ("f32div", (1, 0), S.DIVISION_DOMAIN),
     ("f32div", (-1, 2), S.DIVISION_DOMAIN),
+    ("tofloat", (3,), f64_bits(3.0)),
+    ("tofloat", (MAX_I64,), f64_bits(2.0**63)),
+    ("tofloat", ((1 << 53) + 1,), f64_bits(2.0**53)),
+    ("fsqrt", (f64_bits(64.0),), f64_bits(8.0)),
+    ("fsqrt", (f64_bits(2921.0),), f64_bits(math.sqrt(2921.0))),
+    ("fsqrt", (f64_bits(-0.0),), f64_bits(-0.0)),
+    ("fsqrt", (f64_bits(-1.0),), S.FLOAT_DOMAIN),
+    ("fsqrt", (f64_bits(math.inf),), S.FLOAT_DOMAIN),
+    ("fsqrt", (f64_bits(math.nan),), S.FLOAT_DOMAIN),
+    ("fdiv", (f64_bits(1.0), f64_bits(math.sqrt(80.0))), f64_bits(1.0 / math.sqrt(80.0))),
+    ("fdiv", (f64_bits(1.0), f64_bits(0.0)), S.FLOAT_DOMAIN),
+    ("fdiv", (f64_bits(0.0), f64_bits(-0.0)), S.FLOAT_DOMAIN),
+    ("fdiv", (f64_bits(1e308), f64_bits(1e-308)), S.FLOAT_DOMAIN),
+    ("feq", (f64_bits(0.125), f64_bits(0.125)), 1),
+    ("feq", (f64_bits(0.0), f64_bits(-0.0)), 1),
+    ("feq", (f64_bits(math.nan), f64_bits(math.nan)), 0),
+    ("flt", (f64_bits(-3.0), f64_bits(0.5)), 1),
+    ("flt", (f64_bits(0.5), f64_bits(-3.0)), 0),
+    ("flt", (f64_bits(-0.0), f64_bits(0.0)), 0),
+    ("flt", (f64_bits(-2.0), f64_bits(-1.0)), 1),
     ("min", (3, MIN_I64, 4), MIN_I64),
     ("max", (3, MAX_I64, 4), MAX_I64),
 ]
@@ -97,6 +119,7 @@ EDGES = [0, 1, -1, 2, -2, 3, 7, 62, 63, 64, 1 << 31, 1 << 62, -(1 << 62)]
 EDGES += [MIN_I64, MIN_I64 + 1, MAX_I64, MAX_I64 - 1]
 OPS = ["add", "multiply", "floordiv", "ceildiv", "eq", "ne", "lt", "le", "gt", "ge"]
 OPS += ["and", "bitand", "bitor", "bitxor", "bitlength", "lshift", "f32div", "min", "max", "select"]
+OPS += ["tofloat", "fsqrt", "fdiv", "feq", "flt"]
 
 
 def _reference(instructions, leaves):
@@ -171,6 +194,39 @@ class TestIntegerProgram(TestCase):
         self.assertEqual(out[total], 0)
         self.assertEqual(compiled.evaluate_inputs((MAX_I64, 1))[0], S.ADD_OVERFLOW)
         self.assertEqual(compiled.evaluate_inputs((5, 0))[0], S.DIVISION_DOMAIN)
+
+    def test_domains_rows_fail_at_no_call(self):
+        # emitted while `domains` is a list, a division or shift reads
+        # admitted operands and records where its own were admitted
+        p = IntegerProgram([7, 2])
+        a, b = p.emit("boxed", 0), p.emit("boxed", 1)
+        p.domains = []
+        rows = [p.emit(op, a, b) for op in ("floordiv", "ceildiv", "lshift")]
+        domains, p.domains = p.domains, None
+        compiled = compile_program(p)
+        calls = (((7, 2), [3, 4, 28], [1, 1, 1]), ((7, 0), [0, 0, 7], [0, 0, 1]), ((-7, -1), [0, 0, -7], [0, 0, 0]))
+        for args, values, admitted in calls:
+            status, out = compiled.evaluate_inputs(args)
+            self.assertEqual(status, S.SUCCESS)
+            self.assertEqual([out[r] for r in rows], values)
+            self.assertEqual([out[r] for r in domains], admitted)
+
+    def test_float_domains_rows_fail_at_no_call(self):
+        p = IntegerProgram([4, 2])
+        x, y = (p.emit("tofloat", p.emit("boxed", i)) for i in range(2))
+        p.domains = []
+        rows = [p.emit("fsqrt", x), p.emit("fdiv", x, y)]
+        # a quotient by a double of magnitude below 1 may overflow: not admitted
+        with self.assertRaises(OutOfDomain):
+            p.emit("fdiv", x, p.emit("constant", f64_bits(0.5)))
+        domains, p.domains = p.domains, None
+        compiled = compile_program(p)
+        calls = (((4, 2), [2.0, 2.0], [1, 1]), ((4, -2), [2.0, -2.0], [1, 1]), ((-4, 0), [0.0, 0.0], [0, 0]))
+        for args, values, admitted in calls:
+            status, out = compiled.evaluate_inputs(args)
+            self.assertEqual(status, S.SUCCESS)
+            self.assertEqual([out[r] for r in rows], [f64_bits(v) for v in values])
+            self.assertEqual([out[r] for r in domains], admitted)
 
     def test_identical_rows_are_one_row(self):
         p = IntegerProgram([3, torch.zeros(2, 3)])
@@ -292,6 +348,11 @@ class TestIntegerProgram(TestCase):
             ([("constant", 1), ("bitlength", 0, 0)], 0),
             ([("constant", 1), ("lshift", 0)], 0),
             ([("constant", 1), ("f32div", 0)], 0),
+            ([("constant", 1), ("tofloat", 0, 0)], 0),
+            ([("constant", 1), ("fsqrt", 0, 0)], 0),
+            ([("constant", 1), ("fdiv", 0)], 0),
+            ([("constant", 1), ("feq", 0, 0, 0)], 0),
+            ([("constant", 1), ("flt", 0)], 0),
             ([("boxed", 3)], 2),
             ([("pointer", -1)], 2),
             ([("size", 0, -1)], 1),
@@ -347,8 +408,11 @@ class TestIntegerProgram(TestCase):
         # the int64 edges: the same leaves, status and values as `_step`
         rng = random.Random(seed)
 
+        doubles = [f64_bits(x) for x in (0.0, -0.0, 0.5, 2.0, 64.0, -3.0, 1e308, 1e-308, math.inf, math.nan)]
+
         def value():
-            return rng.choice(EDGES) if rng.random() < 0.5 else rng.randint(-9, 9)
+            r = rng.random()
+            return rng.choice(EDGES) if r < 0.4 else rng.choice(doubles) if r < 0.6 else rng.randint(-9, 9)
 
         for _ in range(50):
             p = IntegerProgram([value(), value(), _random_view(rng), value()])
@@ -365,7 +429,7 @@ class TestIntegerProgram(TestCase):
                     operands = [value()]
                 else:
                     k = rng.randint(2, 4)
-                    arity = {"select": 3, "bitlength": 1, "min": k, "max": k}.get(op, 2)
+                    arity = {"select": 3, "bitlength": 1, "tofloat": 1, "fsqrt": 1, "min": k, "max": k}.get(op, 2)
                     rows = len(p.instructions)
                     operands = [rng.randrange(rows) for _ in range(arity)]
                 try:

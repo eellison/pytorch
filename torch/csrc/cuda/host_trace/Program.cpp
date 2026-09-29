@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cmath>
 #include <limits>
 #include <unordered_map>
 
@@ -36,6 +37,11 @@ HostTraceProgram::HostTraceProgram(
       {"bitlength", Op::BitLength},
       {"lshift", Op::LShift},
       {"f32div", Op::F32Div},
+      {"tofloat", Op::ToFloat},
+      {"fsqrt", Op::FSqrt},
+      {"fdiv", Op::FDiv},
+      {"feq", Op::FEq},
+      {"flt", Op::FLt},
       {"min", Op::Min},
       {"max", Op::Max},
       {"select", Op::Select},
@@ -78,7 +84,8 @@ HostTraceProgram::HostTraceProgram(
     auto op = ops.find(name);
     TORCH_CHECK_VALUE(op != ops.end(), "row ", row, ": unknown op ", name);
     size_t arity = 2;
-    if (op->second == Op::Constant || op->second == Op::BitLength) {
+    if (op->second == Op::Constant || op->second == Op::BitLength ||
+        op->second == Op::ToFloat || op->second == Op::FSqrt) {
       arity = 1;
     } else if (op->second == Op::Select) {
       arity = 3;
@@ -244,6 +251,31 @@ HostTraceProgram::Status HostTraceProgram::evaluate(
         }
         out = std::bit_cast<int32_t>(
             static_cast<float>(a) / static_cast<float>(b));
+        break;
+      case Op::ToFloat:
+        out = std::bit_cast<int64_t>(static_cast<double>(a));
+        break;
+      case Op::FSqrt: {
+        const double x = std::bit_cast<double>(a);
+        if (!(x >= 0.0) || !std::isfinite(x)) {
+          return Status::FloatDomain;
+        }
+        out = std::bit_cast<int64_t>(std::sqrt(x));
+        break;
+      }
+      case Op::FDiv: {
+        const double q = std::bit_cast<double>(a) / std::bit_cast<double>(b);
+        if (!std::isfinite(q)) {
+          return Status::FloatDomain;
+        }
+        out = std::bit_cast<int64_t>(q);
+        break;
+      }
+      case Op::FEq:
+        out = std::bit_cast<double>(a) == std::bit_cast<double>(b);
+        break;
+      case Op::FLt:
+        out = std::bit_cast<double>(a) < std::bit_cast<double>(b);
         break;
       case Op::Min:
       case Op::Max:

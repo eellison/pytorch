@@ -21,8 +21,9 @@ the pool (recorded from each capture on unless the process records its own)
 says which allocations are the call's: the call's blocks are the pool's free
 blocks holding one, and each is one scratch buffer as far as they reach in it
 (the allocations a call frees coalesce). The blocks a capture's call allocated
-(the cuBLAS workspace, a cached one released after the capture) are plugged
-before the next capture, so each capture's sit at their own addresses. Every
+are plugged before the next capture, so each capture's sit at their own
+addresses. The call's cuBLAS workspace is no allocation: each capture's is its
+own window of the arena past the operand sets, one more scratch buffer. Every
 qword of every kernel's parameters is classified across the four: operand +
 delta (moves with the operand set), scratch + delta (inside one of the call's
 blocks in every capture), host (differs with the stack smear or is a stack
@@ -32,8 +33,11 @@ bytes of the parameter structs it would otherwise leave uninitialized. A qword
 that differs otherwise refuses the key, as does a constant pointing into a
 caching-allocator segment (but a GEMM's: see below) or an operand. The binding
 is then launched on fresh random operands at the key's layouts and alignments
-and must equal the eager call on them bitwise. The captures run under the
-current global cuBLAS and cuDNN settings, which the key does not hold.
+and must equal the eager call on them bitwise; a GEMM's, on the call's own
+operands into its output, which with every input must digest as eager left
+them (else eager reruns into the output). The captures run under the cuBLAS
+settings the key holds (the call's at the trace); cuDNN's are the current
+global ones, which the key does not hold.
 
 A cuBLAS or SDPA key launching the kernels (by name: each cuDNN plan loads its
 own copy) of a key harvested in full (another M: the heuristic's choice repeats
@@ -77,25 +81,25 @@ in the four), and the check launches from the generator's offset.
 from __future__ import annotations
 
 import bisect
-import contextlib
-import ctypes
 import dataclasses
+import functools
 import logging
 import struct
 import threading
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable
 from typing import Any
 
 import torch
 import torch.utils._pytree as pytree
 from torch._logging import trace_structured
-from torch.cuda._host_trace_capture import graph_nodes, KernelNode, launch_attributes, MemsetNode, reproducible
+from torch.cuda._host_trace_capture import attribute_value, launch_attributes, MemsetNode, reproducible
 from torch.cuda._host_trace_opaque import (
     OpaqueBinding,
     OpaqueKernel,
     OpaqueKey,
     OpaqueMemset,
     Slot,
+    library_state_as,
 )
 from torch.cuda._host_trace_tape import _gc_hold
 from torch.cuda._utils import _check_cuda_bindings
@@ -132,6 +136,14 @@ _ATTENTION = frozenset(
 _RNG = frozenset({aten.randint.low_out, aten.native_dropout.default, aten.uniform_.default})
 _CONV = frozenset({aten.convolution.default, aten.convolution_backward.default})
 _REDUCE = frozenset({aten.sum.dim_IntList})
+# the fresh outputs eager accumulates in no fixed order (flash backward's dq by
+# fp32 atomics, efficient backward's dq over key splits under a lock): one
+# rerun of eager can agree bitwise by chance, so these are always held to the
+# tolerance
+_UNORDERED = {
+    aten._scaled_dot_product_flash_attention_backward.default: (0,),
+    aten._scaled_dot_product_efficient_attention_backward.default: (0,),
+}
 _FAMILIES = {"blas": frozenset(_OUT), "attention": _ATTENTION, "conv": _CONV, "rng": _RNG, "reduce": _REDUCE}
 
 
@@ -179,6 +191,9 @@ def _class(align: int) -> int:
     return align & -align if align else 256
 
 
+_BITS = {1: torch.uint8, 2: torch.int16, 4: torch.int32, 8: torch.int64}
+
+
 def _host_slot(off: int, imgs: tuple, stack: tuple, smear: tuple) -> bool:
     # whether a qword that moved with the stack smear or the stream is host
     # state of the call: a stack address, or the smear's bytes in
@@ -197,6 +212,35 @@ def _cuda_address(q: int) -> bool:
     return driver.cuPointerGetAttribute(attribute, q)[0] == driver.CUresult.CUDA_SUCCESS
 
 
+@functools.cache
+def _attribute_ids() -> list[int]:
+    from cuda.bindings import driver
+
+    return [int(k) for k in driver.CUlaunchAttributeID]
+
+
+@functools.cache
+def _attributes(raw: tuple[tuple[int, bytes], ...], programmatic: bool) -> tuple:
+    # a captured kernel's attributes as graph_nodes has them, but only those
+    # that differ from a plain launch's (explicit_attributes'), from their
+    # raw CUlaunchAttributeValues
+    from cuda.bindings import driver
+
+    out = []
+    for i, pad in raw:
+        key, v = driver.CUlaunchAttributeID(i), driver.CUlaunchAttributeValue()
+        v.pad = pad
+        out.append((key, attribute_value(key, v)))
+    if programmatic:
+        out.append((driver.CUlaunchAttributeID.CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION, 1))
+    return tuple(sorted(out, key=lambda a: int(a[0])))
+
+
+@functools.cache
+def _raw_attributes(attributes: tuple) -> tuple[tuple[int, bytes], ...]:
+    return tuple((int(a.id), bytes(a.value.pad)) for a in launch_attributes(attributes))
+
+
 def _launch(
     binding: OpaqueBinding,
     addresses: list[int],
@@ -207,52 +251,29 @@ def _launch(
     """The binding's nodes launched in order on `stream` at these addresses;
     `philox` is the generator state its RNG kernels read: the seed's and
     offset's addresses, and the intragraph offset the call starts at."""
-    from cuda.bindings import driver
 
     def value(s: Slot) -> int:
         if s.kind.startswith("philox"):
             return philox[("philox_seed", "philox_offset", "philox").index(s.kind)] + s.delta
         return (addresses if s.kind == "operand" else scratch)[s.index] + s.delta
 
-    for node in binding.nodes:
-        if isinstance(node, OpaqueMemset):
-            fn = {
-                1: driver.cuMemsetD2D8Async,
-                2: driver.cuMemsetD2D16Async,
-                4: driver.cuMemsetD2D32Async,
-            }[node.element_size]
-            pitch = node.pitch or node.width * node.element_size
-            _check_cuda_bindings(
-                fn(value(node.dst), pitch, node.value, node.width, node.height, stream)
+    torch._C._cuda_hostTraceLaunch(
+        stream,
+        [
+            (value(n.dst), n.value, n.element_size, n.width, n.height, n.pitch)
+            if isinstance(n, OpaqueMemset)
+            else (
+                n.function,
+                n.grid,
+                n.block,
+                n.smem,
+                _raw_attributes(n.attributes),
+                n.images,
+                [(s.param, s.offset, value(s)) for s in n.slots],
             )
-            continue
-        images = [bytearray(image) for image in node.images]
-        for s in node.slots:
-            struct.pack_into("<Q", images[s.param], s.offset, value(s))
-        storage = [ctypes.create_string_buffer(bytes(image), len(image)) for image in images]
-        args = (ctypes.c_void_p * len(storage))(*map(ctypes.addressof, storage))
-        attrs = launch_attributes(node.attributes)
-        cfg = driver.CUlaunchConfig()
-        cfg.gridDimX, cfg.gridDimY, cfg.gridDimZ = node.grid
-        cfg.blockDimX, cfg.blockDimY, cfg.blockDimZ = node.block
-        cfg.sharedMemBytes = node.smem
-        cfg.hStream = stream
-        cfg.attrs = attrs
-        cfg.numAttrs = len(attrs)
-        _check_cuda_bindings(
-            driver.cuLaunchKernelEx(cfg, node.function, ctypes.addressof(args), 0)
-        )
-
-
-class _Interface:
-    # a byte range of device memory as a __cuda_array_interface__
-    def __init__(self, ptr: int, size: int) -> None:
-        self.__cuda_array_interface__ = {
-            "data": (ptr, False),
-            "shape": (size,),
-            "typestr": "|u1",
-            "version": 3,
-        }
+            for n in binding.nodes
+        ],
+    )
 
 
 class _Device:
@@ -269,7 +290,7 @@ class _Device:
         self.va = 0
         self.va_size = 0
 
-    def arena(self, size: int) -> torch.Tensor:
+    def arena(self, size: int) -> int:
         """`size` bytes of address space, 2 MiB-aligned and never mapped: a
         capture only records the operands' addresses, and neither cuBLAS nor
         cuDNN queries them at capture."""
@@ -282,9 +303,7 @@ class _Device:
             n = max(1 << 28, 1 << (size - 1).bit_length())
             va = _check_cuda_bindings(driver.cuMemAddressReserve(n, _WINDOW, 0, 0))
             self.va, self.va_size = int(va), n
-        return torch.as_tensor(
-            _Interface(self.va, size), device=torch.device("cuda", self.index)
-        )
+        return self.va
 
     def blocks(self) -> list:
         """The pool's blocks as (stream, address, size, requested size,
@@ -336,15 +355,9 @@ def _argument(op: Any, args: tuple, kwargs: dict, name: str) -> Any:
     return None
 
 
-@contextlib.contextmanager
-def _zero_init() -> Iterator[None]:
-    previous = torch._C._cuda_hostTraceSetHarvesting(True)
-    try:
-        yield
-    finally:
-        torch._C._cuda_hostTraceSetHarvesting(previous)
-
-
+# whether a capture's call runs with the harvest flag set (ATen zeroes its
+# kernels' parameter padding)
+_ZERO_INIT = True
 _LOCK = threading.Lock()
 _DEVICES: dict[int, _Device] = {}
 
@@ -363,13 +376,12 @@ def _signature(nodes: Iterable[Any]) -> tuple:
     # what a harvested key's slots are read against: each kernel by name (a
     # cuDNN plan loads its own copy of its kernels) with its parameter layout
     # and launch attributes, each memset's element
-    from cuda.bindings import driver
-
+    nodes = list(nodes)
+    memset = [isinstance(n, (OpaqueMemset, MemsetNode)) for n in nodes]
+    names = iter(torch._C._cuda_hostTraceFunctionNames([n.function for n, m in zip(nodes, memset) if not m]))
     return tuple(
-        ("memset", n.value, n.element_size)
-        if isinstance(n, (OpaqueMemset, MemsetNode))
-        else (_check_cuda_bindings(driver.cuFuncGetName(n.function)), n.params, n.attributes)
-        for n in nodes
+        ("memset", n.value, n.element_size) if m else (next(names), n.params, n.attributes)
+        for n, m in zip(nodes, memset)
     )
 
 
@@ -396,9 +408,10 @@ class HarvestProvider:
     """The OpaqueProvider for the ops of `families`: "blas", bf16, fp16 and
     fp32 mm, addmm and bmm through cuBLAS; "attention", the cuDNN, flash and
     memory-efficient SDPA forwards and backwards; "conv", cuDNN's convolution
-    forward and backward; "rng", randint's out= form, native_dropout and
-    uniform_ on the default generator, and `rng_ops` (Inductor's
-    inductor_seeds); "reduce", ATen's sum over dims. It harvests at most
+    forward and backward; "rng", randint's out= form, native_dropout, uniform_
+    and any other ATen op that draws from the default generator (bernoulli_,
+    normal_, rand_like), and `rng_ops` (Inductor's inductor_seeds); "reduce",
+    ATen's sum over dims. It harvests at most
     budget() keys, read at each harvest."""
 
     def __init__(
@@ -423,21 +436,19 @@ class HarvestProvider:
     def accepts(self, op: Any, args: tuple, kwargs: dict) -> str | None:
         if self.disabled is not None:
             return self.disabled
-        if op not in self.ops:
+        if op not in self.ops and not self._draws(op):
             return f"{op} is not one of the harvested ops"
         leaves = pytree.tree_leaves((args, kwargs))
         tensors = [t for t in leaves if isinstance(t, torch.Tensor)]
         if any(t.device.type != "cuda" for t in tensors):
             return "an operand is not on a CUDA device"
-        if op in self.rng:
+        if self._draws(op):
             if _argument(op, args, kwargs, "generator") is not None:
                 return f"{op} with a generator other than the default"
             return None
         dtypes = {t.dtype for t in tensors}
         if op in _ATTENTION:
             dtypes = {t.dtype for t in tensors[:3]}
-        # fp32 follows allow_tf32, which like every global setting is assumed
-        # not to change between the harvest and a replay
         if len(dtypes) != 1 or not dtypes <= {torch.bfloat16, torch.float16, torch.float32}:
             return f"operand dtypes {sorted(map(str, dtypes))}: not all bf16, fp16 or fp32"
         # the bias epilogue cuBLAS fuses (addmm's Lt path) takes a 1-D bias
@@ -450,6 +461,11 @@ class HarvestProvider:
                 return "addmm with beta or alpha other than 1"
         return None
 
+    def _draws(self, op: Any) -> bool:
+        tags = getattr(op, "tags", ())
+        seeded = torch.Tag.nondeterministic_seeded in tags and not {torch.Tag.dynamic_output_shape, torch.Tag.data_dependent_output} & set(tags)
+        return op in self.rng or (bool(self.rng) and seeded and op.namespace == "aten")
+
     @staticmethod
     def _normal(key: OpaqueKey) -> tuple:
         return (
@@ -460,6 +476,7 @@ class HarvestProvider:
             tuple(map(_class, key.align)),
             key.scalars,
             key.device,
+            key.state,
         )
 
     def bind(self, key: OpaqueKey) -> OpaqueBinding | None:
@@ -504,9 +521,9 @@ class HarvestProvider:
             try:
                 # the collector held off: a harvest makes many short-lived
                 # objects, and a collection can finalize a capture's graph
-                with _gc_hold, _LOCK:
+                with _gc_hold, _LOCK, library_state_as(key.state):
                     binding = None
-                    group = (_OUT.get(key.op, key.op), key.dtypes, key.device)
+                    group = (_OUT.get(key.op, key.op), key.dtypes, key.device, key.state)
                     sibling = key.op in _OUT or key.op in _ATTENTION
                     siblings = self.templates.get(group) if sibling and _SIBLINGS else None
                     pair = _PAIR
@@ -553,7 +570,7 @@ class HarvestProvider:
         siblings: dict[tuple, OpaqueBinding] | None = None,
         pair: bool = False,
     ) -> OpaqueBinding:
-        if not hasattr(torch._C, "_cuda_hostTraceSmearedCall"):
+        if not hasattr(torch._C, "_cuda_hostTraceHarvestCapture") or not torch._C._cuda_hostTraceHarvestDriver():
             raise _Disabled("no harvest in this build")
         op = key.op
         leaves, spec = pytree.tree_flatten((args, kwargs))
@@ -569,7 +586,7 @@ class HarvestProvider:
             name, overload = op._schema.name, op._schema.overload_name
         if any(t.numel() == 0 for t in operands[:placed]):
             raise _Refused("an empty operand")
-        rng = op in self.rng or bool(_argument(op, args, kwargs, "dropout_p"))
+        rng = self._draws(op) or bool(_argument(op, args, kwargs, "dropout_p"))
         device = operands[0].device.index
         gen = torch.cuda.default_generators[device]
         if device not in _DEVICES:
@@ -591,17 +608,29 @@ class HarvestProvider:
         ]
         windows = [(span + 2 * _WINDOW - 1) // _WINDOW for span in spans[:placed]]
         total = sum(windows) | 1
-        arena = dev.arena((2 * total + 1) * _WINDOW)
-        sets: list[list[torch.Tensor]] = [[], []]
+        # past the sets, each capture's cuBLAS workspace (in place of the
+        # allocator's, at the size the call asks for) in windows of its own
+        workspace = max(torch._C._cuda_getCublasWorkspaceSize(), torch._C._cuda_getCublasLtWorkspaceSize())
+        per_capture = -(-workspace // _WINDOW)
+        arena = dev.arena((2 * total + 1 + 4 * per_capture) * _WINDOW)
+        workspaces = arena + (2 * total + 1) * _WINDOW
+        starts: list[list[int]] = [[], []]
         cursor = 0
-        for t, c, span, n in zip(operands[:placed], classes, spans, windows):
+        for c, n in zip(classes, windows):
             second = total * _WINDOW + (c ^ ((_WINDOW - 1) & ~(2 * c - 1)))
-            for which, at in enumerate((cursor + c, cursor + second)):
-                flat = arena[at : at + span].view(t.dtype)
-                sets[which].append(flat.as_strided(t.shape, t.stride()))
+            starts[0].append(arena + cursor + c)
+            starts[1].append(arena + cursor + second)
             cursor += n * _WINDOW
+        sets = [torch._C._cuda_hostTraceArenaViews(at, operands[:placed]) for at in starts]
+        # a GEMM verifies on the call's own tensors, unless its output overlaps an input
+        in_place = op in _OUT
+        if in_place:
+            lo = operands[-1].data_ptr()
+            hi = lo + spans[-1]
+            in_place = all(t.data_ptr() >= hi or t.data_ptr() + n <= lo for t, n in zip(operands[:-1], spans))
 
         graphs = []  # every capture's graph, held until the harvest is over
+        grown = False  # whether a capture allocated in the pool
         plugs: list[torch.Tensor] = []
         # what the captures left live, held until the harvest is over: their
         # fresh outputs, and an RNG call's per-capture seed and offset
@@ -609,6 +638,8 @@ class HarvestProvider:
         returns = [r.alias_info is None for r in op._schema.returns]
 
         def capture(x: int, stream: torch.cuda.Stream, tensors: list, prime: bool = False) -> tuple:
+            nonlocal grown
+            ws = workspaces + x * per_capture * _WINDOW
             graph = torch.cuda.CUDAGraph(keep_graph=True)
             graphs.append(graph)
             if op in _OUT:
@@ -617,12 +648,6 @@ class HarvestProvider:
                 it = iter(tensors)
                 filled = [next(it) if isinstance(a, torch.Tensor) else a for a in leaves]
                 call_args, call_kwargs = pytree.tree_unflatten(filled, spec)
-            philox = None
-            # TORCH_CUBLAS_WORKSPACE_CACHE=1: the stream's cached cuBLAS
-            # workspace is released before the capture, so the call allocates
-            # its own in the pool (its scratch), and after it, so none is left
-            # live in the pool
-            torch._C._cuda_hostTraceClearCublasWorkspaces(stream.cuda_stream)
             # a convolution's fresh outputs each get a free block of exactly its
             # bytes, and the pool no other free block: cuDNN's dgrad frees its
             # workspace before it allocates grad_weight, which is then not
@@ -637,35 +662,42 @@ class HarvestProvider:
             if own:
                 torch._C._cuda_hostTraceRecordAllocations(True)
             seen = 0 if own else len(torch._C._cuda_hostTracePool(device, dev.pool.id, True)[1])
-            with torch.cuda.stream(stream):
-                graph.capture_begin(pool=dev.pool.id, capture_error_mode="thread_local")
-                try:
-                    dev.anchor.fill_(1)
-                    if rng:
-                        seed, offset, _ = gen.philox_state(_PRETAKE[x])
-                        kept.extend((seed, offset))
-                    before = torch._C._cuda_hostTraceAllocationCount(device)
-                    with _zero_init():
-                        result = torch._C._cuda_hostTraceSmearedCall(name, overload, _SMEAR[x], *call_args, **call_kwargs)
-                    if rng:
-                        taken = int(gen.philox_state(0)[2]) - _PRETAKE[x]
-                        philox = (seed.data_ptr(), offset.data_ptr(), taken)
-                        del seed, offset
-                except Exception as e:
-                    try:
-                        graph.capture_end()
-                    except Exception:
-                        pass
-                    # a CUDA error is the capture's refusal; any other, the harvest's bug
-                    if torch.cuda._host_trace.raise_unexpected and not isinstance(e, torch.AcceleratorError):
-                        raise
-                    raise _Refused(f"the call failed under capture: {e}") from None
-                graph.capture_end()
-            torch._C._cuda_hostTraceClearCublasWorkspaces(stream.cuda_stream)
-            allocs = torch._C._cuda_hostTraceAllocationCount(device) - before
-            pool, history = torch._C._cuda_hostTracePool(device, dev.pool.id, True)
-            # a ring buffer's wrap loses some, which the allocation count sees
-            allocated = history[seen:]
+            # TORCH_CUBLAS_WORKSPACE_CACHE=1: the stream's cached cuBLAS
+            # workspace is released before the capture, so the call allocates
+            # its own in the pool (its scratch), and after it, so none is left
+            # live in the pool
+            try:
+                result, allocs, requested, philox = torch._C._cuda_hostTraceHarvestCapture(
+                    graph,
+                    dev.pool.id,
+                    (stream.stream_id, stream.device_index, stream.device_type),
+                    dev.anchor,
+                    ws,
+                    workspace,
+                    _PRETAKE[x] if rng else None,
+                    _ZERO_INIT,
+                    name,
+                    overload,
+                    _SMEAR[x],
+                    *call_args,
+                    **call_kwargs,
+                )
+            except Exception as e:
+                # a CUDA error is the capture's refusal; any other, the harvest's bug
+                if torch.cuda._host_trace.raise_unexpected and not isinstance(e, torch.AcceleratorError):
+                    raise
+                raise _Refused(f"the call failed under capture: {e}") from None
+            if philox is not None:
+                seed, offset, taken = philox
+                kept.extend((seed, offset))
+                philox = (seed.data_ptr(), offset.data_ptr(), taken)
+                del seed, offset
+            grown |= allocs > 0
+            pool, allocated = [], []
+            if allocs:
+                pool, history = torch._C._cuda_hostTracePool(device, dev.pool.id, True)
+                # a ring buffer's wrap loses some, which the allocation count sees
+                allocated = history[seen:]
             if prime:
                 return ()
             rets = [] if op in _OUT else [result] if len(returns) == 1 else list(result or ())
@@ -684,26 +716,15 @@ class HarvestProvider:
             if len(outputs) != len(operands) - placed:
                 raise _Refused(f"{len(outputs)} fresh outputs under capture, {len(operands) - placed} eager")
             try:
-                fill, *nodes = graph_nodes(graph.raw_cuda_graph())
+                found = torch._C._cuda_hostTraceCapturedNodes(graph.raw_cuda_graph(), _attribute_ids())
             except ValueError as e:
                 raise _Refused(str(e)) from None
-            # the attributes kept are those that differ from the anchor fill's, a plain launch
-            plain = dict(fill.attributes)
-            names = [n.name if isinstance(n, KernelNode) else "memset" for n in nodes]
+            names = [n[0] if len(n) == 9 else "memset" for n in found]
             nodes = [
-                n
-                if isinstance(n, MemsetNode)
-                else OpaqueKernel(
-                    n.function,
-                    n.grid,
-                    n.block,
-                    n.smem,
-                    tuple((k, v) for k, v in n.attributes if v != plain.get(k)),
-                    n.layout,
-                    n.images,
-                    (),
-                )
-                for n in nodes
+                OpaqueKernel(n[1], n[3], n[4], n[5], _attributes(n[7], n[6]), n[2], n[8], ())
+                if len(n) == 9
+                else MemsetNode(*n)
+                for n in found
             ]
             kernels = [n for n in nodes if isinstance(n, OpaqueKernel)]
             if any(not reproducible(k) for n in kernels for k, _ in n.attributes):
@@ -719,7 +740,8 @@ class HarvestProvider:
             # buffer, as far as the call's allocations in it reach
             ends = {b: [a + n for a, n in allocated if b[1] <= a < b[1] + b[2]] for b in pool if not b[4]}
             mine = [b for b, e in ends.items() if e]
-            plugs.extend(dev.plug(mine))
+            if allocs:
+                plugs.extend(dev.plug(mine))
             # an output's own allocation, or a temporary freed before the
             # output took its bytes (the output's address, as bound)
             reused = sum(any(p <= a and a + n <= p + m for p, m in owned) for a, n in allocated)
@@ -730,33 +752,88 @@ class HarvestProvider:
             # allocator places them anywhere)
             order = [next(i for i, (a, _) in enumerate(allocated) if b[1] <= a < b[1] + b[2]) for b in mine]
             ordered = [(a, n) for _, a, n in sorted(zip(order, (b[1] for b in mine), extents))]
+            if requested:
+                ordered.insert(0, (ws, requested))
             return nodes, names, ordered, outputs, philox, _PRETAKE[x]
 
         def verify(binding: OpaqueBinding, stale: list, names: list) -> None:
             nodes, increment = binding.nodes, binding.rng_increment
+            # the binding, and with stale bytes: with another capture's there
+            bindings = [binding]
+            if stale:
+                images = [list(n.images) if isinstance(n, OpaqueKernel) else None for n in nodes]
+                for x, param, off, other in stale:
+                    image = bytearray(images[x][param])
+                    image[off : off + 8] = other
+                    images[x][param] = bytes(image)
+                alt = [n if i is None else dataclasses.replace(n, images=tuple(i)) for n, i in zip(nodes, images)]
+                bindings.append(dataclasses.replace(binding, nodes=tuple(alt)))
+            if in_place:
+                # a GEMM's binding on the call's own tensors, nothing copied:
+                # every operand digested, the output filled with 0xFF and each
+                # binding launched into it, every operand digested again and
+                # compared at one sync per binding. A mismatch reruns eager
+                # into the output; an input the binding wrote is past restoring.
+                # An input's digest is its row sums: a stray write changes
+                # values, it does not move them along a row
+                out, inputs = operands[-1], operands[:-1]
+                digests, columns = torch._C._cuda_hostTraceDigests, [False] * len(inputs) + [True]
+                want, held = digests(operands, columns)
+                scratch = [torch.empty(n, dtype=torch.uint8, device=out.device) for n in binding.scratch]
+                stream = torch.cuda.current_stream().cuda_stream
+                ptrs, scratch_ptrs = [t.data_ptr() for t in operands], [t.data_ptr() for t in scratch]
+                for b in bindings:
+                    out.view(_BITS[out.element_size()]).fill_(-1)
+                    _launch(b, ptrs, scratch_ptrs, stream)
+                    got, after = digests(operands, columns)
+                    if not torch.equal(want, got):
+                        break
+                else:
+                    return
+                getattr(aten, name.removeprefix("aten::")).out(*inputs, out=out)
+                wrong = [i for i, (a, c) in enumerate(zip(held[:-1], after)) if not torch.equal(a, c)]
+                if wrong:
+                    raise RuntimeError(f"host_trace: the harvested launch of {names} wrote input {wrong[0]} of {op}")
+                raise _Refused(f"the binding's launch differs from eager at operand {placed - 1} ({names})")
             # the binding on fresh random operands at the key's layouts and
             # alignments, against the eager call on them (a zero or NaN operand
-            # would pass any binding); two copies of each placed operand, the
-            # binding's fresh outputs filled with 0xFF. An RNG call draws from
-            # the generator's offset for both, which is left where it was
+            # would pass any binding; unbounded ones overflow a long reduction,
+            # and an _UNORDERED output's rounding grows with its terms, not its
+            # result); a second copy of each placed operand when eager writes
+            # one, the binding's fresh outputs filled with 0xFF. An RNG call
+            # draws from the generator's offset for both, which is left where
+            # it was. A drawing op's floating operands are probabilities, means
+            # and scales: in (0, 1)
+            mutates = op in _OUT or any(a.alias_info and a.alias_info.is_write for a in op._schema.arguments)
             filler = torch.Generator(operands[0].device).manual_seed(0)
             bases, copies = [], []
             for t, span, align in zip(operands[:placed], spans, key.align):
                 base = torch.empty(-(-(span + 256) // 8), dtype=torch.int64, device=t.device).view(torch.uint8)
                 flat = base[align : align + span].view(t.dtype)
-                if t.dtype.is_floating_point:
-                    flat.normal_(generator=filler)
+                if t.dtype.is_floating_point and self._draws(op):
+                    flat.uniform_(0.25, 0.75, generator=filler)
+                elif t.dtype.is_floating_point:
+                    flat.uniform_(-1, 1, generator=filler)
                 else:
                     flat.random_(0, 2 if t.dtype == torch.bool else 8, generator=filler)
-                twin = base.clone()
+                twin = base.clone() if mutates else base
                 bases.append((base, twin))
                 copies.append(
                     [b[align : align + span].view(t.dtype).as_strided(t.shape, t.stride()) for b in (base, twin)]
                 )
+            # without a second copy, neither eager nor the binding may change an input's digest
+            inputs = [] if mutates else torch._C._cuda_hostTraceDigests([c[0] for c in copies], [True] * placed)[1]
 
             def same(a: torch.Tensor, b: torch.Tensor) -> bool:
-                a, b = (t.contiguous().reshape(-1).view(torch.uint8) for t in (a, b))
+                # contiguous() keeps a size-1 dim's stride, which view(uint8) rejects
+                a, b = (t.clone(memory_format=torch.contiguous_format).view(-1).view(torch.uint8) for t in (a, b))
                 return torch.equal(a, b)
+
+            def gap(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+                # elementwise; equal values (infinities, NaNs) are 0 apart: the
+                # random operands overflow a few elements of some outputs
+                a, b = a.double(), b.double()
+                return torch.where((a == b) | (a.isnan() & b.isnan()), 0.0, (a - b).abs())
 
             ref_in = [c[0] for c in copies]
             start = gen.get_offset()
@@ -782,15 +859,18 @@ class HarvestProvider:
                     ]
 
                 ref_out = fresh_outputs()
-                # a floating output eager itself doesn't reproduce bitwise (flash
-                # backward's atomically accumulated dq) is held to 4x eager's own
-                # spread plus the dtype's testing tolerance: a wrong address or
-                # size gives garbage, not rounding noise
-                if not any(a.alias_info and a.alias_info.is_write for a in op._schema.arguments):
+                # a floating output eager itself doesn't reproduce bitwise (an
+                # _UNORDERED one, or one this rerun differs in) is held to 4x
+                # eager's own spread plus the dtype's testing tolerance: a wrong
+                # address or size gives garbage, not rounding noise
+                if not mutates:
                     gen.set_offset(start)
+                    unordered = _UNORDERED.get(op, ())
                     spread = [
-                        None if same(a, b) or not a.is_floating_point() else (a.double() - b.double()).abs().max().item()
-                        for a, b in zip(ref_out, fresh_outputs())
+                        gap(a, b).nan_to_num(0.0, 0.0).max().item()
+                        if a.is_floating_point() and (i in unordered or not same(a, b))
+                        else None
+                        for i, (a, b) in enumerate(zip(ref_out, fresh_outputs()))
                     ]
             outs = [
                 torch.empty_strided(t.shape, t.stride(), dtype=t.dtype, device=t.device)
@@ -810,20 +890,22 @@ class HarvestProvider:
             stream = torch.cuda.current_stream().cuda_stream
             gen.set_offset(start)
             referenced = {t.index for n in nodes for t in _slots(n) if t.kind == "operand"}
-            twins = [twin.clone() for _, twin in bases] if stale else []
+            twins = [twin.clone() for _, twin in bases] if stale and mutates else []
             tolerated = tuple(i for i in sorted(referenced) if i >= placed and spread and spread[i - placed] is not None)
 
             def close(want: torch.Tensor, got: torch.Tensor, noise: float) -> bool:
                 rtol, atol = default_tolerances(want)
-                want, got = want.double(), got.double()
-                return bool(((got - want).abs() <= 4 * noise + atol + rtol * want.abs()).all())
+                d = gap(want, got)
+                return bool((d.isfinite() & (d <= 4 * noise + atol + rtol * want.double().abs())).all())
 
             def check(b: OpaqueBinding) -> None:
                 for t in outs:
                     t.untyped_storage().fill_(255)
                 _launch(b, addrs, [t.data_ptr() for t in scratch], stream, state)
                 for i in sorted(referenced):
-                    if i < placed:
+                    if i < placed and not mutates:
+                        ok = torch.equal(torch._C._cuda_hostTraceDigests([copies[i][0]], [True])[1][0], inputs[i])
+                    elif i < placed:
                         ok = torch.equal(*(b.view(torch.int64) for b in bases[i]))
                     elif i in tolerated:
                         ok = close(ref_out[i - placed], outs[i - placed], spread[i - placed])
@@ -832,17 +914,10 @@ class HarvestProvider:
                     if not ok:
                         raise _Refused(f"the binding's launch differs from eager at operand {i} ({names})")
 
-            check(binding)
-            if stale:
-                images = [list(n.images) if isinstance(n, OpaqueKernel) else None for n in nodes]
-                for x, param, off, other in stale:
-                    image = bytearray(images[x][param])
-                    image[off : off + 8] = other
-                    images[x][param] = bytes(image)
+            for b in bindings:
                 for (_, twin), t in zip(bases, twins):
                     twin.copy_(t)
-                alt = [n if i is None else dataclasses.replace(n, images=tuple(i)) for n, i in zip(nodes, images)]
-                check(dataclasses.replace(binding, nodes=tuple(alt)))
+                check(b)
 
         def adopt(cap: tuple, siblings: dict[tuple, OpaqueBinding], placed: list[int]) -> OpaqueBinding:
             # the capture read with the slots of the harvested key launching
@@ -857,15 +932,14 @@ class HarvestProvider:
             # a block is its request rounded up to 512 bytes
             extents = [(n + 511) // 512 * 512 for _, n in blocks]
             live = [(a, a + n) for a, n in zip(here, spans)] + [(a, a + n) for (a, _), n in zip(blocks, extents)]
-            low, high = min(lo for lo, _ in live), max(hi for _, hi in live)
 
             def moved(t: Slot, q: int) -> Slot:
                 if t.kind == "operand" and 0 <= q - here[t.index] < spans[t.index]:
-                    return dataclasses.replace(t, delta=q - here[t.index])
+                    return Slot(t.param, t.offset, t.kind, t.index, q - here[t.index])
                 if t.kind == "scratch":
                     for j, ((a, _), n) in enumerate(zip(blocks, extents)):
                         if a <= q < a + n:
-                            return dataclasses.replace(t, index=j, delta=q - a)
+                            return Slot(t.param, t.offset, t.kind, j, q - a)
                 raise _NoSibling(f"{q:#x} is no {t.kind} of the template's")
 
             nodes: list = []
@@ -873,26 +947,12 @@ class HarvestProvider:
                 if isinstance(n, MemsetNode):
                     nodes.append(OpaqueMemset(moved(t.dst, n.dst), *dataclasses.astuple(n)[1:]))
                     continue
-                images = [bytearray(image) for image in n.images]
-                # the offsets of qwords overlapping a slot's
-                covered: list[set[int]] = [set() for _ in n.images]
-                slots = []
-                for t_slot in t.slots:
-                    param, off = t_slot.param, t_slot.offset
-                    slots.append(moved(t_slot, int.from_bytes(images[param][off : off + 8], "little")))
-                    images[param][off : off + 8] = bytes(8)
-                    covered[param].update(range(off - 7, off + 8))
-                for param, image in enumerate(images):
-                    for first in (0, 4):
-                        qs = zip(_qwords(image, first), _qwords(t.images[param], first))
-                        for i, (q, was) in enumerate(qs):
-                            off = first + 8 * i
-                            if (
-                                (low <= q < high and any(lo <= q < hi for lo, hi in live))
-                                or (q >> 32 and q != was and not stack[0] <= q < stack[1] and _cuda_address(q))
-                            ) and off not in covered[param]:
-                                raise _NoSibling(f"parameter {param} byte {off}: {q:#x} is no constant")
-                nodes.append(dataclasses.replace(n, images=tuple(map(bytes, images)), slots=tuple(slots)))
+                at = [(s.param, s.offset) for s in t.slots]
+                images, qwords, stray = torch._C._cuda_hostTraceSlotQwords(list(n.images), list(t.images), at, live, stack)
+                slots = tuple(map(moved, t.slots, qwords))
+                if stray is not None:
+                    raise _NoSibling("parameter {} byte {}: {:#x} is no constant".format(*stray))
+                nodes.append(dataclasses.replace(n, images=tuple(images), slots=slots))
             return _renumbered(nodes, [n for _, n in blocks], 0)
 
         if dev.pool is None:
@@ -933,8 +993,8 @@ class HarvestProvider:
                         capture(3, s, sets[0]),
                     ]
                 siblings = None
-            # every segment of the device, the pool's too
-            device_segments = torch._C._cuda_hostTraceSegments(device)
+            # every segment of the device, the pool's too (a sibling reads none)
+            device_segments = [] if siblings else torch._C._cuda_hostTraceSegments(device)
         finally:
             if own:
                 torch._C._cuda_hostTraceRecordAllocations(False)
@@ -947,7 +1007,7 @@ class HarvestProvider:
             graphs.clear()
             plugs.clear()
             kept.clear()
-            if sum(b[2] for b in dev.blocks()) > _POOL_KEEP:
+            if grown and sum(b[2] for b in dev.blocks()) > _POOL_KEEP:
                 dev.keeper = None
                 dev.pool = None
         blocks = [c[2] for c in caps]
@@ -957,15 +1017,15 @@ class HarvestProvider:
         # space is no memory the call was handed (the high half of an unrelated
         # address can be its start)
         segments = sorted(device_segments + [(a, a + n) for at in addresses[:2] for a, n in zip(at, spans)])
-        starts = [lo for lo, _ in segments]
+        lows = [lo for lo, _ in segments]
 
         def in_segment(q: int) -> bool:
-            i = bisect.bisect_right(starts, q) - 1
+            i = bisect.bisect_right(lows, q) - 1
             return i >= 0 and q < segments[i][1]
 
         if siblings:
-            binding = adopt(caps[0], siblings, [t.data_ptr() for t in sets[0]])
-            del sets, arena
+            binding = adopt(caps[0], siblings, starts[0])
+            del sets
             if _VERIFY_SIBLINGS:
                 try:
                     verify(binding, [], caps[0][1])
@@ -1146,7 +1206,7 @@ class HarvestProvider:
         kinds = {t.kind for n in binding.nodes for t in _slots(n)}
         if increment and not {"philox_seed", "philox_offset", "philox"} <= kinds:
             raise _Refused(f"{names} take {increment} philox offsets and read no captured generator state")
-        del sets, arena
+        del sets
 
         verify(binding, stale, names)
         return binding

@@ -114,7 +114,8 @@ def quack_rmsnorm_fwd(
     eps: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     input_shape = input.shape
-    N = math.prod(normalized_shape)
+    # quack compiles per N: under a host trace, a SymInt specialized here
+    N = int(math.prod(normalized_shape))
     M = input.numel() // N
     # quack's kernel requires a contiguous 2-D input with trailing stride 1;
     # a plain `.reshape(M, N)` can return a non-contiguous view.
@@ -162,7 +163,8 @@ def quack_rmsnorm_bwd(
     normalized_shape: list[int],
     dw_mask: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    N = math.prod(normalized_shape)
+    # quack compiles per N: under a host trace, a SymInt specialized here
+    N = int(math.prod(normalized_shape))
     M = input.numel() // N
     x = _reshape_2d(input, M, N)
     dout = _reshape_2d(grad_out, M, N)

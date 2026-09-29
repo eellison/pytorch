@@ -186,6 +186,11 @@ def jit_cache(fn):
 
         def _load_cached() -> object:
             """Load the .o into a callable; caller guarantees existence."""
+            # torch: an object exported before host trace observed compiles has no host
+            # function beside it; a miss recompiles it (torch/cuda/_host_trace_cute.py)
+            host_trace = sys.modules.get("torch.cuda._host_trace_cute")
+            if host_trace is not None and host_trace.observing() and not os.path.exists(f"{o_path}.cute_host"):
+                raise FileNotFoundError(f"{o_path}.cute_host")
             m = cute.runtime.load_module(str(o_path), enable_tvm_ffi=True)
             return m[EXPORT_FUNC_NAME]
 

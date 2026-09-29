@@ -11,8 +11,22 @@
 #include <numeric>
 #include <optional>
 #include <type_traits>
+#include <vector>
 
 namespace at::detail::ti_build {
+
+// a built TensorIterator's operands (outputs first), for a host trace's witness
+struct BuiltIterator {
+  std::vector<TensorBase> operands;
+  int noutputs;
+  int64_t numel;
+  ScalarType common_dtype;
+  bool is_reduction;
+};
+
+// TensorIteratorBase::build on this thread appends to `into` while it is set;
+// returns the previous target
+TORCH_API std::vector<BuiltIterator>* record_built_iterators(std::vector<BuiltIterator>* into);
 
 template <typename T>
 constexpr bool is_symbolic = std::is_same_v<T, c10::SymInt>;

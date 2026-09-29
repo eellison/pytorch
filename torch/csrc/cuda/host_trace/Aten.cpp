@@ -6,8 +6,11 @@
 #include <torch/csrc/autograd/python_variable.h>
 
 #include <optional>
+#include <string>
+#include <string_view>
 #include <tuple>
 #include <variant>
+#include <vector>
 
 namespace torch::cuda::host_trace {
 
@@ -36,11 +39,16 @@ struct PyRecorder : ht::Recorder {
   py::module host_trace = py::module::import("torch.cuda._host_trace");
 };
 
-// [(function, offsets, params, fields, grid, block, smem)], each field
-// (param, offset, width, value, is_pointer)
+// [(function, offsets, params, fields, grid, block, smem) or, a memcpy,
+// (dst, src, bytes)], each field (param, offset, width, value, is_pointer)
 py::list records(const PyRecorder& rec) {
   py::list launches;
-  for (const auto& r : rec.launches) {
+  for (const auto& launch : rec.launches) {
+    if (const auto* m = std::get_if<ht::MemcpyRecord>(&launch)) {
+      launches.append(py::make_tuple(m->dst, m->src, m->bytes));
+      continue;
+    }
+    const auto& r = std::get<ht::KernelRecord>(launch);
     py::list params;
     for (const auto& p : r.params) {
       params.append(py::bytes(reinterpret_cast<const char*>(p.data()), p.size()));
@@ -142,6 +150,40 @@ void initHostTraceAtenBindings(py::module& m) {
     PyRecorder rec;
     return traced(rec, ht::fused_rms_norm(rec, input, normalized_ndim, weight.value_or(at::Tensor()), eps));
   }));
+  // node: the witness capture's kernel node (function, parameter offsets and images)
+  m.def("_cuda_hostTracePointwise", torch::wrap_pybind_function([](const std::vector<std::optional<at::Tensor>>& outs, const std::vector<at::ScalarType>& out_dtypes, const std::vector<at::Tensor>& inputs, std::optional<at::ScalarType> compute_dtype, const std::string& name, uintptr_t function, const std::vector<size_t>& offsets, const std::vector<py::bytes>& images) {
+    PyRecorder rec;
+    ht::KernelRecord node;
+    node.function = reinterpret_cast<cudaFunction_t>(function);
+    node.offsets = offsets;
+    for (const auto& image : images) {
+      const auto s = static_cast<std::string_view>(image);
+      node.params.emplace_back(s.begin(), s.end());
+    }
+    const std::vector<at::TensorBase> operands(inputs.begin(), inputs.end());
+    std::vector<at::TensorBase> targets;
+    for (const auto& out : outs) {
+      targets.push_back(out.value_or(at::Tensor()));
+    }
+    const auto results = ht::pointwise(rec, targets, out_dtypes, operands, compute_dtype.value_or(at::ScalarType::Undefined), name, std::move(node));
+    return py::make_tuple(std::vector<at::Tensor>(results.begin(), results.end()), records(rec));
+  }));
+  m.def("_cuda_hostTraceIndexSelect", torch::wrap_pybind_function([](const at::Tensor& self, int64_t dim, const at::Tensor& index) {
+    PyRecorder rec;
+    return traced(rec, ht::index_select(rec, self, dim, index));
+  }));
+  m.def("_cuda_hostTraceCat", torch::wrap_pybind_function([](const std::vector<at::Tensor>& tensors, int64_t dim) {
+    PyRecorder rec;
+    const std::vector<at::TensorBase> operands(tensors.begin(), tensors.end());
+    return traced(rec, ht::cat(rec, operands, dim));
+  }));
+  // a tensor caches its contiguity and density the first time a host reads
+  // them; dropping the cache has the next op read them again, under its guards
+  m.def("_cuda_hostTraceRefreshContiguous", [](const at::Tensor& t) {
+    std::vector<c10::SymInt> sizes(t.sym_sizes().begin(), t.sym_sizes().end());
+    std::vector<c10::SymInt> strides(t.sym_strides().begin(), t.sym_strides().end());
+    t.unsafeGetTensorImpl()->set_sizes_and_strides(sizes, strides);
+  });
 }
 
 } // namespace torch::cuda::host_trace

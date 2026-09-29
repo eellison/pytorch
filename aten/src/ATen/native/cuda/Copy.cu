@@ -510,8 +510,11 @@ REGISTER_DISPATCH(copy_stub, &copy_kernel_cuda)
 // Traced host (ATen/cuda/host_trace/Ops.h)
 namespace at::cuda::host_trace {
 
-// copy_impl and copy_device_to_device on one GPU; a memcpy is not a kernel
+// copy_impl and copy_device_to_device on one GPU
 TensorBase copy_(Recorder& rec, const TensorBase& dst, const TensorBase& src) {
+  if (dst.is_same(src)) {
+    return dst;
+  }
   if (dst.is_neg() != src.is_neg() || dst.is_conj() != src.is_conj()) {
     decline("a copy across neg or conj bits");
   }
@@ -522,7 +525,8 @@ TensorBase copy_(Recorder& rec, const TensorBase& dst, const TensorBase& src) {
   const ScalarType to = iter.dtype(0);
   const ScalarType from = iter.dtype(1);
   if (to == from && iter.is_contiguous()) {
-    decline("a memcpy copy");
+    rec.launches.push_back(MemcpyRecord{iter.data_ptr(0), iter.data_ptr(1), iter.numel() * iter.element_size(0)});
+    return dst;
   }
   for (const ScalarType t : {to, from}) {
     if (!isIntegralType(t, true) && t != kFloat && t != kDouble && t != kHalf && t != kBFloat16) {

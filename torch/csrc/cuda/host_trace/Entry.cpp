@@ -110,6 +110,9 @@ py::list HostTraceVariant::held_images() const {
     } else if (r.kind == Kind::Memset) {
       const auto& m = r.held_memset;
       out.append(py::make_tuple(m[0], m[1], m[2], m[3]));
+    } else if (r.kind == Kind::Memcpy) {
+      const auto& m = r.held_copy;
+      out.append(py::make_tuple(m[0], m[1], m[2]));
     } else {
       const KernelRow& k = kernel_row(r, r.held_row);
       py::tuple images(k.param_offsets.size());
@@ -543,6 +546,16 @@ void initHostTraceVariantBindings(PyObject* module) {
           py::arg("arm") = 0,
           py::arg("piece") = false,
           py::arg("scratch") = std::vector<int64_t>())
+      .def(
+          "add_entry",
+          &HostTraceVariant::add_entry,
+          py::arg("site"),
+          py::arg("predicate"),
+          py::arg("nodes"))
+      .def(
+          "set_program",
+          &HostTraceVariant::set_program,
+          py::arg("program"))
       .def(
           "add_form",
           &HostTraceVariant::add_form,

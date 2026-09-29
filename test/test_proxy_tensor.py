@@ -1376,6 +1376,23 @@ def forward(self, a_1, b_1):
     mm = torch.ops.aten.mm.default(mul, b_1);  mul = b_1 = None
     return mm""")
 
+    @unittest.skipIf(not HAS_CUDA, 'CUDA-only test')
+    def test_rms_norm_symbolic_normalized_shape(self):
+        # CUDA has a fused kernel, so _fused_rms_norm stays in the graph
+        def f(x, w):
+            return torch.nn.functional.rms_norm(x, x.shape[-1:], w)
+
+        gm = make_fx(f, tracing_mode="symbolic")(torch.randn(4, 8, device="cuda"), torch.randn(8, device="cuda"))
+        self.assertExpectedInline(gm.code.strip(), """\
+def forward(self, x_1, w_1):
+    sym_size_int_1 = torch.ops.aten.sym_size.int(x_1, 1)
+    _fused_rms_norm = torch.ops.aten._fused_rms_norm.default(x_1, [sym_size_int_1], w_1, None);  x_1 = sym_size_int_1 = w_1 = None
+    getitem = _fused_rms_norm[0]
+    getitem_1 = _fused_rms_norm[1];  _fused_rms_norm = getitem_1 = None
+    return getitem""")
+        x, w = torch.randn(3, 12, device="cuda"), torch.randn(12, device="cuda")
+        self.assertEqual(gm(x, w), f(x, w))
+
     def test_binary_broadcast(self):
         def f(a, b):
             c = a * b

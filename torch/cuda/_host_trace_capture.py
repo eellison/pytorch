@@ -39,6 +39,7 @@ from torch._logging import trace_structured
 from torch._logging._internal import warning_once
 from torch.cuda._host_trace import declined
 from torch.cuda._host_trace_lower_tape import (
+    LoweredMemcpy,
     LoweredMemset,
     LoweredView,
     PredictedOutput,
@@ -79,8 +80,8 @@ _SCALARS = {1: struct.Struct("<b"), 2: struct.Struct("<h"), 4: struct.Struct("<i
 
 @dataclass(frozen=True)
 class CapturedLaunch:
-    node: int  # its kernel or memset node in the graph, a raw CUgraphNode handle
-    launch: LoweredLaunch | LoweredMemset
+    node: int  # its kernel, memset or memcpy node in the graph, a raw CUgraphNode handle
+    launch: LoweredLaunch | LoweredMemset | LoweredMemcpy
 
 
 @dataclass(frozen=True)
@@ -198,16 +199,21 @@ def node_attributes(node: int) -> dict[Any, Any]:
     out = {}
     for key in driver.CUlaunchAttributeID:
         err, v = driver.cuGraphKernelNodeGetAttribute(node, key)
-        if err != driver.CUresult.CUDA_SUCCESS:
-            continue
-        name = key.name.removeprefix("CU_LAUNCH_ATTRIBUTE_")
-        if name not in _ATTRS:
-            out[key] = bytes(v.pad)
-            continue
-        field, subs, _ = _ATTRS[name]
-        sub = getattr(v, field)  # a view into v, which must outlive it
-        out[key] = tuple(getattr(sub, s) for s in subs) if subs else int(sub)
+        if err == driver.CUresult.CUDA_SUCCESS:
+            out[key] = attribute_value(key, v)
     return out
+
+
+def attribute_value(key: Any, v: Any) -> Any:
+    """A CUlaunchAttributeValue of the CUlaunchAttributeID as
+    launch_attributes takes it: one of _ATTRS decoded, another as its raw
+    bytes."""
+    name = key.name.removeprefix("CU_LAUNCH_ATTRIBUTE_")
+    if name not in _ATTRS:
+        return bytes(v.pad)
+    field, subs, _ = _ATTRS[name]
+    sub = getattr(v, field)  # a view into v, which must outlive it
+    return tuple(getattr(sub, s) for s in subs) if subs else int(sub)
 
 
 @functools.cache
@@ -264,6 +270,15 @@ class MemsetNode:
     pitch: int
 
 
+@dataclass(frozen=True)
+class MemcpyNode:
+    """A 1D device-to-device memcpy node."""
+
+    dst: int
+    src: int
+    nbytes: int
+
+
 def graph_node_handles(raw: int) -> list[int]:
     from cuda.bindings import runtime
 
@@ -272,12 +287,18 @@ def graph_node_handles(raw: int) -> list[int]:
     return [int(n) for n in held]
 
 
-def graph_nodes(raw: int) -> list[KernelNode | MemsetNode]:
+# each kernel's parameter layout, by handle and name (a handle an unloaded
+# module freed can come back as another kernel's)
+_LAYOUTS: dict[tuple[int, str], tuple[tuple[int, int], ...]] = {}
+
+
+def graph_nodes(raw: int, memcpy: bool = False) -> list[KernelNode | MemsetNode | MemcpyNode]:
     """The nodes of a captured graph in stream order, from its edges: a fork
     and join (cuDNN's grouped and FFT paths launch on side streams) in a
     topological order, ties in node order, as serializing loses only eager's
-    concurrency. A node of another kind, or a programmatic edge into anything
-    but a chain's kernel's programmatic port raises ValueError."""
+    concurrency. A node of another kind (a memcpy's but for `memcpy` and a 1D
+    device-to-device one), or a programmatic edge into anything but a chain's
+    kernel's programmatic port raises ValueError."""
     from cuda.bindings import driver
 
     handles = graph_node_handles(raw)
@@ -305,7 +326,7 @@ def graph_nodes(raw: int) -> list[KernelNode | MemsetNode]:
     pred = {n: preds[n][0] for n in chain if preds[n]}
     kernel_t = driver.CUgraphNodeType.CU_GRAPH_NODE_TYPE_KERNEL
     ids = driver.CUlaunchAttributeID
-    out: list[KernelNode | MemsetNode] = []
+    out: list[KernelNode | MemsetNode | MemcpyNode] = []
     for node in chain:
         kind = _check_cuda_bindings(driver.cuGraphNodeGetType(node))
         edge = pred.get(node)
@@ -316,15 +337,22 @@ def graph_nodes(raw: int) -> list[KernelNode | MemsetNode]:
             p = _check_cuda_bindings(driver.cuGraphMemsetNodeGetParams(node))
             out.append(MemsetNode(int(p.dst), p.value, p.elementSize, p.width, p.height, p.pitch))
             continue
+        if memcpy and kind == driver.CUgraphNodeType.CU_GRAPH_NODE_TYPE_MEMCPY:
+            out.append(_memcpy_node(node))
+            continue
         if kind != kernel_t:
             raise ValueError(f"the call adds a {kind.name} node")
         p = _check_cuda_bindings(driver.cuGraphKernelNodeGetParams(node))
-        layout = []
-        while True:
-            err, offset, size = driver.cuFuncGetParamInfo(p.func, len(layout))
-            if err != driver.CUresult.CUDA_SUCCESS:
-                break
-            layout.append((offset, size))
+        name = _check_cuda_bindings(driver.cuFuncGetName(p.func)).decode()
+        layout = _LAYOUTS.get((int(p.func), name))
+        if layout is None:
+            params: list[tuple[int, int]] = []
+            while True:
+                err, offset, size = driver.cuFuncGetParamInfo(p.func, len(params))
+                if err != driver.CUresult.CUDA_SUCCESS:
+                    break
+                params.append((offset, size))
+            layout = _LAYOUTS[int(p.func), name] = tuple(params)
         if p.kernelParams:
             args = (ctypes.c_void_p * len(layout)).from_address(int(p.kernelParams))
             images = tuple(ctypes.string_at(a, n) for a, (_, n) in zip(args, layout))
@@ -341,9 +369,9 @@ def graph_nodes(raw: int) -> list[KernelNode | MemsetNode]:
         attributes[ids.CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION] = int(programmatic)
         out.append(
             KernelNode(
-                _check_cuda_bindings(driver.cuFuncGetName(p.func)).decode(),
+                name,
                 int(p.func),
-                tuple(layout),
+                layout,
                 (p.gridDimX, p.gridDimY, p.gridDimZ),
                 (p.blockDimX, p.blockDimY, p.blockDimZ),
                 p.sharedMemBytes,
@@ -354,11 +382,23 @@ def graph_nodes(raw: int) -> list[KernelNode | MemsetNode]:
     return out
 
 
+def _memcpy_node(node: int) -> MemcpyNode:
+    from cuda.bindings import driver
+
+    p = _check_cuda_bindings(driver.cuGraphMemcpyNodeGetParams(node))
+    device = driver.CUmemorytype.CU_MEMORYTYPE_DEVICE
+    plain = (p.srcMemoryType, p.dstMemoryType, p.Height, p.Depth, p.srcXInBytes, p.dstXInBytes, p.srcY, p.dstY, p.srcZ, p.dstZ)
+    if plain != (device, device, 1, 1, 0, 0, 0, 0, 0, 0):
+        raise ValueError("a memcpy node other than a 1D device-to-device one")
+    return MemcpyNode(int(p.dstDevice), int(p.srcDevice), p.WidthInBytes)
+
+
 def capture_kernel_nodes(
     fn: Callable[[torch.cuda.Stream], Any],
     stream: torch.cuda.Stream | None = None,
     mode: str = "thread_local",
-) -> list[KernelNode | MemsetNode]:
+    memcpy: bool = False,
+) -> list[KernelNode | MemsetNode | MemcpyNode]:
     """fn(stream) captured on `stream` (by default a new side stream no
     capture holds), also the current stream, and never replayed: the graph's
     nodes, graph_nodes."""
@@ -377,7 +417,7 @@ def capture_kernel_nodes(
             fn(stream)
         finally:
             graph.capture_end()
-    return graph_nodes(graph.raw_cuda_graph())
+    return graph_nodes(graph.raw_cuda_graph(), memcpy)
 
 
 def slot_address(slot: PointerSlot, values: Sequence[int], bases: Sequence[int]) -> int:
@@ -454,6 +494,8 @@ def _check_trace_values(lowered: LoweredTape, values: Sequence[int]) -> None:
             traced = (lo.launch.width, lo.launch.height, lo.launch.pitch)
             for row, v in zip((lo.width, lo.height, lo.pitch), traced):
                 check(row, _hint(v), f"memset {name} extent")
+        elif isinstance(lo, LoweredMemcpy):
+            check(lo.nbytes, _hint(lo.launch.nbytes), f"memcpy {name} bytes")
         else:
             dims = zip((*lo.grid, *lo.block, lo.smem), (*lo.launch.grid, *lo.launch.block, lo.launch.smem))
             for axis, (row, v) in enumerate(dims):
@@ -480,18 +522,18 @@ def _frontier(stream: int) -> list[int]:
 
 
 def _launch(
-    launches: Sequence[LoweredLaunch | LoweredMemset],
+    launches: Sequence[LoweredLaunch | LoweredMemset | LoweredMemcpy],
     values: Sequence[int],
     bases: Sequence[int],
     stream: int,
-) -> tuple[list[int], list[LoweredLaunch | LoweredMemset], tuple[torch.Generator, int, int] | None]:
-    """Launch the kernels and memsets into the capture on `stream`; each
+) -> tuple[list[int], list[LoweredLaunch | LoweredMemset | LoweredMemcpy], tuple[torch.Generator, int, int] | None]:
+    """Launch the kernels, memsets and memcpys into the capture on `stream`; each
     one's node, the launches as captured: an RNG kernel's images hold
     the capture's generator state, and that state as CapturedSegment.rng."""
-    from cuda.bindings import driver
+    from cuda.bindings import driver, runtime
 
     nodes: list[int] = []
-    captured: list[LoweredLaunch | LoweredMemset] = []
+    captured: list[LoweredLaunch | LoweredMemset | LoweredMemcpy] = []
     philox = (0, 0, 0)
     rng = None
     for lo in launches:
@@ -505,6 +547,15 @@ def _launch(
             after = _frontier(stream)
             if len(after) != 1 or after[0] in nodes:
                 raise declined(f"memset {m.name} did not add one node to the capture")
+            nodes.append(after[0])
+            continue
+        if isinstance(lo, LoweredMemcpy):
+            dst, src = (slot_address(s, values, bases) for s in lo.slots)
+            d2d = runtime.cudaMemcpyKind.cudaMemcpyDeviceToDevice
+            _check_cuda_bindings(runtime.cudaMemcpyAsync(dst, src, values[lo.nbytes], d2d, stream))
+            after = _frontier(stream)
+            if len(after) != 1 or after[0] in nodes:
+                raise declined(f"memcpy {lo.launch.name} did not add one node to the capture")
             nodes.append(after[0])
             continue
         t = lo.launch
@@ -548,12 +599,12 @@ def _launch(
 def _verify(
     graph: int,
     nodes: Sequence[int],
-    launches: Sequence[LoweredLaunch | LoweredMemset],
+    launches: Sequence[LoweredLaunch | LoweredMemset | LoweredMemcpy],
     values: Sequence[int],
     bases: Sequence[int],
 ) -> None:
-    """The graph holds exactly `nodes`, the i-th launch's kernel or memset
-    node."""
+    """The graph holds exactly `nodes`, the i-th launch's kernel, memset or
+    memcpy node."""
     from cuda.bindings import driver
 
     held = graph_node_handles(graph)
@@ -572,6 +623,17 @@ def _verify(
                 height > 1 and p.pitch != pitch
             ):
                 raise declined(f"the captured node of memset {m.name} has other parameters")
+            continue
+        if isinstance(lo, LoweredMemcpy):
+            kind = _check_cuda_bindings(driver.cuGraphNodeGetType(node))
+            if kind != driver.CUgraphNodeType.CU_GRAPH_NODE_TYPE_MEMCPY:
+                raise declined(f"memcpy {lo.launch.name} captured a {kind.name} node")
+            dst, src = (slot_address(s, values, bases) for s in lo.slots)
+            try:
+                if _memcpy_node(node) != MemcpyNode(dst, src, values[lo.nbytes]):
+                    raise ValueError("other parameters")
+            except ValueError:
+                raise declined(f"the captured node of memcpy {lo.launch.name} has other parameters") from None
             continue
         t = lo.launch
         where = f"the captured node of kernel {t.name}"
@@ -600,7 +662,7 @@ def _verify(
 
 
 def _segment(
-    launches: Sequence[LoweredLaunch | LoweredMemset],
+    launches: Sequence[LoweredLaunch | LoweredMemset | LoweredMemcpy],
     values: Sequence[int],
     bases: Sequence[int],
     stream: torch.cuda.Stream,
@@ -609,7 +671,7 @@ def _segment(
 
     graph = torch.cuda.CUDAGraph(keep_graph=True)
     # a replay advances each generator the graph draws from, as the default
-    generators = (lo.launch.generator for lo in launches if not isinstance(lo, LoweredMemset))
+    generators = (lo.launch.generator for lo in launches if not isinstance(lo, (LoweredMemset, LoweredMemcpy)))
     for gen in {id(g): g for g in generators if g is not None}.values():
         graph.register_generator_state(gen)
     # relaxed, unlike the trace's thread-local capture (a detector there):

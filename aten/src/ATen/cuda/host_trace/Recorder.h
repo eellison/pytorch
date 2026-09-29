@@ -14,6 +14,7 @@
 #include <string>
 #include <type_traits>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace at::cuda::host_trace {
@@ -44,6 +45,13 @@ struct KernelRecord {
   c10::SymInt smem;
 };
 
+// a device-to-device cudaMemcpyAsync of `bytes` from src to dst
+struct MemcpyRecord {
+  c10::SymInt dst;
+  c10::SymInt src;
+  c10::SymInt bytes;
+};
+
 struct Recorder {
   virtual ~Recorder() = default;
   // the byte address of the tensor's data: its root's symbol plus its storage offset
@@ -55,7 +63,7 @@ struct Recorder {
   virtual c10::SymInt f32_div(const c10::SymInt& a, const c10::SymInt& b) = 0;
   // `c ? a : b`, as the program's select row
   virtual c10::SymInt select(const c10::SymBool& c, const c10::SymInt& a, const c10::SymInt& b) = 0;
-  std::vector<KernelRecord> launches;
+  std::vector<std::variant<KernelRecord, MemcpyRecord>> launches;
 };
 
 // a case the traced host does not reproduce; the trace records the op as an eager call

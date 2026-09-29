@@ -85,26 +85,37 @@ def matmul_chain(x, w):
     return add(torch.matmul(add(x).view(4, -1, w.shape[0]), w), 1)
 
 
-@torch.library.custom_op("host_trace_test::transposed_fake", mutates_args=())
-def transposed_fake(x: torch.Tensor) -> torch.Tensor:
-    return x.clone()
+# CUDA kernels the trace does not follow: eager calls, whose metadata comes
+# from their fake kernels
+_lib = torch.library.Library("host_trace_test", "FRAGMENT")
+_lib.define("transposed_fake(Tensor x) -> Tensor")
+_lib.impl("transposed_fake", lambda x: x.clone(), "CUDA")
+_lib.define("transposed_fake_at_4(Tensor x) -> Tensor")
+_lib.impl("transposed_fake_at_4", lambda x: x.clone(), "CUDA")
+transposed_fake = torch.ops.host_trace_test.transposed_fake
+transposed_fake_at_4 = torch.ops.host_trace_test.transposed_fake_at_4
 
 
-@transposed_fake.register_fake
+@torch.library.register_fake("host_trace_test::transposed_fake")
 def _(x):
     return x.new_empty(x.shape[::-1]).t()
 
 
-@torch.library.custom_op("host_trace_test::transposed_fake_at_4", mutates_args=())
-def transposed_fake_at_4(x: torch.Tensor) -> torch.Tensor:
-    return x.clone()
-
-
-@transposed_fake_at_4.register_fake
+@torch.library.register_fake("host_trace_test::transposed_fake_at_4")
 def _(x):
     if x.shape[0] == 4:
         return x.new_empty(x.shape[::-1]).t()
     return torch.empty_like(x)
+
+
+@torch.library.custom_op("host_trace_test::traced_lying_fake", mutates_args=())
+def traced_lying_fake(x: torch.Tensor) -> torch.Tensor:
+    return x.clone()
+
+
+@traced_lying_fake.register_fake
+def _(x):
+    return x.new_empty(x.shape[::-1]).t()
 
 
 @torch.library.custom_op("host_trace_test::size_1_stride", mutates_args=())
@@ -125,12 +136,13 @@ REENTERED: list = []
 LIE = [False]
 
 
-@torch.library.custom_op("host_trace_test::lies_when_small", mutates_args=())
-def lies_when_small(x: torch.Tensor) -> torch.Tensor:
-    return x[1:].clone() if LIE[0] and x.numel() <= 1024 else x.clone()
+# an eager call: as a custom_op its clone would trace (the copy is a memcpy)
+_lib.define("lies_when_small(Tensor x) -> Tensor")
+_lib.impl("lies_when_small", lambda x: x[1:].clone() if LIE[0] and x.numel() <= 1024 else x.clone(), "CUDA")
+lies_when_small = torch.ops.host_trace_test.lies_when_small
 
 
-@lies_when_small.register_fake
+@torch.library.register_fake("host_trace_test::lies_when_small")
 def _(x):
     return torch.empty_like(x)
 
@@ -226,26 +238,36 @@ class TestHostTraceReplay(TestCase):
         self.assertEqual((len(calls), f.traces, f.replays), (2, 1, 1))
         x = torch.randn(1024, device="cuda")
         self.assertEqual(f(x), x + 3)
-        # n % 16 flips Triton's specialization: a miss traces once without a
-        # warm-up and replays the new capture
-        self.assertEqual((len(calls), f.traces, f.replays), (3, 2, 2))
-        self.assertEqual(len(f.variants), 2)
+        # n % 16 flips Triton's specialization, the launch's own guard: a miss
+        # runs that launch again alone, as an entry of the variant
+        self.assertEqual((len(calls), f.traces, f.replays), (2, 1, 2))
+        self.assertEqual((len(f.variants), f.redispatches), (1, 1))
         for n in (1000, 1024, 2048, 3000):
             x = torch.randn(n, device="cuda")
             self.assertEqual(f(x), x + 3)
-        self.assertEqual((len(calls), f.traces), (3, 2))
+        self.assertEqual((len(calls), f.traces), (2, 1))
 
-    def test_a_misaligned_input_retraces(self):
+    def test_len_compared_to_a_constant_guards_the_comparison(self):
+        def fn(x):
+            return x if len(x) == 0 else add(x)
+
+        f = HostTraceReplay(fn)
+        for n in (1000, 3000, 1000):
+            x = torch.randn(n, device="cuda")
+            self.assertEqual(f(x), x + 3)
+        self.assertEqual((f.traces, f.replays), (1, 2))
+
+    def test_a_misaligned_input_redispatches(self):
         f = HostTraceReplay(add)
         base = torch.randn(4000, device="cuda")
         self.assertEqual(f(base[:1000]), base[:1000] + 3)
         x = base[1:1001]
         self.assertEqual(f(x), x + 3)
-        self.assertEqual((f.traces, len(f.variants)), (2, 2))
-        # the offset-4 variant also serves an offset-8 input
+        self.assertEqual((f.traces, len(f.variants), f.redispatches), (1, 1, 1))
+        # the offset-4 entry also serves an offset-8 input
         x = base[2:1002]
         self.assertEqual(f(x), x + 3)
-        self.assertEqual(f.traces, 2)
+        self.assertEqual((f.traces, f.redispatches), (1, 1))
 
     def test_repeated_replays_keep_no_stale_state(self):
         f = HostTraceReplay(add)
@@ -266,21 +288,21 @@ class TestHostTraceReplay(TestCase):
 
         def fn(x):
             calls.append(1)
-            return x + 1
+            return x.cumsum(0)
 
         f = HostTraceReplay(fn)
         x = torch.randn(100, device="cuda")
         # the warm-up is the call: fn runs once for it and once for the trace
-        self.assertEqual(f(x), x + 1)
+        self.assertEqual(f(x), x.cumsum(0))
         self.assertEqual((len(calls), f.traces, f.eager), (2, 1, 1))
         # no traced launches: uncaptured, not a decline
         self.assertEqual((f.uncaptured, f.declines), (1, []))
         # the declined class runs eagerly without a trace
-        self.assertEqual(f(x), x + 1)
+        self.assertEqual(f(x), x.cumsum(0))
         self.assertEqual((len(calls), f.traces, f.eager), (3, 1, 2))
         # another class traces again, without a warm-up
         y = torch.randn(7, device="cuda")
-        self.assertEqual(f(y), y + 1)
+        self.assertEqual(f(y), y.cumsum(0))
         self.assertEqual((len(calls), f.traces, f.eager), (5, 2, 3))
         self.assertEqual((f.variants, f.uncaptured, f.declines), ([], 2, []))
 
@@ -389,15 +411,6 @@ class TestHostTraceReplay(TestCase):
             self.assertEqual((m, k), (2 * n, 7))
             self.assertIs(type(m), int)
         self.assertEqual((f.traces, f.eager, f.declines), (1, 0, []))
-
-    def test_max_variants(self):
-        f = HostTraceReplay(add, max_variants=1)
-        for n in (1000, 1024, 3000, 1024):
-            x = torch.randn(n, device="cuda")
-            self.assertEqual(f(x), x + 3)
-        self.assertEqual((f.traces, f.replays, f.eager), (1, 1, 2))
-        self.assertEqual(len(f.declines), 1)
-        self.assertIn("max_variants (1)", f.declines[0])
 
     def test_replays_on_the_current_stream(self):
         f = HostTraceReplay(add)
@@ -804,6 +817,17 @@ class TestChainReplay(TestCase):
         self.assertEqual((f.traces, f.replays, f.eager), (3, 1, 1))
         self.assertIn("other metadata than its fake kernel", f.declines[0])
 
+    def test_a_traced_kernels_fake_is_not_read(self):
+        # the trace follows the op's Python kernel, not its fake kernel
+        def fn(x):
+            return add(traced_lying_fake(add(x)))
+
+        f = HostTraceReplay(fn)
+        for shape in ((8, 16), (8, 16), (4, 16)):
+            x = torch.randn(shape, device="cuda")
+            self.assertEqual(f(x), x + 6)
+        self.assertEqual((f.eager, f.declines), (0, []))
+
     def test_a_size_1_dims_stride_is_not_compared(self):
         def fn(x):
             return add(size_1_stride(add(x)))
@@ -1145,6 +1169,8 @@ class TestNativeReplay(TestCase):
         # so the serving variant's nodes must hold launch_images at the
         # outputs' addresses
         f = HostTraceReplay(three_outputs)
+        # a variant per trace: the founders' rows give the images
+        f._fold = f._redispatch = lambda *args: False
         inputs = []
         for dtype in (torch.float32, torch.float16, torch.bfloat16):
             for n in (1000, 1024, 3000, 4096):

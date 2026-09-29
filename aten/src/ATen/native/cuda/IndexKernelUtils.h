@@ -2,6 +2,11 @@
 #include <cstdint>
 #include <ATen/native/TensorIterator.h>
 #include <ATen/native/cuda/MemoryAccess.cuh>
+#include <c10/core/SymInt.h>
+
+namespace at::cuda::host_trace {
+struct Recorder;
+} // namespace at::cuda::host_trace
 
 namespace at::native {
 
@@ -53,6 +58,13 @@ template <int64_t Alignment, typename index_t>
 void vectorized_gather_kernel_launch(char * out, char * inp, index_t * idx, int num_ind,
                                      int64_t slice_size_in_bytes, int64_t ind_dim_size, int64_t inp_stride_bytes, int64_t out_stride_bytes,
                                      bool allow_neg_indices=false);
+
+#if !defined(USE_ROCM)
+// vectorized_gather_kernel_launch's launch, recorded (keep in sync)
+template <int64_t Alignment, typename index_t>
+void vectorized_gather_kernel_record(at::cuda::host_trace::Recorder& rec, const c10::SymInt& out, const c10::SymInt& inp, const c10::SymInt& idx, const c10::SymInt& num_ind,
+                                     const c10::SymInt& slice_size_in_bytes, const c10::SymInt& ind_dim_size, const c10::SymInt& inp_stride_bytes, const c10::SymInt& out_stride_bytes);
+#endif
 
 template <typename reduce_op, int64_t Alignment, typename scalar_t, typename index_t>
 void vectorized_scatter_kernel_launch(

@@ -26,15 +26,18 @@ patches.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, TYPE_CHECKING
+
+import functools
 
 import sympy
 
 import torch
-from torch.cuda._host_trace import declined
+from torch.cuda._host_trace import Declined, declined
 from torch.cuda._host_trace_launch import KernelLaunch
-from torch.cuda._host_trace_lower import Lowering
+from torch.cuda._host_trace_ir import Env, Node
+from torch.cuda._host_trace_lower import IRLowering, Lowering
 from torch.cuda._host_trace_opaque import OpaqueKey
 from torch.cuda._host_trace_program import (
     compile_program,
@@ -45,8 +48,10 @@ from torch.cuda._host_trace_program import (
 from torch.cuda._host_trace_tape import (
     _IntOutputRec,
     _sym_expr,
+    _sym_key,
     _TracedTensor,
     EagerCall,
+    Memcpy,
     Memset,
     OpaqueCall,
 )
@@ -103,6 +108,14 @@ class LoweredMemset:
 
 
 @dataclass(frozen=True)
+class LoweredMemcpy:
+    seq: int
+    launch: Memcpy
+    slots: tuple[PointerSlot, PointerSlot]  # the destination, the source
+    nbytes: int  # row
+
+
+@dataclass(frozen=True)
 class LoweredAllocation:
     seq: int
     dtype: torch.dtype
@@ -148,7 +161,7 @@ class LoweredEagerCall:
 
 
 def _opaque_key(
-    op: OpOverload, dtypes: tuple, ranks: tuple[int, ...], scalars: tuple, device: int, ints: Iterable[int]
+    op: OpOverload, dtypes: tuple, ranks: tuple[int, ...], scalars: tuple, device: int, state: tuple, ints: Iterable[int]
 ) -> OpaqueKey:
     # ints: per operand its sizes, then per operand its strides, then per
     # operand its address % 256, then a value per symbolic scalar
@@ -157,7 +170,7 @@ def _opaque_key(
     strides = tuple(tuple(next(it) for _ in range(r)) for r in ranks)
     align = tuple(next(it) for _ in ranks)
     scalars = tuple(next(it) if isinstance(v, (torch.SymInt, ScalarSlot)) else v for v in scalars)
-    return OpaqueKey(op, dtypes, sizes, strides, align, scalars, device)
+    return OpaqueKey(op, dtypes, sizes, strides, align, scalars, device, state)
 
 
 @dataclass(frozen=True)
@@ -171,10 +184,11 @@ class LoweredOpaqueCall:
     rows: tuple[int, ...]  # in _opaque_key's order
     scalars: tuple[Any, ...]  # a ScalarSlot per SymInt, constants
     device: int
+    state: tuple
 
     def key(self, values: Sequence[int]) -> OpaqueKey:
         ints = (values[r] for r in self.rows)
-        return _opaque_key(self.op, self.dtypes, self.ranks, self.scalars, self.device, ints)
+        return _opaque_key(self.op, self.dtypes, self.ranks, self.scalars, self.device, self.state, ints)
 
 
 @dataclass(frozen=True)
@@ -193,7 +207,17 @@ class LoweredKeyedSite:
     device: int
 
     def key(self, ints: Sequence[int]) -> OpaqueKey:
-        return _opaque_key(self.site.op, self.dtypes, self.ranks, self.site.scalars, self.device, ints)
+        return _opaque_key(self.site.op, self.dtypes, self.ranks, self.site.scalars, self.device, self.site.state, ints)
+
+
+@dataclass(frozen=True)
+class LoweredSelector:
+    """A top-level op's own guards (OpRec.guards), which select the nodes its
+    launches run: its trace's, or a folded trace's (_host_trace_replay)."""
+
+    op: int  # in Tape.ops
+    predicate: int  # row
+    nodes: tuple[int, ...]  # indices in `launches`
 
 
 @dataclass(frozen=True)
@@ -203,7 +227,7 @@ class LoweredTape:
     compiled: torch._C._HostTraceProgram
     valid: int  # row: the guards and every allocation's requirement hold
     allocations: tuple[LoweredAllocation, ...]
-    launches: tuple[LoweredLaunch | LoweredMemset, ...]
+    launches: tuple[LoweredLaunch | LoweredMemset | LoweredMemcpy, ...]
     # a range of `launches` (one graph) or an eager call, in program order
     steps: tuple[range | LoweredEagerCall, ...]
     eager_roots: tuple[_Root, ...]  # eager output j's root
@@ -212,6 +236,9 @@ class LoweredTape:
     outputs: tuple[Ref | LoweredView | ScalarSlot, ...]
     opaque: dict[int, LoweredOpaqueCall]  # by index in `steps`
     sites: tuple[LoweredKeyedSite, ...]
+    selectors: tuple[LoweredSelector, ...]
+    # the program's lowering, which a fold extends
+    lowering: _TapeLowering
 
     def evaluate(self, args: Sequence[Any]) -> tuple[int, ...] | None:
         """Every row's value at the call `args`, or None when the call misses:
@@ -225,19 +252,30 @@ class LoweredTape:
         status, values = result
         if status != Status.SUCCESS or values[self.valid] != 1:
             return None
+        if any(values[s.predicate] != 1 for s in self.selectors):
+            return None
         return values
 
 
 class _TapeLowering:
-    def __init__(self, tape: Tape) -> None:
+    def __init__(self, tape: Tape, direct: bool = True) -> None:
         self.tape = tape
         self.program = IntegerProgram(tape.args)
         self.roots: dict[int, Ref] = {}
-        sources: dict[sympy.Symbol, tuple | int] = {}
+        sources: dict[Any, tuple | int] = {}
+        # an IR trace lowers from its nodes unless `direct` is off, which
+        # lowers their sympy export (the oracle's reference)
+        env = tape.shape_env
+        self.ir = direct and isinstance(env, Env)
+        self.key = _sym_key if self.ir else _sym_expr
+        self.lowering = IRLowering(self.program, sources, env.ctx) if self.ir else Lowering(self.program, sources)
+        self._leaves: list[tuple[torch.SymInt, tuple | int]] = []
 
         def source(v: Any, leaf: tuple | int) -> None:
-            if isinstance(v, torch.SymInt) and isinstance(v.node.expr, sympy.Symbol):
-                sources[v.node.expr] = leaf
+            k = self.key(v)
+            if isinstance(k, sympy.Symbol) or (isinstance(k, Node) and k.op == "sym"):
+                sources[k] = leaf
+                self._leaves.append((v, leaf))
 
         for rec in tape.inputs:
             i = rec.position
@@ -266,8 +304,15 @@ class _TapeLowering:
                     self.roots[id(t._root)] = ("eager", len(self.eager))
                     self.dtypes[id(t._root)] = t.dtype
                     self.eager.append(t)
-        self.lowering = Lowering(self.program, sources)
         self.requirements: list[int] = []
+
+    @functools.cached_property
+    def symbolic(self) -> Lowering:
+        """The lowering of sympy expressions over the same program: a fold's
+        and a redispatch's, which rename symbols in sympy."""
+        if not self.ir:
+            return self.lowering
+        return Lowering(self.program, {_sym_expr(v): leaf for v, leaf in self._leaves})
 
     def emit(self, op: str, *operands: int) -> int:
         try:
@@ -276,7 +321,9 @@ class _TapeLowering:
             raise declined(str(e)) from e
 
     def row(self, v: Any) -> int:
-        return self.lowering.lower(_sym_expr(v))
+        if isinstance(v, sympy.Basic):
+            return self.symbolic.lower(v)
+        return self.lowering.lower(self.key(v))
 
     def allocation(self, rec: _AllocRec) -> LoweredAllocation:
         sizes = tuple(self.row(s) for s in rec.sizes)
@@ -297,14 +344,14 @@ class _TapeLowering:
         self.requirements.append(self.emit("select", empty, one, nonnegative))
         return LoweredAllocation(rec.seq, rec.dtype, sizes, strides, nbytes)
 
-    def pointer(self, value: Any, launch: KernelLaunch | Memset) -> PointerSlot:
-        expr = _sym_expr(value)
+    def pointer(self, value: Any, launch: KernelLaunch | Memset | Memcpy) -> PointerSlot:
+        symbolic = isinstance(value, sympy.Basic) or not self.ir
+        lowering, key = (self.symbolic, _sym_expr) if symbolic else (self.lowering, _sym_key)
+        expr = key(value)
         found = []
         for root in launch.roots:
-            root_expr = _sym_expr(root.sym)
-            displacement = expr - root_expr
-            own = root_expr.free_symbols
-            if own & expr.free_symbols and not own & displacement.free_symbols:
+            displacement = lowering.split(expr, key(root.sym))
+            if displacement is not None:
                 found.append((root, displacement))
         if len(found) != 1:
             raise declined(
@@ -312,9 +359,9 @@ class _TapeLowering:
             )
         root, displacement = found[0]
         ref = self.roots[id(root)]
-        address = self.lowering.lower(expr) if ref[0] == "argument" else None
+        address = lowering.lower(expr) if ref[0] == "argument" else None
         base = self.base(ref)
-        return PointerSlot(ref, self.lowering.lower(displacement), address, base)
+        return PointerSlot(ref, lowering.lower(displacement), address, base)
 
     def base(self, ref: Ref) -> int | None:
         kind, k = ref
@@ -390,6 +437,7 @@ class _TapeLowering:
             (*sizes, *strides, *align, *slots),
             scalars,
             self.tape.device.index,
+            call.state,
         )
 
     def address(self, t: _TracedTensor, offset: int) -> int:
@@ -429,7 +477,12 @@ class _TapeLowering:
             self.tape.device.index,
         )
 
-    def launch(self, seq: int, launch: Any) -> LoweredLaunch | LoweredMemset:
+    def launch(self, seq: int, launch: Any) -> LoweredLaunch | LoweredMemset | LoweredMemcpy:
+        if isinstance(launch, Memcpy):
+            if isinstance(launch.nbytes, int) and launch.nbytes < 1:
+                raise declined(f"{launch.name}: a memcpy of {launch.nbytes} bytes")
+            slots = (self.pointer(launch.slots[0], launch), self.pointer(launch.slots[1], launch))
+            return LoweredMemcpy(seq, launch, slots, self.row(launch.nbytes))
         if isinstance(launch, Memset):
             # a memset node's height, and its width and pitch over several
             # rows, are fixed at instantiation; a width of 0 is invalid
@@ -457,7 +510,7 @@ class _TapeLowering:
         tape, refs = self.tape, []
 
         def layout(sizes: Any, strides: Any, offset: Any) -> tuple:
-            return tuple(map(_sym_expr, sizes)), tuple(map(_sym_expr, strides)), _sym_expr(offset)
+            return tuple(map(self.key, sizes)), tuple(map(self.key, strides)), self.key(offset)
 
         # each allocation's and eager output's whole tensor
         whole = {id(rec.root): layout(rec.sizes, rec.strides, 0) for rec in tape.allocs}
@@ -481,9 +534,11 @@ class _TapeLowering:
         return tuple(refs)
 
 
-def lower_tape(tape: Tape) -> LoweredTape:
+def lower_tape(tape: Tape, *, direct: bool = True) -> LoweredTape:
     """The tape's guards, allocations, launches and outputs as rows of one
-    program, compiled; Declined for what the program cannot express."""
+    program, compiled; Declined for what the program cannot express. An IR
+    trace's lowers from its nodes, or with `direct` off from their sympy
+    export."""
     # a call a provider accepted binds at a replay: not eager
     calls = [rec.name for _, rec in tape.launches if isinstance(rec, EagerCall) and not isinstance(rec, OpaqueCall)]
     if calls and len(calls) == len(tape.launches):
@@ -492,11 +547,13 @@ def lower_tape(tape: Tape) -> LoweredTape:
         )
         e.uncaptured = True
         raise e
-    lo = _TapeLowering(tape)
-    addresses = frozenset(rec.root.sym.node.expr for rec in tape.inputs)
-    valid = lo.lowering.predicate(tape.guards, addresses)
+    lo = _TapeLowering(tape, direct)
+    addresses = frozenset(lo.key(rec.root.sym) for rec in tape.inputs)
+    guards = tape.shape_env.records[: tape.guard_count] if lo.ir else tape.guards
+    graph = [g for g, owner in zip(guards, tape.owners) if owner is None]
+    valid = lo.lowering.predicate(graph, addresses)
     allocations = tuple(lo.allocation(rec) for rec in tape.allocs)
-    launches: list[LoweredLaunch | LoweredMemset] = []
+    launches: list[LoweredLaunch | LoweredMemset | LoweredMemcpy] = []
     # host steps read no device memory: all run first, not splitting a run
     host = [(seq, rec) for seq, rec in tape.launches if isinstance(rec, EagerCall) and rec.host]
     steps: list[range | LoweredEagerCall] = [lo.eager_call(seq, rec) for seq, rec in host]
@@ -520,6 +577,12 @@ def lower_tape(tape: Tape) -> LoweredTape:
         steps.append(range(start, len(launches)))
     outputs = lo.outputs()
     sites = tuple(lo.keyed_site(site, index) for site in tape.sites)
+    selectors = []
+    for k, op in enumerate(tape.ops):
+        if op.guards:
+            predicate = lo.lowering.conjunction([guards[i] for i in op.guards], addresses)
+            nodes = tuple(index[id(rec)] for _, rec in tape.launches[op.launches.start : op.launches.stop] if id(rec) in index)
+            selectors.append(LoweredSelector(k, predicate, nodes))
     for row in lo.requirements:
         valid = lo.emit("and", valid, row)
     if lo.program.values[valid] != 1:
@@ -540,4 +603,193 @@ def lower_tape(tape: Tape) -> LoweredTape:
         outputs,
         opaque,
         sites,
+        tuple(selectors),
+        lo,
     )
+
+
+class FoldRefused(Exception):
+    """Why a trace does not fold into a variant's tape; `program`, compiled,
+    when a lowering declined after appending rows the native program must
+    have too."""
+
+    def __init__(self, msg: str, program: torch._C._HostTraceProgram | None = None) -> None:
+        super().__init__(msg)
+        self.program = program
+
+
+def fold(
+    lowered: LoweredTape, tape: Tape, args: Sequence[Any], values: Sequence[int], unselected: Sequence[int]
+) -> tuple[torch._C._HostTraceProgram, list[tuple[int, int, tuple[LoweredLaunch | LoweredMemset, ...]]]]:
+    """The trace `tape` of the call `args`, which the variant's graph guards
+    hold (at rows `values`) but not selectors `unselected` (native site
+    indices), as entries of those selectors: per selector (site, predicate
+    row, its op's launches), rows appended to the variant's program, and the
+    program compiled. An entry's predicate is its op's guards and the trace's
+    graph guards the variant lacks, in the variant's symbols (the trace's
+    renamed by role: an argument's metadata, an int argument, allocation k,
+    eager output j). Sound for any mix of entries: every op returns the same
+    metadata in both tapes, so a view or launch of one op reads the same
+    formulas whichever entry another took. FoldRefused where the tapes differ
+    otherwise: the op sequence, an op's outputs or launch topology (the
+    graph's nodes, their attributes and roots, which the memory plan read),
+    an eager call, the allocations, the outputs."""
+    old, lo = lowered.tape, lowered.lowering
+    if lowered.opaque:
+        raise FoldRefused("the variant learns")
+    ops = list(zip(tape.ops, old.ops))
+    if len(tape.ops) != len(old.ops) or any(
+        a.func != b.func or a.kind != b.kind or a.launches != b.launches or a.allocs != b.allocs for a, b in ops
+    ):
+        raise FoldRefused("another op sequence")
+    counts = [(len(t.inputs), len(t.int_inputs), len(t.allocs), len(t.launches), len(t.sites)) for t in (tape, old)]
+    if counts[0] != counts[1] or not set(tape.argument_pairs) <= set(old.argument_pairs):
+        raise FoldRefused("another tape")
+    eager: list[_TracedTensor] = []
+    for _, rec in tape.launches:
+        for t in rec.outputs if isinstance(rec, EagerCall) else ():
+            if t._root.kind == "eager" and all(t._root is not e._root for e in eager):
+                eager.append(t)
+    if len(eager) != len(lo.eager):
+        raise FoldRefused("other eager outputs")
+    roles: dict[int, Ref] = {id(rec.root): ("argument", rec.position) for rec in tape.inputs}
+    roles |= {id(rec.root): ("allocation", k) for k, rec in enumerate(tape.allocs)}
+    roles |= {id(t._root): ("eager", j) for j, t in enumerate(eager)}
+    roots = [*(rec.root for rec in old.inputs), *(rec.root for rec in old.allocs), *(t._root for t in lo.eager)]
+    by_role = {lo.roots[id(r)]: r for r in roots}
+
+    pairs = [(a.sym, b.sym) for a, b in zip(tape.int_inputs, old.int_inputs)]
+    for a, b in zip(tape.inputs, old.inputs):
+        pairs += [(a.root.sym, b.root.sym), (a.offset, b.offset), *zip(a.sizes, b.sizes), *zip(a.strides, b.strides)]
+    pairs += [(a.q, b.q) for a, b in zip(tape.allocs, old.allocs)]
+    pairs += [(a._root.sym, b._root.sym) for a, b in zip(eager, lo.eager)]
+    mapping: dict[sympy.Symbol, sympy.Expr] = {}
+    for a, b in pairs:
+        a, b = _sym_expr(a), _sym_expr(b)
+        if isinstance(a, sympy.Symbol):
+            mapping.setdefault(a, b)
+        elif len(a.free_symbols) == 1 == len(b.free_symbols):
+            mapping.setdefault(next(iter(a.free_symbols)), next(iter(b.free_symbols)))
+
+    # xreplace rebuilds every node above a replaced symbol, even one replaced by itself
+    moved = {a: b for a, b in mapping.items() if a != b}
+
+    def rename(v: Any) -> Any:
+        # simultaneous: the two traces' symbols may share names
+        e = _sym_expr(v)
+        if not e.free_symbols <= mapping.keys():
+            raise FoldRefused("a symbol of no argument, allocation or eager output")
+        e = e.xreplace(moved)
+        return int(e) if e.is_Integer else e
+
+    def canon(v: Any, new: bool) -> Any:
+        f = rename if new else _sym_expr
+        if isinstance(v, _TracedTensor):
+            role = (roles if new else lo.roots).get(id(v._root))
+            return (role, tuple(map(f, v.shape)), tuple(map(f, v._sym_strides)), f(v._sym_offset), v.dtype)
+        return f(v) if isinstance(v, torch.SymInt) else v
+
+    if any(rename(a) != _sym_expr(b) for a, b in pairs):
+        raise FoldRefused("arguments of other roles")
+    for a, b in ops:
+        if len(a.outputs) != len(b.outputs) or any(canon(x, True) != canon(y, False) for x, y in zip(a.outputs, b.outputs)):
+            raise FoldRefused(f"{a.func} returned other metadata")
+    for a, b in zip(tape.allocs, old.allocs):
+        layout = (a.dtype, tuple(map(rename, a.sizes)), tuple(map(rename, a.strides)))
+        if layout != (b.dtype, tuple(map(_sym_expr, b.sizes)), tuple(map(_sym_expr, b.strides))):
+            raise FoldRefused("other allocations")
+    if tape.result_kind != old.result_kind or len(tape.outputs) != len(old.outputs):
+        raise FoldRefused("other outputs")
+    for a, b in zip(tape.outputs, old.outputs):
+        if isinstance(a, _IntOutputRec) or isinstance(b, _IntOutputRec):
+            same = type(a) is type(b) and rename(a.value) == _sym_expr(b.value)  # type: ignore[union-attr]
+        else:
+            new = (roles.get(id(a.root)), *map(tuple, (map(rename, a.sizes), map(rename, a.strides))), rename(a.offset))
+            same = new == (lo.roots.get(id(b.root)), *map(tuple, (map(_sym_expr, b.sizes), map(_sym_expr, b.strides))), _sym_expr(b.offset))
+            same = same and (a.dtype, a.identity) == (b.dtype, b.identity)
+        if not same:
+            raise FoldRefused("other outputs")
+    for a, b in ops:
+        records = zip(tape.launches[a.launches.start : a.launches.stop], old.launches[b.launches.start : b.launches.stop])
+        if a.kind == "eager":
+            (_, x), (_, y) = next(records)
+            # a Triton or CuTe DSL launch: its function, then its grid and
+            # options or streams, compared as its arguments are
+            split = [(c.target[:2], c.target[2:]) if isinstance(c.target, tuple) else (c.target, ()) for c in (x, y)]
+            new_leaves, new_spec = pytree.tree_flatten((split[0][1], x.args, x.kwargs))
+            old_leaves, old_spec = pytree.tree_flatten((split[1][1], y.args, y.kwargs))
+            if (
+                split[0][0] != split[1][0]
+                or x.generator is not y.generator
+                or new_spec != old_spec
+                or any(canon(p, True) != canon(q, False) for p, q in zip(new_leaves, old_leaves))
+            ):
+                raise FoldRefused(f"another eager call of {a.func}")
+        elif a.kind == "traced":
+            for (_, x), (_, y) in records:
+                same = type(x) is type(y) and {roles.get(id(r)) for r in x.roots} == {lo.roots.get(id(r)) for r in y.roots}
+                if same and isinstance(x, KernelLaunch):
+                    same = (x.attributes, x.programmatic) == (y.attributes, y.programmatic)
+                elif same:
+                    same = x.element_size == y.element_size and rename(x.height) == _sym_expr(y.height)
+                if not same:
+                    raise FoldRefused(f"another launch topology in {a.func}")
+
+    graph = {g for g, owner in zip(old.guards, old.owners) if owner is None}
+    extra: list[Any] = []
+    for g, owner in zip(tape.guards, tape.owners):
+        if owner is None and (r := rename(g)) not in graph and r is not sympy.true and r not in extra:
+            extra.append(r)
+    selected = []
+    for i in unselected:
+        selector = lowered.selectors[i - len(lowered.sites)]
+        op = tape.ops[selector.op]
+        records = [rec for _, rec in tape.launches[op.launches.start : op.launches.stop] if not isinstance(rec, EagerCall)]
+        launches = []
+        for n, rec in zip(selector.nodes, records, strict=True):
+            if isinstance(rec, KernelLaunch) and (rec.rng or rec.rng_increment or rec.descriptors):
+                raise FoldRefused(f"an RNG or TMA launch in {op.func}")
+            if any(roles.get(id(r)) not in by_role for r in rec.roots):
+                raise FoldRefused(f"a launch in {op.func} of a root of no role")
+            owned = tuple(by_role[roles[id(r)]] for r in rec.roots)
+            if isinstance(rec, Memcpy):
+                raise FoldRefused(f"a memcpy in {op.func}")
+            if isinstance(rec, Memset):
+                extents = (rename(rec.width), rename(rec.height), rename(rec.pitch))
+                rec = replace(rec, slots=(rename(rec.slots[0]),), roots=owned, width=extents[0], height=extents[1], pitch=extents[2])
+            else:
+                geometry = (tuple(map(rename, rec.grid)), tuple(map(rename, rec.block)), rename(rec.smem))
+                rec = replace(rec, slots=tuple(map(rename, rec.slots)), roots=owned, grid=geometry[0], block=geometry[1], smem=geometry[2])
+            launches.append((lowered.launches[n].seq, rec))
+        selected.append((i, [rename(tape.guards[g]) for g in op.guards] + extra, launches))
+    return lower_entries(lowered, args, values, selected)
+
+
+def lower_entries(
+    lowered: LoweredTape, args: Sequence[Any], values: Sequence[int], selected: list[tuple[int, list[Any], list[tuple[int, Any]]]]
+) -> tuple[torch._C._HostTraceProgram, list[tuple[int, int, tuple[LoweredLaunch | LoweredMemset, ...]]]]:
+    """Per (selector site, guards, (seq, launch) pairs) in the variant's
+    symbols, the entry (site, predicate row, lowered launches), its rows
+    appended to the variant's program at the call `args` (rows `values`), and
+    the program compiled; FoldRefused where a lowering declines."""
+    lo = lowered.lowering
+    # every row evaluated at the call, where each new row is too
+    program = lo.program
+    program.inputs, program.values = tuple(args), list(values)
+    addresses = frozenset(rec.root.sym.node.expr for rec in lowered.tape.inputs)
+    entries = []
+    try:
+        for i, guards, launches in selected:
+            # the other entries' rows are evaluated at this one's calls
+            with lo.symbolic.total() as domains:
+                predicate = lo.symbolic.conjunction(guards, addresses)
+                rows = tuple(lo.launch(seq, rec) for seq, rec in launches)
+            for ok in domains:
+                predicate = lo.emit("and", predicate, ok)
+            entries.append((i, predicate, rows))
+        compiled = compile_program(program)
+    except Declined as e:
+        raise FoldRefused(f"a lowering declined: {e}", compile_program(program)) from e
+    finally:
+        program.inputs = ()
+    return compiled, entries

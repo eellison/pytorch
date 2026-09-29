@@ -105,7 +105,7 @@ file(GLOB cuda_h CONFIGURE_DEPENDS "cuda/*.h" "cuda/detail/*.h" "cuda/*.cuh" "cu
 file(GLOB cuda_cpp CONFIGURE_DEPENDS "cuda/*.cpp" "cuda/detail/*.cpp" "cuda/tunable/*.cpp" "cuda/host_trace/*.cpp")
 file(GLOB cuda_nvrtc_stub_h CONFIGURE_DEPENDS "cuda/nvrtc_stub/*.h")
 file(GLOB cuda_nvrtc_stub_cpp CONFIGURE_DEPENDS "cuda/nvrtc_stub/*.cpp")
-file(GLOB cuda_cu CONFIGURE_DEPENDS "cuda/*.cu" "cuda/detail/*.cu" "cuda/tunable/*.cu")
+file(GLOB cuda_cu CONFIGURE_DEPENDS "cuda/*.cu" "cuda/detail/*.cu" "cuda/tunable/*.cu" "cuda/host_trace/*.cu")
 file(GLOB cudnn_h CONFIGURE_DEPENDS "cudnn/*.h" "cudnn/*.cuh")
 file(GLOB cudnn_cpp CONFIGURE_DEPENDS "cudnn/*.cpp")
 file(GLOB ops_h CONFIGURE_DEPENDS "ops/*.h")

@@ -3,18 +3,22 @@
 import contextlib
 import gc
 import unittest
+from unittest import mock
 
 import torch
 import torch.nn.functional as F
 from torch.cuda._host_trace_capture import (
     capture_kernel_nodes,
     KernelNode,
+    MemcpyNode,
     MemsetNode,
 )
-from torch.cuda._host_trace_harvest import _zero_init
+from torch.cuda._host_trace_harvest import HarvestProvider
 from torch.cuda._host_trace_launch import KernelLaunch
 from torch.cuda._host_trace_replay import HostTraceReplay
-from torch.cuda._host_trace_tape import _hint, EagerCall, Memset, trace, TrustedInputs
+from torch.cuda._host_trace_tape import _hint, EagerCall, Memcpy, Memset, trace, TrustedInputs
+from torch.nn.attention import sdpa_kernel, SDPBackend
+from torch.testing._internal.common_cuda import PLATFORM_SUPPORTS_FLASH_ATTENTION
 from torch.testing._internal.common_utils import (
     instantiate_parametrized_tests,
     parametrize,
@@ -23,6 +27,16 @@ from torch.testing._internal.common_utils import (
     TEST_CUDA,
     TestCase,
 )
+
+
+@contextlib.contextmanager
+def _zero_init():
+    # the harvest flag, as a harvest's captures set it
+    previous = torch._C._cuda_hostTraceSetHarvesting(True)
+    try:
+        yield
+    finally:
+        torch._C._cuda_hostTraceSetHarvesting(previous)
 
 
 def silu_mul(x, y):
@@ -67,8 +81,7 @@ REDUCTIONS = {
 
 
 # name: (fn of h, operand shapes as CASES', WelfordOps bytes or None for a
-# kernel of scalar and pointer parameters); rms_norm's normalized_shape is ints,
-# which its composite reads as int64_t
+# kernel of scalar and pointer parameters)
 NORMS = {
     "softmax": (lambda h: lambda x: torch.softmax(x, -1), ("mh",), None),
     "log_softmax": (lambda h: lambda x: torch.log_softmax(x, -1), ("mh",), None),
@@ -79,8 +92,11 @@ NORMS = {
     "var_all": (lambda h: torch.var, ("mh",), 5),
     "layer_norm": (lambda h: lambda x, w, b: F.layer_norm(x, x.shape[-1:], w, b), ("mh", "h", "h"), None),
     "layer_norm_no_affine": (lambda h: lambda x: F.layer_norm(x, x.shape[-1:]), ("mh",), None),
-    "rms_norm": (lambda h: lambda x, w: F.rms_norm(x, (h,), w), ("mh", "h"), None),
-    "rms_norm_no_weight": (lambda h: lambda x: F.rms_norm(x, (h,)), ("mh",), None),
+    "rms_norm": (lambda h: lambda x, w: F.rms_norm(x, x.shape[-1:], w), ("mh", "h"), None),
+    "rms_norm_no_weight": (lambda h: lambda x: F.rms_norm(x, x.shape[-1:]), ("mh",), None),
+    # expect_contiguous's copy, then the kernel
+    "layer_norm_t": (lambda h: lambda x, w, b: F.layer_norm(x.t(), x.shape[:1], w, b), ("hm", "h", "h"), None),
+    "rms_norm_t": (lambda h: lambda x, w: F.rms_norm(x.t(), x.shape[:1], w), ("hm", "h"), None),
 }
 
 
@@ -98,7 +114,7 @@ def _no_native_rms_norm():
 
 
 def _norm_inputs(case, m, h, dtype):
-    shapes = {"mh": (m, h), "h": (h,)}
+    shapes = {"mh": (m, h), "hm": (h, m), "h": (h,)}
     return [torch.randn(shapes[s], device="cuda", dtype=dtype) for s in NORMS[case][1]]
 
 
@@ -120,16 +136,126 @@ DECLINES = {
     "sum_with_dtype": (lambda x: x.sum(-1, dtype=torch.float32), lambda x, y: (x,), [EagerCall]),
     "double_mean": (lambda x: x.mean(-1), lambda x, y: (x.double(),), [EagerCall]),
     "empty_sum": (lambda x: x[:0].sum(-1), lambda x, y: (x,), [EagerCall]),
-    "mixed_dtypes": (silu_mul, lambda x, y: (x, y), [KernelLaunch, EagerCall]),
-    "memcpy_clone": (torch.clone, lambda x, y: (x,), [EagerCall]),
-    "python_scalar": (lambda x: x + 2, lambda x, y: (x,), [EagerCall]),
-    "integer_rsqrt": (torch.rsqrt, lambda x, y: (x.long(),), [EagerCall]),
     "shared_root_copy": (_shared_root_copy, lambda x, y: (x,), [KernelLaunch, EagerCall]),
     "softmax_inner": (lambda x: torch.softmax(x, 0), lambda x, y: (x,), [EagerCall]),
     "softmax_strided": (lambda x: torch.softmax(x.t(), -1), lambda x, y: (x,), [EagerCall]),
     "var_no_dof": (lambda x: torch.var(x[:1], 0), lambda x, y: (x,), [EagerCall]),
-    "layer_norm_strided": (lambda x: F.layer_norm(x.t(), (64,)), lambda x, y: (x,), [EagerCall]),
+    "index_select_gather_strided": (lambda x, i: x.t().index_select(0, i), lambda x, y: (x, torch.arange(17, device="cuda")), [EagerCall]),
+    "cat_legacy_empty": (lambda x: torch.cat([x, x.new_empty(0)]), lambda x, y: (x,), [EagerCall]),
+    "cat_mixed_dtypes": (lambda x, y: torch.cat([x[0], y]), lambda x, y: (x, y), [EagerCall]),
 }
+
+
+def _randn(*shape, dtype=torch.float16):
+    return torch.randn(shape, device="cuda", dtype=dtype)
+
+
+# name: (fn, args from (m, h, dtype)): ops of the generic pointwise host
+POINTWISE = {
+    "mul_python_float": (lambda x: x * 0.5, lambda m, h, d: (_randn(m, h, dtype=d),)),
+    "add_python_int": (lambda x: x + 2, lambda m, h, d: (_randn(m, h, dtype=d),)),
+    "pow_3": (lambda x: torch.pow(x, 3.0), lambda m, h, d: (_randn(m, h, dtype=d),)),
+    "pow_2_5": (lambda x: torch.pow(x, 2.5), lambda m, h, d: (_randn(m, h, dtype=d),)),
+    "tanh": (torch.tanh, lambda m, h, d: (_randn(m, h, dtype=d),)),
+    "neg": (torch.neg, lambda m, h, d: (_randn(m, h, dtype=d),)),
+    "cos": (torch.cos, lambda m, h, d: (_randn(m, h, dtype=d),)),
+    "sin": (torch.sin, lambda m, h, d: (_randn(m, h, dtype=d),)),
+    "mul_Scalar": (lambda x: torch.ops.aten.mul.Scalar(x, 0.5), lambda m, h, d: (_randn(m, h, dtype=d),)),
+    "tanh_backward": (torch.ops.aten.tanh_backward, lambda m, h, d: (_randn(m, h, dtype=d), _randn(m, h, dtype=d))),
+    "tanh_backward_broadcast": (torch.ops.aten.tanh_backward, lambda m, h, d: (_randn(m, h, dtype=d), _randn(h, dtype=d))),
+    "mixed_dtypes": (lambda x, y: x * y, lambda m, h, d: (_randn(m, h, dtype=d), _randn(h, dtype=_other(d)))),
+    "mixed_dtypes_contiguous": (lambda x, y: x + y, lambda m, h, d: (_randn(m, h, dtype=d), _randn(m, h, dtype=_other(d)))),
+    "integer_rsqrt": (torch.rsqrt, lambda m, h, d: (torch.randint(1, 100, (m, h), device="cuda"),)),
+    "cos_strided": (lambda x: x[:, ::2].cos(), lambda m, h, d: (_randn(m, h, dtype=d),)),
+    "neg_t": (lambda x: x.t().neg(), lambda m, h, d: (_randn(m, h, dtype=d),)),
+    "mul_strided_cast": (lambda x, y: x[:, ::2] * y[:, ::2], lambda m, h, d: (_randn(m, h, dtype=d), _randn(m, h, dtype=_other(d)))),
+    "neg_misaligned": (lambda x: x.view(-1)[1:].neg(), lambda m, h, d: (_randn(m, h, dtype=d),)),
+    "add_inplace_mixed": (lambda x, y: (x * 1).add_(y), lambda m, h, d: (_randn(m, h, dtype=d), _randn(h, dtype=_other(d)))),
+    "mul_inplace_python_float": (lambda x: x.neg().mul_(0.5), lambda m, h, d: (_randn(m, h, dtype=d),)),
+    "tanh_out": (lambda x: torch.tanh(x, out=x.neg()), lambda m, h, d: (_randn(m, h, dtype=d),)),
+    "add_out_broadcast": (lambda x, y: torch.add(x, y, alpha=2, out=x.neg()), lambda m, h, d: (_randn(m, h, dtype=d), _randn(h, dtype=d))),
+    "add_Scalar": (lambda x: torch.ops.aten.add.Scalar(x, 2, alpha=3), lambda m, h, d: (_randn(m, h, dtype=d),)),
+    "where_python_scalar": (lambda c, x: torch.where(c, x, 0.5), lambda m, h, d: (_randn(m, h) > 0, _randn(m, h, dtype=d))),
+    "addcmul": (lambda x, y, z: torch.addcmul(x, y, z, value=0.5), lambda m, h, d: (_randn(m, h, dtype=d), _randn(m, h, dtype=d), _randn(h, dtype=d))),
+    "lerp": (torch.lerp, lambda m, h, d: (_randn(m, h, dtype=d), _randn(m, h, dtype=d), _randn(m, h, dtype=d))),
+    "clamp_tensor": (torch.clamp, lambda m, h, d: (_randn(m, h, dtype=d), _randn(h, dtype=d) - 1, _randn(h, dtype=d) + 1)),
+    "gt_bool": (torch.gt, lambda m, h, d: (_randn(m, h, dtype=d), _randn(h, dtype=d))),
+    "integer_true_divide": (torch.div, lambda m, h, d: (torch.randint(-50, 50, (m, h), device="cuda"), torch.randint(1, 50, (h,), device="cuda"))),
+    "integer_times_float": (torch.mul, lambda m, h, d: (torch.randint(-50, 50, (m, h), device="cuda"), _randn(h, dtype=d))),
+    "fill_nullary": (lambda x: x.neg().fill_(0.5), lambda m, h, d: (_randn(m, h, dtype=d),)),
+    "fill_functional": (lambda x: torch.fill(x, 0.5), lambda m, h, d: (_randn(m, h, dtype=d),)),
+    "zero_dim_operand": (torch.mul, lambda m, h, d: (_randn(m, h, dtype=d), _randn(dtype=torch.float32))),
+    # functional forms over a CUDA out= kernel; an in-place op of no tag
+    "abs": (torch.abs, lambda m, h, d: (_randn(m, h, dtype=d),)),
+    "logical_not": (torch.logical_not, lambda m, h, d: (_randn(m, h, dtype=d),)),
+    "abs_inplace": (lambda x: x.neg().abs_(), lambda m, h, d: (_randn(m, h, dtype=d),)),
+    # no CUDA out= kernel: the witness is the op
+    "relu": (torch.relu, lambda m, h, d: (_randn(m, h, dtype=d),)),
+    "isnan": (torch.isnan, lambda m, h, d: (_randn(m, h, dtype=d).log(),)),
+    "rsub": (lambda x, y: torch.rsub(x, y, alpha=2), lambda m, h, d: (_randn(m, h, dtype=d), _randn(h, dtype=d))),
+    "dropout_backward": (lambda g, mask: torch.ops.aten.native_dropout_backward(g, mask, 2.0), lambda m, h, d: (_randn(m, h, dtype=d), _randn(m, h) > 0)),
+    # jitted_gpu_kernel's NVRTC kernels: vectorized, strided, casting
+    "jiterator": (torch.special.i1e, lambda m, h, d: (_randn(m, h, dtype=d),)),
+    "jiterator_strided": (lambda x: torch.special.i1e(x[:, ::2]), lambda m, h, d: (_randn(m, h, dtype=d),)),
+    "jiterator_cast": (torch.special.xlog1py, lambda m, h, d: (_randn(m, h, dtype=d), _randn(h, dtype=_other(d)).abs())),
+    # self twice in the iterator
+    "threshold": (lambda x: F.threshold(x, 0.1, 20.0), lambda m, h, d: (_randn(m, h, dtype=d),)),
+    "threshold_backward": (lambda g, x: torch.ops.aten.threshold_backward(g, x, 0.0), lambda m, h, d: (_randn(m, h, dtype=d), _randn(m, h, dtype=d))),
+    # no pointwise tag: admitted by the witness's iterators
+    "floor_divide": (torch.floor_divide, lambda m, h, d: (_randn(m, h, dtype=d), _randn(h, dtype=d))),
+    "polar": (torch.polar, lambda m, h, d: (_randn(m, h, dtype=torch.float32).abs(), _randn(m, h, dtype=torch.float32))),
+    "complex": (torch.complex, lambda m, h, d: (_randn(m, h, dtype=torch.float32), _randn(h, dtype=torch.float32))),
+    # and an empty buffer it returns
+    "logsigmoid": (F.logsigmoid, lambda m, h, d: (_randn(m, h, dtype=d),)),
+    # gpu_kernel_multiple_outputs
+    "frexp": (lambda x: torch.mul(*torch.frexp(x)), lambda m, h, d: (_randn(m, h, dtype=d),)),
+    "frexp_strided": (lambda x: torch.mul(*torch.frexp(x[:, ::2])), lambda m, h, d: (_randn(m, h, dtype=d),)),
+    # a 0-dim temporary of the base, then the kernel
+    "pow_scalar_base": (lambda x: torch.pow(2.5, x), lambda m, h, d: (_randn(m, h, dtype=d),)),
+    "zero_strided": (lambda x: x.neg()[:, ::2].zero_(), lambda m, h, d: (_randn(m, h, dtype=d),)),
+}
+
+
+def _rotate_half(x):
+    h = x.shape[-1] // 2
+    return torch.cat((-x[..., h:], x[..., :h]), dim=-1)
+
+
+# name: (fn, args from (m, h, dtype))
+CATS = {
+    "last_dim": (lambda a, b: torch.cat([a, b], -1), lambda m, h, d: (_randn(m, h, dtype=d), _randn(m, 64, dtype=d))),
+    "rotate_half": (_rotate_half, lambda m, h, d: (_randn(1, 4, m, 64, dtype=d),)),
+    "kv_cache": (lambda past, new: torch.cat([past, new], -2), lambda m, h, d: (_randn(1, 4, m, 64, dtype=d), _randn(1, 4, 1, 64, dtype=d))),
+    "mixed_sizes_dim0": (lambda a, b, c: torch.cat([a, b, c]), lambda m, h, d: (_randn(m, h, dtype=d), _randn(3, h, dtype=d), _randn(1, h, dtype=d))),
+    "empty_input": (lambda a, b: torch.cat([a, b[:0], b]), lambda m, h, d: (_randn(m, h, dtype=d), _randn(2, h, dtype=d))),
+    "non_contiguous": (lambda a, b: torch.cat([a.t(), b.t()]), lambda m, h, d: (_randn(m, 64, dtype=d), _randn(m, 32, dtype=d))),
+    "many_inputs": (lambda *xs: torch.cat(xs, -1), lambda m, h, d: tuple(_randn(m, 8 + i % 3, dtype=d) for i in range(70))),
+}
+
+
+# name: (fn, args from (m, h, dtype)); m indices, as many as a decode step's
+INDEXING = {
+    "index_select_dim0": (lambda x, i: x.index_select(0, i), lambda m, h, d: (_randn(300, h, dtype=d), torch.randint(0, 300, (m,), device="cuda"))),
+    "index_select_dim1": (lambda x, i: x.index_select(1, i), lambda m, h, d: (_randn(64, h, dtype=d), torch.randint(0, h, (m,), device="cuda"))),
+    "index_select_int32_strided": (
+        lambda x, i: x.index_select(0, i[::2]),
+        lambda m, h, d: (_randn(300, h, dtype=d), torch.randint(0, 300, (2 * m,), device="cuda", dtype=torch.int32)),
+    ),
+    "embedding": (lambda i, w: F.embedding(i, w), lambda m, h, d: (torch.randint(0, 300, (1, m), device="cuda"), _randn(300, h, dtype=d))),
+    # more than 16 indices: gather_out's vectorized gather
+    "index_select_gather": (lambda x, i: x.index_select(0, i), lambda m, h, d: (_randn(300, h, dtype=d), torch.randint(0, 300, (m + 16,), device="cuda"))),
+    "index_select_gather_int32": (
+        lambda x, i: x.index_select(0, i),
+        lambda m, h, d: (_randn(300, h, dtype=d), torch.randint(0, 300, (m + 16,), device="cuda", dtype=torch.int32)),
+    ),
+    "embedding_gather": (lambda i, w: F.embedding(i, w), lambda m, h, d: (torch.randint(0, 300, (2, m + 16), device="cuda"), _randn(300, h, dtype=d))),
+}
+
+
+def _zeros(launch: KernelLaunch) -> set[tuple[int, int]]:
+    # (param, byte) a host leaves zero: entries past its tensor count and dims,
+    # which eager leaves stale
+    return {(p, b) for p, image in enumerate(launch.images) for b, v in enumerate(image) if v == 0}
 
 
 def _reduce_unread(functor_bytes: int, arg_bytes: int, arg_align: int | None = None) -> set[tuple[int, int]]:
@@ -159,13 +285,19 @@ def _inputs(case, m, h, dtype):
 
 def _unread(node: KernelNode, launch: KernelLaunch, functor_bytes: int) -> set[tuple[int, int]]:
     # (param, byte) eager leaves uninitialized and the kernel never reads: a
-    # functor's tail (an empty functor's byte), a cast loader's and storer's
-    # padding, and a strided op's padding and OffsetCalculator entries past dims
+    # functor's tail (an empty functor's byte), an empty offset calculator's,
+    # loader's and storer's byte, a cast loader's and storer's padding, and a
+    # strided op's padding and OffsetCalculator entries past dims
+    if not node.name.startswith("_Z"):
+        return set()
     if "vectorized" in node.name or "unrolled" in node.name:
         tail = {(1, b) for b in range(functor_bytes, len(node.images[1]))}
         if "vectorized" in node.name:
             return tail
-        return tail | {(p, b) for p in (5, 6) if len(node.images[p]) == 8 for b in range(1, 4)}
+        empty = {(p, 0) for p in range(3, len(node.images)) if len(node.images[p]) == 1}
+        # LoadWithCast<n> / StoreWithCast<n>: n dtypes padded to 4, n sizes
+        casts = {p: n for p in range(5, len(node.images)) for n in range(1, 9) if len(node.images[p]) == -(-n // 4) * 4 + 4 * n}
+        return tail | empty | {(p, b) for p, n in casts.items() for b in range(n, -(-n // 4) * 4)}
     n = len(launch.pointers)
     cast = "StridedCastOp" in node.name
     at = 8 * n + (-(-n // 4) * 4 if cast else 0)
@@ -186,6 +318,13 @@ def _unread(node: KernelNode, launch: KernelLaunch, functor_bytes: int) -> set[t
 @requires_cuda_python_bindings
 @unittest.skipIf(not hasattr(torch._C, "_cuda_hostTraceMul"), "needs traced hosts")
 class TestHostTraceAten(TestCase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        # a process's first trace allocates state the memory checks would count:
+        # the generator's graph state, the plain launch attributes' probe
+        HostTraceReplay(torch.neg)(torch.ones(1, device="cuda"))
+
     @parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
     @parametrize("case", list(CASES))
     def test_replays_new_shapes(self, dtype, case):
@@ -334,9 +473,12 @@ class TestHostTraceAten(TestCase):
         torch.cuda.synchronize()
         base = torch.cuda.memory_allocated()
         torch.cuda.reset_peak_memory_stats()
+        traces = entry.traces
         out = entry(*args)
         torch.cuda.synchronize()
         replay_peak = torch.cuda.max_memory_allocated() - base
+        # a trace's witness of an op without an out= overload allocates the op's output
+        traced = entry.traces != traces
         ref = fn(*args)
         self.assertEqual(out, ref, atol=0, rtol=0)
         self.assertEqual(out.stride(), ref.stride())
@@ -344,7 +486,8 @@ class TestHostTraceAten(TestCase):
         torch.cuda.reset_peak_memory_stats()
         fn(*args)
         torch.cuda.synchronize()
-        self.assertEqual(replay_peak, torch.cuda.max_memory_allocated() - base)
+        if not traced:
+            self.assertEqual(replay_peak, torch.cuda.max_memory_allocated() - base)
 
     @parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32, torch.float64])
     @parametrize("case", list(NORMS))
@@ -372,6 +515,7 @@ class TestHostTraceAten(TestCase):
             ("softmax_to_float", ((64, 20), (7, 17), (5, 31))),
             ("layer_norm", ((64, 768), (7, 1024), (129, 4096), (300, 20000))),
             ("layer_norm_no_affine", ((64, 767), (7, 1023), (129, 4095))),
+            ("rms_norm", ((64, 768), (7, 1024), (129, 4096), (300, 20000))),
             ("var", ((64, 768), (2, 768), (37, 96), (129, 4096), (600, 200))),
         ],
     )
@@ -402,8 +546,227 @@ class TestHostTraceAten(TestCase):
         for launch, node in zip(launches, nodes):
             if isinstance(node, MemsetNode):
                 self.assertEqual(launch.value, node.value)
+            elif "elementwise_kernel" in node.name:
+                self._assert_launch_matches(launch, node, _unread(node, launch, 0))
             else:
                 self._assert_launch_matches(launch, node, set(unread))
+
+    def _assert_replays_eager_calls(self, entry, fn, args):
+        gc.collect()
+        torch.cuda.synchronize()
+        base = torch.cuda.memory_allocated()
+        torch.cuda.reset_peak_memory_stats()
+        traces = entry.traces
+        out = entry(*args)
+        torch.cuda.synchronize()
+        replay_peak = torch.cuda.max_memory_allocated() - base
+        # a trace's witness of an op without an out= overload allocates the op's output
+        traced = entry.traces != traces
+        ref = fn(*args)
+        self.assertEqual(out, ref, atol=0, rtol=0)
+        self.assertEqual(out.stride(), ref.stride())
+        del out, ref
+        torch.cuda.reset_peak_memory_stats()
+        fn(*args)
+        torch.cuda.synchronize()
+        if not traced:
+            self.assertEqual(replay_peak, torch.cuda.max_memory_allocated() - base)
+
+    def _assert_records_match_eager(self, fn, args, unread):
+        launches = [c for _, c in trace(fn, tuple(args)).launches]
+        self.assertTrue(all(isinstance(c, KernelLaunch) for c in launches))
+        with _zero_init():
+            nodes = capture_kernel_nodes(lambda s: fn(*args))
+        self.assertEqual(len(launches), len(nodes))
+        for launch, node in zip(launches, nodes):
+            self._assert_launch_matches(launch, node, unread(node, launch))
+
+    @parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+    @parametrize("case", list(POINTWISE))
+    def test_pointwise_replays_new_shapes(self, dtype, case):
+        fn, args_fn = POINTWISE[case]
+        entry = HostTraceReplay(fn)
+        for h in (4096, 768):
+            for m in (64, 200, 7, 1):
+                self._assert_replays_eager_calls(entry, fn, args_fn(m, h, dtype))
+        self.assertLessEqual(entry.traces, 2)
+        self.assertEqual(entry.eager, 0)
+
+    @parametrize("dtype", [torch.float16, torch.float32])
+    @parametrize("case", list(POINTWISE))
+    @parametrize("m", [64, 7, 1])
+    def test_pointwise_records_match_eager(self, dtype, case, m):
+        # the functor's bytes are the witness's, eager's own; a device lambda's
+        # hold nvcc's host-side pointer, which differs per call
+        fn, args_fn = POINTWISE[case]
+        self._assert_records_match_eager(fn, args_fn(m, 4096, dtype), lambda node, launch: _unread(node, launch, 0))
+
+    @parametrize("dtype", [torch.float16, torch.float32])
+    def test_pointwise_inplace_on_an_argument(self, dtype):
+        def fn(x, y):
+            x.mul_(y).add_(1)
+            return x * y
+
+        entry = HostTraceReplay(fn)
+        for m in (64, 7, 1):
+            x, y = _randn(m, 768, dtype=dtype), _randn(m, 768, dtype=dtype)
+            x_ref = x.clone()
+            self.assertEqual(entry(x, y), fn(x_ref, y), atol=0, rtol=0)
+            self.assertEqual(x, x_ref, atol=0, rtol=0)
+        self.assertEqual(entry.eager, 0)
+
+    @parametrize("dtype", [torch.float16, torch.float32])
+    def test_zero_of_a_dense_tensor_is_a_memset(self, dtype):
+        def fn(x):
+            y = x.neg()
+            y.t().zero_()
+            x[1:].zero_()
+            return y
+
+        x = _randn(64, 768, dtype=dtype)
+        self.assertEqual([type(c) for _, c in trace(fn, (x,)).launches], [KernelLaunch, Memset, Memset])
+        entry = HostTraceReplay(fn)
+        for m in (64, 7, 2, 1):
+            x = _randn(m, 768, dtype=dtype)
+            x_ref = x.clone()
+            self.assertEqual(entry(x), fn(x_ref), atol=0, rtol=0)
+            self.assertEqual(x, x_ref, atol=0, rtol=0)
+        self.assertEqual(entry.eager, 0)
+
+    @parametrize("dtype", [torch.float16, torch.float32])
+    def test_contiguous_copy_is_a_memcpy(self, dtype):
+        def fn(x, y):
+            z = x.clone()
+            z.copy_(y)
+            return torch.masked_fill(z, y > 0, 1.0)
+
+        args = (_randn(64, 768, dtype=dtype), _randn(64, 768, dtype=dtype))
+        launches = [c for _, c in trace(fn, args).launches]
+        self.assertEqual([type(c) for c in launches], [Memcpy, Memcpy, KernelLaunch, Memcpy, KernelLaunch])
+        nodes = capture_kernel_nodes(lambda s: fn(*args), memcpy=True)
+        self.assertEqual([type(n) for n in nodes], [MemcpyNode, MemcpyNode, KernelNode, MemcpyNode, KernelNode])
+        self.assertEqual([int(_hint(c.nbytes)) for c in launches[:2]], [n.nbytes for n in nodes[:2]])
+        entry = HostTraceReplay(fn)
+        for m in (64, 7, 200, 1):
+            self._assert_replays_eager_calls(entry, fn, (_randn(m, 768, dtype=dtype), _randn(m, 768, dtype=dtype)))
+        self.assertLessEqual(entry.traces, 2)
+        self.assertEqual(entry.eager, 0)
+
+    def test_max_dim_of_a_zero_dim_tensor(self):
+        # values.copy_(self) is a memcpy, then the indices' fill kernel
+        def fn(x):
+            v, i = torch.max(x * 2, 0)
+            return v + 1, i
+
+        self.assertFalse(any(isinstance(c, EagerCall) for _, c in trace(fn, (_randn(),)).launches))
+        entry = HostTraceReplay(fn)
+        for _ in range(3):
+            x = _randn()
+            self.assertEqual(entry(x), fn(x), atol=0, rtol=0)
+        self.assertEqual((entry.traces, entry.eager), (1, 0))
+
+    @parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+    def test_masked_fill_of_a_device_value(self, dtype):
+        # eager reads the value on the host (item()), which no capture takes
+        def fn(x, mask, v):
+            return x.neg().masked_fill_(mask, v)
+
+        args = (_randn(64, 768, dtype=dtype), _randn(768) > 0, _randn(dtype=torch.float32))
+        self.assertTrue(all(isinstance(c, KernelLaunch) for _, c in trace(fn, args).launches))
+        entry = HostTraceReplay(fn)
+        for m in (64, 7, 1):
+            args = (_randn(m, 768, dtype=dtype), _randn(768) > 0, _randn(dtype=torch.float32))
+            self.assertEqual(entry(*args), fn(*args), atol=0, rtol=0)
+        self.assertEqual(entry.eager, 0)
+
+    def test_random_ops_replay_through_the_rng_provider(self):
+        def fn(x):
+            y = F.dropout(x, 0.2, training=True) + torch.rand_like(x)
+            return y.bernoulli_(0.3) * x.neg().normal_()
+
+        entry = HostTraceReplay(fn, opaque=(HarvestProvider(("rng",)),))
+        for m in (64, 64, 7):
+            x = _randn(m, 768)
+            torch.cuda.manual_seed(0)
+            got = entry(x)
+            torch.cuda.manual_seed(0)
+            self.assertEqual(got, fn(x), atol=0, rtol=0)
+        self.assertEqual(entry.eager, 0)
+
+    def test_aliasing_op_that_copies_traces_its_decomposition(self):
+        # under inference mode reshape reaches the trace, and copies a transposed input
+        def fn(x):
+            return x.t().reshape(-1) * 2
+
+        with torch.inference_mode():
+            x = _randn(64, 768)
+            self.assertEqual([type(c) for _, c in trace(fn, (x,)).launches], [KernelLaunch, KernelLaunch])
+            entry = HostTraceReplay(fn)
+            for m in (64, 7, 64):
+                x = _randn(m, 768)
+                self.assertEqual(entry(x), fn(x), atol=0, rtol=0)
+        self.assertEqual(entry.eager, 0)
+
+    def test_factory_parts_and_constant_queries_trace(self):
+        # full of a symbolic size is its fill kernel into its allocation; can_cast is a constant
+        def fn(x):
+            y = torch.full((x.shape[0], 1), 2.0, device=x.device, dtype=x.dtype)
+            z = torch.ones_like(x, dtype=torch.bool) & torch.zeros(768, device=x.device, dtype=torch.bool)
+            return x * y if torch.can_cast(x.dtype, torch.float) else z
+
+        self.assertFalse(any(isinstance(c, EagerCall) for _, c in trace(fn, (_randn(64, 768),)).launches))
+        entry = HostTraceReplay(fn)
+        for m in (64, 7, 64):
+            x = _randn(m, 768)
+            self.assertEqual(entry(x), fn(x), atol=0, rtol=0)
+        self.assertEqual(entry.eager, 0)
+
+    @parametrize("m", [64, 0])
+    def test_an_empty_buffer_out_is_returned(self, m):
+        # log_sigmoid_forward's CUDA kernel leaves its buffer empty
+        def fn(x):
+            return torch.ops.aten.log_sigmoid_forward.output(x, output=torch.empty_like(x), buffer=x.new_empty(0))
+
+        self.assertFalse(any(isinstance(c, EagerCall) for _, c in trace(fn, (_randn(m, 768),)).launches))
+        entry = HostTraceReplay(fn)
+        for n in (m, 7, m):
+            x = _randn(n, 768)
+            self.assertEqual(entry(x), fn(x), atol=0, rtol=0)
+        self.assertEqual(entry.eager, 0)
+
+    def test_empty_argument_launches_nothing(self):
+        def fn(x, y):
+            return x * 2, y.neg()
+
+        tape = trace(fn, (_randn(0, 64), _randn(8, 64)))
+        self.assertEqual([type(c) for _, c in tape.launches], [KernelLaunch])
+        entry = HostTraceReplay(fn)
+        for m in (0, 0, 5, 0):
+            x, y = _randn(m, 64), _randn(8, 64)
+            self.assertEqual(entry(x, y), fn(x, y), atol=0, rtol=0)
+        self.assertEqual((entry.traces, entry.eager), (2, 0))
+
+    @parametrize("dtype", [torch.float16, torch.float32])
+    @parametrize("case", list(CATS) + list(INDEXING))
+    def test_cat_and_indexing_replay_new_shapes(self, dtype, case):
+        fn, args_fn = {**CATS, **INDEXING}[case]
+        entry = HostTraceReplay(fn)
+        for h in (4096, 768):
+            for m in (16, 7, 1, 5):
+                self._assert_replays_eager_calls(entry, fn, args_fn(m, h, dtype))
+        self.assertEqual(entry.eager, 0)
+
+    @parametrize("dtype", [torch.float16, torch.float32])
+    @parametrize("case", list(CATS) + list(INDEXING))
+    @parametrize("m", [16, 1])
+    def test_cat_and_indexing_records_match_eager(self, dtype, case, m):
+        fn, args_fn = {**CATS, **INDEXING}[case]
+
+        def unread(node, launch):
+            pointwise = "elementwise_kernel" in node.name
+            return _unread(node, launch, 0) if pointwise else _zeros(launch)
+
+        self._assert_records_match_eager(fn, args_fn(m, 768, dtype), unread)
 
     @parametrize("case", list(DECLINES))
     def test_decline_is_an_eager_call(self, case):
@@ -417,18 +780,39 @@ class TestHostTraceAten(TestCase):
         entry(*args)
         self.assertEqual(entry(*args), fn(*args), atol=0, rtol=0)
 
-    def test_rms_norm_under_a_native_override_is_an_eager_call(self):
+    @parametrize("h", [768, 8192])
+    def test_rms_norm_under_a_native_override_traces_its_kernel(self, h):
+        # the torch._native override runs under the trace: its CuTe DSL launch is on the tape
         from torch._native.registry import _aten_override_libs
 
         if ("_fused_rms_norm", "CUDA") not in _aten_override_libs:
             self.skipTest("no torch._native _fused_rms_norm override")
-        fn = NORMS["rms_norm"][0](768)
-        args = _norm_inputs("rms_norm", 64, 768, torch.float16)
-        self.assertEqual([type(c) for _, c in trace(fn, tuple(args)).launches], [EagerCall])
+        fn = NORMS["rms_norm"][0](h)
+        args = _norm_inputs("rms_norm", 64, h, torch.float16)
+        self.assertEqual([type(c) for _, c in trace(fn, tuple(args)).launches], [KernelLaunch])
+
+    def test_rms_norm_of_a_new_hidden_size_under_a_native_override_compiles_under_the_trace(self):
+        # the override reads the hidden size as an int (a guard), so quack's
+        # CuTe DSL compile of a new one at a later trace succeeds
+        import torch._vendor.quack.cache as quack_cache
+        from torch._native.registry import _aten_override_libs
+
+        if ("_fused_rms_norm", "CUDA") not in _aten_override_libs:
+            self.skipTest("no torch._native _fused_rms_norm override")
+
+        def fn(x, w):
+            return F.rms_norm(x, x.shape[-1:], w, 1e-6)
+
+        entry = HostTraceReplay(fn)
+        with mock.patch.object(quack_cache, "CACHE_ENABLED", False):
+            for m, h in ((64, 768), (64, 1280), (64, 1280), (7, 1280)):
+                x, w = torch.randn(m, h, device="cuda", dtype=torch.float16), torch.randn(h, device="cuda", dtype=torch.float16)
+                self.assertEqual(entry(x, w), fn(x, w), atol=0, rtol=0)
+        self.assertEqual((entry.traces, entry.replays, entry.eager), (2, 3, 0))
 
     @parametrize("native", [False, True])
     def test_rms_norm_of_a_symbolic_shape_replays(self, native):
-        # rms_norm hands _fused_rms_norm (int[] normalized_shape) the traced
+        # rms_norm hands _fused_rms_norm (SymInt[] normalized_shape) the traced
         # symbolic size, which an eager call replays with
         from torch._native.registry import _aten_override_libs
 
@@ -444,8 +828,24 @@ class TestHostTraceAten(TestCase):
             for m in (64, 7, 300):
                 x = torch.randn(m, 768, device="cuda", dtype=torch.float16)
                 self.assertEqual(entry(x, w), fn(x, w), atol=0, rtol=0)
-            # the torch._native override's Python host guards on the row count
-            self.assertEqual(entry.traces, 3 if native else 1)
+            self.assertEqual((entry.traces, entry.eager), (1, 0))
+
+    def test_bmm_outer_product_under_a_native_override_traces_its_triton_kernel(self):
+        # the override passes its read-only inputs to the launch in ConstTensorWrapper
+        from torch._native.registry import _aten_override_libs
+
+        if ("bmm", "CUDA") not in _aten_override_libs:
+            self.skipTest("no torch._native bmm override")
+
+        def make(m, n):
+            return torch.randn(8, m, 1, device="cuda", dtype=torch.bfloat16), torch.randn(8, 1, n, device="cuda", dtype=torch.bfloat16)
+
+        self.assertEqual([type(c) for _, c in trace(torch.bmm, make(64, 128)).launches], [KernelLaunch])
+        entry = HostTraceReplay(torch.bmm)
+        for m, n in ((64, 128), (64, 128), (32, 256)):
+            a, b = make(m, n)
+            self.assertEqual(entry(a, b), torch.bmm(a, b), atol=0, rtol=0)
+        self.assertEqual(entry.eager, 0)
 
     def test_copy_between_arguments_checks_overlap_at_replay(self):
         # arguments disjoint at the trace share storage at the third call: the
@@ -553,6 +953,81 @@ class TestHostTraceAten(TestCase):
             self.assertEqual(out.stride(), ref.stride())
         self.assertEqual(entry.eager, 0)
         self.assertTrue(all(isinstance(c, KernelLaunch) for _, c in trace(fn, (x, r)).launches))
+
+    def test_softmax_brackets_redispatch_into_one_variant(self):
+        # each softmax's dim bracket picks its kernel under its own guards:
+        # another bracket dispatches that softmax again as an entry, with no
+        # trace, and a call mixing brackets replays both entries
+        def fn(x, y):
+            return torch.softmax(x, -1), torch.softmax(y, -1)
+
+        entry = HostTraceReplay(fn)
+        for hx, hy in ((600, 600), (100, 600), (600, 100), (100, 100), (90, 700)):
+            x = torch.randn(64, hx, device="cuda")
+            y = torch.randn(7, hy, device="cuda")
+            out, ref = entry(x, y), fn(x, y)
+            self.assertEqual(out, ref, atol=0, rtol=0)
+        self.assertEqual((entry.traces, entry.redispatches, len(entry.variants), entry.eager), (1, 2, 1, 0))
+        self.assertEqual((entry.fold_refusals, entry.redispatch_refusals), ({}, {}))
+
+    def test_redispatched_entry_fails_at_no_other_call(self):
+        # the transposed input's launches divide by a value that is 0 at the
+        # first call's shape: its entry's rows fail at no other call
+        def fn(x):
+            return torch.var(x.float(), -1, keepdim=True)
+
+        entry = HostTraceReplay(fn)
+        for x in (torch.randn(2, 33), torch.randn(1024, 64).t(), torch.randn(2, 33)):
+            x = x.to("cuda", torch.bfloat16)
+            self.assertEqual(entry(x), fn(x), atol=0, rtol=0)
+        self.assertEqual((entry.traces, entry.redispatches, len(entry.variants), entry.eager), (1, 1, 1, 0))
+
+    def test_output_metadata_guards_are_the_graphs(self):
+        # where's output size is its first operand's, or another's where the
+        # first broadcasts: the op's metadata changed, so neither its dispatch
+        # again nor a fold takes it, and it is another variant
+        entry = HostTraceReplay(torch.where)
+        for mc in (64, 1, 64, 1):
+            c = torch.randn(mc, 256, device="cuda") > 0
+            x, y = torch.randn(64, 256, device="cuda"), torch.randn(64, 256, device="cuda")
+            self.assertEqual(entry(c, x, y), torch.where(c, x, y), atol=0, rtol=0)
+        self.assertEqual((entry.traces, entry.folds, len(entry.variants), entry.eager), (2, 0, 2, 0))
+        self.assertEqual(list(entry.redispatch_refusals), ["aten.where.self allocates otherwise"])
+        self.assertEqual(list(entry.fold_refusals), ["aten.where.self returned other metadata"])
+
+    def test_a_new_key_is_harvested_without_a_relower(self):
+        # once a variant binds the matmul's keys, a key it does not bind is
+        # harvested on the spot and added as the site's row: no trace, no relower
+        def fn(x, w):
+            return F.silu(x @ w)
+
+        w = torch.randn(256, 512, device="cuda", dtype=torch.bfloat16)
+        entry = HostTraceReplay(fn, opaque=(HarvestProvider(),))
+        for m in (1, 2, 3, 4, 5, 3, 7, 9, 7):
+            x = torch.randn(m, 256, device="cuda", dtype=torch.bfloat16)
+            self.assertEqual(entry(x, w), fn(x, w), atol=0, rtol=0)
+        self.assertEqual((entry.traces, entry.relowers, entry.learned, entry.eager), (2, 1, 2, 0))
+
+    def test_fold_refuses_another_launch_chain(self):
+        # layer_norm is one vectorized kernel at h % 4 == 0, else two
+        fn = NORMS["layer_norm_no_affine"][0](None)
+        entry = HostTraceReplay(fn)
+        for h in (768, 767, 768, 767):
+            self._assert_norm_replays_like_eager(entry, fn, _norm_inputs("layer_norm_no_affine", 64, h, torch.float32))
+        self.assertEqual((entry.traces, entry.folds, len(entry.variants), entry.eager), (2, 0, 2, 0))
+        self.assertEqual(list(entry.fold_refusals), ["another op sequence"])
+
+    @unittest.skipIf(not PLATFORM_SUPPORTS_FLASH_ATTENTION, "requires flash attention")
+    def test_default_sdpa_scale(self):
+        # flash takes 1 / sqrt(head_dim) as a double guarded under the trace:
+        # one trace per head_dim, replayed across sequence lengths
+        entry = HostTraceReplay(F.scaled_dot_product_attention, opaque=(HarvestProvider(("attention",)),))
+        with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+            for d, s, traces in [(64, 128, 1), (64, 96, 1), (128, 200, 2), (128, 64, 2)]:
+                q, k, v = (torch.randn(2, 8, s, d, device="cuda", dtype=torch.bfloat16) for _ in range(3))
+                out = entry(q, k, v)
+                self.assertEqual(out, F.scaled_dot_product_attention(q, k, v), atol=0, rtol=0)
+                self.assertEqual((entry.traces, entry.eager), (traces, 0))
 
 
 instantiate_parametrized_tests(TestHostTraceAten)

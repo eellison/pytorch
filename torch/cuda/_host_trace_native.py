@@ -13,15 +13,16 @@ a Triton launch, calls its Python callback); drop what the plan drops; and
 build the outputs. HostTraceReplay's base, torch._C._HostTraceEntry, calls it
 without entering Python on a hit.
 
-A launch is one record kind of two, the shape of a KernelLaunch and a
-Memset as lowered:
+A launch is one record kind of three, the shape of a KernelLaunch, a
+Memset and a Memcpy as lowered:
   (0, node, function, block rows, smem row, grid rows, per-parameter template
    images, fields ((param, offset, width, is pointer, row, base, delta),
    ...), descriptors ((param, first field, dtype, box, swizzle), ...),
    philox fields ((param, offset, kind, delta), ...), philox increment)
   (1, node, dst (row, base, delta), value, element size, width row, height
    row, pitch row)
-A field or dst with base -1 is its row's value plus delta; otherwise the
+  (2, node, dst (row, base, delta), src (row, base, delta), bytes row)
+A field, dst or src with base -1 is its row's value plus delta; otherwise the
 base's address plus the row's and delta. A 4-byte pointer field is the
 address's low half; a 0-byte field only feeds a descriptor. A philox
 field's kind indexes _PHILOX: its segment's captured seed or offset address,
@@ -42,6 +43,7 @@ import torch
 import torch.utils._pytree as pytree
 from torch.cuda._host_trace import declined
 from torch.cuda._host_trace_lower_tape import (
+    LoweredMemcpy,
     LoweredMemset,
     LoweredView,
     PredictedOutput,
@@ -53,7 +55,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
 
     from torch.cuda._host_trace_capture import CapturedTape
-    from torch.cuda._host_trace_lower_tape import LoweredEagerCall, LoweredKeyedSite
+    from torch.cuda._host_trace_lower_tape import LoweredEagerCall, LoweredKeyedSite, LoweredLaunch
     from torch.cuda._host_trace_memory import MemoryPlan
     from torch.cuda._host_trace_opaque import OpaqueBinding, Slot
 
@@ -84,7 +86,9 @@ class VariantSpec(NamedTuple):
     disagreement: type[AssertionError]
     replay_hooks: tuple  # the global replay (start, end) hooks
     traced: tuple  # (rows, bases) at the traced call, which the nodes hold
-    sites: tuple  # per keyed site (key rows, record indices)
+    # per keyed site (key rows, record indices, scratch allocations), then per
+    # selector ((), record indices, (), predicate row)
+    sites: tuple
     argument_pairs: tuple  # Tape.argument_pairs
 
 
@@ -113,29 +117,7 @@ def flatten_variant(
             views.append((*ref(v.base), v.sizes, v.strides, v.offset, v.dtype))
         return view_index[id(v)]
 
-    launches: list[tuple] = []
-    for c in captured.launches:
-        lo = c.launch
-        if isinstance(lo, LoweredMemset):
-            m = lo.launch
-            shape = (lo.width, lo.height, lo.pitch)
-            launches.append((1, c.node, _source(lo.slots[0]), m.value, m.element_size, *shape))
-            continue
-        t = lo.launch
-        fields = []
-        for i, slot in enumerate(lo.slots):
-            if t.fields is None:
-                param, offset, width = i, 0, t.layout[i][1]
-            elif i < len(t.fields):
-                param, offset, width = t.fields[i]
-            else:
-                param, offset, width = 0, 0, 0
-            fields.append((param, offset, width, not isinstance(slot, ScalarSlot), *_source(slot)))
-        images = t.images or tuple(bytes(size) for _, size in t.layout)
-        descriptors = tuple((d.param, d.first, d.dtype, d.box, d.swizzle) for d in t.descriptors)
-        kernel = (t.function, lo.block, lo.smem, lo.grid)
-        philox = tuple((param, at, _PHILOX.index(kind), delta) for param, at, kind, delta in t.rng)
-        launches.append((0, c.node, *kernel, images, tuple(fields), descriptors, philox, t.rng_increment))
+    launches = [(row[0], c.node, *row[1:]) for c in captured.launches for row in [launch_row(c.launch)]]
     allocations = tuple(
         (a.sizes, a.strides, a.dtype, a.nbytes) for a in lowered.allocations
     )
@@ -187,9 +169,38 @@ def flatten_variant(
         disagreement,
         (graphs._global_replay_start_hooks, graphs._global_replay_end_hooks),
         (tuple(traced[0]), tuple(traced[1])),
-        tuple((site.rows, site.nodes, tuple(site.scratch[j][1] for j in sorted(site.scratch))) for site in lowered.sites),
+        (
+            *((site.rows, site.nodes, tuple(site.scratch[j][1] for j in sorted(site.scratch))) for site in lowered.sites),
+            *(((), s.nodes, (), s.predicate) for s in lowered.selectors),
+        ),
         lowered.tape.argument_pairs,
     )
+
+
+def launch_row(lo: LoweredLaunch | LoweredMemset | LoweredMemcpy) -> tuple:
+    """A launch as rows: (0, function, block, smem, grid, images, fields,
+    descriptors, philox fields, philox increment) for a kernel, (1, dst,
+    value, element size, width, height, pitch) for a memset, (2, dst, src,
+    bytes) for a memcpy."""
+    if isinstance(lo, LoweredMemset):
+        m = lo.launch
+        return (1, _source(lo.slots[0]), m.value, m.element_size, lo.width, lo.height, lo.pitch)
+    if isinstance(lo, LoweredMemcpy):
+        return (2, *map(_source, lo.slots), lo.nbytes)
+    t = lo.launch
+    fields = []
+    for i, slot in enumerate(lo.slots):
+        if t.fields is None:
+            param, offset, width = i, 0, t.layout[i][1]
+        elif i < len(t.fields):
+            param, offset, width = t.fields[i]
+        else:
+            param, offset, width = 0, 0, 0
+        fields.append((param, offset, width, not isinstance(slot, ScalarSlot), *_source(slot)))
+    images = t.images or tuple(bytes(size) for _, size in t.layout)
+    descriptors = tuple((d.param, d.first, d.dtype, d.box, d.swizzle) for d in t.descriptors)
+    philox = tuple((param, at, _PHILOX.index(kind), delta) for param, at, kind, delta in t.rng)
+    return (0, t.function, lo.block, lo.smem, lo.grid, images, tuple(fields), descriptors, philox, t.rng_increment)
 
 
 def _source(slot: Any) -> tuple[int, int, int]:
@@ -241,8 +252,9 @@ def _boxed(step: LoweredEagerCall) -> tuple | None:
     """The step's call for the boxed dispatcher: (schema name, overload name,
     per schema argument (0, constant) | (1, leaf) | (2, ((is leaf, leaf or
     constant), ...)) | (3,) its default, per returned tensor (True, root,
-    sizes, strides, offset, dtype) | (False, the leaf it is), the operator);
-    None for a target without a schema. The C++ declines what else it cannot
+    sizes, strides, offset, dtype) | (False, the leaf it is), the operator,
+    the library_state() it runs under or None); None for a target without a
+    schema. The C++ declines what else it cannot
     express."""
     target = step.call.target
     # a graphsafe RNG step swaps in its generator's state around the call, which the boxed call cannot
@@ -287,7 +299,7 @@ def _boxed(step: LoweredEagerCall) -> tuple | None:
         else (False, p)
         for p in step.outputs
     )
-    return (schema.name, schema.overload_name, tuple(args), outputs, target)
+    return (schema.name, schema.overload_name, tuple(args), outputs, target, step.call.state or None)
 
 
 def native_variant(spec: VariantSpec) -> torch._C._HostTraceVariant:

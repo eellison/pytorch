@@ -22,7 +22,8 @@ from torch.cuda._host_trace_opaque import (
     Slot,
 )
 from torch.cuda._host_trace_replay import HostTraceReplay
-from torch.cuda._host_trace_tape import EagerCall, Memset, OpaqueCall, trace
+from torch.cuda._host_trace_memory import plan_memory, split_runs
+from torch.cuda._host_trace_tape import bind_opaque, EagerCall, Memset, OpaqueCall, trace
 from torch.cuda._host_trace_triton import param_layout, triton_abi
 from torch.testing._internal.common_utils import (
     instantiate_parametrized_tests,
@@ -183,6 +184,40 @@ def plan_errors(v):
     return errors
 
 
+def lowered_rows(lowered):
+    """A lowered tape's rows and records, without its symbols' hints (an
+    allocation's or eager output's placeholder address)."""
+
+    def launch(lo):
+        r = lo.launch
+        if isinstance(lo, LoweredMemset):
+            return (lo.seq, r.name, lo.slots, lo.width, lo.height, lo.pitch, r.value, r.element_size)
+        fixed = (r.function, r.layout, r.fields, r.pointers, r.images, r.attributes, r.programmatic, r.rng, r.rng_increment)
+        return (lo.seq, r.name, lo.slots, lo.grid, lo.block, lo.smem, *fixed)
+
+    def step(s):
+        if isinstance(s, range):
+            return s
+        return (s.seq, s.call.name, s.spec, s.flat, s.leaves, s.outputs, s.grid)
+
+    def site(s):
+        scratch = {j: n for j, (_, n) in s.site.scratch.items()}
+        return (s.site.op, s.dtypes, s.ranks, s.rows, s.operands, s.scratch, s.nodes, s.site.topology, s.site.rng, scratch)
+
+    opaque = {i: (o.op, o.dtypes, o.ranks, o.rows, o.scalars) for i, o in lowered.opaque.items()}
+    return (
+        lowered.program.instructions,
+        lowered.valid,
+        lowered.allocations,
+        [launch(lo) for lo in lowered.launches],
+        [step(s) for s in lowered.steps],
+        len(lowered.eager_roots),
+        lowered.outputs,
+        opaque,
+        [site(s) for s in lowered.sites],
+    )
+
+
 def bound(f):
     """The variants that launch an opaque call's binding."""
     return [v for v in f.variants if not v.captured.lowered.opaque]
@@ -246,15 +281,15 @@ class TestOpaqueCalls(TestCase):
         self.assertIsNotNone(p.table[key])
         # the fresh output holds the eager result the provider learned from
         self.assertEqual(operands[2], add(x) * y)
-        # the key bound at the third call, which traced it again as launches
-        self.assertEqual((f.traces, len(bound(f))), (2, 1))
+        # the key bound at the third call, which relowered the tape with it as launches
+        self.assertEqual((f.traces, f.relowers, len(bound(f))), (1, 1, 1))
         records = [r for _, r in bound(f)[0].tape.launches]
         self.assertFalse(any(isinstance(r, EagerCall) for r in records))
         self.assertIn("aten.mul.Tensor node 0", [r.name for r in records])
         x2, y2 = torch.randn(640, device="cuda"), torch.randn(640, device="cuda")
         self.assertEqual(f(x2, y2), mul_chain(x2, y2))
         self.assertEqual(len(p.learned), 2)
-        self.assertEqual(f.traces, 2)
+        self.assertEqual((f.traces, f.relowers), (1, 1))
 
     def test_a_refused_key_stays_eager(self):
         p = TableProvider()
@@ -287,7 +322,7 @@ class TestOpaqueCalls(TestCase):
         x, y = torch.randn(512, device="cuda"), torch.randn(512, device="cuda")
         for _ in range(6):
             self.assertEqual(f(x, y), mul_chain(x, y), atol=0, rtol=0)
-        self.assertEqual((f.traces, len(bound(f))), (2, 1))
+        self.assertEqual((f.traces, f.relowers, len(bound(f))), (1, 1, 1))
         (variant,) = bound(f)
         (launch,) = [r for _, r in variant.tape.launches if r.owner is p]
         self.assertTrue(launch.programmatic)
@@ -306,7 +341,7 @@ class TestOpaqueCalls(TestCase):
         x, y = torch.randn(512, device="cuda"), torch.randn(512, device="cuda")
         for _ in range(6):
             self.assertEqual(f(x, y), mul_chain(x, y), atol=0, rtol=0)
-        self.assertEqual((f.traces, len(bound(f))), (2, 1))
+        self.assertEqual((f.traces, f.relowers, len(bound(f))), (1, 1, 1))
         (segment,) = bound(f)[0].captured.segments
         nodes = graph_nodes(segment.graph.raw_cuda_graph())
         self.assertEqual([n.attribute("COOPERATIVE") for n in nodes], [0, 1, 0])
@@ -331,7 +366,7 @@ class TestOpaqueCalls(TestCase):
         x, y = torch.randn(512, device="cuda"), torch.randn(512, device="cuda")
         for _ in range(6):
             self.assertEqual(f(x, y), mul_chain(x, y), atol=0, rtol=0)
-        self.assertEqual((f.traces, len(bound(f))), (2, 1))
+        self.assertEqual((f.traces, f.relowers, len(bound(f))), (1, 1, 1))
         (segment,) = bound(f)[0].captured.segments
         nodes = graph_nodes(segment.graph.raw_cuda_graph())
         self.assertEqual([n.attribute("ACCESS_POLICY_WINDOW") == raw for n in nodes], [False, True, False])
@@ -399,7 +434,7 @@ class TestOpaqueCalls(TestCase):
         p = TableProvider(rng_sizes=(700, 900, 1100))
         f = HostTraceReplay(mul_chain, opaque=(p,))
         gen = torch.cuda.default_generators[0]
-        for n, traces in ((700, 2), (900, 2), (1100, 2), (1300, 3)):
+        for n, traces in ((700, 1), (900, 1), (1100, 1), (1300, 2)):
             x, y = torch.randn(n, device="cuda"), torch.randn(n, device="cuda")
             for _ in range(3):
                 offset = gen.get_offset()
@@ -409,27 +444,24 @@ class TestOpaqueCalls(TestCase):
         self.assertEqual(len(bound(f)), 2)
 
     def test_decline_reasons(self):
-        x = torch.randn(512, device="cuda")
+        args = (torch.randn(32, 16, device="cuda"), torch.randn(16, 8, device="cuda"), torch.randn(8, device="cuda"))
 
-        def fn(x):
+        def fn(x, w, v):
             h = add(x)
-            return add(torch.mul(h.half(), h) - h)
+            return add(torch.mv(torch.mm(h.half(), w.half()).float(), v))
 
-        tape = trace(fn, (x,), opaque=(TableProvider(),))
+        tape = trace(fn, args, opaque=(TableProvider(ops=(aten.mm.default,)),))
         eager = [rec for _, rec in tape.launches if isinstance(rec, EagerCall)]
         calls = {str(rec.target): rec for rec in eager}
         self.assertFalse(any(isinstance(c, OpaqueCall) for c in calls.values()))
-        self.assertEqual(calls["aten.mul.Tensor"].reason, "TableProvider: float32 only")
-        self.assertEqual(
-            calls["aten.sub.Tensor"].reason,
-            "TableProvider: aten.sub.Tensor is not in its table",
-        )
+        self.assertEqual(calls["aten.mm.default"].reason, "TableProvider: float32 only")
+        self.assertEqual(calls["aten.mv.default"].reason, "TableProvider: aten.mv.default is not in its table")
         self.assertEqual(lower_tape(tape).opaque, {})
-        plain = trace(fn, (x,))
+        plain = trace(fn, args)
         calls = [rec for _, rec in plain.launches if isinstance(rec, EagerCall)]
         self.assertTrue(all(type(c) is EagerCall and c.reason is None for c in calls))
 
-    def test_an_out_overlapping_an_operand_is_eager(self):
+    def test_an_out_overlapping_an_operand_is_not_bound(self):
         x = torch.randn(512, device="cuda")
 
         def fn(x):
@@ -439,8 +471,8 @@ class TestOpaqueCalls(TestCase):
             return torch.mul(y, h, out=torch.empty_like(y))
 
         tape = trace(fn, (x,), opaque=(TableProvider(ops=(aten.mul.out,)),))
-        reasons = [rec.reason for _, rec in tape.launches if type(rec) is EagerCall]
-        self.assertEqual(reasons, ["aten.mul.out writes a storage another operand is of"])
+        # the pointwise host traces the overlapping mul; only the other binds
+        self.assertFalse(any(type(rec) is EagerCall for _, rec in tape.launches))
         self.assertEqual(len(lower_tape(tape).opaque), 1)
 
     def test_an_out_argument_overlapping_at_replay_runs_eagerly(self):
@@ -499,15 +531,15 @@ class TestOpaqueCalls(TestCase):
         return f, w
 
     def assertNativeRow(self, f, w, m):
-        # a new key: the learner's call harvests it, the next call's fill
-        # adds its row, then the native entry serves it with no retrace
+        # a new key: the first call's fill harvests it and adds its row,
+        # then the native entry serves it with no retrace
         traces, harvests = f.traces, f.opaque[0].harvests
         slow_path = HostTraceReplay._call_slow
         with mock.patch.object(HostTraceReplay, "_call_slow", autospec=True, side_effect=slow_path) as slow:
             for _ in range(5):
                 x = torch.randn(m, 256, device="cuda", dtype=torch.bfloat16)
                 self.assertEqual(f(x, w), mm_chain(x, w), atol=0, rtol=0)
-        self.assertEqual((slow.call_count, f.traces, f.opaque[0].harvests), (2, traces, harvests + 1))
+        self.assertEqual((slow.call_count, f.traces, f.opaque[0].harvests), (1, traces, harvests + 1))
 
     def test_a_new_key_at_a_keyed_site_is_a_native_row(self):
         f, w = self.mm_rows((64, 96))
@@ -558,7 +590,7 @@ class TestOpaqueCalls(TestCase):
         x, y = torch.randn(512, device="cuda"), torch.randn(512, device="cuda")
 
         def fn(x, y):
-            return add(torch.sub(add(torch.mul(add(x), y)), y))
+            return add(torch.cumsum(add(torch.mul(add(x), y)), 0))
 
         lowered = lower_tape(trace(fn, (x, y), opaque=(TableProvider(),)))
         kinds = [type(s).__name__ for s in lowered.steps]
@@ -579,7 +611,7 @@ class TestOpaqueCalls(TestCase):
         # a binding of every size is a row of the bound variant's table, its
         # scratch buffer allocated at the key's bytes
         self.assertEqual(len(bound(f)), 1)
-        self.assertEqual(f.traces, 2)
+        self.assertEqual((f.traces, f.relowers), (1, 1))
         for v in bound(f):
             kinds = {type(lo).__name__ for lo in v.captured.lowered.launches}
             self.assertEqual("LoweredMemset" in kinds, style == "scratch")
@@ -604,16 +636,53 @@ class TestOpaqueCalls(TestCase):
             self.assertEqual(f(x, y), mul_chain(x, y), atol=0, rtol=0)
         self.assertEqual((f.traces, f.replays), (traces, replays + 24))
 
-    def test_topology_cap(self):
-        # past max_variants a key that binds stays an eager call
+    def test_bound_key_relowers(self):
+        # a key that binds after the trace relowers the tape with its binding
         p = TableProvider(style="scratch")
-        f = HostTraceReplay(mul_chain, opaque=(p,), max_variants=2)
+        f = HostTraceReplay(mul_chain, opaque=(p,))
         for n in (512, 640):
             for _ in range(4):
                 x, y = torch.randn(n, device="cuda"), torch.randn(n, device="cuda")
                 self.assertEqual(f(x, y), mul_chain(x, y), atol=0, rtol=0)
-        self.assertEqual((f.traces, len(f.variants), len(bound(f))), (2, 2, 1))
+        self.assertEqual((f.traces, f.relowers, len(f.variants), len(bound(f))), (1, 1, 2, 1))
         self.assertEqual(sum(b is not None for b in p.table.values()), 2)
+
+    @parametrize("provider", ["table", "harvest"])
+    @parametrize("learned", ["both", "first"])
+    def test_relowered_tape_is_the_bound_trace(self, provider, learned):
+        # a learner's tape with its now-bound keys bound (bind_opaque) lowers
+        # and plans as the trace at the same call with them bound; the first
+        # call's output feeds the second, a launch and the call's result
+        if provider == "table":
+            p = TableProvider(style="scratch")
+            op, k = torch.mul, 512
+            args = (torch.randn(1024, device="cuda"), torch.randn(1024, device="cuda"), torch.randn(k, device="cuda"))
+        else:
+            p = HarvestProvider()
+            op, k = torch.mm, 128
+            args = tuple(torch.randn(256, 256, device="cuda", dtype=torch.bfloat16) for _ in range(3))
+
+        def fn(x, y, z):
+            m = op(add(x), y)
+            return m, add(op(m[:k], z))
+
+        learner = trace(fn, args, opaque=(p,))
+        f = HostTraceReplay(fn if learned == "both" else lambda x, y, z: op(add(x), y), opaque=(p,))
+        for _ in range(3):
+            f(*args)  # the eager steps learn the keys
+        learner.release_args()
+        calls = [r for _, r in learner.launches if isinstance(r, OpaqueCall)]
+        self.assertEqual(len(calls), 2)
+        wanted = calls if learned == "both" else calls[:1]
+        relowered, sites = bind_opaque(learner, {id(c) for c in wanted})
+        fresh = trace(fn, args, opaque=(p,))
+        self.assertEqual(len(sites), len(wanted))
+        self.assertEqual(sum(isinstance(r, OpaqueCall) for _, r in fresh.launches), 2 - len(wanted))
+        self.assertEqual([str(g) for g in relowered.guards], [str(g) for g in fresh.guards])
+        a, b = lower_tape(relowered), lower_tape(fresh)
+        self.assertEqual(lowered_rows(a), lowered_rows(b))
+        self.assertEqual(plan_memory(a), plan_memory(b))
+        self.assertEqual(split_runs(a, ())[1], split_runs(b, ())[1])
 
     def test_memory_plan(self):
         p = TableProvider(style="scratch")
@@ -632,7 +701,8 @@ class TestOpaqueCalls(TestCase):
             self.assertEqual(plan_errors(v), [])
         tape = bound(f)[0].tape
         (memset,) = [r for _, r in tape.launches if isinstance(r, Memset)]
-        kernels = [r for _, r in tape.launches if isinstance(r, KernelLaunch) and r.fields]
+        # the binding's kernels; sin is traced by the pointwise host
+        kernels = [r for _, r in tape.launches if isinstance(r, KernelLaunch) and r.name.startswith("aten.mul")]
         self.assertEqual([k.name for k in kernels], ["aten.mul.Tensor node 1", "aten.mul.Tensor node 2"])
         self.assertEqual(kernels[0].fields, ((0, 0, 8), (1, 0, 8), (2, 0, 8)))
         # the scratch buffer is a temporary of the run, the output a tensor

@@ -36,6 +36,14 @@ using StrideVector = TensorIteratorBase::StrideVector;
 namespace ti_build = detail::ti_build;
 
 namespace {
+thread_local std::vector<ti_build::BuiltIterator>* built_iterators = nullptr;
+} // namespace
+
+std::vector<ti_build::BuiltIterator>* ti_build::record_built_iterators(std::vector<ti_build::BuiltIterator>* into) {
+  return std::exchange(built_iterators, into);
+}
+
+namespace {
 
 inline void get_base_ptrs(char** ptrs, ArrayRef<OperandInfo> operands) {
   std::transform(operands.begin(), operands.end(), ptrs, [](const OperandInfo& op) {
@@ -1122,6 +1130,13 @@ void TensorIteratorBase::build(TensorIteratorConfig& config) {
     } else {
       op.data = op.tensor_base().mutable_data_ptr();
     }
+  }
+  if (C10_UNLIKELY(built_iterators != nullptr)) {
+    std::vector<TensorBase> tensors;
+    for (const auto& op : operands_) {
+      tensors.push_back(op.tensor_base());
+    }
+    built_iterators->push_back({std::move(tensors), num_outputs_, numel(), common_dtype_, is_reduction_});
   }
 
   // zero out offsets

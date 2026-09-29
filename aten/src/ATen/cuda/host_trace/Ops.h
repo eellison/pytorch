@@ -6,10 +6,13 @@
 
 #include <ATen/core/TensorBase.h>
 #include <c10/core/Scalar.h>
+#include <c10/core/ScalarType.h>
+#include <c10/util/ArrayRef.h>
 
 #include <optional>
 #include <string_view>
 #include <tuple>
+#include <vector>
 
 namespace at::cuda::host_trace {
 
@@ -35,5 +38,13 @@ TORCH_CUDA_CU_API TensorBase log_softmax(Recorder& rec, const TensorBase& self, 
 TORCH_CUDA_CU_API std::tuple<TensorBase, TensorBase, TensorBase> native_layer_norm(Recorder& rec, const TensorBase& input, int64_t normalized_ndim, const TensorBase& weight, const TensorBase& bias, double eps);
 // (output, rstd)
 TORCH_CUDA_CU_API std::tuple<TensorBase, TensorBase> fused_rms_norm(Recorder& rec, const TensorBase& input, int64_t normalized_ndim, const TensorBase& weight, std::optional<double> eps);
+// a pointwise op's gpu_kernel, gpu_kernel_multiple_outputs or
+// jitted_gpu_kernel launch as the kernel node `node` of a capture of the op
+// launched it (name its kernel's name; empty for no launch): inputs are its
+// TensorIterator's inputs, outs its outputs, each where the op writes an
+// argument, else undefined; compute_dtype the iterator's common dtype
+TORCH_CUDA_CU_API std::vector<TensorBase> pointwise(Recorder& rec, c10::ArrayRef<TensorBase> outs, c10::ArrayRef<c10::ScalarType> out_dtypes, c10::ArrayRef<TensorBase> inputs, c10::ScalarType compute_dtype, std::string_view name, KernelRecord node);
+TORCH_CUDA_CU_API TensorBase index_select(Recorder& rec, const TensorBase& self, int64_t dim, const TensorBase& index);
+TORCH_CUDA_CU_API TensorBase cat(Recorder& rec, c10::ArrayRef<TensorBase> tensors, int64_t dim);
 
 } // namespace at::cuda::host_trace

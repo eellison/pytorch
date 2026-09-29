@@ -7,9 +7,10 @@ bound: the provider returns the kernels and memsets the call launches for
 exactly that key (OpaqueBinding), or None. On a miss the call runs eagerly,
 as any eager call, and the provider may then learn the key from that run. A
 binding's slots say which bytes of a node are an operand's or a scratch
-buffer's address. Global library state (cuBLAS reduced-precision flags, the
-SM carveout) is not in the key: a binding learned under one state serves
-under another.
+buffer's address. The global cuBLAS state eager read at the traced call
+(library_state) is in the key, and the call's eager runs and its learning
+run under it: a call keeps the math mode it was traced under, whatever the
+state at a replay.
 
 A call whose key binds at trace time (bind_at_trace) is the binding itself
 (record_binding): each kernel a KernelLaunch whose `fields` place its slots
@@ -21,7 +22,7 @@ of the site's topology runs on the site's nodes, one of another topology on
 an arm of the site, nodes added beside the site's own in its graph, of which
 the key's row enables one. Each scratch buffer takes the key's bytes when a
 replay allocates it, as eager's call would. A replay skips a variant whose
-OpaqueCall now binds and traces again, below its max_variants.
+OpaqueCall now binds and traces again.
 
 A binding that consumes philox offsets (an RNG call) is a KeyedSite of RNG
 bindings of its topology: a replay packs each RNG kernel's generator state,
@@ -38,6 +39,7 @@ its data_ptr(), storage offset included.
 
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass
 from typing import Any, Protocol, TYPE_CHECKING
 
@@ -46,6 +48,8 @@ from torch.utils import _pytree as pytree
 
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     from torch._ops import OpOverload
     from torch.cuda._host_trace_tape import _Trace
 
@@ -64,6 +68,38 @@ class OpaqueKey:
     align: tuple[int, ...]
     scalars: tuple  # the non-tensor leaves, in leaf order, SymInts as ints
     device: int  # the operands' device: a binding's functions are loaded in its context
+    state: tuple  # library_state() at the traced call
+
+
+_STATE = (
+    (lambda: torch._C._get_fp32_precision_getter("cuda", "matmul"), lambda v: torch._C._set_fp32_precision_setter("cuda", "matmul", v)),
+    (torch._C._get_cublas_allow_fp16_reduced_precision_reduction, lambda v: torch._C._set_cublas_allow_fp16_reduced_precision_reduction(*v)),
+    (torch._C._get_cublas_allow_bf16_reduced_precision_reduction, lambda v: torch._C._set_cublas_allow_bf16_reduced_precision_reduction(*v)),
+    (torch._C._get_cublas_allow_fp16_accumulation, torch._C._set_cublas_allow_fp16_accumulation),
+    (torch._C._get_sm_carveout_experimental, torch._C._set_sm_carveout_experimental),
+    (torch._C._get_blas_preferred_backend, torch._C._set_blas_preferred_backend),
+)
+
+
+def library_state() -> tuple:
+    """The global state cuBLAS calls read: the fp32 math mode (allow_tf32
+    and float32_matmul_precision set it), the fp16 and bf16 reduced-precision
+    reductions, fp16 accumulation, the SM carveout and the preferred library."""
+    return tuple(get() for get, _ in _STATE)
+
+
+@contextlib.contextmanager
+def library_state_as(state: tuple) -> Iterator[None]:
+    """Runs under `state`, a library_state(), and restores the prior one."""
+    prior = library_state()
+    changed = [(set_, v, p) for (_, set_), v, p in zip(_STATE, state, prior) if v != p]
+    try:
+        for set_, v, _ in changed:
+            set_(v)
+        yield
+    finally:
+        for set_, _, p in changed:
+            set_(p)
 
 
 @dataclass(frozen=True)
@@ -151,6 +187,10 @@ class KeyedSite:
     nodes: tuple[Any, ...]  # each binding node's KernelLaunch or Memset
     topology: tuple
     rng: bool
+    state: tuple  # library_state() at the traced call
+    # the call's pytree spec and its tensor leaves' positions: a key's call
+    # is its op on its operands and scalars (_host_trace_replay's _learn)
+    call: tuple[Any, frozenset[int]] | None = None
 
     def fits(self, binding: OpaqueBinding) -> bool:
         """Whether the site can run the binding: on its nodes or an arm's,
@@ -197,15 +237,8 @@ def recordable(binding: OpaqueBinding) -> bool:
     return all(reproducible(a) for k in kernels for a, _ in k.attributes)
 
 
-def bind_at_trace(
-    provider: OpaqueProvider, op: OpOverload, args: tuple, kwargs: dict, fresh: list
-) -> tuple[OpaqueBinding | None, list[Any], str | None]:
-    """The binding of an accepted call at the trace's hints, if the trace can
-    record it, the values to guard at their hints: the fresh outputs'
-    symbolic storage offsets (0); and why the key never binds, if it doesn't
-    (the key is guarded: the call is a plain eager step, which no replay
-    learns from). `fresh` are the fake kernel's fresh outputs, which the
-    binding's allocations replace."""
+def trace_key(op: OpOverload, args: tuple, kwargs: dict, fresh: list) -> tuple[OpaqueKey, list[Any]]:
+    """A call's key at the trace's hints, and the values it reads."""
     from torch.cuda._host_trace_launch import _probe_address
     from torch.cuda._host_trace_tape import _hint
 
@@ -225,8 +258,23 @@ def bind_at_trace(
         tuple(map(_hint, align)),
         tuple(map(_hint, scalars)),
         next(t.device for t in (*traced, *fresh)).index,
+        library_state(),
     )
-    all_values = [*sum(sizes, ()), *sum(strides, ()), *align, *scalars]
+    return key, [*sum(sizes, ()), *sum(strides, ()), *align, *scalars]
+
+
+def bind_at_trace(
+    provider: OpaqueProvider, op: OpOverload, args: tuple, kwargs: dict, fresh: list
+) -> tuple[OpaqueBinding | None, list[Any], str | None]:
+    """The binding of an accepted call at the trace's hints, if the trace can
+    record it, the values to guard at their hints: the fresh outputs'
+    symbolic storage offsets (0); and why the key never binds, if it doesn't
+    (the key is guarded: the call is a plain eager step, which no replay
+    learns from). `fresh` are the fake kernel's fresh outputs, which the
+    binding's allocations replace."""
+    from torch.cuda._host_trace_tape import _hint
+
+    key, all_values = trace_key(op, args, kwargs, fresh)
     binding = provider.bind(key)
     refusal = provider.refusal(key)
     if binding is not None and not recordable(binding):
@@ -251,6 +299,7 @@ def record_binding(
     binding: OpaqueBinding,
     operands: list[Any],
     scalars: list[Any],
+    call: tuple[Any, frozenset[int]] | None = None,
 ) -> KeyedSite:
     """A bound call's nodes as the trace's launches and memsets, its scratch
     buffers as allocations; `operands` are traced tensors."""
@@ -311,4 +360,4 @@ def record_binding(
         )
         tr.record_launch(nodes[-1])
     sized = {j: (t, sizes[j]) for j, t in scratch.items()}
-    return KeyedSite(op, provider, tuple(operands), tuple(scalars), sized, tuple(nodes), binding.topology, binding.rng)
+    return KeyedSite(op, provider, tuple(operands), tuple(scalars), sized, tuple(nodes), binding.topology, binding.rng, library_state(), call)

@@ -14,6 +14,8 @@
 #endif
 #include <c10/util/irange.h>
 
+#include <algorithm>
+
 namespace at::cuda::host_trace {
 
 namespace ti_build = at::detail::ti_build;
@@ -61,10 +63,44 @@ TensorIteratorSym TensorIteratorSym::copy_op(Recorder& rec, const TensorBase& ds
   return iter;
 }
 
+TensorIteratorSym TensorIteratorSym::gather_op(Recorder& rec, const TensorBase& out, const TensorBase& src, const TensorBase& index) {
+  TensorIteratorSym iter({out, src, index});
+  iter.check_all_same_dtype_ = false;
+  iter.build(rec);
+  return iter;
+}
+
 TensorIteratorSym TensorIteratorSym::reduce_op(Recorder& rec, const TensorBase& out, const TensorBase& a) {
   TensorIteratorSym iter({out, a});
   iter.is_reduction_ = true;
   iter.build(rec);
+  return iter;
+}
+
+TensorIteratorSym TensorIteratorSym::pointwise_op(Recorder& rec, c10::ArrayRef<TensorBase> outs, c10::ArrayRef<ScalarType> out_dtypes, c10::ArrayRef<TensorBase> inputs) {
+  TORCH_CHECK(!outs.empty() && outs.size() == out_dtypes.size(), "a pointwise op of ", outs.size(), " outputs and ", out_dtypes.size(), " output dtypes");
+  TensorIteratorSym iter({outs[0]});
+  for (const auto i : c10::irange(outs.size())) {
+    if (outs[i].defined() && at::has_internal_overlap(outs[i]) == MemOverlap::Yes) {
+      decline("a pointwise op into a tensor with internal overlap");
+    }
+    if (i > 0) {
+      iter.operands_.emplace_back(outs[i]).is_output = true;
+    }
+    iter.operands_[i].target_dtype = iter.operands_[i].current_dtype = out_dtypes[i];
+  }
+  iter.noutputs_ = static_cast<int>(outs.size());
+  for (const TensorBase& t : inputs) {
+    iter.operands_.emplace_back(t);
+  }
+  iter.check_all_same_dtype_ = false;
+  iter.allow_cpu_scalars_ = true;
+  iter.build(rec);
+  auto& ops = iter.operands_;
+  ops.erase(std::remove_if(ops.begin() + iter.noutputs_, ops.end(), [](const SymOperandInfo& op) { return !op.tensor.is_cuda(); }), ops.end());
+  if (iter.ninputs() == 0 && !outs[0].defined()) {
+    decline("a pointwise op of no operand on the device");
+  }
   return iter;
 }
 
@@ -105,9 +141,14 @@ std::pair<TensorBase, TensorBase> reduce_buffers(const c10::SymInt& buffer_bytes
 }
 
 void TensorIteratorSym::compute_types() {
+  int cpu_scalars = 0;
   for (const auto i : c10::irange(ntensors())) {
     const TensorBase& t = operands_[i].tensor;
     if (!t.defined()) {
+      continue;
+    }
+    if (allow_cpu_scalars_ && i >= noutputs_ && t.dim() == 0 && t.is_cpu()) {
+      TORCH_CHECK(++cpu_scalars <= 1, "Trying to pass too many CPU scalars to non-CPU kernel!");
       continue;
     }
     if (!t.is_cuda()) {
@@ -118,7 +159,7 @@ void TensorIteratorSym::compute_types() {
     } else if (t.device() != common_device_) {
       decline("operands on different devices");
     }
-    if (i == 0) {
+    if (i < noutputs_) {
       continue;
     }
     if (common_dtype_ == ScalarType::Undefined) {
@@ -127,9 +168,14 @@ void TensorIteratorSym::compute_types() {
       decline(c10::str("operands of ", common_dtype_, " and ", t.scalar_type()));
     }
   }
-  auto& out = operands_[0];
-  if (!out.is_type_defined()) {
-    out.target_dtype = out.current_dtype = common_dtype_;
+  if (common_device_ == kCPU) {
+    decline("no operand on the device");
+  }
+  for (const auto i : c10::irange(noutputs_)) {
+    auto& out = operands_[i];
+    if (!out.is_type_defined()) {
+      out.target_dtype = out.current_dtype = common_dtype_;
+    }
   }
 }
 
@@ -157,11 +203,13 @@ void TensorIteratorSym::build(Recorder& rec) {
   compute_types();
   bool all_ops_are_scalars = false;
   ti_build::compute_shape(shape_, operands_, /*resize_outputs=*/false, all_ops_same_shape_, all_ops_are_scalars);
-  if (!is_reduction_ && output().defined() && !output().sym_sizes().equals(shape_)) {
-    decline("an output of a shape other than the broadcast shape");
+  for (const auto i : c10::irange(noutputs_)) {
+    if (!is_reduction_ && output(i).defined() && !output(i).sym_sizes().equals(shape_)) {
+      decline("an output of a shape other than the broadcast shape");
+    }
   }
-  auto set_output = [this](int /*i*/, c10::SymIntArrayRef sizes, c10::SymIntArrayRef strides, std::optional<MemoryFormat> memory_format) {
-    auto& out = operands_[0];
+  auto set_output = [this](int i, c10::SymIntArrayRef sizes, c10::SymIntArrayRef strides, std::optional<MemoryFormat> memory_format) {
+    auto& out = operands_[i];
     if (out.tensor.defined()) {
       return;
     }
@@ -176,7 +224,9 @@ void TensorIteratorSym::build(Recorder& rec) {
     ti_build::coalesce_dimensions(shape_, operands_, has_coalesced_dimensions_);
   }
   for (auto& op : operands_) {
-    op.data = rec.data_ptr(op.tensor);
+    if (op.tensor.is_cuda()) {
+      op.data = rec.data_ptr(op.tensor);
+    }
   }
 }
 

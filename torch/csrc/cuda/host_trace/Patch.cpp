@@ -149,6 +149,13 @@ std::array<int64_t, 4> HostTraceVariant::memset_shape(
       address, v[m.shape_rows[0]], v[m.shape_rows[1]], v[m.shape_rows[2]]};
 }
 
+std::array<int64_t, 3> HostTraceVariant::memcpy_shape(
+    const MemcpyRow& m,
+    const int64_t* v,
+    const int64_t* bases) const {
+  return {field_value(m.dst, v, bases), field_value(m.src, v, bases), v[m.bytes_row]};
+}
+
 void HostTraceVariant::patch_and_replay(Segment& run, Frame& frame) {
   const int64_t* v = frame.values.data();
   const int64_t* bases = frame.bases.data();
@@ -207,6 +214,28 @@ void HostTraceVariant::patch_and_replay(Segment& run, Frame& frame) {
           fail_after_setter < 0 || fail_after_setter-- != 0,
           "host_trace: a failure injected after a setter");
       r.held_memset = held;
+      r.held_row = row;
+      r.held = true;
+      return;
+    }
+    if (r.kind == Kind::Memcpy) {
+      const std::array<int64_t, 3> held = memcpy_shape(r.copy, v, bases);
+      if (r.held && held == r.held_copy) {
+        return;
+      }
+      r.held = false;
+      TORCH_CHECK_VALUE(held[2] > 0, "host_trace: a memcpy of ", held[2], " bytes");
+      C10_CUDA_CHECK(cudaGraphExecMemcpyNodeSetParams1D(
+          reinterpret_cast<cudaGraphExec_t>(exec),
+          reinterpret_cast<cudaGraphNode_t>(node),
+          reinterpret_cast<void*>(held[0]),
+          reinterpret_cast<const void*>(held[1]),
+          static_cast<size_t>(held[2]),
+          cudaMemcpyDeviceToDevice));
+      TORCH_CHECK(
+          fail_after_setter < 0 || fail_after_setter-- != 0,
+          "host_trace: a failure injected after a setter");
+      r.held_copy = held;
       r.held_row = row;
       r.held = true;
       return;

@@ -16,6 +16,7 @@ from typing import Any, overload, TYPE_CHECKING
 import sympy
 
 from torch._guards import GuardSource, ShapeGuard, SLoc, Source
+from torch.cuda import _host_trace_ir as _ir
 from torch.fx.experimental.symbolic_shapes import DimDynamic, ShapeEnv
 from torch.cuda._host_trace_program import f32_bits
 from torch.utils._sympy.functions import Mod, Where
@@ -33,6 +34,10 @@ if TYPE_CHECKING:
 # the test suites raise an unexpected exception inside a trace, a capture or
 # a harvest instead of declining the call
 raise_unexpected = False
+
+# an untrusted trace's symbolic backend: "ir" (torch.cuda._host_trace_ir) or
+# "sympy" (_TraceShapeEnv); a trusted trace is always sympy's
+symbolic = "ir"
 
 
 class Declined(RuntimeError):
@@ -142,7 +147,12 @@ class _TraceShapeEnv(ShapeEnv):
     def __init__(self, trusted: bool = False) -> None:
         super().__init__(duck_shape=False, specialize_zero_one=False)
         self.trusted = trusted
-        self._recorded: set[sympy.Basic] = set()
+        self._index: dict[sympy.Basic, int] = {}
+        # per guard, the top-level op (_Trace.ops) that recorded it, or None: a
+        # graph-level guard, recorded outside an op or evaluated again outside it
+        self.owners: list[int | None] = []
+        # the op a guard recorded now belongs to
+        self.op: int | None = None
         self._symop_cache = _SymOpMemo(self.domain)
 
     @overload
@@ -209,9 +219,21 @@ class _TraceShapeEnv(ShapeEnv):
         return concrete
 
     def _record(self, g: sympy.Basic, size_oblivious: bool = False) -> None:
-        if g is not sympy.true and g not in self._recorded:
-            self._recorded.add(g)
+        if g is sympy.true:
+            return
+        i = self._index.get(g)
+        if i is None:
+            self._index[g] = len(self.guards)
             self.guards.append(ShapeGuard(g, _NO_SLOC, size_oblivious))
+            self.owners.append(self.op)
+        elif self.owners[i] != self.op:
+            self.owners[i] = None
+
+    def forget(self, n: int) -> None:
+        """Drops the guards recorded after the first n."""
+        for g in self.guards[n:]:
+            del self._index[g.expr]
+        del self.guards[n:], self.owners[n:]
 
     def domain(self, lhs: Any, rhs: Any, out: Any) -> None:
         """A partial operation's domain: the divisor of a floor division, a
@@ -258,6 +280,8 @@ def bit_length(x: IntLikeType) -> IntLikeType:
     if isinstance(x, int):
         return x.bit_length()
     node = x.node
+    if isinstance(node, _ir.IRSymNode):
+        return node.bit_length()
     env, hint = node.shape_env, node.hint
     if hint is None:
         raise NotImplementedError("host_trace: the bit length of an unbacked size")
@@ -269,6 +293,8 @@ def select(c: torch.SymBool, a: IntLikeType, b: IntLikeType) -> IntLikeType:
     """`c ? a : b` for a traced host: a Where, which the program lowers to a select
     row (sym_ite's Piecewise makes sympy fold every expression it enters)."""
     node = c.node
+    if isinstance(node, _ir.IRSymNode):
+        return node.select(a, b)
     exprs = [sympy.Integer(x) if isinstance(x, int) else x.node.expr for x in (a, b)]
     hints = [x if isinstance(x, int) else x.node.hint for x in (a, b)]
     if node.hint is None or None in hints:
@@ -294,6 +320,8 @@ def f32_div(a: IntLikeType, b: IntLikeType) -> IntLikeType:
     if isinstance(a, int) and isinstance(b, int):
         return f32_bits(a, b)
     node = (b if isinstance(a, int) else a).node
+    if isinstance(node, _ir.IRSymNode):
+        return node.f32_div(a, b)
     env = node.shape_env
     exprs = [sympy.Integer(x) if isinstance(x, int) else x.node.expr for x in (a, b)]
     hints = [x if isinstance(x, int) else x.node.hint for x in (a, b)]

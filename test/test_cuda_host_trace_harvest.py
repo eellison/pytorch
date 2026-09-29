@@ -1,6 +1,5 @@
 # Owner(s): ["module: cuda graphs"]
 
-import contextlib
 import dataclasses
 import os
 import subprocess
@@ -29,7 +28,8 @@ if TEST_CUDA:
     import torch.cuda._host_trace_harvest as harvest
     from torch._inductor.cudagraph_host_trace import _harvest_budget
     from torch.cuda._host_trace_harvest import _launch, HarvestProvider
-    from torch.cuda._host_trace_opaque import OpaqueKernel, OpaqueKey
+    from torch.cuda._host_trace_opaque import library_state, OpaqueKernel, OpaqueKey
+    from torch.cuda._host_trace_replay import HostTraceReplay
 
 aten = torch.ops.aten
 bf16 = torch.bfloat16
@@ -60,6 +60,7 @@ def _key(op, args, kwargs):
         tuple(t.data_ptr() % 256 for t in operands),
         tuple(x for x in leaves if not isinstance(x, torch.Tensor)),
         operands[-1].device.index,
+        library_state(),
     )
     return key, operands
 
@@ -140,10 +141,10 @@ class TestHostTraceHarvest(TestCase):
         self.assertEqual(p.refused, {})
 
     def _captures(self, provider, op, args, siblings=True):
-        smeared = torch._C._cuda_hostTraceSmearedCall
+        smeared = torch._C._cuda_hostTraceHarvestCapture
         with (
             mock.patch.object(harvest, "_SIBLINGS", siblings),
-            mock.patch.object(torch._C, "_cuda_hostTraceSmearedCall", side_effect=smeared) as calls,
+            mock.patch.object(torch._C, "_cuda_hostTraceHarvestCapture", side_effect=smeared) as calls,
         ):
             binding, why = _learn(provider, op, args)
         self.assertIsNotNone(binding, why)
@@ -341,9 +342,8 @@ print("ok", p.harvests, p.refused)
         self.assertIs(p.bind(key), binding)
         self.assertIsNone(p.bind(dataclasses.replace(key, device=key.device + 1)))
 
-    def test_settings_not_in_key_documented_limitation(self):
-        # an accepted gap: a binding learned under one split-K setting serves
-        # under another
+    def test_settings_in_key(self):
+        # a binding learned under one split-K setting does not serve another
         m = torch.backends.cuda.matmul
         backend = torch.backends.cuda.preferred_blas_library()
         reduction = m.allow_bf16_reduced_precision_reduction
@@ -356,7 +356,9 @@ print("ok", p.harvests, p.refused)
             self.assertIsNotNone(split, why)
             m.allow_bf16_reduced_precision_reduction = (False, False)
             key, _ = _key(aten.mm.default, (a, b), {})
-            self.assertIs(p.bind(key), split)
+            self.assertIsNone(p.bind(key))
+            m.allow_bf16_reduced_precision_reduction = reduction
+            self.assertIs(p.bind(dataclasses.replace(key, state=library_state())), split)
         finally:
             m.allow_bf16_reduced_precision_reduction = reduction
             torch.backends.cuda.preferred_blas_library(backend)
@@ -375,7 +377,8 @@ print("ok", p.harvests, p.refused)
         self.assertNotEqual(split.scratch, ())
 
     def test_zero_operand(self):
-        # verified on random operands, not the call's
+        # verified on the call's operands, where the zero one hides a wrong
+        # binding: it replays bitwise on random ones too
         def make():
             a = torch.randn(64, 128, device="cuda", dtype=bf16)
             return (a, torch.zeros(128, 96, device="cuda", dtype=bf16)), {}
@@ -429,6 +432,54 @@ print("ok", p.harvests, p.refused)
             reserved.append(torch.cuda.memory_reserved())
         self.assertLessEqual(reserved[-1], reserved[len(reserved) // 2])
 
+    def test_gemm_harvest_peak_is_eagers(self):
+        # the captures' cuBLAS workspace is the arena's and verify launches on
+        # the call's own tensors: past eager's peak, only the digests; the
+        # pool doesn't grow
+        p = HarvestProvider()
+        b = torch.randn(4096, 4096, device="cuda", dtype=bf16)
+        pool = []
+        for m in (256, 1, 8, 1024, 2):
+            a = torch.randn(m, 4096, device="cuda", dtype=bf16)
+            torch.cuda.synchronize()
+            base = torch.cuda.memory_allocated()
+            torch.cuda.reset_peak_memory_stats()
+            key, operands = _key(aten.mm.default, (a, b), {})
+            eager = torch.cuda.max_memory_allocated() - base
+            base = torch.cuda.memory_allocated()
+            torch.cuda.reset_peak_memory_stats()
+            binding = p.learn(key, (a, b), {}, operands)
+            self.assertIsNotNone(binding, p.refused.get(p._normal(key)))
+            self.assertLessEqual(torch.cuda.max_memory_allocated() - base, eager + (1 << 20))
+            pool.append(_private_bytes())
+        self.assertEqual(len(set(pool)), 1)
+
+    @parametrize("wrong", ["output", "input"])
+    def test_gemm_verifies_in_place(self, wrong):
+        # a GEMM's binding is launched into the call's output: a wrong output
+        # refuses the key and eager reruns into it; a written input raises
+        a, b = (torch.randn(256, 256, device="cuda", dtype=bf16) for _ in range(2))
+        key, operands = _key(aten.mm.default, (a, b), {})
+        want = operands[-1].clone()
+
+        def swapped(binding, addresses, *rest):
+            addresses = list(addresses)
+            if wrong == "output":
+                addresses[0], addresses[1] = addresses[1], addresses[0]
+            else:
+                addresses[2] = addresses[0]
+            return _launch(binding, addresses, *rest)
+
+        p = HarvestProvider()
+        with mock.patch.object(harvest, "_launch", swapped):
+            if wrong == "input":
+                with self.assertRaisesRegex(RuntimeError, "wrote input 0"):
+                    p.learn(key, (a, b), {}, operands)
+                return
+            self.assertIsNone(p.learn(key, (a, b), {}, operands))
+        self.assertIn("differs from eager at operand 2", p.refused[p._normal(key)])
+        self.assertBitwise(operands[-1], want)
+
     @parametrize("dtype", [torch.bfloat16, torch.float16])
     def test_addmm_bias(self, dtype):
         def make():
@@ -463,6 +514,39 @@ print("ok", p.harvests, p.refused)
 
         with tf32_on(self) if tf32 else tf32_off():
             self.assertRebinds(HarvestProvider(), getattr(aten, op).default, make)
+
+    def test_math_mode_per_call(self):
+        # each call keeps the TF32 setting it was traced under, whatever the
+        # setting at a replay's harvest
+        def fn(x, w):
+            torch.backends.cuda.matmul.allow_tf32 = False
+            y = x @ w
+            torch.backends.cuda.matmul.allow_tf32 = True
+            z = y @ w
+            torch.backends.cuda.matmul.allow_tf32 = False
+            # a traced launch: a trace of only eager steps runs the call eagerly
+            return y, z, x * w
+
+        # a refused key's eager step too: the replay that refuses it runs its
+        # opaque step eagerly, and the retrace records a plain eager step
+        harvest_ = HarvestProvider._harvest
+
+        def refusing(self, key, *args, **kwargs):
+            if key.sizes[0] == (192, 192):
+                raise harvest._Refused("refused by the test")
+            return harvest_(self, key, *args, **kwargs)
+
+        p = HarvestProvider()
+        f = HostTraceReplay(fn, opaque=(p,))
+        with tf32_off(), mock.patch.object(HarvestProvider, "_harvest", refusing):
+            for n in (128, 128, 256, 256, 192, 192, 192, 128):
+                a, b = (torch.randn(n, n, device="cuda") for _ in range(2))
+                want, got = fn(a, b), f(a, b)
+                self.assertEqual(got, want, atol=0, rtol=0)
+        self.assertEqual(p.harvests, 6)
+        self.assertEqual(len(p.refused), 2)
+        # a new size's harvested keys bind by relowering the tape; the refusal retraces
+        self.assertEqual((f.traces, f.relowers, f.replays), (2, 1, 7))
 
     def test_addmm_declines(self):
         p = HarvestProvider()
@@ -531,6 +615,20 @@ print("ok", p.harvests, p.refused)
             self.assertIsNone(_learn(p, aten.mm.default, (a16, b))[0])
         self.assertIsNotNone(_learn(p, aten.mm.default, (a16, b))[0])
         self.assertEqual((p.harvests, p.refused), (2, {}))
+
+
+_SEEDED = {
+    "bernoulli_p": (aten.bernoulli_.float, lambda x: ((x, 0.3), {})),
+    "bernoulli": (aten.bernoulli.default, lambda x: ((x,), {})),
+    "rand_like": (aten.rand_like.default, lambda x: ((x,), {})),
+    "randn_like": (aten.randn_like.default, lambda x: ((x,), {})),
+    "normal_": (aten.normal_.default, lambda x: ((x,), {})),
+    "exponential_": (aten.exponential_.default, lambda x: ((x,), {})),
+    "random_": (getattr(aten.random_, "from"), lambda x: ((x, 0, 10), {})),
+    "log_normal_": (aten.log_normal_.default, lambda x: ((x,), {})),
+    "cauchy_": (aten.cauchy_.default, lambda x: ((x,), {})),
+    "geometric_": (aten.geometric_.default, lambda x: ((x, 0.3), {})),
+}
 
 
 @unittest.skipIf(not TEST_CUDA, "CUDA not available")
@@ -652,14 +750,14 @@ class TestHostTraceHarvestAttentionAndRng(TestCase):
             bwd = (torch.randn_like(o), q, k, v, o, lse, seed, offset, None, cq, ck, mq, mk, 0.0, True)
             return aten._scaled_dot_product_cudnn_attention_backward.default, bwd
 
-        smeared = torch._C._cuda_hostTraceSmearedCall
+        smeared = torch._C._cuda_hostTraceHarvestCapture
         bindings = []
         for siblings, captures in ((True, 1), (False, 2)):
             p = HarvestProvider(("attention",))
             self.assertIsNotNone(_learn(p, *make(4))[0])
             with (
                 mock.patch.object(harvest, "_SIBLINGS", siblings),
-                mock.patch.object(torch._C, "_cuda_hostTraceSmearedCall", side_effect=smeared) as calls,
+                mock.patch.object(torch._C, "_cuda_hostTraceHarvestCapture", side_effect=smeared) as calls,
             ):
                 binding, why = _learn(p, *make(16))
             self.assertIsNotNone(binding, why)
@@ -685,7 +783,7 @@ class TestHostTraceHarvestAttentionAndRng(TestCase):
             op = aten.native_dropout.default
         p = HarvestProvider(("attention", "rng"))
         key, operands = _key(op, args, {})
-        with mock.patch.object(harvest, "_zero_init", contextlib.nullcontext):
+        with mock.patch.object(harvest, "_ZERO_INIT", False):
             self.assertIsNone(p.learn(key, args, {}, operands))
         why = p.refused[p._normal(key)]
         self.assertIn("unexplained varying parameter", why)
@@ -771,6 +869,12 @@ class TestHostTraceHarvestAttentionAndRng(TestCase):
             return (torch.randn(64, 256, device="cuda"), 0.1, True), {}
 
         self.assertReplays(aten.native_dropout.default, make, rng=True, every=True)
+
+    @parametrize("case", list(_SEEDED))
+    def test_seeded_op(self, case):
+        # any ATen op tagged nondeterministic_seeded is in the family
+        op, make = _SEEDED[case]
+        self.assertReplays(op, lambda: make(torch.rand(64, 256, device="cuda")), rng=True)
 
 
 def setUpModule():
@@ -864,9 +968,9 @@ class TestHostTraceHarvestConv(TestCase):
 
     def test_pair(self):
         # harvested in full from the pair, after the priming capture
-        smeared = torch._C._cuda_hostTraceSmearedCall
+        smeared = torch._C._cuda_hostTraceHarvestCapture
         make = lambda: _conv_backward("plain", bf16, True)  # noqa: E731
-        with mock.patch.object(torch._C, "_cuda_hostTraceSmearedCall", side_effect=smeared) as calls:
+        with mock.patch.object(torch._C, "_cuda_hostTraceHarvestCapture", side_effect=smeared) as calls:
             self.assertReplays(aten.convolution_backward.default, make)
         self.assertEqual(calls.call_count, 3)
 

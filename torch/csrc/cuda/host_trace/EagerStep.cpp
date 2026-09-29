@@ -22,6 +22,51 @@ int64_t buffered_runs = 0;
 // the caching allocator's block granularity (_host_trace_memory._BLOCK)
 constexpr int64_t kBlock = 512;
 
+namespace {
+
+BlasState blas_state() {
+  auto& c = at::globalContext();
+  return {
+      c.float32Precision(at::Float32Backend::CUDA, at::Float32Op::MATMUL),
+      c.allowFP16ReductionCuBLAS(),
+      c.allowBF16ReductionCuBLAS(),
+      c.allowFP16AccumulationCuBLAS(),
+      c._SMCarveout_EXPERIMENTAL(),
+      c.blasPreferredBackend()};
+}
+
+// The global cuBLAS state from `from` to `to`, setting only what differs, as
+// library_state_as does
+void set_blas_state(const BlasState& from, const BlasState& to) {
+  using Option = at::CuBLASReductionOption;
+  auto& c = at::globalContext();
+  if (from.matmul != to.matmul) {
+    c.setFloat32Precision(
+        at::Float32Backend::CUDA, at::Float32Op::MATMUL, to.matmul);
+  }
+  if (from.fp16 != to.fp16) {
+    c.setAllowFP16ReductionCuBLAS(
+        to.fp16 == Option::AllowReducedPrecisionWithSplitK,
+        to.fp16 != Option::DisallowReducedPrecisionDisallowSplitK);
+  }
+  if (from.bf16 != to.bf16) {
+    c.setAllowBF16ReductionCuBLAS(
+        to.bf16 == Option::AllowReducedPrecisionWithSplitK,
+        to.bf16 != Option::DisallowReducedPrecisionDisallowSplitK);
+  }
+  if (from.fp16_accumulation != to.fp16_accumulation) {
+    c.setAllowFP16AccumulationCuBLAS(to.fp16_accumulation);
+  }
+  if (from.carveout != to.carveout) {
+    c._setSMCarveout_EXPERIMENTAL(to.carveout);
+  }
+  if (from.backend != to.backend) {
+    c.setBlasPreferredBackend(to.backend);
+  }
+}
+
+} // namespace
+
 const at::Tensor& HostTraceVariant::base_tensor(
     const BaseRef& ref,
     PyObject* const* args,
@@ -311,7 +356,19 @@ void HostTraceVariant::boxed(
   }
   {
     at::AutoDispatchBelowADInplaceOrView guard;
-    step.op->callBoxed(stack);
+    if (step.blas) {
+      const BlasState prior = blas_state();
+      set_blas_state(prior, *step.blas);
+      try {
+        step.op->callBoxed(stack);
+      } catch (...) {
+        set_blas_state(*step.blas, prior);
+        throw;
+      }
+      set_blas_state(*step.blas, prior);
+    } else {
+      step.op->callBoxed(stack);
+    }
   }
   auto disagree = [&](const std::string& msg) {
     THPObjectPtr e(PyObject_CallFunction(

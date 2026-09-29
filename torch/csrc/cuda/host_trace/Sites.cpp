@@ -37,6 +37,15 @@ int64_t HostTraceVariant::find(const Site& s, const int64_t* key) const {
   return -1;
 }
 
+int64_t HostTraceVariant::select(const Site& s, const int64_t* values) {
+  for (size_t k = 0; k < s.predicates.size(); ++k) {
+    if (values[s.predicates[k]] == 1) {
+      return static_cast<int64_t>(k);
+    }
+  }
+  return -1;
+}
+
 void HostTraceVariant::insert(Site& s, const int64_t* key, int64_t row) {
   const size_t n = s.key_rows.size();
   s.index[key_hash(key, n)].push_back(static_cast<uint32_t>(s.rows.size()));
@@ -130,6 +139,15 @@ bool HostTraceVariant::evaluate(
   c10::SmallVector<int64_t, 32> key;
   for (size_t i = 0; i < sites_.size(); ++i) {
     const Site& s = sites_[i];
+    if (!s.predicates.empty()) {
+      const int64_t row = select(s, frame.values.data());
+      if (row < 0) {
+        frame.keyed_miss = true;
+        return false;
+      }
+      frame.site_entries[i] = row;
+      continue;
+    }
     key.resize_for_overwrite(s.key_rows.size());
     for (size_t j = 0; j < key.size(); ++j) {
       key[j] = frame.values[s.key_rows[j]];
@@ -197,9 +215,17 @@ py::object HostTraceVariant::evaluate_py(py::handle args) const {
   }
   py::list missing;
   py::list unformed;
+  py::list unselected;
   std::vector<int64_t> rows(sites_.size());
   for (size_t i = 0; i < sites_.size(); ++i) {
     const Site& s = sites_[i];
+    if (!s.predicates.empty()) {
+      rows[i] = select(s, frame.values.data());
+      if (rows[i] < 0) {
+        unselected.append(i);
+      }
+      continue;
+    }
     std::vector<int64_t> key;
     for (int64_t row : s.key_rows) {
       key.push_back(frame.values[row]);
@@ -222,7 +248,71 @@ py::object HostTraceVariant::evaluate_py(py::handle args) const {
     }
   }
   std::vector<int64_t> values(frame.values.begin(), frame.values.end());
-  return py::make_tuple(values, missing, unformed);
+  return py::make_tuple(values, missing, unformed, unselected);
+}
+
+void HostTraceVariant::add_entry(
+    size_t site,
+    int64_t predicate,
+    py::handle nodes) {
+  TORCH_CHECK_VALUE(
+      site < sites_.size() && !sites_[site].predicates.empty(),
+      "no selector ",
+      site);
+  Site& s = sites_[site];
+  auto t = nodes.cast<py::tuple>();
+  TORCH_CHECK_VALUE(
+      t.size() == s.records.size(), "an entry of ", t.size(), " nodes");
+  auto e = std::make_unique<Entry>();
+  e->kernels.resize(t.size());
+  e->memsets.resize(t.size());
+  for (size_t i = 0; i < t.size(); ++i) {
+    auto n = t[i].cast<py::tuple>();
+    const auto kind = static_cast<Kind>(n[0].cast<uint8_t>());
+    TORCH_CHECK_VALUE(kind != Kind::Memcpy, "an entry's memcpy");
+    TORCH_CHECK_VALUE(
+        kind == records_[s.records[i]].kind, "an entry's node of another kind");
+    if (kind == Kind::Memset) {
+      MemsetRow& m = e->memsets[i];
+      m.dst = parse_source(n[1]);
+      m.value = n[2].cast<unsigned int>();
+      m.element_size = check_element_size(n[3]);
+      for (size_t k = 0; k < 3; ++k) {
+        m.shape_rows[k] = check_row(n[4 + k].cast<int64_t>());
+      }
+      continue;
+    }
+    KernelRow& k = e->kernels[i];
+    k.dim_rows = set_launch(k, n[1], n[2], n[3], n[4]);
+    for (int64_t row : k.dim_rows) {
+      check_row(row);
+    }
+    append_images(k, n[5], e->image);
+    k.first_field = e->fields.size();
+    for (py::handle x : n[6].cast<py::tuple>()) {
+      e->fields.push_back(parse_field(x, k));
+    }
+    k.field_count = e->fields.size() - k.first_field;
+    TORCH_CHECK_VALUE(
+        n[7].cast<py::tuple>().empty(), "an entry's TMA descriptor");
+    parse_rng(k, segments_[s.segment], n[8], n[9]);
+  }
+  e->held = e->image;
+  for (size_t i = 0; i < t.size(); ++i) {
+    if (records_[s.records[i]].kind == Kind::Kernel) {
+      bind_row(
+          e->kernels[i], e->image.data(), e->held.data(), e->fields.data());
+    }
+  }
+  s.predicates.push_back(check_row(predicate));
+  s.entries.push_back(std::move(e));
+}
+
+void HostTraceVariant::set_program(const HostTraceProgram& program) {
+  TORCH_CHECK_VALUE(
+      program.num_rows() >= program_.num_rows(),
+      "a program of fewer rows than the variant's");
+  program_ = program;
 }
 
 void HostTraceVariant::add_row(
@@ -264,6 +354,7 @@ void HostTraceVariant::add_row(
   for (size_t i = 0; i < t.size(); ++i) {
     auto n = t[i].cast<py::tuple>();
     const auto kind = kinds[i] = static_cast<Kind>(n[0].cast<uint8_t>());
+    TORCH_CHECK_VALUE(kind != Kind::Memcpy, "a keyed row's memcpy");
     TORCH_CHECK_VALUE(
         piece || kind == records_[s.records[i]].kind,
         "a row's node of another kind");
@@ -334,6 +425,7 @@ void HostTraceVariant::add_form(
       auto n = h.cast<py::tuple>();
       Record r{};
       r.kind = static_cast<Kind>(n[0].cast<uint8_t>());
+      TORCH_CHECK_VALUE(r.kind != Kind::Memcpy, "a keyed row's memcpy");
       r.node = reinterpret_cast<CUgraphNode>(n[1].cast<uintptr_t>());
       r.site = static_cast<int64_t>(site);
       r.site_pos = pos++;

@@ -99,6 +99,18 @@ if HAS_CUTE:
             _add, t, t, t, cutlass.Int32(0), stream, options="--enable-tvm-ffi"
         )
 
+    _COMPILED = {}
+
+    @torch.library.custom_op("host_trace_test::cute_add", mutates_args=(), device_types="cuda")
+    def _cute_add(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        # the compile is picked from the size after the fake kernel fixed the output
+        c = torch.empty_like(a)
+        add = _COMPILED["add_1024"] if a.shape[0] == 1024 else _COMPILED["add"]
+        add(a, b, c, a.shape[0])
+        return c
+
+    _cute_add.register_fake(lambda a, b: torch.empty_like(a))
+
     _EXAMPLES = os.environ.get(
         "CUTE_DSL_EXAMPLES",
         os.path.join(
@@ -131,6 +143,7 @@ class TestHostTraceCute(TestCase):
         super().setUpClass()
         cls.add = _compile_add()
         cls.add_explicit = _compile_add(env_stream=False)
+        _COMPILED.update(add=cls.add, add_1024=_compile_add(shape=(1024,)))
 
     def test_add_is_a_launch(self):
         add = self.add
@@ -343,6 +356,50 @@ class TestHostTraceCute(TestCase):
             r(x[::2], x[1::2])
         self.assertEqual(r.traces, 2)
 
+    def test_a_calls_specialization_is_its_own(self):
+        # the compile's align and unit stride guard the call, not the graph
+        add = self.add
+
+        def f(a, b):
+            c = torch.empty_like(a)
+            add(a, b, c, a.shape[0])
+            return c
+
+        a = torch.randn(1000, device="cuda")
+        (op,) = trace(f, (a, a)).ops
+        self.assertEqual(op.kind, "traced")
+        self.assertTrue(op.guards)
+
+    def test_a_custom_ops_compile_choice_dispatches_again_into_one_variant(self):
+        # test_static_leaf_change_retraces's choice, made inside a custom op's
+        # kernel: the op's own, an entry of the one variant
+        r = HostTraceReplay(_cute_add)
+        for n in (1024, 1000, 1000, 1024, 1000):
+            a, b = torch.randn(n, device="cuda"), torch.randn(n, device="cuda")
+            self.assertEqual(r(a, b), a + b, atol=0, rtol=0)
+        self.assertEqual((r.traces, r.folds, r.redispatches, len(r.variants), r.eager), (1, 0, 1, 1, 0))
+
+    def test_a_torch_native_routers_dlpack_impl_is_traced(self):
+        # _fused_rms_norm's router is its host, its condition the op's guards;
+        # quack's adapter hands the input to cute.runtime.from_dlpack, whose
+        # tensors the trace follows, so the override's launch is on the tape
+        def f(x, w):
+            return torch.nn.functional.rms_norm(x, (x.shape[-1],), w, 1e-6)
+
+        def bf16(*shape):
+            return torch.randn(*shape, device="cuda", dtype=torch.bfloat16)
+
+        tape = trace(f, (bf16(64, 1024), bf16(1024)))
+        (op,) = tape.ops
+        self.assertEqual(op.kind, "traced")
+        self.assertTrue(op.guards)
+        self.assertEqual([type(c) for _, c in tape.launches], [KernelLaunch])
+        r = HostTraceReplay(f)
+        # a retrace at a size quack has not compiled compiles inside the router
+        for m, n in ((64, 1024), (128, 1024), (1000, 1024), (64, 1024), (64, 1096), (64, 1160)):
+            x, w = bf16(m, n), bf16(n)
+            self.assertEqual(r(x, w), f(x, w), atol=0, rtol=0)
+
     def test_witness_mismatch_is_an_eager_call(self):
         add, traced = _compile_add(env_stream=False), self.add
 
@@ -479,7 +536,8 @@ class TestHostTraceCute(TestCase):
             check(cute.runtime.load_module(path, enable_tvm_ffi=True).func, "did not load: X")
 
     def test_a_compile_cache_key_is_a_specialization(self):
-        # quack's jit_cache keys its compile by x.size(-1): a guard on N, M stays symbolic
+        # quack's jit_cache keys its compile by x.size(-1) and the kernel is compiled
+        # for a static weight shape: guards on N and w.size(0), M stays symbolic
         from torch._vendor.quack.rmsnorm import rmsnorm_fwd
 
         add = self.add
@@ -494,7 +552,8 @@ class TestHostTraceCute(TestCase):
 
         a = torch.randn(1000, device="cuda")
         tape = trace(f, (bf16(64, 1024), bf16(1024), a))
-        self.assertEqual(sum("1024" in str(g) for g in tape.guards), 1)
+        self.assertTrue(all(isinstance(r, KernelLaunch) for _, r in tape.launches), tape.launches)
+        self.assertEqual(sum("1024" in str(g) for g in tape.guards), 2)
         r = HostTraceReplay(f)
         for m, n in ((64, 1024), (128, 1024), (1000, 1024), (64, 512)):
             x, w = bf16(m, n), bf16(n)
@@ -503,6 +562,53 @@ class TestHostTraceCute(TestCase):
             self.assertEqual(r(x, w, a), (ref, a + a), atol=0, rtol=0)
         # N=512 fails the guard: a second trace
         self.assertEqual((r.traces, r.replays, r.eager), (2, 3, 0))
+
+    def test_a_compile_that_fails_under_a_trace_runs_eagerly_once(self):
+        # a new N compiled inside a later trace reaches quack's RMSNorm.N as a
+        # SymInt; the eager fallback compiles it and the next call of the same
+        # class traces
+        import torch._vendor.quack.cache as quack_cache
+        from torch._vendor.quack.rmsnorm import rmsnorm_fwd
+
+        def f(x, w):
+            return rmsnorm_fwd(x, w)[0]
+
+        def bf16(*shape):
+            return torch.randn(*shape, device="cuda", dtype=torch.bfloat16)
+
+        r = HostTraceReplay(f)
+        with mock.patch.object(quack_cache, "CACHE_ENABLED", False):
+            for m, n in ((64, 1024), (64, 1792), (64, 1792), (32, 1792)):
+                x, w = bf16(m, n), bf16(n)
+                self.assertEqual(r(x, w), f(x, w), atol=0, rtol=0)
+        self.assertEqual((r.traces, r.replays, r.eager), (3, 2, 1))
+        self.assertTrue(any("CuTe DSL compile under the trace" in why for why in r._reasons), r._reasons)
+
+    def test_a_disk_cache_entry_without_its_host_function_recompiles(self):
+        # an object quack's jit_cache exported before its compile was observed
+        # has no host function beside it: loading it is a cache miss
+        import torch._vendor.quack.cache as quack_cache
+        from torch._vendor.quack.rmsnorm import _compile_rmsnorm_fwd, rmsnorm_fwd
+
+        def f(x, w):
+            return rmsnorm_fwd(x, w)[0]
+
+        def bf16(*shape):
+            return torch.randn(*shape, device="cuda", dtype=torch.bfloat16)
+
+        with tempfile.TemporaryDirectory() as d, quack_cache.cache_dir_override(d), mock.patch.object(quack_cache, "CACHE_ENABLED", True):
+            _compile_rmsnorm_fwd.cache_clear()
+            f(bf16(64, 1536), bf16(1536))
+            sidecars = [os.path.join(root, n) for root, _, names in os.walk(d) for n in names if n.endswith(htc.SIDECAR)]
+            self.assertEqual(len(sidecars), 1)
+            os.remove(sidecars[0])
+            _compile_rmsnorm_fwd.cache_clear()
+            r = HostTraceReplay(f)
+            for m in (64, 32):
+                x, w = bf16(m, 1536), bf16(1536)
+                self.assertEqual(r(x, w), f(x, w), atol=0, rtol=0)
+            self.assertEqual((r.traces, r.replays, r.eager), (1, 1, 0))
+            self.assertTrue(os.path.exists(sidecars[0]))
 
     def test_a_compile_inside_a_trace_specializes(self):
         # a per-N compile cache: hashing N, the static shape and the Int32 argument are guards on N
@@ -571,7 +677,7 @@ class TestHostTraceCute(TestCase):
         self.assertEqual([size for _, size in launch.layout], [40, 40, 40, 4])
         r = HostTraceReplay(f)
         # N tiles of 128 pick the raster factor: 1 tile 1, 2 tiles 2, 3 to 5
-        # tiles 4, more 8; each is a trace
+        # tiles 4, more 8; each is the kernel's host dispatched again
         sizes = [
             (256, 256, 128),
             (128, 128, 64),
@@ -587,7 +693,7 @@ class TestHostTraceCute(TestCase):
             ref = a.new_empty(1, m, n)
             gemm(a, b, ref)
             self.assertEqual(r(a, b), ref, atol=0, rtol=0)
-        self.assertEqual((r.traces, r.replays, r.eager), (4, 7, 0))
+        self.assertEqual((r.traces, r.redispatches, r.replays, r.eager), (1, 3, 7, 0))
 
     def test_witness_at_m_not_n(self):
         tg = _example("cute/ampere/kernel/dense_gemm/tensorop_gemm.py", "tensorop_gemm")

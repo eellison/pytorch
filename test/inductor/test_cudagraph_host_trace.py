@@ -518,11 +518,11 @@ class TestInstallation(TestCase):
                 opt.zero_grad()
             self.assertEqual(m.w, ref.w)
         self.assertEqual(len(self.installed), 2)
-        # the learner harvests the fp32 matmuls, then a native variant serves
+        # the learner harvests the fp32 matmuls, then its tape relowered with them bound serves
         for installation in self.installed:
             replay = installation.replay
             self.assertEqual(replay.declines, [])
-            self.assertEqual((replay.traces, len(replay.variants), replay.eager), (2, 2, 0))
+            self.assertEqual((replay.traces, replay.relowers, len(replay.variants), replay.eager), (1, 1, 2, 0))
 
     @config.patch(freezing=True)
     def test_frozen_constants_are_arguments(self):
@@ -701,7 +701,7 @@ class TestInstallation(TestCase):
         self.assertEqual(counters["inductor"]["cudagraph_host_trace_declined"], 0)
         self.assertEqual(counters["inductor"]["cudagraph_skips"], 0)
 
-    def test_empty_input_is_an_eager_step(self):
+    def test_empty_input_is_its_own_variant(self):
         compiled = torch.compile(_pointwise, mode="reduce-overhead")
         for n, offset in [(64, 0), (0, 0), (64, 0), (64, 1), (0, 0), (128, 1)]:
             x = torch.randn(n + offset, device="cuda")[offset:]
@@ -709,8 +709,8 @@ class TestInstallation(TestCase):
             self.assertEqual(compiled(x), _pointwise(x))
         (installation,) = self.installed
         replay = installation.replay
-        # an empty call does not decline the graph: the misaligned call traces
-        self.assertEqual((replay.traces, len(replay.variants), replay.eager), (2, 2, 2))
+        # a size's zero-ness is a guard: the empty call and the misaligned call each trace
+        self.assertEqual((replay.traces, len(replay.variants), replay.eager), (3, 3, 0))
 
     def test_capture_error_declines_only_the_call(self):
         capture = host_trace_replay.capture_tape

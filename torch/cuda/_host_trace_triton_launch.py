@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import contextlib
 import ctypes
+import functools
 import struct
 import types
 from typing import Any, NoReturn, TYPE_CHECKING
@@ -387,7 +388,10 @@ def _jit_run(self: Any, *args: Any, grid: Any, warmup: bool, **kwargs: Any) -> A
     if tr is None:
         return _ORIGINALS["jit"](self, *args, grid=grid, warmup=warmup, **kwargs)
     try:
-        return _intercept(tr, self, args, grid, warmup, kwargs)
+        run = functools.partial(_intercept, tr, self, args, grid, warmup, kwargs)
+        # the grid with the arguments, its SymInts renamed for a redo as theirs
+        redo = lambda a, k: _jit_run(self, *a, warmup=warmup, **k)  # noqa: E731
+        return tr.op(self, args, dict(kwargs, grid=grid), run, host=True, redo=redo)
     except Declined as e:
         if tr.declined is None:
             tr.declined = e
@@ -402,6 +406,11 @@ def _autotuner_run(self: Any, *args: Any, **kwargs: Any) -> Any:
     tr = current_trace()
     if tr is None:
         return _ORIGINALS["autotuner"](self, *args, **kwargs)
+    run = functools.partial(_autotune, tr, self, args, kwargs)
+    return tr.op(self, args, kwargs, run, host=True, redo=lambda a, k: _autotuner_run(self, *a, **k))
+
+
+def _autotune(tr: _Trace, self: Any, args: tuple, kwargs: dict) -> Any:
     name = self.base_fn.__name__
 
     def decline(why: str) -> NoReturn:
@@ -437,12 +446,23 @@ def _autotuner_run(self: Any, *args: Any, **kwargs: Any) -> Any:
 _ORIGINALS: dict[str, Any] = {}
 
 
+def _const_tensor(cls: type, tensor: torch.Tensor) -> Any:
+    # torch._native's read-only view of a traced tensor is the traced tensor,
+    # bound as any tensor argument
+    return tensor if isinstance(tensor, _TracedTensor) else object.__new__(cls)
+
+
 def _hook() -> None:
     from triton.runtime.autotuner import Autotuner
     from triton.runtime.jit import JITFunction
 
+    from torch._native.const_tensor_wrapper import ConstTensorWrapper
+
     _ORIGINALS["jit"], _ORIGINALS["autotuner"] = JITFunction.run, Autotuner.run
     JITFunction.run, Autotuner.run = _jit_run, _autotuner_run
+    # never removed: a class whose assigned __new__ is deleted again rejects
+    # its constructor's arguments
+    ConstTensorWrapper.__new__ = staticmethod(_const_tensor)  # type: ignore[method-assign, assignment]
 
 
 def _unhook() -> None:

@@ -146,6 +146,10 @@ TORCH_CUDA_CPP_API bool isCUDABlasWorkspaceCachingEnabled();
 TORCH_CUDA_CPP_API void* getCUDABlasLtWorkspace();
 TORCH_CUDA_CPP_API void* getCUDABlasLtWorkspace(size_t workspace_size);
 TORCH_CUDA_CPP_API at::DataPtr allocateCUDABlasWorkspace(size_t size);
+// Until reset with nullptr, this thread's allocateCUDABlasWorkspace returns
+// `ptr`, unowned, for requests of at most `size` bytes. Returns the most bytes
+// requested under the previous override.
+TORCH_CUDA_CPP_API size_t setCUDABlasWorkspaceAddressOverride(void* ptr, size_t size);
 TORCH_CUDA_CPP_API void setChosenWorkspaceSize(size_t size);
 TORCH_CUDA_CPP_API void setCUDABlasLtWorkspaceSize(size_t size);
 TORCH_CUDA_CPP_API void resetChosenWorkspaceSize();

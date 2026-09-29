@@ -24,9 +24,11 @@ as the compiled one was, or is an EagerCall naming why.
 from __future__ import annotations
 
 import contextlib
+import functools
 import json
 import math
 import re
+import struct
 import sys
 import threading
 import weakref
@@ -194,7 +196,7 @@ def _static_value(ty: str) -> Any:
     m = re.fullmatch(r'!cute\.tile<"\[(.*)\]">', ty)
     if m is not None and "?" not in m.group(1):
         return tuple(int(x.split(":")[0]) for x in m.group(1).split(";"))
-    m = re.fullmatch(r'!cute\.tile<"(\d+):1">', ty)
+    m = re.fullmatch(r'!cute\.tile<"(\d+):\d+">', ty)
     return None if m is None else int(m.group(1))
 
 
@@ -437,6 +439,11 @@ def _bind(program: _Program, args: Sequence[Any]) -> tuple[list[Any], list[tuple
             if type(a) not in (int, torch.SymInt):
                 raise _Undescribed(f"integer parameter {i} is passed a {type(a).__name__}")
             formals.append(a)
+        elif ty == "f32":
+            # a float the trace holds as a constant, as it holds an ATen call's
+            if type(a) is not float:
+                raise _Undescribed(f"f32 parameter {i} is passed a {type(a).__name__}")
+            formals.append(a)
         else:
             raise _Undescribed(f"a parameter of type {ty}")
     return formals, predicates
@@ -534,6 +541,13 @@ class _Eval:
             return tuple(a)  # an atom as its runtime state
         if n == "cute.make_tiled_mma":
             return a[0]
+        if n in ("cute.make_shape", "cute.make_stride"):
+            # the type's pattern, its dynamic leaves the operands' in order
+            m = re.fullmatch(r'!cute\.\w+<"(.*)">', op.types[0])
+            pat, given = _parse_tuple(m.group(1)), iter(_flat(tuple(a)))
+            if sum(map(_dynamic, _flat(pat))) != len(_flat(tuple(a))):
+                raise _Undescribed(f"{n} of {len(a)} operands into {op.types[0]}")
+            return _unflatten(pat, [next(given) if _dynamic(x) else x for x in _flat(pat)])
         if n == "arith.cmpi":
             pred = self.attr(op, "predicate", int)
             if pred not in _CMP:
@@ -636,6 +650,8 @@ class _Eval:
                 params.append(_Param(fields))
             elif (m := _INT_TYPE_RE.fullmatch(ty)) is not None and int(m.group(1)) in (16, 32, 64):
                 params.append(_Param([(v, int(m.group(1)) // 8, False)]))
+            elif ty == "f32" and type(v) is float:
+                params.append(_Param([(struct.unpack("<i", struct.pack("<f", v))[0], 4, False)]))
             elif ty.startswith("!cute.coord_tensor"):
                 m = re.fullmatch(r'!cute\.coord_tensor<"([^"?]*)", "([^:]*):([^"?]*)">', ty)
                 if m is None:
@@ -822,9 +838,11 @@ def _intercept(
             )
         if isinstance(program, str):
             raise _Undescribed(program)
-        bound = _bind(program, args)
+        # a parameter compiled as None is no formal: TVM-FFI takes the None and drops it
+        given = [a for a in args if a is not None]
+        bound = _bind(program, given)
         for i, ty in enumerate(program.formals):
-            if ty == "!cuda.stream" and len(args) == len(program.formals) and _stream_handle(args[i]) is None:
+            if ty == "!cuda.stream" and len(given) == len(program.formals) and _stream_handle(given[i]) is None:
                 decline(f"argument {i} is a stream as a {type(args[i]).__name__}; pass a torch.cuda.Stream or CUstream")
         roots: list[_Root] = []
         for a in args:
@@ -868,13 +886,22 @@ _ORIGINALS: dict[Any, Any] = {}
 def install() -> None:
     """Observe cute.compile from now on: each compiled function's host
     program is kept for its calls under a trace, exported beside its object
-    and loaded with it. A process without cutlass loaded has nothing to observe."""
+    and loaded with it. A process without cutlass loaded has nothing to observe,
+    unless torch._native registered a CuTe DSL override: that imports cutlass
+    at its first call, which can be a trace's warm-up, and what it compiles or
+    loads then must be observed."""
     if "cutlass" not in sys.modules:
-        return
+        from torch._native import registry
+
+        if not registry.get_dsl_operations("cutedsl"):
+            return
+        import cutlass  # noqa: F401
     from cutlass.base_dsl.compiler import CompileCallable
     from cutlass.base_dsl.export.external_binary_module import ExternalBinaryModule
-    from cutlass.cute.runtime import _FakeTensor
+    from cutlass.cute import runtime
     from cutlass.cutlass_dsl.tvm_ffi_provider import TVMFFIJitCompiledFunctionBase
+
+    from torch.utils.dlpack import ReadOnlyTensorWrapper
 
     with _lock:
         if "compile" not in _ORIGINALS:
@@ -882,12 +909,22 @@ def install() -> None:
             _ORIGINALS["export"] = TVMFFIJitCompiledFunctionBase.export_to_c
             _ORIGINALS["load"] = ExternalBinaryModule.__new__
             _ORIGINALS["lookup"] = ExternalBinaryModule.__getattr__  # __getitem__ calls it
-            _ORIGINALS["fake"] = _FakeTensor.__init__
+            _ORIGINALS["fake"] = runtime._FakeTensor.__init__
+            _ORIGINALS["from_dlpack"] = runtime.from_dlpack
+            _ORIGINALS["read_only"] = ReadOnlyTensorWrapper.__new__
             CompileCallable.__call__ = _compile
             TVMFFIJitCompiledFunctionBase.export_to_c = _export_to_c
             ExternalBinaryModule.__new__ = staticmethod(_load)
             ExternalBinaryModule.__getattr__ = _lookup
-            _FakeTensor.__init__ = _fake_tensor
+            runtime._FakeTensor.__init__ = _fake_tensor
+            runtime.from_dlpack = _from_dlpack
+            ReadOnlyTensorWrapper.__new__ = staticmethod(_read_only)
+
+
+def observing() -> bool:
+    """Whether cute.compile is observed: what it compiles from now on is
+    exported with its host function (quack's jit_cache asks of its entries)."""
+    return "compile" in _ORIGINALS
 
 
 def _concrete(v: Any) -> Any:
@@ -904,6 +941,22 @@ def _fake_tensor(self: Any, dtype: Any, shape: Any, *, stride: Any = None, **kwa
     _ORIGINALS["fake"](self, dtype, _concrete(shape), stride=_concrete(stride), **kwargs)
 
 
+def _read_only(cls: type, tensor: torch.Tensor) -> Any:
+    # a read-only export of a traced tensor is the traced tensor: a CuTe call
+    # takes it as it is, and a DLPack export of it declines
+    if isinstance(tensor, _TracedTensor):
+        return tensor
+    return _ORIGINALS["read_only"](cls, tensor)
+
+
+def _from_dlpack(tensor: Any, *args: Any, **kwargs: Any) -> Any:
+    # a TVM-FFI function takes a torch tensor where it takes a CuTe tensor, so
+    # a traced tensor bound for one stays traced for _intercept
+    if isinstance(tensor, _TracedTensor) and kwargs.get("enable_tvm_ffi") and not kwargs.get("force_tf32"):
+        return tensor
+    return _ORIGINALS["from_dlpack"](tensor, *args, **kwargs)
+
+
 def _compile(self: Any, func: Any, *args: Any, **kwargs: Any) -> Any:
     texts: dict[str, str] = {}
 
@@ -918,7 +971,16 @@ def _compile(self: Any, func: Any, *args: Any, **kwargs: Any) -> Any:
     hooks = kwargs.pop("trace_finalize_hooks", None)
     hooks = () if hooks is None else (hooks,) if callable(hooks) else tuple(hooks)
     args, kwargs = _concrete(args), {k: _concrete(v) for k, v in kwargs.items()}
-    result = _ORIGINALS["compile"](self, func, *args, trace_finalize_hooks=(*hooks, observe), **kwargs)
+    try:
+        result = _ORIGINALS["compile"](self, func, *args, trace_finalize_hooks=(*hooks, observe), **kwargs)
+    except Exception as ex:
+        if (tr := current_trace()) is None:
+            raise
+        # the call's SymInts reached the compile through the caller's objects
+        # (quack's RMSNorm.N); the eager fallback compiles it with integers
+        e = tr.decline(f"a CuTe DSL compile under the trace raised {type(ex).__name__}: {str(ex).splitlines()[0]}")
+        e.retry = True  # a later call finds the compile cached
+        raise e from ex
     name = getattr(result, "function_name", None)
     if name in texts:
         _compiles[result] = _program(texts[name], name)
@@ -968,7 +1030,8 @@ def _tvm_ffi_call(original: Callable[..., Any]) -> Callable[..., Any]:
         if tr is None:
             return original(self, *args, **kwargs)
         try:
-            return _intercept(tr, self, args, kwargs, original)
+            run = functools.partial(_intercept, tr, self, args, kwargs, original)
+            return tr.op(self, args, kwargs, run, host=True, redo=lambda a, k: call(self, *a, **k))
         except Declined as e:
             if e is tr.declined:
                 raise

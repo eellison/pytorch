@@ -40,7 +40,11 @@ A call from inside one of its own eager steps needs no special case: its
 buffers are its own allocations, and it leaves the kernel nodes it patches
 recorded, so the outer call patches what it needs when its next run starts.
 A call no variant holds is traced at its own inputs without a warm-up (the
-replay of its new capture is the call) and joins its family. A trace,
+replay of its new capture is the call) and joins its family, unless it
+folds into a variant whose graph guards hold it but not the own guards of
+some top-level ops (their selectors): each gains the trace's launches of its
+op as an entry, where the two tapes agree otherwise
+(_host_trace_lower_tape.fold). A trace,
 lowering or capture that declines runs the function eagerly, and that call's
 exact class is not traced again; under trust a Declined is the graph's, and
 no call is. Every eager fallback records its reason in `declines`, once per
@@ -49,9 +53,11 @@ reason.
 
 from __future__ import annotations
 
+import contextlib
 import inspect
 import logging
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import Any, TYPE_CHECKING
 
@@ -61,13 +67,16 @@ from torch._prims.rng_prims import _impl_graphsafe_rng
 from torch.cuda import _host_trace_cute  # noqa: F401  hooks cute.compile
 from torch.cuda._host_trace import Declined, declined
 from torch.cuda._host_trace_capture import capture_tape, instantiate_form, plain_attributes
-from torch.cuda._host_trace_lower_tape import lower_tape, PredictedOutput
+from torch.cuda._host_trace_lower_tape import fold, FoldRefused, lower_tape, PredictedOutput
 from torch.cuda._host_trace_memory import auto_memory, plan_memory, split_runs
+from torch.cuda._host_trace_opaque import library_state_as
+from torch.cuda._host_trace_redispatch import redispatch
 from torch.cuda._host_trace_native import (
     binding_row,
     CAPTURE,
     flatten_variant,
     HIT,
+    launch_row,
     MISALIGNED,
     MISS,
     native_variant,
@@ -78,6 +87,7 @@ from torch.cuda._host_trace_tape import (
     _gc_hold,
     _hint,
     argument_contract,
+    bind_opaque,
     current_trace,
     EagerCall,
     trace,
@@ -88,8 +98,14 @@ from torch.utils import _pytree as pytree
 if TYPE_CHECKING:
     from collections.abc import Callable, Collection, Sequence
 
+    from torch._ops import OpOverload
     from torch.cuda._host_trace_capture import CapturedTape
-    from torch.cuda._host_trace_lower_tape import LoweredEagerCall, LoweredOpaqueCall
+    from torch.cuda._host_trace_lower_tape import (
+        LoweredEagerCall,
+        LoweredLaunch,
+        LoweredMemset,
+        LoweredOpaqueCall,
+    )
     from torch.cuda._host_trace_memory import MemoryPlan
     from torch.cuda._host_trace_opaque import KeyedSite, OpaqueBinding, OpaqueKey, OpaqueProvider
     from torch.cuda._host_trace_tape import Tape, TrustedInputs
@@ -169,6 +185,8 @@ class _Variant:
     # per keyed site, a binding of each of its arms 1, 2, ...: its nodes at
     # other launch attributes, or a piece, nodes of their own in their place
     arms: dict[int, list[OpaqueBinding]] = field(default_factory=dict)
+    # the launches of the traces folded into it, which keep their functions loaded
+    folded: list[tuple[LoweredLaunch | LoweredMemset, ...]] = field(default_factory=list)
 
     @property
     def tape(self) -> Tape:
@@ -222,6 +240,7 @@ class HostTraceReplay(torch._C._HostTraceEntry):
     replay allocates (_host_trace_memory): "auto", "eager" or "run_buffer".
     `freed_arguments` are the positions whose tensor a boxed call's caller
     holds no other reference to, which split_runs may free mid-tape.
+    `static_shapes` are the tensor positions whose layout is static (trace).
 
     The call is the base's: a hit runs in C++, anything else is _call_slow."""
 
@@ -229,18 +248,18 @@ class HostTraceReplay(torch._C._HostTraceEntry):
         self,
         fn: Callable[..., Any],
         *,
-        max_variants: int = 16,
         trusted: TrustedInputs | None = None,
         opaque: Sequence[OpaqueProvider] = (),
         memory: str = "eager",
         freed_arguments: Collection[int] = (),
+        static_shapes: Collection[int] = (),
     ) -> None:
         if memory not in ("auto", "eager", "run_buffer"):
             raise ValueError(f"host_trace: memory {memory!r} is not 'auto', 'eager' or 'run_buffer'")
         self.fn = fn
         self.memory = memory
         self.freed_arguments = frozenset(freed_arguments)
-        self.max_variants = max_variants
+        self.static_shapes = frozenset(static_shapes)
         self.trusted = trusted
         self.opaque = opaque
         try:
@@ -256,6 +275,8 @@ class HostTraceReplay(torch._C._HostTraceEntry):
         # why each Triton launch that runs eagerly in a replay does, each once
         self.triton_fallbacks: dict[str, None] = {}
         self.traces = 0
+        # the learning variants' tapes rebuilt with their keys that bind bound, for no trace
+        self.relowers = 0
         self.replays = 0
         self.eager = 0
         # the traces that found nothing to capture (Declined.uncaptured)
@@ -265,6 +286,19 @@ class HostTraceReplay(torch._C._HostTraceEntry):
         self.structural = 0
         # the guards of every variant's tape, summed
         self.guards = 0
+        # the traces folded into a variant, and why each other one did not
+        # fold into a variant it was a candidate for
+        self.folds = 0
+        self.fold_refusals: dict[str, int] = {}
+        # the selector misses served by their ops dispatched again, no trace
+        # (_host_trace_redispatch), their seconds, and why each other did not
+        self.redispatches = 0
+        self.redispatch_s = 0.0
+        self.redispatch_refusals: dict[str, int] = {}
+        # the keys harvested at a keyed site's miss, no trace or relower
+        # (_learn), and their seconds
+        self.learned = 0
+        self.learn_s = 0.0
         # one call at a time: a call patches the execs it replays (a native
         # call holds the base's lock too)
         self._lock = threading.RLock()
@@ -302,14 +336,17 @@ class HostTraceReplay(torch._C._HostTraceEntry):
         with self._lock, _gc_hold:
             # a variant that does not learn holds the call once its keys bind
             pending = False
-            for variant in family or ():
+            candidates: list[tuple[_Variant, list[int], list[int]]] = []
+            for variant in tuple(family or ()):
                 if searched and not variant.learns:
                     continue
-                values = self._fill(variant, args)
+                held = len(candidates)
+                values = self._fill(variant, args, candidates)
                 if values is None:
-                    pending |= not variant.learns and variant.native.evaluate(args) is not None
+                    if len(candidates) == held:
+                        pending |= not variant.learns and variant.native.evaluate(args) is not None
                     continue
-                if variant.learns and len(self.variants) < self.max_variants:
+                if variant.learns:
                     # an opaque call whose key binds or is refused now is traced
                     # again, as its launches or as a plain eager step, unless a
                     # pending variant's keyed site takes the key
@@ -322,28 +359,83 @@ class HostTraceReplay(torch._C._HostTraceEntry):
                     ]
                     if final:
                         variant.tried.update(final)
-                        return self._miss(contract, args, before=variant)
+                        upgraded = self._relower(family, args, variant, values)
+                        if upgraded is None:
+                            return self._miss(contract, args, candidates, before=variant)
+                        if self._fill(upgraded, args, candidates) is not None:
+                            variant = upgraded
                 outcome, result = self._call_native(variant, args)
                 if outcome != MISS:
                     return self._served(variant.native, outcome, result, args)
-            return self._miss(contract, args)
+            # no variant holds the call: one whose graph guards do gains its
+            # failing selectors' entries from their ops dispatched again
+            for j, (variant, values, unselected) in enumerate(candidates if self.trusted is None else ()):
+                if not self._redispatch(variant, args, values, unselected):
+                    continue
+                del candidates[j]
+                if self._fill(variant, args, candidates) is not None:
+                    outcome, result = self._call_native(variant, args)
+                    if outcome != MISS:
+                        return self._served(variant.native, outcome, result, args)
+                break
+            return self._miss(contract, args, candidates)
 
-    def _fill(self, variant: _Variant, args: tuple) -> list[int] | None:
+    def _relower(self, family: list[_Variant], args: tuple, variant: _Variant, values: list[int]) -> _Variant | None:
+        """The learning variant's tape with its opaque calls bound (bind_opaque)
+        at their keys at its traced call, each learned (_learn) unless it binds,
+        or failing that only those whose keys bind at the call too, built and put
+        before it in its family: the variant a trace at the call makes. None
+        where the call must trace again: a key it refuses (a trace guards its
+        values), or one that binds whose key at the traced call does not, or
+        whose binding does not fit the site that key's binding records."""
+        lowered = variant.captured.lowered
+        if any(o.provider.refusal(o.key(values)) is not None for o in lowered.opaque.values()):
+            return None
+        calls = {id(lowered.steps[i].call): o for i, o in lowered.opaque.items()}
+        wanted = {c: b for c, o in calls.items() if (b := o.provider.bind(o.key(values))) is not None}
+        for ids, how in ((set(calls), self._learn), (set(wanted), None)):
+            bound = bind_opaque(variant.tape, ids, how)
+            if bound is not None and all(c in bound[1] and bound[1][c].fits(b) for c, b in wanted.items()):
+                break
+        else:
+            return None
+        try:
+            upgraded = self._build(bound[0])
+        except Declined:
+            return None
+        self.relowers += 1
+        family.insert(family.index(variant), upgraded)
+        self._register(family, args)
+        self.guards += upgraded.tape.guard_count
+        return upgraded
+
+    def _fill(self, variant: _Variant, args: tuple, candidates: list[tuple[_Variant, list[int], list[int]]]) -> list[int] | None:
         """The call's rows if the variant's program holds it, after adding
         each keyed site's missing key to its table and each segment's missing
         form; None if a key does not bind yet (a learning variant's eager run
-        harvests it)."""
+        harvests it), or if a selector selects nothing: then a variant that
+        does not learn is a candidate to dispatch those selectors' ops again
+        for, or to fold the call's trace into, (variant, rows, selectors) in
+        `candidates`."""
         evaluated = variant.native.evaluate(args)
         if evaluated is None:
             return None
-        values, missing, unformed = evaluated
+        values, missing, unformed, unselected = evaluated
+        if unselected:
+            if not variant.learns:
+                candidates.append((variant, values, unselected))
+            return None
         sites = variant.captured.lowered.sites
         bindings = []
         for i, key in missing:
             binding = sites[i].site.provider.bind(sites[i].key(key))
-            if binding is None:
-                return None
+            site = sites[i].site
+            if binding is None and not variant.learns and not site.rng and site.call is not None:
+                binding = self._learn(site.op, site.provider, site.call, sites[i].key(key))
             bindings.append((i, key, binding))
+        # past a key that does not bind the others still learn: a retrace then sees every refusal
+        if any(b is None for _, _, b in bindings):
+            return None
         for i, key, binding in bindings:
             arm = self._arm(variant, i, binding) if sites[i].site.fits(binding) else None
             if arm is None:
@@ -358,6 +450,41 @@ class HostTraceReplay(torch._C._HostTraceEntry):
         for g, arms in unformed:
             variant.native.add_form(g, arms, *self._form(variant, g, arms))
         return values
+
+    def _learn(self, op: OpOverload, provider: OpaqueProvider, call: tuple[Any, frozenset[int]], key: OpaqueKey) -> OpaqueBinding | None:
+        """The key's binding, harvested now from one eager run of `op` on
+        buffers at the key's metadata, `call` its pytree spec and its tensor
+        leaves' positions: no trace, no relower. None for a key the provider
+        refuses, or an input that is not floating point (its values may index).
+        The op draws no RNG: its run would draw from the generator."""
+        if provider.refusal(key) is not None:
+            return None
+        spec, positions = call
+        inputs = len(positions)
+        metadata = list(zip(key.dtypes, key.sizes, key.strides, key.align))
+        if not all(dtype.is_floating_point and align % dtype.itemsize == 0 for dtype, _, _, align in metadata[:inputs]):
+            return None
+        start = time.perf_counter()
+        device = torch.device("cuda", key.device)
+        generator = torch.Generator(device).manual_seed(0)
+        tensors = []
+        for dtype, sizes, strides, align in metadata[:inputs]:
+            span = 1 + sum((n - 1) * s for n, s in zip(sizes, strides)) if all(sizes) else 0
+            # the allocator's blocks are 512-byte aligned: the key's address % 256
+            flat = torch.empty(align // dtype.itemsize + span, dtype=dtype, device=device).uniform_(-1, 1, generator=generator)
+            tensors.append(flat.as_strided(sizes, strides, align // dtype.itemsize))
+        given, scalars = iter(tensors), iter(key.scalars)
+        args, kwargs = pytree.tree_unflatten([next(given) if j in positions else next(scalars) for j in range(spec.num_leaves)], spec)
+        with library_state_as(key.state), torch._C._AutoDispatchBelowADInplaceOrView():
+            out = op(*args, **kwargs)
+        fresh = [o for o in pytree.tree_leaves(out) if isinstance(o, torch.Tensor) and not any(o is t for t in tensors)]
+        want = [(dtype, sizes, strides, 0) for dtype, sizes, strides, _ in metadata[inputs:]]
+        if [(o.dtype, tuple(o.shape), o.stride(), o.storage_offset()) for o in fresh] != want:
+            return None
+        binding = provider.learn(key, args, kwargs, tensors + fresh)
+        self.learned += binding is not None
+        self.learn_s += time.perf_counter() - start
+        return binding
 
     def _arm(self, variant: _Variant, i: int, binding: OpaqueBinding) -> int:
         """Site i's arm for the binding: 0 its nodes' topology, k > 0 its k-th
@@ -466,7 +593,11 @@ class HostTraceReplay(torch._C._HostTraceEntry):
         return self.fn(*args, **kwargs)
 
     def _miss(
-        self, contract: tuple, args: Sequence[Any], before: _Variant | None = None
+        self,
+        contract: tuple,
+        args: Sequence[Any],
+        candidates: Sequence[tuple[_Variant, list[int], list[int]]] = (),
+        before: _Variant | None = None,
     ) -> Any:
         if any(v.native.overlaps(tuple(args)) for v in self._families.get(contract, ())):
             # an assertion, not a dispatch: eager raises its error or runs it
@@ -476,11 +607,6 @@ class HostTraceReplay(torch._C._HostTraceEntry):
         structural = contract if self.trusted is not None else exact
         if structural in self._declined or exact in self._declined:
             return self._eager(args, {})
-        if any(isinstance(a, torch.Tensor) and a.numel() == 0 for a in args):
-            # trace declines an empty argument, and a tape guards its nonempty
-            return self._eager(args, {}, "an empty tensor argument")
-        if len(self.variants) >= self.max_variants:
-            return self._eager(args, {}, f"max_variants ({self.max_variants}) exist")
         device = next((a.device for a in args if isinstance(a, torch.Tensor)), None)
         if device is not None and device.type == "cuda" and _capturing(device):
             # not a decline of the class: the capture ends
@@ -488,7 +614,7 @@ class HostTraceReplay(torch._C._HostTraceEntry):
         # the entry's first trace warms up (lazy initialization happens outside
         # the trace, and the warm-up is the call); a later trace does not
         warm_up = self.traces == 0
-        ran, result, tape = False, None, None
+        ran, result, tape, folded = False, None, None, None
         self.traces += 1
         try:
             tape = trace(
@@ -497,11 +623,14 @@ class HostTraceReplay(torch._C._HostTraceEntry):
                 warm_up=warm_up,
                 trusted=self.trusted,
                 opaque=self.opaque,
+                static_shapes=self.static_shapes,
             )
             ran, result, tape.warm_up_result = warm_up, tape.warm_up_result, None
             if self.trusted is None and tape.contract != contract:
                 raise declined("the call changed the global state")
-            variant = self._build(tape)
+            folded = next((v for v, values, unselected in candidates if self._fold(v, values, unselected, tape, args)), None)
+            if folded is None:
+                variant = self._build(tape)
         except Exception as e:
             if isinstance(e, AssertionError) and tape is not None:
                 raise  # the lowering's or capture's own bug
@@ -514,6 +643,10 @@ class HostTraceReplay(torch._C._HostTraceEntry):
                     self._meta_disagrees.add(e.meta_op)
             elif warm_up and tape is None:
                 raise  # the warm-up's own error: the call's
+            # the raise site's frame holds the exception, and its traceback holds
+            # the frames up to this call's (its arguments, the tape): a cycle
+            # only a gc frees, and the call's memory would outlive it
+            e.__traceback__ = None
             if not isinstance(e, Declined):
                 self._declined.add(exact)  # an OOM, say: the call's, not the graph's
             elif not e.retry:
@@ -530,10 +663,17 @@ class HostTraceReplay(torch._C._HostTraceEntry):
                 self.eager += 1
                 return result
             return self._eager(args, {})
+        if folded is not None:
+            if ran:
+                return result
+            outcome, result = self._call_native(folded, tuple(args))
+            if outcome == MISS:
+                raise AssertionError("host_trace: a call misses the variant its trace folded into")
+            return self._served(folded.native, outcome, result, tuple(args))
         family = self._families.setdefault(contract, [])
         family.insert(family.index(before) if before in family else len(family), variant)
         self._register(family, tuple(args))
-        self.guards += len(tape.guards)
+        self.guards += tape.guard_count
         lowered = variant.captured.lowered
         if lowered.opaque and (evaluated := variant.native.evaluate(tuple(args))) is not None:
             values = evaluated[0]
@@ -544,6 +684,42 @@ class HostTraceReplay(torch._C._HostTraceEntry):
         if outcome == MISS:
             raise AssertionError("host_trace: a call misses the tape traced at it")
         return self._served(variant.native, outcome, result, tuple(args))
+
+    def _fold(self, variant: _Variant, values: list[int], unselected: list[int], tape: Tape, args: Sequence[Any]) -> bool:
+        """Whether the trace of the call `args` folds into the variant, whose
+        graph guards hold the call (at rows `values`) but not the selectors
+        `unselected`: each of those gains the trace's launches of its op as an
+        entry (_host_trace_lower_tape.fold)."""
+        if not self._add_entries(variant, self.fold_refusals, fold, variant.captured.lowered, tape, args, values, unselected):
+            return False
+        self.folds += 1
+        return True
+
+    def _redispatch(self, variant: _Variant, args: tuple, values: list[int], unselected: list[int]) -> bool:
+        """Whether the selectors `unselected` of the variant, whose graph
+        guards hold the call, gain entries from their ops dispatched again at
+        the call's metadata (_host_trace_redispatch): no trace."""
+        start = time.perf_counter()
+        added = self._add_entries(variant, self.redispatch_refusals, redispatch, variant.captured.lowered, args, values, unselected)
+        # a refusal keeps the rows it appended, evaluated at the call, which a fold reads
+        values += variant.captured.lowered.lowering.program.values[len(values) :]
+        self.redispatch_s += time.perf_counter() - start
+        self.redispatches += added
+        return added
+
+    def _add_entries(self, variant: _Variant, refusals: dict[str, int], make: Callable[..., Any], *make_args: Any) -> bool:
+        try:
+            program, entries = make(*make_args)
+        except FoldRefused as e:
+            if e.program is not None:
+                variant.native.set_program(e.program)
+            refusals[str(e)] = refusals.get(str(e), 0) + 1
+            return False
+        variant.native.set_program(program)
+        for site, predicate, launches in entries:
+            variant.native.add_entry(site, predicate, tuple(map(launch_row, launches)))
+            variant.folded.append(launches)
+        return True
 
     def _build(self, tape: Tape) -> _Variant:
         if not hasattr(torch._C, "_HostTraceVariant"):
@@ -615,6 +791,8 @@ def _eager_step(
 
     def run(leaves: list[Any], values: Sequence[int]) -> tuple:
         key = bound = None
+        # the library state eager's call read at the trace
+        state = library_state_as(step.call.state) if step.call.state else contextlib.nullcontext()
         if opaque is not None:
             key = opaque.key(values)
             bound = opaque.provider.bind(key)
@@ -639,7 +817,7 @@ def _eager_step(
             grid = tuple(values[r] for r in step.grid or ())
             jit.run(*call_args, grid=grid, warmup=False, **options)
             return ()
-        with torch._C._AutoDispatchBelowADInplaceOrView():
+        with state, torch._C._AutoDispatchBelowADInplaceOrView():
             if step.call.generator is None:
                 out = target(*call_args, **call_kwargs)
             else:

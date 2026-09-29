@@ -257,8 +257,9 @@ def split_runs(
     """The tape with runs split where a tensor or `freed` argument held to
     its run's end is live at the replay's peak, and its "eager" plan: while
     the peak is an allocation inside a run that drops either, the run is
-    split just before that allocation's first launch, which drops those used
-    only before it once the first part is queued, if that lowers the peak.
+    split just before that allocation's first launch or just after the last
+    earlier launch that uses one of them, whichever lowers the peak most,
+    which drops those used only before it once the first part is queued.
     Decided at the traced call's sizes; each split costs a graph launch per
     replay."""
     nbytes, arguments = _nbytes(lowered), _argument_nbytes(lowered, freed)
@@ -276,17 +277,36 @@ def split_runs(
             return lowered, plan
         launches = range(run.start, run.stop)
         cut = next((j for j in launches if lowered.launches[j].seq > seq), run.stop)
-        if cut in (run.start, run.stop) or cut in inside:
+        # also just after the last launch before `cut` that uses each dropped
+        # tensor or argument: the peak's allocation may come after an earlier
+        # one that splitting there does not lower
+        held = set(m.drops)
+        held_args = {a for a in m.arguments if arguments.get(a)}
+        last_use = {}
+        for j in range(run.start, cut):
+            for slot in lowered.launches[j].slots:
+                if not isinstance(slot, PointerSlot):
+                    continue
+                if slot.root[0] == "argument" and slot.root[1] in held_args:
+                    last_use[("argument", slot.root[1])] = j + 1
+                elif slot.base in held:
+                    last_use[slot.base] = j + 1
+        best = None
+        for c in sorted({cut, *last_use.values()}):
+            if c in (run.start, run.stop) or c in inside:
+                continue
+            steps = (*lowered.steps[:i], range(run.start, c), range(c, run.stop))
+            opaque = {k + (k > i): o for k, o in lowered.opaque.items()}
+            split = dataclasses.replace(
+                lowered, steps=steps + lowered.steps[i + 1 :], opaque=opaque
+            )
+            split_plan = plan_memory(split)
+            split_peak = _peak(split, split_plan, nbytes, arguments)[0]
+            if split_peak < peak and (best is None or split_peak < best[0]):
+                best = (split_peak, split, split_plan)
+        if best is None:
             return lowered, plan
-        steps = (*lowered.steps[:i], range(run.start, cut), range(cut, run.stop))
-        opaque = {k + (k > i): o for k, o in lowered.opaque.items()}
-        split = dataclasses.replace(
-            lowered, steps=steps + lowered.steps[i + 1 :], opaque=opaque
-        )
-        split_plan = plan_memory(split)
-        if _peak(split, split_plan, nbytes, arguments)[0] >= peak:
-            return lowered, plan
-        lowered, plan = split, split_plan
+        _, lowered, plan = best
 
 
 def auto_memory(

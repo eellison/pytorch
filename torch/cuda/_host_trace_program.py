@@ -13,6 +13,7 @@ miss.
 
 from __future__ import annotations
 
+import math
 import operator
 import struct
 from enum import IntEnum
@@ -36,6 +37,7 @@ class Status(IntEnum):
     DIVISION_DOMAIN = 3
     BOOLEAN_DOMAIN = 4
     SHIFT_DOMAIN = 5
+    FLOAT_DOMAIN = 6
 
 
 class OutOfDomain(ValueError):
@@ -70,6 +72,11 @@ _ARITY = {
     "bitlength": 1,
     "lshift": 2,
     "f32div": 2,
+    "tofloat": 1,
+    "fsqrt": 1,
+    "fdiv": 2,
+    "feq": 2,
+    "flt": 2,
     "select": 3,
     **dict.fromkeys(_COMPARISONS, 2),
     **dict.fromkeys(_BITWISE, 2),
@@ -82,6 +89,15 @@ def f32_bits(n: int, d: int) -> int:
     float32 quotient."""
     f = [struct.unpack("<f", struct.pack("<f", x))[0] for x in (n, d)]
     return struct.unpack("<i", struct.pack("<f", f[0] / f[1]))[0]
+
+
+def f64_bits(x: float) -> int:
+    """A double's bits as an int64: a float row's value."""
+    return struct.unpack("<q", struct.pack("<d", x))[0]
+
+
+def f64(bits: int) -> float:
+    return struct.unpack("<d", struct.pack("<q", bits))[0]
 
 
 def _fits(value: int) -> bool:
@@ -117,6 +133,19 @@ def _step(op: str, args: list[int]) -> int | Status:
         if n < 0 or d <= 0:
             return Status.DIVISION_DOMAIN
         return f32_bits(n, d)
+    if op == "tofloat":
+        return f64_bits(float(args[0]))
+    if op == "fsqrt":
+        x = f64(args[0])
+        return f64_bits(math.sqrt(x)) if 0.0 <= x < math.inf else Status.FLOAT_DOMAIN
+    if op == "fdiv":
+        x, y = map(f64, args)
+        q = x / y if y != 0.0 else math.nan
+        return f64_bits(q) if math.isfinite(q) else Status.FLOAT_DOMAIN
+    if op == "feq":
+        return int(f64(args[0]) == f64(args[1]))
+    if op == "flt":
+        return int(f64(args[0]) < f64(args[1]))
     if op in ("and", "select"):
         if any(b not in (0, 1) for b in args[: 2 if op == "and" else 1]):
             return Status.BOOLEAN_DOMAIN
@@ -142,6 +171,10 @@ class IntegerProgram:
       ("lshift", a, b)                  a * 2**b, for b >= 0
       ("f32div", a, b)                  float(a) / float(b)'s float32 bits, as
                                         an int32, for a >= 0 and b > 0
+      ("tofloat", a)                    float(a)'s bits as an int64
+      ("fsqrt", a), ("fdiv", a, b)      math.sqrt and / on the doubles whose
+                                        bits a and b are, for a finite result
+      ("feq" | "flt", a, b)             the doubles' == and <
       ("min" | "max", a, b, ...)
       ("select", cond, if_true, if_false)
     where a, b, ... are earlier rows. floordiv and ceildiv are defined for a
@@ -149,6 +182,12 @@ class IntegerProgram:
     a caller lowering another division (Python's floor on negative operands,
     a modulo) builds it from these. Every row is evaluated at the hints when
     it is emitted (`values`); one that fails there raises OutOfDomain.
+    While `domains` is a list, a division or shift emitted reads admitted
+    operands (numerator 0, divisor 1, shift 0 where its own are not) and
+    appends the row that is 1 where its own are: it fails at no call. So do
+    fsqrt (of a nonnegative double) and fdiv, admitted only for a divisor of
+    magnitude at least 1, where no finite quotient overflows; an fdiv outside
+    that at the hints raises OutOfDomain.
     """
 
     def __init__(self, inputs: Sequence[Any]) -> None:
@@ -156,8 +195,36 @@ class IntegerProgram:
         self.instructions: list[tuple] = []
         self.values: list[int] = []
         self._rows: dict[tuple, int] = {}
+        self.domains: list[int] | None = None
 
     def emit(self, op: str, *operands: int) -> int:
+        if self.domains is not None and op in ("floordiv", "ceildiv", "f32div", "lshift", "fsqrt", "fdiv"):
+            domains, self.domains = self.domains, None
+            try:
+                a, *rest = operands
+                zero = self.emit("constant", 0)  # also +0.0's bits
+                if op == "fsqrt":
+                    ok = self.emit("select", self.emit("flt", a, zero), zero, self.emit("constant", 1))
+                    operands = (self.emit("select", ok, a, zero),)
+                elif op == "fdiv":
+                    (b,) = rest
+                    one, minus_one = self.emit("constant", f64_bits(1.0)), self.emit("constant", f64_bits(-1.0))
+                    small = self.emit("and", self.emit("flt", b, one), self.emit("flt", minus_one, b))
+                    ok = self.emit("select", small, zero, self.emit("constant", 1))
+                    if self.values[ok] != 1:
+                        raise OutOfDomain(Status.FLOAT_DOMAIN, (op, *operands))
+                    operands = (self.emit("select", ok, a, zero), self.emit("select", ok, b, one))
+                elif op == "lshift":
+                    (b,) = rest
+                    ok = self.emit("ge", b, zero)
+                    operands = (a, self.emit("select", ok, b, zero))
+                else:
+                    (b,) = rest
+                    ok = self.emit("and", self.emit("ge", a, zero), self.emit("gt", b, zero))
+                    operands = (self.emit("select", ok, a, zero), self.emit("select", ok, b, self.emit("constant", 1)))
+                domains.append(ok)
+            finally:
+                self.domains = domains
         row = (op, *operands)
         index = self._rows.get(row)
         if index is not None:

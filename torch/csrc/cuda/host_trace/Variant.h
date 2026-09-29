@@ -3,6 +3,7 @@
 #include <torch/csrc/python_headers.h>
 
 #if !defined(USE_ROCM)
+#include <ATen/Context.h>
 #include <ATen/core/dispatch/Dispatcher.h>
 #include <ATen/cuda/CUDAGraph.h>
 #include <c10/util/SmallVector.h>
@@ -85,6 +86,16 @@ struct View {
   std::optional<at::ScalarType> dtype;
 };
 
+// The global cuBLAS state a call read at the trace (library_state())
+struct BlasState {
+  at::Float32Precision matmul;
+  at::CuBLASReductionOption fp16;
+  at::CuBLASReductionOption bf16;
+  bool fp16_accumulation;
+  std::optional<int32_t> carveout;
+  at::BlasBackend backend;
+};
+
 // A replay of one variant of torch/cuda/_host_trace_replay.py, from its
 // validation to its outputs, built once from flatten_variant's VariantSpec
 // (torch/cuda/_host_trace_native.py). Only a step the boxed dispatcher cannot
@@ -100,8 +111,9 @@ class HostTraceVariant {
   // frame.site_entries; false when the call misses
   bool evaluate(PyObject* const* args, size_t count, Frame& frame) const;
   // (rows, [(site, key), ...] the tables lack, [(segment, arms), ...] the
-  // forms lack) at the call, or None when it misses otherwise (a site
-  // declines its key); the forms only once no key is missing
+  // forms lack, [site, ...] the selectors none of whose predicates holds) at
+  // the call, or None when it misses otherwise (a site declines its key); the
+  // forms only once no key is missing
   py::object evaluate_py(py::handle args) const;
   // Whether the call's rows hold and a pair of its arguments overlaps: the
   // call runs eagerly
@@ -117,6 +129,12 @@ class HostTraceVariant {
       int32_t arm,
       bool piece,
       const std::vector<int64_t>& scratch);
+  // Adds a selector's entry: its nodes (_host_trace_native.launch_row, with
+  // rows for the launch dimensions and memset extents), run where predicate
+  // holds and no earlier entry's does
+  void add_entry(size_t site, int64_t predicate, py::handle nodes);
+  // Replaces the program by one that extends it (rows added, for add_entry)
+  void set_program(const HostTraceProgram& program);
   // Adds a form of the segment: exec, an instantiation of graph, a clone of
   // the segment's graph with each of its sites' kernel nodes at the launch
   // attributes of the site's arm in `arms`, or, a piece arm's site, its nodes
@@ -134,7 +152,7 @@ class HostTraceVariant {
   py::tuple call_py(py::handle args);
   // Per record, None or what its exec node holds, as _Variant.held: a
   // kernel's (grid, per-parameter bytes), a memset's (address, width, height,
-  // pitch)
+  // pitch), a memcpy's (dst, src, bytes)
   py::list held_images() const;
   // The eager steps that call Python, and the calls of them
   size_t python_steps() const;
@@ -207,10 +225,16 @@ class HostTraceVariant {
     bool constant_shape;
     std::array<int64_t, 3> shape; // a keyed row's
   };
-  // One kernel or memset node of a segment. Its topology (kind, launch
+  // A 1D device-to-device memcpy (copy_'s cudaMemcpyAsync); no keyed site's
+  struct MemcpyRow {
+    Field dst;
+    Field src;
+    int64_t bytes_row;
+  };
+  // One kernel, memset or memcpy node of a segment. Its topology (kind, launch
   // attributes, programmatic edge into it) is fixed at instantiation; a keyed
   // site's rows share it (a binding of another topology is another variant's).
-  enum class Kind : uint8_t { Kernel, Memset };
+  enum class Kind : uint8_t { Kernel, Memset, Memcpy };
   struct Record {
     Kind kind;
     CUgraphNode node;
@@ -224,6 +248,9 @@ class HostTraceVariant {
     // a memset's
     MemsetRow memset;
     std::array<int64_t, 4> held_memset; // address, width, height, pitch
+    // a memcpy's
+    MemcpyRow copy;
+    std::array<int64_t, 3> held_copy; // dst, src, bytes
   };
   // A key's rows, per site node the kernel or memset of the node's kind
   struct Entry {
@@ -235,9 +262,13 @@ class HostTraceVariant {
     int32_t arm = 0;
     std::vector<int64_t> scratch; // bytes per the site's scratch buffer
   };
-  // A keyed launch table: per key, filled once, the row its nodes run
+  // A keyed launch table: per key, filled once, the row its nodes run. A
+  // selector (a top-level op's own guards) has no key: the first of its
+  // predicates that holds picks the row
   struct Site {
     std::vector<int64_t> key_rows;
+    // a selector's: its records' own, then per entry
+    std::vector<int64_t> predicates;
     std::vector<size_t> records; // per node
     std::vector<int64_t> keys; // key_rows.size() values per key
     // per key: 0 the records' own, k > 0 entries[k - 1], -1 declined
@@ -245,7 +276,7 @@ class HostTraceVariant {
     std::unordered_map<uint64_t, c10::SmallVector<uint32_t, 1>> index;
     std::vector<std::unique_ptr<Entry>> entries;
     std::vector<int64_t> scratch; // its scratch buffers' allocations
-    size_t segment; // its records'
+    size_t segment; // its records' (a selector of no records: none)
   };
   struct Segment {
     py::object graph; // the torch.cuda.CUDAGraph
@@ -345,6 +376,7 @@ class HostTraceVariant {
     std::vector<Predicted> outputs;
     py::object target; // the op, for the disagreement
     std::string name; // str(target)
+    std::optional<BlasState> blas; // unset: the state at the replay
   };
   struct Step {
     int64_t segment; // or -1: eager_[eager]
@@ -387,6 +419,8 @@ class HostTraceVariant {
   bool disjoint(PyObject* const* args, size_t count) const;
   // The key's index in the site's table, or -1
   int64_t find(const Site& s, const int64_t* key) const;
+  // The selector's row at values, or -1
+  static int64_t select(const Site& s, const int64_t* values);
   void insert(Site& s, const int64_t* key, int64_t row);
   KernelRow& kernel_row(Record& r, int64_t row) const;
   const KernelRow& kernel_row(const Record& r, int64_t row) const;
@@ -437,6 +471,10 @@ class HostTraceVariant {
       uint8_t* image) const;
   std::array<int64_t, 4> memset_shape(
       const MemsetRow& m,
+      const int64_t* v,
+      const int64_t* bases) const;
+  std::array<int64_t, 3> memcpy_shape(
+      const MemcpyRow& m,
       const int64_t* v,
       const int64_t* bases) const;
   void patch_and_replay(Segment& run, Frame& frame);

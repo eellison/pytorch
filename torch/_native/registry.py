@@ -315,6 +315,8 @@ _defined_native_ops: set[str] = set()
 # key. Torch's Library has no per-kernel removal API -- `_destroy` on the
 # library is the only teardown mechanism.
 _aten_override_libs: dict[tuple[str, str], torch.library.Library] = {}
+# the kernel each of those libraries installed
+_aten_override_kernels: dict[tuple[str, str], Callable] = {}
 
 
 def _get_def_library(namespace: str) -> torch.library.Library:
@@ -357,11 +359,13 @@ def _install_aten_override(op_symbol: str, dispatch_key: str, kernel: Callable) 
     lib = torch.library.Library("aten", "IMPL", dispatch_key)
     lib.impl(op_symbol, kernel, dispatch_key, with_keyset=True)
     _aten_override_libs[key] = lib
+    _aten_override_kernels[key] = kernel
 
 
 def _destroy_aten_override(op_symbol: str, dispatch_key: str) -> None:
     """Tear down the aten override at (op_symbol, dispatch_key), if any."""
     lib = _aten_override_libs.pop((op_symbol, dispatch_key), None)
+    _aten_override_kernels.pop((op_symbol, dispatch_key), None)
     if lib is not None:
         lib._destroy()
 

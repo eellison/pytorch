@@ -12,6 +12,7 @@ import sympy
 import torch
 from torch.cuda._host_trace import Declined
 from torch.cuda._host_trace_capture import capture_tape
+from torch.cuda._host_trace_launch import KernelLaunch
 from torch.cuda._host_trace_lower import Lowering
 from torch.cuda._host_trace_lower_tape import lower_tape
 from torch.cuda._host_trace_program import compile_program, IntegerProgram
@@ -152,6 +153,30 @@ if HAS_TRITON:
         x = tl.load(x_ptr + i, mask=m)
         keep = tl.rand(seed, i) > p
         tl.store(y_ptr + i, tl.where(keep, x / (1 - p), 0.0), mask=m)
+
+    @torch.library.custom_op("host_trace_test::add_one", mutates_args=(), device_types="cuda")
+    def _add_one(x: torch.Tensor) -> torch.Tensor:
+        # the block is picked from the size after the fake kernel fixed the output
+        y = torch.empty_like(x)
+        n = x.numel()
+        b = 1024 if n >= 4096 else 128
+        _add[(triton.cdiv(n, b),)](x, y, n, 1, B=b)
+        return y
+
+    _add_one.register_fake(lambda x: torch.empty_like(x))
+
+    @triton.jit
+    def _neg(x_ptr, y_ptr, n, B: tl.constexpr):
+        i = tl.program_id(0) * B + tl.arange(0, B)
+        m = i < n
+        tl.store(y_ptr + i, -tl.load(x_ptr + i, mask=m), mask=m)
+
+    def _native_neg(x):
+        y = torch.empty_like(x)
+        n = x.numel()
+        b = 1024 if n >= 4096 else 128
+        _neg[(triton.cdiv(n, b),)](x, y, n, B=b)
+        return y
 
 
 def _launches(tape):
@@ -551,6 +576,49 @@ class TestTritonLaunch(TestCase):
 
         with self.assertRaisesRegex(Declined, "SymFloat"):
             trace(f, (self.x, 1000))
+
+    def test_a_specialization_flip_dispatches_again_into_one_variant(self):
+        # n's divisibility is the launch's own guard: n % 16 != 0 is another
+        # binary, an entry of the one variant from the launch dispatched again
+        f = _add_call(_add)
+        (op,) = trace(f, (self.x, 1024, 3)).ops
+        self.assertEqual(op.kind, "traced")
+        self.assertTrue(op.guards)
+        r = HostTraceReplay(f)
+        for n in (1024, 1000, 2048, 1000):
+            self.assertEqual(r(self.x, n, 3)[:n], self.x[:n] + 3)
+        self.assertEqual((r.traces, r.folds, r.redispatches, len(r.variants), r.eager), (1, 0, 1, 1, 0))
+
+    def test_a_custom_ops_kernel_choice_dispatches_again_into_one_variant(self):
+        tape = trace(_add_one, (self.x,))
+        self.assertEqual([op.kind for op in tape.ops], ["traced"])
+        self.assertIsInstance(_launches(tape)[0], KernelLaunch)
+        r = HostTraceReplay(_add_one)
+        for n in (8192, 1024, 8192, 1024, 4096):
+            x = torch.randn(n, device="cuda")
+            self.assertEqual(r(x), x + 1, atol=0, rtol=0)
+        self.assertEqual((r.traces, r.folds, r.redispatches, len(r.variants), r.eager), (1, 0, 1, 1, 0))
+
+    def test_a_torch_native_routers_kernel_choice_dispatches_again_into_one_variant(self):
+        # the router's condition, the override and its launch are aten.neg's host
+        from torch._native import registry
+
+        graphs = dict(registry._graphs)
+        registry.register_op_override("host_trace_test", "aten", "neg", "CUDA", lambda x: x.dim() == 1, _native_neg)
+        registry._register_overrides_from_graph("neg", "CUDA", registry._graphs[("neg", "CUDA")])
+        try:
+            tape = trace(torch.neg, (self.x,))
+            self.assertEqual([op.kind for op in tape.ops], ["traced"])
+            self.assertIsInstance(_launches(tape)[0], KernelLaunch)
+            r = HostTraceReplay(torch.neg)
+            for n in (8192, 1024, 8192, 1024, 4096):
+                x = torch.randn(n, device="cuda")
+                self.assertEqual(r(x), -x, atol=0, rtol=0)
+            self.assertEqual((r.traces, r.folds, r.redispatches, len(r.variants), r.eager), (1, 0, 1, 1, 0))
+        finally:
+            registry._destroy_aten_override("neg", "CUDA")
+            registry._graphs.clear()
+            registry._graphs.update(graphs)
 
 
 _REVIEWED = {

@@ -21,6 +21,7 @@ class HostTraceProgram {
     DivisionDomain = 3,
     BooleanDomain = 4,
     ShiftDomain = 5,
+    FloatDomain = 6,
   };
 
   HostTraceProgram(
@@ -60,6 +61,11 @@ class HostTraceProgram {
     BitLength,
     LShift,
     F32Div,
+    ToFloat,
+    FSqrt,
+    FDiv,
+    FEq,
+    FLt,
     Min,
     Max,
     Select,

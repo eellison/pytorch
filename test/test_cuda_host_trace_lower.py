@@ -1,5 +1,6 @@
 # Owner(s): ["module: cuda graphs"]
 
+import math
 import random
 
 import sympy
@@ -26,6 +27,8 @@ from torch.utils._sympy.functions import (
     BitwiseFn_bitwise_or,
     BitwiseFn_bitwise_xor,
     CeilToInt,
+    FloatPow,
+    FloatTrueDiv,
     FloorDiv,
     FloorToInt,
     IntTrueDiv,
@@ -34,6 +37,7 @@ from torch.utils._sympy.functions import (
     Mod,
     PowByNatural,
     PythonMod,
+    ToFloat,
 )
 
 
@@ -170,6 +174,44 @@ class TestLowering(TestCase):
         with self.assertRaisesRegex(Declined, "fails at the hints"):
             _lowered([FloorDiv(S, T)], hint=(1, 1, 1, 0))
 
+    def test_float_relations_round_as_the_host(self):
+        # sqrt and / on doubles, each correctly rounded as c10's SymFloat
+        # computes them; 2921 is the first int whose pow(x, 0.5) is not sqrt(x)
+        self.assertTrue(math.pow(2921, 0.5) != math.sqrt(2921))
+        ks = [*range(1, 101), 2921, 3541, 5579]
+        root, quotient = FloatPow(ToFloat(P), 0.5), FloatTrueDiv(ToFloat(S), ToFloat(T))
+        recip = FloatTrueDiv(1.0, root)
+        cases = [(sympy.Eq(root, r), lambda p, s, t, r=r: math.sqrt(p) == r) for r in map(math.sqrt, ks)]
+        cases += [(sympy.Eq(recip, 1 / r), lambda p, s, t, r=r: 1 / math.sqrt(p) == 1 / r) for r in map(math.sqrt, ks)]
+        cases += [
+            (sympy.Ne(root, 0), lambda p, s, t: True),
+            (sympy.Lt(root, 30.0), lambda p, s, t: math.sqrt(p) < 30.0),
+            (sympy.Le(recip, 0.125), lambda p, s, t: 1 / math.sqrt(p) <= 0.125),
+            (sympy.Ge(ToFloat(S), 0.0), lambda p, s, t: s >= 0),
+            (sympy.Gt(quotient, -2.5), lambda p, s, t: s / t > -2.5),
+            (sympy.Eq(quotient, -2.5), lambda p, s, t: s / t == -2.5),
+            (sympy.Eq(ToFloat(S), 7), lambda p, s, t: s == 7),
+        ]
+        compiled, rows = _lowered([e for e, _ in cases])
+        for p in [*range(1, 6001, 29), 63, 64, 65, 899, 900, 901, 2921, 3541, 5579, 2**53 + 1]:
+            for s, t in [(5, -2), (7, -3), (-5, 2), (0, -1), (-3, 7)]:
+                status, outputs = compiled.evaluate_inputs((p, 1, s, t))
+                self.assertEqual(status, Status.SUCCESS)
+                want = [int(fn(p, s, t)) for _, fn in cases]
+                self.assertEqual([outputs[r] for r in rows], want, (p, s, t))
+        self.assertEqual(compiled.evaluate_inputs((4, 1, 7, 0))[0], Status.FLOAT_DOMAIN)
+
+    def test_float_declines(self):
+        root = FloatPow(ToFloat(P), 0.5)
+        cases = [
+            sympy.Eq(FloatPow(ToFloat(P), -0.5), 0.125),  # Python's pow, not 1 / sqrt
+            sympy.Eq(2.0 * root, 1.0),  # sympy reassociates float products
+            sympy.Eq(ToFloat(P), sympy.Float("0.1", 30)),  # not a double
+        ]
+        for e in cases:
+            with self.assertRaises(Declined, msg=str(e)):
+                _lowered([e])
+
 
 def _holds(compiled, row, inputs):
     result = compiled.evaluate_inputs(inputs)
@@ -251,6 +293,26 @@ class TestPredicate(TestCase):
         self.assertFalse(_holds(compiled, predicate, [torch.empty(16, 5)]))
         self.assertFalse(_holds(compiled, predicate, [torch.empty(0, 5)]))  # n > 0
         self.assertFalse(_holds(compiled, predicate, [3]))
+
+    def test_default_sdpa_scale(self):
+        # sdp::calculate_scale's 1 / sqrt(head_dim) under the trace: c10's
+        # SymFloat::sqrt is pow(0.5), and the kernel reads the guarded double
+        def trace(head_dim):
+            env = _TraceShapeEnv()
+            d = env.symbol(head_dim, "d", positive=True)
+            self.assertTrue(float(1.0 / torch.sym_float(d) ** 0.5) == 1.0 / math.pow(head_dim, 0.5))
+            program = IntegerProgram([head_dim])
+            predicate = Lowering(program, {d.node.expr: ("boxed", 0)}).predicate([g.expr for g in env.guards])
+            return compile_program(program), predicate
+
+        compiled, predicate = trace(80)
+        holds = [v for v in range(1, 4000) if _holds(compiled, predicate, [v])]
+        self.assertEqual(holds, [80])
+        # 1 / pow(d, 0.5) is 1 / sqrt(d) at 2921 though the roots differ; at
+        # 5579 the traced hint is not eager's scale: no trace
+        trace(2921)
+        with self.assertRaisesRegex(Declined, "false at the hints under sqrt"):
+            trace(5579)
 
     def test_a_guard_false_at_the_hints_is_an_internal_error(self):
         program = IntegerProgram([3])

@@ -2149,24 +2149,28 @@ void layer_norm_launches(Recorder& rec, const c10::SymInt& M, const c10::SymInt&
 }
 
 // layer_norm_cuda (rms_norm: _fused_rms_norm_cuda, whose mean is undefined)
-// for a contiguous input, weight and bias of its dtype; the fake kernel has run
+// for an input, weight and bias of one dtype; the fake kernel has run
 // _check_layer_norm_inputs
 template <bool rms_norm>
-std::tuple<TensorBase, TensorBase, TensorBase> traced_layer_norm(Recorder& rec, const TensorBase& input, int64_t normalized_ndim, const TensorBase& weight, const TensorBase& bias, double eps) {
-  const int64_t axis = input.dim() - normalized_ndim;
+std::tuple<TensorBase, TensorBase, TensorBase> traced_layer_norm(Recorder& rec, const TensorBase& input_, int64_t normalized_ndim, const TensorBase& weight_, const TensorBase& bias_, double eps) {
+  const int64_t axis = input_.dim() - normalized_ndim;
   TORCH_INTERNAL_ASSERT(normalized_ndim > 0 && axis >= 0);
-  const ScalarType dtype = input.scalar_type();
+  const ScalarType dtype = input_.scalar_type();
   if (dtype != kHalf && dtype != kBFloat16 && dtype != kFloat && dtype != kDouble) {
     decline(c10::str("a ", dtype, " layer norm"));
   }
-  if (!input.is_contiguous()) {
-    decline("a layer norm of a non-contiguous input");
-  }
-  for (const TensorBase* t : {&weight, &bias}) {
-    if (t->defined() && (t->scalar_type() != dtype || !t->is_contiguous())) {
-      decline("a layer norm weight or bias of another dtype or non-contiguous");
+  for (const TensorBase* t : {&weight_, &bias_}) {
+    if (t->defined() && t->scalar_type() != dtype) {
+      decline("a layer norm weight or bias of another dtype");
     }
   }
+  // expect_contiguous: clone(Contiguous), an empty tensor and copy_
+  const auto contiguous = [&rec](const TensorBase& t) {
+    return !t.defined() || t.is_contiguous() ? t : copy_(rec, at::empty_symint(t.sym_sizes(), t.options()), t);
+  };
+  const TensorBase input = contiguous(input_);
+  const TensorBase weight = contiguous(weight_);
+  const TensorBase bias = contiguous(bias_);
   c10::SymInt M = 1;
   c10::SymInt N = 1;
   std::vector<c10::SymInt> stat_shape;

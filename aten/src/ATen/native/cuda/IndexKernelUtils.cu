@@ -8,6 +8,10 @@
 #include <c10/util/BFloat16.h>
 #include <ATen/native/cuda/Loops.cuh>
 #include <ATen/ceil_div.h>
+#include <ATen/native/cuda/IndexKernelUtils.h>
+#if !defined(USE_ROCM)
+#include <ATen/cuda/host_trace/Recorder.h>
+#endif
 
 #include <cstdint>
 #include <type_traits>
@@ -51,6 +55,28 @@ template void vectorized_gather_kernel_launch<16, int64_t>(char * out, char * in
 int64_t ind_dim_size, int64_t inp_stride_bytes, int64_t out_stride_bytes, bool allow_neg_indices);
 template void vectorized_gather_kernel_launch<16, int32_t>(char * out, char * inp, int32_t * idx, int num_ind, int64_t slice_size_in_bytes,
 int64_t ind_dim_size, int64_t inp_stride_bytes, int64_t out_stride_bytes, bool allow_neg_indices);
+
+#if !defined(USE_ROCM)
+template <int64_t Alignment, typename index_t>
+void vectorized_gather_kernel_record(at::cuda::host_trace::Recorder& rec, const c10::SymInt& out, const c10::SymInt& inp, const c10::SymInt& idx, const c10::SymInt& num_ind,
+                                     const c10::SymInt& slice_size_in_bytes, const c10::SymInt& ind_dim_size, const c10::SymInt& inp_stride_bytes, const c10::SymInt& out_stride_bytes) {
+  namespace ht = at::cuda::host_trace;
+  constexpr int64_t max_num_threads = 256;
+  const int64_t warp = at::cuda::warp_size();
+  const c10::SymInt num_threads = ((slice_size_in_bytes + Alignment - 1) / Alignment + warp - 1) / warp * warp;
+  const int64_t max_grid_y = at::cuda::getCurrentDeviceProperties()->maxGridSize[1];
+  const c10::SymInt grid_y = ((slice_size_in_bytes + max_num_threads * Alignment - 1) / (max_num_threads * Alignment)).min(max_grid_y);
+  ht::launch(rec, &vectorized_gather_kernel<Alignment, index_t>, ht::SymDim3(num_ind, grid_y), num_threads.min(max_num_threads), 0,
+             ht::scalar_param<char*>(out), ht::scalar_param<char*>(inp), ht::scalar_param<index_t*>(idx), ht::scalar_param<int>(num_ind),
+             ht::scalar_param<int64_t>(slice_size_in_bytes), ht::scalar_param<int64_t>(ind_dim_size), ht::scalar_param<int64_t>(inp_stride_bytes),
+             ht::scalar_param<int64_t>(out_stride_bytes), ht::Param<bool>(false));
+}
+
+template void vectorized_gather_kernel_record<16, int64_t>(at::cuda::host_trace::Recorder& rec, const c10::SymInt& out, const c10::SymInt& inp, const c10::SymInt& idx, const c10::SymInt& num_ind,
+                                     const c10::SymInt& slice_size_in_bytes, const c10::SymInt& ind_dim_size, const c10::SymInt& inp_stride_bytes, const c10::SymInt& out_stride_bytes);
+template void vectorized_gather_kernel_record<16, int32_t>(at::cuda::host_trace::Recorder& rec, const c10::SymInt& out, const c10::SymInt& inp, const c10::SymInt& idx, const c10::SymInt& num_ind,
+                                     const c10::SymInt& slice_size_in_bytes, const c10::SymInt& ind_dim_size, const c10::SymInt& inp_stride_bytes, const c10::SymInt& out_stride_bytes);
+#endif
 
 // Vectorized scatter: load a vector from src and apply an atomic operation.
 template <int Alignment, typename scalar_t>

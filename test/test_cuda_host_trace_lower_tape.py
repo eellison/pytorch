@@ -1,7 +1,6 @@
 # Owner(s): ["module: cuda graphs"]
 
 import unittest
-from types import SimpleNamespace
 
 import torch
 from torch.cuda._host_trace import Declined
@@ -18,6 +17,7 @@ from torch.cuda._host_trace_tape import (
     _symbolic_run,
     _Trace,
     current_trace,
+    Tape,
     trace,
 )
 from torch.cuda._host_trace_triton import TritonABI, TritonArg
@@ -70,17 +70,7 @@ def _tape(fn, *args):
     ints = [i for i, a in enumerate(args) if type(a) is int]
     out, traced = _symbolic_run(tr, fn, args, positions, ints)
     kind, outputs = _output_records(out, traced, positions)
-    return SimpleNamespace(
-        args=args,
-        inputs=tr.inputs,
-        int_inputs=tr.int_inputs,
-        allocs=tr.allocs,
-        launches=tr.launches,
-        sites=tr.sites,
-        outputs=outputs,
-        result_kind=kind,
-        guards=[g.expr for g in tr.shape_env.guards],
-    )
+    return Tape(tr, args, outputs, kind, None)
 
 
 def _scale(a, n):

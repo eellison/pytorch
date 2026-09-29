@@ -1434,6 +1434,17 @@ class TestInductorDynamic(DynamicShapesTestCase):
         self.assertEqual(fn(x, 4.0), fn_opt(x, 4.0))
         self.assertEqual(cnt.frame_count, 1)
 
+    def test_rms_norm_dynamic_hidden_size(self, device):
+        def fn(x, w):
+            return torch.nn.functional.rms_norm(x, x.shape[-1:], w)
+
+        cnt = CompileCounterWithBackend("inductor")
+        fn_opt = torch.compile(fn, dynamic=True, backend=cnt)
+        for h in (32, 48):
+            x, w = torch.randn(4, h, device=device), torch.randn(h, device=device)
+            self.assertEqual(fn_opt(x, w), fn(x, w))
+        self.assertEqual(cnt.frame_count, 1)
+
     @torch._dynamo.config.patch(specialize_float=False)
     def test_unspecialized_float_fallback_symint_specialization(self):
         def fn(x, y):

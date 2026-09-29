@@ -44,12 +44,14 @@ _lib.define("no_meta(Tensor x) -> Tensor")
 _lib.impl("no_meta", lambda x: x.clone(), "CPU")
 
 
-@torch.library.custom_op("host_trace_test::tape_transposed_fake", mutates_args=())
-def transposed_fake(x: torch.Tensor) -> torch.Tensor:
-    return x.clone()
+# a CUDA kernel the trace does not follow: an eager call, whose metadata
+# comes from its fake kernel
+_lib.define("tape_transposed_fake(Tensor x) -> Tensor")
+_lib.impl("tape_transposed_fake", lambda x: x.clone(), "CUDA")
+transposed_fake = torch.ops.host_trace_test.tape_transposed_fake
 
 
-@transposed_fake.register_fake
+@torch.library.register_fake("host_trace_test::tape_transposed_fake")
 def _(x):
     return x.new_empty(x.shape[::-1]).t()
 
@@ -197,9 +199,7 @@ class TestSymbolicRun(TestCase):
             "aten.nonzero.default has no traced metadata": lambda t: t.nonzero(),
             "no_meta.default has no traced metadata": torch.ops.host_trace_test.no_meta,
             "aten.add.Tensor of a tensor the trace does not track": lambda t: t + x,
-            "aten.zeros.default returns a tensor on meta": lambda t: torch.zeros(
-                4, device="meta"
-            ),
+            "aten._to_copy.default returns a tensor on meta": lambda t: t.to("meta"),
             "aten.equal.default has no traced metadata": lambda t: torch.equal(t, t),
             "aten.is_same_size.default returns a bool": lambda t: t.is_same_size(t),
             "aten.resize_.default changes": lambda t: t.resize_(2),
@@ -291,8 +291,13 @@ class TestSymbolicRun(TestCase):
     def test_views_match_eager(self):
         x = torch.randn(6, 5, 8)[1:]
         z = torch.randn(6, 8, dtype=torch.complex64)[:, 2:]
+        heads = torch.randn(4, 1, 48)
         cases = {
             "view": (lambda t: t[:, 1:3].view(5, 2, 2, 4), x),
+            # computeStride's strides on size-1 dims and empty views
+            "view size-1 dim": (lambda t: t.narrow(2, 16, 16).view(t.shape[0], 1, 4, 4), heads),
+            "view of size-1 dims": (lambda t: t.as_strided((1, 1, 1, 4), (7, 7, 1, 1), 5).view(-1, 4), x),
+            "empty view": (lambda t: t[:, :0].view(t.shape[0], 0, 8), x),
             "reshape": (lambda t: t.reshape(-1, 8), x),
             "flatten": (lambda t: t.flatten(1), x),
             "slice": (lambda t: t[:, 1:4, ::3], x),
@@ -510,7 +515,6 @@ class TestTrace(TestCase):
         cases = {
             "no tensor arguments": (3,),
             "only CUDA tensors": (x.cpu(),),
-            "empty": (x[:0],),
             "negative or conjugate": (torch._neg_view(x),),
         }
         for why, args in cases.items():
@@ -620,9 +624,10 @@ class TestTrace(TestCase):
         self.assertEqual(memset.roots, (tape.allocs[0].root,))
         self.assertEqual((memset.value, memset.element_size, memset.height), (0, 1, 1))
         self.assertEqual(int(memset.width), 8 * 3 * 4)
-        # a view's zero_ is eager
-        self.assertIsInstance(view, EagerCall)
-        self.assertEqual(view.target, torch.ops.aten.zero_.default)
+        # a contiguous view's zero_ is a memset from its offset
+        self.assertIsInstance(view, Memset)
+        self.assertEqual(view.roots, (tape.allocs[1].root,))
+        self.assertEqual(int(view.width), 7 * 4 * 4)
 
     def test_synchronizing_declines(self):
         x = torch.randn(4, device="cuda")
@@ -688,11 +693,51 @@ class TestTrace(TestCase):
         trace(torch.empty_like, (y,), warm_up=False)
         self.assertTrue(torch._C._is_cow_tensor(y))
 
+    def test_is_cow_tensor_of_a_traced_tensor(self):
+        # what torch._native's conditions ask: an argument answers its input's
+        # state at the trace, a tensor the trace allocates False
+        answers = []
+
+        def fn(t):
+            answers.append((torch._C._is_cow_tensor(t), torch._C._is_cow_tensor(torch.empty_like(t))))
+            return t
+
+        x = torch.randn(4)
+        _run(fn, x)
+        _run(fn, torch._lazy_clone(x))
+        self.assertEqual(answers, [(False, False), (True, False)])
+
 
 def setUpModule():
     import torch.cuda._host_trace as host_trace
 
     host_trace.raise_unexpected = True
+
+
+@unittest.skipIf(not TEST_CUDA, "requires CUDA")
+@requires_cuda_python_bindings
+@unittest.skipIf(not hasattr(torch._C, "_cuda_hostTraceMul"), "needs traced hosts")
+class TestOpGuards(TestCase):
+    def test_a_guard_of_one_op_is_its_own(self):
+        x = torch.randn(64, 600, device="cuda")
+        tape = trace(lambda x: torch.softmax(x, -1), (x,))
+        (op,) = tape.ops
+        self.assertEqual(op.kind, "traced")
+        self.assertEqual(len(op.launches), len(tape.launches))
+        self.assertTrue(op.guards)
+        self.assertEqual(op.guards, tuple(i for i, o in enumerate(tape.owners) if o == 0))
+
+    def test_a_guard_two_ops_read_is_the_graphs(self):
+        x = torch.randn(64, 600, device="cuda")
+        tape = trace(lambda x: (torch.softmax(x, -1), torch.softmax(x, -1)), (x,))
+        self.assertEqual([op.guards for op in tape.ops], [(), ()])
+        self.assertEqual(set(tape.owners), {None})
+
+    def test_an_eager_call_is_one_op(self):
+        x = torch.randn(64, 600, device="cuda")
+        tape = trace(lambda x: torch.rsqrt(x.sum(-1, dtype=torch.float32)), (x,))
+        self.assertEqual([op.kind for op in tape.ops], ["eager", "traced"])
+        self.assertIsInstance(tape.launches[tape.ops[0].launches.start][1], EagerCall)
 
 
 if __name__ == "__main__":

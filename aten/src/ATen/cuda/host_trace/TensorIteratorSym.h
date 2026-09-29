@@ -45,8 +45,14 @@ struct TORCH_CUDA_CPP_API TensorIteratorSym {
   static TensorIteratorSym where_op(Recorder& rec, const TensorBase& cond, const TensorBase& a, const TensorBase& b);
   // copy_impl's: dst is the output, src broadcasts to it
   static TensorIteratorSym copy_op(Recorder& rec, const TensorBase& dst, const TensorBase& src);
+  // cuda_scatter_gather_base_kernel's gather: src and index of out's shape
+  static TensorIteratorSym gather_op(Recorder& rec, const TensorBase& out, const TensorBase& src, const TensorBase& index);
   // out is make_reduction's view of the result
   static TensorIteratorSym reduce_op(Recorder& rec, const TensorBase& out, const TensorBase& a);
+  // a structured pointwise op's (TensorIteratorConfig allow_cpu_scalars) with
+  // outputs of out_dtypes, each out where defined (in-place and out=); a 0-dim
+  // CPU input is removed after the build, as gpu_kernel_with_scalars removes it
+  static TensorIteratorSym pointwise_op(Recorder& rec, c10::ArrayRef<TensorBase> outs, c10::ArrayRef<ScalarType> out_dtypes, c10::ArrayRef<TensorBase> inputs);
 
   int ndim() const {
     return static_cast<int>(shape_.size());
@@ -55,13 +61,13 @@ struct TORCH_CUDA_CPP_API TensorIteratorSym {
     return static_cast<int>(operands_.size());
   }
   int ninputs() const {
-    return ntensors() - 1;
+    return ntensors() - noutputs_;
   }
-  static constexpr int noutputs() {
-    return 1;
+  int noutputs() const {
+    return noutputs_;
   }
-  const TensorBase& output() const {
-    return operands_[0].tensor;
+  const TensorBase& output(int arg = 0) const {
+    return operands_[arg].tensor;
   }
   c10::SymIntArrayRef shape() const {
     return shape_;
@@ -101,9 +107,11 @@ struct TORCH_CUDA_CPP_API TensorIteratorSym {
   bool has_coalesced_dimensions_ = false;
   // the output first, undefined until allocated unless given
   c10::SmallVector<SymOperandInfo, 4> operands_;
+  int noutputs_ = 1;
   bool all_ops_same_shape_ = false;
   bool check_all_same_dtype_ = true;
   bool is_reduction_ = false;
+  bool allow_cpu_scalars_ = false;
   ScalarType common_dtype_ = ScalarType::Undefined;
   Device common_device_ = kCPU;
 };

@@ -262,9 +262,9 @@ std::tuple<Tensor, Tensor, Tensor> math_native_layer_norm(
   return outputs;
 }
 
-std::tuple<Tensor, Tensor> rms_norm_composite(
+std::tuple<Tensor, Tensor> rms_norm_composite_symint(
     const Tensor& input,
-    IntArrayRef normalized_shape,
+    c10::SymIntArrayRef normalized_shape,
     const std::optional<Tensor>& weight_opt /* optional */,
     std::optional<double> eps) {
 
@@ -331,22 +331,15 @@ Tensor rms_norm_symint(
   c10::MaybeOwned<Tensor> weight_maybe_owned = at::borrow_from_optional_tensor(weight_opt);
   const Tensor& weight = *weight_maybe_owned;
   _check_rms_norm_inputs_symint(input, normalized_shape, weight);
-  // a symbolic size is a pointer, not its value (a reinterpret_cast of the
-  // SymInts would pass the pointer): guard each to an int
-  c10::SmallVector<int64_t, 5> shape_ints;
-  for (const auto& s : normalized_shape) {
-    shape_ints.push_back(s.guard_int(__FILE__, __LINE__));
-  }
-  const IntArrayRef shape(shape_ints);
 
   // composite fallback for channels last
   if(input.suggest_memory_format() == c10::MemoryFormat::ChannelsLast || input.suggest_memory_format() == c10::MemoryFormat::ChannelsLast3d){
-    return std::get<0>(rms_norm_composite(input, shape, weight_opt, eps));
+    return std::get<0>(rms_norm_composite_symint(input, normalized_shape, weight_opt, eps));
   }
 
   // composite fallback for complex datatypes
   if(input.is_complex()){
-    return std::get<0>(rms_norm_composite(input, shape, weight_opt, eps));
+    return std::get<0>(rms_norm_composite_symint(input, normalized_shape, weight_opt, eps));
   }
 
   if (weight_opt.has_value() && weight_opt.value().defined() && weight_opt.value().dtype() != input.dtype()) {
@@ -354,7 +347,7 @@ Tensor rms_norm_symint(
       "Mismatch dtype between input and weight: input dtype = ", input.dtype(),
       ", weight dtype = ", weight_opt.value().dtype(), ", Cannot dispatch to fused implementation."
     );
-    return std::get<0>(rms_norm_composite(input, shape, weight_opt, eps));
+    return std::get<0>(rms_norm_composite_symint(input, normalized_shape, weight_opt, eps));
   }
 
   #ifdef USE_MPS
@@ -363,15 +356,15 @@ Tensor rms_norm_symint(
     const bool any_inputs_require_grad = input.requires_grad() || weight.requires_grad();
 
     if (!(GradMode::is_enabled() && any_inputs_require_grad)) {
-      return std::get<0>(at::_fused_rms_norm(input.contiguous(), shape, weight_opt, eps));
+      return std::get<0>(at::_fused_rms_norm_symint(input.contiguous(), normalized_shape, weight_opt, eps));
     }
   }
 
   if (input.device().type() == DeviceType::MPS){
-    return std::get<0>(rms_norm_composite(input, shape, weight_opt, eps));
+    return std::get<0>(rms_norm_composite_symint(input, normalized_shape, weight_opt, eps));
   }
   #endif
-  return std::get<0>(at::_fused_rms_norm(input, shape, weight_opt, eps));
+  return std::get<0>(at::_fused_rms_norm_symint(input, normalized_shape, weight_opt, eps));
 }
 
 } // namespace at::native

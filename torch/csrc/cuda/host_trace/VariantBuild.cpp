@@ -86,6 +86,11 @@ HostTraceVariant::HostTraceVariant(py::handle spec)
       records_.push_back(std::move(r));
       continue;
     }
+    if (r.kind == Kind::Memcpy) {
+      r.copy = {parse_source(t[2]), parse_source(t[3]), check_row(t[4].cast<int64_t>())};
+      records_.push_back(std::move(r));
+      continue;
+    }
     TORCH_CHECK_VALUE(r.kind == Kind::Kernel, "a record kind");
     KernelRow& k = r.kernel;
     k.dim_rows = set_launch(k, t[2], t[3], t[4], t[5]);
@@ -159,6 +164,10 @@ HostTraceVariant::HostTraceVariant(py::handle spec)
           memset_shape(r.memset, trace_rows.data(), trace_bases.data());
       continue;
     }
+    if (r.kind == Kind::Memcpy) {
+      r.held_copy = memcpy_shape(r.copy, trace_rows.data(), trace_bases.data());
+      continue;
+    }
     const KernelRow& k = r.kernel;
     pack(k, trace_rows.data(), trace_bases.data(), k.held);
     for (size_t i = 0; i < k.dim_rows.size(); ++i) {
@@ -171,13 +180,23 @@ HostTraceVariant::HostTraceVariant(py::handle spec)
     Site site;
     site.key_rows = check_rows(ints<int64_t>(t[0]));
     site.records = ints<size_t>(t[1]);
-    TORCH_CHECK_VALUE(!site.records.empty(), "a site of no nodes");
-    auto g = std::find_if(segments_.begin(), segments_.end(), [&](auto& x) {
-      return site.records.front() >= x.first && site.records.front() < x.stop;
-    });
-    TORCH_CHECK_VALUE(g != segments_.end(), "a site outside the segments");
-    site.segment = g - segments_.begin();
-    g->sites.push_back(sites_.size());
+    const bool selector = t.size() == 4;
+    if (selector) {
+      site.predicates.push_back(check_row(t[3].cast<int64_t>()));
+    }
+    TORCH_CHECK_VALUE(selector || !site.records.empty(), "a site of no nodes");
+    site.segment = segments_.size();
+    if (!site.records.empty()) {
+      auto g = std::find_if(segments_.begin(), segments_.end(), [&](auto& x) {
+        return site.records.front() >= x.first &&
+            site.records.front() < x.stop;
+      });
+      TORCH_CHECK_VALUE(g != segments_.end(), "a site outside the segments");
+      site.segment = g - segments_.begin();
+      if (!selector) {
+        g->sites.push_back(sites_.size());
+      }
+    }
     for (size_t pos = 0; pos < site.records.size(); ++pos) {
       const size_t i = site.records[pos];
       TORCH_CHECK_VALUE(
@@ -196,11 +215,13 @@ HostTraceVariant::HostTraceVariant(py::handle spec)
       allocations_[k].site = static_cast<int64_t>(sites_.size());
       allocations_[k].scratch = j;
     }
-    std::vector<int64_t> key;
-    for (int64_t row : site.key_rows) {
-      key.push_back(trace_rows[row]);
+    if (!selector) {
+      std::vector<int64_t> key;
+      for (int64_t row : site.key_rows) {
+        key.push_back(trace_rows[row]);
+      }
+      insert(site, key.data(), 0);
     }
-    insert(site, key.data(), 0);
     sites_.push_back(std::move(site));
   }
   for (Segment& g : segments_) {
@@ -357,6 +378,23 @@ HostTraceVariant::HostTraceVariant(py::handle spec)
     }
     step.target = py::reinterpret_borrow<py::object>(t[4]);
     step.name = py::str(step.target);
+    if (!t[5].is_none()) {
+      auto s = t[5].cast<py::tuple>();
+      auto reduction = [](py::handle x) {
+        const auto [reduced, splitk] = x.cast<std::pair<bool, bool>>();
+        using Option = at::CuBLASReductionOption;
+        return reduced ? Option::AllowReducedPrecisionWithSplitK
+            : splitk   ? Option::DisallowReducedPrecisionAllowSplitK
+                       : Option::DisallowReducedPrecisionDisallowSplitK;
+      };
+      step.blas = BlasState{
+          at::str2precision(s[0].cast<std::string>()),
+          reduction(s[1]),
+          reduction(s[2]),
+          s[3].cast<bool>(),
+          s[4].cast<std::optional<int32_t>>(),
+          s[5].cast<at::BlasBackend>()};
+    }
     step.op = *op;
     return true;
   };
