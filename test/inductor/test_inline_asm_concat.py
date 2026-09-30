@@ -617,6 +617,70 @@ class TestNestedAsmLaneInputs(NestedLaneTestCase):
         self.assertEqual(metrics.codegen_nested_reduction, 1)
         self.assertEqual(len([k for k in kernels if "tl.load(" in k]), 1)
 
+    @parametrize("rows", [128, 1024])
+    @config.patch(
+        {
+            "triton.nested_reduction": True,
+            "loop_ordering_after_fusion": True,
+            "emulate_precision_casts": True,
+            "cat_fuse_computed_input_copies": True,
+            "triton.multi_kernel": 0,
+            "force_disable_caches": True,
+        }
+    )
+    def test_padded_two_pass_layer_norm(self, device, rows):
+        # Padding the input (instead of padding the packed outputs with
+        # constants) lets the padded groups flow through the same kernel. The
+        # payload padding is only zero because the conversion maps zero inputs
+        # to zero, which Inductor cannot see through inline asm, so the graph
+        # has to be written this way rather than rewritten automatically.
+        asm, constraints = combine_inputs_asm(3)
+        width, padded = 1056, 1152
+
+        def fn(x, weight, bias, native=True):
+            value = torch.nn.functional.pad(x, (0, padded - width)).float()
+            columns = torch.arange(padded, device=x.device)
+            mean = value.sum(-1, keepdim=True) / width
+            centered = torch.where(columns < width, value - mean, 0)
+            variance = centered.square().sum(-1, keepdim=True) / width
+            normalized = centered * torch.rsqrt(variance + 1e-5)
+            weight = torch.nn.functional.pad(weight, (0, padded - width))
+            bias = torch.nn.functional.pad(bias, (0, padded - width))
+            normalized = normalized * weight.float() + bias.float()
+            value = torch.where(columns < width, normalized.to(torch.bfloat16), 0)
+            groups = value.view(x.shape[0], -1, 32)
+            maximum = groups.float().abs().amax(-1)
+            bits = groups.view(torch.int16).to(torch.int32) & 65535
+            pairs = bits[..., ::2] | (bits[..., 1::2] << 16)
+            scale = maximum.to(torch.int32)
+            if native:
+                words = inline_asm_elementwise(
+                    *pairs.unbind(-1),
+                    scale,
+                    asm_str=asm,
+                    constraints=constraints,
+                    dtype=(torch.int32,) * 3,
+                )
+            else:
+                words = xor_words(pairs, scale, 3)
+            return torch.stack(words, -1).view(x.shape[0], -1), maximum
+
+        # Repeated signed rows keep the sums exact and BF16 rounding away from
+        # midpoints, so the reference can use a different reduction order.
+        row = (torch.arange(width, device=device) % 32 - 16).float() / 8
+        signs = (torch.arange(rows, device=device) % 2 * 2 - 1).float()
+        x = (signs[:, None] * row[None, :]).half()
+        weight = ((torch.arange(width, device=device) % 5 + 1).float() / 8).half()
+        bias = ((torch.arange(width, device=device) % 3 - 1).float() / 16).half()
+        with config.patch({"triton.nested_reduction": False}):
+            expected = torch.compile(lambda *a: fn(*a, native=False))(x, weight, bias)
+        torch._dynamo.reset()
+        actual, kernels = run_and_get_kernels(
+            torch.compile(fn, fullgraph=True), x, weight, bias
+        )
+        self.assertEqual(actual, expected, atol=0, rtol=0)
+        self.assertEqual(len([k for k in kernels if "tl.load(" in k]), 1)
+
 
 class TestNestedLaneForwarding(NestedLaneTestCase):
     @parametrize("persistent", [False, True])
