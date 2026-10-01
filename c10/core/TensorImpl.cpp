@@ -1016,8 +1016,11 @@ void TensorImpl::empty_tensor_restride_symint(MemoryFormat memory_format) {
         const auto last_idx = dim_ - 1;
         sym_shape_meta.strides_[last_idx] = c10::SymInt(1);
         for (auto i = last_idx - 1; i >= 0; --i) {
+          // Unbacked sizes stay raw, as in channels-last strides; the strides
+          // of an empty tensor are never read.
+          const auto& size = sym_shape_meta.sizes_[i + 1];
           sym_shape_meta.strides_[i] = sym_shape_meta.strides_[i + 1] *
-              sym_shape_meta.sizes_[i + 1].max(1);
+              (size.has_hint() ? size.max(1) : size);
         }
       }
       break;

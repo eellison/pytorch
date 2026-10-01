@@ -1819,13 +1819,16 @@ def make_contiguous_strides_for(
     if not shape:
         return ()
 
-    from torch.fx.experimental.symbolic_shapes import is_nested_int
+    from torch.fx.experimental.symbolic_shapes import has_guarding_hint, is_nested_int
 
     multiplier: _IntLikeT | int = 1
     strides = []
     for l in reversed(shape):
         strides.append(multiplier)
-        multiplier *= l if is_nested_int(l) else sym_max(l, 1)  # type:ignore[assignment]
+        # Unbacked sizes stay raw, matching TensorIterator and C++ channels_last
+        # strides; the strides of an empty tensor are never read.
+        raw = is_nested_int(l) or not has_guarding_hint(l)
+        multiplier *= l if raw else sym_max(l, 1)  # type:ignore[assignment]
 
     result = tuple(reversed(strides))
 
