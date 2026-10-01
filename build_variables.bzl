@@ -1592,6 +1592,7 @@ aten_native_source_non_codegen_list = [
     # Files not in native, but depends on native symbols
     # "aten/src/ATen/TensorIndexing.cpp",
     "aten/src/ATen/TensorIterator.cpp",
+    "aten/src/ATen/TensorIteratorSym.cpp",
 ]
 
 # These sources are the only ones that require linking against XNNPACK itself, so

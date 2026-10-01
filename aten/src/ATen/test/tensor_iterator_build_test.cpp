@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <ATen/ATen.h>
+#include <ATen/TensorIteratorSym.h>
 #include <ATen/detail/TensorIteratorBuild.h>
 
 #include <type_traits>
@@ -131,5 +132,28 @@ TEST(TensorIteratorBuildTest, SymIntMatchesInt64) {
     auto ref = from_iterator(a, b);
     expect_same(build<int64_t>({a, b}), ref);
     expect_same(build<c10::SymInt>({a, b}), ref);
+  }
+}
+
+// TensorIteratorSym on concrete SymInts: the output layout after build and the
+// coalesced shape and strides match TensorIterator.
+TEST(TensorIteratorBuildTest, TensorIteratorSymMatchesTensorIterator) {
+  std::vector<std::pair<Tensor, Tensor>> cases = {
+      {at::randn({8, 16}), at::randn({16})},
+      {at::randn({16, 8}).t(), at::randn({8, 16})},
+      {at::randn({4, 8, 16}), at::randn({16, 8, 4}).permute({2, 1, 0})},
+      {at::randn({2, 3, 4, 5}).contiguous(MemoryFormat::ChannelsLast), at::randn({2, 3, 4, 5}).contiguous(MemoryFormat::ChannelsLast)},
+      {at::randn({1, 7}), at::randn({5, 1})},
+  };
+  for (const auto& [a, b] : cases) {
+    TensorIteratorSym iter(TensorIteratorConfig().add_owned_output(TensorBase()).add_const_input(a).add_const_input(b));
+    auto ref = from_iterator(a, b);
+    EXPECT_EQ(iter.output().sizes().vec(), ref.out_sizes);
+    EXPECT_EQ(iter.output().strides().vec(), ref.out_strides);
+    iter.coalesce_dimensions();
+    EXPECT_EQ(to_ints<c10::SymInt>(iter.shape()), ref.shape);
+    for (const auto i : c10::irange(iter.ntensors())) {
+      EXPECT_EQ(to_ints<c10::SymInt>(iter.strides(i)), ref.strides[i]);
+    }
   }
 }
