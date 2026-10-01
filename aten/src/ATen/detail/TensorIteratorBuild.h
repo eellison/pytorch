@@ -2,7 +2,10 @@
 // TensorIteratorBase's shape, stride and output-layout computation, templated
 // on the integer type. TensorIterator.cpp instantiates int64_t; c10::SymInt,
 // where every comparison is a guard, computes the same layout over symbolic
-// sizes (aten/src/ATen/test/tensor_iterator_build_test.cpp).
+// sizes (aten/src/ATen/test/tensor_iterator_build_test.cpp). Comparisons that
+// decide the output layout go through TORCH_GUARD_OR_FALSE: a plain bool for
+// int64_t, a guard for backed SymInts, and false when an unbacked comparison
+// cannot be decided, which takes the non-broadcast path as the Python refs do.
 // Parameters carry
 // the names of the members they bind. An operand is duck-typed on
 // OperandInfo's tensor_base(), stride_bytes, will_resize, is_output,
@@ -43,6 +46,27 @@ c10::ArrayRef<T> strides(const TensorBase& t) {
   } else {
     return t.strides();
   }
+}
+
+template <typename T>
+bool guard_or_false_equals(c10::ArrayRef<T> a, c10::ArrayRef<T> b) {
+  if constexpr (is_symbolic<T>) {
+    return a.size() == b.size() && std::equal(a.begin(), a.end(), b.begin(), [](const T& x, const T& y) { return TORCH_GUARD_OR_FALSE(x.sym_eq(y)); });
+  } else {
+    return a.equals(b);
+  }
+}
+
+// ge() of compute_elementwise_output_logical_to_physical_perm in
+// torch/_prims_common, for orderings the guards above leave undecided.
+inline bool python_ref_ge(const c10::SymInt& a, const c10::SymInt& b) {
+  if (TORCH_GUARD_OR_FALSE(sym_eq(b, 0))) {
+    return true;
+  }
+  if (TORCH_GUARD_OR_FALSE(sym_eq(a, 0))) {
+    return false;
+  }
+  return TORCH_GUARD_OR_FALSE(a.sym_ge(b)) || TORCH_GUARD_OR_FALSE(sym_eq(a % b, 0));
 }
 
 template <typename Shape>
@@ -86,7 +110,7 @@ C10_ALWAYS_INLINE void compute_shape(Shape& shape_, const Operands& operands_, b
     }
     if (shape_.empty()) {
       shape_ = shape;
-    } else if (!shape.equals(shape_)) {
+    } else if (!guard_or_false_equals<T>(shape, shape_)) {
       all_ops_same_shape_ = false;
       if constexpr (is_symbolic<T>) {
         shape_ = infer_size_symdimvector(shape_, shape);
@@ -113,7 +137,7 @@ C10_ALWAYS_INLINE void compute_strides(const Shape& shape_, Operands& operands_,
           op.stride_bytes.resize(ndim(shape_));
       for (const auto i : c10::irange(original_shape.size())) {
         // see NOTE: [Computing output strides]
-        if (original_shape[i] == 1 && shape_[offset + i] !=1) {
+        if (TORCH_GUARD_OR_FALSE(sym_eq(original_shape[i], 1)) && !TORCH_GUARD_OR_FALSE(sym_eq(shape_[offset + i], 1))) {
           op.stride_bytes[offset + i] = 0;
         } else {
           op.stride_bytes[offset + i] = original_stride[i] * element_size_in_bytes;
@@ -168,6 +192,7 @@ C10_ALWAYS_INLINE void reorder_dimensions(Shape& shape_, DimVector& perm_, Opera
     return;
   }
 
+  using T = typename Shape::value_type;
   // returns 1 if the dim0 should come after dim1, -1 if dim0 should come
   // before dim1, and 0 if the comparison is ambiguous.
   auto should_swap = [&](size_t dim0, size_t dim1) {
@@ -181,27 +206,42 @@ C10_ALWAYS_INLINE void reorder_dimensions(Shape& shape_, DimVector& perm_, Opera
       if (is_reduction_ && operands_[arg].is_output) {
         // move reduced dimensions to the front
         // strides of reduced dimensions are always set to 0 by review_reduce_result
-        if ((stride0 == 0) != (stride1 == 0)) {
-          return stride1 == 0 ? 1 : -1;
+        bool zero0 = TORCH_GUARD_OR_FALSE(sym_eq(stride0, 0));
+        bool zero1 = TORCH_GUARD_OR_FALSE(sym_eq(stride1, 0));
+        if (zero0 != zero1) {
+          return zero1 ? 1 : -1;
         }
       }
       //move on to the next input if one of the dimensions is broadcasted
-      if (stride0 == 0 || stride1 == 0) {
+      if (TORCH_GUARD_OR_FALSE(sym_eq(stride0, 0)) || TORCH_GUARD_OR_FALSE(sym_eq(stride1, 0))) {
         continue;
       // it is important to return here only with strict comparisons, for equal strides we try to break the tie later
       // by comparing corresponding dimensions or if that does not work, moving on to the next tensor
-      } else if (stride0 < stride1) {
+      } else if (TORCH_GUARD_OR_FALSE(sym_lt(stride0, stride1))) {
         return -1;
-      } else  if (stride0 > stride1) {
+      } else  if (TORCH_GUARD_OR_FALSE(sym_gt(stride0, stride1))) {
         return 1;
-      } else { //equal strides, use dimensions themselves as the tie-breaker.
+      } else if (!is_symbolic<T> || TORCH_GUARD_OR_FALSE(sym_eq(stride0, stride1))) { //equal strides, use dimensions themselves as the tie-breaker.
         //at this point, with zero strides out of the way, we are guaranteed that operand dimensions are equal to shape_
          const auto& t_dim0 = shape_[dim0];
          const auto& t_dim1 = shape_[dim1];
          //return only if dimensions should be swapped, otherwise move on to the next tensor
-         if (t_dim0 > t_dim1) {
+         if (TORCH_GUARD_OR_FALSE(sym_gt(t_dim0, t_dim1))) {
              return 1;
          }
+         if constexpr (is_symbolic<T>) {
+           if (!TORCH_GUARD_OR_FALSE(t_dim1.sym_ge(t_dim0)) && !python_ref_ge(t_dim1, t_dim0)) {
+             return 1;
+           }
+         }
+      } else if constexpr (is_symbolic<T>) {
+        // Unbacked strides whose order is undecided: order them as the Python refs do.
+        if (python_ref_ge(stride1, stride0)) {
+          return -1;
+        }
+        if (python_ref_ge(stride0, stride1)) {
+          return 1;
+        }
       }
     }
     return 0;
@@ -359,10 +399,18 @@ C10_ALWAYS_INLINE FastSetupType compute_fast_setup_type(const Operands& operands
 
   // For linear iteration, only contiguous tensors can be coalesced
   // Fast setup of any other format requires changing iteration order
+  auto is_contiguous_as = [](const TensorBase& t, at::MemoryFormat memory_format) {
+    if constexpr (is_symbolic<T>) {
+      return t.is_contiguous_or_false(memory_format);
+    } else {
+      return t.is_contiguous(memory_format);
+    }
+  };
+
   if (enforce_linear_iteration_) {
     for (const auto& op : operands_) {
       if (op.tensor_base().defined() && !op.will_resize) {
-        auto is_contiguous = op.tensor_base().is_contiguous(at::MemoryFormat::Contiguous);
+        auto is_contiguous = is_contiguous_as(op.tensor_base(), at::MemoryFormat::Contiguous);
         if (!is_contiguous) {
           return FastSetupType::NONE;
         }
@@ -374,7 +422,7 @@ C10_ALWAYS_INLINE FastSetupType compute_fast_setup_type(const Operands& operands
   bool is_contiguous = true;
   for (const auto& op : operands_) {
     if (op.tensor_base().defined() && !op.will_resize) {
-      is_contiguous &= op.tensor_base().is_contiguous(at::MemoryFormat::Contiguous);
+      is_contiguous &= is_contiguous_as(op.tensor_base(), at::MemoryFormat::Contiguous);
       if (!is_contiguous) {
         break;
       }
@@ -389,8 +437,12 @@ C10_ALWAYS_INLINE FastSetupType compute_fast_setup_type(const Operands& operands
   bool is_non_overlapping_and_dense = true;
   for (const auto& op : operands_) {
     if (op.tensor_base().defined() && !op.will_resize) {
-      is_channels_last &= op.tensor_base().is_contiguous(at::MemoryFormat::ChannelsLast);
-      is_non_overlapping_and_dense &= op.tensor_base().is_non_overlapping_and_dense();
+      is_channels_last &= is_contiguous_as(op.tensor_base(), at::MemoryFormat::ChannelsLast);
+      if constexpr (is_symbolic<T>) {
+        is_non_overlapping_and_dense &= op.tensor_base().unsafeGetTensorImpl()->is_non_overlapping_and_dense_or_false();
+      } else {
+        is_non_overlapping_and_dense &= op.tensor_base().is_non_overlapping_and_dense();
+      }
     }
   }
   if (is_channels_last) {
@@ -407,7 +459,7 @@ C10_ALWAYS_INLINE FastSetupType compute_fast_setup_type(const Operands& operands
           prev = i;
           continue;
         }
-        if (!strides<T>(operands_[prev].tensor_base()).equals(strides<T>(op.tensor_base()))) {
+        if (!guard_or_false_equals<T>(strides<T>(operands_[prev].tensor_base()), strides<T>(op.tensor_base()))) {
           // [Note: stride check for non contiguous tensors in fast setup]
           // We prevent 3 cases doing fast setup here:
           // 1. input tensors have different strides.
