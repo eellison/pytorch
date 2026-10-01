@@ -4,6 +4,7 @@
 #include <ATen/TensorIterator.h>
 #include <ATen/TensorIteratorSym.h>
 #include <ATen/core/dispatch/Dispatcher.h>
+#include <ATen/native/HostPolicy.h>
 #include <torch/csrc/jit/python/pybind_utils.h>
 #include <torch/csrc/utils/pybind.h>
 
@@ -308,6 +309,13 @@ void initTensorIteratorBindings(PyObject* module) {
             it.noutputs(),
             it.ninputs());
       });
+
+  // Host-trace hooks: a stand-in recorder and the kernel-context depth.
+  m.def("_ht_kernel_context_depth", &at::ht::kernel_context_depth);
+  m.def("_ht_set_recorder", [](bool enabled) {
+    static at::ht::Recorder recorder;
+    return at::ht::set_recorder(enabled ? &recorder : nullptr) != nullptr;
+  });
 
   // Fake tensors under fake_tensor_symint_tensor_iterator call the op's C++
   // Meta kernel here, with arguments parsed against its schema. Python meta

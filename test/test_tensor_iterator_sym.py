@@ -1,4 +1,5 @@
 # Owner(s): ["module: fakeTensor"]
+import contextlib
 from unittest import mock
 
 import torch
@@ -109,6 +110,15 @@ DISPATCH_CASES = {
 }
 
 
+@contextlib.contextmanager
+def recorder():
+    prev = torch._C._ht_set_recorder(True)
+    try:
+        yield
+    finally:
+        torch._C._ht_set_recorder(prev)
+
+
 def run_fake(op, layout, use_symint_ti):
     shape_env = ShapeEnv()
     with torch._functorch.config.patch(
@@ -183,6 +193,29 @@ class TestTensorIteratorSym(TestCase):
         self.assertEqual(out.device, eager.device)
         self.assertEqual(hints(out.shape), list(eager.shape))
         self.assertEqual(hints(out.stride()), list(eager.stride()))
+
+    @parametrize("op", list(OPS))
+    @parametrize("layout", list(LAYOUTS))
+    def test_kernel_choice_guards(self, op, layout):
+        # Fake returns before the kernel context, so the guards coalescing
+        # raises with a recorder never reach ShapeEnv; the graph-level guards
+        # are the same either way.
+        with recorder():
+            _, traced = run_fake(op, layout, use_symint_ti=True)
+        _, fake = run_fake(op, layout, use_symint_ti=True)
+        self.assertEqual(fake.kernel_choice_guards, [])
+        graph_guards = [str(g.expr) for g in fake.guards]
+        self.assertEqual([str(g.expr) for g in traced.guards], graph_guards)
+        for g in traced.kernel_choice_guards:
+            self.assertNotIn(str(g.expr), graph_guards)
+
+    def test_kernel_choice_guards_recorded(self):
+        # Coalescing the padded input's two outer dims compares its free
+        # outer stride symbol against the others; nothing before the boundary
+        # asks that.
+        with recorder():
+            _, shape_env = run_fake("add", "padded", use_symint_ti=True)
+        self.assertNotEqual(shape_env.kernel_choice_guards, [])
 
     @parametrize("op", list(OPS))
     @parametrize("case", list(UNBACKED))

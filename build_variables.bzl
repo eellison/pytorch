@@ -1475,6 +1475,7 @@ aten_native_source_non_codegen_list = [
     "aten/src/ATen/native/GatedLinearUnit.cpp",
     "aten/src/ATen/native/GridSampler.cpp",
     "aten/src/ATen/native/Histogram.cpp",
+    "aten/src/ATen/native/HostPolicy.cpp",
     "aten/src/ATen/native/Im2Col.cpp",
     "aten/src/ATen/native/IndexingUtils.cpp",
     "aten/src/ATen/native/Integration.cpp",

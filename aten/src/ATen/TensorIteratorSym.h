@@ -6,8 +6,8 @@
 //
 // The constructor stops where TensorIteratorBase::build stops for meta tensors:
 // outputs are allocated, dimensions are not coalesced. Output metadata is
-// final here. coalesce_dimensions() is available separately; it does not
-// change output metadata.
+// final here. coalesce_dimensions() is kernel choice; call it inside the op's
+// kernel context (ATen/native/HostPolicy.h).
 //
 // Supports configs whose outputs are undefined, without declare_static_shape,
 // and not reductions.
@@ -68,10 +68,13 @@ struct TORCH_API TensorIteratorSym final : private TensorIteratorBase {
   void coalesce_dimensions();
 
   using TensorIteratorBase::common_dtype;
+  using TensorIteratorBase::device;
   using TensorIteratorBase::dtype;
+  using TensorIteratorBase::ninputs;
   using TensorIteratorBase::noutputs;
   using TensorIteratorBase::ntensors;
   using TensorIteratorBase::output;
+  using TensorIteratorBase::tensor_base;
 
   int ndim() const {
     return static_cast<int>(sym_shape_.size());

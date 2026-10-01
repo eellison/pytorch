@@ -3,6 +3,7 @@
 #include <ATen/ATen.h>
 #include <ATen/TensorIteratorSym.h>
 #include <ATen/detail/TensorIteratorBuild.h>
+#include <ATen/native/HostPolicy.h>
 
 #include <type_traits>
 #include <vector>
@@ -156,4 +157,27 @@ TEST(TensorIteratorBuildTest, TensorIteratorSymMatchesTensorIterator) {
       EXPECT_EQ(to_ints<c10::SymInt>(iter.strides(i)), ref.strides[i]);
     }
   }
+}
+
+TEST(TensorIteratorBuildTest, KernelContext) {
+  static_assert(static_cast<bool>(ht::EagerHost{}.kernel_context()));
+  ht::SymHost h;
+  {
+    auto k = h.kernel_context();
+    EXPECT_FALSE(k);
+    EXPECT_EQ(ht::kernel_context_depth(), 0);
+  }
+  ht::Recorder recorder;
+  ht::RecorderGuard guard(&recorder);
+  {
+    auto k = h.kernel_context();
+    EXPECT_TRUE(k);
+    EXPECT_EQ(ht::kernel_context_depth(), 1);
+    {
+      auto inner = h.kernel_context();
+      EXPECT_EQ(ht::kernel_context_depth(), 2);
+    }
+    EXPECT_EQ(ht::kernel_context_depth(), 1);
+  }
+  EXPECT_EQ(ht::kernel_context_depth(), 0);
 }

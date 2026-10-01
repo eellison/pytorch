@@ -1,6 +1,7 @@
 #define TORCH_ASSERT_ONLY_METHOD_OPERATORS
 #include <ATen/TensorIteratorSym.h>
 #include <ATen/detail/TensorIteratorBuild.h>
+#include <ATen/native/HostPolicy.h>
 
 #include <algorithm>
 #include <utility>
@@ -76,6 +77,12 @@ bool TensorIteratorBase::build_sym(TensorIteratorConfig& config) {
     return false;
   }
   TensorIteratorSym iter(config, this);
+  {
+    auto k = ht::SymHost{}.kernel_context();
+    if (k) {
+      iter.coalesce_dimensions();
+    }
+  }
   TensorIteratorBase& built = iter;
   operands_ = std::move(built.operands_);
   num_outputs_ = built.num_outputs_;

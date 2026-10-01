@@ -4082,6 +4082,10 @@ class ShapeEnv:
         )
 
         self.guards: list[ShapeGuard] = []
+        # Guards raised inside an op's kernel context while a host-trace
+        # recorder is active (ATen/native/HostPolicy.h). They select that
+        # op's kernel and are not graph guards.
+        self.kernel_choice_guards: list[ShapeGuard] = []
         self.axioms: dict[sympy.Expr, sympy.Expr] = {}
 
         # A set of ids that have already been allocated. This is used
@@ -4464,7 +4468,7 @@ class ShapeEnv:
         # and the stack when it was added to the set of guards. In order to compare
         # it, we throw away the stack information.
         def map_value(key: str, value: Any) -> Any:
-            if key == "guards":
+            if key in ("guards", "kernel_choice_guards"):
                 # Transform the list of ShapeGuard into a list of expressions.
                 return [g.expr for g in value]
             elif key == "deferred_runtime_asserts":
@@ -9034,7 +9038,10 @@ class ShapeEnv:
                     guard = ShapeGuard(
                         g, self._get_sloc(), size_oblivious=size_oblivious
                     )
-                    self.guards.append(guard)
+                    if torch._C._ht_kernel_context_depth() > 0:
+                        self.kernel_choice_guards.append(guard)
+                    else:
+                        self.guards.append(guard)
                     self.axioms.update(dict(self.get_implications(self.simplify(g))))
             else:
                 self._log_guard("eval [guard suppressed]", g, forcing_spec=forcing_spec)
