@@ -40,6 +40,7 @@ list(APPEND ATen_CPU_TEST_SRCS
   ${CMAKE_CURRENT_SOURCE_DIR}/StorageUtils_test.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/stride_properties_test.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/tensor_iterator_test.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/tensor_iterator_build_test.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/test_parallel.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/thread_init_test.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/type_ptr_test.cpp

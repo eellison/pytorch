@@ -1,10 +1,15 @@
 #pragma once
-// TensorIteratorBase's shape, stride and output-layout computation as free
-// functions. Parameters carry
-// the names of the members they bind; outputs are allocated
+// TensorIteratorBase's shape, stride and output-layout computation, templated
+// on the integer type. TensorIterator.cpp instantiates int64_t; c10::SymInt,
+// where every comparison is a guard, computes the same layout over symbolic
+// sizes (aten/src/ATen/test/tensor_iterator_build_test.cpp).
+// Parameters carry
+// the names of the members they bind. An operand is duck-typed on
+// OperandInfo's tensor_base(), stride_bytes, will_resize, is_output,
+// target_dtype, current_dtype and is_type_defined(); outputs are allocated
 // through set_output(i, sizes, strides, memory_format). The steps
 // TensorIterator.cpp forwards to are C10_ALWAYS_INLINE, so its member
-// functions cost no extra call over the originals.
+// functions cost no extra call over the untemplated originals.
 #include <ATen/ExpandUtils.h>
 #include <ATen/TensorIterator.h>
 #include <c10/util/irange.h>
@@ -12,18 +17,47 @@
 #include <algorithm>
 #include <numeric>
 #include <optional>
+#include <type_traits>
 
 namespace at::detail::ti_build {
 
-inline int ndim(const DimVector& shape_) {
+template <typename T>
+constexpr bool is_symbolic = std::is_same_v<T, c10::SymInt>;
+
+template <typename T>
+using DimVectorOf = std::conditional_t<is_symbolic<T>, c10::SymDimVector, DimVector>;
+
+template <typename T>
+c10::ArrayRef<T> sizes(const TensorBase& t) {
+  if constexpr (is_symbolic<T>) {
+    return t.sym_sizes();
+  } else {
+    return t.sizes();
+  }
+}
+
+template <typename T>
+c10::ArrayRef<T> strides(const TensorBase& t) {
+  if constexpr (is_symbolic<T>) {
+    return t.sym_strides();
+  } else {
+    return t.strides();
+  }
+}
+
+template <typename Shape>
+int ndim(const Shape& shape_) {
   return static_cast<int>(shape_.size());
 }
 
-inline int ntensors(const SmallVector<OperandInfo, 4>& operands_) {
+template <typename Operands>
+int ntensors(const Operands& operands_) {
   return static_cast<int>(operands_.size());
 }
 
-C10_ALWAYS_INLINE void compute_shape(DimVector& shape_, const SmallVector<OperandInfo, 4>& operands_, bool resize_outputs, bool& all_ops_same_shape_, bool& all_ops_are_scalars_) {
+template <typename Shape, typename Operands>
+C10_ALWAYS_INLINE void compute_shape(Shape& shape_, const Operands& operands_, bool resize_outputs, bool& all_ops_same_shape_, bool& all_ops_are_scalars_) {
+  using T = typename Shape::value_type;
   all_ops_same_shape_ = true;
   bool has_scalars = false;
   bool has_tensors = false;
@@ -36,10 +70,12 @@ C10_ALWAYS_INLINE void compute_shape(DimVector& shape_, const SmallVector<Operan
     // the destination tensor.  If the output tensor is also an input, we'll
     // pick it up later in the operands.
     if (resize_outputs && op.is_output) continue;
-    TORCH_CHECK(!op.tensor_base().unsafeGetTensorImpl()->has_symbolic_sizes_strides(),
-      "TensorIterator does not support symbolic shapes; please implement this operator in torch/_refs "
-      "using the elementwise or reduction helpers (look at backtrace to find out what operator this is)");
-    auto shape = op.tensor_base().sizes();
+    if constexpr (!is_symbolic<T>) {
+      TORCH_CHECK(!op.tensor_base().unsafeGetTensorImpl()->has_symbolic_sizes_strides(),
+        "TensorIterator does not support symbolic shapes; please implement this operator in torch/_refs "
+        "using the elementwise or reduction helpers (look at backtrace to find out what operator this is)");
+    }
+    auto shape = sizes<T>(op.tensor_base());
     if (shape.empty()) {
       has_scalars = true;
     } else {
@@ -52,17 +88,23 @@ C10_ALWAYS_INLINE void compute_shape(DimVector& shape_, const SmallVector<Operan
       shape_ = shape;
     } else if (!shape.equals(shape_)) {
       all_ops_same_shape_ = false;
-      shape_ = infer_size_dimvector(shape_, shape);
+      if constexpr (is_symbolic<T>) {
+        shape_ = infer_size_symdimvector(shape_, shape);
+      } else {
+        shape_ = infer_size_dimvector(shape_, shape);
+      }
     }
   }
   all_ops_are_scalars_ = !has_tensors;
 }
 
-C10_ALWAYS_INLINE void compute_strides(const DimVector& shape_, SmallVector<OperandInfo, 4>& operands_, bool static_shape) {
+template <typename Shape, typename Operands>
+C10_ALWAYS_INLINE void compute_strides(const Shape& shape_, Operands& operands_, bool static_shape) {
+  using T = typename Shape::value_type;
   for (auto& op : operands_) {
     if (op.tensor_base().defined() && !op.will_resize) {
-      IntArrayRef original_shape = static_shape ? shape_ : op.tensor_base().sizes();
-      auto original_stride = op.tensor_base().strides();
+      c10::ArrayRef<T> original_shape = static_shape ? c10::ArrayRef<T>(shape_) : sizes<T>(op.tensor_base());
+      auto original_stride = strides<T>(op.tensor_base());
       auto element_size_in_bytes = op.tensor_base().element_size();
       auto offset = ndim(shape_) - original_shape.size();
       if (offset > 0)
@@ -81,11 +123,13 @@ C10_ALWAYS_INLINE void compute_strides(const DimVector& shape_, SmallVector<Oper
   }
 }
 
-C10_ALWAYS_INLINE void permute_dimensions(DimVector& shape_, SmallVector<OperandInfo, 4>& operands_, IntArrayRef perm) {
+template <typename Shape, typename Operands>
+C10_ALWAYS_INLINE void permute_dimensions(Shape& shape_, Operands& operands_, IntArrayRef perm) {
+  using T = typename Shape::value_type;
   TORCH_INTERNAL_ASSERT(perm.size() == static_cast<unsigned>(ndim(shape_)));
 
-  auto reorder = [perm](IntArrayRef data) {
-    auto res = DimVector(data.size(), 0);
+  auto reorder = [perm](c10::ArrayRef<T> data) {
+    auto res = DimVectorOf<T>(data.size(), 0);
     for (const auto i : c10::irange(perm.size())) {
       res[i] = data[perm[i]];
     }
@@ -102,7 +146,8 @@ C10_ALWAYS_INLINE void permute_dimensions(DimVector& shape_, SmallVector<Operand
 }
 
 // See NOTE: [Computing output strides] in TensorIterator.cpp
-C10_ALWAYS_INLINE void reorder_dimensions(DimVector& shape_, DimVector& perm_, SmallVector<OperandInfo, 4>& operands_, bool is_reduction_, bool enforce_linear_iteration_) {
+template <typename Shape, typename Operands>
+C10_ALWAYS_INLINE void reorder_dimensions(Shape& shape_, DimVector& perm_, Operands& operands_, bool is_reduction_, bool enforce_linear_iteration_) {
   // Sort the dimensions based on strides in ascending order with reduced dims
   // at the front. NOTE: that this inverts the order of C-contiguous tensors.
   // strides[0] is the fastest moving dimension instead of strides[ndim - 1].
@@ -131,8 +176,8 @@ C10_ALWAYS_INLINE void reorder_dimensions(DimVector& shape_, DimVector& perm_, S
       if (operands_[arg].stride_bytes.empty() || operands_[arg].will_resize) {
         continue;
       }
-      int64_t stride0 = operands_[arg].stride_bytes[dim0];
-      int64_t stride1 = operands_[arg].stride_bytes[dim1];
+      const auto& stride0 = operands_[arg].stride_bytes[dim0];
+      const auto& stride1 = operands_[arg].stride_bytes[dim1];
       if (is_reduction_ && operands_[arg].is_output) {
         // move reduced dimensions to the front
         // strides of reduced dimensions are always set to 0 by review_reduce_result
@@ -151,8 +196,8 @@ C10_ALWAYS_INLINE void reorder_dimensions(DimVector& shape_, DimVector& perm_, S
         return 1;
       } else { //equal strides, use dimensions themselves as the tie-breaker.
         //at this point, with zero strides out of the way, we are guaranteed that operand dimensions are equal to shape_
-         auto t_dim0 = shape_[dim0];
-         auto t_dim1 = shape_[dim1];
+         const auto& t_dim0 = shape_[dim0];
+         const auto& t_dim1 = shape_[dim1];
          //return only if dimensions should be swapped, otherwise move on to the next tensor
          if (t_dim0 > t_dim1) {
              return 1;
@@ -180,9 +225,10 @@ C10_ALWAYS_INLINE void reorder_dimensions(DimVector& shape_, DimVector& perm_, S
   permute_dimensions(shape_, operands_, perm_);
 }
 
-inline SmallVector<int64_t, 6> compatible_stride(const DimVector& shape_, int64_t element_size) {
-  auto stride = SmallVector<int64_t, 6>();
-  int64_t next_stride = element_size;
+template <typename Shape>
+SmallVector<typename Shape::value_type, 6> compatible_stride(const Shape& shape_, int64_t element_size) {
+  auto stride = SmallVector<typename Shape::value_type, 6>();
+  typename Shape::value_type next_stride = element_size;
   for (const auto dim : c10::irange(ndim(shape_))) {
     stride.push_back(next_stride);
     next_stride *= shape_[dim];
@@ -190,20 +236,22 @@ inline SmallVector<int64_t, 6> compatible_stride(const DimVector& shape_, int64_
   return stride;
 }
 
-inline DimVector invert_perm(IntArrayRef perm_, IntArrayRef input, bool has_coalesced_dimensions_) {
+template <typename T>
+DimVectorOf<T> invert_perm(IntArrayRef perm_, c10::ArrayRef<T> input, bool has_coalesced_dimensions_) {
   // Invert the permutation caused by reorder_dimensions. This is not valid
   // after coalesce_dimensions is called.
   TORCH_INTERNAL_ASSERT(!has_coalesced_dimensions_);
   TORCH_INTERNAL_ASSERT(input.size()==perm_.size());
-  auto res = DimVector(input.size()); //no initialization needed, every value in res should be written to.
+  auto res = DimVectorOf<T>(input.size()); //no initialization needed, every value in res should be written to.
   for (const auto dim : c10::irange(perm_.size())) {
     res[perm_[dim]] = input[dim];
   }
   return res;
 }
 
-template <typename SetOutput>
-C10_ALWAYS_INLINE void allocate_or_resize_outputs(const DimVector& shape_, IntArrayRef perm_, SmallVector<OperandInfo, 4>& operands_, int num_outputs_, bool has_coalesced_dimensions_, const SetOutput& set_output) {
+template <typename Shape, typename Operands, typename SetOutput>
+C10_ALWAYS_INLINE void allocate_or_resize_outputs(const Shape& shape_, IntArrayRef perm_, Operands& operands_, int num_outputs_, bool has_coalesced_dimensions_, const SetOutput& set_output) {
+  using T = typename Shape::value_type;
   // check if permutation is just an inverted order
   bool inverted = true;
   for (const auto j : c10::irange(ndim(shape_))) {
@@ -218,14 +266,14 @@ C10_ALWAYS_INLINE void allocate_or_resize_outputs(const DimVector& shape_, IntAr
       TORCH_INTERNAL_ASSERT(op.is_type_defined(), "no type for operand", i);
       auto element_size = elementSize(op.target_dtype);
       op.stride_bytes = compatible_stride(shape_, static_cast<int64_t>(element_size));
-      auto tensor_shape = invert_perm(perm_, shape_, has_coalesced_dimensions_);
+      auto tensor_shape = invert_perm<T>(perm_, shape_, has_coalesced_dimensions_);
       if (inverted) {
         // can just return contiguous output
         // it is faster because it avoids allocating 0 size tensor and
         // resizing and restriding it
         set_output(i, tensor_shape, {}, std::nullopt);
       } else {
-        auto tensor_stride = invert_perm(perm_, op.stride_bytes, has_coalesced_dimensions_);
+        auto tensor_stride = invert_perm<T>(perm_, op.stride_bytes, has_coalesced_dimensions_);
         for (const auto dim : c10::irange(ndim(shape_))) {
           tensor_stride[dim] /= static_cast<int64_t>(element_size);
         }
@@ -235,12 +283,13 @@ C10_ALWAYS_INLINE void allocate_or_resize_outputs(const DimVector& shape_, IntAr
     } else if (op.tensor_base().defined()) {
       // Even if we don't resize, we still need to tell set_output about
       // the output, so that we properly set guard
-      set_output(i, op.tensor_base().sizes(), {}, std::nullopt);
+      set_output(i, sizes<T>(op.tensor_base()), {}, std::nullopt);
     }
   }
 }
 
-C10_ALWAYS_INLINE void coalesce_dimensions(DimVector& shape_, SmallVector<OperandInfo, 4>& operands_, bool& has_coalesced_dimensions_) {
+template <typename Shape, typename Operands>
+C10_ALWAYS_INLINE void coalesce_dimensions(Shape& shape_, Operands& operands_, bool& has_coalesced_dimensions_) {
   if (ndim(shape_) <= 1) {
     return;
   }
@@ -248,8 +297,8 @@ C10_ALWAYS_INLINE void coalesce_dimensions(DimVector& shape_, SmallVector<Operan
   // We can coalesce two adjacent dimensions if either dim has size 1 or if:
   // shape[n] * stride[n] == stride[n + 1].
   auto can_coalesce = [&](int dim0, int dim1) {
-    auto shape0 = shape_[dim0];
-    auto shape1 = shape_[dim1];
+    const auto& shape0 = shape_[dim0];
+    const auto& shape1 = shape_[dim1];
     if (shape0 == 1 || shape1 == 1) {
       return true;
     }
@@ -293,15 +342,17 @@ C10_ALWAYS_INLINE void coalesce_dimensions(DimVector& shape_, SmallVector<Operan
   has_coalesced_dimensions_ = true;
 }
 
-inline int64_t numel(const DimVector& shape_) {
-  int64_t numel = 1;
-  for (int64_t size : shape_) {
+template <typename Shape>
+typename Shape::value_type numel(const Shape& shape_) {
+  typename Shape::value_type numel = 1;
+  for (const auto& size : shape_) {
     numel *= size;
   }
   return numel;
 }
 
-C10_ALWAYS_INLINE FastSetupType compute_fast_setup_type(const SmallVector<OperandInfo, 4>& operands_, bool is_reduction_, bool all_ops_same_shape_, bool enforce_linear_iteration_) {
+template <typename T, typename Operands>
+C10_ALWAYS_INLINE FastSetupType compute_fast_setup_type(const Operands& operands_, bool is_reduction_, bool all_ops_same_shape_, bool enforce_linear_iteration_) {
   if (is_reduction_ || !all_ops_same_shape_) {
     return FastSetupType::NONE;
   }
@@ -356,7 +407,7 @@ C10_ALWAYS_INLINE FastSetupType compute_fast_setup_type(const SmallVector<Operan
           prev = i;
           continue;
         }
-        if (!operands_[prev].tensor_base().strides().equals(op.tensor_base().strides())) {
+        if (!strides<T>(operands_[prev].tensor_base()).equals(strides<T>(op.tensor_base()))) {
           // [Note: stride check for non contiguous tensors in fast setup]
           // We prevent 3 cases doing fast setup here:
           // 1. input tensors have different strides.
@@ -375,8 +426,9 @@ C10_ALWAYS_INLINE FastSetupType compute_fast_setup_type(const SmallVector<Operan
   return FastSetupType::NONE;
 }
 
-template <typename SetOutput>
-C10_ALWAYS_INLINE bool fast_set_up(FastSetupType setup_type, DimVector& shape_, SmallVector<OperandInfo, 4>& operands_, int num_outputs_, bool& has_coalesced_dimensions_, const SetOutput& set_output) {
+template <typename Shape, typename Operands, typename SetOutput>
+C10_ALWAYS_INLINE bool fast_set_up(FastSetupType setup_type, Shape& shape_, Operands& operands_, int num_outputs_, bool& has_coalesced_dimensions_, const SetOutput& set_output) {
+  using T = typename Shape::value_type;
   // This function tries to do a fast setup to avoid needless reordering of dimensions and tracking output strides
   // Return true if it can do fast setup or false otherwise
   // TODO enable fast handling for reductions
@@ -421,7 +473,7 @@ C10_ALWAYS_INLINE bool fast_set_up(FastSetupType setup_type, DimVector& shape_, 
           if (!op.tensor_base().defined()) {
             TORCH_INTERNAL_ASSERT(op.is_type_defined(), "no type for operand", i);
           }
-          set_output(i, shape_, operands_[i_defined].tensor_base().strides(), std::nullopt);
+          set_output(i, shape_, strides<T>(operands_[i_defined].tensor_base()), std::nullopt);
         }
         break;
       }

@@ -1095,7 +1095,7 @@ bool TensorIteratorBase::fast_set_up(const TensorIteratorConfig& config) {
 }
 
 FastSetupType TensorIteratorBase::compute_fast_setup_type(const TensorIteratorConfig& config) {
-  return ti_build::compute_fast_setup_type(operands_, is_reduction_, all_ops_same_shape_, enforce_linear_iteration_);
+  return ti_build::compute_fast_setup_type<int64_t>(operands_, is_reduction_, all_ops_same_shape_, enforce_linear_iteration_);
 }
 
 void TensorIteratorBase::build(TensorIteratorConfig& config) {
