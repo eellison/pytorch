@@ -584,6 +584,7 @@
 # /test/test_sympy_utils.py
 # /test/test_tensor_creation_ops.py
 # /test/test_tensor_iterator.py
+# /test/test_tensor_iterator_sym.py
 # /test/test_tensorboard.py
 # /test/test_torch.py
 # /test/test_torch_config_hash_determinism.py

@@ -82,6 +82,11 @@ T = TypeVar("T")
 
 aten = torch._ops.ops.aten
 
+# Ops whose C++ Meta kernel runs when
+# torch._functorch.config.fake_tensor_symint_tensor_iterator is set; it builds
+# a SymInt TensorIterator when an operand has symbolic sizes.
+_SYMINT_TENSOR_ITERATOR_OPS = {aten.add.Tensor, aten.mul.Tensor, aten.sigmoid.default}
+
 CONSTANT_NUMEL_LIMIT = 1
 
 RECURSION_COUNT = 0
@@ -1607,6 +1612,9 @@ class FakeTensorMode(TorchDispatchMode):
             torch._functorch.config.fake_tensor_allow_unsafe_data_ptr_access
         )
         self.allow_meta = torch._functorch.config.fake_tensor_allow_meta
+        self.symint_tensor_iterator = (
+            torch._functorch.config.fake_tensor_symint_tensor_iterator
+        )
         self.cache_enabled: bool = (
             torch._dynamo.config.fake_tensor_cache_enabled
             and not self.propagate_real_tensors
@@ -1923,6 +1931,7 @@ class FakeTensorMode(TorchDispatchMode):
             # so we need to handle things a little different depending on
             # whether we're tracing or not.
             is_tracing,
+            self.symint_tensor_iterator,
         ]
         if state.known_symbols:
             # If there are symbols then include the epoch - this is really more
@@ -3076,6 +3085,15 @@ class FakeTensorMode(TorchDispatchMode):
                 compute_unbacked_bindings(self.shape_env, fake_out, peek=True)
 
             return fake_out
+
+        if self.symint_tensor_iterator and func in _SYMINT_TENSOR_ITERATOR_OPS:
+            with in_kernel_invocation_manager(self):
+                r = torch._C._ti_meta(func, *args, **kwargs)
+            return maybe_propagate_real_tensors(
+                self.wrap_meta_outputs_with_default_device_logic(
+                    r, func, flat_args, device=kwargs.get("device")
+                )
+            )
 
         # Try for fastpath
         if has_symbolic_sizes:

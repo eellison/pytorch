@@ -1,12 +1,17 @@
 #include <torch/csrc/TensorIterator.h>
 
+#include <ATen/MetaFunctions.h>
 #include <ATen/TensorIterator.h>
+#include <ATen/TensorIteratorSym.h>
+#include <ATen/core/dispatch/Dispatcher.h>
+#include <torch/csrc/jit/python/pybind_utils.h>
 #include <torch/csrc/utils/pybind.h>
 
 #include <fmt/format.h>
 #include <fmt/ranges.h>
 #include <pybind11/stl.h>
 
+#include <unordered_map>
 #include <vector>
 
 namespace torch {
@@ -302,6 +307,48 @@ void initTensorIteratorBindings(PyObject* module) {
             it.ntensors(),
             it.noutputs(),
             it.ninputs());
+      });
+
+  // Fake tensors under fake_tensor_symint_tensor_iterator call the op's C++
+  // Meta kernel here, with arguments parsed against its schema. Python meta
+  // registrations shadow these kernels in the dispatcher, so they are looked up
+  // directly; the Meta kernel's TensorIteratorBase::build switches to
+  // TensorIteratorSym under SymMetaGuard when an operand is symbolic.
+  m.def(
+      "_ti_meta",
+      [](const py::object& op, const py::args& args, const py::kwargs& kwargs) {
+        static const std::unordered_map<c10::OperatorName, c10::KernelFunction>
+            kernels = {
+                {{"aten::add", "Tensor"},
+                 c10::KernelFunction::makeFromUnboxedFunction(
+                     TORCH_FN(at::meta::add))},
+                {{"aten::mul", "Tensor"},
+                 c10::KernelFunction::makeFromUnboxedFunction(
+                     TORCH_FN(at::meta::mul))},
+                {{"aten::sigmoid", ""},
+                 c10::KernelFunction::makeFromUnboxedFunction(
+                     TORCH_FN(at::meta::sigmoid))},
+            };
+        const auto& schema =
+            py::cast<const c10::FunctionSchema&>(op.attr("_schema"));
+        auto it = kernels.find(schema.operator_name());
+        TORCH_CHECK(
+            it != kernels.end(),
+            "_ti_meta: no kernel for ",
+            schema.operator_name());
+        auto handle = c10::Dispatcher::singleton().findSchemaOrThrow(
+            schema.name().c_str(), schema.overload_name().c_str());
+        // Python scalars for Tensor arguments become wrapped numbers, as in
+        // OpOverload.__call__ for add and mul.
+        jit::ToIValueAllowNumbersAsTensors allow_numbers(true);
+        auto stack =
+            jit::createStackForSchema(schema, args, kwargs, std::nullopt);
+        {
+          at::SymMetaGuard guard;
+          it->second.callBoxed(
+              handle, c10::DispatchKeySet(c10::DispatchKey::Meta), &stack);
+        }
+        return jit::createPyObjectForStack(std::move(stack));
       });
 }
 

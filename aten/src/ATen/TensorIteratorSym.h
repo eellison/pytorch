@@ -11,9 +11,29 @@
 //
 // Supports configs whose outputs are undefined, without declare_static_shape,
 // and not reductions.
+//
+// With a sink, outputs are created by sink->set_output_raw_strided_symint and
+// borrowed from sink->maybe_get_output; this is how a Meta structured kernel
+// reaches it (TensorIteratorBase::build_sym).
 #include <ATen/TensorIterator.h>
 
 namespace at {
+
+// While set, TensorIteratorBase::build on operands with symbolic sizes builds a
+// TensorIteratorSym and hands its outputs to the structured kernel through
+// set_output_raw_strided_symint. Only the Meta functional kernels implement
+// that; torch._C._ti_meta sets this around calling one.
+TORCH_API bool sym_meta_enabled();
+
+struct TORCH_API SymMetaGuard {
+  SymMetaGuard();
+  ~SymMetaGuard();
+  SymMetaGuard(const SymMetaGuard&) = delete;
+  SymMetaGuard& operator=(const SymMetaGuard&) = delete;
+
+ private:
+  bool prev_;
+};
 
 struct TORCH_API TensorIteratorSym final : private TensorIteratorBase {
   // OperandInfo with SymInt stride_bytes, in the shape the templates expect.
@@ -39,7 +59,9 @@ struct TORCH_API TensorIteratorSym final : private TensorIteratorBase {
     ScalarType& current_dtype;
   };
 
-  explicit TensorIteratorSym(TensorIteratorConfig& config);
+  explicit TensorIteratorSym(
+      TensorIteratorConfig& config,
+      impl::MetaBase* sink = nullptr);
   TensorIteratorSym(const TensorIteratorSym&) = delete;
   TensorIteratorSym& operator=(const TensorIteratorSym&) = delete;
 
@@ -64,6 +86,7 @@ struct TORCH_API TensorIteratorSym final : private TensorIteratorBase {
   const Tensor& maybe_get_output(int64_t output_idx) override;
 
  private:
+  friend struct TensorIteratorBase;
   SymDimVector sym_shape_;
   SmallVector<Operand, 4> sym_operands_;
 };

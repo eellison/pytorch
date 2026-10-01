@@ -12,6 +12,7 @@
 #include <ATen/native/Resize.h>
 #include <ATen/TensorIteratorInternal.h>
 #include <ATen/detail/TensorIteratorBuild.h>
+#include <ATen/TensorIteratorSym.h>
 
 #ifndef AT_PER_OPERATOR_HEADERS
 #include <ATen/Functions.h>
@@ -1099,6 +1100,9 @@ FastSetupType TensorIteratorBase::compute_fast_setup_type(const TensorIteratorCo
 }
 
 void TensorIteratorBase::build(TensorIteratorConfig& config) {
+  if (C10_UNLIKELY(sym_meta_enabled()) && build_sym(config)) {
+    return;
+  }
   // populate some persistent configuration fields
   is_reduction_ = config.is_reduction_;
   enforce_linear_iteration_ = config.enforce_linear_iteration_;

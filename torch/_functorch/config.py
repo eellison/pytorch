@@ -283,6 +283,10 @@ custom_op_default_layout_constraint: Literal[
 # options = False, "all", "custom_ops"
 fake_tensor_crossref = False
 
+# Fake tensors run add.Tensor, mul.Tensor and sigmoid.default through the C++
+# SymInt TensorIterator (eager's layout rules) instead of the Python metas.
+fake_tensor_symint_tensor_iterator = False
+
 # This mode specifies that we should also keep track of the real
 # tensor along with the fake tensor, and do real compute.  While
 # seemingly this eliminates the whole point of fake tensors, there are

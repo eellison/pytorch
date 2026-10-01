@@ -623,9 +623,30 @@ void set_output_{name}(
 }}
 """
 
+        # TensorIteratorSym hands symbolic output metadata to the Meta kernel
+        # through this and borrows the output; there is no super to call.
+        if (
+            k is SchemaKind.functional
+            and self.backend_index.dispatch_key == DispatchKey.Meta
+        ):
+            set_output_symint = """
+void set_output_raw_strided_symint(
+    int64_t output_idx, c10::SymIntArrayRef sizes, c10::SymIntArrayRef strides,
+    TensorOptions options
+) override {
+    options = options.device(at::kMeta);
+    outputs_[output_idx] = strides.empty()
+        ? at::detail::empty_symint_meta(sizes, c10::optTypeMetaToScalarType(options.dtype_opt()), options.layout_opt(), options.device_opt(), options.pinned_memory_opt(), options.memory_format_opt())
+        : at::detail::empty_strided_symint_meta(sizes, strides, options);
+}
+"""
+        else:
+            set_output_symint = ""
+
         return f"""
 {gen_set_output_function("strided", maybe_create_proxy=True)}
 {gen_set_output_function("raw_strided", maybe_create_proxy=False)}
+{set_output_symint}
 """
 
     def gen_class_set_output_body(self, k: SchemaKind, maybe_create_proxy: bool) -> str:

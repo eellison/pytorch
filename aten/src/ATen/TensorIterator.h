@@ -634,6 +634,10 @@ struct TORCH_API TensorIteratorBase : public impl::MetaBase {
   bool fast_set_up(const TensorIteratorConfig& /*config*/);
   FastSetupType compute_fast_setup_type(const TensorIteratorConfig& /*config*/);
   void coalesce_dimensions();
+  // Under sym_meta_enabled() (TensorIteratorSym.h), builds a TensorIteratorSym
+  // when an operand has symbolic sizes and takes its operands and dtypes; shape
+  // and strides stay empty. Returns false, leaving config untouched, otherwise.
+  bool build_sym(TensorIteratorConfig& /*config*/);
 
  protected:
   /// Records the "computation" shape of the output tensor. The computation

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <ATen/DimVector.h>
+#include <c10/core/SymIntArrayRef.h>
 #include <c10/core/TensorOptions.h>
 #include <c10/util/strides.h>
 
@@ -108,6 +109,17 @@ struct TORCH_API MetaBase {
       IntArrayRef strides_hint [[maybe_unused]],
       TensorOptions options [[maybe_unused]]) {
     TORCH_INTERNAL_ASSERT(false, "set_output_strided not implemented.");
+  }
+
+  // set_output_raw_strided for symbolic sizes, called by TensorIteratorSym.
+  // Only the Meta kernels of functional structured ops implement it.
+  virtual void set_output_raw_strided_symint(
+      int64_t output_idx [[maybe_unused]],
+      c10::SymIntArrayRef sizes [[maybe_unused]],
+      c10::SymIntArrayRef strides_hint [[maybe_unused]],
+      TensorOptions options [[maybe_unused]]) {
+    TORCH_INTERNAL_ASSERT(
+        false, "set_output_raw_strided_symint not implemented.");
   }
 
   // Use this function if the kernel requires contiguous strides.
