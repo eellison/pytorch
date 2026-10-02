@@ -142,14 +142,13 @@ void pointwise_launch(Recorder& rec, const TensorIteratorSym& iter, std::string_
   rec.launches.push_back(std::move(r));
 }
 
-// jitted_gpu_kernel_generic's routes (CUDAJitLoops.cuh) to NVRTC's extern "C"
+// jitted_gpu_kernel_generic's routes (CUDAJitLoops.cuh), or with `dynamic` a
+// user jiterator's (jiterator.cu), to NVRTC's extern "C"
 // <op>_vectorized<vec>_kernel or <op>_kernel; the node's loader tells the
 // dynamic-cast route, compute_dtype is the kernel's input type there
-template <int N>
-void jitted_launch(Recorder& rec, const TensorIteratorSym& iter, c10::ScalarType compute_dtype, std::string_view name, KernelRecord r) {
-  if (N == 1) {
-    decline("a jiterator kernel of no input");
-  }
+template <int NOUT, int NIN>
+void jitted_launch(Recorder& rec, const TensorIteratorSym& iter, c10::ScalarType compute_dtype, bool dynamic, std::string_view name, KernelRecord r) {
+  constexpr int N = NOUT + NIN;
   const bool vectorized = contains(name, "_vectorized");
   if (!vectorized && r.params.size() < 7) {
     decline(c10::str("kernel ", name, " has ", r.params.size(), " parameters"));
@@ -158,9 +157,9 @@ void jitted_launch(Recorder& rec, const TensorIteratorSym& iter, c10::ScalarType
   if (cast && compute_dtype == c10::ScalarType::Undefined) {
     decline("a jiterator dynamic-cast kernel of an iterator without a common dtype");
   }
-  const int64_t in_size = cast ? c10::elementSize(compute_dtype) : iter.element_size(1);
+  const int64_t in_size = cast ? c10::elementSize(compute_dtype) : iter.element_size(NOUT);
   const int64_t out_size = cast ? in_size : iter.element_size(0);
-  if (cast && (in_size == 1 || iter.element_size(0) == 1)) {
+  if (cast && !dynamic && (in_size == 1 || iter.element_size(0) == 1)) {
     decline("a jiterator dynamic-cast kernel of a 1-byte type");
   }
   std::array<c10::SymInt, N> data;
@@ -173,9 +172,10 @@ void jitted_launch(Recorder& rec, const TensorIteratorSym& iter, c10::ScalarType
   const int64_t bws = (std::min(in_size, out_size) == 1 ? 16 : 8) * num_threads();
   std::string suffix = "_kernel";
   if (iter.is_contiguous() && !cast) {
-    int vec = vectorize_up_to(data[0], out_size, std::min<int>(16 / in_size, in_size < 2 ? 4 : 8));
-    for (const auto i : c10::irange(1, N)) {
-      vec = vectorize_up_to(data[i], in_size, vec);
+    // a user jiterator's vector size is jitted_can_vectorize_up_to's alone
+    int vec = dynamic ? 8 : std::min<int>(16 / in_size, in_size < 2 ? 4 : 8);
+    for (const auto i : c10::irange(N)) {
+      vec = vectorize_up_to(data[i], i < NOUT ? out_size : in_size, vec);
     }
     if (vec > 1) {
       suffix = c10::str("_vectorized", vec, "_kernel");
@@ -190,9 +190,9 @@ void jitted_launch(Recorder& rec, const TensorIteratorSym& iter, c10::ScalarType
       }
       ptr[i] = strides[i].data();
     }
-    Param<::OffsetCalculator<N - 1>> ic;
-    set_offset_calculator(rec, ic, ic.value(), iter.ndim(), iter.shape().data(), ptr.data() + 1);
-    Param<::OffsetCalculator<1>> oc;
+    Param<::OffsetCalculator<NIN>> ic;
+    set_offset_calculator(rec, ic, ic.value(), iter.ndim(), iter.shape().data(), ptr.data() + NOUT);
+    Param<::OffsetCalculator<NOUT>> oc;
     set_offset_calculator(rec, oc, oc.value(), iter.ndim(), iter.shape().data(), ptr.data());
     overlay(r, 2, ic);
     overlay(r, 3, oc);
@@ -206,6 +206,30 @@ void jitted_launch(Recorder& rec, const TensorIteratorSym& iter, c10::ScalarType
   r.block = num_threads();
   r.smem = 0;
   rec.launches.push_back(std::move(r));
+}
+
+template <int NOUT>
+void jitted(Recorder& rec, const TensorIteratorSym& iter, c10::ScalarType compute_dtype, bool dynamic, std::string_view name, KernelRecord r) {
+  switch (iter.ninputs()) {
+    case 1:
+      return jitted_launch<NOUT, 1>(rec, iter, compute_dtype, dynamic, name, std::move(r));
+    case 2:
+      return jitted_launch<NOUT, 2>(rec, iter, compute_dtype, dynamic, name, std::move(r));
+    case 3:
+      return jitted_launch<NOUT, 3>(rec, iter, compute_dtype, dynamic, name, std::move(r));
+    case 4:
+      return jitted_launch<NOUT, 4>(rec, iter, compute_dtype, dynamic, name, std::move(r));
+    case 5:
+      return jitted_launch<NOUT, 5>(rec, iter, compute_dtype, dynamic, name, std::move(r));
+    case 6:
+      return jitted_launch<NOUT, 6>(rec, iter, compute_dtype, dynamic, name, std::move(r));
+    case 7:
+      return jitted_launch<NOUT, 7>(rec, iter, compute_dtype, dynamic, name, std::move(r));
+    case 8:
+      return jitted_launch<NOUT, 8>(rec, iter, compute_dtype, dynamic, name, std::move(r));
+    default:
+      decline(c10::str("a jiterator kernel of ", iter.ninputs(), " inputs"));
+  }
 }
 
 // gpu_kernel_multiple_outputs's unrolled kernel, whose offset calculators
@@ -247,18 +271,25 @@ void multiple_outputs_launch(Recorder& rec, const TensorIteratorSym& iter, std::
   rec.launches.push_back(std::move(r));
 }
 
-template <int N>
-void launch(Recorder& rec, const TensorIteratorSym& iter, c10::ScalarType compute_dtype, std::string_view name, KernelRecord r) {
-  if (name.substr(0, 2) == "_Z") {
-    pointwise_launch<N>(rec, iter, name, std::move(r));
-  } else {
-    jitted_launch<N>(rec, iter, compute_dtype, name, std::move(r));
+template <int NOUT>
+void multiple_outputs(Recorder& rec, const TensorIteratorSym& iter, std::string_view name, KernelRecord r) {
+  switch (iter.ninputs()) {
+    case 1:
+      return multiple_outputs_launch<NOUT, 1>(rec, iter, name, std::move(r));
+    case 2:
+      return multiple_outputs_launch<NOUT, 2>(rec, iter, name, std::move(r));
+    case 3:
+      return multiple_outputs_launch<NOUT, 3>(rec, iter, name, std::move(r));
+    case 4:
+      return multiple_outputs_launch<NOUT, 4>(rec, iter, name, std::move(r));
+    default:
+      decline(c10::str("a pointwise op of ", NOUT, " outputs and ", iter.ninputs(), " inputs"));
   }
 }
 
 } // namespace
 
-std::vector<TensorBase> pointwise(Recorder& rec, c10::ArrayRef<TensorBase> outs, c10::ArrayRef<c10::ScalarType> out_dtypes, c10::ArrayRef<TensorBase> inputs, c10::ScalarType compute_dtype, std::string_view name, KernelRecord node) {
+std::vector<TensorBase> pointwise(Recorder& rec, c10::ArrayRef<TensorBase> outs, c10::ArrayRef<c10::ScalarType> out_dtypes, c10::ArrayRef<TensorBase> inputs, c10::ScalarType compute_dtype, bool dynamic, std::string_view name, KernelRecord node) {
   auto iter = TensorIteratorSym::pointwise_op(rec, outs, out_dtypes, inputs);
   std::vector<TensorBase> outputs;
   for (const auto i : c10::irange(iter.noutputs())) {
@@ -276,12 +307,43 @@ std::vector<TensorBase> pointwise(Recorder& rec, c10::ArrayRef<TensorBase> outs,
   if (!iter.can_use_32bit_indexing()) {
     decline("an iterator beyond 32-bit indexing");
   }
-  if (iter.noutputs() == 2 && iter.ninputs() == 1) {
-    multiple_outputs_launch<2, 1>(rec, iter, name, std::move(node));
+  if (name.substr(0, 2) != "_Z") {
+    switch (iter.noutputs()) {
+      case 1:
+        jitted<1>(rec, iter, compute_dtype, dynamic, name, std::move(node));
+        break;
+      case 2:
+        jitted<2>(rec, iter, compute_dtype, dynamic, name, std::move(node));
+        break;
+      case 3:
+        jitted<3>(rec, iter, compute_dtype, dynamic, name, std::move(node));
+        break;
+      case 4:
+        jitted<4>(rec, iter, compute_dtype, dynamic, name, std::move(node));
+        break;
+      case 5:
+        jitted<5>(rec, iter, compute_dtype, dynamic, name, std::move(node));
+        break;
+      case 6:
+        jitted<6>(rec, iter, compute_dtype, dynamic, name, std::move(node));
+        break;
+      case 7:
+        jitted<7>(rec, iter, compute_dtype, dynamic, name, std::move(node));
+        break;
+      case 8:
+        jitted<8>(rec, iter, compute_dtype, dynamic, name, std::move(node));
+        break;
+      default:
+        decline(c10::str("a jiterator kernel of ", iter.noutputs(), " outputs"));
+    }
     return outputs;
   }
-  if (iter.noutputs() == 2 && iter.ninputs() == 2) {
-    multiple_outputs_launch<2, 2>(rec, iter, name, std::move(node));
+  if (iter.noutputs() == 2) {
+    multiple_outputs<2>(rec, iter, name, std::move(node));
+    return outputs;
+  }
+  if (iter.noutputs() == 3) {
+    multiple_outputs<3>(rec, iter, name, std::move(node));
     return outputs;
   }
   if (iter.noutputs() != 1) {
@@ -289,16 +351,16 @@ std::vector<TensorBase> pointwise(Recorder& rec, c10::ArrayRef<TensorBase> outs,
   }
   switch (iter.ntensors()) {
     case 1:
-      launch<1>(rec, iter, compute_dtype, name, std::move(node));
+      pointwise_launch<1>(rec, iter, name, std::move(node));
       break;
     case 2:
-      launch<2>(rec, iter, compute_dtype, name, std::move(node));
+      pointwise_launch<2>(rec, iter, name, std::move(node));
       break;
     case 3:
-      launch<3>(rec, iter, compute_dtype, name, std::move(node));
+      pointwise_launch<3>(rec, iter, name, std::move(node));
       break;
     case 4:
-      launch<4>(rec, iter, compute_dtype, name, std::move(node));
+      pointwise_launch<4>(rec, iter, name, std::move(node));
       break;
     default:
       decline(c10::str("a pointwise op of ", iter.ntensors(), " operands"));

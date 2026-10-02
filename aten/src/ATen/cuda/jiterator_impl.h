@@ -119,6 +119,11 @@ struct OffsetCalculatorVariant {
     return std::visit([](auto & v){ return static_cast<void*>(v.get()); }, v);
   }
 
+  template <typename F>
+  void visit(F&& f) const {
+    std::visit([&](const auto& p) { f(*p); }, v);
+  }
+
  private:
   OffsetCalculatorTypes v{};
 };
@@ -156,6 +161,11 @@ struct ArrayVariant {
     return std::visit([](auto & a){ return static_cast<void*>(&a); }, array);
   }
 
+  template <typename F>
+  void visit(F&& f) const {
+    std::visit(f, array);
+  }
+
 private:
   ArrayTypes array;
 };
@@ -182,6 +192,11 @@ struct TrivialOffsetCalculatorVariant {
 
   void* data_ptr() {
     return std::visit([](auto & v){ return static_cast<void*>(&v); }, v);
+  }
+
+  template <typename F>
+  void visit(F&& f) const {
+    std::visit(f, v);
   }
 
 private:
@@ -213,6 +228,11 @@ struct LoadWithCastVariant {
     return std::visit([](auto & v){ return static_cast<void*>(v.get()); }, v);
   }
 
+  template <typename F>
+  void visit(F&& f) const {
+    std::visit([&](const auto& p) { f(*p); }, v);
+  }
+
 private:
   LoadWithCastPtr v{};
 };
@@ -240,6 +260,11 @@ struct StoreWithCastVariant {
 
   void* data_ptr() {
     return std::visit([](auto & v){ return static_cast<void*>(v.get()); }, v);
+  }
+
+  template <typename F>
+  void visit(F&& f) const {
+    std::visit([&](const auto& p) { f(*p); }, v);
   }
 
 private:

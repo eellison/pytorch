@@ -545,8 +545,9 @@ print("ok", p.harvests, p.refused)
                 self.assertEqual(got, want, atol=0, rtol=0)
         self.assertEqual(p.harvests, 6)
         self.assertEqual(len(p.refused), 2)
-        # a new size's harvested keys bind by relowering the tape; the refusal retraces
-        self.assertEqual((f.traces, f.relowers, f.replays), (2, 1, 7))
+        # the first call runs eagerly; a new size's harvested keys bind by
+        # relowering the tape; the refusal retraces
+        self.assertEqual((f.traces, f.relowers, f.replays), (2, 1, 5))
 
     def test_addmm_declines(self):
         p = HarvestProvider()

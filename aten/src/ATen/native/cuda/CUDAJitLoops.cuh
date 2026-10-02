@@ -72,6 +72,31 @@ inline c10::SmallBuffer<const void*, 64> pack_kernel_args(
   return ret;
 }
 
+#ifndef USE_ROCM
+// args as report_launch's; the scalar and extra arguments are of desc's
+// types, as jit_utils' generate_code declares them. A Lhs/RhsScalar kernel's
+// scalar is opmath_jitted_gpu_kernel_with_scalars' CPU scalar
+template <typename... Args>
+C10_NOINLINE void report_jitted_launch(
+    const at::cuda::jit::NvrtcFunction& fn, uint32_t grid, const at::cuda::jit::KernelDescriptor& desc,
+    at::cuda::jit::BinaryFuncVariant scalar_pos, const void* scalar_val, c10::ArrayRef<const void*> extra_args,
+    const Args&... args) {
+  at::cuda::host_trace::LaunchLayout l{reinterpret_cast<cudaFunction_t>(fn.function), grid, num_threads(), {}, {}};
+  (report_param(l, args), ...);
+  auto scalar = [&](const void* v, c10::ScalarType t, char cls) {
+    l.classes.emplace_back(c10::elementSize(t), cls);
+    l.bytes.emplace_back(static_cast<const char*>(v), c10::elementSize(t));
+  };
+  const auto opmath = toOpMathType(desc.f_inputs_type);
+  const bool cpu_scalar = scalar_pos != at::cuda::jit::BinaryFuncVariant::NoScalar && static_cast<int>(opmath) < 26;
+  scalar(scalar_val, opmath, cpu_scalar ? 'A' + static_cast<char>(opmath) : 's');
+  for (const auto i : c10::irange(extra_args.size())) {
+    scalar(extra_args[i], desc.extra_args_types[i], 's');
+  }
+  at::cuda::host_trace::report_launch_layout(std::move(l));
+}
+#endif
+
 template<typename array_t,
          typename inp_calc_t,
          typename out_calc_t,
@@ -110,6 +135,11 @@ void launch_jitted_unrolled_kernel(
     }
   }
 
+#ifndef USE_ROCM
+  if (at::cuda::host_trace::harvesting()) {
+    report_jitted_launch(fn_cache, grid, desc, scalar_pos, scalar_val, extra_args, static_cast<int>(N), data, ic, oc, l, s);
+  }
+#endif
   auto args = pack_kernel_args({&N, &data, &ic, &oc, &l, &s, scalar_val}, extra_args);
   at::cuda::jit::launch_jitted_pwise_function(fn_cache, args.data(), {grid, 1u, 1u},
   {num_threads(), 1u, 1u});
@@ -182,6 +212,11 @@ void launch_jitted_vectorized_kernel(
   }
 
   if (vectorized) {
+#ifndef USE_ROCM
+    if (at::cuda::host_trace::harvesting()) {
+      report_jitted_launch(*fn_ptr, grid, desc, scalar_pos, scalar_val, extra_args, static_cast<int>(N), data);
+    }
+#endif
     auto args = pack_kernel_args({&N, &data, scalar_val}, extra_args);
     at::cuda::jit::launch_jitted_pwise_function(
         *fn_ptr, args.data(), {grid, 1u, 1u}, {num_threads(), 1u, 1u});
@@ -195,6 +230,11 @@ void launch_jitted_vectorized_kernel(
     auto l = memory::LoadWithoutCast();
     auto s = memory::StoreWithoutCast();
 
+#ifndef USE_ROCM
+    if (at::cuda::host_trace::harvesting()) {
+      report_jitted_launch(*fn_ptr, grid, desc, scalar_pos, scalar_val, extra_args, static_cast<int>(N), data, ic, oc, l, s);
+    }
+#endif
     auto args = pack_kernel_args(
         {&N, &data, &ic, &oc, &l, &s, scalar_val}, extra_args);
     at::cuda::jit::launch_jitted_pwise_function(

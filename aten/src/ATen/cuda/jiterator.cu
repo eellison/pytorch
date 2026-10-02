@@ -11,6 +11,46 @@
 namespace at {
 namespace native {
 
+#ifndef USE_ROCM
+// the arguments launch_jitted_pwise_function takes from the launches below,
+// their offset calculators, loader and storer built again from iter; the
+// scalar argument, which a NoScalar kernel never reads, of no class (eager
+// passes a float of any compute type), each extra argument its Scalar's
+C10_NOINLINE void report_dynamic_launch(
+    const at::cuda::jit::NvrtcFunction& fn, uint32_t grid, const TensorIteratorBase& iter, int64_t N,
+    bool vectorized, bool contiguous, bool dynamic_casting, const c10::SmallVector<at::Scalar>& extra_args) {
+  at::cuda::host_trace::LaunchLayout l{reinterpret_cast<cudaFunction_t>(fn.function), grid, num_threads(), {}, {}};
+  auto param = [&](const auto& v) { report_param(l, v); };
+  param(static_cast<int>(N));
+  ArrayVariant(iter).visit(param);
+  if (!vectorized) {
+    if (contiguous) {
+      TrivialOffsetCalculatorVariant(iter.ninputs()).visit(param);
+      TrivialOffsetCalculatorVariant(iter.noutputs()).visit(param);
+    } else {
+      OffsetCalculatorVariant</*is_input=*/true>(iter).visit(param);
+      OffsetCalculatorVariant</*is_input=*/false>(iter).visit(param);
+    }
+    if (dynamic_casting) {
+      LoadWithCastVariant(iter).visit(param);
+      StoreWithCastVariant(iter).visit(param);
+    } else {
+      param(memory::LoadWithoutCast());
+      param(memory::StoreWithoutCast());
+    }
+  }
+  const size_t scalar_size = c10::elementSize(toOpMathType(iter.common_dtype()));
+  l.classes.emplace_back(scalar_size, '.');
+  l.bytes.emplace_back(scalar_size, '\0');
+  for (const auto& a : extra_args) {
+    const size_t size = c10::elementSize(a.type());
+    l.classes.emplace_back(size, 's');
+    l.bytes.emplace_back(static_cast<const char*>(a.data_ptr()), size);
+  }
+  at::cuda::host_trace::report_launch_layout(std::move(l));
+}
+#endif
+
 static inline void launch_jitted_vectorized_kernel_dynamic(
   const std::string& name, TensorIteratorBase& iter,
   DeviceIndex dev_idx, int64_t N, const std::string& f, const void* data_ptr,
@@ -78,6 +118,11 @@ static inline void launch_jitted_vectorized_kernel_dynamic(
 
   float scalar_val = 0;
 
+#ifndef USE_ROCM
+  if (at::cuda::host_trace::harvesting()) {
+    report_dynamic_launch(*fn_ptr, grid, iter, N, vectorized, /*contiguous=*/true, /*dynamic_casting=*/false, extra_args);
+  }
+#endif
   if (vectorized) {
     // pack args for kernel launch
     constexpr int kernel_args = 3;
@@ -170,6 +215,11 @@ static inline void launch_jitted_unrolled_kernel_dynamic(
 
   float scalar_val = 0;
 
+#ifndef USE_ROCM
+  if (at::cuda::host_trace::harvesting()) {
+    report_dynamic_launch(*fn_ptr, grid, iter, N, /*vectorized=*/false, contiguous, dynamic_casting, extra_args);
+  }
+#endif
   // pack args for kernel launch
   constexpr int kernel_args = 7;
   auto extra_args_size = extra_args.size();

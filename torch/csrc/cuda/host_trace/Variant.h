@@ -32,6 +32,8 @@ constexpr int64_t kAlignment = 256;
 
 // test-only: the setters that succeed before one raises, or -1
 extern int64_t fail_after_setter;
+// test-only: the memset and memcpy nodes set
+extern int64_t memory_node_sets;
 // test-only: the TMA descriptors encoded, and those whose address alone was
 // replaced
 extern int64_t tma_encodes;
@@ -181,6 +183,14 @@ class HostTraceVariant {
     uint8_t kind;
     int64_t delta;
   };
+  // A functor member eager reads from a 0-dim CPU tensor (a CPU scalar class,
+  // LaunchLayout.h), re-read from source at each replay
+  struct CpuScalar {
+    uint32_t param;
+    uint32_t offset;
+    char cls;
+    at::Tensor source;
+  };
   // A CUtensorMap parameter, encoded from 2 * rank fields from `first`: the
   // address, each extent, each byte stride but the first
   struct Descriptor {
@@ -216,6 +226,7 @@ class HostTraceVariant {
     uint8_t* held; // what the node held when it last ran this row
     std::vector<RngField> rng;
     int64_t rng_increment = 0; // the philox offsets its call takes
+    std::vector<CpuScalar> cpu_scalars;
   };
   struct MemsetRow {
     Field dst;

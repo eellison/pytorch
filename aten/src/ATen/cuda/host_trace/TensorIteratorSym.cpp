@@ -153,7 +153,9 @@ TensorBase review_reduce_result(const TensorBase& result, int64_t ndim, const at
 
 TensorIteratorSym make_reduction(Recorder& rec, TensorBase& result, const TensorBase& self, IntArrayRef dims, bool keepdim, std::optional<ScalarType> dtype) {
   const auto mask = at::native::make_dim_mask(dims, self.dim());
-  result = at::empty_symint(reduction_shape(self, mask, keepdim), self.options().dtype(dtype.value_or(self.scalar_type())));
+  if (!result.defined()) {
+    result = at::empty_symint(reduction_shape(self, mask, keepdim), self.options().dtype(dtype.value_or(self.scalar_type())));
+  }
   return TensorIteratorSym::reduce_op(rec, review_reduce_result(result, self.dim(), mask, keepdim), self);
 }
 

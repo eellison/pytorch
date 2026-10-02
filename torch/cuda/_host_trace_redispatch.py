@@ -200,8 +200,8 @@ def _redo(lowered: LoweredTape, selector: LoweredSelector) -> tuple[list[Any], l
     launches = []
     olds = [rec for _, rec in old.launches[op.launches.start : op.launches.stop]]
     for n, (_, x), y in zip(selector.nodes, tr.launches, olds, strict=True):
-        if isinstance(x, KernelLaunch) and (x.rng or x.rng_increment or x.descriptors):
-            raise FoldRefused(f"an RNG or TMA launch in {op.func}")
+        if isinstance(x, KernelLaunch) and (x.rng or x.rng_increment or x.descriptors or x.cpu_scalars):
+            raise FoldRefused(f"an RNG, TMA or CPU scalar launch in {op.func}")
         if isinstance(x, Memcpy):
             raise FoldRefused(f"a memcpy in {op.func}")
         if any(id(r) not in back for r in x.roots):

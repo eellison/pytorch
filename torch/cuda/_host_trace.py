@@ -57,6 +57,8 @@ class Declined(RuntimeError):
     # nothing to capture: every operation runs eagerly, so a replay would
     # too; not a decline to report
     uncaptured: bool = False
+    # the trace's operator calls are not the warm-up's (_check_witness)
+    witness: bool = False
 
 
 def declined(msg: str) -> Declined:
@@ -143,6 +145,9 @@ class _TraceShapeEnv(ShapeEnv):
 
     # a key built from sizes (a compile cache's) is a specialization, as any value the host reads
     hash_symints_by_value = True
+    # eager's host reads a concrete value where the trace's statically_known_true
+    # would not decide (sdp_utils' mask shape check picking cuDNN attention)
+    static_reads_guard = True
 
     def __init__(self, trusted: bool = False) -> None:
         super().__init__(duck_shape=False, specialize_zero_one=False)

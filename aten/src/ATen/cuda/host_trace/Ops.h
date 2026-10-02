@@ -28,10 +28,10 @@ TORCH_CUDA_CU_API TensorBase to_copy(Recorder& rec, const TensorBase& src, c10::
 // dims empty is all dims
 TORCH_CUDA_CU_API TensorBase sum(Recorder& rec, const TensorBase& self, IntArrayRef dims, bool keepdim);
 TORCH_CUDA_CU_API TensorBase mean(Recorder& rec, const TensorBase& self, IntArrayRef dims, bool keepdim);
-TORCH_CUDA_CU_API TensorBase amax(Recorder& rec, const TensorBase& self, IntArrayRef dims, bool keepdim);
-TORCH_CUDA_CU_API TensorBase amin(Recorder& rec, const TensorBase& self, IntArrayRef dims, bool keepdim);
-TORCH_CUDA_CU_API TensorBase max_all(Recorder& rec, const TensorBase& self);
-TORCH_CUDA_CU_API TensorBase min_all(Recorder& rec, const TensorBase& self);
+TORCH_CUDA_CU_API TensorBase amax(Recorder& rec, const TensorBase& self, IntArrayRef dims, bool keepdim, const TensorBase& out = {});
+TORCH_CUDA_CU_API TensorBase amin(Recorder& rec, const TensorBase& self, IntArrayRef dims, bool keepdim, const TensorBase& out = {});
+TORCH_CUDA_CU_API TensorBase max_all(Recorder& rec, const TensorBase& self, const TensorBase& out = {});
+TORCH_CUDA_CU_API TensorBase min_all(Recorder& rec, const TensorBase& self, const TensorBase& out = {});
 TORCH_CUDA_CU_API std::tuple<TensorBase, TensorBase> max_dim(Recorder& rec, const TensorBase& self, int64_t dim, bool keepdim);
 TORCH_CUDA_CU_API std::tuple<TensorBase, TensorBase> min_dim(Recorder& rec, const TensorBase& self, int64_t dim, bool keepdim);
 TORCH_CUDA_CU_API TensorBase argmax(Recorder& rec, const TensorBase& self, std::optional<int64_t> dim, bool keepdim);
@@ -53,11 +53,12 @@ TORCH_CUDA_CU_API std::tuple<TensorBase, TensorBase> fused_rms_norm(Recorder& re
 // jitted_gpu_kernel launch as the kernel node `node` of a capture of the op
 // launched it (name its kernel's name; empty for no launch): inputs are its
 // TensorIterator's inputs, outs its outputs, each where the op writes an
-// argument, else undefined; compute_dtype the iterator's common dtype
-TORCH_CUDA_CU_API std::vector<TensorBase> pointwise(Recorder& rec, c10::ArrayRef<TensorBase> outs, c10::ArrayRef<c10::ScalarType> out_dtypes, c10::ArrayRef<TensorBase> inputs, c10::ScalarType compute_dtype, std::string_view name, KernelRecord node);
+// argument, else undefined; compute_dtype the iterator's common dtype;
+// dynamic for a user jiterator's launch (torch.cuda.jiterator)
+TORCH_CUDA_CU_API std::vector<TensorBase> pointwise(Recorder& rec, c10::ArrayRef<TensorBase> outs, c10::ArrayRef<c10::ScalarType> out_dtypes, c10::ArrayRef<TensorBase> inputs, c10::ScalarType compute_dtype, bool dynamic, std::string_view name, KernelRecord node);
 TORCH_CUDA_CU_API TensorBase index_select(Recorder& rec, const TensorBase& self, int64_t dim, const TensorBase& index);
-// arange(start, start + size * step, step): its integral start and step
-TORCH_CUDA_CU_API TensorBase arange(Recorder& rec, const c10::SymInt& size, const c10::SymInt& start, const c10::SymInt& step, c10::ScalarType dtype, c10::Device device);
+// arange(start, start + size * step, step): an integral dtype's integral start and step, a floating one's concrete
+TORCH_CUDA_CU_API TensorBase arange(Recorder& rec, const c10::SymInt& size, const c10::Scalar& start, const c10::Scalar& step, c10::ScalarType dtype, c10::Device device);
 TORCH_CUDA_CU_API TensorBase triu(Recorder& rec, const TensorBase& self, int64_t k);
 // (output, total_weight) of a reduction; an undefined weight is none
 TORCH_CUDA_CU_API std::tuple<TensorBase, TensorBase> nll_loss_forward(Recorder& rec, const TensorBase& self, const TensorBase& target, const TensorBase& weight, int64_t reduction, int64_t ignore_index);

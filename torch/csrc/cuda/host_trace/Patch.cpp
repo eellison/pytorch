@@ -1,6 +1,7 @@
 #include <torch/csrc/cuda/host_trace/Variant.h>
 
 #if !defined(USE_ROCM)
+#include <ATen/cuda/host_trace/LaunchLayout.h>
 #include <c10/cuda/CUDAException.h>
 #include <c10/cuda/driver_api.h>
 #include <c10/util/safe_numerics.h>
@@ -13,6 +14,7 @@
 namespace torch::cuda::host_trace {
 
 int64_t fail_after_setter = -1;
+int64_t memory_node_sets = 0;
 int64_t tma_encodes = 0;
 int64_t tma_replaces = 0;
 
@@ -191,10 +193,9 @@ void HostTraceVariant::patch_and_replay(Segment& run, Frame& frame) {
     const int64_t row = r.site >= 0 ? frame.site_entries[r.site] : 0;
     if (r.kind == Kind::Memset) {
       const MemsetRow& m = memset_row(r, row);
+      // set every replay: the node holds the allocation its address was in
+      // when set, and a free and reallocation at that address leaves it stale
       const std::array<int64_t, 4> held = memset_shape(m, v, bases);
-      if (r.held && r.held_row == row && held == r.held_memset) {
-        return;
-      }
       r.held = false;
       for (size_t k = 1; k < 4; ++k) {
         TORCH_CHECK_VALUE(held[k] >= 0, "host_trace: a memset of ", held[k]);
@@ -210,6 +211,7 @@ void HostTraceVariant::patch_and_replay(Segment& run, Frame& frame) {
           reinterpret_cast<cudaGraphExec_t>(exec),
           reinterpret_cast<cudaGraphNode_t>(node),
           &params));
+      ++memory_node_sets;
       TORCH_CHECK(
           fail_after_setter < 0 || fail_after_setter-- != 0,
           "host_trace: a failure injected after a setter");
@@ -219,10 +221,8 @@ void HostTraceVariant::patch_and_replay(Segment& run, Frame& frame) {
       return;
     }
     if (r.kind == Kind::Memcpy) {
+      // set every replay, as a memset is
       const std::array<int64_t, 3> held = memcpy_shape(r.copy, v, bases);
-      if (r.held && held == r.held_copy) {
-        return;
-      }
       r.held = false;
       TORCH_CHECK_VALUE(held[2] > 0, "host_trace: a memcpy of ", held[2], " bytes");
       C10_CUDA_CHECK(cudaGraphExecMemcpyNodeSetParams1D(
@@ -232,6 +232,7 @@ void HostTraceVariant::patch_and_replay(Segment& run, Frame& frame) {
           reinterpret_cast<const void*>(held[1]),
           static_cast<size_t>(held[2]),
           cudaMemcpyDeviceToDevice));
+      ++memory_node_sets;
       TORCH_CHECK(
           fail_after_setter < 0 || fail_after_setter-- != 0,
           "host_trace: a failure injected after a setter");
@@ -252,6 +253,13 @@ void HostTraceVariant::patch_and_replay(Segment& run, Frame& frame) {
                : f.kind == 1 ? run.philox_offset
                              : philox);
       std::memcpy(k.image + k.param_offsets[f.param] + f.offset, &x, sizeof(x));
+    }
+    for (const CpuScalar& c : k.cpu_scalars) {
+      TORCH_CHECK(
+          c.source.device().is_cpu() && c.source.dim() == 0,
+          "host_trace: a CPU scalar no longer a 0-dim CPU tensor");
+      at::cuda::host_trace::cpu_scalar_bytes(
+          c.source, c.cls, k.image + k.param_offsets[c.param] + c.offset);
     }
     std::array<int64_t, 7> dims = k.dims;
     if (!k.constant_dims) {

@@ -21,21 +21,50 @@ namespace {
 void pow_tensor_scalar_kernel(TensorIteratorBase& iter, const Scalar& exp_scalar);
 
 template <typename scalar_t>
-void pow_scalar_tensor_impl(TensorIteratorBase& iter, scalar_t base) {
-  gpu_kernel(iter, [=]GPU_LAMBDA(scalar_t exp) -> scalar_t {
+struct PowScalarTensorFunctor {
+  scalar_t base;
+  __device__ scalar_t operator()(scalar_t exp) const {
     return pow_(base, exp);
-  });
+  }
+  auto host_trace_fields() const {
+    return std::tie(base);
+  }
+};
+
+template <typename scalar_t>
+void pow_scalar_tensor_impl(TensorIteratorBase& iter, scalar_t base) {
+  gpu_kernel(iter, PowScalarTensorFunctor<scalar_t>{base});
 }
+
+template <typename value_t>
+struct PowScalarTensorComplexFunctor {
+  c10::complex<value_t> fct;
+  __device__ c10::complex<value_t> operator()(c10::complex<value_t> exp) const {
+    return std::exp(fct * exp);
+  }
+  auto host_trace_fields() const {
+    return std::tie(fct);
+  }
+};
 
 template <typename value_t>
 void pow_scalar_tensor_impl(TensorIteratorBase& iter, c10::complex<value_t> base) {
   // For complex, thrust::pow uses the identity
   // pow(a, b) = exp(log(a) * b)
   const auto fct = std::log(base);
-  gpu_kernel(iter, [=]GPU_LAMBDA(c10::complex<value_t> exp) -> c10::complex<value_t> {
-    return std::exp(fct * exp);
-  });
+  gpu_kernel(iter, PowScalarTensorComplexFunctor<value_t>{fct});
 }
+
+template <typename scalar_t, typename opmath_t>
+struct PowScalarTensorChalfFunctor {
+  opmath_t fct;
+  __device__ scalar_t operator()(scalar_t exp) const {
+    return std::exp(fct * opmath_t{exp});
+  }
+  auto host_trace_fields() const {
+    return std::tie(fct);
+  }
+};
 
 /* complex<Half> support impl */
 constexpr char pow_scalar_base_name[] = "pow_scalar_base_kernel";
@@ -58,9 +87,7 @@ void pow_scalar_tensor_impl(TensorIteratorBase& iter, c10::complex<at::Half> bas
       /*scalar_val=*/0,
       /*extra_args=*/std::make_tuple(fct));
 #else
-  gpu_kernel(iter, [=] GPU_LAMBDA(scalar_t exp) -> scalar_t {
-    return std::exp(fct * opmath_t{exp});
-  });
+  gpu_kernel(iter, PowScalarTensorChalfFunctor<scalar_t, opmath_t>{fct});
 #endif
 }
 
@@ -75,6 +102,17 @@ static const auto pow_kernel_string =
     });
 #endif
 
+template <typename scalar_t, typename opmath_t>
+struct PowChalfTensorScalarFunctor {
+  opmath_t exp;
+  __device__ scalar_t operator()(scalar_t base) const {
+    return std::pow(opmath_t{base}, exp);
+  }
+  auto host_trace_fields() const {
+    return std::tie(exp);
+  }
+};
+
 /* complex<Half> support impl */
 void pow_chalf_tensor_scalar_impl(TensorIteratorBase& iter, const Scalar& exp_scalar) {
   using scalar_t = c10::complex<at::Half>;
@@ -88,9 +126,7 @@ void pow_chalf_tensor_scalar_impl(TensorIteratorBase& iter, const Scalar& exp_sc
       /*scalar_val=*/0,
       /*extra_args=*/std::make_tuple(exp));
 #else
-  gpu_kernel(iter, [=] GPU_LAMBDA(scalar_t base) -> scalar_t {
-    return std::pow(opmath_t{base}, exp);
-  });
+  gpu_kernel(iter, PowChalfTensorScalarFunctor<scalar_t, opmath_t>{exp});
 #endif
 }
 
@@ -115,7 +151,7 @@ void pow_tensor_tensor_kernel(TensorIteratorBase& iter) {
       jitted_gpu_kernel<pow_name, scalar_t, scalar_t, 2>(
           iter, pow_kernel_string);
 #else
-      gpu_kernel(iter, [=] GPU_LAMBDA(scalar_t base, scalar_t exp) -> scalar_t {
+      gpu_kernel(iter, [] GPU_LAMBDA(scalar_t base, scalar_t exp) -> scalar_t {
             using opmath_t = at::opmath_type<scalar_t>;
             return pow_(opmath_t{base}, opmath_t{exp});
           });
@@ -133,7 +169,7 @@ void pow_tensor_tensor_kernel(TensorIteratorBase& iter) {
         iter.remove_operand(2);
         pow_tensor_scalar_kernel(iter, exp);
       } else {
-        gpu_kernel(iter, [=]GPU_LAMBDA(scalar_t base, scalar_t exp) -> scalar_t {
+        gpu_kernel(iter, []GPU_LAMBDA(scalar_t base, scalar_t exp) -> scalar_t {
           return pow_(base, exp);
         });
       }
@@ -142,6 +178,17 @@ void pow_tensor_tensor_kernel(TensorIteratorBase& iter) {
 }
 
 
+template <typename Base_type, typename Exp_type>
+struct PowTensorScalarFunctor {
+  Exp_type exp;
+  __device__ Base_type operator()(Base_type base) const {
+    return pow_(base, exp);
+  }
+  auto host_trace_fields() const {
+    return std::tie(exp);
+  }
+};
+
 template<typename Base_type, typename Exp_type>
 void pow_tensor_scalar_kernel_impl(TensorIteratorBase& iter,
                                                  Exp_type exp) {
@@ -149,21 +196,19 @@ void pow_tensor_scalar_kernel_impl(TensorIteratorBase& iter,
   // .5 (sqrt), -.5 (rsqrt) and -1 (reciprocal) specializations are handled
   // in pow_tensor_scalar_kernel
   if (d_exp == 2) {
-    gpu_kernel(iter, [=]GPU_LAMBDA(Base_type base) -> Base_type {
+    gpu_kernel(iter, []GPU_LAMBDA(Base_type base) -> Base_type {
       return base * base;
     });
   } else if (d_exp == 3) {
-    gpu_kernel(iter, [=]GPU_LAMBDA(Base_type base) -> Base_type {
+    gpu_kernel(iter, []GPU_LAMBDA(Base_type base) -> Base_type {
       return base * base * base;
     });
   } else if (d_exp == -2) {
-    gpu_kernel(iter, [=]GPU_LAMBDA(Base_type base) -> Base_type {
+    gpu_kernel(iter, []GPU_LAMBDA(Base_type base) -> Base_type {
       return 1.0 / (base * base);
     });
   } else {
-    gpu_kernel(iter, [=]GPU_LAMBDA(Base_type base) -> Base_type {
-      return pow_(base, exp);
-    });
+    gpu_kernel(iter, PowTensorScalarFunctor<Base_type, Exp_type>{exp});
   }
 }
 
@@ -186,15 +231,13 @@ void pow_tensor_scalar_kernel(TensorIteratorBase& iter, const Scalar& exp_scalar
     }
     AT_DISPATCH_COMPLEX_TYPES(iter.common_dtype(), "pow_cuda", [&]() {
       if (exp_scalar.equal(2.0)) {
-        gpu_kernel(iter, [=]GPU_LAMBDA(scalar_t base) -> scalar_t {
+        gpu_kernel(iter, []GPU_LAMBDA(scalar_t base) -> scalar_t {
           return base * base;
         });
         return;
       }
       const auto exp = exp_scalar.to<scalar_t>();
-      gpu_kernel(iter, [=]GPU_LAMBDA(scalar_t base) -> scalar_t {
-        return pow_(base, exp);
-      });
+      gpu_kernel(iter, PowTensorScalarFunctor<scalar_t, scalar_t>{exp});
     });
   } else if (isFloatingType(iter.common_dtype()) || exp_scalar.isIntegral(false)) {
     AT_DISPATCH_ALL_TYPES_AND2(kHalf, kBFloat16, iter.common_dtype(), "pow_cuda", [&]() {

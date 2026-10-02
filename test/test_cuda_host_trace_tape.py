@@ -541,7 +541,7 @@ class TestTrace(TestCase):
         self.assertEqual(tape.result_kind, "tuple")
         self.assertEqual([o.identity for o in tape.outputs], [("argument", 0), None])
         self.assertIs(tape.warm_up_result[0], x)
-        self.assertEqual(tape.contract[1], (torch.get_default_dtype(), False, True))
+        self.assertEqual(tape.contract[1], torch._C._host_trace_global_state())
         sources = {s[0].name for s in tape.shape_env.var_to_sources.values()}
         self.assertTrue({"arg0.size(0)", "arg0.base", "arg1", "alloc0.base/256"} <= sources)
         # -0.0 is another constant

@@ -92,6 +92,9 @@ HostTraceVariant::HostTraceVariant(py::handle spec)
       continue;
     }
     TORCH_CHECK_VALUE(r.kind == Kind::Kernel, "a record kind");
+    TORCH_CHECK_NOT_IMPLEMENTED(
+        c10::cuda::DriverAPI::get()->cuGraphExecKernelNodeSetParams_,
+        "host_trace: the driver lacks cuGraphExecKernelNodeSetParams");
     KernelRow& k = r.kernel;
     k.dim_rows = set_launch(k, t[2], t[3], t[4], t[5]);
     for (int64_t row : k.dim_rows) {
@@ -136,6 +139,22 @@ HostTraceVariant::HostTraceVariant(py::handle spec)
     });
     TORCH_CHECK_VALUE(g != segments_.end(), "a launch outside the segments");
     parse_rng(k, *g, t[9], t[10]);
+    for (py::handle x : t[11].cast<py::tuple>()) {
+      auto [param, offset, cls, source] =
+          x.cast<std::tuple<uint32_t, uint32_t, std::string, at::Tensor>>();
+      TORCH_CHECK_VALUE(
+          cls.size() == 1 && source.device().is_cpu() && source.dim() == 0,
+          "a CPU scalar field");
+      const char c = cls[0];
+      const bool reciprocal = c >= '0' && c <= '9';
+      TORCH_CHECK_VALUE(reciprocal || (c >= 'A' && c <= 'Z'), "a CPU scalar class ", cls);
+      const auto type = static_cast<c10::ScalarType>(reciprocal ? c - '0' : c - 'A');
+      TORCH_CHECK_VALUE(
+          param < k.param_sizes.size() &&
+              offset + c10::elementSize(type) <= k.param_sizes[param],
+          "a CPU scalar field outside its parameter");
+      k.cpu_scalars.push_back({param, offset, c, std::move(source)});
+    }
     records_.push_back(std::move(r));
   }
   TORCH_CHECK_VALUE(

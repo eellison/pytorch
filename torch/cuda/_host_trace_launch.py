@@ -60,6 +60,9 @@ class KernelLaunch:
     # the generator the RNG call draws from, a graph input under graphsafe
     # RNG; None for the default generator
     generator: torch.Generator | None = None
+    # functor members eager reads from a 0-dim CPU tensor, (parameter, byte
+    # offset, CPU scalar class, tensor): re-read from the tensor at each call
+    cpu_scalars: tuple[tuple[int, int, str, torch.Tensor], ...] = field(default=(), compare=False)
 
     @property
     def cluster(self) -> tuple[int, int, int]:

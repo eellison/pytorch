@@ -63,8 +63,8 @@ REGISTER_DISPATCH(min_values_stub, &min_values_kernel_cuda)
 namespace at::cuda::host_trace {
 
 // min_values_kernel_cuda_impl
-TensorBase amin(Recorder& rec, const TensorBase& self, IntArrayRef dims, bool keepdim) {
-  TensorBase result;
+TensorBase amin(Recorder& rec, const TensorBase& self, IntArrayRef dims, bool keepdim, const TensorBase& out) {
+  TensorBase result = out;
   auto iter = make_reduction(rec, result, self, dims, keepdim);
   if (iter.numel() == 0) {
     decline("an empty amin");
@@ -76,12 +76,15 @@ TensorBase amin(Recorder& rec, const TensorBase& self, IntArrayRef dims, bool ke
   return result;
 }
 
-// min(): min_all_kernel_impl over self.contiguous()
-TensorBase min_all(Recorder& rec, const TensorBase& self) {
+// min(), min_unary_out: min_all_kernel_impl over self.contiguous()
+TensorBase min_all(Recorder& rec, const TensorBase& self, const TensorBase& out) {
   if (self.sym_numel() == 0) {
     decline("a min of an empty tensor");
   }
-  return amin(rec, contiguous(rec, self), {}, false);
+  if (out.defined() && (out.dim() != 0 || out.scalar_type() != self.scalar_type())) {
+    decline("a min into an out= tensor it resizes or of another dtype");
+  }
+  return amin(rec, contiguous(rec, self), {}, false, out);
 }
 
 // minmax_out_impl, min_kernel_impl

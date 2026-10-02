@@ -1786,29 +1786,45 @@ Tensor index_select_quantized_cuda(const Tensor& self, int64_t dim, const Tensor
 
 namespace {
 
+template <typename scalar_t>
+struct MaskedFillFunctor {
+  scalar_t value_;
+  __device__ scalar_t operator()(scalar_t self, bool mask) const {
+    if (mask) {
+      return value_;
+    }
+    return self;
+  }
+  auto host_trace_fields() const {
+    return std::tie(value_);
+  }
+};
+
 void masked_fill_kernel(TensorIterator& iter, const Scalar& value) {
   AT_DISPATCH_ALL_TYPES_AND_COMPLEX_AND5(
       kBool, kHalf, kBFloat16, kComplexHalf, kBComplex32, iter.common_dtype(), "masked_fill_", [&]() {
         const auto value_ = value.to<scalar_t>();
-        gpu_kernel(
-            iter, [value_] GPU_LAMBDA(scalar_t self, bool mask) -> scalar_t {
-              if (mask) {
-                return value_;
-              }
-              return self;
-            });
+        gpu_kernel(iter, MaskedFillFunctor<scalar_t>{value_});
       });
 }
 
 template <typename scalar_t>
+struct MaskedFillQuantizedFunctor {
+  scalar_t quantized_val;
+  __device__ scalar_t operator()(scalar_t self, bool mask) const {
+    if (mask) {
+      return quantized_val;
+    }
+    return self;
+  }
+  auto host_trace_fields() const {
+    return std::tie(quantized_val);
+  }
+};
+
+template <typename scalar_t>
 void cuda_masked_fill_kernel_quantized(TensorIterator& iter, scalar_t quantized_val) {
-    gpu_kernel(
-        iter, [quantized_val] GPU_LAMBDA(scalar_t self, bool mask) -> scalar_t {
-          if (mask) {
-            return quantized_val;
-          }
-          return self;
-    });
+    gpu_kernel(iter, MaskedFillQuantizedFunctor<scalar_t>{quantized_val});
 }
 
 void masked_fill_kernel_quantized(TensorIterator& iter, const Scalar& value, double scale, int zero_point) {
@@ -1867,6 +1883,63 @@ Tensor & masked_fill__cuda(Tensor& self, const Tensor & mask, const Tensor & val
 }
 
 
+template <typename index_t>
+struct IndexSelectSparseNnegIndexFunctor {
+  int64_t size;
+  __device__ index_t operator()(index_t idx) const {
+    CUDA_KERNEL_ASSERT(idx >= -size && idx < size
+        && "index_select(): index out of bounds");
+    return idx < 0 ? idx + size : idx;
+  }
+  static constexpr bool host_trace_sizes = true;
+};
+
+template <typename index_t>
+struct IndexSelectSparseIntersectionFunctor {
+  index_t* ptr_intrsc_counts_nneg_index;
+  const index_t* ptr_sorted_dim_indices;
+  int64_t nnz;
+  __device__ index_t operator()(index_t idx_val, index_t idx_idx) const {
+    auto* lb = at::cuda::detail::find_bound<const index_t*, index_t, true>(
+      ptr_sorted_dim_indices,
+      ptr_sorted_dim_indices + nnz,
+      idx_val
+    );
+    auto* ub = at::cuda::detail::find_bound<const index_t*, index_t, false>(
+      ptr_sorted_dim_indices,
+      ptr_sorted_dim_indices + nnz,
+      idx_val
+    );
+    const auto idx_count = ub - lb;
+    ptr_intrsc_counts_nneg_index[idx_idx] = idx_count;
+
+    return lb - ptr_sorted_dim_indices;
+  }
+  static constexpr bool host_trace_sizes = true;
+};
+
+template <typename index_t>
+struct IndexSelectSparseSelectFunctor {
+  index_t* ptr_res_dim_indices;
+  index_t* ptr_selected_dim_indices;
+  const index_t* ptr_argsort_dim_indices;
+  __device__ index_t operator()(index_t idx_idx, index_t count, index_t offset, index_t first_match) const {
+    index_t* __restrict__ ptr_res_dim_indices_out = ptr_res_dim_indices + offset;
+    const index_t* __restrict__ ptr_argsort_dim_indices_in = ptr_argsort_dim_indices + first_match;
+    index_t* __restrict__ ptr_selected_dim_indices_out = ptr_selected_dim_indices + offset;
+    for (index_t i = 0; i < count; ++i) {
+      *ptr_res_dim_indices_out++ = idx_idx;
+      *ptr_selected_dim_indices_out++ = *ptr_argsort_dim_indices_in++;
+    }
+
+    // A dummy return scalar for a dummy output
+    return static_cast<index_t>(1);
+  }
+  auto host_trace_fields() const {
+    return std::tie(ptr_res_dim_indices, ptr_selected_dim_indices, ptr_argsort_dim_indices);
+  }
+};
+
 Tensor index_select_sparse_cuda(const Tensor& self, int64_t dim, const Tensor& index) {
   const auto ndim = self.dim();
   TORCH_CHECK_INDEX(ndim, "index_select() cannot be applied to a 0-dim tensor.");
@@ -1914,11 +1987,7 @@ Tensor index_select_sparse_cuda(const Tensor& self, int64_t dim, const Tensor& i
         .build();
 
       AT_DISPATCH_INDEX_TYPES(index.scalar_type(), "index_select_sparse_cuda", [&]() {
-          gpu_kernel(iter, [size] GPU_LAMBDA (index_t idx) -> index_t {
-              CUDA_KERNEL_ASSERT(idx >= -size && idx < size
-                  && "index_select(): index out of bounds");
-              return idx < 0 ? idx + size : idx;
-          });
+          gpu_kernel(iter, IndexSelectSparseNnegIndexFunctor<index_t>{size});
       });
       return nneg_index;
     }();
@@ -1954,25 +2023,7 @@ Tensor index_select_sparse_cuda(const Tensor& self, int64_t dim, const Tensor& i
           const index_t* ptr_sorted_dim_indices = sorted_dim_indices.const_data_ptr<index_t>();
           gpu_kernel(
               iter,
-              [ptr_intrsc_counts_nneg_index, ptr_sorted_dim_indices, nnz] GPU_LAMBDA (
-                index_t idx_val, index_t idx_idx
-              ) -> index_t {
-                auto* lb = at::cuda::detail::find_bound<const index_t*, index_t, true>(
-                  ptr_sorted_dim_indices,
-                  ptr_sorted_dim_indices + nnz,
-                  idx_val
-                );
-                auto* ub = at::cuda::detail::find_bound<const index_t*, index_t, false>(
-                  ptr_sorted_dim_indices,
-                  ptr_sorted_dim_indices + nnz,
-                  idx_val
-                );
-                const auto idx_count = ub - lb;
-                ptr_intrsc_counts_nneg_index[idx_idx] = idx_count;
-
-                return lb - ptr_sorted_dim_indices;
-              }
-          );
+              IndexSelectSparseIntersectionFunctor<index_t>{ptr_intrsc_counts_nneg_index, ptr_sorted_dim_indices, nnz});
       });
 
       return std::make_tuple(
@@ -2013,21 +2064,7 @@ Tensor index_select_sparse_cuda(const Tensor& self, int64_t dim, const Tensor& i
           const index_t* ptr_argsort_dim_indices = argsort_dim_indices.const_data_ptr<index_t>();
           gpu_kernel(
               iter,
-              [ptr_res_dim_indices, ptr_selected_dim_indices, ptr_argsort_dim_indices] GPU_LAMBDA (
-                index_t idx_idx, index_t count, index_t offset, index_t first_match
-              ) -> index_t {
-                index_t* __restrict__ ptr_res_dim_indices_out = ptr_res_dim_indices + offset;
-                const index_t* __restrict__ ptr_argsort_dim_indices_in = ptr_argsort_dim_indices + first_match;
-                index_t* __restrict__ ptr_selected_dim_indices_out = ptr_selected_dim_indices + offset;
-                for (index_t i = 0; i < count; ++i) {
-                  *ptr_res_dim_indices_out++ = idx_idx;
-                  *ptr_selected_dim_indices_out++ = *ptr_argsort_dim_indices_in++;
-                }
-
-                // A dummy return scalar for a dummy output
-                return static_cast<index_t>(1);
-              }
-          );
+              IndexSelectSparseSelectFunctor<index_t>{ptr_res_dim_indices, ptr_selected_dim_indices, ptr_argsort_dim_indices});
       });
 
       return std::make_tuple(

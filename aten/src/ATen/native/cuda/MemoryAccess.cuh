@@ -134,7 +134,7 @@ struct LoadWithCast {
   array_t dtypes;
   size_array_t element_sizes;
 
-  LoadWithCast(const TensorIteratorBase& iter) {
+  C10_ALWAYS_INLINE LoadWithCast(const TensorIteratorBase& iter) {
     CUDA_KERNEL_ASSERT(iter.ninputs() == N);
     #pragma unroll
     for (auto i = 0; i < N; ++i) {
@@ -165,7 +165,7 @@ struct StoreWithCast {
   array_t dtypes;
   size_array_t element_sizes;
 
-  StoreWithCast(const TensorIteratorBase& iter) {
+  C10_ALWAYS_INLINE StoreWithCast(const TensorIteratorBase& iter) {
     CUDA_KERNEL_ASSERT(iter.noutputs() == N);
     #pragma unroll
     for (auto i = 0; i < N; ++i) {

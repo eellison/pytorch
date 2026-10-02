@@ -40,7 +40,7 @@ its data_ptr(), storage offset included.
 from __future__ import annotations
 
 import contextlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Protocol, TYPE_CHECKING
 
 import torch
@@ -78,13 +78,23 @@ _STATE = (
     (torch._C._get_cublas_allow_fp16_accumulation, torch._C._set_cublas_allow_fp16_accumulation),
     (torch._C._get_sm_carveout_experimental, torch._C._set_sm_carveout_experimental),
     (torch._C._get_blas_preferred_backend, torch._C._set_blas_preferred_backend),
+    (lambda: torch._C._get_fp32_precision_getter("cuda", "conv"), lambda v: torch._C._set_fp32_precision_setter("cuda", "conv", v)),
+    (torch._C._get_cudnn_enabled, torch._C._set_cudnn_enabled),
+    (torch._C._get_cudnn_benchmark, torch._C._set_cudnn_benchmark),
+    (torch._C._get_cudnn_deterministic, torch._C._set_cudnn_deterministic),
+    (
+        lambda: (torch._C._get_deterministic_algorithms(), torch._C._get_deterministic_algorithms_warn_only()),
+        lambda v: torch._C._set_deterministic_algorithms(v[0], warn_only=v[1]),
+    ),
 )
 
 
 def library_state() -> tuple:
-    """The global state cuBLAS calls read: the fp32 math mode (allow_tf32
-    and float32_matmul_precision set it), the fp16 and bf16 reduced-precision
-    reductions, fp16 accumulation, the SM carveout and the preferred library."""
+    """The global state cuBLAS and cuDNN calls read: the fp32 math mode
+    (allow_tf32 and float32_matmul_precision set it), the fp16 and bf16
+    reduced-precision reductions, fp16 accumulation, the SM carveout, the
+    preferred library; and cuDNN's conv fp32 precision, enabled, benchmark
+    and deterministic flags, and deterministic algorithms."""
     return tuple(get() for get, _ in _STATE)
 
 
@@ -147,6 +157,9 @@ class OpaqueBinding:
     nodes: tuple[OpaqueKernel | OpaqueMemset, ...]  # one chain, in stream order
     scratch: tuple[int, ...]  # bytes per scratch buffer
     rng_increment: int = 0  # philox offsets the call consumes
+    # what keeps the library's kernels loaded (a cuDNN plan), held by the
+    # binding and each launch recorded from it
+    owner: Any = field(default=None, compare=False, repr=False)
 
     @property
     def topology(self) -> tuple:
@@ -347,7 +360,7 @@ def record_binding(
                 n.smem,
                 slots,
                 roots,
-                provider,
+                provider if binding.owner is None else (provider, binding.owner),
                 tuple((s.param, s.offset, 8) for s in placed),
                 attributes=tuple((k, v) for k, v in n.attributes if k != pdl),
                 pointers=frozenset(range(len(slots))),

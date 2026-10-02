@@ -49,6 +49,7 @@ from torch.cuda._host_trace_lower_tape import (
     PredictedOutput,
     ScalarSlot,
 )
+from torch.cuda._host_trace_tape import HOST_SEED_OFFSET
 
 
 if TYPE_CHECKING:
@@ -179,7 +180,7 @@ def flatten_variant(
 
 def launch_row(lo: LoweredLaunch | LoweredMemset | LoweredMemcpy) -> tuple:
     """A launch as rows: (0, function, block, smem, grid, images, fields,
-    descriptors, philox fields, philox increment) for a kernel, (1, dst,
+    descriptors, philox fields, philox increment, CPU scalars) for a kernel, (1, dst,
     value, element size, width, height, pitch) for a memset, (2, dst, src,
     bytes) for a memcpy."""
     if isinstance(lo, LoweredMemset):
@@ -200,7 +201,7 @@ def launch_row(lo: LoweredLaunch | LoweredMemset | LoweredMemcpy) -> tuple:
     images = t.images or tuple(bytes(size) for _, size in t.layout)
     descriptors = tuple((d.param, d.first, d.dtype, d.box, d.swizzle) for d in t.descriptors)
     philox = tuple((param, at, _PHILOX.index(kind), delta) for param, at, kind, delta in t.rng)
-    return (0, t.function, lo.block, lo.smem, lo.grid, images, tuple(fields), descriptors, philox, t.rng_increment)
+    return (0, t.function, lo.block, lo.smem, lo.grid, images, tuple(fields), descriptors, philox, t.rng_increment, t.cpu_scalars)
 
 
 def _source(slot: Any) -> tuple[int, int, int]:
@@ -260,6 +261,9 @@ def _boxed(step: LoweredEagerCall) -> tuple | None:
     # a graphsafe RNG step swaps in its generator's state around the call, which the boxed call cannot
     if not isinstance(target, torch._ops.OpOverload) or step.call.generator is not None:
         return None
+    # its outputs go to the device in Python (seed_offset_on_device)
+    if target in HOST_SEED_OFFSET:
+        return None
     markers = [
         _Leaf(i) if isinstance(v, (LoweredView, ScalarSlot)) else v
         for i, v in enumerate(step.leaves)
@@ -304,8 +308,8 @@ def _boxed(step: LoweredEagerCall) -> tuple | None:
 
 def native_variant(spec: VariantSpec) -> torch._C._HostTraceVariant:
     """The variant's native object. A malformed spec is the lowering's bug,
-    raised as one rather than declined; a driver without the TMA descriptor
-    entries declines."""
+    raised as one rather than declined; a driver without the optional entries
+    it needs (TMA descriptors, kernel node updates) declines."""
     try:
         return torch._C._HostTraceVariant(spec)
     except NotImplementedError as e:

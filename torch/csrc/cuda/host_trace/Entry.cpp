@@ -2,6 +2,9 @@
 
 #if !defined(USE_ROCM)
 #include <ATen/Context.h>
+#include <ATen/autocast_mode.h>
+#include <ATen/core/grad_mode.h>
+#include <c10/core/InferenceMode.h>
 #include <c10/core/DefaultDtype.h>
 #include <c10/cuda/CUDAFunctions.h>
 #include <c10/cuda/CUDAGraphsC10Utils.h>
@@ -153,6 +156,7 @@ struct EntryState {
   std::recursive_mutex mutex;
   bool configured = false;
   bool trusted = false;
+  bool global_state = false; // check_global_state: in the contract key
   py::object active; // the tape's threading.local
   py::object disagreement;
   std::vector<EntryFamily> families;
@@ -170,11 +174,58 @@ PyObject* interned(const char* s) {
   return p;
 }
 
-// argument_contract(args) + global_state() as ints, or false when an
-// argument has no such form
+// The global state an eager call's kernels or its outputs depend on, which a
+// replay does not read: a call under other state misses
+void append_global_state(std::vector<int64_t>& key) {
+  using at::Float32Backend;
+  using at::Float32Op;
+  auto& ctx = at::globalContext();
+  key.insert(
+      key.end(),
+      {static_cast<int64_t>(c10::get_default_dtype_as_scalartype()),
+       ctx.deterministicAlgorithms(),
+       ctx.deterministicAlgorithmsWarnOnly(),
+       ctx.deterministicFillUninitializedMemory(),
+       at::GradMode::is_enabled(),
+       c10::InferenceMode::is_enabled(),
+       at::autocast::is_autocast_enabled(at::kCUDA),
+       static_cast<int64_t>(at::autocast::get_autocast_dtype(at::kCUDA)),
+       at::autocast::is_autocast_enabled(at::kCPU),
+       static_cast<int64_t>(at::autocast::get_autocast_dtype(at::kCPU)),
+       static_cast<int64_t>(
+           ctx.float32Precision(Float32Backend::CUDA, Float32Op::MATMUL)),
+       static_cast<int64_t>(ctx.allowFP16ReductionCuBLAS()),
+       static_cast<int64_t>(ctx.allowBF16ReductionCuBLAS()),
+       ctx.allowFP16AccumulationCuBLAS(),
+       static_cast<int64_t>(ctx.blasPreferredBackend()),
+       ctx._SMCarveout_EXPERIMENTAL().value_or(-1),
+       ctx.userEnabledCuDNN(),
+       static_cast<int64_t>(
+           ctx.float32Precision(Float32Backend::CUDA, Float32Op::CONV)),
+       static_cast<int64_t>(
+           ctx.float32Precision(Float32Backend::CUDA, Float32Op::RNN)),
+       ctx.deterministicCuDNN(),
+       ctx.benchmarkCuDNN(),
+       ctx.benchmarkLimitCuDNN(),
+       ctx.userEnabledFlashSDP(),
+       ctx.userEnabledFA3SDP(),
+       ctx.userEnabledFA4SDP(),
+       ctx.userEnabledMemEfficientSDP(),
+       ctx.userEnabledMathSDP(),
+       ctx.userEnabledCuDNNSDP(),
+       ctx.userEnabledOverrideableSDP(),
+       ctx.allowFP16BF16ReductionMathSDP()});
+  for (at::SDPBackend b : ctx.sDPPriorityOrder()) {
+    key.push_back(static_cast<int64_t>(b));
+  }
+}
+
+// argument_contract(args, global_state) as ints, or false when an argument
+// has no such form
 bool contract_key(
     PyObject* const* args,
     size_t count,
+    bool global_state,
     std::vector<int64_t>& key) {
   enum Tag : int64_t { Tensor = 1, Int, None, Bool, Float };
   key.clear();
@@ -192,7 +243,9 @@ bool contract_key(
            t.dim(),
            static_cast<int64_t>(t.layout()),
            t.is_neg(),
-           t.is_conj()});
+           t.is_conj(),
+           t.requires_grad(),
+           t.requires_grad() && at::GradMode::is_enabled()});
     } else if (PyLong_CheckExact(a)) {
       key.push_back(Int);
     } else if (a == Py_None) {
@@ -208,12 +261,9 @@ bool contract_key(
       return false;
     }
   }
-  const auto& ctx = at::globalContext();
-  key.insert(
-      key.end(),
-      {static_cast<int64_t>(c10::get_default_dtype_as_scalartype()),
-       ctx.deterministicAlgorithms(),
-       ctx.deterministicFillUninitializedMemory()});
+  if (global_state) {
+    append_global_state(key);
+  }
   return true;
 }
 
@@ -341,7 +391,7 @@ PyObject* entry_dispatch(
     family = &st.families.front();
   } else {
     thread_local std::vector<int64_t> key;
-    if (contract_key(inputs, count, key)) {
+    if (contract_key(inputs, count, st.global_state, key)) {
       for (const EntryFamily& f : st.families) {
         if (f.key == key) {
           family = &f;
@@ -422,8 +472,9 @@ PyObject* entry_call_boxed(PyObject* self, PyObject* inputs) {
 PyObject* entry_native_init(PyObject* self, PyObject* args) {
   HANDLE_TH_ERRORS
   PyObject *active = nullptr, *disagreement = nullptr;
-  int trusted = 0;
-  if (!PyArg_ParseTuple(args, "OOp", &active, &disagreement, &trusted)) {
+  int trusted = 0, global_state = 0;
+  if (!PyArg_ParseTuple(
+          args, "OOpp", &active, &disagreement, &trusted, &global_state)) {
     return nullptr;
   }
   TORCH_CHECK_TYPE(
@@ -437,6 +488,7 @@ PyObject* entry_native_init(PyObject* self, PyObject* args) {
   st.active = py::reinterpret_borrow<py::object>(active);
   st.disagreement = py::reinterpret_borrow<py::object>(disagreement);
   st.trusted = trusted;
+  st.global_state = global_state;
   st.configured = true;
   Py_RETURN_NONE;
   END_HANDLE_TH_ERRORS
@@ -448,7 +500,11 @@ PyObject* entry_native_key(PyObject* self, PyObject* args) {
   EntryState& st = *reinterpret_cast<HostTraceEntry*>(self)->state;
   std::vector<int64_t> key;
   if (!st.trusted &&
-      !contract_key(&PyTuple_GET_ITEM(args, 0), PyTuple_GET_SIZE(args), key)) {
+      !contract_key(
+          &PyTuple_GET_ITEM(args, 0),
+          PyTuple_GET_SIZE(args),
+          st.global_state,
+          key)) {
     Py_RETURN_NONE;
   }
   return py::cast(key).release().ptr();
@@ -570,6 +626,11 @@ void initHostTraceVariantBindings(PyObject* module) {
   initHarvestBindings(m);
 #endif
   initHostTraceAtenBindings(m);
+  m.def("_host_trace_global_state", [] {
+    std::vector<int64_t> state;
+    append_global_state(state);
+    return py::tuple(py::cast(state));
+  });
   // test-only
   m.def("_host_trace_held_images", [](const HostTraceVariant& v) {
     return v.held_images();
@@ -581,6 +642,7 @@ void initHostTraceVariantBindings(PyObject* module) {
     return py::make_tuple(tma_encodes, tma_replaces);
   });
   m.def("_host_trace_buffered_runs", [] { return buffered_runs; });
+  m.def("_host_trace_memory_node_sets", [] { return memory_node_sets; });
   PyTypeObject& t = HostTraceEntryType;
   t.tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE | Py_TPFLAGS_HAVE_GC;
   t.tp_doc = "HostTraceReplay's base: a replay hit's call in C++";

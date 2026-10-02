@@ -1,6 +1,7 @@
 # Owner(s): ["module: cuda graphs"]
 
 import contextlib
+import functools
 import gc
 import unittest
 from unittest import mock
@@ -8,6 +9,7 @@ from unittest import mock
 import torch
 import torch.nn.functional as F
 import torch.utils._pytree as pytree
+from torch.cuda import _host_trace_replay, _host_trace_tape
 from torch.cuda._host_trace_capture import (
     capture_kernel_nodes,
     KernelNode,
@@ -16,7 +18,6 @@ from torch.cuda._host_trace_capture import (
 )
 from torch.cuda._host_trace_harvest import HarvestProvider
 from torch.cuda._host_trace_launch import KernelLaunch
-from torch.cuda._host_trace_replay import HostTraceReplay
 from torch.cuda._host_trace_tape import _hint, EagerCall, Memcpy, Memset, trace, TrustedInputs
 from torch.nn.attention import sdpa_kernel, SDPBackend
 from torch.testing._internal.common_cuda import PLATFORM_SUPPORTS_FLASH_ATTENTION
@@ -30,6 +31,15 @@ from torch.testing._internal.common_utils import (
 )
 
 
+class HostTraceReplay(_host_trace_replay.HostTraceReplay):
+    # traces at its first call: these are tests of the trace; an entry's first
+    # call runs eagerly (test_the_first_call_runs_eagerly in
+    # test_cuda_host_trace_replay)
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._called = True
+
+
 @contextlib.contextmanager
 def _zero_init():
     # the harvest flag, as a harvest's captures set it
@@ -38,6 +48,110 @@ def _zero_init():
         yield
     finally:
         torch._C._cuda_hostTraceSetHarvesting(previous)
+
+
+# test ops whose functors hold an address or an operand's size
+_FUNCTOR_OPS = r"""
+#include <ATen/native/TensorIterator.h>
+#include <ATen/native/cuda/Loops.cuh>
+#include <torch/library.h>
+
+// fills the stack below the caller with a CUDA address; a Python function, not
+// an op, so that the dispatcher's frames don't move the buffer below the
+// next op's launch site
+__attribute__((noinline)) void smear(int64_t address, int64_t nbytes) {
+  uint64_t buf[1 << 15];
+  for (int64_t i = 0; i < std::min<int64_t>(nbytes / 8, 1 << 15); i++) {
+    buf[i] = static_cast<uint64_t>(address);
+  }
+  asm volatile("" : : "r"(buf) : "memory");
+}
+
+namespace {
+
+template <typename F>
+at::Tensor map(const at::Tensor& x, const F& f) {
+  auto out = at::empty_like(x);
+  auto iter = at::TensorIteratorConfig().add_output(out).add_const_input(x).build();
+  at::native::gpu_kernel(iter, f);
+  return out;
+}
+
+// x + *q
+struct AddAt {
+  const float* q;
+  __device__ float operator()(float a) const {
+    return a + *q;
+  }
+  auto host_trace_fields() const {
+    return std::tie(q);
+  }
+};
+
+// x + p[0]
+at::Tensor add_first(const at::Tensor& x, const at::Tensor& p) {
+  return map(x, AddAt{p.const_data_ptr<float>()});
+}
+
+// x + p.numel(), a member eager computes from an operand's size
+struct AddSize {
+  float n;
+  __device__ float operator()(float a) const {
+    return a + n;
+  }
+  static constexpr bool host_trace_sizes = true;
+};
+
+at::Tensor add_numel(const at::Tensor& x, const at::Tensor& p) {
+  return map(x, AddSize{static_cast<float>(p.numel())});
+}
+
+// x + the float at address
+at::Tensor add_at(const at::Tensor& x, int64_t address) {
+  return map(x, AddAt{reinterpret_cast<const float*>(address)});
+}
+
+at::Tensor like(const at::Tensor& x, const at::Tensor&) {
+  return at::empty_like(x);
+}
+
+} // namespace
+
+TORCH_LIBRARY(ht_functor, m) {
+  m.def("add_first(Tensor x, Tensor p) -> Tensor");
+  m.def("add_numel(Tensor x, Tensor p) -> Tensor");
+  m.def("add_at(Tensor x, int address) -> Tensor");
+}
+
+TORCH_LIBRARY_IMPL(ht_functor, CUDA, m) {
+  m.impl("add_first", add_first);
+  m.impl("add_numel", add_numel);
+  m.impl("add_at", add_at);
+}
+
+TORCH_LIBRARY_IMPL(ht_functor, Meta, m) {
+  m.impl("add_first", like);
+  m.impl("add_numel", like);
+  m.impl("add_at", [](const at::Tensor& x, int64_t) { return at::empty_like(x); });
+}
+"""
+
+
+@functools.cache
+def _functor_ops():
+    # the extension (its smear) and its ops
+    from torch.utils.cpp_extension import load_inline
+
+    ext = load_inline("ht_functor_bytes", cpp_sources="void smear(int64_t address, int64_t nbytes);", cuda_sources=_FUNCTOR_OPS, functions=["smear"], extra_cuda_cflags=["--extended-lambda"])
+    return ext, torch.ops.ht_functor
+
+
+@contextlib.contextmanager
+def _traced_as_pointwise(namespace):
+    # a test op as an ATen pointwise op: the pointwise host's
+    pointwise = _host_trace_tape._pointwise
+    with mock.patch.object(_host_trace_tape, "_pointwise", lambda func: func.namespace == namespace or pointwise(func)):
+        yield
 
 
 def silu_mul(x, y):
@@ -136,7 +250,6 @@ DECLINES = {
     "integer_sum": (lambda x: x.sum(-1), lambda x, y: (x.long(),), [EagerCall]),
     "sum_with_dtype": (lambda x: x.sum(-1, dtype=torch.float32), lambda x, y: (x,), [EagerCall]),
     "double_mean": (lambda x: x.mean(-1), lambda x, y: (x.double(),), [EagerCall]),
-    "empty_sum": (lambda x: x[:0].sum(-1), lambda x, y: (x,), [EagerCall]),
     "shared_root_copy": (_shared_root_copy, lambda x, y: (x,), [KernelLaunch, EagerCall]),
     "softmax_inner": (lambda x: torch.softmax(x, 0), lambda x, y: (x,), [EagerCall]),
     "softmax_strided": (lambda x: torch.softmax(x.t(), -1), lambda x, y: (x,), [EagerCall]),
@@ -150,6 +263,11 @@ DECLINES = {
 def _randn(*shape, dtype=torch.float16):
     return torch.randn(shape, device="cuda", dtype=dtype)
 
+
+_jit_unary = torch.cuda.jiterator._create_jit_fn("template <typename T> T unary(T x) { return x * x + x; }")
+_jit_binary = torch.cuda.jiterator._create_jit_fn("template <typename T> T binary(T x, T y, T alpha) { return alpha * x + y; }", alpha=1.0)
+_jit_four = torch.cuda.jiterator._create_jit_fn("template <typename T> T four(T a, T b, T c, T d, T alpha, T beta) { return alpha * a + beta * b * c - d; }", alpha=0.5, beta=2)
+_jit_two = torch.cuda.jiterator._create_multi_output_jit_fn("template <typename T> void two(T x, T y, T& out0, T& out1) { out0 = x + y; out1 = x - y; }", num_outputs=2)
 
 # name: (fn, args from (m, h, dtype)): ops of the generic pointwise host
 POINTWISE = {
@@ -199,6 +317,17 @@ POINTWISE = {
     "jiterator": (torch.special.i1e, lambda m, h, d: (_randn(m, h, dtype=d),)),
     "jiterator_strided": (lambda x: torch.special.i1e(x[:, ::2]), lambda m, h, d: (_randn(m, h, dtype=d),)),
     "jiterator_cast": (torch.special.xlog1py, lambda m, h, d: (_randn(m, h, dtype=d), _randn(h, dtype=_other(d)).abs())),
+    "jiterator_scalar": (lambda x: torch.special.xlog1py(x, 2.0), lambda m, h, d: (_randn(m, h, dtype=d),)),
+    "jiterator_extra_arg": (lambda x: torch.polygamma(2, x), lambda m, h, d: (_randn(m, h, dtype=d).abs() + 0.5,)),
+    # a user jiterator's (torch.cuda.jiterator) dynamic kernels
+    "jiterator_user": (_jit_unary, lambda m, h, d: (_randn(m, h, dtype=d),)),
+    "jiterator_user_broadcast": (lambda x, y: _jit_binary(x, y, alpha=-1.5), lambda m, h, d: (_randn(m, h, dtype=d), _randn(h, dtype=d))),
+    "jiterator_user_four": (_jit_four, lambda m, h, d: (_randn(m, h, dtype=d), _randn(h, dtype=d), _randn(m, h, dtype=d), _randn(m, 1, dtype=d))),
+    "jiterator_user_two_outputs": (_jit_two, lambda m, h, d: (_randn(m, h, dtype=d), _randn(m, h, dtype=d))),
+    "jiterator_user_strided": (lambda x: _jit_unary(x[:, ::2]), lambda m, h, d: (_randn(m, h, dtype=d),)),
+    "jiterator_user_cast": (_jit_binary, lambda m, h, d: (_randn(m, h, dtype=d), _randn(h, dtype=_other(d)))),
+    "jiterator_user_cast_contiguous": (_jit_binary, lambda m, h, d: (_randn(m, h, dtype=d), _randn(m, h, dtype=_other(d)))),
+    "jiterator_user_misaligned": (lambda x: _jit_unary(x.view(-1)[1:]), lambda m, h, d: (_randn(m, h, dtype=d),)),
     # self twice in the iterator
     "threshold": (lambda x: F.threshold(x, 0.1, 20.0), lambda m, h, d: (_randn(m, h, dtype=d),)),
     "threshold_backward": (lambda g, x: torch.ops.aten.threshold_backward(g, x, 0.0), lambda m, h, d: (_randn(m, h, dtype=d), _randn(m, h, dtype=d))),
@@ -297,6 +426,14 @@ HOSTS = {
     "zeros_like": (lambda x: torch.zeros_like(x[:, :64]), lambda m, h, d: (_randn(m, h, dtype=d),)),
     "repeat_symbolic": (lambda mask: mask.unsqueeze(1).repeat(1, mask.shape[1] + 1, 1), lambda m, h, d: (torch.rand(2, m, device="cuda") > 0.5,)),
     "repeat_leading": (lambda x: x.repeat(2, 1, 3), lambda m, h, d: (_randn(m, 64, dtype=d),)),
+    "channel_shuffle": (lambda x: torch.channel_shuffle(x, 4), lambda m, h, d: (_randn(m, 16, h // 256, 4, dtype=d),)),
+    "channel_shuffle_empty": (lambda x: torch.channel_shuffle(x[:, :, :0], 4), lambda m, h, d: (_randn(m, 16, h // 256, 4, dtype=d),)),
+    "eye": (lambda x: torch.eye(x.shape[0], device=x.device, dtype=x.dtype), lambda m, h, d: (_randn(m, h, dtype=d),)),
+    "eye_m": (lambda x: torch.eye(x.shape[0], 5, device=x.device, dtype=x.dtype), lambda m, h, d: (_randn(m, h, dtype=d),)),
+    "eye_out": (lambda x, out: torch.eye(x.shape[0], out=out), lambda m, h, d: (_randn(m, h, dtype=d), torch.empty(m, m, device="cuda", dtype=d))),
+    "eye_empty": (lambda x: torch.eye(0, x.shape[0], device=x.device, dtype=x.dtype), lambda m, h, d: (_randn(m, h, dtype=d),)),
+    "soft_margin_loss_backward_sum": (lambda g, x, t: torch.ops.aten.soft_margin_loss_backward(g, x, t, 2), lambda m, h, d: (_randn(dtype=d), _randn(m, h, dtype=d), _randn(m, h, dtype=d).sign())),
+    "soft_margin_loss_backward_none": (lambda g, x, t: torch.ops.aten.soft_margin_loss_backward(g, x, t, 0), lambda m, h, d: (_randn(m, h, dtype=d), _randn(m, h, dtype=d), _randn(m, h, dtype=d).sign())),
     "nll_loss_mean": (lambda x, t: F.nll_loss(x, t), lambda m, h, d: (_randn(m, h // 8, dtype=d), _class_targets(m, h // 8))),
     "nll_loss_sum_ignored": (lambda x, t: F.nll_loss(x, t, reduction="sum"), lambda m, h, d: (_randn(m, h // 8, dtype=d), _class_targets(m, h // 8, True))),
     "nll_loss_weight": (lambda x, t, w: F.nll_loss(x, t, w), lambda m, h, d: (_randn(m, h // 8, dtype=d), _class_targets(m, h // 8, True), torch.rand(h // 8, device="cuda", dtype=d))),
@@ -370,15 +507,16 @@ def _unread(node: KernelNode, launch: KernelLaunch, functor_bytes: int) -> set[t
     # functor's tail (an empty functor's byte), an empty offset calculator's,
     # loader's and storer's byte, a cast loader's and storer's padding, and a
     # strided op's padding and OffsetCalculator entries past dims
-    if not node.name.startswith("_Z"):
-        return set()
-    if "vectorized" in node.name or "unrolled" in node.name:
-        tail = {(1, b) for b in range(functor_bytes, len(node.images[1]))}
+    # a jitted kernel's (N, data, ic, oc, loader, storer, scalar, extra arguments) have no functor
+    jitted = not node.name.startswith("_Z")
+    if jitted or "vectorized" in node.name or "unrolled" in node.name:
+        tail = set() if jitted else {(1, b) for b in range(functor_bytes, len(node.images[1]))}
         if "vectorized" in node.name:
             return tail
         empty = {(p, 0) for p in range(3, len(node.images)) if len(node.images[p]) == 1}
         # LoadWithCast<n> / StoreWithCast<n>: n dtypes padded to 4, n sizes
-        casts = {p: n for p in range(5, len(node.images)) for n in range(1, 9) if len(node.images[p]) == -(-n // 4) * 4 + 4 * n}
+        loaders = (4, 5) if jitted else range(5, len(node.images))
+        casts = {p: n for p in loaders for n in range(1, 9) if len(node.images[p]) == -(-n // 4) * 4 + 4 * n}
         return tail | empty | {(p, b) for p, n in casts.items() for b in range(n, -(-n // 4) * 4)}
     n = len(launch.pointers)
     cast = "StridedCastOp" in node.name
@@ -633,7 +771,7 @@ class TestHostTraceAten(TestCase):
             else:
                 self._assert_launch_matches(launch, node, set(unread))
 
-    def _assert_replays_eager_calls(self, entry, fn, args):
+    def _assert_replays_eager_calls(self, entry, fn, args, peak_at_most=False):
         gc.collect()
         torch.cuda.synchronize()
         base = torch.cuda.memory_allocated()
@@ -652,7 +790,11 @@ class TestHostTraceAten(TestCase):
         fn(*args)
         torch.cuda.synchronize()
         if not traced:
-            self.assertEqual(replay_peak, torch.cuda.max_memory_allocated() - base)
+            eager_peak = torch.cuda.max_memory_allocated() - base
+            if peak_at_most:
+                self.assertLessEqual(replay_peak, eager_peak)
+            else:
+                self.assertEqual(replay_peak, eager_peak)
 
     def _assert_records_match_eager(self, fn, args, unread):
         launches = [c for _, c in trace(fn, tuple(args)).launches]
@@ -682,6 +824,197 @@ class TestHostTraceAten(TestCase):
         # hold nvcc's host-side pointer, which differs per call
         fn, args_fn = POINTWISE[case]
         self._assert_records_match_eager(fn, args_fn(m, 4096, dtype), lambda node, launch: _unread(node, launch, 0))
+
+    @parametrize("case", ["mul_python_float", "tanh_backward_broadcast", "mixed_dtypes", "mul_strided_cast", "pow_2_5", "where_python_scalar", "jiterator", "jiterator_cast", "jiterator_scalar", "jiterator_extra_arg", "jiterator_user", "jiterator_user_four", "jiterator_user_two_outputs", "jiterator_user_strided", "jiterator_user_cast", "jiterator_user_misaligned"])
+    def test_pointwise_launch_reports_match_the_captured_nodes(self, case):
+        # each launch site's report (LaunchLayout.h): its kernel, configuration
+        # and, at each byte of a class, the captured node's byte
+        fn, args_fn = POINTWISE[case]
+        args = args_fn(64, 768, torch.float32)
+        torch._C._cuda_hostTraceRecordLaunches(True)
+        try:
+            with _zero_init():
+                nodes = capture_kernel_nodes(lambda s: fn(*args))
+        finally:
+            launched = torch._C._cuda_hostTraceRecordLaunches(False)
+        self.assertEqual(len(launched), len(nodes))
+        for (function, grid, block, classes, data), node in zip(launched, nodes):
+            self.assertEqual((function, grid, block), (node.function, node.grid, node.block))
+            self.assertEqual([len(c) for c in classes], [len(b) for b in node.images])
+            for cs, d, image in zip(classes, data, node.images):
+                self.assertEqual(bytes(x for c, x in zip(cs, d) if c != "."), bytes(x for c, x in zip(cs, image) if c != "."))
+
+    def test_jiterator_of_a_tensor_extra_argument_runs_eagerly(self):
+        # a tensor extra argument is its value, read on the host
+        def fn(x, y):
+            return _jit_binary(x, x, alpha=y)
+
+        x, y = _randn(8, 16, dtype=torch.float32), torch.tensor(2.0, device="cuda")
+        entry = HostTraceReplay(fn)
+        self.assertEqual(entry(x, y), fn(x, y), atol=0, rtol=0)
+        self.assertEqual(entry.eager, 1)
+        self.assertIs(torch._C._cuda_jiterator_compile_and_launch_kernel, _host_trace_tape._jiterator_launch)
+
+    @parametrize("case", ["mul", "rmul", "add_alpha", "rsub", "maximum", "lt", "eq", "div", "half", "double", "long", "complex", "jitted"])
+    def test_cpu_scalar_operand_replays_its_value(self, case):
+        # a CPU buffer the host makes (torch.rand's), a CPU scalar operand:
+        # each replay reads its value as eager's TensorIterator does
+        ops = {
+            "mul": lambda x, s: x * s,
+            "rmul": lambda x, s: s * x,
+            "add_alpha": lambda x, s: torch.add(x, s, alpha=2),
+            "rsub": lambda x, s: s - x,
+            "maximum": lambda x, s: torch.maximum(x, s),
+            "lt": lambda x, s: torch.lt(s, x),
+            "eq": lambda x, s: x.round() == (s * 4).round(),
+            "div": lambda x, s: x / (s + 0.25),
+            "half": lambda x, s: x.half() * s,
+            "double": lambda x, s: x * s.double(),
+            "long": lambda x, s: x.long() + (s * 100).long(),
+            "complex": lambda x, s: x.to(torch.complex64) - s,
+            "jitted": lambda x, s: torch.special.hermite_polynomial_h(x, (s * 4).floor()),
+        }
+
+        def fn(x):
+            return ops[case](x, torch.rand(()))
+
+        entry = HostTraceReplay(fn)
+        for seed in range(4):
+            x = _randn(64, 33, dtype=torch.float32)
+            torch.manual_seed(seed)
+            want = fn(x)
+            torch.manual_seed(seed)
+            self.assertEqual(entry(x), want, atol=0, rtol=0)
+        steps = [[c.reason for _, c in v.captured.lowered.tape.launches if type(c) is EagerCall and not c.host] for v in entry.variants]
+        self.assertEqual((entry.traces, entry.eager, steps), (1, 0, [[]]))
+
+    @parametrize("case", ["div_floor", "div_trunc", "pow", "complex_div"])
+    def test_cpu_scalar_operand_of_a_value_read_runs_eagerly(self, case):
+        # eager reads these CPU scalars into other functor members (a
+        # reciprocal of a trunc, item()) or routes on them: an eager step, and
+        # abs a kernel for the trace to capture
+        ops = {
+            "div_floor": lambda x, s: torch.div(x.abs(), s + 0.5, rounding_mode="floor"),
+            "div_trunc": lambda x, s: torch.div(x.abs(), s + 1, rounding_mode="trunc"),
+            "pow": lambda x, s: x.abs() ** s,
+            "complex_div": lambda x, s: x.to(torch.complex64) / (s + 1),
+        }
+
+        def fn(x):
+            return ops[case](x, torch.rand(()))
+
+        entry = HostTraceReplay(fn)
+        for seed in range(3):
+            x = _randn(64, 33, dtype=torch.float32)
+            torch.manual_seed(seed)
+            want = fn(x)
+            torch.manual_seed(seed)
+            self.assertEqual(entry(x), want, atol=0, rtol=0)
+        steps = [[c.reason for _, c in v.captured.lowered.tape.launches if type(c) is EagerCall and not c.host] for v in entry.variants]
+        self.assertEqual((entry.traces, entry.eager, len(steps), len(steps[0])), (1, 0, 1, 1))
+        self.assertIn("pointwise host declines", steps[0][0])
+
+    def test_host_step_writing_a_buffer_a_device_step_read_declines(self):
+        # a replay runs the host steps first: s.add_ after x * s would change
+        # what the device step reads
+        def fn(x):
+            s = torch.rand(())
+            y = x * s
+            s.add_(1)
+            return y * s
+
+        entry = HostTraceReplay(fn)
+        x = _randn(64, 33, dtype=torch.float32)
+        torch.manual_seed(0)
+        want = fn(x)
+        torch.manual_seed(0)
+        self.assertEqual(entry(x), want, atol=0, rtol=0)
+        self.assertEqual(len(entry.declines), 1)
+        self.assertIn("writes a CPU buffer a device step read earlier", entry.declines[0])
+
+    def test_cpu_scalar_launch_report_marks_the_scalar(self):
+        # the functor member eager reads from a CPU scalar is of its class:
+        # 'A' + its dtype, or '0' + its dtype for div's reciprocal
+        x, s = _randn(64, 33, dtype=torch.float32), torch.tensor(0.75)
+        cases = ((lambda: x * s, "G", torch.tensor(0.75)), (lambda: x / s, "6", torch.tensor(1 / 0.75)), (lambda: x.double() - s, "H", torch.tensor(0.75, dtype=torch.float64)))
+        for fn, cls, value in cases:
+            torch._C._cuda_hostTraceRecordLaunches(True)
+            try:
+                with _zero_init():
+                    capture_kernel_nodes(lambda _: fn())
+            finally:
+                launched = torch._C._cuda_hostTraceRecordLaunches(False)
+            want = torch._C._cuda_hostTraceCpuScalarBytes(s, cls)
+            self.assertEqual(want, value.numpy().tobytes())
+            (classes, data) = launched[-1][3:]
+            (p,) = [p for p, cs in enumerate(classes) if cls in cs]
+            at = classes[p].index(cls)
+            self.assertEqual((classes[p][at : at + len(want)], data[p][at : at + len(want)]), (cls * len(want), want))
+            self.assertEqual(classes[p].count(cls), len(want))
+
+    def test_pointwise_witness_on_a_smeared_stack(self):
+        # a parameter's padding (StridedCastOp's tail) holds the stack's bytes,
+        # here a live CUDA address: the host neither compares nor scans them
+        ext, _ = _functor_ops()
+        keep = torch.empty(1 << 20, dtype=torch.uint8, device="cuda")
+
+        def smeared(fn, *args, **kwargs):
+            def run(s):
+                ext.smear(keep.data_ptr() + 4096, 1 << 18)
+                return fn(s)
+
+            return capture_kernel_nodes(run, *args, **kwargs)
+
+        def fn(x, y, z):
+            return torch.maximum(x, y), x * z
+
+        entry = HostTraceReplay(fn)
+        with mock.patch("torch.cuda._host_trace_capture.capture_kernel_nodes", smeared):
+            for m in (4, 7, 4):
+                args = (_randn(m, 1, dtype=torch.float32), _randn(1, 5, dtype=torch.float32), _randn(1, 5))
+                self.assertEqual([type(c) for _, c in trace(fn, args).launches], [KernelLaunch, KernelLaunch])
+                self._assert_replays_eager_calls(entry, fn, args)
+        self.assertEqual(entry.eager, 0)
+
+    def test_pointwise_functor_holding_an_operand_address(self):
+        # a slot of the operand's address at each replay
+        _, ops = _functor_ops()
+
+        def fn(x, p):
+            return ops.add_first(x, p)
+
+        entry = HostTraceReplay(fn)
+        with _traced_as_pointwise("ht_functor"):
+            for m in (64, 7, 64):
+                args = (_randn(m, 768, dtype=torch.float32), _randn(3, dtype=torch.float32))
+                self.assertEqual([type(c) for _, c in trace(fn, args).launches], [KernelLaunch])
+                self.assertEqual(entry(*args), fn(*args), atol=0, rtol=0)
+        self.assertEqual(entry.eager, 0)
+
+    def test_pointwise_functor_of_an_operands_size_declines(self):
+        # a member marked host_trace_sizes would replay the witness's size
+        _, ops = _functor_ops()
+
+        def fn(x, p):
+            return ops.add_numel(x, p)
+
+        with _traced_as_pointwise("ht_functor"):
+            (call,) = [c for _, c in trace(fn, (_randn(64, 768, dtype=torch.float32), _randn(3, dtype=torch.float32))).launches]
+        self.assertIsInstance(call, EagerCall)
+        self.assertIn("functor has a member of the operands' sizes", call.reason)
+
+    def test_pointwise_functor_holding_a_cuda_address_declines(self):
+        # a pointer member at none of the op's tensors
+        _, ops = _functor_ops()
+        keep = _randn(1, dtype=torch.float32)
+
+        def fn(x):
+            return ops.add_at(x, keep.data_ptr())
+
+        with _traced_as_pointwise("ht_functor"):
+            (call,) = [c for _, c in trace(fn, (_randn(64, 768, dtype=torch.float32),)).launches]
+        self.assertIsInstance(call, EagerCall)
+        self.assertIn("functor points at a tensor that is none of the op's", call.reason)
 
     @parametrize("dtype", [torch.float16, torch.float32])
     def test_pointwise_inplace_on_an_argument(self, dtype):
@@ -850,13 +1183,16 @@ class TestHostTraceAten(TestCase):
     def test_host_replays_new_shapes(self, dtype, case):
         fn, args_fn = HOSTS[case]
         entry = HostTraceReplay(fn)
+        # Loss.cpp holds -target and -target * input to the end of z's full
+        # expression; a replay frees each temporary after its last launch
+        peak_at_most = case.startswith("soft_margin_loss_backward")
         for h in (4096, 768):
             for m in (16, 7, 1, 5):
-                self._assert_replays_eager_calls(entry, fn, args_fn(m, h, dtype))
+                self._assert_replays_eager_calls(entry, fn, args_fn(m, h, dtype), peak_at_most)
         self.assertEqual(entry.eager, 0)
 
     @parametrize("dtype", [torch.float16, torch.float32])
-    @parametrize("case", [c for c in HOSTS if not c.startswith(("batch_norm", "zeros", "causal")) and not c.endswith(("_0dim", "_empty"))])
+    @parametrize("case", [c for c in HOSTS if not c.startswith(("batch_norm", "zeros", "causal", "eye")) and not c.endswith(("_0dim", "_empty"))])
     @parametrize("m", [16, 1])
     def test_host_records_match_eager(self, dtype, case, m):
         fn, args_fn = HOSTS[case]
@@ -919,7 +1255,7 @@ class TestHostTraceAten(TestCase):
 
     def test_rms_norm_of_a_new_hidden_size_under_a_native_override_compiles_under_the_trace(self):
         # the override reads the hidden size as an int (a guard), so quack's
-        # CuTe DSL compile of a new one at a later trace succeeds
+        # CuTe DSL compile of a new one at a later trace (its warm-up) succeeds
         import torch._vendor.quack.cache as quack_cache
         from torch._native.registry import _aten_override_libs
 
@@ -934,7 +1270,7 @@ class TestHostTraceAten(TestCase):
             for m, h in ((64, 768), (64, 1280), (64, 1280), (7, 1280)):
                 x, w = torch.randn(m, h, device="cuda", dtype=torch.float16), torch.randn(h, device="cuda", dtype=torch.float16)
                 self.assertEqual(entry(x, w), fn(x, w), atol=0, rtol=0)
-        self.assertEqual((entry.traces, entry.replays, entry.eager), (2, 3, 0))
+        self.assertEqual((entry.traces, entry.replays, entry.eager), (2, 2, 0))
 
     @parametrize("native", [False, True])
     def test_rms_norm_of_a_symbolic_shape_replays(self, native):
@@ -1124,6 +1460,7 @@ class TestHostTraceAten(TestCase):
     def test_a_new_key_is_harvested_without_a_relower(self):
         # once a variant binds the matmul's keys, a key it does not bind is
         # harvested on the spot and added as the site's row: no trace, no relower
+        # (the second trace's call is its warm-up, so its key is learned too)
         def fn(x, w):
             return F.silu(x @ w)
 
@@ -1132,7 +1469,7 @@ class TestHostTraceAten(TestCase):
         for m in (1, 2, 3, 4, 5, 3, 7, 9, 7):
             x = torch.randn(m, 256, device="cuda", dtype=torch.bfloat16)
             self.assertEqual(entry(x, w), fn(x, w), atol=0, rtol=0)
-        self.assertEqual((entry.traces, entry.relowers, entry.learned, entry.eager), (2, 1, 2, 0))
+        self.assertEqual((entry.traces, entry.relowers, entry.learned, entry.eager), (2, 1, 3, 0))
 
     def test_fold_refuses_another_launch_chain(self):
         # layer_norm is one vectorized kernel at h % 4 == 0, else two

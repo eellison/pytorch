@@ -3,6 +3,7 @@
 #if !defined(USE_ROCM) && defined(__linux__)
 #include <ATen/core/dispatch/Dispatcher.h>
 #include <ATen/detail/TensorIteratorBuild.h>
+#include <ATen/cuda/host_trace/LaunchLayout.h>
 #include <ATen/cuda/CUDAContextLight.h>
 #include <ATen/cuda/CUDAGeneratorImpl.h>
 #include <ATen/cuda/CUDAGraph.h>
@@ -12,6 +13,7 @@
 #include <c10/cuda/CUDACachingAllocator.h>
 #include <c10/cuda/CUDAFunctions.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAHostTraceOwners.h>
 #include <c10/cuda/driver_api.h>
 #include <torch/csrc/jit/python/pybind_utils.h>
 
@@ -388,7 +390,8 @@ using StreamParts = std::tuple<int64_t, int64_t, int64_t>;
 // cuBLAS workspace is released before and after. With `pretake`, the
 // default generator hands the capture its philox state that many offsets
 // on. Returns the call's result, its allocations, the workspace bytes it
-// asked for, and (seed, offset, offsets taken) or None
+// asked for, (seed, offset, offsets taken) or None, and what keeps its
+// library kernels loaded (a capsule) or None
 py::tuple harvest_capture(
     at::cuda::CUDAGraph& graph,
     const Pool& pool,
@@ -416,6 +419,7 @@ py::tuple harvest_capture(
   int64_t before = 0;
   size_t requested = 0;
   py::object philox = py::none();
+  c10::cuda::HostTraceOwners owners;
   try {
     anchor.fill_(1);
     at::Generator gen;
@@ -430,13 +434,16 @@ py::tuple harvest_capture(
     at::cuda::setCUDABlasWorkspaceAddressOverride(
         reinterpret_cast<void*>(workspace), size);
     c10::cuda::setHostTraceHarvesting(zero_init || previous);
+    auto* sink = c10::cuda::setHostTraceOwnerSink(&owners);
     try {
       result = smeared_call(name, overload, pattern, std::move(args), kwargs);
     } catch (...) {
+      c10::cuda::setHostTraceOwnerSink(sink);
       c10::cuda::setHostTraceHarvesting(previous);
       at::cuda::setCUDABlasWorkspaceAddressOverride(nullptr, 0);
       throw;
     }
+    c10::cuda::setHostTraceOwnerSink(sink);
     c10::cuda::setHostTraceHarvesting(previous);
     requested = at::cuda::setCUDABlasWorkspaceAddressOverride(nullptr, 0);
     if (pretake) {
@@ -455,7 +462,14 @@ py::tuple harvest_capture(
   graph.capture_end();
   at::cuda::clearCublasWorkspacesForStream(stream.stream());
   const int64_t allocs = allocation_count(device) - before;
-  return py::make_tuple(result, allocs, requested, philox);
+  py::object held = py::none();
+  if (!owners.empty()) {
+    held = py::capsule(
+        new c10::cuda::HostTraceOwners(std::move(owners)), [](void* p) {
+          delete static_cast<c10::cuda::HostTraceOwners*>(p);
+        });
+  }
+  return py::make_tuple(result, allocs, requested, philox, held);
 }
 
 // Launches nodes in order on the stream: a kernel as (function, grid, block,
@@ -770,6 +784,29 @@ void initHarvestBindings(py::module& m) {
     }
     built.clear();
     return out;
+  });
+  // on: records the launches this thread's pointwise launch sites report; off:
+  // stops, returning each one's (function, grid, block, byte classes, bytes)
+  // per parameter (LaunchLayout.h)
+  m.def("_cuda_hostTraceRecordLaunches", [](bool on) {
+    namespace ht = at::cuda::host_trace;
+    static thread_local std::vector<ht::LaunchLayout> launched;
+    ht::record_launch_layouts(on ? &launched : nullptr);
+    py::list out;
+    for (const auto& l : on ? std::vector<ht::LaunchLayout>() : std::exchange(launched, {})) {
+      const std::vector<py::bytes> bytes(l.bytes.begin(), l.bytes.end());
+      out.append(py::make_tuple(reinterpret_cast<uintptr_t>(l.function), py::make_tuple(l.grid.x, l.grid.y, l.grid.z), py::make_tuple(l.block.x, l.block.y, l.block.z), l.classes, bytes));
+    }
+    return out;
+  });
+  // the bytes eager's functor holds for a CPU scalar class (LaunchLayout.h) of
+  // the 0-dim CPU tensor src
+  m.def("_cuda_hostTraceCpuScalarBytes", [](const at::Tensor& src, const std::string& cls) {
+    TORCH_CHECK(src.device().is_cpu() && src.dim() == 0 && cls.size() == 1, "a CPU scalar class of a 0-dim CPU tensor");
+    char out[16];
+    TORCH_CHECK(at::cuda::host_trace::cpu_scalar_bytes(src, cls[0], out), "not a CPU scalar class: ", cls);
+    const auto type = static_cast<c10::ScalarType>(cls[0] <= '9' ? cls[0] - '0' : cls[0] - 'A');
+    return py::bytes(out, c10::elementSize(type));
   });
 }
 

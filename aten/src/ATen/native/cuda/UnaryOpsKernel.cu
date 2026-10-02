@@ -174,46 +174,74 @@ void sqrt_kernel_cuda(TensorIteratorBase& iter) {
   }
 }
 
+template <typename scalar_t>
+struct ClampFunctor {
+  scalar_t lower;
+  scalar_t upper;
+  __device__ scalar_t operator()(scalar_t v) const {
+    // Propagate nan, which doesn't propagate automatically for ROCm
+    if (_isnan(v)) {
+      return v;
+    } else {
+      return ::min(::max(v, lower), upper);
+    }
+  }
+  auto host_trace_fields() const {
+    return std::tie(lower, upper);
+  }
+};
+
 void clamp_kernel_cuda(TensorIteratorBase& iter, const Scalar& min_value, const Scalar& max_value) {
   AT_DISPATCH_ALL_TYPES_AND2(kHalf, kBFloat16, iter.dtype(), "clamp_cuda", [&]() {
     auto lower = min_value.to<scalar_t>();
     auto upper = max_value.to<scalar_t>();
-    gpu_kernel(iter, [=]GPU_LAMBDA(scalar_t v) -> scalar_t {
-      // Propagate nan, which doesn't propagate automatically for ROCm
-      if (_isnan(v)) {
-        return v;
-      } else {
-        return ::min(::max(v, lower), upper);
-      }
-    });
+    gpu_kernel(iter, ClampFunctor<scalar_t>{lower, upper});
   });
 }
+
+template <typename scalar_t>
+struct ClampMinFunctor {
+  scalar_t lower;
+  __device__ scalar_t operator()(scalar_t v) const {
+    // Propagate nan, which doesn't propagate automatically for ROCm
+    if (_isnan(v)) {
+      return v;
+    } else {
+      return ::max(v, lower);
+    }
+  }
+  auto host_trace_fields() const {
+    return std::tie(lower);
+  }
+};
 
 void clamp_min_kernel_cuda(TensorIteratorBase& iter, const Scalar& min_value) {
   AT_DISPATCH_ALL_TYPES_AND2(kHalf, kBFloat16, iter.dtype(), "clamp_min_cuda", [&]() {
     auto lower = min_value.to<scalar_t>();
-    gpu_kernel(iter, [=]GPU_LAMBDA(scalar_t v) -> scalar_t {
-      // Propagate nan, which doesn't propagate automatically for ROCm
-      if (_isnan(v)) {
-        return v;
-      } else {
-        return ::max(v, lower);
-      }
-    });
+    gpu_kernel(iter, ClampMinFunctor<scalar_t>{lower});
   });
 }
+
+template <typename scalar_t>
+struct ClampMaxFunctor {
+  scalar_t upper;
+  __device__ scalar_t operator()(scalar_t v) const {
+    // Propagate nan, which doesn't propagate automatically for ROCm
+    if (_isnan(v)) {
+      return v;
+    } else {
+      return ::min(v, upper);
+    }
+  }
+  auto host_trace_fields() const {
+    return std::tie(upper);
+  }
+};
 
 void clamp_max_kernel_cuda(TensorIteratorBase& iter, const Scalar& max_value) {
   AT_DISPATCH_ALL_TYPES_AND2(kHalf, kBFloat16, iter.dtype(), "clamp_max_cuda", [&]() {
     auto upper = max_value.to<scalar_t>();
-    gpu_kernel(iter, [=]GPU_LAMBDA(scalar_t v) -> scalar_t {
-      // Propagate nan, which doesn't propagate automatically for ROCm
-      if (_isnan(v)) {
-        return v;
-      } else {
-        return ::min(v, upper);
-      }
-    });
+    gpu_kernel(iter, ClampMaxFunctor<scalar_t>{upper});
   });
 }
 
@@ -227,6 +255,37 @@ C10_HOST_DEVICE static inline scalar_t _nan_to_num_replace(scalar_t a, scalar_t 
         ? neg_inf_replacement
         : a));
 }
+
+template <typename scalar_t, typename value_t>
+struct NanToNumComplexFunctor {
+  value_t nan_replacement;
+  value_t pos_inf_replacement;
+  value_t neg_inf_replacement;
+  __device__ scalar_t operator()(scalar_t a) const {
+    value_t res_real = _nan_to_num_replace(
+      a.real(), nan_replacement, pos_inf_replacement, neg_inf_replacement);
+    value_t res_imag = _nan_to_num_replace(
+      a.imag(), nan_replacement, pos_inf_replacement, neg_inf_replacement);
+    return scalar_t(res_real, res_imag);
+  }
+  auto host_trace_fields() const {
+    return std::tie(nan_replacement, pos_inf_replacement, neg_inf_replacement);
+  }
+};
+
+template <typename scalar_t>
+struct NanToNumFunctor {
+  scalar_t nan_replacement;
+  scalar_t pos_inf_replacement;
+  scalar_t neg_inf_replacement;
+  __device__ scalar_t operator()(scalar_t a) const {
+    return _nan_to_num_replace(
+      a, nan_replacement, pos_inf_replacement, neg_inf_replacement);
+  }
+  auto host_trace_fields() const {
+    return std::tie(nan_replacement, pos_inf_replacement, neg_inf_replacement);
+  }
+};
 
 void nan_to_num_kernel_cuda(
     TensorIteratorBase& iter,
@@ -244,13 +303,7 @@ void nan_to_num_kernel_cuda(
           ? static_cast<value_t>(neg_inf.value())
           : std::numeric_limits<value_t>::lowest();
 
-      gpu_kernel(iter, [=] GPU_LAMBDA(scalar_t a) -> scalar_t {
-        value_t res_real = _nan_to_num_replace(
-          a.real(), nan_replacement, pos_inf_replacement, neg_inf_replacement);
-        value_t res_imag = _nan_to_num_replace(
-          a.imag(), nan_replacement, pos_inf_replacement, neg_inf_replacement);
-        return scalar_t(res_real, res_imag);
-      });
+      gpu_kernel(iter, NanToNumComplexFunctor<scalar_t, value_t>{nan_replacement, pos_inf_replacement, neg_inf_replacement});
     });
   } else {
     AT_DISPATCH_FLOATING_TYPES_AND2(kHalf, kBFloat16, iter.dtype(), "nan_to_num_cuda", [&]() {
@@ -262,10 +315,7 @@ void nan_to_num_kernel_cuda(
           ? static_cast<scalar_t>(neg_inf.value())
           : std::numeric_limits<scalar_t>::lowest();
 
-      gpu_kernel(iter, [=] GPU_LAMBDA(scalar_t a) -> scalar_t {
-          return _nan_to_num_replace(
-            a, nan_replacement, pos_inf_replacement, neg_inf_replacement);
-      });
+      gpu_kernel(iter, NanToNumFunctor<scalar_t>{nan_replacement, pos_inf_replacement, neg_inf_replacement});
     });
   }
 }
@@ -276,7 +326,7 @@ void frexp_kernel_cuda(TensorIteratorBase& iter) {
     // It's a floating point type and must be the same as the input's dtype.
     iter.dtype(),
     "frexp_cuda", [&]() {
-      gpu_kernel_multiple_outputs(iter, [=] GPU_LAMBDA (scalar_t a) -> thrust::tuple<scalar_t, int32_t> {
+      gpu_kernel_multiple_outputs(iter, [] GPU_LAMBDA (scalar_t a) -> thrust::tuple<scalar_t, int32_t> {
         int32_t exponent;
         scalar_t mantissa = std::frexp(a, &exponent);
         return {mantissa, exponent};

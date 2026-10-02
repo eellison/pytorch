@@ -39,13 +39,17 @@ compilation the trace does not describe runs through Triton
 A call from inside one of its own eager steps needs no special case: its
 buffers are its own allocations, and it leaves the kernel nodes it patches
 recorded, so the outer call patches what it needs when its next run starts.
-A call no variant holds is traced at its own inputs without a warm-up (the
-replay of its new capture is the call) and joins its family, unless it
+An entry's first call runs eagerly (cudagraph trees' warm-up). A later
+call no variant holds is traced at its own inputs after a warm-up (the
+call; under trust only the first trace warms up, and a later one's call is
+the replay of its new capture) and joins its family, unless it
 folds into a variant whose graph guards hold it but not the own guards of
 some top-level ops (their selectors): each gains the trace's launches of its
 op as an entry, where the two tapes agree otherwise
-(_host_trace_lower_tape.fold). A trace,
-lowering or capture that declines runs the function eagerly, and that call's
+(_host_trace_lower_tape.fold). A segment whose capture fails is local: the
+call traces again with the ops of the launches it failed at as eager calls
+(SegmentFailed). A trace, lowering or capture that declines otherwise runs
+the function eagerly, and that call's
 exact class is not traced again; under trust a Declined is the graph's, and
 no call is. Every eager fallback records its reason in `declines`, once per
 reason.
@@ -66,7 +70,7 @@ from torch._logging import trace_structured
 from torch._prims.rng_prims import _impl_graphsafe_rng
 from torch.cuda import _host_trace_cute  # noqa: F401  hooks cute.compile
 from torch.cuda._host_trace import Declined, declined
-from torch.cuda._host_trace_capture import capture_tape, instantiate_form, plain_attributes
+from torch.cuda._host_trace_capture import capture_tape, instantiate_form, plain_attributes, SegmentFailed
 from torch.cuda._host_trace_lower_tape import fold, FoldRefused, lower_tape, PredictedOutput
 from torch.cuda._host_trace_memory import auto_memory, plan_memory, split_runs
 from torch.cuda._host_trace_opaque import library_state_as
@@ -90,6 +94,7 @@ from torch.cuda._host_trace_tape import (
     bind_opaque,
     current_trace,
     EagerCall,
+    seed_offset_on_device,
     trace,
 )
 from torch.utils import _pytree as pytree
@@ -242,6 +247,17 @@ class HostTraceReplay(torch._C._HostTraceEntry):
     holds no other reference to, which split_runs may free mid-tape.
     `static_shapes` are the tensor positions whose layout is static (trace).
 
+    fn must be a pure function of its arguments. Torch's global settings
+    (grad and inference mode, autocast, the TF32, reduced-precision, cuDNN
+    and SDPA flags) are assumed unchanged between a trace and its replays
+    unless `check_global_state`, which adds them to the argument contract;
+    a torch.compile caller has these checks from Dynamo's guards. As with
+    torch.cuda.graph, other Python state fn reads (a module's training flag
+    or attributes, a global) is baked into its trace. The entry's first call
+    runs eagerly and the second traces (_miss); fn's Python side effects run
+    at each of a trace's runs and never at a replay, which is unavoidable; and
+    it stores no tensor it makes (with `check_escapes` a trace that does declines).
+
     The call is the base's: a hit runs in C++, anything else is _call_slow."""
 
     def __init__(
@@ -253,6 +269,8 @@ class HostTraceReplay(torch._C._HostTraceEntry):
         memory: str = "eager",
         freed_arguments: Collection[int] = (),
         static_shapes: Collection[int] = (),
+        check_global_state: bool = False,
+        check_escapes: bool = False,
     ) -> None:
         if memory not in ("auto", "eager", "run_buffer"):
             raise ValueError(f"host_trace: memory {memory!r} is not 'auto', 'eager' or 'run_buffer'")
@@ -262,18 +280,24 @@ class HostTraceReplay(torch._C._HostTraceEntry):
         self.static_shapes = frozenset(static_shapes)
         self.trusted = trusted
         self.opaque = opaque
+        self.check_global_state = check_global_state
+        self.check_escapes = check_escapes
         try:
             self._signature: inspect.Signature | None = inspect.signature(fn)
         except (TypeError, ValueError):
             self._signature = None
         self._families: dict[tuple, list[_Variant]] = {}
         self._declined: set[tuple] = set()
+        # the classes whose warm-up's operator calls were not their trace's once
+        self._witness_retried: set[tuple] = set()
         # the operators whose output disagreed with the trace's metadata
         self._meta_disagrees: set[Any] = set()
         # every fallback's reason, in order, each once
         self._reasons: dict[str, None] = {}
         # why each Triton launch that runs eagerly in a replay does, each once
         self.triton_fallbacks: dict[str, None] = {}
+        # the entry's first call runs eagerly (_miss)
+        self._called = False
         self.traces = 0
         # the learning variants' tapes rebuilt with their keys that bind bound, for no trace
         self.relowers = 0
@@ -302,7 +326,7 @@ class HostTraceReplay(torch._C._HostTraceEntry):
         # one call at a time: a call patches the execs it replays (a native
         # call holds the base's lock too)
         self._lock = threading.RLock()
-        self._native_init(_active, _Disagreement, trusted is not None)
+        self._native_init(_active, _Disagreement, trusted is not None, check_global_state)
 
     @property
     def declines(self) -> list[str]:
@@ -327,7 +351,7 @@ class HostTraceReplay(torch._C._HostTraceEntry):
         if torch.cuda.is_initialized() and torch.cuda.is_current_stream_capturing():
             return self._eager(args, {}, "an outer capture: fn is captured as eager")
         # trusted: Dynamo guarded the arguments' kinds and the global state
-        contract = () if self.trusted is not None else argument_contract(args)
+        contract = () if self.trusted is not None else argument_contract(args, self.check_global_state)
         try:
             family = self._families.get(contract)
         except TypeError:
@@ -478,6 +502,7 @@ class HostTraceReplay(torch._C._HostTraceEntry):
         with library_state_as(key.state), torch._C._AutoDispatchBelowADInplaceOrView():
             out = op(*args, **kwargs)
         fresh = [o for o in pytree.tree_leaves(out) if isinstance(o, torch.Tensor) and not any(o is t for t in tensors)]
+        fresh = seed_offset_on_device(op, fresh, device)
         want = [(dtype, sizes, strides, 0) for dtype, sizes, strides, _ in metadata[inputs:]]
         if [(o.dtype, tuple(o.shape), o.stride(), o.storage_offset()) for o in fresh] != want:
             return None
@@ -611,26 +636,65 @@ class HostTraceReplay(torch._C._HostTraceEntry):
         if device is not None and device.type == "cuda" and _capturing(device):
             # not a decline of the class: the capture ends
             return self._eager(args, {}, f"a capture on {device}")
-        # the entry's first trace warms up (lazy initialization happens outside
-        # the trace, and the warm-up is the call); a later trace does not
-        warm_up = self.traces == 0
+        if not self._called:
+            # as cudagraph trees' warm-up, an entry's first call runs eagerly:
+            # first-use work (an autotuner's benchmark, a lazy initialization)
+            # happens outside every trace, and fn runs once per call
+            self._called = True
+            return self._eager(args, {})
+        # a trace warms up: the warm-up is the call, its operator calls the
+        # trace's witness, and at the entry's first lazy initialization happens
+        # outside the trace. Under trust Dynamo's guards stand for the witness.
+        first = self.traces == 0
+        warm_up = first or self.trusted is None
         ran, result, tape, folded = False, None, None, None
-        self.traces += 1
+        # the ops whose segments failed to capture, run eagerly by a trace again
+        eager_ops: dict[int, str] = {}
+        failed: SegmentFailed | None = None
         try:
-            tape = trace(
-                self.fn,
-                tuple(args),
-                warm_up=warm_up,
-                trusted=self.trusted,
-                opaque=self.opaque,
-                static_shapes=self.static_shapes,
-            )
-            ran, result, tape.warm_up_result = warm_up, tape.warm_up_result, None
-            if self.trusted is None and tape.contract != contract:
-                raise declined("the call changed the global state")
-            folded = next((v for v, values, unselected in candidates if self._fold(v, values, unselected, tape, args)), None)
-            if folded is None:
-                variant = self._build(tape)
+            while True:
+                self.traces += 1
+                tape = trace(
+                    self.fn,
+                    tuple(args),
+                    warm_up=warm_up and not ran,
+                    trusted=self.trusted,
+                    opaque=self.opaque,
+                    static_shapes=self.static_shapes,
+                    check_escapes=self.check_escapes,
+                    eager_ops=eager_ops,
+                )
+                if not ran:
+                    ran, result = warm_up, tape.warm_up_result
+                tape.warm_up_result = None
+                # an op the trace cannot run eagerly (a CuTe launch's) fails as the call's
+                if failed is not None and any(k >= len(tape.ops) or not all(isinstance(tape.launches[i][1], EagerCall) for i in tape.ops[k].launches) for k in eager_ops):
+                    raise failed
+                traced = tape.contract if self.check_global_state or self.trusted is not None else (tape.contract[0], ())
+                if traced != contract:
+                    # a warm-up that initialized global state on first use (the
+                    # SDPA priority order) leaves the state the trace ran under
+                    if not first or traced[0] != contract[0]:
+                        raise declined("the call changed the global state")
+                    contract = traced
+                folded = next((v for v, values, unselected in candidates if self._fold(v, values, unselected, tape, args)), None)
+                if folded is not None:
+                    break
+                try:
+                    variant = self._build(tape)
+                    break
+                except SegmentFailed as e:
+                    # as a trace-time decline is, local: the ops that made
+                    # the launches it failed at run eagerly, the rest replays
+                    at = {i for i, (seq, _) in enumerate(tape.launches) if seq in e.seqs}
+                    ops = {k for k, op in enumerate(tape.ops) if any(i in op.launches for i in at)}
+                    if len(at) != len(e.seqs) or not ops or not ops.isdisjoint(eager_ops):
+                        raise
+                    self._note(str(e))
+                    e.__traceback__ = None
+                    failed = e
+                    eager_ops |= dict.fromkeys(ops, str(e))
+                    tape.release_args()
         except Exception as e:
             if isinstance(e, AssertionError) and tape is not None:
                 raise  # the lowering's or capture's own bug
@@ -639,6 +703,11 @@ class HostTraceReplay(torch._C._HostTraceEntry):
             if isinstance(e, Declined):
                 if tape is None:
                     ran, result = e.warm_up_ran, e.warm_up_result
+                # a warm-up's own calls may be first-use work the first call did
+                # not do (an autotuner's benchmark at a new size): once per class
+                if e.witness and exact not in self._witness_retried:
+                    self._witness_retried.add(exact)
+                    e.retry = True
                 if e.meta_op is not None:
                     self._meta_disagrees.add(e.meta_op)
             elif warm_up and tape is None:
@@ -647,14 +716,16 @@ class HostTraceReplay(torch._C._HostTraceEntry):
             # the frames up to this call's (its arguments, the tape): a cycle
             # only a gc frees, and the call's memory would outlive it
             e.__traceback__ = None
-            if not isinstance(e, Declined):
-                self._declined.add(exact)  # an OOM, say: the call's, not the graph's
+            if not isinstance(e, Declined) or (isinstance(e, SegmentFailed) and not isinstance(e.__cause__, Declined)):
+                self._declined.add(exact)  # an OOM or a capture's error, say: the call's, not the graph's
             elif not e.retry:
                 self._declined.add(structural)
                 self.structural += not e.uncaptured
             if isinstance(e, Declined) and e.uncaptured:
                 self.uncaptured += 1
                 log.debug("%s", e)
+            elif isinstance(e, Declined) and e.retry:
+                log.debug("%s (retried)", e)
             elif isinstance(e, Declined):
                 self._note(str(e))
             else:
@@ -677,7 +748,8 @@ class HostTraceReplay(torch._C._HostTraceEntry):
         lowered = variant.captured.lowered
         if lowered.opaque and (evaluated := variant.native.evaluate(tuple(args))) is not None:
             values = evaluated[0]
-            variant.tried.update(k for o in lowered.opaque.values() if o.provider.bind(k := o.key(values)) is not None)
+            # a key bound since the call was traced (a warm-up's harvest) is the relower's to take
+            variant.tried.update(k for i, o in lowered.opaque.items() if lowered.steps[i].call.bound and o.provider.bind(k := o.key(values)) is not None)
         if ran:
             return result
         outcome, result = self._call_native(variant, tuple(args))
@@ -826,6 +898,7 @@ def _eager_step(
             outs = [out]
         else:
             outs = [o for o in pytree.tree_leaves(out) if isinstance(o, torch.Tensor)]
+            outs = seed_offset_on_device(target, outs, device)
         if len(outs) != len(step.outputs):
             raise _Disagreement(f"{target} returned {len(outs)} tensors", target)
         fresh = []

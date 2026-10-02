@@ -186,6 +186,20 @@ void batch_norm_elementwise(
   }
 }
 
+template <typename scalar_t, typename accscalar_t>
+struct BatchNormElementwiseBackwardTrainFunctor {
+  static constexpr bool host_trace_sizes = true;
+  accscalar_t norm_fct;
+  __device__ scalar_t operator()(scalar_t gO, scalar_t input, accscalar_t weight,
+                                 accscalar_t mean, accscalar_t invstd,
+                                 accscalar_t xmu, accscalar_t dy) const {
+    auto factor_1_c = invstd * invstd * xmu * norm_fct;
+    auto factor_2_c = weight * invstd;
+    auto m_dy_c = dy * norm_fct;
+    return (gO - m_dy_c - (input - mean) * factor_1_c) * factor_2_c;
+  }
+};
+
 Tensor batch_norm_elementwise_backward_train(
     const Tensor& grad_out, const Tensor& input, const Tensor& mean, const Tensor& invstd,
     const Tensor& weight, const Tensor& sum_dy, const Tensor& sum_dy_xmu) {
@@ -246,14 +260,7 @@ Tensor batch_norm_elementwise_backward_train(
                                     "batch_norm_eval_backward", [&]{
       using accscalar_t = at::acc_type<scalar_t, true>;
       auto norm_fct = static_cast<accscalar_t>(1.0 / (input.numel() /input.size(1)) );
-      gpu_kernel(iter, [norm_fct] GPU_LAMBDA (scalar_t gO, scalar_t input, accscalar_t weight,
-                                              accscalar_t mean, accscalar_t invstd,
-                                              accscalar_t xmu, accscalar_t dy) -> scalar_t {
-        auto factor_1_c = invstd * invstd * xmu * norm_fct;
-        auto factor_2_c = weight * invstd;
-        auto m_dy_c = dy * norm_fct;
-        return (gO - m_dy_c - (input - mean) * factor_1_c) * factor_2_c;
-      });
+      gpu_kernel(iter, BatchNormElementwiseBackwardTrainFunctor<scalar_t, accscalar_t>{norm_fct});
     });
     return grad_input;
   }
@@ -352,6 +359,20 @@ void batch_norm_mean_var(const Tensor& self, Tensor& save_mean, Tensor& save_var
   }
 }
 
+template <typename scalar_t, typename acc_t>
+struct BatchNormUpdateStatsFunctor {
+  static constexpr bool host_trace_sizes = true;
+  acc_t bessel_correction_factor;
+  acc_t momentum;
+  __device__ thrust::tuple<scalar_t, scalar_t> operator()(acc_t mean, acc_t var, scalar_t running_mean, scalar_t running_var) const {
+    const auto unbiased_var = var * bessel_correction_factor;
+    return thrust::tuple<scalar_t, scalar_t>{
+      mean * momentum + (1 - momentum) * running_mean,
+      unbiased_var * momentum + (1 - momentum) * running_var,
+    };
+  }
+};
+
 void batch_norm_update_stats(
     const Tensor& save_mean, const Tensor& save_var,
     const Tensor& running_mean, const Tensor& running_var,
@@ -375,16 +396,25 @@ void batch_norm_update_stats(
           static_cast<double>(N) / static_cast<double>(N - 1));
       const auto momentum = static_cast<acc_t>(momentum_);
       gpu_kernel_multiple_outputs(
-          iter, [=] GPU_LAMBDA (acc_t mean, acc_t var, scalar_t running_mean, scalar_t running_var)
-               -> thrust::tuple<scalar_t, scalar_t> {
-        const auto unbiased_var = var * bessel_correction_factor;
-        return thrust::tuple<scalar_t, scalar_t>{
-          mean * momentum + (1 - momentum) * running_mean,
-          unbiased_var * momentum + (1 - momentum) * running_var,
-        };
-      });
+          iter, BatchNormUpdateStatsFunctor<scalar_t, acc_t>{bessel_correction_factor, momentum});
   });
 }
+
+template <typename scalar_t, typename acc_t>
+struct BatchNormUpdateStatsAndInvertFunctor {
+  static constexpr bool host_trace_sizes = true;
+  acc_t bessel_correction_factor;
+  acc_t momentum;
+  acc_t eps;
+  __device__ thrust::tuple<scalar_t, scalar_t, acc_t> operator()(acc_t mean, acc_t var, scalar_t running_mean, scalar_t running_var) const {
+    const auto unbiased_var = var * bessel_correction_factor;
+    return thrust::tuple<scalar_t, scalar_t, acc_t>{
+      mean * momentum + (1 - momentum) * running_mean,
+      unbiased_var * momentum + (1 - momentum) * running_var,
+      c10::cuda::compat::rsqrt(var + eps)
+    };
+  }
+};
 
 void batch_norm_update_stats_and_invert(
     const Tensor& save_mean, const Tensor& save_var,
@@ -411,15 +441,7 @@ void batch_norm_update_stats_and_invert(
       const auto eps = static_cast<acc_t>(epsilon);
       const auto momentum = static_cast<acc_t>(momentum_);
       gpu_kernel_multiple_outputs(
-          iter, [=] GPU_LAMBDA (acc_t mean, acc_t var, scalar_t running_mean, scalar_t running_var)
-               -> thrust::tuple<scalar_t, scalar_t, acc_t> {
-        const auto unbiased_var = var * bessel_correction_factor;
-        return thrust::tuple<scalar_t, scalar_t, acc_t>{
-          mean * momentum + (1 - momentum) * running_mean,
-          unbiased_var * momentum + (1 - momentum) * running_var,
-          c10::cuda::compat::rsqrt(var + eps)
-        };
-      });
+          iter, BatchNormUpdateStatsAndInvertFunctor<scalar_t, acc_t>{bessel_correction_factor, momentum, eps});
   });
 }
 
@@ -429,6 +451,9 @@ struct BatchNormInvStdFunctor {
     return c10::cuda::compat::rsqrt(var + eps);
   }
   acc_t eps;
+  auto host_trace_fields() const {
+    return std::tie(eps);
+  }
 };
 
 void batch_norm_calc_invstd(const Tensor& out_invstd, const Tensor& running_var, double epsilon) {

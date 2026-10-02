@@ -36,6 +36,7 @@ if HAS_CUDA_AND_TRITON:
         _InductorKernel,
         _Installation,
         _namespace,
+        _trusted_inputs,
         HostTracePolicy,
     )
     from torch._inductor.runtime.triton_heuristics import (
@@ -48,6 +49,7 @@ if HAS_CUDA_AND_TRITON:
     import torch.cuda._host_trace_replay as host_trace_replay
     from torch.cuda._host_trace_replay import HostTraceReplay
     from torch.cuda._host_trace_tape import EagerCall, Memset, OpaqueCall, trace
+    from torch.cuda._host_trace_triton_launch import owned_module, OwnedModule
 
 
 def _pointwise(x):
@@ -191,16 +193,20 @@ class TestInductorLaunches(TestCase):
     @parametrize("fn,shape", [(_pointwise, (1000,)), (_reduction, (16, 128))])
     def test_launches_match_eager(self, fn, shape, static_launcher):
         with fresh_cache(), config.patch(use_static_cuda_launcher=static_launcher):
-            mod = self._module(fn, torch.randn(shape, device="cuda"))
-            replay = HostTraceReplay(_traced_call(mod))
+            x = torch.randn(shape, device="cuda")
+            mod = self._module(fn, x)
+            # the first call runs eagerly, so the fresh module's first-use
+            # autotuning is outside the trace
+            replay = HostTraceReplay(_traced_call(mod), trusted=_trusted_inputs([x]))
             for _ in range(3):
                 x = torch.randn(shape, device="cuda")
                 (out,) = replay(x)
                 self.assertEqual(out, fn(x))
         self.assertEqual(replay.declines, [])
-        self.assertEqual((replay.traces, replay.replays), (1, 2))
+        self.assertEqual((replay.traces, replay.replays, replay.eager), (1, 1, 1))
         (launch,) = [r for _, r in replay.variants[0].tape.launches]
-        kind = StaticTritonCompileResult if static_launcher else TritonCompileResult
+        # a static launcher's cubin is gone once loaded; else the tape loads its own
+        kind = StaticTritonCompileResult if static_launcher else OwnedModule
         self.assertIs(type(launch.owner), kind)
 
     def test_dynamic_shapes_one_capture(self):
@@ -222,15 +228,17 @@ class TestInductorLaunches(TestCase):
             mod = self._module(_cumsum, x, dynamic=True)
         replay = HostTraceReplay(_traced_call(mod))
         held = set()
-        for n in (100000, 300000, 200000, 300000):
+        # the first call runs eagerly (the fresh module's first-use
+        # autotuning) and the next traces
+        for n in (100000, 100000, 300000, 200000, 300000):
             x = torch.randn(n, device="cuda")
             args = [x if torch.is_tensor(a) else n for a in mod.get_args()]
             (out,) = replay(*args)
             # a split scan's lookback is not deterministic, even eagerly
             self.assertEqual(out, mod.call(list(args))[0], atol=1e-3, rtol=1e-3)
-            (variant,) = replay.variants
-            held.add(torch._C._host_trace_held_images(variant.native)[0])
-        self.assertEqual(replay.declines, [])
+            held.update(torch._C._host_trace_held_images(v.native)[0] for v in replay.variants)
+        (variant,) = replay.variants
+        self.assertEqual((replay.eager, replay.declines), (1, []))
         self.assertIsInstance(variant.tape.launches[0][1], Memset)
         # the memset node is patched to each size's workspace
         self.assertEqual(len({memset[1] for memset in held}), 3)
@@ -240,13 +248,13 @@ class TestInductorLaunches(TestCase):
         with fresh_cache():
             mod = self._module(_two, x, y)
         self.assertIn("assert_size_stride_grouped", mod.call.__func__.__code__.co_names)
-        replay = HostTraceReplay(_traced_call(mod))
+        replay = HostTraceReplay(_traced_call(mod), trusted=_trusted_inputs([x, y]))
         for _ in range(3):
             x, y = (torch.randn(1000, device="cuda") for _ in range(2))
             (out,) = replay(x, y)
             self.assertEqual(out, _two(x, y))
         self.assertEqual(replay.declines, [])
-        self.assertEqual((replay.traces, replay.replays), (1, 2))
+        self.assertEqual((replay.traces, replay.replays, replay.eager), (1, 1, 1))
 
     @config.patch(coordinate_descent_tuning=True)
     def test_coordinate_descent(self):
@@ -268,7 +276,11 @@ class TestInductorLaunches(TestCase):
             self.assertEqual(out, _reduction(x))
         self.assertEqual(replay.declines, [])
         (launch,) = [r for _, r in replay.variants[0].tape.launches]
-        self.assertIs(launch.owner, launcher.compile_result)
+        result = launcher.compile_result
+        if type(result) is TritonCompileResult:
+            self.assertIs(launch.owner, owned_module(result.kernel))
+        else:
+            self.assertIs(launch.owner, result)
 
     def test_declines(self):
         x = torch.randn(1000, device="cuda")
@@ -367,7 +379,7 @@ class TestWrapperSeams(TestCase):
             out = replay(x)
             self.assertEqual(out, x.as_strided((4, 8), (1, 4), x.storage_offset() + 3))
             self.assertEqual(out.data_ptr(), x.data_ptr() + 3 * x.element_size())
-        self.assertEqual((replay.traces, replay.replays), (1, 2))
+        self.assertEqual((replay.traces, replay.replays, replay.eager), (1, 1, 1))
 
     def test_copy_if_misaligned(self):
         # the repair is a dispatch on the address; the misaligned side is a
@@ -435,7 +447,7 @@ class TestInstallation(TestCase):
         replay = installation.replay
         self.assertEqual(replay.declines, [])
         self.assertEqual(
-            (replay.traces, replay.replays, replay.eager), (1, len(sizes) - 1, 0)
+            (replay.traces, replay.replays, replay.eager), (1, len(sizes) - 2, 1)
         )
         # no guard restates the input; only copy_if_misaligned's dispatch on
         # the live input's alignment remains
@@ -460,7 +472,7 @@ class TestInstallation(TestCase):
                 self.assertEqual(compiled(x), fn(x))
         (installation,) = self.installed
         replay = installation.replay
-        self.assertEqual((replay.memory, replay.eager, replay.declines), (memory, 0, []))
+        self.assertEqual((replay.memory, replay.eager, replay.declines), (memory, 1, []))
         (variant,) = replay.variants
         self.assertTrue(any(s.temporaries for s in variant.memory.steps))
         # "auto" takes the run buffer: its peak is within the margin
@@ -489,7 +501,7 @@ class TestInstallation(TestCase):
             self.assertEqual(c1(x), m1(x))
         (installation,) = self.installed
         replay = installation.replay
-        self.assertEqual((replay.traces, replay.eager, replay.declines), (1, 0, []))
+        self.assertEqual((replay.traces, replay.eager, replay.declines), (1, 1, []))
         rows = replay.variants[0].captured.lowered.program.instructions
         self.assertEqual({row[1] for row in rows if row[0] == "pointer"}, {0, 1, 2})
 
@@ -522,7 +534,7 @@ class TestInstallation(TestCase):
         for installation in self.installed:
             replay = installation.replay
             self.assertEqual(replay.declines, [])
-            self.assertEqual((replay.traces, replay.relowers, len(replay.variants), replay.eager), (1, 1, 2, 0))
+            self.assertEqual((replay.traces, replay.relowers, len(replay.variants), replay.eager), (1, 1, 2, 1))
 
     @config.patch(freezing=True)
     def test_frozen_constants_are_arguments(self):
@@ -535,7 +547,7 @@ class TestInstallation(TestCase):
         (installation,) = self.installed
         self.assertGreater(len(installation._constants), 0)
         replay = installation.replay
-        self.assertEqual((replay.traces, replay.eager, replay.declines), (1, 0, []))
+        self.assertEqual((replay.traces, replay.eager, replay.declines), (1, 1, []))
 
     def test_misaligned_input_is_a_variant(self):
         m = _Params().cuda()
@@ -547,7 +559,7 @@ class TestInstallation(TestCase):
                 self.assertEqual(compiled(x, y), m(x, y))
         (installation,) = self.installed
         replay = installation.replay
-        self.assertEqual((replay.traces, len(replay.variants), replay.eager), (2, 2, 0))
+        self.assertEqual((replay.traces, len(replay.variants), replay.eager), (2, 2, 1))
 
     def test_training_step(self):
         m = _Params().cuda()
@@ -620,7 +632,7 @@ class TestInstallation(TestCase):
             self.assertEqual(compiled(x), fn(x))
         (installation,) = self.installed
         replay = installation.replay
-        self.assertEqual((replay.traces, replay.eager, replay.declines), (1, 0, []))
+        self.assertEqual((replay.traces, replay.eager, replay.declines), (1, 1, []))
 
     def test_fallback_output_asserts_under_the_trace(self):
         # size_asserts (the default) checks a fallback op's output with
@@ -662,6 +674,8 @@ class TestInstallation(TestCase):
 
         compiled = torch.compile(_pointwise, mode="reduce-overhead")
         with mock.patch.object(_InductorKernel, "_record", decline):
+            # the first call runs eagerly; the second traces
+            compiled(torch.randn(8, device="cuda"))
             with self.assertRaisesRegex(RuntimeError, "a structural decline"):
                 compiled(torch.randn(8, device="cuda"))
 
@@ -710,7 +724,7 @@ class TestInstallation(TestCase):
         (installation,) = self.installed
         replay = installation.replay
         # a size's zero-ness is a guard: the empty call and the misaligned call each trace
-        self.assertEqual((replay.traces, len(replay.variants), replay.eager), (3, 3, 0))
+        self.assertEqual((replay.traces, len(replay.variants), replay.eager), (3, 3, 1))
 
     def test_capture_error_declines_only_the_call(self):
         capture = host_trace_replay.capture_tape
@@ -729,7 +743,7 @@ class TestInstallation(TestCase):
                 self.assertEqual(compiled(x), _pointwise(x))
         (installation,) = self.installed
         replay = installation.replay
-        self.assertEqual((replay.traces, len(replay.variants), replay.eager), (2, 1, 1))
+        self.assertEqual((replay.traces, len(replay.variants), replay.eager), (2, 1, 2))
         self.assertIn("OutOfMemoryError", replay.declines[0])
 
     def test_workspace_is_a_memset(self):
@@ -739,7 +753,7 @@ class TestInstallation(TestCase):
             self.assertEqual(compiled(x), _cumsum(x), atol=1e-3, rtol=1e-3)
         (installation,) = self.installed
         replay = installation.replay
-        self.assertEqual((replay.traces, replay.eager, replay.declines), (1, 0, []))
+        self.assertEqual((replay.traces, replay.eager, replay.declines), (1, 1, []))
         (variant,) = replay.variants
         self.assertIsInstance(variant.tape.launches[0][1], Memset)
 
@@ -783,7 +797,7 @@ class TestInstallation(TestCase):
                 (launch,) = [r for _, r in replay.variants[-1].tape.launches]
                 self.assertEqual(launch.name, name)
         self.assertEqual(replay.declines, [])
-        self.assertEqual((replay.traces, len(replay.variants), replay.eager), (2, 2, 0))
+        self.assertEqual((replay.traces, len(replay.variants), replay.eager), (2, 2, 1))
 
 
 class _Block(torch.nn.Module):
@@ -1180,7 +1194,7 @@ class TestInstalledAttentionAndRng(TestCase):
                 self.assertEqual(state, torch.get_rng_state())
         (installation,) = self.installed
         self.assertEqual(installation.replay.declines, [])
-        self.assertEqual(installation.replay.eager, 0)
+        self.assertEqual(installation.replay.eager, 1)
         self.assertGreater(installation.replay.replays, 0)
         self.assertTrue(self._host_steps())
 

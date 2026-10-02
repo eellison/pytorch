@@ -4,7 +4,7 @@ import sympy
 
 import torch
 from torch.cuda._host_trace import _TraceShapeEnv
-from torch.fx.experimental.symbolic_shapes import ShapeEnv
+from torch.fx.experimental.symbolic_shapes import ShapeEnv, statically_known_false, statically_known_true
 from torch.testing._internal.common_utils import run_tests, TestCase
 from torch.utils._sympy.functions import FloorDiv, Mod, PythonMod
 
@@ -64,6 +64,20 @@ class TestTraceShapeEnv(TestCase):
         (p,) = _syms(ShapeEnv(), True, p=1024)
         with self.assertRaisesRegex(TypeError, "unhashable type: non-nested SymInt"):
             hash(p)
+
+    def test_a_static_read_is_a_guard(self):
+        # statically_known_true/false decide by the hint where eager reads a
+        # concrete value; any other ShapeEnv's stays undecided without a guard
+        env = _TraceShapeEnv()
+        a, b = _syms(env, True, a=8, b=8)
+        self.assertTrue(statically_known_true(a == b))
+        self.assertTrue(statically_known_false(a == 4))
+        A, B = a.node.expr, b.node.expr
+        self.assertEqual([g.expr for g in env.guards], [sympy.Eq(A, B), sympy.Ne(A, 4)])
+        plain = ShapeEnv(duck_shape=False, specialize_zero_one=False)
+        p, q = _syms(plain, True, p=8, q=8)
+        self.assertFalse(statically_known_true(p == q))
+        self.assertFalse(plain.guards)
 
     def test_ranges_are_never_refined(self):
         # a guard never lets a later one be decided statically: each is

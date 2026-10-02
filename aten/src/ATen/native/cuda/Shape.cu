@@ -14,6 +14,9 @@
 #include <ATen/Dispatch.h>
 #include <ATen/Dispatch_v2.h>
 #include <c10/core/MemoryFormat.h>
+#include <c10/cuda/CUDAFunctions.h>
+
+#include <cstring>
 
 #ifndef AT_PER_OPERATOR_HEADERS
 #include <ATen/Functions.h>
@@ -331,6 +334,11 @@ void parallel_cat(const Tensor &out, const MaterializedITensorListRef& inputs, i
   scalar_t *data = (scalar_t *)(out.mutable_data_ptr());
   CatArrInputTensorMetadata<scalar_t, unsigned int, batch_size, stride_size> catMetaData;
   TensorSizeStride<unsigned int, CAT_ARRAY_MAX_INPUT_DIMS> outputParam;
+  // entries past the batch and dims past nDims are launched uninitialized
+  if (c10::cuda::isHostTraceHarvesting()) {
+    std::memset(&catMetaData, 0, sizeof(catMetaData));
+    std::memset(&outputParam, 0, sizeof(outputParam));
+  }
   // If all batches are contiguous we can call a specialized implementation
   // which requires the input tensor addresses to be aligned to a
   // 16 Byte boundary.

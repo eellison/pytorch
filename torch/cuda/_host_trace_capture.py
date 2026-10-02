@@ -37,7 +37,7 @@ from typing import Any, NoReturn, TYPE_CHECKING
 import torch
 from torch._logging import trace_structured
 from torch._logging._internal import warning_once
-from torch.cuda._host_trace import declined
+from torch.cuda._host_trace import Declined, declined
 from torch.cuda._host_trace_lower_tape import (
     LoweredMemcpy,
     LoweredMemset,
@@ -103,6 +103,16 @@ class CapturedTape:
         return tuple(c for s in self.segments for c in s.launches)
 
 
+class SegmentFailed(Declined):
+    """A segment's capture, verify or instantiation failed: at the launches of
+    tape sequence numbers `seqs` (the one it failed at, else all of the
+    segment's); the ops that made them can run eagerly instead."""
+
+    def __init__(self, msg: str, seqs: tuple[int, ...]) -> None:
+        super().__init__(msg)
+        self.seqs = seqs
+
+
 def launch_slots(
     launch: LoweredLaunch, values: Sequence[int], bases: Sequence[int]
 ) -> tuple[int, ...]:
@@ -131,12 +141,21 @@ def pack_params(
     return packed
 
 
+def pack_cpu_scalars(launch: KernelLaunch, images: Sequence[bytearray]) -> None:
+    """Packs the launch's CPU scalar members, read from their tensors now."""
+    for param, at, cls, source in launch.cpu_scalars:
+        value = torch._C._cuda_hostTraceCpuScalarBytes(source, cls)
+        images[param][at : at + len(value)] = value
+
+
 def launch_images(launch: LoweredLaunch, slots: Sequence[int]) -> tuple[bytes, ...]:
     """Each parameter's bytes at a call, from launch_slots."""
     t = launch.launch
     if t.fields is not None:
         pointers = [not isinstance(slot, ScalarSlot) for slot in launch.slots]
-        return tuple(map(bytes, pack_params(t, slots, pointers)))
+        packed = pack_params(t, slots, pointers)
+        pack_cpu_scalars(t, packed)
+        return tuple(map(bytes, packed))
     return tuple(
         (_SCALARS[size] if isinstance(slot, ScalarSlot) else _POINTER).pack(v)
         for v, slot, (_, size) in zip(slots, launch.slots, t.layout)
@@ -526,13 +545,16 @@ def _launch(
     values: Sequence[int],
     bases: Sequence[int],
     stream: int,
+    copy_at: tuple[int, int],
+    nodes: list[int],
 ) -> tuple[list[int], list[LoweredLaunch | LoweredMemset | LoweredMemcpy], tuple[torch.Generator, int, int] | None]:
     """Launch the kernels, memsets and memcpys into the capture on `stream`; each
-    one's node, the launches as captured: an RNG kernel's images hold
-    the capture's generator state, and that state as CapturedSegment.rng."""
+    one's node (into `nodes`, so a failure is at the launch after them), the
+    launches as captured: an RNG kernel's images hold
+    the capture's generator state, and that state as CapturedSegment.rng. A
+    memcpy copies between `copy_at` (dst, src; _copy_operands)."""
     from cuda.bindings import driver, runtime
 
-    nodes: list[int] = []
     captured: list[LoweredLaunch | LoweredMemset | LoweredMemcpy] = []
     philox = (0, 0, 0)
     rng = None
@@ -550,9 +572,8 @@ def _launch(
             nodes.append(after[0])
             continue
         if isinstance(lo, LoweredMemcpy):
-            dst, src = (slot_address(s, values, bases) for s in lo.slots)
             d2d = runtime.cudaMemcpyKind.cudaMemcpyDeviceToDevice
-            _check_cuda_bindings(runtime.cudaMemcpyAsync(dst, src, values[lo.nbytes], d2d, stream))
+            _check_cuda_bindings(runtime.cudaMemcpyAsync(*copy_at, values[lo.nbytes], d2d, stream))
             after = _frontier(stream)
             if len(after) != 1 or after[0] in nodes:
                 raise declined(f"memcpy {lo.launch.name} did not add one node to the capture")
@@ -566,11 +587,13 @@ def _launch(
             if rng is not None and (rng[0] is not gen or rng[1:] != philox[:2]):
                 raise declined("a run's RNG kernels draw from two generators")
             rng = (gen, *philox[:2])
-        if t.rng:
+        # the node holds these bytes, which a native replay's first patch compares with
+        if t.rng or t.cpu_scalars:
             images = [bytearray(image) for image in t.images]
             for param, at, kind, delta in t.rng:
                 v = philox[("philox_seed", "philox_offset", "philox").index(kind)] + delta
                 _POINTER.pack_into(images[param], at, v)
+            pack_cpu_scalars(t, images)
             lo = captured[-1] = replace(lo, launch=replace(t, images=tuple(map(bytes, images))))
         images = launch_images(lo, launch_slots(lo, values, bases))
         storage = [ctypes.create_string_buffer(image, len(image)) for image in images]
@@ -602,6 +625,7 @@ def _verify(
     launches: Sequence[LoweredLaunch | LoweredMemset | LoweredMemcpy],
     values: Sequence[int],
     bases: Sequence[int],
+    copy_at: tuple[int, int],
 ) -> None:
     """The graph holds exactly `nodes`, the i-th launch's kernel, memset or
     memcpy node."""
@@ -628,9 +652,8 @@ def _verify(
             kind = _check_cuda_bindings(driver.cuGraphNodeGetType(node))
             if kind != driver.CUgraphNodeType.CU_GRAPH_NODE_TYPE_MEMCPY:
                 raise declined(f"memcpy {lo.launch.name} captured a {kind.name} node")
-            dst, src = (slot_address(s, values, bases) for s in lo.slots)
             try:
-                if _memcpy_node(node) != MemcpyNode(dst, src, values[lo.nbytes]):
+                if _memcpy_node(node) != MemcpyNode(*copy_at, values[lo.nbytes]):
                     raise ValueError("other parameters")
             except ValueError:
                 raise declined(f"the captured node of memcpy {lo.launch.name} has other parameters") from None
@@ -661,6 +684,15 @@ def _verify(
                 raise declined(f"{where} holds other bytes in slot {i}")
 
 
+def _copy_operands(device: torch.device, nbytes: int) -> torch.Tensor:
+    """What a captured memcpy node copies between: a memcpy node keeps its
+    capture's kind of memory (cudaMalloc'd or cuMemMap'd, as expandable
+    segments are), and a replay can only set it to operands of that kind, so
+    the capture copies within an allocation of the caching allocator's. The
+    capture runs no node, and the first replay sets every memcpy."""
+    return torch.empty(2 * nbytes, dtype=torch.uint8, device=device)
+
+
 def _segment(
     launches: Sequence[LoweredLaunch | LoweredMemset | LoweredMemcpy],
     values: Sequence[int],
@@ -674,28 +706,51 @@ def _segment(
     generators = (lo.launch.generator for lo in launches if not isinstance(lo, (LoweredMemset, LoweredMemcpy)))
     for gen in {id(g): g for g in generators if g is not None}.values():
         graph.register_generator_state(gen)
+    # the largest memcpy's span, so both operands lie inside the allocation
+    sizes = [values[lo.nbytes] for lo in launches if isinstance(lo, LoweredMemcpy)]
+    span = -(-max([1, *sizes]) // _ALLOC_ALIGNMENT) * _ALLOC_ALIGNMENT
+    copies = _copy_operands(stream.device, span) if sizes else None
+    copy_at = (0, 0) if copies is None else (copies.data_ptr(), copies.data_ptr() + span)
     # relaxed, unlike the trace's thread-local capture (a detector there):
     # the tape, not the capture, decides what is replayed, and a thread-local
     # capture is invalidated by other threads' allocations
+    nodes: list[int] = []
     with _gc_hold, torch.cuda.stream(stream), warnings.catch_warnings():
         warnings.filterwarnings("ignore", "The CUDA Graph is empty")
         graph.capture_begin(capture_error_mode="relaxed")
         try:
-            nodes, launches, rng = _launch(launches, values, bases, stream.cuda_stream)
-        except BaseException:
+            nodes, captured, rng = _launch(launches, values, bases, stream.cuda_stream, copy_at, nodes)
+        except BaseException as e:
             with contextlib.suppress(Exception):
                 graph.capture_end()
-            raise
+            _segment_failed(e, launches[len(nodes) : len(nodes) + 1])
         graph.capture_end()
-    _verify(graph.raw_cuda_graph(), nodes, launches, values, bases)
-    graph.instantiate()
-    # upload before any node is patched (an update of a never-uploaded exec
-    # can leave the node on a slow path for good)
-    exec_ = graph.raw_cuda_graph_exec()
-    _check_cuda_bindings(runtime.cudaGraphUpload(exec_, stream.cuda_stream))
+    try:
+        _verify(graph.raw_cuda_graph(), nodes, captured, values, bases, copy_at)
+        graph.instantiate()
+        # upload before any node is patched (an update of a never-uploaded exec
+        # can leave the node on a slow path for good)
+        exec_ = graph.raw_cuda_graph_exec()
+        _check_cuda_bindings(runtime.cudaGraphUpload(exec_, stream.cuda_stream))
+    except BaseException as e:
+        _segment_failed(e, launches)
     return CapturedSegment(
-        graph, tuple(CapturedLaunch(n, lo) for n, lo in zip(nodes, launches)), rng
+        graph, tuple(CapturedLaunch(n, lo) for n, lo in zip(nodes, captured)), rng
     )
+
+
+def _segment_failed(e: BaseException, at: Sequence[LoweredLaunch | LoweredMemset | LoweredMemcpy]) -> NoReturn:
+    """A segment's failure at launches `at` as a SegmentFailed: the call runs
+    their ops eagerly, the rest replays. An unexpected error raises as itself
+    in the test suites, as an interrupt or an OOM (the call's) does."""
+    if not isinstance(e, Exception) or isinstance(e, torch.OutOfMemoryError) or (torch.cuda._host_trace.raise_unexpected and not isinstance(e, Declined)):
+        raise e
+    names = ", ".join(lo.launch.name for lo in at[:3]) + (f" and {len(at) - 3} more" if len(at) > 3 else "")
+    if isinstance(e, Declined):
+        why = str(e).removeprefix("host_trace: ").removesuffix(" (declined)")
+    else:
+        why = f"{type(e).__name__}: {str(e).splitlines()[0] if str(e) else ''}"
+    raise SegmentFailed(str(declined(f"the capture of {names} failed: {why}")), tuple(lo.seq for lo in at)) from e
 
 
 def capture_tape(lowered: LoweredTape, addresses: Sequence[int]) -> CapturedTape:

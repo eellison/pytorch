@@ -972,19 +972,21 @@ static void launch_reduce_kernel(const ReduceConfig& config, const R& reduction)
   auto stream = at::cuda::getCurrentCUDAStream();
   int shared_memory = config.shared_memory_size();
 
+  // launched from reduction's own bytes: <<<>>> copies it member by member,
+  // leaving its padding (which the harvest flag zeroes) indeterminate
+  void* args[] = {const_cast<R*>(&reduction)};
+  const void* kernel;
   switch(config.output_vec_size) {
   case 4:
-    reduce_kernel<max_threads / 4, 4, R><<<grid, block, shared_memory, stream>>>(reduction);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    kernel = reinterpret_cast<const void*>(&reduce_kernel<max_threads / 4, 4, R>);
     break;
   case 2:
-    reduce_kernel<max_threads / 2, 2, R><<<grid, block, shared_memory, stream>>>(reduction);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    kernel = reinterpret_cast<const void*>(&reduce_kernel<max_threads / 2, 2, R>);
     break;
   default:
-    reduce_kernel<max_threads / 1, 1, R><<<grid, block, shared_memory, stream>>>(reduction);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    kernel = reinterpret_cast<const void*>(&reduce_kernel<max_threads / 1, 1, R>);
   }
+  C10_CUDA_CHECK(cudaLaunchKernel(kernel, grid, block, args, shared_memory, stream));
 }
 
 inline void launch_jitted_reduce_kernel(
@@ -1325,6 +1327,10 @@ inline void gpu_reduce_kernel(TensorIterator& iter, const ops_t& ops, ident_t id
   alignas(reduce_op_t) unsigned char reduce_storage[sizeof(reduce_op_t)];
   if (c10::cuda::isHostTraceHarvesting()) {
     std::memset(reduce_storage, 0, sizeof(reduce_storage));
+#if defined(__GNUC__) && !defined(__CUDA_ARCH__)
+    // GCC's lifetime DSE otherwise drops the memset at the placement new
+    asm volatile("" : : "r"(reduce_storage) : "memory");
+#endif
   }
   auto& reduce = *new (reduce_storage) reduce_op_t(
       ops,

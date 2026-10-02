@@ -128,8 +128,7 @@
   _(cuMemGetAllocationPropertiesFromHandle, 12000) \
   _(cuMemsetD32Async, 12000)                       \
   _(cuStreamWriteValue32, 12000)                   \
-  _(cuGetErrorString, 12000)                       \
-  _(cuGraphExecKernelNodeSetParams, 12000)
+  _(cuGetErrorString, 12000)
 
 #if defined(CUDA_VERSION) && (CUDA_VERSION >= 12030)
 #define C10_LIBCUDA_DRIVER_API_12_3(_) \
@@ -171,6 +170,10 @@
   _(cuTensorMapEncodeTiled, 12000)    \
   _(cuTensorMapReplaceAddress, 12000)
 
+// Host tracing's native replay declines without it
+#define C10_LIBCUDA_DRIVER_API_REPLAY(_) \
+  _(cuGraphExecKernelNodeSetParams, 12000)
+
 // Host tracing's harvest reads its captures' nodes and launches them
 #if defined(CUDA_VERSION) && (CUDA_VERSION >= 12040)
 #define C10_LIBCUDA_DRIVER_API_HARVEST(_) \
@@ -193,6 +196,7 @@
 
 #define C10_LIBCUDA_DRIVER_API_OPTIONAL(_) \
   C10_LIBCUDA_DRIVER_API_TMA(_)            \
+  C10_LIBCUDA_DRIVER_API_REPLAY(_)         \
   C10_LIBCUDA_DRIVER_API_HARVEST(_)        \
   C10_LIBCUDA_DRIVER_API_12_3(_)           \
   C10_LIBCUDA_DRIVER_API_12_8(_)           \

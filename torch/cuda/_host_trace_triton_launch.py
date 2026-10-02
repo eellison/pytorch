@@ -35,6 +35,7 @@ import ctypes
 import functools
 import struct
 import types
+import weakref
 from typing import Any, NoReturn, TYPE_CHECKING
 
 import torch
@@ -42,6 +43,7 @@ from torch.cuda._host_trace import Declined, declined, ProcessHold
 from torch.cuda._host_trace_launch import _GRID_LIMITS, _probe_address, KernelLaunch
 from torch.cuda._host_trace_tape import _hint, _Root, _TracedTensor, current_trace, EagerCall
 from torch.cuda._host_trace_triton import param_layout, triton_abi
+from torch.cuda._utils import _check_cuda_bindings
 from torch.utils._triton import has_triton_package
 
 
@@ -54,6 +56,35 @@ if TYPE_CHECKING:
 
 _SYM_TYPES = (torch.SymInt, torch.SymFloat, torch.SymBool)
 _INT_BITS = {"i32": 32, "i64": 64}
+
+
+class OwnedModule:
+    """A tape's own load of a compiled kernel's cubin: an explicit unload of
+    the kernel's (CompiledKernel.close, a CachingAutotuner's
+    release_benchmark_artifacts) leaves the tape's function loaded."""
+
+    def __init__(self, binary: Any) -> None:
+        from cuda.bindings import driver
+
+        self._unload = driver.cuModuleUnload
+        self.module = _check_cuda_bindings(driver.cuModuleLoadData(binary.asm["cubin"]))
+        self.function = int(_check_cuda_bindings(driver.cuModuleGetFunction(self.module, binary.metadata.name.encode())))
+        # Triton's opt-in to more than 48 KiB of dynamic shared memory
+        attr = driver.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES
+        limit = _check_cuda_bindings(driver.cuFuncGetAttribute(attr, int(binary.function)))
+        _check_cuda_bindings(driver.cuFuncSetAttribute(self.function, attr, limit))
+
+    def __del__(self) -> None:
+        self._unload(self.module)
+
+
+_OWNED: weakref.WeakKeyDictionary[Any, OwnedModule] = weakref.WeakKeyDictionary()
+
+
+def owned_module(binary: Any) -> OwnedModule:
+    if binary not in _OWNED:
+        _OWNED[binary] = OwnedModule(binary)
+    return _OWNED[binary]
 
 
 class _PointerStandIn:
@@ -232,8 +263,11 @@ def _intercept(
             if type(extent) not in (int, torch.SymInt):
                 decline(f"grid axis {axis} is a {type(extent).__name__}")
 
+    # the launch of an op that runs eagerly (_Trace.eager_ops)
+    reason = None if dims is None else tr.eager_ops.get(len(tr.ops))
     try:
-        return _launch(tr, jit, bound, hinted, symbolic, options, dims)
+        if reason is None:
+            return _launch(tr, jit, bound, hinted, symbolic, options, dims)
     except Declined as e:
         # a compile-only call has no launch to run eagerly
         if dims is None or e is tr.declined:
@@ -300,7 +334,8 @@ def _launch(
 
     abi = triton_abi(binary.src, binary.metadata)
     binary._init_handles()
-    record_launch(tr, name, int(binary.function), binary, abi, bound, dims)
+    owned = owned_module(binary)
+    record_launch(tr, name, owned.function, owned, abi, bound, dims)
     return binary
 
 
@@ -316,9 +351,7 @@ def record_launch(
     """Record the launch of `function` on the grid `dims`, each argument of
     the ABI read from `values` by name (a constexpr absent from `values` is
     the compiled one). The caller has guarded every specialization, or
-    vouches for it. `owner` keeps `function` loaded while the tape lives; a
-    tape does not survive an explicit unload of its owner (e.g. a
-    CachingAutotuner's release_benchmark_artifacts)."""
+    vouches for it. `owner` keeps `function` loaded while the tape lives."""
 
     def decline(why: str) -> NoReturn:
         raise declined(f"Triton kernel {name}: {why}")

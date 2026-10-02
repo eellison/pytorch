@@ -3,6 +3,7 @@
 import ctypes
 import gc
 import itertools
+import os
 import sys
 import threading
 import unittest
@@ -10,11 +11,13 @@ import weakref
 from unittest import mock
 
 import torch
+from torch.cuda import _host_trace_capture, _host_trace_replay
+from torch.cuda._host_trace import declined
 from torch.cuda._host_trace_capture import launch_images, launch_slots
-from torch.cuda._host_trace_lower_tape import LoweredMemset
+from torch.cuda._host_trace_lower_tape import LoweredMemcpy, LoweredMemset
 from torch.cuda._host_trace_memory import MemoryPlan, place, StepMemory
-from torch.cuda._host_trace_replay import _exact_class, HostTraceReplay
-from torch.cuda._host_trace_tape import argument_contract as _contract
+from torch.cuda._host_trace_replay import _exact_class
+from torch.cuda._host_trace_tape import argument_contract, EagerCall, trace
 from torch.testing._internal.common_cuda import PLATFORM_SUPPORTS_CUDNN_ATTENTION
 from torch.testing._internal.common_utils import (
     instantiate_parametrized_tests,
@@ -25,6 +28,14 @@ from torch.testing._internal.common_utils import (
     TestCase,
 )
 from torch.utils._triton import has_triton
+
+
+class HostTraceReplay(_host_trace_replay.HostTraceReplay):
+    # traces at its first call: these are tests of the trace; an entry's first
+    # call runs eagerly (test_the_first_call_runs_eagerly)
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._called = True
 
 
 if has_triton():
@@ -168,6 +179,10 @@ def scale2d(x):
     return y
 
 
+def _contract(args, global_state=False):
+    return argument_contract(args, global_state)
+
+
 class TestContract(TestCase):
     def test_contract(self):
         x = torch.randn(4, 4)
@@ -247,6 +262,21 @@ class TestHostTraceReplay(TestCase):
             self.assertEqual(f(x), x + 3)
         self.assertEqual((len(calls), f.traces), (2, 1))
 
+    def test_the_first_call_runs_eagerly(self):
+        calls = []
+
+        def fn(x):
+            calls.append(x.numel())
+            return add(x)
+
+        f = _host_trace_replay.HostTraceReplay(fn)
+        x = torch.randn(1000, device="cuda")
+        # as cudagraph trees': the first call is eager, the second traces (its
+        # warm-up is the call), the third replays
+        for expected in ((1, 0, 0, 1), (3, 1, 0, 1), (3, 1, 1, 1)):
+            self.assertEqual(f(x), x + 3)
+            self.assertEqual((len(calls), f.traces, f.replays, f.eager), expected)
+
     def test_len_compared_to_a_constant_guards_the_comparison(self):
         def fn(x):
             return x if len(x) == 0 else add(x)
@@ -300,7 +330,7 @@ class TestHostTraceReplay(TestCase):
         # the declined class runs eagerly without a trace
         self.assertEqual(f(x), x.cumsum(0))
         self.assertEqual((len(calls), f.traces, f.eager), (3, 1, 2))
-        # another class traces again, without a warm-up
+        # another class traces again, with its warm-up
         y = torch.randn(7, device="cuda")
         self.assertEqual(f(y), y.cumsum(0))
         self.assertEqual((len(calls), f.traces, f.eager), (5, 2, 3))
@@ -340,7 +370,27 @@ class TestHostTraceReplay(TestCase):
         self.assertEqual(f(h), h + 3)
         self.assertEqual(f(x, 3), x + 3)
         self.assertEqual(len(f._families), 3)
-        self.assertEqual((f.traces, f.replays), (3, 4))
+        self.assertEqual((f.traces, f.replays), (3, 2))
+
+    def test_a_branch_the_trace_takes_otherwise_declines(self):
+        # an int argument is a SymInt in the trace, which fails isinstance:
+        # the trace's operator calls are not the warm-up's
+        def fn(x, n):
+            return x * n if isinstance(n, int) else x - 1
+
+        x = torch.randn(64, device="cuda")
+        f = HostTraceReplay(fn)
+        for n in (2, 10, 2):
+            self.assertEqual(f(x, n), fn(x, n))
+        # the first decline may be a lazy initialization, and a decline is of its ints
+        self.assertEqual((f.traces, f.replays, f.eager), (3, 0, 3))
+        self.assertIn("fn's call 0 is aten.sub.Tensor", f.declines[0])
+        self.assertIn("at the warm-up aten.mul.Tensor", f.declines[0])
+        # an int the trace takes symbolically is not a new witness
+        g = HostTraceReplay(lambda x, n: x[:n] * 2)
+        for n in (2, 3, 4):
+            self.assertEqual(g(x, n), x[:n] * 2)
+        self.assertEqual((g.traces, g.replays, g.eager), (1, 2, 0))
 
     def test_result_structures(self):
         def fn(x):
@@ -544,6 +594,102 @@ class TestHostTraceReplay(TestCase):
         why = "output 0 requires grad; a replay's outputs do not"
         self.assertEqual(f.declines, [f"host_trace: {why} (declined)"])
 
+    def test_an_argument_that_requires_grad_declines_under_grad_mode(self):
+        def fn(x):
+            return torch.tanh(x) * 2
+
+        f = HostTraceReplay(fn)
+        x = torch.randn(1000, device="cuda")
+        f(x)
+        f(x)
+        xg = x.clone().requires_grad_()
+        y = f(xg)
+        self.assertTrue(y.requires_grad)
+        self.assertEqual(y, fn(xg))
+        with torch.no_grad():
+            self.assertEqual(f(xg), fn(x))
+        self.assertEqual((f.traces, f.eager), (3, 1))
+        why = "arg0 requires grad under grad mode; a replay records no autograd graph"
+        self.assertEqual(f.declines, [f"host_trace: {why} (declined)"])
+
+    def test_a_traced_tensor_fn_keeps_declines(self):
+        kept = []
+
+        def fn(x):
+            y = x * 2
+            kept.append(y)
+            return y + 1
+
+        f = HostTraceReplay(fn, check_escapes=True)
+        x = torch.randn(1000, device="cuda")
+        for _ in range(3):
+            self.assertEqual(f(x), x * 2 + 1)
+        self.assertEqual((f.traces, f.replays, f.eager), (1, 0, 3))
+        why = "fn kept a traced tensor past the trace, in a list; fn must return the tensors it makes and store none"
+        self.assertEqual(f.declines, [f"host_trace: {why} (declined)"])
+        # the trace's append is now a view of the warm-up's
+        self.assertEqual([type(t) for t in kept], [torch.Tensor] * 4)
+        self.assertEqual(kept[1].data_ptr(), kept[0].data_ptr())
+        self.assertEqual(kept[1] + 1, x * 2 + 1)
+
+    def test_a_traced_tensor_in_an_argument_object_declines(self):
+        class Cache:
+            def __init__(self):
+                self.kv = []
+
+        def fn(x, cache):
+            cache.kv.append(x.sin())
+            return cache.kv[-1] * 2
+
+        f = HostTraceReplay(fn, check_escapes=True)
+        x, cache = torch.randn(1000, device="cuda"), Cache()
+        f(x, cache)
+        self.assertEqual((f.traces, f.replays), (1, 0))
+        self.assertIn("fn kept a traced tensor past the trace", f.declines[0])
+        self.assertEqual(cache.kv[1] * 2, x.sin() * 2)
+
+    def test_a_kept_argument_is_the_argument(self):
+        kept = []
+
+        def fn(x):
+            kept.append(x)
+            return x * 2
+
+        f = HostTraceReplay(fn, check_escapes=True)
+        x = torch.randn(1000, device="cuda")
+        self.assertEqual(f(x), x * 2)
+        self.assertIn("fn kept a traced tensor past the trace", f.declines[0])
+        self.assertEqual(type(kept[1]), torch.Tensor)
+        self.assertEqual(kept[1].data_ptr(), x.data_ptr())
+
+    def test_a_cycle_fn_leaves_is_not_kept(self):
+        def fn(x):
+            y = x * 2
+            box = {"y": y}
+            box["self"] = box
+            return y + 1
+
+        f = HostTraceReplay(fn, check_escapes=True)
+        x = torch.randn(1000, device="cuda")
+        for _ in range(3):
+            self.assertEqual(f(x), x * 2 + 1)
+        self.assertEqual((f.traces, f.replays, f.eager), (1, 2, 0))
+
+    @parametrize("check_global_state", [False, True])
+    def test_first_use_initialization_in_the_warm_up_is_the_traced_state(self, check_global_state):
+        def fn(x):
+            torch.backends.cuda.enable_math_sdp(False)
+            return two_step(x)
+
+        f = HostTraceReplay(fn, check_global_state=check_global_state)
+        x = torch.randn(1000, device="cuda")
+        try:
+            for _ in range(3):
+                self.assertEqual(f(x), two_step(x))
+        finally:
+            torch.backends.cuda.enable_math_sdp(True)
+        self.assertEqual((f.traces, f.replays, f.eager), (1, 2, 0))
+
     @mock.patch("torch.cuda._host_trace.raise_unexpected", False)
     def test_errors_of_the_trace_decline(self):
         def fn(x):
@@ -587,8 +733,8 @@ class TestHostTraceReplay(TestCase):
         x = torch.randn(1000, device="cuda")
         for s in (2**64 + 10, 3, 2**64 + 10, -(2**63) - 1, 4):
             self.assertEqual(f(x, s), x + s % 7)
-        # the second trace replays; the second big int misses, a new class declines
-        self.assertEqual((f.traces, f.replays), (3, 2))
+        # the second big int misses, a new class declines, 4 replays the second trace
+        self.assertEqual((f.traces, f.replays), (3, 1))
         self.assertIn("outside int64", f.declines[0])
 
     def test_a_misaligned_allocation_runs_eagerly(self):
@@ -623,19 +769,118 @@ class TestHostTraceReplay(TestCase):
         self.assertEqual(f(x), x + 3)
         self.assertEqual(f.replays, 1)
 
+    @parametrize("op", ["pad", "pad_crop", "diag_embed", "block_diag", "unbind_copy", "slice_backward", "new_full"])
+    def test_a_composite_runs_as_its_parts(self, op):
+        # a CompositeExplicitAutograd(NonFunctional) op of no route of its own: its body's parts
+        fn = {
+            "pad": lambda x: torch.nn.functional.pad(x, (1, 2, 0, 1), value=3.0),
+            "pad_crop": lambda x: torch.nn.functional.pad(x, (-1, 2)),
+            "diag_embed": lambda x: torch.diag_embed(x),
+            "block_diag": lambda x: torch.block_diag(x, x[1:]),
+            "unbind_copy": lambda x: torch.unbind_copy(x, 1),
+            "slice_backward": lambda x: torch.ops.aten.slice_backward(x, [x.shape[0], x.shape[1] + 3], 1, 1, x.shape[1] + 1, 1),
+            "new_full": lambda x: x.new_full((2, 3), 2.5),
+        }[op]
+        f = HostTraceReplay(fn)
+        for n in (6, 6, 6, 9, 9):
+            x = torch.randn(4, n, device="cuda")
+            self.assertEqual(f(x), fn(x), atol=0, rtol=0)
+        self.assertEqual(f.declines, [])
+        self.assertGreaterEqual(f.replays, 2)
+        for v in f.variants:
+            self.assertFalse([r for _, r in v.tape.launches if isinstance(r, EagerCall)])
+
+    def test_a_composite_with_an_eager_part_is_one_eager_step(self):
+        # cat.out, stack.out's part, has no route: the parts are not split around
+        # it, and a plain eager part adds no reason
+        x, o = torch.randn(4, 6, device="cuda"), torch.empty(2, 4, 6, device="cuda")
+        tape = trace(lambda x, o: torch.stack([x, x], out=o), (x, o))
+        (call,) = [r for _, r in tape.launches]
+        self.assertIsInstance(call, EagerCall)
+        self.assertEqual(call.reason, "aten.stack.out's pointwise host declines: its tensors is not a traced tensor")
+
+    def test_an_empty_copy_keeps_its_sources_strides(self):
+        # an empty tensor is contiguous (c10), so empty_like keeps a broadcast's zero strides
+        f = HostTraceReplay(lambda t: t.to(torch.float32))
+        for n in (0, 0, 0, 5, 0, 7):
+            t = torch.ones((), dtype=torch.bfloat16, device="cuda").expand(1, n, 3)
+            out, want = f(t), t.to(torch.float32)
+            self.assertEqual((out.shape, out.stride()), (want.shape, want.stride()))
+            self.assertEqual(out, want, atol=0, rtol=0)
+        self.assertEqual(f.declines, [])
+        self.assertEqual(f.traces, 2)
+
+    @parametrize("op", ["prod", "var", "std", "var_mean", "std_mean"])
+    def test_a_zero_element_reduction_replays_as_its_outputs_fill(self, op):
+        fn = {
+            "prod": lambda t: t.prod(1),
+            "var": lambda t: t.var(1),
+            "std": lambda t: t.std(1),
+            "var_mean": lambda t: torch.var_mean(t, 1),
+            "std_mean": lambda t: torch.std_mean(t, 1),
+        }[op]
+        f = HostTraceReplay(fn)
+        for n, k in ((3, 0), (5, 0), (3, 0), (4, 2), (3, 0)):
+            t = torch.randn(n, k, device="cuda")
+            self.assertEqual(f(t), fn(t), atol=0, rtol=0, equal_nan=True)
+        self.assertEqual(f.declines, [])
+        self.assertEqual(f.traces, 2)
+        for v in f.variants:
+            self.assertFalse([r for _, r in v.tape.launches if isinstance(r, EagerCall)])
+
+    @parametrize("nbytes", [257, 4096, 64 << 20])
+    def test_a_device_copy_of_any_size_replays(self, nbytes):
+        # its capture copies within a caching-allocator block as large as the copy
+        f = HostTraceReplay(lambda x: x.clone())
+        for _ in range(3):
+            x = torch.randint(0, 256, (nbytes,), dtype=torch.uint8, device="cuda")
+            self.assertEqual(f(x), x, atol=0, rtol=0)
+        self.assertEqual((f.traces, f.replays, f.eager), (1, 2, 0))
+        self.assertEqual(f.declines, [])
+        (v,) = f.variants
+        self.assertEqual([type(lo) for lo in v.captured.lowered.launches], [LoweredMemcpy])
+
+    @parametrize("nbytes", [257, 4096, 64 << 20])
+    def test_a_device_copy_of_any_alignment_or_allocation_replays(self, nbytes):
+        from cuda.bindings import runtime
+
+        from torch.cuda._utils import _check_cuda_bindings
+
+        class Blob:
+            def __init__(self, n):
+                self.ptr = int(_check_cuda_bindings(runtime.cudaMalloc(n)))
+                self.__cuda_array_interface__ = {"shape": (n,), "typestr": "|u1", "data": (self.ptr, False), "version": 3}
+
+            def __del__(self):
+                runtime.cudaFree(self.ptr)
+
+        blobs = [Blob(nbytes + 3) for _ in range(2)]
+        f = HostTraceReplay(lambda x: x.clone())
+        srcs = [torch.empty(nbytes + 3, dtype=torch.uint8, device="cuda")[off:][:nbytes] for off in (0, 1, 3, 0)]
+        # a cudaMalloc operand after allocator ones is refused by an expandable-segments capture (DESIGN_NOTES 36)
+        if "expandable_segments:True" not in (os.environ.get("PYTORCH_CUDA_ALLOC_CONF") or ""):
+            srcs += [torch.as_tensor(b, device="cuda")[off:][:nbytes] for b, off in zip(blobs, (0, 1))]
+        for x in srcs:
+            x.copy_(torch.randint(0, 256, (nbytes,), dtype=torch.uint8, device="cuda"))
+            self.assertEqual(f(x), x, atol=0, rtol=0)
+        self.assertEqual((f.traces, f.replays, f.eager), (1, len(srcs) - 1, 0))
+        self.assertEqual(f.declines, [])
+
     def test_an_autotune_miss_retraces(self):
         def tuned(x):
             y, n = torch.empty_like(x), x.numel()
             _add_tuned[lambda meta: (triton.cdiv(n, meta["B"]),)](x, y, n, 3)
             return y
 
-        f = HostTraceReplay(tuned)
-        # the warm-up tunes 1000; 2000 declines once, and its fallback tunes it
-        for n in (1000, 2000, 2000, 2000):
+        f = _host_trace_replay.HostTraceReplay(tuned)
+        # the first call, eager, tunes its size; a later size's warm-up tunes
+        # it: the benchmark's calls are not the trace's, so that call runs
+        # eagerly and the next traces (a witness decline is retried once per
+        # class, and logged)
+        for n in (1000, 1000, 2000, 2000, 2000):
             x = torch.randn(n, device="cuda")
             self.assertEqual(f(x), x + 3)
-        self.assertEqual((f.traces, f.replays, f.eager), (3, 2, 1))
-        self.assertIn("not in the cache", f.declines[0])
+        self.assertEqual((f.traces, f.replays, f.eager, f.declines), (3, 1, 2, []))
 
     @unittest.skipIf(torch.cuda.device_count() < 2, "requires two GPUs")
     def test_a_capture_on_the_tapes_device(self):
@@ -680,6 +925,65 @@ class TestChainReplay(TestCase):
         for v in f.variants:
             self.assertEqual(len(v.captured.segments), 2)
 
+    @mock.patch("torch.cuda._host_trace.raise_unexpected", False)
+    def test_a_segment_that_fails_to_capture_runs_eagerly(self):
+        # the segment after the matmul fails at its second launch, the mul: the
+        # call traces again with the mul an eager call, and the rest replays
+        def fn(x, w):
+            return (matmul_chain(x, w) * 2).sin()
+
+        launch, calls = _host_trace_capture._launch, []
+
+        def fail_second(launches, *args):
+            calls.append(len(launches))
+            if len(calls) == 2:
+                launch(launches[:1], *args)
+                raise RuntimeError("injected")
+            return launch(launches, *args)
+
+        f = HostTraceReplay(fn)
+        w = torch.randn(16, 8, device="cuda")
+        with mock.patch.object(_host_trace_capture, "_launch", fail_second):
+            for _ in range(3):
+                x = torch.randn(1024, device="cuda")
+                self.assertEqual(f(x, w), fn(x, w), atol=0, rtol=0)
+        self.assertEqual((f.traces, f.replays, f.eager), (2, 2, 0))
+        self.assertEqual(calls, [1, 3, 1, 1, 1])
+        (v,) = f.variants
+        self.assertEqual(len(v.captured.segments), 3)
+        self.assertEqual(len(f.declines), 1)
+        self.assertIn("RuntimeError: injected", f.declines[0])
+        # the suites' strict mode raises it
+        calls.clear()
+        with mock.patch("torch.cuda._host_trace.raise_unexpected", True):
+            with mock.patch.object(_host_trace_capture, "_launch", fail_second):
+                with self.assertRaisesRegex(RuntimeError, "injected"):
+                    HostTraceReplay(fn)(x, w)
+
+    @mock.patch("torch.cuda._host_trace.raise_unexpected", True)
+    def test_a_segment_that_fails_to_verify_runs_eagerly(self):
+        # a decline is local in strict mode too; the Triton launch of the
+        # segment after the matmul runs eagerly
+        verify, calls = _host_trace_capture._verify, []
+
+        def refuse_second(*args):
+            calls.append(None)
+            if len(calls) == 2:
+                raise declined("refused")
+            return verify(*args)
+
+        f = HostTraceReplay(matmul_chain)
+        w = torch.randn(16, 8, device="cuda")
+        with mock.patch.object(_host_trace_capture, "_verify", refuse_second):
+            for _ in range(3):
+                x = torch.randn(1024, device="cuda")
+                self.assertEqual(f(x, w), matmul_chain(x, w), atol=0, rtol=0)
+        self.assertEqual((f.traces, f.replays, f.eager), (2, 2, 0))
+        (v,) = f.variants
+        self.assertEqual(len(v.captured.segments), 1)
+        self.assertEqual(len(f.declines), 1)
+        self.assertIn("the capture of _add failed: refused", f.declines[0])
+
     def test_an_inplace_eager_op(self):
         def fn(x):
             x.mul_(2)
@@ -688,7 +992,7 @@ class TestChainReplay(TestCase):
             return add(y)
 
         f = HostTraceReplay(fn)
-        for n in (1000, 1000, 3000):
+        for n in (1000, 1000, 1000, 3000):
             x = torch.randn(n, device="cuda")
             want = x.clone()
             self.assertEqual(f(x), fn(want))
@@ -748,6 +1052,36 @@ class TestChainReplay(TestCase):
             self.assertEqual(f(q, k, v), fn(q, k, v))
         self.assertEqual((f.replays, f.eager, f.declines), (2, 0, []))
 
+    @unittest.skipIf(not PLATFORM_SUPPORTS_CUDNN_ATTENTION, "requires cuDNN attention")
+    def test_cudnn_attention_of_a_shape_it_does_not_take_raises(self):
+        # a key of another head dim than the query: eager's cuDNN raises (and
+        # at a second such call in the process crashes), a replay would run it
+        def fn(q, k, v):
+            return add(torch.nn.functional.scaled_dot_product_attention(q, k, v))
+
+        f = HostTraceReplay(fn)
+        q, k, v = (torch.randn(2, 4, 64, 64, device="cuda", dtype=torch.bfloat16) for _ in range(3))
+        f(q, k, v), f(q, k, v)
+        k = torch.randn(2, 4, 64, 32, device="cuda", dtype=torch.bfloat16)
+        with self.assertRaises(RuntimeError):
+            f(q, k, v)
+        torch.cuda.synchronize()
+
+    @parametrize("symbolic", ["ir", "sympy"])
+    def test_masked_attention_picks_eagers_backend(self, symbolic):
+        # the selector's mask broadcast check reads sizes; under the trace it
+        # must decide by the hint, as eager does, not decline the fused backends
+        def fn(q, k, v, mask):
+            return add(torch.nn.functional.scaled_dot_product_attention(q, k, v, mask))
+
+        f = HostTraceReplay(fn)
+        with mock.patch("torch.cuda._host_trace.symbolic", symbolic):
+            for s in (128, 128, 256):
+                q, k, v = (torch.randn(2, 4, s, 64, device="cuda", dtype=torch.bfloat16) for _ in range(3))
+                mask = torch.randn(2, 1, s, s, device="cuda", dtype=torch.bfloat16)
+                self.assertEqual(f(q, k, v, mask), fn(q, k, v, mask), atol=0, rtol=0)
+        self.assertEqual(f.eager, 0)
+
     def test_a_view_of_an_eager_output(self):
         def fn(x):
             z = add(x).sin()
@@ -794,28 +1128,26 @@ class TestChainReplay(TestCase):
             f.declines[0],
             r"transposed_fake.default output 0 .*\(16, 1\).* at the warm-up; its fake kernel predicted .*\(1, 8\)",
         )
-        # a trace without a warm-up of a call to the op
-        self.assertIn("other metadata than its fake kernel", f.declines[1])
+        # the trace at (4, 16) warms up too
+        self.assertRegex(f.declines[1], r"output 0 .*\(16, 1\).* at the warm-up; its fake kernel predicted .*\(1, 4\)")
 
-    def test_a_fake_kernels_wrong_layout_at_a_replay_raises(self):
+    def test_a_fake_kernels_wrong_layout_at_a_later_trace_declines(self):
         def fn(x):
             return add(transposed_fake_at_4(add(x)))
 
         f = HostTraceReplay(fn)
         x = torch.randn(8, 16, device="cuda")
         self.assertEqual(f(x), x + 6)
-        # the trace at (4, 16) has no warm-up: its replay finds the disagreement
+        # the trace at (4, 16) warms up too: its warm-up finds the disagreement
         y = torch.randn(4, 16, device="cuda")
-        with self.assertRaisesRegex(
-            AssertionError,
-            r"transposed_fake_at_4.default output 0 .*\[16, 1\].*\[1, 4\]",
-        ):
-            f(y)
-        self.assertEqual(len(f.variants), 1)
+        self.assertEqual(f(y), y + 6)
         self.assertEqual(f(y), y + 6)
         self.assertEqual(f(x), x + 6)
-        self.assertEqual((f.traces, f.replays, f.eager), (3, 1, 1))
-        self.assertIn("other metadata than its fake kernel", f.declines[0])
+        self.assertEqual((f.traces, f.replays, f.eager, len(f.variants)), (2, 1, 2, 1))
+        self.assertRegex(
+            f.declines[0],
+            r"transposed_fake_at_4.default output 0 .*\(16, 1\).* at the warm-up; its fake kernel predicted .*\(1, 4\)",
+        )
 
     def test_a_traced_kernels_fake_is_not_read(self):
         # the trace follows the op's Python kernel, not its fake kernel
@@ -855,7 +1187,9 @@ class TestChainReplay(TestCase):
             z, y = f(x)
             self.assertEqual((z, y), ((x + 3).t().sin().sin().sin() + 3, x + 6))
             self.assertEqual(z.stride(), (1, 16))
-        self.assertEqual((f.traces, f.replays, f.eager), (1, 2, 0))
+        # the lazy initialization is a call the trace does not make: the first
+        # call runs eagerly and the next traces (the witness decline's retry)
+        self.assertEqual((f.traces, f.replays, f.eager, f.declines), (2, 1, 1, []))
 
 
 @unittest.skipIf(not TEST_CUDA, "requires CUDA")
@@ -1242,8 +1576,40 @@ class TestNativeReplay(TestCase):
         self.assertNotIn(None, held_images(f)[0])
         self.assertEqual((f.traces, f.replays, f.eager), (1, 2, 0))
 
-    def test_the_native_key_partitions_as_the_contract(self):
-        f = HostTraceReplay(two_step)
+    def test_memcpy_and_memset_nodes_are_set_every_replay(self):
+        # such a node holds the allocation its address was in when set, which
+        # a free and reallocation at the same address leaves stale; a kernel
+        # node's parameters are bytes, set only when they change
+        def fn(x):
+            y = x.clone()
+            return y, add(y), torch.empty_like(x).zero_()
+
+        f = HostTraceReplay(fn)
+        x = torch.randn(4096, device="cuda")
+        want = (x, x + 3, torch.zeros_like(x))
+        self.assertEqual(f(x), want)
+        # the first replay too, though its nodes hold the trace's values
+        for _ in range(3):
+            sets = torch._C._host_trace_memory_node_sets()
+            self.assertEqual(f(x), want)
+            self.assertEqual(torch._C._host_trace_memory_node_sets(), sets + 2)
+        self.assertEqual((f.traces, f.replays), (1, 3))
+        (before,) = held_images(f)
+        # the memcpy is set first, then (the kernel unchanged) the memset
+        for n, held in ((0, [None, *before[1:]]), (1, [*before[:2], None])):
+            torch._C._host_trace_fail_after_setter(n)
+            try:
+                with self.assertRaisesRegex(RuntimeError, "injected after a setter"):
+                    f(x)
+            finally:
+                torch._C._host_trace_fail_after_setter(-1)
+            self.assertEqual(held_images(f), [held])
+            self.assertEqual(f(x), want)
+        self.assertEqual((f.traces, f.eager), (1, 0))
+
+    @parametrize("check_global_state", [False, True])
+    def test_the_native_key_partitions_as_the_contract(self, check_global_state):
+        f = HostTraceReplay(two_step, check_global_state=check_global_state)
         x = torch.randn(4, 6, device="cuda")
         c = torch.randn(4, 6, device="cuda", dtype=torch.complex64)
         tensors = [x, x[:2], x.t(), x.half(), x[0], x._neg_view(), c, c.conj()]
@@ -1253,9 +1619,41 @@ class TestNativeReplay(TestCase):
         keys = []
         for grad in (True, False):
             with torch.set_grad_enabled(grad):
-                keys += [(f._native_key(a), _contract(a)) for a in cases]
+                keys += [(f._native_key(a), _contract(a, check_global_state)) for a in cases]
+        # a None key (an argument with no native kind) takes the Python path
         for (k1, c1), (k2, c2) in itertools.product(keys, keys):
-            self.assertEqual(k1 == k2, c1 == c2, msg=f"{c1} {c2}")
+            if k1 is not None and k2 is not None:
+                self.assertEqual(k1 == k2, c1 == c2, msg=f"{c1} {c2}")
+
+    @parametrize("check_global_state", [False, True])
+    def test_global_state_is_in_the_contract_on_request(self, check_global_state):
+        f = HostTraceReplay(two_step, check_global_state=check_global_state)
+        x = torch.randn(1000, device="cuda")
+        f(x)
+        f(x)
+        prior = torch.backends.cuda.matmul.fp32_precision
+        try:
+            torch.backends.cuda.matmul.fp32_precision = "ieee" if prior == "tf32" else "tf32"
+            self.assertEqual(f(x), two_step(x))
+        finally:
+            torch.backends.cuda.matmul.fp32_precision = prior
+        self.assertEqual((f.traces, f.replays), (2, 1) if check_global_state else (1, 2))
+
+    def test_grad_mode_splits_an_argument_that_requires_grad(self):
+        # autograd records the call under grad mode only: a replay traced under
+        # no_grad does not serve it (without check_global_state too)
+        def fn(x):
+            return (x * 2).sin()
+
+        f = HostTraceReplay(fn)
+        x = torch.randn(1000, device="cuda", requires_grad=True)
+        with torch.no_grad():
+            f(x)
+            f(x)
+        y = f(x)
+        self.assertIsNotNone(y.grad_fn)
+        self.assertEqual(y, fn(x))
+        self.assertEqual((f.traces, f.replays, f.eager), (2, 1, 1))
 
     def test_a_hit_runs_no_python(self):
         f = HostTraceReplay(two_step)
@@ -1339,7 +1737,9 @@ class TestNativeReplay(TestCase):
 
 
 instantiate_parametrized_tests(TestHostTraceReplay)
+instantiate_parametrized_tests(TestChainReplay)
 instantiate_parametrized_tests(TestReplayMemory)
+instantiate_parametrized_tests(TestNativeReplay)
 
 
 def setUpModule():

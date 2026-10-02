@@ -10,13 +10,13 @@ import unittest
 import sympy
 
 import torch
+from torch.cuda import _host_trace_replay
 from torch.cuda._host_trace import Declined
 from torch.cuda._host_trace_capture import capture_tape
 from torch.cuda._host_trace_launch import KernelLaunch
 from torch.cuda._host_trace_lower import Lowering
 from torch.cuda._host_trace_lower_tape import lower_tape
 from torch.cuda._host_trace_program import compile_program, IntegerProgram
-from torch.cuda._host_trace_replay import HostTraceReplay
 from torch.cuda._host_trace_tape import EagerCall, trace
 from torch.testing._internal.common_utils import (
     instantiate_parametrized_tests,
@@ -27,6 +27,15 @@ from torch.testing._internal.common_utils import (
     TestCase,
 )
 from torch.utils._triton import has_triton
+
+
+class HostTraceReplay(_host_trace_replay.HostTraceReplay):
+    # traces at its first call: these are tests of the trace; an entry's first
+    # call runs eagerly (test_the_first_call_runs_eagerly in
+    # test_cuda_host_trace_replay)
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._called = True
 
 
 HAS_TRITON = has_triton()
@@ -257,14 +266,16 @@ class TestTritonLaunch(TestCase):
         (launch,) = _launches(tape)
         self.assertEqual(launch.name, "_add")
         eager = _add[(1,)](self.x, self.x.clone(), 1000, 3, B=128)
-        self.assertIs(launch.owner, eager)
+        # the tape's own load of the kernel's module
+        self.assertIs(launch.owner, htl.owned_module(eager))
+        self.assertEqual(launch.function, launch.owner.function)
         slots = [_named(tape, v) for v in launch.slots]
         x_ptr, y_ptr = "arg0.base + 4*arg0.storage_offset()", "256*alloc0.base/256"
         self.assertEqual(slots, [x_ptr, y_ptr, "arg1", "arg2", "0", "0"])
         grid = [_named(tape, v) for v in launch.grid]
         self.assertEqual(grid, ["((arg1 + 127)//128)", "1", "1"])
         self.assertEqual(launch.block, (launch.abi.num_warps * 32, 1, 1))
-        self.assertEqual(launch.smem, launch.owner.metadata.shared)
+        self.assertEqual(launch.smem, eager.metadata.shared)
         self.assertEqual(len(launch.layout), launch.abi.num_slots)
         self.assertEqual([r.name for r in launch.roots], ["p0", "a0"])
         # the output reads the kernel's result
@@ -293,13 +304,13 @@ class TestTritonLaunch(TestCase):
     def test_integer_specializations_flip(self):
         def signature(s):
             (launch,) = _launches(trace(_add_call(_add), (self.x, 1000, s)))
-            src = launch.owner.src
-            return src.signature["s"], src.attrs.get((3,), [])
+            (arg,) = [a for a in launch.abi.args if a.name == "s"]
+            return arg.triton_type, arg.divisibility
 
-        self.assertEqual(signature(1), ("constexpr", []))
-        self.assertEqual(signature(32), ("i32", [["tt.divisibility", 16]]))
-        self.assertEqual(signature(33), ("i32", []))
-        self.assertEqual(signature(2**31 + 16), ("i64", [["tt.divisibility", 16]]))
+        self.assertEqual(signature(1), ("constexpr", 1))
+        self.assertEqual(signature(32), ("i32", 16))
+        self.assertEqual(signature(33), ("i32", 1))
+        self.assertEqual(signature(2**31 + 16), ("i64", 16))
 
     def test_pointer_axes(self):
         base = torch.randn(4096, device="cuda")
@@ -385,7 +396,7 @@ class TestTritonLaunch(TestCase):
                 want = torch.nn.functional.layer_norm(x, (N,), w, b, eps)
                 self.assertEqual(f(x, w, b, eps), want, atol=1e-4, rtol=1e-4)
         # one trace per eps: num_warps is a function of N's power of two
-        self.assertEqual((f.traces, f.replays, f.declines), (2, 7, []))
+        self.assertEqual((f.traces, f.replays, f.declines), (2, 6, []))
 
     def test_dropout_with_float_p(self):
         f = HostTraceReplay(_dropout_call)
@@ -417,7 +428,9 @@ class TestTritonLaunch(TestCase):
 
     def test_autotune_multi_config(self):
         f = _tuned_call(_add_tuned2)
-        tape = trace(f, (self.x, 1000, 3))  # the warm-up autotunes
+        # the autotuner's benchmark (its scratch) at a warm-up is not the trace's
+        f(self.x, 1000, 3)
+        tape = trace(f, (self.x, 1000, 3))
         (launch,) = _launches(tape)
         config = _add_tuned2.cache[(1000, "torch.float32", "torch.float32")]
         self.assertEqual(launch.abi.args[4].constant, config.kwargs["B"])
@@ -430,7 +443,7 @@ class TestTritonLaunch(TestCase):
         r = HostTraceReplay(f)
         for n in (1000, 2000, 1000, 2000):
             self.assertEqual(r(self.x, n, 3)[:n], self.x[:n] + 3)
-        self.assertEqual((r.traces, r.replays, r.declines), (2, 3, []))
+        self.assertEqual((r.traces, r.replays, r.declines), (2, 2, []))
 
     def test_warmup_call_records_no_launch(self):
         compiled = []

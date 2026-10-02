@@ -140,6 +140,19 @@ void round_kernel_cuda(TensorIteratorBase& iter) {
       });
 }
 
+template <typename scalar_t>
+struct RoundDecimalsFunctor {
+  scalar_t ten_pow_decimals;
+  bool neg_flag;
+  __device__ scalar_t operator()(scalar_t a) const {
+    return neg_flag ? std::nearbyint(a / ten_pow_decimals) * ten_pow_decimals
+                    : std::nearbyint(a * ten_pow_decimals) / ten_pow_decimals;
+  }
+  auto host_trace_fields() const {
+    return std::tie(ten_pow_decimals, neg_flag);
+  }
+};
+
 void round_decimals_kernel_cuda(TensorIteratorBase& iter, int64_t decimals) {
   AT_DISPATCH_FLOATING_TYPES_AND2(
       ScalarType::Half, ScalarType::BFloat16,
@@ -152,10 +165,7 @@ void round_decimals_kernel_cuda(TensorIteratorBase& iter, int64_t decimals) {
           neg_flag = true;
         }
         ten_pow_decimals = static_cast<scalar_t>(std::pow(10, decimals));
-        gpu_kernel(iter, [ten_pow_decimals, neg_flag]GPU_LAMBDA(scalar_t a) -> scalar_t {
-          return neg_flag ? std::nearbyint(a / ten_pow_decimals) * ten_pow_decimals
-                          : std::nearbyint(a * ten_pow_decimals) / ten_pow_decimals;
-        });
+        gpu_kernel(iter, RoundDecimalsFunctor<scalar_t>{ten_pow_decimals, neg_flag});
       });
 }
 

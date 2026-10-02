@@ -731,7 +731,10 @@ def _describe(
             if size != 128:
                 raise _Undescribed(f"a TMA descriptor parameter of {size} bytes")
             tma.append((index, param))
-            padding.append((index, 64, 128))  # the driver's encode owns these
+            # the DSL's inline encode writes the first 64 bytes and leaves
+            # these as it found them (host stack bytes); a replay launches
+            # the driver's encode's, as every CUDA C++ TMA kernel does
+            padding.append((index, 64, 128))
         elif any(_pin(x) != 0 for x in param.zeros):
             raise _Undescribed("an MMA atom's state is not all zeros")
         offset = 0

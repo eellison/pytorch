@@ -1666,16 +1666,17 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, c10::SymInt, c10::SymInt> _efficient_
   const bool use_dropout = std::fpclassify(dropout_p) != FP_ZERO;
 
   // Note [Seed and Offset Device]
-  // The seed and offset are single element tensors on the device, captured or not, as flash's rng_state
-  // is and as the meta kernel says. During graph capture the kernel writes them (the pointers act as
-  // scratch space for storing the RNG state for the backwards pass); otherwise they are filled with
-  // the generator's values. The backwards pass constructs a PhiloxState with the pointers of device
-  // tensors and with the values of host tensors.
+  // If we are currently in graph capture mode, we need to create the seed and offset tensors on the device.
+  // This is necessary for CUDA graph-safe random number generation, which requires the seed and offset tensors
+  // to be single element tensors on device. During graph capture, when the seed and offset tensors are passed
+  // the pointers act as scratch space for storing the RNG state for the backwards pass.
+  // When calling backwards, we either construct a PhiloxState with the pointers or the actual values.
   // For more information on CUDA graph-safe RNG states, see Note [CUDA Graph-safe RNG states].
 
   at::PhiloxCudaState philox_state;
   const bool in_capture_stream =
       at::cuda::currentStreamCaptureStatus() != at::cuda::CaptureStatus::None;
+  auto device = in_capture_stream ? at::kCUDA : at::kCPU;
   if (use_dropout) {
     auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
         std::nullopt, at::cuda::detail::getDefaultCUDAGenerator());
@@ -1688,11 +1689,15 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, c10::SymInt, c10::SymInt> _efficient_
 
     if (in_capture_stream) {
       // The seed and offset will be populated by the kernel
-      seed_t = at::empty({}, query.options().dtype(at::kLong));
-      offset_t = at::empty({}, query.options().dtype(at::kLong));
+      seed_t = at::empty({}, at::dtype(at::kLong).device(device));
+      offset_t = at::empty({}, at::dtype(at::kLong).device(device));
     } else {
       auto [seed, offset] = at::cuda::philox::unpack(philox_state);
-      const auto options = query.options().dtype(at::kLong);
+#ifdef USE_ROCM
+      const auto options = at::dtype(at::kLong).device(at::kCUDA);
+#else
+      const auto options = at::dtype(at::kLong);
+#endif
       seed_t = at::scalar_tensor(at::Scalar(static_cast<int64_t>(seed)), options);
       offset_t = at::scalar_tensor(at::Scalar(static_cast<int64_t>(offset)), options);
     }

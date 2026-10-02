@@ -229,7 +229,7 @@ class TestCaptureTape(TestCase):
         values = lowered.evaluate(lowered.tape.args)
         nodes, y = [c.node for c in captured.launches], buffers[0].data_ptr()
         with self.assertRaisesRegex(Declined, "has launch attributes"):
-            _verify(graph, nodes, lowered.launches, values, [y])
+            _verify(graph, nodes, lowered.launches, values, [y], 0)
 
     def test_no_launches(self):
         lowered = lower_tape(trace(lambda x: torch.empty_like(x), (torch.randn(4, device="cuda"),)))
@@ -265,9 +265,9 @@ class TestCaptureTape(TestCase):
         graph = captured.segments[0].graph.raw_cuda_graph()
         launches, y = lowered.launches, buffers[0].data_ptr()
         with self.assertRaisesRegex(Declined, "holds other bytes in slot 1"):
-            _verify(graph, nodes, launches, values, [y + 4])
+            _verify(graph, nodes, launches, values, [y + 4], 0)
         with self.assertRaisesRegex(Declined, "nodes the tape did not launch"):
-            _verify(graph, [], launches, values, [y])
+            _verify(graph, [], launches, values, [y], 0)
 
 
 @unittest.skipIf(not TEST_CUDA or not has_triton(), "requires CUDA and Triton")

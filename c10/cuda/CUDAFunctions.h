@@ -12,6 +12,9 @@
 #include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAMacros.h>
 #include <cuda_runtime_api.h>
+
+#include <atomic>
+
 namespace c10::cuda {
 
 // NB: In the past, we were inconsistent about whether or not this reported
@@ -129,10 +132,22 @@ C10_CUDA_API void __inline__ stream_synchronize(cudaStream_t stream) {
 C10_CUDA_API bool hasPrimaryContext(DeviceIndex device_index);
 C10_CUDA_API std::optional<DeviceIndex> getDeviceIndexWithPrimaryContext();
 
+namespace detail {
+// the threads harvesting, so that a launch on no such thread reads no
+// thread-local
+extern C10_CUDA_API std::atomic<int> host_trace_harvesting_threads;
+C10_CUDA_API bool isHostTraceHarvestingThread();
+} // namespace detail
+
 // Set on a thread while the host-trace harvest captures an op there: kernel
 // parameter structs that leave unused bytes uninitialized zero them first,
 // so that every byte of a launch's parameters is the same in each capture
-C10_CUDA_API bool isHostTraceHarvesting();
+inline bool isHostTraceHarvesting() {
+  return C10_UNLIKELY(
+             detail::host_trace_harvesting_threads.load(
+                 std::memory_order_relaxed) != 0) &&
+      detail::isHostTraceHarvestingThread();
+}
 C10_CUDA_API void setHostTraceHarvesting(bool enabled);
 
 } // namespace c10::cuda

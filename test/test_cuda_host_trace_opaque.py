@@ -6,6 +6,7 @@ import unittest
 from unittest import mock
 
 import torch
+from torch.cuda import _host_trace_replay
 from torch.cuda._host_trace_harvest import _launch, HarvestProvider
 from torch.cuda._host_trace_launch import KernelLaunch
 from torch.cuda._host_trace_lower_tape import (
@@ -21,7 +22,6 @@ from torch.cuda._host_trace_opaque import (
     OpaqueMemset,
     Slot,
 )
-from torch.cuda._host_trace_replay import HostTraceReplay
 from torch.cuda._host_trace_memory import plan_memory, split_runs
 from torch.cuda._host_trace_tape import bind_opaque, EagerCall, Memset, OpaqueCall, trace
 from torch.cuda._host_trace_triton import param_layout, triton_abi
@@ -34,6 +34,15 @@ from torch.testing._internal.common_utils import (
     TestCase,
 )
 from torch.utils._triton import has_triton
+
+
+class HostTraceReplay(_host_trace_replay.HostTraceReplay):
+    # traces at its first call: these are tests of the trace; an entry's first
+    # call runs eagerly (test_the_first_call_runs_eagerly in
+    # test_cuda_host_trace_replay)
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._called = True
 
 
 aten = torch.ops.aten
@@ -455,7 +464,8 @@ class TestOpaqueCalls(TestCase):
         calls = {str(rec.target): rec for rec in eager}
         self.assertFalse(any(isinstance(c, OpaqueCall) for c in calls.values()))
         self.assertEqual(calls["aten.mm.default"].reason, "TableProvider: float32 only")
-        self.assertEqual(calls["aten.mv.default"].reason, "TableProvider: aten.mv.default is not in its table")
+        mv = "TableProvider: aten.mv.default is not in its table; aten.mv.default's body declines: host_trace: its part aten.addmv_.default runs eagerly (TableProvider: aten.addmv_.default is not in its table) (declined)"  # noqa: B950
+        self.assertEqual(calls["aten.mv.default"].reason, mv)
         self.assertEqual(lower_tape(tape).opaque, {})
         plain = trace(fn, args)
         calls = [rec for _, rec in plain.launches if isinstance(rec, EagerCall)]
@@ -616,12 +626,14 @@ class TestOpaqueCalls(TestCase):
             kinds = {type(lo).__name__ for lo in v.captured.lowered.launches}
             self.assertEqual("LoweredMemset" in kinds, style == "scratch")
 
-    def test_binding_switches(self):
-        # bindings of both topologies, and two alignments of y, alternate
+    @parametrize("first", [512, 640])
+    def test_binding_switches(self, first):
+        # bindings of both topologies, and two alignments of y, alternate; the
+        # first call's topology is the segment's, the other a piece of a clone
         p = TableProvider(style="mixed")
         f = HostTraceReplay(mul_chain, opaque=(p,))
         base = torch.randn(4096, device="cuda")
-        cases = [(512, 0), (640, 0), (512, 4), (640, 4)]
+        cases = [(first, 0), (1152 - first, 0), (first, 4), (1152 - first, 4)]
         for _ in range(3):
             for n, offset in cases:
                 f(torch.randn(n, device="cuda"), base[offset : offset + n])
@@ -630,10 +642,14 @@ class TestOpaqueCalls(TestCase):
         self.assertEqual(len(bound(f)), 1)
         traces, replays = f.traces, f.replays
         for i in range(24):
-            n, offset = cases[i % len(cases)]
+            # a form each call, then each form twice
+            n, offset = cases[i % 4 if i < 12 else i // 2 % 4]
             x, y = torch.randn(n, device="cuda"), base[offset : offset + n]
             base.normal_()
+            sets = torch._C._host_trace_memory_node_sets()
             self.assertEqual(f(x, y), mul_chain(x, y), atol=0, rtol=0)
+            # the scratch binding's memset node is set every replay, in either form
+            self.assertEqual(torch._C._host_trace_memory_node_sets() - sets, int(n % 256 == 0))
         self.assertEqual((f.traces, f.replays), (traces, replays + 24))
 
     def test_bound_key_relowers(self):

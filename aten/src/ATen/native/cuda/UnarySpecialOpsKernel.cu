@@ -194,6 +194,20 @@ void sinc_kernel_cuda(TensorIteratorBase& iter) {
   #endif
 }
 
+template <typename scalar_t, typename T_ACC>
+struct LogitFunctor {
+  T_ACC lo;
+  T_ACC hi;
+  __device__ scalar_t operator()(scalar_t x) const {
+    const T_ACC x_acc = static_cast<T_ACC>(x);
+    T_ACC z = x_acc < lo ? lo : (x_acc > hi ? hi : x_acc);
+    return c10::cuda::compat::log(z / (T_ACC(1) - z));
+  }
+  auto host_trace_fields() const {
+    return std::tie(lo, hi);
+  }
+};
+
 void logit_kernel_cuda(TensorIteratorBase& iter, const Scalar& eps_scalar) {
   AT_DISPATCH_FLOATING_TYPES_AND2(
       at::ScalarType::Half,
@@ -211,12 +225,7 @@ void logit_kernel_cuda(TensorIteratorBase& iter, const Scalar& eps_scalar) {
         } else {
           const T_ACC lo = eps;
           const T_ACC hi = T_ACC(1) - eps;
-          gpu_kernel(
-              iter, [lo, hi] GPU_LAMBDA(scalar_t x) -> scalar_t {
-                const T_ACC x_acc = static_cast<T_ACC>(x);
-                T_ACC z = x_acc < lo ? lo : (x_acc > hi ? hi : x_acc);
-                return c10::cuda::compat::log(z / (T_ACC(1) - z));
-              });
+          gpu_kernel(iter, LogitFunctor<scalar_t, T_ACC>{lo, hi});
         }
       });
 }
@@ -318,6 +327,21 @@ void erfcx_kernel_cuda(TensorIteratorBase& iter) {
   #endif
 }
 
+template <typename scalar_t, typename opmath_t>
+struct KaiserWindowFunctor {
+  opmath_t inv_alpha;
+  opmath_t beta;
+  opmath_t inv_i0_beta;
+  __device__ scalar_t operator()(scalar_t a) const {
+    opmath_t x = static_cast<opmath_t>(a) * inv_alpha - 1;
+    opmath_t y = std::max<opmath_t>(0, 1 - x * x);
+    return calc_i0(beta * ::sqrt(y)) * inv_i0_beta;
+  }
+  auto host_trace_fields() const {
+    return std::tie(inv_alpha, beta, inv_i0_beta);
+  }
+};
+
 constexpr char kaiser_window_name[] = "kaiser_window";
 void kaiser_window_kernel_cuda(TensorIteratorBase& iter, int64_t window_length, double beta_){
   #if AT_USE_JITERATOR()
@@ -343,11 +367,7 @@ void kaiser_window_kernel_cuda(TensorIteratorBase& iter, int64_t window_length, 
       const opmath_t inv_alpha = static_cast<opmath_t>(2.0 / (window_length - 1));
       const opmath_t beta = static_cast<opmath_t>(beta_);
       const opmath_t inv_i0_beta = 1.0 / calc_i0(beta);
-      gpu_kernel(iter, [=]GPU_LAMBDA(scalar_t a) -> scalar_t {
-        opmath_t x = static_cast<opmath_t>(a) * inv_alpha - 1;
-        opmath_t y = std::max<opmath_t>(0, 1 - x * x);
-        return calc_i0(beta * ::sqrt(y)) * inv_i0_beta;
-      });
+      gpu_kernel(iter, KaiserWindowFunctor<scalar_t, opmath_t>{inv_alpha, beta, inv_i0_beta});
     });
   #endif
 }
@@ -368,7 +388,7 @@ void entr_kernel_cuda(TensorIteratorBase& iter) {
         iter.common_dtype(),
         "entr_cuda",
         [&]() {
-          gpu_kernel(iter, [=] GPU_LAMBDA(scalar_t x) -> scalar_t {
+          gpu_kernel(iter, [] GPU_LAMBDA(scalar_t x) -> scalar_t {
             if (at::_isnan(x)) {
               return x;
             } else if (x > 0) {

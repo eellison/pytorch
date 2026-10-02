@@ -19,6 +19,9 @@ struct FillFunctor {
   __device__ __forceinline__ scalar_t operator() () const {
     return value;
   }
+  auto host_trace_fields() const {
+    return std::tie(value);
+  }
   private:
     scalar_t value;
 };

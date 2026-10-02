@@ -134,13 +134,13 @@ void initHostTraceAtenBindings(py::module& m) {
     PyRecorder rec;
     return traced(rec, ht::amin(rec, self, dims, keepdim));
   }));
-  m.def("_cuda_hostTraceMaxAll", torch::wrap_pybind_function([](const at::Tensor& self) {
+  m.def("_cuda_hostTraceMaxAll", torch::wrap_pybind_function([](const at::Tensor& self, const std::optional<at::Tensor>& out) {
     PyRecorder rec;
-    return traced(rec, ht::max_all(rec, self));
+    return traced(rec, ht::max_all(rec, self, out.value_or(at::Tensor())));
   }));
-  m.def("_cuda_hostTraceMinAll", torch::wrap_pybind_function([](const at::Tensor& self) {
+  m.def("_cuda_hostTraceMinAll", torch::wrap_pybind_function([](const at::Tensor& self, const std::optional<at::Tensor>& out) {
     PyRecorder rec;
-    return traced(rec, ht::min_all(rec, self));
+    return traced(rec, ht::min_all(rec, self, out.value_or(at::Tensor())));
   }));
   m.def("_cuda_hostTraceMaxDim", torch::wrap_pybind_function([](const at::Tensor& self, int64_t dim, bool keepdim) {
     PyRecorder rec;
@@ -182,8 +182,10 @@ void initHostTraceAtenBindings(py::module& m) {
     PyRecorder rec;
     return traced(rec, ht::fused_rms_norm(rec, input, normalized_ndim, weight.value_or(at::Tensor()), eps));
   }));
-  // node: the witness capture's kernel node (function, parameter offsets and images)
-  m.def("_cuda_hostTracePointwise", torch::wrap_pybind_function([](const std::vector<std::optional<at::Tensor>>& outs, const std::vector<at::ScalarType>& out_dtypes, const std::vector<at::Tensor>& inputs, std::optional<at::ScalarType> compute_dtype, const std::string& name, uintptr_t function, const std::vector<size_t>& offsets, const std::vector<py::bytes>& images) {
+  // node: the witness capture's kernel node (function, parameter offsets and
+  // images); addresses: its functor's operand addresses (parameter, offset,
+  // operand, offset into the operand)
+  m.def("_cuda_hostTracePointwise", torch::wrap_pybind_function([](const std::vector<std::optional<at::Tensor>>& outs, const std::vector<at::ScalarType>& out_dtypes, const std::vector<at::Tensor>& inputs, std::optional<at::ScalarType> compute_dtype, bool dynamic, const std::string& name, uintptr_t function, const std::vector<size_t>& offsets, const std::vector<py::bytes>& images, const std::vector<std::tuple<size_t, size_t, at::Tensor, int64_t>>& addresses) {
     PyRecorder rec;
     ht::KernelRecord node;
     node.function = reinterpret_cast<cudaFunction_t>(function);
@@ -192,21 +194,25 @@ void initHostTraceAtenBindings(py::module& m) {
       const auto s = static_cast<std::string_view>(image);
       node.params.emplace_back(s.begin(), s.end());
     }
+    for (const auto& [param, offset, operand, delta] : addresses) {
+      node.fields.push_back({param, offset, sizeof(void*), rec.data_ptr(operand) + delta, true});
+    }
     const std::vector<at::TensorBase> operands(inputs.begin(), inputs.end());
     std::vector<at::TensorBase> targets;
     for (const auto& out : outs) {
       targets.push_back(out.value_or(at::Tensor()));
     }
-    const auto results = ht::pointwise(rec, targets, out_dtypes, operands, compute_dtype.value_or(at::ScalarType::Undefined), name, std::move(node));
+    const auto results = ht::pointwise(rec, targets, out_dtypes, operands, compute_dtype.value_or(at::ScalarType::Undefined), dynamic, name, std::move(node));
     return py::make_tuple(std::vector<at::Tensor>(results.begin(), results.end()), records(rec));
   }));
   m.def("_cuda_hostTraceIndexSelect", torch::wrap_pybind_function([](const at::Tensor& self, int64_t dim, const at::Tensor& index) {
     PyRecorder rec;
     return traced(rec, ht::index_select(rec, self, dim, index));
   }));
-  m.def("_cuda_hostTraceArange", torch::wrap_pybind_function([](const c10::SymInt& size, const c10::SymInt& start, const c10::SymInt& step, at::ScalarType dtype, at::Device device) {
+  m.def("_cuda_hostTraceArange", torch::wrap_pybind_function([](const c10::SymInt& size, const std::variant<c10::SymInt, double>& start, const std::variant<c10::SymInt, double>& step, at::ScalarType dtype, at::Device device) {
     PyRecorder rec;
-    return traced(rec, ht::arange(rec, size, start, step, dtype, device));
+    const auto scalar = [](const std::variant<c10::SymInt, double>& v) { return std::visit([](const auto& x) { return c10::Scalar(x); }, v); };
+    return traced(rec, ht::arange(rec, size, scalar(start), scalar(step), dtype, device));
   }));
   m.def("_cuda_hostTraceTriu", torch::wrap_pybind_function([](const at::Tensor& self, int64_t k) {
     PyRecorder rec;

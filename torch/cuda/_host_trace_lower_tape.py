@@ -583,6 +583,17 @@ def lower_tape(tape: Tape, *, direct: bool = True) -> LoweredTape:
             predicate = lo.lowering.conjunction([guards[i] for i in op.guards], addresses)
             nodes = tuple(index[id(rec)] for _, rec in tape.launches[op.launches.start : op.launches.stop] if id(rec) in index)
             selectors.append(LoweredSelector(k, predicate, nodes))
+    # a memcpy node's bytes lie in its allocations' own (an argument's or eager
+    # output's are the tensors eager's copy_ reads and writes)
+    zero = lo.emit("constant", 0)
+    for m in launches:
+        for slot in m.slots if isinstance(m, LoweredMemcpy) else ():
+            if slot.root[0] == "allocation":
+                end = lo.emit("add", slot.displacement, m.nbytes)
+                fits = lo.emit("and", lo.emit("ge", slot.displacement, zero), lo.emit("le", end, allocations[slot.root[1]].nbytes))
+                if lo.program.values[fits] != 1:
+                    raise declined(f"{m.launch.name}: a memcpy past the end of allocation {slot.root[1]}")
+                lo.requirements.append(fits)
     for row in lo.requirements:
         valid = lo.emit("and", valid, row)
     if lo.program.values[valid] != 1:
@@ -747,8 +758,8 @@ def fold(
         records = [rec for _, rec in tape.launches[op.launches.start : op.launches.stop] if not isinstance(rec, EagerCall)]
         launches = []
         for n, rec in zip(selector.nodes, records, strict=True):
-            if isinstance(rec, KernelLaunch) and (rec.rng or rec.rng_increment or rec.descriptors):
-                raise FoldRefused(f"an RNG or TMA launch in {op.func}")
+            if isinstance(rec, KernelLaunch) and (rec.rng or rec.rng_increment or rec.descriptors or rec.cpu_scalars):
+                raise FoldRefused(f"an RNG, TMA or CPU scalar launch in {op.func}")
             if any(roles.get(id(r)) not in by_role for r in rec.roots):
                 raise FoldRefused(f"a launch in {op.func} of a root of no role")
             owned = tuple(by_role[roles[id(r)]] for r in rec.roots)

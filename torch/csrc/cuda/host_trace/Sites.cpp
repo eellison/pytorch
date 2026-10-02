@@ -296,6 +296,8 @@ void HostTraceVariant::add_entry(
     TORCH_CHECK_VALUE(
         n[7].cast<py::tuple>().empty(), "an entry's TMA descriptor");
     parse_rng(k, segments_[s.segment], n[8], n[9]);
+    TORCH_CHECK_VALUE(
+        n[10].cast<py::tuple>().empty(), "an entry's CPU scalar");
   }
   e->held = e->image;
   for (size_t i = 0; i < t.size(); ++i) {

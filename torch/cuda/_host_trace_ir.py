@@ -1027,6 +1027,8 @@ class Env:
 
     # a key built from sizes (a compile cache's) is a specialization
     hash_symints_by_value = True
+    # a static read decides as eager's concrete value does (_TraceShapeEnv's)
+    static_reads_guard = True
     # what torch's helpers ask of a shape env
     _translation_validation_enabled = False
     _replacements_version_counter = 0
@@ -1541,15 +1543,13 @@ class IRSymNode:
         return float(self.env.guard_value(self.node))
 
     expect_true = guard_bool
+    statically_known_true = guard_bool
     guard_size_oblivious = guard_bool
     guard_or_false = guard_bool
     guard_or_true = guard_bool
 
     def expect_size(self, file: Any = "", line: Any = 0) -> bool:
         return self.ge(self.wrap_int(0)).guard_bool()
-
-    def statically_known_true(self, file: Any = "", line: Any = 0) -> bool:
-        return self.node.op == "true"
 
     def bool_(self) -> bool:
         return self.env.guard_bool(self.node, self.written)

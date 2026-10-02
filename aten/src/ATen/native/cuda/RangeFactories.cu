@@ -299,22 +299,23 @@ Tensor& arange_cuda_out(const Scalar& start, const Scalar& end, const Scalar& st
 // Traced host (ATen/cuda/host_trace/Ops.h)
 namespace at::cuda::host_trace {
 
-TensorBase arange(Recorder& rec, const c10::SymInt& size, const c10::SymInt& start, const c10::SymInt& step, ScalarType dtype, Device device) {
+TensorBase arange(Recorder& rec, const c10::SymInt& size, const Scalar& start, const Scalar& step, ScalarType dtype, Device device) {
   const TensorBase result = at::empty_symint({size}, at::TensorOptions().dtype(dtype).device(device));
   AT_DISPATCH_ALL_TYPES_AND2(kHalf, kBFloat16, dtype, "arange_cuda", [&] {
     using accscalar_t = at::acc_type<scalar_t, true>;
     using F = ArangeFunctor<scalar_t, accscalar_t>;
     Param<F> f;
     if constexpr (std::is_integral_v<accscalar_t>) {
-      f.set(f.value().xstart, start);
-      f.set(f.value().xstep, step);
+      if (!start.isIntegral(false) || !step.isIntegral(false)) {
+        decline("an integral arange of a floating start or step");
+      }
+      f.set(f.value().xstart, start.toSymInt());
+      f.set(f.value().xstep, step.toSymInt());
     } else {
-      const auto xstart = start.maybe_as_int();
-      const auto xstep = step.maybe_as_int();
-      if (!xstart || !xstep) {
+      if (start.isSymbolic() || step.isSymbolic()) {
         decline("a floating arange of a symbolic start or step");
       }
-      f = Param<F>(F{static_cast<accscalar_t>(*xstart), static_cast<accscalar_t>(*xstep)});
+      f = Param<F>(F{start.to<accscalar_t>(), step.to<accscalar_t>()});
     }
     // gpu_kernel_with_index's launch (keep in sync)
     if (size == 0) {

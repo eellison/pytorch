@@ -42,7 +42,7 @@ from torch.cuda._host_trace_tape import (
     TrustedInputs,
 )
 from torch.cuda._host_trace_triton import triton_abi
-from torch.cuda._host_trace_triton_launch import record_launch
+from torch.cuda._host_trace_triton_launch import owned_module, record_launch
 from torch.utils._debug_mode import get_active_debug_mode
 
 
@@ -451,6 +451,11 @@ class _InductorKernel:
             decline(f"{type(result).__name__} is not traced")
         if function is None:
             decline("the kernel is not loaded on the trace's device")
+        owner: Any = result
+        if type(result) is TritonCompileResult:
+            # the tape's own load (a static launcher keeps no cubin to load)
+            owner = owned_module(kernel)
+            function = owner.function
         abi = triton_abi(src, metadata)
 
         launcher = launchers[0]
@@ -488,7 +493,7 @@ class _InductorKernel:
             if type(extent) not in (int, torch.SymInt):
                 decline(f"grid axis {axis} is a {type(extent).__name__}")
         gx, gy, gz = dims
-        record_launch(tr, name, int(function), result, abi, values, (gx, gy, gz))
+        record_launch(tr, name, int(function), owner, abi, values, (gx, gy, gz))
 
 
 class _InductorMultiKernel:

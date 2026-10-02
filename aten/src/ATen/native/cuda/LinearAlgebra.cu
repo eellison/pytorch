@@ -15,6 +15,52 @@ namespace at::native {
 
 namespace {
 
+template <typename scalar_t>
+struct AddrBoolBetaFalseFunctor {
+  scalar_t alpha_val;
+  __device__ scalar_t operator()(scalar_t self_val, scalar_t vec1_val, scalar_t vec2_val) const {
+    return alpha_val && vec1_val && vec2_val;
+  }
+  auto host_trace_fields() const {
+    return std::tie(alpha_val);
+  }
+};
+
+template <typename scalar_t>
+struct AddrBoolFunctor {
+  scalar_t beta_val;
+  scalar_t alpha_val;
+  __device__ scalar_t operator()(scalar_t self_val, scalar_t vec1_val, scalar_t vec2_val) const {
+    return (beta_val && self_val) || (alpha_val && vec1_val && vec2_val);
+  }
+  auto host_trace_fields() const {
+    return std::tie(beta_val, alpha_val);
+  }
+};
+
+template <typename scalar_t>
+struct AddrBetaZeroFunctor {
+  scalar_t alpha_val;
+  __device__ scalar_t operator()(scalar_t self_val, scalar_t vec1_val, scalar_t vec2_val) const {
+    return alpha_val * vec1_val * vec2_val;
+  }
+  auto host_trace_fields() const {
+    return std::tie(alpha_val);
+  }
+};
+
+template <typename scalar_t>
+struct AddrFunctor {
+  scalar_t beta_val;
+  scalar_t alpha_val;
+  __device__ scalar_t operator()(scalar_t self_val, scalar_t vec1_val, scalar_t vec2_val) const {
+    return beta_val * self_val + alpha_val * vec1_val * vec2_val;
+  }
+  auto host_trace_fields() const {
+    return std::tie(beta_val, alpha_val);
+  }
+};
+
 void addr_kernel_cuda(TensorIterator &iter, const Scalar& beta, const Scalar& alpha) {
   if (iter.dtype() == ScalarType::Bool) {
     using scalar_t = bool;
@@ -24,21 +70,9 @@ void addr_kernel_cuda(TensorIterator &iter, const Scalar& beta, const Scalar& al
     // when beta is false, values in self should be ignored,
     // nans and infs in self should not propagate.
     if (beta_val == false) {
-      gpu_kernel(
-        iter,
-        [=] GPU_LAMBDA (scalar_t self_val,
-                        scalar_t vec1_val, scalar_t vec2_val) -> scalar_t {
-          return alpha_val && vec1_val && vec2_val;
-        }
-      );
+      gpu_kernel(iter, AddrBoolBetaFalseFunctor<scalar_t>{alpha_val});
     } else {
-      gpu_kernel(
-        iter,
-        [=] GPU_LAMBDA (scalar_t self_val,
-                        scalar_t vec1_val, scalar_t vec2_val) -> scalar_t {
-          return (beta_val && self_val) || (alpha_val && vec1_val && vec2_val);
-        }
-      );
+      gpu_kernel(iter, AddrBoolFunctor<scalar_t>{beta_val, alpha_val});
     }
     return;
   }
@@ -52,21 +86,9 @@ void addr_kernel_cuda(TensorIterator &iter, const Scalar& beta, const Scalar& al
     // when beta==0, values in self should be ignored,
     // nans and infs in self should not propagate.
     if (beta_val == zero_val) {
-      gpu_kernel(
-        iter,
-        [=] GPU_LAMBDA (scalar_t self_val,
-                        scalar_t vec1_val, scalar_t vec2_val) -> scalar_t {
-          return alpha_val * vec1_val * vec2_val;
-        }
-      );
+      gpu_kernel(iter, AddrBetaZeroFunctor<scalar_t>{alpha_val});
     } else {
-      gpu_kernel(
-        iter,
-        [=] GPU_LAMBDA (scalar_t self_val,
-                        scalar_t vec1_val, scalar_t vec2_val) -> scalar_t {
-          return beta_val * self_val + alpha_val * vec1_val * vec2_val;
-        }
-      );
+      gpu_kernel(iter, AddrFunctor<scalar_t>{beta_val, alpha_val});
     }
   });
 }

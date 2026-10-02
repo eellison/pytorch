@@ -21,6 +21,7 @@ C10_DIAGNOSTIC_POP()
 
 #include <c10/cuda/CUDACachingAllocator.h>
 #include <c10/cuda/CUDAException.h>
+#include <c10/cuda/CUDAHostTraceOwners.h>
 #include <c10/util/env.h>
 
 #include <list>
@@ -368,6 +369,13 @@ _get_benchmark_cache_fused() {
 }
 } // namespace
 
+// A host-trace harvest holds the plan: its kernels are loaded as long as it is
+static void note_host_trace_owner(const cudnn_frontend::ExecutionPlan& plan) {
+  if (auto* owners = c10::cuda::hostTraceOwnerSink()) {
+    owners->push_back(std::make_shared<cudnn_frontend::ExecutionPlan>(plan));
+  }
+}
+
 void run_conv_plan(
     cudnnHandle_t handle,
     const Tensor& x,
@@ -376,6 +384,7 @@ void run_conv_plan(
     const cudnn_frontend::ExecutionPlan& plan,
     const cudnnBackendDescriptorType_t operation) {
   c10::DeviceGuard g(x.options().device());
+  note_host_trace_owner(plan);
   auto workspace_size = plan.getWorkspaceSize();
   auto workspace_ptr =
       c10::cuda::CUDACachingAllocator::get()->allocate(workspace_size);
@@ -423,6 +432,7 @@ void run_conv_plan_fused(
     const Tensor& b,
     const cudnn_frontend::ExecutionPlan& plan) {
   c10::DeviceGuard g(x.options().device());
+  note_host_trace_owner(plan);
   auto workspace_size = plan.getWorkspaceSize();
   auto workspace_ptr =
       c10::cuda::CUDACachingAllocator::get()->allocate(workspace_size);

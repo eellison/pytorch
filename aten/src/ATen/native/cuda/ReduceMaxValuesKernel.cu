@@ -67,8 +67,8 @@ REGISTER_DISPATCH(max_values_stub, &max_values_kernel_cuda)
 namespace at::cuda::host_trace {
 
 // max_values_kernel_cuda_impl
-TensorBase amax(Recorder& rec, const TensorBase& self, IntArrayRef dims, bool keepdim) {
-  TensorBase result;
+TensorBase amax(Recorder& rec, const TensorBase& self, IntArrayRef dims, bool keepdim, const TensorBase& out) {
+  TensorBase result = out;
   auto iter = make_reduction(rec, result, self, dims, keepdim);
   if (iter.numel() == 0) {
     decline("an empty amax");
@@ -80,12 +80,15 @@ TensorBase amax(Recorder& rec, const TensorBase& self, IntArrayRef dims, bool ke
   return result;
 }
 
-// max(): max_all_kernel_impl over self.contiguous()
-TensorBase max_all(Recorder& rec, const TensorBase& self) {
+// max(), max_unary_out: max_all_kernel_impl over self.contiguous()
+TensorBase max_all(Recorder& rec, const TensorBase& self, const TensorBase& out) {
   if (self.sym_numel() == 0) {
     decline("a max of an empty tensor");
   }
-  return amax(rec, contiguous(rec, self), {}, false);
+  if (out.defined() && (out.dim() != 0 || out.scalar_type() != self.scalar_type())) {
+    decline("a max into an out= tensor it resizes or of another dtype");
+  }
+  return amax(rec, contiguous(rec, self), {}, false, out);
 }
 
 // minmax_out_impl, max_kernel_impl

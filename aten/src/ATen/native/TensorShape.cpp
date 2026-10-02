@@ -3041,15 +3041,15 @@ Tensor slice_inverse_symint(
       base.sym_sizes(), base.sym_strides(), base.sym_storage_offset());
 }
 
-Tensor slice_backward(
+Tensor slice_backward_symint(
     const Tensor& grad,
-    IntArrayRef input_sizes,
+    c10::SymIntArrayRef input_sizes,
     int64_t dim,
-    int64_t start,
-    int64_t end,
-    int64_t step) {
-  auto grad_input = at::zeros(input_sizes, grad.options());
-  grad_input.slice(dim, start, end, step).copy_(grad);
+    c10::SymInt start,
+    c10::SymInt end,
+    c10::SymInt step) {
+  auto grad_input = at::zeros_symint(input_sizes, grad.options());
+  grad_input.slice_symint(dim, std::move(start), std::move(end), std::move(step)).copy_(grad);
   return grad_input;
 }
 

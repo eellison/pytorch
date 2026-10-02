@@ -10,9 +10,9 @@ import unittest
 from unittest import mock
 
 import torch
+from torch.cuda import _host_trace_replay
 from torch.cuda._host_trace import Declined
 from torch.cuda._host_trace_launch import KernelLaunch
-from torch.cuda._host_trace_replay import HostTraceReplay
 from torch.cuda._host_trace_tape import EagerCall, trace
 from torch.testing._internal.common_utils import (
     instantiate_parametrized_tests,
@@ -22,6 +22,15 @@ from torch.testing._internal.common_utils import (
     TEST_CUDA,
     TestCase,
 )
+
+
+class HostTraceReplay(_host_trace_replay.HostTraceReplay):
+    # traces at its first call: these are tests of the trace; an entry's first
+    # call runs eagerly (test_the_first_call_runs_eagerly in
+    # test_cuda_host_trace_replay)
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._called = True
 
 
 try:
@@ -339,7 +348,7 @@ class TestHostTraceCute(TestCase):
         for n in (1024, 1000, 1000, 1024, 1000):
             a, b = torch.randn(n, device="cuda"), torch.randn(n, device="cuda")
             self.assertEqual(r(a, b), a + b, atol=0, rtol=0)
-        self.assertEqual((r.traces, r.replays, r.eager), (2, 4, 0))
+        self.assertEqual((r.traces, r.replays, r.eager), (2, 3, 0))
         self.assertEqual(len(r.variants), 2)
 
         # the compile's unit stride is a guard: a strided view misses it,
@@ -491,7 +500,8 @@ class TestHostTraceCute(TestCase):
                 text=True,
                 check=True,
             ).stdout
-        self.assertEqual(out.split(), ["KernelLaunch", "True", "1", "3", "0"])
+        # the first call runs eagerly
+        self.assertEqual(out.split(), ["KernelLaunch", "True", "1", "2", "1"])
 
     def test_a_loaded_object_declines(self):
         other = torch.cuda.Stream()
@@ -561,12 +571,11 @@ class TestHostTraceCute(TestCase):
             ref = rmsnorm_fwd(x, w)[0]
             self.assertEqual(r(x, w, a), (ref, a + a), atol=0, rtol=0)
         # N=512 fails the guard: a second trace
-        self.assertEqual((r.traces, r.replays, r.eager), (2, 3, 0))
+        self.assertEqual((r.traces, r.replays, r.eager), (2, 2, 0))
 
-    def test_a_compile_that_fails_under_a_trace_runs_eagerly_once(self):
-        # a new N compiled inside a later trace reaches quack's RMSNorm.N as a
-        # SymInt; the eager fallback compiles it and the next call of the same
-        # class traces
+    def test_a_compile_under_a_trace_declines(self):
+        # a new N compiled inside a trace without a warm-up reaches quack's
+        # RMSNorm.N as a SymInt; each trace's warm-up compiles it first
         import torch._vendor.quack.cache as quack_cache
         from torch._vendor.quack.rmsnorm import rmsnorm_fwd
 
@@ -581,8 +590,9 @@ class TestHostTraceCute(TestCase):
             for m, n in ((64, 1024), (64, 1792), (64, 1792), (32, 1792)):
                 x, w = bf16(m, n), bf16(n)
                 self.assertEqual(r(x, w), f(x, w), atol=0, rtol=0)
-        self.assertEqual((r.traces, r.replays, r.eager), (3, 2, 1))
-        self.assertTrue(any("CuTe DSL compile under the trace" in why for why in r._reasons), r._reasons)
+            self.assertEqual((r.traces, r.replays, r.eager, r.declines), (2, 2, 0, []))
+            with self.assertRaisesRegex(Declined, "CuTe DSL compile under the trace"):
+                trace(f, (bf16(64, 2048), bf16(2048)), warm_up=False)
 
     def test_a_disk_cache_entry_without_its_host_function_recompiles(self):
         # an object quack's jit_cache exported before its compile was observed
@@ -628,10 +638,10 @@ class TestHostTraceCute(TestCase):
         for n in (1024, 2048, 2048, 1024, 4096):
             a, b = torch.randn(n, device="cuda"), torch.randn(n, device="cuda")
             self.assertEqual(r(a, b), a + b, atol=0, rtol=0)
-        # 1024 is compiled by the eager warm-up; 2048 and 4096 inside their traces
-        self.assertEqual((r.traces, r.replays, r.eager), (3, 4, 0))
+        # each N is compiled by its trace's eager warm-up
+        self.assertEqual((r.traces, r.replays, r.eager), (3, 2, 0))
         a = torch.randn(8192, device="cuda")
-        tape = trace(f, (a, a))
+        tape = trace(f, (a, a), warm_up=False)
         ((_, launch),) = tape.launches
         self.assertIsInstance(launch, KernelLaunch)
         self.assertTrue(any("8192" in str(g) for g in tape.guards))
