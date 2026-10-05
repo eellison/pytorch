@@ -425,11 +425,13 @@ class TestInstallation(TestCase):
         torch._dynamo.reset()
         counters.clear()
         self.installed = []
+        self.calls = []
         cudagraphify = HostTracePolicy.cudagraphify
 
         def spy(*args, **kwargs):
             out = cudagraphify(*args, **kwargs)
             self.installed.append(out)
+            self.calls.append((args, kwargs))
             return out
 
         patch = mock.patch.object(HostTracePolicy, "cudagraphify", spy)
@@ -577,6 +579,57 @@ class TestInstallation(TestCase):
             self.assertIsInstance(installation, _Installation)
             self.assertEqual(installation.replay.declines, [])
             self.assertEqual(installation.replay.traces, 1)
+
+    @config.patch({"triton.cudagraph_host_trace_backward_frees_saved": True})
+    def test_a_backward_frees_its_saved_tensors(self):
+        # a backward's static inputs are its saved tensors too, whose
+        # references its boxed caller hands over: it holds only the static
+        # ones that are the forward's own inputs (primals), its parameters.
+        # Its matmuls' sizes are its own: a harvested key outlives the test
+        class Lin(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.w = torch.nn.Parameter(torch.randn(48, 48))
+
+            def forward(self, x):
+                return (x @ self.w).relu() @ self.w
+
+        compiled = torch.compile(Lin().cuda(), mode="reduce-overhead")
+        for _ in range(3):
+            compiled(torch.randn(16, 48, device="cuda")).sum().backward()
+        (_, _, _, static), kwargs = self.calls[1]
+        names = [p.name for p in kwargs["placeholders"]]
+        held = {i for i in static if names[i].startswith("primals_")}
+        self.assertEqual(len(held), 1)
+        self.assertLess(len(held), len(static))
+        self.assertEqual(self.installed[1].replay.freed_arguments, set(range(len(names))) - held)
+
+    @config.patch(
+        {
+            "triton.cudagraph_host_trace_backward_frees_saved": False,
+            "triton.cudagraph_host_trace_handback": False,
+            "triton.cudagraph_host_trace_replay_splits": "peak",
+        }
+    )
+    def test_a_backward_holding_its_static_inputs(self):
+        # the switches off: a backward holds every static input to its end,
+        # a slow call runs its arguments in place, and runs split only at the
+        # replay's peak. Its matmuls' sizes are its own
+        class Lin(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.w = torch.nn.Parameter(torch.randn(40, 40))
+
+            def forward(self, x):
+                return (x @ self.w).relu() @ self.w
+
+        compiled = torch.compile(Lin().cuda(), mode="reduce-overhead")
+        for _ in range(3):
+            compiled(torch.randn(24, 40, device="cuda")).sum().backward()
+        (_, _, _, static), kwargs = self.calls[1]
+        replay = self.installed[1].replay
+        self.assertEqual(replay.freed_arguments, set(range(len(kwargs["placeholders"]))) - set(static))
+        self.assertEqual((replay.handback, replay.splits), (False, "peak"))
 
     @unittest.skipIf(torch.compiler.config.force_disable_caches, "caches are disabled")
     @config.patch(fx_graph_cache=True)
@@ -1013,6 +1066,36 @@ class TestInstalledAttentionAndRng(TestCase):
         self.assertEqual(len(self.installed), 4)
         self.assertEqual([i.replay.traces for i in self.installed], traces)
         self.assertEqual([i.replay.declines for i in self.installed], [[]] * 4)
+
+    def test_attention_training_from_host_seeds(self):
+        # a block called four times a step, its second graph three: that
+        # forward's first call runs eagerly and returns eager's host seed and
+        # offset, its replays the device's; its backward, traced at a device
+        # seed, takes the host one too. Grads bitwise against the same
+        # compile without graphs from the same generator offset
+        from torch.nn.attention import sdpa_kernel, SDPBackend
+
+        m = _Block(p=0.125).cuda().train()
+        ref = copy.deepcopy(m)
+        compiled, plain = torch.compile(m, mode="reduce-overhead"), torch.compile(ref)
+        gen = torch.cuda.default_generators[torch.cuda.current_device()]
+        x = torch.randn(2, 128, 256, device="cuda", dtype=torch.bfloat16)
+
+        def step(model, f):
+            model.zero_grad(set_to_none=True)
+            f(f(f(f(x)))).float().sum().backward()
+            return [w.grad.clone() for w in model.parameters()]
+
+        with sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION):
+            for _ in range(4):
+                start = gen.get_offset()
+                grads = step(m, compiled)
+                gen.set_offset(start)
+                self.assertEqual(grads, step(ref, plain), atol=0, rtol=0)
+        self.assertEqual(len(self.installed), 4)
+        self.assertEqual([i.replay.declines for i in self.installed], [[]] * 4)
+        # each graph's first call runs eagerly, its second traces, the rest replay
+        self.assertEqual([(i.replay.eager, i.replay.traces) for i in self.installed], [(1, 1)] * 4)
 
     # size_asserts: a dynamic graph's fallback aborts
     @config.patch(size_asserts=False)

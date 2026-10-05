@@ -72,7 +72,7 @@ from torch.cuda import _host_trace_cute  # noqa: F401  hooks cute.compile
 from torch.cuda._host_trace import Declined, declined
 from torch.cuda._host_trace_capture import capture_tape, instantiate_form, plain_attributes, SegmentFailed
 from torch.cuda._host_trace_lower_tape import fold, FoldRefused, lower_tape, PredictedOutput
-from torch.cuda._host_trace_memory import auto_memory, plan_memory, split_runs
+from torch.cuda._host_trace_memory import auto_memory, plan_memory, split_runs, SPLITS
 from torch.cuda._host_trace_opaque import library_state_as
 from torch.cuda._host_trace_redispatch import redispatch
 from torch.cuda._host_trace_native import (
@@ -180,6 +180,14 @@ class _Disagreement(AssertionError):
 
 
 @dataclass
+class Handback:
+    """A boxed call's arguments, handed back to call again (HostTraceReplay's
+    `handback`)"""
+
+    args: tuple
+
+
+@dataclass
 class _Variant:
     captured: CapturedTape
     memory: MemoryPlan
@@ -242,10 +250,14 @@ class HostTraceReplay(torch._C._HostTraceEntry):
     """fn served by host-trace replay; call it as fn. With `trusted`, the
     caller vouches for every call's arguments (TrustedInputs): a call is
     checked only against its variants' dispatch guards. `memory` is how a
-    replay allocates (_host_trace_memory): "auto", "eager" or "run_buffer".
+    replay allocates (_host_trace_memory): "auto", "eager" or "run_buffer";
+    `splits`, where "auto" and "eager" split a run (SPLITS, split_runs).
     `freed_arguments` are the positions whose tensor a boxed call's caller
-    holds no other reference to, which split_runs may free mid-tape.
-    `static_shapes` are the tensor positions whose layout is static (trace).
+    holds no other reference to, which split_runs may free mid-tape. With
+    `handback`, a slow call that traces a variant or adds to one's tables
+    returns Handback instead of running the variant, which Python's reference
+    to the arguments would hold to the end; the caller calls again, with
+    call_boxed. `static_shapes` are the tensor positions whose layout is static (trace).
 
     fn must be a pure function of its arguments. Torch's global settings
     (grad and inference mode, autocast, the TF32, reduced-precision, cuDNN
@@ -271,12 +283,18 @@ class HostTraceReplay(torch._C._HostTraceEntry):
         static_shapes: Collection[int] = (),
         check_global_state: bool = False,
         check_escapes: bool = False,
+        handback: bool = False,
+        splits: str = "peak",
     ) -> None:
         if memory not in ("auto", "eager", "run_buffer"):
             raise ValueError(f"host_trace: memory {memory!r} is not 'auto', 'eager' or 'run_buffer'")
+        if splits not in SPLITS:
+            raise ValueError(f"host_trace: splits {splits!r} is not one of {SPLITS}")
         self.fn = fn
         self.memory = memory
         self.freed_arguments = frozenset(freed_arguments)
+        self.handback = handback
+        self.splits = splits
         self.static_shapes = frozenset(static_shapes)
         self.trusted = trusted
         self.opaque = opaque
@@ -365,11 +383,12 @@ class HostTraceReplay(torch._C._HostTraceEntry):
                 if searched and not variant.learns:
                     continue
                 held = len(candidates)
-                values = self._fill(variant, args, candidates)
-                if values is None:
+                filled = self._fill(variant, args, candidates)
+                if filled is None:
                     if len(candidates) == held:
                         pending |= not variant.learns and variant.native.evaluate(args) is not None
                     continue
+                values, added = filled
                 if variant.learns:
                     # an opaque call whose key binds or is refused now is traced
                     # again, as its launches or as a plain eager step, unless a
@@ -388,6 +407,8 @@ class HostTraceReplay(torch._C._HostTraceEntry):
                             return self._miss(contract, args, candidates, before=variant)
                         if self._fill(upgraded, args, candidates) is not None:
                             variant = upgraded
+                elif self.handback and added:
+                    return Handback(args)
                 outcome, result = self._call_native(variant, args)
                 if outcome != MISS:
                     return self._served(variant.native, outcome, result, args)
@@ -433,10 +454,10 @@ class HostTraceReplay(torch._C._HostTraceEntry):
         self.guards += upgraded.tape.guard_count
         return upgraded
 
-    def _fill(self, variant: _Variant, args: tuple, candidates: list[tuple[_Variant, list[int], list[int]]]) -> list[int] | None:
+    def _fill(self, variant: _Variant, args: tuple, candidates: list[tuple[_Variant, list[int], list[int]]]) -> tuple[list[int], bool] | None:
         """The call's rows if the variant's program holds it, after adding
         each keyed site's missing key to its table and each segment's missing
-        form; None if a key does not bind yet (a learning variant's eager run
+        form, and whether it added any; None if a key does not bind yet (a learning variant's eager run
         harvests it), or if a selector selects nothing: then a variant that
         does not learn is a candidate to dispatch those selectors' ops again
         for, or to fold the call's trace into, (variant, rows, selectors) in
@@ -473,7 +494,7 @@ class HostTraceReplay(torch._C._HostTraceEntry):
             unformed = [] if evaluated is None else evaluated[2]
         for g, arms in unformed:
             variant.native.add_form(g, arms, *self._form(variant, g, arms))
-        return values
+        return values, bool(bindings or unformed)
 
     def _learn(self, op: OpOverload, provider: OpaqueProvider, call: tuple[Any, frozenset[int]], key: OpaqueKey) -> OpaqueBinding | None:
         """The key's binding, harvested now from one eager run of `op` on
@@ -737,6 +758,8 @@ class HostTraceReplay(torch._C._HostTraceEntry):
         if folded is not None:
             if ran:
                 return result
+            if self.handback:
+                return Handback(tuple(args))
             outcome, result = self._call_native(folded, tuple(args))
             if outcome == MISS:
                 raise AssertionError("host_trace: a call misses the variant its trace folded into")
@@ -752,6 +775,8 @@ class HostTraceReplay(torch._C._HostTraceEntry):
             variant.tried.update(k for i, o in lowered.opaque.items() if lowered.steps[i].call.bound and o.provider.bind(k := o.key(values)) is not None)
         if ran:
             return result
+        if self.handback and not variant.learns:
+            return Handback(tuple(args))
         outcome, result = self._call_native(variant, tuple(args))
         if outcome == MISS:
             raise AssertionError("host_trace: a call misses the tape traced at it")
@@ -810,9 +835,9 @@ class HostTraceReplay(torch._C._HostTraceEntry):
         # eager order reads the native caching allocator's release count
         native = torch.cuda.get_allocator_backend() == "native"
         if native and self.memory == "auto":
-            lowered, memory = auto_memory(lowered, self.freed_arguments)
+            lowered, memory = auto_memory(lowered, self.freed_arguments, self.splits)
         elif native and self.memory == "eager":
-            lowered, memory = split_runs(lowered, self.freed_arguments)
+            lowered, memory = split_runs(lowered, self.freed_arguments, splits=self.splits)
         else:
             memory = plan_memory(lowered, self.memory if native else "run_buffer")
         # capture_tape checks the compiled program at the traced call against

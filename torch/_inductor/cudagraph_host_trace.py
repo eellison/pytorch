@@ -34,7 +34,7 @@ from torch._logging import trace_structured
 from torch.cuda._host_trace import Declined
 from torch.cuda._host_trace_harvest import HarvestProvider
 from torch.cuda._host_trace_launch import _probe_address
-from torch.cuda._host_trace_replay import HostTraceReplay
+from torch.cuda._host_trace_replay import Handback, HostTraceReplay
 from torch.cuda._host_trace_tape import (
     _hint,
     _TracedTensor,
@@ -49,6 +49,7 @@ from torch.utils._debug_mode import get_active_debug_mode
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
 
+    from torch._inductor.cudagraph_utils import PlaceholderInfo
     from torch.cuda._host_trace_tape import _Trace
 
 
@@ -74,6 +75,8 @@ class HostTracePolicy(CUDAGraphPolicy):
         is_backward: bool,
         is_inference: bool,
         graph_inputs: TrustedInputs | str | None,
+        placeholders: Sequence[PlaceholderInfo],
+        seeds: Sequence[int],
         **kwargs: Any,
     ) -> Callable[..., Any]:
         # the flag is not in the FX graph cache key
@@ -84,8 +87,13 @@ class HostTracePolicy(CUDAGraphPolicy):
         else:
             try:
                 # static_input_idxs promises stable addresses only where trees
-                # checks them; the tape reads every input's address
-                return _Installation(model, graph_inputs, static_input_idxs)
+                # checks them; the tape reads every input's address. A
+                # backward's are its saved tensors, whose references its caller
+                # hands over but for the forward's own inputs (primals)
+                held = static_input_idxs
+                if is_backward and config.triton.cudagraph_host_trace_backward_frees_saved:
+                    held = [i for i in held if placeholders[i].name.startswith("primals_")]
+                return _Installation(model, graph_inputs, held, seeds, torch.device("cuda", device_index))
             except _Uncaptured:
                 return model
             except _NotInstalled as e:
@@ -118,6 +126,14 @@ def graph_inputs(example_inputs: Sequence[Any]) -> TrustedInputs | str:
         return _trusted_inputs(example_inputs)
     except _NotInstalled as e:
         return str(e)
+
+
+def graph_seeds(example_inputs: Sequence[Any]) -> tuple[int, ...]:
+    """The compiled graph's 0-dim int64 CUDA inputs: among them a backward's
+    dropout seeds and offsets, which its forward's replay returns on the
+    device, as the graph's fake does, and its eager call on the host
+    (HOST_SEED_OFFSET)."""
+    return tuple(i for i, e in enumerate(example_inputs) if isinstance(e, torch.Tensor) and e.is_cuda and e.dim() == 0 and e.dtype == torch.int64)
 
 
 def _trusted_inputs(example_inputs: Sequence[Any]) -> TrustedInputs:
@@ -191,7 +207,9 @@ class _Installation:
         self,
         model: Callable[..., Any],
         inputs: TrustedInputs,
-        static_input_idxs: Sequence[int],
+        held: Sequence[int],
+        seeds: Sequence[int],
+        device: torch.device,
     ) -> None:
         module = getattr(getattr(model, "__func__", None), "__globals__", {})
         if module.get("call") != model:
@@ -231,12 +249,20 @@ class _Installation:
         knobs = config.triton
         opaque = tuple(_PROVIDERS[f] for f in knobs.cudagraph_host_trace_harvest)
         memory = knobs.cudagraph_host_trace_replay_memory
-        # a boxed call hands over its list's references; a parameter's
-        # (static_input_idxs) or constant's tensor stays held
-        freed = set(range(n)) - set(static_input_idxs)
+        # a boxed call hands over its list's references; a `held` input's
+        # tensor (a parameter's) or a constant's stays held by its owner
+        freed = set(range(n)) - set(held)
         self.replay = HostTraceReplay(
-            tensors, trusted=trusted, opaque=opaque, memory=memory, freed_arguments=freed
+            tensors,
+            trusted=trusted,
+            opaque=opaque,
+            memory=memory,
+            freed_arguments=freed,
+            handback=knobs.cudagraph_host_trace_handback,
+            splits=knobs.cudagraph_host_trace_replay_splits,
         )
+        self._seeds = seeds
+        self._device = device
         self._variants = 0
         self._uncaptured = 0
         self._structural = 0
@@ -248,12 +274,21 @@ class _Installation:
         traces = replay.traces
         # a replay drops a list's inputs at their last use, as the graph's own
         # call does; compile_fx_inner's boxed call also takes a tuple
-        if isinstance(new_inputs, list):
-            args = [*new_inputs, *self._constants]
+        boxed = isinstance(new_inputs, list)
+        args = [*new_inputs, *self._constants]
+        if boxed:
             new_inputs.clear()
-            out = list(replay.call_boxed(args))
-        else:
-            out = list(replay(*new_inputs, *self._constants))
+        # a seed the forward's first call (or any it ran eagerly) returned on
+        # the host: the trace reads it where the graph declares it, as a
+        # bound kernel does
+        for i in self._seeds:
+            if not args[i].is_cuda:
+                args[i] = args[i].to(self._device, non_blocking=True)
+        out = replay.call_boxed(args) if boxed else replay(*args)
+        while isinstance(out, Handback):
+            args, out = list(out.args), None
+            out = replay.call_boxed(args)
+        out = list(out)
         if replay.traces != traces:
             self._account()
         for i in self._nones:

@@ -16,8 +16,8 @@ from torch.cuda._host_trace import declined
 from torch.cuda._host_trace_capture import launch_images, launch_slots
 from torch.cuda._host_trace_lower_tape import LoweredMemcpy, LoweredMemset
 from torch.cuda._host_trace_memory import MemoryPlan, place, StepMemory
-from torch.cuda._host_trace_replay import _exact_class
-from torch.cuda._host_trace_tape import argument_contract, EagerCall, trace
+from torch.cuda._host_trace_replay import _exact_class, Handback
+from torch.cuda._host_trace_tape import argument_contract, EagerCall, trace, TrustedInputs
 from torch.testing._internal.common_cuda import PLATFORM_SUPPORTS_CUDNN_ATTENTION
 from torch.testing._internal.common_utils import (
     instantiate_parametrized_tests,
@@ -928,7 +928,9 @@ class TestChainReplay(TestCase):
     @mock.patch("torch.cuda._host_trace.raise_unexpected", False)
     def test_a_segment_that_fails_to_capture_runs_eagerly(self):
         # the segment after the matmul fails at its second launch, the mul: the
-        # call traces again with the mul an eager call, and the rest replays
+        # call traces again with the mul an eager call, and the rest replays.
+        # The first trace's run is split before the sin, a later peak at
+        # varying sizes, so the failing launch holds two
         def fn(x, w):
             return (matmul_chain(x, w) * 2).sin()
 
@@ -941,14 +943,14 @@ class TestChainReplay(TestCase):
                 raise RuntimeError("injected")
             return launch(launches, *args)
 
-        f = HostTraceReplay(fn)
+        f = HostTraceReplay(fn, splits="walk")
         w = torch.randn(16, 8, device="cuda")
         with mock.patch.object(_host_trace_capture, "_launch", fail_second):
             for _ in range(3):
                 x = torch.randn(1024, device="cuda")
                 self.assertEqual(f(x, w), fn(x, w), atol=0, rtol=0)
         self.assertEqual((f.traces, f.replays, f.eager), (2, 2, 0))
-        self.assertEqual(calls, [1, 3, 1, 1, 1])
+        self.assertEqual(calls, [1, 2, 1, 1, 1])
         (v,) = f.variants
         self.assertEqual(len(v.captured.segments), 3)
         self.assertEqual(len(f.declines), 1)
@@ -1402,6 +1404,169 @@ class TestReplayMemory(TestCase):
         (v,) = f.variants
         runs = [s for s in v.captured.lowered.steps if isinstance(s, range)]
         self.assertEqual([len(r) for r in runs], [1, 1])
+
+    def test_a_run_splits_past_a_peak_it_cannot_lower(self):
+        # traced with a large x, the peak is add(x)'s temporary beside its
+        # output, which no split lowers; the later one, where y is dead but
+        # held to its run's end, is the peak with a small x, so the run
+        # splits there too
+        def fn(x, y, c):
+            return add(add(x)), add(y), add(c)
+
+        f = HostTraceReplay(fn, freed_arguments=(1,), splits="walk")
+        m = 1 << 18
+        for n in (1 << 22, 1 << 22, 4096, 4096):
+            args = [torch.randn(k, device="cuda") for k in (n, m, m)]
+            want = (args[0] + 6, args[1] + 3, args[2] + 3)
+            torch.cuda.synchronize()
+            before = torch.cuda.memory_allocated()
+            torch.cuda.reset_peak_memory_stats()
+            y = f.call_boxed(args)
+            torch.cuda.synchronize()
+            peak = torch.cuda.max_memory_allocated() - before
+            self.assertEqual(y, want)
+        self.assertEqual((f.replays, f.eager), (3, 0))
+        self.assertEqual(peak, 4 * (4096 + m))
+        (v,) = f.variants
+        runs = [s for s in v.captured.lowered.steps if isinstance(s, range)]
+        self.assertEqual([len(r) for r in runs], [3, 1])
+
+    def test_fixed_sizes_split_only_at_the_peak(self):
+        # the tape above at fixed sizes: y held to its run's end is live only
+        # past the peak (add(x)'s temporary beside its output), which it
+        # cannot become, so the run stays one graph
+        def fn(x, y, c):
+            return add(add(x)), add(y), add(c)
+
+        n, m = 1 << 22, 1 << 18
+        layouts = tuple(((k,), (1,)) for k in (n, m, m))
+        f = HostTraceReplay(fn, trusted=TrustedInputs(layouts), freed_arguments=(1,), splits="walk")
+        for _ in range(3):
+            args = [torch.randn(k, device="cuda") for k in (n, m, m)]
+            want = (args[0] + 6, args[1] + 3, args[2] + 3)
+            torch.cuda.synchronize()
+            before = torch.cuda.memory_allocated()
+            torch.cuda.reset_peak_memory_stats()
+            y = f.call_boxed(args)
+            torch.cuda.synchronize()
+            peak = torch.cuda.max_memory_allocated() - before
+            self.assertEqual(y, want)
+        self.assertEqual((f.replays, f.eager), (2, 0))
+        self.assertEqual(peak, 4 * 2 * n)
+        (v,) = f.variants
+        runs = [s for s in v.captured.lowered.steps if isinstance(s, range)]
+        self.assertEqual([len(r) for r in runs], [4])
+
+    def test_fixed_sizes_run_buffer_splits_past_the_peak(self):
+        # the tape above under "auto": a run buffer holds y and add(y)'s
+        # output past "eager"'s peak too, and the split there lowers its own
+        def fn(x, y, c):
+            return add(add(x)), add(y), add(c)
+
+        n, m = 1 << 22, 1 << 18
+        layouts = tuple(((k,), (1,)) for k in (n, m, m))
+        f = HostTraceReplay(fn, trusted=TrustedInputs(layouts), memory="auto", freed_arguments=(1,), splits="walk")
+        for _ in range(3):
+            args = [torch.randn(k, device="cuda") for k in (n, m, m)]
+            want = (args[0] + 6, args[1] + 3, args[2] + 3)
+            self.assertEqual(f.call_boxed(args), want)
+        self.assertEqual((f.replays, f.eager), (2, 0))
+        (v,) = f.variants
+        self.assertFalse(any(s.order for s in v.memory.steps))
+        runs = [s for s in v.captured.lowered.steps if isinstance(s, range)]
+        self.assertEqual([len(r) for r in runs], [3, 1])
+
+    def test_split_before_the_peak_allocation_first(self):
+        # every argument freed, at fixed sizes, under "auto": the split just
+        # before add(c), the peak's allocation, is taken first. The last-use
+        # split just after add(x) lowers "eager"'s peak as much, but puts
+        # add(add(x))'s dead output in add(c)'s run buffer beside add(c)'s,
+        # as splits="peak" (the candidate that lowers it most) takes
+        def fn(x, y, c):
+            a = add(x)
+            add(a)
+            return a, add(c)
+
+        k = 4096
+        sizes = (k, k, 2 * k)
+        layouts = tuple(((n,), (1,)) for n in sizes)
+        for splits, want_peak, want_runs in (("walk", 4 * 2 * k, [2, 1]), ("peak", 4 * 3 * k, [1, 2])):
+            f = HostTraceReplay(fn, trusted=TrustedInputs(layouts), memory="auto", freed_arguments=(0, 1, 2), splits=splits)
+            for _ in range(3):
+                args = [torch.randn(n, device="cuda") for n in sizes]
+                want = (args[0] + 3, args[2] + 3)
+                torch.cuda.synchronize()
+                before = torch.cuda.memory_allocated()
+                torch.cuda.reset_peak_memory_stats()
+                y = f.call_boxed(args)
+                torch.cuda.synchronize()
+                peak = torch.cuda.max_memory_allocated() - before
+                self.assertEqual(y, want)
+            self.assertEqual((f.replays, f.eager), (2, 0))
+            (v,) = f.variants
+            runs = [s for s in v.captured.lowered.steps if isinstance(s, range)]
+            self.assertEqual(peak, want_peak)
+            self.assertEqual([len(r) for r in runs], want_runs)
+
+    def test_a_split_lowering_the_peak_by_little_is_undone(self):
+        # splitting before add(x) drops s and add(s)'s dead output at the
+        # peak, 8 * k bytes: for k = n / 256 that is within 1/200 of the
+        # replay's peak (x, s and both outputs), too little for "coarse" to
+        # pay a graph launch for
+        def fn(x, s):
+            add(s)
+            return add(x)
+
+        n = 1 << 20
+        for splits, k, split in (("coarse", n // 256, False), ("coarse", n // 64, True), ("walk", n // 256, True)):
+            sizes = (n, k)
+            layouts = tuple(((m,), (1,)) for m in sizes)
+            f = HostTraceReplay(fn, trusted=TrustedInputs(layouts), memory="auto", freed_arguments=(0, 1), splits=splits)
+            for _ in range(3):
+                args = [torch.randn(m, device="cuda") for m in sizes]
+                want = args[0] + 3
+                torch.cuda.synchronize()
+                before = torch.cuda.memory_allocated()
+                torch.cuda.reset_peak_memory_stats()
+                y = f.call_boxed(args)
+                torch.cuda.synchronize()
+                peak = torch.cuda.max_memory_allocated() - before
+                self.assertEqual(y, want)
+            self.assertEqual((f.replays, f.eager), (2, 0))
+            (v,) = f.variants
+            self.assertEqual(peak, 4 * (n - k if split else n + k))
+            runs = [len(r) for r in v.captured.lowered.steps if isinstance(r, range)]
+            self.assertEqual(runs, [1, 1] if split else [2])
+
+    def test_a_trace_that_does_not_run_hands_the_call_back(self):
+        # under trust only the first trace runs its call: a later one (a
+        # misaligned x's) hands the arguments back, and the call again through
+        # call_boxed drops x after its last use, which Python's reference
+        # would hold to the end
+        def fn(x):
+            return add(add(x), 1)
+
+        n = 1 << 22
+        layouts = (((n,), (1,)),)
+        f = HostTraceReplay(fn, trusted=TrustedInputs(layouts), freed_arguments=(0,), handback=True)
+        handed = []
+        for offset in (0, 0, 1, 1):
+            args = [torch.randn(n + 1, device="cuda")[offset : offset + n]]
+            want = args[0] + 4
+            y = f.call_boxed(args)
+            if isinstance(y, Handback):
+                handed.append(offset)
+                args, y = list(y.args), None
+                torch.cuda.synchronize()
+                before = torch.cuda.memory_allocated()
+                torch.cuda.reset_peak_memory_stats()
+                y = f.call_boxed(args)
+                torch.cuda.synchronize()
+                peak = torch.cuda.max_memory_allocated() - before
+            self.assertEqual(y, want)
+        self.assertEqual(handed, [1])
+        self.assertEqual(peak, 4 * n)
+        self.assertEqual((f.traces, f.eager), (2, 0))
 
     def test_distinct_shapes_reserve_as_eager(self):
         # each replay frees and reuses blocks as eager does, so the cache

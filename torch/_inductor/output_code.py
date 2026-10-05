@@ -314,6 +314,7 @@ def cudagraph_post_compile(
         policy = _active_cudagraph_policy()
         if config.triton.cudagraph_host_trace:
             cudagraphify_kwargs["graph_inputs"] = compiled_graph.host_trace_inputs
+            cudagraphify_kwargs["seeds"] = compiled_graph.host_trace_seeds
         if policy is not None:
             compiled_graph.current_callable = policy.cudagraphify(
                 current_callable,
@@ -762,10 +763,12 @@ class CompiledFxGraph(OutputCode):
         # kept here: post_compile's example inputs are another graph's on an
         # AOT autograd cache hit, which hands a backward its forward's
         self.host_trace_inputs: TrustedInputs | str | None = None
+        self.host_trace_seeds: tuple[int, ...] = ()
         if config.triton.cudagraph_host_trace:
-            from torch._inductor.cudagraph_host_trace import graph_inputs
+            from torch._inductor.cudagraph_host_trace import graph_inputs, graph_seeds
 
             self.host_trace_inputs = graph_inputs(example_inputs)
+            self.host_trace_seeds = graph_seeds(example_inputs)
         self.compile_region_name = compile_region_name
         self.inputs_to_check = inputs_to_check
         self.fx_kwargs = fx_kwargs

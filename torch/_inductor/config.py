@@ -2105,6 +2105,25 @@ class triton:
     # of eager's peak
     cudagraph_host_trace_replay_memory: Literal["auto", "eager", "run_buffer"] = "auto"
 
+    # with cudagraph_host_trace: where "auto" and "eager" split a run into
+    # graphs (torch/cuda/_host_trace_memory.py split_runs). "walk": wherever
+    # that lowers the replay's peak or, when the sizes vary, a later one;
+    # "coarse": as "walk", then undo the replay's peak's splits that lower it
+    # by under 1/200, a graph launch fewer each; "peak": only at the
+    # replay's peak
+    cudagraph_host_trace_replay_splits: Literal["walk", "coarse", "peak"] = "peak"
+
+    # with cudagraph_host_trace: a backward frees its saved tensors after
+    # their last use, as its boxed caller hands their references over; if
+    # False it holds every static input (static_input_idxs) to its end
+    cudagraph_host_trace_backward_frees_saved = False
+
+    # with cudagraph_host_trace: a call that traces or adds to a variant's
+    # tables hands its arguments back to be called again through call_boxed,
+    # which drops each after its last use; if False it runs them in place,
+    # holding them to the end
+    cudagraph_host_trace_handback = False
+
     # Should we skip cudagraphing graphs with dynamic shape inputs
     # If False, we will re-record a graph for each unique set of shape inputs
     cudagraph_skip_dynamic_graphs = False
