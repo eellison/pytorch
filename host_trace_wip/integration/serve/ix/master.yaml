@@ -1,0 +1,120 @@
+# InferenceX-style master config for the local GB300 runs (InferenceX e0315d2a; keys and fields as in
+# inferencex-e2e/configs/nvidia-master.yaml). One entry per SKU. Like InferenceX's --enforce-eager twins
+# (qwen3.827beager, PR #3263), every variant of a model is its own SKU with its own model-prefix and recipe:
+#   <prefix>       vLLM default (recipe args; FULL_AND_PIECEWISE cudagraphs + torch.compile)
+#   <prefix>eager  --enforce-eager
+#   <prefix>ht     ours: --enforce-eager + arm V (host-trace replay) loaded through --worker-extension-cls and the
+#                  armv_endpoints endpoint plugin, installed over POST /armv/install after the server is ready
+#   <prefix>htpad  ours with ARMV_PAD=1 (pads token / request counts like vLLM's FULL dispatch)
+#   <prefix>htvp   ours with ARMV_VP=1 (sampler + request-state writes inside the replayed step)
+# The default and eager SKUs also load the extension in "observe" mode (counters only, no trace) so every SKU reports
+# the same per-win breakdown. x-local holds this box's deviations (shared GPUs): a fixed KV pool instead of
+# gpu-memory-utilization 0.9; gpu-memory-utilization then only feeds vLLM's startup free-memory check.
+qwen3.827b-fp4-gb300-vllm:
+  model: /data/eellison/models/Qwen3.8-27B-NVFP4   # Inferact/Qwen3.8-27B-NVFP4
+  model-prefix: qwen3.827b
+  precision: fp4
+  framework: vllm
+  multinode: false
+  srt-recipe: recipes/qwen3.827b-fp4-vllm.yaml
+  x-armv: { install: observe }
+  x-env: { HOSTTRACE_TORCH_DISABLE_CACHES: '0' }   # the launcher forces Inductor caches off otherwise; vLLM's compile needs them
+  x-local: { kv-cache-memory-bytes: 107374182400, gpu-memory-utilization: 0.5 }
+  scenarios:
+    fixed-seq-len:
+    - { isl: 8192, osl: 1024, search-space: [ { tp: 1, conc-list: [1, 2, 4, 8, 16, 32, 64, 128, 256] } ] }
+    - { isl: 1024, osl: 1024, search-space: [ { tp: 1, conc-list: [1, 2, 4, 8, 16, 32, 64, 128, 256] } ] }
+qwen3.827beager-fp4-gb300-vllm:
+  inherit: qwen3.827b-fp4-gb300-vllm
+  model-prefix: qwen3.827beager
+  x-args: { enforce-eager: true }
+  x-env: { HOSTTRACE_TORCH_DISABLE_CACHES: '1' }
+qwen3.827bht-fp4-gb300-vllm:
+  inherit: qwen3.827b-fp4-gb300-vllm
+  model-prefix: qwen3.827bht
+  x-args: { enforce-eager: true }
+  # FlashInfer workspace without CuTe DSL objects compiled unobserved (serve/fi_ws_ht; see STATUS 10-08)
+  x-env: { HOSTTRACE_TORCH_DISABLE_CACHES: '1', ARMV_CUTE_OBSERVE: '1', FLASHINFER_WORKSPACE_BASE: /data/eellison/src/pytorch/agent_space/paramgraph/land/scratch/integration/serve/fi_ws_ht }
+  x-armv: { install: trace }
+qwen3.827bhtpad-fp4-gb300-vllm:
+  inherit: qwen3.827bht-fp4-gb300-vllm
+  model-prefix: qwen3.827bhtpad
+  x-env: { ARMV_PAD: '1' }
+qwen3.827bhtvp-fp4-gb300-vllm:
+  inherit: qwen3.827bht-fp4-gb300-vllm
+  model-prefix: qwen3.827bhtvp
+  x-env: { ARMV_VP: '1' }
+# Development model (not an InferenceX model): Qwen3-8B bf16, the Phase A configuration.
+qwen38b-bf16-gb300-vllm:
+  model: /data/eellison/models/Qwen3-8B
+  model-prefix: qwen38b
+  precision: bf16
+  framework: vllm
+  multinode: false
+  srt-recipe: recipes/qwen38b-bf16-vllm.yaml
+  x-armv: { install: observe }
+  x-env: { HOSTTRACE_TORCH_DISABLE_CACHES: '0' }
+  x-local: { kv-cache-memory-bytes: 128849018880, gpu-memory-utilization: 0.3 }
+  scenarios:
+    fixed-seq-len:
+    - { isl: 8192, osl: 1024, search-space: [ { tp: 1, conc-list: [1, 2, 4, 8, 16, 32, 64] } ] }
+    - { isl: 1024, osl: 1024, search-space: [ { tp: 1, conc-list: [1, 2, 4, 8, 16, 32, 64] } ] }
+qwen38beager-bf16-gb300-vllm: { inherit: qwen38b-bf16-gb300-vllm, model-prefix: qwen38beager, x-args: { enforce-eager: true }, x-env: { HOSTTRACE_TORCH_DISABLE_CACHES: '1' } }
+qwen38bht-bf16-gb300-vllm: { inherit: qwen38b-bf16-gb300-vllm, model-prefix: qwen38bht, x-args: { enforce-eager: true }, x-armv: { install: trace }, x-env: { HOSTTRACE_TORCH_DISABLE_CACHES: '1', ARMV_CUTE_OBSERVE: '1' } }
+qwen38bhtpad-bf16-gb300-vllm: { inherit: qwen38bht-bf16-gb300-vllm, model-prefix: qwen38bhtpad, x-env: { ARMV_PAD: '1' } }
+qwen38bhtvp-bf16-gb300-vllm: { inherit: qwen38bht-bf16-gb300-vllm, model-prefix: qwen38bhtvp, x-env: { ARMV_VP: '1' } }
+# V-stock (CORE_TASKS.md criterion-5 configuration; the headline arm since 10-08; with the FlashInfer trtllm-gen fork for
+# attention: CAND_FORK=1 ARMV_TRTLLM_FORK=1, as vllm/vstock_gpu0_c2.sh) and its default, both on the pinned
+# build (CAND_LINE=pinned: land/core/pinned, step242 + build_cpp8 + pinned memcpy nodes). Adapter serve/armV_stock.
+qwen38bp-bf16-gb300-vllm:
+  inherit: qwen38b-bf16-gb300-vllm
+  model-prefix: qwen38bp
+  x-env: { CAND_LINE: pinned, HOSTTRACE_TORCH_DISABLE_CACHES: '0' }
+qwen38bvs-bf16-gb300-vllm:
+  inherit: qwen38b-bf16-gb300-vllm
+  model-prefix: qwen38bvs
+  x-args: { enforce-eager: true }
+  x-armv: { install: trace }
+  x-env: { CAND_LINE: pinned, CAND_FORK: '1', ARMV_TRTLLM_FORK: '1', HOSTTRACE_TORCH_DISABLE_CACHES: '1', ARMV_SERVE_ADAPTER: /data/eellison/src/pytorch/agent_space/paramgraph/land/scratch/integration/serve/armV_stock,
+           ARMV_STOCK: '1', ARMV_METADATA: eager, ARMV_HOSTCUTS: '0', ARMV_DECODE_MAX_SEQ: actual, ARMV_PREFILL_MAX_KV: actual, ARMV_NO_REJIT: '1', ARMV_BOUND: '0' }
+qwen3.827bp-fp4-gb300-vllm:
+  inherit: qwen3.827b-fp4-gb300-vllm
+  model-prefix: qwen3.827bp
+  x-env: { CAND_LINE: pinned, HOSTTRACE_TORCH_DISABLE_CACHES: '0' }
+qwen3.827bvs-fp4-gb300-vllm:
+  inherit: qwen3.827b-fp4-gb300-vllm
+  model-prefix: qwen3.827bvs
+  x-args: { enforce-eager: true }
+  x-armv: { install: trace }
+  x-env: { CAND_LINE: pinned, CAND_FORK: '1', ARMV_TRTLLM_FORK: '1', HOSTTRACE_TORCH_DISABLE_CACHES: '1', ARMV_SERVE_ADAPTER: /data/eellison/src/pytorch/agent_space/paramgraph/land/scratch/integration/serve/armV_stock,
+           ARMV_STOCK: '1', ARMV_METADATA: eager, ARMV_HOSTCUTS: '0', ARMV_DECODE_MAX_SEQ: actual, ARMV_PREFILL_MAX_KV: actual, ARMV_NO_REJIT: '1', ARMV_BOUND: '0',
+           ARMV_CUTE_OBSERVE: '1', FLASHINFER_WORKSPACE_BASE: /data/eellison/src/pytorch/agent_space/paramgraph/land/scratch/integration/serve/fi_ws_ht }
+# Qwen3.8-Flash-Next NVFP4 (the priority model since 10-08 evening). Default = the recipe's single-GB300 override (eager
+# kernels, no torch.compile, FULL graphs for decode only); ours = the same args with --enforce-eager (no vLLM graphs) +
+# V-stock (pinned + trtllm-gen fork), so both arms run the same kernels and differ only in who graphs what.
+qwen3.8flashnext-fp4-gb300-vllm:
+  model: /data/eellison/models/Qwen3.8-Flash-Next-NVFP4   # Inferact/Qwen3.8-Flash-Next-NVFP4
+  model-prefix: qwen3.8flashnext
+  precision: fp4
+  framework: vllm
+  multinode: false
+  srt-recipe: recipes/qwen3.8flashnext-fp4-vllm.yaml
+  x-armv: { install: observe }
+  x-raw-args: [-cc.mode, none, -cc.cudagraph_mode, full_decode_only]
+  x-env: { CAND_LINE: pinned, HOSTTRACE_TORCH_DISABLE_CACHES: '0' }
+  x-local: { kv-cache-memory-bytes: 64424509440, gpu-memory-utilization: 0.75 }
+  scenarios:
+    fixed-seq-len:
+    - { isl: 8192, osl: 1024, search-space: [ { tp: 1, conc-list: [1, 2, 4, 8, 16, 32] } ] }
+    - { isl: 1024, osl: 1024, search-space: [ { tp: 1, conc-list: [1, 2, 4, 8, 16, 32] } ] }
+qwen3.8flashnextvs-fp4-gb300-vllm:
+  inherit: qwen3.8flashnext-fp4-gb300-vllm
+  model-prefix: qwen3.8flashnextvs
+  x-raw-args: [-cc.mode, none]
+  x-args: { enforce-eager: true }
+  x-armv: { install: trace }
+  x-env: { CAND_LINE: pinned, CAND_FORK: '1', ARMV_TRTLLM_FORK: '1', HOSTTRACE_TORCH_DISABLE_CACHES: '1',
+           ARMV_SERVE_ADAPTER: /data/eellison/src/pytorch/agent_space/paramgraph/land/scratch/integration/serve/armV_stock,
+           ARMV_STOCK: '1', ARMV_METADATA: eager, ARMV_HOSTCUTS: '0', ARMV_DECODE_MAX_SEQ: actual, ARMV_PREFILL_MAX_KV: actual, ARMV_NO_REJIT: '1',
+           ARMV_BOUND: '0', ARMV_CUTE_OBSERVE: '1',
+           FLASHINFER_WORKSPACE_BASE: /data/eellison/src/pytorch/agent_space/paramgraph/land/scratch/integration/serve/fi_ws_ht }

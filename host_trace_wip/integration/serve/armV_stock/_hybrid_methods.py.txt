@@ -1,0 +1,137 @@
+    def _forward_hybrid(self, t0, fc, input_ids, positions, amd, sm):
+        """HYBRID: the eager-metadata step over several metadata objects (one per KV cache group). Each distinct object
+        of the attn_metadata dict and each distinct slot mapping is walked by _md_walk: its CUDA tensors are arguments;
+        with STOCK its ints are symbolic int arguments (vLLM's stock values: no max_seq_len policy), otherwise keyed."""
+        from vllm.v1.attention.backends.flashinfer import FlashInferMetadata
+
+        objs, groups = {}, []
+        for name, md in amd.items():
+            if id(md) not in objs:
+                objs[id(md)] = len(groups)
+                groups.append((md, []))
+            groups[objs[id(md)]][1].append(name)
+        stock, kinds = [], set()
+        for md, _ in groups:
+            if type(md) is FlashInferMetadata:
+                if not self._form_ok({0: md}, {0: md.slot_mapping}, md, md.slot_mapping):
+                    return self._eager("eager_metadata_form", fc, input_ids, positions)
+                if not STOCK:
+                    stock += self._policy(md)
+            if getattr(md, "num_prefills", 0):
+                kinds.add("prefill")
+            if getattr(md, "num_decodes", 0):
+                kinds.add("decode")
+        kind = "mixed" if len(kinds) == 2 else kinds.pop() if kinds else "none"
+        slots, slot_of = [], {}
+        for name, t in sm.items():
+            if id(t) not in slot_of:
+                slot_of[id(t)] = len(slots)
+                slots.append(t)
+        tensors, ids, ints = list(slots), {id(t): i for i, t in enumerate(slots)}, []
+        try:
+            sig = tuple((tuple(names), _md_walk(md, tensors, ids, ints, STOCK)) for md, names in groups)
+        except _FormMismatch:
+            return self._eager("eager_metadata_form", fc, input_ids, positions)
+        smap = tuple((name, slot_of[id(t)]) for name, t in sm.items())
+        key = ("hyb", kind, "stock" if STOCK else input_ids.shape[0], tuple(positions.shape) if not STOCK else positions.dim(), sig, smap)
+        entry = self.entries.get(key)
+        if entry is None:
+            entry = self.entries[key] = R.HostTraceReplay(self._step_hybrid(key, len(tensors), len(ints)), opaque=(self.provider,), memory=MEMORY, **self.replay_kw)
+            self._count_slow(key, entry)
+        self.calls[kind] += 1
+        pre = self._save_states(groups) if self.check else None
+        self._ctx = (fc, groups, sig)
+        replays = entry.replays
+        try:
+            (out,) = entry(*self.prefix, input_ids, positions, *tensors, *ints)
+        finally:
+            self._ctx = None
+        if entry.replays > replays:
+            self.host_s[f"hyb/{kind}"].append(time.perf_counter() - t0)
+        if self.check:
+            self._check_hybrid(kind, out, fc, input_ids, positions, groups, pre, stock)
+        return out
+
+    def _step_hybrid(self, key, n_t, n_i):
+        from vllm.forward_context import override_forward_context
+
+        n_p, n_a = len(self.params), len(self.attrs)
+        smap = key[5]
+        proxy = self
+
+        def step(*flat):
+            fc, groups, sig = proxy._ctx
+            params = flat[:n_p]
+            attrs = flat[n_p:n_p + n_a]
+            input_ids, positions = flat[n_p + n_a:n_p + n_a + 2]
+            tensors = flat[n_p + n_a + 2:n_p + n_a + 2 + n_t]
+            ints = iter(flat[n_p + n_a + 2 + n_t:])
+            amd = {}
+            for (md, names), (_, msig) in zip(groups, sig):
+                amd.update(dict.fromkeys(names, _md_rebuild(md, msig, tensors, ints)))
+            sfc = copy.copy(fc)
+            sfc.attn_metadata = amd
+            sfc.slot_mapping = {name: tensors[i] for name, i in smap}
+            saved = proxy._swapped(attrs)
+            try:
+                with override_forward_context(sfc), _reparametrize_module(proxy.model, {n: params[s] for n, s in zip(proxy.names, proxy.slots)}, tie_weights=False):
+                    out = proxy.orig_forward(input_ids, positions)
+            finally:
+                for m, k, v in saved:
+                    _set(m, k, v)
+            return (out,)
+
+        return step
+
+    def _state_rows(self, groups):
+        """HYBRID check: the recurrent-state slots this step touches (the GDN / Mamba metadata's state indices)."""
+        idx = []
+        for md, _ in groups:
+            for k in ("non_spec_state_indices_tensor", "state_indices_tensor", "spec_state_indices_tensor"):
+                t = getattr(md, k, None)
+                if isinstance(t, torch.Tensor):
+                    idx.append(t.reshape(-1).long())
+        if not idx:
+            return None
+        rows = torch.unique(torch.cat(idx))
+        return rows[rows >= 0]
+
+    def _save_states(self, groups):
+        rows = self._state_rows(groups)
+        if rows is None:
+            return None
+        return rows, [[t.index_select(0, rows) for t in kv] for kv in self.state_lists]
+
+    def _load_states(self, saved):
+        rows, vals = saved
+        for kv, vs in zip(self.state_lists, vals):
+            for t, v in zip(kv, vs):
+                t.index_copy_(0, rows, v)
+
+    def _check_hybrid(self, kind, out, fc, input_ids, positions, groups, pre, stock):
+        """The replayed step against the model's eager forward on the same metadata, from the same recurrent state: V's
+        state rows after the step are saved, the pre-step rows restored, the eager forward runs, outputs and post-step
+        state rows are compared (NaN-aware: equal where both are NaN), and V's post-step rows are put back."""
+        from vllm.forward_context import override_forward_context
+
+        def same(a, b):
+            return a.shape == b.shape and bool(((a == b) | (a.isnan() & b.isnan()) if a.is_floating_point() else (a == b)).all())
+
+        got = out.clone()
+        torch.cuda.synchronize()
+        post = self._save_states(groups) if pre is not None else None
+        if pre is not None:
+            self._load_states(pre)
+        with override_forward_context(copy.copy(fc)):
+            want = self.orig_forward(input_ids, positions)
+        torch.cuda.synchronize()
+        row = {"kind": kind, "shape": list(want.shape), "bitwise": same(got, want), "nan": bool(want.isnan().any()),
+               "max_abs": float((got.float() - want.float()).nan_to_num().abs().max()) if got.shape == want.shape else None}
+        if pre is not None:
+            ref_post = self._save_states(groups)
+            row["state_bitwise"] = all(same(a, b) for va, vb in zip(post[1], ref_post[1]) for a, b in zip(va, vb))
+            row["state_rows"] = int(pre[0].numel())
+            self._load_states(post)
+        row["stock_parts"] = [type(part).__name__ for part, _ in stock]
+        self.checks.append(row)
+

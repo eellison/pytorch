@@ -1,0 +1,35 @@
+# Qwen3.8-Flash-Next NVFP4 (Inferact/Qwen3.8-Flash-Next-NVFP4) on one GB300 with vLLM, single-turn fixed-seq-len.
+# Args: the vLLM recipe (recipes.vllm.ai/Qwen/Qwen3.8-Flash-Next, read 10-08): base --no-enable-flashinfer-autotune;
+# Blackwell --kv-cache-dtype fp8 --attention-config.indexer_kv_dtype fp8; the single-GB300 (dgx_station_gb300) override
+# --max-num-seqs 32 --max-num-batched-tokens 8192 --distributed-executor-backend mp -cc.mode none
+# -cc.cudagraph_mode full_decode_only. InferenceX fixed-seq: --no-enable-prefix-caching (the recipe enables it); text only
+# (--language-model-only, the recipe's text_only option). The recipe's --gpu-memory-utilization 0.95 is replaced by the
+# master's x-local fixed KV pool (shared GPUs). Our SKU replaces the decode graphs with --enforce-eager + arm V.
+base:
+  schema: 2
+  name: qwen3.8flashnext-fp4-gb300-vllm
+  model: { path: /data/eellison/models/Qwen3.8-Flash-Next-NVFP4, precision: fp4 }
+  resources: { gpu_type: gb300, gpus_per_node: 1 }
+  frontend: { type: vllm }
+  engine: { type: vllm }
+  roles:
+    agg:
+      nodes: 1
+      workers: 1
+      gpus: 1
+      args:
+        tensor-parallel-size: 1
+        language-model-only: true
+        no-enable-flashinfer-autotune: true
+        kv-cache-dtype: fp8
+        attention-config.indexer_kv_dtype: fp8
+        max-num-seqs: 32
+        max-num-batched-tokens: 8192
+        distributed-executor-backend: mp
+        no-enable-prefix-caching: true
+        disable-uvicorn-access-log: true
+      env:
+        PYTHONNOUSERSITE: '1'
+  benchmark:
+    type: fixed-seq
+    env: { RANDOM_RANGE_RATIO: '0.8', USE_CHAT_TEMPLATE: 'false' }
