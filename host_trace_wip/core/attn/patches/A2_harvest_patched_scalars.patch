@@ -1,0 +1,690 @@
+--- a/torch/cuda/_host_trace_tape.py
++++ b/torch/cuda/_host_trace_tape.py
+@@ -43,7 +43,7 @@
+ from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode, unset_fake_temporarily
+ from torch.cuda import _host_trace_ir as _ir
+ from torch.cuda._host_trace import _drop_tracebacks, _TraceShapeEnv, Declined, declined, ProcessHold
+-from torch.cuda._host_trace_opaque import bind_at_trace, library_state, library_state_as, record_binding, trace_key
++from torch.cuda._host_trace_opaque import bind_at_trace, key_scalars, library_state, library_state_as, record_binding, trace_key
+ from torch.cuda._utils import _check_cuda_bindings
+ from torch.fx.experimental import _config as fx_config
+ from torch.fx.experimental.symbolic_shapes import free_symbols, free_unbacked_symbols
+@@ -226,6 +226,9 @@
+     # output at a storage offset): a replay at a key that binds is no reason
+     # to relower
+     bound: bool = False
++    # the key's scalars where it has patched ones (key_scalars), and those
++    patched: tuple[tuple[int, Any], ...] = ()
++    key_scalars: tuple[Any, ...] | None = None
+ 
+ 
+ @dataclass(frozen=True)
+@@ -1091,12 +1094,19 @@
+         outputs = tuple(o for o in pytree.tree_leaves(result) if isinstance(o, torch.Tensor))
+         if binding is not None:
+             operands = [a for a in leaves if isinstance(a, torch.Tensor)] + made
+-            scalars = [a for a in leaves if not isinstance(a, torch.Tensor)]
++            scalars, patched = key_scalars(provider, func, args, kwargs)
+             call = (spec, frozenset(j for j, a in enumerate(leaves) if isinstance(a, torch.Tensor)))
+-            self.sites.append(record_binding(self, func, provider, binding, operands, scalars, call, trace_key(func, args, kwargs, fakes)[0]))
++            key = trace_key(func, args, kwargs, fakes, provider)[0]
++            self.sites.append(record_binding(self, func, provider, binding, operands, scalars, call, key, tuple(patched)))
+         elif provider is not None:
+-            bound = provider.bind(trace_key(func, args, kwargs, fakes)[0]) is not None
+-            self.record_launch(OpaqueCall(func, args, kwargs, outputs, generator=self.generator, provider=provider, state=library_state(), bound=bound))
++            bound = provider.bind(trace_key(func, args, kwargs, fakes, provider)[0]) is not None
++            scalars, patched = key_scalars(provider, func, args, kwargs)
++            self.record_launch(
++                OpaqueCall(
++                    func, args, kwargs, outputs, generator=self.generator, provider=provider, state=library_state(), bound=bound,
++                    patched=tuple(patched), key_scalars=tuple(scalars) if patched else None,
++                )
++            )
+         else:
+             why = "; ".join(reasons) or None
+             self.record_launch(EagerCall(func, args, kwargs, outputs, why, self.generator, state))
+@@ -3469,7 +3479,7 @@
+                 call = (spec, frozenset(j for j, a in enumerate(leaves) if isinstance(a, torch.Tensor)))
+                 # the library state the call was traced under, which its key and site record
+                 with library_state_as(rec.state):
+-                    key = trace_key(rec.target, args, kwargs, fresh)[0]
++                    key = trace_key(rec.target, args, kwargs, fresh, rec.provider)[0]
+                     if learn is not None and rec.generator is None and rec.provider.bind(key) is None:
+                         learn(rec.target, rec.provider, call, key)
+                     binding, values, refusal = bind_at_trace(rec.provider, rec.target, args, kwargs, fresh)
+@@ -3486,9 +3496,9 @@
+                         roots[id(t._root)], tensors[id(t)] = m._root, m
+                         gone |= _sym_expr(t._root.sym).free_symbols
+                     operands = [a for a in leaves if isinstance(a, torch.Tensor)] + made
+-                    scalars = [a for a in leaves if not isinstance(a, torch.Tensor)]
++                    scalars, patched = key_scalars(rec.provider, rec.target, args, kwargs)
+                     with library_state_as(rec.state):
+-                        converted[id(rec)] = record_binding(tr, rec.target, rec.provider, binding, operands, scalars, call, key)
++                        converted[id(rec)] = record_binding(tr, rec.target, rec.provider, binding, operands, scalars, call, key, tuple(patched))
+                     sites.append(converted[id(rec)])
+                     made_by[at_launch[id(rec)]] = range(len(allocs), len(allocs) + len(tr.allocs) - first)
+                     allocs += tr.allocs[first:]
+--- a/torch/cuda/_host_trace_opaque.py
++++ b/torch/cuda/_host_trace_opaque.py
+@@ -48,7 +48,7 @@
+ 
+ 
+ if TYPE_CHECKING:
+-    from collections.abc import Iterable, Iterator
++    from collections.abc import Callable, Iterable, Iterator
+ 
+     from torch._ops import OpOverload
+     from torch.cuda._host_trace_tape import _Trace
+@@ -72,6 +72,10 @@
+     # per operand on a storage another operand is on: (operand, the operand
+     # lowest on the storage, the byte distance up from its address)
+     alias: tuple[tuple[int, int, int], ...] = ()
++    # per patched scalar (OpaqueProvider.patched): (its index in `scalars`,
++    # which holds its class there, its value at the call). Not the key's: a
++    # binding holds for every value of the class, the value a slot of it
++    patched: tuple[tuple[int, int], ...] = field(default=(), compare=False)
+ 
+ 
+ _STATE = (
+@@ -120,14 +124,15 @@
+     """Bytes of a node a replay writes per call: an address plus `delta`."""
+ 
+     param: int  # 0 for a memset's dst
+-    offset: int  # into the parameter, of 8 bytes
++    offset: int  # into the parameter, of `width` bytes
+     # "operand" or "scratch"; or the generator state an RNG kernel reads,
+     # fixed per capture: "philox_seed" and "philox_offset", the addresses of
+     # the capture's seed and offset, and "philox", its intragraph offset at
+-    # the call
++    # the call; or "scalar", a patched scalar's value (OpaqueKey.patched)
+     kind: str
+-    index: int  # operand i or scratch buffer j
++    index: int  # operand i, scratch buffer j, or patched scalar k
+     delta: int
++    width: int = 8  # 4 or 8 for a scalar
+ 
+ 
+ @dataclass(frozen=True)
+@@ -210,6 +215,8 @@
+     call: tuple[Any, frozenset[int]] | None = None
+     # the key the binding its nodes hold is the provider's for
+     key: OpaqueKey | None = field(default=None, compare=False)
++    # (index in scalars, value) per patched scalar, whose class `scalars` holds
++    patched: tuple[tuple[int, Any], ...] = ()
+ 
+     def fits(self, binding: OpaqueBinding) -> bool:
+         """Whether the site can run the binding: on its nodes or an arm's,
+@@ -243,6 +250,13 @@
+         may: a lookup, with no GPU work."""
+         ...
+ 
++    # per op, its int arguments whose value the provider's bindings take as a
++    # slot (a "scalar" Slot) rather than in the key: the argument's name, and
++    # the class of its values a binding holds for, a function of the call's
++    # (args, kwargs) the trace evaluates on its symbolic values (into the
++    # key in the argument's place)
++    patched: dict[OpOverload, tuple[str, Callable[..., Any]]]
++
+     def operands(self, key: OpaqueKey, inputs: int) -> dict[int, torch.Tensor] | None:
+         """For a key learned without its call: the inputs the provider lends
+         (by position, a buffer too big to allocate again), or None to learn
+@@ -294,7 +308,28 @@
+     return tuple(alias[j] for j in order), [distances[j] for j in order]
+ 
+ 
+-def trace_key(op: OpOverload, args: tuple, kwargs: dict, fresh: list) -> tuple[OpaqueKey, list[Any]]:
++def key_scalars(provider: OpaqueProvider | None, op: OpOverload, args: tuple, kwargs: dict) -> tuple[list[Any], list[tuple[int, Any]]]:
++    """The call's non-tensor leaves as its key holds them, a patched scalar's
++    (OpaqueProvider.patched) its class; and (index, value) per patched one."""
++    leaves = pytree.tree_leaves((args, kwargs))
++    scalars = [v for v in leaves if not isinstance(v, torch.Tensor)]
++    name, cls = getattr(provider, "patched", {}).get(op, (None, None))
++    if name is None:
++        return scalars, []
++    i = [a.name for a in op._schema.arguments].index(name)
++    marker = object()
++    if i < len(args):
++        args_at, kwargs_at = (*args[:i], marker, *args[i + 1 :]), kwargs
++    else:
++        args_at, kwargs_at = args, {**kwargs, name: marker}
++    at = [v for v in pytree.tree_leaves((args_at, kwargs_at)) if not isinstance(v, torch.Tensor)]
++    k = next(k for k, v in enumerate(at) if v is marker)
++    value = scalars[k]
++    scalars[k] = cls(*args, **kwargs)
++    return scalars, [(k, value)]
++
++
++def trace_key(op: OpOverload, args: tuple, kwargs: dict, fresh: list, provider: OpaqueProvider | None = None) -> tuple[OpaqueKey, list[Any]]:
+     """A call's key at the trace's hints, and the values it reads."""
+     from torch.cuda._host_trace_launch import _probe_address
+     from torch.cuda._host_trace_tape import _hint
+@@ -306,7 +341,7 @@
+     # an allocation's base is 256-byte aligned
+     align = [_probe_address(t) % 256 for t in traced]
+     align += [o.storage_offset() * o.element_size() % 256 for o in fresh]
+-    scalars = [v for v in leaves if not isinstance(v, torch.Tensor)]
++    scalars, patched = key_scalars(provider, op, args, kwargs)
+     alias, distances = aliasing(traced)
+     key = OpaqueKey(
+         op,
+@@ -318,6 +353,7 @@
+         next(t.device for t in (*traced, *fresh)).index,
+         library_state(),
+         alias,
++        tuple((k, _hint(v)) for k, v in patched),
+     )
+     return key, [*sum(sizes, ()), *sum(strides, ()), *align, *scalars, *distances]
+ 
+@@ -332,7 +368,7 @@
+ 
+     leaves = pytree.tree_leaves((call.args, call.kwargs))
+     fresh = [o for o in call.outputs if all(o is not t for t in leaves)]
+-    traced, values = trace_key(call.target, call.args, call.kwargs, fresh)
++    traced, values = trace_key(call.target, call.args, call.kwargs, fresh, call.provider)
+     # the distances are up from each storage's lowest operand at the trace
+     if [a[:2] for a in traced.alias] != [a[:2] for a in key.alias]:
+         return None
+@@ -353,7 +389,7 @@
+     binding's allocations replace."""
+     from torch.cuda._host_trace_tape import _hint
+ 
+-    key, all_values = trace_key(op, args, kwargs, fresh)
++    key, all_values = trace_key(op, args, kwargs, fresh, provider)
+     n = len(all_values) - len(key.alias)
+     # a provider that keys the alias holds the distances at their hints
+     distances = [v for v in all_values[n:] if isinstance(v, torch.SymInt)] if op in provider.aliased else []
+@@ -383,9 +419,11 @@
+     scalars: list[Any],
+     call: tuple[Any, frozenset[int]] | None = None,
+     key: OpaqueKey | None = None,
++    patched: tuple[tuple[int, Any], ...] = (),
+ ) -> KeyedSite:
+     """A bound call's nodes as the trace's launches and memsets, its scratch
+-    buffers as allocations; `operands` are traced tensors."""
++    buffers as allocations; `operands` are traced tensors, `scalars` the
++    key's (key_scalars) and `patched` its patched scalars."""
+     from cuda.bindings import driver
+ 
+     from torch.cuda._host_trace_launch import KernelLaunch
+@@ -403,6 +441,8 @@
+     roots = tuple({id(t._root): t._root for t in (*operands, *scratch.values())}.values())
+ 
+     def address(s: Slot) -> Any:
++        if s.kind == "scalar":
++            return patched[s.index][1] + s.delta
+         t = buffers[s.kind][s.index]
+         if torch.cuda._host_trace.bound_addresses_unguarded and _hint(t.numel()):
+             return t._root.sym + t._sym_offset * t.element_size() + s.delta
+@@ -433,9 +473,9 @@
+                 slots,
+                 roots,
+                 provider if binding.owner is None else (provider, binding.owner),
+-                tuple((s.param, s.offset, 8) for s in placed),
++                tuple((s.param, s.offset, s.width) for s in placed),
+                 attributes=tuple((k, v) for k, v in n.attributes if k != pdl),
+-                pointers=frozenset(range(len(slots))),
++                pointers=frozenset(i for i, s in enumerate(placed) if s.kind != "scalar"),
+                 images=n.images,
+                 programmatic=bool(dict(n.attributes).get(pdl)),
+                 rng=philox,
+@@ -445,4 +485,4 @@
+         )
+         tr.record_launch(nodes[-1])
+     sized = {j: (t, sizes[j]) for j, t in scratch.items()}
+-    return KeyedSite(op, provider, tuple(operands), tuple(scalars), sized, tuple(nodes), binding.topology, binding.rng, library_state(), call, key)
++    return KeyedSite(op, provider, tuple(operands), tuple(scalars), sized, tuple(nodes), binding.topology, binding.rng, library_state(), call, key, patched)
+--- a/torch/cuda/_host_trace_lower_tape.py
++++ b/torch/cuda/_host_trace_lower_tape.py
+@@ -162,7 +162,8 @@
+ 
+ 
+ def _opaque_key(
+-    op: OpOverload, dtypes: tuple, ranks: tuple[int, ...], scalars: tuple, device: int, state: tuple, ints: Iterable[int], alias: tuple
++    op: OpOverload, dtypes: tuple, ranks: tuple[int, ...], scalars: tuple, device: int, state: tuple, ints: Iterable[int], alias: tuple,
++    patched: tuple = (),
+ ) -> OpaqueKey:
+     # ints: per operand its sizes, then per operand its strides, then per
+     # operand its address % 256, then a value per symbolic scalar, then per
+@@ -180,7 +181,7 @@
+     for at in groups.values():
+         low, lead = min((d, i) for i, d in at.items())
+         pairs += [(i, lead, d - low) for i, d in at.items() if i != lead]
+-    return OpaqueKey(op, dtypes, sizes, strides, align, scalars, device, state, tuple(sorted(pairs)))
++    return OpaqueKey(op, dtypes, sizes, strides, align, scalars, device, state, tuple(sorted(pairs)), patched)
+ 
+ 
+ @dataclass(frozen=True)
+@@ -196,10 +197,12 @@
+     device: int
+     state: tuple
+     alias: tuple = ()  # OpaqueKey.alias at the trace; its distances' rows end `rows`
++    patched: tuple[tuple[int, int], ...] = ()  # (index in scalars, row) per patched scalar
+ 
+     def key(self, values: Sequence[int]) -> OpaqueKey:
+         ints = (values[r] for r in self.rows)
+-        return _opaque_key(self.op, self.dtypes, self.ranks, self.scalars, self.device, self.state, ints, self.alias)
++        patched = tuple((k, values[r]) for k, r in self.patched)
++        return _opaque_key(self.op, self.dtypes, self.ranks, self.scalars, self.device, self.state, ints, self.alias, patched)
+ 
+ 
+ @dataclass(frozen=True)
+@@ -218,13 +221,17 @@
+     device: int
+     alias: tuple = ()  # OpaqueKey.alias at the trace; its distances' rows end `rows`
+     arena_scratch: frozenset[int] = frozenset()  # buffers in an arena at their traced bytes
++    patched: tuple[tuple[int, int], ...] = ()  # (index in the key's scalars, row) per patched scalar
+ 
+     def native_scratch(self) -> list[int]:
+         """The scratch buffers native add_row sizes per key."""
+         return [j for j in sorted(self.scratch) if j not in self.arena_scratch]
+ 
+-    def key(self, ints: Sequence[int]) -> OpaqueKey:
+-        return _opaque_key(self.site.op, self.dtypes, self.ranks, self.site.scalars, self.device, self.site.state, ints, self.alias)
++    def key(self, ints: Sequence[int], values: Sequence[int] | None = None) -> OpaqueKey:
++        """The key at its rows' values `ints`; with the program's `values`,
++        its patched scalars' values too (a learn's call needs them)."""
++        patched = tuple((k, values[r]) for k, r in self.patched) if values is not None else ()
++        return _opaque_key(self.site.op, self.dtypes, self.ranks, self.site.scalars, self.device, self.site.state, ints, self.alias, patched)
+ 
+ 
+ @dataclass(frozen=True)
+@@ -453,6 +460,11 @@
+         strides = [r for _, v in operands for r in v.strides]
+         align = [self.emit("bitand", self.address(t, v.offset), mask) for t, v in operands]
+         scalars = tuple(v for v in eager.leaves if not isinstance(v, LoweredView))
++        patched = []
++        if call.key_scalars is not None:
++            # a patched scalar's class in its place in the key, its value a row
++            patched = [(k, self.row(v)) if isinstance(v, torch.SymInt) else (k, self.emit("constant", v)) for k, v in call.patched]
++            scalars = tuple(ScalarSlot(self.row(v)) if isinstance(v, torch.SymInt) else v for v in call.key_scalars)
+         slots = [v.row for v in scalars if isinstance(v, ScalarSlot)]
+         alias, distances = aliasing([t for t, _ in operands])
+         return LoweredOpaqueCall(
+@@ -465,6 +477,7 @@
+             self.tape.device.index,
+             call.state,
+             alias,
++            tuple(patched),
+         )
+ 
+     def address(self, t: _TracedTensor, offset: int) -> int:
+@@ -492,6 +505,7 @@
+         if any(isinstance(v, (torch.SymFloat, torch.SymBool)) for v in site.scalars):
+             raise declined(f"{site.op} has a symbolic float or bool argument")
+         scalars = [self.row(v) for v in site.scalars if isinstance(v, torch.SymInt)]
++        patched = tuple((k, self.row(v) if isinstance(v, torch.SymInt) else self.emit("constant", v)) for k, v in site.patched)
+         scratch = {j: (zero, self.base(self.roots[id(t._root)])) for j, (t, _) in site.scratch.items()}
+         alias, distances = aliasing(site.operands)
+         return LoweredKeyedSite(
+@@ -504,6 +518,7 @@
+             tuple(index[id(n)] for n in site.nodes),
+             self.tape.device.index,
+             alias,
++            patched=patched,
+         )
+ 
+     def launch(self, seq: int, launch: Any) -> LoweredLaunch | LoweredMemset | LoweredMemcpy:
+--- a/torch/cuda/_host_trace_native.py
++++ b/torch/cuda/_host_trace_native.py
+@@ -227,6 +227,8 @@
+     from torch.cuda._host_trace_opaque import OpaqueKernel, OpaqueMemset
+ 
+     def source(s: Slot) -> tuple[int, int, int]:
++        if s.kind == "scalar":
++            return (site.patched[s.index][1], -1, s.delta)
+         row, base = site.operands[s.index] if s.kind == "operand" else site.scratch[s.index]
+         return (row, base, s.delta)
+ 
+@@ -238,7 +240,7 @@
+             nodes.append((1, source(n.dst), n.value, n.element_size, n.width, n.height, n.pitch))
+             continue
+         images = n.images or tuple(bytes(size) for _, size in n.params)
+-        fields = tuple((s.param, s.offset, 8, True, *source(s)) for s in n.slots if s.kind not in _PHILOX)
++        fields = tuple((s.param, s.offset, s.width, s.kind != "scalar", *source(s)) for s in n.slots if s.kind not in _PHILOX)
+         philox = tuple((s.param, s.offset, _PHILOX.index(s.kind), s.delta) for s in n.slots if s.kind in _PHILOX)
+         increment = binding.rng_increment if n is first else 0
+         nodes.append((0, n.function, n.block, n.smem, n.grid, images, fields, philox, increment))
+--- a/torch/cuda/_host_trace_replay.py
++++ b/torch/cuda/_host_trace_replay.py
+@@ -773,7 +773,7 @@
+         pool = None
+         deferred = False
+         for i, key in missing:
+-            site, opaque_key = sites[i].site, sites[i].key(key)
++            site, opaque_key = sites[i].site, sites[i].key(key, values)
+             binding = site.provider.bind(opaque_key)
+             # an RNG site on a graph's generator (graphsafe RNG) learns in its learning variant, as bind_opaque's do
+             graphsafe = site.rng and any(getattr(n, "generator", None) is not None for n in site.nodes)
+@@ -829,7 +829,7 @@
+         the default generator, whose offset is put back (with restore_rng; the
+         worker's learns draw none): eager's next call draws where it would
+         have."""
+-        if provider.refusal(key) is not None:
++        if provider.refusal(key) is not None or (op in getattr(provider, "patched", {}) and not key.patched):
+             return None
+         spec, positions = call
+         inputs = len(positions)
+@@ -869,7 +869,11 @@
+             else:
+                 flat.zero_()
+             tensors.append(flat.as_strided(sizes, strides))
+-        given, scalars = iter(tensors), iter(key.scalars)
++        # a patched scalar's class in the key, its value at the call the key's too
++        values = list(key.scalars)
++        for k, v in key.patched:
++            values[k] = v
++        given, scalars = iter(tensors), iter(values)
+         args, kwargs = pytree.tree_unflatten([next(given) if j in positions else next(scalars) for j in range(spec.num_leaves)], spec)
+         fresh = []
+         if not lent:
+--- a/torch/cuda/_host_trace_harvest.py
++++ b/torch/cuda/_host_trace_harvest.py
+@@ -197,6 +197,8 @@
+ # a mirror of the allocation a constant address points into spans from this
+ # far below the lowest such address to this far past the highest
+ _MIRROR_BELOW, _MIRROR_ABOVE = 2 << 20, 64 << 20
++# how far from a patched scalar's value its other capture's may lie
++_PATCH_REACH = 4096
+ 
+ 
+ class _Refused(Exception):
+@@ -416,22 +418,99 @@
+     return tuple((int(a.id), bytes(a.value.pad)) for a in launch_attributes(attributes))
+ 
+ 
++def _other_value(cls: Callable[..., Any], leaves: list, spec: Any, at: int) -> int | None:
++    """Another value of the patched scalar at leaf `at` of the class its own
++    is in: the farthest above it within _PATCH_REACH with every value between
++    of the class too, else the farthest below (down to 1)."""
++    value = leaves[at]
++
++    def of(v: int) -> Any:
++        call_args, call_kwargs = pytree.tree_unflatten([v if j == at else a for j, a in enumerate(leaves)], spec)
++        return cls(*call_args, **call_kwargs)
++
++    own, other = of(value), None
++    for v in range(value + 1, value + _PATCH_REACH + 1):
++        if of(v) != own:
++            break
++        other = v
++    if other is None:
++        for v in range(value - 1, max(0, value - _PATCH_REACH), -1):
++            if of(v) != own:
++                break
++            other = v
++    return other
++
++
++def _scalar_slots(nodes: list, raw: list, moved: list, value: int, other: int, names: list) -> list:
++    """`nodes` (A's, classified) with a scalar slot per int32 or int64 of
++    its parameters that is `value` + d in A (`raw`) and `other` + d in the
++    capture at the other value (`moved`), the same d; every other byte not
++    in a slot or loose must be the same in both."""
++    out = []
++    for x, (n, a, b) in enumerate(zip(nodes, raw, moved)):
++        if isinstance(n, OpaqueMemset):
++            if dataclasses.astuple(a)[1:] != dataclasses.astuple(b)[1:]:
++                raise _Refused(f"a memset of {names} differs at another value of its patched scalar")
++            out.append(n)
++            continue
++        slots, images = list(n.slots), [bytearray(i) for i in n.images]
++        for param, (ia, ib) in enumerate(zip(a.images, b.images)):
++            known = bytearray(len(ia))
++            for t in n.slots:
++                if t.param == param:
++                    known[t.offset : t.offset + t.width] = b"\x01" * t.width
++            for p, at, length in n.loose:
++                if p == param:
++                    known[at : at + length] = b"\x01" * length
++            differ = [i for i in range(len(ia)) if ia[i] != ib[i] and not known[i]]
++            while differ:
++                off = differ[0] - differ[0] % 4
++                for width, fmt in ((4, "<i"), (8, "<q")):
++                    if off % width or off + width > len(ia):
++                        continue
++                    d = struct.unpack_from(fmt, ia, off)[0] - value
++                    if struct.unpack_from(fmt, ib, off)[0] - other == d and not any(known[off : off + width]):
++                        # the narrowest that explains it: an int64 only if its high half moves too
++                        if width == 4 and any(i in differ for i in range(off + 4, off + 8)) and off % 8 == 0:
++                            continue
++                        break
++                else:
++                    seen = f"{ia[off : off + 8].hex()} / {ib[off : off + 8].hex()}"
++                    raise _Refused(f"{names[x]} parameter {param} byte {off}: {seen} moves with the patched scalar ({value} / {other}), by no delta")
++                slots.append(Slot(param, off, "scalar", 0, d, width))
++                images[param][off : off + width] = bytes(width)
++                known[off : off + width] = b"\x01" * width
++                differ = [i for i in differ if not known[i]]
++        out.append(dataclasses.replace(n, images=tuple(map(bytes, images)), slots=tuple(slots)))
++    return out
++
++
+ def _launch(
+     binding: OpaqueBinding,
+     addresses: list[int],
+     scratch: list[int],
+     stream: int,
+     philox: tuple[int, int, int] = (0, 0, 0),
++    scalars: tuple[int, ...] = (),
+ ) -> None:
+     """The binding's nodes launched in order on `stream` at these addresses;
+     `philox` is the generator state its RNG kernels read: the seed's and
+-    offset's addresses, and the intragraph offset the call starts at."""
++    offset's addresses, and the intragraph offset the call starts at;
++    `scalars` its patched scalars' values."""
+ 
+     def value(s: Slot) -> int:
+         if s.kind.startswith("philox"):
+             return philox[("philox_seed", "philox_offset", "philox").index(s.kind)] + s.delta
+         return (addresses if s.kind == "operand" else scratch)[s.index] + s.delta
+ 
++    def images(n: OpaqueKernel) -> tuple[bytes, ...]:
++        # a scalar slot's bytes in the image: the launch writes 8-byte slots
++        out = [bytearray(i) for i in n.images]
++        for s in n.slots:
++            if s.kind == "scalar":
++                struct.pack_into({4: "<i", 8: "<q"}[s.width], out[s.param], s.offset, scalars[s.index] + s.delta)
++        return tuple(map(bytes, out))
++
+     torch._C._cuda_hostTraceLaunch(
+         stream,
+         [
+@@ -443,8 +522,8 @@
+                 n.block,
+                 n.smem,
+                 _raw_attributes(n.attributes),
+-                n.images,
+-                [(s.param, s.offset, value(s)) for s in n.slots],
++                images(n),
++                [(s.param, s.offset, value(s)) for s in n.slots if s.kind != "scalar"],
+             )
+             for n in binding.nodes
+         ],
+@@ -661,7 +740,12 @@
+     `lendable` tensors of their dtype, which it reads and does not write. A
+     group on one storage (OpaqueKey.alias: K and V views of one KV layer) is
+     views of one lendable tensor at the key's distances; without
+-    `lend_alias_groups` such a key refuses."""
++    `lend_alias_groups` such a key refuses. `patched` (OpaqueProvider.patched)
++    names an extern op's int argument a binding takes as a slot, keyed on
++    its class: the harvest captures the call again at another value of the
++    class (_other_value) and each int32 or int64 that moves with it, by the
++    same delta, is a scalar slot; any other difference refuses the key, and
++    the check runs at that other value."""
+ 
+     def __init__(
+         self,
+@@ -673,6 +757,7 @@
+         extern_cap: int | None = None,
+         extern_digest: str = "full",
+         lend_alias_groups: bool = True,
++        patched: dict[Any, tuple[str, Callable[..., Any]]] | None = None,
+     ) -> None:
+         if extern_digest not in ("full", "rows"):
+             raise ValueError(f"extern_digest {extern_digest!r}")
+@@ -682,6 +767,7 @@
+         self.extern = frozenset(extern_ops) if "extern" in families else frozenset()
+         self.aliased = self.extern
+         self.indexed = {op: names for op, names in (indexed or {}).items() if op in self.extern}
++        self.patched = {op: p for op, p in (patched or {}).items() if op in self.extern}
+         self.ops = frozenset().union(*(_FAMILIES[f] for f in families)) | self.rng | self.extern
+         self.harvests = 0
+         self.bindings: dict[tuple, OpaqueBinding] = {}
+@@ -933,7 +1019,7 @@
+                 with _gc_hold, _LOCK, library_state_as(key.state):
+                     binding = None
+                     group = (_OUT.get(key.op, key.op), key.dtypes, key.device, key.state)
+-                    sibling = key.op in _OUT or key.op in _ATTENTION or key.op in self.extern
++                    sibling = key.op in _OUT or key.op in _ATTENTION or (key.op in self.extern and key.op not in self.patched)
+                     siblings = self.templates.get(group) if sibling and _SIBLINGS else None
+                     pair = _PAIR
+                     # a refusal of the two captures is the four's to make
+@@ -983,6 +1069,20 @@
+             raise _Disabled("no harvest in this build")
+         op = key.op
+         leaves, spec = pytree.tree_flatten((args, kwargs))
++        # a patched scalar: the check runs at another value of its class
++        patch = self.patched.get(op)
++        check_leaves, check_scalars, patched_value = leaves, (), None
++        if patch is not None:
++            scalar_leaves = [j for j, a in enumerate(leaves) if not isinstance(a, torch.Tensor)]
++            if len(key.patched) != 1 or leaves[scalar_leaves[key.patched[0][0]]] != key.patched[0][1]:
++                raise _Refused(f"{op}'s patched argument {patch[0]} is not the call's")
++            patched_at = scalar_leaves[key.patched[0][0]]
++            patched_value = leaves[patched_at]
++            other_value = _other_value(patch[1], leaves, spec, patched_at)
++            if other_value is None:
++                raise _Transient(f"{op}: no other value of {patch[0]} = {patched_value}'s class within {_PATCH_REACH}")
++            check_leaves = [other_value if j == patched_at else a for j, a in enumerate(leaves)]
++            check_scalars = (other_value,)
+         # the operands the arena holds: the inputs, and an out= overload's
+         # output; the rest are fresh outputs the call allocates in the pool
+         placed = sum(isinstance(a, torch.Tensor) for a in leaves)
+@@ -1089,7 +1189,7 @@
+         kept: list[torch.Tensor] = []
+         returns = [r.alias_info is None for r in op._schema.returns]
+ 
+-        def capture(x: int, stream: torch.cuda.Stream, tensors: list, prime: bool = False) -> tuple:
++        def capture(x: int, stream: torch.cuda.Stream, tensors: list, prime: bool = False, at: list | None = None) -> tuple:
+             nonlocal grown
+             graph = torch.cuda.CUDAGraph(keep_graph=True)
+             graphs.append(graph)
+@@ -1097,7 +1197,7 @@
+                 call_args, call_kwargs = tuple(tensors[:-1]), {"out": tensors[-1]}
+             else:
+                 it = iter(tensors)
+-                filled = [next(it) if isinstance(a, torch.Tensor) else a for a in leaves]
++                filled = [next(it) if isinstance(a, torch.Tensor) else a for a in (leaves if at is None else at)]
+                 call_args, call_kwargs = pytree.tree_unflatten(filled, spec)
+             # a convolution's fresh outputs each get a free block of exactly its
+             # bytes, and the pool no other free block: cuDNN's dgrad frees its
+@@ -1266,7 +1366,7 @@
+                     t.fill_(fill)
+                 if mirrors is not None:
+                     mirrors.fill(fill)
+-                _launch(b, addrs, [t.data_ptr() for t in scratch], stream, philox)
++                _launch(b, addrs, [t.data_ptr() for t in scratch], stream, philox, check_scalars)
+                 done = torch.cuda.Event()
+                 done.record()
+                 deadline = time.monotonic() + _HANG
+@@ -1425,7 +1525,7 @@
+                 else:
+                     it = iter(ref_in)
+                     call_args, call_kwargs = pytree.tree_unflatten(
+-                        [next(it) if isinstance(a, torch.Tensor) else a for a in leaves], spec
++                        [next(it) if isinstance(a, torch.Tensor) else a for a in check_leaves], spec
+                     )
+ 
+                     def fresh_outputs() -> list[torch.Tensor]:
+@@ -1627,6 +1727,8 @@
+                         capture(3, s, sets[0]),
+                     ]
+                 siblings = None
++            # A again at the patched scalar's other value
++            at_other = capture(0, s, sets[0], at=check_leaves) if patch is not None else None
+         finally:
+             # with its graphs reset (a refusal's traceback may hold one) and
+             # its tensors gone, the pool's blocks are free: cached for the
+@@ -1835,6 +1937,10 @@
+                 images.append(bytes(image))
+             nodes.append(dataclasses.replace(a, images=tuple(images), slots=tuple(slots), loose=tuple(loose)))
+ 
++        if at_other is not None:
++            if [n for _, n in at_other[2]] != sizes[0] or list(map(shape, at_other[0])) != list(map(shape, caps[0][0])):
++                raise _Refused(f"{names} launch otherwise at {patch[0]} = {check_scalars[0]}, of {patched_value}'s class")
++            nodes = _scalar_slots(nodes, caps[0][0], at_other[0], patched_value, check_scalars[0], names)
+         binding = _renumbered(nodes, sizes[0], increment, tuple(c[6] for c in caps if c[6] is not None) or None, key.op in _OUT)
+         kinds = {t.kind for n in binding.nodes for t in _slots(n)}
+         if increment and not {"philox_seed", "philox_offset", "philox"} <= kinds:
+--- a/test/test_cuda_host_trace_harvest.py
++++ b/test/test_cuda_host_trace_harvest.py
+@@ -1158,6 +1158,7 @@
+ _extern_lib.define("store_kv(Tensor k, Tensor v, Tensor(a!) k_cache, Tensor(b!) v_cache, Tensor loc) -> ()")
+ _extern_lib.define("double_into(Tensor x, Tensor(a!) out) -> ()")
+ _extern_lib.define("store_paged(Tensor k, Tensor v, Tensor(a!) k_cache, Tensor(b!) v_cache, Tensor slot) -> ()")
++_extern_lib.define("fill_split(Tensor(a!) out, SymInt n) -> ()")
+ 
+ 
+ def _scale_qk(q, k, w):
+@@ -1187,6 +1188,16 @@
+     torch.mul(x, 2, out=out)
+ 
+ 
++def _fill_split(out, n):
++    # a launch whose grid reads a class of n (as a split count) and whose
++    # parameters hold n itself (the fill value)
++    out[:, : 8 * min((n + 63) // 64, 4)].fill_(n)
++
++
++def _split_class(out, n):
++    return torch.sym_min((n + 63) // 64, 4)
++
++
+ _extern_lib.impl("double_into", _double_into, "CUDA")
+ torch.library.register_fake("ht_extern::double_into", lambda x, out: None, lib=_extern_lib)
+ _extern_lib.impl("scale_qk", _scale_qk, "CUDA")
+@@ -1197,6 +1208,8 @@
+ torch.library.register_fake("ht_extern::store_paged", lambda k, v, k_cache, v_cache, slot: None, lib=_extern_lib)
+ torch.library.register_fake("ht_extern::scale_qk", lambda q, k, w: None, lib=_extern_lib)
+ torch.library.register_fake("ht_extern::rope_qk", lambda q, k, pos, table: None, lib=_extern_lib)
++_extern_lib.impl("fill_split", _fill_split, "CUDA")
++torch.library.register_fake("ht_extern::fill_split", lambda out, n: None, lib=_extern_lib)
+ 
+ 
+ @instantiate_parametrized_tests
+@@ -1235,6 +1248,35 @@
+     def eager_calls(self, r):
+         return [rec for v in r.variants for _, rec in v.tape.launches if type(rec) is EagerCall]
+ 
++    @staticmethod
++    def fill_split(out, n):
++        torch.ops.ht_extern.fill_split(out, n)
++        return out + 1
++
++    @parametrize("coarse", [False, True])
++    def test_a_patched_scalar_is_a_slot_of_its_class(self, coarse):
++        # n keyed on its class: a binding per class, n a scalar slot of it,
++        # found by a capture at another n of the class and checked there. A
++        # class coarser than what the launch reads refuses at that capture
++        op = torch.ops.ht_extern.fill_split.default
++        p = HarvestProvider(("extern",), extern_ops=(op,), patched={op: ("n", (lambda out, n: 0) if coarse else _split_class)})
++        r = HostTraceReplay(self.fill_split, opaque=(p,))
++        for n in (70, 71, 100, 128, 129, 300, 20, 75, 5000, 129):
++            out = torch.zeros(4, 32, dtype=torch.int32, device="cuda")
++            ref = out.clone()
++            self.assertEqual(r(out, n), self.fill_split(ref, n), atol=0, rtol=0)
++            self.assertEqual(out, ref, atol=0, rtol=0)
++        if coarse:
++            self.assertEqual(p.bindings, {})
++            self.assertTrue(all("launch otherwise at n = " in why for why in p.refused.values()), p.refused)
++            return
++        self.assertEqual(r.traces, 1)
++        self.assertEqual((p.harvests, len(p.bindings), p.refused), (4, 4, {}))
++        self.assertEqual(sorted(k[6][0] for k in p.bindings), [1, 2, 3, 4])
++        slots = [t for b in p.bindings.values() for n in b.nodes for t in n.slots if t.kind == "scalar"]
++        self.assertEqual([(t.index, t.delta, t.width) for t in slots], [(0, 0, 4)] * 4)
++        self.assertEqual(self.eager_calls(r), [])
++
+     def test_aliased_written_operands(self):
+         # q and k as views of one storage: harvested and replayed bitwise, the
+         # distance between them part of the key (k after q, then after v)

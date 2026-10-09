@@ -1,0 +1,94 @@
+--- a/torch/csrc/cuda/host_trace/Program.cpp
++++ b/torch/csrc/cuda/host_trace/Program.cpp
+@@ -42,6 +42,16 @@
+       {"fdiv", Op::FDiv},
+       {"feq", Op::FEq},
+       {"flt", Op::FLt},
++      {"fadd", Op::FAdd},
++      {"fsub", Op::FSub},
++      {"fmul", Op::FMul},
++      {"f32i", Op::F32I},
++      {"f32r", Op::F32R},
++      {"f32add", Op::F32Add},
++      {"f32sub", Op::F32Sub},
++      {"f32mul", Op::F32Mul},
++      {"f32quot", Op::F32Quot},
++      {"f32fma", Op::F32Fma},
+       {"min", Op::Min},
+       {"max", Op::Max},
+       {"select", Op::Select},
+@@ -85,9 +95,10 @@
+     TORCH_CHECK_VALUE(op != ops.end(), "row ", row, ": unknown op ", name);
+     size_t arity = 2;
+     if (op->second == Op::Constant || op->second == Op::BitLength ||
+-        op->second == Op::ToFloat || op->second == Op::FSqrt) {
++        op->second == Op::ToFloat || op->second == Op::FSqrt ||
++        op->second == Op::F32I || op->second == Op::F32R) {
+       arity = 1;
+-    } else if (op->second == Op::Select) {
++    } else if (op->second == Op::Select || op->second == Op::F32Fma) {
+       arity = 3;
+     } else if (op->second == Op::Min || op->second == Op::Max) {
+       arity = std::max<size_t>(count, 2);
+@@ -296,6 +307,42 @@
+       out = std::bit_cast<int64_t>(q);
+       break;
+     }
++    // IEEE operations as the host's C++ does them; a float32 value is held
++    // as the double it converts to exactly
++    case Op::FAdd:
++      out = std::bit_cast<int64_t>(std::bit_cast<double>(a) + std::bit_cast<double>(b));
++      break;
++    case Op::FSub:
++      out = std::bit_cast<int64_t>(std::bit_cast<double>(a) - std::bit_cast<double>(b));
++      break;
++    case Op::FMul:
++      out = std::bit_cast<int64_t>(std::bit_cast<double>(a) * std::bit_cast<double>(b));
++      break;
++    case Op::F32I:
++      out = std::bit_cast<int64_t>(static_cast<double>(static_cast<float>(a)));
++      break;
++    case Op::F32R:
++      out = std::bit_cast<int64_t>(static_cast<double>(static_cast<float>(std::bit_cast<double>(a))));
++      break;
++    case Op::F32Add:
++    case Op::F32Sub:
++    case Op::F32Mul:
++    case Op::F32Quot: {
++      const float x = static_cast<float>(std::bit_cast<double>(a));
++      const float y = static_cast<float>(std::bit_cast<double>(b));
++      const float r = row.op == Op::F32Add ? x + y
++          : row.op == Op::F32Sub       ? x - y
++          : row.op == Op::F32Mul       ? x * y
++                                       : x / y;
++      out = std::bit_cast<int64_t>(static_cast<double>(r));
++      break;
++    }
++    case Op::F32Fma:
++      out = std::bit_cast<int64_t>(static_cast<double>(std::fmaf(
++          static_cast<float>(std::bit_cast<double>(a)),
++          static_cast<float>(std::bit_cast<double>(b)),
++          static_cast<float>(std::bit_cast<double>(values[x[2]])))));
++      break;
+     case Op::FEq:
+       out = std::bit_cast<double>(a) == std::bit_cast<double>(b);
+       break;
+--- a/torch/csrc/cuda/host_trace/Program.h
++++ b/torch/csrc/cuda/host_trace/Program.h
+@@ -103,6 +103,16 @@
+     FDiv,
+     FEq,
+     FLt,
++    FAdd,
++    FSub,
++    FMul,
++    F32I,
++    F32R,
++    F32Add,
++    F32Sub,
++    F32Mul,
++    F32Quot,
++    F32Fma,
+     Min,
+     Max,
+     Select,

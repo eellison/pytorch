@@ -1,0 +1,68 @@
+--- a/test/test_cuda_host_trace_cute.py
++++ b/test/test_cuda_host_trace_cute.py
+@@ -151,6 +151,12 @@
+     def _plus_one(mA: cute.Tensor, mC: cute.Tensor, n: cutlass.Int32, stream: cuda_driver.CUstream):
+         _plus_one_kernel(mA, mC, n).launch(grid=[(n + 127) // 128, 1, 1], block=[128, 1, 1], stream=stream)
+ 
++    # FlashInfer's mxfp8 GEMM's grid: a static leaf among dynamic ones, over a tile of fewer modes
++    @cute.jit
++    def _plus_one_tiles(mA: cute.Tensor, mC: cute.Tensor, n: cutlass.Int32, stream: cuda_driver.CUstream):
++        t = cute.ceil_div((n, 1, n), (128,))
++        _plus_one_kernel(mA, mC, n).launch(grid=[t[0], t[1], 1], block=[128, 1, 1], stream=stream)
++
+     def _compile_add(shape=None, env_stream=True):
+         t = make_fake_compact_tensor(
+             cutlass.Float32, shape or (cute.sym_int32(),), assumed_align=16
+@@ -463,6 +469,23 @@
+         ty = '!cute.int_tuple<"(?,?{i64})">'
+         self.assertEqual(htc._wrap(ty, (2**32 + 1, 2**32 + 1), []), (1, 2**32 + 1))
+ 
++    def test_a_ceil_div_by_a_tile_of_fewer_modes(self):
++        t = make_fake_compact_tensor(cutlass.Float32, (cute.sym_int32(),), assumed_align=16)
++        tiles = cute.compile(_plus_one_tiles, t, t, cutlass.Int32(0), make_fake_stream(use_tvm_ffi_env_stream=True), options="--enable-tvm-ffi")
++
++        def f(a):
++            c = torch.empty_like(a)
++            tiles(a, c, a.shape[0])
++            return c
++
++        ((_, launch),) = trace(f, (torch.randn(1000, device="cuda"),)).launches
++        self.assertIsInstance(launch, KernelLaunch)
++        r = HostTraceReplay(f)
++        for n in (1000, 2000, 300):
++            a = torch.randn(n, device="cuda")
++            self.assertEqual(r(a), a + 1, atol=0, rtol=0)
++        self.assertEqual((r.traces, r.eager, r.declines), (1, 0, []))
++
+     def test_repeated_launches_parse_types_once(self):
+         # every call of a compiled function re-evaluates its host program; the
+         # MLIR type strings it parses are the same each time
+--- a/torch/cuda/_host_trace_cute.py
++++ b/torch/cuda/_host_trace_cute.py
+@@ -333,7 +333,11 @@
+ def _elementwise(f: Callable[[Any, Any], Any], x: Any, y: Any) -> Any:
+     if isinstance(x, tuple):
+         ys = y if isinstance(y, tuple) else (y,) * len(x)
+-        return tuple(_elementwise(f, a, b) for a, b in zip(x, ys, strict=True))
++        if f is _ceil_div:
++            ys += (1,) * (len(x) - len(ys))  # a tile of fewer modes leaves the rest whole
++        if len(ys) != len(x):
++            raise _Undescribed(f"an elementwise op of {len(x)} modes by {len(ys)}")
++        return tuple(_elementwise(f, a, b) for a, b in zip(x, ys))
+     return f(x, y)
+ 
+ 
+@@ -596,11 +600,11 @@
+         a = [self.operand(op, k) for k in range(len(op.operands))]
+         if n in _PASS or (n == "cute.make_int_tuple" and len(a) == 1):
+             return _wrap(op.types[0], a[0], self.predicates)
+-        if n in ("cute.make_int_tuple", "vector.from_elements", "cute.make_atom"):
++        if n in ("vector.from_elements", "cute.make_atom"):
+             return tuple(a)  # an atom as its runtime state
+         if n == "cute.make_tiled_mma":
+             return a[0]
+-        if n in ("cute.make_shape", "cute.make_stride"):
++        if n in ("cute.make_shape", "cute.make_stride", "cute.make_int_tuple"):
+             # the type's pattern, its dynamic leaves the operands' in order
+             m = re.fullmatch(r'!cute\.\w+<"(.*)">', op.types[0])
+             pat, given = _parse_tuple(m.group(1)), iter(_flat(tuple(a)))

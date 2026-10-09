@@ -1,0 +1,390 @@
+--- a/torch/cuda/_host_trace_tape.py
++++ b/torch/cuda/_host_trace_tape.py
+@@ -375,6 +375,9 @@
+         self._seq = itertools.count()
+         self.inputs: list[_InputRec] = []
+         self.arguments: dict[int, _InputRec] = {}  # by id of its root
++        # the call's real arguments, by position: host state of an argument's
++        # allocation reads them (_real_argument)
++        self.real_args: tuple = ()
+         # argument positions i < j, where a step not run eagerly writes one
+         # and reads the other (Tape.argument_pairs)
+         self.argument_pairs: set[tuple[int, int]] = set()
+@@ -1999,6 +1990,28 @@
+ _ir.INT_READ = _note_int_read
+ 
+ 
++# the bits of an argument's base symbol's hint that are its address (_Trace.input)
++_ADDRESS_MOD = _PLACEHOLDER_LOW + 1
++
++
++def _real_argument(t: torch.Tensor) -> torch.Tensor:
++    """The real argument whose storage traced tensor t views (C++
++    Recorder::real_argument), for host state keyed by the argument's
++    allocation, as a symmetric buffer's rendezvous: the trace guards the
++    argument's address, a guard of the running op's (a call with another
++    buffer dispatches the op again)."""
++    tr = current_trace()
++    rec = tr.arguments.get(id(t._root)) if tr is not None and isinstance(t, _TracedTensor) else None
++    if rec is None or rec.position >= len(tr.real_args):  # type: ignore[union-attr]
++        raise declined("host state of a tensor that is not a view of an argument")
++    real = tr.real_args[rec.position]  # type: ignore[union-attr]
++    base = real.untyped_storage().data_ptr()
++    # the base symbol's hint is the address under a tag (_PLACEHOLDER_TAG): its low bits are the address's
++    if t._root.sym % _ADDRESS_MOD != base % _ADDRESS_MOD:
++        raise declined("an argument's host state at another address than its trace's")
++    return real
++
++
+ def _same_start(a: torch.Tensor, b: torch.Tensor) -> bool:
+     # copy_impl's same-data test (torch/csrc/cuda/host_trace/Aten.cpp): one
+     # root and one offset; distinct roots are distinct allocations (arguments
+@@ -2966,6 +2961,7 @@
+         try:
+             with _gc_hold, _capture(device), intercepting(), cute_intercepting():
+                 tr = _Trace(device, trusted, opaque, static_shapes, check_escapes, eager_ops, declined_compiles=declined_compiles)
++                tr.real_args = tuple(args)
+                 out, traced = _symbolic_run(tr, fn, args, positions, int_positions)
+                 result_kind, outputs = _output_records(out, traced, positions)
+                 if witness is not None:
+--- a/torch/cuda/_host_trace_redispatch.py
++++ b/torch/cuda/_host_trace_redispatch.py
+@@ -262,6 +262,7 @@
+         fake.fake_tensor_converter = FakeTensorConverter(export=False)
+         tr = _Trace(old.device, fake_mode=fake, shape_env=env)
+         tr.inputs, tr.arguments = inputs, {id(i.root): i for i in inputs}
++        tr.real_args = tuple(lo.program.inputs)
+         tr.outer = {k: _TracedTensor(*o) for k, o in outer.items()}
+         built = {k: _TracedTensor(*t) for k, t in tensors.items()}
+         call = pytree.tree_map_only(_TracedTensor, lambda a: built[id(a)], call)
+--- /dev/null	2026-10-07 21:13:59.089592864 -0700
++++ b/test/test_cuda_host_trace_symm.py	2026-10-08 21:45:24.820644709 -0700
+@@ -0,0 +1,328 @@
++# Owner(s): ["module: cuda graphs"]
++# torch.ops.symm_mem collectives under host tracing: their own CUDA host code
++# (CUDASymmetricMemoryOps.cu) runs over SymInts under the trace's recorder, so
++# each collective is a kernel node of the replayed graph. Single-rank tests use
++# a one-rank group (the host code's decisions, no peer); the two-rank suite
++# (HostTraceSymmTest) needs two GPUs.
++
++import os
++import unittest
++
++import torch
++import torch.distributed as dist
++import torch.distributed._symmetric_memory as symm_mem
++from torch.cuda import _host_trace_replay
++from torch.cuda._host_trace_tape import EagerCall
++from torch.testing._internal.common_distributed import (
++    MultiProcContinuousTest,
++    PLATFORM_SUPPORTS_SYMM_MEM,
++    skip_if_lt_x_gpu,
++)
++from torch.testing._internal.common_utils import (
++    instantiate_parametrized_tests,
++    parametrize,
++    requires_cuda_p2p_access,
++    run_tests,
++    skipIfRocm,
++    TEST_CUDA,
++    TestCase,
++)
++
++
++symm_ops = torch.ops.symm_mem
++N_MAX = 1 << 16
++
++
++class HostTraceReplay(_host_trace_replay.HostTraceReplay):
++    # traces at its first call, as the replay suite's
++    def __init__(self, *args, **kwargs):
++        super().__init__(*args, **kwargs)
++        self._called = True
++
++
++def one_shot(buf, x, group_name):
++    p = x * 2
++    full = symm_ops.one_shot_all_reduce_copy(buf.narrow(0, 0, p.numel()).view(p.shape), p, "sum", group_name)
++    return full + 1
++
++
++def two_shot_vllm(buf, x, group_name):
++    # vLLM's SymmMemCommunicator.all_reduce: copy in, two_shot_all_reduce_ in place, copy out
++    p = x * 2
++    n = p.numel()
++    buf[:n].copy_(p.view(-1))
++    symm_ops.two_shot_all_reduce_(buf[:n], "sum", group_name)
++    out = torch.empty_like(p)
++    out.copy_(buf[:n].view(p.shape))
++    return out + 1
++
++
++def _eager_steps(f):
++    return [r for v in f.variants for _, r in v.tape.launches if isinstance(r, EagerCall)]
++
++
++@unittest.skipIf(not TEST_CUDA or not PLATFORM_SUPPORTS_SYMM_MEM, "symmetric memory")
++class TestSymmSingleRank(TestCase):
++    """A one-rank group: each collective's host decisions and launch, traced
++    and replayed, with no peer."""
++
++    @classmethod
++    def setUpClass(cls):
++        super().setUpClass()
++        if not dist.is_initialized():
++            os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
++            os.environ.setdefault("MASTER_PORT", str(29500 + os.getpid() % 2000))
++            torch.cuda.set_device(0)
++            dist.init_process_group("nccl", rank=0, world_size=1, device_id=torch.device("cuda", 0))
++        cls.group_name = dist.group.WORLD.group_name
++
++    def buffer(self, dtype=torch.bfloat16):
++        buf = symm_mem.empty(N_MAX, dtype=dtype, device="cuda")
++        symm_mem.rendezvous(buf, group=self.group_name)
++        return buf
++
++    def check(self, f, fn, args):
++        self.assertEqual(f(*args), fn(*args), atol=0, rtol=0)
++
++    @parametrize("fn", [one_shot, two_shot_vllm])
++    def test_the_collective_is_a_kernel_of_the_graph(self, fn):
++        buf = self.buffer()
++        f = HostTraceReplay(fn)
++        for n in (1024, 2048, 1024, 4096, 2048):
++            self.check(f, fn, (buf, torch.randn(n, device="cuda").to(torch.bfloat16), self.group_name))
++        self.assertEqual(_eager_steps(f), [])
++        self.assertEqual((f.traces, f.eager), (1, 0))
++        self.assertGreater(f.replays, 0)
++
++    def test_a_host_decision_flip_dispatches_the_op_again(self):
++        # one_shot_all_reduce at bf16: a numel of 8k, 8k + 4 or 8k + 2 elements takes the 16-, 8- or 4-byte
++        # kernel (the alignment guards), each with one block of up to 512 threads up to 4096, 2048 or 1024
++        # elements, more blocks above (the launch config's guard): six classes. Each flip is the op's own
++        # guard: it dispatches again, never a retrace
++        buf = self.buffer()
++        f = HostTraceReplay(one_shot)
++        sizes = (1024, 1028, 1022, 8192, 8196, 8198, 1024, 8196, 1022, 8192)
++        for n in sizes:
++            self.check(f, one_shot, (buf, torch.randn(n, device="cuda").to(torch.bfloat16), self.group_name))
++        self.assertEqual(_eager_steps(f), [])
++        self.assertEqual((f.traces, f.eager, f.redispatches), (1, 0, 5))
++        self.assertEqual(f.replays, len(sizes) - 1)
++
++    def test_another_buffer_dispatches_the_op_again(self):
++        # the peer and signal pad tables are the buffer's: the op guards the buffer's address, its own guard
++        bufs = (self.buffer(), self.buffer())
++        f = HostTraceReplay(one_shot)
++        for i in range(6):
++            self.check(f, one_shot, (bufs[i % 2], torch.randn(2048, device="cuda").to(torch.bfloat16), self.group_name))
++        self.assertEqual(_eager_steps(f), [])
++        self.assertEqual((f.traces, f.eager), (1, 0))
++        self.assertGreaterEqual(f.redispatches, 1)
++
++    def test_a_buffer_that_is_not_an_argument_is_an_eager_step(self):
++        buf = self.buffer()
++
++        def closure(x, group_name):
++            return one_shot(buf, x, group_name)
++
++        f = HostTraceReplay(closure)
++        for n in (1024, 2048):
++            self.check(f, closure, (torch.randn(n, device="cuda").to(torch.bfloat16), self.group_name))
++        # the op runs eagerly: as an eager step, or the call as a whole
++        self.assertTrue(f.eager or [s for s in _eager_steps(f) if "symm_mem" in str(s.target)])
++
++    def test_a_tensor_without_rendezvous_raises_eagers_error(self):
++        plain = torch.empty(N_MAX, dtype=torch.bfloat16, device="cuda")
++        f = HostTraceReplay(one_shot)
++        x = torch.randn(1024, device="cuda").to(torch.bfloat16)
++        with self.assertRaisesRegex(RuntimeError, "symmetric|empty_strided_p2p|rendezvous"):
++            f(plain, x, self.group_name)
++        # the process is clean: a symmetric buffer traces
++        g = HostTraceReplay(one_shot)
++        self.check(g, one_shot, (self.buffer(), x, self.group_name))
++
++
++instantiate_parametrized_tests(TestSymmSingleRank)
++
++
++D = 4096
++B_MAX = 32
++
++
++def _rank_x(rank, B, seed, device, dtype=torch.bfloat16):
++    g = torch.Generator(device=device)
++    g.manual_seed(1000 * seed + rank)
++    return torch.randn(B, D, generator=g, device=device).to(dtype)
++
++
++def tp_layer(buf, x, w1, w2, gamma, group_name):
++    # column-parallel then row-parallel projections (a partial sum per rank), the all-reduce, the residual and a norm
++    p = torch.nn.functional.silu(x @ w1) @ w2
++    full = symm_ops.one_shot_all_reduce_copy(buf.narrow(0, 0, p.numel()).view(p.shape), p, "sum", group_name)
++    return torch.nn.functional.rms_norm(full + x, (x.shape[-1],), gamma, 1e-6)
++
++
++def reduce_scatter(buf, x, group_name):
++    p = x * 2
++    n = p.numel()
++    buf[:n].copy_(p.view(-1))
++    out = p.new_empty(n // dist.get_world_size())
++    symm_ops.reduce_scatter_out(buf[:n], group_name, False, out)
++    return out
++
++
++@unittest.skipIf(not PLATFORM_SUPPORTS_SYMM_MEM, "symmetric memory is not supported on this platform")
++@requires_cuda_p2p_access()
++class HostTraceSymmTest(MultiProcContinuousTest):
++    """Every rank traces the same program at the same shapes, so its guards,
++    misses and declines are the same on every rank and every collective runs
++    in lockstep. A collective's barrier spins until its peer's kernel arrives,
++    with no timeout of its own: tearDownClass gives the workers the class
++    timeout and terminates the rest by rank (the base class would join a rank
++    left spinning without a timeout, a hang in place of a failure)."""
++
++    @classmethod
++    def tearDownClass(cls):
++        if cls.__dict__.get("_processes_spawned", False):
++            for task_queue in cls.task_queues:
++                task_queue.put(None)
++            stuck = []
++            for rank, p in enumerate(cls.processes):
++                p.join(timeout=cls.timeout.total_seconds())
++                if p.is_alive():
++                    stuck.append(rank)
++                    p.terminate()
++                    p.join(timeout=30)
++                    if p.is_alive():
++                        p.kill()
++            if stuck:
++                super().tearDownClass()
++                raise AssertionError(
++                    f"rank(s) {stuck} did not exit within {cls.timeout.total_seconds():.0f} s after the class "
++                    "finished and were terminated: a collective whose peer never arrived"
++                )
++        super().tearDownClass()
++
++    @property
++    def device(self):
++        return torch.device("cuda", self.rank)
++
++    def _init(self, numel=B_MAX * D, dtype=torch.bfloat16):
++        torch.cuda.set_device(self.device)
++        self.group_name = dist.group.WORLD.group_name
++        buf = symm_mem.empty(numel, dtype=dtype, device=self.device)
++        symm_mem.rendezvous(buf, group=self.group_name)
++        return buf
++
++    def _pads(self, buf):
++        h = symm_mem.rendezvous(buf, group=self.group_name)
++        return h.get_signal_pad(self.rank, [symm_mem.get_signal_pad_size() // 4], torch.uint32)
++
++    def _assert_pads_reset(self, buf):
++        # this rank's pads after its own collectives completed. The peer may be
++        # ahead: its next collective's first barrier signals this rank's pad as
++        # soon as it launches, so both ranks read their pads before either goes
++        # on (the barrier); without it the lagging rank failed under box load
++        # and left the peer spinning
++        torch.cuda.synchronize()
++        self.assertEqual((self._pads(buf) != 0).nonzero().flatten().tolist(), [])
++        dist.barrier()
++
++    def _check(self, got, want):
++        self.assertEqual(got.dtype, want.dtype)
++        self.assertEqual(got.shape, want.shape)
++        self.assertTrue(torch.equal(got, want))
++
++    @skipIfRocm
++    @skip_if_lt_x_gpu(2)
++    def test_collectives_replay_across_sizes(self):
++        buf = self._init()
++        for fn in (one_shot, two_shot_vllm):
++            f = HostTraceReplay(fn)
++            for B, seed in ((4, 1), (2, 2), (3, 3), (5, 4), (8, 5), (16, 6), (1, 7), (4, 8)):
++                x = _rank_x(self.rank, B, seed, self.device)
++                self._check(f(buf, x, self.group_name), fn(buf, x, self.group_name))
++            self.assertEqual(_eager_steps(f), [])
++            self.assertEqual(f.traces, 1)
++
++    @skipIfRocm
++    @skip_if_lt_x_gpu(2)
++    def test_reduce_scatter_replays(self):
++        buf = self._init()
++        f = HostTraceReplay(reduce_scatter)
++        for B, seed in ((4, 1), (8, 2), (2, 3), (4, 4)):
++            x = _rank_x(self.rank, B * self.world_size, seed, self.device)
++            self._check(f(buf, x, self.group_name), reduce_scatter(buf, x, self.group_name))
++        self.assertEqual(_eager_steps(f), [])
++
++    @skipIfRocm
++    @skip_if_lt_x_gpu(2)
++    def test_back_to_back_replays_leave_the_pads_reset(self):
++        buf = self._init()
++        f = HostTraceReplay(one_shot)
++        f(buf, _rank_x(self.rank, 4, 0, self.device), self.group_name)
++        self._assert_pads_reset(buf)
++        xs = [_rank_x(self.rank, (4, 8, 2, 16, 3)[i % 5], 20 + i, self.device) for i in range(100)]
++        outs = [f(buf, x, self.group_name) for x in xs]
++        self._assert_pads_reset(buf)
++        for x, got in zip(xs[-5:], outs[-5:]):
++            self._check(got, one_shot(buf, x, self.group_name))
++        self.assertEqual(_eager_steps(f), [])
++
++    @skipIfRocm
++    @skip_if_lt_x_gpu(2)
++    def test_interleaved_with_eager_collectives(self):
++        buf = self._init()
++        f = HostTraceReplay(one_shot)
++        for seed in range(5):
++            x = _rank_x(self.rank, 4, 30 + seed, self.device)
++            got = f(buf, x, self.group_name)
++            ref = one_shot(buf, x, self.group_name)
++            nccl = x * 2
++            dist.all_reduce(nccl)
++            self._check(got, ref)
++            self.assertTrue(torch.allclose(got.float(), (nccl + 1).float(), atol=2e-2, rtol=2e-2))
++
++    @skipIfRocm
++    @skip_if_lt_x_gpu(2)
++    def test_two_buffers_dispatch_their_own_tables(self):
++        bufs = (self._init(), self._init())
++        f = HostTraceReplay(one_shot)
++        for i in range(6):
++            x = _rank_x(self.rank, 4, 40 + i, self.device)
++            self._check(f(bufs[i % 2], x, self.group_name), one_shot(bufs[i % 2], x, self.group_name))
++        self.assertEqual((f.traces, len(_eager_steps(f))), (1, 0))
++        self.assertGreaterEqual(f.redispatches, 1)
++
++    @skipIfRocm
++    @skip_if_lt_x_gpu(2)
++    def test_a_host_decision_flip_dispatches_the_op_again(self):
++        buf = self._init()
++        f = HostTraceReplay(one_shot)
++        for n in (1024, 1028, 1022, 8192, 8196, 8198, 1024, 8196):
++            g = torch.Generator(device=self.device)
++            g.manual_seed(n + self.rank)
++            x = torch.randn(n, generator=g, device=self.device).to(torch.bfloat16)
++            self._check(f(buf, x, self.group_name), one_shot(buf, x, self.group_name))
++        self.assertEqual((f.traces, len(_eager_steps(f)), f.redispatches), (1, 0, 5))
++
++    @skipIfRocm
++    @skip_if_lt_x_gpu(2)
++    def test_tp_layer_chain(self):
++        buf = self._init()
++        g = torch.Generator(device=self.device)
++        g.manual_seed(7)  # the same full weights on every rank, then this rank's shard
++        ff = 2 * D // self.world_size
++        w1 = (torch.randn(D, ff * self.world_size, generator=g, device=self.device) / D**0.5).to(torch.bfloat16)
++        w2 = (torch.randn(ff * self.world_size, D, generator=g, device=self.device) / ff**0.5).to(torch.bfloat16)
++        w1 = w1[:, self.rank * ff : (self.rank + 1) * ff].contiguous()
++        w2 = w2[self.rank * ff : (self.rank + 1) * ff].contiguous()
++        gamma = torch.ones(D, dtype=torch.bfloat16, device=self.device)
++        f = HostTraceReplay(tp_layer)
++        for B, seed in ((4, 2), (2, 3), (3, 4), (8, 5), (16, 6), (4, 7)):
++            x = _rank_x(0, B, seed, self.device)  # replicated activations, as tensor parallelism has
++            self._check(f(buf, x, w1, w2, gamma, self.group_name), tp_layer(buf, x, w1, w2, gamma, self.group_name))
++        self.assertEqual([s for s in _eager_steps(f) if "symm_mem" in str(s.target)], [])
++
++
++if __name__ == "__main__":
++    run_tests()

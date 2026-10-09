@@ -1,0 +1,40 @@
+--- a/torch/cuda/_host_trace_replay.py
++++ b/torch/cuda/_host_trace_replay.py
+@@ -842,6 +842,8 @@
+         for i, (j, d) in lead.items():
+             reach[j] = max(reach[j], d + reach[i])
+         buffers = {j: torch.empty(metadata[j][3] + reach[j], dtype=torch.uint8, device=device) for j in range(inputs) if j not in lead and j not in lent}
++        # a drawing op's floating inputs are probabilities, rates or scales: in range, as the harvest's refill
++        bounds = (0.25, 0.75) if torch.Tag.nondeterministic_seeded in op.tags else (-1, 1)
+         tensors = []
+         for i, (dtype, sizes, strides, align) in enumerate(metadata[:inputs]):
+             if i in lent:
+@@ -851,7 +853,7 @@
+             at = metadata[j][3] + d
+             flat = buffers[j][at : at + -(-nbytes(i) // dtype.itemsize) * dtype.itemsize].view(dtype)
+             if dtype.is_floating_point:
+-                flat.uniform_(-1, 1, generator=generator)
++                flat.uniform_(*bounds, generator=generator)
+             else:
+                 flat.zero_()
+             tensors.append(flat.as_strided(sizes, strides))
+--- a/test/test_cuda_host_trace_oob.py
++++ b/test/test_cuda_host_trace_oob.py
+@@ -30,6 +30,17 @@
+ @unittest.skipIf(not TEST_CUDA, "CUDA not available")
+ @instantiate_parametrized_tests
+ class TestHostTraceOobLearn(TestCase):
++    def test_a_drawing_op_learns_on_inputs_in_its_range(self):
++        # a drawing op's out-of-band learn fills its probabilities in [0, 1]:
++        # bernoulli on uniform(-1, 1) is a device-side assert
++        f = HostTraceReplay(lambda p: torch.bernoulli(p), opaque=(HarvestProvider(families=("rng",)),))
++        with mock.patch.object(replay, "oob_learn", True):
++            for _ in range(3):
++                p = torch.ones(63, 26, device="cuda", dtype=torch.bfloat16)
++                self.assertEqual(f(p), torch.ones_like(p), atol=0, rtol=0)
++        torch.cuda.synchronize()
++        self.assertEqual((f.traces, f.oob_binds), (1, 1))
++
+     @parametrize("oob", [False, True])
+     def test_trace_binds_its_keys(self, oob):
+         # with oob_learn a trace's opaque calls bind at keys learned out of

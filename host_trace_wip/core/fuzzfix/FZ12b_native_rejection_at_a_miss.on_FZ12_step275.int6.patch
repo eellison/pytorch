@@ -1,0 +1,121 @@
+--- a/torch/cuda/_host_trace_replay.py
++++ b/torch/cuda/_host_trace_replay.py
+@@ -778,23 +778,26 @@
+             # a refused key is a row the variant refuses: its calls miss it in C++, not handed back here
+             for i, key, binding in bindings:
+                 if binding is None and not variant.learns and sites[i].site.provider.refusal(sites[i].key(key)) is not None:
+-                    variant.native.add_row(i, key, None)
++                    if not self._native_mutate(variant, "a row", variant.native.add_row, i, key, None):
++                        return None
+                     if refused is not None:
+                         refused.append((i, sites[i].key(key)))
+             return None
+         for i, key, binding in bindings:
+             arm = self._arm(variant, i, binding) if sites[i].site.fits(binding) else None
+             if arm is None:
+-                variant.native.add_row(i, key, None)
++                row = (i, key, None)
+             else:
+                 nodes, scratch = binding_row(sites[i], binding)
+-                piece = _piece(sites[i].site, binding)
+-                variant.native.add_row(i, key, nodes, arm, piece, scratch)
++                row = (i, key, nodes, arm, _piece(sites[i].site, binding), scratch)
++            if not self._native_mutate(variant, "a row", variant.native.add_row, *row):
++                return None
+         if bindings:
+             evaluated = variant.native.evaluate(args)
+             unformed = [] if evaluated is None else evaluated[2]
+         for g, arms in unformed:
+-            variant.native.add_form(g, arms, *self._form(variant, g, arms))
++            if not self._native_mutate(variant, "a form", variant.native.add_form, g, arms, *self._form(variant, g, arms)):
++                return None
+         return values, bool(bindings or unformed)
+ 
+     def _learn(self, op: OpOverload, provider: OpaqueProvider, call: tuple[Any, frozenset[int]], key: OpaqueKey, restore_rng: bool = True) -> OpaqueBinding | None:
+@@ -937,6 +940,23 @@
+         device = next(v.tape.device for v in self.variants if v.native is native)
+         return self._eager(args, {}, f"a capture on {device}")
+ 
++    def _native_mutate(self, variant: _Variant, what: str, add: Callable[..., Any], *args: Any) -> bool:
++        """add(*args), a native variant's row, form, entry or program; False
++        where the native variant rejects it: the lowering's bug, which the
++        suites raise (raise_unexpected) and a user's call notes, dropping the
++        variant (its native state is partial), so the call goes on as a miss."""
++        try:
++            add(*args)
++            return True
++        except (TypeError, ValueError, IndexError, RuntimeError) as e:
++            if torch.cuda._host_trace.raise_unexpected:
++                raise AssertionError(f"host_trace: the native variant rejects {what}: {e}") from e
++            self._note(f"host_trace: the native variant rejects {what} ({e}); the variant is dropped")
++            for family in self._families.values():
++                family[:] = [v for v in family if v is not variant]
++            self._native_remove(variant.native)
++            return False
++
+     def _disagreed(self, native: torch._C._HostTraceVariant, e: _Disagreement) -> None:
+         # a call from inside an eager step may have dropped it
+         for family in self._families.values():
+@@ -1292,18 +1312,23 @@
+         try:
+             program, entries = make(*make_args)
+         except FoldRefused as e:
+-            if e.program is not None:
+-                variant.native.set_program(e.program)
++            if e.program is not None and not self._native_mutate(variant, "a program", variant.native.set_program, e.program):
++                e = FoldRefused(f"the native variant rejects a program ({e})")
+             refusals[str(e)] = refusals.get(str(e), 0) + 1
+             _drop_tracebacks(e)
+             return e
+         relocated = variant.memory.relocated
+         if any(isinstance(s, PointerSlot) and s.base in relocated for _, _, launches in entries for lo in launches for s in lo.slots):
+             program, entries = relocate_entries(variant.captured.lowered, relocated, entries, args)
+-        variant.native.set_program(program)
+-        for site, predicate, launches in entries:
+-            variant.native.add_entry(site, predicate, tuple(map(launch_row, launches)))
++        ok = self._native_mutate(variant, "a program", variant.native.set_program, program)
++        for site, predicate, launches in entries if ok else ():
++            if not (ok := self._native_mutate(variant, "an entry", variant.native.add_entry, site, predicate, tuple(map(launch_row, launches)))):
++                break
+             variant.folded.append(launches)
++        if not ok:
++            why = "the native variant rejects an entry or its program"
++            refusals[why] = refusals.get(why, 0) + 1
++            return FoldRefused(why)
+         return None
+ 
+     def _build(self, tape: Tape) -> _Variant:
+--- a/test/test_cuda_host_trace_replay.py
++++ b/test/test_cuda_host_trace_replay.py
+@@ -657,6 +657,31 @@
+             with self.assertRaisesRegex(AssertionError, "the native variant rejects: a site's record 1"):
+                 f(torch.randn(64, device="cuda"))
+ 
++    @parametrize("what", ["row", "entry"])
++    def test_a_native_rejection_at_a_miss_declines(self, what):
++        # a key's row (a new GEMM key) or a redispatch's entry (tactic_op's new class) the native variant rejects:
++        # the suites raise it; a user's call drops the variant, noted, and traces again
++        def fn(x, w):
++            return (x @ w + 1) if what == "row" else tactic_op(x) * 2
++
++        w = torch.randn(64, 64, device="cuda")
++        method = "add_row" if what == "row" else "add_entry"
++        for strict in (False, True):
++            f = HostTraceReplay(fn)
++            for m in (8, 8):
++                x = torch.randn(m, 64, device="cuda")
++                self.assertEqual(f(x, w), fn(x, w), atol=0, rtol=0)
++            x = torch.randn(96 if what == "row" else 20, 64, device="cuda")
++            with mock.patch.object(torch._C._HostTraceVariant, method, side_effect=ValueError("rejected by the test")):
++                with mock.patch.object(torch.cuda._host_trace, "raise_unexpected", strict):
++                    if strict:
++                        with self.assertRaisesRegex(AssertionError, f"the native variant rejects an? {what}: rejected by the test"):
++                            f(x, w)
++                        continue
++                    self.assertEqual(f(x, w), fn(x, w), atol=0, rtol=0)
++            self.assertEqual((f.traces, f.eager), (2, 0))
++            self.assertIn(f"the native variant rejects a{'n' if what == 'entry' else ''} {what} (rejected by the test)", " ".join(f.declines))
++
+     def test_a_redo_takes_a_dispatch_whose_guards_hold(self):
+         # a redo takes a dispatch of the same reads whose guards hold at it: (2, 3000)'s redispatch and (1, 2016)'s
+         # dispatch one softmax for the four layers, (1, 1568)'s none. On this line's binary (no contiguity by

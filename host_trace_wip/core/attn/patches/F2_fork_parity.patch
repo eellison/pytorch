@@ -1,0 +1,103 @@
+--- a/flashinfer/trtllm_trace.py
++++ b/flashinfer/trtllm_trace.py
+@@ -1114,6 +1114,100 @@
+         tr.record_launch(r)
+ 
+ 
++def _field_name(at: int) -> str:
++    """The KernelParams member at byte `at` (parity's report)."""
++    for k, (lo, n) in enumerate(PIECES[: TMA_O + 1]):
++        if lo <= at < lo + n:
++            return f"{('tmaQ', 'tmaK', 'tmaKSf', 'tmaV', 'tmaO')[k]} byte {at - lo}"
++    for table, width in ((_POINTER_AT, 8), (_INT_AT, 4), (_FLOAT_AT, 4)):
++        for name, lo in table.items():
++            if lo <= at < lo + width:
++                return name
++    if _HIDDEN_O_AT <= at < _HIDDEN_O_AT + 8:
++        return "hidden_o"
++    if _FAST_MOD_DIV_AT <= at < _FAST_MOD_DIV_AT + 16:
++        return "heads_q_per_kv_divisor"
++    return f"byte {at}"
++
++
++def parity(kind: str, binding: Any, args: tuple) -> list[str]:
++    """The port against FlashInfer's own launcher at one concrete call, no
++    trace: the kernel, grid, block, shared memory, launch attributes (the
++    cluster) and every KernelParams byte the port computes (and the LSE
++    kernel's launch), against the binding's launch captured, never run, on
++    the call's own tensors. Each difference by name, [] for none; NotFound
++    where the port has no kernel for the call. The binding must have run on
++    a call of the class before (its modules load outside a capture)."""
++    from torch.cuda._host_trace_capture import capture_kernel_nodes, explicit_attributes, KernelNode, pack_params
++    from torch.cuda._host_trace_launch import _DSL_ENCODE_BIT, KernelLaunch, TmaDescriptor
++
++    p, c, pdl = from_binding(kind, args)
++    device = args[0].device.index
++    props = torch.cuda.get_device_properties(device)
++    m, s, cta, func = launch_plan(Kernels(p, props.major * 10 + props.minor, props.shared_memory_per_block_optin), device)
++    if s.multi == MCKV_GMEM_SEPARATE:
++        raise NotFound("a separate reduction kernel (GmemReductionWithSeparateKernel)")
++    image, members, tmas = params(p, m, s, cta, c)
++    fields, slots, pointers = [], [], []
++    for at, width, v, pointer in members:
++        fields.append((FIELDS, at - _BASE, width))
++        slots.append(v)
++        pointers.append(pointer)
++    descriptors = []
++    for x in tmas:
++        descriptors.append(TmaDescriptor(x.piece, len(slots), x.dtype, x.box, x.swizzle))
++        slots += [x.address, *x.shape, *x.strides]
++        pointers += [True] + [False] * (2 * len(x.box) - 1)
++    images = tuple(bytes(image[lo : lo + n]) for lo, n in PIECES)
++    attributes = cluster_attributes(cta.cluster_x)
++    port = KernelLaunch(m.name, func, None, PIECES, (cta.x, cta.y, cta.z), (m.threads, 1, 1), m.smem, tuple(slots), (), None,
++                        tuple(fields), tuple(descriptors), attributes, frozenset(i for i, q in enumerate(pointers) if q), images,
++                        programmatic=pdl, packed=True)
++    anchor = torch.empty(1, device=args[0].device)
++
++    def run(_: torch.cuda.Stream) -> None:
++        anchor.fill_(0)
++        binding(*args)
++
++    _, *nodes = capture_kernel_nodes(run)
++    if not nodes or any(not isinstance(n, KernelNode) for n in nodes):
++        return [f"the binding launched {nodes}"]
++    node, *rest = nodes
++    bad = []
++    want = (node.name, tuple(node.grid), tuple(node.block), node.smem, explicit_attributes(node), node.layout)
++    got = (m.name, (cta.x, cta.y, cta.z), (m.threads, 1, 1), m.smem, attributes, ((0, PARAMS_SIZE),))
++    for what, a, b in zip(("kernel", "grid", "block", "smem", "launch attributes", "parameter layout"), got, want):
++        if a != b:
++            bad.append(f"{what}: port {a}, launcher {b}")
++    if not bad:
++        mine = bytearray(b"".join(pack_params(port, slots, pointers)))
++        real = bytearray(b"".join(node.images))
++        for d in descriptors:
++            real[PIECES[d.param][0] + 8] |= _DSL_ENCODE_BIT
++        differ: dict[str, list[int]] = {}
++        for i in range(min(len(mine), len(real))):
++            if mine[i] != real[i]:
++                differ.setdefault(_field_name(i), []).append(i)
++        for name, at in differ.items():
++            lo, hi = at[0] - at[0] % 4, at[-1] - at[-1] % 4 + 4
++            bad.append(f"{name}: port {mine[lo:hi].hex()}, launcher {real[lo:hi].hex()} (bytes {at[0]}..{at[-1]})")
++    lse = _given(c.lse)
++    if len(rest) != int(lse):
++        bad.append(f"the launcher launched {[r.name for r in rest]} after the FMHA kernel, the port {['lse'] if lse else []}")
++    elif lse:
++        n = p.sum_q * p.heads_q
++        threads = 1024 if n > 512 else 1 << max(n - 1, 0).bit_length()
++        stats, _, _ = workspace(p, c)
++        stride_tokens, stride_heads = _lse_strides(kind, args)
++        values = (stats, c.lse, p.heads_q, stride_tokens, stride_heads, n)
++        record_lse = KernelLaunch(rest[0].name, rest[0].function, None, _LSE_LAYOUT, (_ceil_div(n, threads), 1, 1), (threads, 1, 1), 0, values, (),
++                                  None, tuple((i, 0, w) for i, (_, w) in enumerate(_LSE_LAYOUT)), (), (), frozenset((0, 1)), programmatic=pdl)
++        mine = b"".join(pack_params(record_lse, list(values), [True, True, False, False, False, False]))
++        if (mine, record_lse.grid, threads) != (b"".join(rest[0].images), tuple(rest[0].grid), rest[0].block[0]):
++            bad.append(f"the LSE kernel: port grid {record_lse.grid} block {threads}, launcher grid {rest[0].grid} block {rest[0].block}")
++    return bad
++
++
+ # ---- part 5: the custom ops a trace sees in place of the bindings
+ 
+ # each binding argument as name:kind; T tensor (! written, ? optional),

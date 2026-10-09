@@ -1,0 +1,232 @@
+--- ../../../../scratch/integration/vllm/armV_cand2/adapter.py	2026-10-08 11:42:16.842594041 -0700
++++ adapter.py	2026-10-08 12:11:53.383384357 -0700
+@@ -73,6 +73,11 @@
+ # kernels through their UVA views (hostcuts uva mode), and the step writes the sampled tokens and num_sampled into
+ # pinned UVA output slots, which AsyncOutput reads instead of its two device-to-host copies.
+ VP_UVA = VP and os.environ.get("ARMV_VP_UVA", "1") == "1"
++# ARMV_VP_PINNED=1 (pinned lane, with ARMV_VP_UVA=0): the same single launch through plain pinned host <-> device copies,
++# which host tracing records as memcpy nodes. The step takes the pinned staging views (idx_mapping, query_start_loc)
++# and copies them into the device buffers first, and copies the sampled tokens and num_sampled into pinned output
++# slots last, both with copy_(non_blocking=True) as vLLM's own staging and AsyncOutput do. No UVA view anywhere.
++VP_PINNED = VP and not VP_UVA and os.environ.get("ARMV_VP_PINNED", "0") == "1"
+ VP_SLOTS = 4  # output slots in rotation: more than the steps async scheduling keeps in flight
+ PAD_MAX_TOKENS = int(os.environ.get("ARMV_PAD_MAX_TOKENS", "512"))
+ PAD_MAX_REQS = int(os.environ.get("ARMV_PAD_MAX_REQS", "256"))
+@@ -258,13 +263,14 @@
+                 self.attrs.append((s.penalties_state, "output_bin_counts", s.penalties_state.output_bin_counts))
+             self.vp_res = None  # (input_batch, (sampled, num_sampled, num_rejected)) of the step's VP entry
+             self.vp_post = None
+-            if VP_UVA:
+-                from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
+-
++            if VP_UVA or VP_PINNED:
+                 M = runner.max_num_reqs
+                 self.vp_out_cpu = [(torch.zeros(M, dtype=torch.int64, pin_memory=True), torch.zeros(M, dtype=torch.int32, pin_memory=True))
+                                    for _ in range(VP_SLOTS)]
+-                self.vp_out_uva = [tuple(get_accelerator_view_from_cpu_tensor(t) for t in pair) for pair in self.vp_out_cpu]
++                if VP_UVA:
++                    from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
++
++                    self.vp_out_uva = [tuple(get_accelerator_view_from_cpu_tensor(t) for t in pair) for pair in self.vp_out_cpu]
+                 self.vp_slot = 0
+                 self.vp_host = {}  # id(device tensor handed to AsyncOutput) -> the pinned numpy the step wrote
+         self.prefix = (*self.params, *(v for _, _, v in self.attrs))
+@@ -326,7 +332,7 @@
+             self._install_vp()
+         if HOSTCUTS:
+             import hostcuts
+-            self.hostcuts = hostcuts.install(self.runner, uva=VP_UVA)
++            self.hostcuts = hostcuts.install(self.runner, uva=VP_UVA, pinned=VP_PINNED)
+         for layer in self.layers:
+             layer.use_direct_call = True
+         self.model.forward = self.forward
+@@ -493,6 +499,8 @@
+         if not isinstance(amd, _Pending):
+             return amd, fc.slot_mapping
+         if amd.built is None:
++            # vLLM's own build reads the staged inputs: copied here too (the step still copies them in)
++            self._stage_eager(clear=False)
+             self._flush(amd)
+             amd.built = self._build(amd.input_batch, amd.md_args)
+             md = next(iter(amd.built[0].values()), None)
+@@ -539,6 +547,7 @@
+         from vllm.forward_context import override_forward_context
+ 
+         self.calls[why] += 1
++        self._stage_eager()
+         if not isinstance(fc.attn_metadata, _Pending):
+             return self.orig_forward(input_ids, positions, *rest)
+         amd, sm = self._live(fc)
+@@ -556,6 +565,7 @@
+             return self._eager("eager_inputs", fc, input_ids, positions, intermediate_tensors, inputs_embeds)
+         if isinstance(fc.attn_metadata, _Pending):
+             return self._forward_deferred(t0, fc, input_ids, positions)
++        self._stage_eager()
+         amd, sm = fc.attn_metadata, fc.slot_mapping
+         if not isinstance(amd, dict) or not amd or not isinstance(sm, dict) or not sm:
+             return self._eager("eager_no_metadata", fc, input_ids, positions)
+@@ -643,6 +653,13 @@
+         args = [*self.prefix, input_ids, positions, ib.idx_mapping, ib.query_start_loc, ib.seq_lens, bt.num_blocks.gpu, *in_tensors, *extra]
+         if VP and kind == "decode":
+             args += self._vp_args()
++        stage = getattr(self.runner, "_ht_stage", None)
++        if VP_PINNED and kind == "decode":
++            # the step copies the staging views in itself (None, None: nothing staged)
++            self.runner._ht_stage = None
++            args += [stage[0][1], stage[1][1]] if stage is not None else [None, None]
++        else:
++            self._stage_eager()
+         self._ctx = (fc, p, tmpl, verify)
+         replays = entry.replays
+         t1 = time.perf_counter()
+@@ -729,7 +746,7 @@
+             self.vp_post = input_batch
+             self.calls["vp_sampled"] += 1
+             tok = sampled.view(-1, 1)
+-            if VP_UVA:
++            if VP_UVA or VP_PINNED:
+                 n, (tc, nc) = sampled.shape[0], self.vp_out_cpu[vp[2]]
+                 self.vp_host[id(tok)], self.vp_host[id(ns)] = tc[:n].numpy().reshape(n, 1), nc[:n].numpy()
+             return SamplerOutput(sampled_token_ids=tok, logprobs_tensors=None, num_nans=None, num_sampled=ns, num_rejected=nr), ns, nr
+@@ -740,7 +757,7 @@
+             self.vp_post = None  # post_update ran in the entry
+             r.model_state.postprocess_state(idx_mapping, num_sampled, r.req_states.num_computed_tokens.gpu)
+         r.sample, r.postprocess_sampled = sample, postprocess_sampled
+-        if VP_UVA:
++        if VP_UVA or VP_PINNED:
+             import vllm.v1.worker.gpu.async_utils as au
+ 
+             orig_copy = au.async_copy_to_np
+@@ -757,11 +774,21 @@
+         VP_UVA also the step's output slot (rotated here, once per step)."""
+         s, rs = self.runner.sampler, self.runner.req_states
+         out = [s.sampling_states.temperature.gpu, s.sampling_states.seeds.gpu, rs.prefill_len.gpu]
+-        if VP_UVA:
++        if VP_UVA or VP_PINNED:
+             self.vp_slot = (self.vp_slot + 1) % VP_SLOTS
+-            out += list(self.vp_out_uva[self.vp_slot])
++            out += list((self.vp_out_uva if VP_UVA else self.vp_out_cpu)[self.vp_slot])
+         return out
+ 
++    def _stage_eager(self, clear=True):
++        """VP_PINNED: the staging copies hostcuts left to the step, run here for a step that does not take them
++        (clear) or for an eager read before the step (not clear: the step still takes them)."""
++        stage = getattr(self.runner, "_ht_stage", None)
++        if stage is not None:
++            if clear:
++                self.runner._ht_stage = None
++            for dst, src in stage:
++                dst.copy_(src, non_blocking=True)
++
+     def _vp_tail(self, out, input_ids, positions, idx_mapping, query_start_loc, seq_lens, temperature, seeds, prefill_len, tok_out=None, ns_out=None):
+         """Inside the VP step, after the model: logits, sampler, num_sampled/num_rejected, post_update (as vLLM's
+         sample + postprocess_sampled on a no-draft decode batch, whose logits_indices are arange(n))."""
+@@ -775,7 +802,10 @@
+         ns, nr = get_num_sampled_and_rejected(seq_lens.new_ones(n), seq_lens[:n], self.vp_arange[:n + 1], idx_mapping, prefill_len)
+         post_update(idx_mapping, rs.num_computed_tokens.gpu, rs.last_sampled_tokens, s.penalties_state.output_bin_counts, sampled.view(-1, 1),
+                     ns, nr, query_start_loc[:n + 1], rs.all_token_ids.gpu, rs.total_len.gpu)
+-        if tok_out is not None:  # the device-to-host results, written by kernels into pinned memory (UVA)
++        if tok_out is not None and VP_PINNED:  # the device-to-host results, as AsyncOutput's non_blocking copies
++            tok_out[:n].copy_(sampled, non_blocking=True)
++            ns_out[:n].copy_(ns, non_blocking=True)
++        elif tok_out is not None:  # the device-to-host results, written by kernels into pinned memory (UVA)
+             torch.add(sampled, 0, out=tok_out[:n])
+             torch.add(ns, 0, out=ns_out[:n])
+         return sampled, ns, nr
+@@ -936,7 +966,13 @@
+             rest = flat[n_p + n_a + 6:]
+             vp_t = ()
+             if VP and kind == "decode":
+-                nv = 5 if VP_UVA else 3
++                if VP_PINNED:
++                    # the pinned staging views: into the device buffers before anything reads them
++                    rest, (h_idx, h_qsl) = rest[:-2], rest[-2:]
++                    if h_idx is not None:
++                        idx_mapping.copy_(h_idx, non_blocking=True)
++                        query_start_loc.copy_(h_qsl, non_blocking=True)
++                nv = 5 if VP_UVA or VP_PINNED else 3
+                 rest, vp_t = rest[:-nv], rest[-nv:]
+             tensors, extra = (rest[:-n_x], rest[-n_x:]) if n_x else (rest, ())
+             if pending.inputs:
+--- ../../../../scratch/integration/vllm/armV_cand2/adapter_cpp.py	2026-10-08 07:17:45.950560698 -0700
++++ adapter_cpp.py	2026-10-08 12:11:53.384123592 -0700
+@@ -20,7 +20,9 @@
+ VERIFY = os.environ.get("ARMV_BOUND_VERIFY") == "1"
+ P, ADAPTER, NB = 0, 1, 2  # the bound's sources: the step's _Pending (derived: adapter.cur), the adapter, block_tables.num_blocks
+ HEAD = ("b_idx", "b_qsl", "b_seq")  # p's attributes for input_batch.idx_mapping, query_start_loc, seq_lens
+-VP_NAMES = ("vp_temp", "vp_seed", "vp_plen") + (("vp_tok", "vp_ns") if adapter.VP_UVA else ())  # arm VP: p's attributes for ArmV._vp_args()
++VP_NAMES = ("vp_temp", "vp_seed", "vp_plen") + (("vp_tok", "vp_ns") if adapter.VP_UVA or adapter.VP_PINNED else ())  # arm VP: p's attributes for ArmV._vp_args()
++# arm VP pinned: the pinned staging views the step copies in (hostcuts' runner._ht_stage), per call
++VP_NAMES += ("vp_hidx", "vp_hqsl") if adapter.VP_PINNED else ()
+ 
+ 
+ class ArmVcpp(ArmV):
+@@ -72,7 +74,9 @@
+         vars(p).update(zip(HEAD, (ib.idx_mapping, ib.query_start_loc, ib.seq_lens)))
+         vars(p).update(zip(self.tnames, tensors))
+         if adapter.VP:
+-            vars(p).update(zip(VP_NAMES, self._vp_args()))
++            stage = getattr(self.runner, "_ht_stage", None)
++            staged = ([stage[0][1], stage[1][1]] if stage is not None else [None, None]) if adapter.VP_PINNED else []
++            vars(p).update(zip(VP_NAMES, [*self._vp_args(), *staged]))
+         if VERIFY:
+             want = self._entry_key("decode", ib.num_tokens_after_padding, self._split(ib), self._input_sig(p.inputs)[0])
+             if want != key:
+@@ -87,6 +91,7 @@
+                 return super().forward(input_ids, positions, intermediate_tensors, inputs_embeds)
+             out = self.bound(input_ids, positions)
+             if out is not NotImplemented:
++                self.runner._ht_stage = None  # the step copied the staging views in
+                 if len(out) > 1:
+                     self.vp_res = (p.input_batch, out[1:], getattr(self, "vp_slot", None))
+                 return out[0]
+--- ../../../../scratch/integration/vllm/armV_cand2/hostcuts.py	2026-10-08 07:17:13.821050204 -0700
++++ hostcuts.py	2026-10-08 12:11:53.384538794 -0700
+@@ -28,10 +28,13 @@
+     return now
+ 
+ 
+-def install(runner, uva=False):
++def install(runner, uva=False, pinned=False):
+     """uva (arm VP's single-launch step): the staging slots are pinned host buffers that the step's kernels read
+     through their UVA views (no host-to-device memcpy); idx_mapping / query_start_loc / is_padding are slices of the
+-    slot's view, so they move with the slot."""
++    slot's view, so they move with the slot.
++    pinned (pinned lane, arm VP without UVA): no copy here; runner._ht_stage holds the (device view, pinned staging
++    view) pairs of idx_mapping and query_start_loc, which the VP step copies itself (adapter._stage_eager otherwise).
++    Exact sizes only (no ARMV_PAD): is_padding is a fixed all-False device buffer, read only by MoE layers."""
+     import vllm.envs as envs
+     import vllm.v1.worker.gpu.model_runner as mr
+     from vllm.v1.worker.gpu.buffer_utils import _DEFAULT_MAX_CONCURRENCY, UvaBufferPool, _apply_write_kernel
+@@ -62,7 +65,18 @@
+             stage = torch.zeros(nbytes, dtype=torch.uint8, device=dev)
+             d_idx, d_qsl = stage[:q0].view(torch.int64), stage[q0:q0 + 4 * (M + 1)].view(torch.int32)
+             r.input_buffers.query_start_loc = d_qsl
+-            if pad:
++            if pinned:
++                import os
++
++                if os.environ.get("ARMV_PAD", "0") == "1":
++                    raise RuntimeError("hostcuts pinned: exact sizes only (ARMV_PAD=0)")
++                t_idx = [host[k, :q0].view(torch.int64) for k in range(K)]
++                t_qsl = [host[k, q0:q0 + 4 * (M + 1)].view(torch.int32) for k in range(K)]
++                r._ht_stage = None
++                if pad:
++                    r.input_buffers.is_padding = torch.zeros(T, dtype=torch.bool, device=dev)
++                    pad = False
++            elif pad:
+                 r.input_buffers.is_padding = stage[p0:].view(torch.bool)
+         d_arange = torch.arange(M + 1, dtype=torch.int32, device=dev)
+         d_zeros = torch.zeros(M, dtype=torch.int32, device=dev)
+@@ -93,7 +107,10 @@
+                 h_pad[k][num_tokens:num_tokens_after_padding] = True
+             if t is not None:
+                 t = _mark("pi.host_fill", t)
+-            if stage is not None:
++            if stage is not None and pinned:
++                r._ht_stage = ((d_idx[:n], t_idx[k][:n]), (d_qsl[:nrp + 1], t_qsl[k][:nrp + 1]))
++                s_idx, s_qsl = d_idx, d_qsl
++            elif stage is not None:
+                 stage.copy_(host[k], non_blocking=True)
+                 s_idx, s_qsl = d_idx, d_qsl
+             else:

@@ -1,0 +1,226 @@
+--- a/torch/cuda/_host_trace_ir.py
++++ b/torch/cuda/_host_trace_ir.py
+@@ -228,28 +228,30 @@
+ 
+ 
+ _MINMAX_CALL = re.compile(r"(?<![\w.])(?:max|min)\(")
+-# (code, line) -> the note guard_sloc gives a guard recorded there
+-_GUARD_SLOCS: dict[tuple[Any, int], SLoc] = {}
++# (code, line, by a SymBool's bool()) -> the provenance guard_sloc gives a guard recorded there
++_GUARD_SLOCS: dict[tuple[Any, int, bool], SLoc] = {}
+ 
+ 
+ def guard_sloc() -> SLoc:
+-    """A new guard's provenance: a note where it is the user's bool() of a
+-    SymBool on a line that calls Python's max or min, whose comparison of a
+-    symbolic int is the guard (Dynamo rewrites them, as a trace does unless
+-    trace_builtin_minmax is False)."""
++    """A new guard's provenance: the user's line that recorded it (the
++    innermost frame outside torch, maybe_user_loc), and a note where it is the
++    user's bool() of a SymBool on a line that calls Python's max or min, whose
++    comparison of a symbolic int is the guard (Dynamo rewrites them, as a trace
++    does unless trace_builtin_minmax is False)."""
+     inner, f = None, sys._getframe(1)
+     while f is not None and f.f_code.co_filename.startswith(_TORCH_DIR):
+         inner, f = f, f.f_back
+-    if f is None or inner is None or inner.f_code is not torch.SymBool.__bool__.__code__:
++    if f is None:
+         return _NO_SLOC
+-    k = (f.f_code, f.f_lineno)
++    k = (f.f_code, f.f_lineno, inner is not None and inner.f_code is torch.SymBool.__bool__.__code__)
+     sloc = _GUARD_SLOCS.get(k)
+     if sloc is None:
+-        sloc = _NO_SLOC
+-        if _MINMAX_CALL.search(linecache.getline(f.f_code.co_filename, f.f_lineno)):
+-            site = f"{os.path.basename(f.f_code.co_filename)}:{f.f_lineno}"
+-            sloc = SLoc(f"builtin max/min at {site} with trace_builtin_minmax=False; use torch.sym_max", None)
+-        _GUARD_SLOCS[k] = sloc
++        name = f.f_code.co_filename
++        site = f"{os.path.basename(os.path.dirname(name))}/{os.path.basename(name)}:{f.f_lineno}"
++        note = None
++        if k[2] and _MINMAX_CALL.search(linecache.getline(name, f.f_lineno)):
++            note = f"builtin max/min at {os.path.basename(name)}:{f.f_lineno} with trace_builtin_minmax=False; use torch.sym_max"
++        sloc = _GUARD_SLOCS[k] = SLoc(note, site)
+     return sloc
+ 
+ 
+--- a/torch/cuda/_host_trace_lower_tape.py
++++ b/torch/cuda/_host_trace_lower_tape.py
+@@ -220,6 +220,7 @@
+     op: int  # in Tape.ops
+     predicate: int  # row
+     nodes: tuple[int, ...]  # indices in `launches`
++    rows: tuple[int, ...] = ()  # per own guard (OpRec.guards), its row: which fails at a call (retrace_causes)
+ 
+ 
+ @dataclass(frozen=True)
+@@ -612,9 +613,10 @@
+             nodes = tuple(index[id(rec)] for _, rec in tape.launches[op.launches.start : op.launches.stop] if id(rec) in index)
+             selectors.append(LoweredSelector(k, predicate, nodes))
+         elif op.guards:
++            n = len(lo.lowering.guard_rows)
+             predicate = lo.lowering.conjunction([guards[i] for i in op.guards], addresses)
+             nodes = tuple(index[id(rec)] for _, rec in tape.launches[op.launches.start : op.launches.stop] if id(rec) in index)
+-            selectors.append(LoweredSelector(k, predicate, nodes))
++            selectors.append(LoweredSelector(k, predicate, nodes, tuple(lo.lowering.guard_rows[n:])))
+     # a memcpy node's bytes lie in its allocations' own (an argument's or eager
+     # output's are the tensors eager's copy_ reads and writes)
+     zero = lo.emit("constant", 0)
+@@ -659,6 +661,8 @@
+     def __init__(self, msg: str, program: torch._C._HostTraceProgram | None = None) -> None:
+         super().__init__(msg)
+         self.program = program
++        # redispatch's: the op (in Tape.ops) whose dispatch refused
++        self.op: int | None = None
+ 
+ 
+ class HintsFail(FoldRefused):
+--- a/torch/cuda/_host_trace_redispatch.py
++++ b/torch/cuda/_host_trace_redispatch.py
+@@ -82,8 +82,9 @@
+                         selected.append((i, *_redo(lowered, selector, hosted=True, dispatches=dispatches)))
+                     except HintsFail:
+                         selected.append((i, *_redo(lowered, selector, ir=False, hosted=True)))
+-                except FoldRefused:
++                except FoldRefused as e:
+                     lowered.lowering.refused.add(i)
++                    e.op = selector.op
+                     raise
+         selected.sort(key=lambda s: unselected.index(s[0]))
+         values = program.values
+--- a/torch/cuda/_host_trace_replay.py
++++ b/torch/cuda/_host_trace_replay.py
+@@ -74,6 +74,7 @@
+ from torch._logging import trace_structured
+ from torch._prims.rng_prims import _impl_graphsafe_rng
+ from torch.cuda import _host_trace_cute  # noqa: F401  hooks cute.compile
++from torch.cuda import _host_trace_ir as _ir
+ from torch.cuda._host_trace import _drop_tracebacks, Declined, declined, EagerFallback, ProcessHold
+ from torch.cuda._host_trace_capture import capture_tape, instantiate_form, plain_attributes, SegmentFailed
+ from torch.cuda._host_trace_harvest import HarvestProvider
+@@ -548,6 +549,13 @@
+         self.redispatches = 0
+         self.redispatch_s = 0.0
+         self.redispatch_refusals: dict[str, int] = {}
++        # why each trace after the first traced: (class, op, guard, the user's line, refusal) -> count. Class "meta": a
++        # graph guard an op recorded (its outputs' metadata); "dispatch": an op's own guard failed and its
++        # redispatch refused (refusal); "graph": a guard no op recorded; "contract": no variant of the
++        # call's argument contract; "other": a variant whose guards hold missed (a refused key, say)
++        self.retrace_causes: dict[tuple[str, str | None, str, str | None, str | None], int] = {}
++        # per variant (its native's id), its last redispatch refusal: (the op that refused (Tape.ops), why)
++        self._last_refusal: dict[int, tuple[int | None, str]] = {}
+         # the keys harvested at a keyed site's miss, no trace or relower
+         # (_learn), and their seconds
+         self.learned = 0
+@@ -1003,6 +1011,8 @@
+         # trace's witness, and at the entry's first lazy initialization happens
+         # outside the trace. Under trust Dynamo's guards stand for the witness.
+         first = self.traces == 0
++        if not first:
++            self._retrace_cause(contract, args)
+         warm_up = first or self.trusted is None
+         ran, result, tape, folded = False, None, None, None
+         # the ops whose segments failed to capture, run eagerly by a trace again
+@@ -1157,6 +1167,48 @@
+             raise AssertionError("host_trace: a call misses the tape traced at it")
+         return self._served(variant.native, outcome, result, tuple(args))
+ 
++    def _retrace_cause(self, contract: tuple, args: Sequence[Any]) -> None:
++        """Counts why the call traces again (retrace_causes) and logs it
++        (trace_structured host_trace_retrace): the closest variant's first
++        failing guard, the op that recorded it and the user's line that did
++        (SLoc.maybe_user_loc), and for an op's own guard its redispatch's
++        refusal. A miss path's."""
++        causes = []
++        for variant in self._families.get(contract, ()):
++            low, tape = variant.captured.lowered, variant.tape
++            env = tape.shape_env
++            result = low.compiled.evaluate_inputs(tuple(args))
++            if result is None or result[0] != Status.SUCCESS:
++                causes.append(("other", None, "an input of another kind, or a failing status", None, None))
++                continue
++            values = result[1]
++            if values[low.valid] == 1:
++                op, why = self._last_refusal.get(id(variant.native), (None, None))
++                sel = next((s for s in low.selectors if s.op == op), None)
++                pairs = zip(tape.ops[op].guards, sel.rows) if sel is not None else ()
++                kind = ("dispatch", None if op is None else str(tape.ops[op].func)) if why is not None else ("other", None)
++            else:
++                pairs, kind, why = zip(tape.graph, low.lowering.lowering.guard_rows[: len(tape.graph)]), None, None
++            g = next((g for g, row in pairs if values[row] != 1), None)
++            if g is None:
++                text = "an allocation's requirement or a declared sign" if kind is None else "its guards hold" if why is None else ""
++                causes.append((*(kind or ("other", None)), text, None, why))
++                continue
++            text = _ir.render(env.records[g][0]) if low.lowering.ir else str(env.guards[g].expr)
++            where = (env.slocs[g] if low.lowering.ir else env.guards[g].sloc).maybe_user_loc
++            if kind is None:
++                owners = env.owner_sets[g] if env.owner_sets is not None else {env.owners[g]}
++                op = next((str(tape.ops[o].func) for o in sorted(o for o in owners if o is not None)), None)
++                kind = ("meta" if op is not None else "graph", op)
++            causes.append((*kind, text, where, why))
++        cause = next((c for c in causes if c[0] == "dispatch"), causes[0] if causes else ("contract", None, "", None, None))
++        self.retrace_causes[cause] = self.retrace_causes.get(cause, 0) + 1
++        trace_structured(
++            "artifact",
++            metadata_fn=lambda: {"name": "host_trace_retrace", "encoding": "string"},
++            payload_fn=lambda: f"class {cause[0]}; op {cause[1]}; guard {cause[2]}; at {cause[3]}; refusal {cause[4]}",
++        )
++
+     def _fold(self, variant: _Variant, values: list[int], unselected: list[int], tape: Tape, args: Sequence[Any]) -> bool:
+         """Whether the trace of the call `args` folds into the variant, whose
+         graph guards hold the call (at rows `values`) but not the selectors
+@@ -1177,6 +1229,8 @@
+         values += variant.captured.lowered.lowering.program.values[len(values) :]
+         self.redispatch_s += time.perf_counter() - start
+         self.redispatches += refused is None
++        if refused is not None:
++            self._last_refusal[id(variant.native)] = refused.op, str(refused)
+         return refused
+ 
+     def _eager_sites(self, contract: tuple, variant: _Variant, args: tuple, refused: list[tuple[int, OpaqueKey]]) -> _Variant | None:
+--- a/test/test_cuda_host_trace_replay.py
++++ b/test/test_cuda_host_trace_replay.py
+@@ -574,6 +574,7 @@
+                 self.assertEqual(f(*args), fn(*args), atol=0, rtol=0)
+                 counts.append(sum(softmaxes))
+         self.assertEqual((counts, f.traces, f.redispatches), ([4, 1, 4, 1, 0], 2, 3))
++        self.assertEqual([c[:2] for c in f.retrace_causes], [("dispatch", "aten.sum.dim_IntList")])
+ 
+     def test_a_redo_agrees_with_the_variants_layout_under_its_guards(self):
+         # at b == 1 the eps add returns [1, 1], the variant [b, 1]: one layout under the redo's guard b == 1
+@@ -598,6 +599,23 @@
+             x = torch.randn(m, 64, device="cuda")
+             self.assertEqual(f(x), fn(x), atol=0, rtol=0)
+         self.assertEqual((f.traces, len(f.variants), f.replays, f.eager), (3, 3, 6, 0))
++        # each new class's trace: split_op's own guards fail and its redispatch refuses
++        self.assertEqual([c[0] for c, n in f.retrace_causes.items() for _ in range(n)], ["dispatch"] * 2)
++        self.assertEqual({c[1] for c in f.retrace_causes}, {"host_trace_test.split_op.default"})
++
++    def test_a_retrace_records_a_guard_no_op_recorded(self):
++        # fn's own branch on a size is a graph guard of no op's: a call where it fails traces again
++        def fn(x):
++            return x + 1 if x.shape[0] > 4 else x * 2
++
++        f = HostTraceReplay(fn)
++        for m in (8, 16, 2):
++            x = torch.randn(m, 64, device="cuda")
++            self.assertEqual(f(x), fn(x), atol=0, rtol=0)
++        ((kind, op, _, where, refusal),) = f.retrace_causes
++        line = fn.__code__.co_firstlineno + 1
++        self.assertEqual((kind, op, where, refusal), ("graph", None, f"test/test_cuda_host_trace_replay.py:{line}", None))
++        self.assertEqual((f.traces, sum(f.retrace_causes.values())), (2, 1))
+ 
+     def test_a_refused_redispatch_tries_the_refusing_op_first(self):
+         # the split op refuses at every new class: once it has refused for a
+@@ -1782,8 +1800,8 @@
+             self.assertGreater(len(f.variants), 1)
+         (why,) = f.triton_fallbacks
+         self.assertIn("cooperative launches", why)
+-        self.assertEqual(log.call_count, 1)
+-        self.assertEqual(log.call_args.kwargs["payload_fn"](), why)
++        (fallback,) = [c for c in log.call_args_list if c.kwargs["metadata_fn"]()["name"] == "host_trace_triton_fallback"]
++        self.assertEqual(fallback.kwargs["payload_fn"](), why)
+ 
+     @mock.patch("torch.cuda._host_trace.library_impls", False)
+     def test_a_fake_kernels_wrong_metadata_declines_at_the_warm_up(self):

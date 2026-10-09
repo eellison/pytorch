@@ -1,0 +1,198 @@
+--- a/torch/cuda/_host_trace_capture.py
++++ b/torch/cuda/_host_trace_capture.py
+@@ -601,7 +601,8 @@
+             continue
+         if isinstance(lo, LoweredMemcpy):
+             d2d = runtime.cudaMemcpyKind.cudaMemcpyDeviceToDevice
+-            _check_cuda_bindings(runtime.cudaMemcpyAsync(*copy_at, values[lo.nbytes], d2d, stream))
++            dst, src = _copy_addresses(lo, values, bases, copy_at)
++            _check_cuda_bindings(runtime.cudaMemcpyAsync(dst, src, values[lo.nbytes], d2d, stream))
+             _one_node(stream, nodes, f"memcpy {lo.launch.name}")
+             continue
+         t = lo.launch
+@@ -666,7 +667,7 @@
+             if kind != driver.CUgraphNodeType.CU_GRAPH_NODE_TYPE_MEMCPY:
+                 raise declined(f"memcpy {lo.launch.name} captured a {kind.name} node")
+             try:
+-                if _memcpy_node(node) != MemcpyNode(*copy_at, values[lo.nbytes]):
++                if _memcpy_node(node) != MemcpyNode(*_copy_addresses(lo, values, bases, copy_at), values[lo.nbytes]):
+                     raise ValueError("other parameters")
+             except ValueError:
+                 raise declined(f"the captured node of memcpy {lo.launch.name} has other parameters") from None
+@@ -702,12 +703,23 @@
+ def _copy_operands(device: torch.device, nbytes: int) -> torch.Tensor:
+     """What a captured memcpy node copies between: a memcpy node keeps its
+     capture's kind of memory (cudaMalloc'd or cuMemMap'd, as expandable
+-    segments are), and a replay can only set it to operands of that kind, so
+-    the capture copies within an allocation of the caching allocator's. The
+-    capture runs no node, and the first replay sets every memcpy."""
++    segments and symmetric memory are), and a replay can only set it to
++    operands of that kind, so the capture copies within an allocation of the
++    caching allocator's, as a replay's allocations and eager outputs are. An
++    argument is copied at its own address instead (_copy_addresses): a
++    replay's argument of the other kind fails the node's update, a miss
++    (HostTraceVariant::commit). The capture runs no node, and the first
++    replay sets every memcpy."""
+     return torch.empty(2 * nbytes, dtype=torch.uint8, device=device)
+ 
+ 
++def _copy_addresses(lo: LoweredMemcpy, values: Sequence[int], bases: Sequence[int], copy_at: tuple[int, int]) -> tuple[int, int]:
++    """The memcpy's (dst, src) in the capture: an argument's own address, so
++    the node is of that argument's kind of memory; otherwise copy_at's."""
++    dst, src = (slot_address(slot, values, bases) if slot.root[0] == "argument" else at for slot, at in zip(lo.slots, copy_at))
++    return dst, src
++
++
+ def _segment(
+     launches: Sequence[LoweredLaunch | LoweredMemset | LoweredMemcpy],
+     values: Sequence[int],
+--- a/torch/cuda/_host_trace_native.py
++++ b/torch/cuda/_host_trace_native.py
+@@ -65,7 +65,7 @@
+ _RESULT_KINDS = {"none": 0, "tensor": 1, "tuple": 2, "list": 3}
+ _PHILOX = ("philox_seed", "philox_offset", "philox")
+ # _HostTraceVariant.call's outcomes
+-MISS, MISALIGNED, CAPTURE, HIT = range(4)
++MISS, MISALIGNED, CAPTURE, HIT, MEMORY_KIND = range(5)
+ 
+ 
+ class VariantSpec(NamedTuple):
+--- a/torch/cuda/_host_trace_replay.py
++++ b/torch/cuda/_host_trace_replay.py
+@@ -91,6 +91,7 @@
+     flatten_variant,
+     HIT,
+     launch_row,
++    MEMORY_KIND,
+     MISALIGNED,
+     MISS,
+     native_variant,
+@@ -679,7 +680,8 @@
+             elif self.handback and added:
+                 return Handback(args)
+             outcome, result = self._call_native(variant, args)
+-            if outcome != MISS:
++            # MEMORY_KIND: the variant's memcpy nodes are of the other kind of memory than an argument
++            if outcome not in (MISS, MEMORY_KIND):
+                 return self._served(variant.native, outcome, result, args)
+         # no variant holds the call: one whose graph guards do gains its
+         # failing selectors' entries from their ops dispatched again
+@@ -691,7 +693,7 @@
+                 if self.handback:
+                     return Handback(args)
+                 outcome, result = self._call_native(variant, args)
+-                if outcome != MISS:
++                if outcome not in (MISS, MEMORY_KIND):
+                     return self._served(variant.native, outcome, result, args)
+             break
+         # a refused redispatch traces the graph again. Propagating the op's new metadata through its uses (as
+@@ -953,6 +955,8 @@
+         if outcome == MISALIGNED:
+             why = f"an allocation that is not {_ALLOC_ALIGNMENT}-byte aligned"
+             return self._eager(args, {}, why)
++        if outcome == MEMORY_KIND:
++            return self._eager(args, {}, "an argument a memcpy node copies is of another kind of memory than at its capture")
+         if outcome != CAPTURE:
+             raise AssertionError(f"host_trace: a native outcome {outcome}")
+         device = next(v.tape.device for v in self.variants if v.native is native)
+--- a/test/test_cuda_host_trace_replay.py
++++ b/test/test_cuda_host_trace_replay.py
+@@ -4055,7 +4055,98 @@
+         self.assertEqual(f.static_hits, hits)
+ 
+ 
++_MAPPED_POOLS = []
++
++
++def _mapped_zeros(n):
++    # an allocation in a new expandable segment (a pool of its own, so no
++    # cached cudaMalloc'd block serves it): cuMem-mapped memory, as symm_mem's
++    torch.cuda.memory._set_allocator_settings("expandable_segments:True")
++    try:
++        _MAPPED_POOLS.append(torch.cuda.MemPool())
++        with torch.cuda.use_mem_pool(_MAPPED_POOLS[-1]):
++            return torch.zeros(n, device="cuda")
++    finally:
++        torch.cuda.memory._set_allocator_settings("expandable_segments:False")
++
++
++def _mapped(t):
++    from cuda.bindings import driver
++
++    err, handle = driver.cuMemRetainAllocationHandle(t.data_ptr())
++    if err == driver.CUresult.CUDA_SUCCESS:
++        driver.cuMemRelease(handle)
++    return err == driver.CUresult.CUDA_SUCCESS
++
++
++def copy_into(buf, x):
++    buf[: x.numel()].copy_(x.view(-1))
++    return buf[: x.numel()].view(x.shape) * 2
++
++
++@unittest.skipIf(not TEST_CUDA, "requires CUDA")
++@requires_cuda_python_bindings
++class TestMemcpyMemoryKinds(TestCase):
++    """A memcpy node can only be set to operands of its capture's kind of
++    memory (cudaMalloc'd or cuMem-mapped, as symm_mem is): a device argument
++    a memcpy copies is captured at its own address, and a call whose argument
++    is of the other kind misses the variant (its node's update fails before
++    any step runs) and traces one of that kind."""
++
++    def setUp(self):
++        if "expandable_segments:True" in torch._C._accelerator_getAllocatorSettings():
++            self.skipTest("the caching allocator is in expandable segments")
++
++    @parametrize("static", [False, True])
++    def test_a_copy_into_each_kind_of_memory_replays(self, static):
++        plain, mapped = torch.zeros(4096, device="cuda"), _mapped_zeros(4096)
++        self.assertEqual((_mapped(plain), _mapped(mapped)), (False, True))
++        f = HostTraceReplay(copy_into, static_prefix=int(static))
++        for buf in (mapped, mapped, plain, plain, mapped, plain):
++            for m in (8, 24):
++                x = torch.randn(m, 64, device="cuda")
++                self.assertEqual(f(buf, x), copy_into(buf.clone(), x), atol=0, rtol=0)
++                self.assertEqual(buf[: x.numel()], x.view(-1), atol=0, rtol=0)
++        # the first plain call misses the mapped variant and traces its own
++        self.assertEqual((f.traces, len(f.variants), f.eager, f.replays), (2, 2, 0, 10))
++
++    def test_an_allocation_copied_into_a_mapped_argument(self):
++        # the source is the trace's allocation (the caching allocator's kind),
++        # the destination the mapped argument
++        def fn(buf, x):
++            y = x + 1
++            buf[: y.numel()].copy_(y.view(-1))
++            return buf[: y.numel()].sum()
++
++        mapped = _mapped_zeros(4096)
++        f = HostTraceReplay(fn)
++        for m in (8, 24, 8):
++            x = torch.randn(m, 64, device="cuda")
++            self.assertEqual(f(mapped, x), fn(mapped.clone(), x), atol=0, rtol=0)
++        self.assertEqual((f.traces, f.eager, f.replays), (1, 0, 2))
++
++    @mock.patch("torch.cuda._host_trace.library_impls", False)
++    def test_a_later_steps_copy_of_the_other_kind_misses_before_any_step(self):
++        # an eager step ahead of the copy: the copy's node is set before the
++        # first step runs, so the call still misses cleanly
++        op = torch.ops.host_trace_test.tactic_ext.default
++
++        def fn(buf, x):
++            y = op(x)
++            buf[: y.numel()].copy_(y.view(-1))
++            return buf[: y.numel()].view(y.shape) + 1
++
++        plain, mapped = torch.zeros(4096, device="cuda"), _mapped_zeros(4096)
++        f = HostTraceReplay(fn)
++        for buf in (plain, mapped, mapped, plain):
++            x = torch.randn(8, 64, device="cuda")
++            self.assertEqual(f(buf, x), fn(buf.clone(), x), atol=0, rtol=0)
++        self.assertEqual((f.traces, len(f.variants), f.eager, f.replays), (2, 2, 0, 2))
++        self.assertEqual([sum(isinstance(r, EagerCall) for _, r in v.tape.launches) for v in f.variants], [1, 1])
++
++
+ instantiate_parametrized_tests(TestHostTraceReplay)
++instantiate_parametrized_tests(TestMemcpyMemoryKinds)
+ instantiate_parametrized_tests(TestChainReplay)
+ instantiate_parametrized_tests(TestReplayMemory)
+ instantiate_parametrized_tests(TestNativeReplay)

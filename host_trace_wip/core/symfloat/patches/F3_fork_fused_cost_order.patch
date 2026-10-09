@@ -1,0 +1,254 @@
+--- a/flashinfer/trtllm_trace.py
++++ b/flashinfer/trtllm_trace.py
+@@ -277,10 +277,6 @@
+     return (a + b - 1) // b
+ 
+ 
+-def _f32(x: float) -> float:
+-    return struct.unpack("<f", struct.pack("<f", x))[0]
+-
+-
+ class Kernels:
+     """TllmGenFmhaKernel for one (dtype Q, KV, O) on the current device:
+     kernel selection and CTA config as fmhaKernels.cuh has them."""
+@@ -347,26 +343,30 @@
+             self._select_tile_q(s)
+ 
+     def _select_tile_q(self, s: Select) -> None:
++        best = self.tile if self.tile is not None else self._best_tile_q(s)
++        s.tile_q = best
++        s.kernel_type = KEEPS_AB if best >= 64 else SWAPS_AB
++        self._sync_gq(s)
++
++    def _best_tile_q(self, s: Select) -> int:
++        """selectTileSizeQForGqaGeneration's tileSizeQ at the call's max_kv and
++        batch, symbolic or not: its float32 cost model in the order fmha_gen.so
++        computes it (aarch64: (factor * M) * seq, then fmaf(R * 128, ctasKv,
++        that), times the waves; the first minimum below FLT_MAX wins). Traced,
++        its comparisons are the op's guards (argmin's, against the winner)."""
++        from torch.cuda._host_trace import argmin, f32, f32_fma, f32_mul, FLT_MAX
++
+         p = self.p
+-        if self.tile is not None:
+-            s.tile_q = self.tile
+-            s.kernel_type = KEEPS_AB if self.tile >= 64 else SWAPS_AB
+-            self._sync_gq(s)
+-            return
+-        if s.tile_q <= 8:
+-            return  # no smaller tile: the cost model reads nothing
+-        if isinstance(p.max_kv, torch.SymInt) or isinstance(p.batch, torch.SymInt):
+-            # the cost model's floats read max_kv and the batch, which a trace
+-            # does not carry: the call runs eagerly
+-            raise NotFound("a generation call at max_q > 1 (its tile cost model reads max_kv and the batch as floats)")
+         main = {128: 2.2, 64: 1.68, 32: 1.48, 16: 1.2, 8: 1.0}
+         red = {128: 1.32, 64: 1.2, 32: 1.08, 16: 1.03, 8: 1.0}
+-        factor = 2.0 if p.bf16q_fp8kv and s.transform == TRANSFORM_SEPARATE_KV else 1.0
++        factor = f32(2.0 if p.bf16q_fp8kv and s.transform == TRANSFORM_SEPARATE_KV else 1.0)
+         c = dataclasses.replace(s)
++        if c.tile_q <= 8:
++            return c.tile_q  # no smaller tile: the cost model reads nothing
+         cta = self.cta(self.meta(c), c)
+-        if cta.x * cta.y * cta.z * 2 > p.sm_count or c.tile_q <= 8:
+-            return
+-        default, best, best_t = c.tile_q, c.tile_q, math.inf
++        if cta.x * cta.y * cta.z * 2 > p.sm_count:
++            return c.tile_q
++        default, tiles, costs = c.tile_q, [], []
+         for tq in (128, 64, 32, 16, 8):
+             if tq > default or tq < p.heads_q_per_kv:
+                 continue
+@@ -375,16 +375,12 @@
+             self._sync_gq(c)
+             m = self.meta(c)
+             cta = self.cta(m, c)
+-            # the cost model's floats specialize the split count and the waves
+-            kv = int(cta.max_ctas_kv)
+-            seq = _ceil_div(_ceil_div(p.max_kv, m.step_kv), kv) * m.step_kv
+-            t = _f32(_f32(_f32(factor * _f32(main[tq])) * seq) + _f32(_f32(_f32(red[tq]) * 128.0) * kv))
+-            t = _f32(t * int(_ceil_div(cta.x * cta.y * cta.z, p.sm_count)))
+-            if t < best_t:
+-                best_t, best = t, tq
+-        s.tile_q = best
+-        s.kernel_type = KEEPS_AB if best >= 64 else SWAPS_AB
+-        self._sync_gq(s)
++            seq = _ceil_div(_ceil_div(p.max_kv, m.step_kv), cta.max_ctas_kv) * m.step_kv
++            t = f32_fma(f32_mul(f32(red[tq]), 128.0), f32(cta.max_ctas_kv), f32_mul(f32_mul(factor, f32(main[tq])), f32(seq)))
++            costs.append(f32_mul(t, f32(_ceil_div(cta.x * cta.y * cta.z, p.sm_count))))
++            tiles.append(tq)
++        i = argmin(costs, below=FLT_MAX)
++        return tiles[i] if i >= 0 else default
+ 
+     def select(self, s: Select) -> None:
+         """selectKernel, for paged KV without sparse MLA."""
+--- a/tests/test_trtllm_tile_sweep.py
++++ b/tests/test_trtllm_tile_sweep.py
+@@ -0,0 +1,169 @@
++# The fork's tile cost model (selectTileSizeQForGqaGeneration, generation at max_q > 1) against FlashInfer's real
++# launcher (fmha_gen.so), and under host-trace replay:
++#   SF_FORK=1 CUDA_VISIBLE_DEVICES=1 bash land/core/symfloat/python_sf.sh land/core/symfloat/tests/test_trtllm_tile_sweep.py
++# SWEEP_CLASSES selects classes of the sweep (comma-separated names of CLASSES), so each run fits a GPU hold.
++import itertools
++import math
++import os
++import sys
++import unittest.mock
++
++import torch
++import torch.cuda._host_trace as ht
++
++import flashinfer
++import flashinfer.trtllm_trace as T
++import flashinfer.trtllm_witness as tw
++from torch.cuda._host_trace_replay import HostTraceReplay
++from torch.cuda._host_trace_tape import EagerCall
++from torch.testing._internal.common_utils import run_tests, TestCase
++
++sys.path.insert(0, "/data/eellison/src/pytorch/agent_space/paramgraph/land/core/attn/tests")
++from test_trtllm_fork_parity import call, FAMILIES  # noqa: E402
++
++# (family, q tokens per request, batch): the classes whose generation calls reach the cost model on this box's cubins
++# (q heads per KV head * q > 8 and a free half of the SMs)
++CLASSES = {
++    f"{fam}_q{q}_b{b}": (fam, q, b)
++    for fam, qs in (("bf16_h128_p16", (3, 4, 8, 16)), ("bf16_h128_p16_g6", (2, 4)), ("bf16_h128_p64", (4, 16)), ("fp8_h256_p32", (4, 16)))
++    for q in qs
++    for b in (1, 2, 4, 8)
++}
++KV = sorted(set(range(1, 3073)) | {m + d for m in range(3072, 65537, 256) for d in (-1, 0, 1)})
++STRIDE = int(os.environ.get("SWEEP_STRIDE", "1"))
++
++
++class TestTileSweep(TestCase):
++    workspace = None
++
++    def setUp(self):
++        if TestTileSweep.workspace is None:
++            TestTileSweep.workspace = torch.zeros(256 << 20, dtype=torch.uint8, device="cuda")
++
++    def check(self, fam, q, b, kvs):
++        tiles, skipped, bad = {}, 0, []
++        for kv in kvs:
++            try:
++                c = call(fam, "decode", dict(bs=b, kv=kv, q=q), self.workspace)
++                diff = T.parity(c.kind, c.binding, c.args)
++            except T.NotFound as e:
++                skipped += 1
++                continue
++            except Exception as e:  # the launcher itself has no cubin for the selection on this box
++                if "cubin" not in str(e).lower() and "not found" not in str(e).lower():
++                    raise
++                skipped += 1
++                continue
++            p, _, _ = T.from_binding(c.kind, c.args)
++            props = torch.cuda.get_device_properties(0)
++            k = T.Kernels(p, props.major * 10 + props.minor, props.shared_memory_per_block_optin)
++            s = T.Select.of(p)
++            k.select(s)
++            tiles[s.tile_q] = tiles.get(s.tile_q, 0) + 1
++            if diff:
++                bad.append((kv, diff[:3]))
++        return tiles, skipped, bad
++
++    def test_sweep(self):
++        # SWEEP_STATE (a file): classes already swept are skipped and each finished class is appended, with
++        # SWEEP_BUDGET seconds per run, so a sweep spans several GPU holds
++        import time
++
++        names = os.environ.get("SWEEP_CLASSES")
++        names = names.split(",") if names else list(CLASSES)
++        state = os.environ.get("SWEEP_STATE")
++        done = set()
++        if state and os.path.exists(state):
++            done = {line.split(":")[0] for line in open(state)}
++        budget, start = float(os.environ.get("SWEEP_BUDGET", "1e9")), time.time()
++        print(f"device SMs {torch.cuda.get_device_properties(0).multi_processor_count}")
++        failures = []
++        for name in names:
++            if name in done:
++                continue
++            if time.time() - start > budget:
++                print("budget spent", flush=True)
++                break
++            fam, q, b = CLASSES[name]
++            t0 = time.time()
++            tiles, skipped, bad = self.check(fam, q, b, KV[::STRIDE])
++            line = f"{name}: points {len(KV[::STRIDE]) - skipped} skipped {skipped} tiles {tiles} mismatches {len(bad)} {bad[:3]} ({time.time() - t0:.0f} s)"
++            print(line, flush=True)
++            if state:
++                with open(state, "a") as f:
++                    f.write(line + "\n")
++            failures += [(name, x) for x in bad]
++        self.assertEqual(failures, [])
++
++    def test_the_2049_tie(self):
++        # Q/KV heads 32/8, max_q 16, batch 1, max_kv 2049..2560 on 148/152 SMs: tiles 32 and 16 tie in exact arithmetic.
++        # The port (fmaf for the reduction term, as fmha_gen.so) equals the launcher at every max_kv of the run and
++        # around it; the old unfused order (the reduction product rounded first) differs exactly on the run
++        sms = torch.cuda.get_device_properties(0).multi_processor_count
++        kvs = range(2030, 2581)
++        tiles, skipped, bad = self.check("bf16_h128_p16", 16, 1, kvs)
++        unfused = lambda a, b, c: ht.f32_add(ht.f32_mul(a, b), c)  # noqa: E731
++        with unittest.mock.patch.object(ht, "f32_fma", unfused):
++            _, _, old = self.check("bf16_h128_p16", 16, 1, kvs)
++        print(f"2049 run on {sms} SMs: tiles {tiles} skipped {skipped} mismatches {bad[:3]}; unfused order mismatches at "
++              f"{len(old)} max_kv {old[0][0] if old else None}..{old[-1][0] if old else None}: {old[:1]}")
++        self.assertEqual((bad, skipped), ([], 0))
++        if sms in (148, 152):
++            self.assertEqual([kv for kv, _ in old], list(range(2049, 2561)))
++            self.assertTrue(all(d[0].startswith("kernel") for _, d in old), old[:2])
++
++
++class TestTileTrace(TestCase):
++    # generation at q 16 per request under replay: the cost model's comparisons are the op's guards; max_kv walks
++    # through tile regions (incl. 2049..2560): no eager step, bitwise, a variant per (tile, split) seen
++    def test_decode_q16_walks_the_tile_regions(self):
++        HQ, HKV, D, PAGE, PAGES, WIDTH, Q = 32, 8, 128, 16, 4096, 512, 16
++        g = torch.Generator(device="cuda").manual_seed(0)
++        k = torch.randn(PAGES, HKV, PAGE, D, device="cuda", generator=g).to(torch.bfloat16)
++        v = torch.randn(PAGES, HKV, PAGE, D, device="cuda", generator=g).to(torch.bfloat16)
++        ws = torch.zeros(256 << 20, dtype=torch.uint8, device="cuda")
++
++        def step(q, k, v, ws, bt, seq_lens, out, max_seq_len):
++            for _ in range(4):
++                flashinfer.decode.trtllm_batch_decode_with_kv_cache(
++                    query=q, kv_cache=(k, v), workspace_buffer=ws, block_tables=bt, seq_lens=seq_lens, max_seq_len=max_seq_len,
++                    bmm1_scale=1 / math.sqrt(D), bmm2_scale=1.0, window_left=-1, out=out, kv_layout="HND", backend="trtllm-gen",
++                    q_len_per_req=Q)
++            return out
++
++        r = HostTraceReplay(step)
++        seen = []
++        props = torch.cuda.get_device_properties(0)
++        for i, m in enumerate((700, 1500, 2049, 2300, 2560, 2561, 1500, 3000, 2100, 900, 6000, 2400)):
++            gen = torch.Generator().manual_seed(i)
++            bt = torch.zeros(1, WIDTH, dtype=torch.int32)
++            bt[0, : math.ceil(m / PAGE)] = torch.randperm(PAGES, generator=gen)[: math.ceil(m / PAGE)]
++            bt, seq_lens = bt.cuda(), torch.tensor([m], dtype=torch.int32, device="cuda")
++            q = torch.randn(Q, HQ, D, generator=gen).to(torch.bfloat16).cuda()
++            out, ref = torch.empty_like(q), torch.empty_like(q)
++            step(q, k, v, ws, bt, seq_lens, ref, m)
++            r(q, k, v, ws, bt, seq_lens, out, m)
++            self.assertEqual(out, ref, atol=0, rtol=0)
++            with tw.record_binding_calls() as calls:
++                flashinfer.decode.trtllm_batch_decode_with_kv_cache(
++                    query=q, kv_cache=(k, v), workspace_buffer=ws, block_tables=bt, seq_lens=seq_lens, max_seq_len=m,
++                    bmm1_scale=1 / math.sqrt(D), bmm2_scale=1.0, window_left=-1, out=ref, kv_layout="HND", backend="trtllm-gen",
++                    q_len_per_req=Q)
++            p, _, _ = T.from_binding(calls[0].kind, calls[0].args)
++            kk = T.Kernels(p, props.major * 10 + props.minor, props.shared_memory_per_block_optin)
++            s = T.Select.of(p)
++            kk.select(s)
++            seen.append((m, s.tile_q, int(kk.cta(kk.meta(s), s).max_ctas_kv)))
++        eager = [rec.name for var in r.variants for _, rec in var.tape.launches if isinstance(rec, EagerCall)]
++        print(f"q16: traces {r.traces} replays {r.replays} redispatches {r.redispatches} eager {r.eager} retrace_causes {r.retrace_causes} "
++              f"(max_kv, tile, split) {seen}")
++        self.assertEqual(eager, [])
++        self.assertGreater(len({t for _, t, _ in seen}), 1)
++        # every guard that failed is the op's own (class "dispatch"); a new kernel or split is another launch
++        # topology, which the native replay serves with a variant (a trace) per (tile, split), never a graph guard
++        self.assertTrue(all(c[0] == "dispatch" for c in r.retrace_causes), r.retrace_causes)
++        self.assertEqual(r.traces, len({(t, sp) for _, t, sp in seen}))
++
++
++if __name__ == "__main__":
++    run_tests()

@@ -1,0 +1,44 @@
+--- a/torch/cuda/_host_trace_redispatch.py
++++ b/torch/cuda/_host_trace_redispatch.py
+@@ -367,7 +367,9 @@
+         return back.get(id(x._root)) is y._root and x.dtype == y.dtype and agree
+ 
+     for a, b in zip(tr.allocs, olds):
+-        if (a.dtype, tuple(map(rename, a.sizes)), tuple(map(rename, a.strides))) != (b.dtype, tuple(map(key, b.sizes)), tuple(map(key, b.strides))):
++        # as same() compares an output: under the redo's pins ((1, n) against (s, n) at s == 1)
++        layout, want = [*map(rename, a.sizes), *map(rename, a.strides)], [*map(key, b.sizes), *map(key, b.strides)]
++        if a.dtype != b.dtype or (layout != want and not (pins and list(map(pinned, layout)) == list(map(pinned, want)))):
+             raise FoldRefused(f"{op.func} allocates otherwise")
+     if len(new.outputs) != len(op.outputs) or not all(map(same, new.outputs, op.outputs)):
+         raise FoldRefused(f"{op.func} returned other metadata")
+--- a/test/test_cuda_host_trace_replay.py
++++ b/test/test_cuda_host_trace_replay.py
+@@ -548,8 +548,8 @@
+             self.assertLessEqual(node.free_symbols, symbols.keys())
+ 
+     def test_a_redo_takes_a_dispatch_whose_guards_hold(self):
+-        # a redo takes a dispatch of the same reads whose guards hold at it: (2, 3000)'s redispatch dispatches one
+-        # softmax for the four layers; b = 1 is its own class (a trace)
++        # a redo takes a dispatch of the same reads whose guards hold at it: (2, 3000)'s redispatch and (1, 2016)'s
++        # dispatch one softmax for the four layers, (1, 1568)'s none; (1, 1000) traces (the sum dispatches otherwise)
+         def fn(q, page_table, kv, *ws):
+             k = kv[page_table].flatten(1, 2)
+             for w in ws:
+@@ -573,7 +573,7 @@
+                 del softmaxes[:]
+                 self.assertEqual(f(*args), fn(*args), atol=0, rtol=0)
+                 counts.append(sum(softmaxes))
+-        self.assertEqual((counts, f.traces, f.redispatches), ([4, 1, 4, 0, 0], 2, 2))
++        self.assertEqual((counts, f.traces, f.redispatches), ([4, 1, 4, 1, 0], 2, 3))
+ 
+     def test_a_redo_agrees_with_the_variants_layout_under_its_guards(self):
+         # at b == 1 the eps add returns [1, 1], the variant [b, 1]: one layout under the redo's guard b == 1
+@@ -584,7 +584,7 @@
+         for b in (2, 3, 1):
+             x = torch.randn(b, 64, device="cuda")
+             self.assertEqual(f(x), fn(x), atol=0, rtol=0)
+-        self.assertEqual((f.traces, f.redispatches), (2, 0))
++        self.assertEqual((f.traces, f.redispatches), (1, 1))
+ 
+     @parametrize("adjacent", [False, True])
+     def test_a_split_in_an_op_traces_its_class(self, adjacent):

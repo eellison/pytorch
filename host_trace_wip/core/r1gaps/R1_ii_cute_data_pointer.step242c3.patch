@@ -1,0 +1,286 @@
+--- a/torch/cuda/_host_trace_cute.py
++++ b/torch/cuda/_host_trace_cute.py
+@@ -52,6 +52,7 @@
+ from torch.cuda._host_trace_tape import (
+     _hint,
+     _PLACEHOLDER_LOW,
++    _sym_key,
+     _TracedTensor,
+     current_trace,
+     EagerCall,
+@@ -192,13 +193,14 @@
+     tensor's layout, an int tuple, shape or stride, a tile) as the DSL's own layout algebra
+     evaluates it, in a copy of the module so the live one is untouched: {"tuple": t}, {"layout":
+     [shape, stride]} or {"tile": [layout per mode]}, each leaf an int or {"dyn": width}; a type it
+-    cannot evaluate is {"error": why}. The leaves come from the DSL's get_leaves of each value
+-    (unpack_x_tuple is only ever given those)."""
++    cannot evaluate is {"error": why}; a pointer type is {"ptr": {"align": bytes, "gmem": bool}}.
++    The leaves come from the DSL's get_leaves of each value (unpack_x_tuple is only ever given
++    those)."""
+     from cutlass import Integer
+     from cutlass._mlir import ir
+     from cutlass._mlir._mlir_libs._cutlass_ir import _cute
+     from cutlass._mlir.dialects import cute as cute_ir
+-    from cutlass.cute import core
++    from cutlass.cute import AddressSpace, core
+ 
+     copy = ir.Module.parse(module.operation.get_asm(print_generic_op_form=True), module.context)
+     fn = next(o.operation for o in copy.body.operations if o.operation.name == "func.func" and o.operation.attributes["sym_name"].value == name)
+@@ -216,7 +218,7 @@
+                     walk(b)
+ 
+     walk(entry)
+-    kinds = (_cute.MemRefType, _cute.CoordTensorType, _cute.LayoutType, _cute.IntTupleType, _cute.ShapeType, _cute.StrideType, _cute.TileType)
++    kinds = (_cute.MemRefType, _cute.CoordTensorType, _cute.LayoutType, _cute.IntTupleType, _cute.ShapeType, _cute.StrideType, _cute.TileType, _cute.PtrType)
+ 
+     def leaf(x: Any) -> Any:
+         if type(x) is int:
+@@ -240,6 +242,11 @@
+             if key in out or not any(kind.isinstance(t) for kind in kinds):
+                 continue
+             try:
++                if _cute.PtrType.isinstance(t):
++                    # from the type alone: no value is taken
++                    ptr = _cute.PtrType(t)
++                    out[key] = {"ptr": {"align": ptr.alignment or 1, "gmem": ptr.address_space == AddressSpace.gmem.value}}
++                    continue
+                 v = container[i]
+                 raw = v if isinstance(v, ir.Value) else v.value
+                 if _cute.MemRefType.isinstance(t) or _cute.CoordTensorType.isinstance(t):
+@@ -512,6 +519,8 @@
+         if isinstance(ty, _Builtin) or ty.startswith("!cute.memref"):
+             return True
+         d = self.types.get(ty, {})
++        if "ptr" in d:
++            return True
+         return any(_dynamic(x) for kind in ("tuple", "layout", "tile") if kind in d for x in _flat(_tuples(d[kind])))
+ 
+     def evaluate(
+@@ -524,9 +533,10 @@
+         return [ev.launch(op) for op in self.launches], ev.predicates
+ 
+ 
+-def _bind(program: _Program, args: Sequence[Any]) -> tuple[list[Any], list[tuple[Any, str]]]:
+-    """Each formal's value: a memref's view, an integer's value, None for a
+-    stream; with the compile's specialization of each memref."""
++def _bind(program: _Program, args: Sequence[Any], pointees: dict[int, _Root]) -> tuple[list[Any], list[tuple[Any, str]]]:
++    """Each formal's value: a memref's view, an integer's value, a pointer's
++    address, None for a stream; with the compile's specialization of each
++    memref and pointer. `pointees`: per pointer argument (by id) its root."""
+     streams = [i for i, ty in enumerate(program.formals) if ty == "!cuda.stream"]
+     if len(args) == len(program.formals):
+         passed = list(args)
+@@ -549,6 +559,18 @@
+             if type(a) not in (int, torch.SymInt):
+                 raise _Undescribed(f"integer parameter {i} is passed a {type(a).__name__}")
+             formals.append(a)
++        elif "ptr" in (ptr := program.types.get(ty, {})):
++            root, align = pointees.get(id(a)), ptr["ptr"]["align"]
++            if root is None or not ptr["ptr"]["gmem"]:
++                raise _Undescribed(f"pointer parameter {i} of type {ty} is passed {a}")
++            # the alignment the compile assumed; an allocation's or eager output's base is 256-byte
++            # aligned, and its symbol no guard's input
++            if root.kind != "argument" and 256 % align:
++                raise _Undescribed(f"pointer parameter {i} assumes {align}-byte alignment")
++            offset = a if root.kind == "argument" else a - root.sym
++            if align > 1:
++                predicates.append((offset % align == 0, f"pointer parameter {i}'s address % {align} == 0"))
++            formals.append(a)
+         elif isinstance(ty, _Builtin) and ty.kind == "float" and ty.width == 32:
+             # a float the trace holds as a constant, as it holds an ATen call's
+             if type(a) is not float:
+@@ -849,6 +871,10 @@
+                 params.append(_Param(fields))
+             elif isinstance(ty, _Builtin) and ty.int_of(16, 32, 64):
+                 params.append(_Param([(v, ty.width // 8, False)]))
++            elif "ptr" in (ptr := self.program.types.get(ty, {})):
++                if not ptr["ptr"]["gmem"]:
++                    raise _Undescribed(f"a kernel argument of type {ty}")
++                params.append(_Param([(v, 8, True)]))
+             elif isinstance(ty, _Builtin) and ty.kind == "float" and ty.width == 32 and type(v) is float:
+                 params.append(_Param([(struct.unpack("<i", struct.pack("<f", v))[0], 4, False)]))
+             elif ty.startswith("!cute.coord_tensor"):
+@@ -886,8 +912,8 @@
+ _loaded_from: weakref.WeakKeyDictionary[Any, str] = weakref.WeakKeyDictionary()
+ SIDECAR = ".cute_host"
+ # a sidecar's format: its host function, TVM-FFI's argument spec, the DSL's evaluation of its types
+-# and its object's digest
+-_SIDECAR_VERSION = 3
++# (pointer types too, from 4) and its object's digest
++_SIDECAR_VERSION = 4
+ 
+ 
+ def _encode_spec(params: Sequence[Any], tvm_ffi: bool) -> list:
+@@ -920,10 +946,12 @@
+     return [encode(p) for p in params]
+ 
+ 
+-def _spec_args(spec: list, args: Sequence[Any]) -> tuple[list[Any], list[tuple[Any, str]]]:
++def _spec_args(spec: list, args: Sequence[Any]) -> tuple[list[Any], list[tuple[Any, str]], dict[int, Any]]:
+     """The call's arguments its host function takes, and as guards each check TVM-FFI's binder makes
+     of them (static and shared sizes and strides, divisibility, int bounds, alignment, dtype); a
+-    check that fails at the trace's values declines the call, which eager then rejects."""
++    check that fails at the trace's values declines the call, which eager then rejects. And per
++    DataPointer argument (by position) its address, a traced tensor's data_ptr(): the binder takes
++    any int there and checks nothing of it."""
+     from cutlass import Numeric
+ 
+     from torch.fx.experimental.symbolic_shapes import sym_or
+@@ -931,6 +959,7 @@
+     seen: dict[int, tuple[Any, str]] = {}
+     taken: list[Any] = []
+     guards: list[tuple[Any, str]] = []
++    pointers: dict[int, Any] = {}
+ 
+     def value(v: Any, x: Any, what: str, unless: Any = False) -> None:
+         # unless: where the binder skips the check (a stride of a size-1 dim)
+@@ -952,7 +981,7 @@
+         if div > 1:
+             check(x % div == 0, f"{what} % {div} == 0")
+ 
+-    def take(p: list, a: Any, what: str) -> None:
++    def take(p: list, a: Any, what: str, top: int | None = None) -> None:
+         a = a.value if isinstance(a, Numeric) else a
+         if p[0] == "const":
+             if type(a) is not type(p[1]) and not (type(p[1]) is int and isinstance(a, torch.SymInt)):
+@@ -988,6 +1017,11 @@
+                 raise _Undescribed(f"{what} is a {type(a).__name__} for a scalar")
+             if type(a) in (int, torch.SymInt):
+                 value(p[1], a, what)
++        elif p[0] == "DataPointer" and top is not None:
++            # an int address is memory the trace does not track (or null): an eager call
++            if not isinstance(a, torch.SymInt):
++                raise _Undescribed(f"{what} is a {type(a).__name__} for a TVM-FFI DataPointer")
++            pointers[top] = a
+         elif p[0] != "stream":
+             raise _Undescribed(f"{what} is a TVM-FFI {p[0]} parameter")
+         taken.append(a)
+@@ -996,8 +1030,8 @@
+     if len(args) != len(params):
+         raise _Undescribed(f"{len(args)} arguments for {len(params)} parameters")
+     for i, (p, a) in enumerate(zip(params, args)):
+-        take(p, a, f"argument {i}")
+-    return taken, guards
++        take(p, a, f"argument {i}", i)
++    return taken, guards, pointers
+ 
+ 
+ def _program(text: str, name: str, spec: list, types: dict[str, Any]) -> _Program | str:
+@@ -1138,6 +1172,20 @@
+     return [a.value if isinstance(a, Numeric) else a]
+ 
+ 
++def _pointee(tr: _Trace, address: torch.SymInt) -> _Root:
++    """The root a DataPointer argument points into: the trace's one root whose
++    base symbol the address holds (lowering checks it is that base plus an
++    offset, as for any pointer slot)."""
++    key = _sym_key(address)
++    held = set() if isinstance(key, int) else key.free_symbols
++    roots = (*(i.root for i in tr.inputs), *(a.root for a in tr.allocs), *(t._root for t in tr.eager_outputs))
++    found = [r for r in roots if _sym_key(r.sym).free_symbols & held]
++    if len(found) != 1:
++        raise _Undescribed(f"the DataPointer address {address} is not in one traced tensor's storage")
++    # a pinned host argument's root (pinned memcpy trees) declines at lowering, as any kernel pointer into it
++    return found[0]
++
++
+ def _stand_ins(a: Any) -> Any:
+     if isinstance(a, tuple) and hasattr(a, "_fields"):
+         return type(a)(*map(_stand_ins, a))
+@@ -1181,17 +1229,21 @@
+         if isinstance(program, str):
+             raise _Undescribed(program)
+         # a parameter compiled as None is no formal: TVM-FFI takes the None and drops it
+-        given, guards = _spec_args(program.spec, args)
+-        bound = _bind(program, given)
++        given, guards, pointers = _spec_args(program.spec, args)
++        pointees = {id(a): _pointee(tr, a) for a in pointers.values()}
++        bound = _bind(program, given, pointees)
+         bound[1].extend(guards)
+         for i, ty in enumerate(program.formals):
+             if ty == "!cuda.stream" and len(given) == len(program.formals) and _stream_handle(given[i]) is None:
+                 decline(f"argument {i} is a stream as a {type(given[i]).__name__}; pass a torch.cuda.Stream or CUstream")
+         roots: list[_Root] = []
+-        for a in leaves:
+-            if isinstance(a, _TracedTensor) and not any(r is a._root for r in roots):
+-                roots.append(a._root)
++        for r in (*(a._root for a in leaves if isinstance(a, _TracedTensor)), *pointees.values()):
++            if not any(r is s for s in roots):
++                roots.append(r)
+         stand_ins = [_stand_ins(a) for a in args]
++        for i, a in pointers.items():
++            # as _stand_in places a traced tensor
++            stand_ins[i] = _hint(a) & _PLACEHOLDER_LOW
+         for i, arg in cute_args:
+             stand_ins[i] = arg.make(stand_ins[i])
+ 
+--- a/test/test_cuda_host_trace_cute.py
++++ b/test/test_cuda_host_trace_cute.py
+@@ -106,6 +106,13 @@
+         _iota_kernel(cute.make_identity_tensor(mC.shape), mC, n).launch(grid=[(n + 127) // 128, 1, 1], block=[128, 1, 1], stream=stream)
+ 
+     @cute.jit
++    def _add_by_pointer(mA: cute.Tensor, pB: cute.Pointer, mC: cute.Tensor, n: cutlass.Int32, stream: cuda_driver.CUstream):
++        # FlashInfer's mm_fp4 scale factors: a tensor over a make_ptr pointer, called with a data_ptr() (TVM-FFI's DataPointer)
++        m = cute.size(mA, mode=[0])
++        mB = cute.make_tensor(pB, cute.make_layout(m, stride=1))
++        _add_kernel(mA, mB, mC, n).launch(grid=[(m + 127) // 128, 1, 1], block=[128, 1, 1], stream=stream)
++
++    @cute.jit
+     def _add_on_the_null_stream(
+         mA: cute.Tensor, mB: cute.Tensor, mC: cute.Tensor, n: cutlass.Int32
+     ):
+@@ -589,6 +596,53 @@
+         self.assertEqual(program.types[coords], {"layout": [[{"dyn": 32}], [{"basis": [1, [0]]}]]})
+         self.assertTrue(program.runtime(coords))
+ 
++    def test_a_data_pointer_is_a_traced_tensors_address(self):
++        # the address of an allocation, of an argument and of a view at an offset from a size: each a
++        # pointer slot of the launch, at the replay's address
++        t = make_fake_compact_tensor(cutlass.Float32, (cute.sym_int32(),), assumed_align=16)
++        ptr = make_ptr(cutlass.Float32, 16, cute.AddressSpace.gmem, 16)
++        add = cute.compile(_add_by_pointer, t, ptr, t, cutlass.Int32(0), make_fake_stream(use_tvm_ffi_env_stream=True), options="--enable-tvm-ffi")
++        self.assertEqual(htc._compiles[add].types["!cute.ptr<f32, gmem, align<16>>"], {"ptr": {"align": 16, "gmem": True}})
++
++        def f(a, b):
++            n = a.shape[0]
++            s = b * 2
++            c, d, e = (torch.empty_like(a) for _ in range(3))
++            add(a, s.data_ptr(), c, n)
++            add(c, b.data_ptr(), d, n)
++            add(d, s[b.shape[0] - n :].data_ptr(), e, n)
++            return e
++
++        a, b = torch.randn(1000, device="cuda"), torch.randn(1004, device="cuda")
++        tape = trace(f, (a, b))
++        self.assertFalse([launch.reason for _, launch in tape.launches if isinstance(launch, EagerCall)])
++        self.assertEqual(sum(isinstance(launch, KernelLaunch) and "add_kernel" in launch.name for _, launch in tape.launches), 3)
++        r = HostTraceReplay(f)
++        for n, k in ((1000, 4), (4096, 8), (777, 12), (1000, 4)):
++            a, b = torch.randn(n, device="cuda"), torch.randn(n + k, device="cuda")
++            self.assertEqual(r(a, b), f(a, b), atol=0, rtol=0)
++        self.assertEqual((r.traces, r.replays, r.eager), (1, 3, 0))
++        # the view's pointer 4 bytes off 16: the compile's alignment guard misses, and no variant replays it
++        a, b = torch.randn(1000, device="cuda"), torch.randn(1001, device="cuda")
++        self.assertEqual(r(a, b), f(a, b), atol=0, rtol=0)
++        self.assertEqual((r.traces, r.replays), (2, 3))
++
++    def test_a_data_pointer_outside_the_trace_is_an_eager_call(self):
++        # a DataPointer that is a plain int (memory the trace does not track): the call runs eagerly at it
++        t = make_fake_compact_tensor(cutlass.Float32, (cute.sym_int32(),), assumed_align=16)
++        ptr = make_ptr(cutlass.Float32, 16, cute.AddressSpace.gmem, 16)
++        add = cute.compile(_add_by_pointer, t, ptr, t, cutlass.Int32(0), make_fake_stream(use_tvm_ffi_env_stream=True), options="--enable-tvm-ffi")
++        held = torch.randn(1000, device="cuda")
++
++        def f(a):
++            c = torch.empty_like(a)
++            add(a, held.data_ptr(), c, a.shape[0])
++            return c
++
++        tape = trace(f, (torch.randn(1000, device="cuda"),))
++        ((_, call),) = [x for x in tape.launches if isinstance(x[1], EagerCall)]
++        self.assertIn("argument 1 is a int for a TVM-FFI DataPointer", call.reason)
++
+     def test_an_i64_size_and_a_programmatic_launch_are_a_launch(self):
+         t = make_fake_compact_tensor(cutlass.Float32, (cute.sym_int(64),), assumed_align=16)
+         stream = make_fake_stream(use_tvm_ffi_env_stream=True)

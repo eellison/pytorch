@@ -1,0 +1,524 @@
+--- a/torch/cuda/_host_trace_capture.py
++++ b/torch/cuda/_host_trace_capture.py
+@@ -786,6 +786,29 @@
+     return CapturedTape(lowered, segments)
+ 
+ 
++def section_binding(launches: Sequence[LoweredLaunch | LoweredMemset], values: Sequence[int]) -> OpaqueBinding:
++    """A redispatch section's launches as a piece's nodes (_capture_piece) at
++    the rows `values` of a call it holds: their functions, launch attributes
++    and dimensions; their parameter bytes are don't-care, which a replay's
++    patch fills."""
++    from cuda.bindings import driver
++
++    from torch.cuda._host_trace_opaque import OpaqueBinding, OpaqueKernel, OpaqueMemset
++
++    pdl = driver.CUlaunchAttributeID.CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION
++    nodes: list[OpaqueKernel | OpaqueMemset] = []
++    for lo in launches:
++        t = lo.launch
++        if isinstance(lo, LoweredMemset):
++            nodes.append(OpaqueMemset(None, t.value, t.element_size, *memset_extent(lo, values)))  # type: ignore[arg-type]
++            continue
++        images = t.images or tuple(bytes(n) for _, n in t.layout)
++        attributes = (*t.attributes, *(((pdl, 1),) if t.programmatic else ()))
++        grid, block = (tuple(values[r] for r in rows) for rows in (lo.grid, lo.block))
++        nodes.append(OpaqueKernel(t.function, grid, block, values[lo.smem], attributes, t.layout, (b"".join(images),) if t.packed else images, ()))  # type: ignore[arg-type]
++    return OpaqueBinding(tuple(nodes), ())
++
++
+ def _capture_piece(graph: int, dependencies: list[Any], binding: OpaqueBinding, stream: int) -> list[tuple[int, int]]:
+     """The binding's nodes captured on `stream` into the graph after
+     `dependencies`, on default edges into its first; each one's (kind, node),
+--- a/torch/cuda/_host_trace_lower_tape.py
++++ b/torch/cuda/_host_trace_lower_tape.py
+@@ -233,6 +233,16 @@
+ 
+ 
+ @dataclass(frozen=True)
++class LoweredSection:
++    """A redispatch entry in its op's place (a graph piece): per temporary
++    (its base past the tape's, its bytes' row), and the op's allocations it
++    does not make."""
++
++    temporaries: tuple[tuple[int, int], ...]
++    drops: tuple[int, ...]
++
++
++@dataclass(frozen=True)
+ class LoweredTape:
+     tape: Tape
+     program: IntegerProgram  # complete: no row is added after compilation
+@@ -287,6 +297,8 @@
+         self.entry_guards: list[tuple[int, tuple[Any, ...]]] = []
+         # selectors (native site indices) whose redispatch refused at some call
+         self.refused: set[int] = set()
++        # the section temporaries' bases the native variant holds past the tape's (_add_entries counts them)
++        self.sections = 0
+ 
+         def source(v: Any, leaf: tuple | int) -> None:
+             k = self.key(v)
+@@ -384,7 +396,8 @@
+         kind, k = ref
+         if kind == "argument":
+             return None
+-        return k if kind == "allocation" else len(self.tape.allocs) + k
++        # a section's temporary: its base past the tape's
++        return k if kind in ("allocation", "section") else len(self.tape.allocs) + k
+ 
+     def view(self, t: _TracedTensor) -> LoweredView:
+         sizes = tuple(self.row(s) for s in t.shape)
+@@ -890,37 +903,51 @@
+                 geometry = (tuple(map(rename, rec.grid)), tuple(map(rename, rec.block)), rename(rec.smem))
+                 rec = replace(rec, slots=tuple(map(rename, rec.slots)), roots=owned, grid=geometry[0], block=geometry[1], smem=geometry[2])
+             launches.append((lowered.launches[n].seq, rec))
+-        selected.append((i, [guard(g) for g in op.guards] + extra, launches))
++        selected.append((i, [guard(g) for g in op.guards] + extra, launches, None))
+     return lower_entries(lowered, args, values, selected)
+ 
+ 
+ def lower_entries(
+-    lowered: LoweredTape, args: Sequence[Any], values: Sequence[int], selected: list[tuple[int, list[Any], list[tuple[int, Any]]]]
+-) -> tuple[torch._C._HostTraceProgram, list[tuple[int, int, tuple[LoweredLaunch | LoweredMemset, ...]]]]:
+-    """Per (selector site, guards, (seq, launch) pairs) in the variant's
+-    symbols, the entry (site, predicate row, lowered launches), its rows
+-    appended to the variant's program at the call `args` (rows `values`), and
+-    the program compiled; FoldRefused where a lowering declines."""
++    lowered: LoweredTape, args: Sequence[Any], values: Sequence[int], selected: list[tuple[int, list[Any], list[tuple[int, Any]], Any]]
++) -> tuple[torch._C._HostTraceProgram, list[tuple[int, int, tuple[LoweredLaunch | LoweredMemset, ...], LoweredSection | None]]]:
++    """Per (selector site, guards, (seq, launch) pairs, a redo's Section or
++    None) in the variant's symbols, the entry (site, predicate row, lowered
++    launches, LoweredSection or None), its rows appended to the variant's
++    program at the call `args` (rows `values`), and the program compiled;
++    FoldRefused where a lowering declines. A section's temporaries take the
++    bases past the tape's and the earlier sections'."""
+     lo = lowered.lowering
+     # every row evaluated at the call, where each new row is too
+     program = lo.program
+     program.inputs, program.values = tuple(args), list(values)
+     entries = []
++    base = len(lowered.allocations) + len(lowered.eager_roots) + lo.sections
+     try:
+-        for i, guards, launches in selected:
++        for i, guards, launches, section in selected:
+             # sympy guards in an IR variant: its rename failed at the hints (HintsFail)
+             symbolic = any(isinstance(g, sympy.Basic) for g in guards)
+             low, key = (lo.symbolic, _sym_expr) if symbolic else (lo.lowering, lo.key)
+             addresses = frozenset(key(rec.root.sym) for rec in lowered.tape.inputs)
++            temporaries = []
+             # the other entries' rows are evaluated at this one's calls
+             with low.total() as domains:
+                 predicate = low.conjunction(guards, addresses)
+-                rows = tuple(lo.launch(seq, rec) for seq, rec in launches)
++                for t in section.temporaries if section else ():
++                    lo.roots[id(t.root)] = ("section", base)
++                    temporaries.append((base, lo.allocation(t).nbytes))
++                    # its requirement (nonnegative strides) is the entry's
++                    predicate = lo.emit("and", predicate, lo.requirements.pop())
++                    base += 1
++                try:
++                    rows = tuple(lo.launch(seq, rec) for seq, rec in launches)
++                finally:
++                    for t in section.temporaries if section else ():
++                        del lo.roots[id(t.root)]
+             for ok in domains:
+                 predicate = lo.emit("and", predicate, ok)
+-            entries.append((i, predicate, rows))
++            entries.append((i, predicate, rows, section and LoweredSection(tuple(temporaries), section.drops)))
+         compiled = compile_program(program)
+-        lo.entry_guards += [(i, tuple(guards)) for i, guards, _ in selected]
++        lo.entry_guards += [(i, tuple(guards)) for i, guards, *_ in selected]
+     except Declined as e:
+         raise FoldRefused(f"a lowering declined: {e}", compile_program(program)) from e
+     finally:
+--- a/torch/cuda/_host_trace_memory.py
++++ b/torch/cuda/_host_trace_memory.py
+@@ -341,12 +341,10 @@
+     return MemoryPlan(tuple(sorted(k for k in escapes if k < n_alloc)), tuple(plan))
+ 
+ 
+-def check_plan(lowered: LoweredTape, plan: MemoryPlan) -> None:
+-    """That every allocation a step uses is live there in the plan: at each launch, those its pointer
+-    slots and its keyed site's table (operands, scratch) reach, a temporary of its run between its
+-    seq and its last use, a tensor from its step to the one that drops it; at an eager step, its
+-    leaves' tensors. A plan that frees an allocation before a use lets a later one take its bytes
+-    while it is in use. Build time only."""
++def _liveness(lowered: LoweredTape, plan: MemoryPlan) -> Callable[[int, int, float], bool]:
++    """Whether allocation b is live at step i, seq `seq` in the plan: a temporary of the run between its
++    seq and its last use, a tensor from its seq in its step to the step that drops it; a held or
++    relocated one, an eager output's, always."""
+     n = len(lowered.allocations)
+     made, spans, dropped = {}, {}, {}
+     for i, step in enumerate(plan.steps):
+@@ -354,10 +352,6 @@
+         spans.update((k, (i, seq, last)) for k, seq, last in step.temporaries)
+         dropped.update((b, i) for b in step.drops)
+     held = set(plan.relocated)
+-    tables: dict[int, list[int]] = {}
+-    for site in lowered.sites:
+-        for j in site.nodes:
+-            tables.setdefault(j, []).extend(b for _, b in (*site.operands, *site.scratch.values()) if 0 <= b < n)
+ 
+     def live(b: int, i: int, seq: float) -> bool:
+         if b in held or b >= n:
+@@ -365,8 +359,24 @@
+         if b in spans:
+             run, first, last = spans[b]
+             return run == i and first <= seq <= last
+-        return made.get(b, len(plan.steps)) <= i <= dropped.get(b, len(plan.steps))
++        # eager order makes a tensor at its seq in its step's run
++        start = made.get(b, len(plan.steps))
++        return start <= i <= dropped.get(b, len(plan.steps)) and (start < i or lowered.allocations[b].seq <= seq)
++
++    return live
+ 
++
++def check_plan(lowered: LoweredTape, plan: MemoryPlan) -> None:
++    """That every allocation a step uses is live there in the plan (_liveness): at each launch, those
++    its pointer slots and its keyed site's table (operands, scratch) reach; at an eager step, its
++    leaves' tensors. A plan that frees an allocation before a use lets a later one take its bytes
++    while it is in use. Build time only."""
++    n = len(lowered.allocations)
++    live = _liveness(lowered, plan)
++    tables: dict[int, list[int]] = {}
++    for site in lowered.sites:
++        for j in site.nodes:
++            tables.setdefault(j, []).extend(b for _, b in (*site.operands, *site.scratch.values()) if 0 <= b < n)
+     for i, step in enumerate(lowered.steps):
+         if isinstance(step, range):
+             uses = [(lowered.launches[j].seq, [s.base for s in lowered.launches[j].slots if isinstance(s, PointerSlot) and s.base is not None] + tables.get(j, [])) for j in step]
+@@ -377,6 +387,43 @@
+                 raise AssertionError(f"host_trace: allocations {bad} are used at step {i} (seq {seq}) outside their lifetimes in the memory plan")
+ 
+ 
++def check_section(lowered: LoweredTape, plan: MemoryPlan, nodes: Sequence[int], launches: Sequence[Any], temporaries: Sequence[tuple[int, int]], drops: Collection[int]) -> str | None:
++    """Why a section (launches and temporaries (base, bytes row) in place of launches `nodes` of one op,
++    which does not make the op's allocations `drops`) cannot take the op's place in the plan, or None. Its
++    graph piece replaces the op's chain of one run, and its temporaries live within that chain (or over
++    the run), so every other base it reaches must be live in the plan over the whole of the op's chain,
++    at its first and its last launch: an allocation the plan frees or makes within the chain may share
++    bytes with another there. Build time only."""
++    step = next((i for i, s in enumerate(lowered.steps) if isinstance(s, range) and nodes and nodes[0] in s), None)
++    if step is None or not all(n in lowered.steps[step] for n in nodes):
++        return "its op's launches are not in one graph"
++    first, last = lowered.launches[nodes[0]].seq, lowered.launches[nodes[-1]].seq
++    own, tape = {b for b, _ in temporaries}, len(lowered.allocations) + len(lowered.eager_roots)
++    live = _liveness(lowered, plan)
++    for lo in launches:
++        for s in lo.slots:
++            if not isinstance(s, PointerSlot) or s.base is None or s.base in own:
++                continue
++            if s.base >= tape or s.base in drops or not (live(s.base, step, first) and live(s.base, step, last)):
++                return f"base {s.base} is not live over its op's launches in the plan"
++    return None
++
++
++def section_places(lowered: LoweredTape, plan: MemoryPlan, nodes: Sequence[int]) -> tuple[int, int]:
++    """Where a section of the op of launches `nodes` makes and frees its temporaries in its run's eager
++    order (HostTraceVariant::allocate): before the first event after the op's own allocations, and before
++    the first after its last launch; in a run of no order, among its tensors, both before the first made
++    after the op's first launch. As eager makes them inside the op and frees them as it returns."""
++    step = next(i for i, s in enumerate(lowered.steps) if isinstance(s, range) and nodes[0] in s)
++    m, first, last = plan.steps[step], lowered.launches[nodes[0]].seq, lowered.launches[nodes[-1]].seq
++    if not m.order:
++        at = sum(lowered.allocations[k].seq < first for k in m.tensors)
++        return at, at
++    lasts = {k: end for k, _, end in m.temporaries}
++    keys = [(lowered.allocations[e].seq, 0) if e >= 0 else (lasts[-1 - e], 1) for e in m.order]
++    return sum(k < (first, 0) for k in keys), sum(k < (last, 2) for k in keys)
++
++
+ def _nbytes(lowered: LoweredTape) -> list[int]:
+     """Each base's bytes at the traced call: allocation k's, then eager output
+     j's at len(allocations) + j, as its predictions extend."""
+@@ -1068,7 +1115,7 @@
+ 
+ 
+ def relocate_entries(lowered: LoweredTape, relocated: Mapping[int, tuple[int, ...]], entries: list, args: Sequence[Any]) -> tuple[Any, list]:
+-    """A fold's or a redispatch's entries (site, predicate, launches) with
++    """A fold's or a redispatch's entries (site, predicate, launches, section) with
+     their launches relocated as the variant's are, and the program compiled
+     again over the call `args`, at whose values the program's rows are."""
+     from torch.cuda._host_trace_program import compile_program
+@@ -1076,7 +1123,7 @@
+     program = lowered.lowering.program
+     program.inputs = tuple(args)
+     try:
+-        entries = [(site, predicate, tuple(_moved(program.emit, relocated, lo) for lo in launches)) for site, predicate, launches in entries]
++        entries = [(site, predicate, tuple(_moved(program.emit, relocated, lo) for lo in launches), section) for site, predicate, launches, section in entries]
+         return compile_program(program), entries
+     finally:
+         program.inputs = ()
+--- a/torch/cuda/_host_trace_redispatch.py
++++ b/torch/cuda/_host_trace_redispatch.py
+@@ -7,15 +7,19 @@
+ formulas' values at the call and the planned roots. Its launches become an
+ entry of the selector, lowered as a fold's are, with every guard the run
+ recorded as its predicate. No Python of the traced function runs, and no
+-other op. FoldRefused where the op's outputs, allocations or launch topology
+-differ: the call traces again.
++other op. Where its launch or allocation count differs (a split reduction:
++a memset, a kernel and two temporaries for one kernel), the entry is a
++section: its launches replace the op's in the graph (a form's piece), each
++allocation an output is the variant's, and the others are its temporaries,
++sized at the call by formulas in the variant's symbols. FoldRefused where the
++op's outputs or launch topology differ otherwise: the call traces again.
+ """
+ 
+ from __future__ import annotations
+ 
+ import contextlib
+ import threading
+-from dataclasses import replace
++from dataclasses import dataclass, replace
+ from typing import Any, TYPE_CHECKING
+ 
+ import sympy
+@@ -123,7 +127,7 @@
+     ir: bool = True,
+     hosted: bool = False,
+     dispatches: dict[Any, list[tuple[_Trace, list[torch.SymInt], list[_Root]]]] | None = None,
+-) -> tuple[list[Any], list[tuple[int, Any]]]:
++) -> tuple[list[Any], list[tuple[int, Any]], Section | None]:
+     # ir off renames in sympy
+     # dispatches: the family's dispatches by what they read of their call, each with its fresh symbols and roots
+     old, lo = lowered.tape, lowered.lowering
+@@ -316,12 +320,45 @@
+                 else:
+                     ((fq,), (q,)) = _sym_expr(a._root.sym).free_symbols, _sym_expr(b._root.sym).free_symbols
+                     mapping[fq] = q
+-    if len(new.launches) != len(op.launches) or len(new.allocs) != len(op.allocs):
+-        raise FoldRefused(f"{op.func} dispatches otherwise")
+     olds = old.allocs[op.allocs.start : op.allocs.stop]
+-    for a, b in zip(tr.allocs, olds):
+-        bind(a.q, b.q)
+-        back[id(a.root)] = b.root
++    section: Section | None = None
++    if len(new.launches) != len(op.launches) or len(new.allocs) != len(op.allocs):
++        if eager or not ir:
++            raise FoldRefused(f"{op.func} dispatches otherwise")
++        if not getattr(torch._C, "_host_trace_section_entries", False):
++            raise FoldRefused(f"{op.func} dispatches otherwise; the native replay takes no section entries")
++        if not selector.nodes:
++            raise FoldRefused(f"{op.func} dispatches otherwise; it has no launch a section replaces")
++        seq = lowered.launches[selector.nodes[0]].seq
++        # an allocation an output is maps to the variant's for that output; the rest are the section's own
++        roles = {id(b.root): b for b in olds}
++        mine = {id(a.root): a for a in tr.allocs}
++        pairs = {id(x._root): roles[id(y._root)] for x, y in zip(new.outputs, op.outputs) if isinstance(x, _TracedTensor) and isinstance(y, _TracedTensor) and id(x._root) in mine and id(y._root) in roles}
++        if len({id(b) for b in pairs.values()}) != len(pairs):
++            raise FoldRefused(f"{op.func} returns one allocation as two")
++        temps: list[Temporary] = []
++        ctx = old.shape_env.ctx
++        for a in tr.allocs:
++            if id(a.root) in pairs:
++                b = pairs[id(a.root)]
++                bind(a.q, b.q)
++                back[id(a.root)] = b.root
++                continue
++            # a symbol of the variant's context no guard reads: the temporary's address, as an allocation's
++            mapping[a.q.node.node.args[0]] = ctx.sym(f"section{len(ctx.symbols)}", _hint(a.q))
++            temp = _Root(a.root.name, renamer(a.root.sym), "allocation")
++            back[id(a.root)] = temp
++            temps.append(Temporary(temp, a.dtype, tuple(map(renamer, a.sizes)), tuple(map(renamer, a.strides)), seq))
++        # the op's allocations no output of the section is: it does not make them
++        paired = {id(b) for b in pairs.values()}
++        section = Section(tuple(temps), tuple(k for k, b in zip(op.allocs, olds) if id(b) not in paired))
++        olds = [pairs[id(a.root)] for a in tr.allocs if id(a.root) in pairs]
++        allocs = [a for a in tr.allocs if id(a.root) in pairs]
++    else:
++        allocs = list(tr.allocs)
++        for a, b in zip(allocs, olds):
++            bind(a.q, b.q)
++            back[id(a.root)] = b.root
+ 
+     def rename(v: Any) -> Any:
+         if ir:
+@@ -365,7 +402,7 @@
+         agree = layout == want or (pins and list(map(pinned, layout)) == list(map(pinned, want)))
+         return back.get(id(x._root)) is y._root and x.dtype == y.dtype and agree
+ 
+-    for a, b in zip(tr.allocs, olds):
++    for a, b in zip(allocs, olds):
+         # as same() compares an output: under the redo's pins ((1, n) against (s, n) at s == 1)
+         layout, want = [*map(rename, a.sizes), *map(rename, a.strides)], [*map(key, b.sizes), *map(key, b.strides)]
+         if a.dtype != b.dtype or (layout != want and not (pins and list(map(pinned, layout)) == list(map(pinned, want)))):
+@@ -381,9 +418,24 @@
+         if split[0][0] != split[1][0] or call.generator is not own.generator or new_spec != old_spec or not all(map(same, new_leaves, old_leaves)):
+             raise FoldRefused(f"another eager call of {op.func}")
+         # the variant's own call stands; only the guards that select it are new
+-        return guards, []
++        return guards, [], None
+     launches = []
+     olds = [rec for _, rec in old.launches[op.launches.start : op.launches.stop]]
++    descriptors = getattr(torch._C, "_host_trace_entry_descriptors_enabled", bool)()
++    if section is not None:
++        # a section's launches take the op's place: each reads roots the op's own launches hold (the plan keeps
++        # them live there) or its temporaries
++        held = {id(r) for y in olds for r in y.roots} | {id(t.root) for t in section.temporaries}
++        for _, x in tr.launches:
++            if isinstance(x, KernelLaunch) and (x.rng or x.rng_increment or x.cpu_scalars or (x.descriptors and not descriptors)):
++                raise FoldRefused(f"an RNG, TMA or CPU scalar launch in {op.func}'s section")
++            if isinstance(x, Memcpy):
++                raise FoldRefused(f"a memcpy in {op.func}'s section")
++            owned = tuple(back.get(id(r)) for r in x.roots)
++            if any(r is None or id(r) not in held for r in owned):
++                raise FoldRefused(f"a launch in {op.func}'s section of a root its op does not hold")
++            launches.append((seq, _renamed(x, owned, rename)))
++        return guards, launches, section
+     for n, (_, x), y in zip(selector.nodes, tr.launches, olds, strict=True):
+         if isinstance(x, KernelLaunch) and (x.rng or x.rng_increment or x.cpu_scalars):
+             raise FoldRefused(f"an RNG or CPU scalar launch in {op.func}")
+@@ -404,7 +456,29 @@
+         if not topology:
+             raise FoldRefused(f"another launch topology in {op.func}")
+         launches.append((lowered.launches[n].seq, _renamed(x, owned, rename)))
+-    return guards, launches
++    return guards, launches, None
++
++
++@dataclass(frozen=True)
++class Temporary:
++    """A section's temporary: its root (a symbol of the variant's context no
++    guard reads), dtype, sizes and strides in the variant's symbols, and the
++    seq of the op's first launch, which the section replaces."""
++
++    root: _Root
++    dtype: torch.dtype
++    sizes: tuple[Any, ...]
++    strides: tuple[Any, ...]
++    seq: int
++
++
++@dataclass(frozen=True)
++class Section:
++    """A redo's launches in its op's place: its temporaries, and the op's
++    allocations (indices) it does not make."""
++
++    temporaries: tuple[Temporary, ...]
++    drops: tuple[int, ...]
+ 
+ 
+ def _renamed(x: Any, roots: tuple[_Root, ...], rename: Callable[[Any], Any]) -> Any:
+--- a/torch/cuda/_host_trace_replay.py
++++ b/torch/cuda/_host_trace_replay.py
+@@ -76,10 +76,10 @@
+ from torch.cuda import _host_trace_cute  # noqa: F401  hooks cute.compile
+ from torch.cuda import _host_trace_ir as _ir
+ from torch.cuda._host_trace import _drop_tracebacks, Declined, declined, EagerFallback, ProcessHold
+-from torch.cuda._host_trace_capture import capture_tape, instantiate_form, plain_attributes, SegmentFailed
++from torch.cuda._host_trace_capture import capture_tape, instantiate_form, plain_attributes, section_binding, SegmentFailed
+ from torch.cuda._host_trace_harvest import HarvestProvider
+-from torch.cuda._host_trace_lower_tape import fold, FoldRefused, lower_guards, lower_tape, PointerSlot, PredictedOutput
+-from torch.cuda._host_trace_memory import arena_addresses, auto_memory, check_plan, plan_memory, relocate, relocate_entries, size_classes, split_runs, SPLITS
++from torch.cuda._host_trace_lower_tape import fold, FoldRefused, lower_guards, lower_tape, LoweredSelector, PointerSlot, PredictedOutput
++from torch.cuda._host_trace_memory import arena_addresses, auto_memory, check_plan, check_section, plan_memory, section_places, relocate, relocate_entries, size_classes, split_runs, SPLITS
+ from torch.cuda._host_trace_opaque import key_guards, library_state_as, span_bytes
+ from torch.cuda._host_trace_program import Status
+ from torch.cuda._host_trace_redispatch import redispatch
+@@ -335,7 +335,8 @@
+     # call traced again at them, or this variant's trace declined to record them
+     tried: set[OpaqueKey] = field(default_factory=set)
+     # per keyed site, a binding of each of its arms 1, 2, ...: its nodes at
+-    # other launch attributes, or a piece, nodes of their own in their place
++    # other launch attributes, or a piece, nodes of their own in their place;
++    # per selector, its sections' launches as pieces (section_binding)
+     arms: dict[int, list[OpaqueBinding]] = field(default_factory=dict)
+     # the launches of the traces folded into it, which keep their functions loaded
+     folded: list[tuple[LoweredLaunch | LoweredMemset, ...]] = field(default_factory=list)
+@@ -549,6 +550,10 @@
+         self.redispatches = 0
+         self.redispatch_s = 0.0
+         self.redispatch_refusals: dict[str, int] = {}
++        # the entries that are sections (their op's launches replaced, with temporaries of their own), and
++        # the most bytes one entry's temporaries took at the call that added it
++        self.sections = 0
++        self.section_bytes = 0
+         # why each trace after the first traced: (class, op, guard, the user's line, refusal) -> count. Class "meta": a
+         # graph guard an op recorded (its outputs' metadata); "dispatch": an op's own guard failed and its
+         # redispatch refused (refusal); "graph": a guard no op recorded; "contract": no variant of the
+@@ -891,13 +896,17 @@
+         segments, launches = variant.captured.segments, variant.captured.launches
+         first = sum(len(s.launches) for s in segments[:g])
+         stop = first + len(segments[g].launches)
+-        sites = [(i, s) for i, s in enumerate(variant.captured.lowered.sites) if first <= s.nodes[0] < stop]
++        lowered = variant.captured.lowered
++        # the native segment's sites: its keyed sites, then its selectors where the native takes sections (a
++        # section's piece replaces their nodes)
++        selectors = lowered.selectors if getattr(torch._C, "_host_trace_section_entries", False) else ()
++        sites = [(i, s) for i, s in enumerate((*lowered.sites, *selectors)) if s.nodes and first <= s.nodes[0] < stop]
+         changes, pieces = [], []
+         for (i, site), arm in zip(sites, arms, strict=True):
+             if arm == 0:
+                 continue
+             binding = variant.arms[i][arm - 1]
+-            if _piece(site.site, binding):
++            if isinstance(site, LoweredSelector) or _piece(site.site, binding):
+                 pieces.append((i, [launches[n].node for n in site.nodes], binding))
+                 continue
+             for n, a, b, kernel in zip(site.nodes, site.site.topology, binding.topology, binding.nodes):
+@@ -1297,12 +1306,35 @@
+             refusals[str(e)] = refusals.get(str(e), 0) + 1
+             _drop_tracebacks(e)
+             return e
++        lowered = variant.captured.lowered
+         relocated = variant.memory.relocated
+-        if any(isinstance(s, PointerSlot) and s.base in relocated for _, _, launches in entries for lo in launches for s in lo.slots):
+-            program, entries = relocate_entries(variant.captured.lowered, relocated, entries, args)
++        if any(isinstance(s, PointerSlot) and s.base in relocated for _, _, launches, _ in entries for lo in launches for s in lo.slots):
++            program, entries = relocate_entries(lowered, relocated, entries, args)
+         variant.native.set_program(program)
+-        for site, predicate, launches in entries:
+-            variant.native.add_entry(site, predicate, tuple(map(launch_row, launches)))
++        # every section takes its op's place in the plan, or none is added
++        for site, _, launches, section in entries:
++            selector = lowered.selectors[site - len(lowered.sites)]
++            if section is not None and (why := check_section(lowered, variant.memory, selector.nodes, launches, section.temporaries, section.drops)) is not None:
++                e = FoldRefused(f"{variant.tape.ops[selector.op].func}'s section: {why}")
++                e.op = selector.op
++                lowered.lowering.refused.add(site)
++                # the entries' guards lower_entries kept: none is the variant's
++                del lowered.lowering.entry_guards[len(lowered.lowering.entry_guards) - len(entries) :]
++                refusals[str(e)] = refusals.get(str(e), 0) + 1
++                return e
++        values = lowered.lowering.program.values
++        for site, predicate, launches, section in entries:
++            if section is None:
++                variant.native.add_entry(site, predicate, tuple(map(launch_row, launches)))
++            else:
++                arms = variant.arms.setdefault(site, [])
++                arms.append(section_binding(launches, values))
++                places = section_places(lowered, variant.memory, lowered.selectors[site - len(lowered.sites)].nodes)
++                rows = [row for _, row in section.temporaries]
++                variant.native.add_entry(site, predicate, tuple(map(launch_row, launches)), len(arms), rows, list(section.drops), *places)
++                lowered.lowering.sections += len(rows)
++                self.sections += 1
++                self.section_bytes = max(self.section_bytes, sum(values[row] for row in rows))
+             variant.folded.append(launches)
+         return None
+ 
+--- a/test/test_cuda_host_trace_replay.py
++++ b/test/test_cuda_host_trace_replay.py
+@@ -612,6 +612,22 @@
+             self.assertEqual(f(x), fn(x), atol=0, rtol=0)
+         self.assertEqual((f.traces, f.redispatches), (1, 1))
+ 
++    def test_a_section_traces_again_where_the_native_replay_takes_none(self):
++        # a replay whose native variant takes no section entries (the frozen
++        # binary's): the split's class traces, the refusal its retrace cause
++        def fn(x):
++            return (x * 2).sum(0) + 1
++
++        f = HostTraceReplay(fn)
++        with mock.patch.object(torch._C, "_host_trace_section_entries", False, create=True):
++            for t in (100, 5000):
++                x = torch.randn(t, 64, device="cuda")
++                self.assertEqual(f(x), fn(x), atol=0, rtol=0)
++        self.assertEqual((f.traces, f.redispatches, f.sections), (2, 0, 0))
++        ((cause, n),) = f.retrace_causes.items()
++        self.assertEqual((cause[0], cause[1], n), ("dispatch", "aten.sum.dim_IntList", 1))
++        self.assertRegex(cause[4], "the native replay takes no section entries")
++
+     @parametrize("adjacent", [False, True])
+     def test_a_split_in_an_op_traces_its_class(self, adjacent):
+         # the op's launches and temporary change with the row count: its class

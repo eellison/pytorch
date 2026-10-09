@@ -1,0 +1,99 @@
+--- a/test/test_cuda_host_trace_replay.py
++++ b/test/test_cuda_host_trace_replay.py
+@@ -3396,6 +3396,33 @@
+             self.assertEqual(f(x), x + 4)
+         self.assertEqual((f.replays, f.static_hits), (2, 0))
+ 
++    def test_a_static_hit_after_another_variants_miss(self):
++        # registration order: a call at the second size misses in the first
++        # variant from its kept rows, then hits in the second from its own;
++        # each variant's kept rows stay its own
++        def grows(w, x):
++            y = add(x @ w)
++            for _ in range(x.shape[0] // 8):
++                y = add(y, 1)
++            return y
++
++        w = torch.randn(64, 64, device="cuda")
++        torch._C._host_trace_variant_order(False)
++        try:
++            f = HostTraceReplay(grows, static_prefix=1)
++            for m in (8, 16) * 3:
++                x = torch.randn(m, 64, device="cuda")
++                self.assertEqual(f(w, x), grows(w, x), atol=0, rtol=0)
++            self.assertEqual(len(f.variants), 2)
++            hits = f.static_hits
++            sizes = (16, 8, 16, 16, 8, 8)
++            for m in sizes:
++                x = torch.randn(m, 64, device="cuda")
++                self.assertEqual(f(w, x), grows(w, x), atol=0, rtol=0)
++            self.assertEqual(f.static_hits, hits + len(sizes))
++        finally:
++            torch._C._host_trace_variant_order(True)
++
+     def test_alternating_sizes_try_the_variant_that_served_them(self):
+         # one family, a variant per size; each call tries the variant that
+         # last served its sizes first, so no evaluate misses
+--- a/test/test_cuda_host_trace_opaque.py
++++ b/test/test_cuda_host_trace_opaque.py
+@@ -79,6 +79,10 @@
+     return add(torch.mul(add(x), y), 1)
+ 
+ 
++def prefixed_muls(w, x, y):
++    return torch.mul(add(x), x), torch.mul(y, y), add(w)
++
++
+ def mm_chain(x, w):
+     return add(torch.mm(add(x), w))
+ 
+@@ -763,6 +767,39 @@
+             kinds = {type(lo).__name__ for lo in v.captured.lowered.launches}
+             self.assertEqual("LoweredMemset" in kinds, style == "scratch")
+ 
++    @mock.patch("torch.cuda._host_trace_replay.oob_learn", False)
++    def test_a_missed_key_leaves_no_stale_site_row(self):
++        # static prefix: a call at a new size of x misses x's key after its rows
++        # are evaluated; the next call changes only y's size, so only y's rows
++        # are evaluated again, and x's site still resolves at x's size
++        p = TableProvider()
++        f = HostTraceReplay(prefixed_muls, opaque=(p,), static_prefix=1)
++        w = torch.randn(256, device="cuda")
++
++        def check(n, m):
++            x, y = torch.randn(n, device="cuda"), torch.randn(m, device="cuda")
++            self.assertEqual(f(w, x, y), prefixed_muls(w, x, y), atol=0, rtol=0)
++
++        for n, m in ((512, 512), (640, 640), (512, 640), (640, 512)) * 2:
++            check(n, m)
++        hits = f.static_hits
++        self.assertGreater(hits, 0)
++        for n, m in ((1024, 512), (1024, 640), (512, 640), (1024, 512), (640, 640), (1024, 640)):
++            check(n, m)
++        self.assertGreater(f.static_hits, hits)
++
++    @mock.patch("torch.cuda._host_trace_replay.oob_learn", False)
++    def test_run_buffer_places_scratch_at_each_keys_bytes(self):
++        # the scratch buffer is a run buffer temporary sized by its key's row:
++        # another size places the run's temporaries again, a repeat of the
++        # last size reuses its placement
++        p = TableProvider(style="scratch")
++        f = HostTraceReplay(mul_chain, opaque=(p,), memory="run_buffer")
++        for n in (512, 1024, 512, 512, 4096, 1024, 1024, 4096, 512):
++            x, y = torch.randn(n, device="cuda"), torch.randn(n, device="cuda")
++            self.assertEqual(f(x, y), mul_chain(x, y), atol=0, rtol=0)
++        self.assertEqual(len(bound(f)), 1)
++
+     @parametrize("first", [512, 640])
+     def test_binding_switches(self, first):
+         # bindings of both topologies, and two alignments of y, alternate; the
+--- a/test/test_cuda_host_trace_python_entry.py
++++ b/test/test_cuda_host_trace_python_entry.py
+@@ -36,6 +36,7 @@
+         "test_a_refused_key_is_a_row",
+         "test_alternating_keys_take_their_rows",
+         "test_keys_past_64_harvest",
++        "test_a_missed_key_leaves_no_stale_site_row",
+     ),
+     # the Python dispatch holds the arguments while it serves the call, so a
+     # freed or boxed argument dies after the replay, not at its last use

@@ -1,0 +1,66 @@
+--- a/torch/cuda/_host_trace_lower_tape.py
++++ b/torch/cuda/_host_trace_lower_tape.py
+@@ -419,9 +419,14 @@
+                 leaves.append(v)
+         outputs: list[PredictedOutput | int] = []
+         for t in call.outputs:
+-            if t._root.kind != "eager":
+-                outputs.append(next(i for i, v in enumerate(traced) if v is t))
++            # an output the call was passed (an in-place or out= op's) is that argument, even one over an
++            # earlier eager step's output; only a tensor the call made is a prediction of its root
++            at = next((i for i, v in enumerate(traced) if v is t), None)
++            if at is not None:
++                outputs.append(at)
+                 continue
++            if t._root.kind != "eager":
++                raise AssertionError(f"host_trace: {call.name} returned a tensor it neither made nor was passed")
+             v = self.view(t)
+             outputs.append(
+                 PredictedOutput(
+--- a/test/test_cuda_host_trace_replay.py
++++ b/test/test_cuda_host_trace_replay.py
+@@ -634,6 +634,44 @@
+             self.assertIsInstance(node, _ir.Node)
+             self.assertLessEqual(node.free_symbols, symbols.keys())
+ 
++    @parametrize("case", ["fill_expanded", "zero_flipped", "fill_", "zero_", "add_", "copy_"])
++    @parametrize("returns", ["base", "slice", "both"])
++    def test_an_inplace_op_on_a_slice_of_an_eager_output_is_its_argument(self, case, returns):
++        # sum (int32) and flip (complex64) run as eager steps; an in-place op on a slice of their output
++        # returns its argument, not a new eager output: a replay that took it for one returned the slice for
++        # the base (the base's tensor replaced by the slice's). The bf16 copy of a complex input is the
++        # fuzzer's (it makes zero_ an eager step on the symbolic TensorIterator build)
++        def fn(a0, w):
++            if case == "zero_flipped":
++                v0 = a0.t().flip(0)
++                s = v0[v0.shape[0] // 2 :]
++            else:
++                v0 = a0.sum(1)
++                torch.add(a0, 1, out=a0)
++                s = v0.unsqueeze(0).expand(3, *v0.shape)[:, :1] if case == "fill_expanded" else v0[v0.shape[0] // 4 : v0.shape[0] // 2]
++            if case in ("fill_expanded", "fill_"):
++                s.fill_(3)
++            elif case in ("zero_", "zero_flipped"):
++                s.zero_()
++            elif case == "add_":
++                s.add_(2)
++            else:
++                s.copy_(w[: s.shape[0]])
++            out = {"base": (v0,), "slice": (s,), "both": (v0, s)}[returns]
++            return (*out, a0.to(torch.bfloat16)) if case == "zero_flipped" else out
++
++        f = HostTraceReplay(fn)
++        dtype = torch.complex64 if case == "zero_flipped" else torch.int32
++        for m in (128, 128, 64):
++            a = torch.randint(-8, 9, (m, 18), device="cuda").to(dtype)
++            w = torch.randint(-8, 9, (m,), device="cuda", dtype=torch.int64)
++            got, want = f(a.clone(), w), fn(a.clone(), w)
++            for x, y in zip(torch.utils._pytree.tree_leaves(got), torch.utils._pytree.tree_leaves(want)):
++                self.assertEqual((x.shape, x.stride(), x.storage_offset()), (y.shape, y.stride(), y.storage_offset()))
++                self.assertEqual(x, y, atol=0, rtol=0)
++        self.assertEqual(f.eager, 0)
++        self.assertGreater(f.replays, 0)
++
+     def test_a_redo_takes_a_dispatch_whose_guards_hold(self):
+         # a redo takes a dispatch of the same reads whose guards hold at it: (2, 3000)'s redispatch and (1, 2016)'s
+         # dispatch one softmax for the four layers, (1, 1568)'s none; (1, 1000) traces (the sum dispatches otherwise)

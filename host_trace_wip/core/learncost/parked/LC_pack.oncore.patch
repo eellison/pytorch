@@ -1,0 +1,240 @@
+--- a/torch/csrc/cuda/host_trace/Variant.h
++++ b/torch/csrc/cuda/host_trace/Variant.h
+@@ -326,6 +326,10 @@
+     std::vector<RngField> rng;
+     int64_t rng_increment = 0; // the philox offsets its call takes
+     std::vector<CpuScalar> cpu_scalars;
++    // the fields that read a dynamic row or a base: what pack_changed packs
++    // while the image's other fields are current (pack_gen == pack_gen_)
++    std::vector<uint32_t> dynamic_fields;
++    uint64_t pack_gen = 0;
+   };
+   struct MemsetRow {
+     Field dst;
+@@ -636,6 +640,15 @@
+       const int64_t* v,
+       const int64_t* bases,
+       uint8_t* image) const;
++  // k's image at rows v and bases: its dynamic fields, or every field when
++  // the image was packed under other static values (pack_gen_)
++  void pack_changed(KernelRow& k, const int64_t* v, const int64_t* bases);
++  void pack_field(
++      const KernelRow& k,
++      const Field& f,
++      const int64_t* v,
++      const int64_t* bases,
++      uint8_t* image) const;
+   // A kernel's images at rows v and bases into image
+   void pack(
+       const KernelRow& k,
+@@ -746,6 +759,11 @@
+   // stale only because entries were added: index_users keeps what the
+   // records hold and the values seen (no full re-patch after a new key)
+   bool users_kept_ = false;
++  // per row, whether it may change between calls (dynamic_rows_); bumped
++  // when the classification or a static row's value changes: a kernel
++  // image packed under another pack_gen_ is packed in full
++  std::vector<bool> row_dynamic_;
++  uint64_t pack_gen_ = 1;
+   std::vector<uint8_t> dirty_; // per record
+   std::vector<uint8_t> always_; // per record
+   // what the clean records were patched at: the rows of users_.rows, the
+--- a/torch/csrc/cuda/host_trace/Patch.cpp
++++ b/torch/csrc/cuda/host_trace/Patch.cpp
+@@ -113,59 +113,90 @@
+   }
+ }
+ 
++void HostTraceVariant::pack_changed(
++    KernelRow& k,
++    const int64_t* v,
++    const int64_t* bases) {
++  if (k.pack_gen != pack_gen_) {
++    pack(k, v, bases, k.image);
++    k.dynamic_fields.clear();
++    for (size_t i = 0; i < k.field_count; ++i) {
++      const Field& f = k.fields[i];
++      if (f.width != 0 && (f.base >= 0 || row_dynamic_[f.row])) {
++        k.dynamic_fields.push_back(static_cast<uint32_t>(i));
++      }
++    }
++    k.pack_gen = pack_gen_;
++    return;
++  }
++  for (uint32_t i : k.dynamic_fields) {
++    pack_field(k, k.fields[i], v, bases, k.image);
++  }
++  for (size_t i = 0; i < k.descriptor_count; ++i) {
++    encode(k, k.descriptors[i], v, bases, k.image);
++  }
++}
++
+ void HostTraceVariant::pack(
+     const KernelRow& k,
+     const int64_t* v,
+     const int64_t* bases,
+     uint8_t* image) const {
+   for (size_t i = 0; i < k.field_count; ++i) {
+-    const Field& f = k.fields[i];
+-    if (f.width == 0) {
+-      continue;
++    if (k.fields[i].width != 0) {
++      pack_field(k, k.fields[i], v, bases, image);
+     }
+-    const int64_t x = field_value(f, v, bases);
+-    uint8_t* at = image + k.param_offsets[f.param] + f.offset;
+-    if (f.pointer) {
+-      TORCH_CHECK_VALUE(x >= 0, "host_trace: a negative pointer ", x);
+-      if (f.width == 4) {
+-        const auto y = static_cast<uint32_t>(x);
+-        std::memcpy(at, &y, sizeof(y));
+-      } else {
+-        std::memcpy(at, &x, sizeof(x));
+-      }
+-    } else if (f.width == 1) {
+-      TORCH_CHECK_VALUE(
+-          x >= std::numeric_limits<int8_t>::min() &&
+-              x <= std::numeric_limits<int8_t>::max(),
+-          "host_trace: ",
+-          x,
+-          " is not a 1-byte field's");
+-      const auto y = static_cast<int8_t>(x);
+-      std::memcpy(at, &y, sizeof(y));
+-    } else if (f.width == 2) {
+-      TORCH_CHECK_VALUE(
+-          x >= std::numeric_limits<int16_t>::min() &&
+-              x <= std::numeric_limits<int16_t>::max(),
+-          "host_trace: ",
+-          x,
+-          " is not a 2-byte field's");
+-      const auto y = static_cast<int16_t>(x);
+-      std::memcpy(at, &y, sizeof(y));
+-    } else if (f.width == 4) {
+-      TORCH_CHECK_VALUE(
+-          x >= std::numeric_limits<int32_t>::min() &&
+-              x <= std::numeric_limits<int32_t>::max(),
+-          "host_trace: ",
+-          x,
+-          " is not a 4-byte field's");
+-      const auto y = static_cast<int32_t>(x);
++  }
++  for (size_t i = 0; i < k.descriptor_count; ++i) {
++    encode(k, k.descriptors[i], v, bases, image);
++  }
++}
++
++void HostTraceVariant::pack_field(
++    const KernelRow& k,
++    const Field& f,
++    const int64_t* v,
++    const int64_t* bases,
++    uint8_t* image) const {
++  const int64_t x = field_value(f, v, bases);
++  uint8_t* at = image + k.param_offsets[f.param] + f.offset;
++  if (f.pointer) {
++    TORCH_CHECK_VALUE(x >= 0, "host_trace: a negative pointer ", x);
++    if (f.width == 4) {
++      const auto y = static_cast<uint32_t>(x);
+       std::memcpy(at, &y, sizeof(y));
+     } else {
+       std::memcpy(at, &x, sizeof(x));
+     }
+-  }
+-  for (size_t i = 0; i < k.descriptor_count; ++i) {
+-    encode(k, k.descriptors[i], v, bases, image);
++  } else if (f.width == 1) {
++    TORCH_CHECK_VALUE(
++        x >= std::numeric_limits<int8_t>::min() &&
++            x <= std::numeric_limits<int8_t>::max(),
++        "host_trace: ",
++        x,
++        " is not a 1-byte field's");
++    const auto y = static_cast<int8_t>(x);
++    std::memcpy(at, &y, sizeof(y));
++  } else if (f.width == 2) {
++    TORCH_CHECK_VALUE(
++        x >= std::numeric_limits<int16_t>::min() &&
++            x <= std::numeric_limits<int16_t>::max(),
++        "host_trace: ",
++        x,
++        " is not a 2-byte field's");
++    const auto y = static_cast<int16_t>(x);
++    std::memcpy(at, &y, sizeof(y));
++  } else if (f.width == 4) {
++    TORCH_CHECK_VALUE(
++        x >= std::numeric_limits<int32_t>::min() &&
++            x <= std::numeric_limits<int32_t>::max(),
++        "host_trace: ",
++        x,
++        " is not a 4-byte field's");
++    const auto y = static_cast<int32_t>(x);
++    std::memcpy(at, &y, sizeof(y));
++  } else {
++    std::memcpy(at, &x, sizeof(x));
+   }
+ }
+ 
+@@ -295,6 +326,12 @@
+   for (uint32_t row : dynamic_rows_) {
+     dynamic[row] = true;
+   }
++  // with no static prefix every row may change between calls
++  std::vector<bool> row_dynamic = static_prefix_ == 0 ? std::vector<bool>(dynamic.size(), true) : dynamic;
++  if (!users_kept_ || row_dynamic_ != row_dynamic) {
++    ++pack_gen_;
++  }
++  row_dynamic_ = std::move(row_dynamic);
+   users_.rows.clear();
+   users_.dynamic_rows.clear();
+   for (uint32_t row = 0; row < program_.num_rows(); ++row) {
+@@ -349,6 +386,7 @@
+     for (uint32_t row : users_.rows) {
+       seen_values_[row] = v[row];
+     }
++    ++pack_gen_;
+   } else {
+     // the static rows are the cache's, unchanged since the generation's last
+     // commit
+@@ -359,6 +397,9 @@
+         if (v[row] != seen_values_[row]) {
+           seen_values_[row] = v[row];
+           mark(users_.row_first, users_.row_records, row);
++          if (!row_dynamic_[row]) {
++            ++pack_gen_; // a static row moved: images' static fields are stale
++          }
+         }
+       }
+     }
+@@ -517,7 +558,7 @@
+       return;
+     }
+     KernelRow& k = kernel_row(r, row);
+-    pack(k, v, bases, k.image);
++    pack_changed(k, v, bases);
+     ++kernel_packs;
+     if (k.rng_increment != 0) {
+       philox = running;
+--- a/test/test_cuda_host_trace_harvest.py
++++ b/test/test_cuda_host_trace_harvest.py
+@@ -1920,6 +1920,21 @@
+         self.assertLess(packs, records)
+         self.assertEqual((r.traces, r.learned), (1, 3))
+ 
++    def test_a_row_packed_before_a_static_change_is_packed_in_full(self):
++        # with a static prefix a node's image keeps its static fields and a
++        # call packs only its dynamic ones; after the static weight is
++        # replaced, a GEMM row last packed under the old weight is packed in
++        # full when it is selected again, bitwise
++        def f(w, x):
++            return torch.mm(x, w) + 1
++
++        w1, w2 = (torch.randn(64, 48, device="cuda", dtype=bf16) for _ in range(2))
++        r = HostTraceReplay(f, opaque=(HarvestProvider(),), static_prefix=1)
++        xs = {t: torch.randn(t, 64, device="cuda", dtype=bf16) for t in (32, 40)}
++        for w, t in ((w1, 32), (w1, 32), (w1, 40), (w1, 32), (w2, 40), (w2, 32), (w1, 40), (w2, 40), (w1, 32)):
++            self.assertEqual(r(w, xs[t]), f(w, xs[t]), atol=0, rtol=0)
++        self.assertEqual(r.traces, 1)
++
+     def test_equal_keys_bind_once_per_call(self):
+         # one GEMM key in three layers: a new size's key is built, bound and
+         # learned once, then taken by each layer's site

@@ -1,0 +1,1924 @@
+--- a/test/test_cuda_host_trace_aten.py
++++ b/test/test_cuda_host_trace_aten.py
+@@ -3,7 +3,6 @@
+ import contextlib
+ import functools
+ import gc
+-import threading
+ import unittest
+ from unittest import mock
+ 
+@@ -53,6 +52,7 @@
+ 
+ # test ops whose functors hold an address or an operand's size
+ _FUNCTOR_OPS = r"""
++#include <ATen/cuda/CUDAGeneratorImpl.h>
+ #include <ATen/native/TensorIterator.h>
+ #include <ATen/native/cuda/Loops.cuh>
+ #include <torch/library.h>
+@@ -112,6 +112,21 @@
+   return map(x, AddAt{reinterpret_cast<const float*>(address)});
+ }
+ 
++// x + 1, after drawing a philox offset from the default CUDA generator
++at::Tensor add_drawn(const at::Tensor& x) {
++  auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(std::nullopt, at::cuda::detail::getDefaultCUDAGenerator());
++  {
++    std::lock_guard<std::mutex> lock(gen->mutex_);
++    gen->philox_cuda_state(4);
++  }
++  return x.add(1);
++}
++
++// x + x.size(0), the size read on the host as an int
++at::Tensor add_size0(const at::Tensor& x) {
++  return x.add(static_cast<double>(x.size(0)));
++}
++
+ at::Tensor like(const at::Tensor& x, const at::Tensor&) {
+   return at::empty_like(x);
+ }
+@@ -122,18 +137,24 @@
+   m.def("add_first(Tensor x, Tensor p) -> Tensor");
+   m.def("add_numel(Tensor x, Tensor p) -> Tensor");
+   m.def("add_at(Tensor x, int address) -> Tensor");
++  m.def("add_size0(Tensor x) -> Tensor");
++  m.def("add_drawn(Tensor x) -> Tensor");
+ }
+ 
+ TORCH_LIBRARY_IMPL(ht_functor, CUDA, m) {
+   m.impl("add_first", add_first);
+   m.impl("add_numel", add_numel);
+   m.impl("add_at", add_at);
++  m.impl("add_size0", add_size0);
++  m.impl("add_drawn", add_drawn);
+ }
+ 
+ TORCH_LIBRARY_IMPL(ht_functor, Meta, m) {
+   m.impl("add_first", like);
+   m.impl("add_numel", like);
+   m.impl("add_at", [](const at::Tensor& x, int64_t) { return at::empty_like(x); });
++  m.impl("add_size0", [](const at::Tensor& x) { return at::empty_like(x); });
++  m.impl("add_drawn", [](const at::Tensor& x) { return at::empty_like(x); });
+ }
+ """
+ 
+@@ -147,14 +168,6 @@
+     return ext, torch.ops.ht_functor
+ 
+ 
+-@contextlib.contextmanager
+-def _traced_as_pointwise(namespace):
+-    # a test op as an ATen pointwise op: the pointwise host's
+-    pointwise = _host_trace_tape._pointwise
+-    with mock.patch.object(_host_trace_tape, "_pointwise", lambda func: func.namespace == namespace or pointwise(func)):
+-        yield
+-
+-
+ def silu_mul(x, y):
+     return F.silu(x) * y
+ 
+@@ -248,8 +261,6 @@
+ 
+ # name: (fn, args from (x f16 [64, 4096], y f32 [4096]), the tape's step types)
+ DECLINES = {
+-    "integer_sum": (lambda x: x.sum(-1), lambda x, y: (x.long(),), [EagerCall]),
+-    "sum_with_dtype": (lambda x: x.sum(-1, dtype=torch.float32), lambda x, y: (x,), [EagerCall]),
+     "double_mean": (lambda x: x.mean(-1), lambda x, y: (x.double(),), [EagerCall]),
+     "shared_root_copy": (_shared_root_copy, lambda x, y: (x,), [KernelLaunch, EagerCall]),
+     "softmax_inner": (lambda x: torch.softmax(x, 0), lambda x, y: (x,), [EagerCall]),
+@@ -537,7 +548,7 @@
+ 
+ @unittest.skipIf(not TEST_CUDA, "requires CUDA")
+ @requires_cuda_python_bindings
+-@unittest.skipIf(not hasattr(torch._C, "_cuda_hostTraceMul"), "needs traced hosts")
++@unittest.skipIf(not hasattr(torch._C, "_cuda_hostTraceRedispatchOp"), "needs traced hosts")
+ class TestHostTraceAten(TestCase):
+     @classmethod
+     def setUpClass(cls):
+@@ -913,7 +924,7 @@
+             self.assertEqual(entry(x), want, atol=0, rtol=0)
+         steps = [[c.reason for _, c in v.captured.lowered.tape.launches if type(c) is EagerCall and not c.host] for v in entry.variants]
+         self.assertEqual((entry.traces, entry.eager, len(steps), len(steps[0])), (1, 0, 1, 1))
+-        self.assertIn("pointwise host declines", steps[0][0])
++        self.assertIn("CUDA host declines", steps[0][0])
+ 
+     def test_host_step_writing_a_buffer_a_device_step_read_declines(self):
+         # a replay runs the host steps first: s.add_ after x * s would change
+@@ -953,116 +964,151 @@
+             self.assertEqual((classes[p][at : at + len(want)], data[p][at : at + len(want)]), (cls * len(want), want))
+             self.assertEqual(classes[p].count(cls), len(want))
+ 
+-    def test_pointwise_witness_on_a_smeared_stack(self):
+-        # a parameter's padding (StridedCastOp's tail) holds the stack's bytes,
+-        # here a live CUDA address: the host neither compares nor scans them
+-        ext, _ = _functor_ops()
+-        keep = torch.empty(1 << 20, dtype=torch.uint8, device="cuda")
+-
+-        def smeared(fn, *args, **kwargs):
+-            def run(s):
+-                ext.smear(keep.data_ptr() + 4096, 1 << 18)
+-                return fn(s)
+-
+-            return capture_kernel_nodes(run, *args, **kwargs)
+-
+-        def fn(x, y, z):
+-            return torch.maximum(x, y), x * z
+-
+-        entry = HostTraceReplay(fn)
+-        with mock.patch("torch.cuda._host_trace_capture.capture_kernel_nodes", smeared):
+-            for m in (4, 7, 4):
+-                args = (_randn(m, 1, dtype=torch.float32), _randn(1, 5, dtype=torch.float32), _randn(1, 5))
+-                self.assertEqual([type(c) for _, c in trace(fn, args).launches], [KernelLaunch, KernelLaunch])
+-                self._assert_replays_eager_calls(entry, fn, args)
+-        self.assertEqual(entry.eager, 0)
++    def test_no_pointwise_witness(self):
++        # an op's own CUDA host code runs over symbolic TensorIterators: no
++        # tag, allowlist or capture of eager decides a pointwise op
++        for name in ("_traced_pointwise", "_pointwise_host", "_pointwise", "_elementwise", "_witness_takes", "_UNTAGGED_ELEMENTWISE", "_NULLARY", "_cpu_scalar_probes", "_meta_at_hints"):
++            self.assertFalse(hasattr(_host_trace_tape, name), name)
++        for name in ("_cuda_hostTracePointwise", "_cuda_hostTraceRecordIterators"):
++            self.assertFalse(hasattr(torch._C, name), name)
+ 
+-    def test_pointwise_witness_counts_its_own_allocations(self):
+-        # another thread (a background learn) allocating during the witness's
+-        # capture is not the op allocating
+-        side = torch.cuda.Stream()
+-        with torch.cuda.stream(side):
+-            torch.empty(1 << 20, device="cuda")
+-        ran = []
+-
+-        def other():
+-            with torch.cuda.stream(side):
+-                ran.append(torch.empty(1 << 20, device="cuda").numel())
+-
+-        def allocating(fn, *args, **kwargs):
+-            def run(s):
+-                t = threading.Thread(target=other)
+-                t.start()
+-                t.join()
+-                return fn(s)
++        def no_capture(*args, **kwargs):
++            raise AssertionError("a pointwise op captured eager")
+ 
+-            return capture_kernel_nodes(run, *args, **kwargs)
++        def fn(x, y, c):
++            return torch.where(c, torch.sigmoid(x) * y + 2, x.abs()).floor_divide(y.exp() + 1)
+ 
++        entry = HostTraceReplay(fn)
++        with mock.patch("torch.cuda._host_trace_capture.capture_kernel_nodes", no_capture):
++            for m in (64, 7, 64):
++                args = (_randn(m, 768, dtype=torch.float32), _randn(768, dtype=torch.float32), _randn(m, 768) > 0)
++                self.assertEqual(entry(*args), fn(*args), atol=0, rtol=0)
++        self.assertEqual(entry.eager, 0)
++
++    def test_unconverted_host_code_is_reported(self):
++        # an op whose CUDA host code reads a symbolic iterator's size (here
++        # the reduction kernel's launch path) is a reported eager step, the
++        # accessor and its site named; never a value of the trace
+         def fn(x):
+-            return x + 1
++            return torch.prod(x, -1)
+ 
+-        entry = HostTraceReplay(fn)
+         x = _randn(64, 33, dtype=torch.float32)
+-        with mock.patch("torch.cuda._host_trace_capture.capture_kernel_nodes", allocating):
+-            self.assertEqual(entry(x), fn(x), atol=0, rtol=0)
+-        self.assertTrue(ran)
+-        self.assertEqual([c.reason for v in entry.variants for _, c in v.captured.lowered.tape.launches if type(c) is EagerCall], [])
+-        self.assertEqual((entry.traces, entry.eager, len(entry.variants)), (1, 0, 1))
+-
+-    def test_pointwise_witness_unexplained_allocation_declines(self):
+-        # an allocation in the witness's capture no iterator writes, freed or
+-        # not, declines the op and is named
+-        def allocating(fn, *args, **kwargs):
+-            def run(s):
+-                torch.empty(1000, device="cuda")
+-                return fn(s)
+-
+-            return capture_kernel_nodes(run, *args, **kwargs)
+-
+-        with mock.patch("torch.cuda._host_trace_capture.capture_kernel_nodes", allocating):
+-            (call,) = [c for _, c in trace(lambda x: x + 1, (_randn(64, 33, dtype=torch.float32),)).launches]
+-        self.assertIsInstance(call, EagerCall)
+-        self.assertIn("4000)], which no iterator explains", call.reason)
++        tape = trace(fn, (x,))
++        self.assertEqual([type(c) for _, c in tape.launches], [EagerCall])
++        (u,) = [u for u in tape.unconverted if u.op == "aten.prod.dim_int"]
++        self.assertEqual((u.refusal, u.symbolic), ("accessor", True))
++        self.assertIn("of a symbolic TensorIterator", u.message)
++        self.assertIsNotNone(u.site)
++        # strict (the hint audit's mode, as the test suites run): it raises
++        with mock.patch.object(torch.cuda._host_trace_hint_audit, "mode", "strict"):
++            with self.assertRaises(_host_trace_tape.UnconvertedHost):
++                trace(fn, (x,))
++
++    def test_host_code_reading_a_host_buffer_declines(self):
++        # pow's CUDA host branches on a CPU scalar exponent's value: it reads
++        # the host buffer's stand-in, which refuses, and the op runs eagerly
++        def fn(x):
++            return x.abs() ** torch.rand(())
++
++        entry = HostTraceReplay(fn)
++        for seed in range(3):
++            x = _randn(64, 33, dtype=torch.float32)
++            torch.manual_seed(seed)
++            want = fn(x)
++            torch.manual_seed(seed)
++            self.assertEqual(entry(x), want, atol=0, rtol=0)
++        (tape,) = [v.captured.lowered.tape for v in entry.variants]
++        self.assertIn("aten.pow.Tensor_Tensor", [u.op for u in tape.unconverted])
+ 
+-    def test_pointwise_functor_holding_an_operand_address(self):
+-        # a slot of the operand's address at each replay
++    def test_generator_use_under_the_recorder_declines(self):
++        # the CUDA generator's state is no symbol of the trace: its use by an
++        # op's host code refuses before it advances (a philox offset), also in strict mode
++        _, ops = _functor_ops()
++
++        def fn(x):
++            return ops.add_drawn(x)
++
++        gen = torch.cuda.default_generators[torch.cuda.current_device()]
++        offset = gen.get_offset()
++        with mock.patch.object(torch.cuda._host_trace_hint_audit, "mode", "strict"):
++            tape = trace(fn, (_randn(64, 33, dtype=torch.float32),))
++        self.assertEqual([type(c) for _, c in tape.launches], [EagerCall])
++        self.assertEqual([(u.op, u.refusal) for u in tape.unconverted], [("ht_functor.add_drawn.default", "generator")])
++        self.assertEqual(gen.get_offset(), offset)
++
++    def test_functor_holding_an_operand_address_declines(self):
++        # the host code reads a traced tensor's data pointer, which is
++        # symbolic: its storage refuses the read, the op runs eagerly
+         _, ops = _functor_ops()
+ 
+         def fn(x, p):
+             return ops.add_first(x, p)
+ 
+         entry = HostTraceReplay(fn)
+-        with _traced_as_pointwise("ht_functor"):
+-            for m in (64, 7, 64):
+-                args = (_randn(m, 768, dtype=torch.float32), _randn(3, dtype=torch.float32))
+-                self.assertEqual([type(c) for _, c in trace(fn, args).launches], [KernelLaunch])
+-                self.assertEqual(entry(*args), fn(*args), atol=0, rtol=0)
+-        self.assertEqual(entry.eager, 0)
++        for m in (64, 7, 64):
++            args = (_randn(m, 768, dtype=torch.float32), _randn(3, dtype=torch.float32))
++            tape = trace(fn, args)
++            self.assertEqual([type(c) for _, c in tape.launches], [EagerCall])
++            self.assertEqual([u.op for u in tape.unconverted], ["ht_functor.add_first.default"])
++            self.assertEqual(entry(*args), fn(*args), atol=0, rtol=0)
+ 
+-    def test_pointwise_functor_of_an_operands_size_declines(self):
+-        # a member marked host_trace_sizes would replay the witness's size
++    def test_functor_of_an_operands_size_declines(self):
++        # the host code reads a symbolic size as an int: c10 refuses it
+         _, ops = _functor_ops()
+ 
+         def fn(x, p):
+             return ops.add_numel(x, p)
+ 
+-        with _traced_as_pointwise("ht_functor"):
+-            (call,) = [c for _, c in trace(fn, (_randn(64, 768, dtype=torch.float32), _randn(3, dtype=torch.float32))).launches]
+-        self.assertIsInstance(call, EagerCall)
+-        self.assertIn("functor has a member of the operands' sizes", call.reason)
++        tape = trace(fn, (_randn(64, 768, dtype=torch.float32), _randn(3, dtype=torch.float32)))
++        self.assertEqual([type(c) for _, c in tape.launches], [EagerCall])
++        self.assertEqual([u.op for u in tape.unconverted], ["ht_functor.add_numel.default"])
++
++    def test_a_hosts_int_read_of_a_size_is_reported(self):
++        # C++ host code reading a size as an int specializes it (a guard of its
++        # hint): the op traces, the read is reported, and strict mode raises
++        _, ops = _functor_ops()
+ 
+-    def test_pointwise_functor_holding_a_cuda_address_declines(self):
+-        # a pointer member at none of the op's tensors
++        def fn(x):
++            return ops.add_size0(x)
++
++        x = _randn(64, 768, dtype=torch.float32)
++        with mock.patch.object(torch.cuda._host_trace_hint_audit, "mode", None):
++            tape = trace(fn, (x,))
++        self.assertEqual([type(c) for _, c in tape.launches], [KernelLaunch])
++        self.assertEqual([(u.op, u.refusal) for u in tape.unconverted], [("ht_functor.add_size0.default", "int read")])
++        with mock.patch.object(torch.cuda._host_trace_hint_audit, "mode", "strict"):
++            with self.assertRaises(_host_trace_tape.UnconvertedHost):
++                trace(fn, (x,))
++
++    def test_functor_holding_a_constant_address_traces(self):
++        # an int argument is a constant of the trace: the functor holds it as
++        # eager's does at every call
+         _, ops = _functor_ops()
+         keep = _randn(1, dtype=torch.float32)
+ 
+         def fn(x):
+             return ops.add_at(x, keep.data_ptr())
+ 
+-        with _traced_as_pointwise("ht_functor"):
+-            (call,) = [c for _, c in trace(fn, (_randn(64, 768, dtype=torch.float32),)).launches]
+-        self.assertIsInstance(call, EagerCall)
+-        self.assertIn("functor points at a tensor that is none of the op's", call.reason)
++        entry = HostTraceReplay(fn)
++        for m in (64, 7, 64):
++            x = _randn(m, 768, dtype=torch.float32)
++            self.assertEqual([type(c) for _, c in trace(fn, (x,)).launches], [KernelLaunch])
++            self.assertEqual(entry(x), fn(x), atol=0, rtol=0)
++        self.assertEqual(entry.eager, 0)
++
++    def test_empty_reduction_keeps_eagers_layout(self):
++        # F4d: a sum over a zero-size dim is its meta's output (eager's own
++        # strides) and a zero fill; a stride the host reads is eager's
++        def fn(a):
++            v = a[:, 1:].sum(0, keepdim=True)
++            return v.as_strided((v.shape[0] // 2,) + tuple(v.shape[1:]), (v.stride(0) * 2,) + tuple(v.stride()[1:]), v.storage_offset())
++
++        entry = HostTraceReplay(fn)
++        for m in (34, 34, 20):
++            a = _randn(m, 1, dtype=torch.float32)
++            got, want = entry(a), fn(a)
++            self.assertEqual((got.shape, got.stride()), (want.shape, want.stride()))
++        self.assertEqual(entry.eager, 0)
+ 
+     @parametrize("case", ["pad_right", "pad_left_crop_right", "pad_rows", "expand_copy", "narrow_copy", "as_strided_copy"])
+     def test_a_size_or_integer_argument_is_not_witnessed(self, case):
+@@ -1185,6 +1231,144 @@
+         self.assertLessEqual(entry.traces, 2)
+         self.assertEqual(entry.eager, 0)
+ 
++    @parametrize(
++        "case",
++        ["memcpy", "transposed", "to_bf16", "bf16_to_float", "int_to_float", "broadcast", "clone_strided", "clone_permuted", "to_permuted", "contiguous", "channels_last"],
++    )
++    def test_copy_family_runs_its_cuda_host(self, case):
++        # copy_ (copy_impl, copy_device_to_device), _to_copy and clone run
++        # their own host code over symbolic TensorIterators: a memcpy or
++        # direct_copy_kernel_cuda's launch as eager's, no hand-written host
++        f32, bf16 = torch.float32, torch.bfloat16
++        cases = {
++            "memcpy": (lambda x: torch.empty_like(x).copy_(x), f32),
++            "transposed": (lambda x: torch.empty_like(x.t()).copy_(x.t()), f32),
++            "to_bf16": (lambda x: x.to(bf16), f32),
++            "bf16_to_float": (lambda x: x.to(f32), bf16),
++            "int_to_float": (lambda x: x.to(torch.int32).to(f32), f32),
++            "broadcast": (lambda x: torch.empty_like(x).copy_(x[:1]), f32),
++            "clone_strided": (lambda x: x[:, ::2].clone(), f32),
++            "clone_permuted": (lambda x: x.t().clone(), bf16),
++            "to_permuted": (lambda x: x.t().to(bf16), f32),
++            "contiguous": (lambda x: x.t().contiguous(), f32),
++            "channels_last": (lambda x: x.view(x.shape[0], 4, 8, 24).clone(memory_format=torch.channels_last), f32),
++        }
++        fn, dtype = cases[case]
++        entry = HostTraceReplay(fn)
++        for m in (64, 7, 64, 1):
++            x = _randn(m, 768, dtype=dtype)
++            self.assertFalse([c.reason for _, c in trace(fn, (x,)).launches if isinstance(c, EagerCall)])
++            self._assert_replays_eager_calls(entry, fn, (x,))
++        self.assertEqual(entry.eager, 0)
++
++    @parametrize(
++        "case",
++        ["sum_last", "sum_first", "sum_all", "sum_keepdim_bf16", "amax_last_f16", "amin_first", "sum_transposed", "sum_global", "sum_out_vec", "sum_integer", "sum_with_dtype", "mean_last", "prod_last", "var_last", "var_mean_first"],
++    )
++    def test_reduction_runs_its_cuda_host(self, case):
++        # gpu_reduce_kernel over a symbolic iterator: set_reduce_config over
++        # SymInt, the ReduceOp eager builds and its launch (global reduction's
++        # buffers and semaphore memset included)
++        f32, f16, bf16 = torch.float32, torch.float16, torch.bfloat16
++        cases = {
++            "sum_last": (lambda x: x.sum(-1), (768,), f32),
++            "sum_first": (lambda x: x.sum(0), (768,), f32),
++            "sum_all": (lambda x: x.sum(), (768,), f32),
++            "sum_keepdim_bf16": (lambda x: x.sum(-1, keepdim=True), (768,), bf16),
++            "amax_last_f16": (lambda x: x.amax(-1), (768,), f16),
++            "amin_first": (lambda x: x.amin(0), (768,), f32),
++            "sum_transposed": (lambda x: x.t().sum(-1), (768,), f32),
++            "sum_global": (lambda x: x.sum(0), (40000,), f32),
++            "sum_out_vec": (lambda x: x.view(x.shape[0], 8, 96).sum(1), (768,), f16),
++            "sum_integer": (lambda x: (x * 8).long().sum(-1), (768,), f32),
++            "sum_with_dtype": (lambda x: x.sum(-1, dtype=torch.float32), (768,), f16),
++            "mean_last": (lambda x: x.mean(-1, keepdim=True), (768,), bf16),
++            "prod_last": (lambda x: (x.sigmoid() + 0.5).prod(-1), (768,), f32),
++            "var_last": (lambda x: x.var(-1), (768,), f32),
++            "var_mean_first": (lambda x: torch.var_mean(x, 0), (768,), f32),
++        }
++        fn, rest, dtype = cases[case]
++        entry = HostTraceReplay(fn)
++        for m in (64, 7, 64, 1, 300):
++            x = _randn(m, *rest, dtype=dtype)
++            self.assertFalse([c.reason for _, c in trace(fn, (x,)).launches if isinstance(c, EagerCall)])
++            self._assert_replays_eager_calls(entry, fn, (x,))
++        self.assertEqual(entry.eager, 0)
++
++    @parametrize("case", ["gather_rows", "gather_negative", "columns", "two_indices"])
++    def test_index_runs_its_cuda_host(self, case):
++        # gpu_index_kernel over a symbolic iterator: the vectorized gather or
++        # the elementwise index kernel, as eager chooses
++        def make(m):
++            idx = torch.randperm(100, device="cuda")[:m]
++            return _randn(100, 768, dtype=torch.bfloat16), idx
++
++        cases = {
++            "gather_rows": lambda w, i: w[i],
++            "gather_negative": lambda w, i: w[i - 100],
++            "columns": lambda w, i: w[:, i],
++            "two_indices": lambda w, i: w[i, i + 1],
++        }
++        fn = cases[case]
++        entry = HostTraceReplay(fn)
++        for m in (64, 7, 64, 1):
++            args = make(m)
++            self.assertFalse([c.reason for _, c in trace(fn, args).launches if isinstance(c, EagerCall)])
++            self._assert_replays_eager_calls(entry, fn, args)
++        self.assertEqual(entry.eager, 0)
++
++    @parametrize("case", ["last", "first", "both", "strided", "zero_strided"])
++    def test_flip_and_strided_zero_run_their_cuda_host(self, case):
++        # flip's host restrides its iterator (the output's data at the flipped
++        # dims' far ends, those strides negated); a strided zero_ is fill_'s kernel
++        cases = {
++            "last": lambda x: x.flip(-1),
++            "first": lambda x: x.flip(0),
++            "both": lambda x: x.flip(0, 1),
++            "strided": lambda x: x[:, ::2].flip(1) * 2,
++            "zero_strided": lambda x: x.neg()[:, ::2].zero_(),
++        }
++        fn = cases[case]
++        entry = HostTraceReplay(fn)
++        for m in (64, 7, 64, 3):
++            x = _randn(m, 768, dtype=torch.float32)
++            self.assertFalse([c.reason for _, c in trace(fn, (x,)).launches if isinstance(c, EagerCall)])
++            self.assertEqual(entry(x), fn(x), atol=0, rtol=0)
++        self.assertEqual(entry.eager, 0)
++
++    @parametrize("dtype", [torch.float32, torch.float16, torch.int64])
++    def test_a_symbolic_number_operand_is_a_functor_field(self, dtype):
++        # a symbolic int for a Tensor operand reaches the op's host code as a
++        # wrapped number's stand-in: the member it fills is a field of the
++        # number at each replay, no guard of its value
++        def fn(x, n):
++            return x * n + n
++
++        entry = HostTraceReplay(fn)
++        x = (_randn(64, 768, dtype=torch.float32) * 8).to(dtype)
++        for n in (3, 5, 3, 1000):
++            self.assertEqual(entry(x, n), fn(x, n), atol=0, rtol=0)
++        self.assertEqual((entry.traces, entry.eager), (1, 0))
++        (variant,) = entry.variants
++        self.assertEqual(variant.tape.unconverted, [])
++
++    def test_a_declined_hosts_output_geometry_feeds_traced_ops(self):
++        # cumsum's CUDA host steps aside (an eager step): the guards its host
++        # attempt read are dropped, its output's meta (the eager step's) is
++        # kept, and the traced ops after it read that geometry at every size
++        def fn(x):
++            y = x.t().cumsum(-1)
++            return y[:, 1:] * 2 + y.sum(-1, keepdim=True), y.t().contiguous()
++
++        entry = HostTraceReplay(fn)
++        for m, n in ((64, 768), (7, 768), (64, 512), (200, 33), (1, 768), (64, 768)):
++            x = _randn(m, n, dtype=torch.float32)
++            got, want = entry(x), fn(x)
++            self.assertEqual(got, want, atol=0, rtol=0)
++            self.assertEqual([t.stride() for t in got], [t.stride() for t in want])
++        (variant, *_) = entry.variants
++        self.assertEqual([c.name for _, c in variant.tape.launches if isinstance(c, EagerCall)], ["aten.cumsum.default"])
++
+     def test_max_dim_of_a_zero_dim_tensor(self):
+         # values.copy_(self) is a memcpy, then the indices' fill kernel
+         def fn(x):
+--- a/test/test_cuda_host_trace_fullgraph.py
++++ b/test/test_cuda_host_trace_fullgraph.py
+@@ -51,7 +51,7 @@
+         g = HostTraceReplay(stacked, fullgraph=True, opaque=())
+         self.assertEqual(g(x, o), torch.stack([x, x]) * 2)
+         for _ in range(2):
+-            with self.assertRaisesRegex(EagerFallback, r"eager steps in the tape: aten\.stack\.out \(aten\.stack\.out's pointwise host declines"):
++            with self.assertRaisesRegex(EagerFallback, r"eager steps in the tape: aten\.stack\.out \(aten\.stack\.out's body declines"):
+                 g(x, o)
+         self.assertEqual((g.variants, g.replays), ([], 0))
+ 
+--- a/test/test_cuda_host_trace_replay.py
++++ b/test/test_cuda_host_trace_replay.py
+@@ -950,14 +950,14 @@
+         self.assertEqual((f.traces, f.replays, f.redispatches, f.eager, f.redispatch_refusals), (1, 4, 1, 0, {}))
+ 
+     def test_an_eager_steps_guards_are_its_own(self):
+-        # index is an eager step; its fake kernel's broadcast of i against j picks the output's size
++        # index broadcasts i against j for the output's size
+         def fn(x, i, j):
+             return x[i, j] * 2
+ 
+         x = torch.randn(64, 64, device="cuda")
+         # traced at len(j) == 1: the output is len(i) long; at len(i) == 1 it is len(j)
+         # long, so the redispatch returns other metadata and refuses (a full trace)
+-        cases = {((8, 1), (8, 1), (1, 8), (1, 8)): (2, 2, 0, {"aten.index.Tensor returned other metadata": 1})}
++        cases = {((8, 1), (8, 1), (1, 8), (1, 8)): (2, 2, 0, {"aten.index.Tensor allocates otherwise": 1})}
+         # traced at len(i) == len(j) (one symbol): at (1, 8) the output is that long too, so it redispatches
+         cases[((8, 8), (1, 8), (8, 8), (4, 4))] = (1, 3, 1, {})
+         for sizes, want in cases.items():
+@@ -1378,14 +1378,14 @@
+ 
+     @parametrize("keep", [False, True])
+     def test_an_eager_steps_output_is_kept_only_if_fn_keeps_it(self, keep):
+-        # index is an eager step: the tape's own records of its output are no tensor fn kept
++        # cumsum is an eager step: the tape's own records of its output are no tensor fn kept
+         # a first trace that imports torch._dynamo is kept by torch.fx.wrap's frame, until a gc
+         import torch._dynamo  # noqa: F401
+ 
+         kept = []
+ 
+         def fn(x, i):
+-            k = x[i]
++            k = x[i].cumsum(-1)
+             if keep:
+                 kept.append(k)
+             return k.sum(-1)
+@@ -1393,13 +1393,15 @@
+         f = HostTraceReplay(fn, check_escapes=True)
+         x, i = torch.randn(64, 64, device="cuda"), torch.randint(0, 64, (8,), device="cuda")
+         for _ in range(3):
+-            self.assertEqual(f(x, i), x[i].sum(-1))
++            self.assertEqual(f(x, i), x[i].cumsum(-1).sum(-1))
+         if keep:
+             self.assertEqual((f.traces, f.replays, f.eager), (1, 0, 3))
+             self.assertIn("fn kept a traced tensor past the trace, in a list", f.declines[-1])
+         else:
+-            note = "host_trace: an eager step in a variant: aten.index.Tensor (no traced implementation)"
+-            self.assertEqual((f.traces, f.declines), (1, [note]))
++            note = "host_trace: an eager step in a variant: aten.cumsum.default (aten.cumsum.default's CUDA host declines: "
++            self.assertEqual(f.traces, 1)
++            (why,) = f.declines
++            self.assertTrue(why.startswith(note), why)
+             self.assertGreater(f.replays, 0)
+ 
+     def test_a_traced_tensor_in_an_argument_object_declines(self):
+@@ -1585,7 +1587,7 @@
+         tape = trace(lambda x, o: torch.stack([x, x], out=o), (x, o))
+         (call,) = [r for _, r in tape.launches]
+         self.assertIsInstance(call, EagerCall)
+-        self.assertEqual(call.reason, "aten.stack.out's pointwise host declines: its tensors is not a traced tensor")
++        self.assertTrue(call.reason.startswith("aten.stack.out's body declines: host_trace: its part aten.cat.out runs eagerly ("), call.reason)
+ 
+     def test_an_empty_copy_keeps_its_sources_strides(self):
+         # an empty tensor is contiguous (c10), so empty_like keeps a broadcast's zero strides
+@@ -1611,8 +1613,8 @@
+         for n, k in ((3, 0), (5, 0), (3, 0), (4, 2), (3, 0)):
+             t = torch.randn(n, k, device="cuda")
+             self.assertEqual(f(t), fn(t), atol=0, rtol=0, equal_nan=True)
+-        # the (4, 2) call's prod, var_mean and std_mean have no traced launch
+-        uncaptured = {"prod": "aten.prod.dim_int", "var_mean": "aten.var_mean.correction", "std_mean": "aten.std_mean.correction"}.get(op)
++        # the (4, 2) call's var_mean and std_mean have no traced launch
++        uncaptured = {"var_mean": "aten.var_mean.correction", "std_mean": "aten.std_mean.correction"}.get(op)
+         self.assertEqual(f.declines, [f"host_trace: no traced launches: every operation runs eagerly ({uncaptured}) (declined)"] if uncaptured else [])
+         self.assertEqual(f.traces, 2)
+         for v in f.variants:
+@@ -1753,7 +1755,8 @@
+         self.assertEqual(len(v.captured.segments), 3)
+         self.assertEqual(len(f.declines), 2)
+         self.assertIn("RuntimeError: injected", f.declines[0])
+-        self.assertEqual(f.declines[1], "host_trace: an eager step in a variant: aten.mm.default (no traced implementation)")
++        # no provider (opaque=()): its own CUDA host steps aside at cuBLAS's data pointers
++        self.assertTrue(f.declines[1].startswith("host_trace: an eager step in a variant: aten.mm.default (aten.mm.default's CUDA host declines: "), f.declines[1])
+         # the suites' strict mode raises it
+         calls.clear()
+         with mock.patch("torch.cuda._host_trace.raise_unexpected", True):
+@@ -1784,7 +1787,8 @@
+         self.assertEqual(len(v.captured.segments), 1)
+         self.assertEqual(len(f.declines), 2)
+         self.assertIn("the capture of _add failed: refused", f.declines[0])
+-        self.assertEqual(f.declines[1], "host_trace: an eager step in a variant: aten.mm.default (no traced implementation)")
++        # no provider (opaque=()): its own CUDA host steps aside at cuBLAS's data pointers
++        self.assertTrue(f.declines[1].startswith("host_trace: an eager step in a variant: aten.mm.default (aten.mm.default's CUDA host declines: "), f.declines[1])
+ 
+     def test_an_inplace_eager_op(self):
+         def fn(x):
+@@ -1840,7 +1844,8 @@
+             x, w = torch.randn(n, 64, device="cuda"), torch.randn(64, device="cuda")
+             self.assertEqual(f(x, w), fn(x, w))
+         self.assertEqual((f.replays, f.eager), (2, 0))
+-        self.assertEqual(f.declines, ["host_trace: an eager step in a variant: aten.native_layer_norm_backward.default (no traced implementation)"])
++        (why,) = f.declines
++        self.assertTrue(why.startswith("host_trace: an eager step in a variant: aten.native_layer_norm_backward.default (aten.native_layer_norm_backward.default's CUDA host declines: "), why)
+ 
+     @unittest.skipIf(not PLATFORM_SUPPORTS_CUDNN_ATTENTION, "requires cuDNN attention")
+     def test_cudnn_attention(self):
+@@ -1854,7 +1859,8 @@
+             q, k, v = (torch.randn(2, 4, s, 64, device="cuda", dtype=torch.bfloat16) for _ in range(3))
+             self.assertEqual(f(q, k, v), fn(q, k, v))
+         self.assertEqual((f.replays, f.eager), (2, 0))
+-        self.assertEqual(f.declines, ["host_trace: an eager step in a variant: aten._scaled_dot_product_cudnn_attention.default (no traced implementation)"])
++        (why,) = f.declines
++        self.assertTrue(why.startswith("host_trace: an eager step in a variant: aten._scaled_dot_product_cudnn_attention.default (aten._scaled_dot_product_cudnn_attention.default's CUDA host declines: "), why)
+ 
+     @unittest.skipIf(not PLATFORM_SUPPORTS_CUDNN_ATTENTION, "requires cuDNN attention")
+     def test_cudnn_attention_of_a_shape_it_does_not_take_raises(self):
+@@ -2995,12 +3001,12 @@
+ 
+     def test_an_index_with_a_none_runs_no_python(self):
+         # its Tensor?[] indices, a None among them, are a boxed list
+-        def fn(x, idx):
+-            return add(torch.ops.aten.index.Tensor(add(x), [None, idx]))
++        def fn(x, idx, v):
++            return add(torch.ops.aten.index_put.default(add(x), [None, idx], v))
+ 
+         x = torch.randn(8, 64, 32, device="cuda")
+-        idx = torch.randint(0, 64, (5, 3), device="cuda")
+-        self._boxed_parity(fn, (x, idx), torch.cuda.default_generators[0])
++        idx = torch.randperm(64, device="cuda")[:15].view(5, 3)
++        self._boxed_parity(fn, (x, idx, torch.randn(32, device="cuda")), torch.cuda.default_generators[0])
+ 
+     def test_two_threads_miss_and_hit_one_entry(self):
+         # each thread's sizes miss (a trace, a new variant) and hit, while the
+--- a/test/test_cuda_host_trace_tape.py
++++ b/test/test_cuda_host_trace_tape.py
+@@ -742,7 +742,7 @@
+ 
+ @unittest.skipIf(not TEST_CUDA, "requires CUDA")
+ @requires_cuda_python_bindings
+-@unittest.skipIf(not hasattr(torch._C, "_cuda_hostTraceMul"), "needs traced hosts")
++@unittest.skipIf(not hasattr(torch._C, "_cuda_hostTraceRedispatchOp"), "needs traced hosts")
+ class TestOpGuards(TestCase):
+     def test_a_guard_of_one_op_is_its_own(self):
+         x = torch.randn(64, 600, device="cuda")
+@@ -811,7 +811,7 @@
+ 
+     def test_an_eager_call_is_one_op(self):
+         x = torch.randn(64, 600, device="cuda")
+-        tape = trace(lambda x: torch.rsqrt(x.sum(-1, dtype=torch.float32)), (x,))
++        tape = trace(lambda x: torch.rsqrt(x.cumsum(-1)), (x,))
+         self.assertEqual([op.kind for op in tape.ops], ["eager", "traced"])
+         self.assertIsInstance(tape.launches[tape.ops[0].launches.start][1], EagerCall)
+ 
+--- a/torch/cuda/_host_trace_hint_audit.py
++++ b/torch/cuda/_host_trace_hint_audit.py
+@@ -107,14 +107,9 @@
+     (_TAPE, "_check_witness"): "F17: a size-1 stride adopted from the warm-up where the size's hint is 1 (an unguarded constant; on step242 the warm-up's int inside select(z == 1, r, s)). Keep the fake kernel's symbolic stride (select(z == 1, <symbolic eager rule>, s) where a consumer keys on it); compare layouts at the call, not at the hints",
+     (_TAPE, "_contiguous_strides"): "symbolic: strides[d] = strides[d + 1] * sym_max(size, 1), no hint test",
+     (_TAPE, "_dense_terms.<locals>.<lambda>"): "a guard: bool(nod(sizes, strides) == 1) (the IR's is_non_overlapping_and_dense indicator), or order the dims by guarded comparisons as _infer_dense_strides does",
+-    (_TAPE, "_elementwise"): "guards: decide the broadcast from the fake kernel's symbolic output shape, each size comparison a guard (bool(n == m) / bool(n == 1)), not meta at the hints",
+     (_TAPE, "_call_key"): f"pair the trace's calls with the warm-up's by structure (op, position, rank, dtype); compare layouts {_AT_CALL}",
+     (_TAPE, "_order_key"): f"compare fn's calls with the warm-up's by structure; layouts {_AT_CALL}",
+     (_TAPE, "_order_key.<locals>.<genexpr>"): f"compare fn's calls with the warm-up's by structure; layouts {_AT_CALL}",
+-    (_TAPE, "_Trace._pointwise_host"): _WITNESS,
+-    (_TAPE, "_Trace._pointwise_host.<locals>.stand_in"): _WITNESS,
+-    (_TAPE, "_Trace._pointwise_host.<locals>.check"): _WITNESS,
+-    (_TAPE, "_Trace._pointwise_host.<locals>.check.<locals>.address"): _WITNESS,
+     (_TAPE, "_bind_opaque"): f"{_TAG}; the key values: int(v) (a guard) in place of v == _hint(v)",
+     (_TAPE, "_Trace._eager_call"): "int(v) (guard_int records Eq and returns the value) in place of v == _hint(v)",
+     (_TAPE, "_Trace._eager_call.<locals>.<genexpr>"): "step242: an eager output 'pending' where a size's hint is 1; record the outputs whose strides _check_witness adopts (a set it fills) instead of re-deriving them from hints",
+@@ -779,7 +774,6 @@
+     helpers = (
+         tape._hint,
+         tape._traced_layout,
+-        tape._meta_at_hints,
+         symbolic_shapes.guarding_hint_or_throw,
+         symbolic_shapes.optimization_hint,
+         torch.SymInt.hint.fget,
+--- a/torch/cuda/_host_trace_ir.py
++++ b/torch/cuda/_host_trace_ir.py
+@@ -154,6 +154,10 @@
+ 
+ # the trace running on this thread (_host_trace_tape's _active): an Env records
+ # guards only while its own trace runs or none does
++
++# set by the tape: called with the C++ site of a SymInt read as an int (guard_int)
++INT_READ: Any = None
++
+ ACTIVE = threading.local()
+ 
+ 
+@@ -1661,6 +1665,9 @@
+         return self.env.guard_bool(self.node, self.written)
+ 
+     def guard_int(self, file: Any = "", line: Any = 0) -> int:
++        # C++ code's int read (SymInt::guard_int(__FILE__, __LINE__)): its site, for the trace to report
++        if file and self.node.op != "const" and INT_READ is not None:
++            INT_READ(f"{os.path.basename(str(file))}:{line}")
+         return int(self.env.guard_value(self.node))
+ 
+     def guard_float(self, file: Any = "", line: Any = 0) -> float:
+--- a/torch/cuda/_host_trace_tape.py
++++ b/torch/cuda/_host_trace_tape.py
+@@ -77,6 +77,61 @@
+ _SYM_TYPES = (torch.SymInt, torch.SymFloat, torch.SymBool)
+ 
+ 
++@dataclass(frozen=True)
++class Unconverted:
++    """An op whose own CUDA host code (_traced_redispatch) went past what is
++    converted to symbolic: what to convert next."""
++
++    op: str
++    # the C++ refusal (at::detail::SymbolicRefusal): "accessor", "output",
++    # "generator"; "int read" for host code that read a traced tensor's sizes,
++    # strides or offset as ints (a guard of each value: it works, specialized);
++    # None for another error (a data pointer read)
++    refusal: str | None
++    error: str  # the exception's type
++    message: str  # its first line
++    site: str | None  # the C++ frames below the refusing accessor
++    symbolic: bool  # whether a symbolic TensorIterator was built before it
++
++
++class UnconvertedHost(BaseException):
++    """In strict mode, an op's CUDA host code that built a symbolic
++    TensorIterator and then stopped at code not converted to symbolic, or that
++    read a traced tensor's sizes as ints. A BaseException: the trace's own
++    handlers do not turn it into a decline."""
++
++
++# what C++ host code dispatches when it reads a traced tensor's sizes(),
++# strides() or storage_offset() as ints (the Python sizes hook): each value
++# becomes a guard of its hint. Python code reads them as SymInts (sym_size)
++_INT_READS = {aten.size.default: "sizes()", aten.stride.default: "strides()", aten.storage_offset.default: "storage_offset()"}
++
++
++# every Unconverted of the process, by (op, refusal, site or message):
++# TORCH_HOST_TRACE_UNCONVERTED_LOG=<path> appends them as JSON lines at exit
++UNCONVERTED: collections.Counter = collections.Counter()
++
++
++def _log_unconverted() -> None:
++    import json
++    import os
++
++    if (path := os.environ.get("TORCH_HOST_TRACE_UNCONVERTED_LOG")) and UNCONVERTED:
++        with open(path, "a") as f:
++            for (op, refusal, message), n in UNCONVERTED.most_common():
++                f.write(json.dumps({"op": op, "refusal": refusal, "message": message, "count": n}) + "\n")
++
++
++import atexit as _atexit  # noqa: E402
++
++_atexit.register(_log_unconverted)
++
++
++def _has_cuda_kernel(func: Any) -> bool:
++    # a C++ CUDA kernel: an ATen op's, a C++ extension's (a Python one routes as _python_kernel / _library_kernel)
++    return isinstance(func, OpOverload) and _has_kernel(func.name(), "CUDA") and _python_kernel(func) is None and _library_kernel(func) is None
++
++
+ @dataclass
+ class _Root:
+     name: str  # p<i> for argument i's storage, a<k> for allocation k, e<k> for eager output k
+@@ -335,6 +390,12 @@
+         self.tensors: weakref.WeakSet[_TracedTensor] | None = weakref.WeakSet() if check_escapes else None
+         # the traced hosts' calls with their outputs, for _check_witness
+         self.aten_calls: list[tuple[int, EagerCall]] = []
++        # inside _traced_redispatch: the traced tensors whose storages are
++        # sealed (a data pointer read raises) until it returns
++        self.sealed: list[_TracedTensor] | None = None
++        # the ops whose own CUDA host code went past what is converted to
++        # symbolic (_traced_redispatch): the list of what to convert
++        self.unconverted: list[Unconverted] = []
+         # fn's own operator calls in order, as the warm-up's (_order_key)
+         self.order: list[tuple] = []
+         self.depth = 0  # of _TraceMode dispatches
+@@ -354,6 +415,8 @@
+         self.in_aten = False
+         # inside a top-level op, whose calls and launches are its own
+         self.in_op = False
++        # C++ host code's int reads of traced tensors' sizes (int_read), reported per op by op()
++        self.int_reads: list[str] = []
+         self.ops: list[OpRec] = []
+         # the Library.impl or custom_op kernel being traced and its kind, and
+         # why its body declines (a host-trace entry it called, raised in the
+@@ -690,7 +753,7 @@
+ 
+     def jiterator(self, code: str, name: str, return_by_ref: bool, num_outputs: int, tensors: tuple, kwargs: dict | None = None) -> Any:
+         """A user jiterator's launch (torch.cuda.jiterator), which no operator
+-        dispatches: its pointwise host, of the witness launch at stand-ins."""
++        dispatches: its CUDA host code over symbolic TensorIterators."""
+         label = f"jiterator {name}"
+         args = (code, name, return_by_ref, num_outputs, tensors, kwargs or {})
+ 
+@@ -699,9 +762,9 @@
+                 raise self.decline(f"{label} of a tensor the trace does not track")
+             if any(isinstance(v, (torch.Tensor, *_SYM_TYPES)) for v in args[5].values()):
+                 raise self.decline(f"{label} of an extra argument that is not a constant")
+-            out = self._pointwise_host(label, args, {}, _jiterator_launch, None, [])
++            out = self._traced_jiterator(label, lambda: _jiterator_launch(*args), tensors)
+             if isinstance(out, str):
+-                raise self.decline(f"{label}'s pointwise host declines: {out}")
++                raise self.decline(f"{label}'s CUDA host declines: {out}")
+             return out
+ 
+         return self.op(label, args, {}, run, host=True, redo=lambda a, k: current_trace().jiterator(*a, **k))
+@@ -718,7 +781,7 @@
+             return run()
+         env = self.shape_env
+         k, first, guards = len(self.ops), (len(self.launches), len(self.allocs), len(self.sites)), len(env.owners)
+-        self.in_op, env.op = True, k if host else None
++        self.in_op, env.op, reads = True, k if host else None, len(self.int_reads)
+         try:
+             out = run()
+         finally:
+@@ -740,6 +803,11 @@
+             env.owners[guards:] = [k] * (len(env.owners) - guards)
+             if env.owner_sets is not None:
+                 env.owner_sets[guards:] = [{k} for _ in env.owner_sets[guards:]]
++        if read := self.int_reads[reads:]:
++            del self.int_reads[reads:]
++            # an op run eagerly took no value of its host's reads
++            if kind == "traced":
++                self._report_int_reads(func, read)
+         outputs = tuple(o for o in pytree.tree_leaves(out) if isinstance(o, (torch.Tensor, int, torch.SymInt)))
+         spans = (range(first[0], len(self.launches)), range(first[1], len(self.allocs)))
+         self.ops.append(OpRec(func, (args, kwargs), *spans, outputs, kind, redo=redo))
+@@ -782,6 +850,9 @@
+         # op's Scalar overload
+         numeric = not torch._C._should_allow_numbers_as_tensors(func._schema.name.split("::")[1])
+         numbers = tuple(isinstance(s.type, torch.TensorType) and (isinstance(a, torch.SymInt) or (numeric and type(a) in (int, float))) for s, a in zip(func._schema.arguments, args))
++        # the op's own CUDA host code takes a constant number for a Tensor
++        # operand as eager's arg parser passes it, a wrapped number
++        original = func
+         if any(numbers):
+             if (scalar := _scalar_overload(func, numbers)) is None:
+                 raise self.decline(f"{func} of a number for a Tensor operand")
+@@ -833,13 +904,10 @@
+                 return out
+         # the C++ composite takes no symbolic size: a symbolic factory is the pointwise host's
+         factory = not any(isinstance(a, (torch.Tensor, *_SYM_TYPES)) for a in leaves)
+-        redispatch = (factory and func not in _TRACED_ATEN) or (_pointwise(func) and not any(numbers))
++        redispatch = factory and func not in _TRACED_ATEN
+         if hosts and (func in _ZEROS or func is aten.embedding.default or (redispatch and _composite(func) and _out_overload(func) is None)):
+             # CompositeExplicitAutograd (embedding, a factory (full,
+-            # scalar_tensor), a pointwise op's Scalar overload or functional
+-            # form): its parts, traced, as eager runs them. A
+-            # functional form over a CUDA out= kernel (abs, logical_not) resizes
+-            # an empty tensor: the witness of the out= overload instead
++            # scalar_tensor)): its parts, traced, as eager runs them
+             with _TraceMode(self):
+                 return func.redispatch(torch._C.DispatchKeySet(torch._C.DispatchKey.CUDA), *args, **kwargs)
+         schema = func._schema
+@@ -866,19 +934,30 @@
+         pairs = {(min(w.position, o.position), max(w.position, o.position)) for w, o in others}
+         overlap = any(w.extent[0] <= o.extent[1] and o.extent[0] <= w.extent[1] for w, o in others)
+ 
+-        elementwise = _pointwise(func) or _elementwise(func, args, kwargs)
+-
+         on_roots = [[t for t in tensors if t._root is v._root] for v in written.values() if isinstance(v, _TracedTensor)]
+ 
+         def shared(full_overlap: bool) -> bool:
+-            # TensorIterator allows a full overlap: a pointwise op may read the tensor it writes
++            # TensorIterator allows a full overlap: an op may read the tensor it writes
+             return any(len({id(t) for t in on_root} if full_overlap else on_root) > 1 for on_root in on_roots)
+ 
++        # the written tensor read as itself, a TensorIterator's full overlap:
++        # only the op's own CUDA host code over symbolic TensorIterators, whose
++        # every launch is a TensorIterator kernel (_traced_redispatch), takes it
++        full_only = not overlap and shared(False) and not shared(True)
++        redispatched = self.device.type == "cuda" and hosts and _has_cuda_kernel(original)
++
+         # a provider that keys the operands' layout on the storage harvests and checks them as they lie
+         aliased = any(func in p.aliased for p in self.opaque)
+         # a registered launcher records its kernel's own launch, on the operands as they lie
+         impl = torch.cuda._host_trace._TRACED_IMPLS.get(func) if hosts and torch.cuda._host_trace.traced_impls else None
+-        if overlap or (shared(elementwise) and not aliased and impl is None):
++        if full_only and not aliased and impl is None and redispatched:
++            # the one route that takes a full overlap
++            traced = self._traced_redispatch(original, args, kwargs)
++            if not isinstance(traced, str):
++                self.argument_pairs |= pairs
++                return traced
++            reasons.append(f"{original}'s CUDA host declines: {traced}")
++        elif overlap or (shared(False) and not aliased and impl is None):
+             reasons.append(f"{func} writes a storage another operand is of")
+         else:
+             if impl is not None:
+@@ -886,7 +965,7 @@
+                 if not isinstance(traced, str):
+                     self.argument_pairs |= pairs
+                     return traced
+-                if shared(elementwise) and not aliased:
++                if shared(False) and not aliased:
+                     reasons.append(f"{func} writes a storage another operand is of")
+             if self.opaque and shared(False) and not aliased:
+                 reasons.append(f"{func} writes a tensor it reads: no library kernel")
+@@ -919,27 +998,35 @@
+                 if isinstance(traced, str):
+                     reasons.append(f"{func}'s traced host declines: {traced}")
+                     traced = None
+-                if traced is None and elementwise and self.device.type == "cuda":
+-                    traced = self._traced_pointwise(func, args, kwargs)
++                if traced is None and redispatched:
++                    traced = self._traced_redispatch(original, args, kwargs)
+                     if isinstance(traced, str):
+-                        reasons.append(f"{func}'s pointwise host declines: {traced}")
++                        reasons.append(f"{original}'s CUDA host declines: {traced}")
+                         traced = None
+                 if traced is None and _kernel_less(func):
+                     # a CompositeExplicitAutograd(NonFunctional) op: its body, as
+                     # eager runs it, each of its parts routed as any op
+                     keyset = torch._C.DispatchKeySet(torch._C.DispatchKey.CUDA)
+ 
+-                    def body() -> Any:
+-                        if func in _SYM_BODIES and any(isinstance(a, _SYM_TYPES) for a in pytree.tree_leaves((args, kwargs))):
+-                            return _SYM_BODIES[func](*args, **kwargs)
++                    def redispatch() -> Any:
+                         try:
+                             return func.redispatch(keyset, *args, **kwargs)
+                         except RuntimeError as e:
+                             # an int-signature body's wrapper (C10_AS_INTARRAYREF_SLOW)
+                             if "expected to contain only concrete integers" not in str(e):
+                                 raise
+-                            if func not in _NEW_FACTORIES:
+-                                raise declined("its body takes no symbolic size") from e
++                            return _INT_BODY
++
++                    def body() -> Any:
++                        if func in _SYM_BODIES and any(isinstance(a, _SYM_TYPES) for a in pytree.tree_leaves((args, kwargs))):
++                            return _SYM_BODIES[func](*args, **kwargs)
++                        # its own host code: a TensorIterator the body builds
++                        # (copy_'s copy_impl) is symbolic, its launches recorded
++                        out = self._symbolic_host(func, lambda sink: torch._C._cuda_hostTraceRedispatch(redispatch, sink), tensors, {})
++                        if out is not _INT_BODY:
++                            return out
++                        if func not in _NEW_FACTORIES:
++                            raise declined("its body takes no symbolic size")
+                         # Tensor.new_full's body: the factory at self's options merged with the call's
+                         x, size, *fill = args
+                         options = {"dtype": x.dtype, "layout": x.layout, "device": x.device}
+@@ -1080,7 +1167,14 @@
+             return None  # the fake's verdict
+ 
+     def _traced_host(
+-        self, func: OpOverload, args: tuple, kwargs: dict, kernel: Callable[[], Any], parts: bool = False, body: str | None = None
++        self,
++        func: OpOverload,
++        args: tuple,
++        kwargs: dict,
++        kernel: Callable[[], Any],
++        parts: bool = False,
++        body: str | None = None,
++        forget: bool = False,
+     ) -> Any:
+         """func's output from kernel(), its Python CUDA kernel (_python_kernel)
+         or its composite body on the traced tensors, its calls and launches
+@@ -1132,8 +1226,13 @@
+             del self.allocs[marks[0] :], self.launches[marks[1] :], self.sites[marks[2] :], self.eager_outputs[marks[3] :]
+             del self.aten_calls[marks[4] :]
+             self.declined, self.host, self.host_reads, self.reentry = prior, host, host_reads, None
+-            # what the kernel declined on chose the eager call
+-            _to_graph(env, guards)
++            if forget:
++                # an op's own host code stepping aside (`forget`) runs eagerly
++                # at any sizes: what it read before is no guard of the call
++                env.forget(guards)
++            else:
++                # what the kernel declined on chose the eager call
++                _to_graph(env, guards)
+             if plain_part:
+                 return ""
+             return str(e).splitlines()[0] if isinstance(e, Declined) else f"{type(e).__name__}: {str(e).splitlines()[0] if str(e) else ''}"
+@@ -1203,37 +1302,12 @@
+         launches: list[Any] = []
+         for record in records:
+             if len(record) == 3:
+-                dst, src, nbytes = record
++                dst, src, _ = record
+                 # copy_device_to_device skips a memcpy onto its source
+                 apart = _sym_expr(dst) - _sym_expr(src)
+                 if not any(_sym_expr(r.sym).free_symbols & apart.free_symbols for r in roots) and bool(dst == src):
+                     continue
+-                launches.append(Memcpy(str(func), (dst, src), roots, nbytes))
+-                continue
+-            function, offsets, params, fields, grid, block, smem, *cpu_scalars = record
+-            places, values, is_pointer = [], [], []
+-            for param, offset, width, value, pointer in fields:
+-                places.append((param, offset, width))
+-                values.append(value)
+-                is_pointer.append(pointer)
+-            launches.append(
+-                KernelLaunch(
+-                    str(func),
+-                    function,
+-                    None,
+-                    tuple(zip(offsets, map(len, params))),
+-                    tuple(grid),
+-                    tuple(block),
+-                    smem,
+-                    tuple(values),
+-                    roots,
+-                    fields=tuple(places),
+-                    pointers=frozenset(i for i, p in enumerate(is_pointer) if p),
+-                    images=tuple(params),
+-                    generator=self.generator,
+-                    cpu_scalars=cpu_scalars[0] if cpu_scalars else (),
+-                )
+-            )
++            launches.append(self._launch_of(func, record, roots))
+         if check is not None and not check(out, launches):
+             del self.allocs[marks[0] :], self.launches[marks[1] :]
+             _to_graph(env, guards)
+@@ -1246,400 +1320,216 @@
+             self._witnessed(func, *call, out)
+         return out
+ 
+-    def _traced_pointwise(self, func: OpOverload, args: tuple, kwargs: dict) -> Any:
+-        """A pointwise op's traced host (Pointwise.cu) from a witness: the op's
+-        out= overload (in-place and out= ops, and ops without one: the op) run
+-        at stand-ins of its tensors in a capture gives its kernels and their
+-        parameter bytes (the functors', whatever the op's), and the
+-        TensorIterators it builds each kernel's operands; TensorIteratorSym the
+-        sizes, strides and addresses in them. The output, or why the host
+-        declines."""
++    def _traced_redispatch(self, func: OpOverload, args: tuple, kwargs: dict) -> Any:
++        """func's own CUDA host code (the generated wrapper, its structured meta
++        and impl, the DispatchStub and kernel) run under the trace over
++        symbolic TensorIterators (torch._C._cuda_hostTraceRedispatch): each
++        launch recorded as eager's code builds it, every decision on a symbol a
++        guard; outputs allocated through the trace and nested ops routed as any.
++        Its output, or why it declines: code not converted to symbolic stops at
++        an int64 read (an accessor, a data pointer, the generator) and is
++        reported in Tape.unconverted; in strict mode (the hint audit's) a gap
++        after a symbolic TensorIterator was built raises."""
+         schema = func._schema
+-        if torch.Tag.nondeterministic_seeded in func.tags:
+-            return "it draws from a generator"
+-        if not all(isinstance(r.type, torch.TensorType) for r in schema.returns):
+-            return f"it returns {len(schema.returns)} values"
+         values = (*args, *(kwargs.get(a.name, a.default_value) for a in schema.arguments[len(args) :]))
+-        # the witness runs at the hints: a symbolic operand would replay as its value there
+-        if any(isinstance(x, _SYM_TYPES) for x in pytree.tree_leaves(values)):
+-            return "a symbolic operand"
+-        written = [a for s, a in zip(schema.arguments, values) if s.alias_info is not None and s.alias_info.is_write]
+-        if schema.is_mutable:
+-            # in-place or out=: it writes and returns its written arguments
+-            if len(written) != len(schema.returns) or any(r.alias_info is None for r in schema.returns):
+-                return "it writes other than the tensors it returns"
+-            op, out_name = func, None
+-        else:
+-            # without an out= overload the witness is the op, which allocates its outputs
+-            written, (op, out_name) = [], _out_overload(func) or (func, None)
+-        cpu = {}
+         for s, a in zip(schema.arguments, values):
+-            if isinstance(a, torch.Tensor) and self._is_host(a) and a.dim() == 0:
+-                cpu[id(a)] = a
+-            elif not isinstance(a, _TracedTensor) and any(isinstance(x, torch.Tensor) for x in pytree.tree_leaves(a)):
+-                return f"its {s.name} is not a traced tensor"
+-        if len(cpu) > 1:
+-            return "it reads two CPU buffers"
+-        if not _pointwise(func):
+-            # routed here by its shapes (_elementwise): the host's checks of the operands no iterator
+-            # reads (addmm's mat2 against self and out at K = 0) are its meta's, guards of the op
+-            env = self.shape_env
+-            outer, env.op = env.op, len(self.ops)
+-            try:
+-                self._fake_call(func, args, kwargs)
+-            finally:
+-                env.op = outer
+-        return self._pointwise_host(func, args, kwargs, op, out_name, written)
+-
+-    def _pointwise_host(self, func: OpOverload | str, args: tuple, kwargs: dict, op: Callable[..., Any], out_name: str | None, written: list) -> Any:
+-        """_traced_pointwise's host of the witness op(*args, **kwargs), into
+-        out_name's stand-in where given, writing `written`; func an operator or
+-        a user jiterator's label."""
+-        from cuda.bindings import runtime
+-
+-        from torch.cuda._host_trace_capture import capture_kernel_nodes, KernelNode, MemcpyNode, pack_params
+-        from torch.cuda._host_trace_cute import _stand_in
+-
+-        traced: dict[int, tuple[torch.Tensor, _TracedTensor]] = {}  # by id, each stand-in and its tensor
+-
+-        def stand_in(t: _TracedTensor) -> torch.Tensor:
+-            s = _stand_in(t)
+-            traced[id(s)] = (s, t)
++            if isinstance(a, torch.Generator) or (a is not None and "Generator" in str(s.type) and isinstance(a, torch.Generator)):
++                return "it draws from a generator"
++            if isinstance(s.type, torch.TensorType) and isinstance(a, _SYM_TYPES) and not isinstance(a, torch.SymInt):
++                return f"a symbolic {type(a).__name__} for its Tensor operand {s.name}"
++        # a host buffer (a CPU tensor the trace's host steps write) reaches the
++        # kernel as a stand-in whose storage raises on a read: its value is each
++        # replay's, which only a CPU scalar member (KernelLaunch.cpu_scalars) reads
++        stand_ins: dict[int, torch.Tensor] = {}
++
++        def number_stand_in(a: torch.SymInt) -> torch.Tensor:
++            # a symbolic number for a Tensor operand: a wrapped number's stand-in
++            n = _SymNumberStandIn(a)
++            stand_ins[id(n)] = _SymNumber(a)
++            return n
++
++        def stand_in(a: Any) -> Any:
++            if not (isinstance(a, torch.Tensor) and self._is_host(a)):
++                return a
++            if a.dim() != 0:
++                raise declined("a CPU buffer operand that is not 0-dim")
++            s = _HostBufferStandIn(a)
++            stand_ins[id(s)] = a
+             return s
+ 
+-        base = (_ALLOC_TAG | (self.first_alloc + len(self.allocs) + 1) << _ALLOC_SHIFT) & _PLACEHOLDER_LOW
+-        stand = pytree.tree_map_only(_SYM_TYPES, _hint, pytree.tree_map_only(_TracedTensor, stand_in, (args, kwargs)))
+-        # a host buffer (_traced_pointwise's one CPU scalar operand) holds no
+-        # value at trace time: the witness runs at probe values of it
+-        cpu = next((a for a in pytree.tree_leaves((args, kwargs)) if isinstance(a, torch.Tensor) and not isinstance(a, _TracedTensor)), None)
+-        probes = [] if cpu is None else _cpu_scalar_probes(cpu.dtype)
+-
+-        def at_probe(k: int) -> tuple:
+-            return pytree.tree_map_only(torch.Tensor, lambda t: probes[k] if t is probes[0] else t, stand)
+-
+-        if cpu is not None:
+-            stand = pytree.tree_map_only(torch.Tensor, lambda t: probes[0] if t is cpu else t, stand)
+-        w = None
+-        if out_name is not None:
+-            # the witness's output: the meta kernel's at the hints, which the
+-            # host's launch then matches byte for byte
+-            try:
+-                o = _meta_at_hints(func, args, kwargs)
+-            except Exception as e:
+-                return f"its meta kernel raised {type(e).__name__}: {str(e).splitlines()[0] if str(e) else ''}"
+-            sizes, strides = list(o.shape), list(o.stride())
+-            extent = 1 + sum((n - 1) * st for n, st in zip(sizes, strides)) if all(sizes) else 0
+-            storage = torch._C._construct_storage_from_data_pointer(base, self.device, extent * o.element_size())
+-            with _disable_current_modes():
+-                w = torch.empty(0, dtype=o.dtype, device=self.device).set_(storage, 0, sizes, strides)
+-            stand[1][out_name] = w
+-        spans = [(t.data_ptr(), t.data_ptr() + t.untyped_storage().nbytes()) for t in pytree.tree_leaves(stand) if isinstance(t, torch.Tensor) and t.is_cuda]
+-
+-        def witness(stand: tuple) -> tuple[list, list, list, list, list] | str:
+-            # its nodes, iterators, launch sites' reports (LaunchLayout.h), outputs and allocations
+-            # a relaxed thread: a witness that allocates declines the op, not the trace
+-            relaxed = runtime.cudaStreamCaptureMode.cudaStreamCaptureModeRelaxed
+-            mode = _check_cuda_bindings(runtime.cudaThreadExchangeStreamCaptureMode(relaxed))
+-            made: list[Any] = []
+-            log: list[tuple[int, int]] = []
+-            harvesting = torch._C._cuda_hostTraceSetHarvesting(True)
+-            torch._C._cuda_hostTraceRecordIterators(True)
+-            torch._C._cuda_hostTraceRecordLaunches(True)
+-            try:
+-                with _disable_current_modes(), torch.cuda.device(self.device):
+-                    nodes = capture_kernel_nodes(lambda s: made.append(op(*stand[0], **stand[1])), mode="relaxed", memcpy=True, allocations=log)
+-            except Exception as e:
+-                return f"its witness raised {type(e).__name__}: {str(e).splitlines()[0] if str(e) else ''}"
+-            finally:
+-                launched = torch._C._cuda_hostTraceRecordLaunches(False)
+-                iterators = torch._C._cuda_hostTraceRecordIterators(False)
+-                torch._C._cuda_hostTraceSetHarvesting(harvesting)
+-                _check_cuda_bindings(runtime.cudaThreadExchangeStreamCaptureMode(mode))
+-            return nodes, iterators, launched, made, log
+-
+-        # an output in an operand's storage (a zero-element var's view of w) is no allocation
+-        known = {t.untyped_storage().data_ptr() for t in [s for s, _ in traced.values()] + [w] if t is not None}
+-
+-        def unexplained(iterators: list, log: list) -> str | None:
+-            # the witness's allocations must be exactly its iterators' outputs the op allocates
+-            outs = {id(o): o for ops, n, *_ in iterators for o in ops[:n] if o.is_cuda and o.untyped_storage().data_ptr() not in known}
+-            explained = collections.Counter((o.data_ptr(), b) for o in outs.values() if (b := o.untyped_storage().nbytes()))
+-            if extra := collections.Counter(log) - explained:
+-                return f"its witness allocated {[(hex(a), n) for a, n in extra.elements()]}, which no iterator explains"
+-            if missing := explained - collections.Counter(log):
+-                return f"its witness's iterators write {[(hex(a), n) for a, n in missing.elements()]}, which it did not allocate"
+-            return None
++        try:
++            a2, k2 = pytree.tree_map_only(torch.Tensor, stand_in, (args, kwargs))
++            types = {x.name: x.type for x in schema.arguments}
++            a2 = [number_stand_in(a) if isinstance(a, torch.SymInt) and isinstance(x.type, torch.TensorType) else a for x, a in zip(schema.arguments, a2)]
++            k2 = {k: number_stand_in(a) if isinstance(a, torch.SymInt) and isinstance(types[k], torch.TensorType) else a for k, a in k2.items()}
++        except Declined as e:
++            return str(e).splitlines()[0]
++        keyset = torch._C.DispatchKeySet(torch._C.DispatchKey.CUDA)
++        leaves = [t for t in pytree.tree_leaves((args, kwargs)) if isinstance(t, _TracedTensor)]
+ 
+-        if isinstance(got := witness(stand), str):
+-            return got
+-        nodes, iterators, launched, made, log = got
+-        results = made[0] if isinstance(made[0], tuple) else made
+-        if not all(isinstance(n, (KernelNode, MemcpyNode)) for n in nodes):
+-            return f"its witness launched {len(nodes)} operations"
+-
+-        def metadata(iterators: list, nodes: list, k: int) -> list | None:
+-            # what a CPU scalar's value must not change
+-            if not all(isinstance(n, KernelNode) for n in nodes):
+-                return None
+-            its = [(n, numel, common, reduction, [(o.dtype, o.shape, o.stride(), o.is_cuda or o.data_ptr() == probes[k].data_ptr()) for o in ops]) for ops, n, numel, common, reduction in iterators]
+-            return [its, [(n.function, n.grid, n.block, n.smem, n.layout) for n in nodes]]
+-
+-        if cpu is not None:
+-            if (traced_metadata := metadata(iterators, nodes, 0)) is None:
+-                return "a memcpy of an op of a CPU buffer"
+-
+-        def operand(t: torch.Tensor) -> Any:
+-            # a stand-in, or a broadcast of exactly one (expand_inplace's), is its tensor
+-            if id(t) in traced:
+-                return traced[id(t)][1]
+-            found = set()
+-            for s, v in traced.values():
+-                if s.data_ptr() == t.data_ptr() and s.dtype == t.dtype and t.dim() >= s.dim():
+-                    try:
+-                        if s.expand(t.shape).stride() == t.stride():
+-                            found.add(v)
+-                    except RuntimeError:
+-                        pass
+-            return found.pop() if len(found) == 1 else None
+-
+-        # per iterator: its outputs (a traced tensor, None for the op's output
+-        # the host allocates, "temp" for a 0-dim temporary, an earlier
+-        # iterator's (index, output)), their dtypes, its inputs (a traced
+-        # tensor, an earlier iterator's output, a CPU scalar) and kernel node
+-        written_by: dict[int, tuple[int, int]] = {}
+-        plan: list[tuple[list, list[torch.dtype], list, torch.dtype, Any]] = []
+-        moves: list[tuple[int, int]] = []  # each host allocation's witness address and bytes
+-        live = iter(nodes)
+-        empty_reductions: list[Any] = []  # the inputs of zero-element reductions, which launch nothing
+-        for operands, noutputs, numel, common, reduction in iterators:
+-            outs, ins = operands[:noutputs], operands[noutputs:]
+-            if reduction:
+-                # eager fills a zero-element reduction's output, with a later iterator
+-                found = [operand(i) for i in ins if i.is_cuda]
+-                if numel or None in found:
+-                    return "its witness built a reduction iterator"
+-                empty_reductions += found
+-                continue
+-            if not outs[0].is_cuda:
+-                continue
+-            inputs: list[Any] = []
+-            for i in ins:
+-                if not i.is_cuda:
+-                    inputs.append(cpu if cpu is not None and i.data_ptr() == probes[0].data_ptr() else i)
+-                elif id(i) in written_by:
+-                    inputs.append(written_by[id(i)])
+-                elif (t := operand(i)) is not None:
+-                    inputs.append(t)
+-                else:
+-                    return "an iterator reads a tensor that is none of the op's"
+-            targets: list[Any] = []
+-            for o in outs:
+-                if id(o) in written_by:
+-                    targets.append(written_by[id(o)])
+-                elif id(o) in traced:
+-                    if not any(traced[id(o)][1] is x for x in written):
+-                        return "an iterator writes a tensor the op does not"
+-                    targets.append(traced[id(o)][1])
+-                elif any(o is r for r in results) or o.dim() == 0:
+-                    k = next((k for k, r in enumerate(results) if o is r), None)
+-                    # a nullary iterator's output (full's, ones_like's) has no operand to take a shape from: the op's
+-                    targets.append("temp" if k is None else None if any(i.is_cuda for i in ins) else k)
+-                    moves.append((o.data_ptr(), o.untyped_storage().nbytes()))
+-                else:
+-                    return "an iterator writes a temporary"
+-            node = next(live, None) if numel else None
+-            if numel and node is None:
+-                return f"its witness launched {len(nodes)} kernels, not one per nonempty iterator"
+-            if isinstance(node, MemcpyNode):
+-                # copy_'s memcpy: the traced copy_ host into the op's output
+-                if len(outs) != 1 or len(inputs) != 1:
+-                    return "a memcpy of an iterator of other than one output and input"
+-                targets = [next((k for k, r in enumerate(results) if outs[0] is r), None) if t is None else t for t in targets]
+-            written_by.update((id(o), (len(plan), k)) for k, o in enumerate(outs))
+-            plan.append((targets, [o.dtype for o in outs], inputs, common, node))
+-        if next(live, None) is not None:
+-            return f"its witness launched {len(nodes)} kernels, not one per nonempty iterator"
+-        if isinstance(func, OpOverload) and not _witness_takes(func) and not empty_reductions:
+-            return "ATen declares it no elementwise kernel and it reduces no empty tensor"
+-        finals = [written_by.get(id(r)) or (traced[id(r)][1] if id(r) in traced else None) for r in results]
+-        fakes: list = []
+-        if None in finals or any(type(t) is int for targets, *_ in plan for t in targets):
+-            # an output the host allocates at no operand's shape: the fake kernel's
+-            if not isinstance(func, OpOverload):
+-                return "an output has no operand's shape"
+-            _, out = self._fake_call(func, args, kwargs)
+-            fakes = [out] if len(func._schema.returns) == 1 else list(out)
+-        # a kernel's unused buffer (log_sigmoid_forward's) is an empty tensor it returns
+-        empty = [f is None and any(type(n) is int and n == 0 for n in fakes[k].shape) for k, f in enumerate(finals)]
+-        if any(f is None and not e for f, e in zip(finals, empty)):
+-            return "no iterator writes its output"
+-        moves += [(r.data_ptr(), 0) for r, e in zip(results, empty) if e]
+-        spans += [(a, a + n) for a, n in moves]
+-        if (why := unexplained(iterators, log)) is not None:
+-            return why
+-        # the witness's outputs, freed before the host's run
+-        made.clear()
+-        del got, results, iterators, w
+-        operands = outs = o = None
+-        allocated = len(self.allocs)
+-
+-        # each kernel's byte classes (LaunchLayout.h) where its launch site's
+-        # report matches it (function, grid, block, parameter sizes and every
+-        # byte of a class), its bytes of no class zeroed; a kernel without one
+-        # keeps the witness's bytes, scanned
+-        kernels = [n for n in nodes if isinstance(n, KernelNode)]
+-        classes: dict[int, list[str]] = {}
+-        images = {id(n): n.images for n in kernels}
+-        j = 0
+-        for n in kernels:
+-            if (k := next((k for k in range(j, len(launched)) if launched[k][0] == n.function), None)) is None:
+-                continue
+-            _, grid, block, cls, data = launched[k]
+-            j = k + 1
+-            if (grid, block) == (n.grid, n.block) and [len(c) for c in cls] == [len(b) for b in n.images] and all(c == "." or x == y for cs, d, b in zip(cls, data, n.images) for c, x, y in zip(cs, d, b)):
+-                classes[id(n)] = cls
+-                images[id(n)] = tuple(bytes(0 if c == "." else x for c, x in zip(cs, b)) for cs, b in zip(cls, n.images))
+-        # each member eager reads from the CPU buffer, (parameter, byte offset,
+-        # class): its kernel's iterator's CPU scalar, its bytes eager's read of
+-        # each probe, the kernels' other functor bytes the same at each probe
+-        scalars: dict[int, list[tuple[int, int, str]]] = {}
+-        if cpu is not None:
+-            reading = {id(p[-1]) for p in plan if p[-1] is not None and any(x is cpu for x in p[2])}
+-            for n in kernels:
+-                if id(n) not in classes:
+-                    return f"kernel {n.name} of an op of a CPU buffer has no launch report"
+-                if id(n) not in reading:
+-                    continue
+-                runs = scalars[id(n)] = []
+-                for p, cs in enumerate(classes[id(n)]):
+-                    at = 0
+-                    while at < len(cs):
+-                        if not (cs[at].isupper() or cs[at].isdigit()):
+-                            at += 1
+-                            continue
+-                        width = len(torch._C._cuda_hostTraceCpuScalarBytes(probes[0], cs[at]))
+-                        if cs[at : at + width] != cs[at] * width:
+-                            return f"kernel {n.name}'s CPU scalar member is not of its class's width"
+-                        runs.append((p, at, cs[at]))
+-                        at += width
+-                if not runs:
+-                    return f"kernel {n.name} reads a CPU buffer at no member its launch report marks"
+-
+-            def scalar_value(n: KernelNode, image: Sequence[bytes], k: int) -> bool:
+-                return all(image[p][at : at + len(v)] == v for p, at, c in scalars.get(id(n), ()) for v in [torch._C._cuda_hostTraceCpuScalarBytes(probes[k], c)])
+-
+-            if not all(scalar_value(n, n.images, 0) for n in kernels):
+-                return "a kernel's CPU scalar member is not eager's read of the CPU buffer"
+-            for k in range(1, len(probes)):
+-                if isinstance(again := witness(at_probe(k)), str):
+-                    return f"at another value of its CPU buffer, {again}"
+-                if metadata(again[1], again[0], k) != traced_metadata:
+-                    return "a CPU buffer's value sets its iterators or launches"
+-                for n, m in zip(kernels, again[0]):
+-                    marked = {(p, at + i) for p, at, c in scalars.get(id(n), ()) for i in range(len(torch._C._cuda_hostTraceCpuScalarBytes(probes[k], c)))}
+-                    if not scalar_value(n, m.images, k) or any(c not in "kp." and (p, b) not in marked and x != y for p, (cs, ib, jb) in enumerate(zip(classes[id(n)], n.images, m.images)) for b, (c, x, y) in enumerate(zip(cs, ib, jb))):
+-                        return "a CPU buffer's value sets other than its kernels' CPU scalar members"
+-                if (why := unexplained(again[1], again[4])) is not None:
+-                    return f"at another value of its CPU buffer, {why}"
+-                del again
+-        # a functor's pointer member replays as its operand's address
+-        roots = {id(s): (s.data_ptr(), s.data_ptr() + s.untyped_storage().nbytes(), t) for s, t in traced.values()}
+-        addresses: dict[int, list[tuple[int, int, _TracedTensor, int]]] = {}
+-        for n in kernels:
+-            for p, (cs, b) in enumerate(zip(classes.get(id(n), ()), images[id(n)])):
+-                if "z" in cs:
+-                    return f"kernel {n.name}'s functor has a member of the operands' sizes"
+-                for at in range(0, len(cs) - 7, 8):
+-                    v = int.from_bytes(b[at : at + 8], "little")
+-                    if cs[at : at + 8] != "p" * 8 or v == 0:
+-                        continue
+-                    if (hit := next(((t, v - lo) for lo, hi, t in roots.values() if lo <= v < hi), None)) is None:
+-                        return f"kernel {n.name}'s functor points at a tensor that is none of the op's"
+-                    addresses.setdefault(id(n), []).append((p, at, *hit))
+-
+-        def check(out_t: _TracedTensor, launches: list) -> bool:
+-            kernels = [p[-1] for p in plan if p[-1] is not None]
+-            if len(launches) != len(kernels) or len(self.allocs) - allocated != len(moves):
+-                return False
+-            # host allocation j's placeholder address stands for moves[j]
+-            hosts = [((_ALLOC_TAG | (self.first_alloc + allocated + 1 + j) << _ALLOC_SHIFT) & _PLACEHOLDER_LOW, a, n) for j, (a, n) in enumerate(moves)]
+-
+-            def address(v: Any) -> int:
+-                v = _hint(v) & _PLACEHOLDER_LOW
+-                return next((v - h + a for h, a, n in hosts if h <= v < h + n), v)
+-
+-            for launch, node in zip(launches, kernels):
+-                if isinstance(node, MemcpyNode) or isinstance(launch, Memcpy):
+-                    if not isinstance(launch, Memcpy) or not isinstance(node, MemcpyNode):
+-                        return False
+-                    if (*map(address, launch.slots), _hint(launch.nbytes)) != (node.dst, node.src, node.nbytes):
+-                        return False
+-                    continue
+-                if (tuple(map(_hint, launch.grid)), tuple(map(_hint, launch.block)), _hint(launch.smem)) != (node.grid, node.block, node.smem):
+-                    return False
+-                pointers = [i in launch.pointers for i in range(len(launch.slots))]
+-                slots = [address(v) if p else _hint(v) for v, p in zip(launch.slots, pointers)]
+-                if [bytes(b) for b in pack_params(launch, slots, pointers)] != [bytes(b) for b in images[id(node)]]:
+-                    return False
+-                # the witness's bytes the host does not set replay as they are: a
+-                # tensor's address among them (a functor's pointer), or any CUDA
+-                # address, would be stale. Of a typed kernel only its functors' bytes
+-                placed = {(p, b) for p, at, n in launch.fields for b in range(at, at + n)}
+-                cls = classes.get(id(node))
+-                for p, image in enumerate(images[id(node)]):
+-                    for b in range(0, len(image) - 7, 4):
+-                        v = int.from_bytes(image[b : b + 8], "little")
+-                        if placed & {(p, b + i) for i in range(8)} or (cls is not None and "p" not in cls[p][b : b + 8]):
+-                            continue
+-                        if any(lo <= v < hi for lo, hi in spans) or (v >> 32 and _cuda_address(v)):
+-                            stale.append(f"kernel {node.name} parameter {p} holds a CUDA address at byte {b}")
+-                            return False
+-            return True
++        def kernel() -> Any:
++            # a number for a Tensor operand is a wrapped number, as eager's arg parser makes it
++            return self._symbolic_host(func, lambda sink: torch._C._cuda_hostTraceRedispatchOp(func._handle, keyset, tuple(a2), dict(k2), sink), leaves, stand_ins)
++
++        return self._traced_host(func, args, kwargs, kernel, parts=True, forget=True)
++
++    def _symbolic_host(self, func: Any, invoke: Callable[[Callable[[tuple], None]], Any], tensors: Sequence[_TracedTensor], stand_ins: Mapping[int, torch.Tensor]) -> Any:
++        """invoke(sink), an op's own CUDA host code over `tensors`, with
++        symbolic TensorIterators on (torch._C._cuda_hostTraceRedispatch*):
++        each launch handed to sink and recorded as it happens, the traced tensors' storages sealed (a data
++        pointer read raises). Code not converted to symbolic declines and is
++        recorded in self.unconverted; in strict mode a gap after a symbolic
++        TensorIterator was built raises UnconvertedHost."""
++        marks = len(self.allocs), len(self.eager_outputs)
++        arg_roots = {id(t._root): t._root for t in tensors}
++
++        def sink(record: tuple) -> None:
++            roots = dict(arg_roots)
++            roots.update((id(a.root), a.root) for a in self.allocs[marks[0] :])
++            roots.update((id(t._root), t._root) for t in self.eager_outputs[marks[1] :])
++            launch = self._launch_of(func, record, tuple(roots.values()), stand_ins)
++            if not isinstance(launch, Memcpy):
++                self.host_reads.update(t.untyped_storage()._cdata for *_, t in launch.cpu_scalars)
++            self.record_launch(launch)
++
++        built = torch._C._cuda_hostTraceSymbolicIteratorsBuilt()
++        outer = self.sealed
++        self.sealed = []
++        for t in tensors:
++            torch._C._cuda_hostTraceSeal(t, True)
++            self.sealed.append(t)
++        torch._C._cuda_hostTraceTakeRefusal()
++        try:
++            return invoke(sink)
++        except Exception as e:
++            if isinstance(e, Declined):
++                raise
++            refusal = torch._C._cuda_hostTraceTakeRefusal()
++            symbolic = torch._C._cuda_hostTraceSymbolicIteratorsBuilt() > built
++            lines = str(e).splitlines()
++            message, site = (lines[0] if lines else ""), ("\n".join(lines[1:]).strip() or None)
++            record = Unconverted(str(func), refusal, type(e).__name__, message, site, symbolic)
++            self.unconverted.append(record)
++            UNCONVERTED[(record.op, record.refusal, record.message)] += 1
++            # strict raises at code a symbolic iterator refused (its accessors, its
++            # outputs): converted code's gap. A data pointer or value read, a sizes()
++            # of a symbolic tensor, the generator are the op's host stepping aside
++            if refusal in ("accessor", "output") and symbolic and _hint_audit.mode == "strict":
++                raise UnconvertedHost(f"{func}: {type(e).__name__}: {message}{chr(10) + site if site else ''}") from e
++            raise declined(f"its host stops at {refusal or type(e).__name__}: {message}") from e
++        finally:
++            for t in self.sealed:
++                torch._C._cuda_hostTraceSeal(t, False)
++            # a nested op's host (a composite body's part) unsealed what the enclosing one sealed
++            for t in outer or ():
++                torch._C._cuda_hostTraceSeal(t, True)
++            self.sealed = outer
++
++    def _traced_jiterator(self, label: str, call: Callable[[], Any], tensors: Sequence[_TracedTensor]) -> Any:
++        """A user jiterator's launch (no operator): its CUDA host code
++        (jiterator.cu) over symbolic TensorIterators, as _traced_redispatch's;
++        its outputs, or why it declines (nothing recorded)."""
++        env = self.shape_env
++        marks = len(self.allocs), len(self.launches), len(self.eager_outputs)
++        guards, op = len(env.owners), env.op
++        env.op = len(self.ops)
++        try:
++            with _TraceMode(self):
++                out = self._symbolic_host(label, lambda sink: torch._C._cuda_hostTraceRedispatch(call, sink), tensors, {})
++        except Declined as e:
++            if e.retry:
++                raise
++            del self.allocs[marks[0] :], self.launches[marks[1] :], self.eager_outputs[marks[2] :]
++            _to_graph(env, guards)
++            return str(e).splitlines()[0]
++        finally:
++            env.op = op
++        made = {id(a.root) for a in self.allocs[marks[0] :]}
++        # one output is a tensor, more a tuple (torch._C._cuda_jiterator_compile_and_launch_kernel)
++        if not all(isinstance(t, _TracedTensor) and id(t._root) in made for t in (out if isinstance(out, tuple) else (out,))):
++            raise AssertionError(f"{label} returned a tensor it did not allocate")
++        return out
+ 
+-        stale: list[str] = []
++    def int_read(self, accessor: str, t: Any) -> None:
++        """C++ host code read a traced tensor's sizes, strides or offset as
++        ints: each symbolic value becomes a guard of its hint (sound,
++        specialized), owned by the op. Reported (op()) where the op traces."""
++        values = {"sizes()": t.shape, "strides()": t.stride(), "storage_offset()": (t.storage_offset(),)}[accessor]
++        if any(isinstance(v, torch.SymInt) and v.node.maybe_as_int() is None for v in values):
++            self.int_reads.append(f"a traced tensor's {accessor}")
++
++    def _report_int_reads(self, func: Any, reads: list[str]) -> None:
++        # a traced op whose host specialized: in self.unconverted; in strict mode it raises
++        op, message = str(func), f"host code read symbolic values as ints (each a guard of its hint): {', '.join(sorted(set(reads)))}"
++        self.unconverted.append(Unconverted(op, "int read", "IntRead", message, None, False))
++        UNCONVERTED[(op, "int read", message)] += 1
++        if _hint_audit.mode == "strict":
++            raise UnconvertedHost(f"{op}: {message}")
++
++    def resize_fresh(self, t: torch.Tensor, sizes: list, strides: list) -> bool:
++        """resize_output of an op's own fresh empty output (its functional form
++        over its out= kernel: empty({0}), then the kernel resizes it to the
++        iterator's sizes and strides): a new allocation of those, t rebound
++        to it, as eager's resize_ allocates a new storage; False for any
++        other tensor (its metadata the trace never changes)."""
++        if not isinstance(t, _TracedTensor) or t._root.kind != "allocation":
++            return False
++        rec = next((a for a in self.allocs if a.root is t._root), None)
++        # zero elements of a constant size, and nothing launched since
++        if rec is None or not any(type(n) is int and n == 0 for n in rec.sizes) or any(s > rec.seq for s, _ in self.launches):
++            return False
++        options = {"dtype": t.dtype, "device": t.device}
++        if strides:
++            new = self.allocate(aten.empty_strided.default, (sizes, strides), options)
++        else:
++            new = self.allocate(aten.empty.memory_format, (sizes,), options)
++        t._root, t._sym_strides, t._sym_offset = new._root, list(new._sym_strides), new._sym_offset
++        torch._C._cuda_hostTraceRestride(t, list(new.shape), list(new._sym_strides), new._sym_offset)
++        return True
+ 
+-        declines: list[str] = []
+-        dynamic = not isinstance(func, OpOverload)  # a user jiterator's launch
++    def _launch_of(self, func: Any, record: tuple, roots: tuple, stand_ins: Mapping[int, torch.Tensor] | None = None) -> Any:
++        """A C++ host's launch record (torch/csrc/cuda/host_trace/Aten.cpp
++        record()) as a KernelLaunch or Memcpy; a CPU scalar of a stand-in reads
++        its host buffer."""
++        from torch.cuda._host_trace_launch import KernelLaunch
+ 
+-        def host() -> Any:
+-            outs: list[Any] = []
+-            records: list = []
+-            if any(t.numel() != 0 for t in empty_reductions):
+-                declines.append("a zero-element reduction's input is not empty")
+-                raise NotImplementedError(declines[-1])
+-            for targets, dtypes, inputs, common, node in plan:
+-                targets = [
+-                    torch.empty((), dtype=d, device=self.device) if isinstance(t, str)
+-                    else outs[t[0]][t[1]] if type(t) is tuple
+-                    else torch.empty_strided(fakes[t].shape, fakes[t].stride(), dtype=d, device=self.device) if type(t) is int
+-                    else t
+-                    for t, d in zip(targets, dtypes)
+-                ]
+-                ins = [outs[i[0]][i[1]] if type(i) is tuple else i for i in inputs]
+-                if isinstance(node, MemcpyNode):
+-                    o, recs = torch._C._cuda_hostTraceCopy_(targets[0], ins[0])
+-                    outs.append([o])
+-                    records += recs
+-                    continue
+-                name, function, offsets, image = (node.name, node.function, [o for o, _ in node.layout], list(images[id(node)])) if node else ("", 0, [], [])
+-                try:
+-                    o, recs = torch._C._cuda_hostTracePointwise(targets, dtypes, ins, common, dynamic, name, function, offsets, image, addresses.get(id(node), []))
+-                except NotImplementedError as e:
+-                    declines.append(str(e).splitlines()[0])
+-                    raise
+-                outs.append(o)
+-                if node is not None and id(node) in scalars:
+-                    members = tuple((p, at, c, cpu) for p, at, c in scalars[id(node)])
+-                    recs = [(*r, members) if len(r) == 7 else r for r in recs]
+-                records += recs
+-            rets = [outs[f[0]][f[1]] if type(f) is tuple else f if f is not None else torch.empty_strided(fakes[k].shape, fakes[k].stride(), dtype=fakes[k].dtype, device=self.device) for k, f in enumerate(finals)]
+-            return tuple(rets) if len(rets) > 1 else rets[0], records
+-
+-        tensors = [a for a in pytree.tree_leaves((args, kwargs)) if isinstance(a, _TracedTensor)]
+-        out_t = self._run_host(func, host, tensors, (args, kwargs) if isinstance(func, OpOverload) else None, check)
+-        if out_t is None or isinstance(out_t, str):
+-            return declines[0] if declines else out_t or (stale[0] if stale else "the host's launch at the hints is not the witness's")
+-        return out_t
++        if len(record) == 3:
++            dst, src, nbytes = record
++            return Memcpy(str(func), (dst, src), roots, nbytes)
++        function, offsets, params, fields, grid, block, smem, *cpu_scalars = record
++        places, values, is_pointer = [], [], []
++        for param, offset, width, value, pointer in fields:
++            places.append((param, offset, width))
++            values.append(value)
++            is_pointer.append(pointer)
++        scalars = []
++        for p, at, cls, src in cpu_scalars[0] if cpu_scalars else ():
++            src = (stand_ins or {}).get(id(src), src)
++            if isinstance(src, _SymNumber):
++                # a symbolic number's member: a field of the number's value at each replay
++                place, value = _sym_number_field(p, at, cls, src.value)
++                places.append(place)
++                values.append(value)
++                is_pointer.append(False)
++            else:
++                scalars.append((p, at, cls, src))
++        scalars = tuple(scalars)
++        return KernelLaunch(
++            str(func),
++            function,
++            None,
++            tuple(zip(offsets, map(len, params))),
++            tuple(grid),
++            tuple(block),
++            smem,
++            tuple(values),
++            roots,
++            fields=tuple(places),
++            pointers=frozenset(i for i, p in enumerate(is_pointer) if p),
++            images=tuple(params),
++            generator=self.generator,
++            cpu_scalars=scalars,
++        )
+ 
+     def _check_as_strided(self, root: _Root, v: torch.Tensor) -> None:
+         # eager's setStrided checks (checkAsStridedArgs, checkInBoundsForStorage),
+@@ -1975,12 +1865,6 @@
+     return host(x, dim or [], keepdim)
+ 
+ 
+-def _add(a: torch.Tensor, b: torch.Tensor, alpha: Any) -> Any:
+-    if type(alpha) not in (int, float):
+-        raise NotImplementedError("an add of a non-number alpha")
+-    return torch._C._cuda_hostTraceAdd(a, b, alpha)
+-
+-
+ def _std_var(x: torch.Tensor, dim: list[int] | None, correction: Any, keepdim: bool, take_sqrt: bool) -> Any:
+     correction = 1 if correction is None else correction
+     if type(correction) not in (int, float):
+@@ -2080,122 +1964,42 @@
+     return args.lgamma_().sum(-1).add_(float(p * (p - 1)) * math.log(math.pi) * 0.25)
+ 
+ 
+-def _to_copy(x: torch.Tensor, dtype: Any, layout: Any, device: Any, pin_memory: Any, non_blocking: bool, memory_format: Any) -> Any:
+-    if layout not in (None, torch.strided) or device not in (None, x.device) or pin_memory:
+-        raise NotImplementedError("a _to_copy to another layout or device, or pinned")
+-    return torch._C._cuda_hostTraceToCopy(x, x.dtype if dtype is None else dtype, memory_format or torch.preserve_format)
+-
+-
+-# fill_, untagged in ATen: a FillFunctor gpu_kernel, which writes self and reads
+-# no tensor; fill is empty_like and fill_
+-_NULLARY = (aten.fill_, aten.fill)
+-
+-
+-# ops ATen tags no pointwise whose CUDA host is one TensorIterator kernel over
+-# their tensors (copy_'s, or its memcpy) and which take no integer
+-_UNTAGGED_ELEMENTWISE = frozenset(
+-    {
+-        aten.copy_,
+-        aten.floor_divide,
+-        aten.floor_divide_,
+-        aten.complex,
+-        aten.polar,
+-        aten.zero_,
+-        aten.hardswish,
+-        aten.hardswish_,
+-        aten.hardswish_backward,
+-        aten.hardtanh_backward,
+-        aten.log_sigmoid_forward,
+-        aten.log_sigmoid_backward,
+-        aten.mish_backward,
+-        aten._prelu_kernel,
+-        aten.elu_backward,
+-        aten.leaky_relu_backward,
+-        aten.softplus_backward,
+-        aten.hardshrink_backward,
+-        aten.softshrink_backward,
+-        aten.hardsigmoid_backward,
+-    }
+-)
+-
+-
+-def _witness_takes(func: OpOverload) -> bool:
+-    # the pointwise witness decides at the hints whatever the op's host decides
+-    # on its sizes and its integers (as_strided_copy's strides, narrow_copy's
+-    # start, a pad of 0), so it takes only an op whose host decides nothing but
+-    # its TensorIterator's. Another traces its body or runs eagerly, but where
+-    # it reduces an empty tensor, whose zero size the trace specializes
+-    return _pointwise(func) or func.overloadpacket in _UNTAGGED_ELEMENTWISE
+-
+-
+-@functools.cache
+-def _pointwise(func: OpOverload) -> bool:
+-    # ATen's declaration (native_functions.yaml's pointwise tag) of the op or
+-    # of an overload of it: an elementwise kernel, whose functor holds no
+-    # shape. Which kernel it is the witness shows. An in-place op, often
+-    # untagged, is its functional op's kernel into self
+-    packet = func.overloadpacket
+-    name = func._schema.name.split("::")[1]
+-    packets = [packet, getattr(aten, name[:-1])] if name.endswith("_") and hasattr(aten, name[:-1]) else [packet]
+-    return func.namespace == "aten" and (packet in _NULLARY or any(torch.Tag.pointwise in getattr(p, n).tags for p in packets for n in p.overloads()))
+-
+-
+-def _cpu_scalar_probes(dtype: torch.dtype) -> list[torch.Tensor]:
+-    """The values a pointwise witness runs a CPU buffer of dtype at: the
+-    first the trace's."""
+-    if dtype is torch.bool:
+-        values: list[Any] = [True, False]
+-    elif dtype.is_complex:
+-        values = [0.3 + 0.7j, -2.75 + 1j, 0, 1, -1j, 2, 0.5 - 0.5j]
+-    elif dtype.is_floating_point:
+-        values = [0.3, -2.75, 0.0, 1.0, -1.0, 2.0, 0.5]
+-    elif dtype.is_signed:
+-        values = [3, -3, 5, 0, 1, -1, 2]
+-    else:
+-        values = [3, 5, 0, 1, 2, 7, 200]
+-    with _disable_current_modes():
+-        return [torch.tensor(v, dtype=dtype) for v in values]
+-
+-
+-def _meta_at_hints(func: OpOverload, args: tuple, kwargs: dict) -> Any:
+-    def at_hints(t: _TracedTensor) -> torch.Tensor:
+-        return torch.empty_strided([_hint(n) for n in t.shape], [_hint(n) for n in t._sym_strides], dtype=t.dtype, device="meta")
+-
+-    # a factory's device too: at its own device it would launch, outside the trace
+-    meta = pytree.tree_map_only(torch.device, lambda _: torch.device("meta"), pytree.tree_map_only(_SYM_TYPES, _hint, (args, kwargs)))
+-    with _disable_current_modes():
+-        meta = pytree.tree_map_only(_TracedTensor, at_hints, meta)
+-        return func(*meta[0], **meta[1])
+-
+-
+-def _elementwise(func: OpOverload, args: tuple, kwargs: dict) -> bool:
+-    # an op ATen does not tag pointwise (floor_divide, complex, zero_) whose
+-    # output has its tensors' broadcast shape: the pointwise host's witness
+-    # decides the rest, one TensorIterator kernel per iterator over the op's
+-    # tensors
+-    if func.namespace != "aten" or {torch.Tag.dynamic_output_shape, torch.Tag.data_dependent_output} & set(func.tags):
++# the C++ sites (SymInt::guard_int's __FILE__) of an implicit int read: an
++# int-API use of a symbolic tensor's sizes (their materialization) or of a
++# symbolic Scalar. A guard_int an op's code writes is its own, deliberate
++# guard (an instantiation's or a loop count's choice), not reported
++_IMPLICIT_INT_READS = ("SymbolicShapeMeta.cpp", "Scalar.h")
++
++
++def _note_int_read(site: str) -> None:
++    # _host_trace_ir's INT_READ: C++ code (SymInt::guard_int) read a symbolic
++    # value as an int at site; with the first ATen frame above it
++    if site.split(":")[0] not in _IMPLICIT_INT_READS:
++        return
++    if (tr := current_trace()) is not None and tr.in_op:
++        if (bt := getattr(torch._C, "_cuda_hostTraceBacktrace", None)) is not None:
++            frames = [f for f in bt(1, 24).splitlines() if " at::" in f and "c10::" not in f.split(" at::")[0]]
++            if frames:
++                site = f"{site} < {frames[0].split(': ', 1)[-1].split(' + 0x')[0].strip()}"
++        tr.int_reads.append(site)
++
++
++_ir.INT_READ = _note_int_read
++
++
++def _same_start(a: torch.Tensor, b: torch.Tensor) -> bool:
++    # copy_impl's same-data test (torch/csrc/cuda/host_trace/Aten.cpp): one
++    # root and one offset; distinct roots are distinct allocations (arguments
++    # that overlap are a replay check)
++    if not (isinstance(a, _TracedTensor) and isinstance(b, _TracedTensor)):
+         return False
+-    if not func._schema.returns or not all(isinstance(r.type, torch.TensorType) for r in func._schema.returns):
+-        return False
+-    # at the hints; the pointwise host guards its broadcast
+-    try:
+-        rets = pytree.tree_leaves(_meta_at_hints(func, args, kwargs))
+-    except Exception:
+-        return False
+-    if not rets or not all(isinstance(r, torch.Tensor) for r in rets):
+-        return False
+-    shapes = [[_hint(n) for n in a.shape] for a in pytree.tree_leaves((args, kwargs)) if isinstance(a, torch.Tensor)]
+-    out = list(rets[0].shape)
++    return a._root is b._root and bool(a._sym_offset == b._sym_offset)
+ 
+-    def fits(s: list) -> bool:
+-        return len(s) <= len(out) and all(n in (m, 1) for n, m in zip(reversed(s), reversed(out)))
+ 
+-    # an empty operand that does not broadcast to the output is in none of its iterators (an unused buffer)
+-    shapes = [s for s in shapes if all(s) or fits(s)]
+-    if not all(fits(s) for s in shapes):
+-        return False
+-    # each output size is an operand's, but a factory's (full): the witness decides
+-    return not shapes or all(m == 1 or any(len(s) >= d and s[-d] == m for s in shapes) for d, m in enumerate(reversed(out), 1))
++def _symbolic_resize(t: torch.Tensor, sizes: list, strides: list) -> bool:
++    # at::impl::symbolic_resize's hook (torch/csrc/cuda/host_trace/Aten.cpp)
++    tr = current_trace()
++    return tr is not None and tr.resize_fresh(t, sizes, strides)
+ 
+ 
+ @functools.cache
+@@ -2238,21 +2042,6 @@
+ 
+ # an op's traced host (torch._C._cuda_hostTrace*) on its schema-ordered args
+ _TRACED_ATEN: dict[OpOverload, Callable[..., Any]] = {
+-    aten.mul.Tensor: lambda a, b: torch._C._cuda_hostTraceMul(a, b),
+-    aten.add.Tensor: _add,
+-    aten.silu.default: lambda a: torch._C._cuda_hostTraceSilu(a),
+-    aten.gelu.default: lambda a, approximate: torch._C._cuda_hostTraceGelu(a, approximate),
+-    aten.rsqrt.default: lambda a: torch._C._cuda_hostTraceRsqrt(a),
+-    aten.where.self: lambda cond, a, b: torch._C._cuda_hostTraceWhere(cond, a, b),
+-    aten.copy_.default: lambda dst, src, non_blocking: torch._C._cuda_hostTraceCopy_(dst, src),
+-    aten._to_copy.default: _to_copy,
+-    aten.clone.default: lambda x, memory_format: torch._C._cuda_hostTraceToCopy(x, x.dtype, memory_format or torch.preserve_format),
+-    aten.sum.default: lambda x, dtype: _reduce(torch._C._cuda_hostTraceSum, x, [], False, dtype),
+-    aten.sum.dim_IntList: lambda x, dim, keepdim, dtype: _reduce(torch._C._cuda_hostTraceSum, x, dim, keepdim, dtype),
+-    aten.mean.default: lambda x, dtype: _reduce(torch._C._cuda_hostTraceMean, x, [], False, dtype),
+-    aten.mean.dim: lambda x, dim, keepdim, dtype: _reduce(torch._C._cuda_hostTraceMean, x, dim, keepdim, dtype),
+-    aten.amax.default: lambda x, dim, keepdim: _reduce(torch._C._cuda_hostTraceAmax, x, dim, keepdim),
+-    aten.amin.default: lambda x, dim, keepdim: _reduce(torch._C._cuda_hostTraceAmin, x, dim, keepdim),
+     aten.max.default: lambda x: torch._C._cuda_hostTraceMaxAll(x, None),
+     aten.min.default: lambda x: torch._C._cuda_hostTraceMinAll(x, None),
+     aten.max.unary_out: lambda x, out: torch._C._cuda_hostTraceMaxAll(x, out),
+@@ -2283,6 +2072,9 @@
+ # CompositeExplicitAutograd empty and zero_, of symbolic sizes too
+ _ZEROS = {aten.zeros.default, aten.zeros_like.default}
+ # int-signature bodies of symbolic sizes, as the factory they call
++# a composite body's int-signature wrapper refused a symbolic size
++_INT_BODY = object()
++
+ _NEW_FACTORIES = {aten.new_full.default: torch.full, aten.new_zeros.default: torch.zeros, aten.new_ones.default: torch.ones}
+ 
+ 
+@@ -2421,6 +2213,75 @@
+     return _guard_each(_dense_terms(list(t.shape), t._sym_strides))
+ 
+ 
++class _HostBufferStandIn(torch.Tensor):
++    """A host buffer (a 0-dim CPU tensor the trace's host steps write) as an
++    op's own CUDA host code sees it (_traced_redispatch): its dtype and
++    device, no value; its storage raises on a read."""
++
++    # pyrefly: ignore [bad-override]
++    __torch_function__ = torch._C._disabled_torch_function_impl
++
++    @staticmethod
++    def __new__(cls, buffer: torch.Tensor):
++        t = torch.Tensor._make_wrapper_subclass(cls, (), (), dtype=buffer.dtype, device=buffer.device)
++        torch._C._cuda_hostTraceSeal(t, True)
++        return t
++
++    @classmethod
++    def __torch_dispatch__(cls, func: Any, types: Any, args: tuple = (), kwargs: dict | None = None) -> Any:
++        raise declined(f"{func} of a host buffer's stand-in: its value is each replay's")
++
++
++class _SymNumberStandIn(torch.Tensor):
++    """A symbolic number (a SymInt) where an op's schema takes a Tensor, as
++    an op's own CUDA host code sees it (_traced_redispatch): a wrapped 0-dim
++    int64 CPU tensor, as eager's arg parser passes a number, of no value (its
++    storage raises on a read). A functor member the host code marks from it
++    (host_scalar_member) is the number at each replay."""
++
++    # pyrefly: ignore [bad-override]
++    __torch_function__ = torch._C._disabled_torch_function_impl
++
++    @staticmethod
++    def __new__(cls, value: torch.SymInt):
++        t = torch.Tensor._make_wrapper_subclass(cls, (), (), dtype=torch.int64, device="cpu")
++        # a wrapped number crossing into Python is this (torch::jit::toPyObject)
++        t._wrapped_number = value
++        torch._C._cuda_hostTraceSeal(t, True)
++        torch._C._cuda_hostTraceWrapNumber(t)
++        return t
++
++    @classmethod
++    def __torch_dispatch__(cls, func: Any, types: Any, args: tuple = (), kwargs: dict | None = None) -> Any:
++        raise declined(f"{func} of a symbolic number's stand-in: its value is each replay's")
++
++
++@dataclass(frozen=True)
++class _SymNumber:
++    value: torch.SymInt
++
++
++# ScalarTypes (c10 ScalarType order) a symbolic number fills a functor member
++# of: its width, and the member's bits from the number
++_SYM_NUMBER_MEMBERS: dict[int, tuple[int, Callable[[Any], Any]]] = {
++    0: (1, lambda v: v),  # Byte
++    1: (1, lambda v: v),  # Char
++    3: (4, lambda v: v),  # Int
++    4: (8, lambda v: v),  # Long
++    6: (4, lambda v: torch.cuda._host_trace.f32_div(v, 1)),  # Float: static_cast<float>(v)
++}
++
++
++def _sym_number_field(p: int, at: int, cls: str, value: torch.SymInt) -> tuple[tuple[int, int, int], Any]:
++    # a functor member of class cls (LaunchLayout.h: 'A' + its ScalarType;
++    # '0' + it for a reciprocal) holding the symbolic number
++    member = _SYM_NUMBER_MEMBERS.get(ord(cls) - ord("A"))
++    if member is None:
++        raise declined(f"a symbolic number in a functor member of class {cls!r}, which no program row fills")
++    width, bits = member
++    return (p, at, width), bits(value)
++
++
+ class _TracedTensor(torch.Tensor):
+     """A tensor the host sees during a trace: symbolic sizes, strides and
+     storage offset, no storage; its address is its root's symbol plus the
+@@ -2456,8 +2317,12 @@
+         t._root = root
+         t._sym_strides = list(strides)
+         t._sym_offset = offset
+-        if (tr := current_trace()) is not None and tr.tensors is not None:
+-            tr.tensors.add(t)
++        if (tr := current_trace()) is not None:
++            if tr.tensors is not None:
++                tr.tensors.add(t)
++            if tr.sealed is not None:
++                torch._C._cuda_hostTraceSeal(t, True)
++                tr.sealed.append(t)
+         return t
+ 
+     def __repr__(self, *, tensor_contents=None) -> str:
+@@ -2536,6 +2401,8 @@
+             raise tr.decline(f"{func} on a thread other than the trace's")
+         if func is aten.is_non_overlapping_and_dense.default:
+             return _is_non_overlapping_and_dense(args[0])
++        if (accessor := _INT_READS.get(func)) is not None:
++            tr.int_read(accessor, args[0])
+         if tr.depth:
+             return self._dispatch(func, args, kwargs)
+         tr.depth += 1
+@@ -3239,6 +3106,7 @@
+         sets = tr.shape_env.owner_sets
+         self.owner_sets = None if sets is None else [frozenset(o) for o in sets]
+         self.ops = tr.ops
++        self.unconverted = tuple(tr.unconverted)
+         for op, guards in zip(self.ops, _owned(self.owners, self.owner_sets, len(self.ops))):
+             op.guards = tuple(guards)
+         _hint_audit.freeze(env, self.guard_count)

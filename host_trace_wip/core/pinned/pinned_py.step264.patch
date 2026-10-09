@@ -1,0 +1,412 @@
+--- a/torch/cuda/_host_trace_capture.py
++++ b/torch/cuda/_host_trace_capture.py
+@@ -51,6 +51,7 @@
+     _EAGER_TAG,
+     _gc_hold,
+     CallValues,
++    MEMCPY_KINDS,
+     private_stream,
+ )
+ from torch.cuda._utils import _check_cuda_bindings
+@@ -296,11 +297,12 @@
+ 
+ @dataclass(frozen=True)
+ class MemcpyNode:
+-    """A 1D device-to-device memcpy node."""
++    """A 1D memcpy node between device memory or pinned host memory."""
+ 
+     dst: int
+     src: int
+     nbytes: int
++    kind: str = "D2D"  # as Memcpy.kind
+ 
+ 
+ def graph_node_handles(raw: int) -> list[int]:
+@@ -410,11 +412,14 @@
+     from cuda.bindings import driver
+ 
+     p = _check_cuda_bindings(driver.cuGraphMemcpyNodeGetParams(node))
+-    device = driver.CUmemorytype.CU_MEMORYTYPE_DEVICE
+-    plain = (p.srcMemoryType, p.dstMemoryType, p.Height, p.Depth, p.srcXInBytes, p.dstXInBytes, p.srcY, p.dstY, p.srcZ, p.dstZ)
+-    if plain != (device, device, 1, 1, 0, 0, 0, 0, 0, 0):
+-        raise ValueError("a memcpy node other than a 1D device-to-device one")
+-    return MemcpyNode(int(p.dstDevice), int(p.srcDevice), p.WidthInBytes)
++    device, host = driver.CUmemorytype.CU_MEMORYTYPE_DEVICE, driver.CUmemorytype.CU_MEMORYTYPE_HOST
++    kinds = {(device, device): "D2D", (host, device): "H2D", (device, host): "D2H"}
++    kind = kinds.get((p.srcMemoryType, p.dstMemoryType))
++    if kind is None or (p.Height, p.Depth, p.srcXInBytes, p.dstXInBytes, p.srcY, p.dstY, p.srcZ, p.dstZ) != (1, 1, 0, 0, 0, 0, 0, 0):
++        raise ValueError("a memcpy node other than a 1D one between device memory or pinned host memory")
++    dst = int(p.dstHost if kind == "D2H" else p.dstDevice)
++    src = int(p.srcHost if kind == "H2D" else p.srcDevice)
++    return MemcpyNode(dst, src, p.WidthInBytes, kind)
+ 
+ 
+ def capture_kernel_nodes(
+@@ -581,14 +586,14 @@
+     values: Sequence[int],
+     bases: Sequence[int],
+     stream: int,
+-    copy_at: tuple[int, int],
++    copy_at: dict[str, tuple[int, int]],
+     nodes: list[int],
+ ) -> tuple[list[int], list[LoweredLaunch | LoweredMemset | LoweredMemcpy], tuple[torch.Generator, int, int] | None]:
+     """Launch the kernels, memsets and memcpys into the capture on `stream`; each
+     one's node (into `nodes`, so a failure is at the launch after them), the
+     launches as captured: an RNG kernel's images hold
+     the capture's generator state, and that state as CapturedSegment.rng. A
+-    memcpy copies between `copy_at` (dst, src; _copy_operands)."""
++    memcpy copies between `copy_at` of its kind (dst, src; _copy_operands)."""
+     from cuda.bindings import driver, runtime
+ 
+     captured: list[LoweredLaunch | LoweredMemset | LoweredMemcpy] = []
+@@ -605,8 +610,8 @@
+             _one_node(stream, nodes, f"memset {m.name}")
+             continue
+         if isinstance(lo, LoweredMemcpy):
+-            d2d = runtime.cudaMemcpyKind.cudaMemcpyDeviceToDevice
+-            _check_cuda_bindings(runtime.cudaMemcpyAsync(*copy_at, values[lo.nbytes], d2d, stream))
++            kind = runtime.cudaMemcpyKind(MEMCPY_KINDS[lo.launch.kind])
++            _check_cuda_bindings(runtime.cudaMemcpyAsync(*copy_at[lo.launch.kind], values[lo.nbytes], kind, stream))
+             _one_node(stream, nodes, f"memcpy {lo.launch.name}")
+             continue
+         t = lo.launch
+@@ -643,7 +648,7 @@
+     launches: Sequence[LoweredLaunch | LoweredMemset | LoweredMemcpy],
+     values: Sequence[int],
+     bases: Sequence[int],
+-    copy_at: tuple[int, int],
++    copy_at: dict[str, tuple[int, int]],
+ ) -> None:
+     """The graph holds exactly `nodes`, the i-th launch's kernel, memset or
+     memcpy node."""
+@@ -671,7 +676,8 @@
+             if kind != driver.CUgraphNodeType.CU_GRAPH_NODE_TYPE_MEMCPY:
+                 raise declined(f"memcpy {lo.launch.name} captured a {kind.name} node")
+             try:
+-                if _memcpy_node(node) != MemcpyNode(*copy_at, values[lo.nbytes]):
++                kind = lo.launch.kind
++                if _memcpy_node(node) != MemcpyNode(*copy_at[kind], values[lo.nbytes], kind):
+                     raise ValueError("other parameters")
+             except ValueError:
+                 raise declined(f"the captured node of memcpy {lo.launch.name} has other parameters") from None
+@@ -704,13 +710,15 @@
+                 raise declined(f"{where} holds other bytes in slot {i}")
+ 
+ 
+-def _copy_operands(device: torch.device, nbytes: int) -> torch.Tensor:
++def _copy_operands(device: torch.device, nbytes: int, host: bool) -> tuple[torch.Tensor, torch.Tensor | None]:
+     """What a captured memcpy node copies between: a memcpy node keeps its
+     capture's kind of memory (cudaMalloc'd or cuMemMap'd, as expandable
+-    segments are), and a replay can only set it to operands of that kind, so
+-    the capture copies within an allocation of the caching allocator's. The
++    segments are; pinned host memory), and a replay can only set it to
++    operands of that kind, so the capture copies within an allocation of the
++    caching allocator's, or between it and the pinned host allocator's. The
+     capture runs no node, and the first replay sets every memcpy."""
+-    return torch.empty(2 * nbytes, dtype=torch.uint8, device=device)
++    pinned = torch.empty(nbytes, dtype=torch.uint8, pin_memory=True) if host else None
++    return torch.empty(2 * nbytes, dtype=torch.uint8, device=device), pinned
+ 
+ 
+ def _segment(
+@@ -729,8 +737,14 @@
+     # the largest memcpy's span, so both operands lie inside the allocation
+     sizes = [values[lo.nbytes] for lo in launches if isinstance(lo, LoweredMemcpy)]
+     span = -(-max([1, *sizes]) // _ALLOC_ALIGNMENT) * _ALLOC_ALIGNMENT
+-    copies = _copy_operands(stream.device, span) if sizes else None
+-    copy_at = (0, 0) if copies is None else (copies.data_ptr(), copies.data_ptr() + span)
++    host = any(isinstance(lo, LoweredMemcpy) and lo.launch.kind != "D2D" for lo in launches)
++    copies, pinned = _copy_operands(stream.device, span, host) if sizes else (None, None)
++    copy_at = {}
++    if copies is not None:
++        d = copies.data_ptr()
++        copy_at["D2D"] = (d, d + span)
++    if pinned is not None:
++        copy_at["H2D"], copy_at["D2H"] = (d, pinned.data_ptr()), (pinned.data_ptr(), d)
+     # relaxed, unlike the trace's thread-local capture (a detector there):
+     # the tape, not the capture, decides what is replayed, and a thread-local
+     # capture is invalidated by other threads' allocations
+@@ -841,6 +855,34 @@
+     return list(nodes[:count]), list(edges[:count])
+ 
+ 
++def _live_memcpy_operands(graph: int) -> list[torch.Tensor]:
++    """Points each memcpy node of the graph at live memory of its operands'
++    kinds (device or pinned host) and returns that scratch, which must outlive
++    the graph's instantiation: a node still holds its capture's operands
++    (_copy_operands), freed since, and the driver reads a memcpy node's
++    pointers when it instantiates the graph (a freed pinned block crashes it).
++    A replay sets every memcpy before each launch, as for the capture's exec."""
++    from cuda.bindings import driver
++
++    memcpy_t, host = driver.CUgraphNodeType.CU_GRAPH_NODE_TYPE_MEMCPY, driver.CUmemorytype.CU_MEMORYTYPE_HOST
++    nodes = [(n, _check_cuda_bindings(driver.cuGraphMemcpyNodeGetParams(n))) for n in graph_node_handles(graph) if _check_cuda_bindings(driver.cuGraphNodeGetType(n)) == memcpy_t]
++    if not nodes:
++        return []
++    span = -(-max(p.WidthInBytes for _, p in nodes) // _ALLOC_ALIGNMENT) * _ALLOC_ALIGNMENT
++    device, pinned = _copy_operands(torch.device("cuda", torch.cuda.current_device()), span, any(host in (p.srcMemoryType, p.dstMemoryType) for _, p in nodes))
++    for n, p in nodes:
++        if p.dstMemoryType == host:
++            p.dstHost = pinned.data_ptr()
++        else:
++            p.dstDevice = device.data_ptr()
++        if p.srcMemoryType == host:
++            p.srcHost = pinned.data_ptr()
++        else:
++            p.srcDevice = device.data_ptr() + span
++        _check_cuda_bindings(driver.cuGraphMemcpyNodeSetParams(n, p))
++    return [device] if pinned is None else [device, pinned]
++
++
+ def instantiate_form(
+     graph: int,
+     attributes: Sequence[tuple[int, dict[Any, Any], tuple[int, int, int]]],
+@@ -858,6 +900,7 @@
+ 
+     clone = _check_cuda_bindings(driver.cuGraphClone(graph))
+     try:
++        scratch = _live_memcpy_operands(clone)
+         replaced = [n for nodes, _ in pieces for n in nodes]
+         found = {n: _check_cuda_bindings(driver.cuGraphNodeFindInClone(n, clone)) for n in (*(n for n, *_ in attributes), *replaced)}
+         cluster = driver.CUlaunchAttributeID.CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION
+@@ -911,4 +954,5 @@
+         _check_cuda_bindings(driver.cuGraphDestroy(clone))
+         raise
+     _check_cuda_bindings(driver.cuGraphUpload(exec_, torch.cuda.current_stream().cuda_stream))
++    del scratch  # the exec's memcpy nodes are set at each replay before they run
+     return int(exec_), int(clone), [[(kind, int(node)) for kind, node in p] for p in placed]
+--- a/torch/cuda/_host_trace_lower_tape.py
++++ b/torch/cuda/_host_trace_lower_tape.py
+@@ -381,6 +381,8 @@
+                 f"the pointer {expr} of Triton kernel {launch.name} is not one root plus an offset"
+             )
+         root, displacement = found[0]
++        if root.host and not isinstance(launch, Memcpy):
++            raise declined(f"{launch.name} points at a pinned host argument")
+         ref = self.roots[id(root)]
+         address = lowering.lower(expr) if ref[0] == "argument" else None
+         base = self.base(ref)
+@@ -866,6 +868,8 @@
+                     same = same and (x.function == y.function or compiled_cluster(x.function) == compiled_cluster(y.function))
+                 elif same and isinstance(x, Memset):
+                     same = x.element_size == y.element_size and rename(x.height) == key(y.height)
++                elif same and isinstance(x, Memcpy):
++                    same = x.kind == y.kind
+                 if not same:
+                     raise FoldRefused(f"another launch topology in {a.func}")
+ 
+--- a/torch/cuda/_host_trace_native.py
++++ b/torch/cuda/_host_trace_native.py
+@@ -22,7 +22,8 @@
+    delta), ...), philox increment, CPU scalars)
+   (1, node, dst (row, base, delta), value, element size, width row, height
+    row, pitch row)
+-  (2, node, dst (row, base, delta), src (row, base, delta), bytes row)
++  (2, node, dst (row, base, delta), src (row, base, delta), bytes row,
++   cudaMemcpyKind, the pinned host argument's position or -1)
+ A field, dst or src with base -1 is its row's value plus delta; otherwise the
+ base's address plus the row's and delta. A 4-byte pointer field is the
+ address's low half; a 0-byte field only feeds a descriptor. A philox
+@@ -50,7 +51,7 @@
+     PredictedOutput,
+     ScalarSlot,
+ )
+-from torch.cuda._host_trace_tape import HOST_SEED_OFFSET
++from torch.cuda._host_trace_tape import HOST_SEED_OFFSET, MEMCPY_KINDS
+ 
+ 
+ if TYPE_CHECKING:
+@@ -189,7 +190,9 @@
+         m = lo.launch
+         return (1, _source(lo.slots[0]), m.value, m.element_size, lo.width, lo.height, lo.pitch)
+     if isinstance(lo, LoweredMemcpy):
+-        return (2, *map(_source, lo.slots), lo.nbytes)
++        kind = lo.launch.kind
++        host = -1 if kind == "D2D" else lo.slots[kind == "H2D"].root[1]
++        return (2, *map(_source, lo.slots), lo.nbytes, MEMCPY_KINDS[kind], host)
+     t = lo.launch
+     fields = []
+     for i, slot in enumerate(lo.slots):
+--- a/torch/cuda/_host_trace_redispatch.py
++++ b/torch/cuda/_host_trace_redispatch.py
+@@ -191,7 +191,7 @@
+                     (q,) = _sym_expr(r.sym).free_symbols
+                     mapping[_sym_expr(fq)] = q
+                 sym = _ALLOC_ALIGNMENT * fq
+-            roots[id(r)] = _Root(r.name, sym, r.kind, r.index)
++            roots[id(r)] = _Root(r.name, sym, r.kind, r.index, r.host)
+             back[id(roots[id(r)])] = r
+             if r.kind == "argument":
+                 # the input's record, as trace() has it: an as_strided bound, an overlap, copy-on-write
+--- a/torch/cuda/_host_trace_tape.py
++++ b/torch/cuda/_host_trace_tape.py
+@@ -84,6 +84,8 @@
+     sym: Any  # the base address: an input's symbol, 256*q otherwise
+     kind: Literal["argument", "allocation", "eager"] = "argument"
+     index: int = -1  # k of allocation k or eager output k: its placeholder (_placeholder)
++    # a pinned CPU argument's storage, which only a memcpy node reads or writes
++    host: bool = False
+ 
+ 
+ def _placeholder(root: _Root) -> int:
+@@ -251,12 +253,18 @@
+ 
+ @dataclass(frozen=True)
+ class Memcpy:
+-    """A 1D device-to-device memcpy node of `nbytes` from slots[1] to slots[0]."""
++    """A 1D memcpy node of `nbytes` from slots[1] to slots[0]: device to device,
++    or between the device and a pinned host argument ("H2D", "D2H")."""
+ 
+     name: str
+     slots: tuple[Any, Any]  # dst, src
+     roots: tuple[_Root, ...]  # the roots the slots may be of
+     nbytes: Any
++    kind: Literal["D2D", "H2D", "D2H"] = "D2D"
++
++
++# each Memcpy kind's cudaMemcpyKind: a node's parameters can only be set with its capture's
++MEMCPY_KINDS = {"H2D": 1, "D2H": 2, "D2D": 3}
+ 
+ 
+ _active = _ir.ACTIVE
+@@ -430,7 +438,7 @@
+         # const_data_ptr leaves a copy-on-write input lazy
+         base = t.const_data_ptr() - t.storage_offset() * t.element_size()  # type: ignore[attr-defined]
+         sym = env.symbol(_PLACEHOLDER_TAG | (base & _PLACEHOLDER_LOW), f"{name}.base")
+-        root = _Root(f"p{position}", sym)
++        root = _Root(f"p{position}", sym, host=t.device != self.device)
+         first = t.const_data_ptr()  # type: ignore[attr-defined]
+         last = first + (sum((n - 1) * s for n, s in zip(t.shape, t.stride())) + 1) * t.element_size() - 1 if t.numel() else first - 1
+         rec = _InputRec(position, name, t.dtype, *layout, root, (first, last), torch._C._is_cow_tensor(t))
+@@ -579,7 +587,7 @@
+         """Record t.zero_() of a non-overlapping and dense tensor on the
+         trace's stream as a Memset of its bytes (nothing if it is empty);
+         otherwise it is an op like another."""
+-        if not isinstance(t, _TracedTensor) or self.stream is None:
++        if not isinstance(t, _TracedTensor) or t._root.host or self.stream is None:
+             return False
+         if torch.cuda.current_stream(self.device) != self.stream:
+             return False
+@@ -715,6 +723,50 @@
+         run = functools.partial(self._eager_call, func, args, kwargs)
+         return self.op(func, args, kwargs, run, redo=lambda a, k: current_trace().eager_call(func, a, k))
+ 
++    def _host_copy(self, func: OpOverload, args: tuple, kwargs: dict) -> Any:
++        """copy_ between a pinned host argument and a tensor on the device as a
++        memcpy node, which reads or writes the host buffer when it runs, as
++        eager's non_blocking cudaMemcpyAsync does; _to_copy of a pinned host
++        argument to the device: its allocation and that copy_."""
++        if func is aten._to_copy.default:
++            src, (dtype, layout, device, pin, non_blocking, mf) = args[0], (kwargs.get(k) for k in _TO_COPY_KWARGS)
++            dev = torch.device(device) if device is not None else None
++            if dev is None or dev.type != self.device.type or dev.index not in (None, self.device.index) or dtype not in (None, src.dtype):
++                raise self.decline(f"{func} of a pinned host argument other than to the trace's device")
++            if layout not in (None, torch.strided) or pin or mf not in (None, torch.preserve_format, torch.contiguous_format):
++                raise self.decline(f"{func} of a pinned host argument to another layout")
++            out = self.allocate(aten.empty.memory_format, (list(src.shape),), {"dtype": src.dtype, "device": self.device})
++            return self._host_copy(aten.copy_.default, (out, src, bool(non_blocking)), {})
++        if func is not aten.copy_.default:
++            raise self.decline(f"{func} of a pinned host argument; only its copy_ to or from the device is traced")
++        dst, src = args[:2]
++        non_blocking = args[2] if len(args) > 2 else kwargs.get("non_blocking", False)
++        h2d = isinstance(src, _TracedTensor) and src._root.host
++        dev = dst if h2d else src
++        if not isinstance(dev, _TracedTensor) or dev._root.host or dev.device != self.device:
++            raise self.decline(f"{func} between a pinned host argument and a tensor not on the trace's device")
++        if not non_blocking:
++            # eager synchronizes: the host may reuse or read the buffer once copy_ returns
++            raise self.decline(f"a blocking {func} to or from a pinned host argument")
++        self.check_stream(str(func))
++        if dst.dtype != src.dtype or any(t.is_neg() or t.is_conj() for t in (dst, src)):
++            raise self.decline(f"{func} of a pinned host argument across dtypes or neg/conj bits")
++        if dst.dim() != src.dim() or not _guard_each([a == b for a, b in zip(dst.shape, src.shape)]):
++            raise self.decline(f"{func} of a pinned host argument that broadcasts")
++        if bool(dst.numel() == 0):
++            return dst
++        for t in (dst, src):
++            # copy_kernel_cuda's cudaMemcpyAsync; it copies other layouts through temporaries
++            terms, require = [], 1
++            for n, stride in reversed(list(zip(t.shape, t._sym_strides))):
++                terms.append((n == 1) | (stride == require))
++                require = require * n
++            if not _guard_each(terms):
++                raise self.decline(f"{func} of a pinned host argument and a tensor that are not both contiguous")
++        nbytes = dst.numel() * dst.element_size()
++        self.record_launch(Memcpy(str(func), (dst.data_ptr(), src.data_ptr()), (dst._root, src._root), nbytes, "H2D" if h2d else "D2H"))
++        return dst
++
+     def jiterator(self, code: str, name: str, return_by_ref: bool, num_outputs: int, tensors: tuple, kwargs: dict | None = None) -> Any:
+         """A user jiterator's launch (torch.cuda.jiterator), which no operator
+         dispatches: its pointwise host, of the witness launch at stand-ins."""
+@@ -777,6 +829,8 @@
+             raise self.decline(f"{func} is not an operator")
+         if func is aten._local_scalar_dense.default:
+             raise self.decline(f"{func} reads a traced tensor's value on the host")
++        if any(isinstance(a, _TracedTensor) and a._root.host for a in pytree.tree_leaves((args, kwargs))):
++            return self._host_copy(func, args, kwargs)
+         if func in _SDPA_OPS:
+             q, k, v = args[:3]
+             # the shapes the kernels assume and their metas do not check (cuDNN
+@@ -2240,6 +2294,9 @@
+     return args.lgamma_().sum(-1).add_(float(p * (p - 1)) * math.log(math.pi) * 0.25)
+ 
+ 
++_TO_COPY_KWARGS = ("dtype", "layout", "device", "pin_memory", "non_blocking", "memory_format")
++
++
+ def _to_copy(x: torch.Tensor, dtype: Any, layout: Any, device: Any, pin_memory: Any, non_blocking: bool, memory_format: Any) -> Any:
+     if layout not in (None, torch.strided) or device not in (None, x.device) or pin_memory:
+         raise NotImplementedError("a _to_copy to another layout or device, or pinned")
+@@ -2846,6 +2903,8 @@
+             )
+         if t.requires_grad:
+             raise declined(f"output {k} requires grad; a replay's outputs do not")
++        if t._root.host and identities.get(id(t)) is None:
++            raise declined(f"output {k} is a view of a pinned host argument")
+         records.append(
+             _OutputRec(
+                 f"out{k}",
+@@ -3273,7 +3332,8 @@
+             )
+     if not positions:
+         raise declined("the call has no tensor arguments")
+-    device = args[positions[0]].device
++    cuda = next((args[i].device for i in positions if args[i].is_cuda), None)
++    device = cuda or args[positions[0]].device
+     exact = (torch.Tensor,) if trusted is None else (torch.Tensor, torch.nn.Parameter)
+     for i in positions:
+         a = args[i]
+@@ -3283,9 +3343,11 @@
+             raise declined(
+                 f"arg{i} is a {type(a).__name__}; only torch.Tensor arguments are traced"
+             )
+-        if not a.is_cuda or a.device != device:
++        # a pinned CPU tensor, a memcpy's host side; a pageable one's copy_ is synchronous
++        pinned = cuda is not None and trusted is None and a.device.type == "cpu" and a.is_pinned()
++        if not (a.is_cuda and a.device == device) and not pinned:
+             raise declined(
+-                f"arg{i} is on {a.device}; only CUDA tensors on one device are traced"
++                f"arg{i} is on {a.device}; only CUDA tensors on one device and pinned CPU tensors are traced"
+             )
+         if a.is_neg() or a.is_conj():
+             raise declined(f"arg{i} is a negative or conjugate view")
+@@ -3430,7 +3492,8 @@
+ 
+ def argument_contract(args: tuple, global_state: bool) -> tuple:
+     """What a call must match before any GPU work, as trace() classifies its
+-    arguments: per tensor its exact type, dtype, device, rank, layout,
++    arguments: per tensor its exact type, dtype, device, whether it is
++    pinned (a CPU tensor), rank, layout,
+     neg/conj and requires_grad bits and whether autograd records it (under
+     grad mode, which trace() declines), per int its kind, every other argument
+     by value; then with `global_state` the global state a replay does not
+@@ -3441,7 +3504,8 @@
+     for a in args:
+         if isinstance(a, torch.Tensor):
+             rg = a.requires_grad
+-            kinds.append((type(a), a.dtype, a.device, a.dim(), a.layout, a.is_neg(), a.is_conj(), rg, rg and grad))
++            pinned = a.device.type == "cpu" and a.is_pinned()
++            kinds.append((type(a), a.dtype, a.device, pinned, a.dim(), a.layout, a.is_neg(), a.is_conj(), rg, rg and grad))
+         elif type(a) is int:
+             kinds.append(int)
+         else:

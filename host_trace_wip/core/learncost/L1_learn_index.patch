@@ -1,0 +1,223 @@
+--- a/torch/csrc/cuda/host_trace/Variant.h
++++ b/torch/csrc/cuda/host_trace/Variant.h
+@@ -386,6 +386,15 @@
+     std::vector<int64_t> rows;
+     std::unordered_map<uint64_t, c10::SmallVector<uint32_t, 1>> index;
+     std::vector<std::unique_ptr<Entry>> entries;
++    // per node, what its entries' kernel rows read, over all of them: the
++    // index of users is rebuilt from these, not from every entry (a table
++    // grows by a row per new key, and the index is rebuilt after each)
++    struct Reads {
++      std::vector<std::pair<int64_t, int64_t>> fields; // (row, base)
++      std::vector<int64_t> dim_rows;
++      bool always = false; // an RNG or CPU-scalar row
++    };
++    std::vector<Reads> reads;
+     std::vector<int64_t> scratch; // its scratch buffers' allocations
+     size_t segment; // its records' (a selector of no records: none)
+   };
+@@ -574,6 +583,8 @@
+   // The selector's row at values, or -1
+   static int64_t select(const Site& s, const int64_t* values);
+   void insert(Site& s, const int64_t* key, int64_t row);
++  // adds the entry's kernel rows' reads to s.reads
++  static void note_reads(Site& s, const Entry& e);
+   KernelRow& kernel_row(Record& r, int64_t row) const;
+   void switch_form_held(Segment& run, size_t form);
+   const KernelRow& kernel_row(const Record& r, int64_t row) const;
+--- a/torch/csrc/cuda/host_trace/Sites.cpp
++++ b/torch/csrc/cuda/host_trace/Sites.cpp
+@@ -571,9 +571,34 @@
+     }
+   }
+   s.predicates.push_back(check_row(predicate));
++  note_reads(s, *e);
+   s.entries.push_back(std::move(e));
+ }
+ 
++void HostTraceVariant::note_reads(Site& s, const Entry& e) {
++  if (s.reads.size() < e.kernels.size()) {
++    s.reads.resize(e.kernels.size());
++  }
++  for (size_t i = 0; i < e.kernels.size(); ++i) {
++    const KernelRow& k = e.kernels[i];
++    Site::Reads& r = s.reads[i];
++    r.always |= k.rng_increment != 0 || !k.rng.empty() || !k.cpu_scalars.empty();
++    for (size_t j = 0; j < k.field_count; ++j) {
++      const std::pair<int64_t, int64_t> f{k.fields[j].row, k.fields[j].base};
++      if (std::find(r.fields.begin(), r.fields.end(), f) == r.fields.end()) {
++        r.fields.push_back(f);
++      }
++    }
++    for (int64_t row : k.dim_rows) {
++      if (!k.constant_dims &&
++          std::find(r.dim_rows.begin(), r.dim_rows.end(), row) ==
++              r.dim_rows.end()) {
++        r.dim_rows.push_back(row);
++      }
++    }
++  }
++}
++
+ void HostTraceVariant::set_program(const HostTraceProgram& program) {
+   TORCH_CHECK_VALUE(
+       program.num_rows() >= program_.num_rows(),
+@@ -657,6 +682,7 @@
+           e->kernels[i], e->image.data(), e->held.data(), e->fields.data());
+     }
+   }
++  note_reads(s, *e);
+   s.entries.push_back(std::move(e));
+   insert(s, key.data(), static_cast<int64_t>(s.entries.size()));
+   if (arm != 0 &&
+--- a/torch/csrc/cuda/host_trace/Patch.cpp
++++ b/torch/csrc/cuda/host_trace/Patch.cpp
+@@ -216,11 +216,11 @@
+   std::vector<std::pair<uint32_t, uint32_t>> bases;
+   std::vector<std::pair<uint32_t, uint32_t>> segment_bases;
+   always_.assign(records_.size(), 0);
+-  auto read = [&](const Field& f, uint32_t i, uint32_t segment) {
+-    rows.emplace_back(f.row, i);
+-    if (f.base >= 0) {
+-      bases.emplace_back(f.base, i);
+-      segment_bases.emplace_back(segment, f.base);
++  auto read = [&](int64_t row, int64_t base, uint32_t i, uint32_t segment) {
++    rows.emplace_back(row, i);
++    if (base >= 0) {
++      bases.emplace_back(base, i);
++      segment_bases.emplace_back(segment, base);
+     }
+   };
+   for (uint32_t g = 0; g < segments_.size(); ++g) {
+@@ -231,26 +231,26 @@
+         always_[i] = 1;
+         continue;
+       }
+-      c10::SmallVector<const KernelRow*, 4> ks{&r.kernel};
+-      if (r.site >= 0) {
+-        for (const auto& e : sites_[r.site].entries) {
+-          if (r.site_pos < e->kernels.size()) {
+-            ks.push_back(&e->kernels[r.site_pos]);
+-          }
+-        }
++      const KernelRow& k = r.kernel;
++      if (k.rng_increment != 0 || !k.rng.empty() || !k.cpu_scalars.empty()) {
++        always_[i] = 1;
+       }
+-      for (const KernelRow* k : ks) {
+-        if (k->rng_increment != 0 || !k->rng.empty() ||
+-            !k->cpu_scalars.empty()) {
+-          always_[i] = 1;
++      for (size_t j = 0; j < k.field_count; ++j) {
++        read(k.fields[j].row, k.fields[j].base, record, g);
++      }
++      if (!k.constant_dims) {
++        for (int64_t row : k.dim_rows) {
++          rows.emplace_back(row, record);
+         }
+-        for (size_t j = 0; j < k->field_count; ++j) {
+-          read(k->fields[j], record, g);
++      }
++      if (r.site >= 0 && r.site_pos < sites_[r.site].reads.size()) {
++        const Site::Reads& e = sites_[r.site].reads[r.site_pos];
++        always_[i] |= e.always;
++        for (const auto& [row, base] : e.fields) {
++          read(row, base, record, g);
+         }
+-        if (!k->constant_dims) {
+-          for (int64_t row : k->dim_rows) {
+-            rows.emplace_back(row, record);
+-          }
++        for (int64_t row : e.dim_rows) {
++          rows.emplace_back(row, record);
+         }
+       }
+     }
+--- a/torch/cuda/_host_trace_opaque.py
++++ b/torch/cuda/_host_trace_opaque.py
+@@ -40,6 +40,7 @@
+ from __future__ import annotations
+ 
+ import contextlib
++import functools
+ from dataclasses import dataclass, field
+ from typing import Any, Protocol, TYPE_CHECKING
+ 
+@@ -167,12 +168,13 @@
+     # binding and each launch recorded from it
+     owner: Any = field(default=None, compare=False, repr=False)
+ 
+-    @property
++    @functools.cached_property
+     def topology(self) -> tuple:
+         """What a graph exec fixes at instantiation: a kernel's launch
+         attributes, programmatic edge and compile-time cluster, a memset's
+         element size, height and, over several rows, width and pitch. One
+-        variant per topology."""
++        variant per topology. Cached: a key's binding is read at each site
++        that takes the key, and a cluster is a driver query per kernel."""
+         from torch.cuda._host_trace_launch import compiled_cluster
+ 
+         nodes: list[tuple] = []
+--- a/torch/cuda/_host_trace_harvest.py
++++ b/torch/cuda/_host_trace_harvest.py
+@@ -307,12 +307,12 @@
+     for x, n in enumerate(nodes):
+         if not isinstance(n, OpaqueKernel):
+             continue
+-        slots = {(s.param, s.offset) for s in n.slots}
++        # the bytes a slot's qword starts at, and 4 either side of it
++        near = {(s.param, s.offset + d) for s in n.slots for d in (-4, 0, 4)}
+         for param, image in enumerate(n.images):
+             for first, hits in ((0, aligned), (4, misaligned)):
+                 for i, q in enumerate(_qwords(image, first)):
+-                    off = first + 8 * i
+-                    if not q >> 32 or stack[0] <= q < stack[1] or any((param, off + d) in slots for d in (-4, 0, 4)):
++                    if not q >> 32 or stack[0] <= q < stack[1] or (param, off := first + 8 * i) in near:
+                         continue
+                     if q not in known:
+                         known[q] = _cuda_address(q)
+@@ -1642,8 +1642,6 @@
+                 dev.pool = None
+         blocks = [c[2] for c in caps]
+         stack = torch._C._cuda_hostTraceStackBounds()
+-        heap = _heap_bounds()
+-        addresses = [[t.data_ptr() for t in sets[w]] + c[3] for w, c in zip((0, 1, 0, 0), caps)]
+         if siblings:
+             binding = adopt(caps[0], siblings, starts[0])
+             del sets
+@@ -1654,6 +1652,8 @@
+                     raise _NoSibling(str(e)) from None
+             return binding
+ 
++        heap = _heap_bounds()
++        addresses = [[t.data_ptr() for t in sets[w]] + c[3] for w, c in zip((0, 1, 0, 0), caps)]
+         philox = [c[4] for c in caps]
+         increment = philox[0][2] if rng else 0
+         if rng and any(p[2] != increment for p in philox):
+--- a/test/test_cuda_host_trace_harvest.py
++++ b/test/test_cuda_host_trace_harvest.py
+@@ -1849,6 +1849,23 @@
+             self.calls(r, (40, 40, 48, 32), w)
+         self.assertEqual((r.traces - traces, r.learned - learned, r.relowers, r.eager), (0, 2, 0 if oob else 1, 1))
+ 
++    def test_many_rows_keep_each_rows_users(self):
++        # each new size adds a row to the GEMM's table, after which the call
++        # indexes which nodes read which rows from the site's reads (not from
++        # every row): early and late rows both replay at fresh operand
++        # addresses, bitwise
++        w = torch.randn(64, 48, device="cuda", dtype=bf16)
++        p = HarvestProvider()
++        r = HostTraceReplay(self.f, opaque=(p,))
++        self.calls(r, (32, 32), w)
++        self.calls(r, range(33, 113), w)
++        learned, traces = r.learned, r.traces
++        self.calls(r, (33, 112, 70, 33, 32), w)
++        self.assertEqual((r.learned - learned, r.traces - traces, r.eager), (0, 0, 1))
++        # a binding's topology is computed once, not per site and arm that reads it
++        b = p.bindings[next(iter(p.bindings))]
++        self.assertIs(b.topology, b.topology)
++
+     def test_prepare_range(self):
+         # every size of a range prepared: a first call at any of them learns
+         # nothing and replays, bitwise equal to eager

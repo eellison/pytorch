@@ -1,0 +1,39 @@
+--- a/torch/csrc/cuda/host_trace/Patch.cpp
++++ b/torch/csrc/cuda/host_trace/Patch.cpp
+@@ -244,8 +244,10 @@
+       const Record& r = records_[i];
+       const auto record = static_cast<uint32_t>(i);
+       if (r.kind != Kind::Kernel) {
+-        // a keyed site's memset takes its row's fields: patched every replay
+-        if (r.site >= 0) {
++        // a keyed site's memset takes its row's fields, and a host memcpy's
++        // pinned block may be another allocation at the same address (freed
++        // and reallocated): patched every replay
++        if (r.site >= 0 || (r.kind == Kind::Memcpy && r.copy.kind != cudaMemcpyDeviceToDevice)) {
+           always_[i] = 1;
+           continue;
+         }
+@@ -498,7 +500,9 @@
+     }
+     if (r.kind == Kind::Memcpy) {
+       const std::array<int64_t, 3> held = memcpy_shape(r.copy, v, bases);
+-      if (r.held && r.held_row == row && held == r.held_copy) {
++      // a device node holds its operands' addresses; a host one is set every
++      // replay (index_users)
++      if (r.held && r.held_row == row && held == r.held_copy && r.copy.kind == cudaMemcpyDeviceToDevice) {
+         return;
+       }
+       r.held = false;
+--- a/torch/csrc/cuda/host_trace/VariantBuild.cpp
++++ b/torch/csrc/cuda/host_trace/VariantBuild.cpp
+@@ -167,7 +167,9 @@
+       continue;
+     }
+     if (r.kind == Kind::Memcpy) {
+-      r.held_copy = memcpy_shape(r.copy, trace_rows.data(), trace_bases.data());
++      // the node holds the capture's operands (_copy_operands), not the traced
++      // call's: a later operand at the traced address must still set it
++      r.held = false;
+       continue;
+     }
+     const KernelRow& k = r.kernel;

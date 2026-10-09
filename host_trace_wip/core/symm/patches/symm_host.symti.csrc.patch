@@ -1,0 +1,977 @@
+--- a/aten/src/ATen/cuda/host_trace/Recorder.h
++++ b/aten/src/ATen/cuda/host_trace/Recorder.h
+@@ -77,6 +77,10 @@
+   // called after each launch is appended (a recorder that hands launches on
+   // as they happen, so an op's nested ops keep their order)
+   virtual void on_launch() {}
++  // the real argument whose storage traced tensor t views, for host state
++  // keyed by the argument's allocation (a symmetric buffer's rendezvous); the
++  // trace guards the argument's address. Declines where t views no argument
++  virtual TensorBase real_argument(const TensorBase& t);
+   std::vector<std::variant<KernelRecord, MemcpyRecord>> launches;
+ };
+ 
+@@ -210,4 +214,8 @@
+   rec.on_launch();
+ }
+ 
++inline TensorBase Recorder::real_argument(const TensorBase& /*t*/) {
++  decline("a recorder without real arguments");
++}
++
+ } // namespace at::cuda::host_trace
+--- a/torch/csrc/cuda/host_trace/Aten.cpp
++++ b/torch/csrc/cuda/host_trace/Aten.cpp
+@@ -46,6 +46,15 @@
+     py::gil_scoped_acquire gil;
+     return host_trace.attr("select")(c, a, b).cast<c10::SymInt>();
+   }
++  at::TensorBase real_argument(const at::TensorBase& t) override {
++    py::gil_scoped_acquire gil;
++    static const auto tape = py::module::import("torch.cuda._host_trace_tape");
++    try {
++      return tape.attr("_real_argument")(at::Tensor(t)).cast<at::Tensor>();
++    } catch (py::error_already_set& e) {
++      ht::decline(e.what());
++    }
++  }
+   py::module host_trace = py::module::import("torch.cuda._host_trace");
+ };
+ 
+--- a/torch/csrc/distributed/c10d/symm_mem/CUDASymmetricMemoryOps.cu
++++ b/torch/csrc/distributed/c10d/symm_mem/CUDASymmetricMemoryOps.cu
+@@ -20,6 +20,9 @@
+ #include <torch/csrc/distributed/c10d/ParamCommsUtils.hpp>
+ #include <torch/csrc/distributed/c10d/symm_mem/CUDASymmetricMemory-inl.cuh>
+ #include <torch/csrc/distributed/c10d/symm_mem/CUDASymmetricMemory.hpp>
++#if !defined(USE_ROCM)
++#include <ATen/cuda/host_trace/Recorder.h>
++#endif
+ 
+ #if defined(USE_ROCM) || (defined(CUDART_VERSION) && CUDART_VERSION >= 12030)
+ 
+@@ -99,12 +102,75 @@
+   }
+ }
+ 
+-size_t get_and_verify_alignment(const at::Tensor& input, const char* op_name) {
++// The collectives' host code is one source for eager (int64_t sizes, the
++// kernel launched) and for a host trace (c10::SymInt sizes, the launch
++// recorded into ATen/cuda/host_trace/Recorder.h's recorder, as a symbolic
++// TensorIterator's is). A SymInt comparison guards, so each size-dependent
++// decision below is a guard of the op whose host code makes it
++template <bool kSym>
++struct SymmHost {
++  using Int = std::conditional_t<kSym, c10::SymInt, int64_t>;
++  static Int numel(const at::Tensor& t) {
++    if constexpr (kSym) {
++      return t.sym_numel();
++    } else {
++      return t.numel();
++    }
++  }
++  static Int storage_offset(const at::Tensor& t) {
++    if constexpr (kSym) {
++      return t.sym_storage_offset();
++    } else {
++      return t.storage_offset();
++    }
++  }
++  static Int size(const at::Tensor& t, int64_t d) {
++    if constexpr (kSym) {
++      return t.sym_size(d);
++    } else {
++      return t.size(d);
++    }
++  }
++  static bool same_sizes(const at::Tensor& a, const at::Tensor& b) {
++    if constexpr (kSym) {
++      return a.sym_sizes().equals(b.sym_sizes());
++    } else {
++      return a.sizes() == b.sizes();
++    }
++  }
++  // std::max / std::min; symbolic, the program's select row (no guard)
++  static Int max(const Int& a, const Int& b);
++  static Int min(const Int& a, const Int& b);
++};
++
++template <>
++int64_t SymmHost<false>::max(const int64_t& a, const int64_t& b) {
++  return std::max(a, b);
++}
++template <>
++int64_t SymmHost<false>::min(const int64_t& a, const int64_t& b) {
++  return std::min(a, b);
++}
++
++// at::native::memory::get_alignment of a size (16, 8, 4, 2 or 1)
++template <bool kSym>
++size_t alignment_of(const typename SymmHost<kSym>::Int& x) {
++  for (int64_t a : {16, 8, 4, 2}) {
++    if (x % a == 0) {
++      return a;
++    }
++  }
++  return 1;
++}
++
++template <bool kSym>
++size_t verified_alignment(const at::Tensor& input, const char* op_name) {
++  using H = SymmHost<kSym>;
+   const size_t min_alignment = std::max(4l, input.element_size());
+   // Only check the offset since the multicast address is always at least
+   // 128-bit aligned
+-  const size_t ptr_alignment = at::native::memory::get_alignment(
+-      static_cast<size_t>(input.storage_offset() * input.element_size()));
++  const size_t ptr_alignment =
++      alignment_of<kSym>(H::storage_offset(input) * input.element_size());
+   TORCH_CHECK(
+       ptr_alignment >= min_alignment,
+       op_name,
+@@ -115,7 +181,7 @@
+       "-byte aligned.");
+ 
+   const size_t size_alignment =
+-      at::native::memory::get_alignment(static_cast<size_t>(input.numel() * input.element_size()));
++      alignment_of<kSym>(H::numel(input) * input.element_size());
+   TORCH_CHECK(
+       size_alignment >= min_alignment,
+       op_name,
+@@ -127,6 +193,44 @@
+   return std::min(ptr_alignment, size_alignment);
+ }
+ 
++size_t get_and_verify_alignment(const at::Tensor& input, const char* op_name) {
++  return verified_alignment<false>(input, op_name);
++}
++
++// (num_blocks, num_threads)
++template <bool kSym>
++std::pair<typename SymmHost<kSym>::Int, typename SymmHost<kSym>::Int>
++elementwise_launch_config(
++    const typename SymmHost<kSym>::Int& numel,
++    size_t element_size,
++    size_t alignment,
++    size_t splits,
++    size_t max_num_blocks,
++    size_t max_num_threads,
++    int world_size) {
++  using H = SymmHost<kSym>;
++  using Int = typename H::Int;
++  // Align to preserve alignment in each split
++  const auto unit = static_cast<int64_t>(alignment * splits);
++  const Int aligned_numel = (numel + (unit - 1)) / unit * unit;
++  const Int numel_per_split = aligned_numel / static_cast<int64_t>(splits);
++  const auto numel_per_thread = static_cast<int64_t>(alignment / element_size);
++  const auto per_block = static_cast<int64_t>(max_num_threads) * numel_per_thread;
++
++  if (numel_per_split <= per_block) {
++    Int num_threads = (numel_per_split + (numel_per_thread - 1)) / numel_per_thread;
++    // `sync_remote_blocks` maps threads to peers, so we need to make sure there
++    // are enough threads
++    num_threads = H::max(num_threads, Int(world_size));
++    const int64_t warp = at::cuda::warp_size();
++    num_threads = (num_threads + (warp - 1)) / warp * warp;
++    return {Int(1), num_threads};
++  }
++  return {
++      H::min((numel_per_split + (per_block - 1)) / per_block, Int(static_cast<int64_t>(max_num_blocks))),
++      Int(static_cast<int64_t>(max_num_threads))};
++}
++
+ void init_elementwise_launch_config(
+     size_t numel,
+     size_t element_size,
+@@ -137,26 +241,56 @@
+     int& num_blocks,
+     int& num_threads,
+     int world_size) {
+-  // Align to preserve alignment in each split
+-  const size_t aligned_numel = at::round_up(numel, alignment * splits);
+-  const size_t numel_per_split = aligned_numel / splits;
+-  const size_t numel_per_thread = alignment / element_size;
+-
+-  if (numel_per_split <= max_num_threads * numel_per_thread) {
+-    num_blocks = 1;
+-    num_threads = at::ceil_div(numel_per_split, numel_per_thread);
+-    // `sync_remote_blocks` maps threads to peers, so we need to make sure there
+-    // are enough threads
+-    num_threads = max(num_threads, world_size);
+-    num_threads = at::round_up(num_threads, at::cuda::warp_size());
+-  } else {
+-    num_blocks = std::min(
+-        at::ceil_div(numel_per_split, max_num_threads * numel_per_thread),
+-        max_num_blocks);
+-    num_threads = max_num_threads;
+-  }
++  const auto config = elementwise_launch_config<false>(
++      static_cast<int64_t>(numel), element_size, alignment, splits, max_num_blocks, max_num_threads, world_size);
++  num_blocks = static_cast<int>(config.first);
++  num_threads = static_cast<int>(config.second);
++}
++
++template <bool kSym>
++c10::intrusive_ptr<SymmetricMemory> symm_rendezvous(
++    const at::Tensor& input,
++    const std::string& group_name);
++
++template <>
++c10::intrusive_ptr<SymmetricMemory> symm_rendezvous<false>(
++    const at::Tensor& input,
++    const std::string& group_name) {
++  return c10d::symmetric_memory::rendezvous(input, group_name);
++}
++
++#if !defined(USE_ROCM)
++namespace ht = at::cuda::host_trace;
++
++template <>
++c10::SymInt SymmHost<true>::max(const c10::SymInt& a, const c10::SymInt& b) {
++  return ht::recorder_for("symm_mem").select(a.sym_ge(b), a, b);
++}
++template <>
++c10::SymInt SymmHost<true>::min(const c10::SymInt& a, const c10::SymInt& b) {
++  return ht::recorder_for("symm_mem").select(a.sym_le(b), a, b);
+ }
+ 
++// Under a host trace, the rendezvous of the argument the traced input is a
++// view of, as eager looks it up. The peer buffer and signal pad tables are
++// the buffer's, constants of the launch: real_argument guards the argument's
++// address, a guard of the op's (another buffer dispatches the op again)
++template <>
++c10::intrusive_ptr<SymmetricMemory> symm_rendezvous<true>(
++    const at::Tensor& input,
++    const std::string& group_name) {
++  const at::Tensor real(ht::recorder_for("symm_mem").real_argument(input));
++  return c10d::symmetric_memory::rendezvous(real, group_name);
++}
++
++template <class T>
++ht::Param<T*> traced_ptr(const at::Tensor& t) {
++  ht::Param<T*> p;
++  p.set(p.value(), ht::recorder_for("symm_mem").data_ptr(t));
++  return p;
++}
++#endif
++
+ #if !defined(USE_ROCM) //No multi-cast support on ROCm yet
+ template <typename T, int alignment>
+ static __global__ void multimem_all_reduce_kernel(
+@@ -603,36 +737,40 @@
+   sync_remote_blocks<true, false>(signal_pads, rank, world_size);
+ }
+ 
+-at::Tensor one_shot_all_reduce_out_impl(
++template <bool kSym>
++at::Tensor one_shot_all_reduce_out_host(
+     const at::Tensor& input,
+     const std::optional<at::Tensor>& local_input,
+-    std::string reduce_op,
+-    std::string group_name,
++    const std::string& reduce_op,
++    const std::string& group_name,
+     at::Tensor out) {
++  using H = SymmHost<kSym>;
+   auto pg = c10d::resolve_process_group(group_name);
+-  RECORD_PARAM_COMMS(
+-      static_cast<int64_t>(0),
+-      std::make_tuple(pg->getGroupName(), pg->getGroupDesc()),
+-      pg->getRank(),
+-      "symm_mem::one_shot_all_reduce",
+-      input.numel(),
+-      out.numel(),
+-      input.scalar_type(),
+-      std::vector<int64_t>(),
+-      std::vector<int64_t>(),
+-      -1,
+-      -1,
+-      pg->getSize());
++  if constexpr (!kSym) {
++    RECORD_PARAM_COMMS(
++        static_cast<int64_t>(0),
++        std::make_tuple(pg->getGroupName(), pg->getGroupDesc()),
++        pg->getRank(),
++        "symm_mem::one_shot_all_reduce",
++        input.numel(),
++        out.numel(),
++        input.scalar_type(),
++        std::vector<int64_t>(),
++        std::vector<int64_t>(),
++        -1,
++        -1,
++        pg->getSize());
++  }
+   TORCH_CHECK(
+       input.is_contiguous(), "one_shot_all_reduce: input must be contiguous.");
+   TORCH_CHECK(
+       out.is_contiguous(), "one_shot_all_reduce: output must be contiguous.");
+   TORCH_CHECK(
+-      out.sizes() == input.sizes(),
++      H::same_sizes(out, input),
+       "one_shot_all_reduce: input/output size mismatch, input.sizes(): ",
+-      input.sizes(),
++      input.sym_sizes(),
+       ", output.sizes(): ",
+-      out.sizes());
++      out.sym_sizes());
+   TORCH_CHECK(
+       reduce_op == "sum",
+       "one_shot_all_reduce: only sum is supported for now.");
+@@ -641,68 +779,109 @@
+         local_input->is_contiguous(),
+         "one_shot_all_reduce: local input must be contiguous.");
+     TORCH_CHECK(
+-        local_input->numel() <= input.numel(),
++        H::numel(*local_input) <= H::numel(input),
+         "one_shot_all_reduce: local input size must be smaller than symm buffer size.");
+   }
+-  if (input.numel() == 0) {
++  if (H::numel(input) == 0) {
+     TORCH_CHECK(input.scalar_type() == out.scalar_type());
+     return out;
+   }
+-  auto symm_mem = c10d::symmetric_memory::rendezvous(input, group_name);
++  auto symm_mem = symm_rendezvous<kSym>(input, group_name);
+   TORCH_CHECK(
+       symm_mem != nullptr,
+       "one_shot_all_reduce: input must be allocated with empty_strided_p2p().");
+-  warn_if_multi_stream(group_name, "one_shot_all_reduce");
++  if constexpr (!kSym) {
++    warn_if_multi_stream(group_name, "one_shot_all_reduce");
++  }
+ 
+   const size_t alignment =
+-      get_and_verify_alignment(input, "one_shot_all_reduce");
++      verified_alignment<kSym>(input, "one_shot_all_reduce");
+   if (local_input.has_value()) {
+     const size_t local_alignment =
+-        get_and_verify_alignment(*local_input, "one_shot_all_reduce");
++        verified_alignment<kSym>(*local_input, "one_shot_all_reduce");
+     TORCH_CHECK(
+         alignment == local_alignment,
+         "one_shot_all_reduce: local input and symm buffer must have the same alignment.");
+   }
+ 
+-  int num_blocks = 0, num_threads = 0;
+-  init_elementwise_launch_config(
+-      input.numel(),
++  const auto config = elementwise_launch_config<kSym>(
++      H::numel(input),
+       input.element_size(),
+       alignment,
+       1,
+       one_shot_all_reduce_max_num_blocks,
+       one_shot_all_reduce_max_num_threads,
+-      num_blocks,
+-      num_threads,
+       symm_mem->get_world_size());
++  const auto& num_blocks = config.first;
++  const auto& num_threads = config.second;
+ 
+   AT_DISPATCH_FLOAT_AND_BFLOAT16(
+       input.scalar_type(), "one_shot_all_reduce", [&]() {
+         DISPATCH_ALIGNMENTS_16_8_4(alignment, [&]() {
+           DISPATCH_WORLD_SIZES(symm_mem->get_world_size(), [&]() {
+-            one_shot_all_reduce_kernel<scalar_t, k_alignment, k_world_size>
+-                <<<num_blocks,
+-                   num_threads,
+-                   0,
+-                   at::cuda::getCurrentCUDAStream()>>>(
+-                    reinterpret_cast<scalar_t**>(
+-                        symm_mem->get_buffer_ptrs_dev()),
+-                    out.data_ptr<scalar_t>(),
+-                    local_input.has_value() ? local_input->data_ptr<scalar_t>()
+-                                            : nullptr,
+-                    input.storage_offset(),
+-                    input.numel(),
+-                    reinterpret_cast<uint32_t**>(
+-                        symm_mem->get_signal_pad_ptrs_dev()),
+-                    symm_mem->get_rank(),
+-                    symm_mem->get_world_size());
+-            C10_CUDA_KERNEL_LAUNCH_CHECK();
++            auto* buffer_ptrs =
++                reinterpret_cast<scalar_t**>(symm_mem->get_buffer_ptrs_dev());
++            auto* signal_pads =
++                reinterpret_cast<uint32_t**>(symm_mem->get_signal_pad_ptrs_dev());
++            const size_t rank = symm_mem->get_rank();
++            const size_t world_size = symm_mem->get_world_size();
++            if constexpr (!kSym) {
++              one_shot_all_reduce_kernel<scalar_t, k_alignment, k_world_size>
++                  <<<num_blocks,
++                     num_threads,
++                     0,
++                     at::cuda::getCurrentCUDAStream()>>>(
++                      buffer_ptrs,
++                      out.data_ptr<scalar_t>(),
++                      local_input.has_value() ? local_input->data_ptr<scalar_t>()
++                                              : nullptr,
++                      input.storage_offset(),
++                      input.numel(),
++                      signal_pads,
++                      rank,
++                      world_size);
++              C10_CUDA_KERNEL_LAUNCH_CHECK();
++            } else {
++#if !defined(USE_ROCM)
++              ht::launch(
++                  ht::recorder_for("symm_mem"),
++                  &one_shot_all_reduce_kernel<scalar_t, k_alignment, k_world_size>,
++                  num_blocks,
++                  num_threads,
++                  0,
++                  ht::Param<scalar_t**>(buffer_ptrs),
++                  traced_ptr<scalar_t>(out),
++                  local_input.has_value() ? traced_ptr<scalar_t>(*local_input)
++                                          : ht::Param<scalar_t*>(nullptr),
++                  ht::scalar_param<size_t>(input.sym_storage_offset()),
++                  ht::scalar_param<size_t>(input.sym_numel()),
++                  ht::Param<uint32_t**>(signal_pads),
++                  ht::Param<size_t>(rank),
++                  ht::Param<size_t>(world_size));
++#endif
++            }
+           });
+         });
+       });
+   return out;
+ }
+ 
++at::Tensor one_shot_all_reduce_out_impl(
++    const at::Tensor& input,
++    const std::optional<at::Tensor>& local_input,
++    std::string reduce_op,
++    std::string group_name,
++    at::Tensor out) {
++#if !defined(USE_ROCM)
++  if (ht::current_recorder() != nullptr) {
++    return one_shot_all_reduce_out_host<true>(
++        input, local_input, reduce_op, group_name, std::move(out));
++  }
++#endif
++  return one_shot_all_reduce_out_host<false>(
++      input, local_input, reduce_op, group_name, std::move(out));
++}
++
+ at::Tensor one_shot_all_reduce_out(
+     const at::Tensor& input,
+     std::string reduce_op,
+@@ -876,128 +1055,180 @@
+   sync_remote_blocks<true, true>(signal_pads, rank, world_size);
+ }
+ 
+-at::Tensor two_shot_all_reduce_impl(
++template <bool kSym>
++at::Tensor two_shot_all_reduce_host(
+     at::Tensor input,
+     std::optional<at::Tensor> output,
+-    std::string reduce_op,
+-    std::string group_name) {
++    const std::string& reduce_op,
++    const std::string& group_name) {
++  using H = SymmHost<kSym>;
+   auto pg = c10d::resolve_process_group(group_name);
+-  RECORD_PARAM_COMMS(
+-      static_cast<int64_t>(0),
+-      std::make_tuple(pg->getGroupName(), pg->getGroupDesc()),
+-      pg->getRank(),
+-      "symm_mem::two_shot_all_reduce",
+-      input.numel(),
+-      input.numel(),
+-      input.scalar_type(),
+-      std::vector<int64_t>(),
+-      std::vector<int64_t>(),
+-      -1,
+-      -1,
+-      pg->getSize());
++  if constexpr (!kSym) {
++    RECORD_PARAM_COMMS(
++        static_cast<int64_t>(0),
++        std::make_tuple(pg->getGroupName(), pg->getGroupDesc()),
++        pg->getRank(),
++        "symm_mem::two_shot_all_reduce",
++        input.numel(),
++        input.numel(),
++        input.scalar_type(),
++        std::vector<int64_t>(),
++        std::vector<int64_t>(),
++        -1,
++        -1,
++        pg->getSize());
++  }
+   TORCH_CHECK(
+       input.is_contiguous(), "two_shot_all_reduce: input must be contiguous.");
+   TORCH_CHECK(
+       reduce_op == "sum",
+       "two_shot_all_reduce: only sum is supported for now.");
+ 
+-  auto symm_mem = c10d::symmetric_memory::rendezvous(input, group_name);
++  auto symm_mem = symm_rendezvous<kSym>(input, group_name);
+   TORCH_CHECK(
+       symm_mem != nullptr,
+       "two_shot_all_reduce: input must be allocated with empty_strided_p2p().");
+-  warn_if_multi_stream(group_name, "two_shot_all_reduce_");
++  if constexpr (!kSym) {
++    warn_if_multi_stream(group_name, "two_shot_all_reduce_");
++  }
+ 
+   const size_t alignment =
+-      get_and_verify_alignment(input, "two_shot_all_reduce");
++      verified_alignment<kSym>(input, "two_shot_all_reduce");
+ 
+   if (output.has_value()) {
+     TORCH_CHECK(
+         output->is_contiguous(),
+         "two_shot_all_reduce: output must be contiguous.");
+     const size_t output_alignment =
+-        get_and_verify_alignment(*output, "two_shot_all_reduce");
++        verified_alignment<kSym>(*output, "two_shot_all_reduce");
+     TORCH_CHECK(
+         alignment <= output_alignment,
+         "two_shot_all_reduce: output alignment must be equal to or larger than input.");
+     TORCH_CHECK(
+-        output->sizes() == input.sizes(),
++        H::same_sizes(*output, input),
+         "two_shot_all_reduce: input/output size mismatch, input.sizes(): ",
+-        input.sizes(),
++        input.sym_sizes(),
+         ", output.sizes(): ",
+-        output->sizes());
+-    if (input.numel() == 0) {
++        output->sym_sizes());
++    if (H::numel(input) == 0) {
+       TORCH_CHECK(output->scalar_type() == input.scalar_type());
+       return *output;
+     }
+   } else {
+-    if (input.numel() == 0) {
++    if (H::numel(input) == 0) {
+       return input;
+     }
+   }
+ 
+-  int num_blocks = 0, num_threads = 0;
+-  init_elementwise_launch_config(
+-      input.numel(),
++  const auto config = elementwise_launch_config<kSym>(
++      H::numel(input),
+       input.element_size(),
+       alignment,
+       symm_mem->get_world_size(),
+       two_shot_all_reduce_max_num_blocks,
+       two_shot_all_reduce_max_num_threads,
+-      num_blocks,
+-      num_threads,
+       symm_mem->get_world_size());
++  const auto& num_blocks = config.first;
++  const auto& num_threads = config.second;
+ 
+-  if (!output.has_value()) {
+-    AT_DISPATCH_FLOAT_AND_BFLOAT16(
+-        input.scalar_type(), "two_shot_all_reduce", [&]() {
+-          DISPATCH_ALIGNMENTS_16_8_4(alignment, [&]() {
++  AT_DISPATCH_FLOAT_AND_BFLOAT16(
++      input.scalar_type(), "two_shot_all_reduce", [&]() {
++        DISPATCH_ALIGNMENTS_16_8_4(alignment, [&]() {
++          auto* buffer_ptrs =
++              reinterpret_cast<scalar_t**>(symm_mem->get_buffer_ptrs_dev());
++          auto* signal_pads =
++              reinterpret_cast<uint32_t**>(symm_mem->get_signal_pad_ptrs_dev());
++          const size_t rank = symm_mem->get_rank();
++          const size_t world_size = symm_mem->get_world_size();
++          if (!output.has_value()) {
+             DISPATCH_WORLD_SIZES(symm_mem->get_world_size(), [&]() {
+-              two_shot_all_reduce_kernel_inplace<
+-                  scalar_t,
+-                  k_alignment,
+-                  k_world_size>
+-                  <<<num_blocks,
+-                     num_threads,
+-                     0,
+-                     at::cuda::getCurrentCUDAStream()>>>(
+-                      reinterpret_cast<scalar_t**>(
+-                          symm_mem->get_buffer_ptrs_dev()),
+-                      input.storage_offset(),
+-                      input.numel(),
+-                      reinterpret_cast<uint32_t**>(
+-                          symm_mem->get_signal_pad_ptrs_dev()),
+-                      symm_mem->get_rank(),
+-                      symm_mem->get_world_size());
+-              C10_CUDA_KERNEL_LAUNCH_CHECK();
++              if constexpr (!kSym) {
++                two_shot_all_reduce_kernel_inplace<
++                    scalar_t,
++                    k_alignment,
++                    k_world_size>
++                    <<<num_blocks,
++                       num_threads,
++                       0,
++                       at::cuda::getCurrentCUDAStream()>>>(
++                        buffer_ptrs,
++                        input.storage_offset(),
++                        input.numel(),
++                        signal_pads,
++                        rank,
++                        world_size);
++                C10_CUDA_KERNEL_LAUNCH_CHECK();
++              } else {
++#if !defined(USE_ROCM)
++                ht::launch(
++                    ht::recorder_for("symm_mem"),
++                    &two_shot_all_reduce_kernel_inplace<scalar_t, k_alignment, k_world_size>,
++                    num_blocks,
++                    num_threads,
++                    0,
++                    ht::Param<scalar_t**>(buffer_ptrs),
++                    ht::scalar_param<size_t>(input.sym_storage_offset()),
++                    ht::scalar_param<size_t>(input.sym_numel()),
++                    ht::Param<uint32_t**>(signal_pads),
++                    ht::Param<size_t>(rank),
++                    ht::Param<size_t>(world_size));
++#endif
++              }
+             });
+-          });
+-        });
+-    return input;
+-  } else {
+-    AT_DISPATCH_FLOAT_AND_BFLOAT16(
+-        input.scalar_type(), "two_shot_all_reduce", [&]() {
+-          DISPATCH_ALIGNMENTS_16_8_4(alignment, [&]() {
++          } else {
+             DISPATCH_WORLD_SIZES_NO_DEFAULT(symm_mem->get_world_size(), [&]() {
+-              two_shot_all_reduce_kernel<scalar_t, k_alignment, k_world_size>
+-                  <<<num_blocks,
+-                     num_threads,
+-                     0,
+-                     at::cuda::getCurrentCUDAStream()>>>(
+-                      reinterpret_cast<scalar_t**>(
+-                          symm_mem->get_buffer_ptrs_dev()),
+-                      output->data_ptr<scalar_t>(),
+-                      input.storage_offset(),
+-                      input.numel(),
+-                      reinterpret_cast<uint32_t**>(
+-                          symm_mem->get_signal_pad_ptrs_dev()),
+-                      symm_mem->get_rank(),
+-                      symm_mem->get_world_size());
+-              C10_CUDA_KERNEL_LAUNCH_CHECK();
++              if constexpr (!kSym) {
++                two_shot_all_reduce_kernel<scalar_t, k_alignment, k_world_size>
++                    <<<num_blocks,
++                       num_threads,
++                       0,
++                       at::cuda::getCurrentCUDAStream()>>>(
++                        buffer_ptrs,
++                        output->data_ptr<scalar_t>(),
++                        input.storage_offset(),
++                        input.numel(),
++                        signal_pads,
++                        rank,
++                        world_size);
++                C10_CUDA_KERNEL_LAUNCH_CHECK();
++              } else {
++#if !defined(USE_ROCM)
++                ht::launch(
++                    ht::recorder_for("symm_mem"),
++                    &two_shot_all_reduce_kernel<scalar_t, k_alignment, k_world_size>,
++                    num_blocks,
++                    num_threads,
++                    0,
++                    ht::Param<scalar_t**>(buffer_ptrs),
++                    traced_ptr<scalar_t>(*output),
++                    ht::scalar_param<size_t>(input.sym_storage_offset()),
++                    ht::scalar_param<size_t>(input.sym_numel()),
++                    ht::Param<uint32_t**>(signal_pads),
++                    ht::Param<size_t>(rank),
++                    ht::Param<size_t>(world_size),
++                    ht::Param<size_t>(0));
++#endif
++              }
+             });
+-          });
++          }
+         });
+-    return *output;
++      });
++  return output.has_value() ? *output : input;
++}
++
++at::Tensor two_shot_all_reduce_impl(
++    at::Tensor input,
++    std::optional<at::Tensor> output,
++    std::string reduce_op,
++    std::string group_name) {
++#if !defined(USE_ROCM)
++  if (ht::current_recorder() != nullptr) {
++    return two_shot_all_reduce_host<true>(
++        std::move(input), std::move(output), reduce_op, group_name);
+   }
++#endif
++  return two_shot_all_reduce_host<false>(
++      std::move(input), std::move(output), reduce_op, group_name);
+ }
+ 
+ at::Tensor two_shot_all_reduce_(
+@@ -1015,48 +1246,53 @@
+   return two_shot_all_reduce_impl(input, output, reduce_op, group_name);
+ }
+ 
+-at::Tensor reduce_scatter_out(
++template <bool kSym>
++at::Tensor reduce_scatter_out_host(
+     at::Tensor input,
+-    std::string group_name,
++    const std::string& group_name,
+     bool split_last_dim,
+     at::Tensor output) {
++  using H = SymmHost<kSym>;
+   auto pg = c10d::resolve_process_group(group_name);
+-  RECORD_PARAM_COMMS(
+-      static_cast<int64_t>(0),
+-      std::make_tuple(pg->getGroupName(), pg->getGroupDesc()),
+-      pg->getRank(),
+-      "symm_mem::reduce_scatter",
+-      input.numel(),
+-      output.numel(),
+-      input.scalar_type(),
+-      std::vector<int64_t>(),
+-      std::vector<int64_t>(),
+-      -1,
+-      -1,
+-      pg->getSize());
++  if constexpr (!kSym) {
++    RECORD_PARAM_COMMS(
++        static_cast<int64_t>(0),
++        std::make_tuple(pg->getGroupName(), pg->getGroupDesc()),
++        pg->getRank(),
++        "symm_mem::reduce_scatter",
++        input.numel(),
++        output.numel(),
++        input.scalar_type(),
++        std::vector<int64_t>(),
++        std::vector<int64_t>(),
++        -1,
++        -1,
++        pg->getSize());
++  }
+   TORCH_CHECK(
+       input.is_contiguous(), "reduce_scatter: input must be contiguous.");
+   TORCH_CHECK(
+       output.is_contiguous(), "reduce_scatter: output must be contiguous.");
+ 
+-  auto symm_mem = c10d::symmetric_memory::rendezvous(input, group_name);
++  auto symm_mem = symm_rendezvous<kSym>(input, group_name);
+   TORCH_CHECK(
+       symm_mem != nullptr,
+       "reduce_scatter: input must be allocated with empty_strided_p2p().");
+-  warn_if_multi_stream(group_name, "reduce_scatter_out");
++  if constexpr (!kSym) {
++    warn_if_multi_stream(group_name, "reduce_scatter_out");
++  }
+ 
+-  const size_t alignment = get_and_verify_alignment(input, "reduce_scatter");
++  const size_t alignment = verified_alignment<kSym>(input, "reduce_scatter");
+ 
+   const size_t output_alignment =
+-      get_and_verify_alignment(input, "reduce_scatter");
++      verified_alignment<kSym>(input, "reduce_scatter");
+ 
++  const auto world = static_cast<int64_t>(symm_mem->get_world_size());
++  const auto per_rank_unit = world * static_cast<int64_t>(alignment / input.element_size());
+   TORCH_CHECK(
+-      input.numel() %
+-              (symm_mem->get_world_size() *
+-               (alignment / input.element_size())) ==
+-          0,
++      H::numel(input) % per_rank_unit == 0,
+       "expected number of elements to be divisible by world_size * alignment, number of elements ",
+-      input.numel(),
++      H::numel(input),
+       " world size ",
+       symm_mem->get_world_size(),
+       "alignment ",
+@@ -1064,22 +1300,21 @@
+ 
+   if (split_last_dim) {
+     TORCH_CHECK(input.dim() == output.dim());
+-    bool are_equal_except_last = std::equal(
+-        input.sizes().begin(), input.sizes().end() - 1, output.sizes().begin());
++    bool are_equal_except_last = true;
++    for (int64_t d = 0; d + 1 < input.dim(); ++d) {
++      are_equal_except_last = are_equal_except_last && H::size(input, d) == H::size(output, d);
++    }
+     TORCH_CHECK(
+         are_equal_except_last,
+         "reduce_scatter expected input and output to have same sizes except in the last dimension");
+     TORCH_CHECK(
+-        output.size(-1) == input.size(-1) / symm_mem->get_world_size(),
++        H::size(output, -1) == H::size(input, -1) / world,
+         "reduce_scatter expected output last dim size to be input last dim size / world_size");
+ 
+     TORCH_CHECK(
+-        input.size(-1) %
+-                (symm_mem->get_world_size() *
+-                 (alignment / input.element_size())) ==
+-            0,
++        H::size(input, -1) % per_rank_unit == 0,
+         "expected last dimension to be divisible by world_size * alignment, last dimension ",
+-        input.size(-1),
++        H::size(input, -1),
+         " world size ",
+         symm_mem->get_world_size(),
+         "alignment ",
+@@ -1087,9 +1322,9 @@
+   } else {
+     TORCH_CHECK(input.dim() == 1, "reduce_scatter expected 1D input");
+     TORCH_CHECK(output.dim() == 1, "reduce_scatter expected 1D output");
+-    TORCH_CHECK(output.numel() == input.numel() / symm_mem->get_world_size());
++    TORCH_CHECK(H::numel(output) == H::numel(input) / world);
+   }
+-  if (input.numel() == 0) {
++  if (H::numel(input) == 0) {
+     TORCH_CHECK(input.scalar_type() == output.scalar_type());
+     return output;
+   }
+@@ -1098,78 +1333,81 @@
+       output_alignment >= alignment,
+       "reduce_scatter: output alignment should be not smaller than input alignment");
+ 
+-  int num_blocks = 0, num_threads = 0;
+-  init_elementwise_launch_config(
+-      input.numel(),
++  const auto config = elementwise_launch_config<kSym>(
++      H::numel(input),
+       input.element_size(),
+       alignment,
+       symm_mem->get_world_size(),
+       two_shot_all_reduce_max_num_blocks,
+       two_shot_all_reduce_max_num_threads,
+-      num_blocks,
+-      num_threads,
+       symm_mem->get_world_size());
+-  if (split_last_dim) {
+-    AT_DISPATCH_FLOAT_AND_BFLOAT16(
+-        input.scalar_type(), "two_shot_all_reduce", [&]() {
+-          DISPATCH_ALIGNMENTS_16_8_4(alignment, [&]() {
+-            DISPATCH_WORLD_SIZES_NO_DEFAULT(symm_mem->get_world_size(), [&]() {
+-              two_shot_all_reduce_kernel<
+-                  scalar_t,
+-                  k_alignment,
+-                  k_world_size,
+-                  true,
+-                  true>
+-                  <<<num_blocks,
+-                     num_threads,
+-                     0,
+-                     at::cuda::getCurrentCUDAStream()>>>(
+-                      reinterpret_cast<scalar_t**>(
+-                          symm_mem->get_buffer_ptrs_dev()),
+-                      output.data_ptr<scalar_t>(),
+-                      input.storage_offset(),
+-                      input.numel(),
+-                      reinterpret_cast<uint32_t**>(
+-                          symm_mem->get_signal_pad_ptrs_dev()),
+-                      symm_mem->get_rank(),
+-                      symm_mem->get_world_size(),
+-                      input.size(-1));
+-              C10_CUDA_KERNEL_LAUNCH_CHECK();
+-            });
+-          });
+-        });
+-  } else {
+-    AT_DISPATCH_FLOAT_AND_BFLOAT16(
+-        input.scalar_type(), "two_shot_all_reduce", [&]() {
+-          DISPATCH_ALIGNMENTS_16_8_4(alignment, [&]() {
+-            DISPATCH_WORLD_SIZES_NO_DEFAULT(symm_mem->get_world_size(), [&]() {
+-              two_shot_all_reduce_kernel<
+-                  scalar_t,
+-                  k_alignment,
+-                  k_world_size,
+-                  true,
+-                  false>
+-                  <<<num_blocks,
+-                     num_threads,
+-                     0,
+-                     at::cuda::getCurrentCUDAStream()>>>(
+-                      reinterpret_cast<scalar_t**>(
+-                          symm_mem->get_buffer_ptrs_dev()),
+-                      output.data_ptr<scalar_t>(),
+-                      input.storage_offset(),
+-                      input.numel(),
+-                      reinterpret_cast<uint32_t**>(
+-                          symm_mem->get_signal_pad_ptrs_dev()),
+-                      symm_mem->get_rank(),
+-                      symm_mem->get_world_size(),
+-                      input.size(-1));
++  const auto& num_blocks = config.first;
++  const auto& num_threads = config.second;
++  AT_DISPATCH_FLOAT_AND_BFLOAT16(
++      input.scalar_type(), "two_shot_all_reduce", [&]() {
++        DISPATCH_ALIGNMENTS_16_8_4(alignment, [&]() {
++          DISPATCH_WORLD_SIZES_NO_DEFAULT(symm_mem->get_world_size(), [&]() {
++            auto* kernel = split_last_dim
++                ? &two_shot_all_reduce_kernel<scalar_t, k_alignment, k_world_size, true, true>
++                : &two_shot_all_reduce_kernel<scalar_t, k_alignment, k_world_size, true, false>;
++            auto* buffer_ptrs =
++                reinterpret_cast<scalar_t**>(symm_mem->get_buffer_ptrs_dev());
++            auto* signal_pads =
++                reinterpret_cast<uint32_t**>(symm_mem->get_signal_pad_ptrs_dev());
++            const size_t rank = symm_mem->get_rank();
++            const size_t world_size = symm_mem->get_world_size();
++            if constexpr (!kSym) {
++              kernel<<<num_blocks,
++                       num_threads,
++                       0,
++                       at::cuda::getCurrentCUDAStream()>>>(
++                  buffer_ptrs,
++                  output.data_ptr<scalar_t>(),
++                  input.storage_offset(),
++                  input.numel(),
++                  signal_pads,
++                  rank,
++                  world_size,
++                  input.size(-1));
+               C10_CUDA_KERNEL_LAUNCH_CHECK();
+-            });
++            } else {
++#if !defined(USE_ROCM)
++              ht::launch(
++                  ht::recorder_for("symm_mem"),
++                  kernel,
++                  num_blocks,
++                  num_threads,
++                  0,
++                  ht::Param<scalar_t**>(buffer_ptrs),
++                  traced_ptr<scalar_t>(output),
++                  ht::scalar_param<size_t>(input.sym_storage_offset()),
++                  ht::scalar_param<size_t>(input.sym_numel()),
++                  ht::Param<uint32_t**>(signal_pads),
++                  ht::Param<size_t>(rank),
++                  ht::Param<size_t>(world_size),
++                  ht::scalar_param<size_t>(input.sym_size(-1)));
++#endif
++            }
+           });
+         });
+-  }
++      });
+   return output;
+ }
++
++at::Tensor reduce_scatter_out(
++    at::Tensor input,
++    std::string group_name,
++    bool split_last_dim,
++    at::Tensor output) {
++#if !defined(USE_ROCM)
++  if (ht::current_recorder() != nullptr) {
++    return reduce_scatter_out_host<true>(
++        std::move(input), group_name, split_last_dim, std::move(output));
++  }
++#endif
++  return reduce_scatter_out_host<false>(
++      std::move(input), group_name, split_last_dim, std::move(output));
++}
+ } // namespace
+ #elif defined(CUDART_VERSION) && CUDART_VERSION < 12030
+ namespace {

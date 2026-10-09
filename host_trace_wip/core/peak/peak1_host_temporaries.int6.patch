@@ -1,0 +1,383 @@
+--- a/test/test_cuda_host_trace_memory.py
++++ b/test/test_cuda_host_trace_memory.py
+@@ -4,6 +4,7 @@
+ # temporaries, bitwise outputs vs eager, one arena allocation per run.
+ import gc
+ import unittest
++from unittest import mock
+ 
+ import sympy
+ 
+@@ -230,8 +231,10 @@
+         self.assertTrue(inside, by_bytes)
+ 
+ 
++    @mock.patch("torch.cuda._host_trace.host_temporaries", False)
+     def test_greedy_by_size(self):
+-        # largest first reaches the most bytes live at once, where tape-order first fit does not
++        # largest first reaches the most bytes live at once, where tape-order first fit does not (the
++        # arena's placement alone: hosting moves temporaries out of it)
+         f = HostTraceReplay(decoder, memory="planned")
+         for m in (4096, 4096, 2048, 4096):
+             x = torch.randn(m, device="cuda")
+@@ -281,6 +284,69 @@
+ 
+ instantiate_parametrized_tests(TestPlanned)
+ 
++
++# pointwise chains: eager frees an intermediate after its last use, and the
++# next tensor of its size takes its block
++_CHAINS = {
++    "sigmoid_mul_add": lambda x, y: torch.sigmoid(x) * y + 2,
++    "four_ops": lambda x, y: (((x * 2).sin() + y) * 3).relu(),
++    "two_outputs": lambda x, y: ((x * 2).sin(), x + y),
++    # its output and partial sum are smaller than the chain's temporaries
++    "reduction": lambda x, y: (x * y).exp().sum(1) + 1,
++}
++
++
++@unittest.skipIf(not TEST_CUDA, "requires CUDA")
++class TestPeakMatchesEager(TestCase):
++    def peak(self, h, *args):
++        gc.collect()
++        torch.cuda.synchronize()
++        before = torch.cuda.memory_allocated()
++        torch.cuda.reset_peak_memory_stats()
++        out = h(*args)
++        torch.cuda.synchronize()
++        return out, torch.cuda.max_memory_allocated() - before
++
++    @parametrize("memory", ["auto", "eager", "run_buffer", "planned", "packed"])
++    @parametrize("chain", list(_CHAINS))
++    def test_a_chains_peak_is_eagers(self, chain, memory):
++        # a run's temporary that dies before a tensor the run makes is first
++        # touched lives in that tensor's bytes (host_temporaries), as eager's
++        # tensor takes the freed block: the replay's peak is eager's
++        fn = _CHAINS[chain]
++        f = HostTraceReplay(fn, memory=memory)
++        y = torch.randn(768, device="cuda")
++        for m in (7, 33):
++            f(torch.randn(m, 768, device="cuda"), y)
++        for m in (7, 33, 7):
++            x = torch.randn(m, 768, device="cuda")
++            (got, peak), (want, eager_peak) = self.peak(f, x, y), self.peak(fn, x, y)
++            self.assertEqual(got, want, atol=0, rtol=0)
++            if chain == "reduction" and memory != "eager":
++                # a tensor smaller than the temporaries is made with the run, before eager's frees: here
++                # the m-element output and, in a packed arena, the partial sum (a 512-byte block each)
++                self.assertLessEqual(peak, eager_peak + 2 * 512, (chain, memory, m))
++            else:
++                self.assertEqual(peak, eager_peak, (chain, memory, m))
++        self.assertEqual((f.traces, f.replays), (1, 3))
++
++    def test_without_hosting_the_run_buffer_holds_the_intermediate(self):
++        # host_temporaries off: the output is made with the run buffer, so
++        # the first intermediate's bytes are not reused (one tensor above eager)
++        fn = _CHAINS["sigmoid_mul_add"]
++        x, y = torch.randn(7, 768, device="cuda"), torch.randn(768, device="cuda")
++        with mock.patch("torch.cuda._host_trace.host_temporaries", False):
++            f = HostTraceReplay(fn, memory="run_buffer")
++            f(x, y), f(x, y)  # the first call runs eagerly, the second traces
++        (got, peak), (want, eager_peak) = self.peak(f, x, y), self.peak(fn, x, y)
++        self.assertEqual(got, want, atol=0, rtol=0)
++        self.assertEqual(peak, eager_peak + want.nbytes)
++        (v,) = f.variants
++        self.assertEqual(dict(v.memory.hosted), {})
++
++
++instantiate_parametrized_tests(TestPeakMatchesEager)
++
+ def setUpModule():
+     from torch.cuda import _host_trace_hint_audit
+ 
+--- a/test/test_cuda_host_trace_replay.py
++++ b/test/test_cuda_host_trace_replay.py
+@@ -2269,8 +2269,15 @@
+         self.assertEqual((f.traces, f.replays, f.eager), (1, 1, 0))
+         g = HostTraceReplay(fn, memory="run_buffer")
+         self.assertEqual(g(x), x + 4)
+-        run = StepMemory((2,), temporaries, (), (), (0,))
+-        self.assertEqual(g.variants[0].memory, MemoryPlan((2,), (run, after)))
++        # the unused allocation is dead before the output is first written: it
++        # lives in the output's bytes (hosted), add(x)'s in the run buffer
++        run = StepMemory((2,), temporaries[1:], (), (), (0,))
++        hosted = {0: (2, seqs[0], seqs[0])}
++
++        def plan(m: MemoryPlan) -> tuple:
++            return m.outputs, m.steps, dict(m.hosted)
++
++        self.assertEqual(plan(g.variants[0].memory), ((2,), (run, after), hosted))
+         self.assertEqual(g(x), x + 4)
+         self.assertEqual((g.traces, g.replays, g.eager), (1, 1, 0))
+         # the default, "auto", takes the run buffer here; the output is its own allocation
+@@ -2278,7 +2285,7 @@
+         self.assertEqual(h(x), x + 4)
+         self.assertEqual(h(x), x + 4)
+         self.assertEqual((h.traces, h.replays, h.eager), (1, 1, 0))
+-        self.assertEqual(h.variants[0].memory, MemoryPlan((2,), (run, after)))
++        self.assertEqual(plan(h.variants[0].memory), ((2,), (run, after), hosted))
+         # the unused allocation is dead when add(x)'s is made: they share bytes
+         self.assertEqual(place(temporaries, [4000, 4000]), ([0, 0], 4096))
+ 
+--- a/torch/cuda/_host_trace_memory.py
++++ b/torch/cuda/_host_trace_memory.py
+@@ -54,9 +54,12 @@
+ allocation is made at the start of its step, and a run's temporaries are
+ placed first fit in one buffer freed once the run's graph is queued; two
+ share bytes only if their lifetimes (allocation to last use) do not
+-overlap. A tensor cannot reuse a temporary's bytes, and each distinct
+-buffer size is its own block, which fragments the allocator's pool when
+-the shapes vary.
++overlap. A tensor made with the run cannot reuse the buffer's bytes; instead
++a temporary of a tensor's bytes that dies before the run first touches the
++tensor lives in the tensor (host_temporaries, MemoryPlan.hosted), as eager's
++tensor takes the freed temporary's block: a pointwise chain's peak is
++eager's. Each distinct buffer size is its own block, which fragments the
++allocator's pool when the shapes vary.
+ """
+ 
+ from __future__ import annotations
+@@ -124,6 +127,13 @@
+     relocated: Mapping[int, tuple[int, int, int, int, int]] = dataclasses.field(default_factory=dict)
+     # "planned": each arena and the rows of its `valid` conditions
+     arenas: tuple[tuple[Arena | PackedArena, tuple[int, ...]], ...] = ()
++    # a run's temporary k in the bytes of a tensor of its run, which no step
++    # touches before k's last use (host_temporaries): k -> (tensor, seq, last
++    # use); relocate moves its pointers there
++    hosted: Mapping[int, tuple[int, int, int]] = dataclasses.field(default_factory=dict)
++    # relocate's moves, planned and hosted: allocation k -> (the allocation it
++    # is in, its offset's row), which a fold's or redispatch's entries take too
++    moves: Mapping[int, tuple[int, int]] = dataclasses.field(default_factory=dict)
+ 
+ 
+ @dataclass(frozen=True)
+@@ -261,6 +271,7 @@
+     used: dict[int, set[int]] = {}  # base -> the steps that use it
+     touched = set()  # the bases eager calls read, write or return
+     last_seq = [a.seq for a in allocations]
++    first_use: dict[int, int] = {}  # base -> the seq of its first launch or eager step
+     ends = []  # each step's last seq
+     for i, step in enumerate(steps):
+         if isinstance(step, range):
+@@ -275,6 +286,7 @@
+                         continue
+                     base = k if kind == "allocation" else n_alloc + k
+                     used.setdefault(base, set()).add(i)
++                    first_use.setdefault(base, lo.seq)
+                     if base < n_alloc:
+                         last_seq[base] = lo.seq
+             continue
+@@ -290,6 +302,7 @@
+                 bases.append(k if kind == "allocation" else n_alloc + k)
+         for b in bases:
+             used.setdefault(b, set()).add(i)
++            first_use.setdefault(b, step.seq)
+             touched.add(b)
+     # a keyed site's operands reach its nodes through its table
+     position = {id(rec.root): rec.position for rec in lowered.tape.inputs}
+@@ -319,6 +332,14 @@
+     made: list[list[int]] = [[] for _ in range(len(steps) + 1)]
+     for k in range(n_alloc):
+         made[holding[k]].append(k)
++    hosted: dict[int, tuple[int, int, int]] = {}
++    if memory != "eager" and torch.cuda._host_trace.host_temporaries:
++        # a keyed site's scratch bytes are its table entry's, not its row's
++        scratch = {b for site in lowered.sites for _, b in site.scratch.values()}
++        for i in range(len(steps)):
++            temporaries = [(k, allocations[k].seq, last_seq[k]) for k in made[i] if k in local and k not in scratch]
++            hosts = sorted((first_use[k], k) for k in made[i] if k not in local and k in first_use)
++            hosted.update(_hosts(allocations, temporaries, hosts))
+     dropped: list[list[int]] = [[] for _ in range(len(steps) + 1)]
+     for b, s in last.items():
+         if b not in escapes and b not in local:
+@@ -327,7 +348,7 @@
+     for i in range(len(steps) + 1):
+         tensors = tuple(k for k in made[i] if k not in local)
+         temporaries = tuple(
+-            (k, allocations[k].seq, last_seq[k]) for k in made[i] if k in local
++            (k, allocations[k].seq, last_seq[k]) for k in made[i] if k in local and k not in hosted
+         )
+         drops = tuple(dropped[i])
+         order: tuple[int, ...] = ()
+@@ -338,7 +359,27 @@
+             order = tuple(e for *_, e in sorted(events))
+         arguments = tuple(last_arg[i]) if i < len(steps) else ()
+         plan.append(StepMemory(tensors, temporaries, drops, order, arguments))
+-    return MemoryPlan(tuple(sorted(k for k in escapes if k < n_alloc)), tuple(plan))
++    return MemoryPlan(tuple(sorted(k for k in escapes if k < n_alloc)), tuple(plan), hosted=hosted)
++
++
++def _hosts(
++    allocations: Sequence[Any], temporaries: Sequence[tuple[int, int, int]], hosts: Sequence[tuple[int, int]]
++) -> dict[int, tuple[int, int, int]]:
++    """Run temporaries (allocation, seq, last use) placed at offset 0 of a
++    tensor the run makes, `hosts` (first use's seq, allocation) in first-use
++    order: each host takes, one after another, temporaries of its bytes' row
++    (equal bytes at every call) whose last use precedes its first use, each
++    allocated at or after the last one's last use, as eager's caching
++    allocator gives a tensor the block of a freed temporary of its size. A
++    temporary is hosted once."""
++    out: dict[int, tuple[int, int, int]] = {}
++    for first, host in hosts:
++        end = -math.inf  # the last hosted temporary's last use
++        for k, seq, last in temporaries:
++            if k not in out and last < first and seq >= end and allocations[k].nbytes == allocations[host].nbytes:
++                out[k] = (host, seq, last)
++                end = last
++    return out
+ 
+ 
+ def check_plan(lowered: LoweredTape, plan: MemoryPlan) -> None:
+@@ -354,6 +395,9 @@
+         spans.update((k, (i, seq, last)) for k, seq, last in step.temporaries)
+         dropped.update((b, i) for b in step.drops)
+     held = set(plan.relocated)
++    # a hosted temporary lives in its host from the host's step, between its seq and last use
++    spans.update((k, (made.get(host, -1), seq, last)) for k, (host, seq, last) in plan.hosted.items() if k not in held)
++    first: dict[int, float] = {}
+     tables: dict[int, list[int]] = {}
+     for site in lowered.sites:
+         for j in site.nodes:
+@@ -375,6 +419,10 @@
+         for seq, bases in uses:
+             if bad := [b for b in bases if not live(b, i, seq)]:
+                 raise AssertionError(f"host_trace: allocations {bad} are used at step {i} (seq {seq}) outside their lifetimes in the memory plan")
++            for b in bases:
++                first.setdefault(b, seq)
++    if bad := [k for k, (host, _, last) in plan.hosted.items() if first.get(host, math.inf) <= last]:
++        raise AssertionError(f"host_trace: temporaries {bad} are hosted in a tensor a step uses before their last use")
+ 
+ 
+ def _nbytes(lowered: LoweredTape) -> list[int]:
+@@ -1058,8 +1106,8 @@
+ 
+ 
+ def _moved(emit: Callable[..., int], relocated: Mapping[int, tuple[int, ...]], launch: Any) -> Any:
+-    """The launch with each pointer into a planned temporary at its arena
+-    plus the temporary's offset row."""
++    """The launch with each pointer into a planned or hosted temporary at its
++    arena or host plus the temporary's offset row."""
+ 
+     def move(slot: object) -> object:
+         if isinstance(slot, PointerSlot) and slot.base in relocated:
+@@ -1085,11 +1133,14 @@
+         program.inputs = ()
+ 
+ 
+-def arena_addresses(lowered: LoweredTape, arenas: Sequence[Arena | PackedArena], addresses: Sequence[int]) -> list[int]:
++def arena_addresses(lowered: LoweredTape, plan: MemoryPlan, arenas: Sequence[Arena | PackedArena], addresses: Sequence[int]) -> list[int]:
+     """The capture's placeholder addresses with each planned temporary at its
+-    arena's placeholder plus its offset at the trace: the nodes then hold what
+-    the relocated launches compute there."""
++    arena's placeholder plus its offset at the trace, and each hosted one at
++    its host's: the nodes then hold what the relocated launches compute
++    there."""
+     addresses = list(addresses)
++    for k, (host, *_) in plan.hosted.items():
++        addresses[k] = addresses[host]
+     for arena in arenas:
+         offsets, _ = arena.offsets(lowered.program.values)
+         for k, offset in offsets.items():
+@@ -1102,9 +1153,9 @@
+ ) -> tuple[CapturedTape, MemoryPlan]:
+     """The captured tape with each planned temporary's pointers at its arena
+     plus its offset's row, and each arena allocated as its run's only
+-    temporary but its keyed sites' scratch buffers: the "planned" plan. Must
+-    run before the tape releases its traced call's arguments (the program is
+-    compiled again over them)."""
++    temporary but its keyed sites' scratch buffers (the "planned" plan), and
++    each hosted temporary's at its host. Must run before the tape releases
++    its traced call's arguments (the program is compiled again over them)."""
+     from torch.cuda._host_trace_program import compile_program
+ 
+     lowered = captured.lowered
+@@ -1134,12 +1185,19 @@
+         kept = [t for t in steps[i].temporaries if t[0] not in relocated]
+         steps[i] = dataclasses.replace(steps[i], temporaries=tuple(sorted(own + kept, key=lambda t: t[1])), order=())
+ 
+-    launches = tuple(_moved(emit, relocated, lo) for lo in lowered.launches)
++    zero = emit("constant", 0)
++    moves = {k: (r[0], r[1]) for k, r in relocated.items()} | {k: (host, zero) for k, (host, *_) in plan.hosted.items()}
++    launches = tuple(_moved(emit, moves, lo) for lo in lowered.launches)
++    # a segment's launch as captured (an RNG kernel's with its capture's images), moved as the tape's is
++    segments = tuple(
++        dataclasses.replace(s, launches=tuple(dataclasses.replace(c, launch=_moved(emit, moves, c.launch)) for c in s.launches))
++        for s in captured.segments
++    )
+     sites = tuple(
+         dataclasses.replace(
+             site,
+             operands=tuple(
+-                (emit("add", row, relocated[b][1]), relocated[b][0]) if b in relocated else (row, b)
++                (emit("add", row, moves[b][1]), moves[b][0]) if b in moves else (row, b)
+                 for row, b in site.operands
+             ),
+         )
+@@ -1154,12 +1212,7 @@
+     finally:
+         program.inputs = ()
+     new = dataclasses.replace(lowered, compiled=compiled, valid=valid, allocations=tuple(allocations), launches=launches, sites=sites)
+-    moved = {id(old): lo for old, lo in zip(lowered.launches, launches)}
+-    segments = tuple(
+-        dataclasses.replace(s, launches=tuple(dataclasses.replace(c, launch=moved[id(c.launch)]) for c in s.launches))
+-        for s in captured.segments
+-    )
+     return (
+         dataclasses.replace(captured, lowered=new, segments=segments),
+-        dataclasses.replace(plan, steps=tuple(steps), relocated=relocated, arenas=tuple(kept_arenas)),
++        dataclasses.replace(plan, steps=tuple(steps), relocated=relocated, arenas=tuple(kept_arenas), moves=moves),
+     )
+--- a/torch/cuda/_host_trace.py
++++ b/torch/cuda/_host_trace.py
+@@ -143,6 +143,12 @@
+ # numel() == 0 (data_ptr) for it
+ bound_addresses_unguarded = True
+ 
++# a run's temporary that dies before a tensor the run makes is first touched
++# lives in that tensor's bytes ("run_buffer" and the planned modes; MemoryPlan's
++# hosted), as eager's allocator hands the tensor the freed temporary's block:
++# a chain's output takes its first intermediate's bytes, as in eager
++host_temporaries = True
++
+ # eager's validity checks of a traced call's values (as_strided's bounds, a
+ # negative size) are conditions a variant's calls must meet (its valid row),
+ # not guards: a call that fails one misses, and its trace's warm-up raises
+--- a/torch/cuda/_host_trace_replay.py
++++ b/torch/cuda/_host_trace_replay.py
+@@ -1297,9 +1297,9 @@
+             refusals[str(e)] = refusals.get(str(e), 0) + 1
+             _drop_tracebacks(e)
+             return e
+-        relocated = variant.memory.relocated
+-        if any(isinstance(s, PointerSlot) and s.base in relocated for _, _, launches in entries for lo in launches for s in lo.slots):
+-            program, entries = relocate_entries(variant.captured.lowered, relocated, entries, args)
++        moves = variant.memory.moves
++        if any(isinstance(s, PointerSlot) and s.base in moves for _, _, launches in entries for lo in launches for s in lo.slots):
++            program, entries = relocate_entries(variant.captured.lowered, moves, entries, args)
+         variant.native.set_program(program)
+         for site, predicate, launches in entries:
+             variant.native.add_entry(site, predicate, tuple(map(launch_row, launches)))
+@@ -1326,6 +1326,7 @@
+                 raise _StaleBinding(f"{s.site.op}'s row at {key.sizes} holds the binding at {s.site.key.sizes}")
+         # eager order reads the native caching allocator's release count
+         native = torch.cuda.get_allocator_backend() == "native"
++        arenas: list[Any] = []
+         if native and self.memory == "auto":
+             lowered, memory = auto_memory(lowered, self.freed_arguments, self.splits)
+         elif native and self.memory == "eager":
+@@ -1341,11 +1342,11 @@
+         # the trace's placeholders: the capture runs no kernel, and the first
+         # replay patches every pointer
+         addresses = [_placeholder(rec.root) for rec in tape.allocs]
+-        planned = self.memory in _PLANNED
+-        if planned:
+-            addresses = arena_addresses(lowered, arenas, addresses)
++        moves = bool(arenas or memory.hosted)
++        if moves:
++            addresses = arena_addresses(lowered, memory, arenas, addresses)
+         captured = capture_tape(lowered, addresses)
+-        if planned:
++        if moves:
+             captured, memory = relocate(captured, memory, arenas)
+         bases = [*addresses, *(_placeholder(r) for r in lowered.eager_roots)]
+         tape.release_args()

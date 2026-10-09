@@ -1,0 +1,92 @@
+--- a/torch/cuda/_host_trace.py
++++ b/torch/cuda/_host_trace.py
+@@ -127,6 +127,42 @@
+     return unit
+ 
+ 
++def choice_range(x: int, choose: Callable[[int], Any], period: int, top: int | None = None) -> tuple[Any, int, int]:
++    """(choose(x), lo, hi): the run of values lo <= x <= hi around x at which
++    choose decides the same, for a choose constant on each block
++    (period * k, period * (k + 1)] of its argument (x >= 1): one value per
++    block decides it, down to 1 and up to `top`, else up to x's own block."""
++    c = choose(x)
++    k = (x - 1) // period
++    lo, hi = 1, max((k + 1) * period, top or 0)
++    for j in range(k - 1, -1, -1):
++        if choose(j * period + 1) != c:
++            lo = (j + 1) * period + 1
++            break
++    for j in range(k + 1, (hi - 1) // period + 1):
++        if choose(j * period + 1) != c:
++            hi = j * period
++            break
++    return c, lo, hi
++
++
++def choice(x: IntLikeType, choose: Callable[[int], Any], period: int = 1, top: int | None = None) -> Any:
++    """choose(x) for a traced host where choose reads x through arithmetic a
++    trace does not carry (a launcher's float cost model picking a tile): its
++    decision at x's hint, guarded on the run of values that make the same
++    decision (choice_range), not on x's value. In an op's own host (a custom
++    op's or a dispatch_unit's) the guards are the op's: a call outside the run
++    dispatches the op again, and one inside replays, whatever x is."""
++    if isinstance(x, int):
++        return choose(x)
++    from torch.cuda._host_trace_tape import _hint
++
++    c, lo, hi = choice_range(_hint(x), choose, period, top)
++    if (lo > 1 and not bool(x >= lo)) or not bool(x <= hi):
++        raise AssertionError(f"host_trace: {x}'s hint is outside its own choice's run [{lo}, {hi}]")
++    return c
++
++
+ # a view's symbolic size-1 dim may take another stride than eager's (it
+ # addresses nothing), so the trace does not branch on that size being 1
+ free_size_one_strides = True
+--- a/test/test_cuda_host_trace_triton.py
++++ b/test/test_cuda_host_trace_triton.py
+@@ -1015,6 +1015,44 @@
+         counts = (r.traces, r.replays, r.eager, r.redispatches, len(r.variants))
+         self.assertEqual(counts, (traces, 6 - traces, 0, int(how == "unit"), traces))
+ 
++    def test_a_float_cost_model_choice_dispatches_again_where_it_changes(self):
++        # a launcher's tile choice by a float cost model over n (trtllm-gen's
++        # generation tile, selectTileSizeQForGqaGeneration): choice() guards
++        # the run of n that picks the block, not n, and in a dispatch_unit
++        # those guards are the unit's. A new n inside a run seen replays, a
++        # run first seen dispatches the unit again, no call traces again
++        def cost(n):
++            blocks = {b: -(-n // b) for b in (256, 512, 1024, 2048)}
++            t = {b: -(-k // 132) * (1.0 + 0.37 * b / 256.0) + 0.05 * k for b, k in blocks.items()}
++            return min(t, key=t.get)
++
++        @torch.cuda._host_trace.dispatch_unit
++        def pick(x):
++            n = x.numel()
++            b = torch.cuda._host_trace.choice(n, cost, period=256, top=1 << 17)
++            y = torch.empty_like(x)
++            _add[(triton.cdiv(n, b),)](x, y, n, 1, B=b)
++            return y
++
++        def f(x):
++            return pick(x).sin()
++
++        r = HostTraceReplay(f)
++        # all 1 mod 16: Triton's own specialization of n (% 16, == 1) is fixed
++        sizes = (1009, 1009, 2001, 3825, 3841, 5009, 1505, 20001, 70001, 14833, 4001, 200001, 90001)
++        for n in sizes:
++            x = torch.randn(n, device="cuda")
++            self.assertEqual(r(x), f(x), atol=0, rtol=0)
++        runs = [torch.cuda._host_trace.choice_range(n, cost, 256, 1 << 17) for n in sizes]
++        self.assertEqual([c for c, _, _ in runs], [cost(n) for n in sizes])
++        self.assertEqual(sorted({c for c, _, _ in runs}), [256, 512, 1024, 2048])
++        # the trace is the first call's; each run first seen after it is a redispatch
++        seen, expected = {runs[0][1:]}, 0
++        for _, lo, hi in runs[1:]:
++            expected += (lo, hi) not in seen
++            seen.add((lo, hi))
++        self.assertEqual((r.traces, r.eager, r.redispatches, len(r.variants)), (1, 0, expected, 1))
++
+ 
+ _REVIEWED = {
+     "3.8.0": "f17f11b395889ea4ed4e98de50b6533ab191eb6f07962df9c1d538d31735735e",

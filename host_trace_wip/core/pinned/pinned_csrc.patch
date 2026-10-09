@@ -1,0 +1,128 @@
+--- a/torch/csrc/cuda/host_trace/Variant.h
++++ b/torch/csrc/cuda/host_trace/Variant.h
+@@ -335,11 +335,14 @@
+     bool constant_shape;
+     std::array<int64_t, 3> shape; // a keyed row's
+   };
+-  // A 1D device-to-device memcpy (copy_'s cudaMemcpyAsync); no keyed site's
++  // A 1D memcpy (copy_'s cudaMemcpyAsync); no keyed site's. A host-to-device
++  // or device-to-host one copies from or to pinned argument host_arg
+   struct MemcpyRow {
+     Field dst;
+     Field src;
+     int64_t bytes_row;
++    cudaMemcpyKind kind;
++    int64_t host_arg;
+   };
+   // One kernel, memset or memcpy node of a segment. Its topology (kind, launch
+   // attributes, programmatic edge into it) is fixed at instantiation; a keyed
+--- a/torch/csrc/cuda/host_trace/VariantBuild.cpp
++++ b/torch/csrc/cuda/host_trace/VariantBuild.cpp
+@@ -88,7 +88,11 @@
+       continue;
+     }
+     if (r.kind == Kind::Memcpy) {
+-      r.copy = {parse_source(t[2]), parse_source(t[3]), check_row(t[4].cast<int64_t>())};
++      const auto kind = static_cast<cudaMemcpyKind>(t[5].cast<int>());
++      TORCH_CHECK_VALUE(
++          kind == cudaMemcpyDeviceToDevice || kind == cudaMemcpyHostToDevice || kind == cudaMemcpyDeviceToHost,
++          "a memcpy kind");
++      r.copy = {parse_source(t[2]), parse_source(t[3]), check_row(t[4].cast<int64_t>()), kind, t[6].cast<int64_t>()};
+       records_.push_back(std::move(r));
+       continue;
+     }
+--- a/torch/csrc/cuda/host_trace/Patch.cpp
++++ b/torch/csrc/cuda/host_trace/Patch.cpp
+@@ -2,6 +2,9 @@
+ 
+ #if !defined(USE_ROCM)
+ #include <ATen/cuda/host_trace/LaunchLayout.h>
++#include <ATen/core/CachingHostAllocator.h>
++#include <ATen/cuda/CUDAContext.h>
++#include <torch/csrc/autograd/python_variable.h>
+ #include <c10/cuda/CUDAException.h>
+ #include <c10/cuda/driver_api.h>
+ #include <c10/util/safe_numerics.h>
+@@ -455,7 +458,19 @@
+           reinterpret_cast<void*>(held[0]),
+           reinterpret_cast<const void*>(held[1]),
+           static_cast<size_t>(held[2]),
+-          cudaMemcpyDeviceToDevice));
++          r.copy.kind));
++      if (r.copy.kind != cudaMemcpyDeviceToDevice) {
++        // as eager's non_blocking copy_: the pinned block is not reused
++        // before the work queued on this stream (the replay) completes
++        const int64_t i = r.copy.host_arg;
++        TORCH_CHECK(
++            i >= 0 && static_cast<size_t>(i) < frame.count && THPVariable_Check(frame.args[i]),
++            "host_trace: a memcpy's host argument is not a tensor");
++        PyObject* a = frame.args[i];
++        void* ptr = reinterpret_cast<void*>(held[r.copy.kind == cudaMemcpyHostToDevice ? 1 : 0]);
++        void* ctx = THPVariable_Unpack(a).storage().data_ptr().get_context();
++        at::getHostAllocator(at::kCUDA)->record_event(ptr, ctx, at::cuda::getCurrentCUDAStream(device_));
++      }
+       ++memory_node_sets;
+       TORCH_CHECK(
+           fail_after_setter < 0 || fail_after_setter-- != 0,
+--- a/torch/csrc/cuda/host_trace/Entry.cpp
++++ b/torch/csrc/cuda/host_trace/Entry.cpp
+@@ -397,7 +397,9 @@
+           {Tensor,
+            reinterpret_cast<int64_t>(Py_TYPE(a)),
+            static_cast<int64_t>(t.scalar_type()),
+-           static_cast<int64_t>(t.device().type()),
++           // a pinned CPU tensor (a memcpy's host argument) is its own kind
++           static_cast<int64_t>(t.device().type()) |
++               static_cast<int64_t>(t.is_cpu() && t.is_pinned()) << 16,
+            t.device().index(),
+            t.dim(),
+            static_cast<int64_t>(t.layout()),
+@@ -1132,8 +1134,8 @@
+   std::vector<PyTypeObject*> types; // per call object
+   std::vector<std::pair<BoundRead, PyObject*>> same; // absent reads as None
+   std::vector<BoundBelow> below; // value < limits[index], both ints
+-  std::vector<BoundRead> other; // no CUDA tensor
+-  std::vector<BoundRead> tensors; // CUDA tensors
++  std::vector<BoundRead> other; // no CUDA or pinned tensor
++  std::vector<BoundRead> tensors; // CUDA or pinned CPU tensors
+   std::vector<BoundRead> ints;
+   py::object type; // the output's, or None: the flat outputs
+   py::object fields; // its template's attributes
+@@ -1166,12 +1168,16 @@
+ };
+ 
+ // by type: THPVariable_Check sends a non-tensor through the metaclass's
+-// __instancecheck__, and most of a plan's reads are not tensors
+-bool is_cuda_tensor(PyObject* v) {
+-  return v && THPVariableClass &&
+-      PyType_IsSubtype(
+-             Py_TYPE(v), reinterpret_cast<PyTypeObject*>(THPVariableClass)) &&
+-      THPVariable_Unpack(v).is_cuda();
++// __instancecheck__, and most of a plan's reads are not tensors. A pinned
++// CPU tensor is an argument too (a memcpy's host side)
++bool is_argument_tensor(PyObject* v) {
++  if (!v || !THPVariableClass ||
++      !PyType_IsSubtype(
++          Py_TYPE(v), reinterpret_cast<PyTypeObject*>(THPVariableClass))) {
++    return false;
++  }
++  const at::Tensor& t = THPVariable_Unpack(v);
++  return t.is_cuda() || (t.is_cpu() && t.is_pinned());
+ }
+ 
+ bool bound_matches(
+@@ -1210,12 +1216,12 @@
+     }
+   }
+   for (const BoundRead& r : p.other) {
+-    if (is_cuda_tensor(get(r))) {
++    if (is_argument_tensor(get(r))) {
+       return false;
+     }
+   }
+   for (const BoundRead& r : p.tensors) {
+-    if (!is_cuda_tensor(get(r))) {
++    if (!is_argument_tensor(get(r))) {
+       return false;
+     }
+   }

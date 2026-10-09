@@ -1,0 +1,261 @@
+--- a/torch/cuda/_host_trace_ir.py
++++ b/torch/cuda/_host_trace_ir.py
+@@ -95,6 +95,7 @@
+         "mul",
+         "floordiv",
+         "ceildiv",
++        "floorratio",
+         "mod",
+         "min",
+         "max",
+@@ -145,7 +146,7 @@
+ }
+ # Ctx.transfer's constructor per op: of the operands, or of the op and the operands
+ _BUILDERS = {
+-    **{op: op for op in ("floordiv", "ceildiv", "mod", "min", "max", "bitlen", "f32div", "where")},
++    **{op: op for op in ("floordiv", "ceildiv", "floorratio", "mod", "min", "max", "bitlen", "f32div", "where")},
+     "ffromint": "to_float",
+ }
+ _OP_BUILDERS = {
+@@ -617,7 +618,7 @@
+             if blo is not None and blo >= 0:
+                 return 0, (None if bhi is None else max(bhi - 1, 0))
+             return None, None
+-        if op in ("floordiv", "ceildiv"):
++        if op in ("floordiv", "ceildiv", "floorratio"):
+             alo, ahi = self.bounds(n.args[0])
+             blo, bhi = self.bounds(n.args[1])
+             if alo is not None and alo >= 0 and blo is not None and blo >= 0:
+@@ -709,6 +710,18 @@
+             return a
+         return self.mk("ceildiv", (a, b), -(-a.hint // b.hint))
+ 
++    def floorratio(self, a: Node, b: Node) -> Node:
++        # floor(a / b) of integers the host divided as doubles: apart from
++        # floordiv (exact //), as the sympy path keeps FloorToInt(IntTrueDiv(a, b))
++        # apart from FloorDiv; the two differ past 2**53
++        if b.op == "const" and b.args[0] == 0:
++            raise ZeroDivisionError("floorratio by zero")
++        if a.op == "const" and b.op == "const":
++            return self.const(a.args[0] // b.args[0])
++        if b.op == "const" and b.args[0] == 1:
++            return a
++        return self.mk("floorratio", (a, b), a.hint // b.hint)
++
+     def int_ratio(self, f: Node) -> tuple[Node, Node] | None:
+         # the integer operands of a float division of integer-valued operands
+         # (what int_truediv builds), else None
+@@ -1027,7 +1040,7 @@
+ 
+     def fint(self, op: str, a: Node) -> Node:
+         # int() / math.floor / math.ceil of a float: an integer node over a
+-        # float operand (the ratio of integers takes floordiv / ceildiv)
++        # float operand (the ratio of integers takes floorratio / ceildiv)
+         f = {"ftrunc": int, "ffloor": math.floor, "fceil": math.ceil}[op]
+         if a.op == "fconst":
+             return self.const(f(a.hint))
+@@ -1585,7 +1598,7 @@
+             return self
+         ratio = self.env.ctx.int_ratio(self.node)
+         if ratio is not None:
+-            return self._int(self.env.ctx.floordiv(*ratio))
++            return self._int(self.env.ctx.floorratio(*ratio))
+         return self._int(self.env.ctx.fint("ffloor", self.node))
+ 
+     def ceil(self) -> IRSymNode:
+@@ -1929,6 +1942,8 @@
+             return FloorDiv(e(n.args[0]), e(n.args[1]), evaluate=False)
+         if op == "ceildiv":
+             return CeilToInt(IntTrueDiv(e(n.args[0]), e(n.args[1])))
++        if op == "floorratio":
++            return FloorToInt(IntTrueDiv(e(n.args[0]), e(n.args[1])))
+         if op == "mod":
+             a, b = n.args
+             cls = Mod if ctx.is_nonnegative(a) and ctx.is_nonnegative(b) else PythonMod
+--- a/torch/cuda/_host_trace_lower.py
++++ b/torch/cuda/_host_trace_lower.py
+@@ -487,11 +487,11 @@
+             c, factors = args
+             rows = [self._power_of(f, e) for f, e in factors]
+             return self._chain("multiply", [*([self._int_constant(c)] if c != 1 else []), *rows])
+-        if op in ("floordiv", "ceildiv"):
+-            if op == "ceildiv":
+-                # IRSymNode.ceil of an int ratio
++        if op in ("floordiv", "ceildiv", "floorratio"):
++            if op != "floordiv":
++                # IRSymNode.ceil / floor of an int ratio
+                 self._require_exact(self._int(args[0]))
+-            return self._divide_nodes(*args, floor=op == "floordiv")
++            return self._divide_nodes(*args, floor=op != "ceildiv")
+         if op == "mod":
+             num, den = args
+             quotient = self._divide_nodes(num, den, floor=True)
+--- a/torch/cuda/_host_trace_cover.py
++++ b/torch/cuda/_host_trace_cover.py
+@@ -445,11 +445,11 @@
+         out = a[0]
+         for v, (_, e) in zip(vs, a[1]):
+             out = out * v**e
+-    elif op in ("floordiv", "ceildiv", "mod"):
++    elif op in ("floordiv", "floorratio", "ceildiv", "mod"):
+         x, y = ev(a[0]), ev(a[1])
+         if (np.asarray(y) == 0).any():
+             raise ZeroDivisionError(op)
+-        out = x // y if op == "floordiv" else -(-x // y) if op == "ceildiv" else x % y
++        out = x // y if op in ("floordiv", "floorratio") else -(-x // y) if op == "ceildiv" else x % y
+     elif op in ("min", "max"):
+         vs = [ev(x) for x in a]
+         if any(isinstance(v, np.ndarray) for v in vs):
+--- a/test/host_trace_ir_oracle.py
++++ b/test/host_trace_ir_oracle.py
+@@ -29,6 +29,10 @@
+ under one lowering where the other accepted is a difference. The IR result is
+ returned when there is no difference.
+ 
++Under `install(strict=True)` (default: TORCH_HOST_TRACE_ORACLE=strict) a test
++that records a difference in any of the three logs fails with
++BackendDifference, after its own outcome.
++
+ `install_meta()` (part of `install()`) checks each call the trace routes
+ around its fake kernel (a traced ATen host, a view on a bare meta tensor, an
+ opaque call's meta function) against the fake kernel on the same operands
+@@ -41,10 +45,12 @@
+ import contextlib
+ import dataclasses
+ import math
++import os
+ import random
+ import struct
+ import sys
+ import threading
++import unittest
+ from dataclasses import dataclass, field
+ from typing import Any
+ 
+@@ -206,7 +212,7 @@
+             x = self(e.args[0])
+             ratio = c.int_ratio(x)
+             if ratio is not None:
+-                return (c.ceildiv if ceil else c.floordiv)(*ratio)
++                return (c.ceildiv if ceil else c.floorratio)(*ratio)
+             return c.fint("fceil" if ceil else "ffloor", x)
+         if isinstance(e, tf.OpaqueUnaryFn_sqrt):
+             return c.fun("fsqrt", self(e.args[0]))
+@@ -621,7 +627,7 @@
+     "LoweredEagerCall": ("grid",),
+     "LoweredOpaqueCall": ("rows",),
+     "LoweredKeyedSite": ("rows",),
+-    "LoweredSelector": ("predicate",),
++    "LoweredSelector": ("predicate", "rows"),
+     "LoweredTape": ("valid",),
+ }
+ 
+@@ -954,11 +960,11 @@
+         v = a[0]
+         for f, e in a[1]:
+             v *= ev(f) ** e
+-    elif op in ("floordiv", "ceildiv", "mod"):
++    elif op in ("floordiv", "floorratio", "ceildiv", "mod"):
+         x, d = ev(a[0]), ev(a[1])
+         if d == 0:
+             raise _Undecided("division by zero")
+-        v = x // d if op == "floordiv" else -(-x // d) if op == "ceildiv" else x % d
++        v = x // d if op in ("floordiv", "floorratio") else -(-x // d) if op == "ceildiv" else x % d
+     elif op == "pbn":
+         e = ev(a[1])
+         if e < 0:
+@@ -1210,9 +1216,32 @@
+     tape_mod._Trace._opaque_meta = _meta_opaque
+ 
+ 
+-def install() -> None:
++def _strict(run: Any) -> Any:
++    """unittest.TestCase.run, failing a test whose calls recorded a difference."""
++
++    def strict_run(test: unittest.TestCase, result: Any = None) -> Any:
++        CURRENT["test"] = test.id()
++        logs = (LOG, LOWER_LOG, META_LOG)
++        marks = [len(log) for log in logs]
++        result = run(test, result)
++        diffs = [f"{type(e).__name__}: {e.diff}" for log, m in zip(logs, marks) for e in log[m:] if e.diff]
++        if diffs and result is not None:
++            try:
++                raise BackendDifference(f"{len(diffs)} oracle difference(s): " + " | ".join(d[:400] for d in diffs[:5]))
++            except BackendDifference:
++                result.addFailure(test, sys.exc_info())
++        return result
++
++    return strict_run
++
++
++def install(strict: bool | None = None) -> None:
+     """Rebind trace / _symbolic_run / lower_tape in every loaded module that
+     holds them."""
++    if strict is None:
++        strict = os.environ.get("TORCH_HOST_TRACE_ORACLE") == "strict"
++    if strict:
++        unittest.TestCase.run = _strict(unittest.TestCase.run)
+     # the pairing's first run is sympy's
+     ht.symbolic = "sympy"
+     for mod in list(sys.modules.values()):
+--- a/test/test_cuda_host_trace_lower.py
++++ b/test/test_cuda_host_trace_lower.py
+@@ -2,6 +2,7 @@
+ 
+ import math
+ import random
++import unittest
+ 
+ import sympy
+ from sympy.logic.boolalg import BooleanFalse, BooleanTrue
+@@ -265,6 +266,50 @@
+                     self.assertEqual(status, Status.SUCCESS, (v, xv, yv))
+                     self.assertEqual(outputs[row], math.ceil(float(n) / float(d)), (v, xv, yv))
+ 
++    def test_ir_floor_of_an_int_ratio_is_not_floordiv(self):
++        # math.floor(x / 3.0) floors a rounded double and x // 3 is exact:
++        # past 2**53 they differ, so the first misses there, as its export does
++        E = 2**53
++        self.assertNotEqual(math.floor(float(E + 1) / 3.0), (E + 1) // 3)
++        env = _ir.Env()
++        x = env.symbol(7, "x")
++        node, symbol = x.node.node, env.export.symbol(x.node.node.args[0])
++        for v, exact in ((math.floor(x / 3.0), False), (x // 3, True)):
++            n = v.node.node
++            lowerings = [
++                lambda p: IRLowering(p, {node: ("boxed", 0)}, env.ctx).lower(n),
++                lambda p: Lowering(p, {symbol: ("boxed", 0)}).lower(env.export.expr(n)),
++            ]
++            for lower in lowerings:
++                program = IntegerProgram([7])
++                row = lower(program)
++                compiled = compile_program(program)
++                for xv in (7, -7, 0, E - 1, -(E - 1), E + 1, -(E + 1)):
++                    status, outputs = compiled.evaluate_inputs((xv,))
++                    if not exact and abs(xv) >= E:
++                        self.assertNotEqual(status, Status.SUCCESS, (v, xv))
++                        continue
++                    self.assertEqual(status, Status.SUCCESS, (v, xv))
++                    self.assertEqual(outputs[row], xv // 3 if exact else math.floor(float(xv) / 3.0), (v, xv))
++
++    def test_strict_oracle_fails_a_test_that_records_a_difference(self):
++        import host_trace_ir_oracle as oracle
++
++        class Case(unittest.TestCase):
++            def test_differs(self):
++                oracle.LOWER_LOG.append(oracle.LowerEntry("x", diff="rows differ"))
++
++            def test_agrees(self):
++                oracle.LOWER_LOG.append(oracle.LowerEntry("x"))
++
++        mark = len(oracle.LOWER_LOG)
++        run, result = oracle._strict(unittest.TestCase.run), unittest.TestResult()
++        for name in ("test_differs", "test_agrees"):
++            run(Case(name), result)
++        del oracle.LOWER_LOG[mark:]
++        self.assertEqual([t.id().rsplit(".", 1)[-1] for t, _ in result.failures], ["test_differs"])
++        self.assertIn("rows differ", result.failures[0][1])
++
+     def test_float_relations_round_as_the_host(self):
+         # sqrt and / on doubles, each correctly rounded as c10's SymFloat
+         # computes them; 2921 is the first int whose pow(x, 0.5) is not sqrt(x)

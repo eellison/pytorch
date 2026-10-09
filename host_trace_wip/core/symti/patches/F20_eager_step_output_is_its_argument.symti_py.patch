@@ -1,0 +1,19 @@
+--- a/torch/cuda/_host_trace_lower_tape.py
++++ b/torch/cuda/_host_trace_lower_tape.py
+@@ -417,9 +417,14 @@
+                 leaves.append(v)
+         outputs: list[PredictedOutput | int] = []
+         for t in call.outputs:
+-            if t._root.kind != "eager":
+-                outputs.append(next(i for i, v in enumerate(traced) if v is t))
++            # an output the call was passed (an in-place or out= op's) is that argument, even one over an
++            # earlier eager step's output; only a tensor the call made is a prediction of its root
++            at = next((i for i, v in enumerate(traced) if v is t), None)
++            if at is not None:
++                outputs.append(at)
+                 continue
++            if t._root.kind != "eager":
++                raise AssertionError(f"host_trace: {call.name} returned a tensor it neither made nor was passed")
+             v = self.view(t)
+             outputs.append(
+                 PredictedOutput(

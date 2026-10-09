@@ -1,0 +1,192 @@
+--- a/test/inductor/test_cudagraph_host_trace.py
++++ b/test/inductor/test_cudagraph_host_trace.py
+@@ -834,7 +834,7 @@
+             self.assertEqual(compiled(x), _mm(x))
+         (installation,) = self.installed
+         replay = installation.replay
+-        self.assertEqual((replay.variants, replay.declines), ([], []))
++        self.assertEqual((replay.variants, replay.declines), ([], ["host_trace: no traced launches: every operation runs eagerly (aten.mm.out) (declined)"]))
+         self.assertGreater(replay.uncaptured, 0)
+         self.assertEqual(counters["inductor"]["cudagraph_host_trace_declined"], 0)
+         self.assertEqual(counters["inductor"]["cudagraph_skips"], 0)
+@@ -1404,6 +1404,13 @@
+         records = [r for i in self.installed for _, r in i.replay.variants[0].tape.launches]
+         return [r for r in records if isinstance(r, EagerCall) and r.host]
+ 
++    def _noted_eager_steps(self):
++        # every other decline is a fallback the test does not expect
++        prefix = "host_trace: an eager step in a variant: "
++        declines = [d for i in self.installed for d in i.replay.declines]
++        self.assertTrue(all(d.startswith(prefix) for d in declines), declines)
++        return {d.removeprefix(prefix).split(" (")[0] for d in declines}
++
+     def _eager_steps(self):
+         # the graph breaks: what fullgraph=True raises on
+         records = [r for i in self.installed for _, r in i.replay.variants[0].tape.launches]
+@@ -1426,7 +1433,7 @@
+                 self.assertEqual(got, plain(x), atol=0, rtol=0)
+                 self.assertEqual(state, torch.get_rng_state())
+         (installation,) = self.installed
+-        self.assertEqual(installation.replay.declines, [])
++        self.assertEqual(self._noted_eager_steps(), {"aten.copy_.default"})
+         self.assertEqual(installation.replay.eager, 1)
+         self.assertGreater(installation.replay.replays, 0)
+         self.assertTrue(self._host_steps())
+@@ -1447,7 +1454,8 @@
+             self.assertEqual(x.grad, y.grad)
+         for installation in self.installed:
+             replay = installation.replay
+-            self.assertEqual((replay.traces, replay.replays, replay.eager, replay.declines), (1, 2, 1, []))
++            self.assertEqual((replay.traces, replay.replays, replay.eager), (1, 2, 1))
++        self.assertEqual(self._noted_eager_steps(), {"aten.copy_.default"})
+         self.assertTrue(self._host_steps())
+         # the CPU buffer's copy to the device runs eagerly between replays
+         self.assertEqual(self._eager_steps(), ["aten.copy_.default"])
+@@ -1470,7 +1478,8 @@
+         self.assertEqual(len(self.installed), 2)
+         for installation in self.installed:
+             replay = installation.replay
+-            self.assertEqual((replay.traces, replay.replays, replay.eager, replay.declines), (1, 3, 1, []))
++            self.assertEqual((replay.traces, replay.replays, replay.eager), (1, 3, 1))
++        self.assertEqual(self._noted_eager_steps(), {"aten._fft_c2c.default"})
+         # cuFFT has no traced implementation: each graph runs its two FFTs eagerly
+         self.assertEqual(self._eager_steps(), ["aten._fft_c2c.default"] * 4)
+ 
+--- a/test/test_cuda_host_trace_replay.py
++++ b/test/test_cuda_host_trace_replay.py
+@@ -874,8 +874,9 @@
+         # the warm-up is the call: fn runs once for it and once for the trace
+         self.assertEqual(f(x), x.cumsum(0))
+         self.assertEqual((len(calls), f.traces, f.eager), (2, 1, 1))
+-        # no traced launches: uncaptured, not a decline
+-        self.assertEqual((f.uncaptured, f.declines), (1, []))
++        # no traced launches: uncaptured, not a structural decline
++        why = "host_trace: no traced launches: every operation runs eagerly (aten.cumsum.default) (declined)"
++        self.assertEqual((f.uncaptured, f.structural, f.declines), (1, 0, [why]))
+         # the declined class runs eagerly without a trace
+         self.assertEqual(f(x), x.cumsum(0))
+         self.assertEqual((len(calls), f.traces, f.eager), (3, 1, 2))
+@@ -884,7 +885,7 @@
+         y = torch.randn(7, device="cuda")
+         self.assertEqual(f(y), y.cumsum(0))
+         self.assertEqual((len(calls), f.traces, f.eager), (4, 1, 3) if keep else (5, 2, 3))
+-        self.assertEqual((f.variants, f.uncaptured, f.declines), ([], 1 if keep else 2, []))
++        self.assertEqual((f.variants, f.uncaptured, f.declines), ([], 1 if keep else 2, [why]))
+ 
+     def test_a_tensor_constant_runs_eagerly(self):
+         f = HostTraceReplay(lambda xs: add(xs[0]))
+@@ -1410,7 +1411,9 @@
+         for n, k in ((3, 0), (5, 0), (3, 0), (4, 2), (3, 0)):
+             t = torch.randn(n, k, device="cuda")
+             self.assertEqual(f(t), fn(t), atol=0, rtol=0, equal_nan=True)
+-        self.assertEqual(f.declines, [])
++        # the (4, 2) call's prod, var_mean and std_mean have no traced launch
++        uncaptured = {"prod": "aten.prod.dim_int", "var_mean": "aten.var_mean.correction", "std_mean": "aten.std_mean.correction"}.get(op)
++        self.assertEqual(f.declines, [f"host_trace: no traced launches: every operation runs eagerly ({uncaptured}) (declined)"] if uncaptured else [])
+         self.assertEqual(f.traces, 2)
+         for v in f.variants:
+             self.assertFalse([r for _, r in v.tape.launches if isinstance(r, EagerCall)])
+@@ -1470,12 +1473,12 @@
+         # the first call, eager, tunes its size; a later size's warm-up tunes
+         # it: the benchmark's calls are not the trace's, so that call runs
+         # eagerly and the next traces (a witness decline is retried once per
+-        # class, and logged)
++        # class, and noted)
+         with mock.patch.object(_add_tuned, "_bench", ranked):
+             for n in (1000, 1000, 2000, 2000, 2000):
+                 x = torch.randn(n, device="cuda")
+                 self.assertEqual(f(x), x + 3)
+-        self.assertEqual((f.traces, f.replays, f.eager, f.declines), (3, 1, 2, []))
++        self.assertEqual((f.traces, f.replays, f.eager, [d[-9:] for d in f.declines]), (3, 1, 2, ["(retried)"]))
+ 
+     @unittest.skipIf(torch.cuda.device_count() < 2, "requires two GPUs")
+     def test_a_capture_on_the_tapes_device(self):
+@@ -1548,8 +1551,9 @@
+         self.assertEqual(calls, [1, 2, 1, 1, 1])
+         (v,) = f.variants
+         self.assertEqual(len(v.captured.segments), 3)
+-        self.assertEqual(len(f.declines), 1)
++        self.assertEqual(len(f.declines), 2)
+         self.assertIn("RuntimeError: injected", f.declines[0])
++        self.assertEqual(f.declines[1], "host_trace: an eager step in a variant: aten.mm.default (no traced implementation)")
+         # the suites' strict mode raises it
+         calls.clear()
+         with mock.patch("torch.cuda._host_trace.raise_unexpected", True):
+@@ -1578,8 +1582,9 @@
+         self.assertEqual((f.traces, f.replays, f.eager), (2, 2, 0))
+         (v,) = f.variants
+         self.assertEqual(len(v.captured.segments), 1)
+-        self.assertEqual(len(f.declines), 1)
++        self.assertEqual(len(f.declines), 2)
+         self.assertIn("the capture of _add failed: refused", f.declines[0])
++        self.assertEqual(f.declines[1], "host_trace: an eager step in a variant: aten.mm.default (no traced implementation)")
+ 
+     def test_an_inplace_eager_op(self):
+         def fn(x):
+@@ -1634,7 +1639,8 @@
+         for n in (8, 8, 16):
+             x, w = torch.randn(n, 64, device="cuda"), torch.randn(64, device="cuda")
+             self.assertEqual(f(x, w), fn(x, w))
+-        self.assertEqual((f.replays, f.eager, f.declines), (2, 0, []))
++        self.assertEqual((f.replays, f.eager), (2, 0))
++        self.assertEqual(f.declines, ["host_trace: an eager step in a variant: aten.native_layer_norm_backward.default (no traced implementation)"])
+ 
+     @unittest.skipIf(not PLATFORM_SUPPORTS_CUDNN_ATTENTION, "requires cuDNN attention")
+     def test_cudnn_attention(self):
+@@ -1647,7 +1653,8 @@
+         for s in (128, 128, 256):
+             q, k, v = (torch.randn(2, 4, s, 64, device="cuda", dtype=torch.bfloat16) for _ in range(3))
+             self.assertEqual(f(q, k, v), fn(q, k, v))
+-        self.assertEqual((f.replays, f.eager, f.declines), (2, 0, []))
++        self.assertEqual((f.replays, f.eager), (2, 0))
++        self.assertEqual(f.declines, ["host_trace: an eager step in a variant: aten._scaled_dot_product_cudnn_attention.default (no traced implementation)"])
+ 
+     @unittest.skipIf(not PLATFORM_SUPPORTS_CUDNN_ATTENTION, "requires cuDNN attention")
+     def test_cudnn_attention_of_a_shape_it_does_not_take_raises(self):
+@@ -1752,7 +1759,7 @@
+         self.assertEqual(f(x), x + 6)
+         self.assertEqual((f.traces, f.replays, f.eager, len(f.variants)), (2, 1, 2, 1))
+         self.assertRegex(
+-            f.declines[0],
++            f.declines[-1],
+             r"transposed_fake_at_4.default output 0 .*\(16, 1\).* at the warm-up; its fake kernel predicted .*\(1, 4\)",
+         )
+ 
+@@ -1964,7 +1971,7 @@
+             self.assertEqual(z.stride(), (1, 16))
+         # the lazy initialization is a call the trace does not make: the first
+         # call runs eagerly and the next traces (the witness decline's retry)
+-        self.assertEqual((f.traces, f.replays, f.eager, f.declines), (2, 1, 1, []))
++        self.assertEqual((f.traces, f.replays, f.eager, [d[-9:] for d in f.declines]), (2, 1, 1, ["(retried)"]))
+ 
+ 
+ @unittest.skipIf(not TEST_CUDA, "requires CUDA")
+--- a/torch/cuda/_host_trace_replay.py
++++ b/torch/cuda/_host_trace_replay.py
+@@ -1140,14 +1140,14 @@
+                 self.structural += not e.uncaptured
+             if isinstance(e, Declined) and e.uncaptured:
+                 self.uncaptured += 1
+-                log.debug("%s", e)
++                self._note(str(e))
+                 if torch.cuda._host_trace.keep_eager_regions and not e.retry and not eager_ops and tape is not None:
+                     try:
+                         self._eager_regions.setdefault((contract, exact[2]), []).append(lower_guards(tape))
+                     except Declined as d:
+                         self._note(str(d))
+             elif isinstance(e, Declined) and e.retry:
+-                log.debug("%s (retried)", e)
++                self._note(f"{e} (retried)")
+             elif isinstance(e, Declined):
+                 self._note(str(e), e.side_stream)
+             else:
+@@ -1355,6 +1355,9 @@
+         bases = [*addresses, *(_hint(r.sym) for r in lowered.eager_roots)]
+         tape.release_args()
+         for call in calls:
++            # a step a capture failure made is noted as that failure
++            if not isinstance(call, OpaqueCall) and not call.host and call.reason not in self._reasons:
++                self._note(f"host_trace: an eager step in a variant: {call.name} ({call.reason or 'no traced implementation'})")
+             if not isinstance(call.target, tuple) or call.reason is None:
+                 continue
+             if call.reason not in self.triton_fallbacks:

@@ -1,0 +1,238 @@
+--- a/torch/cuda/_host_trace_lower.py
++++ b/torch/cuda/_host_trace_lower.py
+@@ -48,6 +48,8 @@
+     from torch.cuda._host_trace_program import IntegerProgram
+ 
+ 
++# below this in magnitude an integer's double is exact
++_EXACT = (1 << 53) - 1
+ _COMPARISONS = {
+     sympy.Eq: "eq",
+     sympy.Ne: "ne",
+@@ -250,9 +252,9 @@
+             return self._power(e)
+         if isinstance(e, FloorDiv):
+             return self._divide(*e.args, floor=True)
+-        if isinstance(e, (CeilToInt, FloorToInt)) and isinstance(e.args[0], IntTrueDiv):
+-            # the host rounds a float quotient, exactly so below 2**53
+-            return self._divide(*e.args[0].args, floor=isinstance(e, FloorToInt))
++        if isinstance(e, (CeilToInt, FloorToInt)) and (ratio := _int_ratio(e.args[0])) is not None:
++            self._require_exact(self._lower_integer(ratio[0]))
++            return self._divide(*ratio, floor=isinstance(e, FloorToInt))
+         if isinstance(e, (PythonMod, Mod)):
+             # n - d * (n // d); torch's Mod is the same on its nonnegative domain.
+             # A term of n that d divides (an allocation's 256-aligned base, not
+@@ -327,6 +329,21 @@
+                 square = self._emit("multiply", square, square)
+         return result
+ 
++    def _require_exact(self, n: int) -> None:
++        """The host rounded a double quotient n / d of integers and then took
++        its floor or ceiling: below 2**53 in magnitude n's double is exact and
++        the rounding moves the quotient by less than its distance (at least
++        1 / |d|) to the next integer, so the integer division is exact. A call
++        past it misses: under total() a domain, else a division by the
++        condition, which fails the evaluation where it is 0."""
++        ok = self._emit("and", self._emit("le", n, self._constant(_EXACT)), self._emit("le", self._constant(-_EXACT), n))
++        if self.program.values[ok] != 1:
++            raise declined(f"a rounded float quotient's numerator {self.program.values[n]} is past 2**53")
++        if self.program.domains is not None:
++            self.program.domains.append(ok)
++        else:
++            self._emit("floordiv", self._constant(0), ok)
++
+     def _divide(self, n_expr: sympy.Basic, d_expr: sympy.Basic, *, floor: bool) -> int:
+         n, d = self._lower_integer(n_expr), self._lower_integer(d_expr)
+         n_sign = 1 if n_expr.is_nonnegative else -1 if n_expr.is_nonpositive else 0
+@@ -361,6 +378,25 @@
+         )
+ 
+ 
++def _int_ratio(f: sympy.Basic) -> tuple[sympy.Basic, sympy.Basic] | None:
++    """(n, d), integers whose quotient the double f is, rounded once by the
++    host: IntTrueDiv, or FloatTrueDiv of operands each a ToFloat or an
++    integer-valued double (Ctx.int_ratio of the IR backend), else None."""
++    if isinstance(f, IntTrueDiv):
++        return f.args
++    if not isinstance(f, FloatTrueDiv):
++        return None
++    out = []
++    for x in f.args:
++        if isinstance(x, ToFloat):
++            out.append(x.args[0])
++        elif isinstance(x, sympy.Float) and x._prec == 53 and math.isfinite(v := float(x)) and v == int(v):
++            out.append(sympy.Integer(int(v)))
++        else:
++            return None
++    return out[0], out[1]
++
++
+ # a relation's class name as its integer row and as (float row, swapped, negated)
+ _COMPARISON_ROWS = {"Eq": "eq", "Ne": "ne", "Lt": "lt", "Le": "le", "Gt": "gt", "Ge": "ge"}
+ _FLOAT_COMPARISON_ROWS = dict(zip(_COMPARISON_ROWS, _FLOAT_COMPARISONS.values()))
+@@ -452,6 +488,9 @@
+             rows = [self._power_of(f, e) for f, e in factors]
+             return self._chain("multiply", [*([self._int_constant(c)] if c != 1 else []), *rows])
+         if op in ("floordiv", "ceildiv"):
++            if op == "ceildiv":
++                # IRSymNode.ceil of an int ratio
++                self._require_exact(self._int(args[0]))
+             return self._divide_nodes(*args, floor=op == "floordiv")
+         if op == "mod":
+             num, den = args
+@@ -473,9 +512,9 @@
+             c, a, b = args
+             return self._emit("select", self._bool(c), self._int(a), self._int(b))
+         if op in ("ffloor", "fceil"):
+-            # the host rounds a float quotient of ints, exactly so below 2**53
+             ratio = self.ctx.int_ratio(args[0])
+             if ratio is not None:
++                self._require_exact(self._int(ratio[0]))
+                 return self._divide_nodes(*ratio, floor=op == "ffloor")
+         if op in ("true", "false"):
+             return self._constant(int(op == "true"))
+--- a/test/test_cuda_host_trace_lower.py
++++ b/test/test_cuda_host_trace_lower.py
+@@ -8,7 +8,8 @@
+ 
+ import torch
+ from torch.cuda._host_trace import _TraceShapeEnv, BitLength, Declined, F32Div
+-from torch.cuda._host_trace_lower import Lowering
++from torch.cuda import _host_trace_ir as _ir
++from torch.cuda._host_trace_lower import IRLowering, Lowering
+ from torch.cuda._host_trace_program import (
+     compile_program,
+     IntegerProgram,
+@@ -57,6 +58,8 @@
+     CeilToInt(IntTrueDiv(S, T)),  # how math.ceil(s / t) traces
+     CeilToInt(IntTrueDiv(P, 32)),
+     FloorToInt(IntTrueDiv(-P, Q)),
++    CeilToInt(FloatTrueDiv(ToFloat(-2 * P), -1.0)),  # the length of arange(p, -p, -1.0)
++    FloorToInt(FloatTrueDiv(ToFloat(S), ToFloat(T))),
+     PythonMod(S, T),
+     PythonMod(S, 3),
+     PythonMod(P * Q, T),
+@@ -174,6 +177,94 @@
+         with self.assertRaisesRegex(Declined, "fails at the hints"):
+             _lowered([FloorDiv(S, T)], hint=(1, 1, 1, 0))
+ 
++    def test_rounded_float_quotients(self):
++        # the floor or ceiling of a double quotient of integers is the integer
++        # division where the numerator is below 2**53 in magnitude; past it a
++        # call misses, never a wrong value
++        E = 2**53
++        cases = [
++            (CeilToInt(FloatTrueDiv(ToFloat(-2 * P), -1.0)), lambda p, s, t: (-2 * p, -1), True),
++            (CeilToInt(FloatTrueDiv(ToFloat(S), -1.0)), lambda p, s, t: (s, -1), True),
++            (FloorToInt(FloatTrueDiv(ToFloat(S), 3.0)), lambda p, s, t: (s, 3), False),
++            (CeilToInt(FloatTrueDiv(ToFloat(S + 1), -7.0)), lambda p, s, t: (s + 1, -7), True),
++            (CeilToInt(FloatTrueDiv(ToFloat(S), float(2**60))), lambda p, s, t: (s, 2**60), True),
++            (CeilToInt(FloatTrueDiv(12.0, ToFloat(T))), lambda p, s, t: (12, t), True),
++            (CeilToInt(FloatTrueDiv(ToFloat(S), ToFloat(T))), lambda p, s, t: (s, t), True),
++            (FloorToInt(FloatTrueDiv(ToFloat(S), ToFloat(T))), lambda p, s, t: (s, t), False),
++            (CeilToInt(IntTrueDiv(S, T)), lambda p, s, t: (s, t), True),
++            (FloorToInt(IntTrueDiv(S, T)), lambda p, s, t: (s, t), False),
++        ]
++        # where the integer division would be wrong: (2**53 + 1) / 1 rounds to 2**53
++        self.assertNotEqual(math.ceil((E + 1) / 1), E + 1)
++        rng = random.Random(0)
++        small = [(rng.randint(1, 12), rng.randint(-12, 12), rng.randint(-12, 12)) for _ in range(300)]
++        large = [E - 1, -(E - 1), E, -E, E + 1, 3 * 2**51 + 1, -(3 * 2**51) - 1, 2**62, LO, HI]
++        divisors = [1, -1, 3, -7, E - 1, E + 1, -(2**60) - 1, HI]
++        points = small + [(p, s, t) for p in (1, 2**52 - 1, 2**52, 2**62) for s in large for t in divisors]
++        for e, operands, ceil in cases:
++            compiled, (row,) = _lowered([e])
++            for p, s, t in points:
++                n, d = operands(p, s, t)
++                status, outputs = compiled.evaluate_inputs((p, 1, s, t))
++                if d == 0 or abs(n) >= E:
++                    self.assertNotEqual(status, Status.SUCCESS, (e, p, s, t))
++                    continue
++                self.assertEqual(status, Status.SUCCESS, (e, p, s, t))
++                q = n / d if isinstance(e.args[0], IntTrueDiv) else float(n) / float(d)
++                self.assertEqual(outputs[row], (math.ceil if ceil else math.floor)(q), (e, p, s, t))
++
++    def test_rounded_float_quotient_declines(self):
++        for e in [
++            CeilToInt(FloatTrueDiv(ToFloat(S), 0.5)),  # not an integer-valued double
++            CeilToInt(FloatTrueDiv(ToFloat(S), sympy.Float(3, 30))),  # not a double
++            FloorToInt(FloatTrueDiv(ToFloat(S), ToFloat(T) + 1.0)),
++            FloorToInt(FloatPow(ToFloat(P), 0.5)),
++        ]:
++            with self.assertRaisesRegex(Declined, "no integer lowering", msg=str(e)):
++                _lowered([e])
++        with self.assertRaisesRegex(Declined, "past 2\\*\\*53"):
++            _lowered([CeilToInt(FloatTrueDiv(ToFloat(S), -1.0))], hint=(1, 1, 2**53, 1))
++
++    def test_rounded_float_quotient_under_total_is_a_domain(self):
++        # in a fold entry's rows the bound is a domain row, not a failing status
++        program = IntegerProgram(list(HINT))
++        lowering = Lowering(program, {S: ("boxed", 2)})
++        with lowering.total() as domains:
++            row = lowering.lower(CeilToInt(FloatTrueDiv(ToFloat(S), -1.0)))
++        compiled = compile_program(program)
++        for s, ok in [(7, True), (2**53 - 1, True), (2**53, False), (-(2**53), False), (-5, True)]:
++            status, outputs = compiled.evaluate_inputs((8, 6, s, -3))
++            self.assertEqual(status, Status.SUCCESS, s)
++            self.assertEqual(all(outputs[r] == 1 for r in domains), ok, s)
++            if ok:
++                self.assertEqual(outputs[row], -s)
++
++    def test_ir_rounded_quotients(self):
++        # the IR backend's ceil of an int ratio (a ceildiv node) takes the same bound
++        E = 2**53
++        env = _ir.Env()
++        x, y = env.symbol(7, "x"), env.symbol(3, "y", positive=True)
++        cases = [
++            (math.ceil((-2 * y) / -1.0), lambda xv, yv: (-2 * yv, -1)),
++            (math.ceil(x / -1.0), lambda xv, yv: (xv, -1)),
++            (math.ceil(x / y), lambda xv, yv: (xv, yv)),
++            (math.ceil(torch.sym_float(x) / torch.sym_float(y)), lambda xv, yv: (xv, yv)),
++        ]
++        points = [(7, 3), (-5, 2), (0, 9), (E - 1, 1), (-(E - 1), E + 1), (E, 1), (-E, 5), (5, 2**52), (3, E + 1)]
++        for v, operands in cases:
++            program = IntegerProgram([7, 3])
++            lowering = IRLowering(program, {x.node.node: ("boxed", 0), y.node.node: ("boxed", 1)}, env.ctx)
++            row = lowering.lower(v.node.node)
++            compiled = compile_program(program)
++            for xv, yv in points:
++                n, d = operands(xv, yv)
++                status, outputs = compiled.evaluate_inputs((xv, yv))
++                if abs(n) >= E:
++                    self.assertNotEqual(status, Status.SUCCESS, (v, xv, yv))
++                else:
++                    self.assertEqual(status, Status.SUCCESS, (v, xv, yv))
++                    self.assertEqual(outputs[row], math.ceil(float(n) / float(d)), (v, xv, yv))
++
+     def test_float_relations_round_as_the_host(self):
+         # sqrt and / on doubles, each correctly rounded as c10's SymFloat
+         # computes them; 2921 is the first int whose pow(x, 0.5) is not sqrt(x)
+--- a/test/inductor/test_cudagraph_host_trace.py
++++ b/test/inductor/test_cudagraph_host_trace.py
+@@ -484,6 +484,26 @@
+         )
+         self.assertEqual(counters["inductor"]["cudagraph_host_trace_declined"], 0)
+ 
++    def test_float_step_arange_one_trace(self):
++        # XLNet's relative positions: with a symbolic length Inductor sizes the
++        # arange's buffer CeilToInt(FloatTrueDiv(ToFloat(-2*s), -1.0))
++        def fn(x, inv_freq):
++            s = x.shape[1]
++            pos = torch.arange(s, -s, -1.0, dtype=torch.int64, device=x.device).float()
++            sinusoid = torch.einsum("i,d->id", pos, inv_freq)
++            return x.sum(1, keepdim=True) * torch.cat([sinusoid.sin(), sinusoid.cos()], -1).sum(-1)[None, :s]
++
++        inv_freq = 1 / torch.pow(10000, torch.arange(0, 16, 2.0, device="cuda") / 16)
++        compiled = torch.compile(fn, mode="reduce-overhead", dynamic=True)
++        sizes = [64, 32, 48, 17, 100, 32]
++        for s in sizes:
++            x = torch.randn(4, s, device="cuda")
++            self.assertEqual(compiled(x, inv_freq), fn(x, inv_freq))
++        (installation,) = self.installed
++        replay = installation.replay
++        self.assertEqual(replay.declines, [])
++        self.assertEqual((replay.traces, replay.replays, replay.eager), (1, len(sizes) - 2, 1))
++
+     @parametrize("memory", ["auto", "eager", "run_buffer"])
+     def test_replay_memory_knob(self, memory):
+         def fn(x):

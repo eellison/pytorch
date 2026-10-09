@@ -1,0 +1,1239 @@
+--- a/torch/cuda/_host_trace_harvest.py
++++ b/torch/cuda/_host_trace_harvest.py
+@@ -48,9 +48,9 @@
+ settings the key holds (the call's at the trace); cuDNN's are the current
+ global ones, which the key does not hold.
+ 
+-A cuBLAS or SDPA key launching the kernels (by name: each cuDNN plan loads its
+-own copy) of a key harvested in full (another M: the heuristic's choice repeats
+-across shapes) is its sibling: one capture, A, read with the harvested key's
++A cuBLAS, SDPA or cuDNN convolution key launching the kernels (by name: each
++cuDNN plan loads its own copy) of a key harvested in full (another M or batch:
++the heuristic's choice repeats across shapes) is its sibling: one capture, A, read with the harvested key's
+ slots, each slot's qword re-based to its operand or the call's block here, and
+ checked like any binding. Any qword of another role (into an operand or the
+ call's blocks, or a CUDA address the harvested key does not hold as a
+@@ -200,7 +200,11 @@
+ 
+ 
+ class _Refused(Exception):
+-    pass
++    def __init__(self, msg: str, structural: bool = False) -> None:
++        super().__init__(msg)
++        # a property of the call's kernels, not of its sizes: the op refuses at
++        # every key of its layout class (HarvestProvider._layout_class)
++        self.structural = structural
+ 
+ 
+ class _Transient(_Refused):
+@@ -307,12 +311,12 @@
+     for x, n in enumerate(nodes):
+         if not isinstance(n, OpaqueKernel):
+             continue
+-        slots = {(s.param, s.offset) for s in n.slots}
++        # the bytes a slot's qword starts at, and 4 either side of it
++        near = {(s.param, s.offset + d) for s in n.slots for d in (-4, 0, 4)}
+         for param, image in enumerate(n.images):
+             for first, hits in ((0, aligned), (4, misaligned)):
+                 for i, q in enumerate(_qwords(image, first)):
+-                    off = first + 8 * i
+-                    if not q >> 32 or stack[0] <= q < stack[1] or any((param, off + d) in slots for d in (-4, 0, 4)):
++                    if not q >> 32 or stack[0] <= q < stack[1] or (param, off := first + 8 * i) in near:
+                         continue
+                     if q not in known:
+                         known[q] = _cuda_address(q)
+@@ -689,6 +693,9 @@
+         # bindings by _signature
+         self.templates: dict[tuple, dict[tuple, OpaqueBinding]] = {}
+         self.refused: dict[tuple, str] = {}
++        # structural refusals by _layout_class: an op whose kernels refuse at
++        # one key refuses at every key of the class, with no harvest or retrace
++        self.refused_class: dict[tuple, str] = {}
+         self.lendable = list(lendable)
+         self.lend_alias_groups = lend_alias_groups
+         self.transient: dict[tuple, int] = {}  # transient refusals per key
+@@ -854,9 +861,25 @@
+                 self.functions[key.device, n.name] = n.function
+         return self._resolved(k, key.device)
+ 
+-    def _refuse(self, key: OpaqueKey, why: str) -> None:
++    def _layout_class(self, key: OpaqueKey) -> tuple:
++        """The key without its sizes and integer scalars: per operand its rank,
++        the order of its strides and which are 1 or 0, and its alignment
++        class; a structural refusal holds for every key of the class."""
++
++        def layout(sizes: tuple, strides: tuple) -> tuple:
++            order = tuple(sorted(range(len(strides)), key=lambda d: (-strides[d], d)))
++            return order, tuple(st == 1 for st in strides), tuple(st == 0 for st in strides)
++
++        scalars = tuple(None if type(v) is int else v for v in key.scalars)
++        alias = tuple((i, lead) for i, lead, _ in key.alias) if key.op in self.extern else ()
++        layouts = tuple(layout(z, st) for z, st in zip(key.sizes, key.strides))
++        return (alias, _OUT.get(key.op, key.op), key.dtypes, layouts, tuple(map(_class, key.align)), scalars, key.device, key.state)
++
++    def _refuse(self, key: OpaqueKey, why: str, structural: bool = False) -> None:
+         # final for the process: a trace records the key as a plain eager step
+         self.refused[self._normal(key)] = why
++        if structural:
++            self.refused_class[self._layout_class(key)] = why
+         msg = f"{key.op} at sizes {key.sizes}: {why}"
+         log.info("host_trace: harvest refused %s", msg)
+         trace_structured(
+@@ -869,7 +892,11 @@
+         k = self._normal(key)
+         if k in self.bindings or k in self.stored:
+             return None
+-        return self.refused.get(k)
++        return self.refused.get(k) or (self.refused_class.get(self._layout_class(key)) if self.refused_class else None)
++
++    def refuses_layout(self, key: OpaqueKey) -> bool:
++        k = self._normal(key)
++        return k not in self.bindings and k not in self.stored and self._layout_class(key) in self.refused_class
+ 
+     def _span(self, key: OpaqueKey, i: int) -> int:
+         return span_bytes(key.sizes[i], key.strides[i], key.dtypes[i].itemsize)
+@@ -921,7 +948,7 @@
+                 return self.bindings[k]
+             if k in self.stored and (binding := self._restore(key, k, args, kwargs)) is not None:
+                 return binding
+-            if self.disabled is not None or k in self.refused:
++            if self.disabled is not None or self.refusal(key) is not None:
+                 return None
+             # not now, but maybe at a later call of the key
+             if torch.cuda.is_current_stream_capturing():
+@@ -933,7 +960,7 @@
+                 with _gc_hold, _LOCK, library_state_as(key.state):
+                     binding = None
+                     group = (_OUT.get(key.op, key.op), key.dtypes, key.device, key.state)
+-                    sibling = key.op in _OUT or key.op in _ATTENTION or key.op in self.extern
++                    sibling = key.op in _OUT or key.op in _ATTENTION or key.op in _CONV or key.op in self.extern
+                     siblings = self.templates.get(group) if sibling and _SIBLINGS else None
+                     pair = _PAIR
+                     # a refusal of the two captures is the four's to make
+@@ -965,7 +992,7 @@
+                     self._refuse(key, str(e))
+                 return None
+             except _Refused as e:
+-                self._refuse(key, str(e))
++                self._refuse(key, str(e), e.structural)
+                 return None
+             self.bindings[k] = binding
+             return binding
+@@ -1155,7 +1182,7 @@
+             try:
+                 found = torch._C._cuda_hostTraceCapturedNodes(graph.raw_cuda_graph(), _attribute_ids())
+             except ValueError as e:
+-                raise _Refused(str(e)) from None
++                raise _Refused(str(e), structural=True) from None
+             names = [n[0] if len(n) == 9 else "memset" for n in found]
+             nodes = [
+                 OpaqueKernel(n[1], n[3], n[4], n[5], _attributes(n[7], n[6]), n[2], n[8], ())
+@@ -1165,7 +1192,7 @@
+             ]
+             kernels = [n for n in nodes if isinstance(n, OpaqueKernel)]
+             if any(not reproducible(k) for n in kernels for k, _ in n.attributes):
+-                raise _Refused("a device-updatable kernel node")
++                raise _Refused("a device-updatable kernel node", structural=True)
+             plugged = {t.data_ptr() for t in plugs} | {t.untyped_storage().data_ptr() for t in kept}
+             if any(b[4] and b[1] not in plugged for b in pool):
+                 raise _Refused("the call left an allocation live")
+@@ -1642,8 +1669,6 @@
+                 dev.pool = None
+         blocks = [c[2] for c in caps]
+         stack = torch._C._cuda_hostTraceStackBounds()
+-        heap = _heap_bounds()
+-        addresses = [[t.data_ptr() for t in sets[w]] + c[3] for w, c in zip((0, 1, 0, 0), caps)]
+         if siblings:
+             binding = adopt(caps[0], siblings, starts[0])
+             del sets
+@@ -1654,6 +1679,8 @@
+                     raise _NoSibling(str(e)) from None
+             return binding
+ 
++        heap = _heap_bounds()
++        addresses = [[t.data_ptr() for t in sets[w]] + c[3] for w, c in zip((0, 1, 0, 0), caps)]
+         philox = [c[4] for c in caps]
+         increment = philox[0][2] if rng else 0
+         if rng and any(p[2] != increment for p in philox):
+@@ -1799,10 +1826,10 @@
+                                 where = f"{names[x]} parameter {param} byte {off}"
+                                 heaped = op in _OUT and all(heap[0] <= q < heap[1] for q in qs)
+                                 if op not in _CONV and op not in _REDUCE and not heaped and not retired:
+-                                    raise _Refused(f"{where}: unexplained varying parameter")
++                                    raise _Refused(f"{where}: unexplained varying parameter", structural=True)
+                                 if len({q & 0xFFFFFFFF for q in qs}) > 1 and any(map(_cuda_address, qs)) and not retired:
+                                     seen = " / ".join(img[off : off + 8].hex() for img in imgs)
+-                                    raise _Refused(f"{where}: host state {seen}")
++                                    raise _Refused(f"{where}: host state {seen}", structural=True)
+                                 other = next(img for img in imgs if img[off : off + 8] != imgs[0][off : off + 8])
+                                 stale.append((len(nodes), param, off, other[off : off + 8]))
+                             if any(stack[0] <= int.from_bytes(img[off : off + 8], "little") < stack[1] for img in imgs):
+@@ -1823,7 +1850,7 @@
+                         lo = off - off % 8
+                         seen = " / ".join(img[lo : lo + 8].hex() for img in imgs)
+                         where = f"{names[x]} parameter {param} byte {off}"
+-                        raise _Refused(f"{where}: per-call state of no role: {seen}")
++                        raise _Refused(f"{where}: per-call state of no role: {seen}", structural=True)
+                     if not covered[off]:
+                         free[off] = 1
+                 at = free.find(1)
+--- a/torch/cuda/_host_trace_opaque.py
++++ b/torch/cuda/_host_trace_opaque.py
+@@ -40,6 +40,7 @@
+ from __future__ import annotations
+ 
+ import contextlib
++import functools
+ from dataclasses import dataclass, field
+ from typing import Any, Protocol, TYPE_CHECKING
+ 
+@@ -167,12 +168,13 @@
+     # binding and each launch recorded from it
+     owner: Any = field(default=None, compare=False, repr=False)
+ 
+-    @property
++    @functools.cached_property
+     def topology(self) -> tuple:
+         """What a graph exec fixes at instantiation: a kernel's launch
+         attributes, programmatic edge and compile-time cluster, a memset's
+         element size, height and, over several rows, width and pitch. One
+-        variant per topology."""
++        variant per topology. Cached: a key's binding is read at each site
++        that takes the key, and a cluster is a driver query per kernel."""
+         from torch.cuda._host_trace_launch import compiled_cluster
+ 
+         nodes: list[tuple] = []
+@@ -243,6 +245,12 @@
+         may: a lookup, with no GPU work."""
+         ...
+ 
++    def refuses_layout(self, key: OpaqueKey) -> bool:
++        """Whether the key's refusal holds at every size of its layout (its
++        op's kernels refuse, not its sizes): a trace guards none of the key's
++        sizes for the plain eager step. A lookup."""
++        ...
++
+     def operands(self, key: OpaqueKey, inputs: int) -> dict[int, torch.Tensor] | None:
+         """For a key learned without its call: the inputs the provider lends
+         (by position, a buffer too big to allocate again), or None to learn
+@@ -362,9 +370,11 @@
+     if binding is not None and not recordable(binding):
+         refusal = "a kernel node of its binding is device-updatable"
+     if refusal is not None:
+-        # a plain eager step at this key: the variant does not learn it
++        # a plain eager step at this key, or at every size of its layout: the
++        # variant does not learn it
+         why = f"{op} at sizes {key.sizes}: {refusal}"
+-        return None, [v for v in all_values[:n] if isinstance(v, torch.SymInt)] + distances, why
++        sized = [] if provider.refuses_layout(key) else [v for v in all_values[:n] if isinstance(v, torch.SymInt)]
++        return None, sized + distances, why
+     if binding is None:
+         return None, distances, None
+     # a fresh output is an allocation: storage offset 0
+--- a/torch/cuda/_host_trace_replay.py
++++ b/torch/cuda/_host_trace_replay.py
+@@ -80,7 +80,7 @@
+ from torch.cuda._host_trace import _drop_tracebacks, Declined, declined, EagerFallback, ProcessHold
+ from torch.cuda._host_trace_capture import capture_tape, instantiate_form, plain_attributes, SegmentFailed
+ from torch.cuda._host_trace_harvest import HarvestProvider
+-from torch.cuda._host_trace_lower_tape import fold, FoldRefused, lower_guards, lower_tape, PointerSlot, PredictedOutput
++from torch.cuda._host_trace_lower_tape import fold, FoldRefused, lower_guards, lower_tape, PointerSlot, PredictedOutput, ScalarSlot
+ from torch.cuda._host_trace_memory import arena_addresses, auto_memory, check_plan, plan_memory, relocate, relocate_entries, size_classes, split_runs, SPLITS
+ from torch.cuda._host_trace_opaque import key_guards, library_state_as, span_bytes
+ from torch.cuda._host_trace_program import Status
+@@ -119,6 +119,7 @@
+     from torch.cuda._host_trace_capture import CapturedTape
+     from torch.cuda._host_trace_lower_tape import (
+         LoweredEagerCall,
++        LoweredKeyedSite,
+         LoweredLaunch,
+         LoweredMemset,
+         LoweredOpaqueCall,
+@@ -348,6 +349,9 @@
+     unbound: tuple[Tape, dict[int, OpaqueCall]] | None = None
+     # the variants built from it with refused keys (native site index, key) as eager steps
+     eager_sites: dict[frozenset[tuple[int, OpaqueKey]], _Variant | None] = field(default_factory=dict)
++    # per keyed site, a class shared by the sites whose keys are made alike
++    # (_site_classes): sites of a class at equal key values have one OpaqueKey
++    site_classes: list[int] | None = None
+ 
+     @property
+     def tape(self) -> Tape:
+@@ -769,12 +773,17 @@
+                 candidates.append((variant, values, unselected))
+             return None
+         sites = variant.captured.lowered.sites
++        if variant.site_classes is None:
++            variant.site_classes = _site_classes(sites)
+         bindings = []
+         pool = None
+         deferred = False
++        # each (class, key values) built and bound once: the same GEMM in every layer is one key
++        keys: dict[tuple, tuple[OpaqueKey, OpaqueBinding | None]] = {}
+         for i, key in missing:
+-            site, opaque_key = sites[i].site, sites[i].key(key)
+-            binding = site.provider.bind(opaque_key)
++            site = sites[i].site
++            known = keys.get(memo := (variant.site_classes[i], tuple(key)))
++            opaque_key, binding = known if known is not None else (k := sites[i].key(key), site.provider.bind(k))
+             # an RNG site on a graph's generator (graphsafe RNG) learns in its learning variant, as bind_opaque's do
+             graphsafe = site.rng and any(getattr(n, "generator", None) is not None for n in site.nodes)
+             if binding is None and not variant.learns and not graphsafe and site.call is not None:
+@@ -787,6 +796,7 @@
+                     pool = torch.cuda.MemPool()
+                 with torch.cuda.use_mem_pool(pool, opaque_key.device) if pool is not None else contextlib.nullcontext():
+                     binding = self._learn(site.op, site.provider, site.call, opaque_key)
++            keys[memo] = (opaque_key, binding)
+             bindings.append((i, key, binding))
+         del pool
+         if deferred:
+@@ -1408,6 +1418,21 @@
+         return _Variant(captured, memory, native_variant(spec))
+ 
+ 
++def _site_classes(sites: Sequence[LoweredKeyedSite]) -> list[int]:
++    """Per keyed site, a class: equal for sites whose OpaqueKey is the same
++    function of the key values (_opaque_key's other inputs equal)."""
++    classes: dict[tuple, int] = {}
++    out = []
++    for i, s in enumerate(sites):
++        scalars = tuple(None if isinstance(v, (torch.SymInt, ScalarSlot)) else v for v in s.site.scalars)
++        sig = (id(s.site.provider), s.site.op, s.dtypes, s.ranks, scalars, s.device, s.site.state, s.alias)
++        try:
++            out.append(classes.setdefault(sig, len(classes)))
++        except TypeError:  # an unhashable constant: a class of its own
++            out.append(classes.setdefault(("site", i), len(classes)))
++    return out
++
++
+ def _unbound(tape: Tape, bound: dict[int, KeyedSite]) -> tuple[Tape, dict[int, OpaqueCall]]:
+     # bind_opaque's sites by their calls' ids -> each site's call, by the site's id;
+     # the tape keeps no argument alive
+--- a/test/test_cuda_host_trace_harvest.py
++++ b/test/test_cuda_host_trace_harvest.py
+@@ -1126,6 +1126,29 @@
+             self.assertReplays(aten.convolution_backward.default, make)
+         self.assertEqual(calls.call_count, 3)
+ 
++    def test_a_batch_sibling_takes_one_capture(self):
++        # a new batch whose plan launches a harvested batch's kernels is its
++        # sibling: one capture, read with the harvested key's slots, checked,
++        # and bitwise on fresh operands
++        op = aten.convolution.default
++        smeared = torch._C._cuda_hostTraceHarvestCapture
++        with torch.backends.cudnn.flags(enabled=True, benchmark=False, deterministic=True), tf32_off():
++            p = HarvestProvider(("conv",))
++            bindings, counts = [], []
++            for batch in (4, 6):
++                with mock.patch.object(torch._C, "_cuda_hostTraceHarvestCapture", side_effect=smeared) as calls:
++                    binding, why = _learn(p, op, _conv("plain", bf16, False, batch))
++                self.assertIsNotNone(binding, why)
++                bindings.append(binding)
++                counts.append(calls.call_count)
++            if _names(bindings[1]) != _names(bindings[0]):
++                self.skipTest("cuDNN picks other kernels at batch 6")
++            self.assertEqual(counts[1], 1)
++            args = _conv("plain", bf16, False, 6)
++            key, operands = _key(op, args, {})
++            got, want = _replay(p.bind(key), operands), op(*args)
++            self.assertTrue(torch.equal(got.contiguous().view(torch.uint8), want.contiguous().view(torch.uint8)))
++
+     def test_batch_sizes_are_keys(self):
+         # a dynamic batch is one key per size, each learned once
+         p = HarvestProvider(("conv",))
+@@ -1158,6 +1181,7 @@
+ _extern_lib.define("store_kv(Tensor k, Tensor v, Tensor(a!) k_cache, Tensor(b!) v_cache, Tensor loc) -> ()")
+ _extern_lib.define("double_into(Tensor x, Tensor(a!) out) -> ()")
+ _extern_lib.define("store_paged(Tensor k, Tensor v, Tensor(a!) k_cache, Tensor(b!) v_cache, Tensor slot) -> ()")
++_extern_lib.define("copy_twice(Tensor x, Tensor(a!) out) -> ()")
+ 
+ 
+ def _scale_qk(q, k, w):
+@@ -1188,6 +1212,13 @@
+ 
+ 
+ _extern_lib.impl("double_into", _double_into, "CUDA")
++def _copy_twice(x, out):
++    # a copy_ into out is a memcpy node, which an extern binding cannot hold: its key refuses at any size
++    out.copy_(x * 2)
++
++
++_extern_lib.impl("copy_twice", _copy_twice, "CUDA")
++torch.library.register_fake("ht_extern::copy_twice", lambda x, out: None, lib=_extern_lib)
+ torch.library.register_fake("ht_extern::double_into", lambda x, out: None, lib=_extern_lib)
+ _extern_lib.impl("scale_qk", _scale_qk, "CUDA")
+ _extern_lib.impl("store_kv", _store_kv, "CUDA")
+@@ -1850,6 +1881,90 @@
+             self.calls(r, (40, 40, 48, 32), w)
+         self.assertEqual((r.traces - traces, r.learned - learned, r.relowers, r.eager), (0, 2, 0 if oob else 1, 1))
+ 
++    def test_many_rows_keep_each_rows_users(self):
++        # each new size adds a row to the GEMM's table, after which the call
++        # indexes which nodes read which rows from the site's reads (not from
++        # every row): early and late rows both replay at fresh operand
++        # addresses, bitwise
++        w = torch.randn(64, 48, device="cuda", dtype=bf16)
++        p = HarvestProvider()
++        r = HostTraceReplay(self.f, opaque=(p,))
++        self.calls(r, (32, 32), w)
++        self.calls(r, range(33, 113), w)
++        learned, traces = r.learned, r.traces
++        self.calls(r, (33, 112, 70, 33, 32), w)
++        self.assertEqual((r.learned - learned, r.traces - traces, r.eager), (0, 0, 1))
++        # a binding's topology is computed once, not per site and arm that reads it
++        b = p.bindings[next(iter(p.bindings))]
++        self.assertIs(b.topology, b.topology)
++
++    def test_a_new_row_packs_only_what_it_changes(self):
++        # the call after a new key's row is added packs the nodes a changed row
++        # or site reads, not every node: z's kernel (inputs at fixed
++        # addresses, no key) is not packed again
++        def f(x, w, z, zout):
++            torch.mul(z, 2, out=zout)
++            return torch.mm(x, w) + 1
++
++        w = torch.randn(64, 48, device="cuda", dtype=bf16)
++        z = torch.randn(4096, device="cuda", dtype=bf16)
++        zout = torch.empty_like(z)
++        r = HostTraceReplay(f, opaque=(HarvestProvider(),))
++        xs = {t: torch.randn(t, 64, device="cuda", dtype=bf16) for t in (32, 40, 48)}
++        for t in (32, 32, 40, 32, 40):
++            self.assertEqual(r(xs[t], w, z, zout), f(xs[t], w, z, zout), atol=0, rtol=0)
++        before = torch._C._host_trace_kernel_packs()
++        self.assertEqual(r(xs[48], w, z, zout), f(xs[48], w, z, zout), atol=0, rtol=0)
++        packs = torch._C._host_trace_kernel_packs() - before
++        records = len(torch._C._host_trace_held_images(r.variants[0].native))
++        self.assertLess(packs, records)
++        self.assertEqual((r.traces, r.learned), (1, 3))
++
++    def test_equal_keys_bind_once_per_call(self):
++        # one GEMM key in three layers: a new size's key is built, bound and
++        # learned once, then taken by each layer's site
++        def f(x, w):
++            for _ in range(3):
++                x = torch.mm(x, w)
++            return x
++
++        w = torch.randn(64, 64, device="cuda", dtype=bf16) * 0.1
++        r = HostTraceReplay(f, opaque=(HarvestProvider(),))
++        self.calls_with(r, f, (32, 32), w)
++        with mock.patch.object(HarvestProvider, "bind", autospec=True, side_effect=HarvestProvider.bind) as bind:
++            self.calls_with(r, f, (40,), w)
++        self.assertEqual((bind.call_count, r.learned, r.traces), (1, 2, 1))
++
++    def calls_with(self, r, f, sizes, w):
++        for t in sizes:
++            x = torch.randn(t, 64, device="cuda", dtype=bf16)
++            self.assertEqual(r(x, w), f(x, w), atol=0, rtol=0)
++
++    def test_a_structural_refusal_holds_for_the_layout_class(self):
++        # the op's kernels refuse (a memcpy node) at its first key; a key at
++        # another size of its layout class refuses too, with no harvest, and
++        # the call stays a plain eager step of one variant
++        op = torch.ops.ht_extern.copy_twice.default
++
++        def f(x):
++            out = torch.empty_like(x)
++            op(x, out)
++            return out + 1
++
++        p = HarvestProvider(("extern",), extern_ops=(op,))
++        r = HostTraceReplay(f, opaque=(p,))
++        for t in (8, 16, 24, 32, 40, 48):
++            x = torch.randn(t, 64, device="cuda")
++            self.assertEqual(r(x), f(x), atol=0, rtol=0)
++        self.assertEqual(len(p.refused_class), 1)
++        self.assertIn("node of type", next(iter(p.refused_class.values())))
++        # a key of another layout (a transposed input) is not refused by it
++        f32 = torch.float32
++        transposed = OpaqueKey(op, (f32, f32), ((8, 64), (8, 64)), ((1, 8), (64, 1)), (0, 0), (), torch.cuda.current_device(), library_state())
++        self.assertIsNone(p.refusal(transposed))
++        self.assertIsNotNone(p.refusal(dataclasses.replace(transposed, strides=((64, 1), (64, 1)))))
++        self.assertEqual((p.harvests, r.traces), (1, 2))
++
+     def test_prepare_range(self):
+         # every size of a range prepared: a first call at any of them learns
+         # nothing and replays, bitwise equal to eager
+--- a/test/test_cuda_host_trace_opaque.py
++++ b/test/test_cuda_host_trace_opaque.py
+@@ -130,6 +130,9 @@
+     def refusal(self, key):
+         return "TableProvider: refused" if key in self.table and self.table[key] is None else None
+ 
++    def refuses_layout(self, key):
++        return False
++
+     def learn(self, key, args, kwargs, operands):
+         if key in self.table:
+             return None
+@@ -785,10 +788,39 @@
+             base.normal_()
+             sets = torch._C._host_trace_memory_node_sets()
+             self.assertEqual(f(x, y), mul_chain(x, y), atol=0, rtol=0)
+-            # the scratch binding's memset node is set every replay, in either form
+-            self.assertEqual(torch._C._host_trace_memory_node_sets() - sets, int(n % 256 == 0))
++            # the scratch binding's memset node is set at each form switch, not
++            # at the second call of a form at its row
++            again = i >= 12 and i % 2 == 1
++            self.assertEqual(torch._C._host_trace_memory_node_sets() - sets, int(n % 256 == 0 and not again))
+         self.assertEqual((f.traces, f.replays), (traces, replays + 24))
+ 
++    def test_exec_copies_across_forms(self):
++        # bindings of both topologies and two alignments alternate on fixed
++        # inputs: with a copy per form and row, each call launches the copy
++        # that holds it, setting no node once every case has run, bitwise
++        p = TableProvider(style="mixed")
++        f = HostTraceReplay(mul_chain, opaque=(p,))
++        base = torch.randn(4096, device="cuda")
++        cases = [(512, 0), (640, 0), (512, 4), (640, 4)]
++        xs = {c: torch.randn(c[0], device="cuda") for c in cases}
++        prev = torch._C._host_trace_exec_copies(4)
++        try:
++            for _ in range(2):
++                for n, offset in cases:
++                    f(xs[n, offset], base[offset : offset + n])
++            hits = torch._C._host_trace_exec_copy_counts()[0]
++            for i in range(12):
++                n, offset = cases[i % 4]
++                y = base[offset : offset + n]
++                base.normal_()
++                sets = torch._C._host_trace_kernel_node_sets() + torch._C._host_trace_memory_node_sets()
++                self.assertEqual(f(xs[n, offset], y), mul_chain(xs[n, offset], y), atol=0, rtol=0)
++                self.assertEqual(torch._C._host_trace_kernel_node_sets() + torch._C._host_trace_memory_node_sets(), sets)
++            self.assertEqual(torch._C._host_trace_exec_copy_counts()[0] - hits, 12)
++        finally:
++            torch._C._host_trace_exec_copies(prev)
++        self.assertEqual(len(bound(f)), 1)
++
+     @parametrize("form_held", [False, True])
+     def test_form_switch_sets_what_the_forms_exec_lacks(self, form_held):
+         # forms alternating on the same inputs: with form_held each form's exec
+--- a/test/test_cuda_host_trace_replay.py
++++ b/test/test_cuda_host_trace_replay.py
+@@ -2819,10 +2819,12 @@
+         self.assertNotIn(None, held_images(f)[0])
+         self.assertEqual((f.traces, f.replays, f.eager), (1, 2, 0))
+ 
+-    def test_memcpy_and_memset_nodes_are_set_every_replay(self):
+-        # such a node holds the allocation its address was in when set, which
+-        # a free and reallocation at the same address leaves stale; a kernel
+-        # node's parameters are bytes, set only when they change
++    def test_memcpy_and_memset_nodes_are_set_when_they_change(self):
++        # such a node holds its destination's address, not the allocation
++        # there: after a free and reallocation (or a VMM remap) at the address
++        # the unchanged node writes the new memory (core/learncost/
++        # probe_memset_alloc.py), so it is set only when its parameters
++        # change, as a kernel node is
+         def fn(x):
+             y = x.clone()
+             return y, add(y), torch.empty_like(x).zero_()
+@@ -2831,25 +2833,61 @@
+         x = torch.randn(4096, device="cuda")
+         want = (x, x + 3, torch.zeros_like(x))
+         self.assertEqual(f(x), want)
+-        # the first replay too, though its nodes hold the trace's values
+-        for _ in range(3):
++        # the first replay sets both (its nodes hold the trace's values), the
++        # next ones at the same addresses neither
++        for n in (2, 0, 0):
+             sets = torch._C._host_trace_memory_node_sets()
+             self.assertEqual(f(x), want)
+-            self.assertEqual(torch._C._host_trace_memory_node_sets(), sets + 2)
+-        self.assertEqual((f.traces, f.replays), (1, 3))
+-        (before,) = held_images(f)
+-        # the memcpy is set first, then (the kernel unchanged) the memset
+-        for n, held in ((0, [None, *before[1:]]), (1, [*before[:2], None])):
+-            torch._C._host_trace_fail_after_setter(n)
+-            try:
+-                with self.assertRaisesRegex(RuntimeError, "injected after a setter"):
+-                    f(x)
+-            finally:
+-                torch._C._host_trace_fail_after_setter(-1)
+-            self.assertEqual(held_images(f), [held])
++            self.assertEqual(torch._C._host_trace_memory_node_sets() - sets, n)
++        # the cached segments released: the outputs' new allocations, at the
++        # same addresses or not, are written
++        for _ in range(3):
++            torch.cuda.empty_cache()
+             self.assertEqual(f(x), want)
++        # another input moves the memcpy's source: it is set, the rest is not
++        x2 = x.clone()
++        sets = torch._C._host_trace_memory_node_sets()
++        self.assertEqual(f(x2), want)
++        self.assertGreaterEqual(torch._C._host_trace_memory_node_sets() - sets, 1)
++        # a setter that fails leaves its node unknown, so the next call sets it
++        (before,) = held_images(f)
++        torch._C._host_trace_fail_after_setter(0)
++        try:
++            with self.assertRaisesRegex(RuntimeError, "injected after a setter"):
++                f(x)
++        finally:
++            torch._C._host_trace_fail_after_setter(-1)
++        self.assertEqual(held_images(f), [[None, *before[1:]]])
++        self.assertEqual(f(x), want)
+         self.assertEqual((f.traces, f.eager), (1, 0))
+ 
++    @parametrize("copies", [1, 2])
++    def test_exec_copies_hold_their_sizes(self, copies):
++        # two sizes alternate: with a copy of the segment's exec per size, each
++        # launches the copy that holds it, setting no node after its first
++        # call; with the graph's exec alone, each switch sets every node
++        f = HostTraceReplay(five_step)
++        xs = {n: torch.randn(n, device="cuda") for n in (1024, 2048)}
++        prev = torch._C._host_trace_exec_copies(copies)
++        try:
++            for n in (1024, 1024, 2048):
++                self.assertEqual(f(xs[n]), five_step(xs[n]), atol=0, rtol=0)
++            hits, _ = torch._C._host_trace_exec_copy_counts()
++            sets = []
++            for n in (1024, 2048) * 3:
++                before = torch._C._host_trace_kernel_node_sets()
++                self.assertEqual(f(xs[n]), five_step(xs[n]), atol=0, rtol=0)
++                sets.append(torch._C._host_trace_kernel_node_sets() - before)
++            hits = torch._C._host_trace_exec_copy_counts()[0] - hits
++        finally:
++            torch._C._host_trace_exec_copies(prev)
++        self.assertEqual(len(f.variants), 1)
++        if copies == 1:
++            self.assertTrue(all(sets), sets)
++            self.assertEqual(hits, 0)
++        else:
++            self.assertEqual((sets, hits), ([0] * 6, 6))
++
+     @parametrize("check_global_state", [False, True])
+     def test_the_native_key_partitions_as_the_contract(self, check_global_state):
+         f = HostTraceReplay(two_step, check_global_state=check_global_state)
+--- a/torch/csrc/cuda/host_trace/Entry.cpp
++++ b/torch/csrc/cuda/host_trace/Entry.cpp
+@@ -1700,6 +1700,15 @@
+   m.def("_host_trace_placement_reuse", [](bool enable) {
+     placement_reuse_enabled = enable;
+   });
++  m.def("_host_trace_exec_copies", [](size_t n) {
++    TORCH_CHECK_VALUE(n >= 1, "exec_copies counts the graph's own exec");
++    const size_t previous = exec_copies;
++    exec_copies = n;
++    return previous;
++  });
++  m.def("_host_trace_exec_copy_counts", [] {
++    return py::make_tuple(exec_copy_hits, exec_copy_switches);
++  });
+   m.def("_host_trace_form_held", [](bool enable) {
+     form_held_enabled = enable;
+   });
+--- a/torch/csrc/cuda/host_trace/Patch.cpp
++++ b/torch/csrc/cuda/host_trace/Patch.cpp
+@@ -17,6 +17,9 @@
+ int64_t memory_node_sets = 0;
+ int64_t kernel_packs = 0;
+ int64_t kernel_node_sets = 0;
++size_t exec_copies = 1;
++int64_t exec_copy_hits = 0;
++int64_t exec_copy_switches = 0;
+ bool phase_timing = false;
+ std::array<int64_t, 16> phase_ns{};
+ int64_t tma_encodes = 0;
+@@ -212,15 +215,28 @@
+ } // namespace
+ 
+ void HostTraceVariant::index_users() {
++  // with users_kept_ (only rows were added since the last index), the rows and
++  // bases some record read before, to keep their seen values
++  std::vector<bool> tracked_rows, tracked_bases;
++  if (users_kept_) {
++    tracked_rows.assign(program_.num_rows(), false);
++    for (uint32_t row : users_.rows) {
++      tracked_rows[row] = true;
++    }
++    tracked_bases.assign(base_count_, false);
++    for (uint32_t b : users_.segment_bases) {
++      tracked_bases[b] = true;
++    }
++  }
+   std::vector<std::pair<uint32_t, uint32_t>> rows;
+   std::vector<std::pair<uint32_t, uint32_t>> bases;
+   std::vector<std::pair<uint32_t, uint32_t>> segment_bases;
+   always_.assign(records_.size(), 0);
+-  auto read = [&](const Field& f, uint32_t i, uint32_t segment) {
+-    rows.emplace_back(f.row, i);
+-    if (f.base >= 0) {
+-      bases.emplace_back(f.base, i);
+-      segment_bases.emplace_back(segment, f.base);
++  auto read = [&](int64_t row, int64_t base, uint32_t i, uint32_t segment) {
++    rows.emplace_back(row, i);
++    if (base >= 0) {
++      bases.emplace_back(base, i);
++      segment_bases.emplace_back(segment, base);
+     }
+   };
+   for (uint32_t g = 0; g < segments_.size(); ++g) {
+@@ -228,29 +244,45 @@
+       const Record& r = records_[i];
+       const auto record = static_cast<uint32_t>(i);
+       if (r.kind != Kind::Kernel) {
+-        always_[i] = 1;
+-        continue;
+-      }
+-      c10::SmallVector<const KernelRow*, 4> ks{&r.kernel};
+-      if (r.site >= 0) {
+-        for (const auto& e : sites_[r.site].entries) {
+-          if (r.site_pos < e->kernels.size()) {
+-            ks.push_back(&e->kernels[r.site_pos]);
++        // a keyed site's memset takes its row's fields: patched every replay
++        if (r.site >= 0) {
++          always_[i] = 1;
++          continue;
++        }
++        if (r.kind == Kind::Memset) {
++          read(r.memset.dst.row, r.memset.dst.base, record, g);
++          if (!r.memset.constant_shape) {
++            for (int64_t row : r.memset.shape_rows) {
++              rows.emplace_back(row, record);
++            }
+           }
++        } else {
++          read(r.copy.dst.row, r.copy.dst.base, record, g);
++          read(r.copy.src.row, r.copy.src.base, record, g);
++          rows.emplace_back(r.copy.bytes_row, record);
+         }
++        continue;
+       }
+-      for (const KernelRow* k : ks) {
+-        if (k->rng_increment != 0 || !k->rng.empty() ||
+-            !k->cpu_scalars.empty()) {
+-          always_[i] = 1;
++      const KernelRow& k = r.kernel;
++      if (k.rng_increment != 0 || !k.rng.empty() || !k.cpu_scalars.empty()) {
++        always_[i] = 1;
++      }
++      for (size_t j = 0; j < k.field_count; ++j) {
++        read(k.fields[j].row, k.fields[j].base, record, g);
++      }
++      if (!k.constant_dims) {
++        for (int64_t row : k.dim_rows) {
++          rows.emplace_back(row, record);
+         }
+-        for (size_t j = 0; j < k->field_count; ++j) {
+-          read(k->fields[j], record, g);
++      }
++      if (r.site >= 0 && r.site_pos < sites_[r.site].reads.size()) {
++        const Site::Reads& e = sites_[r.site].reads[r.site_pos];
++        always_[i] |= e.always;
++        for (const auto& [row, base] : e.fields) {
++          read(row, base, record, g);
+         }
+-        if (!k->constant_dims) {
+-          for (int64_t row : k->dim_rows) {
+-            rows.emplace_back(row, record);
+-          }
++        for (int64_t row : e.dim_rows) {
++          rows.emplace_back(row, record);
+         }
+       }
+     }
+@@ -276,12 +308,45 @@
+       }
+     }
+   }
+-  dirty_.assign(records_.size(), 1);
+-  seen_values_.assign(program_.num_rows(), 0);
+-  seen_bases_.assign(base_count_, std::numeric_limits<int64_t>::min());
+-  seen_sites_.assign(sites_.size(), -1);
+-  seen_valid_ = false;
+-  users_stale_ = false;
++  std::vector<uint32_t> segment_of(records_.size(), 0);
++  for (uint32_t g = 0; g < segments_.size(); ++g) {
++    Segment& run = segments_[g];
++    std::fill(segment_of.begin() + run.first, segment_of.begin() + run.stop, g);
++    run.key_rows.clear();
++    run.key_bases.assign(
++        users_.segment_bases.begin() + users_.segment_first[g],
++        users_.segment_bases.begin() + users_.segment_first[g + 1]);
++  }
++  for (uint32_t row : users_.rows) {
++    for (uint32_t k = users_.row_first[row]; k < users_.row_first[row + 1]; ++k) {
++      auto& rows_of = segments_[segment_of[users_.row_records[k]]].key_rows;
++      if (rows_of.empty() || rows_of.back() != row) {
++        rows_of.push_back(row);
++      }
++    }
++  }
++  if (users_kept_) {
++    // a record of a site with a new row is marked when the call selects the
++    // row (seen_sites_); a row or base no record read before is marked at its
++    // next value
++    for (uint32_t row : users_.rows) {
++      if (!tracked_rows[row]) {
++        seen_values_[row] = std::numeric_limits<int64_t>::min();
++      }
++    }
++    for (uint32_t b : users_.segment_bases) {
++      if (!tracked_bases[b]) {
++        seen_bases_[b] = std::numeric_limits<int64_t>::min();
++      }
++    }
++  } else {
++    dirty_.assign(records_.size(), 1);
++    seen_values_.assign(program_.num_rows(), 0);
++    seen_bases_.assign(base_count_, std::numeric_limits<int64_t>::min());
++    seen_sites_.assign(sites_.size(), -1);
++    seen_valid_ = false;
++  }
++  users_stale_ = users_kept_ = false;
+ }
+ 
+ void HostTraceVariant::mark(
+@@ -375,6 +440,176 @@
+   run.form = form;
+ }
+ 
++std::vector<int64_t> HostTraceVariant::copy_key(
++    const Segment& run,
++    const Frame& frame) const {
++  std::vector<int64_t> key;
++  key.reserve(run.key_rows.size() + run.key_bases.size() + run.sites.size());
++  for (uint32_t row : run.key_rows) {
++    key.push_back(frame.values[row]);
++  }
++  for (uint32_t b : run.key_bases) {
++    key.push_back(frame.bases[b]);
++  }
++  for (size_t s : run.sites) {
++    key.push_back(frame.site_entries[s]);
++  }
++  return key;
++}
++
++void HostTraceVariant::switch_copy(Segment& run, size_t form, size_t j) {
++  // the records', then the current form's pieces' held parameters
++  auto slots = [&](size_t f) {
++    std::vector<Record*> out;
++    for (size_t i = run.first; i < run.stop; ++i) {
++      out.push_back(&records_[i]);
++    }
++    if (f != 0) {
++      for (Record& r : run.clones[f - 1].pieces) {
++        out.push_back(&r);
++      }
++    }
++    return out;
++  };
++  std::vector<Record*> current = slots(run.form);
++  auto& saved = run.copies[run.form][run.copy].held;
++  saved.resize(current.size());
++  for (size_t i = 0; i < current.size(); ++i) {
++    const Record& r = *current[i];
++    Segment::CopyHeld& h = saved[i];
++    h.held = r.held;
++    h.row = r.held_row;
++    h.dims = r.held_dims;
++    h.memset = r.held_memset;
++    h.copy = r.held_copy;
++    h.image.clear();
++    if (r.held && r.kind == Kind::Kernel) {
++      const KernelRow& k = kernel_row(r, r.held_row);
++      h.image.assign(k.held, k.held + k.nbytes);
++    }
++  }
++  run.form = form;
++  run.copy = j;
++  std::vector<Record*> next = slots(form);
++  const auto& held = run.copies[form][j].held;
++  for (size_t i = 0; i < next.size(); ++i) {
++    Record& r = *next[i];
++    if (i >= held.size()) {
++      r.held = false; // a new copy: its nodes hold the capture's parameters
++      continue;
++    }
++    const Segment::CopyHeld& h = held[i];
++    r.held = h.held;
++    r.held_row = h.row;
++    r.held_dims = h.dims;
++    r.held_memset = h.memset;
++    r.held_copy = h.copy;
++    if (h.held && r.kind == Kind::Kernel) {
++      std::memcpy(kernel_row(r, h.row).held, h.image.data(), h.image.size());
++    }
++  }
++  ++exec_copy_switches;
++}
++
++HostTraceVariant::Segment::Copy* HostTraceVariant::select_copy(
++    Segment& run,
++    size_t form,
++    const Frame& frame) {
++  std::vector<int64_t> key = copy_key(run, frame);
++  if (run.copies.size() < run.execs.size()) {
++    run.copies.resize(run.execs.size());
++  }
++  // each form's own exec is its copy 0 (the current form's too: switch_copy saves into it)
++  for (size_t f : {form, run.form}) {
++    if (run.copies[f].empty()) {
++      run.copies[f].push_back({run.execs[f], {}, {}, false});
++    }
++  }
++  auto& list = run.copies[form];
++  const bool same = run.form == form;
++  // the copy whose values differ from the call's in the fewest entries; the
++  // current one wins a tie (its records are marked against the last call)
++  auto distance = [&](const Segment::Copy& c, size_t bound) {
++    if (!c.keyed || c.key.size() != key.size()) {
++      return bound;
++    }
++    size_t d = 0;
++    for (size_t i = 0; i < key.size() && d < bound; ++i) {
++      d += c.key[i] != key[i];
++    }
++    return d;
++  };
++  const size_t none = key.size() + 1;
++  size_t j = same ? run.copy : list.size();
++  size_t best = same ? distance(list[run.copy], none) : none;
++  for (size_t c = 0; c < list.size() && best > 0; ++c) {
++    if (!(same && c == run.copy)) {
++      const size_t d = distance(list[c], best);
++      if (d < best) {
++        j = c;
++        best = d;
++      }
++    }
++  }
++  if (best > 0 && list.size() < exec_copies) {
++    // values no copy holds: a new instantiation keeps the others' values
++    cudaGraphExec_t e = nullptr;
++    const cudaGraph_t graph = form == 0
++        ? run.native->raw_cuda_graph()
++        : reinterpret_cast<cudaGraph_t>(run.clones[form - 1].graph);
++    C10_CUDA_CHECK(cudaGraphInstantiate(&e, graph, 0));
++    C10_CUDA_CHECK(cudaGraphUpload(e, at::cuda::getCurrentCUDAStream()));
++    list.push_back({reinterpret_cast<CUgraphExec>(e), {}, {}, false});
++    j = list.size() - 1;
++  } else if (j == list.size()) {
++    // another form's call and no keyed copy of this one: its own exec
++    j = 0;
++  }
++  if (!same || j != run.copy) {
++    const std::vector<int64_t> held = list[j].keyed ? list[j].key : std::vector<int64_t>();
++    switch_copy(run, form, j);
++    // the records whose rows, bases or site rows differ from what the copy
++    // holds, and those patched every replay
++    for (size_t i = run.first; i < run.stop; ++i) {
++      dirty_[i] = held.empty() ? 1 : always_[i];
++    }
++    if (!held.empty()) {
++      auto mark_here = [&](const std::vector<uint32_t>& first, const std::vector<uint32_t>& records, size_t x) {
++        for (uint32_t k = first[x]; k < first[x + 1]; ++k) {
++          if (records[k] >= run.first && records[k] < run.stop) {
++            dirty_[records[k]] = 1;
++          }
++        }
++      };
++      size_t i = 0;
++      for (uint32_t row : run.key_rows) {
++        if (held[i] != key[i]) {
++          mark_here(users_.row_first, users_.row_records, row);
++        }
++        ++i;
++      }
++      for (uint32_t b : run.key_bases) {
++        if (held[i] != key[i]) {
++          mark_here(users_.base_first, users_.base_records, b);
++        }
++        ++i;
++      }
++      for (size_t s : run.sites) {
++        if (held[i] != key[i]) {
++          for (size_t r : sites_[s].records) {
++            dirty_[r] = 1;
++          }
++        }
++        ++i;
++      }
++    }
++    exec_copy_hits += !held.empty() && held == key;
++  }
++  Segment::Copy& copy = list[run.copy];
++  copy.keyed = false; // until its patches all succeed
++  copy.key = std::move(key);
++  return &copy;
++}
+ void HostTraceVariant::patch_and_replay(Segment& run, Frame& frame) {
+   int64_t pt = phase_now();
+   const int64_t* v = frame.values.data();
+@@ -390,25 +625,38 @@
+   const size_t form =
+       run.forms.size() > 1 ? frame.forms[&run - segments_.data()] : 0;
+   Segment::Clone* clone = form == 0 ? nullptr : &run.clones[form - 1];
+-  if (form != run.form && form_held_enabled) {
+-    switch_form_held(run, form);
+-    for (size_t i = run.first; i < run.stop; ++i) {
+-      dirty_[i] = 1;
+-    }
+-  } else if (form != run.form) {
+-    // the form's exec holds its instantiation's parameters
+-    run.form = form;
+-    for (size_t i = run.first; i < run.stop; ++i) {
+-      records_[i].held = false;
+-      dirty_[i] = 1;
++  // another instantiation of the form's graph, which may hold the call's values
++  Segment::Copy* copy = nullptr;
++  if (exec_copies > 1 && !observed(run)) {
++    copy = select_copy(run, form, frame);
++  } else {
++    if (run.copy != 0) {
++      // copies turned off: back to the form's own exec
++      switch_copy(run, run.form, 0);
++      for (size_t i = run.first; i < run.stop; ++i) {
++        dirty_[i] = 1;
++      }
+     }
+-    if (clone) {
+-      for (Record& r : clone->pieces) {
+-        r.held = false;
++    if (form != run.form && form_held_enabled) {
++      switch_form_held(run, form);
++      for (size_t i = run.first; i < run.stop; ++i) {
++        dirty_[i] = 1;
++      }
++    } else if (form != run.form) {
++      // the form's exec holds its instantiation's parameters
++      run.form = form;
++      for (size_t i = run.first; i < run.stop; ++i) {
++        records_[i].held = false;
++        dirty_[i] = 1;
++      }
++      if (clone) {
++        for (Record& r : clone->pieces) {
++          r.held = false;
++        }
+       }
+     }
+   }
+-  const CUgraphExec exec = run.execs[form];
++  const CUgraphExec exec = copy ? copy->exec : run.execs[form];
+   // the philox offsets the segment's RNG calls take before the next, and
+   // the intragraph offset of the current one's kernels
+   int64_t running = 0;
+@@ -417,9 +665,13 @@
+     const int64_t row = r.site >= 0 ? frame.site_entries[r.site] : 0;
+     if (r.kind == Kind::Memset) {
+       const MemsetRow& m = memset_row(r, row);
+-      // set every replay: the node holds the allocation its address was in
+-      // when set, and a free and reallocation at that address leaves it stale
+       const std::array<int64_t, 4> held = memset_shape(m, v, bases);
++      // a node holds its destination's address, not the allocation there
++      // (probe_memset_alloc.py: after a free and reallocation, or a VMM remap,
++      // at the address, the unchanged node writes the new memory)
++      if (r.held && r.held_row == row && held == r.held_memset) {
++        return;
++      }
+       r.held = false;
+       for (size_t k = 1; k < 4; ++k) {
+         TORCH_CHECK_VALUE(held[k] >= 0, "host_trace: a memset of ", held[k]);
+@@ -445,8 +697,10 @@
+       return;
+     }
+     if (r.kind == Kind::Memcpy) {
+-      // set every replay, as a memset is
+       const std::array<int64_t, 3> held = memcpy_shape(r.copy, v, bases);
++      if (r.held && r.held_row == row && held == r.held_copy) {
++        return;
++      }
+       r.held = false;
+       TORCH_CHECK_VALUE(held[2] > 0, "host_trace: a memcpy of ", held[2], " bytes");
+       C10_CUDA_CHECK(cudaGraphExecMemcpyNodeSetParams1D(
+@@ -547,6 +801,9 @@
+       patch(r, r.node);
+     }
+   }
++  if (copy) {
++    copy->keyed = true;
++  }
+   // a replay advances the generator by what the rows' calls take, as eager
+   if (run.generator && running != run.rng_increment) {
+     run.native->set_generator_increment(
+--- a/torch/csrc/cuda/host_trace/Sites.cpp
++++ b/torch/csrc/cuda/host_trace/Sites.cpp
+@@ -319,6 +319,7 @@
+ 
+ void HostTraceVariant::set_static_prefix(size_t n) {
+   users_stale_ = true;
++  users_kept_ = false;
+   static_prefix_ = n;
+   cached_generation_ = 0;
+   delta_valid_ = delta_marked_ = false;
+@@ -518,7 +519,6 @@
+       site < sites_.size() && !sites_[site].predicates.empty(),
+       "no selector ",
+       site);
+-  users_stale_ = true;
+   Site& s = sites_[site];
+   auto t = nodes.cast<py::tuple>();
+   TORCH_CHECK_VALUE(
+@@ -571,7 +571,38 @@
+     }
+   }
+   s.predicates.push_back(check_row(predicate));
++  note_reads(s, *e);
+   s.entries.push_back(std::move(e));
++  rows_added();
++}
++
++void HostTraceVariant::rows_added() {
++  users_kept_ = users_kept_ || !users_stale_;
++  users_stale_ = true;
++}
++
++void HostTraceVariant::note_reads(Site& s, const Entry& e) {
++  if (s.reads.size() < e.kernels.size()) {
++    s.reads.resize(e.kernels.size());
++  }
++  for (size_t i = 0; i < e.kernels.size(); ++i) {
++    const KernelRow& k = e.kernels[i];
++    Site::Reads& r = s.reads[i];
++    r.always |= k.rng_increment != 0 || !k.rng.empty() || !k.cpu_scalars.empty();
++    for (size_t j = 0; j < k.field_count; ++j) {
++      const std::pair<int64_t, int64_t> f{k.fields[j].row, k.fields[j].base};
++      if (std::find(r.fields.begin(), r.fields.end(), f) == r.fields.end()) {
++        r.fields.push_back(f);
++      }
++    }
++    for (int64_t row : k.dim_rows) {
++      if (!k.constant_dims &&
++          std::find(r.dim_rows.begin(), r.dim_rows.end(), row) ==
++              r.dim_rows.end()) {
++        r.dim_rows.push_back(row);
++      }
++    }
++  }
+ }
+ 
+ void HostTraceVariant::set_program(const HostTraceProgram& program) {
+@@ -590,7 +621,6 @@
+     bool piece,
+     const std::vector<int64_t>& scratch) {
+   TORCH_CHECK_VALUE(site < sites_.size(), "no site ", site);
+-  users_stale_ = true;
+   Site& s = sites_[site];
+   TORCH_CHECK_VALUE(
+       key.size() == s.key_rows.size(), "a key of ", key.size(), " values");
+@@ -657,8 +687,10 @@
+           e->kernels[i], e->image.data(), e->held.data(), e->fields.data());
+     }
+   }
++  note_reads(s, *e);
+   s.entries.push_back(std::move(e));
+   insert(s, key.data(), static_cast<int64_t>(s.entries.size()));
++  rows_added();
+   if (arm != 0 &&
+       std::find(armed_.begin(), armed_.end(), s.segment) == armed_.end()) {
+     armed_.push_back(s.segment);
+@@ -718,6 +750,12 @@
+ 
+ HostTraceVariant::~HostTraceVariant() {
+   for (Segment& g : segments_) {
++    for (const auto& list : g.copies) {
++      for (size_t c = 1; c < list.size(); ++c) {
++        C10_CUDA_CHECK_WARN(
++            cudaGraphExecDestroy(reinterpret_cast<cudaGraphExec_t>(list[c].exec)));
++      }
++    }
+     for (size_t f = 1; f < g.execs.size(); ++f) {
+       C10_CUDA_CHECK_WARN(
+           cudaGraphExecDestroy(reinterpret_cast<cudaGraphExec_t>(g.execs[f])));
+--- a/torch/csrc/cuda/host_trace/Variant.h
++++ b/torch/csrc/cuda/host_trace/Variant.h
+@@ -77,6 +77,12 @@
+ extern bool placement_reuse_enabled;
+ // a form switch restores what the form's exec last held (else forgets it)
+ extern bool form_held_enabled;
++// instantiations of a segment's graph kept per segment (1: the graph's exec
++// only), each holding the values it last ran at: a call at those values
++// launches it with no node set (Segment::copies)
++extern size_t exec_copies;
++extern int64_t exec_copy_hits;
++extern int64_t exec_copy_switches;
+ // add_entry takes an entry's TMA descriptors (else refuses the entry)
+ extern bool entry_descriptors_enabled;
+ 
+@@ -386,6 +392,15 @@
+     std::vector<int64_t> rows;
+     std::unordered_map<uint64_t, c10::SmallVector<uint32_t, 1>> index;
+     std::vector<std::unique_ptr<Entry>> entries;
++    // per node, what its entries' kernel rows read, over all of them: the
++    // index of users is rebuilt from these, not from every entry (a table
++    // grows by a row per new key, and the index is rebuilt after each)
++    struct Reads {
++      std::vector<std::pair<int64_t, int64_t>> fields; // (row, base)
++      std::vector<int64_t> dim_rows;
++      bool always = false; // an RNG or CPU-scalar row
++    };
++    std::vector<Reads> reads;
+     std::vector<int64_t> scratch; // its scratch buffers' allocations
+     size_t segment; // its records' (a selector of no records: none)
+   };
+@@ -408,6 +423,31 @@
+       std::vector<Record> pieces;
+     };
+     std::vector<Clone> clones;
++    // with exec_copies > 1, per form instantiations of its graph, [0] the
++    // form's own exec, each with what its nodes held when it last ran
++    // (while not the current one) and the values its records read then. A
++    // call launches the copy whose values differ from its own in the fewest
++    // entries (a new one while there are fewer than exec_copies and none holds
++    // them all), patching the records those entries change
++    struct CopyHeld {
++      bool held = false;
++      int64_t row = 0;
++      std::array<int64_t, 7> dims{};
++      std::array<int64_t, 4> memset{};
++      std::array<int64_t, 3> copy{};
++      std::vector<uint8_t> image;
++    };
++    struct Copy {
++      CUgraphExec exec;
++      std::vector<CopyHeld> held; // per record in [first, stop)
++      std::vector<int64_t> key; // copy_key's values when it last ran
++      bool keyed = false;
++    };
++    std::vector<std::vector<Copy>> copies; // per form
++    size_t copy = 0; // in copies[form]
++    // the rows and bases its records read, from the index of users
++    std::vector<uint32_t> key_rows;
++    std::vector<uint32_t> key_bases;
+     // with form_held_enabled, per form what its exec's kernel nodes held when
+     // it last ran: per record, then per piece
+     struct Held {
+@@ -574,8 +614,22 @@
+   // The selector's row at values, or -1
+   static int64_t select(const Site& s, const int64_t* values);
+   void insert(Site& s, const int64_t* key, int64_t row);
++  // adds the entry's kernel rows' reads to s.reads
++  static void note_reads(Site& s, const Entry& e);
++  // after a site gains an entry: the index of users is rebuilt at the next
++  // commit, keeping what the records hold
++  void rows_added();
+   KernelRow& kernel_row(Record& r, int64_t row) const;
+   void switch_form_held(Segment& run, size_t form);
++  // the values the segment's records read at the call: its rows, bases and
++  // its sites' rows
++  std::vector<int64_t> copy_key(const Segment& run, const Frame& frame) const;
++  // makes copy j of `form` the segment's current exec, saving what the
++  // current one's records (and pieces) hold and restoring j's
++  void switch_copy(Segment& run, size_t form, size_t j);
++  // the copy of `form` the call launches, its records marked dirty against
++  // the values it holds (Segment::copies)
++  Segment::Copy* select_copy(Segment& run, size_t form, const Frame& frame);
+   const KernelRow& kernel_row(const Record& r, int64_t row) const;
+   const MemsetRow& memset_row(const Record& r, int64_t row) const;
+   int64_t check_row(int64_t row) const;
+@@ -729,6 +783,9 @@
+   void mark(const std::vector<uint32_t>& first, const std::vector<uint32_t>& records, size_t i);
+   Users users_;
+   bool users_stale_ = true;
++  // stale only because entries were added: index_users keeps what the
++  // records hold and the values seen (no full re-patch after a new key)
++  bool users_kept_ = false;
+   std::vector<uint8_t> dirty_; // per record
+   std::vector<uint8_t> always_; // per record
+   // what the clean records were patched at: the rows of users_.rows, the

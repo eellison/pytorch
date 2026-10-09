@@ -1,0 +1,14 @@
+--- a/torch/cuda/_host_trace_lower_tape.py
++++ b/torch/cuda/_host_trace_lower_tape.py
+@@ -417,8 +417,9 @@
+                 leaves.append(v)
+         outputs: list[PredictedOutput | int] = []
+         for t in call.outputs:
+-            if t._root.kind != "eager":
+-                outputs.append(next(i for i, v in enumerate(traced) if v is t))
++            at = next((i for i, v in enumerate(traced) if v is t), None)
++            if at is not None:
++                outputs.append(at)
+                 continue
+             v = self.view(t)
+             outputs.append(

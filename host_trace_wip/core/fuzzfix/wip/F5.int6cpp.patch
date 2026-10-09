@@ -1,0 +1,73 @@
+--- a/torch/cuda/_host_trace_tape.py
++++ b/torch/cuda/_host_trace_tape.py
+@@ -1274,6 +1274,15 @@
+                 return f"its {s.name} is not a traced tensor"
+         if len(cpu) > 1:
+             return "it reads two CPU buffers"
++        if not _pointwise(func):
++            # routed here by its shapes (_elementwise): the host's checks of the operands no iterator
++            # reads (addmm's mat2 against self and out at K = 0) are its meta's, guards of the op
++            env = self.shape_env
++            outer, env.op = env.op, len(self.ops)
++            try:
++                self._fake_call(func, args, kwargs)
++            finally:
++                env.op = outer
+         return self._pointwise_host(func, args, kwargs, op, out_name, written)
+ 
+     def _pointwise_host(self, func: OpOverload | str, args: tuple, kwargs: dict, op: Callable[..., Any], out_name: str | None, written: list) -> Any:
+--- a/test/test_cuda_host_trace_aten.py
++++ b/test/test_cuda_host_trace_aten.py
+@@ -1078,6 +1078,52 @@
+             self.assertEqual(x, x_ref, atol=0, rtol=0)
+         self.assertEqual(entry.eager, 0)
+ 
++    def test_a_shape_routed_op_guards_its_meta_checks(self):
++        # addmm.out at K = 0 traces as its iterators (out filled from bias), none of which reads
++        # mat2, whose size the host checks against bias's and out's: its meta's checks are guards,
++        # so a call eager rejects raises eager's error and never replays
++        def fn(a, b, out):
++            bias = out + 1
++            torch.addmm(bias, a, b, out=out)
++            return bias
++
++        def call(m, m_out):
++            return [_randn(*s, dtype=torch.bfloat16) for s in ((12, 0), (0, m), (12, m_out))]
++
++        entry = HostTraceReplay(fn)
++        for m in (128, 128, 64):
++            args = call(m, m)
++            want = [a.clone() for a in args]
++            self.assertEqual(entry(*args), fn(*want), atol=0, rtol=0)
++            self.assertEqual(args[2], want[2], atol=0, rtol=0)
++        self.assertEqual((entry.traces, entry.replays, entry.eager), (1, 2, 0))
++        args = call(64, 65)
++        with self.assertRaisesRegex(RuntimeError, "must match the existing size"):
++            fn(*[a.clone() for a in args])
++        with self.assertRaisesRegex(RuntimeError, "must match the existing size"):
++            entry(*args)
++        self.assertEqual(entry.replays, 2)
++
++    def test_a_shape_routed_op_resizing_out_is_eager(self):
++        # addmm.out at K = 0 into a padded out whose n is not mat2's: eager resizes out to (m, n)
++        # contiguous on its storage; the meta's resize check is a guard, and the trace at that
++        # call declines visibly (its warm-up resized out), so nothing writes the old layout or the padding
++        def fn(out, a, b):
++            torch.addmm(out.new_ones(()), a, b, out=out)
++
++        entry = HostTraceReplay(fn)
++        for n, ld in ((128, 131), (129, 132)):
++            base = torch.randn(127 * ld, device="cuda")
++            ref = base.clone()
++            a, b = torch.randn(127, 0, device="cuda"), torch.randn(0, 128, device="cuda")
++            out, want = base.as_strided((127, n), (ld, 1)), ref.as_strided((127, n), (ld, 1))
++            entry(out, a, b)
++            fn(want, a, b)
++            self.assertEqual((out.shape, out.stride()), (want.shape, want.stride()))
++            self.assertEqual(base, ref, atol=0, rtol=0)
++        self.assertEqual((entry.traces, entry.replays, entry.eager), (2, 0, 1))
++        self.assertIn("the warm-up changed the metadata of arg0", " ".join(entry.declines))
++
+     @parametrize("dtype", [torch.float16, torch.float32])
+     def test_zero_of_a_dense_tensor_is_a_memset(self, dtype):
+         def fn(x):

@@ -1,0 +1,11 @@
+--- a/torch/csrc/cuda/Module.cpp
++++ b/torch/csrc/cuda/Module.cpp
+@@ -398,7 +398,7 @@
+   PyObject* value = nullptr;
+   Py_ssize_t pos = 0;
+   Py_BEGIN_CRITICAL_SECTION(kwargs_o);
+-  while (PyDict_Next(kwargs_o, &pos, &key, &value)) {
++  while (kwargs_o && PyDict_Next(kwargs_o, &pos, &key, &value)) {
+     extra_args.emplace_back(as_scalar(value));
+   }
+   Py_END_CRITICAL_SECTION();

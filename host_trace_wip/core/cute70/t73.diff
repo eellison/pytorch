@@ -1,0 +1,69 @@
+--- a/test/test_cuda_host_trace_cute.py
++++ b/test/test_cuda_host_trace_cute.py
+@@ -194,6 +194,10 @@
+ 
+     _tma_choice.register_fake(_gemm_out)
+ 
++    @torch.library.custom_op("host_trace_test::tma_choice_into", mutates_args=("c",), device_types="cuda")
++    def _tma_choice_into(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor) -> None:
++        _GEMMS[(1, 1) if a.shape[0] <= 256 else (2, 1)](a, b, c)
++
+     _EXAMPLES = os.environ.get(
+         "CUTE_DSL_EXAMPLES",
+         os.path.join(
+@@ -203,6 +207,14 @@
+         ),
+     )
+ 
++    def _compile_gemms():
++        bw = _example("cute/blackwell/kernel/dense_gemm/dense_gemm.py", "bw_dense_gemm")
++        for cluster in ((1, 1), (2, 1)):
++            if cluster not in _GEMMS:
++                op = bw.DenseGemmKernel(cutlass.Float32, False, (128, 128), cluster, True)
++                args = [from_dlpack(_half(1, 256, 128).permute(1, 2, 0), assumed_align=16).mark_layout_dynamic(leading_dim=1) for _ in range(3)]
++                _GEMMS[cluster] = cute.compile(op, *args, make_fake_stream(use_tvm_ffi_env_stream=True), options="--enable-tvm-ffi")
++
+     def _example(path, name):
+         path = os.path.join(_EXAMPLES, path)
+         if not os.path.exists(path):
+@@ -1269,12 +1281,7 @@
+         # the op's TMA kernel and cluster change with m, which no entry holds:
+         # off, its class traces; on, the variant's tape with the op dispatched
+         # again builds the variant, as eager launches it
+-        bw = _example("cute/blackwell/kernel/dense_gemm/dense_gemm.py", "bw_dense_gemm")
+-        for cluster in ((1, 1), (2, 1)):
+-            if cluster not in _GEMMS:
+-                op = bw.DenseGemmKernel(cutlass.Float32, False, (128, 128), cluster, True)
+-                args = [from_dlpack(_half(1, 256, 128).permute(1, 2, 0), assumed_align=16).mark_layout_dynamic(leading_dim=1) for _ in range(3)]
+-                _GEMMS[cluster] = cute.compile(op, *args, make_fake_stream(use_tvm_ffi_env_stream=True), options="--enable-tvm-ffi")
++        _compile_gemms()
+ 
+         def f(a, b):
+             return _tma_choice(a, b) * 2
+@@ -1290,6 +1297,26 @@
+ 
+     @unittest.skipIf(
+         not TEST_CUDA or torch.cuda.get_device_capability() < (10, 0),
++        "requires Blackwell",
++    )
++    def test_a_respec_after_an_allocation_outside_the_op(self):
++        # the output is allocated before the op, outside it: the respecified
++        # variant allocates it before the op's TMA launch, as eager
++        _compile_gemms()
++
++        def f(a, b):
++            c = _gemm_out(a, b)
++            _tma_choice_into(a, b, c)
++            return c
++
++        r = HostTraceReplay(f)
++        for m in (256, 512, 128, 1024, 256):
++            a, b = (_half(1, rows, 128).permute(1, 2, 0) for rows in (m, 256))
++            self.assertEqual(r(a, b), f(a, b), atol=0, rtol=0)
++        self.assertEqual((r.traces, r.respecs, len(r.variants), r.replays, r.eager), (1, 1, 2, 4, 0))
++
++    @unittest.skipIf(
++        not TEST_CUDA or torch.cuda.get_device_capability() < (10, 0),
+         "requires Blackwell",
+     )
+     @parametrize("free", [True, False])

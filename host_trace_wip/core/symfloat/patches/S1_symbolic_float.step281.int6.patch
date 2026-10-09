@@ -1,0 +1,862 @@
+--- a/torch/cuda/_host_trace.py
++++ b/torch/cuda/_host_trace.py
+@@ -19,6 +19,7 @@
+ from torch._guards import GuardSource, ShapeGuard, Source
+ from torch.cuda import _host_trace_ir as _ir
+ from torch.fx.experimental.symbolic_shapes import DimDynamic, ShapeEnv
++from torch.cuda import _host_trace_program as _program
+ from torch.cuda._host_trace_program import f32_bits
+ from torch.utils._sympy.functions import Mod, Where
+ from torch.utils._sympy.numbers import int_oo
+@@ -527,3 +528,91 @@
+         raise NotImplementedError("host_trace: a float division of an unbacked size")
+     # pyrefly: ignore [missing-attribute]
+     return env.create_symintnode(F32Div(*exprs), hint=f32_bits(*hints))
++
++
++# float32 arithmetic for a traced host modelling C++ `float` code: each function
++# is one IEEE operation (f32_fma: std::fmaf), so the host spells out the order
++# its C++ binary computes in; Python's operators on a SymFloat stay double
++FLT_MAX = float.fromhex("0x1.fffffep+127")
++
++
++def _ir_node(args: tuple) -> Any:
++    import torch
++
++    for x in args:
++        if isinstance(x, (torch.SymInt, torch.SymFloat)):
++            if not isinstance(x.node, _ir.IRSymNode):
++                raise NotImplementedError("host_trace: float32 arithmetic needs symbolic = 'ir'")
++            return x.node
++    return None
++
++
++def f32(x: Any) -> Any:
++    """static_cast<float>(x) for a traced host, x an int or a double."""
++    node = _ir_node((x,))
++    if node is None:
++        return _program.f32_of_int(x) if isinstance(x, int) else _program.f32_round(float(x))
++    return node.f32()
++
++
++def _f32_op(op: str, *args: Any) -> Any:
++    node = _ir_node(args)
++    if node is None:
++        for a in args:
++            if type(a) is not float or _program.f32_round(a) != a:
++                raise TypeError(f"host_trace: {a!r} is not a float32 value (convert it with f32())")
++        return _program.float_value(op, args)
++    return node.f32_op(op, args)
++
++
++def f32_add(a: Any, b: Any) -> Any:
++    return _f32_op("f32add", a, b)
++
++
++def f32_sub(a: Any, b: Any) -> Any:
++    return _f32_op("f32sub", a, b)
++
++
++def f32_mul(a: Any, b: Any) -> Any:
++    return _f32_op("f32mul", a, b)
++
++
++def f32_quot(a: Any, b: Any) -> Any:
++    """a / b in float32 (f32_div is the bits of an integer quotient's)."""
++    return _f32_op("f32quot", a, b)
++
++
++def f32_fma(a: Any, b: Any, c: Any) -> Any:
++    """std::fmaf(a, b, c): a * b + c rounded once."""
++    return _f32_op("f32fma", a, b, c)
++
++
++def argmin(costs: Any, below: Any = None) -> int:
++    """C's `best = below; k = -1; for (i...) if (c[i] < best) {best = c[i]; k = i;}`
++    (no bound: below None): the first minimum's index, -1 if no cost is below.
++    Traced, it guards the winner against each other cost (strict < an earlier
++    one, <= a later one) and the bound, decided at the hints: the guards fail
++    only where the winner changes, not where the losers reorder."""
++    import torch
++
++    costs = list(costs)
++
++    def hint(c: Any) -> Any:
++        return c.node.node.hint if isinstance(c, torch.SymFloat) else c
++
++    best, k = hint(below), -1
++    for i, c in enumerate(costs):
++        if best is None or hint(c) < best:
++            best, k = hint(c), i
++    if k < 0:
++        for c in costs:
++            if bool(c < below):
++                raise AssertionError("host_trace: argmin's guard is false at the hints")
++        return -1
++    w = costs[k]
++    holds = [w < c if j < k else w <= c for j, c in enumerate(costs) if j != k]
++    if below is not None:
++        holds.append(w < below)
++    if not all(bool(h) for h in holds):
++        raise AssertionError("host_trace: argmin's guard is false at the hints")
++    return k
+--- a/torch/cuda/_host_trace_cover.py
++++ b/torch/cuda/_host_trace_cover.py
+@@ -25,7 +25,7 @@
+ 
+ import torch
+ import torch.utils._sympy.functions as F
+-from torch.cuda import _host_trace_ir as _ir
++from torch.cuda import _host_trace_ir as _ir, _host_trace_program as _program
+ 
+ _SIZE = re.compile(r"arg(\d+)\.size\((\d+)\)$")
+ _STRIDE = re.compile(r"arg(\d+)\.stride\((\d+)\)$")
+@@ -406,6 +406,22 @@
+ _DECLINED = object()
+ 
+ 
++# the float rows the program evaluates, per element by its own rule (their sympy export, Identity around real
++# arithmetic, is not the host's float arithmetic)
++_IR_FLOATS = frozenset({"ffromint", "fadd", "fsub", "fmul", "fdiv", "f32i", "f32r", "f32add", "f32sub", "f32mul", "f32quot", "f32fma"})
++
++
++def _ir_float(op, vs):
++    def one(*v):
++        if op == "ffromint":
++            return float(int(v[0]))
++        return _program.float_value(op, [int(v[0])] if op == "f32i" else [float(x) for x in v])
++
++    if any(isinstance(v, np.ndarray) for v in vs):
++        return np.frompyfunc(one, len(vs), 1)(*vs).astype(np.float64)
++    return one(*vs)
++
++
+ def _ir_vector(n, leaves, memo, i64, large):
+     """The IR node n at the box's points, as _vector evaluates its sympy export: leaves maps a symbol's name to its
+     value there (an array broadcast over the box, int64 where i64, else of Python ints; or a Python int); memo and
+@@ -500,8 +516,14 @@
+     elif op == "not":
+         v = ev(a[0])
+         out = np.logical_not(v) if isinstance(v, np.ndarray) else not v
++    elif op in _IR_FLOATS:
++        out = _ir_float(op, [ev(x) for x in a])
++    elif op == "fconst":
++        out = n.hint
++    elif op == "fcmp":
++        out = _REL[a[0].capitalize()](ev(a[1]), ev(a[2]))
+     else:
+-        # the float lane and f32div: the guard's sympy export
++        # the rest of the float lane and f32div: the guard's sympy export
+         raise _Fallback(f"no vector form for the IR kind {op}")
+     (memo if not isinstance(out, np.ndarray) or out.size <= _MEMO_SIZE else large)[n.id] = out
+     return out
+--- a/torch/cuda/_host_trace_ir.py
++++ b/torch/cuda/_host_trace_ir.py
+@@ -56,7 +56,7 @@
+ 
+ import torch
+ from torch._guards import ShapeGuard, SLoc
+-from torch.cuda._host_trace_program import f32_bits
++from torch.cuda._host_trace_program import f32_bits, f32_of_int, f32_round, float_value
+ from torch.fx.experimental.sym_node import register_direct_int_node
+ from torch.utils._sympy.functions import (
+     BitwiseFn_bitwise_and,
+@@ -67,6 +67,7 @@
+     FloatTrueDiv,
+     FloorDiv,
+     FloorToInt,
++    Identity,
+     IntTrueDiv,
+     IsNonOverlappingAndDenseIndicator,
+     Max,
+@@ -126,8 +127,18 @@
+         "fneg",
+         "fsqrt",
+         "fpow",
++        "f32i",
++        "f32r",
++        "f32add",
++        "f32sub",
++        "f32mul",
++        "f32quot",
++        "f32fma",
+     }
+ )
++# float32 values (static_cast<float>, the float32 operations), each node one
++# IEEE operation of the host in its order; the hint is the float32 value
++F32_OPS = frozenset({"f32i", "f32r", "f32add", "f32sub", "f32mul", "f32quot", "f32fma"})
+ _REL_TEXT = {"eq": "==", "ne": "!=", "lt": "<", "le": "<="}
+ _REL_CLASSES = {
+     "Eq": sympy.Eq,
+@@ -147,12 +158,15 @@
+ _BUILDERS = {
+     **{op: op for op in ("floordiv", "ceildiv", "mod", "min", "max", "bitlen", "f32div", "where")},
+     "ffromint": "to_float",
++    "f32i": "f32",
++    "f32r": "f32",
+ }
+ _OP_BUILDERS = {
+     **dict.fromkeys(_BITWISE, "bitwise"),
+     **dict.fromkeys(("fadd", "fsub", "fmul", "fdiv", "fpow"), "fbin"),
+     **dict.fromkeys(("fneg", "fsqrt"), "fun"),
+     **dict.fromkeys(("ftrunc", "ffloor", "fceil"), "fint"),
++    **dict.fromkeys(("f32add", "f32sub", "f32mul", "f32quot", "f32fma"), "f32op"),
+ }
+ _TORCH_DIR = os.path.dirname(os.path.abspath(torch.__file__)) + os.sep
+ _NO_SLOC = SLoc(None, None)
+@@ -1025,6 +1039,30 @@
+         hint = -a.hint if op == "fneg" else math.sqrt(a.hint)
+         return self.mk(op, (a,), float(hint))
+ 
++    def f32(self, a: Node) -> Node:
++        """static_cast<float>(a) of an integer or a double."""
++        if a.op in F32_OPS:
++            return a
++        if a.op in ("const", "fconst"):
++            return self.fconst(f32_of_int(a.args[0]) if a.op == "const" else f32_round(a.hint))
++        if a.is_float:
++            return self.mk("f32r", (a,), f32_round(a.hint))
++        if not a.is_int:
++            raise TypeError(f"host_trace: static_cast<float> of the boolean {render(a)}")
++        return self.mk("f32i", (a,), f32_of_int(a.hint))
++
++    def f32op(self, op: str, *args: Node) -> Node:
++        """One float32 operation (f32add, f32sub, f32mul, f32quot, f32fma) on
++        float32 values: float32 nodes, or constants a float32 holds exactly.
++        No rewrite but folding constants by the evaluator's own rule."""
++        for a in args:
++            if a.op not in F32_OPS and not (a.op == "fconst" and f32_round(a.hint) == a.hint):
++                raise TypeError(f"host_trace: {render(a)} is not a float32 value (convert it with f32())")
++        hint = float_value(op, [a.hint for a in args])
++        if all(a.op == "fconst" for a in args):
++            return self.fconst(hint)
++        return self.mk(op, args, hint)
++
+     def fint(self, op: str, a: Node) -> Node:
+         # int() / math.floor / math.ceil of a float: an integer node over a
+         # float operand (the ratio of integers takes floordiv / ceildiv)
+@@ -1628,6 +1666,20 @@
+     def _leaf(self, x: Any) -> Node:
+         return self.env.ctx.const(x) if isinstance(x, int) else x.node.node
+ 
++    def f32(self) -> torch.SymFloat:
++        return torch.SymFloat(self._flt(self.env.ctx.f32(self.node)))
++
++    def f32_op(self, op: str, args: tuple) -> torch.SymFloat:
++        nodes = []
++        for x in args:
++            if isinstance(x, float):
++                nodes.append(self.env.ctx.fconst(x))
++            elif isinstance(x, torch.SymFloat):
++                nodes.append(self._of(x.node))
++            else:
++                raise TypeError(f"host_trace: {x!r} is not a float32 value")
++        return torch.SymFloat(self._flt(self.env.ctx.f32op(op, *nodes)))
++
+     # ---- relations and boolean algebra
+     def _rel(self, cls: str, other: IRSymNode) -> IRSymNode:
+         a, b = self.node, self._of(other)
+@@ -1963,14 +2015,24 @@
+             return sympy.Float(n.hint)
+         if op == "ffromint":
+             return ToFloat(e(n.args[0]))
+-        if op == "fadd":
+-            return e(n.args[0]) + e(n.args[1])
+-        if op == "fsub":
+-            return e(n.args[0]) - e(n.args[1])
+-        if op == "fmul":
+-            return e(n.args[0]) * e(n.args[1])
++        # each float operation an Identity: sympy can not reassociate or fold
++        # across it (the IR's rows evaluate it; this form is for reading)
++        if op in ("fadd", "f32add"):
++            return Identity(e(n.args[0]) + e(n.args[1]))
++        if op in ("fsub", "f32sub"):
++            return Identity(e(n.args[0]) - e(n.args[1]))
++        if op in ("fmul", "f32mul"):
++            return Identity(e(n.args[0]) * e(n.args[1]))
++        if op == "f32quot":
++            return Identity(FloatTrueDiv(e(n.args[0]), e(n.args[1])))
++        if op == "f32fma":
++            return Identity(e(n.args[0]) * e(n.args[1]) + e(n.args[2]))
++        if op == "f32i":
++            return Identity(ToFloat(e(n.args[0])))
++        if op == "f32r":
++            return Identity(e(n.args[0]))
+         if op == "fneg":
+-            return -e(n.args[0])
++            return Identity(-e(n.args[0]))
+         if op == "fdiv":
+             ratio = ctx.int_ratio(n)
+             if ratio is not None:
+--- a/torch/cuda/_host_trace_lower.py
++++ b/torch/cuda/_host_trace_lower.py
+@@ -408,9 +408,10 @@
+ 
+     `sources` maps each sym node the call supplies to its value, as
+     Lowering's does; a guard is an Env record, (node, written form or None).
+-    What the export's lowering declines (a float operation other than an
+-    exact division or a square root, an IsNonOverlappingAndDenseIndicator,
+-    TruncToInt) this declines too, and a sign the declared domains decide
++    The float operations lower one row each, in the host's order (the
++    export's lowering declines those but an exact division or a square
++    root); what else the export's lowering declines (an
++    IsNonOverlappingAndDenseIndicator, TruncToInt) this declines too, and a sign the declared domains decide
+     (Ctx.bounds) selects the shorter division as sympy's assumptions do."""
+ 
+     def __init__(self, program: IntegerProgram, sources: dict[Node, tuple | int], ctx: Ctx) -> None:
+@@ -560,6 +561,12 @@
+             value = n.hint
+         elif op == "ffromint":
+             return self._emit("tofloat", self._int(args[0]))
++        elif op == "f32i":
++            return self._emit("f32i", self._int(args[0]))
++        elif op in ("fadd", "fsub", "fmul", "f32r", "f32add", "f32sub", "f32mul", "f32quot", "f32fma"):
++            return self._emit(op, *(self._float(a) for a in args))
++        elif op == "fneg":
++            return self._emit("fmul", self._constant(f64_bits(-1.0)), self._float(args[0]))
+         elif op in ("fpow", "fdiv") and all(a.op == "fconst" for a in args):
+             x, y = (a.hint for a in args)
+             ratio = self.ctx.int_ratio(n) if op == "fdiv" else None
+--- a/torch/cuda/_host_trace_program.py
++++ b/torch/cuda/_host_trace_program.py
+@@ -17,6 +17,7 @@
+ import operator
+ import struct
+ from enum import IntEnum
++from fractions import Fraction
+ from typing import Any, TYPE_CHECKING
+ 
+ import torch
+@@ -77,18 +78,87 @@
+     "fdiv": 2,
+     "feq": 2,
+     "flt": 2,
++    "fadd": 2,
++    "fsub": 2,
++    "fmul": 2,
++    "f32i": 1,
++    "f32r": 1,
++    "f32add": 2,
++    "f32sub": 2,
++    "f32mul": 2,
++    "f32quot": 2,
++    "f32fma": 3,
+     "select": 3,
+     **dict.fromkeys(_COMPARISONS, 2),
+     **dict.fromkeys(_BITWISE, 2),
+ }
+ 
+ 
++def f32_round(x: float) -> float:
++    """static_cast<float>(x) of a double, as a double (round to nearest even)."""
++    try:
++        return struct.unpack("<f", struct.pack("<f", x))[0]
++    except OverflowError:
++        return math.copysign(math.inf, x)
++
++
++def _f32_nearest(q: Fraction) -> float:
++    """The exact rational q rounded once to the nearest float32 (ties to even)."""
++    if q == 0:
++        return 0.0
++    sign, q = (-1.0 if q < 0 else 1.0), abs(q)
++    e = q.numerator.bit_length() - q.denominator.bit_length()
++    if Fraction(2) ** e > q:
++        e -= 1
++    ulp = Fraction(2) ** (max(e, -126) - 23)
++    m, r = divmod(q / ulp, 1)
++    if r > Fraction(1, 2) or (r == Fraction(1, 2) and m % 2):
++        m += 1
++    v = m * ulp
++    return sign * (math.inf if v >= 2**128 else float(v))
++
++
++def f32_of_int(n: int) -> float:
++    """static_cast<float>(n): the integer rounded once (int -> double -> float
++    rounds twice above 2**53)."""
++    return f32_round(float(n)) if abs(n) <= 1 << 53 else _f32_nearest(Fraction(n))
++
++
++def _fdiv(x: float, y: float) -> float:
++    if y != 0.0:
++        return x / y
++    return math.nan if x == 0.0 or math.isnan(x) else math.copysign(math.inf, x) * math.copysign(1.0, y)
++
++
++def float_value(op: str, args: Sequence[float]) -> float:
++    """A float row's value (a double; a float32 row's is a float32 value) on
++    its float operands, an int for f32i. A float32 add, subtract, multiply or
++    divide done in double and rounded once is the float32 operation's result
++    (53 >= 2 * 24 + 2); the fused multiply-add rounds the exact value once.
++    A float32 row's operands are float32 values; others convert first."""
++    if op == "f32i":
++        return f32_of_int(args[0])
++    if op == "f32r":
++        return f32_round(args[0])
++    if op.startswith("f32"):
++        args = [f32_round(a) for a in args]  # static_cast<float> of each operand
++    if op == "f32fma":
++        x, y, z = args
++        if all(math.isfinite(v) for v in args):
++            q = Fraction(x) * Fraction(y) + Fraction(z)
++            if q == 0:  # IEEE's zero: negative only for -0 + -0
++                return -0.0 if math.copysign(1.0, x * y) < 0 and math.copysign(1.0, z) < 0 and x * y == 0 else 0.0
++            return _f32_nearest(q)
++        return f32_round(x * y + z)
++    x, y = args
++    kind = op[3:] if op.startswith("f32") else op[1:]
++    v = x + y if kind == "add" else x - y if kind == "sub" else x * y if kind == "mul" else _fdiv(x, y)
++    return f32_round(v) if op.startswith("f32") else v
++
++
+ def f32_bits(n: int, d: int) -> int:
+-    """static_cast<float>(n) / static_cast<float>(d)'s bits as an int32: each
+-    rounded to float32, their double quotient rounded once more, which is the
+-    float32 quotient."""
+-    f = [struct.unpack("<f", struct.pack("<f", x))[0] for x in (n, d)]
+-    return struct.unpack("<i", struct.pack("<f", f[0] / f[1]))[0]
++    """static_cast<float>(n) / static_cast<float>(d)'s bits as an int32."""
++    return struct.unpack("<i", struct.pack("<f", float_value("f32quot", [f32_of_int(n), f32_of_int(d)])))[0]
+ 
+ 
+ def f64_bits(x: float) -> int:
+@@ -100,6 +170,10 @@
+     return struct.unpack("<d", struct.pack("<q", bits))[0]
+ 
+ 
++# IEEE operations on doubles' bits, as the host computes them (no domain)
++_FLOAT_ROWS = frozenset({"fadd", "fsub", "fmul", "f32i", "f32r", "f32add", "f32sub", "f32mul", "f32quot", "f32fma"})
++
++
+ def _fits(value: int) -> bool:
+     return MIN_I64 <= value <= MAX_I64
+ 
+@@ -142,6 +216,8 @@
+         x, y = map(f64, args)
+         q = x / y if y != 0.0 else math.nan
+         return f64_bits(q) if math.isfinite(q) else Status.FLOAT_DOMAIN
++    if op in _FLOAT_ROWS:
++        return f64_bits(float_value(op, [args[0]] if op == "f32i" else [f64(a) for a in args]))
+     if op == "feq":
+         return int(f64(args[0]) == f64(args[1]))
+     if op == "flt":
+@@ -175,6 +251,12 @@
+       ("fsqrt", a), ("fdiv", a, b)      math.sqrt and / on the doubles whose
+                                         bits a and b are, for a finite result
+       ("feq" | "flt", a, b)             the doubles' == and <
++      ("fadd" | "fsub" | "fmul", a, b)  + - * of the doubles
++      ("f32i", a)                       static_cast<float>(a)'s value, as a double
++      ("f32r", a)                       static_cast<float>(the double a)
++      ("f32add" | "f32sub" | "f32mul" | "f32quot", a, b), ("f32fma", a, b, c)
++                                        the float32 operation (std::fmaf) on
++                                        float32 values held as doubles
+       ("min" | "max", a, b, ...)
+       ("select", cond, if_true, if_false)
+     where a, b, ... are earlier rows. floordiv and ceildiv are defined for a
+--- a/test/test_cuda_host_trace_float.py
++++ b/test/test_cuda_host_trace_float.py
+@@ -0,0 +1,365 @@
++# Owner(s): ["module: cuda graphs"]
++# Float arithmetic in traced host code: float32 and float64 rows evaluated in the host's operation order (the program's
++# reference and Program.cpp), comparisons as guards, argmin's k - 1 guards, and the sympy export (Identity per operation).
++import itertools
++import math
++import random
++import struct
++import unittest
++from fractions import Fraction
++
++import numpy as np
++import sympy
++
++import torch
++import torch.cuda._host_trace as ht
++from torch.cuda import _host_trace_cover as cover, _host_trace_ir as _ir
++from torch.cuda._host_trace_lower import IRLowering
++from torch.cuda._host_trace_program import (
++    _step,
++    compile_program,
++    f32_bits,
++    f64,
++    f64_bits,
++    IntegerProgram,
++    Status,
++)
++from torch.testing._internal.common_utils import run_tests, TEST_CUDA, TestCase
++from torch.utils._sympy.functions import Identity
++from torch.utils._triton import has_triton
++
++
++f32 = np.float32
++FLOAT_ROWS = ("fadd", "fsub", "fmul", "f32r", "f32add", "f32sub", "f32mul", "f32quot", "f32fma")
++MAIN = {64: 1.68, 32: 1.48, 16: 1.2, 8: 1.0}
++RED = {64: 1.2, 32: 1.08, 16: 1.03, 8: 1.0}
++
++
++def exact_fma32(a, b, c):
++    # an independent reference: the nearest float32 to the exact a * b + c, by search
++    v = Fraction(float(a)) * Fraction(float(b)) + Fraction(float(c))
++    if abs(v) >= Fraction(float(np.finfo(f32).max)) + Fraction(2) ** 103:  # past FLT_MAX by half an ulp
++        return math.copysign(math.inf, v)
++    with np.errstate(over="ignore"):
++        x = f32(float(v))
++        near = [y for y in (np.nextafter(x, f32(-np.inf)), x, np.nextafter(x, f32(np.inf))) if np.isfinite(y)]
++    return float(min(near, key=lambda y: (abs(Fraction(float(y)) - v), int(np.array(y, np.float32).view(np.uint32)) & 1)))
++
++
++def evaluate(program, inputs):
++    """The program's rows at the boxed inputs by the Python reference (_step)."""
++    values = []
++    for op, *x in program.instructions:
++        if op == "constant":
++            v = x[0]
++        elif op == "boxed":
++            v = inputs[x[0]]
++        else:
++            v = _step(op, [values[i] for i in x])
++            if isinstance(v, Status):
++                return v, None
++        values.append(v)
++    return Status.SUCCESS, values
++
++
++def float_rows(cases):
++    """A program of constant rows and one row per (op, operands), compiled; the rows' indices."""
++    program = IntegerProgram([])
++    rows = []
++    for op, operands in cases:
++        args = [program.emit("constant", a if op == "f32i" else f64_bits(a)) for a in operands]
++        rows.append(program.emit(op, *args))
++    return program, rows
++
++
++class TestFloatRows(TestCase):
++    def cases(self):
++        rng = random.Random(0)
++        pool = [0.0, -0.0, 1.0, 1.5, 3.0, 2.0**-126, 2.0**-149, 3.4028234663852886e38, 1e-30, 16777216.0, 16777217.0]
++        values = [float(f32(x)) for x in pool] + [float(f32(rng.uniform(-1e6, 1e6))) for _ in range(300)]
++        values += [float(f32(rng.choice((1, -1)) * 2.0 ** rng.uniform(-40, 40))) for _ in range(300)]
++        out = []
++        for _ in range(3000):
++            a, b, c = rng.choice(values), rng.choice(values), rng.choice(values)
++            out += [("f32add", (a, b)), ("f32sub", (a, b)), ("f32mul", (a, b)), ("f32fma", (a, b, c))]
++            if b != 0.0:
++                out.append(("f32quot", (a, b)))
++            x, y = rng.uniform(-1e3, 1e3), rng.uniform(-1e3, 1e3)
++            out += [("fadd", (x, y)), ("fsub", (x, y)), ("fmul", (x, y)), ("f32r", (x * 1e-3,))]
++        ints = [0, 1, -1, 2**24 + 1, 2**24 + 3, -(2**24 + 1), 2**53 + 2**29 + 1, 2**62 + 2**38 + 1, 2**63 - 1, -(2**63)]
++        out += [("f32i", (n,)) for n in ints + [rng.randrange(-(2**40), 2**40) for _ in range(200)]]
++        return out
++
++    def expected(self, op, args):
++        if op == "f32fma":
++            return exact_fma32(*args)
++        if op == "f32i":
++            return float(Fraction(args[0]).limit_denominator(1)) if abs(args[0]) < 2**24 else _nearest_int32(args[0])
++        if op == "f32r":
++            return float(f32(args[0]))
++        if op.startswith("f32"):
++            x, y = f32(args[0]), f32(args[1])
++            with np.errstate(over="ignore", divide="ignore", invalid="ignore"):
++                return float({"f32add": x + y, "f32sub": x - y, "f32mul": x * y, "f32quot": x / y}[op])
++        x, y = args
++        return {"fadd": x + y, "fsub": x - y, "fmul": x * y}[op]
++
++    def test_reference_rows_are_ieee(self):
++        # each row is one IEEE operation: float32 ones as numpy's float32 ufuncs (one operation each), the fused
++        # multiply-add rounded once, an integer converted once (not through a double above 2**53)
++        for op, args in self.cases():
++            got = f64(_step(op, [args[0]] if op == "f32i" else [f64_bits(a) for a in args]))
++            want = self.expected(op, args)
++            self.assertEqual(struct.pack("<d", got), struct.pack("<d", want), (op, args, got, want))
++
++    def test_compiled_rows_match_the_reference(self):
++        cases = self.cases()
++        program, rows = float_rows(cases)
++        status, values = compile_program(program).evaluate_inputs(())
++        self.assertEqual(status, Status.SUCCESS)
++        for (op, args), row in zip(cases, rows):
++            self.assertEqual(values[row], program.values[row], (op, args))
++
++    def test_f32_div_converts_its_integers_once(self):
++        # static_cast<float>(int64) rounds once: 2**53 + 2**29 + 1 is above the float32 midpoint 2**53 + 2**29, so it
++        # rounds up; through a double it lands on the midpoint and ties to even (down)
++        n = 2**53 + 2**29 + 1
++        want = struct.unpack("<i", struct.pack("<f", 2.0**53 + 2.0**30))[0]
++        self.assertEqual(f32_bits(n, 1), want)
++        program = IntegerProgram([])
++        row = program.emit("f32div", program.emit("constant", n), program.emit("constant", 1))
++        self.assertEqual(compile_program(program).evaluate_inputs(())[1][row], want)
++
++
++def _nearest_int32(n):
++    sh = abs(n).bit_length() - 24
++    q, r = divmod(abs(n), 1 << sh)
++    half = 1 << (sh - 1)
++    q += r > half or (r == half and q & 1)
++    return math.copysign(float(q << sh), n)
++
++
++def cost_terms(mk, batch, sm, tiles):
++    """The trtllm-gen tile cost model's integer inputs per candidate (selectTileSizeQForGqaGeneration's shape, a
++    simplified computeCtaAndClusterConfig): (tile, seq per CTA, CTAs per KV sequence, waves), mk and batch ints or
++    SymInts; the min is an expression (sym_min), so only the comparisons guard."""
++    out = []
++    for tile, (step, ctas) in tiles.items():
++        kv = torch.sym_min(-(-mk // (2 * step)), torch.sym_max(1, sm // (ctas * batch)))
++        seq = -(-(-(-mk // step)) // kv) * step
++        out.append((tile, seq, kv, -(-(ctas * kv * batch) // sm)))
++    return out
++
++
++def binary_costs(terms):
++    # fmha_gen.so's order on aarch64: (factor*M)*seq, then fma(R*128, kv, that), times waves
++    costs = []
++    for tile, seq, kv, waves in terms:
++        main = ht.f32_mul(ht.f32_mul(1.0, ht.f32(MAIN[tile])), ht.f32(seq))
++        t = ht.f32_fma(ht.f32_mul(ht.f32(RED[tile]), 128.0), ht.f32(kv), main)
++        costs.append(ht.f32_mul(ht.f32(waves), t))
++    return costs
++
++
++def reference_costs(terms):
++    # the same order in numpy float32 and the search-based fused multiply-add
++    out = []
++    for tile, seq, kv, waves in terms:
++        main = f32(f32(1.0) * f32(MAIN[tile])) * f32(seq)
++        t = exact_fma32(f32(f32(RED[tile]) * f32(128.0)), f32(kv), main)
++        out.append(f32(waves) * f32(t))
++    return out
++
++
++def first_min(costs, below):
++    best, k = below, -1
++    for i, c in enumerate(costs):
++        if c < best:
++            best, k = c, i
++    return k
++
++
++class TestFloatGuards(TestCase):
++    TILES = {64: (128, 2), 32: (128, 4), 16: (128, 8), 8: (64, 16)}
++
++    def trace(self, mk, batch, sm=148):
++        env = _ir.Env()
++        m, b = env.symbol(mk, "mk", positive=True), env.symbol(batch, "b", positive=True)
++        tiles = list(self.TILES)
++        k = ht.argmin(binary_costs(cost_terms(m, b, sm, self.TILES)), below=ht.FLT_MAX)
++        program = IntegerProgram([mk, batch])
++        lowering = IRLowering(program, {m.node.node: ("boxed", 0), b.node.node: ("boxed", 1)}, env.ctx)
++        predicate = lowering.predicate(env.records)
++        return tiles[k], env, program, predicate
++
++    def holds(self, program, predicate, point):
++        status, values = evaluate(program, point)
++        return status == Status.SUCCESS and values[predicate] == 1
++
++    def test_argmin_guards_the_winner_only(self):
++        # k - 1 comparisons and the bound, each against the winner; a tie goes to the first
++        env = _ir.Env()
++        x = env.symbol(10, "x", positive=True)
++        costs = [ht.f32_mul(ht.f32(x), c) for c in (3.0, 2.0, 2.0, 5.0)]
++        self.assertEqual(ht.argmin(costs, below=ht.FLT_MAX), 1)
++        self.assertEqual(len(env.records), 4)
++        self.assertEqual(ht.argmin([3.0, 2.0, 2.0, 5.0]), 1)
++        self.assertEqual(ht.argmin([3.0, 2.0], below=1.0), -1)
++        y = env.symbol(10, "y", positive=True)
++        self.assertEqual(ht.argmin([ht.f32(y)], below=4.0), -1)
++
++    def test_guards_hold_exactly_where_the_winner_holds(self):
++        # the guard program at every (max_kv, batch) of a box around the hint: it holds where the binary's order picks
++        # the traced tile (numpy float32 reference), else not; the integer parts are expressions
++        for mk, batch in ((300, 1), (1500, 2), (2100, 1), (5000, 3)):
++            tile, env, program, predicate = self.trace(mk, batch)
++            tiles = list(self.TILES)
++            seen = set()
++            for m, b in itertools.product(range(max(1, mk - 700), mk + 700, 3), range(1, 6)):
++                want = tiles[first_min(reference_costs(cost_terms(m, b, 148, self.TILES)), f32(ht.FLT_MAX))]
++                self.assertEqual(self.holds(program, predicate, (m, b)), want == tile, (mk, batch, m, b, tile, want))
++                seen.add(want)
++            self.assertGreater(len(seen), 1, (mk, batch))  # the box crosses a decision boundary
++
++    def test_the_fused_order_decides_an_exact_tie(self):
++        # Q/KV heads 32/8, max_q 16, batch 1, 148 SMs, max_kv 2049: tiles 32 and 16 cost 1448.96 in exact arithmetic;
++        # the binary's fused reduction term picks 16, an unfused order 32
++        terms = [(64, 512, 5, 1), (32, 512, 5, 1), (16, 768, 4, 1), (8, 1280, 2, 1)]
++        self.assertEqual(ht.argmin(binary_costs(terms), below=ht.FLT_MAX), 2)
++        unfused = []
++        for tile, seq, kv, waves in terms:
++            main = ht.f32_mul(ht.f32(MAIN[tile]), ht.f32(seq))
++            unfused.append(ht.f32_mul(ht.f32(waves), ht.f32_add(main, ht.f32_mul(ht.f32_mul(ht.f32(RED[tile]), 128.0), ht.f32(kv)))))
++        self.assertEqual(ht.argmin(unfused, below=ht.FLT_MAX), 1)
++
++    def test_large_integers_round_once(self):
++        # f32(n) of a symbol is static_cast<float>: n = 2**24 + 1 converts to 2**24, so 2**24 + 1 and 2**24 compare equal
++        env = _ir.Env()
++        n = env.symbol(2**24 + 1, "n", positive=True)
++        self.assertTrue(bool(ht.f32(n) == ht.f32(2**24)))
++        program = IntegerProgram([2**24 + 1])
++        predicate = IRLowering(program, {n.node.node: ("boxed", 0)}, env.ctx).predicate(env.records)
++        self.assertTrue(self.holds(program, predicate, (2**24,)))
++        self.assertFalse(self.holds(program, predicate, (2**24 + 2,)))
++        self.assertTrue(self.holds(program, predicate, (2**24 + 1,)))
++
++    def test_float32_operands_are_checked(self):
++        env = _ir.Env()
++        x = ht.f32(env.symbol(3, "x", positive=True))
++        with self.assertRaisesRegex(TypeError, "float32 value"):
++            ht.f32_mul(x, 2.2)
++        with self.assertRaisesRegex(TypeError, "float32 value"):
++            ht.f32_mul(x, env.symbol(3, "y", positive=True) * 1.5)
++        with self.assertRaisesRegex(TypeError, "float32 value"):
++            ht.f32_add(2.2, 1.0)
++        self.assertEqual(ht.f32_mul(x, ht.f32(2.2)).node.node.hint, float(f32(3.0) * f32(2.2)))
++
++    def test_cover_evaluates_float_guards_by_the_rows(self):
++        # the cover solver evaluates an IR float node by the rows' rule over the box, not its sympy export
++        env = _ir.Env()
++        s, k = env.symbol(512, "s", positive=True), env.symbol(5, "k", positive=True)
++        t = ht.f32_fma(ht.f32_mul(ht.f32(1.08), 128.0), ht.f32(k), ht.f32_mul(ht.f32(1.48), ht.f32(s)))
++        leaves = {s.node.node.args[0]: np.arange(1, 4000, dtype=np.int64), k.node.node.args[0]: 5}
++        got = cover._ir_vector(t.node.node, leaves, {}, True, {})
++        want = [exact_fma32(f32(f32(1.08) * f32(128.0)), f32(5), f32(f32(1.48) * f32(v))) for v in range(1, 4000)]
++        self.assertEqual(got.tolist(), want)
++
++
++class TestFloatExport(TestCase):
++    def export(self):
++        env = _ir.Env()
++        s, k = env.symbol(512, "s", positive=True), env.symbol(5, "k", positive=True)
++        fused = ht.f32_fma(ht.f32_mul(ht.f32(1.08), 128.0), ht.f32(k), ht.f32_mul(ht.f32(1.48), ht.f32(s)))
++        unfused = ht.f32_add(ht.f32_mul(ht.f32_mul(ht.f32(1.08), 128.0), ht.f32(k)), ht.f32_mul(ht.f32(1.48), ht.f32(s)))
++        return env, s, k, fused, unfused
++
++    def test_identity_blocks_simplification(self):
++        # one Identity per float operation: sympy's simplify, expand, factor, cancel and substitution leave the export
++        # as it is (no reassociation or folding across an operation)
++        env, s, k, fused, unfused = self.export()
++        r = sympy.Symbol("r", integer=True, positive=True)
++        for v in (fused, unfused):
++            e = env.export.expr(v.node.node)
++            self.assertTrue(isinstance(e, Identity))
++            for f in (sympy.simplify, sympy.expand, sympy.factor, sympy.cancel, sympy.together, lambda x: x.doit()):
++                self.assertEqual(f(e), e)
++            sym_s, sym_k = env.export.expr(s.node.node), env.export.expr(k.node.node)
++            self.assertEqual(e.subs(sym_s, r).subs(r, sym_s), e)
++            # numbers in: every operation keeps its Identity (no fold across it)
++            at = e.subs({sym_s: 512, sym_k: 5})
++            self.assertEqual(sum(isinstance(x, Identity) for x in sympy.preorder_traversal(at)), sum(isinstance(x, Identity) for x in sympy.preorder_traversal(e)))
++        self.assertNotEqual(env.export.expr(fused.node.node), env.export.expr(unfused.node.node))
++
++    def test_rows_evaluate_in_the_operation_order(self):
++        # the IR's rows are the evaluation: at (512, 5) the fused and unfused orders differ by an ulp
++        env, s, k, fused, unfused = self.export()
++        program = IntegerProgram([512, 5])
++        lowering = IRLowering(program, {s.node.node: ("boxed", 0), k.node.node: ("boxed", 1)}, env.ctx)
++        rf, ru = lowering._float(fused.node.node), lowering._float(unfused.node.node)
++        self.assertEqual(f64(program.values[rf]), 1448.9600830078125)
++        self.assertEqual(f64(program.values[ru]), 1448.9599609375)
++        self.assertEqual([program.instructions[rf][0], program.instructions[ru][0]], ["f32fma", "f32add"])
++
++
++HAS_TRITON = has_triton()
++if HAS_TRITON:
++    import triton
++    import triton.language as tl
++    from torch.cuda._host_trace_replay import HostTraceReplay as _Replay
++
++    @triton.jit
++    def _add(x_ptr, y_ptr, n, s, B: tl.constexpr):
++        i = tl.program_id(0) * B + tl.arange(0, B)
++        m = i < n
++        tl.store(y_ptr + i, tl.load(x_ptr + i, mask=m) + s, mask=m)
++
++    class HostTraceReplay(_Replay):
++        def __init__(self, *args, **kwargs):
++            super().__init__(*args, **kwargs)
++            self._called = True
++
++
++@unittest.skipIf(not TEST_CUDA or not HAS_TRITON, "CUDA and Triton")
++class TestFloatCostModelOp(TestCase):
++    def test_a_float_cost_model_dispatches_again_where_its_choice_changes(self):
++        # a launcher's block choice by a float cost model over n, inside a dispatch_unit: the comparisons are the
++        # unit's guards (argmin's, against the winner), so a new n replays while the choice holds and redispatches
++        # the unit where it changes; no call traces again
++        blocks = (256, 512, 1024, 2048)
++
++        def costs(n):
++            out = []
++            for b in blocks:
++                k = -(-n // b)
++                out.append(ht.f32_fma(ht.f32(0.05), ht.f32(k), ht.f32_mul(ht.f32(-(-k // 132)), ht.f32(1.0 + 0.37 * b / 256.0))))
++            return out
++
++        @ht.dispatch_unit
++        def pick(x):
++            n = x.numel()
++            b = blocks[ht.argmin(costs(n))]
++            y = torch.empty_like(x)
++            _add[(triton.cdiv(n, b),)](x, y, n, 1, B=b)
++            return y
++
++        def f(x):
++            return pick(x).sin()
++
++        r = HostTraceReplay(f)
++        # all 1 mod 16: Triton's own specialization of n (% 16, == 1) is fixed
++        sizes = (1009, 1009, 2001, 3825, 3841, 5009, 1505, 20001, 70001, 14833, 4001, 200001, 90001)
++        for n in sizes:
++            x = torch.randn(n, device="cuda")
++            self.assertEqual(r(x), f(x), atol=0, rtol=0)
++        choice = [ht.argmin(costs(n)) for n in sizes]
++        self.assertGreater(len(set(choice)), 2)
++        # the trace is the first call's; each choice first seen after it is a redispatch (a choice seen before replays)
++        seen, expected = {choice[0]}, 0
++        for c in choice[1:]:
++            expected += c not in seen
++            seen.add(c)
++        self.assertEqual((r.traces, r.eager, r.redispatches, len(r.variants)), (1, 0, expected, 1))
++
++
++if __name__ == "__main__":
++    run_tests()
+--- a/test/test_cuda_host_trace_program.py
++++ b/test/test_cuda_host_trace_program.py
+@@ -4,6 +4,7 @@
+ import math
+ import os
+ import random
++import struct
+ import subprocess
+ import sys
+ 
+@@ -110,6 +111,19 @@
+     ("flt", (f64_bits(0.5), f64_bits(-3.0)), 0),
+     ("flt", (f64_bits(-0.0), f64_bits(0.0)), 0),
+     ("flt", (f64_bits(-2.0), f64_bits(-1.0)), 1),
++    ("f32div", ((1 << 53) + (1 << 29) + 1, 1), f32_bits(1 << 53, 1) + 1),
++    ("fadd", (f64_bits(0.1), f64_bits(0.2)), f64_bits(0.1 + 0.2)),
++    ("fsub", (f64_bits(0.0), f64_bits(0.0)), f64_bits(0.0)),
++    ("fmul", (f64_bits(-1.0), f64_bits(0.0)), f64_bits(-0.0)),
++    ("f32i", ((1 << 24) + 1,), f64_bits(2.0**24)),
++    ("f32i", ((1 << 53) + (1 << 29) + 1,), f64_bits(2.0**53 + 2.0**30)),
++    ("f32r", (f64_bits(0.1),), f64_bits(struct.unpack("<f", struct.pack("<f", 0.1))[0])),
++    ("f32add", (f64_bits(2.0**24), f64_bits(1.0)), f64_bits(2.0**24)),
++    ("f32sub", (f64_bits(1.0), f64_bits(2.0**-30)), f64_bits(1.0)),
++    ("f32mul", (f64_bits(3.4028234663852886e38), f64_bits(2.0)), f64_bits(math.inf)),
++    ("f32quot", (f64_bits(1.0), f64_bits(3.0)), f64_bits(struct.unpack("<f", struct.pack("<f", 1.0 / 3.0))[0])),
++    # 1448.96: the fused multiply-add rounds once, unlike mul then add
++    ("f32fma", (f64_bits(138.24000549316406), f64_bits(5.0), f64_bits(757.760009765625)), f64_bits(1448.9600830078125)),
+     ("min", (3, MIN_I64, 4), MIN_I64),
+     ("max", (3, MAX_I64, 4), MAX_I64),
+ ]
+@@ -120,6 +134,8 @@
+ OPS = ["add", "multiply", "floordiv", "ceildiv", "eq", "ne", "lt", "le", "gt", "ge"]
+ OPS += ["and", "bitand", "bitor", "bitxor", "bitlength", "lshift", "f32div", "min", "max", "select"]
+ OPS += ["tofloat", "fsqrt", "fdiv", "feq", "flt"]
++# the IEEE float rows (a NaN keeps the hardware's payload) against the reference on float operands:
++# test_cuda_host_trace_float.py
+ 
+ 
+ def _reference(instructions, leaves):

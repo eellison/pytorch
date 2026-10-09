@@ -1,0 +1,67 @@
+--- a/torch/cuda/_host_trace_tape.py
++++ b/torch/cuda/_host_trace_tape.py
+@@ -3188,6 +3188,8 @@
+     at_launch = {id(rec): i for i, (_, rec) in enumerate(tape.launches)}
+     at_alloc = {id(a): j for j, a in enumerate(tape.allocs)}
+     launch_start, alloc_start = [0] * (len(tape.launches) + 1), [0] * (len(tape.allocs) + 1)
++    # per launch, the new tape's allocations before it: where an op of no allocation's empty span lies
++    allocs_before = [0] * len(tape.launches)
+     made_by: dict[int, range] = {}  # a converted call's launch index -> its fresh allocations' span
+     roots: dict[int, _Root] = {}  # a converted call's fresh output's root: its allocation's
+     tensors: dict[int, _TracedTensor] = {}
+@@ -3242,6 +3244,7 @@
+                 allocs.append(replace(rec, seq=seq + shift) if shift else rec)
+                 continue
+             launch_start[at_launch[id(rec)]] = len(launches)
++            allocs_before[at_launch[id(rec)]] = len(allocs)
+             if isinstance(rec, OpaqueCall) and id(rec) in calls:
+                 args, kwargs = pytree.tree_map_only(_TracedTensor, tensor, (rec.args, rec.kwargs))
+                 leaves, spec = pytree.tree_flatten((args, kwargs))
+@@ -3305,7 +3308,9 @@
+         call, outputs = pytree.tree_map_only(_TracedTensor, tensor, (op.call, op.outputs))
+         # a converted call's fresh allocations are its op's, not the op's before
+         own = [range(alloc_start[op.allocs.start], alloc_start[op.allocs.stop - 1] + 1)] if op.allocs else []
+-        held = [*own, *(made_by[i] for i in op.launches if i in made_by and made_by[i])] or [range(alloc_start[op.allocs.start], alloc_start[op.allocs.start])]
++        # an op of no allocation keeps its place among the new allocations (respec's _splice reads spans in op order)
++        at = allocs_before[op.launches.start] if op.launches else ops[-1].allocs.stop if ops else 0
++        held = [*own, *(made_by[i] for i in op.launches if i in made_by and made_by[i])] or [range(at, at)]
+         spans = range(launch_start[op.launches.start], launch_start[op.launches.stop]), range(min(r.start for r in held), max(r.stop for r in held))
+         ops.append(replace(op, call=call, outputs=outputs, launches=spans[0], allocs=spans[1], guards=tuple(guards)))
+ 
+--- a/test/test_cuda_host_trace_replay.py
++++ b/test/test_cuda_host_trace_replay.py
+@@ -663,6 +663,34 @@
+         self.assertEqual((f.traces, f.respecs, f.respec_refusals), (1, 1, {}))
+         self.assertEqual(redone, [0, 1, 1])
+ 
++    def test_a_respecified_bound_tape_keeps_its_allocations_in_op_order(self):
++        # bind_opaque (oob_learn's) gave the ops of no allocation (add.out, copy_) an empty span past
++        # every allocation: respec's _splice, which reads the spans in op order, kept each allocation
++        # twice and gave the GEMMs' outputs seqs past their launches, and the eager-order plan put
++        # live buffers on each other (every element wrong)
++        def fn(a, b):
++            torch.add(b, 1, out=b)
++            v0 = a @ a.t()
++            v1 = v0 @ a
++            v2 = v1.t() @ a
++            v4 = v1 @ v2
++            v1.copy_(a)
++            return v4 @ (v2.t() @ b)
++
++        def randn(*size):
++            return torch.randn(size, device="cuda", dtype=torch.float16) * 0.1
++
++        f = HostTraceReplay(fn)
++        for a, b in ((randn(128, 30), randn(30, 64)), (randn(43, 96).t(), randn(43, 27)), (randn(43, 96).t(), randn(43, 27))):
++            self.assertEqual(f(a, b.clone()), fn(a, b.clone()), atol=0, rtol=0)
++        self.assertEqual((f.traces, f.respecs, f.respec_refusals, f.replays, f.eager), (1, 1, {}, 2, 0))
++        for v in f.variants:
++            spans = [op.allocs for op in v.tape.ops]
++            self.assertEqual([r.start for r in spans], [0, *(r.stop for r in spans[:-1])])
++            self.assertEqual(spans[-1].stop, len(v.tape.allocs))
++            firsts = [(op.allocs, v.tape.launches[op.launches.start][0]) for op in v.tape.ops if op.launches]
++            self.assertTrue(all(v.tape.allocs[j].seq < seq for span, seq in firsts for j in span))
++
+     @mock.patch("torch.cuda._host_trace.respec_refused_ops", False)
+     def test_a_redispatch_refusal_names_its_op(self):
+         # the redispatch's redos share one capture: the op that enqueues a

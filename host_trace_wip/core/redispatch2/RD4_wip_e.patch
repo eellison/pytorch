@@ -1,0 +1,456 @@
+--- a/torch/cuda/_host_trace_redispatch.py
++++ b/torch/cuda/_host_trace_redispatch.py
+@@ -52,6 +52,7 @@
+     fx_config,
+     Memcpy,
+     Memset,
++    OpaqueCall,
+ )
+ from torch.cuda._utils import _check_cuda_bindings
+ from torch.utils import _pytree as pytree
+@@ -61,17 +62,19 @@
+     from collections.abc import Callable, Iterator, Sequence
+ 
+     from torch.cuda._host_trace_lower_tape import LoweredLaunch, LoweredMemset, LoweredSelector, LoweredTape
++    from torch.cuda._host_trace_opaque import KeyedSite
+     from torch.cuda._host_trace_tape import OpRec
+ 
+ 
+ def redispatch(
+-    lowered: LoweredTape, args: Sequence[Any], values: Sequence[int], unselected: Sequence[int], dispatches: dict | None = None
++    lowered: LoweredTape, args: Sequence[Any], values: Sequence[int], unselected: Sequence[int], dispatches: dict | None = None, opaque: Sequence[Any] = ()
+ ) -> tuple[torch._C._HostTraceProgram, list[tuple[int, int, tuple[LoweredLaunch | LoweredMemset, ...], Any]]]:
+     """Selectors `unselected` (native site indices) of the variant, whose
+     graph guards hold the call `args` (at rows `values`), as entries from
+     their ops dispatched again: fold's result, with no trace. An op whose redo
+     would read what an earlier redo of this variant read (Template), where
+-    that entry's predicate holds, takes that entry with its own roots."""
++    that entry's predicate holds, takes that entry with its own roots. A
++    redo routes calls to the replay's `opaque` providers, as its trace did."""
+     lo = lowered.lowering
+     program = lo.program
+     rows = len(program.values)
+@@ -89,17 +92,17 @@
+                     lo.reads[selector.op] = _reads(lowered, op, selector)
+                 reads = lo.reads[selector.op]
+                 template = lo.templates.get(reads[0]) if reads is not None else None
+-                if template is not None and program.values[template.predicate] == 1:
++                if template is not None and program.values[template.predicate] == 1 and _bound(lowered, reads[2], program.values):
+                     entry, after = _instantiate(lowered, i, template, reads[1], base, selector, op)
+                     if torch.cuda._host_trace.verify_redo_templates:
+-                        full = lower_entry(lowered, i, *_full_redo(lowered, i, selector, dispatches), base)[0]
++                        full = lower_entry(lowered, i, *_full_redo(lowered, i, selector, dispatches, opaque), base)[0]
+                         _assert_same_entry(entry, full, program.values)
+                     lo.instances += 1
+                     entries.append(entry)
+                     recorded.append((i, template.guards))
+                     base = after
+                     continue
+-                guards, launches, section = _full_redo(lowered, i, selector, dispatches)
++                guards, launches, section = _full_redo(lowered, i, selector, dispatches, opaque)
+                 entry, base = lower_entry(lowered, i, guards, launches, section, base)
+                 lo.redos += 1
+                 entries.append(entry)
+@@ -121,12 +124,12 @@
+     return compiled, entries
+ 
+ 
+-def _full_redo(lowered: LoweredTape, i: int, selector: LoweredSelector, dispatches: dict | None) -> tuple[list[Any], list[tuple[int, Any]], Section | None]:
++def _full_redo(lowered: LoweredTape, i: int, selector: LoweredSelector, dispatches: dict | None, opaque: Sequence[Any] = ()) -> tuple[list[Any], list[tuple[int, Any]], Section | None]:
+     try:
+         try:
+-            return _redo(lowered, selector, hosted=True, dispatches=dispatches)
++            return _redo(lowered, selector, hosted=True, dispatches=dispatches, opaque=opaque)
+         except HintsFail:
+-            return _redo(lowered, selector, ir=False, hosted=True)
++            return _redo(lowered, selector, ir=False, hosted=True, opaque=opaque)
+     except FoldRefused as e:
+         lowered.lowering.refused.add(i)
+         e.op = selector.op
+@@ -154,12 +157,13 @@
+     drops: tuple[int, ...]
+ 
+ 
+-def _reads(lowered: LoweredTape, op: OpRec, selector: LoweredSelector) -> tuple[Any, list[_Root]] | None:
+-    """What a redo of `op` reads, as a key, and its roots in reading order,
+-    with no fresh symbol: the op, its call's structure and constants, each
+-    SymInt / SymBool as the variant's node, each root's kind and layout
+-    formulas (by position), each tensor's layout, then the op's own
+-    allocations and outputs and the launch chain it replaces. Only an
++def _reads(lowered: LoweredTape, op: OpRec, selector: LoweredSelector) -> tuple[Any, list[_Root], tuple[int, ...]] | None:
++    """What a redo of `op` reads, as a key, its roots in reading order and its
++    keyed sites (indices in lowered.sites), with no fresh symbol: the op, its
++    call's structure and constants, each SymInt / SymBool as the variant's
++    node, each root's kind and layout formulas (by position), each tensor's
++    layout, then the op's own allocations and outputs, the launch chain it
++    replaces and its keyed sites' calls (_one_role's reads). Only an
+     operator's traced dispatch: one operator for every op of the key, whose
+     redos run in the same Python and global state (the variant's contract,
+     as its own trace assumed), so its records are a function of these reads.
+@@ -225,6 +229,19 @@
+         for _, rec in old.launches[op.launches.start : op.launches.stop]:
+             fixed = (rec.function, rec.attributes, rec.programmatic) if isinstance(rec, KernelLaunch) else (getattr(rec, "element_size", None),)
+             items.append((type(rec), *fixed))
++        span = {id(rec) for _, rec in old.launches[op.launches.start : op.launches.stop]}
++        sites = tuple(j for j, ls in enumerate(lowered.sites) if ls.site.nodes and id(ls.site.nodes[0]) in span)
++        for j in sites:
++            site = lowered.sites[j].site
++            if site.call is None:
++                raise _Unclassified
++            items.append(("site", site.op, site.provider, site.state, repr(site.call[0]), site.call[1], site.rng, tuple(site.scratch)))
++            for t in site.operands:
++                tensor(t)
++            for v in site.scalars:
++                value(v)
++            for t, _ in site.scratch.values():
++                root(t._root)
+     except _Unclassified:
+         return None
+     key = tuple(items)
+@@ -232,7 +249,18 @@
+         hash(key)
+     except TypeError:
+         return None
+-    return key, roots
++    return key, roots, sites
++
++
++def _bound(lowered: LoweredTape, sites: tuple[int, ...], values: Sequence[int]) -> bool:
++    """Whether each keyed site's key binds at the call: where one does not, a
++    full redo records an opaque call, no site, and refuses."""
++    for j in sites:
++        site = lowered.sites[j]
++        key = site.key([values[r] for r in site.rows])
++        if site.site.provider.refusal(key) is not None or site.site.provider.bind(key) is None:
++            return False
++    return True
+ 
+ 
+ def _template(lowered: LoweredTape, entry: tuple, guards: list[Any], launches: list[tuple[int, Any]], redone: Section | None, roots: list[_Root], op: OpRec) -> Template | None:
+@@ -351,6 +379,7 @@
+     ir: bool = True,
+     hosted: bool = False,
+     dispatches: dict[Any, list[tuple[_Trace, list[torch.SymInt], list[_Root]]]] | None = None,
++    opaque: Sequence[Any] = (),
+ ) -> tuple[list[Any], list[tuple[int, Any]], Section | None]:
+     # ir off renames in sympy
+     # dispatches: the family's dispatches by what they read of their call, each with its fresh symbols and roots
+@@ -507,7 +536,7 @@
+         # redo makes its own)
+         fake = vars(_redo_fakes).pop("mode", None) or FakeTensorMode(allow_fallback_kernels=False)
+         fake.fake_tensor_converter = FakeTensorConverter(export=False)
+-        tr = _Trace(old.device, fake_mode=fake, shape_env=env)
++        tr = _Trace(old.device, opaque=opaque, fake_mode=fake, shape_env=env)
+         tr.values = CallValues(env, {m.node.node.args[0]: x for m, x in zip(made, at_call)})
+         tr.inputs, tr.arguments = inputs, {id(i.root): i for i in inputs}
+         tr.outer = {k: _TracedTensor(*o) for k, o in outer.items()}
+@@ -546,11 +575,17 @@
+     # its records are the entry's predicate
+     _hint_audit.freeze(env, len(env.records))
+     eager = op.kind == "eager"
+-    if len(tr.ops) != 1 or tr.sites or (tr.eager_outputs and not eager) or tr.ops[0].kind != op.kind:
++    # the op's keyed sites (FZ12), in order
++    span = {id(rec): j for j, (_, rec) in enumerate(old.launches[op.launches.start : op.launches.stop])}
++    theirs = sorted((s for s in old.sites if s.nodes and id(s.nodes[0]) in span), key=lambda s: span[id(s.nodes[0])])
++    if theirs and any(type(rec) is OpaqueCall for _, rec in tr.launches):
++        # the call bound the sites' keys first (_fill): a nested call whose key none binds is another call
++        raise FoldRefused(f"another keyed site in {op.func}: a call at a key no site binds")
++    if len(tr.ops) != 1 or (tr.eager_outputs and not eager) or tr.ops[0].kind != op.kind:
+         raise FoldRefused(f"{op.func} dispatches otherwise")
+     # one whose guards read a symbol the dispatch made itself is never taken
+     names = {s.node.node.args[0] for s in made}
+-    if sig is not None and cached is None and not nodes and all(g.free_symbols <= names for g, _ in env.records):
++    if sig is not None and cached is None and not nodes and not tr.sites and all(g.free_symbols <= names for g, _ in env.records):
+         dispatches.setdefault(sig, []).append((tr, made, list(roots.values())))
+     new = tr.ops[0]
+     if eager:
+@@ -566,7 +601,27 @@
+                 else:
+                     ((fq,), (q,)) = _sym_expr(a._root.sym).free_symbols, _sym_expr(b._root.sym).free_symbols
+                     mapping[fq] = q
++    # the op's keyed sites serve the redo's nested calls, one to one in order and in the same role: a site evaluates
++    # its key from the call's rows, so the entry holds the op's other launches and allocations
++    if len(tr.sites) != len(theirs) or not all(map(_one_role, tr.sites, theirs)):
++        raise FoldRefused(f"another keyed site in {op.func}")
++    buffers = [(x._root, y._root) for s, v in zip(tr.sites, theirs) for x, y in zip(s.operands[len(s.call[1]) :], v.operands[len(v.call[1]) :])]
++    buffers += [(s.scratch[j][0]._root, v.scratch[j][0]._root) for s, v in zip(tr.sites, theirs) for j in s.scratch]
++    theirs_buffers = {id(t._root) for v in theirs for t in (*v.operands[len(v.call[1]) :], *(t for t, _ in v.scratch.values()))}
++    keyed = {id(n) for s in (*tr.sites, *theirs) for n in s.nodes}
++    mine = {id(a.root): a for a in tr.allocs}
+     olds = old.allocs[op.allocs.start : op.allocs.stop]
++    allocated = {id(b.root): b for b in olds}
++    for x, y in buffers:
++        if id(x) not in mine or id(y) not in allocated:
++            raise FoldRefused(f"a keyed site's buffer {op.func} does not allocate")
++        bind(mine[id(x)].q, allocated[id(y)].q)
++        back[id(x)] = y
++    # the op's own: its allocations and launches but its sites'
++    ours = [(k, b) for k, b in zip(op.allocs, olds) if id(b.root) not in theirs_buffers]
++    olds = [b for _, b in ours]
++    tr_allocs = [a for a in tr.allocs if id(a.root) not in {id(x) for x, _ in buffers}]
++    redone = [(seq, x) for seq, x in tr.launches if id(x) not in keyed]
+ 
+     def shaped(x: Any, y: Any) -> bool:
+         # what a graph exec fixes at instantiation: a kernel's launch attributes (a cluster), programmatic edge and
+@@ -581,11 +636,11 @@
+         return not isinstance(x, Memset) or x.element_size == y.element_size
+ 
+     section: Section | None = None
+-    chain = [rec for _, rec in old.launches[op.launches.start : op.launches.stop]]
+-    counts = len(new.launches) == len(op.launches) and len(new.allocs) == len(op.allocs)
++    chain = [rec for _, rec in old.launches[op.launches.start : op.launches.stop] if id(rec) not in keyed]
++    counts = len(redone) == len(chain) and len(tr_allocs) == len(olds)
+     # another launch chain (more or fewer launches or allocations, or another topology: a split count's cluster), or a
+     # memcpy, which only a section's own node holds
+-    if not counts or not all(map(shaped, (x for _, x in tr.launches), chain)) or any(isinstance(x, Memcpy) for _, x in tr.launches):
++    if not counts or not all(map(shaped, (x for _, x in redone), chain)) or any(isinstance(x, Memcpy) for _, x in redone):
+         if eager or not ir:
+             raise FoldRefused(f"{op.func} dispatches otherwise")
+         if not getattr(torch._C, "_host_trace_section_entries", False):
+@@ -598,13 +653,13 @@
+         seq = lowered.launches[selector.nodes[0]].seq
+         # an allocation an output is maps to the variant's for that output; the rest are the section's own
+         roles = {id(b.root): b for b in olds}
+-        mine = {id(a.root): a for a in tr.allocs}
++        mine = {id(a.root): a for a in tr_allocs}
+         pairs = {id(x._root): roles[id(y._root)] for x, y in zip(new.outputs, op.outputs) if isinstance(x, _TracedTensor) and isinstance(y, _TracedTensor) and id(x._root) in mine and id(y._root) in roles}
+         if len({id(b) for b in pairs.values()}) != len(pairs):
+             raise FoldRefused(f"{op.func} returns one allocation as two")
+         temps: list[Temporary] = []
+         ctx = old.shape_env.ctx
+-        for a in tr.allocs:
++        for a in tr_allocs:
+             if id(a.root) in pairs:
+                 b = pairs[id(a.root)]
+                 bind(a.q, b.q)
+@@ -617,11 +672,11 @@
+             temps.append(Temporary(temp, a.dtype, tuple(map(renamer, a.sizes)), tuple(map(renamer, a.strides)), seq))
+         # the op's allocations no output of the section is: it does not make them
+         paired = {id(b) for b in pairs.values()}
+-        section = Section(tuple(temps), tuple(k for k, b in zip(op.allocs, olds) if id(b) not in paired))
+-        olds = [pairs[id(a.root)] for a in tr.allocs if id(a.root) in pairs]
+-        allocs = [a for a in tr.allocs if id(a.root) in pairs]
++        section = Section(tuple(temps), tuple(k for k, b in ours if id(b) not in paired))
++        olds = [pairs[id(a.root)] for a in tr_allocs if id(a.root) in pairs]
++        allocs = [a for a in tr_allocs if id(a.root) in pairs]
+     else:
+-        allocs = list(tr.allocs)
++        allocs = tr_allocs
+         for a, b in zip(allocs, olds):
+             bind(a.q, b.q)
+             back[id(a.root)] = b.root
+@@ -677,6 +732,8 @@
+             raise FoldRefused(f"{op.func} allocates otherwise")
+     if len(new.outputs) != len(op.outputs) or not all(map(same, new.outputs, op.outputs)):
+         raise FoldRefused(f"{op.func} returned other metadata")
++    if not all(same(x, y) for s, v in zip(tr.sites, theirs) for x, y in zip((*s.operands, *s.scalars), (*v.operands, *v.scalars))):
++        raise FoldRefused(f"another keyed site in {op.func}")
+     if eager:
+         # a Triton or CuTe DSL launch: its function, then its grid and options
+         # or streams, compared as its arguments are (as fold compares them)
+@@ -694,7 +751,7 @@
+         # a section's launches take the op's place: each reads roots the op's own launches hold (the plan keeps
+         # them live there) or its temporaries
+         held = {id(r) for y in olds for r in y.roots} | {id(t.root) for t in section.temporaries}
+-        for _, x in tr.launches:
++        for _, x in redone:
+             if isinstance(x, KernelLaunch) and (x.rng or x.rng_increment or x.cpu_scalars or (x.descriptors and not descriptors)):
+                 raise FoldRefused(f"an RNG, TMA or CPU scalar launch in {op.func}'s section")
+             if isinstance(x, Memcpy) and x.kind != "D2D":
+@@ -704,7 +761,7 @@
+                 raise FoldRefused(f"a launch in {op.func}'s section of a root its op does not hold")
+             launches.append((seq, _renamed(x, owned, rename)))
+         return guards, launches, section
+-    for n, (_, x), y in zip(selector.nodes, tr.launches, olds, strict=True):
++    for n, (_, x), y in zip(selector.nodes, redone, chain, strict=True):
+         if isinstance(x, KernelLaunch) and (x.rng or x.rng_increment or x.cpu_scalars):
+             raise FoldRefused(f"an RNG or CPU scalar launch in {op.func}")
+         if isinstance(x, KernelLaunch) and x.descriptors and not descriptors:
+@@ -749,6 +806,18 @@
+     drops: tuple[int, ...]
+ 
+ 
++def _one_role(s: KeyedSite, v: KeyedSite) -> bool:
++    """Whether a redo's keyed site s is the variant's site v's call but for its
++    operands' and scalars' formulas (_redo compares those): the op, provider,
++    library state, call structure and scratch buffers. An RNG site, or a
++    symbolic bool or float scalar, is no site's."""
++    symbolic = (torch.SymBool, torch.SymFloat)
++    if s.rng or v.rng or s.call is None or any(isinstance(a, symbolic) for a in (*s.scalars, *v.scalars)):
++        return False
++    same = (s.op, s.state, s.call, len(s.operands), len(s.scalars)) == (v.op, v.state, v.call, len(v.operands), len(v.scalars))
++    return same and s.provider is v.provider and s.scratch.keys() <= v.scratch.keys()
++
++
+ def _renamed(x: Any, roots: tuple[_Root, ...], rename: Callable[[Any], Any]) -> Any:
+     # a kernel launch, memset or memcpy with its values renamed and its roots `roots`
+     if isinstance(x, KernelLaunch):
+--- a/torch/cuda/_host_trace_replay.py
++++ b/torch/cuda/_host_trace_replay.py
+@@ -1294,7 +1294,7 @@
+         start = time.perf_counter()
+         lo = variant.captured.lowered.lowering
+         counts = lo.redos, lo.instances
+-        refused = self._add_entries(variant, self.redispatch_refusals, args, redispatch, variant.captured.lowered, args, values, unselected, dispatches)
++        refused = self._add_entries(variant, self.redispatch_refusals, args, redispatch, variant.captured.lowered, args, values, unselected, dispatches, self.opaque)
+         self.redos += lo.redos - counts[0]
+         self.redo_instances += lo.instances - counts[1]
+         # a refusal keeps the rows it appended, evaluated at the call, which a fold reads
+--- a/torch/cuda/_host_trace_tape.py
++++ b/torch/cuda/_host_trace_tape.py
+@@ -222,6 +222,9 @@
+     # the op's dispatch alone, redo(args, kwargs), in current_trace(): its
+     # host again at other metadata (_host_trace_redispatch)
+     redo: Callable[[tuple, dict], Any] | None = None
++    # an op "other" only for its opaque calls: the guards it read, graph-level until every one of those calls binds as
++    # a keyed site (bind_opaque), then owned as a traced op's (shared_op_guards' owner sets)
++    held: tuple[int, ...] = ()
+ 
+ 
+ @dataclass(frozen=True)
+@@ -807,13 +810,17 @@
+             if isinstance(t, _TracedTensor):
+                 torch._C._cuda_hostTraceRefreshContiguous(t)
+         records = [rec for _, rec in self.launches[first[0] :]]
+-        kind = "other"
+-        if len(self.sites) == first[2]:
+-            if not any(isinstance(rec, EagerCall) for rec in records):
+-                kind = "traced"
+-            elif len(records) == 1 and type(records[0]) is EagerCall and not records[0].host:
+-                kind = "eager"
+-        if kind == "other":
++        kind, held = "other", ()
++        if not any(isinstance(rec, EagerCall) for rec in records):
++            # a keyed site's nodes are launches too: the op's other launches are its selector's
++            kind = "traced"
++        elif len(self.sites) == first[2] and len(records) == 1 and type(records[0]) is EagerCall and not records[0].host:
++            kind = "eager"
++        if kind == "other" and env.owner_sets is not None and all(type(rec) is OpaqueCall for rec in records if isinstance(rec, EagerCall)):
++            # only its opaque calls make it "other": its guards are graph-level (OpRec.held) until each binds as a keyed site
++            env.owners[guards:] = [None if o == k else o for o in env.owners[guards:]]
++            held = tuple(i for i in range(guards, len(env.owners)) if k in env.owner_sets[i])
++        elif kind == "other":
+             _to_graph(env, guards, k)
+         elif kind == "eager" and not host:
+             env.owners[guards:] = [k] * (len(env.owners) - guards)
+@@ -821,7 +828,7 @@
+                 env.owner_sets[guards:] = [{k} for _ in env.owner_sets[guards:]]
+         outputs = tuple(o for o in pytree.tree_leaves(out) if isinstance(o, (torch.Tensor, int, torch.SymInt)))
+         spans = (range(first[0], len(self.launches)), range(first[1], len(self.allocs)))
+-        self.ops.append(OpRec(func, (args, kwargs), *spans, outputs, kind, redo=redo))
++        self.ops.append(OpRec(func, (args, kwargs), *spans, outputs, kind, redo=redo, held=held))
+         return out
+ 
+     def _eager_call(self, func: Any, args: tuple, kwargs: dict) -> Any:
+@@ -3593,8 +3600,9 @@
+         sets = tr.shape_env.owner_sets
+         self.owner_sets = None if sets is None else [frozenset(o) for o in sets]
+         self.ops = tr.ops
++        held = {g for op in self.ops for g in op.held}
+         for op, guards in zip(self.ops, _owned(self.owners, self.owner_sets, len(self.ops))):
+-            op.guards = tuple(guards)
++            op.guards = tuple(g for g in guards if g not in held)
+         _hint_audit.freeze(env, self.guard_count)
+         # (i, j): arguments i < j, disjoint at the trace, where a step not run
+         # eagerly writes one and reads the other. A call where they overlap
+@@ -3799,14 +3807,18 @@
+         owner_sets += [{None} for _ in range(added)]
+         env.owner_sets[marks:] = [{None} for _ in range(added)]
+     launch_start[-1], alloc_start[-1] = len(launches), len(allocs)
++    # an op whose opaque calls all bound is traced, as a trace at their keys records it, and owns its guards
++    traced = {k for k, op in enumerate(tape.ops) if op.held and all(id(rec) in converted for _, rec in tape.launches[op.launches.start : op.launches.stop] if isinstance(rec, EagerCall))}
++    held = {g for k, op in enumerate(tape.ops) if k not in traced for g in op.held}
+     ops = []
+-    for op, guards in zip(tape.ops, _owned(owners, owner_sets, len(tape.ops))):
++    for k, (op, guards) in enumerate(zip(tape.ops, _owned(owners, owner_sets, len(tape.ops)))):
+         call, outputs = pytree.tree_map_only(_TracedTensor, tensor, (op.call, op.outputs))
+         # a converted call's fresh allocations are its op's, not the op's before
+         own = [range(alloc_start[op.allocs.start], alloc_start[op.allocs.stop - 1] + 1)] if op.allocs else []
+         held = [*own, *(made_by[i] for i in op.launches if i in made_by and made_by[i])] or [range(alloc_start[op.allocs.start], alloc_start[op.allocs.start])]
+         spans = range(launch_start[op.launches.start], launch_start[op.launches.stop]), range(min(r.start for r in held), max(r.stop for r in held))
+-        ops.append(replace(op, call=call, outputs=outputs, launches=spans[0], allocs=spans[1], guards=tuple(guards)))
++        kind, mine = ("traced", ()) if k in traced else (op.kind, op.held)
++        ops.append(replace(op, call=call, outputs=outputs, launches=spans[0], allocs=spans[1], guards=tuple(g for g in guards if g not in held), kind=kind, held=mine))
+ 
+     order = {id(a.root): a.seq for a in allocs}
+     for s in tape.sites:
+--- a/test/test_cuda_host_trace_harvest.py
++++ b/test/test_cuda_host_trace_harvest.py
+@@ -1271,6 +1271,16 @@
+ 
+ _nested_lib.impl("mm_then_branch", _mm_then_branch, "CUDA")
+ torch.library.register_fake("ht_nested::mm_then_branch", lambda x, w: x.new_empty(x.shape[0], w.shape[1]), lib=_nested_lib)
++_nested_lib.define("mm_by_branch(Tensor x, Tensor w) -> Tensor")
++
++
++def _mm_by_branch(x, w):
++    # the GEMM's operand is another view on each side of the op's own guard
++    return torch.mm(x, w if x.shape[0] > 16 else w.t()) + 1
++
++
++_nested_lib.impl("mm_by_branch", _mm_by_branch, "CUDA")
++torch.library.register_fake("ht_nested::mm_by_branch", lambda x, w: x.new_empty(x.shape[0], w.shape[1]), lib=_nested_lib)
+ torch.library.register_fake("ht_extern::scale_qk", lambda q, k, w: None, lib=_extern_lib)
+ torch.library.register_fake("ht_extern::rope_qk", lambda q, k, pos, table: None, lib=_extern_lib)
+ 
+@@ -1411,6 +1421,60 @@
+         self.assertEqual(r.eager, 1)
+         self.assertGreater(r.replays, 0)
+ 
++    def test_an_op_holding_a_keyed_site_redispatches(self):
++        # the op's own guard flips: its redo's GEMM is the variant's keyed site in the same role, which serves its key
++        # per call, so the entry holds only the op's other launches: one trace, every flip redispatched
++        def fn(x, w):
++            return (torch.ops.ht_nested.mm_then_branch(x + 1, w) - 1,)
++
++        r = HostTraceReplay(fn, opaque=(HarvestProvider(("blas",)),))
++        w = torch.randn(64, 64, device="cuda")
++        with tf32_off():
++            for m in (8, 40, 8, 40, 100, 4):
++                x = torch.randn(m, 64, device="cuda")
++                self.assertEqual(r(x, w), fn(x, w), atol=0, rtol=0)
++        self.assertEqual(r.traces, 1)
++        self.assertGreater(r.redispatches, 0)
++        self.assertEqual(r.retrace_causes, {})
++        for v in r.variants:
++            memory.check_plan(v.captured.lowered, v.memory)
++
++    def test_layers_holding_keyed_sites_share_a_redo_template(self):
++        # four layers of the op flip together: one full redo, the others its template (verify mode, on in this suite,
++        # redoes each in full and compares)
++        def fn(x, *ws):
++            for w in ws:
++                x = torch.ops.ht_nested.mm_then_branch(x, w) * 0.5
++            return (x,)
++
++        r = HostTraceReplay(fn, opaque=(HarvestProvider(("blas",)),))
++        ws = [torch.randn(64, 64, device="cuda") / 8 for _ in range(4)]
++        with tf32_off():
++            for m in (8, 40, 8, 40):
++                x = torch.randn(m, 64, device="cuda")
++                self.assertEqual(r(x, *ws), fn(x, *ws), atol=0, rtol=0)
++        self.assertEqual(r.traces, 1)
++        self.assertGreaterEqual(r.redo_instances, 3 * r.redos)
++        self.assertGreater(r.redos, 0)
++
++    def test_an_op_whose_keyed_site_changes_role_retraces(self):
++        # the GEMM reads w on one side of the op's guard and w.t() on the other: the redo's nested call is not the
++        # variant's site in the same role, so the flip refuses and traces again, counted
++        def fn(x, w):
++            return (torch.ops.ht_nested.mm_by_branch(x * 2, w) - 1,)
++
++        r = HostTraceReplay(fn, opaque=(HarvestProvider(("blas",)),))
++        w = torch.randn(64, 64, device="cuda")
++        with tf32_off():
++            for m in (8, 40, 8):
++                x = torch.randn(m, 64, device="cuda")
++                self.assertEqual(r(x, w), fn(x, w), atol=0, rtol=0)
++        self.assertEqual(r.traces, 2)
++        self.assertEqual(r.redispatches, 0)
++        ((cause, n),) = r.retrace_causes.items()
++        self.assertEqual((cause[0], cause[1], n), ("dispatch", "ht_nested.mm_by_branch.default", 1))
++        self.assertIn("another keyed site in ht_nested.mm_by_branch.default", cause[4])
++
+     def test_a_refused_key_at_a_redispatched_call_retraces(self):
+         # the extern key refused (past extern_cap) at a call the variant holds through the bmm's
+         # redispatch entry (its trace's m == 1 fails): the twin from the trace's tape would fail
