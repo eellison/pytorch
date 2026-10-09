@@ -5,12 +5,18 @@
 #include <ATen/MemoryOverlap.h>
 #include <ATen/cuda/detail/IndexUtils.cuh>
 #include <ATen/native/cuda/MemoryAccess.cuh>
+#if !defined(USE_ROCM)
+#include <ATen/cuda/host_trace/Ops.h>
+#endif
 #include <ATen/native/Resize.h>
 #include <ATen/native/TypeProperties.h>
 #include <ATen/native/TensorShape.h>
 #include <ATen/Dispatch.h>
 #include <ATen/Dispatch_v2.h>
 #include <c10/core/MemoryFormat.h>
+#include <c10/cuda/CUDAFunctions.h>
+
+#include <cstring>
 
 #ifndef AT_PER_OPERATOR_HEADERS
 #include <ATen/Functions.h>
@@ -328,6 +334,11 @@ void parallel_cat(const Tensor &out, const MaterializedITensorListRef& inputs, i
   scalar_t *data = (scalar_t *)(out.mutable_data_ptr());
   CatArrInputTensorMetadata<scalar_t, unsigned int, batch_size, stride_size> catMetaData;
   TensorSizeStride<unsigned int, CAT_ARRAY_MAX_INPUT_DIMS> outputParam;
+  // entries past the batch and dims past nDims are launched uninitialized
+  if (c10::cuda::isHostTraceHarvesting()) {
+    std::memset(&catMetaData, 0, sizeof(catMetaData));
+    std::memset(&outputParam, 0, sizeof(outputParam));
+  }
   // If all batches are contiguous we can call a specialized implementation
   // which requires the input tensor addresses to be aligned to a
   // 16 Byte boundary.
@@ -668,3 +679,256 @@ TORCH_IMPL_FUNC(cat_out_cuda)
 }
 
 } // namespace at::native
+
+#if !defined(USE_ROCM)
+// Traced hosts (ATen/cuda/host_trace/Ops.h)
+namespace at::cuda::host_trace {
+namespace {
+
+namespace an = at::native;
+
+// parallel_cat's launches for a Contiguous memory format (keep in sync).
+// Metadata entries the kernel does not read (a batch's past its count, the
+// size and stride of dims past nDims) are zero here and eager's stack there.
+template <typename scalar_t, int batch_size, int stride_size>
+void parallel_cat(Recorder& rec, const TensorBase& out, c10::ArrayRef<TensorBase> inputs, int64_t dimension, int nDims) {
+  using Meta = an::CatArrInputTensorMetadata<scalar_t, unsigned int, batch_size, stride_size>;
+  using SizeStride = an::TensorSizeStride<unsigned int, an::CAT_ARRAY_MAX_INPUT_DIMS>;
+  constexpr bool isContig = stride_size == 1;
+  constexpr int alignment = 16;
+  constexpr int64_t elsize = sizeof(scalar_t);
+  c10::SymInt osize[an::CAT_ARRAY_MAX_INPUT_DIMS];
+  c10::SymInt ostride[an::CAT_ARRAY_MAX_INPUT_DIMS];
+  c10::SymInt stride0 = 1;
+  for (int i = nDims - 1; i >= 0; --i) {
+    osize[i] = out.sym_size(i);
+    if (isContig) {
+      ostride[i] = stride0;
+      stride0 *= out.sym_size(i);
+    } else {
+      ostride[i] = out.sym_stride(i);
+    }
+  }
+  const c10::SymInt data = rec.data_ptr(out);
+  bool isAligned = true;
+  bool isInOutAligned = isContig && data % alignment == 0 && (dimension == 0 || ostride[dimension - 1] * elsize % alignment == 0);
+  const int64_t num_sm = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+  c10::SymInt max_elements = 0;
+  c10::SymInt offset = 0;
+  for (size_t i = 0; i < inputs.size(); i += batch_size) {
+    Param<Meta> meta;
+    auto& m = meta.value();
+    int batchCounter = 0;
+    for (; batchCounter < batch_size && i + batchCounter < inputs.size(); ++batchCounter) {
+      const TensorBase& t = inputs[i + batchCounter];
+      const c10::SymInt numel = t.sym_numel();
+      c10::SymInt dimSize = 0;
+      if (numel > 0) {
+        dimSize = t.sym_size(dimension);
+        if (isInOutAligned) {
+          c10::SymInt slice_size = 1;
+          if (dimension == 0) {
+            slice_size = numel;
+          } else if (t.sym_size(dimension - 1) != 1) {
+            slice_size = t.sym_stride(dimension - 1);
+          } else {
+            for (int64_t d = dimension; d < t.dim(); ++d) {
+              slice_size *= t.sym_size(d);
+            }
+          }
+          isInOutAligned &= slice_size * elsize % alignment == 0;
+        }
+      }
+      // null for an empty input, which is aligned
+      const c10::SymInt ptr = rec.data_ptr(t);
+      meta.set(m.input[batchCounter], ptr);
+      meta.set(m.offset[batchCounter], offset);
+      meta.set(m.dimSize[batchCounter], dimSize);
+      meta.set(m.nElements[batchCounter], numel);
+      isAligned &= ptr % 16 == 0;
+      isInOutAligned &= ptr % alignment == 0;
+      if constexpr (stride_size > 1) {
+        for (int j = 0; j < nDims; j++) {
+          meta.set(m.tensorStride[batchCounter].tensorSize[j], t.sym_size(j));
+          meta.set(m.tensorStride[batchCounter].tensorStride[j], t.sym_stride(j));
+        }
+        m.isContiguous[batchCounter] = false;
+      } else {
+        m.isContiguous[batchCounter] = true;
+      }
+      offset += dimSize;
+      max_elements = max_elements.max(numel);
+    }
+    if (max_elements == 0) {
+      continue;
+    }
+    // getCatGridContig, else getCatGrid
+    SymDim3 grid(2 * num_sm, batchCounter);
+    SymDim3 block(32 * 16);
+    auto contig_grid = [&](int64_t bytes) {
+      const int64_t per_thread = bytes / elsize;
+      const c10::SymInt blocks = ((max_elements + per_thread - 1) / per_thread + 127) / 128;
+      grid = SymDim3(blocks.min(num_sm * 32), batchCounter);
+      block = SymDim3(128);
+    };
+    if (isInOutAligned) {
+      contig_grid(alignment);
+    } else if (isContig && isAligned && elsize > 2) {
+      contig_grid(an::ALIGNED_VEC_LOAD_BYTES_16);
+    } else if (isContig && isAligned && elsize == 2) {
+      contig_grid(an::ALIGNED_VEC_LOAD_BYTES_8);
+    }
+    Param<SizeStride> outputParam;
+    for (int d = 0; d < nDims; ++d) {
+      outputParam.set(outputParam.value().tensorSize[d], osize[d]);
+      outputParam.set(outputParam.value().tensorStride[d], ostride[d]);
+    }
+    int nDimsLocal = nDims;
+    Param<SizeStride> kernelOutputParam;
+    c10::SymInt trailingSize = 0;
+    if (isInOutAligned) {
+      constexpr int64_t elems_per_vec = alignment / elsize;
+      nDimsLocal = dimension + 1;
+      for (int d = 0; d < nDims; ++d) {
+        c10::SymInt size = osize[d];
+        c10::SymInt stride = ostride[d];
+        if (d == dimension) {
+          size = (dimension == 0 ? out.sym_numel() : ostride[dimension - 1]) / elems_per_vec;
+          stride = 1;
+        } else if (d < dimension) {
+          stride = stride / elems_per_vec;
+        }
+        kernelOutputParam.set(kernelOutputParam.value().tensorSize[d], size);
+        kernelOutputParam.set(kernelOutputParam.value().tensorStride[d], stride);
+      }
+      trailingSize = ostride[dimension];
+    }
+    const Param<int> cat_dim(static_cast<int>(dimension));
+    const auto dim_stride = scalar_param<unsigned int>(ostride[dimension]);
+    const auto typed_data = scalar_param<scalar_t*>(data);
+    auto go = [&](auto dims) {
+      constexpr int DIMS = decltype(dims)::value;
+      if (isInOutAligned) {
+        constexpr int elems_per_vec = alignment / sizeof(scalar_t);
+        launch(rec, &an::CatArrayBatchedCopy_vectorized<scalar_t, unsigned int, DIMS, batch_size, stride_size, alignment, elems_per_vec>, grid, block, 0,
+               scalar_param<char*>(data), meta, kernelOutputParam, cat_dim, scalar_param<unsigned int>(trailingSize));
+      } else if (isContig && isAligned && elsize > 2 && elsize <= 8) {
+        launch(rec, &an::CatArrayBatchedCopy_alignedK_contig<scalar_t, unsigned int, DIMS, batch_size, stride_size, an::ALIGNED_VEC_LOAD_BYTES_16>, grid, block, 0,
+               typed_data, meta, outputParam, cat_dim, dim_stride);
+      } else if (isContig && isAligned && elsize == 2) {
+        launch(rec, &an::CatArrayBatchedCopy_alignedK_contig<scalar_t, unsigned int, DIMS, batch_size, stride_size, an::ALIGNED_VEC_LOAD_BYTES_8>, grid, block, 0,
+               typed_data, meta, outputParam, cat_dim, dim_stride);
+      } else if (isContig) {
+        launch(rec, &an::CatArrayBatchedCopy_contig<scalar_t, unsigned int, DIMS, batch_size, stride_size>, grid, block, 0, typed_data, meta, outputParam, cat_dim, dim_stride);
+      } else {
+        launch(rec, &an::CatArrayBatchedCopy<scalar_t, unsigned int, DIMS, batch_size, stride_size>, grid, block, 0, typed_data, meta, outputParam, cat_dim, dim_stride);
+      }
+    };
+    switch (nDimsLocal) {
+      case 1:
+        go(std::integral_constant<int, 1>());
+        break;
+      case 2:
+        go(std::integral_constant<int, 2>());
+        break;
+      case 3:
+        go(std::integral_constant<int, 3>());
+        break;
+      case 4:
+        go(std::integral_constant<int, 4>());
+        break;
+    }
+  }
+}
+
+template <typename scalar_t>
+void cat_launches(Recorder& rec, const TensorBase& out, c10::ArrayRef<TensorBase> inputs, int64_t dim, bool all_contiguous) {
+  using dtype = an::OpaqueType<sizeof(scalar_t)>;
+  const int nDims = static_cast<int>(inputs[0].dim());
+  if (all_contiguous) {
+    parallel_cat<dtype, an::CAT_ARRAY_BATCH_SIZE, 1>(rec, out, inputs, dim, nDims);
+  } else if (nDims <= an::CAT_ARRAY_MAX_INPUT_DIMS) {
+    parallel_cat<dtype, an::CAT_ARRAY_BATCH_SIZE / 2, an::CAT_ARRAY_BATCH_SIZE / 2>(rec, out, inputs, dim, nDims);
+  } else {
+    decline("a cat by narrow and copy_");
+  }
+}
+
+} // namespace
+
+// cat_out_cuda where it launches CatArrayBatchedCopy*: more than one input,
+// of one dtype and at most 4 dims, a Contiguous output format, and 32-bit
+// indexing; no input a legacy skipped [0]
+TensorBase cat(Recorder& rec, c10::ArrayRef<TensorBase> tensors, int64_t dim) {
+  if (tensors.size() <= 1) {
+    decline("a cat of one tensor");
+  }
+  const TensorBase& first = tensors[0];
+  for (const TensorBase& t : tensors) {
+    TORCH_CHECK(t.dim() > 0, "zero-dimensional tensor cannot be concatenated");
+    if (t.scalar_type() != first.scalar_type()) {
+      decline("a cat of tensors of different dtypes");
+    }
+    if (t.dim() == 1 && t.sym_numel() == 0) {
+      decline("a cat with a legacy empty input");
+    }
+    TORCH_CHECK(t.dim() == first.dim(), "Tensors must have same number of dimensions");
+  }
+  // cat_compute_output_memory_format
+  std::optional<MemoryFormat> format;
+  for (const TensorBase& t : tensors) {
+    const MemoryFormat f = t.suggest_memory_format();
+    if (f == MemoryFormat::Contiguous || (format && *format != f)) {
+      format = MemoryFormat::Contiguous;
+      break;
+    }
+    format = f;
+  }
+  if (*format != MemoryFormat::Contiguous) {
+    decline(c10::str("a cat in memory format ", *format));
+  }
+  dim = at::maybe_wrap_dim(dim, first.dim());
+  bool all_contiguous = true;
+  c10::SymInt size_at_dim = 0;
+  for (const TensorBase& t : tensors) {
+    for (const auto d : c10::irange(first.dim())) {
+      TORCH_CHECK(d == dim || t.sym_size(d) == first.sym_size(d), "Sizes of tensors must match except in dimension ", dim);
+    }
+    size_at_dim += t.sym_size(dim);
+    all_contiguous = all_contiguous && t.is_contiguous();
+  }
+  c10::SymDimVector sizes(first.sym_sizes().begin(), first.sym_sizes().end());
+  sizes[dim] = size_at_dim;
+  const TensorBase out = at::empty_symint(sizes, first.options());
+  if (out.sym_numel() == 0) {
+    return out;
+  }
+  if (out.dim() > an::CAT_ARRAY_MAX_INPUT_DIMS || !at::cuda::detail::canUse32BitIndexMath(out) ||
+      !std::all_of(tensors.begin(), tensors.end(), [](const TensorBase& t) { return at::cuda::detail::canUse32BitIndexMath(t); })) {
+    decline("a cat by narrow and copy_");
+  }
+  if (!all_contiguous && out.scalar_type() == kFloat8_e8m0fnu) {
+    decline("a strided cat of float8_e8m0fnu");
+  }
+  if (isBitsType(out.scalar_type())) {
+    AT_DISPATCH_BIT_TYPES(out.scalar_type(), "cat_cuda", [&]() { cat_launches<scalar_t>(rec, out, tensors, dim, all_contiguous); });
+  } else {
+    AT_DISPATCH_V2(
+        out.scalar_type(),
+        "cat_cuda",
+        AT_WRAP([&]() { cat_launches<scalar_t>(rec, out, tensors, dim, all_contiguous); }),
+        AT_EXPAND(AT_ALL_TYPES_AND_COMPLEX),
+        kComplexHalf,
+        kBComplex32,
+        kHalf,
+        kBool,
+        kBFloat16,
+        AT_EXPAND(AT_FLOAT8_TYPES),
+        AT_EXPAND(AT_BAREBONES_UNSIGNED_TYPES),
+        kFloat4_e2m1fn_x2);
+  }
+  return out;
+}
+
+} // namespace at::cuda::host_trace
+#endif

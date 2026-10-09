@@ -184,6 +184,67 @@ struct KernelLauncher {
   }
 };
 
+template <CDimName cdim_name, typename index_t>
+struct ValidateIdxBoundsFunctor {
+  index_t zero;
+  int64_t dim;
+  FUNCAPI index_t operator()(index_t idx) const {
+    _check_idx_bounds<cdim_name, index_t>(idx, zero, dim);
+    return 0;
+  }
+  static constexpr bool host_trace_sizes = true;
+};
+
+template <CDimName cdim_name, typename index_t, typename geometry_t>
+struct ValidateCompressedIndicesFunctor {
+  index_t zero;
+  int64_t dim;
+  int64_t nnz;
+  int64_t idx_ndims;
+  geometry_t idx_sizes;
+  geometry_t idx_strides;
+  const index_t* RESTRICT ptr_idx;
+  FUNCAPI index_t operator()(
+      index_t cidx_first,
+      index_t cidx_last,
+      index_t cidx_curr,
+      index_t cidx_next,
+      index_t batch_idx) const {
+    // Invariant 5.1
+    _check_first_cidx_is_zero<cdim_name, index_t>(cidx_first, zero);
+    // Invariant 5.2
+    _check_last_cidx_is_nnz<cdim_name, index_t>(cidx_last, nnz);
+    // Invariant 5.3
+    _check_cidx_nondecreasing_locally_bounded_sequence<
+        cdim_name,
+        index_t>(cidx_curr, cidx_next, zero, dim);
+    // Invariant 5.6
+    // NOTE: the implementation below is sync-less, but,
+    // unfortunately, work is not guaranteed to be well-balanced
+    // between different threads.
+    // Note: 5.6 should not be tested when
+    // nnz==0. Fortunately, the code below is no-op when
+    // nnz==0.
+    int64_t idx_offset = 0;
+    // assuming idx contiguity per batch:
+    int64_t tmp = batch_idx * nnz;
+    // `nnz == idx_sizes[idx_ndims - 1]` is checked above as `nnz == idx.size(-1)`
+    for (int i = idx_ndims - 1;
+         i >= 0 && nnz > 0;  // break early when nnz==0
+         i--) {
+      int64_t div = tmp / idx_sizes[i];
+      idx_offset += (tmp - div * idx_sizes[i]) * idx_strides[i];
+      tmp = div;
+    }
+    const auto* RESTRICT ptr_idx_batch = ptr_idx + idx_offset;
+    _check_idx_sorted_distinct_vals_slices_with_cidx<
+        cdim_name,
+        index_t>(ptr_idx_batch, cidx_curr, cidx_next);
+    return 0;
+  }
+  static constexpr bool host_trace_sizes = true;
+};
+
 template <
     CDimName cdim_name,
     template <typename func_t>
@@ -272,10 +333,7 @@ void _validate_compressed_sparse_indices_kernel(
 
     AT_DISPATCH_INDEX_TYPES(idx.scalar_type(), NAME, [&iter, dim]() {
       const auto zero = index_t{0};
-      KernelLauncher::launch(iter, [zero, dim] FUNCAPI(index_t idx) -> index_t {
-        _check_idx_bounds<cdim_name, index_t>(idx, zero, dim);
-        return 0;
-      });
+      KernelLauncher::launch(iter, ValidateIdxBoundsFunctor<cdim_name, index_t>{zero, dim});
     });
   }
 
@@ -314,46 +372,10 @@ void _validate_compressed_sparse_indices_kernel(
         [&iter, &idx, dim, nnz, idx_ndims, &idx_sizes, &idx_strides]() {
           const auto* RESTRICT ptr_idx = idx.const_data_ptr<index_t>();
           const auto zero = index_t{0};
+          using geometry_t = std::decay_t<decltype(idx_sizes)>;
           KernelLauncher::launch(
               iter,
-              [zero, dim, nnz, idx_ndims, idx_sizes, idx_strides, ptr_idx] FUNCAPI(
-                  index_t cidx_first,
-                  index_t cidx_last,
-                  index_t cidx_curr,
-                  index_t cidx_next,
-                  index_t batch_idx) -> index_t {
-                // Invariant 5.1
-                _check_first_cidx_is_zero<cdim_name, index_t>(cidx_first, zero);
-                // Invariant 5.2
-                _check_last_cidx_is_nnz<cdim_name, index_t>(cidx_last, nnz);
-                // Invariant 5.3
-                _check_cidx_nondecreasing_locally_bounded_sequence<
-                    cdim_name,
-                    index_t>(cidx_curr, cidx_next, zero, dim);
-                // Invariant 5.6
-                // NOTE: the implementation below is sync-less, but,
-                // unfortunately, work is not guaranteed to be well-balanced
-                // between different threads.
-                // Note: 5.6 should not be tested when
-                // nnz==0. Fortunately, the code below is no-op when
-                // nnz==0.
-                int64_t idx_offset = 0;
-                // assuming idx contiguity per batch:
-                int64_t tmp = batch_idx * nnz;
-                // `nnz == idx_sizes[idx_ndims - 1]` is checked above as `nnz == idx.size(-1)`
-                for (int i = idx_ndims - 1;
-                     i >= 0 && nnz > 0;  // break early when nnz==0
-                     i--) {
-                  int64_t div = tmp / idx_sizes[i];
-                  idx_offset += (tmp - div * idx_sizes[i]) * idx_strides[i];
-                  tmp = div;
-                }
-                const auto* RESTRICT ptr_idx_batch = ptr_idx + idx_offset;
-                _check_idx_sorted_distinct_vals_slices_with_cidx<
-                    cdim_name,
-                    index_t>(ptr_idx_batch, cidx_curr, cidx_next);
-                return 0;
-              });
+              ValidateCompressedIndicesFunctor<cdim_name, index_t, geometry_t>{zero, dim, nnz, idx_ndims, idx_sizes, idx_strides, ptr_idx});
         });
   }
 }

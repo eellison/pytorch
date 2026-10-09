@@ -33,6 +33,26 @@ struct KernelLauncher {
   }
 };
 
+template <typename index_t, typename hash_coeffs_t>
+struct FlattenIndicesFunctor {
+  const index_t* RESTRICT ptr_indices;
+  int64_t indices_nnz_stride;
+  int64_t sparse_dim;
+  hash_coeffs_t hash_coeffs;
+  int64_t indices_dim_stride;
+  FUNCAPI int64_t operator()(int64_t nnz_idx) const {
+    const auto* RESTRICT ptr_indices_dim = ptr_indices + nnz_idx * indices_nnz_stride;
+    auto hash = static_cast<int64_t>(0);
+    for (int64_t dim = 0; dim < sparse_dim; ++dim) {
+      const auto dim_hash_coeff = hash_coeffs[dim];
+      const auto dim_index = ptr_indices_dim[dim * indices_dim_stride];
+      hash += dim_index * dim_hash_coeff;
+    }
+    return hash;
+  }
+  static constexpr bool host_trace_sizes = true;
+};
+
 template <
   template <typename func_t> class kernel_t,
   typename index_t,
@@ -64,17 +84,7 @@ Tensor _flatten_indices_impl(const Tensor& indices, IntArrayRef size) {
       const auto* RESTRICT ptr_indices = indices.const_data_ptr<index_t>();
 
       KernelLauncher<kernel_t>::launch(iter,
-          // NOTE: capture by value required by CUDA
-          [=] FUNCAPI (int64_t nnz_idx) -> int64_t {
-          const auto* RESTRICT ptr_indices_dim = ptr_indices + nnz_idx * indices_nnz_stride;
-          auto hash = static_cast<int64_t>(0);
-          for (int64_t dim = 0; dim < sparse_dim; ++dim) {
-            const auto dim_hash_coeff = hash_coeffs[dim];
-            const auto dim_index = ptr_indices_dim[dim * indices_dim_stride];
-            hash += dim_index * dim_hash_coeff;
-          }
-          return hash;
-      });
+          FlattenIndicesFunctor<index_t, std::decay_t<decltype(hash_coeffs)>>{ptr_indices, indices_nnz_stride, sparse_dim, hash_coeffs, indices_dim_stride});
     }
 
     return hash;

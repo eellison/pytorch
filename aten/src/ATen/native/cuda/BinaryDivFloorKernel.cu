@@ -17,6 +17,33 @@
 namespace at::native {
 namespace binary_internal {
 
+template <typename scalar_t, typename accscalar_t>
+struct DivFloorFunctor {
+  accscalar_t b;
+  accscalar_t inv_b;
+  __device__ scalar_t operator()(scalar_t a) const {
+    auto mod = std::fmod(a, b);
+    auto div = (a - mod) * inv_b;
+    if ((mod != 0) && (b < 0) != (mod < 0)) {
+      div -= scalar_t(1);
+    }
+
+    scalar_t floordiv;
+    if (div != 0) {
+      floordiv = std::floor(div);
+      if (div - floordiv > scalar_t(0.5)) {
+        floordiv += scalar_t(1.0);
+      }
+    } else {
+      floordiv = c10::cuda::compat::copysign(scalar_t(0), a * inv_b);
+    }
+    return floordiv;
+  }
+  auto host_trace_fields() const {
+    return std::tie(b, inv_b);
+  }
+};
+
 void div_floor_kernel_cuda(TensorIteratorBase& iter) {
   // See NOTE: [Floor Division in Python]
   const auto dtype = iter.common_dtype();
@@ -46,24 +73,7 @@ void div_floor_kernel_cuda(TensorIteratorBase& iter) {
 
           auto inv_b = accscalar_t(1.0) / b;
           iter.remove_operand(2);
-          gpu_kernel(iter, [b, inv_b] GPU_LAMBDA(scalar_t a) -> scalar_t {
-            auto mod = std::fmod(a, b);
-            auto div = (a - mod) * inv_b;
-            if ((mod != 0) && (b < 0) != (mod < 0)) {
-              div -= scalar_t(1);
-            }
-
-            scalar_t floordiv;
-            if (div != 0) {
-              floordiv = std::floor(div);
-              if (div - floordiv > scalar_t(0.5)) {
-                floordiv += scalar_t(1.0);
-              }
-            } else {
-              floordiv = c10::cuda::compat::copysign(scalar_t(0), a * inv_b);
-            }
-            return floordiv;
-          });
+          gpu_kernel(iter, DivFloorFunctor<scalar_t, accscalar_t>{b, inv_b});
         });
   } else {
     AT_DISPATCH_FLOATING_TYPES_AND2(

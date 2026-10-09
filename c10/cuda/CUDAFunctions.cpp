@@ -1,8 +1,10 @@
 #include <c10/cuda/CUDAFunctions.h>
+#include <c10/cuda/CUDAHostTraceOwners.h>
 #include <c10/macros/Macros.h>
 #include <c10/util/WaitCounter.h>
 
 #include <limits>
+#include <utility>
 
 namespace c10::cuda {
 
@@ -179,6 +181,33 @@ std::optional<DeviceIndex> getDeviceIndexWithPrimaryContext() {
     }
   }
   return std::nullopt;
+}
+
+namespace {
+thread_local bool host_trace_harvesting = false;
+thread_local HostTraceOwners* host_trace_owners = nullptr;
+} // namespace
+
+std::atomic<int> detail::host_trace_harvesting_threads{0};
+
+bool detail::isHostTraceHarvestingThread() {
+  return host_trace_harvesting;
+}
+
+void setHostTraceHarvesting(bool enabled) {
+  if (enabled != host_trace_harvesting) {
+    detail::host_trace_harvesting_threads.fetch_add(
+        enabled ? 1 : -1, std::memory_order_relaxed);
+    host_trace_harvesting = enabled;
+  }
+}
+
+HostTraceOwners* hostTraceOwnerSink() {
+  return host_trace_owners;
+}
+
+HostTraceOwners* setHostTraceOwnerSink(HostTraceOwners* sink) {
+  return std::exchange(host_trace_owners, sink);
 }
 
 namespace _internal {

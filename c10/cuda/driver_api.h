@@ -165,7 +165,39 @@
 #define C10_LIBCUDA_DRIVER_API_12_9(_)
 #endif
 
+// Host tracing declines a TMA descriptor kernel without them
+#define C10_LIBCUDA_DRIVER_API_TMA(_) \
+  _(cuTensorMapEncodeTiled, 12000)    \
+  _(cuTensorMapReplaceAddress, 12000)
+
+// Host tracing's native replay declines without it
+#define C10_LIBCUDA_DRIVER_API_REPLAY(_) \
+  _(cuGraphExecKernelNodeSetParams, 12000)
+
+// Host tracing's harvest reads its captures' nodes and launches them
+#if defined(CUDA_VERSION) && (CUDA_VERSION >= 12040)
+#define C10_LIBCUDA_DRIVER_API_HARVEST(_) \
+  _(cuGraphGetNodes, 12000)               \
+  _(cuGraphGetEdges, 12030)               \
+  _(cuGraphNodeGetType, 12000)            \
+  _(cuGraphKernelNodeGetParams, 12000)    \
+  _(cuGraphKernelNodeGetAttribute, 12000) \
+  _(cuGraphMemsetNodeGetParams, 12000)    \
+  _(cuFuncGetName, 12030)                 \
+  _(cuFuncGetParamInfo, 12040)            \
+  _(cuLaunchKernelEx, 12000)              \
+  _(cuMemsetD2D8Async, 12000)             \
+  _(cuMemsetD2D16Async, 12000)            \
+  _(cuMemsetD2D32Async, 12000)            \
+  _(cuPointerGetAttribute, 12000)
+#else
+#define C10_LIBCUDA_DRIVER_API_HARVEST(_)
+#endif
+
 #define C10_LIBCUDA_DRIVER_API_OPTIONAL(_) \
+  C10_LIBCUDA_DRIVER_API_TMA(_)            \
+  C10_LIBCUDA_DRIVER_API_REPLAY(_)         \
+  C10_LIBCUDA_DRIVER_API_HARVEST(_)        \
   C10_LIBCUDA_DRIVER_API_12_3(_)           \
   C10_LIBCUDA_DRIVER_API_12_8(_)           \
   C10_LIBCUDA_DRIVER_API_12_9(_)

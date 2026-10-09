@@ -88,6 +88,8 @@ namespace {
 // synchronization.
 std::atomic<size_t> g_expandable_segments_reserved_bytes{0};
 std::atomic<size_t> g_expandable_segments_count{0};
+// getSegmentReleaseCount(), bumped with DeviceStats::num_device_free
+std::atomic<size_t> g_segment_releases{0};
 } // namespace
 
 #if defined(PYTORCH_C10_DRIVER_API_SUPPORTED) || defined(USE_ROCM)
@@ -1342,6 +1344,9 @@ struct PrivatePool {
   // cudaMalloc_count drop to zero, we can delete this PrivatePool from
   // graph_pools.
   int cudaMalloc_count{0};
+  // each allocation into the pool, (address, requested bytes), while log_on
+  bool log_on{false};
+  std::vector<std::pair<void*, size_t>> log;
   // Instead of maintaining private BlockPools here, I could stuff all blocks
   // (private or no) into the top-level large_blocks and small_blocks, and
   // distinguish private blocks by adding a "pool id" check above the stream
@@ -1617,6 +1622,10 @@ class DeviceCachingAllocator {
   std::string internal_metadata_tag;
 
  public:
+  std::unique_lock<std::recursive_mutex> lock() const {
+    return std::unique_lock<std::recursive_mutex>(mutex);
+  }
+
   explicit DeviceCachingAllocator(c10::DeviceIndex id)
       : device_id(id),
         large_blocks(/*small=*/false),
@@ -1813,8 +1822,8 @@ class DeviceCachingAllocator {
     size_t size = round_size(orig_size);
     auto& pool = get_pool(size, stream);
     const size_t alloc_size = get_allocation_size(size);
-    bool active_user_pool =
-        pool.owner_PrivatePool && pool.owner_PrivatePool->allocator();
+    PrivatePool* const owner = pool.owner_PrivatePool;
+    bool active_user_pool = owner && owner->allocator();
     // The expandable segments are only active on the default pool.
     bool is_expandable_segments_active =
         CUDAAllocatorConfig::expandable_segments() && !active_user_pool;
@@ -2082,8 +2091,12 @@ class DeviceCachingAllocator {
 
     bool split_remainder = should_split(
         params.block, params.size(), params.is_expandable_segments_active);
-    return alloc_found_block(
+    Block* block = alloc_found_block(
         params, orig_size, std::move(context), split_remainder);
+    if (C10_UNLIKELY(owner) && owner->log_on) {
+      owner->log.emplace_back(block->ptr, orig_size);
+    }
+    return block;
   }
 
   Block* mallocWithAddress(size_t orig_size, cudaStream_t stream, void* addr) {
@@ -2113,8 +2126,8 @@ class DeviceCachingAllocator {
       return nullptr;
     }
 
-    const bool active_user_pool =
-        pool.owner_PrivatePool && pool.owner_PrivatePool->allocator();
+    PrivatePool* const owner = pool.owner_PrivatePool;
+    const bool active_user_pool = owner && owner->allocator();
     const bool is_expandable_segments_active =
         CUDAAllocatorConfig::expandable_segments() && !active_user_pool;
     const auto stat_types = get_stat_types_for_pool(pool);
@@ -2167,6 +2180,9 @@ class DeviceCachingAllocator {
         requested_params, orig_size, std::move(context), split_remainder);
     if (prefix_block) {
       free_locked(prefix_block, nullptr);
+    }
+    if (C10_UNLIKELY(owner) && owner->log_on) {
+      owner->log.emplace_back(requested_block->ptr, orig_size);
     }
     return requested_block;
   }
@@ -3215,6 +3231,16 @@ class DeviceCachingAllocator {
     no_split_pools.insert(mempool_id);
   }
 
+  std::vector<std::pair<void*, size_t>> takePoolLog(
+      MempoolId_t mempool_id,
+      bool log_on) {
+    std::lock_guard<std::recursive_mutex> lock(mutex);
+    auto it = graph_pools.find(mempool_id);
+    TORCH_CHECK(it != graph_pools.end(), "takePoolLog: no such pool");
+    it->second->log_on = log_on;
+    return std::exchange(it->second->log, {});
+  }
+
   // See Note [Interaction with CUDA graph capture]
 
   // Routes allocations matching `filter` into the private mempool
@@ -4253,6 +4279,7 @@ class DeviceCachingAllocator {
       const std::shared_ptr<GatheredContext>& context) {
     TORCH_INTERNAL_ASSERT(!block->expandable_segment_);
     stats.num_device_free++;
+    g_segment_releases.fetch_add(1, std::memory_order_relaxed);
     record_trace(
         TraceEntry::SEGMENT_FREE,
         int64_t(block->ptr),
@@ -4369,6 +4396,7 @@ class DeviceCachingAllocator {
     }
 
     stats.num_device_free++;
+    g_segment_releases.fetch_add(1, std::memory_order_relaxed);
     record_trace(
         TraceEntry::SEGMENT_UNMAP,
         int64_t(unmapped.ptr),
@@ -5200,6 +5228,14 @@ class NativeCachingAllocator : public CUDAAllocator {
     device_allocator[device]->setNoSplit(std::move(mempool_id));
   }
 
+  std::vector<std::pair<void*, size_t>> takePoolLog(
+      c10::DeviceIndex device,
+      MempoolId_t mempool_id,
+      bool log_on) override {
+    assertValidDevice(device);
+    return device_allocator[device]->takePoolLog(std::move(mempool_id), log_on);
+  }
+
   // CUDAGraph interactions
   void beginAllocateToPool(
       c10::DeviceIndex device,
@@ -5574,6 +5610,15 @@ size_t getExpandableSegmentsReservedBytes() {
 
 size_t getExpandableSegmentsCount() {
   return g_expandable_segments_count.load(std::memory_order_relaxed);
+}
+
+size_t getSegmentReleaseCount() {
+  return g_segment_releases.load(std::memory_order_relaxed);
+}
+
+std::unique_lock<std::recursive_mutex> lockDeviceAllocator(
+    c10::DeviceIndex device) {
+  return Native::allocator.device_allocator[device]->lock();
 }
 } // namespace cuda::CUDACachingAllocator
 } // namespace c10

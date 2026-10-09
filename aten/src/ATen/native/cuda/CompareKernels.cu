@@ -28,6 +28,9 @@ struct CompareFunctor{
       return a < b;
     }
   }
+  auto host_trace_fields() const {
+    return std::tie(op_);
+  }
 };
 
 // Reflects the comparison operator, so reflect(op)(a, b) == op(b, a)
@@ -44,11 +47,24 @@ OpType reflect(OpType x) {
 }  // namespace (anonymous)
 
 template <typename scalar_t>
+struct CompareScalarFunctor {
+  CompareFunctor<scalar_t> f;
+  scalar_t rhs;
+  __device__ bool operator()(scalar_t lhs) const {
+    return f(lhs, rhs);
+  }
+  auto host_trace_fields() const {
+    return std::tie(f, rhs);
+  }
+  auto host_trace_scalars() const {
+    return std::tie(rhs);
+  }
+};
+
+template <typename scalar_t>
 void compare_scalar_kernel(TensorIteratorBase &iter, OpType op, scalar_t rhs) {
   CompareFunctor<scalar_t> f(op);
-  gpu_kernel(iter, [=] GPU_LAMBDA (scalar_t lhs) -> bool {
-    return f(lhs, rhs);
-  });
+  gpu_kernel(iter, CompareScalarFunctor<scalar_t>{f, rhs});
 }
 
 template <typename scalar_t>

@@ -2079,6 +2079,57 @@ class triton:
     # Use cudagraph trees for memory pooling if `cudagraphs` is True
     cudagraph_trees = True
 
+    # Private: if `cudagraphs` is True, wrap compiled graphs with
+    # host tracing (torch.cuda._host_trace_replay) instead of cudagraph trees
+    cudagraph_host_trace = False
+
+    # with cudagraph_host_trace: the op families harvested
+    # (torch.cuda._host_trace_harvest) so they replay inside the graph:
+    # "blas", cuBLAS mm, addmm and bmm; "attention", the cuDNN, flash and
+    # memory-efficient SDPA forwards and backwards; "conv", convolutions and
+    # their backwards; "rng", the default generator's randint, Inductor's
+    # seeds, native_dropout and uniform_, their philox offsets taken per replay;
+    # "reduce", ATen's sum over dims (a mix-order reduction's final sum)
+    cudagraph_host_trace_harvest: tuple[str, ...] = ("blas", "attention", "conv", "rng", "reduce")
+
+    # with cudagraph_host_trace: how a replay allocates
+    # (torch/cuda/_host_trace_memory.py). "eager": eager's requests and frees
+    # in eager's order, eager's memory; "run_buffer": a run's temporaries in
+    # one buffer, fewer allocator calls and more memory; "auto": run_buffer
+    # per variant when its peak and each buffer are within max(64 MiB, 5%)
+    # of eager's peak
+    cudagraph_host_trace_replay_memory: Literal["auto", "eager", "run_buffer"] = "auto"
+
+    # with cudagraph_host_trace: where "auto" and "eager" split a run into
+    # graphs (torch/cuda/_host_trace_memory.py split_runs). "walk": wherever
+    # that lowers the replay's peak or, when the sizes vary, a later one;
+    # "coarse": as "walk", then undo the replay's peak's splits that lower it
+    # by under 1/200, a graph launch fewer each; "peak": only at the
+    # replay's peak
+    cudagraph_host_trace_replay_splits: Literal["walk", "coarse", "peak"] = "peak"
+
+    # with cudagraph_host_trace: a backward frees its saved tensors after
+    # their last use, as its boxed caller hands their references over; if
+    # False it holds every static input (static_input_idxs) to its end
+    cudagraph_host_trace_backward_frees_saved = True
+
+    # with cudagraph_host_trace: a call that traces or adds to a variant's
+    # tables hands its arguments back to be called again through call_boxed,
+    # which drops each after its last use; if False it runs them in place,
+    # holding them to the end
+    cudagraph_host_trace_handback = True
+
+    # with cudagraph_host_trace: as torch.compile's fullgraph, a graph that
+    # would run uncaptured, a call that would run eagerly or a tape with an
+    # eager step raises EagerFallback (HostTraceReplay's fullgraph). A
+    # learning variant (a harvested op whose key binds at a later call) still
+    # serves, counted in its replay's `learners` and `learner_calls`
+    cudagraph_host_trace_fullgraph = False
+
+    # with cudagraph_host_trace: a harvested op's key learns at its trace, and
+    # one that does not raises EagerFallback (HostTraceReplay's forbid_learners)
+    cudagraph_host_trace_forbid_learners = False
+
     # Should we skip cudagraphing graphs with dynamic shape inputs
     # If False, we will re-record a graph for each unique set of shape inputs
     cudagraph_skip_dynamic_graphs = False
@@ -3208,6 +3259,7 @@ _cache_config_ignore_prefix: list[str] = [
     "_pre_fusion_custom_pass",
     # CUDAGraphPolicy only affects post_compile, not compiled output
     "cudagraph_policy",
+    "triton.cudagraph_host_trace",
     # tests assume that changes here don't invalidate cache
     "force_disable_cudagraph_TESTING_ONLY",
     # timing affects cache structure, not cache content

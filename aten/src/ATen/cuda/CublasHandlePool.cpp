@@ -46,6 +46,15 @@ namespace {
 // -1 means no override; use env var / default
 std::atomic<int64_t> cublas_workspace_override{-1};
 std::atomic<int64_t> cublaslt_workspace_override{-1};
+
+// Host tracing's harvest captures (never replayed): where this thread's cuBLAS
+// workspaces go instead of the allocator, and the most bytes asked of it
+struct WorkspaceAddressOverride {
+  void* ptr = nullptr;
+  size_t size = 0;
+  size_t requested = 0;
+};
+thread_local WorkspaceAddressOverride workspace_address_override;
 } // namespace
 
 namespace {
@@ -329,7 +338,16 @@ size_t getCUDABlasLtWorkspaceSize() {
   return pool_size;
 }
 
+size_t setCUDABlasWorkspaceAddressOverride(void* ptr, size_t size) {
+  return std::exchange(workspace_address_override, {ptr, size, 0}).requested;
+}
+
 at::DataPtr allocateCUDABlasWorkspace(size_t size) {
+  auto& o = workspace_address_override;
+  if (C10_UNLIKELY(o.ptr != nullptr) && size <= o.size) {
+    o.requested = std::max(o.requested, size);
+    return at::DataPtr(o.ptr, c10::Device(c10::kCUDA, c10::cuda::current_device()));
+  }
   return c10::cuda::CUDACachingAllocator::get()->allocate(size);
 }
 

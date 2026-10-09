@@ -552,16 +552,15 @@ _efficient_attention_backward(
   // See Note [Seed and Offset Device]
   at::PhiloxCudaState rng_engine_inputs;
   if (use_dropout) {
-    if (at::cuda::currentStreamCaptureStatus() ==
-        at::cuda::CaptureStatus::None) {
-      rng_engine_inputs = at::PhiloxCudaState(
-          *philox_seed.data_ptr<int64_t>(),
-          *philox_offset.data_ptr<int64_t>());
-    } else { // dropout + capture
+    if (philox_seed.is_cuda()) {
       rng_engine_inputs = at::PhiloxCudaState(
           philox_seed.data_ptr<int64_t>(),
           philox_offset.data_ptr<int64_t>(),
           0);
+    } else {
+      rng_engine_inputs = at::PhiloxCudaState(
+          *philox_seed.data_ptr<int64_t>(),
+          *philox_offset.data_ptr<int64_t>());
     }
   }
 
@@ -788,6 +787,11 @@ _efficient_attention_backward(
 
     // TODO: Initialize unconditional Params fields with C++20 designated initializers.
     typename Kernel::Params p;
+    if (c10::cuda::isHostTraceHarvesting()) {
+      // Params has padding, which default init leaves uninitialized
+      std::memset(static_cast<void*>(&p), 0, sizeof(p));
+      new (&p) typename Kernel::Params();
+    }
     p.query_ptr = (const scalar_t*)query.const_data_ptr();
     p.key_ptr = (const scalar_t*)key.const_data_ptr();
     p.value_ptr = (const scalar_t*)value.const_data_ptr();

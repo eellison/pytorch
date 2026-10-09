@@ -3191,6 +3191,7 @@ class StaticTritonCompileResult(CompileResult[_T]):
             scope, def_args, runner_args, pre_runner_lines=pre_runner_lines
         )
         launcher.config = self.config  # type: ignore[attr-defined]
+        launcher.compile_result = self  # type: ignore[attr-defined]
         launcher.n_regs = self.kernel.n_regs  # type: ignore[attr-defined]
         launcher.n_spills = self.kernel.n_spills  # type: ignore[attr-defined]
         launcher.shared = self.kernel.shared  # type: ignore[attr-defined]
@@ -3416,6 +3417,7 @@ class TritonCompileResult(CompileResult[CompiledKernel]):
 
         launcher = scope["launcher"]
         launcher.config = cfg
+        launcher.compile_result = self
         launcher.n_regs = getattr(binary, "n_regs", None)
         launcher.n_spills = getattr(binary, "n_spills", None)
         launcher.shared = binary_shared

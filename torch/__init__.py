@@ -933,6 +933,8 @@ class SymInt(
         if self.node.is_nested_int():
             # pyrefly: ignore[missing-attribute]  # narrowed by is_nested_int(); only NestedIntNode/SymNode reach here
             return hash(self.node.nested_int())
+        elif (env := getattr(self.node, "shape_env", None)) is not None and env.hash_symints_by_value:
+            return hash(builtins.int(self))
         else:
             # We could support constant SymInts as well, but not doing it for now
             raise TypeError("unhashable type: non-nested SymInt")
@@ -947,6 +949,8 @@ class SymInt(
         return self, 1
 
     def bit_length(self) -> builtins.int:
+        if (env := getattr(self.node, "shape_env", None)) is not None and env.symbolic_bit_length:
+            return torch.cuda._host_trace.bit_length(self)  # type: ignore[return-value]
         # TODO: A more relaxed guard is possible here, where you guard to
         # allow all integer quantities which would result in the same bit
         # length.  We can also just make a dedicated Sympy function for

@@ -40,6 +40,9 @@
 #include <c10/core/ScalarType.h>
 #include <c10/macros/Macros.h>
 #include <c10/util/TypeCast.h>
+#ifndef USE_ROCM
+#include <ATen/cuda/host_trace/LaunchLayout.h>
+#endif
 
 #ifdef __NVCC__
 #define ASSERT_HOST_DEVICE_LAMBDA(type)                       \
@@ -68,6 +71,101 @@ constexpr int block_work_size() {
   return elems_per_thread() * num_threads();
 }
 } // namespace vectorized_templated_config
+#endif
+
+#ifndef USE_ROCM
+// The launch sites below report each launch to the host-trace harvest
+// (ATen/cuda/host_trace/LaunchLayout.h): a parameter's bytes by its type
+template <typename func_t, int ntensors>
+struct StridedOp;
+template <typename func_t, int ntensors>
+struct StridedCastOp;
+
+template <typename T>
+void param_bytes(const T& v, char* c) {
+  if constexpr (std::is_arithmetic_v<T>) {
+    at::cuda::host_trace::value_bytes(v, c, 'k');
+  } else {
+    at::cuda::host_trace::functor_bytes(v, c);
+  }
+}
+
+template <typename T, size_t N>
+void param_bytes(const std::array<T, N>& v, char* c) {
+  at::cuda::host_trace::value_bytes(v, c, 'k');
+}
+
+template <int N, typename index_t, bool signed_strides>
+void param_bytes(const ::OffsetCalculator<N, index_t, signed_strides>& v, char* c) {
+  at::cuda::host_trace::value_bytes(v, c, 'k');
+}
+
+template <int N, typename index_t>
+void param_bytes(const TrivialOffsetCalculator<N, index_t>& v, char* c) {
+  at::cuda::host_trace::value_bytes(v, c, '.');
+}
+
+// LoadWithCast<0>'s placeholder elements are unset
+template <int N>
+void param_bytes(const memory::LoadWithCast<N>& v, char* c) {
+  at::cuda::host_trace::value_bytes(v, c, N ? 'k' : '.');
+}
+
+template <int N>
+void param_bytes(const memory::StoreWithCast<N>& v, char* c) {
+  at::cuda::host_trace::value_bytes(v, c, 'k');
+}
+
+inline void param_bytes(const memory::LoadWithoutCast& v, char* c) {
+  at::cuda::host_trace::value_bytes(v, c, '.');
+}
+
+inline void param_bytes(const memory::StoreWithoutCast& v, char* c) {
+  at::cuda::host_trace::value_bytes(v, c, '.');
+}
+
+template <typename func_t, int ntensors>
+void param_bytes(const StridedOp<func_t, ntensors>& v, char* c) {
+  std::memset(c, '.', sizeof(v));
+  param_bytes(v.data, c + at::cuda::host_trace::member_offset(v, v.data));
+  param_bytes(v.offset_calc, c + at::cuda::host_trace::member_offset(v, v.offset_calc));
+  at::cuda::host_trace::functor_bytes(v.f, c + at::cuda::host_trace::member_offset(v, v.f));
+}
+
+template <typename func_t, int ntensors>
+void param_bytes(const StridedCastOp<func_t, ntensors>& v, char* c) {
+  std::memset(c, '.', sizeof(v));
+  param_bytes(v.data, c + at::cuda::host_trace::member_offset(v, v.data));
+  param_bytes(v.dtypes, c + at::cuda::host_trace::member_offset(v, v.dtypes));
+  param_bytes(v.offset_calc, c + at::cuda::host_trace::member_offset(v, v.offset_calc));
+  at::cuda::host_trace::functor_bytes(v.f, c + at::cuda::host_trace::member_offset(v, v.f));
+}
+
+template <typename T>
+void report_param(at::cuda::host_trace::LaunchLayout& l, const T& v) {
+  l.classes.emplace_back(sizeof(T), '.');
+  param_bytes(v, l.classes.back().data());
+  l.bytes.emplace_back(reinterpret_cast<const char*>(&v), sizeof(T));
+}
+
+// each argument as the kernel's parameter type
+template <typename... KArgs, typename... Args>
+C10_NOINLINE void report_launch(void (*kernel)(KArgs...), dim3 grid, dim3 block, const Args&... args) {
+  at::cuda::host_trace::LaunchLayout l{nullptr, grid, block, {}, {}};
+  C10_CUDA_CHECK(cudaGetFuncBySymbol(&l.function, reinterpret_cast<const void*>(kernel)));
+  (report_param(l, static_cast<KArgs>(args)), ...);
+  at::cuda::host_trace::report_launch_layout(std::move(l));
+}
+
+template <typename... KArgs, typename... Args>
+C10_ALWAYS_INLINE void report_launch_if_harvesting(void (*kernel)(KArgs...), dim3 grid, dim3 block, const Args&... args) {
+  if (at::cuda::host_trace::harvesting()) {
+    report_launch(kernel, grid, block, args...);
+  }
+}
+#else
+template <typename... Args>
+void report_launch_if_harvesting(const Args&...) {}
 #endif
 
 template <typename args_t, size_t... Is>
@@ -320,6 +418,7 @@ __global__ void unrolled_elementwise_kernel(
 }
 
 // this function assume trivial 1d and no dynamic casting
+// Keep in sync with launch_vectorized_kernel in ATen/cuda/host_trace/LoopsSym.cuh
 template <typename func_t, typename array_t>
 static inline void launch_vectorized_kernel(
     int64_t N,
@@ -388,9 +487,11 @@ static inline void launch_vectorized_kernel(
           <<<grid, num_threads(), 0, stream>>>(N, f, data);
 #else
       if (use_sm107_optimizations) {
+        report_launch_if_harvesting(vectorized_elementwise_kernel<8, func_t, array_t, tws_128b >= 8>, grid, num_threads(), N, f, data);
         vectorized_elementwise_kernel<8, func_t, array_t, tws_128b >= 8>
             <<<grid, num_threads(), 0, stream>>>(N, f, data);
       } else {
+        report_launch_if_harvesting(vectorized_elementwise_kernel<8, func_t, array_t>, grid, num_threads(), N, f, data);
         vectorized_elementwise_kernel<8, func_t, array_t>
             <<<grid, num_threads(), 0, stream>>>(N, f, data);
       }
@@ -398,11 +499,13 @@ static inline void launch_vectorized_kernel(
       C10_CUDA_KERNEL_LAUNCH_CHECK();
       break;
     case 4:
+      report_launch_if_harvesting(vectorized_elementwise_kernel<4, func_t, array_t>, grid, num_threads(), N, f, data);
       vectorized_elementwise_kernel<4, func_t, array_t>
           <<<grid, num_threads(), 0, stream>>>(N, f, data);
       C10_CUDA_KERNEL_LAUNCH_CHECK();
       break;
     case 2:
+      report_launch_if_harvesting(vectorized_elementwise_kernel<2, func_t, array_t>, grid, num_threads(), N, f, data);
       vectorized_elementwise_kernel<2, func_t, array_t>
           <<<grid, num_threads(), 0, stream>>>(N, f, data);
       C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -413,6 +516,9 @@ static inline void launch_vectorized_kernel(
       auto loader = memory::LoadWithoutCast();
       auto storer = memory::StoreWithoutCast();
       int64_t grid_unrolled = (N + elementwise_block_work_size() - 1) / elementwise_block_work_size();
+      report_launch_if_harvesting(
+          unrolled_elementwise_kernel<func_t, array_t, elementwise_thread_work_size(), decltype(input_calc), decltype(output_calc), decltype(loader), decltype(storer)>,
+          grid_unrolled, num_threads(), N, f, data, input_calc, output_calc, loader, storer);
       unrolled_elementwise_kernel<func_t, array_t, elementwise_thread_work_size()>
           <<<grid_unrolled, num_threads(), 0, stream>>>(
               N, f, data, input_calc, output_calc, loader, storer);
@@ -577,6 +683,9 @@ static inline void launch_unrolled_kernel(
 
   int64_t grid = (N + elementwise_block_work_size() - 1) / elementwise_block_work_size();
   auto stream = at::cuda::getCurrentCUDAStream();
+  report_launch_if_harvesting(
+      unrolled_elementwise_kernel<func_t, array_t, elementwise_thread_work_size(), inp_calc_t, out_calc_t, loader_t, storer_t>,
+      grid, num_threads(), N, f, data, ic, oc, l, s);
   unrolled_elementwise_kernel<func_t, array_t, elementwise_thread_work_size()>
       <<<grid, num_threads(), 0, stream>>>(N, f, data, ic, oc, l, s);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -606,6 +715,7 @@ static void launch_legacy_kernel(int64_t N, const func_t& f) {
   dim3 block(nt);
   dim3 grid((N + block.x * vt - 1) / (block.x * vt));
   auto stream = at::cuda::getCurrentCUDAStream();
+  report_launch_if_harvesting(elementwise_kernel<nt, vt, func_t>, grid, block, N, f);
   elementwise_kernel<nt, vt, func_t><<<grid, block, 0, stream>>>(N, f);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
@@ -698,6 +808,37 @@ C10_HOST_DEVICE typename traits::result_type invoke(
   return invoke_impl<traits>(f, data, strides, dtypes, i, Indices{});
 }
 
+// The strided loop body as a named functor rather than a lambda, so host code
+// can construct the kernel's parameter.
+template <typename func_t, int ntensors>
+struct StridedOp {
+  using arg0_t = typename function_traits<func_t>::result_type;
+  std::array<char*, ntensors> data;
+  ::OffsetCalculator<ntensors> offset_calc;
+  func_t f;
+  __device__ void operator()(int idx) const {
+    auto offsets = offset_calc.get(idx);
+    arg0_t* out = (arg0_t*)(data[0] + offsets[0]);
+    *out = invoke(f, &data[1], &offsets[1], 1);
+  }
+};
+
+// StridedOp for operands of dtypes other than f's
+template <typename func_t, int ntensors>
+struct StridedCastOp {
+  using arg0_t = typename function_traits<func_t>::result_type;
+  std::array<char*, ntensors> data;
+  std::array<ScalarType, ntensors> dtypes;
+  ::OffsetCalculator<ntensors> offset_calc;
+  func_t f;
+  __device__ void operator()(int idx) const {
+    auto offsets = offset_calc.get(idx);
+    void* out = data[0] + offsets[0];
+    arg0_t result = invoke(f, &data[1], &offsets[1], &dtypes[1], 1);
+    c10::cast_and_store<arg0_t>(dtypes[0], out, result);
+  }
+};
+
 template <typename func_t>
 void gpu_kernel_impl_nocast(TensorIteratorBase& iter, const func_t& f) {
   using traits = function_traits<func_t>;
@@ -723,11 +864,7 @@ void gpu_kernel_impl_nocast(TensorIteratorBase& iter, const func_t& f) {
   auto offset_calc = ::make_offset_calculator<traits::arity + 1>(iter);
 #ifndef USE_ROCM
   constexpr int unroll_factor = sizeof(arg0_t) >= 4 ? 2 : 4;
-  launch_legacy_kernel<128, unroll_factor>(numel, [=] GPU_LAMBDA(int idx) {
-    auto offsets = offset_calc.get(idx);
-    arg0_t* out = (arg0_t*)(data[0] + offsets[0]);
-    *out = invoke(f, &data[1], &offsets[1], 1);
-  });
+  launch_legacy_kernel<128, unroll_factor>(numel, StridedOp<func_t, ntensors>{data, offset_calc, f});
 #else
   constexpr int unroll_factor = sizeof(arg0_t) >= 4 ? 4 : 8;
   constexpr int grp_sz = 128;
@@ -1182,12 +1319,7 @@ void gpu_kernel_impl(TensorIteratorBase& iter, const func_t& f) {
       }
     });
 #else
-    launch_legacy_kernel<128, 4>(numel, [=] GPU_LAMBDA(int idx) {
-      auto offsets = offset_calc.get(idx);
-      void* out = data[0] + offsets[0];
-      arg0_t result = invoke(f, &data[1], &offsets[1], &dtypes[1], 1);
-      c10::cast_and_store<arg0_t>(dtypes[0], out, result);
-    });
+    launch_legacy_kernel<128, 4>(numel, StridedCastOp<func_t, ntensors>{data, dtypes, offset_calc, f});
 #endif
   }
 }

@@ -65,6 +65,17 @@ void trigamma_kernel_cuda(TensorIteratorBase& iter) {
 }
 
 constexpr char polygamma_name[] = "polygamma";
+template <typename scalar_t>
+struct PolygammaFunctor {
+  int64_t n;
+  __device__ scalar_t operator()(scalar_t a) const {
+    return calc_polygamma<scalar_t, /*is_cuda=*/true>(a, static_cast<int>(n));
+  }
+  auto host_trace_fields() const {
+    return std::tie(n);
+  }
+};
+
 void polygamma_kernel_cuda(TensorIteratorBase& iter, int64_t n) {
   if (n == 0) {
     digamma_kernel_cuda(iter);
@@ -93,9 +104,7 @@ void polygamma_kernel_cuda(TensorIteratorBase& iter, int64_t n) {
       at::ScalarType::Half,
       at::ScalarType::BFloat16,
         iter.common_dtype(), "polygamma_cuda", [&]() {
-          gpu_kernel(iter, [=] GPU_LAMBDA(scalar_t a) -> scalar_t {
-            return calc_polygamma<scalar_t, /*is_cuda=*/true>(a, static_cast<int>(n));
-          });
+          gpu_kernel(iter, PolygammaFunctor<scalar_t>{n});
         });
 #endif // AT_USE_JITERATOR()
   }

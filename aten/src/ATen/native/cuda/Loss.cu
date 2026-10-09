@@ -11,12 +11,17 @@
 
 #include <type_traits>
 
+#if !defined(USE_ROCM)
+#include <ATen/cuda/host_trace/Ops.h>
+#endif
+
 #ifndef AT_PER_OPERATOR_HEADERS
 #include <ATen/Functions.h>
 #include <ATen/NativeFunctions.h>
 #else
 #include <ATen/ops/binary_cross_entropy_backward_native.h>
 #include <ATen/ops/binary_cross_entropy_native.h>
+#include <ATen/ops/empty.h>
 #include <ATen/ops/empty_like.h>
 #include <ATen/ops/exp.h>
 #include <ATen/ops/nll_loss_backward_native.h>
@@ -630,3 +635,59 @@ TORCH_IMPL_FUNC(nll_loss_backward_out_cuda)
       ignore_index);
 }
 }  // namespace at::native
+
+#if !defined(USE_ROCM)
+// Traced host (ATen/cuda/host_trace/Ops.h)
+namespace at::cuda::host_trace {
+
+std::tuple<TensorBase, TensorBase> nll_loss_forward(Recorder& rec, const TensorBase& self, const TensorBase& target, const TensorBase& weight, int64_t reduction, int64_t ignore_index) {
+  if (reduction == at::Reduction::None) {
+    decline("an nll_loss without reduction");
+  }
+  if (!self.is_contiguous() || !target.is_contiguous() || (weight.defined() && !weight.is_contiguous())) {
+    decline("an nll_loss of an operand that is not contiguous");
+  }
+  if (target.sym_numel() == 0) {
+    decline("an empty nll_loss");
+  }
+  const TensorBase output = at::empty_symint({}, self.options());
+  const TensorBase total_weight = at::empty_symint({}, self.options());
+  AT_DISPATCH_FLOATING_TYPES_AND2(kHalf, kBFloat16, self.scalar_type(), "nll_loss_forward_reduce_cuda_kernel", [&] {
+    // AT_DISPATCH_NLL_LOSS_INDEX_TYPES
+    auto index_dispatch = [&](auto index) {
+      using index_t = decltype(index);
+      auto ptr = [&rec](const TensorBase& t) { return t.defined() ? rec.data_ptr(t) : c10::SymInt(0); };
+      const bool mean = reduction == at::Reduction::Mean;
+      // nll_loss_forward_out_cuda_template's launch (keep in sync)
+      if (self.dim() == 1) {
+        launch(rec, &at::native::nll_loss_forward_reduce_cuda_kernel_1d<scalar_t, index_t>, 1, 1, 0, scalar_param<scalar_t*>(ptr(output)),
+               scalar_param<scalar_t*>(ptr(total_weight)), scalar_param<const scalar_t*>(ptr(self)), scalar_param<const index_t*>(ptr(target)),
+               scalar_param<const scalar_t*>(ptr(weight)), Param<bool>(mean), scalar_param<int64_t>(self.sym_size(-1)), Param<int64_t>(ignore_index));
+        return;
+      }
+      using accscalar_t = at::acc_type<scalar_t, true>;
+      // nll_loss_threads: 2**round(log2(n / 16)), clamped to [32, 1024]
+      int64_t nthreads = 1024;
+      for (const auto& [bound, threads] : {std::pair<int64_t, int64_t>{46 * 16, 32}, {91 * 16, 64}, {182 * 16, 128}, {363 * 16, 256}, {725 * 16, 512}}) {
+        if (self.sym_size(0) < bound) {
+          nthreads = threads;
+          break;
+        }
+      }
+      launch(rec, &at::native::nll_loss_forward_reduce_cuda_kernel_2d<scalar_t, accscalar_t, index_t>, 1, nthreads,
+             static_cast<int64_t>(nthreads * sizeof(accscalar_t) * 2), scalar_param<scalar_t*>(ptr(output)), scalar_param<scalar_t*>(ptr(total_weight)),
+             scalar_param<const scalar_t*>(ptr(self)), scalar_param<const index_t*>(ptr(target)), scalar_param<const scalar_t*>(ptr(weight)),
+             Param<bool>(mean), scalar_param<int64_t>(self.sym_size(0)), scalar_param<int64_t>(self.sym_size(1)), scalar_param<int64_t>(self.sym_size(-1)),
+             Param<int64_t>(ignore_index));
+    };
+    if (target.scalar_type() == kLong) {
+      index_dispatch(int64_t{});
+    } else {
+      index_dispatch(uint8_t{});
+    }
+  });
+  return {output, total_weight};
+}
+
+} // namespace at::cuda::host_trace
+#endif

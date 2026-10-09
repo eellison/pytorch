@@ -1,6 +1,9 @@
 #pragma once
 
 #include <ATen/CollapseDims.h>
+#include <c10/cuda/CUDAFunctions.h>
+
+#include <cstring>
 
 namespace at::cuda::detail {
 
@@ -37,6 +40,9 @@ struct TensorInfo {
 
 template <typename T, typename IndexType>
 TensorInfo<T, IndexType>::TensorInfo() {
+  if (c10::cuda::isHostTraceHarvesting()) {
+    std::memset(static_cast<void*>(this), 0, sizeof(*this));
+  }
   data = nullptr;
   dims = 0;
 }
@@ -46,6 +52,9 @@ TensorInfo<T, IndexType>::TensorInfo(T* p,
                                      int dim,
                                      IndexType sz[MAX_TENSORINFO_DIMS],
                                      IndexType st[MAX_TENSORINFO_DIMS]) {
+  if (c10::cuda::isHostTraceHarvesting()) {
+    std::memset(static_cast<void*>(this), 0, sizeof(*this));
+  }
   data = p;
   dims = dim;
   TORCH_CHECK(dims < MAX_TENSORINFO_DIMS, "CUDA Tensors cannot have more than 25 dimensions");

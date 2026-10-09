@@ -492,7 +492,7 @@ Tensor constant_pad_nd_mps(const Tensor& self, IntArrayRef pad, const Scalar& va
   if (mps::constant_pad_dense_eligible(cropped, output, padding_dim)) {
     mps::constant_pad_dense_kernel_mps(cropped, output, pad, padding_dim, fill);
   } else if (output.numel() > std::numeric_limits<uint32_t>::max() || ndim > c10::metal::max_ndim) {
-    return at::native::constant_pad_nd(self, pad, value);
+    return at::native::constant_pad_nd_symint(self, c10::fromIntArrayRefSlow(pad), value);
   } else {
     mps::constant_pad_strided_kernel_mps(cropped, output, pad, padding_dim, fill);
   }

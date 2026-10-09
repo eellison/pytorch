@@ -143,6 +143,14 @@ struct AUnaryFunctor {
   }
   // NB: scalar is stored in higher precision!
   AUnaryFunctor(func_t f_, opmath_arg1_t a_): f(f_), a(a_) {}
+#ifndef USE_ROCM
+  auto host_trace_fields() const {
+    return std::tie(f, a);
+  }
+  auto host_trace_scalars() const {
+    return std::tie(a);
+  }
+#endif
   private:
     func_t f;
     opmath_arg1_t a;
@@ -157,6 +165,14 @@ struct BUnaryFunctor {
   }
   // NB: scalar is stored in higher precision!
   BUnaryFunctor(func_t f_, opmath_arg2_t b_): f(f_), b(b_) {}
+#ifndef USE_ROCM
+  auto host_trace_fields() const {
+    return std::tie(f, b);
+  }
+  auto host_trace_scalars() const {
+    return std::tie(b);
+  }
+#endif
   private:
     func_t f;
     opmath_arg2_t b;
@@ -170,6 +186,11 @@ struct BinaryFunctor {
     return f(a, b);
   }
   BinaryFunctor(func_t f_): f(f_) {}
+#ifndef USE_ROCM
+  auto host_trace_fields() const {
+    return std::tie(f);
+  }
+#endif
   private:
     func_t f;
 };
@@ -282,6 +303,7 @@ static inline void launch_unrolled_kernel_for_multi_outputs(int64_t N, const fun
   TORCH_INTERNAL_ASSERT(N > 0 && N <= std::numeric_limits<int32_t>::max());
   int64_t grid = (N + block_work_size() - 1) / block_work_size();
   auto stream = at::cuda::getCurrentCUDAStream();
+  report_launch_if_harvesting(unrolled_elementwise_kernel_for_multi_outputs<num_outputs, func_t, array_t, inp_calc_t, out_calc_t>, grid, num_threads(), N, f, data, ic, oc);
   unrolled_elementwise_kernel_for_multi_outputs<num_outputs, func_t, array_t><<<grid, num_threads(), 0, stream>>>(N, f, data, ic, oc);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
@@ -319,8 +341,6 @@ void gpu_kernel_multiple_outputs_impl(TensorIteratorBase& iter, const func_t& f)
 
 template <typename func_t>
 void gpu_kernel_multiple_outputs(TensorIteratorBase& iter, const func_t& f) {
-  ASSERT_HOST_DEVICE_LAMBDA(func_t);
-
   for (int arg = 0; arg < iter.ntensors(); arg++) {
     TORCH_INTERNAL_ASSERT(iter.device(arg).is_cuda());
   }

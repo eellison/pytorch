@@ -206,6 +206,9 @@ def compute_ufunc_cuda_functors(
             g, name=f"ufunc::{ufunc_name}", compute_t=BaseCType(opmath_t)
         )
         apply_ctx = ufunctor_sig.fields() + ufunctor_sig.arguments().apply
+        fields = ", ".join(b.name for b in ufunctor_sig.fields())
+        scalars = [b.name for b in ufunctor_sig.fields() if isinstance(b.argument, Argument) and b.argument.type.is_tensor_like()]
+        host_trace_scalars = f"auto host_trace_scalars() const {{ return std::tie({', '.join(scalars)}); }}" if scalars else ""
         ufunctors.append(
             f"""
 template <typename scalar_t>
@@ -216,6 +219,10 @@ struct {ufunctor_sig.name} {{
   __device__ {ufunctor_sig.decl_apply()} {{
     return {ufunc_sig.call(apply_ctx)};
   }}
+  auto host_trace_fields() const {{
+    return std::tie({fields});
+  }}
+  {host_trace_scalars}
 }};
 """
         )

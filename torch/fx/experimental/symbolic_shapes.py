@@ -1630,6 +1630,13 @@ def _sym_node_hint_disproves(node: SymNode, target: bool) -> bool:
     return False
 
 
+def _static_read_is_guard(node: Any) -> bool:
+    # a shape env whose trace must decide as a concrete value would (host
+    # tracing): a static read is decided by the hint and recorded as a guard
+    env = getattr(node, "shape_env", None)
+    return getattr(env, "static_reads_guard", False) and node.has_hint()
+
+
 def statically_known_false(x: BoolLikeType) -> bool:
     """
     Returns True if x can be simplified to a constant and is False.
@@ -1646,6 +1653,9 @@ def statically_known_false(x: BoolLikeType) -> bool:
         if not isinstance(x, bool):
             raise AssertionError(f"Expected bool, got {type(x)}")
         return not x
+
+    if _static_read_is_guard(x.node):
+        return not x.node.guard_bool("", 0)
 
     if _sym_node_hint_disproves(x.node, target=False):
         return False
@@ -1672,6 +1682,8 @@ def statically_known_true(x: BoolLikeType) -> bool:
         if not isinstance(x, bool):
             raise AssertionError(f"Expected bool, got {type(x)}")
         return x
+    if _static_read_is_guard(x.node):
+        return x.node.guard_bool("", 0)
     if _sym_node_hint_disproves(x.node, target=True):
         return False
     result = _static_eval_sym_bool(x)
@@ -3955,6 +3967,13 @@ class _FrameLocalResult:
 
 
 class ShapeEnv:
+    # SymInt.__hash__ specializes (a guard on the value) instead of raising TypeError
+    hash_symints_by_value = False
+    # statically_known_true/false decide by the hint and record the guard
+    static_reads_guard = False
+    # SymInt.bit_length is an expression (torch.cuda._host_trace.bit_length) instead of a specialization
+    symbolic_bit_length = False
+
     # This is a wrapper over the actual __init__ function.
     #
     # Where to add a new constructor parameter to ShapeEnv?

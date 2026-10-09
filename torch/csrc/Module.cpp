@@ -50,6 +50,7 @@
 #include <torch/csrc/Event.h>
 #include <torch/csrc/Export.h>
 #include <torch/csrc/Generator.h>
+#include <torch/csrc/cuda/host_trace/Program.h>
 #include <torch/csrc/Layout.h>
 #include <torch/csrc/MemoryFormat.h>
 #include <torch/csrc/QScheme.h>
@@ -2647,6 +2648,7 @@ PyObject* initModule() {
   torch::instruction_counter::initModule(module);
   torch::acc::initModule(module);
   torch::initVerboseBindings(module);
+  torch::initHostTraceProgramBindings(module);
   ASSERT_TRUE(THPStorage_init(module));
   torch::functionalization::initModule(module);
 

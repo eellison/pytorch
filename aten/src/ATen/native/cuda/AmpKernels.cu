@@ -38,6 +38,24 @@ static __host__ __device__ __forceinline__ int isfinite_ensure_cuda_math(float v
 namespace at::native {
 
 namespace {
+template <typename scalar_t, typename opmath_t>
+struct AmpNonFiniteCheckAndUnscaleFunctor {
+  float* found_inf_ptr;
+  const float* inv_scale_ptr;
+  __device__ scalar_t operator()(scalar_t val_in) const {
+    auto val = static_cast<opmath_t>(val_in);
+    if (!isfinite_ensure_cuda_math(val)) {
+      *found_inf_ptr = 1.f;
+    }
+    // Every thread accesses inv_scale, but it will hit in cache.
+    const auto inv_scale_val = *inv_scale_ptr;
+    return static_cast<scalar_t>(inv_scale_val == 1.f ? val : val * inv_scale_val);
+  }
+  auto host_trace_fields() const {
+    return std::tie(found_inf_ptr, inv_scale_ptr);
+  }
+};
+
 // Single-tensor fallback for _amp_foreach_non_finite_check_and_unscale_cuda_.
 // Handles individual tensors that are acceptable to unscale but not MTA-safe.
 void _amp_non_finite_check_and_unscale_cuda_(Tensor& scaled_grad,
@@ -61,16 +79,7 @@ void _amp_non_finite_check_and_unscale_cuda_(Tensor& scaled_grad,
 
       using opmath_t = at::opmath_type<scalar_t>;
 
-      gpu_kernel(iter,
-                 [found_inf_ptr, inv_scale_ptr] GPU_LAMBDA (scalar_t val_in) -> scalar_t {
-                   auto val = static_cast<opmath_t>(val_in);
-                   if (!isfinite_ensure_cuda_math(val)) {
-                     *found_inf_ptr = 1.f;
-                   }
-                   // Every thread accesses inv_scale, but it will hit in cache.
-                   const auto inv_scale_val = *inv_scale_ptr;
-                   return static_cast<scalar_t>(inv_scale_val == 1.f ? val : val * inv_scale_val);
-                 });
+      gpu_kernel(iter, AmpNonFiniteCheckAndUnscaleFunctor<scalar_t, opmath_t>{found_inf_ptr, inv_scale_ptr});
     });
 }
 } // anonymous namespace

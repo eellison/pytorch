@@ -20,14 +20,23 @@ namespace at::native {
 namespace {
 
 template <typename scalar_t>
+struct ThresholdFunctor {
+  scalar_t threshold;
+  scalar_t value;
+  __device__ scalar_t operator()(scalar_t x, scalar_t other) const {
+    return x <= threshold ? value : other;
+  }
+  auto host_trace_fields() const {
+    return std::tie(threshold, value);
+  }
+};
+
+template <typename scalar_t>
 void threshold_kernel_impl(
     TensorIteratorBase& iter,
     scalar_t threshold,
     scalar_t value) {
-  gpu_kernel_with_scalars(
-      iter, [=] GPU_LAMBDA(scalar_t x, scalar_t other) -> scalar_t {
-        return x <= threshold ? value : other;
-      });
+  gpu_kernel_with_scalars(iter, ThresholdFunctor<scalar_t>{threshold, value});
 }
 
 static void threshold_kernel_cuda(
