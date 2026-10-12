@@ -36,7 +36,13 @@ import torch.cuda._host_trace_replay as R
 from torch.cuda._host_trace_harvest import HarvestProvider
 from torch.nn.utils.stateless import _reparametrize_module
 
-FAMILIES = tuple(os.environ.get("ARMV_FAMILIES", "blas,attention,rng,reduce").split(","))
+# ARMV_SOUND=1 (serve, 10-12; the user: "no extra harvest", only cuBLAS is harvested): cuBLAS (family "blas") only; vLLM's open _C ops,
+# the trtllm-gen shim, ATen's open SDPA / RNG / sum and every other open op are
+# traced or run as eager steps (no extern list, no ARMV_EXTRA_EXTERN, no Python launcher ports). summary()["unsound_learned"]
+# lists any learned key outside that set (it must be empty).
+SOUND = os.environ.get("ARMV_SOUND", "0") == "1"
+SOUND_ALLOWED = frozenset({"aten::mm", "aten::addmm", "aten::bmm", "aten.mm.default", "aten.addmm.default", "aten.bmm.default"})
+FAMILIES = ("blas",) if SOUND else tuple(os.environ.get("ARMV_FAMILIES", "blas,attention,rng,reduce").split(","))
 MEMORY = os.environ.get("ARMV_MEMORY", "run_buffer")
 DECODE_MAX_SEQ = os.environ.get("ARMV_DECODE_MAX_SEQ", "model")
 PREFILL_MAX_KV = os.environ.get("ARMV_PREFILL_MAX_KV", "model")
@@ -112,7 +118,10 @@ for _kv in filter(None, os.environ.get("ARMV_HT_SET", "").split(",")):
 # ARMV_TRACED_IMPLS=1: the five _C ops (rms_norm, fused_add_rms_norm, rotary_embedding, silu_and_mul,
 # reshape_and_cache_flash) trace through armV/vllm_ops_trace.py's launchers (src_vllmcpp CHANGES item 21) and leave the
 # extern list; a decline still takes the extern harvest. Default 0: extern harvest, as before.
-TRACED_IMPLS = os.environ.get("ARMV_TRACED_IMPLS", "0") == "1"
+# ARMV_PORTS=1 with ARMV_SOUND (user-approved arm, 10-12): the Python launcher ports of the five _C ops (vllm_ops_trace.py) trace
+# them; a port that declines leaves its op an eager step (SOUND has no extern list, so nothing is harvested)
+PORTS = SOUND and os.environ.get("ARMV_PORTS", "0") == "1"
+TRACED_IMPLS = (os.environ.get("ARMV_TRACED_IMPLS", "0") == "1" and not SOUND) or PORTS
 # ARMV_TRTLLM_FORK=1 (launcher python_vllm_cpp_fork.sh): FlashInfer's trtllm-gen calls trace through the fork's
 # flashinfer.trtllm_trace (sglang/fork/VLLM_NOTES.md): trtllm_shim is not installed, its ops leave the extern list and
 # its COUNTERS the attrs. Default 0: trtllm_shim's extern ops, as before.
@@ -413,12 +422,14 @@ class ArmV:
         c, cache = torch.ops._C, torch.ops._C_cache_ops
         extern = [c.rms_norm.default, c.fused_add_rms_norm.default, c.rotary_embedding.default, c.silu_and_mul.default,
                   cache.reshape_and_cache_flash.default]
+        if SOUND:  # open _C ops: traced or eager, never harvested
+            extern = []
         # serve scratch, diagnosis only: ARMV_EXTERN_DROP = comma list of op names left eager instead of harvested
         drop = set(filter(None, os.environ.get("ARMV_EXTERN_DROP", "").split(",")))
         extern = [o for o in extern if o.name().split("::")[-1].split(".")[0] not in drop]
         # serve scratch (R1 / Qwen3.5: NVFP4, fp8 KV): more of vLLM's _C CUDA ops, harvested like the five above (closed).
         # ARMV_EXTRA_EXTERN: comma list of _C op.overload names
-        for spec in os.environ.get("ARMV_EXTRA_EXTERN", "scaled_fp4_quant.out,static_scaled_fp8_quant.default").split(","):
+        for spec in ("" if SOUND else os.environ.get("ARMV_EXTRA_EXTERN", "scaled_fp4_quant.out,static_scaled_fp8_quant.default")).split(","):
             name, _, overload = spec.partition(".")
             if name and hasattr(c, name):
                 extern.append(getattr(getattr(c, name), overload))
@@ -427,7 +438,7 @@ class ArmV:
 
             names = [n for n in os.environ.get("ARMV_TRACED_IMPLS_NAMES", "").split(",") if n] or None  # diagnostics: a subset of the ports
             extern = [o for o in extern if o not in vllm_ops_trace.install(names)]
-        if not TRTLLM_FORK:
+        if not TRTLLM_FORK and not SOUND:
             extern += [torch.ops.vllm_ht.trtllm_decode.default, torch.ops.vllm_ht.trtllm_context.default]
         extern = tuple(extern)
         # reshape_and_cache_flash writes rows of the interleaved K/V views of each layer's cache at slot = block * block_size
@@ -443,6 +454,16 @@ class ArmV:
             kw["lend_alias_groups"] = True
         self.md_stock_tried, self.md_stock_why = {}, {}  # MD_STOCK_DIAG
         self.provider = HarvestProvider(FAMILIES + ("extern",), extern_ops=extern, indexed=indexed, **kw)
+        if SOUND:  # the run fails at the first learned key outside cuBLAS / the trtllm-gen shim
+            learn = self.provider.learn
+
+            def sound_learn(*a, **k):
+                out = learn(*a, **k)
+                bad = sorted({str(key[1]) for key in self.provider.bindings} - SOUND_ALLOWED)
+                if bad:
+                    raise RuntimeError(f"ARMV_SOUND: learned keys of open ops {bad}")
+                return out
+            self.provider.learn = sound_learn
         self.entries = {}  # key -> HostTraceReplay
         self.calls = collections.Counter()
         self.host_s = collections.defaultdict(list)  # kind -> host seconds of the replayed call (entry to return, no sync)
@@ -886,6 +907,18 @@ class ArmV:
             row["state_rows"] = int(pre[0].numel())
             self._load_states(post)
         row["stock_parts"] = [type(part).__name__ for part, _ in stock]
+        if os.environ.get("ARMV_CHECK_TWICE") == "1" and pre is not None:
+            # control (diagnosis): a second eager forward from the same pre-step state; eager vs eager not bitwise means the
+            # eager reference itself is not reproducible in this regime (nondeterministic kernels or non-idempotent state)
+            post2 = self._save_states(groups)
+            self._load_states(pre)
+            with override_forward_context(copy.copy(fc)):
+                want2 = self.orig_forward(input_ids, positions, **self._extra)
+            torch.cuda.synchronize()
+            row["eager_twice_bitwise"] = same(want, want2)
+            row["eager_twice_max_abs"] = float((want.float() - want2.float()).nan_to_num().abs().max())
+            row["out_absmax"] = float(want.float().nan_to_num().abs().max())
+            self._load_states(post2)
         self.checks.append(row)
 
     @staticmethod
@@ -1447,6 +1480,7 @@ class ArmV:
         res["bindings"] = len(self.provider.bindings)
         res["traced_impls"], res["trtllm_fork"] = TRACED_IMPLS, TRTLLM_FORK
         res["learned_by_op"] = dict(collections.Counter(str(k[1]) for k in self.provider.bindings).most_common())
+        res["unsound_learned"] = sorted({str(k[1]) for k in self.provider.bindings} - SOUND_ALLOWED)
         # replayed calls only: median and count
         res["host_ms"] = {k: (sorted(v)[len(v) // 2] * 1e3, len(v)) for k, v in self.host_s.items() if v}
         res["entry_bench"] = {str(k): v for k, v in self.entry_bench.items()}

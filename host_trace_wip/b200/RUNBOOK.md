@@ -13,17 +13,20 @@ The numbers are for a talk tonight. Do only this, in order, and report each resu
    only. Smoke: `python test/test_cuda_host_trace_replay.py`.
 2. Correctness first: one ours-arm run with the check on (the `--check` path of `vllm/bench/drive_ix2.py`, or
    `vllm/ix_run_check.py`): every checked output must be bitwise vs stock. If not, stop and report.
-3. The controlled mixed-step benchmark, the same as the original "g4" run: `vllm/round_ix2_line.sh` (via
-   `vllm/timing_lib.sh` and `vllm/bench/drive_ix2.py`), three arms default / fullnc (no compile) / ours (V), arms
-   rotated per round, 6 rounds, one GPU, nothing else on it. Shapes: chunk 1024/2048 + 64/128 decodes at KV
-   1024-2048, and the same at KV 6000-8000. The ours arm's adapter is `vllm/armV_cand2` (`INTEG_ARMV`) with the env in
-   `VS=(...)` of that script. The launcher there is `python_vllm_cand2.sh`: replace it with yours (section 4).
-4. Report a table like the original: per shape, median ms per arm and ratios ours vs default / vs fullnc; then model
-   forwards at init, init seconds, eager steps, and bitwise result. Original GB300 numbers for comparison (Qwen3-8B,
-   ms, default / fullnc / ours): 1024 chunk + 64 decodes at KV 1-2K: 59.2 / 48.8 / 17.4 (3.40x / 2.81x). vLLM falls
-   back to no graph on these steps because they exceed its largest capture size; GPU time was the same in all arms.
-5. Only if time remains: `Qwen/Qwen3.5-9B` with `vllm/round_q35p_line.sh` (ours = `armV_stock_fast_cpp_m`,
-   `ARMV_HOST_ARGS=pinned`), same table.
+3. SOUND CONFIG ONLY (hard rule): only cuBLAS may be harvested; every open op (vLLM _C ops, Triton, FlashInfer JIT,
+   ATen) is traced or runs eagerly. The ours arm uses `ARMV_SOUND=1` with adapter `vllm/armV_stock_fast_m`
+   (`INTEG_ARMV`); the run raises if any non-cuBLAS key is learned. Never use the older adapters' default extern lists.
+   Correctness check first: `vllm/bench/drive_ix2.py --arm V --check` with the same env as `VS=(...)` in
+   `vllm/round_g4s_line.sh`, covering the 8 mixed shapes at KV 1-2K and 6-8K plus decode at long KV. Every check must
+   be bitwise; report eager steps and graph segments per variant.
+4. The controlled mixed-step benchmark: `vllm/round_g4s_line.sh` (via `vllm/timing_lib.sh` and
+   `vllm/bench/drive_ix2.py`), three arms default / fullnc (no compile) / ours (V, sound), arms rotated per round,
+   3 rounds, one GPU, nothing else on it. Then a fourth arm, ours with `ARMV_PORTS=1` added (the five vLLM custom ops
+   go through Python launcher ports: real compiled kernels, launch config traced; a port that cannot trace makes that
+   op an eager step, never a harvest); check it bitwise first, same coverage.
+5. Report per shape: median ms per arm and ratios ours vs default / vs fullnc, for both ours arms; then eager steps
+   and segments per variant, model forwards at init, init seconds, bitwise counts. Expect the sound arm to be much
+   closer to fullnc than earlier numbers; report whatever it is.
 
 The InferenceX sweep (sections 5-6) is for later, not today.
 
