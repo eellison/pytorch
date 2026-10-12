@@ -1,0 +1,27 @@
+# Qwen3-8B bf16 on one GB300 with vLLM (development model, not on InferenceX), single-turn fixed-seq-len. InferenceX srt-slurm recipe shape (schema 2,
+# base.roles.agg.args = `vllm serve` flags). Args: the vLLM recipe's NVFP4 TP1 launch (recipes.vllm.ai/Qwen/Qwen3.8-27B)
+# matrix context as --max-model-len (isl + osl + 256) and --max-num-seqs = max(conc, 16) (the runner derives both per
+# point, as the PR's script does). Spec decoding off for now; no chat template (USE_CHAT_TEMPLATE false, as the
+# InferenceX 8k1k recipes).
+base:
+  schema: 2
+  name: qwen38b-bf16-gb300-vllm
+  model: { path: /data/eellison/models/Qwen3-8B, precision: bf16 }
+  resources: { gpu_type: gb300, gpus_per_node: 1 }
+  frontend: { type: vllm }
+  engine: { type: vllm }
+  roles:
+    agg:
+      nodes: 1
+      workers: 1
+      gpus: 1
+      args:
+        tensor-parallel-size: 1
+        attention-backend: FLASHINFER   # Phase A's arm V setting (trtllm-gen decode)
+        no-enable-prefix-caching: true
+        disable-uvicorn-access-log: true
+      env:
+        PYTHONNOUSERSITE: '1'
+  benchmark:
+    type: fixed-seq
+    env: { RANDOM_RANGE_RATIO: '0.8', USE_CHAT_TEMPLATE: 'false' }
