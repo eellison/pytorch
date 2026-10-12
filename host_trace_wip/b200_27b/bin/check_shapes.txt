@@ -1,0 +1,1 @@
+--language-model-only --max-model-len 9216 --batch-size 1 8 64 --decode-tokens 16 --prefill-lens 64 512 --mixed 0 --ix-mixed 1024x8@1024-2048 2048x8@6000-8000 --ix-decode 8:6000-8000 64:1000-3000 --ix-reps 5 --llm-kw {"kv_cache_dtype":"fp8","max_num_seqs":64}
