@@ -247,7 +247,14 @@ class ArmVWorkerExt:
         return {"check": V.check, "checks_so_far": len(V.checks)}
 
     def armv_summary(self):
-        return self._armv.summary()
+        res = self._armv.summary()
+        # misconfiguration flag (ix_run / reports): traces declined on a plain CPU tensor argument (an unpinned host tensor passed
+        # as an argument, e.g. ARMV_HOST_ARGS=1 on a GDN model): every such step silently runs eagerly after a full trace
+        sites = getattr(sys.modules.get("adapter"), "DECLINE_SITES", {})
+        res["cpu_arg_declines"] = sum(n for (m, _), n in sites.items() if "is on cpu; only CUDA tensors" in str(m))
+        # the same for meta stand-ins allocated inside the trace (pinned host args before the _m adapters' fix)
+        res["meta_alloc_declines"] = sum(n for (m, _), n in sites.items() if "an allocation on meta in a trace" in str(m))
+        return res
 
     def armv_breakdown(self):
         st = getattr(self, "_armv_stats", None)

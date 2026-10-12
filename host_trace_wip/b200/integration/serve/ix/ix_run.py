@@ -157,15 +157,21 @@ def main():
             steplog = http("GET", f"{base}/armv/steplog?clear=1", timeout=600)
             if steplog is not None:  # per-step timeline + per-request step indices (ix_tails.py)
                 json.dump(steplog, open(os.path.join(out, name + "_steps.json"), "w"))
-            if e.get("x-armv", {}).get("install") == "trace":  # per-variant eager / opaque ops by name, declines, learned keys (ix_eager.py)
-                json.dump(http("GET", f"{base}/armv/summary", timeout=600), open(os.path.join(out, name + "_summary.json"), "w"), indent=1, default=str)
+            cpu_declines = None
+            if e.get("x-armv", {}).get("install") == "trace":  # per-variant eager / opaque ops by name, declines, learned keys (ix_nv_report.py)
+                summ = http("GET", f"{base}/armv/summary", timeout=600)
+                json.dump(summ, open(os.path.join(out, name + "_summary.json"), "w"), indent=1, default=str)
+                cpu_declines = (summ.get("cpu_arg_declines") or 0) + (summ.get("meta_alloc_declines") or 0)
+                if cpu_declines:
+                    print(f"MISCONFIGURED {name}: {summ.get('cpu_arg_declines')} traces declined on a CPU tensor argument, "
+                          f"{summ.get('meta_alloc_declines')} on a meta allocation inside the trace", flush=True)
             prof = None
             if a.profile_steps and rc == 0:
                 http("POST", f"{base}/armv/profile", {"steps": a.profile_steps})
                 client(conc, 2 * conc, os.path.join(out, name + "_prof.json"))
                 prof = http("GET", f"{base}/armv/profile")
             rec = {"sku": a.sku, "scenario": a.scenario, "conc": conc, "rc": rc, "client_wall_s": wall, "server": info,
-                   "reuse_server": a.reuse_server, "breakdown_before": b0, "breakdown_after": b1, "profile": prof,
+                   "reuse_server": a.reuse_server, "misconfig_declines": cpu_declines, "breakdown_before": b0, "breakdown_after": b1, "profile": prof,
                    "counters": http("GET", f"{base}/armv/counters") if e.get("x-armv", {}).get("install") == "trace" else None}
             json.dump(rec, open(os.path.join(out, name + "_point.json"), "w"), indent=1)
             print(f"{time.strftime('%T')} {name} rc={rc} wall={wall:.0f}s", flush=True)

@@ -73,7 +73,8 @@ for tag in ARGS.tags:
         delta = lambda k: (b1.get(k) or 0) - (b0.get(k) or 0)
         ours = "replays" in b1
         steps = max(delta("steps"), 1)
-        x = {"rc": 0, "tag": tag, "r": r, "steps": steps, "wall": d["client_wall_s"], "prof": (d.get("profile") or {}).get("per_step")}
+        x = {"rc": 0, "tag": tag, "r": r, "steps": steps, "wall": d["client_wall_s"], "prof": (d.get("profile") or {}).get("per_step"),
+             "cpu": d.get("misconfig_declines") or d.get("cpu_arg_declines") or 0}
         if ours:
             sp = p.replace("_point.json", "_summary.json")
             mm, other, reps, names = eager_calls(json.load(open(sp)) if os.path.exists(sp) else None)
@@ -113,6 +114,8 @@ others = collections.defaultdict(collections.Counter)
 for (sku, sc, conc), xs in sorted(points.items(), key=lambda kv: (kv[0][1], kv[0][2], kv[0][0])):
     ok = [x for x in xs if x["rc"] == 0]
     runs = f"{len(ok)}" + (f" (+{len(xs) - len(ok)} failed)" if len(ok) < len(xs) else "")
+    if any(x["cpu"] for x in ok):  # a silent eager fallback: the point is misconfigured, not a result
+        runs += f" MISCONFIGURED ({sum(x['cpu'] for x in ok)} CPU-argument / meta-allocation declines)"
     if not ok:
         print(f"| {sku} | {sc} | {conc} | {runs} |" + " - |" * 12)
         continue
@@ -125,6 +128,8 @@ for (sku, sc, conc), xs in sorted(points.items(), key=lambda kv: (kv[0][1], kv[0
         ec = f"{agg(ok, lambda x: x['mm'], 1)} + {agg(ok, lambda x: x['other'], 1)}"
         le = f"{agg(ok, lambda x: x['learns'], 0)} ({agg(ok, lambda x: x['learn_s'], 1)})"
         tr = agg(ok, lambda x: x["traces"], 0)
+        if max(x["traces"] / x["steps"] for x in ok) > 0.05:  # declined traces retried step after step: not a steady state
+            tr += " RETRACE-BOUND"
         rd = f"{agg(ok, lambda x: x['redisp'], 0)} ({agg(ok, lambda x: x['redisp_s'], 1)})"
         cov = f"- / {agg(ok, lambda x: (x['prof'] or {}).get('kernel_launches_outside_graphs'), 0)}"
     else:

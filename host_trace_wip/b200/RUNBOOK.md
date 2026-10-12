@@ -5,6 +5,28 @@ serving numbers for Qwen3.8-27B NVFP4 (first) and Qwen3.8-Flash-Next NVFP4 (seco
 this branch's PyTorch. Everything you need is in this branch; paths inside the copied scripts are from the original
 box (`/data/eellison/...`) and must be rewritten for this one.
 
+## TODAY: fast path (deadline 15:30 PDT)
+
+The numbers are for a talk tonight. Do only this, in order, and report each result as soon as it exists:
+
+1. Build torch (section 1) and vLLM (section 2), install FlashInfer and the fork (section 3). Download `Qwen/Qwen3-8B`
+   only. Smoke: `python test/test_cuda_host_trace_replay.py`.
+2. Correctness first: one ours-arm run with the check on (the `--check` path of `vllm/bench/drive_ix2.py`, or
+   `vllm/ix_run_check.py`): every checked output must be bitwise vs stock. If not, stop and report.
+3. The controlled mixed-step benchmark, the same as the original "g4" run: `vllm/round_ix2_line.sh` (via
+   `vllm/timing_lib.sh` and `vllm/bench/drive_ix2.py`), three arms default / fullnc (no compile) / ours (V), arms
+   rotated per round, 6 rounds, one GPU, nothing else on it. Shapes: chunk 1024/2048 + 64/128 decodes at KV
+   1024-2048, and the same at KV 6000-8000. The ours arm's adapter is `vllm/armV_cand2` (`INTEG_ARMV`) with the env in
+   `VS=(...)` of that script. The launcher there is `python_vllm_cand2.sh`: replace it with yours (section 4).
+4. Report a table like the original: per shape, median ms per arm and ratios ours vs default / vs fullnc; then model
+   forwards at init, init seconds, eager steps, and bitwise result. Original GB300 numbers for comparison (Qwen3-8B,
+   ms, default / fullnc / ours): 1024 chunk + 64 decodes at KV 1-2K: 59.2 / 48.8 / 17.4 (3.40x / 2.81x). vLLM falls
+   back to no graph on these steps because they exceed its largest capture size; GPU time was the same in all arms.
+5. Only if time remains: `Qwen/Qwen3.5-9B` with `vllm/round_q35p_line.sh` (ours = `armV_stock_fast_cpp_m`,
+   `ARMV_HOST_ARGS=pinned`), same table.
+
+The InferenceX sweep (sections 5-6) is for later, not today.
+
 ## Rules
 
 - At most 2 GPUs at a time unless the user says the box is yours alone. Wrap every GPU job in `flock -x <lockfile>`

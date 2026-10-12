@@ -10,11 +10,18 @@ TAG=${1:-nv1}
 G=/data/eellison/src/pytorch/agent_space/paramgraph/land/scratch/integration
 LOCK=/data/eellison/src/pytorch/agent_space/paramgraph/land/scratch/eager/gpu0.lock
 MASTER=$G/vllm/ix_master_attnlc.yaml
-M27=qwen3.827bp4-fp4-gb300-vllm,qwen3.827bnc4-fp4-gb300-vllm,qwen3.827bvs4-fp4-gb300-vllm
+M27=qwen3.827bp4-fp4-gb300-vllm,qwen3.827bnc4-fp4-gb300-vllm
+# 27B V-stock only with NV_27VS=1: on candidate 4 every decode trace declines (mm_fp4's eager address scalar, "sN is not
+# read from the call's inputs") and retraces at the next step (0.4 tok/s in the warm-up, 10-12 07:15); waits for the CuTe fix
+[ "${NV_27VS:-0}" = 1 ] && M27=$M27,qwen3.827bvs4-fp4-gb300-vllm
 MFN=qwen3.8flashnextp4-fp4-gb300-vllm,qwen3.8flashnextvs4-fp4-gb300-vllm
 ALL=1k1k:1,8k1k:1,1k1k:4,8k1k:4,1k1k:16,8k1k:16,1k1k:64,8k1k:64
 REP=1k1k:4,8k1k:4,1k1k:64,8k1k:64
-PLAN=${PLAN:-"r1|$M27|$ALL r1|$MFN|$ALL r2|$M27|$REP r2|$MFN|$REP r3|$M27|$REP r3|$MFN|$REP"}
+case ${PART:-all} in  # nv_chain.sh: 27B repeat 1, then the q1 rerun, then the rest
+  27r1) PLAN="r1|$M27|$ALL" ;;
+  rest) PLAN="r1|$MFN|$ALL r2|$M27|$REP r2|$MFN|$REP r3|$M27|$REP r3|$MFN|$REP" ;;
+  *) PLAN="r1|$M27|$ALL r1|$MFN|$ALL r2|$M27|$REP r2|$MFN|$REP r3|$M27|$REP r3|$MFN|$REP" ;;
+esac
 cd $G
 free_mib() { nvidia-smi --query-gpu=memory.total,memory.used --format=csv,noheader,nounits -i 0 | tr -d , | awk '{print $1 - $2}'; }
 for blk in $PLAN; do

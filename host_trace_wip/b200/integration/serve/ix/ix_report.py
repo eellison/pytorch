@@ -61,7 +61,7 @@ for tag in ARGS.tags:
                          redisp=delta("redispatches") if "redispatches" in b1 else None, redisp_s=delta("redispatch_s") if "redispatches" in b1 else None,
                          replayed=delta("replays") / steps if ours else None, wall=d["client_wall_s"],
                          full=(b1.get("cg_modes", {}).get("FULL", 0) - b0.get("cg_modes", {}).get("FULL", 0)) / steps,
-                         r=r, kv=kv, rc=d["rc"]))
+                         r=r, kv=kv, rc=d["rc"], cpu=d.get("misconfig_declines") or d.get("cpu_arg_declines") or 0))
 f = lambda x, n=2: "-" if x is None else f"{x:.{n}f}" if isinstance(x, float) else str(x)
 ms = lambda r, k: None if r.get(k) is None else 1e3 * r[k]
 print("Provisional, pre-core-done (learn-cost follow-ups, attention fixes, entry binding pending). InferenceX client "
@@ -81,7 +81,8 @@ for x in sorted(rows, key=lambda x: (x["sc"], x["conc"], x["sku"])):
     share = "" if x["learn_share"] is None else f" ({100 * x['learn_share']:.0f}%{' LEARN-DOMINATED' if x['learn_share'] > 0.25 else ''})"
     rd = "-" if x["redisp"] is None else f"{x['redisp']} ({x['redisp_s']:.1f} s = {100 * x['redisp_s'] / x['wall']:.0f}%{' REDISPATCH-DOMINATED' if x['redisp_s'] > 0.25 * x['wall'] else ''})"
     cov = f"{x['replayed']:.2f}" if x["replayed"] is not None else f"FULL {x['full']:.2f}"
-    print(f"| {x['sku']} ({LINE.get(x['sku'], '?')}) | {x['sc']} | {x['conc']} | {x['steps']} | {f(x['keys'])} | {f(x['learns'])}{share} | {f(x['traces'])} | "
+    mis = f" MISCONFIGURED ({x['cpu']} CPU-argument / meta-allocation declines)" if x["cpu"] else ""
+    print(f"| {x['sku']} ({LINE.get(x['sku'], '?')}){mis} | {x['sc']} | {x['conc']} | {x['steps']} | {f(x['keys'])} | {f(x['learns'])}{share} | {f(x['traces'])} | "
           f"{f(x['eager'])} | {rd} | {cov} | {f(r['tput_per_gpu'], 1)} | {f(r['output_tput_per_gpu'], 1)} | "
           f"{f(ms(r, 'median_tpot'))} / {f(ms(r, 'p90_tpot'))} | {f(ms(r, 'median_itl'))} / {f(ms(r, 'p90_itl'))} | "
           f"{f(ms(r, 'median_ttft'), 1)} / {f(ms(r, 'p90_ttft'), 1)} | {f(ms(r, 'median_e2el'), 0)} / {f(ms(r, 'p90_e2el'), 0)} | {f(x['kv'])} | {x['rc']} |")
