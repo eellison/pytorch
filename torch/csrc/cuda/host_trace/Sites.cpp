@@ -3,6 +3,7 @@
 #if !defined(USE_ROCM)
 #include <torch/csrc/autograd/python_variable.h>
 
+#include <c10/util/ScopeExit.h>
 #include <c10/util/SmallVector.h>
 
 #include <algorithm>
@@ -75,6 +76,13 @@ const HostTraceVariant::KernelRow& HostTraceVariant::kernel_row(
     int64_t row) const {
   return row == 0 ? r.kernel
                   : sites_[r.site].entries[row - 1]->kernels[r.site_pos];
+}
+
+const HostTraceVariant::MemcpyRow& HostTraceVariant::memcpy_row(
+    const Record& r,
+    int64_t row) const {
+  return row == 0 ? r.copy
+                  : sites_[r.site].entries[row - 1]->memcpys[r.site_pos];
 }
 
 const HostTraceVariant::MemsetRow& HostTraceVariant::memset_row(
@@ -193,12 +201,23 @@ bool HostTraceVariant::evaluate_static(
       // patched values' (seen_generation_), which only a commit moves
       std::swap(frame.values, cached_values_);
       cached_generation_ = generation;
+      site_memo_cache_ = false;
     }
     return hit;
   }
-  std::swap(frame.values, cached_values_);
+  // moved, not swapped: a fresh frame's values are inline, and a swap with
+  // them would copy every row (and allocate their buffer) at each call
+  frame.values = std::move(cached_values_);
   cache_busy_ = true;
   frame.cached = this;
+  // whether the memo's reads are the cache's as this call found it; not
+  // after the call changes the cache, until its sites resolve
+  const bool memo_fresh = site_memo_cache_;
+  site_memo_cache_ = false;
+  // the rows this call changes: none (no dynamic leaf changed) or delta's
+  // (restricted), else every dynamic row
+  bool restricted = false;
+  DeltaRows* delta = nullptr;
   int64_t pt = phase_now();
   c10::SmallVector<int64_t, 64> leaves;
   leaves.resize_for_overwrite(program_.num_leaves());
@@ -221,13 +240,14 @@ bool HostTraceVariant::evaluate_static(
         any = true;
       }
     }
+    restricted = true;
     if (!any) {
       valid_rows = nullptr;
       ++delta_skips;
     } else {
-      const DeltaRows& d = delta_rows(changed);
-      valid_rows = &d.valid_rows;
-      other_rows = &d.other_rows;
+      delta = &delta_rows(changed);
+      valid_rows = &delta->valid_rows;
+      other_rows = &delta->other_rows;
       delta_last_changed_.assign(changed.begin(), changed.end());
       ++delta_partials;
     }
@@ -253,14 +273,48 @@ bool HostTraceVariant::evaluate_static(
   }
   frame.overlapped =
       !disjoint(args, count, dynamic_pairs_, &dynamic_pair_arguments_);
-  const bool resolved = !frame.overlapped && evaluate_sites(frame);
+  if (frame.overlapped) {
+    phase_add(3, pt);
+    return false;
+  }
+  // with a fresh memo, a site read can differ from it only among the rows
+  // this call evaluated: none does, the memo's rows are the call's
+  bool memo_holds = memo_fresh && restricted &&
+      site_memo_armed_ == static_cast<int64_t>(armed_.size());
+  if (memo_holds && delta) {
+    if (delta->site_reads_version != site_reads_version_) {
+      delta->site_reads.clear();
+      for (const auto* rows : {&delta->valid_rows, &delta->other_rows}) {
+        for (uint32_t r : *rows) {
+          auto it = std::lower_bound(site_reads_.begin(), site_reads_.end(), r);
+          if (it != site_reads_.end() && *it == r) {
+            delta->site_reads.push_back(static_cast<uint32_t>(it - site_reads_.begin()));
+          }
+        }
+      }
+      delta->site_reads_version = site_reads_version_;
+    }
+    for (uint32_t j : delta->site_reads) {
+      memo_holds = memo_holds && v[site_reads_[j]] == site_read_values_[j];
+    }
+  }
+  bool resolved = true;
+  if (memo_holds) {
+    frame.site_entries.assign(site_memo_entries_.begin(), site_memo_entries_.end());
+    if (!armed_.empty()) {
+      frame.forms.assign(site_memo_forms_.begin(), site_memo_forms_.end());
+    }
+  } else {
+    resolved = evaluate_sites(frame);
+  }
+  site_memo_cache_ = resolved;
   phase_add(3, pt);
   return resolved;
 }
 
 void HostTraceVariant::release(Frame& frame) {
   if (frame.cached == this) {
-    std::swap(frame.values, cached_values_);
+    cached_values_ = std::move(frame.values);
     cache_busy_ = false;
     frame.cached = nullptr;
   }
@@ -274,12 +328,13 @@ void HostTraceVariant::keep(Frame& frame, uint64_t generation) {
   std::swap(frame.values, cached_values_);
   cached_generation_ = generation;
   seen_generation_ = generation;
+  site_memo_cache_ = false;
   delta_valid_ = delta_marked_ = false;
 }
 
-const HostTraceVariant::DeltaRows& HostTraceVariant::delta_rows(
+HostTraceVariant::DeltaRows& HostTraceVariant::delta_rows(
     c10::ArrayRef<uint64_t> changed) {
-  for (const DeltaRows& d : delta_memo_) {
+  for (DeltaRows& d : delta_memo_) {
     if (changed.equals(d.changed)) {
       return d;
     }
@@ -322,6 +377,7 @@ void HostTraceVariant::set_static_prefix(size_t n) {
   users_kept_ = false;
   static_prefix_ = n;
   cached_generation_ = 0;
+  site_memo_cache_ = false;
   delta_valid_ = delta_marked_ = false;
   delta_memo_.clear();
   delta_last_changed_.clear();
@@ -391,6 +447,10 @@ bool HostTraceVariant::evaluate_sites(Frame& frame) const {
   site_memo_entries_.assign(frame.site_entries.begin(), frame.site_entries.end());
   site_memo_forms_.assign(frame.forms.begin(), frame.forms.end());
   site_memo_armed_ = static_cast<int64_t>(armed_.size());
+  // the memo is this frame's reads (the caller says whether those are the
+  // cache's)
+  ++site_reads_version_;
+  site_memo_cache_ = false;
   return true;
 }
 
@@ -499,7 +559,7 @@ py::object HostTraceVariant::evaluate_py(py::handle args) const {
       rows[i] = s.rows[found];
     }
   }
-  if (missing.empty()) {
+  if (missing.empty() && unselected.empty()) {
     c10::SmallVector<int32_t, 8> arms;
     for (size_t g : armed_) {
       if (form_of(segments_[g], rows.data(), arms) < 0) {
@@ -514,24 +574,85 @@ py::object HostTraceVariant::evaluate_py(py::handle args) const {
 void HostTraceVariant::add_entry(
     size_t site,
     int64_t predicate,
-    py::handle nodes) {
+    py::handle nodes,
+    int32_t arm,
+    const std::vector<int64_t>& temporaries,
+    const std::vector<int64_t>& drops,
+    int64_t alloc_at,
+    int64_t free_at) {
   TORCH_CHECK_VALUE(
       site < sites_.size() && !sites_[site].predicates.empty(),
       "no selector ",
       site);
   Site& s = sites_[site];
   auto t = nodes.cast<py::tuple>();
+  const bool piece = arm != 0;
   TORCH_CHECK_VALUE(
-      t.size() == s.records.size(), "an entry of ", t.size(), " nodes");
+      arm >= 0 &&
+          (piece ? t.size() > 0 && !s.records.empty()
+                 : t.size() == s.records.size() && temporaries.empty() &&
+                 drops.empty()),
+      "an entry of ",
+      t.size(),
+      " nodes");
   auto e = std::make_unique<Entry>();
+  e->arm = arm;
+  for (int64_t row : temporaries) {
+    e->temporaries.push_back(check_row(row));
+  }
+  if (piece) {
+    // its places in its run's order: of its events, or of its tensors
+    const auto step = std::find_if(steps_.begin(), steps_.end(), [&](const Step& x) {
+      return x.segment == static_cast<int64_t>(s.segment);
+    });
+    TORCH_CHECK_VALUE(step != steps_.end(), "a section outside the runs");
+    const StepMemory& m = memory_[step - steps_.begin()];
+    const size_t n = m.order.empty() ? m.tensors.size() : m.order.size();
+    TORCH_CHECK_VALUE(
+        alloc_at >= 0 && alloc_at <= free_at && static_cast<size_t>(free_at) <= n,
+        "a section's places ",
+        alloc_at,
+        ", ",
+        free_at);
+    e->alloc_at = static_cast<size_t>(alloc_at);
+    e->free_at = static_cast<size_t>(free_at);
+  }
+  for (int64_t k : drops) {
+    TORCH_CHECK_VALUE(
+        k >= 0 && static_cast<size_t>(k) < n_alloc_ &&
+            (allocations_[k].owner < 0 ||
+             allocations_[k].owner == static_cast<int64_t>(site)) &&
+            allocations_[k].site < 0 && !allocations_[k].arena,
+        "a section's dropped allocation ",
+        k);
+    e->drops.push_back(k);
+  }
+  // the temporaries' bases, which its nodes' fields read
+  e->first_base = base_count_;
+  base_count_ += temporaries.size();
+  auto restore = c10::make_scope_exit([&] {
+    if (e) {
+      base_count_ = e->first_base;
+    }
+  });
+  std::vector<Kind> kinds(t.size());
   e->kernels.resize(t.size());
   e->memsets.resize(t.size());
+  e->memcpys.resize(t.size());
   for (size_t i = 0; i < t.size(); ++i) {
     auto n = t[i].cast<py::tuple>();
-    const auto kind = static_cast<Kind>(n[0].cast<uint8_t>());
-    TORCH_CHECK_VALUE(kind != Kind::Memcpy, "an entry's memcpy");
+    const auto kind = kinds[i] = static_cast<Kind>(n[0].cast<uint8_t>());
+    TORCH_CHECK_VALUE(piece || kind != Kind::Memcpy, "an entry's memcpy");
     TORCH_CHECK_VALUE(
-        kind == records_[s.records[i]].kind, "an entry's node of another kind");
+        piece || kind == records_[s.records[i]].kind,
+        "an entry's node of another kind");
+    if (kind == Kind::Memcpy) {
+      // a section's memcpy: device to device
+      const auto copy = static_cast<cudaMemcpyKind>(n[4].cast<int>());
+      TORCH_CHECK_VALUE(copy == cudaMemcpyDeviceToDevice, "a section's host memcpy");
+      e->memcpys[i] = {parse_source(n[1]), parse_source(n[2]), check_row(n[3].cast<int64_t>()), copy, -1};
+      continue;
+    }
     if (kind == Kind::Memset) {
       MemsetRow& m = e->memsets[i];
       m.dst = parse_source(n[1]);
@@ -563,12 +684,25 @@ void HostTraceVariant::add_entry(
   }
   e->held = e->image;
   for (size_t i = 0; i < t.size(); ++i) {
-    if (records_[s.records[i]].kind == Kind::Kernel) {
+    if (kinds[i] == Kind::Kernel) {
       bind_row(
           e->kernels[i], e->image.data(), e->held.data(), e->fields.data());
       e->kernels[i].descriptors =
           e->descriptors.data() + e->kernels[i].first_descriptor;
     }
+  }
+  if (piece) {
+    if (std::find(armed_.begin(), armed_.end(), s.segment) == armed_.end()) {
+      armed_.push_back(s.segment);
+    }
+    auto& sections = segments_[s.segment].sections;
+    if (!temporaries.empty() &&
+        std::find(sections.begin(), sections.end(), site) == sections.end()) {
+      sections.push_back(site);
+    }
+  }
+  for (int64_t k : drops) {
+    allocations_[k].owner = static_cast<int64_t>(site);
   }
   s.predicates.push_back(check_row(predicate));
   note_reads(s, *e);
@@ -725,7 +859,9 @@ void HostTraceVariant::add_form(
       auto n = h.cast<py::tuple>();
       Record r{};
       r.kind = static_cast<Kind>(n[0].cast<uint8_t>());
-      TORCH_CHECK_VALUE(r.kind != Kind::Memcpy, "a keyed row's memcpy");
+      TORCH_CHECK_VALUE(
+          r.kind != Kind::Memcpy || !sites_[site].predicates.empty(),
+          "a keyed row's memcpy");
       r.node = reinterpret_cast<CUgraphNode>(n[1].cast<uintptr_t>());
       r.site = static_cast<int64_t>(site);
       r.site_pos = pos++;

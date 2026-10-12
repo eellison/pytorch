@@ -107,6 +107,14 @@ def register_traced_impl(op: Any, launcher: Callable[..., Any]) -> None:
 # op's does, rather than guarding the graph, which traces again. False runs it
 # as plain Python
 dispatch_units = True
+# a redispatch instantiating a redo template also redoes the op in full and asserts the two entries are one (the
+# test suites set it)
+verify_redo_templates = False
+# a redispatch's redo resolves a plain CUDA tensor its op's body reaches (module or context state, as vLLM's
+# layer.kv_cache) to the call's tensor argument of the same storage (the StorageImpl, not its address) and the same view,
+# where exactly one is; the trace saw that argument there (the caller swapped it in while fn ran). Off: such a read
+# declines and the call traces again. An integration that swaps its arguments into state turns it on
+redo_resolves_arguments = False
 
 
 def dispatch_unit(fn: Callable[..., Any]) -> Callable[..., Any]:

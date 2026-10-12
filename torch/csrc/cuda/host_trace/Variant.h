@@ -218,7 +218,7 @@ class HostTraceVariant {
   // (rows, [(site, key), ...] the tables lack, [(segment, arms), ...] the
   // forms lack, [site, ...] the selectors none of whose predicates holds) at
   // the call, or None when it misses otherwise (a site declines its key); the
-  // forms only once no key is missing
+  // forms only once no key is missing and every selector selects
   py::object evaluate_py(py::handle args) const;
   // Whether the call's rows hold and a pair of its arguments overlaps: the
   // call runs eagerly
@@ -236,8 +236,21 @@ class HostTraceVariant {
       const std::vector<int64_t>& scratch);
   // Adds a selector's entry: its nodes (_host_trace_native.launch_row, with
   // rows for the launch dimensions and memset extents), run where predicate
-  // holds and no earlier entry's does
-  void add_entry(size_t site, int64_t predicate, py::handle nodes);
+  // holds and no earlier entry's does. With arm > 0 a section: nodes of their
+  // own in place of the selector's (its forms' pieces); per temporary its
+  // bytes' row, at bases from the base count at the call; the allocations of
+  // the selector's op it does not make (`drops`); and where its temporaries
+  // are made and freed in its run's eager order (before events alloc_at and
+  // free_at; a run of no order or temporaries: in its tensors)
+  void add_entry(
+      size_t site,
+      int64_t predicate,
+      py::handle nodes,
+      int32_t arm,
+      const std::vector<int64_t>& temporaries,
+      const std::vector<int64_t>& drops,
+      int64_t alloc_at,
+      int64_t free_at);
   // Replaces the program by one that extends it (rows added, for add_entry)
   void set_program(const HostTraceProgram& program);
   // Adds a form of the segment: exec, an instantiation of graph, a clone of
@@ -377,16 +390,25 @@ class HostTraceVariant {
     MemcpyRow copy;
     std::array<int64_t, 3> held_copy; // dst, src, bytes
   };
-  // A key's rows, per site node the kernel or memset of the node's kind
+  // A key's rows, per site node the kernel, memset or (a section's) memcpy of
+  // the node's kind
   struct Entry {
     std::vector<KernelRow> kernels;
     std::vector<MemsetRow> memsets;
+    std::vector<MemcpyRow> memcpys;
     std::vector<Field> fields;
     std::vector<uint8_t> image;
     std::vector<uint8_t> held;
     int32_t arm = 0;
     std::vector<int64_t> scratch; // bytes per the site's scratch buffer
     std::vector<Descriptor> descriptors;
+    // a section's temporaries: bytes' rows, at bases first_base, ...; its
+    // op's allocations it does not make; its temporaries' places in the order
+    std::vector<int64_t> temporaries;
+    size_t first_base = 0;
+    std::vector<int64_t> drops;
+    size_t alloc_at = 0;
+    size_t free_at = 0;
   };
   // A keyed launch table: per key, filled once, the row its nodes run. A
   // selector (a top-level op's own guards) has no key: the first of its
@@ -423,7 +445,8 @@ class HostTraceVariant {
     size_t form; // the one whose exec the records' held parameters are of
     size_t first;
     size_t stop;
-    std::vector<size_t> sites; // the keyed sites in it
+    std::vector<size_t> sites; // the keyed sites and selectors in it
+    std::vector<size_t> sections; // its selectors with a section's temporaries
     // per form but [0]: its graph, the records' nodes in it (null for one a
     // piece replaced) and the pieces' nodes, as records of their sites
     struct Clone {
@@ -461,6 +484,8 @@ class HostTraceVariant {
     size_t scratch = 0; // its index in the site's
     // a planned arena: sized by its plan, so never a site's scratch buffer
     bool arena = false;
+    // the selector whose op made it, where a section of it does not
+    int64_t owner = -1;
   };
   struct Planned {
     int64_t alloc;
@@ -490,6 +515,12 @@ class HostTraceVariant {
     mutable std::vector<int64_t> placed_sizes;
     mutable std::vector<int64_t> placed_offsets;
     mutable int64_t placed_total = -1;
+    // the rows the temporaries' sizes read, and the temporaries a site's row
+    // sizes (scratch buffers): the placement holds while those rows are at
+    // placed_row_values and those temporaries at their placed sizes
+    std::vector<int64_t> size_rows;
+    std::vector<size_t> site_temporaries;
+    mutable std::vector<int64_t> placed_row_values;
   };
   enum class LeafKind : uint8_t { View, Scalar, Constant };
   struct Leaf {
@@ -569,12 +600,16 @@ class HostTraceVariant {
       const Frame& frame,
       const int64_t* values) const;
   // The step's allocations; the run buffer holding its temporaries, if any.
-  // An eager-order run leaves the device's allocator locked in `hold`.
+  // An eager-order run leaves the device's allocator locked in `hold`. The
+  // run's sections' temporaries freed after it is queued go in `held`.
   at::Tensor allocate(
       const StepMemory& memory,
       const Segment* run,
       Frame& frame,
-      std::unique_lock<std::recursive_mutex>& hold) const;
+      std::unique_lock<std::recursive_mutex>& hold,
+      c10::SmallVector<c10::DataPtr, 4>& held) const;
+  // whether the call's section of its op does not make allocation k
+  bool dropped(int64_t k, const Frame& frame) const;
   void allocate_tensor(int64_t k, Frame& frame) const;
   int64_t alloc_bytes(int64_t k, const Frame& frame) const;
   at::Tensor run_buffer(const StepMemory& memory, Frame& frame) const;
@@ -609,6 +644,7 @@ class HostTraceVariant {
   void switch_form_held(Segment& run, size_t form);
   const KernelRow& kernel_row(const Record& r, int64_t row) const;
   const MemsetRow& memset_row(const Record& r, int64_t row) const;
+  const MemcpyRow& memcpy_row(const Record& r, int64_t row) const;
   int64_t check_row(int64_t row) const;
   int64_t check_base(int64_t base) const;
   // (param, offset, width, pointer, row, base, delta)
@@ -723,6 +759,11 @@ class HostTraceVariant {
   mutable std::vector<int64_t> site_memo_entries_;
   mutable std::vector<int32_t> site_memo_forms_;
   mutable int64_t site_memo_armed_ = -1;
+  // bumped by each rebuild of site_reads_
+  mutable uint64_t site_reads_version_ = 0;
+  // the memo's site reads are cached_values_'s: a delta call compares only
+  // those among the rows it evaluates, as the other rows are the cache's
+  mutable bool site_memo_cache_ = false;
   // the kept call's values, unless a call is using them
   c10::SmallVector<int64_t, 256> cached_values_;
   uint64_t cached_generation_ = 0;
@@ -736,8 +777,12 @@ class HostTraceVariant {
     std::vector<uint64_t> changed;
     std::vector<uint32_t> valid_rows;
     std::vector<uint32_t> other_rows;
+    // the site reads among those rows, as indices in site_reads_ when it was
+    // site_reads_version_'s
+    std::vector<uint32_t> site_reads;
+    uint64_t site_reads_version = 0;
   };
-  const DeltaRows& delta_rows(c10::ArrayRef<uint64_t> changed);
+  DeltaRows& delta_rows(c10::ArrayRef<uint64_t> changed);
   std::vector<int64_t> delta_leaves_;
   std::vector<DeltaRows> delta_memo_;
   std::vector<uint64_t> delta_last_changed_;

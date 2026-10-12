@@ -206,9 +206,7 @@ HostTraceVariant::HostTraceVariant(py::handle spec)
       });
       TORCH_CHECK_VALUE(g != segments_.end(), "a site outside the segments");
       site.segment = g - segments_.begin();
-      if (!selector) {
-        g->sites.push_back(sites_.size());
-      }
+      g->sites.push_back(sites_.size());
     }
     for (size_t pos = 0; pos < site.records.size(); ++pos) {
       const size_t i = site.records[pos];
@@ -479,6 +477,18 @@ HostTraceVariant::HostTraceVariant(py::handle spec)
           k >= 0 && static_cast<size_t>(k) < n_alloc_, "no allocation ", k);
       memory.temporaries.push_back({k, seq, last});
     }
+    for (size_t i = 0; i < memory.temporaries.size(); ++i) {
+      const Allocation& a = allocations_[memory.temporaries[i].alloc];
+      if (a.site >= 0) {
+        memory.site_temporaries.push_back(i);
+      } else {
+        memory.size_rows.push_back(a.nbytes);
+      }
+    }
+    std::sort(memory.size_rows.begin(), memory.size_rows.end());
+    memory.size_rows.erase(
+        std::unique(memory.size_rows.begin(), memory.size_rows.end()),
+        memory.size_rows.end());
     for (int64_t e : ints<int64_t>(t[3])) {
       const int64_t k = e < 0 ? -1 - e : e;
       const auto tmp = std::find_if(

@@ -104,11 +104,6 @@ OFFENDERS: dict[tuple[str, str], str] = {
     (_TAPE, "_Trace._pointwise_host.<locals>.stand_in"): _WITNESS,
     (_TAPE, "_Trace._pointwise_host.<locals>.check"): _WITNESS,
     (_TAPE, "_Trace._pointwise_host.<locals>.check.<locals>.address"): _WITNESS,
-    # owner: the CuTe lane
-    (_CUTE, "_describe"): _WITNESS,
-    (_CUTE, "_intercept"): _WITNESS,
-    (_CUTE, "_intercept_foreign"): _WITNESS,
-    (_CUTE, "_pin"): "int(v) (a guard that returns the value) in place of v == _hint(v)",
 }
 
 

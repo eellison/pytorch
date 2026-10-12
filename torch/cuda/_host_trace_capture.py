@@ -896,22 +896,63 @@ def capture_tape(lowered: LoweredTape, addresses: Sequence[int]) -> CapturedTape
     return CapturedTape(lowered, segments)
 
 
+@dataclass(frozen=True)
+class PieceMemcpy:
+    """A section's 1D device-to-device memcpy node, of `nbytes` at the call."""
+
+    nbytes: int
+
+
+def section_binding(launches: Sequence[LoweredLaunch | LoweredMemset | LoweredMemcpy], values: Sequence[int]) -> OpaqueBinding:
+    """A redispatch section's launches as a piece's nodes (_capture_piece) at
+    the rows `values` of a call it holds: their functions, launch attributes
+    and dimensions; their parameter bytes are don't-care, which a replay's
+    patch fills."""
+    from cuda.bindings import driver
+
+    from torch.cuda._host_trace_opaque import OpaqueBinding, OpaqueKernel, OpaqueMemset
+
+    pdl = driver.CUlaunchAttributeID.CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION
+    nodes: list[OpaqueKernel | OpaqueMemset | PieceMemcpy] = []
+    for lo in launches:
+        t = lo.launch
+        if isinstance(lo, LoweredMemcpy):
+            nodes.append(PieceMemcpy(values[lo.nbytes]))
+            continue
+        if isinstance(lo, LoweredMemset):
+            nodes.append(OpaqueMemset(None, t.value, t.element_size, *memset_extent(lo, values)))  # type: ignore[arg-type]
+            continue
+        images = t.images or tuple(bytes(n) for _, n in t.layout)
+        attributes = (*t.attributes, *(((pdl, 1),) if t.programmatic else ()))
+        grid, block = (tuple(values[r] for r in rows) for rows in (lo.grid, lo.block))
+        nodes.append(OpaqueKernel(t.function, grid, block, values[lo.smem], attributes, t.layout, (b"".join(images),) if t.packed else images, ()))  # type: ignore[arg-type]
+    return OpaqueBinding(tuple(nodes), ())
+
+
 def _capture_piece(graph: int, dependencies: list[Any], binding: OpaqueBinding, stream: int) -> list[tuple[int, int]]:
     """The binding's nodes captured on `stream` into the graph after
     `dependencies`, on default edges into its first; each one's (kind, node),
-    0 a kernel's and 1 a memset's. Its slots hold don't-care bytes, a
-    replay's patch fills them."""
-    from cuda.bindings import driver
+    0 a kernel's, 1 a memset's and 2 a memcpy's. Its slots hold don't-care
+    bytes, a replay's patch fills them; a memcpy copies within an allocation
+    of the caching allocator's (_copy_operands), made before the capture."""
+    from cuda.bindings import driver, runtime
 
     from torch.cuda._host_trace_opaque import OpaqueMemset
 
     pdl = driver.CUlaunchAttributeID.CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION
     relaxed = driver.CUstreamCaptureMode.CU_STREAM_CAPTURE_MODE_RELAXED
+    sizes = [n.nbytes for n in binding.nodes if isinstance(n, PieceMemcpy)]
+    span = -(-max([1, *sizes]) // _ALLOC_ALIGNMENT) * _ALLOC_ALIGNMENT
+    # a section holds device-to-device memcpys only
+    copies = _copy_operands(torch.device("cuda", torch.cuda.current_device()), span, False)[0] if sizes else None
     _check_cuda_bindings(driver.cuStreamBeginCaptureToGraph(stream, graph, dependencies, None, len(dependencies), relaxed))
     nodes: list[tuple[int, int]] = []
     try:
         for n in binding.nodes:
-            if isinstance(n, OpaqueMemset):
+            if isinstance(n, PieceMemcpy):
+                d2d = runtime.cudaMemcpyKind.cudaMemcpyDeviceToDevice
+                _check_cuda_bindings(runtime.cudaMemcpyAsync(copies.data_ptr(), copies.data_ptr() + span, n.nbytes, d2d, stream))  # type: ignore[union-attr]
+            elif isinstance(n, OpaqueMemset):
                 memset = getattr(driver, f"cuMemsetD2D{8 * n.element_size}Async")
                 _check_cuda_bindings(memset(_EAGER_TAG, n.pitch, n.value, n.width, n.height, stream))
             else:
@@ -921,9 +962,10 @@ def _capture_piece(graph: int, dependencies: list[Any], binding: OpaqueBinding, 
             after = _frontier(stream)
             if len(after) != 1:
                 raise declined(f"a piece's node {len(nodes)} did not add one node to the capture")
-            nodes.append((int(isinstance(n, OpaqueMemset)), after[0]))
+            nodes.append((2 if isinstance(n, PieceMemcpy) else int(isinstance(n, OpaqueMemset)), after[0]))
     finally:
         _check_cuda_bindings(driver.cuStreamEndCapture(stream))
+    del copies
     return nodes
 
 
@@ -993,7 +1035,7 @@ def instantiate_form(
     and each piece's nodes as _capture_piece."""
     from cuda.bindings import driver
 
-    from torch.cuda._host_trace_opaque import OpaqueMemset
+    from torch.cuda._host_trace_opaque import OpaqueKernel
 
     clone = _check_cuda_bindings(driver.cuGraphClone(graph))
     try:
@@ -1028,7 +1070,7 @@ def instantiate_form(
             # a programmatic edge stays where its kernel waits on its predecessors: into the piece if the
             # library launched the binding's first kernel programmatically, and out of it into a successor
             # that was its target (the successor waits)
-            first_waits = keep_programmatic_edges and not isinstance(binding.nodes[0], OpaqueMemset) and dict(binding.nodes[0].attributes).get(pdl)
+            first_waits = keep_programmatic_edges and isinstance(binding.nodes[0], OpaqueKernel) and dict(binding.nodes[0].attributes).get(pdl)
             kept = [(d, e) for d, e in zip(into, into_edges) if e.type == programmatic] if first_waits else []
             if kept:
                 first = driver.CUgraphNode(init_value=placed[-1][0][1])  # a list takes no int
@@ -1037,7 +1079,7 @@ def instantiate_form(
                 _check_cuda_bindings(driver.cuGraphAddDependencies(clone, deps, [first] * len(deps), edges, len(deps)))
             if out:
                 last = driver.CUgraphNode(init_value=placed[-1][-1][1])
-                edges = out_edges if keep_programmatic_edges and not isinstance(binding.nodes[-1], OpaqueMemset) else None
+                edges = out_edges if keep_programmatic_edges and isinstance(binding.nodes[-1], OpaqueKernel) else None
                 _check_cuda_bindings(driver.cuGraphAddDependencies(clone, [last] * len(out), out, edges, len(out)))
         flags = driver.CUgraphInstantiate_flags
         exec_ = _check_cuda_bindings(

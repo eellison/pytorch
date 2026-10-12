@@ -438,7 +438,8 @@ bool HostTraceVariant::set_argument_copies(Frame& frame) {
         run.forms.size() > 1 ? frame.forms[g] : 0;
     for (size_t i = run.first; i < run.stop; ++i) {
       Record& r = records_[i];
-      if (r.kind != Kind::Memcpy) {
+      // an entry's memcpy (a section's, in its piece) is set by its row in patch
+      if (r.kind != Kind::Memcpy || (r.site >= 0 && frame.site_entries[r.site] != 0)) {
         continue;
       }
       // an argument's address is its row's value; another operand keeps the
@@ -550,10 +551,11 @@ void HostTraceVariant::patch_and_replay(Segment& run, Frame& frame) {
       return;
     }
     if (r.kind == Kind::Memcpy) {
-      const std::array<int64_t, 3> held = memcpy_shape(r.copy, v, bases);
+      const MemcpyRow& m = memcpy_row(r, row);
+      const std::array<int64_t, 3> held = memcpy_shape(m, v, bases);
       // a device node holds its operands' addresses; a host one is set every
       // replay (index_users)
-      if (r.held && r.held_row == row && held == r.held_copy && r.copy.kind == cudaMemcpyDeviceToDevice) {
+      if (r.held && r.held_row == row && held == r.held_copy && m.kind == cudaMemcpyDeviceToDevice) {
         return;
       }
       r.held = false;
@@ -564,7 +566,7 @@ void HostTraceVariant::patch_and_replay(Segment& run, Frame& frame) {
           reinterpret_cast<void*>(held[0]),
           reinterpret_cast<const void*>(held[1]),
           static_cast<size_t>(held[2]),
-          r.copy.kind);
+          m.kind);
       if (set == cudaErrorInvalidValue) {
         // an operand of the other kind of memory: the node is unchanged
         (void)cudaGetLastError();

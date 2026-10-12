@@ -30,7 +30,7 @@ from torch.cuda._host_trace import declined
 from torch.cuda._host_trace_capture import launch_images, launch_slots
 from torch.cuda._host_trace_launch import KernelLaunch
 from torch.cuda._host_trace_lower_tape import FoldRefused, LoweredMemcpy, LoweredMemset
-from torch.cuda._host_trace_memory import _AFTER, _layout, MemoryPlan, place, StepMemory
+from torch.cuda._host_trace_memory import _AFTER, _layout, check_plan, check_section, MemoryPlan, place, StepMemory
 from torch.cuda._host_trace_program import compile_program, IntegerProgram
 from torch.cuda._host_trace_replay import _exact_class, Handback
 from torch.cuda._host_trace_tape import argument_contract, current_trace, EagerCall, trace, TrustedInputs
@@ -324,6 +324,23 @@ def tactic_add(x):
     n = x.numel()
     _add[(triton.cdiv(n, B),)](x, y, n, 1, B=B)
     return y
+
+
+# module state a custom op's body reads (vLLM's layer.kv_cache): the step swaps its argument in while it runs
+_MODULE_STATE: dict[str, torch.Tensor] = {}
+
+
+@torch.library.custom_op("host_trace_test::reads_module_state", mutates_args=("out",))
+def reads_module_state(q: torch.Tensor, out: torch.Tensor) -> None:
+    kv = _MODULE_STATE["kv"]
+    # an op-owned host branch with the same kernels on both sides
+    q2 = q.reshape(1, -1).view(q.shape) if q.shape[0] == 1 else q
+    torch.add(q2, kv[: q.shape[0]], out=out)
+
+
+@reads_module_state.register_fake
+def _(q, out):
+    return None
 
 
 @torch.library.custom_op("host_trace_test::tactic_op", mutates_args=())
@@ -718,7 +735,7 @@ class TestHostTraceReplay(TestCase):
 
     def test_a_redo_takes_a_dispatch_whose_guards_hold(self):
         # a redo takes a dispatch of the same reads whose guards hold at it: (2, 3000)'s redispatch and (1, 2016)'s
-        # dispatch one softmax for the four layers, (1, 1568)'s none; (1, 1000) traces (the sum dispatches otherwise)
+        # dispatch one softmax for the four layers, (1, 1568)'s none; (1, 1000)'s sums are sections (split reductions)
         def fn(q, page_table, kv, *ws):
             k = kv[page_table].flatten(1, 2)
             for w in ws:
@@ -742,8 +759,7 @@ class TestHostTraceReplay(TestCase):
                 del softmaxes[:]
                 self.assertEqual(f(*args), fn(*args), atol=0, rtol=0)
                 counts.append(sum(softmaxes))
-        self.assertEqual((counts, f.traces, f.redispatches), ([4, 1, 4, 1, 0], 2, 3))
-        self.assertEqual([c[:2] for c in f.retrace_causes], [("dispatch", "aten.sum.dim_IntList")])
+        self.assertEqual((counts, f.traces, f.redispatches, f.sections, f.retrace_causes), ([4, 1, 0, 1, 0], 1, 3, 4, {}))
 
     def test_a_redo_agrees_with_the_variants_layout_under_its_guards(self):
         # at b == 1 the eps add returns [1, 1], the variant [b, 1]: one layout under the redo's guard b == 1
@@ -757,9 +773,11 @@ class TestHostTraceReplay(TestCase):
         self.assertEqual((f.traces, f.redispatches), (1, 1))
 
     @parametrize("adjacent", [False, True])
-    def test_a_split_in_an_op_traces_its_class(self, adjacent):
-        # the op's launches and temporary change with the row count: its class
-        # traces (adjacent: two such ops)
+    def test_a_split_in_an_op_is_a_section(self, adjacent):
+        # the op's launches and temporary change with the row count: each new
+        # class is a section of the one variant, its launches in the op's place
+        # in the graph and its temporary its own (adjacent: two such ops, one
+        # graph form with both)
         def fn(x):
             return add(split_op(split_op(x) if adjacent else add(x)), 1)
 
@@ -767,10 +785,167 @@ class TestHostTraceReplay(TestCase):
         for m in (8, 40, 100, 12, 50, 128, 3, 64, 65):
             x = torch.randn(m, 64, device="cuda")
             self.assertEqual(f(x), fn(x), atol=0, rtol=0)
-        self.assertEqual((f.traces, len(f.variants), f.replays, f.eager), (3, 3, 6, 0))
-        # each new class's trace: split_op's own guards fail and its redispatch refuses
-        self.assertEqual([c[0] for c, n in f.retrace_causes.items() for _ in range(n)], ["dispatch"] * 2)
-        self.assertEqual({c[1] for c in f.retrace_causes}, {"host_trace_test.split_op.default"})
+        ops = 2 if adjacent else 1
+        self.assertEqual((f.traces, len(f.variants), f.replays, f.eager), (1, 1, 8, 0))
+        self.assertEqual((f.redispatches, f.sections, f.retrace_causes), (2, 2 * ops, {}))
+        (v,) = f.variants
+        check_plan(v.captured.lowered, v.memory)
+
+    def test_a_split_reduction_is_a_section(self):
+        # sum's split reduction at many rows (a memset and a kernel through a
+        # staging buffer and semaphores, for one kernel) replaces the variant's
+        # sum in its graph, its temporaries sized at the call: no trace
+        def fn(x):
+            return (x * 2).sum(0) + 1
+
+        f = HostTraceReplay(fn)
+        for t in (100, 300, 5000, 6000, 100, 5000):
+            x = torch.randn(t, 64, device="cuda")
+            self.assertEqual(f(x), fn(x), atol=0, rtol=0)
+        self.assertEqual((f.traces, f.redispatches, f.sections, f.eager, f.retrace_causes), (1, 1, 1, 0, {}))
+        self.assertGreater(f.section_bytes, 0)
+        (v,) = f.variants
+        check_plan(v.captured.lowered, v.memory)
+
+    @parametrize("resolves", [True, False])
+    def test_a_redo_of_a_body_reading_module_state(self, resolves):
+        # the op's body reads its kv from module state, the step's argument only while the step runs: a redo (at the
+        # q.shape[0] == 1 flip) resolves the real kv to that argument by storage and view with redo_resolves_arguments;
+        # without it the body declines (the redo's op is an eager step) and the call traces again, counted
+        def step(kv, q):
+            saved, _MODULE_STATE["kv"] = _MODULE_STATE.get("kv"), kv
+            try:
+                out = torch.empty_like(q)
+                torch.ops.host_trace_test.reads_module_state(q, out)
+                return out * 1
+            finally:
+                _MODULE_STATE["kv"] = saved
+
+        kv = torch.randn(64, 8, device="cuda")
+        _MODULE_STATE["kv"] = kv
+        f = HostTraceReplay(step)
+        with mock.patch.object(torch.cuda._host_trace, "redo_resolves_arguments", resolves):
+            for n in (4, 1, 6, 1):
+                q = torch.randn(n, 8, device="cuda")
+                self.assertEqual(f(kv, q), step(kv, q), atol=0, rtol=0)
+        if resolves:
+            self.assertEqual((f.traces, f.redispatches, f.retrace_causes), (1, 1, {}))
+        else:
+            self.assertEqual((f.traces, f.redispatches), (2, 0))
+            ((cause, n),) = f.retrace_causes.items()
+            self.assertEqual((cause[0], cause[1], n), ("dispatch", "host_trace_test.reads_module_state.default", 1))
+            self.assertEqual(cause[4], "host_trace_test.reads_module_state.default dispatches otherwise")
+
+    @parametrize("first", [4, 1])
+    def test_a_copy_that_becomes_a_memcpy_is_a_section(self, first):
+        # copy_'s host takes a memcpy where the strided source is contiguous
+        # (one row) and a copy kernel otherwise: whichever the variant traced,
+        # the other is a section of it, its node a memcpy or a kernel
+        def fn(x, out):
+            out[: x.shape[0]].copy_(x[:, 0])
+            return out * 2
+
+        out, ref = torch.zeros(64, device="cuda"), torch.zeros(64, device="cuda")
+        f = HostTraceReplay(fn)
+        for n in (first, 5 - first, 6, 1, 4, 1):
+            x = torch.randn(n, 8, device="cuda")
+            self.assertEqual(f(x, out), fn(x, ref), atol=0, rtol=0)
+        self.assertEqual((f.traces, f.redispatches, f.sections, f.eager, f.retrace_causes), (1, 1, 1, 0, {}))
+        (v,) = f.variants
+        check_plan(v.captured.lowered, v.memory)
+
+    def test_layers_share_a_redo_template(self):
+        # every layer's ops redispatch at the same call: the first layer's redo
+        # is a template the others take with their own roots (verify mode, on in
+        # the suites, redoes each in full too and compares the entries)
+        layers = 6
+        ws = [torch.randn(64, 64, device="cuda") / 8 for _ in range(layers)]
+
+        def fn(q, *ws):
+            for w in ws:
+                q = q + torch.softmax(q * torch.rsqrt(q.pow(2).mean(-1, keepdim=True) + 1e-6), -1) @ w
+            return q
+
+        f = HostTraceReplay(fn)
+        for b in (2, 3, 1, 5):
+            q = torch.randn(b, 64, device="cuda")
+            self.assertEqual(f(q, *ws), fn(q, *ws), atol=0, rtol=0)
+        self.assertEqual((f.traces, f.eager), (1, 0))
+        self.assertGreater(f.redispatches, 0)
+        # a redo per distinct read (the first layer reads an argument, the
+        # others the layer before's output): layers 3..6 instantiate the second
+        self.assertGreater(f.redos, 0)
+        self.assertGreaterEqual(f.redo_instances, 2 * f.redos)
+
+    def test_ops_reading_one_argument_share_a_redo_template_past_its_alignment(self):
+        # four ops launch on x and specialize on its 16-byte alignment (a guard on x's root): the redo template pins
+        # x, so at the tactic flip the other three take the first's entry on the same root (verify mode, on in the
+        # suites, redoes each in full too and compares)
+        def fn(x):
+            return tuple(tactic_op(x) for _ in range(4))
+
+        f = HostTraceReplay(fn)
+        for m in (8, 24, 8, 24):
+            x = torch.randn(m, 64, device="cuda")
+            self.assertEqual(f(x), fn(x), atol=0, rtol=0)
+        self.assertEqual((f.traces, f.redispatches, f.redos, f.redo_instances), (1, 1, 1, 3))
+        (v,) = f.variants
+        self.assertTrue(all(t.pinned for t in v.captured.lowered.lowering.templates.values()))
+
+    def test_a_redo_template_is_not_shared_across_a_constant_or_layout(self):
+        # four sums flip to the split reduction at once: two read the same (a
+        # template), keepdim (another constant) and a transposed input (another
+        # layout) are redone in full
+        def fn(x):
+            return (x * 2).sum(0) + (x * 3).sum(0) + (x * 4).sum(0, keepdim=True)[0] + (x * 5).t().sum(1)
+
+        f = HostTraceReplay(fn)
+        for t in (100, 300, 5000, 6000):
+            x = torch.randn(t, 64, device="cuda")
+            self.assertEqual(f(x), fn(x), atol=0, rtol=0)
+        self.assertEqual((f.traces, f.redispatches, f.redos, f.redo_instances, f.eager), (1, 1, 3, 1, 0))
+
+    def test_a_section_needs_its_roots_live_over_its_op(self):
+        # a plan that frees the sum's input within the sum's launches would let
+        # a section's temporary or output take its bytes there: refused
+        def fn(x):
+            return (x * 2).sum(0) + 1
+
+        seen = []
+
+        def check(*args):
+            seen.append(args)
+            return check_section(*args)
+
+        f = HostTraceReplay(fn, memory="eager")
+        with mock.patch.object(_host_trace_replay, "check_section", check):
+            for t in (100, 5000):
+                x = torch.randn(t, 64, device="cuda")
+                self.assertEqual(f(x), fn(x), atol=0, rtol=0)
+        ((lowered, plan, nodes, launches, temporaries, drops),) = seen
+        self.assertIsNone(check_section(lowered, plan, nodes, launches, temporaries, drops))
+        # mul's output, the sum's input: a temporary of the run, freed at its seq instead
+        first = lowered.launches[nodes[0]].seq
+        steps = [dataclasses.replace(m, temporaries=tuple((k, seq, seq if last >= first else last) for k, seq, last in m.temporaries)) for m in plan.steps]
+        self.assertNotEqual(steps, list(plan.steps))
+        why = check_section(lowered, dataclasses.replace(plan, steps=tuple(steps)), nodes, launches, temporaries, drops)
+        self.assertRegex(why, "is not live over its op's launches")
+
+    def test_a_section_traces_again_where_the_native_replay_takes_none(self):
+        # a replay whose native variant takes no section entries (the frozen
+        # binary's): the split's class traces, the refusal its retrace cause
+        def fn(x):
+            return (x * 2).sum(0) + 1
+
+        f = HostTraceReplay(fn)
+        with mock.patch.object(torch._C, "_host_trace_section_entries", False, create=True):
+            for t in (100, 5000):
+                x = torch.randn(t, 64, device="cuda")
+                self.assertEqual(f(x), fn(x), atol=0, rtol=0)
+        self.assertEqual((f.traces, f.redispatches, f.sections), (2, 0, 0))
+        ((cause, n),) = f.retrace_causes.items()
+        self.assertEqual((cause[0], cause[1], n), ("dispatch", "aten.sum.dim_IntList", 1))
+        self.assertRegex(cause[4], "the native replay takes no section entries")
 
     def test_a_retrace_records_a_guard_no_op_recorded(self):
         # fn's own branch on a size is a graph guard of no op's: a call where it fails traces again
@@ -787,11 +962,11 @@ class TestHostTraceReplay(TestCase):
         self.assertEqual((f.traces, sum(f.retrace_causes.values())), (2, 1))
 
     def test_a_refused_redispatch_tries_the_refusing_op_first(self):
-        # the split op refuses at every new class: once it has refused for a
+        # the enqueuing op refuses past 32 rows: once it has refused for a
         # variant, its redispatch tries it before the tactic op, so a refusal
         # again dispatches nothing else
         def fn(x, y):
-            return tactic_op(x), split_op(y)
+            return tactic_op(x), enqueues_past_32(y)
 
         redone = []
         redo = torch.cuda._host_trace_redispatch._redo
@@ -800,8 +975,8 @@ class TestHostTraceReplay(TestCase):
             for m, k in ((8, 8), (20, 40), (40, 100), (60, 20)):
                 x, y = torch.randn(m, 64, device="cuda"), torch.randn(k, 64, device="cuda")
                 self.assertEqual(f(x, y), fn(x, y), atol=0, rtol=0)
-        self.assertEqual((f.traces, f.redispatches, sum(f.redispatch_refusals.values())), (3, 1, 4))
-        self.assertEqual(redone, [0, 1, 1, 0, 1, 1, 0])
+        self.assertEqual((f.traces, f.redispatches, sum(f.redispatch_refusals.values())), (3, 1, 2))
+        self.assertEqual(redone, [0, 1, 1, 1, 0])
 
     def test_a_redispatch_refusal_names_its_op(self):
         # the redispatch's redos share one capture: the op that enqueues a
@@ -1157,9 +1332,9 @@ class TestHostTraceReplay(TestCase):
             x = torch.randn(n, device="cuda")
             want = x + (3 if n % 16 == 0 else 6)
             self.assertEqual(f(x, n, 3), want)
-        # B (next_power_of_2) and EVEN select the variants
-        self.assertEqual(f.traces, 4)
-        self.assertEqual(f.eager, 0)
+        # B (next_power_of_2) and EVEN (a SymBool constexpr) select the
+        # launch's entries: one trace, a redispatch per other class
+        self.assertEqual((f.traces, f.redispatches, f.eager), (1, 3, 0))
 
     def test_families_by_contract(self):
         f = HostTraceReplay(add)
@@ -3569,6 +3744,33 @@ class TestStaticPrefix(TestCase):
             self.assertEqual(f(x), x + 4)
         self.assertEqual((f.replays, f.static_hits), (2, 0))
 
+    def test_a_static_hit_after_another_variants_miss(self):
+        # registration order: a call at the second size misses in the first
+        # variant from its kept rows, then hits in the second from its own;
+        # each variant's kept rows stay its own
+        def grows(w, x):
+            y = add(x @ w)
+            for _ in range(x.shape[0] // 8):
+                y = add(y, 1)
+            return y
+
+        w = torch.randn(64, 64, device="cuda")
+        torch._C._host_trace_variant_order(False)
+        try:
+            f = HostTraceReplay(grows, static_prefix=1)
+            for m in (8, 16) * 3:
+                x = torch.randn(m, 64, device="cuda")
+                self.assertEqual(f(w, x), grows(w, x), atol=0, rtol=0)
+            self.assertEqual(len(f.variants), 2)
+            hits = f.static_hits
+            sizes = (16, 8, 16, 16, 8, 8)
+            for m in sizes:
+                x = torch.randn(m, 64, device="cuda")
+                self.assertEqual(f(w, x), grows(w, x), atol=0, rtol=0)
+            self.assertEqual(f.static_hits, hits + len(sizes))
+        finally:
+            torch._C._host_trace_variant_order(True)
+
     def test_alternating_sizes_try_the_variant_that_served_them(self):
         # one family, a variant per size; each call tries the variant that
         # last served its sizes first, so no evaluate misses
@@ -4327,6 +4529,7 @@ def setUpModule():
     import torch.cuda._host_trace_capture as capture
 
     _host_trace_hint_audit.enable_for_tests()
+    torch.cuda._host_trace.verify_redo_templates = True
     capture.raise_trace_disagreements = True
     torch.cuda._host_trace.raise_unexpected = True
 

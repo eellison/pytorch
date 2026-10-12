@@ -1323,12 +1323,12 @@ class TestHostTraceAten(TestCase):
     def test_minmax_replays_new_sizes_in_one_trace(self, case):
         # a new size re-dispatches the traced reduction with patched launch
         # parameters; a full reduction's switch to a global one (129 x 4096) is
-        # another launch topology: a second trace
+        # another launch chain: a section, its staging buffer and semaphores its own
         fn, args_fn = HOSTS[case]
         entry = HostTraceReplay(fn)
         for m, h in ((64, 768), (2, 768), (37, 96), (129, 4096), (9, 1500), (300, 32)):
             self._assert_replays_eager_calls(entry, fn, args_fn(m, h, torch.float32))
-        self.assertEqual((entry.traces, entry.eager), (1 + int(case.endswith("_all")), 0))
+        self.assertEqual((entry.traces, entry.sections, entry.eager), (1, int(case.endswith("_all")), 0))
 
     def test_symbolic_repeat_replays_new_sizes_in_one_trace(self):
         fn, args_fn = HOSTS["repeat_symbolic"]
@@ -1600,15 +1600,21 @@ class TestHostTraceAten(TestCase):
                 self.assertEqual(entry(x, w), fn(x, w), atol=0, rtol=0)
         self.assertEqual((entry.traces, entry.relowers, entry.learned, entry.eager), (1, 0, 7, 0) if oob else (1, 1, 3, 0))
 
-    def test_fold_refuses_another_launch_chain(self):
-        # layer_norm is one vectorized kernel at h % 4 == 0, else two: a second
-        # trace the fold refuses
+    @parametrize("sections", [True, False])
+    def test_another_launch_chain_is_a_section(self, sections):
+        # layer_norm is one vectorized kernel at h % 4 == 0, else two: a section
+        # of the variant, or where the native replay takes none, a second trace
+        # the fold refuses
         fn = NORMS["layer_norm_no_affine"][0](None)
         entry = HostTraceReplay(fn)
-        for h in (768, 767, 768, 767):
-            self._assert_norm_replays_like_eager(entry, fn, _norm_inputs("layer_norm_no_affine", 64, h, torch.float32))
-        self.assertEqual((entry.traces, entry.folds, len(entry.variants), entry.eager), (2, 0, 2, 0))
-        self.assertEqual(list(entry.fold_refusals), ["another op sequence"])
+        with mock.patch.object(torch._C, "_host_trace_section_entries", sections, create=True):
+            for h in (768, 767, 768, 767):
+                self._assert_norm_replays_like_eager(entry, fn, _norm_inputs("layer_norm_no_affine", 64, h, torch.float32))
+        if sections:
+            self.assertEqual((entry.traces, entry.redispatches, entry.sections, len(entry.variants), entry.eager), (1, 1, 1, 1, 0))
+        else:
+            self.assertEqual((entry.traces, entry.folds, len(entry.variants), entry.eager), (2, 0, 2, 0))
+            self.assertEqual(list(entry.fold_refusals), ["another op sequence"])
 
     @unittest.skipIf(not PLATFORM_SUPPORTS_FLASH_ATTENTION, "requires flash attention")
     def test_default_sdpa_scale(self):
@@ -1629,6 +1635,7 @@ def setUpModule():
     from torch.cuda import _host_trace_hint_audit
 
     _host_trace_hint_audit.enable_for_tests()
+    torch.cuda._host_trace.verify_redo_templates = True
 
 
 if __name__ == "__main__":

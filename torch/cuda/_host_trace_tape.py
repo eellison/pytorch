@@ -222,6 +222,9 @@ class OpRec:
     # the op's dispatch alone, redo(args, kwargs), in current_trace(): its
     # host again at other metadata (_host_trace_redispatch)
     redo: Callable[[tuple, dict], Any] | None = None
+    # an op "other" only for its opaque calls: the guards it recorded, graph-level until every one of those calls
+    # binds as a keyed site (bind_opaque), then owned as a traced op's (shared_op_guards' owner sets); else None
+    held: tuple[int, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -358,6 +361,8 @@ class _Trace:
         # fn's own operator calls in order, as the warm-up's (_order_key)
         self.order: list[tuple] = []
         self.depth = 0  # of _TraceMode dispatches
+        # a redo's resolution of a plain tensor to an argument's stand-in (redo_resolves_arguments), or None
+        self.resolve: Callable[[torch.Tensor], torch.Tensor] | None = None
         self.sites: list[KeyedSite] = []  # the calls bound at trace time
         # the CPU tensors the host's steps write, by storage: the trace's own,
         # each step writing them again at a replay
@@ -807,13 +812,17 @@ class _Trace:
             if isinstance(t, _TracedTensor):
                 torch._C._cuda_hostTraceRefreshContiguous(t)
         records = [rec for _, rec in self.launches[first[0] :]]
-        kind = "other"
-        if len(self.sites) == first[2]:
-            if not any(isinstance(rec, EagerCall) for rec in records):
-                kind = "traced"
-            elif len(records) == 1 and type(records[0]) is EagerCall and not records[0].host:
-                kind = "eager"
-        if kind == "other":
+        kind, held = "other", None
+        if not any(isinstance(rec, EagerCall) for rec in records):
+            # a keyed site's nodes are launches too: the op's other launches are its selector's
+            kind = "traced"
+        elif len(self.sites) == first[2] and len(records) == 1 and type(records[0]) is EagerCall and not records[0].host:
+            kind = "eager"
+        if kind == "other" and env.owner_sets is not None and all(type(rec) is OpaqueCall for rec in records if isinstance(rec, EagerCall)):
+            # only its opaque calls make it "other": its guards are graph-level (OpRec.held) until each binds as a keyed site
+            env.owners[guards:] = [None if o == k else o for o in env.owners[guards:]]
+            held = tuple(i for i in range(guards, len(env.owners)) if k in env.owner_sets[i])
+        elif kind == "other":
             _to_graph(env, guards, k)
         elif kind == "eager" and not host:
             env.owners[guards:] = [k] * (len(env.owners) - guards)
@@ -821,7 +830,7 @@ class _Trace:
                 env.owner_sets[guards:] = [{k} for _ in env.owner_sets[guards:]]
         outputs = tuple(o for o in pytree.tree_leaves(out) if isinstance(o, (torch.Tensor, int, torch.SymInt)))
         spans = (range(first[0], len(self.launches)), range(first[1], len(self.allocs)))
-        self.ops.append(OpRec(func, (args, kwargs), *spans, outputs, kind, redo=redo))
+        self.ops.append(OpRec(func, (args, kwargs), *spans, outputs, kind, redo=redo, held=held))
         return out
 
     def _eager_call(self, func: Any, args: tuple, kwargs: dict) -> Any:
@@ -1393,7 +1402,7 @@ class _Trace:
         traced: dict[int, tuple[torch.Tensor, _TracedTensor]] = {}  # by id, each stand-in and its tensor
 
         def stand_in(t: _TracedTensor) -> torch.Tensor:
-            s = _stand_in(t)
+            s = _stand_in(self, t)
             traced[id(s)] = (s, t)
             return s
 
@@ -2767,6 +2776,8 @@ class _TraceMode(TorchDispatchMode):
         tr = self.trace
         if current_trace() is not tr:
             raise tr.decline(f"{func} on a thread other than the trace's")
+        if tr.resolve is not None:
+            args, kwargs = pytree.tree_map_only(torch.Tensor, tr.resolve, (args, kwargs))
         if func is aten.is_non_overlapping_and_dense.default:
             return _is_non_overlapping_and_dense(args[0], tr.values)
         if tr.depth:
@@ -3593,8 +3604,9 @@ class Tape:
         sets = tr.shape_env.owner_sets
         self.owner_sets = None if sets is None else [frozenset(o) for o in sets]
         self.ops = tr.ops
+        held = {g for op in self.ops for g in op.held or ()}
         for op, guards in zip(self.ops, _owned(self.owners, self.owner_sets, len(self.ops))):
-            op.guards = tuple(guards)
+            op.guards = tuple(g for g in guards if g not in held)
         _hint_audit.freeze(env, self.guard_count)
         # (i, j): arguments i < j, disjoint at the trace, where a step not run
         # eagerly writes one and reads the other. A call where they overlap
@@ -3799,14 +3811,18 @@ def _bind_opaque(
         owner_sets += [{None} for _ in range(added)]
         env.owner_sets[marks:] = [{None} for _ in range(added)]
     launch_start[-1], alloc_start[-1] = len(launches), len(allocs)
+    # an op whose opaque calls all bound is traced, as a trace at their keys records it, and owns its guards
+    traced = {k for k, op in enumerate(tape.ops) if op.held is not None and all(id(rec) in converted for _, rec in tape.launches[op.launches.start : op.launches.stop] if isinstance(rec, EagerCall))}
+    held = {g for k, op in enumerate(tape.ops) if k not in traced for g in op.held or ()}
     ops = []
-    for op, guards in zip(tape.ops, _owned(owners, owner_sets, len(tape.ops))):
+    for k, (op, guards) in enumerate(zip(tape.ops, _owned(owners, owner_sets, len(tape.ops)))):
         call, outputs = pytree.tree_map_only(_TracedTensor, tensor, (op.call, op.outputs))
         # a converted call's fresh allocations are its op's, not the op's before
         own = [range(alloc_start[op.allocs.start], alloc_start[op.allocs.stop - 1] + 1)] if op.allocs else []
         held = [*own, *(made_by[i] for i in op.launches if i in made_by and made_by[i])] or [range(alloc_start[op.allocs.start], alloc_start[op.allocs.start])]
         spans = range(launch_start[op.launches.start], launch_start[op.launches.stop]), range(min(r.start for r in held), max(r.stop for r in held))
-        ops.append(replace(op, call=call, outputs=outputs, launches=spans[0], allocs=spans[1], guards=tuple(guards)))
+        kind, mine = ("traced", None) if k in traced else (op.kind, op.held)
+        ops.append(replace(op, call=call, outputs=outputs, launches=spans[0], allocs=spans[1], guards=tuple(g for g in guards if g not in held), kind=kind, held=mine))
 
     order = {id(a.root): a.seq for a in allocs}
     for s in tape.sites:

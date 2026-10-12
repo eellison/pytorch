@@ -26,6 +26,7 @@ as the compiled one was, or is an EagerCall naming why.
 
 from __future__ import annotations
 
+import ast
 import contextlib
 import dataclasses
 import functools
@@ -50,8 +51,9 @@ from torch.cuda._host_trace import Declined, declined, ProcessHold
 from torch.cuda._host_trace_capture import capture_kernel_nodes, explicit_attributes, KernelNode, pack_params
 from torch.cuda._host_trace_launch import _GRID_LIMITS, _probe_address, KernelLaunch, tma_edits, TmaDescriptor
 from torch.cuda._host_trace_tape import (
-    _hint,
     _PLACEHOLDER_LOW,
+    _placeholder,
+    _sym_key,
     _TracedTensor,
     current_trace,
     EagerCall,
@@ -82,7 +84,7 @@ _EFFECTS = _LAUNCH_ATTRS | {
 }
 # the attributes the interpreter reads, as Python values
 _ATTRS = ("value", "predicate", "mode", "kernel_name", "callee", "num_multicast")
-_PASS = {"cute.get_scalars", "cute.to_int_tuple", "arith.extsi", "arith.index_cast"}
+_PASS = {"cute.get_scalars", "cute.to_int_tuple", "arith.extsi", "arith.index_cast", "cute.inttoptr", "cute.recast_iter"}
 # the ops bit_op evaluates
 _BIT_OPS = {"llvm.intr.ctlz", "arith.extui", "arith.trunci", "arith.shli", "arith.andi", "arith.divui", "arith.floordivsi", "cute.assume"}
 # kernel operands of static types that still have a parameter: a TMA atom's
@@ -95,20 +97,20 @@ _TMA_MAKERS = (
     "cute_nvgpu.atom.make_non_exec_tiled_tma_load",
     "cute_nvgpu.atom.make_non_exec_tiled_tma_store",
 )
-# per TMA format of an atom type, its CUtensorMapDataType and element bytes
+# a TMA atom's format (the DSL's TmaDataFormat) -> (CUtensorMapDataType, element bits)
 _TMA_FORMATS = {
-    "U8": (0, 1),
-    "U16": (1, 2),
-    "U32": (2, 4),
-    "S32": (3, 4),
-    "S64": (5, 8),
-    "F16_RN": (6, 2),
-    "F32_RN": (7, 4),
-    "BF16_RN": (9, 2),
-    "TF32_RN": (11, 4),
+    "U8": (0, 8),
+    "U16": (1, 16),
+    "U32": (2, 32),
+    "S32": (3, 32),
+    "S64": (5, 64),
+    "F16_RN": (6, 16),
+    "F32_RN": (7, 32),
+    "BF16_RN": (9, 16),
+    "TF32_RN": (11, 32),
+    "U4": (13, 4),  # CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B: 4-bit elements packed in shared memory
 }
 # CuTe's layout notation in a cute type's parameters: "(?,(8,?{div=8}))"
-_LEAF_RE = re.compile(r"\(|\)|,|\?(?:\{[^}]*\})?|-?\d+")
 
 
 class _Undescribed(Exception):
@@ -148,12 +150,15 @@ class _Op:
 class _Param:
     """A kernel parameter: `fields` (value, bytes, pointer) packed in order,
     or a CUtensorMap encoded as `tma` (dtype, box, swizzle) over `tma_values`
-    (address, extents, byte strides), or an SM100 MMA atom's `zeros`."""
+    (address, extents, byte strides), or an SM100 MMA atom's `zeros`, or a
+    `stateless` copy atom's (no runtime state: its bytes are whatever the
+    launch left there)."""
 
     fields: list[tuple[Any, int, bool]] = field(default_factory=list)
     tma: tuple[int, tuple[int, ...], int] | None = None
     tma_values: tuple[Any, ...] = ()
     zeros: tuple[Any, ...] = ()
+    stateless: bool = False
 
 
 @dataclass
@@ -171,29 +176,6 @@ class _Launch:
     params: list[_Param]
 
 
-@functools.cache
-def _parse_tuple(s: str) -> Any:
-    """'(?,(8,?{div=8}))' -> ('?', (8, '?{div=8}')): dynamic leaves as their text."""
-    tokens = _LEAF_RE.findall(s)
-    pos = 0
-
-    def parse() -> Any:
-        nonlocal pos
-        tok = tokens[pos]
-        pos += 1
-        if tok != "(":
-            return tok if tok.startswith("?") else int(tok)
-        items = []
-        while tokens[pos] != ")":
-            items.append(parse())
-            if tokens[pos] == ",":
-                pos += 1
-        pos += 1
-        return tuple(items)
-
-    return parse()
-
-
 def _flat(v: Any) -> list[Any]:
     if isinstance(v, (tuple, list)):
         return [x for e in v for x in _flat(e)]
@@ -201,35 +183,217 @@ def _flat(v: Any) -> list[Any]:
 
 
 def _dynamic(leaf: Any) -> bool:
-    return isinstance(leaf, str)
+    # a leaf of a layout or int tuple the DSL evaluated (_evaluate_types): an int, {"dyn": width}, or
+    # a coordinate tensor's static basis stride {"basis": [scale, mode]}
+    return isinstance(leaf, dict) and "dyn" in leaf
 
 
-@functools.cache
-def _static_value(ty: str) -> Any:
-    m = re.fullmatch(r'!cute\.(?:int_tuple|shape|stride)<"(.*)">', ty)
-    if m is not None:
-        v = _parse_tuple(m.group(1))
-        return None if any(map(_dynamic, _flat(v))) else v
-    m = re.fullmatch(r'!cute\.tile<"\[(.*)\]">', ty)
-    if m is not None and "?" not in m.group(1):
-        return tuple(int(x.split(":")[0]) for x in m.group(1).split(";"))
-    m = re.fullmatch(r'!cute\.tile<"(\d+):\d+">', ty)
-    return None if m is None else int(m.group(1))
+def _tuples(x: Any) -> Any:
+    # a descriptor's nested lists (JSON) as tuples
+    return tuple(map(_tuples, x)) if isinstance(x, list) else x
 
 
-@functools.cache
-def _memref_pattern(ty: str) -> tuple[Any, Any]:
-    m = re.search(r'"(.*):(.*)"', ty)
-    if m is None:
-        raise _Undescribed(f"a memref of layout {ty}")
-    return _parse_tuple(m.group(1)), _parse_tuple(m.group(2))
+def _evaluate_types(module: Any, name: str) -> dict[str, Any]:
+    """Each layout-like type of the host function `name` (a memref's, a layout's, a coordinate
+    tensor's layout, an int tuple, shape or stride, a tile) as the DSL's own layout algebra
+    evaluates it, in a copy of the module so the live one is untouched: {"tuple": t}, {"layout":
+    [shape, stride]} or {"tile": [layout per mode]}, each leaf an int or {"dyn": width}; a type it
+    cannot evaluate is {"error": why}; a pointer type is {"ptr": {"align": bytes, "gmem": bool}}.
+    The leaves come from the DSL's get_leaves of each value (unpack_x_tuple is only ever given
+    those)."""
+    from cutlass import Integer
+    from cutlass._mlir import ir
+    from cutlass._mlir._mlir_libs._cutlass_ir import _cute, _cute_nvgpu
+    from cutlass._mlir.dialects import cute_nvgpu as nv
+    from cutlass._mlir.dialects import cute as cute_ir
+    from cutlass.cute import AddressSpace, core
+
+    copy = ir.Module.parse(module.operation.get_asm(print_generic_op_form=True), module.context)
+    fn = next(o.operation for o in copy.body.operations if o.operation.name == "func.func" and o.operation.attributes["sym_name"].value == name)
+    entry = fn.regions[0].blocks[0]
+    # (values, index, type) of each block argument and result: a value is only taken (which runs the
+    # DSL's caster for its type) where its type is one evaluated here, never an atom's or a copy's
+    found: list[tuple[Any, int, Any]] = [(entry.arguments, i, t) for i, t in enumerate(entry.arguments.types)]
+
+    tmas: list[Any] = []  # the TMA atoms' makers
+
+    def walk(block: Any) -> None:
+        for op in block.operations:
+            results = op.operation.results
+            found.extend((results, i, t) for i, t in enumerate(results.types))
+            if op.operation.name in _TMA_MAKERS:
+                tmas.append(op.operation)
+            for region in op.operation.regions:
+                for b in region.blocks:
+                    walk(b)
+
+    walk(entry)
+    kinds = (_cute.MemRefType, _cute.CoordTensorType, _cute.LayoutType, _cute.IntTupleType, _cute.ShapeType, _cute.StrideType, _cute.TileType, _cute.PtrType, _cute.CoordType, _cute.ComposedLayoutType)
+
+    def leaf(x: Any) -> Any:
+        if type(x) is int or x is None:  # None: a coordinate's "_"
+            return x
+        if isinstance(x, Integer) and x.width in (32, 64):
+            return {"dyn": x.width}
+        if isinstance(x, core.ScaledBasis):
+            # its scale an int, or a Ratio as [numerator, denominator] (a sub-byte recast's 1/2@0)
+            s = x.value
+            if type(s) is int:
+                return {"basis": [s, x.mode]}
+            if isinstance(s, core._Ratio):
+                return {"basis": [[s.numerator, s.denominator], x.mode]}
+        raise TypeError(f"a leaf {x!r}")
+
+    def tree(x: Any) -> Any:
+        return [tree(e) for e in x] if isinstance(x, tuple) else leaf(x)
+
+    def tile_mode(m: Any) -> Any:
+        # a layout's [shape, stride]; None for "_" (the mode untiled); a nested tile's modes as {"tile": [...]}
+        if m is None:
+            return None
+        if isinstance(m, tuple):
+            return {"tile": [tile_mode(e) for e in m]}
+        return [tree(m.shape), tree(m.stride)]
+
+    def tma_box(op: Any, fmt: str) -> list[int]:
+        # CuTe's construct_tma_gbasis: the smem index -> gmem mode map (the CTA value map composed
+        # with the right inverse of the smem layout's non-swizzle portion, coalesced, by the DSL),
+        # up to its first mode of a scale other than 1; through the gmem strides in TMA elements,
+        # coalesced to modes of at most 256; then a size-1 mode per gmem mode it leaves out
+        def value(v: Any) -> Any:
+            return v if isinstance(v, ir.Value) else v.value
+
+        memref, smem, vmap = (value(op.operands[i]) for i in range(3))
+        if _cute.ComposedLayoutType.isinstance(smem.type):
+            smem = value(cute_ir.composed_get_outer(smem))
+        shape, stride = layout(value(cute_ir.coalesce(value(cute_ir.composition(vmap, value(cute_ir.right_inverse(smem)))))))
+        shape, stride = (shape, stride) if isinstance(shape, list) else ([shape], [stride])
+        gshape, gstride = layout(value(cute_ir.get_layout(memref)))
+        leaf_of: dict[tuple[int, ...], int] = {}
+
+        def index(t: Any, path: tuple[int, ...]) -> None:
+            if isinstance(t, list):
+                for i, e in enumerate(t):
+                    index(e, (*path, i))
+            else:
+                leaf_of[path] = len(leaf_of)
+
+        index(gshape, ())
+        flat_shape, flat_stride = flatten(gshape), flatten(gstride)
+        gbits, tbits = _cute.MemRefType(memref.type).value_type.width, _TMA_FORMATS[fmt][1]
+        modes, covered = [], set()
+        for n, e in zip(shape, stride):
+            if not (isinstance(n, int) and isinstance(e, dict) and "basis" in e and e["basis"][0] == 1):
+                break
+            j = leaf_of[tuple(e["basis"][1])]
+            covered.add(j)
+            d = flat_stride[j]
+            # recast to TMA elements: an upcast divides the contiguous mode's size, the others' strides
+            if tbits != gbits:
+                r = tbits // gbits
+                if tbits % gbits or (d == 1 and n % r):
+                    raise ValueError(f"a TMA recast of {gbits}-bit elements to {tbits}")
+                n, d = (n // r, 1) if d == 1 else (n, d // r if isinstance(d, int) and d % r == 0 else {"dyn": 0})
+            modes.append((n, d))
+        if not modes:
+            raise ValueError("no smem-contiguous TMA mode")
+        box: list[tuple[int, Any]] = []
+        for n, d in modes:
+            if n == 1:
+                continue
+            if box and isinstance(d, int) and isinstance(box[-1][1], int) and box[-1][0] * box[-1][1] == d and n * box[-1][0] <= 256:
+                box[-1] = (n * box[-1][0], box[-1][1])
+            elif box and box[-1][0] == 1:
+                box[-1] = (n, d)
+            else:
+                box.append((n, d))
+        sizes = [n for n, _ in box] + [1 for j, (n, d) in enumerate(zip(flat_shape, flat_stride)) if j not in covered and n != 1 and d != 0]
+        # TMA's rank limit: the trailing modes grouped
+        return sizes if len(sizes) <= 5 else [*sizes[:4], math.prod(sizes[4:])]
+
+    def flatten(t: Any) -> list[Any]:
+        return [x for e in t for x in flatten(e)] if isinstance(t, list) else [t]
+
+    def layout(raw: Any) -> list:
+        return [tree(core._unpack_x_tuple(cute_ir.get_shape(raw))), tree(core._unpack_x_tuple(cute_ir.get_stride(raw)))]
+
+    out: dict[str, Any] = {}
+    # a copy atom whose instances hold no runtime state: a kernel parameter of no meaningful bytes
+    stateless = (
+        _cute_nvgpu.CopyAtomG2RType,
+        _cute_nvgpu.CopyAtomR2GType,
+        _cute_nvgpu.CopyAtomS2RType,
+        _cute_nvgpu.CopyAtomR2SType,
+        _cute_nvgpu.CopyAtomSIMTSyncCopyType,
+        _cute_nvgpu.CopyAtomSIMTAsyncCopyType,
+        _cute_nvgpu.CopyAtomLdsmType,
+        _cute_nvgpu.CopyAtomStsmType,
+    )
+    # a 32-bit fast divmod divisor (no accessor: compared with the DSL's own type; the power-of-2 one is not)
+    divisor32 = _cute.FastDivmodDivisorType.get(32, False, context=module.context)
+    for _, _, t in found:
+        if any(k.isinstance(t) for k in stateless):
+            out[str(t)] = {"atom": "stateless_copy"}
+        elif t == divisor32:
+            out[str(t)] = {"fast_divmod": 32}
+    for op in tmas:
+        # its format: the maker's tma_format attribute, else the DSL's default for its value type
+        # (the attribute has no accessor: it is compared with each format's attribute)
+        t = op.results.types[0]
+        kind = next((k for k in (_cute_nvgpu.CopyAtomNonExecTiledTmaLoadType, _cute_nvgpu.CopyAtomNonExecTiledTmaStoreType) if k.isinstance(t)), None)
+        if kind is None:
+            out[str(t)] = {"error": "a TMA atom of another kind"}
+            continue
+        if "tma_format" in op.attributes:
+            given = op.attributes["tma_format"]
+            fmt = next((f for f in nv.TmaDataFormat if given == ir.Attribute.parse(f"#cute_nvgpu.tma_data_format<{f}>", module.context)), None)
+        else:
+            fmt = nv.TmaDataFormat(_cute_nvgpu.get_default_tma_format(kind(t).value_type, False))
+        out[str(t)] = {"tma": {"format": None if fmt is None else str(fmt)}}
+    with ir.InsertionPoint(list(entry.operations)[-1]), ir.Location.unknown(module.context):
+        for container, i, t in found:
+            key = str(t)
+            if key in out or not any(kind.isinstance(t) for kind in kinds):
+                continue
+            try:
+                if _cute.PtrType.isinstance(t):
+                    # from the type alone: no value is taken
+                    ptr = _cute.PtrType(t)
+                    out[key] = {"ptr": {"align": ptr.alignment or 1, "gmem": ptr.address_space == AddressSpace.gmem.value}}
+                    continue
+                v = container[i]
+                raw = v if isinstance(v, ir.Value) else v.value
+                if _cute.MemRefType.isinstance(t):
+                    # its element's bits, and its iterator's alignment (bytes)
+                    align = _cute.PtrType(cute_ir.get_iter(raw).type).alignment
+                    out[key] = {"layout": layout(cute_ir.get_layout(raw)), "bits": _cute.MemRefType(t).value_type.width, "align": align}
+                elif _cute.ComposedLayoutType.isinstance(t):
+                    # a swizzled layout's swizzle (bits, base, shift), the inner function of the composition
+                    inner = cute_ir.composed_get_inner(raw).type
+                    sw = _cute.SwizzleType(inner) if _cute.SwizzleType.isinstance(inner) else None
+                    out[key] = {"composed": {"swizzle": None if sw is None else [sw.num_bits, sw.num_base, sw.num_shift]}}
+                elif _cute.CoordTensorType.isinstance(t):
+                    out[key] = {"layout": layout(cute_ir.get_layout(raw))}
+                elif _cute.LayoutType.isinstance(t):
+                    out[key] = {"layout": layout(raw)}
+                elif _cute.IntTupleType.isinstance(t) or _cute.ShapeType.isinstance(t) or _cute.StrideType.isinstance(t) or _cute.CoordType.isinstance(t):
+                    out[key] = {"tuple": tree(core._unpack_x_tuple(raw))}
+                elif _cute.TileType.isinstance(t):
+                    modes = core._unpack_x_tuple(raw)
+                    single = not isinstance(modes, tuple)
+                    out[key] = {"tile": [tile_mode(m) for m in ((modes,) if single else modes)], "single": single}
+            except Exception as e:
+                out[key] = {"error": f"{type(e).__name__}: {str(e).splitlines()[0] if str(e) else ''}"}
+        for op in tmas:
+            tma = out.get(str(op.results.types[0]), {}).get("tma")
+            if tma is not None:
+                try:
+                    tma["box"] = tma_box(op, tma["format"])
+                except Exception as e:
+                    tma["box"] = {"error": f"{type(e).__name__}: {str(e).splitlines()[0] if str(e) else ''}"}
+    return out
 
 
-@functools.cache
-def _is_runtime(ty: str) -> bool:
-    # kernel formals of fully static types (layouts, swizzles, tiled copies,
-    # MMA atoms) have no parameter
-    return isinstance(ty, _Builtin) or ty.startswith("!cute.memref") or "?" in ty
 
 
 _DUNDERS: dict[str, Callable[[Any, Any], Any]] = {
@@ -246,6 +410,7 @@ _DUNDERS: dict[str, Callable[[Any, Any], Any]] = {
     "ge": operator.ge,
     "sym_max": torch.sym_max,
     "sym_min": torch.sym_min,
+    "lshift": operator.lshift,
 }
 
 
@@ -289,25 +454,22 @@ _BIN: dict[str, Callable[[Any, Any], Any]] = {
     "arith.maxsi": functools.partial(_bin, "sym_max"),
     "arith.minsi": functools.partial(_bin, "sym_min"),
 }
+_FLOAT_BIN: dict[str, Callable[[float, float], float]] = {
+    "arith.addf": operator.add,
+    "arith.subf": operator.sub,
+    "arith.mulf": operator.mul,
+    "arith.divf": operator.truediv,
+}
 # arith.cmpi's signed predicates
 _CMP: dict[int, Callable[[Any, Any], Any]] = {
     k: functools.partial(_bin, m) for k, m in enumerate(("eq", "ne", "lt", "le", "gt", "ge"))
 }
 
 
-@functools.cache
-def _int_widths(ty: str) -> tuple[int, ...] | None:
-    if isinstance(ty, _Builtin) and ty.int_of() and ty.width != 1:
-        return (ty.width,)
-    if (m := re.fullmatch(r'!cute\.int_tuple<"(.*)">', ty)) is not None:
-        return tuple(64 if "i64" in str(x) else 32 for x in _flat(_parse_tuple(m.group(1))))
-    return None
-
-
-def _wrap(ty: str, v: Any, predicates: list[tuple[Any, str]]) -> Any:
-    """An integer result at its type's bit width, two's complement as eager
-    computes it; a traced result predicated in range."""
-    if (widths := _int_widths(ty)) is None:
+def _wrap(widths: tuple[int, ...] | None, v: Any, predicates: list[tuple[Any, str]]) -> Any:
+    """An integer result at its type's bit widths (_Program.widths), two's
+    complement as eager computes it; a traced result predicated in range."""
+    if widths is None:
         return v
     out = []
     for x, bits in zip(_flat(v), widths, strict=True):
@@ -354,10 +516,8 @@ def _require(cond: Any, what: str) -> None:
 
 
 def _pin(v: Any) -> int:
-    h = _hint(v)
-    if not bool(v == h):
-        raise AssertionError(f"host_trace: {v} is not {h}")
-    return int(h)
+    # a guard that returns the value
+    return int(v)
 
 
 class _Program:
@@ -370,11 +530,12 @@ class _Program:
     builtin integer, float, index and integer vector types are ever
     materialized, whose casters only wrap them."""
 
-    def __init__(self, text: str, name: str, spec: list) -> None:
+    def __init__(self, text: str, name: str, spec: list, types: dict[str, Any]) -> None:
         from cutlass._mlir._mlir_libs._cutlass_ir._mlir import ir
 
-        # spec: TVM-FFI's argument spec (_encode_spec), whose checks guard each call
-        self.text, self.name, self.spec = text, name, spec
+        # spec: TVM-FFI's argument spec (_encode_spec), whose checks guard each call; types: each
+        # layout-like type as the DSL evaluated it at the compile (_evaluate_types)
+        self.text, self.name, self.spec, self.types = text, name, spec, types
 
         def type_of(t: Any) -> str:
             if isinstance(t, ir.OpaqueType):
@@ -392,7 +553,7 @@ class _Program:
             return isinstance(t, (ir.OpaqueType, ir.IndexType, ir.IntegerType, ir.FloatType))
 
         def attr(a: Any) -> Any:
-            if isinstance(a, (ir.BoolAttr, ir.IntegerAttr)):
+            if isinstance(a, (ir.BoolAttr, ir.IntegerAttr, ir.FloatAttr)):
                 return a.value
             if isinstance(a, ir.DenseI32ArrayAttr):
                 return tuple(a)
@@ -463,6 +624,48 @@ class _Program:
                 raise _Undescribed("a launch on a stream the call does not pass")
         self.kernels = [op.attrs["callee"][-1] for op in self.launches]
 
+    def described(self, ty: str, kind: str) -> Any:
+        d = self.types.get(ty)
+        if d is None or kind not in d:
+            raise _Undescribed(f"its compile did not evaluate {ty} as a {kind}" + (f": {d['error']}" if d and "error" in d else ""))
+        return _tuples(d[kind])
+
+    def static(self, ty: str) -> Any:
+        """A static int tuple's or coordinate's value, a static layout's ({"shape", "stride"}), or a
+        static tile's (each mode's size); else None."""
+        d = self.types.get(ty, {})
+        if "tuple" in d:
+            v = _tuples(d["tuple"])
+            return v if all(type(x) is int or x is None for x in _flat(v)) else None
+        if "layout" in d and "bits" not in d and not ty.startswith("!cute.coord_tensor"):
+            shape, stride = _tuples(d["layout"])
+            return {"shape": shape, "stride": stride} if all(type(x) is int for x in _flat((shape, stride))) else None
+        elif "tile" in d:
+            modes = _tuples(d["tile"])
+            if not all(isinstance(m, tuple) for m in modes):
+                return None
+            sizes = tuple(shape for shape, _ in modes)
+            v = sizes[0] if d["single"] else sizes
+        else:
+            return None
+        return v if all(type(x) is int for x in _flat(v)) else None
+
+    def widths(self, ty: str) -> tuple[int, ...] | None:
+        if isinstance(ty, _Builtin):
+            return (ty.width,) if ty.int_of() and ty.width != 1 else None
+        if "tuple" not in self.types.get(ty, {}):
+            return None
+        return tuple(x["dyn"] if _dynamic(x) else 32 for x in _flat(_tuples(self.types[ty]["tuple"])))
+
+    def runtime(self, ty: str) -> bool:
+        # a kernel formal of a fully static type (a layout, swizzle, tiled copy, MMA atom) has no parameter
+        if isinstance(ty, _Builtin) or ty.startswith("!cute.memref"):
+            return True
+        d = self.types.get(ty, {})
+        if "ptr" in d:
+            return True
+        return any(_dynamic(x) for kind in ("tuple", "layout", "tile") if kind in d for x in _flat(_tuples(d[kind])))
+
     def evaluate(
         self, bound: tuple[list[Any], list[tuple[Any, str]]], smem: dict[str, int]
     ) -> tuple[list[_Launch], list[tuple[Any, str]]]:
@@ -473,9 +676,10 @@ class _Program:
         return [ev.launch(op) for op in self.launches], ev.predicates
 
 
-def _bind(program: _Program, args: Sequence[Any]) -> tuple[list[Any], list[tuple[Any, str]]]:
-    """Each formal's value: a memref's view, an integer's value, None for a
-    stream; with the compile's specialization of each memref."""
+def _bind(program: _Program, args: Sequence[Any], pointees: dict[int, _Root]) -> tuple[list[Any], list[tuple[Any, str]]]:
+    """Each formal's value: a memref's view, an integer's value, a pointer's
+    address, None for a stream; with the compile's specialization of each
+    memref and pointer. `pointees`: per pointer argument (by id) its root."""
     streams = [i for i, ty in enumerate(program.formals) if ty == "!cuda.stream"]
     if len(args) == len(program.formals):
         passed = list(args)
@@ -493,10 +697,22 @@ def _bind(program: _Program, args: Sequence[Any]) -> tuple[list[Any], list[tuple
         elif ty.startswith("!cute.memref"):
             if not isinstance(a, _TracedTensor):
                 raise _Undescribed(f"memref parameter {i} is passed a {type(a).__name__}")
-            formals.append(_memref(ty, a, f"arg{i}"))
+            formals.append(_memref(program.described(ty, "layout"), a, f"arg{i}"))
         elif isinstance(ty, _Builtin) and ty.int_of(16, 32, 64):
             if type(a) not in (int, torch.SymInt):
                 raise _Undescribed(f"integer parameter {i} is passed a {type(a).__name__}")
+            formals.append(a)
+        elif "ptr" in (ptr := program.types.get(ty, {})):
+            root, align = pointees.get(id(a)), ptr["ptr"]["align"]
+            if root is None or not ptr["ptr"]["gmem"]:
+                raise _Undescribed(f"pointer parameter {i} of type {ty} is passed {a}")
+            # the alignment the compile assumed; an allocation's or eager output's base is 256-byte
+            # aligned, and its symbol no guard's input
+            if root.kind != "argument" and 256 % align:
+                raise _Undescribed(f"pointer parameter {i} assumes {align}-byte alignment")
+            offset = a if root.kind == "argument" else a - root.sym
+            if align > 1:
+                predicates.append((offset % align == 0, f"pointer parameter {i}'s address % {align} == 0"))
             formals.append(a)
         elif isinstance(ty, _Builtin) and ty.kind == "float" and ty.width == 32:
             # a float the trace holds as a constant, as it holds an ATen call's
@@ -508,10 +724,10 @@ def _bind(program: _Program, args: Sequence[Any]) -> tuple[list[Any], list[tuple
     return formals, predicates
 
 
-def _memref(ty: str, t: _TracedTensor, what: str) -> dict[str, Any]:
+def _memref(layout: tuple[Any, Any], t: _TracedTensor, what: str) -> dict[str, Any]:
     # the call's view of the tensor: its sizes and strides nested as the layout's (the spec guards them)
     view: dict[str, Any] = {}
-    for kind, pat, vals in zip(("shape", "stride"), _memref_pattern(ty), (t.shape, t._sym_strides)):
+    for kind, pat, vals in zip(("shape", "stride"), layout, (t.shape, t._sym_strides)):
         leaves = _flat(pat)
         if isinstance(pat, tuple) and len(leaves) != len(pat) or len(leaves) != len(vals):
             raise _Undescribed(f"{what}'s {kind} {pat} is not flat over {len(vals)} dims")
@@ -543,7 +759,7 @@ class _Eval:
         if owner is None:
             return self.formals[i]
         if owner not in self.results:
-            statics = [_static_value(ty) for ty in owner.types]
+            statics = [self.program.static(ty) for ty in owner.types]
             if len(statics) == 1 and statics[0] is not None:
                 self.results[owner] = statics
             else:
@@ -578,23 +794,22 @@ class _Eval:
             vals = [self.operand(yields[0], k) for k in range(len(yields[0].operands))] if yields else []
             return vals[0] if len(vals) == 1 else tuple(vals)
         if n == "arith.constant":
-            return self.attr(op, "value", int)
+            return self.attr(op, "value", (int, float))
         if n == "cute.kernel_smem_size":
             return self.smem[self.attr(op, "kernel_name", tuple)[-1]]
         if n in _TMA_MAKERS:
             # its layouts are static, in its operand types
             return self.tma(op, self.operand(op, 0))
         a = [self.operand(op, k) for k in range(len(op.operands))]
-        if n in _PASS or (n == "cute.make_int_tuple" and len(a) == 1):
-            return _wrap(op.types[0], a[0], self.predicates)
+        if n in _PASS:
+            return _wrap(self.program.widths(op.types[0]), a[0], self.predicates)
         if n in ("vector.from_elements", "cute.make_atom"):
             return tuple(a)  # an atom as its runtime state
         if n == "cute.make_tiled_mma":
             return a[0]
         if n in ("cute.make_shape", "cute.make_stride", "cute.make_int_tuple"):
             # the type's pattern, its dynamic leaves the operands' in order
-            m = re.fullmatch(r'!cute\.\w+<"(.*)">', op.types[0])
-            pat, given = _parse_tuple(m.group(1)), iter(_flat(tuple(a)))
+            pat, given = self.program.described(op.types[0], "tuple"), iter(_flat(tuple(a)))
             if sum(map(_dynamic, _flat(pat))) != len(_flat(tuple(a))):
                 raise _Undescribed(f"{n} of {len(a)} operands into {op.types[0]}")
             return _unflatten(pat, [next(given) if _dynamic(x) else x for x in _flat(pat)])
@@ -611,6 +826,36 @@ class _Eval:
             return {"ptr": a[0], "shape": a[1]["shape"], "stride": a[1]["stride"]}
         if n == "cute.make_layout" and len(a) == 2:
             return {"shape": a[0], "stride": a[1]}
+        if n == "cute.fast_divmod.create_divisor":
+            self.predicates.append((_bin("ge", a[0], 1), "a fast divmod divisor >= 1"))
+            return a[0]
+        if n == "cute.slice":
+            return _slice(a[0], a[1], self.program.types.get(self.operand_type(op, 0), {}).get("bits"))
+        if n == "cute.zipped_divide":
+            return _zipped_divide(a[0], self.program.types.get(self.operand_type(op, 1), {}))
+        if n == "cute.tile_to_shape" and isinstance(a[0], dict):
+            v = _tile_to_shape(a[0], _flat(a[1]), _flat(a[2]))
+            # a leaf the type fixes (a size-1 mode's stride 0) is the type's
+            pat = self.program.described(op.types[0], "layout")
+            got, fixed = _flat(v["shape"]) + _flat(v["stride"]), _flat(pat[0]) + _flat(pat[1])
+            if len(got) != len(fixed):
+                raise _Undescribed(f"{n} into {op.types[0]}")
+            leaves = [y if _dynamic(x) else x for x, y in zip(fixed, got)]
+            k = len(_flat(pat[0]))
+            return {"shape": _unflatten(pat[0], leaves[:k]), "stride": _unflatten(pat[1], leaves[k:])}
+        if n == "cute.make_ordered_layout" or (n == "cute.make_layout" and len(a) == 1):
+            # compact strides taken in the order's mode order (one-operand make_layout's: column-major); a
+            # leaf the type fixes (a size-1 mode's 0) is the type's
+            shape = _flat(a[0])
+            order = _flat(a[1]) if len(a) == 2 else list(range(len(shape)))
+            pat = self.program.described(op.types[0], "layout")
+            if len(order) != len(shape) or not all(type(o) is int for o in order):
+                raise _Undescribed(f"{n} of the order {a[1]}")
+            strides, acc = [0] * len(shape), 1
+            for i in sorted(range(len(shape)), key=lambda i: order[i]):
+                strides[i], acc = acc, _bin("mul", acc, shape[i])
+            fixed = _flat(pat[1])
+            return {"shape": _unflatten(pat[0], shape), "stride": _unflatten(pat[1], [s if _dynamic(x) else x for s, x in zip(strides, fixed)])}
         if n in ("cute.get_shape", "cute.get_stride"):
             return a[0]["shape" if n == "cute.get_shape" else "stride"]
         if n == "cute.select":
@@ -629,7 +874,13 @@ class _Eval:
                 x = x[k]
             return math.prod(_flat(x))
         if n in _BIN:
-            return _wrap(op.types[0], _elementwise(_BIN[n], a[0], a[1]), self.predicates)
+            return _wrap(self.program.widths(op.types[0]), _elementwise(_BIN[n], a[0], a[1]), self.predicates)
+        if n in _FLOAT_BIN:
+            # the call's float scalars are Python floats, never traced
+            if not all(type(x) is float for x in a) or (n == "arith.divf" and a[1] == 0):
+                raise _Undescribed(f"{n} of {a}")
+            r = _FLOAT_BIN[n](a[0], a[1])
+            return struct.unpack("<f", struct.pack("<f", r))[0] if op.types[0].width == 32 else r
         if n in _BIT_OPS:
             return self.bit_op(op, a)
         raise _Undescribed(f"unsupported host op {n}")
@@ -677,10 +928,11 @@ class _Eval:
             raise _Undescribed(f"{n} over {[self.operand_type(op, k) for k in range(len(a))]}")
         x = a[0]
         if n == "cute.assume":
-            m = re.fullmatch(r"!cute\.i\d+<divby (\d+)>", op.types[0])
+            m = re.fullmatch(r"!cute\.i\d+(?:<divby (\d+)>)?", op.types[0])
             if m is None:
                 raise _Undescribed(f"cute.assume into {op.types[0]}")
-            preds.append((_bin("eq", _bin("mod", x, int(m.group(1))), 0), f"an assumed value % {m.group(1)} == 0"))
+            if m.group(1) is not None:
+                preds.append((_bin("eq", _bin("mod", x, int(m.group(1))), 0), f"an assumed value % {m.group(1)} == 0"))
             return x
 
         def nonnegative(v: Any, what: str) -> None:
@@ -688,12 +940,11 @@ class _Eval:
                 preds.append((_bin("ge", v, 0), f"{what} >= 0"))
 
         if n == "llvm.intr.ctlz":
-            # a traced operand's is the width less its bit length, guarded to its sign
-            h, w = _hint(x), bits[0]
+            # a traced operand's is the width less its bit length, its sign a guard
+            w = bits[0]
             if type(x) is not int:
-                preds.append((_bin("ge" if h >= 0 else "lt", x, 0), f"a ctlz operand's sign is {h >= 0}"))
-                return _bin("sub", w, torch.cuda._host_trace.bit_length(x)) if h >= 0 else 0
-            return 0 if h < 0 else w - h.bit_length()
+                return _bin("sub", w, torch.cuda._host_trace.bit_length(x)) if bool(_bin("ge", x, 0)) else 0
+            return 0 if x < 0 else w - x.bit_length()
         if n == "arith.extui":
             if type(x) is int:
                 return x % 2 ** bits[0]
@@ -710,10 +961,10 @@ class _Eval:
             if type(y) is not int:
                 preds.append((_bin("ge", y, 0), "a shift amount >= 0"))
                 preds.append((_bin("lt", y, bits[0]), f"a shift amount < {bits[0]}"))
-            return _wrap(op.types[0], _bin("mul", x, 2**y), preds)
+            return _wrap(self.program.widths(op.types[0]), _bin("mul", x, 2**y), preds)
         if n == "arith.andi":
             if type(x) is int and type(y) is int:
-                return _wrap(op.types[0], x & y, preds)
+                return _wrap(self.program.widths(op.types[0]), x & y, preds)
             v, mask = (x, y) if type(y) is int else (y, x)
             if type(mask) is not int or mask < 0 or mask & (mask + 1):
                 raise _Undescribed("a mask of a traced value other than 2**k - 1")
@@ -726,53 +977,99 @@ class _Eval:
             nonnegative(y, "an unsigned divisor")
             return _div(x, y)
         if n == "arith.floordivsi":
-            return _wrap(op.types[0], _bin("int_floordiv", x, y), preds)
+            return _wrap(self.program.widths(op.types[0]), _bin("int_floordiv", x, y), preds)
         raise _Undescribed(f"unsupported host op {n}")
 
     def tma(self, op: _Op, view: dict[str, Any]) -> tuple[_Param, dict[str, Any]]:
         """A tiled TMA atom as its descriptor's parameter over the memref
-        `view`, and its coordinate tensor, the memref's shape."""
+        `view`, and its coordinate tensor: the memref's shape, its type's
+        basis strides. The descriptor's modes are CuTe's
+        fill_tma_gmem_shape_stride over the coordinate tensor's layout, as the
+        DSL evaluates it: leaf j of the memref moves TMA coordinate d by its
+        stride's scale s_j where that stride is s_j@d, so mode d's extent is
+        1 + sum_j (n_j * s_j - max(s_j, 1)) and its stride the memref stride of
+        any j over s_j, in TMA elements (a scale below 1 is a sub-element leaf
+        of the memref, as fp8 scale factors are of a U16 TMA)."""
         atom, memref, smem_layout = op.types[0], self.operand_type(op, 0), self.operand_type(op, 1)
-        fmt = re.search(r"tma_format = (\w+)", atom)
-        basis = re.search(r'tma_gbasis = <"\(([\d,]*)\):\((.*?)\)">', atom)
-        align = re.search(r"align<(\d+)>", memref)
-        swizzle = re.match(r'!cute\.composed_layout<"S<(\d),4,3> o ', smem_layout)
-        if fmt is None or fmt.group(1) not in _TMA_FORMATS or basis is None:
-            raise _Undescribed(f"the TMA atom {atom}")
-        if align is None or int(align.group(1)) % 16:
+        fmt = self.program.types.get(atom, {}).get("tma", {}).get("format")
+        if fmt not in _TMA_FORMATS:
+            raise _Undescribed(f"the TMA atom {atom} of the format {fmt}")
+        if self.program.types.get(memref, {}).get("align", 0) % 16:
             raise _Undescribed(f"a TMA over {memref}")
-        if swizzle is None and "S<" in smem_layout:
+        # a swizzled shared memory layout: S<b,4,3> (CUtensorMapSwizzle b); a plain layout none
+        smem = self.program.types.get(smem_layout, {})
+        sw = smem["composed"]["swizzle"] if "composed" in smem else [0, 4, 3]
+        if "error" in smem or sw is None or sw[1:] != [4, 3]:
             raise _Undescribed(f"a TMA's shared memory swizzle {smem_layout}")
-        dtype, size = _TMA_FORMATS[fmt.group(1)]
-        box = [int(x) for x in basis.group(1).split(",")]
+        dtype, bits = _TMA_FORMATS[fmt]
+        shape, stride = _flat(view["shape"]), _flat(view["stride"])
+        described = self.program.types[memref]
+        fixed_shape, fixed_stride = map(_flat, _tuples(described["layout"]))
+        pattern, coords = self.program.described(op.types[1], "layout")
+        # each memref leaf's TMA mode and scale (p, q: p/q), None where the TMA does not move along it
+        scales: list[tuple[int, int, int] | None] = []
+        for j, e in enumerate(_flat(coords)):
+            if isinstance(e, dict) and len(e["basis"][1]) == 1:
+                p, q = e["basis"][0] if isinstance(e["basis"][0], list) else (e["basis"][0], 1)
+                if p != 1 and q != 1:
+                    raise _Undescribed(f"a TMA coordinate scale {p}/{q}")
+                scales.append((e["basis"][1][0], p, q))
+            elif e == 0 and j < len(fixed_shape) and (fixed_shape[j] == 1 or fixed_stride[j] == 0):
+                scales.append(None)
+            else:
+                raise _Undescribed(f"the TMA coordinate tensor {op.types[1]} over {memref}")
+        rank = 1 + max((x[0] for x in scales if x is not None), default=-1)
+        contributions: list[list[tuple[int, int, int]]] = [[] for _ in range(rank)]  # per mode: (leaf, p, q)
+        for j, x in enumerate(scales):
+            if x is not None:
+                contributions[x[0]].append((j, x[1], x[2]))
+        if len(scales) != len(shape) or len(fixed_shape) != len(shape) or not all(contributions):
+            raise _Undescribed(f"the TMA coordinate tensor {op.types[1]} over {memref}")
+        box = self.program.types[atom]["tma"].get("box")
+        if not isinstance(box, list) or len(box) != rank:
+            raise _Undescribed(f"the TMA atom {atom}'s box {box} over {rank} coordinate modes")
+        box = list(box)
         if (n := op.attrs.get("num_multicast", 1)) > 1:
             # each CTA of the multicast loads a slice of the outermost box mode
             i = max(i for i, b in enumerate(box) if b > 1)
             if box[i] % n:
                 raise _Undescribed(f"a multicast TMA box {box} over {n} CTAs")
             box[i] //= n
-        modes = [int(m) for m in re.findall(r"1@(\d+)", basis.group(2))]
-        shape, stride = _flat(view["shape"]), _flat(view["stride"])
-        # modes the box leaves out are fine when the memref fixes them at 1
-        leaves = _flat(_memref_pattern(memref)[0])
-        unit = [m for m in range(len(shape)) if m not in modes and len(leaves) == len(shape) and leaves[m] == 1]
-        if (
-            basis.group(2) != ",".join(f"1@{m}" for m in modes)
-            or sorted(modes + unit) != list(range(len(shape)))
-            or len(box) != len(modes)
-        ):
-            raise _Undescribed(f"the TMA basis {basis.group(0)} of {len(shape)} modes")
-        self.predicates.append((_bin("eq", stride[modes[0]], 1), f"a TMA's mode {modes[0]} stride == 1"))
-        dims = [shape[m] for m in modes]
+
+        def require(cond: Any, what: str) -> None:
+            self.predicates.append((cond, what))
+
+        dims, byte_strides = [], []
+        for d, contrib in enumerate(contributions):
+            extent = 1
+            for j, p, q in contrib:
+                if q > 1:
+                    require(_bin("eq", _bin("mod", shape[j], q), 0), f"a TMA leaf's extent % {q} == 0")
+                    extent = _bin("add", extent, _bin("sub", _bin("int_floordiv", shape[j], q), 1))
+                else:
+                    extent = _bin("add", extent, _bin("mul", _bin("sub", shape[j], 1), p))
+            # mode d's stride in bits: memref stride * its bits * q / p, the same for each leaf of the mode
+            over = [_bin("mul", stride[j], described["bits"] * q) for j, p, q in contrib]
+            for (j, p, _), b in zip(contrib, over):
+                require(_bin("eq", _bin("mod", b, p), 0), f"a TMA leaf's stride divides by its scale {p}")
+            unit = [_bin("int_floordiv", b, p) for (_, p, _), b in zip(contrib, over)]
+            for u in unit[1:]:
+                require(_bin("eq", u, unit[0]), f"a TMA mode {d}'s leaves stride alike")
+            if d == 0:
+                require(_bin("eq", unit[0], bits), "a TMA's first mode stride == 1 element")
+            else:
+                require(_bin("eq", _bin("mod", unit[0], 8), 0), f"a TMA mode {d}'s stride is whole bytes")
+                byte_strides.append(_bin("int_floordiv", unit[0], 8))
+            dims.append(extent)
         # the DSL's inline encode keeps a byte stride in units of 16, rounded
         # down (a size-1 mode's stride needn't be a multiple of 16)
-        strides = [_bin("sub", v, _bin("mod", v, 16)) for v in (_bin("mul", stride[m], size) for m in modes[1:])]
+        strides = [_bin("sub", v, _bin("mod", v, 16)) for v in byte_strides]
         bounds = [(v, 1, 2**32, "extent") for v in dims] + [(v, 0, 2**40 - 1, "byte stride") for v in strides]
         for v, lo, hi, what in bounds:
-            self.predicates.append((_bin("ge", v, lo), f"a TMA {what} >= {lo}"))
-            self.predicates.append((_bin("le", v, hi), f"a TMA {what} <= {hi}"))
-        encode = (dtype, tuple(box), int(swizzle.group(1)) if swizzle else 0)
-        return _Param(tma=encode, tma_values=(view["ptr"], *dims, *strides)), {"shape": tuple(shape)}
+            require(_bin("ge", v, lo), f"a TMA {what} >= {lo}")
+            require(_bin("le", v, hi), f"a TMA {what} <= {hi}")
+        encode = (dtype, tuple(box), sw[0])
+        return _Param(tma=encode, tma_values=(view["ptr"], *dims, *strides)), {"shape": _unflatten(pattern, shape), "stride": coords}
 
     def launch(self, op: _Op) -> _Launch:
         d = op.operands[0]
@@ -787,25 +1084,32 @@ class _Eval:
         params = []
         for k in range(1, len(op.operands)):
             ty = self.operand_type(op, k)
-            if not (_is_runtime(ty) or ty.startswith(_PARAM_STATICS)):
+            if self.program.types.get(ty, {}).get("atom") == "stateless_copy":
+                params.append(_Param(stateless=True))
+                continue
+            if "fast_divmod" in self.program.types.get(ty, {}):
+                params.append(_Param(_fast_divmod_fields(self.operand(op, k))))
+                continue
+            if not (self.program.runtime(ty) or ty.startswith(_PARAM_STATICS)):
                 continue
             v = self.operand(op, k)
             if ty.startswith("!cute.memref"):
                 if not isinstance(v, dict):
                     raise _Undescribed(f"a memref argument evaluated to {type(v).__name__}")
                 fields = [(v["ptr"], 8, True)]
-                for pat, vals in zip(_memref_pattern(ty), (v["shape"], v["stride"])):
+                for pat, vals in zip(self.program.described(ty, "layout"), (v["shape"], v["stride"])):
                     fields += _leaf_fields(pat, vals)
                 params.append(_Param(fields))
             elif isinstance(ty, _Builtin) and ty.int_of(16, 32, 64):
                 params.append(_Param([(v, ty.width // 8, False)]))
+            elif "ptr" in (ptr := self.program.types.get(ty, {})):
+                if not ptr["ptr"]["gmem"]:
+                    raise _Undescribed(f"a kernel argument of type {ty}")
+                params.append(_Param([(v, 8, True)]))
             elif isinstance(ty, _Builtin) and ty.kind == "float" and ty.width == 32 and type(v) is float:
                 params.append(_Param([(struct.unpack("<i", struct.pack("<f", v))[0], 4, False)]))
             elif ty.startswith("!cute.coord_tensor"):
-                m = re.fullmatch(r'!cute\.coord_tensor<"([^"?]*)", "([^:]*):([^"?]*)">', ty)
-                if m is None:
-                    raise _Undescribed(f"a kernel argument of type {ty}")
-                params.append(_Param(_leaf_fields(_parse_tuple(m.group(2)), v["shape"])))
+                params.append(_Param(_leaf_fields(self.program.described(ty, "layout")[0], v["shape"])))
             elif ty.startswith(_PARAM_STATICS[0]):
                 params.append(v)
             elif ty.startswith(_PARAM_STATICS[1]):
@@ -823,12 +1127,105 @@ class _Eval:
         )
 
 
+def _fast_divmod_fields(d: Any) -> list[tuple[Any, int, bool]]:
+    """A 32-bit fast divmod divisor's kernel parameter as the DSL encodes it: the divisor, its
+    multiplier and two shifts (Granlund and Montgomery's unsigned division by an invariant: with
+    l = ceil(log2 d), m = floor(2**32 * (2**l - d) / d) + 1, shifts min(l, 1) and max(l - 1, 0));
+    the multiplier as its two's complement int32."""
+    l = (d - 1).bit_length() if type(d) is int else torch.cuda._host_trace.bit_length(_bin("sub", d, 1))
+    # floor(2**32 * t / d) in two halves of 16 bits: no intermediate past 2**48 (the program's are int64)
+    t = _bin("mul", _bin("sub", _bin("lshift", 1, l), d), 2**16)
+    q, r = _bin("int_floordiv", t, d), _bin("mod", t, d)
+    m = _bin("add", _bin("add", _bin("mul", q, 2**16), _bin("int_floordiv", _bin("mul", r, 2**16), d)), 1)
+    m = _bin("sub", m, _bin("mul", 2**32, _bin("int_floordiv", m, 2**31)))
+    return [(d, 4, False), (m, 4, False), (_bin("sym_min", l, 1), 1, False), (_bin("sym_max", _bin("sub", l, 1), 0), 1, False)]
+
+
+def _slice(x: Any, coord: Any, bits: int | None) -> Any:
+    """CuTe's slice of a layout or memref view by a coordinate: the modes its "_" leaves keep; its
+    integer leaves move a view's pointer by their strides (in elements of `bits`)."""
+    shape, stride = x["shape"], x["stride"]
+
+    def keep(c: Any, n: Any, d: Any) -> tuple[Any, Any, Any] | None:
+        # (kept shape, kept stride, offset) of a mode under its coordinate
+        if c is None:
+            return n, d, 0
+        if isinstance(c, tuple):
+            if not isinstance(n, tuple) or len(c) != len(n):
+                raise _Undescribed(f"a slice by {coord} of {shape}")
+            parts = [keep(ci, ni, di) for ci, ni, di in zip(c, n, d)]
+            offset = functools.reduce(lambda u, v: _bin("add", u, v), [o for *_, o in parts], 0)
+            kept = [(k, s) for k, s, _ in parts if k is not None]
+            if not kept:
+                return None, None, offset
+            ks, ss = zip(*kept)
+            return (ks[0], ss[0], offset) if len(ks) == 1 else (tuple(ks), tuple(ss), offset)
+        if isinstance(n, tuple):
+            # an integer coordinate of a nested mode is its colexicographic index
+            if type(c) is not int:
+                raise _Undescribed(f"a slice by {coord} of {shape}")
+            offset, rest = 0, c
+            for ni, di in zip(_flat(n), _flat(d)):
+                if type(ni) is not int and rest != 0:
+                    raise _Undescribed(f"a slice by {coord} of {shape}")
+                ci, rest = (rest, 0) if type(ni) is not int else (rest % ni, rest // ni)
+                offset = _bin("add", offset, _bin("mul", ci, di))
+            return None, None, offset
+        return None, None, _bin("mul", c, d)
+
+    s, d, offset = keep(coord, shape, stride)
+    out = {"shape": s if isinstance(s, tuple) else (s,), "stride": d if isinstance(d, tuple) else (d,)}
+    if "ptr" in x:
+        if bits is None or bits % 8:
+            raise _Undescribed(f"a slice of a view of {bits}-bit elements")
+        out["ptr"] = _bin("add", x["ptr"], _bin("mul", offset, bits // 8))
+    elif offset != 0:
+        raise _Undescribed(f"a slice of a layout at an offset {offset}")
+    return out
+
+
+def _zipped_divide(x: Any, tile: dict[str, Any]) -> Any:
+    """CuTe's zipped_divide of a layout or memref view by a tile of contiguous modes (t:1 each):
+    ((the tile), (the rest)), mode i's rest ceil(n_i / t_i) at stride s_i * t_i."""
+    modes = _tuples(tile.get("tile", ()))
+    shape, stride = x["shape"], x["stride"]
+    if not modes or not all(isinstance(m, tuple) and type(m[0]) is int and m[1] == 1 for m in modes) or len(modes) > len(shape):
+        raise _Undescribed(f"a zipped_divide by the tile {tile}")
+    inner = tuple(t for t, _ in modes)
+    rest = tuple(_ceil_div(n, t) for (t, _), n in zip(modes, shape)) + tuple(shape[len(modes) :])
+    rest_stride = tuple(_bin("mul", d, t) for (t, _), d in zip(modes, stride)) + tuple(stride[len(modes) :])
+    out = {"shape": (inner, rest), "stride": (tuple(stride[: len(modes)]), rest_stride)}
+    if "ptr" in x:
+        out["ptr"] = x["ptr"]
+    return out
+
+
+def _tile_to_shape(block: dict[str, Any], target: list[Any], order: list[Any]) -> dict[str, Any]:
+    """CuTe's tile_to_shape: blocked_product(block, make_ordered_layout(ceil_div(target, block), order)):
+    mode i is (block mode i, its repeat), the repeats compact in `order` scaled by the block's cosize."""
+    shape, stride = _tuples(block["shape"]), _tuples(block["stride"])
+    leaves = list(zip(_flat(shape), _flat(stride)))
+    if not all(type(n) is int and type(d) is int for n, d in leaves) or not all(type(o) is int for o in order):
+        raise _Undescribed(f"a tile_to_shape of {block}")
+    cosize = 1 + sum((n - 1) * abs(d) for n, d in leaves)
+    rank = len(target)
+    modes = list(zip(shape, stride)) + [(1, 0)] * (rank - len(shape))
+    if len(order) != rank or len(modes) != rank:
+        raise _Undescribed(f"a tile_to_shape of {block} to {rank} modes")
+    # each repeat ceil(target / block), as CuTe's tile_to_shape takes it
+    repeat = [_ceil_div(t, math.prod(_flat(n)) if isinstance(n, tuple) else n) for (n, _), t in zip(modes, target)]
+    strides, acc = [0] * rank, cosize
+    for i in sorted(range(rank), key=lambda i: order[i]):
+        strides[i], acc = acc, _bin("mul", acc, repeat[i])
+    return {"shape": tuple((n, r) for (n, _), r in zip(modes, repeat)), "stride": tuple((d, r) for (_, d), r in zip(modes, strides))}
+
+
 def _leaf_fields(pat: Any, vals: Any) -> list[tuple[Any, int, bool]]:
     # a layout's dynamic leaves, each an i32 field unless its type says i64
     leaves, flat = _flat(pat), _flat(vals)
     if len(leaves) != len(flat):
         raise _Undescribed(f"a layout {pat} over {len(flat)} values")
-    return [(v, 8 if "i64" in leaf else 4, False) for leaf, v in zip(leaves, flat) if _dynamic(leaf)]
+    return [(v, leaf["dyn"] // 8, False) for leaf, v in zip(leaves, flat) if _dynamic(leaf)]
 
 
 # the thread's last compile's inputs to the DSL's compile_and_cache: (function name, signature, args, kwargs, TVM-FFI)
@@ -838,8 +1235,9 @@ _compiles: weakref.WeakKeyDictionary[Any, _Program | str] = weakref.WeakKeyDicti
 # per module loaded from an exported object: the object's path
 _loaded_from: weakref.WeakKeyDictionary[Any, str] = weakref.WeakKeyDictionary()
 SIDECAR = ".cute_host"
-# a sidecar's format: its host function, TVM-FFI's argument spec and its object's digest
-_SIDECAR_VERSION = 2
+# a sidecar's format: its host function, TVM-FFI's argument spec, the DSL's evaluation of its types
+# (pointer types too, from 4) and its object's digest
+_SIDECAR_VERSION = 5
 
 
 def _encode_spec(params: Sequence[Any], tvm_ffi: bool) -> list:
@@ -872,10 +1270,12 @@ def _encode_spec(params: Sequence[Any], tvm_ffi: bool) -> list:
     return [encode(p) for p in params]
 
 
-def _spec_args(spec: list, args: Sequence[Any]) -> tuple[list[Any], list[tuple[Any, str]]]:
+def _spec_args(spec: list, args: Sequence[Any]) -> tuple[list[Any], list[tuple[Any, str]], dict[int, Any]]:
     """The call's arguments its host function takes, and as guards each check TVM-FFI's binder makes
     of them (static and shared sizes and strides, divisibility, int bounds, alignment, dtype); a
-    check that fails at the trace's values declines the call, which eager then rejects."""
+    check that fails at the trace's values declines the call, which eager then rejects. And per
+    DataPointer argument (by position) its address, a traced tensor's data_ptr(): the binder takes
+    any int there and checks nothing of it."""
     from cutlass import Numeric
 
     from torch.fx.experimental.symbolic_shapes import sym_or
@@ -883,6 +1283,7 @@ def _spec_args(spec: list, args: Sequence[Any]) -> tuple[list[Any], list[tuple[A
     seen: dict[int, tuple[Any, str]] = {}
     taken: list[Any] = []
     guards: list[tuple[Any, str]] = []
+    pointers: dict[int, Any] = {}
 
     def value(v: Any, x: Any, what: str, unless: Any = False) -> None:
         # unless: where the binder skips the check (a stride of a size-1 dim)
@@ -904,7 +1305,7 @@ def _spec_args(spec: list, args: Sequence[Any]) -> tuple[list[Any], list[tuple[A
         if div > 1:
             check(x % div == 0, f"{what} % {div} == 0")
 
-    def take(p: list, a: Any, what: str) -> None:
+    def take(p: list, a: Any, what: str, top: int | None = None) -> None:
         a = a.value if isinstance(a, Numeric) else a
         if p[0] == "const":
             if type(a) is not type(p[1]) and not (type(p[1]) is int and isinstance(a, torch.SymInt)):
@@ -940,6 +1341,11 @@ def _spec_args(spec: list, args: Sequence[Any]) -> tuple[list[Any], list[tuple[A
                 raise _Undescribed(f"{what} is a {type(a).__name__} for a scalar")
             if type(a) in (int, torch.SymInt):
                 value(p[1], a, what)
+        elif p[0] == "DataPointer" and top is not None:
+            # an int address is memory the trace does not track (or null): an eager call
+            if not isinstance(a, torch.SymInt):
+                raise _Undescribed(f"{what} is a {type(a).__name__} for a TVM-FFI DataPointer")
+            pointers[top] = a
         elif p[0] != "stream":
             raise _Undescribed(f"{what} is a TVM-FFI {p[0]} parameter")
         taken.append(a)
@@ -948,13 +1354,13 @@ def _spec_args(spec: list, args: Sequence[Any]) -> tuple[list[Any], list[tuple[A
     if len(args) != len(params):
         raise _Undescribed(f"{len(args)} arguments for {len(params)} parameters")
     for i, (p, a) in enumerate(zip(params, args)):
-        take(p, a, f"argument {i}")
-    return taken, guards
+        take(p, a, f"argument {i}", i)
+    return taken, guards, pointers
 
 
-def _program(text: str, name: str, spec: list) -> _Program | str:
+def _program(text: str, name: str, spec: list, types: dict[str, Any]) -> _Program | str:
     try:
-        return _Program(text, name, spec)
+        return _Program(text, name, spec, types)
     except Exception as e:
         if torch.cuda._host_trace.raise_unexpected and not isinstance(e, _Undescribed):
             raise
@@ -970,10 +1376,10 @@ def _stream_handle(a: Any) -> int | None:
 
 
 def _describe(
-    launch: _Launch, node: KernelNode, roots: tuple[_Root, ...], owner: Any
+    tr: _Trace, launch: _Launch, node: KernelNode, roots: tuple[_Root, ...], owner: Any
 ) -> KernelLaunch:
     """The launch as a record over the trace's values, checked against its
-    kernel node in the stand-in call's capture at the hints."""
+    kernel node in the stand-in call's capture at the traced call's values."""
     cluster = tuple(map(_pin, launch.cluster))
     attributes = {k: tuple(map(_pin, v)) for k, v in launch.attributes.items()}
     # with trace_pdl off the attribute stays and declines the launch below
@@ -993,6 +1399,9 @@ def _describe(
         raise _Undescribed(f"{len(launch.params)} runtime arguments for {len(node.layout)} kernel parameters")
     fields, values, pointers, tma, padding = [], [], [], [], []
     for index, (param, (_, size)) in enumerate(zip(launch.params, node.layout)):
+        if param.stateless:
+            padding.append((index, 0, size))
+            continue
         if param.tma is not None:
             if size != 128:
                 raise _Undescribed(f"a TMA descriptor parameter of {size} bytes")
@@ -1046,11 +1455,11 @@ def _describe(
         frozenset(i for i, p in enumerate(pointers) if p),
         programmatic=programmatic,
     )
-    evaluated = (tuple(map(_hint, grid)), block, smem, cluster)
+    evaluated = (tuple(map(tr.values, grid)), block, smem, cluster)
     launched = (node.grid, node.block, node.smem, record.cluster)
     if evaluated != launched:
         raise _Undescribed(f"kernel {node.name} launched {launched}; the evaluation {evaluated}")
-    slots = [_hint(v) & _PLACEHOLDER_LOW if p else _hint(v) for v, p in zip(values, pointers)]
+    slots = [_at_call(tr, v) & _PLACEHOLDER_LOW if p else tr.values(v) for v, p in zip(values, pointers)]
     # the DSL's maps carry its bit even where the replay launches the
     # driver's as is: the compare checks the encode's inputs either way
     dsl = tuple(dataclasses.replace(d, edits=True, last=[]) for d in record.descriptors)
@@ -1059,23 +1468,31 @@ def _describe(
     # evaluation's: zero outside its fields, as a replay packs it
     for index, lo, hi in padding:
         packed[index][lo:hi] = node.images[index][lo:hi]
+    # a map's bit 21 of its second word is its encoder's (the driver's never sets it for a U4 map at any
+    # size; CUTLASS and Triton clear it by size): no encode input, so not compared
+    maps = {d.param for d in record.descriptors}
     for index, (data, image) in enumerate(zip(packed, node.images)):
+        if index in maps:
+            data, image = bytearray(data), bytearray(image)
+            data[10] &= ~0x20
+            image[10] &= ~0x20
         if data != image:
             raise _Undescribed(f"kernel {node.name} parameter {index} holds other bytes than the evaluation's")
     return record
 
 
-def _stand_in(t: _TracedTensor) -> torch.Tensor:
-    """A tensor at the traced tensor's hint sizes, strides and address; the
-    address without its non-canonical top, as TmaDescriptor encodes it. For
+def _stand_in(tr: _Trace, t: _TracedTensor) -> torch.Tensor:
+    """A tensor at the traced tensor's sizes, strides and address at the
+    traced call (_at_call); the address without its non-canonical top, as
+    TmaDescriptor encodes it. For
     an argument's root that is the caller's live data: nothing reads or
     writes it only because every launch of the call lands in the witness's
     capture, TVM-FFI launching on torch's current stream even inside
     tvm_ffi.use_raw_stream."""
-    sizes = [_hint(s) for s in t.shape]
-    strides = [_hint(s) for s in t._sym_strides]
+    sizes = [tr.values(s) for s in t.shape]
+    strides = [tr.values(s) for s in t._sym_strides]
     extent = 1 + sum((n - 1) * s for n, s in zip(sizes, strides)) if all(sizes) else 0
-    address = _hint(t.data_ptr()) & _PLACEHOLDER_LOW
+    address = _at_call(tr, t.data_ptr()) & _PLACEHOLDER_LOW
     storage = torch._C._construct_storage_from_data_pointer(address, t.device, extent * t.element_size())
     with _disable_current_modes():
         return torch.empty(0, dtype=t.dtype, device=t.device).set_(storage, 0, sizes, strides)
@@ -1090,10 +1507,38 @@ def _fields(a: Any) -> list[Any]:
     return [a.value if isinstance(a, Numeric) else a]
 
 
-def _stand_ins(a: Any) -> Any:
+def _at_call(tr: _Trace, v: Any) -> int:
+    """v at the traced call's values (CallValues); an address into an allocation's or eager
+    output's storage, which no call supplies, at that root's placeholder, as the trace placed it."""
+    if isinstance(v, torch.SymInt) and len(roots := _roots_of(tr, v)) == 1 and roots[0].kind != "argument":
+        return _placeholder(roots[0]) + tr.values(v - roots[0].sym)
+    return tr.values(v)
+
+
+def _roots_of(tr: _Trace, v: Any) -> list[_Root]:
+    # the trace's roots whose base symbol v holds
+    key = _sym_key(v)
+    held = set() if isinstance(key, int) else key.free_symbols
+    roots = (*(i.root for i in tr.inputs), *(a.root for a in tr.allocs), *(t._root for t in tr.eager_outputs))
+    return [r for r in roots if _sym_key(r.sym).free_symbols & held]
+
+
+def _pointee(tr: _Trace, address: torch.SymInt) -> _Root:
+    """The root a DataPointer argument points into: the trace's one root whose
+    base symbol the address holds (lowering checks it is that base plus an
+    offset, as for any pointer slot)."""
+    found = _roots_of(tr, address)
+    if len(found) != 1:
+        raise _Undescribed(f"the DataPointer address {address} is not in one traced tensor's storage")
+    if found[0].host:
+        raise _Undescribed("a DataPointer into a pinned host argument")
+    return found[0]
+
+
+def _stand_ins(tr: _Trace, a: Any) -> Any:
     if isinstance(a, tuple) and hasattr(a, "_fields"):
-        return type(a)(*map(_stand_ins, a))
-    return _stand_in(a) if isinstance(a, _TracedTensor) else _hint(a)
+        return type(a)(*(_stand_ins(tr, x) for x in a))
+    return _stand_in(tr, a) if isinstance(a, _TracedTensor) else tr.values(a)
 
 
 # an intercept may run outside a trace entry's ballast
@@ -1133,17 +1578,19 @@ def _intercept(
         if isinstance(program, str):
             raise _Undescribed(program)
         # a parameter compiled as None is no formal: TVM-FFI takes the None and drops it
-        given, guards = _spec_args(program.spec, args)
-        bound = _bind(program, given)
+        given, guards, pointers = _spec_args(program.spec, args)
+        pointees = {id(a): _pointee(tr, a) for a in pointers.values()}
+        bound = _bind(program, given, pointees)
         bound[1].extend(guards)
         for i, ty in enumerate(program.formals):
             if ty == "!cuda.stream" and len(given) == len(program.formals) and _stream_handle(given[i]) is None:
                 decline(f"argument {i} is a stream as a {type(given[i]).__name__}; pass a torch.cuda.Stream or CUstream")
         roots: list[_Root] = []
-        for a in leaves:
-            if isinstance(a, _TracedTensor) and not any(r is a._root for r in roots):
-                roots.append(a._root)
-        stand_ins = [_stand_ins(a) for a in args]
+        for r in (*(a._root for a in leaves if isinstance(a, _TracedTensor)), *pointees.values()):
+            if not any(r is s for s in roots):
+                roots.append(r)
+        # a DataPointer's at its address, as _stand_in places a traced tensor
+        stand_ins = [_at_call(tr, a) & _PLACEHOLDER_LOW if i in pointers else _stand_ins(tr, a) for i, a in enumerate(args)]
         for i, arg in cute_args:
             stand_ins[i] = arg.make(stand_ins[i])
 
@@ -1163,7 +1610,7 @@ def _intercept(
         launches, predicates = program.evaluate(bound, {node.name: node.smem for node in nodes})
         for cond, what in predicates:
             _require(cond, what)
-        records = [_describe(launch, node, tuple(roots), compiled) for launch, node in zip(launches, nodes)]
+        records = [_describe(tr, launch, node, tuple(roots), compiled) for launch, node in zip(launches, nodes)]
     except Declined:
         raise
     except Exception as e:
@@ -1305,6 +1752,7 @@ class _DLPackArg:
 
 def _compile(self: Any, func: Any, *args: Any, **kwargs: Any) -> Any:
     texts: dict[str, str] = {}
+    types: dict[str, dict[str, Any]] = {}
 
     def observe(dsl: Any, module: Any, name: str) -> None:
         # MLIR's printer only: reading the DSL's live values would run its casters
@@ -1322,6 +1770,7 @@ def _compile(self: Any, func: Any, *args: Any, **kwargs: Any) -> Any:
                 op = op.operation
                 if op.name == "func.func" and op.attributes["sym_name"].value == name:
                     texts[name] = op.get_asm(print_generic_op_form=True)
+            types[name] = _evaluate_types(module, name)
 
     hooks = kwargs.pop("trace_finalize_hooks", None)
     hooks = () if hooks is None else (hooks,) if callable(hooks) else tuple(hooks)
@@ -1353,7 +1802,7 @@ def _compile(self: Any, func: Any, *args: Any, **kwargs: Any) -> Any:
         # without TVM-FFI has no binder: its call is guarded as if it had)
         try:
             *inputs, tvm_ffi = _compile_inputs.last
-            _compiles[result] = _program(texts[name], name, _encode_spec(_tvm_ffi_args_spec_converter(*inputs)[0], tvm_ffi))
+            _compiles[result] = _program(texts[name], name, _encode_spec(_tvm_ffi_args_spec_converter(*inputs)[0], tvm_ffi), types.get(name, {}))
         except Exception as e:
             _compiles[result] = f"its TVM-FFI argument spec did not convert: {type(e).__name__}: {str(e).splitlines()[0] if str(e) else ''}"
     return result
@@ -1380,7 +1829,7 @@ def _export_to_c(self: Any, object_file_path: str, *args: Any, **kwargs: Any) ->
     _ORIGINALS["export"](self, object_file_path, *args, **kwargs)
     program = _compiles.get(self)
     if program is not None:
-        record = {"name": program.name, "text": program.text, "spec": program.spec} if isinstance(program, _Program) else {"error": program}
+        record = {"name": program.name, "text": program.text, "spec": program.spec, "types": program.types} if isinstance(program, _Program) else {"error": program}
         record |= {"version": _SIDECAR_VERSION, "object": _digest(object_file_path)}
         for path in (object_file_path + SIDECAR, _by_content(object_file_path)):
             with open(path, "w") as f:
@@ -1422,7 +1871,7 @@ def _exported(path: str | None) -> _Program | str:
         return "its module was loaded before torch.cuda._host_trace_cute was armed"
     record, older = _record(path)
     if record is not None:
-        return record["error"] if "error" in record else _program(record["text"], record["name"], record["spec"])
+        return record["error"] if "error" in record else _program(record["text"], record["name"], record["spec"], record["types"])
     if older:
         return f"it was loaded from {path} with a host function exported without TVM-FFI's argument spec: compile and export it again (clear a jit cache that holds it, e.g. quack's)"
     return f"it was loaded from {path} without its host function"
@@ -1568,7 +2017,7 @@ def _intercept_foreign(tr: _Trace, foreign: _Foreign, args: tuple) -> None:
             if handle != tr.stream.cuda_stream:
                 decline(f"argument {i} is a stream other than the trace's")
             streams.append((i, type(a)))
-    stand_ins = [_stand_in(a) if isinstance(a, _TracedTensor) else _hint(a) for a in args]
+    stand_ins = [_stand_in(tr, a) if isinstance(a, _TracedTensor) else tr.values(a) for a in args]
     returned = []
 
     def run(side: torch.cuda.Stream) -> None:

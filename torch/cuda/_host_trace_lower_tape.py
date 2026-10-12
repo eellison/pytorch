@@ -239,6 +239,16 @@ class LoweredSelector:
 
 
 @dataclass(frozen=True)
+class LoweredSection:
+    """A redispatch entry in its op's place (a graph piece): per temporary
+    (its base past the tape's, its bytes' row), and the op's allocations it
+    does not make."""
+
+    temporaries: tuple[tuple[int, int], ...]
+    drops: tuple[int, ...]
+
+
+@dataclass(frozen=True)
 class LoweredTape:
     tape: Tape
     program: IntegerProgram  # complete: no row is added after compilation
@@ -293,6 +303,15 @@ class _TapeLowering:
         self.entry_guards: list[tuple[int, tuple[Any, ...]]] = []
         # selectors (native site indices) whose redispatch refused at some call
         self.refused: set[int] = set()
+        # the section temporaries' bases the native variant holds past the tape's (_add_entries counts them)
+        self.sections = 0
+        # redo templates (_host_trace_redispatch): an entry by what its op's redo reads, rows of this program; and the
+        # entries instantiated from them and redone in full
+        self.templates: dict[Any, Any] = {}
+        # per op (index in Tape.ops), what its redo reads (_reads): a function of the variant's tape, made once
+        self.reads: dict[int, Any] = {}
+        self.instances = 0
+        self.redos = 0
 
         def source(v: Any, leaf: tuple | int) -> None:
             k = self.key(v)
@@ -392,7 +411,8 @@ class _TapeLowering:
         kind, k = ref
         if kind == "argument":
             return None
-        return k if kind == "allocation" else len(self.tape.allocs) + k
+        # a section's temporary: its base past the tape's
+        return k if kind in ("allocation", "section") else len(self.tape.allocs) + k
 
     def view(self, t: _TracedTensor) -> LoweredView:
         sizes = tuple(self.row(s) for s in t.shape)
@@ -926,39 +946,74 @@ def _fold(
                 geometry = (tuple(map(rename, rec.grid)), tuple(map(rename, rec.block)), rename(rec.smem))
                 rec = replace(rec, slots=tuple(map(rename, rec.slots)), roots=owned, grid=geometry[0], block=geometry[1], smem=geometry[2])
             launches.append((lowered.launches[n].seq, rec))
-        selected.append((i, [guard(g) for g in op.guards] + extra, launches))
+        selected.append((i, [guard(g) for g in op.guards] + extra, launches, None))
     return lower_entries(lowered, args, values, selected)
 
 
 def lower_entries(
-    lowered: LoweredTape, args: Sequence[Any], values: Sequence[int], selected: list[tuple[int, list[Any], list[tuple[int, Any]]]]
-) -> tuple[torch._C._HostTraceProgram, list[tuple[int, int, tuple[LoweredLaunch | LoweredMemset, ...]]]]:
-    """Per (selector site, guards, (seq, launch) pairs) in the variant's
-    symbols, the entry (site, predicate row, lowered launches), its rows
-    appended to the variant's program at the call `args` (rows `values`), and
-    the program compiled; FoldRefused where a lowering declines."""
+    lowered: LoweredTape, args: Sequence[Any], values: Sequence[int], selected: list[tuple[int, list[Any], list[tuple[int, Any]], Any]]
+) -> tuple[torch._C._HostTraceProgram, list[tuple[int, int, tuple[LoweredLaunch | LoweredMemset, ...], LoweredSection | None]]]:
+    """Per (selector site, guards, (seq, launch) pairs, a redo's Section or
+    None) in the variant's symbols, the entry (lower_entry), its rows appended
+    to the variant's program at the call `args` (rows `values`), and the
+    program compiled; FoldRefused where a lowering declines."""
     lo = lowered.lowering
     # every row evaluated at the call, where each new row is too
     program = lo.program
     program.inputs, program.values = tuple(args), list(values)
     entries = []
+    base = len(lowered.allocations) + len(lowered.eager_roots) + lo.sections
     try:
-        for i, guards, launches in selected:
-            # sympy guards in an IR variant: its rename failed at the hints (HintsFail)
-            symbolic = any(isinstance(g, sympy.Basic) for g in guards)
-            low, key = (lo.symbolic, _sym_expr) if symbolic else (lo.lowering, lo.key)
-            addresses = frozenset(key(rec.root.sym) for rec in lowered.tape.inputs)
-            # the other entries' rows are evaluated at this one's calls
-            with low.total() as domains:
-                predicate = low.conjunction(guards, addresses)
-                rows = tuple(lo.launch(seq, rec) for seq, rec in launches)
-            for ok in domains:
-                predicate = lo.emit("and", predicate, ok)
-            entries.append((i, predicate, rows))
+        for i, guards, launches, section in selected:
+            entry, base = lower_entry(lowered, i, guards, launches, section, base)
+            entries.append(entry)
         compiled = compile_program(program)
-        lo.entry_guards += [(i, tuple(guards)) for i, guards, _ in selected]
+        lo.entry_guards += [(i, tuple(guards)) for i, guards, *_ in selected]
     except Declined as e:
         raise FoldRefused(f"a lowering declined: {e}", compile_program(program)) from e
     finally:
         program.inputs = ()
     return compiled, entries
+
+
+def lower_entry(
+    lowered: LoweredTape, i: int, guards: list[Any], launches: list[tuple[int, Any]], section: Any, base: int
+) -> tuple[tuple[int, int, tuple[LoweredLaunch | LoweredMemset | LoweredMemcpy, ...], LoweredSection | None], int]:
+    """Selector site i's entry (site, predicate row, lowered launches,
+    LoweredSection or None) from its guards and (seq, launch) pairs in the
+    variant's symbols, with the program's inputs set to the call; and the next
+    free base: a section's temporaries take the bases from `base`."""
+    lo = lowered.lowering
+    # sympy guards in an IR variant: its rename failed at the hints (HintsFail)
+    symbolic = any(isinstance(g, sympy.Basic) for g in guards)
+    low, key = (lo.symbolic, _sym_expr) if symbolic else (lo.lowering, lo.key)
+    addresses = frozenset(key(rec.root.sym) for rec in lowered.tape.inputs)
+    temporaries = []
+    # the other entries' rows are evaluated at this one's calls
+    with low.total() as domains:
+        predicate = low.conjunction(guards, addresses)
+        for t in section.temporaries if section else ():
+            lo.roots[id(t.root)] = ("section", base)
+            temporaries.append((base, lo.allocation(t).nbytes))
+            # its requirement (nonnegative strides) is the entry's
+            predicate = lo.emit("and", predicate, lo.requirements.pop())
+            base += 1
+        try:
+            rows = tuple(lo.launch(seq, rec) for seq, rec in launches)
+        finally:
+            for t in section.temporaries if section else ():
+                del lo.roots[id(t.root)]
+        # a section's memcpy copies at least a byte, inside its allocations (as lower_tape requires of the tape's)
+        nbytes = {**{k: a.nbytes for k, a in enumerate(lowered.allocations)}, **dict(temporaries)}
+        zero, one = lo.emit("constant", 0), lo.emit("constant", 1)
+        for m in rows if section else ():
+            if isinstance(m, LoweredMemcpy):
+                predicate = lo.emit("and", predicate, lo.emit("ge", m.nbytes, one))
+                for slot in m.slots:
+                    if slot.root[0] in ("allocation", "section"):
+                        end = lo.emit("add", slot.displacement, m.nbytes)
+                        fits = lo.emit("and", lo.emit("ge", slot.displacement, zero), lo.emit("le", end, nbytes[slot.base]))
+                        predicate = lo.emit("and", predicate, fits)
+    for ok in domains:
+        predicate = lo.emit("and", predicate, ok)
+    return (i, predicate, rows, section and LoweredSection(tuple(temporaries), section.drops)), base

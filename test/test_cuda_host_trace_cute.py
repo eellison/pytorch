@@ -85,6 +85,48 @@ if HAS_CUTE:
         )
 
     @cute.jit
+    def _add_nested(mA: cute.Tensor, mB: cute.Tensor, mC: cute.Tensor, n: cutlass.Int32, stream: cuda_driver.CUstream):
+        # the grid from a nested layout: size((4, (8, n))) // 32 == n
+        lay = cute.make_layout((4, (8, cute.size(mA, mode=[0]))), stride=(1, (4, 32)))
+        _add_kernel(mA, mB, mC, n).launch(grid=[(cute.size(lay) // 32 + 127) // 128, 1, 1], block=[128, 1, 1], stream=stream)
+
+    @cute.kernel
+    def _iota_kernel(cC: cute.Tensor, gC: cute.Tensor, n: cutlass.Int32):
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        bdim, _, _ = cute.arch.block_dim()
+        i = bidx * bdim + tidx
+        if i < n:
+            gC[i] = cutlass.Float32(cC[i][0])
+
+    @cute.kernel
+    def _divmod_kernel(fdd: cute.FastDivmodDivisor, gQ: cute.Tensor, gR: cute.Tensor, gX: cute.Tensor, n: cutlass.Int32, copy: cute.CopyAtom):
+        i = cute.arch.block_idx()[0] * cute.arch.block_dim()[0] + cute.arch.thread_idx()[0]
+        if i < n:
+            q, r = divmod(gX[i], fdd)
+            gQ[i] = q
+            gR[i] = r
+
+    @cute.jit
+    def _divmod(mQ: cute.Tensor, mR: cute.Tensor, mX: cute.Tensor, d: cutlass.Int32, n: cutlass.Int32, stream: cuda_driver.CUstream):
+        # a runtime fast divmod divisor and a stateless copy atom, each a kernel parameter
+        copy = cute.make_copy_atom(cute.nvgpu.CopyG2ROp(), cutlass.Int32, num_bits_per_copy=32)
+        _divmod_kernel(cute.fast_divmod_create_divisor(d), mQ, mR, mX, n, copy).launch(grid=[(n + 127) // 128, 1, 1], block=[128, 1, 1], stream=stream)
+
+    @cute.jit
+    def _iota(mC: cute.Tensor, n: cutlass.Int32, stream: cuda_driver.CUstream):
+        # a coordinate tensor's layout strides are basis elements: (?):(1@0). The interpreter has no
+        # make_identity_tensor: its calls are eager steps
+        _iota_kernel(cute.make_identity_tensor(mC.shape), mC, n).launch(grid=[(n + 127) // 128, 1, 1], block=[128, 1, 1], stream=stream)
+
+    @cute.jit
+    def _add_by_pointer(mA: cute.Tensor, pB: cute.Pointer, mC: cute.Tensor, n: cutlass.Int32, stream: cuda_driver.CUstream):
+        # FlashInfer's mm_fp4 scale factors: a tensor over a make_ptr pointer, called with a data_ptr() (TVM-FFI's DataPointer)
+        m = cute.size(mA, mode=[0])
+        mB = cute.make_tensor(pB, cute.make_layout(m, stride=1))
+        _add_kernel(mA, mB, mC, n).launch(grid=[(m + 127) // 128, 1, 1], block=[128, 1, 1], stream=stream)
+
+    @cute.jit
     def _add_on_the_null_stream(
         mA: cute.Tensor, mB: cute.Tensor, mC: cute.Tensor, n: cutlass.Int32
     ):
@@ -508,12 +550,10 @@ class TestHostTraceCute(TestCase):
             self.assertEqual((r.traces, r.eager), (1, 0))
 
     def test_integer_results_wrap(self):
-        i32, i64 = htc._Builtin("int", 32, "i32"), htc._Builtin("int", 64, "i64")
-        self.assertEqual(htc._wrap(i32, 2**31 + 5, []), -(2**31) + 5)
-        self.assertEqual(htc._wrap(i32, -(2**31) - 1, []), 2**31 - 1)
-        self.assertEqual(htc._wrap(i64, 2**31 + 5, []), 2**31 + 5)
-        ty = '!cute.int_tuple<"(?,?{i64})">'
-        self.assertEqual(htc._wrap(ty, (2**32 + 1, 2**32 + 1), []), (1, 2**32 + 1))
+        self.assertEqual(htc._wrap((32,), 2**31 + 5, []), -(2**31) + 5)
+        self.assertEqual(htc._wrap((32,), -(2**31) - 1, []), 2**31 - 1)
+        self.assertEqual(htc._wrap((64,), 2**31 + 5, []), 2**31 + 5)
+        self.assertEqual(htc._wrap((32, 64), (2**32 + 1, 2**32 + 1), []), (1, 2**32 + 1))
 
     def test_a_ceil_div_by_a_tile_of_fewer_modes(self):
         t = make_fake_compact_tensor(cutlass.Float32, (cute.sym_int32(),), assumed_align=16)
@@ -532,27 +572,109 @@ class TestHostTraceCute(TestCase):
             self.assertEqual(r(a), a + 1, atol=0, rtol=0)
         self.assertEqual((r.traces, r.eager, r.declines), (1, 0, []))
 
-    def test_repeated_launches_parse_types_once(self):
-        # every call of a compiled function re-evaluates its host program; the
-        # MLIR type strings it parses are the same each time
-        t = make_fake_compact_tensor(cutlass.Float32, (cute.sym_int(),), assumed_align=16)
-        stream = make_fake_stream(use_tvm_ffi_env_stream=True)
-        add = cute.compile(_add, t, t, t, cutlass.Int32(0), stream, options="--enable-tvm-ffi")
+    def test_layouts_are_the_dsls_evaluation_at_the_compile(self):
+        # a nested layout's shape and stride, and a memref's, are what the DSL's own layout algebra
+        # gives at the compile: ints and dynamic leaves of a width, no type text read at a call
+        t = make_fake_compact_tensor(cutlass.Float32, (cute.sym_int32(),), assumed_align=16)
+        add = cute.compile(_add_nested, t, t, t, cutlass.Int32(0), make_fake_stream(use_tvm_ffi_env_stream=True), options="--enable-tvm-ffi")
+        layouts = [d["layout"] for d in htc._compiles[add].types.values() if "layout" in d]
+        self.assertIn([[4, [8, {"dyn": 32}]], [1, [4, 32]]], layouts)
+        self.assertIn([[{"dyn": 32}], [1]], layouts)
 
         def f(a, b):
             c = torch.empty_like(a)
             add(a, b, c, a.shape[0])
-            d = torch.empty_like(a)
-            add(c, b, d, a.shape[0])
-            return d
+            return c
 
-        htc._int_widths.cache_clear()
         r = HostTraceReplay(f)
         for n in (1000, 4096, 777, 1000):
             a, b = torch.randn(n, device="cuda"), torch.randn(n, device="cuda")
-            self.assertEqual(r(a, b), a + b + b, atol=0, rtol=0)
+            self.assertEqual(r(a, b), a + b, atol=0, rtol=0)
+        self.assertEqual((r.traces, r.replays, r.eager, r.declines), (1, 3, 0, []))
+
+    def test_every_type_of_these_compiles_is_evaluated(self):
+        # the DSL evaluates each layout-like type of a host function at its compile; none fails
+        t = make_fake_compact_tensor(cutlass.Float32, (cute.sym_int32(),), assumed_align=16)
+        stream = make_fake_stream(use_tvm_ffi_env_stream=True)
+        for fn, args in ((_add, (t, t, t, cutlass.Int32(0))), (_add_nested, (t, t, t, cutlass.Int32(0))), (_plus_one_tiles, (t, t, cutlass.Int32(0))), (_iota, (t, cutlass.Int32(0)))):
+            types = htc._compiles[cute.compile(fn, *args, stream, options="--enable-tvm-ffi")].types
+            self.assertTrue(types)
+            self.assertEqual([ty for ty, d in types.items() if "error" in d], [])
+
+    def test_a_coordinate_tensors_basis_strides_are_static_leaves(self):
+        # a TMA kernel's coordinate tensor parameter is its shape (the sm100 TMA tests launch them)
+        t = make_fake_compact_tensor(cutlass.Float32, (cute.sym_int32(),), assumed_align=16)
+        iota = cute.compile(_iota, t, cutlass.Int32(0), make_fake_stream(use_tvm_ffi_env_stream=True), options="--enable-tvm-ffi")
+        program = htc._compiles[iota]
+        (coords,) = [ty for ty in program.types if ty.startswith("!cute.coord_tensor")]
+        self.assertEqual(program.types[coords], {"layout": [[{"dyn": 32}], [{"basis": [1, [0]]}]]})
+        self.assertTrue(program.runtime(coords))
+
+    def test_a_fast_divmod_divisor_and_a_copy_atom_are_parameters(self):
+        # the divisor's multiplier and shifts are evaluated from the call's divisor at each replay; a
+        # copy atom of no runtime state is a parameter of no meaningful bytes
+        t = make_fake_compact_tensor(cutlass.Int32, (cute.sym_int32(),), assumed_align=16)
+        divmod_ = cute.compile(_divmod, t, t, t, cutlass.Int32(1), cutlass.Int32(0), make_fake_stream(use_tvm_ffi_env_stream=True), options="--enable-tvm-ffi")
+
+        def f(x, d):
+            q, r = torch.empty_like(x), torch.empty_like(x)
+            divmod_(q, r, x, d, x.shape[0])
+            return q, r
+
+        r = HostTraceReplay(f)
+        for n, d in ((1000, 7), (777, 1), (4096, 2**20 + 3), (1000, 2**31 - 1), (555, 128)):
+            x = torch.randint(0, 2**31 - 1, (n,), device="cuda", dtype=torch.int32)
+            q, rem = r(x, d)
+            self.assertEqual(q, x // d, atol=0, rtol=0)
+            self.assertEqual(rem, x % d, atol=0, rtol=0)
+        self.assertEqual((r.traces, r.replays, r.eager, r.declines), (1, 4, 0, []))
+
+    def test_a_data_pointer_is_a_traced_tensors_address(self):
+        # the address of an allocation, of an argument and of a view at an offset from a size: each a
+        # pointer slot of the launch, at the replay's address; the compile's 16-byte alignment is guarded
+        t = make_fake_compact_tensor(cutlass.Float32, (cute.sym_int32(),), assumed_align=16)
+        ptr = make_ptr(cutlass.Float32, 16, cute.AddressSpace.gmem, 16)
+        add = cute.compile(_add_by_pointer, t, ptr, t, cutlass.Int32(0), make_fake_stream(use_tvm_ffi_env_stream=True), options="--enable-tvm-ffi")
+        self.assertEqual(htc._compiles[add].types["!cute.ptr<f32, gmem, align<16>>"], {"ptr": {"align": 16, "gmem": True}})
+
+        def f(a, b):
+            n = a.shape[0]
+            s = b * 2
+            c, d, e = (torch.empty_like(a) for _ in range(3))
+            add(a, s.data_ptr(), c, n)
+            add(c, b.data_ptr(), d, n)
+            add(d, s[b.shape[0] - n :].data_ptr(), e, n)
+            return e
+
+        a, b = torch.randn(1000, device="cuda"), torch.randn(1004, device="cuda")
+        tape = trace(f, (a, b))
+        self.assertFalse([launch.reason for _, launch in tape.launches if isinstance(launch, EagerCall)])
+        self.assertEqual(sum(isinstance(launch, KernelLaunch) and "add_kernel" in launch.name for _, launch in tape.launches), 3)
+        r = HostTraceReplay(f)
+        for n, k in ((1000, 4), (4096, 8), (777, 12), (1000, 4)):
+            a, b = torch.randn(n, device="cuda"), torch.randn(n + k, device="cuda")
+            self.assertEqual(r(a, b), f(a, b), atol=0, rtol=0)
         self.assertEqual((r.traces, r.replays, r.eager), (1, 3, 0))
-        self.assertGreater(htc._int_widths.cache_info().hits, 0)
+        # an argument 4 bytes off 16: its alignment guard misses, and the call runs eagerly
+        big = torch.randn(2000, device="cuda")
+        self.assertEqual(r(a, big[1:1005]), f(a, big[1:1005]), atol=0, rtol=0)
+        self.assertEqual(r.replays, 3)
+
+    def test_a_data_pointer_outside_the_trace_is_an_eager_call(self):
+        # a DataPointer that is a plain int (memory the trace does not track): the call runs eagerly at it
+        t = make_fake_compact_tensor(cutlass.Float32, (cute.sym_int32(),), assumed_align=16)
+        ptr = make_ptr(cutlass.Float32, 16, cute.AddressSpace.gmem, 16)
+        add = cute.compile(_add_by_pointer, t, ptr, t, cutlass.Int32(0), make_fake_stream(use_tvm_ffi_env_stream=True), options="--enable-tvm-ffi")
+        held = torch.randn(1000, device="cuda")
+
+        def f(a):
+            c = torch.empty_like(a)
+            add(a, held.data_ptr(), c, a.shape[0])
+            return c
+
+        tape = trace(f, (torch.randn(1000, device="cuda"),))
+        ((_, call),) = [x for x in tape.launches if isinstance(x[1], EagerCall)]
+        self.assertIn("argument 1 is a int for a TVM-FFI DataPointer", call.reason)
 
     def test_an_i64_size_and_a_programmatic_launch_are_a_launch(self):
         t = make_fake_compact_tensor(cutlass.Float32, (cute.sym_int(64),), assumed_align=16)

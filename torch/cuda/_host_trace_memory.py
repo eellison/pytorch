@@ -427,12 +427,10 @@ def _layout(
     return offsets, program.emit("max", zero, *tops) if tops else zero
 
 
-def check_plan(lowered: LoweredTape, plan: MemoryPlan) -> None:
-    """That every allocation a step uses is live there in the plan: at each launch, those its pointer
-    slots and its keyed site's table (operands, scratch) reach, a temporary of its run between its
-    seq and its last use, a tensor from its step to the one that drops it; at an eager step, its
-    leaves' tensors. A plan that frees an allocation before a use lets a later one take its bytes
-    while it is in use. Build time only."""
+def _liveness(lowered: LoweredTape, plan: MemoryPlan) -> Callable[[int, int, float], bool]:
+    """Whether allocation b is live at step i, seq `seq` in the plan: a temporary of the run between its
+    seq and its last use, a tensor from its seq in its step to the step that drops it; a held or
+    relocated one, an eager output's, always."""
     n = len(lowered.allocations)
     made, spans, dropped = {}, {}, {}
     for i, step in enumerate(plan.steps):
@@ -440,10 +438,6 @@ def check_plan(lowered: LoweredTape, plan: MemoryPlan) -> None:
         spans.update((k, (i, seq, last)) for k, seq, last in step.temporaries)
         dropped.update((b, i) for b in step.drops)
     held = {k for k, *_ in plan.planned} | set(plan.relocated)
-    tables: dict[int, list[int]] = {}
-    for site in lowered.sites:
-        for j in site.nodes:
-            tables.setdefault(j, []).extend(b for _, b in (*site.operands, *site.scratch.values()) if 0 <= b < n)
 
     def live(b: int, i: int, seq: float) -> bool:
         if b in held or b >= n:
@@ -451,8 +445,24 @@ def check_plan(lowered: LoweredTape, plan: MemoryPlan) -> None:
         if b in spans:
             run, first, last = spans[b]
             return run == i and first <= seq <= last
-        return made.get(b, len(plan.steps)) <= i <= dropped.get(b, len(plan.steps))
+        # eager order makes a tensor at its seq in its step's run
+        start = made.get(b, len(plan.steps))
+        return start <= i <= dropped.get(b, len(plan.steps)) and (start < i or lowered.allocations[b].seq <= seq)
 
+    return live
+
+
+def check_plan(lowered: LoweredTape, plan: MemoryPlan) -> None:
+    """That every allocation a step uses is live there in the plan (_liveness): at each launch, those
+    its pointer slots and its keyed site's table (operands, scratch) reach; at an eager step, its
+    leaves' tensors. A plan that frees an allocation before a use lets a later one take its bytes
+    while it is in use. Build time only."""
+    n = len(lowered.allocations)
+    live = _liveness(lowered, plan)
+    tables: dict[int, list[int]] = {}
+    for site in lowered.sites:
+        for j in site.nodes:
+            tables.setdefault(j, []).extend(b for _, b in (*site.operands, *site.scratch.values()) if 0 <= b < n)
     for i, step in enumerate(lowered.steps):
         if isinstance(step, range):
             uses = [(lowered.launches[j].seq, [s.base for s in lowered.launches[j].slots if isinstance(s, PointerSlot) and s.base is not None] + tables.get(j, [])) for j in step]
@@ -461,6 +471,43 @@ def check_plan(lowered: LoweredTape, plan: MemoryPlan) -> None:
         for seq, bases in uses:
             if bad := [b for b in bases if not live(b, i, seq)]:
                 raise AssertionError(f"host_trace: allocations {bad} are used at step {i} (seq {seq}) outside their lifetimes in the memory plan")
+
+
+def check_section(lowered: LoweredTape, plan: MemoryPlan, nodes: Sequence[int], launches: Sequence[Any], temporaries: Sequence[tuple[int, int]], drops: Collection[int]) -> str | None:
+    """Why a section (launches and temporaries (base, bytes row) in place of launches `nodes` of one op,
+    which does not make the op's allocations `drops`) cannot take the op's place in the plan, or None. Its
+    graph piece replaces the op's chain of one run, and its temporaries live within that chain (or over
+    the run), so every other base it reaches must be live in the plan over the whole of the op's chain,
+    at its first and its last launch: an allocation the plan frees or makes within the chain may share
+    bytes with another there. Build time only."""
+    step = next((i for i, s in enumerate(lowered.steps) if isinstance(s, range) and nodes and nodes[0] in s), None)
+    if step is None or not all(n in lowered.steps[step] for n in nodes):
+        return "its op's launches are not in one graph"
+    first, last = lowered.launches[nodes[0]].seq, lowered.launches[nodes[-1]].seq
+    own, tape = {b for b, _ in temporaries}, len(lowered.allocations) + len(lowered.eager_roots)
+    live = _liveness(lowered, plan)
+    for lo in launches:
+        for s in lo.slots:
+            if not isinstance(s, PointerSlot) or s.base is None or s.base in own:
+                continue
+            if s.base >= tape or s.base in drops or not (live(s.base, step, first) and live(s.base, step, last)):
+                return f"base {s.base} is not live over its op's launches in the plan"
+    return None
+
+
+def section_places(lowered: LoweredTape, plan: MemoryPlan, nodes: Sequence[int]) -> tuple[int, int]:
+    """Where a section of the op of launches `nodes` makes and frees its temporaries in its run's eager
+    order (HostTraceVariant::allocate): before the first event after the op's own allocations, and before
+    the first after its last launch; in a run of no order, among its tensors, both before the first made
+    after the op's first launch. As eager makes them inside the op and frees them as it returns."""
+    step = next(i for i, s in enumerate(lowered.steps) if isinstance(s, range) and nodes[0] in s)
+    m, first, last = plan.steps[step], lowered.launches[nodes[0]].seq, lowered.launches[nodes[-1]].seq
+    if not m.order:
+        at = sum(lowered.allocations[k].seq < first for k in m.tensors)
+        return at, at
+    lasts = {k: end for k, _, end in m.temporaries}
+    keys = [(lowered.allocations[e].seq, 0) if e >= 0 else (lasts[-1 - e], 1) for e in m.order]
+    return sum(k < (first, 0) for k in keys), sum(k < (last, 2) for k in keys)
 
 
 def _nbytes(lowered: LoweredTape) -> list[int]:
@@ -1168,7 +1215,7 @@ def _moved(emit: Callable[..., int], relocated: Mapping[int, tuple[int, ...]], l
 
 
 def relocate_entries(lowered: LoweredTape, relocated: Mapping[int, tuple[int, ...]], entries: list, args: Sequence[Any]) -> tuple[Any, list]:
-    """A fold's or a redispatch's entries (site, predicate, launches) with
+    """A fold's or a redispatch's entries (site, predicate, launches, section) with
     their launches relocated as the variant's are, and the program compiled
     again over the call `args`, at whose values the program's rows are."""
     from torch.cuda._host_trace_program import compile_program
@@ -1176,7 +1223,7 @@ def relocate_entries(lowered: LoweredTape, relocated: Mapping[int, tuple[int, ..
     program = lowered.lowering.program
     program.inputs = tuple(args)
     try:
-        entries = [(site, predicate, tuple(_moved(program.emit, relocated, lo) for lo in launches)) for site, predicate, launches in entries]
+        entries = [(site, predicate, tuple(_moved(program.emit, relocated, lo) for lo in launches), section) for site, predicate, launches, section in entries]
         return compile_program(program), entries
     finally:
         program.inputs = ()

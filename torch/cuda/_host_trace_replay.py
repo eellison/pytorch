@@ -78,10 +78,10 @@ from torch._prims.rng_prims import _impl_graphsafe_rng
 from torch.cuda import _host_trace_cute  # noqa: F401  hooks cute.compile
 from torch.cuda import _host_trace_ir as _ir
 from torch.cuda._host_trace import _drop_tracebacks, Declined, declined, EagerFallback, ProcessHold
-from torch.cuda._host_trace_capture import capture_tape, instantiate_form, plain_attributes, SegmentFailed
+from torch.cuda._host_trace_capture import capture_tape, instantiate_form, plain_attributes, section_binding, SegmentFailed
 from torch.cuda._host_trace_harvest import HarvestProvider
-from torch.cuda._host_trace_lower_tape import fold, FoldRefused, lower_guards, lower_tape, LoweredMemcpy, PointerSlot, PredictedOutput, ScalarSlot
-from torch.cuda._host_trace_memory import arena_addresses, auto_memory, check_plan, plan_memory, relocate, relocate_entries, size_classes, split_runs, SPLITS
+from torch.cuda._host_trace_lower_tape import fold, FoldRefused, lower_guards, lower_tape, LoweredMemcpy, LoweredSelector, PointerSlot, PredictedOutput, ScalarSlot
+from torch.cuda._host_trace_memory import arena_addresses, auto_memory, check_plan, check_section, plan_memory, section_places, relocate, relocate_entries, size_classes, split_runs, SPLITS
 from torch.cuda._host_trace_opaque import fill_uniform, key_guards, library_state_as, span_bytes, takes_generator
 from torch.cuda._host_trace_program import Status
 from torch.cuda._host_trace_redispatch import redispatch
@@ -341,7 +341,8 @@ class _Variant:
     # call traced again at them, or this variant's trace declined to record them
     tried: set[OpaqueKey] = field(default_factory=set)
     # per keyed site, a binding of each of its arms 1, 2, ...: its nodes at
-    # other launch attributes, or a piece, nodes of their own in their place
+    # other launch attributes, or a piece, nodes of their own in their place;
+    # per selector, its sections' launches as pieces (section_binding)
     arms: dict[int, list[OpaqueBinding]] = field(default_factory=dict)
     # the launches of the traces folded into it, which keep their functions loaded
     folded: list[tuple[LoweredLaunch | LoweredMemset, ...]] = field(default_factory=list)
@@ -565,6 +566,14 @@ class HostTraceReplay(torch._C._HostTraceEntry):
         self.redispatches = 0
         self.redispatch_s = 0.0
         self.redispatch_refusals: dict[str, int] = {}
+        # the entries that are sections (their op's launches replaced, with temporaries of their own), and
+        # the most bytes one entry's temporaries took at the call that added it
+        self.sections = 0
+        self.section_bytes = 0
+        # the selectors' entries a redispatch built by redoing their ops, and those it took from a redo template
+        # (_host_trace_redispatch.Template)
+        self.redos = 0
+        self.redo_instances = 0
         # why each trace after the first traced: (class, op, guard, the user's line, refusal) -> count. Class "meta": a
         # graph guard an op recorded (its outputs' metadata); "dispatch": an op's own guard failed and its
         # redispatch refused (refusal); "graph": a guard no op recorded; "contract": no variant of the
@@ -772,6 +781,8 @@ class HostTraceReplay(torch._C._HostTraceEntry):
         values, missing, unformed, unselected = evaluated
         if unselected:
             if not variant.learns:
+                if not background:
+                    self._bind_redone_sites(variant, missing, unselected)
                 candidates.append((variant, values, unselected))
             return None
         sites = variant.captured.lowered.sites
@@ -832,6 +843,27 @@ class HostTraceReplay(torch._C._HostTraceEntry):
             if not self._native_mutate(variant, "a form", variant.native.add_form, g, arms, *self._form(variant, g, arms, values)):
                 return None
         return values, bool(bindings or unformed)
+
+    def _bind_redone_sites(self, variant: _Variant, missing: list, unselected: list[int]) -> None:
+        """Learns the missing keys of the keyed sites inside the ops of the
+        selectors `unselected`, which a redispatch redoes: its redo records
+        each nested call as a site only where its key binds, as a trace does.
+        The variant's rows for them are added after (_fill)."""
+        lowered, tape = variant.captured.lowered, variant.tape
+        ops = [tape.ops[lowered.selectors[i - len(lowered.sites)].op] for i in unselected]
+        held = {id(rec) for op in ops for _, rec in tape.launches[op.launches.start : op.launches.stop]}
+        pool = None
+        for i, key in missing:
+            site = lowered.sites[i].site
+            if not site.nodes or id(site.nodes[0]) not in held or site.rng or site.call is None:
+                continue
+            k = lowered.sites[i].key(key)
+            if site.provider.bind(k) is None and site.provider.refusal(k) is None:
+                if pool is None and self.learn_pool:
+                    pool = torch.cuda.MemPool()
+                with torch.cuda.use_mem_pool(pool, k.device) if pool is not None else contextlib.nullcontext():
+                    self._learn(site.op, site.provider, site.call, k)
+        del pool
 
     def _learn(self, op: OpOverload, provider: OpaqueProvider, call: tuple[Any, frozenset[int]], key: OpaqueKey, restore_rng: bool = True) -> OpaqueBinding | None:
         """The key's binding, harvested now from one eager run of `op` on
@@ -928,13 +960,17 @@ class HostTraceReplay(torch._C._HostTraceEntry):
         segments, launches = variant.captured.segments, variant.captured.launches
         first = sum(len(s.launches) for s in segments[:g])
         stop = first + len(segments[g].launches)
-        sites = [(i, s) for i, s in enumerate(variant.captured.lowered.sites) if first <= s.nodes[0] < stop]
+        lowered = variant.captured.lowered
+        # the native segment's sites: its keyed sites, then its selectors where the native takes sections (a
+        # section's piece replaces their nodes)
+        selectors = lowered.selectors if getattr(torch._C, "_host_trace_section_entries", False) else ()
+        sites = [(i, s) for i, s in enumerate((*lowered.sites, *selectors)) if s.nodes and first <= s.nodes[0] < stop]
         changes, pieces = [], []
         for (i, site), arm in zip(sites, arms, strict=True):
             if arm == 0:
                 continue
             binding = variant.arms[i][arm - 1]
-            if _piece(site.site, binding):
+            if isinstance(site, LoweredSelector) or _piece(site.site, binding):
                 pieces.append((i, [launches[n].node for n in site.nodes], binding))
                 continue
             for n, a, b, kernel in zip(site.nodes, site.site.topology, binding.topology, binding.nodes):
@@ -1289,7 +1325,11 @@ class HostTraceReplay(torch._C._HostTraceEntry):
         guards hold the call, gain entries from their ops dispatched again at
         the call's metadata (_host_trace_redispatch): no trace; else why not."""
         start = time.perf_counter()
-        refused = self._add_entries(variant, self.redispatch_refusals, args, redispatch, variant.captured.lowered, args, values, unselected, dispatches)
+        lo = variant.captured.lowered.lowering
+        counts = lo.redos, lo.instances
+        refused = self._add_entries(variant, self.redispatch_refusals, args, redispatch, variant.captured.lowered, args, values, unselected, dispatches, self.opaque)
+        self.redos += lo.redos - counts[0]
+        self.redo_instances += lo.instances - counts[1]
         # a refusal keeps the rows it appended, evaluated at the call, which a fold reads
         values += variant.captured.lowered.lowering.program.values[len(values) :]
         self.redispatch_s += time.perf_counter() - start
@@ -1358,12 +1398,37 @@ class HostTraceReplay(torch._C._HostTraceEntry):
             refusals[str(e)] = refusals.get(str(e), 0) + 1
             _drop_tracebacks(e)
             return e
+        lowered = variant.captured.lowered
         relocated = variant.memory.relocated
-        if any(isinstance(s, PointerSlot) and s.base in relocated for _, _, launches in entries for lo in launches for s in lo.slots):
-            program, entries = relocate_entries(variant.captured.lowered, relocated, entries, args)
+        if any(isinstance(s, PointerSlot) and s.base in relocated for _, _, launches, _ in entries for lo in launches for s in lo.slots):
+            program, entries = relocate_entries(lowered, relocated, entries, args)
         ok = self._native_mutate(variant, "a program", variant.native.set_program, program)
-        for site, predicate, launches in entries if ok else ():
-            if not (ok := self._native_mutate(variant, "an entry", variant.native.add_entry, site, predicate, tuple(map(launch_row, launches)))):
+        # every section takes its op's place in the plan, or none is added
+        for site, _, launches, section in entries if ok else ():
+            selector = lowered.selectors[site - len(lowered.sites)]
+            if section is not None and (why := check_section(lowered, variant.memory, selector.nodes, launches, section.temporaries, section.drops)) is not None:
+                e = FoldRefused(f"{variant.tape.ops[selector.op].func}'s section: {why}")
+                e.op = selector.op
+                lowered.lowering.refused.add(site)
+                # the entries' guards lower_entries kept: none is the variant's
+                del lowered.lowering.entry_guards[len(lowered.lowering.entry_guards) - len(entries) :]
+                refusals[str(e)] = refusals.get(str(e), 0) + 1
+                return e
+        values = lowered.lowering.program.values
+        for site, predicate, launches, section in entries if ok else ():
+            if section is None:
+                ok = self._native_mutate(variant, "an entry", variant.native.add_entry, site, predicate, tuple(map(launch_row, launches)))
+            else:
+                arms = variant.arms.setdefault(site, [])
+                arms.append(section_binding(launches, values))
+                places = section_places(lowered, variant.memory, lowered.selectors[site - len(lowered.sites)].nodes)
+                rows = [row for _, row in section.temporaries]
+                ok = self._native_mutate(variant, "an entry", variant.native.add_entry, site, predicate, tuple(map(launch_row, launches)), len(arms), rows, list(section.drops), *places)
+                if ok:
+                    lowered.lowering.sections += len(rows)
+                    self.sections += 1
+                    self.section_bytes = max(self.section_bytes, sum(values[row] for row in rows))
+            if not ok:
                 break
             variant.folded.append(launches)
         if not ok:

@@ -36,6 +36,7 @@ _CPP_ONLY = {
         "test_a_refused_key_is_a_row",
         "test_alternating_keys_take_their_rows",
         "test_keys_past_64_harvest",
+        "test_a_missed_key_leaves_no_stale_site_row",
     ),
     # the Python dispatch holds the arguments while it serves the call, so a
     # freed or boxed argument dies after the replay, not at its last use

@@ -148,6 +148,19 @@ at::Tensor HostTraceVariant::view(
   return t;
 }
 
+bool HostTraceVariant::dropped(int64_t k, const Frame& frame) const {
+  const int64_t site = allocations_[k].owner;
+  if (site < 0) {
+    return false;
+  }
+  const int64_t row = frame.site_entries[site];
+  if (row <= 0) {
+    return false;
+  }
+  const auto& drops = sites_[site].entries[row - 1]->drops;
+  return std::find(drops.begin(), drops.end(), k) != drops.end();
+}
+
 int64_t HostTraceVariant::alloc_bytes(int64_t k, const Frame& frame) const {
   const Allocation& a = allocations_[k];
   if (a.site >= 0) {
@@ -156,10 +169,14 @@ int64_t HostTraceVariant::alloc_bytes(int64_t k, const Frame& frame) const {
       return sites_[a.site].entries[row - 1]->scratch[a.scratch];
     }
   }
-  return frame.values[a.nbytes];
+  return dropped(k, frame) ? 0 : frame.values[a.nbytes];
 }
 
 void HostTraceVariant::allocate_tensor(int64_t k, Frame& frame) const {
+  if (dropped(k, frame)) {
+    frame.bases[k] = 0;
+    return;
+  }
   const int64_t* v = frame.values.data();
   const Allocation& a = allocations_[k];
   c10::SmallVector<int64_t, 8> sizes, strides;
@@ -190,15 +207,43 @@ at::Tensor HostTraceVariant::allocate(
     const StepMemory& memory,
     const Segment* run,
     Frame& frame,
-    std::unique_lock<std::recursive_mutex>& hold) const {
+    std::unique_lock<std::recursive_mutex>& hold,
+    c10::SmallVector<c10::DataPtr, 4>& held) const {
+  auto* allocator = at::cuda::getCUDADeviceAllocator();
+  // the run's selected sections with temporaries, by their place in the order
+  c10::SmallVector<const Entry*, 4> sections;
+  for (size_t i = 0; run && i < run->sections.size(); ++i) {
+    const Site& s = sites_[run->sections[i]];
+    const int64_t row = frame.site_entries[run->sections[i]];
+    if (row > 0 && !s.entries[row - 1]->temporaries.empty()) {
+      sections.push_back(s.entries[row - 1].get());
+    }
+  }
+  std::sort(sections.begin(), sections.end(), [](const Entry* a, const Entry* b) {
+    return a->alloc_at < b->alloc_at;
+  });
+  auto make = [&](const Entry& e, c10::SmallVector<c10::DataPtr, 4>& into) {
+    for (size_t j = 0; j < e.temporaries.size(); ++j) {
+      into.push_back(allocator->allocate(frame.values[e.temporaries[j]]));
+      frame.bases[e.first_base + j] = reinterpret_cast<int64_t>(into.back().get());
+    }
+  };
   // Eager order frees a temporary before its run's graph is queued, so the
   // allocator stays locked until the launch: another thread's allocation on
   // the stream would take a freed temporary's bytes and queue its kernels
   // ahead of the graph. A segment released meanwhile (our own allocation's
   // OOM retry or garbage collection) may have taken them too, and replay
   // hooks run Python before the launch: then the temporaries go in a run
-  // buffer, the tensors keep their addresses and nothing has launched.
-  if (memory.order.empty() || observed(*run)) {
+  // buffer, the tensors keep their addresses and nothing has launched. A
+  // section's temporaries are made and freed where its op's are, in eager
+  // order or, a run of no temporaries, among its tensors; else before the
+  // run's own allocations (no block of one of its temporaries is free yet),
+  // held until it is queued.
+  const bool observed_run = run && observed(*run);
+  if (observed_run || (memory.order.empty() && (sections.empty() || !memory.temporaries.empty()))) {
+    for (const Entry* e : sections) {
+      make(*e, held);
+    }
     int64_t pt = phase_now();
     for (int64_t k : memory.tensors) {
       allocate_tensor(k, frame);
@@ -211,10 +256,31 @@ at::Tensor HostTraceVariant::allocate(
   hold = c10::cuda::CUDACachingAllocator::lockDeviceAllocator(device_);
   const size_t releases =
       c10::cuda::CUDACachingAllocator::getSegmentReleaseCount();
-  auto* allocator = at::cuda::getCUDADeviceAllocator();
   c10::SmallVector<c10::DataPtr, 16> blocks;
   blocks.resize(memory.temporaries.size());
-  for (const Event& e : memory.order) {
+  c10::SmallVector<c10::DataPtr, 4> made;
+  c10::SmallVector<size_t, 4> starts;
+  const size_t n = memory.order.empty() ? memory.tensors.size() : memory.order.size();
+  for (size_t p = 0; p <= n; ++p) {
+    for (size_t s = 0; s < sections.size(); ++s) {
+      if (sections[s]->alloc_at == p) {
+        starts.push_back(made.size());
+        make(*sections[s], made);
+      }
+      if (sections[s]->free_at == p) {
+        for (size_t j = 0; j < sections[s]->temporaries.size(); ++j) {
+          made[starts[s] + j].clear();
+        }
+      }
+    }
+    if (p == n) {
+      break;
+    }
+    if (memory.order.empty()) {
+      allocate_tensor(memory.tensors[p], frame);
+      continue;
+    }
+    const Event& e = memory.order[p];
     if (e.op == Op::Tensor) {
       allocate_tensor(e.alloc, frame);
     } else if (e.op == Op::Temporary) {
@@ -228,6 +294,9 @@ at::Tensor HostTraceVariant::allocate(
     return at::Tensor();
   }
   ++buffered_runs;
+  for (const Entry* e : sections) {
+    make(*e, held);
+  }
   return run_buffer(memory, frame);
 }
 
@@ -242,21 +311,34 @@ at::Tensor HostTraceVariant::run_buffer(const StepMemory& memory, Frame& frame)
     int64_t offset, end, last;
   };
   const size_t count = memory.temporaries.size();
-  c10::SmallVector<int64_t, 64> sizes(count);
-  for (size_t i = 0; i < count; ++i) {
+  auto rounded = [&](size_t i) {
     const int64_t n = alloc_bytes(memory.temporaries[i].alloc, frame);
-    sizes[i] = (n + kBlock - 1) / kBlock * kBlock;
+    return (n + kBlock - 1) / kBlock * kBlock;
+  };
+  // the last placement holds while the rows that size the temporaries (a few:
+  // many temporaries share one) and the scratch buffers' sizes are its
+  const int64_t* v = frame.values.data();
+  bool reuse = placement_reuse_enabled && memory.placed_total >= 0;
+  for (size_t k = 0; reuse && k < memory.size_rows.size(); ++k) {
+    reuse = v[memory.size_rows[k]] == memory.placed_row_values[k];
   }
-  if (!placement_reuse_enabled || memory.placed_total < 0 ||
-      !std::equal(
-          sizes.begin(),
-          sizes.end(),
-          memory.placed_sizes.begin(),
-          memory.placed_sizes.end())) {
+  for (size_t j = 0; reuse && j < memory.site_temporaries.size(); ++j) {
+    const size_t i = memory.site_temporaries[j];
+    reuse = rounded(i) == memory.placed_sizes[i];
+  }
+  if (!reuse) {
     memory.placed_total = -1;
-    memory.placed_sizes.assign(sizes.begin(), sizes.end());
+    memory.placed_sizes.resize(count);
+    for (size_t i = 0; i < count; ++i) {
+      memory.placed_sizes[i] = rounded(i);
+    }
+    memory.placed_row_values.resize(memory.size_rows.size());
+    for (size_t k = 0; k < memory.size_rows.size(); ++k) {
+      memory.placed_row_values[k] = v[memory.size_rows[k]];
+    }
     memory.placed_offsets.assign(count, 0);
   }
+  const std::vector<int64_t>& sizes = memory.placed_sizes;
   std::vector<int64_t>& offsets = memory.placed_offsets;
   int64_t total = memory.placed_total;
   c10::SmallVector<Live, 16> live;

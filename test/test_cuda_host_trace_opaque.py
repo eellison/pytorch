@@ -79,6 +79,10 @@ def mul_chain(x, y):
     return add(torch.mul(add(x), y), 1)
 
 
+def prefixed_muls(w, x, y):
+    return torch.mul(add(x), x), torch.mul(y, y), add(w)
+
+
 def mm_chain(x, w):
     return add(torch.mm(add(x), w))
 
@@ -765,6 +769,39 @@ class TestOpaqueCalls(TestCase):
         for v in bound(f):
             kinds = {type(lo).__name__ for lo in v.captured.lowered.launches}
             self.assertEqual("LoweredMemset" in kinds, style == "scratch")
+
+    @mock.patch("torch.cuda._host_trace_replay.oob_learn", False)
+    def test_a_missed_key_leaves_no_stale_site_row(self):
+        # static prefix: a call at a new size of x misses x's key after its rows
+        # are evaluated; the next call changes only y's size, so only y's rows
+        # are evaluated again, and x's site still resolves at x's size
+        p = TableProvider()
+        f = HostTraceReplay(prefixed_muls, opaque=(p,), static_prefix=1)
+        w = torch.randn(256, device="cuda")
+
+        def check(n, m):
+            x, y = torch.randn(n, device="cuda"), torch.randn(m, device="cuda")
+            self.assertEqual(f(w, x, y), prefixed_muls(w, x, y), atol=0, rtol=0)
+
+        for n, m in ((512, 512), (640, 640), (512, 640), (640, 512)) * 2:
+            check(n, m)
+        hits = f.static_hits
+        self.assertGreater(hits, 0)
+        for n, m in ((1024, 512), (1024, 640), (512, 640), (1024, 512), (640, 640), (1024, 640)):
+            check(n, m)
+        self.assertGreater(f.static_hits, hits)
+
+    @mock.patch("torch.cuda._host_trace_replay.oob_learn", False)
+    def test_run_buffer_places_scratch_at_each_keys_bytes(self):
+        # the scratch buffer is a run buffer temporary sized by its key's row:
+        # another size places the run's temporaries again, a repeat of the
+        # last size reuses its placement
+        p = TableProvider(style="scratch")
+        f = HostTraceReplay(mul_chain, opaque=(p,), memory="run_buffer")
+        for n in (512, 1024, 512, 512, 4096, 1024, 1024, 4096, 512):
+            x, y = torch.randn(n, device="cuda"), torch.randn(n, device="cuda")
+            self.assertEqual(f(x, y), mul_chain(x, y), atol=0, rtol=0)
+        self.assertEqual(len(bound(f)), 1)
 
     @parametrize("first", [512, 640])
     def test_binding_switches(self, first):

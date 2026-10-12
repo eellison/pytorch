@@ -72,6 +72,14 @@ if HAS_TRITON:
         _body(x_ptr, y_ptr, n, s, B)
 
     @triton.jit
+    def _add_wide(x_ptr, y_ptr, n, s, B: tl.constexpr, WIDE: tl.constexpr):
+        i = tl.program_id(0) * B + tl.arange(0, B)
+        if WIDE:
+            i = i.to(tl.int64)
+        m = i < n
+        tl.store(y_ptr + i, tl.load(x_ptr + i, mask=m) + s, mask=m)
+
+    @triton.jit
     def _add_pdl(x_ptr, y_ptr, n, s, B: tl.constexpr):
         tl.extra.cuda.gdc_wait()
         _body(x_ptr, y_ptr, n, s, B)
@@ -993,13 +1001,59 @@ class TestTritonLaunch(TestCase):
             registry._graphs.clear()
             registry._graphs.update(graphs)
 
+    def test_a_symbolic_bool_argument_redispatches(self):
+        # a constexpr of a size's condition (n >= 2**31, a 64-bit index switch)
+        # is a SymBool argument of the launch: it binds as a SymInt does, so the
+        # launch's specialization flips (% 16, == 1) redispatch as with a constant
+        def run(wide):
+            def f(x):
+                n = x.numel()
+                y = torch.empty_like(x)
+                _add_wide[(triton.cdiv(n, 128),)](x, y, n, 1, B=128, WIDE=n >= 2**31 if wide else False)
+                return y
+
+            r = HostTraceReplay(f)
+            for n in (1000, 1024, 3001, 4096, 1, 777, 2048, 16, 1000, 5):
+                x = torch.randn(n, device="cuda")
+                self.assertEqual(r(x), f(x), atol=0, rtol=0)
+            return r.traces, r.redispatches, r.eager
+
+        constant = run(False)
+        self.assertGreater(constant[1], 0)
+        self.assertEqual(run(True), constant)
+
+    @mock.patch.object(torch.cuda._host_trace, "dispatch_units", True)
+    def test_a_programmatic_choice_in_a_dispatch_unit_is_a_section(self):
+        # past 64 rows the unit's kernel waits on its predecessor (launch_pdl):
+        # another launch topology, which instantiation fixes (a split count's
+        # cluster is another): a section of the one variant
+        def pick(x):
+            y = torch.empty_like(x)
+            n, grid = x.numel(), (triton.cdiv(x.numel(), 128),)
+            if x.shape[0] < 64:
+                _add[grid](x, y, n, 1, B=128)
+            else:
+                _add_pdl[grid](x, y, n, 1, B=128, launch_pdl=True)
+            return y
+
+        unit = torch.cuda._host_trace.dispatch_unit(pick)
+
+        def f(x):
+            return unit(x + 1).sin()
+
+        r = HostTraceReplay(f)
+        for m in (8, 100, 8, 100, 30, 200):
+            x = torch.randn(m, 64, device="cuda")
+            self.assertEqual(r(x), f(x), atol=0, rtol=0)
+        self.assertEqual((r.traces, r.redispatches, r.sections, r.eager, r.retrace_causes), (1, 1, 1, 0, {}))
+
     @parametrize("how", ["model", "unit", "unit_off", "read_again", "allocates"])
     def test_a_python_kernel_choice_in_a_dispatch_unit_dispatches_again(self, how):
         # SGLang's TGV gating: `if m < X:` in Python picks one of two kernels.
         # In the model's Python its guard is the graph's (a trace per side):
         # the next op's redispatch would not run the `if` again. A
         # dispatch_unit does; a guard read outside the unit too stays the
-        # graph's; a choice that allocates otherwise traces its class
+        # graph's; a choice that allocates otherwise is a section
         def pick(x):
             y = torch.empty_like(x)
             n, grid = x.numel(), (triton.cdiv(x.numel(), 128),)
@@ -1028,9 +1082,9 @@ class TestTritonLaunch(TestCase):
             for m in (8, 100, 8, 100, 30, 200):
                 x = torch.randn(m, 64, device="cuda")
                 self.assertEqual(r(x), f(x), atol=0, rtol=0)
-        traces = 1 if how == "unit" else 2
-        counts = (r.traces, r.replays, r.eager, r.redispatches, len(r.variants))
-        self.assertEqual(counts, (traces, 6 - traces, 0, int(how == "unit"), traces))
+        traces = 1 if how in ("unit", "allocates") else 2
+        counts = (r.traces, r.replays, r.eager, r.redispatches, r.sections, len(r.variants))
+        self.assertEqual(counts, (traces, 6 - traces, 0, int(traces == 1), int(how == "allocates"), traces))
 
 
 _REVIEWED = {
@@ -1213,6 +1267,7 @@ def setUpModule():
     import torch.cuda._host_trace_capture as capture
 
     _host_trace_hint_audit.enable_for_tests()
+    torch.cuda._host_trace.verify_redo_templates = True
     capture.raise_trace_disagreements = True
     torch.cuda._host_trace.raise_unexpected = True
 

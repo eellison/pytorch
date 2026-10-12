@@ -64,8 +64,13 @@ Outcome HostTraceVariant::commit(Frame& frame, PyObject** result) {
     const bool run = i < steps_.size() && steps_[i].segment >= 0;
     std::unique_lock<std::recursive_mutex> hold;
     pt = phase_now();
+    c10::SmallVector<c10::DataPtr, 4> sections;
     at::Tensor scratch = allocate(
-        memory, run ? &segments_[steps_[i].segment] : nullptr, frame, hold);
+        memory,
+        run ? &segments_[steps_[i].segment] : nullptr,
+        frame,
+        hold,
+        sections);
     bool misaligned = false;
     for (int64_t k : memory.tensors) {
       misaligned |= frame.bases[k] % kAlignment != 0;
@@ -107,6 +112,7 @@ Outcome HostTraceVariant::commit(Frame& frame, PyObject** result) {
     // the buffer's bytes are freed after the run's graph is queued, so
     // stream-ordered after every kernel that uses them
     scratch.reset();
+    sections.clear();
     for (int64_t b : memory.drops) {
       frame.tensors[b].reset();
     }
@@ -1674,7 +1680,12 @@ void initHostTraceVariantBindings(PyObject* module) {
           &HostTraceVariant::add_entry,
           py::arg("site"),
           py::arg("predicate"),
-          py::arg("nodes"))
+          py::arg("nodes"),
+          py::arg("arm") = 0,
+          py::arg("temporaries") = std::vector<int64_t>(),
+          py::arg("drops") = std::vector<int64_t>(),
+          py::arg("alloc_at") = 0,
+          py::arg("free_at") = 0)
       .def(
           "set_program",
           &HostTraceVariant::set_program,
@@ -1695,6 +1706,8 @@ void initHostTraceVariantBindings(PyObject* module) {
   initHostTraceAtenBindings(m);
   // the native encode takes a descriptor's fill and Triton flavor
   m.attr("_host_trace_tma_flavors") = true;
+  // add_entry takes sections: nodes of their own and temporaries
+  m.attr("_host_trace_section_entries") = true;
   // and launches the driver's map as is (a descriptor's library bits)
   m.attr("_host_trace_tma_raw") = true;
   m.def("_host_trace_global_state", [] {

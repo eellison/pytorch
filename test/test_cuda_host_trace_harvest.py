@@ -1052,6 +1052,7 @@ def setUpModule():
     import torch.cuda._host_trace_capture as capture
 
     _host_trace_hint_audit.enable_for_tests()
+    torch.cuda._host_trace.verify_redo_templates = True
     capture.raise_trace_disagreements = True
     torch.cuda._host_trace.raise_unexpected = True
 
@@ -1270,6 +1271,16 @@ def _mm_then_branch(x, w):
 
 _nested_lib.impl("mm_then_branch", _mm_then_branch, "CUDA")
 torch.library.register_fake("ht_nested::mm_then_branch", lambda x, w: x.new_empty(x.shape[0], w.shape[1]), lib=_nested_lib)
+_nested_lib.define("mm_by_branch(Tensor x, Tensor w) -> Tensor")
+
+
+def _mm_by_branch(x, w):
+    # the GEMM's operand is another view on each side of the op's own guard
+    return torch.mm(x, w if x.shape[0] > 16 else w.t()) + 1
+
+
+_nested_lib.impl("mm_by_branch", _mm_by_branch, "CUDA")
+torch.library.register_fake("ht_nested::mm_by_branch", lambda x, w: x.new_empty(x.shape[0], w.shape[1]), lib=_nested_lib)
 torch.library.register_fake("ht_extern::scale_qk", lambda q, k, w: None, lib=_extern_lib)
 torch.library.register_fake("ht_extern::rope_qk", lambda q, k, pos, table: None, lib=_extern_lib)
 
@@ -1409,6 +1420,60 @@ class TestExternHarvest(TestCase):
         self.assertTrue(all(site_nodes.isdisjoint(s.nodes) for s in lowered.selectors))
         self.assertEqual(r.eager, 1)
         self.assertGreater(r.replays, 0)
+
+    def test_an_op_holding_a_keyed_site_redispatches(self):
+        # the op's own guard flips: its redo's GEMM is the variant's keyed site in the same role, which serves its key
+        # per call, so the entry holds only the op's other launches: one trace, every flip redispatched
+        def fn(x, w):
+            return (torch.ops.ht_nested.mm_then_branch(x + 1, w) - 1,)
+
+        r = HostTraceReplay(fn, opaque=(HarvestProvider(("blas",)),))
+        w = torch.randn(64, 64, device="cuda")
+        with tf32_off():
+            for m in (8, 40, 8, 40, 100, 4):
+                x = torch.randn(m, 64, device="cuda")
+                self.assertEqual(r(x, w), fn(x, w), atol=0, rtol=0)
+        self.assertEqual(r.traces, 1)
+        self.assertGreater(r.redispatches, 0)
+        self.assertEqual(r.retrace_causes, {})
+        for v in r.variants:
+            memory.check_plan(v.captured.lowered, v.memory)
+
+    def test_layers_holding_keyed_sites_share_a_redo_template(self):
+        # four layers of the op flip together: one full redo per distinct read (the first layer reads an argument,
+        # the others the layer before's output), the others its template (verify mode, on in this suite, redoes each
+        # in full and compares). One weight: a key holds each argument's own size symbols
+        def fn(x, w):
+            for _ in range(4):
+                x = torch.ops.ht_nested.mm_then_branch(x, w) * 0.5
+            return (x,)
+
+        r = HostTraceReplay(fn, opaque=(HarvestProvider(("blas",)),))
+        w = torch.randn(64, 64, device="cuda") / 8
+        with tf32_off():
+            for m in (8, 40, 8, 40):
+                x = torch.randn(m, 64, device="cuda")
+                self.assertEqual(r(x, w), fn(x, w), atol=0, rtol=0)
+        self.assertEqual(r.traces, 1)
+        self.assertEqual((r.redos, r.redo_instances), (2, 2))
+
+    def test_an_op_whose_keyed_site_changes_role_retraces(self):
+        # the GEMM reads w on one side of the op's guard and w.t() on the other: the redo's nested call is not the
+        # variant's site in the same role, so the flip refuses and traces again, counted
+        def fn(x, w):
+            return (torch.ops.ht_nested.mm_by_branch(x * 2, w) - 1,)
+
+        r = HostTraceReplay(fn, opaque=(HarvestProvider(("blas",)),))
+        w = torch.randn(64, 64, device="cuda")
+        with tf32_off():
+            for m in (8, 40, 8):
+                x = torch.randn(m, 64, device="cuda")
+                self.assertEqual(r(x, w), fn(x, w), atol=0, rtol=0)
+        self.assertEqual(r.traces, 2)
+        self.assertEqual(r.redispatches, 0)
+        ((cause, n),) = r.retrace_causes.items()
+        self.assertEqual((cause[0], cause[1], n), ("dispatch", "ht_nested.mm_by_branch.default", 1))
+        self.assertIn("another keyed site in ht_nested.mm_by_branch.default", cause[4])
 
     def test_a_refused_key_at_a_redispatched_call_retraces(self):
         # the extern key refused (past extern_cap) at a call the variant holds through the bmm's
@@ -1744,12 +1809,12 @@ class TestExternHarvest(TestCase):
         # the entry's first call (5) runs eagerly; 17 traces
         self.assertEqual((r.traces, r.redispatches, r.eager), (2, 0, 1))
 
-    @parametrize("oob,traces", [(True, 2), (False, 4)])
+    @parametrize("oob,traces", [(True, 1), (False, 4)])
     def test_new_shapes_are_local(self, oob, traces):
         # a shape sweep over one variant's class traces once. A new length is
         # learned (rope, keyed by another entry), redispatched (the embedding's
         # index_select small-index kernel at <= 16 indices), by oob_learn; the
-        # sum's split reduction traces its class
+        # sum's split reduction is a section
         table = torch.randn(4096, 64, device="cuda", dtype=bf16)
         emb = torch.randn(1000, 192, device="cuda", dtype=bf16)
         k_cache, v_cache = (torch.randn(8192, 64, device="cuda", dtype=bf16) for _ in range(2))
@@ -1775,7 +1840,7 @@ class TestExternHarvest(TestCase):
                 self.assertEqual(args, ref, atol=0, rtol=0)
         self.assertEqual((len(p.refused), self.eager_calls(r), r.traces), (0, [], traces))
         if oob:
-            self.assertEqual((r.redispatches, r.relowers, r.eager, len(r.variants), r.learners), (1, 0, 1, 2, 0))
+            self.assertEqual((r.redispatches, r.sections, r.relowers, r.eager, len(r.variants), r.learners), (2, 1, 0, 1, 1, 0))
 
     @mock.patch("torch.cuda._host_trace_replay.oob_learn", False)
     def test_learn_pool(self):
