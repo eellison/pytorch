@@ -77,8 +77,8 @@ its cubins on first use; that is fine. Give the fork arm its own `FLASHINFER_WOR
   `exec python "$@"`. Drop the `CAND_LINE` cases and `site_land`: there is one torch here.
 - `serve/ix/ix_run.py`: runs one point (fresh server, InferenceX client, profiler burst, counters). Usage:
   `bash <launcher> serve/ix/ix_run.py --sku <sku> --scenario 1k1k --conc 4 --gpu 0 --tag <tag>`.
-- `serve/ix/ix_report.py <tag>`: the table. It loads `serve/ix/master.yaml`; merge in `vllm/ix_master_attnlc.yaml`
-  (the vLLM SKUs live there) so every SKU resolves.
+- `serve/ix/ix_nv_report.py --master vllm/ix_master_attnlc.yaml <tag_r1> <tag_r2> <tag_r3>`: the NVFP4 table, repeats
+  merged as median [min-max]. `serve/ix/nv_sweep.sh` is the original sweep driver (order, repeats, idle gating).
 - `serve/plugin/armv_serve.py`: the worker extension (`--worker-extension-cls armv_serve.ArmVWorkerExt`) and the
   `/armv/install` endpoint. Default arms load it in observe mode (counters only).
 - `serve/armV_stock/`, `vllm/armV_stock_fast/`: the "ours" adapters (`ARMV_SERVE_ADAPTER`).
@@ -94,20 +94,28 @@ weights). Three arms per model, all with the same kernels; they differ only in w
 
 | arm | Qwen3.8-27B SKU to copy | what it is |
 |---|---|---|
-| default | `qwen3.827b-fp4-gb300-vllm` | vLLM default: torch.compile + FULL_AND_PIECEWISE graphs |
-| default-nc | same + `x-raw-args: [-cc.mode, none, -cc.cudagraph_mode, full_decode_only]` | no compile, full graphs for decode only |
-| ours | `qwen3.827bvs-fp4-gb300-vllm` | `--enforce-eager` + host-trace replay of the whole step (fork + `ARMV_*` env as in the SKU) |
+| default | `qwen3.827bp4-fp4-gb300-vllm` | the InferenceX recipe: torch.compile + FULL_AND_PIECEWISE graphs |
+| default-nc | `qwen3.827bnc4-fp4-gb300-vllm` | `-cc.mode none -cc.cudagraph_mode full_decode_only`: no compile, full graphs for decode only |
+| ours | `qwen3.827bvs4-fp4-gb300-vllm` | `--enforce-eager` + host-trace replay of the whole step (adapter `serve/armV_stock`, `ARMV_*` env as in the SKU) |
 
-For Flash-Next: default = `qwen3.8flashnext-fp4-gb300-vllm` (the recipe's single-GPU no-compile override), ours =
-`qwen3.8flashnextvs-fp4-gb300-vllm`. Replace every `CAND_LINE` value with nothing (one torch) and every absolute
-`ARMV_SERVE_ADAPTER` / `FLASHINFER_WORKSPACE_BASE` path with this box's.
+Flash-Next: `qwen3.8flashnextp4-fp4-gb300-vllm` (the recipe's single-GPU override, already no-compile, so default =
+default-nc and there are two arms) and `qwen3.8flashnextvs4-fp4-gb300-vllm`. Replace every `CAND_LINE` value with
+nothing (one torch) and every absolute `ARMV_SERVE_ADAPTER` / `FLASHINFER_WORKSPACE_BASE` path with this box's.
+
+Important: the ours SKUs must keep `ARMV_HOST_ARGS: pinned`. Without it every mixed/prefill trace declines on a CPU
+argument and runs eagerly after paying a full trace (an earlier run lost 10-26% that way). Check the counts: mixed
+steps should replay, not show up as eager. `ARMV_STEPLOG=1` (on in these SKUs) saves a per-step timeline
+(`*_steps.json`); `serve/ix/ix_tails.py <tag>` breaks the tail requests down into trace / learn / redispatch /
+eager / replay time.
+
+The 27B ours arm sends attention through the adapter's trtllm shim (the fork refuses head dim 256); that is expected.
 
 Models (Hugging Face): `Inferact/Qwen3.8-27B-NVFP4`, `Inferact/Qwen3.8-Flash-Next-NVFP4`; `Qwen/Qwen3-8B` for a smoke.
 Check `df` before downloading.
 
 ## 6. Order of work
 
-1. Smoke: Qwen3-8B, SKUs `qwen38bp4` (default) and `qwen38bvs4` (ours) copied to b200, 1k1k conc 4. Expected
+1. Smoke: Qwen3-8B, SKUs `qwen38bp4-bf16-gb300-vllm` (default) and `qwen38bvs4-bf16-gb300-vllm` (ours) copied to b200, 1k1k conc 4. Expected
    from the original box: ours bitwise on every checked request (the point JSON's `check.summary`: `bitwise == n`),
    2-10 traces, 2-3 eager steps, `replays` about equal to `steps`.
 2. Qwen3.8-27B NVFP4: 1k1k and 8k1k at conc 1/4/16/64, all three arms, 3 repeats at conc 4 and 64.

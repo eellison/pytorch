@@ -5,7 +5,9 @@
 # or adapter eager call, no replay), replay, else vLLM's dispatch mode (FULL / PIECEWISE / NONE: the default arms).
 # Per request (worker step indices): prefill window = admit step start .. first-token step end; decode window = first-token
 # step end .. finish step end. The step running when a request arrived is not in its window (the worker cannot see arrival);
-# "prev" counts the class of the step before the admit step.
+# "prev" counts the class of the step before the admit step. Step seconds are host time inside execute_model; "between" is
+# the time between consecutive steps (vLLM's sample_tokens / output processing / scheduling; under async scheduling
+# also the wait for the GPU), so a window's classes sum to 100%.
 # Rows: all requests vs the slowest 10% by prefill window (TTFT tail) and by decode time per token (TPOT tail): mean window,
 # and the share of the window in each step class (trace / learn / redispatch / eager / replay / dispatch modes).
 import collections
@@ -32,6 +34,8 @@ def shares(win, steps, cls):
     out = collections.Counter()
     for i in range(lo, hi + 1):
         out[cls[i]] += steps[i][1] - steps[i][0]
+        if i < hi:
+            out["between"] += steps[i + 1][0] - steps[i][1]
     return out
 
 
@@ -67,7 +71,7 @@ def report(path):
         reqs.append(r)
     if not reqs:
         return
-    classes = [k for k in ORDER if k in per] + sorted(k for k in per if k not in ORDER)
+    classes = [k for k in ORDER if k in per] + sorted(k for k in per if k not in ORDER) + ["between"]
 
     def row(label, rs, win, key):
         tot = collections.Counter()
