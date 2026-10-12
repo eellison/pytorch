@@ -1,6 +1,7 @@
 cfb0d3fa1f805bd999769d3a35066810  ./armV_r27/adapter_cpp.py
 b706b6e5c3ea12548030084dc8a02d0e  ./armV_r27/adapter.py
 3f9395bb36cc065e266771483fe845a3  ./armV_r27/hostcuts.py
+6891daf35faf30d84cc3ab1202f8bc23  ./armV_r27/__pycache__/adapter_cpp.cpython-312.pyc
 97faf289afabc50f814e6455ef894479  ./armV_r27/trtllm_shim.py
 9c5a8268636b4222b6e786025d037086  ./bench/drive_fn.py
 6efbedf71cde63310707a2a20af3e76b  ./bin/build_ext.sh
@@ -19,11 +20,11 @@ f9aadecb0b95e6e0abd4268838c2db25  ./env.sh
 02eba4820ea937d990c05d569cbf0316  ./overlay_src/flashinfer/decode.py
 7e45100ef81d8d35c403d72cab07ea01  ./overlay_src/flashinfer/prefill.py
 77e7509303a5a830c5887199fbafcf8d  ./overlay_src/flashinfer/trtllm_cpp.py
-8e1da6fcb8daefe675295678be353081  ./RUNBOOK_27B.md
+125d1b5169e1f9045e8d6a8c8dc7bade  ./RUNBOOK_27B.md
 393bcf7a5e81bd28a71036167ba326d3  ./tools/ports_test.py
 1561c2864dd99ddae67f269341f0586f  ./tools/summ.py
 535b381270a2aa4a647ce25d5f9d7c5f  ./tools/timing_table.py
-0cceb318f0bc17e55f947f0cdb6f7ed6  ./tools/verdict.py
+383aa5bba8237961c2b3221a5eef722c  ./tools/verdict.py
 c61d7aea865cf43955d1135d65fcb09d  ./trtllm_cpp/ht/build_flags.py
 484900751b03851299900d14976e5fef  ./trtllm_cpp/ht/build.py
 52feb9f7b6bb0dcfb732146a936f5c37  ./trtllm_cpp/ht/fi_ht.h
@@ -53,5 +54,7 @@ ba30cf191c182cce5b36bc1b63c68e70  ./trtllm_cpp/upstream/src/include/flashinfer/t
 ada9e3bfda1abe87ecc4f65263ef0664  ./trtllm_cpp/upstream/src/include/flashinfer/trtllm/fmha/fmhaRunnerParams.h
 c66ab6d0dccfbc58e6ac1ba509b40f56  ./trtllm_cpp/upstream/src/include/flashinfer/trtllm/fmha/kernelParams.h
 7d557ef806d3856f6802e0aa501bc85e  ./trtllm_cpp/upstream/src/include/flashinfer/trtllm/fmha/lse.cuh
+9b9dfb7055bc6b39ca54f3ea503cec91  ./vllm_ports/__pycache__/sgl_ops_trace.cpython-312.pyc
+07f75fe2d4a161a6c4c6048724349600  ./vllm_ports/__pycache__/vllm_ops_trace.cpython-312.pyc
 8f659cb660c71dd4b6081cfa3d9c842e  ./vllm_ports/sgl_ops_trace.py
 66a4db6dcbd456cc061d2ebe4efe0c19  ./vllm_ports/vllm_ops_trace.py

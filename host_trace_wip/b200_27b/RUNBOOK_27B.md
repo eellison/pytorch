@@ -150,10 +150,24 @@ eager forward on the same metadata, from the same GDN recurrent state, including
 - every decode check row is bitwise, output and state;
 - every decode variant has **0 eager steps and 1 segment** (one CUDA graph per step);
 - harvested keys are cuBLAS only (`unsound_learned` is empty; `learned_by_op` shows only aten::mm / addmm / bmm);
-- at least one decode replay.
+- clean decode replays at bs 1, 8 and 64.
 
-Reference on GB300: decode variants are 2540-2684 kernels, 0 eager, 1 segment. Learned keys were aten::mm only. Every decode
-row was bitwise, including bs 64 and KV up to 8K.
+A row is clean when its eager reference has no NaN. The row compare is NaN-aware: two all-NaN outputs count as "bitwise".
+On GB300, some processes had NaN in vLLM's own eager reference from the first step on, on every GPU, which made their
+"bitwise" rows meaningless. The verdict therefore counts only clean rows and prints the rest.
+
+The verdict is one of three values:
+- **PASS**: all of the above, with clean decode replays at bs 1, 8 and 64.
+- **PARTIAL**: everything holds, but some of those batch sizes have no clean replay. Rerun the check in a fresh process
+  (new `TAG`), and note in NOTES.md which batch sizes were verified clean.
+- **FAIL**: anything else, including no clean decode replay at all.
+
+Also report the NaN-reference counts the verdict prints. If vLLM's eager reference has NaN at all, that is a finding by
+itself: note at which step it first appears. The rows are in order in the JSON's V.checks.
+
+Reference on GB300, from the processes whose references were clean: decode variants are 2540-2684 kernels, 0 eager,
+1 segment. Learned keys were aten::mm only. Every clean decode row was bitwise (bs 1/4/8). Clean evidence at bs 64 and at
+KV 6-8K is still missing on GB300, so the B200 run is the first chance to get it.
 
 If the check FAILS, do not time. Report the verdict and summary, and the first 200 lines of the log after the first traceback
 or `VLLM_PORT_DECLINE` line.
@@ -174,16 +188,22 @@ The default arms run stock FlashInfer (no overlay) in their own JIT workspace an
 default-nc.
 Do not run anything else on the machine during timing, and note the load average in NOTES.md (it is in `timing.log`).
 
-## Known open issue (do not time prefill / mixed)
-On the GB300 reference box, prefill-64 replays were not bitwise on one specific GPU. The replay output was all NaN or finite
-garbage, and the GDN state was wrong from layer 0, while eager vs eager was bitwise. The same configuration was bitwise on the
-other GPUs. It is not root-caused. We have ruled out the memory plan mode, PDL, host-argument mode, and the GDN CuTe call
-itself.
+## Known open issues (do not time prefill / mixed)
+1. On GB300, prefill-64 replays were not bitwise in most processes on one specific GPU. The replay output was all NaN
+   while vLLM's eager reference was clean; the GDN state was wrong from layer 0 and eager vs eager was bitwise. On another
+   GPU the same configuration was bitwise in every clean process. It is not root-caused. We have ruled out the memory plan
+   mode, PDL, host-argument mode, and the GDN CuTe call itself. A device synchronize before each replayed GDN eager step
+   changed the outcome, but that run's references had NaN (see 2), so it is not conclusive.
+2. vLLM's own eager forward of this model sometimes produced NaN. In some processes it happened for every step from the
+   first, on every GPU, before any replay ran. In others it started partway through a run. The GDN prefill
+   (FlashInfer chunked GDN) produced all-NaN output for a 64-token prefill with finite inputs. The NaN-aware compare hides
+   this, which is why the verdict counts clean rows only.
 
 So, on the B200:
-- report the prefill and mixed rows of the check (`verdict.txt` lists them by path / tokens / bitwise, with the eager-twice
-  control). If any prefill row is not bitwise, also run `bin/run_check.sh c1_gpuK` on two other GPUs and report which
-  GPUs show it;
+- report the prefill and mixed rows of the check (`verdict.txt` lists them by path / tokens / bitwise / reference clean or
+  NaN, with the eager-twice control). If any clean prefill row is not bitwise, also run `bin/run_check.sh c1_gpuK` on two
+  other GPUs and report which GPUs show it;
+- report whether vLLM's eager reference ever has NaN, and from which step;
 - do not time prefill or mixed, and do not report them as replay results.
 
 A second known item, not a correctness problem: mixed steps of 1032 tokens may decline to trace ("sN is not read from the
