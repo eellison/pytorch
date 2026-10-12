@@ -25,7 +25,7 @@ import sympy
 
 import torch
 import torch.utils._sympy.functions as F
-from torch.cuda import _host_trace_ir as _ir
+from torch.cuda import _host_trace_ir as _ir, _host_trace_program as _program
 
 _SIZE = re.compile(r"arg(\d+)\.size\((\d+)\)$")
 _STRIDE = re.compile(r"arg(\d+)\.stride\((\d+)\)$")
@@ -406,6 +406,22 @@ _MEMO_SIZE = 1 << 16
 _DECLINED = object()
 
 
+# the float rows the program evaluates, per element by its own rule (their sympy export, Identity around real
+# arithmetic, is not the host's float arithmetic)
+_IR_FLOATS = frozenset({"ffromint", "fadd", "fsub", "fmul", "fdiv", "f32i", "f32r", "f32add", "f32sub", "f32mul", "f32quot", "f32fma"})
+
+
+def _ir_float(op, vs):
+    def one(*v):
+        if op == "ffromint":
+            return float(int(v[0]))
+        return _program.float_value(op, [int(v[0])] if op == "f32i" else [float(x) for x in v])
+
+    if any(isinstance(v, np.ndarray) for v in vs):
+        return np.frompyfunc(one, len(vs), 1)(*vs).astype(np.float64)
+    return one(*vs)
+
+
 def _ir_vector(n, leaves, memo, i64, large):
     """The IR node n at the box's points, as _vector evaluates its sympy export: leaves maps a symbol's name to its
     value there (an array broadcast over the box, int64 where i64, else of Python ints; or a Python int); memo and
@@ -500,8 +516,14 @@ def _ir_vector(n, leaves, memo, i64, large):
     elif op == "not":
         v = ev(a[0])
         out = np.logical_not(v) if isinstance(v, np.ndarray) else not v
+    elif op in _IR_FLOATS:
+        out = _ir_float(op, [ev(x) for x in a])
+    elif op == "fconst":
+        out = n.hint
+    elif op == "fcmp":
+        out = _REL[a[0].capitalize()](ev(a[1]), ev(a[2]))
     else:
-        # the float lane and f32div: the guard's sympy export
+        # the rest of the float lane and f32div: the guard's sympy export
         raise _Fallback(f"no vector form for the IR kind {op}")
     (memo if not isinstance(out, np.ndarray) or out.size <= _MEMO_SIZE else large)[n.id] = out
     return out

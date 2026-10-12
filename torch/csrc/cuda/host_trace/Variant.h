@@ -143,7 +143,19 @@ struct Frame {
   bool uncaptured = false;
 };
 
-enum class Outcome : int64_t { Miss = 0, Misaligned = 1, Capture = 2, Hit = 3 };
+// MemoryKind: a memcpy node can only be set to operands of its capture's kind
+// of memory (cudaMalloc'd or cuMem-mapped), and an argument it copies is of
+// the other kind: the variant does not hold the call. No step has run
+enum class Outcome : int64_t {
+  Miss = 0,
+  Misaligned = 1,
+  Capture = 2,
+  Hit = 3,
+  MemoryKind = 4
+};
+
+// a memcpy node's update refused an operand of another kind of memory
+struct MemoryKindMismatch {};
 
 // A tensor an eager leaf or an output views: an argument, or a held base
 struct BaseRef {
@@ -656,6 +668,10 @@ class HostTraceVariant {
       const int64_t* v,
       const int64_t* bases) const;
   void patch_and_replay(Segment& run, Frame& frame);
+  // sets each memcpy node a later step replays whose argument operands moved
+  // to them, before any step runs: false if one is of the other kind of
+  // memory (the first step's own nodes fail at its patch, before it runs)
+  bool set_argument_copies(Frame& frame);
   // The segment's form the rows select, or -1; `arms` its arms
   int64_t form_of(
       const Segment& g,

@@ -611,7 +611,8 @@ def _launch(
             continue
         if isinstance(lo, LoweredMemcpy):
             kind = runtime.cudaMemcpyKind(MEMCPY_KINDS[lo.launch.kind])
-            _check_cuda_bindings(runtime.cudaMemcpyAsync(*copy_at[lo.launch.kind], values[lo.nbytes], kind, stream))
+            dst, src = _copy_addresses(lo, values, bases, copy_at)
+            _check_cuda_bindings(runtime.cudaMemcpyAsync(dst, src, values[lo.nbytes], kind, stream))
             _one_node(stream, nodes, f"memcpy {lo.launch.name}")
             continue
         t = lo.launch
@@ -677,7 +678,7 @@ def _verify(
                 raise declined(f"memcpy {lo.launch.name} captured a {kind.name} node")
             try:
                 kind = lo.launch.kind
-                if _memcpy_node(node) != MemcpyNode(*copy_at[kind], values[lo.nbytes], kind):
+                if _memcpy_node(node) != MemcpyNode(*_copy_addresses(lo, values, bases, copy_at), values[lo.nbytes], kind):
                     raise ValueError("other parameters")
             except ValueError:
                 raise declined(f"the captured node of memcpy {lo.launch.name} has other parameters") from None
@@ -713,12 +714,31 @@ def _verify(
 def _copy_operands(device: torch.device, nbytes: int, host: bool) -> tuple[torch.Tensor, torch.Tensor | None]:
     """What a captured memcpy node copies between: a memcpy node keeps its
     capture's kind of memory (cudaMalloc'd or cuMemMap'd, as expandable
-    segments are; pinned host memory), and a replay can only set it to
-    operands of that kind, so the capture copies within an allocation of the
-    caching allocator's, or between it and the pinned host allocator's. The
-    capture runs no node, and the first replay sets every memcpy."""
+    segments and symmetric memory are; pinned host memory), and a replay can
+    only set it to operands of that kind, so the capture copies within an
+    allocation of the caching allocator's, as a replay's allocations and eager
+    outputs are, or between it and the pinned host allocator's. A device
+    argument is copied at its own address instead (_copy_addresses): a
+    replay's argument of the other kind fails the node's update, a miss
+    (HostTraceVariant::commit). The capture runs no node, and the first
+    replay sets every memcpy."""
     pinned = torch.empty(nbytes, dtype=torch.uint8, pin_memory=True) if host else None
     return torch.empty(2 * nbytes, dtype=torch.uint8, device=device), pinned
+
+
+def _copy_addresses(
+    lo: LoweredMemcpy, values: Sequence[int], bases: Sequence[int], copy_at: dict[str, tuple[int, int]]
+) -> tuple[int, int]:
+    """The memcpy's (dst, src) in the capture: a device argument's own
+    address, so the node is of that argument's kind of memory; otherwise
+    copy_at's of the memcpy's kind."""
+    host = {"H2D": 1, "D2H": 0}.get(lo.launch.kind)
+    at = copy_at[lo.launch.kind]
+    dst, src = (
+        slot_address(slot, values, bases) if slot.root[0] == "argument" and i != host else at[i]
+        for i, slot in enumerate(lo.slots)
+    )
+    return dst, src
 
 
 def _segment(
@@ -914,30 +934,46 @@ def _neighbors(get: Callable[..., Any], node: Any) -> tuple[list[Any], list[Any]
     return list(nodes[:count]), list(edges[:count])
 
 
-def _live_memcpy_operands(graph: int) -> list[torch.Tensor]:
-    """Points each memcpy node of the graph at live memory of its operands'
-    kinds (device or pinned host) and returns that scratch, which must outlive
-    the graph's instantiation: a node still holds its capture's operands
-    (_copy_operands), freed since, and the driver reads a memcpy node's
-    pointers when it instantiates the graph (a freed pinned block crashes it).
-    A replay sets every memcpy before each launch, as for the capture's exec."""
+def _live_memcpy_operands(clone: int, copies: Sequence[tuple[int, int | None, int | None, int]]) -> list[torch.Tensor]:
+    """Points each memcpy node of the clone at live memory of the kind it was
+    captured with, and returns the scratch that must outlive the clone's
+    instantiation: a node still holds its capture's operands, freed since, and
+    the driver reads a memcpy node's pointers when it instantiates the graph (a
+    freed pinned block crashes it). The node keeps its operands' kinds of
+    memory (cudaMalloc'd or cuMem-mapped, pinned host) and a replay can only
+    set it to operands of those kinds, so each operand is the call's own where
+    it is an argument's (dst, src: its address, or None), the memory a replay
+    sets it to, and otherwise scratch from the allocator the capture's
+    placeholders and a replay's allocations come from. `copies` is per memcpy
+    node of the graph (node, dst, src, bytes) at the call; a replay sets every
+    memcpy before each launch, as for the capture's exec."""
     from cuda.bindings import driver
 
-    memcpy_t, host = driver.CUgraphNodeType.CU_GRAPH_NODE_TYPE_MEMCPY, driver.CUmemorytype.CU_MEMORYTYPE_HOST
-    nodes = [(n, _check_cuda_bindings(driver.cuGraphMemcpyNodeGetParams(n))) for n in graph_node_handles(graph) if _check_cuda_bindings(driver.cuGraphNodeGetType(n)) == memcpy_t]
+    host = driver.CUmemorytype.CU_MEMORYTYPE_HOST
+    nodes = []
+    for node, dst, src, nbytes in copies:
+        n = _check_cuda_bindings(driver.cuGraphNodeFindInClone(node, clone))
+        p = _check_cuda_bindings(driver.cuGraphMemcpyNodeGetParams(n))
+        if nbytes < 1:
+            # the call's patch refuses it; the node is only instantiated
+            dst = src = None
+            nbytes = p.WidthInBytes
+        nodes.append((n, p, dst, src, nbytes))
     if not nodes:
         return []
-    span = -(-max(p.WidthInBytes for _, p in nodes) // _ALLOC_ALIGNMENT) * _ALLOC_ALIGNMENT
-    device, pinned = _copy_operands(torch.device("cuda", torch.cuda.current_device()), span, any(host in (p.srcMemoryType, p.dstMemoryType) for _, p in nodes))
-    for n, p in nodes:
+    span = -(-max(nbytes for *_, nbytes in nodes) // _ALLOC_ALIGNMENT) * _ALLOC_ALIGNMENT
+    needs_host = any((dst is None and p.dstMemoryType == host) or (src is None and p.srcMemoryType == host) for _, p, dst, src, _ in nodes)
+    device, pinned = _copy_operands(torch.device("cuda", torch.cuda.current_device()), span, needs_host)
+    for n, p, dst, src, nbytes in nodes:
         if p.dstMemoryType == host:
-            p.dstHost = pinned.data_ptr()
+            p.dstHost = pinned.data_ptr() if dst is None else dst
         else:
-            p.dstDevice = device.data_ptr()
+            p.dstDevice = device.data_ptr() if dst is None else dst
         if p.srcMemoryType == host:
-            p.srcHost = pinned.data_ptr()
+            p.srcHost = pinned.data_ptr() if src is None else src
         else:
-            p.srcDevice = device.data_ptr() + span
+            p.srcDevice = device.data_ptr() + span if src is None else src
+        p.WidthInBytes = nbytes
         _check_cuda_bindings(driver.cuGraphMemcpyNodeSetParams(n, p))
     return [device] if pinned is None else [device, pinned]
 
@@ -946,20 +982,22 @@ def instantiate_form(
     graph: int,
     attributes: Sequence[tuple[int, dict[Any, Any], tuple[int, int, int]]],
     pieces: Sequence[tuple[Sequence[int], OpaqueBinding]],
+    copies: Sequence[tuple[int, int | None, int | None, int]] = (),
 ) -> tuple[int, int, list[list[tuple[int, int]]]]:
     """An exec, uploaded on the current stream, of a clone of the graph with
     each (kernel node, {CUlaunchAttributeID: value}, grid) at those launch
     attributes and grid and each piece (a chain of nodes, binding) the binding's nodes
     in the chain's place, on default edges: a programmatic edge into or out of
     the chain is dropped, or with keep_programmatic_edges kept where both ends
-    allow it. The clone, and each piece's nodes as _capture_piece."""
+    allow it; its memcpy nodes at `copies` (_live_memcpy_operands). The clone,
+    and each piece's nodes as _capture_piece."""
     from cuda.bindings import driver
 
     from torch.cuda._host_trace_opaque import OpaqueMemset
 
     clone = _check_cuda_bindings(driver.cuGraphClone(graph))
     try:
-        scratch = _live_memcpy_operands(clone)
+        scratch = _live_memcpy_operands(clone, copies)
         replaced = [n for nodes, _ in pieces for n in nodes]
         found = {n: _check_cuda_bindings(driver.cuGraphNodeFindInClone(n, clone)) for n in (*(n for n, *_ in attributes), *replaced)}
         cluster = driver.CUlaunchAttributeID.CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION

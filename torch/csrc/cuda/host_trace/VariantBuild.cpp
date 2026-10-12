@@ -1,6 +1,7 @@
 #include <torch/csrc/cuda/host_trace/Variant.h>
 
 #if !defined(USE_ROCM)
+#include <c10/cuda/CUDAException.h>
 #include <c10/cuda/driver_api.h>
 #include <torch/csrc/Dtype.h>
 #include <torch/csrc/Generator.h>
@@ -167,7 +168,17 @@ HostTraceVariant::HostTraceVariant(py::handle spec)
       continue;
     }
     if (r.kind == Kind::Memcpy) {
-      r.held_copy = memcpy_shape(r.copy, trace_rows.data(), trace_bases.data());
+      // the node holds the capture's operands (_copy_operands), not the traced
+      // call's: a later operand at the traced address must still set it
+      r.held = false;
+      // what it holds, operands of their kinds of memory (set_argument_copies)
+      cudaMemcpy3DParms p{};
+      C10_CUDA_CHECK(cudaGraphMemcpyNodeGetParams(
+          reinterpret_cast<cudaGraphNode_t>(r.node), &p));
+      r.held_copy = {
+          reinterpret_cast<int64_t>(p.dstPtr.ptr),
+          reinterpret_cast<int64_t>(p.srcPtr.ptr),
+          static_cast<int64_t>(p.extent.width)};
       continue;
     }
     const KernelRow& k = r.kernel;

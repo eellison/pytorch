@@ -244,8 +244,10 @@ void HostTraceVariant::index_users() {
       const Record& r = records_[i];
       const auto record = static_cast<uint32_t>(i);
       if (r.kind != Kind::Kernel) {
-        // a keyed site's memset takes its row's fields: patched every replay
-        if (r.site >= 0) {
+        // a keyed site's memset takes its row's fields, and a host memcpy's
+        // pinned block may be another allocation at the same address (freed
+        // and reallocated): patched every replay
+        if (r.site >= 0 || (r.kind == Kind::Memcpy && r.copy.kind != cudaMemcpyDeviceToDevice)) {
           always_[i] = 1;
           continue;
         }
@@ -423,6 +425,57 @@ void HostTraceVariant::switch_form_held(Segment& run, size_t form) {
   run.form = form;
 }
 
+bool HostTraceVariant::set_argument_copies(Frame& frame) {
+  const int64_t* v = frame.values.data();
+  const size_t first =
+      !steps_.empty() && steps_[0].segment >= 0 ? steps_[0].segment : SIZE_MAX;
+  for (size_t g = 0; g < segments_.size(); ++g) {
+    if (g == first) {
+      continue;
+    }
+    Segment& run = segments_[g];
+    const size_t form =
+        run.forms.size() > 1 ? frame.forms[g] : 0;
+    for (size_t i = run.first; i < run.stop; ++i) {
+      Record& r = records_[i];
+      if (r.kind != Kind::Memcpy) {
+        continue;
+      }
+      // an argument's address is its row's value; another operand keeps the
+      // node's (an allocation of the caching allocator's)
+      std::array<int64_t, 3> held = r.held_copy;
+      bool moved = false;
+      for (const auto& [f, k] : {std::pair{&r.copy.dst, 0}, std::pair{&r.copy.src, 1}}) {
+        if (f->base < 0) {
+          const int64_t x = field_value(*f, v, nullptr);
+          moved |= x != held[k];
+          held[k] = x;
+        }
+      }
+      if (!moved) {
+        continue;
+      }
+      CUgraphNode node =
+          form == 0 ? r.node : run.clones[form - 1].nodes[i - run.first];
+      const cudaError_t set = cudaGraphExecMemcpyNodeSetParams1D(
+          reinterpret_cast<cudaGraphExec_t>(run.execs[form]),
+          reinterpret_cast<cudaGraphNode_t>(node),
+          reinterpret_cast<void*>(held[0]),
+          reinterpret_cast<const void*>(held[1]),
+          static_cast<size_t>(held[2]),
+          r.copy.kind);
+      if (set == cudaErrorInvalidValue) {
+        (void)cudaGetLastError();
+        return false;
+      }
+      C10_CUDA_CHECK(set);
+      ++memory_node_sets;
+      r.held_copy = held;
+    }
+  }
+  return true;
+}
+
 void HostTraceVariant::patch_and_replay(Segment& run, Frame& frame) {
   int64_t pt = phase_now();
   const int64_t* v = frame.values.data();
@@ -498,18 +551,26 @@ void HostTraceVariant::patch_and_replay(Segment& run, Frame& frame) {
     }
     if (r.kind == Kind::Memcpy) {
       const std::array<int64_t, 3> held = memcpy_shape(r.copy, v, bases);
-      if (r.held && r.held_row == row && held == r.held_copy) {
+      // a device node holds its operands' addresses; a host one is set every
+      // replay (index_users)
+      if (r.held && r.held_row == row && held == r.held_copy && r.copy.kind == cudaMemcpyDeviceToDevice) {
         return;
       }
       r.held = false;
       TORCH_CHECK_VALUE(held[2] > 0, "host_trace: a memcpy of ", held[2], " bytes");
-      C10_CUDA_CHECK(cudaGraphExecMemcpyNodeSetParams1D(
+      const cudaError_t set = cudaGraphExecMemcpyNodeSetParams1D(
           reinterpret_cast<cudaGraphExec_t>(exec),
           reinterpret_cast<cudaGraphNode_t>(node),
           reinterpret_cast<void*>(held[0]),
           reinterpret_cast<const void*>(held[1]),
           static_cast<size_t>(held[2]),
-          r.copy.kind));
+          r.copy.kind);
+      if (set == cudaErrorInvalidValue) {
+        // an operand of the other kind of memory: the node is unchanged
+        (void)cudaGetLastError();
+        throw MemoryKindMismatch{};
+      }
+      C10_CUDA_CHECK(set);
       ++memory_node_sets;
       TORCH_CHECK(
           fail_after_setter < 0 || fail_after_setter-- != 0,

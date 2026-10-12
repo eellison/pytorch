@@ -115,6 +115,50 @@ class TestPinnedMemcpy(TestCase):
             self.assertEqual(out, _values(n, k) + 1, atol=0, rtol=0)
         self.assertOneGraph(f, ["H2D", "D2H"])
 
+    def test_a_copy_from_an_intermediate_at_the_traced_address(self):
+        # a device memcpy node holds its capture's operands, not the traced call's: a later call whose
+        # intermediate (the copy's source) lands at the traced call's address must still set it
+        def step(x, out):
+            return out.copy_(x * 2)
+
+        f = HostTraceReplay(step)
+        out = torch.zeros(4096, device="cuda")
+        for k in range(6):
+            x = torch.full((4096,), float(k + 1), device="cuda")
+            self.assertIs(f(x, out), out)
+            self.assertEqual(out, x * 2, atol=0, rtol=0)
+            del x
+        self.assertEqual((f.eager, f.replays), (0, 5))
+
+    def test_host_copies_across_freed_and_reregistered_blocks(self):
+        # rotating slots, and blocks freed (the pinned cache emptied) and registered again, often at the same
+        # address, across many replays: each replay sets its host memcpy nodes, which a node whose addresses
+        # repeat must not skip (a device node may)
+        n = 4096
+
+        def step(h, d, out):
+            y = d.copy_(h, non_blocking=True) + 1
+            out.copy_(y, non_blocking=True)
+            return y
+
+        f = HostTraceReplay(step)
+        d = torch.zeros(n, dtype=torch.int64, device="cuda")
+        slots = [(_pinned(n), _pinned(n)) for _ in range(2)]
+        for k in range(30):
+            fresh = k % 3 == 2
+            h, out = (_pinned(n), _pinned(n)) if fresh else slots[k % 2]
+            h.copy_(_values(n, k))
+            out.fill_(-1)
+            y = f(h, d, out)
+            torch.cuda.synchronize()
+            self.assertEqual(y, _values(n, k).cuda() + 1, atol=0, rtol=0)
+            self.assertEqual(out, _values(n, k) + 1, atol=0, rtol=0)
+            if fresh:
+                del h, out
+                torch._C._host_emptyCache()
+        self.assertEqual((f.eager, f.replays), (0, 29))
+        self.assertOneGraph(f, ["H2D", "D2H"])
+
     def test_sliced_pinned_arguments(self):
         # views at offsets into one pinned block, as staging slots carved from one buffer
         n = 256
@@ -282,6 +326,56 @@ class TestPinnedMemcpy(TestCase):
             torch.cuda.empty_cache()
             torch._C._host_emptyCache()
         self.assertGreater(r.replays, 0)
+
+    @unittest.skipIf("expandable_segments:True" in torch._C._accelerator_getAllocatorSettings(), "the caching allocator is in expandable segments")
+    def test_a_form_keeps_a_mapped_argument_copy(self):
+        # a memcpy node keeps its capture's kind of memory (cudaMalloc'd or cuMem-mapped): an argument copy
+        # captured in cuMem-mapped memory (expandable segments, as symm_mem's) stays at the call's argument
+        # in a form instantiated once the caching allocator is back to cudaMalloc, and its replays set it
+        def f(a0, src, dst):
+            dst.copy_(src)
+            return a0.t() @ a0, dst * 2
+
+        def mapped(t):
+            from cuda.bindings import driver
+
+            err, handle = driver.cuMemRetainAllocationHandle(t.data_ptr())
+            if err == driver.CUresult.CUDA_SUCCESS:
+                driver.cuMemRelease(handle)
+            return err == driver.CUresult.CUDA_SUCCESS
+
+        g = torch.Generator(device="cuda").manual_seed(0)
+        r = _host_trace_replay.HostTraceReplay(f)
+        pool = torch.cuda.MemPool()
+        settings = torch.cuda.memory._set_allocator_settings
+        # no cached cudaMalloc'd block serves the capture's placeholders
+        torch.cuda.empty_cache()
+        settings("expandable_segments:True")
+        try:
+            with torch.cuda.use_mem_pool(pool):
+                src = torch.empty(1024, 50, device="cuda", dtype=torch.bfloat16)
+                dst = torch.empty_like(src)
+            for _ in range(2):
+                src.copy_(torch.randn(1024, 50, device="cuda", generator=g))
+                a0 = torch.randn(58, 1024, device="cuda", generator=g).bfloat16()
+                out = r(a0, src, dst)
+                self.assertEqual(out[1], src * 2, atol=0, rtol=0)
+        finally:
+            settings("expandable_segments:False")
+        torch.cuda.empty_cache()
+        self.assertTrue(mapped(src) and mapped(dst))
+        replays = r.replays
+        for _ in range(2):
+            # a new mm key: a form of the segment
+            src.copy_(torch.randn(1024, 50, device="cuda", generator=g))
+            a0 = torch.randn(2, 1025, device="cuda", generator=g).bfloat16()
+            out = r(a0, src, dst)
+            torch.cuda.synchronize()
+            self.assertEqual(out[0], a0.t() @ a0, atol=0, rtol=0)
+            self.assertEqual(out[1], src * 2, atol=0, rtol=0)
+        self.assertEqual(r.replays, replays + 2)
+        del src, dst, out
+        torch.cuda.synchronize()
 
     def test_a_replay_on_the_same_buffers_after_a_new_trace(self):
         # F24's other form: the same tensors replayed again after a trace at a new size

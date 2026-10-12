@@ -408,9 +408,10 @@ class IRLowering(Lowering):
 
     `sources` maps each sym node the call supplies to its value, as
     Lowering's does; a guard is an Env record, (node, written form or None).
-    What the export's lowering declines (a float operation other than an
-    exact division or a square root, an IsNonOverlappingAndDenseIndicator,
-    TruncToInt) this declines too, and a sign the declared domains decide
+    The float operations lower one row each, in the host's order (the
+    export's lowering declines those but an exact division or a square
+    root); what else the export's lowering declines (an
+    IsNonOverlappingAndDenseIndicator, TruncToInt) this declines too, and a sign the declared domains decide
     (Ctx.bounds) selects the shorter division as sympy's assumptions do."""
 
     def __init__(self, program: IntegerProgram, sources: dict[Node, tuple | int], ctx: Ctx) -> None:
@@ -560,6 +561,12 @@ class IRLowering(Lowering):
             value = n.hint
         elif op == "ffromint":
             return self._emit("tofloat", self._int(args[0]))
+        elif op == "f32i":
+            return self._emit("f32i", self._int(args[0]))
+        elif op in ("fadd", "fsub", "fmul", "f32r", "f32add", "f32sub", "f32mul", "f32quot", "f32fma"):
+            return self._emit(op, *(self._float(a) for a in args))
+        elif op == "fneg":
+            return self._emit("fmul", self._constant(f64_bits(-1.0)), self._float(args[0]))
         elif op in ("fpow", "fdiv") and all(a.op == "fconst" for a in args):
             x, y = (a.hint for a in args)
             ratio = self.ctx.int_ratio(n) if op == "fdiv" else None

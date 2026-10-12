@@ -19,6 +19,7 @@ import sympy
 from torch._guards import GuardSource, ShapeGuard, Source
 from torch.cuda import _host_trace_ir as _ir
 from torch.fx.experimental.symbolic_shapes import DimDynamic, ShapeEnv
+from torch.cuda import _host_trace_program as _program
 from torch.cuda._host_trace_program import f32_bits
 from torch.utils._sympy.functions import Mod, Where
 from torch.utils._sympy.numbers import int_oo
@@ -531,3 +532,91 @@ def f32_div(a: IntLikeType, b: IntLikeType) -> IntLikeType:
         raise NotImplementedError("host_trace: a float division of an unbacked size")
     # pyrefly: ignore [missing-attribute]
     return env.create_symintnode(F32Div(*exprs), hint=f32_bits(*hints))
+
+
+# float32 arithmetic for a traced host modelling C++ `float` code: each function
+# is one IEEE operation (f32_fma: std::fmaf), so the host spells out the order
+# its C++ binary computes in; Python's operators on a SymFloat stay double
+FLT_MAX = float.fromhex("0x1.fffffep+127")
+
+
+def _ir_node(args: tuple) -> Any:
+    import torch
+
+    for x in args:
+        if isinstance(x, (torch.SymInt, torch.SymFloat)):
+            if not isinstance(x.node, _ir.IRSymNode):
+                raise NotImplementedError("host_trace: float32 arithmetic needs symbolic = 'ir'")
+            return x.node
+    return None
+
+
+def f32(x: Any) -> Any:
+    """static_cast<float>(x) for a traced host, x an int or a double."""
+    node = _ir_node((x,))
+    if node is None:
+        return _program.f32_of_int(x) if isinstance(x, int) else _program.f32_round(float(x))
+    return node.f32()
+
+
+def _f32_op(op: str, *args: Any) -> Any:
+    node = _ir_node(args)
+    if node is None:
+        for a in args:
+            if type(a) is not float or _program.f32_round(a) != a:
+                raise TypeError(f"host_trace: {a!r} is not a float32 value (convert it with f32())")
+        return _program.float_value(op, args)
+    return node.f32_op(op, args)
+
+
+def f32_add(a: Any, b: Any) -> Any:
+    return _f32_op("f32add", a, b)
+
+
+def f32_sub(a: Any, b: Any) -> Any:
+    return _f32_op("f32sub", a, b)
+
+
+def f32_mul(a: Any, b: Any) -> Any:
+    return _f32_op("f32mul", a, b)
+
+
+def f32_quot(a: Any, b: Any) -> Any:
+    """a / b in float32 (f32_div is the bits of an integer quotient's)."""
+    return _f32_op("f32quot", a, b)
+
+
+def f32_fma(a: Any, b: Any, c: Any) -> Any:
+    """std::fmaf(a, b, c): a * b + c rounded once."""
+    return _f32_op("f32fma", a, b, c)
+
+
+def argmin(costs: Any, below: Any = None) -> int:
+    """C's `best = below; k = -1; for (i...) if (c[i] < best) {best = c[i]; k = i;}`
+    (no bound: below None): the first minimum's index, -1 if no cost is below.
+    Traced, it guards the winner against each other cost (strict < an earlier
+    one, <= a later one) and the bound, decided at the hints: the guards fail
+    only where the winner changes, not where the losers reorder."""
+    import torch
+
+    costs = list(costs)
+
+    def hint(c: Any) -> Any:
+        return c.node.node.hint if isinstance(c, torch.SymFloat) else c
+
+    best, k = hint(below), -1
+    for i, c in enumerate(costs):
+        if best is None or hint(c) < best:
+            best, k = hint(c), i
+    if k < 0:
+        for c in costs:
+            if bool(c < below):
+                raise AssertionError("host_trace: argmin's guard is false at the hints")
+        return -1
+    w = costs[k]
+    holds = [w < c if j < k else w <= c for j, c in enumerate(costs) if j != k]
+    if below is not None:
+        holds.append(w < below)
+    if not all(bool(h) for h in holds):
+        raise AssertionError("host_trace: argmin's guard is false at the hints")
+    return k

@@ -80,7 +80,7 @@ from torch.cuda import _host_trace_ir as _ir
 from torch.cuda._host_trace import _drop_tracebacks, Declined, declined, EagerFallback, ProcessHold
 from torch.cuda._host_trace_capture import capture_tape, instantiate_form, plain_attributes, SegmentFailed
 from torch.cuda._host_trace_harvest import HarvestProvider
-from torch.cuda._host_trace_lower_tape import fold, FoldRefused, lower_guards, lower_tape, PointerSlot, PredictedOutput, ScalarSlot
+from torch.cuda._host_trace_lower_tape import fold, FoldRefused, lower_guards, lower_tape, LoweredMemcpy, PointerSlot, PredictedOutput, ScalarSlot
 from torch.cuda._host_trace_memory import arena_addresses, auto_memory, check_plan, plan_memory, relocate, relocate_entries, size_classes, split_runs, SPLITS
 from torch.cuda._host_trace_opaque import fill_uniform, key_guards, library_state_as, span_bytes, takes_generator
 from torch.cuda._host_trace_program import Status
@@ -91,6 +91,7 @@ from torch.cuda._host_trace_native import (
     flatten_variant,
     HIT,
     launch_row,
+    MEMORY_KIND,
     MISALIGNED,
     MISS,
     native_variant,
@@ -683,7 +684,8 @@ class HostTraceReplay(torch._C._HostTraceEntry):
             elif self.handback and added:
                 return Handback(args)
             outcome, result = self._call_native(variant, args)
-            if outcome != MISS:
+            # MEMORY_KIND: the variant's memcpy nodes are of the other kind of memory than an argument
+            if outcome not in (MISS, MEMORY_KIND):
                 return self._served(variant.native, outcome, result, args)
         # no variant holds the call: one whose graph guards do gains its
         # failing selectors' entries from their ops dispatched again
@@ -695,7 +697,7 @@ class HostTraceReplay(torch._C._HostTraceEntry):
                 if self.handback:
                     return Handback(args)
                 outcome, result = self._call_native(variant, args)
-                if outcome != MISS:
+                if outcome not in (MISS, MEMORY_KIND):
                     return self._served(variant.native, outcome, result, args)
             break
         # a refused redispatch traces the graph again. Propagating the op's new metadata through its uses (as
@@ -827,7 +829,7 @@ class HostTraceReplay(torch._C._HostTraceEntry):
             evaluated = variant.native.evaluate(args)
             unformed = [] if evaluated is None else evaluated[2]
         for g, arms in unformed:
-            if not self._native_mutate(variant, "a form", variant.native.add_form, g, arms, *self._form(variant, g, arms)):
+            if not self._native_mutate(variant, "a form", variant.native.add_form, g, arms, *self._form(variant, g, arms, values)):
                 return None
         return values, bool(bindings or unformed)
 
@@ -917,10 +919,11 @@ class HostTraceReplay(torch._C._HostTraceEntry):
             k = len(arms) - 1
         return k + 1
 
-    def _form(self, variant: _Variant, g: int, arms: list[int]) -> tuple[int, int, list]:
+    def _form(self, variant: _Variant, g: int, arms: list[int], values: Sequence[int]) -> tuple[int, int, list]:
         """An exec of a clone of segment g's graph with its sites' kernel
         nodes at their arms' launch attributes, a piece arm's site's nodes
-        replaced by the arm's; the clone, and each piece's (site, nodes)."""
+        replaced by the arm's, its memcpy nodes at the call's (rows `values`)
+        argument operands; the clone, and each piece's (site, nodes)."""
         plain = plain_attributes(torch.cuda.current_device())
         segments, launches = variant.captured.segments, variant.captured.launches
         first = sum(len(s.launches) for s in segments[:g])
@@ -939,7 +942,12 @@ class HostTraceReplay(torch._C._HostTraceEntry):
                     own, other = dict(a[1]), dict(b[1])
                     keys = own.keys() | other.keys()
                     changes.append((launches[n].node, {k: other.get(k, plain[k]) for k in keys if own.get(k) != other.get(k)}, kernel.grid))
-        exec_, clone, placed = instantiate_form(segments[g].graph.raw_cuda_graph(), changes, [p[1:] for p in pieces])
+        copies = [
+            (c.node, *(values[s.address] if s.root[0] == "argument" else None for s in c.launch.slots), values[c.launch.nbytes])
+            for c in launches[first:stop]
+            if isinstance(c.launch, LoweredMemcpy)
+        ]
+        exec_, clone, placed = instantiate_form(segments[g].graph.raw_cuda_graph(), changes, [p[1:] for p in pieces], copies)
         return exec_, clone, [(i, nodes) for (i, _, _), nodes in zip(pieces, placed)]
 
     def _call_native(self, variant: _Variant, args: tuple) -> tuple[int, Any]:
@@ -966,6 +974,8 @@ class HostTraceReplay(torch._C._HostTraceEntry):
         if outcome == MISALIGNED:
             why = f"an allocation that is not {_ALLOC_ALIGNMENT}-byte aligned"
             return self._eager(args, {}, why)
+        if outcome == MEMORY_KIND:
+            return self._eager(args, {}, "an argument a memcpy node copies is of another kind of memory than at its capture")
         if outcome != CAPTURE:
             raise AssertionError(f"host_trace: a native outcome {outcome}")
         device = next(v.tape.device for v in self.variants if v.native is native)

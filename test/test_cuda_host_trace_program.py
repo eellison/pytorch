@@ -4,6 +4,7 @@ import gc
 import math
 import os
 import random
+import struct
 import subprocess
 import sys
 
@@ -110,6 +111,19 @@ CASES = [
     ("flt", (f64_bits(0.5), f64_bits(-3.0)), 0),
     ("flt", (f64_bits(-0.0), f64_bits(0.0)), 0),
     ("flt", (f64_bits(-2.0), f64_bits(-1.0)), 1),
+    ("f32div", ((1 << 53) + (1 << 29) + 1, 1), f32_bits(1 << 53, 1) + 1),
+    ("fadd", (f64_bits(0.1), f64_bits(0.2)), f64_bits(0.1 + 0.2)),
+    ("fsub", (f64_bits(0.0), f64_bits(0.0)), f64_bits(0.0)),
+    ("fmul", (f64_bits(-1.0), f64_bits(0.0)), f64_bits(-0.0)),
+    ("f32i", ((1 << 24) + 1,), f64_bits(2.0**24)),
+    ("f32i", ((1 << 53) + (1 << 29) + 1,), f64_bits(2.0**53 + 2.0**30)),
+    ("f32r", (f64_bits(0.1),), f64_bits(struct.unpack("<f", struct.pack("<f", 0.1))[0])),
+    ("f32add", (f64_bits(2.0**24), f64_bits(1.0)), f64_bits(2.0**24)),
+    ("f32sub", (f64_bits(1.0), f64_bits(2.0**-30)), f64_bits(1.0)),
+    ("f32mul", (f64_bits(3.4028234663852886e38), f64_bits(2.0)), f64_bits(math.inf)),
+    ("f32quot", (f64_bits(1.0), f64_bits(3.0)), f64_bits(struct.unpack("<f", struct.pack("<f", 1.0 / 3.0))[0])),
+    # 1448.96: the fused multiply-add rounds once, unlike mul then add
+    ("f32fma", (f64_bits(138.24000549316406), f64_bits(5.0), f64_bits(757.760009765625)), f64_bits(1448.9600830078125)),
     ("min", (3, MIN_I64, 4), MIN_I64),
     ("max", (3, MAX_I64, 4), MAX_I64),
 ]
@@ -120,6 +134,8 @@ EDGES += [MIN_I64, MIN_I64 + 1, MAX_I64, MAX_I64 - 1]
 OPS = ["add", "multiply", "floordiv", "ceildiv", "eq", "ne", "lt", "le", "gt", "ge"]
 OPS += ["and", "bitand", "bitor", "bitxor", "bitlength", "lshift", "f32div", "min", "max", "select"]
 OPS += ["tofloat", "fsqrt", "fdiv", "feq", "flt"]
+# the IEEE float rows (a NaN keeps the hardware's payload) against the reference on float operands:
+# test_cuda_host_trace_float.py
 
 
 def _reference(instructions, leaves):

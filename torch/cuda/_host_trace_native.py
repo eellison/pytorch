@@ -66,7 +66,7 @@ if TYPE_CHECKING:
 _RESULT_KINDS = {"none": 0, "tensor": 1, "tuple": 2, "list": 3}
 _PHILOX = ("philox_seed", "philox_offset", "philox")
 # _HostTraceVariant.call's outcomes
-MISS, MISALIGNED, CAPTURE, HIT = range(4)
+MISS, MISALIGNED, CAPTURE, HIT, MEMORY_KIND = range(5)
 
 
 class VariantSpec(NamedTuple):

@@ -47,6 +47,9 @@ Outcome HostTraceVariant::commit(Frame& frame, PyObject** result) {
   frame.tensors.clear();
   frame.tensors.resize(base_count_);
   frame.bases.assign(base_count_, 0);
+  if (!set_argument_copies(frame)) {
+    return Outcome::MemoryKind;
+  }
   phase_add(13, pt_misc);
   int64_t pt = phase_now();
   PlanLease lease;
@@ -84,7 +87,17 @@ Outcome HostTraceVariant::commit(Frame& frame, PyObject** result) {
     if (i < steps_.size()) {
       const Step& step = steps_[i];
       if (step.segment >= 0) {
-        patch_and_replay(segments_[step.segment], frame);
+        try {
+          patch_and_replay(segments_[step.segment], frame);
+        } catch (const MemoryKindMismatch&) {
+          if (!ran) {
+            return Outcome::MemoryKind;
+          }
+          PyErr_SetString(
+              disagreement_.ptr(),
+              "host_trace: a memcpy node of a later step refused its operand's kind of memory");
+          throw py::error_already_set();
+        }
       } else {
         run_eager(eager_[step.eager], args, frame);
       }
@@ -877,6 +890,10 @@ PyObject* entry_dispatch(
     const uint64_t epoch = st.epoch;
     try {
       outcome = variant->commit(frame, &result);
+      if (outcome == Outcome::MemoryKind) {
+        // the next variant may be of the argument's kind
+        continue;
+      }
     } catch (py::error_already_set& err) {
       err.restore();
       if (PyErr_ExceptionMatches(st.disagreement.ptr())) {

@@ -17,6 +17,7 @@ import math
 import operator
 import struct
 from enum import IntEnum
+from fractions import Fraction
 from typing import Any, TYPE_CHECKING
 
 import torch
@@ -77,18 +78,87 @@ _ARITY = {
     "fdiv": 2,
     "feq": 2,
     "flt": 2,
+    "fadd": 2,
+    "fsub": 2,
+    "fmul": 2,
+    "f32i": 1,
+    "f32r": 1,
+    "f32add": 2,
+    "f32sub": 2,
+    "f32mul": 2,
+    "f32quot": 2,
+    "f32fma": 3,
     "select": 3,
     **dict.fromkeys(_COMPARISONS, 2),
     **dict.fromkeys(_BITWISE, 2),
 }
 
 
+def f32_round(x: float) -> float:
+    """static_cast<float>(x) of a double, as a double (round to nearest even)."""
+    try:
+        return struct.unpack("<f", struct.pack("<f", x))[0]
+    except OverflowError:
+        return math.copysign(math.inf, x)
+
+
+def _f32_nearest(q: Fraction) -> float:
+    """The exact rational q rounded once to the nearest float32 (ties to even)."""
+    if q == 0:
+        return 0.0
+    sign, q = (-1.0 if q < 0 else 1.0), abs(q)
+    e = q.numerator.bit_length() - q.denominator.bit_length()
+    if Fraction(2) ** e > q:
+        e -= 1
+    ulp = Fraction(2) ** (max(e, -126) - 23)
+    m, r = divmod(q / ulp, 1)
+    if r > Fraction(1, 2) or (r == Fraction(1, 2) and m % 2):
+        m += 1
+    v = m * ulp
+    return sign * (math.inf if v >= 2**128 else float(v))
+
+
+def f32_of_int(n: int) -> float:
+    """static_cast<float>(n): the integer rounded once (int -> double -> float
+    rounds twice above 2**53)."""
+    return f32_round(float(n)) if abs(n) <= 1 << 53 else _f32_nearest(Fraction(n))
+
+
+def _fdiv(x: float, y: float) -> float:
+    if y != 0.0:
+        return x / y
+    return math.nan if x == 0.0 or math.isnan(x) else math.copysign(math.inf, x) * math.copysign(1.0, y)
+
+
+def float_value(op: str, args: Sequence[float]) -> float:
+    """A float row's value (a double; a float32 row's is a float32 value) on
+    its float operands, an int for f32i. A float32 add, subtract, multiply or
+    divide done in double and rounded once is the float32 operation's result
+    (53 >= 2 * 24 + 2); the fused multiply-add rounds the exact value once.
+    A float32 row's operands are float32 values; others convert first."""
+    if op == "f32i":
+        return f32_of_int(args[0])
+    if op == "f32r":
+        return f32_round(args[0])
+    if op.startswith("f32"):
+        args = [f32_round(a) for a in args]  # static_cast<float> of each operand
+    if op == "f32fma":
+        x, y, z = args
+        if all(math.isfinite(v) for v in args):
+            q = Fraction(x) * Fraction(y) + Fraction(z)
+            if q == 0:  # IEEE's zero: negative only for -0 + -0
+                return -0.0 if math.copysign(1.0, x * y) < 0 and math.copysign(1.0, z) < 0 and x * y == 0 else 0.0
+            return _f32_nearest(q)
+        return f32_round(x * y + z)
+    x, y = args
+    kind = op[3:] if op.startswith("f32") else op[1:]
+    v = x + y if kind == "add" else x - y if kind == "sub" else x * y if kind == "mul" else _fdiv(x, y)
+    return f32_round(v) if op.startswith("f32") else v
+
+
 def f32_bits(n: int, d: int) -> int:
-    """static_cast<float>(n) / static_cast<float>(d)'s bits as an int32: each
-    rounded to float32, their double quotient rounded once more, which is the
-    float32 quotient."""
-    f = [struct.unpack("<f", struct.pack("<f", x))[0] for x in (n, d)]
-    return struct.unpack("<i", struct.pack("<f", f[0] / f[1]))[0]
+    """static_cast<float>(n) / static_cast<float>(d)'s bits as an int32."""
+    return struct.unpack("<i", struct.pack("<f", float_value("f32quot", [f32_of_int(n), f32_of_int(d)])))[0]
 
 
 def f64_bits(x: float) -> int:
@@ -98,6 +168,10 @@ def f64_bits(x: float) -> int:
 
 def f64(bits: int) -> float:
     return struct.unpack("<d", struct.pack("<q", bits))[0]
+
+
+# IEEE operations on doubles' bits, as the host computes them (no domain)
+_FLOAT_ROWS = frozenset({"fadd", "fsub", "fmul", "f32i", "f32r", "f32add", "f32sub", "f32mul", "f32quot", "f32fma"})
 
 
 def _fits(value: int) -> bool:
@@ -142,6 +216,8 @@ def _step(op: str, args: list[int]) -> int | Status:
         x, y = map(f64, args)
         q = x / y if y != 0.0 else math.nan
         return f64_bits(q) if math.isfinite(q) else Status.FLOAT_DOMAIN
+    if op in _FLOAT_ROWS:
+        return f64_bits(float_value(op, [args[0]] if op == "f32i" else [f64(a) for a in args]))
     if op == "feq":
         return int(f64(args[0]) == f64(args[1]))
     if op == "flt":
@@ -175,6 +251,12 @@ class IntegerProgram:
       ("fsqrt", a), ("fdiv", a, b)      math.sqrt and / on the doubles whose
                                         bits a and b are, for a finite result
       ("feq" | "flt", a, b)             the doubles' == and <
+      ("fadd" | "fsub" | "fmul", a, b)  + - * of the doubles
+      ("f32i", a)                       static_cast<float>(a)'s value, as a double
+      ("f32r", a)                       static_cast<float>(the double a)
+      ("f32add" | "f32sub" | "f32mul" | "f32quot", a, b), ("f32fma", a, b, c)
+                                        the float32 operation (std::fmaf) on
+                                        float32 values held as doubles
       ("min" | "max", a, b, ...)
       ("select", cond, if_true, if_false)
     where a, b, ... are earlier rows. floordiv and ceildiv are defined for a

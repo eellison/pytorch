@@ -4220,7 +4220,98 @@ class TestBoundCall(TestCase):
         self.assertEqual(f.static_hits, hits)
 
 
+_MAPPED_POOLS = []
+
+
+def _mapped_zeros(n):
+    # an allocation in a new expandable segment (a pool of its own, so no
+    # cached cudaMalloc'd block serves it): cuMem-mapped memory, as symm_mem's
+    torch.cuda.memory._set_allocator_settings("expandable_segments:True")
+    try:
+        _MAPPED_POOLS.append(torch.cuda.MemPool())
+        with torch.cuda.use_mem_pool(_MAPPED_POOLS[-1]):
+            return torch.zeros(n, device="cuda")
+    finally:
+        torch.cuda.memory._set_allocator_settings("expandable_segments:False")
+
+
+def _mapped(t):
+    from cuda.bindings import driver
+
+    err, handle = driver.cuMemRetainAllocationHandle(t.data_ptr())
+    if err == driver.CUresult.CUDA_SUCCESS:
+        driver.cuMemRelease(handle)
+    return err == driver.CUresult.CUDA_SUCCESS
+
+
+def copy_into(buf, x):
+    buf[: x.numel()].copy_(x.view(-1))
+    return buf[: x.numel()].view(x.shape) * 2
+
+
+@unittest.skipIf(not TEST_CUDA, "requires CUDA")
+@requires_cuda_python_bindings
+class TestMemcpyMemoryKinds(TestCase):
+    """A memcpy node can only be set to operands of its capture's kind of
+    memory (cudaMalloc'd or cuMem-mapped, as symm_mem is): a device argument
+    a memcpy copies is captured at its own address, and a call whose argument
+    is of the other kind misses the variant (its node's update fails before
+    any step runs) and traces one of that kind."""
+
+    def setUp(self):
+        if "expandable_segments:True" in torch._C._accelerator_getAllocatorSettings():
+            self.skipTest("the caching allocator is in expandable segments")
+
+    @parametrize("static", [False, True])
+    def test_a_copy_into_each_kind_of_memory_replays(self, static):
+        plain, mapped = torch.zeros(4096, device="cuda"), _mapped_zeros(4096)
+        self.assertEqual((_mapped(plain), _mapped(mapped)), (False, True))
+        f = HostTraceReplay(copy_into, static_prefix=int(static))
+        for buf in (mapped, mapped, plain, plain, mapped, plain):
+            for m in (8, 24):
+                x = torch.randn(m, 64, device="cuda")
+                self.assertEqual(f(buf, x), copy_into(buf.clone(), x), atol=0, rtol=0)
+                self.assertEqual(buf[: x.numel()], x.view(-1), atol=0, rtol=0)
+        # the first plain call misses the mapped variant and traces its own
+        self.assertEqual((f.traces, len(f.variants), f.eager, f.replays), (2, 2, 0, 10))
+
+    def test_an_allocation_copied_into_a_mapped_argument(self):
+        # the source is the trace's allocation (the caching allocator's kind),
+        # the destination the mapped argument
+        def fn(buf, x):
+            y = x + 1
+            buf[: y.numel()].copy_(y.view(-1))
+            return buf[: y.numel()].sum()
+
+        mapped = _mapped_zeros(4096)
+        f = HostTraceReplay(fn)
+        for m in (8, 24, 8):
+            x = torch.randn(m, 64, device="cuda")
+            self.assertEqual(f(mapped, x), fn(mapped.clone(), x), atol=0, rtol=0)
+        self.assertEqual((f.traces, f.eager, f.replays), (1, 0, 2))
+
+    @mock.patch("torch.cuda._host_trace.library_impls", False)
+    def test_a_later_steps_copy_of_the_other_kind_misses_before_any_step(self):
+        # an eager step ahead of the copy: the copy's node is set before the
+        # first step runs, so the call still misses cleanly
+        op = torch.ops.host_trace_test.tactic_ext.default
+
+        def fn(buf, x):
+            y = op(x)
+            buf[: y.numel()].copy_(y.view(-1))
+            return buf[: y.numel()].view(y.shape) + 1
+
+        plain, mapped = torch.zeros(4096, device="cuda"), _mapped_zeros(4096)
+        f = HostTraceReplay(fn)
+        for buf in (plain, mapped, mapped, plain):
+            x = torch.randn(8, 64, device="cuda")
+            self.assertEqual(f(buf, x), fn(buf.clone(), x), atol=0, rtol=0)
+        self.assertEqual((f.traces, len(f.variants), f.eager, f.replays), (2, 2, 0, 2))
+        self.assertEqual([sum(isinstance(r, EagerCall) for _, r in v.tape.launches) for v in f.variants], [1, 1])
+
+
 instantiate_parametrized_tests(TestHostTraceReplay)
+instantiate_parametrized_tests(TestMemcpyMemoryKinds)
 instantiate_parametrized_tests(TestChainReplay)
 instantiate_parametrized_tests(TestReplayMemory)
 instantiate_parametrized_tests(TestNativeReplay)

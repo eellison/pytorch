@@ -56,7 +56,7 @@ import sympy
 
 import torch
 from torch._guards import ShapeGuard, SLoc
-from torch.cuda._host_trace_program import f32_bits
+from torch.cuda._host_trace_program import f32_bits, f32_of_int, f32_round, float_value
 from torch.fx.experimental.sym_node import register_direct_int_node
 from torch.utils._sympy.functions import (
     BitwiseFn_bitwise_and,
@@ -67,6 +67,7 @@ from torch.utils._sympy.functions import (
     FloatTrueDiv,
     FloorDiv,
     FloorToInt,
+    Identity,
     IntTrueDiv,
     IsNonOverlappingAndDenseIndicator,
     Max,
@@ -126,8 +127,18 @@ FLOAT_OPS = frozenset(
         "fneg",
         "fsqrt",
         "fpow",
+        "f32i",
+        "f32r",
+        "f32add",
+        "f32sub",
+        "f32mul",
+        "f32quot",
+        "f32fma",
     }
 )
+# float32 values (static_cast<float>, the float32 operations), each node one
+# IEEE operation of the host in its order; the hint is the float32 value
+F32_OPS = frozenset({"f32i", "f32r", "f32add", "f32sub", "f32mul", "f32quot", "f32fma"})
 _REL_TEXT = {"eq": "==", "ne": "!=", "lt": "<", "le": "<="}
 _REL_CLASSES = {
     "Eq": sympy.Eq,
@@ -147,12 +158,15 @@ _BITWISE = {
 _BUILDERS = {
     **{op: op for op in ("floordiv", "ceildiv", "mod", "min", "max", "bitlen", "f32div", "where")},
     "ffromint": "to_float",
+    "f32i": "f32",
+    "f32r": "f32",
 }
 _OP_BUILDERS = {
     **dict.fromkeys(_BITWISE, "bitwise"),
     **dict.fromkeys(("fadd", "fsub", "fmul", "fdiv", "fpow"), "fbin"),
     **dict.fromkeys(("fneg", "fsqrt"), "fun"),
     **dict.fromkeys(("ftrunc", "ffloor", "fceil"), "fint"),
+    **dict.fromkeys(("f32add", "f32sub", "f32mul", "f32quot", "f32fma"), "f32op"),
 }
 _TORCH_DIR = os.path.dirname(os.path.abspath(torch.__file__)) + os.sep
 _NO_SLOC = SLoc(None, None)
@@ -1025,6 +1039,30 @@ class Ctx:
         hint = -a.hint if op == "fneg" else math.sqrt(a.hint)
         return self.mk(op, (a,), float(hint))
 
+    def f32(self, a: Node) -> Node:
+        """static_cast<float>(a) of an integer or a double."""
+        if a.op in F32_OPS:
+            return a
+        if a.op in ("const", "fconst"):
+            return self.fconst(f32_of_int(a.args[0]) if a.op == "const" else f32_round(a.hint))
+        if a.is_float:
+            return self.mk("f32r", (a,), f32_round(a.hint))
+        if not a.is_int:
+            raise TypeError(f"host_trace: static_cast<float> of the boolean {render(a)}")
+        return self.mk("f32i", (a,), f32_of_int(a.hint))
+
+    def f32op(self, op: str, *args: Node) -> Node:
+        """One float32 operation (f32add, f32sub, f32mul, f32quot, f32fma) on
+        float32 values: float32 nodes, or constants a float32 holds exactly.
+        No rewrite but folding constants by the evaluator's own rule."""
+        for a in args:
+            if a.op not in F32_OPS and not (a.op == "fconst" and f32_round(a.hint) == a.hint):
+                raise TypeError(f"host_trace: {render(a)} is not a float32 value (convert it with f32())")
+        hint = float_value(op, [a.hint for a in args])
+        if all(a.op == "fconst" for a in args):
+            return self.fconst(hint)
+        return self.mk(op, args, hint)
+
     def fint(self, op: str, a: Node) -> Node:
         # int() / math.floor / math.ceil of a float: an integer node over a
         # float operand (the ratio of integers takes floordiv / ceildiv)
@@ -1628,6 +1666,20 @@ class IRSymNode:
     def _leaf(self, x: Any) -> Node:
         return self.env.ctx.const(x) if isinstance(x, int) else x.node.node
 
+    def f32(self) -> torch.SymFloat:
+        return torch.SymFloat(self._flt(self.env.ctx.f32(self.node)))
+
+    def f32_op(self, op: str, args: tuple) -> torch.SymFloat:
+        nodes = []
+        for x in args:
+            if isinstance(x, float):
+                nodes.append(self.env.ctx.fconst(x))
+            elif isinstance(x, torch.SymFloat):
+                nodes.append(self._of(x.node))
+            else:
+                raise TypeError(f"host_trace: {x!r} is not a float32 value")
+        return torch.SymFloat(self._flt(self.env.ctx.f32op(op, *nodes)))
+
     # ---- relations and boolean algebra
     def _rel(self, cls: str, other: IRSymNode) -> IRSymNode:
         a, b = self.node, self._of(other)
@@ -1963,14 +2015,24 @@ class _SympyExport:
             return sympy.Float(n.hint)
         if op == "ffromint":
             return ToFloat(e(n.args[0]))
-        if op == "fadd":
-            return e(n.args[0]) + e(n.args[1])
-        if op == "fsub":
-            return e(n.args[0]) - e(n.args[1])
-        if op == "fmul":
-            return e(n.args[0]) * e(n.args[1])
+        # each float operation an Identity: sympy can not reassociate or fold
+        # across it (the IR's rows evaluate it; this form is for reading)
+        if op in ("fadd", "f32add"):
+            return Identity(e(n.args[0]) + e(n.args[1]))
+        if op in ("fsub", "f32sub"):
+            return Identity(e(n.args[0]) - e(n.args[1]))
+        if op in ("fmul", "f32mul"):
+            return Identity(e(n.args[0]) * e(n.args[1]))
+        if op == "f32quot":
+            return Identity(FloatTrueDiv(e(n.args[0]), e(n.args[1])))
+        if op == "f32fma":
+            return Identity(e(n.args[0]) * e(n.args[1]) + e(n.args[2]))
+        if op == "f32i":
+            return Identity(ToFloat(e(n.args[0])))
+        if op == "f32r":
+            return Identity(e(n.args[0]))
         if op == "fneg":
-            return -e(n.args[0])
+            return Identity(-e(n.args[0]))
         if op == "fdiv":
             ratio = ctx.int_ratio(n)
             if ratio is not None:
