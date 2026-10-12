@@ -21,9 +21,8 @@ The numbers are for a talk tonight. Do only this, in order, and report each resu
    be bitwise; report eager steps and graph segments per variant.
 4. The controlled mixed-step benchmark: `vllm/round_g4s_line.sh` (via `vllm/timing_lib.sh` and
    `vllm/bench/drive_ix2.py`), three arms default / fullnc (no compile) / ours (V, sound), arms rotated per round,
-   3 rounds, one GPU, nothing else on it. Then a fourth arm, ours with `ARMV_PORTS=1` added (the five vLLM custom ops
-   go through Python launcher ports: real compiled kernels, launch config traced; a port that cannot trace makes that
-   op an eager step, never a harvest); check it bitwise first, same coverage.
+   3 rounds, one GPU, nothing else on it. Skip the ARMV_PORTS arm: in vLLM 0.29 the ports never engage
+   (the _C ops are called inside vllm_ir library-op bodies), so it equals the sound arm.
 5. Report per shape: median ms per arm and ratios ours vs default / vs fullnc, for both ours arms; then eager steps
    and segments per variant, model forwards at init, init seconds, bitwise counts. Expect the sound arm to be much
    closer to fullnc than earlier numbers; report whatever it is.
