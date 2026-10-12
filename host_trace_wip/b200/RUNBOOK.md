@@ -118,10 +118,14 @@ Check `df` before downloading.
 1. Smoke: Qwen3-8B, SKUs `qwen38bp4-bf16-gb300-vllm` (default) and `qwen38bvs4-bf16-gb300-vllm` (ours) copied to b200, 1k1k conc 4. Expected
    from the original box: ours bitwise on every checked request (the point JSON's `check.summary`: `bitwise == n`),
    2-10 traces, 2-3 eager steps, `replays` about equal to `steps`.
-2. Qwen3.8-27B NVFP4: 1k1k and 8k1k at conc 1/4/16/64, all three arms, 3 repeats at conc 4 and 64.
-   Known state: ours runs NVFP4 GEMMs (FlashInfer CuTe DSL `mm_fp4`) eagerly for now and prefill requests can get
-   distinct trace keys, so expect losses; report them with the counts that explain them.
-3. Flash-Next NVFP4: same matrix (conc up to 32 per the SKU).
+2. Qwen3.8-27B NVFP4: 1k1k and 8k1k at conc 1/4/16/64, default and default-nc only, 3 repeats at conc 4 and 64.
+   Skip the ours arm on this branch: every decode trace declines with "sN is not read from the call's inputs"
+   (the CuTe DSL `mm_fp4` address scalar, a known core gap being fixed), and prefill declines with "an allocation on
+   meta in a trace" (adapter bug, fixed in a later adapter). It gets 0 replays, so it measures nothing. Compare the
+   default arm against InferenceX's published B200 numbers for this model if they exist.
+3. Flash-Next NVFP4: same matrix (conc up to 32 per the SKU), both arms. Before timing the ours arm, run one point and
+   read `/armv/summary`: if traces are not far below steps, or the point JSON says MISCONFIGURED / RETRACE-BOUND, stop
+   and report the decline reasons instead of sweeping.
 
 Per point, report: eager steps (split mm_fp4 vs other: `breakdown_after.eager_path_calls`, `entry_eager`), learns
 and learn share of the run, traces, bitwise checks; then total and output tok/s/GPU, TPOT/ITL p50/p90, TTFT p50/p90;
