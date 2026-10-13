@@ -41,6 +41,7 @@ from torch._prims_common import (
     ELEMENTWISE_TYPE_PROMOTION_KIND,
     get_computation_dtype,
     is_boolean_dtype,
+    is_channels_last_contiguous_or_false,
     is_float_dtype,
     is_integer_dtype,
     Number,
@@ -50,6 +51,8 @@ from torch.fx.experimental.symbolic_shapes import (
     free_unbacked_symbols,
     has_free_unbacked_symbols,
     resolve_unbacked_bindings,
+    statically_known_true,
+    sym_eq,
     SymTypes,
 )
 from torch.utils._ordered_set import OrderedSet
@@ -2527,7 +2530,76 @@ def cat(inputs, dim=0):
         if not has_multi_consumers and (fuse_pointwise_use or horizontal_fuse_cat):
             return pointwise_cat(inputs, dim)
 
+    if (padded := _cat_into_right_pad(inputs, dim, dtype)) is not None:
+        return padded
     return TensorBox(ir.ConcatKernel.create(inputs, dim))
+
+
+def _cat_into_right_pad(
+    inputs: list[TensorBox], dim: int, dtype: torch.dtype
+) -> TensorBox | None:
+    """If this cat's only user is a materialized right-pad of the cat dim, write
+    the cat into the padded buffer, which constant_pad_nd then returns."""
+    node = V.graph.current_node
+    if node is None or node.target is not aten.cat.default or len(node.users) != 1:
+        return None
+    (pad,) = node.users
+    # Same-shape views and aliases are already gone (remove_noop_ops).
+    while (
+        pad.target is aten.expand.default
+        and len(pad.users) == 1
+        and statically_known_true(sym_eq(pad.meta["val"].shape, node.meta["val"].shape))
+    ):
+        (pad,) = pad.users
+    if pad.target is not aten.constant_pad_nd.default:
+        return None
+    padding = pad.args[1]
+    k = 2 * (len(inputs[0].get_size()) - dim) - 1  # right pad of `dim`
+    amount = padding[k] if k < len(padding) else 0
+    value = pad.args[2] if len(pad.args) > 2 else pad.kwargs.get("value", 0)
+
+    def materialized(n: torch.fx.Node) -> bool:
+        # Mutations such as copy_ and index_put_ read the pad inline.
+        if isinstance(n.target, torch._ops.OpOverload) and n.target.is_view:
+            return all(map(materialized, n.users))
+        return n.op == "output" or n.target in needs_realized_inputs
+
+    def channels_last(t: torch.fx.Node | TensorBox) -> bool:
+        if isinstance(t, torch.fx.Node):
+            val = t.meta.get("val")
+            return isinstance(
+                val, torch.Tensor
+            ) and is_channels_last_contiguous_or_false(val)
+        return ir.is_storage_and_layout(t) and ir.Layout.is_channels_last_contiguous(
+            t.get_size(), t.get_stride()
+        )
+
+    if not (
+        isinstance(amount, int)
+        and amount > 0
+        and all(p == 0 for i, p in enumerate(padding) if i != k)
+        and isinstance(value, (int, float, bool))
+        and all(map(materialized, pad.users))
+        # ConcatKernel may pick channels-last where eager pad would not.
+        and not any(map(channels_last, [*inputs, *node.args[0], pad]))
+    ):
+        return None
+    fill_size = list(inputs[0].get_size())
+    fill_size[dim] = amount
+    fill = tensor_constructor(dtype_to_type(dtype)(value))(
+        fill_size, dtype=dtype, device=inputs[0].get_device()
+    )
+    # Stride-pad only for consumers like mm: user-visible outputs keep eager
+    # strides, and a view merging the padded dim would need a copy.
+    with config.patch(
+        comprehensive_padding=config.comprehensive_padding
+        and not pad.meta.get("dislike_padding")
+        and all(u.target in needs_realized_inputs for u in pad.users)
+    ):
+        padded = ir.ConcatKernel.create([*inputs, fill], dim)
+    V.graph.pads_written_by_cat[pad] = padded
+    cat_size = sum(t.get_size()[dim] for t in inputs)
+    return TensorBox(ir.SliceView.create(padded, dim, 0, cat_size, clamp=False))
 
 
 @register_lowering(aten.diagonal, type_promotion_kind=None)
@@ -5685,6 +5757,10 @@ def constant_pad_nd(x, padding, fill_value=0):
         raise AssertionError("expected: (len(padding) % 2) == 0")
     if all(p == 0 for p in padding):
         return clone(x)
+    padded = V.graph.pads_written_by_cat.pop(V.graph.current_node, None)
+    if padded is not None:
+        counters["inductor"]["pad_of_cat_preallocated"] += 1
+        return TensorBox(padded)
 
     if config.inplace_padding:
         out = inplace_constant_pad_nd(x, padding, fill_value)

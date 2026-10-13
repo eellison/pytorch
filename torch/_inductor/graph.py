@@ -486,6 +486,8 @@ class GraphLowering(torch.fx.Interpreter):
         # Inplace padding may require Inductor to allocate slightly larger
         # tensor for padding.
         self.buffer_to_padded_size: dict[str, list[int]] = {}
+        # constant_pad_nd nodes whose result the cat lowering already wrote.
+        self.pads_written_by_cat: dict[Node, ir.IRNode] = {}
 
         self.buffers: list[ir.Buffer] = []
         self.operations: list[ir.Operation] = []
