@@ -1,0 +1,112 @@
+# timing_table.py DIR [SET]: median [min-max] over rounds of the step time (ms, execute_model, synced) and the end-to-end
+# per-token time per arm and row, as matched-on-compile pairs under a headline (faster vLLM config vs our best); V-stock counts.
+import collections, glob, json, os, re, statistics, sys
+
+d = sys.argv[1]
+rows = collections.defaultdict(lambda: collections.defaultdict(list))
+counts = []
+excluded = []  # runs with traces / learns inside measured windows
+cbx = collections.defaultdict(list)  # (C, arm) -> per-round churn stats
+caps = set()  # vLLM's CUDA graph capture sizes (the default arm's cg_config)
+SETF = sys.argv[2] if len(sys.argv) > 2 else None  # optional set name: only t_<SET>_<arm>_r<R>.json
+for f in sorted(glob.glob(os.path.join(d, f"t_{SETF}_*_r*.json" if SETF else "t_*_r*.json"))):
+    arm = re.match(r"t_(?:.*_)?(default|fullnc|vstock|vc|vcvp|breakable)_r\d+\.json", os.path.basename(f)).group(1)
+    j = json.load(open(f))
+    if j.get("window_violations"):  # a trace or cuBLAS learn inside a measured window (user rule 10-13): not a timing result
+        excluded.append((os.path.basename(f), j["window_violations"][:4]))
+        continue
+    for bs, v in j.get("decode", {}).items():
+        if v.get("step_ms"):
+            rows[f"decode bs {bs} (KV ~256)"][arm].append(v["step_ms"])
+    for k, v in j.get("dcurve", {}).items():  # decode curves: mean step (= per-token decode time) over the measured span
+        if v.get("mean_ms"):
+            ctx, bs = k.split("_")
+            rows[f"decode ctx {int(ctx) // 1024}K bs {int(bs):3d} (TPOT mean)"][arm].append(v["mean_ms"])
+    for C, v in j.get("cb", {}).items():  # continuous-batching churn: wall per output token over the measured window
+        if v.get("wall_ms_per_token"):
+            rows[f"churn C={C} end-to-end per token"][arm].append(v["wall_ms_per_token"])
+            cbx[(int(C), arm)].append({k: v.get(k) for k in ("mixed_frac", "shape_changed_frac", "decode_bs_changed_frac", "nodes_set_mean",
+                                                             "mem_nodes_set_mean", "pad_tokens_mean", "learns_in_window", "traces_in_window", "cg_modes")})
+    for L, v in j.get("prefill", {}).items():
+        if v.get("step_ms"):
+            rows[f"prefill {L} tokens"][arm].append(v["step_ms"])
+    if arm == "default":
+        caps.update(j.get("cg_config", {}).get("capture_sizes") or [])
+    for bs, v in j.get("async", {}).items():
+        if v.get("step_ms"):
+            rows[f"END-TO-END decode bs {bs} (async, per token)"][arm].append(v["step_ms"])
+    for k, v in j.get("ix", {}).items():
+        if k.startswith("decode_") and v.get("step_ms"):
+            rows[f"decode bs {k[7:]} (KV {v.get('kv_min_med_max')})"][arm].append(v["step_ms"])
+        if k.startswith("alt_") and v.get("step_ms"):
+            A, B = k[4:].split("_")
+            rows[f"alternating decode {A}<->{B} (KV {v.get('kv_min_med_max')})"][arm].append(v["step_ms"])
+        if k.startswith("mixed_") and v.get("step_ms"):
+            (p, nd), lohi = k[6:].partition("@")[0].split("x"), k.partition("@")[2]
+            rows[f"mixed {p} chunk + {nd} decodes (KV {lohi})"][arm].append(v["step_ms"])
+    if arm in ("vstock", "vc", "vcvp") and "V" in j:
+        V = j["V"]
+        # per entry kind (decode / prefill / mixed): traces, replays, eager calls (a trace's first call and every miss)
+        kinds = collections.defaultdict(lambda: [0, 0, 0])
+        for name, e in V.get("entries", {}).items():
+            kind = name.split("/")[1] if "/" in name else name
+            for i, x in enumerate(("traces", "replays", "eager")):
+                kinds[kind][i] += e.get(x, 0)
+        counts.append({"arm": arm, "round": os.path.basename(f)[:-5].rsplit("_r", 1)[1]} | {k: V.get(k) for k in ("traces", "replays", "eager", "variants")}
+                      | {"unsound": V.get("unsound_learned"), "by_kind(traces,replays,eager)": dict(kinds)})
+def _label(r):
+    m = re.fullmatch(r"decode bs (\d+) \(KV ~256\)", r)
+    return r + (" [cap]" if m and int(m.group(1)) in caps else "") if caps else r
+
+
+fmt = lambda xs: f"{statistics.median(xs):6.2f} [{min(xs):.2f}-{max(xs):.2f}] n={len(xs)}" if xs else "     -"
+# Comparisons are matched on compile (user rule 10-13). Headline: ONE vLLM config for every row (default or default-nc, the faster
+# by geomean over the rows) vs ONE config of ours (compiled forward + VP, else compiled forward). Breakdown: compiled pair default vs Vc+VP (Vc secondary);
+# uncompiled pair default-nc vs V-stock (eager forward, launchers). Ratio = vLLM ms / ours ms (> 1 = ours faster).
+NAMES = {"default": "default", "fullnc": "default-nc", "vstock": "V-stock", "vc": "Vc", "vcvp": "Vc+VP", "breakable": "breakable"}
+ratio = lambda m, base, ours: f"{m[base] / m[ours]:.2f}x" if base in m and ours in m else "-"
+# one vLLM config per table: the faster overall (geomean over the rows both timed); one config for ours (Vc+VP, else Vc)
+med = {r: {a: statistics.median(v) for a, v in arms.items() if v} for r, arms in rows.items()}
+both = [m for m in med.values() if "default" in m and "fullnc" in m]
+gm = lambda a: statistics.geometric_mean([m[a] for m in both]) if both else float("inf")
+base = min(("default", "fullnc"), key=gm) if both else next((a for a in ("default", "fullnc") if any(a in m for m in med.values())), None)
+ours = next((a for a in ("vcvp", "vc") if any(a in m for m in med.values())), None)
+if any(r.startswith(("prefill", "mixed")) for r in rows):
+    print("CAVEAT (prefill / mixed rows): vLLM's prefill / mixed step (~170-260 ms, flat in length) is host time, not GPU time, with either GDN")
+    print("  backend (out/gdnbk_flashinfer.json vs out/gdnbk_triton.json: prefill-64 175 vs 168 ms; mixed profile: GPU busy 17.6 ms of the step,")
+    print("  4025 kernels). Our replay removes that host time. These runs use gdn_prefill_backend=triton (FlashInfer's CuTe GDN prefill NaNs).")
+    print("  Compiled default is slower than default-nc above 256 tokens: its piecewise graphs stop at max_cudagraph_capture_size 256.")
+if base and ours:
+    print(f"HEADLINE: vLLM {NAMES[base]} (faster overall, geomean over rows) vs ours {NAMES[ours]}")
+    print(f"{'row':44s} {NAMES[base]:26s} {NAMES[ours]:26s} speedup")
+    for r, arms in rows.items():
+        print(f"{_label(r):44s} {fmt(arms.get(base, [])):26s} {fmt(arms.get(ours, [])):26s} {ratio(med[r], base, ours)}")
+if any("breakable" in m for m in med.values()):
+    print()
+    print("vLLM BREAKABLE CUDA graphs (VLLM_USE_BREAKABLE_CUDAGRAPH=1, no compile, FULL_AND_PIECEWISE, default capture sizes) vs ours Vc+VP")
+    print(f"{'row':44s} {'breakable':26s} {'Vc+VP':26s} brk/Vc+VP")
+    for r, arms in rows.items():
+        print(f"{_label(r):44s} {fmt(arms.get('breakable', [])):26s} {fmt(arms.get('vcvp', [])):26s} {ratio(med[r], 'breakable', 'vcvp')}")
+print()
+print("COMPILED pair (vLLM default vs ours over the compiled forward)")
+print(f"{'row':44s} {'default':26s} {'Vc+VP':26s} def/Vc+VP {'Vc (secondary)':26s} def/Vc")
+for r, arms in rows.items():
+    m = {a: statistics.median(v) for a, v in arms.items() if v}
+    print(f"{_label(r):44s} {fmt(arms.get('default', [])):26s} {fmt(arms.get('vcvp', [])):26s} {ratio(m, 'default', 'vcvp'):9s} {fmt(arms.get('vc', [])):26s} {ratio(m, 'default', 'vc')}")
+print()
+print("UNCOMPILED pair (vLLM default-nc vs ours on the eager forward; no sampler-in-graph arm in this set)")
+print(f"{'row':44s} {'default-nc':26s} {'V-stock':26s} nc/V-stock")
+for r, arms in rows.items():
+    m = {a: statistics.median(v) for a, v in arms.items() if v}
+    print(f"{_label(r):44s} {fmt(arms.get('fullnc', [])):26s} {fmt(arms.get('vstock', [])):26s} {ratio(m, 'fullnc', 'vstock')}")
+if cbx:
+    print()
+    print("CHURN stats per round (churn rate = shape_changed_frac / mixed_frac; ours: nodes patched per step; vLLM: padded rows)")
+    for (C, arm), xs in sorted(cbx.items()):
+        for x in xs:
+            print(f"   C={C} {NAMES.get(arm, arm)}: {x}")
+if excluded:
+    print("EXCLUDED (trace / learn inside a measured window):", excluded)
+print("our arms' counts per round:")
+for c in counts:
+    print("  ", c)

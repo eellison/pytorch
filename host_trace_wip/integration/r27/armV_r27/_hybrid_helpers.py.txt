@@ -1,0 +1,68 @@
+# ARMV_HYBRID (serve scratch, default 1; active only with more than one attention group, e.g. Qwen3.5 / Qwen3.8 hybrid
+# Gated DeltaNet + attention): vLLM builds every group's metadata eagerly, as stock; the step takes each metadata object's
+# CUDA tensors as arguments; with ARMV_STOCK its Python ints are symbolic int arguments too (V-stock), otherwise they are
+# in the key. Everything else in the objects (flags, host tensors' values, dict keys) is the key.
+HYBRID = os.environ.get("ARMV_HYBRID", "1") == "1"
+# ARMV_HOST_ARGS (default 1, with STOCK): the metadata's CPU tensors (GDN prefill's chunk / conv bookkeeping, built on the
+# host from the request lengths) are arguments too, as traced host tensors, instead of their values being in the key
+HOST_ARGS = os.environ.get("ARMV_HOST_ARGS", "1") == "1"
+
+
+class _Lift:
+    """The key's marker for an int passed as a symbolic argument (STOCK)."""
+
+    def __repr__(self):
+        return "<lifted int>"
+
+
+_LIFT = _Lift()
+
+
+def _md_walk(x, tensors, ids, ints, lift):
+    """The key form of a metadata object. CUDA tensors -> ("T", argument index) (aliases share one argument, by identity);
+    with `lift`, plain ints -> _LIFT and their values appended to `ints`; host tensors -> their values; dataclasses /
+    plain vLLM objects / dicts / sequences -> their fields in order."""
+    if isinstance(x, torch.Tensor):
+        if x.is_cuda or (lift and HOST_ARGS):
+            if id(x) not in ids:
+                ids[id(x)] = len(tensors)
+                tensors.append(x)
+            return ("T", ids[id(x)])
+        return ("C", x.dtype, tuple(x.shape), tuple(x.reshape(-1).tolist()))
+    if type(x) is int and lift:
+        ints.append(x)
+        return _LIFT
+    if x is None or isinstance(x, (bool, int, float, str, enum.Enum, torch.dtype)):
+        return x
+    if isinstance(x, np.generic):
+        return ("np", x.item())
+    if isinstance(x, dict):
+        return ("M", tuple((k, _md_walk(v, tensors, ids, ints, lift)) for k, v in x.items()))
+    if isinstance(x, (list, tuple)):
+        return ("L", type(x), tuple(_md_walk(v, tensors, ids, ints, lift) for v in x))
+    if hasattr(x, "__dict__") and type(x).__module__.startswith("vllm."):
+        return ("O", type(x), tuple((k, _md_walk(v, tensors, ids, ints, lift)) for k, v in vars(x).items()))
+    raise _FormMismatch(f"metadata field of type {type(x).__name__}")
+
+
+def _md_rebuild(x, sig, tensors, ints):
+    """x with its CUDA tensors and lifted ints replaced by the step's (`tensors` by argument index, `ints` an iterator in
+    walk order), following _md_walk's key form; containers are copied, x is untouched."""
+    if sig is _LIFT:
+        return next(ints)
+    if isinstance(sig, tuple) and sig and sig[0] == "T":
+        return tensors[sig[1]]
+    if x is None or isinstance(x, (bool, int, float, str, enum.Enum, torch.dtype, np.generic, torch.Tensor)):
+        return x  # a constant of the key (host tensors included)
+    if isinstance(x, dict):
+        return {k: _md_rebuild(v, sv, tensors, ints) for (k, v), (_, sv) in zip(x.items(), sig[1])}
+    if isinstance(x, (list, tuple)):
+        return type(x)(_md_rebuild(v, sv, tensors, ints) for v, sv in zip(x, sig[2]))
+    if hasattr(x, "__dict__") and type(x).__module__.startswith("vllm."):
+        y = copy.copy(x)
+        for (k, v), (_, sv) in zip(vars(x).items(), sig[2]):
+            setattr(y, k, _md_rebuild(v, sv, tensors, ints))
+        return y
+    return x
+
+

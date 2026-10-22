@@ -1,0 +1,6 @@
+cd /data/eellison/src/pytorch/agent_space/paramgraph/land/core/r27
+until grep -q holding logs/vprobe2.wait; do sleep 15; done
+sleep 30
+ARMV_DIAG_NO_BLAS=1 ARMV_CHECK_STATE_CPU=1 ARMV_PORTS=1 GPUS="2" R27_KV_GIB=8 CMD_TIMEOUT=1200 bash gpu_run.sh vnb2b 58000 run_check.sh vnb2b --batch-size 1 --decode-tokens 8 --prefill-lens 64 --ix-mixed --ix-decode > logs/vnb2b.wait 2>&1
+FLASHINFER_WORKSPACE_BASE=/data/eellison/src/pytorch/agent_space/paramgraph/land/core/r27/fresh2/fi_ws TVM_FFI_CACHE_DIR=/data/eellison/src/pytorch/agent_space/paramgraph/land/core/r27/fresh2/tvm TRITON_CACHE_DIR=/data/eellison/src/pytorch/agent_space/paramgraph/land/core/r27/fresh2/triton VLLM_CACHE_ROOT=/data/eellison/src/pytorch/agent_space/paramgraph/land/core/r27/fresh2/vllm TORCHINDUCTOR_CACHE_DIR=/data/eellison/src/pytorch/agent_space/paramgraph/land/core/r27/fresh2/inductor ARMV_CHECK_STATE_CPU=1 ARMV_PORTS=1 GPUS="2" R27_KV_GIB=8 CMD_TIMEOUT=1800 bash gpu_run.sh vfresh2 58000 run_check.sh vfresh2 --batch-size 1 --decode-tokens 8 --prefill-lens 64 --ix-mixed --ix-decode > logs/vfresh2.wait 2>&1
+CUDA_DEVICE_MAX_CONNECTIONS=1 ARMV_CHECK_STATE_CPU=1 ARMV_PORTS=1 GPUS="2" R27_KV_GIB=8 CMD_TIMEOUT=1200 bash gpu_run.sh vconn2 58000 run_check.sh vconn2 --batch-size 1 --decode-tokens 8 --prefill-lens 64 --ix-mixed --ix-decode > logs/vconn2.wait 2>&1

@@ -1,0 +1,114 @@
+diff -ruN a/test/test_cuda_host_trace_cute.py b/test/test_cuda_host_trace_cute.py
+--- a/test/test_cuda_host_trace_cute.py	2026-10-13 21:30:29.980653080 -0700
++++ b/test/test_cuda_host_trace_cute.py	2026-10-13 21:31:09.663312924 -0700
+@@ -1993,6 +1993,52 @@
+         self.assertIsInstance(call, EagerCall)
+         self.assertIn("keyword arguments", call.reason)
+ 
++class TestRootIndex(TestCase):
++    def test_the_root_index_agrees_with_a_scan(self):
++        # _roots_of's index (extended as a trace's records grow, rebuilt where they are cut back) against a scan of
++        # every root, on a trace of many allocations: the same roots in the same order for each root's base and an
++        # address into it; then on a copy of the records cut back and grown again
++        import torch.cuda._host_trace_cute as cute
++        from torch.cuda._host_trace_tape import current_trace
++
++        class Records:
++            def __init__(self, tr):
++                self.inputs, self.allocs, self.eager_outputs = list(tr.inputs), list(tr.allocs), list(tr.eager_outputs)
++
++        def scan(t, v):
++            key = cute._sym_key(v)
++            held = set() if isinstance(key, int) else key.free_symbols
++            roots = (*(i.root for i in t.inputs), *(a.root for a in t.allocs), *(o._root for o in t.eager_outputs))
++            return [r.name for r in roots if cute._sym_key(r.sym).free_symbols & held]
++
++        checked = []
++
++        def fn(x):
++            ys = [x + i for i in range(64)]
++            tr = current_trace()
++            copy = Records(tr)
++
++            def check(t):
++                for y in (x, *ys):
++                    for v in (y._root.sym, y._root.sym + 16):
++                        self.assertEqual([r.name for r in cute._roots_of(t, v)], scan(t, v))
++                        checked.append(v)
++
++            check(tr)
++            check(copy)
++            n = len(copy.allocs)
++            del copy.allocs[n // 2 :]
++            check(copy)
++            copy.allocs.extend(tr.allocs[n // 2 :])
++            check(copy)
++            copy.allocs[n - 1] = tr.allocs[0]
++            check(copy)
++            return ys[-1]
++
++        trace(fn, (torch.randn(8, device="cuda"),), warm_up=False)
++        self.assertGreaterEqual(len(checked), 5 * 2 * 65)
++
++
+ instantiate_parametrized_tests(TestHostTraceCute)
+ 
+ def setUpModule():
+diff -ruN a/torch/cuda/_host_trace_cute.py b/torch/cuda/_host_trace_cute.py
+--- a/torch/cuda/_host_trace_cute.py	2026-10-13 21:30:29.976469626 -0700
++++ b/torch/cuda/_host_trace_cute.py	2026-10-13 21:30:42.670075252 -0700
+@@ -1529,12 +1529,52 @@
+     return tr.values(v)
+ 
+ 
++class _RootIndex:
++    """A trace's roots by each free symbol of their base, in _roots_of's order (inputs, allocations, eager outputs,
++    each in list order): extended as those lists grow, rebuilt where one was cut back (a declined part's records
++    dropped) or no longer holds the record it held at its last indexed position."""
++
++    def __init__(self) -> None:
++        self.records: tuple[list[Any], list[Any], list[Any]] = ([], [], [])
++        self.by_symbol: dict[Any, list[tuple[int, int]]] = {}
++
++    def roots(self, tr: _Trace, held: set) -> list[_Root]:
++        lists = (tr.inputs, tr.allocs, tr.eager_outputs)
++        if any(len(now) < len(seen) or (seen and now[len(seen) - 1] is not seen[-1]) for now, seen in zip(lists, self.records)):
++            self.__init__()
++        for kind, (now, seen) in enumerate(zip(lists, self.records)):
++            for j in range(len(seen), len(now)):
++                seen.append(now[j])
++                key = _sym_key(_record_root(kind, now[j]).sym)
++                for s in () if isinstance(key, int) else key.free_symbols:
++                    self.by_symbol.setdefault(s, []).append((kind, j))
++        hits = sorted({p for s in held for p in self.by_symbol.get(s, ())})
++        return [_record_root(kind, self.records[kind][j]) for kind, j in hits]
++
++
++def _record_root(kind: int, record: Any) -> _Root:
++    return record._root if kind == 2 else record.root
++
++
++_ROOT_INDEX: weakref.WeakKeyDictionary[_Trace, _RootIndex] = weakref.WeakKeyDictionary()
++# tests: each indexed lookup also scans every root and asserts the same roots in the same order
++_CHECK_ROOT_INDEX = False
++
++
+ def _roots_of(tr: _Trace, v: Any) -> list[_Root]:
+     # the trace's roots whose base symbol v holds
+     key = _sym_key(v)
+     held = set() if isinstance(key, int) else key.free_symbols
+-    roots = (*(i.root for i in tr.inputs), *(a.root for a in tr.allocs), *(t._root for t in tr.eager_outputs))
+-    return [r for r in roots if _sym_key(r.sym).free_symbols & held]
++    index = _ROOT_INDEX.get(tr)
++    if index is None:
++        index = _ROOT_INDEX[tr] = _RootIndex()
++    found = index.roots(tr, held)
++    if _CHECK_ROOT_INDEX:
++        roots = (*(i.root for i in tr.inputs), *(a.root for a in tr.allocs), *(t._root for t in tr.eager_outputs))
++        scanned = [r for r in roots if _sym_key(r.sym).free_symbols & held]
++        if [id(r) for r in found] != [id(r) for r in scanned]:
++            raise AssertionError(f"host_trace: the root index gives {[r.name for r in found]}, a scan {[r.name for r in scanned]}")
++    return found
+ 
+ 
+ def _pointee(tr: _Trace, address: torch.SymInt) -> _Root:

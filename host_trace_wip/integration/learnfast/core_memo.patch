@@ -1,0 +1,88 @@
+diff -ru -x __pycache__ core_memo/a/test/test_cuda_host_trace_replay.py core_memo/b/test/test_cuda_host_trace_replay.py
+--- core_memo/a/test/test_cuda_host_trace_replay.py	2026-10-15 17:05:43.563074593 -0700
++++ core_memo/b/test/test_cuda_host_trace_replay.py	2026-10-15 17:25:46.366712897 -0700
+@@ -1069,6 +1069,27 @@
+         self.assertEqual(seen, [None])
+         self.assertEqual((f.traces, f.redispatches, f.sections, f.retrace_causes), (1, 1, 1, {}))
+ 
++    def test_a_refused_section_is_refused_again_without_a_redo(self):
++        # x's op makes a section the 40-row variant refuses (its output may take its freed input's bytes): (12, 40) traces
++        # a second variant. At (12, 8) neither holds (y's op changes class too) and the first variant is tried first: the
++        # call holds its refused entry's predicate, so it refuses at once with the same refusal, no redo of either op, and
++        # the second variant takes y's section
++        def fn(x, y):
++            return add(split_op_late_output(add(x)), 1).sum() + add(split_op(add(y)), 1).sum()
++
++        f = HostTraceReplay(fn, memory="eager")
++        redos = []
++        for m, n in ((40, 40), (12, 40), (12, 8)):
++            x, y = torch.randn(m, 64, device="cuda"), torch.randn(n, 64, device="cuda")
++            self.assertEqual(f(x, y), fn(x, y), atol=0, rtol=0)
++            redos.append(f.redos)
++        self.assertEqual((f.traces, f.redispatches, f.refused_again), (2, 1, 1))
++        (why,) = [k for k in f.redispatch_refusals if "split_op_late_output" in k]
++        self.assertRegex(why, "shares bytes with allocation")
++        self.assertEqual(f.redispatch_refusals[why], 2)
++        # the last call's redos: y's op in the second variant only
++        self.assertEqual(redos[2] - redos[1], 1)
++
+     @parametrize("memory", ["eager", "run_buffer"])
+     def test_a_section_overlapping_an_allocation_made_within_its_op(self, memory):
+         # as above, but the op's output is made after its first launch: in eager order, or first fit in the run
+diff -ru -x __pycache__ core_memo/a/torch/cuda/_host_trace_replay.py core_memo/b/torch/cuda/_host_trace_replay.py
+--- core_memo/a/torch/cuda/_host_trace_replay.py	2026-10-15 17:05:43.561186901 -0700
++++ core_memo/b/torch/cuda/_host_trace_replay.py	2026-10-15 17:06:01.466986438 -0700
+@@ -367,6 +367,9 @@
+     # per keyed site, a class shared by the sites whose keys are made alike
+     # (_site_classes): sites of a class at equal key values have one OpaqueKey
+     site_classes: list[int] | None = None
++    # (selector site, its refused entry's predicate row) -> the refusal, per section check_section refused: a redispatch whose
++    # call fails that selector and holds that predicate redoes the op down the same branch to the same section (_redispatch)
++    refused_sections: dict[tuple[int, int], str] = field(default_factory=dict)
+ 
+     @property
+     def tape(self) -> Tape:
+@@ -606,6 +609,8 @@
+         # (_host_trace_redispatch.Template)
+         self.redos = 0
+         self.redo_instances = 0
++        # redispatches refused at once: the call holds a section refusal's predicate (_Variant.refused_sections)
++        self.refused_again = 0
+         # why each trace after the first traced: (class, op, guard, the user's line, refusal) -> count. Class "meta": a
+         # graph guard an op recorded (its outputs' metadata); "dispatch": an op's own guard failed and its
+         # redispatch refused (refusal); "graph": a guard no op recorded; "contract": no variant of the
+@@ -1418,7 +1423,18 @@
+         guards hold the call, gain entries from their ops dispatched again at
+         the call's metadata (_host_trace_redispatch): no trace; else why not."""
+         start = time.perf_counter()
+-        lo = variant.captured.lowered.lowering
++        lowered = variant.captured.lowered
++        failing = set(unselected)
++        for (site, predicate), why in variant.refused_sections.items():
++            if site in failing and predicate < len(values) and values[predicate] == 1:
++                e = FoldRefused(why)
++                e.op = lowered.selectors[site - len(lowered.sites)].op
++                self.redispatch_refusals[why] = self.redispatch_refusals.get(why, 0) + 1
++                self.refused_again += 1
++                self._last_refusal[id(variant.native)] = e.op, why
++                self.redispatch_s += time.perf_counter() - start
++                return e
++        lo = lowered.lowering
+         counts = lo.redos, lo.instances
+         refused = self._add_entries(variant, self.redispatch_refusals, args, redispatch, variant.captured.lowered, args, values, unselected, dispatches, self.opaque, self.static_prefix)
+         self.redos += lo.redos - counts[0]
+@@ -1497,11 +1513,13 @@
+             program, entries = relocate_entries(lowered, relocated, entries, args)
+         ok = self._native_mutate(variant, "a program", variant.native.set_program, program)
+         # every section takes its op's place in the plan, or none is added
+-        for site, _, launches, section in entries if ok else ():
++        for site, predicate, launches, section in entries if ok else ():
+             selector = lowered.selectors[site - len(lowered.sites)]
+             if section is not None and (why := check_section(lowered, variant.memory, selector.nodes, launches, section.temporaries, section.drops)) is not None:
+                 e = FoldRefused(f"{variant.tape.ops[selector.op].func}'s section: {why}")
+                 e.op = selector.op
++                if make is redispatch:
++                    variant.refused_sections[(site, predicate)] = str(e)
+                 lowered.lowering.refused.add(site)
+                 # the entries' guards lower_entries kept: none is the variant's
+                 del lowered.lowering.entry_guards[len(lowered.lowering.entry_guards) - len(entries) :]

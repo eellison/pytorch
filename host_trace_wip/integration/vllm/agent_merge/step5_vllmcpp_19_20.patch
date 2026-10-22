@@ -1,0 +1,127 @@
+--- a/torch/cuda/_host_trace_replay.py
++++ b/torch/cuda/_host_trace_replay.py
+@@ -262,7 +262,10 @@
+     takes the full path.
+     A variant that does not learn learns a keyed site's missing key out of
+     band (_learn); with `learn_in_learning_variants` a learning variant (one
+-    with opaque calls) does too, instead of tracing the call again.
++    with opaque calls) does too, instead of tracing the call again. With
++    `redispatch_learners` a learning variant whose graph guards hold a call
++    but whose selectors select nothing redispatches (or folds the trace into)
++    those selectors as a variant that does not learn does.
+ 
+     fn must be a pure function of its arguments. Torch's global settings
+     (grad and inference mode, autocast, the TF32, reduced-precision, cuDNN
+@@ -290,6 +293,7 @@
+         check_global_state: bool = False,
+         check_escapes: bool = False,
+         learn_in_learning_variants: bool = False,
++        redispatch_learners: bool = False,
+     ) -> None:
+         if memory not in ("auto", "eager", "run_buffer", "planned"):
+             raise ValueError(f"host_trace: memory {memory!r} is not 'auto', 'eager', 'run_buffer' or 'planned'")
+@@ -303,6 +307,7 @@
+         self.check_global_state = check_global_state
+         self.check_escapes = check_escapes
+         self.learn_in_learning_variants = learn_in_learning_variants
++        self.redispatch_learners = redispatch_learners
+         try:
+             self._signature: inspect.Signature | None = inspect.signature(fn)
+         except (TypeError, ValueError):
+@@ -438,12 +443,15 @@
+             return None
+         calls = {id(lowered.steps[i].call): o for i, o in lowered.opaque.items()}
+         wanted = {c: b for c, o in calls.items() if (b := o.provider.bind(o.key(values))) is not None}
+-        for ids, how in ((set(calls), self._learn), (set(wanted), None)):
+-            bound = bind_opaque(variant.tape, ids, how)
+-            if bound is not None and all(c in bound[1] and bound[1][c].fits(b) for c, b in wanted.items()):
+-                break
+-        else:
+-            return None
++        pool = torch.cuda.MemPool() if _LEARN_POOL else None
++        with torch.cuda.use_mem_pool(pool, variant.tape.device) if pool is not None else contextlib.nullcontext():
++            for ids, how in ((set(calls), self._learn), (set(wanted), None)):
++                bound = bind_opaque(variant.tape, ids, how)
++                if bound is not None and all(c in bound[1] and bound[1][c].fits(b) for c, b in wanted.items()):
++                    break
++            else:
++                return None
++        del pool
+         try:
+             upgraded = self._build(bound[0])
+         except Declined:
+@@ -462,13 +470,14 @@
+         eager run harvests it), or if a selector selects nothing: then a
+         variant that does not learn is a candidate to dispatch those
+         selectors' ops again for, or to fold the call's trace into,
+-        (variant, rows, selectors) in `candidates`."""
++        (variant, rows, selectors) in `candidates` (a learning variant too
++        with redispatch_learners)."""
+         evaluated = variant.native.evaluate(args)
+         if evaluated is None:
+             return None
+         values, missing, unformed, unselected = evaluated
+         if unselected:
+-            if not variant.learns:
++            if not variant.learns or self.redispatch_learners:
+                 candidates.append((variant, values, unselected))
+             return None
+         sites = variant.captured.lowered.sites
+--- a/test/test_cuda_host_trace_harvest.py
++++ b/test/test_cuda_host_trace_harvest.py
+@@ -1325,6 +1325,34 @@
+                 self.assertEqual(self.eager_calls(r), [])
+                 self.assertEqual((r.learned, r.traces), (learned, traces))
+ 
++    def test_learner_redispatches_selector(self):
++        # rope and store opaque at every size (a learning variant); the
++        # embedding's index_select takes its small-index kernel at <= 16
++        # indices, a selector. Traced at 17, the learning variant redispatches
++        # it at 9 under redispatch_learners; otherwise 9 traces again
++        table = torch.randn(4096, 64, device="cuda", dtype=bf16)
++        emb = torch.randn(1000, 192, device="cuda", dtype=bf16)
++        k_cache, v_cache = (torch.randn(8192, 64, device="cuda", dtype=bf16) for _ in range(2))
++
++        def f(ids, pos, table, k_cache, v_cache, loc, emb):
++            return self.store(self.rope(emb.index_select(0, ids), pos, table), k_cache, v_cache, loc)
++
++        def case(t):
++            return torch.randint(1000, (t,), device="cuda"), torch.randint(4096, (t,), device="cuda"), table, k_cache, v_cache, torch.randperm(8192, device="cuda")[:t], emb
++
++        ops = torch.ops.ht_extern
++        indexed = {ops.store_kv.default: ("loc", "k_cache", "v_cache")}
++        for on, traces, redispatches in ((True, 1, 1), (False, 2, 0)):
++            p = HarvestProvider(("extern",), extern_ops=(ops.rope_qk.default, ops.store_kv.default), indexed=indexed, lendable=(table, k_cache, v_cache))
++            r = HostTraceReplay(f, opaque=(p,), redispatch_learners=on)
++            for args in [case(t) for t in (5, 17, 33, 9, 40)]:
++                ref = [a.clone() if a.is_floating_point() else a for a in args]
++                self.assertEqual(r(*args), f(*ref), atol=0, rtol=0)
++                self.assertEqual(args, ref, atol=0, rtol=0)
++            self.assertTrue(all(v.learns for v in r.variants))
++            # the entry's first call (5) runs eagerly; 17 traces
++            self.assertEqual((r.traces, r.redispatches, r.eager), (traces, redispatches, 1))
++
+     def test_learn_pool(self):
+         # under _LEARN_POOL the out-of-band learns' own operands are in a
+         # private pool, and its segments are gone after the call
+--- a/armV/adapter.py
++++ b/armV/adapter.py
+@@ -57,6 +57,9 @@
+ # learn, and a learning variant learning a keyed site's missing key out of band instead of tracing again
+ LEND_GROUPS = os.environ.get("ARMV_LEND_GROUPS", "1") == "1"
+ LEARNER_LEARNS = os.environ.get("ARMV_LEARNER_LEARNS", "1") == "1"
++# src_vllmcpp item 20 (torch default off): a learning variant redispatches a selector that selects nothing (the
++# embedding's index_select path at T 16 -> 17) instead of tracing again; off by default here too
++REDISPATCH_LEARNERS = os.environ.get("ARMV_REDISPATCH_LEARNERS", "0") == "1"
+ BS_SPLIT = tuple(int(x) for x in os.environ.get("ARMV_BS_SPLIT", "2,32").split(","))
+ FAM_INTS = ("num_actual_tokens", "num_decodes", "num_decode_tokens", "num_prefills", "num_prefill_tokens")
+ ENTRY_BENCH = bool(os.environ.get("ARMV_ENTRY_BENCH"))  # time 50 extra (idempotent) calls of each key's entry at its 12th replay
+@@ -187,6 +190,8 @@
+             self.replay_kw["static_shapes"] = range(len(self.prefix))
+         if LEARNER_LEARNS and "learn_in_learning_variants" in R.HostTraceReplay.__init__.__code__.co_varnames:
+             self.replay_kw["learn_in_learning_variants"] = True
++        if REDISPATCH_LEARNERS and "redispatch_learners" in R.HostTraceReplay.__init__.__code__.co_varnames:
++            self.replay_kw["redispatch_learners"] = True
+         self.in_trace = self.md_trace and INPUTS == "trace"
+         self.rec = None  # prepare_inputs' launches while it runs
+         self.recorded = None  # its launches until prepare_attn takes them

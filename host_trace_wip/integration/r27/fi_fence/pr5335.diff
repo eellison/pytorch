@@ -1,0 +1,40 @@
+diff --git a/flashinfer/gdn_kernels/blackwell/gated_delta_net_chunked.py b/flashinfer/gdn_kernels/blackwell/gated_delta_net_chunked.py
+index 4a2f851544a..120ed78d9ee 100644
+--- a/flashinfer/gdn_kernels/blackwell/gated_delta_net_chunked.py
++++ b/flashinfer/gdn_kernels/blackwell/gated_delta_net_chunked.py
+@@ -4525,6 +4525,7 @@ def compute_group_1_chunk(
+             )
+             for k in cutlass.range(cute.size(tTR_rKS), vectorize=True):
+                 tTR_rKS[k] = tTR_rKS[k] * tGrCumprod[k]
++            cute.arch.fence_view_async_tmem_load()
+             ks_handle.release()
+             for k in cutlass.range(cute.size(tTR_rKS), vectorize=True):
+                 tRT_rV[k] = tRT_rV[k] - tTR_rKS[k].to(self.io_dtype)
+@@ -4566,6 +4567,7 @@ def compute_group_1_chunk(
+             tTR_rNv_inp[None, sub, 0].store(
+                 tTR_rNv[None, sub, 0].load().to(self.io_dtype)
+             )
++        cute.arch.fence_view_async_tmem_load()
+         nv_handle.release()
+ 
+         tTR_rDv = tTR_rNv
+diff --git a/flashinfer/gdn_kernels/blackwell/gated_delta_net_cp_prefill.py b/flashinfer/gdn_kernels/blackwell/gated_delta_net_cp_prefill.py
+index 2109283a52b..2e02e19a6ae 100644
+--- a/flashinfer/gdn_kernels/blackwell/gated_delta_net_cp_prefill.py
++++ b/flashinfer/gdn_kernels/blackwell/gated_delta_net_cp_prefill.py
+@@ -3200,6 +3200,7 @@ def compute_group_1_chunk(
+             )
+             for k in cutlass.range(cute.size(tTR_rKS), vectorize=True):
+                 tTR_rKS[k] = tTR_rKS[k] * tGrCumprod[k]
++            cute.arch.fence_view_async_tmem_load()
+             ks_handle.release()
+             for k in cutlass.range(cute.size(tTR_rKS), vectorize=True):
+                 tRT_rV[k] = tRT_rV[k] - tTR_rKS[k].to(self.io_dtype)
+@@ -3241,6 +3242,7 @@ def compute_group_1_chunk(
+             tTR_rNv_inp[None, sub, 0].store(
+                 tTR_rNv[None, sub, 0].load().to(self.io_dtype)
+             )
++        cute.arch.fence_view_async_tmem_load()
+         nv_handle.release()
+ 
+         tTR_rDv = tTR_rNv

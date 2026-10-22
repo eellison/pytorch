@@ -1,0 +1,51 @@
+INTEG_PAD: the engine's padding, emulated in our SGLang arms for an A/B. Scratch copies only; the sources are unchanged.
+Use them with ARMF_ADAPTER_DIR=land/scratch/integration/adapters_c2/pad. INTEG_PAD=0 is the default and means no padding.
+In that case each copy binds self.forward = self._forward_unpadded at __init__, so model.forward is the source
+adapter's own forward and the trace keys are unchanged. INTEG_PAD=1 pads. INTEG_PAD_DECODE_MAX_BS (default 512) sets the
+decode bucket list's max.
+
+Files (copied from):
+- adapter.py: armF/adapter.py (arm F)
+- adapter_cpp.py: armF/adapter_cpp.py (arm Fc)
+- adapter_prep.py: armF/prep/adapter_prep.py (arm P)
+- adapter_prep_cpp.py: adapters_c2/adapter_prep_cpp.py (arm Pc; it already has the PREP_ABC removal, adapters_c2/CHANGES.txt 1)
+- integ_pad.py: new
+
+1. integ_pad.py (new, ~140 LOC): Pad and check.
+   - Pad.batch pads a decode's bs, or an extend's / mixed's token count, to SGLang's bucket and returns the padded
+     ForwardBatch copy plus input_ids and positions. It uses one eager F.pad per padded tensor, as the runners'
+     fill_from copies before replay.
+     - Decode buckets: generate_decode_cuda_graph_batch_sizes(get_server_args(), 512). That is the serving list on a
+       GPU over 160 GB (52 buckets). one_batch's resolved list ends with an exact bucket at max(--batch-size), so it is
+       not used.
+     - Prefill buckets: cuda_graph_config.prefill.bs (up to 16384), with can_run_graph's 2x padding-factor cap.
+     - Fill values follow build_decode_registry: seq_lens, orig_seq_lens and seq_lens_cpu get the backend's
+       get_cuda_graph_seq_len_fill_value() (trtllm_mha: 1); req_pool_indices, positions, out_cache_loc and input_ids
+       get 0. seq_lens_sum grows by extra * fill and batch_size is the bucket.
+     - A bs or token count past the list (or past the 2x factor) runs unpadded, as the engine runs it eagerly.
+   - Pad.slice_out cuts the output's tensor fields to the raw rows (views, like the runner's [:raw_num_token]).
+   - Pad.decode_size(bs) gives PrepF's padded bs.
+   - Pad.stats counts per kind (decode / extend / prep): calls, padded calls, rows asked, rows computed and pad launches.
+     unpadded_fields lists CUDA fields of the raw size that were left unpadded (none are expected).
+   - check() compares a padded call's raw rows with the model's own eager forward on the unpadded batch ("bitwise")
+     and on the padded batch ("bitwise_padded_eager": same rows and GEMM shapes).
+2. adapter.py and adapter_prep.py, ArmF (~25 LOC each):
+   - imports integ_pad and sets self.pad in __init__;
+   - forward becomes the padding wrapper and the old forward is renamed _forward_unpadded. For decode the wrapper calls
+     backend.init_forward_metadata(padded fb) again (_metadata's buffers at the bucket, or the backend's own init, as the
+     runner's replay init), runs _forward_unpadded with self.check off, slices, and appends integ_pad.check when
+     checking;
+   - summary() gains "pad".
+3. adapter_cpp.py (~30 LOC):
+   - same init and summary changes;
+   - new _pad_forward: the padded call goes through self.bound (ONECALL) or self.forward. install() points
+     model.forward at it when INTEG_PAD=1, and the check setter leaves model.forward alone then.
+4. adapter_prep.py and adapter_prep_cpp.py, PrepF (~20 LOC each):
+   - the grab step runs through the padding wrapper, so the template's metadata is at the padded bs. _md_bs(bs) gives
+     that bs for the template and regrow checks;
+   - _prep_step's trace pads after the prep kernel. The padded bs is the metadata tensors' rows (passed in, so it is
+     symbolic, with no bucket guard in the trace). It runs F.pad x6 in the graph, calls the forward at the padded bs,
+     and slices its outputs to n. The batch state written back (input_ids, seq_lens, orig_seq_lens, out_cache_loc) stays
+     unpadded;
+   - decode() counts prep calls in Pad.stats;
+   - adapter_prep_cpp.py also gains the forward wrapper and summary change (item 2).

@@ -1,0 +1,1 @@
+{"kBlockSize": 1024, "kMaxTies": 1024, "sizeof_Tie": 8, "kSmemSize2": 221952, "kSmemSize4": 221952, "kSmemSize8": 156416, "sizeof_Params": 40, "FILTERED_TOPK_BLOCK_THREADS": 1024, "FILTERED_TOPK_SMEM_DYNAMIC": 131072, "PERSISTENT_kThreadsPerBlock": 1024}

@@ -1,0 +1,11 @@
+From r1gaps (land/core/r1gaps), 10-09 ~01:30, for the serve lane (owner of serve/armV_stock). Nothing in serve/ is edited.
+Coordinator ask: V-stock should not lift metadata host tensors the forward never reads. R1 prefill's "argN is on cpu" is
+GDNAttentionMetadata.nums_dict[8]["nums"] (unpinned; never read by causal_conv1d_fn with metadata; CORE_TASKS h (vi)).
+Prototype in r1gaps/armV_r1/adapter.py (copy of armV_stock 81f91e3a + ARMV_TRTLLM_CPP + diagnostics), ARMV_HOST_ARGS=meta:
+- _md_walk: a host tensor (lift mode) -> key ("H", dtype, shape): not an argument, its values not in the key;
+- _md_rebuild: ("H", dtype, shape) -> torch.empty(shape, dtype=dtype, device="meta").
+So a forward that only carries it traces; any read of its values inside the region (item/tolist/an op with a CUDA
+tensor) raises on the meta tensor and the trace declines with that error (CPU work stays unsupported; a shape read is
+keyed). Caveat: an eager fallback run of the step gets the meta tensor too (the same: fails only if it reads it).
+Diff: diff serve/armV_stock/adapter.py core/r1gaps/armV_r1/adapter.py (HOST_META lines). R1 prefill result with it:
+core/r1gaps/logs/r1_v4meta.log (queued). Take it into armV_stock if you agree, or tell r1gaps what to change.

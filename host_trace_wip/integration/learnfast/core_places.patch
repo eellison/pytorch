@@ -1,0 +1,115 @@
+diff -ru -x __pycache__ core_places/a/test/test_cuda_host_trace_memory.py core_places/b/test/test_cuda_host_trace_memory.py
+--- core_places/a/test/test_cuda_host_trace_memory.py	2026-10-16 10:07:46.342348594 -0700
++++ core_places/b/test/test_cuda_host_trace_memory.py	2026-10-16 10:08:39.817562873 -0700
+@@ -386,6 +386,59 @@
+         (v,) = f.variants
+         self.assertEqual(sum(len(m.freed) for m in v.memory.steps), 8)
+ 
++
++def _section_places_scan(lowered, plan, nodes):
++    # section_places as a scan of the run's events (the uncached form): the reference the cached bisect must equal
++    from torch.cuda._host_trace_memory import _first_seqs
++
++    step = next(i for i, s in enumerate(lowered.steps) if isinstance(s, range) and nodes[0] in s)
++    m, first, last = plan.steps[step], lowered.span(nodes[0])[0], lowered.span(nodes[-1])[1]
++    seqs = _first_seqs(lowered)
++    if not m.order:
++        at = sum(seqs[k] < first for k in m.tensors)
++        return at, at
++    n = len(lowered.allocations)
++    ends = {-1 - k: end for k, _, end in m.temporaries} | {-1 - n - a: seq for a, seq in m.freed}
++    keys = [(seqs[e], 0) if e >= 0 else (ends[e], 1) for e in m.order]
++    return sum(k < (first, 0) for k in keys), sum(k < (last, 2) for k in keys)
++
++
++@unittest.skipIf(not TEST_CUDA, "requires CUDA")
++class TestSectionPlaces(TestCase):
++    @parametrize("memory", ["eager", "run_buffer"])
++    def test_cached_places_equal_the_scan(self, memory):
++        # every selector of a replay whose variant took sum's split-reduction section: the cached, bisected places
++        # equal the scan's, and a plan copied with other steps (dataclasses.replace shares the cache) recomputes
++        import dataclasses
++
++        from torch.cuda._host_trace_memory import section_places
++
++        def f(x):
++            return (x * 2).sum(0) + 1
++
++        r = HostTraceReplay(f, memory=memory)
++        for t in (100, 300, 5000, 6000, 100, 5000):
++            x = torch.randn(t, 64, device="cuda")
++            self.assertEqual(r(x), f(x), atol=0, rtol=0)
++        self.assertEqual(r.sections, 1)
++        (v,) = r.variants
++        lowered, plan = v.captured.lowered, v.memory
++        checked = 0
++        for sel in lowered.selectors:
++            if sel.nodes:
++                for _ in range(2):  # the second call reads the cache
++                    self.assertEqual(section_places(lowered, plan, sel.nodes), _section_places_scan(lowered, plan, sel.nodes))
++                checked += 1
++        self.assertGreater(checked, 0)
++        steps = [dataclasses.replace(m, temporaries=tuple((k, seq, seq) for k, seq, _ in m.temporaries)) for m in plan.steps]
++        other = dataclasses.replace(plan, steps=tuple(steps))
++        for sel in lowered.selectors:
++            if sel.nodes:
++                self.assertEqual(section_places(lowered, other, sel.nodes), _section_places_scan(lowered, other, sel.nodes))
++
++
++instantiate_parametrized_tests(TestSectionPlaces)
++
+ def setUpModule():
+     from torch.cuda import _host_trace_hint_audit
+ 
+diff -ru -x __pycache__ core_places/a/torch/cuda/_host_trace_memory.py core_places/b/torch/cuda/_host_trace_memory.py
+--- core_places/a/torch/cuda/_host_trace_memory.py	2026-10-16 10:07:46.340363783 -0700
++++ core_places/b/torch/cuda/_host_trace_memory.py	2026-10-16 10:08:18.484470806 -0700
+@@ -151,6 +151,9 @@
+     relocated: Mapping[int, tuple[int, int, int, int, int]] = dataclasses.field(default_factory=dict)
+     # "planned": each arena and the rows of its `valid` conditions
+     arenas: tuple[tuple[Arena | PackedArena, tuple[int, ...]], ...] = ()
++    # section_places' sorted events per step: step -> (its StepMemory, the lowering, ordered, keys); an entry holds only
++    # for the same StepMemory and lowering (dataclasses.replace shares this dict)
++    event_keys: dict[int, tuple[Any, Any, bool, list]] = dataclasses.field(default_factory=dict, compare=False, repr=False)
+ 
+ 
+ @dataclass(frozen=True)
+@@ -616,15 +619,30 @@
+     the first after its last launch; in a run of no order, among its tensors, both before the first made
+     after the op's first launch. As eager makes them inside the op and frees them as it returns."""
+     step = next(i for i, s in enumerate(lowered.steps) if isinstance(s, range) and nodes[0] in s)
+-    m, first, last = plan.steps[step], lowered.span(nodes[0])[0], lowered.span(nodes[-1])[1]
+-    seqs = _first_seqs(lowered)
+-    if not m.order:
+-        at = sum(seqs[k] < first for k in m.tensors)
++    first, last = lowered.span(nodes[0])[0], lowered.span(nodes[-1])[1]
++    ordered, keys = _event_keys(lowered, plan, step)
++    if not ordered:
++        at = bisect.bisect_left(keys, first)
+         return at, at
+-    n = len(lowered.allocations)
+-    ends = {-1 - k: end for k, _, end in m.temporaries} | {-1 - n - a: seq for a, seq in m.freed}
+-    keys = [(seqs[e], 0) if e >= 0 else (ends[e], 1) for e in m.order]
+-    return sum(k < (first, 0) for k in keys), sum(k < (last, 2) for k in keys)
++    return bisect.bisect_left(keys, (first, 0)), bisect.bisect_left(keys, (last, 2))
++
++
++def _event_keys(lowered: LoweredTape, plan: MemoryPlan, step: int) -> tuple[bool, list]:
++    """The run of `step`'s events as section_places counts them, sorted (a count of those below a key is a bisect):
++    in eager order each event's (seq, 0) for a make, (its free's seq, 1) for a free; in a run of no order its
++    tensors' seqs. Cached on the plan (MemoryPlan.event_keys): every section entry of the run asks."""
++    m = plan.steps[step]
++    got = plan.event_keys.get(step)
++    if got is None or got[0] is not m or got[1] is not lowered:
++        seqs = _first_seqs(lowered)
++        if not m.order:
++            got = (m, lowered, False, sorted(seqs[k] for k in m.tensors))
++        else:
++            n = len(lowered.allocations)
++            ends = {-1 - k: end for k, _, end in m.temporaries} | {-1 - n - a: seq for a, seq in m.freed}
++            got = (m, lowered, True, sorted((seqs[e], 0) if e >= 0 else (ends[e], 1) for e in m.order))
++        plan.event_keys[step] = got
++    return got[2], got[3]
+ 
+ 
+ def _nbytes(lowered: LoweredTape) -> list[int]:

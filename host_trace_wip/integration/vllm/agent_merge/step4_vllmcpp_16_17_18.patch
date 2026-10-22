@@ -1,0 +1,282 @@
+--- a/torch/cuda/_host_trace_harvest.py
++++ b/torch/cuda/_host_trace_harvest.py
+@@ -582,7 +582,10 @@
+     group the keys that differ only in their sizes' leading dims and their
+     integer scalars (token counts). An extern key learned without its call
+     takes its inputs past _LENT bytes as views of `lendable` tensors of their
+-    dtype, which it reads and does not write."""
++    dtype, which it reads and does not write. One on a storage with other
++    inputs (OpaqueKey.alias: K and V views of one KV layer) refuses, unless
++    `lend_alias_groups`: then the group is views of one lendable tensor at
++    the key's distances."""
+ 
+     def __init__(
+         self,
+@@ -590,8 +593,9 @@
+         budget: Callable[[], int] = lambda: 1024,
+         rng_ops: tuple[Any, ...] = (),
+         extern_ops: tuple[Any, ...] = (),
+-        indexed: dict[Any, tuple[str, ...]] | None = None,
++        indexed: dict[Any, tuple[str | int, ...]] | None = None,
+         lendable: tuple[torch.Tensor, ...] = (),
++        lend_alias_groups: bool = False,
+     ) -> None:
+         self.budget = budget
+         self.rng = _RNG | frozenset(rng_ops) if "rng" in families else frozenset()
+@@ -607,6 +611,7 @@
+         self.templates: dict[tuple, dict[tuple, OpaqueBinding]] = {}
+         self.refused: dict[tuple, str] = {}
+         self.lendable = list(lendable)
++        self.lend_alias_groups = lend_alias_groups
+         self.transient: dict[tuple, int] = {}  # transient refusals per key
+         # per constant address or zeroed scratch block of a harvested
+         # binding: (kernel, parameter, byte, value, channel)
+@@ -700,25 +705,39 @@
+     def operands(self, key: OpaqueKey, inputs: int) -> dict[int, torch.Tensor] | None:
+         if key.op not in self.extern:
+             return {}
++        # with lend_alias_groups, per alias group's lead: (input, distance) of each
++        alias = key.alias if self.lend_alias_groups else ()
++        groups: dict[int, list[tuple[int, int]]] = {}
++        for j, lead, d in alias:
++            groups.setdefault(lead, [(lead, 0)]).append((j, d))
++        members = {j for j, _, _ in alias}
+         lent: dict[int, torch.Tensor] = {}
+         for i in range(inputs):
+-            dtype, align, span = key.dtypes[i], key.align[i], self._span(key, i)
+-            if span <= _LENT:
++            if i in members:
+                 continue
+-            if any(i in (j, lead) for j, lead, _ in key.alias):
++            group = groups.get(i, [(i, 0)])
++            dtype, align = key.dtypes[i], key.align[i]
++            reach = max(d + self._span(key, j) for j, d in group)
++            if reach <= _LENT:
++                continue
++            if not self.lend_alias_groups and any(i in (j, lead) for j, lead, _ in key.alias):
++                return None
++            if any(j >= inputs or key.dtypes[j] != dtype or d % dtype.itemsize for j, d in group):
+                 return None
+             fits = [
+                 t
+                 for t in self.lendable
+                 if t.dtype == dtype and t.device.index == key.device and t.data_ptr() % 256 == 0
+-                and t.untyped_storage().nbytes() - t.storage_offset() * t.itemsize >= align + span
++                and t.untyped_storage().nbytes() - t.storage_offset() * t.itemsize >= align + reach
+             ]
+-            # a lendable tensor of its own per input, where there are enough
++            # a lendable tensor of its own per group, where there are enough
+             taken = {u.untyped_storage().data_ptr() for u in lent.values()}
+             fits.sort(key=lambda t: t.untyped_storage().data_ptr() in taken)
+             if not fits:
+                 return None
+-            lent[i] = fits[0].as_strided(key.sizes[i], key.strides[i], fits[0].storage_offset() + align // dtype.itemsize)
++            at = fits[0].storage_offset() + align // dtype.itemsize
++            for j, d in group:
++                lent[j] = fits[0].as_strided(key.sizes[j], key.strides[j], at + d // dtype.itemsize)
+         return lent
+ 
+     def learn(
+--- a/torch/cuda/_host_trace_replay.py
++++ b/torch/cuda/_host_trace_replay.py
+@@ -260,6 +260,9 @@
+     dtype, ...) keys and evaluates only the other arguments, taking the
+     leading ones' rows from that hit (static_hits counts these); any change
+     takes the full path.
++    A variant that does not learn learns a keyed site's missing key out of
++    band (_learn); with `learn_in_learning_variants` a learning variant (one
++    with opaque calls) does too, instead of tracing the call again.
+ 
+     fn must be a pure function of its arguments. Torch's global settings
+     (grad and inference mode, autocast, the TF32, reduced-precision, cuDNN
+@@ -286,6 +289,7 @@
+         static_prefix: int = 0,
+         check_global_state: bool = False,
+         check_escapes: bool = False,
++        learn_in_learning_variants: bool = False,
+     ) -> None:
+         if memory not in ("auto", "eager", "run_buffer", "planned"):
+             raise ValueError(f"host_trace: memory {memory!r} is not 'auto', 'eager', 'run_buffer' or 'planned'")
+@@ -298,6 +302,7 @@
+         self.opaque = opaque
+         self.check_global_state = check_global_state
+         self.check_escapes = check_escapes
++        self.learn_in_learning_variants = learn_in_learning_variants
+         try:
+             self._signature: inspect.Signature | None = inspect.signature(fn)
+         except (TypeError, ValueError):
+@@ -452,11 +457,12 @@
+     def _fill(self, variant: _Variant, args: tuple, candidates: list[tuple[_Variant, list[int], list[int]]]) -> list[int] | None:
+         """The call's rows if the variant's program holds it, after adding
+         each keyed site's missing key to its table and each segment's missing
+-        form; None if a key does not bind yet (a learning variant's eager run
+-        harvests it), or if a selector selects nothing: then a variant that
+-        does not learn is a candidate to dispatch those selectors' ops again
+-        for, or to fold the call's trace into, (variant, rows, selectors) in
+-        `candidates`."""
++        form; None if a key does not bind and does not learn out of band
++        (a learning variant's only with learn_in_learning_variants; else its
++        eager run harvests it), or if a selector selects nothing: then a
++        variant that does not learn is a candidate to dispatch those
++        selectors' ops again for, or to fold the call's trace into,
++        (variant, rows, selectors) in `candidates`."""
+         evaluated = variant.native.evaluate(args)
+         if evaluated is None:
+             return None
+@@ -471,7 +477,7 @@
+         for i, key in missing:
+             site, opaque_key = sites[i].site, sites[i].key(key)
+             binding = site.provider.bind(opaque_key)
+-            if binding is None and not variant.learns and not site.rng and site.call is not None:
++            if binding is None and (self.learn_in_learning_variants or not variant.learns) and not site.rng and site.call is not None:
+                 if pool is None:
+                     pool = torch.cuda.MemPool() if _LEARN_POOL else False
+                 with torch.cuda.use_mem_pool(pool, opaque_key.device) if pool else contextlib.nullcontext():
+--- a/test/test_cuda_host_trace_harvest.py
++++ b/test/test_cuda_host_trace_harvest.py
+@@ -1008,6 +1008,7 @@
+ _extern_lib.define("rope_qk(Tensor(a!) q, Tensor(b!) k, Tensor pos, Tensor table) -> ()")
+ _extern_lib.define("store_kv(Tensor k, Tensor v, Tensor(a!) k_cache, Tensor(b!) v_cache, Tensor loc) -> ()")
+ _extern_lib.define("double_into(Tensor x, Tensor(a!) out) -> ()")
++_extern_lib.define("store_paged(Tensor k, Tensor v, Tensor(a!) k_cache, Tensor(b!) v_cache, Tensor slot) -> ()")
+ 
+ 
+ def _scale_qk(q, k, w):
+@@ -1026,6 +1027,13 @@
+     v_cache.index_copy_(0, loc, v)
+ 
+ 
++def _store_paged(k, v, k_cache, v_cache, slot):
++    # vLLM reshape_and_cache_flash: a slot is a page (dim 0) and a row in it (dim 1)
++    page, row = slot // k_cache.shape[1], slot % k_cache.shape[1]
++    k_cache[page, row] = k
++    v_cache[page, row] = v
++
++
+ def _double_into(x, out):
+     torch.mul(x, 2, out=out)
+ 
+@@ -1036,6 +1044,8 @@
+ _extern_lib.impl("store_kv", _store_kv, "CUDA")
+ torch.library.register_fake("ht_extern::store_kv", lambda k, v, k_cache, v_cache, loc: None, lib=_extern_lib)
+ _extern_lib.impl("rope_qk", _rope_qk, "CUDA")
++_extern_lib.impl("store_paged", _store_paged, "CUDA")
++torch.library.register_fake("ht_extern::store_paged", lambda k, v, k_cache, v_cache, slot: None, lib=_extern_lib)
+ torch.library.register_fake("ht_extern::scale_qk", lambda q, k, w: None, lib=_extern_lib)
+ torch.library.register_fake("ht_extern::rope_qk", lambda q, k, pos, table: None, lib=_extern_lib)
+ 
+@@ -1060,10 +1070,10 @@
+         torch.ops.ht_extern.store_kv(qkv[:, d : 2 * d], qkv[:, 2 * d :], k_cache, v_cache, loc)
+         return qkv + 1
+ 
+-    def run_cases(self, f, cases, indexed=None, lendable=()):
++    def run_cases(self, f, cases, indexed=None, lendable=(), lend_alias_groups=False):
+         ops = torch.ops.ht_extern
+-        extern = (ops.scale_qk.default, ops.rope_qk.default, ops.store_kv.default)
+-        p = HarvestProvider(("extern",), extern_ops=extern, indexed=indexed, lendable=lendable)
++        extern = (ops.scale_qk.default, ops.rope_qk.default, ops.store_kv.default, ops.store_paged.default)
++        p = HarvestProvider(("extern",), extern_ops=extern, indexed=indexed, lendable=lendable, lend_alias_groups=lend_alias_groups)
+         r = HostTraceReplay(f, opaque=(p,))
+         for args in cases:
+             # the floating arguments are what the calls write
+@@ -1150,6 +1160,47 @@
+             self.assertEqual(p.bindings, {})
+             self.assertTrue(all("past the extern cap" in why for why in p.refused.values()), p.refused)
+ 
++    @staticmethod
++    def store_paged(qkv, kv, slot):
++        # kv is [pages, heads, rows, 2 * d], K and V interleaved in each row: the
++        # caches are [pages, rows, heads, d] views of it, d elements apart (vLLM's
++        # FlashInfer layout on SM100)
++        t, (_, h, _, d2) = qkv.shape[0], kv.shape
++        k_cache, v_cache = kv.transpose(1, 2).split(d2 // 2, -1)
++        k, v = qkv.unflatten(1, (2, h, d2 // 2)).unbind(1)
++        torch.ops.ht_extern.store_paged(k, v, k_cache, v_cache, slot)
++        return qkv + 1
++
++    def paged_cases(self):
++        kv = torch.randn(4096, 2, 16, 128, device="cuda", dtype=bf16)
++        return [(torch.randn(t, 2 * 2 * 64, device="cuda", dtype=bf16), kv, torch.randperm(4096 * 16, device="cuda")[:t]) for t in (3, 11, 40, 11)]
++
++    def test_declared_interleaved_kv_writer(self):
++        # K and V caches interleaved in one page, past the cap: verified on
++        # small caches in one block at their distance, distinct slots spanning
++        # the page and row dims, as declared; replayed into the live caches
++        indexed = {torch.ops.ht_extern.store_paged.default: ("slot", "k_cache", "v_cache", 2)}
++        with mock.patch.object(harvest, "_EXTERN_CAP", 1 << 20):
++            p, r = self.run_cases(self.store_paged, self.paged_cases(), indexed)
++            self.assertEqual(len(p.refused), 0, p.refused)
++            # k and v 256 bytes apart in qkv, v_cache 128 bytes past k_cache
++            self.assertEqual({k[0] for k in p.bindings}, {((1, 0, 256), (3, 2, 128))})
++            self.assertEqual(self.eager_calls(r), [])
++            # undeclared, the written caches are past the cap
++            p, r = self.run_cases(self.store_paged, self.paged_cases())
++            self.assertEqual(p.bindings, {})
++            self.assertTrue(all("past the extern cap" in why for why in p.refused.values()), p.refused)
++
++    def test_interleaved_kv_writer_dropped_v_write_is_refused(self):
++        # a binding without its last kernel (the V write) leaves V's bytes in
++        # the shared block as they were: differs from eager, refused
++        launch = harvest._launch
++        indexed = {torch.ops.ht_extern.store_paged.default: ("slot", "k_cache", "v_cache", 2)}
++        with mock.patch.object(harvest, "_launch", lambda b, *args: launch(dataclasses.replace(b, nodes=b.nodes[:-1]), *args)):
++            p, r = self.run_cases(self.store_paged, self.paged_cases(), indexed)
++        self.assertEqual(p.bindings, {})
++        self.assertTrue(any("differs from eager" in why for why in p.refused.values()), p.refused)
++
+     def double(self, launch=None):
+         # double_into's harvests, each with its peak allocation past its start
+         p = HarvestProvider(("extern",), extern_ops=(torch.ops.ht_extern.double_into.default,))
+@@ -1228,6 +1279,52 @@
+                 self.assertEqual(self.eager_calls(r), [])
+                 self.assertEqual(r.learned, learned)
+ 
++    def test_learned_interleaved_kv_writer(self):
++        # K and V caches as views of one lendable tensor past _LENT (an alias
++        # group): once the variant is keyed (the fourth call), a new size's key
++        # is learned without its call under lend_alias_groups, at the key's
++        # distance; refused otherwise, the learning variant runs it eagerly
++        indexed = {torch.ops.ht_extern.store_paged.default: ("slot", "k_cache", "v_cache", 2)}
++        kv = torch.randn(4096, 2, 16, 128, device="cuda", dtype=bf16)
++        cases = [(torch.randn(t, 2 * 2 * 64, device="cuda", dtype=bf16), kv, torch.randperm(4096 * 16, device="cuda")[:t]) for t in (3, 3, 3, 3, 11, 40, 17)]
++        with mock.patch.object(harvest, "_EXTERN_CAP", 1 << 20), mock.patch.object(harvest, "_LENT", 64 << 10):
++            for groups, learned in ((True, 3), (False, 0)):
++                p, r = self.run_cases(self.store_paged, cases, indexed, (kv,), lend_alias_groups=groups)
++                self.assertEqual(len(p.refused), 0, p.refused)
++                self.assertEqual(self.eager_calls(r), [])
++                self.assertEqual((r.learned, r.traces), (learned, 2))
++
++    def test_learned_in_learning_variant(self):
++        # rope's key bound by another entry: f's trace keys rope and leaves
++        # store opaque (a learning variant). A new size's rope key is learned
++        # without its call under learn_in_learning_variants; otherwise f
++        # traces again
++        table = torch.randn(4096, 64, device="cuda", dtype=bf16)
++        k_cache, v_cache = (torch.randn(8192, 64, device="cuda", dtype=bf16) for _ in range(2))
++
++        def f(qkv, pos, table, k_cache, v_cache, loc):
++            return self.store(self.rope(qkv, pos, table), k_cache, v_cache, loc)
++
++        def case(t):
++            return torch.randn(t, 192, device="cuda", dtype=bf16), torch.randint(4096, (t,), device="cuda"), table, k_cache, v_cache, torch.randperm(8192, device="cuda")[:t]
++
++        ops = torch.ops.ht_extern
++        indexed = {ops.store_kv.default: ("loc", "k_cache", "v_cache")}
++        with mock.patch.object(harvest, "_LENT", 64 << 10):
++            for on, learned, traces in ((True, 4, 1), (False, 0, 2)):
++                p = HarvestProvider(("extern",), extern_ops=(ops.rope_qk.default, ops.store_kv.default), indexed=indexed, lendable=(table, k_cache, v_cache))
++                rope = HostTraceReplay(self.rope, opaque=(p,))
++                for qkv, pos, *_ in [case(5) for _ in range(3)]:
++                    rope(qkv, pos, table)
++                r = HostTraceReplay(f, opaque=(p,), learn_in_learning_variants=on)
++                for args in [case(t) for t in (5, 5, 17, 33, 9, 40)]:
++                    ref = [a.clone() if a.is_floating_point() else a for a in args]
++                    self.assertEqual(r(*args), f(*ref), atol=0, rtol=0)
++                    self.assertEqual(args, ref, atol=0, rtol=0)
++                self.assertEqual(len(p.refused), 0, p.refused)
++                self.assertEqual(self.eager_calls(r), [])
++                self.assertEqual((r.learned, r.traces), (learned, traces))
++
+     def test_learn_pool(self):
+         # under _LEARN_POOL the out-of-band learns' own operands are in a
+         # private pool, and its segments are gone after the call

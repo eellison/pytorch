@@ -1,0 +1,17 @@
+Scratch adapter copies for int6 candidate 2 (sources in land/scratch/sglang/armF, unchanged). Every edit:
+
+1. adapter_prep_cpp.py (from armF/prep/adapter_prep_cpp.py): removed the PREP_ABC block, which set
+   R._LEARN_WIDE, _harvest._BUDGET_GROUPS and _harvest._EXTERN_SIBLINGS. The switches are retired or were never merged on int6
+   (wide learning and extern siblings are unconditional; the budget is gone in 96). The header line now names only
+   PREP_TGV and PREP_BS_META as PREP_M defaults. Used by arm SM (PREP_M=1) and loaded through ARMF_ADAPTER_DIR.
+   The C1 `_by_runs` workaround is kept as is.
+2. tgv/adapter.py (from armF/tgv/adapter.py): removed `if TGV: ht.cute_without_tvm_ffi = True`. The switch was retired at
+   step 70 and the behaviour is always on. Used by FT and MFT.
+3. prefill_adapter/adapter.py and prefill_e2e/adapter.py (from armF/prefill/{adapter,e2e}/adapter.py): dropped
+   budget_unit="group" at L163-164 (the kwarg was removed in 96). Not used by run_c2.sh; kept for the prefill drivers.
+4. mixed_open.py (new): runs armF/mixed/driveM.py under armF/tgv/drive_bf16.py (bf16 GEMM backend initialized). With
+   MIXM_F=1 it uses tgv/adapter.py as adapter_m.
+
+Unchanged and used as is: armF/adapter.py, adapter_cpp.py, prep/adapter_prep.py, mixed/adapter_m.py. A grep found none of
+budget/budget_unit, learn_in_learning_variants, redispatch_learners, cute_without_tvm_ffi or _LEARN_WIDE in them.
+learn_in_learning_variants and redispatch_learners appear only in the vLLM adapter (vLLM lane).

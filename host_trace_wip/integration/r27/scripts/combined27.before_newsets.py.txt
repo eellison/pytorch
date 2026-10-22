@@ -1,0 +1,61 @@
+# combined27.py: the single 27B headline across the timed sets (c5h): n27w (GPU 1: decode bs 1-128, prefill 64-16000, mixed sweep,
+# alternating; full-step metric), n27m (GPU 0, the other instance: the 8 g4 mixed shapes; its decode row is excluded, execute_model-only
+# for vLLM), n27cb2 (GPU 2: churn, end-to-end per output token). Every arm of a set ran on that set's GPU. One vLLM config for every row
+# (the faster by geomean over all rows), then the two-column version (vs default, vs default-nc). Ratio = vLLM / ours (> 1: ours faster).
+import collections, glob, json, os, re, statistics as st, sys
+
+D = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "out", "timing")
+rows = collections.OrderedDict()
+gpu = {"n27w": 1, "n27m": 0, "n27cb2": 2}
+
+
+def add(r, arm, v):
+    rows.setdefault(r, collections.defaultdict(list))[arm].append(v)
+
+
+for setn in ("n27w", "n27d", "n27m", "n27cb2"):
+    for f in sorted(glob.glob(os.path.join(D, f"t_{setn}_*_r*.json"))):
+        arm = re.match(rf"t_{setn}_(default|fullnc|vcvp|breakable|vsvp)_r\d+\.json", os.path.basename(f))
+        if not arm:
+            continue
+        arm, j = arm.group(1), json.load(open(f))
+        if j.get("window_violations"):
+            continue
+        if setn == "n27w":  # its decode and alternating rows are superseded by n27d (decode curves, arms interleaved)
+            for L, v in j.get("prefill", {}).items():
+                v.get("step_ms") and add(f"prefill {int(L):5d}", arm, v["step_ms"])
+        for k, v in j.get("dcurve", {}).items():
+            ctx, bs = map(int, k.split("_"))
+            v.get("mean_ms") and add(f"decode {ctx // 1024}K ctx bs {bs:3d} (per token)", arm, v["mean_ms"])
+        for k, v in j.get("ix", {}).items():
+            if v.get("step_ms") and (k.startswith("mixed_") or (k.startswith("alt_") and setn == "n27d")):
+                add(f"{setn} {k}", arm, v["step_ms"])
+        for C, v in j.get("cb", {}).items():
+            v.get("wall_ms_per_token") and add(f"churn C={C} (per token)", arm, v["wall_ms_per_token"])
+med = {r: {a: st.median(x) for a, x in d.items()} for r, d in rows.items()}
+print(f"27B (c5h, Qwen3.8-27B NVFP4, gdn_prefill_backend=triton). GPUs: n27w 1, n27d 1, n27m 0, n27cb2 2 (all arms of a set on its GPU).")
+print("Every ratio compares two CUDA-graphing methods on the same forward (the same kernels); no ratio crosses the two sections.")
+print("CAVEAT: vLLM's prefill / mixed step is host time (prefill-64 default: GPU busy 10.5 ms of a 216 ms step); graphing removes it.")
+unc = "vsvp"
+secs = [("COMPILED FORWARD: vLLM default (piecewise + FULL decode) vs ours Vc+VP", ["default"], "vcvp"),
+        ("EAGER FORWARD: vLLM default-nc (FULL decode) and vLLM breakable vs ours V+VP", ["fullnc", "breakable"], unc)]
+both = [m for m in med.values() if "vcvp" in m and unc in m]
+if both and st.geometric_mean([m[unc] for m in both]) < st.geometric_mean([m["vcvp"] for m in both]):
+    secs.reverse()
+    print("Faster forward overall (ours on each): eager.")
+elif both:
+    print("Faster forward overall (ours on each): compiled.")
+for title, vl, ours in secs:
+    print()
+    print(title)
+    print(f"{'row':44s} " + " ".join(f"{a:>10s}" for a in vl) + f" {'ours':>10s} " + " ".join(f"{a + '/ours':>13s}" for a in vl))
+    for r, m in med.items():
+        if ours not in m or not any(a in m for a in vl):
+            continue
+        print(f"{r:44s} " + " ".join(f"{m[a]:10.2f}" if a in m else f"{'-':>10s}" for a in vl) + f" {m[ours]:10.2f} "
+              + " ".join(f"{m[a] / m[ours]:12.2f}x" if a in m else f"{'-':>13s}" for a in vl))
+    for grp in ("decode", "prefill", "mixed", "alt", "churn"):
+        for a in vl:
+            g = [m[a] / m[ours] for r, m in med.items() if grp in r and a in m and ours in m]
+            if g:
+                print(f"  {grp:8s} {a:10s} n={len(g):3d} geomean {a}/ours {st.geometric_mean(g):.2f}x")

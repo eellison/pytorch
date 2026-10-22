@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# 10-15 Delta 1 on 27B n27wf (lifted per-step state): TAG MODE on GPU $G
+cd $(dirname $0)
+G=${G:-3}; CPUS=${CPUS:-108-143}; TAG=${TAG:-l27a}; MODE=${MODE:-run}
+LIFT="DIAG27_PROV=1 PROV_LIFT=1 PROV_RELAX_GUARDS=1 DIAG27_CLOSURE=1 DIAG27_CLOSURE_STORAGE=1 DIAG27_FNRESOLVE=1 DIAG27_CUTE_RESOLVE=1 DIAG27_SET=redo_resolves_arguments=1${EXTRA_SET:+,$EXTRA_SET} DIAG27_REDOCTX=1 DIAG27_REDOCTX_LAZY=1 DIAG27_LIFT=1 LF_GPU=$G LF_CPUS=$CPUS"
+[ "${BASE:-0}" = 1 ] && LIFT="LF_GPU=$G LF_CPUS=$CPUS"
+STEP_OFF=1 ./gpulock.sh $G 36000 env $LIFT RUN_TIMEOUT=1120 ./run27wf.sh $TAG $MODE > logs/$TAG.log 2>&1
+echo done >> logs/$TAG.log

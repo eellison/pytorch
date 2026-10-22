@@ -1,0 +1,27 @@
+Arm Af (stock SGLang CUDA graphs plus arm P's fused decode-prep kernel run eagerly). All files are new; no existing file
+was edited (land/scratch/sglang, int6/candidate trees and other adapters_c2 files are untouched).
+
+1. adapters_c2/af/adapter_prep.py (new, ~200 LOC including the kernel and the eligibility, both verbatim copies).
+   - It is loaded under driveF_prep.py's module name (ARMF_ADAPTER_DIR=adapters_c2/af, class PrepF), so the P drivers
+     run it unchanged: PREP_SEQCHECK, stamps_prep.py + launchshim.so, PREP_ASYNC and the profiles.
+   - _prep_decode_kernel is a verbatim copy of armF/prep/adapter_prep.py:534-558, about 25 lines.
+   - PrepF._eligible is a verbatim copy of P's, about 30 lines.
+   - decode() runs prepare_for_decode's host bookkeeping exactly as PrepF.decode does it (about 45 lines). Then it makes
+     one eager launch of the kernel in place of prep kernels #1-#10. Then it runs one_batch.decode's tail unchanged:
+     ForwardBatch.init_new, ModelRunner.forward (SGLang's cuda graph runner: _small_copy_kernel,
+     update_trtllm_mha_graph_metadata_kernel, replay) and mr.sample (the eager greedy sampler).
+   - install() replaces one_batch.decode. It also wraps forward_batch_info.clamp_position so that, during an Af step,
+     the call returns the kernel's positions; the wrapper matches on the identity of this step's new seq_lens tensor.
+     Any other call goes to SGLang's clamp_position. About 10 lines.
+   - Batches that fail eligibility run SGLang's decode unchanged and are counted in calls["decode"] or
+     calls["af_ineligible:..."].
+   - counters() and summary() return the shapes the P drivers read: zeros, plus a calls Counter (af = fused steps).
+   - The module does not import torch.cuda._host_trace. stamps_prep.py imports _host_trace_replay for every arm, as it
+     did before.
+2. adapters_c2/af/count_outside.py (new, ~30 LOC): counts the GPU ops (kernels, memcpys, memsets) of one profiled
+   decode step that are launched outside CUDA graphs. It splits them into before and after the step's first graph
+   launch, by host launch time, and lists their names.
+3. adapters_c2/af/run_af.sh (new): GPU 1 correctness (PREP_SEQCHECK E/A/Af, plus PREP_SEQ_LEN=250) and the profiles
+   for the outside-graph counts (A, Af, F, P, Pc). One gpu1.lock hold per group.
+4. run_prep_time_c2.sh (new, integration/): GPU 0 timing for A/Af/F/P/Pc, run_time.sh's metrics, in
+   run_time_c2.sh's form. It was syntax-checked only and has not been run.

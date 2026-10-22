@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# kidx_line.sh WL ARM: untimed every-size kernel identity (DRIVE_KID=1, DRIVE_TACTIC_LOG=1) for the n27d decode workload (WL d: decode
+# curves bs 1-128 at 1K / 8K + the alternating rows, n27d config, short windows) or the n27cbf churn workload (WL cb: the seeded churn
+# at C 16 / 64, FlashInfer GDN, vLLM defaults; KID's third pass profiles every window step class). out/kid/t_kid<WL>_<ARM>_r1.json.
+# KID never shares a process with a timed window. Run inside a GPU hold.
+R27=/data/eellison/src/pytorch/agent_space/paramgraph/land/core/r27
+I=/data/eellison/src/pytorch/agent_space/paramgraph/land/int6
+S=/data/eellison/src/pytorch/agent_space/paramgraph/land/scratch/sglang/site
+WL=$1 ARM=$2
+export DRIVE_STEP_WITH_SAMPLE=1 DRIVE_KID=1 DRIVE_TACTIC_LOG=1 R27_WT=$I/snap/step324 R27_INSTALL=$I/build_cpp12/install FI_HT_BUILD=$R27/build_c12 TORCH_EXTENSIONS_DIR=$R27/torch_ext_c12
+COMMON=(ARMV_STOCK=1 ARMV_METADATA=eager ARMV_HOSTCUTS=0 ARMV_DECODE_MAX_SEQ=actual ARMV_PREFILL_MAX_KV=actual ARMV_NO_REJIT=1 ARMV_BOUND=0
+    ARMV_HOST_ARGS=pinned ARMV_SOUND=1 ARMV_TRTLLM_CPP=1 ARMV_CUTE_OBSERVE=1 ARMV_PORTS=1
+    HOSTTRACE_TORCH_DISABLE_CACHES=0 ARMV_VP=1 ARMV_VP_UVA=0 ARMV_VP_STOCK=1 ARMV_GC_FREEZE=1)
+case $WL in
+  d) KW='{"kv_cache_dtype": "fp8", "max_num_seqs": 128, "gdn_prefill_backend": "triton"}'; B=n27d; KV=72; EK=prefill,mixed
+     W=(--batch-size 1 --decode-tokens 8 --prefill-lens 64 --mixed 0 --dcurve-ctx 1024 8192 --dcurve-bs $(seq -s ' ' 1 128) --dcurve-steps 2
+        --dcurve-warm 2 --alt-decode 37:50@1024-2048 63:65@1024-2048 97:100@1024-2048 --ix-reps 6) ;;
+  cb) KW='{"kv_cache_dtype": "fp8"}'; B=n27cbf; KV=64; EK=; COMMON+=(ARMV_GDN_WS=1)
+      W=(--batch-size 1 --prefill-lens 64 --mixed 0 --cb 16 64 --cb-steps 3000 --cb-warm 400 --cb-out 256 2048 --cb-prompt 64 512 --cb-prewarm) ;;
+esac
+KWC=${KW%\}}', "compilation_config": {"cudagraph_mode": "NONE"}}'
+W=(--model /data/eellison/models/Qwen3.8-27B-NVFP4 --language-model-only --max-model-len 16384 "${W[@]}")
+case $ARM in
+  default) envs=(R27_OVERLAY=$S HOSTTRACE_TORCH_DISABLE_CACHES=0); args=(--arm default --llm-kw "$KW") ;;
+  fullnc) envs=(R27_OVERLAY=$S); args=(--arm fullnc --llm-kw "$KW") ;;
+  breakable) envs=(R27_OVERLAY=$S VLLM_USE_BREAKABLE_CUDAGRAPH=1 DRIVE_CC_JSON='{"cudagraph_mode": "FULL_AND_PIECEWISE"}'); args=(--arm fullnc_full --llm-kw "$KW") ;;
+  breakablegb) envs=(R27_OVERLAY=$S VLLM_USE_BREAKABLE_CUDAGRAPH=1 VLLM_GDN_EAGER_BREAK=1 DRIVE_CC_JSON='{"cudagraph_mode": "FULL_AND_PIECEWISE"}'); args=(--arm fullnc_full --llm-kw "$KW") ;;
+  vcvp) envs=("${COMMON[@]}" ARMV_EAGER_KINDS=$EK ARMV_INDUCTOR_SEAMS=1 ARMV_BINDINGS_LOAD=$R27/bindings/$B.pkl); args=(--arm Vc --llm-kw "$KWC") ;;
+  vsvp) envs=("${COMMON[@]}" ARMV_EAGER_KINDS=$EK ARMV_BINDINGS_LOAD=$R27/bindings/${B}_v.pkl); args=(--arm V --llm-kw "$KW") ;;
+esac
+O=$R27/out/kid; mkdir -p $O
+env "${envs[@]}" INTEG_GPU_UTIL=0.9 INTEG_KV_BYTES=$((KV << 30)) bash $R27/python_r27.sh $R27/bench/drive_sweep27.py "${W[@]}" "${args[@]}" --out $O/t_kid${WL}_$ARM.json_tmp \
+  && mv $O/t_kid${WL}_$ARM.json_tmp $O/t_kid${WL}_${ARM}_r1.json

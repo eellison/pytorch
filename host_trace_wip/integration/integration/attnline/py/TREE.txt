@@ -1,0 +1,94 @@
+tree int5b = fork commit e074b27eedb minus CUDA_GRAPHS_STATUS.md (wt-land-int5b on a0fd72063f0, working tree incl. the plain-part fix). Copied 2026-10-02T22:43:55Z by rsync of torch functorch torchgen benchmarks test, excluding __pycache__/*.pyc. C++: install_land_int5b_frozen = cp -a of install_land_int5b (libtorch_cuda 2026-10-01 10:46 local; no wt C++ newer). Gates: land/scratch/eager/cov/int5b/REPORT.txt.
+step52: = snap/step48 = work_cpp + 51_cublaslt, minus 49 test (coordinator: 49 out until the harvest leak is fixed)
+step54: = work_cpp + 50_cute_intercept_stack_and_type_caches (18:27:57)
+step56: = work_cpp + 53_trace_stack_chunk (fresh_stack_chunk ON)
+step58: = work_cpp + perf 02 keep_programmatic_edges ON
+step60: = work_cpp + P1a C++/pyi + 48 sglcpp C++/pyi + 48 int6cpp.step46 Python (needs build_cpp install)
+step62: = work_cpp + 52_custom_op_reentry + 54_triton_tma_encode (Python half)
+step64: = work_cpp + 53 py313 delta + 47a_cover_startup_solver
+step66: = work_cpp + perf P1_cpp_entry_switch (cpp_entry ON)
+step68: = work_cpp + 58_cover_ir_rows (ir_rows ON)
+step70: = work_cpp + 49b_harvest_private_streams
+step72: = work_cpp + 49_extern_host_choice_test
+step74: = work_cpp + 55_ir_dunder_fast_paths
+step76: = work_cpp + 56_learners_local_by_default int6cpp (oob_learn ON)
+step78: = work_cpp + 49c_private_capture_streams
+step80: = work_cpp + 55b_symint_dunders_on_register
+step82: = work_cpp + 63_entry_guards_ir (- stray _host_trace_replay.py.orig)
+step84: = work_cpp + 56b_refused_keys_are_eager_steps (refused_eager_steps ON)
+step86: = work_cpp + 49d_side_stream_loud_refusal (no switch)
+step88: = work_cpp + 64_library_codes_cache (no switch)
+step90: = work_cpp + 49e_capture_no_warnings_filter (no switch)
+step92: = work_cpp + 57_flip_lend_alias_groups (lend_alias_groups ON)
+step94: = work_cpp + 57_flip_inductor_handback (cudagraph_host_trace_handback ON)
+step96: = work_cpp + 57_test_inductor_splits_handback (test only)
+step98: = work_cpp + 66_background_race_test (test only)
+step100: = work_cpp + build_cpp2 C++ sources (54 59 61 G63 G5 sglcpp/cpp diffs; csrc and pyi.in = build_cpp2/src) + 61 int6cpp test + G63 py + G5 int6s82 py; needs build_cpp2/install (python_int6_build2.sh / gate_build2.sh). Even line only (no step99).
+step102: = step100 + perf G7_optional_tensor_list cpp (bd3bf15b4836) + py (f0600aed4834); needs build_cpp3/install (python_int6_build3.sh / gate_build3.sh; build_cpp3 = build_cpp2/src + G7 cpp). Even line only (no step101).
+step104: = work_cpp + 66_respec_in_ir (prefill lane; respec through IR; no switch); needs build_cpp3/install
+step106: = work_cpp + 67_refused_redispatch_first (prefill lane; previously refused ops redispatch first; no switch); needs build_cpp3/install
+step108: = work_cpp + G8 test only (as step107)
+step110: = work_cpp + 68_cover_rows_shared_across_variants (as step109); needs build_cpp3/install
+step112: = work_cpp + python_entry skips test_a_refused_key_is_a_row (int6 test-only fix: 56's C++-entry test was not in _CPP_ONLY); needs build_cpp3/install
+step114: = work_cpp + 69_redo_shared_fake_mode_and_capture (as step113); needs build_cpp3/install
+step116: = work_cpp + 57_flip_inductor_backward_frees_saved (as step115); needs build_cpp3/install
+step118: = work_cpp + 80a_cleanup_tape_ir (as step117); needs build_cpp3/install
+step120: = work_cpp + 80b_cleanup_launch (as step119); needs build_cpp3/install
+step122: = work_cpp + 80c_cleanup_memory_harvest (as step121); needs build_cpp3/install
+step124: + 70_cute_from_dlpack_always (.int6cpp.patch)
+step126: + S5_no_cublas_harvest_cap (.int6cpp.patch)
+step128: + S1_dead_code + S1_dead_code_csrc (.int6cpp.patch); needs build_cpp4/install
+step130: + S2_retire_rollout_switches (.int6cpp.patch); needs build_cpp4/install
+step132: + S3_retire_cluster_learn_ints (.int6cpp.patch); needs build_cpp4/install
+step134: + S4_merge_owner_sets (.int6cpp.patch); needs build_cpp4/install
+step136: + S6_retire_learner_switches (.int6cpp.patch); needs build_cpp4/install
+step138: + AMC_autotune_multi_config_pin (.int6cpp.patch); needs build_cpp4/install
+step140: + 72_cute_construction_surface (.int6cpp.patch); needs build_cpp4/install
+step142: + 71_respec_one_splice (.int6cpp.patch); needs build_cpp4/install
+step144: + 73_respec_outside_alloc_test (.int6cpp.patch); needs build_cpp4/install
+step146: + 74_cute_tma_stride_rounding (.int6cpp.patch); needs build_cpp4/install
+step148: + 75_cute_construction_hooks_trace_only (.int6cpp.patch); needs build_cpp4/install
+step150: + 76_cute_make_ptr_decline (.int6cpp.patch); needs build_cpp4/install
+step152: + 77_respec_takes_redispatch_redos (.int6cpp.patch); needs build_cpp4/install
+step154: + G9_memory_auto_default (.int6cpp.patch); needs build_cpp4/install
+step156: + G11_default_blas_harvest (.int6cpp.patch); needs build_cpp4/install
+step158: + 91_cute_from_dlpack_other_thread_test (.int6cpp.patch); needs build_cpp4/install
+step160: + 92_decline_visibility (.int6cpp.patch); needs build_cpp4/install
+step162: + 93_cute_int_tuple_pattern_ceil_div (.int6cpp.patch); needs build_cpp4/install
+step164: + perf/gaps/G12_quiet_harvest_decline (.int6cpp.patch); needs build_cpp4/install
+step166: + 90_cute_compile_decline_retried_once (.int6cpp.patch); needs build_cpp4/install
+step168: + 78_eager_op_guards (.int6cpp.patch); needs build_cpp4/install
+step170: + 79_contiguity_by_construction (.int6cpp.patch tests; _csrc Contiguity.h built in build_cpp5, copy at c10/core); needs build_cpp5/install
+step172: + 81_redo_borrows_a_dispatch (.int6cpp.patch); needs build_cpp5/install
+step174: + 84_respec_borrows_a_dispatch (.int6cpp.patch); needs build_cpp5/install
+step176: + 94_tma_entry_fold_test (.int6cpp.patch, test only); needs build_cpp5/install
+step178: + G13_direct_output_view (.test.patch; .int6cpp_csrc built in build_cpp6, copy in tree); needs build_cpp6/install
+step180: + 85_respec_layout_under_its_pins + 86_redo_key_before_trace (.int6cpp.patch); needs build_cpp6/install
+step182: + 95_pool_allocation_log (.int6cpp.patch; _csrc built in build_cpp7, copies at c10/cuda and torch/csrc); needs build_cpp7/install
+step184: + G14_cycle_free_replays (.step180.patch); needs build_cpp7/install
+step186: + G15_eager_outputs_not_kept (.step180+G14.patch); needs build_cpp7/install
+step188: + 96_no_harvest_budget_exact_twins (.int6cpp.patch); needs build_cpp7/install
+step190: + FZ01 FZ01_drawing_learn_in_range.int6cpp.patch (.int6cpp.patch; needs build_cpp7/install)
+step192: + FZ02 FZ02_key_alias_at_the_call.int6cpp.patch (.int6cpp.patch; needs build_cpp7/install)
+step194: + FZ03 FZ03_shape_routed_meta_guards.int6cpp.patch (.int6cpp.patch; needs build_cpp7/install)
+step196: + FZ04 FZ04_twin_refuses_failing_op_guards.int6cpp.patch (.int6cpp.patch; needs build_cpp7/install)
+step198: + FZ05 FZ05_eager_zero_element_strides.int6cpp.patch (.int6cpp.patch; needs build_cpp8/install)
+step200: + FZ06 FZ06_plan_liveness_from_roots.int6cpp.patch (.int6cpp.patch; needs build_cpp8/install)
+step202: + FZ08 FZ08_remove_respec.int6cpp.patch (.int6cpp.patch; needs build_cpp8/install)
+step204: + FZ09 FZ09_redo_allocations_under_pins.on08.int6cpp.patch (.int6cpp.patch; needs build_cpp8/install)
+step206: + FZ10 FZ10_retrace_causes.on08_09.int6cpp.patch (.int6cpp.patch; needs build_cpp8/install)
+step208: + T2 T2.int6cpp.patch (.int6cpp.patch; needs build_cpp8/install)
+step210: + T3 T3.int6cpp.patch (.int6cpp.patch; needs build_cpp8/install)
+step212: + 97 97_cute_tvm_ffi_spec_guards.int6cpp.patch (.int6cpp.patch; needs build_cpp8/install)
+step214: + 97b 97b_cute_builtin_types_structured.int6cpp.patch (.int6cpp.patch; needs build_cpp8/install)
+step216: + 98 98_cublas_workspace_always_and_plan_check.step212.int6cpp.patch (.int6cpp.patch; needs build_cpp8/install)
+step224: + TT T_triton_soundness.int6cpp.patch (.int6cpp.patch; needs build_cpp8/install)
+step226: + N1 N1_trusted_redispatch.on_fz08.int6cpp.patch (.int6cpp.patch; needs build_cpp8/install)
+step228: + FZ06b FZ06b_entry_root_test_without_respec.on_step220.int6cpp.patch (.int6cpp.patch; needs build_cpp8/install)
+step230: + 98t 98t_plan_check_test_no_harvest.step228.int6cpp.patch (.int6cpp.patch; needs build_cpp8/install)
+step232: + TTg T_triton_soundness_gh200_test.patch (.int6cpp.patch; needs build_cpp8/install)
+step234: + F8 F8.step220.int6cpp.patch (.int6cpp.patch; needs build_cpp8/install)
+step236: + F10 F10.step220.int6cpp.patch (.int6cpp.patch; needs build_cpp8/install)
+step238: + F11 F11.step220.int6cpp.patch (.int6cpp.patch; needs build_cpp8/install)
+step240: + F16 F16.step220.int6cpp.patch (.int6cpp.patch; needs build_cpp8/install)
+step242: + F17 F17.step220.int6cpp.patch (.int6cpp.patch; needs build_cpp8/install)
