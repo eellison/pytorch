@@ -1,0 +1,67 @@
+--- a/options.json	2026-10-09 15:25:42.637515382 -0700
++++ b/options.json	2026-10-09 15:26:07.113281571 -0700
+@@ -8360,6 +8360,24 @@
+    ],
+    "case": "validity_checks",
+    "meaning": "hf5_checks (candidate 4, step 261/262): eager's validity checks of a traced call's values (as_strided's storage bounds, a negative size) are conditions of the variant's calls (Tape.checks, its valid row), not guards; a failing call misses and its warm-up raises eager's error. False: a guard each, as before. Default ON (user decision 10-08: checks before the graph)."
++  },
++  "memory.host_temporaries": {
++   "axis": "memory",
++   "added_by": [
++    "int6_c4"
++   ],
++   "spec": {
++    "kind": "module",
++    "where": "torch.cuda._host_trace",
++    "name": "host_temporaries"
++   },
++   "default": true,
++   "values": [
++    true,
++    false
++   ],
++   "case": "host_temporaries",
++   "meaning": "peak1_host_temporaries (candidate 4): in run_buffer and the planned modes (and auto when it takes the run buffer), a run's temporary that dies before a tensor of its bytes the run makes is first touched lives in that tensor (MemoryPlan.hosted), as eager's allocator gives the tensor the freed block: a pointwise chain's replay peak is eager's. False: the old placement (the run's tensors beside its run buffer, one intermediate above eager on such chains). Default ON (a pure improvement: fewer bytes, no allocator call, nothing on hits)."
+   }
+  }
+ }
+\ No newline at end of file
+--- a/test_options_conformance.py	2026-10-09 15:25:42.655207905 -0700
++++ b/test_options_conformance.py	2026-10-09 15:26:07.114413608 -0700
+@@ -697,6 +697,36 @@
+         (tape,) = [v.captured.lowered.tape for v in r.variants]
+         self.assertEqual(bool(tape.checks), on)
+ 
++    @parametrize("on", [False, True])
++    def test_case_host_temporaries(self, on):
++        # a run's temporary that dies before a tensor of its bytes the run makes is first touched lives in that
++        # tensor (MemoryPlan.hosted): sigmoid(x) * y + 2's first intermediate is in the output, so the run buffer's
++        # peak is eager's; off, the old placement, one tensor above
++        self.need("memory.host_temporaries")
++
++        def chain(x, y):
++            return torch.sigmoid(x) * y + 2
++
++        x, y = torch.randn(7, 768, device="cuda"), torch.randn(768, device="cuda")
++        with mock.patch.object(torch.cuda._host_trace, "host_temporaries", on):
++            r = _ht(chain, memory="run_buffer")
++            self.assertEqual(r(x, y), chain(x, y), atol=0, rtol=0)
++
++        def peak(h):
++            gc.collect()
++            torch.cuda.synchronize()
++            before = torch.cuda.memory_allocated()
++            torch.cuda.reset_peak_memory_stats()
++            out = h(x, y)
++            torch.cuda.synchronize()
++            return torch.cuda.max_memory_allocated() - before, out
++
++        (got_peak, got), (want_peak, want) = peak(r), peak(chain)
++        self.assertEqual(got, want, atol=0, rtol=0)
++        self.assertEqual(got_peak, want_peak if on else want_peak + want.nbytes)
++        self.assertEqual(bool(r.variants[0].memory.hosted), on)
++        self.took(r, replays=1)
++
+ 
+ instantiate_parametrized_tests(TestOptionDefaults)
+ instantiate_parametrized_tests(TestModeCases)

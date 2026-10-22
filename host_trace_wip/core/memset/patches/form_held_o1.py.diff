@@ -1,0 +1,90 @@
+--- step_ms2b/test/test_cuda_host_trace_opaque.py	2026-10-14 11:30:03.621188225 -0700
++++ step_ms3/test/test_cuda_host_trace_opaque.py	2026-10-14 20:56:15.686689256 -0700
+@@ -816,10 +816,13 @@
+             self.assertEqual(f(x, y), mul_chain(x, y), atol=0, rtol=0)
+         self.assertEqual(len(bound(f)), 1)
+ 
++    @parametrize("form_held", [False, True])
+     @parametrize("first", [512, 640])
+-    def test_binding_switches(self, first):
++    def test_binding_switches(self, first, form_held):
+         # bindings of both topologies, and two alignments of y, alternate; the
+         # first call's topology is the segment's, the other a piece of a clone
++        torch._C._host_trace_form_held(form_held)
++        self.addCleanup(torch._C._host_trace_form_held, True)
+         p = TableProvider(style="mixed")
+         f = HostTraceReplay(mul_chain, opaque=(p,))
+         base = torch.randn(4096, device="cuda")
+@@ -839,9 +842,14 @@
+             sets = torch._C._host_trace_memory_node_sets()
+             self.assertEqual(f(x, y), mul_chain(x, y), atol=0, rtol=0)
+             # the scratch binding's memset node is set at each form switch, not
+-            # at the second call of a form at its row
++            # at the second call of a form at its row; with form_held, a form's
++            # exec keeps its memset, set only where its extents or address moved
+             again = i >= 12 and i % 2 == 1
+-            self.assertEqual(torch._C._host_trace_memory_node_sets() - sets, int(n % 256 == 0 and not again))
++            memsets = torch._C._host_trace_memory_node_sets() - sets
++            if form_held:
++                self.assertLessEqual(memsets, int(n % 256 == 0 and not again))
++            else:
++                self.assertEqual(memsets, int(n % 256 == 0 and not again))
+         self.assertEqual((f.traces, f.replays), (traces, replays + 24))
+ 
+     @parametrize("form_held", [False, True])
+@@ -864,10 +872,54 @@
+                 self.assertEqual(f(x, y), mul_chain(x, y), atol=0, rtol=0)
+             sets = torch._C._host_trace_kernel_node_sets() - sets
+         finally:
+-            torch._C._host_trace_form_held(False)
++            torch._C._host_trace_form_held(True)
+         self.assertEqual(len(bound(f)), 1)
+         self.assertEqual(sets == 0, form_held)
+ 
++    @parametrize("stable", [True, False])
++    def test_forms_alternating_set_only_what_moved(self, stable):
++        # two sites, each binding either topology (TableProvider "mixed": n % 256), so up
++        # to four forms, cycled repeatedly. Each form's exec keeps what it held: with the
++        # same tensors per form, a revisit sets no node; with fresh tensors each call
++        # only the nodes reading them. Outputs bitwise either way
++        def fn(x, y, x2, y2):
++            return mul_chain(x, y), mul_chain(x2, y2)
++
++        p = TableProvider(style="mixed")
++        f = HostTraceReplay(fn, opaque=(p,))
++        base = torch.randn(4096, device="cuda")
++        sizes = [(512, 512), (640, 512), (512, 640), (640, 640)]
++
++        def args(n, m):
++            return (torch.randn(n, device="cuda"), base[:n], torch.randn(m, device="cuda"), base[:m])
++
++        fixed = {nm: args(*nm) for nm in sizes}
++        for _ in range(2):
++            for nm in sizes:
++                f(*fixed[nm])
++        self.assertEqual((len(f.variants), len(bound(f))), (1, 1))
++        visits = []
++        for i in range(16):
++            nm = sizes[i % 4]
++            a = fixed[nm] if stable else args(*nm)
++            sets = torch._C._host_trace_kernel_node_sets() + torch._C._host_trace_memory_node_sets()
++            self.assertEqual(f(*a), fn(*a), atol=0, rtol=0)
++            visits.append(torch._C._host_trace_kernel_node_sets() + torch._C._host_trace_memory_node_sets() - sets)
++        if stable:
++            self.assertEqual(visits, [0] * 16)
++        else:
++            # x and x2 are fresh: the adds reading them and the muls are set, not every node
++            self.assertTrue(all(0 < v for v in visits))
++        # without held state each call lands on another form's exec and sets its nodes
++        torch._C._host_trace_form_held(False)
++        try:
++            for nm in sizes:
++                sets = torch._C._host_trace_kernel_node_sets()
++                self.assertEqual(f(*fixed[nm]), fn(*fixed[nm]), atol=0, rtol=0)
++                self.assertGreater(torch._C._host_trace_kernel_node_sets() - sets, 0)
++        finally:
++            torch._C._host_trace_form_held(True)
++
+     @parametrize("same", [True, False])
+     def test_a_row_switch_to_the_held_launch_sets_nothing(self, same):
+         # two keys (tags 1 and 2) of one site alternate on the same operands: with

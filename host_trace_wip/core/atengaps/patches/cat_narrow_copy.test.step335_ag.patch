@@ -1,0 +1,32 @@
+--- ../../step335_ag/test/test_cuda_host_trace_aten.py	2026-10-14 06:20:17.558566446 -0700
++++ test_cuda_host_trace_aten.py	2026-10-14 07:52:17.073259887 -0700
+@@ -422,6 +422,9 @@
+     "empty_input": (lambda a, b: torch.cat([a, b[:0], b]), lambda m, h, d: (_randn(m, h, dtype=d), _randn(2, h, dtype=d))),
+     "non_contiguous": (lambda a, b: torch.cat([a.t(), b.t()]), lambda m, h, d: (_randn(m, 64, dtype=d), _randn(m, 32, dtype=d))),
+     "many_inputs": (lambda *xs: torch.cat(xs, -1), lambda m, h, d: tuple(_randn(m, 8 + i % 3, dtype=d) for i in range(70))),
++    # cat_out_cuda's narrow + copy_ loop: one input, more than 4 dims
++    "one_tensor_strided": (lambda a: torch.cat([a[:, ::2]]), lambda m, h, d: (_randn(m, 128, dtype=d),)),
++    "five_dims": (lambda a, b: torch.cat([a, b], -1), lambda m, h, d: (_randn(1, 2, m, 3, 16, dtype=d), _randn(1, 2, m, 3, 8, dtype=d))),
+ }
+ 
+ 
+@@ -1459,6 +1462,19 @@
+             self._assert_replays_bitwise(entry, fn, args)
+         self.assertEqual((entry.traces, entry.eager), (1, 0))
+ 
++    def test_vstack_of_one_tensor_is_a_memcpy(self):
++        # vLLM's PLE prefill: vstack of its one part, cat_out_cuda's narrow + copy_
++        # loop, whose contiguous copy is a cudaMemcpyAsync
++        def fn(x):
++            return torch.vstack([x])
++
++        entry = HostTraceReplay(fn)
++        for n in (64, 7, 512, 7):
++            x = _randn(n, 1024, dtype=torch.bfloat16)
++            self.assertEqual([type(c) for _, c in trace(fn, (x,)).launches], [Memcpy])
++            self._assert_replays_bitwise(entry, fn, (x,))
++        self.assertEqual((entry.traces, entry.eager), (1, 0))
++
+     @parametrize("static", [False, True])
+     @parametrize("custom_op", [False, True])
+     def test_index_select_past_32_bit_indexing(self, custom_op, static):

@@ -1,0 +1,447 @@
+diff -ruN -x __pycache__ -x '*.pyc' -x TREE.txt step_ms32/torch/cuda/_host_trace_lower_tape.py step_ms33/torch/cuda/_host_trace_lower_tape.py
+--- step_ms32/torch/cuda/_host_trace_lower_tape.py	2026-10-18 12:28:28.748203667 -0700
++++ step_ms33/torch/cuda/_host_trace_lower_tape.py	2026-10-19 10:00:30.239335800 -0700
+@@ -377,6 +377,9 @@
+         self.entry_guards: list[tuple[int, tuple[Any, ...]]] = []
+         # selectors (native site indices) whose redispatch refused at some call
+         self.refused: set[int] = set()
++        # per op index (a library body's), why its redo is refused or None: its records' scalar reads, then its
++        # confirmation at the trace call (_host_trace_redispatch._library_redo_refusal)
++        self.library_redo: dict[int, str | None] = {}
+         # the section temporaries' bases the native variant holds past the tape's (_add_entries counts them)
+         self.sections = 0
+         # per section temporary the native places in its run's buffer (_host_trace_memory.section_seqs), (its run's
+diff -ruN -x __pycache__ -x '*.pyc' -x TREE.txt step_ms32/torch/cuda/_host_trace_redispatch.py step_ms33/torch/cuda/_host_trace_redispatch.py
+--- step_ms32/torch/cuda/_host_trace_redispatch.py	2026-10-18 12:28:28.748009234 -0700
++++ step_ms33/torch/cuda/_host_trace_redispatch.py	2026-10-19 11:13:57.007169365 -0700
+@@ -19,6 +19,7 @@
+ 
+ import collections
+ import contextlib
++import dataclasses
+ import threading
+ import time
+ from dataclasses import dataclass, replace
+@@ -33,7 +34,7 @@
+ from torch.cuda._host_trace import _drop_tracebacks, Declined, declined
+ from torch.cuda._host_trace_launch import compiled_cluster, KernelLaunch
+ from torch.cuda._host_trace_lower_tape import FoldRefused, HintsFail, IRRename, lower_entry, LoweredSection, PointerSlot
+-from torch.cuda._host_trace_program import compile_program
++from torch.cuda._host_trace_program import _read_leaf, _step, compile_program, LEAVES, Status
+ from torch.cuda._host_trace_tape import (
+     _active,
+     _ALLOC_ALIGNMENT,
+@@ -41,6 +42,7 @@
+     _CAPTURE_ERRORS,
+     _InputRec,
+     _ir_census,
++    _metadata,
+     _PLACEHOLDER_LOW,
+     _PLACEHOLDER_TAG,
+     _placeholder,
+@@ -108,6 +110,12 @@
+             for i in sorted(unselected, key=lambda i: i not in lo.refused):
+                 selector = lowered.selectors[i - len(lowered.sites)]
+                 op = lowered.tape.ops[selector.op]
++                # before a template too: another op's template is this op's redo
++                if _library_body(op.func) and (why := _library_redo_refusal(lowered, selector, opaque)) is not None:
++                    lo.refused.add(i)
++                    e = FoldRefused(why if isinstance(why, _OwnRefusal) else f"{op.func} dispatches otherwise; {why}")
++                    e.op = selector.op
++                    raise e
+                 declared = _declared(lowered, static_prefix)
+                 if selector.op not in lo.reads:
+                     lo.reads[selector.op] = _reads(lowered, op, selector, declared)
+@@ -151,6 +159,241 @@
+     return compiled, entries
+ 
+ 
++def _library_body(func: Any) -> bool:
++    """A non-ATen operator or a dispatch unit (a Python function run as one op): its Python body runs in a redo. ATen
++    operators, Triton / CuTe DSL launches and jiterator ops redo from their recorded arguments."""
++    if isinstance(func, OpOverload):
++        return func.namespace != "aten"
++    if isinstance(func, str):  # a jiterator op's label
++        return False
++    module = type(func).__module__ or ""
++    if module.startswith(("triton", "cutlass", "torch.cuda._host_trace")):  # a Triton / CuTe DSL launch
++        return False
++    return callable(func)
++
++
++def _symbols(v: Any, out: set) -> set:
++    """The free symbols (IR names) of a record's values: SymInts, IR nodes, roots, and dataclass records' fields."""
++    if isinstance(v, torch.SymInt):
++        k = _sym_key(v)
++        if isinstance(k, _ir.Node):
++            out |= k.free_symbols
++        elif isinstance(k, sympy.Basic):
++            out |= {str(x) for x in k.free_symbols}
++    elif isinstance(v, _ir.Node):
++        out |= v.free_symbols
++    elif isinstance(v, sympy.Basic):
++        out |= {str(x) for x in v.free_symbols}
++    elif isinstance(v, _Root):
++        _symbols(v.sym, out)
++    elif isinstance(v, (tuple, list, frozenset, set)):
++        for x in v:
++            _symbols(x, out)
++    elif dataclasses.is_dataclass(v) and not isinstance(v, type):
++        for f in dataclasses.fields(v):
++            if f.name not in ("owner", "images", "function", "abi", "provider"):
++                _symbols(getattr(v, f.name), out)
++    return out
++
++
++def _scalar_read(tape: Any, k: int) -> str | None:
++    """A free symbol of op k's records (launches, allocations, owned guards) that reached it as a Python scalar: a call
++    int input that is not one of the op's own call values, or a symbol of no input. A redo of a library body reads such
++    a value from wherever its body found it (a holder its traced function filled from an argument), at the call, and
++    bakes it into the entry with no guard. Symbols of the op's call, its allocations, and the layouts of tensors (call
++    inputs, other ops' allocations) are not: a tensor a body reaches is tracked (resolved to its argument, or declined)."""
++    op = tape.ops[k]
++    own: set = set()
++    for leaf in pytree.tree_leaves(op.call):
++        if isinstance(leaf, _TracedTensor):
++            _symbols((tuple(leaf.shape), tuple(leaf.stride()), leaf.storage_offset(), leaf._root), own)
++        elif isinstance(leaf, torch.SymInt):
++            _symbols(leaf, own)
++    tensors: set = set()
++    for a, rec in enumerate(tape.allocs):
++        _symbols((rec.q, rec.sizes, rec.strides), own if a in op.allocs else tensors)
++    for rec in tape.inputs:
++        _symbols((rec.sizes, rec.strides, rec.offset, rec.root.sym), tensors)
++    records: set = set()
++    for j in op.launches:
++        _symbols(tape.launches[j][1], records)
++    env = tape.shape_env
++    for g in op.guards:
++        _symbols(env.records[g][0] if isinstance(env, _ir.Env) else env.guards[g].expr, records)
++    return next((s for s in sorted(records - own) if s not in tensors), None)
++
++
++def _library_redo_refusal(lowered: LoweredTape, selector: LoweredSelector, opaque: Sequence[Any]) -> str | None:
++    """Why a library body's redo is refused, or None (once per traced op, cached): a symbol of its records that came as a
++    Python scalar (_scalar_read); else its confirmation, the op redone once at the trace call itself (the variant's rows
++    evaluated at the trace's own arguments) giving back its recorded launches launch for launch with no section, and no
++    guard beyond its trace's but over its own symbols. A body that read a holder records a constant where its trace has a
++    symbol there, whatever the values."""
++    lo, tape = lowered.lowering, lowered.tape
++    k = selector.op
++    if k in lo.library_redo:
++        return lo.library_redo[k]
++    op = tape.ops[k]
++    why = None
++    if (sym := _scalar_read(tape, k)) is not None:
++        why = f"its records read {sym}, which its call does not carry (a Python value a redo would bake)"
++    else:
++        start = time.perf_counter()
++        why = _confirmation(lowered, selector, opaque)
++        _LIBRARY_COUNTS["confirmation_s"] += time.perf_counter() - start
++        _LIBRARY_COUNTS["confirmations"] += 1
++    lo.library_redo[k] = why
++    _LIBRARY_COUNTS["refused" if why else "confirmed"] += 1
++    return why
++
++
++def _confirmation(lowered: LoweredTape, selector: LoweredSelector, opaque: Sequence[Any]) -> str | None:
++    lo, tape = lowered.lowering, lowered.tape
++    op = tape.ops[selector.op]
++    program = lo.program
++    inputs = _trace_call(tape, program.inputs)
++    values = _values_at(program, inputs)
++    if values is None:
++        return "confirmation: the variant's rows do not evaluate at its trace call"
++    global redo_bodies
++    bodies = redo_bodies  # a confirmation's body is counted as one (_LIBRARY_COUNTS), not as a redispatch's redo body
++    with _rolled_back(lo):
++        program.inputs, program.values = inputs, values
++        try:
++            guards, launches, section = _redo(lowered, selector, hosted=True, dispatches=None, opaque=opaque)
++        except FoldRefused as e:
++            return _OwnRefusal(str(e))  # the op's redo refuses itself, for its own reason
++        except (HintsFail, Declined) as e:
++            return f"confirmation: its redo at its trace call failed ({type(e).__name__}: {str(e)[:160]})"
++        finally:
++            _LIBRARY_COUNTS["confirmation_bodies"] += redo_bodies - bodies
++            redo_bodies = bodies
++    if section is not None:
++        return "confirmation: its redo at its trace call takes another chain"
++    keyed = {id(n) for site in tape.sites for n in site.nodes}
++    chain = [rec for _, rec in tape.launches[op.launches.start : op.launches.stop] if id(rec) not in keyed]
++    if len(launches) != len(chain):
++        return f"confirmation: {len(launches)} launches at its trace call for its {len(chain)}"
++    for j, ((_, x), y) in enumerate(zip(launches, chain)):
++        if (diff := _launch_difference(x, y)) is not None:
++            return f"confirmation: launch {j} differs at its trace call ({diff})"
++    env = tape.shape_env
++    recorded = {node for node, _ in env.records} if isinstance(env, _ir.Env) else {g.expr for g in env.guards}
++    own = _symbols(op.call, set())
++    for a in op.allocs:
++        _symbols((tape.allocs[a].q, tape.allocs[a].sizes, tape.allocs[a].strides), own)
++    # an IR redo's guards are (node, written) pairs, a sympy one's its expressions
++    exprs = [g[0] if isinstance(g, tuple) else g for g in guards]
++    extra = [g for g in exprs if g not in recorded and not ((free := _symbols(g, set())) and free <= own)]
++    if extra:
++        return f"confirmation: {len(extra)} guards its trace did not record ({repr(extra[0])[:80]})"
++    return None
++
++
++@contextlib.contextmanager
++def _rolled_back(lo: Any) -> Any:
++    """The variant's program and lowering caches as they were before the block (a confirmation's redo appends rows and
++    memoizes their expressions; none of it is the variant's): the rows, their values and dedup keys, the domains, the
++    inputs, the expression memos, guard rows, sources and leaves."""
++    program, lowering = lo.program, lo.lowering
++    n = len(program.instructions)
++    domains = None if program.domains is None else len(program.domains)
++    inputs, values = program.inputs, program.values
++    guard_rows, sources, leaves = len(lowering.guard_rows), set(lowering.sources), len(lo._leaves)
++    try:
++        yield
++    finally:
++        for row in program.instructions[n:]:
++            program._rows.pop(row, None)
++        del program.instructions[n:]
++        if domains is not None:
++            del program.domains[domains:]
++        program.inputs, program.values = inputs, values
++        for cache in (lowering._memo, lowering._float_memo):
++            for key in [k for k, row in cache.items() if row >= n]:
++                del cache[key]
++        lowering.guard_rows[:] = [r for r in lowering.guard_rows if r < n]
++        for key in set(lowering.sources) - sources:
++            del lowering.sources[key]
++        del lo._leaves[leaves:]
++        if torch.cuda._host_trace.verify_redo_templates and (
++            len(program.instructions) != n or len(lowering.guard_rows) > guard_rows
++            or any(row >= n for cache in (lowering._memo, lowering._float_memo) for row in cache.values())
++        ):
++            raise AssertionError("host_trace: a confirmation left a row of its own in the variant's lowering")
++
++
++def _values_at(program: Any, inputs: tuple) -> list[int] | None:
++    """Every row's value at `inputs`, as IntegerProgram.emit evaluates a row (None where one fails)."""
++    values: list[int] = []
++    for row in program.instructions:
++        op, *operands = row
++        if op == "constant":
++            value = operands[0]
++        elif op in LEAVES:
++            if not 0 <= operands[0] < len(inputs) or (value := _read_leaf(row, inputs[operands[0]])) is None:
++                return None
++        else:
++            value = _step(op, [values[x] for x in operands])
++            if isinstance(value, Status):
++                return None
++        values.append(value)
++    return values
++
++
++def _trace_call(tape: Any, current: Sequence[Any]) -> tuple:
++    """The trace call's arguments: a released tensor (release_args' sizes, strides, offset, dtype, base) as the call's own
++    tensor where that has exactly this layout at this address (a static argument: a body's read of module state resolves
++    to it by object, as at the call), else as a tensor at that address and layout over a storage it does not own (only its
++    metadata and address are read)."""
++    args = []
++    for i, a in enumerate(tape.args):
++        if isinstance(a, tuple) and len(a) == 5 and isinstance(a[3], torch.dtype):
++            now = current[i] if i < len(current) else None
++            if isinstance(now, torch.Tensor) and now.dtype == a[3] and _metadata(now)[:3] == (tuple(a[0]), tuple(a[1]), a[2]) and _metadata(now)[4] == a[4]:
++                a = now
++            else:
++                shape, stride, offset, dtype, base = a
++                itemsize = torch.empty((), dtype=dtype).element_size()
++                numel = offset + sum((n - 1) * st for n, st in zip(shape, stride)) + 1 if all(shape) else offset
++                storage = torch._C._construct_storage_from_data_pointer(base, tape.device, numel * itemsize)
++                a = torch.empty(0, dtype=dtype, device=tape.device).set_(storage, offset, shape, stride)
++        args.append(a)
++    return tuple(args)
++
++
++def _launch_difference(x: Any, y: Any) -> str | None:
++    """The first field where a redo's record x and the trace's y differ (values by node, roots by identity), or None."""
++    same = lambda u, v: _sym_key(u) == _sym_key(v)  # noqa: E731
++    if type(x) is not type(y):
++        return f"{type(x).__name__} for {type(y).__name__}"
++    if [id(r) for r in getattr(x, "roots", ())] != [id(r) for r in getattr(y, "roots", ())]:
++        return "roots"
++    if isinstance(x, KernelLaunch):
++        if x.function != y.function:
++            return "function"
++        for name, a, b in (("grid", x.grid, y.grid), ("block", x.block, y.block), ("smem", (x.smem,), (y.smem,)), ("slots", x.slots, y.slots)):
++            if len(a) != len(b) or not all(same(u, v) for u, v in zip(a, b)):
++                return name
++        return None
++    for f in dataclasses.fields(x):
++        if f.name in ("roots", "name"):
++            continue
++        u, v = getattr(x, f.name), getattr(y, f.name)
++        us, vs = (u, v) if isinstance(u, tuple) else ((u,), (v,))
++        if len(us) != len(vs) or not all(same(p, q) for p, q in zip(us, vs)):
++            return f.name
++    return None
++
++
++class _OwnRefusal(str):
++    """A confirmation's redo refused itself: its reason, as the op's redo would give it."""
++
++
++# library-body redos decided, by outcome (tests and the startup harness read them)
++_LIBRARY_COUNTS: collections.Counter = collections.Counter()
++
++
+ def _full_redo(lowered: LoweredTape, i: int, selector: LoweredSelector, dispatches: dict | None, opaque: Sequence[Any] = ()) -> tuple[list[Any], list[tuple[int, Any]], Section | None]:
+     try:
+         try:
+diff -ruN -x __pycache__ -x '*.pyc' step_ms32/test/test_cuda_host_trace_replay.py step_ms33/test/test_cuda_host_trace_replay.py
+--- step_ms32/test/test_cuda_host_trace_replay.py	2026-10-19 09:00:21.414853195 -0700
++++ step_ms33/test/test_cuda_host_trace_replay.py	2026-10-19 11:14:24.758765742 -0700
+@@ -37,6 +37,7 @@
+ from torch.cuda._host_trace_lower_tape import FoldRefused, LoweredMemcpy, LoweredMemset
+ from torch.cuda._host_trace_memory import _AFTER, _layout, check_plan, check_section, MemoryPlan, place, StepMemory
+ from torch.cuda._host_trace_program import compile_program, IntegerProgram
++from torch.cuda._host_trace_redispatch import _LIBRARY_COUNTS
+ from torch.cuda._host_trace_replay import _exact_class, Handback
+ from torch.cuda._host_trace_tape import argument_contract, current_trace, EagerCall, trace, TrustedInputs
+ from torch.cuda._utils import _check_cuda_bindings
+@@ -291,6 +292,19 @@
+ _direct_lib._register_fake("calls_reentered", lambda x: torch.empty_like(x))
+ calls_reentered = torch.ops.host_trace_direct.calls_reentered
+ 
++# a library body reading per-step state from a holder its step function fills from an argument (vLLM's forward context)
++HOLDER = {"n": 0}
++
++
++def _holder_scale(x: torch.Tensor) -> torch.Tensor:
++    f = 2 if x.shape[0] > 16 else 3  # an op-owned guard on its input
++    return x * HOLDER["n"] + f  # the per-step value reaches only a kernel scalar
++
++
++_direct_lib.define("holder_scale(Tensor x) -> Tensor")
++_direct_lib.impl("holder_scale", _holder_scale, "CUDA")
++_direct_lib._register_fake("holder_scale", lambda x: torch.empty_like(x))
++
+ 
+ @torch.library.custom_op("host_trace_test::calls_reentered_op", mutates_args=())
+ def calls_reentered_op(x: torch.Tensor) -> torch.Tensor:
+@@ -1402,7 +1416,8 @@
+                 x, y = torch.randn(m, 64, device="cuda"), torch.randn(k, 64, device="cuda")
+                 self.assertEqual(f(x, y), fn(x, y), atol=0, rtol=0)
+         self.assertEqual((f.traces, f.redispatches, sum(f.redispatch_refusals.values())), (3, 1, 2))
+-        self.assertEqual(redone, [0, 1, 1, 1, 0])
++        # each library op's first redo is preceded by its confirmation (a redo at its trace call)
++        self.assertEqual(redone, [0, 0, 1, 1, 1, 1, 0])
+ 
+     def test_a_redispatch_refusal_names_its_op(self):
+         # the redispatch's redos share one capture: the op that enqueues a
+@@ -4599,6 +4614,94 @@
+     rows evaluated, for steady, alternating and variant-switching calls, split or not; and a fixed graph's shape, so
+     an unintended change to what is launched fails here before a model shows it."""
+ 
++
++    def test_a_library_body_reading_lifted_state_is_not_redone(self):
++        # a library body read HOLDER["n"], which the step function set from its int argument (a SymInt under the trace);
++        # a redo would run the body outside the step function and bake the holder's value then into the new entry's
++        # kernel scalar (step_ms32: wrong at (32, 6) and (32, 5)). The redispatch is refused: the new size retraces
++        def step(x, n):
++            saved = HOLDER["n"]
++            HOLDER["n"] = n
++            try:
++                return torch.ops.host_trace_direct.holder_scale(x) + 1
++            finally:
++                HOLDER["n"] = saved
++
++        r = HostTraceReplay(step)
++        for rows, n in ((8, 4), (8, 4), (8, 6), (32, 4), (32, 6), (32, 5)):
++            x = torch.arange(rows * 4, dtype=torch.float32, device="cuda").view(rows, 4)
++            HOLDER["n"] = n  # the caller's per-step state, outside the replayed function
++            self.assertEqual(r(x, n), step(x, n), atol=0, rtol=0)
++        self.assertEqual((r.traces, r.redispatches), (2, 0))
++        (cause,) = r.retrace_causes
++        self.assertIn("which its call does not carry", cause[4])
++
++    def test_a_library_body_reading_a_holder_equal_to_its_argument_is_not_redone(self):
++        # the holder held x.shape[0] at the trace (the op's own argument symbol: its records show nothing else), and the
++        # caller's state otherwise: a redo would bake the holder's value then. The confirmation at the trace call sees
++        # a constant where the trace has the symbol and refuses; the new size retraces
++        def step(x):
++            saved = HOLDER["n"]
++            HOLDER["n"] = x.shape[0]
++            try:
++                return torch.ops.host_trace_direct.holder_scale(x) + 1
++            finally:
++                HOLDER["n"] = saved
++
++        r = HostTraceReplay(step)
++        for rows in (8, 8, 32, 32, 8):
++            x = torch.arange(rows * 4, dtype=torch.float32, device="cuda").view(rows, 4)
++            HOLDER["n"] = 1  # the caller's state between calls
++            self.assertEqual(r(x), step(x), atol=0, rtol=0)
++        self.assertEqual((r.traces, r.redispatches), (2, 0))
++        (cause,) = r.retrace_causes
++        self.assertIn("confirmation: launch 0 differs at its trace call (slots)", cause[4])
++
++    def test_a_library_body_is_checked_before_another_ops_template(self):
++        # two calls of one operator that read the same: the first's holder is the caller's constant (it confirms and
++        # leaves a template), the second's the step's int; the second takes no template of the first (wip42: wrong at
++        # (32, 6) and (32, 5)): its own check refuses, and the new size retraces
++        def step(x, n):
++            saved = HOLDER["n"]
++            try:
++                HOLDER["n"] = 3
++                a = torch.ops.host_trace_direct.holder_scale(x)
++                HOLDER["n"] = n
++                return a * 10 + torch.ops.host_trace_direct.holder_scale(x)
++            finally:
++                HOLDER["n"] = saved
++
++        HOLDER["n"] = 3
++        self.addCleanup(HOLDER.__setitem__, "n", 0)
++        r = HostTraceReplay(step)
++        for rows, n in ((8, 4), (8, 4), (32, 6), (32, 5)):
++            x = torch.arange(rows * 4, dtype=torch.float32, device="cuda").view(rows, 4)
++            self.assertEqual(r(x, n), step(x, n), atol=0, rtol=0)
++        self.assertEqual((r.traces, r.redispatches, r.redo_instances), (2, 0, 0))
++        (cause,) = r.retrace_causes
++        self.assertIn("which its call does not carry", cause[4])
++
++    def test_a_confirmed_library_redo_is_not_rechecked_on_replay(self):
++        # the confirmation (a Python pass over the rows, a redo, a cache rollback) runs once per traced op, at its first
++        # redispatch; a replay hit, of the redone entry or the traced one, runs none of it
++        def step(x):
++            return torch.ops.host_trace_direct.holder_scale(x) + 1
++
++        HOLDER["n"] = 3
++        self.addCleanup(HOLDER.__setitem__, "n", 0)
++        xs = {n: torch.arange(n * 4, dtype=torch.float32, device="cuda").view(n, 4) for n in (8, 32)}
++        r = HostTraceReplay(step)
++        before = dict(_LIBRARY_COUNTS)
++        for n in (8, 8, 32):
++            self.assertEqual(r(xs[n]), step(xs[n]), atol=0, rtol=0)
++        moved = {k: _LIBRARY_COUNTS[k] - before.get(k, 0) for k in ("confirmations", "confirmed", "refused")}
++        self.assertEqual(moved, {"confirmations": 1, "confirmed": 1, "refused": 0})
++        steady = dict(_LIBRARY_COUNTS)
++        for n in (8, 32) * 8:
++            self.assertEqual(r(xs[n]), step(xs[n]), atol=0, rtol=0)
++        self.assertEqual(dict(_LIBRARY_COUNTS), steady)
++        self.assertEqual((r.traces, r.redispatches), (1, 1))
++
+     def setUp(self):
+         old = torch._C._host_trace_split(False)
+         self.addCleanup(torch._C._host_trace_split, old)
+diff -ruN -x __pycache__ -x '*.pyc' step_ms32/test/test_cuda_host_trace_triton.py step_ms33/test/test_cuda_host_trace_triton.py
+--- step_ms32/test/test_cuda_host_trace_triton.py	2026-10-13 15:40:28.126991623 -0700
++++ step_ms33/test/test_cuda_host_trace_triton.py	2026-10-19 10:50:01.879843884 -0700
+@@ -1004,8 +1004,9 @@
+             self.assertEqual(r(x, 1000, s), f(x, 1000, s), atol=0, rtol=0)
+         self.assertEqual(r.redispatches, 0)
+         self.assertTrue(r.redispatch_refusals)
+-        # refused where the redispatch reads the variant's symbol: a guard on it, or a launch argument
+-        self.assertTrue(all("a guard on a symbol of another trace" in k or "a value of another trace" in k for k in r.redispatch_refusals))
++        # refused where the redispatch reads the variant's symbol: a guard on it, or a launch argument; a dispatch
++        # unit's records reading n (no value of its call) refuse before its redo (_host_trace_redispatch._scalar_read)
++        self.assertTrue(all("a guard on a symbol of another trace" in k or "a value of another trace" in k or "which its call does not carry" in k for k in r.redispatch_refusals))
+ 
+     def test_a_custom_ops_kernel_choice_dispatches_again_into_one_variant(self):
+         tape = trace(_add_one, (self.x,))

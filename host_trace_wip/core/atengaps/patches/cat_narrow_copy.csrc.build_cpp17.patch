@@ -1,0 +1,39 @@
+diff -ru /data/eellison/src/pytorch/agent_space/paramgraph/land/int6/build_cpp17/src/aten/src/ATen/native/cuda/Shape.cu /data/eellison/src/pytorch/agent_space/paramgraph/land/int6/build_cpp18/src/aten/src/ATen/native/cuda/Shape.cu
+--- /data/eellison/src/pytorch/agent_space/paramgraph/land/int6/build_cpp17/src/aten/src/ATen/native/cuda/Shape.cu	2026-10-03 12:56:22.877776540 -0700
++++ /data/eellison/src/pytorch/agent_space/paramgraph/land/int6/build_cpp18/src/aten/src/ATen/native/cuda/Shape.cu	2026-10-14 07:40:41.827012832 -0700
+@@ -856,13 +856,11 @@
+ 
+ } // namespace
+ 
+-// cat_out_cuda where it launches CatArrayBatchedCopy*: more than one input,
+-// of one dtype and at most 4 dims, a Contiguous output format, and 32-bit
+-// indexing; no input a legacy skipped [0]
++// cat_out_cuda of inputs of one dtype, a Contiguous output format and no
++// legacy skipped [0]: CatArrayBatchedCopy* for more than one input of at most
++// 4 dims and 32-bit indexing, else its narrow + copy_ loop
+ TensorBase cat(Recorder& rec, c10::ArrayRef<TensorBase> tensors, int64_t dim) {
+-  if (tensors.size() <= 1) {
+-    decline("a cat of one tensor");
+-  }
++  TORCH_CHECK(!tensors.empty(), "torch.cat(): expected a non-empty list of Tensors");
+   const TensorBase& first = tensors[0];
+   for (const TensorBase& t : tensors) {
+     TORCH_CHECK(t.dim() > 0, "zero-dimensional tensor cannot be concatenated");
+@@ -903,9 +901,15 @@
+   if (out.sym_numel() == 0) {
+     return out;
+   }
+-  if (out.dim() > an::CAT_ARRAY_MAX_INPUT_DIMS || !at::cuda::detail::canUse32BitIndexMath(out) ||
++  if (tensors.size() == 1 || out.dim() > an::CAT_ARRAY_MAX_INPUT_DIMS || !at::cuda::detail::canUse32BitIndexMath(out) ||
+       !std::all_of(tensors.begin(), tensors.end(), [](const TensorBase& t) { return at::cuda::detail::canUse32BitIndexMath(t); })) {
+-    decline("a cat by narrow and copy_");
++    c10::SymInt offset = 0;
++    for (const TensorBase& t : tensors) {
++      const c10::SymInt size = t.sym_size(dim);
++      copy_(rec, at::Tensor(out).narrow_symint(dim, offset, size), t);
++      offset += size;
++    }
++    return out;
+   }
+   if (!all_contiguous && out.scalar_type() == kFloat8_e8m0fnu) {
+     decline("a strided cat of float8_e8m0fnu");

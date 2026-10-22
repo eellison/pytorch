@@ -1,0 +1,48 @@
+diff -ru -x __pycache__ step_ms4/test/test_cuda_host_trace_replay.py step_ms5/test/test_cuda_host_trace_replay.py
+--- step_ms4/test/test_cuda_host_trace_replay.py	2026-10-14 10:47:40.847703196 -0700
++++ step_ms5/test/test_cuda_host_trace_replay.py	2026-10-15 07:13:46.666231534 -0700
+@@ -143,6 +143,10 @@
+     return add(add(add(add(x))), 1)
+ 
+ 
++def branch_on_size(x):
++    return add(x, 1) if x.shape[0] > 4096 else add(add(x), 2)
++
++
+ def matmul_chain(x, w):
+     # triton -> mm (eager; matmul folds the batch with _unsafe_view) -> triton
+     return add(torch.matmul(add(x).view(4, -1, w.shape[0]), w), 1)
+@@ -4017,6 +4021,23 @@
+ @unittest.skipIf(not has_triton(), "requires triton")
+ @unittest.skipIf(not hasattr(torch._C, "_HostTraceVariant"), "requires the native path")
+ class TestDirtyRecords(TestCase):
++    def test_a_variant_that_misses_stops_at_its_valid_row(self):
++        # sizes on either side of the branch, each new: the variant tried first is
++        # the other one, which evaluates its guards' rows only and misses; the
++        # other then serves the call, outputs as eager's
++        f = HostTraceReplay(branch_on_size)
++        for n in (1024, 8192):
++            x = torch.randn(n, device="cuda")
++            self.assertEqual(f(x), branch_on_size(x), atol=0, rtol=0)
++        self.assertEqual(len(f.variants), 2)
++        misses = torch._C._host_trace_valid_first_misses()
++        for i in range(8):
++            n = (1024 if i % 2 else 8192) + 256 * (i + 1)
++            x = torch.randn(n, device="cuda")
++            self.assertEqual(f(x), branch_on_size(x), atol=0, rtol=0)
++        self.assertEqual(len(f.variants), 2)
++        self.assertGreaterEqual(torch._C._host_trace_valid_first_misses() - misses, 8)
++
+     def test_unchanged_records_are_not_packed(self):
+         f = HostTraceReplay(five_step)
+         xs = [torch.randn(n, device="cuda") for n in (4096, 8192)]
+--- step_ms4/torch/_C/__init__.pyi.in	2026-10-15 05:50:01.405615632 -0700
++++ step_ms5/torch/_C/__init__.pyi.in	2026-10-15 07:13:38.454624969 -0700
+@@ -2710,6 +2710,7 @@
+ def _host_trace_kernel_node_sets() -> _int: ...
+ def _host_trace_kernel_row_switches() -> _int: ...
+ def _host_trace_tma_cache_hits() -> _int: ...
++def _host_trace_valid_first_misses() -> _int: ...
+ def _host_trace_piece_skips() -> _int: ...
+ def _host_trace_phase_times(enable: _bool) -> list[_int]: ...
+ def _host_trace_static_split(variant: _HostTraceVariant) -> tuple[_int, _int]: ...

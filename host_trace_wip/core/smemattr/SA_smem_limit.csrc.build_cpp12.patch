@@ -1,0 +1,93 @@
+--- a/c10/cuda/driver_api.h
++++ b/c10/cuda/driver_api.h
+@@ -170,9 +170,11 @@
+   _(cuTensorMapEncodeTiled, 12000)    \
+   _(cuTensorMapReplaceAddress, 12000)
+ 
+-// Host tracing's native replay declines without it
+-#define C10_LIBCUDA_DRIVER_API_REPLAY(_) \
+-  _(cuGraphExecKernelNodeSetParams, 12000)
++// Host tracing's native replay declines without them
++#define C10_LIBCUDA_DRIVER_API_REPLAY(_)     \
++  _(cuGraphExecKernelNodeSetParams, 12000) \
++  _(cuFuncGetAttribute, 12000)             \
++  _(cuFuncSetAttribute, 12000)
+ 
+ // Host tracing's harvest reads its captures' nodes and launches them
+ #if defined(CUDA_VERSION) && (CUDA_VERSION >= 12040)
+--- a/torch/csrc/cuda/host_trace/Variant.h
++++ b/torch/csrc/cuda/host_trace/Variant.h
+@@ -73,6 +73,12 @@
+ // a family tries first the variant that last served the dynamic sizes (else
+ // registration order)
+ extern bool variant_order_enabled;
++
++// A library sets a function's dynamic shared memory limit to its launch's
++// bytes before the launch (cuDNN and cuBLASLt leave it at the last launch's),
++// and the driver refuses a node set or launch above it. A replay's node set
++// or launch at another key's bytes raises it the same way first.
++void raise_dynamic_smem_limit(CUfunction f, unsigned int bytes);
+ // run_buffer keeps a run's placement while its temporaries' sizes repeat
+ extern bool placement_reuse_enabled;
+ // a form switch restores what the form's exec last held (else forgets it)
+--- a/torch/csrc/cuda/host_trace/Patch.cpp
++++ b/torch/csrc/cuda/host_trace/Patch.cpp
+@@ -25,6 +25,22 @@
+ int64_t tma_encodes = 0;
+ int64_t tma_replaces = 0;
+ 
++void raise_dynamic_smem_limit(CUfunction f, unsigned int bytes) {
++  if (bytes == 0) {
++    return;
++  }
++  auto* driver = c10::cuda::DriverAPI::get();
++  int limit = 0;
++  C10_CUDA_DRIVER_CHECK(driver->cuFuncGetAttribute_(
++      &limit, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, f));
++  if (static_cast<int64_t>(bytes) > limit) {
++    C10_CUDA_DRIVER_CHECK(driver->cuFuncSetAttribute_(
++        f,
++        CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
++        static_cast<int>(bytes)));
++  }
++}
++
+ static int driver_version() {
+   static const int version = [] {
+     int v = 0;
+@@ -628,6 +644,7 @@
+     k.params.blockDimY = static_cast<unsigned int>(dims[4]);
+     k.params.blockDimZ = static_cast<unsigned int>(dims[5]);
+     k.params.sharedMemBytes = static_cast<unsigned int>(dims[6]);
++    raise_dynamic_smem_limit(k.params.func, k.params.sharedMemBytes);
+     C10_CUDA_DRIVER_CHECK(
+         driver->cuGraphExecKernelNodeSetParams_(exec, node, &k.params));
+     ++kernel_node_sets;
+--- a/torch/csrc/cuda/host_trace/Harvest.cpp
++++ b/torch/csrc/cuda/host_trace/Harvest.cpp
+@@ -133,7 +133,8 @@
+       d->cuGraphMemsetNodeGetParams_ && d->cuFuncGetName_ &&
+       d->cuFuncGetParamInfo_ && d->cuLaunchKernelEx_ && d->cuMemsetD2D8Async_ &&
+       d->cuMemsetD2D16Async_ && d->cuMemsetD2D32Async_ &&
+-      d->cuPointerGetAttribute_;
++      d->cuPointerGetAttribute_ && d->cuFuncGetAttribute_ &&
++      d->cuFuncSetAttribute_;
+ }
+ 
+ using Layout = std::vector<std::pair<size_t, size_t>>;
+@@ -491,11 +492,10 @@
+     cfg.hStream = s;
+     cfg.attrs = attrs.data();
+     cfg.numAttrs = static_cast<unsigned>(attrs.size());
+-    C10_CUDA_DRIVER_CHECK(driver->cuLaunchKernelEx_(
+-        &cfg,
+-        reinterpret_cast<CUfunction>(node[0].cast<int64_t>()),
+-        params.data(),
+-        nullptr));
++    const auto func = reinterpret_cast<CUfunction>(node[0].cast<int64_t>());
++    raise_dynamic_smem_limit(func, cfg.sharedMemBytes);
++    C10_CUDA_DRIVER_CHECK(
++        driver->cuLaunchKernelEx_(&cfg, func, params.data(), nullptr));
+   }
+ }
+ 

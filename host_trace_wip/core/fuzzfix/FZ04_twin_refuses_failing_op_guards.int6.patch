@@ -1,0 +1,40 @@
+--- a/torch/cuda/_host_trace_replay.py
++++ b/torch/cuda/_host_trace_replay.py
+@@ -1249,6 +1249,9 @@
+         try:
+             if variant.unbound is None or any(id(sites[i].site) not in variant.unbound[1] for i, _ in refused):
+                 raise FoldRefused("a keyed site the trace recorded bound")
++            # the twin's tape is the trace's, whose own op guards fail at a call an entry (a fold's or a redispatch's) selects
++            if variant.captured.lowered.evaluate(args) is None:
++                raise FoldRefused("an op's own guards fail at the call: an entry selects it")
+             tape, calls = variant.unbound
+             at = {id(r): j for j, (_, r) in enumerate(tape.launches)}
+             eager = copy.copy(tape)
+--- a/test/test_cuda_host_trace_harvest.py
++++ b/test/test_cuda_host_trace_harvest.py
+@@ -1261,6 +1261,25 @@
+                 self.assertEqual(got, want, atol=0, rtol=0)
+         self.assertEqual(list(p.refused.values()), ["refused by the test"])
+ 
++    def test_a_refused_key_at_a_redispatched_call_retraces(self):
++        # the extern key refused (past extern_cap) at a call the variant holds through the bmm's
++        # redispatch entry (its trace's m == 1 fails): the twin from the trace's tape would fail
++        # that guard, so it refuses and the call traces again, eagerly exact
++        def fn(x, w, qkv, pos, table):
++            torch.ops.ht_extern.rope_qk(qkv[:, :64], qkv[:, 64:128], pos, table)
++            return torch.bmm(x, w).sum(-1), qkv + 1
++
++        p = HarvestProvider(("blas", "extern"), extern_ops=(torch.ops.ht_extern.rope_qk.default,), extern_cap=64 << 10)
++        r = HostTraceReplay(fn, opaque=(p,))
++        w, table = torch.randn(8, 96, 192, device="cuda", dtype=bf16), torch.randn(4096, 64, device="cuda", dtype=bf16)
++        for m, n in ((32, 40), (1, 40), (32, 40), (65, 300), (65, 300)):
++            x, qkv = torch.randn(8, m, 96, device="cuda", dtype=bf16), torch.randn(n, 192, device="cuda", dtype=bf16)
++            pos, want = torch.randint(0, 4096, (n,), device="cuda"), qkv.clone()
++            self.assertEqual(r(x, w, qkv, pos, table), fn(x, w, want, pos, table), atol=0, rtol=0)
++            self.assertEqual(qkv, want, atol=0, rtol=0)
++        self.assertEqual(len(p.refused), 1)
++        self.assertEqual(r.eager_sites_refusals, {"an op's own guards fail at the call: an entry selects it": 1})
++
+     @mock.patch("torch.cuda._host_trace_replay.oob_learn", False)
+     def test_a_written_input_is_refused(self):
+         # a binding that also writes a live read-only input (a table row no

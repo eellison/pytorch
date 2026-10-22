@@ -1,0 +1,39 @@
+--- a/torch/cuda/_host_trace_hint_audit.py
++++ b/torch/cuda/_host_trace_hint_audit.py
+@@ -81,7 +81,6 @@
+ _TAPE = "torch/cuda/_host_trace_tape.py"
+ _TRITON = "torch/cuda/_host_trace_triton_launch.py"
+ _CUTE = "torch/cuda/_host_trace_cute.py"
+-_MEMORY = "torch/cuda/_host_trace_memory.py"
+ _AT_CALL = "evaluate it at the traced call's inputs (the input record's values through the program's rows), not the node's hint"
+ _WITNESS = f"the witness's stand-ins and comparisons: {_AT_CALL}"
+ 
+@@ -114,8 +113,6 @@
+     (_CUTE, "_intercept"): _WITNESS,
+     (_CUTE, "_intercept_foreign"): _WITNESS,
+     (_CUTE, "_pin"): "int(v) (a guard that returns the value) in place of v == _hint(v)",
+-    (_MEMORY, "_canonical"): f"the equal-at-the-call symbols: {_AT_CALL} (lowered.program.values of their rows); the renames stay valid conditions",
+-    (_MEMORY, "_forms"): f"bounds and bytes at the call: {_AT_CALL} (lowered.program.values); F11: a plan whose valid fails at its own trace declines instead of asserting",
+ }
+ 
+ 
+--- a/torch/cuda/_host_trace_memory.py
++++ b/torch/cuda/_host_trace_memory.py
+@@ -71,6 +71,7 @@
+ import sympy
+ 
+ import torch
++from torch.cuda._host_trace import declined
+ from torch.cuda._host_trace_lower_tape import (
+     LoweredEagerCall,
+     LoweredView,
+@@ -1145,7 +1146,8 @@
+         for site in lowered.sites
+     )
+     if program.values[valid] != 1:
+-        raise AssertionError("host_trace: an arena's conditions fail at the trace")
++        # F11: the arenas' conditions are the trace's call's (its rows' values); one failing there plans nothing
++        raise declined("an arena's conditions fail at the traced call")
+     program.inputs = tuple(lowered.tape.args)
+     try:
+         compiled = compile_program(program)

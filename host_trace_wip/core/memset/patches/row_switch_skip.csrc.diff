@@ -1,0 +1,67 @@
+diff -ru build_cpp19/src/torch/csrc/cuda/host_trace/Entry.cpp build_cpp_ms3/src/torch/csrc/cuda/host_trace/Entry.cpp
+--- build_cpp19/src/torch/csrc/cuda/host_trace/Entry.cpp	2026-10-13 19:08:53.618132437 -0700
++++ build_cpp_ms3/src/torch/csrc/cuda/host_trace/Entry.cpp	2026-10-14 11:28:13.672040815 -0700
+@@ -1785,6 +1785,7 @@
+   m.def("_host_trace_memory_node_sets", [] { return memory_node_sets; });
+   m.def("_host_trace_kernel_packs", [] { return kernel_packs; });
+   m.def("_host_trace_kernel_node_sets", [] { return kernel_node_sets; });
++  m.def("_host_trace_kernel_row_switches", [] { return kernel_row_switches; });
+   m.def("_host_trace_phase_times", [](bool enable) {
+     const auto times = phase_ns;
+     phase_ns.fill(0);
+diff -ru build_cpp19/src/torch/csrc/cuda/host_trace/Patch.cpp build_cpp_ms3/src/torch/csrc/cuda/host_trace/Patch.cpp
+--- build_cpp19/src/torch/csrc/cuda/host_trace/Patch.cpp	2026-10-13 15:39:12.842902841 -0700
++++ build_cpp_ms3/src/torch/csrc/cuda/host_trace/Patch.cpp	2026-10-14 11:28:13.671126249 -0700
+@@ -20,6 +20,7 @@
+ int64_t memory_node_sets = 0;
+ int64_t kernel_packs = 0;
+ int64_t kernel_node_sets = 0;
++int64_t kernel_row_switches = 0;
+ bool phase_timing = false;
+ std::array<int64_t, 16> phase_ns{};
+ int64_t tma_encodes = 0;
+@@ -543,6 +544,13 @@
+       if (r.held && r.held_row == row && held == r.held_memset) {
+         return;
+       }
++      if (r.held && r.held_row != row && held == r.held_memset) {
++        const MemsetRow& h = memset_row(r, r.held_row);
++        if (h.value == m.value && h.element_size == m.element_size) {
++          r.held_row = row;
++          return;
++        }
++      }
+       r.held = false;
+       for (size_t k = 1; k < 4; ++k) {
+         TORCH_CHECK_VALUE(held[k] >= 0, "host_trace: a memset of ", held[k]);
+@@ -630,6 +638,18 @@
+         std::memcmp(k.image, k.held, k.nbytes) == 0) {
+       return;
+     }
++    if (r.held && r.held_row != row && dims == r.held_dims) {
++      // another key's row whose launch is the node's as it is (a cuBLAS key
++      // of another M running the same kernel at the same grid and arguments)
++      const KernelRow& h = kernel_row(r, r.held_row);
++      if (h.params.func == k.params.func && h.param_sizes == k.param_sizes &&
++          std::memcmp(k.image, h.held, k.nbytes) == 0) {
++        std::memcpy(k.held, k.image, k.nbytes);
++        r.held_row = row;
++        ++kernel_row_switches;
++        return;
++      }
++    }
+     // a patch cut short leaves the node unknown, never stale
+     r.held = false;
+     for (int64_t d : dims) {
+diff -ru build_cpp19/src/torch/csrc/cuda/host_trace/Variant.h build_cpp_ms3/src/torch/csrc/cuda/host_trace/Variant.h
+--- build_cpp19/src/torch/csrc/cuda/host_trace/Variant.h	2026-10-13 19:08:01.338098692 -0700
++++ build_cpp_ms3/src/torch/csrc/cuda/host_trace/Variant.h	2026-10-14 11:28:13.671597804 -0700
+@@ -40,6 +40,8 @@
+ // whose node was set (the changed ones)
+ extern int64_t kernel_packs;
+ extern int64_t kernel_node_sets;
++// test-only: kernel records whose selected row changed with nothing to set
++extern int64_t kernel_row_switches;
+ // test-only: with phase_timing, each phase of the replays' host time in ns
+ extern bool phase_timing;
+ extern std::array<int64_t, 16> phase_ns;

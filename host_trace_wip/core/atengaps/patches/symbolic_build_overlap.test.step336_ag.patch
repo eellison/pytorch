@@ -1,0 +1,46 @@
+--- ../../step336_ag/test/test_cuda_host_trace_aten.py	2026-10-14 07:52:17.073259887 -0700
++++ test_cuda_host_trace_aten.py	2026-10-14 09:28:11.639683530 -0700
+@@ -1462,6 +1462,43 @@
+             self._assert_replays_bitwise(entry, fn, args)
+         self.assertEqual((entry.traces, entry.eager), (1, 0))
+ 
++    @parametrize("static", [False, True])
++    def test_a_copy_of_no_symbolic_size_runs_its_cuda_host(self, static):
++        # vLLM's PLE mask at batch size 1 (and every size static): no size of the
++        # copy's symbolic iterator is symbolic, its overlap test the trace's
++        def fn(out, idx):
++            return out * (idx != 0).view(-1, 1).to(out.dtype)
++
++        n = 8 if static else 1
++        entry = HostTraceReplay(fn, static_prefix=2 if static else 0)
++        args = (_randn(n, 1024, dtype=torch.bfloat16), torch.randint(0, 4, (n,), device="cuda", dtype=torch.int32))
++        tape = trace(fn, args)
++        self.assertFalse([c.reason for _, c in tape.launches if isinstance(c, EagerCall)])
++        self.assertFalse([(u.op, u.message) for u in tape.unconverted])
++        for _ in range(3):
++            self._assert_replays_bitwise(entry, fn, args)
++        self.assertEqual((entry.traces, entry.eager), (1, 0))
++
++    @parametrize("static", [False, True])
++    @parametrize("case", ["add_out_partial", "copy_partial", "add_out_internal"])
++    def test_an_overlap_eager_rejects_never_runs(self, case, static):
++        # the symbolic iterator tests only its outputs' internal overlap; operand
++        # overlap is the trace's: with every size static too, each call raises
++        # eager's error and writes nothing
++        fns = {
++            "add_out_partial": lambda x: torch.add(x[:-1], 1, out=x[1:]),
++            "copy_partial": lambda x: x[1:].copy_(x[:-1]),
++            "add_out_internal": lambda x: torch.add(x[1:2], 1, out=x[:1].expand(4, 8)),
++        }
++        fn = fns[case]
++        x = _randn(5, 8, dtype=torch.float32)
++        before = x.clone()
++        entry = HostTraceReplay(fn, static_prefix=int(static))
++        for _ in range(3):
++            with self.assertRaisesRegex(RuntimeError, "refers? to a single memory location"):
++                entry(x)
++        self.assertEqual(x, before, atol=0, rtol=0)
++
+     def test_vstack_of_one_tensor_is_a_memcpy(self):
+         # vLLM's PLE prefill: vstack of its one part, cat_out_cuda's narrow + copy_
+         # loop, whose contiguous copy is a cudaMemcpyAsync

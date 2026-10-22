@@ -1,0 +1,98 @@
+diff -ru '--exclude=__pycache__' '--exclude=TREE.txt' step332_me8/test/test_cuda_host_trace_harvest.py step332_me9/test/test_cuda_host_trace_harvest.py
+--- step332_me8/test/test_cuda_host_trace_harvest.py	2026-10-15 03:12:24.737810264 -0700
++++ step332_me9/test/test_cuda_host_trace_harvest.py	2026-10-15 04:43:47.100513437 -0700
+@@ -764,6 +764,32 @@
+         self.assertBitwise(operands[-1], want)
+         self.assertBitwise(_replay(binding, [a, b, want]), want)
+ 
++    def test_verify_reuses_the_caching_allocators_blocks(self):
++        # verify allocates from the caching allocator (the captures touch no
++        # memory, so no pool of its own): with a free cached block that fits
++        # its buffers, a learn maps no memory-backed segment
++        x = torch.randn(64, 64, 128, 128, device="cuda", dtype=bf16)
++        w = torch.randn(64, 64, 3, 3, device="cuda", dtype=bf16)
++        g = torch.randn(64, 64, 128, 128, device="cuda", dtype=bf16)
++        args = (g, x, w, None, [1, 1], [1, 1], [1, 1], False, [0, 0], 1, [True, True, False])
++        key, operands = _key(aten.convolution_backward.default, args, {})
++        torch.empty(1 << 30, dtype=torch.uint8, device="cuda")  # freed: a cached block
++        p = HarvestProvider(("conv",))
++        with torch.backends.cudnn.flags(enabled=True, benchmark=False, deterministic=True):
++            torch.cuda.synchronize()
++            torch.cuda.memory._record_memory_history(enabled="all", context=None, stacks="python", max_entries=1_000_000)
++            try:
++                binding = p.learn(key, args, {}, operands)
++                torch.cuda.synchronize()
++                trace = torch.cuda.memory._snapshot()["device_traces"][torch.cuda.current_device()]
++            finally:
++                torch.cuda.memory._record_memory_history(enabled=None)
++        self.assertIsNotNone(binding, p.refused)
++        a = harvest._address_only()
++        unmapped = [(r[0], r[0] + a._SPAN) for r in a.ranges.values()]
++        mapped = [e for e in trace if e["action"] in ("segment_alloc", "segment_map") and not any(lo <= e["addr"] < hi for lo, hi in unmapped)]
++        self.assertEqual(mapped, [])
++
+     def test_a_retired_qword_into_a_released_pool_is_poisoned(self):
+         # the earlier workspace address cuBLASLt's CUTLASS 3 struct keeps may
+         # point into memory no allocation maps (a released pool). The address
+diff -ru '--exclude=__pycache__' '--exclude=TREE.txt' step332_me8/torch/cuda/_host_trace_harvest.py step332_me9/torch/cuda/_host_trace_harvest.py
+--- step332_me8/torch/cuda/_host_trace_harvest.py	2026-10-15 03:12:24.739945860 -0700
++++ step332_me9/torch/cuda/_host_trace_harvest.py	2026-10-15 04:43:47.098415727 -0700
+@@ -369,22 +369,21 @@
+ 
+ @contextlib.contextmanager
+ def _released(device: int) -> Iterator[None]:
+-    """Nothing of verify's outlives its harvest: its pool goes back to the
+-    device. A pool
+-    keeps the segments of blocks live when it is dropped, so an exception's
+-    finished frames drop their locals first (the exiting with statement holds
+-    its traceback; its lines stay)."""
++    """Nothing of verify's outlives its harvest but blocks the caching
++    allocator keeps for reuse: an exception's finished frames drop their
++    locals (verify's tensors; the exiting with statement holds its
++    traceback, its lines stay), and the cuBLASLt workspaces verify's GEMMs
++    cached go."""
+     try:
+         yield
+     except BaseException as e:
+         traceback.clear_frames(e.__traceback__)
+         raise
+     finally:
+-        if (dev := _DEVICES.get(device)) is not None:
++        if device in _DEVICES:
+             # verify's eager GEMMs on a stream with no cuBLASLt workspace yet
+-            # cached one in its pool (ATen keeps one per handle and stream)
++            # cached one (ATen keeps one per handle and stream)
+             torch._C._cuda_clearCublasWorkspaces()
+-            dev.checks = None
+ 
+ 
+ # _digest's words per chunk: its temporaries are a few int64 buffers this long
+@@ -648,9 +647,6 @@
+         self.streams = (new_private_stream(dev), new_private_stream(dev))
+         self.anchor = torch.empty(1, device=dev)
+         self.pool: Any = None
+-        # the current learn's verify buffers: a pool of their own, as the
+-        # captures plug every free block of theirs
+-        self.checks: Any = None
+         # a hung verify's scratch zeroed from the host, on the other stream
+         self.zeros = torch.zeros(_WINDOW, dtype=torch.uint8, pin_memory=True)
+         self.keeper: Any = None
+@@ -1560,14 +1556,11 @@
+                 mirrors = _Mirrors(device, addresses) if addresses else None
+             except RuntimeError as e:
+                 raise _Transient(f"no mirror of the constant addresses {sorted(map(hex, addresses))}: {e}") from None
+-            if dev.checks is None:
+-                dev.checks = torch.cuda.MemPool()
+             try:
+-                with torch.cuda.use_mem_pool(dev.checks, device):
+-                    try:
+-                        return checked(binding, variants, hits, misaligned, mirrors, names)
+-                    except _NotBitwise:
+-                        return checked(binding, variants, hits, misaligned, mirrors, names, live=False)
++                try:
++                    return checked(binding, variants, hits, misaligned, mirrors, names)
++                except _NotBitwise:
++                    return checked(binding, variants, hits, misaligned, mirrors, names, live=False)
+             finally:
+                 if mirrors is not None:
+                     mirrors.close()

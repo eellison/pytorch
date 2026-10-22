@@ -1,0 +1,22 @@
+--- a/torch/csrc/cuda/host_trace/Aten.cpp	2026-10-13 04:34:42.751401830 -0700
++++ b/torch/csrc/cuda/host_trace/Aten.cpp	2026-10-13 04:34:42.795219541 -0700
+@@ -112,7 +112,9 @@
+ // re-allocates a fresh empty output of the running op (_symbolic_resize)
+ bool python_symbolic_resize(const at::TensorBase& out, c10::SymIntArrayRef sizes, c10::SymIntArrayRef strides) {
+   py::gil_scoped_acquire gil;
+-  static const auto tape = py::module::import("torch.cuda._host_trace_tape");
++  // leaked on purpose: a static py::object would be decref'd by an exit handler after
++  // Py_Finalize, without the GIL (fatal in module_dealloc when it is the last reference)
++  static const py::handle tape = py::module::import("torch.cuda._host_trace_tape").release();
+   const std::vector<c10::SymInt> s(sizes.begin(), sizes.end());
+   const std::vector<c10::SymInt> t(strides.begin(), strides.end());
+   return tape.attr("_symbolic_resize")(at::Tensor(out), s, t).cast<bool>();
+@@ -120,7 +122,7 @@
+ 
+ bool python_same_start(const at::TensorBase& a, const at::TensorBase& b) {
+   py::gil_scoped_acquire gil;
+-  static const auto tape = py::module::import("torch.cuda._host_trace_tape");
++  static const py::handle tape = py::module::import("torch.cuda._host_trace_tape").release();
+   return tape.attr("_same_start")(at::Tensor(a), at::Tensor(b)).cast<bool>();
+ }
+ 

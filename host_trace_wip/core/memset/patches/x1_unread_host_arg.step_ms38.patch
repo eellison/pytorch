@@ -1,0 +1,128 @@
+diff -ruN -x __pycache__ -x '*.pyc' -x TREE.txt step_ms38/test/test_cuda_host_trace_pinned.py wip50/test/test_cuda_host_trace_pinned.py
+--- step_ms38/test/test_cuda_host_trace_pinned.py	2026-10-09 13:43:13.688749338 -0700
++++ wip50/test/test_cuda_host_trace_pinned.py	2026-10-22 12:31:22.211667119 -0700
+@@ -7,6 +7,7 @@
+ import torch.cuda._host_trace_replay as _host_trace_replay
+ from torch.cuda._host_trace_capture import graph_nodes, MemcpyNode
+ from torch.cuda._host_trace_lower_tape import LoweredMemcpy
++from torch.cuda._host_trace_tape import EagerCall, Memcpy
+ from torch.testing._internal.common_utils import (
+     instantiate_parametrized_tests,
+     parametrize,
+@@ -410,8 +411,9 @@
+                 self.assertEqual(out, _values(n, k).cuda() * 2)
+             else:
+                 self.assertEqual(host, dev.cpu() + 1)
++        # an unpinned CPU argument is traced unread; its copy_ reads it: the unread kind is declined, the call eager as today
+         self.assertEqual(f.variants, [])
+-        self.assertTrue(f.declines and all("only CUDA tensors on one device and pinned CPU tensors" in d for d in f.declines), f.declines)
++        self.assertTrue(f.declines and all("unread kind declined" in d for d in f.declines), f.declines)
+ 
+     def test_a_pageable_call_misses_a_pinned_variant(self):
+         n = 64
+@@ -466,6 +468,48 @@
+         self.assertIn("not both contiguous", f.declines[0])
+ 
+ 
++@unittest.skipIf(not TEST_CUDA, "requires CUDA")
++class TestUnreadHostArgument(TestCase):
++    """An unpinned CPU argument (vLLM's per-request metadata on the host): its
++    sizes are the call's, no copy of it is made and nothing the trace reads its
++    bytes; an op that reads them declines the kind (the user's X1, 10-22)."""
++
++    def test_its_sizes_alone_take_one_entry_at_five_shapes(self):
++        def fn(x, nums):
++            return x[: nums.shape[0]] * 2
++
++        f = HostTraceReplay(fn)
++        x = torch.randn(64, device="cuda")
++        for n in (3, 7, 1, 12, 5, 7, 12):
++            nums = torch.arange(n, dtype=torch.int32)
++            self.assertEqual(f(x, nums), fn(x, nums), atol=0, rtol=0)
++        # one trace, no retrace at a new shape, no eager call, no copy of the tensor
++        self.assertEqual((f.traces, f.eager, f.replays, len(f.variants)), (1, 0, 6, 1))
++        (v,) = f.variants
++        self.assertEqual([r for _, r in v.tape.launches if isinstance(r, (EagerCall, Memcpy))], [])
++        self.assertEqual(f.declines, [])
++
++    def test_an_op_reading_it_declines_the_unread_kind(self):
++        # nums.to(device) reads the bytes: the trace declines, naming the argument and the op, and the call runs
++        # eagerly as an unpinned CPU argument's did before the kind; bitwise either way
++        def fn(x, nums):
++            return x[: nums.shape[0]] * nums.to(x.device)
++
++        f = HostTraceReplay(fn)
++        x = torch.randn(64, device="cuda")
++        for n in (3, 7, 1):
++            nums = torch.arange(n, dtype=torch.int32)
++            for _ in range(2):
++                self.assertEqual(f(x, nums), fn(x, nums), atol=0, rtol=0)
++                nums.mul_(3).add_(1)
++        # one declined trace per new shape, no variant; the decline (recorded once per reason) names the argument, the op, the kind
++        self.assertEqual((f.traces, f.variants), (3, []))
++        self.assertTrue(f.declines, f.declines)
++        for d in f.declines:
++            self.assertIn("p1 read at op ", d)
++            self.assertIn(": unread kind declined (", d)
++
++
+ instantiate_parametrized_tests(TestPinnedMemcpy)
+ 
+ 
+diff -ruN -x __pycache__ -x '*.pyc' -x TREE.txt step_ms38/torch/cuda/_host_trace_tape.py wip50/torch/cuda/_host_trace_tape.py
+--- step_ms38/torch/cuda/_host_trace_tape.py	2026-10-20 08:06:05.875400537 -0700
++++ wip50/torch/cuda/_host_trace_tape.py	2026-10-22 10:37:47.886754823 -0700
+@@ -140,6 +140,10 @@
+     index: int = -1  # k of allocation k or eager output k: its placeholder (_placeholder)
+     # a pinned CPU argument's storage, which only a memcpy node reads or writes
+     host: bool = False
++    # an unpinned CPU argument's storage, which nothing the trace reads (the unread kind, 10-22): its sizes are the call's
++    # and nothing of it is copied; an op that reads its bytes declines the trace (Tape._eager_call), which then keys or
++    # pins the tensor as today
++    unread: bool = False
+ 
+ 
+ def _placeholder(root: _Root) -> int:
+@@ -593,7 +597,7 @@
+         # const_data_ptr leaves a copy-on-write input lazy
+         base = t.const_data_ptr() - t.storage_offset() * t.element_size()  # type: ignore[attr-defined]
+         sym = env.symbol(_PLACEHOLDER_TAG | (base & _PLACEHOLDER_LOW), f"{name}.base")
+-        root = _Root(f"p{position}", sym, host=t.device != self.device)
++        root = _Root(f"p{position}", sym, host=t.device != self.device, unread=t.device.type == "cpu" and not t.is_pinned())
+         first = t.const_data_ptr()  # type: ignore[attr-defined]
+         last = first + (sum((n - 1) * s for n, s in zip(t.shape, t.stride())) + 1) * t.element_size() - 1 if t.numel() else first - 1
+         rec = _InputRec(position, name, t.dtype, *layout, root, (first, last), torch._C._is_cow_tensor(t))
+@@ -996,11 +1000,16 @@
+     def _eager_call(self, func: Any, args: tuple, kwargs: dict) -> Any:
+         if not isinstance(func, OpOverload):
+             raise self.decline(f"{func} is not an operator")
++        hosted = [a._root for a in pytree.tree_leaves((args, kwargs)) if isinstance(a, _TracedTensor) and a._root.host]
++        if (unread := next((r for r in hosted if r.unread), None)) is not None:
++            # the unread kind holds only while nothing of the trace reads the tensor's bytes (its sizes are read freely):
++            # declined here, the call keys, pins or guards the tensor as a read one is today (coordinator 10-22: no eager step)
++            raise self.decline(f"{unread.name} read at op {len(self.ops)}: unread kind declined ({func} reads the storage of an unpinned CPU argument)")
+         if func is aten._local_scalar_dense.default:
+             raise self.decline(f"{func} reads a traced tensor's value on the host")
+         if func is aten.record_stream.default:
+             raise self.side_decline(f"{func}: a traced tensor's lifetime across streams in the allocator is not supported")
+-        if any(isinstance(a, _TracedTensor) and a._root.host for a in pytree.tree_leaves((args, kwargs))):
++        if hosted:
+             return self._host_copy(func, args, kwargs)
+         if func in _SDPA_OPS:
+             q, k, v = args[:3]
+@@ -3541,11 +3550,11 @@
+             raise declined(
+                 f"arg{i} is a {type(a).__name__}; only torch.Tensor arguments are traced"
+             )
+-        # a pinned CPU tensor, a memcpy's host side; a pageable one's copy_ is synchronous
+-        pinned = cuda is not None and trusted is None and a.device.type == "cpu" and a.is_pinned()
+-        if not (a.is_cuda and a.device == device) and not pinned:
++        # a CPU tensor: pinned, a memcpy's host side; unpinned (a pageable copy_ is synchronous), its sizes alone
++        host = cuda is not None and trusted is None and a.device.type == "cpu"
++        if not (a.is_cuda and a.device == device) and not host:
+             raise declined(
+-                f"arg{i} is on {a.device}; only CUDA tensors on one device and pinned CPU tensors are traced"
++                f"arg{i} is on {a.device}; only CUDA tensors on one device and CPU tensors beside them are traced"
+             )
+         if a.is_neg() or a.is_conj():
+             raise declined(f"arg{i} is a negative or conjugate view")

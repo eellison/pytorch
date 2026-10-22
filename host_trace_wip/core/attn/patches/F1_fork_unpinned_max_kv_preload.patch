@@ -1,0 +1,91 @@
+--- a/flashinfer/trtllm_trace.py
++++ b/flashinfer/trtllm_trace.py
+@@ -9,6 +9,7 @@
+ # at the hints. Outside a trace the bindings run unchanged.
+ from __future__ import annotations
+ 
++import contextlib
+ import ctypes
+ import dataclasses
+ import functools
+@@ -284,12 +285,14 @@
+     """TllmGenFmhaKernel for one (dtype Q, KV, O) on the current device:
+     kernel selection and CTA config as fmhaKernels.cuh has them."""
+ 
+-    def __init__(self, p: Runner, sm: int, max_smem: int, force: Optional[tuple[int, int]] = None):
++    def __init__(self, p: Runner, sm: int, max_smem: int, force: Optional[tuple[int, int]] = None, tile: Optional[int] = None):
+         self.p = p
+         self.map = kernel_map(p.dtype_q, p.dtype_kv, p.dtype_o, sm, max_smem)
+         # (multi-CTA mode, split) of one region of computeCtaAndClusterConfig
+         # whatever the call's sizes, split 0 for the call's: a selected launch's candidate
+         self.force = force
++        # the cost model's tile size whatever the call's sizes (preload's)
++        self.tile = tile
+ 
+     def meta(self, s: Select) -> Meta:
+         """loadKernel's lookup: the kernel of hashFromRunnerParams."""
+@@ -345,6 +348,17 @@
+ 
+     def _select_tile_q(self, s: Select) -> None:
+         p = self.p
++        if self.tile is not None:
++            s.tile_q = self.tile
++            s.kernel_type = KEEPS_AB if self.tile >= 64 else SWAPS_AB
++            self._sync_gq(s)
++            return
++        if s.tile_q <= 8:
++            return  # no smaller tile: the cost model reads nothing
++        if isinstance(p.max_kv, torch.SymInt) or isinstance(p.batch, torch.SymInt):
++            # the cost model's floats read max_kv and the batch, which a trace
++            # does not carry: the call runs eagerly
++            raise NotFound("a generation call at max_q > 1 (its tile cost model reads max_kv and the batch as floats)")
+         main = {128: 2.2, 64: 1.68, 32: 1.48, 16: 1.2, 8: 1.0}
+         red = {128: 1.32, 64: 1.2, 32: 1.08, 16: 1.03, 8: 1.0}
+         factor = 2.0 if p.bf16q_fp8kv and s.transform == TRANSFORM_SEPARATE_KV else 1.0
+@@ -943,12 +957,11 @@
+         raise tr.decline(f"trtllm-gen {kind}: a tensor the trace does not track")
+     try:
+         p, c, pdl = from_binding(kind, args)
+-        # max_kv enters a generation call's split count and its params only;
+-        # a context call's tile size takes it through a float cost model
+-        unpinned = not isinstance(p.max_kv, torch.SymInt) or p.max_q == 1
++        # max_kv enters a context call's params only (selectKernel's tile
++        # choice is generation's), a generation call's split count, params
++        # and, at max_q > 1, its tile choice (which declines, _select_tile_q)
+         p = dataclasses.replace(p, hd_qk=pin(p.hd_qk), hd_v=pin(p.hd_v), heads_q=pin(p.heads_q), heads_kv=pin(p.heads_kv),
+-                                page=pin(p.page), max_kv=p.max_kv if unpinned else pin(p.max_kv), window=pin(p.window),
+-                                sm_count=pin(p.sm_count))
++                                page=pin(p.page), window=pin(p.window), sm_count=pin(p.sm_count))
+         require(p.heads_q % p.heads_kv == 0, "heads_q % heads_kv == 0")
+         # only what armF/fork/xcheck_params.py checked byte for byte against the C++ launcher
+         require((p.dtype_q, p.dtype_kv, p.dtype_o) == (BF16, BF16, BF16), "bf16 q, KV and out (cross-checked)")
+@@ -1144,16 +1157,24 @@
+ 
+ 
+ def preload(kind: str, args: Any) -> None:
+-    """At a host trace's warm-up: load the kernels its trace selects at these
+-    arguments (with SELECT, every candidate's), which the trace cannot under
+-    its capture."""
++    """At a host trace's warm-up: load every kernel a trace or a redispatch
++    of the call's class can select (a generation call's at each split and,
++    at max_q > 1, each tile size), which they cannot under their captures."""
+     try:
+         p, _, _ = from_binding(kind, args)
+         props = torch.cuda.get_device_properties(args[0].device)
+         sm, max_smem, device = props.major * 10 + props.minor, props.shared_memory_per_block_optin, args[0].device.index
+         launch_plan(Kernels(p, sm, max_smem), device)
+-        if SELECT and kind == DECODE and p.max_q == 1:
+-            candidates(p, sm, max_smem, device)
++        if kind == DECODE:
++            for force in CANDIDATES:
++                for tile in (128, 64, 32, 16, 8) if p.max_q > 1 else (None,):
++                    with contextlib.suppress(RuntimeError):
++                        m, s, cta, func = launch_plan(Kernels(p, sm, max_smem, force, tile=tile), device)
++                        # and the occupancy its Cga fallback reads
++                        if s.multi == MCKV_CGA and (func, cta.cluster_x) not in _ACTIVE:
++                            _ACTIVE[func, cta.cluster_x] = max_active_clusters(func, m, cta)
++            if SELECT and p.max_q == 1:
++                candidates(p, sm, max_smem, device)
+     except NotFound:
+         pass
+ 

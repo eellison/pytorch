@@ -1,0 +1,244 @@
+diff -ruN a/torch/csrc/cuda/host_trace/EagerStep.cpp b/torch/csrc/cuda/host_trace/EagerStep.cpp
+--- a/torch/csrc/cuda/host_trace/EagerStep.cpp	2026-10-07 17:00:17.999443975 -0700
++++ b/torch/csrc/cuda/host_trace/EagerStep.cpp	2026-10-08 22:36:35.552231677 -0700
+@@ -242,21 +242,34 @@
+     int64_t offset, end, last;
+   };
+   const size_t count = memory.temporaries.size();
+-  c10::SmallVector<int64_t, 64> sizes(count);
+-  for (size_t i = 0; i < count; ++i) {
++  auto rounded = [&](size_t i) {
+     const int64_t n = alloc_bytes(memory.temporaries[i].alloc, frame);
+-    sizes[i] = (n + kBlock - 1) / kBlock * kBlock;
++    return (n + kBlock - 1) / kBlock * kBlock;
++  };
++  // the last placement holds while the rows that size the temporaries (a few:
++  // many temporaries share one) and the scratch buffers' sizes are its
++  const int64_t* v = frame.values.data();
++  bool reuse = placement_reuse_enabled && memory.placed_total >= 0;
++  for (size_t k = 0; reuse && k < memory.size_rows.size(); ++k) {
++    reuse = v[memory.size_rows[k]] == memory.placed_row_values[k];
++  }
++  for (size_t j = 0; reuse && j < memory.site_temporaries.size(); ++j) {
++    const size_t i = memory.site_temporaries[j];
++    reuse = rounded(i) == memory.placed_sizes[i];
+   }
+-  if (!placement_reuse_enabled || memory.placed_total < 0 ||
+-      !std::equal(
+-          sizes.begin(),
+-          sizes.end(),
+-          memory.placed_sizes.begin(),
+-          memory.placed_sizes.end())) {
++  if (!reuse) {
+     memory.placed_total = -1;
+-    memory.placed_sizes.assign(sizes.begin(), sizes.end());
++    memory.placed_sizes.resize(count);
++    for (size_t i = 0; i < count; ++i) {
++      memory.placed_sizes[i] = rounded(i);
++    }
++    memory.placed_row_values.resize(memory.size_rows.size());
++    for (size_t k = 0; k < memory.size_rows.size(); ++k) {
++      memory.placed_row_values[k] = v[memory.size_rows[k]];
++    }
+     memory.placed_offsets.assign(count, 0);
+   }
++  const std::vector<int64_t>& sizes = memory.placed_sizes;
+   std::vector<int64_t>& offsets = memory.placed_offsets;
+   int64_t total = memory.placed_total;
+   c10::SmallVector<Live, 16> live;
+diff -ruN a/torch/csrc/cuda/host_trace/Sites.cpp b/torch/csrc/cuda/host_trace/Sites.cpp
+--- a/torch/csrc/cuda/host_trace/Sites.cpp	2026-10-04 18:45:34.532116070 -0700
++++ b/torch/csrc/cuda/host_trace/Sites.cpp	2026-10-08 22:37:34.307591369 -0700
+@@ -193,12 +193,23 @@
+       // patched values' (seen_generation_), which only a commit moves
+       std::swap(frame.values, cached_values_);
+       cached_generation_ = generation;
++      site_memo_cache_ = false;
+     }
+     return hit;
+   }
+-  std::swap(frame.values, cached_values_);
++  // moved, not swapped: a fresh frame's values are inline, and a swap with
++  // them would copy every row (and allocate their buffer) at each call
++  frame.values = std::move(cached_values_);
+   cache_busy_ = true;
+   frame.cached = this;
++  // whether the memo's reads are the cache's as this call found it; not
++  // after the call changes the cache, until its sites resolve
++  const bool memo_fresh = site_memo_cache_;
++  site_memo_cache_ = false;
++  // the rows this call changes: none (no dynamic leaf changed) or delta's
++  // (restricted), else every dynamic row
++  bool restricted = false;
++  DeltaRows* delta = nullptr;
+   int64_t pt = phase_now();
+   c10::SmallVector<int64_t, 64> leaves;
+   leaves.resize_for_overwrite(program_.num_leaves());
+@@ -221,13 +232,14 @@
+         any = true;
+       }
+     }
++    restricted = true;
+     if (!any) {
+       valid_rows = nullptr;
+       ++delta_skips;
+     } else {
+-      const DeltaRows& d = delta_rows(changed);
+-      valid_rows = &d.valid_rows;
+-      other_rows = &d.other_rows;
++      delta = &delta_rows(changed);
++      valid_rows = &delta->valid_rows;
++      other_rows = &delta->other_rows;
+       delta_last_changed_.assign(changed.begin(), changed.end());
+       ++delta_partials;
+     }
+@@ -253,14 +265,48 @@
+   }
+   frame.overlapped =
+       !disjoint(args, count, dynamic_pairs_, &dynamic_pair_arguments_);
+-  const bool resolved = !frame.overlapped && evaluate_sites(frame);
++  if (frame.overlapped) {
++    phase_add(3, pt);
++    return false;
++  }
++  // with a fresh memo, a site read can differ from it only among the rows
++  // this call evaluated: none does, the memo's rows are the call's
++  bool memo_holds = memo_fresh && restricted &&
++      site_memo_armed_ == static_cast<int64_t>(armed_.size());
++  if (memo_holds && delta) {
++    if (delta->site_reads_version != site_reads_version_) {
++      delta->site_reads.clear();
++      for (const auto* rows : {&delta->valid_rows, &delta->other_rows}) {
++        for (uint32_t r : *rows) {
++          auto it = std::lower_bound(site_reads_.begin(), site_reads_.end(), r);
++          if (it != site_reads_.end() && *it == r) {
++            delta->site_reads.push_back(static_cast<uint32_t>(it - site_reads_.begin()));
++          }
++        }
++      }
++      delta->site_reads_version = site_reads_version_;
++    }
++    for (uint32_t j : delta->site_reads) {
++      memo_holds = memo_holds && v[site_reads_[j]] == site_read_values_[j];
++    }
++  }
++  bool resolved = true;
++  if (memo_holds) {
++    frame.site_entries.assign(site_memo_entries_.begin(), site_memo_entries_.end());
++    if (!armed_.empty()) {
++      frame.forms.assign(site_memo_forms_.begin(), site_memo_forms_.end());
++    }
++  } else {
++    resolved = evaluate_sites(frame);
++  }
++  site_memo_cache_ = resolved;
+   phase_add(3, pt);
+   return resolved;
+ }
+ 
+ void HostTraceVariant::release(Frame& frame) {
+   if (frame.cached == this) {
+-    std::swap(frame.values, cached_values_);
++    cached_values_ = std::move(frame.values);
+     cache_busy_ = false;
+     frame.cached = nullptr;
+   }
+@@ -274,12 +320,13 @@
+   std::swap(frame.values, cached_values_);
+   cached_generation_ = generation;
+   seen_generation_ = generation;
++  site_memo_cache_ = false;
+   delta_valid_ = delta_marked_ = false;
+ }
+ 
+-const HostTraceVariant::DeltaRows& HostTraceVariant::delta_rows(
++HostTraceVariant::DeltaRows& HostTraceVariant::delta_rows(
+     c10::ArrayRef<uint64_t> changed) {
+-  for (const DeltaRows& d : delta_memo_) {
++  for (DeltaRows& d : delta_memo_) {
+     if (changed.equals(d.changed)) {
+       return d;
+     }
+@@ -321,6 +368,7 @@
+   users_stale_ = true;
+   static_prefix_ = n;
+   cached_generation_ = 0;
++  site_memo_cache_ = false;
+   delta_valid_ = delta_marked_ = false;
+   delta_memo_.clear();
+   delta_last_changed_.clear();
+@@ -390,6 +438,10 @@
+   site_memo_entries_.assign(frame.site_entries.begin(), frame.site_entries.end());
+   site_memo_forms_.assign(frame.forms.begin(), frame.forms.end());
+   site_memo_armed_ = static_cast<int64_t>(armed_.size());
++  // the memo is this frame's reads (the caller says whether those are the
++  // cache's)
++  ++site_reads_version_;
++  site_memo_cache_ = false;
+   return true;
+ }
+ 
+diff -ruN a/torch/csrc/cuda/host_trace/VariantBuild.cpp b/torch/csrc/cuda/host_trace/VariantBuild.cpp
+--- a/torch/csrc/cuda/host_trace/VariantBuild.cpp	2026-10-08 10:02:14.713111036 -0700
++++ b/torch/csrc/cuda/host_trace/VariantBuild.cpp	2026-10-08 21:11:41.457837436 -0700
+@@ -463,6 +463,18 @@
+           k >= 0 && static_cast<size_t>(k) < n_alloc_, "no allocation ", k);
+       memory.temporaries.push_back({k, seq, last});
+     }
++    for (size_t i = 0; i < memory.temporaries.size(); ++i) {
++      const Allocation& a = allocations_[memory.temporaries[i].alloc];
++      if (a.site >= 0) {
++        memory.site_temporaries.push_back(i);
++      } else {
++        memory.size_rows.push_back(a.nbytes);
++      }
++    }
++    std::sort(memory.size_rows.begin(), memory.size_rows.end());
++    memory.size_rows.erase(
++        std::unique(memory.size_rows.begin(), memory.size_rows.end()),
++        memory.size_rows.end());
+     for (int64_t e : ints<int64_t>(t[3])) {
+       const int64_t k = e < 0 ? -1 - e : e;
+       const auto tmp = std::find_if(
+diff -ruN a/torch/csrc/cuda/host_trace/Variant.h b/torch/csrc/cuda/host_trace/Variant.h
+--- a/torch/csrc/cuda/host_trace/Variant.h	2026-10-08 10:02:14.712885787 -0700
++++ b/torch/csrc/cuda/host_trace/Variant.h	2026-10-08 22:37:34.306585988 -0700
+@@ -467,6 +467,12 @@
+     mutable std::vector<int64_t> placed_sizes;
+     mutable std::vector<int64_t> placed_offsets;
+     mutable int64_t placed_total = -1;
++    // the rows the temporaries' sizes read, and the temporaries a site's row
++    // sizes (scratch buffers): the placement holds while those rows are at
++    // placed_row_values and those temporaries at their placed sizes
++    std::vector<int64_t> size_rows;
++    std::vector<size_t> site_temporaries;
++    mutable std::vector<int64_t> placed_row_values;
+   };
+   enum class LeafKind : uint8_t { View, Scalar, Constant };
+   struct Leaf {
+@@ -691,6 +697,11 @@
+   mutable std::vector<int64_t> site_memo_entries_;
+   mutable std::vector<int32_t> site_memo_forms_;
+   mutable int64_t site_memo_armed_ = -1;
++  // bumped by each rebuild of site_reads_
++  mutable uint64_t site_reads_version_ = 0;
++  // the memo's site reads are cached_values_'s: a delta call compares only
++  // those among the rows it evaluates, as the other rows are the cache's
++  mutable bool site_memo_cache_ = false;
+   // the kept call's values, unless a call is using them
+   c10::SmallVector<int64_t, 256> cached_values_;
+   uint64_t cached_generation_ = 0;
+@@ -704,8 +715,12 @@
+     std::vector<uint64_t> changed;
+     std::vector<uint32_t> valid_rows;
+     std::vector<uint32_t> other_rows;
++    // the site reads among those rows, as indices in site_reads_ when it was
++    // site_reads_version_'s
++    std::vector<uint32_t> site_reads;
++    uint64_t site_reads_version = 0;
+   };
+-  const DeltaRows& delta_rows(c10::ArrayRef<uint64_t> changed);
++  DeltaRows& delta_rows(c10::ArrayRef<uint64_t> changed);
+   std::vector<int64_t> delta_leaves_;
+   std::vector<DeltaRows> delta_memo_;
+   std::vector<uint64_t> delta_last_changed_;

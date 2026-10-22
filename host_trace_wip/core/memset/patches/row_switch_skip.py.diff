@@ -1,0 +1,72 @@
+--- step_ms1/test/test_cuda_host_trace_opaque.py	2026-10-12 13:08:50.777612149 -0700
++++ step_ms2b/test/test_cuda_host_trace_opaque.py	2026-10-14 11:30:03.621188225 -0700
+@@ -98,6 +98,17 @@
+     pass
+ 
+ 
++@torch.library.custom_op("host_trace_test::mul_into_tagged", mutates_args=("out",))
++def mul_into_tagged(x: torch.Tensor, y: torch.Tensor, out: torch.Tensor, tag: int) -> None:
++    torch.mul(x, y, out=out)
++
++
++@mul_into_tagged.register_fake
++def _(x, y, out, tag):
++    # an int the library's kernel does not read (a layer's metadata): a key of its own
++    pass
++
++
+ class TableProvider:
+     """Stands in for a library: `ops` of float32 tensors; aten.mul of
+     contiguous operands binds to the Triton kernel _mul, anything else is
+@@ -857,6 +868,41 @@
+         self.assertEqual(len(bound(f)), 1)
+         self.assertEqual(sets == 0, form_held)
+ 
++    @parametrize("same", [True, False])
++    def test_a_row_switch_to_the_held_launch_sets_nothing(self, same):
++        # two keys (tags 1 and 2) of one site alternate on the same operands: with
++        # same, both rows launch the node exactly as it holds, so a switch only
++        # moves the record's row; else tag 2's grid has an idle block, so each
++        # switch sets the node
++        class Tagged(TableProvider):
++            def learn(self, key, args, kwargs, operands):
++                self.table[key] = self._binding(*operands)
++                if not same and key.scalars[0] == 2:
++                    (k,) = self.table[key].nodes
++                    grid = (k.grid[0] + 1, *k.grid[1:])
++                    self.table[key] = dataclasses.replace(self.table[key], nodes=(dataclasses.replace(k, grid=grid),))
++                return self.table[key]
++
++        p = Tagged(ops=(torch.ops.host_trace_test.mul_into_tagged.default,))
++
++        def fn(x, y, out, t):
++            mul_into_tagged(x, y, out, t.shape[0])
++            return add(out)
++
++        x, y, out = (torch.randn(512, device="cuda") for _ in range(3))
++        tags = [torch.empty(1, device="cuda"), torch.empty(2, device="cuda")]
++        f = HostTraceReplay(fn, opaque=(p,))
++        for _ in range(3):
++            for t in tags:
++                f(x, y, out, t)
++        self.assertEqual((len(f.variants), len(bound(f)), sum(b is not None for b in p.table.values())), (1, 1, 2))
++        sets, switches = torch._C._host_trace_kernel_node_sets(), torch._C._host_trace_kernel_row_switches()
++        for i in range(6):
++            t = tags[i % 2]
++            self.assertEqual(f(x, y, out, t), fn(x, y, out.clone(), t), atol=0, rtol=0)
++        sets, switches = torch._C._host_trace_kernel_node_sets() - sets, torch._C._host_trace_kernel_row_switches() - switches
++        self.assertEqual((sets, switches), (0, 6) if same else (6, 0))
++
+     @mock.patch("torch.cuda._host_trace_replay.oob_learn", False)
+     def test_bound_key_relowers(self):
+         # a key that binds after the trace relowers the tape with its binding
+--- step_ms1/torch/_C/__init__.pyi.in	2026-10-07 20:39:10.052429718 -0700
++++ step_ms2b/torch/_C/__init__.pyi.in	2026-10-14 11:29:51.215786981 -0700
+@@ -2708,6 +2708,7 @@
+ def _host_trace_memory_node_sets() -> _int: ...
+ def _host_trace_kernel_packs() -> _int: ...
+ def _host_trace_kernel_node_sets() -> _int: ...
++def _host_trace_kernel_row_switches() -> _int: ...
+ def _host_trace_phase_times(enable: _bool) -> list[_int]: ...
+ def _host_trace_static_split(variant: _HostTraceVariant) -> tuple[_int, _int]: ...
+ def _host_trace_held_buffer_bytes() -> _int: ...

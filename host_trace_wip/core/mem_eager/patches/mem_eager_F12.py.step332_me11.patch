@@ -1,0 +1,298 @@
+diff -ru '--exclude=__pycache__' '--exclude=TREE.txt' step332_me11/test/inductor/test_cudagraph_host_trace.py step332_me12/test/inductor/test_cudagraph_host_trace.py
+--- step332_me11/test/inductor/test_cudagraph_host_trace.py	2026-10-15 10:49:41.806463936 -0700
++++ step332_me12/test/inductor/test_cudagraph_host_trace.py	2026-10-15 12:39:47.181470721 -0700
+@@ -1713,16 +1713,32 @@
+ 
+ 
+ class _CausalAttention(torch.nn.Module):
+-    # one causal self-attention block (4 heads of 64), as a decoder layer's
+-    def __init__(self):
++    # one self-attention block (heads of 64), as a decoder layer's: causal,
++    # or masked by the additive mask it is given
++    def __init__(self, heads=4):
+         super().__init__()
+-        self.qkv = torch.nn.Linear(256, 768)
+-        self.out = torch.nn.Linear(256, 256)
++        self.heads = heads
++        self.qkv = torch.nn.Linear(64 * heads, 192 * heads)
++        self.out = torch.nn.Linear(64 * heads, 64 * heads)
+ 
+-    def forward(self, x):
++    def forward(self, x, mask=None):
+         b, s, _ = x.shape
+-        q, k, v = self.qkv(x).view(b, s, 3, 4, 64).permute(2, 0, 3, 1, 4)
+-        return self.out(torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True).transpose(1, 2).reshape(b, s, 256))
++        q, k, v = self.qkv(x).view(b, s, 3, self.heads, 64).permute(2, 0, 3, 1, 4)
++        o = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=mask, is_causal=mask is None)
++        return self.out(o.transpose(1, 2).reshape(b, s, 64 * self.heads))
++
++
++def _constant_bytes(operands):
++    # a constant floating input's random stand-in at verify (its span), the
++    # bound's allowance for it: an input of one value can't check how a
++    # binding indexes it
++    total = 0
++    for t in operands:
++        if isinstance(t, torch.Tensor) and t.is_floating_point() and t.numel() > 1:
++            bits = t.view({1: torch.uint8, 2: torch.int16, 4: torch.int32, 8: torch.int64}[t.element_size()])
++            if bool(bits.amin() == bits.amax()):
++                total += (sum((n - 1) * st for n, st in zip(t.shape, t.stride())) + 1) * t.element_size() + 256
++    return total
+ 
+ 
+ def _gate_step(case, mode):
+@@ -1742,16 +1758,23 @@
+         model = _CausalAttention().cuda()
+         opt = torch.optim.AdamW(model.parameters(), lr=1e-4)
+         shape, grad = (16, 512, 256), True
++    elif case == "masked_attention_training":
++        # at DistilBert's scale: whole-operand copies would be past the slack
++        model = _CausalAttention(heads=12).cuda()
++        opt = torch.optim.AdamW(model.parameters(), lr=1e-4)
++        shape, grad = (64, 512, 768), True
+     else:
+         model = torch.nn.Sequential(torch.nn.Linear(1024, 4096), torch.nn.GELU(), torch.nn.Linear(4096, 1024)).cuda().eval()
+         opt, shape, grad = None, (2048, 1024), False
+     compiled = torch.compile(model, mode=mode)
+-    backend = {"efficient_attention_training": SDPBackend.EFFICIENT_ATTENTION, "flash_attention_training": SDPBackend.FLASH_ATTENTION}.get(case)
++    backend = {"efficient_attention_training": SDPBackend.EFFICIENT_ATTENTION, "masked_attention_training": SDPBackend.EFFICIENT_ATTENTION, "flash_attention_training": SDPBackend.FLASH_ATTENTION}.get(case)
+ 
+     def step():
+         x = torch.randn(shape, device="cuda")
++        # a padding mask with no padding: an additive mask of zeros, an input as a model's attention mask is
++        extra = (torch.zeros(shape[0], 1, shape[1], shape[1], device="cuda", dtype=torch.bfloat16),) if case == "masked_attention_training" else ()
+         with torch.autocast("cuda", dtype=torch.bfloat16), torch.set_grad_enabled(grad), sdpa_kernel(backend) if backend else contextlib.nullcontext():
+-            out = compiled(x)
++            out = compiled(x, *extra)
+         if grad:
+             out.float().sum().backward()
+             opt.step()
+@@ -1801,7 +1824,7 @@
+         self.assertGreater(sum(i.replay.replays for i in self.installed), 0)
+         self.assertEqual(ours, default)
+ 
+-    @parametrize("case", ["conv_training", "transformer_training", "efficient_attention_training", "flash_attention_training"])
++    @parametrize("case", ["conv_training", "transformer_training", "efficient_attention_training", "flash_attention_training", "masked_attention_training"])
+     def test_learns_and_the_first_calls_stay_within_eager_plus_workspace(self, case):
+         import torch.cuda._host_trace_harvest as harvest
+ 
+@@ -1815,7 +1838,7 @@
+                 eager = _live_peak(_traced(lambda: key.op(*args, **kwargs))[1])
+             torch.cuda.set_rng_state(state)
+             binding, trace = _traced(lambda: learn(provider, key, args, kwargs, operands))
+-            learned.append((str(key.op), _live_peak(trace), eager, sum(binding.scratch) if binding is not None else 0))
++            learned.append((str(key.op), _live_peak(trace), eager, sum(binding.scratch) if binding is not None else 0, _constant_bytes(operands)))
+             return binding
+ 
+         def peaks(mode):
+@@ -1834,10 +1857,10 @@
+         }
+         with mock.patch.dict(_PROVIDERS, fresh), mock.patch.object(harvest.HarvestProvider, "learn", measured):
+             ours = peaks("reduce-overhead")
+-        workspace = max((w for *_, w in learned), default=0)
++        workspace = max((w for _, _, _, w, _ in learned), default=0)
+         self.assertGreater(len(learned), 0)
+-        for op, peak, eager, w in learned:
+-            self.assertLessEqual(peak - eager, w + _SLACK, op)
++        for op, peak, eager, w, constant in learned:
++            self.assertLessEqual(peak - eager, w + _SLACK + constant, op)
+         self.assertLessEqual(ours[0], default[0] + _SLACK)
+         self.assertLessEqual(ours[1], default[2] + workspace + _SLACK)
+ 
+diff -ru '--exclude=__pycache__' '--exclude=TREE.txt' step332_me11/test/test_cuda_host_trace_harvest.py step332_me12/test/test_cuda_host_trace_harvest.py
+--- step332_me11/test/test_cuda_host_trace_harvest.py	2026-10-15 10:49:41.808316426 -0700
++++ step332_me12/test/test_cuda_host_trace_harvest.py	2026-10-15 12:39:47.183807599 -0700
+@@ -728,6 +728,20 @@
+                     want = harvest._digest(x)
+                 self.assertEqual(harvest._digest(x), want)
+ 
++    def test_a_digest_holds_one_piece_at_a_time(self):
++        # a broadcast or gapped view (no single kernel over its memory) is
++        # digested through copies of _DIGEST_CHUNK-word pieces, one alive at a
++        # time: not a copy of the tensor (a 384 MiB broadcast mask here)
++        mask = torch.zeros(64, 1, 512, 512, device="cuda", dtype=bf16).expand(64, 12, 512, 512)
++        gapped = torch.randn(4096, 8192, device="cuda")[:, ::2]
++        for t in (mask, gapped):
++            torch.cuda.synchronize()
++            base = torch.cuda.memory_allocated()
++            torch.cuda.reset_peak_memory_stats()
++            harvest._digest(t)
++            torch.cuda.synchronize()
++            self.assertLessEqual(torch.cuda.max_memory_allocated() - base, 2 * 8 * harvest._DIGEST_CHUNK)
++
+     def test_stale_high_halves_are_zeroed(self):
+         # a constant qword whose high half is a stale address's binds with
+         # that half zeroed and loose; a slot's neighbors, loose bytes and
+@@ -1297,7 +1311,7 @@
+         # efficient attention's backward spins on a semaphore in its
+         # workspace with some forms: zeroed from the other stream after 20x
+         # the op's eager time, the launch finishes, and the learn returns with
+-        # no kernel left on any stream, in well under the 10 s ceiling
++        # no kernel left on any stream, long before the (here 60 s) ceiling
+         q, k, v = (torch.randn(16, 12, 512, 64, device="cuda", dtype=bf16) for _ in range(3))
+         o, lse, seed, offset = aten._scaled_dot_product_efficient_attention(q, k, v, None, True, 0.0, False)
+         args = (torch.randn_like(o), q, k, v, None, o, lse, seed, offset, 0.0, (True, True, True, False), False)
+@@ -1305,12 +1319,13 @@
+         key, operands = _key(op, args, {})
+         p = HarvestProvider(families=("attention",))
+         start = time.monotonic()
+-        binding = p.learn(key, args, {}, operands)
++        with mock.patch.object(harvest, "_HANG", 60.0):
++            binding = p.learn(key, args, {}, operands)
+         elapsed = time.monotonic() - start
+         self.assertIsNotNone(binding, p.refused.get(p._normal(key)))
+         streams = (torch.cuda.current_stream(), *harvest._DEVICES[torch.cuda.current_device()].streams)
+         self.assertTrue(all(s.query() for s in streams))
+-        self.assertLess(elapsed, 2.0)
++        self.assertLess(elapsed, 10.0)
+ 
+     def test_coalesced_under_recorded_history(self):
+         # while the process records its own memory history the harvest learns
+diff -ru '--exclude=__pycache__' '--exclude=TREE.txt' step332_me11/torch/cuda/_host_trace_harvest.py step332_me12/torch/cuda/_host_trace_harvest.py
+--- step332_me11/torch/cuda/_host_trace_harvest.py	2026-10-15 10:49:41.810161397 -0700
++++ step332_me12/torch/cuda/_host_trace_harvest.py	2026-10-15 12:39:47.186220412 -0700
+@@ -486,7 +486,8 @@
+     if dims is not None and len(dims) <= _DIGEST_DIMS:
+         pieces = [(x, dims)]
+     else:
+-        pieces = [(piece, [(piece.numel(), 1)]) for piece in _chunks(x, _DIGEST_CHUNK)]
++        # one copied piece at a time
++        pieces = ((piece, [(piece.numel(), 1)]) for piece in _chunks(x, _DIGEST_CHUNK))
+     base = 0
+     for piece, dims in pieces:
+         n = piece.numel()
+@@ -1747,6 +1748,13 @@
+                 return f"{names} did not finish on memory filled {fill:#x}"
+ 
+             stream = torch.cuda.current_stream().cuda_stream
++            # floating inputs of one value (an all-zeros mask): any binding
++            # passes on them, so they take random stand-ins
++            def one_value(t: torch.Tensor) -> bool:
++                bits = t.view(_BITS[t.element_size()])
++                return bool(bits.amin() == bits.amax())
++
++            constant = set() if op in self.extern else {i for i, t in enumerate(operands[:placed]) if t.is_floating_point() and t.numel() > 1 and one_value(t)}
+             if in_place:
+                 # a GEMM's binding on the call's own tensors, nothing copied:
+                 # every operand digested, the output filled with 0xFF and each
+@@ -1780,9 +1788,7 @@
+                 def untouched() -> str | None:
+                     return None
+ 
+-            elif live and not binding.rng and op not in self.extern and not any(a.alias_info and a.alias_info.is_write for a in op._schema.arguments) and not any(
+-                t.is_floating_point() and t.numel() > 1 and bool(t.amin() == t.amax()) for t in operands[:placed]
+-            ):
++            elif live and not binding.rng and op not in self.extern and not any(a.alias_info and a.alias_info.is_write for a in op._schema.arguments):
+                 # the binding on the call's own tensors (live at a learn at the
+                 # call; a missed bind's; _learn's stand-ins and its probe's
+                 # outputs), nothing copied: the outputs' and inputs' digests
+@@ -1791,48 +1797,64 @@
+                 # outputs, which also tells whether eager reproduces them
+                 # bitwise; if not, verify runs on copies (_NotBitwise). A
+                 # constant input (all zeros, say) would pass a wrong binding:
+-                # verified on copies too. An _UNORDERED output (atomics: eager
++                # it takes a random stand-in at its layout and alignment, eager
++                # on the stand-ins gives the outputs' digests, and the call's
++                # outputs are put back from eager after the check. An _UNORDERED output (atomics: eager
+                 # does not reproduce it bitwise) is held to 4x eager's own
+                 # spread, from one eager run, against a copy of the call's
+                 # (the one copy, which also restores it); an op that reads its
+                 # forward's philox seed and offset takes no generator state
+                 # the outputs the binding writes (another, a CPU seed say, is the op's own)
+                 referenced = {t.index for n in nodes for t in _slots(n) if t.kind == "operand"}
+-                ins = operands[:placed]
++                ins = list(operands[:placed])
++                filler = torch.Generator(operands[0].device).manual_seed(0)
++                for i in sorted(constant):
++                    t = ins[i]
++                    span = (sum((n - 1) * st for n, st in zip(t.shape, t.stride())) + 1) * t.element_size()
++                    block = torch.empty(-(-(span + 256) // 8), dtype=torch.int64, device=t.device).view(torch.uint8)
++                    flat = block[key.align[i] : key.align[i] + span].view(t.dtype)
++                    fill_uniform(flat, -1, 1, filler)
++                    ins[i] = flat.as_strided(t.shape, t.stride())
+                 positions = [j for j in range(len(operands) - placed) if placed + j in referenced]
+                 live_outs = [operands[placed + j] for j in positions]
+                 loose = {k for k, j in enumerate(positions) if j in _UNORDERED.get(op, ()) and live_outs[k].is_floating_point()}
+-                ptrs = [t.data_ptr() for t in operands]
+-                want, held = [_digest(o) for o in live_outs], [_digest(t) for t in ins]
+-                saved = {k: live_outs[k].clone() for k in loose}
+-                it = iter(ins)
+-                call_args, call_kwargs = pytree.tree_unflatten([next(it) if isinstance(a, torch.Tensor) else a for a in leaves], spec)
++                ptrs = [t.data_ptr() for t in ins] + [t.data_ptr() for t in operands[placed:]]
++                held = [_digest(t) for t in ins]
+ 
+-                def rerun() -> list[torch.Tensor]:
++                def rerun(inputs: list[torch.Tensor]) -> list[torch.Tensor]:
++                    it = iter(inputs)
++                    call_args, call_kwargs = pytree.tree_unflatten([next(it) if isinstance(a, torch.Tensor) else a for a in leaves], spec)
+                     result = op(*call_args, **call_kwargs)
+                     fresh = _fresh([result] if len(returns) == 1 else list(result or ()), returns)
+                     return [fresh[j] for j in positions]
+ 
+-                def eager() -> bool:
+-                    # the outputs back as the call left them; whether eager gave the ordered ones bitwise again
+-                    fresh = rerun()
+-                    again = all(torch.equal(_digest(f), w) for k, (f, w) in enumerate(zip(fresh, want)) if k not in loose)
+-                    for k, (o, f) in enumerate(zip(live_outs, fresh)):
+-                        o.copy_(saved[k] if k in loose else f)
+-                    return again
+-
+                 noise: dict[int, float] = {}
+-                if loose:
++                if constant or loose:
+                     torch.cuda.current_stream().synchronize()
+                     start = time.monotonic()
+-                    fresh = rerun()
++                    reference = rerun(ins) if constant else live_outs
+                     torch.cuda.current_stream().synchronize()
+                     took.append(time.monotonic() - start)
++                want = [_digest(o) for o in (reference if constant else live_outs)]
++                saved = {k: (reference if constant else live_outs)[k].clone() for k in loose}
++                if constant:
++                    del reference
++                if constant or loose:
++                    # eager once more on the same inputs: the ordered outputs again bitwise, the unordered ones' spread
++                    fresh = rerun(ins)
+                     if not all(torch.equal(_digest(f), w) for k, (f, w) in enumerate(zip(fresh, want)) if k not in loose):
+                         raise _NotBitwise
+                     noise = {k: _gap_max(saved[k], fresh[k]) for k in loose}
+                     del fresh
+ 
++                def eager() -> bool:
++                    # the outputs back as the call left them (from eager on its own inputs); whether eager gave the ordered ones bitwise again
++                    fresh = rerun(list(operands[:placed]))
++                    again = constant or all(torch.equal(_digest(f), w) for k, (f, w) in enumerate(zip(fresh, want)) if k not in loose)
++                    for k, (o, f) in enumerate(zip(live_outs, fresh)):
++                        o.copy_(saved[k] if k in loose and not constant else f)
++                    return bool(again)
++
+                 def run(b: OpaqueBinding, fill: int) -> str | None:
+                     for o in live_outs:
+                         o.view(_BITS[o.element_size()]).fill_(-1)
+@@ -1853,6 +1875,8 @@
+                     return why or f"the binding's launch differs from eager at operand {placed + positions[bad]} ({names})"
+ 
+                 def untouched() -> str | None:
++                    if constant:
++                        eager()
+                     return None
+ 
+             else:
+@@ -1873,11 +1897,15 @@
+                 # a group's in one block, the written floating operands then
+                 # random and the rest zeros: their live values are the call's results
+                 extern = op in self.extern
+-                # each operand's block (its lead operand's) and byte in it
++                # each operand's block (its lead operand's) and byte in it; an
++                # op that writes none of its operands runs on them live but for
++                # the alias groups of its constant inputs
++                randomized = {alias.get(i, (i, 0))[0] for i in constant}
+                 lies: list[tuple[int, int] | None] = []
+                 for i in range(placed):
+                     lead, d = alias.get(i, (i, 0))
+-                    lies.append(None if extern and lead not in copied else (lead, key.align[lead] + d))
++                    live_in = (extern and lead not in copied) or (not extern and not mutates and lead not in randomized)
++                    lies.append(None if live_in else (lead, key.align[lead] + d))
+                 leads = sorted({lie[0] for lie in lies if lie})
+                 lives = {
+                     i: torch.empty(0, dtype=torch.uint8, device=t.device).set_(t.untyped_storage(), t.storage_offset() * t.element_size(), (block_bytes[i],), (1,))

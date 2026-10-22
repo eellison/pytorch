@@ -1,0 +1,32 @@
+--- a/test/test_cuda_host_trace_harvest.py	2026-10-15 13:17:46.533249073 -0700
++++ b/test/test_cuda_host_trace_harvest.py	2026-10-15 18:10:49.558799183 -0700
+@@ -376,6 +376,29 @@
+         out = subprocess.check_output([sys.executable, "-c", code], env=env, text=True)
+         self.assertIn("ok 2 {}", out)
+ 
++    def test_learns_beside_an_nccl_process_group(self):
++        # the "nccl" backend registers every new allocator segment with its
++        # communicators; the harvest's captures allocate address space with no
++        # memory behind it, which NCCL cannot register (a fresh process: the
++        # process group is global)
++        code = f"""
++import sys, torch, torch.distributed as dist
++sys.path.insert(0, {os.path.dirname(os.path.abspath(__file__))!r})
++from test_cuda_host_trace_harvest import _learn, _replay, aten
++from torch.cuda._host_trace_harvest import HarvestProvider
++dist.init_process_group("nccl", store=dist.HashStore(), rank=0, world_size=1, device_id=torch.device("cuda", 0))
++p = HarvestProvider()
++a, b = (torch.randn(*s, device="cuda") for s in ((64, 512), (512, 256)))
++binding, why = _learn(p, aten.mm.default, (a, b))
++assert binding is not None, why
++want = torch.mm(a, b)
++assert torch.equal(_replay(binding, [a, b, want]), want)
++dist.destroy_process_group()
++print("ok", p.harvests, p.refused)
++"""
++        out = subprocess.check_output([sys.executable, "-c", code], text=True)
++        self.assertIn("ok 1 {}", out)
++
+     def test_the_key_carries_the_operands_device(self):
+         # a binding is keyed on its operands' device, not the current one
+         p = HarvestProvider()

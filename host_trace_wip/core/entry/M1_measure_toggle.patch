@@ -1,0 +1,108 @@
+diff -u e1c4_csrc/host_trace/EagerStep.cpp c9e0/src/torch/csrc/cuda/host_trace/EagerStep.cpp
+--- e1c4_csrc/host_trace/EagerStep.cpp	2026-10-09 13:53:45.860222586 -0700
++++ c9e0/src/torch/csrc/cuda/host_trace/EagerStep.cpp	2026-10-09 13:54:09.762005849 -0700
+@@ -250,7 +250,14 @@
+   // many temporaries share one) and the scratch buffers' sizes are its
+   const int64_t* v = frame.values.data();
+   bool reuse = placement_reuse_enabled && memory.placed_total >= 0;
+-  for (size_t k = 0; reuse && k < memory.size_rows.size(); ++k) {
++  if (entry_legacy) {
++    c10::SmallVector<int64_t, 64> legacy_sizes(count);
++    for (size_t i = 0; i < count; ++i) {
++      legacy_sizes[i] = rounded(i);
++    }
++    reuse = reuse && std::equal(legacy_sizes.begin(), legacy_sizes.end(), memory.placed_sizes.begin(), memory.placed_sizes.end());
++  }
++  for (size_t k = 0; !entry_legacy && reuse && k < memory.size_rows.size(); ++k) {
+     reuse = v[memory.size_rows[k]] == memory.placed_row_values[k];
+   }
+   for (size_t j = 0; reuse && j < memory.site_temporaries.size(); ++j) {
+diff -u e1c4_csrc/host_trace/Entry.cpp c9e0/src/torch/csrc/cuda/host_trace/Entry.cpp
+--- e1c4_csrc/host_trace/Entry.cpp	2026-10-08 21:28:11.065477006 -0700
++++ c9e0/src/torch/csrc/cuda/host_trace/Entry.cpp	2026-10-09 13:54:09.762601596 -0700
+@@ -787,7 +787,10 @@
+       count >= st.static_count &&
+       at::GradMode::is_enabled() == st.static_grad_mode &&
+       (!trusted_statics_check || same_static_layout(st, inputs));
+-  if (trusted_statics || same_statics(st, inputs, count)) {
++  int64_t pt_statics = phase_now();  // measurement only: phase 9 the statics check, 15 the rest of the key
++  const bool statics_same = trusted_statics || same_statics(st, inputs, count);
++  phase_add(9, pt_statics);
++  if (statics_same) {
+     if (owner.id) {
+       st.static_owner = owner;
+     }
+@@ -821,6 +824,7 @@
+       }
+     }
+   }
++  phase_add(15, pt_statics);
+   int64_t pt_capture = phase_now();
+   if (!family ||
+       c10::cuda::currentStreamCaptureStatusMayInitCtx() !=
+@@ -1703,6 +1707,7 @@
+   m.def("_host_trace_variant_order", [](bool enable) {
+     variant_order_enabled = enable;
+   });
++  m.def("_host_trace_entry_legacy", [](bool enable) { entry_legacy = enable; });
+   m.def("_host_trace_placement_reuse", [](bool enable) {
+     placement_reuse_enabled = enable;
+   });
+diff -u e1c4_csrc/host_trace/Sites.cpp c9e0/src/torch/csrc/cuda/host_trace/Sites.cpp
+--- e1c4_csrc/host_trace/Sites.cpp	2026-10-09 13:53:45.861065535 -0700
++++ c9e0/src/torch/csrc/cuda/host_trace/Sites.cpp	2026-10-09 13:54:09.761808824 -0700
+@@ -17,6 +17,7 @@
+ bool delta_enabled = true;
+ bool variant_order_enabled = true;
+ bool placement_reuse_enabled = true;
++bool entry_legacy = false;
+ bool form_held_enabled = false;
+ bool entry_descriptors_enabled = true;
+ 
+@@ -199,7 +200,11 @@
+   }
+   // moved, not swapped: a fresh frame's values are inline, and a swap with
+   // them would copy every row (and allocate their buffer) at each call
+-  frame.values = std::move(cached_values_);
++  if (entry_legacy) {
++    std::swap(frame.values, cached_values_);
++  } else {
++    frame.values = std::move(cached_values_);
++  }
+   cache_busy_ = true;
+   frame.cached = this;
+   // whether the memo's reads are the cache's as this call found it; not
+@@ -271,7 +276,7 @@
+   }
+   // with a fresh memo, a site read can differ from it only among the rows
+   // this call evaluated: none does, the memo's rows are the call's
+-  bool memo_holds = memo_fresh && restricted &&
++  bool memo_holds = !entry_legacy && memo_fresh && restricted &&
+       site_memo_armed_ == static_cast<int64_t>(armed_.size());
+   if (memo_holds && delta) {
+     if (delta->site_reads_version != site_reads_version_) {
+@@ -306,7 +311,11 @@
+ 
+ void HostTraceVariant::release(Frame& frame) {
+   if (frame.cached == this) {
+-    cached_values_ = std::move(frame.values);
++    if (entry_legacy) {
++      std::swap(frame.values, cached_values_);
++    } else {
++      cached_values_ = std::move(frame.values);
++    }
+     cache_busy_ = false;
+     frame.cached = nullptr;
+   }
+diff -u e1c4_csrc/host_trace/Variant.h c9e0/src/torch/csrc/cuda/host_trace/Variant.h
+--- e1c4_csrc/host_trace/Variant.h	2026-10-09 13:53:45.862670023 -0700
++++ c9e0/src/torch/csrc/cuda/host_trace/Variant.h	2026-10-09 13:54:09.761566006 -0700
+@@ -75,6 +75,8 @@
+ extern bool variant_order_enabled;
+ // run_buffer keeps a run's placement while its temporaries' sizes repeat
+ extern bool placement_reuse_enabled;
++// measurement only (not kept): candidate 4's paths in place of E1's
++extern bool entry_legacy;
+ // a form switch restores what the form's exec last held (else forgets it)
+ extern bool form_held_enabled;
+ // add_entry takes an entry's TMA descriptors (else refuses the entry)

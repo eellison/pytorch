@@ -1,0 +1,309 @@
+--- a/torch/cuda/_host_trace_ir.py
++++ b/torch/cuda/_host_trace_ir.py
+@@ -48,6 +48,7 @@
+ import re
+ import struct
+ import sys
++import threading
+ from typing import Any
+ 
+ import sympy
+@@ -151,6 +152,10 @@
+ _TORCH_DIR = os.path.dirname(os.path.abspath(torch.__file__)) + os.sep
+ _NO_SLOC = SLoc(None, None)
+ 
++# the trace running on this thread (_host_trace_tape's _active): an Env records
++# guards only while its own trace runs or none does
++ACTIVE = threading.local()
++
+ 
+ class Unsupported(Exception):
+     """An operation the IR backend does not express; the trace declines on
+@@ -341,6 +346,10 @@
+         self.consts: dict[int, Node] = {}
+         self.bounds_memo: dict[Node, tuple] = {}
+ 
++    def owns(self, n: Node) -> bool:
++        # by identity: two contexts' ids collide
++        return n.id < len(self.nodes) and self.nodes[n.id] is n
++
+     def mk(self, op: str, args: tuple, hint: Any) -> Node:
+         key = (op, args)
+         n = self.table.get(key)
+@@ -1008,8 +1017,11 @@
+     def transfer(self, n: Node, src: Ctx, symbols: dict[str, Node], memo: dict[int, Node]) -> Node:
+         """n, a node of `src`, rebuilt here with each symbol the node `symbols`
+         names for it: sympy's xreplace with no sympy step, in this context's
+-        canonical forms. KeyError on a symbol `symbols` lacks; the arithmetic
+-        of this context's hints may raise (a divisor 0 at them)."""
++        canonical forms. KeyError on a node that is not `src`'s or a symbol
++        `symbols` lacks or maps to no node of this context; the arithmetic of
++        this context's hints may raise (a divisor 0 at them)."""
++        if not src.owns(n):
++            raise KeyError(f"node {n.id} ({n.op}) is not the source context's")
+         out = memo.get(n.id)
+         if out is not None:
+             return out
+@@ -1021,6 +1033,8 @@
+         written = src.written.get(n.id)
+         if op in ("sym", "fsym"):
+             out = symbols[args[0]]
++            if not self.owns(out):
++                raise KeyError(args[0])
+         elif op == "const":
+             out = self.const(args[0])
+         elif op == "fconst":
+@@ -1177,6 +1191,9 @@
+         # was written in (Eq(a, b) and Eq(b, a) are two guards), the rest by node
+         if g.op == "true":
+             return
++        active = getattr(ACTIVE, "trace", None)
++        if active is not None and active.shape_env is not self:
++            raise _foreign("a guard on a symbol of another trace")
+         if written is None:
+             written = self.ctx.written.get(g.id)
+         key = _record_key(g, written)
+@@ -1412,26 +1429,32 @@
+     def _bool(self, n: Node) -> IRSymNode:
+         return IRSymNode(n, self.env, bool)
+ 
++    def _of(self, other: IRSymNode) -> Node:
++        # an operand's node, of this node's context: never a node of another trace's
++        if other.env is not self.env:
++            raise _foreign("an operation on symbols of two traces")
++        return other.node
++
+     def _ints(self, other: IRSymNode, what: str) -> tuple[Node, Node]:
+-        a, b = self.node, other.node
++        a, b = self.node, self._of(other)
+         if not (a.is_int and b.is_int):
+             raise self.env.unsupported(f"{what} of a non-integer")
+         return a, b
+ 
+     def add(self, other: IRSymNode) -> IRSymNode:
+-        c, a, b = self.env.ctx, self.node, other.node
++        c, a, b = self.env.ctx, self.node, self._of(other)
+         return self._out(
+             c.fbin("fadd", a, b) if (a.is_float or b.is_float) else c.add(a, b)
+         )
+ 
+     def sub(self, other: IRSymNode) -> IRSymNode:
+-        c, a, b = self.env.ctx, self.node, other.node
++        c, a, b = self.env.ctx, self.node, self._of(other)
+         return self._out(
+             c.fbin("fsub", a, b) if (a.is_float or b.is_float) else c.sub(a, b)
+         )
+ 
+     def mul(self, other: IRSymNode) -> IRSymNode:
+-        c, a, b = self.env.ctx, self.node, other.node
++        c, a, b = self.env.ctx, self.node, self._of(other)
+         return self._out(
+             c.fbin("fmul", a, b) if (a.is_float or b.is_float) else c.mul(a, b)
+         )
+@@ -1462,8 +1485,9 @@
+     floordiv = int_floordiv
+ 
+     def float_truediv(self, other: IRSymNode) -> IRSymNode:
+-        self.env.domain(other.node)
+-        return self._flt(self.env.ctx.fbin("fdiv", self.node, other.node))
++        b = self._of(other)
++        self.env.domain(b)
++        return self._flt(self.env.ctx.fbin("fdiv", self.node, b))
+ 
+     int_truediv = float_truediv
+     truediv = float_truediv
+@@ -1477,7 +1501,7 @@
+         raise self.env.unsupported("a symbolic base to a symbolic exponent")
+ 
+     def float_pow(self, other: IRSymNode) -> IRSymNode:
+-        return self._flt(self.env.ctx.fbin("fpow", self.node, other.node))
++        return self._flt(self.env.ctx.fbin("fpow", self.node, self._of(other)))
+ 
+     # c10 binds no integer pow (sym_node.py's SymNode.pow)
+     pow = float_pow
+@@ -1587,7 +1611,7 @@
+ 
+     # ---- relations and boolean algebra
+     def _rel(self, cls: str, other: IRSymNode) -> IRSymNode:
+-        a, b = self.node, other.node
++        a, b = self.node, self._of(other)
+         r = self.env.ctx._compare(cls, a, b)
+         # a comparison of booleans is the junction _compare_new built, written as itself
+         written = None if r.op in ("true", "false") or (a.is_bool and b.is_bool) else (cls, a, b)
+@@ -1617,10 +1641,10 @@
+         return IRSymNode(r, self.env, bool, written=written)
+ 
+     def sym_and(self, other: IRSymNode) -> IRSymNode:
+-        return self._junction(self.env.ctx.and_(self.node, other.node), other)
++        return self._junction(self.env.ctx.and_(self.node, self._of(other)), other)
+ 
+     def sym_or(self, other: IRSymNode) -> IRSymNode:
+-        return self._junction(self.env.ctx.or_(self.node, other.node), other)
++        return self._junction(self.env.ctx.or_(self.node, self._of(other)), other)
+ 
+     def sym_not(self) -> IRSymNode:
+         r = self.env.ctx.not_(self.node)
+@@ -1720,6 +1744,14 @@
+         return self._bool(self.env.ctx.eq(ind, self.env.ctx.const(1)))
+ 
+ 
++def _foreign(what: str) -> Exception:
++    # the running trace's decline: it declines even where its host catches the exception
++    from torch.cuda._host_trace import declined
++
++    active = getattr(ACTIVE, "trace", None)
++    return active.decline(what) if active is not None else declined(what)
++
++
+ def direct(x: Any) -> IRSymNode | None:
+     """The node of a SymInt that SymInt's binary dunders hand straight to its
+     IRSymNode method (sym_node's _DIRECT_INT_NODES), else None."""
+--- a/torch/cuda/_host_trace_lower.py
++++ b/torch/cuda/_host_trace_lower.py
+@@ -385,6 +385,8 @@
+         try:
+             if isinstance(e, int):
+                 return self._int_constant(e)
++            if not self.ctx.owns(e):
++                raise declined(f"{render(e)} is a value of another trace")
+             return self._lower(e)  # type: ignore[arg-type]
+         except OutOfDomain as error:
+             raise declined(f"{render(e) if isinstance(e, Node) else e} fails at the hints") from error
+--- a/torch/cuda/_host_trace.py
++++ b/torch/cuda/_host_trace.py
+@@ -403,6 +403,9 @@
+     def _record(self, g: sympy.Basic, size_oblivious: bool = False) -> None:
+         if g is sympy.true:
+             return
++        active = getattr(_ir.ACTIVE, "trace", None)
++        if active is not None and active.shape_env is not self:
++            raise _ir._foreign("a guard on a symbol of another trace")
+         i = self._index.get(g)
+         if i is None:
+             i = self._index[g] = len(self.guards)
+--- a/torch/cuda/_host_trace_tape.py
++++ b/torch/cuda/_host_trace_tape.py
+@@ -26,7 +26,6 @@
+ import operator
+ import struct
+ import sys
+-import threading
+ import weakref
+ from dataclasses import dataclass, field, replace
+ from typing import Any, Literal, TYPE_CHECKING
+@@ -252,7 +251,7 @@
+     nbytes: Any
+ 
+ 
+-_active = threading.local()
++_active = _ir.ACTIVE
+ 
+ 
+ def current_trace() -> _Trace | None:
+--- a/test/test_cuda_host_trace_guards.py
++++ b/test/test_cuda_host_trace_guards.py
+@@ -9,7 +9,7 @@
+ import torch
+ import torch.fx.experimental.sym_node as sym_node
+ from torch.cuda import _host_trace_ir as _ir
+-from torch.cuda._host_trace import _TraceShapeEnv
++from torch.cuda._host_trace import _TraceShapeEnv, Declined
+ from torch.fx.experimental.symbolic_shapes import ShapeEnv, statically_known_false, statically_known_true
+ from torch.testing._internal.common_utils import run_tests, TestCase
+ from torch.utils._sympy.functions import FloorDiv, Mod, PythonMod
+@@ -161,7 +161,7 @@
+     def _state(env, out):
+         nodes = [(_ir.render(n), n.hint) for n in env.ctx.nodes]
+         records = [(_ir.render(g), w and (w[0], *map(_ir.render, w[1:]))) for g, w in env.records]
+-        return nodes, records, [(type(v), v.node.hint if isinstance(v, (torch.SymInt, torch.SymBool)) else v) for v in out]
++        return nodes, records, [(type(v), v.node.hint if isinstance(v, (torch.SymInt, torch.SymBool, torch.SymFloat)) else v) for v in out]
+ 
+     @staticmethod
+     def _program(env):
+@@ -218,6 +218,47 @@
+         self.assertIs(_ir.binary("add", env.symbol(1, "x"), 1.5), NotImplemented)
+ 
+ 
++class TestIRContexts(TestCase):
++    # two traces' contexts number their nodes alike: an id of one names an
++    # unrelated node of the other, so a node is only ever its own context's
++    def test_transfer_never_resolves_a_node_of_another_context_by_id(self):
++        variant, fresh, other = _ir.Env(), _ir.Env(), _ir.Env()
++        v = variant.symbol(7, "v")
++        mine, foreign = (fresh.symbol(1000, "y") + 15) // 16, (other.symbol(1000, "x") + 15) // 16
++        self.assertEqual(mine.node.node.id, foreign.node.node.id)
++        memo = {}
++        symbols = {fresh.ctx.nodes[0].args[0]: v.node.node}
++        variant.ctx.transfer(mine.node.node, fresh.ctx, symbols, memo)
++        with self.assertRaises(KeyError):
++            variant.ctx.transfer(foreign.node.node, fresh.ctx, symbols, memo)
++
++    def test_an_operation_on_symbols_of_two_traces_is_refused(self):
++        x, y = _ir.Env().symbol(8, "x"), _ir.Env().symbol(8, "y")
++        with self.assertRaisesRegex(Declined, "symbols of two traces"):
++            x + y
++
++    def test_a_guard_on_another_traces_symbol_is_refused(self):
++        variant, fresh = _ir.Env(), _ir.Env()
++        n = variant.symbol(1000, "n")
++
++        class Running:
++            shape_env, declined = fresh, None
++
++            def decline(self, msg):
++                self.declined = Declined(msg)
++                return self.declined
++
++        running = Running()
++        with mock.patch.object(_ir.ACTIVE, "trace", running, create=True):
++            with self.assertRaisesRegex(Declined, "a guard on a symbol of another trace"):
++                bool(n % 16 == 8)
++        self.assertIsNotNone(running.declined)
++        self.assertEqual(variant.records, [])
++        # outside any trace (a fold, a lowering) the variant records its own
++        self.assertTrue(bool(n % 16 == 8))
++        self.assertEqual(len(variant.records), 1)
++
++
+ def setUpModule():
+     import torch.cuda._host_trace as host_trace
+ 
+--- a/test/test_cuda_host_trace_triton.py
++++ b/test/test_cuda_host_trace_triton.py
+@@ -842,6 +842,36 @@
+             self.assertEqual(r(self.x, n, 3)[:n], self.x[:n] + 3)
+         self.assertEqual((r.traces, r.folds, r.redispatches, len(r.variants), r.eager), (1, 0, 1, 1, 0))
+ 
++    @parametrize("how", ["tuned", "plain", "unit"])
++    def test_a_closures_symbol_is_never_resolved_in_a_redispatch(self, how):
++        # the grid (or a dispatch_unit's body) closes over the trace's n: a
++        # redispatch runs it again on that SymInt, a node of the variant's
++        # context, not of the fresh trace's. It is refused, never looked up by
++        # id among the fresh trace's nodes (which gave the grid of an unrelated row)
++        def plain(x, n, s):
++            y = torch.empty_like(x)
++            _add[lambda meta: (triton.cdiv(n, meta["B"]),)](x, y, n, s, B=128)
++            return y
++
++        def unit(x, n, s):
++            @torch.cuda._host_trace.dispatch_unit
++            def launch(x, s):
++                y = torch.empty_like(x)
++                _add[(triton.cdiv(n, 128),)](x, y, n, s, B=128)
++                return y
++
++            return launch(x, s)
++
++        f = {"tuned": _tuned_call(_add_tuned), "plain": plain, "unit": unit}[how]
++        r = HostTraceReplay(f)
++        # s's int width class flips at 2**32: the launch's own guard
++        for s in (1, 2**32, 2**32 + 5, -1):
++            x = torch.randn(1000, device="cuda")
++            self.assertEqual(r(x, 1000, s), f(x, 1000, s), atol=0, rtol=0)
++        self.assertEqual(r.redispatches, 0)
++        self.assertTrue(r.redispatch_refusals)
++        self.assertTrue(all("a guard on a symbol of another trace" in k for k in r.redispatch_refusals))
++
+     def test_a_custom_ops_kernel_choice_dispatches_again_into_one_variant(self):
+         tape = trace(_add_one, (self.x,))
+         self.assertEqual([op.kind for op in tape.ops], ["traced"])

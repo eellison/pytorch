@@ -1,0 +1,325 @@
+diff -ruN a/test/test_cuda_host_trace_harvest.py b/test/test_cuda_host_trace_harvest.py
+--- a/test/test_cuda_host_trace_harvest.py	2026-10-12 09:46:47.298375434 -0700
++++ b/test/test_cuda_host_trace_harvest.py	2026-10-12 09:46:47.343015609 -0700
+@@ -32,7 +32,7 @@
+     import torch.cuda._host_trace_memory as memory
+     from torch.cuda._host_trace_harvest import _launch, HarvestProvider
+     from torch.cuda._host_trace_opaque import library_state, OpaqueKernel, OpaqueKey
+-    from torch.cuda._host_trace_replay import _BACKGROUND, HostTraceReplay
++    from torch.cuda._host_trace_replay import _BACKGROUND, _KeyProgram, _resized, HostTraceReplay
+     from torch.cuda._host_trace_tape import EagerCall
+ 
+ aten = torch.ops.aten
+@@ -2048,6 +2048,54 @@
+         self.assertIsNotNone(p.refusal(dataclasses.replace(transposed, strides=((64, 1), (64, 1)))))
+         self.assertEqual((p.harvests, r.traces), (1, 2))
+ 
++    def test_warm_up_learns_a_range_ahead(self):
++        # warm_up over x's rows in [33, 80], after one trace: each key a call in
++        # the range needs is learned once (two GEMM sites of one key are one
++        # entry); calls in the range then learn nothing, a call outside learns
++        # as before
++        def f(x, w):
++            return torch.mm(torch.mm(x, w), w) + 1
++
++        w = torch.randn(64, 64, device="cuda", dtype=bf16) * 0.1
++        r = HostTraceReplay(f, opaque=(HarvestProvider(),))
++        x = torch.randn(32, 64, device="cuda", dtype=bf16)
++        for _ in range(2):
++            self.assertEqual(r(x, w), f(x, w), atol=0, rtol=0)
++        report = r.warm_up((x, w), {"n": [(0, 0)]}, {"n": range(33, 81)})
++        self.assertEqual((report.calls, report.held, report.keys, report.learned, report.refused), (48, 48, 48, 48, 0))
++        learned = r.learned
++        for t in (40, 80, 33, 57, 81):
++            y = torch.randn(t, 64, device="cuda", dtype=bf16)
++            self.assertEqual(r(y, w), f(y, w), atol=0, rtol=0)
++        self.assertEqual((r.learned - learned, r.warm_up_misses, r.traces), (1, 0, 1))
++        # a second warm-up of the range finds every key bound
++        again = r.warm_up((x, w), {"n": [(0, 0)]}, {"n": range(33, 81)})
++        self.assertEqual(again.learned, 0)
++
++    def test_warm_up_key_program_agrees_with_the_native_evaluation(self):
++        # warm_up's rows (the keys', validity's and selectors', with the rows
++        # that read no moved argument folded) give at each size the keys the
++        # native evaluation of every row misses on, one per key formula
++        def f(x, w, v):
++            return torch.mm(torch.mm(x, w), w), torch.mm(x, v)
++
++        w = torch.randn(64, 64, device="cuda", dtype=bf16) * 0.1
++        v = torch.randn(64, 48, device="cuda", dtype=bf16) * 0.1
++        r = HostTraceReplay(f, opaque=(HarvestProvider(),))
++        x = torch.randn(32, 64, device="cuda", dtype=bf16)
++        for _ in range(2):
++            r(x, w, v)
++        (variant,) = [v_ for vs in r._families.values() for v_ in vs if not v_.learns]
++        lowered = variant.captured.lowered
++        program = _KeyProgram.of(lowered, (x, w, v), {0})
++        self.assertIsNotNone(program)
++        self.assertLessEqual(len(program.groups), len(lowered.sites))
++        for t in (1, 33, 200):
++            call = _resized((x, w, v), {(0, 0): t})
++            mine = {lowered.sites[i].key(k) for i, k in program.keys(call)}
++            native = {lowered.sites[i].key(tuple(k)) for i, k in variant.native.evaluate(call)[1]}
++            self.assertEqual(mine, native)
++
+     def test_prepare_range(self):
+         # every size of a range prepared: a first call at any of them learns
+         # nothing and replays, bitwise equal to eager
+diff -ruN a/torch/cuda/_host_trace_replay.py b/torch/cuda/_host_trace_replay.py
+--- a/torch/cuda/_host_trace_replay.py	2026-10-12 09:46:47.292029859 -0700
++++ b/torch/cuda/_host_trace_replay.py	2026-10-12 09:46:47.295190454 -0700
+@@ -65,6 +65,8 @@
+ import inspect
+ import itertools
+ import logging
++import math
++import operator
+ import queue
+ import threading
+ import time
+@@ -575,6 +577,10 @@
+         # (_learn), and their seconds
+         self.learned = 0
+         self.learn_s = 0.0
++        # warm_up's declarations, (argument sizes, dims, ranges) each; the keys
++        # a call inside one of them still learned (a warm-up miss: a bug)
++        self._warmed: list[tuple[tuple, dict[str, tuple[tuple[int, int], ...]], dict[str, range]]] = []
++        self.warm_up_misses = 0
+         # the traces whose opaque calls bound out of band (oob_learn)
+         self.oob_binds = 0
+         # the variants built with refused keys as eager steps, no trace
+@@ -710,6 +716,100 @@
+         with self._lock, _gc_hold:
+             return any(not v.learns and self._fill(v, args, [], background=False) is not None for v in self._families.get(contract, ()))
+ 
++    def warm_up(self, args: tuple, dims: dict[str, Sequence[tuple[int, int]]], ranges: dict[str, Iterable[int]]) -> WarmUp:
++        """Learns ahead of time the opaque keys (cuBLAS, cuDNN, extern calls)
++        of every call that differs from `args`, a call of a class this entry
++        has traced, only in the sizes `dims` names: per symbol, its (argument,
++        dim) pairs, which take each value of its range in `ranges` together
++        (several symbols: every combination); a pair (argument, None) is an int
++        argument that moves with its symbol (num_prefill_tokens = T - decodes). Each such call's keys come from
++        evaluating its variant's program on views of `args` at those sizes (no
++        kernel runs and nothing is read; a contiguous argument's strides follow
++        its sizes), deduplicated across sites and calls, and each new one is
++        learned as a miss would learn it (_learn). Afterwards a call inside a
++        declaration that still learns is counted in warm_up_misses. A call
++        outside every declaration learns as before."""
++        names = list(ranges)
++        if set(names) != set(dims):
++            raise ValueError(f"host_trace: warm_up's dims {sorted(dims)} and ranges {sorted(ranges)} name other symbols")
++        values_of = [list(ranges[n]) for n in names]
++        start = time.perf_counter()
++        report = WarmUp(calls=math.prod(map(len, values_of)), symbols=len(names))
++        contract = () if self.trusted is not None else argument_contract(args, self.check_global_state)
++        with self._lock, _gc_hold:
++            family = [v for v in self._families.get(contract, ()) if not v.learns]
++            if not family:
++                raise ValueError("host_trace: warm_up needs a traced call of the arguments' class")
++            keys: dict[OpaqueKey, tuple[_Variant, int]] = {}
++            # each symbol's value at `args`: its first tensor dim's size
++            traced = {n: next(args[a].shape[d] for a, d in dims[n] if d is not None) for n in names}
++            moved = {a for pairs in dims.values() for a, _ in pairs}
++            programs = [_KeyProgram.of(variant.captured.lowered, args, moved) for variant in family]
++            # per variant, each site's static half of its key as a small int:
++            # sites of one signature at the same ints are one key, whichever
++            # layer they are in, before an OpaqueKey is built
++            signatures: dict[Any, int] = {}
++            signature_of = [[_site_signature(site, signatures) for site in variant.captured.lowered.sites] for variant in family]
++            seen: set[tuple] = set()
++            for point in itertools.product(*values_of):
++                call = _resized(args, {(a, d): v - traced[n] if d is None else v for n, v in zip(names, point) for a, d in dims[n]})
++                for variant, program, signature in zip(family, programs, signature_of):
++                    sites = variant.captured.lowered.sites
++                    found = program.keys(call) if program is not None else None
++                    if found is None:
++                        # the native evaluation: every row, the selectors' entries
++                        evaluated = variant.native.evaluate(call)
++                        if evaluated is None or evaluated[3]:
++                            continue
++                        found = [(i, tuple(key)) for i, key in evaluated[1]]
++                    elif not found:
++                        continue
++                    for i, key in found:
++                        if (signature[i], key) not in seen:
++                            seen.add((signature[i], key))
++                            keys.setdefault(sites[i].key(key), (variant, i))
++                    report.held += 1
++                    break
++            report.keys = len(keys)
++            for key, (variant, i) in keys.items():
++                site = variant.captured.lowered.sites[i].site
++                if site.provider.bind(key) is not None:
++                    continue
++                if site.rng or site.call is None or site.provider.refusal(key) is not None:
++                    report.refused += 1
++                    continue
++                if self._learn(site.op, site.provider, site.call, key) is None:
++                    report.refused += 1
++                else:
++                    report.learned += 1
++            torch.cuda.empty_cache()  # the learns' operands, at sizes the run may never take
++            self._warmed.append((tuple(tuple(a.shape) if isinstance(a, torch.Tensor) else None for a in args), {n: tuple(dims[n]) for n in names}, {n: range(min(v), max(v) + 1) for n, v in zip(names, values_of)}))
++        report.seconds = time.perf_counter() - start
++        return report
++
++    def _inside_warm_up(self, args: tuple) -> bool:
++        # whether a declaration covers the call: its sizes are the declaration's
++        # but for the declared dims, each symbol's at one value in its range
++        for shapes, dims, ranges in self._warmed:
++            if len(shapes) != len(args):
++                continue
++            sizes = [list(a.shape) if isinstance(a, torch.Tensor) else None for a in args]
++            ok = True
++            for name, pairs in dims.items():
++                seen = set()
++                for a, d in pairs:
++                    if d is None:
++                        continue
++                    if sizes[a] is None or shapes[a] is None or d >= len(sizes[a]):
++                        ok = False
++                        break
++                    seen.add(sizes[a][d])
++                    sizes[a][d] = shapes[a][d]
++                ok = ok and len(seen) == 1 and next(iter(seen)) in ranges[name]
++            if ok and all((s is None) == (t is None) and (s is None or tuple(s) == t) for s, t in zip(sizes, shapes)):
++                return True
++        return False
++
+     def _relower(self, family: list[_Variant], args: tuple, variant: _Variant, values: list[int]) -> _Variant | None:
+         """The learning variant's tape with its opaque calls bound (bind_opaque)
+         at their keys at its traced call, each learned (_learn) unless it binds,
+@@ -796,6 +896,8 @@
+                     pool = torch.cuda.MemPool()
+                 with torch.cuda.use_mem_pool(pool, opaque_key.device) if pool is not None else contextlib.nullcontext():
+                     binding = self._learn(site.op, site.provider, site.call, opaque_key)
++                if binding is not None and self._warmed and self._inside_warm_up(args):
++                    self.warm_up_misses += 1
+             keys[memo] = (opaque_key, binding)
+             bindings.append((i, key, binding))
+         del pool
+@@ -1449,6 +1551,124 @@
+         return _Variant(captured, memory, native_variant(spec))
+ 
+ 
++def _site_signature(site: Any, signatures: dict[Any, int]) -> int:
++    # a lowered keyed site's key but for its ints, numbered (an unhashable
++    # scalar: the site alone)
++    try:
++        static = (site.site.op, site.dtypes, site.ranks, site.site.scalars, site.device, site.site.state, site.alias)
++        hash(static)
++    except TypeError:
++        static = ("site", id(site))
++    return signatures.setdefault(static, len(signatures))
++
++
++class _KeyProgram:
++    """The rows of a lowered tape that its keyed sites' keys, its validity and
++    its selectors read, with each row that reads none of the `moved` inputs
++    folded to its value at a template call: warm_up evaluates these alone at
++    each point, and the sites that read the same rows at the same signature
++    once. The argument overlap check is not evaluated (a call the native
++    evaluation would refuse for an overlap learns its keys all the same)."""
++
++    def __init__(self, compiled: Any, valid: int, predicates: list[int], groups: list[tuple[int, tuple[int, ...]]]) -> None:
++        self.compiled = compiled
++        self.valid = valid
++        self.predicates = predicates
++        self.groups = groups  # (a site, its key's rows here) per distinct key formula
++        self.getters = [(i, operator.itemgetter(*rows) if len(rows) > 1 else lambda v, r=rows: tuple(v[j] for j in r)) for i, rows in groups]
++
++    @staticmethod
++    def of(lowered: Any, template: tuple, moved: set[int]) -> _KeyProgram | None:
++        result = lowered.compiled.evaluate_inputs(template)
++        if result is None or result[0] != Status.SUCCESS:
++            return None
++        values = result[1]
++        rows = lowered.program.instructions
++        leaf = ("boxed", "pointer", "storage_offset", "size", "stride")
++        reads = [False] * len(rows)
++        for i, row in enumerate(rows):
++            if row[0] in leaf:
++                reads[i] = row[1] in moved
++            elif row[0] != "constant":
++                reads[i] = any(reads[j] for j in row[1:])
++        targets = [lowered.valid, *(s.predicate for s in lowered.selectors), *(r for site in lowered.sites for r in site.rows)]
++        keep: set[int] = set()
++        stack = list(targets)
++        while stack:
++            i = stack.pop()
++            if i not in keep:
++                keep.add(i)
++                if reads[i] and rows[i][0] not in leaf:
++                    stack.extend(rows[i][1:])
++        order = sorted(keep)
++        at = {i: j for j, i in enumerate(order)}
++        spec = [rows[i] if rows[i][0] in leaf and reads[i] else (rows[i][0], *(at[j] for j in rows[i][1:])) if reads[i] else ("constant", values[i]) for i in order]
++        groups: dict[tuple, tuple[int, tuple[int, ...]]] = {}
++        signatures: dict[Any, int] = {}
++        for i, site in enumerate(lowered.sites):
++            here = tuple(at[r] for r in site.rows)
++            groups.setdefault((_site_signature(site, signatures), here), (i, here))
++        return _KeyProgram(
++            torch._C._HostTraceProgram(spec, len(template)),
++            at[lowered.valid],
++            [at[s.predicate] for s in lowered.selectors],
++            list(groups.values()),
++        )
++
++    def keys(self, call: tuple) -> list[tuple[int, tuple[int, ...]]] | None:
++        """Per distinct key formula (a site, its key) at `call`; [] when the
++        variant does not hold there; None when a selector's own guards do
++        not hold (which entry it takes is the native evaluation's)."""
++        result = self.compiled.evaluate_inputs(call)
++        if result is None or result[0] != Status.SUCCESS or result[1][self.valid] != 1:
++            return []
++        values = result[1]
++        if any(values[p] != 1 for p in self.predicates):
++            return None
++        return [(i, get(values)) for i, get in self.getters]
++
++
++@dataclass
++class WarmUp:
++    """What HostTraceReplay.warm_up did: the calls its ranges declare, how many
++    of them a variant holds (the rest would trace), the distinct keys of those,
++    and how many it learned or found refused (the rest were bound)."""
++
++    calls: int
++    symbols: int
++    held: int = 0
++    keys: int = 0
++    learned: int = 0
++    refused: int = 0
++    seconds: float = 0.0
++
++
++def _resized(args: tuple, sizes: dict[tuple[int, int | None], int]) -> tuple:
++    """args with the (argument, dim) sizes given, each resized argument a view
++    at its address that owns nothing (its contents are never read): strides
++    of a contiguous argument follow its sizes, others keep theirs. An int
++    argument (dim None) moves by the value given (its symbol's change)."""
++    from torch._prims_common import make_contiguous_strides_for
++
++    out = list(args)
++    for (a, d), delta in sizes.items():
++        if d is None:
++            out[a] = args[a] + delta
++    for a in {a for a, d in sizes if d is not None}:
++        t = args[a]
++        shape = list(t.shape)
++        for (b, d), n in sizes.items():
++            if b == a and d is not None:
++                shape[d] = n
++        strides = make_contiguous_strides_for(shape) if t.is_contiguous() else t.stride()
++        span = 1 + sum((n - 1) * st for n, st in zip(shape, strides)) if all(shape) else 0
++        storage = torch._C._construct_storage_from_data_pointer(
++            t.untyped_storage().data_ptr(), t.device, (t.storage_offset() + span) * t.element_size()
++        )
++        out[a] = torch.empty(0, dtype=t.dtype, device=t.device).set_(storage, t.storage_offset(), shape, strides)
++    return tuple(out)
++
++
+ def _site_classes(sites: Sequence[LoweredKeyedSite]) -> list[int]:
+     """Per keyed site, a class: equal for sites whose OpaqueKey is the same
+     function of the key values (_opaque_key's other inputs equal)."""

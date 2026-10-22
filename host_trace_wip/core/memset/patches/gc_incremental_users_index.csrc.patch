@@ -1,0 +1,328 @@
+--- a/torch/csrc/cuda/host_trace/Variant.h	2026-10-16 09:49:28.522469907 -0700
++++ b/torch/csrc/cuda/host_trace/Variant.h	2026-10-17 14:11:00.864779017 -0700
+@@ -17,6 +17,7 @@
+ #include <mutex>
+ #include <optional>
+ #include <string>
++#include <tuple>
+ #include <unordered_map>
+ #include <utility>
+ #include <vector>
+@@ -45,6 +46,9 @@
+ // test-only: a form's sites whose pieces were not packed (nothing they read
+ // changed since that form's last replay)
+ extern int64_t piece_skips;
++// users index rebuilds (index_users), and keyed rows added without one (row_added)
++extern int64_t index_builds;
++extern int64_t rows_unindexed;
+ // test-only: with phase_timing, each phase of the replays' host time in ns
+ extern bool phase_timing;
+ extern std::array<int64_t, 16> phase_ns;
+@@ -566,6 +570,9 @@
+       std::vector<CUgraphNode> nodes; // per record, in its range's graph
+       std::vector<CUgraphNode> piece_nodes; // per piece of the form
+       std::vector<size_t> piece_range; // per piece
++      // test and diagnosis: per section, calls that set any of its nodes,
++      // the nodes set, and its launches
++      std::vector<int64_t> calls_set, nodes_set, launches;
+     };
+     std::vector<Split> splits; // per form
+     // an RNG segment's: the generator its kernels draw from, its capture's
+@@ -754,7 +761,12 @@
+   static int64_t select(const Site& s, const int64_t* values);
+   void insert(Site& s, const int64_t* key, int64_t row);
+   // adds the entry's kernel rows' reads to s.reads
+-  static void note_reads(Site& s, const Entry& e);
++  // adds the entry's reads to the site's; whether any is new
++  static bool note_reads(Site& s, const Entry& e);
++  // whether the site's piece reads (index_users) cover the entry's
++  static bool pieces_cover(const Site& s, const Entry& e);
++  // a keyed row added: its reads noted, the users index rebuilt only if they are new
++  void row_added(Site& s, const Entry& e);
+   // after a site gains an entry: the index of users is rebuilt at the next
+   // commit, keeping what the records hold
+   void rows_added();
+@@ -775,6 +787,19 @@
+   std::vector<size_t> split_bounds(Segment& run);
+  public:
+   // test-only: a form's section bounds once built (empty: not split)
++  // per section of a form's split (empty: not split): (calls that set any of
++  // its nodes, nodes set, launches)
++  std::vector<std::tuple<int64_t, int64_t, int64_t>> split_section_counts(size_t segment, size_t form) const {
++    const Segment& run = segments_.at(segment);
++    std::vector<std::tuple<int64_t, int64_t, int64_t>> out;
++    if (form < run.splits.size() && run.splits[form].ok) {
++      const Segment::Split& sp = run.splits[form];
++      for (size_t k = 0; k < sp.launches.size(); ++k) {
++        out.emplace_back(sp.calls_set[k], sp.nodes_set[k], sp.launches[k]);
++      }
++    }
++    return out;
++  }
+   std::vector<size_t> split_bounds_of(size_t segment, size_t form) const {
+     const Segment& run = segments_.at(segment);
+     return form < run.splits.size() && run.splits[form].ok ? run.splits[form].bounds : std::vector<size_t>();
+--- a/torch/csrc/cuda/host_trace/Sites.cpp	2026-10-15 21:29:28.955413979 -0700
++++ b/torch/csrc/cuda/host_trace/Sites.cpp	2026-10-17 14:11:00.865072267 -0700
+@@ -809,18 +809,23 @@
+   users_stale_ = true;
+ }
+ 
+-void HostTraceVariant::note_reads(Site& s, const Entry& e) {
++bool HostTraceVariant::note_reads(Site& s, const Entry& e) {
++  bool added = false;
+   if (s.reads.size() < e.kernels.size()) {
+     s.reads.resize(e.kernels.size());
++    added = true;
+   }
+   for (size_t i = 0; i < e.kernels.size(); ++i) {
+     const KernelRow& k = e.kernels[i];
+     Site::Reads& r = s.reads[i];
+-    r.always |= k.rng_increment != 0 || !k.rng.empty() || !k.cpu_scalars.empty();
++    const bool always = k.rng_increment != 0 || !k.rng.empty() || !k.cpu_scalars.empty();
++    added |= always && !r.always;
++    r.always |= always;
+     for (size_t j = 0; j < k.field_count; ++j) {
+       const std::pair<int64_t, int64_t> f{k.fields[j].row, k.fields[j].base};
+       if (std::find(r.fields.begin(), r.fields.end(), f) == r.fields.end()) {
+         r.fields.push_back(f);
++        added = true;
+       }
+     }
+     for (int64_t row : k.dim_rows) {
+@@ -828,9 +833,60 @@
+           std::find(r.dim_rows.begin(), r.dim_rows.end(), row) ==
+               r.dim_rows.end()) {
+         r.dim_rows.push_back(row);
++        added = true;
+       }
+     }
+   }
++  return added;
++}
++
++bool HostTraceVariant::pieces_cover(const Site& s, const Entry& e) {
++  auto has = [](const std::vector<int64_t>& v, int64_t x) {
++    return std::binary_search(v.begin(), v.end(), x);
++  };
++  auto field = [&](const Field& f) {
++    return has(s.piece_rows, f.row) && (f.base < 0 || has(s.piece_bases, f.base));
++  };
++  for (const KernelRow& k : e.kernels) {
++    if (!s.piece_always &&
++        (k.rng_increment != 0 || !k.rng.empty() || !k.cpu_scalars.empty())) {
++      return false;
++    }
++    for (size_t j = 0; j < k.field_count; ++j) {
++      if (!field(k.fields[j])) {
++        return false;
++      }
++    }
++    if (!k.constant_dims &&
++        !std::all_of(k.dim_rows.begin(), k.dim_rows.end(), [&](int64_t r) { return has(s.piece_rows, r); })) {
++      return false;
++    }
++  }
++  for (const MemsetRow& m : e.memsets) {
++    if (!field(m.dst) ||
++        (!m.constant_shape &&
++         !std::all_of(m.shape_rows.begin(), m.shape_rows.end(), [&](int64_t r) { return has(s.piece_rows, r); }))) {
++      return false;
++    }
++  }
++  for (const MemcpyRow& m : e.memcpys) {
++    if (!field(m.dst) || !field(m.src) || !has(s.piece_rows, m.bytes_row)) {
++      return false;
++    }
++  }
++  return true;
++}
++
++void HostTraceVariant::row_added(Site& s, const Entry& e) {
++  // a row that reads only what the site's rows read already leaves the users
++  // index as it is (index_users): the call that selects it marks its records
++  // (seen_sites_); else the index is rebuilt, keeping what the records hold
++  const bool read = note_reads(s, e);
++  if (read || users_stale_ || !pieces_cover(s, e)) {
++    rows_added();
++  } else {
++    ++rows_unindexed;
++  }
+ }
+ 
+ void HostTraceVariant::set_program(const HostTraceProgram& program) {
+@@ -915,10 +971,9 @@
+           e->kernels[i], e->image.data(), e->held.data(), e->fields.data());
+     }
+   }
+-  note_reads(s, *e);
++  row_added(s, *e);
+   s.entries.push_back(std::move(e));
+   insert(s, key.data(), static_cast<int64_t>(s.entries.size()));
+-  rows_added();
+   if (arm != 0 &&
+       std::find(armed_.begin(), armed_.end(), s.segment) == armed_.end()) {
+     armed_.push_back(s.segment);
+--- a/torch/csrc/cuda/host_trace/Entry.cpp	2026-10-16 10:43:15.135030476 -0700
++++ b/torch/csrc/cuda/host_trace/Entry.cpp	2026-10-17 14:11:00.865173387 -0700
+@@ -1732,12 +1732,23 @@
+ // cannot become part of a reference cycle, its reference count frees it as before, and a later walk stops at it.
+ constexpr int64_t GC_DESCEND = 1, GC_IMMUTABLE = 2, GC_CLEAN = 4, GC_FINAL = 8, GC_CONTAINER = 16, GC_KEEP = 32;
+ 
++// test and diagnosis: objects the walks visited, and old objects incremental walks did not walk again
++int64_t gc_untrack_walked = 0;
++int64_t gc_untrack_old_skips = 0;
++
+ int collect_referent(PyObject* o, void* arg) {
+   static_cast<std::vector<PyObject*>*>(arg)->push_back(o);
+   return 0;
+ }
+ 
+-int64_t gc_untrack(const py::iterable& roots, const py::dict& kinds, const py::function& classify) {
++// With `young` (gc.get_objects(generation=0) at the settle, which the walk empties: collections are held through a
++// slow call, so it holds every object the call made), an immutable or final object outside it that is still tracked
++// is not walked again and stays tracked: it was made before an earlier settle, whose walk left it tracked, and nothing
++// it refers to has changed since. The walk then costs the call's new objects and the mutable objects and containers
++// on the way to them, not every object a variant keeps tracked; it untracks a subset of what a full walk would (a
++// referent of an old object that has become sealable since is not seen). With `dry`, nothing is untracked: the
++// objects the walk would untrack are returned (a test's comparison of the two walks).
++py::object gc_untrack(const py::iterable& roots, const py::dict& kinds, const py::function& classify, const py::object& young, bool dry) {
+   std::unordered_map<PyTypeObject*, int64_t> flags_of;
+   auto flags = [&](PyObject* o) {
+     PyTypeObject* t = Py_TYPE(o);
+@@ -1766,8 +1777,24 @@
+   std::vector<size_t> walked;  // nodes whose referents are walked
+   std::vector<PyObject*> raw;  // their referents, resolved into `edges`
+   std::vector<PyObject*> stack;
++  std::unordered_set<PyObject*> root_set;
+   for (py::handle root : roots) {
+     stack.push_back(root.ptr());
++    root_set.insert(root.ptr());
++  }
++  const bool incremental = !young.is_none();
++  std::unordered_set<PyObject*> young_set;
++  if (incremental) {
++    TORCH_CHECK_TYPE(PyList_Check(young.ptr()), "young must be a list");
++    const Py_ssize_t count = PyList_GET_SIZE(young.ptr());
++    young_set.reserve(static_cast<size_t>(count));
++    for (Py_ssize_t i = 0; i < count; ++i) {
++      young_set.insert(PyList_GET_ITEM(young.ptr(), i));
++    }
++    // the list's references would count against a container's final (its reference count)
++    if (PyList_SetSlice(young.ptr(), 0, count, nullptr) != 0) {
++      throw py::error_already_set();
++    }
+   }
+   while (!stack.empty()) {
+     PyObject* o = stack.back();
+@@ -1785,6 +1812,12 @@
+       n.sealed = (f & GC_CLEAN) ? 1 : 0;
+       continue;
+     }
++    if (incremental && (f & (GC_IMMUTABLE | GC_FINAL)) && !(f & GC_CONTAINER) && PyObject_GC_IsTracked(o) &&
++        !young_set.count(o) && !root_set.count(o)) {
++      ++gc_untrack_old_skips;
++      n.sealed = 0;  // an earlier settle's: left tracked then, and what it refers to is as it was
++      continue;
++    }
+     if (untrackable && !PyObject_GC_IsTracked(o)) {
+       n.sealed = 1;  // untracked by an earlier walk, or a tuple CPython untracked (nothing tracked in it)
+       continue;
+@@ -1917,15 +1950,24 @@
+     }
+   }
+   int64_t untracked = 0;
++  py::list would;
+   for (size_t i : walked) {
+     const Node& n = nodes[i];
+     if (n.sealed == 1 && (n.flags & (GC_IMMUTABLE | GC_FINAL | GC_CONTAINER)) && !(n.flags & GC_KEEP) &&
+         PyObject_GC_IsTracked(n.obj)) {
+-      PyObject_GC_UnTrack(n.obj);
++      if (dry) {
++        would.append(py::handle(n.obj));
++      } else {
++        PyObject_GC_UnTrack(n.obj);
++      }
+       ++untracked;
+     }
+   }
+-  return untracked;
++  gc_untrack_walked += static_cast<int64_t>(nodes.size());
++  if (dry) {
++    return std::move(would);
++  }
++  return py::int_(untracked);
+ }
+ 
+ } // namespace
+@@ -1995,7 +2037,17 @@
+   m.attr("_host_trace_section_entries") = true;
+   // and launches the driver's map as is (a descriptor's library bits)
+   m.attr("_host_trace_tma_raw") = true;
+-  m.def("_host_trace_gc_untrack", &gc_untrack, py::arg("roots"), py::arg("kinds"), py::arg("classify"));
++  m.def(
++      "_host_trace_gc_untrack",
++      &gc_untrack,
++      py::arg("roots"),
++      py::arg("kinds"),
++      py::arg("classify"),
++      py::arg("young") = py::none(),
++      py::arg("dry") = false);
++  // _host_trace_gc_untrack takes `young` (incremental walks) and `dry`
++  m.attr("_host_trace_gc_untrack_incremental") = true;
++  m.def("_host_trace_gc_untrack_counts", [] { return std::make_pair(gc_untrack_walked, gc_untrack_old_skips); });
+   m.def("_host_trace_global_state", [] {
+     std::vector<int64_t> state;
+     append_global_state(state);
+@@ -2046,7 +2098,9 @@
+       py::arg("first_nodes") = py::none(),
+       py::arg("max_nodes") = py::none());
+   m.def("_host_trace_split_bounds", [](HostTraceVariant& v, size_t segment, size_t form) { return v.split_bounds_of(segment, form); });
++  m.def("_host_trace_split_section_counts", [](HostTraceVariant& v, size_t segment, size_t form) { return v.split_section_counts(segment, form); });
+   m.def("_host_trace_piece_skips", [] { return piece_skips; });
++  m.def("_host_trace_index_counts", [] { return std::make_pair(index_builds, rows_unindexed); });
+   m.def("_host_trace_buffered_runs", [] { return buffered_runs; });
+   m.def("_host_trace_delta_counts", [] {
+     return py::make_tuple(delta_skips, delta_partials, delta_fulls, delta_rows_evaluated);
+--- a/torch/csrc/cuda/host_trace/Patch.cpp	2026-10-16 09:49:28.522206193 -0700
++++ b/torch/csrc/cuda/host_trace/Patch.cpp	2026-10-17 14:14:34.364953503 -0700
+@@ -23,6 +23,8 @@
+ int64_t kernel_node_sets = 0;
+ int64_t kernel_row_switches = 0;
+ int64_t piece_skips = 0;
++int64_t index_builds = 0;
++int64_t rows_unindexed = 0;
+ bool split_enabled = false;
+ int64_t split_sections = 4;
+ double split_ratio = 4.0;
+@@ -263,6 +265,7 @@
+ } // namespace
+ 
+ void HostTraceVariant::index_users() {
++  ++index_builds;
+   // with users_kept_ (only rows were added since the last index), the rows and
+   // bases some record read before, to keep their seen values
+   std::vector<bool> tracked_rows, tracked_bases;
+@@ -811,6 +814,9 @@
+     C10_CUDA_CHECK(cudaGraphUpload(exec, at::cuda::getCurrentCUDAStream(device_)));
+   }
+   ++split_builds;
++  sp.calls_set.assign(sp.execs.size(), 0);
++  sp.nodes_set.assign(sp.execs.size(), 0);
++  sp.launches.assign(sp.execs.size(), 0);
+   sp.ok = true;
+   return true;
+ }
+@@ -1105,7 +1111,12 @@
+     const cudaStream_t stream = at::cuda::getCurrentCUDAStream(device_);
+     for (size_t k = 0; k + 1 < sp->bounds.size(); ++k) {
+       exec = sp->execs[k];
++      const int64_t before = kernel_node_sets + memory_node_sets;
+       patch_range(static_cast<int64_t>(k));
++      const int64_t set = kernel_node_sets + memory_node_sets - before;
++      sp->calls_set[k] += set > 0;
++      sp->nodes_set[k] += set;
++      ++sp->launches[k];
+       ++graph_launches;
+       // the first launch runs the graph's replay prologue, once per call
+       if (k == 0) {

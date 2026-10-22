@@ -1,0 +1,443 @@
+diff -ruN -x __pycache__ -x TREE.txt step_ms12/test/test_cuda_host_trace_lower.py wip14/test/test_cuda_host_trace_lower.py
+--- a/test/test_cuda_host_trace_lower.py	2026-10-12 08:31:19.176773977 -0700
++++ b/test/test_cuda_host_trace_lower.py	2026-10-15 19:11:23.352250585 -0700
+@@ -240,6 +240,19 @@
+             if ok:
+                 self.assertEqual(outputs[row], -s)
+ 
++    def test_total_reads_the_rows_before_it_and_keeps_its_own(self):
++        # inside total a row lowered before is reused; one lowered inside is not memoized past it
++        program = IntegerProgram(list(HINT))
++        lowering = Lowering(program, {S: ("boxed", 2), T: ("boxed", 3)})
++        before = lowering.lower(S + 1)
++        with lowering.total():
++            self.assertEqual(lowering.lower(S + 1), before)
++            inside = lowering.lower(S * T + 1)
++            with lowering.total():
++                self.assertEqual((lowering.lower(S + 1), lowering.lower(S * T + 1)), (before, inside))
++        self.assertNotIn(S * T + 1, lowering._memo)
++        self.assertEqual(lowering.lower(S + 1), before)
++
+     def test_ir_rounded_quotients(self):
+         # the IR backend's ceil of an int ratio (a ceildiv node) takes the same bound
+         E = 2**53
+diff -ruN -x __pycache__ -x TREE.txt step_ms12/test/test_cuda_host_trace_replay.py wip14/test/test_cuda_host_trace_replay.py
+--- a/test/test_cuda_host_trace_replay.py	2026-10-15 16:26:16.397595527 -0700
++++ b/test/test_cuda_host_trace_replay.py	2026-10-15 19:22:02.363545079 -0700
+@@ -3,6 +3,7 @@
+ import builtins
+ import ctypes
+ import dataclasses
++import functools
+ import gc
+ import itertools
+ import os
+@@ -359,6 +360,53 @@
+     return None
+ 
+ 
++# a stable-ABI op (vLLM's _C_stable_libtorch ops) whose host code reads its input's element count
++_STABLE_NUMEL = r"""
++#include <cuda_runtime.h>
++#include <torch/csrc/stable/accelerator.h>
++#include <torch/csrc/stable/library.h>
++#include <torch/csrc/stable/ops.h>
++#include <torch/csrc/stable/tensor.h>
++
++using torch::stable::Tensor;
++
++__global__ void scale_by_count(const float* x, float* y, int64_t n) {
++  int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x;
++  if (i < n) {
++    y[i] = x[i] * n;
++  }
++}
++
++Tensor scale_by_numel(Tensor x) {
++  int64_t n = x.numel();
++  torch::stable::accelerator::DeviceGuard guard(x.get_device_index());
++  Tensor y = torch::stable::empty_like(x);
++  void* stream = nullptr;
++  TORCH_ERROR_CODE_CHECK(aoti_torch_get_current_cuda_stream(x.get_device_index(), &stream));
++  scale_by_count<<<(n + 255) / 256, 256, 0, static_cast<cudaStream_t>(stream)>>>(
++      reinterpret_cast<const float*>(x.data_ptr()), reinterpret_cast<float*>(y.data_ptr()), n);
++  return y;
++}
++
++STABLE_TORCH_LIBRARY(ht_stable, m) {
++  m.def("scale_by_numel(Tensor x) -> Tensor");
++}
++
++STABLE_TORCH_LIBRARY_IMPL(ht_stable, CUDA, m) {
++  m.impl("scale_by_numel", TORCH_BOX(&scale_by_numel));
++}
++"""
++
++
++@functools.cache
++def _stable_numel_op():
++    from torch.utils.cpp_extension import load_inline
++
++    load_inline("ht_stable_numel", cpp_sources="", cuda_sources=_STABLE_NUMEL, is_python_module=False, extra_cuda_cflags=["-DUSE_CUDA"])
++    torch.library.register_fake("ht_stable::scale_by_numel")(torch.empty_like)
++    return torch.ops.ht_stable.scale_by_numel
++
++
+ @torch.library.custom_op("host_trace_test::tactic_mul", mutates_args=())
+ def tactic_mul(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+     # a layer's op on its weight (Triton specializes on the weight pointer's 16-byte alignment: a guard on its root)
+@@ -1004,6 +1052,11 @@
+             self.assertEqual(f(*ws, x), fn(*ws, x), atol=0, rtol=0)
+         expected = (1, 1, 2, layers - 2) if static_prefix else (1, 1, layers, 0)
+         self.assertEqual((f.traces, f.redispatches, f.redos, f.redo_instances), expected)
++        # the lowering's argument addresses and first arguments by root, made once, are its tape's
++        (v,) = f.variants
++        lo, inputs = v.captured.lowered.lowering, v.captured.lowered.tape.inputs
++        self.assertEqual(lo.addresses, frozenset(lo.key(r.root.sym) for r in inputs))
++        self.assertEqual(lo.first_inputs, {id(r.root): r for r in reversed(inputs)})
+ 
+     def test_a_static_prefix_weight_at_another_offset_takes_no_template(self):
+         # a static-prefix weight's layout values are constants of the entry and key the read: the second weight's offset
+@@ -1098,6 +1151,27 @@
+         self.assertEqual(seen, [None])
+         self.assertEqual((f.traces, f.redispatches, f.sections, f.retrace_causes), (1, 1, 1, {}))
+ 
++    def test_a_refused_section_is_refused_again_without_a_redo(self):
++        # x's op makes a section the 40-row variant refuses (its output may take its freed input's bytes): (12, 40) traces
++        # a second variant. At (12, 8) neither holds (y's op changes class too) and the first variant is tried first: the
++        # call holds its refused entry's predicate, so it refuses at once with the same refusal, no redo of either op, and
++        # the second variant takes y's section
++        def fn(x, y):
++            return add(split_op_late_output(add(x)), 1).sum() + add(split_op(add(y)), 1).sum()
++
++        f = HostTraceReplay(fn, memory="eager")
++        redos = []
++        for m, n in ((40, 40), (12, 40), (12, 8)):
++            x, y = torch.randn(m, 64, device="cuda"), torch.randn(n, 64, device="cuda")
++            self.assertEqual(f(x, y), fn(x, y), atol=0, rtol=0)
++            redos.append(f.redos)
++        self.assertEqual((f.traces, f.redispatches, f.refused_again), (2, 1, 1))
++        (why,) = [k for k in f.redispatch_refusals if "split_op_late_output" in k]
++        self.assertRegex(why, "shares bytes with allocation")
++        self.assertEqual(f.redispatch_refusals[why], 2)
++        # the last call's redos: y's op in the second variant only
++        self.assertEqual(redos[2] - redos[1], 1)
++
+     @parametrize("memory", ["eager", "run_buffer"])
+     def test_a_section_overlapping_an_allocation_made_within_its_op(self, memory):
+         # as above, but the op's output is made after its first launch: in eager order, or first fit in the run
+@@ -1368,6 +1442,61 @@
+             self.assertIn("the port has no launch", call.reason)
+         self.assertEqual((f.traces, f.replays, f.eager), (1, 2, 0))
+ 
++    def test_a_masked_scalar_setitem_keeps_the_mask_length_symbolic(self):
++        # vLLM's GDN: initial_state[~has_initial_state, ...] = 0. Eager's setitem with a Python number is masked_fill_
++        # of the mask over the leading dims (try_dispatch_masked_fill_), after reading the sizes as ints: traced, the
++        # same masked_fill_ with the sizes symbolic, so one trace takes every sequence count
++        def fn(state, has, cols):
++            state = state * 2
++            state[~has, ...] = 0
++            state[:, cols] = -1.5
++            state[has] = True
++            return state
++
++        f = HostTraceReplay(fn)
++        cols = torch.tensor([True, False, True, False], device="cuda")
++        for n in (3, 7, 1, 16, 5, 7):
++            state, has = torch.randn(n, 4, 8, device="cuda"), torch.rand(n, device="cuda") > 0.5
++            self.assertEqual(f(state, has, cols), fn(state, has, cols), atol=0, rtol=0)
++        self.assertEqual((f.traces, f.eager), (1, 0))
++        calls = [c for v in f.variants for _, c in v.tape.launches if isinstance(c, EagerCall)]
++        self.assertEqual(calls, [])
++
++    def test_a_masked_setitem_of_another_length_raises_as_eager(self):
++        # the mask's length is guarded equal to the tensor's: at another length eager's IndexError, not a broadcast fill
++        def fn(state, has):
++            state = state * 2
++            state[has] = 0
++            return state
++
++        f = HostTraceReplay(fn)
++        for n in (3, 7):
++            state, has = torch.randn(n, 4, device="cuda"), torch.rand(n, device="cuda") > 0.5
++            self.assertEqual(f(state, has), fn(state, has), atol=0, rtol=0)
++        state, has = torch.randn(5, 4, device="cuda"), torch.ones(1, dtype=torch.bool, device="cuda")
++        with self.assertRaisesRegex(IndexError, "shape of the mask"):
++            fn(state, has)
++        with self.assertRaisesRegex(IndexError, "shape of the mask"):
++            f(state, has)
++
++    def test_a_stable_abi_op_reading_its_numel_is_an_eager_step(self):
++        # a stable-ABI op with no port (or one that declines): its CUDA kernel redispatched over symbolic sizes reaches
++        # aoti_torch_get_numel, which raises across the C API boundary; the trace takes that as the host's decline and
++        # runs the op as an eager step on the call's tensors
++        op = _stable_numel_op()
++
++        def fn(x):
++            return op(x * 2) + 1
++
++        calls = [c for _, c in trace(fn, (torch.randn(100, device="cuda"),)).launches if isinstance(c, EagerCall)]
++        self.assertEqual(len(calls), 1)
++        self.assertIn("Cannot call numel() on tensor with symbolic sizes", calls[0].reason)
++        f = HostTraceReplay(fn)
++        for n in (100, 300, 100, 300):
++            x = torch.randn(n, device="cuda")
++            self.assertEqual(f(x), fn(x), atol=0, rtol=0)
++        self.assertEqual((f.traces, f.eager), (1, 0))
++
+     def test_fast_twins_trace_and_replay(self):
+         # split_with_sizes's twin (view) and the extension op's (its fake kernel)
+         op = torch.ops.host_trace_test.tactic_ext.default
+diff -ruN -x __pycache__ -x TREE.txt step_ms12/torch/cuda/_host_trace_ir.py wip14/torch/cuda/_host_trace_ir.py
+--- a/torch/cuda/_host_trace_ir.py	2026-10-15 14:16:32.308152902 -0700
++++ b/torch/cuda/_host_trace_ir.py	2026-10-15 19:14:44.345248847 -0700
+@@ -85,7 +85,7 @@
+ 
+ 
+ if TYPE_CHECKING:
+-    from collections.abc import Iterator
++    from collections.abc import Iterator, Mapping
+ 
+ 
+ INT_OPS = frozenset(
+@@ -1090,7 +1090,7 @@
+             return self.const(f(a.hint))
+         return self.mk(op, (a,), f(a.hint))
+ 
+-    def transfer(self, n: Node, src: Ctx, symbols: dict[str, Node], memo: dict[int, Node]) -> Node:
++    def transfer(self, n: Node, src: Ctx, symbols: Mapping[str, Node], memo: dict[int, Node]) -> Node:
+         """n, a node of `src`, rebuilt here with each symbol the node `symbols`
+         names for it: sympy's xreplace with no sympy step, in this context's
+         canonical forms. KeyError on a node that is not `src`'s or a symbol
+diff -ruN -x __pycache__ -x TREE.txt step_ms12/torch/cuda/_host_trace_lower.py wip14/torch/cuda/_host_trace_lower.py
+--- a/torch/cuda/_host_trace_lower.py	2026-10-12 08:31:19.117773614 -0700
++++ b/torch/cuda/_host_trace_lower.py	2026-10-15 19:11:14.243018589 -0700
+@@ -13,7 +13,7 @@
+ 
+ import contextlib
+ import math
+-from typing import TYPE_CHECKING
++from typing import Any, TYPE_CHECKING
+ 
+ import sympy
+ from sympy.logic.boolalg import BooleanFalse, BooleanTrue
+@@ -79,6 +79,21 @@
+ }
+ 
+ 
++class _Inner(dict):
++    """A memo inside Lowering.total: its own rows, and the enclosing memo's
++    read through (not copied: a lowering's memo grows with its program)."""
++
++    __slots__ = ("outer",)
++
++    def __init__(self, outer: dict) -> None:
++        super().__init__()
++        self.outer = outer
++
++    def get(self, key: Any, default: Any = None) -> Any:
++        row = dict.get(self, key)
++        return self.outer.get(key, default) if row is None else row
++
++
+ class Lowering:
+     """Lowers sympy integer and boolean expressions into `program`.
+ 
+@@ -104,7 +119,7 @@
+         where they equal the expressions (IntegerProgram.domains). None is
+         reused outside."""
+         memo, float_memo = self._memo, self._float_memo
+-        self._memo, self._float_memo, self.program.domains = dict(memo), dict(float_memo), []
++        self._memo, self._float_memo, self.program.domains = _Inner(memo), _Inner(float_memo), []
+         try:
+             yield self.program.domains
+         finally:
+diff -ruN -x __pycache__ -x TREE.txt step_ms12/torch/cuda/_host_trace_lower_tape.py wip14/torch/cuda/_host_trace_lower_tape.py
+--- a/torch/cuda/_host_trace_lower_tape.py	2026-10-15 14:54:30.431207763 -0700
++++ b/torch/cuda/_host_trace_lower_tape.py	2026-10-15 19:04:20.332249883 -0700
+@@ -433,6 +433,17 @@
+             return self.lowering
+         return Lowering(self.program, {_sym_expr(v): leaf for v, leaf in self._leaves})
+ 
++    @functools.cached_property
++    def addresses(self) -> frozenset:
++        """The arguments' address symbols, as a conjunction takes them (made
++        once: a redispatch's entries and instances each take them)."""
++        return frozenset(self.key(rec.root.sym) for rec in self.tape.inputs)
++
++    @functools.cached_property
++    def first_inputs(self) -> dict[int, Any]:
++        """Per root (by id), its first argument, as _redo's root() takes it."""
++        return {id(rec.root): rec for rec in reversed(self.tape.inputs)}
++
+     def emit(self, op: str, *operands: int) -> int:
+         try:
+             return self.program.emit(op, *operands)
+@@ -675,7 +686,7 @@
+     that is 1 at the calls they hold for: an all-eager tape's, which those
+     calls run eagerly with no trace. Declined as lower_tape is."""
+     lo = _TapeLowering(tape, direct)
+-    addresses = frozenset(lo.key(rec.root.sym) for rec in tape.inputs)
++    addresses = lo.addresses
+     guards = tape.shape_env.records[: tape.guard_count] if lo.ir else tape.guards
+     valid = lo.lowering.predicate(guards, addresses)
+     compiled = compile_program(lo.program)
+@@ -697,7 +708,7 @@
+         e.uncaptured = True
+         raise e
+     lo = _TapeLowering(tape, direct)
+-    addresses = frozenset(lo.key(rec.root.sym) for rec in tape.inputs)
++    addresses = lo.addresses
+     guards = tape.shape_env.records[: tape.guard_count] if lo.ir else tape.guards
+     graph = [guards[i] for i in tape.graph]
+     valid = lo.lowering.predicate(graph, addresses)
+@@ -1067,7 +1078,7 @@
+     # sympy guards in an IR variant: its rename failed at the hints (HintsFail)
+     symbolic = any(isinstance(g, sympy.Basic) for g in guards)
+     low, key = (lo.symbolic, _sym_expr) if symbolic else (lo.lowering, lo.key)
+-    addresses = frozenset(key(rec.root.sym) for rec in lowered.tape.inputs)
++    addresses = frozenset(key(rec.root.sym) for rec in lowered.tape.inputs) if symbolic else lo.addresses
+     temporaries = []
+     # the other entries' rows are evaluated at this one's calls
+     with low.total() as domains:
+diff -ruN -x __pycache__ -x TREE.txt step_ms12/torch/cuda/_host_trace_redispatch.py wip14/torch/cuda/_host_trace_redispatch.py
+--- a/torch/cuda/_host_trace_redispatch.py	2026-10-15 14:54:30.431536534 -0700
++++ b/torch/cuda/_host_trace_redispatch.py	2026-10-15 19:14:29.200162825 -0700
+@@ -17,6 +17,7 @@
+ 
+ from __future__ import annotations
+ 
++import collections
+ import contextlib
+ import threading
+ from dataclasses import dataclass, replace
+@@ -313,7 +314,7 @@
+     cache_key = (id(t), tuple(map(id, roots)))
+     if cache_key in lo.instance_templates:
+         return lo.instance_templates[cache_key]
+-    recs = {id(i.root): i for i in reversed(old.inputs)}  # each root's first argument, as _redo's root() takes it
++    recs = lo.first_inputs
+     ctx = old.shape_env.ctx
+     subs: dict[str, _ir.Node] = {}
+     pins: list[Any] = []
+@@ -341,15 +342,14 @@
+     if out is not None and not all(roots[p] is r or p in moved for p, r in t.pinned):
+         out = None
+     if out is not None and (pins or subs):
+-        full, memo = {**ctx.symbols, **subs}, {}
++        full, memo = collections.ChainMap(subs, ctx.symbols), {}
+         renamed = [(ctx.transfer(g, ctx, full, memo), None) for g, _ in t.guards if isinstance(g, _ir.Node) and g.free_symbols & subs.keys()]
+         guards = [g for g in (*renamed, *pins) if g[0].op != "true"]
+         predicate = t.predicate
+         if guards:
+-            addresses = frozenset(lo.key(rec.root.sym) for rec in old.inputs)
+             try:
+                 with lo.lowering.total() as domains:
+-                    predicate = lo.emit("and", predicate, lo.lowering.conjunction(guards, addresses))
++                    predicate = lo.emit("and", predicate, lo.lowering.conjunction(guards, lo.addresses))
+                 for ok in domains:
+                     predicate = lo.emit("and", predicate, ok)
+             except Declined:
+diff -ruN -x __pycache__ -x TREE.txt step_ms12/torch/cuda/_host_trace_replay.py wip14/torch/cuda/_host_trace_replay.py
+--- a/torch/cuda/_host_trace_replay.py	2026-10-15 16:19:28.538607815 -0700
++++ b/torch/cuda/_host_trace_replay.py	2026-10-15 19:04:20.329471877 -0700
+@@ -367,6 +367,9 @@
+     # per keyed site, a class shared by the sites whose keys are made alike
+     # (_site_classes): sites of a class at equal key values have one OpaqueKey
+     site_classes: list[int] | None = None
++    # (selector site, its refused entry's predicate row) -> the refusal, per section check_section refused: a redispatch whose
++    # call fails that selector and holds that predicate redoes the op down the same branch to the same section (_redispatch)
++    refused_sections: dict[tuple[int, int], str] = field(default_factory=dict)
+ 
+     @property
+     def tape(self) -> Tape:
+@@ -606,6 +609,8 @@
+         # (_host_trace_redispatch.Template)
+         self.redos = 0
+         self.redo_instances = 0
++        # redispatches refused at once: the call holds a section refusal's predicate (_Variant.refused_sections)
++        self.refused_again = 0
+         # why each trace after the first traced: (class, op, guard, the user's line, refusal) -> count. Class "meta": a
+         # graph guard an op recorded (its outputs' metadata); "dispatch": an op's own guard failed and its
+         # redispatch refused (refusal); "graph": a guard no op recorded; "contract": no variant of the
+@@ -1417,7 +1422,18 @@
+         guards hold the call, gain entries from their ops dispatched again at
+         the call's metadata (_host_trace_redispatch): no trace; else why not."""
+         start = time.perf_counter()
+-        lo = variant.captured.lowered.lowering
++        lowered = variant.captured.lowered
++        failing = set(unselected)
++        for (site, predicate), why in variant.refused_sections.items():
++            if site in failing and predicate < len(values) and values[predicate] == 1:
++                e = FoldRefused(why)
++                e.op = lowered.selectors[site - len(lowered.sites)].op
++                self.redispatch_refusals[why] = self.redispatch_refusals.get(why, 0) + 1
++                self.refused_again += 1
++                self._last_refusal[id(variant.native)] = e.op, why
++                self.redispatch_s += time.perf_counter() - start
++                return e
++        lo = lowered.lowering
+         counts = lo.redos, lo.instances
+         refused = self._add_entries(variant, self.redispatch_refusals, args, redispatch, variant.captured.lowered, args, values, unselected, dispatches, self.opaque, self.static_prefix)
+         self.redos += lo.redos - counts[0]
+@@ -1496,11 +1512,13 @@
+             program, entries = relocate_entries(lowered, relocated, entries, args)
+         ok = self._native_mutate(variant, "a program", variant.native.set_program, program)
+         # every section takes its op's place in the plan, or none is added
+-        for site, _, launches, section in entries if ok else ():
++        for site, predicate, launches, section in entries if ok else ():
+             selector = lowered.selectors[site - len(lowered.sites)]
+             if section is not None and (why := check_section(lowered, variant.memory, selector.nodes, launches, section.temporaries, section.drops)) is not None:
+                 e = FoldRefused(f"{variant.tape.ops[selector.op].func}'s section: {why}")
+                 e.op = selector.op
++                if make is redispatch:
++                    variant.refused_sections[(site, predicate)] = str(e)
+                 lowered.lowering.refused.add(site)
+                 # the entries' guards lower_entries kept: none is the variant's
+                 del lowered.lowering.entry_guards[len(lowered.lowering.entry_guards) - len(entries) :]
+diff -ruN -x __pycache__ -x TREE.txt step_ms12/torch/cuda/_host_trace_tape.py wip14/torch/cuda/_host_trace_tape.py
+--- a/torch/cuda/_host_trace_tape.py	2026-10-15 13:17:46.587187079 -0700
++++ b/torch/cuda/_host_trace_tape.py	2026-10-15 19:21:41.333336810 -0700
+@@ -2620,6 +2620,31 @@
+     return (p, at, width), bits(value)
+ 
+ 
++def _fill_mask(x: torch.Tensor, index: Any, value: Any) -> torch.Tensor | None:
++    """x[index] = value as eager runs it when that is masked_fill_
++    (try_dispatch_masked_fill_): a Python number, and a boolean mask on x's
++    device over x's dims from the full slices before it, then full slices or
++    an Ellipsis. The mask, a size per x dim past it: eager reads the sizes as
++    ints to check they match, which here is a guard on each pair, not a value
++    pin. None for another index or value (Python's indexing, as before)."""
++    if not isinstance(value, (bool, int, float)):
++        return None
++    parts = index if isinstance(index, tuple) else (index,)
++    full = [isinstance(p, slice) and p == slice(None) for p in parts]
++    at = next((i for i, p in enumerate(parts) if not full[i]), None)
++    if at is None:
++        return None
++    mask = parts[at]
++    rest = parts[at + 1 :]
++    if not isinstance(mask, torch.Tensor) or mask.dtype != torch.bool or mask.device != x.device:
++        return None
++    if any(p is not Ellipsis and not f for p, f in zip(rest, full[at + 1 :])) or sum(p is Ellipsis for p in rest) > 1:
++        return None
++    if at + mask.dim() > x.dim() or any(m != n for m, n in zip(mask.shape, x.shape[at:])):
++        return None
++    return mask.view(*mask.shape, *[1] * (x.dim() - at - mask.dim()))
++
++
+ class _TracedTensor(torch.Tensor):
+     """A tensor the host sees during a trace: symbolic sizes, strides and
+     storage offset, no storage; its address is its root's symbol plus the
+@@ -2675,6 +2700,10 @@
+             return super().__getitem__(index)
+ 
+     def __setitem__(self, index: Any, value: Any) -> None:
++        mask = _fill_mask(self, index, value)
++        if mask is not None:
++            self.masked_fill_(mask, value)
++            return
+         with _ir.static_reads(unguarded=True):
+             super().__setitem__(index, value)
+ 

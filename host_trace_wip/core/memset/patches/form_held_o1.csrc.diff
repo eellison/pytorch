@@ -1,0 +1,598 @@
+diff -ru build_cpp_ms3/src/torch/csrc/cuda/host_trace/Entry.cpp build_cpp_ms4/src/torch/csrc/cuda/host_trace/Entry.cpp
+--- build_cpp_ms3/src/torch/csrc/cuda/host_trace/Entry.cpp	2026-10-14 11:28:13.672040815 -0700
++++ build_cpp_ms4/src/torch/csrc/cuda/host_trace/Entry.cpp	2026-10-14 19:47:30.896881914 -0700
+@@ -180,25 +180,29 @@
+ 
+ py::list HostTraceVariant::held_images() const {
+   py::list out;
+-  for (const Record& r : records_) {
+-    if (!r.held) {
+-      out.append(py::none());
+-    } else if (r.kind == Kind::Memset) {
+-      const auto& m = r.held_memset;
+-      out.append(py::make_tuple(m[0], m[1], m[2], m[3]));
+-    } else if (r.kind == Kind::Memcpy) {
+-      const auto& m = r.held_copy;
+-      out.append(py::make_tuple(m[0], m[1], m[2]));
+-    } else {
+-      const KernelRow& k = kernel_row(r, r.held_row);
+-      py::tuple images(k.param_offsets.size());
+-      for (size_t i = 0; i < k.param_offsets.size(); ++i) {
+-        const auto* at = k.held + k.param_offsets[i];
+-        images[i] =
+-            py::bytes(reinterpret_cast<const char*>(at), k.param_sizes[i]);
++  for (const Segment& g : segments_) {
++    for (size_t i = g.first; i < g.stop; ++i) {
++      const Record& r = records_[i];
++      const Segment::Held& h = g.held[g.form][i - g.first];
++      if (!h.held) {
++        out.append(py::none());
++      } else if (r.kind == Kind::Memset) {
++        const auto& m = h.memset;
++        out.append(py::make_tuple(m[0], m[1], m[2], m[3]));
++      } else if (r.kind == Kind::Memcpy) {
++        const auto& m = h.copy;
++        out.append(py::make_tuple(m[0], m[1], m[2]));
++      } else {
++        const KernelRow& k = kernel_row(r, h.row);
++        py::tuple images(k.param_offsets.size());
++        for (size_t j = 0; j < k.param_offsets.size(); ++j) {
++          const auto* at = h.image.data() + k.param_offsets[j];
++          images[j] =
++              py::bytes(reinterpret_cast<const char*>(at), k.param_sizes[j]);
++        }
++        const auto& d = h.dims;
++        out.append(py::make_tuple(py::make_tuple(d[0], d[1], d[2]), images));
+       }
+-      const auto& g = r.held_dims;
+-      out.append(py::make_tuple(py::make_tuple(g[0], g[1], g[2]), images));
+     }
+   }
+   return out;
+diff -ru build_cpp_ms3/src/torch/csrc/cuda/host_trace/Patch.cpp build_cpp_ms4/src/torch/csrc/cuda/host_trace/Patch.cpp
+--- build_cpp_ms3/src/torch/csrc/cuda/host_trace/Patch.cpp	2026-10-14 11:28:13.671126249 -0700
++++ build_cpp_ms4/src/torch/csrc/cuda/host_trace/Patch.cpp	2026-10-14 19:48:29.938915806 -0700
+@@ -258,6 +258,7 @@
+     }
+   };
+   for (uint32_t g = 0; g < segments_.size(); ++g) {
++    const size_t first_pair = rows.size();
+     for (size_t i = segments_[g].first; i < segments_[g].stop; ++i) {
+       const Record& r = records_[i];
+       const auto record = static_cast<uint32_t>(i);
+@@ -306,7 +307,15 @@
+         }
+       }
+     }
++    std::vector<int64_t>& read = segments_[g].read_rows;
++    read.clear();
++    for (size_t j = first_pair; j < rows.size(); ++j) {
++      read.push_back(rows[j].first);
++    }
++    std::sort(read.begin(), read.end());
++    read.erase(std::unique(read.begin(), read.end()), read.end());
+   }
++  ++users_version_;
+   to_csr(rows, program_.num_rows(), users_.row_first, users_.row_records);
+   to_csr(bases, base_count_, users_.base_first, users_.base_records);
+   to_csr(
+@@ -399,48 +408,97 @@
+   delta_marked_ = generation != 0 && delta_valid_;
+ }
+ 
+-void HostTraceVariant::switch_form_held(Segment& run, size_t form) {
+-  // A keyed row's held image is shared by its site node's record and the
+-  // pieces at that node, live in different forms: each form keeps its own copy
++std::vector<HostTraceVariant::Segment::Held>& HostTraceVariant::form_held(
++    Segment& run,
++    size_t form) {
++  if (run.held.size() < run.execs.size()) {
++    run.held.resize(run.execs.size());
++  }
++  std::vector<Segment::Held>& held = run.held[form];
++  if (held.empty()) {
++    const size_t n = run.stop - run.first;
++    held.resize(n + (form == 0 ? 0 : run.clones[form - 1].pieces.size()));
++    const std::vector<Segment::Held>& now = run.held[run.form];
++    for (size_t i = 0; i < n && i < now.size(); ++i) {
++      held[i].copy = now[i].copy;
++    }
++  }
++  return held;
++}
++
++void HostTraceVariant::switch_form(
++    Segment& run,
++    size_t form,
++    const Frame& frame) {
++  std::vector<Segment::Held>& next = form_held(run, form);
++  uint8_t* dirty = dirty_.data() + run.first;
+   const size_t n = run.stop - run.first;
+-  auto slot = [&](size_t f, size_t i) -> Record* {
+-    if (i >= n) {
+-      return &run.clones[f - 1].pieces[i - n];
+-    }
+-    const bool live = f == 0 ? records_[run.first + i].node != nullptr
+-                             : run.clones[f - 1].nodes[i] != nullptr;
+-    return live ? &records_[run.first + i] : nullptr;
++  if (!form_held_enabled) {
++    // the form's exec as unknown
++    for (Segment::Held& h : next) {
++      h.held = false;
++    }
++    std::fill(dirty, dirty + n, 1);
++    run.form = form;
++    return;
++  }
++  const int64_t* v = frame.values.data();
++  const int64_t* bases = frame.bases.data();
++  const size_t g = &run - segments_.data();
++  const uint32_t* segment_bases = users_.segment_bases.data() + users_.segment_first[g];
++  const size_t base_count = users_.segment_first[g + 1] - users_.segment_first[g];
++  if (run.seen.size() < run.execs.size()) {
++    run.seen.resize(run.execs.size());
++  }
++  // the current form's records are clean at the call's rows, bases and site
++  // rows but those dirty_ marks
++  Segment::Seen& a = run.seen[run.form];
++  a.rows.resize(run.read_rows.size());
++  for (size_t j = 0; j < run.read_rows.size(); ++j) {
++    a.rows[j] = v[run.read_rows[j]];
++  }
++  a.bases.resize(base_count);
++  for (size_t j = 0; j < base_count; ++j) {
++    a.bases[j] = bases[segment_bases[j]];
++  }
++  a.sites.resize(run.sites.size());
++  for (size_t j = 0; j < run.sites.size(); ++j) {
++    a.sites[j] = frame.site_entries[run.sites[j]];
++  }
++  a.dirty.assign(dirty, dirty + n);
++  a.saved = true;
++  a.users_version = users_version_;
++  const Segment::Seen& b = run.seen[form];
++  run.form = form;
++  if (!b.saved || b.users_version != users_version_) {
++    std::fill(dirty, dirty + n, 1);
++    return;
++  }
++  std::copy(b.dirty.begin(), b.dirty.end(), dirty);
++  auto mark_in_run = [&](const std::vector<uint32_t>& first, const std::vector<uint32_t>& records, size_t i) {
++    for (uint32_t k = first[i]; k < first[i + 1]; ++k) {
++      if (records[k] >= run.first && records[k] < run.stop) {
++        dirty_[records[k]] = 1;
++      }
++    }
+   };
+-  run.form_held.resize(run.execs.size());
+-  auto& saved = run.form_held[run.form];
+-  saved.resize(n + (run.form == 0 ? 0 : run.clones[run.form - 1].pieces.size()));
+-  for (size_t i = 0; i < saved.size(); ++i) {
+-    Record* r = slot(run.form, i);
+-    Segment::Held& h = saved[i];
+-    h.held = r && r->kind == Kind::Kernel && r->held;
+-    if (h.held) {
+-      const KernelRow& k = kernel_row(*r, r->held_row);
+-      h.row = r->held_row;
+-      h.dims = r->held_dims;
+-      h.image.assign(k.held, k.held + k.nbytes);
+-    }
+-  }
+-  auto& next = run.form_held[form];
+-  next.resize(n + (form == 0 ? 0 : run.clones[form - 1].pieces.size()));
+-  for (size_t i = 0; i < next.size(); ++i) {
+-    Record* r = slot(form, i);
+-    if (!r) {
+-      continue;
++  for (size_t j = 0; j < run.read_rows.size(); ++j) {
++    if (v[run.read_rows[j]] != b.rows[j]) {
++      mark_in_run(users_.row_first, users_.row_records, run.read_rows[j]);
+     }
+-    const Segment::Held& h = next[i];
+-    r->held = h.held;
+-    if (h.held) {
+-      std::memcpy(kernel_row(*r, h.row).held, h.image.data(), h.image.size());
+-      r->held_row = h.row;
+-      r->held_dims = h.dims;
++  }
++  for (size_t j = 0; j < base_count; ++j) {
++    if (bases[segment_bases[j]] != b.bases[j]) {
++      mark_in_run(users_.base_first, users_.base_records, segment_bases[j]);
++    }
++  }
++  for (size_t j = 0; j < run.sites.size(); ++j) {
++    if (frame.site_entries[run.sites[j]] != b.sites[j]) {
++      for (size_t i : sites_[run.sites[j]].records) {
++        dirty_[i] = 1;
++      }
+     }
+   }
+-  run.form = form;
+ }
+ 
+ bool HostTraceVariant::set_argument_copies(Frame& frame) {
+@@ -454,15 +512,17 @@
+     Segment& run = segments_[g];
+     const size_t form =
+         run.forms.size() > 1 ? frame.forms[g] : 0;
++    std::vector<Segment::Held>& form_state = form_held(run, form);
+     for (size_t i = run.first; i < run.stop; ++i) {
+       Record& r = records_[i];
++      Segment::Held& h = form_state[i - run.first];
+       // an entry's memcpy (a section's, in its piece) is set by its row in patch
+       if (r.kind != Kind::Memcpy || (r.site >= 0 && frame.site_entries[r.site] != 0)) {
+         continue;
+       }
+       // an argument's address is its row's value; another operand keeps the
+       // node's (an allocation of the caching allocator's)
+-      std::array<int64_t, 3> held = r.held_copy;
++      std::array<int64_t, 3> held = h.copy;
+       bool moved = false;
+       for (const auto& [f, k] : {std::pair{&r.copy.dst, 0}, std::pair{&r.copy.src, 1}}) {
+         if (f->base < 0) {
+@@ -489,7 +549,7 @@
+       }
+       C10_CUDA_CHECK(set);
+       ++memory_node_sets;
+-      r.held_copy = held;
++      h.copy = held;
+     }
+   }
+   return true;
+@@ -510,30 +570,12 @@
+   const size_t form =
+       run.forms.size() > 1 ? frame.forms[&run - segments_.data()] : 0;
+   Segment::Clone* clone = form == 0 ? nullptr : &run.clones[form - 1];
+-  if (form != run.form && form_held_enabled) {
+-    switch_form_held(run, form);
+-    for (size_t i = run.first; i < run.stop; ++i) {
+-      dirty_[i] = 1;
+-    }
+-  } else if (form != run.form) {
+-    // the form's exec holds its instantiation's parameters
+-    run.form = form;
+-    for (size_t i = run.first; i < run.stop; ++i) {
+-      records_[i].held = false;
+-      dirty_[i] = 1;
+-    }
+-    if (clone) {
+-      for (Record& r : clone->pieces) {
+-        r.held = false;
+-      }
+-    }
+-  }
+   const CUgraphExec exec = run.execs[form];
+   // the philox offsets the segment's RNG calls take before the next, and
+   // the intragraph offset of the current one's kernels
+   int64_t running = 0;
+   int64_t philox = 0;
+-  auto patch = [&](Record& r, CUgraphNode node) {
++  auto patch = [&](Record& r, Segment::Held& h, CUgraphNode node) {
+     const int64_t row = r.site >= 0 ? frame.site_entries[r.site] : 0;
+     if (r.kind == Kind::Memset) {
+       const MemsetRow& m = memset_row(r, row);
+@@ -541,17 +583,17 @@
+       // a node holds its destination's address, not the allocation there
+       // (probe_memset_alloc.py: after a free and reallocation, or a VMM remap,
+       // at the address, the unchanged node writes the new memory)
+-      if (r.held && r.held_row == row && held == r.held_memset) {
++      if (h.held && h.row == row && held == h.memset) {
+         return;
+       }
+-      if (r.held && r.held_row != row && held == r.held_memset) {
+-        const MemsetRow& h = memset_row(r, r.held_row);
+-        if (h.value == m.value && h.element_size == m.element_size) {
+-          r.held_row = row;
++      if (h.held && h.row != row && held == h.memset) {
++        const MemsetRow& before = memset_row(r, h.row);
++        if (before.value == m.value && before.element_size == m.element_size) {
++          h.row = row;
+           return;
+         }
+       }
+-      r.held = false;
++      h.held = false;
+       for (size_t k = 1; k < 4; ++k) {
+         TORCH_CHECK_VALUE(held[k] >= 0, "host_trace: a memset of ", held[k]);
+       }
+@@ -570,9 +612,9 @@
+       TORCH_CHECK(
+           fail_after_setter < 0 || fail_after_setter-- != 0,
+           "host_trace: a failure injected after a setter");
+-      r.held_memset = held;
+-      r.held_row = row;
+-      r.held = true;
++      h.memset = held;
++      h.row = row;
++      h.held = true;
+       return;
+     }
+     if (r.kind == Kind::Memcpy) {
+@@ -580,10 +622,10 @@
+       const std::array<int64_t, 3> held = memcpy_shape(m, v, bases);
+       // a device node holds its operands' addresses; a host one is set every
+       // replay (index_users)
+-      if (r.held && r.held_row == row && held == r.held_copy && m.kind == cudaMemcpyDeviceToDevice) {
++      if (h.held && h.row == row && held == h.copy && m.kind == cudaMemcpyDeviceToDevice) {
+         return;
+       }
+-      r.held = false;
++      h.held = false;
+       TORCH_CHECK_VALUE(held[2] > 0, "host_trace: a memcpy of ", held[2], " bytes");
+       const cudaError_t set = cudaGraphExecMemcpyNodeSetParams1D(
+           reinterpret_cast<cudaGraphExec_t>(exec),
+@@ -602,9 +644,9 @@
+       TORCH_CHECK(
+           fail_after_setter < 0 || fail_after_setter-- != 0,
+           "host_trace: a failure injected after a setter");
+-      r.held_copy = held;
+-      r.held_row = row;
+-      r.held = true;
++      h.copy = held;
++      h.row = row;
++      h.held = true;
+       return;
+     }
+     KernelRow& k = kernel_row(r, row);
+@@ -634,24 +676,23 @@
+         dims[i] = v[k.dim_rows[i]];
+       }
+     }
+-    if (r.held && r.held_row == row && dims == r.held_dims &&
+-        std::memcmp(k.image, k.held, k.nbytes) == 0) {
+-      return;
+-    }
+-    if (r.held && r.held_row != row && dims == r.held_dims) {
++    if (h.held && dims == h.dims && h.image.size() == k.nbytes &&
++        std::memcmp(k.image, h.image.data(), k.nbytes) == 0) {
++      if (h.row == row) {
++        return;
++      }
+       // another key's row whose launch is the node's as it is (a cuBLAS key
+       // of another M running the same kernel at the same grid and arguments)
+-      const KernelRow& h = kernel_row(r, r.held_row);
+-      if (h.params.func == k.params.func && h.param_sizes == k.param_sizes &&
+-          std::memcmp(k.image, h.held, k.nbytes) == 0) {
+-        std::memcpy(k.held, k.image, k.nbytes);
+-        r.held_row = row;
++      const KernelRow& before = kernel_row(r, h.row);
++      if (before.params.func == k.params.func &&
++          before.param_sizes == k.param_sizes) {
++        h.row = row;
+         ++kernel_row_switches;
+         return;
+       }
+     }
+     // a patch cut short leaves the node unknown, never stale
+-    r.held = false;
++    h.held = false;
+     for (int64_t d : dims) {
+       TORCH_CHECK_VALUE(
+           d >= 0 && d <= std::numeric_limits<unsigned int>::max(),
+@@ -672,10 +713,10 @@
+     TORCH_CHECK(
+         fail_after_setter < 0 || fail_after_setter-- != 0,
+         "host_trace: a failure injected after a setter");
+-    std::memcpy(k.held, k.image, k.nbytes);
+-    r.held_dims = dims;
+-    r.held_row = row;
+-    r.held = true;
++    h.image.assign(k.image, k.image + k.nbytes);
++    h.dims = dims;
++    h.row = row;
++    h.held = true;
+   };
+   if (users_stale_) {
+     // a row added by a call from an eager step
+@@ -690,16 +731,22 @@
+       mark(users_.base_first, users_.base_records, b);
+     }
+   }
++  if (form != run.form) {
++    switch_form(run, form, frame);
++  }
++  std::vector<Segment::Held>& held = form_held(run, form);
++  const size_t n = run.stop - run.first;
+   for (size_t i = run.first; i < run.stop; ++i) {
+     CUgraphNode node = clone ? clone->nodes[i - run.first] : records_[i].node;
+     if (node && dirty_[i]) {
+-      patch(records_[i], node);
++      patch(records_[i], held[i - run.first], node);
+       dirty_[i] = always_[i];
+     }
+   }
+   if (clone) {
+-    for (Record& r : clone->pieces) {
+-      patch(r, r.node);
++    for (size_t j = 0; j < clone->pieces.size(); ++j) {
++      Record& r = clone->pieces[j];
++      patch(r, held[n + j], r.node);
+     }
+   }
+   // a replay advances the generator by what the rows' calls take, as eager
+diff -ru build_cpp_ms3/src/torch/csrc/cuda/host_trace/Sites.cpp build_cpp_ms4/src/torch/csrc/cuda/host_trace/Sites.cpp
+--- build_cpp_ms3/src/torch/csrc/cuda/host_trace/Sites.cpp	2026-10-12 07:35:46.234830678 -0700
++++ build_cpp_ms4/src/torch/csrc/cuda/host_trace/Sites.cpp	2026-10-14 19:47:50.443400306 -0700
+@@ -18,7 +18,7 @@
+ bool delta_enabled = true;
+ bool variant_order_enabled = true;
+ bool placement_reuse_enabled = true;
+-bool form_held_enabled = false;
++bool form_held_enabled = true;
+ bool entry_descriptors_enabled = true;
+ 
+ namespace {
+diff -ru build_cpp_ms3/src/torch/csrc/cuda/host_trace/VariantBuild.cpp build_cpp_ms4/src/torch/csrc/cuda/host_trace/VariantBuild.cpp
+--- build_cpp_ms3/src/torch/csrc/cuda/host_trace/VariantBuild.cpp	2026-10-13 19:08:12.059728065 -0700
++++ build_cpp_ms4/src/torch/csrc/cuda/host_trace/VariantBuild.cpp	2026-10-14 19:47:20.046625586 -0700
+@@ -75,7 +75,6 @@
+     Record r{};
+     r.kind = static_cast<Kind>(t[0].cast<uint8_t>());
+     r.node = reinterpret_cast<CUgraphNode>(t[1].cast<uintptr_t>());
+-    r.held = true;
+     r.site = -1;
+     if (r.kind == Kind::Memset) {
+       MemsetRow& m = r.memset;
+@@ -161,30 +160,37 @@
+   TORCH_CHECK_VALUE(
+       trace_rows.size() == rows && trace_bases.size() == base_count_,
+       "the traced call's rows and bases");
+-  for (Record& r : records_) {
+-    if (r.kind == Kind::Memset) {
+-      r.held_memset =
+-          memset_shape(r.memset, trace_rows.data(), trace_bases.data());
+-      continue;
+-    }
+-    if (r.kind == Kind::Memcpy) {
+-      // the node holds the capture's operands (_copy_operands), not the traced
+-      // call's: a later operand at the traced address must still set it
+-      r.held = false;
+-      // what it holds, operands of their kinds of memory (set_argument_copies)
+-      cudaMemcpy3DParms p{};
+-      C10_CUDA_CHECK(cudaGraphMemcpyNodeGetParams(
+-          reinterpret_cast<cudaGraphNode_t>(r.node), &p));
+-      r.held_copy = {
+-          reinterpret_cast<int64_t>(p.dstPtr.ptr),
+-          reinterpret_cast<int64_t>(p.srcPtr.ptr),
+-          static_cast<int64_t>(p.extent.width)};
+-      continue;
+-    }
+-    const KernelRow& k = r.kernel;
+-    pack(k, trace_rows.data(), trace_bases.data(), k.held);
+-    for (size_t i = 0; i < k.dim_rows.size(); ++i) {
+-      r.held_dims[i] = trace_rows[k.dim_rows[i]];
++  for (Segment& g : segments_) {
++    g.held.assign(1, std::vector<Segment::Held>(g.stop - g.first));
++    for (size_t i = g.first; i < g.stop; ++i) {
++      const Record& r = records_[i];
++      Segment::Held& h = g.held[0][i - g.first];
++      if (r.kind == Kind::Memset) {
++        h.held = true;
++        h.memset = memset_shape(r.memset, trace_rows.data(), trace_bases.data());
++        continue;
++      }
++      if (r.kind == Kind::Memcpy) {
++        // the node holds the capture's operands (_copy_operands), not the
++        // traced call's: a later operand at the traced address must still set
++        // it. What it holds, operands of their kinds of memory
++        // (set_argument_copies)
++        cudaMemcpy3DParms p{};
++        C10_CUDA_CHECK(cudaGraphMemcpyNodeGetParams(
++            reinterpret_cast<cudaGraphNode_t>(r.node), &p));
++        h.copy = {
++            reinterpret_cast<int64_t>(p.dstPtr.ptr),
++            reinterpret_cast<int64_t>(p.srcPtr.ptr),
++            static_cast<int64_t>(p.extent.width)};
++        continue;
++      }
++      const KernelRow& k = r.kernel;
++      h.held = true;
++      h.image.resize(k.nbytes);
++      pack(k, trace_rows.data(), trace_bases.data(), h.image.data());
++      for (size_t j = 0; j < k.dim_rows.size(); ++j) {
++        h.dims[j] = trace_rows[k.dim_rows[j]];
++      }
+     }
+   }
+   // each keyed site's table starts with the traced key, its records' own
+diff -ru build_cpp_ms3/src/torch/csrc/cuda/host_trace/Variant.h build_cpp_ms4/src/torch/csrc/cuda/host_trace/Variant.h
+--- build_cpp_ms3/src/torch/csrc/cuda/host_trace/Variant.h	2026-10-14 11:28:13.671597804 -0700
++++ build_cpp_ms4/src/torch/csrc/cuda/host_trace/Variant.h	2026-10-14 19:48:49.011726542 -0700
+@@ -383,22 +383,15 @@
+   // attributes, programmatic edge into it) is fixed at instantiation; a keyed
+   // site's rows share it (a binding of another topology is another variant's).
+   enum class Kind : uint8_t { Kernel, Memset, Memcpy };
++  // What its exec's node holds is per form (Segment::held)
+   struct Record {
+     Kind kind;
+     CUgraphNode node;
+-    bool held;
+-    int64_t held_row; // the row the node holds, as Frame::site_entries
+     int64_t site; // or -1
+     size_t site_pos; // its node's index in the site
+-    // a kernel's
+-    KernelRow kernel;
+-    std::array<int64_t, 7> held_dims;
+-    // a memset's
+-    MemsetRow memset;
+-    std::array<int64_t, 4> held_memset; // address, width, height, pitch
+-    // a memcpy's
+-    MemcpyRow copy;
+-    std::array<int64_t, 3> held_copy; // dst, src, bytes
++    KernelRow kernel; // a kernel's
++    MemsetRow memset; // a memset's
++    MemcpyRow copy; // a memcpy's
+   };
+   // A key's rows, per site node the kernel, memset or (a section's) memcpy of
+   // the node's kind
+@@ -452,7 +445,7 @@
+     // per form its exec, [0] the graph's, and per site in `sites` its arm
+     std::vector<CUgraphExec> execs;
+     std::vector<std::vector<int32_t>> forms;
+-    size_t form; // the one whose exec the records' held parameters are of
++    size_t form; // the form last replayed (dirty_ is relative to its exec)
+     size_t first;
+     size_t stop;
+     std::vector<size_t> sites; // the keyed sites and selectors in it
+@@ -465,15 +458,31 @@
+       std::vector<Record> pieces;
+     };
+     std::vector<Clone> clones;
+-    // with form_held_enabled, per form what its exec's kernel nodes held when
+-    // it last ran: per record, then per piece
++    // per form, what its exec's nodes hold: per record, then per piece of the
++    // form (made at the form's first replay). A memcpy's operands are known
++    // (copy) even where the node is not held
+     struct Held {
+       bool held = false;
+-      int64_t row = 0;
+-      std::array<int64_t, 7> dims{};
+-      std::vector<uint8_t> image;
++      int64_t row = 0; // the row the node holds, as Frame::site_entries
++      std::array<int64_t, 7> dims{}; // a kernel's grid, block, smem
++      std::vector<uint8_t> image; // a kernel's parameter bytes
++      std::array<int64_t, 4> memset{}; // address, width, height, pitch
++      std::array<int64_t, 3> copy{}; // dst, src, bytes
+     };
+-    std::vector<std::vector<Held>> form_held;
++    std::vector<std::vector<Held>> held;
++    // with form_held_enabled, per form left: the rows, bases and site rows its
++    // records were last patched at, and which were dirty then
++    struct Seen {
++      bool saved = false;
++      uint64_t users_version = 0;
++      std::vector<int64_t> rows; // per read_rows
++      std::vector<int64_t> bases; // per segment base (Users::segment_bases)
++      std::vector<int64_t> sites; // per site in `sites`
++      std::vector<uint8_t> dirty; // per record
++    };
++    std::vector<Seen> seen;
++    // the rows its records read (index_users)
++    std::vector<int64_t> read_rows;
+     // an RNG segment's: the generator its kernels draw from, its capture's
+     // seed and offset addresses, and the increment its exec is set to (-1
+     // the capture's)
+@@ -658,7 +667,13 @@
+   // commit, keeping what the records hold
+   void rows_added();
+   KernelRow& kernel_row(Record& r, int64_t row) const;
+-  void switch_form_held(Segment& run, size_t form);
++  // the form's held state, made at its first use (a memcpy's operands taken
++  // from the current form's)
++  std::vector<Segment::Held>& form_held(Segment& run, size_t form);
++  // to another form of the run: with form_held_enabled its nodes keep what
++  // they held and dirty_ marks what changed since its last replay, else none
++  // is held
++  void switch_form(Segment& run, size_t form, const Frame& frame);
+   const KernelRow& kernel_row(const Record& r, int64_t row) const;
+   const MemsetRow& memset_row(const Record& r, int64_t row) const;
+   const MemcpyRow& memcpy_row(const Record& r, int64_t row) const;
+@@ -829,6 +844,8 @@
+   // stale only because entries were added: index_users keeps what the
+   // records hold and the values seen (no full re-patch after a new key)
+   bool users_kept_ = false;
++  // bumped by index_users: a form's Seen is of a version
++  uint64_t users_version_ = 0;
+   std::vector<uint8_t> dirty_; // per record
+   std::vector<uint8_t> always_; // per record
+   // what the clean records were patched at: the rows of users_.rows, the

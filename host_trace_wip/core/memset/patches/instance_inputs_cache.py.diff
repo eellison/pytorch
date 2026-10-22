@@ -1,0 +1,84 @@
+--- a/torch/cuda/_host_trace_lower_tape.py	2026-10-15 14:54:30.431207763 -0700
++++ b/torch/cuda/_host_trace_lower_tape.py	2026-10-15 18:18:05.980608159 -0700
+@@ -433,6 +433,17 @@
+             return self.lowering
+         return Lowering(self.program, {_sym_expr(v): leaf for v, leaf in self._leaves})
+ 
++    @functools.cached_property
++    def addresses(self) -> frozenset:
++        """The arguments' address symbols, as a conjunction takes them (made
++        once: a redispatch's entries and instances each take them)."""
++        return frozenset(self.key(rec.root.sym) for rec in self.tape.inputs)
++
++    @functools.cached_property
++    def first_inputs(self) -> dict[int, Any]:
++        """Per root (by id), its first argument, as _redo's root() takes it."""
++        return {id(rec.root): rec for rec in reversed(self.tape.inputs)}
++
+     def emit(self, op: str, *operands: int) -> int:
+         try:
+             return self.program.emit(op, *operands)
+@@ -675,7 +686,7 @@
+     that is 1 at the calls they hold for: an all-eager tape's, which those
+     calls run eagerly with no trace. Declined as lower_tape is."""
+     lo = _TapeLowering(tape, direct)
+-    addresses = frozenset(lo.key(rec.root.sym) for rec in tape.inputs)
++    addresses = lo.addresses
+     guards = tape.shape_env.records[: tape.guard_count] if lo.ir else tape.guards
+     valid = lo.lowering.predicate(guards, addresses)
+     compiled = compile_program(lo.program)
+@@ -697,7 +708,7 @@
+         e.uncaptured = True
+         raise e
+     lo = _TapeLowering(tape, direct)
+-    addresses = frozenset(lo.key(rec.root.sym) for rec in tape.inputs)
++    addresses = lo.addresses
+     guards = tape.shape_env.records[: tape.guard_count] if lo.ir else tape.guards
+     graph = [guards[i] for i in tape.graph]
+     valid = lo.lowering.predicate(graph, addresses)
+@@ -1067,7 +1078,7 @@
+     # sympy guards in an IR variant: its rename failed at the hints (HintsFail)
+     symbolic = any(isinstance(g, sympy.Basic) for g in guards)
+     low, key = (lo.symbolic, _sym_expr) if symbolic else (lo.lowering, lo.key)
+-    addresses = frozenset(key(rec.root.sym) for rec in lowered.tape.inputs)
++    addresses = frozenset(key(rec.root.sym) for rec in lowered.tape.inputs) if symbolic else lo.addresses
+     temporaries = []
+     # the other entries' rows are evaluated at this one's calls
+     with low.total() as domains:
+--- a/torch/cuda/_host_trace_redispatch.py	2026-10-15 14:54:30.431536534 -0700
++++ b/torch/cuda/_host_trace_redispatch.py	2026-10-15 18:17:56.837288300 -0700
+@@ -313,7 +313,7 @@
+     cache_key = (id(t), tuple(map(id, roots)))
+     if cache_key in lo.instance_templates:
+         return lo.instance_templates[cache_key]
+-    recs = {id(i.root): i for i in reversed(old.inputs)}  # each root's first argument, as _redo's root() takes it
++    recs = lo.first_inputs
+     ctx = old.shape_env.ctx
+     subs: dict[str, _ir.Node] = {}
+     pins: list[Any] = []
+@@ -346,10 +346,9 @@
+         guards = [g for g in (*renamed, *pins) if g[0].op != "true"]
+         predicate = t.predicate
+         if guards:
+-            addresses = frozenset(lo.key(rec.root.sym) for rec in old.inputs)
+             try:
+                 with lo.lowering.total() as domains:
+-                    predicate = lo.emit("and", predicate, lo.lowering.conjunction(guards, addresses))
++                    predicate = lo.emit("and", predicate, lo.lowering.conjunction(guards, lo.addresses))
+                 for ok in domains:
+                     predicate = lo.emit("and", predicate, ok)
+             except Declined:
+--- a/test/test_cuda_host_trace_replay.py	2026-10-15 16:26:16.397595527 -0700
++++ b/test/test_cuda_host_trace_replay.py	2026-10-15 18:18:25.593735204 -0700
+@@ -1004,6 +1004,11 @@
+             self.assertEqual(f(*ws, x), fn(*ws, x), atol=0, rtol=0)
+         expected = (1, 1, 2, layers - 2) if static_prefix else (1, 1, layers, 0)
+         self.assertEqual((f.traces, f.redispatches, f.redos, f.redo_instances), expected)
++        # the lowering's argument addresses and first arguments by root, made once, are its tape's
++        (v,) = f.variants
++        lo, inputs = v.captured.lowered.lowering, v.captured.lowered.tape.inputs
++        self.assertEqual(lo.addresses, frozenset(lo.key(r.root.sym) for r in inputs))
++        self.assertEqual(lo.first_inputs, {id(r.root): r for r in reversed(inputs)})
+ 
+     def test_a_static_prefix_weight_at_another_offset_takes_no_template(self):
+         # a static-prefix weight's layout values are constants of the entry and key the read: the second weight's offset

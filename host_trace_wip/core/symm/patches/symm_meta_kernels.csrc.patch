@@ -1,0 +1,72 @@
+--- a/torch/csrc/distributed/c10d/symm_mem/SymmetricMemory.cpp	2026-09-30 19:11:37.099345478 -0700
++++ b/torch/csrc/distributed/c10d/symm_mem/SymmetricMemory.cpp	2026-10-08 20:36:07.225341367 -0700
+@@ -501,6 +501,57 @@
+   return at::empty_like(local_input);
+ }
+ 
++// the in-place and out= collectives return their written argument (the
++// signatures are their CUDA kernels')
++at::Tensor two_shot_all_reduce_meta(
++    at::Tensor input,
++    // NOLINTNEXTLINE(performance-unnecessary-value-param)
++    std::string reduce_op,
++    // NOLINTNEXTLINE(performance-unnecessary-value-param)
++    std::string group_name) {
++  return input;
++}
++
++at::Tensor two_shot_all_reduce_out_meta(
++    at::Tensor input,
++    // NOLINTNEXTLINE(performance-unnecessary-value-param)
++    std::string reduce_op,
++    // NOLINTNEXTLINE(performance-unnecessary-value-param)
++    std::string group_name,
++    at::Tensor output) {
++  return output;
++}
++
++at::Tensor one_shot_all_reduce_out_meta(
++    const at::Tensor& input,
++    // NOLINTNEXTLINE(performance-unnecessary-value-param)
++    std::string reduce_op,
++    // NOLINTNEXTLINE(performance-unnecessary-value-param)
++    std::string group_name,
++    at::Tensor out) {
++  return out;
++}
++
++at::Tensor one_shot_all_reduce_copy_out_meta(
++    const at::Tensor& symm_buffer,
++    const at::Tensor& local_input,
++    // NOLINTNEXTLINE(performance-unnecessary-value-param)
++    std::string reduce_op,
++    // NOLINTNEXTLINE(performance-unnecessary-value-param)
++    std::string group_name,
++    at::Tensor out) {
++  return out;
++}
++
++at::Tensor reduce_scatter_out_meta(
++    at::Tensor input,
++    // NOLINTNEXTLINE(performance-unnecessary-value-param)
++    std::string group_name,
++    bool split_last_dim,
++    at::Tensor output) {
++  return output;
++}
++
+ TORCH_LIBRARY_FRAGMENT(symm_mem, m) {
+   m.def(
+       "multimem_all_reduce_(Tensor(a!) input, str reduce_op, str group_name) -> Tensor(a!)");
+@@ -621,6 +672,11 @@
+ TORCH_LIBRARY_IMPL(symm_mem, Meta, m) {
+   m.impl("one_shot_all_reduce", one_shot_all_reduce_meta);
+   m.impl("one_shot_all_reduce_copy", one_shot_all_reduce_copy_meta);
++  m.impl("one_shot_all_reduce_out", one_shot_all_reduce_out_meta);
++  m.impl("one_shot_all_reduce_copy_out", one_shot_all_reduce_copy_out_meta);
++  m.impl("two_shot_all_reduce_", two_shot_all_reduce_meta);
++  m.impl("two_shot_all_reduce_out", two_shot_all_reduce_out_meta);
++  m.impl("reduce_scatter_out", reduce_scatter_out_meta);
+ }
+ 
+ } // namespace

@@ -1,0 +1,445 @@
+--- a/test/test_cuda_host_trace_opaque.py
++++ b/test/test_cuda_host_trace_opaque.py
+@@ -794,6 +794,33 @@
+             self.assertEqual(torch._C._host_trace_memory_node_sets() - sets, int(n % 256 == 0 and not again))
+         self.assertEqual((f.traces, f.replays), (traces, replays + 24))
+ 
++    def test_exec_copies_across_forms(self):
++        # bindings of both topologies and two alignments alternate on fixed
++        # inputs: with a copy per form and row, each call launches the copy
++        # that holds it, setting no node once every case has run, bitwise
++        p = TableProvider(style="mixed")
++        f = HostTraceReplay(mul_chain, opaque=(p,))
++        base = torch.randn(4096, device="cuda")
++        cases = [(512, 0), (640, 0), (512, 4), (640, 4)]
++        xs = {c: torch.randn(c[0], device="cuda") for c in cases}
++        prev = torch._C._host_trace_exec_copies(4)
++        try:
++            for _ in range(2):
++                for n, offset in cases:
++                    f(xs[n, offset], base[offset : offset + n])
++            hits = torch._C._host_trace_exec_copy_counts()[0]
++            for i in range(12):
++                n, offset = cases[i % 4]
++                y = base[offset : offset + n]
++                base.normal_()
++                sets = torch._C._host_trace_kernel_node_sets() + torch._C._host_trace_memory_node_sets()
++                self.assertEqual(f(xs[n, offset], y), mul_chain(xs[n, offset], y), atol=0, rtol=0)
++                self.assertEqual(torch._C._host_trace_kernel_node_sets() + torch._C._host_trace_memory_node_sets(), sets)
++            self.assertEqual(torch._C._host_trace_exec_copy_counts()[0] - hits, 12)
++        finally:
++            torch._C._host_trace_exec_copies(prev)
++        self.assertEqual(len(bound(f)), 1)
++
+     @parametrize("form_held", [False, True])
+     def test_form_switch_sets_what_the_forms_exec_lacks(self, form_held):
+         # forms alternating on the same inputs: with form_held each form's exec
+--- a/test/test_cuda_host_trace_replay.py
++++ b/test/test_cuda_host_trace_replay.py
+@@ -2861,6 +2861,33 @@
+         self.assertEqual(f(x), want)
+         self.assertEqual((f.traces, f.eager), (1, 0))
+ 
++    @parametrize("copies", [1, 2])
++    def test_exec_copies_hold_their_sizes(self, copies):
++        # two sizes alternate: with a copy of the segment's exec per size, each
++        # launches the copy that holds it, setting no node after its first
++        # call; with the graph's exec alone, each switch sets every node
++        f = HostTraceReplay(five_step)
++        xs = {n: torch.randn(n, device="cuda") for n in (1024, 2048)}
++        prev = torch._C._host_trace_exec_copies(copies)
++        try:
++            for n in (1024, 1024, 2048):
++                self.assertEqual(f(xs[n]), five_step(xs[n]), atol=0, rtol=0)
++            hits, _ = torch._C._host_trace_exec_copy_counts()
++            sets = []
++            for n in (1024, 2048) * 3:
++                before = torch._C._host_trace_kernel_node_sets()
++                self.assertEqual(f(xs[n]), five_step(xs[n]), atol=0, rtol=0)
++                sets.append(torch._C._host_trace_kernel_node_sets() - before)
++            hits = torch._C._host_trace_exec_copy_counts()[0] - hits
++        finally:
++            torch._C._host_trace_exec_copies(prev)
++        self.assertEqual(len(f.variants), 1)
++        if copies == 1:
++            self.assertTrue(all(sets), sets)
++            self.assertEqual(hits, 0)
++        else:
++            self.assertEqual((sets, hits), ([0] * 6, 6))
++
+     @parametrize("check_global_state", [False, True])
+     def test_the_native_key_partitions_as_the_contract(self, check_global_state):
+         f = HostTraceReplay(two_step, check_global_state=check_global_state)
+--- a/torch/csrc/cuda/host_trace/Entry.cpp
++++ b/torch/csrc/cuda/host_trace/Entry.cpp
+@@ -1700,6 +1700,15 @@
+   m.def("_host_trace_placement_reuse", [](bool enable) {
+     placement_reuse_enabled = enable;
+   });
++  m.def("_host_trace_exec_copies", [](size_t n) {
++    TORCH_CHECK_VALUE(n >= 1, "exec_copies counts the graph's own exec");
++    const size_t previous = exec_copies;
++    exec_copies = n;
++    return previous;
++  });
++  m.def("_host_trace_exec_copy_counts", [] {
++    return py::make_tuple(exec_copy_hits, exec_copy_switches);
++  });
+   m.def("_host_trace_form_held", [](bool enable) {
+     form_held_enabled = enable;
+   });
+--- a/torch/csrc/cuda/host_trace/Patch.cpp
++++ b/torch/csrc/cuda/host_trace/Patch.cpp
+@@ -17,6 +17,9 @@
+ int64_t memory_node_sets = 0;
+ int64_t kernel_packs = 0;
+ int64_t kernel_node_sets = 0;
++size_t exec_copies = 1;
++int64_t exec_copy_hits = 0;
++int64_t exec_copy_switches = 0;
+ bool phase_timing = false;
+ std::array<int64_t, 16> phase_ns{};
+ int64_t tma_encodes = 0;
+@@ -305,6 +308,23 @@
+       }
+     }
+   }
++  std::vector<uint32_t> segment_of(records_.size(), 0);
++  for (uint32_t g = 0; g < segments_.size(); ++g) {
++    Segment& run = segments_[g];
++    std::fill(segment_of.begin() + run.first, segment_of.begin() + run.stop, g);
++    run.key_rows.clear();
++    run.key_bases.assign(
++        users_.segment_bases.begin() + users_.segment_first[g],
++        users_.segment_bases.begin() + users_.segment_first[g + 1]);
++  }
++  for (uint32_t row : users_.rows) {
++    for (uint32_t k = users_.row_first[row]; k < users_.row_first[row + 1]; ++k) {
++      auto& rows_of = segments_[segment_of[users_.row_records[k]]].key_rows;
++      if (rows_of.empty() || rows_of.back() != row) {
++        rows_of.push_back(row);
++      }
++    }
++  }
+   if (users_kept_) {
+     // a record of a site with a new row is marked when the call selects the
+     // row (seen_sites_); a row or base no record read before is marked at its
+@@ -420,6 +440,176 @@
+   run.form = form;
+ }
+ 
++std::vector<int64_t> HostTraceVariant::copy_key(
++    const Segment& run,
++    const Frame& frame) const {
++  std::vector<int64_t> key;
++  key.reserve(run.key_rows.size() + run.key_bases.size() + run.sites.size());
++  for (uint32_t row : run.key_rows) {
++    key.push_back(frame.values[row]);
++  }
++  for (uint32_t b : run.key_bases) {
++    key.push_back(frame.bases[b]);
++  }
++  for (size_t s : run.sites) {
++    key.push_back(frame.site_entries[s]);
++  }
++  return key;
++}
++
++void HostTraceVariant::switch_copy(Segment& run, size_t form, size_t j) {
++  // the records', then the current form's pieces' held parameters
++  auto slots = [&](size_t f) {
++    std::vector<Record*> out;
++    for (size_t i = run.first; i < run.stop; ++i) {
++      out.push_back(&records_[i]);
++    }
++    if (f != 0) {
++      for (Record& r : run.clones[f - 1].pieces) {
++        out.push_back(&r);
++      }
++    }
++    return out;
++  };
++  std::vector<Record*> current = slots(run.form);
++  auto& saved = run.copies[run.form][run.copy].held;
++  saved.resize(current.size());
++  for (size_t i = 0; i < current.size(); ++i) {
++    const Record& r = *current[i];
++    Segment::CopyHeld& h = saved[i];
++    h.held = r.held;
++    h.row = r.held_row;
++    h.dims = r.held_dims;
++    h.memset = r.held_memset;
++    h.copy = r.held_copy;
++    h.image.clear();
++    if (r.held && r.kind == Kind::Kernel) {
++      const KernelRow& k = kernel_row(r, r.held_row);
++      h.image.assign(k.held, k.held + k.nbytes);
++    }
++  }
++  run.form = form;
++  run.copy = j;
++  std::vector<Record*> next = slots(form);
++  const auto& held = run.copies[form][j].held;
++  for (size_t i = 0; i < next.size(); ++i) {
++    Record& r = *next[i];
++    if (i >= held.size()) {
++      r.held = false; // a new copy: its nodes hold the capture's parameters
++      continue;
++    }
++    const Segment::CopyHeld& h = held[i];
++    r.held = h.held;
++    r.held_row = h.row;
++    r.held_dims = h.dims;
++    r.held_memset = h.memset;
++    r.held_copy = h.copy;
++    if (h.held && r.kind == Kind::Kernel) {
++      std::memcpy(kernel_row(r, h.row).held, h.image.data(), h.image.size());
++    }
++  }
++  ++exec_copy_switches;
++}
++
++HostTraceVariant::Segment::Copy* HostTraceVariant::select_copy(
++    Segment& run,
++    size_t form,
++    const Frame& frame) {
++  std::vector<int64_t> key = copy_key(run, frame);
++  if (run.copies.size() < run.execs.size()) {
++    run.copies.resize(run.execs.size());
++  }
++  // each form's own exec is its copy 0 (the current form's too: switch_copy saves into it)
++  for (size_t f : {form, run.form}) {
++    if (run.copies[f].empty()) {
++      run.copies[f].push_back({run.execs[f], {}, {}, false});
++    }
++  }
++  auto& list = run.copies[form];
++  const bool same = run.form == form;
++  // the copy whose values differ from the call's in the fewest entries; the
++  // current one wins a tie (its records are marked against the last call)
++  auto distance = [&](const Segment::Copy& c, size_t bound) {
++    if (!c.keyed || c.key.size() != key.size()) {
++      return bound;
++    }
++    size_t d = 0;
++    for (size_t i = 0; i < key.size() && d < bound; ++i) {
++      d += c.key[i] != key[i];
++    }
++    return d;
++  };
++  const size_t none = key.size() + 1;
++  size_t j = same ? run.copy : list.size();
++  size_t best = same ? distance(list[run.copy], none) : none;
++  for (size_t c = 0; c < list.size() && best > 0; ++c) {
++    if (!(same && c == run.copy)) {
++      const size_t d = distance(list[c], best);
++      if (d < best) {
++        j = c;
++        best = d;
++      }
++    }
++  }
++  if (best > 0 && list.size() < exec_copies) {
++    // values no copy holds: a new instantiation keeps the others' values
++    cudaGraphExec_t e = nullptr;
++    const cudaGraph_t graph = form == 0
++        ? run.native->raw_cuda_graph()
++        : reinterpret_cast<cudaGraph_t>(run.clones[form - 1].graph);
++    C10_CUDA_CHECK(cudaGraphInstantiate(&e, graph, 0));
++    C10_CUDA_CHECK(cudaGraphUpload(e, at::cuda::getCurrentCUDAStream()));
++    list.push_back({reinterpret_cast<CUgraphExec>(e), {}, {}, false});
++    j = list.size() - 1;
++  } else if (j == list.size()) {
++    // another form's call and no keyed copy of this one: its own exec
++    j = 0;
++  }
++  if (!same || j != run.copy) {
++    const std::vector<int64_t> held = list[j].keyed ? list[j].key : std::vector<int64_t>();
++    switch_copy(run, form, j);
++    // the records whose rows, bases or site rows differ from what the copy
++    // holds, and those patched every replay
++    for (size_t i = run.first; i < run.stop; ++i) {
++      dirty_[i] = held.empty() ? 1 : always_[i];
++    }
++    if (!held.empty()) {
++      auto mark_here = [&](const std::vector<uint32_t>& first, const std::vector<uint32_t>& records, size_t x) {
++        for (uint32_t k = first[x]; k < first[x + 1]; ++k) {
++          if (records[k] >= run.first && records[k] < run.stop) {
++            dirty_[records[k]] = 1;
++          }
++        }
++      };
++      size_t i = 0;
++      for (uint32_t row : run.key_rows) {
++        if (held[i] != key[i]) {
++          mark_here(users_.row_first, users_.row_records, row);
++        }
++        ++i;
++      }
++      for (uint32_t b : run.key_bases) {
++        if (held[i] != key[i]) {
++          mark_here(users_.base_first, users_.base_records, b);
++        }
++        ++i;
++      }
++      for (size_t s : run.sites) {
++        if (held[i] != key[i]) {
++          for (size_t r : sites_[s].records) {
++            dirty_[r] = 1;
++          }
++        }
++        ++i;
++      }
++    }
++    exec_copy_hits += !held.empty() && held == key;
++  }
++  Segment::Copy& copy = list[run.copy];
++  copy.keyed = false; // until its patches all succeed
++  copy.key = std::move(key);
++  return &copy;
++}
+ void HostTraceVariant::patch_and_replay(Segment& run, Frame& frame) {
+   int64_t pt = phase_now();
+   const int64_t* v = frame.values.data();
+@@ -435,25 +625,38 @@
+   const size_t form =
+       run.forms.size() > 1 ? frame.forms[&run - segments_.data()] : 0;
+   Segment::Clone* clone = form == 0 ? nullptr : &run.clones[form - 1];
+-  if (form != run.form && form_held_enabled) {
+-    switch_form_held(run, form);
+-    for (size_t i = run.first; i < run.stop; ++i) {
+-      dirty_[i] = 1;
+-    }
+-  } else if (form != run.form) {
+-    // the form's exec holds its instantiation's parameters
+-    run.form = form;
+-    for (size_t i = run.first; i < run.stop; ++i) {
+-      records_[i].held = false;
+-      dirty_[i] = 1;
++  // another instantiation of the form's graph, which may hold the call's values
++  Segment::Copy* copy = nullptr;
++  if (exec_copies > 1 && !observed(run)) {
++    copy = select_copy(run, form, frame);
++  } else {
++    if (run.copy != 0) {
++      // copies turned off: back to the form's own exec
++      switch_copy(run, run.form, 0);
++      for (size_t i = run.first; i < run.stop; ++i) {
++        dirty_[i] = 1;
++      }
+     }
+-    if (clone) {
+-      for (Record& r : clone->pieces) {
+-        r.held = false;
++    if (form != run.form && form_held_enabled) {
++      switch_form_held(run, form);
++      for (size_t i = run.first; i < run.stop; ++i) {
++        dirty_[i] = 1;
++      }
++    } else if (form != run.form) {
++      // the form's exec holds its instantiation's parameters
++      run.form = form;
++      for (size_t i = run.first; i < run.stop; ++i) {
++        records_[i].held = false;
++        dirty_[i] = 1;
++      }
++      if (clone) {
++        for (Record& r : clone->pieces) {
++          r.held = false;
++        }
+       }
+     }
+   }
+-  const CUgraphExec exec = run.execs[form];
++  const CUgraphExec exec = copy ? copy->exec : run.execs[form];
+   // the philox offsets the segment's RNG calls take before the next, and
+   // the intragraph offset of the current one's kernels
+   int64_t running = 0;
+@@ -598,6 +801,9 @@
+       patch(r, r.node);
+     }
+   }
++  if (copy) {
++    copy->keyed = true;
++  }
+   // a replay advances the generator by what the rows' calls take, as eager
+   if (run.generator && running != run.rng_increment) {
+     run.native->set_generator_increment(
+--- a/torch/csrc/cuda/host_trace/Sites.cpp
++++ b/torch/csrc/cuda/host_trace/Sites.cpp
+@@ -750,6 +750,12 @@
+ 
+ HostTraceVariant::~HostTraceVariant() {
+   for (Segment& g : segments_) {
++    for (const auto& list : g.copies) {
++      for (size_t c = 1; c < list.size(); ++c) {
++        C10_CUDA_CHECK_WARN(
++            cudaGraphExecDestroy(reinterpret_cast<cudaGraphExec_t>(list[c].exec)));
++      }
++    }
+     for (size_t f = 1; f < g.execs.size(); ++f) {
+       C10_CUDA_CHECK_WARN(
+           cudaGraphExecDestroy(reinterpret_cast<cudaGraphExec_t>(g.execs[f])));
+--- a/torch/csrc/cuda/host_trace/Variant.h
++++ b/torch/csrc/cuda/host_trace/Variant.h
+@@ -77,6 +77,12 @@
+ extern bool placement_reuse_enabled;
+ // a form switch restores what the form's exec last held (else forgets it)
+ extern bool form_held_enabled;
++// instantiations of a segment's graph kept per segment (1: the graph's exec
++// only), each holding the values it last ran at: a call at those values
++// launches it with no node set (Segment::copies)
++extern size_t exec_copies;
++extern int64_t exec_copy_hits;
++extern int64_t exec_copy_switches;
+ // add_entry takes an entry's TMA descriptors (else refuses the entry)
+ extern bool entry_descriptors_enabled;
+ 
+@@ -417,6 +423,31 @@
+       std::vector<Record> pieces;
+     };
+     std::vector<Clone> clones;
++    // with exec_copies > 1, per form instantiations of its graph, [0] the
++    // form's own exec, each with what its nodes held when it last ran
++    // (while not the current one) and the values its records read then. A
++    // call launches the copy whose values differ from its own in the fewest
++    // entries (a new one while there are fewer than exec_copies and none holds
++    // them all), patching the records those entries change
++    struct CopyHeld {
++      bool held = false;
++      int64_t row = 0;
++      std::array<int64_t, 7> dims{};
++      std::array<int64_t, 4> memset{};
++      std::array<int64_t, 3> copy{};
++      std::vector<uint8_t> image;
++    };
++    struct Copy {
++      CUgraphExec exec;
++      std::vector<CopyHeld> held; // per record in [first, stop)
++      std::vector<int64_t> key; // copy_key's values when it last ran
++      bool keyed = false;
++    };
++    std::vector<std::vector<Copy>> copies; // per form
++    size_t copy = 0; // in copies[form]
++    // the rows and bases its records read, from the index of users
++    std::vector<uint32_t> key_rows;
++    std::vector<uint32_t> key_bases;
+     // with form_held_enabled, per form what its exec's kernel nodes held when
+     // it last ran: per record, then per piece
+     struct Held {
+@@ -590,6 +621,15 @@
+   void rows_added();
+   KernelRow& kernel_row(Record& r, int64_t row) const;
+   void switch_form_held(Segment& run, size_t form);
++  // the values the segment's records read at the call: its rows, bases and
++  // its sites' rows
++  std::vector<int64_t> copy_key(const Segment& run, const Frame& frame) const;
++  // makes copy j of `form` the segment's current exec, saving what the
++  // current one's records (and pieces) hold and restoring j's
++  void switch_copy(Segment& run, size_t form, size_t j);
++  // the copy of `form` the call launches, its records marked dirty against
++  // the values it holds (Segment::copies)
++  Segment::Copy* select_copy(Segment& run, size_t form, const Frame& frame);
+   const KernelRow& kernel_row(const Record& r, int64_t row) const;
+   const MemsetRow& memset_row(const Record& r, int64_t row) const;
+   int64_t check_row(int64_t row) const;

@@ -1,0 +1,30 @@
+--- a/torch/cuda/_host_trace.py
++++ b/torch/cuda/_host_trace.py
+@@ -68,6 +68,10 @@
+ # as_strided): most of a fake call's time
+ fast_twins = False
+ 
++# with free_size_one_strides, a view's -1 size is the numel over its other sizes,
++# so the view takes the free strides rather than the fake kernel's guards
++free_inferred_views = False
++
+ # with traced_impls on, a trace runs a registered op's launcher (register_traced_impl)
+ # in place of its other routes; opt-in global state
+ traced_impls = False
+--- a/torch/cuda/_host_trace_tape.py
++++ b/torch/cuda/_host_trace_tape.py
+@@ -551,7 +551,13 @@
+             return func(*args, **kwargs)
+         if func in (aten.view.default, aten._unsafe_view.default) and torch.cuda._host_trace.free_size_one_strides:
+             shape = list(args[1])
+-            if not any(type(n) is int and n == -1 for n in shape):
++            inferred = [i for i, n in enumerate(shape) if type(n) is int and n == -1]
++            if len(inferred) == 1 and torch.cuda._host_trace.free_inferred_views:
++                others = functools.reduce(operator.mul, shape[: inferred[0]] + shape[inferred[0] + 1 :], 1)
++                if not (type(others) is int and others == 0):
++                    shape[inferred[0]] = functools.reduce(operator.mul, src.shape, 1) // others
++                    inferred = []
++            if not inferred:
+                 strides = _free_view_strides(src.shape, src._sym_strides, shape)
+                 if strides is not None:
+                     return _TracedTensor(src._root, shape, strides, src._sym_offset, src.dtype, src.device)

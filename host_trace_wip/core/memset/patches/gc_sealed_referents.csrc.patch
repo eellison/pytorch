@@ -1,0 +1,45 @@
+--- a/torch/csrc/cuda/host_trace/Entry.cpp
++++ b/torch/csrc/cuda/host_trace/Entry.cpp
+@@ -1735,6 +1735,7 @@
+ // test and diagnosis: objects the walks visited, and old objects incremental walks did not walk again
+ int64_t gc_untrack_walked = 0;
+ int64_t gc_untrack_old_skips = 0;
++int64_t gc_untrack_sealed_skips = 0;
+ 
+ int collect_referent(PyObject* o, void* arg) {
+   static_cast<std::vector<PyObject*>*>(arg)->push_back(o);
+@@ -1850,11 +1851,21 @@
+     }
+     n.first = raw.size();
+     for (PyObject* r : referents) {
+-      if (PyObject_IS_GC(r)) {
+-        raw.push_back(r);
+-        stack.push_back(r);
+-        pending.push_back(py::reinterpret_borrow<py::object>(r));
++      if (!PyObject_IS_GC(r)) {
++        continue;
++      }
++      // a referent known sealed without walking it (a clean type's, or an immutable or final object an earlier walk
++      // untracked) takes no node: it adds nothing to its referrer's sealed or a container's final (most of what a
++      // walk meets through a variant's tracked hubs: IR nodes, records)
++      const int64_t fr = flags(r);
++      if ((!(fr & GC_DESCEND) && (fr & GC_CLEAN)) ||
++          ((fr & GC_DESCEND) && (fr & (GC_IMMUTABLE | GC_FINAL)) && !(fr & GC_KEEP) && !PyObject_GC_IsTracked(r))) {
++        ++gc_untrack_sealed_skips;
++        continue;
+       }
++      raw.push_back(r);
++      stack.push_back(r);
++      pending.push_back(py::reinterpret_borrow<py::object>(r));
+     }
+     n.count = raw.size() - n.first;
+     walked.push_back(index[o]);
+@@ -2062,7 +2073,7 @@
+       py::arg("dry") = false);
+   // _host_trace_gc_untrack takes `young` (incremental walks) and `dry`
+   m.attr("_host_trace_gc_untrack_incremental") = true;
+-  m.def("_host_trace_gc_untrack_counts", [] { return std::make_pair(gc_untrack_walked, gc_untrack_old_skips); });
++  m.def("_host_trace_gc_untrack_counts", [] { return std::make_tuple(gc_untrack_walked, gc_untrack_old_skips, gc_untrack_sealed_skips); });
+   m.def("_host_trace_global_state", [] {
+     std::vector<int64_t> state;
+     append_global_state(state);

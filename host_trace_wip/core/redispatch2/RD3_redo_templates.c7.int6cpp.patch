@@ -1,0 +1,537 @@
+--- a/torch/cuda/_host_trace_lower_tape.py
++++ b/torch/cuda/_host_trace_lower_tape.py
+@@ -305,6 +305,13 @@
+         self.refused: set[int] = set()
+         # the section temporaries' bases the native variant holds past the tape's (_add_entries counts them)
+         self.sections = 0
++        # redo templates (_host_trace_redispatch): an entry by what its op's redo reads, rows of this program; and the
++        # entries instantiated from them and redone in full
++        self.templates: dict[Any, Any] = {}
++        # per op (index in Tape.ops), what its redo reads (_reads): a function of the variant's tape, made once
++        self.reads: dict[int, Any] = {}
++        self.instances = 0
++        self.redos = 0
+ 
+         def source(v: Any, leaf: tuple | int) -> None:
+             k = self.key(v)
+@@ -929,11 +936,9 @@
+     lowered: LoweredTape, args: Sequence[Any], values: Sequence[int], selected: list[tuple[int, list[Any], list[tuple[int, Any]], Any]]
+ ) -> tuple[torch._C._HostTraceProgram, list[tuple[int, int, tuple[LoweredLaunch | LoweredMemset, ...], LoweredSection | None]]]:
+     """Per (selector site, guards, (seq, launch) pairs, a redo's Section or
+-    None) in the variant's symbols, the entry (site, predicate row, lowered
+-    launches, LoweredSection or None), its rows appended to the variant's
+-    program at the call `args` (rows `values`), and the program compiled;
+-    FoldRefused where a lowering declines. A section's temporaries take the
+-    bases past the tape's and the earlier sections'."""
++    None) in the variant's symbols, the entry (lower_entry), its rows appended
++    to the variant's program at the call `args` (rows `values`), and the
++    program compiled; FoldRefused where a lowering declines."""
+     lo = lowered.lowering
+     # every row evaluated at the call, where each new row is too
+     program = lo.program
+@@ -942,39 +947,8 @@
+     base = len(lowered.allocations) + len(lowered.eager_roots) + lo.sections
+     try:
+         for i, guards, launches, section in selected:
+-            # sympy guards in an IR variant: its rename failed at the hints (HintsFail)
+-            symbolic = any(isinstance(g, sympy.Basic) for g in guards)
+-            low, key = (lo.symbolic, _sym_expr) if symbolic else (lo.lowering, lo.key)
+-            addresses = frozenset(key(rec.root.sym) for rec in lowered.tape.inputs)
+-            temporaries = []
+-            # the other entries' rows are evaluated at this one's calls
+-            with low.total() as domains:
+-                predicate = low.conjunction(guards, addresses)
+-                for t in section.temporaries if section else ():
+-                    lo.roots[id(t.root)] = ("section", base)
+-                    temporaries.append((base, lo.allocation(t).nbytes))
+-                    # its requirement (nonnegative strides) is the entry's
+-                    predicate = lo.emit("and", predicate, lo.requirements.pop())
+-                    base += 1
+-                try:
+-                    rows = tuple(lo.launch(seq, rec) for seq, rec in launches)
+-                finally:
+-                    for t in section.temporaries if section else ():
+-                        del lo.roots[id(t.root)]
+-                # a section's memcpy copies at least a byte, inside its allocations (as lower_tape requires of the tape's)
+-                nbytes = {**{k: a.nbytes for k, a in enumerate(lowered.allocations)}, **dict(temporaries)}
+-                zero, one = lo.emit("constant", 0), lo.emit("constant", 1)
+-                for m in rows if section else ():
+-                    if isinstance(m, LoweredMemcpy):
+-                        predicate = lo.emit("and", predicate, lo.emit("ge", m.nbytes, one))
+-                        for slot in m.slots:
+-                            if slot.root[0] in ("allocation", "section"):
+-                                end = lo.emit("add", slot.displacement, m.nbytes)
+-                                fits = lo.emit("and", lo.emit("ge", slot.displacement, zero), lo.emit("le", end, nbytes[slot.base]))
+-                                predicate = lo.emit("and", predicate, fits)
+-            for ok in domains:
+-                predicate = lo.emit("and", predicate, ok)
+-            entries.append((i, predicate, rows, section and LoweredSection(tuple(temporaries), section.drops)))
++            entry, base = lower_entry(lowered, i, guards, launches, section, base)
++            entries.append(entry)
+         compiled = compile_program(program)
+         lo.entry_guards += [(i, tuple(guards)) for i, guards, *_ in selected]
+     except Declined as e:
+@@ -982,3 +956,46 @@
+     finally:
+         program.inputs = ()
+     return compiled, entries
++
++
++def lower_entry(
++    lowered: LoweredTape, i: int, guards: list[Any], launches: list[tuple[int, Any]], section: Any, base: int
++) -> tuple[tuple[int, int, tuple[LoweredLaunch | LoweredMemset | LoweredMemcpy, ...], LoweredSection | None], int]:
++    """Selector site i's entry (site, predicate row, lowered launches,
++    LoweredSection or None) from its guards and (seq, launch) pairs in the
++    variant's symbols, with the program's inputs set to the call; and the next
++    free base: a section's temporaries take the bases from `base`."""
++    lo = lowered.lowering
++    # sympy guards in an IR variant: its rename failed at the hints (HintsFail)
++    symbolic = any(isinstance(g, sympy.Basic) for g in guards)
++    low, key = (lo.symbolic, _sym_expr) if symbolic else (lo.lowering, lo.key)
++    addresses = frozenset(key(rec.root.sym) for rec in lowered.tape.inputs)
++    temporaries = []
++    # the other entries' rows are evaluated at this one's calls
++    with low.total() as domains:
++        predicate = low.conjunction(guards, addresses)
++        for t in section.temporaries if section else ():
++            lo.roots[id(t.root)] = ("section", base)
++            temporaries.append((base, lo.allocation(t).nbytes))
++            # its requirement (nonnegative strides) is the entry's
++            predicate = lo.emit("and", predicate, lo.requirements.pop())
++            base += 1
++        try:
++            rows = tuple(lo.launch(seq, rec) for seq, rec in launches)
++        finally:
++            for t in section.temporaries if section else ():
++                del lo.roots[id(t.root)]
++        # a section's memcpy copies at least a byte, inside its allocations (as lower_tape requires of the tape's)
++        nbytes = {**{k: a.nbytes for k, a in enumerate(lowered.allocations)}, **dict(temporaries)}
++        zero, one = lo.emit("constant", 0), lo.emit("constant", 1)
++        for m in rows if section else ():
++            if isinstance(m, LoweredMemcpy):
++                predicate = lo.emit("and", predicate, lo.emit("ge", m.nbytes, one))
++                for slot in m.slots:
++                    if slot.root[0] in ("allocation", "section"):
++                        end = lo.emit("add", slot.displacement, m.nbytes)
++                        fits = lo.emit("and", lo.emit("ge", slot.displacement, zero), lo.emit("le", end, nbytes[slot.base]))
++                        predicate = lo.emit("and", predicate, fits)
++    for ok in domains:
++        predicate = lo.emit("and", predicate, ok)
++    return (i, predicate, rows, section and LoweredSection(tuple(temporaries), section.drops)), base
+--- a/torch/cuda/_host_trace.py
++++ b/torch/cuda/_host_trace.py
+@@ -106,6 +106,9 @@
+ # op's does, rather than guarding the graph, which traces again. False runs it
+ # as plain Python
+ dispatch_units = True
++# a redispatch instantiating a redo template also redoes the op in full and asserts the two entries are one (the
++# test suites set it)
++verify_redo_templates = False
+ 
+ 
+ def dispatch_unit(fn: Callable[..., Any]) -> Callable[..., Any]:
+--- a/torch/cuda/_host_trace_redispatch.py
++++ b/torch/cuda/_host_trace_redispatch.py
+@@ -30,7 +30,7 @@
+ from torch.cuda import _host_trace_hint_audit as _hint_audit, _host_trace_ir as _ir
+ from torch.cuda._host_trace import _drop_tracebacks, Declined, declined
+ from torch.cuda._host_trace_launch import compiled_cluster, KernelLaunch
+-from torch.cuda._host_trace_lower_tape import FoldRefused, HintsFail, IRRename, lower_entries
++from torch.cuda._host_trace_lower_tape import FoldRefused, HintsFail, IRRename, lower_entry, LoweredSection, PointerSlot
+ from torch.cuda._host_trace_program import compile_program
+ from torch.cuda._host_trace_tape import (
+     _active,
+@@ -66,31 +66,49 @@
+ 
+ def redispatch(
+     lowered: LoweredTape, args: Sequence[Any], values: Sequence[int], unselected: Sequence[int], dispatches: dict | None = None
+-) -> tuple[torch._C._HostTraceProgram, list[tuple[int, int, tuple[LoweredLaunch | LoweredMemset, ...]]]]:
++) -> tuple[torch._C._HostTraceProgram, list[tuple[int, int, tuple[LoweredLaunch | LoweredMemset, ...], Any]]]:
+     """Selectors `unselected` (native site indices) of the variant, whose
+     graph guards hold the call `args` (at rows `values`), as entries from
+-    their ops dispatched again: fold's result, with no trace."""
+-    program = lowered.lowering.program
++    their ops dispatched again: fold's result, with no trace. An op whose redo
++    would read what an earlier redo of this variant read (Template), where
++    that entry's predicate holds, takes that entry with its own roots."""
++    lo = lowered.lowering
++    program = lo.program
+     rows = len(program.values)
+     # the ops' input formulas are evaluated at the call, each new row too
+     program.inputs, program.values = tuple(args), list(values)
++    entries, recorded = [], []
++    base = len(lowered.allocations) + len(lowered.eager_roots) + lo.sections
+     try:
+-        selected = []
+         # one that refused before goes first: refusing again costs no other op's dispatch
+         with _hosting(lowered.tape.device):
+-            for i in sorted(unselected, key=lambda i: i not in lowered.lowering.refused):
++            for i in sorted(unselected, key=lambda i: i not in lo.refused):
+                 selector = lowered.selectors[i - len(lowered.sites)]
+-                try:
+-                    try:
+-                        selected.append((i, *_redo(lowered, selector, hosted=True, dispatches=dispatches)))
+-                    except HintsFail:
+-                        selected.append((i, *_redo(lowered, selector, ir=False, hosted=True)))
+-                except FoldRefused as e:
+-                    lowered.lowering.refused.add(i)
+-                    e.op = selector.op
+-                    raise
+-        selected.sort(key=lambda s: unselected.index(s[0]))
+-        values = program.values
++                op = lowered.tape.ops[selector.op]
++                if selector.op not in lo.reads:
++                    lo.reads[selector.op] = _reads(lowered, op, selector)
++                reads = lo.reads[selector.op]
++                template = lo.templates.get(reads[0]) if reads is not None else None
++                if template is not None and program.values[template.predicate] == 1:
++                    entry, after = _instantiate(lowered, i, template, reads[1], base, selector, op)
++                    if torch.cuda._host_trace.verify_redo_templates:
++                        full = lower_entry(lowered, i, *_full_redo(lowered, i, selector, dispatches), base)[0]
++                        _assert_same_entry(entry, full, program.values)
++                    lo.instances += 1
++                    entries.append(entry)
++                    recorded.append((i, template.guards))
++                    base = after
++                    continue
++                guards, launches, section = _full_redo(lowered, i, selector, dispatches)
++                entry, base = lower_entry(lowered, i, guards, launches, section, base)
++                lo.redos += 1
++                entries.append(entry)
++                recorded.append((i, tuple(guards)))
++                if reads is not None and (template := _template(lowered, entry, guards, launches, section, reads[1], op)) is not None:
++                    lo.templates[reads[0]] = template
++        entries.sort(key=lambda e: unselected.index(e[0]))
++        compiled = compile_program(program)
++        lo.entry_guards += recorded
+     except (Declined, FoldRefused) as e:
+         compiled = compile_program(program) if len(program.values) > rows else None
+         if isinstance(e, Declined):
+@@ -100,7 +118,218 @@
+         raise
+     finally:
+         program.inputs = ()
+-    return lower_entries(lowered, args, values, selected)
++    return compiled, entries
++
++
++def _full_redo(lowered: LoweredTape, i: int, selector: LoweredSelector, dispatches: dict | None) -> tuple[list[Any], list[tuple[int, Any]], Section | None]:
++    try:
++        try:
++            return _redo(lowered, selector, hosted=True, dispatches=dispatches)
++        except HintsFail:
++            return _redo(lowered, selector, ir=False, hosted=True)
++    except FoldRefused as e:
++        lowered.lowering.refused.add(i)
++        e.op = selector.op
++        raise
++
++
++class _Unclassified(Exception):
++    """A read a redo template's key cannot name: the op is redone in full."""
++
++
++@dataclass(frozen=True)
++class Template:
++    """A redo's entry, by what the redo read (_reads), for another op of the
++    variant that reads the same: its predicate row and guards, its lowered
++    launches, per launch (slot, role) with role ("root", k) the k-th root of
++    the read walk or ("temp", m) the section's m-th temporary, its section
++    (temporaries' bytes rows) and its drops as positions in its op's
++    allocations."""
++
++    predicate: int
++    guards: tuple[Any, ...]
++    rows: tuple[Any, ...]
++    roles: tuple[tuple[tuple[int, tuple[str, int]], ...], ...]
++    section: LoweredSection | None
++    drops: tuple[int, ...]
++
++
++def _reads(lowered: LoweredTape, op: OpRec, selector: LoweredSelector) -> tuple[Any, list[_Root]] | None:
++    """What a redo of `op` reads, as a key, and its roots in reading order,
++    with no fresh symbol: the op, its call's structure and constants, each
++    SymInt / SymBool as the variant's node, each root's kind and layout
++    formulas (by position), each tensor's layout, then the op's own
++    allocations and outputs and the launch chain it replaces. Only an
++    operator's traced dispatch: one operator for every op of the key, whose
++    redos run in the same Python and global state (the variant's contract,
++    as its own trace assumed), so its records are a function of these reads.
++    A launcher's redo (a Triton or CuTe DSL closure) and anything the walk
++    cannot name (a SymFloat, a tensor the trace does not track) is None: the
++    op is redone in full."""
++    func = op.func
++    if op.kind != "traced" or op.redo is None or not isinstance(func, OpOverload) or not lowered.lowering.ir:
++        return None
++    old = lowered.tape
++    items: list[Any] = [func, repr(pytree.tree_structure(op.call)), len(selector.nodes)]
++    roots: list[_Root] = []
++    seen: dict[int, int] = {}
++
++    def value(v: Any) -> None:
++        if isinstance(v, torch.SymFloat) or (isinstance(v, torch.Tensor) and not isinstance(v, _TracedTensor)):
++            raise _Unclassified
++        if isinstance(v, torch.SymBool):
++            items.append(("bool", v.node.node) if v.node.constant is None else (bool, bool(v.node.constant)))
++        elif isinstance(v, torch.SymInt):
++            items.append(("int", _sym_key(v)))
++        else:
++            items.append((type(v), repr(v) if isinstance(v, float) else v))
++
++    def layout(sizes: Any, strides: Any, offset: Any) -> None:
++        for n in (*sizes, *strides, offset):
++            value(n)
++
++    def root(r: _Root) -> None:
++        if id(r) in seen:
++            items.append(("root", seen[id(r)]))
++            return
++        seen[id(r)] = len(roots)
++        roots.append(r)
++        items.append(("new root", r.kind))
++        if r.kind == "argument":
++            rec = next(i for i in old.inputs if i.root is r)
++            layout(rec.sizes, rec.strides, rec.offset)
++            items.append((rec.dtype, rec.extent, rec.cow))
++        elif r.kind == "allocation":
++            a = next(a for a in old.allocs if a.root is r)
++            layout(a.sizes, a.strides, 0)
++            items.append(a.dtype)
++        else:
++            o = next(o for o in old.eager_outputs if o._root is r)
++            layout(o.shape, o._sym_strides, o._sym_offset)
++            items.append(o.dtype)
++
++    def tensor(t: _TracedTensor) -> None:
++        root(t._root)
++        layout(t.shape, t._sym_strides, t._sym_offset)
++        items.append((t.dtype, t.device))
++
++    try:
++        for leaf in pytree.tree_leaves(op.call):
++            tensor(leaf) if isinstance(leaf, _TracedTensor) else value(leaf)
++        # what the redo compares its result with: the op's allocations and outputs, and the chain a section replaces
++        items.append("own")
++        for a in old.allocs[op.allocs.start : op.allocs.stop]:
++            root(a.root)
++        for o in op.outputs:
++            tensor(o) if isinstance(o, _TracedTensor) else value(o)
++        for _, rec in old.launches[op.launches.start : op.launches.stop]:
++            fixed = (rec.function, rec.attributes, rec.programmatic) if isinstance(rec, KernelLaunch) else (getattr(rec, "element_size", None),)
++            items.append((type(rec), *fixed))
++    except _Unclassified:
++        return None
++    key = tuple(items)
++    try:
++        hash(key)
++    except TypeError:
++        return None
++    return key, roots
++
++
++def _template(lowered: LoweredTape, entry: tuple, guards: list[Any], launches: list[tuple[int, Any]], redone: Section | None, roots: list[_Root], op: OpRec) -> Template | None:
++    """The full redo's entry as a Template, or None where another op reading
++    the same could not take it: a guard, scalar, dimension or displacement
++    that reads one of its roots (an alignment specialization on a pointer is
++    that op's own), or a pointer into a root of no role."""
++    lo = lowered.lowering
++    _, predicate, rows, section = entry
++    if any(isinstance(g, sympy.Basic) for g in guards):
++        return None
++    names: set[str] = set()
++    for r in roots:
++        k = _sym_key(r.sym)
++        names |= k.free_symbols if isinstance(k, _ir.Node) else set()
++
++    def free(v: Any) -> bool:
++        k = v if isinstance(v, _ir.Node) else _sym_key(v)
++        return not (isinstance(k, _ir.Node) and k.free_symbols & names)
++
++    if not all(free(g) for g, _ in guards) or not all(free(n) for t in (redone.temporaries if redone else ()) for n in (*t.sizes, *t.strides)):
++        return None
++    position = {lo.roots[id(r)]: k for k, r in enumerate(roots)}
++    temps = {b: m for m, (b, _) in enumerate(section.temporaries)} if section else {}
++    roles = []
++    for row, (_, x) in zip(rows, launches, strict=True):
++        role = []
++        values = x.slots if isinstance(x, (KernelLaunch, Memcpy)) else (x.slots[0],)
++        for k, (slot, v) in enumerate(zip(row.slots, values)):
++            if isinstance(slot, PointerSlot):
++                own = next((r for r in x.roots if _sym_key(r.sym) is not None and lo.lowering.split(_sym_key(v), _sym_key(r.sym)) is not None), None)
++                if own is None or not free(lo.lowering.split(_sym_key(v), _sym_key(own.sym))):
++                    return None
++                if slot.root in position:
++                    role.append((k, ("root", position[slot.root])))
++                elif slot.root[0] == "section" and slot.base in temps:
++                    role.append((k, ("temp", temps[slot.base])))
++                else:
++                    return None
++            elif not free(v):
++                return None
++        dims = (*x.grid, *x.block, x.smem) if isinstance(x, KernelLaunch) else (x.nbytes,) if isinstance(x, Memcpy) else (x.width, x.height, x.pitch)
++        if not all(free(d) for d in dims):
++            return None
++        roles.append(tuple(role))
++    drops = tuple(d - op.allocs.start for d in section.drops) if section else ()
++    return Template(predicate, tuple(guards), rows, tuple(roles), section, drops)
++
++
++def _instantiate(lowered: LoweredTape, i: int, t: Template, roots: list[_Root], base: int, selector: LoweredSelector, op: OpRec) -> tuple[tuple, int]:
++    """Template t as selector site i's entry: its launches with each role's
++    pointer slot into this op's root at that position (or a fresh base per
++    section temporary), at this selector's seqs; and the next free base."""
++    lo = lowered.lowering
++    refs = [lo.roots[id(r)] for r in roots]
++    seqs = [lowered.launches[n].seq for n in selector.nodes]
++    temps = tuple((base + m, row) for m, (_, row) in enumerate(t.section.temporaries)) if t.section else ()
++    rows = []
++    for j, (row, role) in enumerate(zip(t.rows, t.roles)):
++        slots = list(row.slots)
++        for k, (kind, p) in role:
++            s = slots[k]
++            if kind == "temp":
++                slots[k] = PointerSlot(("section", temps[p][0]), s.displacement, None, temps[p][0])
++                continue
++            ref = refs[p]
++            address = lo.emit("add", lo.row(roots[p].sym), s.displacement) if ref[0] == "argument" else None
++            slots[k] = PointerSlot(ref, s.displacement, address, lo.base(ref))
++        rows.append(replace(row, seq=seqs[0] if t.section else seqs[j], slots=tuple(slots)))
++    section = LoweredSection(temps, tuple(op.allocs.start + d for d in t.drops)) if t.section else None
++    return (i, t.predicate, tuple(rows), section), base + len(temps)
++
++
++def _assert_same_entry(a: tuple, b: tuple, values: Sequence[int]) -> None:
++    """verify_redo_templates: an instantiated entry and the full redo's are
++    one entry at the call: predicate, each launch's slots (roots, bases and
++    values), dimensions and extents, the section's bytes and drops."""
++
++    def view(entry: tuple) -> tuple:
++        _, predicate, rows, section = entry
++        out: list[Any] = [values[predicate]]
++        for row in rows:
++            slots = tuple(
++                (s.root, s.base, values[s.displacement], None if s.address is None else values[s.address]) if isinstance(s, PointerSlot) else values[s.row]
++                for s in row.slots
++            )
++            if isinstance(row.launch, KernelLaunch):
++                dims = tuple(values[r] for r in (*row.grid, *row.block, row.smem))
++                out.append((type(row), row.launch.function, row.launch.attributes, slots, dims))
++            else:
++                extents = (values[row.nbytes],) if hasattr(row, "nbytes") else tuple(values[r] for r in (row.width, row.height, row.pitch))
++                out.append((type(row), slots, extents))
++        out.append(None if section is None else (tuple(values[r] for _, r in section.temporaries), section.drops))
++        return tuple(out)
++
++    if view(a) != view(b):
++        raise AssertionError(f"host_trace: a redo template's entry for site {a[0]} differs from the full redo's: {view(a)} != {view(b)}")
+ 
+ 
+ _redo_fakes = threading.local()
+--- a/torch/cuda/_host_trace_replay.py
++++ b/torch/cuda/_host_trace_replay.py
+@@ -565,6 +565,10 @@
+         # the most bytes one entry's temporaries took at the call that added it
+         self.sections = 0
+         self.section_bytes = 0
++        # the selectors' entries a redispatch built by redoing their ops, and those it took from a redo template
++        # (_host_trace_redispatch.Template)
++        self.redos = 0
++        self.redo_instances = 0
+         # why each trace after the first traced: (class, op, guard, the user's line, refusal) -> count. Class "meta": a
+         # graph guard an op recorded (its outputs' metadata); "dispatch": an op's own guard failed and its
+         # redispatch refused (refusal); "graph": a guard no op recorded; "contract": no variant of the
+@@ -1258,7 +1262,11 @@
+         guards hold the call, gain entries from their ops dispatched again at
+         the call's metadata (_host_trace_redispatch): no trace; else why not."""
+         start = time.perf_counter()
++        lo = variant.captured.lowered.lowering
++        counts = lo.redos, lo.instances
+         refused = self._add_entries(variant, self.redispatch_refusals, args, redispatch, variant.captured.lowered, args, values, unselected, dispatches)
++        self.redos += lo.redos - counts[0]
++        self.redo_instances += lo.instances - counts[1]
+         # a refusal keeps the rows it appended, evaluated at the call, which a fold reads
+         values += variant.captured.lowered.lowering.program.values[len(values) :]
+         self.redispatch_s += time.perf_counter() - start
+--- a/test/test_cuda_host_trace_aten.py
++++ b/test/test_cuda_host_trace_aten.py
+@@ -1635,6 +1635,7 @@
+     from torch.cuda import _host_trace_hint_audit
+ 
+     _host_trace_hint_audit.enable_for_tests()
++    torch.cuda._host_trace.verify_redo_templates = True
+ 
+ 
+ if __name__ == "__main__":
+--- a/test/test_cuda_host_trace_harvest.py
++++ b/test/test_cuda_host_trace_harvest.py
+@@ -1034,6 +1034,7 @@
+     import torch.cuda._host_trace_capture as capture
+ 
+     _host_trace_hint_audit.enable_for_tests()
++    torch.cuda._host_trace.verify_redo_templates = True
+     capture.raise_trace_disagreements = True
+     torch.cuda._host_trace.raise_unexpected = True
+ 
+--- a/test/test_cuda_host_trace_replay.py
++++ b/test/test_cuda_host_trace_replay.py
+@@ -698,6 +698,42 @@
+         (v,) = f.variants
+         check_plan(v.captured.lowered, v.memory)
+ 
++    def test_layers_share_a_redo_template(self):
++        # every layer's ops redispatch at the same call: the first layer's redo
++        # is a template the others take with their own roots (verify mode, on in
++        # the suites, redoes each in full too and compares the entries)
++        layers = 6
++        ws = [torch.randn(64, 64, device="cuda") / 8 for _ in range(layers)]
++
++        def fn(q, *ws):
++            for w in ws:
++                q = q + torch.softmax(q * torch.rsqrt(q.pow(2).mean(-1, keepdim=True) + 1e-6), -1) @ w
++            return q
++
++        f = HostTraceReplay(fn)
++        for b in (2, 3, 1, 5):
++            q = torch.randn(b, 64, device="cuda")
++            self.assertEqual(f(q, *ws), fn(q, *ws), atol=0, rtol=0)
++        self.assertEqual((f.traces, f.eager), (1, 0))
++        self.assertGreater(f.redispatches, 0)
++        # a redo per distinct read (the first layer reads an argument, the
++        # others the layer before's output), the other layers instantiated
++        self.assertGreater(f.redos, 0)
++        self.assertGreaterEqual(f.redo_instances, 3 * f.redos)
++
++    def test_a_redo_template_is_not_shared_across_a_constant_or_layout(self):
++        # four sums flip to the split reduction at once: two read the same (a
++        # template), keepdim (another constant) and a transposed input (another
++        # layout) are redone in full
++        def fn(x):
++            return (x * 2).sum(0) + (x * 3).sum(0) + (x * 4).sum(0, keepdim=True)[0] + (x * 5).t().sum(1)
++
++        f = HostTraceReplay(fn)
++        for t in (100, 300, 5000, 6000):
++            x = torch.randn(t, 64, device="cuda")
++            self.assertEqual(f(x), fn(x), atol=0, rtol=0)
++        self.assertEqual((f.traces, f.redispatches, f.redos, f.redo_instances, f.eager), (1, 1, 3, 1, 0))
++
+     def test_a_section_needs_its_roots_live_over_its_op(self):
+         # a plan that frees the sum's input within the sum's launches would let
+         # a section's temporary or output take its bytes there: refused
+@@ -4175,6 +4211,7 @@
+     import torch.cuda._host_trace_capture as capture
+ 
+     _host_trace_hint_audit.enable_for_tests()
++    torch.cuda._host_trace.verify_redo_templates = True
+     capture.raise_trace_disagreements = True
+     torch.cuda._host_trace.raise_unexpected = True
+ 
+--- a/test/test_cuda_host_trace_triton.py
++++ b/test/test_cuda_host_trace_triton.py
+@@ -1267,6 +1267,7 @@
+     import torch.cuda._host_trace_capture as capture
+ 
+     _host_trace_hint_audit.enable_for_tests()
++    torch.cuda._host_trace.verify_redo_templates = True
+     capture.raise_trace_disagreements = True
+     torch.cuda._host_trace.raise_unexpected = True
+ 

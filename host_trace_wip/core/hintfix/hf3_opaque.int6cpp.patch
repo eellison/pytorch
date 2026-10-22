@@ -1,0 +1,296 @@
+--- a/torch/cuda/_host_trace_hint_audit.py
++++ b/torch/cuda/_host_trace_hint_audit.py
+@@ -79,7 +79,6 @@
+ 
+ 
+ _TAPE = "torch/cuda/_host_trace_tape.py"
+-_OPAQUE = "torch/cuda/_host_trace_opaque.py"
+ _TRITON = "torch/cuda/_host_trace_triton_launch.py"
+ _CUTE = "torch/cuda/_host_trace_cute.py"
+ _MEMORY = "torch/cuda/_host_trace_memory.py"
+@@ -115,12 +114,6 @@
+     (_CUTE, "_intercept"): _WITNESS,
+     (_CUTE, "_intercept_foreign"): _WITNESS,
+     (_CUTE, "_pin"): "int(v) (a guard that returns the value) in place of v == _hint(v)",
+-    (_OPAQUE, "aliasing"): "F2: the distances stay symbolic in the key (rows evaluated per call, as its sizes are), for every provider",
+-    (_OPAQUE, "aliasing.<locals>.<lambda>"): "F2: the lead operand by guarded comparisons of the offsets (bool(a <= b)), not their hints",
+-    (_OPAQUE, "trace_key"): f"the trace-time key (align, scalars): {_AT_CALL}, the same rows a bound site evaluates at every call",
+-    (_OPAQUE, "trace_key.<locals>.<genexpr>"): f"the trace-time key (sizes, strides): {_AT_CALL}, the same rows a bound site evaluates at every call",
+-    (_OPAQUE, "record_binding.<locals>.address"): "symbolic: select(numel == 0, 0, root + offset * itemsize) + delta, no hint test",
+-    (_OPAQUE, "bind_at_trace"): "a guard: bool(offset != 0) declines the binding",
+     (_MEMORY, "_canonical"): f"the equal-at-the-call symbols: {_AT_CALL} (lowered.program.values of their rows); the renames stay valid conditions",
+     (_MEMORY, "_forms"): f"bounds and bytes at the call: {_AT_CALL} (lowered.program.values); F11: a plan whose valid fails at its own trace declines instead of asserting",
+ }
+--- a/torch/cuda/_host_trace_lower_tape.py
++++ b/torch/cuda/_host_trace_lower_tape.py
+@@ -166,7 +166,7 @@
+ ) -> OpaqueKey:
+     # ints: per operand its sizes, then per operand its strides, then per
+     # operand its address % 256, then a value per symbolic scalar, then per
+-    # pair of `alias` (the trace's) its distance at the call
++    # pair of `alias` (aliasing's: an operand and its storage's first) its distance at the call
+     it = iter(ints)
+     sizes = tuple(tuple(next(it) for _ in range(r)) for r in ranks)
+     strides = tuple(tuple(next(it) for _ in range(r)) for r in ranks)
+@@ -174,7 +174,7 @@
+     scalars = tuple(next(it) if isinstance(v, (torch.SymInt, ScalarSlot)) else v for v in scalars)
+     # each storage's operands at the call, up from its lowest as aliasing() has them
+     groups: dict[int, dict[int, int]] = {}
+-    for (i, lead, _), d in zip(alias, it, strict=True):
++    for (i, lead), d in zip(alias, it, strict=True):
+         groups.setdefault(lead, {lead: 0})[i] = d
+     pairs = []
+     for at in groups.values():
+@@ -195,7 +195,7 @@
+     scalars: tuple[Any, ...]  # a ScalarSlot per SymInt, constants
+     device: int
+     state: tuple
+-    alias: tuple = ()  # OpaqueKey.alias at the trace; its distances' rows end `rows`
++    alias: tuple = ()  # aliasing's pairs; their distances' rows end `rows`
+ 
+     def key(self, values: Sequence[int]) -> OpaqueKey:
+         ints = (values[r] for r in self.rows)
+@@ -216,7 +216,7 @@
+     scratch: dict[int, tuple[int, int]]  # buffer j's
+     nodes: tuple[int, ...]  # indices in `launches`
+     device: int
+-    alias: tuple = ()  # OpaqueKey.alias at the trace; its distances' rows end `rows`
++    alias: tuple = ()  # aliasing's pairs; their distances' rows end `rows`
+     arena_scratch: frozenset[int] = frozenset()  # buffers in an arena at their traced bytes
+ 
+     def native_scratch(self) -> list[int]:
+--- a/torch/cuda/_host_trace_opaque.py
++++ b/torch/cuda/_host_trace_opaque.py
+@@ -48,7 +48,7 @@
+ 
+ 
+ if TYPE_CHECKING:
+-    from collections.abc import Iterable, Iterator
++    from collections.abc import Callable, Iterable, Iterator
+ 
+     from torch._ops import OpOverload
+     from torch.cuda._host_trace_tape import _Trace
+@@ -272,32 +272,31 @@
+     return (1 + sum((n - 1) * s for n, s in zip(sizes, strides))) * itemsize if all(sizes) else 0
+ 
+ 
+-def aliasing(operands: Iterable[Any]) -> tuple[tuple[tuple[int, int, int], ...], list[Any]]:
+-    """OpaqueKey.alias of traced operands at the trace's hints, and its
+-    distances, in its order (to guard at their hints, or lower to rows)."""
+-    from torch.cuda._host_trace_tape import _hint, _TracedTensor
++def aliasing(operands: Iterable[Any]) -> tuple[tuple[tuple[int, int], ...], list[Any]]:
++    """Per traced operand on a storage an earlier operand is on: (operand, the
++    storage's first operand), and its byte distance up from that one's
++    address, symbolic. OpaqueKey.alias takes each storage's lowest operand at
++    a call, from these distances there (_host_trace_lower_tape._opaque_key)."""
++    from torch.cuda._host_trace_tape import _TracedTensor
+ 
+     on: dict[int, list[tuple[int, Any]]] = {}
+     for i, t in enumerate(operands):
+         if isinstance(t, _TracedTensor):
+             on.setdefault(id(t._root), []).append((i, t._sym_offset * t.element_size()))
+-    alias, distances = [], []
+-    for members in on.values():
+-        if len(members) < 2:
+-            continue
+-        lead, low = min(members, key=lambda m: (_hint(m[1]), m[0]))
+-        for i, at in members:
+-            if i != lead:
+-                distances.append(at - low)
+-                alias.append((i, lead, _hint(distances[-1])))
+-    order = sorted(range(len(alias)), key=alias.__getitem__)
+-    return tuple(alias[j] for j in order), [distances[j] for j in order]
++    pairs, distances = [], []
++    for (lead, low), *rest in on.values():
++        for i, at in rest:
++            pairs.append((i, lead))
++            distances.append(at - low)
++    return tuple(pairs), distances
+ 
+ 
+-def trace_key(op: OpOverload, args: tuple, kwargs: dict, fresh: list) -> tuple[OpaqueKey, list[Any]]:
+-    """A call's key at the trace's hints, and the values it reads."""
++def _key_values(op: OpOverload, args: tuple, kwargs: dict, fresh: list) -> tuple[list[Any], list[Any], tuple[tuple[int, int], ...]]:
++    """A call's operands (its tensor leaves, then the fresh outputs), the
++    values its key reads, symbolic, in _opaque_key's order (sizes, strides,
++    address % 256, the scalar leaves, the alias distances), and its alias
++    pairs (aliasing)."""
+     from torch.cuda._host_trace_launch import _probe_address
+-    from torch.cuda._host_trace_tape import _hint
+ 
+     leaves = pytree.tree_leaves((args, kwargs))
+     traced = [t for t in leaves if isinstance(t, torch.Tensor)]
+@@ -307,19 +306,26 @@
+     align = [_probe_address(t) % 256 for t in traced]
+     align += [o.storage_offset() * o.element_size() % 256 for o in fresh]
+     scalars = [v for v in leaves if not isinstance(v, torch.Tensor)]
+-    alias, distances = aliasing(traced)
+-    key = OpaqueKey(
+-        op,
+-        tuple(t.dtype for t in (*traced, *fresh)),
+-        tuple(tuple(map(_hint, s)) for s in sizes),
+-        tuple(tuple(map(_hint, s)) for s in strides),
+-        tuple(map(_hint, align)),
+-        tuple(map(_hint, scalars)),
+-        next(t.device for t in (*traced, *fresh)).index,
+-        library_state(),
+-        alias,
+-    )
+-    return key, [*sum(sizes, ()), *sum(strides, ()), *align, *scalars, *distances]
++    pairs, distances = aliasing(traced)
++    return [*traced, *fresh], [*sum(sizes, ()), *sum(strides, ()), *align, *scalars, *distances], pairs
++
++
++def trace_key(op: OpOverload, args: tuple, kwargs: dict, fresh: list, values: Callable[[Any], Any]) -> tuple[OpaqueKey, list[Any]]:
++    """A call's key at the traced call, its values evaluated by `values` (the
++    trace's CallValues) as a replay evaluates a bound site's rows; and the
++    values it reads, symbolic (_key_values)."""
++    from torch.cuda._host_trace_lower_tape import _opaque_key
++
++    operands, symbolic, pairs = _key_values(op, args, kwargs, fresh)
++    ranks = tuple(t.dim() for t in operands)
++    head = 2 * sum(ranks) + len(operands)  # sizes, strides, align
++    scalars = symbolic[head : len(symbolic) - len(pairs)]
++    ints = [*symbolic[:head], *(v for v in scalars if isinstance(v, torch.SymInt)), *symbolic[len(symbolic) - len(pairs) :]]
++    # a SymInt scalar takes its int from `ints`, as _opaque_key reads a row
++    scalars = [values(v) if isinstance(v, (torch.SymFloat, torch.SymBool)) else v for v in scalars]
++    device = operands[0].device.index
++    key = _opaque_key(op, tuple(t.dtype for t in operands), ranks, tuple(scalars), device, library_state(), map(values, ints), pairs)
++    return key, symbolic
+ 
+ 
+ def key_guards(call: Any, key: OpaqueKey) -> list[Any] | None:
+@@ -332,46 +338,50 @@
+ 
+     leaves = pytree.tree_leaves((call.args, call.kwargs))
+     fresh = [o for o in call.outputs if all(o is not t for t in leaves)]
+-    traced, values = trace_key(call.target, call.args, call.kwargs, fresh)
+-    # the distances are up from each storage's lowest operand at the trace
+-    if [a[:2] for a in traced.alias] != [a[:2] for a in key.alias]:
++    operands, values, pairs = _key_values(call.target, call.args, call.kwargs, fresh)
++    values = values[: len(values) - len(pairs)]
++    # the same operands share a storage as at the key, each distance up from its lowest there
++    groups: dict[int, set[int]] = {}
++    for i, lead in pairs:
++        groups.setdefault(lead, {lead}).add(i)
++    keyed: dict[int, set[int]] = {}
++    for i, lead, _ in key.alias:
++        keyed.setdefault(lead, {lead}).add(i)
++    if sorted(map(sorted, groups.values())) != sorted(map(sorted, keyed.values())):
+         return None
+-    at = [*sum(key.sizes, ()), *sum(key.strides, ()), *key.align, *key.scalars, *(d for *_, d in key.alias)]
++    at = [*sum(key.sizes, ()), *sum(key.strides, ()), *key.align, *key.scalars]
+     if len(values) != len(at):
+         return None
+-    return [sympy.Eq(_sym_expr(v), a) for v, a in zip(values, at) if isinstance(v, torch.SymInt)]
++    offset = [t._sym_offset * t.element_size() for t in operands]
++    guards = [sympy.Eq(_sym_expr(v), a) for v, a in zip(values, at) if isinstance(v, torch.SymInt)]
++    return guards + [sympy.Eq(_sym_expr(offset[i] - offset[lead]), d) for i, lead, d in key.alias]
+ 
+ 
+ def bind_at_trace(
+-    provider: OpaqueProvider, op: OpOverload, args: tuple, kwargs: dict, fresh: list
++    provider: OpaqueProvider, op: OpOverload, args: tuple, kwargs: dict, fresh: list, values: Callable[[Any], Any]
+ ) -> tuple[OpaqueBinding | None, list[Any], str | None]:
+-    """The binding of an accepted call at the trace's hints, if the trace can
+-    record it, the values to guard at their hints: the fresh outputs'
+-    symbolic storage offsets (0) and the key's alias distances; and why the key never binds, if it doesn't
+-    (the key is guarded: the call is a plain eager step, which no replay
+-    learns from). `fresh` are the fake kernel's fresh outputs, which the
+-    binding's allocations replace."""
+-    from torch.cuda._host_trace_tape import _hint
+-
+-    key, all_values = trace_key(op, args, kwargs, fresh)
+-    n = len(all_values) - len(key.alias)
+-    # a provider that keys the alias holds the distances at their hints
+-    distances = [v for v in all_values[n:] if isinstance(v, torch.SymInt)] if op in provider.aliased else []
++    """The binding of an accepted call at the traced call's key, if the
++    trace can record it; the values to guard (each Eq to its value at the
++    call): a refused key's (the call is a plain eager step, which no replay
++    learns from); and why the key never binds, if it doesn't. The key is
++    otherwise no guard: a bound call is a KeyedSite, its key's rows, the
++    alias distances too, evaluated per call. A fresh output is an
++    allocation: one at a storage offset other than 0 (a guard) does not
++    bind. `fresh` are the fake kernel's fresh outputs, which the binding's
++    allocations replace."""
++    key, all_values = trace_key(op, args, kwargs, fresh, values)
+     binding = provider.bind(key)
+     refusal = provider.refusal(key)
+     if binding is not None and not recordable(binding):
+         refusal = "a kernel node of its binding is device-updatable"
+     if refusal is not None:
+-        # a plain eager step at this key: the variant does not learn it
++        # a plain eager step at this key: the variant does not learn it (the alias distances where its provider keys them)
+         why = f"{op} at sizes {key.sizes}: {refusal}"
+-        return None, [v for v in all_values[:n] if isinstance(v, torch.SymInt)] + distances, why
+-    if binding is None:
+-        return None, distances, None
+-    # a fresh output is an allocation: storage offset 0
+-    offsets = [o.storage_offset() for o in fresh]
+-    if any(_hint(o) for o in offsets):
+-        return None, distances, None
+-    return binding, [o for o in offsets if isinstance(o, torch.SymInt)] + distances, None
++        n = len(all_values) - len(key.alias)
++        return None, [v for v in all_values[: n if op not in provider.aliased else None] if isinstance(v, torch.SymInt)], why
++    if binding is None or any(bool(o.storage_offset() != 0) for o in fresh):
++        return None, [], None
++    return binding, [], None
+ 
+ 
+ def record_binding(
+@@ -389,7 +399,7 @@
+     from cuda.bindings import driver
+ 
+     from torch.cuda._host_trace_launch import KernelLaunch
+-    from torch.cuda._host_trace_tape import _hint, Memset
++    from torch.cuda._host_trace_tape import Memset
+ 
+     pdl = driver.CUlaunchAttributeID.CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION
+ 
+@@ -403,8 +413,9 @@
+     roots = tuple({id(t._root): t._root for t in (*operands, *scratch.values())}.values())
+ 
+     def address(s: Slot) -> Any:
++        # as the site's operand rows have it at every call: its root plus its offset (an empty one's too)
+         t = buffers[s.kind][s.index]
+-        if torch.cuda._host_trace.bound_addresses_unguarded and _hint(t.numel()):
++        if torch.cuda._host_trace.bound_addresses_unguarded:
+             return t._root.sym + t._sym_offset * t.element_size() + s.delta
+         return t.data_ptr() + s.delta
+ 
+--- a/torch/cuda/_host_trace_tape.py
++++ b/torch/cuda/_host_trace_tape.py
+@@ -988,7 +988,7 @@
+         if provider is not None:
+             fakes = [o for r, o in zip(schema.returns, rets) if r.alias_info is None]
+             fakes = [o for o in pytree.tree_leaves(fakes) if isinstance(o, torch.Tensor)]
+-            binding, values, refusal = bind_at_trace(provider, func, args, kwargs, fakes)
++            binding, values, refusal = bind_at_trace(provider, func, args, kwargs, fakes, self.values)
+             for v in values:
+                 int(v)  # a guard: Eq(v, its value at the call)
+             # an operand on an eager step's output with a size-1 dim, whose stride there the warm-up may yet set to
+@@ -1044,9 +1044,9 @@
+             operands = [a for a in leaves if isinstance(a, torch.Tensor)] + made
+             scalars = [a for a in leaves if not isinstance(a, torch.Tensor)]
+             call = (spec, frozenset(j for j, a in enumerate(leaves) if isinstance(a, torch.Tensor)))
+-            self.sites.append(record_binding(self, func, provider, binding, operands, scalars, call, trace_key(func, args, kwargs, fakes)[0]))
++            self.sites.append(record_binding(self, func, provider, binding, operands, scalars, call, trace_key(func, args, kwargs, fakes, self.values)[0]))
+         elif provider is not None:
+-            bound = provider.bind(trace_key(func, args, kwargs, fakes)[0]) is not None
++            bound = provider.bind(trace_key(func, args, kwargs, fakes, self.values)[0]) is not None
+             self.record_launch(OpaqueCall(func, args, kwargs, outputs, generator=self.generator, provider=provider, state=library_state(), bound=bound))
+         else:
+             why = "; ".join(reasons) or None
+@@ -3573,10 +3573,10 @@
+                 call = (spec, frozenset(j for j, a in enumerate(leaves) if isinstance(a, torch.Tensor)))
+                 # the library state the call was traced under, which its key and site record
+                 with library_state_as(rec.state):
+-                    key = trace_key(rec.target, args, kwargs, fresh)[0]
++                    key = trace_key(rec.target, args, kwargs, fresh, tr.values)[0]
+                     if learn is not None and rec.generator is None and rec.provider.bind(key) is None:
+                         learn(rec.target, rec.provider, call, key)
+-                    binding, values, refusal = bind_at_trace(rec.provider, rec.target, args, kwargs, fresh)
++                    binding, values, refusal = bind_at_trace(rec.provider, rec.target, args, kwargs, fresh, tr.values)
+                 if refusal is not None:
+                     return None
+                 if binding is not None and all(type(t.storage_offset()) is int for t in fresh):

@@ -1,0 +1,426 @@
+diff -ru -x __pycache__ step_ms17/test/inductor/test_cudagraph_host_trace.py step_ms18/test/inductor/test_cudagraph_host_trace.py
+--- step_ms17/test/inductor/test_cudagraph_host_trace.py	2026-10-15 21:42:15.038072369 -0700
++++ step_ms18/test/inductor/test_cudagraph_host_trace.py	2026-10-17 14:05:48.757127069 -0700
+@@ -1536,12 +1536,15 @@
+             model(x).float().sum().backward()
+             return [w.grad.clone() for w in model.parameters()]
+ 
+-        with torch.backends.cudnn.flags(enabled=True, benchmark=False, deterministic=True):
++        with torch.backends.cudnn.flags(enabled=True, benchmark=False, deterministic=True), _stale_struct_refusals() as stale:
+             for x in xs * 3:
+                 step(compiled, x)
+             counts = [(r.replay.eager, r.replay.replays) for r in self.installed]
+             for x in xs:
+                 self.assertEqual(step(compiled, x), step(expected, x), atol=0, rtol=0)
++        if stale:
++            # those keys run as eager steps (bitwise above); the no-eager-step expectations below do not hold
++            self.skipTest(f"cuDNN keys refused for the harvest's own address high half: {stale}")
+         self.assertEqual(len(self.installed), 2)
+         for installation, (eager, replays) in zip(self.installed, counts):
+             replay = installation.replay
+@@ -1693,6 +1696,26 @@
+     return peak
+ 
+ 
++
++@contextlib.contextmanager
++def _stale_struct_refusals():
++    """The cuDNN keys refused while in it because a constant of their parameter struct holds the high half of one of
++    the harvest's own reservations (_host_trace_harvest._STALE_STRUCT: refused, never rewritten). Whether one shows up
++    depends on what the process's heap held when cuDNN built the struct (strided dgrad and wgrad, after other tests):
++    a known coverage cost, MERGE_LOG step_ms18."""
++    import torch.cuda._host_trace_harvest as harvest
++
++    found: list[str] = []
++    refuse = harvest.HarvestProvider._refuse
++
++    def spy(self, key, why, structural=False):
++        if harvest._STALE_STRUCT in why:
++            found.append(f"{key.op} at {key.sizes}: {why}")
++        return refuse(self, key, why, structural)
++
++    with mock.patch.object(harvest.HarvestProvider, "_refuse", spy):
++        yield found
++
+ def _sequence(trace):
+     # each allocation as (size, stream by first use) and each free as the
+     # allocation it frees (or an earlier block's size), in order; a run of
+@@ -1820,7 +1843,11 @@
+             return _sequence(_traced(step)[1])
+ 
+         default = sequence(None)
+-        ours = sequence("reduce-overhead")
++        with _stale_struct_refusals() as stale:
++            ours = sequence("reduce-overhead")
++        if stale:
++            # an eager step's allocations are its op's, not the default compile's sequence at that point
++            self.skipTest(f"cuDNN keys refused for the harvest's own address high half: {stale}")
+         self.assertGreater(sum(i.replay.replays for i in self.installed), 0)
+         self.assertEqual(ours, default)
+ 
+diff -ru -x __pycache__ step_ms17/test/test_cuda_host_trace_harvest.py step_ms18/test/test_cuda_host_trace_harvest.py
+--- step_ms17/test/test_cuda_host_trace_harvest.py	2026-10-17 01:38:22.888100990 -0700
++++ step_ms18/test/test_cuda_host_trace_harvest.py	2026-10-17 13:47:46.341918910 -0700
+@@ -765,35 +765,34 @@
+             torch.cuda.synchronize()
+             self.assertLessEqual(torch.cuda.max_memory_allocated() - base, 2 * 8 * harvest._DIGEST_CHUNK)
+ 
+-    def test_stale_high_halves_are_zeroed(self):
+-        # a constant qword whose high half is a stale address's binds with
+-        # that half zeroed and loose; a slot's neighbors, loose bytes and
+-        # other constants keep theirs; a sibling zeroes where its template did
++    def test_a_stale_constant_is_found(self):
++        # the first constant qword the predicate holds, skipping a slot's
++        # neighbors (qs[1]) and loose bytes (qs[4]); the binding is not touched
+         qs = [0xFF11_0000_0020, 0xFF11_0000_0030, 0x8_0000_0FFF, 0xFF11_0000_0040, 0xFF11_0000_0050]
+         image = b"".join(q.to_bytes(8, "little") for q in qs)
+         kernel = OpaqueKernel(0, (1, 1, 1), (1, 1, 1), 0, (), ((0, len(image)),), (image,), (Slot(0, 12, "operand", 0, 0),), ((0, 32, 8),))
+-        b = harvest._canonical(OpaqueBinding((kernel,), ()), lambda q: q >> 32 == 0xFF11)
+-        n = b.nodes[0]
+-        self.assertEqual([int.from_bytes(n.images[0][o : o + 8], "little") for o in range(0, 40, 8)], [0x20, qs[1], qs[2], 0x40, qs[4]])
+-        self.assertEqual(n.loose, ((0, 4, 4), (0, 28, 4), (0, 32, 8)))
+-        self.assertIs(harvest._canonical(b, lambda q: q >> 32 == 0xFF11), b)
+-        sibling = harvest._canonical(OpaqueBinding((dataclasses.replace(kernel, loose=n.loose),), ()), bool, like=b)
+-        self.assertEqual(sibling.nodes[0].images, n.images)
+-
+-    def test_a_tensor_map_parameter_is_never_zeroed(self):
+-        # a cuBLAS nvjet kernel takes its operands' TMA descriptors (CUtensorMaps, 128 bytes at a 64-byte aligned
+-        # offset) as parameters: a word of the map that reads as a stale address's high half is the map's encoding, and
+-        # zeroed (stale high halves, _canonical) the kernel's TMA store traps with an illegal instruction (Flash-Next,
+-        # 10-16). A real map, after a 16-byte struct of a stale high half: the struct's half is zeroed, the map kept
++        b = OpaqueBinding((kernel,), ())
++        self.assertEqual(harvest._stale_constant(b, lambda q: q >> 32 == 0xFF11), (0, 0, 0, qs[0]))
++        self.assertEqual(harvest._stale_constant(b, lambda q: q in qs[1:]), (0, 0, 24, qs[3]))
++        self.assertIsNone(harvest._stale_constant(b, lambda q: q >> 32 == 0xFF12))
++        self.assertEqual(b.nodes[0].images, (image,))
++        self.assertFalse(hasattr(harvest, "_canonical"))
++
++    def test_a_tensor_map_inside_a_params_struct_refuses_untouched(self):
++        # CUTLASS 3 kernels (cuDNN's sm100 dgrad among them) take their TMA
++        # descriptors inside one Params struct: a word of the embedded map that
++        # reads as a stale address's high half is the map's encoding. Zeroed
++        # (the old _canonical) the kernel's TMA traps (Flash-Next, 10-16): the
++        # binding is refused with its bytes as captured, never rewritten
+         from cuda.bindings import driver
+ 
+         from torch.cuda._utils import _check_cuda_bindings
+ 
+         x = torch.zeros(256, 256, device="cuda", dtype=torch.bfloat16)
+-        cu = driver.CUtensorMapDataType.CU_TENSOR_MAP_DATA_TYPE_BFLOAT16
+         tmap = _check_cuda_bindings(
+             driver.cuTensorMapEncodeTiled(
+-                cu, 2, x.data_ptr(), [driver.cuuint64_t(256)] * 2, [driver.cuuint64_t(512)], [driver.cuuint32_t(64)] * 2, [driver.cuuint32_t(1)] * 2,
++                driver.CUtensorMapDataType.CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, x.data_ptr(), [driver.cuuint64_t(256)] * 2, [driver.cuuint64_t(512)],
++                [driver.cuuint32_t(64)] * 2, [driver.cuuint32_t(1)] * 2,
+                 driver.CUtensorMapInterleave.CU_TENSOR_MAP_INTERLEAVE_NONE,
+                 driver.CUtensorMapSwizzle.CU_TENSOR_MAP_SWIZZLE_128B,
+                 driver.CUtensorMapL2promotion.CU_TENSOR_MAP_L2_PROMOTION_NONE,
+@@ -801,20 +800,36 @@
+             )
+         )
+         map_bytes = b"".join(int(w).to_bytes(8, "little") for w in tmap.opaque)
+-        self.assertEqual(len(map_bytes), 128)
+-        self.assertTrue(any(int.from_bytes(map_bytes[o : o + 8], "little") >> 32 for o in range(0, 128, 8)))
+-        struct = (0xFF11_0000_0020).to_bytes(8, "little") + bytes(8)
+-        kernel = OpaqueKernel(0, (1, 1, 1), (1, 1, 1), 0, (), ((0, 16), (64, 128)), (struct, map_bytes), (), ())
+-        b = harvest._canonical(OpaqueBinding((kernel,), ()), lambda q: True)
+-        n = b.nodes[0]
+-        self.assertEqual(int.from_bytes(n.images[0][:8], "little"), 0x20)
+-        self.assertEqual(n.images[1], map_bytes)
+-
+-    def test_a_cublas_binding_is_never_canonical(self):
+-        # _canonical zeroes stale-looking high halves of constant words, for cuDNN's heap-built parameter structs; a
+-        # cuBLAS binding's constants are its own (an nvjet kernel's tensor maps among them): it never runs on one
++        words = [int.from_bytes(map_bytes[o : o + 8], "little") for o in range(0, 128, 8)]
++        hi = next(w for w in words if w >> 32)
++        params = bytes(64) + map_bytes + bytes(64)  # header, the map at 64 (alignas(64)), trailer
++        kernel = OpaqueKernel(0, (1, 1, 1), (1, 1, 1), 0, (), ((0, len(params)),), (params,), (), ())
++        b = OpaqueBinding((kernel,), ())
++        x_, param, off, q = harvest._stale_constant(b, lambda q: q == hi)
++        self.assertEqual((x_, param, q), (0, 0, hi))
++        self.assertTrue(64 <= off < 192)
++        self.assertEqual(b.nodes[0].images[0][64:192], map_bytes)
++
++    def test_a_cudnn_binding_with_a_stale_constant_refuses_before_any_launch(self):
++        # the refusal comes before verify: no launch of the binding (a stale
++        # flag can hang the kernel, which verify cannot recover from)
++        args = _conv("plain", bf16, False)
++        launched = []
++        with (
++            mock.patch.object(harvest, "_stale_constant", lambda b, stale: (0, 0, 0, 0xFFFE_0000_0000)),
++            mock.patch.object(harvest, "_launch", lambda *a, **k: launched.append(a)),
++        ):
++            binding, why = _learn(HarvestProvider(("conv",)), aten.convolution.default, args)
++        self.assertIsNone(binding)
++        self.assertIn(harvest._STALE_STRUCT, why)
++        self.assertEqual(launched, [])
++
++    def test_a_cublas_binding_is_never_checked_for_stale_constants(self):
++        # the stale-constant refusal is for cuDNN's heap-built parameter
++        # structs; a cuBLAS binding's constants are its own (an nvjet kernel's
++        # tensor maps among them) and bind as captured
+         calls = []
+-        real = harvest._canonical
++        real = harvest._stale_constant
+ 
+         def spy(binding, *args, **kwargs):
+             calls.append(binding)
+@@ -822,7 +837,7 @@
+ 
+         p = HarvestProvider()
+         a, b = (torch.randn(*s, device="cuda", dtype=torch.bfloat16) for s in ((64, 512), (512, 256)))
+-        with mock.patch.object(harvest, "_canonical", spy):
++        with mock.patch.object(harvest, "_stale_constant", spy):
+             binding, why = _learn(p, aten.mm.default, (a, b))
+         self.assertIsNotNone(binding, why)
+         self.assertEqual(calls, [])
+@@ -881,6 +896,9 @@
+                 trace = torch.cuda.memory._snapshot()["device_traces"][torch.cuda.current_device()]
+             finally:
+                 torch.cuda.memory._record_memory_history(enabled=None)
++        why = next(iter(p.refused.values()), None)
++        if binding is None and harvest._STALE_STRUCT in why:
++            self.skipTest(why)
+         self.assertIsNotNone(binding, p.refused)
+         a = harvest._address_only()
+         unmapped = [(r[0], r[0] + a._SPAN) for r in a.ranges.values()]
+@@ -1198,7 +1216,10 @@
+         gen = torch.cuda.default_generators[torch.cuda.current_device()]
+         before = gen.get_offset()
+         binding = p.learn(key, args, kwargs, operands)
+-        self.assertIsNotNone(binding, p.refused.get(p._normal(key)))
++        why = p.refused.get(p._normal(key))
++        if binding is None and harvest._STALE_STRUCT in why:
++            self.skipTest(why)
++        self.assertIsNotNone(binding, why)
+         self.assertEqual(binding.rng_increment > 0, rng)
+         # the harvest leaves the generator where it was, and no pool behind
+         self.assertEqual(gen.get_offset(), before)
+@@ -1495,7 +1516,7 @@
+ 
+ # refusals of stale bytes that depend on what ran before (not on the smears):
+ # ATen's bias add and bias grad (TensorIterator structs, until they are zeroed)
+-_STALE_REFUSALS = ("elementwise_kernel", "reduce_kernel")
++_STALE_REFUSALS = ("elementwise_kernel", "reduce_kernel", harvest._STALE_STRUCT)
+ 
+ 
+ def _conv(case, dtype, channels_last, batch=4):
+@@ -1566,14 +1587,21 @@
+         make = lambda: _conv_backward(case, dt, channels_last)  # noqa: E731
+         self.assertReplays(aten.convolution_backward.default, make, tf32=dtype == "tf32")
+ 
+-    def test_strided_dgrad_binds_no_stale_high_half(self):
++    def test_strided_dgrad_binds_no_harvest_high_half(self):
+         # CUTLASS strided dgrad holds an int32 under a stale address's high
+-        # half (parameter byte 1424 here), which it reads as a flag: with some
+-        # address spaces the captured bytes hang it. Bound with no constant
+-        # whose high half is an unmapped device address's
++        # half (parameter byte 1424 here), which it reads as a flag: the
++        # harvest's own high halves there (0xff11) hang it. Bound, it holds no
++        # constant with one of the harvest's ranges' high halves; refused, it
++        # says why
+         make = lambda: _conv_backward("strided_dilated", bf16, True)  # noqa: E731
+-        binding = self.assertReplays(aten.convolution_backward.default, make)
+-        low = min(harvest._DEVICES[torch.cuda.current_device()].va, *(t.data_ptr() for t in make()[:3])) >> 32
++        p = HarvestProvider(("conv",))
++        with torch.backends.cudnn.flags(enabled=True, benchmark=False, deterministic=True), tf32_off():
++            binding, why = _learn(p, aten.convolution_backward.default, make())
++        if binding is None:
++            self.assertIn(harvest._STALE_STRUCT, why)
++            return
++        highs = harvest._own_highs()
++        self.assertTrue(highs)
+         for n in binding.nodes:
+             if not isinstance(n, OpaqueKernel):
+                 continue
+@@ -1583,7 +1611,7 @@
+                 for i, q in enumerate(harvest._qwords(image, 0)):
+                     if (param, 8 * i) in near or any((param, 8 * i + j) in loose for j in range(8)):
+                         continue
+-                    self.assertFalse(low <= q >> 32 < 1 << 16 and not _cuda_address(q), f"parameter {param} byte {8 * i}: {q:#x}")
++                    self.assertFalse(q >> 32 in highs and not _cuda_address(q), f"parameter {param} byte {8 * i}: {q:#x}")
+ 
+     @staticmethod
+     def _wide_backward():
+@@ -2554,6 +2582,9 @@
+             r = HostTraceReplay(fn, opaque=providers)
+             r(*args)
+             learn = _backed_peak(r, args)
++            whys = [w for p in providers for w in p.refused.values()]
++            if r.learned == 0 and whys and all(harvest._STALE_STRUCT in w for w in whys):
++                self.skipTest(whys[0])
+             self.assertGreater(r.learned, 0)
+             workspace = sum(sum(b.scratch) for p in providers for b in p.bindings.values())
+             self.assertLessEqual(learn - eager, workspace + (64 << 20))
+diff -ru -x __pycache__ step_ms17/torch/cuda/_host_trace_harvest.py step_ms18/torch/cuda/_host_trace_harvest.py
+--- step_ms17/torch/cuda/_host_trace_harvest.py	2026-10-17 01:38:12.728526363 -0700
++++ step_ms18/torch/cuda/_host_trace_harvest.py	2026-10-17 13:47:46.341232635 -0700
+@@ -550,11 +550,22 @@
+ _HIGH_VA = 0xFF00_0000_0000
+ 
+ 
++# the harvest's reservations the driver placed at their hints, start -> bytes: their addresses' high halves are in
++# no host or allocator range of the process (a reservation placed elsewhere may share its high half with host
++# mappings), so a constant of a cuDNN parameter struct holding one is the harvest's leftover (_own_highs)
++_HINTED: dict[int, int] = {}
++# a reservation within this many bytes above its hint is at its hint
++_HINT_BAND = 1 << 39
++
++
+ def _reserve_high(size: int, align: int, at: int = _HIGH_VA) -> int:
+     from cuda.bindings import driver
+ 
+     hint = -(-at // align) * align
+-    return int(_check_cuda_bindings(driver.cuMemAddressReserve(size, align, hint, 0)))
++    va = int(_check_cuda_bindings(driver.cuMemAddressReserve(size, align, hint, 0)))
++    if hint <= va < hint + _HINT_BAND:
++        _HINTED[va] = size
++    return va
+ 
+ 
+ class _AddressOnly:
+@@ -766,6 +777,7 @@
+         if size > self.va_size:
+             if self.va:
+                 _check_cuda_bindings(driver.cuMemAddressFree(self.va, self.va_size))
++                _HINTED.pop(self.va, None)
+                 self.va = self.va_size = 0
+             n = max(1 << 28, 1 << (size - 1).bit_length())
+             self.va, self.va_size = _reserve_high(n, _WINDOW), n
+@@ -959,57 +971,37 @@
+     return dataclasses.replace(binding, nodes=_scratch_renumbered(binding.nodes, renumber), scratch=tuple(n for _, n in groups))
+ 
+ 
+-def _tensor_map(param: tuple[int, int]) -> bool:
+-    # a kernel parameter shaped as a CUtensorMap (128 bytes at a 64-byte aligned offset): a TMA descriptor the library
+-    # encoded, as cuBLAS's nvjet kernels take them
+-    offset, size = param
+-    return size == 128 and offset % 64 == 0
+-
+-
+-def _canonical(binding: OpaqueBinding, stale: Callable[[int], bool], like: OpaqueBinding | None = None) -> OpaqueBinding:
+-    # each constant qword (alike in every capture, no slot's, not loose) whose
+-    # high half is a stale address's with that half zeroed: cuDNN builds its
+-    # parameter structs on the heap before the captures, and a field may hold
+-    # another field's leftovers, an address's high half that depends on where
+-    # things were mapped then (CUTLASS strided dgrad reads the high half of an
+-    # int32's qword as a flag, and hangs on some). Zeroed, the binding no
+-    # longer depends on the address space; verify judges that form, and the
+-    # zeroed bytes are loose (a restore's capture holds its own leftovers).
+-    # With `like` (a sibling's template): the template's zeroed high halves
+-    def zeroed(n: OpaqueKernel) -> set[tuple[int, int]]:
+-        return {(p, o - 4) for p, o, size in n.loose if size == 4 and o % 8 == 4 and not any(n.images[p][o : o + 4])}
++_STALE_STRUCT = "the harvest's own address high half in a cuDNN parameter struct (refused, never rewritten)"
++
+ 
+-    nodes, changed = [], False
++def _stale_constant(binding: OpaqueBinding, stale: Callable[[int], bool]) -> tuple[int, int, int, int] | None:
++    # the first constant qword (alike in every capture, no slot's, not loose)
++    # `stale` holds, as (node, parameter, byte, qword). cuDNN builds its
++    # parameter structs on the heap before the captures and a field may hold
++    # another's leftovers: the high half of one of the harvest's own addresses
++    # above an int32 is a byte eager's struct would not hold (CUTLASS strided
++    # dgrad reads that half as a flag and hangs on 0xff11's). Such a binding is
++    # refused before any launch, never rewritten: a rewritten word may be one
++    # the kernel reads (a CUtensorMap's, also inside a CUTLASS 3 Params
++    # struct), and verify's one launch does not prove it never does
+     for x, n in enumerate(binding.nodes):
+         if not isinstance(n, OpaqueKernel):
+-            nodes.append(n)
+             continue
+-        template = like.nodes[x] if like is not None else None
+         near = {(s.param, s.offset + d) for s in n.slots for d in range(-7, 8)}
+         loose = {(p, o + i) for p, o, size in n.loose for i in range(size)}
+-        images, runs = list(n.images), []
+         for param, image in enumerate(n.images):
+-            if _tensor_map(n.params[param]):
+-                # a CUtensorMap's words are its encoding (a field there that reads as an address's high half is
+-                # the map's, and a TMA load or store through a map with it zeroed traps): never canonical
+-                continue
+             for i, q in enumerate(_qwords(image, 0)):
+                 off = 8 * i
+-                if not q >> 32:
+-                    continue
+-                if template is not None:
+-                    if (param, off) not in zeroed(template):
+-                        continue
+-                elif (param, off) in near or any((param, off + b) in loose for b in range(8)) or not stale(q):
+-                    continue
+-                images[param] = images[param][: off + 4] + bytes(4) + images[param][off + 8 :]
+-                runs.append((param, off + 4, 4))
+-        if runs:
+-            changed = True
+-            loose_runs = n.loose if template is not None else tuple(sorted({*n.loose, *runs}))
+-            n = dataclasses.replace(n, images=tuple(images), loose=loose_runs)
+-        nodes.append(n)
+-    return dataclasses.replace(binding, nodes=tuple(nodes)) if changed else binding
++                if q >> 32 and (param, off) not in near and not any((param, off + b) in loose for b in range(8)) and stale(q):
++                    return x, param, off, q
++    return None
++
++
++def _own_highs() -> set[int]:
++    # the high halves of the harvest's reservations at their hints (_HINTED: the operand arena, the captures'
++    # address-only spans, the mirror spans): 0xFE00.. and 0xFF00.. as reserved today
++    return {h for a, n in _HINTED.items() for h in range(a >> 32, ((a + n - 1) >> 32) + 1)}
++
+ 
+ class HarvestProvider:
+     """The OpaqueProvider for the ops of `families`: "blas", bf16, fp16 and
+@@ -2146,7 +2138,10 @@
+                 nodes.append(dataclasses.replace(n, images=tuple(images), slots=slots, loose=t.loose))
+             binding = _renumbered(nodes, [n for _, n in blocks], 0, cap[6], key.op in _OUT)
+             if key.op in _CUDNN:
+-                binding = _canonical(binding, bool, like=template)
++                highs = _own_highs()
++                stale_at = _stale_constant(binding, lambda q: q >> 32 in highs and not _cuda_address(q))
++                if stale_at is not None:
++                    raise _NoSibling("parameter {1} byte {2}: {3:#x}, the harvest's own high half".format(*stale_at))
+             shared = _shared(binding)
+             # its blocks shared as the template's are (unshared if the template's shared form refused)
+             return shared if len(shared.scratch) == len(template.scratch) else binding
+@@ -2416,25 +2411,25 @@
+             raise _Refused(f"{names} take {increment} philox offsets and read no captured generator state")
+         del sets
+ 
+-        # a stale address's high half: past the lowest device address the
+-        # harvest knows (its reservations, the call's operands) or in the
+-        # heap, mapped by nothing (a live constant address is verify's to mirror)
+-        low = min([a for a, _, _ in ours if a] + addresses[0]) >> 32
+-
+-        def stale_high(q: int) -> bool:
+-            return (low <= q >> 32 < 1 << 16 or heap[0] <= q < heap[1]) and q not in retired_qwords and not stack[0] <= q < stack[1] and not _cuda_address(q)
+-
+-        # the forms verify judges, the first it passes binding: stale high
+-        # halves zeroed, then the captured bytes; each with its scratch shared
+-        # (a block that must start zeroed, or a node reaching a block past its
+-        # slots, refuses that), then each block its own
+-        # only for cuDNN's bindings, whose parameter structs it builds on the heap before the captures (what
+-        # _canonical is for); a cuBLAS / CUTLASS binding's constants are its own (its tensor maps' words among them)
+-        canonical = _canonical(binding, stale_high) if op in _CUDNN else binding
+-        forms = []
+-        for c in (canonical, binding) if canonical is not binding else (binding,):
+-            shared = _shared(c)
+-            forms += [shared, c] if shared is not c else [c]
++        # cuDNN builds its parameter structs on the heap before the captures: a
++        # constant there whose high half is one of the harvest's own ranges'
++        # (under an int32, or a stale address into them) is the harvest's
++        # leftover, which eager's struct would not hold, and refuses
++        # (_stale_constant). A cuBLAS / CUTLASS binding's constants are its own
++        highs = _own_highs()
++
++        def own_high(q: int) -> bool:
++            return q >> 32 in highs and q not in retired_qwords and not _cuda_address(q)
++
++        stale_at = _stale_constant(binding, own_high) if op in _CUDNN else None
++        if stale_at is not None:
++            x, param, off, q = stale_at
++            raise _Refused(f"{names[x]} parameter {param} byte {off}: {q:#x}, {_STALE_STRUCT}")
++        # the forms verify judges, the first it passes binding: its scratch
++        # shared (a block that must start zeroed, or a node reaching a block
++        # past its slots, refuses that), then each block its own
++        shared = _shared(binding)
++        forms = [shared, binding] if shared is not binding else [binding]
+         for form in forms[:-1]:
+             try:
+                 return verify(form, stale, names, retired_qwords)

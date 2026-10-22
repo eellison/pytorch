@@ -1,0 +1,155 @@
+diff -ru -x __pycache__ step_ms21/test/test_cuda_host_trace_replay.py step_ms22/test/test_cuda_host_trace_replay.py
+--- step_ms21/test/test_cuda_host_trace_replay.py	2026-10-18 10:23:09.510059111 -0700
++++ step_ms22/test/test_cuda_host_trace_replay.py	2026-10-18 10:23:09.595213387 -0700
+@@ -431,6 +431,21 @@
+     return torch.empty_like(x)
+ 
+ 
++@torch.library.custom_op("host_trace_test::flat_mul", mutates_args=())
++def flat_mul(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
++    # tactic_mul with its output allocated flat by rows times the weight's length (a formula over a static-prefix
++    # layout symbol and a call's), viewed back
++    B = 128 if x.shape[0] <= 16 else 256
++    y = torch.empty(x.shape[0] * w.shape[0], device=x.device, dtype=x.dtype)
++    _mul_cols[(triton.cdiv(y.numel(), B),)](x, w, y, y.numel(), w.numel(), B=B)
++    return y.view(x.shape[0], w.shape[0])
++
++
++@flat_mul.register_fake
++def _(x, w):
++    return x.new_empty(x.shape[0], w.shape[0])
++
++
+ @torch.library.custom_op("host_trace_test::tactic_op", mutates_args=())
+ def tactic_op(x: torch.Tensor) -> torch.Tensor:
+     return tactic_add(x)
+@@ -1067,6 +1082,25 @@
+         self.assertEqual(lo.addresses, frozenset(lo.key(r.root.sym) for r in inputs))
+         self.assertEqual(lo.first_inputs, {id(r.root): r for r in reversed(inputs)})
+ 
++    def test_layers_share_a_template_over_a_formula_of_a_weights_size(self):
++        # each layer's op allocates its output by a formula over its weight's length (a static-prefix layout symbol,
++        # one per layer, of one value) times the call's rows (GDN's prefill workspace): the key takes the weight's
++        # symbol at its value, so the layers share one template, each instance pinning the symbols at their values
++        layers = 4
++        ws = [torch.randn(64, device="cuda") for _ in range(layers)]
++
++        def fn(*a):
++            *weights, x = a
++            for w in weights:
++                x = torch.ops.host_trace_test.flat_mul(x, w)
++            return x
++
++        f = HostTraceReplay(fn, static_prefix=layers)
++        for m in (8, 24, 8, 24):
++            x = torch.randn(m, 64, device="cuda")
++            self.assertEqual(f(*ws, x), fn(*ws, x), atol=0, rtol=0)
++        self.assertEqual((f.traces, f.redispatches, f.redos, f.redo_instances), (1, 1, 2, layers - 2))
++
+     def test_a_static_prefix_weight_at_another_offset_takes_no_template(self):
+         # a static-prefix weight's layout values are constants of the entry and key the read: the second weight's offset
+         # (4 bytes, off 16-byte alignment, so its kernel specializes otherwise) keys it apart and it is redone in full
+diff -ru -x __pycache__ step_ms21/torch/cuda/_host_trace_redispatch.py step_ms22/torch/cuda/_host_trace_redispatch.py
+--- step_ms21/torch/cuda/_host_trace_redispatch.py	2026-10-18 07:01:03.764541576 -0700
++++ step_ms22/torch/cuda/_host_trace_redispatch.py	2026-10-18 07:32:43.901971704 -0700
+@@ -112,7 +112,7 @@
+                 if template is not None:
+                     # its roots at this op's positions: the same object at a pin, another static-prefix argument (its
+                     # guards renamed onto it, its keyed layout values checked), else the full redo
+-                    template = _for_instance(lowered, template, reads[1], static_prefix)
++                    template = _for_instance(lowered, template, reads[1], static_prefix, reads[3])
+                 if template is not None and program.values[template.predicate] == 1 and _bound(lowered, reads[2], program.values):
+                     entry, after = _instantiate(lowered, i, template, reads[1], base, selector, op)
+                     if torch.cuda._host_trace.verify_redo_templates:
+@@ -129,7 +129,7 @@
+                 entries.append(entry)
+                 recorded.append((i, tuple(guards)))
+                 if reads is not None and (template := _template(lowered, entry, guards, launches, section, reads[1], op)) is not None:
+-                    lo.templates[reads[0]] = template
++                    lo.templates[reads[0]] = replace(template, substituted=reads[3])
+         entries.sort(key=lambda e: unselected.index(e[0]))
+         compiled = compile_program(program)
+         lo.entry_guards += recorded
+@@ -181,6 +181,8 @@
+     pinned: tuple[tuple[int, _Root], ...]
+     # the read walk's roots of the op whose redo it is (_for_instance maps them onto another op's)
+     roots: tuple[_Root, ...] = ()
++    # the declared symbols its key took at their values (_reads): pinned there where another op takes it
++    substituted: frozenset[str] = frozenset()
+ 
+ 
+ def _reads(lowered: LoweredTape, op: OpRec, selector: LoweredSelector, declared: frozenset[str] = frozenset()) -> tuple[Any, list[_Root], tuple[int, ...]] | None:
+@@ -204,9 +206,12 @@
+     if op.kind != "traced" or op.redo is None or not isinstance(func, OpOverload) or not lowered.lowering.ir:
+         return None
+     old = lowered.tape
++    ctx = old.shape_env.ctx
+     items: list[Any] = [func, repr(pytree.tree_structure(op.call)), len(selector.nodes)]
+     roots: list[_Root] = []
+     seen: dict[int, int] = {}
++    # the declared symbols a formula over others too is keyed at (their hints): pinned at them where taken (_for_instance)
++    substituted: set[str] = set()
+ 
+     def value(v: Any) -> None:
+         if isinstance(v, torch.SymFloat) or (isinstance(v, torch.Tensor) and not isinstance(v, _TracedTensor)):
+@@ -215,8 +220,20 @@
+             items.append(("bool", v.node.node) if v.node.constant is None else (bool, bool(v.node.constant)))
+         elif isinstance(v, torch.SymInt):
+             k = _sym_key(v)
+-            fs = k.free_symbols if isinstance(k, _ir.Node) else ()
+-            items.append(("value", int(k.hint)) if fs and fs <= declared else ("int", k))
++            fs = k.free_symbols if isinstance(k, _ir.Node) else frozenset()
++            if fs and fs <= declared:
++                items.append(("value", int(k.hint)))
++            elif fs & declared:
++                # a formula over a static-prefix layout symbol and a call's (a weight's dimension times the rows): each
++                # layer's weight has its own symbol of the same value, so the declared ones are keyed at their values
++                hints = {name: ctx.const(int(ctx.symbols[name].hint)) for name in fs & declared}
++                substituted.update(hints)
++                try:
++                    items.append(("int", ctx.transfer(k, ctx, collections.ChainMap(hints, ctx.symbols), {})))
++                except (KeyError, ArithmeticError, ValueError) as e:
++                    raise _Unclassified from e
++            else:
++                items.append(("int", k))
+         else:
+             items.append((type(v), repr(v) if isinstance(v, float) else v))
+ 
+@@ -286,7 +303,7 @@
+         hash(key)
+     except TypeError:
+         return None
+-    return key, roots, sites
++    return key, roots, sites, frozenset(substituted)
+ 
+ 
+ def _declared(lowered: LoweredTape, static_prefix: int) -> frozenset[str]:
+@@ -305,7 +322,7 @@
+     return got
+ 
+ 
+-def _for_instance(lowered: LoweredTape, t: Template, roots: list[_Root], static_prefix: int) -> Template | None:
++def _for_instance(lowered: LoweredTape, t: Template, roots: list[_Root], static_prefix: int, substituted: frozenset[str] = frozenset()) -> Template | None:
+     """Template t for the op whose read walk gave `roots`, or None (a full
+     redo). Each position where t's op read a static-prefix argument: this op
+     reads one too, and its layout symbols and t's op's hold the values the key
+@@ -315,14 +332,16 @@
+     there moves to it. A pin on any other root needs the same object."""
+     lo, old = lowered.lowering, lowered.tape
+     if len(t.roots) != len(roots):
+-        return t if all(roots[p] is r for p, r in t.pinned) else None
+-    cache_key = (id(t), tuple(map(id, roots)))
++        # (a substituted symbol needs its pins: a full redo)
++        return t if not (t.substituted or substituted) and all(roots[p] is r for p, r in t.pinned) else None
++    cache_key = (id(t), tuple(map(id, roots)), substituted)
+     if cache_key in lo.instance_templates:
+         return lo.instance_templates[cache_key]
+     recs = lo.first_inputs
+     ctx = old.shape_env.ctx
+     subs: dict[str, _ir.Node] = {}
+-    pins: list[Any] = []
++    # the declared symbols both keys took at their values hold them at the call (a static prefix's layouts)
++    pins: list[Any] = [(ctx.eq(ctx.symbols[name], ctx.const(int(ctx.symbols[name].hint))), None) for name in sorted(t.substituted | substituted)]
+     moved: set[int] = set()
+     out: Template | None = t
+     for p, (mine, theirs) in enumerate(zip(t.roots, roots)):

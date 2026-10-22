@@ -1,0 +1,74 @@
+--- a/test/test_cuda_host_trace_harvest.py
++++ b/test/test_cuda_host_trace_harvest.py
+@@ -29,6 +29,7 @@
+ 
+     import torch._inductor.inductor_prims  # noqa: F401 (prims.inductor_seeds)
+     import torch.cuda._host_trace_harvest as harvest
++    import torch.cuda._host_trace_memory as memory
+     from torch.cuda._host_trace_harvest import _launch, HarvestProvider
+     from torch.cuda._host_trace_opaque import library_state, OpaqueKernel, OpaqueKey
+     from torch.cuda._host_trace_replay import _BACKGROUND, HostTraceReplay
+--- a/torch/cuda/_host_trace_memory.py
++++ b/torch/cuda/_host_trace_memory.py
+@@ -341,6 +341,42 @@
+     return MemoryPlan(tuple(sorted(k for k in escapes if k < n_alloc)), tuple(plan))
+ 
+ 
++def check_plan(lowered: LoweredTape, plan: MemoryPlan) -> None:
++    """That every allocation a step uses is live there in the plan: at each launch, those its pointer
++    slots and its keyed site's table (operands, scratch) reach, a temporary of its run between its
++    seq and its last use, a tensor from its step to the one that drops it; at an eager step, its
++    leaves' tensors. A plan that frees an allocation before a use lets a later one take its bytes
++    while it is in use. Build time only."""
++    n = len(lowered.allocations)
++    made, spans, dropped = {}, {}, {}
++    for i, step in enumerate(plan.steps):
++        made.update((k, i) for k in step.tensors)
++        spans.update((k, (i, seq, last)) for k, seq, last in step.temporaries)
++        dropped.update((b, i) for b in step.drops)
++    held = set(plan.relocated)
++    tables: dict[int, list[int]] = {}
++    for site in lowered.sites:
++        for j in site.nodes:
++            tables.setdefault(j, []).extend(b for _, b in (*site.operands, *site.scratch.values()) if 0 <= b < n)
++
++    def live(b: int, i: int, seq: float) -> bool:
++        if b in held or b >= n:
++            return True
++        if b in spans:
++            run, first, last = spans[b]
++            return run == i and first <= seq <= last
++        return made.get(b, len(plan.steps)) <= i <= dropped.get(b, len(plan.steps))
++
++    for i, step in enumerate(lowered.steps):
++        if isinstance(step, range):
++            uses = [(lowered.launches[j].seq, [s.base for s in lowered.launches[j].slots if isinstance(s, PointerSlot) and s.base is not None] + tables.get(j, [])) for j in step]
++        else:
++            uses = [(step.seq, [k for kind, k in (leaf.base for leaf in step.leaves if isinstance(leaf, LoweredView)) if kind == "allocation"])]
++        for seq, bases in uses:
++            if bad := [b for b in bases if not live(b, i, seq)]:
++                raise AssertionError(f"host_trace: allocations {bad} are used at step {i} (seq {seq}) outside their lifetimes in the memory plan")
++
++
+ def _nbytes(lowered: LoweredTape) -> list[int]:
+     """Each base's bytes at the traced call: allocation k's, then eager output
+     j's at len(allocations) + j, as its predictions extend."""
+--- a/torch/cuda/_host_trace_replay.py
++++ b/torch/cuda/_host_trace_replay.py
+@@ -78,7 +78,7 @@
+ from torch.cuda._host_trace_capture import capture_tape, instantiate_form, plain_attributes, SegmentFailed
+ from torch.cuda._host_trace_harvest import HarvestProvider
+ from torch.cuda._host_trace_lower_tape import fold, FoldRefused, lower_guards, lower_tape, PointerSlot, PredictedOutput
+-from torch.cuda._host_trace_memory import arena_addresses, auto_memory, plan_memory, relocate, relocate_entries, size_classes, split_runs, SPLITS
++from torch.cuda._host_trace_memory import arena_addresses, auto_memory, check_plan, plan_memory, relocate, relocate_entries, size_classes, split_runs, SPLITS
+ from torch.cuda._host_trace_opaque import key_guards, library_state_as, span_bytes
+ from torch.cuda._host_trace_program import Status
+ from torch.cuda._host_trace_redispatch import redispatch, respec
+@@ -1331,6 +1331,7 @@
+             memory, arenas = size_classes(lowered, packed=self.memory == "packed", reuse=self.memory != "planned_no_reuse", split=self.memory != "planned_no_split")
+         else:
+             memory = plan_memory(lowered, self.memory if native else "run_buffer")
++        check_plan(lowered, memory)
+         # capture_tape checks the compiled program at the traced call against
+         # these rows
+         values = lowered.program.values

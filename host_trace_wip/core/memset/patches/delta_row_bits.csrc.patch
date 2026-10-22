@@ -1,0 +1,160 @@
+--- a/torch/csrc/cuda/host_trace/Sites.cpp
++++ b/torch/csrc/cuda/host_trace/Sites.cpp
+@@ -17,6 +17,8 @@
+ int64_t delta_fulls = 0;
+ int64_t delta_rows_evaluated = 0;
+ bool delta_enabled = true;
++int64_t delta_row_builds = 0;
++bool delta_rows_check = false;
+ int64_t delta_slots = 3;
+ int64_t delta_exchanges = 0;
+ int64_t valid_first_misses = 0;
+@@ -640,17 +642,47 @@
+   }
+   DeltaRows d;
+   d.changed.assign(changed.begin(), changed.end());
+-  std::vector<uint32_t> leaves, rows;
++  const size_t words = (dynamic_rows_.size() + 63) / 64;
++  if (dynamic_valid_bits_.size() != words) {
++    dynamic_valid_bits_.assign(words, 0);
++    for (size_t p = 0; p < dynamic_rows_.size(); ++p) {
++      if (std::binary_search(dynamic_valid_rows_.begin(), dynamic_valid_rows_.end(), dynamic_rows_[p])) {
++        dynamic_valid_bits_[p / 64] |= uint64_t{1} << (p % 64);
++      }
++    }
++  }
++  leaf_reads_.resize(dynamic_leaves_.size());
++  std::vector<uint64_t> reads(words, 0);
+   for (size_t j = 0; j < dynamic_leaves_.size(); ++j) {
+     if ((changed[j / 64] >> (j % 64)) & 1) {
+-      leaves.push_back(dynamic_leaves_[j]);
++      std::vector<uint64_t>& bits = leaf_reads_[j];
++      if (bits.size() != words) {
++        program_.reading_bits(dynamic_leaves_[j], dynamic_rows_, bits);
++      }
++      for (size_t w = 0; w < words; ++w) {
++        reads[w] |= bits[w];
++      }
+     }
+   }
+-  program_.reading(leaves, dynamic_rows_, rows);
+-  for (uint32_t r : rows) {
+-    const bool valid = std::binary_search(
+-        dynamic_valid_rows_.begin(), dynamic_valid_rows_.end(), r);
+-    (valid ? d.valid_rows : d.other_rows).push_back(r);
++  for (size_t w = 0; w < words; ++w) {
++    for (uint64_t b = reads[w]; b != 0; b &= b - 1) {
++      const size_t p = w * 64 + static_cast<size_t>(__builtin_ctzll(b));
++      ((dynamic_valid_bits_[w] >> (p % 64)) & 1 ? d.valid_rows : d.other_rows).push_back(dynamic_rows_[p]);
++    }
++  }
++  ++delta_row_builds;
++  if (delta_rows_check) {
++    std::vector<uint32_t> leaves, rows, valid, other;
++    for (size_t j = 0; j < dynamic_leaves_.size(); ++j) {
++      if ((changed[j / 64] >> (j % 64)) & 1) {
++        leaves.push_back(dynamic_leaves_[j]);
++      }
++    }
++    program_.reading(leaves, dynamic_rows_, rows);
++    for (uint32_t r : rows) {
++      (std::binary_search(dynamic_valid_rows_.begin(), dynamic_valid_rows_.end(), r) ? valid : other).push_back(r);
++    }
++    TORCH_CHECK(valid == d.valid_rows && other == d.other_rows, "host_trace: a delta's rows differ from reading()'s");
+   }
+   delta_memo_.push_back(std::move(d));
+   return delta_memo_.back();
+@@ -676,6 +708,8 @@
+   site_memo_cache_ = false;
+   delta_valid_ = delta_marked_ = false;
+   delta_memo_.clear();
++  leaf_reads_.clear();
++  dynamic_valid_bits_.clear();
+   delta_slots_.clear();
+   delta_last_changed_.clear();
+   dynamic_pairs_.clear();
+--- a/torch/csrc/cuda/host_trace/Variant.h
++++ b/torch/csrc/cuda/host_trace/Variant.h
+@@ -83,6 +83,10 @@
+ extern int64_t delta_fulls;
+ extern int64_t delta_rows_evaluated;
+ extern bool delta_enabled;
++// DeltaRows built (memo misses); test-only: each also built by
++// HostTraceProgram::reading and compared
++extern int64_t delta_row_builds;
++extern bool delta_rows_check;
+ // the static-prefix delta cache keeps up to this many other calls' dynamic
+ // rows besides its own (sizes that alternate re-evaluate nothing)
+ extern int64_t delta_slots;
+@@ -1043,6 +1047,12 @@
+     uint64_t site_reads_version = 0;
+   };
+   DeltaRows& delta_rows(c10::ArrayRef<uint64_t> changed);
++  // a DeltaRows' rows are the union of each changed leaf's (reading is an OR
++  // over operands): per dynamic leaf, the dynamic rows reading it (filled on
++  // its first change), and the valid ones, as bits by position in
++  // dynamic_rows_
++  std::vector<std::vector<uint64_t>> leaf_reads_;
++  std::vector<uint64_t> dynamic_valid_bits_;
+   // up to delta_slots other calls' dynamic rows (of
+   // the cache's generation), and the site memo with them: a call whose dynamic
+   // leaves are nearer one's than the cache's (sizes that alternate) exchanges
+--- a/torch/csrc/cuda/host_trace/Program.h
++++ b/torch/csrc/cuda/host_trace/Program.h
+@@ -71,6 +71,11 @@
+       const std::vector<uint32_t>& leaves,
+       const std::vector<uint32_t>& rows,
+       std::vector<uint32_t>& out) const;
++  // reading()'s rows as bits by position in `rows` (bit p for rows[p])
++  void reading_bits(
++      uint32_t leaf,
++      const std::vector<uint32_t>& rows,
++      std::vector<uint64_t>& bits) const;
+   // leaf i's (input, kind, dim)
+   std::tuple<int64_t, int64_t, int64_t> leaf(size_t i) const {
+     const Leaf& l = leaves_[i];
+--- a/torch/csrc/cuda/host_trace/Program.cpp
++++ b/torch/csrc/cuda/host_trace/Program.cpp
+@@ -472,6 +472,31 @@
+   }
+ }
+ 
++void HostTraceProgram::reading_bits(
++    uint32_t leaf,
++    const std::vector<uint32_t>& rows,
++    std::vector<uint64_t>& bits) const {
++  bits.assign((rows.size() + 63) / 64, 0);
++  std::vector<bool> reads(rows_.size(), false);
++  for (size_t p = 0; p < rows.size(); ++p) {
++    const uint32_t i = rows[p];
++    const Row& row = rows_[i];
++    const int64_t* x = operands_.data() + row.first;
++    bool r = false;
++    if (row.op == Op::Leaf) {
++      r = static_cast<uint32_t>(x[0]) == leaf;
++    } else if (row.op != Op::Constant) {
++      for (uint32_t k = 0; k < row.count && !r; ++k) {
++        r = reads[x[k]];
++      }
++    }
++    reads[i] = r;
++    if (r) {
++      bits[p / 64] |= uint64_t{1} << (p % 64);
++    }
++  }
++}
++
+ namespace {
+ 
+ using Buffer = c10::SmallVector<int64_t, 256>;
+--- a/torch/csrc/cuda/host_trace/Entry.cpp
++++ b/torch/csrc/cuda/host_trace/Entry.cpp
+@@ -2146,6 +2146,8 @@
+     return py::make_tuple(delta_skips, delta_partials, delta_fulls, delta_rows_evaluated);
+   });
+   m.def("_host_trace_delta", [](bool enable) { delta_enabled = enable; });
++  m.def("_host_trace_delta_row_builds", [] { return delta_row_builds; });
++  m.def("_host_trace_delta_rows_check", [](bool enable) { delta_rows_check = enable; });
+   m.def("_host_trace_variant_order", [](bool enable) {
+     variant_order_enabled = enable;
+   });

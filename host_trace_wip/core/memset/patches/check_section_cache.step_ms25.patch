@@ -1,0 +1,98 @@
+diff -ru -x __pycache__ step_ms25/torch/cuda/_host_trace_lower_tape.py step_ms26/torch/cuda/_host_trace_lower_tape.py
+--- step_ms25/torch/cuda/_host_trace_lower_tape.py	2026-10-16 09:50:16.779635538 -0700
++++ step_ms26/torch/cuda/_host_trace_lower_tape.py	2026-10-18 11:58:47.268256697 -0700
+@@ -384,6 +384,11 @@
+         self.placed_sections: dict[int, tuple[int, int, int]] = {}
+         # per step, (its plan StepMemory, its events' sorted keys) for _host_trace_memory.section_places
+         self.section_keys: dict[int, tuple[Any, list]] = {}
++        # check_section's: per lowering, _first_seqs (keyed by the allocation and launch counts); per plan, _liveness;
++        # per step, the run's own lifetimes (_lifetimes) with the plan they are of
++        self.first_seqs: tuple[tuple[int, int], list[int]] | None = None
++        self.liveness: tuple[Any, Any] | None = None
++        self.run_lifetimes: dict[int, tuple[Any, dict]] = {}
+         # redo templates (_host_trace_redispatch): an entry by what its op's redo reads, rows of this program; and the
+         # entries instantiated from them and redone in full
+         self.templates: dict[Any, Any] = {}
+diff -ru -x __pycache__ step_ms25/torch/cuda/_host_trace_memory.py step_ms26/torch/cuda/_host_trace_memory.py
+--- step_ms25/torch/cuda/_host_trace_memory.py	2026-10-16 09:50:16.779131823 -0700
++++ step_ms26/torch/cuda/_host_trace_memory.py	2026-10-18 11:59:02.237080392 -0700
+@@ -279,7 +279,15 @@
+ def _first_seqs(lowered: LoweredTape) -> list[int]:
+     """Per allocation, the first seq a launch may use it at, its own seq at
+     most: a side stream's launch from its fork on (LoweredTape.span), so an
+-    allocation it uses is made before what may run beside it frees bytes."""
++    allocation it uses is made before what may run beside it frees bytes.
++    Made once per lowering (its allocations and launches are fixed)."""
++    cached = lowered.lowering.first_seqs
++    if cached is None or cached[0] != (len(lowered.allocations), len(lowered.launches)):
++        cached = lowered.lowering.first_seqs = ((len(lowered.allocations), len(lowered.launches)), _first_seqs_of(lowered))
++    return cached[1]
++
++
++def _first_seqs_of(lowered: LoweredTape) -> list[int]:
+     first = [a.seq for a in lowered.allocations]
+     if lowered.streams is None:
+         return first
+@@ -488,7 +496,14 @@
+ def _liveness(lowered: LoweredTape, plan: MemoryPlan) -> Callable[[int, int, float], bool]:
+     """Whether allocation b is live at step i, seq `seq` in the plan: a temporary of the run between its
+     seq and its last use, a tensor from its seq in its step to the step that drops it; a held or
+-    relocated one, an eager output's, always."""
++    relocated one, an eager output's, always. Made once per plan."""
++    cached = lowered.lowering.liveness
++    if cached is None or cached[0] is not plan:
++        cached = lowered.lowering.liveness = (plan, _liveness_of(lowered, plan))
++    return cached[1]
++
++
++def _liveness_of(lowered: LoweredTape, plan: MemoryPlan) -> Callable[[int, int, float], bool]:
+     n = len(lowered.allocations)
+     made, spans, dropped = {}, {}, {}
+     for i, step in enumerate(plan.steps):
+@@ -542,6 +557,22 @@
+     takes a freed one's bytes only after its free (_lifetimes): a base whose lifetime does not cover the
+     chain overlaps another that the plan makes after its free, or frees before it is made, within the
+     chain. Exact on the plan's lifetimes (no widening of the op's span). Build time only."""
++    why = _check_section(lowered, plan, nodes, launches, temporaries, drops)
++    if torch.cuda._host_trace.verify_redo_templates:
++        # its caches (_first_seqs, _liveness, the runs' lifetimes) give what a fresh computation does
++        lo = lowered.lowering
++        kept = lo.first_seqs, lo.liveness, lo.run_lifetimes
++        lo.first_seqs, lo.liveness, lo.run_lifetimes = None, None, {}
++        try:
++            fresh = _check_section(lowered, plan, nodes, launches, temporaries, drops)
++        finally:
++            lo.first_seqs, lo.liveness, lo.run_lifetimes = kept
++        if fresh != why:
++            raise AssertionError(f"host_trace: check_section's caches give {why!r}, a fresh computation {fresh!r}")
++    return why
++
++
++def _check_section(lowered: LoweredTape, plan: MemoryPlan, nodes: Sequence[int], launches: Sequence[Any], temporaries: Sequence[tuple[int, int]], drops: Collection[int]) -> str | None:
+     step = next((i for i, s in enumerate(lowered.steps) if isinstance(s, range) and nodes and nodes[0] in s), None)
+     if step is None or not all(n in lowered.steps[step] for n in nodes):
+         return "its op's launches are not in one graph"
+@@ -583,11 +614,19 @@
+     section's own temporaries, made and freed before the first tensor the op's chain makes. A base absent
+     holds its bytes over the run (made before it, held or relocated, an eager output, a dropped one)."""
+     m = plan.steps[step]
+-    seqs = _first_seqs(lowered)
+-    skip = {k for k, *_ in plan.planned} | set(plan.relocated) | set(drops)
+-    lives: dict[tuple[str, int], tuple[float, float]] = {("allocation", k): (seqs[k], last) for k, _, last in m.temporaries if k not in skip}
++    # the run's own bases, by plan and step (a section's drops and temporaries are this call's)
++    cached = lowered.lowering.run_lifetimes.get(step)
++    if cached is None or cached[0] is not plan:
++        seqs = _first_seqs(lowered)
++        held = {k for k, *_ in plan.planned} | set(plan.relocated)
++        run = {("allocation", k): (seqs[k], last) for k, _, last in m.temporaries if k not in held}
++        if m.order or not m.temporaries:
++            run.update((("allocation", k), (seqs[k], math.inf)) for k in m.tensors if k not in held)
++        cached = lowered.lowering.run_lifetimes[step] = (plan, run)
++    lives: dict[tuple[str, int], tuple[float, float]] = dict(cached[1])
++    for k in drops:
++        lives.pop(("allocation", k), None)
+     if m.order or not m.temporaries:
+-        lives.update((("allocation", k), (seqs[k], math.inf)) for k in m.tensors if k not in skip)
+         section = (first - 0.5, math.inf) if m.order else (first - 0.5, first - 0.5)
+         lives.update((("section", b), section) for b in own)
+     else:

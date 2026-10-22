@@ -1,0 +1,179 @@
+--- a/torch/cuda/_host_trace_tape.py
++++ b/torch/cuda/_host_trace_tape.py
+@@ -37,7 +37,7 @@
+ from torch._C import _dispatch_has_kernel_for_dispatch_key as _has_kernel, DispatchKey
+ from torch._dispatch.python import enable_python_dispatcher
+ from torch._ops import OpOverload
+-from torch import _meta_registrations
++from torch import _meta_registrations, _prims_common as utils
+ from torch._prims.rng_prims import _impl_graphsafe_rng, graphsafe_run_with_rng_state
+ from torch._subclasses import fake_impls
+ from torch._subclasses.fake_impls import _compute_stride
+@@ -931,6 +931,8 @@
+                     keyset = torch._C.DispatchKeySet(torch._C.DispatchKey.CUDA)
+ 
+                     def body() -> Any:
++                        if func in _SYM_BODIES and any(isinstance(a, _SYM_TYPES) for a in pytree.tree_leaves((args, kwargs))):
++                            return _SYM_BODIES[func](*args, **kwargs)
+                         try:
+                             return func.redispatch(keyset, *args, **kwargs)
+                         except RuntimeError as e:
+@@ -1254,9 +1256,9 @@
+         if not all(isinstance(r.type, torch.TensorType) for r in schema.returns):
+             return f"it returns {len(schema.returns)} values"
+         values = (*args, *(kwargs.get(a.name, a.default_value) for a in schema.arguments[len(args) :]))
+-        # a size (full's) sets only the shapes, which the host takes from its tensors
+-        if any(isinstance(x, _SYM_TYPES) for s, a in zip(schema.arguments, values) if not isinstance(s.type, torch.ListType) for x in pytree.tree_leaves(a)):
+-            return "a symbolic scalar operand"
++        # the witness runs at the hints: a symbolic operand would replay as its value there
++        if any(isinstance(x, _SYM_TYPES) for x in pytree.tree_leaves(values)):
++            return "a symbolic operand"
+         written = [a for s, a in zip(schema.arguments, values) if s.alias_info is not None and s.alias_info.is_write]
+         if schema.is_mutable:
+             # in-place or out=: it writes and returns its written arguments
+@@ -1444,6 +1446,8 @@
+             plan.append((targets, [o.dtype for o in outs], inputs, common, node))
+         if next(live, None) is not None:
+             return f"its witness launched {len(nodes)} kernels, not one per nonempty iterator"
++        if isinstance(func, OpOverload) and not _witness_takes(func) and not empty_reductions:
++            return "ATen declares it no elementwise kernel and it reduces no empty tensor"
+         finals = [written_by.get(id(r)) or (traced[id(r)][1] if id(r) in traced else None) for r in results]
+         fakes: list = []
+         if None in finals or any(type(t) is int for targets, *_ in plan for t in targets):
+@@ -2062,6 +2066,43 @@
+ _NULLARY = (aten.fill_, aten.fill)
+ 
+ 
++# ops ATen tags no pointwise whose CUDA host is one TensorIterator kernel over
++# their tensors (copy_'s, or its memcpy) and which take no integer
++_UNTAGGED_ELEMENTWISE = frozenset(
++    {
++        aten.copy_,
++        aten.floor_divide,
++        aten.floor_divide_,
++        aten.complex,
++        aten.polar,
++        aten.zero_,
++        aten.hardswish,
++        aten.hardswish_,
++        aten.hardswish_backward,
++        aten.hardtanh_backward,
++        aten.log_sigmoid_forward,
++        aten.log_sigmoid_backward,
++        aten.mish_backward,
++        aten._prelu_kernel,
++        aten.elu_backward,
++        aten.leaky_relu_backward,
++        aten.softplus_backward,
++        aten.hardshrink_backward,
++        aten.softshrink_backward,
++        aten.hardsigmoid_backward,
++    }
++)
++
++
++def _witness_takes(func: OpOverload) -> bool:
++    # the pointwise witness decides at the hints whatever the op's host decides
++    # on its sizes and its integers (as_strided_copy's strides, narrow_copy's
++    # start, a pad of 0), so it takes only an op whose host decides nothing but
++    # its TensorIterator's. Another traces its body or runs eagerly, but where
++    # it reduces an empty tensor, whose zero size the trace specializes
++    return _pointwise(func) or func.overloadpacket in _UNTAGGED_ELEMENTWISE
++
++
+ @functools.cache
+ def _pointwise(func: OpOverload) -> bool:
+     # ATen's declaration (native_functions.yaml's pointwise tag) of the op or
+@@ -2220,6 +2261,59 @@
+ _NEW_FACTORIES = {aten.new_full.default: torch.full, aten.new_zeros.default: torch.zeros, aten.new_ones.default: torch.ones}
+ 
+ 
++def _full(size: list, fill_value: Any, *, dtype: Any = None, layout: Any = None, device: Any = None, pin_memory: Any = None) -> torch.Tensor:
++    # TensorFactories.cpp's full: empty, of the fill value's dtype where none is given (infer_full_options), filled
++    dtype = utils.type_to_dtype(type(fill_value)) if dtype is None else dtype
++    return torch.empty(size, dtype=dtype, layout=layout, device=device, pin_memory=pin_memory).fill_(fill_value)
++
++
++def _constant_pad_nd(x: torch.Tensor, pad: list, value: Any = 0) -> torch.Tensor:
++    # PadNd.cpp's constant_pad_nd, each of its tests of a pad a guard
++    torch._check(len(pad) % 2 == 0, lambda: f"Length of pad must be even but instead it equals {len(pad)}")
++    l_inp, l_pad = x.dim(), len(pad) // 2
++    l_diff = l_inp - l_pad
++    torch._check(l_inp >= l_pad, lambda: "Length of pad should be no more than twice the number of dimensions of the input.")
++    nonpositive, c_input = True, x
++    for i in range(l_diff, l_inp):
++        left, right = pad[2 * (l_inp - i - 1)], pad[2 * (l_inp - i - 1) + 1]
++        if left < 0:
++            c_input = c_input.narrow(i, -left, c_input.size(i) + left)
++        elif left != 0:
++            nonpositive = False
++        if right < 0:
++            c_input = c_input.narrow(i, 0, c_input.size(i) + right)
++        elif right != 0:
++            nonpositive = False
++    if nonpositive:
++        return c_input.clone()
++    new_shape = list(x.shape[:l_diff])
++    for i in range(l_pad):
++        k = len(pad) - (i + 1) * 2
++        new_dim = x.size(l_diff + i) + pad[k] + pad[k + 1]
++        torch._check(new_dim >= 0, lambda: f"constant_pad_nd: dimension {l_diff + i} of the output would be negative")
++        new_shape.append(new_dim)
++    output = torch.empty(new_shape, dtype=x.dtype, device=x.device, memory_format=utils.suggest_memory_format(x))
++    output.fill_(value)
++    c_output = output
++    for i in range(l_diff, l_inp):
++        left, right = pad[2 * (l_inp - i - 1)], pad[2 * (l_inp - i - 1) + 1]
++        if left > 0:
++            c_output = c_output.narrow(i, left, c_output.size(i) - left)
++        if right > 0:
++            c_output = c_output.narrow(i, 0, c_output.size(i) - right)
++    c_output.copy_(c_input)
++    return output
++
++
++# int-signature composite bodies (their sizes C10_AS_INTARRAYREF_SLOW) a call of
++# a symbolic size runs as their Python transcriptions, each part traced as any op
++_SYM_BODIES: dict[OpOverload, Callable[..., Any]] = {
++    aten.constant_pad_nd.default: _constant_pad_nd,
++    aten.full.default: _full,
++    aten.ones.default: lambda size, **options: _full(size, 1.0, **options),
++}
++
++
+ def _cpp_view(fake_mode: FakeTensorMode, func: OpOverload, *args: Any, **kwargs: Any) -> Any:
+     return func(*args, **kwargs)
+ 
+--- a/test/test_cuda_host_trace_aten.py
++++ b/test/test_cuda_host_trace_aten.py
+@@ -1064,6 +1064,30 @@
+         self.assertIsInstance(call, EagerCall)
+         self.assertIn("functor points at a tensor that is none of the op's", call.reason)
+ 
++    @parametrize("case", ["pad_right", "pad_left_crop_right", "pad_rows", "expand_copy", "narrow_copy", "as_strided_copy"])
++    def test_a_size_or_integer_argument_is_not_witnessed(self, case):
++        # traced where its list or integers are the identity (a pad of 0, an
++        # expand at 1, a narrow of every column, the strides of x) the op is a
++        # copy, which the witness would replay at every list: its body traces
++        # them, each test of a symbolic one a guard
++        aten = torch.ops.aten
++        pads = [(n, n + 8) for n in (16, 13, 32, 21, 14, 16)]  # (columns, row stride)
++        fn, shapes = {
++            "pad_right": (lambda x: F.pad(x, (0, (-x.shape[-1]) % 8)), pads),
++            "pad_left_crop_right": (lambda x: F.pad(x, ((-x.shape[-1]) % 8, -(x.shape[-1] % 2))), pads),
++            "pad_rows": (lambda x: F.pad(x.t(), (0, 0, 0, (-x.shape[-1]) % 8)), pads),
++            "expand_copy": (lambda x: aten.expand_copy(x[:, :1], [x.shape[0], x.shape[1] % 3]), pads),
++            "narrow_copy": (lambda x: aten.narrow_copy(x, 1, 0, 16), [(16, 24), (20, 24), (24, 32), (16, 24)]),
++            "as_strided_copy": (lambda x: aten.as_strided_copy(x, [4, 16], [24, 1]), [(16, 24), (16, 40), (16, 32), (16, 24)]),
++        }[case]
++        entry = HostTraceReplay(fn)
++        for n, stride in shapes:
++            x = _randn(4, stride, dtype=torch.float32)[:, :n]
++            got, want = entry(x), fn(x)
++            self.assertEqual((got.shape, got.stride()), (want.shape, want.stride()))
++            self.assertEqual(got, want, atol=0, rtol=0)
++        self.assertEqual(entry.eager, 0)
++
+     @parametrize("dtype", [torch.float16, torch.float32])
+     def test_pointwise_inplace_on_an_argument(self, dtype):
+         def fn(x, y):

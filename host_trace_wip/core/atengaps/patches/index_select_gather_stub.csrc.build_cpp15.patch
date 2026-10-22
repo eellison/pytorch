@@ -1,0 +1,115 @@
+diff -ru /data/eellison/src/pytorch/agent_space/paramgraph/land/int6/build_cpp15/src/aten/src/ATen/cuda/host_trace/TensorIteratorSym.cpp /data/eellison/src/pytorch/agent_space/paramgraph/land/int6/build_cpp17/src/aten/src/ATen/cuda/host_trace/TensorIteratorSym.cpp
+--- /data/eellison/src/pytorch/agent_space/paramgraph/land/int6/build_cpp15/src/aten/src/ATen/cuda/host_trace/TensorIteratorSym.cpp	2026-10-03 12:56:22.868776503 -0700
++++ /data/eellison/src/pytorch/agent_space/paramgraph/land/int6/build_cpp17/src/aten/src/ATen/cuda/host_trace/TensorIteratorSym.cpp	2026-10-14 02:40:49.385972908 -0700
+@@ -65,13 +65,6 @@
+   return iter;
+ }
+ 
+-TensorIteratorSym TensorIteratorSym::gather_op(Recorder& rec, const TensorBase& out, const TensorBase& src, const TensorBase& index) {
+-  TensorIteratorSym iter({out, src, index});
+-  iter.check_all_same_dtype_ = false;
+-  iter.build(rec);
+-  return iter;
+-}
+-
+ TensorIteratorSym TensorIteratorSym::reduce_op(Recorder& rec, const TensorBase& out, const TensorBase& a) {
+   TensorIteratorSym iter({out, a});
+   iter.is_reduction_ = true;
+diff -ru /data/eellison/src/pytorch/agent_space/paramgraph/land/int6/build_cpp15/src/aten/src/ATen/cuda/host_trace/TensorIteratorSym.h /data/eellison/src/pytorch/agent_space/paramgraph/land/int6/build_cpp17/src/aten/src/ATen/cuda/host_trace/TensorIteratorSym.h
+--- /data/eellison/src/pytorch/agent_space/paramgraph/land/int6/build_cpp15/src/aten/src/ATen/cuda/host_trace/TensorIteratorSym.h	2026-10-03 12:56:22.868776503 -0700
++++ /data/eellison/src/pytorch/agent_space/paramgraph/land/int6/build_cpp17/src/aten/src/ATen/cuda/host_trace/TensorIteratorSym.h	2026-10-14 02:40:49.385681130 -0700
+@@ -46,8 +46,6 @@
+   static TensorIteratorSym where_op(Recorder& rec, const TensorBase& cond, const TensorBase& a, const TensorBase& b);
+   // copy_impl's: dst is the output, src broadcasts to it
+   static TensorIteratorSym copy_op(Recorder& rec, const TensorBase& dst, const TensorBase& src);
+-  // cuda_scatter_gather_base_kernel's gather: src and index of out's shape
+-  static TensorIteratorSym gather_op(Recorder& rec, const TensorBase& out, const TensorBase& src, const TensorBase& index);
+   // out is make_reduction's view of the result
+   static TensorIteratorSym reduce_op(Recorder& rec, const TensorBase& out, const TensorBase& a);
+   // values and indices, make_reduction's views
+diff -ru /data/eellison/src/pytorch/agent_space/paramgraph/land/int6/build_cpp15/src/aten/src/ATen/native/cuda/Indexing.cu /data/eellison/src/pytorch/agent_space/paramgraph/land/int6/build_cpp17/src/aten/src/ATen/native/cuda/Indexing.cu
+--- /data/eellison/src/pytorch/agent_space/paramgraph/land/int6/build_cpp15/src/aten/src/ATen/native/cuda/Indexing.cu	2026-10-03 12:56:22.874776527 -0700
++++ /data/eellison/src/pytorch/agent_space/paramgraph/land/int6/build_cpp17/src/aten/src/ATen/native/cuda/Indexing.cu	2026-10-14 02:41:23.371406513 -0700
+@@ -20,8 +20,6 @@
+ #include <ATen/cuda/DeviceUtils.cuh>
+ #if !defined(USE_ROCM)
+ #include <ATen/cuda/host_trace/Ops.h>
+-#include <ATen/cuda/host_trace/TensorIteratorSym.h>
+-#include <ATen/native/cuda/IndexKernelUtils.h>
+ #endif
+ 
+ #ifndef AT_PER_OPERATOR_HEADERS
+@@ -2157,43 +2155,22 @@
+   }
+ }
+ 
+-// index_select_out_cuda_impl's gather_out of index expanded to out's shape,
+-// where cuda_scatter_gather_base_kernel takes the vectorized gather (keep in sync)
+-template <typename index_t>
++// index_select_out_cuda_impl's gather_out of index expanded to out's shape:
++// gather's own stub, whose host (cuda_scatter_gather_base_kernel) is symbolic
++// under the recorder (keep in sync)
+ void index_select_gather(Recorder& rec, const TensorBase& out, const TensorBase& self, int64_t dim, const TensorBase& index) {
+-  if (self.dim() == 0) {
+-    decline("a gather of a 0-dim tensor");
+-  }
+-  const c10::SymIntArrayRef new_size = out.sym_sizes();
+-  c10::SymDimVector tmp_size(new_size.size(), 1);
+-  tmp_size[dim] = index.sym_numel();
+-  const at::Tensor expanded = at::Tensor(index).view_symint(tmp_size).expand_symint(new_size);
+-  // restride_dim(self, dim, new_size)
+-  c10::SymDimVector src_strides(self.sym_strides().begin(), self.sym_strides().end());
+-  src_strides[dim] = 0;
+-  const at::Tensor src = at::Tensor(self).as_strided_symint(new_size, src_strides);
+-  const auto iter = TensorIteratorSym::gather_op(rec, out, src, expanded);
+-  if (!iter.can_use_32bit_indexing()) {
+-    decline("a gather split for 32-bit indexing");
+-  }
+-  // fast_gather_kernel_eligible<16>
+-  constexpr int64_t alignment = 16;
+-  const int64_t element_size = self.element_size();
+-  const c10::SymInt inp_stride_bytes = self.sym_stride(dim) * element_size;
+-  const bool eligible = iter.ndim() == 2 && iter.strides(2)[0] == 0 && iter.strides(2)[1] == iter.element_size(2) && iter.strides(0)[0] == element_size &&
+-      iter.strides(1)[0] == element_size && iter.strides(1)[1] == 0 && iter.data_ptr(0) % alignment == 0 && iter.data_ptr(1) % alignment == 0 &&
+-      iter.shape()[0] * element_size % alignment == 0 && inp_stride_bytes % alignment == 0 && iter.strides(0)[1] % alignment == 0;
+-  if (!eligible) {
+-    decline("a gather by the elementwise kernel");
++  c10::SymDimVector tmp_size(out.dim(), 1);
++  if (self.dim() > 0) {
++    tmp_size[dim] = index.sym_numel();
+   }
+-  at::native::vectorized_gather_kernel_record<alignment, index_t>(rec, iter.data_ptr(0), iter.data_ptr(1), iter.data_ptr(2), iter.shape()[1],
+-                                                                  iter.shape()[0] * element_size, self.sym_size(dim), inp_stride_bytes, iter.strides(0)[1]);
++  const at::Tensor expanded = at::Tensor(index).view_symint(tmp_size).expand_symint(out.sym_sizes());
++  RecorderGuard guard(&rec);
++  at::native::gather_stub(kCUDA, at::Tensor(out), at::Tensor(self), dim, expanded);
+ }
+ 
+ } // namespace
+ 
+-// index_select_cuda where it launches indexSelectSmallIndex, or gather_out's
+-// vectorized gather
++// index_select_cuda where it launches indexSelectSmallIndex, or gather_out
+ TensorBase index_select(Recorder& rec, const TensorBase& self, int64_t dim, const TensorBase& index) {
+   if (self.is_quantized()) {
+     decline("a quantized index_select");
+@@ -2219,13 +2196,13 @@
+       self.scalar_type(),
+       "index_select_cuda",
+       AT_WRAP([&] {
+-        AT_DISPATCH_INDEX_TYPES(index.scalar_type(), "index_select_out_cuda_impl", [&] {
+-          if (gather) {
+-            index_select_gather<index_t>(rec, out, self, dim, index);
+-          } else {
++        if (gather) {
++          index_select_gather(rec, out, self, dim, index);
++        } else {
++          AT_DISPATCH_INDEX_TYPES(index.scalar_type(), "index_select_out_cuda_impl", [&] {
+             index_select_launch<scalar_t, index_t>(rec, out, self, dim, index, out_numel / num_indices);
+-          }
+-        });
++          });
++        }
+       }),
+       AT_EXPAND(AT_ALL_TYPES_AND_COMPLEX),
+       AT_EXPAND(AT_BAREBONES_UNSIGNED_TYPES),

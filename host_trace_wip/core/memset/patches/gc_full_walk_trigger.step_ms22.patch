@@ -1,0 +1,37 @@
+diff -ru -x __pycache__ step_ms22/torch/cuda/_host_trace_replay.py step_ms23/torch/cuda/_host_trace_replay.py
+--- step_ms22/torch/cuda/_host_trace_replay.py	2026-10-17 14:18:47.090192444 -0700
++++ step_ms23/torch/cuda/_host_trace_replay.py	2026-10-18 10:50:42.609113933 -0700
+@@ -159,7 +159,7 @@
+ # whether a walk skips the immutable and final objects an earlier settle left tracked (O(the call's new objects));
+ # False: every walk is from the roots over everything still tracked
+ gc_untrack_incremental = True
+-# objects the incremental walks visited since the last full walk, objects that walk visited, full walks (_gc_untrack)
++# objects the incremental walks untracked since the last full walk, objects that walk visited, full walks (_gc_untrack)
+ _gc_walks = [0, 0, 0]
+ 
+ 
+@@ -1749,18 +1749,18 @@
+         torch._C._host_trace_gc_untrack(list(roots), _GC_KINDS, _gc_flags)
+         return
+     # an incremental walk untracks a subset of what a full one would (an old object that has become sealable since
+-    # its settle is not seen); a full walk runs once the incremental walks since the last one have visited as many
+-    # objects as it did, so the walks cost about twice the incremental ones and nothing stays tracked for good
++    # its settle is not seen); a full walk runs once the incremental walks since the last one have untracked as many
++    # objects as it visited (the variants' state about doubled), so the full walks cost at most the new objects the
++    # walks untracked: O(new objects) in all, and nothing that becomes sealable stays tracked for good
+     full = _gc_walks[0] >= _gc_walks[1]
+     before = torch._C._host_trace_gc_untrack_counts()[0]
+     # collections are held through the slow call (_gc_hold): generation 0 holds every object it made
+-    torch._C._host_trace_gc_untrack(list(roots), _GC_KINDS, _gc_flags, None if full else gc.get_objects(generation=0))
+-    walked = torch._C._host_trace_gc_untrack_counts()[0] - before
++    untracked = torch._C._host_trace_gc_untrack(list(roots), _GC_KINDS, _gc_flags, None if full else gc.get_objects(generation=0))
+     if full:
+-        _gc_walks[0], _gc_walks[1] = 0, walked
++        _gc_walks[0], _gc_walks[1] = 0, torch._C._host_trace_gc_untrack_counts()[0] - before
+         _gc_walks[2] += 1
+     else:
+-        _gc_walks[0] += walked
++        _gc_walks[0] += untracked
+ 
+ 
+ def _site_classes(sites: Sequence[LoweredKeyedSite]) -> list[int]:

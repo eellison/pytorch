@@ -1,0 +1,175 @@
+diff -ru -x __pycache__ step_ms24/test/test_cuda_host_trace_replay.py step_ms25/test/test_cuda_host_trace_replay.py
+--- step_ms24/test/test_cuda_host_trace_replay.py	2026-10-18 11:13:15.494707705 -0700
++++ step_ms25/test/test_cuda_host_trace_replay.py	2026-10-18 11:46:38.052048355 -0700
+@@ -1101,6 +1101,43 @@
+             self.assertEqual(f(*ws, x), fn(*ws, x), atol=0, rtol=0)
+         self.assertEqual((f.traces, f.redispatches, f.redos, f.redo_instances), (1, 1, 2, layers - 2))
+ 
++    def test_an_instance_keeps_the_renamed_guards_on_an_unpinned_root(self):
++        # tactic_mul's Triton launch specializes on its weight's 16-byte alignment: a guard on the weight's base address
++        # (unpinned) and its offset (a pinned static-prefix layout symbol). Each layer's instance renames it onto its
++        # own weight and conjoins it; a template guard renamed only through pinned layout symbols is dropped (the
++        # template's own under the pins). verify_redo_templates (on in the suites) checks the trimmed instance
++        # predicate equals the untrimmed one at each call that takes it
++        import torch.cuda._host_trace_redispatch as rd
++
++        self.assertTrue(torch.cuda._host_trace.verify_redo_templates)
++        layers = 4
++        ws = [torch.randn(64, device="cuda") for _ in range(layers)]
++
++        def fn(*a):
++            *weights, x = a
++            for w in weights:
++                x = torch.ops.host_trace_test.tactic_mul(x, w)
++            return x
++
++        before = collections.Counter(rd.for_instance_stats)
++        f = HostTraceReplay(fn, static_prefix=layers)
++        for m in (8, 24, 8, 24):
++            x = torch.randn(m, 64, device="cuda")
++            self.assertEqual(f(*ws, x), fn(*ws, x), atol=0, rtol=0)
++        moved = collections.Counter(rd.for_instance_stats)
++        moved.subtract(before)
++        self.assertEqual(f.redo_instances, layers - 2)
++        self.assertGreater(moved["computed"], 0)
++        # each computed instance keeps at least its alignment guard, renamed
++        self.assertGreaterEqual(moved["renamed"], moved["computed"])
++        # a misaligned weight is another key (the guard keeps it apart): redone in full, bitwise
++        base = torch.randn(64 + 1, device="cuda")
++        ws[2] = base[1:]
++        x = torch.randn(24, 64, device="cuda")
++        redos = f.redos
++        self.assertEqual(f(*ws, x), fn(*ws, x), atol=0, rtol=0)
++        self.assertGreaterEqual(f.redos + f.traces, redos + 1)
++
+     def test_a_static_prefix_weight_at_another_offset_takes_no_template(self):
+         # a static-prefix weight's layout values are constants of the entry and key the read: the second weight's offset
+         # (4 bytes, off 16-byte alignment, so its kernel specializes otherwise) keys it apart and it is redone in full
+diff -ru -x __pycache__ step_ms24/torch/cuda/_host_trace_redispatch.py step_ms25/torch/cuda/_host_trace_redispatch.py
+--- step_ms24/torch/cuda/_host_trace_redispatch.py	2026-10-18 07:32:43.901971704 -0700
++++ step_ms25/torch/cuda/_host_trace_redispatch.py	2026-10-18 11:46:20.164731248 -0700
+@@ -20,6 +20,7 @@
+ import collections
+ import contextlib
+ import threading
++import time
+ from dataclasses import dataclass, replace
+ from typing import Any, TYPE_CHECKING
+ 
+@@ -70,6 +71,9 @@
+ # test and diagnosis: redos a dispatch of the family served (no body run), and redo bodies run
+ dispatch_hits = 0
+ redo_bodies = 0
++# test and diagnosis: _for_instance's calls, those of another read walk length (no renaming), cache hits, computed instances
++# (their pins, renamed guards, guards trimmed of their pinned renames, declined ones and seconds)
++for_instance_stats: collections.Counter = collections.Counter()
+ 
+ 
+ def redispatch(
+@@ -113,6 +117,8 @@
+                     # its roots at this op's positions: the same object at a pin, another static-prefix argument (its
+                     # guards renamed onto it, its keyed layout values checked), else the full redo
+                     template = _for_instance(lowered, template, reads[1], static_prefix, reads[3])
++                if template is not None and template.untrimmed is not None and program.values[template.untrimmed] != program.values[template.predicate]:
++                    raise AssertionError(f"host_trace: {op.func}'s instance trimmed of its pinned renames disagrees with the untrimmed one at the call")
+                 if template is not None and program.values[template.predicate] == 1 and _bound(lowered, reads[2], program.values):
+                     entry, after = _instantiate(lowered, i, template, reads[1], base, selector, op)
+                     if torch.cuda._host_trace.verify_redo_templates:
+@@ -183,6 +189,9 @@
+     roots: tuple[_Root, ...] = ()
+     # the declared symbols its key took at their values (_reads): pinned there where another op takes it
+     substituted: frozenset[str] = frozenset()
++    # verify_redo_templates: an instance's predicate with every renamed guard (_for_instance trims those renamed only through
++    # pinned layout symbols), checked equal to its predicate at each call that takes it
++    untrimmed: int | None = None
+ 
+ 
+ def _reads(lowered: LoweredTape, op: OpRec, selector: LoweredSelector, declared: frozenset[str] = frozenset()) -> tuple[Any, list[_Root], tuple[int, ...]] | None:
+@@ -331,18 +340,24 @@
+     check, its layout) are renamed onto it and join the predicate, and a pin
+     there moves to it. A pin on any other root needs the same object."""
+     lo, old = lowered.lowering, lowered.tape
++    for_instance_stats["calls"] += 1
+     if len(t.roots) != len(roots):
++        for_instance_stats["unrenamed"] += 1
+         # (a substituted symbol needs its pins: a full redo)
+         return t if not (t.substituted or substituted) and all(roots[p] is r for p, r in t.pinned) else None
+     cache_key = (id(t), tuple(map(id, roots)), substituted)
+     if cache_key in lo.instance_templates:
++        for_instance_stats["cached"] += 1
+         return lo.instance_templates[cache_key]
++    start = time.perf_counter()
+     recs = lo.first_inputs
+     ctx = old.shape_env.ctx
+     subs: dict[str, _ir.Node] = {}
+     # the declared symbols both keys took at their values hold them at the call (a static prefix's layouts)
+     pins: list[Any] = [(ctx.eq(ctx.symbols[name], ctx.const(int(ctx.symbols[name].hint))), None) for name in sorted(t.substituted | substituted)]
+     moved: set[int] = set()
++    # the layout symbols pinned at their values (both ops': their keys hold them at the same values)
++    pinned: set[str] = set()
+     out: Template | None = t
+     for p, (mine, theirs) in enumerate(zip(t.roots, roots)):
+         a = recs.get(id(mine)) if mine.kind == "argument" else None
+@@ -357,6 +372,8 @@
+                 k = _sym_key(v)
+                 if isinstance(k, _ir.Node):
+                     pins.append((ctx.eq(k, ctx.const(int(k.hint))), None))
++                    if k.op == "sym":
++                        pinned.add(k.args[0])
+         if theirs is not mine:
+             moved.add(p)
+             for x, y in zip((a.root.sym, *a.sizes, *a.strides, a.offset), (b.root.sym, *b.sizes, *b.strides, b.offset)):
+@@ -367,18 +384,41 @@
+         out = None
+     if out is not None and (pins or subs):
+         full, memo = collections.ChainMap(subs, ctx.symbols), {}
+-        renamed = [(ctx.transfer(g, ctx, full, memo), None) for g, _ in t.guards if isinstance(g, _ir.Node) and g.free_symbols & subs.keys()]
+-        guards = [g for g in (*renamed, *pins) if g[0].op != "true"]
+-        predicate = t.predicate
+-        if guards:
+-            try:
+-                with lo.lowering.total() as domains:
+-                    predicate = lo.emit("and", predicate, lo.lowering.conjunction(guards, lo.addresses))
+-                for ok in domains:
+-                    predicate = lo.emit("and", predicate, ok)
+-            except Declined:
+-                predicate = None  # a renamed guard false at the hints: this op takes another branch
+-        out = None if predicate is None else replace(t, predicate=predicate, pinned=tuple((p, roots[p]) for p, _ in t.pinned), roots=tuple(roots))
++        # a template guard renamed only through pinned layout symbols is the guard itself under the pins (each symbol
++        # and its rename are pinned at one value), which t.predicate holds already: only a guard reading a renamed symbol
++        # no pin holds (a root's address: its alignment checks) is renamed and conjoined
++        renaming = subs.keys() - pinned
++        renamed = [(ctx.transfer(g, ctx, full, memo), None) for g, _ in t.guards if isinstance(g, _ir.Node) and g.free_symbols & renaming]
++
++        def instance_predicate(renamed: list) -> int | None:
++            guards = [g for g in (*renamed, *pins) if g[0].op != "true"]
++            predicate = t.predicate
++            if guards:
++                try:
++                    with lo.lowering.total() as domains:
++                        predicate = lo.emit("and", predicate, lo.lowering.conjunction(guards, lo.addresses))
++                    for ok in domains:
++                        predicate = lo.emit("and", predicate, ok)
++                except Declined:
++                    return None  # a renamed guard false at the hints: this op takes another branch
++            return predicate
++
++        predicate = instance_predicate(renamed)
++        if torch.cuda._host_trace.verify_redo_templates:
++            # the untrimmed predicate (every guard reading a renamed symbol renamed) holds at this call exactly when
++            # the trimmed one does
++            every = [(ctx.transfer(g, ctx, full, memo), None) for g, _ in t.guards if isinstance(g, _ir.Node) and g.free_symbols & subs.keys()]
++            untrimmed = instance_predicate(every)
++            values = lo.program.values
++            if (predicate is None) != (untrimmed is None) or (predicate is not None and values[predicate] != values[untrimmed]):
++                raise AssertionError(f"host_trace: {t} trimmed of its pinned renames disagrees with the untrimmed instance")
++        for_instance_stats["trimmed"] += sum(1 for g, _ in t.guards if isinstance(g, _ir.Node) and g.free_symbols & subs.keys() and not g.free_symbols & renaming)
++        out = None if predicate is None else replace(t, predicate=predicate, pinned=tuple((p, roots[p]) for p, _ in t.pinned), roots=tuple(roots), untrimmed=untrimmed if torch.cuda._host_trace.verify_redo_templates else None)
++        for_instance_stats["pins"] += len(pins)
++        for_instance_stats["renamed"] += len(renamed)
++    for_instance_stats["computed"] += 1
++    for_instance_stats["declined"] += out is None
++    for_instance_stats["computed_s"] += time.perf_counter() - start
+     lo.instance_templates[cache_key] = out
+     return out
+ 

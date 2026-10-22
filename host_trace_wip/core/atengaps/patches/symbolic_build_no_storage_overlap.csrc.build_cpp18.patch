@@ -1,0 +1,30 @@
+diff -ru /data/eellison/src/pytorch/agent_space/paramgraph/land/int6/build_cpp18/src/aten/src/ATen/TensorIterator.cpp /data/eellison/src/pytorch/agent_space/paramgraph/land/int6/build_cpp19/src/aten/src/ATen/TensorIterator.cpp
+--- /data/eellison/src/pytorch/agent_space/paramgraph/land/int6/build_cpp18/src/aten/src/ATen/TensorIterator.cpp	2026-10-12 11:49:53.935286091 -0700
++++ /data/eellison/src/pytorch/agent_space/paramgraph/land/int6/build_cpp19/src/aten/src/ATen/TensorIterator.cpp	2026-10-14 08:35:32.823751542 -0700
+@@ -1368,15 +1368,23 @@
+ 
+ // build() over c10::SymInt (detail::set_symbolic_iterators): the same steps
+ // on a SymInt state, outputs allocated through set_output_raw_strided_symint;
+-// every size comparison is the trace's guard. Overlap checks are the trace's
+-// (wrapper storages hide aliasing); data pointers are never read.
++// every size comparison is the trace's guard. Overlap checks between operands
++// are the trace's (wrapper storages hide aliasing, and get_overlap_status
++// reads their sealed data pointers once no size is symbolic): only an
++// output's internal overlap is tested here; data pointers are never read.
+ void TensorIteratorBase::build_symbolic(TensorIteratorConfig& config) {
+   sym_ = std::make_shared<detail::SymIteratorState>();
+   ++symbolic_built;
+   auto& shape = sym_->shape;
+   auto& ops = sym_->operands;
+   mark_outputs();
+-  compute_mem_overlaps(config);
++  if (config.check_mem_overlap_) {
++    for (const auto i : c10::irange(num_outputs_)) {
++      if (tensor_base(i).defined()) {
++        assert_no_internal_overlap(tensor_base(i));
++      }
++    }
++  }
+   if (config.static_shape_.has_value()) {
+     shape = c10::SymDimVector(config.static_shape_->begin(), config.static_shape_->end());
+   } else {

@@ -1,0 +1,415 @@
+diff -ru -x __pycache__ step_ms19/test/test_cuda_host_trace_opaque.py step_ms20/test/test_cuda_host_trace_opaque.py
+--- step_ms19/test/test_cuda_host_trace_opaque.py	2026-10-17 14:14:00.316196172 -0700
++++ step_ms20/test/test_cuda_host_trace_opaque.py	2026-10-18 06:44:04.271560921 -0700
+@@ -24,6 +24,7 @@
+     Slot,
+ )
+ from torch.cuda._host_trace_memory import plan_memory, split_runs
++from torch.cuda._host_trace_native import NativeBindings
+ from torch.cuda._host_trace_tape import bind_opaque, EagerCall, Memset, OpaqueCall, trace
+ from torch.cuda._host_trace_triton import param_layout, triton_abi
+ from torch.cuda._utils import _check_cuda_bindings
+@@ -124,6 +125,13 @@
+         self.style = style
+         self.attributes = attributes
+         self.table = {}  # key -> binding, or None when refused
++        # its bindings as native tables: a key is its own normal form
++        self.native = NativeBindings(
++            lambda k: (k.op, k.dtypes, k.sizes, k.strides, k.align, k.scalars, k.device, k.state) if not k.alias else None,
++            lambda op: op,
++            align_class=False,
++            size1_strides=lambda op: False,
++        )
+         self.binds = []
+         self.learned = []
+         self.kernels = []  # keeps each bound function loaded
+@@ -155,6 +163,8 @@
+         ok = key.op in (aten.mul.Tensor, aten.mul.out) and len(set(key.sizes)) == 1
+         ok = ok and all(t.is_contiguous() for t in operands)
+         self.table[key] = self._binding(*operands) if ok else None
++        if self.table[key] is not None:
++            self.native.add(key, self.table[key])
+         return self.table[key]
+ 
+     def _binding(self, x, y, out):
+@@ -850,11 +860,14 @@
+         self.assertEqual((len(f.variants), f.traces), (1, 1))
+         self.assertEqual((after[0] - before[0], after[1] - before[1]), (0, len(sizes) - 2))
+ 
+-    @unittest.expectedFailure  # the native entry does not yet fill a keyed site's row from a binding the provider holds (SPLIT_PIPELINE.md)
+-    def test_a_held_binding_at_a_new_key_is_a_native_hit(self):
++    @parametrize("native_fill", [True, False])
++    def test_a_held_binding_at_a_new_key_is_a_native_hit(self, native_fill):
+         # keys another replay learned: a new replay's keyed site meets each at a new size with its binding in the
+-        # provider (no learn, no trace); the C++ entry should serve the call, as in churn where each mixed step's token
+-        # count is new and its cuBLAS bindings are loaded
++        # provider (no learn, no trace); the C++ entry fills the site's row from the provider's native table and
++        # serves the call, as in churn where each mixed step's token count is new and its cuBLAS bindings are held.
++        # With the fill off, _fill's Python path serves each (a slow hit)
++        old = torch._C._host_trace_native_fill(native_fill)
++        self.addCleanup(torch._C._host_trace_native_fill, old)
+         p = TableProvider()
+         warm = HostTraceReplay(mul_chain, opaque=(p,))
+         sizes = (512, 640, 768, 896)
+@@ -864,11 +877,30 @@
+         f = HostTraceReplay(mul_chain, opaque=(p,))
+         for n in sizes[:1] * 3:
+             self.assertEqual(f(*args[n]), mul_chain(*args[n]), atol=0, rtol=0)
+-        learned, traces = len(p.learned), f.traces
++        learned, traces, fills = len(p.learned), f.traces, torch._C._host_trace_native_fills()
+         for n in sizes[1:]:
+             self.assertEqual(f(*args[n]), mul_chain(*args[n]), atol=0, rtol=0)
+         self.assertEqual((len(p.learned), f.traces), (learned, traces))
+-        self.assertEqual(f.slow_hits, 0)
++        new = len(sizes) - 1
++        self.assertEqual((f.slow_hits, torch._C._host_trace_native_fills() - fills), (0, new) if native_fill else (new, 0))
++
++    def test_a_native_fill_needs_the_sites_topology(self):
++        # a binding of another topology (style "mixed": a memset first at n % 256 == 0) is an arm of the site, which
++        # _fill adds with its form: the table holds it, the C++ fill declines it, and a call at it is not served wrong
++        p = TableProvider(style="mixed")
++        warm = HostTraceReplay(mul_chain, opaque=(p,))
++        sizes = (640, 768, 896, 1024)
++        args = {n: (torch.randn(n, device="cuda"), torch.randn(n, device="cuda")) for n in sizes}
++        for n in sizes * 2:
++            self.assertEqual(warm(*args[n]), mul_chain(*args[n]), atol=0, rtol=0)
++        f = HostTraceReplay(mul_chain, opaque=(p,))
++        for n in (640, 640, 640):
++            self.assertEqual(f(*args[n]), mul_chain(*args[n]), atol=0, rtol=0)
++        fills = torch._C._host_trace_native_fills()
++        for n in (896, 768, 1024, 896, 768, 1024):
++            self.assertEqual(f(*args[n]), mul_chain(*args[n]), atol=0, rtol=0)
++        # 896 (no memset, the site's topology) fills natively; 768 and 1024 (a memset first) do not
++        self.assertEqual(torch._C._host_trace_native_fills() - fills, 1)
+ 
+     @parametrize("form_held", [False, True])
+     @parametrize("first", [512, 640])
+diff -ru -x __pycache__ step_ms19/test/test_cuda_host_trace_python_entry.py step_ms20/test/test_cuda_host_trace_python_entry.py
+--- step_ms19/test/test_cuda_host_trace_python_entry.py	2026-10-16 11:35:58.685032201 -0700
++++ step_ms20/test/test_cuda_host_trace_python_entry.py	2026-10-18 06:48:41.929382869 -0700
+@@ -39,6 +39,9 @@
+         "test_alternating_keys_take_their_rows",
+         "test_keys_past_64_harvest",
+         "test_a_missed_key_leaves_no_stale_site_row",
++        # the C++ entry's fill from the provider's native table (each call of the Python entry is a slow one)
++        "test_a_held_binding_at_a_new_key_is_a_native_hit",
++        "test_a_native_fill_needs_the_sites_topology",
+     ),
+     # the Python dispatch holds the arguments while it serves the call, so a
+     # freed or boxed argument dies after the replay, not at its last use
+diff -ru -x __pycache__ step_ms19/test/test_cuda_host_trace_replay.py step_ms20/test/test_cuda_host_trace_replay.py
+--- step_ms19/test/test_cuda_host_trace_replay.py	2026-10-17 14:00:27.634364052 -0700
++++ step_ms20/test/test_cuda_host_trace_replay.py	2026-10-17 14:25:20.668639940 -0700
+@@ -165,6 +165,10 @@
+     return add(x, 1) if x.shape[0] > 4096 else add(add(x), 2)
+ 
+ 
++def mm_only(x, w):
++    return torch.mm(x, w)
++
++
+ def matmul_chain(x, w):
+     # triton -> mm (eager; matmul folds the batch with _unsafe_view) -> triton
+     return add(torch.matmul(add(x).view(4, -1, w.shape[0]), w), 1)
+@@ -4516,6 +4520,80 @@
+         # TestOpaqueCalls.test_a_held_binding_at_a_new_key_is_a_native_hit holds as an expected failure)
+         self.assertEqual((f.slow_hits, f.traces, f.replays - before[2]), (before[0], before[1], 5))
+ 
++    def test_a_split_call_needs_dirty_records(self):
++        # the split only where the call's patch would be exposed: a steady call (nothing dirty) launches the whole
++        # exec, a size change dirtying at least dirty_min records launches the sections, each patching its own.
++        # Per section: calls that set any of its nodes, the nodes set, its launches
++        torch._C._host_trace_split(True)
++        old = torch._C._host_trace_split_policy(first_nodes=4, dirty_min=8)
++        self.addCleanup(lambda: torch._C._host_trace_split_policy(*old))
++        f = HostTraceReplay(long_chain)
++        xs = {n: torch.randn(n, device="cuda") for n in (4096, 8192)}
++        self.warm(f, long_chain, xs, (4096, 8192, 4096, 4096))
++        (v,) = f.variants
++        n = len(v.captured.lowered.launches)
++        sections = len(torch._C._host_trace_split_bounds(v.native, 0, 0)) - 1
++        self.assertGreater(sections, 1)
++        wholes = torch._C._host_trace_split_dirty_wholes()
++        before = torch._C._host_trace_split_section_counts(v.native, 0, 0)
++        steady = _moved(lambda: self.assertEqual(f(xs[4096]), long_chain(xs[4096]), atol=0, rtol=0))
++        self.assertEqual((steady["launches"], steady["kernel_sets"]), (1, 0))
++        self.assertEqual(torch._C._host_trace_split_dirty_wholes() - wholes, 1)
++        changed = _moved(lambda: self.assertEqual(f(xs[8192]), long_chain(xs[8192]), atol=0, rtol=0))
++        self.assertEqual((changed["launches"], changed["kernel_sets"]), (sections, n))
++        after = torch._C._host_trace_split_section_counts(v.native, 0, 0)
++        self.assertEqual(sum(a[1] - b[1] for a, b in zip(after, before)), n)
++        self.assertEqual([a[2] - b[2] for a, b in zip(after, before)], [1] * sections)
++        self.assertEqual(f.slow_hits, 0)
++
++    def test_held_library_bindings_fill_rows_natively(self):
++        # cuBLAS keys another replay learned: a new replay meets each at a new batch size with its binding held by the
++        # provider; the C++ entry fills each keyed site's row from the provider's native table (no slow call, no
++        # learn), bitwise. An operand at another alignment class is another key (cuBLAS's kernel choice reads it):
++        # no held binding fills it, it is learned
++        from torch.cuda._host_trace_harvest import HarvestProvider
++
++        p = HarvestProvider(("blas",))
++        w = torch.randn(64, 64, device="cuda")
++        sizes = (8, 24, 40, 56)
++        xs = {n: torch.randn(n, 64 * 4, device="cuda") for n in sizes}
++        warm = HostTraceReplay(matmul_chain, opaque=(p,))
++        for n in sizes * 2:
++            self.assertEqual(warm(xs[n], w), matmul_chain(xs[n], w), atol=0, rtol=0)
++        f = HostTraceReplay(matmul_chain, opaque=(p,))
++        for _ in range(3):
++            self.assertEqual(f(xs[8], w), matmul_chain(xs[8], w), atol=0, rtol=0)
++        traces, harvests, fills = f.traces, p.harvests, torch._C._host_trace_native_fills()
++        for n in (24, 40, 56, 24, 8, 56):
++            self.assertEqual(f(xs[n], w), matmul_chain(xs[n], w), atol=0, rtol=0)
++        self.assertEqual((f.slow_hits, f.traces, p.harvests), (0, traces, harvests))
++        self.assertGreaterEqual(torch._C._host_trace_native_fills() - fills, 3)
++
++    def test_a_native_fill_keys_alignment_by_class(self):
++        # cuBLAS's key holds an operand's alignment class (the largest power of two dividing its address, to 256):
++        # x 192 bytes into a block is class 64, as 64 bytes in is, so the binding learned at 64 fills the row at 192
++        # natively; 128 bytes in (class 128) is another key, learned
++        from torch.cuda._host_trace_harvest import HarvestProvider
++
++        p = HarvestProvider(("blas",))
++        w = torch.randn(256, 64, device="cuda")
++        base = torch.randn(64 * 256 + 64, device="cuda")
++
++        def at(n, offset):
++            return base[offset // 4 : offset // 4 + n * 256].view(n, 256)
++
++        warm = HostTraceReplay(mm_only, opaque=(p,))
++        for x in (at(8, 0), at(24, 64)) * 2:
++            self.assertEqual(warm(x, w), mm_only(x, w), atol=0, rtol=0)
++        f = HostTraceReplay(mm_only, opaque=(p,))
++        for _ in range(3):
++            self.assertEqual(f(at(8, 0), w), mm_only(at(8, 0), w), atol=0, rtol=0)
++        harvests, fills = p.harvests, torch._C._host_trace_native_fills()
++        self.assertEqual(f(at(24, 192), w), mm_only(at(24, 192), w), atol=0, rtol=0)
++        self.assertEqual((p.harvests, torch._C._host_trace_native_fills() - fills, f.slow_hits), (harvests, 1, 0))
++        self.assertEqual(f(at(24, 128), w), mm_only(at(24, 128), w), atol=0, rtol=0)
++        self.assertEqual((p.harvests, torch._C._host_trace_native_fills() - fills), (harvests + 1, 1))
++
+     def test_a_fixed_graph_keeps_its_shape(self):
+         # five_step's graph (four Triton adds): its node types and counts, its kernels' largest parameter block and
+         # its edge types (three full edges, no programmatic one: Triton launches without PDL)
+@@ -5710,6 +5788,10 @@
+ 
+ def setUpModule():
+     from torch.cuda import _host_trace_hint_audit
++
++    # the split tests launch a split run's sections every call (TestReplayCounters.test_a_split_call_needs_dirty_records
++    # sets the dirty threshold itself)
++    torch._C._host_trace_split_policy(dirty_min=0)
+     import torch.cuda._host_trace_capture as capture
+ 
+     _host_trace_hint_audit.enable_for_tests()
+diff -ru -x __pycache__ step_ms19/torch/cuda/_host_trace_harvest.py step_ms20/torch/cuda/_host_trace_harvest.py
+--- step_ms19/torch/cuda/_host_trace_harvest.py	2026-10-17 14:14:00.267435799 -0700
++++ step_ms20/torch/cuda/_host_trace_harvest.py	2026-10-17 14:13:07.501908775 -0700
+@@ -144,6 +144,7 @@
+     takes_generator,
+ )
+ from torch.cuda._host_trace_tape import _cuda_address, _gc_hold, new_private_stream, seed_offset_on_device
++from torch.cuda._host_trace_native import NativeBindings
+ from torch.cuda._utils import _check_cuda_bindings
+ from torch.testing._comparison import default_tolerances
+ 
+@@ -1046,6 +1047,10 @@
+         self.ops = frozenset().union(*(_FAMILIES[f] for f in families)) | self.rng | self.extern
+         self.harvests = 0
+         self.bindings: dict[tuple, OpaqueBinding] = {}
++        # the bindings as native tables (_host_trace_native.NativeBindings): a normal key's parts as _normal has them
++        self.native = NativeBindings(
++            lambda k: None if k[0] else k[1:], lambda op: _OUT.get(op, op), align_class=True, size1_strides=lambda op: op in _CUDNN
++        )
+         # per (op, dtypes, device) of a blas or attention key: the harvested
+         # bindings by _signature
+         self.templates: dict[tuple, dict[tuple, OpaqueBinding]] = {}
+@@ -1201,7 +1206,8 @@
+         if not all((device, name) in self.functions for name in names):
+             return None
+         nodes = tuple(dataclasses.replace(n, function=self.functions[device, n.function]) if isinstance(n, OpaqueKernel) else n for n in stored.nodes)
+-        binding = self.bindings[k] = dataclasses.replace(stored, nodes=nodes)
++        binding = dataclasses.replace(stored, nodes=nodes)
++        self._hold(k, binding)
+         del self.stored[k]
+         self.restored += 1
+         return binding
+@@ -1247,7 +1253,11 @@
+         for n in nodes:
+             if isinstance(n, KernelNode):
+                 self.functions[key.device, n.name] = n.function
+-        return self._resolved(k, key.device)
++        binding = self._resolved(k, key.device)
++        # the stored keys whose functions are now all loaded: held, so a keyed site's row at one fills in C++
++        for other in [o for o, b in self.stored.items() if o[7] == key.device and all((key.device, n.function) in self.functions for n in b.nodes if isinstance(n, OpaqueKernel))]:
++            self._resolved(other, key.device)
++        return binding
+ 
+     def _layout_class(self, key: OpaqueKey) -> tuple:
+         """The key without its sizes and integer scalars: per operand its rank,
+@@ -1386,9 +1396,14 @@
+             except _Refused as e:
+                 self._refuse(key, str(e), e.structural)
+                 return None
+-            self.bindings[k] = binding
++            self._hold(k, binding)
+             return binding
+ 
++    def _hold(self, k: tuple, binding: OpaqueBinding) -> None:
++        # a binding at its normal key, and in the native tables (a keyed site's row filled in C++ at a new key)
++        self.bindings[k] = binding
++        self.native.add(k, binding)
++
+     def _harvest(
+         self,
+         key: OpaqueKey,
+diff -ru -x __pycache__ step_ms19/torch/cuda/_host_trace_native.py step_ms20/torch/cuda/_host_trace_native.py
+--- step_ms19/torch/cuda/_host_trace_native.py	2026-10-17 14:14:00.265212778 -0700
++++ step_ms20/torch/cuda/_host_trace_native.py	2026-10-17 14:12:32.482354176 -0700
+@@ -245,6 +245,130 @@
+     return tuple(nodes), [binding.scratch[j] if j < len(binding.scratch) else 0 for j in site.native_scratch()]
+ 
+ 
++def binding_template(binding: OpaqueBinding) -> tuple | None:
++    """The binding's nodes for a native binding table (HostTraceBindingTable.add): binding_row's, with each pointer
++    field's source as (is scratch, index, delta) rather than a site's (row, base). None for a binding a table does not
++    hold: one that draws from the generator, or that a trace could not record."""
++    from torch.cuda._host_trace_opaque import OpaqueKernel, OpaqueMemset, recordable
++
++    if binding.rng or not recordable(binding):
++        return None
++
++    def source(s: Slot) -> tuple[bool, int, int]:
++        return (s.kind == "scratch", s.index, s.delta)
++
++    nodes: list[tuple] = []
++    for n in binding.nodes:
++        if isinstance(n, OpaqueMemset):
++            nodes.append((1, source(n.dst), n.value, n.element_size, n.width, n.height, n.pitch))
++            continue
++        if not isinstance(n, OpaqueKernel) or any(s.kind not in ("operand", "scratch") for s in n.slots):
++            return None
++        images = n.images or tuple(bytes(size) for _, size in n.params)
++        nodes.append((0, n.function, n.block, n.smem, n.grid, images, tuple((s.param, s.offset, *source(s)) for s in n.slots)))
++    return tuple(nodes)
++
++
++# topologies (OpaqueBinding.topology, KeyedSite.topology) as ids: a table's binding fills a site's row of arm 0 when
++# its topology's id is the site's
++_TOPOLOGIES: dict[tuple, int] = {}
++
++
++def topology_id(topology: tuple) -> int:
++    return _TOPOLOGIES.setdefault(topology, len(_TOPOLOGIES))
++
++
++class NativeBindings:
++    """A provider's held bindings as native tables, one per class of keyed site (op, dtypes, ranks, constant
++    scalars, device, library state), keyed by a site key in the provider's normal form: the C++ entry fills a site's
++    row at a key it lacks from its table (HostTraceVariant.fill_from_table), with no Python on that call.
++
++    `parts(k)` takes a key of the provider's bindings (its own normal form) to (op, dtypes, sizes, strides, align,
++    scalars, device, state) as bind() compares them, or None for a key no table holds; `normal_op` takes a site's op
++    to the op its keys' parts have; `align_class` says whether its
++    align is _host_trace_harvest._class of the address % 256 (else the value itself), and `size1_strides(op)` whether
++    its strides are 0 where the size is 1. A table key is the sizes, strides and align, flattened, then the values of
++    the site's symbolic scalars: equal for two keys exactly when bind() takes them to the same binding."""
++
++    def __init__(
++        self, parts: Callable[[Any], tuple | None], normal_op: Callable[[Any], Any], align_class: bool, size1_strides: Callable[[Any], bool]
++    ) -> None:
++        self.parts = parts
++        self.normal_op = normal_op
++        self.align_class = align_class
++        self.size1_strides = size1_strides
++        self.tables: dict[tuple, Any] = {}  # site class -> torch._C._HostTraceBindingTable
++        self.held: dict[Any, tuple[tuple, Any]] = {}  # binding key -> (its parts, the binding: keeps its kernels loaded)
++
++    @staticmethod
++    def _class(site: LoweredKeyedSite) -> tuple:
++        slots = tuple(isinstance(v, (torch.SymInt, ScalarSlot)) for v in site.site.scalars)
++        constants = tuple(None if slot else v for slot, v in zip(slots, site.site.scalars))
++        return (site.site.op, site.dtypes, site.ranks, slots, constants, site.device, site.site.state)
++
++    def _key(self, cls: tuple, parts: tuple) -> list[int] | None:
++        op, dtypes, ranks, slots, constants, device, state = cls
++        p_op, p_dtypes, sizes, strides, align, scalars, p_device, p_state = parts
++        if (p_op, p_dtypes, p_device, p_state) != (self.normal_op(op), dtypes, device, state) or tuple(map(len, sizes)) != ranks:
++            return None
++        if len(scalars) != len(slots) or any(not slot and v != c for slot, v, c in zip(slots, scalars, constants)):
++            return None
++        values = [v for slot, v in zip(slots, scalars) if slot]
++        if not all(type(v) is int for v in values):
++            return None
++        return [*(n for z in sizes for n in z), *(st for t in strides for st in t), *align, *values]
++
++    def add(self, k: Any, binding: Any) -> None:
++        """A binding the provider holds at its key k (bind's normal form)."""
++        parts = self.parts(k)
++        nodes = None if parts is None else binding_template(binding)
++        if nodes is None:
++            return
++        self.held[k] = (parts, binding)
++        for cls, table in self.tables.items():
++            self._add(table, cls, parts, nodes, binding)
++
++    def _add(self, table: Any, cls: tuple, parts: tuple, nodes: tuple, binding: Any) -> None:
++        key = self._key(cls, parts)
++        if key is not None:
++            try:
++                topology = topology_id(binding.topology)
++            except TypeError:  # an unhashable launch attribute: no table holds it
++                return
++            table.add(key, nodes, list(binding.scratch), topology)
++
++    def link(self, native: Any, i: int, site: LoweredKeyedSite, planned_scratch: bool) -> None:
++        """Links the variant's keyed site i to its class's table (HostTraceVariant.set_site_table)."""
++        if site.site.rng or site.alias or not hasattr(native, "set_site_table"):
++            return
++        try:
++            cls = self._class(site)
++            hash(cls)
++            topology = topology_id(site.site.topology)
++        except TypeError:  # an unhashable constant or attribute
++            return
++        table = self.tables.get(cls)
++        if table is None:
++            table = self.tables[cls] = torch._C._HostTraceBindingTable()
++            for parts, binding in self.held.values():
++                nodes = binding_template(binding)
++                if nodes is not None:
++                    self._add(table, cls, parts, nodes, binding)
++        ranks = site.ranks
++        operands = sum(ranks)
++        codes = [0] * operands + [2 if self.size1_strides(site.site.op) else 0] * operands + [1 if self.align_class else 0] * len(ranks)
++        companions = list(range(operands)) + list(range(operands)) + [0] * len(ranks)
++        slots = sum(isinstance(v, (torch.SymInt, ScalarSlot)) for v in site.site.scalars)
++        codes += [0] * slots
++        companions += [0] * slots
++        if len(codes) != len(site.rows):
++            return
++        if not self.size1_strides(site.site.op):
++            companions = [0] * len(codes)
++        scratch = [(j, *site.scratch[j], site.site.scratch[j][1] if planned_scratch else -1) for j in site.site.scratch if j in site.scratch]
++        native.set_site_table(i, table, codes, companions, list(site.operands), scratch, site.native_scratch(), topology)
++
++
+ class _Leaf:
+     __slots__ = ("index",)
+ 
+diff -ru -x __pycache__ step_ms19/torch/cuda/_host_trace_replay.py step_ms20/torch/cuda/_host_trace_replay.py
+--- step_ms19/torch/cuda/_host_trace_replay.py	2026-10-17 14:14:00.315768650 -0700
++++ step_ms20/torch/cuda/_host_trace_replay.py	2026-10-17 14:18:47.090192444 -0700
+@@ -1675,6 +1675,11 @@
+             _Disagreement,
+         )
+         native = native_variant(spec)
++        # a keyed site's provider's held bindings, from which the entry fills a row at a new key in C++
++        for i, site in enumerate(captured.lowered.sites):
++            tables = getattr(site.site.provider, "native", None)
++            if tables is not None:
++                tables.link(native, i, site, self.memory == "planned_scratch")
+         for g, cuts in split_cuts(captured.lowered):
+             if cuts:
+                 native.set_split_cuts(g, cuts)

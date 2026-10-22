@@ -1,0 +1,41 @@
+--- a/test/test_cuda_host_trace_replay.py
++++ b/test/test_cuda_host_trace_replay.py
+@@ -2068,29 +2068,23 @@
+ @requires_cuda_python_bindings
+ @unittest.skipIf(not has_triton(), "requires triton")
+ class TestReplayMemory(TestCase):
+-    def test_an_entry_reads_a_root_its_respecified_launch_did_not(self):
+-        # argmax respecified at n = 1 reads nothing of v (one element: its launch only writes the
+-        # index), but its op holds v: the redispatch entry at n = 13 reads v, which the plan must
+-        # keep live through argmax, not free after the Triton add for later allocations to take
+-        def fn(a0, a1, a2, a3):
++    def test_an_entry_reads_a_root_its_launch_did_not(self):
++        # traced at n = 1, argmax reads nothing of v (one element: its launch only writes the index),
++        # but its op holds v: its redispatch entry at n = 13 reads v, which the plan must keep live
++        # through argmax, not free after the Triton add for the GEMM's output to take
++        def fn(a1, a2):
+             v = add(a2, 2)
+             a1 @ a1.t()
+-            a3.copy_(a0)
+             return v.argmax(0)
+ 
+         def randn(*size):
+             return torch.randn(size, device="cuda", dtype=torch.float16)
+ 
+         f = HostTraceReplay(fn)
+-        calls = (
+-            (randn(64, 16), randn(16, 19), randn(19), randn(1, 64, 16)),
+-            (randn(64, 20)[:, :17], randn(17, 1), randn(1), randn(1, 64, 17)),
+-            (randn(55, 2048), randn(2048, 13), randn(13), randn(4, 55, 2048)),
+-        )
+-        for a0, a1, a2, a3 in calls:
+-            self.assertEqual(f(a0, a1, a2, a3.clone()), fn(a0, a1, a2, a3.clone()), atol=0, rtol=0)
+-        self.assertEqual((f.traces, f.respecs, f.redispatches, f.eager), (1, 1, 1, 0))
+-        tape, memory = f.variants[1].tape, f.variants[1].memory
++        for a1, a2 in ((randn(17, 1), randn(1)), (randn(2048, 13), randn(13)), (randn(2048, 13), randn(13))):
++            self.assertEqual(f(a1, a2), fn(a1, a2), atol=0, rtol=0)
++        self.assertEqual((f.traces, f.redispatches, f.eager, f.retrace_causes), (1, 1, 0, {}))
++        tape, memory = f.variants[0].tape, f.variants[0].memory
+         lives = {k: last for step in memory.steps for k, _, last in step.temporaries}
+         # v is the tape's first allocation (the host's empty_like), argmax its last op
+         self.assertGreaterEqual(lives[0], tape.launches[tape.ops[-1].launches.start][0])

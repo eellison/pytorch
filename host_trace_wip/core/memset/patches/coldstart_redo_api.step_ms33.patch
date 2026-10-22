@@ -1,0 +1,1377 @@
+diff -ruN -x __pycache__ -x '*.pyc' -x TREE.txt step_ms33/torch/cuda/_host_trace_cute.py step_ms34/torch/cuda/_host_trace_cute.py
+--- step_ms33/torch/cuda/_host_trace_cute.py	2026-10-14 06:19:45.126229137 -0700
++++ step_ms34/torch/cuda/_host_trace_cute.py	2026-10-19 12:13:58.977365353 -0700
+@@ -1569,9 +1569,13 @@
+     if index is None:
+         index = _ROOT_INDEX[tr] = _RootIndex()
+     found = index.roots(tr, held)
++    # and a redo's outer roots (the variant's allocations and eager outputs its op reads)
++    outer = [t._root for t in getattr(tr, "outer", {}).values() if not isinstance(k := _sym_key(t._root.sym), int) and k.free_symbols & held]
++    found += [r for r in outer if all(r is not f for f in found)]
+     if _CHECK_ROOT_INDEX:
+         roots = (*(i.root for i in tr.inputs), *(a.root for a in tr.allocs), *(t._root for t in tr.eager_outputs))
+         scanned = [r for r in roots if _sym_key(r.sym).free_symbols & held]
++        scanned += [r for r in outer if all(r is not f for f in scanned)]
+         if [id(r) for r in found] != [id(r) for r in scanned]:
+             raise AssertionError(f"host_trace: the root index gives {[r.name for r in found]}, a scan {[r.name for r in scanned]}")
+     return found
+@@ -1601,6 +1605,8 @@
+     tr: _Trace, compiled: Any, args: tuple, kwargs: dict, call: Callable[..., Any], cute_args: tuple = ()
+ ) -> None:
+     name = compiled.function_name
++    if tr.resolve is not None:  # a redo's argument read straight from module state (_host_trace_redispatch._resolver)
++        args, kwargs = pytree.tree_map_only(torch.Tensor, tr.resolve, (tuple(args), dict(kwargs)))
+     leaves = [x for a in args for x in _fields(a)]
+ 
+     def decline(why: str) -> NoReturn:
+diff -ruN -x __pycache__ -x '*.pyc' -x TREE.txt step_ms33/torch/cuda/_host_trace_ir.py step_ms34/torch/cuda/_host_trace_ir.py
+--- step_ms33/torch/cuda/_host_trace_ir.py	2026-10-18 18:11:46.818509273 -0700
++++ step_ms34/torch/cuda/_host_trace_ir.py	2026-10-20 08:06:05.874877558 -0700
+@@ -1283,6 +1283,10 @@
+         self.owner_sets: list[frozenset[int | None]] | None = None
+         # the op a guard recorded now belongs to
+         self.op: int | None = None
++        # whether a library body's own Python (not an ATen op's C++ host inside it) runs now, and the records it decided on
++        # (recorded or deduped): a decision whose outcome may have escaped into Python state other code reads
++        self.library_python = False
++        self.python_decided: set[int] = set()
+         self.names: dict[str, str] = {}  # symbol name -> source name, in creation order
+         self.unique_ids: set[int] = set()
+         # taken id p -> q: every id in [p, q) is taken, so a probe skips the
+@@ -1343,6 +1347,8 @@
+                 self.owner_sets.append(frozenset())
+         elif self.owners[i] != self.op:
+             self.owners[i] = None
++        if self.library_python:
++            self.python_decided.add(i)
+         if self.owner_sets is not None:
+             self.owner_sets[i] = self.owner_sets[i] | {self.op}
+ 
+diff -ruN -x __pycache__ -x '*.pyc' -x TREE.txt step_ms33/torch/cuda/_host_trace_lower_tape.py step_ms34/torch/cuda/_host_trace_lower_tape.py
+--- step_ms33/torch/cuda/_host_trace_lower_tape.py	2026-10-19 10:00:30.239335800 -0700
++++ step_ms34/torch/cuda/_host_trace_lower_tape.py	2026-10-20 11:22:43.746522519 -0700
+@@ -380,6 +380,17 @@
+         # per op index (a library body's), why its redo is refused or None: its records' scalar reads, then its
+         # confirmation at the trace call (_host_trace_redispatch._library_redo_refusal)
+         self.library_redo: dict[int, str | None] = {}
++        # the library-body ops confirmed by their own confirmation, by redo template key (_reads): (op, its read-walk roots)
++        self.confirmed: dict[Any, list[tuple[int, list[Any]]]] = {}
++        # the ops whose redo_context read RedoCall.rank: their redos are their own (no template, dispatch or shared confirmation)
++        self.rank_read: set[int] = set()
++        # library-body checks, once per lowering: the tape's tensor-layout symbols (_tensor_symbols) and the rows' values at
++        # the trace call (_trace_values)
++        self.tensor_symbols: set[str] | None = None
++        self.trace_values: tuple[list[int], Any] | None = None  # (values, the last row they cover)
++        # redo_context (_host_trace_redispatch._reads_lifted): the lifted arguments' symbols, and per op whether it reads one
++        self.lifted_symbols: set[str] | None = None
++        self.reads_lifted: dict[int, bool] = {}
+         # the section temporaries' bases the native variant holds past the tape's (_add_entries counts them)
+         self.sections = 0
+         # per section temporary the native places in its run's buffer (_host_trace_memory.section_seqs), (its run's
+diff -ruN -x __pycache__ -x '*.pyc' -x TREE.txt step_ms33/torch/cuda/_host_trace.py step_ms34/torch/cuda/_host_trace.py
+--- step_ms33/torch/cuda/_host_trace.py	2026-10-15 19:04:20.599769643 -0700
++++ step_ms34/torch/cuda/_host_trace.py	2026-10-19 12:34:53.710691991 -0700
+@@ -11,6 +11,7 @@
+ import functools
+ import sys
+ import threading
++import weakref
+ from dataclasses import dataclass
+ from typing import Any, overload, TYPE_CHECKING
+ 
+@@ -27,7 +28,7 @@
+ 
+ 
+ if TYPE_CHECKING:
+-    from collections.abc import Callable
++    from collections.abc import Callable, Iterable
+ 
+     import torch
+     from torch.types import FloatLikeType, IntLikeType
+@@ -110,13 +111,55 @@
+ # a redispatch instantiating a redo template also redoes the op in full and asserts the two entries are one (the
+ # test suites set it)
+ verify_redo_templates = False
+-# a redispatch's redo resolves a plain CUDA tensor its op's body reaches (module or context state, as vLLM's
+-# layer.kv_cache) to the call's tensor argument of the same storage (the StorageImpl, not its address) and the same view,
+-# where exactly one is; the trace saw that argument there (the caller swapped it in while fn ran). Off: such a read
++# a redispatch's redo resolves a plain tensor its op's body reaches (module or context state, as vLLM's layer.kv_cache)
++# that is one of the call's tensor arguments (the object) to that argument; the trace saw it there (the caller swapped it
++# in while fn ran). It resolves at the body's torch functions and its Triton and CuTe DSL launches. Off: such a read
+ # declines and the call traces again. An integration that swaps its arguments into state turns it on
+ redo_resolves_arguments = False
+ 
+ 
++class Closure:
++    """Tensors declared fixed (close_over): the same objects, on the same storages at the same layouts, while declared."""
++
++    def __init__(self, tensors: list[Any]) -> None:
++        self._held = {id(t): weakref.ref(t) for t in tensors}
++        _CLOSURES.append(self)
++
++    def holds(self, t: Any) -> bool:
++        ref = self._held.get(id(t))
++        return ref is not None and ref() is t
++
++    def release(self) -> None:
++        """Undeclares them; a variant that took one keeps it (statics_changed() makes the next call check in full)."""
++        if self in _CLOSURES:
++            _CLOSURES.remove(self)
++
++
++_CLOSURES: list[Closure] = []
++
++
++def close_over(modules: Iterable[Any] = (), tensors: Iterable[Any] = ()) -> Closure:
++    """Declares fixed every parameter and buffer of `modules` (and their submodules), every tensor held as one of their
++    attributes or in a list or tuple attribute (KV caches, state, pre-made views), and `tensors`. A redo's body that reaches
++    one on the storage of a static-prefix argument reads it at its own layout on that argument's root (where several share
++    the storage, the one the op's recorded launches read); one that is a static-prefix argument resolves to it. Changing one
++    (set_, .data =, a layout change, a reassigned attribute) needs release() and statics_changed(), as a static prefix does."""
++    import torch
++
++    found: list[Any] = [*tensors]
++    for root in modules:
++        for m in root.modules():
++            found += [*m.parameters(recurse=False), *m.buffers(recurse=False)]
++            for v in vars(m).values():
++                items = v if isinstance(v, (list, tuple)) else (v,)
++                found += [x for x in items if isinstance(x, torch.Tensor)]
++    return Closure(found)
++
++
++def closed_over(t: Any) -> bool:
++    return any(c.holds(t) for c in _CLOSURES)
++
++
+ @dataclass(frozen=True, eq=False)
+ class _UnitRedo:
+     """A dispatch unit's OpRec.redo (_host_trace_tape._EagerRedo)."""
+diff -ruN -x __pycache__ -x '*.pyc' -x TREE.txt step_ms33/torch/cuda/_host_trace_redispatch.py step_ms34/torch/cuda/_host_trace_redispatch.py
+--- step_ms33/torch/cuda/_host_trace_redispatch.py	2026-10-19 11:13:57.007169365 -0700
++++ step_ms34/torch/cuda/_host_trace_redispatch.py	2026-10-20 11:36:53.965689165 -0700
+@@ -42,6 +42,7 @@
+     _CAPTURE_ERRORS,
+     _InputRec,
+     _ir_census,
++    _library_body,
+     _metadata,
+     _PLACEHOLDER_LOW,
+     _PLACEHOLDER_TAG,
+@@ -59,17 +60,48 @@
+     OpaqueCall,
+ )
+ from torch.cuda._utils import _check_cuda_bindings
++from torch.overrides import TorchFunctionMode
+ from torch.utils import _pytree as pytree
+ 
+ 
+ if TYPE_CHECKING:
+     from collections.abc import Callable, Iterator, Sequence
++    from contextlib import AbstractContextManager
+ 
+     from torch.cuda._host_trace_lower_tape import LoweredLaunch, LoweredMemset, LoweredSelector, LoweredTape
+     from torch.cuda._host_trace_opaque import KeyedSite
+     from torch.cuda._host_trace_tape import OpRec
+ 
+ 
++class RedoCall:
++    """What HostTraceReplay's redo_context gets around a library body's redo that reads lifted state: the call's flat
++    arguments (the redo's stand-ins at the lifted positions, the call's own objects elsewhere), the op's operator, and its
++    rank among the tape's ops of that operator. A context that reads the rank makes the redo its op's alone: its entry is
++    no other op's (redo template, family dispatch, shared confirmation)."""
++
++    def __init__(self, args: tuple[Any, ...], func: Any, rank: int) -> None:
++        self.args, self.func, self._rank = args, func, rank
++        self.rank_read = False
++
++    @property
++    def rank(self) -> int:
++        self.rank_read = True
++        return self._rank
++
++
++@dataclass(frozen=True)
++class RedoOptions:
++    """HostTraceReplay's redo_policy, lifted, redo_context and static_prefix."""
++
++    policy: str = "inputs_only"
++    lifted: frozenset[int] = frozenset()
++    context: Callable[[RedoCall], AbstractContextManager[Any]] | None = None
++    static_prefix: int = 0
++
++
++REDO_POLICIES = ("inputs_only", "strict", "refuse")
++
++
+ # test and diagnosis: redos a dispatch of the family served (no body run), and redo bodies run
+ dispatch_hits = 0
+ redo_bodies = 0
+@@ -86,6 +118,7 @@
+     dispatches: dict | None = None,
+     opaque: Sequence[Any] = (),
+     static_prefix: int = 0,
++    redo: RedoOptions = RedoOptions(),
+ ) -> tuple[torch._C._HostTraceProgram, list[tuple[int, int, tuple[LoweredLaunch | LoweredMemset, ...], Any]]]:
+     """Selectors `unselected` (native site indices) of the variant, whose
+     graph guards hold the call `args` (at rows `values`), as entries from
+@@ -96,7 +129,8 @@
+     providers, as its trace did. The first `static_prefix` arguments are
+     the replay's static prefix (a model's parameters, the same tensors every
+     call): a template keys their layouts by value, and another layer's op
+-    takes it with its own (_for_instance)."""
++    takes it with its own (_for_instance). A library body redoes under
++    `redo`'s policy (_library_redo_refusal)."""
+     lo = lowered.lowering
+     program = lo.program
+     rows = len(program.values)
+@@ -110,8 +144,13 @@
+             for i in sorted(unselected, key=lambda i: i not in lo.refused):
+                 selector = lowered.selectors[i - len(lowered.sites)]
+                 op = lowered.tape.ops[selector.op]
++                if redo.policy == "strict" and (why := _python_decided(lowered, selector)) is not None:
++                    lo.refused.add(i)
++                    e = FoldRefused(why)
++                    e.op = selector.op
++                    raise e
+                 # before a template too: another op's template is this op's redo
+-                if _library_body(op.func) and (why := _library_redo_refusal(lowered, selector, opaque)) is not None:
++                if _library_body(op.func) and (why := _library_redo_refusal(lowered, selector, opaque, redo)) is not None:
+                     lo.refused.add(i)
+                     e = FoldRefused(why if isinstance(why, _OwnRefusal) else f"{op.func} dispatches otherwise; {why}")
+                     e.op = selector.op
+@@ -130,19 +169,19 @@
+                 if template is not None and program.values[template.predicate] == 1 and _bound(lowered, reads[2], program.values):
+                     entry, after = _instantiate(lowered, i, template, reads[1], base, selector, op)
+                     if torch.cuda._host_trace.verify_redo_templates:
+-                        full = lower_entry(lowered, i, *_full_redo(lowered, i, selector, dispatches, opaque), base)[0]
++                        full = lower_entry(lowered, i, *_full_redo(lowered, i, selector, dispatches, opaque, redo), base)[0]
+                         _assert_same_entry(entry, full, program.values)
+                     lo.instances += 1
+                     entries.append(entry)
+                     recorded.append((i, template.guards))
+                     base = after
+                     continue
+-                guards, launches, section = _full_redo(lowered, i, selector, dispatches, opaque)
++                guards, launches, section = _full_redo(lowered, i, selector, dispatches, opaque, redo)
+                 entry, base = lower_entry(lowered, i, guards, launches, section, base)
+                 lo.redos += 1
+                 entries.append(entry)
+                 recorded.append((i, tuple(guards)))
+-                if reads is not None and (template := _template(lowered, entry, guards, launches, section, reads[1], op)) is not None:
++                if reads is not None and selector.op not in lo.rank_read and (template := _template(lowered, entry, guards, launches, section, reads[1], op)) is not None:
+                     lo.templates[reads[0]] = replace(template, substituted=reads[3])
+         entries.sort(key=lambda e: unselected.index(e[0]))
+         compiled = compile_program(program)
+@@ -159,19 +198,6 @@
+     return compiled, entries
+ 
+ 
+-def _library_body(func: Any) -> bool:
+-    """A non-ATen operator or a dispatch unit (a Python function run as one op): its Python body runs in a redo. ATen
+-    operators, Triton / CuTe DSL launches and jiterator ops redo from their recorded arguments."""
+-    if isinstance(func, OpOverload):
+-        return func.namespace != "aten"
+-    if isinstance(func, str):  # a jiterator op's label
+-        return False
+-    module = type(func).__module__ or ""
+-    if module.startswith(("triton", "cutlass", "torch.cuda._host_trace")):  # a Triton / CuTe DSL launch
+-        return False
+-    return callable(func)
+-
+-
+ def _symbols(v: Any, out: set) -> set:
+     """The free symbols (IR names) of a record's values: SymInts, IR nodes, roots, and dataclass records' fields."""
+     if isinstance(v, torch.SymInt):
+@@ -196,12 +222,82 @@
+     return out
+ 
+ 
+-def _scalar_read(tape: Any, k: int) -> str | None:
++def _python_decided(lowered: LoweredTape, selector: LoweredSelector) -> str | None:
++    """redo_policy "strict": a failing own guard of the op that a library body's Python decided on (recorded or deduped
++    there, not in an ATen op's C++ host; Env.python_decided), whose outcome may have reached Python state other code reads,
++    which a redo of this op alone leaves as the trace set it. Rows per own guard (selector.rows); where they do not line
++    up, any such guard counts."""
++    op, env = lowered.tape.ops[selector.op], lowered.tape.shape_env
++    decided = getattr(env, "python_decided", ())
++    if not decided:
++        return None
++    values = lowered.lowering.program.values
++    rows = selector.rows if len(selector.rows) == len(op.guards) else (None,) * len(op.guards)
++    for g, row in zip(op.guards, rows):
++        if g in decided and (row is None or row >= len(values) or values[row] != 1):
++            return f"redo_policy strict: {op.func}'s failing guard {repr(env.records[g][0])[:80]} was decided by a library body's Python"
++    return None
++
++
++def _lifted_symbols(tape: Any, lifted: frozenset[int]) -> set:
++    """The symbols of the call's arguments at the lifted positions: tensors' layouts and bases, ints."""
++    out: set = set()
++    for rec in tape.inputs:
++        if rec.position in lifted:
++            _symbols((rec.sizes, rec.strides, rec.offset, rec.root.sym), out)
++    for rec in tape.int_inputs:
++        if rec.position in lifted:
++            _symbols(rec.sym, out)
++    return out
++
++
++def _lifted(lowered: LoweredTape, redo: RedoOptions) -> set:
++    """_lifted_symbols, once per lowering."""
++    lo = lowered.lowering
++    if lo.lifted_symbols is None:
++        lo.lifted_symbols = _lifted_symbols(lowered.tape, redo.lifted)
++    return lo.lifted_symbols
++
++
++def _reads_lifted(lowered: LoweredTape, k: int, redo: RedoOptions) -> bool:
++    """Whether op k's records (launches, allocations, owned guards) read a symbol of the lifted arguments (cached per lowering)."""
++    lo, tape = lowered.lowering, lowered.tape
++    if not redo.lifted:
++        return False
++    if k not in lo.reads_lifted:
++        op, env = tape.ops[k], tape.shape_env
++        records: set = set()
++        for j in op.launches:
++            _symbols(tape.launches[j][1], records)
++        for a in op.allocs:
++            _symbols((tape.allocs[a].q, tape.allocs[a].sizes, tape.allocs[a].strides), records)
++        for g in op.guards:
++            _symbols(env.records[g][0] if isinstance(env, _ir.Env) else env.guards[g].expr, records)
++        lo.reads_lifted[k] = not records.isdisjoint(_lifted(lowered, redo))
++    return lo.reads_lifted[k]
++
++
++def _tensor_symbols(lowered: LoweredTape) -> set:
++    """The symbols of the tape's tensor layouts: its inputs' and every allocation's (once per lowering)."""
++    lo, tape = lowered.lowering, lowered.tape
++    if lo.tensor_symbols is None:
++        out: set = set()
++        for rec in tape.allocs:
++            _symbols((rec.q, rec.sizes, rec.strides), out)
++        for rec in tape.inputs:
++            _symbols((rec.sizes, rec.strides, rec.offset, rec.root.sym), out)
++        lo.tensor_symbols = out
++    return lo.tensor_symbols
++
++
++def _scalar_read(lowered: LoweredTape, k: int, allowed: set) -> str | None:
+     """A free symbol of op k's records (launches, allocations, owned guards) that reached it as a Python scalar: a call
+     int input that is not one of the op's own call values, or a symbol of no input. A redo of a library body reads such
+     a value from wherever its body found it (a holder its traced function filled from an argument), at the call, and
+     bakes it into the entry with no guard. Symbols of the op's call, its allocations, and the layouts of tensors (call
+-    inputs, other ops' allocations) are not: a tensor a body reaches is tracked (resolved to its argument, or declined)."""
++    inputs, other ops' allocations) are not: a tensor a body reaches is tracked (resolved to its argument, or declined);
++    nor are `allowed` (the lifted arguments' symbols, which a redo_context installs)."""
++    tape = lowered.tape
+     op = tape.ops[k]
+     own: set = set()
+     for leaf in pytree.tree_leaves(op.call):
+@@ -209,50 +305,140 @@
+             _symbols((tuple(leaf.shape), tuple(leaf.stride()), leaf.storage_offset(), leaf._root), own)
+         elif isinstance(leaf, torch.SymInt):
+             _symbols(leaf, own)
+-    tensors: set = set()
+-    for a, rec in enumerate(tape.allocs):
+-        _symbols((rec.q, rec.sizes, rec.strides), own if a in op.allocs else tensors)
+-    for rec in tape.inputs:
+-        _symbols((rec.sizes, rec.strides, rec.offset, rec.root.sym), tensors)
++    for a in op.allocs:
++        _symbols((tape.allocs[a].q, tape.allocs[a].sizes, tape.allocs[a].strides), own)
++    tensors = _tensor_symbols(lowered)
+     records: set = set()
+     for j in op.launches:
+         _symbols(tape.launches[j][1], records)
+     env = tape.shape_env
+     for g in op.guards:
+         _symbols(env.records[g][0] if isinstance(env, _ir.Env) else env.guards[g].expr, records)
+-    return next((s for s in sorted(records - own) if s not in tensors), None)
++    return next((s for s in sorted(records - own - allowed) if s not in tensors), None)
+ 
+ 
+-def _library_redo_refusal(lowered: LoweredTape, selector: LoweredSelector, opaque: Sequence[Any]) -> str | None:
++def _library_redo_refusal(lowered: LoweredTape, selector: LoweredSelector, opaque: Sequence[Any], redo: RedoOptions) -> str | None:
+     """Why a library body's redo is refused, or None (once per traced op, cached): a symbol of its records that came as a
+     Python scalar (_scalar_read); else its confirmation, the op redone once at the trace call itself (the variant's rows
+     evaluated at the trace's own arguments) giving back its recorded launches launch for launch with no section, and no
+     guard beyond its trace's but over its own symbols. A body that read a holder records a constant where its trace has a
+-    symbol there, whatever the values."""
++    symbol there, whatever the values. A lifted argument's symbol counts as the op's own where a redo_context installs it
++    (the redo and the confirmation run in it); redo_policy "refuse" refuses every library body."""
+     lo, tape = lowered.lowering, lowered.tape
+     k = selector.op
+     if k in lo.library_redo:
+         return lo.library_redo[k]
+-    op = tape.ops[k]
+     why = None
+-    if (sym := _scalar_read(tape, k)) is not None:
+-        why = f"its records read {sym}, which its call does not carry (a Python value a redo would bake)"
++    if redo.policy == "refuse":
++        why = _OwnRefusal(f"redo_policy refuse: {tape.ops[k].func} is a library body")
++    elif (sym := _scalar_read(lowered, k, set() if redo.context is None else _lifted(lowered, redo))) is not None:
++        lifted = redo.context is None and sym in _lifted(lowered, redo)
++        why = f"its records read {sym}, " + ("lifted state, with no redo_context" if lifted else "which its call does not carry (a Python value a redo would bake)")
+     else:
+         start = time.perf_counter()
+-        why = _confirmation(lowered, selector, opaque)
++        reads = _reads(lowered, tape.ops[k], selector, _declared(lowered, redo.static_prefix)) if lo.ir else None
++        lo.reads[k] = reads
++        candidates = lo.confirmed.get(reads[0], ()) if reads is not None else ()
++        if any(_records_match(lowered, j, roots, k, reads[1], redo) for j, roots in candidates):
++            _LIBRARY_COUNTS["shared"] += 1
++        else:
++            why = _confirmation(lowered, selector, opaque, redo)
++            _LIBRARY_COUNTS["confirmations"] += 1
++            _LIBRARY_COUNTS["confirmations with no confirmed key" if not candidates else "confirmations past a confirmed key"] += 1
++            if why is None and reads is not None and k not in lo.rank_read:
++                lo.confirmed.setdefault(reads[0], []).append((k, reads[1]))
+         _LIBRARY_COUNTS["confirmation_s"] += time.perf_counter() - start
+-        _LIBRARY_COUNTS["confirmations"] += 1
+     lo.library_redo[k] = why
+     _LIBRARY_COUNTS["refused" if why else "confirmed"] += 1
+     return why
+ 
+ 
+-def _confirmation(lowered: LoweredTape, selector: LoweredSelector, opaque: Sequence[Any]) -> str | None:
++def _records_match(lowered: LoweredTape, a: int, roots_a: list[_Root], b: int, roots_b: list[_Root], redo: RedoOptions) -> bool:
++    """Whether op b's records are op a's with a's read-walk roots renamed onto b's by position (a bijection; their base
++    symbols one for one), the static prefix's layout symbols at their values (redo templates key them so): every launch
++    field, allocation and owned guard, constants exactly. Ops of one redo template key redo alike (the property templates
++    rest on), so b's confirmation is a's: b redone at its trace call is a's redo renamed, which gives back a's records
++    renamed, b's."""
++    tape = lowered.tape
++    ctx = tape.shape_env.ctx
++    if len(roots_a) != len(roots_b):
++        _LIBRARY_COUNTS["share_miss:roots"] += 1
++        return False
++    rename: dict[str, str] = {}
++    for x, y in zip(roots_a, roots_b):
++        kx, ky = _sym_key(x.sym), _sym_key(y.sym)
++        if not isinstance(kx, _ir.Node) or not isinstance(ky, _ir.Node) or len(kx.free_symbols) != 1 or len(ky.free_symbols) != 1:
++            _LIBRARY_COUNTS["share_miss:root base"] += 1
++            return False
++        (nx,), (ny,) = kx.free_symbols, ky.free_symbols
++        if rename.setdefault(nx, ny) != ny:
++            _LIBRARY_COUNTS["share_miss:bijection"] += 1
++            return False
++    if len(set(rename.values())) != len(rename):
++        _LIBRARY_COUNTS["share_miss:bijection"] += 1
++        return False
++    declared = _declared(lowered, redo.static_prefix)
++    hints = {n: ctx.const(int(ctx.symbols[n].hint)) for n in declared}
++    at_b = collections.ChainMap(hints, ctx.symbols)
++    from_a = collections.ChainMap({nx: ctx.symbols[ny] for nx, ny in rename.items()}, at_b)
++    position_a = {id(r): p for p, r in enumerate(roots_a)}
++    position_b = {id(r): p for p, r in enumerate(roots_b)}
++
++    def canon(v: Any, symbols: Any) -> Any:
++        k = _sym_key(v) if isinstance(v, (torch.SymInt, torch.SymBool, torch.SymFloat)) else v
++        if isinstance(k, _ir.Node):
++            return ctx.transfer(k, ctx, symbols, {})
++        if isinstance(k, _Root):
++            return ("root", (position_a if symbols is from_a else position_b)[id(k)])  # KeyError: a root of no read
++        if isinstance(k, (tuple, list)):
++            return tuple(canon(x, symbols) for x in k)
++        if dataclasses.is_dataclass(k) and not isinstance(k, type):
++            # a field the class leaves out of its own equality (compare=False: a TMA descriptor's last-encode cache) is no record
++            fields = (f for f in dataclasses.fields(k) if f.compare and f.name not in ("name", "witness", "owner", "images", "abi"))
++            return (type(k), *(canon(getattr(k, f.name), symbols) for f in fields))
++        return k
++
++    def same(x: Any, y: Any) -> bool:
++        try:
++            return bool(canon(x, from_a) == canon(y, at_b))
++        except Exception:  # a root of no read, a formula that does not transfer, a field with no equality: not shared
++            return False
++
++    op_a, op_b = tape.ops[a], tape.ops[b]
++    if len(op_a.launches) != len(op_b.launches) or len(op_a.allocs) != len(op_b.allocs) or len(op_a.guards) != len(op_b.guards):
++        _LIBRARY_COUNTS["share_miss:counts"] += 1
++        return False
++    env = tape.shape_env
++    if any(getattr(rec, "cpu_scalars", ()) for _, rec in tape.launches[op_b.launches.start : op_b.launches.stop]):
++        _LIBRARY_COUNTS["share_miss:cpu scalars"] += 1
++        return False  # re-read from a CPU tensor at each call (KernelLaunch.cpu_scalars, compare=False): its own
++    for (_, x), (_, y) in zip(tape.launches[op_a.launches.start : op_a.launches.stop], tape.launches[op_b.launches.start : op_b.launches.stop]):
++        if not same(x, y):
++            field = next((f.name for f in dataclasses.fields(x) if f.compare and not same(getattr(x, f.name), getattr(y, f.name))), "type") if dataclasses.is_dataclass(x) and type(x) is type(y) else "type"
++            _LIBRARY_COUNTS[f"share_miss:launch {field}"] += 1
++            return False
++    for p, q in zip(tape.allocs[op_a.allocs.start : op_a.allocs.stop], tape.allocs[op_b.allocs.start : op_b.allocs.stop]):
++        if not same((p.dtype, p.sizes, p.strides, p.root), (q.dtype, q.sizes, q.strides, q.root)):
++            _LIBRARY_COUNTS["share_miss:allocation"] += 1
++            return False
++    # the owned guards as sets (their order is the trace's recording order, which dedup with earlier ops moves)
++    try:
++        guards_a = {canon(env.records[g][0], from_a) for g in op_a.guards}
++        guards_b = {canon(env.records[h][0], at_b) for h in op_b.guards}
++    except Exception:
++        guards_a, guards_b = None, ()
++    if guards_a != guards_b:
++        _LIBRARY_COUNTS["share_miss:guard"] += 1
++        return False
++    return True
++
++
++def _confirmation(lowered: LoweredTape, selector: LoweredSelector, opaque: Sequence[Any], redo: RedoOptions) -> str | None:
+     lo, tape = lowered.lowering, lowered.tape
+     op = tape.ops[selector.op]
+     program = lo.program
+     inputs = _trace_call(tape, program.inputs)
+-    values = _values_at(program, inputs)
++    values = _trace_values(lo, inputs)
+     if values is None:
+         return "confirmation: the variant's rows do not evaluate at its trace call"
+     global redo_bodies
+@@ -260,7 +446,7 @@
+     with _rolled_back(lo):
+         program.inputs, program.values = inputs, values
+         try:
+-            guards, launches, section = _redo(lowered, selector, hosted=True, dispatches=None, opaque=opaque)
++            guards, launches, section = _redo(lowered, selector, hosted=True, dispatches=None, opaque=opaque, redo=redo)
+         except FoldRefused as e:
+             return _OwnRefusal(str(e))  # the op's redo refuses itself, for its own reason
+         except (HintsFail, Declined) as e:
+@@ -274,8 +460,12 @@
+     chain = [rec for _, rec in tape.launches[op.launches.start : op.launches.stop] if id(rec) not in keyed]
+     if len(launches) != len(chain):
+         return f"confirmation: {len(launches)} launches at its trace call for its {len(chain)}"
++    # the static prefix's layouts are the same every call: a value the redo read off a declared view (close_over) at its
++    # constant layout equals the trace's at their values
++    declared = _declared(lowered, redo.static_prefix) if lo.ir else frozenset()
++    fold = _at_values(tape.shape_env.ctx, declared) if declared else None
+     for j, ((_, x), y) in enumerate(zip(launches, chain)):
+-        if (diff := _launch_difference(x, y)) is not None:
++        if (diff := _launch_difference(x, y, fold)) is not None:
+             return f"confirmation: launch {j} differs at its trace call ({diff})"
+     env = tape.shape_env
+     recorded = {node for node, _ in env.records} if isinstance(env, _ir.Env) else {g.expr for g in env.guards}
+@@ -284,7 +474,11 @@
+         _symbols((tape.allocs[a].q, tape.allocs[a].sizes, tape.allocs[a].strides), own)
+     # an IR redo's guards are (node, written) pairs, a sympy one's its expressions
+     exprs = [g[0] if isinstance(g, tuple) else g for g in guards]
+-    extra = [g for g in exprs if g not in recorded and not ((free := _symbols(g, set())) and free <= own)]
++    # and a guard over what a declared view's read reads besides: the static prefix's layouts and bases (the same every call)
++    for rec in tape.inputs if declared else ():
++        if rec.position < redo.static_prefix:
++            _symbols(rec.root.sym, own)
++    extra = [g for g in exprs if g not in recorded and not ((free := _symbols(g, set())) and free <= own | declared)]
+     if extra:
+         return f"confirmation: {len(extra)} guards its trace did not record ({repr(extra[0])[:80]})"
+     return None
+@@ -323,10 +517,29 @@
+             raise AssertionError("host_trace: a confirmation left a row of its own in the variant's lowering")
+ 
+ 
+-def _values_at(program: Any, inputs: tuple) -> list[int] | None:
+-    """Every row's value at `inputs`, as IntegerProgram.emit evaluates a row (None where one fails)."""
+-    values: list[int] = []
+-    for row in program.instructions:
++def _trace_values(lo: Any, inputs: tuple) -> list[int] | None:
++    """Every row's value at the trace call (a copy: a confirmation's redo appends its own): the rows' values at the trace
++    call are a function of the rows and the trace call's metadata, so the lowering keeps them and evaluates only the rows
++    added since (rows are only appended; a confirmation's own are rolled back past them)."""
++    program = lo.program
++    cached, last = lo.trace_values or (None, None)
++    rows = program.instructions
++    # a rollback cuts a suffix of the rows: a kept value past the cut was of a row it removed (another row object now)
++    if cached is None or len(cached) > len(rows) or (cached and rows[len(cached) - 1] is not last):
++        cached = _values_at(program, inputs)
++    elif len(cached) < len(rows):
++        cached = _values_at(program, inputs, cached)
++    lo.trace_values = None if cached is None else (cached, rows[len(cached) - 1] if cached else None)
++    if cached is not None and torch.cuda._host_trace.verify_redo_templates and cached != _values_at(program, inputs):
++        raise AssertionError("host_trace: the kept trace-call row values disagree with a fresh evaluation")
++    return None if cached is None else list(cached)
++
++
++def _values_at(program: Any, inputs: tuple, prefix: list[int] | None = None) -> list[int] | None:
++    """Every row's value at `inputs`, as IntegerProgram.emit evaluates a row (None where one fails); with `prefix`, the
++    first rows' values, evaluating only the rest."""
++    values: list[int] = list(prefix or ())
++    for row in program.instructions[len(values) :]:
+         op, *operands = row
+         if op == "constant":
+             value = operands[0]
+@@ -362,9 +575,29 @@
+     return tuple(args)
+ 
+ 
+-def _launch_difference(x: Any, y: Any) -> str | None:
+-    """The first field where a redo's record x and the trace's y differ (values by node, roots by identity), or None."""
+-    same = lambda u, v: _sym_key(u) == _sym_key(v)  # noqa: E731
++def _at_values(ctx: Any, declared: frozenset[str]) -> Callable[[Any], Any]:
++    """A value as a node with the `declared` symbols at their values."""
++    hints = {name: ctx.const(int(ctx.symbols[name].hint)) for name in declared}
++    symbols = collections.ChainMap(hints, ctx.symbols)
++
++    def fold(v: Any) -> Any:
++        k = _sym_key(v)
++        if isinstance(k, int):
++            return ctx.const(k)
++        if not isinstance(k, _ir.Node) or not k.free_symbols & declared:
++            return k
++        try:
++            return ctx.transfer(k, ctx, symbols, {})
++        except (KeyError, ArithmeticError, ValueError):
++            return k
++
++    return fold
++
++
++def _launch_difference(x: Any, y: Any, fold: Callable[[Any], Any] | None = None) -> str | None:
++    """The first field where a redo's record x and the trace's y differ (values by node, roots by identity), or None;
++    with `fold`, values equal as fold gives them count as equal."""
++    same = lambda u, v: _sym_key(u) == _sym_key(v) or (fold is not None and fold(u) == fold(v))  # noqa: E731
+     if type(x) is not type(y):
+         return f"{type(x).__name__} for {type(y).__name__}"
+     if [id(r) for r in getattr(x, "roots", ())] != [id(r) for r in getattr(y, "roots", ())]:
+@@ -375,6 +608,12 @@
+         for name, a, b in (("grid", x.grid, y.grid), ("block", x.block, y.block), ("smem", (x.smem,), (y.smem,)), ("slots", x.slots, y.slots)):
+             if len(a) != len(b) or not all(same(u, v) for u, v in zip(a, b)):
+                 return name
++        # and the rest of the record (TMA descriptors, parameter layout, attributes, RNG): not the name, the CUfunction's own
++        # abi / owner / images, or what the class leaves out of its equality (caches, the capture's witness)
++        skip = ("name", "function", "abi", "grid", "block", "smem", "slots", "roots", "owner", "images")
++        for f in dataclasses.fields(x):
++            if f.compare and f.name not in skip and not _same_value(getattr(x, f.name), getattr(y, f.name), same):
++                return f.name
+         return None
+     for f in dataclasses.fields(x):
+         if f.name in ("roots", "name"):
+@@ -386,6 +625,29 @@
+     return None
+ 
+ 
++def _same_value(u: Any, v: Any, same: Callable[[Any, Any], bool]) -> bool:
++    """A record field's values equal: SymInts and ints by `same`, tuples elementwise, dataclasses by their compared fields."""
++    if isinstance(u, (tuple, list)) and isinstance(v, (tuple, list)):
++        return len(u) == len(v) and all(_same_value(p, q, same) for p, q in zip(u, v))
++    if dataclasses.is_dataclass(u) and not isinstance(u, type):
++        return type(u) is type(v) and all(_same_value(getattr(u, f.name), getattr(v, f.name), same) for f in dataclasses.fields(u) if f.compare)
++    if isinstance(u, (int, torch.SymInt)) and isinstance(v, (int, torch.SymInt)) and not isinstance(u, bool):
++        return same(u, v)
++    return u is v or u == v
++
++
++class _Resolving(TorchFunctionMode):
++    """A redo's resolver (_resolver) at the torch-function layer."""
++
++    def __init__(self, resolve: Callable[[torch.Tensor], torch.Tensor]) -> None:
++        super().__init__()
++        self.resolve = resolve
++
++    def __torch_function__(self, func: Any, types: Any, args: tuple = (), kwargs: dict | None = None) -> Any:
++        args, kwargs = pytree.tree_map_only(torch.Tensor, self.resolve, (args, kwargs or {}))
++        return func(*args, **kwargs)
++
++
+ class _OwnRefusal(str):
+     """A confirmation's redo refused itself: its reason, as the op's redo would give it."""
+ 
+@@ -394,12 +656,14 @@
+ _LIBRARY_COUNTS: collections.Counter = collections.Counter()
+ 
+ 
+-def _full_redo(lowered: LoweredTape, i: int, selector: LoweredSelector, dispatches: dict | None, opaque: Sequence[Any] = ()) -> tuple[list[Any], list[tuple[int, Any]], Section | None]:
++def _full_redo(
++    lowered: LoweredTape, i: int, selector: LoweredSelector, dispatches: dict | None, opaque: Sequence[Any] = (), redo: RedoOptions = RedoOptions()
++) -> tuple[list[Any], list[tuple[int, Any]], Section | None]:
+     try:
+         try:
+-            return _redo(lowered, selector, hosted=True, dispatches=dispatches, opaque=opaque)
++            return _redo(lowered, selector, hosted=True, dispatches=dispatches, opaque=opaque, redo=redo)
+         except HintsFail:
+-            return _redo(lowered, selector, ir=False, hosted=True, opaque=opaque)
++            return _redo(lowered, selector, ir=False, hosted=True, opaque=opaque, redo=redo)
+     except FoldRefused as e:
+         lowered.lowering.refused.add(i)
+         e.op = selector.op
+@@ -834,6 +1098,7 @@
+     hosted: bool = False,
+     dispatches: dict[Any, list[tuple[_Trace, list[torch.SymInt], list[_Root]]]] | None = None,
+     opaque: Sequence[Any] = (),
++    redo: RedoOptions = RedoOptions(),
+ ) -> tuple[list[Any], list[tuple[int, Any]], Section | None]:
+     # ir off renames in sympy
+     # dispatches: the family's dispatches by what they read of their call, each with its fresh symbols and roots
+@@ -964,6 +1229,18 @@
+     # the hints: the formulas at the call, rows that fail at no other call
+     with lo.symbolic.total():
+         call = pytree.tree_map(lambda a: tensor(a) if isinstance(a, _TracedTensor) else value(a), op.call)
++        # a library body that reads lifted state redoes inside redo_context, its holders holding stand-ins for the lifted
++        # arguments (built as the call's are, so its read of them is a read of the call)
++        stand_ins: dict[int, Any] | None = None
++        if redo.context is not None and _library_body(op.func) and _reads_lifted(lowered, selector.op, redo):
++            stand_ins = {}
++            for rec in old.inputs:
++                if rec.position in redo.lifted:
++                    stand_ins[rec.position] = (root(rec.root), [value(n) for n in rec.sizes], [value(s) for s in rec.strides], value(rec.offset), rec.dtype, old.device)
++            for irec in old.int_inputs:
++                if irec.position in redo.lifted:
++                    stand_ins[irec.position] = value(irec.sym)
++            shape.append(("redo_context", tuple(sorted(stand_ins))))
+     # a dispatch that read the same of its call, whose guards hold at this one, is this one's: the op's records are a
+     # function of what it reads (an entry's are taken wherever its predicate holds)
+     sig, cached, nodes = None, None, 0
+@@ -1008,8 +1285,8 @@
+         tr.values = CallValues(env, {m.node.node.args[0]: x for m, x in zip(made, at_call)})
+         tr.inputs, tr.arguments = inputs, {id(i.root): i for i in inputs}
+         tr.outer = {k: _TracedTensor(*o) for k, o in outer.items()}
+-        if torch.cuda._host_trace.redo_resolves_arguments:
+-            tr.resolve = _resolver(old, lo, tr, root, made, at_call, inputs, resolved)
++        if torch.cuda._host_trace.redo_resolves_arguments or torch.cuda._host_trace._CLOSURES:
++            tr.resolve = _resolver(old, lo, op, tr, root, value, made, at_call, resolved, redo.static_prefix)
+         built = {k: _TracedTensor(*t) for k, t in tensors.items()}
+         call = pytree.tree_map_only(_TracedTensor, lambda a: built[id(a)], call)
+         if len(op.allocs):
+@@ -1018,12 +1295,22 @@
+         _active.trace = tr
+         # an operator's dispatch runs where _TraceMode dispatched it, a launcher where the host called it
+         mode = contextlib.nullcontext() if isinstance(op.func, OpOverload) else _TraceMode(tr)
++        context = contextlib.ExitStack()
++        if tr.resolve is not None:
++            # at each torch function the body calls, before autograd sees a plain tensor
++            context.enter_context(_Resolving(tr.resolve))
++        if stand_ins is not None:
++            args = list(lo.program.inputs)
++            for p, x in stand_ins.items():
++                args[p] = _TracedTensor(*x) if isinstance(x, tuple) else x
++            redo_call = RedoCall(tuple(args), op.func, sum(o.func == op.func for o in old.ops[: selector.op]))
++            context.enter_context(redo.context(redo_call))  # type: ignore[misc]
+         redo_bodies += 1
+         try:
+             # hosted: inside the caller's _hosting, one capture for all its redos
+             with contextlib.nullcontext() if hosted else _hosting(old.device):
+                 tr.stream = torch.cuda.current_stream(old.device)
+-                with mode, fx_config.patch(backed_size_oblivious=False):  # type: ignore[attr-defined]
++                with mode, fx_config.patch(backed_size_oblivious=False), context:  # type: ignore[attr-defined]
+                     op.redo(*call)
+                 from cuda.bindings import runtime
+ 
+@@ -1040,6 +1327,8 @@
+         finally:
+             _active.trace = prior
+             _redo_fakes.mode = fake
++            if stand_ins is not None and redo_call.rank_read:
++                lo.rank_read.add(selector.op)
+     if tr.declined is not None or _ir_census(tr):
+         _drop_tracebacks(tr.declined)
+         raise FoldRefused(f"{op.func} declines again: {tr.declined or _ir_census(tr)}")
+@@ -1053,7 +1342,7 @@
+         raise FoldRefused(f"{op.func} dispatches otherwise")
+     # one whose guards read a symbol the dispatch made itself is never taken
+     names = {s.node.node.args[0] for s in made}
+-    if sig is not None and cached is None and not nodes and not tr.sites and not resolved and all(g.free_symbols <= names for g, _ in env.records):
++    if sig is not None and cached is None and not nodes and not tr.sites and not resolved and selector.op not in lo.rank_read and all(g.free_symbols <= names for g, _ in env.records):
+         dispatches.setdefault(sig, []).append((tr, made, list(roots.values())))
+     new = tr.ops[0]
+     if eager:
+@@ -1253,40 +1542,56 @@
+ 
+ 
+ def _resolver(
+-    old: Any, lo: Any, tr: _Trace, root: Callable[[_Root], _Root], made: list, at_call: list, inputs: list, resolved: dict[int, _TracedTensor]
++    old: Any, lo: Any, op: OpRec, tr: _Trace, root: Callable[[_Root], _Root], value: Callable[[Any], Any], made: list, at_call: list, resolved: dict[int, _TracedTensor], static_prefix: int
+ ) -> Callable[[torch.Tensor], torch.Tensor]:
+-    """redo_resolves_arguments: a plain CUDA tensor the redo's body reaches
+-    becomes the stand-in of the call's tensor argument of the same storage
+-    object and view (dtype, sizes, strides, storage offset), where exactly one
+-    is: that argument's root at its input record's layout in fresh symbols, as
+-    the redo builds any argument it reads. Any other tensor is left as it is
+-    (it declines as before)."""
+-    by_storage: dict[int, list[tuple[_InputRec, torch.Tensor]]] = {}
++    """A plain tensor the redo's body reaches, as a stand-in on one of the
++    call's arguments' roots (in fresh symbols, as the redo builds any argument
++    it reads): with redo_resolves_arguments, one that is a tensor argument (the
++    object), at that argument's input record's layout; one close_over declared
++    on the storage of a static-prefix argument (the same object every call), at
++    its own layout, constant while declared, on that argument's root (where
++    several static-prefix arguments share the storage, the one the op's
++    recorded launches read). Any other tensor is left as it is (it declines as
++    before)."""
++    ht = torch.cuda._host_trace
++    by_object: dict[int, _InputRec] = {}
++    by_storage: dict[int, list[_InputRec]] = {}
+     for rec in old.inputs:
+         a = lo.program.inputs[rec.position]
+         if isinstance(a, torch.Tensor):
+-            by_storage.setdefault(a.untyped_storage()._cdata, []).append((rec, a))
++            if ht.redo_resolves_arguments or (rec.position < static_prefix and ht.closed_over(a)):
++                by_object.setdefault(id(a), rec)
++            if rec.position < static_prefix and ht._CLOSURES:
++                by_storage.setdefault(a.untyped_storage()._cdata, []).append(rec)
++    read = {id(r) for _, launch in old.launches[op.launches.start : op.launches.stop] for r in getattr(launch, "roots", ())}
++
++    def on_storage(t: torch.Tensor) -> _InputRec | None:
++        recs = by_storage.get(t.untyped_storage()._cdata, ())
++        roots = {id(rec.root): rec for rec in recs}
++        if len(roots) > 1:
++            roots = {k: rec for k, rec in roots.items() if k in read}
++        return next(iter(roots.values())) if len(roots) == 1 else None
+ 
+-    def resolve(t: torch.Tensor) -> torch.Tensor:
+-        if isinstance(t, _TracedTensor) or t.device.type != "cuda":
+-            return t
+-        if id(t) in resolved:
+-            return resolved[id(t)]
+-        view = (t.dtype, t.shape, t.stride(), t.storage_offset())
+-        found = [rec for rec, a in by_storage.get(t.untyped_storage()._cdata, ()) if (a.dtype, a.shape, a.stride(), a.storage_offset()) == view]
+-        if len(found) != 1:
+-            return t
++    def stand_in(t: torch.Tensor, rec: _InputRec, layout: Callable[[], tuple]) -> _TracedTensor:
+         n = len(made)
+         with lo.symbolic.total():
+-            r = root(found[0].root)
++            r = root(rec.root)
++            sizes, strides, offset = layout()
+         for m, x in zip(made[n:], at_call[n:]):
+             tr.values.bind(m, x)
+-        rec = next(i for i in inputs if i.root is r)
+-        if rec.position != found[0].position:
+-            # the root's record is another argument's view of it: not this tensor's layout
++        tr.arguments.setdefault(id(r), next(i for i in tr.inputs if i.root is r))
++        return _TracedTensor(r, sizes, strides, offset, t.dtype, t.device)
++
++    def resolve(t: torch.Tensor) -> torch.Tensor:
++        if isinstance(t, _TracedTensor) or t.device.type != "cuda":
+             return t
+-        tr.arguments[id(r)] = rec
+-        resolved[id(t)] = _TracedTensor(r, list(rec.sizes), list(rec.strides), rec.offset, t.dtype, t.device)
++        if id(t) not in resolved:
++            if (rec := by_object.get(id(t))) is not None:
++                resolved[id(t)] = stand_in(t, rec, lambda: ([value(s) for s in rec.sizes], [value(s) for s in rec.strides], value(rec.offset)))
++            elif by_storage and ht.closed_over(t) and (rec := on_storage(t)) is not None:
++                resolved[id(t)] = stand_in(t, rec, lambda: (list(t.shape), list(t.stride()), t.storage_offset()))
++            else:
++                return t
+         return resolved[id(t)]
+ 
+     return resolve
+diff -ruN -x __pycache__ -x '*.pyc' -x TREE.txt step_ms33/torch/cuda/_host_trace_replay.py step_ms34/torch/cuda/_host_trace_replay.py
+--- step_ms33/torch/cuda/_host_trace_replay.py	2026-10-18 10:50:42.609113933 -0700
++++ step_ms34/torch/cuda/_host_trace_replay.py	2026-10-20 09:18:11.534090768 -0700
+@@ -88,7 +88,7 @@
+ from torch.cuda._host_trace_memory import arena_addresses, auto_memory, check_plan, check_section, plan_memory, section_places, section_seqs, relocate, relocate_entries, size_classes, split_runs, SPLITS
+ from torch.cuda._host_trace_opaque import fill_uniform, key_guards, library_state_as, span_bytes, takes_generator
+ from torch.cuda._host_trace_program import Status
+-from torch.cuda._host_trace_redispatch import redispatch
++from torch.cuda._host_trace_redispatch import REDO_POLICIES, redispatch, RedoCall, RedoOptions
+ from torch.cuda._host_trace_native import (
+     binding_row,
+     CAPTURE,
+@@ -505,6 +505,32 @@
+     `background_errors`. With `forbid_learners` such a key learns at the call
+     instead, as without `background`.
+ 
++    Where an op's own guards fail, a redispatch dispatches that op again
++    (_host_trace_redispatch) instead of tracing fn. `redo_policy` is how a
++    library body (a non-ATen operator or a dispatch unit, whose Python body
++    runs again) may be: "inputs_only" (the default) redoes it only where its
++    records read nothing but its call, and a run at its trace call gives back
++    its records. It relies on a contract: a library body does not leak a
++    decision into Python state that code outside the op reads (another op's
++    body, fn's own code); its effects flow through its outputs. A body that
++    does (it stashes int(x.shape[0]) where fn reads it) gets stale values when
++    its own guard fails and it alone is redone. "strict" needs no contract: it
++    also refuses a redispatch whose failing guard the body's Python decided on
++    (the call traces), at the cost of every Python kernel choice in a body.
++    "refuse" never redoes one (the call traces). `lifted` are the
++    positions of fn's flat arguments that carry per-step state the caller
++    moved out of Python holders (attention metadata tensors, ints) and that
++    fn puts back into them; with `redo_context`, a library body that reads
++    them redoes inside redo_context(RedoCall(args, func, rank)), which makes
++    the holders hold `args` (the redo's stand-ins at the lifted positions)
++    for the redo and restores them; `rank` is the op's index among the
++    tape's ops of the same operator. Without it such a body is not redone.
++    A context must take the same path for the same operator and argument
++    structure, apart from what it reads through tracked fields: reading
++    `rank` makes the op's redo its own (no other op shares it), and ops whose
++    context does not read it share redo templates, dispatches and
++    confirmations as any op does.
++
+     fn must be a pure function of its arguments. Torch's global settings
+     (grad and inference mode, autocast, the TF32, reduced-precision, cuDNN
+     and SDPA flags) are assumed unchanged between a trace and its replays
+@@ -550,11 +576,17 @@
+         fullgraph: bool = False,
+         forbid_learners: bool = False,
+         boxed_fn: Callable[[list[Any]], Any] | None = None,
++        redo_policy: str = "inputs_only",
++        lifted: Collection[int] | None = None,
++        redo_context: Callable[[RedoCall], contextlib.AbstractContextManager[Any]] | None = None,
+     ) -> None:
+         if memory not in ("auto", "eager", "run_buffer", "held", *_PLANNED):
+             raise ValueError(f"host_trace: memory {memory!r} is not 'auto', 'eager', 'run_buffer', 'held' or one of {_PLANNED}")
+         if splits not in SPLITS:
+             raise ValueError(f"host_trace: splits {splits!r} is not one of {SPLITS}")
++        if redo_policy not in REDO_POLICIES:
++            raise ValueError(f"host_trace: redo_policy {redo_policy!r} is not one of {REDO_POLICIES}")
++        self.redo = RedoOptions(redo_policy, frozenset(lifted or ()), redo_context, static_prefix)
+         self.fn = fn
+         self.memory = memory
+         self.freed_arguments = frozenset(freed_arguments)
+@@ -1476,7 +1508,9 @@
+                 return e
+         lo = lowered.lowering
+         counts = lo.redos, lo.instances
+-        refused = self._add_entries(variant, self.redispatch_refusals, args, redispatch, variant.captured.lowered, args, values, unselected, dispatches, self.opaque, self.static_prefix)
++        # a redo runs its op's host as the trace did, Python's max and min included
++        with _builtin_minmax if self.trace_builtin_minmax else contextlib.nullcontext():
++            refused = self._add_entries(variant, self.redispatch_refusals, args, redispatch, variant.captured.lowered, args, values, unselected, dispatches, self.opaque, self.static_prefix, self.redo)
+         self.redos += lo.redos - counts[0]
+         self.redo_instances += lo.instances - counts[1]
+         # a refusal keeps the rows it appended, evaluated at the call, which a fold reads
+diff -ruN -x __pycache__ -x '*.pyc' -x TREE.txt step_ms33/torch/cuda/_host_trace_tape.py step_ms34/torch/cuda/_host_trace_tape.py
+--- step_ms33/torch/cuda/_host_trace_tape.py	2026-10-19 08:58:25.498864313 -0700
++++ step_ms34/torch/cuda/_host_trace_tape.py	2026-10-20 08:06:05.875400537 -0700
+@@ -951,6 +951,8 @@
+         env = self.shape_env
+         k, first, guards = len(self.ops), (len(self.launches), len(self.allocs), len(self.sites)), len(env.owners)
+         self.in_op, env.op, reads = True, k if host else None, len(self.int_reads)
++        if isinstance(env, _ir.Env):
++            env.library_python = _library_body(func)
+         try:
+             # guard_sloc memoizes its walks within the op (its body's guards, an aten op's, a CuTe or Triton launcher's,
+             # share their frames), holding no frame past the op
+@@ -958,6 +960,8 @@
+                 out = run()
+         finally:
+             self.in_op, env.op = False, None
++            if isinstance(env, _ir.Env):
++                env.library_python = False
+         # a later op reading a property this op cached would not guard it again
+         for t in pytree.tree_leaves((args, kwargs, out)):
+             if isinstance(t, _TracedTensor):
+@@ -1600,6 +1604,10 @@
+             torch._C._cuda_hostTraceSeal(t, True)
+             self.sealed.append(t)
+         torch._C._cuda_hostTraceTakeRefusal()
++        env = self.shape_env
++        library_python = isinstance(env, _ir.Env) and env.library_python
++        if library_python:
++            env.library_python = False
+         try:
+             return invoke(sink)
+         except Exception as e:
+@@ -1619,6 +1627,8 @@
+                 raise UnconvertedHost(f"{func}: {type(e).__name__}: {message}{chr(10) + site if site else ''}") from e
+             raise declined(f"its host stops at {refusal or type(e).__name__}: {message}") from e
+         finally:
++            if library_python:
++                env.library_python = True
+             for t in self.sealed:
+                 torch._C._cuda_hostTraceSeal(t, False)
+             # a nested op's host (a composite body's part) unsealed what the enclosing one sealed
+@@ -1796,6 +1806,19 @@
+     return opdef._backend_fns.get(None)
+ 
+ 
++def _library_body(func: Any) -> bool:
++    """A non-ATen operator or a dispatch unit (a Python function run as one op): its Python body runs in a redo. ATen
++    operators, Triton / CuTe DSL launches and jiterator ops redo from their recorded arguments."""
++    if isinstance(func, OpOverload):
++        return func.namespace != "aten"
++    if isinstance(func, str):  # a jiterator op's label
++        return False
++    module = type(func).__module__ or ""
++    if module.startswith(("triton", "cutlass", "torch.cuda._host_trace")):  # a Triton / CuTe DSL launch
++        return False
++    return callable(func)
++
++
+ def _library_body_kind(func: OpOverload, kernel: Callable[..., Any]) -> str | None:
+     """Where `kernel` (_python_kernel's) is a body whose re-entry switch is on,
+     its kind: "Library.impl" or "custom_op"."""
+diff -ruN -x __pycache__ -x '*.pyc' -x TREE.txt step_ms33/torch/cuda/_host_trace_triton_launch.py step_ms34/torch/cuda/_host_trace_triton_launch.py
+--- step_ms33/torch/cuda/_host_trace_triton_launch.py	2026-10-08 20:30:49.131186802 -0700
++++ step_ms34/torch/cuda/_host_trace_triton_launch.py	2026-10-19 11:57:20.925662818 -0700
+@@ -44,6 +44,7 @@
+ from torch.cuda._host_trace_launch import _driver_version, _GRID_LIMITS, _probe_address, KernelLaunch, tma_edits, TmaDescriptor
+ from torch.cuda._host_trace_tape import _PLACEHOLDER_LOW, _Root, _TracedTensor, current_trace, EagerCall
+ from torch.cuda._host_trace_triton import param_layout, triton_abi
++from torch.utils._pytree import tree_map_only
+ from torch.utils._triton import has_triton_package
+ 
+ 
+@@ -250,6 +251,8 @@
+     from triton.tools.tensor_descriptor import TensorDescriptor
+ 
+     name = jit.fn.__name__
++    if tr.resolve is not None:  # a redo's kernel argument read straight from module state (_host_trace_redispatch._resolver)
++        args, kwargs = tree_map_only(torch.Tensor, tr.resolve, (args, kwargs))
+ 
+     # phase (a), the call: its declines are the trace's
+     def decline(why: str) -> NoReturn:
+@@ -464,6 +467,8 @@
+     def decline(why: str) -> NoReturn:
+         raise declined(f"Triton kernel {name}: {why}")
+ 
++    if tr.resolve is not None:  # a pointer a grid callback put in META (from a redo's module state)
++        values = {k: tr.resolve(v) if isinstance(v, torch.Tensor) else v for k, v in values.items()}
+     # under trusted inputs the caller sized the slots and grids it compiled:
+     # their limits are not checked
+     trusted = tr.trusted is not None
+diff -ruN -x __pycache__ -x '*.pyc' step_ms33/test/test_cuda_host_trace_cute.py step_ms34/test/test_cuda_host_trace_cute.py
+--- step_ms33/test/test_cuda_host_trace_cute.py	2026-10-15 05:50:01.406648951 -0700
++++ step_ms34/test/test_cuda_host_trace_cute.py	2026-10-20 11:37:11.642618874 -0700
+@@ -1699,6 +1699,59 @@
+         not TEST_CUDA or torch.cuda.get_device_capability() < (10, 0),
+         "requires Blackwell",
+     )
++    @parametrize("records", ["same", "another swizzle"])
++    def test_layers_with_tma_descriptors_share_a_confirmation(self, records):
++        # three chained layers of _tma_gemm on static-prefix weights: the second and third read what the one before wrote
++        # (an allocation; the first reads the argument, another key), and their TMA descriptors' last-encode caches
++        # (compare=False) hold each layer's addresses, which is no record: the third shares the second's confirmation (2 own,
++        # 1 shared). A descriptor record field that differs (the third's swizzle, edited into its tape record) is a record:
++        # it confirms on its own, and its redo, which does not give that field back, is refused
++        import dataclasses
++
++        from torch.cuda._host_trace_launch import KernelLaunch
++        from torch.cuda._host_trace_redispatch import _LIBRARY_COUNTS
++
++        bw = _example("cute/blackwell/kernel/dense_gemm/dense_gemm.py", "bw_dense_gemm")
++        a, b, c = (_half(1, 128, 128).permute(1, 2, 0) for _ in range(3))
++        compile_args = [from_dlpack(t, assumed_align=16).mark_layout_dynamic(leading_dim=1) for t in (a, b, c)]
++        stream = make_fake_stream(use_tvm_ffi_env_stream=True)
++        for big, tile in ((True, (128, 128)), (False, (128, 64))):
++            op = bw.DenseGemmKernel(cutlass.Float32, False, tile, (1, 1), True)
++            _TMA_GEMMS[big] = cute.compile(op, *compile_args, stream, options="--enable-tvm-ffi")
++
++        def step(w1, w2, w3, x):
++            return _tma_gemm(_tma_gemm(_tma_gemm(x, w1), w2), w3)
++
++        ws = [_half(1, 128, 128).permute(1, 2, 0) for _ in range(3)]
++        r = HostTraceReplay(step, static_prefix=3)
++        x = _half(1, 256, 128).permute(1, 2, 0)
++        self.assertEqual(r(*ws, x), step(*ws, x), atol=0, rtol=0)
++        tape = r.variants[0].tape
++        layers = [op for op in tape.ops if op.func is torch.ops.host_trace_test.tma_gemm.default]
++        tmas = [[(j, rec) for j, (_, rec) in enumerate(tape.launches) if j in o.launches and isinstance(rec, KernelLaunch) and rec.descriptors] for o in layers]
++        self.assertTrue(len(tmas) == 3 and all(tmas))
++        for k, launches in enumerate(tmas):  # each layer's own last encode (its addresses), as a replay leaves them
++            for _, rec in launches:
++                for d in rec.descriptors:
++                    d.last[:] = [("layer", k)]
++        if records == "another swizzle":
++            j, rec = tmas[2][0]
++            edited = dataclasses.replace(rec.descriptors[0], swizzle=rec.descriptors[0].swizzle ^ 1)
++            tape.launches[j] = (tape.launches[j][0], dataclasses.replace(rec, descriptors=(edited, *rec.descriptors[1:])))
++        before = dict(_LIBRARY_COUNTS)
++        x = _half(1, 512, 128).permute(1, 2, 0)
++        out = r(*ws, x)
++        moved = {k: _LIBRARY_COUNTS[k] - before.get(k, 0) for k in ("confirmations", "shared", "refused")}
++        if records == "same":
++            self.assertEqual(out, step(*ws, x), atol=0, rtol=0)
++            self.assertEqual((moved, r.redispatches), ({"confirmations": 2, "shared": 1, "refused": 0}, 1))
++        else:
++            self.assertEqual(moved, {"confirmations": 3, "shared": 0, "refused": 1})
++
++    @unittest.skipIf(
++        not TEST_CUDA or torch.cuda.get_device_capability() < (10, 0),
++        "requires Blackwell",
++    )
+     @parametrize("entry_descriptors", [True, False])
+     def test_a_tma_compile_choice_dispatches_again_into_one_variant(self, entry_descriptors):
+         # _tma_gemm's N tile (128 from m 512, else 64) is its op's own choice:
+diff -ruN -x __pycache__ -x '*.pyc' step_ms33/test/test_cuda_host_trace_replay.py step_ms34/test/test_cuda_host_trace_replay.py
+--- step_ms33/test/test_cuda_host_trace_replay.py	2026-10-19 11:14:24.758765742 -0700
++++ step_ms34/test/test_cuda_host_trace_replay.py	2026-10-20 11:22:43.857236223 -0700
+@@ -3,6 +3,7 @@
+ import bisect
+ import builtins
+ import collections
++import contextlib
+ import ctypes
+ import dataclasses
+ import functools
+@@ -16,6 +17,7 @@
+ import unittest
+ import weakref
+ from concurrent.futures import ThreadPoolExecutor
++from typing import Any
+ from unittest import mock
+ 
+ import sympy
+@@ -306,6 +308,99 @@
+ _direct_lib._register_fake("holder_scale", lambda x: torch.empty_like(x))
+ 
+ 
++# a GDN-like library body: it reads the step's metadata (a tensor and an int the caller lifted into fn's arguments) from a
++# forward-context holder its step function fills, and picks its form by its input's size
++FORWARD = {"md": None}
++
++
++@dataclasses.dataclass
++class _StepMetadata:
++    bias: torch.Tensor
++    tokens: int
++
++
++def _metadata_scale(x: torch.Tensor) -> torch.Tensor:
++    md = FORWARD["md"]
++    f = 2 if x.shape[0] > 16 else 3
++    return x * md.tokens + md.bias[: x.shape[0]] * f
++
++
++def _capped_scale(x: torch.Tensor) -> torch.Tensor:
++    f = 2 if x.shape[0] > 16 else 3
++    return x * min(x.shape[0], 24) + f  # builtin min over a symbolic int
++
++
++_direct_lib.define("capped_scale(Tensor x) -> Tensor")
++_direct_lib.impl("capped_scale", _capped_scale, "CUDA")
++_direct_lib._register_fake("capped_scale", lambda x: torch.empty_like(x))
++
++_direct_lib.define("metadata_scale(Tensor x) -> Tensor")
++_direct_lib.impl("metadata_scale", _metadata_scale, "CUDA")
++_direct_lib._register_fake("metadata_scale", lambda x: torch.empty_like(x))
++
++
++# library bodies that break redo_policy "inputs_only"'s contract: one stashes a size it decided on (an op guard) in Python
++# state, and another op's body reads it
++STASH = {"n": 0}
++
++
++def _stash_size(x: torch.Tensor) -> torch.Tensor:
++    STASH["n"] = int(x.shape[0])
++    return x * 2
++
++
++_direct_lib.define("stash_size(Tensor x) -> Tensor")
++_direct_lib.impl("stash_size", _stash_size, "CUDA")
++_direct_lib._register_fake("stash_size", lambda x: torch.empty_like(x))
++_direct_lib.define("add_stashed(Tensor y) -> Tensor")
++_direct_lib.impl("add_stashed", lambda y: y + STASH["n"], "CUDA")
++_direct_lib._register_fake("add_stashed", lambda y: torch.empty_like(y))
++
++
++# a library body reading a view from module state: the caller swaps the step's argument in while fn runs, and a pre-made
++# view of the same weight is there otherwise
++MODULE_STATE: dict[str, Any] = {"view": None}
++
++
++def _view_scale(x: torch.Tensor) -> torch.Tensor:
++    f = 2 if x.shape[0] > 16 else 3
++    return x * MODULE_STATE["view"][: x.shape[0]] + f
++
++
++_direct_lib.define("view_scale(Tensor x) -> Tensor")
++_direct_lib.impl("view_scale", _view_scale, "CUDA")
++_direct_lib._register_fake("view_scale", lambda x: torch.empty_like(x))
++
++
++# a layer index a body reads from a holder (as vLLM's MoE ops read forward_context.moe_layer_index)
++RANK = {"i": 0}
++
++
++def _ranked_scale(x: torch.Tensor) -> torch.Tensor:
++    md = FORWARD["md"]
++    f = 2 if x.shape[0] > 16 else 3
++    return x * md.tokens + (RANK["i"] + f)
++
++
++_direct_lib.define("ranked_scale(Tensor x) -> Tensor")
++_direct_lib.impl("ranked_scale", _ranked_scale, "CUDA")
++_direct_lib._register_fake("ranked_scale", lambda x: torch.empty_like(x))
++
++
++@contextlib.contextmanager
++def _forward_context(md: _StepMetadata) -> Any:
++    saved, FORWARD["md"] = FORWARD["md"], md
++    try:
++        yield
++    finally:
++        FORWARD["md"] = saved
++
++
++def _metadata_step(x: torch.Tensor, bias: torch.Tensor, tokens: int) -> torch.Tensor:
++    with _forward_context(_StepMetadata(bias, tokens)):
++        return torch.ops.host_trace_direct.metadata_scale(x) + 1
++
++
+ @torch.library.custom_op("host_trace_test::calls_reentered_op", mutates_args=())
+ def calls_reentered_op(x: torch.Tensor) -> torch.Tensor:
+     return REENTERED[0](x)
+@@ -4681,6 +4776,179 @@
+         (cause,) = r.retrace_causes
+         self.assertIn("which its call does not carry", cause[4])
+ 
++    def _metadata_calls(self, r: Any) -> None:
++        for rows in (8, 8, 32, 32, 8):
++            x = torch.arange(rows * 4, dtype=torch.float32, device="cuda").view(rows, 4)
++            bias = torch.randn(64, 4, device="cuda")
++            self.assertEqual(r(x, bias, rows + 1), _metadata_step(x, bias, rows + 1), atol=0, rtol=0)
++
++    def test_a_library_body_reading_lifted_metadata_redoes_in_its_context(self):
++        # the body reads the step's lifted tensor and int from the forward context: in redo_context, which holds the redo's
++        # stand-ins there, it is confirmed and redone (one trace); its context ran around the confirmation and the redo only
++        calls = []
++
++        def context(call):
++            calls.append((call.func, call.rank, type(call.args[1]).__name__, type(call.args[2]).__name__))
++            return _forward_context(_StepMetadata(call.args[1], call.args[2]))
++
++        r = HostTraceReplay(_metadata_step, lifted=(1, 2), redo_context=context)
++        self._metadata_calls(r)
++        self.assertEqual((r.traces, r.redispatches), (1, 1))
++        op = torch.ops.host_trace_direct.metadata_scale.default
++        self.assertEqual(calls, [(op, 0, "_TracedTensor", "SymInt")] * 2)
++
++    @parametrize("how", ["no context", "not lifted", "refuse"])
++    def test_a_library_body_reading_lifted_metadata_is_not_redone_otherwise(self, how):
++        # without redo_context, with the metadata not declared lifted, or under redo_policy "refuse", the body is not redone
++        kwargs = {"no context": {"lifted": (1, 2)}, "not lifted": {}, "refuse": {"lifted": (1, 2), "redo_policy": "refuse", "redo_context": lambda call: contextlib.nullcontext()}}[how]
++        r = HostTraceReplay(_metadata_step, **kwargs)
++        self._metadata_calls(r)
++        self.assertEqual((r.traces, r.redispatches), (2, 0))
++        (cause,) = r.retrace_causes
++        why = {"no context": "lifted state, with no redo_context", "not lifted": "which its call does not carry", "refuse": "redo_policy refuse"}[how]
++        self.assertIn(why, cause[4])
++
++    def test_a_library_body_redoes_with_the_traces_builtin_min(self):
++        # the trace ran the body's min(s, 24) as sym_min (trace_builtin_minmax): its redo does too, so the confirmation sees
++        # the trace's form (step_ms33: a comparison guard the trace did not record, refused, a second trace)
++        def step(x):
++            return torch.ops.host_trace_direct.capped_scale(x) + 1
++
++        r = HostTraceReplay(step)
++        for rows in (8, 8, 32, 32, 8):
++            x = torch.arange(rows * 4, dtype=torch.float32, device="cuda").view(rows, 4)
++            self.assertEqual(r(x), step(x), atol=0, rtol=0)
++        self.assertEqual((r.traces, r.redispatches), (1, 1))
++
++    @parametrize("closed", [False, True])
++    def test_a_redo_reads_a_declared_view_on_a_static_prefix_weight(self, closed):
++        # the body reads MODULE_STATE["view"]: the static-prefix view the step swaps in at the trace, a pre-made view of the
++        # same weight (another object) at a redo. Declared (close_over), it is read at its own layout on the root the op read
++        # (one trace); else it declines and the call traces
++        weight = torch.randn(64, 4, device="cuda")
++        attribute, premade = weight[:32], weight[:32]
++
++        def step(w, a, x):
++            saved, MODULE_STATE["view"] = MODULE_STATE["view"], a
++            try:
++                return torch.ops.host_trace_direct.view_scale(x) + w[0]
++            finally:
++                MODULE_STATE["view"] = saved
++
++        MODULE_STATE["view"] = premade
++        self.addCleanup(MODULE_STATE.__setitem__, "view", None)
++        if closed:
++            closure = torch.cuda._host_trace.close_over(tensors=[weight, attribute, premade])
++            self.addCleanup(closure.release)
++        r = HostTraceReplay(step, static_prefix=2)
++        for rows in (8, 8, 32, 32, 8):
++            x = torch.arange(rows * 4, dtype=torch.float32, device="cuda").view(rows, 4)
++            self.assertEqual(r(weight, attribute, x), step(weight, attribute, x), atol=0, rtol=0)
++        self.assertEqual((r.traces, r.redispatches), (1, 1) if closed else (2, 0))
++
++    def test_close_over_declares_module_state(self):
++        m = torch.nn.Linear(4, 4, device="cuda")
++        m.cache = [torch.zeros(2, device="cuda")]
++        m.view = m.weight[1:]
++        closure = torch.cuda._host_trace.close_over(modules=[torch.nn.Sequential(m)])
++        try:
++            self.assertTrue(all(torch.cuda._host_trace.closed_over(t) for t in (m.weight, m.bias, m.cache[0], m.view)))
++            self.assertFalse(torch.cuda._host_trace.closed_over(m.weight[1:]))
++        finally:
++            closure.release()
++        self.assertFalse(torch.cuda._host_trace.closed_over(m.weight))
++
++    @parametrize("reader", ["op", "user scalar", "user branch"])
++    @parametrize("policy", ["inputs_only", "strict"])
++    def test_a_decision_a_library_body_leaks_into_python_state(self, policy, reader):
++        # stash_size's int(x.shape[0]) is its own guard; the stashed value is read by another op's body or by fn's code (an
++        # ATen add's scalar, a plain-int branch). "inputs_only" assumes no such leak (its contract): it redoes stash_size
++        # alone and the reader keeps the trace's value. "strict" refuses that redispatch: the call traces, bitwise
++        def step(x, y):
++            a = torch.ops.host_trace_direct.stash_size(x)
++            if reader == "op":
++                return a, torch.ops.host_trace_direct.add_stashed(y)
++            if reader == "user scalar":
++                return a, y + STASH["n"]
++            return a, y * 2 if STASH["n"] > 16 else y * 3
++
++        self.addCleanup(STASH.__setitem__, "n", 0)
++        r = HostTraceReplay(step, redo_policy=policy)
++        y = torch.ones(4, device="cuda")
++        same = []
++        for rows in (8, 8, 32):
++            x = torch.ones(rows, 4, device="cuda")
++            out, ref = r(x, y), step(x, y)
++            same.append(torch.equal(out[1], ref[1]))
++        if policy == "strict":
++            self.assertEqual((r.traces, r.redispatches, same), (2, 0, [True] * 3))
++            (cause,) = r.retrace_causes
++            self.assertIn("redo_policy strict", cause[4])
++        else:
++            self.assertEqual((r.traces, r.redispatches, same), (1, 1, [True, True, False]))
++
++    @parametrize("layers", ["same", "ranked", "mixed"])
++    def test_layers_of_one_body_share_its_confirmation(self, layers):
++        # four calls of one library body on the same input: their records are one another's, roots renamed, so the first's
++        # confirmation is theirs (1 own, 3 shared). Each reading its layer index through the context (RedoCall.rank: a
++        # different constant in each one's records) confirms on its own and takes no other's redo (4 own). Both in one
++        # model: the context reads the rank for the ranked body only, and the other keeps its sharing (5 own, 3 shared)
++        ops = {"same": ["metadata_scale"], "ranked": ["ranked_scale"], "mixed": ["metadata_scale", "ranked_scale"]}[layers]
++
++        def step(x, bias, tokens):
++            with _forward_context(_StepMetadata(bias, tokens)):
++                out = []
++                for name in ops:
++                    for k in range(4):
++                        RANK["i"] = k
++                        out.append(getattr(torch.ops.host_trace_direct, name)(x))
++                return torch.stack(out)
++
++        @contextlib.contextmanager
++        def context(call):
++            # the rank only where the body reads it (as vLLM sets moe_layer_index for its MoE ops only)
++            saved = RANK["i"]
++            if call.func is torch.ops.host_trace_direct.ranked_scale.default:
++                RANK["i"] = call.rank
++            try:
++                with _forward_context(_StepMetadata(call.args[1], call.args[2])):
++                    yield
++            finally:
++                RANK["i"] = saved
++
++        r = HostTraceReplay(step, lifted=(1, 2), redo_context=context)
++        before = dict(_LIBRARY_COUNTS)
++        for rows in (8, 8, 32):
++            x = torch.arange(rows * 4, dtype=torch.float32, device="cuda").view(rows, 4)
++            bias = torch.randn(64, 4, device="cuda")
++            self.assertEqual(r(x, bias, rows + 1), step(x, bias, rows + 1), atol=0, rtol=0)
++        self.assertEqual((r.traces, r.redispatches), (1, 1))
++        moved = {k: _LIBRARY_COUNTS[k] - before.get(k, 0) for k in ("confirmations", "shared", "refused")}
++        expected = {"same": (1, 3), "ranked": (4, 0), "mixed": (5, 3)}[layers]
++        self.assertEqual(moved, {"confirmations": expected[0], "shared": expected[1], "refused": 0})
++
++    def test_the_kept_trace_call_values_follow_a_rollback(self):
++        # _trace_values keeps the rows' values at the trace call per lowering and extends them over rows added since; a value
++        # kept inside a rolled-back block (a row the rollback removes) is not taken for the row appended in its place
++        from torch.cuda._host_trace_redispatch import _rolled_back, _trace_call, _trace_values, _values_at
++
++        r = HostTraceReplay(lambda x: torch.ops.host_trace_direct.holder_scale(x) + 1)
++        r(torch.ones(8, 4, device="cuda"))
++        lo = r.variants[0].captured.lowered.lowering
++        program, inputs = lo.program, _trace_call(r.variants[0].captured.lowered.tape, ())
++        self.assertEqual(_trace_values(lo, inputs), _values_at(program, inputs))
++        n = len(program.instructions)
++        with _rolled_back(lo):
++            program.inputs, program.values = inputs, _values_at(program, inputs)
++            row = lo.emit("constant", 123457)
++            self.assertEqual(_trace_values(lo, inputs)[row], 123457)
++        self.assertEqual(len(program.instructions), n)
++        program.inputs, program.values = inputs, _values_at(program, inputs)
++        row = lo.emit("constant", 654321)
++        program.inputs = ()
++        values = _trace_values(lo, inputs)
++        self.assertEqual((values[row], values), (654321, _values_at(program, inputs)))
++
+     def test_a_confirmed_library_redo_is_not_rechecked_on_replay(self):
+         # the confirmation (a Python pass over the rows, a redo, a cache rollback) runs once per traced op, at its first
+         # redispatch; a replay hit, of the redone entry or the traced one, runs none of it

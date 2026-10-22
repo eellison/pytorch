@@ -1,0 +1,113 @@
+diff -ru -x __pycache__ step_ms29/test/test_cuda_host_trace_replay.py step_ms30/test/test_cuda_host_trace_replay.py
+--- step_ms29/test/test_cuda_host_trace_replay.py	2026-10-18 18:07:25.019302234 -0700
++++ step_ms30/test/test_cuda_host_trace_replay.py	2026-10-18 18:11:46.815416584 -0700
+@@ -1333,6 +1333,21 @@
+         self.assertEqual((kind, op, where, refusal), ("graph", None, f"test/test_cuda_host_trace_replay.py:{line}", None))
+         self.assertEqual((f.traces, sum(f.retrace_causes.values())), (2, 1))
+ 
++    def test_guard_provenance_is_memoized_within_an_op(self):
++        # an op's body records its guards tens of frames below the user's line: guard_sloc memoizes the walk per frame
++        # it passed (the verify oracle, on in the suites, compares each with a full walk) and drops the frames when the
++        # op returns, so no frame (nor its locals) outlives its op
++        from torch.cuda import _host_trace_ir as ir
++
++        self.assertTrue(torch.cuda._host_trace.verify_redo_templates)
++        f = HostTraceReplay(lambda x: tactic_op(x) * 2)
++        hits = ir.sloc_memo_hits[0]
++        for m in (16, 24, 40):
++            x = torch.randn(m, 64, device="cuda")
++            self.assertEqual(f(x), tactic_op(x) * 2, atol=0, rtol=0)
++        self.assertGreater(ir.sloc_memo_hits[0], hits)
++        self.assertEqual(ir._SLOC_MEMO, {})
++
+     def test_a_dispatch_learned_in_one_variant_serves_another(self):
+         # a variant per side of y's 4 rows, both with tactic_op on x: the class 17..32 dispatched again in the first
+         # variant is the second's too (the family's dispatches, keyed by what the redo reads: an input's extent as
+diff -ru -x __pycache__ step_ms29/torch/cuda/_host_trace_ir.py step_ms30/torch/cuda/_host_trace_ir.py
+--- step_ms29/torch/cuda/_host_trace_ir.py	2026-10-15 20:03:55.867368587 -0700
++++ step_ms30/torch/cuda/_host_trace_ir.py	2026-10-18 18:11:46.818509273 -0700
+@@ -276,15 +276,68 @@
+ _SYMBOOL_BOOL = torch.SymBool.__bool__.__code__
+ 
+ 
++# guard_sloc's memo: per torch frame a walk passed (by id, holding the frame, so its id is no other's), the
++# provenance a walk from below it gives. While the frame runs its user frame is suspended at one line, so the answer
++# holds; it memoizes only inside a trace's top-level op (sloc_memo, _Trace.op: an aten op, a CuTe or Triton launcher)
++# and is cleared when the op returns (and past _SLOC_MEMO_MAX entries), so it holds no frame past its op (a CuTe or GDN
++# body records thousands of guards tens of frames deep)
++_SLOC_MEMO: dict[int, tuple[Any, SLoc]] = {}
++_SLOC_MEMO_MAX = 1 << 14
++# test and diagnosis: guards whose walk stopped at a memoized frame
++sloc_memo_hits = [0]
++
++
++@contextlib.contextmanager
++def sloc_memo() -> Iterator[None]:
++    """guard_sloc memoizes inside the block (a trace's top-level op), and drops what it held at its end."""
++    prior = getattr(ACTIVE, "sloc_memo", False)
++    ACTIVE.sloc_memo = True
++    try:
++        yield
++    finally:
++        ACTIVE.sloc_memo = prior
++        if not prior:
++            _SLOC_MEMO.clear()
++
++
+ def guard_sloc() -> SLoc:
+     """A new guard's provenance: the user's line that recorded it (the
+     innermost frame outside torch, maybe_user_loc), and a note where it is the
+     user's bool() of a SymBool on a line that calls Python's max or min, whose
+     comparison of a symbolic int is the guard (Dynamo rewrites them, as a trace
+     does unless trace_builtin_minmax is False)."""
+-    inner, f = None, sys._getframe(1)
++    if not getattr(ACTIVE, "sloc_memo", False):
++        return _sloc_walk()
++    path, f = [], sys._getframe(1)
++    while f is not None and f.f_code.co_filename.startswith(_TORCH_DIR):
++        held = _SLOC_MEMO.get(id(f))
++        if held is not None and held[0] is f:
++            got = held[1]
++            sloc_memo_hits[0] += 1
++            break
++        path.append(f)
++        f = f.f_back
++    else:
++        got = _sloc_of(f, path[-1] if path else None)
++    if torch.cuda._host_trace.verify_redo_templates and got is not _sloc_walk():
++        raise AssertionError("host_trace: guard_sloc's memo disagrees with a full walk")
++    if len(_SLOC_MEMO) + len(path) > _SLOC_MEMO_MAX:
++        _SLOC_MEMO.clear()
++    for frame in path:
++        _SLOC_MEMO[id(frame)] = (frame, got)
++    return got
++
++
++def _sloc_walk() -> SLoc:
++    # guard_sloc's full walk from its caller's caller (the verify oracle)
++    inner, f = None, sys._getframe(2)
+     while f is not None and f.f_code.co_filename.startswith(_TORCH_DIR):
+         inner, f = f, f.f_back
++    return _sloc_of(f, inner)
++
++
++def _sloc_of(f: Any, inner: Any) -> SLoc:
++    # the provenance of user frame f (None: none), inner the torch frame it called
+     if f is None:
+         return _NO_SLOC
+     k = (id(f.f_code), f.f_lineno, inner is not None and inner.f_code is _SYMBOOL_BOOL)
+diff -ru -x __pycache__ step_ms29/torch/cuda/_host_trace_tape.py step_ms30/torch/cuda/_host_trace_tape.py
+--- step_ms29/torch/cuda/_host_trace_tape.py	2026-10-15 20:03:55.869124053 -0700
++++ step_ms30/torch/cuda/_host_trace_tape.py	2026-10-18 18:11:46.819524542 -0700
+@@ -954,7 +954,10 @@
+         k, first, guards = len(self.ops), (len(self.launches), len(self.allocs), len(self.sites)), len(env.owners)
+         self.in_op, env.op, reads = True, k if host else None, len(self.int_reads)
+         try:
+-            out = run()
++            # guard_sloc memoizes its walks within the op (its body's guards, an aten op's, a CuTe or Triton launcher's,
++            # share their frames), holding no frame past the op
++            with _ir.sloc_memo():
++                out = run()
+         finally:
+             self.in_op, env.op = False, None
+         # a later op reading a property this op cached would not guard it again

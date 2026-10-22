@@ -1,0 +1,103 @@
+--- a/torch/csrc/cuda/host_trace/Variant.h	2026-10-18 17:55:38.790252869 -0700
++++ b/torch/csrc/cuda/host_trace/Variant.h	2026-10-18 17:58:35.629454337 -0700
+@@ -120,6 +120,8 @@
+ extern int64_t split_dirty_min;
+ // calls whose run launched whole for fewer dirty records than split_dirty_min
+ extern int64_t split_dirty_wholes;
++// execs uploaded (each in the call that first launches it: upload_once, split_ready)
++extern int64_t exec_uploads;
+ // test-only: calls launched split, and forms whose sub-execs were built
+ extern int64_t split_calls;
+ // test-only: graph launches of native replays (a split call's sections each)
+@@ -666,6 +668,8 @@
+     int64_t rng_increment = -1;
+     // its host-to-device and device-to-host memcpy records
+     std::vector<size_t> host_copies;
++    // per form, whether its exec was uploaded (upload_once: in the call that first launches it)
++    std::vector<uint8_t> uploaded;
+   };
+   struct Allocation {
+     std::vector<int64_t> sizes; // rows
+@@ -870,6 +874,8 @@
+   bool split_ready(Segment& run, size_t form, const Frame& frame);
+   // a split run's section bounds (record offsets), from its cuts
+   std::vector<size_t> split_bounds(Segment& run);
++  // uploads the form's exec unless it was (each exec once, in the call that first launches it)
++  void upload_once(Segment& run, size_t form);
+  public:
+   // test-only: a form's section bounds once built (empty: not split)
+   // per section of a form's split (empty: not split): (calls that set any of
+--- a/torch/csrc/cuda/host_trace/Patch.cpp	2026-10-18 17:55:38.790123236 -0700
++++ b/torch/csrc/cuda/host_trace/Patch.cpp	2026-10-18 17:56:09.668206868 -0700
+@@ -39,6 +39,7 @@
+ int64_t split_calls = 0;
+ int64_t split_dirty_min = 256;
+ int64_t split_dirty_wholes = 0;
++int64_t exec_uploads = 0;
+ int64_t graph_launches = 0;
+ int64_t split_builds = 0;
+ bool phase_timing = false;
+@@ -713,6 +714,17 @@
+   return bounds;
+ }
+ 
++void HostTraceVariant::upload_once(Segment& run, size_t form) {
++  if (run.uploaded.size() < run.execs.size()) {
++    run.uploaded.resize(run.execs.size(), 0);
++  }
++  if (!run.uploaded[form]) {
++    C10_CUDA_CHECK(cudaGraphUpload(reinterpret_cast<cudaGraphExec_t>(run.execs[form]), at::cuda::getCurrentCUDAStream(device_)));
++    run.uploaded[form] = 1;
++    ++exec_uploads;
++  }
++}
++
+ bool HostTraceVariant::split_ready(Segment& run, size_t form, const Frame& frame) {
+   if (run.splits.size() < run.execs.size()) {
+     run.splits.resize(run.execs.size());
+@@ -820,6 +832,7 @@
+     // before any node is set (an update of a never-uploaded exec can leave the
+     // node on a slow path for good)
+     C10_CUDA_CHECK(cudaGraphUpload(exec, at::cuda::getCurrentCUDAStream(device_)));
++    ++exec_uploads;
+   }
+   ++split_builds;
+   sp.calls_set.assign(sp.execs.size(), 0);
+@@ -1064,10 +1077,11 @@
+   const size_t n = run.stop - run.first;
+   // a split run launches its form's sections every call, each patched while
+   // the one before it runs; the whole exec only without sections
+-  bool split = split_enabled && !hooks && !run.cuts.empty() && !run.generator && split_ready(run, form, frame);
++  bool split = split_enabled && !hooks && !run.cuts.empty() && !run.generator;
+   if (split && split_dirty_min > 0) {
+     // the records this call patches in the current state's exec (a switch to the other state's patches those its
+-    // exec last held otherwise: changed_since)
++    // exec last held otherwise: changed_since). Decided before the sections are built: split_ready uploads them,
++    // and an uploaded exec this call does not launch slows every graph kernel of the context until it launches
+     const uint8_t* d = dirty_.data() + run.first;
+     const auto dirty = static_cast<int64_t>(std::count(d, d + n, uint8_t{1}));
+     if (dirty < split_dirty_min) {
+@@ -1075,6 +1089,13 @@
+       ++split_dirty_wholes;
+     }
+   }
++  split = split && split_ready(run, form, frame);
++  if (!split) {
++    // the exec this call launches, uploaded here on its first launch (not at capture or instantiation): an uploaded
++    // exec not yet launched slows every graph kernel of the context until its first launch; uploaded before any of
++    // its nodes is set (a set before an exec's first upload leaves the node on a slow path for good)
++    upload_once(run, form);
++  }
+   if (form != run.form || split != run.split) {
+     switch_form(run, form, split, frame);
+   }
+--- a/torch/csrc/cuda/host_trace/Entry.cpp	2026-10-18 17:55:38.790365285 -0700
++++ b/torch/csrc/cuda/host_trace/Entry.cpp	2026-10-18 17:55:54.913226633 -0700
+@@ -2130,6 +2130,7 @@
+       py::arg("max_nodes") = py::none(),
+       py::arg("dirty_min") = py::none());
+   m.def("_host_trace_split_dirty_wholes", [] { return split_dirty_wholes; });
++  m.def("_host_trace_exec_uploads", [] { return exec_uploads; });
+   m.def("_host_trace_split_bounds", [](HostTraceVariant& v, size_t segment, size_t form) { return v.split_bounds_of(segment, form); });
+   m.def("_host_trace_split_section_counts", [](HostTraceVariant& v, size_t segment, size_t form) { return v.split_section_counts(segment, form); });
+   m.def("_host_trace_piece_skips", [] { return piece_skips; });

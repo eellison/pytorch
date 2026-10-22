@@ -1,0 +1,12 @@
+--- a/test/test_cuda_host_trace_python_entry.py
++++ b/test/test_cuda_host_trace_python_entry.py
+@@ -42,8 +42,8 @@
+     "TestReplayMemory": (
+         "test_a_run_splits_past_a_peak_it_cannot_lower",
+         "test_a_run_splits_where_a_freed_argument_dies",
++        "test_a_slow_call_that_does_not_run_hands_the_call_back",
+         "test_a_split_lowering_the_peak_by_little_is_undone",
+-        "test_a_trace_that_does_not_run_hands_the_call_back",
+         "test_call_boxed_drops_an_argument_after_its_last_use",
+         "test_split_before_the_peak_allocation_first",
+     ),

@@ -1,0 +1,532 @@
+--- a/torch/csrc/cuda/host_trace/Entry.cpp	2026-10-15 21:29:28.955128058 -0700
++++ b/torch/csrc/cuda/host_trace/Entry.cpp	2026-10-16 10:43:15.135030476 -0700
+@@ -18,6 +18,7 @@
+ #include <torch/csrc/utils/python_symnode.h>
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <cstring>
+ #include <mutex>
+ #include <unordered_map>
+@@ -277,6 +278,12 @@
+   uint64_t version = 0;
+ };
+ 
++// a fresh owner id, shared by bounds and trusting entries so none collide
++uint64_t next_static_owner() {
++  static std::atomic<uint64_t> owners{0};
++  return ++owners;
++}
++
+ struct EntryState {
+   std::recursive_mutex mutex;
+   bool configured = false;
+@@ -300,6 +307,12 @@
+   uint64_t static_generation = 0;
+   // the bound call that last checked or recorded them
+   StaticOwner static_owner;
++  // the owner of this entry's own (unbound) calls, whose static prefix is
++  // trusted until statics_changed(); id 0: no static prefix
++  StaticOwner own_owner;
++  // statics' objects, contiguous: an unbound trusted call passes these
++  // (a bound holds its own prefix)
++  std::vector<PyObject*> static_objects;
+   // bumped by each change of the families
+   uint64_t epoch = 0;
+ };
+@@ -769,6 +782,8 @@
+   EntryState& st = *entry->state;
+   int64_t pt = phase_now();
+   int64_t pt_total = pt;
++  // a bound's owner, else the entry's own
++  const StaticOwner& trust = owner.id ? owner : st.own_owner;
+   auto slow = [&](bool searched) -> PyObject* {
+     if (!args) {
+       return nullptr;
+@@ -834,15 +849,17 @@
+   // the snapshot's generation when the leading arguments are its
+   uint64_t generation = 0;
+   thread_local std::vector<int64_t> key;
+-  const bool trusted_statics = owner.id &&
+-      owner.id == st.static_owner.id &&
+-      owner.version == st.static_owner.version && st.static_generation &&
++  const bool trusted_statics = trust.id &&
++      trust.id == st.static_owner.id &&
++      trust.version == st.static_owner.version && st.static_generation &&
+       count >= st.static_count &&
+       at::GradMode::is_enabled() == st.static_grad_mode &&
++      (owner.id ||
++       std::equal(inputs, inputs + st.static_count, st.static_objects.begin())) &&
+       (!trusted_statics_check || same_static_layout(st, inputs));
+   if (trusted_statics || same_statics(st, inputs, count)) {
+-    if (owner.id) {
+-      st.static_owner = owner;
++    if (trust.id) {
++      st.static_owner = trust;
+     }
+     EntryFamily& f = st.families[st.static_family];
+     // a tensor's contract key is 11 ints
+@@ -972,10 +989,15 @@
+       } else if (recorded) {
+         static uint64_t generations = 0;
+         st.statics.swap(records);
++        // the records' objects: a commit may have released owned arguments
++        st.static_objects.clear();
++        for (const StaticArg& a : st.statics) {
++          st.static_objects.push_back(a.object);
++        }
+         st.static_grad_mode = grad_mode;
+         st.static_family = family_index;
+         st.static_generation = ++generations;
+-        st.static_owner = owner;
++        st.static_owner = trust;
+         variant->keep(frame, st.static_generation);
+       }
+     }
+@@ -1055,6 +1077,9 @@
+         py::reinterpret_borrow<py::object>(PyTuple_GET_ITEM(names, i)));
+   }
+   forget_statics(st);
++  // the static prefix is trusted (feedback 10-04: no per-call checks of
++  // statics); a change to one needs statics_changed()
++  st.own_owner = static_count ? StaticOwner{next_static_owner(), 0} : StaticOwner{};
+   for (EntryFamily& f : st.families) {
+     for (EntryVariant& v : f.variants) {
+       v.variant->set_static_prefix(st.static_count);
+@@ -1133,8 +1158,18 @@
+   END_HANDLE_TH_ERRORS
+ }
+ 
++// The static prefix may have been re-pointed or changed in layout: the next
++// unbound call checks it in full and records it again
++PyObject* entry_statics_changed(PyObject* self, PyObject* /*unused*/) {
++  EntryState& st = *reinterpret_cast<HostTraceEntry*>(self)->state;
++  EntryLock lock(st.mutex);
++  ++st.own_owner.version;
++  Py_RETURN_NONE;
++}
++
+ PyMethodDef entry_methods[] = {
+     {"call_boxed", entry_call_boxed, METH_O, nullptr},
++    {"statics_changed", entry_statics_changed, METH_NOARGS, nullptr},
+     {"_native_init", entry_native_init, METH_VARARGS, nullptr},
+     {"_native_key", entry_native_key, METH_O, nullptr},
+     {"_native_add", entry_native_add, METH_VARARGS, nullptr},
+@@ -1534,8 +1569,7 @@
+     st.resets.emplace_back(read(t[0], t[1], sources), t[2].ptr());
+   }
+   if (trust_statics) {
+-    static uint64_t bounds = 0;
+-    st.owner.id = ++bounds;
++    st.owner.id = next_static_owner();
+   }
+   return self.release();
+   END_HANDLE_TH_ERRORS
+@@ -1987,21 +2021,31 @@
+     return old;
+   });
+   m.def("_host_trace_delta_exchanges", [] { return delta_exchanges; });
+-  m.def("_host_trace_split", [](std::optional<int64_t> threshold) {
+-    const int64_t old = split_threshold;
+-    if (threshold) {
+-      split_threshold = *threshold;
+-    }
+-    return old;
+-  });
+-  m.def("_host_trace_split_counts", [] { return py::make_tuple(split_calls, split_builds, split_catch_up_sets); });
+-  m.def("_host_trace_split_catch_up", [](std::optional<int64_t> n) {
+-    const int64_t old = split_catch_up;
+-    if (n) {
+-      split_catch_up = *n;
++  m.def("_host_trace_split", [](std::optional<bool> enable) {
++    const bool old = split_enabled;
++    if (enable) {
++      split_enabled = *enable;
+     }
+     return old;
+   });
++  m.def("_host_trace_split_counts", [] { return py::make_tuple(split_calls, split_builds); });
++  // (sections, ratio, first section's records, most records per section);
++  // None keeps a value; the old values back
++  m.def(
++      "_host_trace_split_policy",
++      [](std::optional<int64_t> sections, std::optional<double> ratio, std::optional<int64_t> first_nodes, std::optional<int64_t> max_nodes) {
++        auto old = py::make_tuple(split_sections, split_ratio, split_first_nodes, split_max_nodes);
++        split_sections = sections.value_or(split_sections);
++        split_ratio = ratio.value_or(split_ratio);
++        split_first_nodes = first_nodes.value_or(split_first_nodes);
++        split_max_nodes = max_nodes.value_or(split_max_nodes);
++        return old;
++      },
++      py::arg("sections") = py::none(),
++      py::arg("ratio") = py::none(),
++      py::arg("first_nodes") = py::none(),
++      py::arg("max_nodes") = py::none());
++  m.def("_host_trace_split_bounds", [](HostTraceVariant& v, size_t segment, size_t form) { return v.split_bounds_of(segment, form); });
+   m.def("_host_trace_piece_skips", [] { return piece_skips; });
+   m.def("_host_trace_buffered_runs", [] { return buffered_runs; });
+   m.def("_host_trace_delta_counts", [] {
+@@ -2034,6 +2078,7 @@
+   });
+   m.def("_host_trace_memory_node_sets", [] { return memory_node_sets; });
+   m.def("_host_trace_kernel_packs", [] { return kernel_packs; });
++  m.def("_host_trace_graph_launches", [] { return graph_launches; });
+   m.def("_host_trace_kernel_node_sets", [] { return kernel_node_sets; });
+   m.def("_host_trace_kernel_row_switches", [] { return kernel_row_switches; });
+   m.def("_host_trace_phase_times", [](bool enable) {
+--- a/torch/csrc/cuda/host_trace/Patch.cpp	2026-10-15 11:31:01.823394605 -0700
++++ b/torch/csrc/cuda/host_trace/Patch.cpp	2026-10-16 09:49:28.522206193 -0700
+@@ -11,6 +11,7 @@
+ #include <torch/csrc/utils/object_ptr.h>
+ 
+ #include <algorithm>
++#include <cmath>
+ #include <cstring>
+ #include <limits>
+ 
+@@ -22,10 +23,13 @@
+ int64_t kernel_node_sets = 0;
+ int64_t kernel_row_switches = 0;
+ int64_t piece_skips = 0;
+-int64_t split_threshold = -1;
+-int64_t split_catch_up = 128;
+-int64_t split_catch_up_sets = 0;
++bool split_enabled = false;
++int64_t split_sections = 4;
++double split_ratio = 4.0;
++int64_t split_first_nodes = 0;
++int64_t split_max_nodes = 0;
+ int64_t split_calls = 0;
++int64_t graph_launches = 0;
+ int64_t split_builds = 0;
+ bool phase_timing = false;
+ std::array<int64_t, 16> phase_ns{};
+@@ -285,23 +289,6 @@
+   };
+   for (uint32_t g = 0; g < segments_.size(); ++g) {
+     const size_t first_pair = rows.size();
+-    std::vector<int64_t>& shape = segments_[g].shape_rows;
+-    shape.clear();
+-    for (size_t i = segments_[g].first; i < segments_[g].stop; ++i) {
+-      const Record& r = records_[i];
+-      if (r.kind == Kind::Memset && !r.memset.constant_shape) {
+-        shape.insert(shape.end(), r.memset.shape_rows.begin(), r.memset.shape_rows.end());
+-      } else if (r.kind == Kind::Kernel && !r.kernel.constant_dims) {
+-        shape.insert(shape.end(), r.kernel.dim_rows.begin(), r.kernel.dim_rows.end());
+-      }
+-      if (r.kind == Kind::Kernel && r.site >= 0 && r.site_pos < sites_[r.site].reads.size()) {
+-        const auto& d = sites_[r.site].reads[r.site_pos].dim_rows;
+-        shape.insert(shape.end(), d.begin(), d.end());
+-      }
+-    }
+-    std::sort(shape.begin(), shape.end());
+-    shape.erase(std::unique(shape.begin(), shape.end()), shape.end());
+-    segments_[g].whole_shape.clear();
+     for (size_t i = segments_[g].first; i < segments_[g].stop; ++i) {
+       const Record& r = records_[i];
+       const auto record = static_cast<uint32_t>(i);
+@@ -624,6 +611,97 @@
+   run.cuts = cuts;
+ }
+ 
++std::vector<size_t> HostTraceVariant::split_bounds(Segment& run) {
++  if (users_stale_) {
++    index_users();
++  }
++  const size_t n = run.stop - run.first;
++  // the records a call can re-set: those reading a dynamic row or an address,
++  // and those set every call
++  std::vector<int64_t> dyn(n + 1, 0);
++  auto take = [&](const std::vector<uint32_t>& first, const std::vector<uint32_t>& records, size_t i) {
++    for (uint32_t k = first[i]; k < first[i + 1]; ++k) {
++      if (records[k] >= run.first && records[k] < run.stop) {
++        dyn[records[k] - run.first + 1] = 1;
++      }
++    }
++  };
++  for (uint32_t row : users_.dynamic_rows) {
++    take(users_.row_first, users_.row_records, row);
++  }
++  for (size_t b = 0; b + 1 < users_.base_first.size(); ++b) {
++    take(users_.base_first, users_.base_records, b);
++  }
++  for (size_t i = 0; i < n; ++i) {
++    dyn[i + 1] = (dyn[i + 1] || always_[run.first + i]) + dyn[i];
++  }
++  // a section's patch is hidden behind the GPU time of the one before it
++  // while its re-set records are at most split_ratio times that one's records:
++  // sections grow by split_ratio from a first of about dyn / (1 + R + ... +
++  // R^(K-1)) re-set records (at least 16 records), at most split_sections of
++  // them; split_first_nodes / split_max_nodes set the first section's records
++  // and the most a section takes instead
++  std::vector<size_t> bounds{0};
++  const std::vector<size_t>& cuts = run.cuts;
++  if (split_max_nodes > 0) {
++    // each section the most records up to split_max_nodes (a longer one where
++    // no cut is nearer)
++    const auto most = static_cast<size_t>(split_max_nodes);
++    while (n - bounds.back() > most) {
++      const size_t lo = bounds.back();
++      size_t take = 0;
++      for (size_t c : cuts) {
++        if (c <= lo) {
++          continue;
++        }
++        if (c - lo <= most || take == 0) {
++          take = c;
++        }
++        if (c - lo >= most) {
++          break;
++        }
++      }
++      if (take == 0) {
++        break;
++      }
++      bounds.push_back(take);
++    }
++    bounds.push_back(n);
++    return bounds;
++  }
++  double sum = 0;
++  for (int64_t j = 0; j < split_sections; ++j) {
++    sum += std::pow(split_ratio, static_cast<double>(j));
++  }
++  const auto target = static_cast<int64_t>(std::ceil(static_cast<double>(dyn[n]) / std::max(sum, 1.0)));
++  auto first = std::find_if(cuts.begin(), cuts.end(), [&](size_t c) {
++    return split_first_nodes > 0 ? c >= static_cast<size_t>(split_first_nodes) : c >= 16 && dyn[c] >= target;
++  });
++  if (first == cuts.end()) {
++    return {0, n};
++  }
++  bounds.push_back(*first);
++  while (static_cast<int64_t>(bounds.size()) < split_sections && bounds.back() < n) {
++    const size_t lo = bounds.back();
++    const double room = split_ratio * static_cast<double>(lo - bounds[bounds.size() - 2]);
++    if (static_cast<double>(dyn[n] - dyn[lo]) <= room) {
++      break;
++    }
++    size_t best = 0;
++    for (size_t c : cuts) {
++      if (c > lo && static_cast<double>(dyn[c] - dyn[lo]) <= room) {
++        best = c;
++      }
++    }
++    if (best == 0) {
++      break;
++    }
++    bounds.push_back(best);
++  }
++  bounds.push_back(n);
++  return bounds;
++}
++
+ bool HostTraceVariant::split_ready(Segment& run, size_t form, const Frame& frame) {
+   if (run.splits.size() < run.execs.size()) {
+     run.splits.resize(run.execs.size());
+@@ -634,17 +712,7 @@
+   }
+   sp.tried = true;
+   const size_t n = run.stop - run.first;
+-  // the first range about an eighth of the records, each next at most about
+-  // six times the one before (a node's GPU time covers several nodes' patch)
+-  sp.bounds = {0};
+-  size_t want = std::max<size_t>(n / 8, 1);
+-  for (size_t c : run.cuts) {
+-    if (c >= want && c < n) {
+-      sp.bounds.push_back(c);
+-      want = 7 * c;
+-    }
+-  }
+-  sp.bounds.push_back(n);
++  sp.bounds = split_bounds(run);
+   if (sp.bounds.size() < 3) {
+     return false;
+   }
+@@ -980,31 +1048,9 @@
+     }
+   }
+   const size_t n = run.stop - run.first;
+-  bool split = false;
+-  const bool splits = split_threshold >= 0 && !hooks && !run.cuts.empty() && !run.generator;
+-  // the launch dimensions, memset extents and site rows of the call
+-  thread_local std::vector<int64_t> shape;
+-  if (splits) {
+-    shape.clear();
+-    for (int64_t row : run.shape_rows) {
+-      shape.push_back(v[row]);
+-    }
+-    for (size_t site : run.sites) {
+-      shape.push_back(frame.site_entries[site]);
+-    }
+-    if (run.whole_shape.size() < run.execs.size()) {
+-      run.whole_shape.resize(run.execs.size());
+-    }
+-    // a launch configuration the whole exec does not hold (a size change), or
+-    // more than split_threshold of its records it has not caught up on
+-    const bool config = shape != run.whole_shape[form];
+-    size_t stale = 0;
+-    if (form != run.form || run.split) {
+-      const bool saved = run.seen.size() > 2 * form && run.seen[2 * form].saved && run.seen[2 * form].users_version == users_version_;
+-      stale = saved ? static_cast<size_t>(std::count(run.seen[2 * form].dirty.begin(), run.seen[2 * form].dirty.end(), 1)) : n;
+-    }
+-    split = (config || static_cast<int64_t>(stale) > split_threshold) && split_ready(run, form, frame);
+-  }
++  // a split run launches its form's sections every call, each patched while
++  // the one before it runs; the whole exec only without sections
++  const bool split = split_enabled && !hooks && !run.cuts.empty() && !run.generator && split_ready(run, form, frame);
+   if (form != run.form || split != run.split) {
+     switch_form(run, form, split, frame);
+   }
+@@ -1060,6 +1106,7 @@
+     for (size_t k = 0; k + 1 < sp->bounds.size(); ++k) {
+       exec = sp->execs[k];
+       patch_range(static_cast<int64_t>(k));
++      ++graph_launches;
+       // the first launch runs the graph's replay prologue, once per call
+       if (k == 0) {
+         run.native->replay_exec(reinterpret_cast<cudaGraphExec_t>(exec));
+@@ -1067,55 +1114,8 @@
+         C10_CUDA_CHECK(cudaGraphLaunch(reinterpret_cast<cudaGraphExec_t>(exec), stream));
+       }
+     }
+-    // catch-up, while the GPU runs the last range: up to split_catch_up of
+-    // the whole exec's stale records are set (it is not launched this call),
+-    // and its snapshot moves to the call's values, so once few records changed
+-    // since, the policy launches it whole again
+-    if (form_held_enabled && split_catch_up > 0) {
+-      if (run.seen.size() < 2 * run.execs.size()) {
+-        run.seen.resize(2 * run.execs.size());
+-      }
+-      Segment::Seen& w = run.seen[2 * form];
+-      thread_local std::vector<uint8_t> marks;
+-      marks.resize(n);
+-      changed_since(run, w, frame, marks.data());
+-      std::vector<Segment::Held>& whole = form_held(run, form, false);
+-      exec = run.execs[form];
+-      int64_t budget = split_catch_up;
+-      for (size_t i = 0; i < n && budget > 0; ++i) {
+-        CUgraphNode node = clone ? clone->nodes[i] : records_[run.first + i].node;
+-        if (node && marks[i]) {
+-          patch(records_[run.first + i], whole[i], node);
+-          marks[i] = always_[run.first + i];
+-          --budget;
+-          ++split_catch_up_sets;
+-        }
+-      }
+-      const int64_t* bases_now = frame.bases.data();
+-      const uint32_t* segment_bases = users_.segment_bases.data() + users_.segment_first[&run - segments_.data()];
+-      const size_t base_count = users_.segment_first[&run - segments_.data() + 1] - users_.segment_first[&run - segments_.data()];
+-      w.rows.resize(run.read_rows.size());
+-      for (size_t j = 0; j < run.read_rows.size(); ++j) {
+-        w.rows[j] = v[run.read_rows[j]];
+-      }
+-      w.bases.resize(base_count);
+-      for (size_t j = 0; j < base_count; ++j) {
+-        w.bases[j] = bases_now[segment_bases[j]];
+-      }
+-      w.sites.resize(run.sites.size());
+-      for (size_t j = 0; j < run.sites.size(); ++j) {
+-        w.sites[j] = frame.site_entries[run.sites[j]];
+-      }
+-      w.dirty.assign(marks.begin(), marks.end());
+-      w.saved = true;
+-      w.users_version = users_version_;
+-      run.whole_shape[form] = shape;
+-    }
+   } else {
+     patch_range(-1);
+-    if (splits) {
+-      run.whole_shape[form] = shape;
+-    }
+   }
+   // a replay advances the generator by what the rows' calls take, as eager
+   if (run.generator && running != run.rng_increment) {
+@@ -1141,6 +1141,7 @@
+   if (sp) {
+     // launched range by range above
+   } else if (hooks) {
++    ++graph_launches;
+     TORCH_CHECK(
+         form == 0,
+         "host_trace: replay hooks on a segment replayed in another form");
+@@ -1154,6 +1155,7 @@
+       throw py::error_already_set();
+     }
+   } else {
++    ++graph_launches;
+     run.native->replay_exec(reinterpret_cast<cudaGraphExec_t>(exec));
+   }
+   phase_add(6, pt);
+--- a/torch/csrc/cuda/host_trace/Variant.h	2026-10-15 22:13:10.547799280 -0700
++++ b/torch/csrc/cuda/host_trace/Variant.h	2026-10-16 09:49:28.522469907 -0700
+@@ -99,20 +99,22 @@
+ extern bool placement_reuse_enabled;
+ // a form switch restores what the form's exec last held (else forgets it)
+ extern bool form_held_enabled;
+-// executor-level split (opt-in): a call that changes a launch configuration
+-// its form's whole exec holds (a launch dimension, memset extent or site row:
+-// a size change), or whose whole exec has more than split_threshold records
+-// not yet caught up, launches the form's sub-execs back to back instead,
+-// patching each while the one before it runs; args-only calls launch whole.
+-// -1: off
+-extern int64_t split_threshold;
++// executor-level split (opt-in): a run with legal cuts launches its form's
++// sections (sub-execs over the same nodes and addresses) every call, patching
++// section k+1 while section k runs. Sections grow by split_ratio in the records
++// a call can re-set, at most split_sections; split_first_nodes > 0 sets the
++// first section's records and split_max_nodes > 0 the most records a section
++// takes (test and diagnosis knobs, 0: auto)
++extern bool split_enabled;
++extern int64_t split_sections;
++extern double split_ratio;
++extern int64_t split_first_nodes;
++extern int64_t split_max_nodes;
+ // test-only: calls launched split, and forms whose sub-execs were built
+ extern int64_t split_calls;
++// test-only: graph launches of native replays (a split call's sections each)
++extern int64_t graph_launches;
+ extern int64_t split_builds;
+-// per split call, at most this many of the whole exec's stale records are set
+-// after the last range is launched (catch-up); test-only: those records
+-extern int64_t split_catch_up;
+-extern int64_t split_catch_up_sets;
+ // add_entry takes an entry's TMA descriptors (else refuses the entry)
+ extern bool entry_descriptors_enabled;
+ 
+@@ -292,7 +294,7 @@
+   // Replaces the program by one that extends it (rows added, for add_entry)
+   void set_program(const HostTraceProgram& program);
+   // the lowering's safe cut points of a segment (record offsets, sorted), for
+-  // the executor-level split (split_threshold)
++  // the executor-level split (split_enabled)
+   void set_split_cuts(size_t segment, const std::vector<size_t>& cuts);
+   // Adds a form of the segment: exec, an instantiation of graph, a clone of
+   // the segment's graph with each of its sites' kernel nodes at the launch
+@@ -548,11 +550,6 @@
+     std::vector<Seen> seen; // per state
+     // the rows its records read (index_users)
+     std::vector<int64_t> read_rows;
+-    // and those its launch dimensions and memset extents read (index_users);
+-    // per form, their values and the site rows when its whole exec was last
+-    // patched (empty: unknown), for the split policy
+-    std::vector<int64_t> shape_rows;
+-    std::vector<std::vector<int64_t>> whole_shape;
+     // the active state's mode: the form's sub-execs (Split), else its exec
+     bool split = false;
+     // the lowering's safe cut points (record offsets: no programmatic edge
+@@ -774,6 +771,15 @@
+   bool changed_since(const Segment& run, const Segment::Seen& s, const Frame& frame, uint8_t* out) const;
+   // the form's sub-execs, built at their first use; false when it has none
+   bool split_ready(Segment& run, size_t form, const Frame& frame);
++  // a split run's section bounds (record offsets), from its cuts
++  std::vector<size_t> split_bounds(Segment& run);
++ public:
++  // test-only: a form's section bounds once built (empty: not split)
++  std::vector<size_t> split_bounds_of(size_t segment, size_t form) const {
++    const Segment& run = segments_.at(segment);
++    return form < run.splits.size() && run.splits[form].ok ? run.splits[form].bounds : std::vector<size_t>();
++  }
++ private:
+ 
+   const KernelRow& kernel_row(const Record& r, int64_t row) const;
+   const MemsetRow& memset_row(const Record& r, int64_t row) const;

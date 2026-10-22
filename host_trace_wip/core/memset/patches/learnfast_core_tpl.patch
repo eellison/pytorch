@@ -1,0 +1,310 @@
+diff -ru -x __pycache__ core_tpl/a/test/test_cuda_host_trace_replay.py core_tpl/b/test/test_cuda_host_trace_replay.py
+--- core_tpl/a/test/test_cuda_host_trace_replay.py	2026-10-15 14:20:14.786417400 -0700
++++ core_tpl/b/test/test_cuda_host_trace_replay.py	2026-10-15 14:26:08.685171933 -0700
+@@ -99,6 +99,12 @@
+         tl.store(y_ptr + m * N + n, x * 2, mask=mask)
+ 
+     @triton.jit
++    def _mul_cols(x_ptr, w_ptr, y_ptr, n, N, B: tl.constexpr):
++        i = tl.program_id(0) * B + tl.arange(0, B)
++        m = i < n
++        tl.store(y_ptr + i, tl.load(x_ptr + i, mask=m) * tl.load(w_ptr + i % N, mask=m), mask=m)
++
++    @triton.jit
+     def _second_row(x_ptr, y_ptr, N, sxm, B: tl.constexpr):
+         n = tl.program_id(0) * B + tl.arange(0, B)
+         tl.store(y_ptr + n, tl.load(x_ptr + sxm + n, mask=n < N), mask=n < N)
+@@ -353,6 +359,21 @@
+     return None
+ 
+ 
++@torch.library.custom_op("host_trace_test::tactic_mul", mutates_args=())
++def tactic_mul(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
++    # a layer's op on its weight (Triton specializes on the weight pointer's 16-byte alignment: a guard on its root)
++    # with a tactic on the row count
++    B = 128 if x.shape[0] <= 16 else 256
++    y = torch.empty_like(x)
++    _mul_cols[(triton.cdiv(x.numel(), B),)](x, w, y, x.numel(), w.numel(), B=B)
++    return y
++
++
++@tactic_mul.register_fake
++def _(x, w):
++    return torch.empty_like(x)
++
++
+ @torch.library.custom_op("host_trace_test::tactic_op", mutates_args=())
+ def tactic_op(x: torch.Tensor) -> torch.Tensor:
+     return tactic_add(x)
+@@ -911,6 +932,46 @@
+         self.assertGreater(f.redos, 0)
+         self.assertGreaterEqual(f.redo_instances, 2 * f.redos)
+ 
++    @parametrize("static_prefix", [True, False])
++    def test_layers_share_a_redo_template_over_static_prefix_weights(self, static_prefix):
++        # every layer's op reads its own weight (an argument whose pointer alignment the op's kernel specializes on: a
++        # pin) and flips its tactic at the same call. With the weights the replay's static prefix, a template's pin on
++        # a weight moves to another layer's (its alignment guard renamed onto that weight, its layout values checked):
++        # one redo per distinct read (the first layer reads an argument, the others the layer before's output) and the
++        # rest instantiated (verify mode, on in the suites, redoes each in full too and compares). Weights outside the
++        # static prefix keep the pin: every layer is redone in full
++        layers = 4
++        ws = [torch.randn(64, device="cuda") for _ in range(layers)]
++
++        def fn(*a):
++            *weights, x = a
++            for w in weights:
++                x = torch.ops.host_trace_test.tactic_mul(x, w)
++            return x
++
++        f = HostTraceReplay(fn, static_prefix=layers if static_prefix else 0)
++        for m in (8, 24, 8, 24):
++            x = torch.randn(m, 64, device="cuda")
++            self.assertEqual(f(*ws, x), fn(*ws, x), atol=0, rtol=0)
++        expected = (1, 1, 2, layers - 2) if static_prefix else (1, 1, layers, 0)
++        self.assertEqual((f.traces, f.redispatches, f.redos, f.redo_instances), expected)
++
++    def test_a_static_prefix_weight_at_another_offset_takes_no_template(self):
++        # a static-prefix weight's layout values are constants of the entry and key the read: the second weight's offset
++        # (4 bytes, off 16-byte alignment, so its kernel specializes otherwise) keys it apart and it is redone in full
++        buf = torch.randn(4 * 64 + 1, device="cuda")
++        ws = [torch.randn(64, device="cuda"), buf[1:65], torch.randn(64, device="cuda")]
++
++        def fn(*a):
++            *weights, x = a
++            return tuple(torch.ops.host_trace_test.tactic_mul(x, w) for w in weights)
++
++        f = HostTraceReplay(fn, static_prefix=len(ws))
++        for m in (8, 24, 8, 24):
++            x = torch.randn(m, 64, device="cuda")
++            self.assertEqual(f(*ws, x), fn(*ws, x), atol=0, rtol=0)
++        self.assertEqual((f.traces, f.redispatches, f.redos, f.redo_instances), (1, 1, 2, 1))
++
+     def test_ops_reading_one_argument_share_a_redo_template_past_its_alignment(self):
+         # four ops launch on x and specialize on its 16-byte alignment (a guard on x's root): the redo template pins
+         # x, so at the tactic flip the other three take the first's entry on the same root (verify mode, on in the
+diff -ru -x __pycache__ core_tpl/a/torch/cuda/_host_trace_lower_tape.py core_tpl/b/torch/cuda/_host_trace_lower_tape.py
+--- core_tpl/a/torch/cuda/_host_trace_lower_tape.py	2026-10-15 14:21:29.319542593 -0700
++++ core_tpl/b/torch/cuda/_host_trace_lower_tape.py	2026-10-15 14:21:46.073054589 -0700
+@@ -384,6 +384,9 @@
+         self.templates: dict[Any, Any] = {}
+         # per op (index in Tape.ops), what its redo reads (_reads): a function of the variant's tape, made once
+         self.reads: dict[int, Any] = {}
++        # per static prefix length, its layouts' symbols; per (template, an op's read roots), that op's template or None
++        self.declared: dict[int, frozenset] = {}
++        self.instance_templates: dict[tuple, Any] = {}
+         self.instances = 0
+         self.redos = 0
+ 
+diff -ru -x __pycache__ core_tpl/a/torch/cuda/_host_trace_redispatch.py core_tpl/b/torch/cuda/_host_trace_redispatch.py
+--- core_tpl/a/torch/cuda/_host_trace_redispatch.py	2026-10-15 14:20:14.777239264 -0700
++++ core_tpl/b/torch/cuda/_host_trace_redispatch.py	2026-10-15 14:21:18.599018862 -0700
+@@ -67,7 +67,13 @@
+ 
+ 
+ def redispatch(
+-    lowered: LoweredTape, args: Sequence[Any], values: Sequence[int], unselected: Sequence[int], dispatches: dict | None = None, opaque: Sequence[Any] = ()
++    lowered: LoweredTape,
++    args: Sequence[Any],
++    values: Sequence[int],
++    unselected: Sequence[int],
++    dispatches: dict | None = None,
++    opaque: Sequence[Any] = (),
++    static_prefix: int = 0,
+ ) -> tuple[torch._C._HostTraceProgram, list[tuple[int, int, tuple[LoweredLaunch | LoweredMemset, ...], Any]]]:
+     """Selectors `unselected` (native site indices) of the variant, whose
+     graph guards hold the call `args` (at rows `values`), as entries from
+@@ -75,7 +81,10 @@
+     would read what an earlier redo of this variant read (Template), where
+     that entry's predicate holds, takes that entry with its own roots. A
+     redo of an op holding keyed sites routes calls to the replay's `opaque`
+-    providers, as its trace did."""
++    providers, as its trace did. The first `static_prefix` arguments are
++    the replay's static prefix (a model's parameters, the same tensors every
++    call): a template keys their layouts by value, and another layer's op
++    takes it with its own (_for_instance)."""
+     lo = lowered.lowering
+     program = lo.program
+     rows = len(program.values)
+@@ -89,13 +98,15 @@
+             for i in sorted(unselected, key=lambda i: i not in lo.refused):
+                 selector = lowered.selectors[i - len(lowered.sites)]
+                 op = lowered.tape.ops[selector.op]
++                declared = _declared(lowered, static_prefix)
+                 if selector.op not in lo.reads:
+-                    lo.reads[selector.op] = _reads(lowered, op, selector)
++                    lo.reads[selector.op] = _reads(lowered, op, selector, declared)
+                 reads = lo.reads[selector.op]
+                 template = lo.templates.get(reads[0]) if reads is not None else None
+-                if template is not None and not all(reads[1][p] is r for p, r in template.pinned):
+-                    # it reads a root of its own op at a position where this op's is another
+-                    template = None
++                if template is not None:
++                    # its roots at this op's positions: the same object at a pin, another static-prefix argument (its
++                    # guards renamed onto it, its keyed layout values checked), else the full redo
++                    template = _for_instance(lowered, template, reads[1], static_prefix)
+                 if template is not None and program.values[template.predicate] == 1 and _bound(lowered, reads[2], program.values):
+                     entry, after = _instantiate(lowered, i, template, reads[1], base, selector, op)
+                     if torch.cuda._host_trace.verify_redo_templates:
+@@ -162,9 +173,11 @@
+     section: LoweredSection | None
+     drops: tuple[int, ...]
+     pinned: tuple[tuple[int, _Root], ...]
++    # the read walk's roots of the op whose redo it is (_for_instance maps them onto another op's)
++    roots: tuple[_Root, ...] = ()
+ 
+ 
+-def _reads(lowered: LoweredTape, op: OpRec, selector: LoweredSelector) -> tuple[Any, list[_Root], tuple[int, ...]] | None:
++def _reads(lowered: LoweredTape, op: OpRec, selector: LoweredSelector, declared: frozenset[str] = frozenset()) -> tuple[Any, list[_Root], tuple[int, ...]] | None:
+     """What a redo of `op` reads, as a key, its roots in reading order and its
+     keyed sites (indices in lowered.sites), with no fresh symbol: the op, its
+     call's structure and constants, each SymInt / SymBool as the variant's
+@@ -176,7 +189,11 @@
+     as its own trace assumed), so its records are a function of these reads.
+     A launcher's redo (a Triton or CuTe DSL closure) and anything the walk
+     cannot name (a SymFloat, a tensor the trace does not track) is None: the
+-    op is redone in full."""
++    op is redone in full. A SymInt over `declared` symbols alone (the static
++    prefix's layouts) is keyed by its value; an argument's extent by its
++    length; then the roots its recorded launch chain holds (a body's reads
++    of module state: weights, the step's metadata), so an op of another layer
++    takes the template with its own roots at those positions."""
+     func = op.func
+     if op.kind != "traced" or op.redo is None or not isinstance(func, OpOverload) or not lowered.lowering.ir:
+         return None
+@@ -191,7 +208,9 @@
+         if isinstance(v, torch.SymBool):
+             items.append(("bool", v.node.node) if v.node.constant is None else (bool, bool(v.node.constant)))
+         elif isinstance(v, torch.SymInt):
+-            items.append(("int", _sym_key(v)))
++            k = _sym_key(v)
++            fs = k.free_symbols if isinstance(k, _ir.Node) else ()
++            items.append(("value", int(k.hint)) if fs and fs <= declared else ("int", k))
+         else:
+             items.append((type(v), repr(v) if isinstance(v, float) else v))
+ 
+@@ -209,7 +228,8 @@
+         if r.kind == "argument":
+             rec = next(i for i in old.inputs if i.root is r)
+             layout(rec.sizes, rec.strides, rec.offset)
+-            items.append((rec.dtype, rec.extent, rec.cow))
++            # the extent's length: its place is the root's (a run's address, not a read)
++            items.append((rec.dtype, rec.extent[1] - rec.extent[0], rec.cow))
+         elif r.kind == "allocation":
+             a = next(a for a in old.allocs if a.root is r)
+             layout(a.sizes, a.strides, 0)
+@@ -236,6 +256,10 @@
+         for _, rec in old.launches[op.launches.start : op.launches.stop]:
+             fixed = (rec.function, rec.attributes, rec.programmatic) if isinstance(rec, KernelLaunch) else (getattr(rec, "element_size", None),)
+             items.append((type(rec), *fixed))
++        items.append("chain roots")
++        for _, rec in old.launches[op.launches.start : op.launches.stop]:
++            for r in getattr(rec, "roots", ()):
++                root(r)
+         span = {id(rec) for _, rec in old.launches[op.launches.start : op.launches.stop]}
+         sites = tuple(j for j, ls in enumerate(lowered.sites) if ls.site.nodes and id(ls.site.nodes[0]) in span)
+         for j in sites:
+@@ -259,6 +283,82 @@
+     return key, roots, sites
+ 
+ 
++def _declared(lowered: LoweredTape, static_prefix: int) -> frozenset[str]:
++    """The symbols of the static prefix's layouts (sizes, strides, offsets)."""
++    lo = lowered.lowering
++    got = lo.declared.get(static_prefix)
++    if got is None:
++        names: set[str] = set()
++        for rec in lowered.tape.inputs:
++            if rec.position < static_prefix:
++                for v in (*rec.sizes, *rec.strides, rec.offset):
++                    k = _sym_key(v)
++                    if isinstance(k, _ir.Node):
++                        names |= k.free_symbols
++        got = lo.declared[static_prefix] = frozenset(names)
++    return got
++
++
++def _for_instance(lowered: LoweredTape, t: Template, roots: list[_Root], static_prefix: int) -> Template | None:
++    """Template t for the op whose read walk gave `roots`, or None (a full
++    redo). Each position where t's op read a static-prefix argument: this op
++    reads one too, and its layout symbols and t's op's hold the values the key
++    took (value pins, rows at each call: a changed prefix misses); where it is
++    another argument, t's guards reading t's op's (its address: an alignment
++    check, its layout) are renamed onto it and join the predicate, and a pin
++    there moves to it. A pin on any other root needs the same object."""
++    lo, old = lowered.lowering, lowered.tape
++    if len(t.roots) != len(roots):
++        return t if all(roots[p] is r for p, r in t.pinned) else None
++    cache_key = (id(t), tuple(map(id, roots)))
++    if cache_key in lo.instance_templates:
++        return lo.instance_templates[cache_key]
++    recs = {id(i.root): i for i in reversed(old.inputs)}  # each root's first argument, as _redo's root() takes it
++    ctx = old.shape_env.ctx
++    subs: dict[str, _ir.Node] = {}
++    pins: list[Any] = []
++    moved: set[int] = set()
++    out: Template | None = t
++    for p, (mine, theirs) in enumerate(zip(t.roots, roots)):
++        a = recs.get(id(mine)) if mine.kind == "argument" else None
++        if a is None or a.position >= static_prefix:
++            continue
++        b = recs.get(id(theirs)) if theirs.kind == "argument" else None
++        if b is None or b.position >= static_prefix:
++            out = None
++            break
++        for rec in (a, b):
++            for v in (*rec.sizes, *rec.strides, rec.offset):
++                k = _sym_key(v)
++                if isinstance(k, _ir.Node):
++                    pins.append((ctx.eq(k, ctx.const(int(k.hint))), None))
++        if theirs is not mine:
++            moved.add(p)
++            for x, y in zip((a.root.sym, *a.sizes, *a.strides, a.offset), (b.root.sym, *b.sizes, *b.strides, b.offset)):
++                kx, ky = _sym_key(x), _sym_key(y)
++                if isinstance(kx, _ir.Node) and kx.op == "sym":
++                    subs[kx.args[0]] = ky if isinstance(ky, _ir.Node) else ctx.const(int(ky))
++    if out is not None and not all(roots[p] is r or p in moved for p, r in t.pinned):
++        out = None
++    if out is not None and (pins or subs):
++        full, memo = {**ctx.symbols, **subs}, {}
++        renamed = [(ctx.transfer(g, ctx, full, memo), None) for g, _ in t.guards if isinstance(g, _ir.Node) and g.free_symbols & subs.keys()]
++        guards = [g for g in (*renamed, *pins) if g[0].op != "true"]
++        predicate = t.predicate
++        if guards:
++            addresses = frozenset(lo.key(rec.root.sym) for rec in old.inputs)
++            try:
++                with lo.lowering.total() as domains:
++                    predicate = lo.emit("and", predicate, lo.lowering.conjunction(guards, addresses))
++                for ok in domains:
++                    predicate = lo.emit("and", predicate, ok)
++            except Declined:
++                predicate = None  # a renamed guard false at the hints: this op takes another branch
++        out = None if predicate is None else replace(t, predicate=predicate, pinned=tuple((p, roots[p]) for p, _ in t.pinned), roots=tuple(roots))
++    lo.instance_templates[cache_key] = out
++    return out
++
++
+ def _bound(lowered: LoweredTape, sites: tuple[int, ...], values: Sequence[int]) -> bool:
+     """Whether each keyed site's key binds at the call: where one does not, a
+     full redo records an opaque call, no site, and refuses."""
+@@ -319,7 +419,7 @@
+             pin(d)
+         roles.append(tuple(role))
+     drops = tuple(d - op.allocs.start for d in section.drops) if section else ()
+-    return Template(predicate, tuple(guards), rows, tuple(roles), section, drops, tuple((p, roots[p]) for p in sorted(pinned)))
++    return Template(predicate, tuple(guards), rows, tuple(roles), section, drops, tuple((p, roots[p]) for p in sorted(pinned)), tuple(roots))
+ 
+ 
+ def _instantiate(lowered: LoweredTape, i: int, t: Template, roots: list[_Root], base: int, selector: LoweredSelector, op: OpRec) -> tuple[tuple, int]:
+diff -ru -x __pycache__ core_tpl/a/torch/cuda/_host_trace_replay.py core_tpl/b/torch/cuda/_host_trace_replay.py
+--- core_tpl/a/torch/cuda/_host_trace_replay.py	2026-10-15 14:20:14.782116542 -0700
++++ core_tpl/b/torch/cuda/_host_trace_replay.py	2026-10-15 14:21:46.073359550 -0700
+@@ -1328,7 +1328,7 @@
+         start = time.perf_counter()
+         lo = variant.captured.lowered.lowering
+         counts = lo.redos, lo.instances
+-        refused = self._add_entries(variant, self.redispatch_refusals, args, redispatch, variant.captured.lowered, args, values, unselected, dispatches, self.opaque)
++        refused = self._add_entries(variant, self.redispatch_refusals, args, redispatch, variant.captured.lowered, args, values, unselected, dispatches, self.opaque, self.static_prefix)
+         self.redos += lo.redos - counts[0]
+         self.redo_instances += lo.instances - counts[1]
+         # a refusal keeps the rows it appended, evaluated at the call, which a fold reads

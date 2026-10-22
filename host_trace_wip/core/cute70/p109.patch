@@ -1,0 +1,241 @@
+--- a/torch/cuda/_host_trace.py
++++ b/torch/cuda/_host_trace.py
+@@ -105,11 +105,6 @@
+ # with the CuTe DSL's constants
+ triton_tma_encode = True
+ 
+-# the CuTe route also takes functions compiled without TVM-FFI and called with
+-# from_dlpack tensors of traced tensors, and reads a cute.experimental host
+-# function after the DSL's passes ahead of cute-to-nvvm (SGLang's TGV GEMM)
+-cute_without_tvm_ffi = False
+-
+ # where redispatch refuses an op for its launch topology or allocations, the
+ # variant's tape with its failing ops dispatched again at the call (respec)
+ # builds a variant, captured whole, with no trace
+--- a/torch/cuda/_host_trace_cute.py
++++ b/torch/cuda/_host_trace_cute.py
+@@ -1,13 +1,12 @@
+ """CuTe DSL compiled functions under a host trace.
+ 
+ A function compiled with `cute.compile(..., options="--enable-tvm-ffi")` and
+-called with traced tensors (with `torch.cuda._host_trace.cute_without_tvm_ffi`,
+-also one compiled without TVM-FFI and called with `from_dlpack` tensors of
+-traced tensors) is not run: its launches are recorded as KernelLaunch records
+-with `fields`, or the call is an EagerCall that a replay runs as eager does.
+-A trace-finalize hook on cute.compile prints the host function with MLIR's
+-printer (with that switch, a cute.experimental one after the DSL's own passes
+-that add its TMA descriptors); MLIR's parser loads it into a
++called with traced tensors (also one compiled without TVM-FFI and called with
++`from_dlpack` tensors of traced tensors) is not run: its launches are recorded
++as KernelLaunch records with `fields`, or the call is an EagerCall that a
++replay runs as eager does. A trace-finalize hook on cute.compile prints the
++host function with MLIR's printer (a cute.experimental one after the DSL's own
++passes that add its TMA descriptors); MLIR's parser loads it into a
+ context of ours, where the DSL's dialects are not registered, and a generic
+ interpreter over its arith/scf/cute/cuda ops makes it a _Program: per launch
+ the kernel, its config and parameter fields as expressions over the call's
+@@ -39,7 +38,6 @@
+ import struct
+ import sys
+ import threading
+-import types
+ import weakref
+ from dataclasses import dataclass, field
+ from typing import Any, NoReturn, TYPE_CHECKING
+@@ -1079,7 +1077,6 @@
+ _lock = threading.Lock()
+ # cutlass's own methods, saved at the first hook and never cleared
+ _ORIGINALS: dict[Any, Any] = {}
+-_rebound = False
+ 
+ 
+ def install() -> None:
+@@ -1109,31 +1106,15 @@
+             _ORIGINALS["load"] = ExternalBinaryModule.__new__
+             _ORIGINALS["lookup"] = ExternalBinaryModule.__getattr__  # __getitem__ calls it
+             _ORIGINALS["fake"] = runtime._FakeTensor.__init__
+-            _ORIGINALS["from_dlpack"] = runtime.from_dlpack
++            _ORIGINALS["tensor"] = runtime._Tensor.__new__
+             _ORIGINALS["read_only"] = ReadOnlyTensorWrapper.__new__
+             CompileCallable.__call__ = _compile
+             TVMFFIJitCompiledFunctionBase.export_to_c = _export_to_c
+             ExternalBinaryModule.__new__ = staticmethod(_load)
+             ExternalBinaryModule.__getattr__ = _lookup
+             runtime._FakeTensor.__init__ = _fake_tensor
+-            runtime.from_dlpack = _from_dlpack
++            runtime._Tensor.__new__ = staticmethod(_cute_tensor)
+             ReadOnlyTensorWrapper.__new__ = staticmethod(_read_only)
+-        if torch.cuda._host_trace.cute_without_tvm_ffi and not _rebound:
+-            _rebind_from_dlpack()
+-
+-
+-def _rebind_from_dlpack() -> None:
+-    # a module imported before the hook bound cutlass's from_dlpack by name
+-    # (SGLang's TGV GEMM, imported at model load), which runtime.from_dlpack
+-    # no longer reaches: point those names at the hook
+-    global _rebound
+-    _rebound = True
+-    original = _ORIGINALS["from_dlpack"]
+-    for module in list(sys.modules.values()):
+-        if isinstance(module, types.ModuleType):
+-            names = vars(module)
+-            for name in [k for k, v in list(names.items()) if v is original]:
+-                names[name] = _from_dlpack
+ 
+ 
+ def observing() -> bool:
+@@ -1166,15 +1147,13 @@
+     return _ORIGINALS["read_only"](cls, tensor)
+ 
+ 
+-def _from_dlpack(tensor: Any, *args: Any, **kwargs: Any) -> Any:
+-    # a TVM-FFI function takes a torch tensor where it takes a CuTe tensor, so
+-    # a traced tensor bound for one stays traced for _intercept
+-    if isinstance(tensor, _TracedTensor) and not kwargs.get("force_tf32"):
+-        if kwargs.get("enable_tvm_ffi"):
+-            return tensor
+-        if torch.cuda._host_trace.cute_without_tvm_ffi:
+-            return _DLPackArg(tensor, args, kwargs)
+-    return _ORIGINALS["from_dlpack"](tensor, *args, **kwargs)
++def _cute_tensor(cls: type, tensor: Any, *args: Any, **kwargs: Any) -> Any:
++    # from_dlpack's CuTe tensor, however from_dlpack was imported. A TVM-FFI
++    # function takes a torch tensor where it takes a CuTe tensor, so a traced
++    # tensor bound for one stays traced for _intercept
++    if isinstance(tensor, _TracedTensor):
++        return tensor if kwargs.get("enable_tvm_ffi") else _DLPackArg(tensor, args, kwargs)
++    return _ORIGINALS["tensor"](cls)
+ 
+ 
+ @dataclass(eq=False)
+@@ -1202,7 +1181,9 @@
+         raise tr.decline(why) if tr is not None else AttributeError(why)
+ 
+     def make(self, t: torch.Tensor) -> Any:
+-        cute_tensor = _ORIGINALS["from_dlpack"](t, *self.args, **self.kwargs)
++        from cutlass.cute.runtime import from_dlpack
++
++        cute_tensor = from_dlpack(t, *self.args, **self.kwargs)
+         for mark, args, kwargs in self.marks:
+             cute_tensor = getattr(cute_tensor, mark)(*args, **kwargs)
+         return cute_tensor
+@@ -1217,7 +1198,7 @@
+             # cute.experimental's passes ahead of cute-to-nvvm make its TMA
+             # atoms and add them to the launch: run them on a copy
+             head, nvvm, _ = dsl._get_pipeline(None).partition(", cute-to-nvvm")
+-            if nvvm and torch.cuda._host_trace.cute_without_tvm_ffi:
++            if nvvm:
+                 from cutlass._mlir import ir
+                 from cutlass._mlir.passmanager import PassManager
+ 
+--- a/test/test_cuda_host_trace_cute.py
++++ b/test/test_cuda_host_trace_cute.py
+@@ -7,7 +7,6 @@
+ import subprocess
+ import sys
+ import tempfile
+-import types
+ import unittest
+ from typing import NamedTuple, Optional
+ from unittest import mock
+@@ -322,11 +321,7 @@
+             add(from_dlpack(a, assumed_align=16), a, a, 1000)
+             return a
+ 
+-        with self.assertRaisesRegex(Declined, "DLPack export of a traced tensor"):
+-            trace(dlpack, (torch.randn(1000, device="cuda"),), warm_up=False)
+-        with mock.patch.object(torch.cuda._host_trace, "cute_without_tvm_ffi", True), self.assertRaisesRegex(
+-            Declined, "from_dlpack tensor of a traced tensor passed to a TVM-FFI function"
+-        ):
++        with self.assertRaisesRegex(Declined, "from_dlpack tensor of a traced tensor passed to a TVM-FFI function"):
+             trace(dlpack, (torch.randn(1000, device="cuda"),), warm_up=False)
+ 
+         def on_side_stream(a):
+@@ -1464,7 +1459,6 @@
+         args = [_cute_tensor(x) for _ in range(3)]
+         return cute.compile(jit, *args, cutlass.Int32(0), cuda_driver.CUstream(0))
+ 
+-    @mock.patch.object(torch.cuda._host_trace, "cute_without_tvm_ffi", True)
+     def test_a_from_dlpack_call_without_tvm_ffi_is_a_launch(self):
+         add = self._compile_without_tvm_ffi(_add)
+ 
+@@ -1490,7 +1484,6 @@
+         with self.assertRaisesRegex(Declined, "reads shape of a from_dlpack tensor of a traced tensor"):
+             trace(reads_shape, (x,), warm_up=False)
+ 
+-    @mock.patch.object(torch.cuda._host_trace, "cute_without_tvm_ffi", True)
+     def test_an_undescribed_from_dlpack_call_is_an_eager_call(self):
+         add, traced = self._compile_without_tvm_ffi(_add_shifted), self.add
+ 
+@@ -1515,30 +1508,34 @@
+             self.assertEqual(r(a, b), a + b + b, atol=0, rtol=0)
+         self.assertEqual((r.traces, r.replays, r.eager), (1, 2, 0))
+ 
+-    @mock.patch.object(torch.cuda._host_trace, "cute_without_tvm_ffi", True)
+     def test_a_from_dlpack_bound_before_the_hook_is_a_launch(self):
+         # SGLang imports its TGV GEMM, which binds from_dlpack by name, at
+-        # model load: before the hook replaces cute.runtime.from_dlpack
+-        stale = types.ModuleType("stale_from_dlpack")
+-        with mock.patch.object(cute.runtime, "from_dlpack", htc._ORIGINALS["from_dlpack"]):
+-            exec("from cutlass.cute.runtime import from_dlpack", vars(stale))
+-        add = self._compile_without_tvm_ffi(_add)
+-
+-        def f(a, b):
+-            c = torch.empty_like(a)
+-            stream = cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream)
+-            ab_c = [stale.from_dlpack(t, assumed_align=16).mark_layout_dynamic() for t in (a, b, c)]
+-            add(*ab_c, a.shape[0], stream)
+-            return c
+-
+-        with mock.patch.dict(sys.modules, {stale.__name__: stale}), mock.patch.object(htc, "_rebound", False):
+-            r = HostTraceReplay(f)
++        # model load: before torch.cuda._host_trace_cute installs its hooks
++        script = """if True:
++            import sys
++            from cutlass.cute.runtime import from_dlpack
++            hooked = "torch.cuda._host_trace_cute" in sys.modules
++            sys.path.insert(0, sys.argv[1])
++            import cuda.bindings.driver as cuda_driver, torch, test_cuda_host_trace_cute as t
++            add = t.TestHostTraceCute._compile_without_tvm_ffi(None, t._add)
++            def f(a, b):
++                c = torch.empty_like(a)
++                stream = cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream)
++                add(*[from_dlpack(x, assumed_align=16).mark_layout_dynamic() for x in (a, b, c)], a.shape[0], stream)
++                return c
++            r, ok = t.HostTraceReplay(f), []
+             for n in (1000, 4096, 1000):
+                 a, b = torch.randn(n, device="cuda"), torch.randn(n, device="cuda")
+-                self.assertEqual(r(a, b), a + b, atol=0, rtol=0)
+-        self.assertEqual((r.traces, r.replays, r.eager), (1, 2, 0))
+-        self.assertIs(stale.from_dlpack, htc._from_dlpack)
+-
++                ok.append(torch.equal(r(a, b), a + b))
++            print(hooked, all(ok), r.traces, r.replays, r.eager)
++        """
++        out = subprocess.run(
++            [sys.executable, "-c", script, os.path.dirname(os.path.abspath(__file__))],
++            capture_output=True,
++            text=True,
++            check=True,
++        ).stdout
++        self.assertEqual(out.split(), ["False", "True", "1", "2", "0"])
+ 
+ instantiate_parametrized_tests(TestHostTraceCute)
+ 
+--- a/test/test_cuda_host_trace_integration.py
++++ b/test/test_cuda_host_trace_integration.py
+@@ -5,7 +5,6 @@
+ 
+ import importlib.util
+ import unittest
+-from unittest import mock
+ 
+ import torch
+ from torch.cuda import _host_trace_replay
+@@ -52,7 +51,6 @@
+         "requires Blackwell",
+     )
+     @unittest.skipIf(not HAS_SGLANG, "requires SGLang")
+-    @mock.patch.object(torch.cuda._host_trace, "cute_without_tvm_ffi", True)
+     def test_sglang_tgv_gemm(self):
+         # cute.experimental, without TVM-FFI: its own passes add the TMA
+         # descriptors to the launch; 2-CTA clusters, PDL

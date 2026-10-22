@@ -1,0 +1,21 @@
+diff -ru -x __pycache__ step_ms23/test/test_cuda_host_trace_replay.py step_ms24/test/test_cuda_host_trace_replay.py
+--- step_ms23/test/test_cuda_host_trace_replay.py	2026-10-18 10:23:09.595213387 -0700
++++ step_ms24/test/test_cuda_host_trace_replay.py	2026-10-18 11:13:15.494707705 -0700
+@@ -5792,6 +5792,17 @@
+         self.assertLess(incremental[0], full[0])
+         self.assertGreaterEqual(incremental[2], 1)
+ 
++    def test_a_walk_takes_no_node_for_a_sealed_referent(self):
++        # what an earlier walk untracked (IR nodes, records) and clean objects (types, operators) are sealed: a later
++        # walk meeting them through a variant's tracked state counts them, taking no node for them
++        f = HostTraceReplay(_choice)
++        f._redispatch = lambda *args: FoldRefused("")
++        before = torch._C._host_trace_gc_untrack_counts()
++        rows = self._per_call(f, (16, 24, 40))
++        after = torch._C._host_trace_gc_untrack_counts()
++        self.assertLessEqual(max(n for n, _ in rows), 300, rows)
++        self.assertGreater(after[2] - before[2], 0)
++
+     def test_untracking_is_off_without_the_switch(self):
+         with mock.patch.object(_host_trace_replay, "gc_untrack", False):
+             f = HostTraceReplay(_layer, static_shapes=(0,))

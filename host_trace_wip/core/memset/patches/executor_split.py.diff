@@ -1,0 +1,141 @@
+diff -ru -x __pycache__ step_ms5/test/test_cuda_host_trace_replay.py step_ms6/test/test_cuda_host_trace_replay.py
+--- step_ms5/test/test_cuda_host_trace_replay.py	2026-10-15 07:13:46.666231534 -0700
++++ step_ms6/test/test_cuda_host_trace_replay.py	2026-10-15 09:26:40.670497180 -0700
+@@ -143,6 +143,12 @@
+     return add(add(add(add(x))), 1)
+ 
+ 
++def long_chain(x):
++    for _ in range(4):
++        x = five_step(x)
++    return x
++
++
+ def branch_on_size(x):
+     return add(x, 1) if x.shape[0] > 4096 else add(add(x), 2)
+ 
+@@ -4021,6 +4027,62 @@
+ @unittest.skipIf(not has_triton(), "requires triton")
+ @unittest.skipIf(not hasattr(torch._C, "_HostTraceVariant"), "requires the native path")
+ class TestDirtyRecords(TestCase):
++    @parametrize("threshold", [-1, 0, 1000])
++    def test_a_split_replay_is_the_whole_replay(self, threshold):
++        # torch._C._host_trace_split: past threshold dirty records the segment's
++        # sub-execs run back to back (each patched while the one before runs);
++        # -1 off, 0 every call that patches, 1000 never here. Outputs bitwise
++        old = torch._C._host_trace_split(threshold)
++        self.addCleanup(torch._C._host_trace_split, old)
++        f = HostTraceReplay(long_chain)
++        before = torch._C._host_trace_split_counts()[:2]
++        for n in (4096, 8192) * 4:
++            x = torch.randn(n, device="cuda")
++            self.assertEqual(f(x), long_chain(x), atol=0, rtol=0)
++        self.assertEqual((f.traces, f.eager, len(f.variants)), (1, 0, 1))
++        calls, builds = (a - b for a, b in zip(torch._C._host_trace_split_counts()[:2], before))
++        self.assertEqual((calls > 0, builds), (True, 1) if threshold == 0 else (False, 0))
++
++    def test_a_split_switch_keeps_each_execs_parameters(self):
++        # with a threshold, a size change (every node reads the size) runs split
++        # and a repeat of the same size and tensors runs whole; switching modes
++        # sets only what each mode's execs lack. Outputs bitwise
++        old = torch._C._host_trace_split(8)
++        self.addCleanup(torch._C._host_trace_split, old)
++        f = HostTraceReplay(long_chain)
++        xs = {n: torch.randn(n, device="cuda") for n in (4096, 8192)}
++        for n in (4096, 8192, 4096, 8192):
++            self.assertEqual(f(xs[n]), long_chain(xs[n]), atol=0, rtol=0)
++        modes = []
++        for n in (4096, 4096, 8192, 8192, 4096):
++            calls = torch._C._host_trace_split_counts()[0]
++            self.assertEqual(f(xs[n]), long_chain(xs[n]), atol=0, rtol=0)
++            modes.append(torch._C._host_trace_split_counts()[0] - calls)
++        # a size change splits; the whole exec catches up behind the split calls
++        self.assertIn(1, modes)
++        self.assertEqual((f.traces, f.eager, len(f.variants)), (1, 0, 1))
++
++    def test_a_split_variant_returns_to_whole_after_catch_up(self):
++        # after sizes alternate (every call split), repeats of one size set the
++        # whole exec's stale nodes behind the split launches, a few per call,
++        # until its patch set is small: those calls launch it whole again
++        old = torch._C._host_trace_split(4)
++        self.addCleanup(torch._C._host_trace_split, old)
++        catch_up = torch._C._host_trace_split_catch_up(6)
++        self.addCleanup(torch._C._host_trace_split_catch_up, catch_up)
++        f = HostTraceReplay(long_chain)
++        xs = {n: torch.randn(n, device="cuda") for n in (4096, 8192)}
++        for n in (4096, 8192) * 3:
++            self.assertEqual(f(xs[n]), long_chain(xs[n]), atol=0, rtol=0)
++        modes = []
++        for _ in range(8):
++            calls = torch._C._host_trace_split_counts()[0]
++            self.assertEqual(f(xs[4096]), long_chain(xs[4096]), atol=0, rtol=0)
++            modes.append(torch._C._host_trace_split_counts()[0] - calls)
++        # split until the whole exec caught up (20 records, 6 per call), then whole
++        self.assertEqual(modes[-3:], [0, 0, 0], modes)
++        self.assertEqual(modes[0], 1, modes)
++
+     def test_a_variant_that_misses_stops_at_its_valid_row(self):
+         # sizes on either side of the branch, each new: the variant tried first is
+         # the other one, which evaluates its guards' rows only and misses; the
+--- step_ms5/torch/_C/__init__.pyi.in	2026-10-15 07:13:38.454624969 -0700
++++ step_ms6/torch/_C/__init__.pyi.in	2026-10-15 09:26:40.669872536 -0700
+@@ -2711,6 +2711,9 @@
+ def _host_trace_kernel_row_switches() -> _int: ...
+ def _host_trace_tma_cache_hits() -> _int: ...
+ def _host_trace_valid_first_misses() -> _int: ...
++def _host_trace_split(threshold: _int | None = None) -> _int: ...
++def _host_trace_split_counts() -> tuple[_int, _int, _int]: ...
++def _host_trace_split_catch_up(n: _int | None = None) -> _int: ...
+ def _host_trace_piece_skips() -> _int: ...
+ def _host_trace_phase_times(enable: _bool) -> list[_int]: ...
+ def _host_trace_static_split(variant: _HostTraceVariant) -> tuple[_int, _int]: ...
+--- step_ms5/torch/cuda/_host_trace_native.py	2026-10-13 15:38:23.524433781 -0700
++++ step_ms6/torch/cuda/_host_trace_native.py	2026-10-15 08:03:08.546285795 -0700
+@@ -306,6 +306,24 @@
+     return (schema.name, schema.overload_name, tuple(args), outputs, target, step.call.state or None, step.call.generator, target in HOST_SEED_OFFSET)
+ 
+ 
++def split_cuts(lowered: Any) -> list[tuple[int, list[int]]]:
++    """Per run (native segment) of the lowered tape, the launch offsets a
++    sub-exec may start at (the executor-level split, torch._C._host_trace_split):
++    no programmatic edge into the launch, and not inside a keyed site's or a
++    selector's node chain or an unjoined fork (_run_starts)."""
++    from torch.cuda._host_trace_memory import _run_starts
++
++    inside = set(_run_starts(lowered))
++    for selector in lowered.selectors:
++        if selector.nodes:
++            inside.update(range(min(selector.nodes) + 1, max(selector.nodes) + 1))
++    out = []
++    for r in (s for s in lowered.steps if isinstance(s, range)):
++        cuts = [c - r.start for c in range(r.start + 1, r.stop) if c not in inside and not getattr(lowered.launches[c].launch, "programmatic", False)]
++        out.append((len(out), cuts))
++    return out
++
++
+ def native_variant(spec: VariantSpec) -> torch._C._HostTraceVariant:
+     """The variant's native object. A malformed spec is the lowering's bug:
+     the suites raise it (raise_unexpected), a user's call declines, noted; a
+--- step_ms5/torch/cuda/_host_trace_replay.py	2026-10-12 07:43:02.342497396 -0700
++++ step_ms6/torch/cuda/_host_trace_replay.py	2026-10-15 08:03:08.547558633 -0700
+@@ -95,6 +95,7 @@
+     MISALIGNED,
+     MISS,
+     native_variant,
++    split_cuts,
+ )
+ from torch.cuda._host_trace_tape import (
+     _active,
+@@ -1515,7 +1516,11 @@
+             lambda step: _eager_step(step, device, opaque.get(id(step))),
+             _Disagreement,
+         )
+-        return _Variant(captured, memory, native_variant(spec))
++        native = native_variant(spec)
++        for g, cuts in split_cuts(captured.lowered):
++            if cuts:
++                native.set_split_cuts(g, cuts)
++        return _Variant(captured, memory, native)
+ 
+ 
+ def _site_classes(sites: Sequence[LoweredKeyedSite]) -> list[int]:

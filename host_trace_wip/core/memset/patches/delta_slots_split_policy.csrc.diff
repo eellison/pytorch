@@ -1,0 +1,285 @@
+diff -ru build_cpp_ms7/src/torch/csrc/cuda/host_trace/Entry.cpp build_cpp_ms8/src/torch/csrc/cuda/host_trace/Entry.cpp
+--- build_cpp_ms7/src/torch/csrc/cuda/host_trace/Entry.cpp	2026-10-15 09:26:25.168742692 -0700
++++ build_cpp_ms8/src/torch/csrc/cuda/host_trace/Entry.cpp	2026-10-15 10:17:21.746614723 -0700
+@@ -1764,6 +1764,14 @@
+   });
+   m.def("_host_trace_tma_cache_hits", [] { return tma_cache_hits; });
+   m.def("_host_trace_valid_first_misses", [] { return valid_first_misses; });
++  m.def("_host_trace_delta_slots", [](std::optional<int64_t> n) {
++    const int64_t old = delta_slots;
++    if (n) {
++      delta_slots = *n;
++    }
++    return old;
++  });
++  m.def("_host_trace_delta_exchanges", [] { return delta_exchanges; });
+   m.def("_host_trace_split", [](std::optional<int64_t> threshold) {
+     const int64_t old = split_threshold;
+     if (threshold) {
+diff -ru build_cpp_ms7/src/torch/csrc/cuda/host_trace/Patch.cpp build_cpp_ms8/src/torch/csrc/cuda/host_trace/Patch.cpp
+--- build_cpp_ms7/src/torch/csrc/cuda/host_trace/Patch.cpp	2026-10-15 09:26:25.168143040 -0700
++++ build_cpp_ms8/src/torch/csrc/cuda/host_trace/Patch.cpp	2026-10-15 11:31:01.823394605 -0700
+@@ -285,6 +285,23 @@
+   };
+   for (uint32_t g = 0; g < segments_.size(); ++g) {
+     const size_t first_pair = rows.size();
++    std::vector<int64_t>& shape = segments_[g].shape_rows;
++    shape.clear();
++    for (size_t i = segments_[g].first; i < segments_[g].stop; ++i) {
++      const Record& r = records_[i];
++      if (r.kind == Kind::Memset && !r.memset.constant_shape) {
++        shape.insert(shape.end(), r.memset.shape_rows.begin(), r.memset.shape_rows.end());
++      } else if (r.kind == Kind::Kernel && !r.kernel.constant_dims) {
++        shape.insert(shape.end(), r.kernel.dim_rows.begin(), r.kernel.dim_rows.end());
++      }
++      if (r.kind == Kind::Kernel && r.site >= 0 && r.site_pos < sites_[r.site].reads.size()) {
++        const auto& d = sites_[r.site].reads[r.site_pos].dim_rows;
++        shape.insert(shape.end(), d.begin(), d.end());
++      }
++    }
++    std::sort(shape.begin(), shape.end());
++    shape.erase(std::unique(shape.begin(), shape.end()), shape.end());
++    segments_[g].whole_shape.clear();
+     for (size_t i = segments_[g].first; i < segments_[g].stop; ++i) {
+       const Record& r = records_[i];
+       const auto record = static_cast<uint32_t>(i);
+@@ -964,19 +981,29 @@
+   }
+   const size_t n = run.stop - run.first;
+   bool split = false;
+-  if (split_threshold >= 0 && !hooks && !run.cuts.empty() && !run.generator) {
+-    // the patch set relative to the form's whole exec
+-    size_t whole = n;
+-    if (form == run.form && !run.split) {
+-      whole = static_cast<size_t>(std::count(dirty_.begin() + run.first, dirty_.begin() + run.stop, 1));
+-    } else if (run.seen.size() > 2 * form) {
+-      thread_local std::vector<uint8_t> marks;
+-      marks.resize(n);
+-      if (changed_since(run, run.seen[2 * form], frame, marks.data())) {
+-        whole = static_cast<size_t>(std::count(marks.begin(), marks.end(), 1));
+-      }
++  const bool splits = split_threshold >= 0 && !hooks && !run.cuts.empty() && !run.generator;
++  // the launch dimensions, memset extents and site rows of the call
++  thread_local std::vector<int64_t> shape;
++  if (splits) {
++    shape.clear();
++    for (int64_t row : run.shape_rows) {
++      shape.push_back(v[row]);
++    }
++    for (size_t site : run.sites) {
++      shape.push_back(frame.site_entries[site]);
++    }
++    if (run.whole_shape.size() < run.execs.size()) {
++      run.whole_shape.resize(run.execs.size());
++    }
++    // a launch configuration the whole exec does not hold (a size change), or
++    // more than split_threshold of its records it has not caught up on
++    const bool config = shape != run.whole_shape[form];
++    size_t stale = 0;
++    if (form != run.form || run.split) {
++      const bool saved = run.seen.size() > 2 * form && run.seen[2 * form].saved && run.seen[2 * form].users_version == users_version_;
++      stale = saved ? static_cast<size_t>(std::count(run.seen[2 * form].dirty.begin(), run.seen[2 * form].dirty.end(), 1)) : n;
+     }
+-    split = static_cast<int64_t>(whole) > split_threshold && split_ready(run, form, frame);
++    split = (config || static_cast<int64_t>(stale) > split_threshold) && split_ready(run, form, frame);
+   }
+   if (form != run.form || split != run.split) {
+     switch_form(run, form, split, frame);
+@@ -1082,9 +1109,13 @@
+       w.dirty.assign(marks.begin(), marks.end());
+       w.saved = true;
+       w.users_version = users_version_;
++      run.whole_shape[form] = shape;
+     }
+   } else {
+     patch_range(-1);
++    if (splits) {
++      run.whole_shape[form] = shape;
++    }
+   }
+   // a replay advances the generator by what the rows' calls take, as eager
+   if (run.generator && running != run.rng_increment) {
+diff -ru build_cpp_ms7/src/torch/csrc/cuda/host_trace/Sites.cpp build_cpp_ms8/src/torch/csrc/cuda/host_trace/Sites.cpp
+--- build_cpp_ms7/src/torch/csrc/cuda/host_trace/Sites.cpp	2026-10-15 08:03:06.352257244 -0700
++++ build_cpp_ms8/src/torch/csrc/cuda/host_trace/Sites.cpp	2026-10-15 10:17:21.746239681 -0700
+@@ -17,6 +17,8 @@
+ int64_t delta_fulls = 0;
+ int64_t delta_rows_evaluated = 0;
+ bool delta_enabled = true;
++int64_t delta_slots = 3;
++int64_t delta_exchanges = 0;
+ int64_t valid_first_misses = 0;
+ bool variant_order_enabled = true;
+ bool placement_reuse_enabled = true;
+@@ -227,7 +229,7 @@
+   frame.cached = this;
+   // whether the memo's reads are the cache's as this call found it; not
+   // after the call changes the cache, until its sites resolve
+-  const bool memo_fresh = site_memo_cache_;
++  bool memo_fresh = site_memo_cache_;
+   site_memo_cache_ = false;
+   // the rows this call changes: none (no dynamic leaf changed) or delta's
+   // (restricted), else every dynamic row
+@@ -247,6 +249,32 @@
+   const std::vector<uint32_t>* valid_rows = &dynamic_valid_rows_;
+   const std::vector<uint32_t>* other_rows = &dynamic_other_rows_;
+   if (delta_enabled && delta_valid_) {
++    auto differing = [&](const int64_t* other) {
++      size_t c = 0;
++      for (size_t j = 0; j < n; ++j) {
++        c += leaves[dynamic_leaves_[j]] != other[j];
++      }
++      return c;
++    };
++    bool exchanged = false;
++    if (delta_slots > 0 && !delta_slots_.empty()) {
++      size_t fewest = differing(delta_leaves_.data());
++      DeltaSlot* best = nullptr;
++      for (DeltaSlot& d : delta_slots_) {
++        size_t c = 0;
++        if (fewest != 0 && d.generation == cached_generation_ &&
++            (c = differing(d.leaves.data())) < fewest) {
++          fewest = c;
++          best = &d;
++        }
++      }
++      if (best) {
++        exchange(*best, v, memo_fresh);
++        best->used = ++delta_tick_;
++        ++delta_exchanges;
++        exchanged = true;
++      }
++    }
+     c10::SmallVector<uint64_t, 4> changed((n + 63) / 64, 0);
+     bool any = false;
+     for (size_t j = 0; j < n; ++j) {
+@@ -263,6 +291,30 @@
+       delta = &delta_rows(changed);
+       valid_rows = &delta->valid_rows;
+       other_rows = &delta->other_rows;
++      // where the call re-evaluates many rows (another size), the cache's are
++      // kept first for a later call at its leaves; a few (a length) are not
++      const size_t m = static_cast<size_t>(std::max<int64_t>(delta_slots, 0));
++      if (!exchanged && m > 0 &&
++          (valid_rows->size() + other_rows->size()) * 8 >= dynamic_rows_.size()) {
++        DeltaSlot* d = nullptr;
++        if (delta_slots_.size() < m) {
++          d = &delta_slots_.emplace_back();
++        } else {
++          d = &*std::min_element(delta_slots_.begin(), delta_slots_.end(), [](const DeltaSlot& x, const DeltaSlot& y) { return x.used < y.used; });
++        }
++        d->generation = cached_generation_;
++        d->used = ++delta_tick_;
++        d->leaves = delta_leaves_;
++        d->rows.resize(dynamic_rows_.size());
++        for (size_t j = 0; j < dynamic_rows_.size(); ++j) {
++          d->rows[j] = v[dynamic_rows_[j]];
++        }
++        d->memo = memo_fresh;
++        d->memo_armed = site_memo_armed_;
++        d->read_values = site_read_values_;
++        d->entries = site_memo_entries_;
++        d->forms = site_memo_forms_;
++      }
+       delta_last_changed_.assign(changed.begin(), changed.end());
+       ++delta_partials;
+     }
+@@ -327,6 +379,22 @@
+   return resolved;
+ }
+ 
++void HostTraceVariant::exchange(DeltaSlot& d, int64_t* v, bool& memo_fresh) {
++  std::swap(delta_leaves_, d.leaves);
++  for (size_t j = 0; j < dynamic_rows_.size(); ++j) {
++    std::swap(v[dynamic_rows_[j]], d.rows[j]);
++  }
++  // the rows changed without a delta: mark_dirty compares them
++  delta_marked_ = false;
++  std::swap(site_read_values_, d.read_values);
++  std::swap(site_memo_armed_, d.memo_armed);
++  std::swap(site_memo_entries_, d.entries);
++  std::swap(site_memo_forms_, d.forms);
++  const bool kept = d.memo && site_read_values_.size() == site_reads_.size();
++  d.memo = memo_fresh;
++  memo_fresh = kept;
++}
++
+ void HostTraceVariant::release(Frame& frame) {
+   if (frame.cached == this) {
+     cached_values_ = std::move(frame.values);
+@@ -395,6 +463,7 @@
+   site_memo_cache_ = false;
+   delta_valid_ = delta_marked_ = false;
+   delta_memo_.clear();
++  delta_slots_.clear();
+   delta_last_changed_.clear();
+   dynamic_pairs_.clear();
+   dynamic_pair_arguments_.clear();
+diff -ru build_cpp_ms7/src/torch/csrc/cuda/host_trace/Variant.h build_cpp_ms8/src/torch/csrc/cuda/host_trace/Variant.h
+--- build_cpp_ms7/src/torch/csrc/cuda/host_trace/Variant.h	2026-10-15 09:26:25.168336417 -0700
++++ build_cpp_ms8/src/torch/csrc/cuda/host_trace/Variant.h	2026-10-15 11:31:14.343225472 -0700
+@@ -79,6 +79,11 @@
+ extern int64_t delta_fulls;
+ extern int64_t delta_rows_evaluated;
+ extern bool delta_enabled;
++// the static-prefix delta cache keeps up to this many other calls' dynamic
++// rows besides its own (sizes that alternate re-evaluate nothing)
++extern int64_t delta_slots;
++// test-only: calls whose cache was exchanged with a kept call's
++extern int64_t delta_exchanges;
+ // test-only: full evaluations that stopped at a valid row that does not hold
+ extern int64_t valid_first_misses;
+ // a family tries first the variant that last served the dynamic sizes (else
+@@ -94,9 +99,11 @@
+ extern bool placement_reuse_enabled;
+ // a form switch restores what the form's exec last held (else forgets it)
+ extern bool form_held_enabled;
+-// executor-level split (opt-in): a call whose patch set relative to its
+-// form's whole exec has more than split_threshold records launches the form's
+-// sub-execs back to back instead, patching each while the one before it runs;
++// executor-level split (opt-in): a call that changes a launch configuration
++// its form's whole exec holds (a launch dimension, memset extent or site row:
++// a size change), or whose whole exec has more than split_threshold records
++// not yet caught up, launches the form's sub-execs back to back instead,
++// patching each while the one before it runs; args-only calls launch whole.
+ // -1: off
+ extern int64_t split_threshold;
+ // test-only: calls launched split, and forms whose sub-execs were built
+@@ -533,6 +540,11 @@
+     std::vector<Seen> seen; // per state
+     // the rows its records read (index_users)
+     std::vector<int64_t> read_rows;
++    // and those its launch dimensions and memset extents read (index_users);
++    // per form, their values and the site rows when its whole exec was last
++    // patched (empty: unknown), for the split policy
++    std::vector<int64_t> shape_rows;
++    std::vector<std::vector<int64_t>> whole_shape;
+     // the active state's mode: the form's sub-execs (Split), else its exec
+     bool split = false;
+     // the lowering's safe cut points (record offsets: no programmatic edge
+@@ -894,6 +906,25 @@
+     uint64_t site_reads_version = 0;
+   };
+   DeltaRows& delta_rows(c10::ArrayRef<uint64_t> changed);
++  // up to delta_slots other calls' dynamic rows (of
++  // the cache's generation), and the site memo with them: a call whose dynamic
++  // leaves are nearer one's than the cache's (sizes that alternate) exchanges
++  // it with the cache before its delta
++  struct DeltaSlot {
++    uint64_t generation = 0;
++    uint64_t used = 0;
++    std::vector<int64_t> leaves; // per dynamic_leaves_
++    std::vector<int64_t> rows; // per dynamic_rows_
++    bool memo = false; // site_memo_cache_ then
++    int64_t memo_armed = -1;
++    std::vector<int64_t> read_values;
++    std::vector<int64_t> entries;
++    std::vector<int32_t> forms;
++  };
++  // the cache's dynamic rows and memo exchanged with d's
++  void exchange(DeltaSlot& d, int64_t* v, bool& memo_fresh);
++  std::vector<DeltaSlot> delta_slots_;
++  uint64_t delta_tick_ = 0;
+   std::vector<int64_t> delta_leaves_;
+   std::vector<DeltaRows> delta_memo_;
+   std::vector<uint64_t> delta_last_changed_;

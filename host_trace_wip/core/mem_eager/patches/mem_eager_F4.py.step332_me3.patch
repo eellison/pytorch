@@ -1,0 +1,536 @@
+diff -ru '--exclude=__pycache__' '--exclude=TREE.txt' step332_me3/test/test_cuda_host_trace_harvest.py step332_me4/test/test_cuda_host_trace_harvest.py
+--- step332_me3/test/test_cuda_host_trace_harvest.py	2026-10-14 16:49:45.319070530 -0700
++++ step332_me4/test/test_cuda_host_trace_harvest.py	2026-10-14 22:08:48.842112937 -0700
+@@ -33,7 +33,7 @@
+     from torch.cuda._host_trace_harvest import _launch, HarvestProvider
+     from torch.cuda._host_trace_opaque import library_state, OpaqueKernel, OpaqueKey
+     from torch.cuda._host_trace_replay import _BACKGROUND, HostTraceReplay
+-    from torch.cuda._host_trace_tape import EagerCall, trace
++    from torch.cuda._host_trace_tape import _Witness, EagerCall, trace
+ 
+ aten = torch.ops.aten
+ bf16 = torch.bfloat16
+@@ -667,6 +667,29 @@
+         steps = [rec for v in r.variants for _, rec in v.tape.launches if type(rec) is EagerCall]
+         self.assertEqual(steps, [])
+ 
++    def test_same_is_bitwise_by_a_chunked_digest(self):
++        # verify's compare: bits in index order (+0/-0 and NaN payloads differ), any
++        # strides, across chunk boundaries, with temporaries of chunks, not of the tensor
++        a = torch.randn(3000, 1700, device="cuda")
++        self.assertTrue(harvest._same(a, a.clone()))
++        self.assertTrue(harvest._same(a.t(), a.t().contiguous()))
++        b = a.clone()
++        b[2999, 1699] = torch.nextafter(b[2999, 1699], torch.tensor(float("inf"), device="cuda"))
++        self.assertFalse(harvest._same(a, b))
++        z = torch.zeros(5, device="cuda")
++        self.assertFalse(harvest._same(z, -z))
++        n = torch.full((5,), float("nan"), device="cuda")
++        m = n.clone()
++        m.view(torch.int32)[2] += 1
++        self.assertFalse(harvest._same(n, m))
++        self.assertFalse(harvest._same(a, a.flip(0)))
++        h = torch.randn(1 << 28, device="cuda", dtype=bf16)  # 512 MiB
++        torch.cuda.synchronize()
++        torch.cuda.reset_peak_memory_stats()
++        base = torch.cuda.memory_allocated()
++        self.assertTrue(harvest._same(h, h))
++        self.assertLess(torch.cuda.max_memory_allocated() - base, 128 << 20)
++
+     def test_a_learn_leaves_no_reserved_memory(self):
+         # nothing of verify's outlives the learn: its buffers come from a pool
+         # of their own, which goes back to the device when the harvest is
+@@ -744,28 +767,6 @@
+         torch.cuda.synchronize()
+         self.assertEqual(torch.addmm(*args), torch.addmm(*args), atol=0, rtol=0)
+ 
+-    def test_a_conv_learn_frees_its_probe_outputs_before_its_captures(self):
+-        # a convolution's harvest reads only its fresh outputs' layouts: the
+-        # learn drops _learn's probe outputs before it captures
+-        seen = []
+-        harvest_ = HarvestProvider._harvest
+-
+-        def spy(provider, key, args, kwargs, operands, *rest, **kw):
+-            seen.append([o.device.type for o in operands])
+-            return harvest_(provider, key, args, kwargs, operands, *rest, **kw)
+-
+-        def fn(x, w):
+-            return torch.nn.functional.conv2d(x, w)
+-
+-        x, w = torch.randn(8, 16, 32, 32, device="cuda"), torch.randn(32, 16, 3, 3, device="cuda")
+-        r = HostTraceReplay(fn, opaque=(HarvestProvider(("conv",)),))
+-        with mock.patch.object(HarvestProvider, "_harvest", spy):
+-            for _ in range(3):
+-                self.assertEqual(r(x, w), fn(x, w))
+-        self.assertGreater(r.replays, 0)
+-        self.assertTrue(seen)
+-        self.assertEqual({tuple(s) for s in seen}, {("cuda", "cuda", "meta")})
+-
+     def learned_on(self, fn, *args):
+         # the operand positions each trace-time learn read live tensors at,
+         # and the calls' outputs
+@@ -777,11 +778,31 @@
+             return learn_(replay, op, provider, call, key, real, **kwargs)
+ 
+         r = HostTraceReplay(fn)
+-        with mock.patch.object(HostTraceReplay, "_learn", spy):
++        # the trace's own learn (bind_opaque's, as a trace without a warm-up has it)
++        with mock.patch.object(HostTraceReplay, "_learn", spy), mock.patch.object(_Witness, "_learn", lambda *a: None):
+             outs = [r(*args) for _ in range(3)]
+         self.assertGreater(r.replays, 0)
+         return lents, outs
+ 
++    def test_a_trace_learns_at_the_warm_up_call(self):
++        # the warm-up's call learns its key on its live inputs and output: the
++        # trace binds it, and no learn of stand-ins runs
++        calls = []
++        learn_ = HostTraceReplay._learn
++
++        def spy(replay, *args, **kwargs):
++            calls.append(args[0])
++            return learn_(replay, *args, **kwargs)
++
++        x, w = torch.randn(256, 512, device="cuda"), torch.randn(512, 384, device="cuda")
++        r = HostTraceReplay(torch.mm)
++        with mock.patch.object(HostTraceReplay, "_learn", spy):
++            for _ in range(3):
++                self.assertBitwise(r(x, w), torch.mm(x, w))
++        self.assertEqual(calls, [])
++        self.assertGreater(r.replays, 0)
++        self.assertEqual(r.eager, 1)
++
+     def test_a_trace_learns_on_its_live_operands(self):
+         # at the trace a GEMM's operands that are the call's arguments and its
+         # output are live: the learn reads them, the op does not run again,
+@@ -2298,9 +2319,10 @@
+             self.assertEqual(r(x, w), f(x, w), atol=0, rtol=0)
+ 
+     def test_a_structural_refusal_holds_for_the_layout_class(self):
+-        # the op's kernels refuse (a memcpy node) at its first key; a key at
+-        # another size of its layout class refuses too, with no harvest, and
+-        # the call stays a plain eager step of one variant
++        # the op's kernels refuse (a memcpy node) at its first key, learned at
++        # the warm-up's call; a key at another size of its layout class refuses
++        # too, with no harvest, and the call stays a plain eager step of one
++        # variant, traced once
+         op = torch.ops.ht_extern.copy_twice.default
+ 
+         def f(x):
+@@ -2320,7 +2342,7 @@
+         transposed = OpaqueKey(op, (f32, f32), ((8, 64), (8, 64)), ((1, 8), (64, 1)), (0, 0), (), torch.cuda.current_device(), library_state())
+         self.assertIsNone(p.refusal(transposed))
+         self.assertIsNotNone(p.refusal(dataclasses.replace(transposed, strides=((64, 1), (64, 1)))))
+-        self.assertEqual((p.harvests, r.traces), (1, 2))
++        self.assertEqual((p.harvests, r.traces), (1, 1))
+ 
+     def test_prepare_range(self):
+         # every size of a range prepared: a first call at any of them learns
+diff -ru '--exclude=__pycache__' '--exclude=TREE.txt' step332_me3/test/test_cuda_host_trace_opaque.py step332_me4/test/test_cuda_host_trace_opaque.py
+--- step332_me3/test/test_cuda_host_trace_opaque.py	2026-10-12 13:08:50.777612149 -0700
++++ step332_me4/test/test_cuda_host_trace_opaque.py	2026-10-14 22:08:48.844703416 -0700
+@@ -341,9 +341,9 @@
+             self.assertEqual(f(x, y), mul_chain(x, y))
+         self.assertEqual(len(p.learned), 1)
+         self.assertIsNone(p.table[p.learned[0][0]])
+-        # the refusal traced it again as a plain eager step: that variant
+-        # does not learn, so its calls run natively
+-        self.assertEqual(f.traces, 2)
++        # the warm-up refused it at its call, so the trace records it as a plain
++        # eager step: that variant does not learn, so its calls run natively
++        self.assertEqual(f.traces, 1)
+         refused = [v for v in f.variants if not v.learns]
+         self.assertEqual(len(refused), 1)
+         records = [r for _, r in refused[0].tape.launches]
+@@ -475,7 +475,7 @@
+ 
+     def test_an_unrecordable_binding_is_an_eager_step(self):
+         # the key binds, but the trace cannot record the binding (a
+-        # device-updatable node): traced once more, as a plain eager step
++        # device-updatable node): a plain eager step
+         from cuda.bindings import driver
+ 
+         updatable = driver.CUlaunchAttributeID.CU_LAUNCH_ATTRIBUTE_DEVICE_UPDATABLE_KERNEL_NODE
+@@ -486,7 +486,7 @@
+         x, y = torch.randn(512, device="cuda"), torch.randn(512, device="cuda")
+         for _ in range(8):
+             self.assertEqual(f(x, y), mul_chain(x, y))
+-        self.assertEqual((f.traces, len(f.variants), len(bound(f))), (2, 2, 1))
++        self.assertEqual((f.traces, len(f.variants), len(bound(f))), (1, 1, 1))
+         eager = [r for _, r in bound(f)[0].tape.launches if type(r) is EagerCall]
+         self.assertEqual(len(eager), 1)
+         self.assertTrue(eager[0].reason.endswith("device-updatable"))
+diff -ru '--exclude=__pycache__' '--exclude=TREE.txt' step332_me3/torch/cuda/_host_trace_harvest.py step332_me4/torch/cuda/_host_trace_harvest.py
+--- step332_me3/torch/cuda/_host_trace_harvest.py	2026-10-14 21:18:53.447854432 -0700
++++ step332_me4/torch/cuda/_host_trace_harvest.py	2026-10-14 22:08:48.846780804 -0700
+@@ -241,6 +241,12 @@
+     pass
+ 
+ 
++class _NotBitwise(Exception):
++    # eager does not give the call's outputs bitwise again: verify on copies,
++    # with its spread
++    pass
++
++
+ class _NoSibling(Exception):
+     # the key is harvested in full after all
+     pass
+@@ -380,13 +386,53 @@
+             dev.checks = None
+ 
+ 
++# _digest's words per chunk: its temporaries are a few int64 buffers this long
++_DIGEST_CHUNK = 1 << 19
++# splitmix64's constants (as int64), and the two lanes' seeds
++_GOLDEN, _MIX1, _MIX2 = -0x61C8864680B583EB, -0x40A7B892E31B1A47, -0x6B2FB644ECCEEE15
++_LANES = (0x2545F4914F6CDD1D, 0x1B873593A1E5F2C7)
++
++
++def _chunks(x: torch.Tensor, n: int):
++    # x's elements in index order as 1-D pieces of at most about n elements
++    # (a piece of a non-contiguous tensor is a copy of that piece only)
++    if x.numel() <= n or x.dim() == 0:
++        yield x.reshape(-1)
++        return
++    d = next(i for i in range(x.dim()) if x.shape[i] > 1)
++    rows = max(1, n * x.shape[d] // x.numel())
++    for piece in x.split(rows, d):
++        yield from _chunks(piece.squeeze(d) if rows == 1 else piece, n)
++
++
++def _digest(t: torch.Tensor) -> torch.Tensor:
++    """A strong digest of t's bits in index order: per element of its integer
++    view of the same itemsize, splitmix64 of the element plus its index times
++    the golden ratio, plus a lane's seed, summed per lane (two lanes, 128
++    bits). Integer arithmetic throughout, so it does not depend on the order a
++    reduction takes; the temporaries are _DIGEST_CHUNK words long."""
++    if t.is_complex():
++        t = torch.view_as_real(t)
++    x = t.view(_BITS[t.element_size()])
++    out = torch.zeros(len(_LANES), dtype=torch.int64, device=t.device)
++    base = 0
++    for piece in _chunks(x, _DIGEST_CHUNK):
++        v0 = piece.to(torch.int64) + (torch.arange(base, base + piece.numel(), device=t.device) * _GOLDEN)
++        base += piece.numel()
++        for lane, seed in enumerate(_LANES):
++            v = v0 + seed
++            v = (v ^ ((v >> 30) & ((1 << 34) - 1))) * _MIX1
++            v = (v ^ ((v >> 27) & ((1 << 37) - 1))) * _MIX2
++            v = v ^ ((v >> 31) & ((1 << 33) - 1))
++            out[lane] += v.sum()
++    return out
++
++
+ def _same(a: torch.Tensor, b: torch.Tensor) -> bool:
+-    """Whether two tensors of one layout hold the same bits: +0 and -0, and NaN
+-    payloads, are told apart. Compared as the integer view of the same
+-    itemsize, at any strides, with no copy."""
+-    if a.is_complex():
+-        a, b = torch.view_as_real(a), torch.view_as_real(b)
+-    return torch.equal(a.view(_BITS[a.element_size()]), b.view(_BITS[b.element_size()]))
++    """Whether two tensors of one shape hold the same bits in index order (+0
++    and -0, and NaN payloads, told apart): their _digests, which allocate
++    chunks, not a buffer the size of either."""
++    return torch.equal(_digest(a), _digest(b))
+ 
+ 
+ def _patched(image: bytes, off: int, q: int) -> bytes:
+@@ -476,7 +522,8 @@
+             t.fill_(value)
+ 
+     def touched(self, value: int) -> bool:
+-        return any(bool((t != value).any()) for t in self.tensors)
++        # in slices: a window is up to 66 MiB, a whole compare's bool buffer as big
++        return any(bool((c != value).any()) for t in self.tensors for c in t.split(1 << 22))
+ 
+     def close(self) -> None:
+         torch.cuda.synchronize()
+@@ -1075,13 +1122,6 @@
+         self, key: OpaqueKey, args: tuple, kwargs: dict, operands: list[Any]
+     ) -> OpaqueBinding | None:
+         k = self._normal(key)
+-        if key.op in _CONV or key.op in _ATTENTION:
+-            # a convolution's or attention's harvest reads only its fresh
+-            # outputs' layouts: dropped from `operands` now, so a learn's probe
+-            # outputs (_learn's, which the list alone holds) are freed before
+-            # its captures
+-            placed = sum(isinstance(a, torch.Tensor) for a in pytree.tree_leaves((args, kwargs)))
+-            operands[placed:] = [torch.empty_strided(o.shape, o.stride(), dtype=o.dtype, device="meta") for o in operands[placed:]]
+         with self._lock, torch.cuda.device(key.device):
+             if k in self.bindings:
+                 return self.bindings[k]
+@@ -1418,7 +1458,10 @@
+                 dev.checks = torch.cuda.MemPool()
+             try:
+                 with torch.cuda.use_mem_pool(dev.checks, device):
+-                    return checked(binding, variants, hits, misaligned, mirrors, names)
++                    try:
++                        return checked(binding, variants, hits, misaligned, mirrors, names)
++                    except _NotBitwise:
++                        return checked(binding, variants, hits, misaligned, mirrors, names, live=False)
+             finally:
+                 if mirrors is not None:
+                     mirrors.close()
+@@ -1430,6 +1473,7 @@
+             misaligned: list[tuple[int, int, int, int]],
+             mirrors: _Mirrors | None,
+             names: list,
++            live: bool = True,
+         ) -> OpaqueBinding:
+             nodes, increment = binding.nodes, binding.rng_increment
+             first = len(binding.scratch)
+@@ -1528,6 +1572,58 @@
+ 
+                 def untouched() -> str | None:
+                     return None
++
++            elif live and not rng and op not in self.extern and op not in _UNORDERED and not any(a.alias_info and a.alias_info.is_write for a in op._schema.arguments) and not any(
++                t.is_floating_point() and t.numel() > 1 and bool(t.amin() == t.amax()) for t in operands[:placed]
++            ):
++                # the binding on the call's own tensors (live at a learn at the
++                # call; a missed bind's; _learn's stand-ins and its probe's
++                # outputs), nothing copied: the outputs' and inputs' digests
++                # taken, each launch into the outputs (filled 0xFF first) and
++                # everything digested again. A mismatch reruns eager into the
++                # outputs, which also tells whether eager reproduces them
++                # bitwise; if not, verify runs on copies (_NotBitwise). A
++                # constant input (all zeros, say) would pass a wrong binding:
++                # verified on copies too
++                # the outputs the binding writes (another, a CPU seed say, is the op's own)
++                referenced = {t.index for n in nodes for t in _slots(n) if t.kind == "operand"}
++                ins = operands[:placed]
++                live_outs = [o for i, o in enumerate(operands[placed:]) if placed + i in referenced]
++                ptrs = [t.data_ptr() for t in operands]
++                want, held = [_digest(o) for o in live_outs], [_digest(t) for t in ins]
++                it = iter(ins)
++                call_args, call_kwargs = pytree.tree_unflatten([next(it) if isinstance(a, torch.Tensor) else a for a in leaves], spec)
++
++                def eager() -> bool:
++                    # the outputs back as the call left them; whether eager gave them bitwise again
++                    result = op(*call_args, **call_kwargs)
++                    fresh = _fresh([result] if len(returns) == 1 else list(result or ()), returns)
++                    fresh = [f for i, f in enumerate(fresh) if placed + i in referenced]
++                    again = all(torch.equal(_digest(f), w) for f, w in zip(fresh, want))
++                    for o, f in zip(live_outs, fresh):
++                        o.copy_(f)
++                    return again
++
++                def run(b: OpaqueBinding, fill: int) -> str | None:
++                    for o in live_outs:
++                        o.view(_BITS[o.element_size()]).fill_(-1)
++                    try:
++                        why = launch(b, ptrs, fill)
++                    except _Disabled:
++                        eager()
++                        raise
++                    wrong = [i for i, (t, d) in enumerate(zip(ins, held)) if not torch.equal(_digest(t), d)]
++                    if wrong:
++                        eager()
++                        raise RuntimeError(f"host_trace: the harvested launch of {names} wrote input {wrong[0]} of {op}")
++                    if why is None and all(torch.equal(_digest(o), w) for o, w in zip(live_outs, want)):
++                        return None
++                    if not eager() and why is None:
++                        raise _NotBitwise
++                    return why or f"the binding's launch differs from eager at its outputs ({names})"
++
++                def untouched() -> str | None:
++                    return None
+ 
+             else:
+                 # the binding on fresh random operands at the key's layouts and
+diff -ru '--exclude=__pycache__' '--exclude=TREE.txt' step332_me3/torch/cuda/_host_trace_opaque.py step332_me4/torch/cuda/_host_trace_opaque.py
+--- step332_me3/torch/cuda/_host_trace_opaque.py	2026-10-14 16:49:45.323674394 -0700
++++ step332_me4/torch/cuda/_host_trace_opaque.py	2026-10-14 22:08:48.848712751 -0700
+@@ -262,9 +262,8 @@
+     ) -> OpaqueBinding | None:
+         """At a replay whose bind missed, right after the call ran eagerly on
+         the current stream: `operands` are its real tensors in operand order,
+-        the fresh outputs holding its result. The provider may replace the
+-        list's entries (a fresh output it reads only the layout of), so the
+-        caller keeps no reference of its own to what it needs freed. The
++        the fresh outputs holding its result, which the provider may write
++        while it checks a binding (they hold the result again after). The
+         provider caches a refusal itself."""
+         ...
+ 
+@@ -360,6 +359,27 @@
+     return key, symbolic
+ 
+ 
++def real_key(op: OpOverload, args: tuple, kwargs: dict, fresh: list) -> OpaqueKey:
++    """trace_key's key for a call on real tensors (the warm-up's call, its
++    fresh outputs `fresh`): the same values, read off the tensors."""
++    from torch.cuda._host_trace_lower_tape import _opaque_key
++
++    leaves = pytree.tree_leaves((args, kwargs))
++    inputs = [t for t in leaves if isinstance(t, torch.Tensor)]
++    operands = [*inputs, *fresh]
++    on: dict[int, list[tuple[int, int]]] = {}
++    for i, t in enumerate(inputs):
++        on.setdefault(t.untyped_storage().data_ptr(), []).append((i, t.storage_offset() * t.element_size()))
++    pairs, distances = [], []
++    for (lead, low), *rest in on.values():
++        for i, at in rest:
++            pairs.append((i, lead))
++            distances.append(at - low)
++    ints = [*(n for t in operands for n in t.shape), *(n for t in operands for n in t.stride()), *(t.data_ptr() % 256 for t in operands), *distances]
++    scalars = tuple(v for v in leaves if not isinstance(v, torch.Tensor))
++    return _opaque_key(op, tuple(t.dtype for t in operands), tuple(t.dim() for t in operands), scalars, operands[0].device.index, library_state(), ints, tuple(pairs))
++
++
+ def key_guards(call: Any, key: OpaqueKey) -> list[Any] | None:
+     """That the opaque call `call`'s record is at `key`, as conditions in
+     the tape's symbols (sympy): the values bind_at_trace guards at a refused
+diff -ru '--exclude=__pycache__' '--exclude=TREE.txt' step332_me3/torch/cuda/_host_trace_replay.py step332_me4/torch/cuda/_host_trace_replay.py
+--- step332_me3/torch/cuda/_host_trace_replay.py	2026-10-14 16:49:45.325675813 -0700
++++ step332_me4/torch/cuda/_host_trace_replay.py	2026-10-14 22:08:48.850539609 -0700
+@@ -865,6 +865,14 @@
+                     self._learn(site.op, site.provider, site.call, k)
+         del pool
+ 
++    def _learn_at_call(self, provider: OpaqueProvider, key: OpaqueKey, args: tuple, kwargs: dict, operands: list[Any]) -> None:
++        """A key the trace's warm-up learns at its call, on the call's live
++        tensors (trace's `learn`), so the trace binds it with no stand-ins
++        (_learn's); with learn_pool, in a pool dropped after it."""
++        pool = torch.cuda.MemPool() if self.learn_pool else None
++        with torch.no_grad(), torch.cuda.use_mem_pool(pool, key.device) if pool is not None else contextlib.nullcontext():
++            self.learned += provider.learn(key, args, kwargs, operands) is not None
++
+     def _learn(
+         self,
+         op: OpOverload,
+@@ -937,7 +945,7 @@
+             tensors.append(flat.as_strided(sizes, strides))
+         given, scalars = iter(tensors), iter(key.scalars)
+         args, kwargs = pytree.tree_unflatten([next(given) if j in positions else next(scalars) for j in range(spec.num_leaves)], spec)
+-        out, fresh = None, []
++        fresh = []
+         if len(metadata) > inputs and all(j in mine for j in range(inputs, len(metadata))):
+             # the call's own outputs, holding the op's result
+             fresh = [mine[j] for j in range(inputs, len(metadata))]
+@@ -955,10 +963,7 @@
+         want = [(dtype, sizes, strides, 0) for dtype, sizes, strides, _ in metadata[inputs:]]
+         if [(o.dtype, tuple(o.shape), o.stride(), o.storage_offset()) for o in fresh] != want:
+             return None
+-        # the list alone holds the probe's outputs: a provider may drop them (HarvestProvider.learn)
+-        operands = tensors + fresh
+-        del out, fresh
+-        binding = provider.learn(key, args, kwargs, operands)
++        binding = provider.learn(key, args, kwargs, tensors + fresh)
+         self.learned += binding is not None
+         self.learn_s += time.perf_counter() - start
+         return binding
+@@ -1159,6 +1164,7 @@
+                         check_escapes=self.check_escapes,
+                         eager_ops=eager_ops,
+                         declined_compiles=self._declined_compiles,
++                        learn=self._learn_at_call if oob_learn and not self.background else None,
+                     )
+                 if not ran:
+                     ran, result = warm_up, tape.warm_up_result
+diff -ru '--exclude=__pycache__' '--exclude=TREE.txt' step332_me3/torch/cuda/_host_trace_tape.py step332_me4/torch/cuda/_host_trace_tape.py
+--- step332_me3/torch/cuda/_host_trace_tape.py	2026-10-14 16:49:45.327194765 -0700
++++ step332_me4/torch/cuda/_host_trace_tape.py	2026-10-14 22:08:48.852481349 -0700
+@@ -43,7 +43,7 @@
+ from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode, unset_fake_temporarily
+ from torch.cuda import _host_trace_hint_audit as _hint_audit, _host_trace_ir as _ir
+ from torch.cuda._host_trace import _drop_tracebacks, _TraceShapeEnv, Declined, declined, ProcessHold
+-from torch.cuda._host_trace_opaque import bind_at_trace, library_state, library_state_as, record_binding, trace_key
++from torch.cuda._host_trace_opaque import bind_at_trace, library_state, library_state_as, real_key, record_binding, takes_generator, trace_key
+ from torch.cuda._utils import _check_cuda_bindings
+ from torch.fx.experimental import _config as fx_config
+ from torch.fx.experimental.symbolic_shapes import free_symbols, free_unbacked_symbols
+@@ -396,6 +396,9 @@
+         # argument positions i < j, where a step not run eagerly writes one
+         # and reads the other (Tape.argument_pairs)
+         self.argument_pairs: set[tuple[int, int]] = set()
++        # the keys the warm-up learned at their calls: their calls stay
++        # OpaqueCalls, bound after the trace as a learned key's are (bind_opaque)
++        self.warm_learned: set[Any] = set()
+         self.int_inputs: list[_IntInputRec] = []
+         self.allocs: list[_AllocRec] = []
+         # allocation k's symbol is alloc<first_alloc + k>: bind_opaque's follow its tape's
+@@ -1177,6 +1180,9 @@
+             pending = {id(o._root) for o in self.eager_outputs if any(self.values(n) == 1 for n in o.shape)}
+             if binding is not None and any(isinstance(t, _TracedTensor) and id(t._root) in pending for t in leaves):
+                 binding = None
++            # a key the warm-up learned binds after the trace, as one learned then would
++            if binding is not None and trace_key(func, args, kwargs, fakes, self.values)[0] in self.warm_learned:
++                binding = None
+             if refusal is not None:
+                 provider, reasons, state = None, [refusal], library_state()
+         if provider is not None:
+@@ -3041,8 +3047,10 @@
+     def _should_skip_dynamo(cls):
+         return False
+ 
+-    def __init__(self, opaque: Sequence[OpaqueProvider] = ()) -> None:
++    def __init__(self, opaque: Sequence[OpaqueProvider] = (), learn: Callable[..., Any] | None = None) -> None:
+         super().__init__()
++        self.learn = learn
++        self.learned: set[Any] = set()  # the keys learn ran at
+         self.calls: dict[tuple, list[list[tuple]]] = {}
+         self.order: list[tuple] = []
+         # per call its tensor outputs, weakly; after the warm-up those it
+@@ -3064,6 +3072,20 @@
+             return None
+         return kernel
+ 
++    def _learn(self, func: Any, args: tuple, kwargs: dict, out: Any) -> None:
++        # a call the trace keys, learned at the call on its live inputs and
++        # output (as a replay's missed bind learns, _eager_step): the trace then
++        # binds it with no stand-ins (HostTraceReplay._learn's)
++        provider = next((p for p in self.opaque if p.accepts(func, args, kwargs) is None), None)
++        if provider is None:
++            return
++        rets = [out] if len(func._schema.returns) == 1 else list(out or ())
++        fresh = [o for r, ret in zip(func._schema.returns, rets) if r.alias_info is None for o in pytree.tree_leaves(ret) if isinstance(o, torch.Tensor)]
++        key = real_key(func, args, kwargs, fresh)
++        if provider.bind(key) is None and provider.refusal(key) is None:
++            self.learned.add(key)
++            self.learn(provider, key, args, kwargs, [*(t for t in pytree.tree_leaves((args, kwargs)) if isinstance(t, torch.Tensor)), *fresh])
++
+     def __torch_dispatch__(self, func, types, args: tuple = (), kwargs=None):
+         kwargs = kwargs or {}
+         if (body := self._body(func, args, kwargs)) is not None:
+@@ -3080,6 +3102,8 @@
+             out = tuple(seed_offset_on_device(func, list(out), args[0].device))
+         if func is aten.detach.default:
+             return out
++        if self.learn is not None and not self.depth and not takes_generator(func):
++            self._learn(func, args, kwargs, out)
+         key = _call_key(func, args, kwargs, None)
+         tensors = [o for o in pytree.tree_leaves(out) if isinstance(o, torch.Tensor)]
+         self.calls.setdefault(key, []).append([_real_layout(o) for o in tensors])
+@@ -3243,9 +3267,13 @@
+     check_escapes: bool = False,
+     eager_ops: Mapping[int, str] | None = None,
+     declined_compiles: set[Any] | None = None,
++    learn: Callable[..., Any] | None = None,
+ ) -> Tape:
+     """Trace one call fn(*args). Tensor arguments become traced tensors and
+     int arguments symbols; every other argument is a constant of the tape.
++    With `learn`, learn(provider, key, args, kwargs, operands) runs at the
++    warm-up's call of each op a provider accepts whose key neither binds nor
++    is refused, on the call's live tensors (its inputs, then its fresh outputs).
+     With `warm_up` fn first runs once on the real arguments, so what it
+     initializes on first use happens outside the trace; a warm-up that
+     changes a tensor argument's metadata declines, an eager call whose fake
+@@ -3313,7 +3341,7 @@
+         result, witness = None, None
+         if warm_up:
+             before = [_metadata(args[i]) for i in positions]
+-            with _Witness(opaque) as witness:
++            with _Witness(opaque, learn) as witness:
+                 result = fn(*args)
+             # not at the mode's exit: a higher-order op's impl enters it again
+             witness.outputs = [[r() for r in refs] for refs in witness.outputs]
+@@ -3329,6 +3357,8 @@
+         try:
+             with _gc_hold, _capture(device), intercepting(), cute_intercepting():
+                 tr = _Trace(device, trusted, opaque, static_shapes, check_escapes, eager_ops, declined_compiles=declined_compiles)
++                if witness is not None:
++                    tr.warm_learned = witness.learned
+                 out, traced = _symbolic_run(tr, fn, args, positions, int_positions)
+                 result_kind, outputs = _output_records(out, traced, positions)
+                 if witness is not None:

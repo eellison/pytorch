@@ -1,0 +1,221 @@
+diff -ru '--exclude=__pycache__' '--exclude=TREE.txt' step332_me7/test/inductor/test_cudagraph_host_trace.py step332_me8/test/inductor/test_cudagraph_host_trace.py
+--- step332_me7/test/inductor/test_cudagraph_host_trace.py	2026-10-15 03:58:15.597880755 -0700
++++ step332_me8/test/inductor/test_cudagraph_host_trace.py	2026-10-15 04:19:09.613395258 -0700
+@@ -684,6 +684,35 @@
+         self.assertLessEqual(first_backward_peak("reduce-overhead"), default + (1 << 20))
+         self.assertEqual([i.replay.eager for i in self.installed], [1, 1])
+ 
++    def test_the_trace_call_frees_its_inputs_at_last_use(self):
++        # the call that traces warms up on the boxed list's references too
++        # (TraceHandback), the trace reading the dropped inputs' stand-ins: a
++        # backward's saved activations go as it consumes them, so its peak is
++        # the default compile's steady one but for its learns (a workspace,
++        # the 64 MiB of test_a_learn_costs_at_most_its_workspace)
++        def backward_peaks(mode):
++            torch._dynamo.reset()
++            torch.manual_seed(0)
++            model = torch.nn.Sequential(*(torch.nn.Sequential(torch.nn.Linear(4096, 4096, bias=False), torch.nn.ReLU()) for _ in range(4))).cuda()
++            compiled = torch.compile(model, mode=mode)
++            x = torch.randn(4096, 4096, device="cuda")
++            peaks = []
++            for _ in range(3):
++                model.zero_grad(set_to_none=True)
++                loss = compiled(x).sum()
++                torch.cuda.synchronize()
++                base = torch.cuda.memory_allocated()
++                torch.cuda.reset_peak_memory_stats()
++                loss.backward()
++                del loss
++                torch.cuda.synchronize()
++                peaks.append(torch.cuda.max_memory_allocated() - base)
++            return peaks
++
++        steady = backward_peaks(None)[2]
++        self.assertLessEqual(backward_peaks("reduce-overhead")[1], steady + (64 << 20))
++        self.assertEqual([(i.replay.traces, i.replay.replays) for i in self.installed], [(1, 1), (1, 1)])
++
+     @config.patch({"triton.cudagraph_host_trace_backward_frees_saved": True})
+     def test_a_backward_frees_its_saved_tensors(self):
+         # a backward's static inputs are its saved tensors too, whose
+diff -ru '--exclude=__pycache__' '--exclude=TREE.txt' step332_me7/torch/cuda/_host_trace_replay.py step332_me8/torch/cuda/_host_trace_replay.py
+--- step332_me7/torch/cuda/_host_trace_replay.py	2026-10-15 03:58:15.593888600 -0700
++++ step332_me8/torch/cuda/_host_trace_replay.py	2026-10-15 04:19:09.615454948 -0700
+@@ -100,7 +100,9 @@
+     _active,
+     _ALLOC_ALIGNMENT,
+     _gc_hold,
++    _metadata,
+     _placeholder,
++    _released_arg,
+     argument_contract,
+     bind_opaque,
+     current_trace,
+@@ -333,6 +335,16 @@
+ 
+ 
+ @dataclass
++class TraceHandback:
++    """A boxed call that traces with a warm-up, handed back before it: the
++    caller's trace_boxed(list(args), resume) runs the warm-up on the list's
++    references, so each input goes at its last use as at an eager call"""
++
++    args: tuple
++    resume: tuple
++
++
++@dataclass
+ class _Variant:
+     captured: CapturedTape
+     memory: MemoryPlan
+@@ -399,6 +411,19 @@
+     torch._C.__dict__["_HostTraceEntry"] = _HostTraceEntry
+ 
+ 
++def _stand_ins(args: Sequence[Any], freed: Collection[int]) -> tuple:
++    # each freed CUDA tensor argument as a tensor over no memory at its
++    # metadata and address (Tape.release_args'), which the trace reads; a
++    # held one, a host one, a Parameter, one that requires grad or a lazy
++    # copy-on-write one as it is
++    return tuple(
++        _released_arg(_metadata(a), a.device)
++        if i in freed and type(a) is torch.Tensor and a.is_cuda and not a.requires_grad and not torch._C._is_cow_tensor(a)
++        else a
++        for i, a in enumerate(args)
++    )
++
++
+ class HostTraceReplay(torch._C._HostTraceEntry):
+     """fn served by host-trace replay; call it as fn. With `trusted`, the
+     caller vouches for every call's arguments (TrustedInputs): a call is
+@@ -416,6 +441,10 @@
+     Unless `trace_builtin_minmax` is False, a trace runs Python's max and min
+     over ints, one of them symbolic, as torch.sym_max and sym_min, which guard
+     on no comparison (as Dynamo's rewrite of them does).
++    With `boxed_fn` (fn taking its arguments as a list it clears), the
++    entry's first call (call_first_boxed) and, with `handback`, a trace's
++    warm-up (TraceHandback, trace_boxed) run on a boxed caller's list: each
++    input goes at its last use, as at the graph's own call.
+     With `learn_pool`, the keys learned at a miss (_learn) allocate from a
+     pool dropped after them, not the caching allocator's: no reserved growth
+     from their operands, for a cudaMalloc and cudaFree per miss. With
+@@ -1122,6 +1151,14 @@
+         self.eager += 1
+         return self.fn(*args, **kwargs)
+ 
++    def trace_boxed(self, inputs: list[Any], resume: tuple) -> Any:
++        """The call _miss handed back to trace (TraceHandback), on the list's
++        references: the trace's warm-up runs boxed_fn on the list, which drops
++        each input at its last use, and the trace reads the dropped inputs'
++        metadata and addresses (_stand_ins)."""
++        contract, candidates, before = resume
++        return self._miss(contract, inputs, list(candidates), before, boxed=True)
++
+     @torch.cuda._host_trace.on_a_fresh_stack_chunk(32800)
+     def _miss(
+         self,
+@@ -1129,6 +1166,7 @@
+         args: Sequence[Any],
+         candidates: Sequence[tuple[_Variant, list[int], list[int]]] = (),
+         before: _Variant | None = None,
++        boxed: bool = False,
+     ) -> Any:
+         if any(v.native.overlaps(tuple(args)) for v in self._families.get(contract, ())):
+             # an assertion, not a dispatch: eager raises its error or runs it
+@@ -1157,9 +1195,16 @@
+         # trace's witness, and at the entry's first lazy initialization happens
+         # outside the trace. Under trust Dynamo's guards stand for the witness.
+         first = self.traces == 0
++        warm_up = first or self.trusted is None
++        if warm_up and not boxed and self.boxed_fn is not None and self.handback and self.freed_arguments:
++            return TraceHandback(tuple(args), (contract, tuple(candidates), before))
+         if not first:
+             self._retrace_cause(contract, args)
+-        warm_up = first or self.trusted is None
++        # boxed: the list is the call's (its warm-up's), the trace's the
++        # dropped inputs' stand-ins
++        inputs = args
++        if boxed:
++            args = _stand_ins(args, self.freed_arguments)
+         ran, result, tape, folded = False, None, None, None
+         # the ops whose segments failed to capture, run eagerly by a trace again
+         eager_ops: dict[int, str] = {}
+@@ -1172,6 +1217,7 @@
+                     tape = trace(
+                         self.fn,
+                         tuple(args),
++                        boxed=(self.boxed_fn, inputs) if boxed and not ran else None,
+                         warm_up=warm_up and not ran,
+                         trusted=self.trusted,
+                         opaque=self.opaque,
+@@ -1284,7 +1330,7 @@
+             if ran:
+                 self.eager += 1
+                 return result
+-            return self._eager(args, {}, fallback=not (isinstance(e, Declined) and e.retry))
++            return self._eager(inputs, {}, fallback=not (isinstance(e, Declined) and e.retry))
+         if folded is not None:
+             if ran:
+                 return result
+diff -ru '--exclude=__pycache__' '--exclude=TREE.txt' step332_me7/torch/cuda/_host_trace_tape.py step332_me8/torch/cuda/_host_trace_tape.py
+--- step332_me7/torch/cuda/_host_trace_tape.py	2026-10-14 22:08:48.852481349 -0700
++++ step332_me8/torch/cuda/_host_trace_tape.py	2026-10-15 04:19:09.617424462 -0700
+@@ -3268,6 +3268,7 @@
+     eager_ops: Mapping[int, str] | None = None,
+     declined_compiles: set[Any] | None = None,
+     learn: Callable[..., Any] | None = None,
++    boxed: tuple[Callable[[list[Any]], Any], list[Any]] | None = None,
+ ) -> Tape:
+     """Trace one call fn(*args). Tensor arguments become traced tensors and
+     int arguments symbols; every other argument is a constant of the tape.
+@@ -3297,7 +3298,10 @@
+     top-level ops at the indices `eager_ops` maps (in Tape.ops) are eager
+     calls, for the reason it maps them to. A CuTe compile that raises is a
+     retried decline unless `declined_compiles` (the caller's record, which it
+-    joins) has its function."""
++    joins) has its function. With `boxed` (fn's boxed form and the call's
++    list), the warm-up runs boxed_fn on the list, which it consumes, and
++    `args` are the stand-ins of the inputs it drops (their metadata and
++    addresses)."""
+     positions = [i for i, a in enumerate(args) if isinstance(a, torch.Tensor)]
+     int_positions = [i for i, a in enumerate(args) if type(a) is int]
+     for i, a in enumerate(args):
+@@ -3342,7 +3346,8 @@
+         if warm_up:
+             before = [_metadata(args[i]) for i in positions]
+             with _Witness(opaque, learn) as witness:
+-                result = fn(*args)
++                result = fn(*args) if boxed is None else boxed[0](boxed[1])
++            boxed = None
+             # not at the mode's exit: a higher-order op's impl enters it again
+             witness.outputs = [[r() for r in refs] for refs in witness.outputs]
+             for i, was in zip(positions, before):
+diff -ru '--exclude=__pycache__' '--exclude=TREE.txt' step332_me7/torch/_inductor/cudagraph_host_trace.py step332_me8/torch/_inductor/cudagraph_host_trace.py
+--- step332_me7/torch/_inductor/cudagraph_host_trace.py	2026-10-15 03:58:15.595246497 -0700
++++ step332_me8/torch/_inductor/cudagraph_host_trace.py	2026-10-15 04:19:09.619354359 -0700
+@@ -34,7 +34,7 @@
+ from torch.cuda._host_trace import Declined, EagerFallback
+ from torch.cuda._host_trace_harvest import HarvestProvider
+ from torch.cuda._host_trace_launch import _probe_address
+-from torch.cuda._host_trace_replay import Handback, HostTraceReplay
++from torch.cuda._host_trace_replay import Handback, HostTraceReplay, TraceHandback
+ from torch.cuda._host_trace_tape import _TracedTensor, current_trace, TrustedInputs
+ from torch.cuda._host_trace_triton import triton_abi
+ from torch.cuda._host_trace_triton_launch import _traced_leaf, owned_module, record_launch
+@@ -298,9 +298,14 @@
+             out = replay.call_first_boxed(args)
+         else:
+             out = replay.call_boxed(args) if boxed else replay(*args)
+-        while isinstance(out, Handback):
+-            args, out = list(out.args), None
+-            out = replay.call_boxed(args)
++        while isinstance(out, (Handback, TraceHandback)):
++            if isinstance(out, TraceHandback):
++                # the list holds the only references: the trace's warm-up drops each at its last use
++                args, resume, out = list(out.args), out.resume, None
++                out = replay.trace_boxed(args, resume)
++            else:
++                args, out = list(out.args), None
++                out = replay.call_boxed(args)
+         out = list(out)
+         if replay.traces != traces:
+             self._account()

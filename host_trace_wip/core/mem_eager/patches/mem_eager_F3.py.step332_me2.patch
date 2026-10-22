@@ -1,0 +1,94 @@
+diff -ru '--exclude=__pycache__' '--exclude=TREE.txt' step332_me2/torch/cuda/_host_trace_harvest.py step332_me3/torch/cuda/_host_trace_harvest.py
+--- step332_me2/torch/cuda/_host_trace_harvest.py	2026-10-14 17:50:36.337974097 -0700
++++ step332_me3/torch/cuda/_host_trace_harvest.py	2026-10-14 21:18:53.447854432 -0700
+@@ -15,9 +15,9 @@
+ A priming capture of A runs first (an uncaptured run's leftovers: cuDNN's
+ transient parameter image, and nvcc's host pointer at the end of an ATen
+ __host__ __device__ lambda's parameter, at another heap address in a harvest's
+-first capture). The four capture into a pool of the harvests', kept between harvests while
+-it caches at most _POOL_KEEP bytes; verify's buffers come from a pool of
+-their own, which goes back to the device once the harvest is over. The pool's own log of its
++first capture). The four capture into a pool of the harvest's own, back to the
++device once they are over (a binding's constant into it is checked as below);
++verify's buffers come from a pool of their own, back once the harvest is over. The pool's own log of its
+ allocations during the capture says which are the call's: the call's blocks are the pool's free
+ blocks holding one, and each is one scratch buffer as far as they reach in it
+ (the allocations a call frees coalesce). The blocks a capture's call allocated
+@@ -252,10 +252,9 @@
+ _VERIFY_SIBLINGS = True
+ # whether a key harvested in full first tries two captures
+ _PAIR = True
+-# bytes of the harvest pool kept cached between harvests: a binding's
+-# constant addresses into it (stale fields of a library's structs, which a
+-# kernel may read while their values do not matter) stay mapped
+-_POOL_KEEP = 64 << 20
++# bytes of the harvest pool kept cached between harvests: none, it goes back
++# to the device after each harvest's captures
++_POOL_KEEP = 0
+ # operand bytes an extern key's check copies, at most, for a provider whose
+ # extern_cap is None: a KV pool layer is past it, FlashInfer's 512 MiB
+ # trtllm-gen workspace is not
+@@ -1254,6 +1253,9 @@
+ 
+         graphs = []  # every capture's graph, held until the harvest is over
+         grown = False  # whether a capture allocated in the pool
++        # the harvest's own memory, which no binding may hold a constant into:
++        # (start, bytes, what), the most telling first
++        ours: list[tuple[int, int, str]] = [(dev.va, dev.va_size, "the operand arena")]
+         plugs: list[torch.Tensor] = []
+         # what the captures left live, held until the harvest is over: their
+         # fresh outputs, and an RNG call's per-capture seed and offset
+@@ -1319,6 +1321,8 @@
+                 philox = (seed.data_ptr(), offset.data_ptr(), taken)
+                 del seed, offset
+             grown |= bool(allocated)
++            ours[:0] = [(a, n, f"capture {x}'s allocation") for a, n in allocated]
++            ours.extend((b[1], b[2], "the capture pool") for b in dev.blocks())
+             pool = dev.blocks() if allocated else []
+             if prime:
+                 return ()
+@@ -1377,6 +1381,22 @@
+             # a live constant address, into a scratch block of the harvest's
+             # own (zeroed if it must be)
+             nodes = binding.nodes
++            # a constant into the harvest's own memory (an earlier capture's
++            # block, the operand arena) goes away with the pool: verify mirrors
++            # and poisons it like a retired qword, so a live one (a workspace
++            # the kernel writes or a value it reads) fails the check and refuses
++            # the key; a stale leftover of a library's struct passes
++            ours_hits = set()
++            for x, n in enumerate(nodes):
++                if not isinstance(n, OpaqueKernel):
++                    continue
++                near = {(t.param, t.offset + d) for t in n.slots for d in (-4, 0, 4)}
++                for param, image in enumerate(n.images):
++                    for first in (0, 4):
++                        for i, q in enumerate(_qwords(image, first)):
++                            if (param, first + 8 * i) not in near and any(a <= q < a + size for a, size, _ in ours):
++                                ours_hits.add(q)
++            retired = {*retired, *ours_hits}
+             variants = [binding]
+             if stale:
+                 images = [list(n.images) if isinstance(n, OpaqueKernel) else None for n in nodes]
+@@ -1807,17 +1827,15 @@
+                 siblings = None
+         finally:
+             # with its graphs reset (a refusal's traceback may hold one) and
+-            # its tensors gone, the pool's blocks are free: cached for the
+-            # next harvest up to _POOL_KEEP bytes, else returned to the
+-            # device by the pool's destructor
++            # its tensors gone, the pool's blocks are free: back to the device
++            # by the pool's destructor
+             for graph in graphs:
+                 graph.reset()
+             graphs.clear()
+             plugs.clear()
+             kept.clear()
+-            if grown and sum(b[2] for b in dev.blocks()) > _POOL_KEEP:
+-                dev.keeper = None
+-                dev.pool = None
++            dev.keeper = None
++            dev.pool = None
+         blocks = [c[2] for c in caps]
+         stack = torch._C._cuda_hostTraceStackBounds()
+         if siblings:

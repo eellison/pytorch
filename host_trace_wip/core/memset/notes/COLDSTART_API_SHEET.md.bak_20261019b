@@ -1,0 +1,72 @@
+# Cold-start API sheet (for the user's review before ms33): op-local redo over lifted per-step state
+
+The concepts are the user's (op-owned guards with a local redo; lifting global state into op inputs; closure "not relaxing
+any existing safety"). This sheet names the API that carries them into core. Every item is opt-in; with none of it set, core
+behaves exactly as ms32 (whose default redoes library bodies; the adapters refuse them through learnfast's no_lib_redo today). The only callers are the vLLM integration adapters (r27 armV_r27, MiMo armV, integration
+armV_stock_fast_m4).
+
+## 1. `HostTraceReplay(fn, ..., redo_policy="all")`
+- `"all"` (default): unchanged. Core today redoes any op at a redispatch, library bodies included (a non-ATen operator or a
+  dispatch unit runs its Python body in the redo).
+- `"refuse"`: a redispatch never redoes a library-body op; the call retraces. This is what the vLLM adapters do today by
+  importing learnfast's no_lib_redo (a library body reading per-step state from a holder would bake the current call's value
+  into the entry); it moves into core under this name.
+- `"inputs_only"`: such an op may redo only if
+  (a) statically, every free symbol of its records (launches, allocations, the guards it owns) is one of its own call's
+      inputs, its own allocations', a `lifted` position's (item 2), or (with item 4) a declared storage's constant; and
+  (b) on its first redispatch, a confirmation (the op redone once at the trace call's own values, evaluated from the
+      trace call's arguments, no hint reads) reproduces its recorded launches exactly, launch for launch (function, grid,
+      block, smem, every slot, every root), and records no guard beyond the trace's except ones over its own symbols.
+      Cached per traced op (variant x op index), not per operator name.
+  Otherwise it refuses as "refuse" does.
+  A failing guard that pins a lifted symbol (s == c) refuses, unless every record of it was made inside an ATen op's C++
+  symbolic evaluation within the op (a kernel-internal decision, re-evaluated by the redo). Anything unproven refuses,
+  labelled ("redo_policy: <op> reads <symbol>, not an input" / "confirmation: <first differing field>").
+
+## 2. `HostTraceReplay(fn, ..., lifted=None)`
+- `None` (default): no lifted positions.
+- A `range` or sequence of positions in the call's flat arguments that carry per-step state the integration lifted out of
+  its holders (vLLM: the step's attention / GDN metadata tensors and lifted ints). Under `inputs_only`, their symbols count
+  as an op's inputs; they are what `redo_context` installs. Declared by the caller, never inferred.
+
+## 3. `HostTraceReplay(fn, ..., redo_context=None)`
+- `None` (default): an op whose records read a lifted symbol refuses ("reads lifted state; no redo_context").
+- `Callable[[RedoCall], ContextManager]`. Core calls it only around the redo of an op whose records read a lifted symbol
+  (lazy), with `RedoCall(args, func, rank)`:
+  - `args`: the call's flat arguments, with the redo's symbolic stand-ins at the `lifted` positions (and at every
+    position the op reads), the variant's own objects elsewhere;
+  - `func`: the op's OpOverload;
+  - `rank`: the op's index among the tape's ops of the same `func` (vLLM's MoE ops find their layer by such a counter).
+  The context manager makes the integration's holders hold `args`' stand-ins while the redo runs, and restores them on
+  exit (vLLM: `_md_rebuild` + `override_forward_context`, and the MoE counter at `rank`). A body that reads a copy instead
+  of the holder fails (a) or (b) and refuses.
+
+## 4. `torch.cuda._host_trace.close_over(modules=(), tensors=()) -> Closure`
+- Declares storages fixed by address (vLLM bakes the same pointers into its own graphs): every parameter and buffer of
+  `modules`, every tensor held as one of their attributes (and lists of them: KV caches, mamba state, pre-made views),
+  and `tensors` (persistent runner buffers). `Closure.release()` undeclares.
+- In a trace or redo, a tensor on a declared storage gets a constant base; its offset / sizes / strides trace as usual. A
+  declared object (a pre-made view in module state) traces with its layout guarded. Any other plain tensor on a declared
+  storage (a per-step view the runner made) must arrive as an argument or the read declines; its layout is never baked.
+- Invalidation, no per-call check: Module.__setattr__ / register_parameter / register_buffer on declared modules, and
+  `.data =` / set_ / resize_ / in-place metadata ops on declared tensors, mark every variant that closed over them stale
+  (its next call retraces). In-place value writes (weights, KV) stay valid, as in vLLM.
+- Default: nothing declared.
+
+## 5. `torch.cuda._host_trace.redo_resolves_arguments` (exists, RD5; semantics narrowed and extended)
+- Resolution becomes by object identity only: a plain tensor a redo's body reaches that IS one of the call's tensor
+  arguments becomes that argument's stand-in (no storage / view equality, no tie-break; anything else declines). It now
+  also applies at the TorchFunction level (before autograd), at the Triton launch intercept and in record_launch.
+- Default unchanged (off).
+
+## Not API (internal, with tests)
+- CuTe `_roots_of` also searches a redo's outer roots.
+- Guard records carry whether they were made inside an ATen op's C++ symbolic evaluation (for the pin rule in 1).
+- A redo runs under the trace's builtin min / max handling (trace_builtin_minmax).
+
+## Stays in the integration (labelled overlays, not core)
+- fla_symlen (flash-linear-attention chunked ops use `.shape[0]` instead of `len()`; `len()` must return a Python int).
+- The adapters turning 1-4 on, and sections on with eager-order memory.
+
+Dropped: cross-layer template key-out (tpl_layer): on ms32 it costs more than it saves (27B ready 146.0 s without it vs 179.2 s
+with it). Held for the user: the unread unpinned CPU argument kind (X1, ~30 s of warm-up and ~55 s to steady on 27B).

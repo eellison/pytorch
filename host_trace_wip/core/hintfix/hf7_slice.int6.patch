@@ -1,0 +1,142 @@
+--- a/test/test_cuda_host_trace_replay.py
++++ b/test/test_cuda_host_trace_replay.py
+@@ -1955,6 +1955,21 @@
+             self.assertEqual(f(a0, a1), fn(a0, a1), atol=0, rtol=0)
+         self.assertEqual((f.traces, f.redispatches, f.replays, f.eager), (1, 1, 3, 0))
+ 
++    def test_a_full_width_slice_is_one_view_at_every_size(self):
++        # buf[:, :n] at n == width: indexing's return-self shortcut changes only identity, so the
++        # trace at n = 8 serves n = 64 (vLLM block_table's slot_mappings[:, :num_tokens_padded]); the
++        # mul alone dispatches again there (its operand is contiguous at the full width, which its
++        # TensorIterator collapses: an op guard), no graph guard
++        def fn(buf, x):
++            return buf[:, : x.shape[0]] * 2 + x.sum()
++
++        f = HostTraceReplay(fn)
++        buf = torch.randn(16, 64, device="cuda")
++        for n in (8, 8, 64, 64, 32, 64):
++            x = torch.randn(n, device="cuda")
++            self.assertEqual(f(buf, x), fn(buf, x), atol=0, rtol=0)
++        self.assertEqual((f.traces, f.redispatches, f.replays, f.retrace_causes), (1, 1, 5, {}))
++
+     @parametrize("checks", [True, False])
+     def test_an_as_strided_bound_is_a_check_of_the_calls(self, checks):
+         # eager's checkInBoundsForStorage: with validity_checks a condition the variant's calls meet
+--- a/test/test_cuda_host_trace_tape.py
++++ b/test/test_cuda_host_trace_tape.py
+@@ -374,6 +374,15 @@
+             self.assertTrue(_holds(tr, {"arg0.size(0)": traced_at}))
+             self.assertFalse(_holds(tr, {"arg0.size(0)": other}))
+ 
++    def test_a_full_width_slice_takes_no_guard_on_covering_its_dim(self):
++        # Python indexing returns self for a slice it statically knows covers
++        # its dim (applySlice), a shortcut for identity only: its read is no
++        # guard, so the trace at n = 8 holds at n = 64, the full width (vLLM's
++        # slot_mappings[:, :num_tokens_padded]); past it eager clamps
++        tr, out, _ = _run(lambda b, x: b[:, : x.shape[0]], torch.randn(16, 64), torch.randn(8))
++        self.assertTrue(_holds(tr, {"arg1.size(0)": 64}))
++        self.assertFalse(_holds(tr, {"arg1.size(0)": 65}))
++
+     def test_symbolic_slices_and_selects_do_not_pin(self):
+         cases = {
+             "slice": lambda t: t[1 : t.shape[0] - 1],
+--- a/torch/cuda/_host_trace_ir.py
++++ b/torch/cuda/_host_trace_ir.py
+@@ -40,6 +40,7 @@
+ 
+ from __future__ import annotations
+ 
++import contextlib
+ import dis
+ import hashlib
+ import linecache
+@@ -49,7 +50,7 @@
+ import struct
+ import sys
+ import threading
+-from typing import Any
++from typing import Any, TYPE_CHECKING
+ 
+ import sympy
+ 
+@@ -82,6 +83,10 @@
+ from torch.utils._sympy.value_ranges import ValueRanges
+ 
+ 
++if TYPE_CHECKING:
++    from collections.abc import Iterator
++
++
+ INT_OPS = frozenset(
+     {
+         "const",
+@@ -157,6 +162,18 @@
+ ACTIVE = threading.local()
+ 
+ 
++@contextlib.contextmanager
++def static_reads(unguarded: bool) -> Iterator[None]:
++    """C++'s TORCH_STATICALLY_KNOWN_TRUE reads on this thread decided by the
++    declared domains alone (unguarded), or as guards, inside the block."""
++    prior = getattr(ACTIVE, "unguarded_static", False)
++    ACTIVE.unguarded_static = unguarded
++    try:
++        yield
++    finally:
++        ACTIVE.unguarded_static = prior
++
++
+ class Unsupported(Exception):
+     """An operation the IR backend does not express; the trace declines on
+     it by name (op, site)."""
+@@ -1667,7 +1684,15 @@
+         return float(self.env.guard_value(self.node))
+ 
+     expect_true = guard_bool
+-    statically_known_true = guard_bool
++
++    def statically_known_true(self, file: Any = "", line: Any = 0) -> bool:
++        # a static read decides as eager's concrete value does (a guard), but
++        # inside a host's identity-only shortcut (static_reads_unguarded) by
++        # the declared domains alone
++        if getattr(ACTIVE, "unguarded_static", False):
++            return self.node.op == "true"
++        return self.env.guard_bool(self.node, self.written)
++
+     guard_size_oblivious = guard_bool
+     guard_or_false = guard_bool
+     guard_or_true = guard_bool
+--- a/torch/cuda/_host_trace_tape.py
++++ b/torch/cuda/_host_trace_tape.py
+@@ -2610,6 +2610,18 @@
+     def __repr__(self, *, tensor_contents=None) -> str:
+         return f"_TracedTensor({self._root.name}, {tuple(self.shape)}, {tuple(self._sym_strides)})"
+ 
++    # Python indexing (applySlicing) returns self for a slice it statically
++    # knows covers its dim, a shortcut that changes only the result's identity
++    # (the JIT tracer's disable_slice_optimization skips it): its static reads
++    # are no guards, so a symbolic slice is one view at every size
++    def __getitem__(self, index: Any) -> Any:
++        with _ir.static_reads(unguarded=True):
++            return super().__getitem__(index)
++
++    def __setitem__(self, index: Any, value: Any) -> None:
++        with _ir.static_reads(unguarded=True):
++            super().__setitem__(index, value)
++
+     # A read of the value on the host has no place on the tape. item() and
+     # the number conversions decline by name at _local_scalar_dense; these
+     # reach the value without dispatching.
+@@ -2677,7 +2689,11 @@
+         self.trace = tr
+ 
+     def __torch_dispatch__(self, func, types, args: tuple = (), kwargs=None):
+-        kwargs = kwargs or {}
++        # an op's own static reads are guards, under indexing too (_TracedTensor.__getitem__)
++        with _ir.static_reads(unguarded=False):
++            return self._traced_dispatch(func, args, kwargs or {})
++
++    def _traced_dispatch(self, func: OpOverload, args: tuple, kwargs: dict) -> Any:
+         tr = self.trace
+         if current_trace() is not tr:
+             raise tr.decline(f"{func} on a thread other than the trace's")

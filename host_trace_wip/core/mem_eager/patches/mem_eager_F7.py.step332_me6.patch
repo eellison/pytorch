@@ -1,0 +1,119 @@
+diff -ru '--exclude=__pycache__' '--exclude=TREE.txt' step332_me6/test/inductor/test_cudagraph_host_trace.py step332_me7/test/inductor/test_cudagraph_host_trace.py
+--- step332_me6/test/inductor/test_cudagraph_host_trace.py	2026-10-13 19:12:13.462270763 -0700
++++ step332_me7/test/inductor/test_cudagraph_host_trace.py	2026-10-15 03:58:15.597880755 -0700
+@@ -662,6 +662,28 @@
+             replay = installation.replay
+             self.assertEqual((replay.traces, replay.replays, replay.eager, replay.declines), (1, 1, 1, []))
+ 
++    def test_the_first_call_frees_its_inputs_at_last_use(self):
++        # the first call runs eagerly on the boxed list's references, which the
++        # graph drops at their last use as its own call does: a backward's
++        # saved activations go as it consumes them, so its first call's peak
++        # (which seeds the cache's segments for the steady state) is the
++        # default compile's, its backward compiled in both
++        def first_backward_peak(mode):
++            torch._dynamo.reset()
++            torch.manual_seed(0)
++            model = torch.nn.Sequential(*(torch.nn.Sequential(torch.nn.Linear(4096, 4096, bias=False), torch.nn.ReLU()) for _ in range(4))).cuda()
++            loss = torch.compile(model, mode=mode)(torch.randn(4096, 4096, device="cuda")).sum()
++            torch.cuda.synchronize()
++            base = torch.cuda.memory_allocated()
++            torch.cuda.reset_peak_memory_stats()
++            loss.backward()
++            torch.cuda.synchronize()
++            return torch.cuda.max_memory_allocated() - base
++
++        default = first_backward_peak(None)
++        self.assertLessEqual(first_backward_peak("reduce-overhead"), default + (1 << 20))
++        self.assertEqual([i.replay.eager for i in self.installed], [1, 1])
++
+     @config.patch({"triton.cudagraph_host_trace_backward_frees_saved": True})
+     def test_a_backward_frees_its_saved_tensors(self):
+         # a backward's static inputs are its saved tensors too, whose
+diff -ru '--exclude=__pycache__' '--exclude=TREE.txt' step332_me6/torch/cuda/_host_trace_replay.py step332_me7/torch/cuda/_host_trace_replay.py
+--- step332_me6/torch/cuda/_host_trace_replay.py	2026-10-14 22:08:48.850539609 -0700
++++ step332_me7/torch/cuda/_host_trace_replay.py	2026-10-15 03:58:15.593888600 -0700
+@@ -495,6 +495,7 @@
+         background: bool = False,
+         fullgraph: bool = False,
+         forbid_learners: bool = False,
++        boxed_fn: Callable[[list[Any]], Any] | None = None,
+     ) -> None:
+         if memory not in ("auto", "eager", "run_buffer", "held", *_PLANNED):
+             raise ValueError(f"host_trace: memory {memory!r} is not 'auto', 'eager', 'run_buffer', 'held' or one of {_PLANNED}")
+@@ -516,6 +517,7 @@
+         self.background = background
+         self.fullgraph = fullgraph
+         self.forbid_learners = forbid_learners
++        self.boxed_fn = boxed_fn
+         try:
+             self._signature: inspect.Signature | None = inspect.signature(fn)
+         except (TypeError, ValueError):
+@@ -613,6 +615,19 @@
+         return list(self._reasons)
+ 
+     @property
++    def called(self) -> bool:
++        return self._called
++
++    def call_first_boxed(self, inputs: list[Any]) -> Any:
++        """The entry's first call, eager as _miss runs it, by boxed_fn on the
++        list's references: each is dropped at its last use, as the graph's
++        own boxed call does. The first call's peak seeds the caching
++        allocator's segments for the steady state; this way it is eager's."""
++        self._called = True
++        self.eager += 1
++        return self.boxed_fn(inputs)
++
++    @property
+     def variants(self) -> list[_Variant]:
+         return [v for family in self._families.values() for v in family]
+ 
+diff -ru '--exclude=__pycache__' '--exclude=TREE.txt' step332_me6/torch/_inductor/cudagraph_host_trace.py step332_me7/torch/_inductor/cudagraph_host_trace.py
+--- step332_me6/torch/_inductor/cudagraph_host_trace.py	2026-10-13 19:06:43.396115860 -0700
++++ step332_me7/torch/_inductor/cudagraph_host_trace.py	2026-10-15 03:58:15.595246497 -0700
+@@ -235,15 +235,21 @@
+         # inputs that need none): fixed by the graph, and not the tape's
+         self._nones: list[int] = []
+ 
+-        def tensors(*args: Any) -> list[Any]:
++        def boxed(args: list[Any]) -> list[Any]:
++            # the graph's call on the list, which it clears: the list's
++            # references are the call's, dropped at their last use
+             scope.update(zip(names, args[n:]))
++            del args[n:]
+             try:
+-                out = call(self_, list(args[:n]))
++                out = call(self_, args)
+             finally:
+                 scope.update(zip(names, self._constants))
+             self._nones = [i for i, o in enumerate(out) if o is None]
+             return [o for o in out if o is not None]
+ 
++        def tensors(*args: Any) -> list[Any]:
++            return boxed(list(args))
++
+         knobs = config.triton
+         opaque = tuple(_PROVIDERS[f] for f in knobs.cudagraph_host_trace_harvest)
+         memory = knobs.cudagraph_host_trace_replay_memory
+@@ -262,6 +268,7 @@
+             splits=knobs.cudagraph_host_trace_replay_splits,
+             fullgraph=knobs.cudagraph_host_trace_fullgraph,
+             forbid_learners=knobs.cudagraph_host_trace_forbid_learners,
++            boxed_fn=boxed,
+         )
+         self._seeds = seeds
+         self._device = device
+@@ -286,7 +293,11 @@
+         for i in self._seeds:
+             if not args[i].is_cuda:
+                 args[i] = args[i].to(self._device, non_blocking=True)
+-        out = replay.call_boxed(args) if boxed else replay(*args)
++        if boxed and not replay.called and current_trace() is None:
++            # the first call, eager: its inputs dropped at their last use
++            out = replay.call_first_boxed(args)
++        else:
++            out = replay.call_boxed(args) if boxed else replay(*args)
+         while isinstance(out, Handback):
+             args, out = list(out.args), None
+             out = replay.call_boxed(args)

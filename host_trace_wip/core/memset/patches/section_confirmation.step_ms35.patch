@@ -1,0 +1,272 @@
+--- step_ms35/torch/cuda/_host_trace_redispatch.py	2026-10-20 11:36:53.965689165 -0700
++++ wip47/torch/cuda/_host_trace_redispatch.py	2026-10-20 17:39:49.007286929 -0700
+@@ -65,7 +65,7 @@
+ 
+ 
+ if TYPE_CHECKING:
+-    from collections.abc import Callable, Iterator, Sequence
++    from collections.abc import Callable, Iterator, Mapping, Sequence
+     from contextlib import AbstractContextManager
+ 
+     from torch.cuda._host_trace_lower_tape import LoweredLaunch, LoweredMemset, LoweredSelector, LoweredTape
+@@ -454,8 +454,6 @@
+         finally:
+             _LIBRARY_COUNTS["confirmation_bodies"] += redo_bodies - bodies
+             redo_bodies = bodies
+-    if section is not None:
+-        return "confirmation: its redo at its trace call takes another chain"
+     keyed = {id(n) for site in tape.sites for n in site.nodes}
+     chain = [rec for _, rec in tape.launches[op.launches.start : op.launches.stop] if id(rec) not in keyed]
+     if len(launches) != len(chain):
+@@ -464,8 +462,20 @@
+     # constant layout equals the trace's at their values
+     declared = _declared(lowered, redo.static_prefix) if lo.ir else frozenset()
+     fold = _at_values(tape.shape_env.ctx, declared) if declared else None
++    fold_x, roots = fold, None
++    if section is not None:
++        # a section (a memcpy only a section's node holds, say) confirms where it gives back the trace's records but for its
++        # scratch: its temporaries are the op's dropped allocations, in allocation order (notes/SECTION_CONFIRMATION.md)
++        if not lo.ir or isinstance(paired := _section_pairing(tape, op, section), str):
++            return f"confirmation: its redo at its trace call takes another chain ({paired if lo.ir else 'sympy'})"
++        roots, scratch = paired
++        fold, fold_x = _at_values(tape.shape_env.ctx, declared), _at_values(tape.shape_env.ctx, declared, scratch)
++        for t, k in zip(section.temporaries, section.drops):
++            a = tape.allocs[k]
++            if t.dtype != a.dtype or not _same_value((t.sizes, t.strides), (tuple(a.sizes), tuple(a.strides)), lambda u, v: fold_x(u) == fold(v)):
++                return f"confirmation: its redo at its trace call takes another chain (a temporary is not its allocation's layout)"
+     for j, ((_, x), y) in enumerate(zip(launches, chain)):
+-        if (diff := _launch_difference(x, y, fold)) is not None:
++        if (diff := _launch_difference(x, y, fold, fold_x=fold_x, roots=roots)) is not None:
+             return f"confirmation: launch {j} differs at its trace call ({diff})"
+     env = tape.shape_env
+     recorded = {node for node, _ in env.records} if isinstance(env, _ir.Env) else {g.expr for g in env.guards}
+@@ -474,6 +484,8 @@
+         _symbols((tape.allocs[a].q, tape.allocs[a].sizes, tape.allocs[a].strides), own)
+     # an IR redo's guards are (node, written) pairs, a sympy one's its expressions
+     exprs = [g[0] if isinstance(g, tuple) else g for g in guards]
++    if section is not None:
++        exprs = [fold_x(g) for g in exprs]  # over the scratch's own addresses: the allocations'
+     # and a guard over what a declared view's read reads besides: the static prefix's layouts and bases (the same every call)
+     for rec in tape.inputs if declared else ():
+         if rec.position < redo.static_prefix:
+@@ -575,16 +587,17 @@
+     return tuple(args)
+ 
+ 
+-def _at_values(ctx: Any, declared: frozenset[str]) -> Callable[[Any], Any]:
+-    """A value as a node with the `declared` symbols at their values."""
++def _at_values(ctx: Any, declared: frozenset[str], renamed: Mapping[str, Any] | None = None) -> Callable[[Any], Any]:
++    """A value as a node with the `declared` symbols at their values (and the `renamed` symbols as those nodes)."""
+     hints = {name: ctx.const(int(ctx.symbols[name].hint)) for name in declared}
+-    symbols = collections.ChainMap(hints, ctx.symbols)
++    symbols = collections.ChainMap(dict(renamed or {}), hints, ctx.symbols)
++    names = declared | set(renamed or ())
+ 
+     def fold(v: Any) -> Any:
+         k = _sym_key(v)
+         if isinstance(k, int):
+             return ctx.const(k)
+-        if not isinstance(k, _ir.Node) or not k.free_symbols & declared:
++        if not isinstance(k, _ir.Node) or not k.free_symbols & names:
+             return k
+         try:
+             return ctx.transfer(k, ctx, symbols, {})
+@@ -594,13 +607,17 @@
+     return fold
+ 
+ 
+-def _launch_difference(x: Any, y: Any, fold: Callable[[Any], Any] | None = None) -> str | None:
++def _launch_difference(
++    x: Any, y: Any, fold: Callable[[Any], Any] | None = None, *, fold_x: Callable[[Any], Any] | None = None, roots: Mapping[int, Any] | None = None
++) -> str | None:
+     """The first field where a redo's record x and the trace's y differ (values by node, roots by identity), or None;
+-    with `fold`, values equal as fold gives them count as equal."""
+-    same = lambda u, v: _sym_key(u) == _sym_key(v) or (fold is not None and fold(u) == fold(v))  # noqa: E731
++    with `fold`, values equal as fold gives them count as equal (x's through `fold_x`, if given); `roots` maps a root of x
++    (by id) to the trace's root it stands for (a section's temporary to its allocation)."""
++    fx = fold_x or fold
++    same = lambda u, v: _sym_key(u) == _sym_key(v) or (fold is not None and fx(u) == fold(v))  # noqa: E731
+     if type(x) is not type(y):
+         return f"{type(x).__name__} for {type(y).__name__}"
+-    if [id(r) for r in getattr(x, "roots", ())] != [id(r) for r in getattr(y, "roots", ())]:
++    if [id((roots or {}).get(id(r), r)) for r in getattr(x, "roots", ())] != [id(r) for r in getattr(y, "roots", ())]:
+         return "roots"
+     if isinstance(x, KernelLaunch):
+         if x.function != y.function:
+@@ -625,13 +642,36 @@
+     return None
+ 
+ 
++def _section_pairing(tape: Any, op: Any, section: Section) -> tuple[dict[int, Any], dict[str, Any]] | str:
++    """A section's temporaries paired with the op's dropped allocations in allocation order (no search): per pair the
++    temporary's root standing for the allocation's, and its base symbol renamed to the allocation's; why not, where the
++    counts differ, an output is among the drops, or a base is not one symbol."""
++    if len(section.temporaries) != len(section.drops):
++        return "its temporaries do not pair with its allocations"
++    outputs = {id(o._root) for o in op.outputs if isinstance(o, _TracedTensor)}
++    ctx = tape.shape_env.ctx
++    roots: dict[int, Any] = {}
++    scratch: dict[str, Any] = {}
++    for t, k in zip(section.temporaries, section.drops):
++        a = tape.allocs[k]
++        if id(a.root) in outputs:
++            return "an output among its temporaries"
++        kt, ka = _sym_key(t.root.sym), _sym_key(a.root.sym)
++        if not isinstance(kt, _ir.Node) or not isinstance(ka, _ir.Node) or len(kt.free_symbols) != 1 or len(ka.free_symbols) != 1:
++            return "a temporary's base is not one symbol"
++        ((nt,), (na,)) = kt.free_symbols, ka.free_symbols
++        roots[id(t.root)] = a.root
++        scratch[nt] = ctx.symbols[na]
++    return roots, scratch
++
++
+ def _same_value(u: Any, v: Any, same: Callable[[Any, Any], bool]) -> bool:
+     """A record field's values equal: SymInts and ints by `same`, tuples elementwise, dataclasses by their compared fields."""
+     if isinstance(u, (tuple, list)) and isinstance(v, (tuple, list)):
+         return len(u) == len(v) and all(_same_value(p, q, same) for p, q in zip(u, v))
+     if dataclasses.is_dataclass(u) and not isinstance(u, type):
+         return type(u) is type(v) and all(_same_value(getattr(u, f.name), getattr(v, f.name), same) for f in dataclasses.fields(u) if f.compare)
+-    if isinstance(u, (int, torch.SymInt)) and isinstance(v, (int, torch.SymInt)) and not isinstance(u, bool):
++    if isinstance(u, (int, torch.SymInt, _ir.Node)) and isinstance(v, (int, torch.SymInt, _ir.Node)) and not isinstance(u, bool):
+         return same(u, v)
+     return u is v or u == v
+ 
+@@ -1427,8 +1467,12 @@
+             temp = _Root(a.root.name, renamer(a.root.sym), "allocation", a.root.index)
+             back[id(a.root)] = temp
+             temps.append(Temporary(temp, a.dtype, tuple(map(renamer, a.sizes)), tuple(map(renamer, a.strides)), seq))
+-        # the op's allocations no output of the section is: it does not make them
++        # the op's allocations no output of the section is: it does not make them, so no other launch may read one (a library
++        # body's scratch a later op reaches through Python state)
+         paired = {id(b) for b in pairs.values()}
++        dropped = {id(b.root) for _, b in ours if id(b) not in paired}
++        if any(id(r) in dropped for j, (_, rec) in enumerate(old.launches) if j not in op.launches for r in getattr(rec, "roots", ())):
++            raise FoldRefused(f"{op.func}'s section drops an allocation another op reads")
+         section = Section(tuple(temps), tuple(k for k, b in ours if id(b) not in paired))
+         olds = [pairs[id(a.root)] for a in tr_allocs if id(a.root) in pairs]
+         allocs = [a for a in tr_allocs if id(a.root) in pairs]
+--- step_ms35/test/test_cuda_host_trace_replay.py	2026-10-20 11:22:43.857236223 -0700
++++ wip47/test/test_cuda_host_trace_replay.py	2026-10-20 17:39:49.399273922 -0700
+@@ -357,6 +357,46 @@
+ _direct_lib._register_fake("add_stashed", lambda y: torch.empty_like(y))
+ 
+ 
++# library bodies whose chains hold a device-to-device copy into their own scratch: their redos are sections
++SCRATCH: dict[str, Any] = {"t": None}
++
++
++def _copy_scale(x: torch.Tensor) -> torch.Tensor:
++    f = 2 if x.shape[0] > 16 else 3
++    scratch = torch.empty_like(x)
++    scratch.copy_(x)
++    return scratch * f
++
++
++def _copy_twice(x: torch.Tensor) -> torch.Tensor:
++    f = 2 if x.shape[0] > 16 else 3
++    a, b = torch.empty_like(x), torch.empty_like(x)
++    a.copy_(x)
++    b.copy_(x)
++    return a * b * f  # the two scratch buffers in symmetric roles
++
++
++def _copy_stash(x: torch.Tensor) -> torch.Tensor:
++    f = 2 if x.shape[0] > 16 else 3
++    scratch = torch.empty_like(x)
++    scratch.copy_(x)
++    SCRATCH["t"] = scratch  # outlives the op: the step reads it after
++    return x * f
++
++
++def _copy_holder_sized(x: torch.Tensor) -> torch.Tensor:
++    f = 2 if x.shape[0] > 16 else 3
++    scratch = torch.empty(HOLDER["n"], x.shape[1], device=x.device)
++    scratch[: x.shape[0]].copy_(x)
++    return scratch[: x.shape[0]] * f
++
++
++for _name, _fn in (("copy_scale", _copy_scale), ("copy_twice", _copy_twice), ("copy_stash", _copy_stash), ("copy_holder_sized", _copy_holder_sized)):
++    _direct_lib.define(f"{_name}(Tensor x) -> Tensor")
++    _direct_lib.impl(_name, _fn, "CUDA")
++    _direct_lib._register_fake(_name, lambda x: torch.empty_like(x))
++
++
+ # a library body reading a view from module state: the caller swaps the step's argument in while fn runs, and a pre-made
+ # view of the same weight is there otherwise
+ MODULE_STATE: dict[str, Any] = {"view": None}
+@@ -4949,6 +4989,75 @@
+         values = _trace_values(lo, inputs)
+         self.assertEqual((values[row], values), (654321, _values_at(program, inputs)))
+ 
++    def _section_calls(self, step, rows=(8, 8, 32, 32, 8, 64), n=None):
++        r = HostTraceReplay(step)
++        for t in rows:
++            x = torch.arange(t * 4, dtype=torch.float32, device="cuda").view(t, 4)
++            args = (x,) if n is None else (x, n)
++            self.assertEqual(r(*args), step(*args), atol=0, rtol=0)
++        return r
++
++    @parametrize("op", ["copy_scale", "copy_twice"])
++    def test_a_library_section_that_gives_back_its_records_confirms(self, op):
++        # the redo copies into its own scratch (a D2D memcpy only a section holds): at its trace call it gives back the trace's
++        # records but for the scratch, its temporaries paired with the op's allocations in order (two in symmetric roles too):
++        # confirmed, and every size redispatches, bitwise
++        before = dict(_LIBRARY_COUNTS)
++        r = self._section_calls(lambda x: getattr(torch.ops.host_trace_direct, op)(x) + 1)
++        self.assertEqual((r.traces, r.redispatches > 0, r.sections > 0), (1, True, True))
++        self.assertEqual(_LIBRARY_COUNTS["refused"] - before.get("refused", 0), 0)
++
++    def test_a_library_section_with_an_outliving_scratch_retraces(self):
++        # the scratch outlives the op (the step reads it after): a section would drop the allocation the step reads, which the
++        # redo refuses; the call traces again, bitwise
++        def step(x):
++            y = torch.ops.host_trace_direct.copy_stash(x)
++            return y + SCRATCH["t"]
++
++        self.addCleanup(SCRATCH.__setitem__, "t", None)
++        r = self._section_calls(step)
++        self.assertEqual((r.redispatches, r.sections), (0, 0))
++        self.assertGreater(r.traces, 1)
++        self.assertIn("drops an allocation another op reads", "".join(r.redispatch_refusals))
++
++    def test_a_library_section_of_another_record_type_is_refused(self):
++        # the trace's copy record edited into another record type (a memset of its bytes): the redo's memcpy does not give it back
++        from torch.cuda._host_trace_tape import Memcpy, Memset
++
++        def step(x):
++            return torch.ops.host_trace_direct.copy_scale(x) + 1
++
++        r = HostTraceReplay(step)
++        x = torch.ones(8, 4, device="cuda")
++        self.assertEqual(r(x), step(x), atol=0, rtol=0)
++        tape = r.variants[0].tape
++        (op,) = (o for o in tape.ops if o.func is torch.ops.host_trace_direct.copy_scale.default)
++        chain = [j for j in op.launches]
++        j = next(j for j in chain if isinstance(tape.launches[j][1], Memcpy))
++        copy = tape.launches[j][1]
++        tape.launches[j] = (tape.launches[j][0], Memset(copy.name, (copy.slots[0],), copy.roots, 0, 1, copy.nbytes, 1, copy.nbytes))
++        x = torch.ones(32, 4, device="cuda")
++        self.assertEqual(r(x), step(x), atol=0, rtol=0)
++        self.assertEqual((r.traces, r.redispatches), (2, 0))
++        self.assertIn("differs at its trace call (Memcpy for Memset)", "".join(r.redispatch_refusals))
++
++    def test_a_library_section_with_a_holder_sized_scratch_is_refused(self):
++        # the scratch's size came from a holder the step filled from its int: redone at its trace call, the body reads the
++        # holder's value then (a constant where the trace has the symbol) and does not give its records back
++        def step(x, n):
++            saved, HOLDER["n"] = HOLDER["n"], n
++            try:
++                return torch.ops.host_trace_direct.copy_holder_sized(x) + 1
++            finally:
++                HOLDER["n"] = saved
++
++        r = HostTraceReplay(step)
++        for t in (8, 8, 32):
++            x = torch.ones(t, 4, device="cuda")
++            self.assertEqual(r(x, t + 8), step(x, t + 8), atol=0, rtol=0)
++        self.assertEqual((r.traces, r.redispatches), (2, 0))
++        self.assertIn("copy_holder_sized", "".join(r.redispatch_refusals))
++
+     def test_a_confirmed_library_redo_is_not_rechecked_on_replay(self):
+         # the confirmation (a Python pass over the rows, a redo, a cache rollback) runs once per traced op, at its first
+         # redispatch; a replay hit, of the redone entry or the traced one, runs none of it

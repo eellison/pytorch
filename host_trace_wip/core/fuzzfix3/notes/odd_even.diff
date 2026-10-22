@@ -1,0 +1,702 @@
+--- base_o/torch/cuda/_host_trace_capture.py	2026-10-05 06:06:38.968576815 -0700
++++ base_e/torch/cuda/_host_trace_capture.py	2026-10-06 05:48:52.140354252 -0700
+@@ -422,17 +422,29 @@
+     stream: torch.cuda.Stream | None = None,
+     mode: str = "thread_local",
+     memcpy: bool = False,
++    allocations: list[tuple[int, int]] | None = None,
+ ) -> list[KernelNode | MemsetNode | MemcpyNode]:
+     """fn(stream) captured on `stream` (by default a private stream), also
+-    the current stream, and never replayed: the graph's nodes, graph_nodes."""
++    the current stream, and never replayed: the graph's nodes, graph_nodes.
++    With `allocations`, extends it by the (address, requested bytes) of each
++    allocation into the capture's pool, from any thread."""
+     graph = torch.cuda.CUDAGraph(keep_graph=True)
+     held = private_stream() if stream is None else contextlib.nullcontext(stream)
+     with _gc_hold, held as stream, torch.cuda.stream(stream):
+-        graph.capture_begin(capture_error_mode=mode)
++        if allocations is None:
++            graph.capture_begin(capture_error_mode=mode)
++        else:
++            pool = torch.cuda.graph_pool_handle()
++            graph.capture_begin(pool=pool, capture_error_mode=mode)
++            torch._C._cuda_hostTracePoolLog(stream.device_index, pool, True)
+         try:
+             fn(stream)
+         finally:
+-            graph.capture_end()
++            try:
++                graph.capture_end()
++            finally:
++                if allocations is not None:
++                    allocations += torch._C._cuda_hostTracePoolLog(stream.device_index, pool, False)
+     return graph_nodes(graph.raw_cuda_graph(), memcpy)
+ 
+ 
+--- base_o/torch/cuda/_host_trace_harvest.py	2026-10-06 07:20:57.725576542 -0700
++++ base_e/torch/cuda/_host_trace_harvest.py	2026-10-06 07:21:01.476034032 -0700
+@@ -16,9 +16,8 @@
+ transient parameter image, and nvcc's host pointer at the end of an ATen
+ __host__ __device__ lambda's parameter, at another heap address in a harvest's
+ first capture). The four capture into a pool of the harvests', kept between
+-harvests while it caches at most _POOL_KEEP bytes. The allocator's history of
+-the pool (recorded from each capture on unless the process records its own)
+-says which allocations are the call's: the call's blocks are the pool's free
++harvests while it caches at most _POOL_KEEP bytes. The pool's own log of its
++allocations during the capture says which are the call's: the call's blocks are the pool's free
+ blocks holding one, and each is one scratch buffer as far as they reach in it
+ (the allocations a call frees coalesce). The blocks a capture's call allocated
+ are plugged before the next capture, so each capture's sit at their own
+@@ -486,7 +485,7 @@
+     def blocks(self) -> list:
+         """The pool's blocks as (stream, address, size, requested size,
+         active, in the small pool)."""
+-        return torch._C._cuda_hostTracePool(self.index, self.pool.id, False)[0]
++        return torch._C._cuda_hostTracePool(self.index, self.pool.id)
+ 
+     def plug(self, keep: list) -> list[torch.Tensor]:
+         """Tensors in the pool exactly covering the free blocks in keep.
+@@ -1109,16 +1108,12 @@
+                     holes.append(torch.empty(o.untyped_storage().nbytes(), dtype=torch.uint8, device=device))
+                 plugs.extend(dev.plug([b for b in dev.blocks() if not b[4]]))
+             del holes
+-            # the history from here on: restarted, or the process's own from its length
+-            if own:
+-                torch._C._cuda_hostTraceRecordAllocations(True)
+-            seen = 0 if own else len(torch._C._cuda_hostTracePool(device, dev.pool.id, True)[1])
+             # the call allocates its cuBLAS workspace in the pool (its
+             # scratch); TORCH_CUBLAS_WORKSPACE_CACHE=1: the stream's cached one
+             # is released before the capture, and after it, so none is left
+             # live in the pool
+             try:
+-                result, allocs, _, philox, held = torch._C._cuda_hostTraceHarvestCapture(
++                result, allocated, _, philox, held = torch._C._cuda_hostTraceHarvestCapture(
+                     graph,
+                     dev.pool.id,
+                     (stream.stream_id, stream.device_index, stream.device_type),
+@@ -1143,12 +1138,8 @@
+                 kept.extend((seed, offset))
+                 philox = (seed.data_ptr(), offset.data_ptr(), taken)
+                 del seed, offset
+-            grown |= allocs > 0
+-            pool, allocated = [], []
+-            if allocs:
+-                pool, history = torch._C._cuda_hostTracePool(device, dev.pool.id, True)
+-                # a ring buffer's wrap loses some, which the allocation count sees
+-                allocated = history[seen:]
++            grown |= bool(allocated)
++            pool = dev.blocks() if allocated else []
+             if prime:
+                 return ()
+             rets = [] if op in _OUT else [result] if len(returns) == 1 else list(result or ())
+@@ -1177,24 +1168,17 @@
+             plugged = {t.data_ptr() for t in plugs} | {t.untyped_storage().data_ptr() for t in kept}
+             if any(b[4] and b[1] not in plugged for b in pool):
+                 raise _Refused("the call left an allocation live")
+-            # the harvest's own history is unbounded: it is the count, whatever
+-            # other threads allocate. The process's may have wrapped, which the
+-            # device-wide count sees (another thread's allocations refuse too)
+-            if own:
+-                allocs = len(allocated)
+-            elif len(allocated) != allocs:
+-                raise _Transient(f"{allocs} allocations, {len(allocated)} of them the call's")
+             # the free blocks the call allocated in: freed allocations
+             # coalesce with their free neighbors, so each is one scratch
+             # buffer, as far as the call's allocations in it reach
+             ends = {b: [a + n for a, n in allocated if b[1] <= a < b[1] + b[2]] for b in pool if not b[4]}
+             mine = [b for b, e in ends.items() if e]
+-            if allocs:
++            if allocated:
+                 plugs.extend(dev.plug(mine))
+             # an output's own allocation, or a temporary freed before the
+             # output took its bytes (the output's address, as bound)
+             reused = sum(any(p <= a and a + n <= p + m for p, m in owned) for a, n in allocated)
+-            if sum(map(len, ends.values())) + reused != allocs:
++            if sum(map(len, ends.values())) + reused != len(allocated):
+                 raise _Refused(f"the call's allocations {allocated} are not its blocks and outputs")
+             extents = [max(ends[b]) - b[1] for b in mine]
+             # the blocks in the order the call first allocated in them (the
+@@ -1615,7 +1599,6 @@
+                     dev.keeper.capture_begin(pool=dev.pool.id, capture_error_mode="thread_local")
+                     dev.anchor.fill_(1)
+                     dev.keeper.capture_end()
+-        own = not torch._C._cuda_isHistoryEnabled()
+         smear = _SMEAR
+         try:
+             # a priming capture, not checked: cuDNN's first capture after an
+@@ -1644,8 +1627,6 @@
+                     ]
+                 siblings = None
+         finally:
+-            if own:
+-                torch._C._cuda_hostTraceRecordAllocations(False)
+             # with its graphs reset (a refusal's traceback may hold one) and
+             # its tensors gone, the pool's blocks are free: cached for the
+             # next harvest up to _POOL_KEEP bytes, else returned to the
+--- base_o/torch/cuda/_host_trace_lower_tape.py	2026-10-05 08:57:22.395612813 -0700
++++ base_e/torch/cuda/_host_trace_lower_tape.py	2026-10-05 08:57:25.322638810 -0700
+@@ -122,6 +122,7 @@
+     sizes: tuple[int, ...]  # rows
+     strides: tuple[int, ...]  # rows
+     nbytes: int  # row: the storage bytes, as computeStorageNbytes
++    arena: bool = False  # a planned arena (memory.relocate); never a keyed site's scratch
+ 
+ 
+ @dataclass(frozen=True)
+@@ -207,6 +208,11 @@
+     nodes: tuple[int, ...]  # indices in `launches`
+     device: int
+     alias: tuple = ()  # OpaqueKey.alias, guarded at the trace
++    arena_scratch: frozenset[int] = frozenset()  # buffers in an arena at their traced bytes
++
++    def native_scratch(self) -> list[int]:
++        """The scratch buffers native add_row sizes per key."""
++        return [j for j in sorted(self.scratch) if j not in self.arena_scratch]
+ 
+     def key(self, ints: Sequence[int]) -> OpaqueKey:
+         return _opaque_key(self.site.op, self.dtypes, self.ranks, self.site.scalars, self.device, self.site.state, ints, self.alias)
+@@ -859,13 +865,14 @@
+         if not trivial(r := guard(i)) and r not in extra:
+             extra.append(r)
+     selected = []
++    descriptors = getattr(torch._C, "_host_trace_entry_descriptors_enabled", bool)()
+     for i in unselected:
+         selector = lowered.selectors[i - len(lowered.sites)]
+         op = tape.ops[selector.op]
+         records = [rec for _, rec in tape.launches[op.launches.start : op.launches.stop] if not isinstance(rec, EagerCall)]
+         launches = []
+         for n, rec in zip(selector.nodes, records, strict=True):
+-            if isinstance(rec, KernelLaunch) and (rec.rng or rec.rng_increment or rec.descriptors or rec.cpu_scalars):
++            if isinstance(rec, KernelLaunch) and (rec.rng or rec.rng_increment or (rec.descriptors and not descriptors) or rec.cpu_scalars):
+                 raise FoldRefused(f"an RNG, TMA or CPU scalar launch in {op.func}")
+             if any(roles.get(id(r)) not in by_role for r in rec.roots):
+                 raise FoldRefused(f"a launch in {op.func} of a root of no role")
+--- base_o/torch/cuda/_host_trace_memory.py	2026-10-05 09:03:50.832546649 -0700
++++ base_e/torch/cuda/_host_trace_memory.py	2026-10-05 09:03:54.598057917 -0700
+@@ -57,6 +57,15 @@
+ overlap. A tensor cannot reuse a temporary's bytes, and each distinct
+ buffer size is its own block, which fragments the allocator's pool when
+ the shapes vary.
++
++"held" makes no allocator call for what does not outlive the replay:
++every allocation but the outputs and keyed sites' scratch buffers is at an
++offset in one buffer (_layout), the offsets and its size rows of the
++program. The buffer is held across replays, one per device and stream
++(HostTraceVariant::plan), and grows when a call needs more, so the bytes
++stay allocated between calls and an allocation's address moves only when
++its offset or the buffer does. A replay inside a stream capture, or under
++one still running on the stream, takes a buffer of its own.
+ """
+ 
+ from __future__ import annotations
+@@ -88,6 +97,7 @@
+ 
+     from torch.cuda._host_trace_capture import CapturedTape
+     from torch.cuda._host_trace_lower_tape import LoweredTape
++    from torch.cuda._host_trace_program import IntegerProgram
+ 
+ 
+ # the caching allocator's block granularity: a temporary's offset in the
+@@ -119,6 +129,10 @@
+     outputs: tuple[int, ...]  # the output allocations, in tape order
+     # per step of the tape, then one for the allocations after its last step
+     steps: tuple[StepMemory, ...]
++    # "held": (allocation, its offset's row, an eager call reads or writes
++    # it) in the buffer of `buffer`'s row's bytes; the steps make the rest
++    planned: tuple[tuple[int, int, bool], ...] = ()
++    buffer: int = -1
+     # "planned": a planned temporary k -> (its run's arena allocation, its
+     # offset's row, its bytes' row, its seq, its last use)
+     relocated: Mapping[int, tuple[int, int, int, int, int]] = dataclasses.field(default_factory=dict)
+@@ -314,12 +328,27 @@
+     last = {k: holding[k] for k in range(n_alloc)}
+     for b, s in used.items():
+         last[b] = max(s)
++    pool: set[int] = set()
++    planned: tuple[tuple[int, int, bool], ...] = ()
++    buffer = -1
++    if memory == "held":
++        # a keyed site's scratch bytes are its table entry's, not a row
++        scratch = {b for site in lowered.sites for _, b in site.scratch.values()}
++        pool = {k for k in range(n_alloc) if k not in escapes and k not in scratch}
++        spans = {}
++        for k in sorted(pool):
++            start = (holding[k], allocations[k].seq)
++            end = (holding[k], last_seq[k]) if k in local else (last[k], _AFTER)
++            spans[k] = (allocations[k].nbytes, start, end)
++        offsets, buffer = _layout(lowered.program, spans)
++        planned = tuple((k, offsets[k], k in touched) for k in sorted(pool))
+     made: list[list[int]] = [[] for _ in range(len(steps) + 1)]
+     for k in range(n_alloc):
+-        made[holding[k]].append(k)
++        if k not in pool:
++            made[holding[k]].append(k)
+     dropped: list[list[int]] = [[] for _ in range(len(steps) + 1)]
+     for b, s in last.items():
+-        if b not in escapes and b not in local:
++        if b not in escapes and b not in local and (b not in pool or b in touched):
+             dropped[s].append(b)
+     plan = []
+     for i in range(len(steps) + 1):
+@@ -336,7 +365,64 @@
+             order = tuple(e for *_, e in sorted(events))
+         arguments = tuple(last_arg[i]) if i < len(steps) else ()
+         plan.append(StepMemory(tensors, temporaries, drops, order, arguments))
+-    return MemoryPlan(tuple(sorted(k for k in escapes if k < n_alloc)), tuple(plan))
++    outputs = tuple(sorted(k for k in escapes if k < n_alloc))
++    return MemoryPlan(outputs, tuple(plan), planned, buffer)
++
++
++# a tensor's span ends after the step of its last use
++_AFTER = float("inf")
++
++
++def _layout(
++    program: IntegerProgram, spans: Mapping[int, tuple[int, tuple, tuple]]
++) -> tuple[dict[int, int], int]:
++    """Each allocation's offset row in one buffer, and the buffer's bytes'
++    row, for `spans` (allocation -> (bytes row, start, end)); two whose spans
++    overlap never share bytes, at any call. At the traced call the offsets
++    are first fit's in start order. Ranked by that offset, an allocation
++    sits at the highest end of the earlier ranked ones it overlaps, which
++    is its first-fit offset at the traced call."""
++    v = program.values
++
++    def size(row: int) -> int:
++        return -(-v[row] // _BLOCK) * _BLOCK
++
++    first_fit = {}
++    live: list[tuple[int, int, tuple]] = []  # (offset, end, span end)
++    for k, (row, start, end) in sorted(spans.items(), key=lambda x: x[1][1]):
++        live = sorted(b for b in live if b[2] > start)
++        at = 0
++        for offset, top, _ in live:
++            # an empty one too goes in a nonempty gap, above any it ties
++            if offset - at >= max(size(row), 1):
++                break
++            at = max(at, top)
++        first_fit[k] = at
++        live.append((at, at + size(row), end))
++    ranked = sorted(spans, key=lambda k: (first_fit[k], spans[k][1]))
++    zero = program.emit("constant", 0)
++    pad, mask = program.emit("constant", _BLOCK - 1), program.emit("constant", -_BLOCK)
++    offsets: dict[int, int] = {}
++    ends: list[int] = []
++    under: list[set[int]] = []  # per ranked allocation, the earlier ones it overlaps
++    covered: set[int] = set()
++    for i, k in enumerate(ranked):
++        row, start, end = spans[k]
++        overlaps = {j for j in range(i) if spans[ranked[j]][1] < end and start < spans[ranked[j]][2]}
++        # j is below another overlapping one that overlaps it
++        kept: list[int] = []
++        for j in sorted(overlaps, reverse=True):
++            if not any(j in under[h] for h in kept):
++                kept.append(j)
++        at = program.emit("max", zero, *(ends[j] for j in kept)) if kept else zero
++        if v[at] != first_fit[k]:
++            raise AssertionError(f"allocation {k} at {v[at]}, first fit {first_fit[k]}")
++        offsets[k] = at
++        ends.append(program.emit("add", at, program.emit("bitand", program.emit("add", row, pad), mask)))
++        under.append(overlaps)
++        covered |= overlaps
++    tops = [ends[i] for i in range(len(ranked)) if i not in covered]
++    return offsets, program.emit("max", zero, *tops) if tops else zero
+ 
+ 
+ def _nbytes(lowered: LoweredTape) -> list[int]:
+@@ -661,7 +747,9 @@
+     return offsets, total
+ 
+ 
+-def size_classes(lowered: LoweredTape, packed: bool = False, reuse: bool = True, split: bool = True) -> tuple[MemoryPlan, list[Arena | PackedArena]]:
++def size_classes(
++    lowered: LoweredTape, packed: bool = False, reuse: bool = True, split: bool = True, scratch: bool = False
++) -> tuple[MemoryPlan, list[Arena | PackedArena]]:
+     """The "run_buffer" plan and each run's arenas, decided at the traced
+     call: a run's temporaries but its keyed sites' scratch buffers, in one
+     arena or, when the run buffer (first fit, as the native commit places
+@@ -670,9 +758,11 @@
+     ("planned") or _pack ("packed"), else by size classes: one class per
+     symbolic byte count, its slots assigned in tape order (the lowest free
+     one; a slot frees after its holder's last use). reuse=False skips _holes
+-    and _offline (size classes only), split=False the split around scratch."""
++    and _offline (size classes only), split=False the split around scratch.
++    scratch=True puts the scratch buffers in the arena too, each at its traced
++    bytes (a constant row), which a key's binding must not exceed."""
+     plan = plan_memory(lowered, "run_buffer")
+-    scratch = {b for site in lowered.sites for _, b in site.scratch.values()}
++    scratch = set() if scratch else {b for site in lowered.sites for _, b in site.scratch.values()}
+     values = lowered.program.values
+     arenas: list[Arena | PackedArena] = []
+     for i, m in enumerate(plan.steps):
+@@ -1086,7 +1176,7 @@
+         if program.values[base] != total or any(program.values[rows[k]] != o for k, o in offsets.items()):
+             raise AssertionError("host_trace: an arena's rows disagree with its plan at the trace")
+         a = allocations[arena.allocation]
+-        allocations[arena.allocation] = dataclasses.replace(a, dtype=torch.uint8, sizes=(base,), strides=(one,), nbytes=base)
++        allocations[arena.allocation] = dataclasses.replace(a, dtype=torch.uint8, sizes=(base,), strides=(one,), nbytes=base, arena=True)
+ 
+     for i in {arena.step for arena in arenas}:
+         own = [(a.allocation, a.seq, a.last) for a in arenas if a.step == i]
+@@ -1101,6 +1191,8 @@
+                 (emit("add", row, relocated[b][1]), relocated[b][0]) if b in relocated else (row, b)
+                 for row, b in site.operands
+             ),
++            scratch={j: (emit("add", row, relocated[b][1]), relocated[b][0]) if b in relocated else (row, b) for j, (row, b) in site.scratch.items()},
++            arena_scratch=frozenset(j for j, (_, b) in site.scratch.items() if b in relocated),
+         )
+         for site in lowered.sites
+     )
+--- base_o/torch/cuda/_host_trace_native.py	2026-10-05 06:06:32.348689517 -0700
++++ base_e/torch/cuda/_host_trace_native.py	2026-10-05 06:06:32.356581292 -0700
+@@ -92,6 +92,9 @@
+     # selector ((), record indices, (), predicate row)
+     sites: tuple
+     argument_pairs: tuple  # Tape.argument_pairs
++    # "held": (the buffer's bytes row, its (allocation, offset row,
++    # tensor) triples), else ()
++    planned: tuple = ()
+ 
+ 
+ def flatten_variant(
+@@ -121,7 +124,7 @@
+ 
+     launches = [(row[0], c.node, *row[1:]) for c in captured.launches for row in [launch_row(c.launch)]]
+     allocations = tuple(
+-        (a.sizes, a.strides, a.dtype, a.nbytes) for a in lowered.allocations
++        (a.sizes, a.strides, a.dtype, a.nbytes, a.arena) for a in lowered.allocations
+     )
+     steps: list[Any] = []
+     segment = 0
+@@ -172,10 +175,11 @@
+         (graphs._global_replay_start_hooks, graphs._global_replay_end_hooks),
+         (tuple(traced[0]), tuple(traced[1])),
+         (
+-            *((site.rows, site.nodes, tuple(site.scratch[j][1] for j in sorted(site.scratch))) for site in lowered.sites),
++            *((site.rows, site.nodes, tuple(site.scratch[j][1] for j in site.native_scratch())) for site in lowered.sites),
+             *(((), s.nodes, (), s.predicate) for s in lowered.selectors),
+         ),
+         lowered.tape.argument_pairs,
++        (memory.buffer, memory.planned) if memory.buffer >= 0 else (),
+     )
+ 
+ 
+@@ -236,7 +240,7 @@
+         increment = binding.rng_increment if n is first else 0
+         nodes.append((0, n.function, n.block, n.smem, n.grid, images, fields, philox, increment))
+     used = binding.used_scratch
+-    return tuple(nodes), [binding.scratch[j] if j in used else 0 for j in sorted(site.scratch)]
++    return tuple(nodes), [binding.scratch[j] if j in used else 0 for j in site.native_scratch()]
+ 
+ 
+ class _Leaf:
+@@ -251,15 +255,12 @@
+     per schema argument (0, constant) | (1, leaf) | (2, ((is leaf, leaf or
+     constant), ...)) | (3,) its default, per returned tensor (True, root,
+     sizes, strides, offset, dtype) | (False, the leaf it is), the operator,
+-    the library_state() it runs under or None); None for a target without a
+-    schema. The C++ declines what else it cannot
+-    express."""
++    the library_state() it runs under or None, its graphsafe RNG generator
++    state or None, whether its CPU outputs go to the device
++    (seed_offset_on_device)); None for a target without a schema. The C++
++    declines what else it cannot express."""
+     target = step.call.target
+-    # a graphsafe RNG step swaps in its generator's state around the call, which the boxed call cannot
+-    if not isinstance(target, torch._ops.OpOverload) or step.call.generator is not None:
+-        return None
+-    # its outputs go to the device in Python (seed_offset_on_device)
+-    if target in HOST_SEED_OFFSET:
++    if not isinstance(target, torch._ops.OpOverload):
+         return None
+     markers = [
+         _Leaf(i) if isinstance(v, (LoweredView, ScalarSlot)) else v
+@@ -300,7 +301,7 @@
+         else (False, p)
+         for p in step.outputs
+     )
+-    return (schema.name, schema.overload_name, tuple(args), outputs, target, step.call.state or None)
++    return (schema.name, schema.overload_name, tuple(args), outputs, target, step.call.state or None, step.call.generator, target in HOST_SEED_OFFSET)
+ 
+ 
+ def native_variant(spec: VariantSpec) -> torch._C._HostTraceVariant:
+--- base_o/torch/cuda/_host_trace.py	2026-10-06 05:42:31.892745989 -0700
++++ base_e/torch/cuda/_host_trace.py	2026-10-06 06:01:09.239383726 -0700
+@@ -151,6 +151,10 @@
+ # fresh, oversized frame-stack chunk (on_a_fresh_stack_chunk)
+ fresh_stack_chunk = True
+ 
++# an entry made with this off is served by HostTraceReplay's Python dispatch
++# (_call_slow), not the C++ entry; the variants' commits are native either way
++cpp_entry = True
++
+ 
+ @functools.cache
+ def _ballast(slots: int) -> Callable[..., Any]:
+--- base_o/torch/cuda/_host_trace_redispatch.py	2026-10-06 07:20:57.727527078 -0700
++++ base_e/torch/cuda/_host_trace_redispatch.py	2026-10-06 07:21:01.478910876 -0700
+@@ -577,11 +577,12 @@
+         return guards, sorted(records + launches, key=lambda r: r[0])
+     launches = []
+     olds = [rec for _, rec in old.launches[op.launches.start : op.launches.stop]]
++    descriptors = getattr(torch._C, "_host_trace_entry_descriptors_enabled", bool)()
+     for n, (_, x), y in zip(selector.nodes, tr.launches, olds, strict=True):
+         if isinstance(x, KernelLaunch) and (x.rng or x.rng_increment or x.cpu_scalars):
+             raise FoldRefused(f"an RNG or CPU scalar launch in {op.func}")
+-        if isinstance(x, KernelLaunch) and x.descriptors:
+-            # an entry holds no TMA descriptor
++        if isinstance(x, KernelLaunch) and x.descriptors and not descriptors:
++            # an entry holds no TMA descriptor without entry descriptors
+             raise FoldRefused(f"a TMA launch in {op.func}", respec=True)
+         if isinstance(x, Memcpy):
+             raise FoldRefused(f"a memcpy in {op.func}")
+--- base_o/torch/cuda/_host_trace_replay.py	2026-10-06 07:20:57.727861992 -0700
++++ base_e/torch/cuda/_host_trace_replay.py	2026-10-06 07:21:01.479262014 -0700
+@@ -61,7 +61,9 @@
+ import contextlib
+ import copy
+ import functools
++import dataclasses
+ import inspect
++import itertools
+ import logging
+ import queue
+ import threading
+@@ -188,8 +190,10 @@
+ 
+ 
+ # size_classes modes: "planned_no_reuse" keeps size classes (no _holes / _offline),
+-# "planned_no_split" one arena per run step (no split around keyed-site scratch)
+-_PLANNED = ("planned", "planned_no_reuse", "planned_no_split", "packed")
++# "planned_no_split" one arena per run step (no split around keyed-site scratch),
++# "planned_scratch" each keyed site's scratch buffer a slot of its traced bytes in
++# the arena (a run step allocates once; a key whose binding needs more is declined)
++_PLANNED = ("planned", "planned_no_reuse", "planned_no_split", "packed", "planned_scratch")
+ 
+ 
+ def _capturing(device: torch.device) -> bool:
+@@ -361,13 +365,12 @@
+         trace declines in _build."""
+ 
+         replays = 0
++        static_hits = 0
++        slow_calls = 0
+ 
+         def __call__(self, *args: Any, **kwargs: Any) -> Any:
+-            if current_trace() is not None:
+-                return self.fn(*args, **kwargs)  # pyrefly: ignore [missing-attribute]
+-            return self._call_slow(
+-                args, kwargs, False
+-            )  # pyrefly: ignore [missing-attribute]
++            self.slow_calls += 1
++            return self._call_slow(args, kwargs, False)  # pyrefly: ignore [missing-attribute]
+ 
+         def call_boxed(self, inputs: list[Any]) -> Any:
+             args = tuple(inputs)
+@@ -393,8 +396,8 @@
+     """fn served by host-trace replay; call it as fn. With `trusted`, the
+     caller vouches for every call's arguments (TrustedInputs): a call is
+     checked only against its variants' dispatch guards. `memory` is how a
+-    replay allocates (_host_trace_memory): "auto" (the default), "eager" or
+-    "run_buffer"; `splits`, where "auto" and "eager" split a run (SPLITS, split_runs).
++    replay allocates (_host_trace_memory): "auto" (the default), "eager",
++    "run_buffer", "held" or one of _PLANNED; `splits`, where "auto" and "eager" split a run (SPLITS, split_runs).
+     `opaque` is the keyed calls' providers (_host_trace_opaque); by default a
+     HarvestProvider of its own, for cuBLAS's mm, addmm and bmm; () keys none.
+     `freed_arguments` are the positions whose tensor a boxed call's caller
+@@ -417,6 +420,12 @@
+     A variant that does not learn learns a keyed site's missing key out of
+     band (_learn); a learning variant (one with opaque calls) traces the call
+     again, as it does where its selectors select nothing.
++    The first `static_prefix` arguments are expected to be the same tensors
++    at every call (a model's parameters): a call whose leading arguments are
++    the last hit's objects with the same metadata (data_ptr, sizes, strides,
++    dtype, ...) keys and evaluates only the other arguments, taking the
++    leading ones' rows from that hit (static_hits counts these); any change
++    takes the full path.
+ 
+     With `fullgraph`, as torch.compile's, no call falls back and no tape
+     breaks: where a call would run eagerly (a decline, an argument the
+@@ -469,6 +478,7 @@
+         memory: str = "auto",
+         freed_arguments: Collection[int] = (),
+         static_shapes: Collection[int] = (),
++        static_prefix: int = 0,
+         check_global_state: bool = False,
+         check_escapes: bool = False,
+         handback: bool = False,
+@@ -479,8 +489,8 @@
+         fullgraph: bool = False,
+         forbid_learners: bool = False,
+     ) -> None:
+-        if memory not in ("auto", "eager", "run_buffer", *_PLANNED):
+-            raise ValueError(f"host_trace: memory {memory!r} is not 'auto', 'eager', 'run_buffer' or one of {_PLANNED}")
++        if memory not in ("auto", "eager", "run_buffer", "held", *_PLANNED):
++            raise ValueError(f"host_trace: memory {memory!r} is not 'auto', 'eager', 'run_buffer', 'held' or one of {_PLANNED}")
+         if splits not in SPLITS:
+             raise ValueError(f"host_trace: splits {splits!r} is not one of {SPLITS}")
+         self.fn = fn
+@@ -489,6 +499,7 @@
+         self.handback = handback
+         self.splits = splits
+         self.static_shapes = frozenset(static_shapes)
++        self.static_prefix = static_prefix
+         self.trusted = trusted
+         self.opaque = (HarvestProvider(),) if opaque is None else opaque
+         self.check_global_state = check_global_state
+@@ -574,7 +585,12 @@
+         # one call at a time: a call patches the execs it replays (a native
+         # call holds the base's lock too)
+         self._lock = threading.RLock()
+-        self._native_init(_active, _Disagreement, trusted is not None, check_global_state)
++        if torch.cuda._host_trace.cpp_entry:
++            # the parameters a keyword can pass by position, as _positional binds them
++            params = self._signature.parameters.values() if self._signature is not None else ()
++            positional = itertools.takewhile(lambda p: p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD), params)
++            names = tuple(p.name if p.kind is p.POSITIONAL_OR_KEYWORD else None for p in positional)
++            self._native_init(_active, _Disagreement, trusted is not None, check_global_state, static_prefix, names)
+ 
+     @property
+     def declines(self) -> list[str]:
+@@ -590,6 +606,8 @@
+         """The call when the base's native path does not serve it; `searched`:
+         the native path evaluated the call's family, none holds it and no
+         keyed site missed, which leaves the variants that learn."""
++        if current_trace() is not None:
++            return self.fn(*args, **(kwargs or {}))
+         if kwargs:
+             bound = self._positional(args, kwargs)
+             if bound is None:
+@@ -792,7 +810,10 @@
+                         refused.append((i, sites[i].key(key)))
+             return None
+         for i, key, binding in bindings:
+-            arm = self._arm(variant, i, binding) if sites[i].site.fits(binding) else None
++            fits = sites[i].site.fits(binding)
++            if fits and self.memory == "planned_scratch":
++                fits = all(binding.scratch[j] <= sites[i].site.scratch[j][1] for j in binding.used_scratch)
++            arm = self._arm(variant, i, binding) if fits else None
+             if arm is None:
+                 variant.native.add_row(i, key, None)
+             else:
+@@ -1327,8 +1348,15 @@
+             lowered, memory = auto_memory(lowered, self.freed_arguments, self.splits)
+         elif native and self.memory == "eager":
+             lowered, memory = split_runs(lowered, self.freed_arguments, splits=self.splits)
++        elif self.memory == "held":
++            memory = plan_memory(lowered, "held")
++            # lower_tape dropped the program's inputs; only their count is compiled
++            compiled = torch._C._HostTraceProgram(lowered.program.instructions, len(tape.args))
++            lowered = dataclasses.replace(lowered, compiled=compiled)
+         elif self.memory in _PLANNED:
+-            memory, arenas = size_classes(lowered, packed=self.memory == "packed", reuse=self.memory != "planned_no_reuse", split=self.memory != "planned_no_split")
++            memory, arenas = size_classes(
++                lowered, packed=self.memory == "packed", reuse=self.memory != "planned_no_reuse", split=self.memory != "planned_no_split", scratch=self.memory == "planned_scratch"
++            )
+         else:
+             memory = plan_memory(lowered, self.memory if native else "run_buffer")
+         # capture_tape checks the compiled program at the traced call against
+--- base_o/torch/cuda/_host_trace_tape.py	2026-10-06 07:20:57.729179406 -0700
++++ base_e/torch/cuda/_host_trace_tape.py	2026-10-06 07:21:01.480729892 -0700
+@@ -1320,18 +1320,19 @@
+             stand[1][out_name] = w
+         spans = [(t.data_ptr(), t.data_ptr() + t.untyped_storage().nbytes()) for t in pytree.tree_leaves(stand) if isinstance(t, torch.Tensor) and t.is_cuda]
+ 
+-        def witness(stand: tuple) -> tuple[list, list, list, list] | str:
+-            # its nodes, iterators, launch sites' reports (LaunchLayout.h) and outputs
++        def witness(stand: tuple) -> tuple[list, list, list, list, list] | str:
++            # its nodes, iterators, launch sites' reports (LaunchLayout.h), outputs and allocations
+             # a relaxed thread: a witness that allocates declines the op, not the trace
+             relaxed = runtime.cudaStreamCaptureMode.cudaStreamCaptureModeRelaxed
+             mode = _check_cuda_bindings(runtime.cudaThreadExchangeStreamCaptureMode(relaxed))
+             made: list[Any] = []
++            log: list[tuple[int, int]] = []
+             harvesting = torch._C._cuda_hostTraceSetHarvesting(True)
+             torch._C._cuda_hostTraceRecordIterators(True)
+             torch._C._cuda_hostTraceRecordLaunches(True)
+             try:
+                 with _disable_current_modes(), torch.cuda.device(self.device):
+-                    nodes = capture_kernel_nodes(lambda s: made.append(op(*stand[0], **stand[1])), mode="relaxed", memcpy=True)
++                    nodes = capture_kernel_nodes(lambda s: made.append(op(*stand[0], **stand[1])), mode="relaxed", memcpy=True, allocations=log)
+             except Exception as e:
+                 return f"its witness raised {type(e).__name__}: {str(e).splitlines()[0] if str(e) else ''}"
+             finally:
+@@ -1339,12 +1340,24 @@
+                 iterators = torch._C._cuda_hostTraceRecordIterators(False)
+                 torch._C._cuda_hostTraceSetHarvesting(harvesting)
+                 _check_cuda_bindings(runtime.cudaThreadExchangeStreamCaptureMode(mode))
+-            return nodes, iterators, launched, made
++            return nodes, iterators, launched, made, log
++
++        # an output in an operand's storage (a zero-element var's view of w) is no allocation
++        known = {t.untyped_storage().data_ptr() for t in [s for s, _ in traced.values()] + [w] if t is not None}
++
++        def unexplained(iterators: list, log: list) -> str | None:
++            # the witness's allocations must be exactly its iterators' outputs the op allocates
++            outs = {id(o): o for ops, n, *_ in iterators for o in ops[:n] if o.is_cuda and o.untyped_storage().data_ptr() not in known}
++            explained = collections.Counter((o.data_ptr(), b) for o in outs.values() if (b := o.untyped_storage().nbytes()))
++            if extra := collections.Counter(log) - explained:
++                return f"its witness allocated {[(hex(a), n) for a, n in extra.elements()]}, which no iterator explains"
++            if missing := explained - collections.Counter(log):
++                return f"its witness's iterators write {[(hex(a), n) for a, n in missing.elements()]}, which it did not allocate"
++            return None
+ 
+-        allocations = torch._C._cuda_hostTraceAllocationCount(self.device.index)
+         if isinstance(got := witness(stand), str):
+             return got
+-        nodes, iterators, launched, made = got
++        nodes, iterators, launched, made, log = got
+         results = made[0] if isinstance(made[0], tuple) else made
+         if not all(isinstance(n, (KernelNode, MemcpyNode)) for n in nodes):
+             return f"its witness launched {len(nodes)} operations"
+@@ -1381,7 +1394,6 @@
+         written_by: dict[int, tuple[int, int]] = {}
+         plan: list[tuple[list, list[torch.dtype], list, torch.dtype, Any]] = []
+         moves: list[tuple[int, int]] = []  # each host allocation's witness address and bytes
+-        witnessed = 0  # the witness's own allocations (of bytes) among them
+         live = iter(nodes)
+         empty_reductions: list[Any] = []  # the inputs of zero-element reductions, which launch nothing
+         for operands, noutputs, numel, common, reduction in iterators:
+@@ -1418,7 +1430,6 @@
+                     # a nullary iterator's output (full's, ones_like's) has no operand to take a shape from: the op's
+                     targets.append("temp" if k is None else None if any(i.is_cuda for i in ins) else k)
+                     moves.append((o.data_ptr(), o.untyped_storage().nbytes()))
+-                    witnessed += o is not w and moves[-1][1] > 0
+                 else:
+                     return "an iterator writes a temporary"
+             node = next(live, None) if numel else None
+@@ -1447,12 +1458,12 @@
+             return "no iterator writes its output"
+         moves += [(r.data_ptr(), 0) for r, e in zip(results, empty) if e]
+         spans += [(a, a + n) for a, n in moves]
++        if (why := unexplained(iterators, log)) is not None:
++            return why
+         # the witness's outputs, freed before the host's run
+         made.clear()
+         del got, results, iterators, w
+         operands = outs = o = None
+-        if torch._C._cuda_hostTraceAllocationCount(self.device.index) != allocations + witnessed:
+-            return "its witness allocated"
+         allocated = len(self.allocs)
+ 
+         # each kernel's byte classes (LaunchLayout.h) where its launch site's
+@@ -1503,7 +1514,6 @@
+             if not all(scalar_value(n, n.images, 0) for n in kernels):
+                 return "a kernel's CPU scalar member is not eager's read of the CPU buffer"
+             for k in range(1, len(probes)):
+-                before = torch._C._cuda_hostTraceAllocationCount(self.device.index)
+                 if isinstance(again := witness(at_probe(k)), str):
+                     return f"at another value of its CPU buffer, {again}"
+                 if metadata(again[1], again[0], k) != traced_metadata:
+@@ -1512,9 +1522,9 @@
+                     marked = {(p, at + i) for p, at, c in scalars.get(id(n), ()) for i in range(len(torch._C._cuda_hostTraceCpuScalarBytes(probes[k], c)))}
+                     if not scalar_value(n, m.images, k) or any(c not in "kp." and (p, b) not in marked and x != y for p, (cs, ib, jb) in enumerate(zip(classes[id(n)], n.images, m.images)) for b, (c, x, y) in enumerate(zip(cs, ib, jb))):
+                         return "a CPU buffer's value sets other than its kernels' CPU scalar members"
++                if (why := unexplained(again[1], again[4])) is not None:
++                    return f"at another value of its CPU buffer, {why}"
+                 del again
+-                if torch._C._cuda_hostTraceAllocationCount(self.device.index) - before != witnessed:
+-                    return "its witness allocated"
+         # a functor's pointer member replays as its operand's address
+         roots = {id(s): (s.data_ptr(), s.data_ptr() + s.untyped_storage().nbytes(), t) for s, t in traced.values()}
+         addresses: dict[int, list[tuple[int, int, _TracedTensor, int]]] = {}

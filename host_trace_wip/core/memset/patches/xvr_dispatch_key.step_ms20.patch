@@ -1,0 +1,111 @@
+diff -ru -x __pycache__ step_ms20/test/test_cuda_host_trace_replay.py step_ms21/test/test_cuda_host_trace_replay.py
+--- step_ms20/test/test_cuda_host_trace_replay.py	2026-10-17 14:25:20.668639940 -0700
++++ step_ms21/test/test_cuda_host_trace_replay.py	2026-10-18 10:23:09.510059111 -0700
+@@ -1262,6 +1262,44 @@
+         self.assertEqual((kind, op, where, refusal), ("graph", None, f"test/test_cuda_host_trace_replay.py:{line}", None))
+         self.assertEqual((f.traces, sum(f.retrace_causes.values())), (2, 1))
+ 
++    def test_a_dispatch_learned_in_one_variant_serves_another(self):
++        # a variant per side of y's 4 rows, both with tactic_op on x: the class 17..32 dispatched again in the first
++        # variant is the second's too (the family's dispatches, keyed by what the redo reads: an input's extent as
++        # its length, emptiness and overlaps, not the variant trace's bytes), so the second takes it with no redo body
++        import torch.cuda._host_trace_redispatch as rd
++
++        def fn(x, y):
++            return tactic_op(x) * (2 if y.shape[0] > 4 else 3)
++
++        f = HostTraceReplay(fn)
++        xs = {m: torch.randn(m, 64, device="cuda") for m in (16, 24)}
++        ys = {m: torch.randn(m, device="cuda") for m in (2, 8)}
++        for m, k in ((16, 2), (24, 2), (16, 8)):
++            self.assertEqual(f(xs[m], ys[k]), fn(xs[m], ys[k]), atol=0, rtol=0)
++        self.assertEqual((f.traces, f.redispatches, len(f.variants)), (2, 1, 2))
++        hits, bodies = rd.dispatch_hits, rd.redo_bodies
++        self.assertEqual(f(xs[24], ys[8]), fn(xs[24], ys[8]), atol=0, rtol=0)
++        self.assertEqual((f.traces, f.redispatches), (2, 2))
++        self.assertEqual((rd.dispatch_hits - hits, rd.redo_bodies - bodies), (1, 0))
++        for m, k in ((24, 2), (24, 8), (16, 8), (16, 2)):
++            self.assertEqual(f(xs[m], ys[k]), fn(xs[m], ys[k]), atol=0, rtol=0)
++        self.assertEqual((f.traces, f.redispatches), (2, 2))
++
++    def test_a_redo_reads_extents_only_for_overlap(self):
++        # the family's dispatch key holds an input's extent as its length and emptiness and the inputs' overlaps
++        # (_host_trace_redispatch._redo): sound while the trace reads extents only for the written/read overlap test
++        # (_Trace._eager_call). A new reader of an extent must update the key; this fails until it is reviewed
++        import inspect
++
++        import torch.cuda._host_trace_redispatch as rd
++        import torch.cuda._host_trace_tape as tape
++
++        readers = [line.strip() for line in inspect.getsource(tape).splitlines() if ".extent" in line and not line.strip().startswith("#")]
++        self.assertEqual(len(readers), 2, readers)
++        self.assertTrue(all(r.startswith(("others = [", "overlap = any(")) for r in readers), readers)
++        keyed = [line.strip() for line in inspect.getsource(rd).splitlines() if ".extent" in line and not line.strip().startswith("#")]
++        self.assertEqual(len(keyed), 3, keyed)
++
+     def test_a_refused_redispatch_tries_the_refusing_op_first(self):
+         # the enqueuing op refuses past 32 rows: once it has refused for a
+         # variant, its redispatch tries it before the tactic op, so a refusal
+diff -ru -x __pycache__ step_ms20/torch/cuda/_host_trace_redispatch.py step_ms21/torch/cuda/_host_trace_redispatch.py
+--- step_ms20/torch/cuda/_host_trace_redispatch.py	2026-10-15 20:03:55.868326544 -0700
++++ step_ms21/torch/cuda/_host_trace_redispatch.py	2026-10-18 07:01:03.764541576 -0700
+@@ -67,6 +67,11 @@
+     from torch.cuda._host_trace_tape import OpRec
+ 
+ 
++# test and diagnosis: redos a dispatch of the family served (no body run), and redo bodies run
++dispatch_hits = 0
++redo_bodies = 0
++
++
+ def redispatch(
+     lowered: LoweredTape,
+     args: Sequence[Any],
+@@ -592,7 +597,11 @@
+                 layout = [value(n) for n in rec.sizes], [value(s) for s in rec.strides], value(rec.offset)
+                 rec = replace(rec, sizes=layout[0], strides=layout[1], offset=layout[2], root=roots[id(r)])
+                 inputs.append(rec)
+-                shape.append((rec.dtype, rec.extent, rec.cow))
++                # what a redo reads of an input's extent (its place is the variant's trace's): its length, whether it is
++                # empty, and (the dispatch key's) its overlap with the other inputs (_Trace._eager_call's written/read
++                # test; test_a_redo_reads_extents_only_for_overlap keeps it the only reader)
++                first, last = rec.extent
++                shape.append((rec.dtype, last - first, first <= last, rec.cow))
+             else:
+                 # the storage, as trace() has it: an as_strided bound
+                 if r.kind == "allocation":
+@@ -625,7 +634,9 @@
+     if dispatches is not None and ir and not any(isinstance(a, torch.Tensor) and not isinstance(a, _TracedTensor) for a in pytree.tree_leaves(op.call)):
+         index = {k: i for i, k in enumerate([*map(id, (*made, *roots.values())), *tensors])}
+         read = tuple((index[id(x)], x.node.node.args[0] in env.ctx.positive) if isinstance(x, torch.SymInt) else (index[id(x)],) if isinstance(x, (_Root, _TracedTensor)) else x for x in shape)
+-        sig = (op.func if isinstance(op.func, OpOverload) else op.redo, op.kind, repr(pytree.tree_structure(op.call)), read)
++        live = [(i, r.extent) for i, r in enumerate(inputs) if r.extent[0] <= r.extent[1]]
++        overlaps = tuple((i, j) for i, a in live for j, b in live if i < j and a[0] <= b[1] and b[0] <= a[1])
++        sig = (op.func if isinstance(op.func, OpOverload) else op.redo, op.kind, repr(pytree.tree_structure(op.call)), read, overlaps)
+         try:
+             hash(sig)
+         except TypeError:
+@@ -637,10 +648,14 @@
+         for c in reversed(dispatches[sig]):
+             at = {s.node.node.args[0]: h for s, h in zip(c[1], hints)}
+             with contextlib.suppress(KeyError, ArithmeticError, ValueError):
+-                if all(consts.transfer(g, c[0].shape_env.ctx, at, {}).op == "true" for g, _ in c[0].shape_env.records):
++                # its guards and its checks of the call's values (both become the entry's guards)
++                held = [*(g for g, _ in c[0].shape_env.records), *(ch.node.node for ch in c[0].checks)]
++                if all(consts.transfer(g, c[0].shape_env.ctx, at, {}).op == "true" for g in held):
+                     cached = c
+                     break
++    global dispatch_hits, redo_bodies
+     if cached is not None:
++        dispatch_hits += 1
+         tr, made_then, roots_then = cached
+         env = tr.shape_env
+         renamer = IRRename(old.shape_env, env, renamer.refusal)
+@@ -666,6 +681,7 @@
+         _active.trace = tr
+         # an operator's dispatch runs where _TraceMode dispatched it, a launcher where the host called it
+         mode = contextlib.nullcontext() if isinstance(op.func, OpOverload) else _TraceMode(tr)
++        redo_bodies += 1
+         try:
+             # hosted: inside the caller's _hosting, one capture for all its redos
+             with contextlib.nullcontext() if hosted else _hosting(old.device):

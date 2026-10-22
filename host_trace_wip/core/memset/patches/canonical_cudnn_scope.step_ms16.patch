@@ -1,0 +1,107 @@
+diff -ru -x __pycache__ -x '*.pyc' step_ms16/test/test_cuda_host_trace_harvest.py step_ms17/test/test_cuda_host_trace_harvest.py
+--- step_ms16/test/test_cuda_host_trace_harvest.py	2026-10-15 18:10:49.558799183 -0700
++++ step_ms17/test/test_cuda_host_trace_harvest.py	2026-10-17 01:38:22.888100990 -0700
+@@ -780,6 +780,53 @@
+         sibling = harvest._canonical(OpaqueBinding((dataclasses.replace(kernel, loose=n.loose),), ()), bool, like=b)
+         self.assertEqual(sibling.nodes[0].images, n.images)
+ 
++    def test_a_tensor_map_parameter_is_never_zeroed(self):
++        # a cuBLAS nvjet kernel takes its operands' TMA descriptors (CUtensorMaps, 128 bytes at a 64-byte aligned
++        # offset) as parameters: a word of the map that reads as a stale address's high half is the map's encoding, and
++        # zeroed (stale high halves, _canonical) the kernel's TMA store traps with an illegal instruction (Flash-Next,
++        # 10-16). A real map, after a 16-byte struct of a stale high half: the struct's half is zeroed, the map kept
++        from cuda.bindings import driver
++
++        from torch.cuda._utils import _check_cuda_bindings
++
++        x = torch.zeros(256, 256, device="cuda", dtype=torch.bfloat16)
++        cu = driver.CUtensorMapDataType.CU_TENSOR_MAP_DATA_TYPE_BFLOAT16
++        tmap = _check_cuda_bindings(
++            driver.cuTensorMapEncodeTiled(
++                cu, 2, x.data_ptr(), [driver.cuuint64_t(256)] * 2, [driver.cuuint64_t(512)], [driver.cuuint32_t(64)] * 2, [driver.cuuint32_t(1)] * 2,
++                driver.CUtensorMapInterleave.CU_TENSOR_MAP_INTERLEAVE_NONE,
++                driver.CUtensorMapSwizzle.CU_TENSOR_MAP_SWIZZLE_128B,
++                driver.CUtensorMapL2promotion.CU_TENSOR_MAP_L2_PROMOTION_NONE,
++                driver.CUtensorMapFloatOOBfill.CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE,
++            )
++        )
++        map_bytes = b"".join(int(w).to_bytes(8, "little") for w in tmap.opaque)
++        self.assertEqual(len(map_bytes), 128)
++        self.assertTrue(any(int.from_bytes(map_bytes[o : o + 8], "little") >> 32 for o in range(0, 128, 8)))
++        struct = (0xFF11_0000_0020).to_bytes(8, "little") + bytes(8)
++        kernel = OpaqueKernel(0, (1, 1, 1), (1, 1, 1), 0, (), ((0, 16), (64, 128)), (struct, map_bytes), (), ())
++        b = harvest._canonical(OpaqueBinding((kernel,), ()), lambda q: True)
++        n = b.nodes[0]
++        self.assertEqual(int.from_bytes(n.images[0][:8], "little"), 0x20)
++        self.assertEqual(n.images[1], map_bytes)
++
++    def test_a_cublas_binding_is_never_canonical(self):
++        # _canonical zeroes stale-looking high halves of constant words, for cuDNN's heap-built parameter structs; a
++        # cuBLAS binding's constants are its own (an nvjet kernel's tensor maps among them): it never runs on one
++        calls = []
++        real = harvest._canonical
++
++        def spy(binding, *args, **kwargs):
++            calls.append(binding)
++            return real(binding, *args, **kwargs)
++
++        p = HarvestProvider()
++        a, b = (torch.randn(*s, device="cuda", dtype=torch.bfloat16) for s in ((64, 512), (512, 256)))
++        with mock.patch.object(harvest, "_canonical", spy):
++            binding, why = _learn(p, aten.mm.default, (a, b))
++        self.assertIsNotNone(binding, why)
++        self.assertEqual(calls, [])
++
+     def test_scratch_blocks_share_as_eager_frees_them(self):
+         def shared(uses, sizes):
+             nodes = tuple(OpaqueMemset(Slot(0, 0, "scratch", j, 0), 0, 1, 1, 1, 1) for j in uses)
+diff -ru -x __pycache__ -x '*.pyc' step_ms16/torch/cuda/_host_trace_harvest.py step_ms17/torch/cuda/_host_trace_harvest.py
+--- step_ms16/torch/cuda/_host_trace_harvest.py	2026-10-15 13:17:46.535606752 -0700
++++ step_ms17/torch/cuda/_host_trace_harvest.py	2026-10-17 01:38:12.728526363 -0700
+@@ -959,6 +959,13 @@
+     return dataclasses.replace(binding, nodes=_scratch_renumbered(binding.nodes, renumber), scratch=tuple(n for _, n in groups))
+ 
+ 
++def _tensor_map(param: tuple[int, int]) -> bool:
++    # a kernel parameter shaped as a CUtensorMap (128 bytes at a 64-byte aligned offset): a TMA descriptor the library
++    # encoded, as cuBLAS's nvjet kernels take them
++    offset, size = param
++    return size == 128 and offset % 64 == 0
++
++
+ def _canonical(binding: OpaqueBinding, stale: Callable[[int], bool], like: OpaqueBinding | None = None) -> OpaqueBinding:
+     # each constant qword (alike in every capture, no slot's, not loose) whose
+     # high half is a stale address's with that half zeroed: cuDNN builds its
+@@ -982,6 +989,10 @@
+         loose = {(p, o + i) for p, o, size in n.loose for i in range(size)}
+         images, runs = list(n.images), []
+         for param, image in enumerate(n.images):
++            if _tensor_map(n.params[param]):
++                # a CUtensorMap's words are its encoding (a field there that reads as an address's high half is
++                # the map's, and a TMA load or store through a map with it zeroed traps): never canonical
++                continue
+             for i, q in enumerate(_qwords(image, 0)):
+                 off = 8 * i
+                 if not q >> 32:
+@@ -2133,7 +2144,9 @@
+                 if stray is not None:
+                     raise _NoSibling("parameter {} byte {}: {:#x} is no constant".format(*stray))
+                 nodes.append(dataclasses.replace(n, images=tuple(images), slots=slots, loose=t.loose))
+-            binding = _canonical(_renumbered(nodes, [n for _, n in blocks], 0, cap[6], key.op in _OUT), bool, like=template)
++            binding = _renumbered(nodes, [n for _, n in blocks], 0, cap[6], key.op in _OUT)
++            if key.op in _CUDNN:
++                binding = _canonical(binding, bool, like=template)
+             shared = _shared(binding)
+             # its blocks shared as the template's are (unshared if the template's shared form refused)
+             return shared if len(shared.scratch) == len(template.scratch) else binding
+@@ -2415,7 +2428,9 @@
+         # halves zeroed, then the captured bytes; each with its scratch shared
+         # (a block that must start zeroed, or a node reaching a block past its
+         # slots, refuses that), then each block its own
+-        canonical = _canonical(binding, stale_high)
++        # only for cuDNN's bindings, whose parameter structs it builds on the heap before the captures (what
++        # _canonical is for); a cuBLAS / CUTLASS binding's constants are its own (its tensor maps' words among them)
++        canonical = _canonical(binding, stale_high) if op in _CUDNN else binding
+         forms = []
+         for c in (canonical, binding) if canonical is not binding else (binding,):
+             shared = _shared(c)

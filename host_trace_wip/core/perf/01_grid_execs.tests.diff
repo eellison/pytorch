@@ -1,0 +1,87 @@
+--- a/test/test_cuda_host_trace_replay.py
++++ b/test/test_cuda_host_trace_replay.py
+@@ -356,6 +356,51 @@
+         self.assertEqual(f.eager, 0)
+         self.assertEqual(f.replays, len(sizes) - 1)
+ 
++    @parametrize("cap", [0, 1, 4])
++    def test_a_launch_configuration_gets_its_own_exec(self, cap):
++        # three grids of one variant, alternating: under the cap each grid gets
++        # an exec of its own, instantiated once (the trace's grid takes the
++        # segment's exec), so a grid change sets no grid in an exec; past the
++        # cap, and at 0, an exec is re-gridded in place
++        f = HostTraceReplay(add)
++        xs = [torch.randn(n, device="cuda") for n in (1000, 3000, 5000)]
++        was = torch._C._host_trace_grid_execs(cap)[0]
++        try:
++            before = torch._C._host_trace_grid_execs(-1)
++            for _ in range(3):
++                for x in xs:
++                    self.assertEqual(f(x), x + 3, atol=0, rtol=0)
++            after = torch._C._host_trace_grid_execs(-1)
++        finally:
++            torch._C._host_trace_grid_execs(was)
++        instantiations, switches = after[1] - before[1], after[2] - before[2]
++        self.assertEqual((len(f.variants), f.traces, f.replays, f.eager), (1, 1, 8, 0))
++        self.assertEqual(instantiations, {0: 0, 1: 1, 4: 2}[cap])
++        self.assertEqual(switches > 0, cap > 0)
++
++    @parametrize("frozen", [False, True])
++    def test_frozen_grid_execs_instantiate_nothing_after_warm_up(self, frozen):
++        # warm up two grids, then a third: frozen, the third re-grids an exec
++        # in place on every replay instead of instantiating one
++        f = HostTraceReplay(add)
++        warm = [torch.randn(n, device="cuda") for n in (1000, 3000)]
++        new = torch.randn(5000, device="cuda")
++        was = torch._C._host_trace_grid_execs(4)[0]
++        was_frozen = torch._C._host_trace_grid_execs_frozen(-1)[0]
++        try:
++            for x in warm + warm:
++                self.assertEqual(f(x), x + 3, atol=0, rtol=0)
++            torch._C._host_trace_grid_execs_frozen(int(frozen))
++            before = torch._C._host_trace_grid_execs(-1)[1], torch._C._host_trace_grid_execs_frozen(-1)[1]
++            for x in [new, new, *warm, new, *warm, new]:
++                self.assertEqual(f(x), x + 3, atol=0, rtol=0)
++            after = torch._C._host_trace_grid_execs(-1)[1], torch._C._host_trace_grid_execs_frozen(-1)[1]
++        finally:
++            torch._C._host_trace_grid_execs(was)
++            torch._C._host_trace_grid_execs_frozen(int(was_frozen))
++        self.assertEqual((len(f.variants), f.traces, f.replays, f.eager), (1, 1, 11, 0))
++        self.assertEqual((after[0] - before[0], after[1] - before[1]), (0, 4) if frozen else (1, 0))
++
+     @parametrize("layout", ["contiguous", "transposed", "sliced", "strided"])
+     def test_numerics_across_strides(self, layout):
+         f = HostTraceReplay(scale2d)
+--- a/test/test_cuda_host_trace_opaque.py
++++ b/test/test_cuda_host_trace_opaque.py
+@@ -724,6 +724,30 @@
+             self.assertEqual(torch._C._host_trace_memory_node_sets() - sets, int(n % 256 == 0))
+         self.assertEqual((f.traces, f.replays), (traces, replays + 24))
+ 
++    @parametrize("cap", [0, 2, 8])
++    def test_binding_switches_with_grid_execs(self, cap):
++        # test_binding_switches with an exec per launch configuration: forms
++        # and sizes alternate, each (form, grid) an exec of its own under the cap
++        p = TableProvider(style="mixed")
++        f = HostTraceReplay(mul_chain, opaque=(p,))
++        base = torch.randn(4096, device="cuda")
++        cases = [(512, 0), (640, 0), (512, 4), (640, 4), (1024, 0), (1280, 4)]
++        was = torch._C._host_trace_grid_execs(cap)[0]
++        try:
++            before = torch._C._host_trace_grid_execs(-1)
++            for _ in range(4):
++                for n, offset in cases:
++                    x, y = torch.randn(n, device="cuda"), base[offset : offset + n]
++                    base.normal_()
++                    self.assertEqual(f(x, y), mul_chain(x, y), atol=0, rtol=0)
++            after = torch._C._host_trace_grid_execs(-1)
++        finally:
++            torch._C._host_trace_grid_execs(was)
++        self.assertEqual(len(bound(f)), 1)
++        self.assertEqual(f.eager, 0)
++        self.assertGreater(f.replays, 0)
++        self.assertEqual(after[1] - before[1] > 0, cap > 0)
++
+     @parametrize("form_held", [False, True])
+     def test_form_switch_sets_what_the_forms_exec_lacks(self, form_held):
+         # forms alternating on the same inputs: with form_held each form's exec

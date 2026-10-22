@@ -1,0 +1,283 @@
+--- a/torch/csrc/cuda/host_trace/EagerStep.cpp	2026-10-13 19:08:30.998176188 -0700
++++ b/torch/csrc/cuda/host_trace/EagerStep.cpp	2026-10-15 22:13:16.287116030 -0700
+@@ -242,15 +242,22 @@
+   // held until it is queued.
+   const bool observed_run = run && observed(*run);
+   if (observed_run || (memory.order.empty() && (sections.empty() || !memory.temporaries.empty()))) {
++    // a run buffer's run places a section's temporaries with its own, over
++    // its op's launches (Entry::last_seq), as eager frees them after its op
++    c10::SmallVector<const Entry*, 4> placed;
+     for (const Entry* e : sections) {
+-      make(*e, held);
++      if (memory.order.empty() && !memory.temporaries.empty() && e->last_seq >= 0) {
++        placed.push_back(e);
++      } else {
++        make(*e, held);
++      }
+     }
+     int64_t pt = phase_now();
+     for (int64_t k : memory.tensors) {
+       allocate_tensor(k, frame);
+     }
+     phase_add(11, pt);
+-    at::Tensor scratch = run_buffer(memory, frame);
++    at::Tensor scratch = run_buffer(memory, frame, placed);
+     phase_add(12, pt);
+     return scratch;
+   }
+@@ -320,23 +327,43 @@
+   return run_buffer(memory, frame);
+ }
+ 
+-at::Tensor HostTraceVariant::run_buffer(const StepMemory& memory, Frame& frame)
+-    const {
++at::Tensor HostTraceVariant::run_buffer(
++    const StepMemory& memory,
++    Frame& frame,
++    c10::ArrayRef<const Entry*> sections) const {
+   if (memory.temporaries.empty()) {
+     return at::Tensor();
+   }
+   // _host_trace_memory.place: each temporary takes the lowest gap among
+-  // those live at its allocation (first fit)
++  // those live at its allocation (first fit); a placed section's temporaries
++  // are made at its made_seq and live to its last_seq
+   struct Live {
+     int64_t offset, end, last;
+   };
+   const size_t count = memory.temporaries.size();
++  auto round_up = [](int64_t n) { return (n + kBlock - 1) / kBlock * kBlock; };
+   auto rounded = [&](size_t i) {
+-    const int64_t n = alloc_bytes(memory.temporaries[i].alloc, frame);
+-    return (n + kBlock - 1) / kBlock * kBlock;
++    return round_up(alloc_bytes(memory.temporaries[i].alloc, frame));
+   };
++  c10::SmallVector<const Entry*, 4> ordered(sections.begin(), sections.end());
++  std::stable_sort(ordered.begin(), ordered.end(), [](const Entry* a, const Entry* b) {
++    return a->made_seq < b->made_seq;
++  });
++  // per placed section its seqs and temporaries' sizes, which with the run's
++  // own sizes decide the placement
++  c10::SmallVector<int64_t, 8> section_sizes, section_key;
++  for (const Entry* e : ordered) {
++    section_key.push_back(e->made_seq);
++    section_key.push_back(e->last_seq);
++    section_key.push_back(static_cast<int64_t>(e->temporaries.size()));
++    for (int64_t row : e->temporaries) {
++      section_sizes.push_back(round_up(frame.values[row]));
++      section_key.push_back(section_sizes.back());
++    }
++  }
+   // the last placement holds while the rows that size the temporaries (a few:
+-  // many temporaries share one) and the scratch buffers' sizes are its
++  // many temporaries share one), the scratch buffers' sizes and the placed
++  // sections and their temporaries' sizes are its
+   const int64_t* v = frame.values.data();
+   bool reuse = placement_reuse_enabled && memory.placed_total >= 0;
+   for (size_t k = 0; reuse && k < memory.size_rows.size(); ++k) {
+@@ -346,6 +373,8 @@
+     const size_t i = memory.site_temporaries[j];
+     reuse = rounded(i) == memory.placed_sizes[i];
+   }
++  reuse = reuse &&
++      std::equal(section_key.begin(), section_key.end(), memory.placed_section_key.begin(), memory.placed_section_key.end());
+   if (!reuse) {
+     memory.placed_total = -1;
+     memory.placed_sizes.resize(count);
+@@ -357,43 +386,62 @@
+       memory.placed_row_values[k] = v[memory.size_rows[k]];
+     }
+     memory.placed_offsets.assign(count, 0);
++    memory.placed_section_key.assign(section_key.begin(), section_key.end());
++    memory.placed_section_offsets.assign(section_sizes.size(), 0);
+   }
+   const std::vector<int64_t>& sizes = memory.placed_sizes;
+   std::vector<int64_t>& offsets = memory.placed_offsets;
+-  int64_t total = memory.placed_total;
+-  c10::SmallVector<Live, 16> live;
+-  for (size_t i = 0; total < 0 && i < count; ++i) {
+-    const Temporary& tmp = memory.temporaries[i];
+-    const int64_t size = sizes[i];
+-    if (size == 0) {
+-      continue;
+-    }
+-    live.erase(
+-        std::remove_if(
+-            live.begin(),
+-            live.end(),
+-            [&](const Live& b) { return b.last <= tmp.seq; }),
+-        live.end());
+-    std::sort(live.begin(), live.end(), [](const Live& a, const Live& b) {
+-      return std::tie(a.offset, a.end, a.last) <
+-          std::tie(b.offset, b.end, b.last);
+-    });
+-    int64_t at = 0;
+-    for (const Live& b : live) {
+-      if (b.offset - at >= size) {
+-        break;
+-      }
+-      at = std::max(at, b.end);
+-    }
+-    offsets[i] = at;
+-    live.push_back({at, at + size, tmp.last});
+-    memory.placed_total = std::max(memory.placed_total, at + size);
+-  }
+   if (memory.placed_total < 0) {
+-    memory.placed_total = 0;
++    c10::SmallVector<Live, 16> live;
++    auto take = [&](int64_t size, int64_t seq, int64_t last) {
++      live.erase(
++          std::remove_if(
++              live.begin(),
++              live.end(),
++              [&](const Live& b) { return b.last <= seq; }),
++          live.end());
++      std::sort(live.begin(), live.end(), [](const Live& a, const Live& b) {
++        return std::tie(a.offset, a.end, a.last) <
++            std::tie(b.offset, b.end, b.last);
++      });
++      int64_t at = 0;
++      for (const Live& b : live) {
++        if (b.offset - at >= size) {
++          break;
++        }
++        at = std::max(at, b.end);
++      }
++      live.push_back({at, at + size, last});
++      memory.placed_total = std::max(memory.placed_total, at + size);
++      return at;
++    };
++    // the run's temporaries in tape order and the sections by made_seq, merged
++    // by seq (a section first on a tie)
++    size_t s = 0, base = 0;
++    for (size_t i = 0; i <= count; ++i) {
++      while (s < ordered.size() && (i == count || ordered[s]->made_seq <= memory.temporaries[i].seq)) {
++        for (size_t j = 0; j < ordered[s]->temporaries.size(); ++j, ++base) {
++          if (section_sizes[base]) {
++            memory.placed_section_offsets[base] = take(section_sizes[base], ordered[s]->made_seq, ordered[s]->last_seq);
++          }
++        }
++        ++s;
++      }
++      if (i < count && sizes[i]) {
++        offsets[i] = take(sizes[i], memory.temporaries[i].seq, memory.temporaries[i].last);
++      }
++    }
++    if (memory.placed_total < 0) {
++      memory.placed_total = 0;
++    }
+   }
+-  total = memory.placed_total;
++  const int64_t total = memory.placed_total;
+   if (total == 0) {
++    for (const Entry* e : ordered) {
++      for (size_t j = 0; j < e->temporaries.size(); ++j) {
++        frame.bases[e->first_base + j] = 0;
++      }
++    }
+     return at::Tensor();
+   }
+   at::Tensor scratch = at::native::empty_cuda(
+@@ -409,6 +457,12 @@
+       frame.bases[memory.temporaries[i].alloc] = at + offsets[i];
+     }
+   }
++  size_t base = 0;
++  for (const Entry* e : ordered) {
++    for (size_t j = 0; j < e->temporaries.size(); ++j, ++base) {
++      frame.bases[e->first_base + j] = at + memory.placed_section_offsets[base];
++    }
++  }
+   return scratch;
+ }
+ 
+--- a/torch/csrc/cuda/host_trace/Sites.cpp	2026-10-15 10:17:21.746239681 -0700
++++ b/torch/csrc/cuda/host_trace/Sites.cpp	2026-10-15 21:29:28.955413979 -0700
+@@ -663,7 +663,9 @@
+     const std::vector<int64_t>& temporaries,
+     const std::vector<int64_t>& drops,
+     int64_t alloc_at,
+-    int64_t free_at) {
++    int64_t free_at,
++    int64_t made_seq,
++    int64_t last_seq) {
+   TORCH_CHECK_VALUE(
+       site < sites_.size() && !sites_[site].predicates.empty(),
+       "no selector ",
+@@ -700,6 +702,14 @@
+         free_at);
+     e->alloc_at = static_cast<size_t>(alloc_at);
+     e->free_at = static_cast<size_t>(free_at);
++    TORCH_CHECK_VALUE(
++        last_seq == -1 || (m.order.empty() && made_seq < last_seq),
++        "a section's seqs ",
++        made_seq,
++        ", ",
++        last_seq);
++    e->made_seq = made_seq;
++    e->last_seq = last_seq;
+   }
+   for (int64_t k : drops) {
+     TORCH_CHECK_VALUE(
+--- a/torch/csrc/cuda/host_trace/Entry.cpp	2026-10-15 14:11:53.752616651 -0700
++++ b/torch/csrc/cuda/host_trace/Entry.cpp	2026-10-15 21:29:28.955128058 -0700
+@@ -1929,7 +1929,9 @@
+           py::arg("temporaries") = std::vector<int64_t>(),
+           py::arg("drops") = std::vector<int64_t>(),
+           py::arg("alloc_at") = 0,
+-          py::arg("free_at") = 0)
++          py::arg("free_at") = 0,
++          py::arg("made_seq") = -1,
++          py::arg("last_seq") = -1)
+       .def(
+           "set_program",
+           &HostTraceVariant::set_program,
+--- a/torch/csrc/cuda/host_trace/Variant.h	2026-10-15 11:31:14.343225472 -0700
++++ b/torch/csrc/cuda/host_trace/Variant.h	2026-10-15 22:13:10.547799280 -0700
+@@ -286,7 +286,9 @@
+       const std::vector<int64_t>& temporaries,
+       const std::vector<int64_t>& drops,
+       int64_t alloc_at,
+-      int64_t free_at);
++      int64_t free_at,
++      int64_t made_seq,
++      int64_t last_seq);
+   // Replaces the program by one that extends it (rows added, for add_entry)
+   void set_program(const HostTraceProgram& program);
+   // the lowering's safe cut points of a segment (record offsets, sorted), for
+@@ -452,6 +454,12 @@
+     std::vector<int64_t> drops;
+     size_t alloc_at = 0;
+     size_t free_at = 0;
++    // in a run buffer's run (no order): the seqs its temporaries are made at
++    // (before its op's first launch) and last used at (its op's last launch),
++    // over which they take the buffer's bytes first fit with the run's own
++    // temporaries; last_seq -1: made before the run and held over it
++    int64_t made_seq = -1;
++    int64_t last_seq = -1;
+   };
+   // A keyed launch table: per key, filled once, the row its nodes run. A
+   // selector (a top-level op's own guards) has no key: the first of its
+@@ -625,6 +633,10 @@
+     std::vector<int64_t> size_rows;
+     std::vector<size_t> site_temporaries;
+     mutable std::vector<int64_t> placed_row_values;
++    // the sections placed with them (Entry::last_seq), in made_seq order:
++    // per section its seqs, temporary count and sizes; their offsets
++    mutable std::vector<int64_t> placed_section_key;
++    mutable std::vector<int64_t> placed_section_offsets;
+   };
+   enum class LeafKind : uint8_t { View, Scalar, Constant };
+   struct Leaf {
+@@ -718,7 +730,10 @@
+   bool dropped(int64_t k, const Frame& frame) const;
+   void allocate_tensor(int64_t k, Frame& frame) const;
+   int64_t alloc_bytes(int64_t k, const Frame& frame) const;
+-  at::Tensor run_buffer(const StepMemory& memory, Frame& frame) const;
++  at::Tensor run_buffer(
++      const StepMemory& memory,
++      Frame& frame,
++      c10::ArrayRef<const Entry*> sections = {}) const;
+   // "planned": the buffer, and each planned allocation's base and tensor
+   void plan(Frame& frame, PlanLease& lease) const;
+   // an eager step's fresh output's storage is not the planned buffer's

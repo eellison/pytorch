@@ -1,0 +1,199 @@
+diff -ru '--exclude=__pycache__' '--exclude=TREE.txt' step332_me5/test/test_cuda_host_trace_harvest.py step332_me6/test/test_cuda_host_trace_harvest.py
+--- step332_me5/test/test_cuda_host_trace_harvest.py	2026-10-15 03:11:33.281594999 -0700
++++ step332_me6/test/test_cuda_host_trace_harvest.py	2026-10-15 03:12:24.737810264 -0700
+@@ -31,7 +31,7 @@
+     import torch.cuda._host_trace_harvest as harvest
+     import torch.cuda._host_trace_memory as memory
+     from torch.cuda._host_trace_harvest import _launch, HarvestProvider
+-    from torch.cuda._host_trace_opaque import library_state, OpaqueBinding, OpaqueKernel, OpaqueKey, Slot
++    from torch.cuda._host_trace_opaque import library_state, OpaqueBinding, OpaqueKernel, OpaqueKey, OpaqueMemset, Slot
+     from torch.cuda._host_trace_replay import _BACKGROUND, HostTraceReplay
+     from torch.cuda._host_trace_tape import _cuda_address, _Witness, EagerCall, trace
+ 
+@@ -730,6 +730,20 @@
+         sibling = harvest._canonical(OpaqueBinding((dataclasses.replace(kernel, loose=n.loose),), ()), bool, like=b)
+         self.assertEqual(sibling.nodes[0].images, n.images)
+ 
++    def test_scratch_blocks_share_as_eager_frees_them(self):
++        def shared(uses, sizes):
++            nodes = tuple(OpaqueMemset(Slot(0, 0, "scratch", j, 0), 0, 1, 1, 1, 1) for j in uses)
++            b = harvest._shared(OpaqueBinding(nodes, sizes))
++            return [n.dst.index for n in b.nodes], b.scratch
++
++        # one after the other: one block of the larger's bytes
++        self.assertEqual(shared((0, 0, 1, 1), (8, 16)), ([0, 0, 0, 0], (16,)))
++        # live together: each its own; a later one joins the first free block
++        self.assertEqual(shared((0, 1, 0), (8, 16)), ([0, 1, 0], (8, 16)))
++        self.assertEqual(shared((0, 1, 0, 2), (8, 16, 4)), ([0, 1, 0, 0], (8, 16)))
++        # a block no node reads keeps its own
++        self.assertEqual(shared((0,), (8, 16)), ([0], (8, 16)))
++
+     def test_a_learn_leaves_no_reserved_memory(self):
+         # nothing of verify's outlives the learn: its buffers come from a pool
+         # of their own, which goes back to the device when the harvest is
+@@ -1428,6 +1442,41 @@
+                         continue
+                     self.assertFalse(low <= q >> 32 < 1 << 16 and not _cuda_address(q), f"parameter {param} byte {8 * i}: {q:#x}")
+ 
++    @staticmethod
++    def _wide_backward():
++        # cuDNN's dgrad and wgrad each take a workspace at these sizes
++        x, g = (torch.randn(32, 64, 128, 128, device="cuda", dtype=bf16) for _ in range(2))
++        w = torch.randn(64, 64, 3, 3, device="cuda", dtype=bf16)
++        return g, x, w, None, [1, 1], [1, 1], [1, 1], False, [0, 0], 1, [True, True, False]
++
++    def test_dgrad_and_wgrad_workspaces_share_a_block(self):
++        # eager frees dgrad's workspace before wgrad takes its own: the
++        # binding holds one block of the larger's bytes, both at its start
++        # (wgrad's kernel keeps a stale pointer into dgrad's)
++        op = aten.convolution_backward.default
++        with mock.patch.object(harvest, "_shared", lambda b: b):
++            unshared = self.assertReplays(op, self._wide_backward)
++        if len(unshared.scratch) != 2:
++            self.skipTest(f"workspaces {unshared.scratch} on this cuDNN")
++        self.assertEqual(self.assertReplays(op, self._wide_backward).scratch, (max(unshared.scratch),))
++
++    def test_a_refused_shared_form_binds_unshared(self):
++        # a shared form verify refuses (here its last two kernels swapped:
++        # wgrad's reduction before the partials it reads) gives way to the
++        # binding with each block its own
++        shared = harvest._shared
++
++        def broken(b):
++            s = shared(b)
++            return s if s is b else dataclasses.replace(s, nodes=(*s.nodes[:-2], s.nodes[-1], s.nodes[-2]))
++
++        op = aten.convolution_backward.default
++        with mock.patch.object(harvest, "_shared", broken):
++            binding = self.assertReplays(op, self._wide_backward)
++        if len(binding.scratch) == 1:
++            self.skipTest("one workspace on this cuDNN")
++        self.assertEqual(len(binding.scratch), 2)
++
+     def test_pair(self):
+         # harvested in full from the pair, after the priming capture
+         smeared = torch._C._cuda_hostTraceHarvestCapture
+@@ -2335,7 +2384,7 @@
+         b = p.bindings[next(iter(p.bindings))]
+         self.assertIs(b.topology, b.topology)
+ 
+-    @parametrize("case", ["conv", "attention", "mm"])
++    @parametrize("case", ["conv", "conv_backward", "attention", "mm"])
+     def test_a_learn_costs_at_most_its_workspace(self, case):
+         # the call that learns its key (the trace's warm-up call) holds no
+         # more memory than eager's call but the binding's workspace and small
+@@ -2347,10 +2396,14 @@
+         def attention(q, k, v):
+             return torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
+ 
++        def backward(g, x, w):
++            return aten.convolution_backward(g, x, w, None, [1, 1], [1, 1], [1, 1], False, [0, 0], 1, [True, True, False])[:2]
++
+         fn, args = {
+             "conv": (conv, (torch.randn(64, 64, 128, 128, device="cuda", dtype=bf16), torch.randn(64, 64, 3, 3, device="cuda", dtype=bf16))),
+             "attention": (attention, tuple(torch.randn(32, 16, 2048, 64, device="cuda", dtype=bf16) for _ in range(3))),
+             "mm": (torch.mm, (torch.randn(16384, 4096, device="cuda", dtype=bf16), torch.randn(4096, 4096, device="cuda", dtype=bf16))),
++            "conv_backward": (backward, tuple(torch.randn(64, 64, 128, 128, device="cuda", dtype=bf16) for _ in range(2)) + (torch.randn(64, 64, 3, 3, device="cuda", dtype=bf16),)),
+         }[case]
+         providers = (HarvestProvider(), HarvestProvider(("attention",)), HarvestProvider(("conv",)))
+         with torch.backends.cudnn.flags(enabled=True, benchmark=False, deterministic=True):
+diff -ru '--exclude=__pycache__' '--exclude=TREE.txt' step332_me5/torch/cuda/_host_trace_harvest.py step332_me6/torch/cuda/_host_trace_harvest.py
+--- step332_me5/torch/cuda/_host_trace_harvest.py	2026-10-15 03:11:33.283908484 -0700
++++ step332_me6/torch/cuda/_host_trace_harvest.py	2026-10-15 03:12:24.739945860 -0700
+@@ -814,24 +814,49 @@
+     return (k[0], op, *k[2:])
+ 
+ 
++def _scratch_renumbered(nodes: Iterable[Any], renumber: dict[int, int]) -> tuple:
++    def moved(t: Slot) -> Slot:
++        return dataclasses.replace(t, index=renumber[t.index]) if t.kind == "scratch" else t
++
++    return tuple(
++        dataclasses.replace(n, dst=moved(n.dst)) if isinstance(n, OpaqueMemset) else dataclasses.replace(n, slots=tuple(map(moved, n.slots)))
++        for n in nodes
++    )
++
++
+ def _renumbered(nodes: list, sizes: list[int], increment: int, owner: Any = None, keep: bool = False) -> OpaqueBinding:
+     # only the scratch some slot points into, renumbered; with keep every block (a cuBLAS call's
+     # workspace, which eager allocates whether or not the kernel reads it)
+     used = list(range(len(sizes))) if keep else sorted({t.index for n in nodes for t in _slots(n) if t.kind == "scratch"})
+     renumber = {j: i for i, j in enumerate(used)}
++    return OpaqueBinding(_scratch_renumbered(nodes, renumber), tuple(sizes[j] for j in used), increment, owner)
+ 
+-    def moved(t: Slot) -> Slot:
+-        if t.kind != "scratch":
+-            return t
+-        return dataclasses.replace(t, index=renumber[t.index])
+-
+-    nodes = [
+-        dataclasses.replace(n, dst=moved(n.dst))
+-        if isinstance(n, OpaqueMemset)
+-        else dataclasses.replace(n, slots=tuple(map(moved, n.slots)))
+-        for n in nodes
+-    ]
+-    return OpaqueBinding(tuple(nodes), tuple(sizes[j] for j in used), increment, owner)
++
++def _shared(binding: OpaqueBinding) -> OpaqueBinding:
++    # scratch blocks eager has live one after the other in one block, at
++    # offset 0, as its allocator gives a freed workspace to the next request:
++    # a block joins an earlier one whose later nodes all take the new block
++    # too (they are the new block's call, holding a stale pointer into the
++    # freed one, as cuDNN's wgrad into dgrad's workspace); a block no node
++    # reads keeps its own. verify judges the shared form
++    users: dict[int, set[int]] = {}
++    for x, n in enumerate(binding.nodes):
++        for t in _slots(n):
++            if t.kind == "scratch":
++                users.setdefault(t.index, set()).add(x)
++    groups: list[tuple[set[int], int]] = []  # (the nodes using a shared block, its bytes)
++    renumber = {}
++    for j, size in enumerate(binding.scratch):
++        mine = users.get(j)
++        i = next((i for i, (used, _) in enumerate(groups) if mine and used and all(x in mine for x in used if x >= min(mine))), len(groups))
++        if i == len(groups):
++            groups.append((set(mine or ()), size))
++        else:
++            groups[i] = (groups[i][0] | mine, max(groups[i][1], size))
++        renumber[j] = i
++    if len(groups) == len(binding.scratch):
++        return binding
++    return dataclasses.replace(binding, nodes=_scratch_renumbered(binding.nodes, renumber), scratch=tuple(n for _, n in groups))
+ 
+ 
+ def _canonical(binding: OpaqueBinding, stale: Callable[[int], bool], like: OpaqueBinding | None = None) -> OpaqueBinding:
+@@ -1963,7 +1988,10 @@
+                 if stray is not None:
+                     raise _NoSibling("parameter {} byte {}: {:#x} is no constant".format(*stray))
+                 nodes.append(dataclasses.replace(n, images=tuple(images), slots=slots, loose=t.loose))
+-            return _canonical(_renumbered(nodes, [n for _, n in blocks], 0, cap[6], key.op in _OUT), bool, like=template)
++            binding = _canonical(_renumbered(nodes, [n for _, n in blocks], 0, cap[6], key.op in _OUT), bool, like=template)
++            shared = _shared(binding)
++            # its blocks shared as the template's are (unshared if the template's shared form refused)
++            return shared if len(shared.scratch) == len(template.scratch) else binding
+ 
+         if dev.pool is None:
+             with torch.cuda.device(device):
+@@ -2238,10 +2266,18 @@
+         def stale_high(q: int) -> bool:
+             return (low <= q >> 32 < 1 << 16 or heap[0] <= q < heap[1]) and q not in retired_qwords and not stack[0] <= q < stack[1] and not _cuda_address(q)
+ 
++        # the forms verify judges, the first it passes binding: stale high
++        # halves zeroed, then the captured bytes; each with its scratch shared
++        # (a block that must start zeroed, or a node reaching a block past its
++        # slots, refuses that), then each block its own
+         canonical = _canonical(binding, stale_high)
+-        if canonical is not binding:
++        forms = []
++        for c in (canonical, binding) if canonical is not binding else (binding,):
++            shared = _shared(c)
++            forms += [shared, c] if shared is not c else [c]
++        for form in forms[:-1]:
+             try:
+-                return verify(canonical, stale, names, retired_qwords)
++                return verify(form, stale, names, retired_qwords)
+             except _Refused as e:
+-                log.info("host_trace: %s at sizes %s binds with its captured stale bytes: %s", op, key.sizes, e)
+-        return verify(binding, stale, names, retired_qwords)
++                log.info("host_trace: %s at sizes %s: a form of its binding refused, trying the next: %s", op, key.sizes, e)
++        return verify(forms[-1], stale, names, retired_qwords)

@@ -1,0 +1,32 @@
+diff -ru -x __pycache__ step_ms27/test/test_cuda_host_trace_replay.py step_ms28/test/test_cuda_host_trace_replay.py
+--- step_ms27/test/test_cuda_host_trace_replay.py	2026-10-18 11:46:38.052048355 -0700
++++ step_ms28/test/test_cuda_host_trace_replay.py	2026-10-18 16:50:28.321209014 -0700
+@@ -4629,6 +4629,15 @@
+         # TestOpaqueCalls.test_a_held_binding_at_a_new_key_is_a_native_hit holds as an expected failure)
+         self.assertEqual((f.slow_hits, f.traces, f.replays - before[2]), (before[0], before[1], 5))
+ 
++    def test_the_split_is_on_by_default(self):
++        # a fresh process splits (dirty_min 256) unless TORCH_HOST_TRACE_SPLIT=0
++        import subprocess
++
++        code = "import torch; print(torch._C._host_trace_split(None), torch._C._host_trace_split_policy()[4])"
++        on = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True).stdout.split()
++        off = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True, env={**os.environ, "TORCH_HOST_TRACE_SPLIT": "0"}).stdout.split()
++        self.assertEqual((on, off[0]), (["True", "256"], "False"))
++
+     def test_a_split_call_needs_dirty_records(self):
+         # the split only where the call's patch would be exposed: a steady call (nothing dirty) launches the whole
+         # exec, a size change dirtying at least dirty_min records launches the sections, each patching its own.
+@@ -5909,8 +5918,10 @@
+ def setUpModule():
+     from torch.cuda import _host_trace_hint_audit
+ 
+-    # the split tests launch a split run's sections every call (TestReplayCounters.test_a_split_call_needs_dirty_records
+-    # sets the dirty threshold itself)
++    # the split is on by default (TORCH_HOST_TRACE_SPLIT); this module's tests count launches of whole execs and opt into
++    # the split themselves, which then launches a split run's sections every call
++    # (TestReplayCounters.test_a_split_call_needs_dirty_records sets the dirty threshold itself)
++    torch._C._host_trace_split(False)
+     torch._C._host_trace_split_policy(dirty_min=0)
+     import torch.cuda._host_trace_capture as capture
+ 

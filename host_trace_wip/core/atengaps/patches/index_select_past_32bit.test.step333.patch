@@ -1,0 +1,87 @@
+--- step333/test/test_cuda_host_trace_aten.py	2026-10-12 13:08:50.751612005 -0700
++++ step335_ag/test/test_cuda_host_trace_aten.py	2026-10-14 04:52:10.981596925 -0700
+@@ -290,6 +290,22 @@
+ OFFSET_CALC_STRIDES_AT, OFFSET_CALC_STRIDES_BYTES_PER_OPERAND = 304, 100
+ 
+ 
++# vLLM's PLE short conv: a custom op whose body reads the conv state pool from
++# module state, not from its arguments (the adapter swaps the traced pool in)
++_CONV_STATE = {}
++
++
++@torch.library.custom_op("host_trace_test::select_conv_state", mutates_args=("out",))
++def _select_conv_state(out: torch.Tensor, i: torch.Tensor) -> None:
++    pool = _CONV_STATE["pool"]
++    out.copy_(pool.transpose(-1, -2)[..., -pool.shape[1] :].index_select(0, i))
++
++
++@_select_conv_state.register_fake
++def _(out, i):
++    return None
++
++
+ def _shared_root_copy(x):
+     t = x * x
+     return t[:32].copy_(t[32:])
+@@ -301,7 +317,6 @@
+     "shared_root_copy": (_shared_root_copy, lambda x, y: (x,), [KernelLaunch, EagerCall]),
+     "softmax_inner": (lambda x: torch.softmax(x, 0), lambda x, y: (x,), [EagerCall]),
+     "softmax_strided": (lambda x: torch.softmax(x.t(), -1), lambda x, y: (x,), [EagerCall]),
+-    "index_select_gather_strided": (lambda x, i: x.t().index_select(0, i), lambda x, y: (x, torch.arange(17, device="cuda")), [EagerCall]),
+     "cat_legacy_empty": (lambda x: torch.cat([x, x.new_empty(0)]), lambda x, y: (x,), [EagerCall]),
+     "cat_mixed_dtypes": (lambda x, y: torch.cat([x[0], y]), lambda x, y: (x, y), [EagerCall]),
+ }
+@@ -426,6 +441,11 @@
+         lambda m, h, d: (_randn(300, h, dtype=d), torch.randint(0, 300, (m + 16,), device="cuda", dtype=torch.int32)),
+     ),
+     "embedding_gather": (lambda i, w: F.embedding(i, w), lambda m, h, d: (torch.randint(0, 300, (2, m + 16), device="cuda"), _randn(300, h, dtype=d))),
++    # unit stride along the selected dim: gather's elementwise kernel
++    "index_select_gather_strided": (
++        lambda x, i: x.t().index_select(0, i),
++        lambda m, h, d: (_randn(h, 300, dtype=d), torch.randint(0, 300, (m + 16,), device="cuda")),
++    ),
+ }
+ 
+ 
+@@ -1439,6 +1459,41 @@
+             self._assert_replays_bitwise(entry, fn, args)
+         self.assertEqual((entry.traces, entry.eager), (1, 0))
+ 
++    @parametrize("static", [False, True])
++    @parametrize("custom_op", [False, True])
++    def test_index_select_past_32_bit_indexing(self, custom_op, static):
++        # a view whose span passes 2**31 elements: canUse32BitIndexMath (a guard on
++        # the span) sends index_select to gather_out, whose elementwise kernel is
++        # traced; below 2**31 the same indices take the small-index kernel
++        h, l = 1024, 9
++        raw = torch.randint(0, 256, (2**31 + l * h,), device="cuda", dtype=torch.uint8)
++        pools = {"large": raw.as_strided((3, l, h), (2**30, h, 1)), "small": raw.as_strided((3, l, h), (l * h, h, 1))}
++        kernels = {"large": "_scatter_gather_elementwise_kernel", "small": "indexSelectSmallIndex"}
++
++        self.addCleanup(_CONV_STATE.clear)
++
++        def fn(pool, i):
++            if not custom_op:
++                return pool.transpose(-1, -2)[..., -l:].index_select(0, i)
++            _CONV_STATE["pool"] = pool
++            out = torch.empty(i.shape[0], h, l, device="cuda", dtype=pool.dtype)
++            torch.ops.host_trace_test.select_conv_state(out, i)
++            return out
++
++        entry = HostTraceReplay(fn, static_prefix=int(static))
++        for span, n in (("large", 3), ("large", 5), ("small", 3), ("small", 5), ("large", 2)):
++            args = (pools[span], torch.randint(0, 3, (n,), device="cuda"))
++            tape = trace(fn, args)
++            self.assertFalse([c.reason for _, c in tape.launches if isinstance(c, EagerCall)])
++            with _zero_init():
++                nodes = [node for node in capture_kernel_nodes(lambda s: fn(*args), memcpy=True) if isinstance(node, KernelNode)]
++            self.assertEqual([k for k in kernels.values() if any(k in node.name for node in nodes)], [kernels[span]])
++            self.assertEqual([c.function for _, c in tape.launches if isinstance(c, KernelLaunch)], [node.function for node in nodes])
++            self._assert_replays_bitwise(entry, fn, args)
++        # the span guard flips at each switch: a redispatch of index_select, a new
++        # variant inside the custom op's body
++        self.assertEqual((entry.traces, entry.eager), (1 + custom_op, 0))
++
+     @parametrize("bias", [False, True])
+     def test_a_depthwise_convolution_runs_its_cuda_host(self, bias):
+         # convolution's own host: the shape checks and backend choice over

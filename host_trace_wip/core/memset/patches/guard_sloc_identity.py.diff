@@ -1,0 +1,60 @@
+--- step_ms8_me12/torch/cuda/_host_trace_ir.py	2026-10-12 13:08:50.717611816 -0700
++++ step_ms9/torch/cuda/_host_trace_ir.py	2026-10-15 14:16:32.308152902 -0700
+@@ -269,8 +269,10 @@
+ 
+ 
+ _MINMAX_CALL = re.compile(r"(?<![\w.])(?:max|min)\(")
+-# (code, line, by a SymBool's bool()) -> the provenance guard_sloc gives a guard recorded there
+-_GUARD_SLOCS: dict[tuple[Any, int, bool], SLoc] = {}
++# (id of the code, line, by a SymBool's bool()) -> (the code, the provenance guard_sloc gives a guard recorded
++# there); keyed by identity, as hashing a code object hashes its contents, and holding the code so its id stays its
++_GUARD_SLOCS: dict[tuple[int, int, bool], tuple[Any, SLoc]] = {}
++_SYMBOOL_BOOL = torch.SymBool.__bool__.__code__
+ 
+ 
+ def guard_sloc() -> SLoc:
+@@ -284,16 +286,16 @@
+         inner, f = f, f.f_back
+     if f is None:
+         return _NO_SLOC
+-    k = (f.f_code, f.f_lineno, inner is not None and inner.f_code is torch.SymBool.__bool__.__code__)
+-    sloc = _GUARD_SLOCS.get(k)
+-    if sloc is None:
++    k = (id(f.f_code), f.f_lineno, inner is not None and inner.f_code is _SYMBOOL_BOOL)
++    held = _GUARD_SLOCS.get(k)
++    if held is None:
+         name = f.f_code.co_filename
+         site = f"{os.path.basename(os.path.dirname(name))}/{os.path.basename(name)}:{f.f_lineno}"
+         note = None
+         if k[2] and _MINMAX_CALL.search(linecache.getline(name, f.f_lineno)):
+             note = f"builtin max/min at {os.path.basename(name)}:{f.f_lineno} with trace_builtin_minmax=False; use torch.sym_max"
+-        sloc = _GUARD_SLOCS[k] = SLoc(note, site)
+-    return sloc
++        held = _GUARD_SLOCS[k] = (f.f_code, SLoc(note, site))
++    return held[1]
+ 
+ 
+ class Node:
+--- step_ms8_me12/test/test_cuda_host_trace_guards.py	2026-10-08 20:22:38.462529484 -0700
++++ step_ms9/test/test_cuda_host_trace_guards.py	2026-10-15 14:16:32.310146097 -0700
+@@ -153,6 +153,20 @@
+         self.assertEqual([g.expr for g in env.guards][1:], want)
+ 
+ 
++class TestGuardSloc(TestCase):
++    def test_equal_code_in_two_files_gives_each_its_site(self):
++        # a guard's provenance is the recording code's own line: two code objects
++        # that compare equal (the same source compiled under two file names)
++        # give their own sites
++        src = "def record():\n    return guard_sloc()\n"
++        sites = []
++        for name in ("/tmp/model_a/layers.py", "/tmp/model_b/layers.py"):
++            ns = {"guard_sloc": _ir.guard_sloc}
++            exec(compile(src, name, "exec"), ns)
++            sites.append(ns["record"]().maybe_user_loc)
++        self.assertEqual(sites, ["model_a/layers.py:2", "model_b/layers.py:2"])
++
++
+ class TestIRSymNodeDunders(TestCase):
+     # SymInt's binary dunders call an IRSymNode's method directly for ints
+     # and non-constant IR ints; the generic path must build the same nodes

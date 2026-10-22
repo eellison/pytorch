@@ -1,0 +1,176 @@
+--- a/torch/cuda/_host_trace_lower_tape.py
++++ b/torch/cuda/_host_trace_lower_tape.py
+@@ -165,13 +165,22 @@
+     op: OpOverload, dtypes: tuple, ranks: tuple[int, ...], scalars: tuple, device: int, state: tuple, ints: Iterable[int], alias: tuple
+ ) -> OpaqueKey:
+     # ints: per operand its sizes, then per operand its strides, then per
+-    # operand its address % 256, then a value per symbolic scalar
++    # operand its address % 256, then a value per symbolic scalar, then per
++    # pair of `alias` (the trace's) its distance at the call
+     it = iter(ints)
+     sizes = tuple(tuple(next(it) for _ in range(r)) for r in ranks)
+     strides = tuple(tuple(next(it) for _ in range(r)) for r in ranks)
+     align = tuple(next(it) for _ in ranks)
+     scalars = tuple(next(it) if isinstance(v, (torch.SymInt, ScalarSlot)) else v for v in scalars)
+-    return OpaqueKey(op, dtypes, sizes, strides, align, scalars, device, state, alias)
++    # each storage's operands at the call, up from its lowest as aliasing() has them
++    groups: dict[int, dict[int, int]] = {}
++    for (i, lead, _), d in zip(alias, it, strict=True):
++        groups.setdefault(lead, {lead: 0})[i] = d
++    pairs = []
++    for at in groups.values():
++        low, lead = min((d, i) for i, d in at.items())
++        pairs += [(i, lead, d - low) for i, d in at.items() if i != lead]
++    return OpaqueKey(op, dtypes, sizes, strides, align, scalars, device, state, tuple(sorted(pairs)))
+ 
+ 
+ @dataclass(frozen=True)
+@@ -186,7 +195,7 @@
+     scalars: tuple[Any, ...]  # a ScalarSlot per SymInt, constants
+     device: int
+     state: tuple
+-    alias: tuple = ()  # OpaqueKey.alias, guarded at the trace
++    alias: tuple = ()  # OpaqueKey.alias at the trace; its distances' rows end `rows`
+ 
+     def key(self, values: Sequence[int]) -> OpaqueKey:
+         ints = (values[r] for r in self.rows)
+@@ -207,7 +216,7 @@
+     scratch: dict[int, tuple[int, int]]  # buffer j's
+     nodes: tuple[int, ...]  # indices in `launches`
+     device: int
+-    alias: tuple = ()  # OpaqueKey.alias, guarded at the trace
++    alias: tuple = ()  # OpaqueKey.alias at the trace; its distances' rows end `rows`
+     arena_scratch: frozenset[int] = frozenset()  # buffers in an arena at their traced bytes
+ 
+     def native_scratch(self) -> list[int]:
+@@ -442,16 +451,17 @@
+         align = [self.emit("bitand", self.address(t, v.offset), mask) for t, v in operands]
+         scalars = tuple(v for v in eager.leaves if not isinstance(v, LoweredView))
+         slots = [v.row for v in scalars if isinstance(v, ScalarSlot)]
++        alias, distances = aliasing([t for t, _ in operands])
+         return LoweredOpaqueCall(
+             call.target,
+             call.provider,
+             tuple(t.dtype for t, _ in operands),
+             tuple(len(v.sizes) for _, v in operands),
+-            (*sizes, *strides, *align, *slots),
++            (*sizes, *strides, *align, *slots, *map(self.row, distances)),
+             scalars,
+             self.tape.device.index,
+             call.state,
+-            aliasing([t for t, _ in operands])[0],
++            alias,
+         )
+ 
+     def address(self, t: _TracedTensor, offset: int) -> int:
+@@ -480,16 +490,17 @@
+             raise declined(f"{site.op} has a symbolic float or bool argument")
+         scalars = [self.row(v) for v in site.scalars if isinstance(v, torch.SymInt)]
+         scratch = {j: (zero, self.base(self.roots[id(t._root)])) for j, (t, _) in site.scratch.items()}
++        alias, distances = aliasing(site.operands)
+         return LoweredKeyedSite(
+             site,
+             tuple(t.dtype for t in site.operands),
+             tuple(t.dim() for t in site.operands),
+-            (*sizes, *strides, *align, *scalars),
++            (*sizes, *strides, *align, *scalars, *map(self.row, distances)),
+             tuple(operands),
+             scratch,  # type: ignore[arg-type]
+             tuple(index[id(n)] for n in site.nodes),
+             self.tape.device.index,
+-            aliasing(site.operands)[0],
++            alias,
+         )
+ 
+     def launch(self, seq: int, launch: Any) -> LoweredLaunch | LoweredMemset | LoweredMemcpy:
+--- a/torch/cuda/_host_trace_opaque.py
++++ b/torch/cuda/_host_trace_opaque.py
+@@ -278,8 +278,8 @@
+ 
+ 
+ def aliasing(operands: Iterable[Any]) -> tuple[tuple[tuple[int, int, int], ...], list[Any]]:
+-    """OpaqueKey.alias of traced operands at the trace's hints, and the
+-    distances (to guard at their hints)."""
++    """OpaqueKey.alias of traced operands at the trace's hints, and its
++    distances, in its order (to guard at their hints, or lower to rows)."""
+     from torch.cuda._host_trace_tape import _hint, _TracedTensor
+ 
+     on: dict[int, list[tuple[int, Any]]] = {}
+@@ -295,7 +295,8 @@
+             if i != lead:
+                 distances.append(at - low)
+                 alias.append((i, lead, _hint(distances[-1])))
+-    return tuple(sorted(alias)), distances
++    order = sorted(range(len(alias)), key=alias.__getitem__)
++    return tuple(alias[j] for j in order), [distances[j] for j in order]
+ 
+ 
+ def trace_key(op: OpOverload, args: tuple, kwargs: dict, fresh: list) -> tuple[OpaqueKey, list[Any]]:
+@@ -336,7 +337,10 @@
+ 
+     leaves = pytree.tree_leaves((call.args, call.kwargs))
+     fresh = [o for o in call.outputs if all(o is not t for t in leaves)]
+-    _, values = trace_key(call.target, call.args, call.kwargs, fresh)
++    traced, values = trace_key(call.target, call.args, call.kwargs, fresh)
++    # the distances are up from each storage's lowest operand at the trace
++    if [a[:2] for a in traced.alias] != [a[:2] for a in key.alias]:
++        return None
+     at = [*sum(key.sizes, ()), *sum(key.strides, ()), *key.align, *key.scalars, *(d for *_, d in key.alias)]
+     if len(values) != len(at):
+         return None
+--- a/test/test_cuda_host_trace_oob.py
++++ b/test/test_cuda_host_trace_oob.py
+@@ -65,6 +65,53 @@
+         self.assertEqual(len(p.refused), 1)
+         self.assertEqual(f.oob_binds, 0)
+ 
++    def test_a_learn_lays_aliased_operands_out_as_at_the_call(self):
++        # blas keys do not key their operands' aliasing, but a learn lays them
++        # out on one buffer: at the call's distance (B 1920 bytes up from A
++        # at the third call), never the trace's (20), which contradicts B's
++        # alignment (a kernel for 16-byte aligned B runs on B at +20)
++        def mm(a):
++            return a @ a.split(a.shape[0] // 2 + 1)[-1].t()
++
++        learn, keys = HostTraceReplay._learn, []
++
++        def checked(self_, op, provider, call, key, *args, **kwargs):
++            keys.append(key)
++            self.assertTrue(all((key.align[lead] + d) % 256 == key.align[i] for i, lead, d in key.alias), key)
++            return learn(self_, op, provider, call, key, *args, **kwargs)
++
++        f = HostTraceReplay(mm)
++        with mock.patch.object(HostTraceReplay, "_learn", checked), mock.patch.object(replay, "oob_learn", True):
++            for a in (torch.randn(18, 96), torch.randn(96, 18).t(), torch.randn(18, 96)):
++                a = a.to(device="cuda", dtype=torch.float16)
++                self.assertEqual(f(a), mm(a), atol=0, rtol=0)
++        self.assertEqual([k.alias for k in keys], [((1, 0, 20),), ((1, 0, 1920),)])
++        self.assertEqual((f.traces, f.replays), (1, 1))
++
++    def test_a_refused_aliased_key_twin_guards_the_calls_key(self):
++        # the GEMM of two views of one storage refused at a call: its twin (_eager_sites) guards
++        # the call's key, B 268 bytes up from A, not the trace's 768, which the call's tape fails
++        def fn(a):
++            n = a.shape[0]
++            v = torch.split(a, [n - n // 3, n // 3])[1]
++            return (v @ a.t()) + 1
++
++        harvest_ = HarvestProvider._harvest
++
++        def refusing(self, key, *args, **kwargs):
++            if key.sizes[0] == (66, 24):
++                raise harvest._Refused("refused by the test")
++            return harvest_(self, key, *args, **kwargs)
++
++        p = HarvestProvider()
++        f = HostTraceReplay(fn, opaque=(p,))
++        with mock.patch.object(HarvestProvider, "_harvest", refusing), mock.patch.object(replay, "oob_learn", True):
++            for a in (torch.randn(96, 13), torch.randn(12, 48), torch.randn(24, 200).t(), torch.randn(24, 200).t()):
++                a = a.to(device="cuda", dtype=torch.float16)
++                self.assertEqual(f(a), fn(a), atol=0, rtol=0)
++        self.assertEqual(list(p.refused.values()), ["refused by the test"])
++        self.assertEqual((f.traces, f.eager_sites, f.eager_sites_refusals), (1, 1, {}))
++
+ 
+ if __name__ == "__main__":
+     run_tests()

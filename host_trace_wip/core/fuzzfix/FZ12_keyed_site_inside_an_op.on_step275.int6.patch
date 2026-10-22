@@ -1,0 +1,144 @@
+--- a/torch/cuda/_host_trace_lower_tape.py
++++ b/torch/cuda/_host_trace_lower_tape.py
+@@ -624,6 +624,9 @@
+     outputs = lo.outputs()
+     sites = tuple(lo.keyed_site(site, index) for site in tape.sites)
+     selectors = []
++    # a keyed site's nodes are the site's, patched per key from its table: an op that holds the site (a library body's
++    # GEMM) selects only its other launches, so each record has one owner
++    keyed = {id(n) for site in tape.sites for n in site.nodes}
+     for k, op in enumerate(tape.ops):
+         if k in tape.twin_guards:
+             # a refused key's guards (key_guards), in sympy
+@@ -633,12 +636,12 @@
+                 predicate = low.conjunction(list(tape.twin_guards[k]), frozenset(key(rec.root.sym) for rec in tape.inputs))
+             for ok in domains:
+                 predicate = lo.emit("and", predicate, ok)
+-            nodes = tuple(index[id(rec)] for _, rec in tape.launches[op.launches.start : op.launches.stop] if id(rec) in index)
++            nodes = tuple(index[id(rec)] for _, rec in tape.launches[op.launches.start : op.launches.stop] if id(rec) in index and id(rec) not in keyed)
+             selectors.append(LoweredSelector(k, predicate, nodes))
+         elif op.guards:
+             n = len(lo.lowering.guard_rows)
+             predicate = lo.lowering.conjunction([guards[i] for i in op.guards], addresses)
+-            nodes = tuple(index[id(rec)] for _, rec in tape.launches[op.launches.start : op.launches.stop] if id(rec) in index)
++            nodes = tuple(index[id(rec)] for _, rec in tape.launches[op.launches.start : op.launches.stop] if id(rec) in index and id(rec) not in keyed)
+             selectors.append(LoweredSelector(k, predicate, nodes, tuple(lo.lowering.guard_rows[n:])))
+     # a memcpy node's bytes lie in its allocations' own (an argument's or eager
+     # output's are the tensors eager's copy_ reads and writes)
+@@ -886,10 +889,16 @@
+         if not trivial(r := renamer.record(c) if ir else rename(c)) and r not in extra:
+             extra.append(r)
+     selected = []
++    keyed, old_keyed = ({id(n) for site in t.sites for n in site.nodes} for t in (tape, old))
+     for i in unselected:
+         selector = lowered.selectors[i - len(lowered.sites)]
+         op = tape.ops[selector.op]
+         records = [rec for _, rec in tape.launches[op.launches.start : op.launches.stop] if not isinstance(rec, EagerCall)]
++        # its keyed sites' nodes stay theirs (lower_tape's selectors): where they lie among the op's launches must agree
++        mine = [rec for _, rec in old.launches[old.ops[selector.op].launches.start : old.ops[selector.op].launches.stop] if not isinstance(rec, EagerCall)]
++        if [id(rec) in keyed for rec in records] != [id(rec) in old_keyed for rec in mine]:
++            raise FoldRefused(f"another keyed-site layout in {op.func}")
++        records = [rec for rec in records if id(rec) not in keyed]
+         launches = []
+         for n, rec in zip(selector.nodes, records, strict=True):
+             if isinstance(rec, KernelLaunch) and (rec.rng or rec.rng_increment or rec.descriptors or rec.cpu_scalars):
+--- a/torch/cuda/_host_trace_native.py
++++ b/torch/cuda/_host_trace_native.py
+@@ -303,12 +303,15 @@
+ 
+ 
+ def native_variant(spec: VariantSpec) -> torch._C._HostTraceVariant:
+-    """The variant's native object. A malformed spec is the lowering's bug,
+-    raised as one rather than declined; a driver without the optional entries
+-    it needs (TMA descriptors, kernel node updates) declines."""
++    """The variant's native object. A malformed spec is the lowering's bug:
++    the suites raise it (raise_unexpected), a user's call declines, noted; a
++    driver without the optional entries it needs (TMA descriptors, kernel node
++    updates) declines."""
+     try:
+         return torch._C._HostTraceVariant(spec)
+     except NotImplementedError as e:
+         raise declined(str(e)) from e
+     except (TypeError, ValueError, IndexError, RuntimeError) as e:
+-        raise AssertionError(f"host_trace: the native variant rejects: {e}") from e
++        if torch.cuda._host_trace.raise_unexpected:
++            raise AssertionError(f"host_trace: the native variant rejects: {e}") from e
++        raise declined(f"the native variant rejects the lowering ({e})") from e
+--- a/test/test_cuda_host_trace_harvest.py
++++ b/test/test_cuda_host_trace_harvest.py
+@@ -1144,6 +1144,20 @@
+ _extern_lib.impl("rope_qk", _rope_qk, "CUDA")
+ _extern_lib.impl("store_paged", _store_paged, "CUDA")
+ torch.library.register_fake("ht_extern::store_paged", lambda k, v, k_cache, v_cache, slot: None, lib=_extern_lib)
++
++# a library op whose Python CUDA kernel runs a harvested GEMM (a keyed site inside the op) and then branches on a size
++# (the op's own guard, so a selector over its launches): Flash-Next's attention op around a harvested extern, in small
++_nested_lib = torch.library.Library("ht_nested", "DEF")
++_nested_lib.define("mm_then_branch(Tensor x, Tensor w) -> Tensor")
++
++
++def _mm_then_branch(x, w):
++    y = torch.mm(x, w)
++    return y * 2 if x.shape[0] > 16 else y + 1
++
++
++_nested_lib.impl("mm_then_branch", _mm_then_branch, "CUDA")
++torch.library.register_fake("ht_nested::mm_then_branch", lambda x, w: x.new_empty(x.shape[0], w.shape[1]), lib=_nested_lib)
+ torch.library.register_fake("ht_extern::scale_qk", lambda q, k, w: None, lib=_extern_lib)
+ torch.library.register_fake("ht_extern::rope_qk", lambda q, k, pos, table: None, lib=_extern_lib)
+ 
+@@ -1264,6 +1278,26 @@
+                 self.assertEqual(got, want, atol=0, rtol=0)
+         self.assertEqual(list(p.refused.values()), ["refused by the test"])
+ 
++    def test_a_keyed_site_inside_an_op_with_its_own_guards(self):
++        # the GEMM's node is its keyed site's (patched per key); the op's selector takes only its other launches, so
++        # no record has two owners (the native variant rejected the spec: "a site's record")
++        def fn(x, w):
++            return (torch.ops.ht_nested.mm_then_branch(x + 1, w) - 1,)
++
++        p = HarvestProvider(("blas",))
++        r = HostTraceReplay(fn, opaque=(p,))
++        w = torch.randn(64, 64, device="cuda")
++        with tf32_off():
++            for m in (8, 40, 8, 40, 100):
++                x = torch.randn(m, 64, device="cuda")
++                self.assertEqual(r(x, w), fn(x, w), atol=0, rtol=0)
++        lowered = r.variants[0].captured.lowered
++        site_nodes = {n for s in lowered.sites for n in s.nodes}
++        self.assertTrue(site_nodes)
++        self.assertTrue(all(site_nodes.isdisjoint(s.nodes) for s in lowered.selectors))
++        self.assertEqual(r.eager, 1)
++        self.assertGreater(r.replays, 0)
++
+     def test_a_refused_key_at_a_redispatched_call_retraces(self):
+         # the extern key refused (past extern_cap) at a call the variant holds through the bmm's
+         # redispatch entry (its trace's m == 1 fails): the twin from the trace's tape would fail
+--- a/test/test_cuda_host_trace_replay.py
++++ b/test/test_cuda_host_trace_replay.py
+@@ -638,6 +638,25 @@
+         self.assertEqual(f.eager, 0)
+         self.assertGreater(f.replays, 0)
+ 
++    def test_a_native_rejection_declines_the_trace(self):
++        # a spec the native variant rejects is the lowering's bug: the suites raise it, a user's call declines
++        # (noted) and runs eagerly, never an AssertionError into user code
++        def fn(x):
++            return x * 2 + 1
++
++        reject = mock.patch.object(torch._C, "_HostTraceVariant", side_effect=ValueError("a site's record 1"))
++        f = HostTraceReplay(fn)
++        with reject, mock.patch.object(torch.cuda._host_trace, "raise_unexpected", False):
++            for _ in range(2):
++                x = torch.randn(64, device="cuda")
++                self.assertEqual(f(x), fn(x), atol=0, rtol=0)
++        self.assertEqual((f.traces, f.replays, f.eager), (1, 0, 2))
++        self.assertIn("the native variant rejects the lowering (a site's record 1)", " ".join(f.declines))
++        f = HostTraceReplay(fn)
++        with reject, mock.patch.object(torch.cuda._host_trace, "raise_unexpected", True):
++            with self.assertRaisesRegex(AssertionError, "the native variant rejects: a site's record 1"):
++                f(torch.randn(64, device="cuda"))
++
+     def test_a_redo_takes_a_dispatch_whose_guards_hold(self):
+         # a redo takes a dispatch of the same reads whose guards hold at it: (2, 3000)'s redispatch and (1, 2016)'s
+         # dispatch one softmax for the four layers, (1, 1568)'s none. On this line's binary (no contiguity by

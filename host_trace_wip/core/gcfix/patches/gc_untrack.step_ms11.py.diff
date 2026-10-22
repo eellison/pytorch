@@ -1,0 +1,484 @@
+--- a/torch/cuda/_host_trace_replay.py
++++ b/torch/cuda/_host_trace_replay.py
+@@ -68,10 +68,13 @@
+ import queue
+ import threading
+ import time
++import types
+ from collections.abc import Iterable
+ from dataclasses import dataclass, field
+ from typing import Any, TYPE_CHECKING
+ 
++import sympy
++
+ import torch
+ from torch._logging import trace_structured
+ from torch._prims.rng_prims import _impl_graphsafe_rng
+@@ -101,9 +104,11 @@
+     _active,
+     _ALLOC_ALIGNMENT,
+     _gc_hold,
++    _GC_RECORDS,
+     _metadata,
+     _placeholder,
+     _released_arg,
++    _TracedTensor,
+     argument_contract,
+     bind_opaque,
+     current_trace,
+@@ -147,6 +152,10 @@
+ # again, as a trace guarding the refused key
+ refused_eager_steps = True
+ 
++# a slow call that builds or extends variants untracks their immutable Python state from the cyclic collector
++# (_gc_untrack), so a gen-2 collection walks about none of a trace's objects. False: every object stays tracked
++gc_untrack = True
++
+ 
+ def _exact_class(contract: tuple, args: Sequence[Any]) -> tuple:
+     # the contract plus every value a trace reads except addresses, and the
+@@ -633,6 +642,8 @@
+         # one call at a time: a call patches the execs it replays (a native
+         # call holds the base's lock too)
+         self._lock = threading.RLock()
++        # the variants this slow call built or extended, untracked at its end (_gc_untrack)
++        self._touched: list[_Variant] = []
+         if torch.cuda._host_trace.cpp_entry:
+             # the parameters a keyword can pass by position, as _positional binds them
+             params = self._signature.parameters.values() if self._signature is not None else ()
+@@ -689,8 +700,21 @@
+                 return self._call_held(family, contract, args, searched)
+             except _Deferred:
+                 self.deferred += 1
++            finally:
++                self._settle()
+         return self._eager(args, {}, "a key learning in the background", fallback=False)
+ 
++    def _settle(self) -> None:
++        """After a slow call: the variants it built or extended drop their IR
++        caches, and they and the redispatches' redo caches untrack what
++        nothing writes again (_gc_untrack)."""
++        touched, self._touched = self._touched, []
++        for v in touched:
++            if isinstance(v.tape.shape_env, _ir.Env):
++                v.tape.shape_env.ctx.drop_memos()
++        if touched:
++            _gc_untrack([*touched, self._dispatches])
++
+     def _call_held(self, family: list[_Variant] | None, contract: tuple, args: tuple, searched: bool) -> Any:
+         # a variant that does not learn holds the call once its keys bind
+         pending = False
+@@ -1482,6 +1506,7 @@
+         return twin
+ 
+     def _add_entries(self, variant: _Variant, refusals: dict[str, int], args: tuple, make: Callable[..., Any], *make_args: Any) -> FoldRefused | None:
++        self._touched.append(variant)
+         try:
+             program, entries = make(*make_args)
+         except FoldRefused as e:
+@@ -1522,7 +1547,9 @@
+                     self.section_bytes = max(self.section_bytes, sum(values[row] for row in rows))
+             if not ok:
+                 break
+-            variant.folded.append(launches)
++            # a witness (KernelLaunch.witness) checks a launch at its capture, done: it would hold its trace
++            unwitnessed = (dataclasses.replace(lo, launch=dataclasses.replace(lo.launch, witness=None)) if getattr(lo.launch, "witness", None) else lo for lo in launches)
++            variant.folded.append(tuple(unwitnessed))
+         if not ok:
+             why = "the native variant rejects an entry or its program"
+             refusals[why] = refusals.get(why, 0) + 1
+@@ -1611,7 +1638,68 @@
+         for g, cuts in split_cuts(captured.lowered):
+             if cuts:
+                 native.set_split_cuts(g, cuts)
+-        return _Variant(captured, memory, native)
++        variant = _Variant(captured, memory, native)
++        self._touched.append(variant)
++        return variant
++
++
++# torch._C._host_trace_gc_untrack's flags (_gc_flags)
++_GC_DESCEND, _GC_IMMUTABLE, _GC_CLEAN, _GC_FINAL, _GC_CONTAINER, _GC_KEEP = 1, 2, 4, 8, 16, 32
++# per type, its flags
++_GC_KINDS: dict[type, int] = {}
++_HEAPTYPE = 1 << 9
++
++
++def _gc_flags(t: type) -> int:
++    """How _gc_untrack treats an object of type t (torch._C._host_trace_gc_untrack).
++    Immutable: tuples, frozensets, IR nodes (hash-consed), IRSymNodes and the
++    Sym* wrappers over them, pytree specs and the host trace's frozen
++    dataclasses without a cached property. Final, nothing writes them once the
++    slow call that made them ends: a tape's records (its inputs, allocations,
++    roots, outputs and ops) and traced tensors (kept tracked); their lists and
++    dicts, held by nothing else, are final too. Clean, reaching no object of a
++    trace's records: types, modules, operators, sympy expressions, and an Env
++    (its IR, guard records and sympy export refer to nothing outside it).
++    Every untracked object's type deallocates through PyObject_GC_UnTrack (its
++    bases heap types or object). Everything else of the host trace's (the
++    tapes, lowerings, programs and variants that folds, redispatches and
++    relowers extend) is walked and stays tracked; anything else is neither."""
++    if t in (tuple, frozenset):
++        return _GC_DESCEND | _GC_IMMUTABLE
++    if t in (list, dict, set):
++        return _GC_DESCEND | _GC_CONTAINER
++    if issubclass(t, (type, types.ModuleType, torch._ops.OpOverload, torch._ops.OpOverloadPacket, sympy.Basic)):
++        return _GC_CLEAN
++    if t is _ir.Env:
++        return _GC_DESCEND | _GC_CLEAN
++    if t is _TracedTensor:
++        return _GC_DESCEND | _GC_FINAL | _GC_KEEP
++    if not all(c is object or c.__flags__ & _HEAPTYPE for c in t.__mro__):
++        return 0
++    if t in (_ir.Node, _ir.IRSymNode, torch.SymInt, torch.SymFloat, torch.SymBool) or issubclass(t, pytree.TreeSpec):
++        return _GC_DESCEND | _GC_IMMUTABLE
++    if t in _GC_RECORDS:
++        return _GC_DESCEND | _GC_FINAL
++    if not t.__module__.startswith("torch.cuda._host_trace"):
++        return 0
++    params = getattr(t, "__dataclass_params__", None)
++    if params is not None and params.frozen and not any(isinstance(v, functools.cached_property) for c in t.__mro__ for v in vars(c).values()):
++        return _GC_DESCEND | _GC_IMMUTABLE
++    return _GC_DESCEND
++
++
++def _gc_untrack(roots: Iterable[Any]) -> None:
++    """Untracks what the roots (variants, redo caches) keep and nothing writes again from the cyclic
++    collector (torch._C._host_trace_gc_untrack, PyObject_GC_UnTrack): an
++    object _gc_flags calls immutable or final whose referents are all such
++    objects or clean. Nothing an untracked object reaches changes, so it
++    cannot become part of a reference cycle; its reference count frees it as
++    before. A variant's IR, tuples and records are most of a trace's objects
++    and outlive it; the containers folds, redispatches and relowers extend
++    stay tracked. A walk stops at an untracked object, so a variant extended
++    again costs its tracked state, not its whole tape."""
++    if gc_untrack and hasattr(torch._C, "_host_trace_gc_untrack"):
++        torch._C._host_trace_gc_untrack(list(roots), _GC_KINDS, _gc_flags)
+ 
+ 
+ def _site_classes(sites: Sequence[LoweredKeyedSite]) -> list[int]:
+--- a/torch/cuda/_host_trace_tape.py
++++ b/torch/cuda/_host_trace_tape.py
+@@ -255,6 +255,22 @@
+         return str(self.target)
+ 
+ 
++# OpRec.redo of an operator call and of a jiterator launch: objects, not closures, so a variant's ops hold no
++# function or cell (_host_trace_replay._gc_untrack); eq=False: a redo template keys a non-operator op by its redo
++@dataclass(frozen=True, eq=False)
++class _EagerRedo:
++    func: Any
++
++    def __call__(self, args: tuple, kwargs: dict) -> Any:
++        return current_trace().eager_call(self.func, args, kwargs)
++
++
++@dataclass(frozen=True, eq=False)
++class _JiteratorRedo:
++    def __call__(self, args: tuple, kwargs: dict) -> Any:
++        return current_trace().jiterator(*args, **kwargs)
++
++
+ @dataclass
+ class OpRec:
+     """A top-level op (an operator, a Triton or CuTe DSL launch): the records
+@@ -293,6 +309,11 @@
+     bound: bool = False
+ 
+ 
++# the records a trace writes while it runs and nothing writes once its tape is built (bind_opaque and a twin's
++# tape replace them): final for _host_trace_replay._gc_untrack
++_GC_RECORDS = (_Root, _InputRec, _IntInputRec, _AllocRec, _OutputRec, _IntOutputRec, OpRec)
++
++
+ @dataclass(frozen=True)
+ class Memset:
+     """A memset node: `height` rows `pitch` bytes apart of `width` elements
+@@ -855,7 +876,7 @@
+ 
+     def eager_call(self, func: Any, args: tuple, kwargs: dict) -> Any:
+         run = functools.partial(self._eager_call, func, args, kwargs)
+-        return self.op(func, args, kwargs, run, redo=lambda a, k: current_trace().eager_call(func, a, k))
++        return self.op(func, args, kwargs, run, redo=_EagerRedo(func))
+ 
+     def _host_copy(self, func: OpOverload, args: tuple, kwargs: dict) -> Any:
+         """copy_ between a pinned host argument and a tensor on the device as a
+@@ -917,7 +938,7 @@
+                 raise self.decline(f"{label}'s CUDA host declines: {out}")
+             return out
+ 
+-        return self.op(label, args, {}, run, host=True, redo=lambda a, k: current_trace().jiterator(*a, **k))
++        return self.op(label, args, {}, run, host=True, redo=_JiteratorRedo())
+ 
+     def op(
+         self, func: Any, args: tuple, kwargs: dict, run: Callable[[], Any], host: bool = False, redo: Callable[[tuple, dict], Any] | None = None
+@@ -956,7 +977,7 @@
+         elif kind == "eager" and not host:
+             env.owners[guards:] = [k] * (len(env.owners) - guards)
+             if env.owner_sets is not None:
+-                env.owner_sets[guards:] = [{k} for _ in env.owner_sets[guards:]]
++                env.owner_sets[guards:] = [frozenset((k,)) for _ in env.owner_sets[guards:]]
+         if read := self.int_reads[reads:]:
+             del self.int_reads[reads:]
+             # an op run eagerly took no value of its host's reads
+@@ -3790,7 +3811,7 @@
+     # after the tape's allocations
+     tr.first_alloc = max((a.root.index + 1 for a in tape.allocs), default=0)
+     marks, owners = len(env.owners), list(env.owners)
+-    owner_sets = None if env.owner_sets is None else [set(o) for o in env.owner_sets]
++    owner_sets = None if env.owner_sets is None else list(env.owner_sets)
+     # each launch's and allocation's index in the new tape, for the ops' spans
+     at_launch = {id(rec): i for i, (_, rec) in enumerate(tape.launches)}
+     at_alloc = {id(a): j for j, a in enumerate(tape.allocs)}
+@@ -3939,8 +3960,8 @@
+     env.owners[marks:] = [None] * added
+     if owner_sets is not None:
+         # a kept guard is graph-level, as its owners entry
+-        owner_sets += [{None} for _ in range(added)]
+-        env.owner_sets[marks:] = [{None} for _ in range(added)]
++        owner_sets += [frozenset((None,)) for _ in range(added)]
++        env.owner_sets[marks:] = [frozenset((None,)) for _ in range(added)]
+     launch_start[-1], alloc_start[-1] = len(launches), len(allocs)
+     # an op whose opaque calls all bound is traced, as a trace at their keys records it, and owns its guards
+     traced = {k for k, op in enumerate(tape.ops) if op.held is not None and all(id(rec) in converted for _, rec in tape.launches[op.launches.start : op.launches.stop] if isinstance(rec, EagerCall))}
+--- a/torch/cuda/_host_trace_ir.py
++++ b/torch/cuda/_host_trace_ir.py
+@@ -50,6 +50,7 @@
+ import struct
+ import sys
+ import threading
++import weakref
+ from typing import Any, TYPE_CHECKING
+ 
+ import sympy
+@@ -386,6 +387,12 @@
+         self.consts: dict[int, Node] = {}
+         self.bounds_memo: dict[Node, tuple] = {}
+ 
++    def drop_memos(self) -> None:
++        """Empties the operation and bounds caches (a function of interned
++        nodes, rebuilt on demand): a lowered trace's context keeps its table."""
++        self.memo = {}
++        self.bounds_memo = {}
++
+     def owns(self, n: Node) -> bool:
+         # by identity: two contexts' ids collide
+         return n.id < len(self.nodes) and self.nodes[n.id] is n
+@@ -1220,7 +1227,7 @@
+         # per record, its provenance (guard_sloc)
+         self.slocs: list[SLoc] = []
+         # (_TraceShapeEnv.owner_sets)
+-        self.owner_sets: list[set[int | None]] | None = None
++        self.owner_sets: list[frozenset[int | None]] | None = None
+         # the op a guard recorded now belongs to
+         self.op: int | None = None
+         self.names: dict[str, str] = {}  # symbol name -> source name, in creation order
+@@ -1280,11 +1287,11 @@
+             self.owners.append(self.op)
+             self.slocs.append(guard_sloc())
+             if self.owner_sets is not None:
+-                self.owner_sets.append(set())
++                self.owner_sets.append(frozenset())
+         elif self.owners[i] != self.op:
+             self.owners[i] = None
+         if self.owner_sets is not None:
+-            self.owner_sets[i].add(self.op)
++            self.owner_sets[i] = self.owner_sets[i] | {self.op}
+ 
+     def forget(self, n: int) -> None:
+         """Drops the guards recorded after the first n."""
+@@ -1897,7 +1904,8 @@
+     sympy's and torch's own constructors."""
+ 
+     def __init__(self, env: Env) -> None:
+-        self.env = env
++        # weak: the Env holds its export, and a cycle would leave every node of a dropped trace to the cyclic collector
++        self._env = weakref.ref(env)
+         self.symbols: dict[str, sympy.Symbol] = {}
+         self._exprs: dict[int, Any] = {}
+         self._relations: dict[tuple, Any] = {}
+@@ -1907,6 +1915,13 @@
+         self._int_range = ValueRanges.unknown_int()
+         self._float_range = ValueRanges(-sympy.oo, sympy.oo)
+ 
++    @property
++    def env(self) -> Env:
++        env = self._env()
++        if env is None:
++            raise AssertionError("host_trace: the sympy export of a dropped Env")
++        return env
++
+     def symbol(self, name: str) -> sympy.Symbol:
+         s = self.symbols.get(name)
+         if s is None:
+--- a/torch/cuda/_host_trace.py
++++ b/torch/cuda/_host_trace.py
+@@ -117,6 +117,16 @@
+ redo_resolves_arguments = False
+ 
+ 
++@dataclass(frozen=True, eq=False)
++class _UnitRedo:
++    """A dispatch unit's OpRec.redo (_host_trace_tape._EagerRedo)."""
++
++    unit: Callable[..., Any]
++
++    def __call__(self, args: tuple, kwargs: dict) -> Any:
++        return self.unit(*args, **kwargs)
++
++
+ def dispatch_unit(fn: Callable[..., Any]) -> Callable[..., Any]:
+     """fn(*args, **kwargs), under a trace with dispatch_units on, as one op
+     that runs again alone from its arguments (a redispatch). The contract a
+@@ -131,7 +141,7 @@
+         tr = tape.current_trace() if tape is not None and dispatch_units else None
+         if tr is None:
+             return fn(*args, **kwargs)
+-        return tr.op(fn, args, kwargs, lambda: fn(*args, **kwargs), host=True, redo=lambda a, k: unit(*a, **k))
++        return tr.op(fn, args, kwargs, lambda: fn(*args, **kwargs), host=True, redo=_UnitRedo(unit))
+ 
+     return unit
+ 
+@@ -355,7 +365,7 @@
+         self.owners: list[int | None] = []
+         # with shared_op_guards on (_Trace sets a list), per guard every op that
+         # recorded or evaluated it, None for outside an op
+-        self.owner_sets: list[set[int | None]] | None = None
++        self.owner_sets: list[frozenset[int | None]] | None = None
+         # the op a guard recorded now belongs to
+         self.op: int | None = None
+         self._symop_cache = _SymOpMemo(self.domain)
+@@ -435,11 +445,11 @@
+             self.guards.append(ShapeGuard(g, _ir.guard_sloc(), size_oblivious))
+             self.owners.append(self.op)
+             if self.owner_sets is not None:
+-                self.owner_sets.append(set())
++                self.owner_sets.append(frozenset())
+         elif self.owners[i] != self.op:
+             self.owners[i] = None
+         if self.owner_sets is not None:
+-            self.owner_sets[i].add(self.op)
++            self.owner_sets[i] = self.owner_sets[i] | {self.op}
+ 
+     def forget(self, n: int) -> None:
+         """Drops the guards recorded after the first n."""
+--- a/test/test_cuda_host_trace_replay.py
++++ b/test/test_cuda_host_trace_replay.py
+@@ -5164,6 +5164,109 @@
+         self.assertEqual((f.traces, f.replays, f.eager), (1, 0, 3))
+ 
+ 
++
++
++def _layer(x, w):
++    # a GEMM (a keyed site), a kernel choice by row count in an op (a selector), Triton and ATen pointwise
++    return add(torch.relu(tactic_op(torch.mm(x, w))) * 2)
++
++
++def _choice(x, w):
++    # the kernel choice alone, which folds (cuBLAS may pick another kernel chain at another size: another op sequence)
++    return add(tactic_op(x) * 2)
++
++
++@unittest.skipIf(not TEST_CUDA or not has_triton(), "requires CUDA and Triton")
++class TestGcFootprint(TestCase):
++    """A slow call leaves what its variants keep untracked by the cyclic
++    collector (_host_trace_replay._gc_untrack), creates no cyclic garbage, and
++    nothing leaks when the entry goes."""
++
++    def setUp(self):
++        self.w = torch.randn(32, 32, device="cuda")
++        # what a first trace makes for the process (Triton compiles, GEMM bindings, caches)
++        for fn in (_layer, _choice):
++            warm = HostTraceReplay(fn)
++            if fn is _choice:
++                warm._redispatch = lambda *args: FoldRefused("")
++            for n in (16, 24, 40, 56, 8):
++                warm(torch.randn(n, 32, device="cuda"), self.w)
++
++    def _per_call(self, f, sizes):
++        """Per call, (tracked objects it left alive, cyclic garbage it left)."""
++        out = []
++        for n in sizes:
++            x = torch.randn(n, 32, device="cuda")
++            gc.collect()
++            before = len(gc.get_objects())
++            self.assertEqual(f(x, self.w), f.fn(x, self.w))
++            garbage = gc.collect()
++            out.append((len(gc.get_objects()) - before, garbage))
++        return out
++
++    @parametrize("how", ["trace", "redispatch", "fold"])
++    def test_a_variant_leaves_few_tracked_objects(self, how):
++        f = HostTraceReplay(_choice if how == "fold" else _layer, static_shapes=(0,) if how == "trace" else ())
++        if how == "fold":
++            f._redispatch = lambda *args: FoldRefused("")
++        # a trace per size, or a trace and an entry per new kernel choice (tactic_add's 128, 256 and 1024)
++        sizes = (16, 8, 24, 40, 56) if how == "trace" else (16, 24, 40)
++        rows = self._per_call(f, sizes)
++        counts = {"trace": (5, 0, 0), "redispatch": (1, 2, 0), "fold": (3, 0, 2)}[how]
++        self.assertEqual((f.traces, f.redispatches, f.folds), counts)
++        # a trace of this layer keeps about 1500 objects (test_untracking_is_off_without_the_switch): tracked, its
++        # tensors and closures and the variant's mutable state
++        self.assertLessEqual(max(n for n, _ in rows), 300, rows)
++        self.assertEqual([g for _, g in rows], [0] * len(rows), rows)
++
++    def test_untracking_is_off_without_the_switch(self):
++        with mock.patch.object(_host_trace_replay, "gc_untrack", False):
++            f = HostTraceReplay(_layer, static_shapes=(0,))
++            rows = self._per_call(f, (16, 56))
++        self.assertGreater(min(n for n, _ in rows), 1000, rows)
++
++    def test_dropped_entries_leave_nothing(self):
++        import tracemalloc
++
++        def run():
++            refs = []
++            for fn in (_layer, _choice):
++                for static in (True, False):
++                    f = HostTraceReplay(fn, static_shapes=(0,) if static else ())
++                    if fn is _choice:
++                        f._redispatch = lambda *args: FoldRefused("")
++                    for n in (16, 24, 40, 56):
++                        f(torch.randn(n, 32, device="cuda"), self.w)
++                    refs += [weakref.ref(v) for v in f.variants] + [weakref.ref(v.tape) for v in f.variants]
++            return refs
++
++        def grown(untrack):
++            """Python memory and tracked objects three runs leave, with
++            untracking on or off: what the process keeps (caches) either way."""
++            with mock.patch.object(_host_trace_replay, "gc_untrack", untrack):
++                gc.collect()
++                tracked, memory = len(gc.get_objects()), tracemalloc.get_traced_memory()[0]
++                for _ in range(3):
++                    refs = run()
++                    gc.collect()
++                    self.assertEqual([r for r in refs if r() is not None], [])
++                return tracemalloc.get_traced_memory()[0] - memory, len(gc.get_objects()) - tracked
++
++        tracemalloc.start()
++        try:
++            run()
++            run()
++            torch.cuda.synchronize()
++            device = torch.cuda.memory_allocated()
++            off, on = grown(False), grown(True)
++        finally:
++            tracemalloc.stop()
++        # each run traces 8 variants (about 1500 objects each, untracked but about 150) and adds redispatched and
++        # folded entries: none of it is left
++        self.assertLess(on[0], off[0] + 64 * 1024, (on, off))
++        self.assertLessEqual(on[1], 30, (on, off))
++        self.assertEqual(torch.cuda.memory_allocated(), device)
++
+ instantiate_parametrized_tests(TestSideStreams)
+ instantiate_parametrized_tests(TestReplayMemory)
+ instantiate_parametrized_tests(TestNativeReplay)
+@@ -5172,6 +5275,7 @@
+ instantiate_parametrized_tests(TestStaticPrefix)
+ instantiate_parametrized_tests(TestBoundCall)
+ instantiate_parametrized_tests(TestDirtyRecords)
++instantiate_parametrized_tests(TestGcFootprint)
+ 
+ 
+ def setUpModule():

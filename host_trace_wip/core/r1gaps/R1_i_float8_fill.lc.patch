@@ -1,0 +1,116 @@
+--- a/torch/cuda/_host_trace_opaque.py
++++ b/torch/cuda/_host_trace_opaque.py
+@@ -275,6 +275,14 @@
+     return all(reproducible(a) for k in kernels for a, _ in k.attributes)
+ 
+ 
++def fill_uniform(t: torch.Tensor, low: float, high: float, generator: torch.Generator) -> None:
++    # float8 has no uniform_: its values are float32's draws, rounded
++    if t.dtype.itemsize == 1:
++        t.copy_(torch.empty(t.shape, device=t.device).uniform_(low, high, generator=generator))
++    else:
++        t.uniform_(low, high, generator=generator)
++
++
+ def span_bytes(sizes: tuple[int, ...], strides: tuple[int, ...], itemsize: int) -> int:
+     """A strided tensor's bytes from its first element through its last (0 when empty)."""
+     return (1 + sum((n - 1) * s for n, s in zip(sizes, strides))) * itemsize if all(sizes) else 0
+--- a/torch/cuda/_host_trace_harvest.py
++++ b/torch/cuda/_host_trace_harvest.py
+@@ -125,6 +125,7 @@
+ from torch._logging import trace_structured
+ from torch.cuda._host_trace_capture import attribute_value, launch_attributes, MemsetNode, reproducible
+ from torch.cuda._host_trace_opaque import (
++    fill_uniform,
+     OpaqueBinding,
+     OpaqueKernel,
+     OpaqueKey,
+@@ -1404,13 +1405,13 @@
+                             flat.as_strided(t.shape, t.stride()).copy_(torch.randperm(index_range, generator=filler, device=t.device)[: t.numel()].view(t.shape))
+                         elif extern:
+                             if t.dtype.is_floating_point and any(t is w for w in written):
+-                                flat.as_strided(t.shape, t.stride()).uniform_(-1, 1, generator=filler)
++                                fill_uniform(flat.as_strided(t.shape, t.stride()), -1, 1, filler)
+                             elif any(t is w for w in written):
+                                 flat.as_strided(t.shape, t.stride()).zero_()
+                         elif t.dtype.is_floating_point and self._draws(op):
+-                            flat.uniform_(0.25, 0.75, generator=filler)
++                            fill_uniform(flat, 0.25, 0.75, filler)
+                         elif t.dtype.is_floating_point:
+-                            flat.uniform_(-1, 1, generator=filler)
++                            fill_uniform(flat, -1, 1, filler)
+                         else:
+                             flat.random_(0, 2 if t.dtype == torch.bool else 8, generator=filler)
+ 
+--- a/torch/cuda/_host_trace_replay.py
++++ b/torch/cuda/_host_trace_replay.py
+@@ -82,7 +82,7 @@
+ from torch.cuda._host_trace_harvest import HarvestProvider
+ from torch.cuda._host_trace_lower_tape import fold, FoldRefused, lower_guards, lower_tape, PointerSlot, PredictedOutput, ScalarSlot
+ from torch.cuda._host_trace_memory import arena_addresses, auto_memory, check_plan, plan_memory, relocate, relocate_entries, size_classes, split_runs, SPLITS
+-from torch.cuda._host_trace_opaque import key_guards, library_state_as, span_bytes
++from torch.cuda._host_trace_opaque import fill_uniform, key_guards, library_state_as, span_bytes
+ from torch.cuda._host_trace_program import Status
+ from torch.cuda._host_trace_redispatch import redispatch
+ from torch.cuda._host_trace_native import (
+@@ -875,7 +875,7 @@
+             at = metadata[j][3] + d
+             flat = buffers[j][at : at + -(-nbytes(i) // dtype.itemsize) * dtype.itemsize].view(dtype)
+             if dtype.is_floating_point:
+-                flat.uniform_(*bounds, generator=generator)
++                fill_uniform(flat, *bounds, generator)
+             else:
+                 flat.zero_()
+             tensors.append(flat.as_strided(sizes, strides))
+--- a/test/test_cuda_host_trace_harvest.py
++++ b/test/test_cuda_host_trace_harvest.py
+@@ -1182,6 +1182,7 @@
+ _extern_lib.define("double_into(Tensor x, Tensor(a!) out) -> ()")
+ _extern_lib.define("store_paged(Tensor k, Tensor v, Tensor(a!) k_cache, Tensor(b!) v_cache, Tensor slot) -> ()")
+ _extern_lib.define("copy_twice(Tensor x, Tensor(a!) out) -> ()")
++_extern_lib.define("to_fp8(Tensor x, Tensor(a!) out) -> ()")
+ 
+ 
+ def _scale_qk(q, k, w):
+@@ -1218,6 +1219,15 @@
+ 
+ 
+ _extern_lib.impl("copy_twice", _copy_twice, "CUDA")
++
++
++def _to_fp8(x, out):
++    # vLLM's static_scaled_fp8_quant: a float8 output written, not read
++    out.copy_(x)
++
++
++_extern_lib.impl("to_fp8", _to_fp8, "CUDA")
++torch.library.register_fake("ht_extern::to_fp8", lambda x, out: None, lib=_extern_lib)
+ torch.library.register_fake("ht_extern::copy_twice", lambda x, out: None, lib=_extern_lib)
+ torch.library.register_fake("ht_extern::double_into", lambda x, out: None, lib=_extern_lib)
+ _extern_lib.impl("scale_qk", _scale_qk, "CUDA")
+@@ -1520,6 +1530,25 @@
+         self.assertEqual(self.eager_calls(r), [])
+         self.assertGreaterEqual(max(peaks), 2 * 2048 * 8192 * 2)
+ 
++    def test_a_float8_output_is_harvested(self):
++        # a written float8 operand starts the verify random, drawn in float32 (float8 has no uniform_)
++        p = HarvestProvider(("extern",), extern_ops=(torch.ops.ht_extern.to_fp8.default,))
++
++        def f(x):
++            out = torch.empty(x.shape, device=x.device, dtype=torch.float8_e4m3fn)
++            torch.ops.ht_extern.to_fp8(x * 0.5, out)
++            return out
++
++        r = HostTraceReplay(f, opaque=(p,))
++        for t in (64, 256, 64, 256):
++            x = torch.randn(t, 128, device="cuda")
++            self.assertEqual(r(x).view(torch.uint8), f(x).view(torch.uint8), atol=0, rtol=0)
++        self.assertEqual(p.refused, {})
++        self.assertEqual(len(p.bindings), 2)
++        self.assertEqual(self.eager_calls(r), [])
++        # the first call runs eagerly
++        self.assertEqual((r.traces, r.replays, r.eager), (1, 2, 1))
++
+     def test_written_not_read_dropped_write_is_refused(self):
+         # a binding that writes nothing leaves the random copy: refused
+         launch = harvest._launch

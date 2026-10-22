@@ -1,0 +1,31 @@
+--- a/test/test_cuda_host_trace_cute.py
++++ b/test/test_cuda_host_trace_cute.py
+@@ -1453,9 +1453,10 @@
+         not TEST_CUDA or torch.cuda.get_device_capability() < (10, 0),
+         "requires Blackwell",
+     )
+-    def test_a_tma_kernel_choice_traces_its_class(self):
+-        # the op's TMA kernel and cluster change with m, which no entry holds:
+-        # its class traces
++    def test_a_tma_kernel_choice_is_a_section_of_its_variant(self):
++        # the op's TMA kernel and cluster change with m: another launch
++        # topology, which a section of the one variant holds (its piece's node
++        # at the other cluster, its descriptors patched per call)
+         _compile_gemms()
+ 
+         def f(a, b):
+@@ -1465,9 +1466,11 @@
+         for m in (256, 512, 128, 1024, 256):
+             a, b = (_half(1, rows, 128).permute(1, 2, 0) for rows in (m, 256))
+             self.assertEqual(r(a, b), f(a, b), atol=0, rtol=0)
+-        self.assertEqual((r.traces, len(r.variants), r.replays, r.eager), (2, 2, 3, 0))
+-        clusters = [[lo.launch.cluster for lo in v.captured.lowered.launches if isinstance(lo.launch, KernelLaunch) and lo.launch.descriptors] for v in r.variants]
+-        self.assertEqual(clusters, [[(1, 1, 1)], [(2, 1, 1)]])
++        self.assertEqual((r.traces, len(r.variants), r.replays, r.eager, r.redispatches, r.sections), (1, 1, 4, 0, 1, 1))
++        (v,) = r.variants
++        tma = [lo.launch.cluster for lo in v.captured.lowered.launches if isinstance(lo.launch, KernelLaunch) and lo.launch.descriptors]
++        section = [lo.launch.cluster for launches in v.folded for lo in launches if isinstance(lo.launch, KernelLaunch) and lo.launch.descriptors]
++        self.assertEqual((tma, section), ([(1, 1, 1)], [(2, 1, 1)]))
+ 
+     @unittest.skipIf(
+         not TEST_CUDA or torch.cuda.get_device_capability() < (10, 0),

@@ -1,0 +1,127 @@
+diff -ru -x __pycache__ step_ms26/torch/cuda/_host_trace_lower_tape.py step_ms27/torch/cuda/_host_trace_lower_tape.py
+--- step_ms26/torch/cuda/_host_trace_lower_tape.py	2026-10-18 11:58:47.268256697 -0700
++++ step_ms27/torch/cuda/_host_trace_lower_tape.py	2026-10-18 12:28:28.748203667 -0700
+@@ -389,6 +389,9 @@
+         self.first_seqs: tuple[tuple[int, int], list[int]] | None = None
+         self.liveness: tuple[Any, Any] | None = None
+         self.run_lifetimes: dict[int, tuple[Any, dict]] = {}
++        # _for_instance's: per static-prefix argument record (by id), its layout pins and their conjunction's row
++        self.root_pins: dict[int, list] = {}
++        self.root_pin_rows: dict[int, int | None] = {}
+         # redo templates (_host_trace_redispatch): an entry by what its op's redo reads, rows of this program; and the
+         # entries instantiated from them and redone in full
+         self.templates: dict[Any, Any] = {}
+diff -ru -x __pycache__ step_ms26/torch/cuda/_host_trace_redispatch.py step_ms27/torch/cuda/_host_trace_redispatch.py
+--- step_ms26/torch/cuda/_host_trace_redispatch.py	2026-10-18 11:46:20.164731248 -0700
++++ step_ms27/torch/cuda/_host_trace_redispatch.py	2026-10-18 12:28:28.748009234 -0700
+@@ -356,8 +356,10 @@
+     # the declared symbols both keys took at their values hold them at the call (a static prefix's layouts)
+     pins: list[Any] = [(ctx.eq(ctx.symbols[name], ctx.const(int(ctx.symbols[name].hint))), None) for name in sorted(t.substituted | substituted)]
+     moved: set[int] = set()
+-    # the layout symbols pinned at their values (both ops': their keys hold them at the same values)
++    # the layout symbols pinned at their values (both ops': their keys hold them at the same values), and the static-prefix
++    # roots whose layouts are pinned (each root's pins one row, made once per lowering: _root_pin_row)
+     pinned: set[str] = set()
++    root_pins: list[Any] = []
+     out: Template | None = t
+     for p, (mine, theirs) in enumerate(zip(t.roots, roots)):
+         a = recs.get(id(mine)) if mine.kind == "argument" else None
+@@ -368,12 +370,12 @@
+             out = None
+             break
+         for rec in (a, b):
++            if all(rec is not r for r in root_pins):
++                root_pins.append(rec)
+             for v in (*rec.sizes, *rec.strides, rec.offset):
+                 k = _sym_key(v)
+-                if isinstance(k, _ir.Node):
+-                    pins.append((ctx.eq(k, ctx.const(int(k.hint))), None))
+-                    if k.op == "sym":
+-                        pinned.add(k.args[0])
++                if isinstance(k, _ir.Node) and k.op == "sym":
++                    pinned.add(k.args[0])
+         if theirs is not mine:
+             moved.add(p)
+             for x, y in zip((a.root.sym, *a.sizes, *a.strides, a.offset), (b.root.sym, *b.sizes, *b.strides, b.offset)):
+@@ -382,7 +384,7 @@
+                     subs[kx.args[0]] = ky if isinstance(ky, _ir.Node) else ctx.const(int(ky))
+     if out is not None and not all(roots[p] is r or p in moved for p, r in t.pinned):
+         out = None
+-    if out is not None and (pins or subs):
++    if out is not None and (pins or subs or root_pins):
+         full, memo = collections.ChainMap(subs, ctx.symbols), {}
+         # a template guard renamed only through pinned layout symbols is the guard itself under the pins (each symbol
+         # and its rename are pinned at one value), which t.predicate holds already: only a guard reading a renamed symbol
+@@ -390,8 +392,10 @@
+         renaming = subs.keys() - pinned
+         renamed = [(ctx.transfer(g, ctx, full, memo), None) for g, _ in t.guards if isinstance(g, _ir.Node) and g.free_symbols & renaming]
+ 
+-        def instance_predicate(renamed: list) -> int | None:
++        def instance_predicate(renamed: list, grouped: bool = True) -> int | None:
+             guards = [g for g in (*renamed, *pins) if g[0].op != "true"]
++            if not grouped:
++                guards += [g for r in root_pins for g in _root_pins(lowered, r) if g[0].op != "true"]
+             predicate = t.predicate
+             if guards:
+                 try:
+@@ -401,6 +405,10 @@
+                         predicate = lo.emit("and", predicate, ok)
+                 except Declined:
+                     return None  # a renamed guard false at the hints: this op takes another branch
++            if grouped:
++                for r in root_pins:
++                    if (row := _root_pin_row(lowered, r)) is not None:
++                        predicate = lo.emit("and", predicate, row)
+             return predicate
+ 
+         predicate = instance_predicate(renamed)
+@@ -408,13 +416,13 @@
+             # the untrimmed predicate (every guard reading a renamed symbol renamed) holds at this call exactly when
+             # the trimmed one does
+             every = [(ctx.transfer(g, ctx, full, memo), None) for g, _ in t.guards if isinstance(g, _ir.Node) and g.free_symbols & subs.keys()]
+-            untrimmed = instance_predicate(every)
++            untrimmed = instance_predicate(every, grouped=False)
+             values = lo.program.values
+             if (predicate is None) != (untrimmed is None) or (predicate is not None and values[predicate] != values[untrimmed]):
+                 raise AssertionError(f"host_trace: {t} trimmed of its pinned renames disagrees with the untrimmed instance")
+         for_instance_stats["trimmed"] += sum(1 for g, _ in t.guards if isinstance(g, _ir.Node) and g.free_symbols & subs.keys() and not g.free_symbols & renaming)
+         out = None if predicate is None else replace(t, predicate=predicate, pinned=tuple((p, roots[p]) for p, _ in t.pinned), roots=tuple(roots), untrimmed=untrimmed if torch.cuda._host_trace.verify_redo_templates else None)
+-        for_instance_stats["pins"] += len(pins)
++        for_instance_stats["pins"] += len(pins) + sum(len(_root_pins(lowered, r)) for r in root_pins)
+         for_instance_stats["renamed"] += len(renamed)
+     for_instance_stats["computed"] += 1
+     for_instance_stats["declined"] += out is None
+@@ -423,6 +431,33 @@
+     return out
+ 
+ 
++def _root_pins(lowered: LoweredTape, rec: Any) -> list[tuple[Any, None]]:
++    """The pins of a static-prefix argument record (LoweredTape.lowering.first_inputs'): each of its layout formulas
++    equal to its value. Made once per lowering."""
++    lo = lowered.lowering
++    got = lo.root_pins.get(id(rec))
++    if got is None:
++        ctx = lowered.tape.shape_env.ctx
++        got = lo.root_pins[id(rec)] = [(ctx.eq(k, ctx.const(int(k.hint))), None) for v in (*rec.sizes, *rec.strides, rec.offset) if isinstance(k := _sym_key(v), _ir.Node)]
++    return got
++
++
++def _root_pin_row(lowered: LoweredTape, rec: Any) -> int | None:
++    """The row that is 1 when the record's pins (_root_pins) hold, or None for none; made once per lowering: every
++    instance taking a template onto or from the root conjoins it."""
++    lo = lowered.lowering
++    if id(rec) not in lo.root_pin_rows:
++        pins = [g for g in _root_pins(lowered, rec) if g[0].op != "true"]
++        row = None
++        if pins:
++            with lo.lowering.total() as domains:
++                row = lo.lowering.conjunction(pins, lo.addresses)
++            for ok in domains:
++                row = lo.emit("and", row, ok)
++        lo.root_pin_rows[id(rec)] = row
++    return lo.root_pin_rows[id(rec)]
++
++
+ def _bound(lowered: LoweredTape, sites: tuple[int, ...], values: Sequence[int]) -> bool:
+     """Whether each keyed site's key binds at the call: where one does not, a
+     full redo records an opaque call, no site, and refuses."""

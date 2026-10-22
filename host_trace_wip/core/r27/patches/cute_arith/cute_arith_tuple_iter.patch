@@ -1,0 +1,64 @@
+Only in b/test: __pycache__
+diff -ru a/test/test_cuda_host_trace_cute.py b/test/test_cuda_host_trace_cute.py
+--- a/test/test_cuda_host_trace_cute.py	2026-10-13 04:51:17.170147242 -0700
++++ b/test/test_cuda_host_trace_cute.py	2026-10-13 04:51:41.155369962 -0700
+@@ -115,8 +115,7 @@
+ 
+     @cute.jit
+     def _iota(mC: cute.Tensor, n: cutlass.Int32, stream: cuda_driver.CUstream):
+-        # a coordinate tensor's layout strides are basis elements: (?):(1@0). The interpreter has no
+-        # make_identity_tensor: its calls are eager steps
++        # a coordinate tensor's layout strides are basis elements: (?):(1@0)
+         _iota_kernel(cute.make_identity_tensor(mC.shape), mC, n).launch(grid=[(n + 127) // 128, 1, 1], block=[128, 1, 1], stream=stream)
+ 
+     @cute.jit
+@@ -610,6 +609,25 @@
+         self.assertEqual(program.types[coords], {"layout": [[{"dyn": 32}], [{"basis": [1, [0]]}]]})
+         self.assertTrue(program.runtime(coords))
+ 
++    def test_an_identity_tensor_is_a_launch(self):
++        # make_identity_tensor's counting iterator (FlashInfer's 256x192 mm_fp4 tactic passes one)
++        t = make_fake_compact_tensor(cutlass.Float32, (cute.sym_int32(),), assumed_align=16)
++        iota = cute.compile(_iota, t, cutlass.Int32(0), make_fake_stream(use_tvm_ffi_env_stream=True), options="--enable-tvm-ffi")
++
++        def f(x):
++            c = torch.empty_like(x)
++            iota(c, c.shape[0])
++            return c
++
++        x = torch.empty(1000, device="cuda")
++        ((_, launch),) = trace(f, (x,)).launches
++        self.assertIsInstance(launch, KernelLaunch)
++        r = HostTraceReplay(f)
++        for n in (1000, 1000, 77, 4099):
++            x = torch.empty(n, device="cuda")
++            self.assertEqual(r(x), torch.arange(n, device="cuda", dtype=torch.float32), atol=0, rtol=0)
++        self.assertEqual((r.traces, r.replays, r.eager), (1, 3, 0))
++
+     def test_a_fast_divmod_divisor_and_a_copy_atom_are_parameters(self):
+         # the divisor's multiplier and shifts are evaluated from the call's divisor at each replay; a
+         # copy atom of no runtime state is a parameter of no meaningful bytes
+diff -ru a/torch/cuda/_host_trace_cute.py b/torch/cuda/_host_trace_cute.py
+--- a/torch/cuda/_host_trace_cute.py	2026-10-13 04:51:17.156147143 -0700
++++ b/torch/cuda/_host_trace_cute.py	2026-10-13 04:52:23.131375058 -0700
+@@ -820,6 +820,20 @@
+             return _CMP[pred](a[0], a[1])
+         if n == "cute.get_iter":
+             return a[0]["ptr"]
++        if n in ("cute.make_arith_tuple_iter", "cute.deref_arith_tuple_iter"):
++            # a counting iterator as its base coordinate; a coordinate tensor's parameter is its shape
++            # alone, so the base must be static
++            if not all(type(x) is int for x in _flat(a[0])):
++                raise _Undescribed(f"{n} of the coordinate {a[0]}")
++            return a[0]
++        if n == "cute.make_identity_tensor":
++            # a coordinate tensor at the zero coordinate over the shape, its strides the type's static bases
++            pat = self.program.described(op.types[0], "layout")
++            shape, fixed = _flat(a[0]), _flat(pat[0])
++            if len(shape) != len(fixed):
++                raise _Undescribed(f"{n} of {a[0]} into {op.types[0]}")
++            leaves = [s if _dynamic(x) else x for s, x in zip(shape, fixed)]
++            return {"ptr": _unflatten(pat[0], [0] * len(fixed)), "shape": _unflatten(pat[0], leaves), "stride": pat[1]}
+         if n == "cute.get_layout":
+             return {"shape": a[0]["shape"], "stride": a[0]["stride"]}
+         if n == "cute.make_view":

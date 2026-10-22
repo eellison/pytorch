@@ -1,0 +1,35 @@
+--- a/test/test_cuda_host_trace_replay.py	2026-10-14 06:19:45.132229188 -0700
++++ b/test/test_cuda_host_trace_replay.py	2026-10-14 09:44:53.702062501 -0700
+@@ -1429,6 +1429,32 @@
+         memset = torch._C._host_trace_held_images(variant.native)[0]
+         self.assertEqual(memset[1], 5000 * 4)
+ 
++    @parametrize("memory", ["auto", "eager", "held"])
++    def test_a_fresh_zeros_zeroes_its_call_size(self, memory):
++        # a profiler's memset bytes can show the node's instantiation width (Memset (Unknown) of the trace
++        # call's size) after cudaGraphExecMemsetNodeSetParams set another: the memory says what ran. Each
++        # call scribbles its buffer before freeing it, so a memset short of the call's size leaves 9s that
++        # the next call at that memory sums; an empty() in its place shows that the memory is reused
++        def make(factory):
++            def fn(x):
++                buf = factory(x.shape[0] * 96, dtype=torch.uint8, device=x.device)
++                s = buf.sum(dtype=torch.int64)
++                buf.fill_(9)
++                return s
++
++            return fn
++
++        sizes = random.Random(0).choices(range(1, 300), k=30)
++        stale, held = {}, {}
++        for factory in (torch.zeros, torch.empty):
++            f = HostTraceReplay(make(factory), memory=memory)
++            stale[factory] = sum(int(f(torch.empty(n, device="cuda"))) != 0 for n in sizes)
++            self.assertEqual((f.traces, f.eager), (1, 0))
++            held[factory] = [img[1] for img in torch._C._host_trace_held_images(f.variants[0].native) if isinstance(img, tuple) and len(img) == 4]
++        self.assertEqual(stale[torch.zeros], 0)
++        self.assertGreater(stale[torch.empty], len(sizes) // 2)
++        self.assertEqual(held, {torch.zeros: [sizes[-1] * 96], torch.empty: []})
++
+     def test_int_outputs(self):
+         f = HostTraceReplay(lambda x: (add(x), x.shape[0] * 2, 7))
+         for n in (1000, 3000, 5000):

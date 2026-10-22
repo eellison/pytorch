@@ -1,0 +1,282 @@
+--- a/test/test_cuda_host_trace_replay.py
++++ b/test/test_cuda_host_trace_replay.py
+@@ -2002,6 +2002,25 @@
+             self.assertEqual(f(a0, a1), fn(a0, a1), atol=0, rtol=0)
+         self.assertEqual((f.traces, f.redispatches, f.replays, f.eager), (1, 1, 3, 0))
+ 
++    @parametrize("checks", [True, False])
++    def test_an_as_strided_bound_is_a_check_of_the_calls(self, checks):
++        # eager's checkInBoundsForStorage: with validity_checks a condition the variant's calls meet
++        # (Tape.checks), no guard; a call past the bound misses and its warm-up raises eager's error
++        def fn(x, n):
++            return torch.zeros(n, device="cuda").as_strided((x.shape[0],), (1,)) + x
++
++        f = HostTraceReplay(fn)
++        with mock.patch("torch.cuda._host_trace.validity_checks", checks):
++            for m, n in ((4, 8), (6, 8), (5, 9)):
++                x = torch.randn(m, device="cuda")
++                self.assertEqual(f(x, n), fn(x, n), atol=0, rtol=0)
++            self.assertEqual((f.traces, f.replays), (1, 2))
++            with self.assertRaisesRegex(RuntimeError, "out of bounds"):
++                f(torch.randn(9, device="cuda"), 8)
++        self.assertEqual(f.replays, 2)
++        (tape,) = [v.captured.lowered.tape for v in f.variants]
++        self.assertEqual(bool(tape.checks), checks)
++
+     def test_a_zero_element_eager_output_keeps_eagers_strides(self):
+         # sort's zero-element outputs take the input's strides where its fake kernel's are
+         # contiguous: they address nothing, so the replay keeps eager's output, no disagreement
+--- a/test/test_cuda_host_trace_tape.py
++++ b/test/test_cuda_host_trace_tape.py
+@@ -156,11 +156,11 @@
+         n = rec.sym.node.expr
+         self.assertEqual((rec.position, rec.name), (1, "arg1"))
+         self.assertEqual(out.shape[0].node.expr, n)
+-        # the allocation checks its size is nonnegative (and the wrapper
+-        # construction tests it for zero); the branch is a guard
+-        self.assertEqual(
+-            [g.expr for g in tr.shape_env.guards], [n >= 0, sympy.Ne(n, 0), n > 2]
+-        )
++        # the allocation checks its size is nonnegative, a condition of the
++        # calls (Tape.checks), not a guard; the wrapper construction tests it
++        # for zero and the branch is a guard
++        self.assertEqual([g.expr for g in tr.shape_env.guards], [sympy.Ne(n, 0), n > 2])
++        self.assertEqual([c.node.expr for c in tr.checks], [n >= 0])
+         # a bool is a constant
+         self.assertEqual(
+             _run(lambda t, flag: t, torch.randn(2), True)[0].int_inputs, []
+--- a/torch/cuda/_host_trace_hint_audit.py
++++ b/torch/cuda/_host_trace_hint_audit.py
+@@ -29,7 +29,7 @@
+   - a guard over the value was recorded while the reading frame was live (the
+     reader branched on it and recorded the condition: `if _hint(n) == 0 and
+     bool(n == 0)`); or
+-  - its call site is in ALLOWLIST: diagnostic text only ("safe"), or
++  - its call site is in ALLOWLIST: a backend's own bookkeeping ("safe"), or
+     "guarded" (a guard over the value is recorded by another frame, checked
+     to exist).
+ A read on a symbol of another trace than the one running is never sound, nor
+@@ -85,13 +85,12 @@
+ _WITNESS = f"the witness's stand-ins and comparisons: {_AT_CALL}"
+ 
+ # (path under the torch package's parent, co_qualname) -> why the hint read
+-# there needs no guard: diagnostic text only, each site approved by name
++# there needs no guard, each site approved by name (user, 10-08)
+ ALLOWLIST: dict[tuple[str, str], Allowed] = {
+-    (_TAPE, "_Trace._check_as_strided"): Allowed("safe", "the text of as_strided's error message"),
+-    (_TAPE, "_Trace.allocate"): Allowed("safe", "the text of a negative size's error message"),
+-    ("torch/cuda/_host_trace.py", "bit_length"): Allowed("safe", "the sympy backend's hint of a new node, from its operand's (the backend's own bookkeeping)"),
+-    ("torch/cuda/_host_trace.py", "select"): Allowed("safe", "the sympy backend's hint of a new node, from its operands'"),
+-    ("torch/cuda/_host_trace.py", "f32_div"): Allowed("safe", "the sympy backend's hint of a new node, from its operands'"),
++    # a new node's trace-time value computed from its operands' is the sympy backend's bookkeeping, as the IR's Node.hint is
++    ("torch/cuda/_host_trace.py", "bit_length"): Allowed("safe", "the sympy backend's value of a new node, from its operand's"),
++    ("torch/cuda/_host_trace.py", "select"): Allowed("safe", "the sympy backend's value of a new node, from its operands'"),
++    ("torch/cuda/_host_trace.py", "f32_div"): Allowed("safe", "the sympy backend's value of a new node, from its operands'"),
+ }
+ 
+ # every other site that reads a hint, with its replacement (symbolic, a guard,
+--- a/torch/cuda/_host_trace_lower_tape.py
++++ b/torch/cuda/_host_trace_lower_tape.py
+@@ -561,6 +561,11 @@
+         return tuple(refs)
+ 
+ 
++def _check_records(checks: Sequence[torch.SymBool], ir: bool) -> list[Any]:
++    # Tape.checks as guards: IR records (node, written form), else sympy
++    return [(c.node.node, c.node.written) for c in checks] if ir else [c.node.expr for c in checks]
++
++
+ def lower_guards(tape: Tape, *, direct: bool = True) -> tuple[torch._C._HostTraceProgram, int]:
+     """The tape's guards, the graph's and every op's, compiled with the row
+     that is 1 at the calls they hold for: an all-eager tape's, which those
+@@ -593,6 +598,8 @@
+     graph = [guards[i] for i in tape.graph]
+     valid = lo.lowering.predicate(graph, addresses)
+     allocations = tuple(lo.allocation(rec) for rec in tape.allocs)
++    if tape.checks:
++        lo.requirements.append(lo.lowering.conjunction(_check_records(tape.checks, lo.ir), addresses))
+     launches: list[LoweredLaunch | LoweredMemset | LoweredMemcpy] = []
+     # host steps read no device memory: all run first, not splitting a run
+     host = [(seq, rec) for seq, rec in tape.launches if isinstance(rec, EagerCall) and rec.host]
+@@ -875,6 +882,10 @@
+     for i in tape.graph:
+         if not trivial(r := guard(i)) and r not in extra:
+             extra.append(r)
++    # the trace's checks of its call's values (Tape.checks), which an entry's calls meet as its guards
++    for c in _check_records(tape.checks, ir):
++        if not trivial(r := renamer.record(c) if ir else rename(c)) and r not in extra:
++            extra.append(r)
+     selected = []
+     descriptors = getattr(torch._C, "_host_trace_entry_descriptors_enabled", bool)()
+     for i in unselected:
+--- a/torch/cuda/_host_trace.py
++++ b/torch/cuda/_host_trace.py
+@@ -143,6 +143,13 @@
+ # numel() == 0 (data_ptr) for it
+ bound_addresses_unguarded = True
+ 
++# eager's validity checks of a traced call's values (as_strided's bounds, a
++# negative size) are conditions a variant's calls must meet (its valid row),
++# not guards: a call that fails one misses, and its trace's warm-up raises
++# eager's error with the call's values. One the declared domains or a recorded
++# guard decide adds nothing. False guards each, as a branch
++validity_checks = True
++
+ # with free_size_one_strides, a view's -1 size is the numel over its other sizes,
+ # so the view takes the free strides rather than the fake kernel's guards
+ free_inferred_views = True
+--- a/torch/cuda/_host_trace_redispatch.py
++++ b/torch/cuda/_host_trace_redispatch.py
+@@ -334,11 +334,13 @@
+         return int(e) if e.is_Integer else e
+ 
+     if ir:
+-        # Env records, as the variant's own guards
+-        guards = [r for r in map(renamer.record, env.records) if r[0].op != "true"]
++        # Env records, as the variant's own guards, and its checks of the call's values (Tape.checks)
++        records = [*env.records, *((c.node.node, c.node.written) for c in tr.checks)]
++        guards = [r for r in map(renamer.record, records) if r[0].op != "true"]
+         false = any(r[0].op == "false" for r in guards)
+     else:
+-        guards = [g for g in (rename(g.expr) for g in env.guards) if g is not sympy.true]
++        exprs = [*(g.expr for g in env.guards), *(c.node.expr for c in tr.checks)]
++        guards = [g for g in map(rename, exprs) if g is not sympy.true]
+         false = sympy.false in guards
+     if false:
+         raise AssertionError(f"host_trace: {op.func}'s dispatch again guards a condition the call fails")
+--- a/torch/cuda/_host_trace_tape.py
++++ b/torch/cuda/_host_trace_tape.py
+@@ -342,6 +342,8 @@
+         self.tensors: weakref.WeakSet[_TracedTensor] | None = weakref.WeakSet() if check_escapes else None
+         # the traced call's values (_symbolic_run, a redispatch's _redo)
+         self.values: CallValues | None = None
++        # eager's checks of the call's values that its calls must meet (check)
++        self.checks: list[torch.SymBool] = []
+         # the traced hosts' calls with their outputs, for _check_witness
+         self.aten_calls: list[tuple[int, EagerCall]] = []
+         # fn's own operator calls in order, as the warm-up's (_order_key)
+@@ -537,11 +539,9 @@
+         if mf not in _ALLOC_FORMATS:
+             raise self.decline(f"an allocation in memory format {mf}")
+         for s in sizes:
+-            # c10's check_size_nonnegative, a guard for a size from an int argument
+-            if not bool(s >= 0):
+-                raise RuntimeError(
+-                    f"Trying to create tensor with negative dimension {_hint(s)}: {sizes}"
+-                )
++            # c10's check_size_nonnegative
++            message = functools.partial(self._negative_size, s, sizes)
++            self.check(s >= 0, message)
+         k = self.first_alloc + len(self.allocs)
+         name = f"alloc{k}"
+         root = _Root(f"a{k}", None, "allocation", k)
+@@ -551,6 +551,29 @@
+         self.allocs.append(rec)
+         return _TracedTensor(root, sizes, strides, 0, dtype, self.device)
+ 
++    def _negative_size(self, s: Any, sizes: list) -> RuntimeError:
++        at = [self.values(n) for n in sizes]
++        return RuntimeError(f"Trying to create tensor with negative dimension {self.values(s)}: {at}")
++
++    def check(self, cond: Any, error: Callable[[], Exception]) -> None:
++        """eager's check `cond` of the call's values, which raises error()
++        where it fails: at the traced call, a condition of the trace's calls
++        (Tape.checks) with validity_checks on, else a guard."""
++        if not isinstance(cond, torch.SymBool) or not torch.cuda._host_trace.validity_checks:
++            if not bool(cond):
++                raise error()
++            return
++        if not self.values(cond):
++            raise error()
++        node = cond.node
++        if isinstance(node, _ir.IRSymNode):
++            env = self.shape_env
++            if node.node.op == "true" or _ir._record_key(node.node, node.written) in env._index:
++                return  # the declared domains or a guard decide it
++        elif node.expr is sympy.true:
++            return
++        self.checks.append(cond)
++
+     def zero(self, t: Any) -> bool:
+         """Record t.zero_() of a non-overlapping and dense tensor on the
+         trace's stream as a Memset of its bytes (nothing if it is empty);
+@@ -1650,24 +1673,28 @@
+         # eager's setStrided checks (checkAsStridedArgs, checkInBoundsForStorage),
+         # which the fake kernel skips for symbolic values
+         sizes, strides, offset = list(v.shape), list(v.stride()), v.storage_offset()
+-        where = f"sizes {[_hint(s) for s in sizes]}, strides {[_hint(s) for s in strides]}, storage offset {_hint(offset)}"
+-        if not _guard_each([st >= 0 for st in strides]):
+-            raise RuntimeError(
+-                f"as_strided: Negative strides are not supported ({where})"
+-            )
+-        if not bool(offset >= 0):
+-            raise RuntimeError(f"Tensor: invalid storage offset ({where})")
+-        if any(bool(s == 0) for s in sizes):
+-            return
+-        needed = _storage_nbytes(sizes, strides, offset, v.dtype.itemsize)
++
++        def error(what: str) -> Callable[[], RuntimeError]:
++            def make() -> RuntimeError:
++                at = self.values
++                return RuntimeError(what.format(f"sizes {list(map(at, sizes))}, strides {list(map(at, strides))}, storage offset {at(offset)}"))
++
++            return make
++
++        for st in strides:
++            self.check(st >= 0, error("as_strided: Negative strides are not supported ({})"))
++        self.check(offset >= 0, error("Tensor: invalid storage offset ({})"))
+         if root.kind == "allocation" and id(root) not in self.outer:
+             a = next(a for a in self.allocs if a.root is root)
+-            bound = _storage_nbytes(a.sizes, a.strides, 0, a.dtype.itemsize)
+-            if not bool(needed <= bound):
+-                raise RuntimeError(
+-                    f"setStorage: {where} are out of bounds for the storage"
+-                )
++            empty = _any_zero(a.sizes)
++            extent = (1 + sum((n - 1) * st for n, st in zip(a.sizes, a.strides))) * a.dtype.itemsize
++            bound = torch.cuda._host_trace.select(empty, 0, extent) if isinstance(empty, torch.SymBool) else 0 if empty else extent
++            needed = (offset + 1 + sum((n - 1) * st for n, st in zip(sizes, strides))) * v.dtype.itemsize
++            self.check(_either(_any_zero(sizes), needed <= bound), error("setStorage: {} are out of bounds for the storage"))
++            return
++        if any(bool(s == 0) for s in sizes):
+             return
++        needed = _storage_nbytes(sizes, strides, offset, v.dtype.itemsize)
+         # neither an input's nor an eager output's storage size is part of the
+         # trace: the bound is the bytes up to the input's or output's end
+         if root.kind == "argument":
+@@ -1934,6 +1961,18 @@
+     return True
+ 
+ 
++def _either(a: Any, b: Any) -> Any:
++    # a or b, each a bool or a SymBool, with no guard
++    if a is True or b is True:
++        return True
++    return b if a is False else a if b is False else a | b
++
++
++def _any_zero(sizes: Sequence[Any]) -> Any:
++    # whether a size is 0, with no guard
++    return functools.reduce(_either, [s == 0 for s in sizes], False)
++
++
+ def _storage_nbytes(sizes: list, strides: list, offset: Any, itemsize: int) -> Any:
+     # at::detail::computeStorageNbytes, each zero-size test a guard
+     extent: Any = 1
+@@ -3407,6 +3446,8 @@
+         self.launches = tr.launches
+         self.sites = tr.sites
+         self.eager_outputs = tr.eager_outputs
++        # eager's checks of the call's values every call must meet (_Trace.check)
++        self.checks = tr.checks
+         self.outputs = outputs
+         self.result_kind = result_kind  # "tensor", "tuple", "list" or "none"
+         # how many conditions the host branched on (`guards`)
+@@ -3641,6 +3682,7 @@
+     sites.sort(key=lambda s: min(order[id(t._root)] for t, _ in s.scratch.values()))
+     out = copy.copy(tape)
+     out.allocs, out.launches, out.sites, out.ops, out.owners = allocs, launches, sites, ops, owners
++    out.checks = [*tape.checks, *tr.checks]
+     if added:
+         out.guard_count = marks + added
+     out.owner_sets = None if owner_sets is None else [frozenset(o) for o in owner_sets]

@@ -1,0 +1,222 @@
+diff -ruN -x __pycache__ -x '*.pyc' -x TREE.txt step_ms34/torch/cuda/_host_trace_harvest.py wip46/torch/cuda/_host_trace_harvest.py
+--- step_ms34/torch/cuda/_host_trace_harvest.py	2026-10-19 07:21:52.755001250 -0700
++++ wip46/torch/cuda/_host_trace_harvest.py	2026-10-20 15:43:28.700674702 -0700
+@@ -926,6 +926,68 @@
+     return (k[0], op if isinstance(op, str) else (op._schema.name, op._overloadname), *k[2:])
+ 
+ 
++class _RestoreOnly:
++    """preload's provider for HostTraceReplay._learn: a stored key's restore, nothing harvested."""
++
++    def __init__(self, provider: HarvestProvider) -> None:
++        self.provider = provider
++
++    def refusal(self, key: OpaqueKey) -> str | None:
++        return self.provider.refusal(key)
++
++    def operands(self, key: OpaqueKey, inputs: int) -> dict[int, torch.Tensor] | None:
++        return self.provider.operands(key, inputs)
++
++    def learn(self, key: OpaqueKey, args: tuple, kwargs: dict, operands: list[Any]) -> OpaqueBinding | None:
++        p = self.provider
++        k = p._normal(key)
++        with p._lock, torch.cuda.device(key.device):
++            return p._restore(key, k, args, kwargs) if k in p.stored else None
++
++
++# a stored key's operator by its normal name (_OUT): the default overload, whose call the warm-up's learn makes
++_DEFAULT_OF = {"aten::mm": aten.mm.default, "aten::addmm": aten.addmm.default, "aten::bmm": aten.bmm.default}
++
++
++def _synthetic_call(k: tuple) -> tuple[OpaqueKey, tuple[Any, frozenset[int]]] | None:
++    """A stored key as an OpaqueKey of a callable operator and its call's pytree spec (tensor leaves' positions; the key's
++    scalars in the other arguments' places, in schema order), as the offline learn builds it; None for a key it cannot
++    call (a mixed-dtype mm)."""
++    alias, op, dtypes, sizes, strides, classes, scalars, device, state = _local(k)
++    if isinstance(op, str):
++        if op == "aten::mm" and dtypes[-1] != dtypes[0]:
++            return None
++        op = _DEFAULT_OF.get(op)
++        if op is None:
++            return None
++    key = OpaqueKey(op, dtypes, sizes, strides, tuple(0 if c == 256 else c for c in classes), scalars, device, state, alias)
++    tensors = len(dtypes) - sum(1 for r in op._schema.returns if r.alias_info is None)
++    leaves: list[Any] = []
++    positions: list[int] = []
++    given = iter(scalars)
++    args: list[Any] = []
++    kwargs: dict[str, Any] = {}
++    for arg in op._schema.arguments:
++        is_tensor = isinstance(arg.type, torch.TensorType) or str(arg.type).startswith("Tensor")
++        if is_tensor and len(positions) < tensors:
++            positions.append(len(leaves))
++            v: Any = object()  # a tensor leaf's place (_learn puts the synthetic tensor there)
++            leaves.append(v)
++        elif is_tensor:
++            continue
++        else:
++            try:
++                v = next(given)
++            except StopIteration:
++                continue
++            leaves.append(v)
++        if arg.kwarg_only:
++            kwargs[arg.name] = v
++        else:
++            args.append(v)
++    return key, (pytree.tree_flatten((tuple(args), kwargs))[1], frozenset(positions))
++
++
+ def _local(k: tuple) -> tuple:
+     op = k[1]
+     if not isinstance(op, str):
+@@ -1080,6 +1142,13 @@
+         self.functions: dict[tuple[int, str], int] = {}
+         self.restored = 0
+         self.stale: list[str] = []
++        # the stored keys by each (device, function name) they wait for, how many each still waits for, and per device
++        # those whose functions are all loaded (_await): a restore visits only the keys its new functions complete; the
++        # keys it visited (counter)
++        self._awaiting: dict[tuple[int, str], list[tuple]] = {}
++        self._missing: dict[tuple, int] = {}
++        self._complete: dict[int, dict[tuple, None]] = {}
++        self.index_visits = 0
+         # each distinct slot, slot tuple, launch shape and parameter layout
+         # of the bindings, held once (_compact)
+         self._interned: dict[Any, Any] = {}
+@@ -1183,9 +1252,51 @@
+         if not entries or not _same_meta(data["meta"], _meta(entries[0][0][7], versions)):
+             return 0
+         for k, b in entries:
+-            self.stored[_local(k)] = self._compact(b)
++            local = _local(k)
++            self.stored[local] = self._compact(b)
++            self._await(local, self.stored[local])
+         return len(entries)
+ 
++    def preload(self) -> int:
++        """Loads, before any call, the kernel functions load's bindings wait for: per function, one stored key that waits for
++        it is restored from a plain capture of its operator on synthetic operands at the key's metadata (the warm-up's
++        _learn, its call from the operator's schema), then every stored key whose functions are all loaded is held. A call
++        at a stored key then fills its row in C++, with no restore at the call. A key whose capture differs from it is put
++        back for its own call to judge. The count restored."""
++        import types
++
++        from torch.cuda._host_trace_replay import HostTraceReplay
++
++        before = self.restored
++        restore_only = _RestoreOnly(self)
++        while self._awaiting:
++            want, keys = next(iter(self._awaiting.items()))
++            k = next((k for k in keys if k in self.stored and (call := _synthetic_call(k)) is not None), None)
++            if k is None:
++                del self._awaiting[want]
++                continue
++            key, spec = call
++            stored, stale = self.stored[k], len(self.stale)
++            binding = HostTraceReplay._learn(types.SimpleNamespace(learned=0, learn_s=0.0), key.op, restore_only, spec, key)
++            if binding is None:
++                self.stored[k] = stored
++                del self.stale[stale:]
++            if want in self._awaiting:  # this key did not load the function: another key of it, if any
++                self._awaiting[want] = [o for o in self._awaiting[want] if o != k]
++                if not self._awaiting[want]:
++                    del self._awaiting[want]
++        return self.restored - before
++
++    def _await(self, k: tuple, binding: OpaqueBinding) -> None:
++        device = k[7]
++        missing = {n.function for n in binding.nodes if isinstance(n, OpaqueKernel)} - {name for d, name in self.functions if d == device}
++        if missing:
++            self._missing[k] = len(missing)
++            for name in missing:
++                self._awaiting.setdefault((device, name), []).append(k)
++        else:
++            self._complete.setdefault(device, {})[k] = None
++
+     def _compact(self, binding: OpaqueBinding) -> OpaqueBinding:
+         """binding with its parts that other bindings repeat (slots, launch
+         shapes and parameter layouts) shared with theirs: keys that differ in
+@@ -1259,10 +1370,22 @@
+             return None
+         for n in nodes:
+             if isinstance(n, KernelNode):
++                if (key.device, n.name) not in self.functions:
++                    for waiting in self._awaiting.pop((key.device, n.name), ()):
++                        self.index_visits += 1
++                        self._missing[waiting] -= 1
++                        if not self._missing[waiting]:
++                            del self._missing[waiting]
++                            self._complete.setdefault(key.device, {})[waiting] = None
+                 self.functions[key.device, n.name] = n.function
+         binding = self._resolved(k, key.device)
+         # the stored keys whose functions are now all loaded: held, so a keyed site's row at one fills in C++
+-        for other in [o for o, b in self.stored.items() if o[7] == key.device and all((key.device, n.function) in self.functions for n in b.nodes if isinstance(n, OpaqueKernel))]:
++        ready = [o for o in self._complete.pop(key.device, {}) if o in self.stored]
++        if torch.cuda._host_trace.verify_redo_templates:
++            scan = [o for o, b in self.stored.items() if o[7] == key.device and all((key.device, n.function) in self.functions for n in b.nodes if isinstance(n, OpaqueKernel))]
++            if set(ready) != set(scan):
++                raise AssertionError(f"host_trace: the restore index gives {len(ready)} stored keys complete, a scan {len(scan)}")
++        for other in ready:
+             self._resolved(other, key.device)
+         return binding
+ 
+diff -ruN -x __pycache__ -x '*.pyc' step_ms34/test/test_cuda_host_trace_harvest.py wip46/test/test_cuda_host_trace_harvest.py
+--- step_ms34/test/test_cuda_host_trace_harvest.py	2026-10-19 09:00:34.305462654 -0700
++++ wip46/test/test_cuda_host_trace_harvest.py	2026-10-20 15:43:37.588753968 -0700
+@@ -1,5 +1,6 @@
+ # Owner(s): ["module: cuda graphs"]
+ 
++import collections
+ import dataclasses
+ import functools
+ import os
+@@ -2857,6 +2858,48 @@
+         self.assertEqual((q.restored, len(q.stale) > 0, q.harvests), (0, True, len(p.bindings)))
+ 
+ 
++    def test_a_restore_visits_only_the_keys_its_functions_complete(self):
++        # load's stored keys wait for their kernel functions by name; a restore that loads a function visits only the keys
++        # waiting for it (index_visits), and holds every stored key whose functions are then all loaded (what a scan of
++        # every stored key gives: verify_redo_templates checks it at each restore)
++        from torch.cuda._host_trace_opaque import OpaqueKernel
++
++        w = torch.randn(64, 48, device="cuda", dtype=bf16)
++        p = HarvestProvider()
++        self.calls(HostTraceReplay(self.f, opaque=(p,)), (32, 32, 40, 72, 72, 200, 200), w)
++        with tempfile.TemporaryDirectory() as d:
++            path = os.path.join(d, "bindings.pickle")
++            p.save(path)
++            q = HarvestProvider()
++            self.assertEqual(q.load(path), len(p.bindings))
++        before = dict(q.stored)
++        uses = collections.Counter((k[7], n.function) for k, b in before.items() for n in {n.function: n for n in b.nodes if isinstance(n, OpaqueKernel)}.values())
++        self.calls(HostTraceReplay(self.f, opaque=(q,)), (32, 32), w)
++        self.assertGreater(q.restored, 0)
++        loaded = {f for f in uses if f in q.functions}
++        complete = {k for k, b in before.items() if all((k[7], n.function) in q.functions for n in b.nodes if isinstance(n, OpaqueKernel))}
++        self.assertEqual(complete, set(before) - set(q.stored))
++        self.assertEqual(q.index_visits, sum(uses[f] for f in loaded))
++
++    def test_preload_restores_before_any_call(self):
++        # preload restores one stored key per kernel function on synthetic operands and holds every stored key: the calls at
++        # the stored sizes then restore nothing, harvest nothing, and replay bitwise
++        w = torch.randn(64, 48, device="cuda", dtype=bf16)
++        p = HarvestProvider()
++        sizes = (32, 32, 40, 72, 72, 200, 200)
++        self.calls(HostTraceReplay(self.f, opaque=(p,)), sizes, w)
++        with tempfile.TemporaryDirectory() as d:
++            path = os.path.join(d, "bindings.pickle")
++            saved = p.save(path)
++            q = HarvestProvider()
++            self.assertEqual(q.load(path), saved)
++        restored = q.preload()
++        self.assertGreater(restored, 0)
++        self.assertEqual((len(q.stored), len(q.bindings), q.stale), (0, saved, []))
++        before = (q.restored, q.harvests)
++        self.calls(HostTraceReplay(self.f, opaque=(q,)), sizes, w)
++        self.assertEqual((q.restored, q.harvests), before)
++
+     @parametrize("pattern", [0, 0x3C])
+     def test_persist_padding(self, pattern):
+         # a stored kernel's padding holds the harvest's smear and its unread

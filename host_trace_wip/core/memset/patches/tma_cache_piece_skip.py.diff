@@ -1,0 +1,93 @@
+diff -ru -x __pycache__ step_ms3/test/test_cuda_host_trace_cute.py step_ms4/test/test_cuda_host_trace_cute.py
+--- step_ms3/test/test_cuda_host_trace_cute.py	2026-10-14 06:01:44.019098782 -0700
++++ step_ms4/test/test_cuda_host_trace_cute.py	2026-10-15 05:50:01.406648951 -0700
+@@ -1661,6 +1661,44 @@
+         not TEST_CUDA or torch.cuda.get_device_capability() < (10, 0),
+         "requires Blackwell",
+     )
++    def test_alternating_sizes_reuse_their_descriptor_encodes(self):
++        # A's descriptor extents follow m: the first call at each m encodes it,
++        # a later call at an m seen before takes that encode's map (the address
++        # replaced), with no encode. Outputs bitwise
++        bw = _example("cute/blackwell/kernel/dense_gemm/dense_gemm.py", "bw_dense_gemm")
++        a, b, c = (_half(1, 256, 64).permute(1, 2, 0) for _ in range(3))
++        op = bw.DenseGemmKernel(cutlass.Float32, False, (128, 128), (1, 1), True)
++        compile_args = [
++            from_dlpack(t, assumed_align=16).mark_layout_dynamic(leading_dim=1)
++            for t in (a, b, c)
++        ]
++        stream = make_fake_stream(use_tvm_ffi_env_stream=True)
++        gemm = cute.compile(op, *compile_args, stream, options="--enable-tvm-ffi")
++
++        def f(a, b):
++            c = a.new_empty(1, a.shape[0], b.shape[0]).permute(1, 2, 0)
++            gemm(a, b, c)
++            return c
++
++        r = HostTraceReplay(f)
++        b = _half(1, 128, 64).permute(1, 2, 0)
++        xs = {m: _half(1, m, 64).permute(1, 2, 0) for m in (256, 384)}
++        for m in (256, 384, 256, 384):
++            r(xs[m], b)
++        encodes, hits = torch._C._host_trace_tma_counts()[0], torch._C._host_trace_tma_cache_hits()
++        for m in (256, 384) * 3:
++            out = r(xs[m], b)
++            ref = xs[m].new_empty(1, m, 128).permute(1, 2, 0)
++            gemm(xs[m], b, ref)
++            self.assertEqual(out, ref, atol=0, rtol=0)
++        self.assertEqual(torch._C._host_trace_tma_counts()[0] - encodes, 0)
++        self.assertGreater(torch._C._host_trace_tma_cache_hits() - hits, 0)
++        self.assertEqual((r.traces, len(r.variants), r.eager), (1, 1, 0))
++
++    @unittest.skipIf(
++        not TEST_CUDA or torch.cuda.get_device_capability() < (10, 0),
++        "requires Blackwell",
++    )
+     @parametrize("entry_descriptors", [True, False])
+     def test_a_tma_compile_choice_dispatches_again_into_one_variant(self, entry_descriptors):
+         # _tma_gemm's N tile (128 from m 512, else 64) is its op's own choice:
+diff -ru -x __pycache__ step_ms3/test/test_cuda_host_trace_opaque.py step_ms4/test/test_cuda_host_trace_opaque.py
+--- step_ms3/test/test_cuda_host_trace_opaque.py	2026-10-14 20:56:15.686689256 -0700
++++ step_ms4/test/test_cuda_host_trace_opaque.py	2026-10-15 07:11:29.504075190 -0700
+@@ -877,6 +877,30 @@
+         self.assertEqual(sets == 0, form_held)
+ 
+     @parametrize("stable", [True, False])
++    def test_a_piece_whose_reads_repeat_is_not_packed(self, stable):
++        # n % 256 == 0 binds the scratch topology, a piece of the plain call's
++        # form: a repeated call at it with the same operands packs none of its
++        # nodes; a fresh y (an operand the piece reads) packs and patches it.
++        # Outputs bitwise
++        p = TableProvider(style="mixed")
++        f = HostTraceReplay(mul_chain, opaque=(p,))
++        base = torch.randn(4096, device="cuda")
++        x6, x5 = torch.randn(640, device="cuda"), torch.randn(512, device="cuda")
++        for _ in range(2):
++            f(x6, base[:640])
++            f(x5, base[:512])
++        self.assertEqual(len(bound(f)), 1)
++        skips = []
++        ys = [base[:512]] + [torch.randn(512, device="cuda") for _ in range(4)]
++        for i in range(4):
++            y = base[:512] if stable else ys[i + 1]
++            s0 = torch._C._host_trace_piece_skips()
++            self.assertEqual(f(x5, y), mul_chain(x5, y), atol=0, rtol=0)
++            skips.append(torch._C._host_trace_piece_skips() - s0)
++        # (the first call after the fresh tensors' allocations may move an intermediate)
++        self.assertEqual(skips[1:], [1] * 3 if stable else [0] * 3, skips)
++
++    @parametrize("stable", [True, False])
+     def test_forms_alternating_set_only_what_moved(self, stable):
+         # two sites, each binding either topology (TableProvider "mixed": n % 256), so up
+         # to four forms, cycled repeatedly. Each form's exec keeps what it held: with the
+--- step_ms3/torch/_C/__init__.pyi.in	2026-10-14 11:29:51.215786981 -0700
++++ step_ms4/torch/_C/__init__.pyi.in	2026-10-15 05:50:01.405615632 -0700
+@@ -2709,6 +2709,8 @@
+ def _host_trace_kernel_packs() -> _int: ...
+ def _host_trace_kernel_node_sets() -> _int: ...
+ def _host_trace_kernel_row_switches() -> _int: ...
++def _host_trace_tma_cache_hits() -> _int: ...
++def _host_trace_piece_skips() -> _int: ...
+ def _host_trace_phase_times(enable: _bool) -> list[_int]: ...
+ def _host_trace_static_split(variant: _HostTraceVariant) -> tuple[_int, _int]: ...
+ def _host_trace_held_buffer_bytes() -> _int: ...

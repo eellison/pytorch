@@ -1,0 +1,168 @@
+--- a/torch/cuda/_host_trace.py
++++ b/torch/cuda/_host_trace.py
+@@ -109,6 +109,11 @@
+ # a redispatch instantiating a redo template also redoes the op in full and asserts the two entries are one (the
+ # test suites set it)
+ verify_redo_templates = False
++# a redispatch's redo resolves a plain CUDA tensor its op's body reaches (module or context state, as vLLM's
++# layer.kv_cache) to the call's tensor argument of the same storage (the StorageImpl, not its address) and the same view,
++# where exactly one is; the trace saw that argument there (the caller swapped it in while fn ran). Off: such a read
++# declines and the call traces again. An integration that swaps its arguments into state turns it on
++redo_resolves_arguments = False
+ 
+ 
+ def dispatch_unit(fn: Callable[..., Any]) -> Callable[..., Any]:
+--- a/torch/cuda/_host_trace_redispatch.py
++++ b/torch/cuda/_host_trace_redispatch.py
+@@ -521,6 +521,7 @@
+     # a dispatch that read the same of its call, whose guards hold at this one, is this one's: the op's records are a
+     # function of what it reads (an entry's are taken wherever its predicate holds)
+     sig, cached, nodes = None, None, 0
++    resolved: dict[int, _TracedTensor] = {}  # the plain tensors the body reached resolved to arguments (_resolver)
+     if dispatches is not None and ir and not any(isinstance(a, torch.Tensor) and not isinstance(a, _TracedTensor) for a in pytree.tree_leaves(op.call)):
+         index = {k: i for i, k in enumerate([*map(id, (*made, *roots.values())), *tensors])}
+         read = tuple((index[id(x)], x.node.node.args[0] in env.ctx.positive) if isinstance(x, torch.SymInt) else (index[id(x)],) if isinstance(x, (_Root, _TracedTensor)) else x for x in shape)
+@@ -555,6 +556,8 @@
+         tr.values = CallValues(env, {m.node.node.args[0]: x for m, x in zip(made, at_call)})
+         tr.inputs, tr.arguments = inputs, {id(i.root): i for i in inputs}
+         tr.outer = {k: _TracedTensor(*o) for k, o in outer.items()}
++        if torch.cuda._host_trace.redo_resolves_arguments:
++            tr.resolve = _resolver(old, lo, tr, root, made, at_call, inputs, resolved)
+         built = {k: _TracedTensor(*t) for k, t in tensors.items()}
+         call = pytree.tree_map_only(_TracedTensor, lambda a: built[id(a)], call)
+         if len(op.allocs):
+@@ -597,7 +600,7 @@
+         raise FoldRefused(f"{op.func} dispatches otherwise")
+     # one whose guards read a symbol the dispatch made itself is never taken
+     names = {s.node.node.args[0] for s in made}
+-    if sig is not None and cached is None and not nodes and not tr.sites and all(g.free_symbols <= names for g, _ in env.records):
++    if sig is not None and cached is None and not nodes and not tr.sites and not resolved and all(g.free_symbols <= names for g, _ in env.records):
+         dispatches.setdefault(sig, []).append((tr, made, list(roots.values())))
+     new = tr.ops[0]
+     if eager:
+@@ -792,6 +795,43 @@
+     return guards, launches, None
+ 
+ 
++def _resolver(
++    old: Any, lo: Any, tr: _Trace, root: Callable[[_Root], _Root], made: list, at_call: list, inputs: list, resolved: dict[int, _TracedTensor]
++) -> Callable[[torch.Tensor], torch.Tensor]:
++    """redo_resolves_arguments: a plain CUDA tensor the redo's body reaches
++    becomes the stand-in of the call's tensor argument of the same storage
++    object and view (dtype, sizes, strides, storage offset), where exactly one
++    is: that argument's root at its input record's layout in fresh symbols, as
++    the redo builds any argument it reads. Any other tensor is left as it is
++    (it declines as before)."""
++    by_storage: dict[int, list[tuple[_InputRec, torch.Tensor]]] = {}
++    for rec in old.inputs:
++        a = lo.program.inputs[rec.position]
++        if isinstance(a, torch.Tensor):
++            by_storage.setdefault(a.untyped_storage()._cdata, []).append((rec, a))
++
++    def resolve(t: torch.Tensor) -> torch.Tensor:
++        if isinstance(t, _TracedTensor) or t.device.type != "cuda":
++            return t
++        if id(t) in resolved:
++            return resolved[id(t)]
++        view = (t.dtype, t.shape, t.stride(), t.storage_offset())
++        found = [rec for rec, a in by_storage.get(t.untyped_storage()._cdata, ()) if (a.dtype, a.shape, a.stride(), a.storage_offset()) == view]
++        if len(found) != 1:
++            return t
++        n = len(made)
++        with lo.symbolic.total():
++            r = root(found[0].root)
++        for m, x in zip(made[n:], at_call[n:]):
++            tr.values.bind(m, x)
++        rec = next(i for i in inputs if i.root is r)
++        tr.arguments[id(r)] = rec
++        resolved[id(t)] = _TracedTensor(r, list(rec.sizes), list(rec.strides), rec.offset, t.dtype, t.device)
++        return resolved[id(t)]
++
++    return resolve
++
++
+ @dataclass(frozen=True)
+ class Temporary:
+     """A section's temporary: its root (a symbol of the variant's context no
+--- a/torch/cuda/_host_trace_tape.py
++++ b/torch/cuda/_host_trace_tape.py
+@@ -353,6 +353,8 @@
+         # fn's own operator calls in order, as the warm-up's (_order_key)
+         self.order: list[tuple] = []
+         self.depth = 0  # of _TraceMode dispatches
++        # a redo's resolution of a plain tensor to an argument's stand-in (redo_resolves_arguments), or None
++        self.resolve: Callable[[torch.Tensor], torch.Tensor] | None = None
+         self.sites: list[KeyedSite] = []  # the calls bound at trace time
+         # the CPU tensors the host's steps write, by storage: the trace's own,
+         # each step writing them again at a replay
+@@ -2707,6 +2709,8 @@
+         tr = self.trace
+         if current_trace() is not tr:
+             raise tr.decline(f"{func} on a thread other than the trace's")
++        if tr.resolve is not None:
++            args, kwargs = pytree.tree_map_only(torch.Tensor, tr.resolve, (args, kwargs))
+         if func is aten.is_non_overlapping_and_dense.default:
+             return _is_non_overlapping_and_dense(args[0], tr.values)
+         if tr.depth:
+--- a/test/test_cuda_host_trace_replay.py
++++ b/test/test_cuda_host_trace_replay.py
+@@ -292,6 +292,23 @@
+     return y
+ 
+ 
++# module state a custom op's body reads (vLLM's layer.kv_cache): the step swaps its argument in while it runs
++_MODULE_STATE: dict[str, torch.Tensor] = {}
++
++
++@torch.library.custom_op("host_trace_test::reads_module_state", mutates_args=("out",))
++def reads_module_state(q: torch.Tensor, out: torch.Tensor) -> None:
++    kv = _MODULE_STATE["kv"]
++    # an op-owned host branch with the same kernels on both sides
++    q2 = q.reshape(1, -1).view(q.shape) if q.shape[0] == 1 else q
++    torch.add(q2, kv[: q.shape[0]], out=out)
++
++
++@reads_module_state.register_fake
++def _(q, out):
++    return None
++
++
+ @torch.library.custom_op("host_trace_test::tactic_op", mutates_args=())
+ def tactic_op(x: torch.Tensor) -> torch.Tensor:
+     return tactic_add(x)
+@@ -739,6 +756,35 @@
+         (v,) = f.variants
+         self.assertTrue(all(t.pinned for t in v.captured.lowered.lowering.templates.values()))
+ 
++    @parametrize("resolves", [True, False])
++    def test_a_redo_of_a_body_reading_module_state(self, resolves):
++        # the op's body reads its kv from module state, the step's argument only while the step runs: a redo (at the
++        # q.shape[0] == 1 flip) resolves the real kv to that argument by storage and view with redo_resolves_arguments;
++        # without it the body declines (the redo's op is an eager step) and the call traces again, counted
++        def step(kv, q):
++            saved, _MODULE_STATE["kv"] = _MODULE_STATE.get("kv"), kv
++            try:
++                out = torch.empty_like(q)
++                torch.ops.host_trace_test.reads_module_state(q, out)
++                return out * 1
++            finally:
++                _MODULE_STATE["kv"] = saved
++
++        kv = torch.randn(64, 8, device="cuda")
++        _MODULE_STATE["kv"] = kv
++        f = HostTraceReplay(step)
++        with mock.patch.object(torch.cuda._host_trace, "redo_resolves_arguments", resolves):
++            for n in (4, 1, 6, 1):
++                q = torch.randn(n, 8, device="cuda")
++                self.assertEqual(f(kv, q), step(kv, q), atol=0, rtol=0)
++        if resolves:
++            self.assertEqual((f.traces, f.redispatches, f.retrace_causes), (1, 1, {}))
++        else:
++            self.assertEqual((f.traces, f.redispatches), (2, 0))
++            ((cause, n),) = f.retrace_causes.items()
++            self.assertEqual((cause[0], cause[1], n), ("dispatch", "host_trace_test.reads_module_state.default", 1))
++            self.assertEqual(cause[4], "host_trace_test.reads_module_state.default dispatches otherwise")
++
+     def test_layers_share_a_redo_template(self):
+         # every layer's ops redispatch at the same call: the first layer's redo
+         # is a template the others take with their own roots (verify mode, on in

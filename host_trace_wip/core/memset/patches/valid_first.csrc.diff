@@ -1,0 +1,79 @@
+diff -ru build_cpp_ms5/src/torch/csrc/cuda/host_trace/Entry.cpp build_cpp_ms6/src/torch/csrc/cuda/host_trace/Entry.cpp
+--- build_cpp_ms5/src/torch/csrc/cuda/host_trace/Entry.cpp	2026-10-15 05:48:41.545455165 -0700
++++ build_cpp_ms6/src/torch/csrc/cuda/host_trace/Entry.cpp	2026-10-15 07:13:14.899052991 -0700
+@@ -1758,6 +1758,7 @@
+     return py::make_tuple(tma_encodes, tma_replaces);
+   });
+   m.def("_host_trace_tma_cache_hits", [] { return tma_cache_hits; });
++  m.def("_host_trace_valid_first_misses", [] { return valid_first_misses; });
+   m.def("_host_trace_piece_skips", [] { return piece_skips; });
+   m.def("_host_trace_buffered_runs", [] { return buffered_runs; });
+   m.def("_host_trace_delta_counts", [] {
+diff -ru build_cpp_ms5/src/torch/csrc/cuda/host_trace/Sites.cpp build_cpp_ms6/src/torch/csrc/cuda/host_trace/Sites.cpp
+--- build_cpp_ms5/src/torch/csrc/cuda/host_trace/Sites.cpp	2026-10-15 05:48:59.190969601 -0700
++++ build_cpp_ms6/src/torch/csrc/cuda/host_trace/Sites.cpp	2026-10-15 07:13:14.898209210 -0700
+@@ -7,6 +7,7 @@
+ #include <c10/util/SmallVector.h>
+ 
+ #include <algorithm>
++#include <numeric>
+ #include <utility>
+ 
+ namespace torch::cuda::host_trace {
+@@ -16,6 +17,7 @@
+ int64_t delta_fulls = 0;
+ int64_t delta_rows_evaluated = 0;
+ bool delta_enabled = true;
++int64_t valid_first_misses = 0;
+ bool variant_order_enabled = true;
+ bool placement_reuse_enabled = true;
+ bool form_held_enabled = true;
+@@ -105,9 +107,22 @@
+   frame.args = args;
+   frame.count = count;
+   frame.values.resize_for_overwrite(program_.num_rows());
+-  frame.evaluated = program_.evaluate(leaves.data(), frame.values.data()) ==
++  if (valid_split_rows_ != program_.num_rows()) {
++    // the rows the valid row reads first: a call another variant serves stops there
++    std::vector<uint32_t> all(program_.num_rows());
++    std::iota(all.begin(), all.end(), 0);
++    program_.partition(static_cast<int64_t>(valid_), all, valid_first_rows_, valid_other_rows_);
++    valid_split_rows_ = program_.num_rows();
++  }
++  frame.evaluated = false;
++  if (program_.evaluate(valid_first_rows_, leaves.data(), frame.values.data()) != HostTraceProgram::Status::Success ||
++      frame.values[valid_] != 1) {
++    ++valid_first_misses;
++    return false;
++  }
++  frame.evaluated = program_.evaluate(valid_other_rows_, leaves.data(), frame.values.data()) ==
+       HostTraceProgram::Status::Success;
+-  if (!frame.evaluated || frame.values[valid_] != 1) {
++  if (!frame.evaluated) {
+     return false;
+   }
+   frame.overlapped = !disjoint(args, count);
+diff -ru build_cpp_ms5/src/torch/csrc/cuda/host_trace/Variant.h build_cpp_ms6/src/torch/csrc/cuda/host_trace/Variant.h
+--- build_cpp_ms5/src/torch/csrc/cuda/host_trace/Variant.h	2026-10-15 05:48:59.190138684 -0700
++++ build_cpp_ms6/src/torch/csrc/cuda/host_trace/Variant.h	2026-10-15 07:13:14.898696605 -0700
+@@ -79,6 +79,8 @@
+ extern int64_t delta_fulls;
+ extern int64_t delta_rows_evaluated;
+ extern bool delta_enabled;
++// test-only: full evaluations that stopped at a valid row that does not hold
++extern int64_t valid_first_misses;
+ // a family tries first the variant that last served the dynamic sizes (else
+ // registration order)
+ extern bool variant_order_enabled;
+@@ -806,6 +808,11 @@
+   std::vector<Output> outputs_;
+   std::vector<ArgumentPair> argument_pairs_;
+   std::vector<size_t> pair_arguments_;
++  // evaluate_rows's: the rows the valid row reads and the rest, in order, for
++  // a program of valid_split_rows_ rows
++  mutable std::vector<uint32_t> valid_first_rows_;
++  mutable std::vector<uint32_t> valid_other_rows_;
++  mutable size_t valid_split_rows_ = 0;
+   // set_static_prefix's: the rows, leaves and argument pairs that read an
+   // argument at or after static_prefix_, and the pairs' arguments
+   size_t static_prefix_ = 0;

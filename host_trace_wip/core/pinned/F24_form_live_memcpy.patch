@@ -1,0 +1,125 @@
+--- a/torch/cuda/_host_trace_capture.py
++++ b/torch/cuda/_host_trace_capture.py
+@@ -850,6 +850,34 @@
+     return list(nodes[:count]), list(edges[:count])
+ 
+ 
++def _live_memcpy_operands(graph: int) -> list[torch.Tensor]:
++    """Points each memcpy node of the graph at live memory of its operands'
++    kinds (device or pinned host) and returns that scratch, which must outlive
++    the graph's instantiation: a node still holds its capture's operands
++    (_copy_operands), freed since, and the driver reads a memcpy node's
++    pointers when it instantiates the graph (a freed pinned block crashes it).
++    A replay sets every memcpy before each launch, as for the capture's exec."""
++    from cuda.bindings import driver
++
++    memcpy_t, host = driver.CUgraphNodeType.CU_GRAPH_NODE_TYPE_MEMCPY, driver.CUmemorytype.CU_MEMORYTYPE_HOST
++    nodes = [(n, _check_cuda_bindings(driver.cuGraphMemcpyNodeGetParams(n))) for n in graph_node_handles(graph) if _check_cuda_bindings(driver.cuGraphNodeGetType(n)) == memcpy_t]
++    if not nodes:
++        return []
++    span = -(-max(p.WidthInBytes for _, p in nodes) // _ALLOC_ALIGNMENT) * _ALLOC_ALIGNMENT
++    device, pinned = _copy_operands(torch.device("cuda", torch.cuda.current_device()), span, any(host in (p.srcMemoryType, p.dstMemoryType) for _, p in nodes))
++    for n, p in nodes:
++        if p.dstMemoryType == host:
++            p.dstHost = pinned.data_ptr()
++        else:
++            p.dstDevice = device.data_ptr()
++        if p.srcMemoryType == host:
++            p.srcHost = pinned.data_ptr()
++        else:
++            p.srcDevice = device.data_ptr() + span
++        _check_cuda_bindings(driver.cuGraphMemcpyNodeSetParams(n, p))
++    return [device] if pinned is None else [device, pinned]
++
++
+ def instantiate_form(
+     graph: int,
+     attributes: Sequence[tuple[int, dict[Any, Any], tuple[int, int, int]]],
+@@ -867,6 +895,7 @@
+ 
+     clone = _check_cuda_bindings(driver.cuGraphClone(graph))
+     try:
++        scratch = _live_memcpy_operands(clone)
+         replaced = [n for nodes, _ in pieces for n in nodes]
+         found = {n: _check_cuda_bindings(driver.cuGraphNodeFindInClone(n, clone)) for n in (*(n for n, *_ in attributes), *replaced)}
+         cluster = driver.CUlaunchAttributeID.CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION
+@@ -920,4 +949,5 @@
+         _check_cuda_bindings(driver.cuGraphDestroy(clone))
+         raise
+     _check_cuda_bindings(driver.cuGraphUpload(exec_, torch.cuda.current_stream().cuda_stream))
++    del scratch  # the exec's memcpy nodes are set at each replay before they run
+     return int(exec_), int(clone), [[(kind, int(node)) for kind, node in p] for p in placed]
+--- a/test/test_cuda_host_trace_pinned.py
++++ b/test/test_cuda_host_trace_pinned.py
+@@ -1,5 +1,6 @@
+ # Owner(s): ["module: cuda graphs"]
+ 
++import gc
+ import unittest
+ 
+ import torch
+@@ -243,6 +244,64 @@
+         self.assertIs(b(obj), NotImplemented)
+         self.assertOneGraph(f, ["H2D", "D2H"])
+ 
++    @parametrize("direction", ["d2h", "h2d", "d2d"])
++    def test_a_form_instantiates_after_the_traced_buffers_are_freed(self, direction):
++        # F24: a new mm key instantiates a form from a clone of the variant's graph, whose memcpy node
++        # still held its capture's operands; with the pinned (and device) caches emptied the driver
++        # crashed on the freed host pointer
++        def f(a0, a1, buf):
++            v1 = torch.sigmoid(a1)
++            v2 = a0.t() @ a0
++            if direction == "d2h":
++                buf.copy_(v1, non_blocking=True)
++            elif direction == "h2d":
++                v1 = v1 + a1.new_empty(a1.shape).copy_(buf, non_blocking=True)
++            else:
++                v1 = v1 + torch.empty_like(a1).copy_(buf)
++            return torch.abs(a1), v2, v1
++
++        def mk(n, k, m, seed):
++            g = torch.Generator(device="cuda").manual_seed(seed)
++            a0 = torch.randn(n, k, device="cuda", generator=g).bfloat16()
++            a1 = torch.randn(k, m, device="cuda", generator=g).bfloat16()
++            buf = torch.randn(k, m, device="cuda", generator=g).bfloat16()
++            return a0, a1, buf if direction == "d2d" else buf.cpu().pin_memory()
++
++        r = _host_trace_replay.HostTraceReplay(f)
++        for i, shape in enumerate([(58, 1024, 50), (58, 1024, 50), (2, 1025, 50), (2, 1025, 50)]):
++            args = mk(*shape, i)
++            want = f(*(a.clone() for a in args))
++            out = r(*args)
++            torch.cuda.synchronize()
++            self.assertEqual(out[0], want[0], atol=0, rtol=0)
++            self.assertEqual(out[2], want[2], atol=0, rtol=0)
++            if direction == "d2h":
++                self.assertEqual(args[2], torch.sigmoid(args[1]).cpu(), atol=0, rtol=0)
++            del args, out, want
++            gc.collect()
++            torch.cuda.empty_cache()
++            torch._C._host_emptyCache()
++        self.assertGreater(r.replays, 0)
++
++    def test_a_replay_on_the_same_buffers_after_a_new_trace(self):
++        # F24's other form: the same tensors replayed again after a trace at a new size
++        def f(a0, a1, p0):
++            v1 = torch.sigmoid(a1)
++            v2 = a0.t() @ a0
++            p0.copy_(v1, non_blocking=True)
++            return torch.abs(a1), a0.sum(), v2
++
++        r = _host_trace_replay.HostTraceReplay(f)
++        for i, (n, k, reuse) in enumerate([(58, 1024, False), (58, 1024, False), (0, 0, True), (2, 1025, False), (0, 0, True)]):
++            if not reuse:
++                g = torch.Generator(device="cuda").manual_seed(i)
++                args = (torch.randn(n, k, device="cuda", generator=g).bfloat16(), torch.randn(k, 50, device="cuda", generator=g).bfloat16(),
++                        torch.empty(k, 50, dtype=torch.bfloat16, pin_memory=True))
++            out = r(*args)
++            torch.cuda.synchronize()
++            self.assertEqual(out[0], torch.abs(args[1]), atol=0, rtol=0)
++            self.assertEqual(args[2], torch.sigmoid(args[1]).cpu(), atol=0, rtol=0)
++
+     @parametrize("direction", ["h2d", "d2h"])
+     def test_pageable_declines(self, direction):
+         # eager's copy_ to or from pageable memory is synchronous

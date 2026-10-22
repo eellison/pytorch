@@ -1,0 +1,241 @@
+--- a/torch/csrc/cuda/host_trace/Entry.cpp
++++ b/torch/csrc/cuda/host_trace/Entry.cpp
+@@ -15,11 +15,13 @@
+ #include <torch/csrc/autograd/python_variable.h>
+ #include <torch/csrc/utils/object_ptr.h>
+ #include <torch/csrc/utils/pythoncapi_compat.h>
++#include <torch/csrc/utils/python_symnode.h>
+ 
+ #include <algorithm>
+ #include <cstring>
+ #include <mutex>
+ #include <unordered_map>
++#include <unordered_set>
+ #include <vector>
+ 
+ namespace torch::cuda::host_trace {
+@@ -1682,6 +1684,216 @@
+     sizeof(HostTraceBound),
+ };
+ 
++// _host_trace_replay._gc_untrack's walk over the Python objects reachable from `roots`. A type's flags come from
++// classify(type), cached in `kinds`:
++//   GC_DESCEND   its referents (tp_traverse) are walked
++//   GC_IMMUTABLE nothing changes what it refers to once it is made
++//   GC_FINAL     nothing changes what it refers to once the slow call that made it ends
++//   GC_CONTAINER a list, dict or set: final when every reference to it is held by an immutable or final object or
++//                a final container (its reference count says there is no other)
++//   GC_CLEAN     an object of the type may be reached from a sealed one (it reaches no object outside it)
++//   GC_KEEP      never untracked (a tensor)
++// An object is sealed when it is immutable, final or a final container and every referent is sealed, clean or
++// untracked; a sealed object is untracked (PyObject_GC_UnTrack). Nothing an untracked object reaches changes, so it
++// cannot become part of a reference cycle, its reference count frees it as before, and a later walk stops at it.
++constexpr int64_t GC_DESCEND = 1, GC_IMMUTABLE = 2, GC_CLEAN = 4, GC_FINAL = 8, GC_CONTAINER = 16, GC_KEEP = 32;
++
++int collect_referent(PyObject* o, void* arg) {
++  static_cast<std::vector<PyObject*>*>(arg)->push_back(o);
++  return 0;
++}
++
++int64_t gc_untrack(const py::iterable& roots, const py::dict& kinds, const py::function& classify) {
++  std::unordered_map<PyTypeObject*, int64_t> flags_of;
++  auto flags = [&](PyObject* o) {
++    PyTypeObject* t = Py_TYPE(o);
++    auto it = flags_of.find(t);
++    if (it != flags_of.end()) {
++      return it->second;
++    }
++    py::handle type(reinterpret_cast<PyObject*>(t));
++    py::object f = kinds.contains(type) ? py::object(kinds[type]) : py::object(classify(type));
++    kinds[type] = f;
++    return flags_of[t] = f.cast<int64_t>();
++  };
++  struct Node {
++    PyObject* obj;
++    int64_t flags;
++    size_t first = 0, count = 0;  // its referents in `edges`, once walked
++    Py_ssize_t owners = 0;  // references from immutable, final and container nodes
++    int8_t sealed = -1, final = -1;  // -1 unknown
++  };
++  std::vector<Node> nodes;
++  // classify runs Python, which may switch threads: the walk holds what it visits (`held`), and what it is yet to
++  // visit (`pending`, released before reference counts are read)
++  std::vector<py::object> held, pending;
++  std::unordered_map<PyObject*, size_t> index;
++  std::vector<PyObject*> referents;
++  std::vector<size_t> walked;  // nodes whose referents are walked
++  std::vector<PyObject*> raw;  // their referents, resolved into `edges`
++  std::vector<PyObject*> stack;
++  for (py::handle root : roots) {
++    stack.push_back(root.ptr());
++  }
++  while (!stack.empty()) {
++    PyObject* o = stack.back();
++    stack.pop_back();
++    if (!PyObject_IS_GC(o) || index.count(o)) {
++      continue;
++    }
++    held.push_back(py::reinterpret_borrow<py::object>(o));
++    const int64_t f = flags(o);
++    index[o] = nodes.size();
++    nodes.push_back({o, f});
++    Node& n = nodes.back();
++    const bool untrackable = (f & (GC_IMMUTABLE | GC_FINAL)) && !(f & GC_KEEP);
++    if (!(f & GC_DESCEND)) {
++      n.sealed = (f & GC_CLEAN) ? 1 : 0;
++      continue;
++    }
++    if (untrackable && !PyObject_GC_IsTracked(o)) {
++      n.sealed = 1;  // untracked by an earlier walk, or a tuple CPython untracked (nothing tracked in it)
++      continue;
++    }
++    referents.clear();
++    if (Py_TYPE(o)->tp_traverse != nullptr) {
++      Py_TYPE(o)->tp_traverse(o, collect_referent, &referents);
++    }
++    // a traced tensor's symbolic sizes, strides, offset and storage size hold their Python nodes from C++
++    if (THPVariable_Check(o) && THPVariable_Unpack(o).unsafeGetTensorImpl()->has_symbolic_sizes_strides()) {
++      const at::Tensor& t = THPVariable_Unpack(o);
++      const c10::TensorImpl* impl = t.unsafeGetTensorImpl();
++      auto add = [&](const c10::SymInt& s) {
++        if (s.is_heap_allocated()) {
++          if (auto* p = dynamic_cast<torch::impl::PythonSymNodeImpl*>(s.toSymNodeImplUnowned())) {
++            referents.push_back(p->getPyObj().ptr());
++          }
++        }
++      };
++      for (const auto& s : t.sym_sizes()) {
++        add(s);
++      }
++      for (const auto& s : t.sym_strides()) {
++        add(s);
++      }
++      add(t.sym_storage_offset());
++      if (impl->has_storage()) {
++        add(impl->unsafe_storage().sym_nbytes());
++      }
++    }
++    n.first = raw.size();
++    for (PyObject* r : referents) {
++      if (PyObject_IS_GC(r)) {
++        raw.push_back(r);
++        stack.push_back(r);
++        pending.push_back(py::reinterpret_borrow<py::object>(r));
++      }
++    }
++    n.count = raw.size() - n.first;
++    walked.push_back(index[o]);
++  }
++  pending.clear();
++  std::vector<size_t> edges(raw.size());
++  for (size_t i = 0; i < raw.size(); ++i) {
++    edges[i] = index.at(raw[i]);
++  }
++  // per container, the containers referring to it
++  std::unordered_map<size_t, std::vector<size_t>> container_parents;
++  for (size_t p : walked) {
++    const Node& n = nodes[p];
++    if (!(n.flags & (GC_IMMUTABLE | GC_FINAL | GC_CONTAINER))) {
++      continue;
++    }
++    for (size_t e = n.first; e < n.first + n.count; ++e) {
++      nodes[edges[e]].owners++;
++      if (n.flags & GC_CONTAINER) {
++        container_parents[edges[e]].push_back(p);
++      }
++    }
++  }
++  static const std::vector<size_t> no_parents;
++  auto parents_of = [&](size_t i) -> const std::vector<size_t>& {
++    auto it = container_parents.find(i);
++    return it == container_parents.end() ? no_parents : it->second;
++  };
++  // final: over referrers (a container on a cycle of containers is not final)
++  auto is_final = [&](size_t root) {
++    std::vector<std::pair<size_t, size_t>> todo{{root, 0}};
++    std::unordered_set<size_t> open{root};
++    while (!todo.empty()) {
++      auto& [i, k] = todo.back();
++      Node& n = nodes[i];
++      if (!(n.flags & GC_CONTAINER)) {
++        n.final = (n.flags & (GC_IMMUTABLE | GC_FINAL)) ? 1 : 0;
++      }
++      const auto& parents = parents_of(i);
++      if (n.final < 0 && k < parents.size()) {
++        const size_t p = parents[k++];
++        if (nodes[p].final < 0 && !open.count(p)) {
++          open.insert(p);
++          todo.emplace_back(p, 0);
++        }
++        continue;
++      }
++      if (n.final < 0) {
++        bool all = n.owners == Py_REFCNT(n.obj) - 1;  // less `held`'s
++        for (size_t p : parents) {
++          all = all && nodes[p].final == 1;
++        }
++        n.final = all ? 1 : 0;
++      }
++      open.erase(i);
++      todo.pop_back();
++    }
++    return nodes[root].final == 1;
++  };
++  // sealed: over referents (a node on a cycle is not sealed)
++  for (size_t root : walked) {
++    if (nodes[root].sealed >= 0) {
++      continue;
++    }
++    std::vector<std::pair<size_t, size_t>> todo{{root, 0}};
++    std::unordered_set<size_t> open{root};
++    while (!todo.empty()) {
++      auto& [i, k] = todo.back();
++      Node& n = nodes[i];
++      if (k < n.count) {
++        const size_t c = edges[n.first + k++];
++        if (nodes[c].sealed < 0 && !open.count(c)) {
++          open.insert(c);
++          todo.emplace_back(c, 0);
++        }
++        continue;
++      }
++      bool all = true;
++      for (size_t e = n.first; e < n.first + n.count; ++e) {
++        all = all && nodes[edges[e]].sealed == 1;
++      }
++      bool sealed;
++      if (n.flags & (GC_IMMUTABLE | GC_FINAL)) {
++        sealed = all;
++      } else if (n.flags & GC_CONTAINER) {
++        sealed = all && is_final(i);
++      } else {
++        sealed = (n.flags & GC_CLEAN) != 0;
++      }
++      n.sealed = sealed ? 1 : 0;
++      open.erase(i);
++      todo.pop_back();
++    }
++  }
++  int64_t untracked = 0;
++  for (size_t i : walked) {
++    const Node& n = nodes[i];
++    if (n.sealed == 1 && (n.flags & (GC_IMMUTABLE | GC_FINAL | GC_CONTAINER)) && !(n.flags & GC_KEEP) &&
++        PyObject_GC_IsTracked(n.obj)) {
++      PyObject_GC_UnTrack(n.obj);
++      ++untracked;
++    }
++  }
++  return untracked;
++}
++
+ } // namespace
+ 
+ } // namespace torch::cuda::host_trace
+@@ -1747,6 +1959,7 @@
+   m.attr("_host_trace_section_entries") = true;
+   // and launches the driver's map as is (a descriptor's library bits)
+   m.attr("_host_trace_tma_raw") = true;
++  m.def("_host_trace_gc_untrack", &gc_untrack, py::arg("roots"), py::arg("kinds"), py::arg("classify"));
+   m.def("_host_trace_global_state", [] {
+     std::vector<int64_t> state;
+     append_global_state(state);

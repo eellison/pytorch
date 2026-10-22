@@ -1,0 +1,41 @@
+diff -ru -x __pycache__ a/test/test_cuda_host_trace_tape.py b/test/test_cuda_host_trace_tape.py
+--- a/test/test_cuda_host_trace_tape.py	2026-10-08 20:29:55.451415906 -0700
++++ b/test/test_cuda_host_trace_tape.py	2026-10-09 15:10:08.835168117 -0700
+@@ -655,6 +655,18 @@
+         with self.assertRaisesRegex(Declined, "on a stream other than the trace's"):
+             trace(side_stream, (x,))
+ 
++    def test_a_pointwise_op_of_an_eager_output_traces(self):
++        # e1's hint has the low bits of the op's own output allocation (allocation 1): the witness's
++        # host maps an address to its allocation by the whole hint
++        def fn(x, w):
++            x = x * 2
++            a = x @ w
++            return torch.relu(x @ w) + a
++
++        x, w = torch.randn(8, 4, device="cuda"), torch.randn(4, 6, device="cuda")
++        tape = trace(fn, (x, w))
++        self.assertEqual([type(rec).__name__ for _, rec in tape.launches], ["KernelLaunch", "EagerCall", "EagerCall", "KernelLaunch", "KernelLaunch"])
++
+     def test_an_untagged_metadata_change_declines(self):
+         # the op's fake kernel changes its argument's metadata: the trace compares, not the tag
+         def fn(x):
+diff -ru -x __pycache__ a/torch/cuda/_host_trace_tape.py b/torch/cuda/_host_trace_tape.py
+--- a/torch/cuda/_host_trace_tape.py	2026-10-08 21:24:33.864564666 -0700
++++ b/torch/cuda/_host_trace_tape.py	2026-10-09 15:09:56.996359853 -0700
+@@ -1654,11 +1654,12 @@
+             if len(launches) != len(kernels) or len(self.allocs) - allocated != len(moves):
+                 return False
+             # host allocation j's placeholder address stands for moves[j]
+-            hosts = [((_ALLOC_TAG | (self.first_alloc + allocated + 1 + j) << _ALLOC_SHIFT) & _PLACEHOLDER_LOW, a, n) for j, (a, n) in enumerate(moves)]
++            hosts = [(_ALLOC_TAG | (self.first_alloc + allocated + 1 + j) << _ALLOC_SHIFT, a, n) for j, (a, n) in enumerate(moves)]
+ 
++            # by the whole hint: an eager output's or argument's low bits can be a host allocation's
+             def address(v: Any) -> int:
+-                v = _hint(v) & _PLACEHOLDER_LOW
+-                return next((v - h + a for h, a, n in hosts if h <= v < h + n), v)
++                v = _hint(v)
++                return next((v - h + a for h, a, n in hosts if h <= v < h + n), v & _PLACEHOLDER_LOW)
+ 
+             for launch, node in zip(launches, kernels):
+                 if isinstance(node, MemcpyNode) or isinstance(launch, Memcpy):

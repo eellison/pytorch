@@ -1,0 +1,91 @@
+diff -ru -x __pycache__ snap/step_ms30/test/test_cuda_host_trace_harvest.py snap/step_ms31/test/test_cuda_host_trace_harvest.py
+--- snap/step_ms30/test/test_cuda_host_trace_harvest.py	2026-10-17 13:47:46.341918910 -0700
++++ snap/step_ms31/test/test_cuda_host_trace_harvest.py	2026-10-19 07:25:02.833907736 -0700
+@@ -376,6 +376,52 @@
+         out = subprocess.check_output([sys.executable, "-c", code], env=env, text=True)
+         self.assertIn("ok 2 {}", out)
+ 
++    @parametrize("fill", [True, False])
++    def test_learns_and_replays_under_deterministic_algorithms(self, fill):
++        # use_deterministic_algorithms(True) makes torch.empty fill its memory
++        # with a kernel: the harvest's own allocations in its address-only pool
++        # (reserved, never mapped) must launch none, else an illegal address (a
++        # fresh process: the error is sticky). Each family's key learns and
++        # replays bitwise; a user's empty output under the fill declines the
++        # trace (the fill is not recorded) and every call is eager's bytes.
++        code = f"""
++import torch
++from torch.cuda._host_trace_harvest import HarvestProvider
++from torch.cuda._host_trace_replay import HostTraceReplay
++torch.use_deterministic_algorithms(True)
++torch.utils.deterministic.fill_uninitialized_memory = {fill}
++x = torch.randn(8, 64, 28, 28, device="cuda", dtype=torch.bfloat16).to(memory_format=torch.channels_last)
++w = torch.randn(128, 64, 3, 3, device="cuda", dtype=torch.bfloat16).to(memory_format=torch.channels_last)
++a, b = torch.randn(512, 768, device="cuda"), torch.randn(768, 1024, device="cuda")
++q, k, v = (torch.randn(2, 8, 256, 64, device="cuda", dtype=torch.bfloat16) for _ in range(3))
++cases = (
++    ("conv", lambda x, w: torch.nn.functional.conv2d(x, w, padding=1), (x, w)),
++    ("blas", torch.mm, (a, b)),
++    ("attention", torch.nn.functional.scaled_dot_product_attention, (q, k, v)),
++)
++for family, f, args in cases:
++    p = HarvestProvider((family,))
++    r = HostTraceReplay(f, opaque=(p,))
++    for _ in range(4):  # eager, trace, then two replays
++        out = r(*args)
++    torch.cuda.synchronize()
++    assert torch.equal(out, f(*args)), family
++    assert r.replays == 2 and p.harvests >= 1 and not p.refused, (family, r.replays, p.harvests, p.refused)
++if {fill}:
++    def g(y):
++        return y + torch.empty(y.shape, device=y.device), torch.mm(a, b)
++    y = torch.randn(1000, device="cuda")
++    r = HostTraceReplay(g, opaque=(HarvestProvider(("blas",)),))
++    for _ in range(4):
++        got = r(y)
++    want = g(y)
++    assert all(torch.equal(u.view(torch.int32), e.view(torch.int32)) for u, e in zip(got, want))
++    assert r.replays == 0, r.replays
++print("ok")
++"""
++        out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
++        self.assertIn("ok", out.stdout, out.stderr[-3000:])
++
+     def test_learns_beside_an_nccl_process_group(self):
+         # the "nccl" backend registers every new allocator segment with its
+         # communicators; the harvest's captures allocate address space with no
+diff -ru -x __pycache__ snap/step_ms30/torch/cuda/_host_trace_harvest.py snap/step_ms31/torch/cuda/_host_trace_harvest.py
+--- snap/step_ms30/torch/cuda/_host_trace_harvest.py	2026-10-17 14:13:07.501908775 -0700
++++ snap/step_ms31/torch/cuda/_host_trace_harvest.py	2026-10-19 07:21:52.755001250 -0700
+@@ -608,6 +608,13 @@
+     return _AddressOnly()
+ 
+ 
++def _unfilled(nbytes: int, device: int) -> torch.Tensor:
++    """`nbytes` from the current allocation pool, launching nothing: an address-only pool's blocks are never mapped, and
++    torch.empty under use_deterministic_algorithms(True) (fill_uninitialized_memory) launches a fill into them, an
++    illegal address. A storage of the allocator is no factory op and never filled."""
++    return torch.empty(0, dtype=torch.uint8, device=device).set_(torch.UntypedStorage(nbytes, device=device))
++
++
+ # per device, the address ranges mirrors map in (4 GiB-aligned, free ones),
+ # reserved for the process: reserved and freed per check, their addresses (low
+ # ones, for the alignment) went to the caching allocator's next segments,
+@@ -816,7 +823,7 @@
+         with torch.cuda.use_mem_pool(self.pool, self.index):
+             for stream, piece in order:
+                 with torch.cuda.stream(streams[stream]):
+-                    t = torch.empty(piece, dtype=torch.uint8, device=self.index)
++                    t = _unfilled(piece, self.index)
+                 owner = pieces.pop((stream, t.data_ptr(), piece), None)
+                 if owner is None:
+                     raise _Disabled(
+@@ -1547,7 +1554,7 @@
+             holes = []
+             for o in operands[placed:] if op in _CONV else ():
+                 with torch.cuda.use_mem_pool(dev.pool, device), torch.cuda.stream(stream):
+-                    holes.append(torch.empty(o.untyped_storage().nbytes(), dtype=torch.uint8, device=device))
++                    holes.append(_unfilled(o.untyped_storage().nbytes(), device))
+                 plugs.extend(dev.plug([b for b in dev.blocks() if not b[4]]))
+             del holes
+             # the call allocates its cuBLAS workspace in the pool (its

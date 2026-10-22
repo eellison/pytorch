@@ -1,0 +1,28 @@
+--- a/torch/cuda/_host_trace_hint_audit.py
++++ b/torch/cuda/_host_trace_hint_audit.py
+@@ -95,19 +95,24 @@
+ 
+ # every other site that reads a hint, with its replacement (symbolic, a guard,
+ # or a decline): strict mode notes these and raises on any new site. A fix
+-# removes its entry; the target is none.
++# removes its entry; the target is none. Owners (lanes, 10-08): symti
++# (land/core/symti: the symbolic TensorIterator retires the pointwise
++# witness), Triton (land/core/next/triton_hint), CuTe (land/core/cute70).
+ OFFENDERS: dict[tuple[str, str], str] = {
++    # owner: the symti lane (pointwise / elementwise)
+     (_TAPE, "_elementwise"): "guards: decide the broadcast from the fake kernel's symbolic output shape, each size comparison a guard (bool(n == m) / bool(n == 1)), not meta at the hints",
+     (_TAPE, "_Trace._pointwise_host"): _WITNESS,
+     (_TAPE, "_Trace._pointwise_host.<locals>.stand_in"): _WITNESS,
+     (_TAPE, "_Trace._pointwise_host.<locals>.check"): _WITNESS,
+     (_TAPE, "_Trace._pointwise_host.<locals>.check.<locals>.address"): _WITNESS,
++    # owner: the Triton lane (launcher paths)
+     (_TRITON, "_witness"): _WITNESS,
+     (_TRITON, "_launch.<locals>.launcher"): _WITNESS,
+     (_TRITON, "_intercept"): f"T3: decline a SymInt argument that is not the running trace's (v.node.env is not tr.shape_env); the compile's values: build the binary from the symbolic specialization key, or {_AT_CALL}",
+     (_TRITON, "_SymbolicSpecialization.__call__"): "with align off pass the SymInt itself (Triton's int specialization reads no value there); a non-specialized pointer likewise",
+     (_TRITON, "_resolve"): "int(entry) / bool(entry) (a guard that returns the value) in place of entry == _hint(entry)",
+     (_TRITON, "record_launch"): "the constexpr check: int(v) / bool(v) (a guard), not _hint(v)",
++    # owner: the CuTe lane
+     (_CUTE, "_describe"): _WITNESS,
+     (_CUTE, "_intercept"): _WITNESS,
+     (_CUTE, "_intercept_foreign"): _WITNESS,

@@ -1,0 +1,150 @@
+symti: ATen pointwise traced symbolically (no witness). Design sketch, 2026-10-08.
+Base: land/int6/snap/step242 (Python) + land/core/hintaudit/hint_audit.int6cpp.patch, C++ = land/int6/build_cpp8/src.
+
+0. Today
+- _TRACED_ATEN hand-written C++ hosts (add, mul, silu, gelu, rsqrt, where, copy_, fill_, reductions, norms, ...)
+  run TensorIteratorSym (ti_build<SymInt>) + LoopsSym.cuh (a "keep in sync" copy of CUDALoops routing). Sound
+  but per-op reimplementations of meta + stub.
+- Everything else elementwise goes to the witness (_traced_pointwise -> _pointwise_host -> Pointwise.cu): run
+  eager at stand-ins in a capture, take the kernel and its parameter bytes, overlay sizes/strides/addresses from
+  TensorIteratorSym. The functor bytes are trusted because of the `pointwise` tag / _UNTAGGED_ELEMENTWISE /
+  host_trace_fields annotations ('z' class). Hint reads: _pointwise_host + locals, _elementwise, the probes.
+- Measured on the current even build (64x768 f32, GPU 1, median of 6 fresh traces): symbolic host add 0.91 ms,
+  mul 0.81 ms per op; witness abs 1.53, sigmoid 1.33, sub 1.59, addcmul 1.64 ms per op.
+
+1. The route: run the op's real CUDA host code over a symbolic TensorIterator
+  _traced_redispatch(func): under a thread-local recorder, func.redispatch(DispatchKeySet(CUDA), ...) under
+  _TraceMode, i.e. the generated RegisterCUDA wrapper -> structured meta -> impl -> DispatchStub -> the real
+  stub (abs_kernel_cuda etc.) -> gpu_kernel. Nothing is hand-written per op and nothing is copied from a run.
+  Allocations (at::empty_strided_symint) reach the trace through _TraceMode as today; nested ops (a proxy
+  out's copy_, a fill_) route as any op.
+
+  1a. TensorIteratorBase symbolic mode (libtorch_cpu)
+  - build() checks one TLS flag (set only while a recorder is active; eager pays one TLS read per build, the
+    cost the TI prototype's commit 6 accepted). In symbolic mode the build runs the existing ti_build<SymInt>
+    steps on a side state (sym_: SymInt shape, per-operand SymInt byte strides, perm) - the same functions eager
+    runs on int64_t, so output sizes/strides/memory format are eager's by construction.
+  - Every int64 accessor of shape-derived data (numel, shape, strides, data_ptr, num_output_elements, view
+    offsets, get_strides/base ptrs, split/with_32bit_indexing, for_each, narrow, ...) returns the value only when
+    it is a true constant (maybe_as_int, never a hint) and otherwise declines "<accessor> of a symbolic
+    iterator". Bool predicates (is_contiguous, is_scalar, can_use_32bit_indexing, has_contiguous_first_dim,
+    is_dim_reduced, is_trivial_1d) are computed on SymInt and each test is a guard. remove_operand (scalars
+    path) is implemented on both states. So a stub or impl that reads a size the route has not converted
+    declines visibly; it can never read a hint. Rank, dtypes, devices are concrete facts.
+  - Output allocation: new MetaBase virtual set_output_raw_strided_symint. TensorIterator (non-structured)
+    allocates with at::empty_strided_symint. torchgen emits the override for CUDA structured classes:
+    functional = create_out_symint; out= = resize check as guards (a needed resize declines, nothing is
+    resized), maybe_create_proxy on guarded stride compares; inplace = check_inplace on guarded sizes.
+    Meta functions that compute shapes from int64 sizes() throw (c10 refuses int64 reads of symbolic sizes)
+    and decline; the reduction ones (resize_reduction, make_reduction) get sym_sizes versions (F4d).
+  - compute_mem_overlaps: wrapper storages hide aliasing (get_overlap_status says TooHard). In symbolic mode
+    the recorder answers same-root; a written operand on the root of another operand is allowed only as eager
+    allows it (same view: guarded equal sizes/strides/offset = Full overlap), else declines. Python's
+    `shared(elementwise)` (the tag) is replaced by these approved pairs.
+
+  1b. CUDALoops launch side (libtorch_cuda) -- user decision 10-08: templates, one source
+  - The host-side launch code is templated on a host kind H: EagerHost (int64_t, kernel<<<>>>) and SymHost
+    (c10::SymInt, records the launch in the thread-local recorder). Templated: gpu_kernel / gpu_kernel_nocast /
+    gpu_kernel_multiple_outputs / *_with_scalars bodies (Loops.cuh), gpu_kernel_impl(_nocast),
+    launch_vectorized_kernel, launch_unrolled_kernel, launch_legacy_kernel (CUDALoops.cuh), can_vectorize_up_to
+    (MemoryAccess.cuh), make_offset_calculator / IntDivider setup (OffsetCalculator.cuh, IntegerDivider.cuh
+    host side), then CUDAJitLoops. H supplies the iterator reads (eager: today's int64 accessors, inlined; sym:
+    the iterator's SymInt state), the launch, and the 32-bit split (sym: guard, else a clear error).
+    The public entry points branch once: if (iter.is_symbolic()) body<SymHost> else body<EagerHost>.
+    EagerHost instantiations are today's code (checked on disassembly of sample TUs); same func_t, so SymHost
+    records exactly the instantiations eager launches. Device param structs stay int: SymHost converts at the
+    launch boundary (a Param<K> per kernel parameter: constants written, SymInts recorded as fields).
+    LoopsSym.cuh and Pointwise.cu are deleted. ROCm paths stay eager-only.
+  - What SymHost decides and how:
+      numel == 0               guard (bool), no launch
+      32-bit indexing          guard true, else an error naming the op (follow-up: eager's split, symbolic)
+      dynamic casting          dtypes: constants
+      contiguity               guards (ti_build is_contiguous on SymInt)
+      vector size              guards on symbolic addresses (root symbol + offset*itemsize) % (vec*size)
+      sm_107 / arch caps        device properties: constants of the trace's device (as every route)
+      grid                     symbolic (n + bws - 1) / bws; block, smem constants
+      offset calculator        sizes/strides symbolic fields; IntDivider via bit_length/pow2 rows (existing)
+      data pointers            Recorder::data_ptr (symbolic), never read from the tensor
+      functor bytes            f as the stub built it: its inputs are constants, guarded values (a symbolic
+                               Scalar's to<T>() guards), or a CPU scalar (below)
+  - CPU scalar operands: a 0-dim CPU tensor created by the host code from constants (wrapped numbers) is a
+    constant and is read as eager reads it. A trace host buffer is passed as a stand-in whose storage throws;
+    opmath_gpu_kernel_with_scalars / opmath_symmetric_* (where the value lands untransformed in
+    AUnary/BUnaryFunctor's member) record a cpu_scalar field (KernelLaunch.cpu_scalars, class 'A'+dtype). A
+    stub that reads a host buffer itself (div, pow, lerp, addcmul, compare) errors by name until converted
+    (a guard on the value or a recorded field), converted when a suite row hits it.
+  - Out-of-path kernels (reductions, indexing, CPU loops) keep the int64 accessors; in symbolic mode those
+    accessors error with the accessor named (one predicted branch each in eager), so an unconverted op is a
+    clear error, never a hint read.
+  - Ops are converted as needed (user 10-08): each suite/conformance/vLLM run reports the unconverted ops it
+    hits (op, site); those get converted. The hand-written _TRACED_ATEN hosts are deleted as their real host
+    code is templated the same way (Reduce.cuh, Copy.cu, SoftMax.cu, norms, cat, ...).
+  - By-construction backstops: traced tensors' storages throw on data_ptr (constant-size ones today return
+    nullptr+offset silently: fixed by setting the storage throw flags at _TracedTensor creation); a launch not
+    through the recorder shows up as a node of the side-stream capture and declines (existing); a CUDA
+    generator use under the recorder declines (TLS check in CUDAGeneratorImpl) unless inside
+    graphsafe_run_with_rng_state's existing handling.
+
+2. Python
+  - New _traced_redispatch(func): any aten overload with a CUDA kernel, operands traced tensors / host buffers
+    (stand-ins) / constants / SymInt-SymFloat; outputs, records (pushed per launch, so nested ops keep their
+    order) and guards through _run_host's existing rollback on decline.
+  - Removed: _traced_pointwise, _pointwise_host (+ stand_in/check/address), _witness_takes,
+    _UNTAGGED_ELEMENTWISE, _elementwise, _pointwise (all three uses: composite routing, aliasing, meta-check
+    skip), jiterator()'s witness, _cuda_hostTracePointwise + Pointwise.cu, record_built_iterators. Their
+    OFFENDERS entries go. No tag or allowlist decides soundness anywhere; routing order is cost only.
+  - The pointwise hand-written hosts (add, mul, silu, gelu, rsqrt, where, fill_) move to the route once their
+    launches match bitwise; copy_/_to_copy (memcpy paths), reductions and norms keep theirs this candidate.
+
+3. Build
+  Even line only: land/core/symti/src = build_cpp8/src + this change; isolated build dir land/core/symti/build,
+  install land/core/symti/install, `pip install -e . -v --no-build-isolation` (build_cpp8's build.sh), CPUs
+  108-143, MAX_JOBS=16. TensorIterator.h / TensorMeta.h / Loops.cuh / torchgen changes rebuild most of ATen
+  (estimate 3-5 h; build_cpp8 took 53 min mostly from ccache, which this change invalidates). The router and
+  descriptor code live in host_trace .cu/.cpp files so later iterations rebuild minutes. No sm_90 build unless
+  GB300 GPU 1 stays unavailable.
+
+4. Trace cost
+  Expected at or below the witness: the route does what the add/mul hosts do (0.8-0.9 ms/op at 64x768) plus the
+  dispatcher and structured meta, and drops the witness's capture, probe runs and byte comparisons
+  (1.3-1.6 ms/op). Measured before/after on minops84 decode/prefill and decode36/prefill36 (trace counts,
+  trace time, declines by reason).
+
+5. Coverage order
+  (1) gpu_kernel family + CPU scalar fields: the T2 census's 163 tagged + 20 _UNTAGGED_ELEMENTWISE ops at
+      float32/16/bf16 (census.py reused against the new route; declines listed by reason/site);
+  (2) empty-reduction fills via resize_reduction/make_reduction on sym_sizes + constant numel (F4d);
+  (3) jiterator; then (4) witness deletion (it never served closed-source libraries, so nothing keeps it).
+  Each int64-accessor decline that a census op hits is fixed at its site (a SymInt or guarded-bool form).
+
+6. Tests
+  Bitwise vs eager at several sizes/strides/dtypes (contiguous, transposed, broadcast, offset/misaligned,
+  CPU-scalar operands, out=/inplace, sizes that change the vector width and 32-bit limit) for the moved ops;
+  the T2 (test_a_size_or_integer_argument_is_not_witnessed), F5/F5b/F5c and F4d repros; the _FUNCTOR_OPS
+  extension ops (a functor holding a size or an address must decline, not replay); a test that no witness
+  symbol remains and that the pointwise route never captures eager; the router-vs-LaunchLayout parity test;
+  trace counts/time before/after on minops84 decode/prefill and decode36/prefill36.
+
+7. Revisions after the first build (10-08)
+  - Binary size: the first build (routing instantiated per functor over SymHost) grew libtorch_cuda .text by
+    15 MB (+27%). The routing now runs over "facts": StaticFacts<func_t> (compile time) for eager, and
+    host_trace::SymFacts (run time) for a symbolic iterator, instantiated once (SymLoops.cu). Per functor the
+    symbolic path is make_sym_facts: the addresses of the kernel instantiations eager's gpu_kernel_impl
+    already instantiates, the functor's bytes and type facts (stores only). The decisions (vector width,
+    sm_107 / arch caps, grid, offset calculators, IntDivider, cast vs no-cast, contiguous vs strided) are one
+    source in CUDALoops.cuh; eager's launch statements are unchanged inside `if constexpr (!H::symbolic)`.
+    One vector-width ladder (VectorWidth.h) serves MemoryAccess.cuh, jit_utils.h and SymFacts.
+  - Number operands: a Python number for a Tensor operand reaches the kernel as eager's arg parser passes it,
+    a wrapped number (torch._C._cuda_hostTraceRedispatchOp, toIValue with numbers allowed); a symbolic one
+    is refused before (toIValue would wrap a placeholder).
+  - Functional forms over an out= kernel (abs, logical_*, isinf, nan_to_num, deg2rad, ...: empty({0}) then
+    the out kernel resizes it): at::impl::symbolic_resize, a hook the redispatch sets; the trace re-allocates
+    a fresh empty output of the running op (nothing launched since its allocation) at the iterator's sizes and
+    strides and rebinds the traced tensor, as eager's resize_ allocates a new storage. Any other resize of a
+    given output is refused (SymbolicRefusal::Output).
+  - Hand-written pointwise hosts deleted (mul, add, silu, gelu, rsqrt, where: C++, bindings, _TRACED_ATEN);
+    copy_/_to_copy, fill_, reductions, norms, cat, index_select, arange, triu, nll_loss, pools stay until their
+    real host code is templated the same way.
+  - Later item (user 10-08): eager cost in ns per launch from a C++ loop, old vs new binary. Not measured yet
+    (the Python-level bench is too noisy at this scale).
+

@@ -1,0 +1,199 @@
+diff -ru -x __pycache__ snap/step_ms31/test/inductor/test_cudagraph_host_trace.py snap/step_ms32/test/inductor/test_cudagraph_host_trace.py
+--- snap/step_ms31/test/inductor/test_cudagraph_host_trace.py	2026-10-17 14:05:48.851905562 -0700
++++ snap/step_ms32/test/inductor/test_cudagraph_host_trace.py	2026-10-19 09:01:48.660805078 -0700
+@@ -23,6 +23,7 @@
+ from torch._inductor.test_case import run_tests, TestCase
+ from torch._inductor.utils import fresh_cache, run_and_get_code
+ from torch.testing._internal.common_utils import (
++    DeterministicGuard,
+     instantiate_parametrized_tests,
+     parametrize,
+ )
+@@ -404,6 +405,32 @@
+             self.assertEqual(out.data_ptr(), x.data_ptr() + 3 * x.element_size())
+         self.assertEqual((replay.traces, replay.replays, replay.eager), (1, 1, 1))
+ 
++    def test_inductor_empty_is_unfilled_under_deterministic_fill(self):
++        # under use_deterministic_algorithms(True) with fill_uninitialized_memory,
++        # eager's empty_strided_cuda (at::detail) fills nothing while a factory
++        # op's dispatch fills: the seam records no fill, a user's
++        # torch.empty_strided records eager's one
++        _, scope = self._guards_scope()
++        empty = scope["_empty_strided_cuda"]
++
++        def seam(x):
++            return empty((1000,), (1,), torch.float32).copy_(x)
++
++        def user(x):
++            return torch.empty_strided((1000,), (1,), device=x.device).copy_(x)
++
++        launches = []
++        with DeterministicGuard(True, fill_uninitialized_memory=True):
++            for fn in (seam, user):
++                replay = HostTraceReplay(fn)
++                for _ in range(3):
++                    x = torch.randn(1000, device="cuda")
++                    self.assertEqual(replay(x), x)
++                self.assertEqual(replay.declines, [])
++                self.assertGreater(replay.replays, 0)
++                launches.append(len(replay.variants[0].tape.launches))
++        self.assertEqual(launches[1], launches[0] + 1)
++
+     def test_copy_if_misaligned(self):
+         # the repair is a dispatch on the address; the misaligned side is a
+         # variant of its own (TestInstallation.test_misaligned_input_is_a_variant)
+diff -ru -x __pycache__ snap/step_ms31/test/test_cuda_host_trace_harvest.py snap/step_ms32/test/test_cuda_host_trace_harvest.py
+--- snap/step_ms31/test/test_cuda_host_trace_harvest.py	2026-10-19 07:25:02.833907736 -0700
++++ snap/step_ms32/test/test_cuda_host_trace_harvest.py	2026-10-19 09:00:34.305462654 -0700
+@@ -382,8 +382,8 @@
+         # with a kernel: the harvest's own allocations in its address-only pool
+         # (reserved, never mapped) must launch none, else an illegal address (a
+         # fresh process: the error is sticky). Each family's key learns and
+-        # replays bitwise; a user's empty output under the fill declines the
+-        # trace (the fill is not recorded) and every call is eager's bytes.
++        # replays bitwise; a user's empty output under the fill replays eager's
++        # fill (NaN), bitwise as int views.
+         code = f"""
+ import torch
+ from torch.cuda._host_trace_harvest import HarvestProvider
+@@ -408,15 +408,15 @@
+     assert torch.equal(out, f(*args)), family
+     assert r.replays == 2 and p.harvests >= 1 and not p.refused, (family, r.replays, p.harvests, p.refused)
+ if {fill}:
+-    def g(y):
++    def g(y, a, b):
+         return y + torch.empty(y.shape, device=y.device), torch.mm(a, b)
+     y = torch.randn(1000, device="cuda")
+     r = HostTraceReplay(g, opaque=(HarvestProvider(("blas",)),))
+     for _ in range(4):
+-        got = r(y)
+-    want = g(y)
++        got = r(y, a, b)
++    want = g(y, a, b)
+     assert all(torch.equal(u.view(torch.int32), e.view(torch.int32)) for u, e in zip(got, want))
+-    assert r.replays == 0, r.replays
++    assert r.replays == 2, r.replays
+ print("ok")
+ """
+         out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+diff -ru -x __pycache__ snap/step_ms31/test/test_cuda_host_trace_replay.py snap/step_ms32/test/test_cuda_host_trace_replay.py
+--- snap/step_ms31/test/test_cuda_host_trace_replay.py	2026-10-18 18:11:46.815416584 -0700
++++ snap/step_ms32/test/test_cuda_host_trace_replay.py	2026-10-19 09:00:21.414853195 -0700
+@@ -42,6 +42,7 @@
+ from torch.cuda._utils import _check_cuda_bindings
+ from torch.testing._internal.common_cuda import PLATFORM_SUPPORTS_CUDNN_ATTENTION, PLATFORM_SUPPORTS_MEM_EFF_ATTENTION
+ from torch.testing._internal.common_utils import (
++    DeterministicGuard,
+     instantiate_parametrized_tests,
+     parametrize,
+     requires_cuda_python_bindings,
+@@ -4178,6 +4179,28 @@
+             self.check(f, w, torch.randn(m, 64, device="cuda"))
+         self.check(f, w, x)
+ 
++    def test_a_deterministic_fill_replays_eagers_bytes(self):
++        # use_deterministic_algorithms(True) with fill_uninitialized_memory: eager
++        # fills a factory op's result (NaN, an int dtype's max); the replay
++        # records and replays that fill, so a read of the empty output is eager's
++        # bytes even after the caller overwrote the last call's output
++        def f(x):
++            e = torch.empty(x.shape, device=x.device)
++            i = torch.empty_like(x, dtype=torch.int32)
++            return x + e, i + 1, e.view(torch.int32).clone()
++
++        x = torch.randn(1000, device="cuda")
++        with DeterministicGuard(True, fill_uninitialized_memory=True):
++            r = HostTraceReplay(f)
++            for _ in range(4):
++                got = r(x)
++                for t in got:
++                    t.fill_(1)
++            got, want = r(x), f(x)
++        self.assertGreaterEqual(r.replays, 3)
++        for g, w in zip(got, want):
++            self.assertEqual(g.view(torch.int32), w.view(torch.int32), atol=0, rtol=0)
++
+     def test_without_a_prefix_no_hit_is_static(self):
+         f = HostTraceReplay(affine)
+         w = torch.randn(64, 64, device="cuda")
+diff -ru -x __pycache__ snap/step_ms31/test/test_cuda_host_trace_tape.py snap/step_ms32/test/test_cuda_host_trace_tape.py
+--- snap/step_ms31/test/test_cuda_host_trace_tape.py	2026-10-12 13:08:50.791612226 -0700
++++ snap/step_ms32/test/test_cuda_host_trace_tape.py	2026-10-19 08:59:01.569412780 -0700
+@@ -300,12 +300,11 @@
+         with self.assertRaisesRegex(Declined, "past the end of eager output e0"):
+             _run(lambda a, b: (a @ b).as_strided((8, 6), (6, 1), 1), x, w)
+ 
+-    def test_deterministic_fill_declines(self):
+-        with DeterministicGuard(True, fill_uninitialized_memory=True):
+-            with self.assertRaisesRegex(Declined, "fill_uninitialized_memory"):
++    def test_deterministic_fill_traces(self):
++        # eager's fill of a factory op's result is recorded (the replay test checks its bytes), not declined
++        for fill in (True, False):
++            with DeterministicGuard(True, fill_uninitialized_memory=fill):
+                 _run(torch.empty_like, torch.randn(3))
+-        with DeterministicGuard(True, fill_uninitialized_memory=False):
+-            _run(torch.empty_like, torch.randn(3))
+ 
+     def test_views_match_eager(self):
+         x = torch.randn(6, 5, 8)[1:]
+diff -ru -x __pycache__ snap/step_ms31/torch/cuda/_host_trace_tape.py snap/step_ms32/torch/cuda/_host_trace_tape.py
+--- snap/step_ms31/torch/cuda/_host_trace_tape.py	2026-10-18 18:11:46.819524542 -0700
++++ snap/step_ms32/torch/cuda/_host_trace_tape.py	2026-10-19 08:58:25.498864313 -0700
+@@ -659,12 +659,10 @@
+         return self.shape_env.create_symintnode(expr, hint=value)
+ 
+     def allocate(self, func: Any, args: tuple, kwargs: dict) -> _TracedTensor:
+-        deterministic = torch.are_deterministic_algorithms_enabled()
+-        if deterministic and torch._C._get_deterministic_fill_uninitialized_memory():
+-            raise self.decline(
+-                "use_deterministic_algorithms(True) with fill_uninitialized_memory fills every allocation "
+-                "with a kernel the trace does not record"
+-            )
++        # no fill here: under use_deterministic_algorithms(True) with fill_uninitialized_memory, eager fills what its
++        # empty / empty_strided return, and the mode records that fill for a factory op (_Mode._dispatch); its other
++        # callers' allocations eager makes without one (a structured kernel's output, Inductor's empty_strided_cuda) or
++        # overwrites whole (a resized fresh output, a pinned copy's destination)
+         device = kwargs.get("device")
+         if device is None:
+             # the factories' default is the CPU, the *_like / new_* ops' their source's device
+@@ -2551,6 +2549,12 @@
+         return outs
+     return [o.to(device, non_blocking=True) if isinstance(o, torch.Tensor) and o.device.type == "cpu" else o for o in outs]
+ 
++def _deterministic_fill(dtype: torch.dtype) -> float | int | bool:
++    if dtype.is_floating_point or dtype.is_complex:
++        return float("nan")
++    return True if dtype == torch.bool else torch.iinfo(dtype).max
++
++
+ _ALLOC_OPS = {
+     aten.empty.memory_format,
+     aten.empty_strided.default,
+@@ -2845,7 +2849,12 @@
+             with self:
+                 return func._op_dk(composite, *args, **kwargs)
+         if func in _ALLOC_OPS:
+-            return self.trace.allocate(func, args, kwargs)
++            out = self.trace.allocate(func, args, kwargs)
++            if torch.are_deterministic_algorithms_enabled() and torch._C._get_deterministic_fill_uninitialized_memory():
++                # eager's at::native::fill_empty_deterministic_: NaN for a floating or complex dtype, the max otherwise
++                with self:
++                    out.fill_(_deterministic_fill(out.dtype))
++            return out
+         if func is aten.zero_.default and self.trace.zero(args[0]):
+             return args[0]
+         # resize_output of an op's own fresh empty output outside a TensorIterator
+diff -ru -x __pycache__ snap/step_ms31/torch/_inductor/cudagraph_host_trace.py snap/step_ms32/torch/_inductor/cudagraph_host_trace.py
+--- snap/step_ms31/torch/_inductor/cudagraph_host_trace.py	2026-10-15 13:17:46.539885787 -0700
++++ snap/step_ms32/torch/_inductor/cudagraph_host_trace.py	2026-10-19 08:58:25.500866115 -0700
+@@ -351,7 +351,9 @@
+ 
+ 
+ def _empty_strided(tr: _Trace, size: Any, stride: Any, dtype: Any) -> Any:
+-    return torch.empty_strided(size, stride, dtype=dtype, device=tr.device)
++    # the trace's allocation directly, as eager's empty_strided_cuda (at::detail, no deterministic fill), not the
++    # factory op's dispatch (which records eager's fill under use_deterministic_algorithms)
++    return tr.allocate(torch.ops.aten.empty_strided.default, (list(size), list(stride)), {"dtype": dtype, "device": tr.device})
+ 
+ 
+ def _empty_strided_cpu(tr: _Trace, size: Any, stride: Any, dtype: Any) -> Any:

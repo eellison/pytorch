@@ -1,0 +1,24 @@
+--- a/torch/csrc/cuda/host_trace/Patch.cpp
++++ b/torch/csrc/cuda/host_trace/Patch.cpp
+@@ -11,6 +11,7 @@
+ #include <torch/csrc/utils/object_ptr.h>
+ 
+ #include <algorithm>
++#include <cstdlib>
+ #include <cmath>
+ #include <cstring>
+ #include <limits>
+@@ -25,7 +26,12 @@
+ int64_t piece_skips = 0;
+ int64_t index_builds = 0;
+ int64_t rows_unindexed = 0;
+-bool split_enabled = false;
++// on unless TORCH_HOST_TRACE_SPLIT=0: with split_dirty_min a call splits only where its patch would be exposed
++// (dev-box A/B, 8B and 27B churn: neutral to 1% faster, never slower)
++bool split_enabled = [] {
++  const char* v = std::getenv("TORCH_HOST_TRACE_SPLIT");
++  return v == nullptr || std::string(v) != "0";
++}();
+ int64_t split_sections = 4;
+ double split_ratio = 4.0;
+ int64_t split_first_nodes = 0;

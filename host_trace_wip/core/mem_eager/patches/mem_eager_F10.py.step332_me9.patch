@@ -1,0 +1,324 @@
+diff -ru '--exclude=__pycache__' '--exclude=TREE.txt' step332_me9/test/inductor/test_cudagraph_host_trace.py step332_me10/test/inductor/test_cudagraph_host_trace.py
+--- step332_me9/test/inductor/test_cudagraph_host_trace.py	2026-10-15 04:19:09.613395258 -0700
++++ step332_me10/test/inductor/test_cudagraph_host_trace.py	2026-10-15 06:16:53.910044117 -0700
+@@ -37,6 +37,7 @@
+         _Installation,
+         _namespace,
+         _trusted_inputs,
++        _PROVIDERS,
+         HostTracePolicy,
+     )
+     from torch._inductor.runtime.triton_heuristics import (
+@@ -1647,5 +1648,179 @@
+     torch.cuda._host_trace.raise_unexpected = True
+ 
+ 
++
++# allocations under this many bytes are left out of the allocator-sequence
++# parity check (the allowlist): a scalar's or an index's buffers, which the
++# trace's host-side work and Inductor's code place differently
++_SMALL = 1024
++_SLACK = 64 << 20
++
++
++def _address_only_ranges():
++    import torch.cuda._host_trace_harvest as harvest
++
++    if not hasattr(harvest, "_address_only"):
++        return []
++    a = harvest._address_only()
++    return [(r[0], r[0] + a._SPAN) for r in a.ranges.values()]
++
++
++def _traced(fn):
++    # fn's result and the allocator's trace of its run, the blocks of the
++    # harvest's address-only capture span (no memory behind them) left out
++    torch.cuda.synchronize()
++    torch.cuda.memory._record_memory_history(enabled="all", context=None, stacks="python", max_entries=2_000_000)
++    try:
++        out = fn()
++        torch.cuda.synchronize()
++        trace = torch.cuda.memory._snapshot()["device_traces"][torch.cuda.current_device()]
++    finally:
++        torch.cuda.memory._record_memory_history(enabled=None)
++    unmapped = _address_only_ranges()
++    return out, [e for e in trace if not any(lo <= e["addr"] < hi for lo, hi in unmapped)]
++
++
++def _live_peak(trace):
++    # the peak of live bytes over the window's start
++    live = peak = 0
++    for e in trace:
++        if e["action"] == "alloc":
++            live += e["size"]
++        elif e["action"] == "free_completed":
++            live -= e["size"]
++        peak = max(peak, live)
++    return peak
++
++
++def _sequence(trace):
++    # each allocation as (size, stream by first use) and each free as the
++    # allocation it frees (or an earlier block's size), in order; a run of
++    # frees with no allocation between them as a sorted run, since the cache's
++    # free blocks after it do not depend on the order of its frees
++    streams, live, seq, frees = {}, {}, [], []
++    for e in trace:
++        if e["size"] < _SMALL:
++            continue
++        if e["action"] == "alloc":
++            seq += sorted(frees)
++            frees = []
++            live[e["addr"]] = sum(1 for x in seq if x[0] == "alloc")
++            seq.append(("alloc", e["size"], streams.setdefault(e["stream"], len(streams))))
++        elif e["action"] == "free_completed":
++            frees.append(("free", live.pop(e["addr"])) if e["addr"] in live else ("free earlier", e["size"]))
++    return seq + sorted(frees)
++
++
++def _gate_step(case, mode):
++    # one step of a representative workload, compiled with `mode`
++    torch.manual_seed(0)
++    if case == "conv_training":
++        model = torch.nn.Sequential(
++            *(torch.nn.Sequential(torch.nn.Conv2d(a, b, 3, stride=2, padding=1), torch.nn.BatchNorm2d(b), torch.nn.ReLU()) for a, b in ((3, 32), (32, 64), (64, 128)))
++        ).cuda()
++        opt = torch.optim.SGD(model.parameters(), lr=1e-2, momentum=0.9)
++        shape, grad = (256, 3, 128, 128), True
++    elif case == "transformer_training":
++        model = torch.nn.TransformerEncoder(torch.nn.TransformerEncoderLayer(256, 4, 1024, dropout=0.0, batch_first=True), 2).cuda()
++        opt = torch.optim.AdamW(model.parameters(), lr=1e-4)
++        shape, grad = (16, 128, 256), True
++    else:
++        model = torch.nn.Sequential(torch.nn.Linear(1024, 4096), torch.nn.GELU(), torch.nn.Linear(4096, 1024)).cuda().eval()
++        opt, shape, grad = None, (2048, 1024), False
++    compiled = torch.compile(model, mode=mode)
++
++    def step():
++        x = torch.randn(shape, device="cuda")
++        with torch.autocast("cuda", dtype=torch.bfloat16), torch.set_grad_enabled(grad):
++            out = compiled(x)
++        if grad:
++            out.float().sum().backward()
++            opt.step()
++            opt.zero_grad(set_to_none=True)
++
++    return step
++
++
++@requires_cuda_and_triton
++@config.patch({"triton.cudagraph_host_trace": True})
++@instantiate_parametrized_tests
++class TestMemoryGate(TestCase):
++    """Memory is deterministic, so it is checked as such: a steady replay
++    step's caching-allocator sequence is the default compile's, and the
++    learns, the first call and the trace step stay within eager's peak plus
++    the bindings' workspace and 64 MiB."""
++
++    def setUp(self):
++        super().setUp()
++        torch._dynamo.reset()
++        self.installed = []
++        cudagraphify = HostTracePolicy.cudagraphify
++
++        def spy(*args, **kwargs):
++            out = cudagraphify(*args, **kwargs)
++            self.installed.append(out)
++            return out
++
++        patch = mock.patch.object(HostTracePolicy, "cudagraphify", spy)
++        patch.start()
++        self.addCleanup(patch.stop)
++
++    @parametrize("case", ["conv_training", "transformer_training", "inference"])
++    # inference replays "auto" by default (run buffers, by design not eager's
++    # sequence): its parity is checked in eager memory
++    @config.patch({"triton.cudagraph_host_trace_replay_memory": "eager"})
++    def test_a_steady_step_allocates_as_the_default_compile(self, case):
++        def sequence(mode):
++            torch._dynamo.reset()
++            step = _gate_step(case, mode)
++            for _ in range(4):
++                step()
++            return _sequence(_traced(step)[1])
++
++        default = sequence(None)
++        ours = sequence("reduce-overhead")
++        self.assertGreater(sum(i.replay.replays for i in self.installed), 0)
++        self.assertEqual(ours, default)
++
++    @parametrize("case", ["conv_training", "transformer_training"])
++    def test_learns_and_the_first_calls_stay_within_eager_plus_workspace(self, case):
++        import torch.cuda._host_trace_harvest as harvest
++
++        learned = []
++        learn = harvest.HarvestProvider.learn
++
++        def measured(provider, key, args, kwargs, operands):
++            # the op's eager peak on the same arguments, the generator put back
++            state = torch.cuda.get_rng_state()
++            with torch.no_grad():
++                eager = _live_peak(_traced(lambda: key.op(*args, **kwargs))[1])
++            torch.cuda.set_rng_state(state)
++            binding, trace = _traced(lambda: learn(provider, key, args, kwargs, operands))
++            learned.append((str(key.op), _live_peak(trace), eager, sum(binding.scratch) if binding is not None else 0))
++            return binding
++
++        def peaks(mode):
++            torch._dynamo.reset()
++            step = _gate_step(case, mode)
++            return [_live_peak(_traced(step)[1]) for _ in range(3)]
++
++        default = peaks(None)
++        # providers of the test's own: no key bound by an earlier test
++        fresh = {
++            "blas": harvest.HarvestProvider(),
++            "attention": harvest.HarvestProvider(("attention",)),
++            "conv": harvest.HarvestProvider(("conv",)),
++            "rng": harvest.HarvestProvider(("rng",), (torch.ops.prims.inductor_seeds.default,)),
++            "reduce": harvest.HarvestProvider(("reduce",)),
++        }
++        with mock.patch.dict(_PROVIDERS, fresh), mock.patch.object(harvest.HarvestProvider, "learn", measured):
++            ours = peaks("reduce-overhead")
++        workspace = max((w for *_, w in learned), default=0)
++        self.assertGreater(len(learned), 0)
++        for op, peak, eager, w in learned:
++            self.assertLessEqual(peak - eager, w + _SLACK, op)
++        self.assertLessEqual(ours[0], default[0] + _SLACK)
++        self.assertLessEqual(ours[1], default[2] + workspace + _SLACK)
++
+ if __name__ == "__main__":
+     run_tests()
+diff -ru '--exclude=__pycache__' '--exclude=TREE.txt' step332_me9/test/test_cuda_host_trace_harvest.py step332_me10/test/test_cuda_host_trace_harvest.py
+--- step332_me9/test/test_cuda_host_trace_harvest.py	2026-10-15 04:43:47.100513437 -0700
++++ step332_me10/test/test_cuda_host_trace_harvest.py	2026-10-15 06:16:53.908088683 -0700
+@@ -715,6 +715,19 @@
+         self.assertTrue(harvest._same(h, h))
+         self.assertLess(torch.cuda.max_memory_allocated() - base, 128 << 20)
+ 
++    def test_the_fused_digest_is_the_chunked_one(self):
++        # one kernel over a dense tensor in memory order (any order of its
++        # dims), chunk copies for a view with gaps: the same digest as torch
++        # ops on index-order chunks, for every dtype width and layout
++        base = torch.randn(37, 129, 5, device="cuda") * 100
++        cl = torch.randn(8, 16, 9, 7, device="cuda").to(memory_format=torch.channels_last)
++        for dt in (torch.float32, bf16, torch.int64, torch.int16, torch.uint8, torch.bool, torch.complex64):
++            t = base > 0 if dt == torch.bool else base.to(dt)
++            for x in (t, t.transpose(0, 2), t.permute(2, 0, 1), t[:, ::3], t[0], t[:0], t.unsqueeze(1).expand(37, 2, 129, 5), cl.to(dt) if dt != torch.bool else cl > 0):
++                with mock.patch.object(harvest, "has_triton", lambda: False):
++                    want = harvest._digest(x)
++                self.assertEqual(harvest._digest(x), want)
++
+     def test_stale_high_halves_are_zeroed(self):
+         # a constant qword whose high half is a stale address's binds with
+         # that half zeroed and loose; a slot's neighbors, loose bytes and
+diff -ru '--exclude=__pycache__' '--exclude=TREE.txt' step332_me9/torch/cuda/_host_trace_harvest.py step332_me10/torch/cuda/_host_trace_harvest.py
+--- step332_me9/torch/cuda/_host_trace_harvest.py	2026-10-15 04:43:47.098415727 -0700
++++ step332_me10/torch/cuda/_host_trace_harvest.py	2026-10-15 06:16:53.905912800 -0700
+@@ -128,6 +128,7 @@
+ 
+ import torch
+ import torch.utils._pytree as pytree
++from torch.utils._triton import has_triton
+ from torch._logging import trace_structured
+ from torch._ops import OpOverload
+ from torch.cuda._host_trace_capture import attribute_value, launch_attributes, MemsetNode, reproducible
+@@ -405,20 +406,94 @@
+         yield from _chunks(piece.squeeze(d) if rows == 1 else piece, n)
+ 
+ 
++_DIGEST_DIMS = 6
++
++
++@functools.cache
++def _digest_kernel() -> Any:
++    import triton
++    import triton.language as tl
++
++    @triton.jit
++    def kernel(x, out, n, base, golden, mix1, mix2, seed0, seed1, s0, s1, s2, s3, s4, s5, l0, l1, l2, l3, l4, l5, DIMS: tl.constexpr, BLOCK: tl.constexpr):  # noqa: N803
++        # x's elements in memory order; each one's index-order position from
++        # its coordinates (dims innermost first: sizes s, index strides l)
++        offs = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
++        mask = offs < n
++        rem = offs
++        index = (rem % s0) * l0
++        rem = rem // s0
++        if DIMS > 1:
++            index += (rem % s1) * l1
++            rem = rem // s1
++        if DIMS > 2:
++            index += (rem % s2) * l2
++            rem = rem // s2
++        if DIMS > 3:
++            index += (rem % s3) * l3
++            rem = rem // s3
++        if DIMS > 4:
++            index += (rem % s4) * l4
++            rem = rem // s4
++        if DIMS > 5:
++            index += (rem % s5) * l5
++        v0 = tl.load(x + offs, mask=mask, other=0).to(tl.int64) + (index + base) * golden
++        for lane in tl.static_range(2):
++            v = v0 + (seed0 if lane == 0 else seed1)
++            v = (v ^ ((v >> 30) & 0x3FFFFFFFF)) * mix1
++            v = (v ^ ((v >> 27) & 0x1FFFFFFFFF)) * mix2
++            v = v ^ ((v >> 31) & 0x1FFFFFFFF)
++            tl.atomic_add(out + lane, tl.sum(tl.where(mask, v, 0), axis=0))
++
++    return kernel
++
++
++def _dense_dims(x: torch.Tensor) -> list[tuple[int, int]] | None:
++    # (size, index-order stride) per dim, innermost in memory first, when x's
++    # elements fill its span in some order of its dims (contiguous, channels
++    # last, a transpose); None for a view with gaps or overlaps
++    index, stride = [1] * x.dim(), 1
++    for d in reversed(range(x.dim())):
++        index[d], stride = stride, stride * x.shape[d]
++    dims = sorted(((x.stride(d), x.shape[d], index[d]) for d in range(x.dim()) if x.shape[d] > 1), key=lambda t: t[0])
++    expect = 1
++    for st, size, _ in dims:
++        if st != expect:
++            return None
++        expect *= size
++    return [(size, i) for _, size, i in dims] or [(1, 1)]
++
++
+ def _digest(t: torch.Tensor) -> torch.Tensor:
+     """A strong digest of t's bits in index order: per element of its integer
+     view of the same itemsize, splitmix64 of the element plus its index times
+     the golden ratio, plus a lane's seed, summed per lane (two lanes, 128
+     bits). Integer arithmetic throughout, so it does not depend on the order a
+-    reduction takes; the temporaries are _DIGEST_CHUNK words long."""
++    reduction takes. On CUDA one fused kernel reads a dense tensor in memory
++    order (any order of its dims); a view with gaps copies pieces of
++    _DIGEST_CHUNK words for it; elsewhere torch ops on such pieces."""
+     if t.is_complex():
+         t = torch.view_as_real(t)
+     x = t.view(_BITS[t.element_size()])
+     out = torch.zeros(len(_LANES), dtype=torch.int64, device=t.device)
++    if not x.numel():
++        return out
++    fused = x.is_cuda and has_triton()
++    dims = _dense_dims(x) if fused else None
++    if dims is not None and len(dims) <= _DIGEST_DIMS:
++        pieces = [(x, dims)]
++    else:
++        pieces = [(piece, [(piece.numel(), 1)]) for piece in _chunks(x, _DIGEST_CHUNK)]
+     base = 0
+-    for piece in _chunks(x, _DIGEST_CHUNK):
+-        v0 = piece.to(torch.int64) + (torch.arange(base, base + piece.numel(), device=t.device) * _GOLDEN)
+-        base += piece.numel()
++    for piece, dims in pieces:
++        n = piece.numel()
++        if fused:
++            sizes, strides = zip(*(dims + [(1, 0)] * (_DIGEST_DIMS - len(dims))))
++            _digest_kernel()[(-(-n // 1024),)](piece, out, n, base, _GOLDEN, _MIX1, _MIX2, *_LANES, *sizes, *strides, DIMS=len(dims), BLOCK=1024)
++            base += n
++            continue
++        v0 = piece.to(torch.int64) + (torch.arange(base, base + n, device=t.device) * _GOLDEN)
++        base += n
+         for lane, seed in enumerate(_LANES):
+             v = v0 + seed
+             v = (v ^ ((v >> 30) & ((1 << 34) - 1))) * _MIX1

@@ -1,0 +1,45 @@
+--- a/torch/cuda/_host_trace_capture.py
++++ b/torch/cuda/_host_trace_capture.py
+@@ -578,6 +578,10 @@
+     config.hStream = stream
+     config.attrs = launch_attributes(attributes)
+     config.numAttrs = len(attributes)
++    # the library set the function's dynamic shared memory limit to its own last launch's bytes (raise_dynamic_smem_limit)
++    limit_attr = driver.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES
++    if smem > _check_cuda_bindings(driver.cuFuncGetAttribute(limit_attr, function)):
++        _check_cuda_bindings(driver.cuFuncSetAttribute(function, limit_attr, smem))
+     _check_cuda_bindings(driver.cuLaunchKernelEx(config, function, ctypes.addressof(arguments), 0))
+ 
+ 
+--- a/test/test_cuda_host_trace_replay.py
++++ b/test/test_cuda_host_trace_replay.py
+@@ -3141,6 +3141,29 @@
+         self.assertEqual(len(f.variants), 12)
+         self.assertEqual((f.traces, f.eager), (12, 0))
+ 
++    def test_a_node_set_above_its_functions_lowered_smem_limit(self):
++        # cuDNN and cuBLASLt set a function's dynamic shared memory limit to their launch's
++        # bytes before it, so the limit is whatever their last launch needed (whisper's
++        # lean_reduction_kernel: 2600 at batch 5, 6240 at batch 2). A node set at a key's larger
++        # bytes raises it as eager's launch would; the driver refuses it otherwise
++        from cuda.bindings import driver
++
++        attr = driver.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES
++        f = HostTraceReplay(lambda x: x.sum(-1))
++        for n in (64, 64):
++            x = torch.randn(n, 4096, device="cuda")
++            self.assertEqual(f(x), x.sum(-1))
++        (launch,) = [r for v in f.variants for _, r in v.tape.launches if isinstance(r, KernelLaunch)]
++        was = _check_cuda_bindings(driver.cuFuncGetAttribute(attr, launch.function))
++        _check_cuda_bindings(driver.cuFuncSetAttribute(launch.function, attr, 1024))
++        try:
++            x = torch.randn(8, 4096, device="cuda")  # the reduction's 2048 bytes of shared memory
++            self.assertEqual(f(x), x.sum(-1))
++            self.assertEqual((f.traces, f.replays), (1, 2))
++            self.assertEqual(_check_cuda_bindings(driver.cuFuncGetAttribute(attr, launch.function)), 2048)
++        finally:
++            _check_cuda_bindings(driver.cuFuncSetAttribute(launch.function, attr, was))
++
+     def test_an_error_after_a_setter_leaves_the_node_unknown(self):
+         f = HostTraceReplay(two_step)
+         for n in (1000, 3000):

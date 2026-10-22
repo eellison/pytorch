@@ -1,0 +1,94 @@
+--- a/torch/csrc/distributed/c10d/nccl2/NCCLCachingAllocatorHook.cpp	2026-10-03 12:56:21.811871884 -0700
++++ b/torch/csrc/distributed/c10d/nccl2/NCCLCachingAllocatorHook.cpp	2026-10-15 17:21:55.859064228 -0700
+@@ -9,6 +9,9 @@
+ 
+ #include <ATen/Context.h>
+ #include <c10/core/AllocatorConfig.h>
++#if !defined(USE_ROCM) && defined(PYTORCH_C10_DRIVER_API_SUPPORTED)
++#include <c10/cuda/driver_api.h>
++#endif
+ #include <torch/csrc/distributed/c10d/nccl2/Logging.hpp>
+ #include <torch/csrc/distributed/c10d/nccl2/ProcessGroupNCCL.hpp>
+ 
+@@ -38,6 +41,20 @@
+   });
+   return out;
+ }
++// A pool's custom allocator may hand out address space with no memory mapped
++// behind it (e.g. for CUDA graph captures that are never replayed), which
++// ncclCommRegister refuses: its cuMemGetAddressRange finds no allocation there.
++bool isMapped(void* addr) {
++#if !defined(USE_ROCM) && defined(PYTORCH_C10_DRIVER_API_SUPPORTED)
++  CUdeviceptr base = 0;
++  size_t size = 0;
++  return c10::cuda::DriverAPI::get()->cuMemGetAddressRange_(
++             &base, &size, reinterpret_cast<CUdeviceptr>(addr)) ==
++      CUDA_SUCCESS;
++#else
++  return true;
++#endif
++}
+ } // namespace
+ 
+ NCCLCachingAllocatorHook& NCCLCachingAllocatorHook::getInstance() {
+@@ -76,6 +93,10 @@
+     }
+     // NOLINTNEXTLINE(performance-no-int-to-ptr)
+     void* addr = reinterpret_cast<void*>(segmentInfo.address);
++    if (!isMapped(addr)) {
++      unmapped_.insert(addr);
++      continue;
++    }
+     registeredMemMap_.emplace(
+         addr, MemInfo{segmentInfo.total_size, segmentInfo.device});
+   }
+@@ -94,6 +115,10 @@
+     size_t len = te.size_;
+     TORCH_CHECK(
+         !registeredMemMap_.count(addr), "Memory already registered with NCCL");
++    if (!isMapped(addr)) {
++      unmapped_.insert(addr);
++      return;
++    }
+     registeredMemMap_.emplace(addr, MemInfo{len, te.device_});
+     for (auto* comm : commsForDevice(registeredComms_, te.device_)) {
+       comm->register_address(addr, len);
+@@ -103,6 +128,9 @@
+       c10::cuda::CUDACachingAllocator::TraceEntry::Action::SEGMENT_FREE) {
+     // NOLINTNEXTLINE(performance-no-int-to-ptr)
+     void* addr = reinterpret_cast<void*>(static_cast<uintptr_t>(te.addr_));
++    if (unmapped_.erase(addr)) {
++      return;
++    }
+     TORCH_CHECK(
+         registeredMemMap_.count(addr), "Memory not registered with NCCL");
+     registeredMemMap_.erase(addr);
+--- a/torch/csrc/distributed/c10d/nccl2/NCCLCachingAllocatorHook.hpp	2026-10-03 12:56:21.811871884 -0700
++++ b/torch/csrc/distributed/c10d/nccl2/NCCLCachingAllocatorHook.hpp	2026-10-15 17:21:44.926363525 -0700
+@@ -15,6 +15,7 @@
+ #include <mutex>
+ #include <set>
+ #include <unordered_map>
++#include <unordered_set>
+ 
+ #include <c10/cuda/CUDACachingAllocator.h>
+ 
+@@ -45,6 +46,8 @@
+ 
+   std::mutex mutex_;
+   std::unordered_map<void*, MemInfo> registeredMemMap_;
++  // segments with no memory mapped behind them, which NCCL cannot register
++  std::unordered_set<void*> unmapped_;
+   std::set<ProcessGroupNCCL*> registeredComms_;
+   bool register_default_pool_segments_;
+ };
+--- a/caffe2/CMakeLists.txt	2026-10-03 12:56:20.288507609 -0700
++++ b/caffe2/CMakeLists.txt	2026-10-15 17:21:44.926619111 -0700
+@@ -628,6 +628,7 @@
+       append_filelist("libtorch_cuda_distributed_extra_sources" Caffe2_GPU_SRCS)
+       set_source_files_properties(
+         ${TORCH_SRC_DIR}/csrc/distributed/c10d/ProcessGroupNCCL.cpp
++        ${TORCH_SRC_DIR}/csrc/distributed/c10d/nccl2/NCCLCachingAllocatorHook.cpp
+         ${TORCH_SRC_DIR}/csrc/distributed/c10d/cuda/utils.cpp
+         ${TORCH_SRC_DIR}/csrc/distributed/c10d/intra_node_comm.cpp
+         ${TORCH_SRC_DIR}/csrc/distributed/c10d/symm_mem/CudaDMAConnectivity.cpp

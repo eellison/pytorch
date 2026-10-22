@@ -1,0 +1,645 @@
+diff -ruN -x __pycache__ -x TREE.txt step_ms15/test/test_cuda_host_trace_lower.py step_ms16/test/test_cuda_host_trace_lower.py
+--- a/test/test_cuda_host_trace_lower.py	2026-10-15 20:03:55.864159673 -0700
++++ b/test/test_cuda_host_trace_lower.py	2026-10-16 10:43:39.453160973 -0700
+@@ -240,6 +240,24 @@
+             if ok:
+                 self.assertEqual(outputs[row], -s)
+ 
++    def test_a_guard_reaches_few_ands(self):
++        # the predicate of 64 guards, each on its own symbol: its ands are a balanced tree, so the rows that read one
++        # guard's symbol (what a call changing it evaluates) are its guard and the ands above it, about log2(64)
++        syms = sympy.symbols("g0:64", integer=True)
++        program = IntegerProgram([5] * 64)
++        lowering = Lowering(program, {s: ("boxed", i) for i, s in enumerate(syms)})
++        valid = lowering.conjunction([sympy.Ge(s, 1) for s in syms])
++        compiled = compile_program(program)
++        self.assertEqual(compiled.evaluate_inputs([5] * 64)[1][valid], 1)
++        self.assertEqual(compiled.evaluate_inputs([5] * 63 + [0])[1][valid], 0)
++        first = lowering.lower(syms[0])
++        reach, cone = {first}, 0
++        for r, (op, *args) in enumerate(program.instructions):
++            if op not in ("constant", "boxed", "pointer", "storage_offset", "size", "stride") and reach & set(args):
++                reach.add(r)
++                cone += 1
++        self.assertLessEqual(cone, 9)
++
+     def test_total_reads_the_rows_before_it_and_keeps_its_own(self):
+         # inside total a row lowered before is reused; one lowered inside is not memoized past it
+         program = IntegerProgram(list(HINT))
+diff -ruN -x __pycache__ -x TREE.txt step_ms15/test/test_cuda_host_trace_opaque.py step_ms16/test/test_cuda_host_trace_opaque.py
+--- a/test/test_cuda_host_trace_opaque.py	2026-10-15 16:18:18.066605721 -0700
++++ b/test/test_cuda_host_trace_opaque.py	2026-10-16 11:10:43.187256968 -0700
+@@ -832,6 +832,26 @@
+                     self.assertEqual(f(x, base[:n]), mul_chain(x, base[:n]), atol=0, rtol=0)
+         self.assertEqual((len(f.variants), len(bound(f)), f.eager), (1, 1, 0))
+ 
++    @unittest.expectedFailure  # the native entry does not yet fill a keyed site's row from a binding the provider holds (SPLIT_PIPELINE.md)
++    def test_a_held_binding_at_a_new_key_is_a_native_hit(self):
++        # keys another replay learned: a new replay's keyed site meets each at a new size with its binding in the
++        # provider (no learn, no trace); the C++ entry should serve the call, as in churn where each mixed step's token
++        # count is new and its cuBLAS bindings are loaded
++        p = TableProvider()
++        warm = HostTraceReplay(mul_chain, opaque=(p,))
++        sizes = (512, 640, 768, 896)
++        args = {n: (torch.randn(n, device="cuda"), torch.randn(n, device="cuda")) for n in sizes}
++        for n in sizes * 2:
++            self.assertEqual(warm(*args[n]), mul_chain(*args[n]), atol=0, rtol=0)
++        f = HostTraceReplay(mul_chain, opaque=(p,))
++        for n in sizes[:1] * 3:
++            self.assertEqual(f(*args[n]), mul_chain(*args[n]), atol=0, rtol=0)
++        learned, traces = len(p.learned), f.traces
++        for n in sizes[1:]:
++            self.assertEqual(f(*args[n]), mul_chain(*args[n]), atol=0, rtol=0)
++        self.assertEqual((len(p.learned), f.traces), (learned, traces))
++        self.assertEqual(f.slow_hits, 0)
++
+     @parametrize("form_held", [False, True])
+     @parametrize("first", [512, 640])
+     def test_binding_switches(self, first, form_held):
+diff -ruN -x __pycache__ -x TREE.txt step_ms15/test/test_cuda_host_trace_python_entry.py step_ms16/test/test_cuda_host_trace_python_entry.py
+--- a/test/test_cuda_host_trace_python_entry.py	2026-10-15 12:10:54.548086723 -0700
++++ b/test/test_cuda_host_trace_python_entry.py	2026-10-16 11:35:58.685032201 -0700
+@@ -22,6 +22,8 @@
+     "TestStaticPrefix": None,
+     "TestBoundCall": None,
+     "TestDirtyRecords": ("test_alternating_statics_repatch_their_readers", "test_alternating_sizes_take_their_kept_rows"),
++    # every call of the Python entry is a slow call: the counters' slow_hits == 0 is the C++ entry's
++    "TestReplayCounters": None,
+     # a hit enters no Python, its native key and variant order
+     "TestNativeReplay": (
+         "test_a_graphsafe_rng_step_runs_no_python",
+diff -ruN -x __pycache__ -x TREE.txt step_ms15/test/test_cuda_host_trace_replay.py step_ms16/test/test_cuda_host_trace_replay.py
+--- a/test/test_cuda_host_trace_replay.py	2026-10-15 21:06:32.949487426 -0700
++++ b/test/test_cuda_host_trace_replay.py	2026-10-16 11:11:40.244878371 -0700
+@@ -1,11 +1,14 @@
+ # Owner(s): ["module: cuda graphs"]
+ 
++import bisect
+ import builtins
++import collections
+ import ctypes
+ import dataclasses
+ import functools
+ import gc
+ import itertools
++import math
+ import os
+ import random
+ import sys
+@@ -28,6 +31,7 @@
+     _host_trace_tape,
+ )
+ from torch.cuda._host_trace import declined
++from torch.cuda._host_trace_native import split_cuts
+ from torch.cuda._host_trace_capture import launch_images, launch_slots
+ from torch.cuda._host_trace_launch import KernelLaunch
+ from torch.cuda._host_trace_lower_tape import FoldRefused, LoweredMemcpy, LoweredMemset
+@@ -150,6 +154,7 @@
+     return add(add(add(add(x))), 1)
+ 
+ 
++
+ def long_chain(x):
+     for _ in range(4):
+         x = five_step(x)
+@@ -1102,6 +1107,40 @@
+             self.assertEqual(f(x), fn(x), atol=0, rtol=0)
+         self.assertEqual((f.traces, f.redispatches, f.redos, f.redo_instances, f.eager), (1, 1, 3, 1, 0))
+ 
++    @parametrize("memory", ["eager", "run_buffer"])
++    def test_section_places_are_the_order_counts(self, memory):
++        # section_places bisects its step's sorted event keys (kept per plan step): the same places as counting the
++        # step's events before the op's first launch and its last, for every selector of a sectioned variant
++        from torch.cuda._host_trace_memory import _first_seqs, section_places
++
++        def fn(x):
++            return (x * 2).sum(0) + (x * 3).sum(0) + 1
++
++        f = HostTraceReplay(fn, memory=memory)
++        for t in (100, 300, 5000, 6000):
++            x = torch.randn(t, 64, device="cuda")
++            self.assertEqual(f(x), fn(x), atol=0, rtol=0)
++        checked = 0
++        for v in f.variants:
++            lowered, plan = v.captured.lowered, v.memory
++            seqs = _first_seqs(lowered)
++            for selector in lowered.selectors:
++                nodes = selector.nodes
++                step = next(i for i, r in enumerate(lowered.steps) if isinstance(r, range) and nodes[0] in r)
++                m, first, last = plan.steps[step], lowered.span(nodes[0])[0], lowered.span(nodes[-1])[1]
++                if not m.order:
++                    at = sum(seqs[k] < first for k in m.tensors)
++                    want = at, at
++                else:
++                    n = len(lowered.allocations)
++                    ends = {-1 - k: end for k, _, end in m.temporaries} | {-1 - n - a: seq for a, seq in m.freed}
++                    keys = [(seqs[e], 0) if e >= 0 else (ends[e], 1) for e in m.order]
++                    want = sum(k < (first, 0) for k in keys), sum(k < (last, 2) for k in keys)
++                self.assertEqual(section_places(lowered, plan, nodes), want)
++                self.assertEqual(section_places(lowered, plan, nodes), want)
++                checked += 1
++        self.assertGreater(checked, 0)
++
+     def test_a_section_needs_its_roots_live_over_its_op(self):
+         # a plan that frees the sum's input within the sum's launches would let
+         # a section's temporary or output take its bytes there: refused
+@@ -4042,7 +4081,9 @@
+         self.assertEqual(f.static_hits, 1)
+         w2 = change(w)
+         if w2 is None:
++            # an in-place change to a static: the trusted prefix needs telling
+             w2 = w
++            f.statics_changed()
+         x2 = x.to(w2.dtype)
+         # a trace or a full hit; then a full hit or the first static one
+         self.check(f, w2, x2)
+@@ -4057,6 +4098,36 @@
+             self.check(f, w, x)
+             self.assertEqual(f.static_hits, hits + 2)
+ 
++    def test_a_trusted_prefix_skips_the_static_checks_until_statics_changed(self):
++        # the static prefix is trusted: an unbound call with the same objects
++        # neither re-checks nor re-reads them (a re-pointed static replays its
++        # old address), until statics_changed(); then the next call checks
++        # them in full and lands on the variant of their new layout
++        f = HostTraceReplay(affine, static_prefix=1)
++        base = torch.randn(2 * 64 * 64, device="cuda")
++        w = base[: 64 * 64].view(64, 64)
++        x = torch.randn(8, 64, device="cuda")
++        for _ in range(3):
++            self.check(f, w, x)
++        hits = f.static_hits
++        self.check(f, w, x)
++        self.assertEqual(f.static_hits, hits + 1)
++        # re-pointed in place to other values at the same layout
++        w.set_(base.untyped_storage(), 64 * 64, (64, 64), (64, 1))
++        f.statics_changed()
++        self.check(f, w, x)
++        self.check(f, w, x)
++        self.assertEqual(f.static_hits, hits + 2)
++        # re-pointed in place to a transposed layout: its own variant's result
++        w.set_(base.untyped_storage(), 0, (64, 64), (1, 64))
++        f.statics_changed()
++        self.check(f, w, x)
++        self.check(f, w, x)
++        # another object at the static position is never trusted
++        w3 = torch.randn(64, 64, device="cuda")
++        self.check(f, w3, x)
++        self.check(f, w3, x)
++
+     def test_a_changed_grad_mode_takes_the_full_path(self):
+         f = HostTraceReplay(affine, static_prefix=1)
+         w = torch.randn(64, 64, device="cuda")
+@@ -4325,85 +4396,231 @@
+             self.check(f, fn, x)
+ 
+ 
++def _counters():
++    # the native replay's per-process counters a call moves
++    delta = torch._C._host_trace_delta_counts()
++    return {
++        "launches": torch._C._host_trace_graph_launches(),
++        "kernel_sets": torch._C._host_trace_kernel_node_sets(),
++        "memory_sets": torch._C._host_trace_memory_node_sets(),
++        "packs": torch._C._host_trace_kernel_packs(),
++        "tma_encodes": torch._C._host_trace_tma_counts()[0],
++        "rows": delta[3],
++    }
++
++
++def _moved(call):
++    before = _counters()
++    call()
++    after = _counters()
++    return {k: after[k] - before[k] for k in after}
++
++
++def _graph_shape(raw):
++    # a captured graph's node types, kernel parameter bytes and edge types: what a launch costs the driver
++    from cuda.bindings import driver
++
++    g = driver.CUgraph(init_value=int(raw))
++    count = _check_cuda_bindings(driver.cuGraphGetNodes(g, 0))[1]
++    nodes = _check_cuda_bindings(driver.cuGraphGetNodes(g, count))[0]
++    types, params = collections.Counter(), []
++    for n in nodes:
++        t = _check_cuda_bindings(driver.cuGraphNodeGetType(n))
++        types[t.name.removeprefix("CU_GRAPH_NODE_TYPE_")] += 1
++        if t == driver.CUgraphNodeType.CU_GRAPH_NODE_TYPE_KERNEL:
++            func, i, size = _check_cuda_bindings(driver.cuGraphKernelNodeGetParams(n)).func, 0, 0
++            while True:
++                err, offset, nbytes = driver.cuFuncGetParamInfo(func, i)
++                if int(err):
++                    break
++                size, i = max(size, int(offset) + int(nbytes)), i + 1
++            params.append(size)
++    edges = collections.Counter(t for _, _, t in _edges(raw, types=True))
++    return dict(types), max(params, default=0), dict(edges)
++
++
+ @unittest.skipIf(not TEST_CUDA, "requires CUDA")
+ @requires_cuda_python_bindings
+ @unittest.skipIf(not has_triton(), "requires triton")
+ @unittest.skipIf(not hasattr(torch._C, "_HostTraceVariant"), "requires the native path")
+-class TestDirtyRecords(TestCase):
+-    @parametrize("threshold", [-1, 0])
+-    def test_a_split_replay_is_the_whole_replay(self, threshold):
+-        # torch._C._host_trace_split: a call that changes a launch configuration
+-        # of the whole exec (here every call: sizes alternate) runs the
+-        # segment's sub-execs back to back, each patched while the one before
+-        # runs; -1 off. Outputs bitwise
+-        old = torch._C._host_trace_split(threshold)
++class TestReplayCounters(TestCase):
++    """Per-call work as counters (deterministic, no wall clock): graph launches, node sets, packs, TMA encodes and
++    rows evaluated, for steady, alternating and variant-switching calls, split or not; and a fixed graph's shape, so
++    an unintended change to what is launched fails here before a model shows it."""
++
++    def setUp(self):
++        old = torch._C._host_trace_split(False)
+         self.addCleanup(torch._C._host_trace_split, old)
++
++    def warm(self, f, fn, xs, order):
++        for n in order:
++            self.assertEqual(f(xs[n]), fn(xs[n]), atol=0, rtol=0)
++
++    @parametrize("split", [False, True])
++    def test_a_steady_call_sets_nothing(self, split):
++        torch._C._host_trace_split(split)
++        old = torch._C._host_trace_split_policy(first_nodes=4)
++        self.addCleanup(lambda: torch._C._host_trace_split_policy(*old))
+         f = HostTraceReplay(long_chain)
+-        before = torch._C._host_trace_split_counts()[:2]
+-        for n in (4096, 8192) * 4:
++        xs = {n: torch.randn(n, device="cuda") for n in (4096, 8192)}
++        self.warm(f, long_chain, xs, (4096, 8192, 4096, 4096))
++        (v,) = f.variants
++        sections = max(len(torch._C._host_trace_split_bounds(v.native, 0, 0)) - 1, 1)
++        moved = _moved(lambda: f(xs[4096]))
++        self.assertEqual(moved, {"launches": sections, "kernel_sets": 0, "memory_sets": 0, "packs": 0, "tma_encodes": 0, "rows": 0})
++        self.assertEqual(sections > 1, split)
++        self.assertEqual(f.slow_hits, 0)
++
++    @parametrize("split", [False, True])
++    def test_alternating_sizes_set_each_size_reading_node_once(self, split):
++        # long_chain: 20 Triton launches, each reading the size (its grid and numel): one set each per size change,
++        # in whichever section holds it; the rows of the size evaluated once (a full delta per change)
++        torch._C._host_trace_split(split)
++        old = torch._C._host_trace_split_policy(first_nodes=4)
++        self.addCleanup(lambda: torch._C._host_trace_split_policy(*old))
++        f = HostTraceReplay(long_chain)
++        xs = {n: torch.randn(n, device="cuda") for n in (4096, 8192)}
++        self.warm(f, long_chain, xs, (4096, 8192, 4096, 8192))
++        (v,) = f.variants
++        n = len(v.captured.lowered.launches)
++        moved = [_moved(lambda m=m: f(xs[m])) for m in (4096, 8192)]
++        self.assertEqual([m["kernel_sets"] for m in moved], [n, n])
++        self.assertEqual([m["packs"] for m in moved], [n, n])
++        self.assertEqual([m["tma_encodes"] for m in moved], [0, 0])
++        self.assertEqual(f.slow_hits, 0)
++
++    def test_a_variant_switch_sets_nothing(self):
++        # branch_on_size: a variant per side of 4096; alternating between them at their sizes and tensors sets no node
++        f = HostTraceReplay(branch_on_size)
++        xs = {n: torch.randn(n, device="cuda") for n in (4096, 8192)}
++        self.warm(f, branch_on_size, xs, (4096, 8192, 4096, 8192))
++        self.assertEqual(len(f.variants), 2)
++        moved = [_moved(lambda m=m: f(xs[m])) for m in (4096, 8192, 4096)]
++        self.assertEqual([(m["kernel_sets"], m["memory_sets"], m["launches"]) for m in moved], [(0, 0, 1)] * 3)
++        self.assertEqual(f.slow_hits, 0)
++
++    def test_learned_library_calls_are_served_natively(self):
++        # cuBLAS keys at several batch sizes, learned and bound as keyed sites: once each size has run, every call is
++        # a native hit; the Python slow path serves none of the repeats (it is for a genuine miss)
++        from torch.cuda._host_trace_harvest import HarvestProvider
++
++        w = torch.randn(64, 64, device="cuda")
++        f = HostTraceReplay(matmul_chain, opaque=(HarvestProvider(("blas",)),))
++        xs = {n: torch.randn(n, 64 * 4, device="cuda") for n in (8, 24, 40)}
++        for n in (8, 24, 40) * 2:
++            self.assertEqual(f(xs[n], w), matmul_chain(xs[n], w), atol=0, rtol=0)
++        before = (f.slow_hits, f.traces, f.replays)
++        for n in (40, 8, 24, 8, 40):
++            self.assertEqual(f(xs[n], w), matmul_chain(xs[n], w), atol=0, rtol=0)
++        # (the warm-up's first call at a size after its key learned fills the keyed site's row in Python: a slow hit
++        # TestOpaqueCalls.test_a_held_binding_at_a_new_key_is_a_native_hit holds as an expected failure)
++        self.assertEqual((f.slow_hits, f.traces, f.replays - before[2]), (before[0], before[1], 5))
++
++    def test_a_fixed_graph_keeps_its_shape(self):
++        # five_step's graph (four Triton adds): its node types and counts, its kernels' largest parameter block and
++        # its edge types (three full edges, no programmatic one: Triton launches without PDL)
++        f = HostTraceReplay(five_step)
++        for n in (4096, 8192):
+             x = torch.randn(n, device="cuda")
+-            self.assertEqual(f(x), long_chain(x), atol=0, rtol=0)
+-        self.assertEqual((f.traces, f.eager, len(f.variants)), (1, 0, 1))
+-        calls, builds = (a - b for a, b in zip(torch._C._host_trace_split_counts()[:2], before))
+-        self.assertEqual((calls > 0, builds), (True, 1) if threshold == 0 else (False, 0))
+-
+-    def test_a_split_switch_keeps_each_execs_parameters(self):
+-        # with a threshold, a size change (every node reads the size) runs split
+-        # and a repeat of the same size and tensors runs whole; switching modes
+-        # sets only what each mode's execs lack. Outputs bitwise
+-        old = torch._C._host_trace_split(8)
++            self.assertEqual(f(x), five_step(x), atol=0, rtol=0)
++        (v,) = f.variants
++        (segment,) = v.captured.segments
++        types, params, edges = _graph_shape(segment.graph.raw_cuda_graph())
++        self.assertEqual((types, params, edges), ({"KERNEL": 4}, 40, {0: 3}))
++
++
++@unittest.skipIf(not TEST_CUDA, "requires CUDA")
++@requires_cuda_python_bindings
++@unittest.skipIf(not has_triton(), "requires triton")
++@unittest.skipIf(not hasattr(torch._C, "_HostTraceVariant"), "requires the native path")
++class TestDirtyRecords(TestCase):
++    def split(self, enable=True, **policy):
++        # torch._C._host_trace_split: a run with legal cuts launches its form's sections every call, section k+1
++        # patched while section k runs; _host_trace_split_policy sets the sections' sizes
++        old = torch._C._host_trace_split(enable)
+         self.addCleanup(torch._C._host_trace_split, old)
++        if policy:
++            old_policy = torch._C._host_trace_split_policy(**policy)
++            self.addCleanup(lambda: torch._C._host_trace_split_policy(*old_policy))
++
++    def test_a_split_replay_is_the_whole_replay(self):
++        # sizes alternate: every call re-sets the nodes that read the size, section by section. Outputs bitwise and,
++        # split or not, the same peak memory and the same node sets per call: a cut materializes nothing (the sections
++        # are the graph's nodes over the same addresses; no copy, allocation or output is added)
++        xs = {n: torch.randn(n, device="cuda") for n in (4096, 8192)}
++
++        def run(split):
++            torch._C._host_trace_split(split)
++            f = HostTraceReplay(long_chain)
++            for n in (4096, 8192, 4096):
++                f(xs[n])
++            calls = torch._C._host_trace_split_counts()[0]
++            torch.cuda.synchronize()
++            torch.cuda.reset_peak_memory_stats()
++            base = torch.cuda.memory_allocated()
++            sets = []
++            for n in (8192, 4096) * 4:
++                before = torch._C._host_trace_kernel_node_sets() + torch._C._host_trace_memory_node_sets()
++                self.assertEqual(f(xs[n]), long_chain(xs[n]), atol=0, rtol=0)
++                sets.append(torch._C._host_trace_kernel_node_sets() + torch._C._host_trace_memory_node_sets() - before)
++            torch.cuda.synchronize()
++            self.assertEqual((f.traces, f.eager, len(f.variants)), (1, 0, 1))
++            (v,) = f.variants
++            return torch.cuda.max_memory_allocated() - base, sets, torch._C._host_trace_split_counts()[0] - calls, v
++
++        self.split(False, first_nodes=4)
++        whole = run(False)
++        split = run(True)
++        self.assertEqual((whole[0], whole[1], whole[2]), (split[0], split[1], 0))
++        self.assertEqual(split[2], 8)
++        v = split[3]
++        bounds = torch._C._host_trace_split_bounds(v.native, 0, 0)
++        n = len(v.captured.lowered.launches)
++        self.assertEqual((bounds[0], bounds[-1]), (0, n))
++        self.assertGreater(len(bounds), 2)
++        self.assertTrue(set(bounds[1:-1]) <= set(dict(split_cuts(v.captured.lowered))[0]), bounds)
++        self.assertEqual(torch._C._host_trace_split_bounds(whole[3].native, 0, 0), [])
++
++    def test_a_same_size_call_sets_no_node(self):
++        # a repeat of a size and its tensors re-sets nothing in any section: every section launches as it is
++        self.split(first_nodes=4)
+         f = HostTraceReplay(long_chain)
+         xs = {n: torch.randn(n, device="cuda") for n in (4096, 8192)}
+-        for n in (4096, 8192, 4096, 8192):
++        for n in (4096, 8192, 4096):
+             self.assertEqual(f(xs[n]), long_chain(xs[n]), atol=0, rtol=0)
+-        modes = []
+-        for n in (4096, 4096, 8192, 8192, 4096):
+-            calls = torch._C._host_trace_split_counts()[0]
++        sets = []
++        for n in (4096, 4096, 8192, 8192):
++            before = torch._C._host_trace_kernel_node_sets() + torch._C._host_trace_memory_node_sets()
+             self.assertEqual(f(xs[n]), long_chain(xs[n]), atol=0, rtol=0)
+-            modes.append(torch._C._host_trace_split_counts()[0] - calls)
+-        # a size change splits; the whole exec catches up behind the split calls
+-        self.assertIn(1, modes)
+-        self.assertEqual((f.traces, f.eager, len(f.variants)), (1, 0, 1))
+-
+-    def test_an_args_only_call_launches_whole(self):
+-        # with the split on, calls at one size with fresh tensors (pointers
+-        # move, no launch configuration does) launch the whole exec; a size
+-        # change launches split. Outputs bitwise
+-        old = torch._C._host_trace_split(0)
+-        self.addCleanup(torch._C._host_trace_split, old)
++            sets.append(torch._C._host_trace_kernel_node_sets() + torch._C._host_trace_memory_node_sets() - before)
++        self.assertEqual((sets[1], sets[3]), (0, 0), sets)
++        self.assertGreater(sets[2], 0, sets)
++
++    @parametrize("policy", [{}, {"first_nodes": 3}, {"max_nodes": 5}, {"sections": 2, "ratio": 2.0}])
++    def test_the_split_policy_places_sections_at_legal_cuts(self, policy):
++        # the auto policy (sections growing by the ratio in re-settable records) and the node-count knobs place every
++        # bound at a legal cut; a section of at most max_nodes records unless no cut is nearer
++        self.split(**policy)
+         f = HostTraceReplay(long_chain)
+-        for _ in range(3):
+-            x = torch.randn(4096, device="cuda")
+-            self.assertEqual(f(x), long_chain(x), atol=0, rtol=0)
+-        modes = []
+-        for n in (4096, 4096, 4096, 8192):
++        for n in (4096, 8192, 4096):
+             x = torch.randn(n, device="cuda")
+-            calls = torch._C._host_trace_split_counts()[0]
+             self.assertEqual(f(x), long_chain(x), atol=0, rtol=0)
+-            modes.append(torch._C._host_trace_split_counts()[0] - calls)
+-        self.assertEqual(modes, [0, 0, 0, 1])
+-
+-    def test_a_split_variant_returns_to_whole_after_catch_up(self):
+-        # after sizes alternate (every call split), repeats of one size set the
+-        # whole exec's stale nodes behind the split launches, a few per call,
+-        # until its patch set is small: those calls launch it whole again
+-        old = torch._C._host_trace_split(4)
+-        self.addCleanup(torch._C._host_trace_split, old)
+-        catch_up = torch._C._host_trace_split_catch_up(6)
+-        self.addCleanup(torch._C._host_trace_split_catch_up, catch_up)
+-        f = HostTraceReplay(long_chain)
+-        xs = {n: torch.randn(n, device="cuda") for n in (4096, 8192)}
+-        for n in (4096, 8192) * 3:
+-            self.assertEqual(f(xs[n]), long_chain(xs[n]), atol=0, rtol=0)
+-        modes = []
+-        for _ in range(8):
+-            calls = torch._C._host_trace_split_counts()[0]
+-            self.assertEqual(f(xs[4096]), long_chain(xs[4096]), atol=0, rtol=0)
+-            modes.append(torch._C._host_trace_split_counts()[0] - calls)
+-        # split until the whole exec caught up (20 records, 6 per call), then whole
+-        self.assertEqual(modes[-3:], [0, 0, 0], modes)
+-        self.assertEqual(modes[0], 1, modes)
++        (v,) = f.variants
++        bounds = torch._C._host_trace_split_bounds(v.native, 0, 0)
++        cuts = dict(split_cuts(v.captured.lowered))[0]
++        n = len(v.captured.lowered.launches)
++        if not bounds:
++            # the auto policy's first section needs at least 16 records: a graph this small may not split
++            self.assertFalse({"first_nodes", "max_nodes"} & policy.keys(), policy)
++            return
++        self.assertEqual((bounds[0], bounds[-1]), (0, n))
++        self.assertTrue(set(bounds[1:-1]) <= set(cuts), (bounds, cuts))
++        if "max_nodes" in policy:
++            self.assertTrue(all(b - a <= 5 or not any(a < c < b for c in cuts if c - a <= 5) for a, b in zip(bounds, bounds[1:])), bounds)
++        if "first_nodes" in policy:
++            self.assertEqual(bounds[1], min(c for c in cuts if c >= 3))
++        if "sections" in policy:
++            self.assertLessEqual(len(bounds) - 1, 2)
+ 
+     @parametrize("slots", [0, 3])
+     def test_alternating_sizes_take_their_kept_rows(self, slots):
+@@ -5141,6 +5358,38 @@
+                 self.assertEqual(len(_sinks(clone)), 1)
+         self.assert_concurrent(f)
+ 
++    def test_no_section_starts_inside_a_fork(self):
++        # a cut only where every forked side stream has joined back: with sections of at most two records, no bound
++        # falls after a side launch before its join. Outputs bitwise
++        old = torch._C._host_trace_split(True)
++        self.addCleanup(torch._C._host_trace_split, old)
++        old_policy = torch._C._host_trace_split_policy(max_nodes=2)
++        self.addCleanup(lambda: torch._C._host_trace_split_policy(*old_policy))
++
++        def fn(x, w):
++            side, cur = _side("inline"), torch.cuda.current_stream()
++            y = add(add(x))
++            side.wait_stream(cur)
++            with torch.cuda.stream(side):
++                s = add(add(y), 2)
++            z = add(y, 4)
++            cur.wait_stream(side)
++            return (add(add(z + s)),)
++
++        f = self.sweep(fn)
++        for v in f.variants:
++            lowered = v.captured.lowered
++            bounds = torch._C._host_trace_split_bounds(v.native, 0, 0)
++            self.assertGreater(len(bounds), 2)
++            streams, seqs = lowered.streams, [lo.seq for lo in lowered.launches]
++            inside = set()
++            for j, k in enumerate(streams.stream):
++                if k:
++                    end = streams.span[j][1]
++                    join = len(seqs) if end == math.inf else bisect.bisect_left(seqs, end)
++                    inside.update(range(j + 1, join + 1))
++            self.assertFalse(inside & set(bounds[1:-1]), (bounds, sorted(inside)))
++
+     def test_two_side_streams(self):
+         def fn(x, w):
+             a, b, cur = _side("a"), _side("b", priority=-1), torch.cuda.current_stream()
+@@ -5403,6 +5652,7 @@
+         self.assertEqual(torch.cuda.memory_allocated(), device)
+ 
+ instantiate_parametrized_tests(TestSideStreams)
++instantiate_parametrized_tests(TestReplayCounters)
+ instantiate_parametrized_tests(TestReplayMemory)
+ instantiate_parametrized_tests(TestNativeReplay)
+ instantiate_parametrized_tests(TestEntryParity)
+diff -ruN -x __pycache__ -x TREE.txt step_ms15/torch/cuda/_host_trace_lower.py step_ms16/torch/cuda/_host_trace_lower.py
+--- a/torch/cuda/_host_trace_lower.py	2026-10-15 20:03:55.867705325 -0700
++++ b/torch/cuda/_host_trace_lower.py	2026-10-16 10:43:33.814739482 -0700
+@@ -189,10 +189,12 @@
+         return None
+ 
+     def _all(self, rows: Iterable[int]) -> int:
+-        result = self._constant(1)
+-        for row in rows:
+-            result = self._emit("and", result, row)
+-        return result
++        # a balanced tree of ands (the constant 1 its first leaf): a call that changes one guard re-evaluates the
++        # ands above it, about log2 of the guards, not every and after it in a chain
++        level = [self._constant(1), *rows]
++        while len(level) > 1:
++            level = [self._emit("and", *level[i : i + 2]) if i + 1 < len(level) else level[i] for i in range(0, len(level), 2)]
++        return level[0]
+ 
+     def _chain(self, op: str, rows: list[int]) -> int:
+         result = rows[0]
+diff -ruN -x __pycache__ -x TREE.txt step_ms15/torch/cuda/_host_trace_lower_tape.py step_ms16/torch/cuda/_host_trace_lower_tape.py
+--- a/torch/cuda/_host_trace_lower_tape.py	2026-10-15 21:32:38.952551711 -0700
++++ b/torch/cuda/_host_trace_lower_tape.py	2026-10-16 09:50:16.779635538 -0700
+@@ -382,6 +382,8 @@
+         # per section temporary the native places in its run's buffer (_host_trace_memory.section_seqs), (its run's
+         # step, the seq it is made at, the seq of its last use)
+         self.placed_sections: dict[int, tuple[int, int, int]] = {}
++        # per step, (its plan StepMemory, its events' sorted keys) for _host_trace_memory.section_places
++        self.section_keys: dict[int, tuple[Any, list]] = {}
+         # redo templates (_host_trace_redispatch): an entry by what its op's redo reads, rows of this program; and the
+         # entries instantiated from them and redone in full
+         self.templates: dict[Any, Any] = {}
+diff -ruN -x __pycache__ -x TREE.txt step_ms15/torch/cuda/_host_trace_memory.py step_ms16/torch/cuda/_host_trace_memory.py
+--- a/torch/cuda/_host_trace_memory.py	2026-10-15 21:32:38.952949826 -0700
++++ b/torch/cuda/_host_trace_memory.py	2026-10-16 09:50:16.779131823 -0700
+@@ -617,14 +617,23 @@
+     after the op's first launch. As eager makes them inside the op and frees them as it returns."""
+     step = next(i for i, s in enumerate(lowered.steps) if isinstance(s, range) and nodes[0] in s)
+     m, first, last = plan.steps[step], lowered.span(nodes[0])[0], lowered.span(nodes[-1])[1]
+-    seqs = _first_seqs(lowered)
++    # per step of the plan, its events' keys sorted (a count below a key is a bisection): made once per plan, as
++    # each section entry of each redispatch places its temporaries
++    cached = lowered.lowering.section_keys.get(step)
++    if cached is None or cached[0] is not m:
++        seqs = _first_seqs(lowered)
++        if not m.order:
++            keys = sorted((seqs[k], 0) for k in m.tensors)
++        else:
++            n = len(lowered.allocations)
++            ends = {-1 - k: end for k, _, end in m.temporaries} | {-1 - n - a: seq for a, seq in m.freed}
++            keys = sorted((seqs[e], 0) if e >= 0 else (ends[e], 1) for e in m.order)
++        cached = lowered.lowering.section_keys[step] = (m, keys)
++    keys = cached[1]
+     if not m.order:
+-        at = sum(seqs[k] < first for k in m.tensors)
++        at = bisect.bisect_left(keys, (first, 0))
+         return at, at
+-    n = len(lowered.allocations)
+-    ends = {-1 - k: end for k, _, end in m.temporaries} | {-1 - n - a: seq for a, seq in m.freed}
+-    keys = [(seqs[e], 0) if e >= 0 else (ends[e], 1) for e in m.order]
+-    return sum(k < (first, 0) for k in keys), sum(k < (last, 2) for k in keys)
++    return bisect.bisect_left(keys, (first, 0)), bisect.bisect_left(keys, (last, 2))
+ 
+ 
+ def _nbytes(lowered: LoweredTape) -> list[int]:
+diff -ruN -x __pycache__ -x TREE.txt step_ms15/torch/cuda/_host_trace_replay.py step_ms16/torch/cuda/_host_trace_replay.py
+--- a/torch/cuda/_host_trace_replay.py	2026-10-16 07:41:01.138666191 -0700
++++ b/torch/cuda/_host_trace_replay.py	2026-10-16 11:10:43.186274338 -0700
+@@ -470,11 +470,17 @@
+     band (_learn); a learning variant (one with opaque calls) traces the call
+     again, as it does where its selectors select nothing.
+     The first `static_prefix` arguments are expected to be the same tensors
+-    at every call (a model's parameters): a call whose leading arguments are
+-    the last hit's objects with the same metadata (data_ptr, sizes, strides,
+-    dtype, ...) keys and evaluates only the other arguments, taking the
+-    leading ones' rows from that hit (static_hits counts these); any change
+-    takes the full path.
++    at every call (a model's parameters) and are trusted: a call whose
++    leading arguments are the last full hit's objects keys and evaluates only
++    the other arguments, taking the leading ones' rows from that hit
++    (static_hits counts these), without re-reading their metadata or
++    addresses. Another object takes the full path; an in-place change to one
++    (set_, .data =, a layout change) needs statics_changed(), after which the
++    next call checks them in full. Objects are compared by address, so a
++    static freed and another object allocated at its address is a change to
++    it as well: it needs statics_changed(). torch._C.
++    _host_trace_trusted_statics_check (debugging) re-checks their layout at
++    every call.
+ 
+     With `fullgraph`, as torch.compile's, no call falls back and no tape
+     breaks: where a call would run eagerly (a decline, an argument the
+@@ -620,6 +626,10 @@
+         self.redo_instances = 0
+         # redispatches refused at once: the call holds a section refusal's predicate (_Variant.refused_sections)
+         self.refused_again = 0
++        # calls the Python slow path served from an existing variant with no trace, redispatch or relower (a keyed
++        # site's row filled from a binding the provider holds counts): each one a hit the native entry should have
++        # served (the runtime is C++; Python is for a genuine miss)
++        self.slow_hits = 0
+         # why each trace after the first traced: (class, op, guard, the user's line, refusal) -> count. Class "meta": a
+         # graph guard an op recorded (its outputs' metadata); "dispatch": an op's own guard failed and its
+         # redispatch refused (refusal); "graph": a guard no op recorded; "contract": no variant of the
+@@ -769,6 +779,7 @@
+             outcome, result = self._call_native(variant, args)
+             # MEMORY_KIND: the variant's memcpy nodes are of the other kind of memory than an argument
+             if outcome not in (MISS, MEMORY_KIND):
++                self.slow_hits += outcome == HIT and not (variant.learns and final)
+                 return self._served(variant.native, outcome, result, args)
+         # no variant holds the call: one whose graph guards do gains its
+         # failing selectors' entries from their ops dispatched again

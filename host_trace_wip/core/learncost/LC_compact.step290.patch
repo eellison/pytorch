@@ -1,0 +1,119 @@
+diff -ruN a/test/test_cuda_host_trace_harvest.py b/test/test_cuda_host_trace_harvest.py
+--- a/test/test_cuda_host_trace_harvest.py	2026-10-12 08:19:38.506914552 -0700
++++ b/test/test_cuda_host_trace_harvest.py	2026-10-12 08:19:38.552558776 -0700
+@@ -129,6 +129,22 @@
+             self.assertBitwise(_replay(binding, operands), ref)
+         return binding
+ 
++    def test_bindings_share_the_parts_they_repeat(self):
++        # keys that differ in M take the same kernels with the same slots and
++        # parameter layouts: their bindings hold them once (_compact), and
++        # each still replays bitwise
++        p = HarvestProvider()
++        b = torch.randn(768, 1024, device="cuda", dtype=bf16)
++        bindings = [
++            self.assertRebinds(p, aten.mm.default, lambda m=m: ((torch.randn(m, 768, device="cuda", dtype=bf16), b), {}))
++            for m in (200, 201)
++        ]
++        pairs = [(x, y) for x, y in zip(*(binding.nodes for binding in bindings)) if isinstance(x, OpaqueKernel) and x.slots == y.slots]
++        self.assertTrue(pairs)
++        for x, y in pairs:
++            self.assertIs(x.slots, y.slots)
++            self.assertIs(x.params, y.params)
++
+     def test_mm_sweep(self):
+         # nvjet's choice changes across M (at 73, 80 and 96 among others) and
+         # small M takes split-K (nvjet into the workspace, then cublasLt's
+diff -ruN a/torch/cuda/_host_trace_harvest.py b/torch/cuda/_host_trace_harvest.py
+--- a/torch/cuda/_host_trace_harvest.py	2026-10-12 08:19:38.502131134 -0700
++++ b/torch/cuda/_host_trace_harvest.py	2026-10-12 08:19:38.504662636 -0700
+@@ -612,6 +612,9 @@
+         "torch": (torch.__version__, torch.version.git_version, torch.version.cuda),
+         "libraries": _libraries(),
+         "versions": dict(versions or {}),
++        # 2: Slot, OpaqueKernel and OpaqueMemset have __slots__, which a
++        # version 1 file's dict states do not unpickle into
++        "format": 2,
+     }
+ 
+ 
+@@ -714,6 +717,9 @@
+         self.functions: dict[tuple[int, str], int] = {}
+         self.restored = 0
+         self.stale: list[str] = []
++        # each distinct slot, slot tuple, launch shape and parameter layout
++        # of the bindings, held once (_compact)
++        self._interned: dict[Any, Any] = {}
+ 
+     def accepts(self, op: Any, args: tuple, kwargs: dict) -> str | None:
+         if self.disabled is not None:
+@@ -809,9 +815,30 @@
+         if not entries or not _same_meta(data["meta"], _meta(entries[0][0][7], versions)):
+             return 0
+         for k, b in entries:
+-            self.stored[_local(k)] = b
++            self.stored[_local(k)] = self._compact(b)
+         return len(entries)
+ 
++    def _compact(self, binding: OpaqueBinding) -> OpaqueBinding:
++        """binding with its parts that other bindings repeat (slots, launch
++        shapes and parameter layouts) shared with theirs: keys that differ in
++        a size share all but their parameter images, so a binding holds a few
++        objects of its own, for the memory and the collector's passes."""
++        intern = self._interned.setdefault
++
++        def kernel(n: OpaqueKernel) -> OpaqueKernel:
++            return dataclasses.replace(
++                n,
++                grid=intern(n.grid, n.grid),
++                block=intern(n.block, n.block),
++                attributes=intern(n.attributes, n.attributes),
++                params=intern(n.params, n.params),
++                slots=intern(slots := tuple(intern(t, t) for t in n.slots), slots),
++                loose=intern(n.loose, n.loose),
++            )
++
++        nodes = tuple(kernel(n) if isinstance(n, OpaqueKernel) else dataclasses.replace(n, dst=intern(n.dst, n.dst)) for n in binding.nodes)
++        return dataclasses.replace(binding, nodes=nodes, scratch=intern(binding.scratch, binding.scratch))
++
+     def _resolved(self, k: tuple, device: int) -> OpaqueBinding | None:
+         stored = self.stored[k]
+         names = [n.function for n in stored.nodes if isinstance(n, OpaqueKernel)]
+@@ -986,6 +1013,7 @@
+                                 raise
+                     if binding is None:
+                         binding = self._harvest(key, args, kwargs, operands)
++                    binding = self._compact(binding)
+                     if sibling:
+                         self.templates.setdefault(group, {}).setdefault(_signature(binding.nodes), binding)
+             except _Disabled as e:
+diff -ruN a/torch/cuda/_host_trace_opaque.py b/torch/cuda/_host_trace_opaque.py
+--- a/torch/cuda/_host_trace_opaque.py	2026-10-12 08:19:38.502257054 -0700
++++ b/torch/cuda/_host_trace_opaque.py	2026-10-12 08:19:38.504778092 -0700
+@@ -116,7 +116,7 @@
+             set_(p)
+ 
+ 
+-@dataclass(frozen=True)
++@dataclass(frozen=True, slots=True)
+ class Slot:
+     """Bytes of a node a replay writes per call: an address plus `delta`."""
+ 
+@@ -131,7 +131,7 @@
+     delta: int
+ 
+ 
+-@dataclass(frozen=True)
++@dataclass(frozen=True, slots=True)
+ class OpaqueKernel:
+     function: int  # CUfunction handle
+     grid: tuple[int, int, int]
+@@ -149,7 +149,7 @@
+     loose: tuple[tuple[int, int, int], ...] = ()
+ 
+ 
+-@dataclass(frozen=True)
++@dataclass(frozen=True, slots=True)
+ class OpaqueMemset:
+     dst: Slot
+     value: int

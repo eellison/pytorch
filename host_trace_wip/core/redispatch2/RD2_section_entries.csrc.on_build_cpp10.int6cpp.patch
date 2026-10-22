@@ -1,0 +1,524 @@
+--- a/torch/csrc/cuda/host_trace/EagerStep.cpp
++++ b/torch/csrc/cuda/host_trace/EagerStep.cpp
+@@ -148,6 +148,19 @@
+   return t;
+ }
+ 
++bool HostTraceVariant::dropped(int64_t k, const Frame& frame) const {
++  const int64_t site = allocations_[k].owner;
++  if (site < 0) {
++    return false;
++  }
++  const int64_t row = frame.site_entries[site];
++  if (row <= 0) {
++    return false;
++  }
++  const auto& drops = sites_[site].entries[row - 1]->drops;
++  return std::find(drops.begin(), drops.end(), k) != drops.end();
++}
++
+ int64_t HostTraceVariant::alloc_bytes(int64_t k, const Frame& frame) const {
+   const Allocation& a = allocations_[k];
+   if (a.site >= 0) {
+@@ -156,10 +169,14 @@
+       return sites_[a.site].entries[row - 1]->scratch[a.scratch];
+     }
+   }
+-  return frame.values[a.nbytes];
++  return dropped(k, frame) ? 0 : frame.values[a.nbytes];
+ }
+ 
+ void HostTraceVariant::allocate_tensor(int64_t k, Frame& frame) const {
++  if (dropped(k, frame)) {
++    frame.bases[k] = 0;
++    return;
++  }
+   const int64_t* v = frame.values.data();
+   const Allocation& a = allocations_[k];
+   c10::SmallVector<int64_t, 8> sizes, strides;
+@@ -190,15 +207,43 @@
+     const StepMemory& memory,
+     const Segment* run,
+     Frame& frame,
+-    std::unique_lock<std::recursive_mutex>& hold) const {
++    std::unique_lock<std::recursive_mutex>& hold,
++    c10::SmallVector<c10::DataPtr, 4>& held) const {
++  auto* allocator = at::cuda::getCUDADeviceAllocator();
++  // the run's selected sections with temporaries, by their place in the order
++  c10::SmallVector<const Entry*, 4> sections;
++  for (size_t i = 0; run && i < run->sections.size(); ++i) {
++    const Site& s = sites_[run->sections[i]];
++    const int64_t row = frame.site_entries[run->sections[i]];
++    if (row > 0 && !s.entries[row - 1]->temporaries.empty()) {
++      sections.push_back(s.entries[row - 1].get());
++    }
++  }
++  std::sort(sections.begin(), sections.end(), [](const Entry* a, const Entry* b) {
++    return a->alloc_at < b->alloc_at;
++  });
++  auto make = [&](const Entry& e, c10::SmallVector<c10::DataPtr, 4>& into) {
++    for (size_t j = 0; j < e.temporaries.size(); ++j) {
++      into.push_back(allocator->allocate(frame.values[e.temporaries[j]]));
++      frame.bases[e.first_base + j] = reinterpret_cast<int64_t>(into.back().get());
++    }
++  };
+   // Eager order frees a temporary before its run's graph is queued, so the
+   // allocator stays locked until the launch: another thread's allocation on
+   // the stream would take a freed temporary's bytes and queue its kernels
+   // ahead of the graph. A segment released meanwhile (our own allocation's
+   // OOM retry or garbage collection) may have taken them too, and replay
+   // hooks run Python before the launch: then the temporaries go in a run
+-  // buffer, the tensors keep their addresses and nothing has launched.
+-  if (memory.order.empty() || observed(*run)) {
++  // buffer, the tensors keep their addresses and nothing has launched. A
++  // section's temporaries are made and freed where its op's are, in eager
++  // order or, a run of no temporaries, among its tensors; else before the
++  // run's own allocations (no block of one of its temporaries is free yet),
++  // held until it is queued.
++  const bool observed_run = run && observed(*run);
++  if (observed_run || (memory.order.empty() && (sections.empty() || !memory.temporaries.empty()))) {
++    for (const Entry* e : sections) {
++      make(*e, held);
++    }
+     int64_t pt = phase_now();
+     for (int64_t k : memory.tensors) {
+       allocate_tensor(k, frame);
+@@ -211,10 +256,31 @@
+   hold = c10::cuda::CUDACachingAllocator::lockDeviceAllocator(device_);
+   const size_t releases =
+       c10::cuda::CUDACachingAllocator::getSegmentReleaseCount();
+-  auto* allocator = at::cuda::getCUDADeviceAllocator();
+   c10::SmallVector<c10::DataPtr, 16> blocks;
+   blocks.resize(memory.temporaries.size());
+-  for (const Event& e : memory.order) {
++  c10::SmallVector<c10::DataPtr, 4> made;
++  c10::SmallVector<size_t, 4> starts;
++  const size_t n = memory.order.empty() ? memory.tensors.size() : memory.order.size();
++  for (size_t p = 0; p <= n; ++p) {
++    for (size_t s = 0; s < sections.size(); ++s) {
++      if (sections[s]->alloc_at == p) {
++        starts.push_back(made.size());
++        make(*sections[s], made);
++      }
++      if (sections[s]->free_at == p) {
++        for (size_t j = 0; j < sections[s]->temporaries.size(); ++j) {
++          made[starts[s] + j].clear();
++        }
++      }
++    }
++    if (p == n) {
++      break;
++    }
++    if (memory.order.empty()) {
++      allocate_tensor(memory.tensors[p], frame);
++      continue;
++    }
++    const Event& e = memory.order[p];
+     if (e.op == Op::Tensor) {
+       allocate_tensor(e.alloc, frame);
+     } else if (e.op == Op::Temporary) {
+@@ -228,6 +294,9 @@
+     return at::Tensor();
+   }
+   ++buffered_runs;
++  for (const Entry* e : sections) {
++    make(*e, held);
++  }
+   return run_buffer(memory, frame);
+ }
+ 
+--- a/torch/csrc/cuda/host_trace/Entry.cpp
++++ b/torch/csrc/cuda/host_trace/Entry.cpp
+@@ -64,8 +64,13 @@
+     const bool run = i < steps_.size() && steps_[i].segment >= 0;
+     std::unique_lock<std::recursive_mutex> hold;
+     pt = phase_now();
++    c10::SmallVector<c10::DataPtr, 4> sections;
+     at::Tensor scratch = allocate(
+-        memory, run ? &segments_[steps_[i].segment] : nullptr, frame, hold);
++        memory,
++        run ? &segments_[steps_[i].segment] : nullptr,
++        frame,
++        hold,
++        sections);
+     bool misaligned = false;
+     for (int64_t k : memory.tensors) {
+       misaligned |= frame.bases[k] % kAlignment != 0;
+@@ -107,6 +112,7 @@
+     // the buffer's bytes are freed after the run's graph is queued, so
+     // stream-ordered after every kernel that uses them
+     scratch.reset();
++    sections.clear();
+     for (int64_t b : memory.drops) {
+       frame.tensors[b].reset();
+     }
+@@ -1674,7 +1680,12 @@
+           &HostTraceVariant::add_entry,
+           py::arg("site"),
+           py::arg("predicate"),
+-          py::arg("nodes"))
++          py::arg("nodes"),
++          py::arg("arm") = 0,
++          py::arg("temporaries") = std::vector<int64_t>(),
++          py::arg("drops") = std::vector<int64_t>(),
++          py::arg("alloc_at") = 0,
++          py::arg("free_at") = 0)
+       .def(
+           "set_program",
+           &HostTraceVariant::set_program,
+@@ -1695,6 +1706,8 @@
+   initHostTraceAtenBindings(m);
+   // the native encode takes a descriptor's fill and Triton flavor
+   m.attr("_host_trace_tma_flavors") = true;
++  // add_entry takes sections: nodes of their own and temporaries
++  m.attr("_host_trace_section_entries") = true;
+   // and launches the driver's map as is (a descriptor's library bits)
+   m.attr("_host_trace_tma_raw") = true;
+   m.def("_host_trace_global_state", [] {
+--- a/torch/csrc/cuda/host_trace/Patch.cpp
++++ b/torch/csrc/cuda/host_trace/Patch.cpp
+@@ -438,7 +438,8 @@
+         run.forms.size() > 1 ? frame.forms[g] : 0;
+     for (size_t i = run.first; i < run.stop; ++i) {
+       Record& r = records_[i];
+-      if (r.kind != Kind::Memcpy) {
++      // an entry's memcpy (a section's, in its piece) is set by its row in patch
++      if (r.kind != Kind::Memcpy || (r.site >= 0 && frame.site_entries[r.site] != 0)) {
+         continue;
+       }
+       // an argument's address is its row's value; another operand keeps the
+@@ -550,10 +551,11 @@
+       return;
+     }
+     if (r.kind == Kind::Memcpy) {
+-      const std::array<int64_t, 3> held = memcpy_shape(r.copy, v, bases);
++      const MemcpyRow& m = memcpy_row(r, row);
++      const std::array<int64_t, 3> held = memcpy_shape(m, v, bases);
+       // a device node holds its operands' addresses; a host one is set every
+       // replay (index_users)
+-      if (r.held && r.held_row == row && held == r.held_copy && r.copy.kind == cudaMemcpyDeviceToDevice) {
++      if (r.held && r.held_row == row && held == r.held_copy && m.kind == cudaMemcpyDeviceToDevice) {
+         return;
+       }
+       r.held = false;
+@@ -564,7 +566,7 @@
+           reinterpret_cast<void*>(held[0]),
+           reinterpret_cast<const void*>(held[1]),
+           static_cast<size_t>(held[2]),
+-          r.copy.kind);
++          m.kind);
+       if (set == cudaErrorInvalidValue) {
+         // an operand of the other kind of memory: the node is unchanged
+         (void)cudaGetLastError();
+--- a/torch/csrc/cuda/host_trace/Sites.cpp
++++ b/torch/csrc/cuda/host_trace/Sites.cpp
+@@ -3,6 +3,7 @@
+ #if !defined(USE_ROCM)
+ #include <torch/csrc/autograd/python_variable.h>
+ 
++#include <c10/util/ScopeExit.h>
+ #include <c10/util/SmallVector.h>
+ 
+ #include <algorithm>
+@@ -77,6 +78,13 @@
+                   : sites_[r.site].entries[row - 1]->kernels[r.site_pos];
+ }
+ 
++const HostTraceVariant::MemcpyRow& HostTraceVariant::memcpy_row(
++    const Record& r,
++    int64_t row) const {
++  return row == 0 ? r.copy
++                  : sites_[r.site].entries[row - 1]->memcpys[r.site_pos];
++}
++
+ const HostTraceVariant::MemsetRow& HostTraceVariant::memset_row(
+     const Record& r,
+     int64_t row) const {
+@@ -551,7 +559,7 @@
+       rows[i] = s.rows[found];
+     }
+   }
+-  if (missing.empty()) {
++  if (missing.empty() && unselected.empty()) {
+     c10::SmallVector<int32_t, 8> arms;
+     for (size_t g : armed_) {
+       if (form_of(segments_[g], rows.data(), arms) < 0) {
+@@ -566,24 +574,85 @@
+ void HostTraceVariant::add_entry(
+     size_t site,
+     int64_t predicate,
+-    py::handle nodes) {
++    py::handle nodes,
++    int32_t arm,
++    const std::vector<int64_t>& temporaries,
++    const std::vector<int64_t>& drops,
++    int64_t alloc_at,
++    int64_t free_at) {
+   TORCH_CHECK_VALUE(
+       site < sites_.size() && !sites_[site].predicates.empty(),
+       "no selector ",
+       site);
+   Site& s = sites_[site];
+   auto t = nodes.cast<py::tuple>();
++  const bool piece = arm != 0;
+   TORCH_CHECK_VALUE(
+-      t.size() == s.records.size(), "an entry of ", t.size(), " nodes");
++      arm >= 0 &&
++          (piece ? t.size() > 0 && !s.records.empty()
++                 : t.size() == s.records.size() && temporaries.empty() &&
++                 drops.empty()),
++      "an entry of ",
++      t.size(),
++      " nodes");
+   auto e = std::make_unique<Entry>();
++  e->arm = arm;
++  for (int64_t row : temporaries) {
++    e->temporaries.push_back(check_row(row));
++  }
++  if (piece) {
++    // its places in its run's order: of its events, or of its tensors
++    const auto step = std::find_if(steps_.begin(), steps_.end(), [&](const Step& x) {
++      return x.segment == static_cast<int64_t>(s.segment);
++    });
++    TORCH_CHECK_VALUE(step != steps_.end(), "a section outside the runs");
++    const StepMemory& m = memory_[step - steps_.begin()];
++    const size_t n = m.order.empty() ? m.tensors.size() : m.order.size();
++    TORCH_CHECK_VALUE(
++        alloc_at >= 0 && alloc_at <= free_at && static_cast<size_t>(free_at) <= n,
++        "a section's places ",
++        alloc_at,
++        ", ",
++        free_at);
++    e->alloc_at = static_cast<size_t>(alloc_at);
++    e->free_at = static_cast<size_t>(free_at);
++  }
++  for (int64_t k : drops) {
++    TORCH_CHECK_VALUE(
++        k >= 0 && static_cast<size_t>(k) < n_alloc_ &&
++            (allocations_[k].owner < 0 ||
++             allocations_[k].owner == static_cast<int64_t>(site)) &&
++            allocations_[k].site < 0 && !allocations_[k].arena,
++        "a section's dropped allocation ",
++        k);
++    e->drops.push_back(k);
++  }
++  // the temporaries' bases, which its nodes' fields read
++  e->first_base = base_count_;
++  base_count_ += temporaries.size();
++  auto restore = c10::make_scope_exit([&] {
++    if (e) {
++      base_count_ = e->first_base;
++    }
++  });
++  std::vector<Kind> kinds(t.size());
+   e->kernels.resize(t.size());
+   e->memsets.resize(t.size());
++  e->memcpys.resize(t.size());
+   for (size_t i = 0; i < t.size(); ++i) {
+     auto n = t[i].cast<py::tuple>();
+-    const auto kind = static_cast<Kind>(n[0].cast<uint8_t>());
+-    TORCH_CHECK_VALUE(kind != Kind::Memcpy, "an entry's memcpy");
++    const auto kind = kinds[i] = static_cast<Kind>(n[0].cast<uint8_t>());
++    TORCH_CHECK_VALUE(piece || kind != Kind::Memcpy, "an entry's memcpy");
+     TORCH_CHECK_VALUE(
+-        kind == records_[s.records[i]].kind, "an entry's node of another kind");
++        piece || kind == records_[s.records[i]].kind,
++        "an entry's node of another kind");
++    if (kind == Kind::Memcpy) {
++      // a section's memcpy: device to device
++      const auto copy = static_cast<cudaMemcpyKind>(n[4].cast<int>());
++      TORCH_CHECK_VALUE(copy == cudaMemcpyDeviceToDevice, "a section's host memcpy");
++      e->memcpys[i] = {parse_source(n[1]), parse_source(n[2]), check_row(n[3].cast<int64_t>()), copy, -1};
++      continue;
++    }
+     if (kind == Kind::Memset) {
+       MemsetRow& m = e->memsets[i];
+       m.dst = parse_source(n[1]);
+@@ -615,13 +684,26 @@
+   }
+   e->held = e->image;
+   for (size_t i = 0; i < t.size(); ++i) {
+-    if (records_[s.records[i]].kind == Kind::Kernel) {
++    if (kinds[i] == Kind::Kernel) {
+       bind_row(
+           e->kernels[i], e->image.data(), e->held.data(), e->fields.data());
+       e->kernels[i].descriptors =
+           e->descriptors.data() + e->kernels[i].first_descriptor;
+     }
+   }
++  if (piece) {
++    if (std::find(armed_.begin(), armed_.end(), s.segment) == armed_.end()) {
++      armed_.push_back(s.segment);
++    }
++    auto& sections = segments_[s.segment].sections;
++    if (!temporaries.empty() &&
++        std::find(sections.begin(), sections.end(), site) == sections.end()) {
++      sections.push_back(site);
++    }
++  }
++  for (int64_t k : drops) {
++    allocations_[k].owner = static_cast<int64_t>(site);
++  }
+   s.predicates.push_back(check_row(predicate));
+   note_reads(s, *e);
+   s.entries.push_back(std::move(e));
+@@ -777,7 +859,9 @@
+       auto n = h.cast<py::tuple>();
+       Record r{};
+       r.kind = static_cast<Kind>(n[0].cast<uint8_t>());
+-      TORCH_CHECK_VALUE(r.kind != Kind::Memcpy, "a keyed row's memcpy");
++      TORCH_CHECK_VALUE(
++          r.kind != Kind::Memcpy || !sites_[site].predicates.empty(),
++          "a keyed row's memcpy");
+       r.node = reinterpret_cast<CUgraphNode>(n[1].cast<uintptr_t>());
+       r.site = static_cast<int64_t>(site);
+       r.site_pos = pos++;
+--- a/torch/csrc/cuda/host_trace/VariantBuild.cpp
++++ b/torch/csrc/cuda/host_trace/VariantBuild.cpp
+@@ -206,9 +206,7 @@
+       });
+       TORCH_CHECK_VALUE(g != segments_.end(), "a site outside the segments");
+       site.segment = g - segments_.begin();
+-      if (!selector) {
+-        g->sites.push_back(sites_.size());
+-      }
++      g->sites.push_back(sites_.size());
+     }
+     for (size_t pos = 0; pos < site.records.size(); ++pos) {
+       const size_t i = site.records[pos];
+--- a/torch/csrc/cuda/host_trace/Variant.h
++++ b/torch/csrc/cuda/host_trace/Variant.h
+@@ -218,7 +218,7 @@
+   // (rows, [(site, key), ...] the tables lack, [(segment, arms), ...] the
+   // forms lack, [site, ...] the selectors none of whose predicates holds) at
+   // the call, or None when it misses otherwise (a site declines its key); the
+-  // forms only once no key is missing
++  // forms only once no key is missing and every selector selects
+   py::object evaluate_py(py::handle args) const;
+   // Whether the call's rows hold and a pair of its arguments overlaps: the
+   // call runs eagerly
+@@ -236,8 +236,21 @@
+       const std::vector<int64_t>& scratch);
+   // Adds a selector's entry: its nodes (_host_trace_native.launch_row, with
+   // rows for the launch dimensions and memset extents), run where predicate
+-  // holds and no earlier entry's does
+-  void add_entry(size_t site, int64_t predicate, py::handle nodes);
++  // holds and no earlier entry's does. With arm > 0 a section: nodes of their
++  // own in place of the selector's (its forms' pieces); per temporary its
++  // bytes' row, at bases from the base count at the call; the allocations of
++  // the selector's op it does not make (`drops`); and where its temporaries
++  // are made and freed in its run's eager order (before events alloc_at and
++  // free_at; a run of no order or temporaries: in its tensors)
++  void add_entry(
++      size_t site,
++      int64_t predicate,
++      py::handle nodes,
++      int32_t arm,
++      const std::vector<int64_t>& temporaries,
++      const std::vector<int64_t>& drops,
++      int64_t alloc_at,
++      int64_t free_at);
+   // Replaces the program by one that extends it (rows added, for add_entry)
+   void set_program(const HostTraceProgram& program);
+   // Adds a form of the segment: exec, an instantiation of graph, a clone of
+@@ -377,16 +390,25 @@
+     MemcpyRow copy;
+     std::array<int64_t, 3> held_copy; // dst, src, bytes
+   };
+-  // A key's rows, per site node the kernel or memset of the node's kind
++  // A key's rows, per site node the kernel, memset or (a section's) memcpy of
++  // the node's kind
+   struct Entry {
+     std::vector<KernelRow> kernels;
+     std::vector<MemsetRow> memsets;
++    std::vector<MemcpyRow> memcpys;
+     std::vector<Field> fields;
+     std::vector<uint8_t> image;
+     std::vector<uint8_t> held;
+     int32_t arm = 0;
+     std::vector<int64_t> scratch; // bytes per the site's scratch buffer
+     std::vector<Descriptor> descriptors;
++    // a section's temporaries: bytes' rows, at bases first_base, ...; its
++    // op's allocations it does not make; its temporaries' places in the order
++    std::vector<int64_t> temporaries;
++    size_t first_base = 0;
++    std::vector<int64_t> drops;
++    size_t alloc_at = 0;
++    size_t free_at = 0;
+   };
+   // A keyed launch table: per key, filled once, the row its nodes run. A
+   // selector (a top-level op's own guards) has no key: the first of its
+@@ -423,7 +445,8 @@
+     size_t form; // the one whose exec the records' held parameters are of
+     size_t first;
+     size_t stop;
+-    std::vector<size_t> sites; // the keyed sites in it
++    std::vector<size_t> sites; // the keyed sites and selectors in it
++    std::vector<size_t> sections; // its selectors with a section's temporaries
+     // per form but [0]: its graph, the records' nodes in it (null for one a
+     // piece replaced) and the pieces' nodes, as records of their sites
+     struct Clone {
+@@ -461,6 +484,8 @@
+     size_t scratch = 0; // its index in the site's
+     // a planned arena: sized by its plan, so never a site's scratch buffer
+     bool arena = false;
++    // the selector whose op made it, where a section of it does not
++    int64_t owner = -1;
+   };
+   struct Planned {
+     int64_t alloc;
+@@ -575,12 +600,16 @@
+       const Frame& frame,
+       const int64_t* values) const;
+   // The step's allocations; the run buffer holding its temporaries, if any.
+-  // An eager-order run leaves the device's allocator locked in `hold`.
++  // An eager-order run leaves the device's allocator locked in `hold`. The
++  // run's sections' temporaries freed after it is queued go in `held`.
+   at::Tensor allocate(
+       const StepMemory& memory,
+       const Segment* run,
+       Frame& frame,
+-      std::unique_lock<std::recursive_mutex>& hold) const;
++      std::unique_lock<std::recursive_mutex>& hold,
++      c10::SmallVector<c10::DataPtr, 4>& held) const;
++  // whether the call's section of its op does not make allocation k
++  bool dropped(int64_t k, const Frame& frame) const;
+   void allocate_tensor(int64_t k, Frame& frame) const;
+   int64_t alloc_bytes(int64_t k, const Frame& frame) const;
+   at::Tensor run_buffer(const StepMemory& memory, Frame& frame) const;
+@@ -615,6 +644,7 @@
+   void switch_form_held(Segment& run, size_t form);
+   const KernelRow& kernel_row(const Record& r, int64_t row) const;
+   const MemsetRow& memset_row(const Record& r, int64_t row) const;
++  const MemcpyRow& memcpy_row(const Record& r, int64_t row) const;
+   int64_t check_row(int64_t row) const;
+   int64_t check_base(int64_t base) const;
+   // (param, offset, width, pointer, row, base, delta)
+--- a/torch/_C/__init__.pyi.in
++++ b/torch/_C/__init__.pyi.in
+@@ -2581,6 +2581,17 @@
+         piece: _bool = False,
+         scratch: list[_int] = ...,
+     ) -> None: ...
++    def add_entry(
++        self,
++        site: _int,
++        predicate: _int,
++        nodes: tuple[Any, ...],
++        arm: _int = 0,
++        temporaries: list[_int] = ...,
++        drops: list[_int] = ...,
++        alloc_at: _int = 0,
++        free_at: _int = 0,
++    ) -> None: ...
+     def add_form(
+         self, segment: _int, arms: list[_int], exec: _int, graph: _int, pieces: list[Any]
+     ) -> None: ...
+@@ -2708,6 +2719,7 @@
+ def _host_trace_entry_descriptors(enable: _bool) -> None: ...
+ def _host_trace_entry_descriptors_enabled() -> _bool: ...
+ _host_trace_tma_flavors: _bool
++_host_trace_section_entries: _bool
+ _host_trace_tma_raw: _bool
+ def _host_trace_trusted_statics_check(enable: _bool) -> None: ...
+ def _host_trace_delta_changed(variant: _HostTraceVariant) -> list[tuple[_int, _int, _int]]: ...

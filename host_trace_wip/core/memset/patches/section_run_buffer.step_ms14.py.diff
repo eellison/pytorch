@@ -1,0 +1,136 @@
+--- a/torch/cuda/_host_trace_lower_tape.py	2026-10-15 20:03:55.868028751 -0700
++++ b/torch/cuda/_host_trace_lower_tape.py	2026-10-15 21:32:38.952551711 -0700
+@@ -379,6 +379,9 @@
+         self.refused: set[int] = set()
+         # the section temporaries' bases the native variant holds past the tape's (_add_entries counts them)
+         self.sections = 0
++        # per section temporary the native places in its run's buffer (_host_trace_memory.section_seqs), (its run's
++        # step, the seq it is made at, the seq of its last use)
++        self.placed_sections: dict[int, tuple[int, int, int]] = {}
+         # redo templates (_host_trace_redispatch): an entry by what its op's redo reads, rows of this program; and the
+         # entries instantiated from them and redone in full
+         self.templates: dict[Any, Any] = {}
+--- a/torch/cuda/_host_trace_replay.py	2026-10-15 20:03:55.868642578 -0700
++++ b/torch/cuda/_host_trace_replay.py	2026-10-16 07:41:01.138666191 -0700
+@@ -84,7 +84,7 @@
+ from torch.cuda._host_trace_capture import capture_tape, instantiate_form, plain_attributes, section_binding, SegmentFailed
+ from torch.cuda._host_trace_harvest import HarvestProvider
+ from torch.cuda._host_trace_lower_tape import fold, FoldRefused, lower_guards, lower_tape, LoweredMemcpy, LoweredSelector, PointerSlot, PredictedOutput, ScalarSlot
+-from torch.cuda._host_trace_memory import arena_addresses, auto_memory, check_plan, check_section, plan_memory, section_places, relocate, relocate_entries, size_classes, split_runs, SPLITS
++from torch.cuda._host_trace_memory import arena_addresses, auto_memory, check_plan, check_section, plan_memory, section_places, section_seqs, relocate, relocate_entries, size_classes, split_runs, SPLITS
+ from torch.cuda._host_trace_opaque import fill_uniform, key_guards, library_state_as, span_bytes, takes_generator
+ from torch.cuda._host_trace_program import Status
+ from torch.cuda._host_trace_redispatch import redispatch
+@@ -1556,10 +1556,15 @@
+             else:
+                 arms = variant.arms.setdefault(site, [])
+                 arms.append(section_binding(launches, values))
+-                places = section_places(lowered, variant.memory, lowered.selectors[site - len(lowered.sites)].nodes)
++                nodes = lowered.selectors[site - len(lowered.sites)].nodes
++                places = section_places(lowered, variant.memory, nodes)
++                step = next(i for i, s in enumerate(lowered.steps) if isinstance(s, range) and nodes[0] in s)
++                made, last = section_seqs(lowered, variant.memory, step, lowered.span(nodes[0])[0], lowered.span(nodes[-1])[1])
+                 rows = [row for _, row in section.temporaries]
+-                ok = self._native_mutate(variant, "an entry", variant.native.add_entry, site, predicate, tuple(map(launch_row, launches)), len(arms), rows, list(section.drops), *places)
++                ok = self._native_mutate(variant, "an entry", variant.native.add_entry, site, predicate, tuple(map(launch_row, launches)), len(arms), rows, list(section.drops), *places, made, last)
+                 if ok:
++                    if last >= 0:
++                        lowered.lowering.placed_sections.update((b, (step, made, last)) for b, _ in section.temporaries)
+                     lowered.lowering.sections += len(rows)
+                     self.sections += 1
+                     self.section_bytes = max(self.section_bytes, sum(values[row] for row in rows))
+--- a/torch/cuda/_host_trace_memory.py	2026-10-15 16:26:16.325245301 -0700
++++ b/torch/cuda/_host_trace_memory.py	2026-10-15 21:32:38.952949826 -0700
+@@ -547,7 +547,7 @@
+         return "its op's launches are not in one graph"
+     first, last = lowered.span(nodes[0])[0], lowered.span(nodes[-1])[1]
+     own, tape = {b for b, _ in temporaries}, len(lowered.allocations) + len(lowered.eager_roots)
+-    lives = _lifetimes(lowered, plan, step, first, own, drops)
++    lives = _lifetimes(lowered, plan, step, first, last, own, drops)
+     live = _liveness(lowered, plan)
+     reached: dict[Any, None] = {}
+     for lo in launches:
+@@ -573,13 +573,13 @@
+     return None
+ 
+ 
+-def _lifetimes(lowered: LoweredTape, plan: MemoryPlan, step: int, first: float, own: Collection[int], drops: Collection[int]) -> dict[tuple[str, int], tuple[float, float]]:
++def _lifetimes(lowered: LoweredTape, plan: MemoryPlan, step: int, first: float, last_seq: float, own: Collection[int], drops: Collection[int]) -> dict[tuple[str, int], tuple[float, float]]:
+     """The bases of the run of `step` that may share bytes there, each (made, freed) in seqs, as
+     HostTraceVariant::allocate makes them before the run's graph is queued. In "eager" order (a run with
+     an order): its temporaries (made at their seq, freed after their last use), its tensors (never freed
+     in the run), its freed arguments, and a section's own temporaries (made before the op's first launch,
+-    freed after its last). A run buffer's run (temporaries, no order): its temporaries, placed first fit
+-    over their lifetimes; a section's are held over the run. A run of tensors only: its tensors, and a
++    freed after its last). A run buffer's run (temporaries, no order): its temporaries and its sections'
++    (section_seqs), placed first fit over their lifetimes. A run of tensors only: its tensors, and a
+     section's own temporaries, made and freed before the first tensor the op's chain makes. A base absent
+     holds its bytes over the run (made before it, held or relocated, an eager output, a dropped one)."""
+     m = plan.steps[step]
+@@ -590,10 +590,26 @@
+         lives.update((("allocation", k), (seqs[k], math.inf)) for k in m.tensors if k not in skip)
+         section = (first - 0.5, math.inf) if m.order else (first - 0.5, first - 0.5)
+         lives.update((("section", b), section) for b in own)
++    else:
++        lives.update((("section", b), (made + 0.5, last)) for b, (s, made, last) in lowered.lowering.placed_sections.items() if s == step)
++        made, last = section_seqs(lowered, plan, step, first, last_seq)
++        lives.update((("section", b), (made + 0.5, last)) for b in own if last >= 0)
+     lives.update((("argument", a), (-math.inf, seq)) for a, seq in (m.freed if m.order else ()))
+     return lives
+ 
+ 
++def section_seqs(lowered: LoweredTape, plan: MemoryPlan, step: int, first: float, last: float) -> tuple[int, int]:
++    """Where HostTraceVariant::run_buffer places the temporaries of a section over launch seqs [first, last] of
++    run `step`: (the seq they are made at, just before the op's first launch; the seq of their last use, its
++    last launch), first fit with the run's own temporaries, so the next op's take their bytes as eager's do. In
++    a run with an order or no temporaries, or over a side stream's unbounded span: (-1, -1), made before the
++    run and held over it."""
++    m = plan.steps[step]
++    if m.order or not m.temporaries or not (math.isfinite(first) and math.isfinite(last)):
++        return -1, -1
++    return int(first) - 1, int(last)
++
++
+ def section_places(lowered: LoweredTape, plan: MemoryPlan, nodes: Sequence[int]) -> tuple[int, int]:
+     """Where a section of the op of launches `nodes` makes and frees its temporaries in its run's eager
+     order (HostTraceVariant::allocate): before the first event after the op's own allocations, and before
+--- a/test/inductor/test_cudagraph_host_trace.py	2026-10-15 13:17:46.530778049 -0700
++++ b/test/inductor/test_cudagraph_host_trace.py	2026-10-15 21:42:15.038072369 -0700
+@@ -1864,5 +1864,37 @@
+         self.assertLessEqual(ours[0], default[0] + _SLACK)
+         self.assertLessEqual(ours[1], default[2] + workspace + _SLACK)
+ 
++    def test_run_buffer_sections_stay_within_eager_order(self):
++        # a section's temporaries in a run buffer's run take the buffer's bytes over its op's launches, as eager makes
++        # and frees them around its op: sixteen sum ops, each a section at many rows (the split reduction's staging
++        # buffer and semaphores), peak as in eager order, not with sixteen staging buffers live at once
++        def fn(x):
++            out = x.sum(0)
++            for i in range(1, 16):
++                out = out + x.sum(0) * (i + 1)
++            return out
++
++        def peak(call):
++            torch.cuda.synchronize()
++            base = torch.cuda.memory_allocated()
++            torch.cuda.reset_peak_memory_stats()
++            out = call()
++            torch.cuda.synchronize()
++            return torch.cuda.max_memory_allocated() - base, out
++
++        peaks = {}
++        for memory in ("run_buffer", "eager"):
++            f = HostTraceReplay(fn, memory=memory)
++            for t in (100, 300, 5000, 6000):
++                x = torch.randn(t, 512, device="cuda")
++                self.assertEqual(f(x), fn(x), atol=0, rtol=0)
++            x = torch.randn(20000, 512, device="cuda")
++            self.assertEqual(f(x), fn(x), atol=0, rtol=0)
++            peaks[memory], out = peak(lambda: f(x))
++            self.assertEqual(out, fn(x), atol=0, rtol=0)
++            self.assertEqual((f.traces, f.redispatches), (1, 1))
++            self.assertGreater(f.sections, 0)
++        self.assertLessEqual(peaks["run_buffer"], peaks["eager"] + 2**20, peaks)
++
+ if __name__ == "__main__":
+     run_tests()

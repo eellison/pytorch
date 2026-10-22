@@ -1,0 +1,41 @@
+--- a/torch/cuda/_host_trace_redispatch.py
++++ b/torch/cuda/_host_trace_redispatch.py
+@@ -74,7 +74,8 @@
+     their ops dispatched again: fold's result, with no trace. An op whose redo
+     would read what an earlier redo of this variant read (Template), where
+     that entry's predicate holds, takes that entry with its own roots. A
+-    redo routes calls to the replay's `opaque` providers, as its trace did."""
++    redo of an op holding keyed sites routes calls to the replay's `opaque`
++    providers, as its trace did."""
+     lo = lowered.lowering
+     program = lo.program
+     rows = len(program.values)
+@@ -396,6 +397,9 @@
+     # dispatches: the family's dispatches by what they read of their call, each with its fresh symbols and roots
+     old, lo = lowered.tape, lowered.lowering
+     op: OpRec = old.ops[selector.op]
++    # the op's keyed sites (FZ12), in order: its redo routes calls to the providers, as its trace did
++    span = {id(rec): j for j, (_, rec) in enumerate(old.launches[op.launches.start : op.launches.stop])}
++    theirs = sorted((s for s in old.sites if s.nodes and id(s.nodes[0]) in span), key=lambda s: span[id(s.nodes[0])])
+     if op.kind not in ("traced", "eager") or op.redo is None or torch.cuda._host_trace.symbolic != "ir":
+         raise FoldRefused(f"{op.func} has no traced dispatch to run again")
+     # the fresh symbols' env, as _Trace makes one: only a redo that dispatches builds the _Trace and its tensors
+@@ -548,7 +552,7 @@
+         # redo makes its own)
+         fake = vars(_redo_fakes).pop("mode", None) or FakeTensorMode(allow_fallback_kernels=False)
+         fake.fake_tensor_converter = FakeTensorConverter(export=False)
+-        tr = _Trace(old.device, opaque=opaque, fake_mode=fake, shape_env=env)
++        tr = _Trace(old.device, opaque=opaque if theirs else (), fake_mode=fake, shape_env=env)
+         tr.values = CallValues(env, {m.node.node.args[0]: x for m, x in zip(made, at_call)})
+         tr.inputs, tr.arguments = inputs, {id(i.root): i for i in inputs}
+         tr.outer = {k: _TracedTensor(*o) for k, o in outer.items()}
+@@ -589,9 +593,6 @@
+     # its records are the entry's predicate
+     _hint_audit.freeze(env, len(env.records))
+     eager = op.kind == "eager"
+-    # the op's keyed sites (FZ12), in order
+-    span = {id(rec): j for j, (_, rec) in enumerate(old.launches[op.launches.start : op.launches.stop])}
+-    theirs = sorted((s for s in old.sites if s.nodes and id(s.nodes[0]) in span), key=lambda s: span[id(s.nodes[0])])
+     if theirs and any(type(rec) is OpaqueCall for _, rec in tr.launches):
+         # the call bound the sites' keys first (_fill): a nested call whose key none binds is another call
+         raise FoldRefused(f"another keyed site in {op.func}: a call at a key no site binds")

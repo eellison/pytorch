@@ -1,0 +1,99 @@
+diff -ru -x __pycache__ step_ms6/test/test_cuda_host_trace_python_entry.py step_ms7/test/test_cuda_host_trace_python_entry.py
+--- step_ms6/test/test_cuda_host_trace_python_entry.py	2026-10-14 05:35:51.376188991 -0700
++++ step_ms7/test/test_cuda_host_trace_python_entry.py	2026-10-15 12:10:54.548086723 -0700
+@@ -21,7 +21,7 @@
+     # static_prefix, _HostTraceBound and their dirty records
+     "TestStaticPrefix": None,
+     "TestBoundCall": None,
+-    "TestDirtyRecords": ("test_alternating_statics_repatch_their_readers",),
++    "TestDirtyRecords": ("test_alternating_statics_repatch_their_readers", "test_alternating_sizes_take_their_kept_rows"),
+     # a hit enters no Python, its native key and variant order
+     "TestNativeReplay": (
+         "test_a_graphsafe_rng_step_runs_no_python",
+diff -ru -x __pycache__ step_ms6/test/test_cuda_host_trace_replay.py step_ms7/test/test_cuda_host_trace_replay.py
+--- step_ms6/test/test_cuda_host_trace_replay.py	2026-10-15 09:26:40.670497180 -0700
++++ step_ms7/test/test_cuda_host_trace_replay.py	2026-10-15 11:31:40.101961954 -0700
+@@ -4027,11 +4027,12 @@
+ @unittest.skipIf(not has_triton(), "requires triton")
+ @unittest.skipIf(not hasattr(torch._C, "_HostTraceVariant"), "requires the native path")
+ class TestDirtyRecords(TestCase):
+-    @parametrize("threshold", [-1, 0, 1000])
++    @parametrize("threshold", [-1, 0])
+     def test_a_split_replay_is_the_whole_replay(self, threshold):
+-        # torch._C._host_trace_split: past threshold dirty records the segment's
+-        # sub-execs run back to back (each patched while the one before runs);
+-        # -1 off, 0 every call that patches, 1000 never here. Outputs bitwise
++        # torch._C._host_trace_split: a call that changes a launch configuration
++        # of the whole exec (here every call: sizes alternate) runs the
++        # segment's sub-execs back to back, each patched while the one before
++        # runs; -1 off. Outputs bitwise
+         old = torch._C._host_trace_split(threshold)
+         self.addCleanup(torch._C._host_trace_split, old)
+         f = HostTraceReplay(long_chain)
+@@ -4062,6 +4063,24 @@
+         self.assertIn(1, modes)
+         self.assertEqual((f.traces, f.eager, len(f.variants)), (1, 0, 1))
+ 
++    def test_an_args_only_call_launches_whole(self):
++        # with the split on, calls at one size with fresh tensors (pointers
++        # move, no launch configuration does) launch the whole exec; a size
++        # change launches split. Outputs bitwise
++        old = torch._C._host_trace_split(0)
++        self.addCleanup(torch._C._host_trace_split, old)
++        f = HostTraceReplay(long_chain)
++        for _ in range(3):
++            x = torch.randn(4096, device="cuda")
++            self.assertEqual(f(x), long_chain(x), atol=0, rtol=0)
++        modes = []
++        for n in (4096, 4096, 4096, 8192):
++            x = torch.randn(n, device="cuda")
++            calls = torch._C._host_trace_split_counts()[0]
++            self.assertEqual(f(x), long_chain(x), atol=0, rtol=0)
++            modes.append(torch._C._host_trace_split_counts()[0] - calls)
++        self.assertEqual(modes, [0, 0, 0, 1])
++
+     def test_a_split_variant_returns_to_whole_after_catch_up(self):
+         # after sizes alternate (every call split), repeats of one size set the
+         # whole exec's stale nodes behind the split launches, a few per call,
+@@ -4083,6 +4102,30 @@
+         self.assertEqual(modes[-3:], [0, 0, 0], modes)
+         self.assertEqual(modes[0], 1, modes)
+ 
++    @parametrize("slots", [0, 3])
++    def test_alternating_sizes_take_their_kept_rows(self, slots):
++        # a static prefix's delta cache keeps other calls' dynamic rows: sizes
++        # that alternate exchange them in and evaluate no row; without kept rows
++        # each size change evaluates every row that reads the size. Bitwise
++        old = torch._C._host_trace_delta_slots(slots)
++        self.addCleanup(torch._C._host_trace_delta_slots, old)
++
++        def fn(w, x):
++            return five_step(x), add(w)
++
++        f = HostTraceReplay(fn, static_prefix=1)
++        w = torch.randn(1024, device="cuda")
++        xs = {n: torch.randn(n, device="cuda") for n in (4096, 8192)}
++        for n in (4096, 8192) * 3:
++            f(w, xs[n])
++        rows, exchanges = torch._C._host_trace_delta_counts()[3], torch._C._host_trace_delta_exchanges()
++        for n in (4096, 8192) * 4:
++            out = f(w, xs[n])
++            self.assertEqual(out, fn(w, xs[n]), atol=0, rtol=0)
++        rows, exchanges = torch._C._host_trace_delta_counts()[3] - rows, torch._C._host_trace_delta_exchanges() - exchanges
++        self.assertEqual((rows == 0, exchanges == 8), (slots > 0, slots > 0))
++        self.assertEqual((f.traces, len(f.variants)), (1, 1))
++
+     def test_a_variant_that_misses_stops_at_its_valid_row(self):
+         # sizes on either side of the branch, each new: the variant tried first is
+         # the other one, which evaluates its guards' rows only and misses; the
+--- step_ms6/torch/_C/__init__.pyi.in	2026-10-15 09:26:40.669872536 -0700
++++ step_ms7/torch/_C/__init__.pyi.in	2026-10-15 10:16:41.637048775 -0700
+@@ -2711,6 +2711,8 @@
+ def _host_trace_kernel_row_switches() -> _int: ...
+ def _host_trace_tma_cache_hits() -> _int: ...
+ def _host_trace_valid_first_misses() -> _int: ...
++def _host_trace_delta_slots(n: _int | None = None) -> _int: ...
++def _host_trace_delta_exchanges() -> _int: ...
+ def _host_trace_split(threshold: _int | None = None) -> _int: ...
+ def _host_trace_split_counts() -> tuple[_int, _int, _int]: ...
+ def _host_trace_split_catch_up(n: _int | None = None) -> _int: ...

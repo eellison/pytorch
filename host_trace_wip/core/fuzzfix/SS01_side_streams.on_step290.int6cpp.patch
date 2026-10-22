@@ -1,0 +1,994 @@
+diff -ru a/test/test_cuda_host_trace_replay.py b/test/test_cuda_host_trace_replay.py
+--- a/test/test_cuda_host_trace_replay.py	2026-10-09 00:38:26.064176375 -0700
++++ b/test/test_cuda_host_trace_replay.py	2026-10-09 15:30:18.017015693 -0700
+@@ -1275,24 +1275,25 @@
+         self.assertEqual(y, x + 3)
+         self.assertEqual((f.traces, f.replays, f.eager), (1, 1, 0))
+ 
+-    def test_a_side_stream_declines_once_and_warns(self):
++    def test_a_never_forked_side_stream_declines_once_and_warns(self):
+         side = torch.cuda.Stream()
+ 
+-        def fork_join(x):
++        def unforked(x):
+             y = add(x)
+-            side.wait_stream(torch.cuda.current_stream())
++            # x is ready before the call: eager reads it on the side stream without a fork
+             with torch.cuda.stream(side):
+-                y = add(y)
++                z = add(x, 1)
+             torch.cuda.current_stream().wait_stream(side)
+-            return y
++            return y + z
+ 
+-        f = HostTraceReplay(fork_join)
++        f = HostTraceReplay(unforked)
+         with self.assertLogs("torch.cuda._host_trace_replay", "WARNING") as logs:
+             for n in (64, 64, 128, 256, 64):
+                 x = torch.randn(n, device="cuda")
+-                self.assertEqual(f(x), fork_join(x), atol=0, rtol=0)
++                torch.cuda.synchronize()
++                self.assertEqual(f(x), unforked(x), atol=0, rtol=0)
+         self.assertEqual(len(logs.output), 1)
+-        self.assertIn("_add: launched on a stream other than the trace's", logs.output[0])
++        self.assertIn("_add: launched on a stream other than the trace's and never forked from it", logs.output[0])
+         self.assertEqual((f.traces, f.replays, f.eager, f.structural), (1, 0, 5, 1))
+ 
+     def test_a_call_under_capture_is_captured_as_eager(self):
+@@ -4222,6 +4223,213 @@
+ 
+ instantiate_parametrized_tests(TestHostTraceReplay)
+ instantiate_parametrized_tests(TestChainReplay)
++# vLLM's moe_forward_shared in small: the shared experts on a side stream, joined both ways
++_side_lib = torch.library.Library("host_trace_side", "DEF")
++_side_lib.define("shared_side(Tensor x, Tensor w) -> Tensor")
++_SIDE_STREAMS: dict[str, torch.cuda.Stream] = {}
++
++
++def _side(name, priority=0):
++    if name not in _SIDE_STREAMS:
++        _SIDE_STREAMS[name] = torch.cuda.Stream(priority=priority)
++    return _SIDE_STREAMS[name]
++
++
++def _shared_side(x, w):
++    side, cur = _side("shared"), torch.cuda.current_stream()
++    side.wait_stream(cur)
++    with torch.cuda.stream(side):
++        s = x @ w
++    y = torch.relu(x @ w)
++    cur.wait_stream(side)
++    return y + s
++
++
++_side_lib.impl("shared_side", _shared_side, "CUDA")
++torch.library.register_fake("host_trace_side::shared_side", lambda x, w: x.new_empty(x.shape[0], w.shape[1]), lib=_side_lib)
++
++
++def _eager_steps(f):
++    from torch.cuda._host_trace_tape import OpaqueCall
++
++    return sum(isinstance(rec, EagerCall) and not isinstance(rec, OpaqueCall) and not rec.host for v in f.variants for _, rec in v.tape.launches)
++
++
++def _reaches(segment):
++    """Per launch of the captured segment, the launches its node reaches in the graph."""
++    from cuda.bindings import runtime
++
++    raw = segment.graph.raw_cuda_graph()
++    m = _check_cuda_bindings(runtime.cudaGraphGetEdges(raw, numEdges=0))[-1]
++    src, dst = _check_cuda_bindings(runtime.cudaGraphGetEdges(raw, numEdges=m))[:2]
++    index = {c.node: i for i, c in enumerate(segment.launches)}
++    after = {i: set() for i in index.values()}
++    for a, b in zip(src, dst):
++        after[index[int(a)]].add(index[int(b)])
++    reach = {}
++    for i in sorted(after, reverse=True):
++        reach[i] = set(after[i]).union(*(reach[j] for j in after[i]))
++    return reach
++
++
++@unittest.skipIf(not TEST_CUDA or not has_triton(), "CUDA and Triton")
++class TestSideStreams(TestCase):
++    """Work on side streams forked from the traced call's stream and joined
++    back: their launches are in the variant's graphs, ordered as eager orders
++    them (core_gaps_repro.py gap_3)."""
++
++    def setUp(self):
++        from torch.cuda._host_trace_harvest import HarvestProvider
++
++        self.w = torch.randn(64, 64, device="cuda")
++        self.blas = (HarvestProvider(("blas",)),)
++
++    def sweep(self, fn, ms=(8, 40, 8, 40, 100), memory="auto"):
++        f = HostTraceReplay(fn, opaque=self.blas, memory=memory)
++        for m in ms:
++            x = torch.randn(m, 64, device="cuda")
++            self.assertEqual(f(x, self.w), fn(x, self.w), atol=0, rtol=0)
++        self.assertEqual((f.eager, _eager_steps(f)), (0, 0))
++        self.assertGreater(f.replays, 0)
++        return f
++
++    @parametrize("form", ["op", "inline"])
++    @parametrize("memory", ["auto", "run_buffer", "held", "eager"])
++    def test_side_stream_work_is_in_the_graph(self, form, memory):
++        def inline(x, w):
++            side, cur = _side("inline"), torch.cuda.current_stream()
++            side.wait_stream(cur)
++            with torch.cuda.stream(side):
++                s = x @ w
++            y = torch.relu(x @ w)
++            cur.wait_stream(side)
++            return (y + s,)
++
++        fn = (lambda x, w: (torch.ops.host_trace_side.shared_side(x * 2, w) + 1,)) if form == "op" else inline
++        f = self.sweep(fn, memory=memory)
++        for v in f.variants:
++            streams = v.captured.lowered.streams
++            (segment,) = v.captured.segments
++            side = [i for i, k in enumerate(streams.stream) if k]
++            main = [i for i, k in enumerate(streams.stream) if not k]
++            self.assertTrue(side and main)
++            reach = _reaches(segment)
++            # the side GEMM runs beside the origin's work, and the add after the join follows both
++            self.assertTrue(any(j not in reach[i] and i not in reach[j] for i in side for j in main))
++            self.assertTrue(all(main[-1] in reach[i] for i in side))
++
++    def test_two_side_streams(self):
++        def fn(x, w):
++            a, b, cur = _side("a"), _side("b", priority=-1), torch.cuda.current_stream()
++            a.wait_stream(cur)
++            b.wait_stream(cur)
++            with torch.cuda.stream(a):
++                s = x @ w
++            with torch.cuda.stream(b):
++                t = (x * 3).sum(0)
++            y = x + 1
++            cur.wait_stream(a)
++            cur.wait_stream(b)
++            return (y @ w + s + t,)
++
++        f = self.sweep(fn)
++        self.assertEqual(f.variants[0].captured.lowered.streams.priorities, (0, _side("a").priority, _side("b").priority))
++
++    def test_a_fork_after_an_eager_step(self):
++        # the eager step (index has no traced implementation) ends a run; the fork after it is in the next
++        def fn(x, w):
++            side, cur = _side("after"), torch.cuda.current_stream()
++            y = x[torch.arange(x.shape[0], device=x.device)] + 1
++            side.wait_stream(cur)
++            with torch.cuda.stream(side):
++                s = y @ w
++            z = y * 2
++            cur.wait_stream(side)
++            return (z + s,)
++
++        f = HostTraceReplay(fn, opaque=self.blas)
++        for m in (8, 8, 40):
++            x = torch.randn(m, 64, device="cuda")
++            self.assertEqual(f(x, self.w), fn(x, self.w), atol=0, rtol=0)
++        self.assertEqual(f.eager, 0)
++        self.assertGreater(f.replays, 0)
++        # the index step and a run with the fork after it
++        self.assertEqual((len(f.variants), _eager_steps(f)), (1, 1))
++        self.assertTrue(any(f.variants[0].captured.lowered.streams.stream))
++
++    def test_a_side_buffer_stays_live_through_its_join(self):
++        # s is written on the side stream while the origin allocates and writes t: the plan keeps s from the
++        # fork to the join, so t never takes its bytes
++        def fn(x, w):
++            side, cur = _side("live"), torch.cuda.current_stream()
++            side.wait_stream(cur)
++            with torch.cuda.stream(side):
++                s = x @ w
++            t = torch.relu(x) * 2
++            cur.wait_stream(side)
++            return (s + t,)
++
++        from torch.cuda._host_trace_memory import plan_memory
++
++        lowered = self.sweep(fn, ms=(64, 64)).variants[0].captured.lowered
++        side = [j for j, k in enumerate(lowered.streams.stream) if k]
++        self.assertTrue(side)
++        for memory in ("eager", "run_buffer", "held"):
++            plan = plan_memory(lowered, memory)
++            spans = {k: (first, last) for m in plan.steps for k, first, last in m.temporaries}
++            run_end = lowered.launches[-1].seq
++            for j in side:
++                first, last = lowered.span(j)
++                bases = [s.base for s in lowered.launches[j].slots if getattr(s, "base", None) is not None]
++                for b in (b for b in bases if b in spans):
++                    self.assertLessEqual(spans[b][0], first)
++                    self.assertGreaterEqual(spans[b][1], min(last, run_end))
++            f = self.sweep(fn, ms=(64, 64, 128), memory=memory)
++            self.assertTrue(f.variants)
++
++    @parametrize(
++        "case, why",
++        [
++            subtest(("never_forked", "never forked from it"), name="never_forked"),
++            subtest(("unjoined", "unjoined work"), name="unjoined"),
++            subtest(("eager_step_on_side", "on a side stream; an eager step there is not supported"), name="eager_step_on_side"),
++            subtest(("record_stream", "aten.record_stream.default has no traced metadata"), name="record_stream"),
++            subtest(("eager_step_inside_the_fork", "a step boundary inside a fork is not supported"), name="eager_step_inside_the_fork"),
++        ],
++    )
++    def test_side_stream_declines(self, case, why):
++        # each a decline the call reports and runs eagerly, bitwise
++        def fn(x, w):
++            side, cur = _side(case), torch.cuda.current_stream()
++            if case != "never_forked":
++                side.wait_stream(cur)
++            with torch.cuda.stream(side):
++                s = x @ w
++                if case == "eager_step_on_side":
++                    s = s[torch.arange(s.shape[0], device=s.device)]
++                if case == "record_stream":
++                    s.record_stream(cur)
++                if case == "unjoined":
++                    return (s + 1,)  # finished on the side stream, never joined (the caller synchronizes)
++            # index has no traced implementation: an eager step on the origin while the side GEMM may run
++            n = x[torch.arange(x.shape[0], device=x.device)] if case == "eager_step_inside_the_fork" else 0
++            cur.wait_stream(side)
++            return (s + 1 + n,)
++
++        f = HostTraceReplay(fn, opaque=self.blas)
++        with mock.patch.object(torch.cuda._host_trace, "raise_unexpected", False):
++            for m in (8, 8):
++                x = torch.randn(m, 64, device="cuda")
++                torch.cuda.synchronize()
++                want = fn(x, self.w)
++                got = f(x, self.w)
++                torch.cuda.synchronize()
++                self.assertEqual(got, want, atol=0, rtol=0)
++        self.assertEqual(f.replays, 0)
++        self.assertTrue(any(why in d for d in f.declines), f.declines)
++
++
++instantiate_parametrized_tests(TestSideStreams)
+ instantiate_parametrized_tests(TestReplayMemory)
+ instantiate_parametrized_tests(TestNativeReplay)
+ instantiate_parametrized_tests(TestEntryParity)
+diff -ru a/torch/cuda/_host_trace_capture.py b/torch/cuda/_host_trace_capture.py
+--- a/torch/cuda/_host_trace_capture.py	2026-10-09 13:43:13.687296019 -0700
++++ b/torch/cuda/_host_trace_capture.py	2026-10-09 14:11:28.638619865 -0700
+@@ -67,6 +67,7 @@
+         LoweredLaunch,
+         LoweredTape,
+         PointerSlot,
++        StreamOrder,
+     )
+     from torch.cuda._host_trace_opaque import OpaqueBinding
+ 
+@@ -581,6 +582,62 @@
+     _check_cuda_bindings(driver.cuLaunchKernelEx(config, function, ctypes.addressof(arguments), 0))
+ 
+ 
++class _Fork:
++    """A run's launches on their streams in its capture (StreamOrder): each on
++    its logical stream after an event of each launch of the run it follows,
++    a side stream's first with none after the run's start; the origin joins
++    every side stream at the end. Event records and waits add no nodes."""
++
++    def __init__(self, order: StreamOrder, run: range, handles: Sequence[int]) -> None:
++        self.stream = [order.stream[j] for j in run]
++        self.after = [tuple(p - run.start for p in order.after[j] if p >= run.start) for j in run]
++        self.priority = [order.priorities[k] for k in self.stream]
++        self.handles = handles
++        self.waited = {p for a in self.after for p in a}
++        self.events: dict[int, Any] = {}  # by launch, -1 the run's start
++        self.forked: set[int] = set()
++
++    def _record(self, i: int, stream: int) -> None:
++        from cuda.bindings import runtime
++
++        self.events[i] = _check_cuda_bindings(runtime.cudaEventCreateWithFlags(runtime.cudaEventDisableTiming))
++        _check_cuda_bindings(runtime.cudaEventRecord(self.events[i], stream))
++
++    def _wait(self, stream: int, i: int) -> None:
++        from cuda.bindings import runtime
++
++        _check_cuda_bindings(runtime.cudaStreamWaitEvent(stream, self.events[i], 0))
++
++    def begin(self) -> None:
++        self._record(-1, self.handles[0])
++
++    def before(self, i: int) -> int:
++        """Launch i's stream, ordered after what it follows."""
++        k = self.stream[i]
++        handle = self.handles[k]
++        if k and k not in self.forked and not self.after[i]:
++            self._wait(handle, -1)
++        self.forked.add(k)
++        for p in self.after[i]:
++            self._wait(handle, p)
++        return handle
++
++    def done(self, i: int) -> None:
++        if i in self.waited:
++            self._record(i, self.handles[self.stream[i]])
++
++    def join(self) -> None:
++        for k in sorted(self.forked - {0}):
++            self._record(-2 - k, self.handles[k])
++            self._wait(self.handles[0], -2 - k)
++
++    def close(self) -> None:
++        from cuda.bindings import runtime
++
++        for event in self.events.values():
++            _check_cuda_bindings(runtime.cudaEventDestroy(event))
++
++
+ def _launch(
+     launches: Sequence[LoweredLaunch | LoweredMemset | LoweredMemcpy],
+     values: Sequence[int],
+@@ -588,8 +645,10 @@
+     stream: int,
+     copy_at: dict[str, tuple[int, int]],
+     nodes: list[int],
++    fork: _Fork | None = None,
+ ) -> tuple[list[int], list[LoweredLaunch | LoweredMemset | LoweredMemcpy], tuple[torch.Generator, int, int] | None]:
+-    """Launch the kernels, memsets and memcpys into the capture on `stream`; each
++    """Launch the kernels, memsets and memcpys into the capture on `stream`, or
++    with `fork` each on its stream; each
+     one's node (into `nodes`, so a failure is at the launch after them), the
+     launches as captured: an RNG kernel's images hold
+     the capture's generator state, and that state as CapturedSegment.rng. A
+@@ -599,7 +658,11 @@
+     captured: list[LoweredLaunch | LoweredMemset | LoweredMemcpy] = []
+     philox = (0, 0, 0)
+     rng = None
+-    for lo in launches:
++    for i, lo in enumerate(launches):
++        if fork is not None:
++            if i:
++                fork.done(i - 1)
++            stream = fork.before(i)
+         captured.append(lo)
+         if isinstance(lo, LoweredMemset):
+             # the driver takes the placeholder address: the replay patches it
+@@ -639,6 +702,8 @@
+         grid, block = (tuple(values[row] for row in rows) for rows in (lo.grid, lo.block))
+         _launch_kernel(t.function, images, grid, block, values[lo.smem], attributes, stream)
+         _one_node(stream, nodes, f"kernel {t.name}")
++    if fork is not None:
++        fork.join()
+     return nodes, captured, rng
+ 
+ 
+@@ -649,15 +714,17 @@
+     values: Sequence[int],
+     bases: Sequence[int],
+     copy_at: dict[str, tuple[int, int]],
++    priorities: Sequence[int] | None = None,
+ ) -> None:
+     """The graph holds exactly `nodes`, the i-th launch's kernel, memset or
+-    memcpy node."""
++    memcpy node; a kernel node captured on a stream of another priority
++    (`priorities`, per launch) holds it."""
+     from cuda.bindings import driver
+ 
+     held = graph_node_handles(graph)
+     if len(held) != len(nodes) or set(held) != set(nodes):
+         raise declined("the capture holds nodes the tape did not launch")
+-    for node, lo in zip(nodes, launches):
++    for i, (node, lo) in enumerate(zip(nodes, launches)):
+         if isinstance(lo, LoweredMemset):
+             m, (width, height, pitch) = lo.launch, memset_extent(lo, values)
+             kind = _check_cuda_bindings(driver.cuGraphNodeGetType(node))
+@@ -696,8 +763,12 @@
+             raise declined(f"{where} has another launch config")
+         plain = plain_attributes(torch.cuda.current_device())
+         attributes = {k: v for k, v in node_attributes(node).items() if v != plain.get(k)}
+-        if attributes != dict(t.attributes):
+-            raise declined(f"{where} has launch attributes {attributes}; the launch {dict(t.attributes)}")
++        want = dict(t.attributes)
++        priority = driver.CUlaunchAttributeID.CU_LAUNCH_ATTRIBUTE_PRIORITY
++        if priorities is not None and priorities[i] != plain.get(priority):
++            want[priority] = priorities[i]
++        if attributes != want:
++            raise declined(f"{where} has launch attributes {attributes}; the launch {want}")
+         if not p.kernelParams or p.extra:
+             raise declined(f"{where} has no parameter array")
+         params = int(p.kernelParams)
+@@ -726,6 +797,7 @@
+     values: Sequence[int],
+     bases: Sequence[int],
+     stream: torch.cuda.Stream,
++    fork: _Fork | None = None,
+ ) -> CapturedSegment:
+     from cuda.bindings import runtime
+ 
+@@ -752,17 +824,26 @@
+     with _gc_hold, torch.cuda.stream(stream):
+         graph.capture_begin(capture_error_mode="relaxed")
+         try:
+-            nodes, captured, rng = _launch(launches, values, bases, stream.cuda_stream, copy_at, nodes)
++            if fork is not None:
++                fork.begin()
++            nodes, captured, rng = _launch(launches, values, bases, stream.cuda_stream, copy_at, nodes, fork)
+         except BaseException as e:
+             # a node, so capture_end does not warn of an empty graph
+             with contextlib.suppress(Exception):
+                 torch.cuda._sleep(0)
+             with contextlib.suppress(Exception):
++                if fork is not None:
++                    fork.join()
++            with contextlib.suppress(Exception):
+                 graph.capture_end()
++            if fork is not None:
++                fork.close()
+             _segment_failed(e, launches[len(nodes) : len(nodes) + 1])
+         graph.capture_end()
++    if fork is not None:
++        fork.close()
+     try:
+-        _verify(graph.raw_cuda_graph(), nodes, captured, values, bases, copy_at)
++        _verify(graph.raw_cuda_graph(), nodes, captured, values, bases, copy_at, fork.priority if fork is not None else None)
+         graph.instantiate()
+         # upload before any node is patched (an update of a never-uploaded exec
+         # can leave the node on a slow path for good)
+@@ -866,9 +947,13 @@
+         for lo in lowered.launches:
+             if not isinstance(lo, (LoweredMemset, LoweredMemcpy)) and lo.launch.witness is not None:
+                 _witness(lo, values, bases)
+-        with private_stream(tape.device) as stream:
++        order = lowered.streams
++        with private_stream(tape.device) as stream, contextlib.ExitStack() as held:
++            handles = [stream.cuda_stream]
++            if order is not None:
++                handles += [held.enter_context(private_stream(tape.device, p)).cuda_stream for p in order.priorities[1:]]
+             segments = tuple(
+-                _segment(lowered.launches[r.start : r.stop], values, bases, stream)
++                _segment(lowered.launches[r.start : r.stop], values, bases, stream, _Fork(order, r, handles) if order is not None and any(order.stream[j] for j in r) else None)
+                 for r in lowered.steps
+                 if isinstance(r, range)
+             )
+diff -ru a/torch/cuda/_host_trace_cute.py b/torch/cuda/_host_trace_cute.py
+--- a/torch/cuda/_host_trace_cute.py	2026-10-07 20:39:10.040346040 -0700
++++ b/torch/cuda/_host_trace_cute.py	2026-10-09 14:13:59.266908679 -0700
+@@ -1117,8 +1117,8 @@
+         if leaves is not args and isinstance(a, tuple) and any(isinstance(x, torch.Tensor) and not isinstance(x, _TracedTensor) for x in _fields(a)):
+             decline(f"argument {i} holds a tensor the trace does not track")
+         if (handle := _stream_handle(a)) is not None:
+-            if handle != tr.stream.cuda_stream:
+-                decline(f"argument {i} is a stream other than the trace's")
++            if handle != torch.cuda.current_stream(tr.device).cuda_stream:
++                decline(f"argument {i} is a stream other than the trace's or the side stream it is called on")
+             if i >= len(args):
+                 decline("a stream passed by keyword")
+             streams.append((i, type(a)))
+@@ -1565,8 +1565,8 @@
+         if not isinstance(a, torch.Tensor) and any(isinstance(x, torch.Tensor) for x in pytree.tree_leaves(a)):
+             decline(f"argument {i} holds tensors in a {type(a).__name__}")
+         if (handle := _stream_handle(a)) is not None:
+-            if handle != tr.stream.cuda_stream:
+-                decline(f"argument {i} is a stream other than the trace's")
++            if handle != torch.cuda.current_stream(tr.device).cuda_stream:
++                decline(f"argument {i} is a stream other than the trace's or the side stream it is called on")
+             streams.append((i, type(a)))
+     stand_ins = [_stand_in(a) if isinstance(a, _TracedTensor) else _hint(a) for a in args]
+     returned = []
+diff -ru a/torch/cuda/_host_trace_lower_tape.py b/torch/cuda/_host_trace_lower_tape.py
+--- a/torch/cuda/_host_trace_lower_tape.py	2026-10-08 23:36:51.341616962 -0700
++++ b/torch/cuda/_host_trace_lower_tape.py	2026-10-09 14:33:03.162678440 -0700
+@@ -30,6 +30,7 @@
+ from typing import Any, TYPE_CHECKING
+ 
+ import functools
++import math
+ 
+ import sympy
+ 
+@@ -239,6 +240,65 @@
+ 
+ 
+ @dataclass(frozen=True)
++class StreamOrder:
++    """Where a tape's launches ran: on the trace's stream, or on side streams
++    forked from it in the trace's capture and joined back (_Trace._mark)."""
++
++    stream: tuple[int, ...]  # per launch (LoweredTape.launches), its logical stream, 0 the trace's
++    # per launch, the launches on other streams it directly follows (those of earlier steps left out)
++    after: tuple[tuple[int, ...], ...]
++    # per launch, the seqs it may run between: on the trace's stream its own; on a side stream, from its latest
++    # ancestor on the trace's stream (-1: none) to its earliest descendant there (inf: none, joined at the end)
++    span: tuple[tuple[float, float], ...]
++    priorities: tuple[int, ...]  # per logical stream
++
++
++def _stream_order(tape: Tape, launches: Sequence[LoweredLaunch | LoweredMemset | LoweredMemcpy]) -> StreamOrder:
++    """The tape's StreamOrder. A step boundary (an eager call) while a side
++    stream's work is not joined declines: the run before it would end with
++    the fork still open."""
++    records = [(seq, rec) for seq, rec in tape.launches if not (isinstance(rec, EagerCall) and rec.host)]
++    streams, after = tape.streams, tape.after
++    children: dict[int, list[int]] = {}
++    for seq, preds in after.items():
++        for p in preds:
++            children.setdefault(p, []).append(seq)
++    first: dict[int, float] = {}
++    last: dict[int, float] = {}
++    prev: dict[int, float] = {}
++    for seq, _ in records:
++        k = streams.get(seq, 0)
++        first[seq] = prev[k] = max([seq if k == 0 else prev.get(k, -1), *(first[p] for p in after.get(seq, ()))])
++    prev = {}
++    for seq, _ in reversed(records):
++        k = streams.get(seq, 0)
++        last[seq] = prev[k] = min([seq if k == 0 else prev.get(k, math.inf), *(last[c] for c in children.get(seq, ()))])
++    pending = -math.inf
++    for seq, rec in records:
++        if streams.get(seq, 0) and isinstance(rec, EagerCall):
++            raise declined(f"{rec.name} on a side stream runs eagerly (its key does not bind); an eager step there is not supported")
++        if streams.get(seq, 0):
++            pending = max(pending, last[seq])
++        elif isinstance(rec, EagerCall) and pending > seq:
++            raise declined(f"{rec.name} runs eagerly while a side stream's work is not joined; a step boundary inside a fork is not supported")
++    index = {lo.seq: j for j, lo in enumerate(launches)}
++    return StreamOrder(
++        tuple(streams.get(lo.seq, 0) for lo in launches),
++        tuple(tuple(sorted(index[p] for p in after.get(lo.seq, ()) if p in index)) for lo in launches),
++        tuple((first[lo.seq], last[lo.seq]) for lo in launches),
++        (0, *tape.priorities),
++    )
++
++
++def _stream_layout(tape: Tape) -> list[tuple[int, tuple[int, ...]]] | None:
++    """Per record, its logical stream and the records (by position) it follows on other streams."""
++    if not tape.streams:
++        return None
++    position = {seq: i for i, (seq, _) in enumerate(tape.launches)}
++    return [(tape.streams.get(seq, 0), tuple(position[p] for p in tape.after.get(seq, ()))) for seq, _ in tape.launches]
++
++
++@dataclass(frozen=True)
+ class LoweredTape:
+     tape: Tape
+     program: IntegerProgram  # complete: no row is added after compilation
+@@ -257,6 +317,13 @@
+     selectors: tuple[LoweredSelector, ...]
+     # the program's lowering, which a fold extends
+     lowering: _TapeLowering
++    streams: StreamOrder | None = None  # None: every launch on the trace's stream
++
++    def span(self, j: int) -> tuple[float, float]:
++        """The seqs launch j may run between (StreamOrder.span)."""
++        if self.streams is None:
++            return self.launches[j].seq, self.launches[j].seq
++        return self.streams.span[j]
+ 
+     def evaluate(self, args: Sequence[Any]) -> tuple[int, ...] | None:
+         """Every row's value at the call `args`, or None when the call misses:
+@@ -684,6 +751,7 @@
+         sites,
+         tuple(selectors),
+         lo,
++        _stream_order(tape, launches) if tape.streams else None,
+     )
+ 
+ 
+@@ -772,6 +840,8 @@
+     counts = [(len(t.inputs), len(t.int_inputs), len(t.allocs), len(t.launches), len(t.sites)) for t in (tape, old)]
+     if counts[0] != counts[1] or not set(tape.argument_pairs) <= set(old.argument_pairs):
+         raise FoldRefused("another tape")
++    if _stream_layout(tape) != _stream_layout(old):
++        raise FoldRefused("another stream layout")
+     eager: list[_TracedTensor] = []
+     for _, rec in tape.launches:
+         for t in rec.outputs if isinstance(rec, EagerCall) else ():
+diff -ru a/torch/cuda/_host_trace_memory.py b/torch/cuda/_host_trace_memory.py
+--- a/torch/cuda/_host_trace_memory.py	2026-10-09 00:51:51.618182904 -0700
++++ b/torch/cuda/_host_trace_memory.py	2026-10-09 14:12:24.375264715 -0700
+@@ -274,12 +274,18 @@
+             args_used[ref[1]] = {len(steps)}
+     used: dict[int, set[int]] = {}  # base -> the steps that use it
+     touched = set()  # the bases eager calls read, write or return
++    # each allocation's first and last seq a launch may use it at (LoweredTape.span), its own seq at least
++    first_seq = [a.seq for a in allocations]
+     last_seq = [a.seq for a in allocations]
+     ends = []  # each step's last seq
+     for i, step in enumerate(steps):
+         if isinstance(step, range):
+             ends.append(lowered.launches[step.stop - 1].seq)
+-            for lo in lowered.launches[step.start : step.stop]:
++            for j in step:
++                lo = lowered.launches[j]
++                # a side stream's launch joined at the run's end runs until it
++                first, last = lowered.span(j)
++                last = min(last, ends[-1])
+                 # every root the launch holds, addressed or not: an entry for its op (a fold's or a
+                 # redispatch's) may address any of them (they match the launch's roots)
+                 refs = [s.root for s in lo.slots if isinstance(s, PointerSlot)] + [lowered.lowering.roots[id(r)] for r in lo.launch.roots]
+@@ -290,7 +296,8 @@
+                     base = k if kind == "allocation" else n_alloc + k
+                     used.setdefault(base, set()).add(i)
+                     if base < n_alloc:
+-                        last_seq[base] = lo.seq
++                        first_seq[base] = min(first_seq[base], first)
++                        last_seq[base] = max(last_seq[base], last)
+             continue
+         ends.append(step.seq)
+         bases = [n_alloc + p.root for p in step.outputs if not isinstance(p, int)]
+@@ -339,7 +346,7 @@
+         pool = {k for k in range(n_alloc) if k not in escapes and k not in scratch}
+         spans = {}
+         for k in sorted(pool):
+-            start = (holding[k], allocations[k].seq)
++            start = (holding[k], first_seq[k])
+             end = (holding[k], last_seq[k]) if k in local else (last[k], _AFTER)
+             spans[k] = (allocations[k].nbytes, start, end)
+         offsets, buffer = _layout(lowered.program, spans)
+@@ -356,7 +363,7 @@
+     for i in range(len(steps) + 1):
+         tensors = tuple(k for k in made[i] if k not in local)
+         temporaries = tuple(
+-            (k, allocations[k].seq, last_seq[k]) for k in made[i] if k in local
++            (k, first_seq[k], last_seq[k]) for k in made[i] if k in local
+         )
+         drops = tuple(dropped[i])
+         order: tuple[int, ...] = ()
+@@ -430,7 +437,7 @@
+ def check_plan(lowered: LoweredTape, plan: MemoryPlan) -> None:
+     """That every allocation a step uses is live there in the plan: at each launch, those its pointer
+     slots and its keyed site's table (operands, scratch) reach, a temporary of its run between its
+-    seq and its last use, a tensor from its step to the one that drops it; at an eager step, its
++    seq and its last use over the launch's span (a side stream's launch runs from its fork to its join), a tensor from its step to the one that drops it; at an eager step, its
+     leaves' tensors. A plan that frees an allocation before a use lets a later one take its bytes
+     while it is in use. Build time only."""
+     n = len(lowered.allocations)
+@@ -455,7 +462,8 @@
+ 
+     for i, step in enumerate(lowered.steps):
+         if isinstance(step, range):
+-            uses = [(lowered.launches[j].seq, [s.base for s in lowered.launches[j].slots if isinstance(s, PointerSlot) and s.base is not None] + tables.get(j, [])) for j in step]
++            end = lowered.launches[step.stop - 1].seq
++            uses = [(min(at, end), [s.base for s in lowered.launches[j].slots if isinstance(s, PointerSlot) and s.base is not None] + tables.get(j, [])) for j in step for at in sorted(set(lowered.span(j)))]
+         else:
+             uses = [(step.seq, [k for kind, k in (leaf.base for leaf in step.leaves if isinstance(leaf, LoweredView)) if kind == "allocation"])]
+         for seq, bases in uses:
+@@ -560,14 +568,36 @@
+     return all(fixed[r] for r in rows) and not free_symbols(args)
+ 
+ 
+-def _site_starts(lowered: LoweredTape) -> dict[int, int]:
+-    """A launch inside a keyed site (past its first) -> the site's first."""
++def _run_starts(lowered: LoweredTape) -> dict[int, int]:
++    """A launch no run may start at -> the launch before it one may start at:
++    inside a keyed site (past its first) the site's first; inside a fork
++    (past a side stream's launch, up to its join) the fork's first side
++    launch, so no run ends with a side stream's work not joined."""
+     starts: dict[int, int] = {}
+     for site in lowered.sites:
+         if site.nodes:
+             first = min(site.nodes)
+             for j in range(first + 1, max(site.nodes) + 1):
+                 starts[j] = min(starts.get(j, first), first)
++    order = lowered.streams
++    if order is None:
++        return starts
++    seqs = [lo.seq for lo in lowered.launches]
++    forks: dict[int, int] = {}
++    head, reach = -1, -1
++    for j, k in enumerate(order.stream):
++        if not k:
++            continue
++        end = order.span[j][1]
++        join = len(seqs) if end == math.inf else bisect.bisect_left(seqs, end)
++        if j > reach:
++            head = j
++        reach = max(reach, join)
++        for c in range(j + 1, join + 1):
++            forks[c] = head
++    for c in {*starts, *forks}:
++        site = starts.get(c, c)
++        starts[c] = forks.get(site, site)
+     return starts
+ 
+ 
+@@ -610,7 +640,7 @@
+     Decided at the traced call's sizes; each split costs a graph launch per
+     replay."""
+     nbytes, arguments = _nbytes(lowered), _argument_nbytes(lowered, freed)
+-    inside = _site_starts(lowered)
++    inside = _run_starts(lowered)
+     plan = plan_memory(lowered)
+     while True:
+         peak, i, seq = _peak(lowered, plan, nbytes, arguments)
+@@ -678,7 +708,7 @@
+     if splits == "peak":
+         return _split_at_the_peak(lowered, freed)
+     nbytes, arguments = _nbytes(lowered), _argument_nbytes(lowered, freed)
+-    site_start = _site_starts(lowered)
++    site_start = _run_starts(lowered)
+     plan = plan_memory(lowered)
+     top, after = _peak(lowered, plan, nbytes, arguments)[0], -1
+     if later is None:
+diff -ru a/torch/cuda/_host_trace_tape.py b/torch/cuda/_host_trace_tape.py
+--- a/torch/cuda/_host_trace_tape.py	2026-10-09 15:09:56.996359853 -0700
++++ b/torch/cuda/_host_trace_tape.py	2026-10-09 15:30:18.008476927 -0700
+@@ -304,6 +304,7 @@
+         fake_mode: FakeTensorMode | None = None,
+         declined_compiles: set[Any] | None = None,
+         shape_env: Any = None,
++        markers: _Markers | None = None,
+     ) -> None:
+         self.device = device
+         self.trusted = trusted
+@@ -315,9 +316,22 @@
+         self.declined_compiles = declined_compiles
+         # the trace's symbol for each of the caller's, under trusted inputs
+         self.given: dict[sympy.Symbol, torch.SymInt] = {}
+-        # the trace's capturing stream, the only one a launch may be recorded on
++        # the trace's capturing stream; a launch may also be recorded on a side
++        # stream forked from it in the capture (`markers`)
+         cuda = device.type == "cuda"
+         self.stream = torch.cuda.current_stream(device) if cuda else None
++        # the capture's markers (trace's _capture); None in a redo's or a
++        # binding's trace, where a launch is recorded on `stream` only
++        self.markers = markers
++        # the side streams launches were recorded on: logical stream k + 1 is side_streams[k]
++        self.side_streams: list[torch.cuda.Stream] = []
++        # per record on a side stream its logical stream (Tape.streams)
++        self.stream_of: dict[int, int] = {}
++        # per record, the records on other streams it directly follows (Tape.after)
++        self.after: dict[int, tuple[int, ...]] = {}
++        # the last record on `stream` before the first marker, which a node
++        # with an unmarked dependency (on `stream`'s prefix) follows
++        self.unmarked: int | None = None
+         # computes a view's and an eager call's metadata; without its cache
+         # every guard a kernel evaluates is recorded, and without fallback
+         # kernels an op with no meta raises instead of running on zeros
+@@ -396,16 +410,61 @@
+         return e
+ 
+     def check_stream(self, what: str) -> None:
+-        if self.stream is not None and torch.cuda.current_stream(self.device) != self.stream:
+-            e = self.decline(f"{what} on a stream other than the trace's")
+-            e.side_stream = True
+-            raise e
++        """Declines work on a stream other than the trace's, but for a side
++        stream forked from it in the trace's capture."""
++        if self.stream is None:
++            return
++        current = torch.cuda.current_stream(self.device)
++        if current == self.stream or (self.markers is not None and _capture_info(current)[:2] == _capture_info(self.stream)[:2]):
++            return
++        joined = "" if self.markers is None else " and never forked from it (a wait_stream or an event wait)"
++        e = self.decline(f"{what} on a stream other than the trace's{joined}")
++        e.side_stream = True
++        raise e
+ 
+     def record_launch(self, record: Any) -> None:
+         if isinstance(record, EagerCall) and not record.host:
+             leaves = pytree.tree_leaves((record.args, record.kwargs))
+             self.host_reads.update(a.untyped_storage()._cdata for a in leaves if isinstance(a, torch.Tensor) and self._is_host(a))
+-        self.launches.append((next(self._seq), record))
++        seq = next(self._seq)
++        if self.markers is not None and not (isinstance(record, EagerCall) and record.host):
++            self._mark(seq, record)
++        self.launches.append((seq, record))
++
++    def _mark(self, seq: int, record: Any) -> None:
++        """Once a record is on a side stream, a marker node per record on its
++        stream: the capture's dependencies of the node are the records on
++        other streams it follows (`after`)."""
++        from cuda.bindings import runtime
++
++        current = torch.cuda.current_stream(self.device)
++        side = current != self.stream
++        if not side and not self.markers.seqs:
++            return  # no side stream yet: nothing to order
++        if side:
++            what = record.name
++            self.check_stream(what)
++            if isinstance(record, EagerCall) and not isinstance(record, OpaqueCall):
++                # its replay would need the stream and the events around it; an opaque call binds
++                # after the trace (bind_opaque), or its lowering declines
++                raise self.decline(f"{what} on a side stream; an eager step there is not supported")
++            if not self.markers.seqs:
++                self.unmarked = next((s for s, r in reversed(self.launches) if not (isinstance(r, EagerCall) and r.host)), None)
++            if current not in self.side_streams:
++                self.side_streams.append(current)
++            self.stream_of[seq] = self.side_streams.index(current) + 1
++        if self.markers.event is None:
++            self.markers.event = _check_cuda_bindings(runtime.cudaEventCreateWithFlags(runtime.cudaEventDisableTiming))
++        deps = _capture_info(current)[2]
++        _check_cuda_bindings(runtime.cudaEventRecordWithFlags(self.markers.event, current.cuda_stream, runtime.cudaEventRecordExternal))
++        node = _capture_info(current)[2]
++        if len(node) != 1 or node[0] in self.markers.seqs:
++            raise AssertionError(f"host_trace: a marker of record {seq} added {node} to the capture")
++        self.markers.seqs[node[0]] = seq
++        mine = self.stream_of.get(seq, 0)
++        after = {self.markers.seqs.get(d, self.unmarked) for d in deps}
++        if after := tuple(sorted(a for a in after if a is not None and self.stream_of.get(a, 0) != mine)):
++            self.after[seq] = after
+ 
+     def input(self, position: int, t: torch.Tensor) -> _TracedTensor:
+         env = self.shape_env
+@@ -2942,7 +3001,7 @@
+ _CAPTURE_ERRORS = frozenset({401, 800, *range(900, 909)})
+ 
+ 
+-def new_private_stream(device: torch.device | int | None = None) -> torch.cuda.ExternalStream:
++def new_private_stream(device: torch.device | int | None = None, priority: int = 0) -> torch.cuda.ExternalStream:
+     """A new non-blocking stream outside torch.cuda.Stream()'s pool, which
+     hands its streams to any caller: another thread's work or allocations on
+     one would land in a capture on it."""
+@@ -2950,24 +3009,24 @@
+ 
+     index = torch.cuda._utils._get_device_index(device, optional=True)
+     with torch.cuda.device(index):
+-        handle = _check_cuda_bindings(runtime.cudaStreamCreateWithFlags(runtime.cudaStreamNonBlocking))
++        handle = _check_cuda_bindings(runtime.cudaStreamCreateWithPriority(runtime.cudaStreamNonBlocking, priority))
+     return torch.cuda.ExternalStream(int(handle), index)
+ 
+ 
+-_PRIVATE_STREAMS: dict[int, list[torch.cuda.ExternalStream]] = {}
++_PRIVATE_STREAMS: dict[tuple[int, int], list[torch.cuda.ExternalStream]] = {}
+ 
+ 
+ @contextlib.contextmanager
+-def private_stream(device: torch.device | int | None = None) -> Iterator[torch.cuda.ExternalStream]:
++def private_stream(device: torch.device | int | None = None, priority: int = 0) -> Iterator[torch.cuda.ExternalStream]:
+     """A private stream (new_private_stream) no one else holds until exit,
+     reused afterwards: the caching allocator keeps a stream's freed blocks
+     for that stream, so streams are not made per call."""
+     index = torch.cuda._utils._get_device_index(device, optional=True)
+-    free = _PRIVATE_STREAMS.setdefault(index, [])
++    free = _PRIVATE_STREAMS.setdefault((index, priority), [])
+     try:
+         stream = free.pop()
+     except IndexError:
+-        stream = new_private_stream(index)
++        stream = new_private_stream(index, priority)
+     try:
+         yield stream
+     finally:
+@@ -2994,13 +3053,34 @@
+             outer += pools
+ 
+ 
++@dataclass
++class _Markers:
++    """The event-record nodes (cudaEventRecordExternal) a trace adds to its
++    capture once a launch is recorded on a side stream, one per record from
++    then on (_Trace._mark): the capture gives a node the dependencies its
++    stream has, so whatever ordered the streams (wait_stream, an event a
++    library or a C++ op records and waits on) orders the records."""
++
++    event: Any = None  # recorded at each node; the graph is never launched
++    seqs: dict[int, int] = field(default_factory=dict)  # node -> its record's seq
++
++
++def _capture_info(stream: torch.cuda.Stream) -> tuple[int, int, list[int]]:
++    """The stream's capture status, capture id and dependency nodes."""
++    from cuda.bindings import runtime
++
++    status, capture, _, nodes, *_ = _check_cuda_bindings(runtime.cudaStreamGetCaptureInfo(stream.cuda_stream))
++    return int(status), int(capture), [int(n) for n in nodes]
++
++
+ # thread-local, unlike capture_tape's relaxed capture: here the capture is the
+ # detector, so an operation it refuses must raise on this thread
+ @contextlib.contextmanager
+-def _capture(device: torch.device) -> Iterator[None]:
++def _capture(device: torch.device) -> Iterator[_Markers]:
+     from cuda.bindings import runtime as _cuda_runtime
+ 
+     graph = torch.cuda.CUDAGraph(keep_graph=True)
++    markers = _Markers()
+     try:
+         with _witness_pools_freed(), private_stream(device) as stream, torch.cuda.stream(stream):
+             graph.capture_begin(capture_error_mode="thread_local")
+@@ -3008,23 +3088,28 @@
+                 # a node of ours: capture_end warns of an empty graph, and a
+                 # filter for that would swap the process's warnings filters
+                 torch.cuda._sleep(0)
+-                yield
++                yield markers
+             except BaseException:
+                 with contextlib.suppress(Exception):
+                     graph.capture_end()
+                 raise
+             graph.capture_end()
++        raw = graph.raw_cuda_graph()
++        _, nodes = _check_cuda_bindings(_cuda_runtime.cudaGraphGetNodes(raw, numNodes=0))
++        if nodes > 1 + len(markers.seqs):
++            raise declined(f"the host enqueued {nodes - 1 - len(markers.seqs)} operations the trace does not record")
+     except torch.AcceleratorError as e:
+         if getattr(e, "error_code", None) not in _CAPTURE_ERRORS:
+             raise
++        # an unjoined side stream fails capture_end
+         raise declined(
+             "the host performed an operation a stream capture does not permit "
+             f"({str(e).splitlines()[0]}); it would run at the trace and never in a replay"
+         ) from e
+-    raw = graph.raw_cuda_graph()
+-    _, nodes = _check_cuda_bindings(_cuda_runtime.cudaGraphGetNodes(raw, numNodes=0))
+-    if nodes > 1:
+-        raise declined(f"the host enqueued {nodes - 1} operations the trace does not record")
++    finally:
++        del graph
++        if markers.event is not None:
++            _check_cuda_bindings(_cuda_runtime.cudaEventDestroy(markers.event))
+ 
+ 
+ # the cyclic collector, held off during a trace's or segment's capture: a
+@@ -3418,8 +3503,8 @@
+                     raise e
+         state = torch._C._host_trace_global_state()
+         try:
+-            with _gc_hold, _capture(device), intercepting(), cute_intercepting():
+-                tr = _Trace(device, trusted, opaque, static_shapes, check_escapes, eager_ops, declined_compiles=declined_compiles)
++            with _gc_hold, _capture(device) as markers, intercepting(), cute_intercepting():
++                tr = _Trace(device, trusted, opaque, static_shapes, check_escapes, eager_ops, declined_compiles=declined_compiles, markers=markers)
+                 out, traced = _symbolic_run(tr, fn, args, positions, int_positions)
+                 result_kind, outputs = _output_records(out, traced, positions)
+                 if witness is not None:
+@@ -3578,6 +3663,13 @@
+         self.int_inputs = tr.int_inputs
+         self.allocs = tr.allocs
+         self.launches = tr.launches
++        # per launch on a side stream (forked from the trace's in its capture)
++        # its logical stream, 0 the trace's; per launch, the launches on other
++        # streams it directly follows, as their seqs; per logical stream past
++        # 0, its priority
++        self.streams = tr.stream_of
++        self.after = tr.after
++        self.priorities = tuple(s.priority for s in tr.side_streams)
+         self.sites = tr.sites
+         self.eager_outputs = tr.eager_outputs
+         # eager's checks of the call's values every call must meet (_Trace.check)
+@@ -3734,6 +3826,12 @@
+     events = sorted([(a.seq, a) for a in tape.allocs] + tape.launches, key=lambda e: e[0])
+     shift = 0
+     added = None  # the guards the bindings added, once they stand
++    # each record's new seq, a converted call's its last node's (on the trace's stream, the record before it there
++    # where it has none); the records' streams and the records they follow on others (Tape.streams, Tape.after)
++    moved: dict[int, int | None] = {}
++    last_main = None
++    streams: dict[int, int] = {}
++    after: dict[int, tuple[int, ...]] = {}
+     try:
+         for seq, rec in events:
+             if isinstance(rec, _AllocRec):
+@@ -3774,12 +3872,28 @@
+                     allocs += tr.allocs[first:]
+                     launches += tr.launches
+                     shift = next(tr._seq) - seq - 1
++                    if seq in tape.streams:
++                        if not tr.launches:
++                            return None  # what follows it on its stream would lose its order
++                        streams.update((n, tape.streams[seq]) for n, _ in tr.launches)
++                        moved[seq] = tr.launches[-1][0]
++                    else:
++                        last_main = moved[seq] = launches[-1][0] if tr.launches else last_main
++                    if seq in tape.after:
++                        after[tr.launches[0][0]] = tape.after[seq]
+                     continue
+             new = remap(rec)
+             if new is None:
+                 return None
+             records[id(rec)] = new
+             launches.append((seq + shift, new))
++            moved[seq] = seq + shift
++            if seq in tape.streams:
++                streams[seq + shift] = tape.streams[seq]
++            else:
++                last_main = seq + shift
++            if seq in tape.after:
++                after[seq + shift] = tape.after[seq]
+         if (len(env.owners) != marks and not keep_guards) or not converted or _guarded_symbols(tape) & {s.name for s in gone}:
+             return None
+         added = len(env.owners) - marks
+@@ -3816,6 +3930,8 @@
+     sites.sort(key=lambda s: min(order[id(t._root)] for t, _ in s.scratch.values()))
+     out = copy.copy(tape)
+     out.allocs, out.launches, out.sites, out.ops, out.owners = allocs, launches, sites, ops, owners
++    out.streams = streams
++    out.after = {seq: tuple(sorted({moved[p] for p in preds} - {None})) for seq, preds in after.items()}
+     out.checks = [*tape.checks, *tr.checks]
+     if added:
+         out.guard_count = marks + added

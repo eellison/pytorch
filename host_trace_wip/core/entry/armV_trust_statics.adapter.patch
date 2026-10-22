@@ -1,0 +1,51 @@
+--- a/adapter.py
++++ b/adapter.py
+@@ -67,6 +67,11 @@
+ STOCK = os.environ.get("ARMV_STOCK", "0") == "1"
+ # ARMV_DIRECT_CALL=0: keep vLLM's attention custom-op call path (unified_attention op) instead of the direct call
+ DIRECT_CALL = os.environ.get("ARMV_DIRECT_CALL", "1") == "1"
++# ARMV_TRUST_STATICS=1: each entry's calls go through a torch._C._HostTraceBound holding self.prefix (the weights,
++# buffers, KV caches and workspace: model state, never per-step data) with trust_statics=True, the contract of core
++# patch 61: no per-call check of the leading tensors; ArmV.statics_changed() must follow any re-point or layout change
++# of them (a weight reload, a KV cache re-allocation). Read at each call (the entry lane's A/B toggles it).
++TRUST_STATICS = os.environ.get("ARMV_TRUST_STATICS", "0") == "1"
+ _STOCK_INTS = ("num_actual_tokens", "num_decodes", "num_decode_tokens", "num_prefills", "num_prefill_tokens")  # diagnostics: vLLM's metadata build inside the trace (soundness check)  # diagnostics: try vLLM's metadata builder inside the trace
+ STATIC_SHAPES = os.environ.get("ARMV_STATIC_SHAPES", "0") == "1"
+ # ARMV_WIDE_SLOTS=1: block_tables.slot_mappings one column wider than max_num_batched_tokens, so the step's
+@@ -287,6 +292,7 @@
+                 self.vp_slot = 0
+                 self.vp_host = {}  # id(device tensor handed to AsyncOutput) -> the pinned numpy the step wrote
+         self.prefix = (*self.params, *(v for _, _, v in self.attrs))
++        self.bounds = {}  # ARMV_TRUST_STATICS: (entry key, argument count) -> its _HostTraceBound
+         self.replay_kw = {"static_prefix": len(self.prefix)} if STATIC_PREFIX else {}
+         if STATIC_SHAPES:
+             # weights, KV layers and the fixed buffers keep their layout: constants in the trace (Dynamo's
+@@ -613,7 +619,15 @@
+         self._ctx = (fc, md)
+         replays = entry.replays
+         try:
+-            (out,) = entry(*args)
++            res = NotImplemented
++            if TRUST_STATICS:
++                n = len(self.prefix)
++                bound = self.bounds.get((key, len(args)))
++                if bound is None:
++                    bound = self.bounds[(key, len(args))] = torch._C._HostTraceBound(self.prefix, len(args) - n, 0, (self,), trust_statics=True)
++                    bound.add(entry, (), (), (), (), (), (), None, ())
++                res = bound(*args[n:])
++            (out,) = entry(*args) if res is NotImplemented else res
+         finally:
+             self._ctx = None
+         if entry.replays > replays:
+@@ -622,6 +636,11 @@
+             self._check(kind, out, fc, input_ids, positions, amd, sm, stock)
+         return out
+ 
++    def statics_changed(self):
++        """ARMV_TRUST_STATICS: the leading tensors (self.prefix's) were re-pointed or re-laid out in place."""
++        for b in self.bounds.values():
++            b.statics_changed()
++
+     @staticmethod
+     def _stock_form(md):
+         """STOCK: the metadata's non-tensor fields other than the lifted ints (they must match within an entry)."""

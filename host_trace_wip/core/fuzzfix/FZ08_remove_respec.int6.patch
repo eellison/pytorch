@@ -1,0 +1,964 @@
+--- a/torch/cuda/_host_trace_capture.py
++++ b/torch/cuda/_host_trace_capture.py
+@@ -768,8 +768,8 @@
+     values = lowered.evaluate(tape.args)
+     if values is None:
+         raise declined("the traced call misses its own tape")
+-    if not tape.respec_guards:
+-        # a respecified tape's records hold its first call's hints
++    if not tape.twin_guards:
++        # a twin's tape (_eager_sites) holds its trace's records, at the call
+         _check_trace_values(lowered, values)
+     with torch.cuda.device(tape.device):
+         if any(a % _ALLOC_ALIGNMENT for a in addresses):
+--- a/torch/cuda/_host_trace_cover.py
++++ b/torch/cuda/_host_trace_cover.py
+@@ -940,8 +940,8 @@
+ 
+     def site_selected(self, variant, site):
+         """Where the selector at native site `site` selects an entry: its traced launches (the op's own guards)
+-        or a fold's or redispatch's (their guards, LoweredTape.lowering.entry_guards); a respecified op's own
+-        guards are Tape.respec_guards."""
++        or a fold's or redispatch's (their guards, LoweredTape.lowering.entry_guards); a twin's refused op's
++        key guards are Tape.twin_guards."""
+         return np.broadcast_to(self._site_selected(variant, site), self.shape)
+ 
+     def _site_selected(self, variant, site):
+@@ -951,8 +951,8 @@
+         if hit is not None and hit[0] is variant and hit[1] is lowered and hit[2] == len(entries):
+             return hit[3]
+         k = lowered.selectors[site - len(lowered.sites)].op
+-        if k in variant.tape.respec_guards:
+-            ok = self._and(self._row(variant, ("respec", k, n), g) for n, g in enumerate(variant.tape.respec_guards[k]))
++        if k in variant.tape.twin_guards:
++            ok = self._and(self._row(variant, ("twin", k, n), g) for n, g in enumerate(variant.tape.twin_guards[k]))
+         else:
+             ok = self._accepts(variant, variant.tape.ops[k].guards)
+         parts = [ok, *(self._and(self._row(variant, ("entry", id(lowered.lowering), j, n), g) for n, g in enumerate(guards)) for j, guards in entries)]
+@@ -1203,7 +1203,7 @@
+             held |= mine
+             same = collections.defaultdict(list)
+             for k, sel in enumerate(lowered.selectors):
+-                key = ("respec", sel.op) if sel.op in v.tape.respec_guards else tuple(solver.expr(v, i) for i in v.tape.ops[sel.op].guards)
++                key = ("twin", sel.op) if sel.op in v.tape.twin_guards else tuple(solver.expr(v, i) for i in v.tape.ops[sel.op].guards)
+                 same[key].append(n + k)
+             for sites in same.values():
+                 group = {"sites": len(sites), "dispatched_at": []}
+--- a/torch/cuda/_host_trace_lower_tape.py
++++ b/torch/cuda/_host_trace_lower_tape.py
+@@ -315,8 +315,8 @@
+ 
+     @functools.cached_property
+     def symbolic(self) -> Lowering:
+-        """The lowering of sympy expressions over the same program: respec's
+-        guards, which rename symbols in sympy."""
++        """The lowering of sympy expressions over the same program: a twin's
++        key guards (Tape.twin_guards), in sympy."""
+         if not self.ir:
+             return self.lowering
+         return Lowering(self.program, {_sym_expr(v): leaf for v, leaf in self._leaves})
+@@ -601,12 +601,12 @@
+     sites = tuple(lo.keyed_site(site, index) for site in tape.sites)
+     selectors = []
+     for k, op in enumerate(tape.ops):
+-        if k in tape.respec_guards:
+-            # Env records in the tape's context, or sympy where respec's rename failed at the hints
+-            symbolic = any(isinstance(g, sympy.Basic) for g in tape.respec_guards[k])
++        if k in tape.twin_guards:
++            # a refused key's guards (key_guards), in sympy
++            symbolic = any(isinstance(g, sympy.Basic) for g in tape.twin_guards[k])
+             low, key = (lo.symbolic, _sym_expr) if symbolic else (lo.lowering, lo.key)
+             with low.total() as domains:
+-                predicate = low.conjunction(list(tape.respec_guards[k]), frozenset(key(rec.root.sym) for rec in tape.inputs))
++                predicate = low.conjunction(list(tape.twin_guards[k]), frozenset(key(rec.root.sym) for rec in tape.inputs))
+             for ok in domains:
+                 predicate = lo.emit("and", predicate, ok)
+             nodes = tuple(index[id(rec)] for _, rec in tape.launches[op.launches.start : op.launches.stop] if id(rec) in index)
+@@ -656,13 +656,9 @@
+     when a lowering declined after appending rows the native program must
+     have too."""
+ 
+-    def __init__(self, msg: str, program: torch._C._HostTraceProgram | None = None, respec: bool = False) -> None:
++    def __init__(self, msg: str, program: torch._C._HostTraceProgram | None = None) -> None:
+         super().__init__(msg)
+         self.program = program
+-        # an op's launch topology or allocations differ, which respec takes
+-        self.respec = respec
+-        # redispatch's: the ops it dispatched again before one refused, op -> (guards, launches), which respec takes
+-        self.redone: dict[int, tuple[list[Any], list[tuple[int, Any]]]] = {}
+ 
+ 
+ class HintsFail(FoldRefused):
+--- a/torch/cuda/_host_trace_memory.py
++++ b/torch/cuda/_host_trace_memory.py
+@@ -362,7 +362,7 @@
+     for rec in lowered.tape.inputs:
+         if rec.position not in freed:
+             continue
+-        # the call's metadata, a respecified tape's call's too (its records hold their hints)
++        # the call's metadata, a twin's call's too (its records hold their trace's hints)
+         a = lowered.tape.args[rec.position]
+         sizes, strides, offset = (a.shape, a.stride(), a.storage_offset()) if isinstance(a, torch.Tensor) else a[:3]
+         extent = 1 + offset + sum((s - 1) * d for s, d in zip(sizes, strides))
+--- a/torch/cuda/_host_trace.py
++++ b/torch/cuda/_host_trace.py
+@@ -72,11 +72,6 @@
+ # with the CuTe DSL's constants
+ triton_tma_encode = True
+ 
+-# where redispatch refuses an op for its launch topology or allocations, the
+-# variant's tape with its failing ops dispatched again at the call (respec)
+-# builds a variant, captured whole, with no trace
+-respec_refused_ops = True
+-
+ # with traced_impls on, a trace runs a registered op's launcher (register_traced_impl)
+ # in place of its other routes
+ traced_impls = True
+--- a/torch/cuda/_host_trace_redispatch.py
++++ b/torch/cuda/_host_trace_redispatch.py
+@@ -8,17 +8,12 @@
+ entry of the selector, lowered as a fold's are, with every guard the run
+ recorded as its predicate. No Python of the traced function runs, and no
+ other op. FoldRefused where the op's outputs, allocations or launch topology
+-differ: the graph's metadata changed. Where only its launch topology or
+-allocations do, respec splices its new records into the variant's tape, which
+-builds a variant as a trace at the call would (respec_refused_ops).
++differ: the call traces again.
+ """
+ 
+ from __future__ import annotations
+ 
+ import contextlib
+-import copy
+-import itertools
+-import math
+ import threading
+ from dataclasses import replace
+ from typing import Any, TYPE_CHECKING
+@@ -32,7 +27,6 @@
+ from torch.cuda._host_trace import _drop_tracebacks, _TraceShapeEnv, Declined, declined
+ from torch.cuda._host_trace_launch import compiled_cluster, KernelLaunch
+ from torch.cuda._host_trace_lower_tape import FoldRefused, HintsFail, IRRename, lower_entries
+-from torch.cuda._host_trace_opaque import library_state_as, record_binding
+ from torch.cuda._host_trace_program import compile_program
+ from torch.cuda._host_trace_tape import (
+     _active,
+@@ -64,8 +58,7 @@
+     from collections.abc import Callable, Iterator, Sequence
+ 
+     from torch.cuda._host_trace_lower_tape import LoweredLaunch, LoweredMemset, LoweredSelector, LoweredTape
+-    from torch.cuda._host_trace_opaque import KeyedSite, OpaqueBinding, OpaqueKey
+-    from torch.cuda._host_trace_tape import OpRec, Tape
++    from torch.cuda._host_trace_tape import OpRec
+ 
+ 
+ def redispatch(
+@@ -89,9 +82,8 @@
+                         selected.append((i, *_redo(lowered, selector, hosted=True, dispatches=dispatches)))
+                     except HintsFail:
+                         selected.append((i, *_redo(lowered, selector, ir=False, hosted=True)))
+-                except FoldRefused as e:
++                except FoldRefused:
+                     lowered.lowering.refused.add(i)
+-                    e.redone = {lowered.selectors[j - len(lowered.sites)].op: (guards, launches) for j, guards, launches in selected}
+                     raise
+         selected.sort(key=lambda s: unselected.index(s[0]))
+         values = program.values
+@@ -107,143 +99,10 @@
+     return lower_entries(lowered, args, values, selected)
+ 
+ 
+-def respec(
+-    lowered: LoweredTape,
+-    args: Sequence[Any],
+-    values: Sequence[int],
+-    unselected: Sequence[int],
+-    bindings: Sequence[OpaqueBinding] = (),
+-    redone: dict[int, tuple[list[Any], list[tuple[int, Any]]]] | None = None,
+-    dispatches: dict | None = None,
+-) -> tuple[Tape, torch._C._HostTraceProgram | None]:
+-    """The variant's tape with the ops of selectors `unselected` dispatched
+-    again at the call `args` (rows `values`), each one's launches, allocations
+-    and guards in place of its own, at the call: the tape a trace of the call
+-    records where those ops' launch topology or allocations differ, with no
+-    trace. FoldRefused as redispatch, but for those. An op whose own guards
+-    fail at the call, selected by an entry, is dispatched again too: the
+-    tape's records of it are not the call's. Each keyed site is recorded at
+-    its key's binding at the call, `bindings` in site order: its nodes are
+-    its table's row of the traced key. An op of `redone` (a refused
+-    redispatch's) is not dispatched again: its allocations are the tape's. With the variant's program compiled
+-    where respec appended rows to it (None where not)."""
+-    program = lowered.lowering.program
+-    rows = len(program.values)
+-    program.inputs, program.values = tuple(args), list(values)
+-    tape = lowered.tape
+-    # placeholders past the tape's: a temporary of an op's own stays one of its own
+-    first = max(map(_tag, tape.allocs), default=0)
+-    spliced = {}
+-    try:
+-        for i, selector in enumerate(lowered.selectors, len(lowered.sites)):
+-            if selector.op in (redone or {}):
+-                # its values as _redo's respec keeps them: SymInts in the variant's env
+-                guards, launches = redone[selector.op]
+-                op = tape.ops[selector.op]
+-                # an eager step's entry has no launches: its own call stands
+-                launches = tape.launches[op.launches.start : op.launches.stop] if op.kind == "eager" else [(s, _renamed(x, x.roots, lambda v: torch.SymInt(_ir.IRSymNode(v, tape.shape_env, int)) if isinstance(v, _ir.Node) else v)) for s, x in launches]
+-                spliced[selector.op] = guards, sorted([(a.seq, a) for a in tape.allocs[op.allocs.start : op.allocs.stop]] + launches, key=lambda r: r[0])
+-            elif i in unselected or values[selector.predicate] != 1:
+-                try:
+-                    spliced[selector.op] = _redo(lowered, selector, first_alloc=first, dispatches=dispatches)
+-                except HintsFail:
+-                    spliced[selector.op] = _redo(lowered, selector, first_alloc=first, ir=False)
+-                first = max([first, *(_tag(a) for _, a in spliced[selector.op][1] if isinstance(a, _AllocRec))])
+-        tape = _splice(tape, spliced)
+-        for site, binding in zip(lowered.sites, bindings, strict=True):
+-            tape = _rebind(tape, site.site, binding, site.key([values[r] for r in site.rows]))
+-        # the rows appended to the variant's program, which its later entries' rows may reuse
+-        compiled = compile_program(program) if len(program.values) > len(values) else None
+-    except (Declined, FoldRefused) as e:
+-        compiled = compile_program(program) if len(program.values) > rows else None
+-        if isinstance(e, Declined):
+-            raise FoldRefused(f"a lowering declined: {e}", compiled) from e
+-        if e.program is None:
+-            e.program = compiled
+-        raise
+-    finally:
+-        program.inputs = ()
+-    tape.args = tuple(args)
+-    tape.warm_up_result = None
+-    return tape, compiled
+-
+-
+ def _tag(a: _AllocRec) -> int:
+     return (_hint(a.q) * _ALLOC_ALIGNMENT ^ _ALLOC_TAG) >> _ALLOC_SHIFT
+ 
+ 
+-def _splice(tape: Tape, spliced: dict[int, tuple[list[Any] | None, list[tuple[int, Any]]]]) -> Tape:
+-    """The tape with each op k of `spliced` given its launches and allocations
+-    `records`, in order, and its guards (unless None) in place of its own. The
+-    records take seqs between the records around op k's, any op's or none's; an
+-    allocation of op k's that `records` lacks is a temporary no other op reads."""
+-    # the earliest seq of the records from each index on, an op's or not
+-    later = [[*itertools.accumulate(reversed(xs), min, initial=math.inf)][::-1] for xs in ([s for s, _ in tape.launches], [a.seq for a in tape.allocs])]
+-    out = copy.copy(tape)
+-    out.ops, out.launches, out.allocs = [], [], []
+-    before = -1
+-
+-    def emit(launches: list[tuple[float, Any]], allocs: list[_AllocRec]) -> None:
+-        nonlocal before
+-        out.launches += launches
+-        out.allocs += allocs
+-        before = max([before, *(s for s, _ in launches), *(a.seq for a in allocs)])
+-
+-    ends = 0, 0
+-    for k, op in enumerate(tape.ops):
+-        # a record of no op's keeps its place
+-        emit(tape.launches[ends[0] : op.launches.start], tape.allocs[ends[1] : op.allocs.start])
+-        launches, allocs = tape.launches[op.launches.start : op.launches.stop], tape.allocs[op.allocs.start : op.allocs.stop]
+-        if k in spliced:
+-            records = spliced[k][1]
+-            after = min(later[0][op.launches.stop], later[1][op.allocs.stop])
+-            step = ((after if after < math.inf else before + len(records) + 1) - before) / (len(records) + 1)
+-            timed = [(before + (j + 1) * step, rec) for j, (_, rec) in enumerate(records)]
+-            launches = [(s, rec) for s, rec in timed if not isinstance(rec, _AllocRec)]
+-            allocs = [replace(rec, seq=s) for s, rec in timed if isinstance(rec, _AllocRec)]
+-        n = len(out.launches), len(out.allocs)
+-        out.ops.append(replace(op, launches=range(n[0], n[0] + len(launches)), allocs=range(n[1], n[1] + len(allocs))))
+-        emit(launches, allocs)
+-        ends = op.launches.stop, op.allocs.stop
+-    emit(tape.launches[ends[0] :], tape.allocs[ends[1] :])
+-    # seqs as ints again, in the same order (a memory plan's temporaries hold them)
+-    events = sorted([(s, 0, j) for j, (s, _) in enumerate(out.launches)] + [(a.seq, 1, j) for j, a in enumerate(out.allocs)])
+-    rank = {(kind, j): r for r, (_, kind, j) in enumerate(events)}
+-    out.launches = [(rank[0, j], rec) for j, (_, rec) in enumerate(out.launches)]
+-    out.allocs = [replace(a, seq=rank[1, j]) for j, a in enumerate(out.allocs)]
+-    if guards := {k: tuple(g) for k, (g, _) in spliced.items() if g is not None}:
+-        out.respec_guards = {**tape.respec_guards, **guards}
+-    return out
+-
+-
+-def _rebind(tape: Tape, site: KeyedSite, binding: OpaqueBinding, key: OpaqueKey) -> Tape:
+-    """The tape with keyed site `site` recorded at `binding`: its nodes and
+-    scratch buffers in place of its own, as bind_opaque records them."""
+-    if site.rng:
+-        raise FoldRefused(f"{site.op} is an RNG keyed site")
+-    at = {id(rec): j for j, (_, rec) in enumerate(tape.launches)}
+-    k = next(k for k, o in enumerate(tape.ops) if at[id(site.nodes[0])] in o.launches)
+-    op = tape.ops[k]
+-    nodes = {id(n) for n in site.nodes}
+-    if any(id(rec) not in nodes for _, rec in tape.launches[op.launches.start : op.launches.stop]):
+-        raise FoldRefused(f"{op.func} launches besides its keyed site's")
+-    env = tape.shape_env
+-    tr = _Trace(tape.device)
+-    tr.shape_env = env
+-    tr.first_alloc = max(map(_tag, tape.allocs), default=0)
+-    marks = len(env.owners)
+-    with library_state_as(site.state):
+-        new = record_binding(tr, site.op, site.provider, binding, list(site.operands), list(site.scalars), site.call, key)
+-    if len(env.owners) != marks:
+-        env.forget(marks)
+-        raise FoldRefused(f"{site.op}'s binding at the call guards")
+-    scratch = {id(t._root) for t, _ in site.scratch.values()}
+-    kept = [(a.seq, a) for a in tape.allocs[op.allocs.start : op.allocs.stop] if id(a.root) not in scratch]
+-    out = _splice(tape, {k: (None, kept + sorted([(a.seq, a) for a in tr.allocs] + tr.launches, key=lambda r: r[0]))})
+-    out.sites = [new if s is site else s for s in tape.sites]
+-    return out
+-
+-
+ _redo_fakes = threading.local()
+ 
+ 
+@@ -260,16 +119,14 @@
+ def _redo(
+     lowered: LoweredTape,
+     selector: LoweredSelector,
+-    first_alloc: int | None = None,
+     ir: bool = True,
+     hosted: bool = False,
+     dispatches: dict[Any, list[tuple[_Trace, list[torch.SymInt], list[_Root]]]] | None = None,
+ ) -> tuple[list[Any], list[tuple[int, Any]]]:
+-    # first_alloc: respec's, the placeholders its temporaries take come after; ir off renames in sympy
++    # ir off renames in sympy
+     # dispatches: the family's dispatches by what they read of their call, each with its fresh symbols and roots
+     old, lo = lowered.tape, lowered.lowering
+     op: OpRec = old.ops[selector.op]
+-    respec = first_alloc is not None
+     if op.kind not in ("traced", "eager") or op.redo is None or not isinstance(old.shape_env, _ir.Env):
+         raise FoldRefused(f"{op.func} has no traced dispatch to run again")
+     # the fresh symbols' env, as _Trace makes one: only a redo that dispatches builds the _Trace and its tensors
+@@ -409,9 +266,7 @@
+         tr.outer = {k: _TracedTensor(*o) for k, o in outer.items()}
+         built = {k: _TracedTensor(*t) for k, t in tensors.items()}
+         call = pytree.tree_map_only(_TracedTensor, lambda a: built[id(a)], call)
+-        if respec:
+-            tr.first_alloc = first_alloc
+-        elif len(op.allocs):
++        if len(op.allocs):
+             tr.first_alloc = _tag(old.allocs[op.allocs.start]) - 1
+         prior = getattr(_active, "trace", None)
+         _active.trace = tr
+@@ -462,38 +317,12 @@
+                 else:
+                     ((fq,), (q,)) = _sym_expr(a._root.sym).free_symbols, _sym_expr(b._root.sym).free_symbols
+                     mapping[fq] = q
+-    if not respec and (len(new.launches) != len(op.launches) or len(new.allocs) != len(op.allocs)):
+-        raise FoldRefused(f"{op.func} dispatches otherwise", respec=True)
++    if len(new.launches) != len(op.launches) or len(new.allocs) != len(op.allocs):
++        raise FoldRefused(f"{op.func} dispatches otherwise")
+     olds = old.allocs[op.allocs.start : op.allocs.stop]
+-    # a fresh temporary's record is renamed in a copy: the trace may be a later call's
+-    allocs = list(tr.allocs)
+-    if respec:
+-        # an output's allocation is the old output's; any other is a fresh temporary
+-        old_root = {id(b.root): b for b in olds}
+-        fresh_root = {id(a.root) for a in tr.allocs}
+-        for x, y in zip(new.outputs, op.outputs):
+-            if isinstance(x, _TracedTensor) and isinstance(y, _TracedTensor) and id(x._root) in fresh_root and id(y._root) in old_root:
+-                if back.setdefault(id(x._root), y._root) is not y._root:
+-                    raise FoldRefused(f"{op.func} returned other metadata")
+-        matched = {id(a.root): old_root[id(back[id(a.root)])] for a in tr.allocs if id(a.root) in back}
+-        old.shape_env.unique_ids |= env.unique_ids
+-        for j, a in enumerate(allocs):
+-            if id(a.root) in matched:
+-                bind(a.q, matched[id(a.root)].q)
+-            elif ir:
+-                # a fresh temporary of the variant's own, in its symbols, placed past first_alloc as trace() places
+-                # one (a taken dispatch's placeholders are its own call's)
+-                k = first_alloc + j
+-                q = old.shape_env.symbol((_ALLOC_TAG | ((k + 1) << _ALLOC_SHIFT)) // _ALLOC_ALIGNMENT, f"alloc{k}.base/{_ALLOC_ALIGNMENT}")
+-                bind(a.q, q)
+-                back[id(a.root)] = _Root(f"a{k}", _ALLOC_ALIGNMENT * q, "allocation")
+-                allocs[j] = replace(a, name=f"alloc{k}", root=back[id(a.root)], q=q)
+-            else:
+-                mapping[_sym_expr(a.q)] = _sym_expr(a.q)
+-    else:
+-        for a, b in zip(tr.allocs, olds):
+-            bind(a.q, b.q)
+-            back[id(a.root)] = b.root
++    for a, b in zip(tr.allocs, olds):
++        bind(a.q, b.q)
++        back[id(a.root)] = b.root
+ 
+     def rename(v: Any) -> Any:
+         if ir:
+@@ -504,11 +333,6 @@
+         e = e.xreplace(mapping)
+         return int(e) if e.is_Integer else e
+ 
+-    def kept(v: Any) -> Any:
+-        # a value respec's tape keeps: a SymInt in the variant's env, as trace() records one
+-        v = rename(v)
+-        return torch.SymInt(_ir.IRSymNode(v, old.shape_env, int)) if isinstance(v, _ir.Node) else v
+-
+     if ir:
+         # Env records, as the variant's own guards
+         guards = [r for r in map(renamer.record, env.records) if r[0].op != "true"]
+@@ -542,15 +366,9 @@
+         agree = layout == want or (pins and list(map(pinned, layout)) == list(map(pinned, want)))
+         return back.get(id(x._root)) is y._root and x.dtype == y.dtype and agree
+ 
+-    records: list[tuple[int, Any]] = []
+-    for a, b in zip(allocs, olds) if not respec else ((a, matched.get(id(a.root))) for a in allocs):
+-        layout = (a.dtype, tuple(map(rename, a.sizes)), tuple(map(rename, a.strides)))
+-        if b is not None and layout == (b.dtype, tuple(map(key, b.sizes)), tuple(map(key, b.strides))):
+-            records.append((a.seq, b))
+-        elif not respec:
+-            raise FoldRefused(f"{op.func} allocates otherwise", respec=True)
+-        else:
+-            records.append((a.seq, replace(b or a, dtype=a.dtype, sizes=list(map(kept, a.sizes)), strides=list(map(kept, a.strides)))))
++    for a, b in zip(tr.allocs, olds):
++        if (a.dtype, tuple(map(rename, a.sizes)), tuple(map(rename, a.strides))) != (b.dtype, tuple(map(key, b.sizes)), tuple(map(key, b.strides))):
++            raise FoldRefused(f"{op.func} allocates otherwise")
+     if len(new.outputs) != len(op.outputs) or not all(map(same, new.outputs, op.outputs)):
+         raise FoldRefused(f"{op.func} returned other metadata")
+     if eager:
+@@ -562,19 +380,7 @@
+         if split[0][0] != split[1][0] or call.generator is not own.generator or new_spec != old_spec or not all(map(same, new_leaves, old_leaves)):
+             raise FoldRefused(f"another eager call of {op.func}")
+         # the variant's own call stands; only the guards that select it are new
+-        return guards, [old.launches[op.launches.start]] if respec else []
+-    if respec:
+-        launches = []
+-        for seq, x in tr.launches:
+-            # a variant's own launch holds its TMA descriptors, over its slots
+-            if isinstance(x, KernelLaunch) and (x.rng or x.rng_increment or x.cpu_scalars):
+-                raise FoldRefused(f"an RNG or CPU scalar launch in {op.func}")
+-            if isinstance(x, Memcpy):
+-                raise FoldRefused(f"a memcpy in {op.func}")
+-            if any(id(r) not in back and id(r) not in fresh_root for r in x.roots):
+-                raise FoldRefused(f"a launch in {op.func} of a root of no role")
+-            launches.append((seq, _renamed(x, tuple(back.get(id(r), r) for r in x.roots), kept)))
+-        return guards, sorted(records + launches, key=lambda r: r[0])
++        return guards, []
+     launches = []
+     olds = [rec for _, rec in old.launches[op.launches.start : op.launches.stop]]
+     for n, (_, x), y in zip(selector.nodes, tr.launches, olds, strict=True):
+@@ -582,7 +388,7 @@
+             raise FoldRefused(f"an RNG or CPU scalar launch in {op.func}")
+         if isinstance(x, KernelLaunch) and x.descriptors:
+             # an entry holds no TMA descriptor
+-            raise FoldRefused(f"a TMA launch in {op.func}", respec=True)
++            raise FoldRefused(f"a TMA launch in {op.func}")
+         if isinstance(x, Memcpy):
+             raise FoldRefused(f"a memcpy in {op.func}")
+         if any(id(r) not in back for r in x.roots):
+@@ -595,7 +401,7 @@
+         elif topology:
+             topology = x.element_size == y.element_size and rename(x.height) == key(y.height)
+         if not topology:
+-            raise FoldRefused(f"another launch topology in {op.func}", respec=True)
++            raise FoldRefused(f"another launch topology in {op.func}")
+         launches.append((lowered.launches[n].seq, _renamed(x, owned, rename)))
+     return guards, launches
+ 
+--- a/torch/cuda/_host_trace_replay.py
++++ b/torch/cuda/_host_trace_replay.py
+@@ -81,7 +81,7 @@
+ from torch.cuda._host_trace_memory import arena_addresses, auto_memory, plan_memory, relocate, relocate_entries, size_classes, split_runs, SPLITS
+ from torch.cuda._host_trace_opaque import key_guards, library_state_as, span_bytes
+ from torch.cuda._host_trace_program import Status
+-from torch.cuda._host_trace_redispatch import redispatch, respec
++from torch.cuda._host_trace_redispatch import redispatch
+ from torch.cuda._host_trace_native import (
+     binding_row,
+     CAPTURE,
+@@ -548,12 +548,6 @@
+         self.redispatches = 0
+         self.redispatch_s = 0.0
+         self.redispatch_refusals: dict[str, int] = {}
+-        # the variants built from a variant's tape with the ops redispatch
+-        # refused dispatched again (respec_refused_ops), no trace, their
+-        # seconds, and why each other did not build
+-        self.respecs = 0
+-        self.respec_s = 0.0
+-        self.respec_refusals: dict[str, int] = {}
+         # the keys harvested at a keyed site's miss, no trace or relower
+         # (_learn), and their seconds
+         self.learned = 0
+@@ -663,11 +657,8 @@
+                 return self._served(variant.native, outcome, result, args)
+         # no variant holds the call: one whose graph guards do gains its
+         # failing selectors' entries from their ops dispatched again
+-        respecable = []
+         for j, (variant, values, unselected) in enumerate(candidates if self.trusted is None else ()):
+-            if (refused := self._redispatch(variant, args, values, unselected, self._dispatches.setdefault(contract, {}))) is not None:
+-                if refused.respec and torch.cuda._host_trace.respec_refused_ops:
+-                    respecable.append((variant, values, unselected, refused.redone))
++            if self._redispatch(variant, args, values, unselected, self._dispatches.setdefault(contract, {})) is not None:
+                 continue
+             del candidates[j]
+             if self._fill(variant, args, candidates) is not None:
+@@ -675,18 +666,8 @@
+                 if outcome != MISS:
+                     return self._served(variant.native, outcome, result, args)
+             break
+-        # or where only their launch topology or allocations differ, the
+-        # variant's tape with them dispatched again builds a variant
+-        for variant, values, unselected, redone in respecable:
+-            respecified = self._respec(contract, variant, args, values, unselected, redone)
+-            if respecified is None:
+-                continue
+-            if self.handback:
+-                return Handback(args)
+-            outcome, result = self._call_native(respecified, args)
+-            if outcome == MISS:
+-                raise AssertionError("host_trace: a call misses the variant respecified at it")
+-            return self._served(respecified.native, outcome, result, args)
++        # a refused redispatch traces the graph again. Propagating the op's new metadata through its uses (as
++        # respec did) could serve it where all kernel and tensor access goes through custom ops; engine code does not
+         return self._miss(contract, args, candidates)
+ 
+     def prepare(self, *args: Any) -> bool:
+@@ -1198,49 +1179,10 @@
+         self.redispatches += refused is None
+         return refused
+ 
+-    def _respec(self, contract: tuple, variant: _Variant, args: tuple, values: list[int], unselected: list[int], redone: dict) -> _Variant | None:
+-        """The variant's tape with the ops of selectors `unselected` dispatched
+-        again at the call (_host_trace_redispatch.respec), built and put after
+-        it in its family: the variant a trace at the call builds, with no
+-        trace. None where respec refuses or the build declines."""
+-        start = time.perf_counter()
+-        sites = variant.captured.lowered.sites
+-        try:
+-            # each keyed site at its key at the call, learned unless it binds
+-            bindings = []
+-            for s in sites:
+-                key = s.key([values[r] for r in s.rows])
+-                binding = s.site.provider.bind(key)
+-                if binding is None and not s.site.rng and s.site.call is not None:
+-                    pool = torch.cuda.MemPool() if self.learn_pool else None
+-                    with torch.cuda.use_mem_pool(pool, key.device) if pool is not None else contextlib.nullcontext():
+-                        binding = self._learn(s.site.op, s.site.provider, s.site.call, key)
+-                    del pool
+-                if binding is None:
+-                    raise FoldRefused(f"{s.site.op}'s key at the call does not bind")
+-                bindings.append(binding)
+-            tape, program = respec(variant.captured.lowered, args, values, unselected, bindings, redone, self._dispatches.setdefault(contract, {}))
+-            if program is not None:
+-                variant.native.set_program(program)
+-            respecified = self._build(tape)
+-        except (Declined, FoldRefused) as e:
+-            if isinstance(e, FoldRefused) and e.program is not None:
+-                variant.native.set_program(e.program)
+-            why = str(e) if isinstance(e, FoldRefused) else f"the build declined: {e}"
+-            self.respec_refusals[why] = self.respec_refusals.get(why, 0) + 1
+-            return None
+-        finally:
+-            self.respec_s += time.perf_counter() - start
+-        self.respecs += 1
+-        family = self._families[contract]
+-        family.insert(family.index(variant) + 1, respecified)
+-        self._register(family, args)
+-        return respecified
+-
+     def _eager_sites(self, contract: tuple, variant: _Variant, args: tuple, refused: list[tuple[int, OpaqueKey]]) -> _Variant | None:
+         """The variant's tape before its opaque calls were bound, with the
+         calls of keyed sites `refused` (index, the key the provider refuses at
+-        the call) as plain eager steps, each guarding its key (its op's respec
++        the call) as plain eager steps, each guarding its key (its op's twin
+         guards), and the others bound; built at the call and put after it in
+         its family: what a trace at the call builds, with no trace. None where
+         the variant has no such tape or the build declines."""
+@@ -1252,7 +1194,7 @@
+             tape, calls = variant.unbound
+             at = {id(r): j for j, (_, r) in enumerate(tape.launches)}
+             eager = copy.copy(tape)
+-            eager.launches, eager.respec_guards, eager.args = list(tape.launches), dict(tape.respec_guards), tuple(args)
++            eager.launches, eager.twin_guards, eager.args = list(tape.launches), dict(tape.twin_guards), tuple(args)
+             for i, key in refused:
+                 r = calls[id(sites[i].site)]
+                 if (guards := key_guards(r, key)) is None:
+@@ -1261,7 +1203,7 @@
+                 j = at[id(r)]
+                 eager.launches[j] = (tape.launches[j][0], EagerCall(r.target, r.args, r.kwargs, r.outputs, why, r.generator, r.state))
+                 k = next(k for k, op in enumerate(tape.ops) if j in op.launches)
+-                eager.respec_guards[k] = (*eager.respec_guards.get(k, ()), *guards)
++                eager.twin_guards[k] = (*eager.twin_guards.get(k, ()), *guards)
+             rest = {id(r) for _, r in eager.launches if isinstance(r, OpaqueCall)}
+             # the other sites' keys at the trace bound when the variant was built
+             bound = bind_opaque(eager, rest, keep_guards=oob_learn) if rest else (eager, {})
+--- a/torch/cuda/_host_trace_tape.py
++++ b/torch/cuda/_host_trace_tape.py
+@@ -3112,9 +3112,9 @@
+         # eagerly writes one and reads the other. A call where they overlap
+         # runs eagerly; trusted inputs' aliasing is the caller's (none)
+         self.argument_pairs = tuple(sorted(tr.argument_pairs)) if tr.trusted is None else ()
+-        # per op dispatched again at another call (_host_trace_redispatch.respec),
+-        # its guards then in the tape's symbols, which select it in place of op.guards
+-        self.respec_guards: dict[int, tuple[Any, ...]] = {}
++        # per op of a twin (_host_trace_replay._eager_sites), its refused key's
++        # guards in the tape's symbols, which select it in place of op.guards
++        self.twin_guards: dict[int, tuple[Any, ...]] = {}
+ 
+     @property
+     def graph(self) -> list[int]:
+--- a/test/test_cuda_host_trace_aten.py
++++ b/test/test_cuda_host_trace_aten.py
+@@ -1205,12 +1205,12 @@
+     def test_minmax_replays_new_sizes_in_one_trace(self, case):
+         # a new size re-dispatches the traced reduction with patched launch
+         # parameters; a full reduction's switch to a global one (129 x 4096) is
+-        # another launch topology, which respec takes (off, a second trace)
++        # another launch topology: a second trace
+         fn, args_fn = HOSTS[case]
+         entry = HostTraceReplay(fn)
+         for m, h in ((64, 768), (2, 768), (37, 96), (129, 4096), (9, 1500), (300, 32)):
+             self._assert_replays_eager_calls(entry, fn, args_fn(m, h, torch.float32))
+-        self.assertEqual((entry.traces, entry.respecs, entry.eager), (1, int(case.endswith("_all")), 0))
++        self.assertEqual((entry.traces, entry.eager), (1 + int(case.endswith("_all")), 0))
+ 
+     def test_symbolic_repeat_replays_new_sizes_in_one_trace(self):
+         fn, args_fn = HOSTS["repeat_symbolic"]
+@@ -1277,8 +1277,8 @@
+             for m, h in ((64, 768), (64, 1280), (64, 1280), (7, 1280)):
+                 x, w = torch.randn(m, h, device="cuda", dtype=torch.float16), torch.randn(h, device="cuda", dtype=torch.float16)
+                 self.assertEqual(entry(x, w), fn(x, w), atol=0, rtol=0)
+-        # the new size's compile and launch, by respec
+-        self.assertEqual((entry.traces, entry.respecs, entry.replays, entry.eager), (1, 1, 3, 0))
++        # the new size's compile and launch, by a trace
++        self.assertEqual((entry.traces, entry.replays, entry.eager), (2, 2, 0))
+ 
+     @parametrize("native", [False, True])
+     def test_rms_norm_of_a_symbolic_shape_replays(self, native):
+@@ -1483,17 +1483,15 @@
+                 self.assertEqual(entry(x, w), fn(x, w), atol=0, rtol=0)
+         self.assertEqual((entry.traces, entry.relowers, entry.learned, entry.eager), (1, 0, 7, 0) if oob else (2, 1, 3, 0))
+ 
+-    @parametrize("respec", [False, True])
+-    def test_fold_refuses_another_launch_chain(self, respec):
+-        # layer_norm is one vectorized kernel at h % 4 == 0, else two: off, a
+-        # second trace the fold refuses; on, respec builds its variant
++    def test_fold_refuses_another_launch_chain(self):
++        # layer_norm is one vectorized kernel at h % 4 == 0, else two: a second
++        # trace the fold refuses
+         fn = NORMS["layer_norm_no_affine"][0](None)
+         entry = HostTraceReplay(fn)
+-        with mock.patch.object(torch.cuda._host_trace, "respec_refused_ops", respec):
+-            for h in (768, 767, 768, 767):
+-                self._assert_norm_replays_like_eager(entry, fn, _norm_inputs("layer_norm_no_affine", 64, h, torch.float32))
+-        self.assertEqual((entry.traces, entry.respecs, entry.folds, len(entry.variants), entry.eager), (1, 1, 0, 2, 0) if respec else (2, 0, 0, 2, 0))
+-        self.assertEqual(list(entry.fold_refusals), [] if respec else ["another op sequence"])
++        for h in (768, 767, 768, 767):
++            self._assert_norm_replays_like_eager(entry, fn, _norm_inputs("layer_norm_no_affine", 64, h, torch.float32))
++        self.assertEqual((entry.traces, entry.folds, len(entry.variants), entry.eager), (2, 0, 2, 0))
++        self.assertEqual(list(entry.fold_refusals), ["another op sequence"])
+ 
+     @unittest.skipIf(not PLATFORM_SUPPORTS_FLASH_ATTENTION, "requires flash attention")
+     def test_default_sdpa_scale(self):
+--- a/test/test_cuda_host_trace_cute.py
++++ b/test/test_cuda_host_trace_cute.py
+@@ -1230,44 +1230,21 @@
+         not TEST_CUDA or torch.cuda.get_device_capability() < (10, 0),
+         "requires Blackwell",
+     )
+-    @parametrize("respec", [False, True])
+-    def test_a_tma_kernel_choice_respecifies(self, respec):
++    def test_a_tma_kernel_choice_traces_its_class(self):
+         # the op's TMA kernel and cluster change with m, which no entry holds:
+-        # off, its class traces; on, the variant's tape with the op dispatched
+-        # again builds the variant, as eager launches it
++        # its class traces
+         _compile_gemms()
+ 
+         def f(a, b):
+             return _tma_choice(a, b) * 2
+ 
+         r = HostTraceReplay(f)
+-        with mock.patch.object(torch.cuda._host_trace, "respec_refused_ops", respec):
+-            for m in (256, 512, 128, 1024, 256):
+-                a, b = (_half(1, rows, 128).permute(1, 2, 0) for rows in (m, 256))
+-                self.assertEqual(r(a, b), f(a, b), atol=0, rtol=0)
+-        self.assertEqual((r.traces, r.respecs, len(r.variants), r.replays, r.eager), (1, 1, 2, 4, 0) if respec else (2, 0, 2, 3, 0))
+-        clusters = [[lo.launch.cluster for lo in v.captured.lowered.launches if isinstance(lo.launch, KernelLaunch) and lo.launch.descriptors] for v in r.variants]
+-        self.assertEqual(clusters, [[(1, 1, 1)], [(2, 1, 1)]])
+-
+-    @unittest.skipIf(
+-        not TEST_CUDA or torch.cuda.get_device_capability() < (10, 0),
+-        "requires Blackwell",
+-    )
+-    def test_a_respec_after_an_allocation_outside_the_op(self):
+-        # the output is allocated before the op, outside it: the respecified
+-        # variant allocates it before the op's TMA launch, as eager
+-        _compile_gemms()
+-
+-        def f(a, b):
+-            c = _gemm_out(a, b)
+-            _tma_choice_into(a, b, c)
+-            return c
+-
+-        r = HostTraceReplay(f)
+         for m in (256, 512, 128, 1024, 256):
+             a, b = (_half(1, rows, 128).permute(1, 2, 0) for rows in (m, 256))
+             self.assertEqual(r(a, b), f(a, b), atol=0, rtol=0)
+-        self.assertEqual((r.traces, r.respecs, len(r.variants), r.replays, r.eager), (1, 1, 2, 4, 0))
++        self.assertEqual((r.traces, len(r.variants), r.replays, r.eager), (2, 2, 3, 0))
++        clusters = [[lo.launch.cluster for lo in v.captured.lowered.launches if isinstance(lo.launch, KernelLaunch) and lo.launch.descriptors] for v in r.variants]
++        self.assertEqual(clusters, [[(1, 1, 1)], [(2, 1, 1)]])
+ 
+     @unittest.skipIf(
+         not TEST_CUDA or torch.cuda.get_device_capability() < (10, 0),
+--- a/test/test_cuda_host_trace_harvest.py
++++ b/test/test_cuda_host_trace_harvest.py
+@@ -599,22 +599,6 @@
+         want = (1, 1, 6, 1) if eager_steps else (2, 1, 5, 0)
+         self.assertEqual((f.traces, f.relowers, f.replays, f.eager_sites), want)
+ 
+-    @parametrize("new_key", [False, True])
+-    def test_a_respec_beside_a_bound_mm(self, new_key):
+-        # at S=3000 the sum splits: its variant's tape is respecified beside
+-        # the bound mm, whose output allocation stays the mm op's; at a new
+-        # batch respec rebinds the mm at its key at the call
+-        def fn(x, w):
+-            return torch.mm(x.sum(1), w) + 1
+-
+-        w = torch.randn(64, 64, device="cuda")
+-        f = HostTraceReplay(fn, opaque=(HarvestProvider(),))
+-        with tf32_off():
+-            for bs, s in ((4, 8), (4, 16), (4, 32), (4, 1000), (8 if new_key else 4, 3000)):
+-                x = torch.randn(bs, s, 64, device="cuda")
+-                self.assertBitwise(f(x, w), fn(x, w))
+-        self.assertEqual((f.traces, f.respecs, f.respec_refusals, f.eager), (1, 1, {}, 1))
+-
+     def test_the_default_harvests_blas(self):
+         # by default an entry harvests cuBLAS's keys; opaque=() runs the mm as an eager step
+         def fn(x, w):
+@@ -1581,12 +1565,12 @@
+         # the entry's first call (5) runs eagerly; 17 traces
+         self.assertEqual((r.traces, r.redispatches, r.eager), (2, 0, 1))
+ 
+-    @parametrize("oob,traces", [(True, 1), (False, 4)])
++    @parametrize("oob,traces", [(True, 2), (False, 4)])
+     def test_new_shapes_are_local(self, oob, traces):
+         # a shape sweep over one variant's class traces once. A new length is
+         # learned (rope, keyed by another entry), redispatched (the embedding's
+-        # index_select small-index kernel at <= 16 indices) or respecified (the
+-        # sum's split reduction), never traced again: by oob_learn
++        # index_select small-index kernel at <= 16 indices), by oob_learn; the
++        # sum's split reduction traces its class
+         table = torch.randn(4096, 64, device="cuda", dtype=bf16)
+         emb = torch.randn(1000, 192, device="cuda", dtype=bf16)
+         k_cache, v_cache = (torch.randn(8192, 64, device="cuda", dtype=bf16) for _ in range(2))
+@@ -1612,33 +1596,7 @@
+                 self.assertEqual(args, ref, atol=0, rtol=0)
+         self.assertEqual((len(p.refused), self.eager_calls(r), r.traces), (0, [], traces))
+         if oob:
+-            self.assertEqual((r.redispatches, r.respecs, r.relowers, r.eager, len(r.variants), r.learners), (1, 1, 0, 1, 2, 0))
+-
+-    @parametrize("body", ["rope", "store", "both"])
+-    def test_respec_rebinds_keyed_sites(self, body):
+-        # the sum's split reduction changes past 300 rows: the respecified
+-        # variant binds each keyed extern site's key at the call (oob_learn)
+-        table = torch.randn(4096, 64, device="cuda", dtype=bf16)
+-        emb = torch.randn(1000, 192, device="cuda", dtype=bf16)
+-        k_cache, v_cache = (torch.randn(8192, 64, device="cuda", dtype=bf16) for _ in range(2))
+-
+-        def f(ids, pos, table, k, v, loc, emb):
+-            h = emb.index_select(0, ids)
+-            out = self.rope(h, pos, table) if body != "store" else h
+-            return (self.store(out, k, v, loc) if body != "rope" else out), h.sum(0)
+-
+-        def case(t):
+-            return torch.randint(1000, (t,), device="cuda"), torch.randint(4096, (t,), device="cuda"), table, k_cache, v_cache, torch.randperm(8192, device="cuda")[:t], emb
+-
+-        ops = torch.ops.ht_extern
+-        indexed = {ops.store_kv.default: ("loc", "k_cache", "v_cache")}
+-        p = HarvestProvider(("extern",), extern_ops=(ops.rope_qk.default, ops.store_kv.default), indexed=indexed, lendable=(table, k_cache, v_cache))
+-        r = HostTraceReplay(f, opaque=(p,))
+-        for args in [case(t) for t in (5, 5, 17, 300, 2000, 2000, 64)]:
+-            ref = [a.clone() if a.is_floating_point() else a for a in args]
+-            self.assertEqual(r(*args), f(*ref), atol=0, rtol=0)
+-            self.assertEqual(args, ref, atol=0, rtol=0)
+-        self.assertEqual((len(p.refused), r.traces, r.respecs), (0, 1, 1))
++            self.assertEqual((r.redispatches, r.relowers, r.eager, len(r.variants), r.learners), (1, 0, 1, 2, 0))
+ 
+     @mock.patch("torch.cuda._host_trace_replay.oob_learn", False)
+     def test_learn_pool(self):
+--- a/test/test_cuda_host_trace_replay.py
++++ b/test/test_cuda_host_trace_replay.py
+@@ -548,8 +548,8 @@
+             self.assertLessEqual(node.free_symbols, symbols.keys())
+ 
+     def test_a_redo_takes_a_dispatch_whose_guards_hold(self):
+-        # a redo takes a dispatch of the same reads whose guards hold at it: (2, 3000)'s redispatch and (1, 2016)'s
+-        # respec dispatch one softmax for the four layers, (1, 1568)'s none, taking (1, 2016)'s
++        # a redo takes a dispatch of the same reads whose guards hold at it: (2, 3000)'s redispatch dispatches one
++        # softmax for the four layers; b = 1 is its own class (a trace)
+         def fn(q, page_table, kv, *ws):
+             k = kv[page_table].flatten(1, 2)
+             for w in ws:
+@@ -573,7 +573,7 @@
+                 del softmaxes[:]
+                 self.assertEqual(f(*args), fn(*args), atol=0, rtol=0)
+                 counts.append(sum(softmaxes))
+-        self.assertEqual((counts, f.traces, f.redispatches, f.respecs), ([4, 1, 4, 1, 0], 2, 2, 1))
++        self.assertEqual((counts, f.traces, f.redispatches), ([4, 1, 4, 0, 0], 2, 2))
+ 
+     def test_a_redo_agrees_with_the_variants_layout_under_its_guards(self):
+         # at b == 1 the eps add returns [1, 1], the variant [b, 1]: one layout under the redo's guard b == 1
+@@ -584,49 +584,20 @@
+         for b in (2, 3, 1):
+             x = torch.randn(b, 64, device="cuda")
+             self.assertEqual(f(x), fn(x), atol=0, rtol=0)
+-        self.assertEqual((f.traces, f.redispatches, f.respecs), (1, 0, 1))
++        self.assertEqual((f.traces, f.redispatches), (2, 0))
+ 
+     @parametrize("adjacent", [False, True])
+-    @parametrize("respec", [False, True])
+-    def test_a_split_in_an_op_respecifies(self, respec, adjacent):
+-        # the op's launches and temporary change with the row count: off, a
+-        # class traces; on, the variant's tape with the op dispatched again at
+-        # the call builds the variant a trace would, with no trace (adjacent:
+-        # two such ops, spliced in one pass)
++    def test_a_split_in_an_op_traces_its_class(self, adjacent):
++        # the op's launches and temporary change with the row count: its class
++        # traces (adjacent: two such ops)
+         def fn(x):
+             return add(split_op(split_op(x) if adjacent else add(x)), 1)
+ 
+-        def run(on, rows):
+-            with mock.patch.object(torch.cuda._host_trace, "respec_refused_ops", on):
+-                f = HostTraceReplay(fn)
+-                for m in rows:
+-                    x = torch.randn(m, 64, device="cuda")
+-                    self.assertEqual(f(x), fn(x), atol=0, rtol=0)
+-            return f
+-
+-        f = run(respec, (8, 40, 100, 12, 50, 128, 3, 64, 65))
+-        self.assertEqual((f.traces, f.respecs, len(f.variants), f.eager), (1, 2, 3, 0) if respec else (3, 0, 3, 0))
+-        # a respecified call replays its new variant; a traced one returns its warm-up's result
+-        self.assertEqual(f.replays, 8 if respec else 6)
+-        if not respec:
+-            return
+-        self.assertEqual(f.respec_refusals, {})
+-        # each respecified variant is the variant a trace at its class builds
+-        for v, m in zip(f.variants[1:], (40, 100)):
+-            traced = run(False, (m,)).variants[0]
+-            mine, theirs = v.captured.lowered, traced.captured.lowered
+-            # renamed in IR: its guards are Env records, its fresh temporary's symbols the variant's own
+-            env = mine.tape.shape_env
+-            self.assertTrue(all(isinstance(g, _ir.Node) for guards in mine.tape.respec_guards.values() for g, _ in guards))
+-            for a in mine.tape.allocs:
+-                self.assertTrue(all(s.node.env is env for s in (a.q, *a.sizes, *a.strides) if isinstance(s, torch.SymInt)))
+-            self.assertEqual([lo.launch.name for lo in mine.launches], [lo.launch.name for lo in theirs.launches])
+-            self.assertEqual(len(mine.allocations), len(theirs.allocations))
+-            self.assertEqual([len(s.launches) for s in v.captured.segments], [len(s.launches) for s in traced.captured.segments])
+-            # the same plan; its seqs are a respecified tape's own, in the same order
+-            plans = [[(s.tensors, [t[0] for t in s.temporaries], s.drops, s.order) for s in p.steps] for p in (v.memory, traced.memory)]
+-            self.assertEqual(plans[0], plans[1])
+-            self.assertEqual(v.memory.outputs, traced.memory.outputs)
++        f = HostTraceReplay(fn)
++        for m in (8, 40, 100, 12, 50, 128, 3, 64, 65):
++            x = torch.randn(m, 64, device="cuda")
++            self.assertEqual(f(x), fn(x), atol=0, rtol=0)
++        self.assertEqual((f.traces, len(f.variants), f.replays, f.eager), (3, 3, 6, 0))
+ 
+     def test_a_refused_redispatch_tries_the_refusing_op_first(self):
+         # the split op refuses at every new class: once it has refused for a
+@@ -637,9 +608,7 @@
+ 
+         redone = []
+         redo = torch.cuda._host_trace_redispatch._redo
+-        with mock.patch.object(torch.cuda._host_trace, "respec_refused_ops", False), mock.patch.object(
+-            torch.cuda._host_trace_redispatch, "_redo", lambda lowered, selector, **k: redone.append(selector.op) or redo(lowered, selector, **k)
+-        ):
++        with mock.patch.object(torch.cuda._host_trace_redispatch, "_redo", lambda lowered, selector, **k: redone.append(selector.op) or redo(lowered, selector, **k)):
+             f = HostTraceReplay(fn)
+             for m, k in ((8, 8), (20, 40), (40, 100), (60, 20)):
+                 x, y = torch.randn(m, 64, device="cuda"), torch.randn(k, 64, device="cuda")
+@@ -647,23 +616,6 @@
+         self.assertEqual((f.traces, f.redispatches, sum(f.redispatch_refusals.values())), (3, 1, 4))
+         self.assertEqual(redone, [0, 1, 1, 0, 1, 1, 0])
+ 
+-    def test_a_respec_takes_the_refused_redispatchs_redos(self):
+-        # the tactic op, dispatched again before the split op refused, is not
+-        # dispatched again by the respec that follows
+-        def fn(x, y):
+-            return tactic_op(x), split_op(y)
+-
+-        redone = []
+-        redo = torch.cuda._host_trace_redispatch._redo
+-        with mock.patch.object(torch.cuda._host_trace_redispatch, "_redo", lambda lowered, selector, **k: redone.append(selector.op) or redo(lowered, selector, **k)):
+-            f = HostTraceReplay(fn)
+-            for m, k in ((8, 8), (20, 40), (20, 40)):
+-                x, y = torch.randn(m, 64, device="cuda"), torch.randn(k, 64, device="cuda")
+-                self.assertEqual(f(x, y), fn(x, y), atol=0, rtol=0)
+-        self.assertEqual((f.traces, f.respecs, f.respec_refusals), (1, 1, {}))
+-        self.assertEqual(redone, [0, 1, 1])
+-
+-    @mock.patch("torch.cuda._host_trace.respec_refused_ops", False)
+     def test_a_redispatch_refusal_names_its_op(self):
+         # the redispatch's redos share one capture: the op that enqueues a
+         # launch the trace does not record is the one its refusal names
+@@ -728,21 +680,6 @@
+         self.assertEqual(sorted(map(len, modes.values())), [1, 1])
+         self.assertEqual(len(set.union(*modes.values())), 2)
+ 
+-    def test_a_respec_dispatches_an_entry_selected_op_again(self):
+-        # the tactic op's entry from a redispatch selects it at the third call,
+-        # where its own guards fail: the respecified tape holds its records at
+-        # the call, not its trace's
+-        def fn(x, y):
+-            return split_op(x), tactic_op(y)
+-
+-        with mock.patch.object(torch.cuda._host_trace, "respec_refused_ops", True):
+-            f = HostTraceReplay(fn)
+-            for m, k in ((8, 20), (8, 40), (40, 40), (50, 50)):
+-                x, y = torch.randn(m, 64, device="cuda"), torch.randn(k, 64, device="cuda")
+-                self.assertEqual(f(x, y), fn(x, y), atol=0, rtol=0)
+-        self.assertEqual((f.traces, f.redispatches, f.respecs, len(f.variants), f.eager), (1, 1, 1, 2, 0))
+-        self.assertEqual(f.respec_refusals, {})
+-
+     @parametrize("how", ["off", "impl", "impl_shared"])
+     @mock.patch("torch.cuda._host_trace.library_impls", False)
+     def test_a_traced_impl_owns_its_kernel_choice(self, how):
+--- a/test/test_cuda_host_trace_triton.py
++++ b/test/test_cuda_host_trace_triton.py
+@@ -873,19 +873,19 @@
+             registry._graphs.clear()
+             registry._graphs.update(graphs)
+ 
+-    @parametrize("how", ["model", "unit", "unit_off", "read_again", "allocates", "allocates_no_respec"])
++    @parametrize("how", ["model", "unit", "unit_off", "read_again", "allocates"])
+     def test_a_python_kernel_choice_in_a_dispatch_unit_dispatches_again(self, how):
+         # SGLang's TGV gating: `if m < X:` in Python picks one of two kernels.
+         # In the model's Python its guard is the graph's (a trace per side):
+         # the next op's redispatch would not run the `if` again. A
+         # dispatch_unit does; a guard read outside the unit too stays the
+-        # graph's; a choice that allocates otherwise respecifies the variant
++        # graph's; a choice that allocates otherwise traces its class
+         def pick(x):
+             y = torch.empty_like(x)
+             n, grid = x.numel(), (triton.cdiv(x.numel(), 128),)
+             if x.shape[0] < 64:
+                 _add[grid](x, y, n, 1, B=128)
+-            elif how.startswith("allocates"):
++            elif how == "allocates":
+                 w = torch.empty_like(x)
+                 _scale[grid](x, w, n, 2, B=128)
+                 _add[grid](w, y, n, 0, B=128)
+@@ -899,10 +899,7 @@
+             y = unit(x)
+             return y * 3 if how == "read_again" and x.shape[0] < 64 else y.sin()
+ 
+-        with (
+-            mock.patch.object(torch.cuda._host_trace, "dispatch_units", how != "unit_off"),
+-            mock.patch.object(torch.cuda._host_trace, "respec_refused_ops", how != "allocates_no_respec"),
+-        ):
++        with mock.patch.object(torch.cuda._host_trace, "dispatch_units", how != "unit_off"):
+             if how == "unit":
+                 op = trace(f, (torch.randn(8, 64, device="cuda"),)).ops[0]
+                 self.assertEqual((op.func, op.kind), (pick, "traced"))
+@@ -911,9 +908,9 @@
+             for m in (8, 100, 8, 100, 30, 200):
+                 x = torch.randn(m, 64, device="cuda")
+                 self.assertEqual(r(x), f(x), atol=0, rtol=0)
+-        traces = 1 if how in ("unit", "allocates") else 2
+-        counts = (r.traces, r.replays, r.eager, r.redispatches, r.respecs, len(r.variants))
+-        self.assertEqual(counts, (traces, 6 - traces, 0, int(how == "unit"), int(how == "allocates"), 1 if how == "unit" else 2))
++        traces = 1 if how == "unit" else 2
++        counts = (r.traces, r.replays, r.eager, r.redispatches, len(r.variants))
++        self.assertEqual(counts, (traces, 6 - traces, 0, int(how == "unit"), traces))
+ 
+ 
+ _REVIEWED = {

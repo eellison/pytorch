@@ -1,0 +1,77 @@
+--- a/torch/cuda/_host_trace_memory.py
++++ b/torch/cuda/_host_trace_memory.py
+@@ -280,15 +280,17 @@
+         if isinstance(step, range):
+             ends.append(lowered.launches[step.stop - 1].seq)
+             for lo in lowered.launches[step.start : step.stop]:
+-                for slot in lo.slots:
+-                    if not isinstance(slot, PointerSlot):
++                # every root the launch holds, addressed or not: an entry for its op (a fold's or a
++                # redispatch's) may address any of them (they match the launch's roots)
++                refs = [s.root for s in lo.slots if isinstance(s, PointerSlot)] + [lowered.lowering.roots[id(r)] for r in lo.launch.roots]
++                for kind, k in refs:
++                    if kind == "argument":
++                        args_used.setdefault(k, set()).add(i)
+                         continue
+-                    if slot.root[0] == "argument":
+-                        args_used.setdefault(slot.root[1], set()).add(i)
+-                    elif slot.base is not None:
+-                        used.setdefault(slot.base, set()).add(i)
+-                        if slot.base < n_alloc:
+-                            last_seq[slot.base] = lo.seq
++                    base = k if kind == "allocation" else n_alloc + k
++                    used.setdefault(base, set()).add(i)
++                    if base < n_alloc:
++                        last_seq[base] = lo.seq
+             continue
+         ends.append(step.seq)
+         bases = [n_alloc + p.root for p in step.outputs if not isinstance(p, int)]
+--- a/test/test_cuda_host_trace_replay.py
++++ b/test/test_cuda_host_trace_replay.py
+@@ -2146,6 +2146,46 @@
+ @requires_cuda_python_bindings
+ @unittest.skipIf(not has_triton(), "requires triton")
+ class TestReplayMemory(TestCase):
++    def test_an_entry_reads_a_root_its_respecified_launch_did_not(self):
++        # argmax respecified at n = 1 reads nothing of v (one element: its launch only writes the
++        # index), but its op holds v: the redispatch entry at n = 13 reads v, which the plan must
++        # keep live through argmax, not free after the Triton add for later allocations to take
++        def fn(a0, a1, a2, a3):
++            v = add(a2, 2)
++            a1 @ a1.t()
++            a3.copy_(a0)
++            return v.argmax(0)
++
++        def randn(*size):
++            return torch.randn(size, device="cuda", dtype=torch.float16)
++
++        f = HostTraceReplay(fn)
++        calls = (
++            (randn(64, 16), randn(16, 19), randn(19), randn(1, 64, 16)),
++            (randn(64, 20)[:, :17], randn(17, 1), randn(1), randn(1, 64, 17)),
++            (randn(55, 2048), randn(2048, 13), randn(13), randn(4, 55, 2048)),
++        )
++        for a0, a1, a2, a3 in calls:
++            self.assertEqual(f(a0, a1, a2, a3.clone()), fn(a0, a1, a2, a3.clone()), atol=0, rtol=0)
++        self.assertEqual((f.traces, f.respecs, f.redispatches, f.eager), (1, 1, 1, 0))
++        tape, memory = f.variants[1].tape, f.variants[1].memory
++        lives = {k: last for step in memory.steps for k, _, last in step.temporaries}
++        # v is the tape's first allocation (the host's empty_like), argmax its last op
++        self.assertGreaterEqual(lives[0], tape.launches[tape.ops[-1].launches.start][0])
++
++    def test_an_entry_reads_a_root_its_traced_launch_did_not(self):
++        # argmax over a size-1 dim at the trace writes zeros and reads nothing of v: its redispatch
++        # entry at size 3 reads v, which the stack's and the add's temporaries must not take
++        def fn(a, b):
++            v = b.sum(2, keepdim=True)
++            return v.argmax(0), torch.stack([a, a]) + 1.5
++
++        f = HostTraceReplay(fn)
++        for n, m, k in ((1, 200, 25), (1, 200, 25), (3, 96, 13)):
++            a, b = (torch.randn(s, device="cuda", dtype=torch.bfloat16) for s in ((m, k), (n, m, k)))
++            self.assertEqual(f(a, b), fn(a, b), atol=0, rtol=0)
++        self.assertEqual((f.traces, f.redispatches, f.eager), (1, 1, 0))
++
+     def test_the_plan_follows_the_tape(self):
+         def fn(x):
+             torch.empty_like(x)

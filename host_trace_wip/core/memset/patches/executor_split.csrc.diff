@@ -1,0 +1,624 @@
+diff -ru build_cpp_ms6/src/torch/csrc/cuda/host_trace/Entry.cpp build_cpp_ms7/src/torch/csrc/cuda/host_trace/Entry.cpp
+--- build_cpp_ms6/src/torch/csrc/cuda/host_trace/Entry.cpp	2026-10-15 07:13:14.899052991 -0700
++++ build_cpp_ms7/src/torch/csrc/cuda/host_trace/Entry.cpp	2026-10-15 09:26:25.168742692 -0700
+@@ -183,7 +183,7 @@
+   for (const Segment& g : segments_) {
+     for (size_t i = g.first; i < g.stop; ++i) {
+       const Record& r = records_[i];
+-      const Segment::Held& h = g.held[g.form][i - g.first];
++      const Segment::Held& h = g.held[2 * g.form + g.split][i - g.first];
+       if (!h.held) {
+         out.append(py::none());
+       } else if (r.kind == Kind::Memset) {
+@@ -1730,6 +1730,11 @@
+           py::arg("exec"),
+           py::arg("graph"),
+           py::arg("pieces"))
++      .def(
++          "set_split_cuts",
++          &HostTraceVariant::set_split_cuts,
++          py::arg("segment"),
++          py::arg("cuts"))
+       .def_property_readonly("python_steps", &HostTraceVariant::python_steps)
+       .def_readonly("python_calls", &HostTraceVariant::python_calls);
+ #if defined(__linux__)
+@@ -1759,6 +1764,21 @@
+   });
+   m.def("_host_trace_tma_cache_hits", [] { return tma_cache_hits; });
+   m.def("_host_trace_valid_first_misses", [] { return valid_first_misses; });
++  m.def("_host_trace_split", [](std::optional<int64_t> threshold) {
++    const int64_t old = split_threshold;
++    if (threshold) {
++      split_threshold = *threshold;
++    }
++    return old;
++  });
++  m.def("_host_trace_split_counts", [] { return py::make_tuple(split_calls, split_builds, split_catch_up_sets); });
++  m.def("_host_trace_split_catch_up", [](std::optional<int64_t> n) {
++    const int64_t old = split_catch_up;
++    if (n) {
++      split_catch_up = *n;
++    }
++    return old;
++  });
+   m.def("_host_trace_piece_skips", [] { return piece_skips; });
+   m.def("_host_trace_buffered_runs", [] { return buffered_runs; });
+   m.def("_host_trace_delta_counts", [] {
+diff -ru build_cpp_ms6/src/torch/csrc/cuda/host_trace/Patch.cpp build_cpp_ms7/src/torch/csrc/cuda/host_trace/Patch.cpp
+--- build_cpp_ms6/src/torch/csrc/cuda/host_trace/Patch.cpp	2026-10-15 05:49:12.347087272 -0700
++++ build_cpp_ms7/src/torch/csrc/cuda/host_trace/Patch.cpp	2026-10-15 09:26:25.168143040 -0700
+@@ -22,6 +22,11 @@
+ int64_t kernel_node_sets = 0;
+ int64_t kernel_row_switches = 0;
+ int64_t piece_skips = 0;
++int64_t split_threshold = -1;
++int64_t split_catch_up = 128;
++int64_t split_catch_up_sets = 0;
++int64_t split_calls = 0;
++int64_t split_builds = 0;
+ bool phase_timing = false;
+ std::array<int64_t, 16> phase_ns{};
+ int64_t tma_encodes = 0;
+@@ -483,15 +488,16 @@
+ 
+ std::vector<HostTraceVariant::Segment::Held>& HostTraceVariant::form_held(
+     Segment& run,
+-    size_t form) {
+-  if (run.held.size() < run.execs.size()) {
+-    run.held.resize(run.execs.size());
++    size_t form,
++    bool split) {
++  if (run.held.size() < 2 * run.execs.size()) {
++    run.held.resize(2 * run.execs.size());
+   }
+-  std::vector<Segment::Held>& held = run.held[form];
++  std::vector<Segment::Held>& held = run.held[2 * form + split];
+   if (held.empty()) {
+     const size_t n = run.stop - run.first;
+     held.resize(n + (form == 0 ? 0 : run.clones[form - 1].pieces.size()));
+-    const std::vector<Segment::Held>& now = run.held[run.form];
++    const std::vector<Segment::Held>& now = run.held[2 * run.form + run.split];
+     for (size_t i = 0; i < n && i < now.size(); ++i) {
+       held[i].copy = now[i].copy;
+     }
+@@ -499,20 +505,65 @@
+   return held;
+ }
+ 
++bool HostTraceVariant::changed_since(
++    const Segment& run,
++    const Segment::Seen& s,
++    const Frame& frame,
++    uint8_t* out) const {
++  const size_t n = run.stop - run.first;
++  if (!s.saved || s.users_version != users_version_) {
++    std::fill(out, out + n, 1);
++    return false;
++  }
++  const int64_t* v = frame.values.data();
++  const int64_t* bases = frame.bases.data();
++  const size_t g = &run - segments_.data();
++  const uint32_t* segment_bases = users_.segment_bases.data() + users_.segment_first[g];
++  const size_t base_count = users_.segment_first[g + 1] - users_.segment_first[g];
++  std::copy(s.dirty.begin(), s.dirty.end(), out);
++  auto mark_in_run = [&](const std::vector<uint32_t>& first, const std::vector<uint32_t>& records, size_t i) {
++    for (uint32_t k = first[i]; k < first[i + 1]; ++k) {
++      if (records[k] >= run.first && records[k] < run.stop) {
++        out[records[k] - run.first] = 1;
++      }
++    }
++  };
++  for (size_t j = 0; j < run.read_rows.size(); ++j) {
++    if (v[run.read_rows[j]] != s.rows[j]) {
++      mark_in_run(users_.row_first, users_.row_records, run.read_rows[j]);
++    }
++  }
++  for (size_t j = 0; j < base_count; ++j) {
++    if (bases[segment_bases[j]] != s.bases[j]) {
++      mark_in_run(users_.base_first, users_.base_records, segment_bases[j]);
++    }
++  }
++  for (size_t j = 0; j < run.sites.size(); ++j) {
++    if (frame.site_entries[run.sites[j]] != s.sites[j]) {
++      for (size_t i : sites_[run.sites[j]].records) {
++        out[i - run.first] = 1;
++      }
++    }
++  }
++  return true;
++}
++
+ void HostTraceVariant::switch_form(
+     Segment& run,
+     size_t form,
++    bool split,
+     const Frame& frame) {
+-  std::vector<Segment::Held>& next = form_held(run, form);
++  std::vector<Segment::Held>& next = form_held(run, form, split);
+   uint8_t* dirty = dirty_.data() + run.first;
+   const size_t n = run.stop - run.first;
+   if (!form_held_enabled) {
+-    // the form's exec as unknown
++    // the state's exec as unknown
+     for (Segment::Held& h : next) {
+       h.held = false;
+     }
+     std::fill(dirty, dirty + n, 1);
+     run.form = form;
++    run.split = split;
+     return;
+   }
+   const int64_t* v = frame.values.data();
+@@ -520,12 +571,12 @@
+   const size_t g = &run - segments_.data();
+   const uint32_t* segment_bases = users_.segment_bases.data() + users_.segment_first[g];
+   const size_t base_count = users_.segment_first[g + 1] - users_.segment_first[g];
+-  if (run.seen.size() < run.execs.size()) {
+-    run.seen.resize(run.execs.size());
++  if (run.seen.size() < 2 * run.execs.size()) {
++    run.seen.resize(2 * run.execs.size());
+   }
+-  // the current form's records are clean at the call's rows, bases and site
++  // the current state's records are clean at the call's rows, bases and site
+   // rows but those dirty_ marks
+-  Segment::Seen& a = run.seen[run.form];
++  Segment::Seen& a = run.seen[2 * run.form + run.split];
+   a.rows.resize(run.read_rows.size());
+   for (size_t j = 0; j < run.read_rows.size(); ++j) {
+     a.rows[j] = v[run.read_rows[j]];
+@@ -541,37 +592,142 @@
+   a.dirty.assign(dirty, dirty + n);
+   a.saved = true;
+   a.users_version = users_version_;
+-  const Segment::Seen& b = run.seen[form];
+   run.form = form;
+-  if (!b.saved || b.users_version != users_version_) {
+-    std::fill(dirty, dirty + n, 1);
+-    return;
++  run.split = split;
++  changed_since(run, run.seen[2 * form + split], frame, dirty);
++}
++
++void HostTraceVariant::set_split_cuts(size_t segment, const std::vector<size_t>& cuts) {
++  TORCH_CHECK_VALUE(segment < segments_.size(), "no segment ", segment);
++  Segment& run = segments_[segment];
++  const size_t n = run.stop - run.first;
++  for (size_t j = 0; j < cuts.size(); ++j) {
++    TORCH_CHECK_VALUE(cuts[j] > 0 && cuts[j] < n && (j == 0 || cuts[j] > cuts[j - 1]), "a segment's cut points");
+   }
+-  std::copy(b.dirty.begin(), b.dirty.end(), dirty);
+-  auto mark_in_run = [&](const std::vector<uint32_t>& first, const std::vector<uint32_t>& records, size_t i) {
+-    for (uint32_t k = first[i]; k < first[i + 1]; ++k) {
+-      if (records[k] >= run.first && records[k] < run.stop) {
+-        dirty_[records[k]] = 1;
+-      }
++  run.cuts = cuts;
++}
++
++bool HostTraceVariant::split_ready(Segment& run, size_t form, const Frame& frame) {
++  if (run.splits.size() < run.execs.size()) {
++    run.splits.resize(run.execs.size());
++  }
++  Segment::Split& sp = run.splits[form];
++  if (sp.tried) {
++    return sp.ok;
++  }
++  sp.tried = true;
++  const size_t n = run.stop - run.first;
++  // the first range about an eighth of the records, each next at most about
++  // six times the one before (a node's GPU time covers several nodes' patch)
++  sp.bounds = {0};
++  size_t want = std::max<size_t>(n / 8, 1);
++  for (size_t c : run.cuts) {
++    if (c >= want && c < n) {
++      sp.bounds.push_back(c);
++      want = 7 * c;
+     }
++  }
++  sp.bounds.push_back(n);
++  if (sp.bounds.size() < 3) {
++    return false;
++  }
++  Segment::Clone* clone = form == 0 ? nullptr : &run.clones[form - 1];
++  auto node_of = [&](size_t i) {
++    return clone ? clone->nodes[i] : records_[run.first + i].node;
+   };
+-  for (size_t j = 0; j < run.read_rows.size(); ++j) {
+-    if (v[run.read_rows[j]] != b.rows[j]) {
+-      mark_in_run(users_.row_first, users_.row_records, run.read_rows[j]);
+-    }
++  auto range_of = [&](size_t i) {
++    return static_cast<size_t>(std::upper_bound(sp.bounds.begin(), sp.bounds.end(), i) - sp.bounds.begin() - 1);
++  };
++  const size_t pieces = clone ? clone->pieces.size() : 0;
++  sp.nodes.assign(n, nullptr);
++  sp.piece_nodes.assign(pieces, nullptr);
++  sp.piece_range.assign(pieces, 0);
++  for (size_t j = 0; j < pieces; ++j) {
++    // a site's pieces replace its records, all in one range
++    sp.piece_range[j] = range_of(sites_[clone->pieces[j].site].records.front() - run.first);
+   }
+-  for (size_t j = 0; j < base_count; ++j) {
+-    if (bases[segment_bases[j]] != b.bases[j]) {
+-      mark_in_run(users_.base_first, users_.base_records, segment_bases[j]);
++  const int64_t* v = frame.values.data();
++  const int64_t* bases = frame.bases.data();
++  const auto graph = form == 0 ? run.native->raw_cuda_graph() : reinterpret_cast<cudaGraph_t>(clone->graph);
++  auto fail = [&]() {
++    (void)cudaGetLastError();
++    for (CUgraphExec e : sp.execs) {
++      C10_CUDA_CHECK_WARN(cudaGraphExecDestroy(reinterpret_cast<cudaGraphExec_t>(e)));
++    }
++    for (CUgraph h : sp.graphs) {
++      C10_CUDA_CHECK_WARN(cudaGraphDestroy(reinterpret_cast<cudaGraph_t>(h)));
++    }
++    sp.execs.clear();
++    sp.graphs.clear();
++    return false;
++  };
++  for (size_t k = 0; k + 1 < sp.bounds.size(); ++k) {
++    cudaGraph_t sub = nullptr;
++    if (cudaGraphClone(&sub, graph) != cudaSuccess) {
++      return fail();
++    }
++    sp.graphs.push_back(reinterpret_cast<CUgraph>(sub));
++    auto take = [&](CUgraphNode original, bool inside, CUgraphNode& out) {
++      cudaGraphNode_t node = nullptr;
++      if (cudaGraphNodeFindInClone(&node, reinterpret_cast<cudaGraphNode_t>(original), sub) != cudaSuccess) {
++        return false;
++      }
++      if (inside) {
++        out = reinterpret_cast<CUgraphNode>(node);
++        return true;
++      }
++      return cudaGraphDestroyNode(node) == cudaSuccess;
++    };
++    for (size_t i = 0; i < n; ++i) {
++      CUgraphNode unused = nullptr;
++      if (node_of(i) && !take(node_of(i), range_of(i) == k, range_of(i) == k ? sp.nodes[i] : unused)) {
++        return fail();
++      }
+     }
+-  }
+-  for (size_t j = 0; j < run.sites.size(); ++j) {
+-    if (frame.site_entries[run.sites[j]] != b.sites[j]) {
+-      for (size_t i : sites_[run.sites[j]].records) {
+-        dirty_[i] = 1;
++    for (size_t j = 0; j < pieces; ++j) {
++      CUgraphNode unused = nullptr;
++      if (!take(clone->pieces[j].node, sp.piece_range[j] == k, sp.piece_range[j] == k ? sp.piece_nodes[j] : unused)) {
++        return fail();
++      }
++    }
++    // the driver reads a memcpy node's operands at instantiation: the call's
++    auto live = [&](const Record& r, CUgraphNode node) {
++      if (!node || r.kind != Kind::Memcpy) {
++        return true;
+       }
++      const int64_t row = r.site >= 0 ? frame.site_entries[r.site] : 0;
++      const MemcpyRow& m = memcpy_row(r, row);
++      const std::array<int64_t, 3> at = memcpy_shape(m, v, bases);
++      return at[2] > 0 &&
++          cudaGraphMemcpyNodeSetParams1D(
++              reinterpret_cast<cudaGraphNode_t>(node),
++              reinterpret_cast<void*>(at[0]),
++              reinterpret_cast<const void*>(at[1]),
++              static_cast<size_t>(at[2]),
++              m.kind) == cudaSuccess;
++    };
++    for (size_t i = 0; i < n; ++i) {
++      if (range_of(i) == k && !live(records_[run.first + i], sp.nodes[i])) {
++        return fail();
++      }
++    }
++    for (size_t j = 0; j < pieces; ++j) {
++      if (sp.piece_range[j] == k && !live(clone->pieces[j], sp.piece_nodes[j])) {
++        return fail();
++      }
++    }
++    cudaGraphExec_t exec = nullptr;
++    if (cudaGraphInstantiateWithFlags(&exec, sub, cudaGraphInstantiateFlagAutoFreeOnLaunch | cudaGraphInstantiateFlagUseNodePriority) != cudaSuccess) {
++      return fail();
+     }
++    sp.execs.push_back(reinterpret_cast<CUgraphExec>(exec));
++    // before any node is set (an update of a never-uploaded exec can leave the
++    // node on a slow path for good)
++    C10_CUDA_CHECK(cudaGraphUpload(exec, at::cuda::getCurrentCUDAStream(device_)));
+   }
++  ++split_builds;
++  sp.ok = true;
++  return true;
+ }
+ 
+ bool HostTraceVariant::set_argument_copies(Frame& frame) {
+@@ -643,7 +799,9 @@
+   const size_t form =
+       run.forms.size() > 1 ? frame.forms[&run - segments_.data()] : 0;
+   Segment::Clone* clone = form == 0 ? nullptr : &run.clones[form - 1];
+-  const CUgraphExec exec = run.execs[form];
++  CUgraphExec exec = run.execs[form];
++  // the hooks' Python replay runs the graph's own exec, whole
++  const bool hooks = observed(run);
+   // the philox offsets the segment's RNG calls take before the next, and
+   // the intragraph offset of the current one's kernels
+   int64_t running = 0;
+@@ -804,21 +962,46 @@
+       mark(users_.base_first, users_.base_records, b);
+     }
+   }
+-  if (form != run.form) {
+-    switch_form(run, form, frame);
+-  }
+-  std::vector<Segment::Held>& held = form_held(run, form);
+   const size_t n = run.stop - run.first;
+-  for (size_t i = run.first; i < run.stop; ++i) {
+-    CUgraphNode node = clone ? clone->nodes[i - run.first] : records_[i].node;
+-    if (node && dirty_[i]) {
+-      patch(records_[i], held[i - run.first], node);
+-      dirty_[i] = always_[i];
++  bool split = false;
++  if (split_threshold >= 0 && !hooks && !run.cuts.empty() && !run.generator) {
++    // the patch set relative to the form's whole exec
++    size_t whole = n;
++    if (form == run.form && !run.split) {
++      whole = static_cast<size_t>(std::count(dirty_.begin() + run.first, dirty_.begin() + run.stop, 1));
++    } else if (run.seen.size() > 2 * form) {
++      thread_local std::vector<uint8_t> marks;
++      marks.resize(n);
++      if (changed_since(run, run.seen[2 * form], frame, marks.data())) {
++        whole = static_cast<size_t>(std::count(marks.begin(), marks.end(), 1));
++      }
++    }
++    split = static_cast<int64_t>(whole) > split_threshold && split_ready(run, form, frame);
++  }
++  if (form != run.form || split != run.split) {
++    switch_form(run, form, split, frame);
++  }
++  std::vector<Segment::Held>& held = form_held(run, form, split);
++  Segment::Split* sp = split ? &run.splits[form] : nullptr;
++  // range k's records (all of them whole: k -1) and its sites' pieces
++  auto patch_range = [&](int64_t k) {
++    const size_t lo = k < 0 ? 0 : sp->bounds[k];
++    const size_t hi = k < 0 ? n : sp->bounds[k + 1];
++    for (size_t i = run.first + lo; i < run.first + hi; ++i) {
++      CUgraphNode node = sp ? sp->nodes[i - run.first] : clone ? clone->nodes[i - run.first] : records_[i].node;
++      if (node && dirty_[i]) {
++        patch(records_[i], held[i - run.first], node);
++        dirty_[i] = always_[i];
++      }
++    }
++    if (!clone) {
++      return;
+     }
+-  }
+-  if (clone) {
+     thread_local std::vector<int64_t> reads;
+     for (Segment::Clone::Group& group : clone->groups) {
++      if (sp && (group.first == group.stop || sp->piece_range[group.first] != static_cast<size_t>(k))) {
++        continue;
++      }
+       const Site& s = sites_[group.site];
+       reads.clear();
+       reads.push_back(frame.site_entries[group.site]);
+@@ -828,7 +1011,7 @@
+       for (int64_t b : s.piece_bases) {
+         reads.push_back(bases[b]);
+       }
+-      bool same = !s.piece_always && group.users_version == users_version_ && reads == group.seen;
++      bool same = !s.piece_always && group.users_version[split] == users_version_ && reads == group.seen[split];
+       for (size_t j = group.first; same && j < group.stop; ++j) {
+         same = held[n + j].held;
+       }
+@@ -838,11 +1021,70 @@
+       }
+       for (size_t j = group.first; j < group.stop; ++j) {
+         Record& r = clone->pieces[j];
+-        patch(r, held[n + j], r.node);
++        patch(r, held[n + j], sp ? sp->piece_nodes[j] : r.node);
+       }
+-      group.seen = reads;
+-      group.users_version = users_version_;
++      group.seen[split] = reads;
++      group.users_version[split] = users_version_;
+     }
++  };
++  if (sp) {
++    ++split_calls;
++    const cudaStream_t stream = at::cuda::getCurrentCUDAStream(device_);
++    for (size_t k = 0; k + 1 < sp->bounds.size(); ++k) {
++      exec = sp->execs[k];
++      patch_range(static_cast<int64_t>(k));
++      // the first launch runs the graph's replay prologue, once per call
++      if (k == 0) {
++        run.native->replay_exec(reinterpret_cast<cudaGraphExec_t>(exec));
++      } else {
++        C10_CUDA_CHECK(cudaGraphLaunch(reinterpret_cast<cudaGraphExec_t>(exec), stream));
++      }
++    }
++    // catch-up, while the GPU runs the last range: up to split_catch_up of
++    // the whole exec's stale records are set (it is not launched this call),
++    // and its snapshot moves to the call's values, so once few records changed
++    // since, the policy launches it whole again
++    if (form_held_enabled && split_catch_up > 0) {
++      if (run.seen.size() < 2 * run.execs.size()) {
++        run.seen.resize(2 * run.execs.size());
++      }
++      Segment::Seen& w = run.seen[2 * form];
++      thread_local std::vector<uint8_t> marks;
++      marks.resize(n);
++      changed_since(run, w, frame, marks.data());
++      std::vector<Segment::Held>& whole = form_held(run, form, false);
++      exec = run.execs[form];
++      int64_t budget = split_catch_up;
++      for (size_t i = 0; i < n && budget > 0; ++i) {
++        CUgraphNode node = clone ? clone->nodes[i] : records_[run.first + i].node;
++        if (node && marks[i]) {
++          patch(records_[run.first + i], whole[i], node);
++          marks[i] = always_[run.first + i];
++          --budget;
++          ++split_catch_up_sets;
++        }
++      }
++      const int64_t* bases_now = frame.bases.data();
++      const uint32_t* segment_bases = users_.segment_bases.data() + users_.segment_first[&run - segments_.data()];
++      const size_t base_count = users_.segment_first[&run - segments_.data() + 1] - users_.segment_first[&run - segments_.data()];
++      w.rows.resize(run.read_rows.size());
++      for (size_t j = 0; j < run.read_rows.size(); ++j) {
++        w.rows[j] = v[run.read_rows[j]];
++      }
++      w.bases.resize(base_count);
++      for (size_t j = 0; j < base_count; ++j) {
++        w.bases[j] = bases_now[segment_bases[j]];
++      }
++      w.sites.resize(run.sites.size());
++      for (size_t j = 0; j < run.sites.size(); ++j) {
++        w.sites[j] = frame.site_entries[run.sites[j]];
++      }
++      w.dirty.assign(marks.begin(), marks.end());
++      w.saved = true;
++      w.users_version = users_version_;
++    }
++  } else {
++    patch_range(-1);
+   }
+   // a replay advances the generator by what the rows' calls take, as eager
+   if (run.generator && running != run.rng_increment) {
+@@ -865,7 +1107,9 @@
+     at::getHostAllocator(at::kCUDA)->record_event(ptr, ctx, at::cuda::getCurrentCUDAStream(device_));
+   }
+   phase_add(5, pt);
+-  if (observed(run)) {
++  if (sp) {
++    // launched range by range above
++  } else if (hooks) {
+     TORCH_CHECK(
+         form == 0,
+         "host_trace: replay hooks on a segment replayed in another form");
+diff -ru build_cpp_ms6/src/torch/csrc/cuda/host_trace/Sites.cpp build_cpp_ms7/src/torch/csrc/cuda/host_trace/Sites.cpp
+--- build_cpp_ms6/src/torch/csrc/cuda/host_trace/Sites.cpp	2026-10-15 07:13:14.898209210 -0700
++++ build_cpp_ms7/src/torch/csrc/cuda/host_trace/Sites.cpp	2026-10-15 08:03:06.352257244 -0700
+@@ -869,7 +869,7 @@
+         site,
+         " in the segment");
+     replaced[site] = true;
+-    c.groups.push_back({site, c.pieces.size(), c.pieces.size(), {}, 0});
++    c.groups.push_back({site, c.pieces.size(), c.pieces.size(), {}, {}});
+     size_t pos = 0;
+     for (py::handle h : t[1].cast<py::tuple>()) {
+       auto n = h.cast<py::tuple>();
+@@ -903,6 +903,14 @@
+ 
+ HostTraceVariant::~HostTraceVariant() {
+   for (Segment& g : segments_) {
++    for (const Segment::Split& sp : g.splits) {
++      for (CUgraphExec e : sp.execs) {
++        C10_CUDA_CHECK_WARN(cudaGraphExecDestroy(reinterpret_cast<cudaGraphExec_t>(e)));
++      }
++      for (CUgraph h : sp.graphs) {
++        C10_CUDA_CHECK_WARN(cudaGraphDestroy(reinterpret_cast<cudaGraph_t>(h)));
++      }
++    }
+     for (size_t f = 1; f < g.execs.size(); ++f) {
+       C10_CUDA_CHECK_WARN(
+           cudaGraphExecDestroy(reinterpret_cast<cudaGraphExec_t>(g.execs[f])));
+diff -ru build_cpp_ms6/src/torch/csrc/cuda/host_trace/Variant.h build_cpp_ms7/src/torch/csrc/cuda/host_trace/Variant.h
+--- build_cpp_ms6/src/torch/csrc/cuda/host_trace/Variant.h	2026-10-15 07:13:14.898696605 -0700
++++ build_cpp_ms7/src/torch/csrc/cuda/host_trace/Variant.h	2026-10-15 09:26:25.168336417 -0700
+@@ -94,6 +94,18 @@
+ extern bool placement_reuse_enabled;
+ // a form switch restores what the form's exec last held (else forgets it)
+ extern bool form_held_enabled;
++// executor-level split (opt-in): a call whose patch set relative to its
++// form's whole exec has more than split_threshold records launches the form's
++// sub-execs back to back instead, patching each while the one before it runs;
++// -1: off
++extern int64_t split_threshold;
++// test-only: calls launched split, and forms whose sub-execs were built
++extern int64_t split_calls;
++extern int64_t split_builds;
++// per split call, at most this many of the whole exec's stale records are set
++// after the last range is launched (catch-up); test-only: those records
++extern int64_t split_catch_up;
++extern int64_t split_catch_up_sets;
+ // add_entry takes an entry's TMA descriptors (else refuses the entry)
+ extern bool entry_descriptors_enabled;
+ 
+@@ -270,6 +282,9 @@
+       int64_t free_at);
+   // Replaces the program by one that extends it (rows added, for add_entry)
+   void set_program(const HostTraceProgram& program);
++  // the lowering's safe cut points of a segment (record offsets, sorted), for
++  // the executor-level split (split_threshold)
++  void set_split_cuts(size_t segment, const std::vector<size_t>& cuts);
+   // Adds a form of the segment: exec, an instantiation of graph, a clone of
+   // the segment's graph with each of its sites' kernel nodes at the launch
+   // attributes of the site's arm in `arms`, or, a piece arm's site, its nodes
+@@ -487,8 +502,8 @@
+         size_t site;
+         size_t first;
+         size_t stop;
+-        std::vector<int64_t> seen;
+-        uint64_t users_version = 0;
++        std::array<std::vector<int64_t>, 2> seen; // per mode (whole, split)
++        std::array<uint64_t, 2> users_version{};
+       };
+       std::vector<Group> groups;
+     };
+@@ -504,7 +519,7 @@
+       std::array<int64_t, 4> memset{}; // address, width, height, pitch
+       std::array<int64_t, 3> copy{}; // dst, src, bytes
+     };
+-    std::vector<std::vector<Held>> held;
++    std::vector<std::vector<Held>> held; // per state: 2 * form + split
+     // with form_held_enabled, per form left: the rows, bases and site rows its
+     // records were last patched at, and which were dirty then
+     struct Seen {
+@@ -515,9 +530,27 @@
+       std::vector<int64_t> sites; // per site in `sites`
+       std::vector<uint8_t> dirty; // per record
+     };
+-    std::vector<Seen> seen;
++    std::vector<Seen> seen; // per state
+     // the rows its records read (index_users)
+     std::vector<int64_t> read_rows;
++    // the active state's mode: the form's sub-execs (Split), else its exec
++    bool split = false;
++    // the lowering's safe cut points (record offsets: no programmatic edge
++    // into the record, outside a keyed site's chain and a fork), sorted
++    std::vector<size_t> cuts;
++    // per form, its sub-execs: each a clone of the form's graph without the
++    // nodes of the other ranges, over records [bounds[k], bounds[k + 1])
++    struct Split {
++      bool tried = false;
++      bool ok = false;
++      std::vector<size_t> bounds;
++      std::vector<CUgraph> graphs;
++      std::vector<CUgraphExec> execs;
++      std::vector<CUgraphNode> nodes; // per record, in its range's graph
++      std::vector<CUgraphNode> piece_nodes; // per piece of the form
++      std::vector<size_t> piece_range; // per piece
++    };
++    std::vector<Split> splits; // per form
+     // an RNG segment's: the generator its kernels draw from, its capture's
+     // seed and offset addresses, and the increment its exec is set to (-1
+     // the capture's)
+@@ -704,11 +737,17 @@
+   KernelRow& kernel_row(Record& r, int64_t row) const;
+   // the form's held state, made at its first use (a memcpy's operands taken
+   // from the current form's)
+-  std::vector<Segment::Held>& form_held(Segment& run, size_t form);
++  std::vector<Segment::Held>& form_held(Segment& run, size_t form, bool split = false);
+   // to another form of the run: with form_held_enabled its nodes keep what
+   // they held and dirty_ marks what changed since its last replay, else none
+   // is held
+-  void switch_form(Segment& run, size_t form, const Frame& frame);
++  void switch_form(Segment& run, size_t form, bool split, const Frame& frame);
++  // marks into `out` (per record of the run) what changed since the state's
++  // last replay; false when the state has no snapshot (all changed)
++  bool changed_since(const Segment& run, const Segment::Seen& s, const Frame& frame, uint8_t* out) const;
++  // the form's sub-execs, built at their first use; false when it has none
++  bool split_ready(Segment& run, size_t form, const Frame& frame);
++
+   const KernelRow& kernel_row(const Record& r, int64_t row) const;
+   const MemsetRow& memset_row(const Record& r, int64_t row) const;
+   const MemcpyRow& memcpy_row(const Record& r, int64_t row) const;

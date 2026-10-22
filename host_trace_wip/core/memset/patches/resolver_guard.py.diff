@@ -1,0 +1,46 @@
+diff -ru -x __pycache__ step_ms7/test/test_cuda_host_trace_replay.py step_ms8/test/test_cuda_host_trace_replay.py
+--- step_ms7/test/test_cuda_host_trace_replay.py	2026-10-15 11:31:40.101961954 -0700
++++ step_ms8/test/test_cuda_host_trace_replay.py	2026-10-15 12:32:24.525823457 -0700
+@@ -846,6 +846,30 @@
+             self.assertEqual((cause[0], cause[1], n), ("dispatch", "host_trace_test.reads_module_state.default", 1))
+             self.assertEqual(cause[4], "host_trace_test.reads_module_state.default dispatches otherwise")
+ 
++    def test_a_redo_resolves_an_aliased_argument_at_its_own_view(self):
++        # kv and kv2 are two arguments on one storage at different offsets; the
++        # body reads kv2 from module state: the redo's stand-in for it is kv2's
++        # own view (not the root's first argument kv's). Outputs bitwise
++        def step(kv, kv2, q):
++            saved, _MODULE_STATE["kv"] = _MODULE_STATE.get("kv"), kv2
++            try:
++                out = torch.empty_like(q)
++                torch.ops.host_trace_test.reads_module_state(q, out)
++                return out * 1, kv[:1] * 1
++            finally:
++                _MODULE_STATE["kv"] = saved
++
++        base = torch.randn(128, 8, device="cuda")
++        kv, kv2 = base[:64], base[32:96]
++        _MODULE_STATE["kv"] = kv2
++        self.addCleanup(_MODULE_STATE.pop, "kv", None)
++        f = HostTraceReplay(step)
++        with mock.patch.object(torch.cuda._host_trace, "redo_resolves_arguments", True):
++            for n in (4, 1, 6, 1):
++                q = torch.randn(n, 8, device="cuda")
++                self.assertEqual(f(kv, kv2, q), step(kv, kv2, q), atol=0, rtol=0)
++        self.assertEqual((f.traces, f.redispatches, f.retrace_causes), (1, 1, {}))
++
+     @parametrize("first", [4, 1])
+     def test_a_copy_that_becomes_a_memcpy_is_a_section(self, first):
+         # copy_'s host takes a memcpy where the strided source is contiguous
+--- step_ms7/torch/cuda/_host_trace_redispatch.py	2026-10-12 08:56:46.821636843 -0700
++++ step_ms8/torch/cuda/_host_trace_redispatch.py	2026-10-15 12:33:18.583023500 -0700
+@@ -829,6 +829,9 @@
+         for m, x in zip(made[n:], at_call[n:]):
+             tr.values.bind(m, x)
+         rec = next(i for i in inputs if i.root is r)
++        if rec.position != found[0].position:
++            # the root's record is another argument's view of it: not this tensor's layout
++            return t
+         tr.arguments[id(r)] = rec
+         resolved[id(t)] = _TracedTensor(r, list(rec.sizes), list(rec.strides), rec.offset, t.dtype, t.device)
+         return resolved[id(t)]

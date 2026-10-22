@@ -1,0 +1,68 @@
+--- a/torch/cuda/_host_trace.py
++++ b/torch/cuda/_host_trace.py
+@@ -39,6 +39,10 @@
+ # "sympy" (_TraceShapeEnv); a trusted trace is always sympy's
+ symbolic = "ir"
+ 
++# a view's symbolic size-1 dim may take another stride than eager's (it
++# addresses nothing), so the trace does not branch on that size being 1
++free_size_one_strides = True
++
+ 
+ class Declined(RuntimeError):
+     """The host did something the tracer does not describe; the call runs
+--- a/torch/cuda/_host_trace_tape.py
++++ b/torch/cuda/_host_trace_tape.py
+@@ -547,6 +547,12 @@
+                     f"{func} of an untraced tensor with symbolic arguments"
+                 )
+             return func(*args, **kwargs)
++        if func in (aten.view.default, aten._unsafe_view.default) and torch.cuda._host_trace.free_size_one_strides:
++            shape = list(args[1])
++            if not any(type(n) is int and n == -1 for n in shape):
++                strides = _free_view_strides(src.shape, src._sym_strides, shape)
++                if strides is not None:
++                    return _TracedTensor(src._root, shape, strides, src._sym_offset, src.dtype, src.device)
+         out = None
+         if (route := _META_VIEWS.get(func)) is not None:
+             twin = torch.empty(0, dtype=src.dtype, device="meta").as_strided(src.shape, src._sym_strides, src._sym_offset)
+@@ -1631,6 +1637,39 @@
+     return node.expr
+ 
+ 
++def _free_view_strides(old_shape: Sequence[Any], old_stride: Sequence[Any], new_shape: list) -> list | None:
++    """computeStride's view strides, deciding no symbolic size is 1: a dim
++    joins the next one's chunk only where its stride continues it, and a chunk
++    takes the view dims whose product is its size identically. Where a
++    symbolic size is 1 they differ from eager's only on size-1 dims. None
++    where that does not decide the view."""
++    old = [(n, s) for n, s in zip(old_shape, old_stride) if not _same(n, 1)]
++    numel = functools.reduce(operator.mul, old_shape, 1)
++    if not old or numel == 0:
++        return None
++    strides: list = [None] * len(new_shape)
++    view_d, d = len(new_shape) - 1, len(old) - 1
++    while d >= 0:
++        size, base = old[d]
++        while d > 0 and not (old[d - 1][1] != size * base):
++            d -= 1
++            size = size * old[d][0]
++        d -= 1
++        product = 1
++        while view_d >= 0 and (not _same(product, size) or _same(new_shape[view_d], 1)):
++            strides[view_d] = product * base
++            product = product * new_shape[view_d]
++            view_d -= 1
++        if not _same(product, size):
++            return None
++    return strides if view_d < 0 else None
++
++
++def _same(a: Any, b: Any) -> bool:
++    # equal as expressions, at every value of their symbols
++    return _sym_key(a) == _sym_key(b)
++
++
+ def _guard_each(terms: list) -> bool:
+     # One guard per term rather than one conjunction: a True answer records
+     # every term, a False answer only the first failing term's negation.

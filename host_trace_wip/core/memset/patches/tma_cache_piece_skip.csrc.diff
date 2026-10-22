@@ -1,0 +1,249 @@
+diff -ru build_cpp_ms4/src/torch/csrc/cuda/host_trace/Entry.cpp build_cpp_ms5/src/torch/csrc/cuda/host_trace/Entry.cpp
+--- build_cpp_ms4/src/torch/csrc/cuda/host_trace/Entry.cpp	2026-10-14 19:47:30.896881914 -0700
++++ build_cpp_ms5/src/torch/csrc/cuda/host_trace/Entry.cpp	2026-10-15 05:48:41.545455165 -0700
+@@ -1757,6 +1757,8 @@
+   m.def("_host_trace_tma_counts", [] {
+     return py::make_tuple(tma_encodes, tma_replaces);
+   });
++  m.def("_host_trace_tma_cache_hits", [] { return tma_cache_hits; });
++  m.def("_host_trace_piece_skips", [] { return piece_skips; });
+   m.def("_host_trace_buffered_runs", [] { return buffered_runs; });
+   m.def("_host_trace_delta_counts", [] {
+     return py::make_tuple(delta_skips, delta_partials, delta_fulls, delta_rows_evaluated);
+diff -ru build_cpp_ms4/src/torch/csrc/cuda/host_trace/Patch.cpp build_cpp_ms5/src/torch/csrc/cuda/host_trace/Patch.cpp
+--- build_cpp_ms4/src/torch/csrc/cuda/host_trace/Patch.cpp	2026-10-14 19:48:29.938915806 -0700
++++ build_cpp_ms5/src/torch/csrc/cuda/host_trace/Patch.cpp	2026-10-15 05:49:12.347087272 -0700
+@@ -21,10 +21,12 @@
+ int64_t kernel_packs = 0;
+ int64_t kernel_node_sets = 0;
+ int64_t kernel_row_switches = 0;
++int64_t piece_skips = 0;
+ bool phase_timing = false;
+ std::array<int64_t, 16> phase_ns{};
+ int64_t tma_encodes = 0;
+ int64_t tma_replaces = 0;
++int64_t tma_cache_hits = 0;
+ 
+ void raise_dynamic_smem_limit(CUfunction f, unsigned int bytes) {
+   if (bytes == 0) {
+@@ -79,8 +81,23 @@
+   x[0] &= (int64_t{1} << 52) - 1;
+   auto* driver = c10::cuda::DriverAPI::get();
+   auto* address = reinterpret_cast<void*>(x[0]);
+-  if (d.last.empty() ||
+-      !std::equal(x.begin() + 1, x.end(), d.last.begin() + 1)) {
++  auto seen = std::find_if(d.encoded.begin(), d.encoded.end(), [&](const Descriptor::Encoded& e) {
++    return std::equal(x.begin() + 1, x.end(), e.values.begin() + 1, e.values.end());
++  });
++  const bool moved = d.last.empty() ||
++      !std::equal(x.begin() + 1, x.end(), d.last.begin() + 1);
++  if (moved && seen != d.encoded.end()) {
++    d.map = seen->map;
++    d.clear_bit21 = seen->clear_bit21;
++    if (seen->values[0] != x[0]) {
++      C10_CUDA_DRIVER_CHECK(driver->cuTensorMapReplaceAddress_(&d.map, address));
++      ++tma_replaces;
++    }
++    ++tma_cache_hits;
++    std::rotate(d.encoded.begin(), seen, seen + 1);
++    d.encoded.front().values.assign(x.begin(), x.end());
++    d.encoded.front().map = d.map;
++  } else if (moved) {
+     std::array<cuuint64_t, 5> dims{};
+     std::array<cuuint64_t, 5> strides{};
+     std::array<cuuint32_t, 5> ones{1, 1, 1, 1, 1};
+@@ -116,6 +133,10 @@
+       d.clear_bit21 = driver_version() <= 13010 &&
+           static_cast<int32_t>(static_cast<uint32_t>(index)) < 128 * 1024 - 1;
+     }
++    d.encoded.insert(d.encoded.begin(), {std::vector<int64_t>(x.begin(), x.end()), d.map, d.clear_bit21});
++    if (d.encoded.size() > kEncodedPerDescriptor) {
++      d.encoded.pop_back();
++    }
+   } else if (d.last[0] != x[0]) {
+     C10_CUDA_DRIVER_CHECK(driver->cuTensorMapReplaceAddress_(&d.map, address));
+     ++tma_replaces;
+@@ -316,6 +337,58 @@
+     read.erase(std::unique(read.begin(), read.end()), read.end());
+   }
+   ++users_version_;
++  for (Site& s : sites_) {
++    // every row's nodes, the records' own and each entry's
++    std::vector<int64_t> piece_rows, piece_bases;
++    s.piece_always = false;
++    auto field = [&](const Field& f) {
++      piece_rows.push_back(f.row);
++      if (f.base >= 0) {
++        piece_bases.push_back(f.base);
++      }
++    };
++    auto kernel = [&](const KernelRow& k) {
++      s.piece_always |= k.rng_increment != 0 || !k.rng.empty() || !k.cpu_scalars.empty();
++      for (size_t j = 0; j < k.field_count; ++j) {
++        field(k.fields[j]);
++      }
++      if (!k.constant_dims) {
++        piece_rows.insert(piece_rows.end(), k.dim_rows.begin(), k.dim_rows.end());
++      }
++    };
++    auto on_memset = [&](const MemsetRow& m) {
++      field(m.dst);
++      if (!m.constant_shape) {
++        piece_rows.insert(piece_rows.end(), m.shape_rows.begin(), m.shape_rows.end());
++      }
++    };
++    auto on_memcpy = [&](const MemcpyRow& m) {
++      field(m.dst);
++      field(m.src);
++      piece_rows.push_back(m.bytes_row);
++    };
++    for (size_t i : s.records) {
++      const Record& r = records_[i];
++      if (r.kind == Kind::Kernel) {
++        kernel(r.kernel);
++      } else if (r.kind == Kind::Memset) {
++        on_memset(r.memset);
++      } else {
++        on_memcpy(r.copy);
++      }
++    }
++    for (const auto& e : s.entries) {
++      std::for_each(e->kernels.begin(), e->kernels.end(), kernel);
++      std::for_each(e->memsets.begin(), e->memsets.end(), on_memset);
++      std::for_each(e->memcpys.begin(), e->memcpys.end(), on_memcpy);
++    }
++    for (std::vector<int64_t>* v : {&piece_rows, &piece_bases}) {
++      std::sort(v->begin(), v->end());
++      v->erase(std::unique(v->begin(), v->end()), v->end());
++    }
++    s.piece_rows = std::move(piece_rows);
++    s.piece_bases = std::move(piece_bases);
++  }
+   to_csr(rows, program_.num_rows(), users_.row_first, users_.row_records);
+   to_csr(bases, base_count_, users_.base_first, users_.base_records);
+   to_csr(
+@@ -744,9 +817,31 @@
+     }
+   }
+   if (clone) {
+-    for (size_t j = 0; j < clone->pieces.size(); ++j) {
+-      Record& r = clone->pieces[j];
+-      patch(r, held[n + j], r.node);
++    thread_local std::vector<int64_t> reads;
++    for (Segment::Clone::Group& group : clone->groups) {
++      const Site& s = sites_[group.site];
++      reads.clear();
++      reads.push_back(frame.site_entries[group.site]);
++      for (int64_t row : s.piece_rows) {
++        reads.push_back(v[row]);
++      }
++      for (int64_t b : s.piece_bases) {
++        reads.push_back(bases[b]);
++      }
++      bool same = !s.piece_always && group.users_version == users_version_ && reads == group.seen;
++      for (size_t j = group.first; same && j < group.stop; ++j) {
++        same = held[n + j].held;
++      }
++      if (same) {
++        ++piece_skips;
++        continue;
++      }
++      for (size_t j = group.first; j < group.stop; ++j) {
++        Record& r = clone->pieces[j];
++        patch(r, held[n + j], r.node);
++      }
++      group.seen = reads;
++      group.users_version = users_version_;
+     }
+   }
+   // a replay advances the generator by what the rows' calls take, as eager
+diff -ru build_cpp_ms4/src/torch/csrc/cuda/host_trace/Sites.cpp build_cpp_ms5/src/torch/csrc/cuda/host_trace/Sites.cpp
+--- build_cpp_ms4/src/torch/csrc/cuda/host_trace/Sites.cpp	2026-10-14 19:47:50.443400306 -0700
++++ build_cpp_ms5/src/torch/csrc/cuda/host_trace/Sites.cpp	2026-10-15 05:48:59.190969601 -0700
+@@ -854,6 +854,7 @@
+         site,
+         " in the segment");
+     replaced[site] = true;
++    c.groups.push_back({site, c.pieces.size(), c.pieces.size(), {}, 0});
+     size_t pos = 0;
+     for (py::handle h : t[1].cast<py::tuple>()) {
+       auto n = h.cast<py::tuple>();
+@@ -867,6 +868,7 @@
+       r.site_pos = pos++;
+       c.pieces.push_back(std::move(r));
+     }
++    c.groups.back().stop = c.pieces.size();
+   }
+   for (size_t i = g.first; i < g.stop; ++i) {
+     const Record& r = records_[i];
+diff -ru build_cpp_ms4/src/torch/csrc/cuda/host_trace/Variant.h build_cpp_ms5/src/torch/csrc/cuda/host_trace/Variant.h
+--- build_cpp_ms4/src/torch/csrc/cuda/host_trace/Variant.h	2026-10-14 19:48:49.011726542 -0700
++++ build_cpp_ms5/src/torch/csrc/cuda/host_trace/Variant.h	2026-10-15 05:48:59.190138684 -0700
+@@ -42,6 +42,9 @@
+ extern int64_t kernel_node_sets;
+ // test-only: kernel records whose selected row changed with nothing to set
+ extern int64_t kernel_row_switches;
++// test-only: a form's sites whose pieces were not packed (nothing they read
++// changed since that form's last replay)
++extern int64_t piece_skips;
+ // test-only: with phase_timing, each phase of the replays' host time in ns
+ extern bool phase_timing;
+ extern std::array<int64_t, 16> phase_ns;
+@@ -61,6 +64,10 @@
+ // replaced
+ extern int64_t tma_encodes;
+ extern int64_t tma_replaces;
++// test-only: descriptors whose values matched an earlier encode of theirs
++extern int64_t tma_cache_hits;
++// the encodes each descriptor keeps (Descriptor::encoded)
++constexpr size_t kEncodedPerDescriptor = 4;
+ // test-only: runs whose temporaries went in a run buffer though the variant
+ // allocates in eager order
+ extern int64_t buffered_runs;
+@@ -336,6 +343,15 @@
+     // the last encode's values: a change of the address alone replaces it
+     std::vector<int64_t> last;
+     CUtensorMap map;
++    // the last few encodes (most recent first), each the values it was
++    // encoded at, its map and clear_bit21: values seen before (sizes that
++    // alternate) take its map, with the address replaced
++    struct Encoded {
++      std::vector<int64_t> values;
++      CUtensorMap map;
++      bool clear_bit21;
++    };
++    std::vector<Encoded> encoded;
+   };
+   // What a kernel node runs: its record's own, or a keyed site's row for a
+   // key (harvested once, selected by one hash lookup of the key's rows)
+@@ -437,6 +453,12 @@
+     std::vector<Reads> reads;
+     std::vector<int64_t> scratch; // its scratch buffers' allocations
+     size_t segment; // its records' (a selector of no records: none)
++    // what any of its rows' kernels reads, over every node (index_users): a
++    // piece of the site is unchanged while these and the site row are; any
++    // RNG or CPU scalar kernel makes it always patched
++    std::vector<int64_t> piece_rows;
++    std::vector<int64_t> piece_bases;
++    bool piece_always = false;
+   };
+   struct Segment {
+     py::object graph; // the torch.cuda.CUDAGraph
+@@ -456,6 +478,17 @@
+       CUgraph graph;
+       std::vector<CUgraphNode> nodes;
+       std::vector<Record> pieces;
++      // per site its pieces [first, stop), and what its rows' reads (the
++      // site row, then PieceReads' rows, bases and launch dimension rows) were
++      // when they were last patched (empty: not yet)
++      struct Group {
++        size_t site;
++        size_t first;
++        size_t stop;
++        std::vector<int64_t> seen;
++        uint64_t users_version = 0;
++      };
++      std::vector<Group> groups;
+     };
+     std::vector<Clone> clones;
+     // per form, what its exec's nodes hold: per record, then per piece of the

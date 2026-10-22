@@ -1,0 +1,466 @@
+--- a/torch/csrc/cuda/host_trace/Variant.h	2026-10-17 14:11:00.864779017 -0700
++++ b/torch/csrc/cuda/host_trace/Variant.h	2026-10-17 14:24:50.030453646 -0700
+@@ -114,6 +114,12 @@
+ extern double split_ratio;
+ extern int64_t split_first_nodes;
+ extern int64_t split_max_nodes;
++// a call launches its run's sections only when at least this many of the run's records are dirty (its patch would
++// be exposed: a size change, a mixed step); fewer (steady decode, hidden behind the GPU work in flight) launch the
++// whole exec. 0: sections every call
++extern int64_t split_dirty_min;
++// calls whose run launched whole for fewer dirty records than split_dirty_min
++extern int64_t split_dirty_wholes;
+ // test-only: calls launched split, and forms whose sub-execs were built
+ extern int64_t split_calls;
+ // test-only: graph launches of native replays (a split call's sections each)
+@@ -228,6 +234,57 @@
+ // validation to its outputs, built once from flatten_variant's VariantSpec
+ // (torch/cuda/_host_trace_native.py). Only a step the boxed dispatcher cannot
+ // express (a Triton launch) calls back into Python.
++// A provider's held bindings for the keyed sites of one class (_host_trace_native.NativeBindings): per table key
++// (a site key in the provider's normal form, Site::TableLink) the binding's nodes, their pointer sources as
++// (operand or scratch buffer, index, delta), its scratch bytes and its topology's id. A keyed miss whose key is
++// here gets its site's row in C++ (fill_from_table), as _fill's add_row would add it from the binding.
++class HostTraceBindingTable {
++ public:
++  struct Source {
++    bool scratch;
++    uint32_t index;
++    int64_t delta;
++  };
++  struct Field {
++    uint32_t param;
++    uint32_t offset;
++    Source source;
++  };
++  struct Node {
++    bool memset;
++    uintptr_t function;
++    std::array<int64_t, 7> dims; // grid xyz, block xyz, shared bytes
++    std::vector<std::string> images;
++    std::vector<Field> fields;
++    Source dst; // a memset's
++    unsigned int value;
++    unsigned int element_size;
++    std::array<int64_t, 3> shape; // width, height, pitch
++  };
++  struct Binding {
++    std::vector<Node> nodes;
++    std::vector<int64_t> scratch;
++    int64_t topology;
++  };
++  // nodes as _host_trace_native.binding_template
++  void add(const std::vector<int64_t>& key, py::handle nodes, const std::vector<int64_t>& scratch, int64_t topology);
++  const Binding* find(const int64_t* key, size_t n) const;
++  size_t size() const {
++    return bindings_.size();
++  }
++
++ private:
++  size_t width_ = 0;
++  std::vector<int64_t> keys_;
++  std::vector<Binding> bindings_;
++  std::unordered_map<uint64_t, c10::SmallVector<uint32_t, 1>> index_;
++};
++
++// whether a keyed miss is filled from its site's binding table (fill_from_table); off: _fill's Python path
++extern bool native_fill_enabled;
++// rows fill_from_table added
++extern int64_t native_fills;
++
+ class HostTraceVariant {
+  public:
+   explicit HostTraceVariant(py::handle spec);
+@@ -265,6 +322,17 @@
+   // Whether the call's rows hold and a pair of its arguments overlaps: the
+   // call runs eagerly
+   bool overlaps_py(py::handle args) const;
++  // Links site to a binding table (Site::TableLink): a key it lacks whose normal form the table holds gets its row
++  // in C++
++  void set_site_table(
++      size_t site,
++      std::shared_ptr<HostTraceBindingTable> table,
++      const std::vector<int8_t>& codes,
++      const std::vector<int32_t>& companions,
++      const std::vector<std::pair<int64_t, int64_t>>& operands,
++      const std::vector<std::array<int64_t, 4>>& scratch,
++      const std::vector<int64_t>& native_scratch,
++      int64_t topology);
+   // Adds site's row for key: nodes as _host_trace_native.binding_row, or
+   // None to decline the key; the site's arm (0 its nodes' launch attributes)
+   // the nodes need, whether the arm is a piece (nodes of their own, not the
+@@ -497,6 +565,20 @@
+     std::vector<int64_t> piece_rows;
+     std::vector<int64_t> piece_bases;
+     bool piece_always = false;
++    // the binding table a keyed miss is filled from: per key value its normal form (0 as is, 1 its alignment class,
++    // 2 a stride, 0 where its size, key value `companions[j]`, is 1); per operand its (row, base); per scratch buffer
++    // the site has, (index, row, base, the most bytes a row may take or -1); the buffers add_row sizes, in order; and
++    // the topology's id a row of arm 0 has
++    struct TableLink {
++      std::shared_ptr<HostTraceBindingTable> table;
++      std::vector<int8_t> codes;
++      std::vector<int32_t> companions;
++      std::vector<std::pair<int64_t, int64_t>> operands;
++      std::vector<std::array<int64_t, 4>> scratch;
++      std::vector<int64_t> native_scratch;
++      int64_t topology;
++    };
++    std::unique_ptr<TableLink> link;
+   };
+   struct Segment {
+     py::object graph; // the torch.cuda.CUDAGraph
+@@ -767,6 +849,9 @@
+   static bool pieces_cover(const Site& s, const Entry& e);
+   // a keyed row added: its reads noted, the users index rebuilt only if they are new
+   void row_added(Site& s, const Entry& e);
++  // site i's row for key from its binding table, added: its index in the site's keys, or -1 (no table, no binding,
++  // another topology, or a scratch buffer the site lacks or holds fewer bytes of)
++  int64_t fill_from_table(size_t i, const int64_t* key);
+   // after a site gains an entry: the index of users is rebuilt at the next
+   // commit, keeping what the records hold
+   void rows_added();
+--- a/torch/csrc/cuda/host_trace/Sites.cpp	2026-10-17 14:11:00.865072267 -0700
++++ b/torch/csrc/cuda/host_trace/Sites.cpp	2026-10-17 14:18:35.162053818 -0700
+@@ -36,8 +36,221 @@
+   return h;
+ }
+ 
++HostTraceBindingTable::Source parse_table_source(py::handle h) {
++  auto [scratch, index, delta] = h.cast<std::tuple<bool, uint32_t, int64_t>>();
++  return {scratch, index, delta};
++}
++
+ } // namespace
+ 
++bool native_fill_enabled = true;
++int64_t native_fills = 0;
++
++void HostTraceBindingTable::add(
++    const std::vector<int64_t>& key,
++    py::handle nodes,
++    const std::vector<int64_t>& scratch,
++    int64_t topology) {
++  TORCH_CHECK_VALUE(bindings_.empty() || key.size() == width_, "a table key of ", key.size(), " values");
++  width_ = key.size();
++  if (find(key.data(), key.size()) != nullptr) {
++    return;
++  }
++  Binding b;
++  b.scratch = scratch;
++  b.topology = topology;
++  for (py::handle h : nodes.cast<py::tuple>()) {
++    auto t = h.cast<py::tuple>();
++    Node n{};
++    n.memset = t[0].cast<uint8_t>() == 1;
++    if (n.memset) {
++      n.dst = parse_table_source(t[1]);
++      n.value = t[2].cast<unsigned int>();
++      n.element_size = t[3].cast<unsigned int>();
++      TORCH_CHECK_VALUE(n.element_size == 1 || n.element_size == 2 || n.element_size == 4, "a memset element of ", n.element_size, " bytes");
++      n.shape = {t[4].cast<int64_t>(), t[5].cast<int64_t>(), t[6].cast<int64_t>()};
++    } else {
++      n.function = t[1].cast<uintptr_t>();
++      const auto block = t[2].cast<std::array<int64_t, 3>>();
++      const auto grid = t[4].cast<std::array<int64_t, 3>>();
++      n.dims = {grid[0], grid[1], grid[2], block[0], block[1], block[2], t[3].cast<int64_t>()};
++      for (py::handle image : t[5].cast<py::tuple>()) {
++        n.images.push_back(image.cast<std::string>());
++      }
++      for (py::handle f : t[6].cast<py::tuple>()) {
++        auto ft = f.cast<py::tuple>();
++        Field field{ft[0].cast<uint32_t>(), ft[1].cast<uint32_t>(), parse_table_source(py::make_tuple(ft[2], ft[3], ft[4]))};
++        TORCH_CHECK_VALUE(field.param < n.images.size() && field.offset + 8 <= n.images[field.param].size(), "a field outside its parameter");
++        n.fields.push_back(field);
++      }
++    }
++    b.nodes.push_back(std::move(n));
++  }
++  index_[key_hash(key.data(), width_)].push_back(static_cast<uint32_t>(bindings_.size()));
++  keys_.insert(keys_.end(), key.begin(), key.end());
++  bindings_.push_back(std::move(b));
++}
++
++const HostTraceBindingTable::Binding* HostTraceBindingTable::find(const int64_t* key, size_t n) const {
++  if (n != width_ || bindings_.empty()) {
++    return nullptr;
++  }
++  auto it = index_.find(key_hash(key, n));
++  if (it == index_.end()) {
++    return nullptr;
++  }
++  for (uint32_t i : it->second) {
++    if (std::equal(key, key + n, keys_.begin() + static_cast<ptrdiff_t>(i) * n)) {
++      return &bindings_[i];
++    }
++  }
++  return nullptr;
++}
++
++void HostTraceVariant::set_site_table(
++    size_t site,
++    std::shared_ptr<HostTraceBindingTable> table,
++    const std::vector<int8_t>& codes,
++    const std::vector<int32_t>& companions,
++    const std::vector<std::pair<int64_t, int64_t>>& operands,
++    const std::vector<std::array<int64_t, 4>>& scratch,
++    const std::vector<int64_t>& native_scratch,
++    int64_t topology) {
++  TORCH_CHECK_VALUE(site < sites_.size() && sites_[site].predicates.empty(), "no keyed site ", site);
++  Site& s = sites_[site];
++  TORCH_CHECK_VALUE(codes.size() == s.key_rows.size() && companions.size() == codes.size(), "a table link of ", codes.size(), " codes");
++  for (size_t j = 0; j < codes.size(); ++j) {
++    TORCH_CHECK_VALUE(
++        codes[j] >= 0 && codes[j] <= 2 && (codes[j] != 2 || (companions[j] >= 0 && static_cast<size_t>(companions[j]) < codes.size())),
++        "a table link's code ",
++        static_cast<int>(codes[j]));
++  }
++  for (const auto& [row, base] : operands) {
++    check_row(row);
++    TORCH_CHECK_VALUE(base == -1 || check_base(base) >= 0, "no base ", base);
++  }
++  for (const auto& x : scratch) {
++    check_row(x[1]);
++    TORCH_CHECK_VALUE(x[2] == -1 || check_base(x[2]) >= 0, "no base ", x[2]);
++  }
++  if (native_scratch.size() != s.scratch.size()) {
++    return; // add_row would decline its rows' scratch bytes: _fill's path
++  }
++  s.link = std::make_unique<Site::TableLink>(Site::TableLink{std::move(table), codes, companions, operands, scratch, native_scratch, topology});
++}
++
++int64_t HostTraceVariant::fill_from_table(size_t i, const int64_t* key) {
++  Site& s = sites_[i];
++  if (!native_fill_enabled || !s.link) {
++    return -1;
++  }
++  const Site::TableLink& l = *s.link;
++  const size_t n = s.key_rows.size();
++  c10::SmallVector<int64_t, 32> normal(key, key + n);
++  for (size_t j = 0; j < n; ++j) {
++    if (l.codes[j] == 1) {
++      // _host_trace_harvest._class: the largest power of two dividing the address, up to 256
++      normal[j] = key[j] ? (key[j] & -key[j]) : 256;
++    } else if (l.codes[j] == 2 && key[l.companions[j]] == 1) {
++      normal[j] = 0;
++    }
++  }
++  const HostTraceBindingTable::Binding* b = l.table->find(normal.data(), n);
++  if (b == nullptr || b->topology != l.topology || b->nodes.size() != s.records.size()) {
++    return -1;
++  }
++  // site.fits: every scratch buffer the binding takes is one of the site's, within its bytes
++  auto scratch_of = [&](uint32_t index) -> const std::array<int64_t, 4>* {
++    for (const auto& x : l.scratch) {
++      if (x[0] == static_cast<int64_t>(index)) {
++        return &x;
++      }
++    }
++    return nullptr;
++  };
++  for (size_t j = 0; j < b->scratch.size(); ++j) {
++    const auto* x = scratch_of(static_cast<uint32_t>(j));
++    if (x == nullptr || ((*x)[3] >= 0 && b->scratch[j] > (*x)[3])) {
++      return -1;
++    }
++  }
++  auto source = [&](const HostTraceBindingTable::Source& src, Field& f) {
++    if (src.scratch) {
++      const auto* x = scratch_of(src.index);
++      if (x == nullptr) {
++        return false;
++      }
++      f.row = (*x)[1];
++      f.base = (*x)[2];
++    } else {
++      if (src.index >= l.operands.size()) {
++        return false;
++      }
++      f.row = l.operands[src.index].first;
++      f.base = l.operands[src.index].second;
++    }
++    f.delta = src.delta;
++    return true;
++  };
++  auto e = std::make_unique<Entry>();
++  e->arm = 0;
++  for (int64_t j : l.native_scratch) {
++    e->scratch.push_back(j >= 0 && static_cast<size_t>(j) < b->scratch.size() ? b->scratch[j] : 0);
++  }
++  e->kernels.resize(b->nodes.size());
++  e->memsets.resize(b->nodes.size());
++  for (size_t k = 0; k < b->nodes.size(); ++k) {
++    const HostTraceBindingTable::Node& node = b->nodes[k];
++    if (records_[s.records[k]].kind != (node.memset ? Kind::Memset : Kind::Kernel)) {
++      return -1;
++    }
++    if (node.memset) {
++      MemsetRow& m = e->memsets[k];
++      m.dst = Field{0, 0, 8, true, 0, -1, 0};
++      if (!source(node.dst, m.dst)) {
++        return -1;
++      }
++      m.value = node.value;
++      m.element_size = node.element_size;
++      m.constant_shape = true;
++      m.shape = node.shape;
++      continue;
++    }
++    KernelRow& kr = e->kernels[k];
++    kr.params.func = reinterpret_cast<CUfunction>(node.function);
++    kr.dims = node.dims;
++    kr.constant_dims = true;
++    kr.offset = e->image.size();
++    for (const std::string& image : node.images) {
++      e->image.resize((e->image.size() + 7) / 8 * 8);
++      kr.param_offsets.push_back(e->image.size() - kr.offset);
++      kr.param_sizes.push_back(static_cast<uint32_t>(image.size()));
++      e->image.insert(e->image.end(), image.begin(), image.end());
++    }
++    kr.nbytes = e->image.size() - kr.offset;
++    kr.first_field = e->fields.size();
++    for (const HostTraceBindingTable::Field& tf : node.fields) {
++      Field f{tf.param, tf.offset, 8, true, 0, -1, 0};
++      if (!source(tf.source, f)) {
++        return -1;
++      }
++      e->fields.push_back(f);
++    }
++    kr.field_count = e->fields.size() - kr.first_field;
++  }
++  e->held = e->image;
++  for (size_t k = 0; k < b->nodes.size(); ++k) {
++    if (!b->nodes[k].memset) {
++      bind_row(e->kernels[k], e->image.data(), e->held.data(), e->fields.data());
++    }
++  }
++  row_added(s, *e);
++  s.entries.push_back(std::move(e));
++  insert(s, key, static_cast<int64_t>(s.entries.size()));
++  ++native_fills;
++  return static_cast<int64_t>(s.rows.size()) - 1;
++}
++
+ int64_t HostTraceVariant::find(const Site& s, const int64_t* key) const {
+   const size_t n = s.key_rows.size();
+   auto it = s.index.find(key_hash(key, n));
+@@ -556,7 +769,11 @@
+     for (size_t j = 0; j < key.size(); ++j) {
+       key[j] = frame.values[s.key_rows[j]];
+     }
+-    const int64_t found = find(s, key.data());
++    int64_t found = find(s, key.data());
++    if (found < 0) {
++      // the tables grow at a miss (frame.site_entries holds row indices, not entries)
++      found = const_cast<HostTraceVariant*>(this)->fill_from_table(i, key.data());
++    }
+     if (found < 0) {
+       frame.keyed_miss = true;
+       return false;
+@@ -634,7 +851,10 @@
+     for (int64_t row : s.key_rows) {
+       key.push_back(frame.values[row]);
+     }
+-    const int64_t found = find(s, key.data());
++    int64_t found = find(s, key.data());
++    if (found < 0) {
++      found = const_cast<HostTraceVariant*>(this)->fill_from_table(i, key.data());
++    }
+     if (found < 0) {
+       missing.append(py::make_tuple(i, key));
+     } else if (s.rows[found] < 0) {
+--- a/torch/csrc/cuda/host_trace/Entry.cpp	2026-10-17 14:11:00.865173387 -0700
++++ b/torch/csrc/cuda/host_trace/Entry.cpp	2026-10-17 14:24:50.030974769 -0700
+@@ -1981,8 +1981,23 @@
+ #if !defined(USE_ROCM)
+   using namespace host_trace;
+   auto m = py::handle(module).cast<py::module>();
++  py::class_<HostTraceBindingTable, std::shared_ptr<HostTraceBindingTable>>(m, "_HostTraceBindingTable")
++      .def(py::init<>())
++      .def("add", &HostTraceBindingTable::add, py::arg("key"), py::arg("nodes"), py::arg("scratch"), py::arg("topology"))
++      .def("__len__", &HostTraceBindingTable::size);
+   py::class_<HostTraceVariant>(m, "_HostTraceVariant")
+       .def(py::init<py::handle>(), py::arg("spec"))
++      .def(
++          "set_site_table",
++          &HostTraceVariant::set_site_table,
++          py::arg("site"),
++          py::arg("table"),
++          py::arg("codes"),
++          py::arg("companions"),
++          py::arg("operands"),
++          py::arg("scratch"),
++          py::arg("native_scratch"),
++          py::arg("topology"))
+       .def("call", &HostTraceVariant::call_py, py::arg("args"))
+       .def("evaluate", &HostTraceVariant::evaluate_py, py::arg("args"))
+       .def("overlaps", &HostTraceVariant::overlaps_py, py::arg("args"))
+@@ -2085,22 +2100,35 @@
+   // None keeps a value; the old values back
+   m.def(
+       "_host_trace_split_policy",
+-      [](std::optional<int64_t> sections, std::optional<double> ratio, std::optional<int64_t> first_nodes, std::optional<int64_t> max_nodes) {
+-        auto old = py::make_tuple(split_sections, split_ratio, split_first_nodes, split_max_nodes);
++      [](std::optional<int64_t> sections,
++         std::optional<double> ratio,
++         std::optional<int64_t> first_nodes,
++         std::optional<int64_t> max_nodes,
++         std::optional<int64_t> dirty_min) {
++        auto old = py::make_tuple(split_sections, split_ratio, split_first_nodes, split_max_nodes, split_dirty_min);
+         split_sections = sections.value_or(split_sections);
+         split_ratio = ratio.value_or(split_ratio);
+         split_first_nodes = first_nodes.value_or(split_first_nodes);
+         split_max_nodes = max_nodes.value_or(split_max_nodes);
++        split_dirty_min = dirty_min.value_or(split_dirty_min);
+         return old;
+       },
+       py::arg("sections") = py::none(),
+       py::arg("ratio") = py::none(),
+       py::arg("first_nodes") = py::none(),
+-      py::arg("max_nodes") = py::none());
++      py::arg("max_nodes") = py::none(),
++      py::arg("dirty_min") = py::none());
++  m.def("_host_trace_split_dirty_wholes", [] { return split_dirty_wholes; });
+   m.def("_host_trace_split_bounds", [](HostTraceVariant& v, size_t segment, size_t form) { return v.split_bounds_of(segment, form); });
+   m.def("_host_trace_split_section_counts", [](HostTraceVariant& v, size_t segment, size_t form) { return v.split_section_counts(segment, form); });
+   m.def("_host_trace_piece_skips", [] { return piece_skips; });
+   m.def("_host_trace_index_counts", [] { return std::make_pair(index_builds, rows_unindexed); });
++  m.def("_host_trace_native_fills", [] { return native_fills; });
++  m.def("_host_trace_native_fill", [](bool on) {
++    const bool was = native_fill_enabled;
++    native_fill_enabled = on;
++    return was;
++  });
+   m.def("_host_trace_buffered_runs", [] { return buffered_runs; });
+   m.def("_host_trace_delta_counts", [] {
+     return py::make_tuple(delta_skips, delta_partials, delta_fulls, delta_rows_evaluated);
+--- a/torch/csrc/cuda/host_trace/Patch.cpp	2026-10-17 14:14:34.364953503 -0700
++++ b/torch/csrc/cuda/host_trace/Patch.cpp	2026-10-17 14:24:50.030719088 -0700
+@@ -31,6 +31,8 @@
+ int64_t split_first_nodes = 0;
+ int64_t split_max_nodes = 0;
+ int64_t split_calls = 0;
++int64_t split_dirty_min = 256;
++int64_t split_dirty_wholes = 0;
+ int64_t graph_launches = 0;
+ int64_t split_builds = 0;
+ bool phase_timing = false;
+@@ -1056,7 +1058,17 @@
+   const size_t n = run.stop - run.first;
+   // a split run launches its form's sections every call, each patched while
+   // the one before it runs; the whole exec only without sections
+-  const bool split = split_enabled && !hooks && !run.cuts.empty() && !run.generator && split_ready(run, form, frame);
++  bool split = split_enabled && !hooks && !run.cuts.empty() && !run.generator && split_ready(run, form, frame);
++  if (split && split_dirty_min > 0) {
++    // the records this call patches in the current state's exec (a switch to the other state's patches those its
++    // exec last held otherwise: changed_since)
++    const uint8_t* d = dirty_.data() + run.first;
++    const auto dirty = static_cast<int64_t>(std::count(d, d + n, uint8_t{1}));
++    if (dirty < split_dirty_min) {
++      split = false;
++      ++split_dirty_wholes;
++    }
++  }
+   if (form != run.form || split != run.split) {
+     switch_form(run, form, split, frame);
+   }

@@ -1,0 +1,52 @@
+--- a/torch/cuda/_host_trace_replay.py
++++ b/torch/cuda/_host_trace_replay.py
+@@ -1480,8 +1480,8 @@
+             )
+             got = (
+                 list(o.shape),
+-                # a size-1 dim's stride addresses nothing (_addressing)
+-                [w if n == 1 else s for n, s, w in zip(o.shape, o.stride(), want[1])],
++                # a size-1 dim's stride addresses nothing (_addressing), nor does a zero-element output's: eager's stands
++                [w if n == 1 or o.numel() == 0 else s for n, s, w in zip(o.shape, o.stride(), want[1])],
+                 o.storage_offset(),
+                 o.dtype,
+                 o.device,
+--- a/torch/csrc/cuda/host_trace/EagerStep.cpp
++++ b/torch/csrc/cuda/host_trace/EagerStep.cpp
+@@ -654,9 +654,11 @@
+         o.storage_offset() == v[p.offset] && o.scalar_type() == p.dtype &&
+         o.device() == device && (o.numel() == 0 || base % kAlignment == 0);
+     for (size_t d = 0; same && d < p.sizes.size(); ++d) {
+-      // a size-1 dim's stride addresses nothing (_addressing)
++      // a size-1 dim's stride addresses nothing (_addressing), nor does a
++      // zero-element output's: the replay keeps eager's
+       same = o.sizes()[d] == v[p.sizes[d]] &&
+-          (o.sizes()[d] == 1 || o.strides()[d] == v[p.strides[d]]);
++          (o.sizes()[d] == 1 || o.numel() == 0 ||
++           o.strides()[d] == v[p.strides[d]]);
+     }
+     if (!same) {
+       std::vector<int64_t> sizes, strides;
+--- a/test/test_cuda_host_trace_replay.py
++++ b/test/test_cuda_host_trace_replay.py
+@@ -1953,6 +1953,20 @@
+             self.assertEqual(f(x), x + 6)
+         self.assertEqual((f.traces, f.replays, f.eager, f.declines), (1, 5, 0, []))
+ 
++    def test_a_zero_element_eager_output_keeps_eagers_strides(self):
++        # sort's zero-element outputs take the input's strides where its fake kernel's are
++        # contiguous: they address nothing, so the replay keeps eager's output, no disagreement
++        def fn(x, y):
++            return x.argsort(2), y + 1
++
++        f = HostTraceReplay(fn)
++        y = torch.randn(8, device="cuda")
++        for x in (torch.randn(1, 12, 0, device="cuda"), torch.empty_strided((1, 12, 0), (12, 1, 12), device="cuda")):
++            got, want = f(x, y), fn(x, y)
++            self.assertEqual(got, want, atol=0, rtol=0)
++            self.assertEqual([t.stride() for t in got], [t.stride() for t in want])
++        self.assertEqual((f.traces, f.replays, f.eager), (1, 1, 0))
++
+     @parametrize("free", [True, False])
+     def test_a_size_1_views_stride_is_free(self, free):
+         # qkv[:, :256] viewed (T, 256): eager's computeStride strides dim 0 by

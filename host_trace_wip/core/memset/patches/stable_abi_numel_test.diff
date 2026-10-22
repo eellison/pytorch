@@ -1,0 +1,89 @@
+--- a/test/test_cuda_host_trace_replay.py	2026-10-15 16:26:16.397595527 -0700
++++ b/test/test_cuda_host_trace_replay.py	2026-10-15 18:39:55.038522046 -0700
+@@ -3,6 +3,7 @@
+ import builtins
+ import ctypes
+ import dataclasses
++import functools
+ import gc
+ import itertools
+ import os
+@@ -359,6 +360,53 @@
+     return None
+ 
+ 
++# a stable-ABI op (vLLM's _C_stable_libtorch ops) whose host code reads its input's element count
++_STABLE_NUMEL = r"""
++#include <cuda_runtime.h>
++#include <torch/csrc/stable/accelerator.h>
++#include <torch/csrc/stable/library.h>
++#include <torch/csrc/stable/ops.h>
++#include <torch/csrc/stable/tensor.h>
++
++using torch::stable::Tensor;
++
++__global__ void scale_by_count(const float* x, float* y, int64_t n) {
++  int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x;
++  if (i < n) {
++    y[i] = x[i] * n;
++  }
++}
++
++Tensor scale_by_numel(Tensor x) {
++  int64_t n = x.numel();
++  torch::stable::accelerator::DeviceGuard guard(x.get_device_index());
++  Tensor y = torch::stable::empty_like(x);
++  void* stream = nullptr;
++  TORCH_ERROR_CODE_CHECK(aoti_torch_get_current_cuda_stream(x.get_device_index(), &stream));
++  scale_by_count<<<(n + 255) / 256, 256, 0, static_cast<cudaStream_t>(stream)>>>(
++      reinterpret_cast<const float*>(x.data_ptr()), reinterpret_cast<float*>(y.data_ptr()), n);
++  return y;
++}
++
++STABLE_TORCH_LIBRARY(ht_stable, m) {
++  m.def("scale_by_numel(Tensor x) -> Tensor");
++}
++
++STABLE_TORCH_LIBRARY_IMPL(ht_stable, CUDA, m) {
++  m.impl("scale_by_numel", TORCH_BOX(&scale_by_numel));
++}
++"""
++
++
++@functools.cache
++def _stable_numel_op():
++    from torch.utils.cpp_extension import load_inline
++
++    load_inline("ht_stable_numel", cpp_sources="", cuda_sources=_STABLE_NUMEL, is_python_module=False, extra_cuda_cflags=["-DUSE_CUDA"])
++    torch.library.register_fake("ht_stable::scale_by_numel")(torch.empty_like)
++    return torch.ops.ht_stable.scale_by_numel
++
++
+ @torch.library.custom_op("host_trace_test::tactic_mul", mutates_args=())
+ def tactic_mul(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+     # a layer's op on its weight (Triton specializes on the weight pointer's 16-byte alignment: a guard on its root)
+@@ -1368,6 +1416,24 @@
+             self.assertIn("the port has no launch", call.reason)
+         self.assertEqual((f.traces, f.replays, f.eager), (1, 2, 0))
+ 
++    def test_a_stable_abi_op_reading_its_numel_is_an_eager_step(self):
++        # a stable-ABI op with no port (or one that declines): its CUDA kernel redispatched over symbolic sizes reaches
++        # aoti_torch_get_numel, which raises across the C API boundary; the trace takes that as the host's decline and
++        # runs the op as an eager step on the call's tensors
++        op = _stable_numel_op()
++
++        def fn(x):
++            return op(x * 2) + 1
++
++        calls = [c for _, c in trace(fn, (torch.randn(100, device="cuda"),)).launches if isinstance(c, EagerCall)]
++        self.assertEqual(len(calls), 1)
++        self.assertIn("Cannot call numel() on tensor with symbolic sizes", calls[0].reason)
++        f = HostTraceReplay(fn)
++        for n in (100, 300, 100, 300):
++            x = torch.randn(n, device="cuda")
++            self.assertEqual(f(x), fn(x), atol=0, rtol=0)
++        self.assertEqual((f.traces, f.eager), (1, 0))
++
+     def test_fast_twins_trace_and_replay(self):
+         # split_with_sizes's twin (view) and the extension op's (its fake kernel)
+         op = torch.ops.host_trace_test.tactic_ext.default

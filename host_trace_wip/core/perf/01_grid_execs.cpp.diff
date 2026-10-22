@@ -1,0 +1,472 @@
+--- a/c10/cuda/driver_api.h
++++ b/c10/cuda/driver_api.h
+@@ -171,8 +171,9 @@
+   _(cuTensorMapReplaceAddress, 12000)
+ 
+ // Host tracing's native replay declines without it
+-#define C10_LIBCUDA_DRIVER_API_REPLAY(_) \
+-  _(cuGraphExecKernelNodeSetParams, 12000)
++#define C10_LIBCUDA_DRIVER_API_REPLAY(_)     \
++  _(cuGraphExecKernelNodeSetParams, 12000) \
++  _(cuGraphKernelNodeSetParams, 12000)
+ 
+ // Host tracing's harvest reads its captures' nodes and launches them
+ #if defined(CUDA_VERSION) && (CUDA_VERSION >= 12040)
+--- a/torch/_C/__init__.pyi.in
++++ b/torch/_C/__init__.pyi.in
+@@ -2709,6 +2709,8 @@
+ def _host_trace_memory_node_sets() -> _int: ...
+ def _host_trace_kernel_packs() -> _int: ...
+ def _host_trace_kernel_node_sets() -> _int: ...
++def _host_trace_grid_execs(cap: _int) -> tuple[_int, _int, _int, _int]: ...
++def _host_trace_grid_execs_frozen(frozen: _int) -> tuple[_bool, _int]: ...
+ def _host_trace_phase_times(enable: _bool) -> list[_int]: ...
+ def _host_trace_launch_stamps(enable: _bool) -> list[_int]: ...
+ def _host_trace_static_split(variant: _HostTraceVariant) -> tuple[_int, _int]: ...
+--- a/torch/csrc/cuda/host_trace/Entry.cpp
++++ b/torch/csrc/cuda/host_trace/Entry.cpp
+@@ -1512,6 +1512,21 @@
+   m.def("_host_trace_memory_node_sets", [] { return memory_node_sets; });
+   m.def("_host_trace_kernel_packs", [] { return kernel_packs; });
+   m.def("_host_trace_kernel_node_sets", [] { return kernel_node_sets; });
++  m.def("_host_trace_grid_execs", [](int64_t cap) {
++    const int64_t was = grid_exec_cap;
++    if (cap >= 0) {
++      grid_exec_cap = cap;
++    }
++    return py::make_tuple(
++        was, grid_instantiations, grid_switches, grid_instantiate_ns);
++  });
++  m.def("_host_trace_grid_execs_frozen", [](int64_t frozen) {
++    const bool was = grid_execs_frozen;
++    if (frozen >= 0) {
++      grid_execs_frozen = frozen != 0;
++    }
++    return py::make_tuple(was, grid_frozen_misses);
++  });
+   m.def("_host_trace_launch_stamps", [](bool enable) {
+     std::vector<int64_t> stamps;
+     stamps.swap(launch_ns);
+--- a/torch/csrc/cuda/host_trace/Patch.cpp
++++ b/torch/csrc/cuda/host_trace/Patch.cpp
+@@ -2,6 +2,7 @@
+ 
+ #if !defined(USE_ROCM)
+ #include <ATen/cuda/host_trace/LaunchLayout.h>
++#include <ATen/cuda/CUDAContext.h>
+ #include <c10/cuda/CUDAException.h>
+ #include <c10/cuda/driver_api.h>
+ #include <c10/util/safe_numerics.h>
+@@ -17,6 +18,12 @@
+ int64_t memory_node_sets = 0;
+ int64_t kernel_packs = 0;
+ int64_t kernel_node_sets = 0;
++int64_t grid_exec_cap = 0;
++bool grid_execs_frozen = false;
++int64_t grid_frozen_misses = 0;
++int64_t grid_instantiations = 0;
++int64_t grid_switches = 0;
++int64_t grid_instantiate_ns = 0;
+ bool phase_timing = false;
+ std::array<int64_t, 16> phase_ns{};
+ bool launch_stamping = false;
+@@ -308,8 +315,17 @@
+ }
+ 
+ void HostTraceVariant::switch_form_held(Segment& run, size_t form) {
++  run.form_held.resize(run.execs.size());
++  swap_held(run, run.form_held[run.form], form, run.form_held[form]);
++}
++
++void HostTraceVariant::swap_held(
++    Segment& run,
++    std::vector<Segment::Held>& saved,
++    size_t form,
++    const std::vector<Segment::Held>& next) {
+   // A keyed row's held image is shared by its site node's record and the
+-  // pieces at that node, live in different forms: each form keeps its own copy
++  // pieces at that node, live in different forms: each exec keeps its own copy
+   const size_t n = run.stop - run.first;
+   auto slot = [&](size_t f, size_t i) -> Record* {
+     if (i >= n) {
+@@ -319,8 +335,6 @@
+                              : run.clones[f - 1].nodes[i] != nullptr;
+     return live ? &records_[run.first + i] : nullptr;
+   };
+-  run.form_held.resize(run.execs.size());
+-  auto& saved = run.form_held[run.form];
+   saved.resize(n + (run.form == 0 ? 0 : run.clones[run.form - 1].pieces.size()));
+   for (size_t i = 0; i < saved.size(); ++i) {
+     Record* r = slot(run.form, i);
+@@ -333,14 +347,13 @@
+       h.image.assign(k.held, k.held + k.nbytes);
+     }
+   }
+-  auto& next = run.form_held[form];
+-  next.resize(n + (form == 0 ? 0 : run.clones[form - 1].pieces.size()));
+-  for (size_t i = 0; i < next.size(); ++i) {
++  const size_t m = n + (form == 0 ? 0 : run.clones[form - 1].pieces.size());
++  for (size_t i = 0; i < m; ++i) {
+     Record* r = slot(form, i);
+     if (!r) {
+       continue;
+     }
+-    const Segment::Held& h = next[i];
++    const Segment::Held h = i < next.size() ? next[i] : Segment::Held{};
+     r->held = h.held;
+     if (h.held) {
+       std::memcpy(kernel_row(*r, h.row).held, h.image.data(), h.image.size());
+@@ -351,6 +364,222 @@
+   run.form = form;
+ }
+ 
++std::vector<int64_t> HostTraceVariant::launch_config(
++    Segment& run,
++    size_t form,
++    const Frame* frame) {
++  auto* driver = c10::cuda::DriverAPI::get();
++  Segment::Clone* clone = form == 0 ? nullptr : &run.clones[form - 1];
++  std::vector<int64_t> config;
++  auto add = [&](const Record& r, CUgraphNode node) {
++    if (r.kind != Kind::Kernel || !node) {
++      return;
++    }
++    if (!frame) {
++      CUDA_KERNEL_NODE_PARAMS p{};
++      C10_CUDA_DRIVER_CHECK(driver->cuGraphKernelNodeGetParams_(node, &p));
++      config.insert(
++          config.end(),
++          {reinterpret_cast<int64_t>(p.func),
++           p.gridDimX,
++           p.gridDimY,
++           p.gridDimZ,
++           p.blockDimX,
++           p.blockDimY,
++           p.blockDimZ,
++           p.sharedMemBytes});
++      return;
++    }
++    const int64_t row = r.site >= 0 ? frame->site_entries[r.site] : 0;
++    const KernelRow& k = kernel_row(r, row);
++    config.push_back(reinterpret_cast<int64_t>(k.params.func));
++    for (size_t d = 0; d < 7; ++d) {
++      config.push_back(
++          k.constant_dims ? k.dims[d] : frame->values[k.dim_rows[d]]);
++    }
++  };
++  for (size_t i = run.first; i < run.stop; ++i) {
++    add(records_[i], clone ? clone->nodes[i - run.first] : records_[i].node);
++  }
++  if (clone) {
++    for (const Record& r : clone->pieces) {
++      add(r, r.node);
++    }
++  }
++  return config;
++}
++
++CUgraphExec HostTraceVariant::select_grid(
++    Segment& run,
++    const Frame& frame,
++    size_t form) {
++  if (!run.grid_indexed) {
++    for (size_t i = run.first; i < run.stop; ++i) {
++      const Record& r = records_[i];
++      if (r.kind == Kind::Kernel && !r.kernel.constant_dims) {
++        run.grid_rows.insert(
++            run.grid_rows.end(),
++            r.kernel.dim_rows.begin(),
++            r.kernel.dim_rows.end());
++      }
++    }
++    std::sort(run.grid_rows.begin(), run.grid_rows.end());
++    run.grid_rows.erase(
++        std::unique(run.grid_rows.begin(), run.grid_rows.end()),
++        run.grid_rows.end());
++    run.grid_indexed = true;
++  }
++  std::vector<int64_t>& key = run.grid_key;
++  key.clear();
++  key.push_back(static_cast<int64_t>(form));
++  for (int64_t row : run.grid_rows) {
++    key.push_back(frame.values[row]);
++  }
++  for (size_t s : run.sites) {
++    key.push_back(frame.site_entries[s]);
++  }
++  if (run.grid >= 0 && run.grids[run.grid].key == key) {
++    return run.grids[run.grid].exec;
++  }
++  int64_t to = -1;
++  auto it = run.grid_index.find(key);
++  if (it != run.grid_index.end()) {
++    to = static_cast<int64_t>(it->second);
++  } else if (
++      !grid_execs_frozen &&
++      static_cast<int64_t>(run.grids.size()) < grid_exec_cap) {
++    to = static_cast<int64_t>(instantiate_grid(run, frame, form));
++  } else {
++    grid_frozen_misses += grid_execs_frozen;
++    // past the cap: the current exec if of the form, else the form's first,
++    // re-gridded in place
++    for (size_t i = 0; i < run.grids.size() && to < 0; ++i) {
++      if (run.grids[i].form == form) {
++        to = static_cast<int64_t>(i);
++      }
++    }
++    if (run.grid >= 0 && run.grids[run.grid].form == form) {
++      to = run.grid;
++    }
++    if (to < 0) {
++      run.grids.push_back({form, key, run.execs[form], false, {}});
++      to = static_cast<int64_t>(run.grids.size() - 1);
++    }
++  }
++  if (to != run.grid) {
++    switch_grid(run, to);
++  }
++  return run.grids[to].exec;
++}
++
++size_t HostTraceVariant::instantiate_grid(
++    Segment& run,
++    const Frame& frame,
++    size_t form) {
++  run.form_configs.resize(run.execs.size());
++  std::vector<int64_t>& own = run.form_configs[form];
++  bool adopted = false;
++  for (const Segment::Grid& x : run.grids) {
++    adopted = adopted || (!x.owned && x.form == form);
++  }
++  if (!adopted && own.empty()) {
++    // nothing has set the form graph's nodes yet: they hold what its exec
++    // was instantiated at
++    own = launch_config(run, form, nullptr);
++  }
++  const std::vector<int64_t> config = launch_config(run, form, &frame);
++  if (!adopted && config == own) {
++    run.grids.push_back({form, run.grid_key, run.execs[form], false, {}});
++    run.grid_index.emplace(run.grid_key, run.grids.size() - 1);
++    own.clear();
++    return run.grids.size() - 1;
++  }
++  const auto t0 = std::chrono::steady_clock::now();
++  // the form graph's kernel nodes at the frame's configuration; their
++  // parameters are whatever their images hold, patched before the first launch
++  auto* driver = c10::cuda::DriverAPI::get();
++  Segment::Clone* clone = form == 0 ? nullptr : &run.clones[form - 1];
++  auto set = [&](const Record& r, CUgraphNode node) {
++    if (r.kind != Kind::Kernel || !node) {
++      return;
++    }
++    const int64_t row = r.site >= 0 ? frame.site_entries[r.site] : 0;
++    const KernelRow& k = kernel_row(r, row);
++    std::array<int64_t, 7> dims = k.dims;
++    if (!k.constant_dims) {
++      for (size_t d = 0; d < dims.size(); ++d) {
++        dims[d] = frame.values[k.dim_rows[d]];
++      }
++    }
++    for (int64_t d : dims) {
++      TORCH_CHECK_VALUE(
++          d >= 0 && d <= std::numeric_limits<unsigned int>::max(),
++          "host_trace: a launch dimension of ",
++          d);
++    }
++    CUDA_KERNEL_NODE_PARAMS p = k.params;
++    p.gridDimX = static_cast<unsigned int>(dims[0]);
++    p.gridDimY = static_cast<unsigned int>(dims[1]);
++    p.gridDimZ = static_cast<unsigned int>(dims[2]);
++    p.blockDimX = static_cast<unsigned int>(dims[3]);
++    p.blockDimY = static_cast<unsigned int>(dims[4]);
++    p.blockDimZ = static_cast<unsigned int>(dims[5]);
++    p.sharedMemBytes = static_cast<unsigned int>(dims[6]);
++    C10_CUDA_DRIVER_CHECK(driver->cuGraphKernelNodeSetParams_(node, &p));
++  };
++  for (size_t i = run.first; i < run.stop; ++i) {
++    set(records_[i], clone ? clone->nodes[i - run.first] : records_[i].node);
++  }
++  if (clone) {
++    for (const Record& r : clone->pieces) {
++      set(r, r.node);
++    }
++  }
++  cudaGraphExec_t exec = nullptr;
++  // CUDAGraph::instantiate's flags
++  C10_CUDA_CHECK(cudaGraphInstantiateWithFlags(
++      &exec,
++      clone ? reinterpret_cast<cudaGraph_t>(clone->graph)
++            : run.native->raw_cuda_graph(),
++      cudaGraphInstantiateFlagAutoFreeOnLaunch |
++          cudaGraphInstantiateFlagUseNodePriority));
++  run.grids.push_back(
++      {form, run.grid_key, reinterpret_cast<CUgraphExec>(exec), true, {}});
++  run.grid_index.emplace(run.grid_key, run.grids.size() - 1);
++  C10_CUDA_CHECK(cudaGraphUpload(exec, at::cuda::getCurrentCUDAStream()));
++  ++grid_instantiations;
++  grid_instantiate_ns += (std::chrono::steady_clock::now() - t0).count();
++  return run.grids.size() - 1;
++}
++
++void HostTraceVariant::switch_grid(Segment& run, int64_t to) {
++  // the records hold the current exec's state, or with none the form exec's
++  std::vector<Segment::Held> none;
++  std::vector<Segment::Held>& saved =
++      run.grid >= 0 ? run.grids[run.grid].held : none;
++  if (to >= 0) {
++    const Segment::Grid& x = run.grids[to];
++    const bool same = run.grid < 0 && !x.owned && x.form == run.form;
++    swap_held(run, saved, x.form, same ? saved : x.held);
++  } else {
++    // leaving: the form's exec is current from here on and the non-keyed path
++    // patches the form execs, so what any of them held is unknown
++    const bool same = !run.grids[run.grid].owned;
++    swap_held(run, saved, run.form, same ? saved : none);
++    for (Segment::Grid& x : run.grids) {
++      if (!x.owned) {
++        x.held.clear();
++      }
++    }
++    run.form_held.clear();
++  }
++  for (size_t i = run.first; i < run.stop; ++i) {
++    dirty_[i] = 1;
++  }
++  run.grid = to;
++  ++grid_switches;
++}
++
+ void HostTraceVariant::patch_and_replay(Segment& run, Frame& frame) {
+   int64_t pt = phase_now();
+   const int64_t* v = frame.values.data();
+@@ -366,7 +595,15 @@
+   const size_t form =
+       run.forms.size() > 1 ? frame.forms[&run - segments_.data()] : 0;
+   Segment::Clone* clone = form == 0 ? nullptr : &run.clones[form - 1];
+-  if (form != run.form && form_held_enabled) {
++  const bool hooks = observed(run);
++  const bool keyed = grid_exec_cap > 0 && !hooks;
++  if (!keyed && run.grid >= 0) {
++    switch_grid(run, -1);
++  }
++  CUgraphExec exec = run.execs[form];
++  if (keyed) {
++    exec = select_grid(run, frame, form);
++  } else if (form != run.form && form_held_enabled) {
+     switch_form_held(run, form);
+     for (size_t i = run.first; i < run.stop; ++i) {
+       dirty_[i] = 1;
+@@ -384,7 +621,6 @@
+       }
+     }
+   }
+-  const CUgraphExec exec = run.execs[form];
+   // the philox offsets the segment's RNG calls take before the next, and
+   // the intragraph offset of the current one's kernels
+   int64_t running = 0;
+@@ -534,7 +770,7 @@
+     launch_ns.push_back(
+         std::chrono::steady_clock::now().time_since_epoch().count());
+   }
+-  if (observed(run)) {
++  if (hooks) {
+     TORCH_CHECK(
+         form == 0,
+         "host_trace: replay hooks on a segment replayed in another form");
+--- a/torch/csrc/cuda/host_trace/Sites.cpp
++++ b/torch/csrc/cuda/host_trace/Sites.cpp
+@@ -718,6 +718,12 @@
+ 
+ HostTraceVariant::~HostTraceVariant() {
+   for (Segment& g : segments_) {
++    for (const Segment::Grid& x : g.grids) {
++      if (x.owned) {
++        C10_CUDA_CHECK_WARN(
++            cudaGraphExecDestroy(reinterpret_cast<cudaGraphExec_t>(x.exec)));
++      }
++    }
+     for (size_t f = 1; f < g.execs.size(); ++f) {
+       C10_CUDA_CHECK_WARN(
+           cudaGraphExecDestroy(reinterpret_cast<cudaGraphExec_t>(g.execs[f])));
+--- a/torch/csrc/cuda/host_trace/Variant.h
++++ b/torch/csrc/cuda/host_trace/Variant.h
+@@ -13,6 +13,7 @@
+ 
+ #include <array>
+ #include <chrono>
++#include <map>
+ #include <memory>
+ #include <mutex>
+ #include <optional>
+@@ -79,6 +80,21 @@
+ extern bool placement_reuse_enabled;
+ // a form switch restores what the form's exec last held (else forgets it)
+ extern bool form_held_enabled;
++// A segment keeps up to grid_exec_cap execs, one per form and launch
++// configuration of its kernels, each instantiated at it: a configuration
++// change never sets a grid, block, smem or function in an uploaded exec, which
++// would slow the node's successor for the exec's life. 0: one exec per form,
++// re-gridded in place. Test-only: the execs instantiated, the switches between
++// them and the instantiate + upload time
++extern int64_t grid_exec_cap;
++// frozen: a configuration with no exec yet takes the past-the-cap path, so
++// after a warm-up over the served sizes nothing is instantiated while serving.
++// grid_frozen_misses counts the replays that found no exec for theirs
++extern bool grid_execs_frozen;
++extern int64_t grid_frozen_misses;
++extern int64_t grid_instantiations;
++extern int64_t grid_switches;
++extern int64_t grid_instantiate_ns;
+ // add_entry takes an entry's TMA descriptors (else refuses the entry)
+ extern bool entry_descriptors_enabled;
+ 
+@@ -411,6 +427,25 @@
+       std::vector<uint8_t> image;
+     };
+     std::vector<std::vector<Held>> form_held;
++    // with grid_exec_cap, per (form, configuration) its exec and what its
++    // records' kernel nodes held while another ran; a form's own exec is one
++    // when its instantiation's configuration comes up
++    struct Grid {
++      size_t form;
++      std::vector<int64_t> key;
++      CUgraphExec exec;
++      bool owned; // else execs[form]
++      std::vector<Held> held;
++    };
++    std::vector<Grid> grids;
++    std::map<std::vector<int64_t>, size_t> grid_index;
++    int64_t grid = -1; // the current, -1 none
++    // the key: the form, the dimension rows of its kernels, its sites' rows
++    std::vector<int64_t> grid_rows;
++    bool grid_indexed = false;
++    std::vector<int64_t> grid_key;
++    // per form, its exec's configuration (launch_config) until adopted
++    std::vector<std::vector<int64_t>> form_configs;
+     // an RNG segment's: the generator its kernels draw from, its capture's
+     // seed and offset addresses, and the increment its exec is set to (-1
+     // the capture's)
+@@ -563,6 +598,23 @@
+   void insert(Site& s, const int64_t* key, int64_t row);
+   KernelRow& kernel_row(Record& r, int64_t row) const;
+   void switch_form_held(Segment& run, size_t form);
++  // saves the records' and pieces' held state into `saved` and loads `next`'s
++  // for `form`
++  void swap_held(
++      Segment& run,
++      std::vector<Segment::Held>& saved,
++      size_t form,
++      const std::vector<Segment::Held>& next);
++  // per kernel node of the form, its function, grid, block and smem: the
++  // frame's, or (frame null) what its graph's nodes hold
++  std::vector<int64_t> launch_config(
++      Segment& run,
++      size_t form,
++      const Frame* frame);
++  // the exec of the frame's form and configuration, made current
++  CUgraphExec select_grid(Segment& run, const Frame& frame, size_t form);
++  size_t instantiate_grid(Segment& run, const Frame& frame, size_t form);
++  void switch_grid(Segment& run, int64_t to);
+   const KernelRow& kernel_row(const Record& r, int64_t row) const;
+   const MemsetRow& memset_row(const Record& r, int64_t row) const;
+   int64_t check_row(int64_t row) const;

@@ -1,0 +1,241 @@
+--- step_ms10/torch/cuda/_host_trace_replay.py	2026-10-15 14:54:30.431811224 -0700
++++ step_ms11/torch/cuda/_host_trace_replay.py	2026-10-15 16:19:28.538607815 -0700
+@@ -1036,10 +1036,9 @@
+         first = sum(len(s.launches) for s in segments[:g])
+         stop = first + len(segments[g].launches)
+         lowered = variant.captured.lowered
+-        # the native segment's sites: its keyed sites, then its selectors where the native takes sections (a
+-        # section's piece replaces their nodes)
+-        selectors = lowered.selectors if getattr(torch._C, "_host_trace_section_entries", False) else ()
+-        sites = [(i, s) for i, s in enumerate((*lowered.sites, *selectors)) if s.nodes and first <= s.nodes[0] < stop]
++        # the native segment's sites, as flatten_variant gives them: its keyed sites, then its selectors (a section's
++        # piece replaces their nodes; with section entries off a selector's arm stays 0)
++        sites = [(i, s) for i, s in enumerate((*lowered.sites, *lowered.selectors)) if s.nodes and first <= s.nodes[0] < stop]
+         changes, pieces = [], []
+         for (i, site), arm in zip(sites, arms, strict=True):
+             if arm == 0:
+--- step_ms10/torch/cuda/_host_trace_memory.py	2026-10-14 06:19:45.129331019 -0700
++++ step_ms11/torch/cuda/_host_trace_memory.py	2026-10-15 16:26:16.325245301 -0700
+@@ -536,25 +536,64 @@
+ def check_section(lowered: LoweredTape, plan: MemoryPlan, nodes: Sequence[int], launches: Sequence[Any], temporaries: Sequence[tuple[int, int]], drops: Collection[int]) -> str | None:
+     """Why a section (launches and temporaries (base, bytes row) in place of launches `nodes` of one op,
+     which does not make the op's allocations `drops`) cannot take the op's place in the plan, or None. Its
+-    graph piece replaces the op's chain of one run, and its temporaries live within that chain (or over
+-    the run), so every other base it reaches must be live in the plan over the whole of the op's chain,
+-    at its first and its last launch: an allocation the plan frees or makes within the chain may share
+-    bytes with another there. Build time only."""
++    graph piece replaces the op's chain of one run, so each base it reaches (an allocation or a freed
++    argument, and its own temporaries) is in use over the whole of the op's chain, from its first launch to
++    its last. The run's allocations are all made before its graph is queued, in the plan's order, and one
++    takes a freed one's bytes only after its free (_lifetimes): a base whose lifetime does not cover the
++    chain overlaps another that the plan makes after its free, or frees before it is made, within the
++    chain. Exact on the plan's lifetimes (no widening of the op's span). Build time only."""
+     step = next((i for i, s in enumerate(lowered.steps) if isinstance(s, range) and nodes and nodes[0] in s), None)
+     if step is None or not all(n in lowered.steps[step] for n in nodes):
+         return "its op's launches are not in one graph"
+     first, last = lowered.span(nodes[0])[0], lowered.span(nodes[-1])[1]
+     own, tape = {b for b, _ in temporaries}, len(lowered.allocations) + len(lowered.eager_roots)
++    lives = _lifetimes(lowered, plan, step, first, own, drops)
+     live = _liveness(lowered, plan)
++    reached: dict[Any, None] = {}
+     for lo in launches:
+         for s in lo.slots:
+-            if not isinstance(s, PointerSlot) or s.base is None or s.base in own:
++            if not isinstance(s, PointerSlot):
+                 continue
+-            if s.base >= tape or s.base in drops or not (live(s.base, step, first) and live(s.base, step, last)):
++            if s.base is None:
++                reached[("argument", s.root[1])] = None
++            elif s.base in own:
++                reached[("section", s.base)] = None
++            elif s.base >= tape or s.base in drops or (("allocation", s.base) not in lives and not (live(s.base, step, first) and live(s.base, step, last))):
+                 return f"base {s.base} is not live over its op's launches in the plan"
++            else:
++                reached[("allocation", s.base)] = None
++    for x in reached:
++        a_x, b_x = lives.get(x, (-math.inf, math.inf))
++        if a_x <= first and last <= b_x:
++            continue
++        for c, (a_c, b_c) in lives.items():
++            # c takes x's bytes after x's free while the section still uses x, or x takes c's before c's free
++            if c != x and (b_x < a_c <= last or first <= b_c < a_x):
++                return f"{x[0]} {x[1]} shares bytes with {c[0]} {c[1]} over its op's launches in the plan"
+     return None
+ 
+ 
++def _lifetimes(lowered: LoweredTape, plan: MemoryPlan, step: int, first: float, own: Collection[int], drops: Collection[int]) -> dict[tuple[str, int], tuple[float, float]]:
++    """The bases of the run of `step` that may share bytes there, each (made, freed) in seqs, as
++    HostTraceVariant::allocate makes them before the run's graph is queued. In "eager" order (a run with
++    an order): its temporaries (made at their seq, freed after their last use), its tensors (never freed
++    in the run), its freed arguments, and a section's own temporaries (made before the op's first launch,
++    freed after its last). A run buffer's run (temporaries, no order): its temporaries, placed first fit
++    over their lifetimes; a section's are held over the run. A run of tensors only: its tensors, and a
++    section's own temporaries, made and freed before the first tensor the op's chain makes. A base absent
++    holds its bytes over the run (made before it, held or relocated, an eager output, a dropped one)."""
++    m = plan.steps[step]
++    seqs = _first_seqs(lowered)
++    skip = {k for k, *_ in plan.planned} | set(plan.relocated) | set(drops)
++    lives: dict[tuple[str, int], tuple[float, float]] = {("allocation", k): (seqs[k], last) for k, _, last in m.temporaries if k not in skip}
++    if m.order or not m.temporaries:
++        lives.update((("allocation", k), (seqs[k], math.inf)) for k in m.tensors if k not in skip)
++        section = (first - 0.5, math.inf) if m.order else (first - 0.5, first - 0.5)
++        lives.update((("section", b), section) for b in own)
++    lives.update((("argument", a), (-math.inf, seq)) for a, seq in (m.freed if m.order else ()))
++    return lives
++
++
+ def section_places(lowered: LoweredTape, plan: MemoryPlan, nodes: Sequence[int]) -> tuple[int, int]:
+     """Where a section of the op of launches `nodes` makes and frees its temporaries in its run's eager
+     order (HostTraceVariant::allocate): before the first event after the op's own allocations, and before
+--- step_ms10/test/test_cuda_host_trace_replay.py	2026-10-15 14:54:30.428811199 -0700
++++ step_ms11/test/test_cuda_host_trace_replay.py	2026-10-15 16:26:16.397595527 -0700
+@@ -408,6 +408,26 @@
+     return torch.empty_like(x)
+ 
+ 
++@torch.library.custom_op("host_trace_test::split_op_late_output", mutates_args=())
++def split_op_late_output(x: torch.Tensor) -> torch.Tensor:
++    # split_add with its output made after its first launch of two (past 16 rows)
++    n = x.numel()
++    if x.shape[0] <= 16:
++        y = torch.empty_like(x)
++        _add[(triton.cdiv(n, 128),)](x, y, n, 3, B=128)
++        return y
++    t = torch.empty(n, device=x.device, dtype=x.dtype)
++    _add[(triton.cdiv(n, 128),)](x, t, n, 1, B=128)
++    y = torch.empty_like(x)
++    _add[(triton.cdiv(n, 128),)](t, y, n, 2, B=128)
++    return y
++
++
++@split_op_late_output.register_fake
++def _(x):
++    return torch.empty_like(x)
++
++
+ @torch.library.custom_op("host_trace_test::enqueues_past_32", mutates_args=())
+ def enqueues_past_32(x: torch.Tensor) -> torch.Tensor:
+     # a launch the tracer does not see past 32 rows
+@@ -822,17 +842,46 @@
+         (v,) = f.variants
+         check_plan(v.captured.lowered, v.memory)
+ 
+-    def test_a_split_reduction_is_a_section(self):
++    def test_section_entries_off_after_sections_keeps_new_forms(self):
++        # two sums, each a section at many rows: forms [0, 0], [1, 0] and [0, 1]
++        # made with section entries on; with them off, (many, many) needs the
++        # new form [1, 1] of entries that exist (no redispatch), whose arms list
++        # the native segment's sites, selectors included (learnfast's repro of
++        # the zip ValueError). Bitwise
++        def fn(x, y):
++            return (x * 2).sum(0) + (y * 2).sum(0)
++
++        f = HostTraceReplay(fn)
++        small, big = 100, 5000
++        with mock.patch.object(torch._C, "_host_trace_section_entries", True, create=True):
++            for a, b in ((small, small), (300, 300), (big, small), (6000, small), (small, big), (small, 6000)):
++                x, y = torch.randn(a, 64, device="cuda"), torch.randn(b, 64, device="cuda")
++                self.assertEqual(f(x, y), fn(x, y), atol=0, rtol=0)
++        with mock.patch.object(torch._C, "_host_trace_section_entries", False, create=True):
++            x, y = torch.randn(big, 64, device="cuda"), torch.randn(big, 64, device="cuda")
++            self.assertEqual(f(x, y), fn(x, y), atol=0, rtol=0)
++        self.assertEqual((f.traces, f.eager), (1, 0))
++
++    @parametrize("sections", [True, False])
++    def test_a_split_reduction_is_a_section(self, sections):
+         # sum's split reduction at many rows (a memset and a kernel through a
+         # staging buffer and semaphores, for one kernel) replaces the variant's
+-        # sum in its graph, its temporaries sized at the call: no trace
++        # sum in its graph, its temporaries sized at the call: no trace. With
++        # section entries off (torch._C._host_trace_section_entries False) the
++        # redispatch refuses and the other count traces again
+         def fn(x):
+             return (x * 2).sum(0) + 1
+ 
++        patch = mock.patch.object(torch._C, "_host_trace_section_entries", sections, create=True)
++        patch.start()
++        self.addCleanup(patch.stop)
+         f = HostTraceReplay(fn)
+         for t in (100, 300, 5000, 6000, 100, 5000):
+             x = torch.randn(t, 64, device="cuda")
+             self.assertEqual(f(x), fn(x), atol=0, rtol=0)
++        if not sections:
++            self.assertEqual((f.traces, f.sections, f.eager, len(f.variants)), (2, 0, 0, 2))
++            return
+         self.assertEqual((f.traces, f.redispatches, f.sections, f.eager, f.retrace_causes), (1, 1, 1, 0, {}))
+         self.assertGreater(f.section_bytes, 0)
+         (v,) = f.variants
+@@ -1024,7 +1073,47 @@
+         steps = [dataclasses.replace(m, temporaries=tuple((k, seq, seq if last >= first else last) for k, seq, last in m.temporaries)) for m in plan.steps]
+         self.assertNotEqual(steps, list(plan.steps))
+         why = check_section(lowered, dataclasses.replace(plan, steps=tuple(steps)), nodes, launches, temporaries, drops)
+-        self.assertRegex(why, "is not live over its op's launches")
++        self.assertRegex(why, "shares bytes with .* over its op's launches")
++
++    @parametrize("memory", ["eager", "run_buffer"])
++    def test_a_section_reading_an_input_freed_within_its_op(self, memory):
++        # traced past 16 rows, split_op's first launch of two is the last use of its input (add's output, a
++        # temporary freed there); its one-launch section at 8 rows reads that input over the whole op. No
++        # allocation the plan makes after that free within the op (its temporary is the section's to drop,
++        # its output made before): the section is taken
++        def fn(x):
++            return add(split_op(add(x)), 1)
++
++        seen = []
++
++        def check(*args):
++            seen.append(check_section(*args))
++            return seen[-1]
++
++        f = HostTraceReplay(fn, memory=memory)
++        with mock.patch.object(_host_trace_replay, "check_section", check):
++            for m in (40, 8, 40, 8):
++                x = torch.randn(m, 64, device="cuda")
++                self.assertEqual(f(x), fn(x), atol=0, rtol=0)
++        self.assertEqual(seen, [None])
++        self.assertEqual((f.traces, f.redispatches, f.sections, f.retrace_causes), (1, 1, 1, {}))
++
++    @parametrize("memory", ["eager", "run_buffer"])
++    def test_a_section_overlapping_an_allocation_made_within_its_op(self, memory):
++        # as above, but the op's output is made after its first launch: in eager order, or first fit in the run
++        # buffer (both temporaries of the run), it may take the freed input's bytes, which the section still reads
++        # while writing it, so the section is refused and the class traces
++        def fn(x):
++            return add(split_op_late_output(add(x)), 1)
++
++        f = HostTraceReplay(fn, memory=memory)
++        for m in (40, 8, 40, 8):
++            x = torch.randn(m, 64, device="cuda")
++            self.assertEqual(f(x), fn(x), atol=0, rtol=0)
++        self.assertEqual((f.traces, f.redispatches, f.sections), (2, 0, 0))
++        ((cause, n),) = f.retrace_causes.items()
++        self.assertEqual((cause[1], n), ("host_trace_test.split_op_late_output.default", 1))
++        self.assertRegex(cause[4], "shares bytes with allocation .* over its op's launches in the plan")
+ 
+     def test_a_section_traces_again_where_the_native_replay_takes_none(self):
+         # a replay whose native variant takes no section entries (the frozen
+--- step_ms10/test/test_cuda_host_trace_opaque.py	2026-10-15 13:17:46.543905556 -0700
++++ step_ms11/test/test_cuda_host_trace_opaque.py	2026-10-15 16:18:18.066605721 -0700
+@@ -816,6 +816,22 @@
+             self.assertEqual(f(x, y), mul_chain(x, y), atol=0, rtol=0)
+         self.assertEqual(len(bound(f)), 1)
+ 
++    @parametrize("sections", [False, True])
++    def test_a_new_form_beside_selectors_whatever_the_section_flag(self, sections):
++        # the Triton adds around the opaque mul are selectors in the mul's
++        # segment; a key of the other topology makes a new form. Its arms list
++        # the native segment's sites, selectors included, also where sections
++        # are switched off (torch._C._host_trace_section_entries False). Bitwise
++        p = TableProvider(style="mixed")
++        f = HostTraceReplay(mul_chain, opaque=(p,))
++        base = torch.randn(4096, device="cuda")
++        with mock.patch.object(torch._C, "_host_trace_section_entries", sections, create=True):
++            for _ in range(2):
++                for n in (512, 640):
++                    x = torch.randn(n, device="cuda")
++                    self.assertEqual(f(x, base[:n]), mul_chain(x, base[:n]), atol=0, rtol=0)
++        self.assertEqual((len(f.variants), len(bound(f)), f.eager), (1, 1, 0))
++
+     @parametrize("form_held", [False, True])
+     @parametrize("first", [512, 640])
+     def test_binding_switches(self, first, form_held):

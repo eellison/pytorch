@@ -1,0 +1,14 @@
+--- a/torch/cuda/_host_trace_capture.py
++++ b/torch/cuda/_host_trace_capture.py
+@@ -74,8 +74,9 @@
+ # the test suites raise a trace value that disagrees with the live one
+ raise_trace_disagreements = False
+ # instantiate_form keeps a programmatic edge into or out of a replaced chain
+-# where both ends allow it; False puts the piece on default edges
+-keep_programmatic_edges = False
++# where both ends allow it, as eager launches them; False puts the piece on
++# default edges
++keep_programmatic_edges = True
+ 
+ _POINTER = struct.Struct("<Q")
+ _POINTERS = {4: struct.Struct("<I"), 8: _POINTER}  # a 4-byte one is the low half

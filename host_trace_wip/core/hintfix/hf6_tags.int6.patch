@@ -1,0 +1,153 @@
+--- a/test/test_cuda_host_trace_tape.py
++++ b/test/test_cuda_host_trace_tape.py
+@@ -62,6 +62,19 @@
+     return x.new_empty(x.shape[::-1]).t()
+ 
+ 
++# an op that changes its argument's metadata without the inplace_view tag
++_lib.define("tape_untagged_flatten_(Tensor(a!) x) -> ()")
++untagged_flatten_ = torch.ops.host_trace_test.tape_untagged_flatten_
++
++
++def _flatten_(x):
++    x.resize_(x.numel())
++
++
++_lib.impl("tape_untagged_flatten_", _flatten_, "CUDA")
++torch.library.register_fake("host_trace_test::tape_untagged_flatten_", _flatten_)
++
++
+ def _run(fn, *args):
+     # the symbolic run on the CPU, without trace()'s capture
+     tr = _Trace(torch.device("cpu"))
+@@ -623,6 +636,16 @@
+         with self.assertRaisesRegex(Declined, "on a stream other than the trace's"):
+             trace(side_stream, (x,))
+ 
++    def test_an_untagged_metadata_change_declines(self):
++        # the op's fake kernel changes its argument's metadata: the trace compares, not the tag
++        def fn(x):
++            y = x.clone()
++            untagged_flatten_(y)
++            return y + 1
++
++        with self.assertRaisesRegex(Declined, "changes a traced tensor's metadata"):
++            trace(fn, (torch.randn(2, 8, device="cuda"),), warm_up=False)
++
+     def test_zeroing_an_allocation_is_a_memset(self):
+         x = torch.randn(8, 4, device="cuda")
+ 
+--- a/torch/cuda/_host_trace_harvest.py
++++ b/torch/cuda/_host_trace_harvest.py
+@@ -124,6 +124,7 @@
+ import torch
+ import torch.utils._pytree as pytree
+ from torch._logging import trace_structured
++from torch._ops import OpOverload
+ from torch.cuda._host_trace_capture import attribute_value, launch_attributes, MemsetNode, reproducible
+ from torch.cuda._host_trace_opaque import (
+     OpaqueBinding,
+@@ -133,6 +134,7 @@
+     Slot,
+     library_state_as,
+     span_bytes,
++    takes_generator,
+ )
+ from torch.cuda._host_trace_tape import _cuda_address, _gc_hold, new_private_stream, seed_offset_on_device
+ from torch.cuda._utils import _check_cuda_bindings
+@@ -737,9 +739,11 @@
+         return None
+ 
+     def _draws(self, op: Any) -> bool:
++        # the rng family's ops and, with it on, an aten op that takes a Generator; a capture of any
++        # other op that takes philox offsets is refused (_harvest)
+         tags = getattr(op, "tags", ())
+-        seeded = torch.Tag.nondeterministic_seeded in tags and not {torch.Tag.dynamic_output_shape, torch.Tag.data_dependent_output} & set(tags)
+-        return op in self.rng or (bool(self.rng) and seeded and op.namespace == "aten")
++        static = not {torch.Tag.dynamic_output_shape, torch.Tag.data_dependent_output} & set(tags)
++        return op in self.rng or (bool(self.rng) and isinstance(op, OpOverload) and op.namespace == "aten" and static and takes_generator(op))
+ 
+     def _normal(self, key: OpaqueKey) -> tuple:
+         return (
+@@ -1126,7 +1130,7 @@
+                     dev.anchor,
+                     0,
+                     0,
+-                    _PRETAKE[x] if rng else None,
++                    _PRETAKE[x] if rng else 0,
+                     _ZERO_INIT,
+                     name,
+                     overload,
+@@ -1674,6 +1678,8 @@
+             return binding
+ 
+         philox = [c[4] for c in caps]
++        if not rng and any(p[2] for p in philox):
++            raise _Refused(f"{op} takes {[p[2] for p in philox]} philox offsets and takes no Generator")
+         increment = philox[0][2] if rng else 0
+         if rng and any(p[2] != increment for p in philox):
+             raise _Refused(f"the captures took {[p[2] for p in philox]} philox offsets")
+--- a/torch/cuda/_host_trace_opaque.py
++++ b/torch/cuda/_host_trace_opaque.py
+@@ -259,6 +259,20 @@
+         ...
+ 
+ 
++def takes_generator(op: OpOverload) -> bool:
++    """Whether op draws from a generator by its schema: it takes a Generator,
++    or an overload of its packet does (rand_like's default overload draws
++    from the default one its .generator overload takes). One that draws
++    otherwise shows at its harvest: it takes philox offsets."""
++    packet = op.overloadpacket
++    for overload in (op, *(getattr(packet, name) for name in packet.overloads())):
++        for a in overload._schema.arguments:
++            t = a.type.getElementType() if isinstance(a.type, torch.OptionalType) else a.type
++            if isinstance(t, torch._C._GeneratorType):
++                return True
++    return False
++
++
+ def recordable(binding: OpaqueBinding) -> bool:
+     """Whether a trace can record the binding's nodes as its launches."""
+     from torch.cuda._host_trace_capture import reproducible
+--- a/torch/cuda/_host_trace_replay.py
++++ b/torch/cuda/_host_trace_replay.py
+@@ -80,7 +80,7 @@
+ from torch.cuda._host_trace_harvest import HarvestProvider
+ from torch.cuda._host_trace_lower_tape import fold, FoldRefused, lower_guards, lower_tape, PointerSlot, PredictedOutput
+ from torch.cuda._host_trace_memory import arena_addresses, auto_memory, check_plan, plan_memory, relocate, relocate_entries, size_classes, split_runs, SPLITS
+-from torch.cuda._host_trace_opaque import key_guards, library_state_as, span_bytes
++from torch.cuda._host_trace_opaque import key_guards, library_state_as, span_bytes, takes_generator
+ from torch.cuda._host_trace_program import Status
+ from torch.cuda._host_trace_redispatch import redispatch
+ from torch.cuda._host_trace_native import (
+@@ -834,7 +834,7 @@
+             reach[j] = max(reach[j], d + reach[i])
+         buffers = {j: torch.empty(metadata[j][3] + reach[j], dtype=torch.uint8, device=device) for j in range(inputs) if j not in lead and j not in lent}
+         # a drawing op's floating inputs are probabilities, rates or scales: in range, as the harvest's refill
+-        bounds = (0.25, 0.75) if torch.Tag.nondeterministic_seeded in op.tags else (-1, 1)
++        bounds = (0.25, 0.75) if takes_generator(op) else (-1, 1)
+         tensors = []
+         for i, (dtype, sizes, strides, align) in enumerate(metadata[:inputs]):
+             if i in lent:
+--- a/torch/cuda/_host_trace_tape.py
++++ b/torch/cuda/_host_trace_tape.py
+@@ -1085,10 +1085,17 @@
+             twins = pytree.tree_map_only(_TracedTensor, self._twin, (args, kwargs))
+             twins = pytree.tree_map_only(torch.Tensor, lambda t: self._host_fake(t) if self._is_host(t) else t, twins)
+             try:
+-                return twins, func(*twins[0], **twins[1])
++                out = func(*twins[0], **twins[1])
+             except Exception as e:
+                 why = f"{type(e).__name__}: {str(e).splitlines()[0]}"
+                 raise self.decline(f"{func} has no traced metadata ({why})") from e
++        # an op that changes an argument's metadata (an in-place view, a resize), tagged or not: its twin's.
++        # One it returns is its written output, which _eager_call compares
++        returned = {id(o) for o in pytree.tree_leaves(out)}
++        for t, twin in zip(pytree.tree_leaves((args, kwargs)), pytree.tree_leaves(twins)):
++            if isinstance(t, _TracedTensor) and id(twin) not in returned and (twin.dim() != t.dim() or not all(map(_same, (*twin.shape, *twin.stride(), twin.storage_offset()), (*t.shape, *t._sym_strides, t._sym_offset)))):
++                raise self.decline(f"{func} changes a traced tensor's metadata")
++        return twins, out
+     def _opaque_meta(self, func: OpOverload, leaves: list, spec: Any) -> tuple[Any, list] | None:
+         """func's outputs (meta tensors) and operand twins from its meta
+         function on bare meta twins, without FakeTensorMode's dispatch; None

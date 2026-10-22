@@ -1,0 +1,547 @@
+diff -ru '--exclude=__pycache__' '--exclude=TREE.txt' step331/test/inductor/test_cudagraph_host_trace.py step332/test/inductor/test_cudagraph_host_trace.py
+--- step331/test/inductor/test_cudagraph_host_trace.py	2026-10-13 05:28:40.360074515 -0700
++++ step332/test/inductor/test_cudagraph_host_trace.py	2026-10-13 19:12:13.462270763 -0700
+@@ -523,6 +523,31 @@
+         # "auto" takes the run buffer: its peak is within the margin
+         self.assertEqual(any(s.order for s in variant.memory.steps), memory == "eager")
+ 
++    @parametrize("memory", [None, "auto", "run_buffer"])
++    def test_replay_memory_default_by_graph(self, memory):
++        # None: a training graph's forward and backward replay eager memory,
++        # an inference graph "auto"; an explicit value is every graph's
++        class Lin(torch.nn.Module):
++            def __init__(self):
++                super().__init__()
++                self.w = torch.nn.Parameter(torch.randn(40, 40))
++
++            def forward(self, x):
++                return (x @ self.w).relu()
++
++        with config.patch({"triton.cudagraph_host_trace_replay_memory": memory}):
++            compiled = torch.compile(Lin().cuda(), mode="reduce-overhead")
++            for _ in range(3):
++                compiled(torch.randn(24, 40, device="cuda")).sum().backward()
++            with torch.no_grad():
++                for _ in range(3):
++                    compiled(torch.randn(24, 40, device="cuda"))
++        calls = [(kwargs["is_backward"], kwargs["is_inference"]) for _, kwargs in self.calls]
++        self.assertEqual(calls, [(False, False), (True, False), (False, True)])
++        training = "eager" if memory is None else memory
++        inference = "auto" if memory is None else memory
++        self.assertEqual([i.replay.memory for i in self.installed], [training, training, inference])
++
+     def test_static_inputs_are_read_at_every_call(self):
+         # static_input_idxs does not promise the same tensor at every call:
+         # two instances share one compile, and a `.data` swap moves a param
+diff -ru '--exclude=__pycache__' '--exclude=TREE.txt' step331/test/test_cuda_host_trace_harvest.py step332/test/test_cuda_host_trace_harvest.py
+--- step331/test/test_cuda_host_trace_harvest.py	2026-10-13 18:05:08.689230298 -0700
++++ step332/test/test_cuda_host_trace_harvest.py	2026-10-13 21:27:41.736469270 -0700
+@@ -389,8 +389,8 @@
+         # table: the workspace) is live there in the memory plan
+         plan_memory = memory.plan_memory
+ 
+-        def early(lowered, mode="eager"):
+-            plan = plan_memory(lowered, mode)
++        def early(lowered, mode="eager", **kwargs):
++            plan = plan_memory(lowered, mode, **kwargs)
+             steps = [dataclasses.replace(s, temporaries=tuple((k, seq, seq) for k, seq, _ in s.temporaries)) for s in plan.steps]
+             return dataclasses.replace(plan, steps=tuple(steps))
+ 
+diff -ru '--exclude=__pycache__' '--exclude=TREE.txt' step331/test/test_cuda_host_trace_memory.py step332/test/test_cuda_host_trace_memory.py
+--- step331/test/test_cuda_host_trace_memory.py	2026-10-08 20:22:38.467524964 -0700
++++ step332/test/test_cuda_host_trace_memory.py	2026-10-13 20:49:44.931768018 -0700
+@@ -281,6 +281,111 @@
+ 
+ instantiate_parametrized_tests(TestPlanned)
+ 
++
++def last_use(s, x):
++    # s's last use is the sum; the output, of s's bytes, is made after it
++    return x + s.sum()
++
++
++def backward_like(g, s0, *saved):
++    # a backward's pattern: a big temporary first, then smaller outputs that
++    # outlive the call, each made while a saved input is still read. Every
++    # request is over 10 MiB: its own segment, or a free block's bytes
++    t = s0.sum()
++    d = g.repeat(16).view(16, -1).sum(0)
++    h = d[: d.numel() * 3 // 4]
++    return (t, *(s[: h.numel()] * h for s in saved))
++
++
++def backward_like_eager(args):
++    # backward_like as Inductor's boxed call runs it: each input dropped at its last use
++    g, s0, *saved = args
++    args.clear()
++    t = s0.sum()
++    del s0
++    big = g.repeat(16)
++    del g
++    d = big.view(16, -1).sum(0)
++    del big
++    h = d[: d.numel() * 3 // 4]
++    outs = []
++    for i in range(len(saved)):
++        outs.append(saved[i][: h.numel()] * h)
++        saved[i] = None
++    return (t, *outs)
++
++
++@unittest.skipIf(not TEST_CUDA, "requires CUDA")
++class TestEagerArgumentFrees(TestCase):
++    # memory="eager": a boxed call's arguments are dropped at their last
++    # launch in a run, as eager drops them
++
++    def last_use_call(self, f, keep):
++        n = 786_000  # bytes no other block of the test has
++        s, x = torch.randn(n, device="cuda"), torch.randn(n, device="cuda")
++        want, before, ptr = last_use(s, x), s.clone(), s.data_ptr()
++        args = [s, x]
++        if not keep:
++            del s
++        replays = f.replays
++        out = f.call_boxed(args)
++        self.assertEqual(out, want, atol=0, rtol=0)
++        if keep:
++            self.assertEqual(s, before, atol=0, rtol=0)
++        return out.data_ptr() == ptr, f.replays > replays
++
++    def test_a_stolen_argument_is_freed_at_its_last_use(self):
++        f = HostTraceReplay(last_use, memory="eager")
++        results = [self.last_use_call(f, keep=False) for _ in range(4)]
++        # the replays' outputs take the argument's bytes: it was freed after the sum
++        self.assertEqual(results[2:], [(True, True)] * 2)
++        (v,) = f.variants
++        # both arguments' last launches are in the run
++        self.assertEqual([{a for a, _ in m.freed} for m in v.memory.steps], [{0, 1}, set()])
++
++    def test_a_held_argument_is_not_freed(self):
++        f = HostTraceReplay(last_use, memory="eager")
++        results = [self.last_use_call(f, keep=True) for _ in range(4)]
++        self.assertEqual(results[2:], [(False, True)] * 2)
++        # nor a call's that is not boxed
++        n = 786_000
++        s, x = torch.randn(n, device="cuda"), torch.randn(n, device="cuda")
++        ptr = s.data_ptr()
++        out = f(s, x)
++        self.assertNotEqual(out.data_ptr(), ptr)
++        self.assertEqual(out, last_use(s, x), atol=0, rtol=0)
++
++    def kept(self, call, seed):
++        # reserved bytes after empty_cache with the outputs held, the outputs
++        gc.collect()
++        torch.cuda.synchronize()
++        torch.cuda.empty_cache()
++        base = torch.cuda.memory_reserved()
++        torch.manual_seed(seed)
++        args = [torch.empty(1 << 22, device="cuda").normal_() for _ in range(8)]
++        out = call(args)
++        torch.cuda.synchronize()
++        torch.cuda.empty_cache()
++        return torch.cuda.memory_reserved() - base, out
++
++    def test_kept_memory_is_eagers(self):
++        f = HostTraceReplay(backward_like, memory="eager")
++        for seed in range(3):
++            self.kept(f.call_boxed, seed)
++        replays = f.replays
++        kept, out = self.kept(f.call_boxed, 3)
++        self.assertEqual(f.replays, replays + 1)
++        # each measured with nothing else held
++        out = [o.cpu() for o in out]
++        kept_eager, want = self.kept(backward_like_eager, 3)
++        self.assertEqual(out, [w.cpu() for w in want], atol=0, rtol=0)
++        # the outputs are where eager's are, in the saved inputs' freed
++        # segments, not in the 256 MiB temporary's
++        self.assertLess(kept, 256 << 20)
++        self.assertLessEqual(abs(kept - kept_eager), 2 << 20, f"kept {kept}, eager's {kept_eager}")
++        (v,) = f.variants
++        self.assertEqual(sum(len(m.freed) for m in v.memory.steps), 8)
++
+ def setUpModule():
+     from torch.cuda import _host_trace_hint_audit
+ 
+diff -ru '--exclude=__pycache__' '--exclude=TREE.txt' step331/test/test_cuda_host_trace_python_entry.py step332/test/test_cuda_host_trace_python_entry.py
+--- step331/test/test_cuda_host_trace_python_entry.py	2026-10-12 06:28:22.596058254 -0700
++++ step332/test/test_cuda_host_trace_python_entry.py	2026-10-14 05:35:51.376188991 -0700
+@@ -46,6 +46,7 @@
+         "test_a_slow_call_that_does_not_run_hands_the_call_back",
+         "test_a_split_lowering_the_peak_by_little_is_undone",
+         "test_call_boxed_drops_an_argument_after_its_last_use",
++        "test_fixed_sizes_split_only_at_the_peak",
+         "test_split_before_the_peak_allocation_first",
+     ),
+     # it compares the two paths itself
+diff -ru '--exclude=__pycache__' '--exclude=TREE.txt' step331/test/test_cuda_host_trace_replay.py step332/test/test_cuda_host_trace_replay.py
+--- step331/test/test_cuda_host_trace_replay.py	2026-10-13 06:18:52.344719803 -0700
++++ step332/test/test_cuda_host_trace_replay.py	2026-10-13 20:59:30.408339029 -0700
+@@ -2611,10 +2611,10 @@
+         # the unused allocation's last use is its own allocation, add(x)'s the
+         # second launch, which reads it; both are the run's temporaries
+         temporaries = ((0, seqs[0], seqs[0]), (1, seqs[1], second))
+-        # eager order: the unused one is freed at once, add(x)'s after the
+-        # second launch, which follows the output's allocation; x's last use
+-        # is the run
+-        run = StepMemory((2,), temporaries, (), (0, -1, 1, 2, -2), (0,))
++        # eager order: the unused one is freed at once, x (-1 - 3 - 0) after
++        # the first launch, its last use, and add(x)'s after the second, which
++        # follows the output's allocation
++        run = StepMemory((2,), temporaries, (), (0, -1, 1, -4, 2, -2), (0,), ((0, first),))
+         after = StepMemory((), (), ())
+         self.assertEqual(v.memory, MemoryPlan((2,), (run, after)))
+         self.assertLess(seqs[1], first)
+@@ -2823,9 +2823,9 @@
+ 
+     def test_a_run_splits_past_a_peak_it_cannot_lower(self):
+         # traced with a large x, the peak is add(x)'s temporary beside its
+-        # output, which no split lowers; the later one, where y is dead but
+-        # held to its run's end, is the peak with a small x, so the run
+-        # splits there too
++        # output, which no split lowers. y is dead after add(y), and eager
++        # order frees it there, as eager does: with a small x no later peak
++        # holds it, and the run stays one graph
+         def fn(x, y, c):
+             return add(add(x)), add(y), add(c)
+ 
+@@ -2842,15 +2842,14 @@
+             peak = torch.cuda.max_memory_allocated() - before
+             self.assertEqual(y, want)
+         self.assertEqual((f.replays, f.eager), (3, 0))
+-        self.assertEqual(peak, 4 * (4096 + m))
++        self.assertEqual(peak, 4 * m)
+         (v,) = f.variants
+         runs = [s for s in v.captured.lowered.steps if isinstance(s, range)]
+-        self.assertEqual([len(r) for r in runs], [3, 1])
++        self.assertEqual([len(r) for r in runs], [4])
+ 
+     def test_fixed_sizes_split_only_at_the_peak(self):
+-        # the tape above at fixed sizes: y held to its run's end is live only
+-        # past the peak (add(x)'s temporary beside its output), which it
+-        # cannot become, so the run stays one graph
++        # the tape above at fixed sizes: the run stays one graph, and x, freed
++        # at its last launch, lends add(add(x))'s output its bytes
+         def fn(x, y, c):
+             return add(add(x)), add(y), add(c)
+ 
+@@ -2868,7 +2867,7 @@
+             peak = torch.cuda.max_memory_allocated() - before
+             self.assertEqual(y, want)
+         self.assertEqual((f.replays, f.eager), (2, 0))
+-        self.assertEqual(peak, 4 * 2 * n)
++        self.assertEqual(peak, 4 * n)
+         (v,) = f.variants
+         runs = [s for s in v.captured.lowered.steps if isinstance(s, range)]
+         self.assertEqual([len(r) for r in runs], [4])
+diff -ru '--exclude=__pycache__' '--exclude=TREE.txt' step331/torch/cuda/_host_trace_memory.py step332/torch/cuda/_host_trace_memory.py
+--- step331/torch/cuda/_host_trace_memory.py	2026-10-12 07:42:49.582718983 -0700
++++ step332/torch/cuda/_host_trace_memory.py	2026-10-13 20:55:57.414562936 -0700
+@@ -25,17 +25,25 @@
+ places the run's temporaries as "run_buffer" does. The price
+ against eager: a tensor is dropped once the step of its last use is queued,
+ not right after that use; split_runs splits a run where that holds a tensor
+-across the replay's peak, or a later peak when the sizes vary. An argument no output is or views is dropped
+-after its last step too when the caller hands its references over
+-(HostTraceReplay.call_boxed, Inductor's boxed call); otherwise the caller
+-holds it anyway. split_runs splits where that holds a freed argument
+-(HostTraceReplay's `freed_arguments`) across the peak too. Where it splits
++across the replay's peak, or a later peak when the sizes vary. When the
++caller hands its references over (HostTraceReplay.call_boxed, Inductor's
++boxed call), the replay drops its reference to an argument no output is or
++views as eager does: right after its last launch when that is in a run, as a
++temporary's free, else after its last step. The allocator frees it if no
++one else holds it. The native commit drops the argument's Python object
++before the run's first allocation and its storage at the free: a Python
++object's finalizer may run Python, never under the allocator's lock. A
++cached segment released after such a free (its own allocation's OOM retry)
++raises: unlike a temporary, the argument cannot move to a run buffer, and
++the run's earlier launches read it. split_runs splits where a step-end drop
++holds a freed argument (HostTraceReplay's `freed_arguments`) across the peak
++too. Where it splits
+ is HostTraceReplay's `splits` (SPLITS): "walk" splits wherever
+ that lowers the replay's peak or, when the sizes vary, a later one; "coarse"
+ then undoes the replay's peak's splits that each lower it by little, a
+ graph launch fewer each; "peak" (the default) splits only at the replay's peak.
+ 
+-"auto" (HostTraceReplay's and Inductor's default) picks one of the two
++"auto" (HostTraceReplay's default, and Inductor's for inference) picks one of the two
+ per variant, by auto_memory.
+ 
+ "planned" places each run's temporaries (but a keyed site's scratch buffer)
+@@ -117,11 +125,16 @@
+     # the bases (allocation k, eager output len(allocations) + j) whose last
+     # step this is
+     drops: tuple[int, ...]
+-    # "eager" memory, a run with temporaries: its allocations k in tape order,
+-    # each temporary's free (-1 - k) right after its last use; else empty
++    # "eager" memory, a run with temporaries or `freed`: its allocations k in
++    # tape order, each temporary's free (-1 - k) right after its last use and
++    # each freed argument's (-1 - len(allocations) - a) right after its last
++    # launch; else empty
+     order: tuple[int, ...] = ()
+     # the argument positions whose last step this is
+     arguments: tuple[int, ...] = ()
++    # "eager" memory: (argument, the seq of its last launch) of those of
++    # `arguments` the run's launches use, which `order` frees
++    freed: tuple[tuple[int, int], ...] = ()
+ 
+ 
+ @dataclass(frozen=True)
+@@ -256,7 +269,10 @@
+     return all(c <= 0 for m, c in f.items() if any(m)) and _at(f, bounds) <= 0
+ 
+ 
+-def plan_memory(lowered: LoweredTape, memory: str = "eager") -> MemoryPlan:
++def plan_memory(lowered: LoweredTape, memory: str = "eager", argument_frees: bool = True) -> MemoryPlan:
++    """The steps' allocations and frees in `memory`. Without
++    `argument_frees`, "eager" drops each argument after its last step, as the
++    other modes do: the splits a run buffer takes (auto_memory)."""
+     allocations, steps = lowered.allocations, lowered.steps
+     n_alloc = len(allocations)
+     escapes = set()
+@@ -272,6 +288,8 @@
+         ref = out.base if isinstance(out, LoweredView) else out
+         if isinstance(ref, tuple) and ref[0] == "argument":
+             args_used[ref[1]] = {len(steps)}
++    # argument position -> (step, seq) of the last launch that uses it
++    arg_launch: dict[int, tuple[int, int]] = {}
+     used: dict[int, set[int]] = {}  # base -> the steps that use it
+     touched = set()  # the bases eager calls read, write or return
+     last_seq = [a.seq for a in allocations]
+@@ -286,6 +304,7 @@
+                 for kind, k in refs:
+                     if kind == "argument":
+                         args_used.setdefault(k, set()).add(i)
++                        arg_launch[k] = (i, lo.seq)
+                         continue
+                     base = k if kind == "allocation" else n_alloc + k
+                     used.setdefault(base, set()).add(i)
+@@ -311,7 +330,17 @@
+     for site in lowered.sites:
+         for t in site.site.operands:
+             if id(t._root) in position and site.nodes:
+-                args_used.setdefault(position[id(t._root)], set()).add(step_of[site.nodes[0]])
++                i, a = step_of[site.nodes[0]], position[id(t._root)]
++                args_used.setdefault(a, set()).add(i)
++                arg_launch[a] = max(arg_launch.get(a, (-1, -1)), (i, lowered.launches[max(site.nodes)].seq))
++    # a use inside a keyed site or selector holds to its last node: an arm's
++    # or a section's piece may read the argument later in the op
++    for nodes in [s.nodes for s in lowered.sites] + [s.nodes for s in lowered.selectors]:
++        if nodes:
++            first, last = lowered.launches[min(nodes)].seq, lowered.launches[max(nodes)].seq
++            for a, (i, seq) in arg_launch.items():
++                if first <= seq < last:
++                    arg_launch[a] = (i, last)
+     last_arg: list[list[int]] = [[] for _ in range(len(steps) + 1)]
+     for a, s in args_used.items():
+         last_arg[max(s)].append(a)
+@@ -359,14 +388,18 @@
+             (k, allocations[k].seq, last_seq[k]) for k in made[i] if k in local
+         )
+         drops = tuple(dropped[i])
++        arguments = tuple(last_arg[i]) if i < len(steps) else ()
+         order: tuple[int, ...] = ()
+-        if memory == "eager" and temporaries:
++        freed: tuple[tuple[int, int], ...] = ()
++        if memory == "eager":
++            if argument_frees and i < len(steps) and isinstance(steps[i], range):
++                freed = tuple((a, arg_launch[a][1]) for a in arguments if arg_launch.get(a, (-1,))[0] == i)
+             events = [(allocations[k].seq, 0, k) for k in tensors]
+             for k, seq, last_use in temporaries:
+                 events += [(seq, 0, k), (last_use, 1, -1 - k)]
+-            order = tuple(e for *_, e in sorted(events))
+-        arguments = tuple(last_arg[i]) if i < len(steps) else ()
+-        plan.append(StepMemory(tensors, temporaries, drops, order, arguments))
++            events += [(seq, 1, -1 - n_alloc - a) for a, seq in freed]
++            order = tuple(e for *_, e in sorted(events)) if temporaries or freed else ()
++        plan.append(StepMemory(tensors, temporaries, drops, order, arguments, freed))
+     outputs = tuple(sorted(k for k in escapes if k < n_alloc))
+     return MemoryPlan(outputs, tuple(plan), planned, buffer)
+ 
+@@ -505,8 +538,9 @@
+     if not m.order:
+         at = sum(lowered.allocations[k].seq < first for k in m.tensors)
+         return at, at
+-    lasts = {k: end for k, _, end in m.temporaries}
+-    keys = [(lowered.allocations[e].seq, 0) if e >= 0 else (lasts[-1 - e], 1) for e in m.order]
++    n = len(lowered.allocations)
++    ends = {-1 - k: end for k, _, end in m.temporaries} | {-1 - n - a: seq for a, seq in m.freed}
++    keys = [(lowered.allocations[e].seq, 0) if e >= 0 else (ends[e], 1) for e in m.order]
+     return sum(k < (first, 0) for k in keys), sum(k < (last, 2) for k in keys)
+ 
+ 
+@@ -570,6 +604,9 @@
+             end = step.seq if step is not None else math.inf
+         if m.order:
+             for e in m.order:
++                if e < -n:
++                    live -= arguments.get(-1 - n - e, 0)
++                    continue
+                 k = e if e >= 0 else -1 - e
+                 live += nbytes[k] if e >= 0 else -nbytes[k]
+                 seq = lowered.allocations[k].seq
+@@ -586,7 +623,8 @@
+             if end > after:
+                 peak = max(peak, (live, i, -1))
+         live -= sum(nbytes[b] for b in m.drops)
+-        live -= sum(arguments.get(a, 0) for a in m.arguments)
++        freed = {a for a, _ in m.freed} if m.order else set()
++        live -= sum(arguments.get(a, 0) for a in m.arguments if a not in freed)
+     return peak
+ 
+ 
+@@ -623,7 +661,8 @@
+     launch before `cut` that uses it: the peak's allocation may come after an
+     earlier one that splitting there does not lower."""
+     held = set(m.drops)
+-    held_args = {a for a in m.arguments if arguments.get(a)}
++    freed = {a for a, _ in m.freed} if m.order else set()
++    held_args = {a for a in m.arguments if arguments.get(a) and a not in freed}
+     last_use = {}
+     for j in range(run.start, cut):
+         for slot in lowered.launches[j].slots:
+@@ -645,7 +684,7 @@
+ 
+ 
+ def _split_at_the_peak(
+-    lowered: LoweredTape, freed: Collection[int] = ()
++    lowered: LoweredTape, freed: Collection[int] = (), argument_frees: bool = True
+ ) -> tuple[LoweredTape, MemoryPlan]:
+     """split_runs' "peak": the tape with runs split where a tensor or `freed`
+     argument held to its run's end is live at the replay's peak, and its
+@@ -658,7 +697,7 @@
+     replay."""
+     nbytes, arguments = _nbytes(lowered), _argument_nbytes(lowered, freed)
+     inside = _site_starts(lowered)
+-    plan = plan_memory(lowered)
++    plan = plan_memory(lowered, argument_frees=argument_frees)
+     while True:
+         peak, i, seq = _peak(lowered, plan, nbytes, arguments)
+         run = lowered.steps[i] if 0 <= i < len(lowered.steps) else None
+@@ -673,7 +712,7 @@
+             if c in (run.start, run.stop) or c in inside:
+                 continue
+             split = _split_run(lowered, i, c)
+-            split_plan = plan_memory(split)
++            split_plan = plan_memory(split, argument_frees=argument_frees)
+             split_peak = _peak(split, split_plan, nbytes, arguments)[0]
+             if split_peak < peak and (best is None or split_peak < best[0]):
+                 best = (split_peak, split, split_plan)
+@@ -683,7 +722,7 @@
+ 
+ 
+ def _rejoin(
+-    lowered: LoweredTape, cuts: list[int], nbytes: Sequence[int], arguments: Mapping[int, int], bound: int
++    lowered: LoweredTape, cuts: list[int], nbytes: Sequence[int], arguments: Mapping[int, int], bound: int, argument_frees: bool
+ ) -> tuple[LoweredTape, MemoryPlan]:
+     """The tape with each run starting at one of `cuts`, first first, joined
+     to the run before it if the replay's peak stays at most `bound`."""
+@@ -695,13 +734,13 @@
+         steps = (*lowered.steps[: i - 1], range(prev.start, lowered.steps[i].stop), *lowered.steps[i + 1 :])
+         opaque = {k - (k > i): o for k, o in lowered.opaque.items()}
+         joined = dataclasses.replace(lowered, steps=steps, opaque=opaque)
+-        if _peak(joined, plan_memory(joined), nbytes, arguments)[0] <= bound:
++        if _peak(joined, plan_memory(joined, argument_frees=argument_frees), nbytes, arguments)[0] <= bound:
+             lowered = joined
+-    return lowered, plan_memory(lowered)
++    return lowered, plan_memory(lowered, argument_frees=argument_frees)
+ 
+ 
+ def split_runs(
+-    lowered: LoweredTape, freed: Collection[int] = (), later: bool | None = None, splits: str = "peak"
++    lowered: LoweredTape, freed: Collection[int] = (), later: bool | None = None, splits: str = "peak", argument_frees: bool = True
+ ) -> tuple[LoweredTape, MemoryPlan]:
+     """`splits` (SPLITS) "walk" and "coarse": the tape with runs split where a tensor or `freed` argument held to
+     its run's end is live at a peak, and its "eager" plan. Walking the peaks
+@@ -721,12 +760,12 @@
+     drop a few saved tensors: "coarse", once the replay's peak is walked,
+     undoes its splits, first first, while the replay's peak stays within
+     1/200 of what they reached. "peak": _split_at_the_peak. Decided at the
+-    traced call's sizes."""
++    traced call's sizes. `argument_frees`: plan_memory's."""
+     if splits == "peak":
+-        return _split_at_the_peak(lowered, freed)
++        return _split_at_the_peak(lowered, freed, argument_frees)
+     nbytes, arguments = _nbytes(lowered), _argument_nbytes(lowered, freed)
+     site_start = _site_starts(lowered)
+-    plan = plan_memory(lowered)
++    plan = plan_memory(lowered, argument_frees=argument_frees)
+     top, after = _peak(lowered, plan, nbytes, arguments)[0], -1
+     if later is None:
+         later = not _fixed_sizes(lowered, freed)
+@@ -747,7 +786,7 @@
+                     if not run.start < c < run.stop:
+                         continue
+                     split = _split_run(lowered, i, c)
+-                    split_plan = plan_memory(split)
++                    split_plan = plan_memory(split, argument_frees=argument_frees)
+                     split_top = _peak(split, split_plan, nbytes, arguments)[0]
+                     gain = peak - _peak(split, split_plan, nbytes, arguments, after)[0]
+                     if split_top <= top and gain > (0 if after < 0 else top // 100) and (best is None or gain > best[0]):
+@@ -760,7 +799,7 @@
+                 peak_cuts.append(c)
+             continue
+         if after < 0 and peak_cuts and splits == "coarse":
+-            lowered, plan = _rejoin(lowered, peak_cuts, nbytes, arguments, top + top // 200)
++            lowered, plan = _rejoin(lowered, peak_cuts, nbytes, arguments, top + top // 200, argument_frees)
+             top, peak_cuts, rejoined = _peak(lowered, plan, nbytes, arguments)[0], [], True
+             continue
+         if not later:
+@@ -793,9 +832,11 @@
+     peak = _peak(split, eager, nbytes, arguments)[0]
+     tape, buffered = lowered, plan_memory(lowered, "run_buffer")
+     buffered_peak = _peak(tape, buffered, nbytes, arguments)[0]
+-    candidates = [(split, 0)]
++    # a run buffer frees an argument after its run, as eager order's splits
++    # without its in-run frees model it
++    candidates = [(split_runs(lowered, freed, later=not fixed, splits=splits, argument_frees=False)[0] if arguments else split, 0)]
+     if fixed and splits != "peak":
+-        candidates.append((split_runs(lowered, freed, later=True, splits=splits)[0], peak // 100))
++        candidates.append((split_runs(lowered, freed, later=True, splits=splits, argument_frees=False)[0], peak // 100))
+     for candidate, gain in candidates:
+         if candidate is lowered:
+             continue
+diff -ru '--exclude=__pycache__' '--exclude=TREE.txt' step331/torch/_inductor/config.py step332/torch/_inductor/config.py
+--- step331/torch/_inductor/config.py	2026-10-06 07:21:01.482034058 -0700
++++ step332/torch/_inductor/config.py	2026-10-13 19:06:37.214649205 -0700
+@@ -2097,8 +2097,9 @@
+     # in eager's order, eager's memory; "run_buffer": a run's temporaries in
+     # one buffer, fewer allocator calls and more memory; "auto": run_buffer
+     # per variant when its peak and each buffer are within max(64 MiB, 5%)
+-    # of eager's peak
+-    cudagraph_host_trace_replay_memory: Literal["auto", "eager", "run_buffer"] = "auto"
++    # of eager's peak; None: "eager" for a training graph (forward and
++    # backward), "auto" for inference
++    cudagraph_host_trace_replay_memory: Literal["auto", "eager", "run_buffer"] | None = None
+ 
+     # with cudagraph_host_trace: where "auto" and "eager" split a run into
+     # graphs (torch/cuda/_host_trace_memory.py split_runs). "walk": wherever
+diff -ru '--exclude=__pycache__' '--exclude=TREE.txt' step331/torch/_inductor/cudagraph_host_trace.py step332/torch/_inductor/cudagraph_host_trace.py
+--- step331/torch/_inductor/cudagraph_host_trace.py	2026-10-08 20:30:49.133811582 -0700
++++ step332/torch/_inductor/cudagraph_host_trace.py	2026-10-13 19:06:43.396115860 -0700
+@@ -88,7 +88,7 @@
+                 held = static_input_idxs
+                 if is_backward and config.triton.cudagraph_host_trace_backward_frees_saved:
+                     held = [i for i in held if placeholders[i].name.startswith("primals_")]
+-                return _Installation(model, graph_inputs, held, seeds, torch.device("cuda", device_index))
++                return _Installation(model, graph_inputs, held, seeds, torch.device("cuda", device_index), is_inference)
+             except _Uncaptured:
+                 if config.triton.cudagraph_host_trace_fullgraph:
+                     raise EagerFallback(
+@@ -207,6 +207,7 @@
+         held: Sequence[int],
+         seeds: Sequence[int],
+         device: torch.device,
++        is_inference: bool,
+     ) -> None:
+         module = getattr(getattr(model, "__func__", None), "__globals__", {})
+         if module.get("call") != model:
+@@ -246,6 +247,8 @@
+         knobs = config.triton
+         opaque = tuple(_PROVIDERS[f] for f in knobs.cudagraph_host_trace_harvest)
+         memory = knobs.cudagraph_host_trace_replay_memory
++        if memory is None:
++            memory = "auto" if is_inference else "eager"
+         # a boxed call hands over its list's references; a `held` input's
+         # tensor (a parameter's) or a constant's stays held by its owner
+         freed = set(range(n)) - set(held)

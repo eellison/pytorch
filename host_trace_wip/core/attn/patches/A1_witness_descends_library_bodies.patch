@@ -1,0 +1,125 @@
+--- a/torch/cuda/_host_trace_tape.py
++++ b/torch/cuda/_host_trace_tape.py
+@@ -2940,17 +2940,40 @@
+     def _should_skip_dynamo(cls):
+         return False
+ 
+-    def __init__(self) -> None:
++    def __init__(self, opaque: Sequence[OpaqueProvider] = ()) -> None:
+         super().__init__()
+         self.calls: dict[tuple, list[list[tuple]]] = {}
+         self.order: list[tuple] = []
+         # per call its tensor outputs, weakly; after the warm-up those it
+         # kept or returned, a leaked traced tensor's twin (trace())
+         self.outputs: list[list[Any]] = []
++        self.opaque = opaque
++        # inside a Python body the trace descends: its calls are witnessed, not fn's own
++        self.depth = 0
++
++    def _body(self, func: Any, args: tuple, kwargs: dict) -> Callable[..., Any] | None:
++        # a Library.impl or custom_op body the trace runs on its traced tensors
++        # (_traced_host) runs under the witness too, as its calls then see a
++        # dispatch mode: first-use work they do under one happens here
++        if func.namespace in ("aten", "_native") or torch.cuda._host_trace._TRACED_IMPLS.get(func) is not None:
++            return None
++        if (kernel := _python_kernel(func)) is None or _library_body_kind(func, kernel) is None:
++            return None
++        if any(p.accepts(func, args, kwargs) is None for p in self.opaque):
++            return None
++        return kernel
+ 
+     def __torch_dispatch__(self, func, types, args: tuple = (), kwargs=None):
+         kwargs = kwargs or {}
+-        out = func(*args, **kwargs)
++        if (body := self._body(func, args, kwargs)) is not None:
++            self.depth += 1
++            try:
++                with self:
++                    out = body(*args, **kwargs)
++            finally:
++                self.depth -= 1
++        else:
++            out = func(*args, **kwargs)
+         if func in HOST_SEED_OFFSET:
+             # the warm-up returns what a replay does
+             out = tuple(seed_offset_on_device(func, list(out), args[0].device))
+@@ -2959,7 +2982,7 @@
+         key = _call_key(func, args, kwargs, _real_layout)
+         tensors = [o for o in pytree.tree_leaves(out) if isinstance(o, torch.Tensor)]
+         self.calls.setdefault(key, []).append([_real_layout(o) for o in tensors])
+-        if func in _ALLOC_OPS or func.is_view:
++        if func in _ALLOC_OPS or func.is_view or self.depth:
+             return out
+         self.order.append(_order_key(func, args, kwargs, out, _real_layout))
+         self.outputs.append([weakref.ref(o) for o in tensors])
+@@ -3115,7 +3138,7 @@
+         result, witness = None, None
+         if warm_up:
+             before = [_metadata(args[i]) for i in positions]
+-            with _Witness() as witness:
++            with _Witness(opaque) as witness:
+                 result = fn(*args)
+             # not at the mode's exit: a higher-order op's impl enters it again
+             witness.outputs = [[r() for r in refs] for refs in witness.outputs]
+--- a/test/test_cuda_host_trace_replay.py
++++ b/test/test_cuda_host_trace_replay.py
+@@ -275,6 +275,34 @@
+     return torch.empty_like(x)
+ 
+ 
++# a library op whose trace needs state set up outside the trace's capture (the
++# FlashInfer fork's kernel modules), which its caller's wrapper sets up only
++# under a dispatch mode (a trace's warm-up), inside a Library.impl body
++FIRST_USE: list = []
++
++
++@torch.library.custom_op("host_trace_test::set_up_at_warm_up", mutates_args=())
++def set_up_at_warm_up(x: torch.Tensor) -> torch.Tensor:
++    if current_trace() is not None and not FIRST_USE:
++        raise current_trace().decline("not set up at the warm-up")
++    return x * 2
++
++
++@set_up_at_warm_up.register_fake
++def _(x):
++    return torch.empty_like(x)
++
++
++def _sets_up_under_a_mode(x: torch.Tensor) -> torch.Tensor:
++    if torch._C._len_torch_dispatch_stack() and current_trace() is None:
++        FIRST_USE.append(x.numel())
++    return set_up_at_warm_up(x)
++
++
++_direct_lib.define("sets_up_inside(Tensor x) -> Tensor")
++_direct_lib.impl("sets_up_inside", _sets_up_under_a_mode, "CUDA")
++_direct_lib._register_fake("sets_up_inside", lambda x: torch.empty_like(x))
++
+ # per body kind: the op whose body calls REENTERED[0], and its re-entry switch
+ REENTRY_OPS = {"Library.impl": (calls_reentered, "library_impls_reentry"), "custom_op": (torch.ops.host_trace_test.calls_reentered_op, "custom_op_reentry")}
+ 
+@@ -2159,6 +2187,24 @@
+             self.assertEqual(len(calls), 3)
+ 
+     @mock.patch("torch.cuda._host_trace.library_impls", True)
++    def test_a_library_impl_bodys_calls_see_the_warm_up(self):
++        # the warm-up runs a body the trace descends under its witness: the
++        # body's calls see a dispatch mode there, as the trace's do
++        FIRST_USE.clear()
++        self.addCleanup(FIRST_USE.clear)
++
++        def fn(x):
++            return add(torch.ops.host_trace_direct.sets_up_inside(add(x)), 1)
++
++        f = HostTraceReplay(fn)
++        for n in (4096, 4096, 2048, 4096):
++            x = torch.randn(n, device="cuda")
++            self.assertEqual(f(x), add(add(x) * 2, 1), atol=0, rtol=0)
++        self.assertEqual(FIRST_USE, [4096])
++        self.assertEqual((f.traces, f.eager, f.declines), (1, 0, []))
++        self.assertFalse([r for v in f.variants for _, r in v.tape.launches if isinstance(r, EagerCall)])
++
++    @mock.patch("torch.cuda._host_trace.library_impls", True)
+     def test_a_library_impl_registered_after_a_trace_is_on_the_stack(self):
+         x = torch.randn(4096, device="cuda")
+         trace(add, (x,))

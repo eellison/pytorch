@@ -1,0 +1,43 @@
+diff -ru '--exclude=__pycache__' '--exclude=TREE.txt' step332_me/torch/cuda/_host_trace_harvest.py step332_me2/torch/cuda/_host_trace_harvest.py
+--- step332_me/torch/cuda/_host_trace_harvest.py	2026-10-14 16:49:45.321492623 -0700
++++ step332_me2/torch/cuda/_host_trace_harvest.py	2026-10-14 17:50:36.337974097 -0700
+@@ -394,6 +394,20 @@
+     return image[:off] + q.to_bytes(8, "little") + image[off + 8 :]
+ 
+ 
++# where the harvest asks for its address ranges (the operand arena, mirror
++# spans): among the caching allocator's segments, not at the low addresses the
++# driver hands out first, which a kernel's small int pairs (a size less one
++# under another) read as, past an operand of the arena or a mirror
++_HIGH_VA = 0xFF00_0000_0000
++
++
++def _reserve_high(size: int, align: int) -> int:
++    from cuda.bindings import driver
++
++    hint = -(-_HIGH_VA // align) * align
++    return int(_check_cuda_bindings(driver.cuMemAddressReserve(size, align, hint, 0)))
++
++
+ # per device, the address ranges mirrors map in (4 GiB-aligned, free ones),
+ # reserved for the process: reserved and freed per check, their addresses (low
+ # ones, for the alignment) went to the caching allocator's next segments,
+@@ -439,7 +453,7 @@
+                 span = min((x for x in free if x[1] >= (1 << 32) + size), default=None, key=lambda x: x[1])
+                 if span is None:
+                     reserved = (1 << 32) + -(-size // _MIRROR_SPAN_STEP) * _MIRROR_SPAN_STEP
+-                    span = (int(_check_cuda_bindings(driver.cuMemAddressReserve(reserved, 1 << 32, 0, 0))), reserved)
++                    span = (_reserve_high(reserved, 1 << 32), reserved)
+                 else:
+                     free.remove(span)
+                 self.spans.append(span)
+@@ -568,8 +582,7 @@
+                 _check_cuda_bindings(driver.cuMemAddressFree(self.va, self.va_size))
+                 self.va = self.va_size = 0
+             n = max(1 << 28, 1 << (size - 1).bit_length())
+-            va = _check_cuda_bindings(driver.cuMemAddressReserve(n, _WINDOW, 0, 0))
+-            self.va, self.va_size = int(va), n
++            self.va, self.va_size = _reserve_high(n, _WINDOW), n
+         return self.va
+ 
+     def blocks(self) -> list:

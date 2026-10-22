@@ -1,0 +1,15 @@
+--- a/sgl_ops_trace.py
++++ b/sgl_ops_trace.py
+@@ -155,8 +155,10 @@
+         self.what = op._schema.name
+         if tr is None:
+             raise RuntimeError(f"{self.what}: a traced impl outside a trace")
+-        if torch.cuda.current_device() != tr.device.index or torch.cuda.current_stream() != tr.stream:
+-            raise tr.decline(f"{self.what}: called off the trace's device or stream")
++        if torch.cuda.current_device() != tr.device.index:
++            raise tr.decline(f"{self.what}: called off the trace's device")
++        # the trace's stream, or a side stream forked from it in the trace's capture (declines a never-forked one)
++        tr.check_stream(self.what)
+         leaves = [*args, *kwargs.values()]
+         if any(isinstance(a, torch.Tensor) and not isinstance(a, _TracedTensor) for a in leaves):
+             raise tr.decline(f"{self.what}: a tensor the trace does not track")

@@ -1,0 +1,399 @@
+--- a/torch/cuda/_host_trace_capture.py
++++ b/torch/cuda/_host_trace_capture.py
+@@ -50,7 +50,7 @@
+     _ALLOC_SHIFT,
+     _EAGER_TAG,
+     _gc_hold,
+-    _hint,
++    CallValues,
+     private_stream,
+ )
+ from torch.cuda._utils import _check_cuda_bindings
+@@ -480,6 +480,8 @@
+     if list(values) != list(lowered.program.values):
+         _trace_disagrees("the compiled program disagrees with its rows at the traced call")
+     tape = lowered.tape
++    # the trace's values at the call the program ran at, from its arguments, not the nodes' hints
++    at = CallValues.of_call(tape.shape_env, tape.args, tape.inputs, tape.int_inputs)
+     roots = {("argument", rec.position): rec.root for rec in tape.inputs}
+     roots |= {("allocation", k): rec.root for k, rec in enumerate(tape.allocs)}
+     roots |= {("eager", j): root for j, root in enumerate(lowered.eager_roots)}
+@@ -490,10 +492,10 @@
+ 
+     def check_view(v: LoweredView | PredictedOutput, t: Any, what: str) -> None:
+         for d, (row, s) in enumerate(zip(v.sizes, t.shape)):
+-            check(row, _hint(s), f"{what} size {d}")
++            check(row, at(s), f"{what} size {d}")
+         for d, (row, s) in enumerate(zip(v.strides, t._sym_strides)):
+-            check(row, _hint(s), f"{what} stride {d}")
+-        check(v.offset, _hint(t._sym_offset), f"{what} storage offset")
++            check(row, at(s), f"{what} stride {d}")
++        check(v.offset, at(t._sym_offset), f"{what} storage offset")
+ 
+     for step in lowered.steps:
+         if isinstance(step, range):
+@@ -502,37 +504,37 @@
+         traced = pytree.tree_leaves((call.args, call.kwargs))
+         for i, (leaf, v) in enumerate(zip(step.leaves, traced)):
+             if isinstance(leaf, ScalarSlot):
+-                check(leaf.row, _hint(v), f"{call.name} argument {i}")
++                check(leaf.row, at(v), f"{call.name} argument {i}")
+             elif isinstance(leaf, LoweredView):
+                 check_view(leaf, v, f"{call.name} argument {i}")
+         for i, (p, t) in enumerate(zip(step.outputs, call.outputs)):
+             if isinstance(p, PredictedOutput):
+                 check_view(p, t, f"{call.name} output {i}")
+         for axis, row in enumerate(step.grid or ()):
+-            check(row, _hint(call.target[2][axis]), f"{call.name} grid axis {axis}")
++            check(row, at(call.target[2][axis]), f"{call.name} grid axis {axis}")
+ 
+     for alloc, rec in zip(lowered.allocations, tape.allocs):
+         for d, (row, v) in enumerate(zip(alloc.sizes, rec.sizes)):
+-            check(row, _hint(v), f"{rec.name} size {d}")
++            check(row, at(v), f"{rec.name} size {d}")
+         for d, (row, v) in enumerate(zip(alloc.strides, rec.strides)):
+-            check(row, _hint(v), f"{rec.name} stride {d}")
++            check(row, at(v), f"{rec.name} stride {d}")
+     for lo in lowered.launches:
+         name = lo.launch.name
+         if isinstance(lo, LoweredMemset):
+             traced = (lo.launch.width, lo.launch.height, lo.launch.pitch)
+             for row, v in zip((lo.width, lo.height, lo.pitch), traced):
+-                check(row, _hint(v), f"memset {name} extent")
++                check(row, at(v), f"memset {name} extent")
+         elif isinstance(lo, LoweredMemcpy):
+-            check(lo.nbytes, _hint(lo.launch.nbytes), f"memcpy {name} bytes")
++            check(lo.nbytes, at(lo.launch.nbytes), f"memcpy {name} bytes")
+         else:
+             dims = zip((*lo.grid, *lo.block, lo.smem), (*lo.launch.grid, *lo.launch.block, lo.launch.smem))
+             for axis, (row, v) in enumerate(dims):
+-                check(row, _hint(v), f"kernel {name} launch dimension {axis}")
++                check(row, at(v), f"kernel {name} launch dimension {axis}")
+         for i, (slot, v) in enumerate(zip(lo.slots, lo.launch.slots)):
+             if isinstance(slot, ScalarSlot):
+-                check(slot.row, _hint(v), f"kernel {name} slot {i}")
++                check(slot.row, at(v), f"kernel {name} slot {i}")
+             else:
+-                offset = _hint(v) - _hint(roots[slot.root].sym)
++                offset = at(v - roots[slot.root].sym)
+                 check(
+                     slot.displacement, offset, f"kernel {name} slot {i} offset"
+                 )
+--- a/torch/cuda/_host_trace_hint_audit.py
++++ b/torch/cuda/_host_trace_hint_audit.py
+@@ -82,9 +82,6 @@
+ _OPAQUE = "torch/cuda/_host_trace_opaque.py"
+ _TRITON = "torch/cuda/_host_trace_triton_launch.py"
+ _CUTE = "torch/cuda/_host_trace_cute.py"
+-_CAPTURE = "torch/cuda/_host_trace_capture.py"
+-_REDISPATCH = "torch/cuda/_host_trace_redispatch.py"
+-_REPLAY = "torch/cuda/_host_trace_replay.py"
+ _MEMORY = "torch/cuda/_host_trace_memory.py"
+ _AT_CALL = "evaluate it at the traced call's inputs (the input record's values through the program's rows), not the node's hint"
+ _TAG = "keep the allocation's index in its record (_AllocRec / _Root) and build the placeholder from it, not from the symbol's hint"
+@@ -118,13 +115,6 @@
+     (_TAPE, "_bind_opaque"): f"{_TAG}; the key values: int(v) (a guard) in place of v == _hint(v)",
+     (_TAPE, "_Trace._eager_call"): "int(v) (guard_int records Eq and returns the value) in place of v == _hint(v)",
+     (_TAPE, "_Trace._eager_call.<locals>.<genexpr>"): "step242: an eager output 'pending' where a size's hint is 1; record the outputs whose strides _check_witness adopts (a set it fills) instead of re-deriving them from hints",
+-    (_CAPTURE, "_check_trace_values"): f"the check's expected values: {_AT_CALL}",
+-    (_CAPTURE, "_check_trace_values.<locals>.check_view"): f"the check's expected values: {_AT_CALL}",
+-    (_REPLAY, "HostTraceReplay._build"): _TAG,
+-    (_REPLAY, "HostTraceReplay._build.<locals>.<genexpr>"): _TAG,
+-    (_REDISPATCH, "_tag"): _TAG,
+-    (_REDISPATCH, "_redo.<locals>.root"): _TAG,
+-    (_REDISPATCH, "_redo"): "keep each fresh symbol's call value (lo.program.values[row]) with it and evaluate the cached guards at those, not at the fresh symbols' hints",
+     (_TRITON, "_witness"): _WITNESS,
+     (_TRITON, "_launch.<locals>.launcher"): _WITNESS,
+     (_TRITON, "_intercept"): f"T3: decline a SymInt argument that is not the running trace's (v.node.env is not tr.shape_env); the compile's values: build the binary from the symbolic specialization key, or {_AT_CALL}",
+--- a/torch/cuda/_host_trace_redispatch.py
++++ b/torch/cuda/_host_trace_redispatch.py
+@@ -31,22 +31,20 @@
+ from torch.cuda._host_trace_tape import (
+     _active,
+     _ALLOC_ALIGNMENT,
+-    _ALLOC_SHIFT,
+-    _ALLOC_TAG,
+-    _AllocRec,
+     _capture,
+     _CAPTURE_ERRORS,
+-    _hint,
+     _InputRec,
+     _ir_census,
+     _PLACEHOLDER_LOW,
+     _PLACEHOLDER_TAG,
++    _placeholder,
+     _Root,
+     _sym_expr,
+     _sym_key,
+     _Trace,
+     _TracedTensor,
+     _TraceMode,
++    CallValues,
+     fx_config,
+     Memcpy,
+ )
+@@ -100,10 +98,6 @@
+     return lower_entries(lowered, args, values, selected)
+ 
+ 
+-def _tag(a: _AllocRec) -> int:
+-    return (_hint(a.q) * _ALLOC_ALIGNMENT ^ _ALLOC_TAG) >> _ALLOC_SHIFT
+-
+-
+ _redo_fakes = threading.local()
+ 
+ 
+@@ -150,6 +144,7 @@
+     inputs: list[_InputRec] = []
+     outer: dict[int, tuple] = {}
+     made: list[torch.SymInt] = []
++    at_call: list[int] = []  # each of `made`'s value: its formula's at the call, or a root's placeholder
+     # what the dispatch reads of its call, in order: constants, the fresh symbols, roots and tensors
+     shape: list[Any] = []
+ 
+@@ -170,7 +165,8 @@
+             return v
+         k = key(v)
+         if k not in fresh:
+-            fresh[k] = env.symbol(lo.program.values[lo.row(k)], f"r{len(fresh)}", positive=bool(_sym_expr(v).is_positive))
++            at_call.append(lo.program.values[lo.row(k)])
++            fresh[k] = env.symbol(at_call[-1], f"r{len(fresh)}", positive=bool(_sym_expr(v).is_positive))
+             made.append(fresh[k])
+             bind(fresh[k], v)
+         shape.append(fresh[k])
+@@ -180,11 +176,13 @@
+         if id(r) not in roots:
+             if r.kind == "argument":
+                 base = lo.program.values[lo.row(r.sym)]
+-                sym = env.symbol(_PLACEHOLDER_TAG | (base & _PLACEHOLDER_LOW), f"{r.name}.base")
++                at_call.append(_PLACEHOLDER_TAG | (base & _PLACEHOLDER_LOW))
++                sym = env.symbol(at_call[-1], f"{r.name}.base")
+                 made.append(sym)
+                 bind(sym, r.sym)
+             else:
+-                fq = env.symbol(_hint(r.sym) // _ALLOC_ALIGNMENT, f"{r.name}.base/{_ALLOC_ALIGNMENT}")
++                at_call.append(_placeholder(r) // _ALLOC_ALIGNMENT)
++                fq = env.symbol(at_call[-1], f"{r.name}.base/{_ALLOC_ALIGNMENT}")
+                 made.append(fq)
+                 if ir:
+                     (q,) = _sym_key(r.sym).free_symbols
+@@ -193,7 +191,7 @@
+                     (q,) = _sym_expr(r.sym).free_symbols
+                     mapping[_sym_expr(fq)] = q
+                 sym = _ALLOC_ALIGNMENT * fq
+-            roots[id(r)] = _Root(r.name, sym, r.kind)
++            roots[id(r)] = _Root(r.name, sym, r.kind, r.index)
+             back[id(roots[id(r)])] = r
+             if r.kind == "argument":
+                 # the input's record, as trace() has it: an as_strided bound, an overlap, copy-on-write
+@@ -240,7 +238,7 @@
+             sig = None
+     if sig in (dispatches or {}):
+         consts = _ir.Ctx()
+-        hints = [consts.const(_hint(m)) for m in made]
++        hints = [consts.const(x) for x in at_call]
+         # the latest first: a layer takes the one before's
+         for c in reversed(dispatches[sig]):
+             at = {s.node.node.args[0]: h for s, h in zip(c[1], hints)}
+@@ -261,12 +259,13 @@
+         fake = vars(_redo_fakes).pop("mode", None) or FakeTensorMode(allow_fallback_kernels=False)
+         fake.fake_tensor_converter = FakeTensorConverter(export=False)
+         tr = _Trace(old.device, fake_mode=fake, shape_env=env)
++        tr.values = CallValues(env, {m.node.node.args[0]: x for m, x in zip(made, at_call)})
+         tr.inputs, tr.arguments = inputs, {id(i.root): i for i in inputs}
+         tr.outer = {k: _TracedTensor(*o) for k, o in outer.items()}
+         built = {k: _TracedTensor(*t) for k, t in tensors.items()}
+         call = pytree.tree_map_only(_TracedTensor, lambda a: built[id(a)], call)
+         if len(op.allocs):
+-            tr.first_alloc = _tag(old.allocs[op.allocs.start]) - 1
++            tr.first_alloc = old.allocs[op.allocs.start].root.index
+         prior = getattr(_active, "trace", None)
+         _active.trace = tr
+         # an operator's dispatch runs where _TraceMode dispatched it, a launcher where the host called it
+--- a/torch/cuda/_host_trace_replay.py
++++ b/torch/cuda/_host_trace_replay.py
+@@ -99,7 +99,7 @@
+     _active,
+     _ALLOC_ALIGNMENT,
+     _gc_hold,
+-    _hint,
++    _placeholder,
+     argument_contract,
+     bind_opaque,
+     current_trace,
+@@ -1368,14 +1368,14 @@
+         values = lowered.program.values
+         # the trace's placeholders: the capture runs no kernel, and the first
+         # replay patches every pointer
+-        addresses = [_hint(rec.root.sym) for rec in tape.allocs]
++        addresses = [_placeholder(rec.root) for rec in tape.allocs]
+         planned = self.memory in _PLANNED
+         if planned:
+             addresses = arena_addresses(lowered, arenas, addresses)
+         captured = capture_tape(lowered, addresses)
+         if planned:
+             captured, memory = relocate(captured, memory, arenas)
+-        bases = [*addresses, *(_hint(r.sym) for r in lowered.eager_roots)]
++        bases = [*addresses, *(_placeholder(r) for r in lowered.eager_roots)]
+         tape.release_args()
+         for call in calls:
+             # a step a capture failure made is noted as that failure
+--- a/torch/cuda/_host_trace_tape.py
++++ b/torch/cuda/_host_trace_tape.py
+@@ -82,6 +82,13 @@
+     name: str  # p<i> for argument i's storage, a<k> for allocation k, e<k> for eager output k
+     sym: Any  # the base address: an input's symbol, 256*q otherwise
+     kind: Literal["argument", "allocation", "eager"] = "argument"
++    index: int = -1  # k of allocation k or eager output k: its placeholder (_placeholder)
++
++
++def _placeholder(root: _Root) -> int:
++    # an allocation's or eager output's base at the trace (q's value is a 256th of it): a
++    # non-canonical address an escaped launch faults on, which the first replay patches
++    return (_ALLOC_TAG if root.kind == "allocation" else _EAGER_TAG) | ((root.index + 1) << _ALLOC_SHIFT)
+ 
+ 
+ @dataclass
+@@ -333,6 +340,8 @@
+         self.outer: dict[int, _TracedTensor] = {}
+         # every tensor of the trace, to find one fn kept past it (trace's check_escapes)
+         self.tensors: weakref.WeakSet[_TracedTensor] | None = weakref.WeakSet() if check_escapes else None
++        # the traced call's values (_symbolic_run, a redispatch's _redo)
++        self.values: CallValues | None = None
+         # the traced hosts' calls with their outputs, for _check_witness
+         self.aten_calls: list[tuple[int, EagerCall]] = []
+         # fn's own operator calls in order, as the warm-up's (_order_key)
+@@ -541,9 +550,9 @@
+                 )
+         k = self.first_alloc + len(self.allocs)
+         name = f"alloc{k}"
+-        hint = (_ALLOC_TAG | ((k + 1) << _ALLOC_SHIFT)) // _ALLOC_ALIGNMENT
+-        q = self.shape_env.symbol(hint, f"{name}.base/{_ALLOC_ALIGNMENT}")
+-        root = _Root(f"a{k}", _ALLOC_ALIGNMENT * q, "allocation")
++        root = _Root(f"a{k}", None, "allocation", k)
++        q = self.shape_env.symbol(_placeholder(root) // _ALLOC_ALIGNMENT, f"{name}.base/{_ALLOC_ALIGNMENT}")
++        root.sym = _ALLOC_ALIGNMENT * q
+         rec = _AllocRec(next(self._seq), name, sizes, strides, dtype, root, q)
+         self.allocs.append(rec)
+         return _TracedTensor(root, sizes, strides, 0, dtype, self.device)
+@@ -1011,9 +1020,9 @@
+                 made.append(self.allocate(aten.empty_strided.default, (sizes, strides), kw))
+                 return made[-1]
+             k = len(self.eager_outputs)
+-            hint = (_EAGER_TAG | ((k + 1) << _ALLOC_SHIFT)) // _ALLOC_ALIGNMENT
+-            q = self.shape_env.symbol(hint, f"eager{k}.base/{_ALLOC_ALIGNMENT}")
+-            root = _Root(f"e{k}", _ALLOC_ALIGNMENT * q, "eager")
++            root = _Root(f"e{k}", None, "eager", k)
++            q = self.shape_env.symbol(_placeholder(root) // _ALLOC_ALIGNMENT, f"eager{k}.base/{_ALLOC_ALIGNMENT}")
++            root.sym = _ALLOC_ALIGNMENT * q
+             sizes, strides, offset = list(o.shape), list(o.stride()), o.storage_offset()
+             t = _TracedTensor(root, sizes, strides, offset, o.dtype, self.device)
+             self.eager_outputs.append(t)
+@@ -1786,6 +1795,77 @@
+     return v.node.hint if isinstance(v, _SYM_TYPES) else v
+ 
+ 
++class CallValues:
++    """A trace's values at one call: each symbol at the value of the call's
++    leaf it stands for (an input's size, stride, storage offset or base
++    address, an int argument), any expression over them evaluated from those,
++    an IR node by the IR's own arithmetic on constants (Ctx.transfer), a sympy
++    one by xreplace. Never a node's hint: an allocation's or eager output's
++    base, which no call supplies, raises KeyError."""
++
++    def __init__(self, env: Any, symbols: Mapping[Any, int]) -> None:
++        self.env = env
++        self.ir = isinstance(env, _ir.Env)
++        # an IR symbol's name or a sympy symbol -> its value
++        self.symbols: dict[Any, int] = {}
++        self._ctx = _ir.Ctx()
++        self._at: dict[str, _ir.Node] = {}
++        self._memo: dict[int, _ir.Node] = {}
++        for s, value in symbols.items():
++            self._set(s, value)
++
++    def _set(self, s: Any, value: int) -> None:
++        self.symbols[s] = int(value)
++        if self.ir:
++            self._at[s] = self._ctx.const(value)
++
++    @classmethod
++    def of_call(cls, env: Any, args: Sequence[Any], inputs: Sequence[_InputRec], int_inputs: Sequence[_IntInputRec]) -> CallValues:
++        """At the call `args` (tensors, or release_args' metadata), through
++        the input records, as _TapeLowering's leaves read it."""
++        values = cls(env, {})
++        for rec in inputs:
++            a = args[rec.position]
++            if isinstance(a, torch.Tensor):
++                shape, stride, offset = a.shape, a.stride(), a.storage_offset()
++                base = a.const_data_ptr() - offset * a.element_size()  # type: ignore[attr-defined]
++            else:
++                shape, stride, offset, _, base = a
++            for d, (size, st) in enumerate(zip(rec.sizes, rec.strides)):
++                values.bind(size, shape[d])
++                values.bind(st, stride[d])
++            values.bind(rec.offset, offset)
++            values.bind(rec.root.sym, base)
++        for rec in int_inputs:
++            values.bind(rec.sym, args[rec.position])
++        return values
++
++    def bind(self, v: Any, value: int) -> None:
++        # v's value where v is a symbol; a constant or an expression of one binds nothing
++        k = _sym_key(v) if self.ir else _sym_expr(v)
++        if self.ir and isinstance(k, _ir.Node) and k.op == "sym":
++            self._set(k.args[0], value)
++        elif not self.ir and isinstance(k, sympy.Symbol):
++            self._set(k, value)
++
++    def __call__(self, v: Any) -> Any:
++        if not isinstance(v, _SYM_TYPES):
++            return v
++        if not self.ir:
++            e = _sym_expr(v) if isinstance(v, torch.SymInt) else v.node.expr
++            r = e.xreplace({s: sympy.Integer(self.symbols[s]) for s in e.free_symbols})
++            return bool(r) if isinstance(v, torch.SymBool) else float(r) if isinstance(v, torch.SymFloat) else int(r)
++        n = v.node.node
++        r = self._ctx.transfer(n, self.env.ctx, self._at, self._memo)
++        if r.op == "const":
++            return r.args[0]
++        if r.op in ("true", "false"):
++            return r.op == "true"
++        if r.op == "fconst":
++            return struct.unpack("<d", r.args[0])[0]
++        raise AssertionError(f"host_trace: {_ir.render(n)} is not a constant at the call's values")
++
++
+ def _sym_expr(v: Any) -> sympy.Expr:
+     if isinstance(v, sympy.Basic):
+         return v
+@@ -2618,11 +2698,13 @@
+         tr.bind_given(args)
+     for i in positions:
+         traced[i] = tr.input(i, args[i])
+-        # an empty argument's trace launches nothing for it: a size is zero or not at replay as at the trace
+-        for size in traced[i].shape:
+-            bool(size != 0) if _hint(size) else bool(size == 0)
+     for i in int_positions:
+         traced[i] = tr.int_input(i, args[i])
++    tr.values = CallValues.of_call(tr.shape_env, args, tr.inputs, tr.int_inputs)
++    for i in positions:
++        # an empty argument's trace launches nothing for it: a size is zero or not at replay as at the trace
++        for size in traced[i].shape:
++            bool(size != 0) if tr.values(size) else bool(size == 0)
+     for i in positions:
+         if traced[i]._origin is None:
+             traced[i]._origin = ("arg", i)
+@@ -3323,9 +3405,9 @@
+     env = tape.shape_env
+     tr = _Trace(tape.device)
+     tr.shape_env = env
+-    # after the tape's allocation symbols, whose hints are its placeholder addresses
+-    tags = [(_hint(a.q) * _ALLOC_ALIGNMENT ^ _ALLOC_TAG) >> _ALLOC_SHIFT for a in tape.allocs]
+-    tr.first_alloc = max(tags, default=0)
++    tr.values = CallValues.of_call(env, tape.args, tape.inputs, tape.int_inputs)
++    # after the tape's allocations
++    tr.first_alloc = max((a.root.index + 1 for a in tape.allocs), default=0)
+     marks, owners = len(env.owners), list(env.owners)
+     owner_sets = None if env.owner_sets is None else [set(o) for o in env.owner_sets]
+     # each launch's and allocation's index in the new tape, for the ops' spans

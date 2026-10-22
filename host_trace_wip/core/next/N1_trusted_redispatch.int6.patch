@@ -1,0 +1,213 @@
+--- a/torch/cuda/_host_trace_replay.py
++++ b/torch/cuda/_host_trace_replay.py
+@@ -664,13 +664,15 @@
+         # no variant holds the call: one whose graph guards do gains its
+         # failing selectors' entries from their ops dispatched again
+         respecable = []
+-        for j, (variant, values, unselected) in enumerate(candidates if self.trusted is None else ()):
++        for j, (variant, values, unselected) in enumerate(candidates):
+             if (refused := self._redispatch(variant, args, values, unselected, self._dispatches.setdefault(contract, {}))) is not None:
+                 if refused.respec and torch.cuda._host_trace.respec_refused_ops:
+                     respecable.append((variant, values, unselected, refused.redone))
+                 continue
+             del candidates[j]
+             if self._fill(variant, args, candidates) is not None:
++                if self.handback:
++                    return Handback(args)
+                 outcome, result = self._call_native(variant, args)
+                 if outcome != MISS:
+                     return self._served(variant.native, outcome, result, args)
+--- a/torch/cuda/_host_trace_redispatch.py
++++ b/torch/cuda/_host_trace_redispatch.py
+@@ -29,7 +29,7 @@
+ from torch._ops import OpOverload
+ from torch._subclasses.fake_tensor import FakeTensorConverter, FakeTensorMode
+ from torch.cuda import _host_trace_ir as _ir
+-from torch.cuda._host_trace import _drop_tracebacks, _TraceShapeEnv, Declined, declined
++from torch.cuda._host_trace import _drop_tracebacks, Declined, declined
+ from torch.cuda._host_trace_launch import compiled_cluster, KernelLaunch
+ from torch.cuda._host_trace_lower_tape import FoldRefused, HintsFail, IRRename, lower_entries
+ from torch.cuda._host_trace_opaque import library_state_as, record_binding
+@@ -270,18 +270,16 @@
+     old, lo = lowered.tape, lowered.lowering
+     op: OpRec = old.ops[selector.op]
+     respec = first_alloc is not None
+-    if op.kind not in ("traced", "eager") or op.redo is None or not isinstance(old.shape_env, _ir.Env):
++    if op.kind not in ("traced", "eager") or op.redo is None or torch.cuda._host_trace.symbolic != "ir":
+         raise FoldRefused(f"{op.func} has no traced dispatch to run again")
+     # the fresh symbols' env, as _Trace makes one: only a redo that dispatches builds the _Trace and its tensors
+-    env = _ir.Env() if torch.cuda._host_trace.symbolic == "ir" else _TraceShapeEnv(trusted=False)
++    env = _ir.Env()
+     # no fresh symbol shares a name with the variant's: one the dispatch did
+     # not get from its arguments (a closure's) is refused, not renamed
+     env.unique_ids |= old.shape_env.unique_ids
+-    env._id_skips.update(old.shape_env._id_skips)
++    env._id_skips.update(getattr(old.shape_env, "_id_skips", {}))
+     # an IR variant's entry takes the fresh trace's nodes renamed in the variant's context
+     ir = ir and lo.ir
+-    if ir and not isinstance(env, _ir.Env):
+-        raise FoldRefused(f"{op.func} dispatches again in a sympy trace")
+     key = _sym_key if ir else _sym_expr
+     renamer = IRRename(old.shape_env, env, f"{op.func} dispatched on a symbol of no argument")
+     # the fresh trace's symbol -> its formula in the variant's symbols (by name, a node, in ir)
+@@ -519,7 +517,7 @@
+     if false:
+         raise AssertionError(f"host_trace: {op.func}'s dispatch again guards a condition the call fails")
+     # a symbol the redo's guards pin (s == 1 at a size-1 call): its layouts and the variant's agree under them
+-    ctx, pins = old.shape_env.ctx, {}
++    ctx, pins = old.shape_env.ctx if ir else None, {}
+     for g, _ in guards if ir else ():
+         c, ts = ctx.as_terms(g.args[0]) if g.op == "eq" else (0, {})
+         if len(ts) == 1 and (t := next(iter(ts))).op == "sym" and abs(ts[t]) == 1:
+--- a/test/test_cuda_host_trace_replay.py
++++ b/test/test_cuda_host_trace_replay.py
+@@ -12,6 +12,8 @@
+ from concurrent.futures import ThreadPoolExecutor
+ from unittest import mock
+ 
++import sympy
++
+ import torch
+ from torch._subclasses.fake_tensor import FakeTensor
+ from torch.cuda import _host_trace_capture, _host_trace_ir as _ir, _host_trace_replay, _host_trace_tape
+@@ -32,6 +34,7 @@
+     TEST_CUDA,
+     TestCase,
+ )
++from torch.utils._sympy.value_ranges import ValueRanges
+ from torch.utils._triton import has_triton
+ 
+ 
+@@ -480,6 +483,28 @@
+         self.assertEqual(f(x), x + 3)
+         self.assertEqual((f.traces, f.redispatches), (1, 1))
+ 
++    def test_a_trusted_misaligned_input_redispatches(self):
++        # trust vouches for layouts, never addresses: the launch owns its alignment guard
++        f = HostTraceReplay(add, trusted=TrustedInputs((((1000,), (1,)),)))
++        base = torch.randn(4000, device="cuda")
++        for k in (0, 1, 4, 2, 8, 3):
++            x = base[k : k + 1000]
++            self.assertEqual(f(x), x + 3, atol=0, rtol=0)
++        self.assertEqual((f.traces, f.replays, f.redispatches, f.eager), (1, 5, 1, 0))
++
++    def test_a_trusted_view_at_a_size_dependent_offset_redispatches(self):
++        def fn(x, n):
++            t = x[: 2 * n] * 3
++            return add(t[n : 2 * n])
++
++        s = sympy.Symbol("s0", integer=True, positive=True)
++        f = HostTraceReplay(fn, trusted=TrustedInputs((((8192,), (1,)), s), {s: ValueRanges(1, 4096)}))
++        x = torch.randn(8192, device="cuda")
++        for n in (1000, 1001, 1004, 1003, 1002, 1008):
++            self.assertEqual(f(x, n), fn(x, n), atol=0, rtol=0)
++        # t[n:]'s alignment (n % 4) and n % 16 (1008) each select a redispatched entry
++        self.assertEqual((f.traces, f.replays, f.redispatches, f.eager), (1, 5, 2, 0))
++
+     @parametrize("shared", [False, True])
+     def test_a_guard_two_ops_share_redispatches_both(self, shared):
+         # both launches specialize on n % 16: graph-level, a flip traces; with
+@@ -628,6 +653,18 @@
+             self.assertEqual(plans[0], plans[1])
+             self.assertEqual(v.memory.outputs, traced.memory.outputs)
+ 
++    def test_a_trusted_split_respecifies(self):
++        # a trusted tape is sympy: the split op's redo is renamed in sympy, as a trace at its class would record it
++        def fn(x):
++            return add(split_op(add(x)), 1)
++
++        s = sympy.Symbol("s0", integer=True, positive=True)
++        f = HostTraceReplay(fn, trusted=TrustedInputs((((s, 64), (64, 1)),), {s: ValueRanges(1, 4096)}))
++        for m in (8, 40, 100, 12, 50, 128, 3, 64, 65):
++            x = torch.randn(m, 64, device="cuda")
++            self.assertEqual(f(x), fn(x), atol=0, rtol=0)
++        self.assertEqual((f.traces, f.replays, f.respecs, len(f.variants), f.eager, f.respec_refusals), (1, 8, 2, 3, 0, {}))
++
+     def test_a_refused_redispatch_tries_the_refusing_op_first(self):
+         # the split op refuses at every new class: once it has refused for a
+         # variant, its redispatch tries it before the tactic op, so a refusal
+@@ -2457,17 +2494,20 @@
+             runs = [len(r) for r in v.captured.lowered.steps if isinstance(r, range)]
+             self.assertEqual(runs, [1, 1] if split else [2])
+ 
+-    def test_a_trace_that_does_not_run_hands_the_call_back(self):
+-        # under trust only the first trace runs its call: a later one (a
+-        # misaligned x's) hands the arguments back, and the call again through
+-        # call_boxed drops x after its last use, which Python's reference
+-        # would hold to the end
++    @parametrize("redispatch", [True, False])
++    def test_a_slow_call_that_does_not_run_hands_the_call_back(self, redispatch):
++        # under trust only the first trace runs its call: a later slow call (a
++        # misaligned x's redispatch, or a trace where it refuses) hands the
++        # arguments back, and the call again through call_boxed drops x after
++        # its last use, which Python's reference would hold to the end
+         def fn(x):
+             return add(add(x), 1)
+ 
+         n = 1 << 22
+         layouts = (((n,), (1,)),)
+         f = HostTraceReplay(fn, trusted=TrustedInputs(layouts), freed_arguments=(0,), handback=True)
++        if not redispatch:
++            f._redispatch = lambda *args: FoldRefused("")
+         handed = []
+         for offset in (0, 0, 1, 1):
+             args = [torch.randn(n + 1, device="cuda")[offset : offset + n]]
+@@ -2485,7 +2525,7 @@
+             self.assertEqual(y, want)
+         self.assertEqual(handed, [1])
+         self.assertEqual(peak, 4 * n)
+-        self.assertEqual((f.traces, f.eager), (2, 0))
++        self.assertEqual((f.traces, f.redispatches, f.eager), (1, 1, 0) if redispatch else (2, 0, 0))
+ 
+     def test_distinct_shapes_reserve_as_eager(self):
+         # each replay frees and reuses blocks as eager does, so the cache
+--- a/test/inductor/test_cudagraph_host_trace.py
++++ b/test/inductor/test_cudagraph_host_trace.py
+@@ -73,6 +73,26 @@
+     return x.cumsum(0)
+ 
+ 
++if HAS_CUDA_AND_TRITON:
++    import triton
++    import triton.language as tl
++
++    @triton.jit
++    def _add_one(x_ptr, y_ptr, n, B: tl.constexpr):
++        i = tl.program_id(0) * B + tl.arange(0, B)
++        tl.store(y_ptr + i, tl.load(x_ptr + i, mask=i < n) + 1, mask=i < n)
++
++    @torch.library.custom_op("host_trace_test::add_one", mutates_args=())
++    def _add_one_op(x: torch.Tensor) -> torch.Tensor:
++        y = torch.empty_like(x)
++        _add_one[(triton.cdiv(x.numel(), 128),)](x, y, x.numel(), B=128)
++        return y
++
++    @_add_one_op.register_fake
++    def _(x):
++        return torch.empty_like(x)
++
++
+ _CASES = {
+     "pointwise": (_pointwise, (1024,), {}),
+     "reduction": (_reduction, (16, 128), {}),
+@@ -566,6 +586,20 @@
+         replay = installation.replay
+         self.assertEqual((replay.traces, len(replay.variants), replay.eager), (2, 2, 1))
+ 
++    def test_a_launch_alignment_flip_redispatches(self):
++        # the custom op's Triton launch specializes on its view's alignment, which
++        # moves with the size: the launch's own guard, redispatched under trust too
++        def fn(x):
++            return _add_one_op(x[x.shape[0] - 1000 :]) * 2
++
++        compiled = torch.compile(fn, mode="reduce-overhead", dynamic=True)
++        for k in (0, 1, 4, 2, 8, 3, 0, 1):
++            x = torch.randn(1000 + k, device="cuda")
++            self.assertEqual(compiled(x), fn(x), atol=0, rtol=0)
++        (installation,) = self.installed
++        replay = installation.replay
++        self.assertEqual((replay.traces, replay.redispatches, len(replay.variants), replay.eager), (1, 1, 1, 1))
++
+     def test_training_step(self):
+         m = _Params().cuda()
+         ref = _Params().cuda()

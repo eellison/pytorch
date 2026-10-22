@@ -1,0 +1,158 @@
+--- a/torch/csrc/cuda/host_trace/Variant.h	2026-10-08 21:48:10.445696274 -0700
++++ b/torch/csrc/cuda/host_trace/Variant.h	2026-10-08 21:48:10.735425843 -0700
+@@ -143,7 +143,19 @@
+   bool uncaptured = false;
+ };
+ 
+-enum class Outcome : int64_t { Miss = 0, Misaligned = 1, Capture = 2, Hit = 3 };
++// MemoryKind: a memcpy node can only be set to operands of its capture's kind
++// of memory (cudaMalloc'd or cuMem-mapped), and an argument it copies is of
++// the other kind: the variant does not hold the call. No step has run
++enum class Outcome : int64_t {
++  Miss = 0,
++  Misaligned = 1,
++  Capture = 2,
++  Hit = 3,
++  MemoryKind = 4
++};
++
++// a memcpy node's update refused an operand of another kind of memory
++struct MemoryKindMismatch {};
+ 
+ // A tensor an eager leaf or an output views: an argument, or a held base
+ struct BaseRef {
+@@ -642,6 +654,10 @@
+       const int64_t* v,
+       const int64_t* bases) const;
+   void patch_and_replay(Segment& run, Frame& frame);
++  // sets each memcpy node a later step replays whose argument operands moved
++  // to them, before any step runs: false if one is of the other kind of
++  // memory (the first step's own nodes fail at its patch, before it runs)
++  bool set_argument_copies(Frame& frame);
+   // The segment's form the rows select, or -1; `arms` its arms
+   int64_t form_of(
+       const Segment& g,
+--- a/torch/csrc/cuda/host_trace/Patch.cpp	2026-10-08 21:48:10.728663791 -0700
++++ b/torch/csrc/cuda/host_trace/Patch.cpp	2026-10-08 21:48:24.093447859 -0700
+@@ -378,6 +378,57 @@
+   run.form = form;
+ }
+ 
++bool HostTraceVariant::set_argument_copies(Frame& frame) {
++  const int64_t* v = frame.values.data();
++  const size_t first =
++      !steps_.empty() && steps_[0].segment >= 0 ? steps_[0].segment : SIZE_MAX;
++  for (size_t g = 0; g < segments_.size(); ++g) {
++    if (g == first) {
++      continue;
++    }
++    Segment& run = segments_[g];
++    const size_t form =
++        run.forms.size() > 1 ? frame.forms[g] : 0;
++    for (size_t i = run.first; i < run.stop; ++i) {
++      Record& r = records_[i];
++      if (r.kind != Kind::Memcpy) {
++        continue;
++      }
++      // an argument's address is its row's value; another operand keeps the
++      // node's (an allocation of the caching allocator's)
++      std::array<int64_t, 3> held = r.held_copy;
++      bool moved = false;
++      for (const auto& [f, k] : {std::pair{&r.copy.dst, 0}, std::pair{&r.copy.src, 1}}) {
++        if (f->base < 0) {
++          const int64_t x = field_value(*f, v, nullptr);
++          moved |= x != held[k];
++          held[k] = x;
++        }
++      }
++      if (!moved) {
++        continue;
++      }
++      CUgraphNode node =
++          form == 0 ? r.node : run.clones[form - 1].nodes[i - run.first];
++      const cudaError_t set = cudaGraphExecMemcpyNodeSetParams1D(
++          reinterpret_cast<cudaGraphExec_t>(run.execs[form]),
++          reinterpret_cast<cudaGraphNode_t>(node),
++          reinterpret_cast<void*>(held[0]),
++          reinterpret_cast<const void*>(held[1]),
++          static_cast<size_t>(held[2]),
++          r.copy.kind);
++      if (set == cudaErrorInvalidValue) {
++        (void)cudaGetLastError();
++        return false;
++      }
++      C10_CUDA_CHECK(set);
++      ++memory_node_sets;
++      r.held_copy = held;
++    }
++  }
++  return true;
++}
++
+ void HostTraceVariant::patch_and_replay(Segment& run, Frame& frame) {
+   int64_t pt = phase_now();
+   const int64_t* v = frame.values.data();
+@@ -452,13 +503,19 @@
+       const std::array<int64_t, 3> held = memcpy_shape(r.copy, v, bases);
+       r.held = false;
+       TORCH_CHECK_VALUE(held[2] > 0, "host_trace: a memcpy of ", held[2], " bytes");
+-      C10_CUDA_CHECK(cudaGraphExecMemcpyNodeSetParams1D(
++      const cudaError_t set = cudaGraphExecMemcpyNodeSetParams1D(
+           reinterpret_cast<cudaGraphExec_t>(exec),
+           reinterpret_cast<cudaGraphNode_t>(node),
+           reinterpret_cast<void*>(held[0]),
+           reinterpret_cast<const void*>(held[1]),
+           static_cast<size_t>(held[2]),
+-          r.copy.kind));
++          r.copy.kind);
++      if (set == cudaErrorInvalidValue) {
++        // an operand of the other kind of memory: the node is unchanged
++        (void)cudaGetLastError();
++        throw MemoryKindMismatch{};
++      }
++      C10_CUDA_CHECK(set);
+       ++memory_node_sets;
+       TORCH_CHECK(
+           fail_after_setter < 0 || fail_after_setter-- != 0,
+--- a/torch/csrc/cuda/host_trace/Entry.cpp	2026-10-08 21:48:10.728923728 -0700
++++ b/torch/csrc/cuda/host_trace/Entry.cpp	2026-10-08 21:48:10.742147383 -0700
+@@ -47,6 +47,9 @@
+   frame.tensors.clear();
+   frame.tensors.resize(base_count_);
+   frame.bases.assign(base_count_, 0);
++  if (!set_argument_copies(frame)) {
++    return Outcome::MemoryKind;
++  }
+   phase_add(13, pt_misc);
+   int64_t pt = phase_now();
+   PlanLease lease;
+@@ -84,7 +87,17 @@
+     if (i < steps_.size()) {
+       const Step& step = steps_[i];
+       if (step.segment >= 0) {
+-        patch_and_replay(segments_[step.segment], frame);
++        try {
++          patch_and_replay(segments_[step.segment], frame);
++        } catch (const MemoryKindMismatch&) {
++          if (!ran) {
++            return Outcome::MemoryKind;
++          }
++          PyErr_SetString(
++              disagreement_.ptr(),
++              "host_trace: a memcpy node of a later step refused its operand's kind of memory");
++          throw py::error_already_set();
++        }
+       } else {
+         run_eager(eager_[step.eager], args, frame);
+       }
+@@ -877,6 +890,10 @@
+     const uint64_t epoch = st.epoch;
+     try {
+       outcome = variant->commit(frame, &result);
++      if (outcome == Outcome::MemoryKind) {
++        // the next variant may be of the argument's kind
++        continue;
++      }
+     } catch (py::error_already_set& err) {
+       err.restore();
+       if (PyErr_ExceptionMatches(st.disagreement.ptr())) {

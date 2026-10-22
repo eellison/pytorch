@@ -1,0 +1,108 @@
+--- step_ms36/torch/cuda/_host_trace_redispatch.py	2026-10-20 17:39:49.007286929 -0700
++++ wip48/torch/cuda/_host_trace_redispatch.py	2026-10-21 09:38:40.538176930 -0700
+@@ -469,7 +469,8 @@
+         if not lo.ir or isinstance(paired := _section_pairing(tape, op, section), str):
+             return f"confirmation: its redo at its trace call takes another chain ({paired if lo.ir else 'sympy'})"
+         roots, scratch = paired
+-        fold, fold_x = _at_values(tape.shape_env.ctx, declared), _at_values(tape.shape_env.ctx, declared, scratch)
++        ctx = tape.shape_env.ctx
++        fold, fold_x, rename = _at_values(ctx, declared), _at_values(ctx, declared, scratch), _at_values(ctx, frozenset(), scratch)
+         for t, k in zip(section.temporaries, section.drops):
+             a = tape.allocs[k]
+             if t.dtype != a.dtype or not _same_value((t.sizes, t.strides), (tuple(a.sizes), tuple(a.strides)), lambda u, v: fold_x(u) == fold(v)):
+@@ -485,7 +486,8 @@
+     # an IR redo's guards are (node, written) pairs, a sympy one's its expressions
+     exprs = [g[0] if isinstance(g, tuple) else g for g in guards]
+     if section is not None:
+-        exprs = [fold_x(g) for g in exprs]  # over the scratch's own addresses: the allocations'
++        # renamed, not folded: the membership test below judges a guard by its symbols, and a declared symbol at its value makes it a constant
++        exprs = [rename(g) for g in exprs]
+     # and a guard over what a declared view's read reads besides: the static prefix's layouts and bases (the same every call)
+     for rec in tape.inputs if declared else ():
+         if rec.position < redo.static_prefix:
+--- step_ms36/test/test_cuda_host_trace_replay.py	2026-10-20 17:39:49.399273922 -0700
++++ wip48/test/test_cuda_host_trace_replay.py	2026-10-21 09:38:59.897284431 -0700
+@@ -391,12 +391,40 @@
+     return scratch[: x.shape[0]] * f
+ 
+ 
+-for _name, _fn in (("copy_scale", _copy_scale), ("copy_twice", _copy_twice), ("copy_stash", _copy_stash), ("copy_holder_sized", _copy_holder_sized)):
++def _copy_holder_guard(x: torch.Tensor) -> torch.Tensor:
++    f = 2 if HOLDER["n"] > 16 else 3  # a guard over a holder the step filled from its int
++    scratch = torch.empty_like(x)
++    scratch.copy_(x)
++    return scratch * f
++
++
++for _name, _fn in (("copy_scale", _copy_scale), ("copy_twice", _copy_twice), ("copy_stash", _copy_stash), ("copy_holder_sized", _copy_holder_sized), ("copy_holder_guard", _copy_holder_guard)):
+     _direct_lib.define(f"{_name}(Tensor x) -> Tensor")
+     _direct_lib.impl(_name, _fn, "CUDA")
+     _direct_lib._register_fake(_name, lambda x: torch.empty_like(x))
+ 
+ 
++# the same bodies with a guard over a static-prefix argument's size (a declared symbol), with and without the scratch
++def _copy_scale_w(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
++    f = 2 if w.shape[0] > 16 else 3
++    g = 2 if x.shape[0] > 16 else 3
++    scratch = torch.empty_like(x)
++    scratch.copy_(x)
++    return scratch * f * g
++
++
++def _scale_w(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
++    f = 2 if w.shape[0] > 16 else 3
++    g = 2 if x.shape[0] > 16 else 3
++    return x * f * g
++
++
++for _name, _fn in (("copy_scale_w", _copy_scale_w), ("scale_w", _scale_w)):
++    _direct_lib.define(f"{_name}(Tensor x, Tensor w) -> Tensor")
++    _direct_lib.impl(_name, _fn, "CUDA")
++    _direct_lib._register_fake(_name, lambda x, w: torch.empty_like(x))
++
++
+ # a library body reading a view from module state: the caller swaps the step's argument in while fn runs, and a pre-made
+ # view of the same weight is there otherwise
+ MODULE_STATE: dict[str, Any] = {"view": None}
+@@ -5058,6 +5086,41 @@
+         self.assertEqual((r.traces, r.redispatches), (2, 0))
+         self.assertIn("copy_holder_sized", "".join(r.redispatch_refusals))
+ 
++    @parametrize("op", ["scale_w", "copy_scale_w"])
++    def test_a_library_section_with_a_guard_over_the_static_prefix_confirms(self, op):
++        # the body branches on the static-prefix argument's size (a declared symbol) and on its input's: without the scratch
++        # the confirmation accepts the declared guard (over own | declared); with it (a section) the guards must be judged on
++        # the same form (the scratch renamed, nothing folded to a value), or the declared guard is a constant and counts as
++        # one the trace did not record (step_ms36: copy_scale_w refused, 2 traces)
++        def step(w, x):
++            return getattr(torch.ops.host_trace_direct, op)(x, w) + w[:1]
++
++        before = dict(_LIBRARY_COUNTS)
++        w = torch.ones(32, 4, device="cuda")
++        r = HostTraceReplay(step, static_prefix=1)
++        for rows in (8, 8, 32, 32, 8, 64):
++            x = torch.arange(rows * 4, dtype=torch.float32, device="cuda").view(rows, 4)
++            self.assertEqual(r(w, x), step(w, x), atol=0, rtol=0)
++        self.assertEqual((r.traces, r.redispatches > 0, r.sections > 0), (1, True, op == "copy_scale_w"))
++        self.assertEqual(_LIBRARY_COUNTS["refused"] - before.get("refused", 0), 0)
++
++    def test_a_library_section_with_a_guard_over_a_holder_is_refused(self):
++        # the body's guard is over a holder the step filled from its int: a symbol the op's call does not carry (a redo would
++        # bake the holder's value); refused, the new size traces again, bitwise
++        def step(x, n):
++            saved, HOLDER["n"] = HOLDER["n"], n
++            try:
++                return torch.ops.host_trace_direct.copy_holder_guard(x) + 1
++            finally:
++                HOLDER["n"] = saved
++
++        r = HostTraceReplay(step)
++        for t in (8, 8, 32):
++            x = torch.ones(t, 4, device="cuda")
++            self.assertEqual(r(x, t + 8), step(x, t + 8), atol=0, rtol=0)
++        self.assertEqual((r.traces, r.redispatches), (2, 0))
++        self.assertIn("copy_holder_guard", "".join(r.redispatch_refusals))
++
+     def test_a_confirmed_library_redo_is_not_rechecked_on_replay(self):
+         # the confirmation (a Python pass over the rows, a redo, a cache rollback) runs once per traced op, at its first
+         # redispatch; a replay hit, of the redone entry or the traced one, runs none of it

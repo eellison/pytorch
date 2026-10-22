@@ -1,0 +1,76 @@
+diff -ruN a/test/test_cuda_host_trace_pinned.py b/test/test_cuda_host_trace_pinned.py
+--- a/test/test_cuda_host_trace_pinned.py	2026-10-12 06:47:21.472750419 -0700
++++ b/test/test_cuda_host_trace_pinned.py	2026-10-12 06:47:21.474964256 -0700
+@@ -397,6 +397,33 @@
+             self.assertEqual(args[2], torch.sigmoid(args[1]).cpu(), atol=0, rtol=0)
+ 
+     @parametrize("direction", ["h2d", "d2h"])
++    def test_a_copy_replays_on_the_trace_calls_tensors(self, direction):
++        # F26's pinned form: a host copy between arguments, replayed on the
++        # tensors the trace call ran on, with new host contents each call
++        def f(d, h):
++            if direction == "h2d":
++                d[::3].copy_(h, non_blocking=True)
++                return d * 2
++            h.copy_(d[::3], non_blocking=True)
++            return d + 1
++
++        r = HostTraceReplay(f)
++        d, h = torch.zeros(2, 64, 35, device="cuda"), torch.zeros(1, 64, 35, pin_memory=True)
++        for k in range(4):
++            if direction == "h2d":
++                h.copy_(torch.full_like(h, float(k + 1)))
++            else:
++                d.fill_(float(k + 1))
++            want_d, want_h = d.clone(), h.clone()
++            want = f(want_d, want_h)
++            torch.cuda.synchronize()
++            out = r(d, h)
++            torch.cuda.synchronize()
++            self.assertEqual(out, want, atol=0, rtol=0)
++            self.assertEqual((d, h), (want_d, want_h), atol=0, rtol=0)
++        self.assertEqual((r.traces, r.replays, r.eager), (1, 3, 0))
++
++    @parametrize("direction", ["h2d", "d2h"])
+     def test_pageable_declines(self, direction):
+         # eager's copy_ to or from pageable memory is synchronous
+         n = 64
+diff -ruN a/test/test_cuda_host_trace_replay.py b/test/test_cuda_host_trace_replay.py
+--- a/test/test_cuda_host_trace_replay.py	2026-10-12 06:47:21.472861555 -0700
++++ b/test/test_cuda_host_trace_replay.py	2026-10-12 06:47:21.475065505 -0700
+@@ -2981,6 +2981,35 @@
+         self.assertNotIn(None, held_images(f)[0])
+         self.assertEqual((f.traces, f.replays, f.eager), (1, 2, 0))
+ 
++    @parametrize("case", ["copy_only", "copy_row", "no_mm", "full"])
++    def test_a_copy_into_an_argument_replays_on_the_trace_calls_tensors(self, case):
++        # F26: a copy_ into an argument is a memcpy node, captured between
++        # scratch operands. Replays on the tensors the trace call ran on (its
++        # operands at the traced addresses) must still set the node at its
++        # first replay, which a node held at the traced values would skip
++        def fn(a0, a1):
++            v = a1 @ a1.t() if case == "full" else None
++            if case != "copy_only":
++                torch.add(a1, 1, out=a1)
++            (a0[0] if case == "copy_row" else a0[::3]).copy_(a1)
++            return v.t() @ v if case == "full" else a1.sum()
++
++        def mk(seed):
++            g = torch.Generator(device="cuda").manual_seed(seed)
++            return torch.randn(2, 64, 35, device="cuda", generator=g), torch.randn(64, 35, device="cuda", generator=g)
++
++        # this file's HostTraceReplay traces at its first call: calls 1-4
++        # replay on the trace call's tensors
++        r = HostTraceReplay(fn)
++        args = mk(1)
++        for _ in range(5):
++            want_args = tuple(a.clone() for a in args)
++            want = fn(*want_args)
++            self.assertEqual(r(*args), want, atol=0, rtol=0)
++            for a, w in zip(args, want_args):
++                self.assertEqual(a, w, atol=0, rtol=0)
++        self.assertEqual((r.traces, r.replays, r.eager), (1, 4, 0))
++
+     def test_memcpy_and_memset_nodes_are_set_when_they_change(self):
+         # such a node holds its destination's address, not the allocation
+         # there: after a free and reallocation (or a VMM remap) at the address

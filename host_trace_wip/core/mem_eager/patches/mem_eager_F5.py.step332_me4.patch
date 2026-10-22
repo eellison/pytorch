@@ -1,0 +1,277 @@
+diff -ru '--exclude=__pycache__' '--exclude=TREE.txt' step332_me4/test/test_cuda_host_trace_harvest.py step332_me5/test/test_cuda_host_trace_harvest.py
+--- step332_me4/test/test_cuda_host_trace_harvest.py	2026-10-14 22:08:48.842112937 -0700
++++ step332_me5/test/test_cuda_host_trace_harvest.py	2026-10-15 03:11:33.281594999 -0700
+@@ -31,9 +31,9 @@
+     import torch.cuda._host_trace_harvest as harvest
+     import torch.cuda._host_trace_memory as memory
+     from torch.cuda._host_trace_harvest import _launch, HarvestProvider
+-    from torch.cuda._host_trace_opaque import library_state, OpaqueKernel, OpaqueKey
++    from torch.cuda._host_trace_opaque import library_state, OpaqueBinding, OpaqueKernel, OpaqueKey, Slot
+     from torch.cuda._host_trace_replay import _BACKGROUND, HostTraceReplay
+-    from torch.cuda._host_trace_tape import _Witness, EagerCall, trace
++    from torch.cuda._host_trace_tape import _cuda_address, _Witness, EagerCall, trace
+ 
+ aten = torch.ops.aten
+ bf16 = torch.bfloat16
+@@ -102,6 +102,31 @@
+     )
+ 
+ 
++def _backed_peak(f, args):
++    # peak live bytes of a call backed by memory, from the allocator's trace:
++    # the captures' blocks (address space only, never mapped) left out
++    torch.cuda.synchronize()
++    torch.cuda.empty_cache()
++    torch.cuda.memory._record_memory_history(enabled="all", context=None, stacks="python", max_entries=1_000_000)
++    try:
++        f(*args)
++        torch.cuda.synchronize()
++        trace = torch.cuda.memory._snapshot()["device_traces"][torch.cuda.current_device()]
++    finally:
++        torch.cuda.memory._record_memory_history(enabled=None)
++    a = harvest._address_only()
++    unmapped = [(r[0], r[0] + a._SPAN) for r in a.ranges.values()]
++    live, cur, peak = {}, 0, 0
++    for e in trace:
++        if e["action"] == "alloc" and not any(lo <= e["addr"] < hi for lo, hi in unmapped):
++            live[e["addr"]] = e["size"]
++            cur += e["size"]
++            peak = max(peak, cur)
++        elif e["action"] == "free_completed" and e["addr"] in live:
++            cur -= live.pop(e["addr"])
++    return peak
++
++
+ def _names(binding):
+     return tuple(
+         driver.cuFuncGetName(n.function)[1].decode()[:48]
+@@ -690,6 +715,21 @@
+         self.assertTrue(harvest._same(h, h))
+         self.assertLess(torch.cuda.max_memory_allocated() - base, 128 << 20)
+ 
++    def test_stale_high_halves_are_zeroed(self):
++        # a constant qword whose high half is a stale address's binds with
++        # that half zeroed and loose; a slot's neighbors, loose bytes and
++        # other constants keep theirs; a sibling zeroes where its template did
++        qs = [0xFF11_0000_0020, 0xFF11_0000_0030, 0x8_0000_0FFF, 0xFF11_0000_0040, 0xFF11_0000_0050]
++        image = b"".join(q.to_bytes(8, "little") for q in qs)
++        kernel = OpaqueKernel(0, (1, 1, 1), (1, 1, 1), 0, (), ((0, len(image)),), (image,), (Slot(0, 12, "operand", 0, 0),), ((0, 32, 8),))
++        b = harvest._canonical(OpaqueBinding((kernel,), ()), lambda q: q >> 32 == 0xFF11)
++        n = b.nodes[0]
++        self.assertEqual([int.from_bytes(n.images[0][o : o + 8], "little") for o in range(0, 40, 8)], [0x20, qs[1], qs[2], 0x40, qs[4]])
++        self.assertEqual(n.loose, ((0, 4, 4), (0, 28, 4), (0, 32, 8)))
++        self.assertIs(harvest._canonical(b, lambda q: q >> 32 == 0xFF11), b)
++        sibling = harvest._canonical(OpaqueBinding((dataclasses.replace(kernel, loose=n.loose),), ()), bool, like=b)
++        self.assertEqual(sibling.nodes[0].images, n.images)
++
+     def test_a_learn_leaves_no_reserved_memory(self):
+         # nothing of verify's outlives the learn: its buffers come from a pool
+         # of their own, which goes back to the device when the harvest is
+@@ -1369,6 +1409,25 @@
+         make = lambda: _conv_backward(case, dt, channels_last)  # noqa: E731
+         self.assertReplays(aten.convolution_backward.default, make, tf32=dtype == "tf32")
+ 
++    def test_strided_dgrad_binds_no_stale_high_half(self):
++        # CUTLASS strided dgrad holds an int32 under a stale address's high
++        # half (parameter byte 1424 here), which it reads as a flag: with some
++        # address spaces the captured bytes hang it. Bound with no constant
++        # whose high half is an unmapped device address's
++        make = lambda: _conv_backward("strided_dilated", bf16, True)  # noqa: E731
++        binding = self.assertReplays(aten.convolution_backward.default, make)
++        low = min(harvest._DEVICES[torch.cuda.current_device()].va, *(t.data_ptr() for t in make()[:3])) >> 32
++        for n in binding.nodes:
++            if not isinstance(n, OpaqueKernel):
++                continue
++            near = {(s.param, s.offset + d) for s in n.slots for d in range(-7, 8)}
++            loose = {(p, o + i) for p, o, size in n.loose for i in range(size)}
++            for param, image in enumerate(n.images):
++                for i, q in enumerate(harvest._qwords(image, 0)):
++                    if (param, 8 * i) in near or any((param, 8 * i + j) in loose for j in range(8)):
++                        continue
++                    self.assertFalse(low <= q >> 32 < 1 << 16 and not _cuda_address(q), f"parameter {param} byte {8 * i}: {q:#x}")
++
+     def test_pair(self):
+         # harvested in full from the pair, after the priming capture
+         smeared = torch._C._cuda_hostTraceHarvestCapture
+@@ -2276,6 +2335,34 @@
+         b = p.bindings[next(iter(p.bindings))]
+         self.assertIs(b.topology, b.topology)
+ 
++    @parametrize("case", ["conv", "attention", "mm"])
++    def test_a_learn_costs_at_most_its_workspace(self, case):
++        # the call that learns its key (the trace's warm-up call) holds no
++        # more memory than eager's call but the binding's workspace and small
++        # terms (digests, mirror windows): no copy of an operand or output
++        # (128 MiB each here), captures into address space only
++        def conv(x, w):
++            return torch.nn.functional.conv2d(x, w, padding=1)
++
++        def attention(q, k, v):
++            return torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
++
++        fn, args = {
++            "conv": (conv, (torch.randn(64, 64, 128, 128, device="cuda", dtype=bf16), torch.randn(64, 64, 3, 3, device="cuda", dtype=bf16))),
++            "attention": (attention, tuple(torch.randn(32, 16, 2048, 64, device="cuda", dtype=bf16) for _ in range(3))),
++            "mm": (torch.mm, (torch.randn(16384, 4096, device="cuda", dtype=bf16), torch.randn(4096, 4096, device="cuda", dtype=bf16))),
++        }[case]
++        providers = (HarvestProvider(), HarvestProvider(("attention",)), HarvestProvider(("conv",)))
++        with torch.backends.cudnn.flags(enabled=True, benchmark=False, deterministic=True):
++            eager = _backed_peak(fn, args)
++            r = HostTraceReplay(fn, opaque=providers)
++            r(*args)
++            learn = _backed_peak(r, args)
++            self.assertGreater(r.learned, 0)
++            workspace = sum(sum(b.scratch) for p in providers for b in p.bindings.values())
++            self.assertLessEqual(learn - eager, workspace + (64 << 20))
++            self.assertEqual(r(*args), fn(*args), atol=0, rtol=0)
++
+     def test_a_new_row_packs_only_what_it_changes(self):
+         # the call after a new key's row is added packs the nodes a changed row
+         # or site reads, not every node: z's kernel (inputs at fixed
+diff -ru '--exclude=__pycache__' '--exclude=TREE.txt' step332_me4/torch/cuda/_host_trace_harvest.py step332_me5/torch/cuda/_host_trace_harvest.py
+--- step332_me4/torch/cuda/_host_trace_harvest.py	2026-10-14 22:08:48.846780804 -0700
++++ step332_me5/torch/cuda/_host_trace_harvest.py	2026-10-15 03:11:33.283908484 -0700
+@@ -112,6 +112,7 @@
+ from __future__ import annotations
+ 
+ import contextlib
++import ctypes
+ import dataclasses
+ import functools
+ import logging
+@@ -446,13 +447,52 @@
+ _HIGH_VA = 0xFF00_0000_0000
+ 
+ 
+-def _reserve_high(size: int, align: int) -> int:
++def _reserve_high(size: int, align: int, at: int = _HIGH_VA) -> int:
+     from cuda.bindings import driver
+ 
+-    hint = -(-_HIGH_VA // align) * align
++    hint = -(-at // align) * align
+     return int(_check_cuda_bindings(driver.cuMemAddressReserve(size, align, hint, 0)))
+ 
+ 
++class _AddressOnly:
++    """The captures' allocator: address space and no memory. A capture records
++    addresses and its graph is reset unlaunched, so nothing it allocates is
++    ever touched (the operand arena's reasoning, for the call's own
++    allocations, outputs and the plugs). Per device a reserved range handed out
++    upward, rewound once every piece is back."""
++
++    _SPAN = 64 << 30
++
++    def __init__(self) -> None:
++        alloc_fn = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_void_p)
++        free_fn = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_void_p)
++        self.ranges: dict[int, list[int]] = {}  # device -> [base, next, pieces out]
++        self.c_alloc, self.c_free = alloc_fn(self._alloc), free_fn(self._free)
++        self.allocator = torch._C._cuda_customAllocator(ctypes.cast(self.c_alloc, ctypes.c_void_p).value, ctypes.cast(self.c_free, ctypes.c_void_p).value)
++
++    def _alloc(self, size: int, device: int, stream: Any) -> int:
++        r = self.ranges.get(device)
++        if r is None:
++            base = _reserve_high(self._SPAN, 1 << 21, 0xFE00_0000_0000)
++            r = self.ranges[device] = [base, base, 0]
++        at = -(-r[1] // _WINDOW) * _WINDOW
++        if at + size > r[0] + self._SPAN:
++            return 0
++        r[1], r[2] = at + size, r[2] + 1
++        return at
++
++    def _free(self, ptr: int, size: int, device: int, stream: Any) -> None:
++        r = self.ranges[device]
++        r[2] -= 1
++        if r[2] == 0:
++            r[1] = r[0]
++
++
++@functools.cache
++def _address_only() -> _AddressOnly:
++    return _AddressOnly()
++
++
+ # per device, the address ranges mirrors map in (4 GiB-aligned, free ones),
+ # reserved for the process: reserved and freed per check, their addresses (low
+ # ones, for the alignment) went to the caching allocator's next segments,
+@@ -794,6 +834,47 @@
+     return OpaqueBinding(tuple(nodes), tuple(sizes[j] for j in used), increment, owner)
+ 
+ 
++def _canonical(binding: OpaqueBinding, stale: Callable[[int], bool], like: OpaqueBinding | None = None) -> OpaqueBinding:
++    # each constant qword (alike in every capture, no slot's, not loose) whose
++    # high half is a stale address's with that half zeroed: cuDNN builds its
++    # parameter structs on the heap before the captures, and a field may hold
++    # another field's leftovers, an address's high half that depends on where
++    # things were mapped then (CUTLASS strided dgrad reads the high half of an
++    # int32's qword as a flag, and hangs on some). Zeroed, the binding no
++    # longer depends on the address space; verify judges that form, and the
++    # zeroed bytes are loose (a restore's capture holds its own leftovers).
++    # With `like` (a sibling's template): the template's zeroed high halves
++    def zeroed(n: OpaqueKernel) -> set[tuple[int, int]]:
++        return {(p, o - 4) for p, o, size in n.loose if size == 4 and o % 8 == 4 and not any(n.images[p][o : o + 4])}
++
++    nodes, changed = [], False
++    for x, n in enumerate(binding.nodes):
++        if not isinstance(n, OpaqueKernel):
++            nodes.append(n)
++            continue
++        template = like.nodes[x] if like is not None else None
++        near = {(s.param, s.offset + d) for s in n.slots for d in range(-7, 8)}
++        loose = {(p, o + i) for p, o, size in n.loose for i in range(size)}
++        images, runs = list(n.images), []
++        for param, image in enumerate(n.images):
++            for i, q in enumerate(_qwords(image, 0)):
++                off = 8 * i
++                if not q >> 32:
++                    continue
++                if template is not None:
++                    if (param, off) not in zeroed(template):
++                        continue
++                elif (param, off) in near or any((param, off + b) in loose for b in range(8)) or not stale(q):
++                    continue
++                images[param] = images[param][: off + 4] + bytes(4) + images[param][off + 8 :]
++                runs.append((param, off + 4, 4))
++        if runs:
++            changed = True
++            loose_runs = n.loose if template is not None else tuple(sorted({*n.loose, *runs}))
++            n = dataclasses.replace(n, images=tuple(images), loose=loose_runs)
++        nodes.append(n)
++    return dataclasses.replace(binding, nodes=tuple(nodes)) if changed else binding
++
+ class HarvestProvider:
+     """The OpaqueProvider for the ops of `families`: "blas", bf16, fp16 and
+     fp32 mm, addmm and bmm through cuBLAS; "attention", the cuDNN, flash and
+@@ -1882,11 +1963,11 @@
+                 if stray is not None:
+                     raise _NoSibling("parameter {} byte {}: {:#x} is no constant".format(*stray))
+                 nodes.append(dataclasses.replace(n, images=tuple(images), slots=slots, loose=t.loose))
+-            return _renumbered(nodes, [n for _, n in blocks], 0, cap[6], key.op in _OUT)
++            return _canonical(_renumbered(nodes, [n for _, n in blocks], 0, cap[6], key.op in _OUT), bool, like=template)
+ 
+         if dev.pool is None:
+             with torch.cuda.device(device):
+-                dev.pool = torch.cuda.MemPool()
++                dev.pool = torch.cuda.MemPool(allocator=_address_only().allocator)
+                 # a graph kept on the pool: the pinned host allocator asserts
+                 # when a pool id is captured into after all its graphs are gone
+                 dev.keeper = torch.cuda.CUDAGraph()
+@@ -2149,4 +2230,18 @@
+             raise _Refused(f"{names} take {increment} philox offsets and read no captured generator state")
+         del sets
+ 
++        # a stale address's high half: past the lowest device address the
++        # harvest knows (its reservations, the call's operands) or in the
++        # heap, mapped by nothing (a live constant address is verify's to mirror)
++        low = min([a for a, _, _ in ours if a] + addresses[0]) >> 32
++
++        def stale_high(q: int) -> bool:
++            return (low <= q >> 32 < 1 << 16 or heap[0] <= q < heap[1]) and q not in retired_qwords and not stack[0] <= q < stack[1] and not _cuda_address(q)
++
++        canonical = _canonical(binding, stale_high)
++        if canonical is not binding:
++            try:
++                return verify(canonical, stale, names, retired_qwords)
++            except _Refused as e:
++                log.info("host_trace: %s at sizes %s binds with its captured stale bytes: %s", op, key.sizes, e)
+         return verify(binding, stale, names, retired_qwords)

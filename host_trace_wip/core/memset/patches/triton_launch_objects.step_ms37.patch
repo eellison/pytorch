@@ -1,0 +1,235 @@
+diff -ruN -x __pycache__ -x '*.pyc' -x TREE.txt step_ms37/test/test_cuda_host_trace_replay.py wip49/test/test_cuda_host_trace_replay.py
+--- step_ms37/test/test_cuda_host_trace_replay.py	2026-10-21 09:38:59.897284431 -0700
++++ wip49/test/test_cuda_host_trace_replay.py	2026-10-22 09:40:44.164575710 -0700
+@@ -6451,6 +6451,53 @@
+         self.assertLessEqual(max(n for n, _ in rows), 300, rows)
+         self.assertGreater(after[2] - before[2], 0)
+ 
++    def test_a_triton_step_leaves_as_few_tracked_objects_as_an_aten_one(self):
++        # a Triton launch's record held closures (its witness, launcher and redo), which the walk seals nothing behind:
++        # ~30 tracked objects per launch stayed (1,557 per trace of 51 launches in memset/coldstart/gc_census_probe_triton.py);
++        # as objects, the record seals and a Triton step's residue is an ATen step's (its ops' records and traced tensors)
++        def triton_step(x, w):
++            y = x
++            for i in range(48):
++                y = add(y, i + 1)
++            return torch.relu(torch.mm(y, w)).sum(0)
++
++        def aten_step(x, w):
++            y = x
++            for i in range(48):
++                y = y + (i + 1)
++            return torch.relu(torch.mm(y, w)).sum(0)
++
++        rows = {}
++        for name, fn in (("triton", triton_step), ("aten", aten_step)):
++            f = HostTraceReplay(fn, static_shapes=(0,))
++            rows[name] = self._per_call(f, (16, 8, 24))
++            self.assertEqual(f.traces, 3)
++        for name, r in rows.items():
++            self.assertEqual([g for _, g in r], [0] * len(r), (name, r))
++        triton_, aten_ = (max(n for n, _ in rows[k]) for k in ("triton", "aten"))
++        self.assertLessEqual(triton_, 800, rows)
++        self.assertLessEqual(triton_, 2 * aten_ + 200, rows)
++        gc.collect()
++        launches = sum(1 for o in gc.get_objects() if isinstance(o, KernelLaunch))
++        self.assertLessEqual(launches, 8, launches)
++
++    def test_a_replay_hit_leaves_no_tracked_object(self):
++        # a hit runs no Python of the trace's: no tracked object survives it, and what the collector sees allocated is its
++        # outputs' Python objects (generation-0 count: 1-2 per hit here, their tuples and tensors), none of the trace's state
++        f = HostTraceReplay(_layer, static_shapes=(0,))
++        x = torch.randn(16, 32, device="cuda")
++        for _ in range(3):  # this module's HostTraceReplay traces at its first call
++            f(x, self.w)
++        self.assertEqual((f.traces, f.replays), (1, 2))
++        gc.collect()
++        before, count = len(gc.get_objects()), gc.get_count()[0]
++        for _ in range(20):
++            out = f(x, self.w)
++            del out
++        self.assertEqual(len(gc.get_objects()) - before, 0)
++        self.assertLessEqual(gc.get_count()[0] - count, 2 * 20)
++        self.assertEqual(f.replays, 22)
++
+     def test_untracking_is_off_without_the_switch(self):
+         with mock.patch.object(_host_trace_replay, "gc_untrack", False):
+             f = HostTraceReplay(_layer, static_shapes=(0,))
+diff -ruN -x __pycache__ -x '*.pyc' -x TREE.txt step_ms37/torch/cuda/_host_trace_replay.py wip49/torch/cuda/_host_trace_replay.py
+--- step_ms37/torch/cuda/_host_trace_replay.py	2026-10-20 09:18:11.534090768 -0700
++++ wip49/torch/cuda/_host_trace_replay.py	2026-10-22 09:31:14.075710782 -0700
+@@ -1727,6 +1727,7 @@
+ # per type, its flags
+ _GC_KINDS: dict[type, int] = {}
+ _HEAPTYPE = 1 << 9
++_TRITON_CLEAN = frozenset({"CompiledKernel", "JITFunction", "Autotuner", "Heuristics", "dtype", "constexpr"})
+ 
+ 
+ def _gc_flags(t: type) -> int:
+@@ -1749,6 +1750,14 @@
+         return _GC_DESCEND | _GC_CONTAINER
+     if issubclass(t, (type, types.ModuleType, torch._ops.OpOverload, torch._ops.OpOverloadPacket, sympy.Basic)):
+         return _GC_CLEAN
++    if (t.__module__.startswith("triton.") and t.__qualname__ in _TRITON_CLEAN) or (
++        t.__module__ == "torch.cuda._host_trace_triton_launch" and t.__qualname__ == "OwnedModule"
++    ):
++        # Triton's compiled binary, JIT function, autotuner and constexpr values, and a tape's own load of a kernel's cubin,
++        # held by a Triton launch's witness, owner and redo (_host_trace_triton_launch._Launcher, _Witness.values,
++        # OwnedModule, _JitRedo, _AutotunerRedo): long-lived library objects that reach no object of a trace's records,
++        # clean as types, modules and operators are
++        return _GC_CLEAN
+     if t is _ir.Env:
+         return _GC_DESCEND | _GC_CLEAN
+     if t is _TracedTensor:
+diff -ruN -x __pycache__ -x '*.pyc' -x TREE.txt step_ms37/torch/cuda/_host_trace_triton_launch.py wip49/torch/cuda/_host_trace_triton_launch.py
+--- step_ms37/torch/cuda/_host_trace_triton_launch.py	2026-10-19 11:57:20.925662818 -0700
++++ wip49/torch/cuda/_host_trace_triton_launch.py	2026-10-22 09:31:14.075046906 -0700
+@@ -37,6 +37,7 @@
+ import struct
+ import types
+ import weakref
++from dataclasses import dataclass
+ from typing import Any, NoReturn, TYPE_CHECKING
+ 
+ import torch
+@@ -388,11 +389,7 @@
+     binary._init_handles()
+     owned = owned_module(binary)
+ 
+-    def launcher(stream: int, args: dict, grid: tuple[int, int, int]) -> None:
+-        # JITFunction.run's launch of the binary, with no hooks (declined above)
+-        binary.run(*grid, stream, binary.function, binary.packed_metadata, None, None, None, *args.values())
+-
+-    record_launch(tr, name, owned.function, owned, abi, bound, dims, launcher)
++    record_launch(tr, name, owned.function, owned, abi, bound, dims, _Launcher(binary))
+     return binary
+ 
+ 
+@@ -445,6 +442,75 @@
+     return dtype, fill, (*shape, *strides), (v.base.data_ptr(), *extents, *byte_strides)
+ 
+ 
++# OpRec.redo of a Triton call and of an autotuner's: objects, not closures, as the tape's _EagerRedo (eq=False: a redo template
++# keys an op by its redo, by identity), so the op's record seals for _host_trace_replay._gc_untrack
++@dataclass(frozen=True, eq=False)
++class _JitRedo:
++    jit: Any
++    warmup: bool
++
++    def __call__(self, a: tuple, k: dict) -> Any:
++        return _jit_run(self.jit, *a, warmup=self.warmup, **k)
++
++
++@dataclass(frozen=True, eq=False)
++class _AutotunerRedo:
++    autotuner: Any
++
++    def __call__(self, a: tuple, k: dict) -> Any:
++        return _autotuner_run(self.autotuner, *a, **k)
++
++
++@dataclass(frozen=True)
++class _Launcher:
++    """JITFunction.run's launch of the binary, with no hooks (_launch declined them). An object, not a closure: a function or
++    a cell is nothing _host_trace_replay._gc_untrack seals, and would keep the launch it witnesses and its lowering tracked."""
++
++    binary: Any
++
++    def __call__(self, stream: int, args: dict, grid: tuple[int, int, int]) -> None:
++        b = self.binary
++        b.run(*grid, stream, b.function, b.packed_metadata, None, None, None, *args.values())
++
++
++@dataclass(frozen=True)
++class _Witness:
++    """KernelLaunch.witness of a Triton launch: the launch through its own launcher (`launch_with`) on each argument's value at
++    a call, read from the record's slots there (arg_at). An object for the same reason as _Launcher."""
++
++    launch_with: Callable[[int, dict[str, Any], tuple[int, int, int]], None]
++    values: Mapping[str, Any]
++    by_name: Mapping[str, Any]
++    # each launcher argument from the record's slots at a call (in their order after the descriptors' moves)
++    at: Mapping[int, int]
++    firsts: Mapping[int, int]
++
++    def arg_at(self, k: str, v: Any, slots_at: Sequence[int]) -> Any:
++        from triton.tools.tensor_descriptor import TensorDescriptor
++
++        a = self.by_name.get(k)
++        if a is None:
++            return v
++        if a.slot is None:
++            return a.constant
++        if a.descriptor is not None:
++            rank = a.descriptor.rank
++            shape = [slots_at[self.at[a.slot + 1 + i]] for i in range(rank)]
++            strides = [slots_at[self.at[a.slot + 1 + rank + i]] for i in range(rank)]
++            # the encode's address, without a placeholder's top (TmaDescriptor.encode)
++            base = _PointerStandIn(v.base.dtype, slots_at[self.firsts[a.slot]] & _PLACEHOLDER_LOW)
++            return TensorDescriptor(base, shape, strides, list(v.block_shape), v.padding, v.round_f32_to_tf32)
++        if a.is_pointer or a.triton_type in _INT_BITS:
++            return slots_at[self.at[a.slot]]
++        return v  # a float, a constant of the trace
++
++    def __call__(self, stream: int, slots_at: Sequence[int], grid: tuple[int, int, int]) -> None:
++        # a value of the trace that is no kernel parameter (an Inductor
++        # launcher's grid argument) has no value at the call: not passed
++        args = {k: self.arg_at(k, v, slots_at) for k, v in self.values.items() if k in self.by_name or not _traced_leaf(v)}
++        self.launch_with(stream, args, grid)
++
++
+ def record_launch(
+     tr: _Trace,
+     name: str,
+@@ -546,31 +612,7 @@
+     firsts = {d.param: d.first for d in tma}
+     by_name = {a.name: a for a in abi.args}
+ 
+-    def arg_at(k: str, v: Any, slots_at: Sequence[int]) -> Any:
+-        from triton.tools.tensor_descriptor import TensorDescriptor
+-
+-        a = by_name.get(k)
+-        if a is None:
+-            return v
+-        if a.slot is None:
+-            return a.constant
+-        if a.descriptor is not None:
+-            rank = a.descriptor.rank
+-            shape = [slots_at[at[a.slot + 1 + i]] for i in range(rank)]
+-            strides = [slots_at[at[a.slot + 1 + rank + i]] for i in range(rank)]
+-            # the encode's address, without a placeholder's top (TmaDescriptor.encode)
+-            base = _PointerStandIn(v.base.dtype, slots_at[firsts[a.slot]] & _PLACEHOLDER_LOW)
+-            return TensorDescriptor(base, shape, strides, list(v.block_shape), v.padding, v.round_f32_to_tf32)
+-        if a.is_pointer or a.triton_type in _INT_BITS:
+-            return slots_at[at[a.slot]]
+-        return v  # a float, a constant of the trace
+-
+-    def witness(stream: int, slots_at: Sequence[int], grid: tuple[int, int, int]) -> None:
+-        # a value of the trace that is no kernel parameter (an Inductor
+-        # launcher's grid argument) has no value at the call: not passed
+-        args = {k: arg_at(k, v, slots_at) for k, v in values.items() if k in by_name or not _traced_leaf(v)}
+-        launch_with(stream, args, grid)
+-
++    witness = _Witness(launch_with, values, by_name, at, firsts)
+     launch = KernelLaunch(
+         name,
+         function,
+@@ -598,8 +640,7 @@
+     try:
+         run = functools.partial(_intercept, tr, self, args, grid, warmup, kwargs)
+         # the grid with the arguments, its SymInts renamed for a redo as theirs
+-        redo = lambda a, k: _jit_run(self, *a, warmup=warmup, **k)  # noqa: E731
+-        return tr.op(self, args, dict(kwargs, grid=grid), run, host=True, redo=redo)
++        return tr.op(self, args, dict(kwargs, grid=grid), run, host=True, redo=_JitRedo(self, warmup))
+     except Declined as e:
+         if tr.declined is None:
+             tr.declined = e
+@@ -615,7 +656,7 @@
+     if tr is None:
+         return _ORIGINALS["autotuner"](self, *args, **kwargs)
+     run = functools.partial(_autotune, tr, self, args, kwargs)
+-    return tr.op(self, args, kwargs, run, host=True, redo=lambda a, k: _autotuner_run(self, *a, **k))
++    return tr.op(self, args, kwargs, run, host=True, redo=_AutotunerRedo(self))
+ 
+ 
+ def _autotune(tr: _Trace, self: Any, args: tuple, kwargs: dict) -> Any:

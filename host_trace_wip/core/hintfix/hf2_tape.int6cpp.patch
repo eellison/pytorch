@@ -1,0 +1,399 @@
+--- a/test/test_cuda_host_trace_oob.py
++++ b/test/test_cuda_host_trace_oob.py
+@@ -148,6 +148,23 @@
+         ((site,),) = [v.captured.lowered.sites for v in f.variants]
+         self.assertEqual(site.site.key.strides[1], (27, 1))
+ 
++    def test_a_gemm_on_an_eager_size_1_output_keys_eagers_stride_at_each_call(self):
++        # eager's sort keeps its input's stride on the size-1 dim (27, then 30), its fake kernel
++        # predicts a contiguous output. The warm-up check gives the output eager's rule there, the
++        # input's stride where the size is 1, not the warm-up's 27: a call at stride 30 keys the GEMM
++        # at 30, as eager's call does (with 27 it would bind the stride-27 key's kernels, silently)
++        def fn(a):
++            v = a.sort(1).values
++            return v.t() @ v, a * 2
++
++        p = HarvestProvider()
++        f = HostTraceReplay(fn, opaque=(p,))
++        for width in (27, 27, 30, 30):
++            y = torch.randn(1, width, device="cuda", dtype=torch.bfloat16)[:, :24]
++            self.assertEqual(f(y), fn(y), atol=0, rtol=0)
++        self.assertEqual(f.traces, 1)
++        self.assertEqual({k[4][1] for k in p.bindings}, {(27, 1), (30, 1)})
++
+ 
+ def setUpModule():
+     from torch.cuda import _host_trace_hint_audit
+--- a/torch/cuda/_host_trace_hint_audit.py
++++ b/torch/cuda/_host_trace_hint_audit.py
+@@ -84,7 +84,6 @@
+ _CUTE = "torch/cuda/_host_trace_cute.py"
+ _MEMORY = "torch/cuda/_host_trace_memory.py"
+ _AT_CALL = "evaluate it at the traced call's inputs (the input record's values through the program's rows), not the node's hint"
+-_TAG = "keep the allocation's index in its record (_AllocRec / _Root) and build the placeholder from it, not from the symbol's hint"
+ _WITNESS = f"the witness's stand-ins and comparisons: {_AT_CALL}"
+ 
+ # (path under the torch package's parent, co_qualname) -> why the hint read
+@@ -101,20 +100,11 @@
+ # or a decline): strict mode notes these and raises on any new site. A fix
+ # removes its entry; the target is none.
+ OFFENDERS: dict[tuple[str, str], str] = {
+-    (_TAPE, "_check_witness"): "F17: a size-1 stride adopted from the warm-up where the size's hint is 1 (an unguarded constant; on step242 the warm-up's int inside select(z == 1, r, s)). Keep the fake kernel's symbolic stride (select(z == 1, <symbolic eager rule>, s) where a consumer keys on it); compare layouts at the call, not at the hints",
+-    (_TAPE, "_contiguous_strides"): "symbolic: strides[d] = strides[d + 1] * sym_max(size, 1), no hint test",
+-    (_TAPE, "_dense_terms.<locals>.<lambda>"): "a guard: bool(nod(sizes, strides) == 1) (the IR's is_non_overlapping_and_dense indicator), or order the dims by guarded comparisons as _infer_dense_strides does",
+     (_TAPE, "_elementwise"): "guards: decide the broadcast from the fake kernel's symbolic output shape, each size comparison a guard (bool(n == m) / bool(n == 1)), not meta at the hints",
+-    (_TAPE, "_call_key"): f"pair the trace's calls with the warm-up's by structure (op, position, rank, dtype); compare layouts {_AT_CALL}",
+-    (_TAPE, "_order_key"): f"compare fn's calls with the warm-up's by structure; layouts {_AT_CALL}",
+-    (_TAPE, "_order_key.<locals>.<genexpr>"): f"compare fn's calls with the warm-up's by structure; layouts {_AT_CALL}",
+     (_TAPE, "_Trace._pointwise_host"): _WITNESS,
+     (_TAPE, "_Trace._pointwise_host.<locals>.stand_in"): _WITNESS,
+     (_TAPE, "_Trace._pointwise_host.<locals>.check"): _WITNESS,
+     (_TAPE, "_Trace._pointwise_host.<locals>.check.<locals>.address"): _WITNESS,
+-    (_TAPE, "_bind_opaque"): f"{_TAG}; the key values: int(v) (a guard) in place of v == _hint(v)",
+-    (_TAPE, "_Trace._eager_call"): "int(v) (guard_int records Eq and returns the value) in place of v == _hint(v)",
+-    (_TAPE, "_Trace._eager_call.<locals>.<genexpr>"): "step242: an eager output 'pending' where a size's hint is 1; record the outputs whose strides _check_witness adopts (a set it fills) instead of re-deriving them from hints",
+     (_TRITON, "_witness"): _WITNESS,
+     (_TRITON, "_launch.<locals>.launcher"): _WITNESS,
+     (_TRITON, "_intercept"): f"T3: decline a SymInt argument that is not the running trace's (v.node.env is not tr.shape_env); the compile's values: build the binary from the symbolic specialization key, or {_AT_CALL}",
+--- a/torch/cuda/_host_trace_tape.py
++++ b/torch/cuda/_host_trace_tape.py
+@@ -532,13 +532,7 @@
+             dtype = kwargs.get("dtype") or src.dtype
+             traced = isinstance(src, _TracedTensor)
+             src_strides = src._sym_strides if traced else list(src.stride())
+-            if mf not in (None, torch.preserve_format):
+-                strides = _format_strides(sizes, mf)
+-            elif bool(src.numel() == 0) or _guard_each(_dense_terms(sizes, src_strides)):
+-                # c10's is_contiguous: an empty tensor is
+-                strides = list(src_strides)
+-            else:
+-                strides = _infer_dense_strides(sizes, src_strides)
++            strides = _empty_like_strides(sizes, src_strides, mf, self.values)
+             mf = None
+         if mf not in _ALLOC_FORMATS:
+             raise self.decline(f"an allocation in memory format {mf}")
+@@ -567,7 +561,7 @@
+             return False
+         if not t.numel():
+             return True
+-        if not _is_non_overlapping_and_dense(t):
++        if not _is_non_overlapping_and_dense(t, self.values):
+             return False
+         nbytes = t.numel() * t.element_size()
+         self.record_launch(Memset(f"zero_ of {t._root.name}", (t.data_ptr(),), (t._root,), 0, 1, nbytes, 1, nbytes))
+@@ -995,10 +989,12 @@
+             fakes = [o for r, o in zip(schema.returns, rets) if r.alias_info is None]
+             fakes = [o for o in pytree.tree_leaves(fakes) if isinstance(o, torch.Tensor)]
+             binding, values, refusal = bind_at_trace(provider, func, args, kwargs, fakes)
+-            _guard_each([v == _hint(v) for v in values])
++            for v in values:
++                int(v)  # a guard: Eq(v, its value at the call)
+             # an operand on an eager step's output with a size-1 dim, whose stride there the warm-up may yet set to
+-            # eager's (_check_witness): the call binds after the trace (bind_opaque), at the key its rows then hold
+-            pending = {id(o._root) for o in self.eager_outputs if any(_hint(n) == 1 for n in o.shape)}
++            # eager's (_check_witness): the call binds after the trace (bind_opaque), at the key its rows then hold.
++            # Either way it is a keyed site: the choice reads the call, no guard
++            pending = {id(o._root) for o in self.eager_outputs if any(self.values(n) == 1 for n in o.shape)}
+             if binding is not None and any(isinstance(t, _TracedTensor) and id(t._root) in pending for t in leaves):
+                 binding = None
+             if refusal is not None:
+@@ -1949,14 +1945,11 @@
+ 
+ 
+ def _contiguous_strides(sizes: list) -> list:
+-    # c10::contiguous_strides: a zero size counts as 1 in the products (guarded
+-    # on the traced value so no other size's expression changes)
++    # c10::contiguous_strides: a zero size counts as 1 in the products (max(size, 1),
++    # a size the declared domains put at >= 1 itself)
+     strides: list = [1] * len(sizes)
+     for d in range(len(sizes) - 2, -1, -1):
+-        size = sizes[d + 1]
+-        if _hint(size) == 0 and bool(size == 0):
+-            size = 1
+-        strides[d] = strides[d + 1] * size
++        strides[d] = strides[d + 1] * torch.sym_max(sizes[d + 1], 1)
+     return strides
+ 
+ 
+@@ -2034,10 +2027,48 @@
+     return out
+ 
+ 
+-def _dense_terms(sizes: list, strides: list) -> list:
+-    # dense in the permutation the strides have at the trace
++def _empty_like_strides(sizes: list, strides: list, mf: Any, values: CallValues) -> list:
++    # at::native::empty_like's strides of a source's, each branch a guard
++    if mf not in (None, torch.preserve_format):
++        return _format_strides(sizes, mf)
++    # c10's is_contiguous: an empty tensor is
++    if bool(functools.reduce(operator.mul, sizes, 1) == 0) or _guard_each(_dense_terms(sizes, strides, values)):
++        return list(strides)
++    return _infer_dense_strides(sizes, strides)
++
++
++class _EagerMeta(TorchDispatchMode):
++    """Over meta tensors: an op's Python meta function (meta_table) with
++    eager's empty_like (_empty_like_strides, each branch a guard) where the
++    meta's own decides no size-1 or density condition; an op without one, its
++    meta kernel."""
++
++    @classmethod
++    def _should_skip_dynamo(cls):
++        return False
++
++    def __init__(self, values: CallValues) -> None:
++        super().__init__()
++        self.values = values
++
++    def __torch_dispatch__(self, func, types, args: tuple = (), kwargs=None):
++        kwargs = kwargs or {}
++        if func is aten.empty_like.default:
++            src = args[0]
++            strides = _empty_like_strides(list(src.shape), list(src.stride()), kwargs.get("memory_format"), self.values)
++            return torch.empty_strided(src.shape, strides, dtype=kwargs.get("dtype") or src.dtype, device="meta")
++        meta = torch._decomp.meta_table.get(func)
++        if meta is None:
++            return func(*args, **kwargs)
++        with self:
++            return meta(*args, **kwargs)
++
++
++def _dense_terms(sizes: list, strides: list, values: CallValues) -> list:
++    # dense in the permutation the strides have at the traced call (`values`): a choice the
++    # terms, each a guard, decide (they order the dims of size above 1 as it does)
+     order = sorted(
+-        range(len(sizes)), key=lambda d: (_hint(sizes[d]) < 2, _hint(strides[d]))
++        range(len(sizes)), key=lambda d: (values(sizes[d]) < 2, values(strides[d]))
+     )
+     terms, require = [], 1
+     for d in order:
+@@ -2495,10 +2526,10 @@
+ }
+ 
+ 
+-def _is_non_overlapping_and_dense(t: _TracedTensor) -> bool:
++def _is_non_overlapping_and_dense(t: _TracedTensor, values: CallValues) -> bool:
+     # c10 answers every other metadata query of a traced tensor from its
+     # symbols, each condition a guard; this one is an operator call
+-    return _guard_each(_dense_terms(list(t.shape), t._sym_strides))
++    return _guard_each(_dense_terms(list(t.shape), t._sym_strides, values))
+ 
+ 
+ class _TracedTensor(torch.Tensor):
+@@ -2591,8 +2622,8 @@
+     @classmethod
+     # pyrefly: ignore [bad-override]
+     def __torch_dispatch__(cls, func, types, args: tuple = (), kwargs=None):
+-        if func is aten.is_non_overlapping_and_dense.default:
+-            return _is_non_overlapping_and_dense(args[0])
++        if func is aten.is_non_overlapping_and_dense.default and (tr := current_trace()) is not None:
++            return _is_non_overlapping_and_dense(args[0], tr.values)
+         raise _declined(
+             f"{func} on a traced tensor outside its trace (fn kept it past the trace: fn must return the tensors it makes)"
+         )
+@@ -2615,7 +2646,7 @@
+         if current_trace() is not tr:
+             raise tr.decline(f"{func} on a thread other than the trace's")
+         if func is aten.is_non_overlapping_and_dense.default:
+-            return _is_non_overlapping_and_dense(args[0])
++            return _is_non_overlapping_and_dense(args[0], tr.values)
+         if tr.depth:
+             return self._dispatch(func, args, kwargs)
+         tr.depth += 1
+@@ -2634,7 +2665,7 @@
+             # allocates and reinterprets below the dispatcher at the warm-up
+             return out
+         k = len(tr.order)
+-        tr.order.append(_order_key(func, args, kwargs, out, _traced_layout))
++        tr.order.append(_order_key(func, args, kwargs, out, tr.values))
+         for i, o in enumerate(o for o in pytree.tree_leaves(out) if isinstance(o, torch.Tensor)):
+             if isinstance(o, _TracedTensor) and o._origin is None:
+                 o._origin = (k, i)
+@@ -2910,12 +2941,11 @@
+     return tuple(t.shape), tuple(t.stride()), t.storage_offset(), t.dtype, t.device
+ 
+ 
+-def _traced_layout(t: torch.Tensor) -> tuple:
++def _traced_layout(t: torch.Tensor, values: CallValues) -> tuple:
++    # t's layout at the traced call
+     if not isinstance(t, _TracedTensor):  # a host buffer
+         return _real_layout(t)
+-    sizes = tuple(_hint(s) for s in t.shape)
+-    strides = tuple(_hint(s) for s in t._sym_strides)
+-    return sizes, strides, _hint(t._sym_offset), t.dtype, t.device
++    return tuple(map(values, t.shape)), tuple(map(values, t._sym_strides)), values(t._sym_offset), t.dtype, t.device
+ 
+ 
+ def _addressing(layout: tuple) -> tuple:
+@@ -2934,21 +2964,24 @@
+     return _addressing(layout)
+ 
+ 
+-def _call_key(func: Any, args: tuple, kwargs: dict, layout: Callable) -> tuple:
+-    # an operator call by its tensor arguments' layouts and int arguments
++def _call_key(func: Any, args: tuple, kwargs: dict, values: CallValues | None) -> tuple:
++    # an operator call by its tensor arguments' layouts and int arguments, at
++    # the traced call's `values` (None: a warm-up call's, of real tensors)
++    layout = _real_layout if values is None else functools.partial(_traced_layout, values=values)
+     key: list[Any] = [func]
+     for a in pytree.tree_leaves((args, kwargs)):
+         if isinstance(a, torch.Tensor):
+             key.append(_layout_key(layout(a)))
+         elif isinstance(a, (int, torch.SymInt, torch.SymBool)):
+-            key.append(_hint(a))
++            key.append(a if values is None else values(a))
+     return tuple(key)
+ 
+ 
+-def _order_key(func: Any, args: tuple, kwargs: dict, out: Any, layout: Callable) -> tuple:
++def _order_key(func: Any, args: tuple, kwargs: dict, out: Any, values: CallValues | None) -> tuple:
+     # a call of fn's by its key and its tensor outputs' layouts
++    layout = _real_layout if values is None else functools.partial(_traced_layout, values=values)
+     outs = tuple(_layout_key(layout(o)) for o in pytree.tree_leaves(out) if isinstance(o, torch.Tensor))
+-    return _call_key(func, args, kwargs, layout), outs
++    return _call_key(func, args, kwargs, values), outs
+ 
+ 
+ def _order_repr(key: tuple | None) -> str:
+@@ -2979,12 +3012,12 @@
+             out = tuple(seed_offset_on_device(func, list(out), args[0].device))
+         if func is aten.detach.default:
+             return out
+-        key = _call_key(func, args, kwargs, _real_layout)
++        key = _call_key(func, args, kwargs, None)
+         tensors = [o for o in pytree.tree_leaves(out) if isinstance(o, torch.Tensor)]
+         self.calls.setdefault(key, []).append([_real_layout(o) for o in tensors])
+         if func in _ALLOC_OPS or func.is_view:
+             return out
+-        self.order.append(_order_key(func, args, kwargs, out, _real_layout))
++        self.order.append(_order_key(func, args, kwargs, out, None))
+         self.outputs.append([weakref.ref(o) for o in tensors])
+         return out
+ 
+@@ -3008,13 +3041,15 @@
+     check) included, and dispatched to the same operators (which SDPA
+     backend). Under trusted inputs Dynamo's guards stand for this."""
+     keyed = []
++    values = tr.values
+     hosts = {id(call) for _, call in tr.aten_calls}
+     for _, call in heapq.merge(tr.launches, tr.aten_calls, key=operator.itemgetter(0)):
+         if isinstance(call, EagerCall) and not isinstance(call.target, tuple):
+-            key = _call_key(call.target, call.args, call.kwargs, _traced_layout)
++            key = _call_key(call.target, call.args, call.kwargs, values)
+             keyed.append((key, call))
+     counts = collections.Counter(key for key, _ in keyed)
+     seen: collections.Counter = collections.Counter()
++    inexact: set[int] = set()  # roots whose size-1 strides are the fake kernel's, not eager's
+     for key, call in keyed:
+         real = witness.calls.get(key, [])
+         k, seen[key] = seen[key], seen[key] + 1
+@@ -3030,21 +3065,27 @@
+         for i, o in enumerate(call.outputs):
+             if id(o) in arguments:
+                 continue
+-            want = _traced_layout(o)
+-            if got[i] != want and _addressing(got[i]) == _addressing(want):
++            want = _traced_layout(o, values)
++            if got[i] != want and _addressing(got[i]) == _addressing(want) and id(call) not in hosts:
+                 # predict the op's own size-1 strides, which a replay checks: eager's where the size is 1
+-                # (a select over a symbolic size), the trace's elsewhere
+-                o._sym_strides = [
+-                    s if n != 1 or r == _hint(s) else r if type(z) is int else torch.cuda._host_trace.select(z == 1, r, s)
+-                    for n, z, r, s in zip(want[0], o.shape, got[i][1], o._sym_strides)
+-                ]
+-            elif got[i] != want:
++                # (a select over a symbolic size), the trace's elsewhere. With no rule they stay the fake's
++                if (strides := _size_one_strides(tr, call, i, want, got[i])) is None:
++                    inexact.add(id(o._root))
++                else:
++                    o._sym_strides = strides
++            elif got[i] != want and _addressing(got[i]) != _addressing(want):
+                 e = declined(
+                     f"{call.name} output {i} is (sizes, strides, storage offset, dtype, device) "
+                     f"{got[i]} at the warm-up; {what} predicted {want}"
+                 )
+                 e.meta_op = None if id(call) in hosts else call.target
+                 raise e
++    # an opaque call keyed on such a stride would key another than eager's: it runs eagerly, unbound
++    for k, (seq, rec) in enumerate(tr.launches):
++        leaves = pytree.tree_leaves((rec.args, rec.kwargs)) if isinstance(rec, OpaqueCall) else ()
++        if any(isinstance(t, _TracedTensor) and id(t._root) in inexact for t in leaves):
++            why = f"{rec.target} reads an eager output's size-1 stride, eager's at the warm-up and not its fake kernel's"
++            tr.launches[k] = seq, EagerCall(rec.target, rec.args, rec.kwargs, rec.outputs, why, rec.generator, rec.state)
+     for k, (got, want) in enumerate(itertools.zip_longest(witness.order, tr.order) if tr.trusted is None else ()):
+         if got != want:
+             e = declined(f"fn's call {k} is {_order_repr(want)} in the trace; at the warm-up {_order_repr(got)}")
+@@ -3052,6 +3093,63 @@
+             raise e
+ 
+ 
++def _size_one_strides(tr: _Trace, call: EagerCall, i: int, want: tuple, got: tuple) -> list | None:
++    """Output i of an eager call whose fake kernel predicted another stride
++    than eager's on a dim of size 1 at the call: its strides with eager's
++    rule there, select(size == 1, rule, the fake's), the rule
++    _size_one_rule's, evaluated at the call to be eager's. None where a dim
++    has none."""
++    o = call.outputs[i]
++    strides = list(o._sym_strides)
++    for d, (n, z, r, s) in enumerate(zip(want[0], o.shape, got[1], o._sym_strides)):
++        if n != 1 or r == want[1][d]:
++            continue
++        rule = None if type(z) is int else _size_one_rule(tr, call, i, d, z)
++        if rule is None or tr.values(rule) != r:
++            return None
++        strides[d] = torch.cuda._host_trace.select(z == 1, rule, s)
++    return strides
++
++
++def _size_one_rule(tr: _Trace, call: EagerCall, i: int, d: int, z: Any) -> Any:
++    """Output i's stride d at size z = 1: the op's meta at the operands with
++    each dim of size z at 1, under eager's empty_like (_EagerMeta). Each
++    condition it guards, which held at the call, is guarded where z is 1
++    (Or(z != 1, g)). None where it raises or returns another shape, or off
++    the IR backend."""
++    env = tr.shape_env
++    if not isinstance(call.target, OpOverload) or not isinstance(env, _ir.Env):
++        return None
++
++    def at_one(t: torch.Tensor) -> torch.Tensor:
++        if not isinstance(t, _TracedTensor):
++            return t.to("meta")
++        sizes = [1 if _same(n, z) else n for n in t.shape]
++        return torch.empty(0, dtype=t.dtype, device="meta").as_strided(sizes, t._sym_strides, t._sym_offset)
++
++    mark = len(env.records)
++    args = pytree.tree_map_only(torch.SymInt, lambda v: 1 if _same(v, z) else v, (call.args, call.kwargs))
++    try:
++        with unset_fake_temporarily():
++            with torch._C._DisablePythonDispatcher():
++                twins = pytree.tree_map_only(torch.Tensor, at_one, args)
++            with _EagerMeta(tr.values):
++                out = call.target(*twins[0], **twins[1])
++    except Exception:
++        env.forget(mark)
++        return None
++    conditions = env.records[mark:]
++    env.forget(mark)
++    outs = [t for t in pytree.tree_leaves(out) if isinstance(t, torch.Tensor)]
++    if len(outs) != len(call.outputs) or outs[i].dim() <= d or not _same(outs[i].shape[d], 1):
++        return None
++    ctx, at_size = env.ctx, _sym_key(z)
++    other = ctx.ne(at_size, ctx.const(1))
++    for g, _ in conditions:
++        env.guard_bool(ctx.or_(other, g))
++    return outs[i].stride()[d]
++
++
+ def _metadata(t: torch.Tensor) -> tuple:
+     base = t.const_data_ptr() - t.storage_offset() * t.element_size()  # type: ignore[attr-defined]
+     return tuple(t.shape), t.stride(), t.storage_offset(), t.dtype, base
+@@ -3482,7 +3580,8 @@
+                 if refusal is not None:
+                     return None
+                 if binding is not None and all(type(t.storage_offset()) is int for t in fresh):
+-                    _guard_each([v == _hint(v) for v in values])
++                    for v in values:
++                        int(v)  # a guard: Eq(v, its value at the call)
+                     tr._seq = itertools.count(seq + shift)
+                     tr.generator = rec.generator
+                     first, tr.launches = len(tr.allocs), []

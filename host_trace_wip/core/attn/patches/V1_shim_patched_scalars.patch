@@ -1,0 +1,103 @@
+--- a/trtllm_shim.py
++++ b/trtllm_shim.py
+@@ -8,6 +8,11 @@
+ # Operand roles as in SGLang's shim: decode writes the workspace and the multi-CTA counters (reset to 0 by the
+ # kernel); context without lse reads neither. vLLM passes no counter buffer, so FlashInfer allocates a fresh zeroed
+ # one per call (an aten.zeros per layer); the ops get COUNTERS, one persistent zeroed buffer.
++import functools
++import importlib.util
++import os
++import sys
++
+ import torch
+ 
+ import flashinfer
+@@ -21,12 +26,12 @@
+ _lib = torch.library.Library("vllm_ht", "DEF")
+ _lib.define(
+     "trtllm_decode(Tensor query, Tensor k_cache, Tensor v_cache, Tensor(a!) workspace, Tensor(b!) counters, Tensor block_tables, "
+-    "Tensor seq_lens, Tensor(c!) out, float bmm1_scale, float bmm2_scale, int max_seq_len, int window_left) -> ()"
++    "Tensor seq_lens, Tensor(c!) out, float bmm1_scale, float bmm2_scale, SymInt max_seq_len, int window_left) -> ()"
+ )
+ _lib.define(
+     "trtllm_context(Tensor query, Tensor k_cache, Tensor v_cache, Tensor workspace, Tensor counters, Tensor block_tables, "
+     "Tensor seq_lens, Tensor cum_seq_lens_q, Tensor cum_seq_lens_kv, Tensor(a!) out, float bmm1_scale, float bmm2_scale, "
+-    "SymInt max_q_len, int max_kv_len, SymInt batch_size, int window_left) -> ()"
++    "SymInt max_q_len, SymInt max_kv_len, SymInt batch_size, int window_left) -> ()"
+ )
+ 
+ 
+@@ -49,6 +54,61 @@
+ torch.library.register_fake("vllm_ht::trtllm_decode", lambda *a: None, lib=_lib)
+ torch.library.register_fake("vllm_ht::trtllm_context", lambda *a: None, lib=_lib)
+ 
++# The harvest's patched scalars (HarvestProvider(patched=...)): the KV length a binding takes as a slot, keyed on what the
++# launcher's kernel selection and CTA config read of it (FlashInfer's fmhaKernels.cuh, through the fork's port of it,
++# flashinfer/trtllm_trace.py): a context call reads max_kv only into its params (selectKernel's tile choice is
++# generation's), a decode call (one query token) also into its split count, min(ceil(max_kv / (2 stepKv)),
++# max(1, SMs // (ctasQ * ctasY * batch))), which picks the multi-CTA mode and the grid. A sliding window compares
++# max_kv with the window: the key holds max_kv itself there.
++_PORT = os.environ.get("ARMV_TRTLLM_PORT", "/data/eellison/src/pytorch/agent_space/paramgraph/land/scratch/sglang/fork/flashinfer/trtllm_trace.py")
++
++
++@functools.cache
++def _port():
++    spec = importlib.util.spec_from_file_location("_trtllm_port", _PORT)
++    port = importlib.util.module_from_spec(spec)
++    sys.modules["_trtllm_port"] = port  # its dataclasses look their module up
++    spec.loader.exec_module(port)
++    return port
++
++
++@functools.cache
++def _decode_config(dtype, heads_q, heads_kv, head_dim, page, device):
++    # the first selection pass's kernel (Gmem reduction), whose stepKv the split reads, and ctasQ * ctasY
++    T = _port()
++    props = torch.cuda.get_device_properties(device)
++    dt = T._DTYPES[dtype]
++    p = T.Runner(dtype_q=dt, dtype_kv=dt, dtype_o=dt, kernel_type=T.GENERATION, mask=T.CAUSAL, scheduler=T.STATIC, multi=True,
++                 hd_qk=head_dim, hd_v=head_dim, heads_q=heads_q, heads_kv=heads_kv, page=page, max_q=1, max_kv=1, batch=1, sum_q=1,
++                 pages_per_seq=1, pool=1, window=T.INT_MAX, sm_count=props.multi_processor_count, skips_softmax=False,
++                 fp16_softmax=False, spcompress=False, transform=T.TRANSFORM_FULL)
++    k = T.Kernels(p, props.major * 10 + props.minor, props.shared_memory_per_block_optin)
++    s = T.Select.of(p)
++    k.select(s)
++    m = k.meta(s)
++    per_cta = min(p.heads_q_per_kv, m.step_q) if m.groups_heads_q else 1
++    return m.step_kv, (heads_q // per_cta) * (m.hd_v // s.hd_per_cta_v), props.multi_processor_count
++
++
++def _decode_class(query, k_cache, v_cache, workspace, counters, block_tables, seq_lens, out, bmm1_scale, bmm2_scale, max_seq_len,
++                  window_left):
++    if window_left != -1:
++        return max_seq_len
++    # the heads, head dim and page are the model's: specialized
++    dims = (int(query.shape[1]), int(k_cache.shape[1]), int(query.shape[-1]), int(k_cache.shape[2]))
++    step, ctas, sms = _decode_config(query.dtype, *dims, query.device.index)
++    return torch.sym_min((max_seq_len + 2 * step - 1) // (2 * step), torch.sym_max(1, sms // (ctas * query.shape[0])))
++
++
++def _context_class(query, k_cache, v_cache, workspace, counters, block_tables, seq_lens, cum_seq_lens_q, cum_seq_lens_kv, out,
++                   bmm1_scale, bmm2_scale, max_q_len, max_kv_len, batch_size, window_left):
++    return max_kv_len if window_left != -1 else 0
++
++
++def patched():
++    return {torch.ops.vllm_ht.trtllm_decode.default: ("max_seq_len", _decode_class),
++            torch.ops.vllm_ht.trtllm_context.default: ("max_kv_len", _context_class)}
++
+ # keyword arguments the ops cover only at these values
+ _DECODE = {"sinks": None, "o_sf_scale": None, "kv_layout": "HND", "backend": "trtllm-gen", "q_len_per_req": 1, "max_q_len": None,
+            "cum_seq_lens_q": None, "kv_cache_sf": None, "lse": None, "return_lse": False}
+--- a/adapter.py
++++ b/adapter.py
+@@ -326,6 +326,9 @@
+         if LEND_GROUPS and "lend_alias_groups" in HarvestProvider.__init__.__code__.co_varnames:
+             kw["lend_alias_groups"] = True
+         self.md_stock_tried, self.md_stock_why = {}, {}  # MD_STOCK_DIAG
++        if not TRTLLM_FORK and "patched" in HarvestProvider.__init__.__code__.co_varnames:
++            # the trtllm-gen ops' KV length a slot of their bindings, keyed on its split class (core attn lane, item d)
++            kw["patched"] = trtllm_shim.patched()
+         self.provider = HarvestProvider(FAMILIES + ("extern",), extern_ops=extern, indexed=indexed, **kw)
+         self.entries = {}  # key -> HostTraceReplay
+         self.calls = collections.Counter()

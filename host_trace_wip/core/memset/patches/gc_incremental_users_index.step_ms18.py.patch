@@ -1,0 +1,132 @@
+diff -ru -x __pycache__ step_ms18/test/test_cuda_host_trace_opaque.py step_ms19/test/test_cuda_host_trace_opaque.py
+--- step_ms18/test/test_cuda_host_trace_opaque.py	2026-10-16 11:10:43.187256968 -0700
++++ step_ms19/test/test_cuda_host_trace_opaque.py	2026-10-17 14:14:00.316196172 -0700
+@@ -832,6 +832,24 @@
+                     self.assertEqual(f(x, base[:n]), mul_chain(x, base[:n]), atol=0, rtol=0)
+         self.assertEqual((len(f.variants), len(bound(f)), f.eager), (1, 1, 0))
+ 
++    def test_a_new_keys_row_rebuilds_no_users_index(self):
++        # a row at a new key reads the rows and bases the site's rows read already: the users index is kept (the
++        # call that selects the row patches its nodes), not rebuilt per new key (8B churn's mixed steps, 2.5-3 ms each)
++        p = TableProvider()
++        f = HostTraceReplay(mul_chain, opaque=(p,))
++        sizes = (512, 640, 768, 896, 1024)
++        args = {n: (torch.randn(n, device="cuda"), torch.randn(n, device="cuda")) for n in sizes}
++        # the site's first row past its traced one notes what its rows read (one rebuild)
++        for n in sizes[:2] * 2:
++            self.assertEqual(f(*args[n]), mul_chain(*args[n]), atol=0, rtol=0)
++        before = torch._C._host_trace_index_counts()
++        for n in sizes[2:]:
++            self.assertEqual(f(*args[n]), mul_chain(*args[n]), atol=0, rtol=0)
++            self.assertEqual(f(*args[n]), mul_chain(*args[n]), atol=0, rtol=0)
++        after = torch._C._host_trace_index_counts()
++        self.assertEqual((len(f.variants), f.traces), (1, 1))
++        self.assertEqual((after[0] - before[0], after[1] - before[1]), (0, len(sizes) - 2))
++
+     @unittest.expectedFailure  # the native entry does not yet fill a keyed site's row from a binding the provider holds (SPLIT_PIPELINE.md)
+     def test_a_held_binding_at_a_new_key_is_a_native_hit(self):
+         # keys another replay learned: a new replay's keyed site meets each at a new size with its binding in the
+diff -ru -x __pycache__ step_ms18/test/test_cuda_host_trace_replay.py step_ms19/test/test_cuda_host_trace_replay.py
+--- step_ms18/test/test_cuda_host_trace_replay.py	2026-10-16 11:11:40.244878371 -0700
++++ step_ms19/test/test_cuda_host_trace_replay.py	2026-10-17 14:00:27.634364052 -0700
+@@ -5597,6 +5597,51 @@
+         self.assertLessEqual(max(n for n, _ in rows), 300, rows)
+         self.assertEqual([g for _, g in rows], [0] * len(rows), rows)
+ 
++    @parametrize("how", ["trace", "redispatch", "fold"])
++    def test_an_incremental_walk_untracks_a_subset_of_a_full_walk(self, how):
++        # at each settle the incremental walk (skipping what earlier settles left tracked) would untrack nothing a
++        # walk over everything still tracked would not (what it misses, a later full walk untracks:
++        # test_an_incremental_walk_walks_fewer_objects); then the settle's real walk runs
++        rows = []
++        real = _host_trace_replay._gc_untrack
++
++        def compare(roots):
++            roots = list(roots)
++            kinds, flags = _host_trace_replay._GC_KINDS, _host_trace_replay._gc_flags
++            # as ids: a list of the objects would hold a reference against a container's final
++            full = {id(o) for o in torch._C._host_trace_gc_untrack(roots, kinds, flags, None, True)}
++            incremental = {id(o) for o in torch._C._host_trace_gc_untrack(roots, kinds, flags, gc.get_objects(generation=0), True)}
++            rows.append((len(full), len(incremental - full), len(full - incremental)))
++            real(roots)
++
++        f = HostTraceReplay(_choice if how == "fold" else _layer, static_shapes=(0,) if how == "trace" else ())
++        if how == "fold":
++            f._redispatch = lambda *args: FoldRefused("")
++        with mock.patch.object(_host_trace_replay, "_gc_untrack", compare):
++            self._per_call(f, (16, 8, 24, 40, 56) if how == "trace" else (16, 24, 40))
++        self.assertTrue(rows)
++        self.assertEqual([extra for _, extra, _ in rows], [0] * len(rows), rows)
++        self.assertGreater(sum(n - missed for n, _, missed in rows), 0, rows)
++
++    def test_an_incremental_walk_walks_fewer_objects(self):
++        # a fold extends a variant: incremental walks do not walk again what the earlier settles left tracked, and a
++        # full walk runs once they have walked as many objects as the last full walk did
++        def walked(incremental):
++            with mock.patch.object(_host_trace_replay, "gc_untrack_incremental", incremental), mock.patch.object(_host_trace_replay, "_gc_walks", [0, 0, 0]) as walks:
++                f = HostTraceReplay(_choice)
++                f._redispatch = lambda *args: FoldRefused("")
++                before = torch._C._host_trace_gc_untrack_counts()
++                rows = self._per_call(f, (16, 24, 40, 56, 72, 88))
++                after = torch._C._host_trace_gc_untrack_counts()
++            self.assertLessEqual(max(n for n, _ in rows), 300, rows)
++            return after[0] - before[0], after[1] - before[1], walks[2]
++
++        full, incremental = walked(False), walked(True)
++        self.assertEqual(full[1], 0)
++        self.assertGreater(incremental[1], 0)
++        self.assertLess(incremental[0], full[0])
++        self.assertGreaterEqual(incremental[2], 1)
++
+     def test_untracking_is_off_without_the_switch(self):
+         with mock.patch.object(_host_trace_replay, "gc_untrack", False):
+             f = HostTraceReplay(_layer, static_shapes=(0,))
+diff -ru -x __pycache__ step_ms18/torch/cuda/_host_trace_replay.py step_ms19/torch/cuda/_host_trace_replay.py
+--- step_ms18/torch/cuda/_host_trace_replay.py	2026-10-16 11:10:43.186274338 -0700
++++ step_ms19/torch/cuda/_host_trace_replay.py	2026-10-17 14:14:00.315768650 -0700
+@@ -63,6 +63,7 @@
+ import functools
+ import dataclasses
+ import inspect
++import gc
+ import itertools
+ import logging
+ import queue
+@@ -155,6 +156,11 @@
+ # a slow call that builds or extends variants untracks their immutable Python state from the cyclic collector
+ # (_gc_untrack), so a gen-2 collection walks about none of a trace's objects. False: every object stays tracked
+ gc_untrack = True
++# whether a walk skips the immutable and final objects an earlier settle left tracked (O(the call's new objects));
++# False: every walk is from the roots over everything still tracked
++gc_untrack_incremental = True
++# objects the incremental walks visited since the last full walk, objects that walk visited, full walks (_gc_untrack)
++_gc_walks = [0, 0, 0]
+ 
+ 
+ def _exact_class(contract: tuple, args: Sequence[Any]) -> tuple:
+@@ -1732,8 +1738,24 @@
+     and outlive it; the containers folds, redispatches and relowers extend
+     stay tracked. A walk stops at an untracked object, so a variant extended
+     again costs its tracked state, not its whole tape."""
+-    if gc_untrack and hasattr(torch._C, "_host_trace_gc_untrack"):
++    if not gc_untrack or not hasattr(torch._C, "_host_trace_gc_untrack"):
++        return
++    if not gc_untrack_incremental or not hasattr(torch._C, "_host_trace_gc_untrack_incremental"):
+         torch._C._host_trace_gc_untrack(list(roots), _GC_KINDS, _gc_flags)
++        return
++    # an incremental walk untracks a subset of what a full one would (an old object that has become sealable since
++    # its settle is not seen); a full walk runs once the incremental walks since the last one have visited as many
++    # objects as it did, so the walks cost about twice the incremental ones and nothing stays tracked for good
++    full = _gc_walks[0] >= _gc_walks[1]
++    before = torch._C._host_trace_gc_untrack_counts()[0]
++    # collections are held through the slow call (_gc_hold): generation 0 holds every object it made
++    torch._C._host_trace_gc_untrack(list(roots), _GC_KINDS, _gc_flags, None if full else gc.get_objects(generation=0))
++    walked = torch._C._host_trace_gc_untrack_counts()[0] - before
++    if full:
++        _gc_walks[0], _gc_walks[1] = 0, walked
++        _gc_walks[2] += 1
++    else:
++        _gc_walks[0] += walked
+ 
+ 
+ def _site_classes(sites: Sequence[LoweredKeyedSite]) -> list[int]:
