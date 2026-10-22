@@ -4,37 +4,231 @@
 
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/jiterator.h>
+
+#include <cstring>
+#include <deque>
 #include <ATen/cuda/jiterator_impl.h>
+#ifndef USE_ROCM
+#include <ATen/cuda/host_trace/SymDynamic.h>
+#endif
 
 #include <iostream>
 #include <utility>
 namespace at {
 namespace native {
 
+#ifndef USE_ROCM
+// the arguments launch_jitted_pwise_function takes from the launches below,
+// their offset calculators, loader and storer built again from iter; the
+// scalar argument, which a NoScalar kernel never reads, of no class (eager
+// passes a float of any compute type), each extra argument its Scalar's
+C10_NOINLINE void report_dynamic_launch(
+    const at::cuda::jit::NvrtcFunction& fn, uint32_t grid, const TensorIteratorBase& iter, int64_t N,
+    bool vectorized, bool contiguous, bool dynamic_casting, const c10::SmallVector<at::Scalar>& extra_args) {
+  at::cuda::host_trace::LaunchLayout l{reinterpret_cast<cudaFunction_t>(fn.function), grid, num_threads(), {}, {}};
+  auto param = [&](const auto& v) { report_param(l, v); };
+  param(static_cast<int>(N));
+  ArrayVariant(iter).visit(param);
+  if (!vectorized) {
+    if (contiguous) {
+      TrivialOffsetCalculatorVariant(iter.ninputs()).visit(param);
+      TrivialOffsetCalculatorVariant(iter.noutputs()).visit(param);
+    } else {
+      OffsetCalculatorVariant</*is_input=*/true>(iter).visit(param);
+      OffsetCalculatorVariant</*is_input=*/false>(iter).visit(param);
+    }
+    if (dynamic_casting) {
+      LoadWithCastVariant(iter).visit(param);
+      StoreWithCastVariant(iter).visit(param);
+    } else {
+      param(memory::LoadWithoutCast());
+      param(memory::StoreWithoutCast());
+    }
+  }
+  const size_t scalar_size = c10::elementSize(toOpMathType(iter.common_dtype()));
+  l.classes.emplace_back(scalar_size, '.');
+  l.bytes.emplace_back(scalar_size, '\0');
+  for (const auto& a : extra_args) {
+    const size_t size = c10::elementSize(a.type());
+    l.classes.emplace_back(size, 's');
+    l.bytes.emplace_back(static_cast<const char*>(a.data_ptr()), size);
+  }
+  at::cuda::host_trace::report_launch_layout(std::move(l));
+}
+#endif
+
+// A dynamic launch's parameters as the host kind holds them: addresses of the
+// values for an eager launch (launch_jitted_pwise_function), descriptors for a
+// symbolic iterator's recorded one (host_trace::SymHost)
+template <class H>
+struct DynParams {
+  std::vector<const void*> ptrs;
+  void add(const void* p) {
+    ptrs.push_back(p);
+  }
+  void launch(const at::cuda::jit::NvrtcFunction& fn, uint32_t grid) {
+    at::cuda::jit::launch_jitted_pwise_function(fn, ptrs.data(), {grid, 1u, 1u}, {num_threads(), 1u, 1u});
+  }
+};
+
+#ifndef USE_ROCM
+template <>
+struct DynParams<at::cuda::host_trace::SymHost> {
+  std::vector<at::cuda::host_trace::ArgDesc> descs;
+  // bytes a descriptor points at that the params own (a zeroed loader's)
+  std::deque<std::vector<uint8_t>> scratch;
+  void add(const at::cuda::host_trace::ArgDesc& d) {
+    descs.push_back(d);
+  }
+  void launch(const at::cuda::jit::NvrtcFunction& fn, const c10::SymInt& grid) {
+    at::cuda::host_trace::record_function(reinterpret_cast<cudaFunction_t>(fn.function), descs.data(), descs.size(), grid, num_threads(), 0);
+  }
+};
+#endif
+
+// the operands' data parameter: the char* array, or their symbolic addresses
+template <class H>
+struct DynData;
+
+template <>
+struct DynData<EagerHost> {
+  explicit DynData(const TensorIteratorBase& iter) : array(iter) {
+    for (auto i = 0; i < iter.ntensors(); ++i) {
+      pointers.push_back(static_cast<char*>(iter.data_ptr(i)));
+    }
+  }
+  void add_to(DynParams<EagerHost>& p) {
+    p.add(array.data_ptr());
+  }
+  ArrayVariant array;
+  c10::SmallVector<char*, 16> pointers;
+};
+
+#ifndef USE_ROCM
+template <>
+struct DynData<at::cuda::host_trace::SymHost> {
+  explicit DynData(const TensorIteratorBase& iter) {
+    for (auto i = 0; i < iter.ntensors(); ++i) {
+      pointers.push_back(at::cuda::host_trace::operand_address(iter, i));
+    }
+  }
+  void add_to(DynParams<at::cuda::host_trace::SymHost>& p) {
+    p.add(at::cuda::host_trace::pointers_desc(pointers.data(), pointers.size()));
+  }
+  c10::SmallVector<c10::SymInt, 16> pointers;
+};
+#endif
+
+// a parameter that is a value's bytes (an offset calculator of no state, a
+// loader, a storer, a scalar, an extra argument)
+template <class H>
+void add_bytes(DynParams<H>& p, const void* value, size_t size) {
+#ifndef USE_ROCM
+  if constexpr (H::symbolic) {
+    p.add(at::cuda::host_trace::bytes_desc(value, size));
+    return;
+  } else
+#endif
+  {
+    p.add(value);
+  }
+}
+
+// the variant's held value as a bytes parameter
+template <class H, class Variant>
+void add_variant(DynParams<H>& p, Variant& v) {
+#ifndef USE_ROCM
+  if constexpr (H::symbolic) {
+    v.visit([&](const auto& x) {
+      using T = std::decay_t<decltype(x)>;
+      const void* bytes = &x;
+      if constexpr (requires { x.dtypes; x.element_sizes; }) {
+        // a LoadWithCast / StoreWithCast: its members on zeroed bytes, so its
+        // padding is the same at every trace (eager zeroes it while harvesting)
+        auto& z = p.scratch.emplace_back(sizeof(T), 0);
+        const T& r = *reinterpret_cast<const T*>(z.data());
+        std::memcpy(z.data() + (reinterpret_cast<const char*>(&r.dtypes) - reinterpret_cast<const char*>(&r)), &x.dtypes, sizeof(x.dtypes));
+        std::memcpy(z.data() + (reinterpret_cast<const char*>(&r.element_sizes) - reinterpret_cast<const char*>(&r)), &x.element_sizes, sizeof(x.element_sizes));
+        bytes = z.data();
+      } else if constexpr (std::is_empty_v<T>) {
+        // an empty one's byte (a trivial offset calculator, a plain loader): zero
+        bytes = p.scratch.emplace_back(sizeof(T), 0).data();
+      }
+      auto d = at::cuda::host_trace::bytes_desc(bytes, sizeof(T));
+      d.align = alignof(T);
+      p.add(d);
+    });
+    return;
+  } else
+#endif
+  {
+    p.add(v.data_ptr());
+  }
+}
+
+// the count, data and (unrolled) offsets, loader and storer parameters are in
+// p; the scalar (unused, 0) and extra arguments are appended here
+template <class H>
+static void add_scalar_and_extra_args(DynParams<H>& p, const float& scalar_val, const c10::SmallVector<at::Scalar>& extra_args) {
+  add_bytes(p, &scalar_val, sizeof(float));
+  for (const auto& a : extra_args) {
+    add_bytes(p, a.data_ptr(), c10::elementSize(a.type()));
+  }
+}
+
+template <class H>
+static void add_count(DynParams<H>& p, const typename H::int_t& N) {
+#ifndef USE_ROCM
+  if constexpr (H::symbolic) {
+    p.add(at::cuda::host_trace::int_desc(N));
+    return;
+  } else
+#endif
+  {
+    p.add(&N);
+  }
+}
+
+// each route's jitted kernels: one cache, whichever host kind (eager, or a
+// CUDA graph host trace's symbolic one) asks for them
+struct JitCache {
+  std::mutex mutex;
+  std::unordered_map<std::string, at::cuda::jit::NvrtcFunction> fns;
+};
+
+JitCache& vectorized_cache() {
+  static JitCache cache;
+  return cache;
+}
+
+JitCache& unrolled_cache() {
+  static JitCache cache;
+  return cache;
+}
+
+template <class H>
 static inline void launch_jitted_vectorized_kernel_dynamic(
   const std::string& name, TensorIteratorBase& iter,
-  DeviceIndex dev_idx, int64_t N, const std::string& f, const void* data_ptr,
+  DeviceIndex dev_idx, const typename H::int_t& N, const std::string& f, DynData<H>& data,
   const c10::SmallVector<at::Scalar>& extra_args, bool return_by_ref) {
-  TORCH_INTERNAL_ASSERT(N > 0 && N <= std::numeric_limits<int32_t>::max());
+  if constexpr (!H::symbolic) {
+    TORCH_INTERNAL_ASSERT(N > 0 && N <= std::numeric_limits<int32_t>::max());
+  }
 
   int nInputs = iter.ninputs();
   int nOutputs = iter.noutputs();
   const at::ScalarType common_dtype = iter.common_dtype();
 
   int tws = at::cuda::jit::calc_thread_work_size(nInputs, nOutputs, common_dtype, common_dtype);
-  int vec_size = jitted_can_vectorize_up_to(iter);
+  using pointer_t = typename decltype(data.pointers)::value_type;
+  int vec_size = jitted_can_vectorize_up_to<pointer_t>(iter, data.pointers);
 
   int bws = tws * num_threads();
-  // N is still int64_t for the computation, but it's always safe to cast result to int
-  const uint32_t grid = (N + bws - 1) / bws;
+  const std::conditional_t<H::symbolic, c10::SymInt, uint32_t> grid = (N + bws - 1) / bws;
 
   bool vectorized = vec_size > 1;
 
   // Different kernels are compiled depending on what we're vectorizing up to (1, 2 or 4 elements)
-  //   fn_ptr is set to the appropriate function based on the vec size and GPU used
-  // TODO: Memory use can probably be optimized by reusing kernels across GPUs with
-  //   the same compute capability
-
   std::string f_inputs_type_str = at::cuda::jit::typeName(common_dtype);
   std::string compute_type_str = at::cuda::jit::typeName(toOpMathType(common_dtype));
   std::string result_type_str = at::cuda::jit::typeName(common_dtype);
@@ -47,12 +241,10 @@ static inline void launch_jitted_vectorized_kernel_dynamic(
   ss << static_cast<int>(at::cuda::jit::BinaryFuncVariant::NoScalar);
   ss << extra_args_types;
   ss << vec_size;
-// DeviceIndex, e.g. int8_t, is not treated as a number by the stream, cast to int as a workaround
   ss << static_cast<int>(dev_idx);
   const std::string cache_key = std::move(ss).str();
 
-  static std::mutex _jiterator_mutex;
-  static std::unordered_map<std::string, at::cuda::jit::NvrtcFunction> fns;
+  auto& [_jiterator_mutex, fns] = vectorized_cache();
   at::cuda::jit::NvrtcFunction* fn_ptr = &fns[cache_key];
 
   if (!fn_ptr->function) {
@@ -74,59 +266,46 @@ static inline void launch_jitted_vectorized_kernel_dynamic(
   }
 
   // size of `extra_args` is unknown at compile-time
-  auto extra_args_size = extra_args.size();
-
   float scalar_val = 0;
 
-  if (vectorized) {
-    // pack args for kernel launch
-    constexpr int kernel_args = 3;
-    auto args = std::make_unique<const void*[]>(kernel_args + extra_args_size);
-    args[0] = &N;
-    args[1] = data_ptr;
-    args[2] = &scalar_val;
-
-    for (const auto i : c10::irange(extra_args_size)) {
-      // since 3 slots are already filled in `args`
-      args[i + 3] = extra_args[i].data_ptr();
+#ifndef USE_ROCM
+  if constexpr (!H::symbolic) {
+    if (at::cuda::host_trace::harvesting()) {
+      report_dynamic_launch(*fn_ptr, grid, iter, N, vectorized, /*contiguous=*/true, /*dynamic_casting=*/false, extra_args);
     }
-    at::cuda::jit::launch_jitted_pwise_function(*fn_ptr, args.get(), {grid, 1u, 1u}, {num_threads(), 1u, 1u});
-  } else {
+  }
+#endif
+  DynParams<H> p;
+  add_count(p, N);
+  data.add_to(p);
+  if (!vectorized) {
     TrivialOffsetCalculatorVariant input_offset_calculator(iter.ninputs());
-    void* ic_ptr = input_offset_calculator.data_ptr();
     TrivialOffsetCalculatorVariant output_offset_calculator(iter.noutputs());
-    void* oc_ptr = output_offset_calculator.data_ptr();
-
     auto l = memory::LoadWithoutCast();
     auto s = memory::StoreWithoutCast();
-
-    // pack args for kernel launch
-    constexpr int kernel_args = 7;
-    auto args = std::make_unique<const void*[]>(kernel_args + extra_args_size);
-    args[0] = &N;
-    args[1] = data_ptr;
-    args[2] = ic_ptr;
-    args[3] = oc_ptr;
-    args[4] = &l;
-    args[5] = &s;
-    args[6] = &scalar_val;
-
-    for (const auto i : c10::irange(extra_args_size)) {
-      // since 7 slots are already filled in `args`
-      args[i + 7] = extra_args[i].data_ptr();
-    }
-
-    at::cuda::jit::launch_jitted_pwise_function(*fn_ptr, args.get(), {grid, 1u, 1u}, {num_threads(), 1u, 1u});
+    add_variant(p, input_offset_calculator);
+    add_variant(p, output_offset_calculator);
+    add_bytes(p, &l, sizeof(l));
+    add_bytes(p, &s, sizeof(s));
+    add_scalar_and_extra_args(p, scalar_val, extra_args);
+    p.launch(*fn_ptr, grid);
+    return;
   }
+  add_scalar_and_extra_args(p, scalar_val, extra_args);
+  p.launch(*fn_ptr, grid);
 }
 
+// ic, oc, l, s: the offset calculators', loader's and storer's parameters, already in p after N and data
+template <class H>
 static inline void launch_jitted_unrolled_kernel_dynamic(
   const std::string& name, TensorIteratorBase& iter,
-  DeviceIndex dev_idx, int64_t N, const std::string& f, const void* data_ptr,
-  const void* ic_ptr, const void* oc_ptr, const void* l_ptr, const void* s_ptr, bool contiguous, bool dynamic_casting,
+  DeviceIndex dev_idx, const typename H::int_t& N, const std::string& f, DynParams<H>& p,
+  bool contiguous, bool dynamic_casting,
   const c10::SmallVector<at::Scalar>& extra_args, bool return_by_ref) {
 
-  TORCH_INTERNAL_ASSERT(N > 0 && N <= std::numeric_limits<int32_t>::max());
+  if constexpr (!H::symbolic) {
+    TORCH_INTERNAL_ASSERT(N > 0 && N <= std::numeric_limits<int32_t>::max());
+  }
 
   int nInputs = iter.ninputs();
   int nOutputs = iter.noutputs();
@@ -134,8 +313,7 @@ static inline void launch_jitted_unrolled_kernel_dynamic(
 
   int tws = at::cuda::jit::calc_thread_work_size(nInputs, nOutputs, common_dtype, common_dtype);
   int bws = tws * num_threads();
-  //casting result to int is always safe, intermediate is int64 and won't overflow
-  const uint32_t grid = (N + bws - 1) / bws;
+  const std::conditional_t<H::symbolic, c10::SymInt, uint32_t> grid = (N + bws - 1) / bws;
 
   std::string f_inputs_type_str = at::cuda::jit::typeName(common_dtype);
   std::string compute_type_str = at::cuda::jit::typeName(toOpMathType(common_dtype));
@@ -152,8 +330,7 @@ static inline void launch_jitted_unrolled_kernel_dynamic(
   ss << dev_idx;
   const std::string cache_key = std::move(ss).str();
 
-  static std::mutex _jiterator_mutex;
-  static std::unordered_map<std::string, at::cuda::jit::NvrtcFunction> fns;
+  auto& [_jiterator_mutex, fns] = unrolled_cache();
 
   at::cuda::jit::NvrtcFunction* fn_ptr = &fns[cache_key];
   if (!fn_ptr->function) {
@@ -170,26 +347,43 @@ static inline void launch_jitted_unrolled_kernel_dynamic(
 
   float scalar_val = 0;
 
-  // pack args for kernel launch
-  constexpr int kernel_args = 7;
-  auto extra_args_size = extra_args.size();
-  auto args = std::make_unique<const void*[]>(kernel_args + extra_args_size);
-  args[0] = &N;
-  args[1] = data_ptr;
-  args[2] = ic_ptr;
-  args[3] = oc_ptr;
-  args[4] = l_ptr;
-  args[5] = s_ptr;
-  args[6] = &scalar_val;
-
-  for (const auto i : c10::irange(extra_args_size)) {
-    // since 7 slots are already filled in `args`
-    args[i + 7] = extra_args[i].data_ptr();
+#ifndef USE_ROCM
+  if constexpr (!H::symbolic) {
+    if (at::cuda::host_trace::harvesting()) {
+      report_dynamic_launch(*fn_ptr, grid, iter, N, /*vectorized=*/false, contiguous, dynamic_casting, extra_args);
+    }
   }
-
-  at::cuda::jit::launch_jitted_pwise_function(*fn_ptr, args.get(), {grid, 1u, 1u}, {num_threads(), 1u, 1u});
+#endif
+  add_scalar_and_extra_args(p, scalar_val, extra_args);
+  p.launch(*fn_ptr, grid);
 }
 
+// the input or output offset calculator: make_unique_offset_calculator's, or the symbolic iterator's
+template <class H, bool IS_INPUT>
+struct DynOffsets {
+  explicit DynOffsets(const TensorIteratorBase& iter)
+      : v(iter) {}
+  void add_to(DynParams<H>& p) {
+    add_variant(p, v);
+  }
+  OffsetCalculatorVariant<IS_INPUT> v;
+};
+
+#ifndef USE_ROCM
+template <bool IS_INPUT>
+struct DynOffsets<at::cuda::host_trace::SymHost, IS_INPUT> {
+  explicit DynOffsets(const TensorIteratorBase& iter)
+      : n(IS_INPUT ? iter.ninputs() : iter.noutputs()),
+        offsets(at::cuda::host_trace::sym_offsets(iter, IS_INPUT ? iter.noutputs() : 0, n, /*element_strides=*/true)) {}
+  void add_to(DynParams<at::cuda::host_trace::SymHost>& p) {
+    p.add(at::cuda::host_trace::offset_calculator_desc(n, offsets));
+  }
+  int n;
+  at::cuda::host_trace::SymOffsets offsets;
+};
+#endif
+
+template <class H>
 static void jitted_gpu_kernel_dynamic_impl(
     const std::string& kernel_name,
     TensorIteratorBase& iter,
@@ -202,10 +396,9 @@ static void jitted_gpu_kernel_dynamic_impl(
   TORCH_INTERNAL_ASSERT(iter.noutputs() <= 8);
   TORCH_INTERNAL_ASSERT(iter.ninputs() <= 8);
 
-  ArrayVariant data(iter);
-  const void* data_ptr = data.data_ptr();
+  DynData<H> data(iter);
 
-  int64_t numel = iter.numel();
+  typename H::int_t numel = H::numel(iter);
   bool contiguous = iter.is_contiguous();
 
   // Decides which of 4 kernel types to launch
@@ -219,25 +412,26 @@ static void jitted_gpu_kernel_dynamic_impl(
   if (!dynamic_casting) {
     if (contiguous) {
       // Case 1: no dynamic casting and contiguous
-      launch_jitted_vectorized_kernel_dynamic(kernel_name, iter,
-         iter.device().index(), numel, f, data_ptr, extra_args, return_by_ref);
+      launch_jitted_vectorized_kernel_dynamic<H>(kernel_name, iter,
+         iter.device().index(), numel, f, data, extra_args, return_by_ref);
       return;
     }
 
     // Case 2: no dynamic casting and noncontiguous
-    OffsetCalculatorVariant</*is_input=*/true> input_offset_calculator(iter);
-    const void* ic_ptr = input_offset_calculator.data_ptr();
-    OffsetCalculatorVariant</*is_input=*/false> output_offset_calculator(iter);
-    const void* oc_ptr = output_offset_calculator.data_ptr();
-
+    DynOffsets<H, /*is_input=*/true> input_offset_calculator(iter);
+    DynOffsets<H, /*is_input=*/false> output_offset_calculator(iter);
     auto loader = memory::LoadWithoutCast();
     auto storer = memory::StoreWithoutCast();
-    const void* l_ptr = &loader;
-    const void* s_ptr = &storer;
+    DynParams<H> p;
+    add_count(p, numel);
+    data.add_to(p);
+    input_offset_calculator.add_to(p);
+    output_offset_calculator.add_to(p);
+    add_bytes(p, &loader, sizeof(loader));
+    add_bytes(p, &storer, sizeof(storer));
 
-    launch_jitted_unrolled_kernel_dynamic(
-      kernel_name, iter, iter.device().index(), numel, f, data_ptr,
-      ic_ptr, oc_ptr, l_ptr, s_ptr, contiguous, dynamic_casting, extra_args, return_by_ref);
+    launch_jitted_unrolled_kernel_dynamic<H>(
+      kernel_name, iter, iter.device().index(), numel, f, p, contiguous, dynamic_casting, extra_args, return_by_ref);
 
     return;
   }
@@ -247,34 +441,37 @@ static void jitted_gpu_kernel_dynamic_impl(
 
   // Creates load casts from inputs (note offset indexing into the iterators noutpus...n tensors)
   LoadWithCastVariant loader(iter);
-  void* l_ptr = loader.data_ptr();
 
   // Creates store cast to output (the 0...noutpus-1 tensor in TensorIterator)
   StoreWithCastVariant storer(iter);
-  void* s_ptr = storer.data_ptr();
 
+  DynParams<H> p;
+  add_count(p, numel);
+  data.add_to(p);
   if (contiguous) {
     // Case 3: dynamic casting and contiguous
     TrivialOffsetCalculatorVariant input_offset_calculator(iter.ninputs());
-    void* ic_ptr = input_offset_calculator.data_ptr();
     TrivialOffsetCalculatorVariant output_offset_calculator(iter.noutputs());
-    void* oc_ptr = output_offset_calculator.data_ptr();
+    add_variant(p, input_offset_calculator);
+    add_variant(p, output_offset_calculator);
+    add_variant(p, loader);
+    add_variant(p, storer);
 
-    launch_jitted_unrolled_kernel_dynamic(
-      kernel_name, iter, iter.device().index(), numel, f, data_ptr,
-      ic_ptr, oc_ptr, l_ptr, s_ptr, contiguous, dynamic_casting, extra_args, return_by_ref);
+    launch_jitted_unrolled_kernel_dynamic<H>(
+      kernel_name, iter, iter.device().index(), numel, f, p, contiguous, dynamic_casting, extra_args, return_by_ref);
     return;
   }
 
   // Case 4: dynamic casting and noncontiguous
-  OffsetCalculatorVariant</*is_input=*/true> input_offset_calculator(iter);
-  void* ic_ptr = input_offset_calculator.data_ptr();
-  OffsetCalculatorVariant</*is_input=*/false> output_offset_calculator(iter);
-  void* oc_ptr = output_offset_calculator.data_ptr();
+  DynOffsets<H, /*is_input=*/true> input_offset_calculator(iter);
+  DynOffsets<H, /*is_input=*/false> output_offset_calculator(iter);
+  input_offset_calculator.add_to(p);
+  output_offset_calculator.add_to(p);
+  add_variant(p, loader);
+  add_variant(p, storer);
 
-  launch_jitted_unrolled_kernel_dynamic(
-      kernel_name, iter, iter.device().index(), numel, f, data_ptr,
-      ic_ptr, oc_ptr, l_ptr, s_ptr, contiguous, dynamic_casting, extra_args, return_by_ref);
+  launch_jitted_unrolled_kernel_dynamic<H>(
+      kernel_name, iter, iter.device().index(), numel, f, p, contiguous, dynamic_casting, extra_args, return_by_ref);
 }
 
 // Entrypoint for dynamic version of jitted GPU kernels, which accepts dynamic number of inputs
@@ -298,7 +495,8 @@ static void jitted_gpu_kernel_dynamic(
       "argument ", arg, ": expected a CUDA device but found ", iter.device(arg));
   }
 
-  if (iter.numel() == 0) {
+  // a symbolic iterator (a host trace): an empty one is a guard
+  if (C10_UNLIKELY(iter.is_symbolic()) ? iter.sym_numel() == 0 : iter.numel() == 0) {
     return;
   }
 
@@ -320,7 +518,12 @@ static void jitted_gpu_kernel_dynamic(
     }
   }
 
-  jitted_gpu_kernel_dynamic_impl(kernel_name, iter, f, needs_dynamic_casting, extra_args, return_by_ref);
+#ifndef USE_ROCM
+  if (C10_UNLIKELY(iter.is_symbolic())) {
+    return jitted_gpu_kernel_dynamic_impl<at::cuda::host_trace::SymHost>(kernel_name, iter, f, needs_dynamic_casting, extra_args, return_by_ref);
+  }
+#endif
+  jitted_gpu_kernel_dynamic_impl<EagerHost>(kernel_name, iter, f, needs_dynamic_casting, extra_args, return_by_ref);
 }
 
 } // namespace native

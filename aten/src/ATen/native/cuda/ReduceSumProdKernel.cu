@@ -7,15 +7,24 @@
 #include <ATen/native/ReduceOps.h>
 #include <ATen/jit_macros.h>
 #include <ATen/OpMathType.h>
+#if !defined(USE_ROCM)
+#include <ATen/cuda/host_trace/Ops.h>
+#include <ATen/cuda/host_trace/ReduceSym.cuh>
+#endif
 
 namespace at::native {
+
+template <typename acc_t>
+struct SumCombine {
+  __device__ acc_t operator()(acc_t a, acc_t b) const {
+    return a + b;
+  }
+};
 
 template <typename scalar_t, typename acc_t = scalar_t, typename out_t = scalar_t>
 struct sum_functor {
   void operator()(TensorIterator& iter) {
-    const auto sum_combine = [] GPU_LAMBDA(acc_t a, acc_t b) -> acc_t {
-      return a + b;
-    };
+    const auto sum_combine = SumCombine<acc_t>();
     constexpr bool is_16_bits = sizeof(scalar_t) == 2;
     if constexpr (is_16_bits) {
       gpu_reduce_kernel<scalar_t, out_t, /*vt0=*/4, /*input_vec_size=*/8>(
@@ -276,3 +285,33 @@ REGISTER_DISPATCH(prod_stub, &prod_kernel_cuda)
 REGISTER_DISPATCH(xor_sum_stub, &xor_sum_kernel_cuda)
 
 } // namespace at::native
+
+#if !defined(USE_ROCM)
+// Traced host (ATen/cuda/host_trace/Ops.h)
+namespace at::cuda::host_trace {
+
+// sum_functor for a floating self and result of its dtype
+TensorBase sum(Recorder& rec, const TensorBase& self, IntArrayRef dims, bool keepdim) {
+  const ScalarType dtype = self.scalar_type();
+  if (dtype != kHalf && dtype != kBFloat16 && dtype != kFloat && dtype != kDouble) {
+    decline(c10::str("a ", dtype, " sum"));
+  }
+  TensorBase result;
+  auto iter = make_reduction(rec, result, self, dims, keepdim);
+  if (iter.numel() == 0) {
+    decline("an empty sum");
+  }
+  AT_DISPATCH_FLOATING_TYPES_AND2(kHalf, kBFloat16, dtype, "sum_cuda", [&]() {
+    using acc_t = at::opmath_type<scalar_t>;
+    Param ops(at::native::func_wrapper<scalar_t>(at::native::SumCombine<acc_t>()));
+    if constexpr (sizeof(scalar_t) == 2) {
+      gpu_reduce_kernel<scalar_t, scalar_t, 4, 8>(rec, iter, ops);
+    } else {
+      gpu_reduce_kernel<scalar_t, scalar_t>(rec, iter, ops);
+    }
+  });
+  return result;
+}
+
+} // namespace at::cuda::host_trace
+#endif

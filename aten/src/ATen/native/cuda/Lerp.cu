@@ -85,6 +85,30 @@ void lerp_tensor_kernel(at::TensorIteratorBase& iter) {
   }
 }
 
+template <typename scalar_t, typename opmath_t>
+struct LerpScalarComplexFunctor {
+  opmath_t weight_val;
+  __device__ scalar_t operator()(scalar_t self_val, scalar_t end_val) const {
+    opmath_t self_val_f = self_val;
+    opmath_t end_val_f = end_val;
+    return lerp(self_val, end_val, weight_val);
+  }
+  auto host_trace_fields() const {
+    return std::tie(weight_val);
+  }
+};
+
+template <typename scalar_t, typename opmath_t>
+struct LerpScalarFunctor {
+  opmath_t weight_val;
+  __device__ scalar_t operator()(scalar_t self_val, scalar_t end_val) const {
+    return lerp(self_val, end_val, weight_val);
+  }
+  auto host_trace_fields() const {
+    return std::tie(weight_val);
+  }
+};
+
 constexpr char lerp_scalar_name[] = "lerp_scalar";
 void lerp_scalar_kernel(at::TensorIteratorBase& iter, const c10::Scalar& weight) {
   auto dtype = iter.common_dtype();
@@ -117,13 +141,7 @@ void lerp_scalar_kernel(at::TensorIteratorBase& iter, const c10::Scalar& weight)
   AT_DISPATCH_COMPLEX_TYPES_AND(kComplexHalf, dtype, "lerp_cuda", [&] {
     using opmath_t = at::opmath_type<scalar_t>;
     auto weight_val = weight.to<opmath_t>();
-    at::native::gpu_kernel(
-        iter,
-        [=] GPU_LAMBDA(scalar_t self_val, scalar_t end_val) {
-          opmath_t self_val_f = self_val;
-          opmath_t end_val_f = end_val;
-          return lerp(self_val, end_val, weight_val);
-        });
+    at::native::gpu_kernel(iter, LerpScalarComplexFunctor<scalar_t, opmath_t>{weight_val});
   });
 #endif
   } else {
@@ -133,10 +151,7 @@ void lerp_scalar_kernel(at::TensorIteratorBase& iter, const c10::Scalar& weight)
       [&]{
         using opmath_t = at::opmath_type<scalar_t>;
         auto weight_val = weight.to<opmath_t>();
-        at::native::gpu_kernel(
-            iter, [=] GPU_LAMBDA(scalar_t self_val, scalar_t end_val) {
-              return lerp(self_val, end_val, weight_val);
-            });
+        at::native::gpu_kernel(iter, LerpScalarFunctor<scalar_t, opmath_t>{weight_val});
       });
     }
 }

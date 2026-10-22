@@ -55,6 +55,23 @@ sym_node_log = torch._logging.getArtifactLogger(__name__, "sym_node")
 # When passed as hint to SymNode, it means we already know hint is unavailable
 # and should not waste time calling compute_hint()
 _NO_HINT: object = object()
+
+# Node types whose integer nodes take SymInt's binary dunders without promotion
+# or constant checks: for a non-constant int node and an int or a non-constant
+# int node of the same type, the dunder calls the node's method directly. A
+# registered type's binary methods never return a constant node. SymInt gets
+# these dunders (_DIRECT_DUNDERS) only once a type is registered.
+_DIRECT_INT_NODES: set[type] = set()
+_DIRECT_DUNDERS: list[tuple[str, Callable[..., Any]]] = []
+
+
+def register_direct_int_node(node_type: type) -> None:
+    if not _DIRECT_INT_NODES:
+        for attr, impl in _DIRECT_DUNDERS:
+            setattr(SymInt, attr, impl)
+    _DIRECT_INT_NODES.add(node_type)
+
+
 # Type alias for hint values (including the sentinel)
 HintType = bool | float | int | None
 
@@ -2016,6 +2033,31 @@ def _make_user_magic(method: str, user_type: type) -> None:
             return (method_to_operator(method))(get_constant(self))
         return wrap_node(getattr(self.node, method_attr)())
 
+    def direct_operand(node: Any, other: object) -> Any:
+        # the node the generic path below would pass for `other`, or None
+        # when the generic path may do more (promote, a constant, a float)
+        if node.pytype is not int or node.constant is not None:
+            return None
+        if type(other) is int:
+            return node.wrap_int(other)
+        if type(other) is SymInt:
+            o = other.node
+            if type(o) is type(node) and o.pytype is int and o.constant is None:
+                return o
+        return None
+
+    def direct_binary_magic_impl(self: object, other: object) -> Any:
+        node = self.node
+        if type(node) in _DIRECT_INT_NODES and (other_node := direct_operand(node, other)) is not None:
+            return wrap_node(getattr(node, method_attr)(other_node))
+        return binary_magic_impl(self, other)
+
+    def direct_rbinary_magic_impl(self: object, other: object) -> Any:
+        node = self.node
+        if type(node) in _DIRECT_INT_NODES and (other_node := direct_operand(node, other)) is not None:
+            return wrap_node(getattr(other_node, method_attr)(node))
+        return rbinary_magic_impl(self, other)
+
     def binary_magic_impl(self: object, other: object) -> Any:
         if not isinstance(other, (int, float, bool, SymInt, SymFloat, SymBool)):
             return NotImplemented
@@ -2117,8 +2159,12 @@ def _make_user_magic(method: str, user_type: type) -> None:
         if method in bitwise_ops:
             method_name = bitwise_ops[method]
         setattrs(user_type, f"__{method_name}__", binary_magic_impl)
+        if user_type is SymInt:
+            _DIRECT_DUNDERS.append((f"__{method_name}__", direct_binary_magic_impl))
         if method in reflectable_magic_methods:
             setattrs(user_type, f"__r{method_name}__", rbinary_magic_impl)
+            if user_type is SymInt:
+                _DIRECT_DUNDERS.append((f"__r{method_name}__", direct_rbinary_magic_impl))
 
 
 for method in magic_methods:  # type: ignore[assignment]

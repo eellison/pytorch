@@ -28,7 +28,7 @@ inline std::tuple<bool, Tensor> canDispatchToMaskedFill(
     const Tensor& self,
     const torch::List<std::optional<at::Tensor>>& indices,
     const Tensor& value) {
-  if (!(value.numel() == 1 && value.device().is_cpu())) {
+  if (!(value.device().is_cpu() && value.sym_numel() == 1)) {
     return std::make_tuple(false, Tensor());
   }
   return at::indexing::impl::canDispatchToMaskedFill(self, indices);

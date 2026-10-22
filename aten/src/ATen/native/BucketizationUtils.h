@@ -83,8 +83,8 @@ inline bool searchsorted_dims_matched_before_last_dim(const Tensor& boundaries, 
   if (boundaries.dim() != input.dim()) {
     return false;
   }
-  const auto& dims_bd = boundaries.sizes();
-  const auto& dims_in = input.sizes();
+  const auto dims_bd = boundaries.sym_sizes();
+  const auto dims_in = input.sym_sizes();
   for (int64_t dim = 0; dim + 1 < boundaries.dim(); ++dim) {
     if (dims_bd[dim] != dims_in[dim]) {
       return false;
@@ -142,18 +142,18 @@ inline void searchsorted_pre_check(
     }
   }
 
-  TORCH_CHECK(input.dim() > 0 || (input.dim() == 0 && input.numel() == 1 && boundaries.dim() == 1),
+  TORCH_CHECK(input.dim() > 0 || (input.dim() == 0 && input.sym_numel() == 1 && boundaries.dim() == 1),
     "torch.searchsorted(): input value can be a scalar only when boundaries tensor dimension is 1, but we got ",
     "boundaries tensor dim(", boundaries.dim(), ") and input value's dim(", input.dim(), ") numel(",
-    input.numel(), ")");
+    input.sym_numel(), ")");
 
   TORCH_CHECK(boundaries.dim() != 0, "torch.searchsorted(): boundaries tensor should have positive dimension, but ",
     "got 0 dimension");
 
   TORCH_CHECK(boundaries.dim() == 1 || searchsorted_dims_matched_before_last_dim(boundaries, input),
     "torch.searchsorted(): boundaries tensor should be 1 dimension or the first N-1 dimensions of boundaries tensor ",
-    "and input value tensor must match, but we got boundaries tensor ", boundaries.sizes(), " and input value tensor ",
-    input.sizes());
+    "and input value tensor must match, but we got boundaries tensor ", boundaries.sym_sizes(), " and input value tensor ",
+    input.sym_sizes());
 
   ScalarType output_dtype = output.scalar_type();
   TORCH_CHECK(
@@ -164,9 +164,9 @@ inline void searchsorted_pre_check(
       " and out_int32 flag is ", (out_int32 ? "True" : "False"));
 
   if (out_int32) {
-    TORCH_CHECK(boundaries.sizes().back() < INT_MAX,
+    TORCH_CHECK(boundaries.sym_sizes().back() < INT_MAX,
       "torch.searchsorted(): the size of boundaries' last dimension should be less than ", INT_MAX, ", but we got ",
-      boundaries.sizes().back());
+      boundaries.sym_sizes().back());
   }
 }
 

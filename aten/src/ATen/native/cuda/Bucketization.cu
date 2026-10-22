@@ -5,6 +5,9 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/native/BucketizationUtils.h>
 #include <ATen/native/Resize.h>
+#if !defined(USE_ROCM)
+#include <ATen/cuda/host_trace/SymImage.h>
+#endif
 
 #ifndef AT_PER_OPERATOR_HEADERS
 #include <ATen/Functions.h>
@@ -86,6 +89,30 @@ __global__ void searchsorted_cuda_kernel(
 
 template<typename input_t, typename output_t>
 void searchsorted_cuda_contiguous(Tensor& result, const Tensor& input, const Tensor& boundaries, const bool& right, const Tensor& sorter) {
+#if !defined(USE_ROCM)
+  if (auto* rec = at::cuda::host_trace::current_recorder()) {
+    // a CUDA graph host trace: the same launch over symbolic sizes, recorded
+    namespace ht = at::cuda::host_trace;
+    const c10::SymInt numel_in = input.sym_numel();
+    const bool is_scalar_input = input.dim() == 0 && numel_in == 1;
+    const c10::SymInt idim_in = is_scalar_input ? c10::SymInt(1) : input.sym_sizes().back();
+    const c10::SymInt idim_bd = boundaries.sym_sizes().back();
+    const int64_t maxThread = at::cuda::getCurrentDeviceProperties()->maxThreadsPerBlock;
+    const c10::SymInt block = ht::sym_min(*rec, maxThread, numel_in);
+    const c10::SymInt grid = ht::sym_min(*rec, 1024, (numel_in + block - 1) / block);
+    std::vector<ht::ParamImage> params;
+    params.push_back(ht::param_pointer(*rec, result));
+    params.push_back(ht::param_pointer(*rec, input));
+    params.push_back(ht::param_pointer(*rec, boundaries));
+    params.push_back(sorter.defined() ? ht::param_pointer(*rec, sorter) : ht::param_of<const int64_t*>(0));
+    params.push_back(ht::param_of<int64_t>(idim_in));
+    params.push_back(ht::param_of<int64_t>(idim_bd));
+    params.push_back(ht::param_of<int64_t>(numel_in));
+    params.push_back(ht::param_bytes(right));
+    params.push_back(ht::param_bytes(boundaries.dim() == 1));
+    return ht::record_images(reinterpret_cast<const void*>(&searchsorted_cuda_kernel<input_t, output_t>), std::move(params), grid, block, 0);
+  }
+#endif
   int64_t numel_in = input.numel();
   bool is_scalar_input = input.dim() == 0 && numel_in == 1;
   // inner most dim size of input and boundaries
@@ -141,11 +168,11 @@ Tensor& searchsorted_out_cuda(
   c10::MaybeOwned<Tensor> sorter_maybe_owned = at::borrow_from_optional_tensor(sorter_opt);
   const Tensor& sorter = *sorter_maybe_owned;
   searchsorted_pre_check(sorted_sequence, self, result, out_int32, right, side_opt, sorter);
-  resize_output(result, self.sizes());
+  resize_output_symint(result, self.sym_sizes());
 
   // we have two inputs to set right, pre_check checks that they aren't set to opposites
   bool is_right = (side_opt && *side_opt == "right") || right;
-  if (self.numel() == 0) {
+  if (self.sym_numel() == 0) {
     return result;
   }
 

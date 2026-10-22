@@ -525,6 +525,9 @@ struct CalcIgamma{
       return calc_igamma(a,b);
     }
   }
+  auto host_trace_fields() const {
+    return std::tie(calc_igammac_);
+  }
 };
 
 }

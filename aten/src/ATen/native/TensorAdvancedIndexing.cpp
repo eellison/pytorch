@@ -157,14 +157,19 @@ TORCH_META_FUNC(gather)
   // https://github.com/pytorch/pytorch/pull/63312#discussion_r694794832 and
   // https://github.com/pytorch/pytorch/issues/63837
   bool check_result = result.defined();
-  set_output_raw_strided(0, index.sizes(), {}, self.options());
+  if (C10_UNLIKELY(at::detail::symbolic_iterators() && index.is_cuda())) {
+    // a CUDA graph host trace: the same output over SymInt
+    set_output_raw_strided_symint(0, index.sym_sizes(), {}, self.options());
+  } else {
+    set_output_raw_strided(0, index.sizes(), {}, self.options());
+  }
   if (check_result) {
     at::assert_no_internal_overlap(result);
     at::assert_no_overlap(result, self);
     at::assert_no_partial_overlap(result, index);
   }
 
-  auto is_index_empty = index.numel() == 0;
+  auto is_index_empty = index.sym_numel() == 0;
   if (!is_index_empty) {
     TORCH_CHECK(
         index.scalar_type() == ScalarType::Long ||
@@ -266,7 +271,12 @@ TORCH_PRECOMPUTE_META_FUNC(index_copy)
   // https://github.com/pytorch/pytorch/pull/63312#discussion_r694794832 and
   // https://github.com/pytorch/pytorch/issues/63837
   bool check_result = result.defined();
-  set_output_raw_strided(0, self.sizes(), {}, self.options());
+  if (C10_UNLIKELY(self.unsafeGetTensorImpl()->has_symbolic_sizes_strides())) {
+    // a symbolic self (a CUDA graph host trace): the same output over SymInt
+    set_output_raw_strided_symint(0, self.sym_sizes(), {}, self.options());
+  } else {
+    set_output_raw_strided(0, self.sizes(), {}, self.options());
+  }
   if (check_result) {
     at::assert_no_internal_overlap(result);
     at::assert_no_overlap(result, index);
@@ -279,7 +289,7 @@ TORCH_PRECOMPUTE_META_FUNC(index_copy)
       index.dim(),
       ")");
 
-  int64_t numIndices = index.numel();
+  const c10::SymInt numIndices = index.sym_numel();
   if (source.dim() == 0 && numIndices != 1) {
     TORCH_CHECK_INDEX(
         false,
@@ -317,11 +327,11 @@ TORCH_PRECOMPUTE_META_FUNC(index_copy)
       source.device());
 
   // Check that source and destination slices have the same size
-  auto selfSlicedSizes = self.sizes().vec();
+  auto selfSlicedSizes = self.sym_sizes().vec();
   if (!selfSlicedSizes.empty()) {
     selfSlicedSizes.erase(selfSlicedSizes.begin() + dim);
   }
-  auto sourceSlicedSizes = source.sizes().vec();
+  auto sourceSlicedSizes = source.sym_sizes().vec();
   if (!sourceSlicedSizes.empty()) {
     sourceSlicedSizes.erase(sourceSlicedSizes.begin() + dim);
   }
@@ -332,18 +342,18 @@ TORCH_PRECOMPUTE_META_FUNC(index_copy)
           sourceSlicedSizes.begin())) {
     std::stringstream ss;
     ss << "index_copy_(): Source/destination tensor must have same slice shapes. ";
-    ss << "Destination slice shape: " << selfSlicedSizes << " at dimension "
+    ss << "Destination slice shape: " << c10::SymIntArrayRef(selfSlicedSizes) << " at dimension "
        << dim;
-    ss << " and source slice shape: " << sourceSlicedSizes
+    ss << " and source slice shape: " << c10::SymIntArrayRef(sourceSlicedSizes)
        << " at dimension 0.";
     TORCH_CHECK(false, std::move(ss).str());
   }
   TORCH_CHECK_INDEX(
-      source.dim() == 0 || numIndices == source.size(dim),
+      source.dim() == 0 || numIndices == source.sym_size(dim),
       "index_copy_(): Number of indices (",
       numIndices,
       ") should be equal to source.size(dim) (",
-      source.size(dim),
+      source.sym_size(dim),
       ")");
 
   return TORCH_PRECOMPUTE_STRUCT(index_copy)().set_dim(dim);
@@ -550,6 +560,9 @@ TORCH_PRECOMPUTE_META_FUNC2(index, Tensor)
 
   auto info = at::native::make_info(self, std::move(indices));
   build_index_op(*this, info, result);
+  if (!info.sym_indexed_sizes.empty()) {
+    set_sym_index_geometry(info.sym_indexed_sizes, info.sym_indexed_strides);
+  }
   return TORCH_PRECOMPUTE_STRUCT2(index, Tensor)()
       .set_sizes(std::move(info.indexed_sizes))
       .set_strides(std::move(info.indexed_strides));
@@ -587,9 +600,9 @@ DEFINE_DISPATCH(gather_expanded_index_stub);
 
 static bool all_strides_match(TensorList tensors) {
   TORCH_CHECK(!tensors.empty());
-  auto strides = tensors[0].strides();
+  auto strides = tensors[0].sym_strides();
   for (auto& tensor : tensors.slice(1)) {
-    if (!strides.equals(tensor.strides())) {
+    if (!strides.equals(tensor.sym_strides())) {
       return false;
     }
   }
@@ -604,9 +617,9 @@ static Tensor restride_src(
     const Tensor& src,
     int64_t dims_before,
     int64_t dims_indexed,
-    IntArrayRef replacement_shape) {
-  auto shape = DimVector(src.sizes());
-  auto strides = DimVector(src.strides());
+    SymIntArrayRef replacement_shape) {
+  auto shape = SymDimVector(src.sym_sizes());
+  auto strides = SymDimVector(src.sym_strides());
   int64_t end = dims_before + dims_indexed;
   shape.erase(shape.begin() + dims_before, shape.begin() + end);
   strides.erase(strides.begin() + dims_before, strides.begin() + end);
@@ -615,7 +628,7 @@ static Tensor restride_src(
       replacement_shape.begin(),
       replacement_shape.end());
   strides.insert(strides.begin() + dims_before, replacement_shape.size(), 0);
-  return src.as_strided(shape, strides);
+  return src.as_strided_symint(shape, strides);
 }
 
 // Add dimensions of size 1 to an index tensor so that it can be broadcast to
@@ -625,18 +638,20 @@ static Tensor reshape_indexer(
     const Tensor& index,
     int64_t dims_before,
     int64_t dims_after) {
-  auto orig_shape = index.sizes();
-  auto shape = DimVector();
+  auto orig_shape = index.sym_sizes();
+  auto shape = SymDimVector();
   shape.append(dims_before, 1);
   shape.append(orig_shape.begin(), orig_shape.end());
   shape.append(dims_after, 1);
-  return index.reshape(shape);
+  return index.reshape_symint(shape);
 }
 
 AdvancedIndex::AdvancedIndex(const Tensor& src, TensorList indices_list) {
+  // a symbolic src (a CUDA graph host trace's): its geometry over SymInt
+  const bool symbolic = src.unsafeGetTensorImpl()->has_symbolic_sizes_strides();
   int64_t element_size_bytes = src.element_size();
   int64_t dims_before = 0, dims_after = 0, dims_indexed = 0;
-  IntArrayRef replacement_shape;
+  SymIntArrayRef replacement_shape;
   for (const auto dim : c10::irange(indices_list.size())) {
     if (!indices_list[dim].defined()) {
       if (dims_indexed == 0) {
@@ -646,9 +661,14 @@ AdvancedIndex::AdvancedIndex(const Tensor& src, TensorList indices_list) {
       }
     } else {
       dims_indexed++;
-      replacement_shape = indices_list[dim].sizes();
-      indexed_sizes.push_back(src.size(dim));
-      indexed_strides.push_back(src.stride(dim) * element_size_bytes);
+      replacement_shape = indices_list[dim].sym_sizes();
+      if (symbolic) {
+        sym_indexed_sizes.push_back(src.sym_size(dim));
+        sym_indexed_strides.push_back(src.sym_stride(dim) * element_size_bytes);
+      } else {
+        indexed_sizes.push_back(src.size(dim));
+        indexed_strides.push_back(src.stride(dim) * element_size_bytes);
+      }
     }
   }
 
@@ -657,10 +677,11 @@ AdvancedIndex::AdvancedIndex(const Tensor& src, TensorList indices_list) {
   // is no number that's a valid index for an empty tensor. Normally, out of
   // bounds is handled in the indexing kernel, but this case fails earlier in
   // restride_src with an unhelpful error message.
-  if (std::find(indexed_sizes.begin(), indexed_sizes.end(), 0) !=
-          indexed_sizes.end() &&
-      std::find(replacement_shape.begin(), replacement_shape.end(), 0) ==
-          replacement_shape.end()) {
+  const bool indexed_zero = symbolic
+      ? std::any_of(sym_indexed_sizes.begin(), sym_indexed_sizes.end(), [](const c10::SymInt& n) { return n == 0; })
+      : std::find(indexed_sizes.begin(), indexed_sizes.end(), 0) != indexed_sizes.end();
+  if (indexed_zero &&
+      std::none_of(replacement_shape.begin(), replacement_shape.end(), [](const c10::SymInt& n) { return n == 0; })) {
     TORCH_CHECK_INDEX(
         false, "index is out of bounds for dimension with size 0");
   }
@@ -693,11 +714,11 @@ static TensorIterator make_index_put_iterator(
     const AdvancedIndex& info,
     const Tensor& value) {
   TORCH_CHECK(
-      is_expandable_to(value.sizes(), info.src.sizes()),
+      is_expandable_to(value.sym_sizes(), info.src.sym_sizes()),
       "shape mismatch: value tensor of shape ",
-      value.sizes(),
+      value.sym_sizes(),
       " cannot be broadcast to indexing result of shape ",
-      info.src.sizes());
+      info.src.sym_sizes());
   TORCH_CHECK(
       value.scalar_type() == info.src.scalar_type(),
       "Index put requires the source and destination dtypes match, "
@@ -984,7 +1005,7 @@ Tensor& _index_put_impl_(
     }
   }
   auto value_ = value;
-  if (value.device() != self.device() && value.numel() == 1 &&
+  if (value.device() != self.device() && value.sym_numel() == 1 &&
       value.dim() == 0) {
     value_ = value.to(self.device());
   }
@@ -999,7 +1020,7 @@ Tensor& _index_put_impl_(
        self.device().type() == DeviceType::XPU ||
        self.device().type() == DeviceType::PrivateUse1) &&
       (accumulate ||
-       (globalContext().deterministicAlgorithms() && value_.numel() > 1))) {
+       (globalContext().deterministicAlgorithms() && value_.sym_numel() > 1))) {
     TORCH_CHECK(
         value_.device() == self.device(),
         "expected device ",
@@ -1014,6 +1035,9 @@ Tensor& _index_put_impl_(
 
   auto info = make_info(self, indices);
   auto iter = make_index_put_iterator(info, value_);
+  if (!info.sym_indexed_sizes.empty()) {
+    iter.set_sym_index_geometry(info.sym_indexed_sizes, info.sym_indexed_strides);
+  }
   index_put_stub(
       iter.device_type(),
       iter,
@@ -1116,12 +1140,12 @@ TORCH_IMPL_FUNC(index_copy_out)
 
   // Prepare `index` for TensorIterator.
   // It is restrided to be broadcastable over `self` in TensorIterator.
-  auto index_sizes = std::vector<int64_t>(result_nonzero.dim(), 1);
-  auto index_strides = std::vector<int64_t>(result_nonzero.dim(), 0);
-  index_sizes[dim] = index.numel();
+  auto index_sizes = std::vector<c10::SymInt>(result_nonzero.dim(), 1);
+  auto index_strides = std::vector<c10::SymInt>(result_nonzero.dim(), 0);
+  index_sizes[dim] = index.sym_numel();
   index_strides[dim] =
-      (index.dim() > 0) ? index.stride(0) : 1; // `index` is 1d or scalar
-  auto index_restrided = index.as_strided(index_sizes, index_strides);
+      (index.dim() > 0) ? index.sym_stride(0) : 1; // `index` is 1d or scalar
+  auto index_restrided = index.as_strided_symint(index_sizes, index_strides);
 
   // Prepare `result` for TensorIterator.
   // Restride `result` to not advance in dimension `dim`.
@@ -1132,12 +1156,12 @@ TORCH_IMPL_FUNC(index_copy_out)
   // match as required by TensorIterator (input shape should
   // strictly broadcast over output shape, i.e.
   // output.shape[i] >= input.shape[i] for i in range(dims)).
-  auto result_sizes = result_nonzero.sizes().vec();
-  auto result_strides = result_nonzero.strides().vec();
-  result_sizes[dim] = index.numel();
+  auto result_sizes = result_nonzero.sym_sizes().vec();
+  auto result_strides = result_nonzero.sym_strides().vec();
+  result_sizes[dim] = index.sym_numel();
   result_strides[dim] = 0;
   auto result_restrided =
-      result_nonzero.as_strided(result_sizes, result_strides);
+      result_nonzero.as_strided_symint(result_sizes, result_strides);
 
   auto iter = TensorIteratorConfig()
                   // We do not check for overlap because `result` is restrided
@@ -1151,10 +1175,16 @@ TORCH_IMPL_FUNC(index_copy_out)
                   .add_const_input(source_nonzero)
                   .build();
 
-  auto result_dim_size = result_nonzero.size(dim);
-  auto result_dim_stride = result_nonzero.stride(dim);
+  const auto result_dim_size = result_nonzero.sym_size(dim);
+  const auto result_dim_stride = result_nonzero.sym_stride(dim);
+  if (iter.is_symbolic()) {
+    // a CUDA graph host trace's: the kernel reads them from the iterator
+    iter.set_sym_index_geometry({result_dim_size}, {result_dim_stride});
+    index_copy_stub(iter.device_type(), iter, dim, 0, 0);
+    return;
+  }
   index_copy_stub(
-      iter.device_type(), iter, dim, result_dim_size, result_dim_stride);
+      iter.device_type(), iter, dim, result_dim_size.expect_int(), result_dim_stride.expect_int());
 }
 
 // Not calling into index_reduce_func_impl because of a different dtype dispatch
@@ -2099,7 +2129,7 @@ TORCH_IMPL_FUNC(gather_out)
  const Tensor& index,
  bool sparse_grad,
  const Tensor& result) {
-  if (index.numel() == 0)
+  if (index.sym_numel() == 0)
     return;
   dim = at::maybe_wrap_dim(dim, self.dim());
   if (can_use_expanded_index_path(

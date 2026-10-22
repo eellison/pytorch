@@ -80,7 +80,8 @@ void jitted_gpu_kernel(
       "argument ", arg, ": expected a CUDA device but found ", iter.device(arg));
   }
 
-  if (iter.numel() == 0) {
+  // a symbolic iterator (a host trace): an empty one is a guard
+  if (C10_UNLIKELY(iter.is_symbolic()) ? iter.sym_numel() == 0 : iter.numel() == 0) {
     return;
   }
 
@@ -157,13 +158,31 @@ void jitted_gpu_kernel(
 }
 
 // TODO: support runtime state capture similar to `jitted_gpu_kernel`.
+// a jitted kernel's scalar parameter read from operand arg: for a host
+// trace's host buffer, pending as the jitted scalar slot (each replay reads
+// the buffer) while the scope lives
+template <typename opmath_t>
+auto jitted_scalar(const TensorIteratorBase& iter, int arg) {
+#ifndef USE_ROCM
+  namespace ht = at::cuda::host_trace;
+  std::unique_ptr<ht::ScalarScope> scope;
+  if (C10_UNLIKELY(iter.is_symbolic()) && ht::is_host_buffer(iter.tensor_base(arg))) {
+    scope = ht::SymHost::scalar_slot<opmath_t>(&ht::jitted_scalar_slot, iter.tensor_base(arg));
+  }
+  return scope;
+#else
+  return 0;
+#endif
+}
+
 template <char const *name, typename return_type, typename f_inputs_type>
 void opmath_jitted_gpu_kernel_with_scalars(TensorIteratorBase& iter, const std::string& f) {
   TORCH_INTERNAL_ASSERT(iter.ntensors() == 3);
   //currently jiterator only handles binary functions where both inputs are of the same type (f_inputs_type)
   using opmath_t = at::opmath_type<f_inputs_type>;
   if (iter.is_cpu_scalar(1)) {
-    auto scalar_val = iter.scalar_value<opmath_t>(1);
+    auto scalar_val = host_scalar<opmath_t>(iter, 1);
+    [[maybe_unused]] auto scalar = jitted_scalar<opmath_t>(iter, 1);
     iter.remove_operand(1);
     // TODO: When all kernels that use gpu_kernel_with_scalars are
     // ported to structured, this device guard can be deleted.  This
@@ -173,7 +192,8 @@ void opmath_jitted_gpu_kernel_with_scalars(TensorIteratorBase& iter, const std::
     const OptionalDeviceGuard device_guard(iter.device(1));
     jitted_gpu_kernel<name, return_type, f_inputs_type, 1>(iter, f, at::cuda::jit::BinaryFuncVariant::LhsScalar, scalar_val);
   } else if (iter.is_cpu_scalar(2)) {
-    auto scalar_val = iter.scalar_value<opmath_t>(2);
+    auto scalar_val = host_scalar<opmath_t>(iter, 2);
+    [[maybe_unused]] auto scalar = jitted_scalar<opmath_t>(iter, 2);
     iter.remove_operand(2);
     jitted_gpu_kernel<name, return_type, f_inputs_type, 1>(iter, f, at::cuda::jit::BinaryFuncVariant::RhsScalar, scalar_val);
   } else {

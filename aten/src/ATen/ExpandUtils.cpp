@@ -1,6 +1,7 @@
 #define TORCH_ASSERT_ONLY_METHOD_OPERATORS
 #include <ATen/ExpandUtils.h>
 #include <ATen/ExpandBase.h>
+#include <ATen/InferDenseStrides.h>
 
 #include <c10/util/irange.h>
 
@@ -148,7 +149,8 @@ InferExpandGeometryResult<DimVector> inferExpandGeometry_dimvector(
 // 2. The strides propagation rule that is used in this function is exactily the same as what is being used in
 //    TensorIterator. Please refer to https://github.com/pytorch/pytorch/pull/42922 for more details
 
-std::vector<int64_t> infer_dense_strides(IntArrayRef tensor_sizes, IntArrayRef tensor_strides) {
+template <typename T>
+static std::vector<T> infer_dense_strides_of(c10::ArrayRef<T> tensor_sizes, c10::ArrayRef<T> tensor_strides) {
 
   TORCH_CHECK(tensor_sizes.size() == tensor_strides.size(),
     "Input sizes and strides should have same size but got ", tensor_sizes.size(), " and ", tensor_strides.size());
@@ -172,8 +174,8 @@ std::vector<int64_t> infer_dense_strides(IntArrayRef tensor_sizes, IntArrayRef t
   // return  1 if dim0 should come after dim1
   // return  0 if comparison is ambiguous
   auto should_swap = [&](size_t dim0, size_t dim1) {
-    int64_t stride0 = tensor_strides[dim0];
-    int64_t stride1 = tensor_strides[dim1];
+    const T& stride0 = tensor_strides[dim0];
+    const T& stride1 = tensor_strides[dim1];
 
     // if any stride is 0, treat it as ambiguous comparison to
     // keep the same behavior as TensorIterator
@@ -213,8 +215,8 @@ std::vector<int64_t> infer_dense_strides(IntArrayRef tensor_sizes, IntArrayRef t
   }
 
   // compute output strides which preserves the input tensor's memory layout
-  std::vector<int64_t> out_strides(ndim);
-  int64_t curr_stride = 1;
+  std::vector<T> out_strides(ndim);
+  T curr_stride = 1;
   for (const auto i : c10::irange(ndim)) {
     int64_t idx = perm[i];
     out_strides[idx] = curr_stride;
@@ -225,6 +227,14 @@ std::vector<int64_t> infer_dense_strides(IntArrayRef tensor_sizes, IntArrayRef t
     }
   }
   return out_strides;
+}
+
+std::vector<int64_t> infer_dense_strides(IntArrayRef tensor_sizes, IntArrayRef tensor_strides) {
+  return infer_dense_strides_of(tensor_sizes, tensor_strides);
+}
+
+std::vector<c10::SymInt> infer_dense_strides_symint(c10::SymIntArrayRef tensor_sizes, c10::SymIntArrayRef tensor_strides) {
+  return infer_dense_strides_of(tensor_sizes, tensor_strides);
 }
 
 } // namespace at

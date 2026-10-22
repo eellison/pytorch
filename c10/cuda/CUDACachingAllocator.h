@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_set>
 #include <utility>
@@ -196,6 +197,18 @@ class CUDAAllocator : public DeviceAllocator {
         false,
         name(),
         " does not yet support setNoSplit. "
+        "If you need it, please file an issue describing your use case.");
+  }
+  // The pool's allocations, (address, requested bytes), logged since the
+  // last call; it logs on while log_on
+  virtual std::vector<std::pair<void*, size_t>> takePoolLog(
+      c10::DeviceIndex device,
+      MempoolId_t mempool_id,
+      bool log_on) {
+    TORCH_CHECK(
+        false,
+        name(),
+        " does not yet support takePoolLog. "
         "If you need it, please file an issue describing your use case.");
   }
 
@@ -517,6 +530,12 @@ inline void setUseOnOOM(
 inline void setNoSplit(c10::DeviceIndex device, MempoolId_t mempool_id) {
   get()->setNoSplit(device, mempool_id);
 }
+inline std::vector<std::pair<void*, size_t>> takePoolLog(
+    c10::DeviceIndex device,
+    MempoolId_t mempool_id,
+    bool log_on) {
+  return get()->takePoolLog(device, mempool_id, log_on);
+}
 inline int getPoolUseCount(c10::DeviceIndex device, MempoolId_t mempool_id) {
   return get()->getPoolUseCount(device, mempool_id);
 }
@@ -604,6 +623,17 @@ C10_CUDA_API void setDefaultExpandableSegmentReserveFractionForClass(
 // reads; safe to call at any time.
 C10_CUDA_API size_t getExpandableSegmentsReservedBytes();
 C10_CUDA_API size_t getExpandableSegmentsCount();
+
+// Process-wide count of device segments the native caching allocator has
+// released (cudaFree or unmap; DeviceStats::num_device_free over all devices,
+// never reset). A cheap relaxed-atomic read.
+C10_CUDA_API size_t getSegmentReleaseCount();
+
+// Holds the native caching allocator's lock for `device` until destroyed: no
+// other thread allocates, frees or empties the cache on the device meanwhile.
+// The lock is recursive, so the holder's own allocations and frees proceed.
+C10_CUDA_API std::unique_lock<std::recursive_mutex> lockDeviceAllocator(
+    c10::DeviceIndex device);
 
 } // namespace c10::cuda::CUDACachingAllocator
 

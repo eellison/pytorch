@@ -72,7 +72,47 @@ inline c10::SmallBuffer<const void*, 64> pack_kernel_args(
   return ret;
 }
 
-template<typename array_t,
+#ifndef USE_ROCM
+// args as report_launch's; the scalar and extra arguments are of desc's
+// types, as jit_utils' generate_code declares them. A Lhs/RhsScalar kernel's
+// scalar is opmath_jitted_gpu_kernel_with_scalars' CPU scalar
+template <typename... Args>
+C10_NOINLINE void report_jitted_launch(
+    const at::cuda::jit::NvrtcFunction& fn, uint32_t grid, const at::cuda::jit::KernelDescriptor& desc,
+    at::cuda::jit::BinaryFuncVariant scalar_pos, const void* scalar_val, c10::ArrayRef<const void*> extra_args,
+    const Args&... args) {
+  at::cuda::host_trace::LaunchLayout l{reinterpret_cast<cudaFunction_t>(fn.function), grid, num_threads(), {}, {}};
+  (report_param(l, args), ...);
+  auto scalar = [&](const void* v, c10::ScalarType t, char cls) {
+    l.classes.emplace_back(c10::elementSize(t), cls);
+    l.bytes.emplace_back(static_cast<const char*>(v), c10::elementSize(t));
+  };
+  const auto opmath = toOpMathType(desc.f_inputs_type);
+  const bool cpu_scalar = scalar_pos != at::cuda::jit::BinaryFuncVariant::NoScalar && static_cast<int>(opmath) < 26;
+  scalar(scalar_val, opmath, cpu_scalar ? 'A' + static_cast<char>(opmath) : 's');
+  for (const auto i : c10::irange(extra_args.size())) {
+    scalar(extra_args[i], desc.extra_args_types[i], 's');
+  }
+  at::cuda::host_trace::report_launch_layout(std::move(l));
+}
+#endif
+
+#ifndef USE_ROCM
+// a jitted kernel's scalar and extra arguments, as a symbolic launch records them
+inline std::vector<at::cuda::host_trace::ArgDesc> jitted_rest(
+    const at::cuda::jit::KernelDescriptor& desc, const void* scalar_val, c10::ArrayRef<const void*> extra_args) {
+  namespace ht = at::cuda::host_trace;
+  std::vector<ht::ArgDesc> rest;
+  rest.push_back(ht::bytes_desc(scalar_val, c10::elementSize(toOpMathType(desc.f_inputs_type)), &ht::jitted_scalar_slot));
+  for (const auto i : c10::irange(extra_args.size())) {
+    rest.push_back(ht::bytes_desc(extra_args[i], c10::elementSize(desc.extra_args_types[i])));
+  }
+  return rest;
+}
+#endif
+
+template<class H = EagerHost,
+         typename data_t,
          typename inp_calc_t,
          typename out_calc_t,
          typename loader_t,
@@ -81,8 +121,8 @@ void launch_jitted_unrolled_kernel(
     std::mutex &jiterator_mutex,
     at::cuda::jit::NvrtcFunction &fn_cache,
     const at::cuda::jit::KernelDescriptor &desc,
-    int64_t N,
-    array_t data,
+    typename H::int_t N,
+    data_t data,
     inp_calc_t ic,
     out_calc_t oc,
     loader_t l,
@@ -92,12 +132,14 @@ void launch_jitted_unrolled_kernel(
     const void* scalar_val,
     c10::ArrayRef<const void*> extra_args) {
 
-  TORCH_INTERNAL_ASSERT(N > 0 && N <= std::numeric_limits<int32_t>::max());
+  if constexpr (!H::symbolic) {
+    TORCH_INTERNAL_ASSERT(N > 0 && N <= std::numeric_limits<int32_t>::max());
+  }
 
   int tws = at::cuda::jit::calc_thread_work_size(desc.nInputs, desc.nOutputs, desc.f_inputs_type, desc.result_type);
   int bws = tws * num_threads();
   //casting result to int is always safe, intermediate is int64 and won't overflow
-  const uint32_t grid = (N + bws - 1) / bws;
+  const std::conditional_t<H::symbolic, c10::SymInt, uint32_t> grid = (N + bws - 1) / bws;
 
   if (!fn_cache.function) {
     const std::lock_guard<std::mutex> lock{jiterator_mutex};
@@ -110,26 +152,46 @@ void launch_jitted_unrolled_kernel(
     }
   }
 
+#ifndef USE_ROCM
+  if constexpr (H::symbolic) {
+    using array_t = std::array<char*, std::tuple_size_v<data_t>>;
+    using ic_t = typename H::template offset_calculator_t<inp_calc_t>;
+    using oc_t = typename H::template offset_calculator_t<out_calc_t>;
+    const auto rest = jitted_rest(desc, scalar_val, extra_args);
+    H::template launch_jitted<int, array_t, ic_t, oc_t, loader_t, storer_t>(
+        reinterpret_cast<cudaFunction_t>(fn_cache.function), grid, num_threads(), rest, N, data, ic, oc, l, s);
+    return;
+  } else {
+  if (at::cuda::host_trace::harvesting()) {
+    report_jitted_launch(fn_cache, grid, desc, scalar_pos, scalar_val, extra_args, static_cast<int>(N), data, ic, oc, l, s);
+  }
+#endif
   auto args = pack_kernel_args({&N, &data, &ic, &oc, &l, &s, scalar_val}, extra_args);
   at::cuda::jit::launch_jitted_pwise_function(fn_cache, args.data(), {grid, 1u, 1u},
   {num_threads(), 1u, 1u});
+#ifndef USE_ROCM
+  }
+#endif
 }
 
-template<int arity, typename array_t>
+template<int arity, class H = EagerHost, typename data_t>
 void launch_jitted_vectorized_kernel(
     std::mutex &jiterator_mutex, JittedVecKernelCache &fn_cache,
-    const at::cuda::jit::KernelDescriptor &desc, int64_t N, array_t data,
+    const at::cuda::jit::KernelDescriptor &desc, typename H::int_t N, data_t data,
     at::cuda::jit::BinaryFuncVariant scalar_pos,
     const void *scalar_val, c10::ArrayRef<const void*> extra_args) {
-  TORCH_INTERNAL_ASSERT(N > 0 && N <= std::numeric_limits<int32_t>::max());
+  if constexpr (!H::symbolic) {
+    TORCH_INTERNAL_ASSERT(N > 0 && N <= std::numeric_limits<int32_t>::max());
+  }
 
   int tws = at::cuda::jit::calc_thread_work_size(desc.nInputs, desc.nOutputs, desc.f_inputs_type, desc.result_type);
   int bws = tws * num_threads();
   // N is still int64_t for the computation, but it's always safe to cast result to int
-  const uint32_t grid = (N + bws - 1) / bws;
+  const std::conditional_t<H::symbolic, c10::SymInt, uint32_t> grid = (N + bws - 1) / bws;
 
+  using pointer_t = typename data_t::value_type;
   int vec_size = at::cuda::jit::can_vectorize_up_to(
-      desc, c10::ArrayRef<char*>(data.data(), data.size()));
+      desc, c10::ArrayRef<pointer_t>(data.data(), data.size()));
 
 #ifndef USE_ROCM
   const auto input_size = c10::scalarTypeToTypeMeta(desc.f_inputs_type).itemsize();
@@ -181,7 +243,29 @@ void launch_jitted_vectorized_kernel(
     }
   }
 
+#ifndef USE_ROCM
+  if constexpr (H::symbolic) {
+    using array_t = std::array<char*, std::tuple_size_v<data_t>>;
+    const auto rest = jitted_rest(desc, scalar_val, extra_args);
+    const auto function = reinterpret_cast<cudaFunction_t>(fn_ptr->function);
+    if (vectorized) {
+      H::template launch_jitted<int, array_t>(function, grid, num_threads(), rest, N, data);
+    } else {
+      auto ic = TrivialOffsetCalculator<arity>();
+      auto oc = TrivialOffsetCalculator<1>();
+      auto l = memory::LoadWithoutCast();
+      auto s = memory::StoreWithoutCast();
+      H::template launch_jitted<int, array_t, decltype(ic), decltype(oc), decltype(l), decltype(s)>(function, grid, num_threads(), rest, N, data, ic, oc, l, s);
+    }
+    return;
+  } else
+#endif
   if (vectorized) {
+#ifndef USE_ROCM
+    if (at::cuda::host_trace::harvesting()) {
+      report_jitted_launch(*fn_ptr, grid, desc, scalar_pos, scalar_val, extra_args, static_cast<int>(N), data);
+    }
+#endif
     auto args = pack_kernel_args({&N, &data, scalar_val}, extra_args);
     at::cuda::jit::launch_jitted_pwise_function(
         *fn_ptr, args.data(), {grid, 1u, 1u}, {num_threads(), 1u, 1u});
@@ -195,6 +279,11 @@ void launch_jitted_vectorized_kernel(
     auto l = memory::LoadWithoutCast();
     auto s = memory::StoreWithoutCast();
 
+#ifndef USE_ROCM
+    if (at::cuda::host_trace::harvesting()) {
+      report_jitted_launch(*fn_ptr, grid, desc, scalar_pos, scalar_val, extra_args, static_cast<int>(N), data, ic, oc, l, s);
+    }
+#endif
     auto args = pack_kernel_args(
         {&N, &data, &ic, &oc, &l, &s, scalar_val}, extra_args);
     at::cuda::jit::launch_jitted_pwise_function(
@@ -203,7 +292,7 @@ void launch_jitted_vectorized_kernel(
   }
 }
 
-template <int arity>
+template <int arity, class H = EagerHost>
 void jitted_gpu_kernel_generic(
     std::mutex &jiterator_mutex,
     JittedKernelVariantCache &cache,
@@ -218,13 +307,32 @@ void jitted_gpu_kernel_generic(
   TORCH_INTERNAL_ASSERT(iter.noutputs() == 1);
 
   constexpr int ntensors = arity + 1;
-  std::array<char*, ntensors> data;
-  for (auto i : c10::irange(ntensors)) {
-    data[i] = (char*)iter.data_ptr(i);
-  }
+  auto data = H::template data<ntensors>(iter);
 
-  int64_t numel = iter.numel();
+  typename H::int_t numel = H::numel(iter);
   bool contiguous = iter.is_contiguous();
+
+  // make_input/output_offset_calculator, or the symbolic iterator's
+  auto input_calc = [&]() {
+#ifndef USE_ROCM
+    if constexpr (H::symbolic) {
+      return H::template offset_calculator<arity>(iter, 1, /*element_strides=*/true);
+    } else
+#endif
+    {
+      return make_input_offset_calculator<arity>(iter);
+    }
+  };
+  auto output_calc = [&]() {
+#ifndef USE_ROCM
+    if constexpr (H::symbolic) {
+      return H::template offset_calculator<1>(iter, 0, /*element_strides=*/true);
+    } else
+#endif
+    {
+      return make_output_offset_calculator(iter);
+    }
+  };
 
   // Decides which of 4 kernel types to launch
   // Variations are:
@@ -237,18 +345,18 @@ void jitted_gpu_kernel_generic(
   if (!dynamic_casting) {
     if (contiguous) {
       // Case 1: no dynamic casting and contiguous
-      launch_jitted_vectorized_kernel<arity>(
+      launch_jitted_vectorized_kernel<arity, H>(
           jiterator_mutex, cache.vec, desc,
           numel, data, scalar_pos, scalar_val, extra_args);
       return;
     }
 
     // Case 2: no dynamic casting and noncontiguous
-    auto input_offset_calculator = make_input_offset_calculator<arity>(iter);
-    auto output_offset_calculator = make_output_offset_calculator(iter);
+    auto input_offset_calculator = input_calc();
+    auto output_offset_calculator = output_calc();
     auto loader = memory::LoadWithoutCast();
     auto storer = memory::StoreWithoutCast();
-    launch_jitted_unrolled_kernel(
+    launch_jitted_unrolled_kernel<H>(
         jiterator_mutex, cache.noncontiguous, desc, numel, data,
         input_offset_calculator, output_offset_calculator, loader,
         storer, contiguous, scalar_pos, scalar_val, extra_args);
@@ -268,16 +376,16 @@ void jitted_gpu_kernel_generic(
     // Case 3: dynamic casting and contiguous
     auto input_offset_calculator = TrivialOffsetCalculator<arity>();
     auto output_offset_calculator = TrivialOffsetCalculator<1>();
-    launch_jitted_unrolled_kernel(
+    launch_jitted_unrolled_kernel<H>(
         jiterator_mutex, cache.dynamic_contiguous, desc, numel, data, input_offset_calculator,
         output_offset_calculator, loader, storer, contiguous, scalar_pos, scalar_val, extra_args);
     return;
   }
 
   // Case 4: dynamic casting and noncontiguous
-  auto input_offset_calculator = make_input_offset_calculator<arity>(iter);
-  auto output_offset_calculator = make_output_offset_calculator(iter);
-  launch_jitted_unrolled_kernel(
+  auto input_offset_calculator = input_calc();
+  auto output_offset_calculator = output_calc();
+  launch_jitted_unrolled_kernel<H>(
       jiterator_mutex, cache.dynamic_noncontiguous, desc, numel, data, input_offset_calculator,
       output_offset_calculator, loader, storer, contiguous, scalar_pos, scalar_val, extra_args);
 }
@@ -310,6 +418,12 @@ static void jitted_gpu_kernel_impl(
 
   auto &cache = device_caches[iter.device().index()];
   auto extra_args_array = tuple_to_array(extra_args);
+#ifndef USE_ROCM
+  if (C10_UNLIKELY(iter.is_symbolic())) {
+    return jitted_gpu_kernel_generic<arity, at::cuda::host_trace::SymHost>(
+        jiterator_mutex, cache, desc, scalar_pos, extra_args_array, iter, dynamic_casting, &scalar_val);
+  }
+#endif
   return jitted_gpu_kernel_generic<arity>(
       jiterator_mutex,
       cache,

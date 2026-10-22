@@ -53,6 +53,22 @@ void sigmoid_backward_kernel_cuda(TensorIteratorBase& iter) {
   }
 }
 
+template <typename scalar_t, typename T_ACC>
+struct LogitBackwardFunctor {
+  T_ACC lo;
+  T_ACC hi;
+  __device__ scalar_t operator()(scalar_t dy, scalar_t x) const {
+    const T_ACC dy_acc = static_cast<T_ACC>(dy);
+    const T_ACC x_acc = static_cast<T_ACC>(x);
+    return (x_acc < lo || x_acc > hi)
+        ? T_ACC(0)
+        : dy_acc / (x_acc * (T_ACC(1) - x_acc));
+  }
+  auto host_trace_fields() const {
+    return std::tie(lo, hi);
+  }
+};
+
 void logit_backward_kernel_cuda(TensorIteratorBase& iter, const Scalar& eps_scalar) {
   AT_DISPATCH_FLOATING_TYPES_AND2(
       at::ScalarType::Half,
@@ -74,14 +90,7 @@ void logit_backward_kernel_cuda(TensorIteratorBase& iter, const Scalar& eps_scal
         } else {
           const T_ACC lo = eps;
           const T_ACC hi = T_ACC(1) - eps;
-          gpu_kernel(
-              iter, [lo, hi] GPU_LAMBDA(scalar_t dy, scalar_t x) -> scalar_t {
-                const T_ACC dy_acc = static_cast<T_ACC>(dy);
-                const T_ACC x_acc = static_cast<T_ACC>(x);
-                return (x_acc < lo || x_acc > hi)
-                    ? T_ACC(0)
-                    : dy_acc / (x_acc * (T_ACC(1) - x_acc));
-              });
+          gpu_kernel(iter, LogitBackwardFunctor<scalar_t, T_ACC>{lo, hi});
         }
       });
 }

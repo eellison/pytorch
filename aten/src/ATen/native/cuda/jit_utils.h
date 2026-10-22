@@ -2,9 +2,11 @@
 
 #include <string>
 
+#include <c10/core/SymInt.h>
 #include <c10/util/irange.h>
 #include <ATen/jit_macros.h>
 #include <ATen/cuda/detail/LazyNVRTC.h>
+#include <ATen/native/cuda/VectorWidth.h>
 
 namespace at::cuda::jit {
 
@@ -51,30 +53,22 @@ KernelDescriptor make_kernel_descriptor(
   return ret;
 }
 
-inline int can_vectorize_up_to(size_t default_alignment, void *pointer) {
-  auto ip = reinterpret_cast<uintptr_t>(pointer);
-#ifdef USE_ROCM
-  if ((default_alignment == 1) && (ip % (16 * default_alignment) == 0)) {
-    return 16;
-  }
-  if ((default_alignment <= 2) && (ip % (8 * default_alignment) == 0)) {
-    return 8;
-  }
-#else
-  if (ip % (8 * default_alignment) == 0) {
-    return 8;
-  }
-#endif
-  if (ip % (4 * default_alignment) == 0) {
-    return 4;
-  }
-  if (ip % (2 * default_alignment) == 0) {
-    return 2;
-  }
-  return 1;
+template <typename address_t>
+inline int can_vectorize_up_to_address(size_t default_alignment, const address_t& ip) {
+  return at::native::vector_width_for(static_cast<int64_t>(default_alignment), ip);
 }
 
-inline int can_vectorize_up_to(const KernelDescriptor &desc, c10::ArrayRef<char*> pointers) {
+inline int can_vectorize_up_to(size_t default_alignment, void *pointer) {
+  return can_vectorize_up_to_address(default_alignment, static_cast<int64_t>(reinterpret_cast<uintptr_t>(pointer)));
+}
+
+inline int can_vectorize_up_to(size_t default_alignment, const c10::SymInt& address) {
+  return can_vectorize_up_to_address(default_alignment, address);
+}
+
+// pointer_t: char*, or a host trace's SymInt address
+template <typename pointer_t>
+inline int can_vectorize_up_to(const KernelDescriptor &desc, c10::ArrayRef<pointer_t> pointers) {
   TORCH_INTERNAL_ASSERT(desc.nOutputs == 1);
   TORCH_INTERNAL_ASSERT(static_cast<int64_t>(pointers.size()) == 1 + desc.nInputs);
 

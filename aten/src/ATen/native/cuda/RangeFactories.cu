@@ -10,6 +10,8 @@
 #include <limits>
 #if defined(USE_ROCM)
 #include <algorithm>
+#else
+#include <ATen/cuda/host_trace/Ops.h>
 #endif
 
 #ifndef AT_PER_OPERATOR_HEADERS
@@ -17,6 +19,7 @@
 #include <ATen/NativeFunctions.h>
 #else
 #include <ATen/ops/arange_native.h>
+#include <ATen/ops/empty.h>
 #include <ATen/ops/empty_like.h>
 #include <ATen/ops/linspace_native.h>
 #include <ATen/ops/logspace_native.h>
@@ -106,6 +109,17 @@ void gpu_kernel_with_index(at::Tensor &output, func_t f) {
   }
 #endif
 }
+
+template <typename scalar_t, typename accscalar_t>
+struct ArangeFunctor {
+  __device__ __host__ scalar_t operator()(int64_t ind) const {
+    accscalar_t inc = xstep * static_cast<accscalar_t>(ind);
+    accscalar_t val = xstart + inc;
+    return static_cast<scalar_t>(val);
+  }
+  accscalar_t xstart;
+  accscalar_t xstep;
+};
 
 }  // namespace
 
@@ -269,11 +283,7 @@ Tensor& arange_cuda_out(const Scalar& start, const Scalar& end, const Scalar& st
     bool is_contiguous = result.is_contiguous();
     Tensor r = !is_contiguous ? at::empty_like(result, LEGACY_CONTIGUOUS_MEMORY_FORMAT) : result;
 
-    gpu_kernel_with_index(r, [xstart, xstep]GPU_LAMBDA(int64_t ind) -> scalar_t {
-        accscalar_t inc = xstep * static_cast<accscalar_t>(ind);
-        accscalar_t val = xstart + inc;
-        return static_cast<scalar_t>(val);
-    });
+    gpu_kernel_with_index(r, ArangeFunctor<scalar_t, accscalar_t>{xstart, xstep});
 
     if(!is_contiguous) {
       result.copy_(r);
@@ -284,3 +294,43 @@ Tensor& arange_cuda_out(const Scalar& start, const Scalar& end, const Scalar& st
 }
 
 } // namespace at::native
+
+#if !defined(USE_ROCM)
+// Traced host (ATen/cuda/host_trace/Ops.h)
+namespace at::cuda::host_trace {
+
+TensorBase arange(Recorder& rec, const c10::SymInt& size, const Scalar& start, const Scalar& step, ScalarType dtype, Device device) {
+  const TensorBase result = at::empty_symint({size}, at::TensorOptions().dtype(dtype).device(device));
+  AT_DISPATCH_ALL_TYPES_AND2(kHalf, kBFloat16, dtype, "arange_cuda", [&] {
+    using accscalar_t = at::acc_type<scalar_t, true>;
+    using F = ArangeFunctor<scalar_t, accscalar_t>;
+    Param<F> f;
+    if constexpr (std::is_integral_v<accscalar_t>) {
+      if (!start.isIntegral(false) || !step.isIntegral(false)) {
+        decline("an integral arange of a floating start or step");
+      }
+      f.set(f.value().xstart, start.toSymInt());
+      f.set(f.value().xstep, step.toSymInt());
+    } else {
+      if (start.isSymbolic() || step.isSymbolic()) {
+        decline("a floating arange of a symbolic start or step");
+      }
+      f = Param<F>(F{start.to<accscalar_t>(), step.to<accscalar_t>()});
+    }
+    // gpu_kernel_with_index's launch (keep in sync)
+    if (size == 0) {
+      return;
+    }
+    const SymDim3 grid((size + block_work_size - 1) / block_work_size);
+    const auto data = scalar_param<scalar_t*>(rec.data_ptr(result));
+    if (size <= std::numeric_limits<int>::max()) {
+      launch(rec, &elementwise_kernel_with_index<int, F>, grid, SymDim3(num_threads()), 0, scalar_param<int>(size), f, data);
+    } else {
+      launch(rec, &elementwise_kernel_with_index<int64_t, F>, grid, SymDim3(num_threads()), 0, scalar_param<int64_t>(size), f, data);
+    }
+  });
+  return result;
+}
+
+} // namespace at::cuda::host_trace
+#endif

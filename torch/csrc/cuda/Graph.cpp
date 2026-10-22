@@ -2,6 +2,7 @@
 
 #include <pybind11/chrono.h>
 #include <pybind11/stl.h>
+#include <torch/csrc/Generator.h>
 
 #include <torch/csrc/jit/python/pybind_utils.h>
 #include <torch/csrc/utils/pybind.h>
@@ -79,6 +80,17 @@ void THCPGraph_init(PyObject* module) {
       .def(
           "replay",
           torch::wrap_pybind_function_no_gil(&at::cuda::CUDAGraph::replay))
+      .def(
+          "set_generator_increment",
+          [](::at::cuda::CUDAGraph& self,
+             py::handle generator,
+             uint64_t increment) {
+            at::Generator gen = THPGenerator_Unwrap(generator.ptr());
+            py::gil_scoped_release no_gil;
+            self.set_generator_increment(gen, increment);
+          },
+          py::arg("generator"),
+          py::arg("increment"))
       .def(
           "reset",
           torch::wrap_pybind_function_no_gil(&at::cuda::CUDAGraph::reset))

@@ -279,23 +279,28 @@ void logaddexp_kernel_cuda(TensorIteratorBase& iter) {
   }
 }
 
+template <typename scalar_t, typename opmath_t>
+struct LogAddExp2Functor {
+  __device__ scalar_t operator()(scalar_t a_, scalar_t b_) const {
+    const auto inv_log_2 = static_cast<opmath_t>(1.0 / c10::ln_2<double>);
+    const auto a = static_cast<opmath_t>(a_);
+    const auto b = static_cast<opmath_t>(b_);
+    if (::isinf(a) && a == b) {
+      return a;
+    } else {
+      const auto m = ::max(a, b);
+      return m + ::log1p(::exp2(-::abs(a - b))) * inv_log_2;
+    }
+  }
+};
+
 void logaddexp2_kernel_cuda(TensorIteratorBase& iter) {
   AT_DISPATCH_FLOATING_TYPES_AND2(
       ScalarType::BFloat16, ScalarType::Half,
       iter.dtype(), "logaddexp2_cuda",
       [&]() {
         using opmath_t = at::opmath_type<scalar_t>;
-        const auto inv_log_2 = static_cast<opmath_t>(1.0 / c10::ln_2<double>);
-        gpu_kernel(iter, [inv_log_2] GPU_LAMBDA (scalar_t a_, scalar_t b_) -> scalar_t {
-          const auto a = static_cast<opmath_t>(a_);
-          const auto b = static_cast<opmath_t>(b_);
-          if (::isinf(a) && a == b) {
-            return a;
-          } else {
-            const auto m = ::max(a, b);
-            return m + ::log1p(::exp2(-::abs(a - b))) * inv_log_2;
-          }
-        });
+        gpu_kernel(iter, LogAddExp2Functor<scalar_t, opmath_t>());
       });
 }
 

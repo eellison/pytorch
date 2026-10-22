@@ -70,6 +70,8 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
 
     from torch._inductor import metrics
+    from torch._inductor.cudagraph_utils import CUDAGraphPolicy
+    from torch.cuda._host_trace_tape import TrustedInputs
     from torch._inductor.graph import GraphLowering
     from torch._library.fake_class_registry import FakeScriptObject
     from torch.export.pt2_archive._package_weights import Weights
@@ -178,12 +180,27 @@ def copy_strided_storage_(dst: torch.Tensor, src: torch.Tensor) -> None:
     )
 
 
+def _active_cudagraph_policy() -> CUDAGraphPolicy | None:
+    policy = config.cudagraph_policy
+    if not config.triton.cudagraph_host_trace:
+        return policy
+    if policy is not None:
+        raise RuntimeError(
+            "config.cudagraph_policy and config.triton.cudagraph_host_trace are both set"
+        )
+    from torch._inductor.cudagraph_host_trace import HostTracePolicy
+
+    return HostTracePolicy()
+
+
 def maybe_handle_backward_generation(
     compiled_graph: CompiledFxGraph,
     boxed_forward_device_index: BoxedDeviceIndex | None,
 ) -> None:
     if compiled_graph.current_callable is None:
         raise AssertionError("compiled_graph.current_callable must not be None")
+    if config.triton.cudagraph_host_trace:
+        return
     is_backward = compiled_graph.fx_kwargs["is_backward"]
 
     # See [Backward Generation Handling]
@@ -215,7 +232,7 @@ def prepare_cudagraph_post_compile(
     example_inputs: Sequence[InputType],
     boxed_forward_device_index: BoxedDeviceIndex | None,
 ) -> None:
-    if not config.triton.cudagraph_trees:
+    if not config.triton.cudagraph_trees and not config.triton.cudagraph_host_trace:
         # Force specialize all inputs so that CUDA graphs will work
         for t in example_inputs:
             if isinstance(t, torch.SymInt):
@@ -294,7 +311,10 @@ def cudagraph_post_compile(
             user_visible_output_idxs=tuple(user_visible_output_idxs),
         )
 
-        policy = config.cudagraph_policy
+        policy = _active_cudagraph_policy()
+        if config.triton.cudagraph_host_trace:
+            cudagraphify_kwargs["graph_inputs"] = compiled_graph.host_trace_inputs
+            cudagraphify_kwargs["seeds"] = compiled_graph.host_trace_seeds
         if policy is not None:
             compiled_graph.current_callable = policy.cudagraphify(
                 current_callable,
@@ -740,6 +760,15 @@ class CompiledFxGraph(OutputCode):
                 )
 
         self.cudagraph_info = cudagraph_info
+        # kept here: post_compile's example inputs are another graph's on an
+        # AOT autograd cache hit, which hands a backward its forward's
+        self.host_trace_inputs: TrustedInputs | str | None = None
+        self.host_trace_seeds: tuple[int, ...] = ()
+        if config.triton.cudagraph_host_trace:
+            from torch._inductor.cudagraph_host_trace import graph_inputs, graph_seeds
+
+            self.host_trace_inputs = graph_inputs(example_inputs)
+            self.host_trace_seeds = graph_seeds(example_inputs)
         self.compile_region_name = compile_region_name
         self.inputs_to_check = inputs_to_check
         self.fx_kwargs = fx_kwargs
@@ -886,7 +915,7 @@ class CompiledFxGraph(OutputCode):
         # outer level via policy.wrap_output), disable cudagraphs for
         # this graph so the rest of post_compile (input realignment,
         # _wrap_compiled_regions) still runs normally.
-        policy = config.cudagraph_policy
+        policy = _active_cudagraph_policy()
         if policy is not None and not policy.should_wrap(self):
             counters["inductor"]["cudagraph_skips"] += 1
             BoxedBool.disable(cudagraphs)
@@ -943,8 +972,12 @@ class CompiledFxGraph(OutputCode):
         inputs_to_check = self.inputs_to_check
         # cudagraphs could have been disabled from the earlier conditions
         # so we still need to realign inputs if that happens
+        ran_cudagraphs = cudagraphs
+        if config.triton.cudagraph_host_trace:
+            # the realigning wrapper goes outside the host trace installation
+            ran_cudagraphs = BoxedBool(False)
         maybe_realign_inputs(
-            cudagraphs,
+            ran_cudagraphs,
             self,
             inputs_to_check,
             self.mutated_input_idxs,

@@ -36,6 +36,25 @@ void check_zero_points_cuda(
     "zero_point is above upper bound.");
 }
 
+template <typename scalar_t>
+struct QuantizePerTensorAffineFunctor {
+  double scale;
+  int64_t zero_point;
+  int64_t qmin;
+  int64_t qmax;
+  __device__ scalar_t operator()(float raw_val, scalar_t quantized_val) const {
+    int64_t qvalue =
+        static_cast<int64_t>(std::nearbyint(raw_val / scale) + zero_point);
+    qvalue = std::max<int64_t>(qvalue, qmin);
+    qvalue = std::min<int64_t>(qvalue, qmax);
+    quantized_val.val_ = qvalue;
+    return quantized_val;
+  }
+  auto host_trace_fields() const {
+    return std::tie(scale, zero_point, qmin, qmax);
+  }
+};
+
 void quantize_tensor_per_tensor_affine_cuda(
     const Tensor& rtensor,
     Tensor& qtensor,
@@ -52,18 +71,21 @@ void quantize_tensor_per_tensor_affine_cuda(
                         .add_input(rtensor)
                         .add_input(qtensor)
                         .build();
-        gpu_kernel(
-            iter,
-            [=] GPU_LAMBDA(float raw_val, scalar_t quantized_val) -> scalar_t {
-              int64_t qvalue =
-                  static_cast<int64_t>(std::nearbyint(raw_val / scale) + zero_point);
-              qvalue = std::max<int64_t>(qvalue, qmin);
-              qvalue = std::min<int64_t>(qvalue, qmax);
-              quantized_val.val_ = qvalue;
-              return quantized_val;
-            });
+        gpu_kernel(iter, QuantizePerTensorAffineFunctor<scalar_t>{scale, zero_point, qmin, qmax});
       });
 }
+
+template <typename scalar_t>
+struct DequantizePerTensorAffineFunctor {
+  int64_t zero_point;
+  double scale;
+  __device__ float operator()(scalar_t value) const {
+    return (static_cast<float>(value.val_) - zero_point) * scale;
+  }
+  auto host_trace_fields() const {
+    return std::tie(zero_point, scale);
+  }
+};
 
 void dequantize_tensor_per_tensor_affine_cuda(
     const Tensor& qtensor,
@@ -77,11 +99,27 @@ void dequantize_tensor_per_tensor_affine_cuda(
                         .add_output(rtensor)
                         .add_input(qtensor)
                         .build();
-        gpu_kernel(iter, [=] GPU_LAMBDA(scalar_t value) -> float {
-          return (static_cast<float>(value.val_) - zero_point) * scale;
-        });
+        gpu_kernel(iter, DequantizePerTensorAffineFunctor<scalar_t>{zero_point, scale});
       });
 }
+
+template <typename scalar_t>
+struct QuantizePerChannelAffineFunctor {
+  int64_t qmin;
+  int64_t qmax;
+  __device__ scalar_t operator()(float raw_val, scalar_t quantized_val, double scale, int64_t zero_point) const {
+
+    int64_t qvalue =
+        static_cast<int64_t>(std::nearbyint(raw_val/scale) + zero_point);
+    qvalue = std::max<int64_t>(qvalue, qmin);
+    qvalue = std::min<int64_t>(qvalue, qmax);
+    quantized_val.val_ = qvalue;
+    return quantized_val;
+  }
+  auto host_trace_fields() const {
+    return std::tie(qmin, qmax);
+  }
+};
 
 void quantize_tensor_per_channel_affine_cuda(
     const Tensor& rtensor,
@@ -112,17 +150,7 @@ void quantize_tensor_per_channel_affine_cuda(
       constexpr int64_t qmin = std::numeric_limits<underlying_t>::min();
       constexpr int64_t qmax = std::numeric_limits<underlying_t>::max();
       // trying to match _quantize_per_channel_ref_nd in test_quantized_tensor.py
-      gpu_kernel(
-          iter,
-          [=] GPU_LAMBDA(float raw_val, scalar_t quantized_val, double scale, int64_t zero_point) -> scalar_t {
-
-            int64_t qvalue =
-                static_cast<int64_t>(std::nearbyint(raw_val/scale) + zero_point);
-            qvalue = std::max<int64_t>(qvalue, qmin);
-            qvalue = std::min<int64_t>(qvalue, qmax);
-            quantized_val.val_ = qvalue;
-            return quantized_val;
-          });
+      gpu_kernel(iter, QuantizePerChannelAffineFunctor<scalar_t>{qmin, qmax});
     });
 }
 
@@ -155,12 +183,33 @@ void dequantize_tensor_per_channel_affine_cuda(
 
         gpu_kernel(
             iter,
-            [=] GPU_LAMBDA(
+            [] GPU_LAMBDA(
                 scalar_t value, double scale, int64_t zero_point) -> float {
               return static_cast<float>(value.val_ - zero_point) * scale;
             });
       });
 }
+
+template <typename scalar_t>
+struct QuantizePerChannelFloatQparamsFunctor {
+  int64_t qmin;
+  int64_t qmax;
+  __device__ scalar_t operator()(
+      float raw_val,
+      scalar_t quantized_val,
+      float scale,
+      float zero_point) const {
+    float inv_scale = 1.0f / scale;
+    int64_t qvalue = lrintf(raw_val * inv_scale + zero_point);
+    qvalue = std::max<int64_t>(qvalue, qmin);
+    qvalue = std::min<int64_t>(qvalue, qmax);
+    quantized_val.val_ = qvalue;
+    return quantized_val;
+  }
+  auto host_trace_fields() const {
+    return std::tie(qmin, qmax);
+  }
+};
 
 void quantize_tensor_per_channel_float_qparams_cuda(
     const Tensor& rtensor,
@@ -193,20 +242,7 @@ void quantize_tensor_per_channel_float_qparams_cuda(
         constexpr int64_t qmin = std::numeric_limits<underlying_t>::min();
         constexpr int64_t qmax = std::numeric_limits<underlying_t>::max();
         // trying to match _quantize_per_channel_ref_nd in
-        gpu_kernel(
-            iter,
-            [=] GPU_LAMBDA(
-                float raw_val,
-                scalar_t quantized_val,
-                float scale,
-                float zero_point) -> scalar_t {
-              float inv_scale = 1.0f / scale;
-              int64_t qvalue = lrintf(raw_val * inv_scale + zero_point);
-              qvalue = std::max<int64_t>(qvalue, qmin);
-              qvalue = std::min<int64_t>(qvalue, qmax);
-              quantized_val.val_ = qvalue;
-              return quantized_val;
-            });
+        gpu_kernel(iter, QuantizePerChannelFloatQparamsFunctor<scalar_t>{qmin, qmax});
       });
 }
 
@@ -239,7 +275,7 @@ void dequantize_tensor_per_channel_float_qparams_cuda(
 
         gpu_kernel(
             iter,
-            [=] GPU_LAMBDA(
+            [] GPU_LAMBDA(
                 scalar_t value, float scale, float zero_point) -> float {
               return (static_cast<float>(value.val_) - zero_point) * scale;
             });

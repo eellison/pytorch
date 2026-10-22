@@ -40,6 +40,15 @@ inline Tensor restride_dim(
   return src.as_strided(replacement_shape, strides);
 }
 
+inline Tensor restride_dim_symint(
+  const Tensor& src, int64_t dim,
+  c10::SymIntArrayRef replacement_shape
+) {
+  auto strides = ensure_nonempty_vec(src.sym_strides().vec());
+  strides[dim] = 0;
+  return src.as_strided_symint(replacement_shape, strides);
+}
+
 inline void _dimreduce_setup(const Tensor &result, const Tensor &self,
                                 int64_t dim) {
   IntArrayRef self_sizes = self.sizes();
@@ -136,6 +145,22 @@ inline DimMask make_dim_mask(OptionalIntArrayRef opt_dims, int64_t ndim, bool al
   return mask;
 }
 
+// over int64_t sizes, or a symbolic tensor's (a CUDA graph host trace's) SymInt ones
+template <typename Shape, typename T>
+inline Shape shape_from_dim_mask(c10::ArrayRef<T> sizes, DimMask mask, bool keepdim) {
+  auto shape = Shape(sizes.begin(), sizes.end());
+  for (int dim = shape.size() - 1; dim >= 0; dim--) {
+    if (mask[dim]) {
+      if (keepdim) {
+        shape[dim] = 1;
+      } else {
+        shape.erase(shape.begin() + dim);
+      }
+    }
+  }
+  return shape;
+}
+
 inline DimVector shape_from_dim_mask(const Tensor& self, DimMask mask, bool keepdim) {
   auto shape = DimVector(self.sizes());
   for (int dim = shape.size() - 1; dim >= 0; dim--) {
@@ -154,8 +179,13 @@ inline void resize_reduction_result(
     Tensor& result, const Tensor& self, DimMask mask, bool keepdim,
     ScalarType /*dtype*/)
 {
-  auto shape = shape_from_dim_mask(self, mask, keepdim);
   TORCH_CHECK(result.defined(), "Cannot create a new tensor inside a reduction op. You likely tried to call an operator with an out argument but the out argument was an undefined tensor.");
+  if (C10_UNLIKELY(self.unsafeGetTensorImpl()->has_symbolic_sizes_strides())) {
+    // a symbolic tensor (a CUDA graph host trace): the same shape over SymInt
+    at::native::resize_output_symint(result, shape_from_dim_mask<c10::SymDimVector>(self.sym_sizes(), mask, keepdim));
+    return;
+  }
+  auto shape = shape_from_dim_mask(self, mask, keepdim);
   at::native::resize_output(result, shape);
 }
 
@@ -170,6 +200,18 @@ inline Tensor create_reduction_result(
 inline Tensor review_reduce_result(const Tensor& result, int ndim, DimMask mask, bool keepdim) {
   if (keepdim) {
     return result;
+  }
+  if (C10_UNLIKELY(result.unsafeGetTensorImpl()->has_symbolic_sizes_strides())) {
+    // a symbolic result (a CUDA graph host trace): the same view over SymInt
+    auto shape = c10::SymDimVector(result.sym_sizes().begin(), result.sym_sizes().end());
+    auto stride = c10::SymDimVector(result.sym_strides().begin(), result.sym_strides().end());
+    for (const auto dim : c10::irange(ndim)) {
+      if (mask[dim]) {
+        shape.insert(shape.begin() + dim, 1);
+        stride.insert(stride.begin() + dim, 0);
+      }
+    }
+    return result.as_strided_symint(shape, stride);
   }
   auto shape = DimVector(result.sizes());
   auto stride = DimVector(result.strides());
@@ -383,6 +425,13 @@ inline void resize_reduction(
     bool allow_empty_dims=false) {
   DimVector dims_ = at::native::make_dim_vector(opt_dims, self.dim());
   maybe_wrap_dims(dims_, self.dim());
+  if (C10_UNLIKELY(self.unsafeGetTensorImpl()->has_symbolic_sizes_strides()) && self.layout() == kStrided) {
+    // a symbolic tensor (a CUDA graph host trace): the same shape over SymInt
+    auto mask = native::make_dim_mask(dims_, self.dim(), allow_empty_dims);
+    auto shape = native::shape_from_dim_mask<c10::SymDimVector>(self.sym_sizes(), mask, keepdim);
+    meta.set_output_raw_strided_symint(0, shape, {}, self.options().dtype(out_dtype));
+    return;
+  }
   auto shape = get_reduction_shape(self, dims_, keepdim, allow_empty_dims);
   if (self.layout() == kStrided) {
     meta.set_output_raw_strided(0, shape, {}, self.options().dtype(out_dtype));

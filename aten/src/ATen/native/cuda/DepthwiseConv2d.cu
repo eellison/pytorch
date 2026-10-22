@@ -6,6 +6,9 @@
 #include <ATen/cuda/CUDABlas.h>
 #include <ATen/cuda/detail/KernelUtils.h>
 #include <ATen/native/ConvUtils.h>
+#if !defined(USE_ROCM)
+#include <ATen/cuda/host_trace/SymImage.h>
+#endif
 #include <ATen/native/cuda/block_reduce.cuh>
 #include <ATen/native/Resize.h>
 #include <ATen/native/IndexingUtils.h>
@@ -357,6 +360,77 @@ __global__ void conv_depthwise2d_grad_weight_kernel(
   }
 }
 
+#if !defined(USE_ROCM)
+// conv_depthwise2d_forward_out in a CUDA graph host trace: the same checks,
+// output and launch over symbolic sizes, the launch recorded
+void sym_conv_depthwise2d_forward_out(
+                  at::cuda::host_trace::Recorder& rec,
+                  const Tensor &input,
+                  const Tensor &output,
+                  const Tensor &weight,
+                  const Tensor &bias,
+                  const int kW, const int kH,
+                  const int dW, const int dH,
+                  const int padW, const int padH,
+                  const int dilationW, const int dilationH) {
+  namespace ht = at::cuda::host_trace;
+  TORCH_CHECK(input.sym_numel() > 0 && input.dim() == 4);
+  TORCH_CHECK(weight.sym_numel() > 0 && weight.dim() == 4);
+  const auto in_sizes = input.sym_sizes();
+  const auto w_sizes = weight.sym_sizes();
+  TORCH_CHECK(w_sizes[1] == 1);
+  TORCH_CHECK(w_sizes[0] % in_sizes[1] == 0);
+  const bool has_bias = bias.defined();
+  TORCH_CHECK(!has_bias || (bias.dim() <= 1 && bias.sym_numel() == w_sizes[0]));
+  const c10::SymInt height = in_sizes[2];
+  const c10::SymInt width = in_sizes[3];
+  const c10::SymInt outputChannels = w_sizes[0];
+  // conv_output_size
+  auto out_dim = [](const c10::SymInt& in, int64_t k, int64_t pad, int64_t stride, int64_t dilation) {
+    return (in + 2 * pad - dilation * (k - 1) - 1) / stride + 1;
+  };
+  // conv_depthwise2d_cuda_out passes the kernel's sizes (as ints, its weight's)
+  const c10::SymInt outputHeight = out_dim(height, kH, padH, dH, dilationH);
+  const c10::SymInt outputWidth = out_dim(width, kW, padW, dW, dilationW);
+  at::native::resize_output_symint(output, {in_sizes[0], outputChannels, outputHeight, outputWidth});
+  TORCH_CHECK(output.is_contiguous());
+  const c10::SymInt depthwiseMultiplier = outputChannels / in_sizes[1];
+  TORCH_CHECK(canUse32BitIndexMath(input) && canUse32BitIndexMath(output));
+  const c10::SymInt n = output.sym_numel();
+  // GET_BLOCKS(n)
+  const c10::SymInt blocks = (n - 1) / CUDA_NUM_THREADS + 1;
+  TORCH_INTERNAL_ASSERT(blocks <= std::numeric_limits<int>::max(), "Can't schedule too many blocks on CUDA device");
+  AT_DISPATCH_FLOATING_TYPES_AND2(kHalf, kBFloat16, input.scalar_type(),
+                                  "conv_depthwise2d_forward_cuda", [&] {
+    using In = PackedTensorAccessor32<const scalar_t, 4, DefaultPtrTraits>;
+    using Out = PackedTensorAccessor32<scalar_t, 4, DefaultPtrTraits>;
+    using Bias = PackedTensorAccessor32<const scalar_t, 1, DefaultPtrTraits>;
+    std::vector<ht::ParamImage> params;
+    params.push_back(ht::param_accessor32<In, 4>(rec, input));
+    params.push_back(ht::param_accessor32<Out, 4>(rec, output));
+    params.push_back(ht::param_accessor32<In, 4>(rec, weight));
+    // without a bias: dummy_packed_accessor32's zeros
+    params.push_back(has_bias ? ht::param_accessor32<Bias, 1>(rec, bias) : ht::ParamImage(sizeof(Bias), alignof(Bias)));
+    params.push_back(ht::param_bytes(has_bias));
+    params.push_back(ht::param_of<int32_t>(n));
+    params.push_back(ht::param_of<int>(outputChannels));
+    params.push_back(ht::param_of<int>(depthwiseMultiplier));
+    params.push_back(ht::param_of<int>(width));
+    params.push_back(ht::param_of<int>(height));
+    params.push_back(ht::param_of<int>(outputWidth));
+    params.push_back(ht::param_of<int>(outputHeight));
+    for (const int v : {kW, kH, dW, dH, padW, padH, dilationW, dilationH}) {
+      params.push_back(ht::param_bytes(v));
+    }
+    const void* kernel = kW == 5 && kH == 5 ? reinterpret_cast<const void*>(&conv_depthwise2d_forward_kernel<5, scalar_t, int32_t>)
+        : kW == 3 && kH == 3              ? reinterpret_cast<const void*>(&conv_depthwise2d_forward_kernel<3, scalar_t, int32_t>)
+        : kW == 1 && kH == 1              ? reinterpret_cast<const void*>(&conv_depthwise2d_forward_kernel<1, scalar_t, int32_t>)
+                                          : reinterpret_cast<const void*>(&conv_depthwise2d_forward_kernel_generic<scalar_t, int32_t>);
+    ht::record_images(kernel, std::move(params), blocks, CUDA_NUM_THREADS, 0);
+  });
+}
+#endif
+
 void conv_depthwise2d_forward_out(
                   const Tensor &input,
                   const Tensor &output,
@@ -366,6 +440,11 @@ void conv_depthwise2d_forward_out(
                   const int dW, const int dH,
                   const int padW, const int padH,
                   const int dilationW, const int dilationH) {
+#if !defined(USE_ROCM)
+  if (auto* rec = at::cuda::host_trace::current_recorder()) {
+    return sym_conv_depthwise2d_forward_out(*rec, input, output, weight, bias, kW, kH, dW, dH, padW, padH, dilationW, dilationH);
+  }
+#endif
   // Only handle 4D Input Tensors for now
   TORCH_CHECK(input.numel() > 0 && input.dim() == 4);
   TORCH_CHECK(weight.numel() > 0 && weight.dim() == 4);

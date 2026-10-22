@@ -1664,7 +1664,7 @@
 - func: constant_pad_nd(Tensor self, SymInt[] pad, Scalar value=0) -> Tensor
   variants: function
   dispatch:
-    CompositeExplicitAutograd: constant_pad_nd
+    CompositeExplicitAutograd: constant_pad_nd_symint
     MPS: constant_pad_nd_mps
   autogen: constant_pad_nd.out
   tags: core
@@ -3298,14 +3298,14 @@
   dispatch:
     CompositeImplicitAutograd: rms_norm_symint
 
-- func: _fused_rms_norm(Tensor input, int[] normalized_shape, Tensor? weight, float? eps) -> (Tensor, Tensor)
+- func: _fused_rms_norm(Tensor input, SymInt[] normalized_shape, Tensor? weight, float? eps) -> (Tensor, Tensor)
   dispatch:
     CUDA: _fused_rms_norm_cuda
     MPS: _fused_rms_norm_mps
     XPU: _fused_rms_norm_xpu
-    CompositeImplicitAutograd: rms_norm_composite
+    CompositeImplicitAutograd: rms_norm_composite_symint
 
-- func: _fused_rms_norm_backward(Tensor grad_out, Tensor input, int[] normalized_shape, Tensor rstd, Tensor? weight, bool[2] output_mask) -> (Tensor, Tensor)
+- func: _fused_rms_norm_backward(Tensor grad_out, Tensor input, SymInt[] normalized_shape, Tensor rstd, Tensor? weight, bool[2] output_mask) -> (Tensor, Tensor)
   dispatch:
     CUDA: _fused_rms_norm_backward_cuda
     XPU: _fused_rms_norm_backward_xpu
@@ -5530,7 +5530,7 @@
   device_check: NoCheck
   device_guard: False
   dispatch:
-    CompositeExplicitAutograd: slice_backward
+    CompositeExplicitAutograd: slice_backward_symint
   autogen: slice_backward.out
 
 # NB: This op exists to back the implementation of reverse view_funcs for various views (chunk,

@@ -76,6 +76,14 @@ struct IntDivider {
 };
 
 // Implement fast integer division.
+// IntDivider<unsigned int>'s magic number m' for divisor d and shift
+// ceil(log2(d)), over the integer type T (uint64_t, or c10::SymInt for a
+// host trace's recorded launch); pow2(s) is 2**s
+template <typename T, typename Pow2>
+T int_divider_magic(const T& divisor, const T& shift, const Pow2& pow2) {
+  return (T(uint64_t(1) << 32) * (pow2(shift) - divisor)) / divisor + 1;
+}
+
 template <>
 struct IntDivider<unsigned int> {
   static_assert(sizeof(unsigned int) == 4, "Assumes 32-bit unsigned int.");
@@ -88,8 +96,7 @@ struct IntDivider<unsigned int> {
     // TODO: gcc/clang has __builtin_clz() but it's not portable.
     for (shift = 0; shift < 32; shift++) if ((1U << shift) >= divisor) break;
 
-    uint64_t one = 1;
-    uint64_t magic = ((one << 32) * ((one << shift) - divisor)) / divisor + 1;
+    uint64_t magic = int_divider_magic<uint64_t>(divisor, shift, [](uint64_t s) { return uint64_t(1) << s; });
     m1 = magic;
     assert(m1 > 0 && m1 == magic);  // m1 must fit in 32 bits.
   }

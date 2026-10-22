@@ -400,7 +400,7 @@ TORCH_META_FUNC(amax)
     TORCH_CHECK(self.scalar_type() == maybe_result.scalar_type(), "Expected the dtype for input and out to match, but got ",
             self.scalar_type(), " for input's dtype and ",  maybe_result.scalar_type(), " for out's dtype.");
   }
-  if (self.numel() == 0) {
+  if (self.sym_numel() == 0) {
     at::native::zero_numel_check_dims(self, dim, "amax()");
   }
   const ScalarType& out_dtype = maybe_result.defined() ? maybe_result.scalar_type() : self.scalar_type();
@@ -414,7 +414,7 @@ TORCH_META_FUNC(amin)
     TORCH_CHECK(self.scalar_type() == maybe_result.scalar_type(), "Expected the dtype for input and out to match, but got ",
                 self.scalar_type(), " for input's dtype and ",  maybe_result.scalar_type(), " for out's dtype.");
   }
-  if (self.numel() == 0) {
+  if (self.sym_numel() == 0) {
     at::native::zero_numel_check_dims(self, dim, "amin()");
   }
   const ScalarType& out_dtype = maybe_result.defined() ? maybe_result.scalar_type() : self.scalar_type();
@@ -876,12 +876,12 @@ std::tuple<Tensor&, Tensor&> cummax_out(const Tensor& self, int64_t dim, Tensor&
   }
 
   {
-    at::native::resize_output(values, self.sizes());
-    at::native::resize_output(indices, self.sizes());
+    at::native::resize_output_symint(values, self.sym_sizes());
+    at::native::resize_output_symint(indices, self.sym_sizes());
     if(self.dim() == 0) {
       values.fill_(self);
       indices.fill_(0);
-    } else if(self.numel() != 0) {
+    } else if(self.sym_numel() != 0) {
       at::_cummax_helper(self, values, indices, dim);
     }
   }
@@ -889,8 +889,8 @@ std::tuple<Tensor&, Tensor&> cummax_out(const Tensor& self, int64_t dim, Tensor&
 }
 
 std::tuple<Tensor, Tensor> cummax(const Tensor& self, int64_t dim) {
-  auto values = at::empty(self.sizes(), self.options());
-  auto indices = at::empty(self.sizes(), self.options().dtype(at::kLong));
+  auto values = at::empty_symint(self.sym_sizes(), self.options());
+  auto indices = at::empty_symint(self.sym_sizes(), self.options().dtype(at::kLong));
   at::cummax_out(values, indices, self, dim);
   return std::make_tuple(std::move(values), std::move(indices));
 }
@@ -913,12 +913,12 @@ std::tuple<Tensor&, Tensor&> cummin_out(const Tensor& self, int64_t dim, Tensor&
   }
 
   {
-    at::native::resize_output(values, self.sizes());
-    at::native::resize_output(indices, self.sizes());
+    at::native::resize_output_symint(values, self.sym_sizes());
+    at::native::resize_output_symint(indices, self.sym_sizes());
     if(self.dim() == 0) {
       values.fill_(self);
       indices.fill_(0);
-    } else if(self.numel() != 0) {
+    } else if(self.sym_numel() != 0) {
       at::_cummin_helper(self, values, indices, dim);
     }
   }
@@ -926,8 +926,8 @@ std::tuple<Tensor&, Tensor&> cummin_out(const Tensor& self, int64_t dim, Tensor&
 }
 
 std::tuple<Tensor, Tensor> cummin(const Tensor& self, int64_t dim) {
-  auto values = at::empty(self.sizes(), self.options());
-  auto indices = at::empty(self.sizes(), self.options().dtype(at::kLong));
+  auto values = at::empty_symint(self.sym_sizes(), self.options());
+  auto indices = at::empty_symint(self.sym_sizes(), self.options().dtype(at::kLong));
   at::cummin_out(values, indices, self, dim);
   return std::make_tuple(std::move(values), std::move(indices));
 }
@@ -1282,7 +1282,8 @@ TORCH_IMPL_FUNC(sum_out)
  std::optional<ScalarType> opt_dtype,
  const Tensor& result) {
   auto iter = meta::make_reduction_from_out_ty(self, result, opt_dim, keepdim, result.scalar_type());
-  if (iter.numel() == 0) {
+  // a symbolic iterator (a CUDA graph host trace): whether it is empty is a guard
+  if (iter.is_symbolic() ? iter.sym_numel() == 0 : iter.numel() == 0) {
     result.zero_();
   } else {
     // Here is a limitation of TensorIterator reductions for permuted input with lower precision on CPU.
@@ -1392,7 +1393,7 @@ static void impl_func_prod(
     std::optional<ScalarType> dtype,
     const Tensor& result) {
   auto iter = meta::make_reduction_from_out_ty(self, result, dims, keepdim, result.scalar_type());
-  if (iter.numel() == 0) {
+  if (iter.is_symbolic() ? iter.sym_numel() == 0 : iter.numel() == 0) {
     result.fill_(1);
   } else {
     prod_stub(iter.device_type(), iter);
@@ -1470,7 +1471,7 @@ TORCH_IMPL_FUNC(mean_out)
     // device is not CPU
     auto iter = at::meta::make_reduction_from_out_ty(
         self, result, opt_dim, keepdim, dtype);
-    if (iter.numel() == 0) {
+    if (iter.is_symbolic() ? iter.sym_numel() == 0 : iter.numel() == 0) {
       result.fill_(std::numeric_limits<double>::quiet_NaN());
     } else {
       mean_stub(iter.device_type(), iter);
@@ -1793,7 +1794,7 @@ Tensor& any_dims_out_default(
 TORCH_IMPL_FUNC(amin_out) (const Tensor& self, IntArrayRef dim, bool keepdim, const Tensor& result) {
   auto iter =
       meta::make_reduction(self, result, dim, keepdim, self.scalar_type());
-  if (iter.numel() != 0) {
+  if (iter.is_symbolic() ? iter.sym_numel() != 0 : iter.numel() != 0) {
     min_values_stub(iter.device_type(), iter);
   }
 }
@@ -1801,7 +1802,7 @@ TORCH_IMPL_FUNC(amin_out) (const Tensor& self, IntArrayRef dim, bool keepdim, co
 TORCH_IMPL_FUNC(amax_out) (const Tensor& self, IntArrayRef dim, bool keepdim, const Tensor& result) {
   auto iter =
       meta::make_reduction(self, result, dim, keepdim, self.scalar_type());
-  if (iter.numel() != 0) {
+  if (iter.is_symbolic() ? iter.sym_numel() != 0 : iter.numel() != 0) {
     max_values_stub(iter.device_type(), iter);
   }
 }
@@ -1909,8 +1910,18 @@ static double std_var_all_cpu(const Tensor& self, double correction, bool take_s
 
 namespace {
   inline void warn_invalid_degrees_of_freedom(const char* fname, const TensorIterator& iter, double correction) {
-    int64_t reducing_over_num_elements = iter.num_output_elements() == 0 ? 0 : iter.numel() / iter.num_output_elements();
-    if (reducing_over_num_elements - correction <= 0) {
+    bool invalid = false;
+    if (iter.is_symbolic()) {
+      const c10::SymInt outputs = iter.sym_num_output_elements();
+      const c10::SymInt reducing = outputs == 0 ? c10::SymInt(0) : iter.sym_numel() / outputs;
+      // reducing - correction <= 0 for an integer reducing, as an integer guard
+      invalid = !std::isnan(correction) &&
+          (correction >= static_cast<double>(std::numeric_limits<int64_t>::max()) || reducing <= static_cast<int64_t>(std::floor(correction)));
+    } else {
+      int64_t reducing_over_num_elements = iter.num_output_elements() == 0 ? 0 : iter.numel() / iter.num_output_elements();
+      invalid = reducing_over_num_elements - correction <= 0;
+    }
+    if (invalid) {
       TORCH_WARN(fname, "(): degrees of freedom is <= 0. Correction should be strictly less than the reduction factor (input numel divided by output numel).");
     }
   }
@@ -1970,12 +1981,12 @@ static Tensor& std_var_out(
               "desired output type ", result.scalar_type());
   warn_invalid_degrees_of_freedom(fname, iter, correction);
 
-  if (iter.numel() == 0) {
+  if (iter.is_symbolic() ? iter.sym_numel() == 0 : iter.numel() == 0) {
     // Trivial reduction
     result.fill_(std::numeric_limits<double>::quiet_NaN());
     return result;
   } else if (
-      result.numel() == 1 && iter.device_type() == kCPU &&
+      iter.device_type() == kCPU && result.numel() == 1 &&
       iter.common_dtype() != kBFloat16 && iter.common_dtype() != kHalf) {
     // NOTE: CPU performance significantly regressed when attempting to port to
     // ATen,
@@ -2050,7 +2061,7 @@ static std::tuple<Tensor&, Tensor&> std_var_mean_out(
       make_reduction(fname, result1, result2, self, dim, keepdim, dtype);
   warn_invalid_degrees_of_freedom(fname, iter, correction);
 
-  if (iter.numel() == 0) {
+  if (iter.is_symbolic() ? iter.sym_numel() == 0 : iter.numel() == 0) {
     // Trivial reduction
     result1.fill_(std::numeric_limits<double>::quiet_NaN());
     result2.fill_(std::numeric_limits<double>::quiet_NaN());

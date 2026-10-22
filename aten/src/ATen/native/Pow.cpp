@@ -34,6 +34,11 @@ TORCH_META_FUNC2(pow, Scalar) (const Scalar& base, const Tensor& exp) {
     // This overload doesn't directly use TensorIterator. It attempts to short-circuit,
     // but otherwise redispatches to the Tensor_Tensor overload.
     auto dtype = maybe_get_output().defined() ? maybe_get_output().scalar_type() : at::result_type(base, exp);
+    if (C10_UNLIKELY(exp.unsafeGetTensorImpl()->has_symbolic_sizes_strides())) {
+      // a symbolic exp (a CUDA graph host trace): the same output over SymInt
+      set_output_raw_strided_symint(0, exp.sym_sizes(), {}, exp.options().dtype(dtype));
+      return;
+    }
     set_output_raw_strided(0, exp.sizes(), {}, exp.options().dtype(dtype));
 }
 

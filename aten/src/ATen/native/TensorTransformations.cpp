@@ -43,25 +43,29 @@ Tensor flip(const Tensor& self, IntArrayRef dims) {
 
   Tensor out_tensor = at::empty_like(self, MemoryFormat::Preserve);
 
+  // a symbolic self (a CUDA graph host trace): the same over SymInt
+  const bool symbolic = self.unsafeGetTensorImpl()->has_symbolic_sizes_strides();
+
   // Count dimensions in which we need to do work
   int n = 0;
-  auto strides = DimVector(self.strides());
+  auto strides = SymDimVector(self.sym_strides());
   for (const auto i : c10::irange(total_dims)) {
-    if (flip_dims_b[i] && self.size(i) > 1 && self.stride(i) != 0) {
+    if (flip_dims_b[i] && self.sym_size(i) > 1 && self.sym_stride(i) != 0) {
       n++;
       strides[i] = 0;
     }
   }
 
   // Nothing to do, we return fast
-  if (n == 0 || self.numel() <= 1) {
+  if (n == 0 || self.sym_numel() <= 1) {
     out_tensor.copy_(self);
     return out_tensor;
   }
 
   // create dummy output with 0 strides at flipped dimension, to prevent
   // tensorIterator from coalescing flipped dims
-  const auto restrided_self = self.as_strided(self.sizes(), strides);
+  const auto restrided_self = symbolic ? self.as_strided_symint(self.sym_sizes(), strides)
+                                       : self.as_strided(self.sizes(), C10_AS_INTARRAYREF_SLOW(strides));
   auto iter =
       TensorIteratorConfig()
           .set_check_mem_overlap(false)
@@ -71,6 +75,25 @@ Tensor flip(const Tensor& self, IntArrayRef dims) {
           .add_const_input(self)
           .add_const_input(restrided_self)
           .build();
+
+  if (iter.is_symbolic()) {
+    // as below: the output's data moved to its flipped dims' far ends, those strides negated
+    const auto sizes = iter.sym_shape();
+    auto strides_bytes = SymDimVector(iter.sym_strides(0));
+    const auto strides_self = iter.sym_strides(1);
+    const auto strides_dummy = iter.sym_strides(2);
+    c10::SymInt offset = 0;
+    for (const auto i : c10::irange(iter.ndim())) {
+      if (strides_dummy[i] == 0 && strides_self[i] != 0) {
+        offset += strides_bytes[i] * (sizes[i] - 1);
+        strides_bytes[i] *= -1;
+      }
+    }
+    iter._unsafe_set_arg_sym_strides(0, strides_bytes);
+    iter._unsafe_offset_arg_sym_data(0, offset);
+    flip_stub(iter.device_type(), iter, self.is_quantized());
+    return out_tensor;
+  }
 
   auto* data = reinterpret_cast<char*>(iter.data_ptr(0));
   const auto sizes = iter.shape();

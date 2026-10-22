@@ -12,6 +12,7 @@
 
 #include <array>
 #include <bitset>
+#include <memory>
 
 namespace at {
 class Tensor;
@@ -243,6 +244,35 @@ enum class FastSetupType : uint8_t {
 class TensorIteratorConfig;
 struct TensorIterator;
 
+namespace detail {
+// A symbolic TensorIterator's sizes and byte strides (TensorIterator.cpp)
+struct SymIteratorState;
+// While set on this thread, a TensorIterator over a Python-dispatched operand
+// (a CUDA graph host trace's traced tensor) builds over c10::SymInt: sizes,
+// strides and outputs are eager's, computed by the same code
+// (ATen/detail/TensorIteratorBuild.h), and the launch side reads them through
+// the sym_* accessors. Returns the previous value.
+TORCH_API bool set_symbolic_iterators(bool enabled);
+TORCH_API bool symbolic_iterators();
+// Why symbolic host code last refused to go on (set just before it raises
+// NotImplementedError), for the trace to report it as data, not text
+enum class SymbolicRefusal : uint8_t {
+  None,
+  // an int64_t read of a symbolic iterator's sizes, strides or data
+  // (convert the caller)
+  Accessor,
+  // an output the symbolic code would resize or cannot allocate symbolically
+  Output,
+  // the CUDA generator, whose state is no symbol of the trace
+  Generator,
+};
+TORCH_API void note_symbolic_refusal(SymbolicRefusal why);
+// the last refusal on this thread, cleared
+TORCH_API SymbolicRefusal take_symbolic_refusal();
+// symbolic iterators built on this thread
+TORCH_API int64_t symbolic_iterators_built();
+} // namespace detail
+
 struct TORCH_API TensorIteratorBase : public impl::MetaBase {
   using DimMask = std::bitset<64>;
   using PtrVector = SmallVector<char*, 4>;
@@ -268,9 +298,15 @@ struct TORCH_API TensorIteratorBase : public impl::MetaBase {
   void foreach_reduced_elt(loop_subiter_t loop, bool parallelize = true);
 
   int ndim() const {
+    if (C10_UNLIKELY(sym_ != nullptr)) {
+      return sym_ndim();
+    }
     return static_cast<int>(shape_.size());
   }
   IntArrayRef shape() const {
+    if (C10_UNLIKELY(sym_ != nullptr)) {
+      symbolic_read("shape()");
+    }
     return shape_;
   }
   int64_t numel() const;
@@ -284,6 +320,9 @@ struct TORCH_API TensorIteratorBase : public impl::MetaBase {
     return ntensors() - noutputs();
   }
   IntArrayRef view_offsets() const {
+    if (C10_UNLIKELY(sym_ != nullptr)) {
+      symbolic_read("view_offsets()");
+    }
     return view_offsets_;
   }
 
@@ -302,6 +341,9 @@ struct TORCH_API TensorIteratorBase : public impl::MetaBase {
 
   /// Accessors for each operand
   IntArrayRef strides(int64_t arg) const {
+    if (C10_UNLIKELY(sym_ != nullptr)) {
+      symbolic_read("strides()");
+    }
     return operands_[arg].stride_bytes;
   }
   void* data_ptr(int64_t arg) const;
@@ -392,6 +434,10 @@ struct TORCH_API TensorIteratorBase : public impl::MetaBase {
   template <typename T>
   T scalar_value(int64_t arg) {
     auto& op = operands_[arg];
+    if (C10_UNLIKELY(sym_ != nullptr)) {
+      // the operand's own storage: a constant, or a host buffer whose read throws
+      return c10::fetch_and_cast<T>(op.tensor_base().scalar_type(), op.tensor_base().const_data_ptr());
+    }
     return c10::fetch_and_cast<T>(op.tensor_base().scalar_type(), op.data);
   }
 
@@ -486,18 +532,30 @@ struct TORCH_API TensorIteratorBase : public impl::MetaBase {
 
   // Helper functions for advanced stride manipulations (e.g. torch.flip)
   void _unsafe_set_arg_strides(const int64_t arg, IntArrayRef strides) {
+    if (C10_UNLIKELY(sym_ != nullptr)) {
+      symbolic_read("_unsafe_set_arg_strides()");
+    }
     operands_[arg].stride_bytes = strides;
   }
   void _unsafe_set_arg_data(const int64_t arg, void* data) {
+    if (C10_UNLIKELY(sym_ != nullptr)) {
+      symbolic_read("_unsafe_set_arg_data()");
+    }
     operands_[arg].data = data;
   }
 
   // Helper functions for custom device, custom device can get OperandInfo in
   // their side.
   const OperandInfo& operand(int arg = 0) const {
+    if (C10_UNLIKELY(sym_ != nullptr)) {
+      symbolic_read("operand()");
+    }
     return operands_[arg];
   }
   OperandInfo& operand(int arg = 0) {
+    if (C10_UNLIKELY(sym_ != nullptr)) {
+      symbolic_read("operand()");
+    }
     return operands_[arg];
   }
 
@@ -523,6 +581,9 @@ struct TORCH_API TensorIteratorBase : public impl::MetaBase {
   }
 
   bool has_contiguous_first_dim() const {
+    if (C10_UNLIKELY(sym_ != nullptr)) {
+      return sym_has_contiguous_first_dim();
+    }
     if (ndim() == 0) {
       return true;
     }
@@ -541,6 +602,36 @@ struct TORCH_API TensorIteratorBase : public impl::MetaBase {
       IntArrayRef sizes,
       IntArrayRef strides,
       TensorOptions options) override;
+  void set_output_raw_strided_symint(
+      int64_t output_idx,
+      c10::SymIntArrayRef sizes,
+      c10::SymIntArrayRef strides,
+      TensorOptions options) override;
+
+  // A symbolic iterator (detail::set_symbolic_iterators): its int64_t
+  // accessors of sizes, strides and data raise NotImplementedError naming
+  // the accessor; these give the SymInt values, its bool predicates
+  // (is_contiguous, can_use_32bit_indexing, ...) guard.
+  bool is_symbolic() const {
+    return sym_ != nullptr;
+  }
+  c10::SymIntArrayRef sym_shape() const;
+  c10::SymIntArrayRef sym_strides(int64_t arg) const;
+  c10::SymInt sym_numel() const;
+  c10::SymInt sym_num_output_elements() const;
+  // index.Tensor's indexed sizes and byte strides (AdvancedIndex) over
+  // SymInt: its structured meta passes them to its kernel as ints, so on a
+  // symbolic iterator the meta sets them here for the kernel
+  void set_sym_index_geometry(c10::SymDimVector sizes, c10::SymDimVector strides);
+  bool has_sym_index_geometry() const;
+  // flip's restride of a symbolic iterator's operand (_unsafe_set_arg_strides
+  // and _unsafe_set_arg_data's): its byte strides, and its data's byte offset
+  // from the operand tensor's address
+  void _unsafe_set_arg_sym_strides(int64_t arg, c10::SymIntArrayRef strides);
+  void _unsafe_offset_arg_sym_data(int64_t arg, const c10::SymInt& bytes);
+  c10::SymInt sym_data_offset(int64_t arg) const;
+  c10::SymIntArrayRef sym_index_sizes() const;
+  c10::SymIntArrayRef sym_index_strides() const;
 
 #define TORCH_DISALLOW_TEMPORARIES_IMPL(methodname, maybestatic)            \
   maybestatic void methodname(                                              \
@@ -634,6 +725,10 @@ struct TORCH_API TensorIteratorBase : public impl::MetaBase {
   bool fast_set_up(const TensorIteratorConfig& /*config*/);
   FastSetupType compute_fast_setup_type(const TensorIteratorConfig& /*config*/);
   void coalesce_dimensions();
+  void build_symbolic(TensorIteratorConfig& /*config*/);
+  [[noreturn]] void symbolic_read(const char* accessor) const;
+  int sym_ndim() const;
+  bool sym_has_contiguous_first_dim() const;
 
  protected:
   /// Records the "computation" shape of the output tensor. The computation
@@ -728,6 +823,9 @@ struct TORCH_API TensorIteratorBase : public impl::MetaBase {
 
   /// Set by populate_operands(), says if we're handling meta tensors
   bool is_meta_ = false;
+
+  /// A symbolic iterator's state; null for every other iterator
+  std::shared_ptr<detail::SymIteratorState> sym_;
 };
 
 struct TORCH_API TensorIterator final : public TensorIteratorBase {
@@ -773,6 +871,11 @@ struct TORCH_API TensorIterator final : public TensorIteratorBase {
       int64_t output_idx,
       IntArrayRef sizes,
       IntArrayRef strides,
+      TensorOptions options) override;
+  void set_output_raw_strided_symint(
+      int64_t output_idx,
+      c10::SymIntArrayRef sizes,
+      c10::SymIntArrayRef strides,
       TensorOptions options) override;
 };
 

@@ -1553,7 +1553,6 @@ at::Tensor _convolution(
   auto weight = weight_r;
   auto bias = bias_r;
   auto k = weight.ndimension();
-  c10::IntArrayRef weight_sizes = weight.sizes();
   int64_t dim = k - 2;
 
   TORCH_CHECK(dim > 0, "weight should have at least three dimensions");
@@ -1571,7 +1570,26 @@ at::Tensor _convolution(
   params.cudnn_enabled = cudnn_enabled;
   params.allow_tf32 = allow_tf32;
 
-  check_shape_forward(input, weight_sizes, bias, params);
+  // a symbolic input (a CUDA graph host trace's): the shape checks and the
+  // backend choice over SymInt, each test a guard
+  const bool symbolic = input.unsafeGetTensorImpl()->has_symbolic_sizes_strides();
+  ConvParams<c10::SymInt> sym_params;
+  if (symbolic) {
+    auto to_sym = [](const std::vector<int64_t>& v) { return std::vector<c10::SymInt>(v.begin(), v.end()); };
+    sym_params.stride = to_sym(params.stride);
+    sym_params.padding = to_sym(params.padding);
+    sym_params.dilation = to_sym(params.dilation);
+    sym_params.transposed = params.transposed;
+    sym_params.output_padding = to_sym(params.output_padding);
+    sym_params.groups = params.groups;
+    sym_params.benchmark = params.benchmark;
+    sym_params.deterministic = params.deterministic;
+    sym_params.cudnn_enabled = params.cudnn_enabled;
+    sym_params.allow_tf32 = params.allow_tf32;
+    check_shape_forward(input, weight.sym_sizes(), bias, sym_params);
+  } else {
+    check_shape_forward(input, weight.sizes(), bias, params);
+  }
 
   // Expand 1d -> 2d.
   // This is only done for backends that don't natively support 1d spatial input.
@@ -1579,20 +1597,28 @@ at::Tensor _convolution(
     // avoid accidentally going through NHWC for permuted 3d input.
     input = input.contiguous();
     params.view1d_as_2d();
+    sym_params.view1d_as_2d();
     input = view4d(input);
     weight = view4d(weight);
   }
 
   // Select appropriate backend to use.
-  auto bias_sizes_opt = bias.defined() ? std::optional<IntArrayRef>(bias.sizes()) : std::nullopt;
   bool need_backward = GradMode::is_enabled() &&
       (input.requires_grad() || weight.requires_grad() || (bias.defined() && bias.requires_grad()));
-  ConvBackend backend = _select_conv_backend(input, weight, bias, c10::OptionalIntArrayRef(bias_sizes_opt), need_backward, params);
+  ConvBackend backend = symbolic
+      ? _select_conv_backend(input, weight, bias, bias.defined() ? at::OptionalSymIntArrayRef(bias.sym_sizes()) : at::OptionalSymIntArrayRef(), need_backward, sym_params)
+      : _select_conv_backend(input, weight, bias, bias.defined() ? c10::OptionalIntArrayRef(bias.sizes()) : c10::OptionalIntArrayRef(), need_backward, params);
   at::MemoryFormat backend_memory_format = determine_backend_memory_format(input, weight, backend);
 
   // Call the backend.
   Tensor output;
-  auto kernel_size = weight.sizes().slice(2);
+  // the backends take the kernel's sizes as ints: a symbolic weight's (a CUDA
+  // graph host trace's) each a guard
+  std::vector<int64_t> kernel_size_v;
+  for (const auto& size : weight.sym_sizes().slice(2)) {
+    kernel_size_v.push_back(size.guard_int(__FILE__, __LINE__));
+  }
+  IntArrayRef kernel_size = kernel_size_v;
   switch (backend) {
     case ConvBackend::CudaDepthwise2d:
       output = at::_conv_depthwise2d(input.contiguous(), weight, kernel_size, bias,

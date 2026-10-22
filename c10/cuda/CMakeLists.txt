@@ -47,6 +47,7 @@ set(C10_CUDA_HEADERS
     CUDAException.h
     CUDAEvent.h
     CUDAFunctions.h
+    CUDAHostTraceOwners.h
     CUDAGuard.h
     CUDAMacros.h
     CUDAMathCompat.h

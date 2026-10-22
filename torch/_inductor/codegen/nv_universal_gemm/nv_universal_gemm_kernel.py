@@ -278,6 +278,9 @@ def _compile_nvgemm(
     if fallback_fn is not None:
         artifact = fallback_fn(kernel)
     if artifact is None:
+        from torch._inductor.runtime.cutedsl_cache import host_trace_cute
+
+        host_trace_cute()
         with CUTEDSL_COMPILE_LOCK:
             artifact = kernel.compile(args)
         was_compiled = True

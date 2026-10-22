@@ -25,6 +25,9 @@
 
 #include <c10/cuda/CUDAMathCompat.h>
 #include <c10/util/env.h>
+#if !defined(USE_ROCM)
+#include <ATen/cuda/host_trace/Ops.h>
+#endif
 
 #ifdef USE_ROCM
 #include <ATen/cuda/detail/ROCmMacros.cuh>
@@ -1147,6 +1150,18 @@ void launch_vectorized_layer_norm_kernel(
 
 }
 
+// whether LayerNormKernelImplInternal takes the fast path: all tensors are properly aligned, N is less than 2^24
+// (to use float count), N is multiple of vec_size (so that all rows are aligned if tensor is aligned). An undefined
+// gamma or beta is address 0. Shared with the CUDA host trace below, where N and the addresses are SymInt and
+// each test is a guard.
+template <typename T, typename Int, typename Addr>
+bool can_use_vectorized_layer_norm(const Int& N, const Addr& X, const Addr& Y, const Addr& gamma, const Addr& beta) {
+  constexpr int alignment = vec_size * sizeof(T);
+  return (std::is_same_v<T, float> || std::is_same_v<T, at::Half> || std::is_same_v<T, at::BFloat16>) &&
+      N <= static_cast<int64_t>(1ULL << std::numeric_limits<float>::digits) && N % vec_size == 0 &&
+      X % alignment == 0 && Y % alignment == 0 && gamma % alignment == 0 && beta % alignment == 0;
+}
+
 template <typename T, typename T_ACC, bool rms_norm = false>
 void LayerNormKernelImplInternal(
     const Tensor& X,
@@ -1169,18 +1184,8 @@ void LayerNormKernelImplInternal(
   T_ACC* mean_data = !rms_norm ? mean->data_ptr<T_ACC>() : nullptr;
   T_ACC* rstd_data = rstd->data_ptr<T_ACC>();
 
-  // check if can take fast path - all tensors are properly aligned, N is less than 2^24 (to use float count),
-  // N is multiple of vec_size (so that all rows are aligned if tensor is aligned)
-  constexpr int num_vec_elems = vec_size;
-  constexpr int alignment = num_vec_elems * sizeof(T);
-  bool can_vec_X = can_vectorize(X_data, alignment);
-  bool can_vec_Y = can_vectorize(Y_data, alignment);
-  bool can_vec_gamma = gamma.defined() ? can_vectorize(gamma_data, alignment) : true;
-  bool can_vec_beta = beta.defined() ? can_vectorize(beta_data, alignment) : true;
-
-  if ((std::is_same_v<T, float> || std::is_same_v<T, at::Half> || std::is_same_v<T, at::BFloat16>) &&
-  N <= static_cast<int64_t>(1ULL << std::numeric_limits<float>::digits) && N % num_vec_elems == 0 &&
-  can_vec_X && can_vec_Y && can_vec_gamma && can_vec_beta) {
+  if (can_use_vectorized_layer_norm<T>(N, reinterpret_cast<uint64_t>(X_data), reinterpret_cast<uint64_t>(Y_data),
+          reinterpret_cast<uint64_t>(gamma_data), reinterpret_cast<uint64_t>(beta_data))) {
     launch_vectorized_layer_norm_kernel<T, T_ACC, rms_norm>(static_cast<int>(N), M, eps, X_data, gamma_data, beta_data, Y_data, mean_data, rstd_data);
   } else {
   cudaStream_t cuda_stream = at::cuda::getCurrentCUDAStream();
@@ -2103,3 +2108,102 @@ REGISTER_DISPATCH(LayerNormKernel, &LayerNormKernelImpl)
 REGISTER_DISPATCH(LayerNormBackwardKernel, &LayerNormBackwardKernelImpl)
 
 } // namespace at::native
+
+#if !defined(USE_ROCM)
+// Traced hosts (ATen/cuda/host_trace/Ops.h)
+namespace at::cuda::host_trace {
+namespace {
+
+namespace an = at::native;
+
+// LayerNormKernelImplInternal's launches (keep in sync; the fast path's choice
+// is shared) over a contiguous X, gamma and beta
+template <typename T, typename T_ACC, bool rms_norm>
+void layer_norm_launches(Recorder& rec, const c10::SymInt& M, const c10::SymInt& N, T_ACC eps, const TensorBase& X, const TensorBase& gamma, const TensorBase& beta, const TensorBase& Y, const TensorBase& mean, const TensorBase& rstd) {
+  if (M > at::cuda::getCurrentDeviceProperties()->maxGridSize[0]) {
+    decline("a layer norm of more rows than a grid's");
+  }
+  const auto address = [&rec](const TensorBase& t) { return t.defined() ? rec.data_ptr(t) : c10::SymInt(0); };
+  const c10::SymInt X_data = address(X);
+  const c10::SymInt gamma_data = address(gamma);
+  const c10::SymInt beta_data = address(beta);
+  const c10::SymInt Y_data = address(Y);
+  const c10::SymInt mean_data = address(mean);
+  const c10::SymInt rstd_data = address(rstd);
+  if (an::can_use_vectorized_layer_norm<T>(N, X_data, Y_data, gamma_data, beta_data)) {
+    // launch_vectorized_layer_norm_kernel
+    const int warp_size = at::cuda::warp_size();
+    const dim3 threads(warp_size, ::num_threads() / warp_size, 1);
+    const int nshared = threads.y > 1 ? threads.y * 3 / 2 * sizeof(T_ACC) : 0;
+    launch(rec, &an::vectorized_layer_norm_kernel<T, T_ACC, rms_norm>, M, SymDim3(int64_t{threads.x}, int64_t{threads.y}), nshared,
+           scalar_param<int>(N), Param<T_ACC>(eps), scalar_param<const T*>(X_data), scalar_param<const T*>(gamma_data),
+           scalar_param<const T*>(beta_data), scalar_param<T_ACC*>(mean_data), scalar_param<T_ACC*>(rstd_data), scalar_param<T*>(Y_data));
+  } else {
+    launch(rec, &an::RowwiseMomentsCUDAKernel<T, T_ACC, rms_norm>, M, an::cuda_utils::kCUDABlockReduceNumThreads, 0,
+           scalar_param<int64_t>(M), scalar_param<int64_t>(N), Param<T_ACC>(eps), scalar_param<const T*>(X_data),
+           scalar_param<T_ACC*>(mean_data), scalar_param<T_ACC*>(rstd_data));
+    launch(rec, &an::LayerNormForwardCUDAKernel<T, T_ACC, rms_norm>, M, an::kCUDANumThreads, 0,
+           scalar_param<int64_t>(M), scalar_param<int64_t>(N), scalar_param<const T*>(X_data), scalar_param<const T_ACC*>(mean_data),
+           scalar_param<const T_ACC*>(rstd_data), scalar_param<const T*>(gamma_data), scalar_param<const T*>(beta_data), scalar_param<T*>(Y_data));
+  }
+}
+
+// layer_norm_cuda (rms_norm: _fused_rms_norm_cuda, whose mean is undefined)
+// for an input, weight and bias of one dtype; the fake kernel has run
+// _check_layer_norm_inputs
+template <bool rms_norm>
+std::tuple<TensorBase, TensorBase, TensorBase> traced_layer_norm(Recorder& rec, const TensorBase& input_, int64_t normalized_ndim, const TensorBase& weight_, const TensorBase& bias_, double eps) {
+  const int64_t axis = input_.dim() - normalized_ndim;
+  TORCH_INTERNAL_ASSERT(normalized_ndim > 0 && axis >= 0);
+  const ScalarType dtype = input_.scalar_type();
+  if (dtype != kHalf && dtype != kBFloat16 && dtype != kFloat && dtype != kDouble) {
+    decline(c10::str("a ", dtype, " layer norm"));
+  }
+  for (const TensorBase* t : {&weight_, &bias_}) {
+    if (t->defined() && t->scalar_type() != dtype) {
+      decline("a layer norm weight or bias of another dtype");
+    }
+  }
+  // expect_contiguous: clone(Contiguous), an empty tensor and copy_
+  const auto contiguous = [&rec](const TensorBase& t) {
+    return !t.defined() || t.is_contiguous() ? t : copy_(rec, at::empty_symint(t.sym_sizes(), t.options()), t);
+  };
+  const TensorBase input = contiguous(input_);
+  const TensorBase weight = contiguous(weight_);
+  const TensorBase bias = contiguous(bias_);
+  c10::SymInt M = 1;
+  c10::SymInt N = 1;
+  std::vector<c10::SymInt> stat_shape;
+  for (const auto i : c10::irange(input.dim())) {
+    (i < axis ? M : N) *= input.sym_size(i);
+    stat_shape.push_back(i < axis ? input.sym_size(i) : c10::SymInt(1));
+  }
+  // mean and rstd are eager's [M] viewed to stat_shape
+  const auto stat_options = input.options().dtype(at::toAccumulateType(dtype, /*is_cuda=*/true));
+  const TensorBase Y = at::empty_symint(input.sym_sizes(), input.options());
+  const TensorBase mean = rms_norm ? TensorBase() : at::empty_symint(stat_shape, stat_options);
+  const TensorBase rstd = at::empty_symint(stat_shape, stat_options);
+  if (M > 0) {
+    AT_DISPATCH_FLOATING_TYPES_AND2(kHalf, kBFloat16, dtype, "LayerNormKernelImpl", [&]() {
+      using acc_t = at::acc_type<scalar_t, true>;
+      layer_norm_launches<scalar_t, acc_t, rms_norm>(rec, M, N, static_cast<acc_t>(eps), input, weight, bias, Y, mean, rstd);
+    });
+  }
+  return {Y, mean, rstd};
+}
+
+} // namespace
+
+std::tuple<TensorBase, TensorBase, TensorBase> native_layer_norm(Recorder& rec, const TensorBase& input, int64_t normalized_ndim, const TensorBase& weight, const TensorBase& bias, double eps) {
+  return traced_layer_norm<false>(rec, input, normalized_ndim, weight, bias, eps);
+}
+
+std::tuple<TensorBase, TensorBase> fused_rms_norm(Recorder& rec, const TensorBase& input, int64_t normalized_ndim, const TensorBase& weight, std::optional<double> eps) {
+  const bool float_acc = at::toAccumulateType(input.scalar_type(), /*is_cuda=*/true) == kFloat;
+  const double eps_val = eps.value_or(float_acc ? std::numeric_limits<float>::epsilon() : std::numeric_limits<double>::epsilon());
+  auto [Y, mean, rstd] = traced_layer_norm<true>(rec, input, normalized_ndim, weight, TensorBase(), eps_val);
+  return {Y, rstd};
+}
+
+} // namespace at::cuda::host_trace
+#endif

@@ -28,6 +28,9 @@ struct CompareFunctor{
       return a < b;
     }
   }
+  auto host_trace_fields() const {
+    return std::tie(op_);
+  }
 };
 
 // Reflects the comparison operator, so reflect(op)(a, b) == op(b, a)
@@ -44,11 +47,27 @@ OpType reflect(OpType x) {
 }  // namespace (anonymous)
 
 template <typename scalar_t>
-void compare_scalar_kernel(TensorIteratorBase &iter, OpType op, scalar_t rhs) {
-  CompareFunctor<scalar_t> f(op);
-  gpu_kernel(iter, [=] GPU_LAMBDA (scalar_t lhs) -> bool {
+struct CompareScalarFunctor {
+  CompareFunctor<scalar_t> f;
+  scalar_t rhs;
+  __device__ bool operator()(scalar_t lhs) const {
     return f(lhs, rhs);
-  });
+  }
+  auto host_trace_fields() const {
+    return std::tie(f, rhs);
+  }
+  auto host_trace_scalars() const {
+    return std::tie(rhs);
+  }
+};
+
+// src: the CPU scalar operand rhs was read from (host_scalar_source)
+template <typename scalar_t>
+void compare_scalar_kernel(TensorIteratorBase &iter, OpType op, scalar_t rhs, const TensorBase& src) {
+  CompareFunctor<scalar_t> f(op);
+  CompareScalarFunctor<scalar_t> g{f, rhs};
+  [[maybe_unused]] auto scalar = host_scalar_member(g, g.rhs, iter, src);
+  gpu_kernel(iter, g);
 }
 
 template <typename scalar_t>
@@ -58,14 +77,16 @@ void compare_kernel_impl(TensorIteratorBase &iter, OpType op) {
   // generating two otherwise identical kernels with mirrored
   // arguments.
   if (iter.is_cpu_scalar(1)) {
-    const scalar_t lhs = iter.scalar_value<scalar_t>(1);
+    const scalar_t lhs = host_scalar<scalar_t>(iter, 1);
+    const auto src = host_scalar_source(iter, 1);
     iter.remove_operand(1);
     const DeviceGuard device_guard(iter.device(1));
-    compare_scalar_kernel(iter, reflect(op), lhs);
+    compare_scalar_kernel(iter, reflect(op), lhs, src);
   } else if (iter.is_cpu_scalar(2)) {
-    const scalar_t rhs = iter.scalar_value<scalar_t>(2);
+    const scalar_t rhs = host_scalar<scalar_t>(iter, 2);
+    const auto src = host_scalar_source(iter, 2);
     iter.remove_operand(2);
-    compare_scalar_kernel(iter, op, rhs);
+    compare_scalar_kernel(iter, op, rhs, src);
   } else {
     CompareFunctor<scalar_t> f(op);
     gpu_kernel(iter, f);

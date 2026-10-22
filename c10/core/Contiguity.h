@@ -63,13 +63,17 @@ inline static c10::SymBool _compute_contiguous_sym(
     c10::SymInt expected_stride_max = 1;
     // NB: make sure we do signed arithmetic
     for (int64_t d = int64_t(sizes.size()) - 1; d >= 0; d--) {
-      if (TORCH_GUARD_OR_FALSE(sym_eq(sizes[d], 1))) {
-        continue;
-      }
-
-      if (TORCH_GUARD_OR_TRUE(sym_ne(strides[d], expected_stride)) &&
-          TORCH_GUARD_OR_TRUE(sym_ne(strides[d], expected_stride_max))) {
-        return false;
+      // A symbolic size whose stride is the expected one by construction
+      // needs no size-1 guard: multiplying by a size 1 is skipping it.
+      if (!sizes[d].is_heap_allocated() ||
+          !TORCH_STATICALLY_KNOWN_TRUE(sym_eq(strides[d], expected_stride))) {
+        if (TORCH_GUARD_OR_FALSE(sym_eq(sizes[d], 1))) {
+          continue;
+        }
+        if (TORCH_GUARD_OR_TRUE(sym_ne(strides[d], expected_stride)) &&
+            TORCH_GUARD_OR_TRUE(sym_ne(strides[d], expected_stride_max))) {
+          return false;
+        }
       }
       expected_stride_max *= sizes[d].max(1);
       expected_stride *= sizes[d];

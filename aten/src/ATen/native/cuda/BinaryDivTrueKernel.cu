@@ -17,6 +17,25 @@ namespace at::native {
 namespace binary_internal {
 
 constexpr char div_name[] = "div_kernel";
+// BUnaryFunctor<scalar_t, scalar_t, scalar_t, MulFunctor<opmath_t>>, its
+// scalar marked as the CPU scalar's reciprocal
+template <typename scalar_t, typename opmath_t>
+struct MulReciprocalFunctor {
+  MulFunctor<opmath_t> f;
+  opmath_t inv_b;
+  __device__ scalar_t operator()(scalar_t a) const {
+    return f(a, inv_b);
+  }
+#ifndef USE_ROCM
+  auto host_trace_fields() const {
+    return std::tie(f, inv_b);
+  }
+  auto host_trace_reciprocals() const {
+    return std::tie(inv_b);
+  }
+#endif
+};
+
 void div_true_kernel_cuda(TensorIteratorBase& iter) {
   auto common_dtype = iter.common_dtype();
   if (iter.common_dtype() == kComplexHalf) {
@@ -43,12 +62,14 @@ void div_true_kernel_cuda(TensorIteratorBase& iter) {
               c10::is_complex<scalar_t>::value,
               c10::complex<double>,
               double>;
-          auto inv_b = static_cast<opmath_t>(high_prec_t(1.0) / iter.scalar_value<high_prec_t>(2));
+          auto inv_b = static_cast<opmath_t>(high_prec_t(1.0) / host_scalar<high_prec_t>(iter, 2));
+          const auto src = host_scalar_source(iter, 2);
           iter.remove_operand(2);
-          gpu_kernel(
-              iter,
-              BUnaryFunctor<scalar_t, scalar_t, scalar_t, MulFunctor<opmath_t>>(
-                  MulFunctor<opmath_t>(), inv_b));
+          MulReciprocalFunctor<scalar_t, opmath_t> f{MulFunctor<opmath_t>(), inv_b};
+          // a replay's member is 1 / the buffer's value in double precision, as
+          // here; no replay computes a complex reciprocal, so a complex one refuses
+          [[maybe_unused]] auto scalar = host_scalar_member(f, f.inv_b, iter, src, /*reciprocal=*/true);
+          gpu_kernel(iter, f);
         });
   } else {
     AT_DISPATCH_FLOATING_AND_COMPLEX_TYPES_AND2(

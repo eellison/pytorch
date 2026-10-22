@@ -608,7 +608,12 @@ py::object toPyObject(IValue ivalue) {
     return py::none();
   } else if (ivalue.isTensor()) {
     auto tensor = std::move(ivalue).toTensor();
-    if (tensor.unsafeGetTensorImpl()->is_wrapped_number()) {
+    // a Python subclass's wrapped number on a device (a CUDA graph host
+    // trace's traced tensor, pow(Scalar, Tensor)'s wrapped base) has no value
+    // to read: it passes as itself, still a wrapped number
+    const bool device_subclass_number = tensor.unsafeGetTensorImpl()->is_wrapped_number() && !tensor.device().is_cpu() &&
+        !tensor._is_zerotensor() && tensor.key_set().has(c10::DispatchKey::Python);
+    if (tensor.unsafeGetTensorImpl()->is_wrapped_number() && !device_subclass_number) {
       TORCH_INTERNAL_ASSERT(
           tensor.device().is_cpu() ||
           (tensor._is_zerotensor() && tensor.dim() == 0));

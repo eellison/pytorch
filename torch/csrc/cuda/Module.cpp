@@ -36,6 +36,7 @@
 #include <torch/csrc/Generator.h>
 #include <torch/csrc/cuda/CUDAPluggableAllocator.h>
 #include <torch/csrc/cuda/GdsFile.h>
+#include <torch/csrc/cuda/host_trace/Variant.h>
 #include <torch/csrc/cuda/THCP.h>
 #include <torch/csrc/cuda/memory_snapshot.h>
 #include <torch/csrc/cuda/python_comm.h>
@@ -397,7 +398,7 @@ PyObject* THCPModule_cudaJiteratorCompileAndLaunchKernel(
   PyObject* value = nullptr;
   Py_ssize_t pos = 0;
   Py_BEGIN_CRITICAL_SECTION(kwargs_o);
-  while (PyDict_Next(kwargs_o, &pos, &key, &value)) {
+  while (kwargs_o && PyDict_Next(kwargs_o, &pos, &key, &value)) {
     extra_args.emplace_back(as_scalar(value));
   }
   Py_END_CRITICAL_SECTION();
@@ -2648,6 +2649,7 @@ void initModule(PyObject* module) {
   registerCudaDeviceProperties(module);
   registerCudaPluggableAllocator(module);
   initCudaMethodBindings(module);
+  initHostTraceVariantBindings(module);
 }
 
 } // namespace torch::cuda

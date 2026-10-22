@@ -15,6 +15,17 @@
 namespace at::native {
 namespace binary_internal {
 
+template <typename scalar_t, typename accscalar_t>
+struct DivTruncFunctor {
+  accscalar_t inv_b;
+  __device__ scalar_t operator()(scalar_t a) const {
+    return std::trunc(a * inv_b);
+  }
+  auto host_trace_fields() const {
+    return std::tie(inv_b);
+  }
+};
+
 void div_trunc_kernel_cuda(TensorIteratorBase& iter) {
   auto dtype = iter.common_dtype();
   if (isIntegralType(dtype, /*includeBool*/ false)) {
@@ -32,9 +43,7 @@ void div_trunc_kernel_cuda(TensorIteratorBase& iter) {
           using accscalar_t = at::acc_type<scalar_t, true>;
           auto inv_b = accscalar_t(1.0) / iter.scalar_value<accscalar_t>(2);
           iter.remove_operand(2);
-          gpu_kernel(iter, [inv_b] GPU_LAMBDA(scalar_t a) -> scalar_t {
-            return std::trunc(a * inv_b);
-          });
+          gpu_kernel(iter, DivTruncFunctor<scalar_t, accscalar_t>{inv_b});
         });
   } else {
     AT_DISPATCH_FLOATING_TYPES_AND2(

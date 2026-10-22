@@ -5501,7 +5501,7 @@ std::tuple<Tensor, Tensor> infinitely_differentiable_native_rms_norm_backward(
     const Tensor& dY,
     const Tensor& drstd,
     const Tensor& input,
-    IntArrayRef normalized_shape,
+    c10::SymIntArrayRef normalized_shape,
     const Tensor& rstd,
     const std::optional<Tensor>& weight_opt,
     std::array<bool, 2> grad_input_mask) {
@@ -7066,7 +7066,7 @@ Tensor rms_norm_jvp(
     const Tensor& weight_p,
     const Tensor& weight_t,
     const Tensor& saved_rstd,
-    IntArrayRef normalized_shape) {
+    c10::SymIntArrayRef normalized_shape) {
   auto dims = std::vector<int64_t>{};
   auto view_size = input_t.sizes().vec();
   auto view_size_affine = input_t.sizes().vec();
@@ -7122,7 +7122,7 @@ Tensor rms_norm_rstd_jvp(
     const Tensor& input_p,
     const Tensor& input_t,
     const Tensor& saved_rstd,
-    IntArrayRef normalized_shape) {
+    c10::SymIntArrayRef normalized_shape) {
   auto dims = std::vector<int64_t>{};
   auto view_size = input_t.sizes().vec();
   auto view_size_affine = input_t.sizes().vec();

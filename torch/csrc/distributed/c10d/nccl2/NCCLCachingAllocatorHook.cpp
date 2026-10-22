@@ -9,6 +9,9 @@
 
 #include <ATen/Context.h>
 #include <c10/core/AllocatorConfig.h>
+#if !defined(USE_ROCM) && defined(PYTORCH_C10_DRIVER_API_SUPPORTED)
+#include <c10/cuda/driver_api.h>
+#endif
 #include <torch/csrc/distributed/c10d/nccl2/Logging.hpp>
 #include <torch/csrc/distributed/c10d/nccl2/ProcessGroupNCCL.hpp>
 
@@ -37,6 +40,20 @@ std::vector<ProcessGroupNCCL*> commsForDevice(
     return a->getCommName() < b->getCommName();
   });
   return out;
+}
+// A pool's custom allocator may hand out address space with no memory mapped
+// behind it (e.g. for CUDA graph captures that are never replayed), which
+// ncclCommRegister refuses: its cuMemGetAddressRange finds no allocation there.
+bool isMapped(void* addr) {
+#if !defined(USE_ROCM) && defined(PYTORCH_C10_DRIVER_API_SUPPORTED)
+  CUdeviceptr base = 0;
+  size_t size = 0;
+  return c10::cuda::DriverAPI::get()->cuMemGetAddressRange_(
+             &base, &size, reinterpret_cast<CUdeviceptr>(addr)) ==
+      CUDA_SUCCESS;
+#else
+  return true;
+#endif
 }
 } // namespace
 
@@ -76,6 +93,10 @@ void NCCLCachingAllocatorHook::registerMemPreHook() {
     }
     // NOLINTNEXTLINE(performance-no-int-to-ptr)
     void* addr = reinterpret_cast<void*>(segmentInfo.address);
+    if (!isMapped(addr)) {
+      unmapped_.insert(addr);
+      continue;
+    }
     registeredMemMap_.emplace(
         addr, MemInfo{segmentInfo.total_size, segmentInfo.device});
   }
@@ -94,6 +115,10 @@ void NCCLCachingAllocatorHook::regDeregMem(
     size_t len = te.size_;
     TORCH_CHECK(
         !registeredMemMap_.count(addr), "Memory already registered with NCCL");
+    if (!isMapped(addr)) {
+      unmapped_.insert(addr);
+      return;
+    }
     registeredMemMap_.emplace(addr, MemInfo{len, te.device_});
     for (auto* comm : commsForDevice(registeredComms_, te.device_)) {
       comm->register_address(addr, len);
@@ -103,6 +128,9 @@ void NCCLCachingAllocatorHook::regDeregMem(
       c10::cuda::CUDACachingAllocator::TraceEntry::Action::SEGMENT_FREE) {
     // NOLINTNEXTLINE(performance-no-int-to-ptr)
     void* addr = reinterpret_cast<void*>(static_cast<uintptr_t>(te.addr_));
+    if (unmapped_.erase(addr)) {
+      return;
+    }
     TORCH_CHECK(
         registeredMemMap_.count(addr), "Memory not registered with NCCL");
     registeredMemMap_.erase(addr);

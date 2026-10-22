@@ -6,6 +6,7 @@
 #include <ATen/NumericUtils.h>
 #include <ATen/Parallel.h>
 #include <ATen/ScalarOps.h>
+#include <ATen/InferDenseStrides.h>
 #include <ATen/TensorIterator.h>
 #include <ATen/TensorMeta.h>
 #include <ATen/TensorOperators.h>
@@ -84,6 +85,15 @@ TORCH_META_FUNC2(sort, stable)
   // See issue: https://github.com/pytorch/pytorch/issues/65863
   // Strides should be dense, so as not to allocate too much memory.
   // We either use 'self' strides, or infer dense strides from them.
+  if (C10_UNLIKELY(at::detail::symbolic_iterators() && self.is_cuda())) {
+    // a CUDA graph host trace: the same outputs over SymInt
+    const auto strides = self.is_non_overlapping_and_dense()
+        ? self.sym_strides().vec()
+        : at::infer_dense_strides_symint(self.sym_sizes(), self.sym_strides());
+    set_output_raw_strided_symint(0, self.sym_sizes(), strides, self.options());
+    set_output_raw_strided_symint(1, self.sym_sizes(), strides, self.options().dtype(kLong));
+    return;
+  }
   std::vector<int64_t> strides = (self.is_non_overlapping_and_dense())
       ? self.strides().vec()
       : at::infer_dense_strides(self.sizes(), self.strides());

@@ -123,6 +123,76 @@ TensorIterator make_value_selection_intersection_iter(
   return iter;
 }
 
+template <typename index_t, typename hash_coeffs_t>
+struct SparseIndicesHashFunctor {
+  const index_t* RESTRICT ptr_indices;
+  int64_t indices_nnz_stride;
+  int64_t sparse_dim;
+  hash_coeffs_t hash_coeffs;
+  int64_t indices_dim_stride;
+  FUNCAPI int64_t operator()(index_t nnz_idx) const {
+    int64_t hash = 0;
+    if (!ptr_indices) {
+      return hash;
+    }
+    const auto* RESTRICT ptr_indices_dim = ptr_indices + nnz_idx * indices_nnz_stride;
+    for (int64_t dim = 0; dim < sparse_dim; ++dim) {
+      const auto dim_hash_coeff = hash_coeffs[dim];
+      const auto dim_index = ptr_indices_dim[dim * indices_dim_stride];
+      hash += dim_index * dim_hash_coeff;
+    }
+    return hash;
+  }
+  static constexpr bool host_trace_sizes = true;
+};
+
+template <typename index_t, typename hash_coeffs_t>
+struct SparseHashIntersectionFunctor {
+  const int64_t* RESTRICT hash_ptr;
+  int64_t sparse_dim;
+  const index_t* RESTRICT ptr_indices;
+  int64_t indices_nnz_stride;
+  hash_coeffs_t hash_coeffs;
+  int64_t indices_dim_stride;
+  const int64_t* RESTRICT ptr_sorted_hash;
+  int64_t sorted_hash_len;
+  int64_t* RESTRICT ptr_intersection_count;
+  int64_t* RESTRICT ptr_intersection_first_idx;
+  FUNCAPI index_t operator()(index_t nnz_idx) const {
+    int64_t hash = 0;
+    if (hash_ptr) {
+      hash = hash_ptr[nnz_idx];
+    } else if (sparse_dim) {
+      // Compute hash value
+      const auto* RESTRICT ptr_indices_dim = ptr_indices + nnz_idx * indices_nnz_stride;
+      for (int64_t dim = 0; dim < sparse_dim; ++dim) {
+        const auto dim_hash_coeff = hash_coeffs[dim];
+        const auto dim_index = ptr_indices_dim[dim * indices_dim_stride];
+        hash += dim_index * dim_hash_coeff;
+      }
+    }
+
+    // Perform hash values intersection
+    const auto* RESTRICT lb = find_bound<const int64_t*, int64_t, /*is_lower=*/true>(
+        ptr_sorted_hash,
+        ptr_sorted_hash + sorted_hash_len,
+        hash
+    );
+
+    const auto* RESTRICT ub = find_bound<const int64_t*, int64_t, /*is_lower=*/false>(
+        ptr_sorted_hash,
+        ptr_sorted_hash + sorted_hash_len,
+        hash
+    );
+
+    ptr_intersection_count[nnz_idx] = ub - lb;
+    ptr_intersection_first_idx[nnz_idx] = lb - ptr_sorted_hash;
+
+    return 0;
+  }
+  static constexpr bool host_trace_sizes = true;
+};
+
 template <
   template <typename func_t> class kernel_t,
   typename value_selection_intersection_kernel_t,
@@ -240,6 +310,7 @@ void _sparse_binary_op_intersection_kernel_impl(
   }();
 
   const auto hash_coeffs = std::get<0>(*hash_coeffs_storage);
+  using hash_coeffs_t = std::decay_t<decltype(hash_coeffs)>;
 
   const auto nnz_arange = at::arange(
       std::max(probably_coalesced._nnz(), source._nnz()),
@@ -271,20 +342,7 @@ void _sparse_binary_op_intersection_kernel_impl(
       const auto* RESTRICT ptr_indices = indices.const_data_ptr<index_t>();
 
       KernelLauncher::launch(iter,
-          // NOTE: capture by value required by CUDA
-          [=] FUNCAPI (index_t nnz_idx) -> int64_t {
-          int64_t hash = 0;
-          if (!ptr_indices) {
-            return hash;
-          }
-          const auto* RESTRICT ptr_indices_dim = ptr_indices + nnz_idx * indices_nnz_stride;
-          for (int64_t dim = 0; dim < sparse_dim; ++dim) {
-            const auto dim_hash_coeff = hash_coeffs[dim];
-            const auto dim_index = ptr_indices_dim[dim * indices_dim_stride];
-            hash += dim_index * dim_hash_coeff;
-          }
-          return hash;
-      });
+          SparseIndicesHashFunctor<index_t, hash_coeffs_t>{ptr_indices, indices_nnz_stride, sparse_dim, hash_coeffs, indices_dim_stride});
     }
 
     return hash;
@@ -357,39 +415,8 @@ void _sparse_binary_op_intersection_kernel_impl(
 
       // Fusing hash computation with hash intersection.
       KernelLauncher::launch(iter,
-          // NOTE: capture by value required by CUDA
-          [=] FUNCAPI (index_t nnz_idx) -> index_t {
-          int64_t hash = 0;
-          if (hash_ptr) {
-            hash = hash_ptr[nnz_idx];
-          } else if (sparse_dim) {
-            // Compute hash value
-            const auto* RESTRICT ptr_indices_dim = ptr_indices + nnz_idx * indices_nnz_stride;
-            for (int64_t dim = 0; dim < sparse_dim; ++dim) {
-              const auto dim_hash_coeff = hash_coeffs[dim];
-              const auto dim_index = ptr_indices_dim[dim * indices_dim_stride];
-              hash += dim_index * dim_hash_coeff;
-            }
-          }
-
-          // Perform hash values intersection
-          const auto* RESTRICT lb = find_bound<const int64_t*, int64_t, /*is_lower=*/true>(
-              ptr_sorted_hash,
-              ptr_sorted_hash + sorted_hash_len,
-              hash
-          );
-
-          const auto* RESTRICT ub = find_bound<const int64_t*, int64_t, /*is_lower=*/false>(
-              ptr_sorted_hash,
-              ptr_sorted_hash + sorted_hash_len,
-              hash
-          );
-
-          ptr_intersection_count[nnz_idx] = ub - lb;
-          ptr_intersection_first_idx[nnz_idx] = lb - ptr_sorted_hash;
-
-          return 0;
-      });
+          SparseHashIntersectionFunctor<index_t, hash_coeffs_t>{hash_ptr, sparse_dim, ptr_indices, indices_nnz_stride, hash_coeffs,
+              indices_dim_stride, ptr_sorted_hash, sorted_hash_len, ptr_intersection_count, ptr_intersection_first_idx});
     }
 
     return std::make_tuple(intersection_count, intersection_first_idx);

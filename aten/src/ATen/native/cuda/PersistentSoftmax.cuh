@@ -10,10 +10,43 @@
 
 namespace {
 
-int log2_ceil(int value) {
+// Int is a SymInt in the CUDA host trace (SoftMax.cu), where each comparison
+// is a guard: log2_ceil picks the kernel instantiation
+template <typename Int>
+int log2_ceil(const Int& value) {
     int log2_value = 0;
     while ((1 << log2_value) < value) ++log2_value;
     return log2_value;
+}
+
+template <typename Int>
+struct SoftmaxWarpForwardConfig {
+    int log2_elements;
+    int warp_size;
+    int warps_per_block;
+    Int blocks;
+};
+
+// dispatch_softmax_forward's launch configuration, shared with the CUDA host
+// trace (SoftMax.cu), which computes it over SymInt: blocks is a size expression
+template <typename Int>
+SoftmaxWarpForwardConfig<Int> softmax_warp_forward_config(const Int& softmax_elements, const Int& batch_count, int device_warp_size) {
+    int log2_elements = log2_ceil(softmax_elements);
+    const int next_power_of_two = 1 << log2_elements;
+
+    // This value must match the WARP_SIZE constexpr value computed inside softmax_warp_forward.
+    int warp_size = (next_power_of_two < device_warp_size) ? next_power_of_two : device_warp_size;
+
+    // This value must match the WARP_BATCH constexpr value computed inside softmax_warp_forward.
+    int batches_per_warp = (next_power_of_two <= 128) ? 2 : 1;
+
+    // use 128 threads per block to maximize gpu utilization
+    constexpr int threads_per_block = 128;
+
+    int warps_per_block = (threads_per_block / warp_size);
+    int batches_per_block = warps_per_block * batches_per_warp;
+    Int blocks = (batch_count + batches_per_block - 1) / batches_per_block;
+    return {log2_elements, warp_size, warps_per_block, blocks};
 }
 
 template<typename T>
@@ -306,23 +339,11 @@ void dispatch_softmax_forward(output_t *dst, const input_t *src, int softmax_ele
     if (softmax_elements == 0) {
         return;
     } else {
-        int log2_elements = log2_ceil(softmax_elements);
-        const int next_power_of_two = 1 << log2_elements;
-
-        // This value must match the WARP_SIZE constexpr value computed inside softmax_warp_forward.
-        int warp_size = at::cuda::warp_size();
-        warp_size = (next_power_of_two < warp_size) ? next_power_of_two : warp_size;
-
-        // This value must match the WARP_BATCH constexpr value computed inside softmax_warp_forward.
-        int batches_per_warp = (next_power_of_two <= 128) ? 2 : 1;
-
-        // use 128 threads per block to maximize gpu utilization
-        constexpr int threads_per_block = 128;
-
-        int warps_per_block = (threads_per_block / warp_size);
-        int batches_per_block = warps_per_block * batches_per_warp;
-        int blocks = (batch_count + batches_per_block - 1) / batches_per_block;
-        dim3 threads(warp_size, warps_per_block, 1);
+        const auto config = softmax_warp_forward_config(softmax_elements, batch_count, at::cuda::warp_size());
+        const int log2_elements = config.log2_elements;
+        const int warp_size = config.warp_size;
+        const int blocks = config.blocks;
+        dim3 threads(warp_size, config.warps_per_block, 1);
         // Launch code would be more elegant if C++ supported FOR CONSTEXPR
         switch (log2_elements) {
 #ifdef USE_ROCM

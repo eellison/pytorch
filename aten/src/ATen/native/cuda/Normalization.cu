@@ -11,6 +11,12 @@
 #include <c10/cuda/CUDAMathCompat.h>
 #include <utility>
 
+#if !defined(USE_ROCM)
+#include <ATen/TensorUtils.h>
+#include <ATen/cuda/host_trace/LoopsSym.cuh>
+#include <ATen/cuda/host_trace/Ops.h>
+#endif
+
 #ifndef AT_PER_OPERATOR_HEADERS
 #include <ATen/Functions.h>
 #include <ATen/NativeFunctions.h>
@@ -26,7 +32,9 @@
 #include <ATen/ops/batch_norm_update_stats_native.h>
 #include <ATen/ops/cudnn_batch_norm.h>
 #include <ATen/ops/cudnn_batch_norm_backward.h>
+#include <ATen/ops/empty.h>
 #include <ATen/ops/empty_like.h>
+#include <ATen/ops/empty_strided.h>
 #include <ATen/ops/from_blob.h>
 #include <ATen/ops/miopen_batch_norm.h>
 #include <ATen/ops/miopen_batch_norm_backward.h>
@@ -178,6 +186,20 @@ void batch_norm_elementwise(
   }
 }
 
+template <typename scalar_t, typename accscalar_t>
+struct BatchNormElementwiseBackwardTrainFunctor {
+  static constexpr bool host_trace_sizes = true;
+  accscalar_t norm_fct;
+  __device__ scalar_t operator()(scalar_t gO, scalar_t input, accscalar_t weight,
+                                 accscalar_t mean, accscalar_t invstd,
+                                 accscalar_t xmu, accscalar_t dy) const {
+    auto factor_1_c = invstd * invstd * xmu * norm_fct;
+    auto factor_2_c = weight * invstd;
+    auto m_dy_c = dy * norm_fct;
+    return (gO - m_dy_c - (input - mean) * factor_1_c) * factor_2_c;
+  }
+};
+
 Tensor batch_norm_elementwise_backward_train(
     const Tensor& grad_out, const Tensor& input, const Tensor& mean, const Tensor& invstd,
     const Tensor& weight, const Tensor& sum_dy, const Tensor& sum_dy_xmu) {
@@ -238,14 +260,7 @@ Tensor batch_norm_elementwise_backward_train(
                                     "batch_norm_eval_backward", [&]{
       using accscalar_t = at::acc_type<scalar_t, true>;
       auto norm_fct = static_cast<accscalar_t>(1.0 / (input.numel() /input.size(1)) );
-      gpu_kernel(iter, [norm_fct] GPU_LAMBDA (scalar_t gO, scalar_t input, accscalar_t weight,
-                                              accscalar_t mean, accscalar_t invstd,
-                                              accscalar_t xmu, accscalar_t dy) -> scalar_t {
-        auto factor_1_c = invstd * invstd * xmu * norm_fct;
-        auto factor_2_c = weight * invstd;
-        auto m_dy_c = dy * norm_fct;
-        return (gO - m_dy_c - (input - mean) * factor_1_c) * factor_2_c;
-      });
+      gpu_kernel(iter, BatchNormElementwiseBackwardTrainFunctor<scalar_t, accscalar_t>{norm_fct});
     });
     return grad_input;
   }
@@ -344,6 +359,20 @@ void batch_norm_mean_var(const Tensor& self, Tensor& save_mean, Tensor& save_var
   }
 }
 
+template <typename scalar_t, typename acc_t>
+struct BatchNormUpdateStatsFunctor {
+  static constexpr bool host_trace_sizes = true;
+  acc_t bessel_correction_factor;
+  acc_t momentum;
+  __device__ thrust::tuple<scalar_t, scalar_t> operator()(acc_t mean, acc_t var, scalar_t running_mean, scalar_t running_var) const {
+    const auto unbiased_var = var * bessel_correction_factor;
+    return thrust::tuple<scalar_t, scalar_t>{
+      mean * momentum + (1 - momentum) * running_mean,
+      unbiased_var * momentum + (1 - momentum) * running_var,
+    };
+  }
+};
+
 void batch_norm_update_stats(
     const Tensor& save_mean, const Tensor& save_var,
     const Tensor& running_mean, const Tensor& running_var,
@@ -367,16 +396,25 @@ void batch_norm_update_stats(
           static_cast<double>(N) / static_cast<double>(N - 1));
       const auto momentum = static_cast<acc_t>(momentum_);
       gpu_kernel_multiple_outputs(
-          iter, [=] GPU_LAMBDA (acc_t mean, acc_t var, scalar_t running_mean, scalar_t running_var)
-               -> thrust::tuple<scalar_t, scalar_t> {
-        const auto unbiased_var = var * bessel_correction_factor;
-        return thrust::tuple<scalar_t, scalar_t>{
-          mean * momentum + (1 - momentum) * running_mean,
-          unbiased_var * momentum + (1 - momentum) * running_var,
-        };
-      });
+          iter, BatchNormUpdateStatsFunctor<scalar_t, acc_t>{bessel_correction_factor, momentum});
   });
 }
+
+template <typename scalar_t, typename acc_t>
+struct BatchNormUpdateStatsAndInvertFunctor {
+  static constexpr bool host_trace_sizes = true;
+  acc_t bessel_correction_factor;
+  acc_t momentum;
+  acc_t eps;
+  __device__ thrust::tuple<scalar_t, scalar_t, acc_t> operator()(acc_t mean, acc_t var, scalar_t running_mean, scalar_t running_var) const {
+    const auto unbiased_var = var * bessel_correction_factor;
+    return thrust::tuple<scalar_t, scalar_t, acc_t>{
+      mean * momentum + (1 - momentum) * running_mean,
+      unbiased_var * momentum + (1 - momentum) * running_var,
+      c10::cuda::compat::rsqrt(var + eps)
+    };
+  }
+};
 
 void batch_norm_update_stats_and_invert(
     const Tensor& save_mean, const Tensor& save_var,
@@ -403,17 +441,20 @@ void batch_norm_update_stats_and_invert(
       const auto eps = static_cast<acc_t>(epsilon);
       const auto momentum = static_cast<acc_t>(momentum_);
       gpu_kernel_multiple_outputs(
-          iter, [=] GPU_LAMBDA (acc_t mean, acc_t var, scalar_t running_mean, scalar_t running_var)
-               -> thrust::tuple<scalar_t, scalar_t, acc_t> {
-        const auto unbiased_var = var * bessel_correction_factor;
-        return thrust::tuple<scalar_t, scalar_t, acc_t>{
-          mean * momentum + (1 - momentum) * running_mean,
-          unbiased_var * momentum + (1 - momentum) * running_var,
-          c10::cuda::compat::rsqrt(var + eps)
-        };
-      });
+          iter, BatchNormUpdateStatsAndInvertFunctor<scalar_t, acc_t>{bessel_correction_factor, momentum, eps});
   });
 }
+
+template <typename scalar_t, typename acc_t>
+struct BatchNormInvStdFunctor {
+  __device__ acc_t operator()(scalar_t var) const {
+    return c10::cuda::compat::rsqrt(var + eps);
+  }
+  acc_t eps;
+  auto host_trace_fields() const {
+    return std::tie(eps);
+  }
+};
 
 void batch_norm_calc_invstd(const Tensor& out_invstd, const Tensor& running_var, double epsilon) {
   auto iter = TensorIteratorConfig()
@@ -425,10 +466,7 @@ void batch_norm_calc_invstd(const Tensor& out_invstd, const Tensor& running_var,
   AT_DISPATCH_FLOATING_TYPES_AND2(kHalf, kBFloat16, running_var.scalar_type(),
                                   "batch_norm_invert_std_cuda", [&] {
     using acc_t = at::acc_type<scalar_t, true>;
-    auto eps = static_cast<acc_t>(epsilon);
-    gpu_kernel(iter, [eps] GPU_LAMBDA (scalar_t var) -> acc_t {
-      return c10::cuda::compat::rsqrt(var + eps);
-    });
+    gpu_kernel(iter, BatchNormInvStdFunctor<scalar_t, acc_t>{static_cast<acc_t>(epsilon)});
   });
 }
 }
@@ -840,3 +878,183 @@ std::tuple<Tensor, Tensor> batch_norm_update_stats_cuda(
 }
 
 } // namespace at::native
+
+#if !defined(USE_ROCM)
+// Traced host (ATen/cuda/host_trace/Ops.h)
+namespace at::cuda::host_trace {
+namespace {
+
+namespace an = at::native;
+
+// GenericPackedTensorAccessor's protected members, to set in a Param
+template <class A>
+struct AccessorMembers : A {
+  using A::data_;
+  using A::sizes_;
+  using A::strides_;
+};
+
+// its data_ as a plain pointer, which Param::set records as one
+template <typename T, class A>
+T*& accessor_data(Param<A>& p) {
+  // a C-style cast, to drop the member's __restrict__
+  return (T*&)(p.value().*(&AccessorMembers<A>::data_));
+}
+
+template <typename T, typename index_t>
+Param<GenericPackedTensorAccessor<T, 1, RestrictPtrTraits, index_t>> accessor_or_dummy(Recorder& rec, const TensorBase& t) {
+  using A = GenericPackedTensorAccessor<T, 1, RestrictPtrTraits, index_t>;
+  Param<A> p;
+  if (t.defined()) {
+    p.set(accessor_data<T>(p), rec.data_ptr(t));
+    p.set((p.value().*(&AccessorMembers<A>::sizes_))[0], t.sym_size(0));
+    p.set((p.value().*(&AccessorMembers<A>::strides_))[0], t.sym_stride(0));
+  }
+  return p;
+}
+
+// t viewed as [N, C, F], as eager's reshape and view of a contiguous t
+template <typename T, typename index_t>
+Param<GenericPackedTensorAccessor<T, 3, RestrictPtrTraits, index_t>> accessor_3d(Recorder& rec, const TensorBase& t, const c10::SymDimVector& shape) {
+  using A = GenericPackedTensorAccessor<T, 3, RestrictPtrTraits, index_t>;
+  const auto strides = at::detail::computeStride(t.sym_sizes(), t.sym_strides(), shape);
+  TORCH_INTERNAL_ASSERT(strides.has_value());
+  Param<A> p;
+  p.set(accessor_data<T>(p), rec.data_ptr(t));
+  for (const auto i : c10::irange(3)) {
+    p.set((p.value().*(&AccessorMembers<A>::sizes_))[i], shape[i]);
+    p.set((p.value().*(&AccessorMembers<A>::strides_))[i], (*strides)[i]);
+  }
+  return p;
+}
+
+// getNumThreads
+int64_t num_threads(const c10::SymInt& n) {
+  for (const int64_t t : {32, 64, 128, 256}) {
+    if (n <= t) {
+      return t;
+    }
+  }
+  return an::MAX_BLOCK_SIZE;
+}
+
+// lastPow2 of n >= 1
+c10::SymInt last_pow2(Recorder& rec, const c10::SymInt& n) {
+  if (auto c = n.maybe_as_int()) {
+    return an::lastPow2(static_cast<unsigned int>(*c));
+  }
+  return rec.pow2(rec.bit_length(n) - 1);
+}
+
+// batch_norm_elemt_cuda_template's launch (keep in sync)
+template <typename input_scalar_t, typename stat_scalar_t>
+void batch_norm_elemt_launch(Recorder& rec, const TensorBase& out, const TensorBase& input, const TensorBase& weight, const TensorBase& bias, const TensorBase& mean, const TensorBase& invstd) {
+  using stat_accscalar_t = at::acc_type<stat_scalar_t, true>;
+  c10::SymDimVector shape{input.sym_size(0), input.sym_size(1), 1};
+  for (const auto i : c10::irange(2, input.dim())) {
+    shape[2] *= input.sym_size(i);
+  }
+  const int64_t tf = std::max(num_threads(shape[2] / 4), std::min(num_threads(shape[2]), int64_t{64}));
+  const int64_t tb = std::max(int64_t{64} / tf, int64_t{1});
+  const c10::SymInt blocks_y = c10::SymInt(256 * 1024 / shape[1]).min((shape[0] + tb - 1) / tb).max(1).min(static_cast<int64_t>(an::MAX_GRID_SIZE));
+  launch(rec, &an::batch_norm_transform_input_kernel<input_scalar_t, stat_scalar_t, stat_accscalar_t, true, int32_t>,
+         SymDim3(shape[1], blocks_y), SymDim3(tf, tb), 0,
+         accessor_3d<const input_scalar_t, int32_t>(rec, input, shape), accessor_3d<input_scalar_t, int32_t>(rec, out, shape),
+         accessor_or_dummy<stat_accscalar_t, int32_t>(rec, mean), accessor_or_dummy<stat_accscalar_t, int32_t>(rec, invstd),
+         accessor_or_dummy<const stat_scalar_t, int32_t>(rec, weight), accessor_or_dummy<const stat_scalar_t, int32_t>(rec, bias),
+         Param<stat_accscalar_t>(1e-5));
+}
+
+// batch_norm_elemt_channels_last_cuda_template's launch (keep in sync)
+template <typename scalar_t, typename layerscalar_t>
+void batch_norm_elemt_channels_last_launch(Recorder& rec, const TensorBase& out, const TensorBase& input, const TensorBase& weight, const TensorBase& bias, const TensorBase& mean, const TensorBase& invstd) {
+  using accscalar_t = at::acc_type<scalar_t, true>;
+  const c10::SymInt& stride = input.sym_size(1);
+  const c10::SymInt reduction_size = input.sym_numel() / stride;
+  // flexible_launch_configs; its second block_x is its first where the block is full
+  const c10::SymInt block_y = last_pow2(rec, (reduction_size + an::ELEMENTS_PER_THREAD - 1) / an::ELEMENTS_PER_THREAD).min(an::MAX_BLOCK_SIZE / last_pow2(rec, stride).min(an::OPTIMAL_TILE_W));
+  const c10::SymInt block_x = last_pow2(rec, stride).min(an::MAX_BLOCK_SIZE / block_y);
+  const c10::SymInt grid_y = ((reduction_size + block_y * an::ELEMENTS_PER_THREAD - 1) / (block_y * an::ELEMENTS_PER_THREAD)).min(an::MAX_H_BLOCK);
+  const auto address = [&rec](const TensorBase& t) { return t.defined() ? rec.data_ptr(t) : c10::SymInt(0); };
+  launch(rec, &an::batch_norm_transform_input_channels_last_kernel<scalar_t, accscalar_t, layerscalar_t, an::ELEMENTS_PER_ITER>,
+         SymDim3((stride + block_x - 1) / block_x, grid_y), SymDim3(block_x, block_y), 0,
+         scalar_param<const scalar_t*>(address(input)), Param<const scalar_t*>(), scalar_param<const accscalar_t*>(address(mean)),
+         scalar_param<const accscalar_t*>(address(invstd)), scalar_param<const layerscalar_t*>(address(weight)),
+         scalar_param<const layerscalar_t*>(address(bias)), scalar_param<scalar_t*>(address(out)), scalar_param<int>(reduction_size),
+         scalar_param<int>(stride), Param<bool>(false));
+}
+
+} // namespace
+
+std::tuple<TensorBase, TensorBase, TensorBase> native_batch_norm(Recorder& rec, const TensorBase& input, const TensorBase& weight, const TensorBase& bias, const TensorBase& running_mean, const TensorBase& running_var, bool training, double eps) {
+  if (training) {
+    decline("a batch norm in training");
+  }
+  if (!running_mean.defined() || !running_var.defined()) {
+    decline("a batch norm without running statistics");
+  }
+  const ScalarType dtype = input.scalar_type();
+  if (dtype != kHalf && dtype != kBFloat16 && dtype != kFloat) {
+    decline(c10::str("a ", dtype, " batch norm"));
+  }
+  const ScalarType acc = at::toAccumulateType(dtype, /*is_cuda=*/true);
+  if (running_var.scalar_type() == kDouble) {
+    decline("a double running variance");
+  }
+  const TensorBase& param = weight.defined() ? weight : bias;
+  const ScalarType param_dtype = param.defined() ? param.scalar_type() : dtype;
+  if ((param_dtype != dtype && param_dtype != acc) || (weight.defined() && bias.defined() && weight.scalar_type() != bias.scalar_type())) {
+    decline("a batch norm weight or bias of another dtype");
+  }
+  if (input.sym_numel() == 0) {
+    decline("an empty batch norm");
+  }
+  // batch_norm_cuda's empty_like(self) of a dense self, save_mean and save_invstd
+  if (!input.is_non_overlapping_and_dense()) {
+    decline("a batch norm of an input that is not dense");
+  }
+  const TensorBase out = at::empty_strided_symint(input.sym_sizes(), input.sym_strides(), input.options());
+  const auto stat_options = input.options().dtype(acc);
+  const TensorBase save_mean = at::empty_symint({input.sym_size(1)}, stat_options);
+  const TensorBase save_invstd = at::empty_symint({input.sym_size(1)}, stat_options);
+  copy_(rec, save_mean, running_mean);
+  // batch_norm_calc_invstd
+  auto iter = TensorIteratorSym::pointwise_op(rec, {save_invstd}, {acc}, {running_var});
+  AT_DISPATCH_FLOATING_TYPES_AND2(kHalf, kBFloat16, running_var.scalar_type(), "batch_norm_invert_std_cuda", [&] {
+    using acc_t = at::acc_type<scalar_t, true>;
+    gpu_kernel(rec, iter, an::BatchNormInvStdFunctor<scalar_t, acc_t>{static_cast<acc_t>(eps)});
+  });
+  // batch_norm_elementwise's batch_norm_choose_impl. canUse32BitIndexMath of a
+  // dense input, whose last element is at numel - 1: its linearId % size of
+  // symbolic sizes costs sympy minutes on a deep conv net
+  if (input.sym_numel() >= std::numeric_limits<int32_t>::max()) {
+    decline("a batch norm beyond 32-bit indexing");
+  }
+  const bool contiguous = input.is_contiguous();
+  if (contiguous && input.sym_stride(1) != 1) {
+    AT_DISPATCH_FLOATING_TYPES_AND2(kBFloat16, kHalf, dtype, "batch_norm_elementwise_cuda", [&] {
+      using accscalar_t = at::acc_type<scalar_t, true>;
+      if (param_dtype != dtype) {
+        batch_norm_elemt_launch<scalar_t, accscalar_t>(rec, out, input, weight, bias, save_mean, save_invstd);
+      } else {
+        batch_norm_elemt_launch<scalar_t, scalar_t>(rec, out, input, weight, bias, save_mean, save_invstd);
+      }
+    });
+  } else if ((contiguous || input.is_contiguous(at::MemoryFormat::ChannelsLast)) && (!weight.defined() || weight.is_contiguous()) &&
+             (!bias.defined() || bias.is_contiguous())) {
+    AT_DISPATCH_FLOATING_TYPES_AND2(kHalf, kBFloat16, dtype, "batchnorm_forward", [&] {
+      using accscalar_t = at::acc_type<scalar_t, true>;
+      if (param_dtype != dtype) {
+        batch_norm_elemt_channels_last_launch<scalar_t, accscalar_t>(rec, out, input, weight, bias, save_mean, save_invstd);
+      } else {
+        batch_norm_elemt_channels_last_launch<scalar_t, scalar_t>(rec, out, input, weight, bias, save_mean, save_invstd);
+      }
+    });
+  } else {
+    decline("a batch norm through TensorIterator (batch_norm_elementwise's general case)");
+  }
+  return {out, save_mean, save_invstd};
+}
+
+} // namespace at::cuda::host_trace
+#endif

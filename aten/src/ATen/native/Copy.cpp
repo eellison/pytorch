@@ -1,6 +1,8 @@
 #define TORCH_ASSERT_ONLY_METHOD_OPERATORS
 #include <ATen/native/Copy.h>
 
+#include <utility>
+
 #include <ATen/core/Tensor.h>
 #include <ATen/Dispatch.h>
 #include <ATen/Dispatch_v2.h>
@@ -137,6 +139,14 @@ bool is_supported_device(Device device) {
 
 namespace at::native {
 
+namespace {
+thread_local SymbolicSameStart symbolic_same_start = nullptr;
+} // namespace
+
+SymbolicSameStart set_symbolic_same_start(SymbolicSameStart hook) {
+  return std::exchange(symbolic_same_start, hook);
+}
+
 static Tensor & copy_impl(Tensor & self, const Tensor & src, bool non_blocking) {
   // TODO: this should be handled during dispatch, but that's missing...
   TORCH_CHECK(self.defined(), "self is undefined");
@@ -256,10 +266,10 @@ static Tensor & copy_impl(Tensor & self, const Tensor & src, bool non_blocking) 
 
   // Exit early if self and src are views of the same data
   const bool is_same_data = (
-      self.is_alias_of(src) &&
-      self.storage_offset() == src.storage_offset() &&
-      self.strides().equals(src.strides()) &&
-      self.sizes().equals(src.sizes()) &&
+      (symbolic_same_start ? symbolic_same_start(self, src) : self.is_alias_of(src)) &&
+      self.sym_storage_offset() == src.sym_storage_offset() &&
+      self.sym_strides().equals(src.sym_strides()) &&
+      self.sym_sizes().equals(src.sym_sizes()) &&
       self.scalar_type() == src.scalar_type() &&
       self.is_conj() == src.is_conj() &&
       self.is_neg() == src.is_neg()
@@ -277,7 +287,8 @@ static Tensor & copy_impl(Tensor & self, const Tensor & src, bool non_blocking) 
     .check_all_same_device(false)
     .build();
 
-  if (iter.numel() == 0) {
+  // a symbolic iterator (a CUDA graph host trace): whether it is empty is a guard
+  if (iter.is_symbolic() ? iter.sym_numel() == 0 : iter.numel() == 0) {
     return self;
   }
 

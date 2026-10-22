@@ -288,6 +288,22 @@ def cummaxmin(self, dim):
     return values, indices
 
 
+@register_meta(aten._conv_depthwise2d.default)
+def meta_conv_depthwise2d(input, weight, kernel_size, bias, stride, padding, dilation):
+    # conv_depthwise2d_forward_out's output: (N, weight's channels, H out, W out), contiguous
+    sizes = [input.shape[0], weight.shape[0]]
+    for d in range(2):
+        span = dilation[d] * (kernel_size[d] - 1) + 1
+        sizes.append((input.shape[2 + d] + 2 * padding[d] - span) // stride[d] + 1)
+    return input.new_empty(sizes)
+
+
+@register_meta([aten._cummax_helper.default, aten._cummin_helper.default])
+def cummaxmin_helper(self, values, indices, dim):
+    # cummax_out's kernel: it writes values and indices, already sized as self
+    return None
+
+
 @register_meta([aten.logcumsumexp.default, aten.logcumsumexp.out])
 @out_wrapper()
 def logcumsumexp(self, dim):

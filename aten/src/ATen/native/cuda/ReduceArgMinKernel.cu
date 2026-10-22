@@ -10,6 +10,10 @@
 #include <ATen/native/cuda/ReduceOps.h>
 #include <ATen/cuda/NumericLimits.cuh>
 #include <ATen/native/cuda/Reduce.cuh>
+#if !defined(USE_ROCM)
+#include <ATen/cuda/host_trace/Ops.h>
+#include <ATen/cuda/host_trace/ReduceSym.cuh>
+#endif
 
 #include <thrust/pair.h>
 
@@ -42,3 +46,34 @@ void argmin_kernel_cuda(TensorIterator& iter) {
 REGISTER_DISPATCH(argmin_stub, &argmin_kernel_cuda)
 
 } // namespace at::native
+
+#if !defined(USE_ROCM)
+// Traced host (ATen/cuda/host_trace/Ops.h)
+namespace at::cuda::host_trace {
+
+// argmax_argmin_impl
+TensorBase argmin(Recorder& rec, const TensorBase& self, std::optional<int64_t> dim, bool keepdim) {
+  TensorBase result;
+  auto iter = make_arg_reduction(rec, result, self, dim, keepdim);
+  if (!iter) {
+    return result;
+  }
+  auto run = [&](auto scalar, auto acc) {
+    using scalar_t = decltype(scalar);
+    using acc_t = decltype(acc);
+    Param ops(at::native::ArgMinOps<acc_t>{});
+    gpu_reduce_kernel<scalar_t, int64_t>(rec, *iter, ops, thrust::pair<acc_t, int64_t>(at::numeric_limits<acc_t>::upper_bound(), 0));
+  };
+  // argmin_kernel_cuda
+  if (self.scalar_type() == kHalf) {
+    run(at::Half{}, float{});
+  } else if (self.scalar_type() == kBFloat16) {
+    run(at::BFloat16{}, float{});
+  } else {
+    AT_DISPATCH_ALL_TYPES(self.scalar_type(), "argmin_cuda", [&]() { run(scalar_t{}, scalar_t{}); });
+  }
+  return result;
+}
+
+} // namespace at::cuda::host_trace
+#endif

@@ -186,6 +186,17 @@ fused_dropout_kernel(cuda::detail::TensorInfo<const scalar_t, IndexType> a,
   }
 }
 
+template <typename mask_t, typename scalar_t, typename accscalar_t>
+struct MaskedScaleFunctor {
+  accscalar_t scale;
+  __device__ scalar_t operator()(const scalar_t src_val, const mask_t mask_val) const {
+    return (float)mask_val * src_val * scale;
+  }
+  auto host_trace_fields() const {
+    return std::tie(scale);
+  }
+};
+
 template<typename mask_t, typename scalar_t, typename accscalar_t>
 void masked_scale_kernel(at::Tensor& ret, const at::Tensor& src, const at::Tensor& mask, accscalar_t scale){
    auto iter = at::TensorIteratorConfig()
@@ -195,11 +206,7 @@ void masked_scale_kernel(at::Tensor& ret, const at::Tensor& src, const at::Tenso
      .add_const_input(mask)
      .build();
 
-   at::native::gpu_kernel(
-       iter,
-       [=]GPU_LAMBDA(const scalar_t src_val, const mask_t mask_val) -> scalar_t {
-          return (float)mask_val * src_val * scale;
-       });
+   at::native::gpu_kernel(iter, MaskedScaleFunctor<mask_t, scalar_t, accscalar_t>{scale});
 }
 
 template <typename scalar_t>

@@ -1,4 +1,5 @@
 #include <ATen/WrapDimUtilsMulti.h>
+#include <ATen/TensorIterator.h>
 #include <ATen/core/ATen_fwd.h>
 #include <c10/core/ScalarType.h>
 #include <c10/core/SymInt.h>
@@ -251,7 +252,7 @@ TORCH_PRECOMPUTE_META_FUNC(cat)(const ITensorListRef& tensors, int64_t dim) {
 
   // Fallback 'set_output' parameters.
   // (in case we don't find a valid tensor)
-  DimVector sizes{0};
+  SymDimVector sizes{0};
   TensorOptions options =
       materialized[0].get().options().dtype(out_dtype).memory_format(
           memory_format);
@@ -269,31 +270,36 @@ TORCH_PRECOMPUTE_META_FUNC(cat)(const ITensorListRef& tensors, int64_t dim) {
     // Compute the output tensor size.
     // It should have the same shape as any other valid tensor,
     // except in the dimension 'dim'.
-    size_t size_at_dim = 0;
+    c10::SymInt size_at_dim = 0;
     for (const auto i : c10::irange(materialized.size())) {
       const Tensor& t = materialized[i];
       all_same_dtype = all_same_dtype && out_dtype == t.scalar_type();
       if (!at::native::cat_should_skip_tensor(t)) {
         at::native::check_cat_shape_except_dim(materialized[valid], t, dim, i);
-        size_at_dim += t.size(dim);
+        size_at_dim += t.sym_size(dim);
         all_contiguous = all_contiguous && t.is_contiguous(memory_format);
         all_same_sizes_and_stride = all_same_sizes_and_stride &&
-            t.sizes() == materialized[valid].get().sizes() &&
-            t.strides() == materialized[valid].get().strides();
+            t.sym_sizes() == materialized[valid].get().sym_sizes() &&
+            t.sym_strides() == materialized[valid].get().sym_strides();
       } else {
         all_contiguous = false;
       }
     }
 
     // Actually set the output.
-    sizes = materialized[valid].get().sizes().vec();
+    sizes = SymDimVector(materialized[valid].get().sym_sizes());
     sizes[dim] = size_at_dim;
     options =
         materialized[valid].get().options().dtype(out_dtype).memory_format(
             memory_format);
   }
 
-  set_output_raw_strided(0, sizes, {}, options);
+  if (C10_UNLIKELY(at::detail::symbolic_iterators() && options.device().is_cuda())) {
+    // a CUDA graph host trace: the same output over SymInt
+    set_output_raw_strided_symint(0, sizes, {}, options);
+  } else {
+    set_output_raw_strided(0, C10_AS_INTARRAYREF_SLOW(sizes), {}, options);
+  }
   // Checks for overlaps between the inputs and the output tensor.
   if (is_out_defined && found_valid_tensor) {
     at::assert_no_internal_overlap(result);
@@ -959,8 +965,8 @@ Tensor block_diag(TensorList tensors) {
   }
 
   ScalarType output_scalar_type = native::result_type(tensors);
-  int64_t result_dim0 = 0;
-  int64_t result_dim1 = 0;
+  c10::SymInt result_dim0 = 0;
+  c10::SymInt result_dim1 = 0;
   std::vector<Tensor> tensors_2D(tensors.size());
 
   // Sum the dimensions of the tensors, check tensor sizes,
@@ -977,37 +983,37 @@ Tensor block_diag(TensorList tensors) {
         ndims,
         " dimensions");
 
-    int64_t dim0 = 1;
-    int64_t dim1 = 1;
+    c10::SymInt dim0 = 1;
+    c10::SymInt dim1 = 1;
 
     if (ndims == 2) {
-      dim0 = tensor.size(0);
-      dim1 = tensor.size(1);
+      dim0 = tensor.sym_size(0);
+      dim1 = tensor.sym_size(1);
       tensors_2D[tensor_idx] = tensor;
     } else if (ndims == 1) {
       // Switching dim 0 to dim 1 is intentional
-      dim1 = tensor.size(0);
-      tensors_2D[tensor_idx] = tensor.expand({dim0, dim1});
+      dim1 = tensor.sym_size(0);
+      tensors_2D[tensor_idx] = tensor.expand_symint({dim0, dim1});
     } else {
-      tensors_2D[tensor_idx] = tensor.expand({dim0, dim1});
+      tensors_2D[tensor_idx] = tensor.expand_symint({dim0, dim1});
     }
     result_dim0 += dim0;
     result_dim1 += dim1;
   }
 
-  result = at::zeros(
+  result = at::zeros_symint(
       {result_dim0, result_dim1},
       tensors[0].options().dtype(output_scalar_type));
 
-  int64_t cur_dim0 = 0;
-  int64_t cur_dim1 = 0;
+  c10::SymInt cur_dim0 = 0;
+  c10::SymInt cur_dim1 = 0;
 
   // Copy each tensor into the appropriate location in the result matrix
   for (const auto& tensor : tensors_2D) {
-    int64_t dim0 = tensor.size(0);
-    int64_t dim1 = tensor.size(1);
-    result.slice(0, cur_dim0, cur_dim0 + dim0)
-        .slice(1, cur_dim1, cur_dim1 + dim1)
+    c10::SymInt dim0 = tensor.sym_size(0);
+    c10::SymInt dim1 = tensor.sym_size(1);
+    result.slice_symint(0, cur_dim0, cur_dim0 + dim0)
+        .slice_symint(1, cur_dim1, cur_dim1 + dim1)
         .copy_(tensor);
 
     cur_dim0 += dim0;
@@ -1250,12 +1256,12 @@ Tensor diag_embed(
       dim1_,
       ", ",
       dim2_);
-  int64_t new_dim_len = std::abs(offset) + self.size(-1);
-  auto sizes = self.sizes().vec();
+  c10::SymInt new_dim_len = std::abs(offset) + self.sym_size(-1);
+  auto sizes = self.sym_sizes().vec();
   sizes.pop_back();
   sizes.insert(sizes.begin() + std::min(dim1, dim2), new_dim_len);
   sizes.insert(sizes.begin() + std::max(dim1, dim2), new_dim_len);
-  auto result = at::zeros(sizes, self.options());
+  auto result = at::zeros_symint(sizes, self.options());
   auto diag = result.diagonal(offset, dim1, dim2);
   diag.copy_(self);
   return result;
@@ -3041,15 +3047,15 @@ Tensor slice_inverse_symint(
       base.sym_sizes(), base.sym_strides(), base.sym_storage_offset());
 }
 
-Tensor slice_backward(
+Tensor slice_backward_symint(
     const Tensor& grad,
-    IntArrayRef input_sizes,
+    c10::SymIntArrayRef input_sizes,
     int64_t dim,
-    int64_t start,
-    int64_t end,
-    int64_t step) {
-  auto grad_input = at::zeros(input_sizes, grad.options());
-  grad_input.slice(dim, start, end, step).copy_(grad);
+    c10::SymInt start,
+    c10::SymInt end,
+    c10::SymInt step) {
+  auto grad_input = at::zeros_symint(input_sizes, grad.options());
+  grad_input.slice_symint(dim, std::move(start), std::move(end), std::move(step)).copy_(grad);
   return grad_input;
 }
 
@@ -3224,15 +3230,15 @@ static inline std::vector<Tensor> get_stack_inputs(
     TensorList tensors,
     int64_t dim) {
   std::vector<Tensor> inputs(tensors.size());
-  at::IntArrayRef entry_shape = tensors[0].sizes();
+  c10::SymIntArrayRef entry_shape = tensors[0].sym_sizes();
   inputs[0] = tensors[0].unsqueeze(dim);
   for (const auto i : c10::irange(1, tensors.size())) {
     TORCH_CHECK(
-        tensors[i].sizes() == entry_shape,
+        tensors[i].sym_sizes() == entry_shape,
         "stack expects each tensor to be equal size, but got ",
         entry_shape,
         " at entry 0 and ",
-        tensors[i].sizes(),
+        tensors[i].sym_sizes(),
         " at entry ",
         i);
     inputs[i] = tensors[i].unsqueeze(dim);
@@ -3281,14 +3287,14 @@ Tensor _stack_cpu(TensorList tensors, int64_t dim) {
 }
 
 static void check_stack_inputs(TensorList tensors, int64_t dim) {
-  at::IntArrayRef entry_shape = tensors[0].sizes();
+  c10::SymIntArrayRef entry_shape = tensors[0].sym_sizes();
   for (const auto i : c10::irange(1, tensors.size())) {
     TORCH_CHECK(
-        tensors[i].sizes() == entry_shape,
+        tensors[i].sym_sizes() == entry_shape,
         "stack expects each tensor to be equal size, but got ",
         entry_shape,
         " at entry 0 and ",
-        tensors[i].sizes(),
+        tensors[i].sym_sizes(),
         " at entry ",
         i);
   }
@@ -3386,10 +3392,10 @@ Tensor stack(TensorList tensors, int64_t dim) {
   auto wrapped_dim = maybe_wrap_dim(dim, tensors[0].ndimension() + 1);
   if (wrapped_dim < tensors[0].ndimension() && !tensors[0].is_sparse()) {
     check_stack_inputs(tensors, wrapped_dim);
-    auto result_sizes = tensors[0].sizes().vec();
-    result_sizes.insert(result_sizes.begin() + wrapped_dim, tensors.size());
+    auto result_sizes = tensors[0].sym_sizes().vec();
+    result_sizes.insert(result_sizes.begin() + wrapped_dim, c10::SymInt(static_cast<int64_t>(tensors.size())));
     auto out = at::cat(tensors, wrapped_dim);
-    return out.view(result_sizes); // one can always split a dimension with view
+    return out.view_symint(result_sizes); // one can always split a dimension with view
   } else {
     // if dim = tensors[0].ndimension(), view cannot efficiently handle it
     return at::cat(get_stack_inputs(tensors, dim), dim);

@@ -17,10 +17,30 @@ import os
 import pickle
 import struct
 from pathlib import Path
+from types import ModuleType
 from typing import Any
 
 
 log = logging.getLogger(__name__)
+
+# the parent's cudagraph_host_trace, for compile workers
+HOST_TRACE_ENV = "TORCHINDUCTOR_HOST_TRACE_CUTE_WORKER"
+
+
+def host_trace_cute() -> ModuleType | None:
+    """torch.cuda._host_trace_cute, armed, under Inductor's cudagraph_host_trace
+    (in a compile worker, the parent's). Host tracing describes a CuTe function
+    by its compile's host program, which export_to_c then writes beside the object."""
+    from torch._inductor import config
+
+    if not (config.triton.cudagraph_host_trace or os.environ.get(HOST_TRACE_ENV) == "1"):
+        return None
+    import cutlass  # noqa: F401  install() observes a loaded cutlass
+
+    from torch.cuda import _host_trace_cute
+
+    _host_trace_cute.install()
+    return _host_trace_cute
 
 
 def _fix_elf_dup_text_flags(data: bytes) -> bytes:
@@ -102,7 +122,10 @@ def disk_cache_get(
         module_path, config_key, runtime_key, device_index, device_capability
     )
     obj_path = _cache_dir() / f"{h}.o"
-    if obj_path.exists():
+    htc = host_trace_cute()
+    # under host trace, an object exported without its host function is a
+    # miss: the recompile exports both
+    if obj_path.exists() and (htc is None or Path(f"{obj_path}{htc.SIDECAR}").exists()):
         try:
             raw = obj_path.read_bytes()
             patched = _fix_elf_dup_text_flags(raw)
@@ -150,6 +173,11 @@ def disk_cache_set(
             patched = _fix_elf_dup_text_flags(f.read())
         with open(tmp_path, "wb") as f:
             f.write(patched)
+        from torch.cuda._host_trace_cute import SIDECAR
+
+        # host trace's export writes the host function beside the object
+        if os.path.exists(tmp_path + SIDECAR):
+            os.replace(tmp_path + SIDECAR, f"{obj_path}{SIDECAR}")
         os.replace(tmp_path, str(obj_path))
     except (AttributeError, RuntimeError, TypeError):
         log.debug(

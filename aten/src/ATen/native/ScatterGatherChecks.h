@@ -49,10 +49,10 @@ inline void gather_shape_check(const Tensor& self, int64_t dim,
   for (const auto i : c10::irange(self_dims)) {
     if (i != dim) {
       TORCH_CHECK(
-        ensure_nonempty_size(index, i) <= ensure_nonempty_size(self, i),
+        ensure_nonempty_sym_size(index, i) <= ensure_nonempty_sym_size(self, i),
         "Size does not match at dimension ", i,
-        " expected index ", index.sizes(),
-        " to be no larger than self ", self.sizes(),
+        " expected index ", index.sym_sizes(),
+        " to be no larger than self ", self.sym_sizes(),
         " apart from dimension ", dim
       );
     }

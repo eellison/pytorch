@@ -22,7 +22,7 @@ static c10::MaybeOwned<Tensor> contiguous_out_arg(const Tensor &tensor) {
   if (tensor.is_contiguous()) {
     return c10::MaybeOwned<Tensor>::borrowed(tensor);
   }
-  return c10::MaybeOwned<Tensor>::owned(at::empty(tensor.sizes(), tensor.options()));
+  return c10::MaybeOwned<Tensor>::owned(at::empty_symint(tensor.sym_sizes(), tensor.options()));
 }
 
 void cummax_helper_cuda(const Tensor& self, Tensor& values, Tensor& indices, int64_t dim) {

@@ -1,6 +1,8 @@
 #define TORCH_ASSERT_ONLY_METHOD_OPERATORS
 #define TORCH_ASSERT_NO_OPERATORS
 #include <ATen/TensorIterator.h>
+
+#include <optional>
 #undef TORCH_ASSERT_NO_OPERATORS
 
 #include <ATen/core/Tensor.h>
@@ -11,6 +13,7 @@
 #include <ATen/MemoryOverlap.h>
 #include <ATen/native/Resize.h>
 #include <ATen/TensorIteratorInternal.h>
+#include <ATen/detail/TensorIteratorBuild.h>
 
 #ifndef AT_PER_OPERATOR_HEADERS
 #include <ATen/Functions.h>
@@ -20,6 +23,7 @@
 #include <ATen/ops/empty_strided.h>
 #endif
 
+#include <c10/util/Backtrace.h>
 #include <c10/util/irange.h>
 #include <c10/util/SmallBuffer.h>
 
@@ -32,6 +36,153 @@ using DimMask = TensorIteratorBase::DimMask;
 using PtrVector = TensorIteratorBase::PtrVector;
 using loop2d_t = TensorIteratorBase::loop2d_t;
 using StrideVector = TensorIteratorBase::StrideVector;
+namespace ti_build = detail::ti_build;
+
+namespace {
+thread_local bool symbolic_iterators_enabled = false;
+thread_local detail::SymbolicRefusal symbolic_refusal = detail::SymbolicRefusal::None;
+thread_local int64_t symbolic_built = 0;
+} // namespace
+
+bool detail::set_symbolic_iterators(bool enabled) {
+  return std::exchange(symbolic_iterators_enabled, enabled);
+}
+
+bool detail::symbolic_iterators() {
+  return symbolic_iterators_enabled;
+}
+
+void detail::note_symbolic_refusal(SymbolicRefusal why) {
+  symbolic_refusal = why;
+}
+
+detail::SymbolicRefusal detail::take_symbolic_refusal() {
+  return std::exchange(symbolic_refusal, SymbolicRefusal::None);
+}
+
+int64_t detail::symbolic_iterators_built() {
+  return symbolic_built;
+}
+
+namespace {
+thread_local impl::SymbolicResize symbolic_resize_hook = nullptr;
+} // namespace
+
+impl::SymbolicResize impl::set_symbolic_resize(SymbolicResize hook) {
+  return std::exchange(symbolic_resize_hook, hook);
+}
+
+bool impl::symbolic_resize(const TensorBase& out, c10::SymIntArrayRef sizes, c10::SymIntArrayRef strides) {
+  return symbolic_resize_hook != nullptr && symbolic_resize_hook(out, sizes, strides);
+}
+
+void impl::refuse_symbolic_output() {
+  detail::note_symbolic_refusal(detail::SymbolicRefusal::Output);
+  TORCH_CHECK_NOT_IMPLEMENTED(
+      false, "host_trace: an output a symbolic TensorIterator cannot allocate, or would resize (set_output_raw_strided_symint)");
+}
+
+namespace detail {
+
+// an operand of a symbolic iterator: at::OperandInfo's fields the build reads,
+// over SymInt (ti_build duck-types it); index-aligned with operands_
+struct SymOperand {
+  explicit SymOperand(const OperandInfo& op)
+      : tensor(op.tensor_base()), is_output(op.is_output), will_resize(op.will_resize), target_dtype(op.target_dtype), current_dtype(op.current_dtype) {}
+  const TensorBase& tensor_base() const {
+    return tensor;
+  }
+  bool is_type_defined() const {
+    return target_dtype != ScalarType::Undefined;
+  }
+  TensorBase tensor;
+  c10::SmallVector<c10::SymInt, 6> stride_bytes;
+  // the operand's data's byte offset from the tensor's address (flip's restride)
+  c10::SymInt data_offset = 0;
+  bool is_output;
+  bool will_resize;
+  ScalarType target_dtype;
+  ScalarType current_dtype;
+};
+
+struct SymIteratorState {
+  c10::SymDimVector shape;
+  c10::SmallVector<SymOperand, 4> operands;
+  std::optional<std::pair<c10::SymDimVector, c10::SymDimVector>> index_geometry;
+};
+
+} // namespace detail
+
+void TensorIteratorBase::symbolic_read(const char* accessor) const {
+  detail::note_symbolic_refusal(detail::SymbolicRefusal::Accessor);
+  // the callers below the accessor: the site to convert
+  TORCH_CHECK_NOT_IMPLEMENTED(
+      false, "host_trace: ", accessor, " of a symbolic TensorIterator (", ntensors(), " operands, common dtype ",
+      common_dtype_, "): its sizes, strides and data are symbolic; convert the caller to the sym_* accessors. Site:\n",
+      c10::get_backtrace(/*frames_to_skip=*/2, /*maximum_number_of_frames=*/4, /*skip_python_frames=*/true));
+}
+
+int TensorIteratorBase::sym_ndim() const {
+  return static_cast<int>(sym_->shape.size());
+}
+
+c10::SymIntArrayRef TensorIteratorBase::sym_shape() const {
+  TORCH_INTERNAL_ASSERT(sym_ != nullptr);
+  return sym_->shape;
+}
+
+c10::SymIntArrayRef TensorIteratorBase::sym_strides(int64_t arg) const {
+  TORCH_INTERNAL_ASSERT(sym_ != nullptr);
+  return sym_->operands[arg].stride_bytes;
+}
+
+c10::SymInt TensorIteratorBase::sym_numel() const {
+  TORCH_INTERNAL_ASSERT(sym_ != nullptr);
+  return ti_build::numel(sym_->shape);
+}
+
+c10::SymInt TensorIteratorBase::sym_num_output_elements() const {
+  TORCH_INTERNAL_ASSERT(sym_ != nullptr);
+  return ti_build::num_output_elements(sym_->shape, sym_->operands);
+}
+
+void TensorIteratorBase::set_sym_index_geometry(c10::SymDimVector sizes, c10::SymDimVector strides) {
+  TORCH_INTERNAL_ASSERT(sym_ != nullptr);
+  sym_->index_geometry.emplace(std::move(sizes), std::move(strides));
+}
+
+void TensorIteratorBase::_unsafe_set_arg_sym_strides(int64_t arg, c10::SymIntArrayRef strides) {
+  TORCH_INTERNAL_ASSERT(sym_ != nullptr);
+  sym_->operands[arg].stride_bytes.assign(strides.begin(), strides.end());
+}
+
+void TensorIteratorBase::_unsafe_offset_arg_sym_data(int64_t arg, const c10::SymInt& bytes) {
+  TORCH_INTERNAL_ASSERT(sym_ != nullptr);
+  sym_->operands[arg].data_offset += bytes;
+}
+
+c10::SymInt TensorIteratorBase::sym_data_offset(int64_t arg) const {
+  TORCH_INTERNAL_ASSERT(sym_ != nullptr);
+  return sym_->operands[arg].data_offset;
+}
+
+bool TensorIteratorBase::has_sym_index_geometry() const {
+  return sym_ != nullptr && sym_->index_geometry.has_value();
+}
+
+c10::SymIntArrayRef TensorIteratorBase::sym_index_sizes() const {
+  TORCH_INTERNAL_ASSERT(has_sym_index_geometry());
+  return sym_->index_geometry->first;
+}
+
+c10::SymIntArrayRef TensorIteratorBase::sym_index_strides() const {
+  TORCH_INTERNAL_ASSERT(has_sym_index_geometry());
+  return sym_->index_geometry->second;
+}
+
+bool TensorIteratorBase::sym_has_contiguous_first_dim() const {
+  return ti_build::has_contiguous_first_dim(sym_->shape, sym_->operands);
+}
 
 namespace {
 
@@ -224,81 +375,7 @@ TensorIteratorConfig& TensorIteratorConfig::declare_static_shape(IntArrayRef sha
 // We might change this behavior in future once performance considerations are resolved
 
 void TensorIteratorBase::reorder_dimensions() {
-  // Sort the dimensions based on strides in ascending order with reduced dims
-  // at the front. NOTE: that this inverts the order of C-contiguous tensors.
-  // strides[0] is the fastest moving dimension instead of strides[ndim - 1].
-  // See NOTE: [Computing output strides] and inline  comments for more detailed description
-
-  perm_.resize(ndim());
-  if (ndim() == 1) {
-    perm_[0] = 0;
-    return;
-  }
-
-  // initialize perm with n-1, n-2, ..., 1, 0
-  std::iota(perm_.rbegin(), perm_.rend(), 0);
-
-  // Reordering dimensions changes iteration order
-  if (enforce_linear_iteration_) {
-    permute_dimensions(perm_);
-    return;
-  }
-
-  // returns 1 if the dim0 should come after dim1, -1 if dim0 should come
-  // before dim1, and 0 if the comparison is ambiguous.
-  auto should_swap = [&](size_t dim0, size_t dim1) {
-    for (const auto arg : c10::irange(ntensors())) {
-      // ignore undefined or incorrectly sized tensors
-      if (operands_[arg].stride_bytes.empty() || operands_[arg].will_resize) {
-        continue;
-      }
-      int64_t stride0 = operands_[arg].stride_bytes[dim0];
-      int64_t stride1 = operands_[arg].stride_bytes[dim1];
-      if (is_reduction_ && operands_[arg].is_output) {
-        // move reduced dimensions to the front
-        // strides of reduced dimensions are always set to 0 by review_reduce_result
-        if ((stride0 == 0) != (stride1 == 0)) {
-          return stride1 == 0 ? 1 : -1;
-        }
-      }
-      //move on to the next input if one of the dimensions is broadcasted
-      if (stride0 == 0 || stride1 == 0) {
-        continue;
-      // it is important to return here only with strict comparisons, for equal strides we try to break the tie later
-      // by comparing corresponding dimensions or if that does not work, moving on to the next tensor
-      } else if (stride0 < stride1) {
-        return -1;
-      } else  if (stride0 > stride1) {
-        return 1;
-      } else { //equal strides, use dimensions themselves as the tie-breaker.
-        //at this point, with zero strides out of the way, we are guaranteed that operand dimensions are equal to shape_
-         auto t_dim0 = shape_[dim0];
-         auto t_dim1 = shape_[dim1];
-         //return only if dimensions should be swapped, otherwise move on to the next tensor
-         if (t_dim0 > t_dim1) {
-             return 1;
-         }
-      }
-    }
-    return 0;
-  };
-
-  // insertion sort with support for ambiguous comparisons
-  for (const auto i : c10::irange(1, ndim())) {
-    int dim1 = i;
-    for (int dim0 = i - 1; dim0 >= 0; dim0--) {
-      int comparison = should_swap(perm_[dim0], perm_[dim1]);
-      if (comparison > 0) {
-        std::swap(perm_[dim0], perm_[dim1]);
-        dim1 = dim0;
-      } else if (comparison < 0) {
-        break;
-      }
-    }
-  }
-
-  // perform re-ordering of shape and strides
-  permute_dimensions(perm_);
+  ti_build::reorder_dimensions(shape_, perm_, operands_, is_reduction_, enforce_linear_iteration_);
 }
 
 // Computes a common dtype using type promotion
@@ -325,6 +402,12 @@ static TensorOptions original_options(const OperandInfo& op) {
   } else {
     return op.options();
   }
+}
+
+static auto output_setter(TensorIteratorBase& iter) {
+  return [&iter](int i, IntArrayRef sizes, IntArrayRef strides, std::optional<MemoryFormat> memory_format) {
+    iter.set_output_raw_strided(i, sizes, strides, original_options(iter.operand(i)).memory_format(memory_format));
+  };
 }
 
 // Implements the behavior of the following flags:
@@ -541,126 +624,42 @@ void TensorIteratorBase::compute_types(const TensorIteratorConfig& config) {
 }
 
 StrideVector TensorIteratorBase::compatible_stride(int64_t element_size) const {
-  auto stride = StrideVector();
-  int64_t next_stride = element_size;
-  for (const auto dim : c10::irange(ndim())) {
-    stride.push_back(next_stride);
-    next_stride *= shape_[dim];
+  if (C10_UNLIKELY(sym_ != nullptr)) {
+    symbolic_read("compatible_stride()");
   }
-  return stride;
+  return ti_build::compatible_stride(shape_, element_size);
 }
 
 DimVector TensorIteratorBase::invert_perm(IntArrayRef input) const {
-  // Invert the permutation caused by reorder_dimensions. This is not valid
-  // after coalesce_dimensions is called.
-  TORCH_INTERNAL_ASSERT(!has_coalesced_dimensions_);
-  TORCH_INTERNAL_ASSERT(input.size()==perm_.size());
-  auto res = DimVector(input.size()); //no initialization needed, every value in res should be written to.
-  for (const auto dim : c10::irange(ndim())) {
-    res[perm_[dim]] = input[dim];
+  if (C10_UNLIKELY(sym_ != nullptr)) {
+    symbolic_read("invert_perm()");
   }
-  return res;
+  return ti_build::invert_perm(shape_, perm_, input, has_coalesced_dimensions_);
 }
 
 void TensorIteratorBase::allocate_or_resize_outputs() {
-  // check if permutation is just an inverted order
-  bool inverted = true;
-  for (const auto j : c10::irange(ndim())) {
-    if (perm_[j] != ndim() - j - 1) {
-      inverted = false;
-      break;
-    }
-  }
-  for (const auto i : c10::irange(num_outputs_)) {
-    auto& op = operands_[i];
-    if (!op.tensor_base().defined() || op.will_resize) {
-      TORCH_INTERNAL_ASSERT(op.is_type_defined(), "no type for operand", i);
-      auto element_size = elementSize(op.target_dtype);
-      op.stride_bytes = compatible_stride(static_cast<int64_t>(element_size));
-      auto tensor_shape = invert_perm(shape_);
-      if (inverted) {
-        // can just return contiguous output
-        // it is faster because it avoids allocating 0 size tensor and
-        // resizing and restriding it
-        set_output_raw_strided(i, tensor_shape, {}, original_options(op));
-      } else {
-        auto tensor_stride = invert_perm(op.stride_bytes);
-        for (const auto dim : c10::irange(ndim())) {
-          tensor_stride[dim] /= static_cast<int64_t>(element_size);
-        }
-        set_output_raw_strided(i, tensor_shape, tensor_stride, original_options(op));
-      }
-      op.current_dtype = op.target_dtype;
-    } else if (op.tensor_base().defined()) {
-      // Even if we don't resize, we still need to tell set_output about
-      // the output, so that we properly set guard
-      set_output_raw_strided(i, op.tensor_base().sizes(), {}, original_options(op));
-    }
-  }
+  ti_build::allocate_or_resize_outputs(shape_, perm_, operands_, num_outputs_, has_coalesced_dimensions_, output_setter(*this));
 }
 
 void TensorIteratorBase::coalesce_dimensions() {
-  if (ndim() <= 1) {
-    return;
-  }
-
-  // We can coalesce two adjacent dimensions if either dim has size 1 or if:
-  // shape[n] * stride[n] == stride[n + 1].
-  auto can_coalesce = [&](int dim0, int dim1) {
-    auto shape0 = shape_[dim0];
-    auto shape1 = shape_[dim1];
-    if (shape0 == 1 || shape1 == 1) {
-      return true;
-    }
-    for (const auto i : c10::irange(ntensors())) {
-      auto& stride = operands_[i].stride_bytes;
-      if (shape0 * stride[dim0] != stride[dim1]) {
-        return false;
-      }
-    }
-    return true;
-  };
-
-  // replace each operands stride at dim0 with its stride at dim1
-  auto replace_stride = [&](int dim0, int dim1) {
-    for (const auto i : c10::irange(ntensors())) {
-      auto& stride = operands_[i].stride_bytes;
-      stride[dim0] = stride[dim1];
-    }
-  };
-
-  int prev_dim = 0;
-  for (const auto dim : c10::irange(1, ndim())) {
-    if (can_coalesce(prev_dim, dim)) {
-      if (shape_[prev_dim] == 1) {
-        replace_stride(prev_dim, dim);
-      }
-      shape_[prev_dim] *= shape_[dim];
-    } else {
-      prev_dim++;
-      if (prev_dim != dim) {
-        replace_stride(prev_dim, dim);
-        shape_[prev_dim] = shape_[dim];
-      }
-    }
-  }
-
-  shape_.resize(prev_dim + 1);
-  for (const auto i : c10::irange(ntensors())) {
-    operands_[i].stride_bytes.resize(ndim());
-  }
-  has_coalesced_dimensions_ = true;
+  ti_build::coalesce_dimensions(shape_, operands_, has_coalesced_dimensions_);
 }
 
 int64_t TensorIteratorBase::numel() const {
-  int64_t numel = 1;
-  for (int64_t size : shape_) {
-    numel *= size;
+  if (C10_UNLIKELY(sym_ != nullptr)) {
+    // a true constant only (an empty iterator of a zero size), never a hint
+    if (auto n = sym_numel().maybe_as_int()) {
+      return *n;
+    }
+    symbolic_read("numel()");
   }
-  return numel;
+  return ti_build::numel(shape_);
 }
 
 StrideVector TensorIteratorBase::get_dim_strides(int dim) const {
+  if (C10_UNLIKELY(sym_ != nullptr)) {
+    symbolic_read("get_dim_strides()");
+  }
   auto dims = ndim();
   auto inner_strides = StrideVector();
   for (auto& op : operands_) {
@@ -670,12 +669,23 @@ StrideVector TensorIteratorBase::get_dim_strides(int dim) const {
 }
 
 SmallVector<char*, 4> TensorIteratorBase::get_base_ptrs() const {
+  if (C10_UNLIKELY(sym_ != nullptr)) {
+    symbolic_read("get_base_ptrs()");
+  }
   auto ptrs = SmallVector<char*, 4>(ntensors());
   at::get_base_ptrs(ptrs.data(), operands_);
   return ptrs;
 }
 
 bool TensorIteratorBase::is_dim_reduced(int dim) const {
+  if (C10_UNLIKELY(sym_ != nullptr)) {
+    for (auto& op : sym_->operands) {
+      if (op.is_output && op.stride_bytes[dim] == 0 && sym_->shape[dim] > 1) {
+        return true;
+      }
+    }
+    return false;
+  }
   for (auto& op : operands_) {
     if (op.is_output && op.stride_bytes[dim] == 0 && shape_[dim] > 1) {
       return true;
@@ -685,46 +695,27 @@ bool TensorIteratorBase::is_dim_reduced(int dim) const {
 }
 
 void TensorIteratorBase::permute_dimensions(IntArrayRef perm) {
-  TORCH_INTERNAL_ASSERT(perm.size() == static_cast<unsigned>(ndim()));
-
-  auto reorder = [perm](IntArrayRef data) {
-    auto res = DimVector(data.size(), 0);
-    for (const auto i : c10::irange(perm.size())) {
-      res[i] = data[perm[i]];
-    }
-    return res;
-  };
-
-  // Update shape and strides
-  shape_ = reorder(shape_);
-  for (auto& op : operands_) {
-    if (!op.stride_bytes.empty()) {
-      op.stride_bytes = reorder(op.stride_bytes);
-    }
-  }
+  ti_build::permute_dimensions(shape_, operands_, perm);
 }
 
 int64_t TensorIteratorBase::num_output_elements() const {
-  int64_t elem = 1;
-  for (const auto dim : c10::irange(ndim())) {
-    if (operands_[0].stride_bytes[dim] != 0 || shape_[dim] == 0)  {
-      elem *= shape_[dim];
-    }
+  if (C10_UNLIKELY(sym_ != nullptr)) {
+    symbolic_read("num_output_elements()");
   }
-  return elem;
+  return ti_build::num_output_elements(shape_, operands_);
 }
 
 int TensorIteratorBase::num_reduce_dims() const {
-  int count = 0;
-  for (const auto dim : c10::irange(ndim())) {
-    if (operands_[0].stride_bytes[dim] == 0) {
-      count++;
-    }
+  if (C10_UNLIKELY(sym_ != nullptr)) {
+    return ti_build::num_reduce_dims(sym_->shape, sym_->operands);
   }
-  return count;
+  return ti_build::num_reduce_dims(shape_, operands_);
 }
 
 void TensorIteratorBase::for_each(loop2d_t loop, int64_t grain_size) {
+  if (C10_UNLIKELY(sym_ != nullptr)) {
+    symbolic_read("for_each()");
+  }
   int64_t numel = this->numel();
   if (numel == 0) {
     return;
@@ -739,6 +730,9 @@ void TensorIteratorBase::for_each(loop2d_t loop, int64_t grain_size) {
 }
 
 StrideVector TensorIteratorBase::get_strides() const {
+  if (C10_UNLIKELY(sym_ != nullptr)) {
+    symbolic_read("get_strides()");
+  }
   const auto dim = ndim();
   StrideVector strides(static_cast<size_t>(std::max(dim, 2)) * ntensors());
   at::get_strides(strides.data(), operands_, dim);
@@ -746,6 +740,9 @@ StrideVector TensorIteratorBase::get_strides() const {
 }
 
 void TensorIteratorBase::serial_for_each(loop2d_t loop, Range range) const {
+  if (C10_UNLIKELY(sym_ != nullptr)) {
+    symbolic_read("serial_for_each()");
+  }
   if (range.size() == 0) {
     return;
   }
@@ -768,17 +765,23 @@ bool TensorIteratorBase::is_trivial_1d() const {
 }
 
 bool TensorIteratorBase::is_contiguous() const {
-  if (numel() == 1) {
-    return true;
+  if (C10_UNLIKELY(sym_ != nullptr)) {
+    return ti_build::is_contiguous(sym_->shape, sym_->operands);
   }
-  if (ndim() != 1) {
-    return false;
-  }
-  return has_contiguous_first_dim();
+  return ti_build::is_contiguous(shape_, operands_);
 }
 
 
 bool TensorIteratorBase::is_scalar(int64_t arg) const {
+  if (C10_UNLIKELY(sym_ != nullptr)) {
+    const auto& stride = sym_->operands[arg].stride_bytes;
+    for (const auto i : c10::irange(ndim())) {
+      if (stride[i] != 0 && sym_->shape[i] != 1) {
+        return false;
+      }
+    }
+    return true;
+  }
   const auto& stride = operands_[arg].stride_bytes;
   for (const auto i : c10::irange(ndim())) {
     if (stride[i] != 0 && shape_[i] != 1) {
@@ -810,18 +813,30 @@ void TensorIteratorBase::cast_outputs() {
 }
 
 void* TensorIteratorBase::data_ptr(int64_t arg) const {
+  if (C10_UNLIKELY(sym_ != nullptr)) {
+    symbolic_read("data_ptr()");
+  }
   return operands_[arg].data;
 }
 
 void TensorIteratorBase::remove_operand(int64_t arg) {
+  if (C10_UNLIKELY(sym_ != nullptr)) {
+    sym_->operands.erase(sym_->operands.begin() + arg);
+  }
   operands_.erase(operands_.begin() + arg);
 }
 
 void TensorIteratorBase::unsafe_replace_operand(int64_t arg, void* data) {
+  if (C10_UNLIKELY(sym_ != nullptr)) {
+    symbolic_read("unsafe_replace_operand()");
+  }
   operands_[arg].data = data;
 }
 
 void TensorIteratorBase::narrow(int dim, int64_t start, int64_t size) {
+  if (C10_UNLIKELY(sym_ != nullptr)) {
+    symbolic_read("narrow()");
+  }
   TORCH_INTERNAL_ASSERT(dim < ndim() && size >= 1);
   shape_[dim] = size;
   view_offsets_[dim] += start;
@@ -834,6 +849,9 @@ void TensorIteratorBase::narrow(int dim, int64_t start, int64_t size) {
 }
 
 void TensorIteratorBase::select_all_keeping_dim(int start_dim, IntArrayRef indices) {
+  if (C10_UNLIKELY(sym_ != nullptr)) {
+    symbolic_read("select_all_keeping_dim()");
+  }
   TORCH_INTERNAL_ASSERT(start_dim <= ndim());
   for (const auto i : c10::irange(start_dim, ndim())) {
     for (auto& op : operands_) {
@@ -1108,10 +1126,10 @@ TensorIterator TensorIterator::reduce_op(TensorBase& out1, TensorBase& out2, con
       ", output1 is on ", out1.device(), " and output2 is on", out2.device());
   TORCH_CHECK(out1.dim() == out2.dim(), "reduce_op(): expected both outputs to have same number of dims, but output1 has ", out1.dim(),
       " and output2 has ", out2.dim());
-  TORCH_CHECK(out1.sizes() == out2.sizes(), "reduce_op(): expected both outputs to have same sizes, but output1 has ", out1.sizes(),
-      " and output2 has ", out2.sizes());
-  TORCH_CHECK(out1.strides() == out2.strides(), "reduce_op(): expected both outputs to have same strides, but output1 has ", out1.strides(),
-      " and output2 has ", out2.strides());
+  TORCH_CHECK(out1.sym_sizes() == out2.sym_sizes(), "reduce_op(): expected both outputs to have same sizes, but output1 has ", out1.sym_sizes(),
+      " and output2 has ", out2.sym_sizes());
+  TORCH_CHECK(out1.sym_strides() == out2.sym_strides(), "reduce_op(): expected both outputs to have same strides, but output1 has ", out1.sym_strides(),
+      " and output2 has ", out2.sym_strides());
   return TensorIteratorConfig()
     .set_check_mem_overlap(false)
     .add_owned_output(out1)
@@ -1205,82 +1223,24 @@ void TensorIteratorBase::compute_shape(const TensorIteratorConfig& config) {
     shape_ = *config.static_shape_;
     return;
   }
-
-  all_ops_same_shape_ = true;
-  bool has_scalars = false;
-  bool has_tensors = false;
-  for (auto& op : operands_) {
-    if (!op.tensor_base().defined()) continue;
-
-    // For now, don't include output tensors when we're resizing outputs.
-    // These shapes don't participate in shape computation.
-    // This preserves the legacy behavior where torch.add(..., out=dst) resizes
-    // the destination tensor.  If the output tensor is also an input, we'll
-    // pick it up later in the operands.
-    if (config.resize_outputs_ && op.is_output) continue;
-    TORCH_CHECK(!op.tensor_base().unsafeGetTensorImpl()->has_symbolic_sizes_strides(),
-      "TensorIterator does not support symbolic shapes; please implement this operator in torch/_refs "
-      "using the elementwise or reduction helpers (look at backtrace to find out what operator this is)");
-    auto shape = op.tensor_base().sizes();
-    if (shape.empty()) {
-      has_scalars = true;
-    } else {
-      has_tensors = true;
-    }
-    if (has_scalars && has_tensors) {
-      all_ops_same_shape_ = false;
-    }
-    if (shape_.empty()) {
-      shape_ = shape;
-    } else if (!shape.equals(shape_)) {
-      all_ops_same_shape_ = false;
-      shape_ = infer_size_dimvector(shape_, shape);
-    }
-  }
-  all_ops_are_scalars_ = !has_tensors;
+  ti_build::compute_shape(shape_, operands_, config.resize_outputs_, all_ops_same_shape_, all_ops_are_scalars_);
 }
 
 void TensorIteratorBase::compute_strides(const TensorIteratorConfig& config) {
-  for (auto& op : operands_) {
-    if (op.tensor_base().defined() && !op.will_resize) {
-      IntArrayRef original_shape = config.static_shape_ ? shape_ : op.tensor_base().sizes();
-      auto original_stride = op.tensor_base().strides();
-      auto element_size_in_bytes = op.tensor_base().element_size();
-      auto offset = ndim() - original_shape.size();
-      if (offset > 0)
-          op.stride_bytes.resize(ndim(), 0);
-      else
-          op.stride_bytes.resize(ndim());
-      for (const auto i : c10::irange(original_shape.size())) {
-        // see NOTE: [Computing output strides]
-        if (original_shape[i] == 1 && shape_[offset + i] !=1) {
-          op.stride_bytes[offset + i] = 0;
-        } else {
-          op.stride_bytes[offset + i] = original_stride[i] * element_size_in_bytes;
-        }
-      }
-    }
-  }
+  ti_build::compute_strides(shape_, operands_, config.static_shape_.has_value());
 }
 
 bool TensorIteratorBase::can_use_32bit_indexing() const {
-  int64_t max_value = std::numeric_limits<int32_t>::max();
-  if (numel() > max_value) {
-    return false;
+  if (C10_UNLIKELY(sym_ != nullptr)) {
+    return ti_build::can_use_32bit_indexing(sym_->shape, sym_->operands);
   }
-  for (auto& op : operands_) {
-    int64_t max_offset = 1;
-    for (const auto dim : c10::irange(ndim())) {
-      max_offset += (shape_[dim] - 1) * op.stride_bytes[dim];
-    }
-    if (max_offset > max_value) {
-      return false;
-    }
-  }
-  return true;
+  return ti_build::can_use_32bit_indexing(shape_, operands_);
 }
 
 std::unique_ptr<TensorIterator> TensorIteratorBase::split(int dim) {
+  if (C10_UNLIKELY(sym_ != nullptr)) {
+    symbolic_read("split()");
+  }
   TORCH_INTERNAL_ASSERT(dim >= 0 && dim < ndim() && shape()[dim] >= 2);
   auto copy = std::make_unique<TensorIterator>(*this);
 
@@ -1297,6 +1257,9 @@ std::unique_ptr<TensorIterator> TensorIteratorBase::split(int dim) {
 
 
 int TensorIteratorBase::get_dim_to_split() const {
+  if (C10_UNLIKELY(sym_ != nullptr)) {
+    symbolic_read("get_dim_to_split()");
+  }
   TORCH_INTERNAL_ASSERT(ndim() >= 1);
   int64_t max_extent = -1;
   int dim_to_split = -1;
@@ -1320,148 +1283,11 @@ int TensorIteratorBase::get_dim_to_split() const {
 }
 
 bool TensorIteratorBase::fast_set_up(const TensorIteratorConfig& config) {
-  // This function tries to do a fast setup to avoid needless reordering of dimensions and tracking output strides
-  // Return true if it can do fast setup or false otherwise
-  // TODO enable fast handling for reductions
-  FastSetupType setup_type = compute_fast_setup_type(config);
-  if (setup_type == FastSetupType::NONE) {
-    return false;
-  }
-
-  // allocate memory for output, memory format depends on setup_type
-  switch (setup_type) {
-    case FastSetupType::CONTIGUOUS:
-      {
-        for (const auto i : c10::irange(num_outputs_)) {
-          auto& op = operands_[i];
-          if (!op.tensor_base().defined()) {
-            TORCH_INTERNAL_ASSERT(op.is_type_defined(), "no type for operand", i);
-          }
-          set_output_raw_strided(i, shape_, {}, original_options(op).memory_format(MemoryFormat::Contiguous));
-        }
-        break;
-      }
-    case FastSetupType::CHANNELS_LAST:
-      {
-        for (const auto i : c10::irange(num_outputs_)) {
-          auto& op = operands_[i];
-          if (!op.tensor_base().defined()) {
-            TORCH_INTERNAL_ASSERT(op.is_type_defined(), "no type for operand", i);
-          }
-          set_output_raw_strided(i, shape_, {}, original_options(op).memory_format(MemoryFormat::ChannelsLast));
-        }
-        break;
-      }
-    case FastSetupType::NON_OVERLAPPING_DENSE:
-      {
-        // find the index of a defined tensor in operands_ start from input tensor
-        int i_defined = -1;
-        for (i_defined = ntensors() - 1; i_defined >= 0; --i_defined) {
-          if (tensor(i_defined).defined()) break;
-        }
-        TORCH_CHECK(i_defined >= 0, "Can not find a defined tensor when fast allocating memory to outputs");
-        for (const auto i : c10::irange(num_outputs_)) {
-          auto& op = operands_[i];
-          if (!op.tensor_base().defined()) {
-            TORCH_INTERNAL_ASSERT(op.is_type_defined(), "no type for operand", i);
-          }
-          set_output_raw_strided(i, shape_, tensor_base(i_defined).strides(), original_options(op));
-        }
-        break;
-      }
-    default:
-      TORCH_INTERNAL_ASSERT(false, "Unsupported fast setup type", std::to_string((int)setup_type));
-  }
-  //coalescing dimensions consists of collapsing dimensions to 1 (we are limited to contiguous no-broadcast cases here)
-  if (ndim() > 1){
-    has_coalesced_dimensions_ = true;
-  }
-  if (ndim() >= 1) {
-    shape_[0] = numel();
-    shape_.resize(1);
-  }
-  for (auto& op : operands_ ) {
-    auto element_size_in_bytes = op.tensor_base().element_size();
-    op.stride_bytes.resize(ndim());
-    if (ndim()>0) {
-      op.stride_bytes[0] = element_size_in_bytes;
-    }
-  }
-  return true;
+  return ti_build::fast_set_up(compute_fast_setup_type(config), shape_, operands_, num_outputs_, has_coalesced_dimensions_, output_setter(*this));
 }
 
 FastSetupType TensorIteratorBase::compute_fast_setup_type(const TensorIteratorConfig& config) {
-  if (is_reduction_ || !all_ops_same_shape_) {
-    return FastSetupType::NONE;
-  }
-
-  // For linear iteration, only contiguous tensors can be coalesced
-  // Fast setup of any other format requires changing iteration order
-  if (enforce_linear_iteration_) {
-    for (const auto& op : operands_) {
-      if (op.tensor_base().defined() && !op.will_resize) {
-        auto is_contiguous = op.tensor_base().is_contiguous(at::MemoryFormat::Contiguous);
-        if (!is_contiguous) {
-          return FastSetupType::NONE;
-        }
-      }
-    }
-    return FastSetupType::CONTIGUOUS;
-  }
-
-  bool is_contiguous = true;
-  for (const auto& op : operands_) {
-    if (op.tensor_base().defined() && !op.will_resize) {
-      is_contiguous &= op.tensor_base().is_contiguous(at::MemoryFormat::Contiguous);
-      if (!is_contiguous) {
-        break;
-      }
-    }
-  }
-  // TODO this leads to ambiguous cases (NC11) to be always treated as contiguous
-  if (is_contiguous) {
-    return FastSetupType::CONTIGUOUS;
-  }
-
-  bool is_channels_last = true;
-  bool is_non_overlapping_and_dense = true;
-  for (const auto& op : operands_) {
-    if (op.tensor_base().defined() && !op.will_resize) {
-      is_channels_last &= op.tensor_base().is_contiguous(at::MemoryFormat::ChannelsLast);
-      is_non_overlapping_and_dense &= op.tensor_base().is_non_overlapping_and_dense();
-    }
-  }
-  if (is_channels_last) {
-    return FastSetupType::CHANNELS_LAST;
-  }
-  if (is_non_overlapping_and_dense) {
-    int64_t prev = -1;
-    // Fast setup is allowed only when all the defined tensors have the same shape and strides,
-    // Iterate from back to check input tensors' strides first, then output tensors'.
-    for (int64_t i = ntensors() - 1; i >= 0; --i) {
-      const auto& op = operands_[i];
-      if (op.tensor_base().defined() && !op.will_resize) {
-        if (prev < 0) {
-          prev = i;
-          continue;
-        }
-        if (!tensor_base(prev).strides().equals(op.tensor_base().strides())) {
-          // [Note: stride check for non contiguous tensors in fast setup]
-          // We prevent 3 cases doing fast setup here:
-          // 1. input tensors have different strides.
-          // 2. output tensors won't be resized and have different strides.
-          // 3. input tensors have the same strides, but output tensors have different strides with input tensors.
-          //    We don't allow re-stride output tensors in this case since it is not compatible with
-          //    numpy. The behavior in numpy is that if the output tensor has same shape as the input
-          //    tensor but different strides, the strides of output tensor will be preserved, so we do
-          //    the same in tensor iterator.
-          return FastSetupType::NONE;
-        }
-      }
-    }
-    return FastSetupType::NON_OVERLAPPING_DENSE;
-  }
-  return FastSetupType::NONE;
+  return ti_build::compute_fast_setup_type<int64_t>(operands_, is_reduction_, all_ops_same_shape_, enforce_linear_iteration_);
 }
 
 void TensorIteratorBase::build(TensorIteratorConfig& config) {
@@ -1471,6 +1297,13 @@ void TensorIteratorBase::build(TensorIteratorConfig& config) {
 
   // fill in operands_ based on configuration
   populate_operands(config);
+  if (C10_UNLIKELY(symbolic_iterators_enabled)) {
+    for (const auto& op : operands_) {
+      if (op.tensor_base().defined() && op.tensor_base().key_set().has(DispatchKey::Python)) {
+        return build_symbolic(config);
+      }
+    }
+  }
   // set is_output and is_read_write flags on appropriate tensors
   mark_outputs();
   // Check that the outputs have no internal overlap
@@ -1531,6 +1364,104 @@ void TensorIteratorBase::build(TensorIteratorConfig& config) {
   // a valid value for the offset
   int64_t ndim_offsets = (ndim() ? ndim() : 1);
   view_offsets_.assign(ndim_offsets, 0);
+}
+
+// build() over c10::SymInt (detail::set_symbolic_iterators): the same steps
+// on a SymInt state, outputs allocated through set_output_raw_strided_symint;
+// every size comparison is the trace's guard. Overlap checks between operands
+// are the trace's (wrapper storages hide aliasing, and get_overlap_status
+// reads their sealed data pointers once no size is symbolic): only an
+// output's internal overlap is tested here; data pointers are never read.
+void TensorIteratorBase::build_symbolic(TensorIteratorConfig& config) {
+  sym_ = std::make_shared<detail::SymIteratorState>();
+  ++symbolic_built;
+  auto& shape = sym_->shape;
+  auto& ops = sym_->operands;
+  mark_outputs();
+  if (config.check_mem_overlap_) {
+    for (const auto i : c10::irange(num_outputs_)) {
+      if (tensor_base(i).defined()) {
+        assert_no_internal_overlap(tensor_base(i));
+      }
+    }
+  }
+  if (config.static_shape_.has_value()) {
+    shape = c10::SymDimVector(config.static_shape_->begin(), config.static_shape_->end());
+  } else {
+    std::vector<detail::SymOperand> view;
+    for (const auto& op : operands_) {
+      view.emplace_back(op);
+    }
+    ti_build::compute_shape(shape, view, config.resize_outputs_, all_ops_same_shape_, all_ops_are_scalars_);
+    // mark_resize_outputs over the symbolic shape
+    for (const auto i : c10::irange(num_outputs_)) {
+      const auto& output = tensor_base(i);
+      if (!output.defined()) {
+        operands_[i].will_resize = true;
+      }
+      if (output.defined() && !output.sym_sizes().equals(shape)) {
+        if (config.resize_outputs_ && !operands_[i].is_read_write) {
+          operands_[i].will_resize = true;
+          continue;
+        }
+        TORCH_CHECK(is_reduction_, "output with shape ", output.sym_sizes(), " doesn't match the broadcast shape ", shape);
+      }
+    }
+  }
+  compute_types(config);
+  for (const auto& op : operands_) {
+    ops.emplace_back(op);
+  }
+  auto set_output = [this](int i, c10::SymIntArrayRef sizes, c10::SymIntArrayRef strides, std::optional<MemoryFormat> memory_format) {
+    set_output_raw_strided_symint(i, sizes, strides, original_options(operands_[i]).memory_format(memory_format));
+    sym_->operands[i].tensor = operands_[i].tensor_base();
+    sym_->operands[i].current_dtype = operands_[i].current_dtype;
+  };
+  const auto setup_type = ti_build::compute_fast_setup_type<c10::SymInt>(ops, is_reduction_, all_ops_same_shape_, enforce_linear_iteration_);
+  if (!ti_build::fast_set_up(setup_type, shape, ops, num_outputs_, has_coalesced_dimensions_, set_output)) {
+    ti_build::compute_strides(shape, ops, config.static_shape_.has_value());
+    ti_build::reorder_dimensions(shape, perm_, ops, is_reduction_, enforce_linear_iteration_);
+    ti_build::allocate_or_resize_outputs(shape, perm_, ops, num_outputs_, has_coalesced_dimensions_, set_output);
+    if (!is_meta_) {
+      ti_build::coalesce_dimensions(shape, ops, has_coalesced_dimensions_);
+    }
+  }
+  for (const auto i : c10::irange(ntensors())) {
+    operands_[i].current_dtype = ops[i].current_dtype;
+  }
+  view_offsets_.assign(std::max<size_t>(shape.size(), 1), 0);
+}
+
+void TensorIteratorBase::set_output_raw_strided_symint(int64_t output_idx, c10::SymIntArrayRef sizes, c10::SymIntArrayRef strides, TensorOptions options) {
+  auto& op = operands_[output_idx];
+  const auto& t = maybe_get_output(output_idx);
+  TORCH_INTERNAL_ASSERT(t.defined());
+  if (!op.tensor_base().defined()) {
+    op.tensor(c10::MaybeOwned<TensorBase>::borrowed(t));
+  } else if (op.will_resize && op.original_tensor_base().defined()) {
+    detail::note_symbolic_refusal(detail::SymbolicRefusal::Output);
+    TORCH_CHECK_NOT_IMPLEMENTED(false, "host_trace: a symbolic iterator resizes an output's temporary");
+  }
+  op.current_dtype = op.tensor_base().scalar_type();
+}
+
+void TensorIterator::set_output_raw_strided_symint(int64_t output_idx, c10::SymIntArrayRef sizes, c10::SymIntArrayRef strides, TensorOptions options) {
+  auto& op = operands_[output_idx];
+  if (!op.tensor_base().defined()) {
+    if (strides.empty()) {
+      op.tensor(c10::MaybeOwned<TensorBase>::owned(at::empty_symint(sizes, options)));
+    } else {
+      op.tensor(c10::MaybeOwned<TensorBase>::owned(at::empty_strided_symint(sizes, strides, options)));
+    }
+    op.current_dtype = op.target_dtype;
+  } else if (op.will_resize) {
+    // resize_output of a given output: only a fresh empty one, re-allocated by the trace
+    const bool contiguous = strides.empty() && options.memory_format_opt().value_or(MemoryFormat::Contiguous) == MemoryFormat::Contiguous;
+    if (!(contiguous || !strides.empty()) || !impl::symbolic_resize(op.tensor_base(), sizes, strides)) {
+      detail::note_symbolic_refusal(detail::SymbolicRefusal::Output);
+      TORCH_CHECK_NOT_IMPLEMENTED(false, "host_trace: a symbolic iterator resizes its output");
+    }
+  }
 }
 
 // This is the structured kernels' implementation of set_output.  It is
@@ -1644,6 +1575,9 @@ const Tensor& TensorIterator::maybe_get_output(int64_t output_idx) {
 }
 
 SplitUntil32Bit TensorIteratorBase::with_32bit_indexing() const {
+  if (C10_UNLIKELY(sym_ != nullptr)) {
+    symbolic_read("with_32bit_indexing() (an iterator beyond 32-bit indexing)");
+  }
   return SplitUntil32Bit(*this);
 }
 

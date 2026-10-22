@@ -80,6 +80,25 @@ void CUDAGraph::register_generator_state(
   captured_generator_states_[std::move(state)] = 0;
 }
 
+void CUDAGraph::set_generator_increment(
+    const at::Generator& generator,
+    uint64_t increment) {
+  TORCH_CHECK(
+      capture_ended_,
+      "CUDAGraph::set_generator_increment requires a completed capture.");
+  // see Note [Why enforce RNG offset % 4 == 0?] in CUDAGeneratorImpl.cpp
+  TORCH_CHECK(
+      increment % 4 == 0,
+      "CUDAGraph::set_generator_increment: the increment must be a multiple of 4, got ",
+      increment);
+  auto* cuda_gen = at::check_generator<at::CUDAGeneratorImpl>(generator);
+  auto it = captured_generator_states_.find(cuda_gen->state());
+  TORCH_CHECK(
+      it != captured_generator_states_.end(),
+      "CUDAGraph::set_generator_increment: this generator was not used during the graph's capture.");
+  it->second = increment;
+}
+
 bool CUDAGraph::has_retained_pool(MempoolId_t pool) const {
   for (const auto& retained_pool : retained_mempool_ids_) {
     if (retained_pool == pool) {
@@ -315,7 +334,12 @@ void CUDAGraph::replay() {
   TORCH_CHECK(has_graph_exec_,
               "Called CUDAGraph::replay before the graph was instantiated; "
               "call instantiate() first.");
+  replay_exec(graph_exec_);
+}
 
+void CUDAGraph::replay_exec(cudaGraphExec_t exec) {
+  TORCH_CHECK(capture_ended_,
+              "Called CUDAGraph::replay_exec without a preceding successful capture.");
   c10::OptionalDeviceGuard device_guard{capture_stream_.device()};
 
   for (auto& [generator_state, wholegraph_increment] :
@@ -323,7 +347,7 @@ void CUDAGraph::replay() {
     generator_state->replay_prologue(capture_id_, wholegraph_increment);
   }
   // graph_exec_ may be replayed in any stream.
-  AT_CUDA_CHECK(cudaGraphLaunch(graph_exec_, at::cuda::getCurrentCUDAStream()));
+  AT_CUDA_CHECK(cudaGraphLaunch(exec, at::cuda::getCurrentCUDAStream()));
 }
 
 void CUDAGraph::enable_debug_mode() {

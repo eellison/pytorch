@@ -30,16 +30,16 @@ inline void check_cat_shape_except_dim(
     if (dim == dimension) {
       continue;
     }
-    int64_t first_dim_size = first.sizes()[dim];
-    int64_t second_dim_size = second.sizes()[dim];
+    const c10::SymInt& first_dim_size = first.sym_sizes()[dim];
+    const c10::SymInt& second_dim_size = second.sym_sizes()[dim];
     TORCH_CHECK(
         first_dim_size == second_dim_size,
         "Sizes of tensors must match except in dimension ",
         dimension,
         ". Expected size ",
-        static_cast<long long>(first_dim_size),
+        first_dim_size,
         " but got size ",
-        static_cast<long long>(second_dim_size),
+        second_dim_size,
         " for tensor number ",
         index,
         " in the list.");

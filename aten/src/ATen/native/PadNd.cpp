@@ -26,11 +26,11 @@
 
 namespace at::native {
 
-Tensor constant_pad_nd(const Tensor& self, IntArrayRef pad, const Scalar& value) {
+Tensor constant_pad_nd_symint(const Tensor& self, c10::SymIntArrayRef pad, const Scalar& value) {
     TORCH_CHECK(pad.size() % 2 == 0, "Length of pad must be even but instead it equals ",
              pad.size());
 
-    auto input_sizes = self.sizes();
+    auto input_sizes = self.sym_sizes();
     auto l_inp = self.dim();
 
     auto l_pad = pad.size() / 2;
@@ -46,12 +46,12 @@ Tensor constant_pad_nd(const Tensor& self, IntArrayRef pad, const Scalar& value)
     for (const auto i : c10::irange(l_diff, l_inp)) {
         auto pad_idx = 2 * (l_inp - i - 1);
         if (pad[pad_idx] < 0) {
-            c_input = c_input.narrow(i, -pad[pad_idx], c_input.size(i) + pad[pad_idx]);
+            c_input = c_input.narrow_symint(i, -pad[pad_idx], c_input.sym_size(i) + pad[pad_idx]);
         } else if (pad[pad_idx] != 0) {
             all_pads_non_positive = false;
         }
         if (pad[pad_idx + 1] < 0) {
-            c_input = c_input.narrow(i, 0, c_input.size(i) + pad[pad_idx + 1]);
+            c_input = c_input.narrow_symint(i, 0, c_input.sym_size(i) + pad[pad_idx + 1]);
         } else if (pad[pad_idx + 1] != 0) {
             all_pads_non_positive = false;
         }
@@ -64,7 +64,7 @@ Tensor constant_pad_nd(const Tensor& self, IntArrayRef pad, const Scalar& value)
     }
 
 
-    std::vector<int64_t> new_shape;
+    c10::SymDimVector new_shape;
     new_shape.reserve(l_diff);
     for (size_t i = 0; i < l_diff; i ++) {
         new_shape.emplace_back(input_sizes[i]);
@@ -86,10 +86,10 @@ Tensor constant_pad_nd(const Tensor& self, IntArrayRef pad, const Scalar& value)
         TORCH_CHECK(qscheme == kPerTensorAffine || qscheme == kPerTensorSymmetric,
                     "Only per-tensor padding is supported.");
         output = at::_empty_affine_quantized(
-            new_shape, self.options().memory_format(memory_format),
+            C10_AS_INTARRAYREF_SLOW(new_shape), self.options().memory_format(memory_format),
             self.q_scale(), self.q_zero_point(), std::nullopt);
     } else {
-        output = at::empty(new_shape, self.options().memory_format(memory_format));
+        output = at::empty_symint(new_shape, self.options().memory_format(memory_format));
     }
     output.fill_(value);
 
@@ -97,10 +97,10 @@ Tensor constant_pad_nd(const Tensor& self, IntArrayRef pad, const Scalar& value)
     for (const auto i : c10::irange(l_diff, l_inp)) {
         auto pad_idx = 2 * (l_inp - i - 1);
         if (pad[pad_idx] > 0) {
-            c_output = c_output.narrow(i, pad[pad_idx], c_output.size(i) - pad[pad_idx]);
+            c_output = c_output.narrow_symint(i, pad[pad_idx], c_output.sym_size(i) - pad[pad_idx]);
         }
         if (pad[pad_idx + 1] > 0) {
-            c_output = c_output.narrow(i, 0, c_output.size(i) - pad[pad_idx + 1]);
+            c_output = c_output.narrow_symint(i, 0, c_output.sym_size(i) - pad[pad_idx + 1]);
         }
     }
     c_output.copy_(c_input);

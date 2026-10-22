@@ -1,5 +1,6 @@
 #define TORCH_ASSERT_ONLY_METHOD_OPERATORS
 #include <ATen/core/Tensor.h>
+#include <ATen/TensorIterator.h>
 #include <ATen/Dispatch.h>
 #include <ATen/cuda/CUDAApplyUtils.cuh>
 #include <ATen/cuda/CUDAContext.h>
@@ -34,6 +35,14 @@
 namespace at::native {
 
 Tensor& zero_cuda_(Tensor& self) {
+  if (C10_UNLIKELY(at::detail::symbolic_iterators() && self.key_set().has(c10::DispatchKey::Python))) {
+    // a CUDA graph host trace, whose addresses are symbolic: a dense self's
+    // memset below is the trace's own zero (a Memset node), so here a
+    // non-dense self is fill_'s kernel, as below
+    TORCH_CHECK_NOT_IMPLEMENTED(
+        !(self.sym_numel() != 0 && self.is_non_overlapping_and_dense()), "host_trace: a dense zero_ outside the trace's Memset");
+    return self.fill_(0);
+  }
 #if !defined(USE_ROCM) || ROCM_VERSION < 70000 || ROCM_VERSION >= 70100
   void* const ptr = self.mutable_data_ptr();
   if (ptr != nullptr && self.is_non_overlapping_and_dense()) {

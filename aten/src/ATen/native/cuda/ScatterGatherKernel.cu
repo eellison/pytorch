@@ -14,6 +14,9 @@
 #include <ATen/cuda/detail/OffsetCalculator.cuh>
 #include <ATen/cuda/Atomic.cuh>
 #include <ATen/cuda/CUDAContext.h>
+#if !defined(USE_ROCM)
+#include <ATen/cuda/host_trace/SymImage.h>
+#endif
 
 namespace at::native {
 
@@ -121,6 +124,35 @@ static void _launch_scatter_gather_kernel(int64_t N, const func_t& f) {
   _scatter_gather_elementwise_kernel<nt, vt, func_t><<<grid, block, 0, stream>>>(N, f);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
+
+// _cuda_scatter_gather_internal_kernel's elementwise functor: a named type,
+// so that a CUDA graph host trace knows where each of its members lies
+template <bool is_scatter_like, typename scalar_t, typename index_t, typename func_t>
+struct ScatterGatherFunctor {
+  OffsetCalculator<3> offset_calc;
+  char* self_ptr;
+  char* src_ptr;
+  char* index_ptr;
+  int64_t index_size;
+  int64_t index_stride;
+  int64_t numel;
+  func_t f;
+
+  __device__ void operator()(int i) const {
+    auto offsets = offset_calc.get(i);
+
+    int64_t idx_dim = *(index_t*)(index_ptr + offsets[2]);
+    CUDA_KERNEL_ASSERT_VERBOSE(idx_dim >= 0 && idx_dim < index_size
+      && "scatter gather kernel index out of bounds", "Expected 0 <= idx_dim < index_size (%ld), but got idx_dim = %ld", index_size, idx_dim);
+
+    f(
+      (scalar_t*)(self_ptr + offsets[0]),
+      is_scatter_like ? idx_dim * index_stride : 0,
+      numel,
+      (scalar_t*)(src_ptr + offsets[1]) + (is_scatter_like ? 0 : idx_dim * index_stride)
+    );
+  }
+};
 
 template <bool is_scatter_like, typename scalar_t, typename index_t>
 struct _cuda_scatter_gather_internal_kernel {
@@ -249,26 +281,96 @@ struct _cuda_scatter_gather_internal_kernel {
       }
     }
 #endif
-    auto offset_calc = make_offset_calculator<3>(iter);
-    auto loop = [=]C10_DEVICE(int i) {
-      auto offsets = offset_calc.get(i);
-
-      int64_t idx_dim = *(index_t*)(index_ptr + offsets[2]);
-      CUDA_KERNEL_ASSERT_VERBOSE(idx_dim >= 0 && idx_dim < index_size
-        && "scatter gather kernel index out of bounds", "Expected 0 <= idx_dim < index_size (%ld), but got idx_dim = %ld", index_size, idx_dim);
-
-      f(
-        (scalar_t*)(self_ptr + offsets[0]),
-        is_scatter_like ? idx_dim * index_stride : 0,
-        numel,
-        (scalar_t*)(src_ptr + offsets[1]) + (is_scatter_like ? 0 : idx_dim * index_stride)
-      );
-    };
-
+    ScatterGatherFunctor<is_scatter_like, scalar_t, index_t, func_t> loop{
+        make_offset_calculator<3>(iter), self_ptr, src_ptr, index_ptr, index_size, index_stride, numel, f};
     _launch_scatter_gather_kernel<num_threads(), thread_work_size()>(iter.numel(), loop);
 
   }
 }; // struct _cuda_scatter_gather_internal_kernel
+
+#if !defined(USE_ROCM)
+// _cuda_scatter_gather_internal_kernel of a gather in a CUDA graph host trace:
+// the same choice over its symbolic iterator, the launch recorded
+template <typename scalar_t, typename index_t>
+void sym_gather_internal_kernel(const TensorIterator& iter, const c10::SymInt& index_size, const c10::SymInt& index_stride, const c10::SymInt& numel) {
+  namespace ht = at::cuda::host_trace;
+  // eager splits the iterator
+  TORCH_CHECK_NOT_IMPLEMENTED(iter.can_use_32bit_indexing(), "host_trace: a gather beyond 32-bit indexing");
+  ht::Recorder& rec = ht::recorder_for("a gather");
+  const c10::SymInt self_ptr = ht::operand_address(iter, 0);
+  const c10::SymInt src_ptr = ht::operand_address(iter, 1);
+  const c10::SymInt index_ptr = ht::operand_address(iter, 2);
+  const auto shape = iter.sym_shape();
+  // fast_gather_kernel_eligible<16>, each test a guard
+  constexpr int64_t element_size = sizeof(scalar_t);
+  constexpr int64_t alignment = 16;
+  const auto s0 = iter.sym_strides(0), s1 = iter.sym_strides(1), s2 = iter.sym_strides(2);
+  const bool eligible = iter.ndim() == 2 && s2[0] == 0 && s2[1] == iter.element_size(2) && s0[0] == element_size && s1[0] == element_size &&
+      s1[1] == 0 && self_ptr % alignment == 0 && src_ptr % alignment == 0 && shape[0] * element_size % alignment == 0 &&
+      index_stride * element_size % alignment == 0 && s0[1] % alignment == 0;
+  if (eligible) {
+    if (iter.sym_numel() == 0) {
+      return;
+    }
+    return at::native::vectorized_gather_kernel_record<alignment, index_t>(
+        rec, self_ptr, src_ptr, index_ptr, shape[1], shape[0] * element_size, index_size, index_stride * element_size, s0[1]);
+  }
+  const c10::SymInt n = iter.sym_numel();
+  if (n == 0) {
+    return;
+  }
+  using functor_t = ScatterGatherFunctor<false, scalar_t, index_t, TensorAssign>;
+  ht::ParamImage op(sizeof(functor_t), alignof(functor_t));
+  alignas(functor_t) unsigned char raw[sizeof(functor_t)];
+  const functor_t& r = *reinterpret_cast<const functor_t*>(raw);
+  auto at = [&r](const auto& m) { return static_cast<size_t>(reinterpret_cast<const char*>(&m) - reinterpret_cast<const char*>(&r)); };
+  ht::put_offset_calculator(op, at(r.offset_calc), 3, ht::sym_offsets(iter, 0, 3, /*element_strides=*/false));
+  op.set(at(r.self_ptr), sizeof(char*), self_ptr, true);
+  op.set(at(r.src_ptr), sizeof(char*), src_ptr, true);
+  op.set(at(r.index_ptr), sizeof(char*), index_ptr, true);
+  op.set(at(r.index_size), sizeof(int64_t), index_size);
+  op.set(at(r.index_stride), sizeof(int64_t), index_stride);
+  op.set(at(r.numel), sizeof(int64_t), numel);
+  // _launch_scatter_gather_kernel<num_threads(), thread_work_size()>(n, functor)
+  constexpr int nt = num_threads();
+  constexpr int vt = thread_work_size();
+  TORCH_INTERNAL_ASSERT(n <= std::numeric_limits<int32_t>::max());
+  std::vector<ht::ParamImage> params;
+  params.push_back(ht::param_of<int>(n));
+  params.push_back(std::move(op));
+  ht::record_images(reinterpret_cast<const void*>(&_scatter_gather_elementwise_kernel<nt, vt, functor_t>), std::move(params), (n + nt * vt - 1) / (nt * vt), nt, 0);
+}
+
+// cuda_scatter_gather_base_kernel<false>'s gather (TensorAssign) in a CUDA
+// graph host trace: the same restriding over SymInt
+inline void sym_gather(const Tensor& self, int64_t dim, const Tensor& index, const Tensor& src) {
+  at::assert_no_internal_overlap(self);
+  auto index_sizes = ensure_nonempty_vec(index.sym_sizes().vec());
+  auto self_strides = ensure_nonempty_vec(self.sym_strides().vec());
+  auto self_restrided = self.as_strided_symint(index_sizes, self_strides);
+  auto src_restrided = restride_dim_symint(src, dim, index_sizes);
+  auto iter = TensorIteratorConfig()
+    .set_check_mem_overlap(false)
+    .check_all_same_dtype(false)
+    .resize_outputs(false)
+    .add_output(self_restrided)
+    .add_const_input(src_restrided)
+    .add_const_input(index)
+    .build();
+  const auto index_size = ensure_nonempty_sym_size(src, dim);
+  const auto index_stride = ensure_nonempty_sym_stride(src, dim);
+  AT_DISPATCH_ALL_TYPES_AND_COMPLEX_AND3(
+    at::ScalarType::Half, at::ScalarType::Bool, at::ScalarType::BFloat16,
+    iter.dtype(),
+    "cuda_scatter_gather_base_kernel_func", [&] {
+      using dtype = OpaqueType<sizeof(scalar_t)>;
+      AT_DISPATCH_INDEX_TYPES(index.scalar_type(), "cuda_scatter_gather_base_kernel_func", [&] () {
+        sym_gather_internal_kernel<dtype, index_t>(iter, index_size, index_stride, self.sym_numel());
+      });
+    }
+  );
+}
+#endif
 
 template <bool is_scatter_like = true, bool cast_to_opaque = true>
 struct cuda_scatter_gather_base_kernel {
@@ -338,6 +440,13 @@ struct cuda_scatter_gather_base_kernel {
     const std::string& method_name,
     const TensorAssign& f
   ) {
+#if !defined(USE_ROCM)
+    if constexpr (!is_scatter_like && cast_to_opaque) {
+      if (at::cuda::host_trace::current_recorder() != nullptr) {
+        return sym_gather(self, dim, index, src);
+      }
+    }
+#endif
     at::assert_no_internal_overlap(self);
 
     auto index_sizes = ensure_nonempty_vec(index.sizes().vec());

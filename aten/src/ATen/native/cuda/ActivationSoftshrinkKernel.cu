@@ -20,6 +20,17 @@
 namespace at::native {
 namespace {
 
+template <typename scalar_t>
+struct SoftshrinkFunctor {
+  scalar_t lambd;
+  __device__ scalar_t operator()(scalar_t a) const {
+    return at::_isnan(a) ? a : (a > lambd ? a - lambd : (a < -lambd ? a + lambd : scalar_t(0)));
+  }
+  auto host_trace_fields() const {
+    return std::tie(lambd);
+  }
+};
+
 void softshrink_kernel(TensorIteratorBase& iter, const Scalar& value) {
   AT_DISPATCH_FLOATING_TYPES_AND2(
       at::ScalarType::Half,
@@ -28,11 +39,21 @@ void softshrink_kernel(TensorIteratorBase& iter, const Scalar& value) {
       "softshrink_cuda",
       [&]() {
         auto lambd = value.to<scalar_t>();
-        gpu_kernel(iter, [lambd] GPU_LAMBDA(scalar_t a) -> scalar_t {
-          return at::_isnan(a) ? a : (a > lambd ? a - lambd : (a < -lambd ? a + lambd : scalar_t(0)));
-        });
+        gpu_kernel(iter, SoftshrinkFunctor<scalar_t>{lambd});
       });
 }
+
+template <typename scalar_t>
+struct ShrinkBackwardFunctor {
+  scalar_t lambd;
+  __device__ scalar_t operator()(scalar_t grad_val, scalar_t self_val) const {
+    return (self_val >= -lambd && self_val <= lambd) ? scalar_t(0)
+                                                     : grad_val;
+  }
+  auto host_trace_fields() const {
+    return std::tie(lambd);
+  }
+};
 
 void shrink_backward_kernel(TensorIteratorBase& iter, const Scalar& value) {
   AT_DISPATCH_FLOATING_TYPES_AND2(
@@ -42,13 +63,7 @@ void shrink_backward_kernel(TensorIteratorBase& iter, const Scalar& value) {
       "shrink_backward_cuda",
       [&]() {
         auto lambd = value.to<scalar_t>();
-        gpu_kernel(
-            iter,
-            [lambd] GPU_LAMBDA(
-                scalar_t grad_val, scalar_t self_val) -> scalar_t {
-              return (self_val >= -lambd && self_val <= lambd) ? scalar_t(0)
-                                                               : grad_val;
-            });
+        gpu_kernel(iter, ShrinkBackwardFunctor<scalar_t>{lambd});
       });
 }
 } // namespace

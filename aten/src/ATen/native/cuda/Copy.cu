@@ -10,6 +10,10 @@
 #include <ATen/native/Copy.h>
 #include <ATen/native/TensorIterator.h>
 #include <ATen/native/cuda/Loops.cuh>
+#if !defined(USE_ROCM)
+#include <ATen/cuda/host_trace/LoopsSym.cuh>
+#include <ATen/cuda/host_trace/Ops.h>
+#endif
 
 #ifndef AT_PER_OPERATOR_HEADERS
 #include <ATen/Functions.h>
@@ -38,32 +42,38 @@ at::cuda::CUDAEventPool::Event getEventFromPool(const at::DeviceIndex device_idx
   return event_pool->get(device_idx);
 }
 
+template <typename scalar_t>
+struct CopyFunctor {
+  __device__ scalar_t operator()(scalar_t x) const {
+    return x;
+  }
+};
+
+template <typename from_t, typename to_t>
+struct CastCopyFunctor {
+  __device__ to_t operator()(from_t value) const {
+    return static_cast<to_t>(value);
+  }
+};
+
 } // namespace
 
 void neg_kernel_cuda(TensorIteratorBase &iter);
 void conj_kernel_cuda(TensorIteratorBase &iter);
 
 void float16_copy_kernel_cuda(TensorIteratorBase &iter) {
-    gpu_kernel_nocast(iter, [] GPU_LAMBDA(float value) {
-        return static_cast<at::Half>(value);
-    });
+    gpu_kernel_nocast(iter, CastCopyFunctor<float, at::Half>());
 }
 
 void bfloat16_copy_kernel_cuda(TensorIteratorBase &iter) {
-    gpu_kernel_nocast(iter, [] GPU_LAMBDA(float value) {
-        return static_cast<at::BFloat16>(value);
-    });
+    gpu_kernel_nocast(iter, CastCopyFunctor<float, at::BFloat16>());
 }
 
 void bfloat16tofloat32_copy_kernel_cuda(TensorIteratorBase &iter) {
-    gpu_kernel_nocast(iter, [] GPU_LAMBDA(at::BFloat16 value) {
-        return static_cast<float>(value);
-    });
+    gpu_kernel_nocast(iter, CastCopyFunctor<at::BFloat16, float>());
 }
 void float16tofloat32_copy_kernel_cuda(TensorIteratorBase &iter) {
-    gpu_kernel_nocast(iter, [] GPU_LAMBDA(at::Half value) {
-        return static_cast<float>(value);
-    });
+    gpu_kernel_nocast(iter, CastCopyFunctor<at::Half, float>());
 }
 
 template <typename SrcT>
@@ -243,7 +253,7 @@ void direct_copy_kernel_cuda(TensorIteratorBase &iter) {
   } else {
     AT_DISPATCH_V2(
         dtype, "copy_", AT_WRAP([&] {
-          gpu_kernel(iter, [] GPU_LAMBDA(scalar_t x) { return x; });
+          gpu_kernel(iter, CopyFunctor<scalar_t>());
     }), AT_EXPAND(AT_ALL_TYPES_AND_COMPLEX), kHalf, kBool, kBFloat16, kComplexHalf, kBComplex32, AT_EXPAND(AT_BAREBONES_UNSIGNED_TYPES));
   }
 }
@@ -260,7 +270,9 @@ using namespace at::cuda;
 void copy_device_to_device(TensorIterator& iter,
                            bool non_blocking,
                            bool p2p_enabled) {
-  int64_t numel = iter.numel();
+  // a symbolic iterator (a CUDA graph host trace): its size and addresses are the trace's
+  const bool symbolic = iter.is_symbolic();
+  int64_t numel = symbolic ? 0 : iter.numel();
 
   // We can memcpy the memory if both tensors have the same type AND both
   // tensors are contiguous after dimension coalescing and reordering.
@@ -272,6 +284,7 @@ void copy_device_to_device(TensorIterator& iter,
   Device dst_device = iter.device(0);
   Device src_device = iter.device(1);
 
+  TORCH_CHECK_NOT_IMPLEMENTED(!symbolic || src_device == dst_device, "host_trace: a copy across devices");
   CUDAGuard device_guard(src_device);
 
   // We always perform the copy on the source device, using the current stream
@@ -297,7 +310,15 @@ void copy_device_to_device(TensorIterator& iter,
     dst_ready->block(copy_stream);
   }
 
-  if (memcpy_eligible) {
+  if (memcpy_eligible && C10_UNLIKELY(symbolic)) {
+#if !defined(USE_ROCM)
+    // eager's src != dst below always holds: the trace runs a copy within one storage eagerly
+    auto& rec = at::cuda::host_trace::recorder_for("copy_");
+    rec.launches.push_back(at::cuda::host_trace::MemcpyRecord{
+        rec.data_ptr(iter.tensor_base(0)), rec.data_ptr(iter.tensor_base(1)), iter.sym_numel() * iter.element_size(0)});
+    rec.on_launch();
+#endif
+  } else if (memcpy_eligible) {
     void *dst = iter.data_ptr(0);
     void *src = iter.data_ptr(1);
     size_t size = numel * iter.element_size(0);
@@ -495,3 +516,57 @@ static void copy_kernel_cuda(TensorIterator& iter, bool non_blocking) {
 REGISTER_DISPATCH(copy_stub, &copy_kernel_cuda)
 
 } // namespace at::native
+
+#if !defined(USE_ROCM)
+// Traced host (ATen/cuda/host_trace/Ops.h)
+namespace at::cuda::host_trace {
+
+// copy_impl and copy_device_to_device on one GPU
+TensorBase copy_(Recorder& rec, const TensorBase& dst, const TensorBase& src) {
+  if (dst.is_same(src)) {
+    return dst;
+  }
+  if (dst.is_neg() != src.is_neg() || dst.is_conj() != src.is_conj()) {
+    decline("a copy across neg or conj bits");
+  }
+  auto iter = TensorIteratorSym::copy_op(rec, dst, src);
+  if (iter.numel() == 0) {
+    return dst;
+  }
+  const ScalarType to = iter.dtype(0);
+  const ScalarType from = iter.dtype(1);
+  if (to == from && iter.is_contiguous()) {
+    rec.launches.push_back(MemcpyRecord{iter.data_ptr(0), iter.data_ptr(1), iter.numel() * iter.element_size(0)});
+    return dst;
+  }
+  for (const ScalarType t : {to, from}) {
+    if (!isIntegralType(t, true) && t != kFloat && t != kDouble && t != kHalf && t != kBFloat16) {
+      decline(c10::str("a copy of a ", t, " tensor"));
+    }
+  }
+  // direct_copy_kernel_cuda's dtype ladder
+  using at::native::CastCopyFunctor;
+  if (from == kFloat && to == kBFloat16) {
+    gpu_kernel_nocast(rec, iter, CastCopyFunctor<float, BFloat16>());
+  } else if (from == kFloat && to == kHalf) {
+    gpu_kernel_nocast(rec, iter, CastCopyFunctor<float, Half>());
+  } else if (from == kBFloat16 && to == kFloat) {
+    gpu_kernel_nocast(rec, iter, CastCopyFunctor<BFloat16, float>());
+  } else if (from == kHalf && to == kFloat) {
+    gpu_kernel_nocast(rec, iter, CastCopyFunctor<Half, float>());
+  } else {
+    AT_DISPATCH_V2(to, "copy_", AT_WRAP([&] {
+      gpu_kernel(rec, iter, at::native::CopyFunctor<scalar_t>());
+    }), AT_EXPAND(AT_ALL_TYPES), kHalf, kBool, kBFloat16, AT_EXPAND(AT_BAREBONES_UNSIGNED_TYPES));
+  }
+  return dst;
+}
+
+// _to_copy and clone on a strided CUDA tensor: empty_like, then copy_
+TensorBase to_copy(Recorder& rec, const TensorBase& src, ScalarType dtype, MemoryFormat memory_format) {
+  Tensor out = at::empty_like(Tensor(src), src.options().dtype(dtype), memory_format);
+  return copy_(rec, out, src);
+}
+
+} // namespace at::cuda::host_trace
+#endif

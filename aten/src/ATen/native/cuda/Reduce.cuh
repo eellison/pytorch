@@ -11,6 +11,7 @@
 #include <c10/macros/Macros.h>
 #include <c10/cuda/CUDACachingAllocator.h>
 #include <array>
+#include <cstring>
 #include <functional>
 #include <iosfwd>
 #include <type_traits>
@@ -19,6 +20,9 @@
 
 #include <ATen/native/cuda/jit_utils.h>
 #include <ATen/native/cuda/KernelUtils.cuh>
+#if !defined(USE_ROCM)
+#include <ATen/cuda/host_trace/SymReduce.h>
+#endif
 
 namespace at::native {
 
@@ -70,6 +74,62 @@ constexpr int max_reduce_threads(c10::ScalarType type) {
   return type == kComplexDouble ? 256 : 512;
 }
 
+struct ReduceConfig;
+
+// The reduction config's arithmetic. setReduceConfig and its helpers below are
+// shared with the CUDA host trace (ATen/cuda/host_trace/ReduceSym.cuh), whose
+// Math computes over SymInt: there a choice that only picks a launch size is a
+// select, not a guard, so it is written as one here.
+struct ReduceConfigMath {
+  using Config = ReduceConfig;
+  using Int = int;
+  using Index = int64_t;
+  using Bool = bool;
+  template <typename A, typename B>
+  static auto select(bool c, A a, B b) { return c ? a : b; }
+  static int last_pow2(int n) { return native::last_pow2(n); }
+  static int64_t div_up(int64_t a, int64_t b) { return native::div_up(a, b); }
+  static int min(int a, int b) { return std::min(a, b); }
+  static int max(int a, int b) { return std::max(a, b); }
+  static int clamp(int v, int lo, int hi) { return std::clamp(v, lo, hi); }
+  static bool lt(int64_t a, int64_t b) { return a < b; }
+  static bool le(int64_t a, int64_t b) { return a <= b; }
+  static bool ge(int64_t a, int64_t b) { return a >= b; }
+  static bool ne(int64_t a, int64_t b) { return a != b; }
+  static bool logical_not(bool a) { return !a; }
+  static bool logical_and(bool a, bool b) { return a && b; }
+  static bool logical_or(bool a, bool b) { return a || b; }
+};
+
+// type_max_threads: mnt_wrapper<scalar_t>::MAX_NUM_THREADS
+template <typename Math>
+C10_ALWAYS_INLINE void set_block_dimension(const Math& m, typename Math::Config& config, int type_max_threads, typename Math::Index dim0, typename Math::Index dim1) {
+  using Int = typename Math::Int;
+  const int max_num_threads = type_max_threads / config.output_vec_size;
+  Int dim0_pow2 = m.select(m.lt(dim0, max_num_threads), m.last_pow2(dim0), max_num_threads);
+  Int dim1_pow2 = m.select(m.lt(dim1, max_num_threads), m.last_pow2(dim1), max_num_threads);
+  config.block_width = m.min(dim0_pow2, int(at::cuda::warp_size()));
+  config.block_height = m.min(dim1_pow2, Int(max_num_threads / config.block_width));
+  config.block_width = m.min(dim0_pow2, Int(max_num_threads / config.block_height));
+  config.num_threads = config.block_width * config.block_height;
+}
+
+// Returns the step before a split by parallelism where `where` holds, else 0
+template <typename Math>
+C10_ALWAYS_INLINE typename Math::Int split_where(const Math& m, typename Math::Int& step, const typename Math::Int& parallelism, const typename Math::Bool& where) {
+  typename Math::Int prior = m.select(where, step, 0);
+  step *= m.select(where, parallelism, 1);
+  return prior;
+}
+
+template <typename Math>
+C10_ALWAYS_INLINE typename Math::Int shared_memory_size(const Math& m, const typename Math::Config& config) {
+  const auto none = m.logical_and(
+      m.logical_not(config.should_block_y_reduce()),
+      m.logical_or(!config.should_block_x_reduce(), m.le(config.block_width, at::cuda::warp_size())));
+  return m.select(none, 0, config.element_size_bytes * config.num_threads * config.output_vec_size);
+}
+
 struct ReduceConfig {
   static constexpr int BLOCK_X = 0;
   static constexpr int BLOCK_Y = 1;
@@ -94,17 +154,6 @@ struct ReduceConfig {
 
   bool vectorize_input = false;
   int output_vec_size = 1;
-
-  template <typename T>
-  void set_block_dimension(int64_t dim0, int64_t dim1) {
-    const int max_num_threads = mnt_wrapper<T>::MAX_NUM_THREADS / output_vec_size;
-    int dim0_pow2 = dim0 < max_num_threads ? static_cast<int>(last_pow2(dim0)) : max_num_threads;
-    int dim1_pow2 = dim1 < max_num_threads ? static_cast<int>(last_pow2(dim1)) : max_num_threads;
-    block_width = std::min(dim0_pow2, int(at::cuda::warp_size()));
-    block_height = std::min(dim1_pow2, int(max_num_threads / block_width));
-    block_width = std::min(dim0_pow2, int(max_num_threads / block_height));
-    num_threads = block_width * block_height;
-  }
 
   int split_input(int parallelism) {
     int step = step_input;
@@ -181,12 +230,7 @@ struct ReduceConfig {
   }
 
   int shared_memory_size() const {
-    if (!should_block_y_reduce() &&
-        (!should_block_x_reduce() ||
-         block_width <= at::cuda::warp_size())) {
-      return 0;
-    }
-    return element_size_bytes * num_threads * output_vec_size;
+    return native::shared_memory_size(ReduceConfigMath{}, *this);
   }
 
   int64_t global_memory_size() const {
@@ -932,32 +976,31 @@ static void launch_reduce_kernel(const ReduceConfig& config, const R& reduction)
   auto stream = at::cuda::getCurrentCUDAStream();
   int shared_memory = config.shared_memory_size();
 
+  // launched from reduction's own bytes: <<<>>> copies it member by member,
+  // leaving its padding (which the harvest flag zeroes) indeterminate
+  void* args[] = {const_cast<R*>(&reduction)};
+  const void* kernel;
   switch(config.output_vec_size) {
   case 4:
-    reduce_kernel<max_threads / 4, 4, R><<<grid, block, shared_memory, stream>>>(reduction);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    kernel = reinterpret_cast<const void*>(&reduce_kernel<max_threads / 4, 4, R>);
     break;
   case 2:
-    reduce_kernel<max_threads / 2, 2, R><<<grid, block, shared_memory, stream>>>(reduction);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    kernel = reinterpret_cast<const void*>(&reduce_kernel<max_threads / 2, 2, R>);
     break;
   default:
-    reduce_kernel<max_threads / 1, 1, R><<<grid, block, shared_memory, stream>>>(reduction);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    kernel = reinterpret_cast<const void*>(&reduce_kernel<max_threads / 1, 1, R>);
   }
+  C10_CUDA_CHECK(cudaLaunchKernel(kernel, grid, block, args, shared_memory, stream));
 }
 
-inline void launch_jitted_reduce_kernel(
+// a jitted reduction's kernel for output_vec_size, compiled at its first use
+inline at::cuda::jit::NvrtcFunction& jitted_reduce_function(
     std::mutex &jiterator_mutex,
     std::array<at::cuda::jit::NvrtcFunction, 3> &fn_cache,
     const at::cuda::jit::KernelDescriptor &desc,
-    int vt0, const ReduceConfig& config, const void *reduction) {
-  dim3 block = config.block();
-  dim3 grid = config.grid();
-
-  int shared_memory = config.shared_memory_size();
+    int vt0, int output_vec_size) {
   at::cuda::jit::NvrtcFunction* fn_ptr;
-  switch(config.output_vec_size) {
+  switch(output_vec_size) {
   case 4:
     fn_ptr = &fn_cache[0];
     break;
@@ -971,18 +1014,46 @@ inline void launch_jitted_reduce_kernel(
     const std::lock_guard<std::mutex> lock{jiterator_mutex};
     if (!fn_ptr->function) {
       int max_threads_codegen =
-          max_reduce_threads(desc.f_inputs_type) / config.output_vec_size;
+          max_reduce_threads(desc.f_inputs_type) / output_vec_size;
       auto code = at::cuda::jit::generate_reduction_code(
-          desc, vt0, true, false, config.output_vec_size, max_threads_codegen);
+          desc, vt0, true, false, output_vec_size, max_threads_codegen);
 
       *fn_ptr = at::cuda::jit::jit_pwise_function(code, "reduction_" + desc.name);
     }
   }
+  return *fn_ptr;
+}
+
+inline void launch_jitted_reduce_kernel(
+    std::mutex &jiterator_mutex,
+    std::array<at::cuda::jit::NvrtcFunction, 3> &fn_cache,
+    const at::cuda::jit::KernelDescriptor &desc,
+    int vt0, const ReduceConfig& config, const void *reduction) {
+  dim3 block = config.block();
+  dim3 grid = config.grid();
+
+  int shared_memory = config.shared_memory_size();
+  auto& fn = jitted_reduce_function(jiterator_mutex, fn_cache, desc, vt0, config.output_vec_size);
   constexpr int kernel_args = 1;
   const void* args[kernel_args];
   args[0] = reduction;
-  at::cuda::jit::launch_jitted_pwise_function(*fn_ptr, args, grid, block, shared_memory);
+  at::cuda::jit::launch_jitted_pwise_function(fn, args, grid, block, shared_memory);
 }
+
+#if !defined(USE_ROCM)
+// the host trace's handle on a jitted reduction's kernels (ReduceFacts::jit)
+struct JittedReduce {
+  std::mutex& mutex;
+  std::array<at::cuda::jit::NvrtcFunction, 3>& cache;
+  const at::cuda::jit::KernelDescriptor& desc;
+  int vt0;
+
+  static void* function(const void* self, int output_vec_size) {
+    const auto& j = *static_cast<const JittedReduce*>(self);
+    return jitted_reduce_function(j.mutex, j.cache, j.desc, j.vt0, output_vec_size).function;
+  }
+};
+#endif
 
 
 class AccumulationBuffer {
@@ -1021,8 +1092,8 @@ class AccumulationBuffer {
   at::DataPtr buffer_;
 };
 
-template <typename scalar_t>
-int get_output_vec_size(const TensorIterator &iter) {
+// scalar_size: sizeof(scalar_t)
+inline int get_output_vec_size(const TensorIteratorBase &iter, int64_t scalar_size) {
   int vec_size = 4;
   auto update_vec_size = [&vec_size](uint64_t n) {
     while(n % vec_size != 0) {
@@ -1030,7 +1101,7 @@ int get_output_vec_size(const TensorIterator &iter) {
     }
   };
 
-  uint64_t base_address = reinterpret_cast<uint64_t>(iter.data_ptr(iter.noutputs())) / sizeof(scalar_t);
+  uint64_t base_address = reinterpret_cast<uint64_t>(iter.data_ptr(iter.noutputs())) / scalar_size;
   update_vec_size(base_address);
 
   const int output_index = iter.num_reduce_dims();
@@ -1039,26 +1110,42 @@ int get_output_vec_size(const TensorIterator &iter) {
   int j = 0;
   for(auto i : iter.strides(iter.noutputs())) {
     if (j != output_index) {
-      update_vec_size(i / sizeof(scalar_t));
+      update_vec_size(i / scalar_size);
     }
     j++;
   }
   return vec_size;
 }
 
-template<typename arg_t, typename scalar_t, int vt0, int input_vec_size=vt0>
-ReduceConfig setReduceConfig(const TensorIterator& iter){
+template <typename scalar_t>
+int get_output_vec_size(const TensorIterator &iter) {
+  return get_output_vec_size(iter, sizeof(scalar_t));
+}
+
+// setReduceConfig's type facts, as values: the host trace's run-time
+// reduction (ATen/cuda/host_trace/SymReduce.cu) has them only at run time
+struct ReduceSizes {
+  int arg_size;  // sizeof(arg_t)
+  int scalar_size;  // sizeof(scalar_t)
+  int input_vec_size;
+  int max_threads;  // mnt_wrapper<scalar_t>::MAX_NUM_THREADS
+};
+
+template<typename Math, typename Iter>
+typename Math::Config set_reduce_config(const Iter& iter, const Math& m, const ReduceSizes& sizes){
+  using Int = typename Math::Int;
+  using Index = typename Math::Index;
   // Start by assuming that each thread handles a single output and all
   // the inputs for that output.
-  int64_t num_outputs = iter.num_output_elements();
-  int64_t inputs_per_output = iter.numel() / num_outputs;
+  Index num_outputs = iter.num_output_elements();
+  Index inputs_per_output = iter.numel() / num_outputs;
   int input_index = iter.ntensors() - 1;
 
-  auto config = ReduceConfig(sizeof(arg_t), num_outputs, inputs_per_output);
+  auto config = typename Math::Config(sizes.arg_size, num_outputs, inputs_per_output);
 
-  int64_t dim0;
-  int64_t dim1;
-  int64_t fastest_moving_stride;
+  Index dim0;
+  Index dim1;
+  Index fastest_moving_stride;
   bool reduction_on_fastest_striding_dimension;
 
   if (iter.ndim() > 0) {
@@ -1093,7 +1180,7 @@ ReduceConfig setReduceConfig(const TensorIterator& iter){
     }
   } else {
     reduction_on_fastest_striding_dimension = true;
-    fastest_moving_stride = sizeof(scalar_t);
+    fastest_moving_stride = sizes.scalar_size;
     dim0 = 1;
     dim1 = 1;
   }
@@ -1112,25 +1199,25 @@ ReduceConfig setReduceConfig(const TensorIterator& iter){
   // This case happens when the fastest moving dimension is not the dimension of reduction. In such case,
   // threads with different threadIdx.x are independent and will produce results for different outputs.
   // In such case, values in each loaded vector always correspond to different outputs.
-  if (fastest_moving_stride == sizeof(scalar_t)) {
-    if (reduction_on_fastest_striding_dimension && dim0 >= 128 && iter.num_reduce_dims() == 1) {
-      // Case 1: "vectorize along input"
+  if (fastest_moving_stride == sizes.scalar_size) {
+    if (reduction_on_fastest_striding_dimension && iter.num_reduce_dims() == 1) {
+      // Case 1: "vectorize along input", if dim0 >= 128
       // Note that if vt0 < ReduceConfig::vec_size, then this means the register pressure could be high, in such case,
       // we should avoid vectorization.
-      config.vectorize_input = true;
-      dim0 /= input_vec_size;
+      config.vectorize_input = m.ge(dim0, 128);
+      dim0 = m.select(config.vectorize_input, dim0 / sizes.input_vec_size, dim0);
     } else if (!reduction_on_fastest_striding_dimension) {
       // Case 2: "vectorize along output"
-      config.output_vec_size = get_output_vec_size<scalar_t>(iter);
+      config.output_vec_size = get_output_vec_size(iter, sizes.scalar_size);
       dim0 /= config.output_vec_size;
     }
   }
 
   // Adjust block_width and block_height
-  config.set_block_dimension<scalar_t>(dim0, dim1);
+  set_block_dimension(m, config, sizes.max_threads, dim0, dim1);
 
-  int block_width = config.block_width;
-  int block_height = config.block_height;
+  Int block_width = config.block_width;
+  Int block_height = config.block_height;
 
   if (iter.ndim() == 0 || reduction_on_fastest_striding_dimension) {
     // Split the input across lanes if the input is contiguous in the reduced
@@ -1149,55 +1236,113 @@ ReduceConfig setReduceConfig(const TensorIterator& iter){
 #endif
   constexpr int max_values_per_thread = 256;
 
-  const int warp_split_threshold =
-      std::min<int>(block_height * 16, max_values_per_thread);
-  bool split_across_warps = config.values_per_thread() >= warp_split_threshold;
+  const Int warp_split_threshold =
+      m.min(block_height * 16, max_values_per_thread);
+  const auto split_across_warps = m.ge(config.values_per_thread(), warp_split_threshold);
   const int num_mp =
       at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
 
-  if (split_across_warps) {
-    // Divide the input across warps in a thread-block, if that leaves at least
-    // 16 elements to be summed by each thread. This will require inter-warp
-    // reduction using shared memory.
-    config.input_mult[1] = config.split_input(block_height);
-  } else {
-    // Otherwise, each warp handles a separate output.
-    config.output_mult[1] = config.split_output(block_height);
-  }
+  // Divide the input across warps in a thread-block, if that leaves at least
+  // 16 elements to be summed by each thread. This will require inter-warp
+  // reduction using shared memory.
+  config.input_mult[1] = split_where(m, config.step_input, block_height, split_across_warps);
+  // Otherwise, each warp handles a separate output.
+  config.output_mult[1] = split_where(m, config.step_output, block_height, m.logical_not(split_across_warps));
 
   int max_threads_per_mp =
       at::cuda::getCurrentDeviceProperties()->maxThreadsPerMultiProcessor;
-  const int blocks_per_sm = max_threads_per_mp / config.num_threads;
-  const int target_grid_size = num_mp * blocks_per_sm;
-  int grid = config.grid().x;
-  if (config.input_mult[1] != 0 && config.values_per_thread() >= max_values_per_thread && grid <= target_grid_size) {
-    // Divide the input across thread-blocks if the amount of work per-thread
-    // is large enough and the size of the output is small enough. This will
-    // require a reduction using global memory.
-    // If we decide to split input across blocks, as long as we can get enough
-    // number of blocks (`target_grid_size`) to balance SM, we should still
-    // make the number of values per thread large for best performance.
-    int ctas_per_output1 = div_up(target_grid_size, grid);
-    int ctas_per_output2 = div_up(config.values_per_thread(), min_values_per_thread);
-    int ctas_per_output3 = div_up(config.values_per_thread(), max_values_per_thread);
-    // We want the minimum of ctas_per_output1 and ctas_per_output2, so that each thread can have
-    // a large number of values to deal with. But we don't want values_per_thread to be larger than
-    // max_values_per_thread
-    config.ctas_per_output = std::clamp<int>(ctas_per_output1, ctas_per_output3, ctas_per_output2);
-    if (config.ctas_per_output > 1) {
+  const Int blocks_per_sm = max_threads_per_mp / config.num_threads;
+  const Int target_grid_size = num_mp * blocks_per_sm;
+  Int grid = config.grid().x;
+  // Divide the input across thread-blocks if the amount of work per-thread
+  // is large enough and the size of the output is small enough. This will
+  // require a reduction using global memory.
+  // If we decide to split input across blocks, as long as we can get enough
+  // number of blocks (`target_grid_size`) to balance SM, we should still
+  // make the number of values per thread large for best performance.
+  const auto split_across_ctas = m.logical_and(
+      m.logical_and(m.ne(config.input_mult[1], 0), m.ge(config.values_per_thread(), max_values_per_thread)),
+      m.le(grid, target_grid_size));
+  Int ctas_per_output1 = m.div_up(target_grid_size, grid);
+  Int ctas_per_output2 = m.div_up(config.values_per_thread(), min_values_per_thread);
+  Int ctas_per_output3 = m.div_up(config.values_per_thread(), max_values_per_thread);
+  // We want the minimum of ctas_per_output1 and ctas_per_output2, so that each thread can have
+  // a large number of values to deal with. But we don't want values_per_thread to be larger than
+  // max_values_per_thread
+  config.ctas_per_output = m.select(split_across_ctas, m.clamp(ctas_per_output1, ctas_per_output3, ctas_per_output2), 1);
+  if (config.ctas_per_output > 1) {
 #ifdef USE_ROCM
-      // Set min ctas value as 64. Having more reductions (i.e less values_per_thread) seems to improve perf.
-      config.ctas_per_output = std::max(config.ctas_per_output, 64);
+    // Set min ctas value as 64. Having more reductions (i.e less values_per_thread) seems to improve perf.
+    config.ctas_per_output = m.max(config.ctas_per_output, 64);
 #endif
-      config.input_mult[2] = config.split_input(config.ctas_per_output);
-    }
+    config.input_mult[2] = config.split_input(config.ctas_per_output);
   }
   return config;
 };
 
+template<typename arg_t, typename scalar_t, int vt0, int input_vec_size=vt0, typename Math=ReduceConfigMath, typename Iter>
+typename Math::Config setReduceConfig(const Iter& iter, const Math& m = {}){
+  return set_reduce_config(iter, m, ReduceSizes{sizeof(arg_t), sizeof(scalar_t), input_vec_size, mnt_wrapper<scalar_t>::MAX_NUM_THREADS});
+}
+
+#if !defined(USE_ROCM)
+// What the host trace's run-time reduction reads of ReduceOp R (R's launch,
+// gpu_reduce_kernel below): the kernels eager's launch_reduce_kernel
+// instantiates, R's layout, and the ops' and identity's bytes (which live
+// while the facts are used)
+template <typename R, int max_threads>
+at::cuda::host_trace::ReduceFacts make_reduce_facts(const decltype(R::ops)& ops, const decltype(R::ident)& ident, ReduceSizes sizes) {
+  at::cuda::host_trace::ReduceFacts f;
+  f.kernels = {
+      reinterpret_cast<const void*>(&reduce_kernel<max_threads / 4, 4, R>),
+      reinterpret_cast<const void*>(&reduce_kernel<max_threads / 2, 2, R>),
+      reinterpret_cast<const void*>(&reduce_kernel<max_threads / 1, 1, R>)};
+  f.arg_size = sizes.arg_size;
+  f.scalar_size = sizes.scalar_size;
+  f.input_vec_size = sizes.input_vec_size;
+  f.max_threads = sizes.max_threads;
+  alignas(R) unsigned char raw[sizeof(R)];
+  const R& r = *reinterpret_cast<const R*>(raw);
+  auto at = [&r](const auto& m) { return static_cast<uint32_t>(reinterpret_cast<const char*>(&m) - reinterpret_cast<const char*>(&r)); };
+  f.size = sizeof(R);
+  f.align = alignof(R);
+  f.ops = at(r.ops);
+  f.ident = at(r.ident);
+  f.config = at(r.config);
+  f.input_calc = at(r.input_calc);
+  f.output_calc = at(r.output_calc);
+  f.src = at(r.src);
+  f.dst = at(r.dst);
+  f.acc_buf = at(r.acc_buf);
+  f.cta_buf = at(r.cta_buf);
+  f.semaphores = at(r.semaphores);
+  f.base_idx = at(r.base_idx);
+  f.accumulate = at(r.accumulate);
+  f.final_output = at(r.final_output);
+  f.noutputs = at(r.noutputs);
+  f.ops_bytes = &ops;
+  f.ops_size = sizeof(ops);
+  f.ident_bytes = &ident;
+  f.ident_size = sizeof(ident);
+  return f;
+}
+#endif
+
 template <typename scalar_t, typename out_scalar_t, int vt0=4, int input_vec_size=vt0, typename ops_t, typename ident_t=double>
 inline void gpu_reduce_kernel(TensorIterator& iter, const ops_t& ops, ident_t ident=0,
                               AccumulationBuffer* acc_buf_ptr=nullptr, int64_t base_idx=0) {
+#if !defined(USE_ROCM)
+  if (C10_UNLIKELY(iter.is_symbolic())) {
+    // a CUDA graph host trace: this launch over the iterator's symbolic sizes, recorded
+    using reduce_op_t = ReduceOp<scalar_t, ops_t, uint32_t, out_scalar_t, vt0, input_vec_size>;
+    constexpr int max_threads = mnt_wrapper<scalar_t>::MAX_NUM_THREADS;
+    const typename reduce_op_t::arg_t id = ident;
+    using traits = function_traits<decltype(&ops_t::reduce)>;
+    using arg_t = typename traits::template arg<0>::type;
+    const ReduceSizes sizes{sizeof(arg_t), sizeof(scalar_t), input_vec_size, max_threads};
+    return at::cuda::host_trace::sym_gpu_reduce_kernel(iter, make_reduce_facts<reduce_op_t, max_threads>(ops, id, sizes));
+  }
+#endif
   AT_ASSERT(iter.numel() > 0 && iter.ntensors() - iter.noutputs() == 1 && iter.noutputs() >= 1);
 
   using traits = function_traits<decltype(&ops_t::reduce)>;
@@ -1279,7 +1424,18 @@ inline void gpu_reduce_kernel(TensorIterator& iter, const ops_t& ops, ident_t id
   AT_ASSERT(can_use_32bit_indexing);
   auto output_calc = make_output_calculator<uint32_t>(iter);
   auto input_calc = make_input_calculator<uint32_t>(iter);
-  auto reduce = ReduceOp<scalar_t, ops_t, uint32_t, out_scalar_t, vt0, input_vec_size>(
+  using reduce_op_t = ReduceOp<scalar_t, ops_t, uint32_t, out_scalar_t, vt0, input_vec_size>;
+  // The kernel parameter is this object's bytes; a host trace harvest needs
+  // its padding and empty ops functor zeroed, not left as stack garbage
+  alignas(reduce_op_t) unsigned char reduce_storage[sizeof(reduce_op_t)];
+  if (c10::cuda::isHostTraceHarvesting()) {
+    std::memset(reduce_storage, 0, sizeof(reduce_storage));
+#if defined(__GNUC__) && !defined(__CUDA_ARCH__)
+    // GCC's lifetime DSE otherwise drops the memset at the placement new
+    asm volatile("" : : "r"(reduce_storage) : "memory");
+#endif
+  }
+  auto& reduce = *new (reduce_storage) reduce_op_t(
       ops,
       config,
       input_calc,
@@ -1304,11 +1460,56 @@ inline void gpu_reduce_kernel(TensorIterator& iter, const ops_t& ops, ident_t id
 template <char const* name, typename scalar_t, typename out_scalar_t, int vt0=4, typename ident_t=double>
 inline void jitted_gpu_reduce_kernel(TensorIterator& iter, const std::string& func, ident_t ident=0,
                               AccumulationBuffer* acc_buf_ptr=nullptr, int64_t base_idx=0) {
-  AT_ASSERT(iter.numel() > 0 && iter.ntensors() - iter.noutputs() == 1 && iter.noutputs() >= 1);
+  constexpr int nInputs = 1;
+  constexpr int nOutputs = 1;
+  static auto desc = at::cuda::jit::make_kernel_descriptor<
+    out_scalar_t, scalar_t>(name, func, nInputs, nOutputs);
+
+  static std::mutex jiterator_mutex;
+  static std::vector<std::array<at::cuda::jit::NvrtcFunction, 3>> fn_cache(c10::cuda::device_count());
+  auto &cache = fn_cache[iter.device().index()];
 
   //TODO - this will be different for more complicated reductions, but for now reductions using
   //func_wrapper all have arg_t = opmath
   using arg_t = at::opmath_type<scalar_t>;
+#if !defined(USE_ROCM)
+  if (C10_UNLIKELY(iter.is_symbolic())) {
+    // a CUDA graph host trace: this launch over the iterator's symbolic sizes, recorded
+    using R = ReduceJitOp<scalar_t, out_scalar_t>;
+    const JittedReduce jit{jiterator_mutex, cache, desc, vt0};
+    const typename R::arg_t id = ident;
+    alignas(R) unsigned char raw[sizeof(R)];
+    const R& r = *reinterpret_cast<const R*>(raw);
+    auto at = [&r](const auto& m) { return static_cast<uint32_t>(reinterpret_cast<const char*>(&m) - reinterpret_cast<const char*>(&r)); };
+    at::cuda::host_trace::ReduceFacts f;
+    f.jit_function = &JittedReduce::function;
+    f.jit = &jit;
+    f.arg_size = sizeof(arg_t);
+    f.scalar_size = sizeof(scalar_t);
+    f.input_vec_size = vt0;
+    f.max_threads = mnt_wrapper<scalar_t>::MAX_NUM_THREADS;
+    f.size = sizeof(R);
+    f.align = alignof(R);
+    f.ident = at(r.ident);
+    f.config = at(r.config);
+    f.input_calc = at(r.input_calc);
+    f.output_calc = at(r.output_calc);
+    f.src = at(r.src);
+    f.dst = at(r.dst);
+    f.acc_buf = at(r.acc_buf);
+    f.cta_buf = at(r.cta_buf);
+    f.semaphores = at(r.semaphores);
+    f.base_idx = at(r.base_idx);
+    f.accumulate = at(r.accumulate);
+    f.final_output = at(r.final_output);
+    f.noutputs = at(r.noutputs);
+    f.ident_bytes = &id;
+    f.ident_size = sizeof(id);
+    return at::cuda::host_trace::sym_gpu_reduce_kernel(iter, f);
+  }
+#endif
+  AT_ASSERT(iter.numel() > 0 && iter.ntensors() - iter.noutputs() == 1 && iter.noutputs() >= 1);
+
   // at::Half/at::ComplexHalf overflows easily as it's range is very small.
   // So when scalar_t and out_scalar_t are at::Half/at::ComplexHalf, we
   // set can_accumulate_in_output to False.
@@ -1404,15 +1605,6 @@ inline void jitted_gpu_reduce_kernel(TensorIterator& iter, const std::string& fu
       base_idx);
   reduce.accumulate = iter.should_accumulate();
   reduce.final_output = iter.is_final_output();
-
-  constexpr int nInputs = 1;
-  constexpr int nOutputs = 1;
-  static auto desc = at::cuda::jit::make_kernel_descriptor<
-    out_scalar_t, scalar_t>(name, func, nInputs, nOutputs);
-
-  static std::mutex jiterator_mutex;
-  static std::vector<std::array<at::cuda::jit::NvrtcFunction, 3>> fn_cache(c10::cuda::device_count());
-  auto &cache = fn_cache[iter.device().index()];
 
   launch_jitted_reduce_kernel(
       jiterator_mutex, cache, desc, vt0, config, &reduce);

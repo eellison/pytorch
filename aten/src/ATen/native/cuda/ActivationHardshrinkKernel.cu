@@ -19,6 +19,17 @@
 namespace at::native {
 namespace {
 
+template <typename scalar_t>
+struct HardshrinkFunctor {
+  scalar_t lambd;
+  __device__ scalar_t operator()(scalar_t a) const {
+    return (a >= -lambd && a <= lambd) ? scalar_t(0) : a;
+  }
+  auto host_trace_fields() const {
+    return std::tie(lambd);
+  }
+};
+
 void hardshrink_kernel(TensorIteratorBase& iter, const Scalar& value) {
   AT_DISPATCH_FLOATING_TYPES_AND2(
       at::ScalarType::Half,
@@ -27,9 +38,7 @@ void hardshrink_kernel(TensorIteratorBase& iter, const Scalar& value) {
       "hardshrink_cuda",
       [&]() {
         auto lambd = value.to<scalar_t>();
-        gpu_kernel(iter, [lambd] GPU_LAMBDA(scalar_t a) -> scalar_t {
-          return (a >= -lambd && a <= lambd) ? scalar_t(0) : a;
-        });
+        gpu_kernel(iter, HardshrinkFunctor<scalar_t>{lambd});
       });
 }
 } // namespace

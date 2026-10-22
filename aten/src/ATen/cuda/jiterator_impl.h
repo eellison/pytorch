@@ -45,7 +45,9 @@ c10::SmallVector<std::string> get_extra_args_typenames(const c10::SmallVector<at
   return args_typenames;
 }
 
-int can_vectorize_up_to(at::ScalarType type, char* pointer) {
+// pointer_t: char*, or a host trace's SymInt address
+template <typename pointer_t>
+int can_vectorize_up_to(at::ScalarType type, const pointer_t& pointer) {
   switch(type) {
 #define DEFINE_CASE(ctype, scalartype)                                   \
     case scalartype : return memory::can_vectorize_up_to<ctype>(pointer);
@@ -61,19 +63,29 @@ int can_vectorize_up_to(at::ScalarType type, char* pointer) {
 
 // jitted version of the above
 // See Note [Jiterator], this relies on the assumptions enumerated there
-int jitted_can_vectorize_up_to(const TensorIteratorBase& iter) {
+// over the operands' addresses: char*, or a host trace's SymInt ones
+template <typename pointer_t>
+int jitted_can_vectorize_up_to(const TensorIteratorBase& iter, c10::ArrayRef<pointer_t> data) {
   const at::ScalarType common_dtype = iter.common_dtype();
   const at::ScalarType result_dtype = common_dtype;
 
   // Deals with output
-  int result = can_vectorize_up_to(result_dtype, static_cast<char*>(iter.data_ptr(0)));
+  int result = can_vectorize_up_to(result_dtype, data[0]);
 
   // Incorporates input(s)
   for (auto i = 1; i < iter.ntensors(); ++i) {
-    result = std::min<int>(result, can_vectorize_up_to(common_dtype, static_cast<char*>(iter.data_ptr(i))));
+    result = std::min<int>(result, can_vectorize_up_to(common_dtype, data[i]));
   }
 
   return result;
+}
+
+inline int jitted_can_vectorize_up_to(const TensorIteratorBase& iter) {
+  c10::SmallVector<char*, 16> data;
+  for (auto i = 0; i < iter.ntensors(); ++i) {
+    data.push_back(static_cast<char*>(iter.data_ptr(i)));
+  }
+  return jitted_can_vectorize_up_to<char*>(iter, data);
 }
 
 template<bool IS_INPUT, int N>
@@ -119,6 +131,11 @@ struct OffsetCalculatorVariant {
     return std::visit([](auto & v){ return static_cast<void*>(v.get()); }, v);
   }
 
+  template <typename F>
+  void visit(F&& f) const {
+    std::visit([&](const auto& p) { f(*p); }, v);
+  }
+
  private:
   OffsetCalculatorTypes v{};
 };
@@ -156,6 +173,11 @@ struct ArrayVariant {
     return std::visit([](auto & a){ return static_cast<void*>(&a); }, array);
   }
 
+  template <typename F>
+  void visit(F&& f) const {
+    std::visit(f, array);
+  }
+
 private:
   ArrayTypes array;
 };
@@ -182,6 +204,11 @@ struct TrivialOffsetCalculatorVariant {
 
   void* data_ptr() {
     return std::visit([](auto & v){ return static_cast<void*>(&v); }, v);
+  }
+
+  template <typename F>
+  void visit(F&& f) const {
+    std::visit(f, v);
   }
 
 private:
@@ -213,6 +240,11 @@ struct LoadWithCastVariant {
     return std::visit([](auto & v){ return static_cast<void*>(v.get()); }, v);
   }
 
+  template <typename F>
+  void visit(F&& f) const {
+    std::visit([&](const auto& p) { f(*p); }, v);
+  }
+
 private:
   LoadWithCastPtr v{};
 };
@@ -240,6 +272,11 @@ struct StoreWithCastVariant {
 
   void* data_ptr() {
     return std::visit([](auto & v){ return static_cast<void*>(v.get()); }, v);
+  }
+
+  template <typename F>
+  void visit(F&& f) const {
+    std::visit([&](const auto& p) { f(*p); }, v);
   }
 
 private:

@@ -40,6 +40,10 @@
 #include <c10/core/ScalarType.h>
 #include <c10/macros/Macros.h>
 #include <c10/util/TypeCast.h>
+#ifndef USE_ROCM
+#include <ATen/cuda/host_trace/LaunchLayout.h>
+#include <ATen/cuda/host_trace/SymHost.h>
+#endif
 
 #ifdef __NVCC__
 #define ASSERT_HOST_DEVICE_LAMBDA(type)                       \
@@ -69,6 +73,124 @@ constexpr int block_work_size() {
 }
 } // namespace vectorized_templated_config
 #endif
+
+#ifndef USE_ROCM
+// The launch sites below report each launch to the host-trace harvest
+// (ATen/cuda/host_trace/LaunchLayout.h): a parameter's bytes by its type
+template <typename func_t, int ntensors>
+struct StridedOp;
+template <typename func_t, int ntensors>
+struct StridedCastOp;
+
+template <typename T>
+void param_bytes(const T& v, char* c) {
+  if constexpr (std::is_arithmetic_v<T>) {
+    at::cuda::host_trace::value_bytes(v, c, 'k');
+  } else {
+    at::cuda::host_trace::functor_bytes(v, c);
+  }
+}
+
+template <typename T, size_t N>
+void param_bytes(const std::array<T, N>& v, char* c) {
+  at::cuda::host_trace::value_bytes(v, c, 'k');
+}
+
+template <int N, typename index_t, bool signed_strides>
+void param_bytes(const ::OffsetCalculator<N, index_t, signed_strides>& v, char* c) {
+  at::cuda::host_trace::value_bytes(v, c, 'k');
+}
+
+template <int N, typename index_t>
+void param_bytes(const TrivialOffsetCalculator<N, index_t>& v, char* c) {
+  at::cuda::host_trace::value_bytes(v, c, '.');
+}
+
+// LoadWithCast<0>'s placeholder elements are unset
+template <int N>
+void param_bytes(const memory::LoadWithCast<N>& v, char* c) {
+  at::cuda::host_trace::value_bytes(v, c, N ? 'k' : '.');
+}
+
+template <int N>
+void param_bytes(const memory::StoreWithCast<N>& v, char* c) {
+  at::cuda::host_trace::value_bytes(v, c, 'k');
+}
+
+inline void param_bytes(const memory::LoadWithoutCast& v, char* c) {
+  at::cuda::host_trace::value_bytes(v, c, '.');
+}
+
+inline void param_bytes(const memory::StoreWithoutCast& v, char* c) {
+  at::cuda::host_trace::value_bytes(v, c, '.');
+}
+
+template <typename func_t, int ntensors>
+void param_bytes(const StridedOp<func_t, ntensors>& v, char* c) {
+  std::memset(c, '.', sizeof(v));
+  param_bytes(v.data, c + at::cuda::host_trace::member_offset(v, v.data));
+  param_bytes(v.offset_calc, c + at::cuda::host_trace::member_offset(v, v.offset_calc));
+  at::cuda::host_trace::functor_bytes(v.f, c + at::cuda::host_trace::member_offset(v, v.f));
+}
+
+template <typename func_t, int ntensors>
+void param_bytes(const StridedCastOp<func_t, ntensors>& v, char* c) {
+  std::memset(c, '.', sizeof(v));
+  param_bytes(v.data, c + at::cuda::host_trace::member_offset(v, v.data));
+  param_bytes(v.dtypes, c + at::cuda::host_trace::member_offset(v, v.dtypes));
+  param_bytes(v.offset_calc, c + at::cuda::host_trace::member_offset(v, v.offset_calc));
+  at::cuda::host_trace::functor_bytes(v.f, c + at::cuda::host_trace::member_offset(v, v.f));
+}
+
+template <typename T>
+void report_param(at::cuda::host_trace::LaunchLayout& l, const T& v) {
+  l.classes.emplace_back(sizeof(T), '.');
+  param_bytes(v, l.classes.back().data());
+  l.bytes.emplace_back(reinterpret_cast<const char*>(&v), sizeof(T));
+}
+
+// each argument as the kernel's parameter type
+template <typename... KArgs, typename... Args>
+C10_NOINLINE void report_launch(void (*kernel)(KArgs...), dim3 grid, dim3 block, const Args&... args) {
+  at::cuda::host_trace::LaunchLayout l{nullptr, grid, block, {}, {}};
+  C10_CUDA_CHECK(cudaGetFuncBySymbol(&l.function, reinterpret_cast<const void*>(kernel)));
+  (report_param(l, static_cast<KArgs>(args)), ...);
+  at::cuda::host_trace::report_launch_layout(std::move(l));
+}
+
+template <typename... KArgs, typename... Args>
+C10_ALWAYS_INLINE void report_launch_if_harvesting(void (*kernel)(KArgs...), dim3 grid, dim3 block, const Args&... args) {
+  if (at::cuda::host_trace::harvesting()) {
+    report_launch(kernel, grid, block, args...);
+  }
+}
+#else
+template <typename... Args>
+void report_launch_if_harvesting(const Args&...) {}
+#endif
+
+// The host kind the launch code below runs as. EagerHost launches over the
+// iterator's int64_t sizes and data pointers; a symbolic iterator's launch
+// (at::detail::set_symbolic_iterators) runs the same code as
+// host_trace::SymHost over c10::SymInt and records the launch
+// (ATen/cuda/host_trace/SymHost.h).
+struct EagerHost {
+  static constexpr bool symbolic = false;
+  using int_t = int64_t;
+
+  static int64_t numel(const TensorIteratorBase& iter) {
+    return iter.numel();
+  }
+
+  template <int N>
+  static std::array<char*, N> data(const TensorIteratorBase& iter) {
+    std::array<char*, N> data;
+    for (int i = 0; i < N; i++) {
+      data[i] = (char*)iter.data_ptr(i);
+    }
+    return data;
+  }
+};
 
 template <typename args_t, size_t... Is>
 constexpr auto sum_of_sizes(args_t args, std::index_sequence<Is...>) {
@@ -319,26 +441,66 @@ __global__ void unrolled_elementwise_kernel(
   elementwise_kernel_helper(f, policy);
 }
 
-// this function assume trivial 1d and no dynamic casting
-template <typename func_t, typename array_t>
-static inline void launch_vectorized_kernel(
-    int64_t N,
-    const func_t& f,
-    array_t data) {
-  TORCH_INTERNAL_ASSERT(N > 0 && N <= std::numeric_limits<int32_t>::max());
+// What the launch routing below reads of func_t, at compile time. The same
+// routing runs once for every functor of a symbolic iterator (a CUDA graph host
+// trace) over host_trace::SymFacts, these facts at run time (make_sym_facts).
+template <typename func_t>
+struct StaticFacts {
+  using functor_type = func_t;
   using traits = function_traits<func_t>;
-  constexpr auto io_size = calc_io_size<func_t>();
+  using result_type = typename traits::result_type;
+  static constexpr int arity = traits::arity;
+  static constexpr int ntensors = arity + 1;
+  using array_t = std::array<char*, ntensors>;
+  static constexpr auto io_size = calc_io_size<func_t>();
+  static constexpr int tws = elems_per_thread<io_size>();
+#ifndef USE_ROCM
+  static constexpr size_t result_size = sizeof(result_type);
+  static constexpr size_t max_input_size = at::native::max_of_sizes(
+      typename traits::ArgsTuple{}, std::make_index_sequence<std::tuple_size_v<typename traits::ArgsTuple>>{});
+  static constexpr auto tws_128b = elems_per_thread_128b<io_size - result_size>(result_size);
+  static constexpr int strided_unroll = result_size >= 4 ? 2 : 4;
+#endif
+
+  static array_t data(const TensorIteratorBase& iter) {
+    array_t data;
+    for (int i = 0; i < ntensors; i++) {
+      data[i] = (char*)iter.data_ptr(i);
+    }
+    return data;
+  }
+  static int can_vectorize(const array_t& data) {
+    return memory::can_vectorize_up_to<func_t>(data);
+  }
+  static bool needs_dynamic_casting(TensorIteratorBase& iter) {
+    return at::native::needs_dynamic_casting<func_t>::check(iter);
+  }
+};
+
+// this function assume trivial 1d and no dynamic casting
+template <class H, class Facts, typename functor_t, typename data_t>
+static inline void launch_vectorized_kernel(
+    const Facts& facts,
+    typename H::int_t N,
+    const functor_t& f,
+    const data_t& data) {
+  if constexpr (!H::symbolic) {
+    TORCH_INTERNAL_ASSERT(N > 0 && N <= std::numeric_limits<int32_t>::max());
+  }
   auto stream = at::cuda::getCurrentCUDAStream();
 #ifdef USE_ROCM
+  static_assert(!H::symbolic);
+  using func_t = typename Facts::functor_type;
+  using array_t = data_t;
+  constexpr auto io_size = calc_io_size<func_t>();
   int vec_size = memory::can_vectorize_up_to<func_t>(data);
   c10::DeviceIndex curDevice = -1;
   AT_CUDA_CHECK(c10::cuda::GetDevice(&curDevice));
   // Similar check in vectorized_elementwise_kernel() as well. Both should be in sync.
   int tws = at::detail::getCUDAHooks().isGPUArch({"gfx942"}, curDevice) ? 16 : elems_per_thread<io_size>();
 #else
-  using cpp_type = typename function_traits<func_t>::result_type;
-  const uint16_t max_vec_size = memory::can_vectorize_up_to<func_t>(data);
-  uint16_t vec_size = 16 / static_cast<uint16_t>(sizeof(cpp_type));
+  const uint16_t max_vec_size = facts.can_vectorize(data);
+  uint16_t vec_size = 16 / static_cast<uint16_t>(facts.result_size);
   cudaDeviceProp* p = at::cuda::getDeviceProperties(stream.device().index());
   // Empirical benchmarking set this threshold; retain the existing path for
   // smaller workloads to avoid performance regressions
@@ -346,12 +508,9 @@ static inline void launch_vectorized_kernel(
   // which is important for small footprints).
   constexpr int64_t min_sm107_io_size = 16 * 1024 * 1024;
   const bool use_sm107_optimizations =
-      p->major == 10 && p->minor == 7 && N * io_size >= min_sm107_io_size;
+      p->major == 10 && p->minor == 7 && N * facts.io_size >= min_sm107_io_size;
   if (use_sm107_optimizations) {
-    using args_t = typename function_traits<func_t>::ArgsTuple;
-    constexpr auto max_input_size = at::native::max_of_sizes(
-        args_t{}, std::make_index_sequence<std::tuple_size_v<args_t>>{});
-    vec_size = 32 / static_cast<uint16_t>(std::max(sizeof(cpp_type), max_input_size));
+    vec_size = 32 / static_cast<uint16_t>(std::max(facts.result_size, facts.max_input_size));
   }
   vec_size = std::min<uint16_t>(vec_size, max_vec_size);
   // due to excessive binary size the `vectorized_elementwise_kernel` of
@@ -361,19 +520,31 @@ static inline void launch_vectorized_kernel(
     vec_size = std::min<uint16_t>(vec_size, 4);
   }
 #if !defined(CUDA_VERSION) || CUDA_VERSION < 12080
-  if constexpr (sizeof(cpp_type) < 2) {
+  if (facts.result_size < 2) {
     vec_size = std::min<uint16_t>(vec_size, 4);
   }
 #endif
-  int tws = elems_per_thread<io_size>();
-  constexpr auto input_size = io_size - sizeof(cpp_type);
-  constexpr auto tws_128b = elems_per_thread_128b<input_size>(sizeof(cpp_type));
-  if (tws_128b >= 8 && use_sm107_optimizations && vec_size == 8) {
-    tws = tws_128b;
+  int tws = facts.tws;
+  if (facts.tws_128b >= 8 && use_sm107_optimizations && vec_size == 8) {
+    tws = facts.tws_128b;
   }
 #endif
   int bws = tws * num_threads();
-  int64_t grid = (N + bws - 1) / bws;
+  typename H::int_t grid = (N + bws - 1) / bws;
+#ifndef USE_ROCM
+  if constexpr (H::symbolic) {
+    // the unrolled kernel's grid where nothing vectorizes
+    const typename H::int_t grid_unrolled = (N + elementwise_block_work_size() - 1) / elementwise_block_work_size();
+    facts.record_vectorized(vec_size, use_sm107_optimizations, vec_size == 1 ? grid_unrolled : grid, N, data);
+  } else
+#endif
+  {
+  using func_t = typename Facts::functor_type;
+  using traits = function_traits<func_t>;
+  using array_t = data_t;
+#ifndef USE_ROCM
+  constexpr auto tws_128b = Facts::tws_128b;
+#endif
   switch (vec_size) {
 #ifdef USE_ROCM
     case 16:
@@ -388,9 +559,11 @@ static inline void launch_vectorized_kernel(
           <<<grid, num_threads(), 0, stream>>>(N, f, data);
 #else
       if (use_sm107_optimizations) {
+        report_launch_if_harvesting(vectorized_elementwise_kernel<8, func_t, array_t, tws_128b >= 8>, grid, num_threads(), N, f, data);
         vectorized_elementwise_kernel<8, func_t, array_t, tws_128b >= 8>
             <<<grid, num_threads(), 0, stream>>>(N, f, data);
       } else {
+        report_launch_if_harvesting(vectorized_elementwise_kernel<8, func_t, array_t>, grid, num_threads(), N, f, data);
         vectorized_elementwise_kernel<8, func_t, array_t>
             <<<grid, num_threads(), 0, stream>>>(N, f, data);
       }
@@ -398,11 +571,13 @@ static inline void launch_vectorized_kernel(
       C10_CUDA_KERNEL_LAUNCH_CHECK();
       break;
     case 4:
+      report_launch_if_harvesting(vectorized_elementwise_kernel<4, func_t, array_t>, grid, num_threads(), N, f, data);
       vectorized_elementwise_kernel<4, func_t, array_t>
           <<<grid, num_threads(), 0, stream>>>(N, f, data);
       C10_CUDA_KERNEL_LAUNCH_CHECK();
       break;
     case 2:
+      report_launch_if_harvesting(vectorized_elementwise_kernel<2, func_t, array_t>, grid, num_threads(), N, f, data);
       vectorized_elementwise_kernel<2, func_t, array_t>
           <<<grid, num_threads(), 0, stream>>>(N, f, data);
       C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -413,6 +588,9 @@ static inline void launch_vectorized_kernel(
       auto loader = memory::LoadWithoutCast();
       auto storer = memory::StoreWithoutCast();
       int64_t grid_unrolled = (N + elementwise_block_work_size() - 1) / elementwise_block_work_size();
+      report_launch_if_harvesting(
+          unrolled_elementwise_kernel<func_t, array_t, elementwise_thread_work_size(), decltype(input_calc), decltype(output_calc), decltype(loader), decltype(storer)>,
+          grid_unrolled, num_threads(), N, f, data, input_calc, output_calc, loader, storer);
       unrolled_elementwise_kernel<func_t, array_t, elementwise_thread_work_size()>
           <<<grid_unrolled, num_threads(), 0, stream>>>(
               N, f, data, input_calc, output_calc, loader, storer);
@@ -421,6 +599,7 @@ static inline void launch_vectorized_kernel(
     }
     default:
       TORCH_INTERNAL_ASSERT(false, "Unexpected vectorization size");
+  }
   }
 }
 
@@ -577,6 +756,9 @@ static inline void launch_unrolled_kernel(
 
   int64_t grid = (N + elementwise_block_work_size() - 1) / elementwise_block_work_size();
   auto stream = at::cuda::getCurrentCUDAStream();
+  report_launch_if_harvesting(
+      unrolled_elementwise_kernel<func_t, array_t, elementwise_thread_work_size(), inp_calc_t, out_calc_t, loader_t, storer_t>,
+      grid, num_threads(), N, f, data, ic, oc, l, s);
   unrolled_elementwise_kernel<func_t, array_t, elementwise_thread_work_size()>
       <<<grid, num_threads(), 0, stream>>>(N, f, data, ic, oc, l, s);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -606,6 +788,7 @@ static void launch_legacy_kernel(int64_t N, const func_t& f) {
   dim3 block(nt);
   dim3 grid((N + block.x * vt - 1) / (block.x * vt));
   auto stream = at::cuda::getCurrentCUDAStream();
+  report_launch_if_harvesting(elementwise_kernel<nt, vt, func_t>, grid, block, N, f);
   elementwise_kernel<nt, vt, func_t><<<grid, block, 0, stream>>>(N, f);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
@@ -698,37 +881,72 @@ C10_HOST_DEVICE typename traits::result_type invoke(
   return invoke_impl<traits>(f, data, strides, dtypes, i, Indices{});
 }
 
-template <typename func_t>
-void gpu_kernel_impl_nocast(TensorIteratorBase& iter, const func_t& f) {
-  using traits = function_traits<func_t>;
-  using arg0_t = typename traits::result_type;
-  constexpr int ntensors = traits::arity + 1;
+// The strided loop body as a named functor rather than a lambda, so host code
+// can construct the kernel's parameter.
+template <typename func_t, int ntensors>
+struct StridedOp {
+  using arg0_t = typename function_traits<func_t>::result_type;
+  std::array<char*, ntensors> data;
+  ::OffsetCalculator<ntensors> offset_calc;
+  func_t f;
+  __device__ void operator()(int idx) const {
+    auto offsets = offset_calc.get(idx);
+    arg0_t* out = (arg0_t*)(data[0] + offsets[0]);
+    *out = invoke(f, &data[1], &offsets[1], 1);
+  }
+};
 
+// StridedOp for operands of dtypes other than f's
+template <typename func_t, int ntensors>
+struct StridedCastOp {
+  using arg0_t = typename function_traits<func_t>::result_type;
+  std::array<char*, ntensors> data;
+  std::array<ScalarType, ntensors> dtypes;
+  ::OffsetCalculator<ntensors> offset_calc;
+  func_t f;
+  __device__ void operator()(int idx) const {
+    auto offsets = offset_calc.get(idx);
+    void* out = data[0] + offsets[0];
+    arg0_t result = invoke(f, &data[1], &offsets[1], &dtypes[1], 1);
+    c10::cast_and_store<arg0_t>(dtypes[0], out, result);
+  }
+};
+
+// The routing of gpu_kernel's launch: over StaticFacts<func_t> and func_t
+// for eager (EagerHost), over host_trace::SymFacts once for every functor for
+// a symbolic iterator (host_trace::SymHost, which records the launch)
+template <class H, class Facts, typename functor_t>
+void gpu_kernel_impl_nocast(TensorIteratorBase& iter, const Facts& facts, const functor_t& f) {
   TORCH_INTERNAL_ASSERT(iter.can_use_32bit_indexing());
-  TORCH_INTERNAL_ASSERT(iter.ninputs() == traits::arity);
+  TORCH_INTERNAL_ASSERT(iter.ninputs() == facts.arity);
   TORCH_INTERNAL_ASSERT(iter.noutputs() == 1);
 
-  std::array<char*, ntensors> data;
-  for (int i = 0; i < ntensors; i++) {
-    data[i] = (char*)iter.data_ptr(i);
-  }
+  auto data = facts.data(iter);
 
-  int64_t numel = iter.numel();
+  typename H::int_t numel = H::numel(iter);
 
   bool contiguous = iter.is_contiguous();
 
   if (contiguous) {
-    return launch_vectorized_kernel(numel, f, data);
+    return launch_vectorized_kernel<H>(facts, numel, f, data);
   }
-  auto offset_calc = ::make_offset_calculator<traits::arity + 1>(iter);
 #ifndef USE_ROCM
-  constexpr int unroll_factor = sizeof(arg0_t) >= 4 ? 2 : 4;
-  launch_legacy_kernel<128, unroll_factor>(numel, [=] GPU_LAMBDA(int idx) {
-    auto offsets = offset_calc.get(idx);
-    arg0_t* out = (arg0_t*)(data[0] + offsets[0]);
-    *out = invoke(f, &data[1], &offsets[1], 1);
-  });
+  if constexpr (H::symbolic) {
+    // launch_legacy_kernel<128, unroll> of a StridedOp
+    const int64_t work = 128 * facts.strided_unroll;
+    facts.record_strided(/*cast=*/false, (numel + work - 1) / work, numel, data, iter);
+  } else {
+    using func_t = typename Facts::functor_type;
+    constexpr int ntensors = Facts::ntensors;
+    auto offset_calc = ::make_offset_calculator<ntensors>(iter);
+    constexpr int unroll_factor = Facts::strided_unroll;
+    launch_legacy_kernel<128, unroll_factor>(numel, StridedOp<func_t, ntensors>{data, offset_calc, f});
+  }
 #else
+  using func_t = typename Facts::functor_type;
+  using traits = function_traits<func_t>;
+  using arg0_t = typename traits::result_type;
+  auto offset_calc = ::make_offset_calculator<traits::arity + 1>(iter);
   constexpr int unroll_factor = sizeof(arg0_t) >= 4 ? 4 : 8;
   constexpr int grp_sz = 128;
   launch_legacy_kernel_manual_unroll<grp_sz, unroll_factor>(numel, [=] GPU_LAMBDA(int idx, bool unrl) {
@@ -1014,28 +1232,28 @@ struct type_specialized_broadcast_kernel_launcher {
 } // namespace
 #endif
 
-template <typename func_t>
-void gpu_kernel_impl(TensorIteratorBase& iter, const func_t& f) {
-  if (!needs_dynamic_casting<func_t>::check(iter)) {
-    return gpu_kernel_impl_nocast(iter, f);
+template <class H, class Facts, typename functor_t>
+void gpu_kernel_impl(TensorIteratorBase& iter, const Facts& facts, const functor_t& f) {
+  if (!facts.needs_dynamic_casting(iter)) {
+    return gpu_kernel_impl_nocast<H>(iter, facts, f);
   }
-  using traits = function_traits<func_t>;
-  using arg0_t = typename traits::result_type;
-  constexpr int ntensors = traits::arity + 1;
 
   TORCH_INTERNAL_ASSERT(iter.can_use_32bit_indexing());
-  TORCH_INTERNAL_ASSERT(iter.ninputs() == traits::arity);
+  TORCH_INTERNAL_ASSERT(iter.ninputs() == facts.arity);
   TORCH_INTERNAL_ASSERT(iter.noutputs() == 1);
 
-  std::array<char*, ntensors> data;
-  for (int i = 0; i < ntensors; i++) {
-    data[i] = (char*)iter.data_ptr(i);
-  }
+  auto data = facts.data(iter);
 
-  int64_t numel = iter.numel();
+  typename H::int_t numel = H::numel(iter);
 
   bool contiguous = iter.is_contiguous();
 
+#ifdef USE_ROCM
+  using func_t = typename Facts::functor_type;
+  using traits = function_traits<func_t>;
+  using arg0_t = typename traits::result_type;
+  constexpr int ntensors = traits::arity + 1;
+#endif
   if (contiguous) {
 #ifdef USE_ROCM
     // Attempt to call specialized vectorized elementwise kernel
@@ -1109,6 +1327,12 @@ void gpu_kernel_impl(TensorIteratorBase& iter, const func_t& f) {
       }
     });
 #else
+    if constexpr (H::symbolic) {
+      facts.record_unrolled_cast((numel + elementwise_block_work_size() - 1) / elementwise_block_work_size(), numel, data, iter);
+      return;
+    } else {
+    using func_t = typename Facts::functor_type;
+    using traits = function_traits<func_t>;
     auto loader = memory::LoadWithCast<traits::arity>(iter);
     auto storer = memory::StoreWithCast<1>(iter);
     auto input_offset_calculator = TrivialOffsetCalculator<traits::arity>();
@@ -1121,13 +1345,23 @@ void gpu_kernel_impl(TensorIteratorBase& iter, const func_t& f) {
         output_offset_calculator,
         loader,
         storer);
+    }
 #endif
   } else {
+#ifndef USE_ROCM
+    if constexpr (H::symbolic) {
+      // launch_legacy_kernel<128, 4> of a StridedCastOp
+      facts.record_strided(/*cast=*/true, (numel + 128 * 4 - 1) / (128 * 4), numel, data, iter);
+      return;
+    } else {
+    using func_t = typename Facts::functor_type;
+    constexpr int ntensors = Facts::ntensors;
+#endif
     std::array<ScalarType, ntensors> dtypes;
     for (int i = 0; i < ntensors; i++) {
       dtypes[i] = iter.dtype(i);
     }
-    auto offset_calc = ::make_offset_calculator<traits::arity + 1>(iter);
+    auto offset_calc = ::make_offset_calculator<ntensors>(iter);
 #ifdef USE_ROCM
     if (check_binary_rt_types_for_specialization(iter)) {
       // constexpr to reduce the amount of kernels generated for
@@ -1182,14 +1416,90 @@ void gpu_kernel_impl(TensorIteratorBase& iter, const func_t& f) {
       }
     });
 #else
-    launch_legacy_kernel<128, 4>(numel, [=] GPU_LAMBDA(int idx) {
-      auto offsets = offset_calc.get(idx);
-      void* out = data[0] + offsets[0];
-      arg0_t result = invoke(f, &data[1], &offsets[1], &dtypes[1], 1);
-      c10::cast_and_store<arg0_t>(dtypes[0], out, result);
-    });
+    launch_legacy_kernel<128, 4>(numel, StridedCastOp<func_t, ntensors>{data, dtypes, offset_calc, f});
+    }
 #endif
   }
 }
+
+#ifndef USE_ROCM
+// LoadWithCast<arity> and StoreWithCast<1> of iter's dtypes, as their bytes
+template <int arity>
+void cast_params(const TensorIteratorBase& iter, std::vector<uint8_t>& load, std::vector<uint8_t>& store) {
+  const memory::LoadWithCast<arity> l(iter);
+  const memory::StoreWithCast<1> s(iter);
+  const auto* lb = reinterpret_cast<const uint8_t*>(&l);
+  const auto* sb = reinterpret_cast<const uint8_t*>(&s);
+  load.assign(lb, lb + sizeof(l));
+  store.assign(sb, sb + sizeof(s));
+}
+
+// The run-time facts the routing reads for a symbolic iterator's launch of f
+// (gpu_kernel), all the per-functor code of that launch: the kernels eager's
+// gpu_kernel_impl (or with nocast gpu_kernel_impl_nocast) instantiates, f's
+// bytes and StaticFacts<func_t>
+template <typename func_t, bool nocast>
+at::cuda::host_trace::SymFacts make_sym_facts(const func_t& f) {
+  using facts = StaticFacts<func_t>;
+  using traits = typename facts::traits;
+  using array_t = typename facts::array_t;
+  constexpr int ntensors = facts::ntensors;
+  using at::cuda::host_trace::SymFacts;
+  static_assert(ntensors <= SymFacts::max_tensors);
+  SymFacts s;
+  s.arity = facts::arity;
+  s.ntensors = ntensors;
+  s.io_size = facts::io_size;
+  s.tws = facts::tws;
+  s.tws_128b = facts::tws_128b;
+  s.strided_unroll = facts::strided_unroll;
+  s.result_size = facts::result_size;
+  s.max_input_size = facts::max_input_size;
+  s.types[0] = c10::CppTypeToScalarType<typename traits::result_type>::value;
+  s.sizes[0] = sizeof(typename traits::result_type);
+  [&]<size_t... I>(std::index_sequence<I...>) {
+    ((s.types[I + 1] = c10::CppTypeToScalarType<typename traits::template arg<I>::type>::value, s.sizes[I + 1] = sizeof(typename traits::template arg<I>::type)), ...);
+  }(std::make_index_sequence<facts::arity>{});
+  using ic_t = TrivialOffsetCalculator<facts::arity>;
+  using oc_t = TrivialOffsetCalculator<1>;
+  using plain_load_t = memory::LoadWithoutCast;
+  using plain_store_t = memory::StoreWithoutCast;
+  using op_t = StridedOp<func_t, ntensors>;
+  s.kernels[SymFacts::Vec8] = reinterpret_cast<const void*>(&vectorized_elementwise_kernel<8, func_t, array_t>);
+  s.kernels[SymFacts::Vec8Sm107] = reinterpret_cast<const void*>(&vectorized_elementwise_kernel<8, func_t, array_t, facts::tws_128b >= 8>);
+  s.kernels[SymFacts::Vec4] = reinterpret_cast<const void*>(&vectorized_elementwise_kernel<4, func_t, array_t>);
+  s.kernels[SymFacts::Vec2] = reinterpret_cast<const void*>(&vectorized_elementwise_kernel<2, func_t, array_t>);
+  s.kernels[SymFacts::Unrolled] = reinterpret_cast<const void*>(&unrolled_elementwise_kernel<func_t, array_t, elementwise_thread_work_size(), ic_t, oc_t, plain_load_t, plain_store_t>);
+  s.kernels[SymFacts::Strided] = reinterpret_cast<const void*>(&elementwise_kernel<128, facts::strided_unroll, op_t>);
+  s.functor = &f;
+  s.functor_size = sizeof(func_t);
+  s.functor_align = alignof(func_t);
+  s.trivial_in_size = sizeof(ic_t);
+  s.trivial_out_size = sizeof(oc_t);
+  s.plain_load_size = sizeof(plain_load_t);
+  s.plain_store_size = sizeof(plain_store_t);
+  // the strided functors' layouts, on zeroed bytes (their offset calculator has no default constructor)
+  alignas(op_t) uint8_t op_raw[sizeof(op_t)] = {};
+  const op_t& op = *reinterpret_cast<const op_t*>(op_raw);
+  s.strided = {sizeof(op_t), alignof(op_t), static_cast<uint32_t>(at::cuda::host_trace::member_offset(op, op.data)), 0,
+               static_cast<uint32_t>(at::cuda::host_trace::member_offset(op, op.offset_calc)), static_cast<uint32_t>(at::cuda::host_trace::member_offset(op, op.f))};
+  if constexpr (!nocast) {
+    using load_t = memory::LoadWithCast<facts::arity>;
+    using store_t = memory::StoreWithCast<1>;
+    using cast_op_t = StridedCastOp<func_t, ntensors>;
+    s.kernels[SymFacts::UnrolledCast] = reinterpret_cast<const void*>(&unrolled_elementwise_kernel<func_t, array_t, elementwise_thread_work_size(), ic_t, oc_t, load_t, store_t>);
+    s.kernels[SymFacts::StridedCast] = reinterpret_cast<const void*>(&elementwise_kernel<128, 4, cast_op_t>);
+    s.cast_params = &cast_params<facts::arity>;
+    s.load_align = alignof(load_t);
+    s.store_align = alignof(store_t);
+    alignas(cast_op_t) uint8_t cast_raw[sizeof(cast_op_t)] = {};
+    const cast_op_t& cop = *reinterpret_cast<const cast_op_t*>(cast_raw);
+    s.strided_cast = {sizeof(cast_op_t), alignof(cast_op_t), static_cast<uint32_t>(at::cuda::host_trace::member_offset(cop, cop.data)),
+                      static_cast<uint32_t>(at::cuda::host_trace::member_offset(cop, cop.dtypes)), static_cast<uint32_t>(at::cuda::host_trace::member_offset(cop, cop.offset_calc)),
+                      static_cast<uint32_t>(at::cuda::host_trace::member_offset(cop, cop.f))};
+  }
+  return s;
+}
+#endif
 
 } // namespace at::native

@@ -1,5 +1,6 @@
 #include <ATen/Functions.h>
 #include <ATen/Tensor.h>
+#include <ATen/TensorIterator.h>
 #include <ATen/cuda/CUDAGeneratorImpl.h>
 #include <ATen/cuda/CUDAGraph.h>
 #include <ATen/cuda/CUDAGraphsUtils.cuh>
@@ -480,6 +481,12 @@ uint64_t CUDAGeneratorImpl::philox_offset_per_thread() const {
  * See Note [Acquire lock when using random generators]
  */
 PhiloxCudaState CUDAGeneratorImpl::philox_cuda_state(uint64_t increment) {
+  // a host trace's symbolic TensorIterator host code (at::detail::
+  // set_symbolic_iterators): the generator's state is no symbol of the trace
+  if (C10_UNLIKELY(at::detail::symbolic_iterators())) {
+    at::detail::note_symbolic_refusal(at::detail::SymbolicRefusal::Generator);
+    TORCH_CHECK_NOT_IMPLEMENTED(false, "host_trace: an op's host code draws from the CUDA generator");
+  }
   auto capture_id = at::cuda::currentStreamCaptureId();
   if (capture_id.has_value()) {
     auto* capture_state = state_->get_capture_state(capture_id.value(), true);
@@ -516,6 +523,12 @@ void CUDAGeneratorImpl::philox_state(
     at::Tensor& seed,
     at::Tensor& offset,
     at::Tensor& intragraph_offset) {
+  // a host trace's symbolic TensorIterator host code (at::detail::
+  // set_symbolic_iterators): the generator's state is no symbol of the trace
+  if (C10_UNLIKELY(at::detail::symbolic_iterators())) {
+    at::detail::note_symbolic_refusal(at::detail::SymbolicRefusal::Generator);
+    TORCH_CHECK_NOT_IMPLEMENTED(false, "host_trace: an op's host code draws from the CUDA generator");
+  }
   const auto cpu_opts = at::TensorOptions().dtype(at::kLong).device(at::kCPU);
   auto capture_id = at::cuda::currentStreamCaptureId();
   if (capture_id.has_value()) {
@@ -545,6 +558,12 @@ void CUDAGeneratorImpl::philox_state(
  */
 std::pair<uint64_t, uint64_t> CUDAGeneratorImpl::philox_engine_inputs(
     uint64_t increment) {
+  // a host trace's symbolic TensorIterator host code (at::detail::
+  // set_symbolic_iterators): the generator's state is no symbol of the trace
+  if (C10_UNLIKELY(at::detail::symbolic_iterators())) {
+    at::detail::note_symbolic_refusal(at::detail::SymbolicRefusal::Generator);
+    TORCH_CHECK_NOT_IMPLEMENTED(false, "host_trace: an op's host code draws from the CUDA generator");
+  }
   at::cuda::assertNotCapturing(
       "Refactor this op to use CUDAGeneratorImpl::philox_cuda_state. Cannot call CUDAGeneratorImpl::philox_engine_inputs");
   uint64_t offset = state_->philox_offset_per_thread_;

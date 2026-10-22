@@ -1,14 +1,29 @@
 #pragma once
 
 #include <ATen/DimVector.h>
+#include <c10/core/SymIntArrayRef.h>
 #include <c10/core/TensorOptions.h>
 #include <c10/util/strides.h>
 
 namespace at {
 
 class Tensor;
+class TensorBase;
 
 namespace impl {
+
+// raises NotImplementedError for an output a symbolic TensorIterator cannot
+// allocate (TensorIterator.cpp; noted as detail::SymbolicRefusal::Output)
+[[noreturn]] TORCH_API void refuse_symbolic_output();
+
+// A host trace's hook, set while its recorder is (TensorIterator.cpp): resizes
+// a given output to sizes and strides (empty strides: contiguous) where it is
+// a fresh empty allocation of the running op (an op's functional form over
+// its out= kernel, `empty({0})` then the kernel's resize_output), as eager's
+// resize_ allocates a new storage; false where it is not
+using SymbolicResize = bool (*)(const TensorBase& out, c10::SymIntArrayRef sizes, c10::SymIntArrayRef strides);
+TORCH_API SymbolicResize set_symbolic_resize(SymbolicResize hook);
+TORCH_API bool symbolic_resize(const TensorBase& out, c10::SymIntArrayRef sizes, c10::SymIntArrayRef strides);
 
 // Use this to define the prototype for a meta function.  There are two
 // versions; one that takes one argument (just the operator name), or FUNC2
@@ -108,6 +123,19 @@ struct TORCH_API MetaBase {
       IntArrayRef strides_hint [[maybe_unused]],
       TensorOptions options [[maybe_unused]]) {
     TORCH_INTERNAL_ASSERT(false, "set_output_strided not implemented.");
+  }
+
+  // set_output_raw_strided over symbolic sizes, for a TensorIterator built
+  // symbolically (a CUDA graph host trace): allocates through the dispatcher
+  // (empty_strided_symint), checks a given output with each comparison a
+  // guard, and never resizes one. Kernels whose class does not implement it
+  // raise NotImplementedError.
+  virtual void set_output_raw_strided_symint(
+      int64_t output_idx [[maybe_unused]],
+      c10::SymIntArrayRef sizes [[maybe_unused]],
+      c10::SymIntArrayRef strides_hint [[maybe_unused]],
+      TensorOptions options [[maybe_unused]]) {
+    refuse_symbolic_output();
   }
 
   // Use this function if the kernel requires contiguous strides.

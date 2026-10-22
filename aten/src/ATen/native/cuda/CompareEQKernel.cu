@@ -26,6 +26,9 @@ struct CompareEqFunctor{
     }
 
   }
+  auto host_trace_fields() const {
+    return std::tie(op_);
+  }
  };
 }
 

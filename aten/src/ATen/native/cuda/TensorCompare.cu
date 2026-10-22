@@ -13,13 +13,16 @@ namespace at::native {
 
 namespace {
 
+template <typename scalar_t>
+struct WhereFunctor {
+  __device__ scalar_t operator()(bool cond_val, scalar_t self_val, scalar_t other_val) const {
+    return cond_val ? self_val : other_val;
+  }
+};
+
 void where_kernel_impl(TensorIterator &iter) {
   AT_DISPATCH_V2(opaqueScalarType(iter.dtype()), "where_cuda", [&] {
-      gpu_kernel_opaque(
-        iter,
-        [=] GPU_LAMBDA (bool cond_val, scalar_t self_val, scalar_t other_val) -> scalar_t {
-          return cond_val ? self_val : other_val;
-        });
+      gpu_kernel_opaque(iter, WhereFunctor<scalar_t>());
   }, AT_EXPAND(AT_OPAQUE_TYPES));
 }
 
@@ -58,33 +61,44 @@ void clamp_kernel_impl(TensorIteratorBase& iter) {
   }), AT_EXPAND(AT_ALL_TYPES), AT_EXPAND(AT_BAREBONES_UNSIGNED_TYPES), kHalf, kBFloat16);
 }
 
+template <typename scalar_t, typename opmath_t>
+struct ClampScalarFunctor {
+  at::native::detail::ClampLimits minmax;
+  opmath_t lim0_val;
+  opmath_t lim1_val;
+  __device__ scalar_t operator()(scalar_t v) const {
+    opmath_t val = static_cast<opmath_t>(v);
+    // Propagate nan, which doesn't propagate automatically for ROCm
+    if (_isnan(static_cast<opmath_t>(v))) {
+      return v;
+    } else if (minmax==at::native::detail::ClampLimits::Min){
+      if (val == lim0_val)
+        return v;
+      return (val < lim0_val) ? static_cast<scalar_t>(lim0_val) : v;
+    } else if (minmax==at::native::detail::ClampLimits::Max){
+      if (val == lim0_val)
+        return v;
+      return (val > lim0_val) ? static_cast<scalar_t>(lim0_val) : v;
+    } else {
+      // The following replaces std::clamp(val, low, high) and is a viable solution for
+      // both CUDA and ROCm since std::clamp and this replacement generates the same PTX.
+      // The replacement should generate the same PTX as std::clamp. See https://godbolt.org/z/Wde9KW3v4
+      opmath_t result = (val < lim0_val) ? lim0_val : val;
+      return scalar_t((lim1_val < result) ? lim1_val : result);
+    }
+  }
+  auto host_trace_fields() const {
+    return std::tie(minmax, lim0_val, lim1_val);
+  }
+};
+
 void inline launch_clamp_scalar(TensorIteratorBase& iter, Scalar lim0, Scalar lim1, at::native::detail::ClampLimits minmax){
   AT_DISPATCH_V2(iter.common_dtype(), "clamp_scalar_cuda", AT_WRAP([&] {
     using opmath_t = at::opmath_type<scalar_t>;
-    auto lim0_val = lim0.to<opmath_t>();
-    auto lim1_val = lim1.to<opmath_t>();
-
-    gpu_kernel(iter, [=]GPU_LAMBDA(scalar_t v) -> scalar_t {
-      opmath_t val = static_cast<opmath_t>(v);
-      // Propagate nan, which doesn't propagate automatically for ROCm
-      if (_isnan(static_cast<opmath_t>(v))) {
-        return v;
-      } else if (minmax==at::native::detail::ClampLimits::Min){
-        if (val == lim0_val)
-          return v;
-        return (val < lim0_val) ? static_cast<scalar_t>(lim0_val) : v;
-      } else if (minmax==at::native::detail::ClampLimits::Max){
-        if (val == lim0_val)
-          return v;
-        return (val > lim0_val) ? static_cast<scalar_t>(lim0_val) : v;
-      } else {
-        // The following replaces std::clamp(val, low, high) and is a viable solution for
-        // both CUDA and ROCm since std::clamp and this replacement generates the same PTX.
-        // The replacement should generate the same PTX as std::clamp. See https://godbolt.org/z/Wde9KW3v4
-        opmath_t result = (val < lim0_val) ? lim0_val : val;
-        return scalar_t((lim1_val < result) ? lim1_val : result);
-      }
-    });
+    ClampScalarFunctor<scalar_t, opmath_t> f{minmax, scalar_arg<opmath_t>(iter, lim0), scalar_arg<opmath_t>(iter, lim1)};
+    [[maybe_unused]] auto lim0_member = scalar_arg_member(f, f.lim0_val, iter, lim0);
+    [[maybe_unused]] auto lim1_member = scalar_arg_member(f, f.lim1_val, iter, lim1);
+    gpu_kernel(iter, f);
   }), AT_EXPAND(AT_ALL_TYPES), AT_EXPAND(AT_BAREBONES_UNSIGNED_TYPES), kHalf, kBFloat16);
 }
 
@@ -150,3 +164,4 @@ void _assert_async_cuda(const Tensor& self_tensor) {
 }
 
 } // namespace at::native
+

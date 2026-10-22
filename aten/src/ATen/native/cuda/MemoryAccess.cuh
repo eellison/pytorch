@@ -10,6 +10,7 @@
 #include <ATen/detail/FunctionTraits.h>
 #include <ATen/cuda/detail/OffsetCalculator.cuh>
 #include <ATen/native/cuda/thread_constants.h>
+#include <ATen/native/cuda/VectorWidth.h>
 
 #include <thrust/tuple.h>
 
@@ -134,7 +135,7 @@ struct LoadWithCast {
   array_t dtypes;
   size_array_t element_sizes;
 
-  LoadWithCast(const TensorIteratorBase& iter) {
+  C10_ALWAYS_INLINE LoadWithCast(const TensorIteratorBase& iter) {
     CUDA_KERNEL_ASSERT(iter.ninputs() == N);
     #pragma unroll
     for (auto i = 0; i < N; ++i) {
@@ -165,7 +166,7 @@ struct StoreWithCast {
   array_t dtypes;
   size_array_t element_sizes;
 
-  StoreWithCast(const TensorIteratorBase& iter) {
+  C10_ALWAYS_INLINE StoreWithCast(const TensorIteratorBase& iter) {
     CUDA_KERNEL_ASSERT(iter.noutputs() == N);
     #pragma unroll
     for (auto i = 0; i < N; ++i) {
@@ -517,36 +518,27 @@ struct multi_outputs_unroll {
 // This is only used in host, but we will wrap this into some templates
 // which is C10_HOST_DEVICE, so we have to make this C10_HOST_DEVICE
 // in order to compile
+// the vector width an address allows: a uint64_t address, or a host trace's
+// c10::SymInt one (each test a guard)
+template<typename scalar_t, typename address_t>
+inline C10_HOST_DEVICE int can_vectorize_up_to_address(const address_t& address) {
+  static_assert(std::alignment_of_v<aligned_vector<scalar_t, 2>> == 2 * sizeof(scalar_t));
+  return vector_width_for(static_cast<int64_t>(sizeof(scalar_t)), address);
+}
+
 template<typename scalar_t>
 inline C10_HOST_DEVICE int can_vectorize_up_to(const char *pointer) {
-  uint64_t address = reinterpret_cast<uint64_t>(pointer);
-  constexpr int vec2_alignment = std::alignment_of_v<aligned_vector<scalar_t, 2>>;
-  constexpr int vec4_alignment = std::alignment_of_v<aligned_vector<scalar_t, 4>>;
-  constexpr int vec8_alignment = std::alignment_of_v<aligned_vector<scalar_t, 8>>;
-#ifdef USE_ROCM
-  constexpr int vec16_alignment = std::alignment_of_v<aligned_vector<scalar_t, 16>>;
-  constexpr int type_size = sizeof(scalar_t);
-  if (type_size == 1 && (address % vec16_alignment == 0)) {
-    return 16;
-  } else if (type_size <= 2 && (address % vec8_alignment == 0)) {
-    return 8;
-  } else
-#else
-  if (address % vec8_alignment == 0) {
-   return 8;
-  } else
-#endif
-  if (address % vec4_alignment == 0) {
-    return 4;
-  } else if (address % vec2_alignment == 0) {
-    return 2;
-  }
-  return 1;
+  return can_vectorize_up_to_address<scalar_t>(reinterpret_cast<uint64_t>(pointer));
 }
 
 template<typename scalar_t>
 inline C10_HOST_DEVICE int can_vectorize_up_to(char *pointer) {
   return can_vectorize_up_to<scalar_t>(static_cast<const char*>(pointer));
+}
+
+template<typename scalar_t>
+inline int can_vectorize_up_to(const c10::SymInt& address) {
+  return can_vectorize_up_to_address<scalar_t>(address);
 }
 
 template<int i>

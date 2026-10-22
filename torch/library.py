@@ -52,6 +52,9 @@ _P = ParamSpec("_P")
 # libraries calling into kernels not intended to be called.
 _impls: set[str] = set()
 _defs: set[str] = set()
+# The Python functions registered as kernels (with_keyset=False), by their _impls key: what a host trace
+# (torch.cuda._host_trace.library_impls) runs in place of the kernel
+_python_impls: dict[str, Callable] = {}
 
 # prim is reserved by TorchScript interpreter
 _reserved_namespaces = ["prim"]
@@ -259,6 +262,7 @@ class Library:
             _del_library,
             _impls,
             self._op_impls,
+            _python_impls,
             _defs,
             self._op_defs,
             self._registration_handles,
@@ -514,6 +518,10 @@ class Library:
 
         _impls.add(key)
         self._op_impls.add(key)
+        if not with_keyset and fn is not fallthrough_kernel:
+            _python_impls[key] = fn
+        else:
+            _python_impls.pop(key, None)
 
     def register_symm_mem_args(self, op_name, arg_names):
         r"""Registers which arguments require symmetric memory allocation for an operator.
@@ -610,6 +618,8 @@ class Library:
         self._registration_handles.clear()
         global _impls
         _impls -= self._op_impls
+        for key in self._op_impls:
+            _python_impls.pop(key, None)
         _clear_torch_ops_cache(self._op_defs)
 
 
@@ -648,6 +658,7 @@ def _clear_torch_ops_cache(op_defs):
 def _del_library(
     captured_impls,
     op_impls,
+    python_impls,
     captured_defs,
     op_defs,
     registration_handles,
@@ -666,6 +677,8 @@ def _del_library(
             del schema_to_signature_cache[(name, overload_name)]
 
     captured_impls -= op_impls
+    for key in op_impls:
+        python_impls.pop(key, None)
     captured_defs -= op_defs
     for handle in registration_handles:
         handle.destroy()

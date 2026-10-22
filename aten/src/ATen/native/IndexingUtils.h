@@ -178,6 +178,10 @@ struct AdvancedIndex {
   std::vector<Tensor> indices;
   DimVector indexed_sizes;
   DimVector indexed_strides;
+  // the same over SymInt, of a symbolic src (a CUDA graph host trace's);
+  // indexed_sizes and indexed_strides are then empty
+  c10::SymDimVector sym_indexed_sizes;
+  c10::SymDimVector sym_indexed_strides;
   int64_t dims_before;
   int64_t dims_after;
 };

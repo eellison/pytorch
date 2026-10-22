@@ -5,8 +5,12 @@
 #include <ATen/cuda/CUDAContext.h>
 
 #include <c10/util/Load.h>
+#include <c10/util/irange.h>
 #include <limits>
 #include <cmath>
+#if !defined(USE_ROCM)
+#include <ATen/cuda/host_trace/SymImage.h>
+#endif
 
 namespace at::native {
 
@@ -184,10 +188,41 @@ inline void check_fits_in_unsigned(int64_t val, const char* name) {
 }
 
 
+
 template<typename scalar_t, class BinaryFunction>
 __host__ void scan_outer_dim_with_indices(
     const TensorBase& self, const TensorBase& values, const TensorBase& indices,
     int dim, scalar_t init, BinaryFunction binary_op) {
+#if !defined(USE_ROCM)
+  if (auto* rec = at::cuda::host_trace::current_recorder()) {
+    // a CUDA graph host trace: the same launch over symbolic sizes, recorded
+    namespace ht = at::cuda::host_trace;
+    const auto sizes = self.sym_sizes();
+    const c10::SymInt row_size = sizes[dim];
+    c10::SymInt num_orows = 1, num_irows = 1;
+    for (const auto i : c10::irange(dim)) {
+      num_orows *= sizes[i];
+    }
+    for (const auto i : c10::irange(dim + 1, static_cast<int>(sizes.size()))) {
+      num_irows *= sizes[i];
+    }
+    constexpr int64_t umax = std::numeric_limits<uint32_t>::max();
+    TORCH_CHECK(num_irows <= umax && num_orows <= umax && row_size <= umax, "num_irows, num_orows and row_size must fit in a 32-bit uint32_t value");
+    const c10::SymInt threads = ht::sym_min(*rec, 512, num_irows);
+    const int64_t max_grid = at::cuda::getCurrentDeviceProperties()->maxGridSize[1];
+    const ht::SymDim3 grid(ht::sym_min(*rec, max_grid, num_orows), ht::sym_min(*rec, max_grid, (num_irows + threads - 1) / threads));
+    std::vector<ht::ParamImage> params;
+    params.push_back(ht::param_pointer(*rec, self));
+    params.push_back(ht::param_pointer(*rec, values));
+    params.push_back(ht::param_pointer(*rec, indices));
+    params.push_back(ht::param_of<uint32_t>(num_orows));
+    params.push_back(ht::param_of<uint32_t>(num_irows));
+    params.push_back(ht::param_of<uint32_t>(row_size));
+    params.push_back(ht::param_bytes(init));
+    params.push_back(ht::param_bytes(binary_op));
+    return ht::record_images(reinterpret_cast<const void*>(&tensor_kernel_scan_outer_dim_with_indices<scalar_t, BinaryFunction>), std::move(params), grid, threads, 0);
+  }
+#endif
   int64_t row_size = self.size(dim);
   auto sizes = self.sizes();
 
@@ -216,6 +251,34 @@ template <typename scalar_t, class BinaryFunction>
 __host__ void scan_innermost_dim_with_indices(
     const TensorBase& self, const TensorBase& values, const TensorBase& indices,
     scalar_t init, BinaryFunction binary_op) {
+#if !defined(USE_ROCM)
+  if (auto* rec = at::cuda::host_trace::current_recorder()) {
+    // a CUDA graph host trace: the same launch over symbolic sizes, recorded;
+    // get_log_num_threads_x_inner_scan as the program's bitlength and select rows
+    namespace ht = at::cuda::host_trace;
+    const c10::SymInt row_size = self.sym_size(self.dim() - 1);
+    const c10::SymInt num_rows = self.sym_numel() / row_size;
+    const c10::SymInt diff = rec->bit_length(row_size - 1) - rec->bit_length(num_rows - 1);
+    // (9 + diff) / 2 rounds either way to the same value once clamped to [4, 9]
+    const c10::SymInt log_x = ht::sym_min(*rec, ht::sym_max(*rec, (diff + 9) / 2, 4), 9);
+    const uint32_t num_threads = 512;
+    const ht::SymDim3 threads(rec->pow2(log_x), rec->pow2(9 - log_x));
+    const int64_t max_grid = at::cuda::getCurrentDeviceProperties()->maxGridSize[0];
+    const c10::SymInt grid = ht::sym_min(*rec, max_grid, (num_rows + threads.y - 1) / threads.y);
+    std::vector<ht::ParamImage> params;
+    params.push_back(ht::param_pointer(*rec, self));
+    params.push_back(ht::param_pointer(*rec, values));
+    params.push_back(ht::param_pointer(*rec, indices));
+    params.push_back(ht::param_of<int>(num_rows));
+    params.push_back(ht::param_of<int>(row_size));
+    params.push_back(ht::param_bytes(num_threads));
+    params.push_back(ht::param_of<uint32_t>(log_x));
+    params.push_back(ht::param_bytes(init));
+    params.push_back(ht::param_bytes(binary_op));
+    const int64_t mem_size = 2 * num_threads * (sizeof(scalar_t) + sizeof(int64_t));
+    return ht::record_images(reinterpret_cast<const void*>(&tensor_kernel_scan_innermost_dim_with_indices<scalar_t, BinaryFunction>), std::move(params), grid, threads, mem_size);
+  }
+#endif
   int ndim = self.dim();
   // Treat all outer dimensions as a single dimension.
   int row_size = self.size(ndim - 1);

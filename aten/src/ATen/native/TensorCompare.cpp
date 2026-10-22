@@ -324,10 +324,27 @@ static std::pair<bool, bool> clamp_bound_range(const Scalar& bound) {
         c10::less_than_lowest<scalar_t>(value),
         c10::greater_than_max<scalar_t>(value)};
   }
+  if (bound.isSymbolic()) {
+    // a host trace's symbolic integer: each comparison a guard
+    const auto value = bound.toSymInt();
+    using limits = std::numeric_limits<scalar_t>;
+    if constexpr (std::is_same_v<scalar_t, int64_t>) {
+      return {false, false};
+    } else if constexpr (std::is_same_v<scalar_t, uint64_t>) {
+      return {value < 0, false};
+    } else {
+      return {value < static_cast<int64_t>(limits::lowest()), value > static_cast<int64_t>(limits::max())};
+    }
+  }
   const auto value = bound.toLong();
   return {
       c10::less_than_lowest<scalar_t>(value),
       c10::greater_than_max<scalar_t>(value)};
+}
+
+// an integral bound (a host trace's symbolic one too) is never NaN
+static bool is_nan_bound(const Scalar& bound) {
+  return !bound.isIntegral(/*includeBool=*/true) && bound.toDouble() != bound.toDouble();
 }
 
 // Reconciles a clamp bound with the target dtype, returning the scalar to apply
@@ -898,10 +915,8 @@ TORCH_IMPL_FUNC(clamp_out)
   using at::native::detail::ClampLimits;
 
   // If either scalar bound is NaN, the result should be all NaNs
-  const bool min_is_nan =
-      min.has_value() && (min.get().toDouble() != min.get().toDouble());
-  const bool max_is_nan =
-      max.has_value() && (max.get().toDouble() != max.get().toDouble());
+  const bool min_is_nan = min.has_value() && is_nan_bound(min.get());
+  const bool max_is_nan = max.has_value() && is_nan_bound(max.get());
 
   if (min_is_nan || max_is_nan) {
     at::fill_(
@@ -940,7 +955,7 @@ TORCH_IMPL_FUNC(clamp_Tensor_out)
 
 TORCH_IMPL_FUNC(clamp_max_out)
 (const Tensor& self, const Scalar& max, const Tensor& result) {
-  if (max.toDouble() != max.toDouble()) {
+  if (is_nan_bound(max)) {
     // TODO this is not great, building TI again is expensive, but I can't use
     // fill_stub because fill is not structured
     // this is a corner case anyway
@@ -961,7 +976,7 @@ TORCH_IMPL_FUNC(clamp_max_Tensor_out)
 
 TORCH_IMPL_FUNC(clamp_min_out)
 (const Tensor& self, const Scalar& min, const Tensor& result) {
-  if (min.toDouble() != min.toDouble()) {
+  if (is_nan_bound(min)) {
     at::fill_(const_cast<Tensor&>(result), min);
   } else if (
       const auto bound = prepare_clamp_bound(

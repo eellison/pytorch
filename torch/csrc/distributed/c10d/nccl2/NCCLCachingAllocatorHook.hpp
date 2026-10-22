@@ -15,6 +15,7 @@
 #include <mutex>
 #include <set>
 #include <unordered_map>
+#include <unordered_set>
 
 #include <c10/cuda/CUDACachingAllocator.h>
 
@@ -45,6 +46,8 @@ class NCCLCachingAllocatorHook {
 
   std::mutex mutex_;
   std::unordered_map<void*, MemInfo> registeredMemMap_;
+  // segments with no memory mapped behind them, which NCCL cannot register
+  std::unordered_set<void*> unmapped_;
   std::set<ProcessGroupNCCL*> registeredComms_;
   bool register_default_pool_segments_;
 };

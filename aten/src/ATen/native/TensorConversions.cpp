@@ -54,6 +54,7 @@
 #include <ATen/native/NonSymbolicBC.h>
 #include <ATen/native/SparseTensorUtils.h>
 #include <ATen/native/TensorConversions.h>
+#include <ATen/InferDenseStrides.h>
 #include <c10/core/impl/DeviceGuardImplInterface.h>
 #include <algorithm>
 #include <numeric>
@@ -353,16 +354,22 @@ Tensor _to_copy(
           r.copy_(self, non_blocking);
           set_quantizer_(r, quantizer);
         } else {
-          r = at::empty_strided(
-              self.sizes(), self.strides(), options.pinned_memory(pin_out));
+          r = at::empty_strided_symint(
+              self.sym_sizes(), self.sym_strides(), options.pinned_memory(pin_out));
           r.copy_(self, non_blocking);
         }
         return r;
       } else if (!self.is_quantized() && self.layout() == kStrided) {
         Tensor r;
-        auto strides = infer_dense_strides(self.sizes(), self.strides());
-        r = at::empty_strided(
-            self.sizes(), strides, options.pinned_memory(pin_out));
+        if (C10_UNLIKELY(self.unsafeGetTensorImpl()->has_symbolic_sizes_strides())) {
+          // a symbolic tensor (a CUDA graph host trace): the same strides over SymInt
+          r = at::empty_strided_symint(
+              self.sym_sizes(), infer_dense_strides_symint(self.sym_sizes(), self.sym_strides()), options.pinned_memory(pin_out));
+        } else {
+          auto strides = infer_dense_strides(self.sizes(), self.strides());
+          r = at::empty_strided(
+              self.sizes(), strides, options.pinned_memory(pin_out));
+        }
         r.copy_(self, non_blocking);
         return r;
       } else {

@@ -1,5 +1,6 @@
 #define TORCH_ASSERT_ONLY_METHOD_OPERATORS
 #include <ATen/native/TensorFactories.h>
+#include <ATen/InferDenseStrides.h>
 
 #include <ATen/CPUGeneratorImpl.h>
 #include <ATen/Dispatch.h>
@@ -440,11 +441,17 @@ Tensor empty_like(
       // If input tensor is not dense and non-overlapping but strided, we will
       // infer an output strides which keeps the layout permutation of the input
       // tensor.
-      std::vector<int64_t> strides =
-          infer_dense_strides(self.sizes(), self.strides());
-      // See Note [Explicit nullopt MemoryFormat argument]
-      result = at::empty_strided(
-          self.sizes(), strides, options.memory_format(std::nullopt));
+      if (C10_UNLIKELY(self.unsafeGetTensorImpl()->has_symbolic_sizes_strides())) {
+        // a symbolic tensor (a CUDA graph host trace): the same strides over SymInt
+        result = at::empty_strided_symint(
+            self.sym_sizes(), infer_dense_strides_symint(self.sym_sizes(), self.sym_strides()), options.memory_format(std::nullopt));
+      } else {
+        std::vector<int64_t> strides =
+            infer_dense_strides(self.sizes(), self.strides());
+        // See Note [Explicit nullopt MemoryFormat argument]
+        result = at::empty_strided(
+            self.sizes(), strides, options.memory_format(std::nullopt));
+      }
     } else {
       // See Note [Explicit nullopt MemoryFormat argument]
       result = at::empty_symint(

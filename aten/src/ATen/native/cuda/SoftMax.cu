@@ -28,6 +28,10 @@
 #include <ATen/ops/_softmax_backward_data_native.h>
 #include <ATen/ops/softmax.h>
 #include <ATen/ops/_softmax_backward_data.h>
+#include <ATen/ops/empty.h>
+#endif
+#if !defined(USE_ROCM)
+#include <ATen/cuda/host_trace/Ops.h>
 #endif
 
 namespace at::native {
@@ -1642,3 +1646,120 @@ Tensor masked_softmax_backward_cuda(
 }
 
 } // namespace at::native
+
+#if !defined(USE_ROCM)
+// Traced hosts (ATen/cuda/host_trace/Ops.h)
+namespace at::cuda::host_trace {
+namespace {
+
+namespace an = at::native;
+
+template <typename input_t, typename output_t, typename acc_t, bool is_log_softmax, int... L>
+void launch_softmax_warp_forward(Recorder& rec, int log2_elements, const SymDim3& grid, const SymDim3& block, const c10::SymInt& out, const c10::SymInt& in, const c10::SymInt& batch_count, const c10::SymInt& elements, std::integer_sequence<int, L...>) {
+  const auto launch_one = [&](auto kernel) {
+    launch(rec, kernel, grid, block, 0, scalar_param<output_t*>(out), scalar_param<const input_t*>(in), scalar_param<int>(batch_count),
+           scalar_param<int>(elements), scalar_param<int>(elements), scalar_param<const bool*>(0), scalar_param<int>(-1), scalar_param<bool>(0));
+  };
+  ((log2_elements == L ? launch_one(&softmax_warp_forward<input_t, output_t, acc_t, L, is_log_softmax, false, 32>) : void()), ...);
+}
+
+template <typename scalar_t, typename accscalar_t, typename outscalar_t, template <typename, typename, typename> class Epilogue, int... R>
+void launch_softmax_forward_reg(Recorder& rec, int64_t reg_cnt, const c10::SymInt& grid, int64_t block, int64_t smem, const c10::SymInt& out, const c10::SymInt& in, const c10::SymInt& dim_size, std::integer_sequence<int, R...>) {
+  const auto launch_one = [&](auto kernel) {
+    launch(rec, kernel, grid, block, smem, scalar_param<outscalar_t*>(out), scalar_param<const scalar_t*>(in), scalar_param<int64_t>(dim_size));
+  };
+  ((reg_cnt == R ? launch_one(&an::cunn_SoftMaxForwardReg<scalar_t, accscalar_t, outscalar_t, Epilogue, int64_t, R>) : void()), ...);
+}
+
+// host_softmax's launches for inner_size 1 (keep in sync); with_reg is its
+// !half_to_float branch, the one with cunn_SoftMaxForwardReg
+template <typename scalar_t, typename accscalar_t, typename outscalar_t, template <typename, typename, typename> class Epilogue, bool is_log_softmax, bool with_reg>
+void softmax_launches(Recorder& rec, const c10::SymInt& out, const c10::SymInt& in, const c10::SymInt& outer_size, const c10::SymInt& dim_size) {
+  if (dim_size <= 2048 && dim_size * static_cast<int64_t>(sizeof(scalar_t)) <= 8192) {
+    // eager's launch per (1 << 30) / dim_size rows is one launch here
+    if (outer_size * dim_size > (int64_t{1} << 30)) {
+      decline("a persistent softmax of more than 2^30 elements");
+    }
+    const auto config = softmax_warp_forward_config(dim_size, outer_size, at::cuda::warp_size());
+    const SymDim3 threads(config.warp_size, config.warps_per_block);
+    launch_softmax_warp_forward<scalar_t, outscalar_t, accscalar_t, is_log_softmax>(
+        rec, config.log2_elements, config.blocks, threads, out, in, outer_size, dim_size, std::make_integer_sequence<int, 12>{});
+    return;
+  }
+  constexpr int ILP = sizeof(float4) / sizeof(scalar_t);
+  // dim_size > max_threads here, where SoftMaxForward_getBlockSize is max_threads'
+  const int64_t block = an::SoftMaxForward_getBlockSize(an::max_threads).x;
+  const size_t smem_reduction_sz = block / at::cuda::warp_size() * sizeof(accscalar_t);
+  const auto smem_reduction = static_cast<int64_t>(smem_reduction_sz);
+  // potential_register_count
+  const c10::SymInt reg_cnt = (dim_size + block - 1) / block;
+  if (with_reg && reg_cnt < 10) {
+    launch_softmax_forward_reg<scalar_t, accscalar_t, outscalar_t, Epilogue>(
+        rec, reg_cnt.guard_int(__FILE__, __LINE__), outer_size, block, smem_reduction, out, in, dim_size, std::integer_sequence<int, 1, 2, 3, 4, 5, 6, 7, 8, 9>{});
+    return;
+  }
+  const auto max_elements_per_smem = (at::cuda::getCurrentDeviceProperties()->sharedMemPerBlock - smem_reduction_sz) / sizeof(scalar_t);
+  if (dim_size < static_cast<int64_t>(max_elements_per_smem) && in % an::ALIGN_BYTES == 0 && out % an::ALIGN_BYTES == 0 && dim_size % ILP == 0) {
+    const c10::SymInt smem = dim_size * static_cast<int64_t>(sizeof(scalar_t)) + smem_reduction;
+    // eager deduces index_t from its int64_t dim_size
+    launch(rec, &an::cunn_SoftMaxForwardSmem<ILP, scalar_t, accscalar_t, outscalar_t, Epilogue, int64_t>, outer_size, block, smem,
+           scalar_param<outscalar_t*>(out), scalar_param<const scalar_t*>(in), scalar_param<int64_t>(dim_size));
+  } else {
+    launch(rec, &an::cunn_SoftMaxForward<ILP, scalar_t, accscalar_t, outscalar_t, Epilogue>, outer_size, block, smem_reduction,
+           scalar_param<outscalar_t*>(out), scalar_param<const scalar_t*>(in), scalar_param<int>(dim_size));
+  }
+}
+
+// host_softmax for a contiguous input; cunn_SpatialSoftMaxForward's
+// occupancy-sized launch (inner_size > 1) declines
+template <template <typename, typename, typename> class Epilogue, bool is_log_softmax>
+TensorBase traced_softmax(Recorder& rec, const TensorBase& input, int64_t dim_, bool half_to_float) {
+  const ScalarType dtype = input.scalar_type();
+  if (half_to_float && dtype != kHalf) {
+    decline("a half_to_float softmax of a non-Half input");
+  }
+  if (input.dim() == 0 || !input.is_contiguous()) {
+    decline("a softmax of a 0-d or non-contiguous input");
+  }
+  const int64_t dim = maybe_wrap_dim(dim_, input.dim());
+  c10::SymInt outer_size = 1;
+  for (const auto i : c10::irange(dim)) {
+    outer_size *= input.sym_size(i);
+  }
+  c10::SymInt inner_size = 1;
+  for (int64_t i = dim + 1; i < input.dim(); ++i) {
+    inner_size *= input.sym_size(i);
+  }
+  const c10::SymInt dim_size = input.sym_size(dim);
+  if (input.sym_numel() == 0) {
+    decline("an empty softmax");
+  }
+  if (inner_size != 1) {
+    decline("a softmax over a dim with inner elements");
+  }
+  const TensorBase output = at::empty_symint(input.sym_sizes(), input.options().dtype(half_to_float ? kFloat : dtype));
+  const c10::SymInt in = rec.data_ptr(input);
+  const c10::SymInt out = rec.data_ptr(output);
+  AT_DISPATCH_FLOATING_TYPES_AND2(kHalf, kBFloat16, dtype, "host_softmax", [&] {
+    using accscalar_t = at::acc_type<scalar_t, true>;
+    if (!half_to_float) {
+      softmax_launches<scalar_t, accscalar_t, scalar_t, Epilogue, is_log_softmax, true>(rec, out, in, outer_size, dim_size);
+    } else {
+      softmax_launches<scalar_t, accscalar_t, accscalar_t, Epilogue, is_log_softmax, false>(rec, out, in, outer_size, dim_size);
+    }
+  });
+  return output;
+}
+
+} // namespace
+
+TensorBase softmax(Recorder& rec, const TensorBase& self, int64_t dim, bool half_to_float) {
+  return traced_softmax<an::SoftMaxForwardEpilogue, false>(rec, self, dim, half_to_float);
+}
+
+TensorBase log_softmax(Recorder& rec, const TensorBase& self, int64_t dim, bool half_to_float) {
+  return traced_softmax<an::LogSoftMaxForwardEpilogue, true>(rec, self, dim, half_to_float);
+}
+
+} // namespace at::cuda::host_trace
+#endif
