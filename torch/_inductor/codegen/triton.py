@@ -5380,11 +5380,18 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 if load_counts[name] > expected_count and (
                     has_rindex or indirect_indexing
                 ):
-                    return "evict_last"
-                return "evict_first"
+                    return ", eviction_policy='evict_last'"
+                # A gathered row reduced along (e.g. norm(table[idx])) is often
+                # re-read by other programs via repeated indices, so it must not
+                # be evicted first. Rows gathered along the reduction dim
+                # (embedding-bag style) keep evict_first, which helps random
+                # gathers from tables much larger than L2.
+                if indirect_indexing and has_rindex:
+                    return ""
+                return ", eviction_policy='evict_first'"
 
             expected_count = load_counts[name]
-            ep = ", eviction_policy='<EP>'"
+            ep = "<EP>"
             make_line = functools.partial(DelayReplaceLine, "<EP>", decide_later)
         else:
             ep = ""

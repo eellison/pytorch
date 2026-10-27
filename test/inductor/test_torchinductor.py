@@ -22006,6 +22006,46 @@ if RUN_GPU:
             self.assertIn("eviction_policy='evict_last'", lines[0])
             self.assertIn("eviction_policy='evict_first'", lines[1])
 
+        @config.patch("triton.multi_kernel", False)
+        def test_no_evict_first_for_gathered_reduction_load(self):
+            def gathered_loads(f, *args):
+                torch._dynamo.reset()
+                code = run_and_get_triton_code(torch.compile(f), *args)
+                loads = [line for line in code.split("\n") if "tl.load" in line]
+                gathered = [
+                    x for x in loads if re.search(r"tl\.load\([^,]*\btmp\d+", x)
+                ]
+                return code, loads, gathered
+
+            def row_gather(table, idx, y):
+                return (table[idx] * y).sum(dim=-1)
+
+            def bag(table, idx):
+                return table[idx].sum(dim=1)
+
+            table = torch.randn(64, 128, device=GPU_TYPE)
+            idx = torch.randint(0, 64, (256,), device=GPU_TYPE)
+            y = torch.randn(256, 128, device=GPU_TYPE)
+            bag_idx = torch.randint(0, 64, (32, 256), device=GPU_TYPE)
+            for persistent in (True, False):
+                with config.patch("triton.persistent_reductions", persistent):
+                    # Reduction along a gathered row: no early eviction for the
+                    # gathered row; the dense single-use load keeps evict_first.
+                    code, loads, gathered = gathered_loads(row_gather, table, idx, y)
+                    self.assertEqual(
+                        "@triton_heuristics.persistent_reduction" in code, persistent
+                    )
+                    dense = [x for x in loads if "r0_1 + 128*x0" in x]
+                    self.assertEqual(len(gathered), 1, loads)
+                    self.assertEqual(len(dense), 1, loads)
+                    self.assertNotIn("eviction_policy", gathered[0])
+                    self.assertIn("eviction_policy='evict_first'", dense[0])
+
+                    # Reduction over gathered rows (embedding-bag style) is unchanged.
+                    _, loads, gathered = gathered_loads(bag, table, bag_idx)
+                    self.assertEqual(len(gathered), 1, loads)
+                    self.assertIn("eviction_policy='evict_first'", gathered[0])
+
         @config.patch("triton.skip_l1_cache", True)
         def test_skip_l1_cache(self):
             @torch.compile
