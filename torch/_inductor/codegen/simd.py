@@ -4344,18 +4344,23 @@ class SIMDScheduling(BaseScheduling):
             kernel_features.reduction_numel,
             kernel_features.coalesce_analysis,
         )
-        kernels = self.create_kernel_choices(
-            kernel_features,
-            [tiling],
-            {"features": kernel_features, "tiling_scores": tiling_score},
-        )
-        for kernel in kernels:
-            self.codegen_node_schedule_with_kernel(node_schedule, kernel)
-        MultiKernel.merge_workspaces_inplace(kernels)
-
         # Collect config_patches from operations (e.g., decomposition ops with
         # coordinate_descent_tuning) and apply during kernel codegen
         config_patches = self._collect_config_patches(node_schedule)
+
+        kernel_kwargs: dict[str, Any] = {
+            "features": kernel_features,
+            "tiling_scores": tiling_score,
+        }
+        persistent = self._benchmark_persistent_reduction(
+            kernel_features, tiling, kernel_kwargs, config_patches
+        )
+        if persistent is not None:
+            kernel_kwargs["override_persistent_reduction"] = persistent
+        kernels = self.create_kernel_choices(kernel_features, [tiling], kernel_kwargs)
+        for kernel in kernels:
+            self.codegen_node_schedule_with_kernel(node_schedule, kernel)
+        MultiKernel.merge_workspaces_inplace(kernels)
 
         for kernel in kernels:
             with V.set_kernel_handler(kernel), config.patch(**config_patches):
@@ -4407,6 +4412,19 @@ class SIMDScheduling(BaseScheduling):
                     )
 
         self.free_buffers_in_scheduler()
+
+    def _benchmark_persistent_reduction(
+        self,
+        kernel_features: SIMDKernelFeatures,
+        tiling: dict[str, sympy.Expr],
+        kernel_kwargs: dict[str, Any],
+        config_patches: dict[str, Any],
+    ) -> bool | None:
+        """
+        Whether a benchmark found a persistent kernel faster than a looped one for
+        this reduction, or None if not benchmarked.
+        """
+        return None
 
     def _launch_kernel_and_cleanup(
         self,

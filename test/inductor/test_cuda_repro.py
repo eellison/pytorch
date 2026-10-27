@@ -22,6 +22,7 @@ from torch._inductor.compile_fx import compile_fx_inner
 from torch._inductor.runtime.benchmarking import benchmarker
 from torch._inductor.runtime.hints import DeviceProperties
 from torch._inductor.utils import (
+    fresh_cache,
     run_and_get_code,
     run_and_get_graph_lowering,
     run_fw_bw_and_get_code,
@@ -2868,6 +2869,106 @@ class CudaReproTests(TestCase):
         persistent_code = code.split("@triton_heuristics.persistent_reduction", 1)[1]
         self.assertIn("reduction_hint=ReductionHint.INNER", persistent_code)
         self.assertNotIn("for roffset", persistent_code)
+
+    @staticmethod
+    def _norm_gate_norm(x, w1, b1, w2, b2):
+        y = F.layer_norm(x.float(), (x.shape[1],), w1, b1).to(x.dtype)
+        y = x * torch.sigmoid(y)
+        return F.layer_norm(y.float(), (x.shape[1],), w2, b2).to(x.dtype)
+
+    def _compile_long_row(self, n, persistent_ms, looped_ms, **config_patches):
+        from torch._inductor.codegen.triton import TritonScheduling
+
+        benchmarked = []
+        inputs = []
+
+        def fake_benchmark(self_, mod, *args, **kwargs):
+            with open(mod.__file__) as f:
+                src = f.read()
+            self.assertNotIn("coordinate_descent_tuning", src)
+            persistent = "@triton_heuristics.persistent_reduction" in src
+            benchmarked.append(persistent)
+            inputs.append(kwargs.get("args"))
+            return (persistent_ms if persistent else looped_ms), mod.__file__
+
+        x = torch.randn(1024, n, device=device_type, dtype=torch.float16)
+        params = [torch.randn(n, device=device_type) for _ in range(4)]
+        torch._dynamo.reset()
+        with (
+            fresh_cache(),
+            config.patch(config_patches),
+            unittest.mock.patch.object(
+                TritonScheduling, "benchmark_codegened_module", fake_benchmark
+            ),
+        ):
+            compiled = torch.compile(self._norm_gate_norm, fullgraph=True)
+            out, code = run_and_get_code(compiled, x, *params)
+        self.assertEqual(self._norm_gate_norm(x, *params), out, atol=1e-2, rtol=1e-2)
+        if inputs:
+            # Both kernels' inputs are allocated up front and reused for the
+            # second round of timing.
+            self.assertIsNotNone(inputs[0])
+            self.assertIsNot(inputs[0], inputs[1])
+            self.assertIs(inputs[0], inputs[2])
+            self.assertIs(inputs[1], inputs[3])
+        return "\n".join(code), benchmarked
+
+    @skipIfRocm
+    def test_long_row_persistent_reduction_benchmarked(self):
+        if device_type != "cuda":
+            raise unittest.SkipTest("requires CUDA")
+
+        code, benchmarked = self._compile_long_row(
+            8192, persistent_ms=1.0, looped_ms=2.0, max_autotune=True
+        )
+        self.assertEqual([False, True, False, True], benchmarked)
+        self.assertEqual(1, code.count("@triton_heuristics.persistent_reduction"))
+        self.assertNotIn("@triton_heuristics.reduction", code)
+        kernel = code.split("@triton_heuristics.persistent_reduction", 1)[1]
+        kernel = kernel.split("device_str=", 1)[0]
+        self.assertNotIn("for r0_offset", kernel)
+        # The row stays in registers: no intermediate is written back out.
+        self.assertEqual(1, kernel.count("tl.store("))
+        # The second norm's weights are loaded after the first reduction rather
+        # than hoisted to the top of the kernel.
+        self.assertGreater(kernel.rindex("tl.load("), kernel.index("tl.sum("))
+
+        code, benchmarked = self._compile_long_row(
+            8192, persistent_ms=2.0, looped_ms=1.0, coordinate_descent_tuning=True
+        )
+        self.assertEqual([False, True, False, True], benchmarked)
+        self.assertNotIn("@triton_heuristics.persistent_reduction", code)
+        self.assertIn("for r0_offset", code)
+
+    @skipIfRocm
+    def test_long_row_persistent_reduction_not_benchmarked(self):
+        if device_type != "cuda":
+            raise unittest.SkipTest("requires CUDA")
+
+        for n, config_patches in [
+            (8192, {}),
+            (8192, {"max_autotune": True, "deterministic": True}),
+            (8192, {"max_autotune": True, "batch_invariant": True}),
+            (2048, {"max_autotune": True}),
+            (32769, {"max_autotune": True}),
+        ]:
+            with self.subTest(n=n, **config_patches):
+                code, benchmarked = self._compile_long_row(
+                    n, persistent_ms=1.0, looped_ms=2.0, **config_patches
+                )
+                self.assertEqual([], benchmarked)
+                self.assertNotIn("@triton_heuristics.persistent_reduction", code)
+
+        # MultiKernel times both kernels at runtime up to its own persistent
+        # threshold; past it, the compile-time measurement applies.
+        _, benchmarked = self._compile_long_row(
+            8192, persistent_ms=1.0, looped_ms=2.0, **{"triton.multi_kernel": 1}
+        )
+        self.assertEqual([], benchmarked)
+        _, benchmarked = self._compile_long_row(
+            32768, persistent_ms=1.0, looped_ms=2.0, **{"triton.multi_kernel": 1}
+        )
+        self.assertEqual([False, True, False, True], benchmarked)
 
     @parametrize(
         "use_block_ptr",

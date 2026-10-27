@@ -553,6 +553,53 @@ class InductorChoices:
             features.reduction_numel, threshold
         )  # type: ignore[arg-types]
 
+    def should_benchmark_persistent_reduction(
+        self, features: SIMDKernelFeatures
+    ) -> bool:
+        """
+        Whether to compile a reduction both as a persistent and as a looped kernel,
+        benchmark them, and keep the faster one.
+
+        Holding a long row in registers lets a kernel that makes several passes over
+        it skip writing intermediates out and reading them back, at the cost of
+        occupancy. Which wins depends on the kernel and its shapes, so it is measured
+        rather than predicted, when the user has opted into autotuning.
+        """
+        if (
+            not (
+                config.max_autotune
+                or config.max_autotune_pointwise
+                or config.coordinate_descent_tuning
+                or config.triton.multi_kernel
+            )
+            # The two kernels reduce in different orders, and the pick depends on
+            # timing and on the row count.
+            or config.deterministic
+            or config.batch_invariant
+            or not config.triton.persistent_reductions
+        ):
+            return False
+        if (
+            features.get_reduction_hint() != ReductionHint.INNER
+            or features.strict_reduction_rblock() is not None
+        ):
+            return False
+        rnumel = V.graph.sizevars.simplify(features.reduction_numel)
+        # Up to 2048 the looped kernel's autotuning already covers the row in one
+        # block. Past 32768 a row doesn't fit in one CTA's registers.
+        if not (isinstance(rnumel, sympy.Integer) and 2048 < int(rnumel) <= 32768):
+            return False
+        if config.triton.multi_kernel and self.should_use_persistent_reduction(
+            features, False
+        ):
+            # MultiKernel already picks between the two at runtime, on real inputs.
+            return False
+        if torch.version.hip is not None:
+            return False
+        nodes = features.scheduler_nodes()
+        device = next(iter(nodes)).get_device() if nodes else None
+        return device is not None and device.type == "cuda"
+
     def _inner_reduction_no_split_threshold(
         self,
         props: DeviceProperties,

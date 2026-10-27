@@ -4917,8 +4917,25 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         ):
             # Lift loads whose address and mask are available outside the loop.
             return self.body
+        elif self._load_at_first_use:
+            return self.compute
         else:
             return self.loads
+
+    @functools.cached_property
+    def _load_at_first_use(self) -> bool:
+        # A persistent kernel over a long row holds a full row of every value it
+        # loads. Hoisting all loads to the top keeps them all live across every
+        # reduction in the kernel and spills; loading each one where it is first
+        # used keeps only what the current reduction needs.
+        return (
+            self.persistent_reduction
+            and not self.cooperative_reduction
+            and not self.mix_order_reduction
+            and V.graph.sizevars.statically_known_gt(
+                self.features.reduction_numel, 2048
+            )
+        )
 
     def _range_tree_mask_shape(self, mask: str) -> BlockShapeType:
         for tree in self.active_range_trees():
@@ -9170,12 +9187,14 @@ class TritonScheduling(SIMDScheduling):
         n_spills_threshold=8,
         node_names: OrderedSet[str] | None = None,
         skip_perf_cache: bool = False,
+        args: Sequence[Any] | None = None,
     ) -> tuple[float, str]:
         """Benchmark an already compiled module.
 
         skip_perf_cache: don't serve the result from the .kernel_perf memo. Callers that
         need the autotuned winner in mod.triton_.launchers (not just the timing) must set
         this, since a perf-cache hit returns before the autotuner ever runs.
+        args: inputs to time the kernel on; by default, fresh ones from mod.get_args().
         """
         device_interface = get_interface_for_device(V.graph.device_type)
         with (
@@ -9214,7 +9233,8 @@ class TritonScheduling(SIMDScheduling):
                 if ms is not None:
                     return ms, mod.__file__
 
-            args = mod.get_args()
+            if args is None:
+                args = mod.get_args()
             call = mod.call
             wrapped_jit_function = mod.triton_
             # call once to trigger the compilation
@@ -9265,6 +9285,70 @@ class TritonScheduling(SIMDScheduling):
             )
             store_cache()
             return ms, mod.__file__
+
+    def _benchmark_persistent_reduction(
+        self,
+        kernel_features: SIMDKernelFeatures,
+        tiling: dict[str, sympy.Expr],
+        kernel_kwargs: dict[str, Any],
+        config_patches: dict[str, Any],
+    ) -> bool | None:
+        """
+        If V.choices asks for it, compile this reduction as both a looped and a
+        persistent kernel and return whether the persistent one is faster.
+        """
+        if not V.choices.should_benchmark_persistent_reduction(kernel_features):
+            return None
+        forced: dict[str, Any] = {}
+        self.kernel_type.apply_feature_required_overrides(kernel_features, forced)
+        if forced or kernel_features.contains_op("scan"):
+            return None
+        node_names = OrderedSet(n.get_name() for n in kernel_features.scheduler_nodes())
+        modules = []
+        for persistent in (False, True):
+            kernel = self.create_kernel_choices(
+                kernel_features,
+                [tiling],
+                {**kernel_kwargs, "override_persistent_reduction": persistent},
+            )[0]
+            if kernel.cooperative_reduction:
+                return None
+            self.codegen_node_schedule_with_kernel(
+                kernel_features.node_schedule, kernel
+            )
+            with (
+                V.set_kernel_handler(kernel),
+                # Coordinate descent runs on the chosen kernel once it is regenerated.
+                config.patch(
+                    {
+                        **config_patches,
+                        "benchmark_kernel": True,
+                        "coordinate_descent_tuning": False,
+                    }
+                ),
+            ):
+                src_code = kernel.codegen_kernel()
+            src_code = src_code.replace(str(Placeholder.KERNEL_NAME), "triton_")
+            modules.append(PyCodeCache.load(src_code))
+        # Allocate both kernels' inputs before timing either. A kernel timed on
+        # memory that the previous benchmark just freed can come out much faster
+        # than it runs in steady state.
+        inputs = [mod.get_args() for mod in modules]
+        looped: list[float] = []
+        persistent_ms: list[float] = []
+        for repeat in range(2):
+            for mod, args, timings in zip(modules, inputs, (looped, persistent_ms)):
+                ms, _ = self.benchmark_codegened_module(
+                    mod, node_names=node_names, skip_perf_cache=repeat > 0, args=args
+                )
+                timings.append(ms)
+        log.debug(
+            "persistent vs looped reduction for %s: %s vs %s ms",
+            node_names,
+            persistent_ms,
+            looped,
+        )
+        return max(persistent_ms) < min(looped)
 
     def create_kernel_choices(  # type: ignore[override]
         self,
