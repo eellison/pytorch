@@ -2186,11 +2186,9 @@ class PythonWrapperCodegen(CodeGen):
         tuning_code_for_trace = (
             "# Autotune execution metadata:\n"
             "# defs config patch: "
-            f"autotune_queue_static_precompile={queue_enabled_for_defs}, "
-            "coordinate_descent_tuning_batch="
-            f"{config.coordinate_descent_tuning_batch and queue_enabled_for_defs}\n"
+            f"autotune_queue_static_precompile={queue_enabled_for_defs}\n"
             "# calls: run_kernel_autotune_calls computes eligible queue calls "
-            f"for {list(self.kernel_autotune_names)!r} and opens autotune_queue "
+            f"for {list(self.kernel_autotune_names)!r}; opens autotune_queue "
             f"only when expected_calls >= {self._autotune_queue_min_kernels()}\n"
             + tuning_code
         )
@@ -2219,9 +2217,6 @@ class PythonWrapperCodegen(CodeGen):
         try:
             with config.patch(
                 autotune_queue_static_precompile=queue_enabled_for_defs,
-                coordinate_descent_tuning_batch=(
-                    config.coordinate_descent_tuning_batch and queue_enabled_for_defs
-                ),
             ):
                 exec(defs_code, scope)
             self.run_kernel_autotune_calls(scope)

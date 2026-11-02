@@ -82,24 +82,6 @@ def _save_coordesc_winner_kernel(autotuner, winner, stream, save_kernel) -> None
         autotuner.save_gpu_kernel(stream, winner)
 
 
-def _run_scalar_coordesc_fallback(
-    autotuner, launcher, args, kwargs, stream, save_kernel
-) -> None:
-    device_idx = getattr(getattr(autotuner, "device_props", None), "index", None)
-    device_idx = device_idx if isinstance(device_idx, int) else None
-    with _device_guard(autotuner.get_device_interface(), device_idx):
-        winner = autotuner.coordinate_descent_tuning(
-            launcher,
-            *args,
-            use_batch_benchmarking=None,
-            clone_args=False,
-            **kwargs,
-        )
-    _save_coordesc_winner_kernel(autotuner, winner, stream, save_kernel)
-    autotuner.launchers = [winner]
-    autotuner._cached_launcher = None
-
-
 class _AutotuneQueueTaskBase:
     def _init_queue_task_state(
         self,
@@ -959,7 +941,6 @@ class _AutotuneQueue:
 
     def _add_task(self, task):
         if not self._prepare_for_live_bytes_budget(task.queue_bytes):
-            task.run_scalar()
             return False
 
         counters["inductor"]["autotune_queue_tasks"] += 1
@@ -992,14 +973,6 @@ class _AutotuneQueue:
 
         estimated_queue_bytes = _estimate_retained_arg_bytes(args, kwargs)
         if not self._prepare_for_live_bytes_budget(estimated_queue_bytes):
-            _run_scalar_coordesc_fallback(
-                autotuner,
-                launcher,
-                args,
-                kwargs,
-                stream,
-                save_kernel,
-            )
             return False
         self._drain_for_live_kernel_budget()
 

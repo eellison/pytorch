@@ -254,6 +254,9 @@ def apply_effective_coordinate_descent_queue_metadata(
 
     enabled = (
         config.autotune_queue
+        and not _requires_benchmark_arg_clones_from_metadata(
+            inductor_meta, triton_meta
+        )
         and _coordinate_descent_batch_enabled_for(
             inductor_meta,
             triton_meta,
@@ -267,6 +270,18 @@ def apply_effective_coordinate_descent_queue_metadata(
     else:
         inductor_meta.pop(_COORDESC_BATCH_EFFECTIVE_KEY, None)
     return enabled
+
+
+def _requires_benchmark_arg_clones_from_metadata(
+    inductor_meta: dict[str, Any], triton_meta: dict[str, Any]
+) -> bool:
+    return bool(
+        inductor_meta.get(
+            "mutated_input_arg_names", inductor_meta.get("mutated_arg_names")
+        )
+        or triton_meta.get("restore_value")
+        or triton_meta.get("reset_to_zero")
+    )
 
 
 def _static_autotune_config_count(kernel: Any) -> int:

@@ -945,6 +945,10 @@ class CachingAutotuner(KernelInterface):
         )
         return {
             **self.__dict__,
+            "_compile_result_coordesc_flags": tuple(
+                bool(getattr(result.config, "found_by_coordesc", False))
+                for result in self.compile_results
+            ),
             "lock": None,
             "_config_compile_submitter": None,
             "_static_config_compile_submitter": None,
@@ -952,7 +956,17 @@ class CachingAutotuner(KernelInterface):
         }
 
     def __setstate__(self, state: dict[str, Any]) -> None:
+        coordesc_flags = state.pop("_compile_result_coordesc_flags", None)
         self.__dict__.update(state)
+        if coordesc_flags is not None:
+            if len(coordesc_flags) != len(self.compile_results):
+                raise AssertionError(
+                    "coordinate-descent flags must match compile results"
+                )
+            for result, found_by_coordesc in zip(
+                self.compile_results, coordesc_flags
+            ):
+                result.config.found_by_coordesc = found_by_coordesc
         self.lock = threading.Lock()
 
     def get_device_interface(self):
@@ -1894,7 +1908,7 @@ class CachingAutotuner(KernelInterface):
         counters["inductor"]["autotune_queue_enqueue_ns"] += (
             time.time_ns() - enqueue_start_ns
         )
-        return self.launchers[0], task if task is not False else None
+        return self.launchers[0], task
 
     def _make_coordesc_launcher_for_config(self, config2launcher, config):
         with self.lock:
@@ -2364,12 +2378,7 @@ class CachingAutotuner(KernelInterface):
                     save_kernel=not benchmark_run,
                     **kwargs,
                 )
-                if deferred_coordesc_task is not None:
-                    deferred_autotune_task = deferred_coordesc_task
-                    self.launchers = [
-                        launcher,
-                    ]
-                else:
+                if deferred_coordesc_task is False:
                     self.launchers = [
                         self.coordinate_descent_tuning(
                             self.launchers[0],
@@ -2378,12 +2387,23 @@ class CachingAutotuner(KernelInterface):
                             **kwargs,
                         )
                     ]
+                else:
+                    if deferred_coordesc_task is None:
+                        raise AssertionError(
+                            "autotune queue enqueue must return a task or False"
+                        )
+                    deferred_autotune_task = deferred_coordesc_task
+                    self.launchers = [
+                        launcher,
+                    ]
             else:
                 self.launchers = [
                     self.coordinate_descent_tuning(
                         self.launchers[0],
                         *args,
-                        use_batch_benchmarking=None,
+                        use_batch_benchmarking=(
+                            self._coordinate_descent_batch_enabled()
+                        ),
                         **kwargs,
                     )
                 ]

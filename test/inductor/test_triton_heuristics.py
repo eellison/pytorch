@@ -2,6 +2,7 @@
 
 import functools
 import os
+import pickle
 import sys
 import tempfile
 import threading
@@ -200,7 +201,7 @@ class TestTritonHeuristics(TestCase):
         with self.assertRaisesRegex(AssertionError, "pre_hook"):
             CachingAutotuner(**args)
 
-    def test_coordinate_descent_batch_inactive_fallback_uses_scalar_benchmarking(
+    def test_coordinate_descent_batch_fallback_benchmark_modes(
         self,
     ):
         order = []
@@ -268,7 +269,40 @@ class TestTritonHeuristics(TestCase):
             [
                 ("prepare", True),
                 "recheck",
-                ("coordesc", False),
+                ("coordesc", True),
+                "pre",
+                ("launch", 17),
+                "post",
+            ],
+        )
+        autotuner._can_coordinate_descent_tune = lambda: True
+        launcher.config.found_by_coordesc = False
+        order.clear()
+
+        batch = SimpleNamespace(
+            disposable_args=True,
+            enqueue=lambda *args, **kwargs: False,
+        )
+        with (
+            patch(
+                "torch._inductor.runtime.triton_heuristics.get_active_autotune_queue",
+                return_value=batch,
+            ),
+            patch(
+                "torch._inductor.runtime.triton_heuristics.TritonBundler.put_winner"
+            ),
+            patch(
+                "torch._inductor.runtime.triton_heuristics.triton.set_allocator",
+                create=True,
+            ),
+        ):
+            autotuner.run("arg", stream=17)
+
+        self.assertEqual(
+            order,
+            [
+                ("prepare", False),
+                ("coordesc", None),
                 "pre",
                 ("launch", 17),
                 "post",
@@ -566,6 +600,29 @@ class TestTritonHeuristics(TestCase):
         self.assertIsNone(autotuner._config_compile_submitter)
         self.assertIsNone(autotuner._static_config_compile_submitter)
         self.assertIsNone(autotuner._static_triton_bundle_key)
+
+    def test_pickle_state_preserves_coordesc_cache_winner(self):
+        args = self._get_cos_kernel_caching_autotuner_args()
+        autotuner = CachingAutotuner(**args)
+        configs = args["configs"]
+        configs[0].found_by_coordesc = True
+        configs[1].found_by_coordesc = False
+        autotuner.compile_results = [
+            SimpleNamespace(config=config) for config in configs
+        ]
+
+        old_values = autotuner.prepare_for_pickle()
+        restored = pickle.loads(pickle.dumps(autotuner))
+        autotuner.restore_after_unpickle(old_values)
+
+        self.assertEqual(
+            [
+                result.config.found_by_coordesc
+                for result in restored.compile_results
+            ],
+            [True, False],
+        )
+        self.assertNotIn("_compile_result_coordesc_flags", restored.__dict__)
 
     def test_partial_precompile_skips_invalid_until_first_valid_config(self):
         bad_config = triton.Config({"XBLOCK": 1}, num_warps=4, num_stages=1)

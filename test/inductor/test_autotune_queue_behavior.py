@@ -21,6 +21,10 @@ from torch._inductor.runtime.autotune_queue import (
 from torch._inductor.runtime.hints import HeuristicType
 from torch._inductor.runtime.triton_heuristics import CachingAutotuner
 from torch._inductor.test_case import run_tests, TestCase
+from torch.testing._internal.common_utils import (
+    instantiate_parametrized_tests,
+    parametrize,
+)
 
 
 try:
@@ -31,6 +35,7 @@ except ImportError:
     raise unittest.SkipTest("requires triton")  # noqa: B904
 
 
+@instantiate_parametrized_tests
 class TestAutotuneQueueBehavior(TestCase):
     @staticmethod
     def _autotune_queue_patch(**overrides):
@@ -96,7 +101,7 @@ class TestAutotuneQueueBehavior(TestCase):
             queued = batch.enqueue(object(), object(), (), {}, None, False)
 
         self.assertFalse(queued)
-        self.assertEqual(calls, ["run_scalar"])
+        self.assertEqual(calls, [])
         self.assertEqual(batch.tasks, [])
 
     def test_live_bytes_budget_skips_before_task(self):
@@ -138,7 +143,7 @@ class TestAutotuneQueueBehavior(TestCase):
             )
 
         self.assertFalse(queued)
-        self.assertEqual(calls, ["scalar"])
+        self.assertEqual(calls, [])
         self.assertEqual(batch.tasks, [])
 
     def test_skips_tasks_requiring_arg_clones(self):
@@ -287,6 +292,37 @@ class TestAutotuneQueueBehavior(TestCase):
         self.assertEqual(
             inductor_meta["coordinate_descent_tuning_batch_policy"], "none"
         )
+
+    @parametrize(
+        "clone_metadata",
+        (
+            ({"mutated_input_arg_names": ["inp"]}, {}),
+            ({"mutated_arg_names": ["inp"]}, {}),
+            ({}, {"restore_value": ["inp"]}),
+            ({}, {"reset_to_zero": ["out"]}),
+        ),
+    )
+    def test_clone_required_kernel_uses_scalar_metadata(self, clone_metadata):
+        inductor_extra, triton_extra = clone_metadata
+        inductor_meta = {
+            "coordinate_descent_tuning": True,
+            "coordinate_descent_tuning_batch_requested": True,
+            "coordinate_descent_tuning_batch_policy": "all",
+            **inductor_extra,
+        }
+        triton_meta = {"device_type": "cuda", **triton_extra}
+
+        with config.patch({"autotune_queue": True, "compile_threads": 2}):
+            enabled = apply_effective_coordinate_descent_queue_metadata(
+                inductor_meta,
+                triton_meta,
+                HeuristicType.REDUCTION,
+                False,
+                keep_disabled=True,
+            )
+
+        self.assertFalse(enabled)
+        self.assertFalse(inductor_meta["coordinate_descent_tuning_batch"])
 
     def test_skips_when_compile_threads_one(self):
         counters.clear()
@@ -494,6 +530,65 @@ class TestAutotuneQueueBehavior(TestCase):
                 PythonWrapperCodegen.run_kernel_autotune_calls(wrapper, scope)
         autotune_queue.assert_not_called()
         self.assertEqual(scope["calls"], [False])
+
+    def test_compile_time_defs_preserve_batch_mode_below_queue_min(self):
+        from torch._inductor.codegen.wrapper import PythonWrapperCodegen
+        from torch._inductor.utils import IndentedBuffer
+        from torch._inductor.virtualized import V
+        from torch.utils._ordered_set import OrderedSet
+
+        wrapper = SimpleNamespace(
+            kernel_autotune_defs=IndentedBuffer(),
+            kernel_autotune_calls=IndentedBuffer(),
+            kernel_autotune_names=OrderedSet(["kernel0"]),
+        )
+        wrapper.kernel_autotune_defs.splice(
+            """
+            from torch._inductor import config as inductor_config
+            class AsyncCompile:
+                def wait(self, scope):
+                    pass
+            async_compile = AsyncCompile()
+            queue_enabled = inductor_config.autotune_queue
+            static_precompile = inductor_config.autotune_queue_static_precompile
+            observations = [(queue_enabled, static_precompile)]
+            """
+        )
+        wrapper._should_batch_kernel_autotune_calls = functools.partial(
+            PythonWrapperCodegen._should_batch_kernel_autotune_calls,
+            wrapper,
+        )
+        wrapper._autotune_queue_min_kernels = functools.partial(
+            PythonWrapperCodegen._autotune_queue_min_kernels,
+            wrapper,
+        )
+        wrapper._has_enough_autotune_kernels_for_queue = functools.partial(
+            PythonWrapperCodegen._has_enough_autotune_kernels_for_queue,
+            wrapper,
+        )
+        observations = []
+
+        def run_calls(scope):
+            observations.extend(scope["observations"])
+            observations.append(
+                (config.autotune_queue, config.autotune_queue_static_precompile)
+            )
+
+        wrapper.run_kernel_autotune_calls = run_calls
+
+        with (
+            V.set_graph_handler(SimpleNamespace(autotuning_inputs=[])),
+            config.patch(
+                {
+                    "autotune_queue": True,
+                    "autotune_queue_min_kernels": 2,
+                    "triton.autotune_at_compile_time": True,
+                }
+            ),
+        ):
+            PythonWrapperCodegen.generate_and_run_autotune_block(wrapper)
+
+        self.assertEqual(observations, [(True, False), (True, False)])
 
     def test_expected_autotune_queue_calls(self):
         class Launcher:
