@@ -4137,7 +4137,9 @@ class DeviceCachingAllocator {
         cudaStreamCaptureStatusNone;
   }
 
-  BlockPool& get_pool(size_t size, cudaStream_t stream) {
+  // Inlined: on the allocation fast path, and its common case (no allocation
+  // scope open) is a couple of instructions.
+  C10_ALWAYS_INLINE BlockPool& get_pool(size_t size, cudaStream_t stream) {
     // allocation_scopes_ tracks active mempool diversions (real captures or
     // user-managed pools via use_mem_pool / NCCL registration / inductor
     // warmup). When non-empty we route allocations into the matching private
