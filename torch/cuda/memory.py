@@ -1702,6 +1702,13 @@ class MemPool(_MemPool):
             to Out Of Memory. This is False by default.
         no_split(bool): a bool that indicates if this pool should not split a segment.
             This is False by default.
+        passthrough(bool): if True, allocations routed to this pool (by
+            :func:`use_mem_pool` or graph capture) bypass the caching
+            allocator: each one is requested from :attr:`allocator` (with
+            the caching allocator's size rounding) and returned to it when
+            the tensor is freed. ``record_stream`` calls on these tensors are forwarded
+            to :attr:`allocator`, which is responsible for deferring reuse.
+            Requires :attr:`allocator`. This is False by default.
     """
 
     def __init__(
@@ -1709,9 +1716,10 @@ class MemPool(_MemPool):
         allocator: _cuda_CUDAAllocator | None = None,
         use_on_oom: bool = False,
         no_split: bool = False,
+        passthrough: bool = False,
     ):
         # pyrefly: ignore [bad-argument-count]
-        super().__init__(allocator, True, use_on_oom, no_split)
+        super().__init__(allocator, True, use_on_oom, no_split, passthrough)
 
     @classmethod
     def from_py_allocator(
@@ -1721,6 +1729,7 @@ class MemPool(_MemPool):
         *,
         use_on_oom: bool = False,
         no_split: bool = False,
+        passthrough: bool = False,
     ) -> "MemPool":
         r"""Create a MemPool backed by Python allocation callbacks.
 
@@ -1741,12 +1750,17 @@ class MemPool(_MemPool):
                 cached blocks as a last resort. Defaults to ``False``.
             no_split: Whether the caching allocator should avoid splitting this
                 pool's segments. Defaults to ``False``.
+            passthrough: Whether each tensor allocation routed to this pool is
+                passed to ``alloc_fn`` / ``free_fn`` instead of being cached.
+                See :class:`MemPool`. Defaults to ``False``.
 
         See :ref:`cuda-memory-python-allocators` for callback requirements and
         examples.
         """
         allocator = torch._C._cuda_createPythonAllocator(alloc_fn, free_fn)
-        return cls(allocator, use_on_oom=use_on_oom, no_split=no_split)
+        return cls(
+            allocator, use_on_oom=use_on_oom, no_split=no_split, passthrough=passthrough
+        )
 
     @property
     def id(self) -> tuple[int, int]:

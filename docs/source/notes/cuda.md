@@ -1063,6 +1063,39 @@ mode. It may call allocation APIs such as `cudaMalloc` or CUDA virtual-memory
 APIs, but it must not launch work on or synchronize the capturing stream,
 synchronize the device, or begin or end capture.
 
+### Per-tensor allocation with `passthrough=True`
+
+By default, the allocator of a pool only provides segments, which the caching
+allocator splits and reuses. With `passthrough=True`, every tensor allocation
+routed to the pool (by {func}`torch.cuda.use_mem_pool` or CUDA graph capture)
+calls the allocator with the tensor's size, rounded up as the caching allocator
+does (to a multiple of 512 bytes by default), and freeing the tensor calls the free callback immediately, even after
+the scope has exited or the pool has been destroyed. This lets the allocator
+decide where each tensor lives, for example to place the tensors of a captured
+CUDA graph according to an offline memory plan.
+
+```python
+pool = torch.cuda.MemPool.from_py_allocator(alloc, free, passthrough=True)
+with torch.cuda.use_mem_pool(pool):
+    x = torch.empty(1024, device="cuda")  # alloc(4096, device, stream)
+del x  # free(ptr, 4096, device, stream)
+```
+
+The caching allocator keeps no state for these tensors, so:
+
+* they are not counted by {func}`torch.cuda.memory_stats` or shown in memory
+  snapshots;
+* an allocation the allocator cannot satisfy raises
+  {class}`torch.OutOfMemoryError` without releasing cached blocks and retrying;
+* the caching allocator does not delay frees for streams recorded with
+  {meth}`torch.Tensor.record_stream`. The call is forwarded to the pool's
+  allocator; Python-defined allocators do not receive it, and must not reuse
+  memory that another stream may still be using;
+* they cannot be shared with other processes.
+
+Allocations outside the pool's scope, including those of other threads, are
+not affected.
+
 
 ## Tuning NVLink Performance with Custom Memory Allocator on H100/H200 GPUs
 In rare cases, performance of NVLink on H100/H200 GPUs can be influenced by the physical memory
