@@ -333,6 +333,17 @@ inline CUDAAllocator* get() {
   return allocator.load();
 }
 
+// Runtime allocator swap: handlers the native caching allocator calls for
+// memory it does not own, so pointers / DataPtrs of a swapped-out allocator
+// keep reaching their owner. Only reached on what were error / skip paths:
+// raw_delete of an unknown pointer (returns true if handled, else the usual
+// "invalid device pointer" error) and recordStream of a foreign DataPtr.
+using ForeignRawDeleteFn = bool (*)(void* ptr);
+using ForeignRecordStreamFn = void (*)(const DataPtr& ptr, CUDAStream stream);
+C10_CUDA_API void setForeignPtrHandlers(
+    ForeignRawDeleteFn raw_delete,
+    ForeignRecordStreamFn record_stream);
+
 // Called directly by clients.
 inline void* raw_alloc(size_t nbytes) {
   return get()->raw_alloc(nbytes);

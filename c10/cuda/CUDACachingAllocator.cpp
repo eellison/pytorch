@@ -4519,6 +4519,12 @@ static void uncached_delete(void* ptr) {
 }
 
 static void local_raw_delete(void* ptr);
+// see setForeignPtrHandlers. Kept in .data (not .bss) so that adding them does not shift the placement of the
+// allocator's hot static state (Native::allocator), which measurably changes the hot path's speed.
+__attribute__((section(".data"))) static std::atomic<ForeignRawDeleteFn>
+    foreign_raw_delete{nullptr};
+__attribute__((section(".data"))) static std::atomic<ForeignRecordStreamFn>
+    foreign_record_stream{nullptr};
 // NOLINTBEGIN(misc-use-internal-linkage)
 thread_local std::stack<std::string> DeviceCachingAllocator::compile_context;
 thread_local std::string DeviceCachingAllocator::user_metadata;
@@ -4655,6 +4661,10 @@ class NativeCachingAllocator : public CUDAAllocator {
     }
     Block* block = get_allocated_block(ptr, true /* remove */);
     if (!block) {
+      auto foreign = foreign_raw_delete.load(std::memory_order_acquire);
+      if (foreign && foreign(ptr)) {
+        return;
+      }
       TORCH_CHECK(false, "invalid device pointer: ", ptr);
     }
     const c10::impl::PyInterpreter* interp = c10::impl::GPUTrace::get_trace();
@@ -4858,8 +4868,13 @@ class NativeCachingAllocator : public CUDAAllocator {
     // we have implemented reference counting based sharing mechanism to
     // guarantee tensors won't be accidentally freed by one process while
     // they are still being used in another
-    if (ptr.get_deleter() != &local_raw_delete)
+    if (ptr.get_deleter() != &local_raw_delete) {
+      auto foreign = foreign_record_stream.load(std::memory_order_acquire);
+      if (foreign) {
+        foreign(ptr, stream);
+      }
       return;
+    }
 
     Block* block = get_allocated_block(ptr.get());
     // block must not be null reaching here
@@ -5322,6 +5337,13 @@ void local_raw_delete(void* ptr) {
 }
 
 } // namespace Native
+
+void setForeignPtrHandlers(
+    ForeignRawDeleteFn raw_delete,
+    ForeignRecordStreamFn record_stream) {
+  Native::foreign_raw_delete.store(raw_delete, std::memory_order_release);
+  Native::foreign_record_stream.store(record_stream, std::memory_order_release);
+}
 
 namespace CudaMallocAsync {
 // If this is put in its own header file, it gets incorrectly renamed in HIPify.

@@ -61,6 +61,7 @@ __all__ = [
     "get_allocator_backend",
     "CUDAPluggableAllocator",
     "change_current_allocator",
+    "swap_current_allocator",
     "MemPool",
     "use_mem_pool",
 ]
@@ -1354,6 +1355,19 @@ def change_current_allocator(allocator: _CUDAAllocator) -> None:
         See :ref:`cuda-memory-management` for details on creating and using a custom allocator
     """
     torch._C._cuda_changeCurrentAllocator(allocator.allocator())
+
+
+def swap_current_allocator(allocator: _CUDAAllocator | None) -> None:
+    r"""Make ``allocator`` the current CUDA allocator, also after CUDA is initialized.
+
+    ``allocator`` must be a :class:`CUDAPluggableAllocator`; ``None`` restores the native caching
+    allocator. Not allowed during a CUDA graph capture. Tensors keep freeing into the allocator that
+    created them, and graphs release their pools into the allocator that was current at capture
+    begin, also after a later swap. A swapped-in allocator is kept alive for the rest of the process.
+    """
+    torch._C._cuda_swapCurrentAllocator(
+        None if allocator is None else allocator.allocator()
+    )
 
 
 def _get_current_allocator() -> _CUDAAllocator:

@@ -38,9 +38,8 @@ TORCH_CUDA_CPP_API MempoolId_t graph_pool_handle();
 // event-query capture-mode fix (https://github.com/ROCm/rocm-systems/pull/3176).
 // Not needed on CUDA/NVIDIA where cross-thread event query does not have this
 // restriction.
-#if defined(USE_ROCM)
+// Also used by the runtime allocator swap (CUDAPluggableAllocator.cpp).
 TORCH_CUDA_CPP_API bool is_graph_capture_active();
-#endif // defined(USE_ROCM)
 
 struct CUDAGraph;
 
@@ -164,6 +163,14 @@ struct TORCH_CUDA_CPP_API CUDAGraph {
   // know you'll replay those graphs in the same order you captured them.
   MempoolId_t mempool_id_;
   std::vector<MempoolId_t> retained_mempool_ids_;
+
+  // The CUDA allocator that was current at capture_begin; it owns mempool_id_ and the retained pools.
+  // (Runtime allocator swap: the current allocator may change before capture_end / reset.)
+  c10::cuda::CUDACachingAllocator::CUDAAllocator* capture_allocator_ = nullptr;
+  c10::cuda::CUDACachingAllocator::CUDAAllocator* pool_allocator() const {
+    return capture_allocator_ ? capture_allocator_
+                              : c10::cuda::CUDACachingAllocator::get();
+  }
 
   // Stream on which capture began
   at::cuda::CUDAStream capture_stream_;

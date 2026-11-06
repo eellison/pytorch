@@ -23,7 +23,6 @@ static std::mutex _currently_capturing_graphs_mutex;
 static ska::flat_hash_map<CaptureId_t, CUDAGraph*> _currently_capturing_graphs;
 
 
-#if defined(USE_ROCM)
 // Returns true when at least one CUDAGraph capture is currently active in this
 // process. Uses the same mutex-protected capture map as capture lifecycle
 // bookkeeping.
@@ -31,7 +30,6 @@ bool is_graph_capture_active() {
   std::unique_lock<std::mutex> lock(_currently_capturing_graphs_mutex);
   return !_currently_capturing_graphs.empty();
 }
-#endif // defined(USE_ROCM)
 
 CUDAGraph* get_graph_from_capture_id(CaptureId_t capture_id) {
   std::lock_guard<std::mutex> lock(_currently_capturing_graphs_mutex);
@@ -105,7 +103,7 @@ void CUDAGraph::retain_pool(MempoolId_t pool) {
   if (has_retained_pool(pool)) {
     return;
   }
-  c10::cuda::CUDACachingAllocator::createOrIncrefPool(capture_dev_, pool);
+  pool_allocator()->createOrIncrefPool(capture_dev_, pool);
   record_retained_pool(pool);
 }
 
@@ -167,10 +165,14 @@ void CUDAGraph::capture_begin(MempoolId_t pool/*={0,0}*/, cudaStreamCaptureMode 
     TORCH_INTERNAL_ASSERT(mempool_id_.first > 0);
   }
 
+  // The allocator current at capture_begin owns this capture's pool: every later pool call of this graph
+  // (capture_end, reset, retain_pool) goes to it, even if the current allocator was swapped meanwhile.
+  capture_allocator_ = c10::cuda::CUDACachingAllocator::get();
+
   // Addendum: beginAllocateStreamToPool is now called before cudaStreamBeginCapture to prevent an
   // autograd thread's free() call triggering an invalid cudaEventRecord in the caching allocator
   // due to the capture status being updated _after_ a capture had already started.
-  c10::cuda::CUDACachingAllocator::beginAllocateToPool(
+  pool_allocator()->beginAllocateToPool(
       capture_dev_, mempool_id_, create_allocate_filter<cudaStream_t>());
   record_retained_pool(mempool_id_);
 
@@ -185,7 +187,7 @@ void CUDAGraph::capture_begin(MempoolId_t pool/*={0,0}*/, cudaStreamCaptureMode 
   // prevent potentially unsafe CUDA API calls during capture.  See
   // https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__STREAM.html#group__CUDART__STREAM_1g9d0535d93a214cbf126835257b16ba85
   AT_CUDA_CHECK(cudaStreamBeginCapture(capture_stream_, capture_mode));
-  c10::cuda::CUDACachingAllocator::markCaptureBegin(capture_dev_);
+  pool_allocator()->markCaptureBegin(capture_dev_);
 
   auto capture_id_opt = c10::cuda::captureIdMayInitCtx(stream);
   TORCH_INTERNAL_ASSERT(capture_id_opt.has_value(),
@@ -215,7 +217,7 @@ void CUDAGraph::capture_end_pre() {
   // Clear bookkeeping before propagating the return status so watchdog-side
   // checks cannot observe stale "capture active" state on error paths.
   cudaError_t endCaptureErr = cudaStreamEndCapture(capture_stream_, &graph_);
-  c10::cuda::CUDACachingAllocator::markCaptureEnd(capture_dev_);
+  pool_allocator()->markCaptureEnd(capture_dev_);
   {
     std::unique_lock<std::mutex> lock(_currently_capturing_graphs_mutex);
     TORCH_CHECK(
@@ -229,7 +231,7 @@ void CUDAGraph::capture_end_pre() {
   // (e.g. due to an illegal operation during capture). These calls are
   // safe regardless of whether the capture succeeded — they simply
   // remove the pool routing entry added by beginAllocateToPool.
-  c10::cuda::CUDACachingAllocator::endAllocateToPool(capture_dev_, mempool_id_);
+  pool_allocator()->endAllocateToPool(capture_dev_, mempool_id_);
   at::getHostAllocator(at::kCUDA)->end_allocate_to_pool(mempool_id_);
   // Allocation recording has stopped (even if endCaptureErr is a failure), so
   // reset() must not end the pool again.
@@ -378,7 +380,7 @@ void CUDAGraph::reset() {
       // Capture was abandoned before capture_end() ran, so the allocator is
       // still routing allocations to this pool. Stop that before releasing so
       // the pool is left in a consistent, freeable state.
-      c10::cuda::CUDACachingAllocator::endAllocateToPool(capture_dev_, mempool_id_);
+      pool_allocator()->endAllocateToPool(capture_dev_, mempool_id_);
       at::getHostAllocator(at::kCUDA)->end_allocate_to_pool(mempool_id_);
       capturing_to_pool_ = false;
     }
@@ -389,7 +391,7 @@ void CUDAGraph::reset() {
 
     // notifyCaptureDestroy may throw. How should we handle this?
     for (const auto& pool : retained_mempool_ids_) {
-      c10::cuda::CUDACachingAllocator::releasePool(capture_dev_, pool);
+      pool_allocator()->releasePool(capture_dev_, pool);
     }
     retained_mempool_ids_.clear();
     at::getHostAllocator(at::kCUDA)->release_pool(mempool_id_);
@@ -569,9 +571,9 @@ getCurrentCUDAStream(), &cond_node, nullptr, 1, cudaStreamSetCaptureDependencies
   conditional_graph_capture_ids_.push(0);
   conditional_node_handles_.push(handle);
 
-  c10::cuda::CUDACachingAllocator::endAllocateToPool(capture_dev_, mempool_id_);
+  pool_allocator()->endAllocateToPool(capture_dev_, mempool_id_);
   at::getHostAllocator(at::kCUDA)->end_allocate_to_pool(mempool_id_);
-  c10::cuda::CUDACachingAllocator::beginAllocateToPool(
+  pool_allocator()->beginAllocateToPool(
       capture_dev_, mempool_id_, create_child_allocate_filter());
   auto filter = create_child_allocate_filter();
   at::getHostAllocator(at::kCUDA)->begin_allocate_to_pool(mempool_id_, [filter](c10::Stream stream) {
@@ -585,7 +587,7 @@ getCurrentCUDAStream(), &cond_node, nullptr, 1, cudaStreamSetCaptureDependencies
       nullptr,
       0,
       capture_mode_));
-  c10::cuda::CUDACachingAllocator::markCaptureBegin(capture_dev_);
+  pool_allocator()->markCaptureBegin(capture_dev_);
 
   auto child_capture_id_opt = c10::cuda::captureIdMayInitCtx(child_stream);
   TORCH_INTERNAL_ASSERT(child_capture_id_opt.has_value(),
@@ -628,9 +630,9 @@ void CUDAGraph::end_capture_to_conditional_node() {
 
   CUDAStream stream = conditional_node_streams_.top().current_stream();
   AT_CUDA_CHECK(cudaStreamEndCapture(stream.stream(), nullptr));
-  c10::cuda::CUDACachingAllocator::markCaptureEnd(capture_dev_);
+  pool_allocator()->markCaptureEnd(capture_dev_);
 
-  c10::cuda::CUDACachingAllocator::endAllocateToPool(capture_dev_, mempool_id_);
+  pool_allocator()->endAllocateToPool(capture_dev_, mempool_id_);
   at::getHostAllocator(at::kCUDA)->end_allocate_to_pool(mempool_id_);
 
   conditional_node_streams_.pop();
@@ -641,11 +643,11 @@ void CUDAGraph::end_capture_to_conditional_node() {
   conditional_node_raw_streams_.pop();
 
   if (conditional_graph_capture_ids_.empty()) {
-    c10::cuda::CUDACachingAllocator::beginAllocateToPool(
+    pool_allocator()->beginAllocateToPool(
         capture_dev_, mempool_id_, create_allocate_filter<cudaStream_t>());
     at::getHostAllocator(at::kCUDA)->begin_allocate_to_pool(mempool_id_, create_allocate_filter<c10::Stream>());
   } else {
-    c10::cuda::CUDACachingAllocator::beginAllocateToPool(
+    pool_allocator()->beginAllocateToPool(
         capture_dev_, mempool_id_, create_child_allocate_filter());
     auto filter = create_child_allocate_filter();
     at::getHostAllocator(at::kCUDA)->begin_allocate_to_pool(mempool_id_, [filter](c10::Stream stream) {

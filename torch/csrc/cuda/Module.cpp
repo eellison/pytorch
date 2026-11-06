@@ -1338,6 +1338,13 @@ static void registerCudaPluggableAllocator(PyObject* module) {
              allocator) {
         torch::cuda::CUDAPluggableAllocator::changeCurrentAllocator(allocator);
       });
+  m.def("_cuda_swapCurrentAllocator", [](const py::object& allocator) {
+    torch::cuda::CUDAPluggableAllocator::swapCurrentAllocator(
+        allocator.is_none()
+            ? nullptr
+            : allocator.cast<std::shared_ptr<
+                  c10::cuda::CUDACachingAllocator::CUDAAllocator>>());
+  });
   py::class_<
       torch::cuda::CUDAPluggableAllocator::CUDAPluggableAllocator,
       c10::cuda::CUDACachingAllocator::CUDAAllocator,

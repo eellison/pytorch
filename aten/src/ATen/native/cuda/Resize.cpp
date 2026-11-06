@@ -19,6 +19,13 @@ void resize_bytes_cuda(StorageImpl* storage, size_t size_bytes) {
   TORCH_CHECK(storage->resizable(), "Trying to resize storage that is not resizable");
   auto allocator = storage->allocator();
   TORCH_CHECK(allocator != nullptr, "Trying to resize storage without an allocator");
+  // Runtime allocator swap: a storage created by a CUDA allocator that is no longer current re-allocates from
+  // the current one (e.g. FSDP2's unsharded-parameter storages, created eagerly and resized inside a capture).
+  if (C10_UNLIKELY(allocator != c10::cuda::CUDACachingAllocator::get()) && size_bytes != 0 &&
+      dynamic_cast<c10::cuda::CUDACachingAllocator::CUDAAllocator*>(allocator)) {
+    allocator = c10::cuda::CUDACachingAllocator::get();
+    storage->set_allocator(allocator);
+  }
 
   c10::Device device = storage->device();
 

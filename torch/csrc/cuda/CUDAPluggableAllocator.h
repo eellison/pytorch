@@ -22,6 +22,19 @@ createCustomAllocator(
 TORCH_CUDA_CPP_API void changeCurrentAllocator(
     const std::shared_ptr<c10::cuda::CUDACachingAllocator::CUDAAllocator>&
         allocator);
+// Runtime swap: make `allocator` (a CUDAPluggableAllocator, or nullptr for the
+// native caching allocator) the current CUDA allocator, also after CUDA / the
+// native allocator is initialized. Not allowed while a CUDA graph capture is
+// in progress. Swapped-in allocators are kept alive for the process lifetime:
+// their tensors free into them (also after swap-back), raw_delete and
+// recordStream of their pointers reach them, and graphs captured with them
+// release their pools into them. While swapped in at runtime, the pluggable
+// allocator forwards markCaptureBegin/End, emptyCache() and recordStream of
+// native DataPtrs to the native allocator, so native blocks stay
+// capture-safe.
+TORCH_CUDA_CPP_API void swapCurrentAllocator(
+    const std::shared_ptr<c10::cuda::CUDACachingAllocator::CUDAAllocator>&
+        allocator);
 
 struct _AllocationMetadata {
   _AllocationMetadata();
@@ -146,6 +159,13 @@ struct TORCH_CUDA_CPP_API CUDAPluggableAllocator
       bool p2p_enabled) override;
   std::string name() override;
   void copy_data(void* dest, const void* src, std::size_t count) const final;
+  void markCaptureBegin(c10::DeviceIndex device) override;
+  void markCaptureEnd(c10::DeviceIndex device) override;
+  // true if ptr was allocated here and not yet freed
+  bool owns(void* ptr);
+  // set by swapCurrentAllocator: forward capture marks / emptyCache / native
+  // recordStream to this native allocator
+  c10::cuda::CUDACachingAllocator::CUDAAllocator* forward_native_ = nullptr;
 
  protected:
   std::function<void*(size_t, int, cudaStream_t)> alloc_fn_;

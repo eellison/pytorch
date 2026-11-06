@@ -1,7 +1,13 @@
+#include <ATen/cuda/CUDAGraph.h>
+#include <c10/core/Allocator.h>
 #include <c10/cuda/CUDACachingAllocator.h>
+#include <c10/cuda/CUDAFunctions.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <algorithm>
+#include <limits>
 #include <mutex>
 #include <utility>
+#include <vector>
 
 #include <torch/csrc/cuda/CUDAPluggableAllocator.h>
 
@@ -10,6 +16,27 @@ namespace torch::cuda::CUDAPluggableAllocator {
 int device_count = 0;
 
 void custom_raw_deleter(void* ptr);
+
+// Runtime swap state (guarded by registry_mutex): the native allocator, and
+// every pluggable allocator that was ever current (kept alive; owner lookup).
+std::mutex registry_mutex;
+c10::cuda::CUDACachingAllocator::CUDAAllocator* native_allocator = nullptr;
+std::vector<std::shared_ptr<CUDAPluggableAllocator>> installed_allocators;
+extern std::shared_ptr<c10::cuda::CUDACachingAllocator::CUDAAllocator>
+    current_custom_allocator;
+
+// the installed pluggable allocator that allocated ptr (other than skip)
+CUDAPluggableAllocator* find_owner(
+    void* ptr,
+    CUDAPluggableAllocator* skip = nullptr) {
+  const std::lock_guard<std::mutex> lock(registry_mutex);
+  for (auto& a : installed_allocators) {
+    if (a.get() != skip && a->owns(ptr)) {
+      return a.get();
+    }
+  }
+  return nullptr;
+}
 
 _AllocationMetadata::_AllocationMetadata() : size(0), device_idx(-1) {}
 
@@ -126,10 +153,18 @@ void CUDAPluggableAllocator::raw_delete(void* ptr) {
   c10::DeviceIndex device_idx = -1;
   size_t size = 0;
   {
-    const std::lock_guard<std::mutex> lock(allocator_mutex_);
-    TORCH_CHECK(
-        allocation_metadata_.count(ptr),
-        "Trying to free a pointer not allocated here");
+    std::unique_lock<std::mutex> lock(allocator_mutex_);
+    if (!allocation_metadata_.count(ptr)) {
+      lock.unlock();
+      // runtime swap: another installed pluggable allocator's pointer, or
+      // (while swapped in) a native allocator pointer
+      if (auto* owner = find_owner(ptr, this)) {
+        return owner->raw_delete(ptr);
+      }
+      TORCH_CHECK(
+          forward_native_, "Trying to free a pointer not allocated here");
+      return forward_native_->raw_delete(ptr);
+    }
     _AllocationMetadata& metadata = allocation_metadata_[ptr];
     size = metadata.size;
     device_idx = metadata.device_idx;
@@ -175,7 +210,10 @@ CUDAPluggableAllocator::getExpandableSegmentSizes(c10::DeviceIndex device) {
 void CUDAPluggableAllocator::emptyCache(
     /*unused*/ c10::cuda::MempoolId_t mempool_id) {
   if (reset_fn_) {
-    return reset_fn_();
+    reset_fn_();
+  }
+  if (forward_native_ && mempool_id.first == 0 && mempool_id.second == 0) {
+    forward_native_->emptyCache(mempool_id);
   }
 }
 
@@ -199,9 +237,36 @@ void* CUDAPluggableAllocator::getBaseAllocation(void* ptr, size_t* size) {
 void CUDAPluggableAllocator::recordStream(
     const c10::DataPtr& ptr,
     c10::cuda::CUDAStream stream) {
-  if (record_stream_fn_) {
-    record_stream_fn_(ptr.get(), stream);
+  // runtime swap: route by the DataPtr's owner
+  if (forward_native_ && ptr.get_deleter() == forward_native_->raw_deleter()) {
+    return forward_native_->recordStream(ptr, stream);
   }
+  CUDAPluggableAllocator* owner = this;
+  if (ptr.get_deleter() == &custom_raw_deleter && !owns(ptr.get())) {
+    if (auto* o = find_owner(ptr.get(), this)) {
+      owner = o;
+    }
+  }
+  if (owner->record_stream_fn_) {
+    owner->record_stream_fn_(ptr.get(), stream);
+  }
+}
+
+void CUDAPluggableAllocator::markCaptureBegin(c10::DeviceIndex device) {
+  if (forward_native_) {
+    forward_native_->markCaptureBegin(device);
+  }
+}
+
+void CUDAPluggableAllocator::markCaptureEnd(c10::DeviceIndex device) {
+  if (forward_native_) {
+    forward_native_->markCaptureEnd(device);
+  }
+}
+
+bool CUDAPluggableAllocator::owns(void* ptr) {
+  const std::lock_guard<std::mutex> lock(allocator_mutex_);
+  return allocation_metadata_.count(ptr) != 0;
 }
 
 c10::CachingDeviceAllocator::DeviceStats CUDAPluggableAllocator::getDeviceStats(
@@ -388,18 +453,110 @@ createCustomAllocator(
   return allocator;
 }
 
+// registry_mutex held: remember the native allocator, keep current_custom_allocator alive / findable
+static void remember_current_locked() {
+  if (!native_allocator && !current_custom_allocator) {
+    native_allocator = c10::cuda::CUDACachingAllocator::allocator.load();
+  }
+  auto p =
+      std::dynamic_pointer_cast<CUDAPluggableAllocator>(current_custom_allocator);
+  if (p &&
+      std::find(installed_allocators.begin(), installed_allocators.end(), p) ==
+          installed_allocators.end()) {
+    installed_allocators.push_back(p);
+  }
+}
+
 void changeCurrentAllocator(
     const std::shared_ptr<c10::cuda::CUDACachingAllocator::CUDAAllocator>&
         allocator) {
   TORCH_CHECK(
       !c10::cuda::CUDACachingAllocator::allocator.load()->initialized(),
       "Can't swap an already initialized allocator");
+  const std::lock_guard<std::mutex> lock(registry_mutex);
+  remember_current_locked();
   c10::cuda::CUDACachingAllocator::allocator.store(allocator.get());
   current_custom_allocator = allocator;
+  remember_current_locked();
+}
+
+// called by the native allocator for pointers / DataPtrs it does not own
+static bool foreign_raw_delete(void* ptr) {
+  auto* owner = find_owner(ptr);
+  if (!owner) {
+    return false;
+  }
+  owner->raw_delete(ptr);
+  return true;
+}
+
+static void foreign_record_stream(
+    const c10::DataPtr& ptr,
+    c10::cuda::CUDAStream stream) {
+  if (ptr.get_deleter() != &custom_raw_deleter) {
+    return;
+  }
+  if (auto* owner = find_owner(ptr.get())) {
+    owner->recordStream(ptr, stream);
+  }
+}
+
+void swapCurrentAllocator(
+    const std::shared_ptr<c10::cuda::CUDACachingAllocator::CUDAAllocator>&
+        allocator) {
+  TORCH_CHECK(
+      !at::cuda::is_graph_capture_active(),
+      "Can't swap the CUDA allocator while a CUDA graph capture is in progress");
+  const std::lock_guard<std::mutex> lock(registry_mutex);
+  remember_current_locked();
+  TORCH_CHECK(native_allocator, "swapCurrentAllocator: no native allocator");
+  c10::cuda::CUDACachingAllocator::CUDAAllocator* target = nullptr;
+  if (allocator) {
+    auto p = std::dynamic_pointer_cast<CUDAPluggableAllocator>(allocator);
+    TORCH_CHECK(
+        p,
+        "swapCurrentAllocator expects a CUDAPluggableAllocator (or None for the native allocator)");
+    if (!p->initialized()) {
+      p->init(c10::cuda::device_count());
+    }
+    if (native_allocator->initialized()) {
+      p->forward_native_ = native_allocator;
+    }
+    target = p.get();
+  } else {
+    if (!native_allocator->initialized()) {
+      native_allocator->init(c10::cuda::device_count());
+    }
+    target = native_allocator;
+  }
+  static const bool handlers_set = [] {
+    c10::cuda::CUDACachingAllocator::setForeignPtrHandlers(
+        &foreign_raw_delete, &foreign_record_stream);
+    return true;
+  }();
+  (void)handlers_set;
+  c10::cuda::CUDACachingAllocator::allocator.store(target);
+  // c10::GetAllocator(kCUDA) / getDeviceAllocator(kCUDA) users (e.g.
+  // torch.UntypedStorage(n, device="cuda")) follow the swap too
+  c10::SetAllocator(
+      c10::DeviceType::CUDA, target, std::numeric_limits<uint8_t>::max());
+  current_custom_allocator = allocator;
+  remember_current_locked();
 }
 
 void custom_raw_deleter(void* ptr) {
-  current_custom_allocator->raw_delete(ptr);
+  CUDAPluggableAllocator* owner = find_owner(ptr);
+  if (owner) {
+    return owner->raw_delete(ptr);
+  }
+  // an allocator used without being installed (stock behaviour)
+  std::shared_ptr<c10::cuda::CUDACachingAllocator::CUDAAllocator> cur;
+  {
+    const std::lock_guard<std::mutex> lock(registry_mutex);
+    cur = current_custom_allocator;
+  }
+  TORCH_CHECK(cur, "CUDAPluggableAllocator: freeing an unknown pointer");
+  cur->raw_delete(ptr);
 }
 
 } // namespace torch::cuda::CUDAPluggableAllocator
