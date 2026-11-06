@@ -19,8 +19,12 @@ MemPool::MemPool(
     std::shared_ptr<CUDACachingAllocator::CUDAAllocator> allocator,
     bool is_user_created,
     bool use_on_oom,
-    bool no_split)
+    bool no_split,
+    bool passthrough)
     : is_user_created_(is_user_created) {
+  TORCH_CHECK(
+      !passthrough || allocator,
+      "MemPool(passthrough=True) requires a custom allocator");
   if (is_user_created_) {
     id_ = {0, uid_++};
   } else {
@@ -34,6 +38,9 @@ MemPool::MemPool(
   }
   if (no_split) {
     CUDACachingAllocator::setNoSplit(device_, id_);
+  }
+  if (passthrough) {
+    CUDACachingAllocator::setPassthrough(device_, id_);
   }
 }
 

@@ -1380,6 +1380,14 @@ class MemPool(_MemPool):
             to Out Of Memory. This is False by default.
         no_split(bool): a bool that indicates if this pool should not split a segment.
             This is False by default.
+        passthrough(bool): if True, the caching allocator neither carves nor
+            caches memory of this pool: every allocation routed to the pool is
+            requested from :attr:`allocator` at its rounded size (512 B
+            multiple), and is returned to :attr:`allocator` as soon as the
+            caching allocator would have made it reusable (at free, or once
+            its ``record_stream`` uses are complete). ``record_stream`` calls
+            on the pool's tensors are forwarded to :attr:`allocator`.
+            Requires :attr:`allocator`. This is False by default.
     """
 
     def __init__(
@@ -1387,9 +1395,10 @@ class MemPool(_MemPool):
         allocator: _cuda_CUDAAllocator | None = None,
         use_on_oom: bool = False,
         no_split: bool = False,
+        passthrough: bool = False,
     ):
         # pyrefly: ignore [bad-argument-count]
-        super().__init__(allocator, True, use_on_oom, no_split)
+        super().__init__(allocator, True, use_on_oom, no_split, passthrough)
 
     @property
     def id(self) -> tuple[int, int]:

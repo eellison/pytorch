@@ -198,6 +198,18 @@ class CUDAAllocator : public DeviceAllocator {
         " does not yet support setNoSplit. "
         "If you need it, please file an issue describing your use case.");
   }
+  // Pass-through pool: every allocation routed to the pool is its own segment
+  // of exactly the (rounded) request size from the pool's allocator, and every
+  // free returns it to that allocator (no carving, caching or reuse).
+  virtual void setPassthrough(
+      c10::DeviceIndex device,
+      MempoolId_t mempool_id) {
+    TORCH_CHECK(
+        false,
+        name(),
+        " does not yet support setPassthrough. "
+        "If you need it, please file an issue describing your use case.");
+  }
 
   // returns true if the allocated blocks are equal to expected live allocations
   virtual bool checkPoolLiveAllocations(
@@ -516,6 +528,9 @@ inline void setUseOnOOM(
 }
 inline void setNoSplit(c10::DeviceIndex device, MempoolId_t mempool_id) {
   get()->setNoSplit(device, mempool_id);
+}
+inline void setPassthrough(c10::DeviceIndex device, MempoolId_t mempool_id) {
+  get()->setPassthrough(device, mempool_id);
 }
 inline int getPoolUseCount(c10::DeviceIndex device, MempoolId_t mempool_id) {
   return get()->getPoolUseCount(device, mempool_id);

@@ -1310,7 +1310,8 @@ PrivatePoolState::PrivatePoolState(
 
 cudaError_t allocPrimitive(void** ptr, size_t size, AllocParams& p) {
   if (p.pool->owner_PrivatePool && p.pool->owner_PrivatePool->allocator()) {
-    *ptr = p.pool->owner_PrivatePool->allocator()->raw_alloc(size);
+    *ptr = p.pool->owner_PrivatePool->allocator()->raw_alloc_with_stream(
+        size, p.stream());
     return *ptr ? cudaSuccess : cudaErrorMemoryAllocation;
   } else {
     return C10_CUDA_ERROR_HANDLED(cudaMalloc(ptr, size));
@@ -1455,6 +1456,10 @@ class DeviceCachingAllocator {
 
   // tracks which pools should not split a segment
   ska::flat_hash_set<MempoolId_t, MempoolIdHash> no_split_pools;
+
+  // pass-through pools (MemPool(passthrough=True)): no carving, caching or
+  // reuse; each allocation is one segment of the pool's allocator
+  ska::flat_hash_set<MempoolId_t, MempoolIdHash> passthrough_pools;
 
   // Map of blocks whose freeing is deferred until after CUDA graph capture.
   //   - Key: Block* to be freed.
@@ -1729,7 +1734,9 @@ class DeviceCachingAllocator {
 
     size_t size = round_size(orig_size);
     auto& pool = get_pool(size, stream);
-    const size_t alloc_size = get_allocation_size(size);
+    const bool passthrough = is_passthrough(pool);
+    // pass-through: ask the pool's allocator for exactly the rounded size
+    const size_t alloc_size = passthrough ? size : get_allocation_size(size);
     bool active_user_pool =
         pool.owner_PrivatePool && pool.owner_PrivatePool->allocator();
     // The expandable segments are only active on the default pool.
@@ -1744,12 +1751,15 @@ class DeviceCachingAllocator {
         is_expandable_segments_active);
     params.stat_types = get_stat_types_for_pool(pool);
 
-    // First, try to get a block from the existing pool.
-    bool block_found =
-        // Search pool
-        get_free_block(params)
-        // Trigger callbacks and retry search
-        || (trigger_free_memory_callbacks(params) && get_free_block(params));
+    // First, try to get a block from the existing pool (a pass-through pool
+    // caches nothing).
+    bool block_found = !passthrough &&
+        (
+            // Search pool
+            get_free_block(params)
+            // Trigger callbacks and retry search
+            || (trigger_free_memory_callbacks(params) &&
+                get_free_block(params)));
 
     // Can't reuse an existing block; try to get a new one.
     if (!block_found) {
@@ -2535,6 +2545,13 @@ class DeviceCachingAllocator {
     if (C10_UNLIKELY(is_capture_context())) {
       block_to_cudagraph_stream_uses[block].insert(stream);
     }
+    if (C10_UNLIKELY(is_passthrough(*block->pool))) {
+      // Tell the pool's allocator which streams use the block. The free is
+      // still deferred here until these uses complete (see free_locked).
+      block->pool->owner_PrivatePool->allocator()->recordStream(
+          c10::DataPtr(block->ptr, c10::Device(c10::DeviceType::CUDA, device_id)),
+          stream);
+    }
   }
 
   /** get memory fraction limiting maximum allocated memory **/
@@ -3095,6 +3112,20 @@ class DeviceCachingAllocator {
     no_split_pools.insert(mempool_id);
   }
 
+  void setPassthrough(MempoolId_t mempool_id) {
+    std::lock_guard<std::recursive_mutex> lock(mutex);
+    auto* pp = get_private_pool(mempool_id);
+    TORCH_CHECK(
+        pp->allocator() != nullptr,
+        "a pass-through MemPool needs a custom allocator");
+    passthrough_pools.insert(mempool_id);
+  }
+
+  bool is_passthrough(const BlockPool& pool) const {
+    return C10_UNLIKELY(!passthrough_pools.empty()) && pool.owner_PrivatePool &&
+        passthrough_pools.count(pool.owner_PrivatePool->id);
+  }
+
   // See Note [Interaction with CUDA graph capture]
 
   // Routes allocations matching `filter` into the private mempool
@@ -3520,6 +3551,19 @@ class DeviceCachingAllocator {
     size_t requested_size = block->requested_size;
 
     auto& pool = *block->pool;
+    if (C10_UNLIKELY(is_passthrough(pool))) {
+      // Pass-through: the block is its own segment (never split or cached);
+      // return it to the pool's allocator now.
+      active_blocks.erase(block);
+      for_each_selected_stat_type(
+          get_stat_types_for_pool(pool), [&](size_t stat_type) {
+            stats.active[stat_type].decrease(1);
+            stats.active_bytes[stat_type].decrease(original_block_size);
+            stats.requested_bytes[stat_type].decrease(requested_size);
+          });
+      release_block(block, context);
+      return;
+    }
     int64_t net_change_inactive_split_blocks = 0;
     int64_t net_change_inactive_split_size = 0;
 
@@ -4092,6 +4136,7 @@ class DeviceCachingAllocator {
       release_blocks(it->second->small_blocks, context);
       release_blocks(it->second->large_blocks, context);
       if (it->second->cudaMalloc_count == 0) {
+        passthrough_pools.erase(it->first);
         auto erase_count = graph_pools.erase(it->first);
         TORCH_INTERNAL_ASSERT(erase_count == 1);
         it = graph_pools_freeable.erase(it);
@@ -5066,6 +5111,12 @@ class NativeCachingAllocator : public CUDAAllocator {
   void setNoSplit(c10::DeviceIndex device, MempoolId_t mempool_id) override {
     assertValidDevice(device);
     device_allocator[device]->setNoSplit(std::move(mempool_id));
+  }
+
+  void setPassthrough(c10::DeviceIndex device, MempoolId_t mempool_id)
+      override {
+    assertValidDevice(device);
+    device_allocator[device]->setPassthrough(std::move(mempool_id));
   }
 
   // CUDAGraph interactions
