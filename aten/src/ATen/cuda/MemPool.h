@@ -23,7 +23,8 @@ struct TORCH_CUDA_CPP_API MemPool {
           nullptr,
       bool is_user_created = true,
       bool use_on_oom = false,
-      bool no_split = false);
+      bool no_split = false,
+      bool passthrough = false);
   MemPool(const MemPool&) = delete;
   MemPool(MemPool&&) = default;
   MemPool& operator=(const MemPool&) = delete;

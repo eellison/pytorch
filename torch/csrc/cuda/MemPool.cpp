@@ -19,11 +19,21 @@ void THCPMemPool_init(PyObject* module) {
                  allocator,
              bool is_user_created,
              bool use_on_oom,
-             bool no_split) {
+             bool no_split,
+             bool passthrough) {
             torch::utils::device_lazy_init(at::kCUDA);
             return std::make_shared<::at::cuda::MemPool>(
-                std::move(allocator), is_user_created, use_on_oom, no_split);
-          }))
+                std::move(allocator),
+                is_user_created,
+                use_on_oom,
+                no_split,
+                passthrough);
+          }),
+          py::arg("allocator"),
+          py::arg("is_user_created") = true,
+          py::arg("use_on_oom") = false,
+          py::arg("no_split") = false,
+          py::arg("passthrough") = false)
       .def_property_readonly("id", &::at::cuda::MemPool::id)
       .def("use_count", &::at::cuda::MemPool::use_count);
 }

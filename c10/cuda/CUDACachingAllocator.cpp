@@ -1262,12 +1262,24 @@ struct PrivatePool {
   std::shared_ptr<CUDAAllocator> allocator_;
   BlockPool large_blocks;
   BlockPool small_blocks;
+  // MemPool(passthrough=True): while a scope routes to this pool, the
+  // allocations it receives bypass the caching allocator entirely (see
+  // NativeCachingAllocator::passthrough_alloc). The pool never owns blocks.
+  bool passthrough{false};
 
  public:
   CUDAAllocator* allocator() {
     return allocator_.get();
   }
+  const std::shared_ptr<CUDAAllocator>& allocator_shared() const {
+    return allocator_;
+  }
 };
+
+// Number of open beginAllocateToPool scopes (all devices) whose pool is a
+// passthrough pool. Read with a relaxed load on allocate / raw_alloc: when it
+// is 0 (always, unless such a scope is open) nothing else is consulted.
+std::atomic<int64_t> active_passthrough_scopes{0};
 
 MempoolId_t BlockPool::owner_MempoolId() const {
   if (owner_PrivatePool) {
@@ -3095,6 +3107,35 @@ class DeviceCachingAllocator {
     no_split_pools.insert(mempool_id);
   }
 
+  void setPassthrough(MempoolId_t mempool_id) {
+    std::lock_guard<std::recursive_mutex> lock(mutex);
+    auto* pp = get_private_pool(mempool_id);
+    TORCH_CHECK(
+        pp->allocator() != nullptr,
+        "a passthrough MemPool needs a custom allocator");
+    for (auto& scope : allocation_scopes_) {
+      TORCH_CHECK(
+          scope.first != mempool_id,
+          "setPassthrough: the pool is in use by an allocation scope");
+    }
+    pp->passthrough = true;
+  }
+
+  // The allocator of the passthrough pool an allocation on `stream` is routed
+  // to right now (same LIFO search and filters as get_pool), or nullptr if
+  // the allocation belongs to the caching allocator. Only called while
+  // active_passthrough_scopes != 0.
+  std::shared_ptr<CUDAAllocator> passthroughAllocatorFor(cudaStream_t stream) {
+    std::lock_guard<std::recursive_mutex> lock(mutex);
+    for (auto& [pool_id, scope] : std::views::reverse(allocation_scopes_)) {
+      if (scope(stream)) {
+        auto* pp = get_private_pool(pool_id);
+        return pp->passthrough ? pp->allocator_shared() : nullptr;
+      }
+    }
+    return nullptr;
+  }
+
   // See Note [Interaction with CUDA graph capture]
 
   // Routes allocations matching `filter` into the private mempool
@@ -3116,6 +3157,10 @@ class DeviceCachingAllocator {
           "beginAllocateToPool: already recording to mempool_id");
     }
     allocation_scopes_.emplace_back(mempool_id, std::move(filter));
+    if (C10_UNLIKELY(get_private_pool(mempool_id)->passthrough)) {
+      passthrough_scope_ids_.insert(mempool_id);
+      active_passthrough_scopes.fetch_add(1, std::memory_order_relaxed);
+    }
   }
 
   // Ends the allocation-routing scope opened by beginAllocateToPool for
@@ -3185,6 +3230,9 @@ class DeviceCachingAllocator {
          ++it) {
       if (it->first == mempool_id) {
         allocation_scopes_.erase(it);
+        if (C10_UNLIKELY(passthrough_scope_ids_.erase(mempool_id))) {
+          active_passthrough_scopes.fetch_sub(1, std::memory_order_relaxed);
+        }
         return;
       }
     }
@@ -4470,6 +4518,10 @@ class DeviceCachingAllocator {
       }
     }
   }
+
+  // open allocation scopes whose pool is a passthrough pool (declared last:
+  // leaves the layout of every other member unchanged)
+  ska::flat_hash_set<MempoolId_t, MempoolIdHash> passthrough_scope_ids_;
 };
 
 // Returns whether to force all allocations to bypass the caching allocator and
@@ -4519,6 +4571,68 @@ static void uncached_delete(void* ptr) {
 }
 
 static void local_raw_delete(void* ptr);
+
+// Passthrough allocations (MemPool(passthrough=True)) never become Blocks: the
+// DataPtr's context keeps the pool's allocator alive and its deleter returns
+// the memory to that allocator directly, bypassing the caching allocator.
+struct PassthroughContext {
+  void* ptr;
+  std::shared_ptr<CUDAAllocator> allocator;
+};
+
+static void local_passthrough_delete(void* ctx) {
+  std::unique_ptr<PassthroughContext> c(static_cast<PassthroughContext*>(ctx));
+  c->allocator->raw_delete(c->ptr);
+}
+
+// raw_alloc'd passthrough pointers -> the allocator that owns them. Only
+// consulted for pointers the caching allocator does not know (cold paths).
+std::mutex passthrough_raw_mutex;
+ska::flat_hash_map<const void*, std::shared_ptr<CUDAAllocator>>
+    passthrough_raw_ptrs;
+
+static std::shared_ptr<CUDAAllocator> find_passthrough_raw(
+    const void* ptr,
+    bool remove) {
+  std::lock_guard<std::mutex> lock(passthrough_raw_mutex);
+  auto it = passthrough_raw_ptrs.find(ptr);
+  if (it == passthrough_raw_ptrs.end()) {
+    return nullptr;
+  }
+  auto a = it->second;
+  if (remove) {
+    passthrough_raw_ptrs.erase(it);
+  }
+  return a;
+}
+
+// free() of a pointer that is not a block: a passthrough raw_alloc?
+C10_NOINLINE static bool free_passthrough_raw(void* ptr) {
+  auto a = find_passthrough_raw(ptr, /*remove=*/true);
+  if (a) {
+    a->raw_delete(ptr);
+  }
+  return a != nullptr;
+}
+
+C10_NOINLINE static void record_stream_passthrough(
+    const DataPtr& ptr,
+    cuda::CUDAStream stream) {
+  static_cast<PassthroughContext*>(ptr.get_context())
+      ->allocator->recordStream(ptr, stream);
+}
+
+// recordStream() of a pointer that is not a block: a passthrough raw_alloc?
+C10_NOINLINE static bool record_stream_passthrough_raw(
+    const DataPtr& ptr,
+    cuda::CUDAStream stream) {
+  auto a = find_passthrough_raw(ptr.get(), /*remove=*/false);
+  if (a) {
+    a->recordStream(ptr, stream);
+  }
+  return a != nullptr;
+}
+
 // NOLINTBEGIN(misc-use-internal-linkage)
 thread_local std::stack<std::string> DeviceCachingAllocator::compile_context;
 thread_local std::string DeviceCachingAllocator::user_metadata;
@@ -4655,6 +4769,10 @@ class NativeCachingAllocator : public CUDAAllocator {
     }
     Block* block = get_allocated_block(ptr, true /* remove */);
     if (!block) {
+      // a raw_alloc of a passthrough scope? (never reached for our blocks)
+      if (free_passthrough_raw(ptr)) {
+        return;
+      }
       TORCH_CHECK(false, "invalid device pointer: ", ptr);
     }
     const c10::impl::PyInterpreter* interp = c10::impl::GPUTrace::get_trace();
@@ -4858,10 +4976,19 @@ class NativeCachingAllocator : public CUDAAllocator {
     // we have implemented reference counting based sharing mechanism to
     // guarantee tensors won't be accidentally freed by one process while
     // they are still being used in another
-    if (ptr.get_deleter() != &local_raw_delete)
+    if (ptr.get_deleter() != &local_raw_delete) {
+      // passthrough tensor: the pool's allocator owns the stream semantics
+      if (C10_UNLIKELY(ptr.get_deleter() == &local_passthrough_delete)) {
+        record_stream_passthrough(ptr, stream);
+      }
       return;
+    }
 
     Block* block = get_allocated_block(ptr.get());
+    // a raw_alloc of a passthrough scope wrapped with raw_deleter()?
+    if (C10_UNLIKELY(!block) && record_stream_passthrough_raw(ptr, stream)) {
+      return;
+    }
     // block must not be null reaching here
     TORCH_INTERNAL_ASSERT(block != nullptr, "No allocated block can be found");
     device_allocator[block->device]->recordStream(block, stream);
@@ -4983,6 +5110,10 @@ class NativeCachingAllocator : public CUDAAllocator {
       devPtr = uncached_allocate(size);
     } else {
       if (size != 0) {
+        if (C10_UNLIKELY(
+                active_passthrough_scopes.load(std::memory_order_relaxed))) {
+          return allocate_with_passthrough_scope(size, device, stream);
+        }
         this->malloc(&devPtr, device, size, stream);
       }
     }
@@ -5068,6 +5199,12 @@ class NativeCachingAllocator : public CUDAAllocator {
     device_allocator[device]->setNoSplit(std::move(mempool_id));
   }
 
+  void setPassthrough(c10::DeviceIndex device, MempoolId_t mempool_id)
+      override {
+    assertValidDevice(device);
+    device_allocator[device]->setPassthrough(std::move(mempool_id));
+  }
+
   // CUDAGraph interactions
   void beginAllocateToPool(
       c10::DeviceIndex device,
@@ -5115,6 +5252,11 @@ class NativeCachingAllocator : public CUDAAllocator {
     } else {
       c10::DeviceIndex device = 0;
       C10_CUDA_CHECK(c10::cuda::GetDevice(&device));
+      if (C10_UNLIKELY(
+              active_passthrough_scopes.load(std::memory_order_relaxed))) {
+        return raw_alloc_with_passthrough_scope(
+            device, nbytes, cuda::getCurrentCUDAStream(device));
+      }
       malloc(&r, device, nbytes, cuda::getCurrentCUDAStream(device));
     }
     return r;
@@ -5130,6 +5272,10 @@ class NativeCachingAllocator : public CUDAAllocator {
     } else {
       c10::DeviceIndex device = 0;
       C10_CUDA_CHECK(c10::cuda::GetDevice(&device));
+      if (C10_UNLIKELY(
+              active_passthrough_scopes.load(std::memory_order_relaxed))) {
+        return raw_alloc_with_passthrough_scope(device, nbytes, stream);
+      }
       malloc(&r, device, nbytes, stream);
     }
     return r;
@@ -5308,6 +5454,77 @@ class NativeCachingAllocator : public CUDAAllocator {
   void copy_data(void* dest, const void* src, std::size_t count) const final {
     C10_CUDA_CHECK(
         cudaMemcpy(dest, src, count, cudaMemcpyKind::cudaMemcpyDeviceToDevice));
+  }
+
+ private:
+  // ---- passthrough pools: cold paths only, all out of line ----
+  // If an open passthrough scope routes an allocation on `stream` of `device`,
+  // allocates it from the pool's allocator (rounded like the caching
+  // allocator: 512 B / roundup_power2_divisions) and returns that allocator.
+  std::shared_ptr<CUDAAllocator> passthrough_alloc(
+      void** devPtr,
+      c10::DeviceIndex device,
+      size_t size,
+      cudaStream_t stream) {
+    TORCH_INTERNAL_ASSERT(
+        0 <= device && static_cast<size_t>(device) < device_allocator.size(),
+        "Allocator not initialized for device ",
+        device,
+        ": did you call init?");
+    auto a = device_allocator[device]->passthroughAllocatorFor(stream);
+    if (!a) {
+      return nullptr;
+    }
+    const size_t rounded = DeviceCachingAllocator::round_size(size);
+    {
+      // as for segment allocations: the allocator may allocate (cudaMalloc,
+      // cuMem*) while a stream is being captured
+      at::cuda::CUDAStreamCaptureModeGuard g{cudaStreamCaptureModeRelaxed};
+      *devPtr = a->raw_alloc_with_stream(rounded, stream);
+    }
+    TORCH_CHECK_WITH(
+        OutOfMemoryError,
+        *devPtr != nullptr,
+        "CUDA out of memory. The allocator of a passthrough MemPool failed to "
+        "allocate ",
+        format_size(rounded));
+    return a;
+  }
+
+  // allocate() while a passthrough scope is open (on any thread / device)
+  C10_NOINLINE DataPtr allocate_with_passthrough_scope(
+      size_t size,
+      c10::DeviceIndex device,
+      CUDAStream stream) {
+    void* devPtr = nullptr;
+    if (auto a = passthrough_alloc(&devPtr, device, size, stream)) {
+      return {
+          devPtr,
+          new PassthroughContext{devPtr, std::move(a)},
+          &local_passthrough_delete,
+          Device(DeviceType::CUDA, device)};
+    }
+    this->malloc(&devPtr, device, size, stream);
+    if (TORCH_SDT_IS_ENABLED(malloc)) {
+      TORCH_SDT_WITH_SEMAPHORE(malloc, devPtr, device, size, stream.id());
+    }
+    return {devPtr, devPtr, &local_raw_delete, Device(DeviceType::CUDA, device)};
+  }
+
+  // raw_alloc*() while a passthrough scope is open
+  C10_NOINLINE void* raw_alloc_with_passthrough_scope(
+      c10::DeviceIndex device,
+      size_t nbytes,
+      cudaStream_t stream) {
+    void* r = nullptr;
+    auto a = passthrough_alloc(&r, device, nbytes, stream);
+    if (!a) {
+      malloc(&r, device, nbytes, stream);
+      return r;
+    }
+    std::lock_guard<std::mutex> lock(passthrough_raw_mutex);
+    passthrough_raw_ptrs.emplace(r, std::move(a));
+    return r;
   }
 };
 
