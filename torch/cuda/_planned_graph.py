@@ -18,10 +18,18 @@ passthrough=True)`` and :func:`torch.cuda.graph`): other planners can be written
 the same way outside of PyTorch.
 
 Sharing rule: allocation ``j`` may reuse the memory of allocation ``i`` if ``i``
-was freed before ``j`` was allocated (in host order) and both were allocated on
-the same stream, so stream order separates all uses of ``i`` from all uses of
-``j``. As in eager mode, a tensor used on another stream must not be freed
-before that stream's work has been joined back.
+was freed before ``j`` was allocated (in host order) and every captured node
+that may use ``i`` happens before every captured node that may use ``j``. The
+recorder notes the capture frontier (``cuStreamGetCaptureInfo``) of the
+allocating stream at each allocation, and at each free the frontiers of the
+allocation's stream and of every stream recorded for it with
+:meth:`torch.Tensor.record_stream`. ``i`` and ``j`` may then share memory if
+each node of ``i``'s free frontier is an ancestor (or equal to) a node of
+``j``'s allocation frontier, since all work issued after ``j``'s allocation
+depends on that frontier. This allows sharing across streams along
+synchronization edges. As in eager mode, a tensor used on another stream must
+either be recorded with ``record_stream`` or not be freed before that stream's
+work has been joined back.
 """
 
 from __future__ import annotations
@@ -40,6 +48,114 @@ if TYPE_CHECKING:
 __all__: list[str] = []
 
 
+class _Driver:
+    """The few CUDA driver calls the planner needs, through ctypes."""
+
+    def __init__(self) -> None:
+        from torch.cuda._utils import _get_cuda_library
+
+        if torch.version.hip:
+            raise RuntimeError("PlannedGraph is not supported on ROCm yet")
+        lib = _get_cuda_library()
+        u64 = ctypes.c_uint64
+        lib.cuMemAddressReserve.argtypes = [
+            ctypes.POINTER(u64),
+            ctypes.c_size_t,
+            ctypes.c_size_t,
+            u64,
+            ctypes.c_ulonglong,
+        ]
+        lib.cuMemAddressFree.argtypes = [u64, ctypes.c_size_t]
+        self.lib = lib
+        capture_info_v3 = getattr(lib, "cuStreamGetCaptureInfo_v3", None)
+        self._capture_info_v3 = capture_info_v3 is not None
+        self._capture_info = capture_info_v3 or lib.cuStreamGetCaptureInfo_v2
+        edges_v2 = getattr(lib, "cuGraphGetEdges_v2", None)
+        self._edges_v2 = edges_v2 is not None
+        self._edges = edges_v2 or lib.cuGraphGetEdges
+
+    def capture_frontier(self, stream: int) -> list[int] | None:
+        """The nodes that work issued next on ``stream`` would depend on, or
+        None if ``stream`` is not being captured."""
+        status = ctypes.c_int(0)
+        capture_id = ctypes.c_uint64(0)
+        graph = ctypes.c_void_p()
+        deps = ctypes.POINTER(ctypes.c_void_p)()
+        n = ctypes.c_size_t(0)
+        args = [
+            ctypes.c_void_p(stream),
+            ctypes.byref(status),
+            ctypes.byref(capture_id),
+            ctypes.byref(graph),
+            ctypes.byref(deps),
+        ]
+        if self._capture_info_v3:
+            # edge data must be requested, or edges that carry it make the
+            # query fail as lossy
+            args.append(ctypes.byref(ctypes.c_void_p()))
+        args.append(ctypes.byref(n))
+        rc = self._capture_info(*args)
+        if rc != 0:
+            from torch.cuda._utils import _check_cuda
+
+            _check_cuda(rc)
+        if status.value != 1:  # CU_STREAM_CAPTURE_STATUS_ACTIVE
+            return None
+        return [deps[i] or 0 for i in range(n.value)]
+
+    def graph_topology(self, graph: int) -> tuple[list[int], list[tuple[int, int]]]:
+        from torch.cuda._utils import _check_cuda
+
+        g = ctypes.c_void_p(graph)
+        n = ctypes.c_size_t(0)
+        _check_cuda(self.lib.cuGraphGetNodes(g, None, ctypes.byref(n)))
+        nodes = (ctypes.c_void_p * max(n.value, 1))()
+        _check_cuda(self.lib.cuGraphGetNodes(g, nodes, ctypes.byref(n)))
+        m = ctypes.c_size_t(0)
+        extra: list[Any] = [None] if self._edges_v2 else []
+        _check_cuda(self._edges(g, None, None, *extra, ctypes.byref(m)))
+        src = (ctypes.c_void_p * max(m.value, 1))()
+        dst = (ctypes.c_void_p * max(m.value, 1))()
+        if self._edges_v2:
+            # CUgraphEdgeData is 8 bytes; edges that carry data (e.g.
+            # programmatic dependencies) make the query fail without it
+            extra = [(ctypes.c_uint64 * max(m.value, 1))()]
+        if m.value:  # (non-null arrays with a count of 0 are rejected)
+            _check_cuda(self._edges(g, src, dst, *extra, ctypes.byref(m)))
+        return (
+            [nodes[i] or 0 for i in range(n.value)],
+            [(src[i] or 0, dst[i] or 0) for i in range(m.value)],
+        )
+
+
+def _ancestors_or_self(
+    nodes: list[int], edges: list[tuple[int, int]]
+) -> dict[int, int]:
+    """For each node, a bitset (int over node indices) of itself and its
+    ancestors."""
+    index = {h: i for i, h in enumerate(nodes)}
+    parents: list[list[int]] = [[] for _ in nodes]
+    children: list[list[int]] = [[] for _ in nodes]
+    indegree = [0] * len(nodes)
+    for a, b in edges:
+        parents[index[b]].append(index[a])
+        children[index[a]].append(index[b])
+        indegree[index[b]] += 1
+    ready = [i for i, d in enumerate(indegree) if d == 0]
+    masks = [0] * len(nodes)
+    while ready:  # Kahn: a node is visited after all of its parents
+        i = ready.pop()
+        m = 1 << i
+        for p in parents[i]:
+            m |= masks[p]
+        masks[i] = m
+        for c in children[i]:
+            indegree[c] -= 1
+            if indegree[c] == 0:
+                ready.append(c)
+    return {h: masks[i] for h, i in index.items()}
+
+
 # cudaMalloc's alignment guarantee, so placed tensors keep every alignment property
 # (e.g. what cuBLASLt picks kernels by) that code can assume of a fresh allocation
 _ALIGNMENT = 256
@@ -50,20 +166,8 @@ class _AddressSpace:
 
     _CHUNK = 1 << 40
 
-    def __init__(self) -> None:
-        from torch.cuda._utils import _get_cuda_library
-
-        if torch.version.hip:
-            raise RuntimeError("PlannedGraph is not supported on ROCm yet")
-        self._lib = _get_cuda_library()
-        self._lib.cuMemAddressReserve.argtypes = [
-            ctypes.POINTER(ctypes.c_uint64),
-            ctypes.c_size_t,
-            ctypes.c_size_t,
-            ctypes.c_uint64,
-            ctypes.c_ulonglong,
-        ]
-        self._lib.cuMemAddressFree.argtypes = [ctypes.c_uint64, ctypes.c_size_t]
+    def __init__(self, driver: _Driver) -> None:
+        self._lib = driver.lib
         self._reserved: list[tuple[int, int]] = []
         self._top = 0
         self._end = 0
@@ -97,12 +201,20 @@ class _Allocation:
     stream: int
     alloc_time: int
     free_time: int | None = None  # None: live at the end of the capture
+    # capture frontiers (graph node handles); None if a stream was not captured
+    alloc_frontier: list[int] | None = None
+    free_frontier: list[int] | None = None
+    used_streams: set[int] = dataclasses.field(default_factory=set)
+    # bitsets over graph nodes, filled in from the topology after capture
+    alloc_closure: int = 0
+    free_mask: int | None = None
     offset: int = -1
 
 
 class _Recorder:
-    def __init__(self) -> None:
-        self.address_space = _AddressSpace()
+    def __init__(self, driver: _Driver) -> None:
+        self.driver = driver
+        self.address_space = _AddressSpace(driver)
         self.allocations: list[_Allocation] = []
         self._live: dict[int, int] = {}
         self._time = 0
@@ -110,15 +222,52 @@ class _Recorder:
     def alloc(self, size: int, device: int, stream: int) -> int:
         ptr = self.address_space.alloc(size)
         self._live[ptr] = len(self.allocations)
-        self.allocations.append(_Allocation(size, stream, self._time))
+        self.allocations.append(
+            _Allocation(
+                size,
+                stream,
+                self._time,
+                alloc_frontier=self.driver.capture_frontier(stream),
+            )
+        )
         self._time += 1
         return ptr
 
+    def record_stream(self, ptr: int, stream: int) -> None:
+        index = self._live.get(ptr)
+        if index is not None:
+            self.allocations[index].used_streams.add(stream)
+
     def free(self, ptr: int, size: int, device: int, stream: int) -> None:
         index = self._live.pop(ptr, None)
-        if index is not None:
-            self.allocations[index].free_time = self._time
-            self._time += 1
+        if index is None:
+            return
+        a = self.allocations[index]
+        a.free_time = self._time
+        self._time += 1
+        frontier: list[int] = []
+        for s in {a.stream} | a.used_streams:
+            f = self.driver.capture_frontier(s)
+            if f is None:  # freed outside of the capture
+                return
+            frontier.extend(f)
+        a.free_frontier = frontier
+
+    def resolve(self, nodes: list[int], edges: list[tuple[int, int]]) -> None:
+        """Turns the recorded frontiers into bitsets over the captured graph."""
+        closure = _ancestors_or_self(nodes, edges)
+        index = {h: i for i, h in enumerate(nodes)}
+        for a in self.allocations:
+            for h in a.alloc_frontier or ():
+                a.alloc_closure |= closure.get(h, 0)
+            if (
+                a.free_time is not None
+                and a.free_frontier is not None
+                and all(h in index for h in a.free_frontier)
+            ):
+                a.free_mask = 0
+                for h in a.free_frontier:
+                    a.free_mask |= 1 << index[h]
 
 
 class _Placer:
@@ -147,10 +296,13 @@ class _Placer:
 
 def _may_overlap(a: _Allocation, b: _Allocation) -> bool:
     """Whether a and b may be in use on the GPU at the same time."""
-    if a.stream != b.stream:
-        return True
     first, second = (a, b) if a.alloc_time < b.alloc_time else (b, a)
-    return first.free_time is None or first.free_time > second.alloc_time
+    if first.free_time is None or first.free_time > second.alloc_time:
+        return True
+    if first.free_mask is None:  # no frontier information: same stream only
+        return first.stream != second.stream
+    # every node of first's free frontier must precede second's allocation
+    return (first.free_mask & ~second.alloc_closure) != 0
 
 
 def _plan(allocations: list[_Allocation], alignment: int = _ALIGNMENT) -> int:
@@ -223,14 +375,20 @@ class PlannedGraph:
     def capture(self, *args: Any, **kwargs: Any) -> Any:
         r"""Captures ``fn(*args, **kwargs)`` and returns its outputs, which
         :meth:`replay` updates in place."""
-        recorder = _Recorder()
+        recorder = _Recorder(_Driver())
         try:
             record_pool = torch.cuda.MemPool.from_py_allocator(
-                recorder.alloc, recorder.free, passthrough=True
+                recorder.alloc,
+                recorder.free,
+                record_stream_fn=recorder.record_stream,
+                passthrough=True,
             )
-            record_graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(record_graph, pool=record_pool.id):
+            record_graph = torch.cuda.CUDAGraph(keep_graph=True)
+            with torch.cuda.graph(record_graph, pool=record_pool):
                 outputs = self.fn(*args, **kwargs)
+            recorder.resolve(
+                *recorder.driver.graph_topology(record_graph.raw_cuda_graph())
+            )
             del outputs, record_graph, record_pool
             torch.cuda.synchronize()
         finally:
@@ -249,7 +407,7 @@ class PlannedGraph:
             placer.alloc, placer.free, passthrough=True
         )
         self.graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(self.graph, pool=self._pool.id):
+        with torch.cuda.graph(self.graph, pool=self._pool):
             self.outputs = self.fn(*args, **kwargs)
         if placer.count != len(allocations):
             raise RuntimeError(

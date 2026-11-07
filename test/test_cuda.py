@@ -13563,6 +13563,71 @@ class TestPlannedGraph(TestCase):
         b = _Allocation(size=512, stream=1, alloc_time=1, free_time=2)
         self.assertEqual(_plan([a, b]), 1536)
 
+    def _cross_stream(self, fn, *, expected_buffers):
+        from torch.cuda._planned_graph import PlannedGraph
+
+        self._warmup(fn)
+        torch.cuda.synchronize()
+        ref = [t.clone() for t in fn()]
+        g = PlannedGraph(fn)
+        outs = g.capture()
+        g.replay()
+        torch.cuda.synchronize()
+        self.assertEqual(list(outs), ref)
+        self.assertEqual(g.arena_bytes, expected_buffers * (1 << 22))
+
+    def test_cross_stream_sharing_after_join(self):
+        x = torch.ones(1 << 20, device="cuda")
+        side = torch.cuda.Stream()
+
+        def fn():
+            cur = torch.cuda.current_stream()
+            side.wait_stream(cur)
+            with torch.cuda.stream(side):
+                t = x * 2
+                u = t + 1
+            cur.wait_stream(side)
+            del t  # freed after the join: v may reuse it
+            v = u * 3
+            return (u, v)
+
+        self._cross_stream(fn, expected_buffers=2)
+
+    def test_no_cross_stream_sharing_before_join(self):
+        x = torch.ones(1 << 20, device="cuda")
+        side = torch.cuda.Stream()
+
+        def fn():
+            cur = torch.cuda.current_stream()
+            side.wait_stream(cur)
+            with torch.cuda.stream(side):
+                t = x * 2
+                u = t + 1
+            del t
+            v = x * 3  # allocated before cur waits on side: may race with t
+            cur.wait_stream(side)
+            return (u, v)
+
+        self._cross_stream(fn, expected_buffers=3)
+
+    def test_record_stream_blocks_sharing(self):
+        x = torch.ones(1 << 20, device="cuda")
+        side = torch.cuda.Stream()
+
+        def fn():
+            cur = torch.cuda.current_stream()
+            t = x * 2
+            side.wait_stream(cur)
+            with torch.cuda.stream(side):
+                u = t + 1
+            t.record_stream(side)
+            del t  # still in use on side
+            v = x * 3
+            cur.wait_stream(side)
+            return (u, v)
+
+        self._cross_stream(fn, expected_buffers=3)
+
     def test_nondeterministic_capture_raises(self):
         from torch.cuda._planned_graph import PlannedGraph
 
