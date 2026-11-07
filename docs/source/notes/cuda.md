@@ -1089,8 +1089,9 @@ The caching allocator keeps no state for these tensors, so:
   {class}`torch.OutOfMemoryError` without releasing cached blocks and retrying;
 * the caching allocator does not delay frees for streams recorded with
   {meth}`torch.Tensor.record_stream`. The call is forwarded to the pool's
-  allocator; Python-defined allocators do not receive it, and must not reuse
-  memory that another stream may still be using;
+  allocator (for Python-defined allocators, to the optional
+  `record_stream_fn(ptr, stream)` callback), which must not reuse memory that
+  another stream may still be using;
 * they cannot be shared with other processes.
 
 Allocations outside the pool's scope, including those of other threads, are
