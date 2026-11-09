@@ -188,11 +188,117 @@ class _AddressSpace:
         self._top += size
         return ptr
 
-    def release(self) -> None:
+    def release(self, retire: bool) -> None:
+        """Frees the reservations, or with ``retire`` keeps them reserved so
+        that their addresses are never handed out again."""
         for base, nbytes in self._reserved:
-            self._lib.cuMemAddressFree(base, nbytes)
+            if retire:
+                _retired_ranges.append((base, nbytes))
+            else:
+                self._lib.cuMemAddressFree(base, nbytes)
         self._reserved.clear()
         self._top = self._end = 0
+
+
+# Address ranges that stay reserved for the life of the process, so that no
+# later allocation can reuse them (see PlannedGraph(vmm_arena=True)).
+_retired_ranges: list[tuple[int, int]] = []
+
+
+class _VMMArena:
+    """Physical memory mapped at its own reserved virtual address range."""
+
+    class _Location(ctypes.Structure):
+        _fields_ = [("type", ctypes.c_int), ("id", ctypes.c_int)]
+
+    class _AllocFlags(ctypes.Structure):
+        _fields_ = [
+            ("compressionType", ctypes.c_ubyte),
+            ("gpuDirectRDMACapable", ctypes.c_ubyte),
+            ("usage", ctypes.c_ushort),
+            ("reserved", ctypes.c_ubyte * 4),
+        ]
+
+    class _Prop(ctypes.Structure):
+        _fields_ = [
+            ("type", ctypes.c_int),
+            ("requestedHandleTypes", ctypes.c_int),
+            ("location", ctypes.c_byte * 8),  # _Location
+            ("win32HandleMetaData", ctypes.c_void_p),
+            ("allocFlags", ctypes.c_byte * 8),  # _AllocFlags
+        ]
+
+    class _AccessDesc(ctypes.Structure):
+        _fields_ = [("location", ctypes.c_byte * 8), ("flags", ctypes.c_int)]
+
+    def __init__(
+        self, driver: _Driver, nbytes: int, device: int, handle_types: int
+    ) -> None:
+        from torch.cuda._utils import _check_cuda
+
+        lib = driver.lib
+        self._lib = lib
+        location = self._Location(1, device)  # CU_MEM_LOCATION_TYPE_DEVICE
+        prop = self._Prop()
+        prop.type = 1  # CU_MEM_ALLOCATION_TYPE_PINNED
+        prop.requestedHandleTypes = handle_types
+        ctypes.memmove(prop.location, ctypes.byref(location), 8)
+        granularity = ctypes.c_size_t(0)
+        _check_cuda(
+            lib.cuMemGetAllocationGranularity(
+                ctypes.byref(granularity),
+                ctypes.byref(prop),
+                1,  # RECOMMENDED
+            )
+        )
+        g = granularity.value
+        self.size = max((nbytes + g - 1) // g * g, g)
+        self.handle = ctypes.c_uint64(0)
+        _check_cuda(
+            lib.cuMemCreate(
+                ctypes.byref(self.handle),
+                ctypes.c_size_t(self.size),
+                ctypes.byref(prop),
+                ctypes.c_ulonglong(0),
+            )
+        )
+        base = ctypes.c_uint64(0)
+        _check_cuda(lib.cuMemAddressReserve(ctypes.byref(base), self.size, g, 0, 0))
+        self.ptr = base.value
+        _check_cuda(
+            lib.cuMemMap(
+                ctypes.c_uint64(self.ptr),
+                ctypes.c_size_t(self.size),
+                ctypes.c_size_t(0),
+                self.handle,
+                ctypes.c_ulonglong(0),
+            )
+        )
+        access = self._AccessDesc()
+        ctypes.memmove(access.location, ctypes.byref(location), 8)
+        access.flags = 3  # CU_MEM_ACCESS_FLAGS_PROT_READWRITE
+        _check_cuda(
+            lib.cuMemSetAccess(
+                ctypes.c_uint64(self.ptr),
+                ctypes.c_size_t(self.size),
+                ctypes.byref(access),
+                ctypes.c_size_t(1),
+            )
+        )
+
+    def release(self) -> None:
+        """Unmaps and frees the memory; the address range stays reserved."""
+        from torch.cuda._utils import _check_cuda
+
+        if self.ptr:
+            _check_cuda(
+                self._lib.cuMemUnmap(
+                    ctypes.c_uint64(self.ptr), ctypes.c_size_t(self.size)
+                )
+            )
+            _check_cuda(self._lib.cuMemRelease(self.handle))
+            _retired_ranges.append((self.ptr, self.size))
+            self.ptr = 0
 
 
 @dataclasses.dataclass
@@ -355,6 +461,15 @@ class PlannedGraph:
         >>> for _ in range(steps):
         ...     loss = g.replay()
 
+    With ``vmm_arena=True``, the arena is physical memory mapped at its own
+    virtual address range (exportable with ``handle_types``, a
+    ``CUmemAllocationHandleType`` mask, POSIX file descriptors by default), and
+    neither its addresses nor those used by the recording capture are ever
+    reused after :meth:`release` or a new :meth:`capture`. Use it when
+    collectives in ``fn`` register their buffers by address (for example NCCL
+    with ``NCCL_GRAPH_REGISTER``), so that a stale registration can never
+    refer to new memory.
+
     Attributes:
         arena_bytes: size of the planned arena.
         peak_live_bytes: largest total size of the capture's allocations live at
@@ -362,8 +477,17 @@ class PlannedGraph:
         num_allocations: number of allocations made by one capture of ``fn``.
     """
 
-    def __init__(self, fn: Callable[..., Any]) -> None:
+    def __init__(
+        self,
+        fn: Callable[..., Any],
+        *,
+        vmm_arena: bool = False,
+        handle_types: int = 1,
+    ) -> None:
         self.fn = fn
+        self.vmm_arena = vmm_arena
+        self.handle_types = handle_types
+        self._vmm: _VMMArena | None = None
         self.graph: torch.cuda.CUDAGraph | None = None
         self.outputs: Any = None
         self.arena: torch.Tensor | None = None
@@ -374,8 +498,12 @@ class PlannedGraph:
 
     def capture(self, *args: Any, **kwargs: Any) -> Any:
         r"""Captures ``fn(*args, **kwargs)`` and returns its outputs, which
-        :meth:`replay` updates in place."""
-        recorder = _Recorder(_Driver())
+        :meth:`replay` updates in place. Capturing again re-plans: the previous
+        graph and arena are released first."""
+        if self.graph is not None:
+            self.release()
+        driver = _Driver()
+        recorder = _Recorder(driver)
         try:
             record_pool = torch.cuda.MemPool.from_py_allocator(
                 recorder.alloc,
@@ -392,17 +520,27 @@ class PlannedGraph:
             del outputs, record_graph, record_pool
             torch.cuda.synchronize()
         finally:
-            recorder.address_space.release()
+            recorder.address_space.release(retire=self.vmm_arena)
 
         allocations = recorder.allocations
         self.num_allocations = len(allocations)
         self.peak_live_bytes = _peak_live_bytes(allocations)
         self.arena_bytes = _plan(allocations)
-        self.arena = torch.empty(
-            max(self.arena_bytes, 1), dtype=torch.uint8, device="cuda"
-        )
+        if self.vmm_arena:
+            self._vmm = _VMMArena(
+                driver,
+                self.arena_bytes,
+                torch.cuda.current_device(),
+                self.handle_types,
+            )
+            base = self._vmm.ptr
+        else:
+            self.arena = torch.empty(
+                max(self.arena_bytes, 1), dtype=torch.uint8, device="cuda"
+            )
+            base = self.arena.data_ptr()
 
-        placer = _Placer(allocations, self.arena.data_ptr())
+        placer = _Placer(allocations, base)
         self._pool = torch.cuda.MemPool.from_py_allocator(
             placer.alloc, placer.free, passthrough=True
         )
@@ -415,6 +553,18 @@ class PlannedGraph:
                 f"({placer.count}) than the first ({len(allocations)})"
             )
         return self.outputs
+
+    def release(self) -> None:
+        r"""Destroys the graph and frees the arena. The outputs of
+        :meth:`capture` must not be used afterwards."""
+        self.graph = None
+        self.outputs = None
+        self._pool = None
+        torch.cuda.synchronize()
+        if self._vmm is not None:
+            self._vmm.release()
+            self._vmm = None
+        self.arena = None
 
     def replay(self) -> Any:
         r"""Replays the graph and returns the outputs of :meth:`capture`."""

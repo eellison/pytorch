@@ -13628,6 +13628,57 @@ class TestPlannedGraph(TestCase):
 
         self._cross_stream(fn, expected_buffers=3)
 
+    def test_vmm_arena_replan_retires_addresses(self):
+        from torch.cuda import _planned_graph
+        from torch.cuda._planned_graph import PlannedGraph
+
+        x = torch.ones(1 << 20, device="cuda")
+
+        def fn():
+            y = x
+            for _ in range(4):
+                y = y * 2 + 1
+            return y
+
+        self._warmup(fn)
+        expected = fn()
+        g = PlannedGraph(fn, vmm_arena=True)
+        out = g.capture()
+        g.replay()
+        torch.cuda.synchronize()
+        self.assertEqual(out, expected)
+        first = g._vmm.ptr
+        self.assertTrue(first <= out.data_ptr() < first + g._vmm.size)
+
+        # re-plan: a new arena at new addresses; the old ones stay reserved
+        out = g.capture()
+        g.replay()
+        torch.cuda.synchronize()
+        self.assertEqual(out, expected)
+        second = g._vmm.ptr
+        self.assertNotEqual(first, second)
+        retired = _planned_graph._retired_ranges
+        self.assertTrue(any(base == first for base, _ in retired))
+        g.release()
+        self.assertTrue(any(base == second for base, _ in retired))
+        self.assertIsNone(g.graph)
+
+    def test_caching_arena_recapture(self):
+        from torch.cuda._planned_graph import PlannedGraph
+
+        x = torch.ones(1 << 20, device="cuda")
+
+        def fn():
+            return (x * 2 + 1) * 3
+
+        self._warmup(fn)
+        g = PlannedGraph(fn)
+        g.capture()
+        out = g.capture()
+        g.replay()
+        torch.cuda.synchronize()
+        self.assertEqual(out, fn())
+
     def test_nondeterministic_capture_raises(self):
         from torch.cuda._planned_graph import PlannedGraph
 
