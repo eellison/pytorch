@@ -13452,6 +13452,115 @@ print(json.dumps([
 
 
 @unittest.skipIf(not TEST_CUDA, "CUDA not available, skipping tests")
+@unittest.skipIf(TEST_WITH_ROCM, "PlannedGraph reserves VA with the CUDA driver")
+@unittest.skipIf(TEST_CUDAMALLOCASYNC, "requires the native caching allocator")
+class TestPlannedGraph(TestCase):
+    @staticmethod
+    def _warmup(fn):
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(3):
+                fn()
+        torch.cuda.current_stream().wait_stream(s)
+
+    def test_training_step_matches_eager(self):
+        from torch.cuda._planned_graph import PlannedGraph
+
+        def make():
+            torch.manual_seed(0)
+            model = nn.Sequential(
+                nn.Linear(256, 256), nn.GELU(), nn.Linear(256, 256), nn.GELU()
+            ).cuda()
+            opt = torch.optim.Adam(model.parameters(), lr=1e-3, capturable=True)
+            return model, opt
+
+        x = torch.randn(64, 256, device="cuda")
+
+        def step_fn(model, opt):
+            def step():
+                opt.zero_grad(set_to_none=True)
+                loss = model(x).square().mean()
+                loss.backward()
+                opt.step()
+                return loss.detach()
+
+            return step
+
+        model, opt = make()
+        step = step_fn(model, opt)
+        self._warmup(step)
+        start = (deepcopy(model.state_dict()), deepcopy(opt.state_dict()))
+        ref_losses = [step().clone() for _ in range(3)]
+        ref_params = [p.detach().clone() for p in model.parameters()]
+
+        model.load_state_dict(start[0])
+        opt.load_state_dict(start[1])
+        g = PlannedGraph(step)
+        g.capture()
+        losses = [g.replay().clone() for _ in range(3)]
+        self.assertEqual(losses, ref_losses, atol=0, rtol=0)
+        self.assertEqual(list(model.parameters()), ref_params, atol=0, rtol=0)
+        self.assertGreater(g.num_allocations, 0)
+        self.assertGreaterEqual(g.arena_bytes, g.peak_live_bytes)
+
+    def test_temporaries_share_memory(self):
+        from torch.cuda._planned_graph import PlannedGraph
+
+        x = torch.ones(1 << 20, device="cuda")
+
+        def fn():
+            y = x
+            for _ in range(8):
+                y = y * 2 + 1
+            return y
+
+        self._warmup(fn)
+        g = PlannedGraph(fn)
+        out = g.capture()
+        g.replay()
+        torch.cuda.synchronize()
+        self.assertEqual(out, fn())
+        # 8 * 2 temporaries of 4 MiB, but at most a few are live at once
+        self.assertLessEqual(g.arena_bytes, 4 * x.nbytes)
+        self.assertGreater(g.num_allocations, 8)
+
+    def test_plan_stream_rule(self):
+        from torch.cuda._planned_graph import _Allocation, _plan
+
+        # disjoint lifetimes on one stream share memory
+        a = _Allocation(size=1024, stream=1, alloc_time=0, free_time=1)
+        b = _Allocation(size=1024, stream=1, alloc_time=2, free_time=3)
+        self.assertEqual(_plan([a, b]), 1024)
+        self.assertEqual(a.offset, b.offset)
+        # disjoint lifetimes on different streams do not
+        a = _Allocation(size=1024, stream=1, alloc_time=0, free_time=1)
+        b = _Allocation(size=1024, stream=2, alloc_time=2, free_time=3)
+        self.assertEqual(_plan([a, b]), 2048)
+        # an allocation live at the end overlaps everything after it
+        a = _Allocation(size=1024, stream=1, alloc_time=0, free_time=None)
+        b = _Allocation(size=512, stream=1, alloc_time=1, free_time=2)
+        self.assertEqual(_plan([a, b]), 1536)
+
+    def test_nondeterministic_capture_raises(self):
+        from torch.cuda._planned_graph import PlannedGraph
+
+        sizes = iter([1024, 2048])
+
+        def fn():
+            return torch.empty(next(sizes), device="cuda").fill_(1)
+
+        with self.assertRaisesRegex(RuntimeError, "different allocation"):
+            PlannedGraph(fn).capture()
+
+    def test_replay_before_capture_raises(self):
+        from torch.cuda._planned_graph import PlannedGraph
+
+        with self.assertRaisesRegex(RuntimeError, "before capture"):
+            PlannedGraph(lambda: None).replay()
+
+
+@unittest.skipIf(not TEST_CUDA, "CUDA not available, skipping tests")
 @torch.testing._internal.common_utils.markDynamoStrictTest
 class TestCudaOptims(TestCase):
     # These tests will be instantiate with instantiate_device_type_tests
