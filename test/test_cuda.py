@@ -13410,6 +13410,27 @@ print(json.dumps([
         del a
 
     @unittest.skipIf(TEST_CUDAMALLOCASYNC, "requires the native caching allocator")
+    def test_mempool_passthrough_record_stream_callback(self):
+        arena = self._PassthroughArena()
+        recorded = []
+        pool = torch.cuda.MemPool.from_py_allocator(
+            arena.alloc,
+            arena.free,
+            record_stream_fn=lambda ptr, stream: recorded.append((ptr, stream)),
+            passthrough=True,
+        )
+        side = torch.cuda.Stream()
+        with torch.cuda.use_mem_pool(pool):
+            a = torch.ones(1024, device="cuda")
+        a.record_stream(side)
+        self.assertEqual(recorded, [(a.data_ptr(), side.cuda_stream)])
+        with self.assertRaisesRegex(RuntimeError, "record_stream_fn"):
+            torch.cuda.MemPool.from_py_allocator(
+                arena.alloc, arena.free, record_stream_fn=1, passthrough=True
+            )
+        del a
+
+    @unittest.skipIf(TEST_CUDAMALLOCASYNC, "requires the native caching allocator")
     def test_mempool_passthrough_allocator_failure(self):
         def alloc(size, device, stream):
             return None

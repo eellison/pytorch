@@ -1727,6 +1727,7 @@ class MemPool(_MemPool):
         alloc_fn: Callable[[int, int, int], int | None],
         free_fn: Callable[[int, int, int, int], None],
         *,
+        record_stream_fn: Callable[[int, int], None] | None = None,
         use_on_oom: bool = False,
         no_split: bool = False,
         passthrough: bool = False,
@@ -1746,6 +1747,10 @@ class MemPool(_MemPool):
                 device, and allocation stream.
             free_fn: Callable that frees a segment and receives its device
                 address, backing segment size, device, and allocation stream.
+            record_stream_fn: Optional callable ``record_stream_fn(ptr, stream)``,
+                called when :meth:`torch.Tensor.record_stream` is used on a tensor
+                allocated by this pool with ``passthrough=True``. ``stream`` is
+                the raw address of the stream.
             use_on_oom: Whether allocations outside this pool may borrow its
                 cached blocks as a last resort. Defaults to ``False``.
             no_split: Whether the caching allocator should avoid splitting this
@@ -1757,7 +1762,9 @@ class MemPool(_MemPool):
         See :ref:`cuda-memory-python-allocators` for callback requirements and
         examples.
         """
-        allocator = torch._C._cuda_createPythonAllocator(alloc_fn, free_fn)
+        allocator = torch._C._cuda_createPythonAllocator(
+            alloc_fn, free_fn, record_stream_fn
+        )
         return cls(
             allocator, use_on_oom=use_on_oom, no_split=no_split, passthrough=passthrough
         )

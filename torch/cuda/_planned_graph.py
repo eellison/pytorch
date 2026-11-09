@@ -229,7 +229,7 @@ class PlannedGraph:
                 recorder.alloc, recorder.free, passthrough=True
             )
             record_graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(record_graph, pool=record_pool):
+            with torch.cuda.graph(record_graph, pool=record_pool.id):
                 outputs = self.fn(*args, **kwargs)
             del outputs, record_graph, record_pool
             torch.cuda.synchronize()
@@ -249,7 +249,7 @@ class PlannedGraph:
             placer.alloc, placer.free, passthrough=True
         )
         self.graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(self.graph, pool=self._pool):
+        with torch.cuda.graph(self.graph, pool=self._pool.id):
             self.outputs = self.fn(*args, **kwargs)
         if placer.count != len(allocations):
             raise RuntimeError(
