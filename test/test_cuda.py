@@ -10819,6 +10819,52 @@ for args in ((a, b), (a, b, False)):
         segments = torch.cuda.memory._snapshot()["segments"]
         self.assertTrue(len(segments) > 0, "expected more than one segment")
 
+    @unittest.skipIf(TEST_CUDAMALLOCASYNC, "requires the native caching allocator")
+    def test_mempool_deleted_during_capture(self):
+        # ~MemPool must not release the pool's cached memory while a capture is
+        # in progress (releasing synchronizes and frees), whether the pool dies
+        # on the capturing thread or another one, on the capture's device or
+        # another one.
+        def make_pool():
+            pool = torch.cuda.MemPool()
+            with torch.cuda.use_mem_pool(pool):
+                t = torch.ones(1024, 1024, device="cuda")
+            del t
+            return pool
+
+        def pool_segments(pool_id):
+            return [
+                s
+                for s in torch.cuda.memory._snapshot()["segments"]
+                if tuple(s["segment_pool_id"]) == tuple(pool_id)
+            ]
+
+        x = torch.ones(16, device="cuda")
+        devices = range(min(torch.cuda.device_count(), 2))
+        for device, other_thread in product(devices, (False, True)):
+            # a pool on another device than the capture's: freeing its segments
+            # during a global-mode capture is forbidden too
+            with torch.cuda.device(device):
+                held = [make_pool()]
+            pool_id = held[0].id
+            self.assertEqual(len(pool_segments(pool_id)), 1)
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g):
+                y = x * 2
+                if other_thread:
+                    t = threading.Thread(target=held.clear)
+                    t.start()
+                    t.join()
+                else:
+                    held.clear()
+                    gc.collect()
+            g.replay()
+            self.assertEqual(y, torch.full_like(y, 2))
+            # The pool is freeable: the next empty_cache releases its memory.
+            self.assertEqual(len(pool_segments(pool_id)), 1)
+            torch.cuda.empty_cache()
+            self.assertEqual(len(pool_segments(pool_id)), 0)
+
     @serialTest()
     def test_mempool_empty_cache_inactive(self):
         torch.cuda.empty_cache()

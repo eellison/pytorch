@@ -3476,6 +3476,11 @@ class DeviceCachingAllocator {
     return is_capture_context();
   }
 
+  bool hasActiveCaptures() {
+    std::lock_guard<std::recursive_mutex> lock(mutex);
+    return capture_tracker_.hasActiveCaptures();
+  }
+
   // Called by CUDAGraph::reset and MemPool::~MemPool()
   void releasePool(MempoolId_t mempool_id) {
     std::lock_guard<std::recursive_mutex> lock(mutex);
@@ -5655,6 +5660,14 @@ class NativeCachingAllocator : public CUDAAllocator {
       return false;
     }
     return device_allocator[device]->isCaptureContext();
+  }
+
+  bool hasActiveCaptures(c10::DeviceIndex device) override {
+    // Before init() no CUDAGraph can have begun a capture.
+    if (device < 0 || static_cast<size_t>(device) >= device_allocator.size()) {
+      return false;
+    }
+    return device_allocator[device]->hasActiveCaptures();
   }
 
   void releasePool(c10::DeviceIndex device, MempoolId_t mempool_id) override {

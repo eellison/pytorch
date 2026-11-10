@@ -173,6 +173,12 @@ class CUDAAllocator : public DeviceAllocator {
     return c10::cuda::currentStreamCaptureStatusMayInitCtx() !=
         CaptureStatus::None;
   }
+  // Whether a CUDA graph capture registered with markCaptureBegin is in
+  // progress on `device`, on any thread or stream. Allocators that do not
+  // track captures report only a capture of the current stream.
+  virtual bool hasActiveCaptures(c10::DeviceIndex device) {
+    return isCaptureContext(device);
+  }
   virtual void releasePool(c10::DeviceIndex device, MempoolId_t mempool_id) = 0;
   virtual int getPoolUseCount(
       c10::DeviceIndex /*device*/,
@@ -495,6 +501,10 @@ inline void markCaptureEnd(c10::DeviceIndex device) {
 
 inline bool isCaptureContext(c10::DeviceIndex device) {
   return get()->isCaptureContext(device);
+}
+
+inline bool hasActiveCaptures(c10::DeviceIndex device) {
+  return get()->hasActiveCaptures(device);
 }
 
 inline void recordHistory(

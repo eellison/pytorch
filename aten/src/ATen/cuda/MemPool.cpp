@@ -1,4 +1,5 @@
 #include <ATen/cuda/MemPool.h>
+#include <c10/cuda/CUDAFunctions.h>
 
 namespace at::cuda {
 
@@ -45,6 +46,17 @@ MemPool::~MemPool() {
   // until it is reset.
   CUDACachingAllocator::setUseOnOOM(device_, id_, false);
   CUDACachingAllocator::releasePool(device_, id_);
+  // Releasing the pool's cached memory synchronizes on its events and frees
+  // segments, which a CUDA graph capture in progress forbids, whichever thread
+  // or device captures (e.g. a pool garbage-collected inside a captured region,
+  // or on another thread during a capture). The pool is freeable already, so
+  // the next emptyCache (or an allocation that runs out of memory) releases it
+  // instead.
+  for (c10::DeviceIndex d = 0; d < c10::cuda::device_count(); ++d) {
+    if (CUDACachingAllocator::hasActiveCaptures(d)) {
+      return;
+    }
+  }
   c10::cuda::CUDACachingAllocator::emptyCache(id_);
 }
 
