@@ -685,6 +685,10 @@ getCurrentCUDAStream(), &cond_node, nullptr, 1, cudaStreamSetCaptureDependencies
   at::getHostAllocator(at::kCUDA)->begin_allocate_to_pool(mempool_id_, [filter](c10::Stream stream) {
     return filter(CUDAStream(CUDAStream::UNCHECKED, stream));
   });
+  // Each begin_allocate_to_pool takes a reference to the pool, and reset()
+  // drops only one: drop the one taken for the scope that just ended.
+  c10::cuda::CUDACachingAllocator::releasePool(capture_dev_, mempool_id_);
+  at::getHostAllocator(at::kCUDA)->release_pool(mempool_id_);
 
   AT_CUDA_CHECK(cudaStreamBeginCaptureToGraph(
       child_stream,
@@ -767,6 +771,9 @@ void CUDAGraph::end_capture_to_conditional_node() {
       return filter(CUDAStream(CUDAStream::UNCHECKED, stream));
     });
   }
+  // as in begin_capture_to_conditional_node
+  c10::cuda::CUDACachingAllocator::releasePool(capture_dev_, mempool_id_);
+  at::getHostAllocator(at::kCUDA)->release_pool(mempool_id_);
   TORCH_CHECK(
       invalid_capture_free_count == 0,
       "A CUDA graph allocation was freed from an invalid conditional capture "

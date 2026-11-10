@@ -7176,6 +7176,40 @@ torch._C._cuda_setCheckpointPoolState(device, state, [], [])
     @unittest.skipUnless(
         TEST_CUDA_NATIVE_ALLOCATOR, "requires the native CUDA caching allocator"
     )
+    def test_cuda_graph_conditional_releases_pool_on_reset(self):
+        # Entering and leaving a conditional body must not leak references to
+        # the graph's pool, or reset() never makes it freeable.
+        pool = torch.cuda.MemPool()
+        pred = torch.ones((), device="cuda", dtype=torch.bool)
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.stream(torch.cuda.Stream()):
+            g.capture_begin(pool=pool.id)
+            x = torch.ones(1024, device="cuda")
+            for _ in range(2):
+                g.begin_capture_to_if_node(pred)
+                self.assertEqual(pool.use_count(), 2)
+                x.add_(1)
+                g.end_capture_to_conditional_node()
+            g.capture_end()
+        self.assertEqual(pool.use_count(), 2)
+        g.replay()
+        torch.cuda.synchronize()
+        self.assertEqual(x, torch.full_like(x, 3))
+        g.reset()
+        self.assertEqual(pool.use_count(), 1)
+
+    @unittest.skipIf(
+        not TEST_CUDA_GRAPH, "CUDA >= 11.0 or ROCM >= 5.3 required for graphs"
+    )
+    @unittest.skipIf(
+        TEST_WITH_ROCM
+        or not torch.version.cuda
+        or tuple(int(x) for x in torch.version.cuda.split(".")) < (12, 4),
+        "CUDA >= 12.4 required for conditional graph nodes",
+    )
+    @unittest.skipUnless(
+        TEST_CUDA_NATIVE_ALLOCATOR, "requires the native CUDA caching allocator"
+    )
     @serialTest()
     def test_cuda_graph_conditional_tracks_auxiliary_stream_allocations(self):
         torch.cuda.empty_cache()
