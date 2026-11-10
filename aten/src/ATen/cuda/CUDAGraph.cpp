@@ -25,6 +25,22 @@ namespace at::cuda {
 static std::mutex _currently_capturing_graphs_mutex;
 static ska::flat_hash_map<CaptureId_t, CUDAGraph*> _currently_capturing_graphs;
 
+#if !defined(USE_ROCM) && (defined(CUDA_VERSION) && CUDA_VERSION >= 12040)
+// A conditional node switches the pool's allocation scope, and each
+// beginAllocateToPool takes a reference to the pool that reset() does not
+// drop: drop it here. The caching allocators count pool references; a
+// CUDAPluggableAllocator's release_pool callback may mean "graph destroyed",
+// so it keeps getting one release per graph.
+static void release_conditional_scope_reference(
+    c10::DeviceIndex device,
+    const MempoolId_t& mempool_id) {
+  if (c10::cuda::CUDACachingAllocator::get()->name() != "pluggable") {
+    c10::cuda::CUDACachingAllocator::releasePool(device, mempool_id);
+  }
+  at::getHostAllocator(at::kCUDA)->release_pool(mempool_id);
+}
+#endif
+
 
 #if defined(USE_ROCM)
 // Returns true when at least one CUDAGraph capture is currently active in this
@@ -685,10 +701,7 @@ getCurrentCUDAStream(), &cond_node, nullptr, 1, cudaStreamSetCaptureDependencies
   at::getHostAllocator(at::kCUDA)->begin_allocate_to_pool(mempool_id_, [filter](c10::Stream stream) {
     return filter(CUDAStream(CUDAStream::UNCHECKED, stream));
   });
-  // Each begin_allocate_to_pool takes a reference to the pool, and reset()
-  // drops only one: drop the one taken for the scope that just ended.
-  c10::cuda::CUDACachingAllocator::releasePool(capture_dev_, mempool_id_);
-  at::getHostAllocator(at::kCUDA)->release_pool(mempool_id_);
+  release_conditional_scope_reference(capture_dev_, mempool_id_);
 
   AT_CUDA_CHECK(cudaStreamBeginCaptureToGraph(
       child_stream,
@@ -771,9 +784,7 @@ void CUDAGraph::end_capture_to_conditional_node() {
       return filter(CUDAStream(CUDAStream::UNCHECKED, stream));
     });
   }
-  // as in begin_capture_to_conditional_node
-  c10::cuda::CUDACachingAllocator::releasePool(capture_dev_, mempool_id_);
-  at::getHostAllocator(at::kCUDA)->release_pool(mempool_id_);
+  release_conditional_scope_reference(capture_dev_, mempool_id_);
   TORCH_CHECK(
       invalid_capture_free_count == 0,
       "A CUDA graph allocation was freed from an invalid conditional capture "

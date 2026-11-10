@@ -7207,6 +7207,83 @@ torch._C._cuda_setCheckpointPoolState(device, state, [], [])
         or tuple(int(x) for x in torch.version.cuda.split(".")) < (12, 4),
         "CUDA >= 12.4 required for conditional graph nodes",
     )
+    @unittest.skipIf(IS_WINDOWS, "load_inline")
+    def test_cuda_graph_conditional_pluggable_release_pool_once(self):
+        # A CUDAPluggableAllocator does not count pool references: its
+        # release_pool callback gets one call per graph, from reset(), and none
+        # at a conditional node's scope switches.
+        code = """
+import ctypes
+import torch
+from torch.utils.cpp_extension import load_inline
+
+source = '''
+#include <cuda_runtime_api.h>
+#include <cstddef>
+#include <utility>
+extern "C" {
+int release_pool_calls = 0;
+void* alloc(size_t size, int device, cudaStream_t stream) {
+  void* ptr = nullptr;
+  return cudaMalloc(&ptr, size) == cudaSuccess ? ptr : nullptr;
+}
+void free_fn(void* ptr, size_t size, int device, cudaStream_t stream) {
+  cudaFree(ptr);
+}
+}
+void release_pool(int device, std::pair<unsigned long long, unsigned long long> pool) {
+  ++release_pool_calls;
+}
+extern "C" void* release_pool_address() {
+  return reinterpret_cast<void*>(&release_pool);
+}
+'''
+path = load_inline(
+    name="conditional_release_pool_allocator",
+    cpp_sources=source,
+    is_python_module=False,
+    keep_intermediates=False,
+    with_cuda=True,
+)
+lib = ctypes.CDLL(path)
+lib.release_pool_address.restype = ctypes.c_void_p
+allocator = torch.cuda.memory.CUDAPluggableAllocator(path, "alloc", "free_fn")
+allocator._allocator.set_release_pool(lib.release_pool_address())
+torch.cuda.memory.change_current_allocator(allocator)
+calls = ctypes.c_int.in_dll(lib, "release_pool_calls")
+
+pred = torch.ones((), device="cuda", dtype=torch.bool)
+x = torch.ones(1024, device="cuda")
+torch.cuda.synchronize()
+g = torch.cuda.CUDAGraph()
+with torch.cuda.stream(torch.cuda.Stream()):
+    g.capture_begin()
+    for _ in range(2):
+        g.begin_capture_to_if_node(pred)
+        x.add_(1)
+        g.end_capture_to_conditional_node()
+    g.capture_end()
+during_capture = calls.value
+g.replay()
+torch.cuda.synchronize()
+assert x.sum().item() == 3 * 1024
+g.reset()
+print("release_pool calls", during_capture, calls.value)
+"""
+        out = subprocess.check_output(
+            [sys.executable, "-c", code], text=True, timeout=600
+        )
+        self.assertIn("release_pool calls 0 1", out)
+
+    @unittest.skipIf(
+        not TEST_CUDA_GRAPH, "CUDA >= 11.0 or ROCM >= 5.3 required for graphs"
+    )
+    @unittest.skipIf(
+        TEST_WITH_ROCM
+        or not torch.version.cuda
+        or tuple(int(x) for x in torch.version.cuda.split(".")) < (12, 4),
+        "CUDA >= 12.4 required for conditional graph nodes",
+    )
     @unittest.skipUnless(
         TEST_CUDA_NATIVE_ALLOCATOR, "requires the native CUDA caching allocator"
     )
