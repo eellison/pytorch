@@ -13381,6 +13381,25 @@ print(json.dumps([
                 gc.collect()
                 torch.cuda.empty_cache()
 
+    def test_pluggable_allocator_raw_delete_nullptr(self):
+        # raw_alloc(0) of a CUDAPluggableAllocator whose alloc_fn returns NULL
+        # is not recorded, and raw_delete(nullptr) is a no-op
+        code = """
+import torch
+log = []
+a = torch._C._cuda_createPythonAllocator(
+    lambda size, dev, stream: log.append(("alloc", size)) or None,
+    lambda ptr, size, dev, stream: log.append(("free", ptr, size)))
+torch.cuda.memory.change_current_allocator(torch.cuda.memory._CUDAAllocator(a))
+p = torch.cuda.caching_allocator_alloc(0)
+torch.cuda.caching_allocator_delete(p)
+print("OK", p, log)
+"""
+        out = subprocess.check_output(
+            [sys.executable, "-c", code], text=True, timeout=300
+        )
+        self.assertIn("OK 0 [('alloc', 0)]", out)
+
 
 @unittest.skipIf(not TEST_CUDA, "CUDA not available, skipping tests")
 @torch.testing._internal.common_utils.markDynamoStrictTest

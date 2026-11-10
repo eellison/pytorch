@@ -85,7 +85,7 @@ void* CUDAPluggableAllocator::malloc(
     c10::DeviceIndex device,
     cudaStream_t stream) {
   void* r = alloc_fn_(size, device, stream);
-  {
+  if (r != nullptr) {
     const std::lock_guard<std::mutex> lock(allocator_mutex_);
     allocation_metadata_.emplace(r, _AllocationMetadata(size, device, stream));
   }
@@ -122,6 +122,11 @@ void* CUDAPluggableAllocator::raw_alloc_with_stream(
 }
 
 void CUDAPluggableAllocator::raw_delete(void* ptr) {
+  // as for the caching allocator: raw_alloc(0) may return nullptr, which is
+  // not recorded
+  if (ptr == nullptr) {
+    return;
+  }
   cudaStream_t stream{};
   c10::DeviceIndex device_idx = -1;
   size_t size = 0;
