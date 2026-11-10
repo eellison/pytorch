@@ -47,6 +47,8 @@ using c10::cuda::CUDACachingAllocator::setNoSplit;
 using c10::cuda::CUDACachingAllocator::getPoolUseCount;
 using c10::cuda::CUDACachingAllocator::getIpcDevPtr;
 using c10::cuda::CUDACachingAllocator::shareIpcHandle;
+using c10::cuda::CUDACachingAllocator::LayeredAllocatorHooks;
+using c10::cuda::CUDACachingAllocator::setLayeredAllocatorHooks;
 using c10::cuda::CUDACachingAllocator::name;
 using c10::cuda::CUDACachingAllocator::memcpyAsync;
 using c10::cuda::CUDACachingAllocator::enablePeerAccess;

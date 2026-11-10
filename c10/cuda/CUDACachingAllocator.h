@@ -3,6 +3,7 @@
 #include <c10/core/AllocatorConfig.h>
 #include <c10/core/CachingDeviceAllocator.h>
 #include <c10/cuda/CUDAAllocatorConfig.h>
+#include <c10/cuda/CUDAGraphMemory.h>
 #include <c10/cuda/CUDAGraphsC10Utils.h>
 #include <c10/cuda/CUDAMacros.h>
 #include <c10/cuda/CUDAStream.h>
@@ -161,6 +162,19 @@ class CUDAAllocator : public DeviceAllocator {
   // registration, or inductor cudagraph_trees warmup).
   virtual void markCaptureBegin(c10::DeviceIndex /*device*/) {}
   virtual void markCaptureEnd(c10::DeviceIndex /*device*/) {}
+  // Registration-aware versions (see CUDAGraphMemory.h). Allocators that do
+  // not track capture registrations get the legacy hooks above.
+  virtual void markCaptureBegin(
+      c10::DeviceIndex device,
+      const CUDAGraphMemory::CaptureRegistration& /*registration*/) {
+    markCaptureBegin(device);
+  }
+  virtual size_t markCaptureEnd(
+      c10::DeviceIndex device,
+      CaptureId_t /*capture_id*/) {
+    markCaptureEnd(device);
+    return 0;
+  }
   // Whether the current stream on `device` is inside a CUDA graph capture.
   // The native allocator answers from the capture count kept by
   // markCaptureBegin/markCaptureEnd and only queries the driver while a
@@ -180,6 +194,14 @@ class CUDAAllocator : public DeviceAllocator {
     return isCaptureContext(device);
   }
   virtual void releasePool(c10::DeviceIndex device, MempoolId_t mempool_id) = 0;
+  // For an allocator layered over this one (torch.cuda.memory.use_allocator):
+  // the private pool that the open beginAllocateToPool scopes of `device`
+  // route an allocation on `stream` from the calling thread to, or {0, 0}.
+  virtual MempoolId_t getAllocationPool(
+      c10::DeviceIndex /*device*/,
+      cudaStream_t /*stream*/) {
+    return {0, 0};
+  }
   virtual int getPoolUseCount(
       c10::DeviceIndex /*device*/,
       MempoolId_t /*mempool_id*/) {
@@ -367,6 +389,20 @@ C10_CUDA_API extern std::atomic<CUDAAllocator*> allocator;
 inline CUDAAllocator* get() {
   return allocator.load();
 }
+
+// An allocator layered over the native one (torch.cuda.memory.use_allocator)
+// keeps owning memory after it stops being current:
+//   deleter: the DataPtr deleter of its tensors. The native recordStream
+//     rejects them instead of skipping them as foreign memory.
+//   raw_delete(ptr): frees the layer's raw allocation ptr, if it is one, and
+//     returns whether it was. The native raw_delete asks first: such a pointer
+//     may also start a live native block (an allocator sub-allocating from a
+//     tensor's storage).
+struct LayeredAllocatorHooks {
+  DeleterFnPtr deleter;
+  bool (*raw_delete)(void* ptr);
+};
+C10_CUDA_API void setLayeredAllocatorHooks(const LayeredAllocatorHooks* hooks);
 
 // Called directly by clients.
 inline void* raw_alloc(size_t nbytes) {

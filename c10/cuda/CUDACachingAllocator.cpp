@@ -3508,8 +3508,18 @@ class DeviceCachingAllocator {
 
   int getPoolUseCount(MempoolId_t mempool_id) const {
     std::lock_guard<std::recursive_mutex> lock(mutex);
-    auto pp = get_private_pool(mempool_id);
-    return pp->use_count;
+    auto it = graph_pools.find(mempool_id);
+    return it == graph_pools.end() ? 0 : it->second->use_count;
+  }
+
+  MempoolId_t getAllocationPool(cudaStream_t stream) {
+    std::lock_guard<std::recursive_mutex> lock(mutex);
+    for (auto& [pool_id, scope] : std::views::reverse(allocation_scopes_)) {
+      if (scope(stream)) {
+        return pool_id;
+      }
+    }
+    return {0, 0};
   }
 
   void addPeerAccess(c10::DeviceIndex dev_to_access) {
@@ -5041,6 +5051,7 @@ static void uncached_delete(void* ptr) {
 }
 
 static void local_raw_delete(void* ptr);
+static std::atomic<const LayeredAllocatorHooks*> layered_hooks{nullptr};
 // NOLINTBEGIN(misc-use-internal-linkage)
 thread_local std::stack<std::string> DeviceCachingAllocator::compile_context;
 thread_local std::string DeviceCachingAllocator::user_metadata;
@@ -5406,8 +5417,14 @@ class NativeCachingAllocator : public CUDAAllocator {
     // we have implemented reference counting based sharing mechanism to
     // guarantee tensors won't be accidentally freed by one process while
     // they are still being used in another
-    if (ptr.get_deleter() != &local_raw_delete)
+    if (ptr.get_deleter() != &local_raw_delete) {
+      auto* layered = layered_hooks.load(std::memory_order_acquire);
+      TORCH_CHECK(
+          !layered || ptr.get_deleter() != layered->deleter,
+          "record_stream is not supported for now on memory allocated through "
+          "torch.cuda.memory.use_allocator");
       return;
+    }
 
     Block* block = get_allocated_block(ptr.get());
     // block must not be null reaching here
@@ -5639,7 +5656,7 @@ class NativeCachingAllocator : public CUDAAllocator {
 
   void markCaptureBegin(
       c10::DeviceIndex device,
-      const CUDAGraphMemory::CaptureRegistration& registration) {
+      const CUDAGraphMemory::CaptureRegistration& registration) override {
     assertValidDevice(device);
     device_allocator[device]->markCaptureBegin(registration);
   }
@@ -5649,7 +5666,8 @@ class NativeCachingAllocator : public CUDAAllocator {
     device_allocator[device]->markCaptureEnd();
   }
 
-  size_t markCaptureEnd(c10::DeviceIndex device, CaptureId_t capture_id) {
+  size_t markCaptureEnd(c10::DeviceIndex device, CaptureId_t capture_id)
+      override {
     assertValidDevice(device);
     return device_allocator[device]->markCaptureEnd(capture_id);
   }
@@ -5679,6 +5697,12 @@ class NativeCachingAllocator : public CUDAAllocator {
       override {
     assertValidDevice(device);
     return device_allocator[device]->getPoolUseCount(std::move(mempool_id));
+  }
+
+  MempoolId_t getAllocationPool(c10::DeviceIndex device, cudaStream_t stream)
+      override {
+    assertValidDevice(device);
+    return device_allocator[device]->getAllocationPool(stream);
   }
 
   void* raw_alloc(size_t nbytes) override {
@@ -5752,6 +5776,10 @@ class NativeCachingAllocator : public CUDAAllocator {
   }
 
   void raw_delete(void* ptr) override {
+    if (auto* layered = layered_hooks.load(std::memory_order_acquire);
+        C10_UNLIKELY(layered != nullptr) && layered->raw_delete(ptr)) {
+      return;
+    }
     if (!isEnabled()) {
       uncached_delete(ptr);
     } else {
@@ -5917,32 +5945,22 @@ void local_raw_delete(void* ptr) {
 
 } // namespace Native
 
+void setLayeredAllocatorHooks(const LayeredAllocatorHooks* hooks) {
+  Native::layered_hooks.store(hooks, std::memory_order_release);
+}
+
 } // namespace cuda::CUDACachingAllocator
 
 namespace cuda::CUDAGraphMemory {
 
-// TODO: Migrate out-of-tree allocators before replacing the legacy
-// CUDAAllocator capture hooks with registration-aware hooks.
 void markCaptureBegin(
     c10::DeviceIndex device,
     const CaptureRegistration& registration) {
-  auto* current_allocator = CUDACachingAllocator::get();
-  if (current_allocator == &CUDACachingAllocator::Native::allocator) {
-    CUDACachingAllocator::Native::allocator.markCaptureBegin(
-        device, registration);
-  } else {
-    current_allocator->markCaptureBegin(device);
-  }
+  CUDACachingAllocator::get()->markCaptureBegin(device, registration);
 }
 
 size_t markCaptureEnd(c10::DeviceIndex device, CaptureId_t capture_id) {
-  auto* current_allocator = CUDACachingAllocator::get();
-  if (current_allocator == &CUDACachingAllocator::Native::allocator) {
-    return CUDACachingAllocator::Native::allocator.markCaptureEnd(
-        device, capture_id);
-  }
-  current_allocator->markCaptureEnd(device);
-  return 0;
+  return CUDACachingAllocator::get()->markCaptureEnd(device, capture_id);
 }
 
 } // namespace cuda::CUDAGraphMemory
