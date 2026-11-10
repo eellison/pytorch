@@ -13400,6 +13400,327 @@ print("OK", p, log)
         )
         self.assertIn("OK 0 [('alloc', 0)]", out)
 
+    class _PassthroughArena:
+        """Bump allocator over one preallocated CUDA buffer, starting at the
+        buffer's own address, that records every call: the allocator of a
+        passthrough MemPool."""
+
+        def __init__(self, nbytes=64 << 20):
+            self.buf = torch.empty(nbytes, dtype=torch.uint8, device="cuda")
+            self.base = self.buf.data_ptr()
+            self.end = self.base + nbytes
+            self.top = self.base
+            self.log = []  # ("alloc" | "free", ptr, size, stream)
+
+        def alloc(self, size, device, stream):
+            if self.top + size > self.end:
+                return None
+            ptr = self.top
+            self.top += (size + 511) // 512 * 512
+            self.log.append(("alloc", ptr, size, stream))
+            return ptr
+
+        def free(self, ptr, size, device, stream):
+            self.log.append(("free", ptr, size, stream))
+
+        def allocs(self):
+            return [e[1:] for e in self.log if e[0] == "alloc"]
+
+        def frees(self):
+            return [e[1:] for e in self.log if e[0] == "free"]
+
+        def owns(self, t):
+            return self.base <= t.data_ptr() < self.end
+
+        def pool(self):
+            return torch.cuda.MemPool.from_py_allocator(
+                self.alloc, self.free, passthrough=True
+            )
+
+    @unittest.skipIf(TEST_CUDAMALLOCASYNC, "requires the native caching allocator")
+    def test_mempool_passthrough_routes_each_allocation(self):
+        arena = self._PassthroughArena()
+        pool = arena.pool()
+        stream = torch.cuda.current_stream().cuda_stream
+        allocated_before = torch.cuda.memory_allocated()
+        with torch.cuda.use_mem_pool(pool):
+            a = torch.empty(1000, dtype=torch.float32, device="cuda")
+            b = torch.empty(3 << 20, dtype=torch.uint8, device="cuda")
+        # one allocator call per tensor, in order, with its exact size; the
+        # first one is at the buffer's own address (a live native block)
+        self.assertEqual(
+            arena.allocs(),
+            [(a.data_ptr(), a.nbytes, stream), (b.data_ptr(), b.nbytes, stream)],
+        )
+        self.assertEqual(a.data_ptr(), arena.base)
+        # the caching allocator does not account for them
+        self.assertEqual(torch.cuda.memory_allocated(), allocated_before)
+        # allocations outside the scope are not routed
+        c = torch.empty(1000, device="cuda")
+        self.assertFalse(arena.owns(c))
+        # frees reach the allocator at once, in order; empty_cache is unrelated
+        a_ptr, b_ptr = a.data_ptr(), b.data_ptr()
+        del b
+        torch.cuda.empty_cache()
+        self.assertEqual(arena.frees(), [(b_ptr, 3 << 20, stream)])
+        del a, c
+        self.assertEqual([p for p, _, _ in arena.frees()], [b_ptr, a_ptr])
+        # a capture into the pool: the same, on the capture stream, and a
+        # free inside the capture reaches the allocator at once
+        x = torch.ones(1024, device="cuda")
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(2):
+                (x * 2 + 1).sum()
+        torch.cuda.current_stream().wait_stream(s)
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g, pool=pool.id, stream=s):
+            tmp = x * 2
+            tmp_ptr = tmp.data_ptr()
+            y = tmp + 1
+            del tmp
+        self.assertTrue(arena.owns(y))
+        self.assertEqual([st for _, _, st in arena.allocs()[2:]], [s.cuda_stream] * 2)
+        self.assertEqual([p for p, _, _ in arena.frees()[2:]], [tmp_ptr])
+        self.assertIn(tuple(pool.id), [tuple(p) for p in g.pools()])
+        x.fill_(3)
+        g.replay()
+        torch.cuda.synchronize()
+        self.assertEqual(y, torch.full_like(y, 7))
+        # frees after the capture, and after the MemPool is gone, are
+        # immediate too; the graph still uses the memory on replay (the bump
+        # allocator never reuses it)
+        del pool
+        gc.collect()
+        torch.cuda.empty_cache()
+        y_ptr = y.data_ptr()
+        del y
+        self.assertEqual([p for p, _, _ in arena.frees()[2:]], [tmp_ptr, y_ptr])
+        g.replay()
+        torch.cuda.synchronize()
+        g.reset()
+        self.assertEqual(len(arena.frees()), 4)
+
+    @unittest.skipIf(TEST_CUDAMALLOCASYNC, "requires the native caching allocator")
+    def test_mempool_passthrough_pools_threads_devices_stay_native(self):
+        arena = self._PassthroughArena()
+        passthrough = arena.pool()
+        regular = torch.cuda.MemPool()
+        allocator, dummy_allocator = self.get_dummy_allocator(check_vars=True)
+        custom = torch.cuda.MemPool(allocator.allocator())
+        # pools used inside the scope (e.g. NCCL registration or symmetric
+        # memory pools) keep getting cached segments from their allocator
+        with torch.cuda.use_mem_pool(regular):
+            with torch.cuda.use_mem_pool(passthrough):
+                inner = torch.empty(1024, device="cuda")
+                with torch.cuda.use_mem_pool(custom):
+                    nested = torch.empty(1024, device="cuda")
+            outer = torch.empty(1024, device="cuda")
+        self.assertTrue(arena.owns(inner))
+        self.assertFalse(arena.owns(nested) or arena.owns(outer))
+        self.assertEqual((len(custom.snapshot()), len(regular.snapshot())), (1, 1))
+        # the same C++ allocator as a passthrough pool: per tensor, no segment
+        alloc_lib = ctypes.CDLL(dummy_allocator)
+        called_dummy_alloc = ctypes.c_int.in_dll(alloc_lib, "called_dummy_alloc")
+        called_dummy_free = ctypes.c_int.in_dll(alloc_lib, "called_dummy_free")
+        called_dummy_free.value = 0
+        cpp = torch.cuda.MemPool(allocator.allocator(), passthrough=True)
+        with torch.cuda.use_mem_pool(cpp):
+            t = torch.ones(1000, device="cuda")
+        self.assertEqual(len(cpp.snapshot()), 0)
+        self.assertEqual(t.sum().item(), 1000)
+        del t
+        self.assertEqual(called_dummy_free.value, 321)
+        # other threads and devices are not routed
+        others = []
+        with torch.cuda.use_mem_pool(passthrough):
+            th = threading.Thread(
+                target=lambda: others.append(torch.empty(1024, device="cuda"))
+            )
+            th.start()
+            th.join()
+            if torch.cuda.device_count() > 1:
+                others.append(torch.empty(1024, device="cuda:1"))
+            mine = torch.empty(1024, device="cuda")
+        self.assertTrue(arena.owns(mine))
+        self.assertFalse(any(arena.owns(o) for o in others))
+        self.assertEqual(len(arena.allocs()), 2)
+        # a pool used inside a captured step
+        x = torch.ones(1024, device="cuda")
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g, pool=passthrough.id):
+            a = x * 2
+            with torch.cuda.use_mem_pool(regular):
+                b = a + 1
+        self.assertTrue(arena.owns(a))
+        self.assertFalse(arena.owns(b))
+        self.assertIn(tuple(regular.id), [tuple(p) for p in g.pools()])
+        x.fill_(3)
+        g.replay()
+        torch.cuda.synchronize()
+        self.assertEqual(b, torch.full_like(b, 7))
+        del inner, nested, outer, mine, a, b, g
+        others.clear()
+        # release custom's segment now (through the C++ allocator): other
+        # tests expect to be the library's first user
+        del custom
+        called_dummy_alloc.value = 0
+        called_dummy_free.value = 0
+
+    @unittest.skipIf(TEST_CUDAMALLOCASYNC, "requires the native caching allocator")
+    def test_mempool_passthrough_raw_alloc(self):
+        arena = self._PassthroughArena()
+        pool = arena.pool()
+        allocated_before = torch.cuda.memory_allocated()
+        with torch.cuda.use_mem_pool(pool):
+            p0 = torch.cuda.caching_allocator_alloc(4096)
+            p1 = torch.cuda.caching_allocator_alloc(8192)
+        self.assertEqual(
+            [(p, s) for p, s, _ in arena.allocs()], [(p0, 4096), (p1, 8192)]
+        )
+        self.assertEqual(torch.cuda.memory_allocated(), allocated_before)
+        # p0 is the address of the buffer's own (native) block: deleting it
+        # frees the raw allocation, not the block
+        self.assertEqual(p0, arena.base)
+        torch.cuda.caching_allocator_delete(p0)
+        self.assertEqual([(p, s) for p, s, _ in arena.frees()], [(p0, 4096)])
+        self.assertEqual(torch.cuda.memory_allocated(), allocated_before)
+        arena.buf.fill_(1)
+        torch.cuda.caching_allocator_delete(p1)
+        self.assertEqual(len(arena.frees()), 2)
+        with self.assertRaisesRegex(RuntimeError, "invalid device pointer"):
+            torch.cuda.caching_allocator_delete(p1)
+        # native raw allocations are unaffected
+        native = torch.cuda.caching_allocator_alloc(4096)
+        torch.cuda.caching_allocator_delete(native)
+        self.assertEqual(len(arena.frees()), 2)
+        self.assertEqual(arena.buf[:16].sum().item(), 16)
+
+    @unittest.skipIf(TEST_CUDAMALLOCASYNC, "requires the native caching allocator")
+    def test_mempool_passthrough_resize_of_existing_storage(self):
+        # FSDP2-style: a storage created outside the scope is resized inside it
+        x = torch.empty(4096, device="cuda")
+        storage = x.untyped_storage()
+        nbytes = storage.nbytes()
+        storage.resize_(0)
+        arena = self._PassthroughArena()
+        pool = arena.pool()
+        with torch.cuda.use_mem_pool(pool):
+            storage.resize_(nbytes)
+        self.assertTrue(arena.owns(x))
+        self.assertEqual([s for _, s, _ in arena.allocs()], [nbytes])
+        x.fill_(2)
+        self.assertEqual(x.sum().item(), 2 * 4096)
+        storage.resize_(0)
+        self.assertEqual([(p, s) for p, s, _ in arena.frees()], [(arena.base, nbytes)])
+        # resized again outside the scope: native
+        storage.resize_(nbytes)
+        self.assertFalse(arena.owns(x))
+
+    @unittest.skipIf(TEST_CUDAMALLOCASYNC, "requires the native caching allocator")
+    def test_mempool_passthrough_multiple_graphs_and_shared_pools(self):
+        arena1, arena2 = self._PassthroughArena(), self._PassthroughArena()
+        pool1, pool2 = arena1.pool(), arena2.pool()
+        x = torch.ones(1024, device="cuda")
+        g1, g2, g3 = (torch.cuda.CUDAGraph() for _ in range(3))
+        with torch.cuda.graph(g1, pool=pool1.id):
+            y1 = x * 2
+        with torch.cuda.graph(g2, pool=pool2.id):
+            y2 = y1 + 1
+        # a second graph sharing pool1, and so its allocator
+        with torch.cuda.graph(g3, pool=pool1.id):
+            y3 = y2 * 2
+        self.assertTrue(arena1.owns(y1) and arena2.owns(y2) and arena1.owns(y3))
+        self.assertEqual((len(arena1.allocs()), len(arena2.allocs())), (2, 1))
+        x.fill_(3)
+        for g in (g1, g2, g3):
+            g.replay()
+        torch.cuda.synchronize()
+        self.assertEqual(y3, torch.full_like(y3, 14))
+        # each free goes to the allocator that made the allocation
+        y2_ptr = y2.data_ptr()
+        del y2
+        self.assertEqual([p for p, _, _ in arena2.frees()], [y2_ptr])
+        self.assertEqual(arena1.frees(), [])
+        g2.reset()
+        del y1, y3
+        self.assertEqual(len(arena1.frees()), 2)
+
+    @unittest.skipIf(TEST_CUDAMALLOCASYNC, "requires the native caching allocator")
+    def test_mempool_passthrough_errors(self):
+        arena = self._PassthroughArena()
+        with self.assertRaisesRegex(RuntimeError, "requires a custom allocator"):
+            torch.cuda.MemPool(passthrough=True)
+        for kwargs in ({"use_on_oom": True}, {"no_split": True}):
+            with self.assertRaisesRegex(RuntimeError, "use_on_oom and no_split"):
+                torch.cuda.MemPool.from_py_allocator(
+                    arena.alloc, arena.free, passthrough=True, **kwargs
+                )
+        mode = [None]
+
+        def alloc(size, device, stream):
+            if mode[0] == "none":
+                return None
+            if mode[0] == "raise":
+                raise ValueError("planner says no")
+            if mode[0] == "misaligned":
+                return arena.base + 16
+            return arena.alloc(size, device, stream)
+
+        pool = torch.cuda.MemPool.from_py_allocator(alloc, arena.free, passthrough=True)
+        allocated_before = torch.cuda.memory_allocated()
+        with torch.cuda.use_mem_pool(pool):
+            mode[0] = "none"
+            with self.assertRaisesRegex(torch.OutOfMemoryError, "passthrough MemPool"):
+                torch.empty(1024, device="cuda")
+            mode[0] = "raise"
+            with self.assertRaisesRegex(ValueError, "planner says no"):
+                torch.empty(1024, device="cuda")
+            mode[0] = "misaligned"
+            with self.assertRaisesRegex(RuntimeError, "not aligned to 256 bytes"):
+                torch.empty(16, device="cuda")
+            # the misaligned pointer was handed back
+            self.assertEqual(
+                [(p, s) for p, s, _ in arena.frees()], [(arena.base + 16, 64)]
+            )
+            mode[0] = None
+            a = torch.empty(1024, device="cuda")
+        self.assertTrue(arena.owns(a))
+        self.assertEqual(torch.cuda.memory_allocated(), allocated_before)
+        # record_stream is not supported on these tensors; native ones unaffected
+        side = torch.cuda.Stream()
+        with self.assertRaisesRegex(RuntimeError, "record_stream is not supported"):
+            a.record_stream(side)
+        torch.ones(1024, device="cuda").record_stream(side)
+        a_ptr = a.data_ptr()
+        del a
+        self.assertEqual([p for p, _, _ in arena.frees()], [arena.base + 16, a_ptr])
+
+    def test_mempool_passthrough_requires_native_caching(self):
+        code = """
+import torch
+try:
+    torch.cuda.MemPool.from_py_allocator(
+        lambda *args: None, lambda *args: None, passthrough=True)
+except RuntimeError as e:
+    print("ERR", e)
+"""
+        for env, expected in (
+            ({"PYTORCH_NO_CUDA_MEMORY_CACHING": "1"}, "caching is disabled"),
+            (
+                {"PYTORCH_CUDA_ALLOC_CONF": "backend:cudaMallocAsync"},
+                "requires the native CUDA caching allocator",
+            ),
+        ):
+            out = subprocess.check_output(
+                [sys.executable, "-c", code],
+                text=True,
+                timeout=300,
+                env={**os.environ, **env},
+            )
+            self.assertIn(expected, out)
+
 
 @unittest.skipIf(not TEST_CUDA, "CUDA not available, skipping tests")
 @torch.testing._internal.common_utils.markDynamoStrictTest

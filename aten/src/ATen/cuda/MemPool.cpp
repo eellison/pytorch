@@ -20,8 +20,28 @@ MemPool::MemPool(
     std::shared_ptr<CUDACachingAllocator::CUDAAllocator> allocator,
     bool is_user_created,
     bool use_on_oom,
-    bool no_split)
+    bool no_split,
+    bool passthrough)
     : is_user_created_(is_user_created) {
+  TORCH_CHECK(
+      !passthrough || allocator,
+      "MemPool(passthrough=True) requires a custom allocator");
+  TORCH_CHECK(
+      !passthrough || (!use_on_oom && !no_split),
+      "MemPool(passthrough=True) does not cache blocks, so use_on_oom and "
+      "no_split do not apply");
+  // Checked before the pool is created, so a failure leaves nothing behind.
+  TORCH_CHECK(
+      !passthrough ||
+          CUDACachingAllocator::get()->name() == std::string("native"),
+      "MemPool(passthrough=True) requires the native CUDA caching allocator "
+      "backend, but the current allocator is ",
+      CUDACachingAllocator::get()->name());
+  TORCH_CHECK(
+      !passthrough || CUDACachingAllocator::get()->isEnabled(),
+      "MemPool(passthrough=True) is not supported while CUDA memory caching "
+      "is disabled (PYTORCH_NO_CUDA_MEMORY_CACHING=1): allocations would "
+      "bypass the pool");
   if (is_user_created_) {
     id_ = {0, uid_++};
   } else {
@@ -35,6 +55,9 @@ MemPool::MemPool(
   }
   if (no_split) {
     CUDACachingAllocator::setNoSplit(device_, id_);
+  }
+  if (passthrough) {
+    CUDACachingAllocator::setPassthrough(device_, id_);
   }
 }
 

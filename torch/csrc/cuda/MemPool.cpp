@@ -14,16 +14,27 @@ using shared_ptr_class_ = py::class_<T, std::shared_ptr<T>>;
 void THCPMemPool_init(PyObject* module) {
   auto torch_C_m = py::handle(module).cast<py::module>();
   shared_ptr_class_<::at::cuda::MemPool>(torch_C_m, "_MemPool")
-      .def(py::init(
-          [](std::shared_ptr<c10::cuda::CUDACachingAllocator::CUDAAllocator>
-                 allocator,
-             bool is_user_created,
-             bool use_on_oom,
-             bool no_split) {
-            torch::utils::device_lazy_init(at::kCUDA);
-            return std::make_shared<::at::cuda::MemPool>(
-                std::move(allocator), is_user_created, use_on_oom, no_split);
-          }))
+      .def(
+          py::init(
+              [](std::shared_ptr<c10::cuda::CUDACachingAllocator::CUDAAllocator>
+                     allocator,
+                 bool is_user_created,
+                 bool use_on_oom,
+                 bool no_split,
+                 bool passthrough) {
+                torch::utils::device_lazy_init(at::kCUDA);
+                return std::make_shared<::at::cuda::MemPool>(
+                    std::move(allocator),
+                    is_user_created,
+                    use_on_oom,
+                    no_split,
+                    passthrough);
+              }),
+          py::arg("allocator"),
+          py::arg("is_user_created") = true,
+          py::arg("use_on_oom") = false,
+          py::arg("no_split") = false,
+          py::arg("passthrough") = false)
       .def_property_readonly("id", &::at::cuda::MemPool::id)
       .def("use_count", &::at::cuda::MemPool::use_count);
 }

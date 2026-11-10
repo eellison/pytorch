@@ -1063,6 +1063,51 @@ mode. It may call allocation APIs such as `cudaMalloc` or CUDA virtual-memory
 APIs, but it must not launch work on or synchronize the capturing stream,
 synchronize the device, or begin or end capture.
 
+(cuda-memory-passthrough)=
+### Per-tensor allocation with `passthrough=True`
+
+By default, the allocator of a pool only provides segments, which the caching
+allocator splits and reuses. With `passthrough=True`, every allocation routed
+to the pool (by {func}`torch.cuda.use_mem_pool` or CUDA graph capture,
+including {func}`torch.cuda.caching_allocator_alloc`) calls the allocator with
+the allocation's exact size in bytes, and freeing the tensor (or
+{func}`torch.cuda.caching_allocator_delete`) calls the free callback
+immediately, even after the scope has exited or the pool has been destroyed.
+The allocator must return pointers aligned to 256 bytes, as `cudaMalloc` does.
+This lets the allocator decide where each tensor lives, for example to place
+the tensors of a captured CUDA graph according to an offline memory plan.
+
+```python
+pool = torch.cuda.MemPool.from_py_allocator(alloc, free, passthrough=True)
+with torch.cuda.use_mem_pool(pool):
+    x = torch.empty(1024, device="cuda")  # alloc(4096, device, stream)
+del x  # free(ptr, 4096, device, stream)
+```
+
+The semantics are those of the caching allocator: allocations and frees reach
+the allocator in program order, and a free means that PyTorch no longer
+references the memory. As for the blocks of a graph's private pool, memory
+freed during a capture is still used by the graph on every replay, so the
+allocator must not hand it out, or release it, outside that graph until the
+graph has been reset and its last replay has completed.
+
+The caching allocator keeps no state for these allocations, so:
+
+* they are not counted by {func}`torch.cuda.memory_stats` or shown in memory
+  snapshots, and {func}`torch.cuda.empty_cache` does not touch them;
+* an allocation the allocator cannot satisfy raises
+  {class}`torch.OutOfMemoryError` without releasing cached blocks and retrying;
+* {meth}`torch.Tensor.record_stream` on these tensors raises; reuse across
+  streams is the allocator's responsibility;
+* they cannot be shared with other processes or lazily cloned, and the
+  allocation callback must not allocate through PyTorch inside the scope;
+* conditional nodes are unsupported: the conditional-scope free check does
+  not cover the allocator's memory.
+
+Allocations outside the pool's scope, including those of other threads and
+devices, and of pools used inside the scope, are not affected. The pool
+requires the native caching allocator backend with caching enabled.
+
 
 ## Tuning NVLink Performance with Custom Memory Allocator on H100/H200 GPUs
 In rare cases, performance of NVLink on H100/H200 GPUs can be influenced by the physical memory
