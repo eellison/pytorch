@@ -358,6 +358,7 @@ Save after instantiation and before resetting or destroying the graph.
      get_allocator_backend
      CUDAPluggableAllocator
      change_current_allocator
+     use_allocator
      MemPool
      LocalizedAllocator
 ```

@@ -65,6 +65,7 @@ __all__ = [
     "get_allocator_backend",
     "CUDAPluggableAllocator",
     "change_current_allocator",
+    "use_allocator",
     "MemPool",
     "LocalizedAllocator",
     "use_mem_pool",
@@ -1676,6 +1677,47 @@ def change_current_allocator(allocator: _CUDAAllocator) -> None:
         See :ref:`cuda-memory-management` for details on creating and using a custom allocator
     """
     torch._C._cuda_changeCurrentAllocator(allocator.allocator())
+
+
+@contextlib.contextmanager
+def use_allocator(allocator: _CUDAAllocator):
+    r"""Context manager: CUDA graphs captured in it on this thread allocate from ``allocator``.
+
+    While any such context is open, the current CUDA allocator forwards everything to the caching
+    allocator, except the allocations of the captures this context *claims*: a capture begun on this
+    thread into a new private pool (:class:`torch.cuda.graph` with no ``pool``, or a fresh
+    :func:`graph_pool_handle`), or into a pool an earlier capture of this context claimed. While such a
+    capture is in progress, every allocation that the caching allocator would place into its pool
+    (tensors, :func:`caching_allocator_alloc`, ``resize_`` of storages, from any thread) is made by
+    ``allocator`` at its exact size, one call per allocation. Everything else behaves as without the
+    context: :func:`use_mem_pool` scopes opened inside the capture, :class:`MemPool` pools (NCCL,
+    symmetric memory), other threads, devices and captures, and the memory statistics, which do not
+    count the memory of ``allocator``.
+
+    ``allocator`` sees the same calls as a :class:`CUDAPluggableAllocator` does today:
+    ``alloc_fn(size, device, stream)``, which must return a 256-byte aligned address (``None`` raises
+    :class:`torch.OutOfMemoryError`) and runs in relaxed capture mode (it may ``cudaMalloc``), and
+    ``free_fn(ptr, size, device, stream)`` as soon as the allocation dies, in order. A free during
+    the capture means that the lifetime ended; the graph keeps using the memory, so ``allocator`` must
+    not hand it out again outside that graph until the graph is destroyed (the caching allocator
+    reuses blocks freed in a capture only within the graph's pool). ``alloc_fn`` must not allocate
+    CUDA memory through PyTorch.
+
+    Not supported: :meth:`~torch.Tensor.record_stream` on memory of ``allocator`` (raises), sharing
+    it between processes, conditional graph nodes (a conditional body's allocations route like the rest
+    of the capture, but the caching allocator's conditional-scope free check does not cover them),
+    cudagraph trees, and the ``cudaMallocAsync`` backend. Contexts exit innermost first, on the thread
+    that entered them.
+
+    Args:
+        allocator(torch.cuda.memory._CUDAAllocator): the allocator, e.g. a
+            :class:`CUDAPluggableAllocator`.
+    """
+    token = torch._C._cuda_beginUseAllocator(allocator.allocator())
+    try:
+        yield
+    finally:
+        torch._C._cuda_endUseAllocator(token)
 
 
 def _get_current_allocator() -> _CUDAAllocator:

@@ -22,6 +22,11 @@ createCustomAllocator(
 TORCH_CUDA_CPP_API void changeCurrentAllocator(
     const std::shared_ptr<c10::cuda::CUDACachingAllocator::CUDAAllocator>&
         allocator);
+// torch.cuda.memory.use_allocator: opens a window on this thread and returns
+// its token; closes the window of a token (innermost first, on its thread).
+TORCH_CUDA_CPP_API uint64_t beginUseAllocator(
+    std::shared_ptr<c10::cuda::CUDACachingAllocator::CUDAAllocator> allocator);
+TORCH_CUDA_CPP_API void endUseAllocator(uint64_t token);
 
 struct _AllocationMetadata {
   _AllocationMetadata();
